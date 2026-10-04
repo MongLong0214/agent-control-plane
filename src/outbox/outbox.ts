@@ -152,6 +152,23 @@ export const HOLDER_CLAIMED_KIND_SQL = [...HOLDER_CLAIMED_KINDS]
   .join(", ");
 
 /**
+ * The holder-claimed row `alias` names has never left `PENDING` (review finding 01, schema v40).
+ *
+ * `PENDING` with no attempts, no `sent_at` and no `claim_token` does not mean never claimed: those
+ * are ordinary columns any statement can put back, and a claimed, acknowledged or rejected row put
+ * back that way reads exactly like one nobody was handed. `outbox_holder_message_departs` records
+ * the first departure from `PENDING` of every row, whatever its kind and whoever writes it — the
+ * kind is just as rewritable — and nothing removes a departure. So every path that hands a
+ * holder-claimed row to someone — the holder's claim, a takeover's retarget, a runtime move, a
+ * restart's carry — asserts this, in the statement that moves the row as well as in the read that
+ * chose it. Product code never moves a holder-claimed row back to `PENDING`. Nothing else reads the
+ * departures: the generic sweep, its retry and the lease reclaim move a generic row out of and back
+ * into `PENDING` without consulting them.
+ */
+const neverDepartedSql = (alias: string): string =>
+  `NOT EXISTS (SELECT 1 FROM holder_message_departures departed WHERE departed.message_id = ${alias}.message_id)`;
+
+/**
  * The outward, role-level kinds an adopted canonical CTO receives in band rather than over Buzz.
  *
  * A canonical CTO is an interactive runtime no provider launched (`adoptedCanonicalRuntimeSql`). A
@@ -675,8 +692,8 @@ export class Outbox {
       // Every queued row is read, not `LIMIT 1`, because `admits` decides which of them may be
       // handed over at all (#1044) — and it decides before anything below writes. A withheld row is
       // skipped, so one stale peer message does not stop the owner's messages queued behind it.
-      const queued = this.db.all<RawOutbox>(
-        `SELECT o.* FROM outbox o
+      const queued = this.db.all<RawOutbox & { never_departed: number }>(
+        `SELECT o.*, ${neverDepartedSql("o")} AS never_departed FROM outbox o
           WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
             AND o.status = 'PENDING'
             AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
@@ -688,10 +705,16 @@ export class Outbox {
       // (#1044): an unreadable later row must not cost the holder the readable message ahead of it,
       // nor the report of an unresolved hand-over. Only reading is caught here — a failure inside
       // `admits` is the caller's, and still propagates.
+      //
+      // A row that ever left PENDING is withheld the same way, whatever it reads now (review
+      // finding 01): it was handed over, settled or moved once already, and a statement put it
+      // back. Withheld, it is never handed over again and never counted as work waiting, it does
+      // not stand at the head of the queue in front of a message nobody was handed; the holder is
+      // told its id, as for any withheld row. The write below asserts the same.
       const admitted: RawOutbox[] = [];
       const withheld: UnresolvedOwnerMessage[] = [];
-      for (const row of queued) {
-        const message = readableMessage(row);
+      for (const { never_departed: neverDeparted, ...row } of queued) {
+        const message = neverDeparted === 1 ? readableMessage(row) : null;
         if (message !== null && admits(message)) admitted.push(row);
         else withheld.push(unresolvedOwnerMessage(row));
       }
@@ -720,7 +743,8 @@ export class Outbox {
           WHERE message_id = ? AND status = 'PENDING'
             AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
             AND role_key = ? AND binding_generation = ? AND target_session_id = ?
-            AND ${exactHolderTarget("outbox")}`,
+            AND ${exactHolderTarget("outbox")}
+            AND ${neverDepartedSql("outbox")}`,
         [
           now,
           candidate.message_id,
@@ -1442,7 +1466,13 @@ export class Outbox {
       // row already carrying it changes nothing here and falls through to the rejection below —
       // which settles its ingress claim in this same transaction, rather than leaving it queued
       // for a generation nobody holds.
-      const carriedOnce = holderClaimed ? " AND (reason_code IS NULL OR reason_code <> ?)" : "";
+      //
+      // `PENDING` cannot tell a row nobody was handed from one handed over and put back by a
+      // statement either (review finding 01), so the set it asserts also includes *this row never
+      // left PENDING*; a row that did falls through to the same reject.
+      const carriedOnce = holderClaimed
+        ? ` AND (reason_code IS NULL OR reason_code <> ?) AND ${neverDepartedSql("outbox")}`
+        : "";
       const moved = retargetable
         ? this.db.run(
             `UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
@@ -1610,7 +1640,8 @@ export class Outbox {
             `UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
               WHERE message_id = ? AND status = 'PENDING' AND kind = ?
                 AND role_key = ? AND binding_generation = ? AND target_session_id = ?
-                AND attempts = 0 AND sent_at IS NULL AND claim_token IS NULL`,
+                AND attempts = 0 AND sent_at IS NULL AND claim_token IS NULL
+                AND ${neverDepartedSql("outbox")}`,
             [
               toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id, row.kind,
               roleKey, fromGeneration, fromSessionId,
@@ -1663,6 +1694,14 @@ export class Outbox {
   #peerMessageCarried(messageId: string): boolean {
     return this.db.get<{ present: number }>(
       `SELECT 1 AS present FROM peer_message_carries WHERE message_id = ? AND outcome = 'CARRIED'`,
+      [messageId],
+    ) !== undefined;
+  }
+
+  /** Whether this message ever left PENDING (review finding 01): `neverDepartedSql`, as a read. */
+  #holderMessageDeparted(messageId: string): boolean {
+    return this.db.get<{ present: number }>(
+      `SELECT 1 AS present FROM holder_message_departures WHERE message_id = ?`,
       [messageId],
     ) !== undefined;
   }
@@ -1808,10 +1847,12 @@ export class Outbox {
   #peerMessageCarryRefusal(row: RawOutbox, succession: PeerMessageSuccession): PeerMessageCarryRefusal | null {
     if (this.#peerMessageCarried(row.message_id)) return PeerMessageCarryRefusal.ALREADY_CARRIED;
     // Unclaimed: never handed over, never in flight, never attempted. UNKNOWN and IN_DOUBT
-    // outcomes are reconciled with what they already have, never moved.
+    // outcomes are reconciled with what they already have, never moved. The row's own columns can
+    // be put back by any statement, so the departure record decides too (review finding 01): a row
+    // that ever left PENDING was claimed, whatever it reads now.
     if (
       row.status !== "PENDING" || row.attempts !== 0 || (row.sent_at ?? null) !== null ||
-      (row.claim_token ?? null) !== null
+      (row.claim_token ?? null) !== null || this.#holderMessageDeparted(row.message_id)
     ) {
       return PeerMessageCarryRefusal.ALREADY_CLAIMED;
     }
@@ -1909,14 +1950,17 @@ export class Outbox {
         // generation's or this runtime's in between must move nothing.
         // Never an `IDENTITY_BOUND_KINDS` row (#1044): the generation is the same, but the receiving
         // session a peer message was admitted for is the one that just went, so it is rejected
-        // below rather than re-addressed to a runtime its proof does not name.
+        // below rather than re-addressed to a runtime its proof does not name. Nor a row that ever
+        // left PENDING (review finding 01): it was handed over once already, so it is rejected
+        // below like the `SENT` row it really is.
         const moved =
           row.status === "PENDING" && !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind)
             ? this.db.run(
                 `UPDATE outbox SET target_session_id = ?
                   WHERE message_id = ? AND status = 'PENDING'
                     AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
-                    AND role_key = ? AND binding_generation = ? AND target_session_id = ?`,
+                    AND role_key = ? AND binding_generation = ? AND target_session_id = ?
+                    AND ${neverDepartedSql("outbox")}`,
                 [toSessionId, row.message_id, roleKey, bindingGeneration, fromSessionId],
               ).changes
             : 0;

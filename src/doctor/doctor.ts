@@ -17,7 +17,7 @@ import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-prefl
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { isClean, tryRevParse } from "../git/git.ts";
-import type { Outbox } from "../outbox/outbox.ts";
+import { HOLDER_CLAIMED_KIND_SQL, type Outbox } from "../outbox/outbox.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -1605,12 +1605,12 @@ export class Doctor {
   }
 
   private checkOutbox(): Finding[] {
+    const findings: Finding[] = [];
     const stuck = this.db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM outbox WHERE status = 'PENDING' AND attempts >= 3`,
     );
-    if ((stuck?.n ?? 0) === 0) return [];
-    return [
-      {
+    if ((stuck?.n ?? 0) > 0) {
+      findings.push({
         code: "OUTBOX_DELIVERY_STUCK",
         severity: "ERROR",
         scope: "outbox",
@@ -1618,8 +1618,32 @@ export class Doctor {
         confidence: "HIGH",
         observedEvidence: { pendingWithRetries: stuck?.n ?? 0 },
         recommendedAction: "inspect the Buzz transport and retry the outbox",
-      },
-    ];
+      });
+    }
+    // Review finding 01: a holder-claimed row that left PENDING once and reads PENDING again was put
+    // back by a statement no product path makes. The hand-over, the carry and every retarget refuse
+    // it, so it stays PENDING with nothing to take it — named here rather than left looking like an
+    // ordinary queued message. Holder-claimed kinds only: the ledger records every kind, and a
+    // generic row a retry or a lease reclaim returns to PENDING is doing what it should.
+    const returned = this.db.all<{ message_id: string }>(
+      `SELECT o.message_id FROM outbox o
+         JOIN holder_message_departures d ON d.message_id = o.message_id
+        WHERE o.status = 'PENDING' AND o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
+        ORDER BY o.created_at, o.rowid`,
+    );
+    if (returned.length > 0) {
+      findings.push({
+        code: "OUTBOX_HOLDER_MESSAGE_RETURNED_TO_PENDING",
+        severity: "ERROR",
+        scope: "outbox",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: { count: returned.length, messageIds: returned.map((row) => row.message_id) },
+        recommendedAction:
+          "a holder-claimed message that was already handed over, settled or moved reads PENDING again; it will not be handed over or carried — find the writer that put it back",
+      });
+    }
+    return findings;
   }
 
   private repositoryProjectSuspended(projectId: string | null): boolean {

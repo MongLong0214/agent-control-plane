@@ -130,9 +130,9 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- CP-HI-06 — DELETE followed by INSERT is also a first claim\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_override_insert_authority[\s\S]*?\nEND;/,
   // v39 alone installs this guard, the owner-reply intent's key (R1056-02).
   /-- CP-HI-06 — an owner reply's recorded intent \(#1036, R1056-02\) is found by its key alone[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_owner_reply_key_immutable[\s\S]*?\nEND;/,
-  // v40 alone creates the peer-message carry record and its guards (ACP-PEER-SUCCESSION-01), and
-  // the refusal notices beside them (ACP-RESTART-04).
-  /-- -{75}\n-- peer_message_carries[\s\S]*?CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role[^;]*;/,
+  // v40 alone creates the peer-message carry record and its guards (ACP-PEER-SUCCESSION-01), the refusal
+  // notices beside them (ACP-RESTART-04), and the holder-message departures with their trigger (finding 01).
+  /-- -{75}\n-- peer_message_carries[\s\S]*?CREATE TRIGGER IF NOT EXISTS holder_message_departures_no_delete[\s\S]*?\nEND;/,
   // v40 alone installs the Buzz source key guard (ACP-RESTART-02).
   /-- CP-HI-06 — a Buzz event's admitted row \(ACP-RESTART-02, schema v40\)[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_buzz_source_key_immutable[\s\S]*?\nEND;/,
 ];
@@ -2672,8 +2672,9 @@ const v39: SchemaMigration = {
 };
 
 /**
- * v40's guards, read from schema.sql by name: over the carry record, over the refusal notices
- * (ACP-RESTART-04), and over a Buzz event's admitted key (ACP-RESTART-02).
+ * v40's triggers, read from schema.sql by name: over the carry record, over the refusal notices
+ * (ACP-RESTART-04), over a Buzz event's admitted key (ACP-RESTART-02), and the holder-message
+ * departure record with the outbox trigger that writes it (review finding 01).
  */
 const V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES: readonly string[] = [
   "peer_message_carries_insert_authority",
@@ -2685,10 +2686,15 @@ const V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES: readonly string[] = [
   "peer_message_refusal_notices_immutable",
   "peer_message_refusal_notices_no_delete",
   "inbound_messages_buzz_source_key_immutable",
+  "outbox_holder_message_departs",
+  "outbox_message_id_immutable",
+  "holder_message_departures_no_replace",
+  "holder_message_departures_immutable",
+  "holder_message_departures_no_delete",
 ];
 
-/** v40's two record tables, each with its one index, read from schema.sql by pattern. */
-const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index: RegExp }> = [
+/** v40's three record tables, and the index each has beyond its key, read from schema.sql by pattern. */
+const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index?: RegExp }> = [
   {
     name: "peer_message_carries",
     table: /CREATE TABLE IF NOT EXISTS peer_message_carries \([\s\S]*?\n\);/,
@@ -2698,6 +2704,10 @@ const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index: Reg
     name: "peer_message_refusal_notices",
     table: /CREATE TABLE IF NOT EXISTS peer_message_refusal_notices \([\s\S]*?\n\);/,
     index: /CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role[^;]*;/,
+  },
+  {
+    name: "holder_message_departures",
+    table: /CREATE TABLE IF NOT EXISTS holder_message_departures \([\s\S]*?\n\);/,
   },
 ];
 
@@ -2713,9 +2723,20 @@ const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index: Reg
  * marker. And one guard on an existing table, `inbound_messages`: a Buzz event's admitted row keeps
  * its key (ACP-RESTART-02), since the carry record names that row by its key.
  *
- * Additive: two new tables, an index each, and nine triggers; no existing row or object is changed,
- * so every v39 row is kept as it is. A queued peer message written before this has no record and is
- * carried by nothing until a v40 restart decides it.
+ * And the departure record (review finding 01): whether a holder-claimed message was ever claimed is
+ * not readable from its outbox row, whose status, attempts, sent_at, claim_token and kind any
+ * statement can put back. So an append-only table records every outbox row's first departure from
+ * PENDING, whatever its kind, written by a trigger on `outbox` that fires for every writer; the
+ * carry, the successor retarget, the runtime move and the hand-over refuse a message that has one,
+ * and no generic path reads it. A row that had already left PENDING before v40 gets a BACKFILL
+ * departure here, in the same step, so the first v40 restart cannot carry one a raw writer had
+ * already put back. A departure names its message by id, so v40 also fixes an outbox row's id once
+ * written: renamed, a departed row would read as one with no departure.
+ *
+ * Additive: three new tables, an index on two of them, fourteen triggers, and the backfill rows in the
+ * new departure table; no existing row or object is changed, so every v39 row is kept as it is. A
+ * queued peer message written before this has no record and is carried by nothing until a v40
+ * restart decides it.
  *
  * v12 and v13 replay a fixed snapshot that does not contain the tables, but a chain test can build
  * a v39 image out of a current database, which does. So a table already present is accepted only
@@ -2733,7 +2754,9 @@ const v40: SchemaMigration = {
   apply: (raw) => {
     for (const record of V40_RECORD_TABLES) {
       const tableDdl = schemaObject(record.table, `the ${record.name} table`, SCHEMA_VERSION);
-      const indexDdl = schemaObject(record.index, `the ${record.name} index`, SCHEMA_VERSION);
+      const indexDdl = record.index === undefined
+        ? null
+        : schemaObject(record.index, `the ${record.name} index`, SCHEMA_VERSION);
       const existing = (raw.prepare(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
       ).get(record.name) as { sql: string } | undefined)?.sql;
@@ -2748,10 +2771,15 @@ const v40: SchemaMigration = {
       } else {
         raw.exec(tableDdl);
       }
-      raw.exec(indexDdl);
+      if (indexDdl !== null) raw.exec(indexDdl);
     }
     raw.exec(dropsFor(V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES));
     raw.exec(triggerDdlFor(V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES, SCHEMA_VERSION));
+    // Review finding 01: every row that has already left PENDING, of any kind, departed before the
+    // trigger above existed. The table is empty here (checked above), so no guard refuses a row.
+    raw.exec(`INSERT INTO holder_message_departures (message_id, from_status, to_status, departed_at, basis)
+      SELECT message_id, NULL, status, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'BACKFILL' FROM outbox
+       WHERE status <> 'PENDING'`);
   },
   checksum: () => migrationChecksum("v40-peer-message-carry-record", SCHEMA_VERSION),
 };
@@ -2913,6 +2941,12 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "peer_message_refusal_notices_immutable", sentinel: "PEER_MESSAGE_NOTICE_IMMUTABLE", introducedIn: 40 },
   { name: "peer_message_refusal_notices_no_delete", sentinel: "PEER_MESSAGE_NOTICE_IMMUTABLE", introducedIn: 40 },
   { name: "inbound_messages_buzz_source_key_immutable", sentinel: "INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE", introducedIn: 40 },
+  // Raises nothing: its load-bearing part is the write, so the write is its sentinel.
+  { name: "outbox_holder_message_departs", sentinel: "INSERT INTO holder_message_departures", introducedIn: 40 },
+  { name: "outbox_message_id_immutable", sentinel: "OUTBOX_MESSAGE_ID_IMMUTABLE", introducedIn: 40 },
+  { name: "holder_message_departures_no_replace", sentinel: "HOLDER_MESSAGE_DEPARTURE_NO_REPLACE", introducedIn: 40 },
+  { name: "holder_message_departures_immutable", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
+  { name: "holder_message_departures_no_delete", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 

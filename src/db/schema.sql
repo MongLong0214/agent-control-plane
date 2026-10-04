@@ -1358,6 +1358,83 @@ CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role
   ON peer_message_refusal_notices(role_key, entry);
 
 -- ---------------------------------------------------------------------------
+-- holder_message_departures  (schema v40, review finding 01)
+--   Lifecycle: one row per outbox message, of any kind, that has ever left PENDING — handed over,
+--   claimed by a delivery loop, sent, acknowledged, rejected, expired, or moved by any other
+--   statement. `TRANSITION`: written by `outbox_holder_message_departs` in the statement that moved
+--   the row, whoever wrote it. `BACKFILL`: written by v40 for a row that had already left PENDING
+--   before the trigger existed; its earlier status was not observed, so `from_status` is null.
+--   Integrity: the outbox row's status, attempts, sent_at and claim_token are ordinary columns any
+--   statement can put back, and so is its kind, so a row that reads as a PENDING holder-claimed
+--   message (`HOLDER_CLAIMED_KINDS`) may still have been claimed — as itself, or as another kind.
+--   "Never claimed" is read here instead: only the holder-claimed hand-over paths read this table,
+--   and a message with a departure is never carried to a successor, never re-addressed and never
+--   handed to a holder again, whatever its row says now. Every kind is recorded so a kind rewritten
+--   before the row left PENDING cannot hide the departure; a generic row that a retry or a lease
+--   reclaim returns to PENDING is not affected, because no generic path reads this table. A
+--   departure is never updated, replaced or deleted. Its INSERT needs no authority: a forged
+--   departure can only make a message ineligible, which fails safe.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS holder_message_departures (
+  message_id   TEXT PRIMARY KEY NOT NULL,
+  from_status  TEXT,
+  to_status    TEXT NOT NULL,
+  departed_at  TEXT NOT NULL,
+  basis        TEXT NOT NULL CHECK (basis IN ('TRANSITION','BACKFILL')),
+  CHECK ((basis = 'TRANSITION') = (from_status IS NOT NULL))
+);
+
+-- CP-HI-06 — the departure is recorded by the database for every writer, raw SQL included, the
+-- moment a row first leaves PENDING; a later status write cannot take it back. No kind filter: the
+-- kind is as rewritable as the status, and a row that left PENDING under another kind was claimed
+-- all the same. A second departure of the same message is not attempted, so the no-replace guard
+-- below never refuses a product write, including a generic retry that leaves PENDING again.
+CREATE TRIGGER IF NOT EXISTS outbox_holder_message_departs
+AFTER UPDATE OF status ON outbox
+WHEN OLD.status = 'PENDING' AND NEW.status <> 'PENDING'
+  AND NOT EXISTS (SELECT 1 FROM holder_message_departures WHERE message_id = NEW.message_id)
+BEGIN
+  INSERT INTO holder_message_departures (message_id, from_status, to_status, departed_at, basis)
+  VALUES (NEW.message_id, OLD.status, NEW.status, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'TRANSITION');
+END;
+
+-- CP-HI-06 — a departure names its message by id, so the id is fixed once written: a departed row
+-- renamed and put back to PENDING in one statement fires no departure (it leaves SENT, not PENDING)
+-- and its new id has none, so it would read as a message nobody was ever handed. No product path
+-- writes an outbox row's id after its INSERT.
+CREATE TRIGGER IF NOT EXISTS outbox_message_id_immutable
+BEFORE UPDATE OF message_id ON outbox
+WHEN NEW.message_id IS NOT OLD.message_id
+BEGIN
+  SELECT RAISE(ABORT, 'OUTBOX_MESSAGE_ID_IMMUTABLE');
+END;
+
+-- CP-HI-06 — one departure per message, ever; a second is refused, not merged.
+CREATE TRIGGER IF NOT EXISTS holder_message_departures_no_replace
+BEFORE INSERT ON holder_message_departures
+WHEN EXISTS (
+  SELECT 1 FROM holder_message_departures
+   WHERE message_id = NEW.message_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_NO_REPLACE');
+END;
+
+-- CP-HI-08 — a departure is evidence that the message was claimed: never rewritten.
+CREATE TRIGGER IF NOT EXISTS holder_message_departures_immutable
+BEFORE UPDATE ON holder_message_departures
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — and never removed: a deleted departure would let a reverted row be handed over again.
+CREATE TRIGGER IF NOT EXISTS holder_message_departures_no_delete
+BEFORE DELETE ON holder_message_departures
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+
+-- ---------------------------------------------------------------------------
 -- inbound_messages
 --   Lifecycle: ingress replay defence (§27.1 nonce/idempotency, §27.3 MCP).
 --   Integrity: unique nonce per channel is the whole point.

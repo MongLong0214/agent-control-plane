@@ -1334,6 +1334,12 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   PEER_MESSAGE_NOTICE_NO_REPLACE: ReasonCode.CONFLICT,
   PEER_MESSAGE_NOTICE_IMMUTABLE: ReasonCode.CONFLICT,
   INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE: ReasonCode.CONFLICT,
+  // Review finding 01 — a holder-claimed message's departure from PENDING is never rewritten,
+  // replaced or removed.
+  HOLDER_MESSAGE_DEPARTURE_NO_REPLACE: ReasonCode.CONFLICT,
+  HOLDER_MESSAGE_DEPARTURE_IMMUTABLE: ReasonCode.CONFLICT,
+  // and the outbox row's id, which names the departure, is fixed once written.
+  OUTBOX_MESSAGE_ID_IMMUTABLE: ReasonCode.CONFLICT,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
@@ -16,6 +16,7 @@ import { digestOf } from "../../src/core/digest.ts";
 import { type Decision, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
+import { AuditLog } from "../../src/db/audit.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
 import { installMigrationLedger } from "../../src/db/migrations.ts";
 import {
@@ -27,14 +28,14 @@ import { recoverDeadCanonicalBinding } from "../../src/daemon/dead-binding-recov
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
-import type { HolderIdentity } from "../../src/outbox/outbox.ts";
+import { type HolderIdentity, Outbox } from "../../src/outbox/outbox.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import {
   CanonicalSelfClaim,
   hostSessionRegistryAbsent,
   type ProcessSnapshot,
 } from "../../src/registry/canonical-self-claim.ts";
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, makeCore, makeRepo, seedRun, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
@@ -1644,6 +1645,670 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
       expect(dump(restored, ["schema_migrations"])).toEqual(before);
     } finally {
       restored.close();
+    }
+  });
+
+  it("W4 finding 01: a v39 database's rows outside PENDING get a BACKFILL departure, exactly those, of every kind", () => {
+    const { path } = legacyImage(39);
+    const legacy = new Database(path);
+    // v39 had none of the departure objects.
+    legacy.exec(`
+      DROP TRIGGER outbox_holder_message_departs;
+      DROP TRIGGER outbox_message_id_immutable;
+      DROP TRIGGER holder_message_departures_no_replace;
+      DROP TRIGGER holder_message_departures_immutable;
+      DROP TRIGGER holder_message_departures_no_delete;
+      DROP TABLE holder_message_departures;
+    `);
+    const row = legacy.prepare(
+      `INSERT INTO outbox (message_id, idempotency_key, role_key, binding_generation, target_session_id, kind,
+                           payload_json, payload_digest, request_fingerprint, expires_at, created_at, status)
+       VALUES (?, ?, 'PRIMARY_CTO:p', 1, 'sess_cto', ?, '{}', 'sha256:x', ?, ?, ?, ?)`,
+    );
+    const rows: Array<[string, MessageKind, string]> = [
+      ["msg_peer_sent", MessageKind.PEER_MESSAGE, "SENT"],
+      ["msg_owner_acked", MessageKind.OWNER_MESSAGE, "ACKED"],
+      ["msg_peer_pending", MessageKind.PEER_MESSAGE, "PENDING"],
+      ["msg_owner_pending", MessageKind.OWNER_MESSAGE, "PENDING"],
+      // Not holder-claimed: recorded all the same, since the kind is no more fixed than the status.
+      ["msg_dispatch_sent", MessageKind.RUN_DISPATCH, "SENT"],
+      ["msg_dispatch_pending", MessageKind.RUN_DISPATCH, "PENDING"],
+    ];
+    for (const [id, kind, status] of rows) row.run(id, `key:${id}`, kind, `fp:${id}`, NOW, NOW, status);
+    expect(legacy.prepare(
+      `SELECT name FROM sqlite_master WHERE name LIKE '%departure%' OR name = 'outbox_message_id_immutable'`,
+    ).all()).toEqual([]);
+    const before = dump(legacy, ["schema_migrations"]);
+    legacy.close();
+
+    approveMigration(path, "finding 01 v39 backfill fixture");
+    const migrated = openDb(path);
+    try {
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(40);
+      expect(migrated.all(`SELECT * FROM holder_message_departures ORDER BY message_id`)).toEqual([
+        { message_id: "msg_dispatch_sent", from_status: null, to_status: "SENT", departed_at: expect.any(String), basis: "BACKFILL" },
+        { message_id: "msg_owner_acked", from_status: null, to_status: "ACKED", departed_at: expect.any(String), basis: "BACKFILL" },
+        { message_id: "msg_peer_sent", from_status: null, to_status: "SENT", departed_at: expect.any(String), basis: "BACKFILL" },
+      ]);
+      expect(migrated.all<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'trigger'
+            AND (tbl_name = 'holder_message_departures'
+                 OR name IN ('outbox_holder_message_departs', 'outbox_message_id_immutable')) ORDER BY name`,
+      ).map((trigger) => trigger.name)).toEqual([
+        "holder_message_departures_immutable",
+        "holder_message_departures_no_delete",
+        "holder_message_departures_no_replace",
+        "outbox_holder_message_departs",
+        "outbox_message_id_immutable",
+      ]);
+    } finally {
+      migrated.close();
+    }
+    // Every v39 row is kept as it was; only the new table has rows.
+    const after = new Database(path, { readonly: true });
+    try {
+      expect(dump(after, ["schema_migrations", "holder_message_departures", "peer_message_carries",
+        "peer_message_refusal_notices"])).toEqual(before);
+    } finally {
+      after.close();
+    }
+    // And from v40 on, a PENDING row that leaves PENDING is recorded as it happens.
+    const reopened = openDb(path);
+    try {
+      reopened.run(`UPDATE outbox SET status = 'SENT' WHERE message_id = 'msg_peer_pending'`);
+      reopened.run(`UPDATE outbox SET status = 'IN_FLIGHT' WHERE message_id = 'msg_dispatch_pending'`);
+      // Leaving a status other than PENDING records nothing new, and a second departure is not tried.
+      reopened.run(`UPDATE outbox SET status = 'REJECTED' WHERE message_id = 'msg_dispatch_sent'`);
+      reopened.run(`UPDATE outbox SET status = 'PENDING' WHERE message_id = 'msg_dispatch_pending'`);
+      reopened.run(`UPDATE outbox SET status = 'IN_FLIGHT' WHERE message_id = 'msg_dispatch_pending'`);
+      expect(reopened.all(
+        `SELECT message_id, from_status, to_status, basis FROM holder_message_departures
+          WHERE basis = 'TRANSITION' ORDER BY message_id`,
+      )).toEqual([
+        { message_id: "msg_dispatch_pending", from_status: "PENDING", to_status: "IN_FLIGHT", basis: "TRANSITION" },
+        { message_id: "msg_peer_pending", from_status: "PENDING", to_status: "SENT", basis: "TRANSITION" },
+      ]);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+/**
+ * Review finding 01. The carry and the hand-over decided "never claimed" from the outbox row's own
+ * status, attempts, sent_at and claim_token — columns any statement can put back. A raw writer could
+ * therefore return a claimed or settled peer message to PENDING, and the restart carried the CEO's
+ * words to the successor, or the same holder was handed them a second time. Schema v40's
+ * `holder_message_departures` records the first departure from PENDING for every writer, and every
+ * hand-over path refuses a message that has one.
+ */
+describe("finding 01: a holder-claimed message that ever left PENDING is never handed over again", () => {
+  /** What a raw writer does to make a claimed row read as one nobody was ever handed. */
+  const putBack = (fixture: Fixture, messageId: string): void => {
+    fixture.harness.cp.db.run(
+      `UPDATE outbox SET status = 'PENDING', attempts = 0, sent_at = NULL, acked_at = NULL,
+                         claim_token = NULL, claimed_at = NULL, reason_code = NULL
+        WHERE message_id = ?`,
+      [messageId],
+    );
+  };
+  const rowOf = (fixture: Fixture, messageId: string) =>
+    fixture.harness.cp.db.get<Record<string, unknown>>(`SELECT * FROM outbox WHERE message_id = ?`, [messageId]);
+  const carried = (fixture: Fixture) => fixture.carries().filter((carry) => carry.outcome === "CARRIED");
+  const refusals = (fixture: Fixture) =>
+    fixture.carries().map((carry) => [carry.message_id, carry.outcome, carry.refusal]);
+
+  it("records a departure for every kind: the trigger and the backfill name no kind at all", () => {
+    // The kind is as rewritable as the status (W7), so a filter on it is a way around the record.
+    const schema = readFileSync(new URL("../../src/db/schema.sql", import.meta.url), "utf8");
+    const trigger = /CREATE TRIGGER IF NOT EXISTS outbox_holder_message_departs\n[\s\S]*?\nEND;/.exec(schema)?.[0];
+    expect(trigger).toBeDefined();
+    expect(trigger).not.toMatch(/\bkind\b/);
+    const migrations = readFileSync(new URL("../../src/db/migrations.ts", import.meta.url), "utf8");
+    const backfill = /INSERT INTO holder_message_departures[\s\S]*?`\);/.exec(migrations)?.[0];
+    expect(backfill).toBeDefined();
+    expect(backfill).not.toMatch(/\bkind\b/);
+  });
+
+  it("W1a a claimed (SENT) peer message put back to PENDING by raw SQL is not carried; the successor gets nothing", async () => {
+    const fixture = await startFixture();
+    try {
+      const ledger = ownerMessageLedger(fixture.harness.cp);
+      await fixture.ceoSays("건네진 뒤 되돌려진 지시");
+      const [queued] = fixture.peerRows();
+      const taken = ledger.claim(fixture.holderOf(fixture.first.sessionId));
+      expect(handedOver(taken.allowed ? taken.value : null).claimed?.messageId).toBe(queued!.message_id);
+      putBack(fixture, queued!.message_id);
+      expect(rowOf(fixture, queued!.message_id)).toMatchObject({
+        status: "PENDING", attempts: 0, sent_at: null, claim_token: null,
+      });
+
+      const successor = await restart(fixture, 2);
+
+      expect(carried(fixture)).toEqual([]);
+      expect(refusals(fixture)).toEqual([[queued!.message_id, "REFUSED", "ALREADY_CLAIMED"]]);
+      expect(fixture.peerRows()[0]).toMatchObject({
+        status: "REJECTED", binding_generation: 1, target_session_id: fixture.first.sessionId,
+      });
+      const got = ledger.claim(fixture.holderOf(successor.sessionId));
+      expect(handedOver(got.allowed ? got.value : null).claimed).toBeNull();
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("W1b the same put-back row is not handed to its holder again, and the doctor names it", async () => {
+    const fixture = await startFixture();
+    try {
+      const { harness } = fixture;
+      const ledger = ownerMessageLedger(harness.cp);
+      const holder = fixture.holderOf(fixture.first.sessionId);
+      await fixture.ceoSays("두 번 건네지면 안 되는 지시");
+      const [queued] = fixture.peerRows();
+      const taken = ledger.claim(holder);
+      expect(handedOver(taken.allowed ? taken.value : null).claimed?.messageId).toBe(queued!.message_id);
+      putBack(fixture, queued!.message_id);
+      const putBackRow = rowOf(fixture, queued!.message_id);
+
+      const before = fixture.writes();
+      const again = ledger.claim(holder);
+      expect(again.allowed, JSON.stringify(again)).toBe(true);
+      expect(handedOver(again.allowed ? again.value : null)).toMatchObject({
+        claimed: null,
+        withheld: [{ messageId: queued!.message_id }],
+      });
+      // The outbox itself refuses it, whatever the caller's predicate admits.
+      const bare = harness.cp.outbox.claimForHolder(holder, () => true);
+      expect(bare.claimed).toEqual([]);
+      expect(bare.hasMore).toBe(false);
+      expect(fixture.writes()).toBe(before);
+      expect(rowOf(fixture, queued!.message_id)).toEqual(putBackRow);
+
+      const report = await harness.cp.doctor.run("system");
+      expect(report.findings.find((finding) => finding.code === "OUTBOX_HOLDER_MESSAGE_RETURNED_TO_PENDING"))
+        .toMatchObject({ observedEvidence: { count: 1, messageIds: [queued!.message_id] } });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("W2 the same for a message that went ACKED, REJECTED or EXPIRED before the put-back", async () => {
+    const fixture = await startFixture();
+    try {
+      const { harness } = fixture;
+      const ledger = ownerMessageLedger(harness.cp);
+      const holder = fixture.holderOf(fixture.first.sessionId);
+      await fixture.ceoSays("받고 끝낸 지시");
+      await fixture.ceoSays("받고 거절한 지시");
+      await fixture.ceoSays("만료된 지시");
+      const [acked, rejected, expired] = fixture.peerRows();
+      const first = ledger.claim(holder);
+      expect(handedOver(first.allowed ? first.value : null).claimed?.messageId).toBe(acked!.message_id);
+      expect(ledger.complete(acked!.message_id, holder).reasonCode).toBe(ReasonCode.OK);
+      const second = ledger.claim(holder);
+      expect(handedOver(second.allowed ? second.value : null).claimed?.messageId).toBe(rejected!.message_id);
+      expect(ledger.reject(rejected!.message_id, holder).allowed).toBe(true);
+      // No product path expires a holder-claimed row; a raw writer can.
+      harness.cp.db.run(`UPDATE outbox SET status = 'EXPIRED' WHERE message_id = ?`, [expired!.message_id]);
+      expect(fixture.peerRows().map((row) => row.status)).toEqual(["ACKED", "REJECTED", "EXPIRED"]);
+      for (const row of [acked, rejected, expired]) putBack(fixture, row!.message_id);
+      expect(fixture.peerRows().map((row) => row.status)).toEqual(["PENDING", "PENDING", "PENDING"]);
+
+      // Not handed to the holder again.
+      const before = fixture.writes();
+      const again = ledger.claim(holder);
+      expect(handedOver(again.allowed ? again.value : null).claimed).toBeNull();
+      expect(harness.cp.outbox.claimForHolder(holder, () => true).claimed).toEqual([]);
+      expect(fixture.writes()).toBe(before);
+
+      // Not carried on restart, and the successor gets nothing.
+      const successor = await restart(fixture, 2);
+      expect(carried(fixture)).toEqual([]);
+      expect(refusals(fixture)).toEqual([
+        [acked!.message_id, "REFUSED", "ALREADY_CLAIMED"],
+        [rejected!.message_id, "REFUSED", "ALREADY_CLAIMED"],
+        [expired!.message_id, "REFUSED", "ALREADY_CLAIMED"],
+      ]);
+      const got = ledger.claim(fixture.holderOf(successor.sessionId));
+      expect(handedOver(got.allowed ? got.value : null).claimed).toBeNull();
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("W3 the departure refuses raw UPDATE, DELETE and REPLACE, and survives the outbox row being deleted and re-inserted", async () => {
+    const fixture = await startFixture();
+    const external = new Database(join(fixture.harness.root, "state.sqlite"));
+    try {
+      const { harness } = fixture;
+      const ledger = ownerMessageLedger(harness.cp);
+      const holder = fixture.holderOf(fixture.first.sessionId);
+      await fixture.ceoSays("기록을 지워 되살리려는 지시");
+      const [queued] = fixture.peerRows();
+      const id = queued!.message_id;
+      const departures = () => harness.cp.db.all(`SELECT * FROM holder_message_departures ORDER BY rowid`);
+      expect(departures()).toEqual([]);
+      ledger.claim(holder);
+      const [departure] = departures();
+      expect(departures()).toEqual([
+        { message_id: id, from_status: "PENDING", to_status: "SENT", departed_at: expect.any(String), basis: "TRANSITION" },
+      ]);
+
+      // ACP's own connection and an external one with none of ACP's pragmas: both refused.
+      const writers: Array<[string, (sql: string, params: unknown[]) => unknown]> = [
+        ["acp", (sql, params) => harness.cp.db.run(sql, params)],
+        ["external", (sql, params) => external.prepare(sql).run(...(params as never[]))],
+      ];
+      for (const [name, write] of writers) {
+        for (const set of ["to_status = 'PENDING'", "from_status = 'SENT'", "departed_at = '2000-01-01T00:00:00.000Z'",
+                           "basis = 'BACKFILL', from_status = NULL", "message_id = 'msg_elsewhere'"]) {
+          expect(() => write(`UPDATE holder_message_departures SET ${set} WHERE message_id = ?`, [id]), `${name}: ${set}`)
+            .toThrow(/HOLDER_MESSAGE_DEPARTURE_IMMUTABLE/);
+        }
+        expect(() => write(`DELETE FROM holder_message_departures WHERE message_id = ?`, [id]), name)
+          .toThrow(/HOLDER_MESSAGE_DEPARTURE_IMMUTABLE/);
+        expect(() => write(`DELETE FROM holder_message_departures`, []), name)
+          .toThrow(/HOLDER_MESSAGE_DEPARTURE_IMMUTABLE/);
+        for (const verb of ["INSERT OR REPLACE", "REPLACE", "INSERT OR IGNORE", "INSERT"]) {
+          const replaced = (): unknown => write(
+            `${verb} INTO holder_message_departures (message_id, from_status, to_status, departed_at, basis)
+             VALUES (?, 'PENDING', 'REJECTED', '2000-01-01T00:00:00.000Z', 'TRANSITION')`,
+            [id],
+          );
+          expect(replaced, `${name}: ${verb}`).toThrow(/HOLDER_MESSAGE_DEPARTURE_NO_REPLACE/);
+        }
+      }
+      expect(departures()).toEqual([departure]);
+
+      // The outbox row deleted and re-inserted under the same id, as a message nobody was handed.
+      const row = external.prepare(`SELECT * FROM outbox WHERE message_id = ?`).get(id) as Record<string, unknown>;
+      external.prepare(`DELETE FROM outbox WHERE message_id = ?`).run(id);
+      const reborn: Record<string, unknown> = { ...row, status: "PENDING", attempts: 0, sent_at: null, claim_token: null, claimed_at: null };
+      const columns = Object.keys(reborn);
+      external.prepare(`INSERT INTO outbox (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`)
+        .run(...columns.map((column) => reborn[column] as never));
+      expect(rowOf(fixture, id)).toMatchObject({ status: "PENDING", attempts: 0, sent_at: null });
+      expect(departures()).toEqual([departure]);
+
+      const again = ledger.claim(holder);
+      expect(handedOver(again.allowed ? again.value : null).claimed).toBeNull();
+      const successor = await restart(fixture, 2);
+      expect(carried(fixture)).toEqual([]);
+      expect(refusals(fixture)).toEqual([[id, "REFUSED", "ALREADY_CLAIMED"]]);
+      const got = ledger.claim(fixture.holderOf(successor.sessionId));
+      expect(handedOver(got.allowed ? got.value : null).claimed).toBeNull();
+    } finally {
+      external.close();
+      await fixture.close();
+    }
+  });
+
+  it("W5 a put-back row does not strand the queue: a later message is claimable, and a clean one is carried exactly once", async () => {
+    const fixture = await startFixture();
+    try {
+      const ledger = ownerMessageLedger(fixture.harness.cp);
+      const holder = fixture.holderOf(fixture.first.sessionId);
+      await fixture.ceoSays("되돌려진 첫 지시");
+      const [reverted] = fixture.peerRows();
+      ledger.claim(holder);
+      putBack(fixture, reverted!.message_id);
+      await fixture.ceoSays("그 뒤에 온 진짜 지시");
+      const later = fixture.peerRows()[1]!;
+
+      // The put-back row stands first in the queue and is skipped, not handed and not blocking.
+      const next = ledger.claim(holder);
+      expect(handedOver(next.allowed ? next.value : null)).toMatchObject({
+        claimed: { messageId: later.message_id, text: "그 뒤에 온 진짜 지시" },
+        withheld: [{ messageId: reverted!.message_id }],
+      });
+      expect(ledger.complete(later.message_id, holder).reasonCode).toBe(ReasonCode.OK);
+
+      await fixture.ceoSays("재시작 전에 대기 중인 지시");
+      const clean = fixture.peerRows()[2]!;
+      const successor = await restart(fixture, 2);
+      expect(carried(fixture).map((carry) => carry.message_id)).toEqual([clean.message_id]);
+      expect(refusals(fixture)).toEqual([
+        [reverted!.message_id, "REFUSED", "ALREADY_CLAIMED"],
+        [clean.message_id, "CARRIED", null],
+      ]);
+      const newHolder = fixture.holderOf(successor.sessionId);
+      const taken = ledger.claim(newHolder);
+      expect(handedOver(taken.allowed ? taken.value : null).claimed).toMatchObject({
+        messageId: clean.message_id, text: "재시작 전에 대기 중인 지시",
+      });
+      expect(ledger.complete(clean.message_id, newHolder).reasonCode).toBe(ReasonCode.OK);
+      const after = ledger.claim(newHolder);
+      expect(handedOver(after.allowed ? after.value : null).claimed).toBeNull();
+      expect(carried(fixture)).toHaveLength(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("W7 a row flipped to a generic kind, taken out of PENDING and put back, then flipped back, is never handed over or carried", async () => {
+    const fixture = await startFixture();
+    try {
+      const { harness } = fixture;
+      const ledger = ownerMessageLedger(harness.cp);
+      const holder = fixture.holderOf(fixture.first.sessionId);
+      await fixture.ceoSays("일반 종류로 바뀌어 쓸려 나간 지시");
+      await fixture.ceoSays("일반 종류로 바뀌어 손으로 돌려진 지시");
+      const [swept, handled] = fixture.peerRows();
+      const flip = (messageId: string, kind: MessageKind): void => {
+        harness.cp.db.run(`UPDATE outbox SET kind = ? WHERE message_id = ?`, [kind, messageId]);
+      };
+
+      // One goes out through the generic sweep, as a generic kind, and the lease reclaim puts it back.
+      flip(swept!.message_id, MessageKind.TASK_ASSIGN);
+      expect(harness.cp.outbox.claimDeliverable().map((message) => message.messageId)).toEqual([swept!.message_id]);
+      expect(rowOf(fixture, swept!.message_id)).toMatchObject({ status: "IN_FLIGHT" });
+      harness.clock.advance(5 * 60 * 1000 + 1);
+      expect(harness.cp.outbox.reclaimStaleLeases()).toBe(1);
+      // The other is moved PENDING -> IN_FLIGHT -> PENDING by raw statements, as a generic kind.
+      flip(handled!.message_id, MessageKind.TASK_ASSIGN);
+      harness.cp.db.run(
+        `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = 'tok-raw', claimed_at = ? WHERE message_id = ?`,
+        [harness.clock.nowIso(), handled!.message_id],
+      );
+      harness.cp.db.run(
+        `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL WHERE message_id = ?`,
+        [handled!.message_id],
+      );
+      // Both flipped back: each now reads as a peer message nobody was ever handed.
+      for (const row of [swept, handled]) {
+        flip(row!.message_id, MessageKind.PEER_MESSAGE);
+        expect(rowOf(fixture, row!.message_id)).toMatchObject({
+          kind: MessageKind.PEER_MESSAGE, status: "PENDING", attempts: 0, sent_at: null, claim_token: null,
+        });
+      }
+
+      const before = fixture.writes();
+      const again = ledger.claim(holder);
+      expect(handedOver(again.allowed ? again.value : null).claimed).toBeNull();
+      expect(harness.cp.outbox.claimForHolder(holder, () => true).claimed).toEqual([]);
+      expect(fixture.writes()).toBe(before);
+
+      const successor = await restart(fixture, 2);
+      expect(carried(fixture)).toEqual([]);
+      expect(refusals(fixture)).toEqual([
+        [swept!.message_id, "REFUSED", "ALREADY_CLAIMED"],
+        [handled!.message_id, "REFUSED", "ALREADY_CLAIMED"],
+      ]);
+      const got = ledger.claim(fixture.holderOf(successor.sessionId));
+      expect(handedOver(got.allowed ? got.value : null).claimed).toBeNull();
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("W8 renaming a departed row while putting it back to PENDING is refused; the original is still not handed over or carried", async () => {
+    const fixture = await startFixture();
+    const external = new Database(join(fixture.harness.root, "state.sqlite"));
+    try {
+      const { harness } = fixture;
+      const ledger = ownerMessageLedger(harness.cp);
+      const holder = fixture.holderOf(fixture.first.sessionId);
+      await fixture.ceoSays("새 이름으로 되살리려는 지시");
+      const [queued] = fixture.peerRows();
+      const id = queued!.message_id;
+      const renamed = `${id}_renamed`;
+      ledger.claim(holder);
+      expect(rowOf(fixture, id)).toMatchObject({ status: "SENT" });
+
+      // The status trigger does not fire on a row leaving SENT, and a new id has no departure.
+      const renameAndPutBack = `UPDATE outbox SET message_id = ?, status = 'PENDING', attempts = 0, sent_at = NULL,
+                                                   claim_token = NULL, claimed_at = NULL
+                                 WHERE message_id = ?`;
+      let refused: unknown = null;
+      try {
+        harness.cp.db.run(renameAndPutBack, [renamed, id]);
+      } catch (error) {
+        refused = error;
+      }
+
+      // Nothing under either id is handed to the holder again.
+      const again = ledger.claim(holder);
+      expect(handedOver(again.allowed ? again.value : null).claimed).toBeNull();
+      expect(harness.cp.outbox.claimForHolder(holder, () => true).claimed).toEqual([]);
+      expect(rowOf(fixture, renamed)).toBeUndefined();
+      expect(rowOf(fixture, id)).toMatchObject({ status: "SENT" });
+      expect(String(refused)).toMatch(/OUTBOX_MESSAGE_ID_IMMUTABLE/);
+
+      // The original put back by a status write alone: its departure still refuses it.
+      putBack(fixture, id);
+      const putBackAgain = ledger.claim(holder);
+      expect(handedOver(putBackAgain.allowed ? putBackAgain.value : null).claimed).toBeNull();
+      const successor = await restart(fixture, 2);
+      expect(carried(fixture)).toEqual([]);
+      expect(refusals(fixture)).toEqual([[id, "REFUSED", "ALREADY_CLAIMED"]]);
+      const got = ledger.claim(fixture.holderOf(successor.sessionId));
+      expect(handedOver(got.allowed ? got.value : null).claimed).toBeNull();
+
+      // Refused on a connection with none of ACP's pragmas too, with or without the status revert.
+      for (const sql of [renameAndPutBack, `UPDATE outbox SET message_id = ? WHERE message_id = ?`]) {
+        expect(() => external.prepare(sql).run(renamed, id)).toThrow(/OUTBOX_MESSAGE_ID_IMMUTABLE/);
+      }
+      expect(rowOf(fixture, renamed)).toBeUndefined();
+    } finally {
+      external.close();
+      await fixture.close();
+    }
+  });
+
+  describe("an owner's message put back by raw SQL is not moved to anyone either", () => {
+    const SEEDED_INCARNATION = "inc-1";
+    const seeded = () => {
+      const core = makeCore();
+      const run = seedRun({ db: core.db, clock: core.clock, repoPath: makeRepo() });
+      const holder: HolderIdentity = {
+        roleKey: run.roleKey,
+        bindingGeneration: run.generation,
+        targetSessionId: run.sessionId,
+        sessionIncarnation: SEEDED_INCARNATION,
+      };
+      const enqueue = (text: string): string => {
+        const queued = core.outbox.enqueue({
+          idempotencyKey: `owner:${crypto.randomUUID()}`,
+          roleKey: run.roleKey,
+          bindingGeneration: run.generation,
+          targetSessionId: run.sessionId,
+          runId: run.runId,
+          kind: MessageKind.OWNER_MESSAGE,
+          payload: { text },
+        });
+        if (!queued.allowed) throw new Error(`enqueue failed: ${queued.message}`);
+        return queued.value.messageId;
+      };
+      // Handed over, then put back as if nobody had been.
+      const reverted = enqueue("handed over, then put back");
+      expect(core.outbox.claimForHolder(holder).claimed.map((m) => m.messageId)).toEqual([reverted]);
+      core.db.run(
+        `UPDATE outbox SET status = 'PENDING', attempts = 0, sent_at = NULL, claim_token = NULL, claimed_at = NULL
+          WHERE message_id = ?`,
+        [reverted],
+      );
+      const fresh = enqueue("never handed over");
+      const successor = core.sessions.create({ provider: "claude", model: "successor-cto" });
+      expect(core.sessions.transition(successor.sessionId, SessionLifecycle.READY, "failover").allowed).toBe(true);
+      return { core, run, reverted, fresh, successor };
+    };
+
+    it("W1o a takeover retargets the untouched one and rejects the put-back one", () => {
+      const { core, run, reverted, fresh, successor } = seeded();
+      const moved = core.outbox.retargetOrReject(run.roleKey, run.generation, run.generation + 1, successor.sessionId);
+      expect(moved).toEqual({ retargeted: [fresh], rejected: [reverted] });
+      expect(core.outbox.get(reverted)).toMatchObject({ status: "REJECTED", bindingGeneration: run.generation });
+    });
+
+    it("W1o a runtime move re-addresses the untouched one and rejects the put-back one", () => {
+      const { core, run, reverted, fresh, successor } = seeded();
+      const moved = core.outbox.carryHolderMessagesToRuntime(run.roleKey, run.generation, run.sessionId, successor.sessionId);
+      expect(moved).toEqual({ carried: [fresh], rejected: [reverted] });
+      expect(core.outbox.get(reverted)).toMatchObject({ status: "REJECTED", targetSessionId: run.sessionId });
+    });
+  });
+});
+
+/**
+ * W6. The holder's claim and the restart's carry, on two connections to one database file: the
+ * message reaches exactly one holder — claimed and then not carried, or carried once and then
+ * refused to the old holder — never both and never twice. Both run in `BEGIN IMMEDIATE`, so a
+ * statement of one cannot land inside the other; the two "inside the window" cases start one while
+ * the other's transaction is open and show that it is refused (SQLITE_BUSY after the connection's
+ * busy timeout) rather than interleaved, and that its retry after the commit sees the decided row.
+ *
+ * The second connection is a bare `Db` and `Outbox` on the same file — one process admits a single
+ * control plane per database — and claims through `Outbox.claimForHolder` with a predicate that
+ * admits every row, so only the claim's own SQL and compare-and-set stand between it and the row.
+ */
+describe("W6 the holder's claim and the restart's carry, on two connections, hand the message to one holder once", () => {
+  /** A second connection to the same database file, as another process holds one. */
+  const secondConnection = (fixture: Fixture) => {
+    const db = openDb(join(fixture.harness.root, "state.sqlite"));
+    const outbox = new Outbox(db, fixture.harness.clock, new AuditLog(db, fixture.harness.clock));
+    return { db, outbox };
+  };
+  type Other = ReturnType<typeof secondConnection>;
+  const CARRY_WRITE = /^\s*UPDATE outbox SET binding_generation = \?, target_session_id = \?, reason_code = \?/;
+  const CLAIM_WRITE = /^\s*UPDATE outbox SET status = 'SENT', sent_at = \?, attempts = attempts \+ 1/;
+  /** Every hand-over either connection made, by message and holder session. */
+  const handOvers: Array<{ messageId: string; to: string }> = [];
+  /** The holder's claim on the restart's own connection, through the real hand-over. */
+  const takeHere = (fixture: Fixture, holder: HolderIdentity): string | null => {
+    const taken = ownerMessageLedger(fixture.harness.cp).claim(holder);
+    const claimed = handedOver(taken.allowed ? taken.value : null)?.claimed?.messageId ?? null;
+    if (claimed) handOvers.push({ messageId: claimed, to: holder.targetSessionId });
+    return claimed;
+  };
+  /** The holder's claim on the other connection. */
+  const takeThere = (other: Other, holder: HolderIdentity): string | null => {
+    const claimed = other.outbox.claimForHolder(holder, () => true).claimed[0]?.messageId ?? null;
+    if (claimed) handOvers.push({ messageId: claimed, to: holder.targetSessionId });
+    return claimed;
+  };
+  const exactlyOnce = (fixture: Fixture, messageId: string, to: string, carriedOnce: boolean) => {
+    expect(handOvers.filter((h) => h.messageId === messageId)).toEqual([{ messageId, to }]);
+    expect(fixture.carries().filter((carry) => carry.outcome === "CARRIED").map((carry) => carry.message_id))
+      .toEqual(carriedOnce ? [messageId] : []);
+  };
+
+  it("claim first, on the other connection: the holder has it, the restart does not carry it", async () => {
+    handOvers.length = 0;
+    const fixture = await startFixture();
+    const other = secondConnection(fixture);
+    try {
+      await fixture.ceoSays("다른 연결이 먼저 받는 지시");
+      const [queued] = fixture.peerRows();
+      expect(takeThere(other, fixture.holderOf(fixture.first.sessionId))).toBe(queued!.message_id);
+      const successor = await restart(fixture, 2);
+      expect(fixture.peerRows()[0]).toMatchObject({ status: "REJECTED", binding_generation: 1 });
+      expect(takeHere(fixture, fixture.holderOf(successor.sessionId))).toBeNull();
+      expect(takeThere(other, fixture.holderOf(successor.sessionId))).toBeNull();
+      exactlyOnce(fixture, queued!.message_id, fixture.first.sessionId, false);
+    } finally {
+      other.db.close();
+      await fixture.close();
+    }
+  });
+
+  it("carry first: the old holder's claim on the other connection is refused, the successor has it once", async () => {
+    handOvers.length = 0;
+    const fixture = await startFixture();
+    const other = secondConnection(fixture);
+    try {
+      await fixture.ceoSays("먼저 옮겨지는 지시");
+      const [queued] = fixture.peerRows();
+      const successor = await restart(fixture, 2);
+      const carriedRows = fixture.peerRows();
+      expect(takeThere(other, fixture.holderAt(fixture.first.sessionId, 1))).toBeNull();
+      expect(fixture.peerRows()).toEqual(carriedRows);
+      expect(takeThere(other, fixture.holderOf(successor.sessionId))).toBe(queued!.message_id);
+      expect(takeHere(fixture, fixture.holderOf(successor.sessionId))).toBeNull();
+      exactlyOnce(fixture, queued!.message_id, successor.sessionId, true);
+    } finally {
+      other.db.close();
+      await fixture.close();
+    }
+  });
+
+  it("the old holder's claim started inside the carry's transaction is refused, not interleaved; the carry wins once", async () => {
+    handOvers.length = 0;
+    const fixture = await startFixture();
+    const other = secondConnection(fixture);
+    try {
+      await fixture.ceoSays("옮겨지는 도중에 받으려는 지시");
+      const [queued] = fixture.peerRows();
+      const oldHolder = fixture.holderAt(fixture.first.sessionId, 1);
+      const { db } = fixture.harness.cp;
+      const run = db.run.bind(db);
+      let inside: { claimed: string | null } | { error: unknown } | null = null;
+      const spy = vi.spyOn(db, "run").mockImplementation(((sql: string, params: unknown[] = []) => {
+        if (inside === null && CARRY_WRITE.test(sql)) {
+          // The carry has read the row and holds the write lock; the other connection claims now.
+          try {
+            inside = { claimed: takeThere(other, oldHolder) };
+          } catch (error) {
+            inside = { error };
+          }
+        }
+        return run(sql, params);
+      }) as typeof db.run);
+      let successor: Awaited<ReturnType<typeof restart>>;
+      try {
+        successor = await restart(fixture, 2);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(inside).not.toBeNull();
+      expect(inside).toHaveProperty("error");
+      expect(String((inside as unknown as { error: unknown }).error)).toMatch(/locked|busy/i);
+      expect(takeThere(other, oldHolder)).toBeNull();
+      expect(takeThere(other, fixture.holderOf(successor.sessionId))).toBe(queued!.message_id);
+      expect(takeHere(fixture, fixture.holderOf(successor.sessionId))).toBeNull();
+      exactlyOnce(fixture, queued!.message_id, successor.sessionId, true);
+    } finally {
+      other.db.close();
+      await fixture.close();
+    }
+  });
+
+  it("a restart started inside the old holder's claim transaction does not carry what that claim took", async () => {
+    handOvers.length = 0;
+    const fixture = await startFixture();
+    const other = secondConnection(fixture);
+    try {
+      await fixture.ceoSays("받는 도중에 재시작이 끼어드는 지시");
+      const [queued] = fixture.peerRows();
+      const run = other.db.run.bind(other.db);
+      let restarting: Promise<unknown> | null = null;
+      const spy = vi.spyOn(other.db, "run").mockImplementation(((sql: string, params: unknown[] = []) => {
+        if (restarting === null && CLAIM_WRITE.test(sql)) {
+          // The claim has chosen the row and holds the write lock; the restart begins now.
+          fixture.harness.clock.advance(60_000);
+          restarting = fixture.claimAs(2).then((claimed) => claimed, (error: unknown) => ({ error }));
+        }
+        return run(sql, params);
+      }) as typeof other.db.run);
+      try {
+        expect(takeThere(other, fixture.holderOf(fixture.first.sessionId))).toBe(queued!.message_id);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(restarting).not.toBeNull();
+      const first = (await restarting!) as { allowed?: boolean };
+      // Either the restart's transaction ran after the claim committed, or it was refused while the
+      // claim held the lock and is run again now. Either way it sees the row the claim took.
+      const successorSessionId = first.allowed === true
+        ? fixture.harness.cp.bindings.active(fixture.ctoRoleKey)!.sessionId
+        : (await restart(fixture, 2)).sessionId;
+      expect(successorSessionId).not.toBe(fixture.first.sessionId);
+      expect(fixture.peerRows()[0]).toMatchObject({ status: "REJECTED", binding_generation: 1 });
+      expect(takeHere(fixture, fixture.holderOf(successorSessionId))).toBeNull();
+      expect(takeThere(other, fixture.holderOf(successorSessionId))).toBeNull();
+      exactlyOnce(fixture, queued!.message_id, fixture.first.sessionId, false);
+    } finally {
+      other.db.close();
+      await fixture.close();
     }
   });
 });
