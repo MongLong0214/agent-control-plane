@@ -168,6 +168,30 @@ export const HOLDER_CLAIMED_KIND_SQL = [...HOLDER_CLAIMED_KINDS]
 const neverDepartedSql = (alias: string): string =>
   `NOT EXISTS (SELECT 1 FROM holder_message_departures departed WHERE departed.message_id = ${alias}.message_id)`;
 
+/** Why an admitted event is spent, as `holder_message_source_departures` records it. */
+export type SourceSpentReason = "MESSAGE_DEPARTED" | "TURN_TERMINAL";
+
+/**
+ * The admitted event the row `alias` points at was never spent for any of `reasons` (review finding
+ * 01, round 2). A departure keyed by the message id does not see the same event queued again under a
+ * new id — a claimed row deleted and its pointer re-inserted, or the pointer copied beside the
+ * original — so every path that checks `neverDepartedSql` checks this too, keyed by the event itself.
+ * The pointer is read as `outbox_holder_message_source_departs` reads it; a row with no Buzz pointer
+ * names no event and is not held back by this. The reasons are module constants, never caller input.
+ */
+export const sourceNeverSpentSql = (alias: string, reasons: readonly SourceSpentReason[]): string =>
+  `NOT EXISTS (SELECT 1 FROM holder_message_source_departures spent
+    WHERE spent.source_channel = 'buzz'
+      AND spent.reason IN (${reasons.map((reason) => `'${reason.replace(/'/g, "''")}'`).join(", ")})
+      AND spent.source_nonce = (CASE WHEN json_valid(${alias}.payload_json) = 1
+        THEN CASE WHEN json_extract(${alias}.payload_json, '$.sourceChannel') = 'buzz'
+                  THEN json_extract(${alias}.payload_json, '$.sourceNonce') END END))`;
+
+/** A hand-over refuses an event an earlier message already took out of PENDING. */
+const HANDED: readonly SourceSpentReason[] = ["MESSAGE_DEPARTED"];
+/** The restart's carry also refuses an event whose turn ever held a terminal fact. */
+const HANDED_OR_TERMINAL: readonly SourceSpentReason[] = ["MESSAGE_DEPARTED", "TURN_TERMINAL"];
+
 /**
  * The outward, role-level kinds an adopted canonical CTO receives in band rather than over Buzz.
  *
@@ -386,6 +410,12 @@ export class Outbox {
       [messageId],
     );
     if (!claim) return allow(ReasonCode.OK, undefined);
+    // A fence does not decide the turn (ACP-RESTART-03), and a turn whose first terminal fact is on
+    // record is decided, however its claim JSON reads now (review finding 01, round 2): the fence
+    // takes the row out of the queue and writes nothing beside that record.
+    if (by === "FENCE" && this.#sourceSpent(claim.channel, claim.nonce, ["TURN_TERMINAL"])) {
+      return allow(ReasonCode.OK, undefined);
+    }
     return this.settlement.completeNoReplyAndResolveTurn(claim.channel, claim.nonce, {
       keepSettled: by === "FENCE",
     });
@@ -693,7 +723,8 @@ export class Outbox {
       // handed over at all (#1044) — and it decides before anything below writes. A withheld row is
       // skipped, so one stale peer message does not stop the owner's messages queued behind it.
       const queued = this.db.all<RawOutbox & { never_departed: number }>(
-        `SELECT o.*, ${neverDepartedSql("o")} AS never_departed FROM outbox o
+        `SELECT o.*, (${neverDepartedSql("o")} AND ${sourceNeverSpentSql("o", HANDED)}) AS never_departed
+           FROM outbox o
           WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
             AND o.status = 'PENDING'
             AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
@@ -744,7 +775,8 @@ export class Outbox {
             AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
             AND role_key = ? AND binding_generation = ? AND target_session_id = ?
             AND ${exactHolderTarget("outbox")}
-            AND ${neverDepartedSql("outbox")}`,
+            AND ${neverDepartedSql("outbox")}
+            AND ${sourceNeverSpentSql("outbox", HANDED)}`,
         [
           now,
           candidate.message_id,
@@ -1471,7 +1503,8 @@ export class Outbox {
       // statement either (review finding 01), so the set it asserts also includes *this row never
       // left PENDING*; a row that did falls through to the same reject.
       const carriedOnce = holderClaimed
-        ? ` AND (reason_code IS NULL OR reason_code <> ?) AND ${neverDepartedSql("outbox")}`
+        ? ` AND (reason_code IS NULL OR reason_code <> ?) AND ${neverDepartedSql("outbox")}
+             AND ${sourceNeverSpentSql("outbox", HANDED)}`
         : "";
       const moved = retargetable
         ? this.db.run(
@@ -1641,7 +1674,8 @@ export class Outbox {
               WHERE message_id = ? AND status = 'PENDING' AND kind = ?
                 AND role_key = ? AND binding_generation = ? AND target_session_id = ?
                 AND attempts = 0 AND sent_at IS NULL AND claim_token IS NULL
-                AND ${neverDepartedSql("outbox")}`,
+                AND ${neverDepartedSql("outbox")}
+                AND ${sourceNeverSpentSql("outbox", HANDED_OR_TERMINAL)}`,
             [
               toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id, row.kind,
               roleKey, fromGeneration, fromSessionId,
@@ -1695,6 +1729,16 @@ export class Outbox {
     return this.db.get<{ present: number }>(
       `SELECT 1 AS present FROM peer_message_carries WHERE message_id = ? AND outcome = 'CARRIED'`,
       [messageId],
+    ) !== undefined;
+  }
+
+  /** Whether this admitted event was spent for any of `reasons`: `sourceNeverSpentSql`, as a read. */
+  #sourceSpent(channel: string, nonce: string, reasons: readonly SourceSpentReason[]): boolean {
+    return this.db.get<{ present: number }>(
+      `SELECT 1 AS present FROM holder_message_source_departures
+        WHERE source_channel = ? AND source_nonce = ?
+          AND reason IN (${reasons.map((reason) => `'${reason.replace(/'/g, "''")}'`).join(", ")})`,
+      [channel, nonce],
     ) !== undefined;
   }
 
@@ -1862,6 +1906,11 @@ export class Outbox {
     if (row.reason_code === ReasonCode.OUTBOX_RETARGETED) return PeerMessageCarryRefusal.DIFFERENT_LINEAGE;
     const pointer = ownerMessagePointerOf(readPayload(row.payload_json));
     if (!pointer) return PeerMessageCarryRefusal.SOURCE_UNREADABLE;
+    // The event itself, whatever row points at it now (review finding 01, round 2): handed over under
+    // another message id, or answered — a terminal fact the claim JSON below can have lost since.
+    if (this.#sourceSpent(pointer.sourceChannel, pointer.sourceNonce, HANDED_OR_TERMINAL)) {
+      return PeerMessageCarryRefusal.ALREADY_CLAIMED;
+    }
     const source = this.db.get<{ payload_json: string | null; turn_claim_json: string | null }>(
       `SELECT payload_json, turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
       [pointer.sourceChannel, pointer.sourceNonce],
@@ -1960,7 +2009,8 @@ export class Outbox {
                   WHERE message_id = ? AND status = 'PENDING'
                     AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
                     AND role_key = ? AND binding_generation = ? AND target_session_id = ?
-                    AND ${neverDepartedSql("outbox")}`,
+                    AND ${neverDepartedSql("outbox")}
+                    AND ${sourceNeverSpentSql("outbox", HANDED)}`,
                 [toSessionId, row.message_id, roleKey, bindingGeneration, fromSessionId],
               ).changes
             : 0;

@@ -132,9 +132,9 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- CP-HI-06 — an owner reply's recorded intent \(#1036, R1056-02\) is found by its key alone[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_owner_reply_key_immutable[\s\S]*?\nEND;/,
   // v40 alone creates the peer-message carry record and its guards (ACP-PEER-SUCCESSION-01), the refusal
   // notices beside them (ACP-RESTART-04), and the holder-message departures with their trigger (finding 01).
-  /-- -{75}\n-- peer_message_carries[\s\S]*?CREATE TRIGGER IF NOT EXISTS holder_message_departures_no_delete[\s\S]*?\nEND;/,
-  // v40 alone installs the Buzz source key guard (ACP-RESTART-02).
-  /-- CP-HI-06 — a Buzz event's admitted row \(ACP-RESTART-02, schema v40\)[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_buzz_source_key_immutable[\s\S]*?\nEND;/,
+  /-- -{75}\n-- peer_message_carries[\s\S]*?CREATE TRIGGER IF NOT EXISTS holder_message_source_departures_no_delete[\s\S]*?\nEND;/,
+  // v40 alone installs the Buzz source key guard (ACP-RESTART-02) and the turn-terminal records (finding 01).
+  /-- CP-HI-06 — a Buzz event's admitted row \(ACP-RESTART-02, schema v40\)[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_turn_terminal_departs_on_insert[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -2691,23 +2691,34 @@ const V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES: readonly string[] = [
   "holder_message_departures_no_replace",
   "holder_message_departures_immutable",
   "holder_message_departures_no_delete",
+  "outbox_departed_no_delete",
+  "outbox_holder_message_source_departs",
+  "inbound_messages_turn_terminal_departs",
+  "inbound_messages_turn_terminal_departs_on_insert",
+  "holder_message_source_departures_no_replace",
+  "holder_message_source_departures_immutable",
+  "holder_message_source_departures_no_delete",
 ];
 
 /** v40's three record tables, and the index each has beyond its key, read from schema.sql by pattern. */
 const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index?: RegExp }> = [
   {
     name: "peer_message_carries",
-    table: /CREATE TABLE IF NOT EXISTS peer_message_carries \([\s\S]*?\n\);/,
+    table: /CREATE TABLE IF NOT EXISTS peer_message_carries \([\s\S]*?\n\) WITHOUT ROWID;/,
     index: /CREATE INDEX IF NOT EXISTS peer_message_carries_by_successor[^;]*;/,
   },
   {
     name: "peer_message_refusal_notices",
-    table: /CREATE TABLE IF NOT EXISTS peer_message_refusal_notices \([\s\S]*?\n\);/,
+    table: /CREATE TABLE IF NOT EXISTS peer_message_refusal_notices \([\s\S]*?\n\) WITHOUT ROWID;/,
     index: /CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role[^;]*;/,
   },
   {
     name: "holder_message_departures",
-    table: /CREATE TABLE IF NOT EXISTS holder_message_departures \([\s\S]*?\n\);/,
+    table: /CREATE TABLE IF NOT EXISTS holder_message_departures \([\s\S]*?\n\) WITHOUT ROWID;/,
+  },
+  {
+    name: "holder_message_source_departures",
+    table: /CREATE TABLE IF NOT EXISTS holder_message_source_departures \([\s\S]*?\n\) WITHOUT ROWID;/,
   },
 ];
 
@@ -2733,7 +2744,14 @@ const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index?: Re
  * already put back. A departure names its message by id, so v40 also fixes an outbox row's id once
  * written: renamed, a departed row would read as one with no departure.
  *
- * Additive: three new tables, an index on two of them, fourteen triggers, and the backfill rows in the
+ * Round-2 review of finding 01: three more ways around a record keyed by the message id. The record
+ * tables are WITHOUT ROWID, so a REPLACE through a hidden rowid cannot delete one. A row that ever
+ * left PENDING cannot be deleted, and the event it pointed at is recorded as spent in a second
+ * append-only table keyed by the event, so a pointer queued again under a new id is refused. The
+ * same table records the first terminal fact of the event's turn, which the restart's carry reads
+ * instead of a claim JSON an ordinary statement can edit.
+ *
+ * Additive: four new tables, an index on two of them, twenty-one triggers, and the backfill rows in the
  * new departure table; no existing row or object is changed, so every v39 row is kept as it is. A
  * queued peer message written before this has no record and is carried by nothing until a v40
  * restart decides it.
@@ -2780,6 +2798,29 @@ const v40: SchemaMigration = {
     raw.exec(`INSERT INTO holder_message_departures (message_id, from_status, to_status, departed_at, basis)
       SELECT message_id, NULL, status, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'BACKFILL' FROM outbox
        WHERE status <> 'PENDING'`);
+    // And every event such a row pointed at, once, and every Buzz event whose turn already holds a
+    // terminal fact. The pointer and the facts are read as the triggers above read them.
+    raw.exec(`INSERT INTO holder_message_source_departures
+        (source_channel, source_nonce, reason, message_id, recorded_at, basis)
+      SELECT 'buzz', nonce, 'MESSAGE_DEPARTED', MIN(message_id), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'BACKFILL'
+        FROM (SELECT message_id,
+                     CASE WHEN json_valid(payload_json) = 1
+                           AND json_extract(payload_json, '$.sourceChannel') = 'buzz'
+                           AND json_type(payload_json, '$.sourceNonce') = 'text'
+                          THEN json_extract(payload_json, '$.sourceNonce') END AS nonce
+                FROM outbox WHERE status <> 'PENDING')
+       WHERE nonce IS NOT NULL
+       GROUP BY nonce`);
+    raw.exec(`INSERT INTO holder_message_source_departures
+        (source_channel, source_nonce, reason, message_id, recorded_at, basis)
+      SELECT channel, nonce, 'TURN_TERMINAL', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'BACKFILL'
+        FROM inbound_messages
+       WHERE channel = 'buzz' AND turn_claim_json IS NOT NULL
+         AND (CASE WHEN json_valid(turn_claim_json) = 1
+                   THEN json_type(turn_claim_json, '$.repliedAt') IS NOT NULL
+                     OR json_type(turn_claim_json, '$.noReplyAt') IS NOT NULL
+                     OR json_type(turn_claim_json, '$.settledAt') IS NOT NULL
+                   ELSE 0 END) = 1`);
   },
   checksum: () => migrationChecksum("v40-peer-message-carry-record", SCHEMA_VERSION),
 };
@@ -2947,6 +2988,14 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "holder_message_departures_no_replace", sentinel: "HOLDER_MESSAGE_DEPARTURE_NO_REPLACE", introducedIn: 40 },
   { name: "holder_message_departures_immutable", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
   { name: "holder_message_departures_no_delete", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
+  { name: "outbox_departed_no_delete", sentinel: "OUTBOX_DEPARTED_ROW_NO_DELETE", introducedIn: 40 },
+  // Raise nothing: as `outbox_holder_message_departs`, their load-bearing part is the write.
+  { name: "outbox_holder_message_source_departs", sentinel: "INSERT INTO holder_message_source_departures", introducedIn: 40 },
+  { name: "inbound_messages_turn_terminal_departs", sentinel: "INSERT INTO holder_message_source_departures", introducedIn: 40 },
+  { name: "inbound_messages_turn_terminal_departs_on_insert", sentinel: "INSERT INTO holder_message_source_departures", introducedIn: 40 },
+  { name: "holder_message_source_departures_no_replace", sentinel: "HOLDER_MESSAGE_SOURCE_DEPARTURE_NO_REPLACE", introducedIn: 40 },
+  { name: "holder_message_source_departures_immutable", sentinel: "HOLDER_MESSAGE_SOURCE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
+  { name: "holder_message_source_departures_no_delete", sentinel: "HOLDER_MESSAGE_SOURCE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 

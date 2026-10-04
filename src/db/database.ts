@@ -1340,6 +1340,10 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   HOLDER_MESSAGE_DEPARTURE_IMMUTABLE: ReasonCode.CONFLICT,
   // and the outbox row's id, which names the departure, is fixed once written.
   OUTBOX_MESSAGE_ID_IMMUTABLE: ReasonCode.CONFLICT,
+  // A row that left PENDING is not deleted, and the event a departed row pointed at stays spent.
+  OUTBOX_DEPARTED_ROW_NO_DELETE: ReasonCode.CONFLICT,
+  HOLDER_MESSAGE_SOURCE_DEPARTURE_NO_REPLACE: ReasonCode.CONFLICT,
+  HOLDER_MESSAGE_SOURCE_DEPARTURE_IMMUTABLE: ReasonCode.CONFLICT,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

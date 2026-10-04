@@ -17,7 +17,7 @@ import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-prefl
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { isClean, tryRevParse } from "../git/git.ts";
-import { HOLDER_CLAIMED_KIND_SQL, type Outbox } from "../outbox/outbox.ts";
+import { HOLDER_CLAIMED_KIND_SQL, type Outbox, sourceNeverSpentSql } from "../outbox/outbox.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -1624,11 +1624,13 @@ export class Doctor {
     // back by a statement no product path makes. The hand-over, the carry and every retarget refuse
     // it, so it stays PENDING with nothing to take it — named here rather than left looking like an
     // ordinary queued message. Holder-claimed kinds only: the ledger records every kind, and a
-    // generic row a retry or a lease reclaim returns to PENDING is doing what it should.
+    // generic row a retry or a lease reclaim returns to PENDING is doing what it should. So is a row
+    // pointing at an event another message already took out of PENDING: the same event queued again.
     const returned = this.db.all<{ message_id: string }>(
       `SELECT o.message_id FROM outbox o
-         JOIN holder_message_departures d ON d.message_id = o.message_id
         WHERE o.status = 'PENDING' AND o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
+          AND (EXISTS (SELECT 1 FROM holder_message_departures d WHERE d.message_id = o.message_id)
+               OR NOT ${sourceNeverSpentSql("o", ["MESSAGE_DEPARTED"])})
         ORDER BY o.created_at, o.rowid`,
     );
     if (returned.length > 0) {
