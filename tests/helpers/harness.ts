@@ -299,8 +299,10 @@ export const makeStartedOperator = async (options: {
 export const bindWorkerForTask = (
   controlPlane: Pick<ControlPlane, "sessions" | "bindings">,
   taskId: string,
+  /** The worker session's own provider and model, which a worker receipt is admitted under. */
+  identity: { provider: string; model: string } = { provider: "scripted", model: "scripted-worker" },
 ): string => {
-  const session = controlPlane.sessions.create({ provider: "scripted", model: "scripted-worker" });
+  const session = controlPlane.sessions.create(identity);
   const ready = controlPlane.sessions.transition(session.sessionId, SessionLifecycle.READY, "test worker");
   if (!ready.allowed) throw new Error(`worker session readiness failed: ${ready.message}`);
   const bound = controlPlane.bindings.bind({
@@ -312,8 +314,11 @@ export const bindWorkerForTask = (
   return session.sessionId;
 };
 
-export const bindWorker = (harness: Harness, taskId: string): string =>
-  bindWorkerForTask(harness.cp, taskId);
+export const bindWorker = (
+  harness: Harness,
+  taskId: string,
+  identity?: { provider: string; model: string },
+): string => bindWorkerForTask(harness.cp, taskId, identity);
 
 /**
  * Work happens on a task branch cut from the base, exactly as the branch contract

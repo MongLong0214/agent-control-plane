@@ -76,6 +76,15 @@ export interface ExecutionStart {
   harnessDigest?: string | null;
 }
 
+/**
+ * A worker receipt names its session. Provider and model are that session's: the receipt may omit
+ * them, and a receipt that states either must state the session's own (#512).
+ */
+export type WorkerExecutionStart = Omit<ExecutionStart, "provider" | "model"> & {
+  provider?: string | undefined;
+  model?: string | undefined;
+};
+
 export interface ExecutionOutcome {
   status: "SUCCEEDED" | "FAILED" | "ABANDONED" | "TIMEOUT";
   resultDigest?: string | null;
@@ -298,6 +307,18 @@ export class TaskGraph {
   }
 
   startExecution(input: ExecutionStart): Decision<ExecutionRecord> {
+    return this.recordExecution(input, null);
+  }
+
+  /**
+   * `admitted` is the worker identity capacity admitted, when this records a worker execution: it
+   * is read again here, inside the transaction that records it, and the labels written are that
+   * identity's, so what was admitted and what is recorded cannot differ.
+   */
+  private recordExecution(
+    input: ExecutionStart,
+    admitted: { provider: string; model: string } | null,
+  ): Decision<ExecutionRecord> {
     return this.db.tx(() => {
       const task = this.get(input.taskId);
       if (!task) return deny(ReasonCode.NOT_FOUND, "unknown task", { taskId: input.taskId });
@@ -311,6 +332,10 @@ export class TaskGraph {
       }
       const workerBinding = this.assertLiveWorkerBinding(input);
       if (!workerBinding.allowed) return workerBinding as Decision<ExecutionRecord>;
+      if (admitted) {
+        const identity = this.workerIdentity({ ...input, ...admitted });
+        if (!identity.allowed) return identity as Decision<ExecutionRecord>;
+      }
       if (task.state !== TaskState.READY && task.state !== TaskState.FAILED) {
         return deny(
           ReasonCode.TASK_DEPENDENCY_UNSATISFIED,
@@ -433,17 +458,57 @@ export class TaskGraph {
    * the synchronous receipt primitive used by tests and recovery import; the MCP worker
    * allocator is deliberately routed only through this admission method.
    */
-  async startWorkerExecution(input: ExecutionStart): Promise<Decision<ExecutionRecord>> {
+  async startWorkerExecution(input: WorkerExecutionStart): Promise<Decision<ExecutionRecord>> {
     // Do not ask capacity to allocate a worker whose durable identity is already invalid.
     // `startExecution` repeats this check inside its transaction after the async probe.
     const workerBinding = this.assertLiveWorkerBinding(input);
     if (!workerBinding.allowed) return workerBinding as Decision<ExecutionRecord>;
-    const capacity = await this.admitWorkerFanout(input.provider, input.model, {
+    // #512 — capacity is admitted for the provider and model the bound session runs, never for
+    // ones the receipt names: a receipt could otherwise spend another provider's quota, or none
+    // that was probed, on this worker.
+    const identity = this.workerIdentity(input);
+    if (!identity.allowed) return identity as Decision<ExecutionRecord>;
+    const capacity = await this.admitWorkerFanout(identity.value.provider, identity.value.model, {
       runId: input.runId,
       taskId: input.taskId,
     });
     if (!capacity.allowed) return capacity as Decision<ExecutionRecord>;
-    return this.startExecution(input);
+    return this.recordExecution({ ...input, ...identity.value }, identity.value);
+  }
+
+  /**
+   * The provider and model a worker execution is admitted and recorded under: the bound worker
+   * session's own. A receipt that states either must state the session's.
+   */
+  private workerIdentity(
+    input: Pick<WorkerExecutionStart, "runId" | "taskId" | "workerSessionId" | "provider" | "model">,
+  ): Decision<{ provider: string; model: string }> {
+    const session = this.db.get<{ provider: string; model: string }>(
+      `SELECT provider, model FROM sessions WHERE session_id = ?`,
+      [input.workerSessionId],
+    );
+    if (!session) {
+      return deny(ReasonCode.WORKER_BINDING_REQUIRED, "worker execution names an unknown session", {
+        runId: input.runId,
+        taskId: input.taskId,
+        workerSessionId: input.workerSessionId,
+      });
+    }
+    if (
+      (input.provider !== undefined && input.provider !== session.provider) ||
+      (input.model !== undefined && input.model !== session.model)
+    ) {
+      return deny(ReasonCode.CONFLICT, "the receipt names a provider or model its worker session does not run", {
+        runId: input.runId,
+        taskId: input.taskId,
+        workerSessionId: input.workerSessionId,
+        provider: input.provider ?? null,
+        model: input.model ?? null,
+        sessionProvider: session.provider,
+        sessionModel: session.model,
+      });
+    }
+    return allow(ReasonCode.OK, { provider: session.provider, model: session.model });
   }
 
   /**

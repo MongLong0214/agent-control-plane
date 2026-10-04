@@ -167,7 +167,7 @@ const startWorkerFanoutWith = async (remainingPercent: number) => {
       ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
       workerSessionId,
       provider: "scripted",
-      model: "worker",
+      model: "scripted-worker",
       repositoryId,
       concurrencyWidth: 2,
     }),

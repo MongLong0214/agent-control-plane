@@ -389,8 +389,8 @@ export class CapacityMonitor {
   // Deliberately not persisted: provider-global rows cannot represent role provenance.
   readonly #roleSnapshots = new WeakMap<RoleCapacityBinding, CapacityReading>();
   /**
-   * #512 — the §14.5 burn source for a role binding: its own successive real probe readings,
-   * bounded to the newest `ROLE_HISTORY_LIMIT`. A role-scoped provider has no other: its readings
+   * #512 — the §14.5 burn source for a role binding: its own successive real probe readings that
+   * enrichment judged HEALTHY, bounded to the newest `ROLE_HISTORY_LIMIT`. A role-scoped provider has no other: its readings
    * never reach `capacity_snapshots`, and rows a provider wrote there before it became role-scoped
    * must not stand in for this binding. In memory and keyed by the registration, so a restart or
    * an invalidated binding starts it empty, and burn is unknown until two readings exist.
@@ -417,12 +417,21 @@ export class CapacityMonitor {
       return this.unknownRoleCapacity(provider, role);
     }
     this.#roleSnapshots.set(binding, structuredClone(reading));
-    // One entry per observation, as `capacity_snapshots`' (provider, bucket, observed_at) key keeps
-    // one row per observation: a collector answering the same observation twice replaces it.
-    const history = (this.#roleHistory.get(binding) ?? []).filter((entry) => entry.observedAt !== reading.observedAt);
-    history.push(structuredClone(reading));
-    this.#roleHistory.set(binding, history.slice(-ROLE_HISTORY_LIMIT));
-    return this.roleCapacity(binding, reading);
+    const measured = this.roleCapacity(binding, reading);
+    // Only an observation the monitor itself accepts as current is burn evidence: judged after
+    // enrichment, so a reading the sensor marked ERROR, one dated beyond the clock-skew allowance
+    // (enrichment turns it into ERROR), and one already older than the freshness window (STALE)
+    // never enter. Its timestamp is the normalized one, so a permitted clock lead cannot sit in
+    // the future of every later reading.
+    if (measured.sensorHealth === "HEALTHY") {
+      // One entry per observation, as `capacity_snapshots`' (provider, bucket, observed_at) key
+      // keeps one row per observation: a collector answering the same observation twice replaces it.
+      const observation: CapacityReading = structuredClone({ ...reading, observedAt: measured.observedAt });
+      const history = (this.#roleHistory.get(binding) ?? []).filter((entry) => entry.observedAt !== observation.observedAt);
+      history.push(observation);
+      this.#roleHistory.set(binding, history.slice(-ROLE_HISTORY_LIMIT));
+    }
+    return measured;
   }
 
   currentForRole(provider: string, role: Role): RoleProviderCapacity | null {

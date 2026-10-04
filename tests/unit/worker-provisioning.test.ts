@@ -15,7 +15,8 @@ import {
   TaskState,
   roleKeyFor,
 } from "../../src/domain/types.ts";
-import { CapacityMonitor } from "../../src/capacity/capacity-monitor.ts";
+import { CapacityMonitor, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
+import { sha256 } from "../../src/core/digest.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { CapacityReading, SessionHandle, SessionSpec } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -266,8 +267,9 @@ const claimLaunchedCredential = (socketPath: string, externalSessionId: string) 
 /** A dispatched run owned by a launched CTO connected to its socket, and one READY task. */
 interface FixtureOptions {
   /**
-   * Whether one real WORKER reading is taken before the row runs (default true). With it, the
-   * admission probe is the second reading and the window's burn is measured.
+   * Whether one real, fresh WORKER reading (81%, three minutes old) is taken before the row runs
+   * (default true). With it, the admission probe is the second reading and the window's burn is
+   * measured.
    */
   primeReading?: boolean;
   /** Rows left in `capacity_snapshots` from before Claude was role-scoped. */
@@ -297,7 +299,7 @@ const staffingFixture = async (options: FixtureOptions = {}) => {
   for (const role of CTO_ROLES) harness.cp.providers.registerForRole(claude, role);
   claude.setCapacity(claudeReading(harness));
   if (options.pre917Rows) seedPre917ClaudeRows(harness, options.pre917Rows);
-  if (options.primeReading !== false) await takeWorkerReading(harness, claude, claudeReadingAt(harness, 81, 30));
+  if (options.primeReading !== false) await takeWorkerReading(harness, claude, claudeReadingAt(harness, 81, 3));
   // Rows below count the probes *they* cause.
   claude.capacityProbes = 0;
 
@@ -793,7 +795,7 @@ describe("W6: the WORKER binding refuses a session that is not independent", () 
 
 describe("B1: a Claude worker is admitted against the WORKER role's own Claude capacity", () => {
   const startClaudeWorker = async (f: Fixture) => {
-    const workerSessionId = bindWorker(f.harness, f.taskId);
+    const workerSessionId = bindWorker(f.harness, f.taskId, { provider: "claude", model: "opus" });
     return f.harness.cp.tasks.startWorkerExecution({
       runId: f.runId,
       taskId: f.taskId,
@@ -888,7 +890,7 @@ describe("P1/P2: a Claude WORKER's burn is its own binding's in-memory readings,
     await withFixture(async (f) => {
       // 90% in the window that has since reset, 80% in the current one: the drop is not burn.
       const previousWindow = new Date(f.harness.clock.now().getTime() - 60 * 1000).toISOString();
-      await takeWorkerReading(f.harness, f.claude, claudeReadingAt(f.harness, 90, 30, previousWindow));
+      await takeWorkerReading(f.harness, f.claude, claudeReadingAt(f.harness, 90, 3, previousWindow));
       conserve(await f.provision());
       expectNothingSpawned(f, 0);
     }, { primeReading: false, ...(pre917Rows ? { pre917Rows } : {}) });
@@ -896,7 +898,7 @@ describe("P1/P2: a Claude WORKER's burn is its own binding's in-memory readings,
 
   it.each([undefined, "measured"] as const)("two readings whose remaining quota rose in one window refuse (pre-#917 rows: %s)", async (pre917Rows) => {
     await withFixture(async (f) => {
-      await takeWorkerReading(f.harness, f.claude, claudeReadingAt(f.harness, 70, 30));
+      await takeWorkerReading(f.harness, f.claude, claudeReadingAt(f.harness, 70, 3));
       conserve(await f.provision());
       expectNothingSpawned(f, 0);
     }, { primeReading: false, ...(pre917Rows ? { pre917Rows } : {}) });
@@ -913,7 +915,7 @@ describe("P1/P2: a Claude WORKER's burn is its own binding's in-memory readings,
 
   it("a reading whose quota is unknown is not a burn observation; the delta spans it", async () => {
     await withFixture(async (f) => {
-      const unknown = claudeReadingAt(f.harness, 80, 10);
+      const unknown = claudeReadingAt(f.harness, 80, 1);
       await takeWorkerReading(f.harness, f.claude, { ...unknown, buckets: [{ ...unknown.buckets[0]!, remainingPercent: null }] });
       const admitted = await f.provision();
       expect(admitted.reasonCode, admitted.message).toBe(ReasonCode.OK);
@@ -929,7 +931,7 @@ describe("P1/P2: a Claude WORKER's burn is its own binding's in-memory readings,
 
   it("the demand a role-scoped provider is admitted with reads no capacity_snapshots row", async () => {
     await withFixture(async (f) => {
-      // In memory: the primed reading (81%, 30 minutes ago) and this one (80%, now) burn 2%/h. The
+      // In memory: the primed reading (81%, 3 minutes ago) and this one (80%, now) burn 20%/h. The
       // pre-#917 rows would have measured 1%/h.
       await takeWorkerReading(f.harness, f.claude, claudeReadingAt(f.harness, 80, 0));
       const all = vi.spyOn(f.harness.cp.db, "all");
@@ -939,8 +941,8 @@ describe("P1/P2: a Claude WORKER's burn is its own binding's in-memory readings,
       const read = [...all.mock.calls, ...get.mock.calls].map(([sql]) => String(sql));
       expect(read.length).toBeGreaterThan(0);
       expect(read.some((sql) => sql.includes("capacity_snapshots"))).toBe(false);
-      expect(demand.burnRatePercentPerHourByBucket?.[BUCKET]).toBeCloseTo(2, 5);
-      expect(demand.burnRatePercentPerHour).toBeCloseTo(2, 5);
+      expect(demand.burnRatePercentPerHourByBucket?.[BUCKET]).toBeCloseTo(20, 5);
+      expect(demand.burnRatePercentPerHour).toBeCloseTo(20, 5);
       expect(roleless.burnRatePercentPerHourByBucket).toEqual({});
       expect(roleless.burnRatePercentPerHour).toBeNaN();
     }, { pre917Rows: "measured" });
@@ -968,6 +970,315 @@ describe("P1/P2: a Claude WORKER's burn is its own binding's in-memory readings,
       f.harness.cp.providers.invalidateCapacityForRole("claude", Role.WORKER);
       conserve(await f.provision());
       expectNothingSpawned(f, 0);
+    });
+  });
+});
+
+/** Provisions the task's worker through the socket and answers its session id. */
+const provisionedWorker = async (f: Fixture): Promise<string> => {
+  const provisioned = await f.provision();
+  if (!provisioned.ok) throw new Error(`provisioning failed: ${provisioned.reasonCode} ${provisioned.message ?? ""}`);
+  return (provisioned.value as { workerSessionId: string }).workerSessionId;
+};
+
+const readySession = (f: Fixture, model: string): string => {
+  const session = f.harness.cp.sessions.create({ provider: "scripted", model });
+  const ready = f.harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "row");
+  if (!ready.allowed) throw new Error(ready.message);
+  return session.sessionId;
+};
+
+const registerOtherProject = (f: Fixture): string => {
+  const otherProjectId = "another-project";
+  const manifest = fixtureManifest(otherProjectId);
+  const registered = f.harness.cp.projects.register({
+    projectId: otherProjectId,
+    name: "fixture",
+    manifest,
+    authorization: f.harness.cp.manifestAuthorizationForTests(manifest),
+  });
+  if (!registered.allowed) throw new Error(registered.message);
+  return otherProjectId;
+};
+
+describe("ACP1069-R1-01: only readings the monitor accepts as current are burn evidence", () => {
+  const conserve = (body: ToolBody) => expect(body.reasonCode, body.message).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+
+  it("an ERROR reading that carries quota is not an observation: the next fresh reading is the only one", async () => {
+    await withFixture(async (f) => {
+      f.claude.setCapacity({ ...claudeReadingAt(f.harness, 81, 1), sensorHealth: "ERROR", error: "collector failed" });
+      expect((await f.provision()).reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+      f.claude.setCapacity(claudeReadingAt(f.harness, 80, 0));
+      conserve(await f.provision());
+      expectNothingSpawned(f, 0);
+    }, { primeReading: false });
+  });
+
+  it("a reading dated beyond the clock-skew allowance is not an observation", async () => {
+    await withFixture(async (f) => {
+      // An hour ahead at 80%, then a fresh 81%: counted, the future row would read as the newer of
+      // the two and measure a burn of 1%/h between them.
+      f.claude.setCapacity(claudeReadingAt(f.harness, 80, -60));
+      expect((await f.provision()).reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+      f.claude.setCapacity(claudeReadingAt(f.harness, 81, 0));
+      conserve(await f.provision());
+      expectNothingSpawned(f, 0);
+    }, { primeReading: false });
+  });
+
+  it("a STALE reading is not an observation, even inside the stale grace", async () => {
+    await withFixture(async (f) => {
+      f.claude.setCapacity(claudeReadingAt(f.harness, 81, 10));
+      conserve(await f.provision());
+      f.claude.setCapacity(claudeReadingAt(f.harness, 80, 0));
+      conserve(await f.provision());
+      expectNothingSpawned(f, 0);
+    }, { primeReading: false });
+  });
+
+  it("a permitted clock lead is recorded at the normalized time, so a later reading still measures burn", async () => {
+    await withFixture(async (f) => {
+      const resetAt = resetAtFrom(f.harness);
+      // 50 seconds ahead: inside the 60-second allowance, so the monitor takes it as now.
+      await takeWorkerReading(f.harness, f.claude, claudeReadingAt(f.harness, 81, -50 / 60, resetAt));
+      f.harness.clock.advance(30_000);
+      f.claude.setCapacity(claudeReadingAt(f.harness, 80, 0, resetAt));
+      const admitted = await f.provision();
+      expect(admitted.reasonCode, admitted.message).toBe(ReasonCode.OK);
+    }, { primeReading: false });
+  });
+
+  it("provisioning a role-scoped Claude worker never runs the persisted burn query", async () => {
+    await withFixture(async (f) => {
+      const all = vi.spyOn(f.harness.cp.db, "all");
+      const get = vi.spyOn(f.harness.cp.db, "get");
+      const admitted = await f.provision();
+      expect(admitted.reasonCode, admitted.message).toBe(ReasonCode.OK);
+      const read = [...all.mock.calls, ...get.mock.calls].map(([sql]) => String(sql));
+      expect(read.length).toBeGreaterThan(0);
+      expect(read.filter((sql) => sql.includes("FROM capacity_snapshots"))).toEqual([]);
+    }, { pre917Rows: "measured" });
+  });
+});
+
+describe("ACP1069-R1-02: a WORKER and another role never share a session, in either order", () => {
+  const snapshot = (f: Fixture) => {
+    const ownerKey = f.harness.cp.runs.require(f.runId).ownerRoleKey!;
+    const workerKey = roleKeyFor(Role.WORKER, { taskId: f.taskId });
+    const owner = f.harness.cp.bindings.active(ownerKey);
+    const worker = f.harness.cp.bindings.active(workerKey);
+    const run = f.harness.cp.runs.require(f.runId);
+    return {
+      owner: owner && { sessionId: owner.sessionId, generation: owner.bindingGeneration, assignmentId: owner.assignmentId },
+      worker: worker && { sessionId: worker.sessionId, generation: worker.bindingGeneration, assignmentId: worker.assignmentId },
+      run: { owner: run.ownerSessionId, generation: run.ownerBindingGeneration },
+      assignments: f.harness.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM assignments`)?.n,
+    };
+  };
+
+  it("bind refuses PRIMARY_CTO elsewhere on a provisioned worker's session", async () => {
+    await withFixture(async (f) => {
+      const worker = await provisionedWorker(f);
+      const otherProjectId = registerOtherProject(f);
+      const before = snapshot(f);
+      const refused = f.harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: otherProjectId, sessionId: worker });
+      expect(refused.reasonCode).toBe(ReasonCode.WORKER_SESSION_NOT_INDEPENDENT);
+      expect(snapshot(f)).toEqual(before);
+      expect(f.harness.cp.bindings.bySession(worker).map((binding) => binding.role)).toEqual([Role.WORKER]);
+    });
+  });
+
+  it("bind refuses the CEO on a provisioned worker's session", async () => {
+    await withFixture(async (f) => {
+      const worker = await provisionedWorker(f);
+      const before = snapshot(f);
+      const refused = f.harness.cp.bindings.bind({ role: Role.CEO, sessionId: worker });
+      expect(refused.reasonCode).toBe(ReasonCode.WORKER_SESSION_NOT_INDEPENDENT);
+      expect(snapshot(f)).toEqual(before);
+    });
+  });
+
+  it.each(["REPLACED", "SURVIVED"] as const)(
+    "switchTo(%s) refuses the run's PRIMARY_CTO onto a provisioned worker's session and leaves both bindings as they were",
+    async (conversation) => {
+      await withFixture(async (f) => {
+        const worker = await provisionedWorker(f);
+        const before = snapshot(f);
+        const refused = f.harness.cp.bindings.switchTo({
+          role: Role.PRIMARY_CTO,
+          projectId: f.projectId,
+          sessionId: worker,
+          reason: "row",
+          conversation,
+          takeover: true,
+        });
+        expect(refused.reasonCode).toBe(ReasonCode.WORKER_SESSION_NOT_INDEPENDENT);
+        expect(snapshot(f)).toEqual(before);
+        expect(before.owner?.sessionId).toBe(f.ownerSessionId);
+        expect(f.harness.cp.runs.require(f.runId).state).toBe(RunState.ACTIVE);
+      });
+    },
+  );
+
+  it("a WORKER bind that would reuse the CTO's actor, moving its runtime, is refused", async () => {
+    await withFixture(async (f) => {
+      const otherProjectId = registerOtherProject(f);
+      const target = { executorKind: "hermes", targetLocator: "cto-target", targetLocatorDigest: sha256("cto-target") };
+      const cto = readySession(f, "elsewhere-cto");
+      expect(f.harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: otherProjectId, sessionId: cto, verifiedTarget: target }).reasonCode)
+        .toBe(ReasonCode.OK);
+      const candidate = readySession(f, "worker-candidate");
+      const refused = f.harness.cp.bindings.bind({ role: Role.WORKER, taskId: f.taskId, runId: f.runId, sessionId: candidate, verifiedTarget: target });
+      expect(refused.reasonCode).toBe(ReasonCode.WORKER_SESSION_NOT_INDEPENDENT);
+      expect(f.harness.cp.bindings.activePrimaryCto(otherProjectId)?.sessionId).toBe(cto);
+      expect(workerRows(f)).toEqual([]);
+    });
+  });
+
+  it("a PRIMARY_CTO bind that would reuse a WORKER's actor, moving its runtime, is refused", async () => {
+    await withFixture(async (f) => {
+      const otherProjectId = registerOtherProject(f);
+      const target = { executorKind: "hermes", targetLocator: "worker-target", targetLocatorDigest: sha256("worker-target") };
+      const worker = readySession(f, "scripted-worker");
+      expect(f.harness.cp.bindings.bind({ role: Role.WORKER, taskId: f.taskId, runId: f.runId, sessionId: worker, verifiedTarget: target }).reasonCode)
+        .toBe(ReasonCode.OK);
+      const candidate = readySession(f, "cto-candidate");
+      const refused = f.harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: otherProjectId, sessionId: candidate, verifiedTarget: target });
+      expect(refused.reasonCode).toBe(ReasonCode.WORKER_SESSION_NOT_INDEPENDENT);
+      expect(f.harness.cp.bindings.active(roleKeyFor(Role.WORKER, { taskId: f.taskId }))?.sessionId).toBe(worker);
+      expect(f.harness.cp.bindings.activePrimaryCto(otherProjectId)).toBeNull();
+    });
+  });
+
+  it("a surviving move of an actor that already carries a WORKER and a CTO is refused", async () => {
+    await withFixture(async (f) => {
+      const otherProjectId = registerOtherProject(f);
+      const target = { executorKind: "hermes", targetLocator: "mixed-target", targetLocatorDigest: sha256("mixed-target") };
+      const cto = readySession(f, "elsewhere-cto");
+      expect(f.harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: otherProjectId, sessionId: cto, verifiedTarget: target }).reasonCode)
+        .toBe(ReasonCode.OK);
+      // A binary before this check let a WORKER reuse the CTO's actor. Reproduce that state with the
+      // check stood down for this one write (a binary without the check needs no stand-down), then restore it.
+      const registry = f.harness.cp.bindings as unknown as { assertWorkerSeparation?: () => unknown };
+      const legacy = registry.assertWorkerSeparation
+        ? vi.spyOn(registry as { assertWorkerSeparation: () => unknown }, "assertWorkerSeparation")
+          .mockReturnValue({ allowed: true, reasonCode: ReasonCode.OK, evidence: {}, value: undefined })
+        : null;
+      const mixed = readySession(f, "mixed-runtime");
+      expect(f.harness.cp.bindings.bind({ role: Role.WORKER, taskId: f.taskId, runId: f.runId, sessionId: mixed, verifiedTarget: target }).reasonCode)
+        .toBe(ReasonCode.OK);
+      legacy?.mockRestore();
+      const fresh = readySession(f, "move-target");
+      const refused = f.harness.cp.bindings.switchTo({
+        role: Role.PRIMARY_CTO, projectId: otherProjectId, sessionId: fresh, reason: "row", conversation: "SURVIVED",
+      });
+      expect(refused.reasonCode).toBe(ReasonCode.WORKER_SESSION_NOT_INDEPENDENT);
+      expect(f.harness.cp.bindings.activePrimaryCto(otherProjectId)?.sessionId).toBe(mixed);
+      expect(f.harness.cp.bindings.active(roleKeyFor(Role.WORKER, { taskId: f.taskId }))?.sessionId).toBe(mixed);
+    });
+  });
+
+  it("a session that holds PRIMARY_CTO only through a surviving runtime move cannot become a WORKER", async () => {
+    await withFixture(async (f) => {
+      const moved = readySession(f, "moved-cto-runtime");
+      expect(f.harness.cp.bindings.switchTo({
+        role: Role.PRIMARY_CTO, projectId: f.projectId, sessionId: moved, reason: "runtime moved", conversation: "SURVIVED",
+      }).reasonCode).toBe(ReasonCode.OK);
+      expect(f.harness.cp.runs.require(f.runId).ownerSessionId).toBe(f.ownerSessionId);
+      const refused = f.harness.cp.bindings.bind({ role: Role.WORKER, taskId: f.taskId, sessionId: moved });
+      expect(refused.reasonCode).toBe(ReasonCode.WORKER_SESSION_NOT_INDEPENDENT);
+      expect(workerRows(f)).toEqual([]);
+    });
+  });
+});
+
+describe("ACP1069-R1-03: a worker receipt is admitted and recorded as its session's own provider and model", () => {
+  const started = (f: Fixture, workerSessionId: string, fields: Record<string, unknown> = {}) =>
+    f.cto.call("task_receipt_submit", {
+      idempotencyKey: randomUUID(),
+      runId: f.runId,
+      taskId: f.taskId,
+      phase: "started",
+      workerSessionId,
+      repositoryId: f.repositoryId,
+      ...fields,
+    });
+
+  const recorded = (f: Fixture) => ({
+    executions: f.harness.cp.db.all<{ provider: string; model: string }>(
+      `SELECT provider, model FROM task_executions WHERE task_id = ?`,
+      [f.taskId],
+    ),
+    invocations: f.harness.cp.db.all<{ payload_json: string }>(
+      `SELECT payload_json FROM baseline_records WHERE run_id = ? AND record_kind = 'INVOCATION_STARTED'`,
+      [f.runId],
+    ).map((row) => {
+      const payload = (JSON.parse(row.payload_json) as { payload: { provider: string; requestedModel: string } }).payload;
+      return { provider: payload.provider, requestedModel: payload.requestedModel };
+    }),
+  });
+
+  it("refuses a receipt naming gpt, against measured GPT capacity, while Claude is unreadable", async () => {
+    await withFixture(async (f) => {
+      const worker = await provisionedWorker(f);
+      const gpt = new TestProductionAdapter(f.harness.clock, "gpt");
+      f.harness.cp.providers.register(gpt);
+      const resetAt = resetAtFrom(f.harness);
+      for (const [minutesAgo, remaining] of [[2, 81], [0, 80]] as const) {
+        gpt.setCapacity({
+          provider: "gpt", sensorHealth: "HEALTHY", runtimeHealth: "HEALTHY",
+          observedAt: new Date(f.harness.clock.now().getTime() - minutesAgo * 60_000).toISOString(),
+          source: "gpt-fixture",
+          buckets: [{ id: BUCKET, remainingPercent: remaining, resetAt, capabilities: ["worker"] }],
+        });
+        await f.harness.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+      }
+      f.claude.setCapacity({ ...claudeReading(f.harness), sensorHealth: "ERROR", buckets: [], error: "collector failed" });
+      const probes = f.claude.capacityProbes;
+      const refused = await started(f, worker, { provider: "gpt", model: "opus" });
+      expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
+      expect(f.claude.capacityProbes).toBe(probes);
+      expect(f.harness.cp.tasks.get(f.taskId)?.state).toBe(TaskState.READY);
+      expect(recorded(f).executions).toEqual([]);
+    });
+  });
+
+  it("refuses a receipt naming sonnet for an Opus worker session", async () => {
+    await withFixture(async (f) => {
+      const worker = await provisionedWorker(f);
+      const refused = await started(f, worker, { provider: "claude", model: "sonnet" });
+      expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
+      expect(f.harness.cp.tasks.get(f.taskId)?.state).toBe(TaskState.READY);
+      expect(recorded(f).executions).toEqual([]);
+    });
+  });
+
+  it("admits a receipt that omits provider and model as the session's claude/opus, and records those labels", async () => {
+    await withFixture(async (f) => {
+      const worker = await provisionedWorker(f);
+      const probes = f.claude.capacityProbes;
+      const accepted = await started(f, worker);
+      expect(accepted.reasonCode, accepted.message).toBe(ReasonCode.OK);
+      expect(f.claude.capacityProbes).toBe(probes + 1);
+      expect(recorded(f)).toEqual({
+        executions: [{ provider: "claude", model: "opus" }],
+        invocations: [{ provider: "claude", requestedModel: "opus" }],
+      });
+    });
+  });
+
+  it("refuses when the session's identity differs inside the recording transaction from the one admitted", async () => {
+    await withFixture(async (f) => {
+      const worker = await provisionedWorker(f);
+      f.claude.onProbeCapacity = () => {
+        f.claude.onProbeCapacity = null;
+        // No writer changes a session's model; this stands in for one that would, mid-admission.
+        f.harness.cp.db.run(`UPDATE sessions SET model = 'sonnet' WHERE session_id = ?`, [worker]);
+      };
+      const refused = await started(f, worker, { provider: "claude", model: "opus" });
+      expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
+      expect(f.harness.cp.tasks.get(f.taskId)?.state).toBe(TaskState.READY);
+      expect(recorded(f).executions).toEqual([]);
     });
   });
 });

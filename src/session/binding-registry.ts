@@ -253,10 +253,6 @@ export class BindingRegistry {
         const independence = this.assertReviewerIndependence(input.runId, input.sessionId);
         if (!independence.allowed) return independence as Decision<RoleBinding>;
       }
-      if (input.role === Role.WORKER) {
-        const independence = this.assertWorkerIndependence(input);
-        if (!independence.allowed) return independence as Decision<RoleBinding>;
-      }
 
       const generation = this.nextGeneration(roleKey);
       const assignmentId = newAssignmentId();
@@ -265,6 +261,9 @@ export class BindingRegistry {
         ? this.restoredCeoActor(input)
         : this.actorOwning(claimedTarget);
       if (!reused.allowed) return reused as Decision<RoleBinding>;
+      // A reused actor's runtime pointer moves to this session below, carrying every role it holds.
+      const separated = this.assertWorkerSeparation(input, roleKey, reused.value);
+      if (!separated.allowed) return separated as Decision<RoleBinding>;
       // Plan a new id before verification so target authentication is the last pre-write step.
       const freshCandidate = `actor:${newAssignmentId()}`;
       const provisionalActorId = reused.value ?? freshCandidate;
@@ -502,10 +501,15 @@ export class BindingRegistry {
         const independence = this.assertReviewerIndependence(input.runId, input.sessionId);
         if (!independence.allowed) return independence as Decision<RoleBinding>;
       }
-      if (input.role === Role.WORKER) {
-        const independence = this.assertWorkerIndependence(input);
-        if (!independence.allowed) return independence as Decision<RoleBinding>;
-      }
+      // A surviving conversation moves its actor's runtime pointer here, carrying every role it holds.
+      const movedActor = effectiveConversation === "SURVIVED" && current
+        ? this.db.get<{ actor_id: string }>(
+          `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+          [current.assignmentId],
+        )?.actor_id ?? null
+        : null;
+      const separated = this.assertWorkerSeparation(input, roleKey, movedActor);
+      if (!separated.allowed) return separated as Decision<RoleBinding>;
 
       // #493 — the counterpart survived, so only its runtime moves. The binding is not
       // rewritten, which is why `binding_generation` cannot advance here: there is no new row
@@ -987,32 +991,44 @@ export class BindingRegistry {
   }
 
   /**
-   * #512 — a WORKER is an implementer, never the session that routes or reviews it. Refused when
-   * the incoming session holds any active non-WORKER binding, by the binding's recorded session
-   * or by its actor's live runtime, or when it owns the task's run.
+   * #512 — a WORKER is an implementer, never the session that routes or reviews it, whichever of
+   * the two is bound first.
+   *
+   * Refused when, after this write, the incoming session would carry both an active WORKER and an
+   * active role of any other kind — counting an assignment by its recorded session or by its
+   * actor's live runtime — or when a WORKER would land on the owner of its task's run.
+   * `movedActorId` is an existing actor whose runtime pointer the write moves to the incoming
+   * session (a reused actor in `bind`, a surviving conversation in `switchTo`); every role that
+   * actor holds lands there too, so it is counted with the incoming role.
    *
    * A backstop under the worker provisioning path, which only ever binds a session it has just
-   * constituted. It does not depend on that caller: any `bind` or `switchTo` that names a WORKER
-   * is asked the same question.
+   * constituted. It does not depend on that caller: every `bind` and `switchTo` asks it.
    */
-  private assertWorkerIndependence(input: BindInput): Decision<void> {
-    const held = this.db.get<{ role_key: string; role: string }>(
+  private assertWorkerSeparation(input: BindInput, roleKey: string, movedActorId: string | null): Decision<void> {
+    const moved = movedActorId === null ? [] : this.db.all<{ role_key: string; role: Role }>(
+      `SELECT role_key, role FROM assignments WHERE actor_id = ? AND status = 'ACTIVE' ORDER BY role_key`,
+      [movedActorId],
+    );
+    const resident = this.db.all<{ role_key: string; role: Role }>(
       `SELECT a.role_key, a.role
          FROM assignments a
          LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
-        WHERE a.status = 'ACTIVE' AND a.role <> 'WORKER'
+        WHERE a.status = 'ACTIVE'
           AND (a.session_id = ? OR c.current_session_id = ?)
-        ORDER BY a.role_key
-        LIMIT 1`,
+        ORDER BY a.role_key`,
       [input.sessionId, input.sessionId],
     );
-    if (held) {
+    const together = [{ role_key: roleKey, role: input.role }, ...moved, ...resident];
+    const worker = together.find((held) => held.role === Role.WORKER);
+    const other = together.find((held) => held.role !== Role.WORKER);
+    if (worker && other) {
       return deny(
         ReasonCode.WORKER_SESSION_NOT_INDEPENDENT,
-        "a worker session must not hold another role",
-        { sessionId: input.sessionId, roleKey: held.role_key, role: held.role },
+        "a worker must not share a session with another role",
+        { sessionId: input.sessionId, roleKey: other.role_key, role: other.role, workerRoleKey: worker.role_key },
       );
     }
+    if (input.role !== Role.WORKER) return allow(ReasonCode.OK, undefined);
     const owned = this.db.get<{ run_id: string }>(
       `SELECT run_id FROM runs
         WHERE owner_session_id = ?
