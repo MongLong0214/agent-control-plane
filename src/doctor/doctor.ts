@@ -1645,6 +1645,36 @@ export class Doctor {
           "a holder-claimed message that was already handed over, settled or moved reads PENDING again; it will not be handed over or carried — find the writer that put it back",
       });
     }
+    // acp-daemon-notice/v1: a refusal notice the daemon could not deliver to the CEO, terminally —
+    // Hermes refused it, a 200 did not match, or the pinned CEO moved since its bytes were fixed. It
+    // is never retried under a new id, so this is where it becomes visible.
+    const undelivered = this.db.all<{
+      event_id: string; kind: string; message_id: string | null; failure: string; diagnostics_json: string;
+    }>(
+      `SELECT event_id, kind, message_id, failure, diagnostics_json FROM peer_message_notice_deliveries
+        WHERE entry = 'FAILED' ORDER BY created_at, event_id`,
+    );
+    if (undelivered.length > 0) {
+      findings.push({
+        code: "PEER_MESSAGE_NOTICE_DELIVERY_FAILED",
+        severity: "ERROR",
+        scope: "outbox",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          count: undelivered.length,
+          notices: undelivered.map((row) => ({
+            eventId: row.event_id,
+            kind: row.kind,
+            messageId: row.message_id,
+            failure: row.failure,
+            diagnostics: (() => { try { return JSON.parse(row.diagnostics_json) as unknown; } catch { return null; } })(),
+          })),
+        },
+        recommendedAction:
+          "the CEO was not told of these refused peer messages by the daemon; the role's next holder is still shown each one until it reports it — read the diagnostics for what Hermes refused or what the answer did not match",
+      });
+    }
     return findings;
   }
 

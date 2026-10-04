@@ -168,6 +168,18 @@ export const HOLDER_CLAIMED_KIND_SQL = [...HOLDER_CLAIMED_KINDS]
 const neverDepartedSql = (alias: string): string =>
   `NOT EXISTS (SELECT 1 FROM holder_message_departures departed WHERE departed.message_id = ${alias}.message_id)`;
 
+/**
+ * The daemon has the notice `alias` names (an OWED row of `peer_message_refusal_notices`) in hand:
+ * its delivery is in doubt or settled, and not failed (acp-daemon-notice/v1, amendment 1). Such a
+ * notice is the daemon's to tell; a holder is neither shown it nor allowed to report it.
+ */
+const daemonHoldsNoticeSql = (alias: string): string =>
+  `EXISTS (SELECT 1 FROM peer_message_notice_deliveries held
+     WHERE held.kind = 'NOTICE' AND held.entry = 'IN_DOUBT' AND held.message_id = ${alias}.message_id
+       AND held.role_key = ${alias}.role_key AND held.reason = ${alias}.reason
+       AND NOT EXISTS (SELECT 1 FROM peer_message_notice_deliveries ended
+                        WHERE ended.event_id = held.event_id AND ended.entry = 'FAILED'))`;
+
 /** Why an admitted event is spent, as `holder_message_source_departures` records it. */
 export type SourceSpentReason = "MESSAGE_DEPARTED" | "TURN_TERMINAL";
 
@@ -1827,6 +1839,8 @@ export class Outbox {
             SELECT 1 FROM peer_message_refusal_notices r
              WHERE r.message_id = n.message_id AND r.entry = 'REPORTED'
           )
+          -- One channel per notice (amendment 1): one the daemon is telling the CEO itself is not shown.
+          AND NOT ${daemonHoldsNoticeSql("n")}
         ORDER BY n.created_at, n.message_id`,
       [holder.roleKey],
     );
@@ -1859,6 +1873,18 @@ export class Outbox {
       )) {
         return allow(ReasonCode.OK, undefined);
       }
+      // One channel per notice (amendment 1). The report is the holder taking the telling on itself,
+      // made before it tells the CEO; a notice the daemon has in doubt or settled is the daemon's, and
+      // the holder must not tell it too. Decided in this transaction, which the daemon's IN_DOUBT
+      // write serializes against, so exactly one of the two claims lands.
+      if (this.db.get(
+        `SELECT 1 AS present FROM peer_message_refusal_notices n
+          WHERE n.message_id = ? AND n.entry = 'OWED' AND n.role_key = ? AND ${daemonHoldsNoticeSql("n")}`,
+        [messageId, holder.roleKey],
+      )) {
+        return deny(ReasonCode.CONFLICT,
+          "the daemon is telling the CEO about this refused peer message itself; do not tell the CEO", { messageId });
+      }
       this.#writePeerMessageNotice({
         messageId,
         entry: "REPORTED",
@@ -1873,6 +1899,153 @@ export class Outbox {
       });
       return allow(ReasonCode.OK, undefined);
     });
+  }
+
+  /**
+   * acp-daemon-notice/v1 (#1068 finding 04): every OWED refusal notice the daemon has neither settled
+   * nor failed, oldest first, whether or not any CTO holds the role — the daemon tells the CEO itself
+   * rather than waiting for a successor to. Each comes with the IN_DOUBT entry an earlier attempt
+   * wrote, whose bytes every retry resends unchanged.
+   */
+  undeliveredPeerMessageNotices(): PeerMessageNoticeDeliveryCandidate[] {
+    return this.db.all<{
+      message_id: string; role_key: string; reason: string; sender: string | null;
+      source_channel: string | null; source_nonce: string | null; created_at: string;
+      in_doubt_event_id: string | null; in_doubt_payload_digest: string | null; in_doubt_canonical_json: string | null;
+    }>(
+      `SELECT n.message_id, n.role_key, n.reason, n.sender, n.source_channel, n.source_nonce, n.created_at,
+              d.event_id AS in_doubt_event_id, d.payload_digest AS in_doubt_payload_digest,
+              d.canonical_json AS in_doubt_canonical_json
+         FROM peer_message_refusal_notices n
+         LEFT JOIN peer_message_notice_deliveries d
+           ON d.kind = 'NOTICE' AND d.message_id = n.message_id AND d.role_key = n.role_key
+          AND d.reason = n.reason AND d.entry = 'IN_DOUBT'
+        WHERE n.entry = 'OWED'
+          AND NOT EXISTS (
+            SELECT 1 FROM peer_message_notice_deliveries done
+             WHERE done.kind = 'NOTICE' AND done.message_id = n.message_id AND done.role_key = n.role_key
+               AND done.reason = n.reason AND done.entry IN ('SETTLED','FAILED'))
+          -- One channel per notice (amendment 1): a holder took this one on itself.
+          AND NOT EXISTS (
+            SELECT 1 FROM peer_message_refusal_notices r
+             WHERE r.message_id = n.message_id AND r.entry = 'REPORTED')
+        ORDER BY n.created_at, n.message_id`,
+    ).map((row) => ({
+      messageId: row.message_id,
+      roleKey: row.role_key,
+      reason: row.reason,
+      sender: row.sender,
+      sourceChannel: row.source_channel,
+      sourceNonce: row.source_nonce,
+      createdAt: row.created_at,
+      inDoubt: row.in_doubt_event_id !== null && row.in_doubt_payload_digest !== null &&
+        row.in_doubt_canonical_json !== null
+        ? { eventId: row.in_doubt_event_id, payloadDigest: row.in_doubt_payload_digest,
+            canonicalJson: row.in_doubt_canonical_json }
+        : null,
+    }));
+  }
+
+  /**
+   * The IN_DOUBT entry for one notice, written before its first POST (acp-daemon-notice/v1): the exact
+   * canonical bytes and their digest. Idempotent: an entry already written for this event id is
+   * returned as it stands, whatever was offered, because a retry must resend what was first signed.
+   */
+  recordPeerMessageNoticeInDoubt(input: {
+    eventId: string; messageId: string; roleKey: string; reason: string; payloadDigest: string; canonicalJson: string;
+  }): { payloadDigest: string; canonicalJson: string } | null {
+    return this.db.tx(() => {
+      const existing = this.db.get<{ payload_digest: string; canonical_json: string }>(
+        `SELECT payload_digest, canonical_json FROM peer_message_notice_deliveries
+          WHERE event_id = ? AND entry = 'IN_DOUBT'`,
+        [input.eventId],
+      );
+      if (existing) return { payloadDigest: existing.payload_digest, canonicalJson: existing.canonical_json };
+      // One channel per notice (amendment 1): a holder that already took the telling on itself keeps
+      // it, and the daemon starts nothing. Checked in this transaction, against the holder's report.
+      if (this.db.get(
+        `SELECT 1 AS present FROM peer_message_refusal_notices WHERE message_id = ? AND entry = 'REPORTED'`,
+        [input.messageId],
+      )) return null;
+      this.#writePeerMessageNoticeDelivery(
+        { eventId: input.eventId, entry: "IN_DOUBT", payloadDigest: input.payloadDigest, receiptId: null, failure: null },
+        { kind: "NOTICE", ...input }, { canonicalJson: input.canonicalJson },
+      );
+      return { payloadDigest: input.payloadDigest, canonicalJson: input.canonicalJson };
+    });
+  }
+
+  /** The notice reached the CEO: a 200 whose every settlement condition held, and its receipt. */
+  settlePeerMessageNoticeDelivery(input: {
+    eventId: string; messageId: string; roleKey: string; reason: string; payloadDigest: string; receiptId: string;
+  }): void {
+    this.db.tx(() => this.#writePeerMessageNoticeDelivery(
+      { eventId: input.eventId, entry: "SETTLED", payloadDigest: input.payloadDigest, receiptId: input.receiptId, failure: null },
+      { kind: "NOTICE", ...input }, { receiptId: input.receiptId },
+    ));
+  }
+
+  /**
+   * The notice will not be delivered under this id: Hermes refused it, a 200 did not match, or the
+   * pinned CEO destination moved since its bytes were fixed. Terminal, kept with what differed, and
+   * shown by the doctor; never re-minted under a new id.
+   */
+  failPeerMessageNoticeDelivery(input: {
+    eventId: string; messageId: string; roleKey: string; reason: string; payloadDigest: string;
+    failure: PeerMessageNoticeDeliveryFailure; diagnostics: Record<string, unknown>;
+  }): void {
+    this.db.tx(() => this.#writePeerMessageNoticeDelivery(
+      { eventId: input.eventId, entry: "FAILED", payloadDigest: input.payloadDigest, receiptId: null, failure: input.failure },
+      { kind: "NOTICE", ...input }, { failure: input.failure, diagnosticsJson: JSON.stringify(input.diagnostics) },
+    ));
+  }
+
+  /** Whether any delivery entry exists for this event id: a probe is sent only when none does. */
+  daemonNoticeDeliveryExists(eventId: string): boolean {
+    return this.db.get(`SELECT 1 AS present FROM peer_message_notice_deliveries WHERE event_id = ?`, [eventId]) !==
+      undefined;
+  }
+
+  /**
+   * The live-acceptance probe's entries (amendment 1): kind PROBE, no message. IN_DOUBT before its
+   * first POST, refused when any entry for the id already exists; SETTLED or FAILED for the first
+   * answer; RESENT, with the receipt when it met every settlement condition, for the one resend.
+   */
+  recordDaemonNoticeProbe(input: {
+    eventId: string; entry: "IN_DOUBT" | "SETTLED" | "FAILED" | "RESENT"; payloadDigest: string;
+    canonicalJson?: string; receiptId?: string | null; failure?: PeerMessageNoticeDeliveryFailure;
+    diagnostics?: Record<string, unknown>;
+  }): void {
+    this.db.tx(() => this.#writePeerMessageNoticeDelivery(
+      { eventId: input.eventId, entry: input.entry, payloadDigest: input.payloadDigest,
+        receiptId: input.receiptId ?? null, failure: input.failure ?? null },
+      { kind: "PROBE", messageId: null, roleKey: null, reason: null },
+      {
+        ...(input.canonicalJson === undefined ? {} : { canonicalJson: input.canonicalJson }),
+        ...(input.receiptId ? { receiptId: input.receiptId } : {}),
+        ...(input.failure === undefined ? {} : { failure: input.failure }),
+        ...(input.diagnostics === undefined ? {} : { diagnosticsJson: JSON.stringify(input.diagnostics) }),
+      },
+    ));
+  }
+
+  #writePeerMessageNoticeDelivery(
+    entry: PeerMessageNoticeDeliveryEntry,
+    notice: { kind: "NOTICE" | "PROBE"; messageId: string | null; roleKey: string | null; reason: string | null },
+    columns: { canonicalJson?: string; receiptId?: string; failure?: string; diagnosticsJson?: string },
+  ): void {
+    this.db.withPeerMessageNoticeDelivery(new PeerMessageNoticeDeliveryAuthorityToken(this.db, entry), () =>
+      this.db.run(
+        `INSERT INTO peer_message_notice_deliveries (
+           event_id, entry, kind, message_id, role_key, reason, payload_digest, canonical_json, receipt_id,
+           failure, diagnostics_json, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          entry.eventId, entry.entry, notice.kind, notice.messageId, notice.roleKey, notice.reason, entry.payloadDigest,
+          columns.canonicalJson ?? null, columns.receiptId ?? null, columns.failure ?? null,
+          columns.diagnosticsJson ?? null, this.clock.nowIso(),
+        ],
+      ));
   }
 
   /** `exactHolderTarget` for a caller-supplied holder tuple. Only reads. */
@@ -2283,6 +2456,55 @@ class PeerMessageNoticeAuthorityToken {
 export type PeerMessageNoticeAuthority = PeerMessageNoticeAuthorityToken;
 /** The entry a notice authority names, or null when `value` is not one issued for `db`. */
 export const peerMessageNoticeEntryOf = PeerMessageNoticeAuthorityToken.entryOf;
+
+/** Why a notice delivery is terminal (acp-daemon-notice/v1). */
+export type PeerMessageNoticeDeliveryFailure = "HERMES_REFUSED" | "RESPONSE_MISMATCH" | "DESTINATION_MOVED";
+
+/** One entry of `peer_message_notice_deliveries`, as its insert trigger's marker names it. */
+export interface PeerMessageNoticeDeliveryEntry {
+  readonly eventId: string;
+  readonly entry: "IN_DOUBT" | "SETTLED" | "FAILED" | "RESENT";
+  readonly payloadDigest: string;
+  readonly receiptId: string | null;
+  readonly failure: PeerMessageNoticeDeliveryFailure | null;
+}
+
+/** An OWED notice the daemon still owes the CEO, with the IN_DOUBT entry of an earlier attempt. */
+export interface PeerMessageNoticeDeliveryCandidate {
+  messageId: string;
+  roleKey: string;
+  reason: string;
+  sender: string | null;
+  sourceChannel: string | null;
+  sourceNonce: string | null;
+  createdAt: string;
+  inDoubt: { eventId: string; payloadDigest: string; canonicalJson: string } | null;
+}
+
+/**
+ * The capability to write one notice-delivery entry (acp-daemon-notice/v1), minted only inside this
+ * module for exactly the entry it is about to write; `Db.withPeerMessageNoticeDelivery` checks the
+ * brand before it raises the marker the entry's insert trigger requires. As the notice authority.
+ */
+class PeerMessageNoticeDeliveryAuthorityToken {
+  readonly #minted = true;
+  readonly #db: Db;
+  readonly #entry: PeerMessageNoticeDeliveryEntry;
+
+  constructor(db: Db, entry: PeerMessageNoticeDeliveryEntry) {
+    this.#db = db;
+    this.#entry = Object.freeze({ ...entry });
+    Object.freeze(this);
+  }
+
+  static entryOf(value: unknown, db: Db): PeerMessageNoticeDeliveryEntry | null {
+    if (typeof value !== "object" || value === null || !(#minted in value)) return null;
+    return value.#db === db ? value.#entry : null;
+  }
+}
+export type PeerMessageNoticeDeliveryAuthority = PeerMessageNoticeDeliveryAuthorityToken;
+/** The entry a delivery authority names, or null when `value` is not one issued for `db`. */
+export const peerMessageNoticeDeliveryEntryOf = PeerMessageNoticeDeliveryAuthorityToken.entryOf;
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);

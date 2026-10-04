@@ -1278,10 +1278,12 @@ CREATE INDEX IF NOT EXISTS peer_message_carries_by_successor
 --   it was still PENDING — on a revoke (a plain one, or the operator's dead-binding door), a
 --   takeover by another runtime, a same-generation runtime move, or a canonical restart that
 --   refused to carry it. One OWED entry per message, written by the fence in the transaction that rejects the row;
---   one REPORTED entry, written when the role's current holder says it told the CEO. Shown, as
---   metadata only, to whoever holds the role while an OWED entry has no REPORTED one — whether or
---   not that holder is the carry successor — because the daemon cannot sign Buzz in a canonical
---   room and the holder is how the CEO is told.
+--   one REPORTED entry, written when the role's current holder takes the telling on itself — before
+--   it tells the CEO, so that one channel tells it (amendment 1). Shown, as metadata only, to
+--   whoever holds the role while an OWED entry has no REPORTED one and the daemon has no delivery of
+--   it in doubt or settled (`peer_message_notice_deliveries`) — whether or not that holder is the
+--   carry successor. The daemon tells the CEO itself where it can (acp-daemon-notice/v1); the holder
+--   is the channel for what the daemon does not deliver.
 --   Integrity: the outbox row's status says the message was rejected, not that anyone was told; an
 --   ordinary statement can write either. So an entry is inserted only under the connection-local
 --   marker `Db.withPeerMessageNotice` raises for that one exact entry, from a capability only the
@@ -1358,6 +1360,120 @@ END;
 
 CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role
   ON peer_message_refusal_notices(role_key, entry);
+
+-- ---------------------------------------------------------------------------
+-- peer_message_notice_deliveries  (schema v40, ACP-RESTART-04, acp-daemon-notice/v1)
+--   Lifecycle: the daemon's own delivery of an OWED refusal notice to the CEO, through the CEO's
+--   existing canonical conversation, with no successor CTO involved. Keyed by the notice's
+--   `event_id` (`acp-notice:` + sha256 of `<message_id>\n<role_key>\n<reason>`). One `IN_DOUBT` entry,
+--   written before the first POST, holding the exact canonical bytes and their digest, so every
+--   retry — after a 409, a timeout or a restart — resends the same id and the same payload. Then at
+--   most one of: `SETTLED`, with the Gateway's receipt id, written only for a 200 whose event id,
+--   payload digest, `completed` receipt, session and lineage all match; or `FAILED`, terminal, with
+--   the category and what differed — a Hermes refusal (signature, principal, destination or payload
+--   mismatch), a 200 that did not match, or a pinned CEO destination that moved since the bytes were
+--   fixed. A notice is never redirected and never re-minted under a new id. One channel per notice
+--   (amendment 1): the daemon starts no delivery for a notice a holder REPORTED, and a holder is not
+--   shown, and may not report, a notice the daemon has in doubt or settled. A PROBE (kind) is the
+--   synthetic live-acceptance notice: no message, sent once at startup when no entry for its id
+--   exists, its one resend recorded as RESENT.
+--   Integrity: an entry is inserted only under the connection-local marker
+--   `Db.withPeerMessageNoticeDelivery` raises for that one entry, from a capability only the outbox
+--   mints; an IN_DOUBT entry only beside its OWED notice, a SETTLED or FAILED entry only beside the
+--   IN_DOUBT entry with the same digest, and never both. WITHOUT ROWID; never updated, never deleted.
+--   The notice text in the canonical bytes is metadata only, never the refused message's payload.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS peer_message_notice_deliveries (
+  event_id         TEXT NOT NULL,
+  entry            TEXT NOT NULL CHECK (entry IN ('IN_DOUBT','SETTLED','FAILED','RESENT')),
+  -- NOTICE: a real refusal notice. PROBE: the synthetic live-acceptance notice (amendment 1), which
+  -- names no message and is resent exactly once, the resend recorded as RESENT.
+  kind             TEXT NOT NULL CHECK (kind IN ('NOTICE','PROBE')),
+  -- NOTICE: the OWED notice this delivers — its key in peer_message_refusal_notices and its reason.
+  message_id       TEXT,
+  role_key         TEXT,
+  reason           TEXT,
+  payload_digest   TEXT NOT NULL,
+  -- IN_DOUBT: the canonical JSON, exactly as signed and as every retry resends it.
+  canonical_json   TEXT,
+  -- SETTLED: the receipt the Gateway gave for the completed CEO turn. RESENT: the receipt the resend
+  -- came back with when it met every settlement condition, else null.
+  receipt_id       TEXT,
+  -- FAILED: why. FAILED and RESENT: what was answered or what differed (status, Hermes error code,
+  -- mismatched field names) — never the answer's text.
+  failure          TEXT CHECK (failure IN ('HERMES_REFUSED','RESPONSE_MISMATCH','DESTINATION_MOVED')),
+  diagnostics_json TEXT,
+  created_at       TEXT NOT NULL,
+  PRIMARY KEY (event_id, entry),
+  CHECK ((kind = 'NOTICE') = (message_id IS NOT NULL AND role_key IS NOT NULL AND reason IS NOT NULL)),
+  CHECK (kind = 'NOTICE' OR (message_id IS NULL AND role_key IS NULL AND reason IS NULL)),
+  CHECK ((kind = 'NOTICE' AND substr(event_id, 1, 11) = 'acp-notice:')
+      OR (kind = 'PROBE' AND substr(event_id, 1, 17) = 'acp-notice-probe:')),
+  CHECK (entry <> 'RESENT' OR kind = 'PROBE'),
+  CHECK ((entry = 'IN_DOUBT') = (canonical_json IS NOT NULL)),
+  CHECK (entry <> 'SETTLED' OR receipt_id IS NOT NULL),
+  CHECK (entry NOT IN ('IN_DOUBT','FAILED') OR receipt_id IS NULL),
+  CHECK ((entry = 'FAILED') = (failure IS NOT NULL)),
+  CHECK ((entry IN ('FAILED','RESENT')) = (diagnostics_json IS NOT NULL))
+) WITHOUT ROWID;
+
+-- CP-HI-06 — a delivery entry is the evidence that the CEO was told, or why not; ordinary SQL must
+-- not write one. `acp_peer_message_notice_delivery_authorized` answers 1 only while the outbox holds
+-- the marker for exactly this entry. An IN_DOUBT entry is the first for its event id; a NOTICE one
+-- needs its OWED notice and no REPORTED one — one channel per notice (amendment 1). Every later entry
+-- needs the IN_DOUBT entry with the same digest and subject, and a notice is settled or failed, not
+-- both.
+CREATE TRIGGER IF NOT EXISTS peer_message_notice_deliveries_insert_authority
+BEFORE INSERT ON peer_message_notice_deliveries
+WHEN acp_peer_message_notice_delivery_authorized(
+  NEW.event_id, NEW.entry, NEW.payload_digest, NEW.receipt_id, NEW.failure
+) <> 1
+  OR (NEW.entry = 'IN_DOUBT' AND EXISTS (
+    SELECT 1 FROM peer_message_notice_deliveries WHERE event_id = NEW.event_id))
+  OR (NEW.entry = 'IN_DOUBT' AND NEW.kind = 'NOTICE' AND NOT EXISTS (
+    SELECT 1 FROM peer_message_refusal_notices
+     WHERE message_id = NEW.message_id AND entry = 'OWED' AND role_key = NEW.role_key
+       AND reason = NEW.reason))
+  OR (NEW.entry = 'IN_DOUBT' AND NEW.kind = 'NOTICE' AND EXISTS (
+    SELECT 1 FROM peer_message_refusal_notices
+     WHERE message_id = NEW.message_id AND entry = 'REPORTED'))
+  OR (NEW.entry <> 'IN_DOUBT' AND NOT EXISTS (
+    SELECT 1 FROM peer_message_notice_deliveries
+     WHERE event_id = NEW.event_id AND entry = 'IN_DOUBT' AND payload_digest = NEW.payload_digest
+       AND kind = NEW.kind AND message_id IS NEW.message_id AND role_key IS NEW.role_key
+       AND reason IS NEW.reason))
+  OR (NEW.entry IN ('SETTLED','FAILED') AND EXISTS (
+    SELECT 1 FROM peer_message_notice_deliveries
+     WHERE event_id = NEW.event_id AND entry IN ('SETTLED','FAILED')))
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_DELIVERY_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — one entry of each kind per notice, ever; a second is refused, not merged.
+CREATE TRIGGER IF NOT EXISTS peer_message_notice_deliveries_no_replace
+BEFORE INSERT ON peer_message_notice_deliveries
+WHEN EXISTS (
+  SELECT 1 FROM peer_message_notice_deliveries
+   WHERE event_id = NEW.event_id AND entry = NEW.entry
+)
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_DELIVERY_NO_REPLACE');
+END;
+
+-- CP-HI-08 — a delivery entry is never rewritten.
+CREATE TRIGGER IF NOT EXISTS peer_message_notice_deliveries_immutable
+BEFORE UPDATE ON peer_message_notice_deliveries
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_DELIVERY_IMMUTABLE');
+END;
+
+-- CP-HI-08 — and never removed: a deleted SETTLED entry is a notice sent twice, a deleted IN_DOUBT
+-- one a retry under other bytes.
+CREATE TRIGGER IF NOT EXISTS peer_message_notice_deliveries_no_delete
+BEFORE DELETE ON peer_message_notice_deliveries
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_DELIVERY_IMMUTABLE');
+END;
 
 -- ---------------------------------------------------------------------------
 -- holder_message_departures  (schema v40, review finding 01)

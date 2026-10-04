@@ -2685,6 +2685,10 @@ const V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES: readonly string[] = [
   "peer_message_refusal_notices_no_replace",
   "peer_message_refusal_notices_immutable",
   "peer_message_refusal_notices_no_delete",
+  "peer_message_notice_deliveries_insert_authority",
+  "peer_message_notice_deliveries_no_replace",
+  "peer_message_notice_deliveries_immutable",
+  "peer_message_notice_deliveries_no_delete",
   "inbound_messages_buzz_source_key_immutable",
   "outbox_holder_message_departs",
   "outbox_message_id_immutable",
@@ -2700,7 +2704,7 @@ const V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES: readonly string[] = [
   "holder_message_source_departures_no_delete",
 ];
 
-/** v40's three record tables, and the index each has beyond its key, read from schema.sql by pattern. */
+/** v40's record tables, and the index each has beyond its key, read from schema.sql by pattern. */
 const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index?: RegExp }> = [
   {
     name: "peer_message_carries",
@@ -2711,6 +2715,10 @@ const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index?: Re
     name: "peer_message_refusal_notices",
     table: /CREATE TABLE IF NOT EXISTS peer_message_refusal_notices \([\s\S]*?\n\) WITHOUT ROWID;/,
     index: /CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role[^;]*;/,
+  },
+  {
+    name: "peer_message_notice_deliveries",
+    table: /CREATE TABLE IF NOT EXISTS peer_message_notice_deliveries \([\s\S]*?\n\) WITHOUT ROWID;/,
   },
   {
     name: "holder_message_departures",
@@ -2751,7 +2759,11 @@ const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index?: Re
  * same table records the first terminal fact of the event's turn, which the restart's carry reads
  * instead of a claim JSON an ordinary statement can edit.
  *
- * Additive: four new tables, an index on two of them, twenty-one triggers, and the backfill rows in the
+ * Finding 04 (acp-daemon-notice/v1): the daemon delivers each OWED notice to the CEO itself, through
+ * the CEO's existing canonical conversation, and records the delivery append-only — in doubt before
+ * the POST, then settled on a matching receipt or failed — in a fifth table with its own guards.
+ *
+ * Additive: five new tables, an index on two of them, twenty-five triggers, and the backfill rows in the
  * new departure table; no existing row or object is changed, so every v39 row is kept as it is. A
  * queued peer message written before this has no record and is carried by nothing until a v40
  * restart decides it.
@@ -2981,6 +2993,10 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "peer_message_refusal_notices_no_replace", sentinel: "PEER_MESSAGE_NOTICE_NO_REPLACE", introducedIn: 40 },
   { name: "peer_message_refusal_notices_immutable", sentinel: "PEER_MESSAGE_NOTICE_IMMUTABLE", introducedIn: 40 },
   { name: "peer_message_refusal_notices_no_delete", sentinel: "PEER_MESSAGE_NOTICE_IMMUTABLE", introducedIn: 40 },
+  { name: "peer_message_notice_deliveries_insert_authority", sentinel: "PEER_MESSAGE_NOTICE_DELIVERY_AUTHORITY_DENIED", introducedIn: 40 },
+  { name: "peer_message_notice_deliveries_no_replace", sentinel: "PEER_MESSAGE_NOTICE_DELIVERY_NO_REPLACE", introducedIn: 40 },
+  { name: "peer_message_notice_deliveries_immutable", sentinel: "PEER_MESSAGE_NOTICE_DELIVERY_IMMUTABLE", introducedIn: 40 },
+  { name: "peer_message_notice_deliveries_no_delete", sentinel: "PEER_MESSAGE_NOTICE_DELIVERY_IMMUTABLE", introducedIn: 40 },
   { name: "inbound_messages_buzz_source_key_immutable", sentinel: "INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE", introducedIn: 40 },
   // Raises nothing: its load-bearing part is the write, so the write is its sentinel.
   { name: "outbox_holder_message_departs", sentinel: "INSERT INTO holder_message_departures", introducedIn: 40 },

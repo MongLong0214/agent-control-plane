@@ -1531,6 +1531,13 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     "peer_message_refusal_notices_no_delete",
     "peer_message_refusal_notices_no_replace",
   ];
+  /** v40's finding-04 delivery record's guards (acp-daemon-notice/v1). */
+  const DELIVERY_TRIGGERS = [
+    "peer_message_notice_deliveries_immutable",
+    "peer_message_notice_deliveries_insert_authority",
+    "peer_message_notice_deliveries_no_delete",
+    "peer_message_notice_deliveries_no_replace",
+  ];
   /** v40's finding-01 triggers: the departure records' guards and the triggers that write them. */
   const DEPARTURE_TRIGGERS = [
     "holder_message_departures_immutable",
@@ -1578,6 +1585,9 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     // Finding 01's departure records, their outbox and ingress triggers and the id guard: v40's too.
     legacy.exec(`${DEPARTURE_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n")}
       DROP TABLE holder_message_departures; DROP TABLE holder_message_source_departures;`);
+    // And finding 04's delivery record, which v39 did not have either.
+    legacy.exec(`${DELIVERY_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n")}
+      DROP TABLE peer_message_notice_deliveries;`);
     legacy.exec(`${NOTICE_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n")}
       DROP INDEX peer_message_refusal_notices_by_role; DROP TABLE peer_message_refusal_notices;
       DROP TRIGGER inbound_messages_buzz_source_key_immutable;`);
@@ -1637,6 +1647,11 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
         `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'peer_message_refusal_notices' ORDER BY name`,
       ).map((row) => row.name)).toEqual(NOTICE_TRIGGERS);
       expect(migrated.get<{ n: number }>(`SELECT COUNT(*) AS n FROM peer_message_refusal_notices`)?.n).toBe(0);
+      // Finding 04's delivery record arrives guarded and empty.
+      expect(migrated.all<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'peer_message_notice_deliveries' ORDER BY name`,
+      ).map((row) => row.name)).toEqual(DELIVERY_TRIGGERS);
+      expect(migrated.get<{ n: number }>(`SELECT COUNT(*) AS n FROM peer_message_notice_deliveries`)?.n).toBe(0);
       // ACP-RESTART-02: the Buzz row written before v40 keeps its key from v40 on.
       expect(() => migrated.run(
         `UPDATE inbound_messages SET nonce = nonce || ':moved' WHERE channel = 'buzz'`,
@@ -1656,7 +1671,8 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     const after = new Database(path, { readonly: true });
     try {
       expect(dump(after, ["schema_migrations", "peer_message_carries", "peer_message_refusal_notices",
-        "holder_message_departures", "holder_message_source_departures"])).toEqual(before);
+        "holder_message_departures", "holder_message_source_departures", "peer_message_notice_deliveries"]))
+        .toEqual(before);
     } finally {
       after.close();
     }
@@ -1744,7 +1760,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     const after = new Database(path, { readonly: true });
     try {
       expect(dump(after, ["schema_migrations", "holder_message_departures", "holder_message_source_departures",
-        "peer_message_carries", "peer_message_refusal_notices"])).toEqual(before);
+        "peer_message_carries", "peer_message_refusal_notices", "peer_message_notice_deliveries"])).toEqual(before);
     } finally {
       after.close();
     }
