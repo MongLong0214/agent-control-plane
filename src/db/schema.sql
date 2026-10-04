@@ -777,6 +777,14 @@ CREATE TABLE IF NOT EXISTS task_executions (
                                                          'policy','capacity','infrastructure',
                                                          'unknown_observed')),
   result_digest            TEXT,
+  -- #512 (schema v41) — 1 when the control plane launched this execution itself
+  -- (`task_worker_run`). Its started and finished receipts are the runtime's, so the CTO's
+  -- task_receipt_submit may not open or close it.
+  runtime_managed          INTEGER NOT NULL DEFAULT 0 CHECK (runtime_managed IN (0,1)),
+  -- #512 (schema v41) — the OS start time of `worker_process_id`, read from the process when it
+  -- was spawned, never from the database clock. A pid alone does not identify a process, so a
+  -- restart kills a recorded worker only while the live pid still reports this start time.
+  worker_process_started_at TEXT,
   UNIQUE (task_id, attempt)
 );
 
@@ -833,6 +841,185 @@ WHEN NEW.run_id <> OLD.run_id
   OR NEW.worker_session_id <> OLD.worker_session_id
 BEGIN
   SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_IDENTITY_IMMUTABLE');
+END;
+
+-- ---------------------------------------------------------------------------
+-- worker session independence  (#512, schema v41)
+-- ---------------------------------------------------------------------------
+-- CP-HI-04 — the implementer is a separate session. The CTO routes and reviews; a WORKER bound to
+-- the session that owns its task's run, or to a session that answers for any other role, puts two
+-- authorities in one runtime that the guard and the producer set tell apart. So an ACTIVE WORKER
+-- binding may name neither the run owner's session nor a session holding another ACTIVE non-WORKER
+-- binding, whether that session is the binding-time one or the one an actor's live pointer names.
+-- Three writes can reach that state, and each has its guard: inserting the binding (this one),
+-- making a WORKER binding ACTIVE, and moving a WORKER actor's live pointer. The worker runner refuses
+-- the same thing first, with evidence; these are the backstop for every raw writer.
+CREATE TRIGGER IF NOT EXISTS assignments_worker_session_independent
+BEFORE INSERT ON assignments
+WHEN NEW.role = 'WORKER' AND NEW.status = 'ACTIVE' AND (
+  EXISTS (
+    SELECT 1 FROM runs r
+     WHERE r.owner_session_id IN (
+             NEW.session_id,
+             (SELECT c.current_session_id FROM conversational_actors c WHERE c.actor_id = NEW.actor_id))
+       AND (r.run_id = NEW.run_id
+            OR r.run_id IN (SELECT t.run_id FROM tasks t WHERE t.task_id = NEW.task_id))
+  )
+  OR EXISTS (
+    SELECT 1 FROM assignments o
+      LEFT JOIN conversational_actors oc ON oc.actor_id = o.actor_id
+     WHERE o.status = 'ACTIVE' AND o.role <> 'WORKER'
+       AND (o.actor_id = NEW.actor_id
+            OR o.session_id IN (
+                 NEW.session_id,
+                 (SELECT c.current_session_id FROM conversational_actors c WHERE c.actor_id = NEW.actor_id))
+            OR oc.current_session_id IN (
+                 NEW.session_id,
+                 (SELECT c.current_session_id FROM conversational_actors c WHERE c.actor_id = NEW.actor_id)))
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'WORKER_SESSION_NOT_INDEPENDENT');
+END;
+
+-- CP-HI-04 — the same rule for a WORKER binding that becomes ACTIVE by UPDATE rather than INSERT.
+CREATE TRIGGER IF NOT EXISTS assignments_worker_session_independent_on_activate
+BEFORE UPDATE OF status ON assignments
+WHEN NEW.role = 'WORKER' AND NEW.status = 'ACTIVE' AND OLD.status IS NOT 'ACTIVE' AND (
+  EXISTS (
+    SELECT 1 FROM runs r
+     WHERE r.owner_session_id IN (
+             NEW.session_id,
+             (SELECT c.current_session_id FROM conversational_actors c WHERE c.actor_id = NEW.actor_id))
+       AND (r.run_id = NEW.run_id
+            OR r.run_id IN (SELECT t.run_id FROM tasks t WHERE t.task_id = NEW.task_id))
+  )
+  OR EXISTS (
+    SELECT 1 FROM assignments o
+      LEFT JOIN conversational_actors oc ON oc.actor_id = o.actor_id
+     WHERE o.status = 'ACTIVE' AND o.role <> 'WORKER'
+       AND (o.actor_id = NEW.actor_id
+            OR o.session_id IN (
+                 NEW.session_id,
+                 (SELECT c.current_session_id FROM conversational_actors c WHERE c.actor_id = NEW.actor_id))
+            OR oc.current_session_id IN (
+                 NEW.session_id,
+                 (SELECT c.current_session_id FROM conversational_actors c WHERE c.actor_id = NEW.actor_id)))
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'WORKER_SESSION_NOT_INDEPENDENT');
+END;
+
+-- CP-HI-04 — and for a live pointer moved onto such a session. A WORKER actor's runtime may change
+-- (failover), but never to the run owner's session or to one that holds another role.
+CREATE TRIGGER IF NOT EXISTS conversational_actors_worker_session_independent
+BEFORE UPDATE OF current_session_id ON conversational_actors
+WHEN NEW.current_session_id IS NOT NULL
+ AND NEW.current_session_id IS NOT OLD.current_session_id
+ AND EXISTS (
+   SELECT 1 FROM assignments w
+    WHERE w.actor_id = NEW.actor_id AND w.role = 'WORKER' AND w.status = 'ACTIVE'
+      AND (
+        EXISTS (
+          SELECT 1 FROM runs r
+           WHERE r.owner_session_id = NEW.current_session_id
+             AND (r.run_id = w.run_id
+                  OR r.run_id IN (SELECT t.run_id FROM tasks t WHERE t.task_id = w.task_id)))
+        OR EXISTS (
+          SELECT 1 FROM assignments o
+            LEFT JOIN conversational_actors oc ON oc.actor_id = o.actor_id
+           WHERE o.status = 'ACTIVE' AND o.role <> 'WORKER'
+             AND (o.actor_id = NEW.actor_id
+                  OR o.session_id = NEW.current_session_id
+                  OR (oc.current_session_id = NEW.current_session_id AND oc.actor_id <> NEW.actor_id)))
+      )
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'WORKER_SESSION_NOT_INDEPENDENT');
+END;
+
+-- CP-HI-04 — the same rule whichever role is attached first. A session that already holds an ACTIVE
+-- WORKER binding — as the binding-time session or as its actor's live runtime — takes no ACTIVE
+-- non-WORKER binding, and a non-WORKER binding cannot be minted on the WORKER's own actor. Without
+-- this, provisioning the worker first and then binding, switching (REPLACED) or failing over
+-- (SURVIVED) the CTO onto its session gave one runtime both authorities (ACP1069-R1-02).
+CREATE TRIGGER IF NOT EXISTS assignments_session_holds_no_worker
+BEFORE INSERT ON assignments
+WHEN NEW.role <> 'WORKER' AND NEW.status = 'ACTIVE' AND EXISTS (
+  SELECT 1 FROM assignments w
+    LEFT JOIN conversational_actors wc ON wc.actor_id = w.actor_id
+   WHERE w.role = 'WORKER' AND w.status = 'ACTIVE'
+     AND (w.actor_id = NEW.actor_id
+          OR w.session_id IN (
+               NEW.session_id,
+               (SELECT c.current_session_id FROM conversational_actors c WHERE c.actor_id = NEW.actor_id))
+          OR wc.current_session_id IN (
+               NEW.session_id,
+               (SELECT c.current_session_id FROM conversational_actors c WHERE c.actor_id = NEW.actor_id)))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'WORKER_SESSION_NOT_INDEPENDENT');
+END;
+
+-- CP-HI-04 — and for a non-WORKER binding that becomes ACTIVE by UPDATE on such a session.
+CREATE TRIGGER IF NOT EXISTS assignments_session_holds_no_worker_on_activate
+BEFORE UPDATE OF status ON assignments
+WHEN NEW.role <> 'WORKER' AND NEW.status = 'ACTIVE' AND OLD.status IS NOT 'ACTIVE' AND EXISTS (
+  SELECT 1 FROM assignments w
+    LEFT JOIN conversational_actors wc ON wc.actor_id = w.actor_id
+   WHERE w.role = 'WORKER' AND w.status = 'ACTIVE'
+     AND (w.actor_id = NEW.actor_id
+          OR w.session_id IN (
+               NEW.session_id,
+               (SELECT c.current_session_id FROM conversational_actors c WHERE c.actor_id = NEW.actor_id))
+          OR wc.current_session_id IN (
+               NEW.session_id,
+               (SELECT c.current_session_id FROM conversational_actors c WHERE c.actor_id = NEW.actor_id)))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'WORKER_SESSION_NOT_INDEPENDENT');
+END;
+
+-- CP-HI-04 — and for the live pointer of an actor that holds a non-WORKER role: a CTO or CEO
+-- runtime may fail over, but never onto a session a WORKER binding holds. (An actor holding both
+-- roles is refused when it moves by `conversational_actors_worker_session_independent`.)
+CREATE TRIGGER IF NOT EXISTS conversational_actors_session_holds_no_worker
+BEFORE UPDATE OF current_session_id ON conversational_actors
+WHEN NEW.current_session_id IS NOT NULL
+ AND NEW.current_session_id IS NOT OLD.current_session_id
+ AND EXISTS (
+   SELECT 1 FROM assignments o
+    WHERE o.actor_id = NEW.actor_id AND o.role <> 'WORKER' AND o.status = 'ACTIVE'
+ )
+ AND EXISTS (
+   SELECT 1 FROM assignments w
+     LEFT JOIN conversational_actors wc ON wc.actor_id = w.actor_id
+    WHERE w.role = 'WORKER' AND w.status = 'ACTIVE'
+      AND (w.session_id = NEW.current_session_id
+           OR (wc.current_session_id = NEW.current_session_id AND wc.actor_id <> NEW.actor_id))
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'WORKER_SESSION_NOT_INDEPENDENT');
+END;
+
+-- CP-HI-04 — and for the run's owner pin. A run is never re-pinned (takeover or a raw writer) onto
+-- the session that is the WORKER of one of its own tasks.
+CREATE TRIGGER IF NOT EXISTS runs_owner_session_not_its_worker
+BEFORE UPDATE OF owner_session_id ON runs
+WHEN NEW.owner_session_id IS NOT NULL
+ AND NEW.owner_session_id IS NOT OLD.owner_session_id
+ AND EXISTS (
+   SELECT 1 FROM assignments w
+     LEFT JOIN conversational_actors wc ON wc.actor_id = w.actor_id
+    WHERE w.role = 'WORKER' AND w.status = 'ACTIVE'
+      AND (w.run_id = NEW.run_id
+           OR w.task_id IN (SELECT t.task_id FROM tasks t WHERE t.run_id = NEW.run_id))
+      AND (w.session_id = NEW.owner_session_id
+           OR wc.current_session_id = NEW.owner_session_id)
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'WORKER_SESSION_NOT_INDEPENDENT');
 END;
 
 -- ---------------------------------------------------------------------------

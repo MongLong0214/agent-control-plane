@@ -1624,10 +1624,16 @@ export class Daemon {
       }
     }
 
+    // #512 — a worker turn this control plane launched is never re-invoked. Its recorded process is
+    // killed only when pid, OS start time and ownership all match; otherwise nothing is killed and
+    // the task is blocked from another turn. Either way the execution ends ABANDONED.
+    const orphanedExecutions: string[] = this.cp.workerTurns
+      .reconcileAfterRestart()
+      .map((orphan) => orphan.executionId);
+
     // A receipt that says RUNNING across a restart has no live worker behind it.
-    const orphanedExecutions: string[] = [];
     for (const row of this.cp.db.all<{ execution_id: string; worker_process_id: number | null }>(
-      `SELECT execution_id, worker_process_id FROM task_executions WHERE status = 'RUNNING'`,
+      `SELECT execution_id, worker_process_id FROM task_executions WHERE status = 'RUNNING' AND runtime_managed = 0`,
     )) {
       if (row.worker_process_id == null || !isAlive(row.worker_process_id)) {
         this.cp.tasks.finishExecution(row.execution_id, {

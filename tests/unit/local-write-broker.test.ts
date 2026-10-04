@@ -1,8 +1,9 @@
-import { afterAll, describe, expect, it } from "vitest";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { isoPlus } from "../../src/core/clock.ts";
+import { ACP_SCRATCH_ROOT } from "../../src/core/scratch-root.ts";
 import { newAssignmentId, newTaskId } from "../../src/core/ids.ts";
 import { ManagedWriteGuard, WriteOperation } from "../../src/guard/managed-write-guard.ts";
 import { realWorkspaceProbe } from "../../src/guard/workspace-probe.ts";
@@ -15,7 +16,21 @@ import {
 import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, gitSync, makeCore, makeRepo, seedActor, seedRun, tempDir } from "../helpers/fixtures.ts";
 
-afterAll(cleanupTempDirs);
+/**
+ * The adapter allocates its per-invocation scratch under `~/.agent-control-plane/scratch`, read from
+ * HOME when the module loads. That is the live daemon's state root, so this file points HOME at a
+ * private directory before anything is imported, and the test below asserts it did.
+ */
+const isolatedHome = vi.hoisted(() => {
+  const home = `${(process.env["TMPDIR"] ?? "/tmp").replace(/\/+$/, "")}/acp-local-write-broker-home-${process.pid}`;
+  process.env["HOME"] = home;
+  return home;
+});
+
+afterAll(() => {
+  cleanupTempDirs();
+  rmSync(isolatedHome, { recursive: true, force: true });
+});
 
 const seatbeltCanApply = (): boolean =>
   process.platform === "darwin" &&
@@ -47,6 +62,7 @@ process.stdout.write(JSON.stringify({ outsideDenied }));
 
 describe("CP-HI-01 local runtime write broker", () => {
   it("#355 refuses an ungranted CLI write and actively denies a provider write outside its guarded target", async () => {
+    expect(ACP_SCRATCH_ROOT.startsWith(`${isolatedHome}/`)).toBe(true);
     const core = makeCore();
     const repository = makeRepo();
     const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repository });
@@ -73,18 +89,30 @@ describe("CP-HI-01 local runtime write broker", () => {
        VALUES (?, ?, 'runtime write', 'implementation', 'READY', '{}', ?, ?)`,
       [taskId, seeded.runId, now, now],
     );
+    // #512 — the worker is its own READY session, never the run owner's: the database refuses a
+    // WORKER binding on the CTO's session (WORKER_SESSION_NOT_INDEPENDENT).
+    const workerSessionId = "ses_runtime_bound_worker";
+    const workerIncarnation = "inc-worker-1";
+    core.db.run(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES (?, ?, 'claude', 'opus', 'READY', ?, ?)`,
+      [workerSessionId, workerIncarnation, now, now],
+    );
     core.db.run(
       `INSERT INTO assignments (assignment_id, role_key, role, run_id, task_id, actor_id, session_id,
                                 session_incarnation, binding_generation, mode, status, created_at)
-       VALUES (?, ?, 'WORKER', ?, ?, ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
-      [newAssignmentId(), `WORKER:${taskId}`, seeded.runId, taskId, seedActor(core.db, "WORKER", seeded.sessionId), seeded.sessionId, now],
+       VALUES (?, ?, 'WORKER', ?, ?, ?, ?, ?, 1, 'PREFERRED', 'ACTIVE', ?)`,
+      [
+        newAssignmentId(), `WORKER:${taskId}`, seeded.runId, taskId,
+        seedActor(core.db, "WORKER", workerSessionId, workerIncarnation), workerSessionId, workerIncarnation, now,
+      ],
     );
     core.db.run(
       `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
                                     worker_session_id, provider, model, repository_id, worktree_id,
                                     started_at, status)
        VALUES (?, ?, ?, 1, ?, ?, 'claude', 'opus', ?, ?, ?, 'RUNNING')`,
-      [taskReceiptId, seeded.runId, taskId, seeded.generation, seeded.sessionId, seeded.repositoryId, assignedWorktree, now],
+      [taskReceiptId, seeded.runId, taskId, seeded.generation, workerSessionId, seeded.repositoryId, assignedWorktree, now],
     );
     // The adapter receives a directory target, but the guard also observes the actual
     // checkout branch. A live claim for both resources makes this a valid managed write,
@@ -152,8 +180,9 @@ describe("CP-HI-01 local runtime write broker", () => {
         assignedWorktreeId: assignedWorktree,
         repositoryIdentity: seeded.identity,
         runId: seeded.runId,
-        sessionId: seeded.sessionId,
-        bindingGeneration: seeded.generation + 1,
+        sessionId: workerSessionId,
+        sessionIncarnation: workerIncarnation,
+        bindingGeneration: 2,
       },
     });
     expect(rejectedByGuard.ok).toBe(false);
@@ -180,8 +209,9 @@ describe("CP-HI-01 local runtime write broker", () => {
         assignedWorktreeId: otherAssignedWorktree,
         repositoryIdentity: seeded.identity,
         runId: seeded.runId,
-        sessionId: seeded.sessionId,
-        bindingGeneration: seeded.generation,
+        sessionId: workerSessionId,
+        sessionIncarnation: workerIncarnation,
+        bindingGeneration: 1,
       },
     });
     expect(receiptBoundToARequestedAtB.ok).toBe(false);
@@ -211,8 +241,9 @@ describe("CP-HI-01 local runtime write broker", () => {
         assignedWorktreeId: assignedWorktree,
         repositoryIdentity: seeded.identity,
         runId: seeded.runId,
-        sessionId: seeded.sessionId,
-        bindingGeneration: seeded.generation,
+        sessionId: workerSessionId,
+        sessionIncarnation: workerIncarnation,
+        bindingGeneration: 1,
       },
     });
     expect(outsideAssignedWorktree.ok).toBe(false);
@@ -237,8 +268,9 @@ describe("CP-HI-01 local runtime write broker", () => {
         assignedWorktreeId: assignedWorktree,
         repositoryIdentity: seeded.identity,
         runId: seeded.runId,
-        sessionId: seeded.sessionId,
-        bindingGeneration: seeded.generation,
+        sessionId: workerSessionId,
+        sessionIncarnation: workerIncarnation,
+        bindingGeneration: 1,
       },
     });
 

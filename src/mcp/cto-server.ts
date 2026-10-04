@@ -21,6 +21,7 @@ import type { BlindReviewGate } from "../review/blind-review.ts";
 import type { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
+import { WORKER_TURN_MAX_TIMEOUT_MS, type WorkerTurnRequest, type WorkerTurnRunner } from "../run/worker-turn.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
@@ -63,6 +64,7 @@ export interface CtoMcpSource extends McpMutationSource {
   readonly sessions: SessionRegistry;
   readonly bindings: BindingRegistry;
   readonly tasks: TaskGraph;
+  readonly workerTurns: WorkerTurnRunner;
 }
 
 /** Only ports constructed below may be attached to an MCP server. */
@@ -147,6 +149,15 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     startTaskExecution: (input: Parameters<TaskGraph["startWorkerExecution"]>[0]) =>
       source.tasks.startWorkerExecution(input),
     taskRunningWidth: (runId: string) => source.tasks.runningWidth(runId),
+    // #512 — the runtime launches and owns a worker turn; the CTO names run, task and claim only.
+    startWorkerTurn: (input: WorkerTurnRequest) => source.workerTurns.start(input),
+    workerExecution: (executionId: string, runId: string) => source.workerTurns.describe(executionId, runId),
+    executionIsRuntimeManaged: (executionId: string) => source.tasks.execution(executionId)?.runtimeManaged === true,
+    taskIsRuntimeManaged: (taskId: string) =>
+      Boolean(source.db.get<{ n: number }>(
+        `SELECT 1 AS n FROM task_executions WHERE task_id = ? AND runtime_managed = 1 LIMIT 1`,
+        [taskId],
+      )),
     recordTaskActivity: (executionId: string, runId: string) => source.tasks.recordActivity(executionId, runId),
     finishTaskExecution: (
       executionId: string,
@@ -381,6 +392,19 @@ const createCtoServerFromPort = (
     async (args) => write("task_receipt_submit", args.idempotencyKey, async (peer) => {
       const fenced = owner(peer, args.runId);
       if (!fenced.allowed) return respond(fenced);
+      // #512 — a runtime-managed execution's started and finished receipts are the control plane's.
+      // The CTO may not open one for a task the runtime runs, nor close one with a status of its choosing.
+      if (
+        (args.phase === "started" &&
+          (port.taskIsRuntimeManaged(args.taskId) || (args.executionId != null && port.executionIsRuntimeManaged(args.executionId)))) ||
+        (args.phase === "finished" && args.executionId != null && port.executionIsRuntimeManaged(args.executionId))
+      ) {
+        return respond(deny(
+          ReasonCode.COMPLETION_AUTHORITY_DENIED,
+          "the control plane owns this runtime-managed execution's receipts; task_receipt_submit may not open or finish it",
+          { taskId: args.taskId, executionId: args.executionId ?? null, phase: args.phase },
+        ));
+      }
       if (args.phase === "started") {
         return respond(
           await port.startTaskExecution({
@@ -401,6 +425,44 @@ const createCtoServerFromPort = (
       return args.phase === "activity"
         ? respond(port.recordTaskActivity(args.executionId, args.runId))
         : respond(port.finishTaskExecution(args.executionId, { status: args.status ?? "SUCCEEDED", resultDigest: args.resultDigest ?? null, failureClass: args.failureClass ?? null }, args.runId));
+    }),
+  );
+  server.registerTool(
+    "task_worker_run",
+    {
+      description:
+        "Run one worker turn for a task: the control plane launches the task's WORKER session in the claimed worktree, verifies and commits its change, and owns the receipts. Returns the execution id at once; read it with task_execution_get.",
+      inputSchema: {
+        ...mutation,
+        ...runIdentity,
+        taskId: z.string().min(1),
+        claimId: z.string().min(1),
+        timeoutMs: z.number().int().positive().max(WORKER_TURN_MAX_TIMEOUT_MS).optional(),
+      },
+    },
+    async (args) => write("task_worker_run", args.idempotencyKey, async (peer) => {
+      const fenced = owner(peer, args.runId);
+      if (!fenced.allowed) return respond(fenced);
+      return respond(await port.startWorkerTurn({
+        runId: args.runId,
+        taskId: args.taskId,
+        claimId: args.claimId,
+        ...(args.timeoutMs === undefined ? {} : { timeoutMs: args.timeoutMs }),
+        ownerSessionId: fenced.value.sessionId,
+        ownerBindingGeneration: fenced.value.bindingGeneration,
+      }));
+    }),
+  );
+  server.registerTool(
+    "task_execution_get",
+    {
+      description:
+        "Read one task execution of a run you own: its state, and either its success digest with the inputs it was computed from or its failure diagnostics.",
+      inputSchema: { ...runIdentity, executionId: z.string().min(1) },
+    },
+    async (args) => read("task_execution_get", (peer) => {
+      const fenced = owner(peer, args.runId);
+      return fenced.allowed ? respond(port.workerExecution(args.executionId, args.runId)) : respond(fenced);
     }),
   );
   server.registerTool(

@@ -73,6 +73,11 @@ export interface ExecutionStart {
   contextPacketDigest?: string | null;
   /** Must match the immutable run harness when the caller knows it. */
   harnessDigest?: string | null;
+  /**
+   * #512 — the control plane launches and owns this execution (`task_worker_run`). Its receipts
+   * are the runtime's; the CTO's task_receipt_submit may neither open nor close it.
+   */
+  runtimeManaged?: boolean;
 }
 
 export interface ExecutionOutcome {
@@ -99,6 +104,13 @@ export interface ExecutionRecord {
   model: string;
   workerSessionId: string;
   ownerBindingGeneration: number;
+  /** #512 — launched and owned by the control plane rather than reported by the CTO. */
+  runtimeManaged: boolean;
+  workerProcessId: number | null;
+  /** The OS start time the spawned process reported, never the database clock. */
+  workerProcessStartedAt: string | null;
+  repositoryId: string | null;
+  worktreeId: string | null;
 }
 
 /** The worker allocator must admit its exact lower-priority allocation before recording it. */
@@ -389,12 +401,14 @@ export class TaskGraph {
       this.db.run(
         `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
                                       worker_session_id, worker_process_id, provider, model,
-                                      repository_id, worktree_id, concurrency_width, started_at, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING')`,
+                                      repository_id, worktree_id, concurrency_width, started_at, status,
+                                      runtime_managed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?)`,
         [
           executionId, input.runId, input.taskId, attempt, input.ownerBindingGeneration,
           input.workerSessionId, input.workerProcessId ?? null, input.provider, input.model,
           input.repositoryId ?? null, input.worktreeId ?? null, input.concurrencyWidth ?? null, now,
+          input.runtimeManaged === true ? 1 : 0,
         ],
       );
       this.db.run(
@@ -413,6 +427,7 @@ export class TaskGraph {
           model: input.model,
           worktreeId: input.worktreeId ?? null,
           ownerBindingGeneration: input.ownerBindingGeneration,
+          runtimeManaged: input.runtimeManaged === true,
         },
       });
 
@@ -614,6 +629,31 @@ export class TaskGraph {
 
       return allow(ReasonCode.OK, this.execution(executionId)!);
     });
+  }
+
+  /**
+   * #512 — the process a runtime-managed execution spawned, as the process itself reported it.
+   *
+   * Written once, while the execution is still RUNNING, so a restart can find the worker and tell
+   * it apart from a later process that reuses its pid. `startedAt` is the OS start time read from
+   * the process; a null one is recorded as unknown, which a restart treats as unidentifiable.
+   */
+  recordWorkerProcess(executionId: string, pid: number, startedAt: string | null): Decision<void> {
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "a worker process id must be a positive integer", { executionId, pid });
+    }
+    const written = this.db.run(
+      `UPDATE task_executions SET worker_process_id = ?, worker_process_started_at = ?
+        WHERE execution_id = ? AND status = 'RUNNING' AND runtime_managed = 1 AND worker_process_id IS NULL`,
+      [pid, startedAt, executionId],
+    ).changes;
+    if (written !== 1) {
+      return deny(ReasonCode.CONFLICT, "only a running runtime-managed execution records its process, once", {
+        executionId,
+        pid,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /** §25.2 — a long job records a low-frequency activity lease, not a heartbeat. */
@@ -946,6 +986,11 @@ interface RawExecution {
   model: string;
   worker_session_id: string;
   owner_binding_generation: number;
+  runtime_managed: number;
+  worker_process_id: number | null;
+  worker_process_started_at: string | null;
+  repository_id: string | null;
+  worktree_id: string | null;
 }
 
 const hydrateExecution = (row: RawExecution): ExecutionRecord => ({
@@ -963,4 +1008,9 @@ const hydrateExecution = (row: RawExecution): ExecutionRecord => ({
   model: row.model,
   workerSessionId: row.worker_session_id,
   ownerBindingGeneration: row.owner_binding_generation,
+  runtimeManaged: row.runtime_managed === 1,
+  workerProcessId: row.worker_process_id,
+  workerProcessStartedAt: row.worker_process_started_at,
+  repositoryId: row.repository_id,
+  worktreeId: row.worktree_id,
 });

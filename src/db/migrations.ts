@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 40;
+export const SCHEMA_VERSION = 41;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -135,6 +135,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- -{75}\n-- peer_message_carries[\s\S]*?CREATE TRIGGER IF NOT EXISTS holder_message_departures_no_delete[\s\S]*?\nEND;/,
   // v40 alone installs the Buzz source key guard (ACP-RESTART-02).
   /-- CP-HI-06 — a Buzz event's admitted row \(ACP-RESTART-02, schema v40\)[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_buzz_source_key_immutable[\s\S]*?\nEND;/,
+  // v41 alone installs the worker-session independence guards (#512), both directions.
+  /-- -{75}\n-- worker session independence[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_owner_session_not_its_worker[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -2784,6 +2786,130 @@ const v40: SchemaMigration = {
   checksum: () => migrationChecksum("v40-peer-message-carry-record", SCHEMA_VERSION),
 };
 
+/**
+ * v41's guards, read from schema.sql by name: one per write that can put a WORKER and another
+ * authority in one session, whichever of the two is attached first.
+ */
+const V41_WORKER_INDEPENDENCE_TRIGGER_NAMES: readonly string[] = [
+  "assignments_worker_session_independent",
+  "assignments_worker_session_independent_on_activate",
+  "conversational_actors_worker_session_independent",
+  "assignments_session_holds_no_worker",
+  "assignments_session_holds_no_worker_on_activate",
+  "conversational_actors_session_holds_no_worker",
+  "runs_owner_session_not_its_worker",
+];
+
+/** v41's two task_executions columns, each with the shape schema.sql declares for it. */
+const V41_TASK_EXECUTION_COLUMNS: ReadonlyArray<{
+  name: string;
+  type: string;
+  notnull: number;
+  defaultValue: string | null;
+  /** Rows a database may already hold under this column without anything here having written them. */
+  unvouched: string;
+}> = [
+  { name: "runtime_managed", type: "INTEGER", notnull: 1, defaultValue: "0", unvouched: "runtime_managed <> 0" },
+  { name: "worker_process_started_at", type: "TEXT", notnull: 0, defaultValue: null, unvouched: "worker_process_started_at IS NOT NULL" },
+];
+
+/**
+ * ACTIVE WORKER bindings that already share a session with their run's owner or with another ACTIVE
+ * role — exactly what v41's triggers refuse from now on, in both directions, written as one query
+ * over the same facts. Which of the two was attached first leaves no trace in the rows, and does
+ * not matter: the pair is refused either way.
+ */
+const V41_WORKER_SESSION_VIOLATIONS = `
+  SELECT w.assignment_id FROM assignments w
+    LEFT JOIN conversational_actors wc ON wc.actor_id = w.actor_id
+   WHERE w.role = 'WORKER' AND w.status = 'ACTIVE' AND (
+     EXISTS (
+       SELECT 1 FROM runs r
+        WHERE r.owner_session_id IN (w.session_id, wc.current_session_id)
+          AND (r.run_id = w.run_id
+               OR r.run_id IN (SELECT t.run_id FROM tasks t WHERE t.task_id = w.task_id)))
+     OR EXISTS (
+       SELECT 1 FROM assignments o
+         LEFT JOIN conversational_actors oc ON oc.actor_id = o.actor_id
+        WHERE o.status = 'ACTIVE' AND o.role <> 'WORKER'
+          AND (o.actor_id = w.actor_id
+               OR o.session_id IN (w.session_id, wc.current_session_id)
+               OR oc.current_session_id IN (w.session_id, wc.current_session_id))))
+   ORDER BY w.assignment_id`;
+
+/**
+ * #512. The control plane now runs a worker turn itself (`task_worker_run`), so two facts become
+ * durable and one rule becomes the database's.
+ *
+ * `task_executions.runtime_managed` marks the executions the runtime launched: their started and
+ * finished receipts are the control plane's, never the CTO's. `task_executions.worker_process_started_at`
+ * holds the OS start time read from the spawned process, so a restart can tell the recorded worker
+ * from a process that merely reuses its pid.
+ *
+ * And the implementer is a separate session, whichever role is attached first. Three triggers refuse
+ * an ACTIVE WORKER binding whose session is its run owner's or holds another ACTIVE non-WORKER
+ * binding — on INSERT, on a move to ACTIVE, and when a WORKER actor's live pointer moves onto such a
+ * session. Four refuse the reverse: a non-WORKER binding inserted or made ACTIVE on a session an
+ * ACTIVE WORKER binding holds, a non-WORKER actor's pointer moved onto one, and a run's owner pin
+ * moved onto the session that is the WORKER of one of its tasks. All raise
+ * `WORKER_SESSION_NOT_INDEPENDENT`.
+ *
+ * Fails closed. A database that already holds such a binding is not migrated: nothing here may
+ * decide which of the two roles the shared session should lose, so the step throws and the whole
+ * migration rolls back with every row as it was. It never revokes, rewrites or deletes data.
+ *
+ * Additive otherwise: two nullable-or-defaulted columns and seven triggers. A chain test can build a
+ * v40 image out of a current database, which already has both columns; a column already present is
+ * accepted only with schema.sql's exact shape and no value this step did not write, and the
+ * triggers are dropped and recreated, as v40 does for its own.
+ *
+ * A live database at v40 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v41: SchemaMigration = {
+  id: "v41-runtime-managed-worker-turns",
+  fromVersion: 40,
+  toVersion: 41,
+  apply: (raw) => {
+    const present = new Map(
+      (raw.pragma("table_xinfo(task_executions)") as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        dflt_value: string | null;
+      }>).map((column) => [column.name, column]),
+    );
+    for (const column of V41_TASK_EXECUTION_COLUMNS) {
+      const existing = present.get(column.name);
+      if (existing !== undefined) {
+        if (existing.type.toUpperCase() !== column.type || existing.notnull !== column.notnull
+            || existing.dflt_value !== column.defaultValue
+            || raw.prepare(`SELECT 1 FROM task_executions WHERE ${column.unvouched} LIMIT 1`).get()) {
+          throw new Error(`v41 pre-existing task_executions.${column.name} does not match the current schema or is populated`);
+        }
+        continue;
+      }
+      const definition = schemaObject(
+        new RegExp(`^\\s*${column.name}\\s+${column.type}\\b[^\\n]*?(?=,\\n)`, "m"),
+        `the task_executions.${column.name} column`,
+        SCHEMA_VERSION,
+      ).trim();
+      raw.exec(`ALTER TABLE task_executions ADD COLUMN ${definition}`);
+    }
+    const violations = (raw.prepare(V41_WORKER_SESSION_VIOLATIONS).all() as Array<{ assignment_id: string }>)
+      .map((row) => row.assignment_id);
+    if (violations.length > 0) {
+      throw new Error(
+        `v41 refuses to migrate: ${violations.length} ACTIVE WORKER binding(s) share a session with their run's owner `
+        + `or another role (${violations.join(", ")}); nothing was changed`,
+      );
+    }
+    raw.exec(dropsFor(V41_WORKER_INDEPENDENCE_TRIGGER_NAMES));
+    raw.exec(triggerDdlFor(V41_WORKER_INDEPENDENCE_TRIGGER_NAMES, SCHEMA_VERSION));
+  },
+  checksum: () => migrationChecksum("v41-runtime-managed-worker-turns", SCHEMA_VERSION),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2814,6 +2940,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v38,
   v39,
   v40,
+  v41,
 ]);
 
 interface RequiredTrigger {
@@ -2947,6 +3074,13 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "holder_message_departures_no_replace", sentinel: "HOLDER_MESSAGE_DEPARTURE_NO_REPLACE", introducedIn: 40 },
   { name: "holder_message_departures_immutable", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
   { name: "holder_message_departures_no_delete", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
+  { name: "assignments_worker_session_independent", sentinel: "WORKER_SESSION_NOT_INDEPENDENT", introducedIn: 41 },
+  { name: "assignments_worker_session_independent_on_activate", sentinel: "WORKER_SESSION_NOT_INDEPENDENT", introducedIn: 41 },
+  { name: "conversational_actors_worker_session_independent", sentinel: "WORKER_SESSION_NOT_INDEPENDENT", introducedIn: 41 },
+  { name: "assignments_session_holds_no_worker", sentinel: "WORKER_SESSION_NOT_INDEPENDENT", introducedIn: 41 },
+  { name: "assignments_session_holds_no_worker_on_activate", sentinel: "WORKER_SESSION_NOT_INDEPENDENT", introducedIn: 41 },
+  { name: "conversational_actors_session_holds_no_worker", sentinel: "WORKER_SESSION_NOT_INDEPENDENT", introducedIn: 41 },
+  { name: "runs_owner_session_not_its_worker", sentinel: "WORKER_SESSION_NOT_INDEPENDENT", introducedIn: 41 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 
