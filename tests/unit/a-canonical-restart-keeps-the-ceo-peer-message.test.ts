@@ -1,6 +1,8 @@
 import Database from "better-sqlite3";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -23,7 +25,11 @@ import {
   ownerMessageLedger,
   startBuzzMessageIngressListener,
   startDaemonBuzzMentionSubscriber,
+  startLocalMcpListeners,
 } from "../../src/daemon/agentcpd.ts";
+import { createCtoBindingRuntime } from "../../src/daemon/cto-binding-runtime.ts";
+import { type DaemonNoticeBody, deliverOwedPeerMessageNotices } from "../../src/runtime/acp-daemon-notice.ts";
+import { runBoundedChild } from "../helpers/bounded-child.ts";
 import { recoverDeadCanonicalBinding } from "../../src/daemon/dead-binding-recovery.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
@@ -2384,6 +2390,270 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
     }
   });
 
+  /**
+   * Round-3 review, 01: the holder's claim read only MESSAGE_DEPARTED. A turn the ingress completed,
+   * its terminal fact then erased with an ordinary json_remove, kept its TURN_TERMINAL record — and
+   * the holder still received the instruction: the original holder, and the successor after a
+   * genuine carry. Every hand-over path now asks one predicate, `handOverEligibleSql`.
+   */
+  const TERMINAL_FACTS = ["noReplyAt", "repliedAt", "settledAt"] as const;
+  /**
+   * The turn reaches a terminal fact and a statement then erases it. `noReplyAt` through the real
+   * ingress no-reply completion; `repliedAt` and `settledAt` as the reply and receipt paths write
+   * them onto the claim (the receipt path's own settlement is covered by (p)).
+   */
+  const answerThenErase = (fixture: Fixture, eventId: string, fact: (typeof TERMINAL_FACTS)[number]): void => {
+    const { harness } = fixture;
+    const nonce = buzzMessageNonce(eventId);
+    if (fact === "noReplyAt") {
+      expect(new IngressGuard(harness.cp.db, harness.clock, harness.cp.audit, {})
+        .completeNoReplyAndResolveTurn("buzz", nonce).allowed).toBe(true);
+    } else {
+      harness.cp.db.run(
+        `UPDATE inbound_messages SET turn_claim_json = json_set(turn_claim_json, '$.${fact}', ?)
+          WHERE channel = 'buzz' AND nonce = ?`,
+        [harness.clock.nowIso(), nonce],
+      );
+    }
+    expect(fixture.turnClaim(eventId)[fact]).toEqual(expect.any(String));
+    harness.cp.db.run(
+      `UPDATE inbound_messages SET turn_claim_json = json_remove(turn_claim_json, '$.${fact}')
+        WHERE channel = 'buzz' AND nonce = ?`,
+      [nonce],
+    );
+    expect(fixture.turnClaim(eventId)[fact]).toBeUndefined();
+    expect(harness.cp.db.get(
+      `SELECT reason FROM holder_message_source_departures WHERE source_channel = 'buzz' AND source_nonce = ?`,
+      [nonce],
+    )).toEqual({ reason: "TURN_TERMINAL" });
+  };
+
+  it.each(TERMINAL_FACTS)("R3a the original holder is not handed a turn that held %s, after it was erased", async (fact) => {
+    const fixture = await startFixture();
+    try {
+      const ledger = ownerMessageLedger(fixture.harness.cp);
+      const holder = fixture.holderOf(fixture.first.sessionId);
+      const event = await fixture.ceoSays(`${fact} 뒤에 기록이 지워진 지시`);
+      const [queued] = fixture.peerRows();
+      answerThenErase(fixture, event.id, fact);
+      expect(fixture.peerRows()[0]).toMatchObject({ status: "PENDING" });
+      const before = fixture.writes();
+      const again = ledger.claim(holder);
+      expect(handedOver(again.allowed ? again.value : null)).toMatchObject({
+        claimed: null, withheld: [{ messageId: queued!.message_id }],
+      });
+      expect(fixture.harness.cp.outbox.claimForHolder(holder, () => true).claimed).toEqual([]);
+      expect(fixture.writes()).toBe(before);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it.each(TERMINAL_FACTS)("R3b the successor after a genuine carry is not handed a turn that held %s, after it was erased", async (fact) => {
+    const fixture = await startFixture();
+    try {
+      const ledger = ownerMessageLedger(fixture.harness.cp);
+      const event = await fixture.ceoSays(`옮겨진 뒤 ${fact} 가 지워진 지시`);
+      const [queued] = fixture.peerRows();
+      const successor = await restart(fixture, 2);
+      expect(fixture.carries().map((carry) => [carry.message_id, carry.outcome])).toEqual([[queued!.message_id, "CARRIED"]]);
+      answerThenErase(fixture, event.id, fact);
+      const holder = fixture.holderOf(successor.sessionId);
+      const got = ledger.claim(holder);
+      expect(handedOver(got.allowed ? got.value : null)).toMatchObject({
+        claimed: null, withheld: [{ messageId: queued!.message_id }],
+      });
+      expect(fixture.harness.cp.outbox.claimForHolder(holder, () => true).claimed).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it.each(TERMINAL_FACTS)("R3c a takeover and a runtime move reject an owner's message whose turn held %s", (fact) => {
+    for (const move of ["takeover", "runtime-move"] as const) {
+      const core = makeCore();
+      const run = seedRun({ db: core.db, clock: core.clock, repoPath: makeRepo() });
+      const enqueue = (nonce: string): string => {
+        const queued = core.outbox.enqueue({
+          idempotencyKey: `owner-message:${nonce}`, roleKey: run.roleKey, bindingGeneration: run.generation,
+          targetSessionId: run.sessionId, runId: run.runId, kind: MessageKind.OWNER_MESSAGE,
+          payload: { sourceChannel: "buzz", sourceNonce: nonce, sourcePayloadDigest: `sha256:${nonce}` },
+        });
+        if (!queued.allowed) throw new Error(`enqueue failed: ${queued.message}`);
+        return queued.value.messageId;
+      };
+      // The admitted event, answered, and the fact then erased from its claim.
+      core.db.run(
+        `INSERT INTO inbound_messages (channel, nonce, actor, received_at, turn_claim_json)
+         VALUES ('buzz', 'buzz-message:answered', 'owner', ?, ?)`,
+        [core.clock.nowIso(), JSON.stringify({ turnRequestId: "turn-answered", [fact]: core.clock.nowIso() })],
+      );
+      core.db.run(
+        `UPDATE inbound_messages SET turn_claim_json = json_remove(turn_claim_json, '$.${fact}')
+          WHERE channel = 'buzz' AND nonce = 'buzz-message:answered'`,
+      );
+      const answered = enqueue("buzz-message:answered");
+      const fresh = enqueue("buzz-message:fresh");
+      const successor = core.sessions.create({ provider: "claude", model: "successor-cto" });
+      expect(core.sessions.transition(successor.sessionId, SessionLifecycle.READY, "failover").allowed).toBe(true);
+      const moved = move === "takeover"
+        ? core.outbox.retargetOrReject(run.roleKey, run.generation, run.generation + 1, successor.sessionId)
+        : core.outbox.carryHolderMessagesToRuntime(run.roleKey, run.generation, run.sessionId, successor.sessionId);
+      const passed = "retargeted" in moved ? moved.retargeted : moved.carried;
+      expect(passed, `${move} ${fact}`).toEqual([fresh]);
+      expect(moved.rejected, `${move} ${fact}`).toEqual([answered]);
+    }
+  });
+
+  /**
+   * The predicate is asserted twice on a path: by the read that chooses the row and by the statement
+   * that moves it, in one transaction. Each layer gets a row that fails when only it is removed: the
+   * read is made to miss the answered turn, so only the write stands between it and a hand-over; or
+   * the write is watched, so the read's refusal is seen to come before any write is attempted.
+   */
+  it("R3d the claim's write refuses an answered turn even when its read has missed it", async () => {
+    const fixture = await startFixture();
+    try {
+      const { db } = fixture.harness.cp;
+      const holder = fixture.holderOf(fixture.first.sessionId);
+      const event = await fixture.ceoSays("읽기가 놓친 끝난 지시");
+      const [queued] = fixture.peerRows();
+      answerThenErase(fixture, event.id, "noReplyAt");
+      const all = db.all.bind(db);
+      const spy = vi.spyOn(db, "all").mockImplementation(((sql: string, params: unknown[] = []) => {
+        const rows = all(sql, params) as Array<Record<string, unknown>>;
+        return /AS never_departed/.test(sql) ? rows.map((row) => ({ ...row, never_departed: 1 })) : rows;
+      }) as typeof db.all);
+      let claimed: unknown[];
+      try {
+        claimed = fixture.harness.cp.outbox.claimForHolder(holder, () => true).claimed;
+      } finally {
+        spy.mockRestore();
+      }
+      expect(claimed).toEqual([]);
+      expect(fixture.peerRows()[0]).toMatchObject({ message_id: queued!.message_id, status: "PENDING" });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("R3e the carry's write refuses an answered turn even when its read has missed it", async () => {
+    const fixture = await startFixture();
+    try {
+      const { db } = fixture.harness.cp;
+      const event = await fixture.ceoSays("운반 읽기가 놓친 끝난 지시");
+      const [queued] = fixture.peerRows();
+      answerThenErase(fixture, event.id, "noReplyAt");
+      const get = db.get.bind(db);
+      const spy = vi.spyOn(db, "get").mockImplementation(((sql: string, params: unknown[] = []) =>
+        /AS eligible FROM outbox o/.test(sql) ? { eligible: 1 } : get(sql, params)) as typeof db.get);
+      try {
+        await restart(fixture, 2);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(fixture.carries().map((carry) => [carry.message_id, carry.outcome, carry.refusal])).toEqual([
+        [queued!.message_id, "REFUSED", "ALREADY_CLAIMED"],
+      ]);
+      expect(fixture.peerRows()[0]).toMatchObject({ status: "REJECTED", binding_generation: 1 });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("R3f the carry's read refuses an answered turn before any carry write is attempted", async () => {
+    const fixture = await startFixture();
+    try {
+      const { db } = fixture.harness.cp;
+      const event = await fixture.ceoSays("쓰기 전에 거절되는 끝난 지시");
+      const [queued] = fixture.peerRows();
+      answerThenErase(fixture, event.id, "noReplyAt");
+      const run = db.run.bind(db);
+      let carryWrites = 0;
+      const spy = vi.spyOn(db, "run").mockImplementation(((sql: string, params: unknown[] = []) => {
+        if (/AND attempts = 0 AND sent_at IS NULL AND claim_token IS NULL/.test(sql)) carryWrites += 1;
+        return run(sql, params);
+      }) as typeof db.run);
+      try {
+        await restart(fixture, 2);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(carryWrites).toBe(0);
+      expect(fixture.carries().map((carry) => [carry.message_id, carry.outcome, carry.refusal])).toEqual([
+        [queued!.message_id, "REFUSED", "ALREADY_CLAIMED"],
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  /** An owner's message whose admitted event was answered and the fact erased, beside a fresh one. */
+  const answeredOwnerMessage = () => {
+    const core = makeCore();
+    const run = seedRun({ db: core.db, clock: core.clock, repoPath: makeRepo() });
+    const enqueue = (nonce: string): string => {
+      const queued = core.outbox.enqueue({
+        idempotencyKey: `owner-message:${nonce}`, roleKey: run.roleKey, bindingGeneration: run.generation,
+        targetSessionId: run.sessionId, runId: run.runId, kind: MessageKind.OWNER_MESSAGE,
+        payload: { sourceChannel: "buzz", sourceNonce: nonce, sourcePayloadDigest: `sha256:${nonce}` },
+      });
+      if (!queued.allowed) throw new Error(`enqueue failed: ${queued.message}`);
+      return queued.value.messageId;
+    };
+    core.db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, turn_claim_json)
+       VALUES ('buzz', 'buzz-message:answered', 'owner', ?, ?)`,
+      [core.clock.nowIso(), JSON.stringify({ turnRequestId: "turn-answered", noReplyAt: core.clock.nowIso() })],
+    );
+    core.db.run(`UPDATE inbound_messages SET turn_claim_json = json_remove(turn_claim_json, '$.noReplyAt')
+                  WHERE channel = 'buzz' AND nonce = 'buzz-message:answered'`);
+    const answered = enqueue("buzz-message:answered");
+    const fresh = enqueue("buzz-message:fresh");
+    const successor = core.sessions.create({ provider: "claude", model: "successor-cto" });
+    expect(core.sessions.transition(successor.sessionId, SessionLifecycle.READY, "failover").allowed).toBe(true);
+    const move = (kind: "takeover" | "runtime-move") => {
+      const moved = kind === "takeover"
+        ? core.outbox.retargetOrReject(run.roleKey, run.generation, run.generation + 1, successor.sessionId)
+        : core.outbox.carryHolderMessagesToRuntime(run.roleKey, run.generation, run.sessionId, successor.sessionId);
+      return { passed: "retargeted" in moved ? moved.retargeted : moved.carried, rejected: moved.rejected };
+    };
+    return { core, answered, fresh, move };
+  };
+
+  it.each(["takeover", "runtime-move"] as const)("R3g the %s write refuses an answered turn even when its read has missed it", (kind) => {
+    const { core, answered, fresh, move } = answeredOwnerMessage();
+    const get = core.db.get.bind(core.db);
+    const spy = vi.spyOn(core.db, "get").mockImplementation(((sql: string, params: unknown[] = []) =>
+      /AS eligible FROM outbox o/.test(sql) ? { eligible: 1 } : get(sql, params)) as typeof core.db.get);
+    let moved: ReturnType<typeof move>;
+    try {
+      moved = move(kind);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(moved).toEqual({ passed: [fresh], rejected: [answered] });
+  });
+
+  it.each(["takeover", "runtime-move"] as const)("R3h the %s read refuses an answered turn before any move is attempted", (kind) => {
+    const { core, answered, fresh, move } = answeredOwnerMessage();
+    const run = core.db.run.bind(core.db);
+    const attempts: string[] = [];
+    const spy = vi.spyOn(core.db, "run").mockImplementation(((sql: string, params: unknown[] = []) => {
+      if (/^\s*UPDATE outbox SET (binding_generation = \?, )?target_session_id = \?/.test(sql) &&
+          params.includes(answered)) attempts.push(answered);
+      return run(sql, params);
+    }) as typeof core.db.run);
+    let moved: ReturnType<typeof move>;
+    try {
+      moved = move(kind);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(attempts).toEqual([]);
+    expect(moved).toEqual({ passed: [fresh], rejected: [answered] });
+  });
+
   describe("an owner's message put back by raw SQL is not moved to anyone either", () => {
     const SEEDED_INCARNATION = "inc-1";
     const seeded = () => {
@@ -2492,6 +2762,180 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
  * control plane per database — and claims through `Outbox.claimForHolder` with a predicate that
  * admits every row, so only the claim's own SQL and compare-and-set stand between it and the row.
  */
+/**
+ * The coverage the final review (round 3) listed as unverified: an explicit unlink, retargeting by
+ * two independent OS processes at once, and the refusal reported through the real CTO socket.
+ */
+describe("finding 01/04: an explicit unlink, two OS processes, and the real CTO socket", () => {
+  it("an explicit unlink — the CEO releases the live CTO's binding — refuses the queued peer message and owes its sender a notice", async () => {
+    const fixture = await startFixture();
+    try {
+      const { harness } = fixture;
+      const event = await fixture.ceoSays("풀려나기 전에 대기 중인 지시");
+      const [queued] = fixture.peerRows();
+      // The CEO's own door for ending a live CTO's binding, as `cto_binding_release` calls it.
+      const released = createCtoBindingRuntime(harness.cp, undefined).release(fixture.ceoSession, {
+        requestId: "release-1", projectId: fixture.projectId, role: "PRIMARY_CTO", action: "release",
+        expectedBindingGeneration: 1, reason: "explicit unlink",
+      });
+      expect(released.allowed, JSON.stringify(released)).toBe(true);
+      expect(harness.cp.bindings.active(fixture.ctoRoleKey)).toBeNull();
+      expect(fixture.peerRows()[0]).toMatchObject({ message_id: queued!.message_id, status: "REJECTED", binding_generation: 1 });
+      expect(fixture.turnClaim(event.id)["noReplyAt"]).toEqual(expect.any(String));
+      expect(fixture.carries()).toEqual([]);
+      expect(harness.cp.db.all(
+        `SELECT message_id, entry, reason, sender FROM peer_message_refusal_notices ORDER BY entry`,
+      )).toEqual([{ message_id: queued!.message_id, entry: "OWED", reason: "REVOKED", sender: fixture.ceo.pubkey }]);
+
+      // And with no CTO at all the daemon tells the sender: one notice, settled once, metadata only.
+      const destination = {
+        session_id: "20261004_000000_ceo", lineage_root_digest: `sha256:${"a".repeat(64)}`,
+        process_pid: 4242, process_started_at: "darwin-tv:1790000000.000001",
+      };
+      const sent: DaemonNoticeBody[] = [];
+      const report = await deliverOwedPeerMessageNotices(harness.cp.outbox, async () => ({
+        destination,
+        send: async (body) => {
+          sent.push(body);
+          return { kind: "RESPONDED", status: 200, body: {
+            event_id: body.event_id, payload_digest: body.payload_digest, text: "noted",
+            receipt: { receipt_id: "receipt-1", status: "completed", session_id: destination.session_id,
+              lineage_root_digest: destination.lineage_root_digest },
+          } };
+        },
+      }), "unlink-test-lane-secret");
+      expect(report.settled).toHaveLength(1);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.text).toContain(`message_id=${queued!.message_id}`);
+      expect(sent[0]!.text).toContain("reason=REVOKED");
+      expect(sent[0]!.text).not.toContain("풀려나기 전에");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("two independent OS processes restarting the conversation at once: one carry, one holder", async () => {
+    const fixture = await startFixture();
+    try {
+      const { harness } = fixture;
+      await fixture.ceoSays("두 프로세스가 동시에 옮기려는 지시");
+      const [queued] = fixture.peerRows();
+      const barrier = tempDir("acp-xproc-");
+      const child = fileURLToPath(new URL("../helpers/canonical-restart-child.ts", import.meta.url));
+      const input = (name: string): string => JSON.stringify({
+        root: harness.root, repoPath: harness.repoPath,
+        nowIso: new Date(harness.clock.now().getTime() + 60_000).toISOString(),
+        projectId: fixture.projectId, ctoBuzzActor: fixture.cto.pubkey, ownerActor: fixture.owner.pubkey,
+        barrierDir: barrier, name, run: 2, canon: CANON, cwd: CWD, room: PROJECT_ROOM,
+        protocol: PEER_PROTOCOL, identity: PEER_IDENTITY,
+      });
+      const spawn = (name: string) => runBoundedChild(
+        process.execPath, ["--experimental-transform-types", "--no-warnings", child, input(name)],
+        { cwd: process.cwd(), budgetMs: 120_000 },
+      );
+      const running = [spawn("a"), spawn("b")];
+      // Both processes are up, with their own connection open, before either claims.
+      const deadline = Date.now() + 110_000;
+      while (!(existsSync(join(barrier, "a.ready")) && existsSync(join(barrier, "b.ready")))) {
+        if (Date.now() > deadline) throw new Error("the child processes never became ready");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      writeFileSync(join(barrier, "go"), "");
+      const outcomes = (await Promise.all(running)).map((result) => {
+        expect(result.status, result.stderr).toBe(0);
+        return JSON.parse(result.stdout.trim().split("\n").at(-1)!) as {
+          allowed: boolean; sessionId?: string; reasonCode?: string; threw?: string; pid: number;
+        };
+      });
+      expect(new Set(outcomes.map((outcome) => outcome.pid)).size).toBe(2);
+      expect(outcomes.every((outcome) => outcome.pid !== process.pid)).toBe(true);
+      const winners = outcomes.filter((outcome) => outcome.allowed);
+      expect(winners, JSON.stringify(outcomes)).toHaveLength(1);
+      const loser = outcomes.find((outcome) => !outcome.allowed)!;
+      expect(loser.threw, JSON.stringify(loser)).toBeUndefined();
+      // Exactly one record for the message, the carry, and the row with exactly one holder.
+      expect(fixture.carries().map((carry) => [carry.message_id, carry.outcome, carry.to_session_id]))
+        .toEqual([[queued!.message_id, "CARRIED", winners[0]!.sessionId]]);
+      expect(fixture.peerRows()[0]).toMatchObject({
+        status: "PENDING", binding_generation: 2, target_session_id: winners[0]!.sessionId,
+      });
+      const ledger = ownerMessageLedger(harness.cp);
+      const holder = fixture.holderOf(winners[0]!.sessionId!);
+      expect(handedOver((() => { const t = ledger.claim(holder); return t.allowed ? t.value : null; })()).claimed)
+        .toMatchObject({ messageId: queued!.message_id });
+      expect(handedOver((() => { const t = ledger.claim(holder); return t.allowed ? t.value : null; })()).claimed)
+        .toBeNull();
+    } finally {
+      await fixture.close();
+    }
+  }, 180_000);
+
+  it("the refusal reaches the successor through the real CTO socket, and its report travels back over it", async () => {
+    const fixture = await startFixture();
+    const listeners = await startLocalMcpListeners(fixture.harness.cp, tempDir("acp-crs-"), "socket-test-token");
+    let socket: ReturnType<typeof createConnection> | null = null;
+    try {
+      await fixture.ceoSays("소켓으로 알려질 거절된 지시");
+      const [queued] = fixture.peerRows();
+      // The operator's dead-binding door releases generation 1: the row is rejected and a notice owed.
+      const predecessor = fixture.harness.cp.sessions.require(fixture.first.sessionId);
+      expect(recoverDeadCanonicalBinding("operator", {
+        projectId: fixture.projectId, role: Role.PRIMARY_CTO, sessionId: predecessor.sessionId,
+        sessionIncarnation: predecessor.incarnation, expectedBindingGeneration: 1,
+      }, {
+        db: fixture.harness.cp.db, audit: fixture.harness.cp.audit, sessions: fixture.harness.cp.sessions,
+        bindings: fixture.harness.cp.bindings, liveness: { signal: signalFrom(claudeRun(2)) },
+      }).allowed).toBe(true);
+      const successor = await restart(fixture, 2);
+      const ctoPath = listeners.socketPaths[1]!;
+      socket = createConnection(ctoPath);
+      await new Promise<void>((resolve, reject) => { socket!.once("connect", resolve); socket!.once("error", reject); });
+      const pending = new Map<number, (body: Record<string, unknown>) => void>();
+      let buffer = "";
+      let nextId = 2;
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString();
+        for (let newline = buffer.indexOf("\n"); newline >= 0; newline = buffer.indexOf("\n")) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          let message: { id?: number; method?: string; result?: { structuredContent?: Record<string, unknown> } };
+          try { message = JSON.parse(line) as typeof message; } catch { continue; }
+          if (message.method === undefined && message.id !== undefined && pending.has(message.id)) {
+            pending.get(message.id)!(message.result?.structuredContent ?? { ok: false });
+            pending.delete(message.id);
+          }
+        }
+      });
+      socket.write(`${JSON.stringify({ token: "socket-test-token", sessionId: successor.sessionId,
+        sessionSecret: successor.sessionSecret })}\n${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2025-11-25", capabilities: { sampling: {} },
+          clientInfo: { name: "cto-peer", version: "1" } } })}\n${JSON.stringify({ jsonrpc: "2.0",
+        method: "notifications/initialized", params: {} })}\n`);
+      const call = (name: string, args: Record<string, unknown>) => new Promise<Record<string, unknown>>((resolve) => {
+        const id = nextId++;
+        pending.set(id, resolve);
+        socket!.write(`${JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } })}\n`);
+      });
+      const first = await call("role_owner_message_claim", { roleKey: fixture.ctoRoleKey });
+      expect(first, JSON.stringify(first)).toMatchObject({ ok: true });
+      expect((first["value"] as { refusedAtRestart?: unknown[] }).refusedAtRestart).toEqual([
+        expect.objectContaining({ messageId: queued!.message_id, reason: "REVOKED" }),
+      ]);
+      expect(JSON.stringify(first)).not.toContain("소켓으로 알려질");
+      const reported = await call("role_owner_message_report_refusal", {
+        roleKey: fixture.ctoRoleKey, messageId: queued!.message_id,
+      });
+      expect(reported, JSON.stringify(reported)).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      const after = await call("role_owner_message_claim", { roleKey: fixture.ctoRoleKey });
+      expect((after["value"] as { refusedAtRestart?: unknown[] }).refusedAtRestart).toBeUndefined();
+    } finally {
+      socket?.destroy();
+      await listeners.close();
+      await fixture.close();
+    }
+  }, 60_000);
+});
+
 describe("W6 the holder's claim and the restart's carry, on two connections, hand the message to one holder once", () => {
   /** A second connection to the same database file, as another process holds one. */
   const secondConnection = (fixture: Fixture) => {

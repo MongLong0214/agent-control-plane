@@ -199,10 +199,18 @@ export const sourceNeverSpentSql = (alias: string, reasons: readonly SourceSpent
         THEN CASE WHEN json_extract(${alias}.payload_json, '$.sourceChannel') = 'buzz'
                   THEN json_extract(${alias}.payload_json, '$.sourceNonce') END END))`;
 
-/** A hand-over refuses an event an earlier message already took out of PENDING. */
-const HANDED: readonly SourceSpentReason[] = ["MESSAGE_DEPARTED"];
-/** The restart's carry also refuses an event whose turn ever held a terminal fact. */
-const HANDED_OR_TERMINAL: readonly SourceSpentReason[] = ["MESSAGE_DEPARTED", "TURN_TERMINAL"];
+/**
+ * The one hand-over predicate (review finding 01, round 3). The row `alias` names may go to anyone —
+ * claimed by its holder, retargeted on a takeover, re-addressed on a runtime move, carried on a
+ * restart — only if it never left PENDING and its admitted event was never spent: not taken out of
+ * PENDING under another message id, and not answered. Answered means the event's turn once held a
+ * terminal fact (`TURN_TERMINAL`), however its claim JSON reads now, so an ordinary `json_remove`
+ * after the ingress completed the turn hands nothing over. Every one of those paths asserts exactly
+ * this, in the read that chooses the row and in the statement that moves it, and nothing else does,
+ * so the paths cannot drift apart again.
+ */
+export const handOverEligibleSql = (alias: string): string =>
+  `(${neverDepartedSql(alias)} AND ${sourceNeverSpentSql(alias, ["MESSAGE_DEPARTED", "TURN_TERMINAL"])})`;
 
 /**
  * The outward, role-level kinds an adopted canonical CTO receives in band rather than over Buzz.
@@ -735,7 +743,7 @@ export class Outbox {
       // handed over at all (#1044) — and it decides before anything below writes. A withheld row is
       // skipped, so one stale peer message does not stop the owner's messages queued behind it.
       const queued = this.db.all<RawOutbox & { never_departed: number }>(
-        `SELECT o.*, (${neverDepartedSql("o")} AND ${sourceNeverSpentSql("o", HANDED)}) AS never_departed
+        `SELECT o.*, ${handOverEligibleSql("o")} AS never_departed
            FROM outbox o
           WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
             AND o.status = 'PENDING'
@@ -751,7 +759,8 @@ export class Outbox {
       //
       // A row that ever left PENDING is withheld the same way, whatever it reads now (review
       // finding 01): it was handed over, settled or moved once already, and a statement put it
-      // back. Withheld, it is never handed over again and never counted as work waiting, it does
+      // back. So is a row whose admitted event another message took, or whose turn was answered
+      // (`handOverEligibleSql`): the instruction is spent even though this row never moved. Withheld, it is never handed over again and never counted as work waiting, it does
       // not stand at the head of the queue in front of a message nobody was handed; the holder is
       // told its id, as for any withheld row. The write below asserts the same.
       const admitted: RawOutbox[] = [];
@@ -787,8 +796,7 @@ export class Outbox {
             AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
             AND role_key = ? AND binding_generation = ? AND target_session_id = ?
             AND ${exactHolderTarget("outbox")}
-            AND ${neverDepartedSql("outbox")}
-            AND ${sourceNeverSpentSql("outbox", HANDED)}`,
+            AND ${handOverEligibleSql("outbox")}`,
         [
           now,
           candidate.message_id,
@@ -1496,9 +1504,13 @@ export class Outbox {
           // generation's exact session, so a successor is exactly who must not be handed it. It
           // falls through to the reject below, which settles its ingress claim. (The one exception,
           // the same conversation restarted, never reaches this line: the hold above takes it.)
+          //
+          // And never a row the one hand-over predicate refuses (review finding 01): asked here, as
+          // the read that decides the row, and again by the compare-and-set below, as the write.
           row.status === "PENDING" &&
           toGeneration !== fromGeneration &&
-          !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind)
+          !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) &&
+          this.#handOverEligible(row.message_id)
         : row.status === "PENDING" &&
           RETARGETABLE_KINDS.has(row.kind as MessageKind) &&
           row.expires_at > now;
@@ -1515,8 +1527,7 @@ export class Outbox {
       // statement either (review finding 01), so the set it asserts also includes *this row never
       // left PENDING*; a row that did falls through to the same reject.
       const carriedOnce = holderClaimed
-        ? ` AND (reason_code IS NULL OR reason_code <> ?) AND ${neverDepartedSql("outbox")}
-             AND ${sourceNeverSpentSql("outbox", HANDED)}`
+        ? ` AND (reason_code IS NULL OR reason_code <> ?) AND ${handOverEligibleSql("outbox")}`
         : "";
       const moved = retargetable
         ? this.db.run(
@@ -1686,8 +1697,7 @@ export class Outbox {
               WHERE message_id = ? AND status = 'PENDING' AND kind = ?
                 AND role_key = ? AND binding_generation = ? AND target_session_id = ?
                 AND attempts = 0 AND sent_at IS NULL AND claim_token IS NULL
-                AND ${neverDepartedSql("outbox")}
-                AND ${sourceNeverSpentSql("outbox", HANDED_OR_TERMINAL)}`,
+                AND ${handOverEligibleSql("outbox")}`,
             [
               toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id, row.kind,
               roleKey, fromGeneration, fromSessionId,
@@ -1754,12 +1764,12 @@ export class Outbox {
     ) !== undefined;
   }
 
-  /** Whether this message ever left PENDING (review finding 01): `neverDepartedSql`, as a read. */
-  #holderMessageDeparted(messageId: string): boolean {
-    return this.db.get<{ present: number }>(
-      `SELECT 1 AS present FROM holder_message_departures WHERE message_id = ?`,
+  /** `handOverEligibleSql`, as a read of one row: the same predicate, never a second copy of it. */
+  #handOverEligible(messageId: string): boolean {
+    return this.db.get<{ eligible: number }>(
+      `SELECT ${handOverEligibleSql("o")} AS eligible FROM outbox o WHERE o.message_id = ?`,
       [messageId],
-    ) !== undefined;
+    )?.eligible === 1;
   }
 
   /** The digest of the admitted payload stored at this ingress key, or null when unreadable. */
@@ -2065,11 +2075,12 @@ export class Outbox {
     if (this.#peerMessageCarried(row.message_id)) return PeerMessageCarryRefusal.ALREADY_CARRIED;
     // Unclaimed: never handed over, never in flight, never attempted. UNKNOWN and IN_DOUBT
     // outcomes are reconciled with what they already have, never moved. The row's own columns can
-    // be put back by any statement, so the departure record decides too (review finding 01): a row
-    // that ever left PENDING was claimed, whatever it reads now.
+    // be put back by any statement, so the one hand-over predicate decides too (review finding 01):
+    // a row that ever left PENDING, or whose event was taken under another id or answered, was
+    // claimed, whatever it reads now.
     if (
       row.status !== "PENDING" || row.attempts !== 0 || (row.sent_at ?? null) !== null ||
-      (row.claim_token ?? null) !== null || this.#holderMessageDeparted(row.message_id)
+      (row.claim_token ?? null) !== null || !this.#handOverEligible(row.message_id)
     ) {
       return PeerMessageCarryRefusal.ALREADY_CLAIMED;
     }
@@ -2079,11 +2090,6 @@ export class Outbox {
     if (row.reason_code === ReasonCode.OUTBOX_RETARGETED) return PeerMessageCarryRefusal.DIFFERENT_LINEAGE;
     const pointer = ownerMessagePointerOf(readPayload(row.payload_json));
     if (!pointer) return PeerMessageCarryRefusal.SOURCE_UNREADABLE;
-    // The event itself, whatever row points at it now (review finding 01, round 2): handed over under
-    // another message id, or answered — a terminal fact the claim JSON below can have lost since.
-    if (this.#sourceSpent(pointer.sourceChannel, pointer.sourceNonce, HANDED_OR_TERMINAL)) {
-      return PeerMessageCarryRefusal.ALREADY_CLAIMED;
-    }
     const source = this.db.get<{ payload_json: string | null; turn_claim_json: string | null }>(
       `SELECT payload_json, turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
       [pointer.sourceChannel, pointer.sourceNonce],
@@ -2174,16 +2180,17 @@ export class Outbox {
         // session a peer message was admitted for is the one that just went, so it is rejected
         // below rather than re-addressed to a runtime its proof does not name. Nor a row that ever
         // left PENDING (review finding 01): it was handed over once already, so it is rejected
-        // below like the `SENT` row it really is.
+        // below like the `SENT` row it really is. Nor one whose event was taken or answered: the one
+        // hand-over predicate is asked here, as the read, and again by the compare-and-set, as the write.
         const moved =
-          row.status === "PENDING" && !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind)
+          row.status === "PENDING" && !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) &&
+          this.#handOverEligible(row.message_id)
             ? this.db.run(
                 `UPDATE outbox SET target_session_id = ?
                   WHERE message_id = ? AND status = 'PENDING'
                     AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
                     AND role_key = ? AND binding_generation = ? AND target_session_id = ?
-                    AND ${neverDepartedSql("outbox")}
-                    AND ${sourceNeverSpentSql("outbox", HANDED)}`,
+                    AND ${handOverEligibleSql("outbox")}`,
                 [toSessionId, row.message_id, roleKey, bindingGeneration, fromSessionId],
               ).changes
             : 0;
