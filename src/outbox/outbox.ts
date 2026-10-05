@@ -200,25 +200,28 @@ export const sourceNeverSpentSql = (alias: string, reasons: readonly SourceSpent
                   THEN json_extract(${alias}.payload_json, '$.sourceNonce') END END))`;
 
 /**
- * The payload of the row `alias` names has no duplicate object key, at any depth (review finding 01,
- * narrow review). SQLite's `json_extract` reads the first of two duplicate keys and `JSON.parse` the
- * last, so a duplicated `sourceNonce` let the predicate check one event while the consumer delivered
- * another. Without duplicates the two read the same value. The same `json_tree` test the v38 claim
- * guards use; a payload that is not JSON at all names no event for either reader and is refused as
- * unreadable where it is read.
+ * SQLite reads the payload of the row `alias` names, and reads it one way (review finding 01, narrow
+ * reviews 1 and 2): `json_valid` accepts it, and no object in it repeats a key at any depth. SQLite's
+ * `json_extract` reads the first of two duplicate keys and `JSON.parse` the last, so a duplicated
+ * `sourceNonce` let the predicate check one event while the consumer delivered another; without
+ * duplicates the two read the same value. The same `json_tree` test the v38 claim guards use.
+ *
+ * A payload SQLite cannot parse is refused, not taken to name no event: `sourceNeverSpentSql` reads
+ * no pointer from it, so it could refuse no spent one, while `JSON.parse` may still read one — JSON
+ * nested deeper than SQLite's parser goes is valid to JavaScript and not to `json_valid`. `CASE`
+ * keeps such a payload off `json_tree`, which raises on it rather than answering.
  */
-const payloadKeysUniqueSql = (alias: string): string =>
+const payloadUnambiguousSql = (alias: string): string =>
   `(CASE WHEN json_valid(${alias}.payload_json) = 1
      THEN NOT EXISTS (SELECT 1 FROM json_tree(${alias}.payload_json) WHERE typeof(key) = 'text'
                        GROUP BY parent, key HAVING COUNT(*) > 1)
-     ELSE 1 END)`;
+     ELSE 0 END)`;
 
 /**
  * The one hand-over predicate (review finding 01, round 3). The row `alias` names may go to anyone —
  * claimed by its holder, retargeted on a takeover, re-addressed on a runtime move, carried on a
  * restart — only if it never left PENDING, its admitted event was never spent — not taken out of
- * PENDING under another message id, and not answered — and its payload names that event
- * unambiguously. Answered means the event's turn once held a terminal fact (`TURN_TERMINAL`),
+ * PENDING under another message id, and not answered — and SQLite reads its payload, one way. Answered means the event's turn once held a terminal fact (`TURN_TERMINAL`),
  * however its claim JSON reads now, so an ordinary `json_remove` after the ingress completed the turn
  * hands nothing over. Every one of those paths asserts exactly this, in the read that chooses the row
  * and in the statement that moves it, and nothing else does, so the paths cannot drift apart again.
@@ -226,7 +229,7 @@ const payloadKeysUniqueSql = (alias: string): string =>
  */
 export const handOverEligibleSql = (alias: string): string =>
   `(${neverDepartedSql(alias)} AND ${sourceNeverSpentSql(alias, ["MESSAGE_DEPARTED", "TURN_TERMINAL"])}
-    AND ${payloadKeysUniqueSql(alias)})`;
+    AND ${payloadUnambiguousSql(alias)})`;
 
 /**
  * The outward, role-level kinds an adopted canonical CTO receives in band rather than over Buzz.
@@ -1793,18 +1796,23 @@ export class Outbox {
 
   /**
    * The pointer half of the hand-over rule, decided from the very parse the consumer delivers (review
-   * finding 01, narrow review). The payload must be exactly the canonical serialization of its own
-   * parse — what `enqueue` writes — so it carries no duplicate key and no other spelling SQLite could
-   * read differently, and the event its parsed pointer names must never have been spent. This is the
-   * restart carry's parsed-pointer check from before the paths were unified, now on every read. A
-   * payload that does not parse names no event; the readers refuse it as unreadable themselves.
+   * finding 01, narrow reviews 1 and 2). The payload must parse, and be exactly the canonical
+   * serialization of that parse — what `enqueue` writes — so it carries no duplicate key and no other
+   * spelling SQLite could read differently, and the event its parsed pointer names must never have
+   * been spent. This is the restart carry's parsed-pointer check from before the paths were unified,
+   * now on every read.
+   *
+   * Bytes `JSON.parse` refuses are refused here too, not taken to name no event: SQLite may still
+   * read a pointer from them (it stops at a NUL that `JSON.parse` rejects), and a takeover or a
+   * runtime move would otherwise re-address a message no holder can read. A parse with no Buzz
+   * pointer names no event to check; `ownerMessageLedger` refuses a message that carries none.
    */
   #payloadHandOverEligible(payloadJson: string): boolean {
     let parsed: unknown;
     try {
       parsed = JSON.parse(payloadJson) as unknown;
     } catch {
-      return true;
+      return false;
     }
     if (JSON.stringify(parsed) !== payloadJson) return false;
     const pointer = ownerMessagePointerOf(parsed);

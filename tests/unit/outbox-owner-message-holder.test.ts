@@ -4,7 +4,7 @@ import { InMemoryBuzzTransport, BuzzAdapter } from "../../src/buzz/buzz-adapter.
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { HOLDER_CLAIMED_KINDS, MessageKind, RETARGETABLE_KINDS } from "../../src/outbox/envelope.ts";
-import { Outbox } from "../../src/outbox/outbox.ts";
+import { handOverEligibleSql, Outbox } from "../../src/outbox/outbox.ts";
 import type { HolderIdentity } from "../../src/outbox/outbox.ts";
 import { cleanupTempDirs, makeCore, makeRepo, seedActor, seedRun } from "../helpers/fixtures.ts";
 
@@ -547,26 +547,37 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
     if (!theirs.allowed || !mine.allowed) return;
 
     const foreignRow = core.db.get<Record<string, unknown>>(
-      `SELECT * FROM outbox WHERE message_id = ?`,
+      `SELECT o.*, ${handOverEligibleSql("o")} AS never_departed
+         FROM outbox o WHERE o.message_id = ?`,
       [theirs.value.messageId],
     );
     expect(foreignRow).toBeDefined();
+    expect(foreignRow?.never_departed).toBe(1);
 
     // The seam: the candidate read hands back a row that is no longer the caller's, exactly as a
     // concurrent retarget between the two statements would. Only the candidate read is
     // substituted — the write, and every other statement, runs against the real database.
     let substitute = true;
     let substitutions = 0;
+    let compareAndSets = 0;
     const isCandidateRead = (sql: string): boolean =>
+      sql.trimStart().startsWith("SELECT o.*") &&
       sql.includes("'PENDING'") &&
       sql.includes(MessageKind.OWNER_MESSAGE) &&
-      sql.includes("ORDER BY") &&
-      !sql.includes("COUNT(");
+      sql.includes("ORDER BY");
     const racingDb = new Proxy(core.db, {
       get(target, prop): unknown {
         const value: unknown = Reflect.get(target, prop, target);
         if (typeof value !== "function") return value;
         const bound = (value as (...args: unknown[]) => unknown).bind(target);
+        if (prop === "run") {
+          return (sql: string, params?: unknown[]): unknown => {
+            if (sql.trimStart().startsWith("UPDATE outbox SET status = 'SENT'")) {
+              compareAndSets += 1;
+            }
+            return bound(sql, params);
+          };
+        }
         if (prop !== "all" && prop !== "get") return bound;
         return (sql: string, params?: unknown[]): unknown => {
           if (substitute && isCandidateRead(sql)) {
@@ -583,6 +594,7 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
     // The seam actually fired. Without this the row would go quietly vacuous the moment the
     // candidate read changed shape, and assert nothing at all.
     expect(substitutions).toBeGreaterThan(0);
+    expect(compareAndSets).toBe(1);
     expect(raced.claimed).toEqual([]);
     expect(JSON.stringify(raced)).not.toContain("addressed to the other holder");
     // The other holder's message was neither handed over nor moved.

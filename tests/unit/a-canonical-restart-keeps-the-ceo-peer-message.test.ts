@@ -2592,7 +2592,7 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
       const spy = vi.spyOn(db, "get").mockImplementation(((sql: string, params: unknown[] = []) => {
         if (PARSED_POINTER_LOOKUP.test(sql)) return undefined;
         const row = get(sql, params) as Record<string, unknown> | undefined;
-        return /AS eligible, o\.payload_json FROM outbox o/.test(sql) && row ? { ...row, eligible: 1 } : row;
+        return /AS eligible(?:, o\.payload_json)? FROM outbox o/.test(sql) && row ? { ...row, eligible: 1 } : row;
       }) as typeof db.get);
       try {
         await restart(fixture, 2);
@@ -2678,7 +2678,7 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
     const spy = vi.spyOn(core.db, "get").mockImplementation(((sql: string, params: unknown[] = []) => {
       if (PARSED_POINTER_LOOKUP.test(sql)) return undefined;
       const row = get(sql, params) as Record<string, unknown> | undefined;
-      return /AS eligible, o\.payload_json FROM outbox o/.test(sql) && row ? { ...row, eligible: 1 } : row;
+      return /AS eligible(?:, o\.payload_json)? FROM outbox o/.test(sql) && row ? { ...row, eligible: 1 } : row;
     }) as typeof core.db.get);
     let moved: ReturnType<typeof move>;
     try {
@@ -3368,7 +3368,7 @@ describe("finding 01, narrow review: the pointer the predicate checks is the poi
       const view = sqliteView(queued!.payload_json);
       const get = db.get.bind(db);
       const spy = vi.spyOn(db, "get").mockImplementation(((sql: string, params: unknown[] = []) =>
-        /AS eligible, o\.payload_json FROM outbox o/.test(sql) ? { eligible: 1, payload_json: view } : get(sql, params)) as typeof db.get);
+        /AS eligible(?:, o\.payload_json)? FROM outbox o/.test(sql) ? { eligible: 1, payload_json: view } : get(sql, params)) as typeof db.get);
       try {
         await restart(fixture, 2);
       } finally {
@@ -3390,7 +3390,7 @@ describe("finding 01, narrow review: the pointer the predicate checks is the poi
     const view = sqliteView(canonical);
     const get = core.db.get.bind(core.db);
     const spy = vi.spyOn(core.db, "get").mockImplementation(((sql: string, params: unknown[] = []) =>
-      /AS eligible, o\.payload_json FROM outbox o/.test(sql) && params.includes(answered)
+      /AS eligible(?:, o\.payload_json)? FROM outbox o/.test(sql) && params.includes(answered)
         ? { eligible: 1, payload_json: view }
         : get(sql, params)) as typeof core.db.get);
     let moved: ReturnType<typeof move>;
@@ -3484,7 +3484,7 @@ describe("finding 01, narrow review: the pointer the predicate checks is the poi
       let carryWrites = 0;
       const reads = vi.spyOn(db, "get").mockImplementation(((sql: string, params: unknown[] = []) => {
         const row = get(sql, params) as Record<string, unknown> | undefined;
-        return /AS eligible, o\.payload_json FROM outbox o/.test(sql) && row ? { ...row, eligible: 1 } : row;
+        return /AS eligible(?:, o\.payload_json)? FROM outbox o/.test(sql) && row ? { ...row, eligible: 1 } : row;
       }) as typeof db.get);
       const moves = vi.spyOn(db, "run").mockImplementation(((sql: string, params: unknown[] = []) => {
         if (/AND attempts = 0 AND sent_at IS NULL AND claim_token IS NULL/.test(sql)) carryWrites += 1;
@@ -3512,7 +3512,7 @@ describe("finding 01, narrow review: the pointer the predicate checks is the poi
     const attempts: string[] = [];
     const reads = vi.spyOn(core.db, "get").mockImplementation(((sql: string, params: unknown[] = []) => {
       const row = get(sql, params) as Record<string, unknown> | undefined;
-      return /AS eligible, o\.payload_json FROM outbox o/.test(sql) && row ? { ...row, eligible: 1 } : row;
+      return /AS eligible(?:, o\.payload_json)? FROM outbox o/.test(sql) && row ? { ...row, eligible: 1 } : row;
     }) as typeof core.db.get);
     const moves = vi.spyOn(core.db, "run").mockImplementation(((sql: string, params: unknown[] = []) => {
       if (/^\s*UPDATE outbox SET (binding_generation = \?, )?target_session_id = \?/.test(sql) &&
@@ -3528,6 +3528,22 @@ describe("finding 01, narrow review: the pointer the predicate checks is the poi
     }
     expect(attempts).toEqual([]);
     expect(moved).toEqual({ passed: [fresh], rejected: [answered] });
+  });
+
+  // The read layer, bytes with no parse (narrow review 2). SQLite stops at a NUL that `JSON.parse`
+  // rejects, so a pointer followed by one is valid to `json_valid`, names a never-spent event to
+  // `json_extract` and has no duplicate key: only the read's own parse refuses it, before any move.
+  it.each(["takeover", "runtime-move"] as const)("R bytes JSON.parse refuses but SQLite reads (a trailing NUL) are not moved on %s", (path) => {
+    const { core, answered, fresh, payloadOf, rewrite, move } = coreWithAnswered();
+    const bytes = `${payloadOf(fresh)}\u0000`;
+    expect(() => JSON.parse(bytes)).toThrow();
+    expect(core.db.get(`SELECT json_valid(?) AS valid, json_extract(?, '$.sourceNonce') AS nonce`, [bytes, bytes]))
+      .toEqual({ valid: 1, nonce: "buzz-message:fresh" });
+    rewrite(fresh, bytes);
+    expect(payloadOf(fresh)).toBe(bytes);
+    const moved = move(path);
+    expect(moved.passed).toEqual([]);
+    expect([...moved.rejected].sort()).toEqual([answered, fresh].sort());
   });
 
   // The same question for the other JSON the predicate reads: an ingress turn claim's terminal facts
