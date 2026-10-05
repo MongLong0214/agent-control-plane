@@ -21,6 +21,7 @@ import type { BlindReviewGate } from "../review/blind-review.ts";
 import type { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
+import type { WorkerProvisionRequest, WorkerStaffing } from "../run/worker-staffing.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
@@ -63,6 +64,7 @@ export interface CtoMcpSource extends McpMutationSource {
   readonly sessions: SessionRegistry;
   readonly bindings: BindingRegistry;
   readonly tasks: TaskGraph;
+  readonly workers: WorkerStaffing;
 }
 
 /** Only ports constructed below may be attached to an MCP server. */
@@ -147,6 +149,8 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     startTaskExecution: (input: Parameters<TaskGraph["startWorkerExecution"]>[0]) =>
       source.tasks.startWorkerExecution(input),
     taskRunningWidth: (runId: string) => source.tasks.runningWidth(runId),
+    // #512 — mints a task's first WORKER binding on a session the control plane constitutes.
+    provisionWorker: (request: WorkerProvisionRequest) => source.workers.provision(request),
     recordTaskActivity: (executionId: string, runId: string) => source.tasks.recordActivity(executionId, runId),
     finishTaskExecution: (
       executionId: string,
@@ -375,8 +379,9 @@ const createCtoServerFromPort = (
   server.registerTool(
     "task_receipt_submit",
     {
-      description: "Open or close a task execution receipt.",
-      inputSchema: { ...mutation, ...runIdentity, taskId: z.string(), phase: z.enum(["started", "activity", "finished"]), executionId: z.string().nullable().optional(), provider: z.string().default("unknown"), model: z.string().default("unknown"), workerSessionId: z.string(), workerProcessId: z.number().int().nullable().optional(), repositoryId: z.string().nullable().optional(), worktreeId: z.string().nullable().optional(), status: z.enum(["SUCCEEDED", "FAILED", "ABANDONED", "TIMEOUT"]).optional(), failureClass: z.enum(["transient", "repairable", "contract", "security", "policy", "capacity", "infrastructure", "unknown_observed"]).optional(), resultDigest: z.string().nullable().optional() },
+      description:
+        "Open or close a task execution receipt. A started receipt runs under its worker session's own provider and model: omit them, or state the session's.",
+      inputSchema: { ...mutation, ...runIdentity, taskId: z.string(), phase: z.enum(["started", "activity", "finished"]), executionId: z.string().nullable().optional(), provider: z.string().min(1).optional(), model: z.string().min(1).optional(), workerSessionId: z.string(), workerProcessId: z.number().int().nullable().optional(), repositoryId: z.string().nullable().optional(), worktreeId: z.string().nullable().optional(), status: z.enum(["SUCCEEDED", "FAILED", "ABANDONED", "TIMEOUT"]).optional(), failureClass: z.enum(["transient", "repairable", "contract", "security", "policy", "capacity", "infrastructure", "unknown_observed"]).optional(), resultDigest: z.string().nullable().optional() },
     },
     async (args) => write("task_receipt_submit", args.idempotencyKey, async (peer) => {
       const fenced = owner(peer, args.runId);
@@ -401,6 +406,33 @@ const createCtoServerFromPort = (
       return args.phase === "activity"
         ? respond(port.recordTaskActivity(args.executionId, args.runId))
         : respond(port.finishTaskExecution(args.executionId, { status: args.status ?? "SUCCEEDED", resultDigest: args.resultDigest ?? null, failureClass: args.failureClass ?? null }, args.runId));
+    }),
+  );
+  server.registerTool(
+    "task_worker_provision",
+    {
+      description:
+        "Staff a READY task of an ACTIVE run you own with its first worker: a fresh session the control plane constitutes, admits capacity for, and binds as the task's WORKER. Returns the worker session id to name in task_receipt_submit.",
+      inputSchema: {
+        ...mutation, ...runIdentity,
+        taskId: z.string().min(1),
+        // Required, never defaulted: the control plane does not choose a provider for the CTO.
+        provider: z.string().min(1),
+        model: z.string().min(1).optional(),
+      },
+    },
+    async (args) => write("task_worker_provision", args.idempotencyKey, async (peer) => {
+      const fenced = owner(peer, args.runId);
+      if (!fenced.allowed) return respond(fenced);
+      return respond(await port.provisionWorker({
+        runId: args.runId,
+        taskId: args.taskId,
+        provider: args.provider,
+        model: args.model,
+        ownerBindingGeneration: fenced.value.bindingGeneration,
+        // The same fence, asked again after the capacity await and inside the bind transaction.
+        fence: () => owner(peer, args.runId),
+      }));
     }),
   );
   server.registerTool(

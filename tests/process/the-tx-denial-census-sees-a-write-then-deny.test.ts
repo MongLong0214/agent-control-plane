@@ -181,6 +181,7 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     anchor:
       "written, and that refusal has to take the observation with it (#664's discipline).\n" +
       "    let enqueued = false;\n" +
+      "    let parkedWithoutEvidence = false;\n" +
       "    const decided: Decision<TurnMaterialization> = this.db.txDecision(() => {",
   },
   {

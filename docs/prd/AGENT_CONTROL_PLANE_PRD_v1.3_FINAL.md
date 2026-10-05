@@ -755,8 +755,8 @@ Role Coverage Demand
 ```text
 Mechanical Low-ambiguity Code → Luna Max 우선
 Normal Implementation → Luna/Sonnet/Terra 중 CTO 판단
-Complex Semantic Work → Sonnet 또는 CTO 직접
-Architecture/Root Cause/High Risk → Opus CTO 직접
+Complex Semantic Work → Sonnet 또는 Opus WORKER (CTO는 라우팅·리뷰)
+Architecture/Root Cause/High Risk → Opus WORKER, CTO는 설계·리뷰 (CTO 직접 구현 없음)
 Optional Diversity → Grok
 ```
 
@@ -1575,6 +1575,7 @@ contract_get
 plan_submit
 resource_claim
 resource_release
+task_worker_provision
 task_receipt_submit
 result_submit
 escalation_open
