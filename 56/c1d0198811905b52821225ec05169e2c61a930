@@ -1,0 +1,67 @@
+Limit: a peer message's admission proof is immutable evidence that names the receiving CTO session and generation, so a same-conversation restart cannot rewrite it; the hand-over instead accepts one durable same-actor succession hop proven from assignments and the self-claim's DEAD_BINDING_RECOVERED record
+Warn: only the self-claim's same-actor dead-predecessor recovery holds and carries PENDING peer messages; every other revoke path (operator door, takeover, continuity, CEO) still rejects identity-bound rows, and OUTBOX_RETARGETED on a peer row now also marks a same-conversation carry
+Record-Id: r-peercarry
+Provenance: inherited db17a17058d40cda44dea88642f9b0c0f4a92d8c
+
+Limit: the repository treats raw database writers as in scope, so same-actor succession for a carried peer message is proven only by an append-only peer_message_carries record whose INSERT requires the connection-local carry authority minted inside the claim transaction; the OUTBOX_RETARGETED mark and audit actor strings are not evidence
+Limit: the carry follows the CEO decision of 2026-10-03 19:28Z: only an unclaimed PENDING message, never attempted, sent, claimed or receipted, for the same actor, conversation UUID and signer with DEAD_BINDING_RECOVERED continuity, carried once; already-REJECTED rows are never revived
+Warn: src/db/migrations.ts changed for v40, so its frozen pin must be confirmed by the CEO before the pin test is updated; deploying needs an approved v39 to v40 migration
+Record-Id: r-peercarryv40
+Follows: r-peercarry
+Provenance: inherited 7c750ff06c7c78eff174ea751e064e4850e4ef8f
+
+Limit: the v40 src/db/migrations.ts pin is the digest the CEO computed independently from GitHub for 7c750ff0 (sha256 885e15de..., blob ec13ae15...), approved for those exact bytes only; it is void if the source changes
+Warn: do not recompute this pin from the file in a later change; the next digest must again come from the independent authority
+Record-Id: r-pinv40confirm
+Follows: r-peercarryv40
+Provenance: inherited eb1ac4329b2a376c350050d8babba36cfa4555d3
+
+Limit: the carry record now binds the admitted source payload digest and the hand-over compares the admitted row's bytes against it, because the outbox pointer digest stays raw-writable (finding 01 is not addressed here; its scope is with the CEO)
+Warn: fences that reject an identity-bound peer message keep an existing settled receipt exactly as it was (keepSettled) and owe the sender a notice in peer_message_refusal_notices; the holder's own complete or reject still refuses a settled turn
+Warn: src/db/migrations.ts changed again, so the CEO-confirmed pin 885e15de is void; the new digest must be confirmed by the CEO before the pin test is updated
+Record-Id: r-peercarryv40r1
+Follows: r-pinv40confirm
+Provenance: inherited c706cb5d139ad1cb8d75161e556030df61f402ab
+
+Limit: raw SQL writers are inside this repository's threat model, so finding 01 is closed here rather than split off: a trigger records every outbox row that leaves PENDING in the append-only holder_message_departures ledger, and holder claim, retarget and carry refuse a departed message; a protected lifecycle ledger for the whole outbox is not built
+Ruled-out: dropping a departed row from claimForHolder's SELECT | it is reported as withheld instead, because the existing witness for a raw-reverted row expects withheld
+Warn: holder_message_departures is append-only and never pruned: it gains one row per outbox message of any kind that ever leaves PENDING
+Warn: outbox.message_id is now immutable (OUTBOX_MESSAGE_ID_IMMUTABLE); code that renames an outbox row will be refused
+Warn: a privileged writer can still DROP TRIGGER the departure trigger or the ledger guards, the residual every trigger in this schema carries
+Warn: src/db/migrations.ts changed again, so the frozen pin stays void until the CEO computes the final head's bytes independently
+Record-Id: r-peercarryv40r2
+Follows: r-peercarryv40r1
+Provenance: inherited c421f07eba44ea6ded6a550923d9260c82b1dd4c
+
+Limit: the three v40 record tables are WITHOUT ROWID and a re-queued or recreated row is refused by an event-keyed departure, but outbox, inbound_messages and canonical_turns are still rowid tables whose REPLACE through rowid is not closed here
+Ruled-out: guarding the noReplyAt JSON field in place | the whole inbound row can be recreated through its rowid, so the terminal fact is recorded in an append-only event-keyed table instead
+Warn: deleting an outbox row that has a departure is refused, while deleting a PENDING row that never departed is still allowed (a test deletes one as setup)
+Warn: an outside writer that defines ACP's authority functions on its own connection can still forge carry or notice records; that writer runs code against the database, the same class as the privileged DDL writer left outside the defended boundary
+Record-Id: r-peercarryv40r3
+Follows: r-peercarryv40r2
+Provenance: inherited c773de9cff2f968d58e7b60076691546dcc4cd94
+
+Limit: a refused peer message's notice reaches the CEO through the acp-daemon-notice/v1 push only after Hermes supports the daemon principal; the consumer starts only with ACP_DAEMON_NOTICE_ENABLED=1 so ACP can deploy first without failing notices
+Warn: the holder's report tool now means 'I am taking this on' and must be called before telling the CEO; it is refused while the daemon holds the notice, and the daemon skips a REPORTED notice, so each refusal reaches the CEO through at most one channel
+Warn: only the error field of a non-200 body is read and only the contract's exact status and code pairs are terminal; anything else stays in doubt and is retried with the same bytes
+Warn: the HMAC proves the sender holds the ACP-Hermes lane secret, not that it is the agentcpd process; any same-user process with Keychain access holds it too
+Record-Id: r-peercarryv40r4
+Follows: r-peercarryv40r3
+Provenance: inherited 22c8b40d5e3b715b4ed0eb85082351de652186cb
+
+Warn: every hand-over path (holder claim, takeover retarget, runtime move, restart carry) checks one shared predicate, handOverEligibleSql, in both its selecting read and its moving write: the row never left PENDING and its event is neither TURN_TERMINAL nor MESSAGE_DEPARTED; add a new path through it, never a second copy
+Warn: a holder no longer receives a still-PENDING message whose turn was already answered by any route; such a row is listed as withheld by id
+Record-Id: r-peercarryv40r5
+Follows: r-peercarryv40r4
+Provenance: inherited a5a0800a98bbf3554de6560b2ba2416e9bfd63af
+
+Limit: a hand-over pointer is trusted only when its stored bytes equal JSON.stringify(JSON.parse(bytes)) and no key repeats at any depth, so the SQL predicate and the TypeScript consumer read the same source; the source-departure trigger still records only the first sourceNonce of a raw-written duplicate row, which can no longer be handed over
+Ruled-out: a write-time duplicate-key trigger in v40 | it cannot cover rows written before it and would void the CEO-verified migrations.ts pin, while the hand-over checks close the bypass on their own
+Record-Id: r-peercarryv40r6
+Follows: r-peercarryv40r5
+Provenance: inherited cc94e2b9fcbb6900b61d8bdc5c8610c2ccb29b12
+
+Limit: A hand-over must refuse a payload unreadable by either SQLite or JSON.parse: parser disagreement can otherwise check no pointer while the other reader delivers one.
+Record-Id: r-054017a757d3
+Follows: r-peercarryv40r6
+Provenance: inherited 31d1da1f1d0f7495b1a335f48e12c0ac30289a3e
