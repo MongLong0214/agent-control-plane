@@ -1072,6 +1072,7 @@ describe("baseline boundary contracts", () => {
       "v37-seed-claude-cli-executor-kind",
       "v38-canonical-verified-target-override",
       "v39-owner-reply-intent-keeps-its-key",
+      "v40-peer-message-carry-record",
     ]);
   });
 

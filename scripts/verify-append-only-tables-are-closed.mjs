@@ -83,7 +83,8 @@ for (const [table, { verbs, names }] of [...guards].sort()) {
  * narrow the guard.
  */
 const uniqueKeysOf = (table) => {
-  const declaration = new RegExp(`CREATE TABLE IF NOT EXISTS ${table} \\(([\\s\\S]*?)\\n\\);`).exec(schema);
+  // `WITHOUT ROWID` follows the closing parenthesis of a table whose declared key is its only identity.
+  const declaration = new RegExp(`CREATE TABLE IF NOT EXISTS ${table} \\(([\\s\\S]*?)\\n\\)(?: WITHOUT ROWID)?;`).exec(schema);
   if (declaration === null) return null;
   const body = declaration[1];
   const keys = [];

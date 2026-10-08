@@ -1167,6 +1167,482 @@ CREATE INDEX IF NOT EXISTS outbox_role ON outbox(role_key, binding_generation, s
 CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE status = 'PENDING';
 
 -- ---------------------------------------------------------------------------
+-- peer_message_carries  (schema v40, ACP-PEER-SUCCESSION-01)
+--   Lifecycle: one record per decision the canonical self-claim's dead-predecessor recovery makes
+--   about a queued CEO peer message (#1044) addressed to the released CTO generation: CARRIED once
+--   to the same conversation's next generation, or REFUSED — rejected, with a reason category the
+--   successor is shown so it can tell the CEO. Written in the claim transaction that recovers the
+--   predecessor, binds the successor and moves the outbox row, or not at all.
+--   Integrity: the peer hand-over accepts a holder other than the one the admission proof names
+--   only through a CARRIED record that matches it field for field, and only while the admitted
+--   row at the record's key still digests to the record's `source_payload_digest` (ACP-RESTART-02)
+--   — the digest the insert trigger verified against that row when the record was written, never
+--   the outbox pointer's, which any statement can rewrite. The outbox row's
+--   OUTBOX_RETARGETED mark and the recovery audit row's `actor` text are ordinary columns any
+--   statement can write, and are not evidence of anything. A record is inserted only under the
+--   connection-local marker `Db.withPeerMessageCarry` raises for one exact succession, from a
+--   capability only the self-claim mints; it is never updated and never deleted. WITHOUT ROWID: its
+--   declared key is its only identity, so no REPLACE through a hidden rowid deletes a record.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS peer_message_carries (
+  message_id               TEXT NOT NULL,
+  outcome                  TEXT NOT NULL CHECK (outcome IN ('CARRIED','REFUSED')),
+  refusal                  TEXT CHECK (refusal IN ('DIFFERENT_ACTOR_OR_SIGNER','DIFFERENT_LINEAGE',
+                                                   'ALREADY_CARRIED','ALREADY_CLAIMED',
+                                                   'SOURCE_UNREADABLE')),
+  -- The admitted event, as the outbox row's pointer names it: the ingress row's key.
+  source_channel           TEXT,
+  source_nonce             TEXT,
+  -- ACP-RESTART-02: the digest of the payload the admitted row at that key held when the record
+  -- was written, verified by the insert trigger against that row. Null only on a REFUSED record
+  -- whose source could not be read.
+  source_payload_digest    TEXT,
+  role_key                 TEXT NOT NULL,
+  from_session_id          TEXT NOT NULL,
+  from_session_incarnation TEXT NOT NULL,
+  from_binding_generation  INTEGER NOT NULL,
+  from_assignment_id       TEXT NOT NULL,
+  to_session_id            TEXT NOT NULL,
+  to_session_incarnation   TEXT NOT NULL,
+  to_binding_generation    INTEGER NOT NULL,
+  to_assignment_id         TEXT NOT NULL,
+  -- The one conversational actor both generations belong to, its claimed conversation UUID and
+  -- the Buzz channel identity both runtimes speak as.
+  actor_id                 TEXT NOT NULL,
+  conversation_uuid        TEXT NOT NULL,
+  buzz_actor_id            TEXT NOT NULL,
+  -- The DEAD_BINDING_RECOVERED audit row the same transaction wrote for the predecessor.
+  recovery_audit_event_id  INTEGER NOT NULL,
+  created_at               TEXT NOT NULL,
+  PRIMARY KEY (message_id, outcome),
+  CHECK ((outcome = 'CARRIED') = (refusal IS NULL)),
+  CHECK (outcome = 'REFUSED' OR (source_channel IS NOT NULL AND source_nonce IS NOT NULL
+                                 AND source_payload_digest IS NOT NULL)),
+  -- One hop: a carry names the generation after the released one, and another runtime.
+  CHECK (to_binding_generation = from_binding_generation + 1),
+  CHECK (to_session_id <> from_session_id)
+) WITHOUT ROWID;
+
+-- CP-HI-06 — the hand-over's only evidence of a same-conversation succession, so ordinary SQL must
+-- not be able to write one. `acp_peer_message_carry_authorized` answers 1 only while the
+-- self-claim's carry holds the marker for this exact succession, and a CARRIED record only when that
+-- succession was proven continuous. It is also handed the admitted row the record's key names, and
+-- answers 1 only when the record's payload digest is that row's (ACP-RESTART-02): required on a
+-- CARRIED record, and checked on a REFUSED one whenever it states one.
+CREATE TRIGGER IF NOT EXISTS peer_message_carries_insert_authority
+BEFORE INSERT ON peer_message_carries
+WHEN acp_peer_message_carry_authorized(
+  NEW.outcome, NEW.role_key,
+  NEW.from_session_id, NEW.from_session_incarnation, NEW.from_binding_generation, NEW.from_assignment_id,
+  NEW.to_session_id, NEW.to_session_incarnation, NEW.to_binding_generation, NEW.to_assignment_id,
+  NEW.actor_id, NEW.conversation_uuid, NEW.buzz_actor_id, NEW.recovery_audit_event_id,
+  NEW.source_payload_digest,
+  (SELECT payload_json FROM inbound_messages
+    WHERE channel = NEW.source_channel AND nonce = NEW.source_nonce)
+) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_CARRY_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — one carry and one refusal per message, ever; a second of either is refused, not merged.
+CREATE TRIGGER IF NOT EXISTS peer_message_carries_no_replace
+BEFORE INSERT ON peer_message_carries
+WHEN EXISTS (
+  SELECT 1 FROM peer_message_carries
+   WHERE message_id = NEW.message_id AND outcome = NEW.outcome
+)
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_CARRY_NO_REPLACE');
+END;
+
+-- CP-HI-08 — a carry record is evidence: never rewritten.
+CREATE TRIGGER IF NOT EXISTS peer_message_carries_immutable
+BEFORE UPDATE ON peer_message_carries
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_CARRY_IMMUTABLE');
+END;
+
+-- CP-HI-08 — and never removed: a deleted CARRIED record would let a second carry of the same row in.
+CREATE TRIGGER IF NOT EXISTS peer_message_carries_no_delete
+BEFORE DELETE ON peer_message_carries
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_CARRY_IMMUTABLE');
+END;
+
+CREATE INDEX IF NOT EXISTS peer_message_carries_by_successor
+  ON peer_message_carries(to_session_id, to_binding_generation);
+
+-- ---------------------------------------------------------------------------
+-- peer_message_refusal_notices  (schema v40, ACP-RESTART-04)
+--   Lifecycle: the notice owed to the CEO for a queued peer message (#1044) that ACP rejected while
+--   it was still PENDING — on a revoke (a plain one, or the operator's dead-binding door), a
+--   takeover by another runtime, a same-generation runtime move, or a canonical restart that
+--   refused to carry it. One OWED entry per message, written by the fence in the transaction that rejects the row;
+--   one REPORTED entry, written when the role's current holder takes the telling on itself — before
+--   it tells the CEO, so that one channel tells it (amendment 1). Shown, as metadata only, to
+--   whoever holds the role while an OWED entry has no REPORTED one and the daemon has no delivery of
+--   it in doubt or settled (`peer_message_notice_deliveries`) — whether or not that holder is the
+--   carry successor. The daemon tells the CEO itself where it can (acp-daemon-notice/v1); the holder
+--   is the channel for what the daemon does not deliver.
+--   Integrity: the outbox row's status says the message was rejected, not that anyone was told; an
+--   ordinary statement can write either. So an entry is inserted only under the connection-local
+--   marker `Db.withPeerMessageNotice` raises for that one exact entry, from a capability only the
+--   outbox mints at the rejecting fence and at the holder's report; a REPORTED entry only beside
+--   the OWED one for the same message and role. Never updated, never deleted. Never the payload.
+--   WITHOUT ROWID, so no REPLACE through a hidden rowid deletes an entry.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS peer_message_refusal_notices (
+  message_id               TEXT NOT NULL,
+  entry                    TEXT NOT NULL CHECK (entry IN ('OWED','REPORTED')),
+  role_key                 TEXT NOT NULL,
+  -- OWED: why the message was rejected — the path's category, or the restart's carry refusal.
+  reason                   TEXT CHECK (reason IN ('REVOKED','REPLACED','RUNTIME_MOVED',
+                                                  'DIFFERENT_ACTOR_OR_SIGNER','DIFFERENT_LINEAGE',
+                                                  'ALREADY_CARRIED','ALREADY_CLAIMED',
+                                                  'SOURCE_UNREADABLE')),
+  -- OWED: the Buzz identity that signed the event and the admitted event's key, as the outbox
+  -- row's pointer named them when it was rejected; null when that pointer could not be read.
+  sender                   TEXT,
+  source_channel           TEXT,
+  source_nonce             TEXT,
+  -- OWED: the generation and session the message was addressed to. REPORTED: the holder that
+  -- reported it, with its incarnation.
+  binding_generation       INTEGER NOT NULL,
+  session_id               TEXT NOT NULL,
+  session_incarnation      TEXT,
+  created_at               TEXT NOT NULL,
+  PRIMARY KEY (message_id, entry),
+  CHECK ((entry = 'OWED') = (reason IS NOT NULL)),
+  CHECK (entry = 'OWED' OR session_incarnation IS NOT NULL)
+) WITHOUT ROWID;
+
+-- CP-HI-06 — an entry is evidence that the CEO is owed a notice, or was given one; ordinary SQL must
+-- not be able to write either. `acp_peer_message_notice_authorized` answers 1 only while the outbox
+-- holds the marker for this exact entry, and a REPORTED entry needs its OWED one.
+CREATE TRIGGER IF NOT EXISTS peer_message_refusal_notices_insert_authority
+BEFORE INSERT ON peer_message_refusal_notices
+WHEN acp_peer_message_notice_authorized(
+  NEW.message_id, NEW.entry, NEW.role_key, NEW.reason, NEW.sender, NEW.source_channel,
+  NEW.source_nonce, NEW.binding_generation, NEW.session_id, NEW.session_incarnation
+) <> 1
+  OR (NEW.entry = 'REPORTED' AND NOT EXISTS (
+    SELECT 1 FROM peer_message_refusal_notices
+     WHERE message_id = NEW.message_id AND entry = 'OWED' AND role_key = NEW.role_key
+  ))
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — one OWED and one REPORTED entry per message, ever; a second of either is refused.
+CREATE TRIGGER IF NOT EXISTS peer_message_refusal_notices_no_replace
+BEFORE INSERT ON peer_message_refusal_notices
+WHEN EXISTS (
+  SELECT 1 FROM peer_message_refusal_notices
+   WHERE message_id = NEW.message_id AND entry = NEW.entry
+)
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_NO_REPLACE');
+END;
+
+-- CP-HI-08 — an entry is never rewritten.
+CREATE TRIGGER IF NOT EXISTS peer_message_refusal_notices_immutable
+BEFORE UPDATE ON peer_message_refusal_notices
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — and never removed: a deleted OWED entry is a CEO who is never told.
+CREATE TRIGGER IF NOT EXISTS peer_message_refusal_notices_no_delete
+BEFORE DELETE ON peer_message_refusal_notices
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_IMMUTABLE');
+END;
+
+CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role
+  ON peer_message_refusal_notices(role_key, entry);
+
+-- ---------------------------------------------------------------------------
+-- peer_message_notice_deliveries  (schema v40, ACP-RESTART-04, acp-daemon-notice/v1)
+--   Lifecycle: the daemon's own delivery of an OWED refusal notice to the CEO, through the CEO's
+--   existing canonical conversation, with no successor CTO involved. Keyed by the notice's
+--   `event_id` (`acp-notice:` + sha256 of `<message_id>\n<role_key>\n<reason>`). One `IN_DOUBT` entry,
+--   written before the first POST, holding the exact canonical bytes and their digest, so every
+--   retry — after a 409, a timeout or a restart — resends the same id and the same payload. Then at
+--   most one of: `SETTLED`, with the Gateway's receipt id, written only for a 200 whose event id,
+--   payload digest, `completed` receipt, session and lineage all match; or `FAILED`, terminal, with
+--   the category and what differed — a Hermes refusal (signature, principal, destination or payload
+--   mismatch), a 200 that did not match, or a pinned CEO destination that moved since the bytes were
+--   fixed. A notice is never redirected and never re-minted under a new id. One channel per notice
+--   (amendment 1): the daemon starts no delivery for a notice a holder REPORTED, and a holder is not
+--   shown, and may not report, a notice the daemon has in doubt or settled. A PROBE (kind) is the
+--   synthetic live-acceptance notice: no message, sent once at startup when no entry for its id
+--   exists, its one resend recorded as RESENT.
+--   Integrity: an entry is inserted only under the connection-local marker
+--   `Db.withPeerMessageNoticeDelivery` raises for that one entry, from a capability only the outbox
+--   mints; an IN_DOUBT entry only beside its OWED notice, a SETTLED or FAILED entry only beside the
+--   IN_DOUBT entry with the same digest, and never both. WITHOUT ROWID; never updated, never deleted.
+--   The notice text in the canonical bytes is metadata only, never the refused message's payload.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS peer_message_notice_deliveries (
+  event_id         TEXT NOT NULL,
+  entry            TEXT NOT NULL CHECK (entry IN ('IN_DOUBT','SETTLED','FAILED','RESENT')),
+  -- NOTICE: a real refusal notice. PROBE: the synthetic live-acceptance notice (amendment 1), which
+  -- names no message and is resent exactly once, the resend recorded as RESENT.
+  kind             TEXT NOT NULL CHECK (kind IN ('NOTICE','PROBE')),
+  -- NOTICE: the OWED notice this delivers — its key in peer_message_refusal_notices and its reason.
+  message_id       TEXT,
+  role_key         TEXT,
+  reason           TEXT,
+  payload_digest   TEXT NOT NULL,
+  -- IN_DOUBT: the canonical JSON, exactly as signed and as every retry resends it.
+  canonical_json   TEXT,
+  -- SETTLED: the receipt the Gateway gave for the completed CEO turn. RESENT: the receipt the resend
+  -- came back with when it met every settlement condition, else null.
+  receipt_id       TEXT,
+  -- FAILED: why. FAILED and RESENT: what was answered or what differed (status, Hermes error code,
+  -- mismatched field names) — never the answer's text.
+  failure          TEXT CHECK (failure IN ('HERMES_REFUSED','RESPONSE_MISMATCH','DESTINATION_MOVED')),
+  diagnostics_json TEXT,
+  created_at       TEXT NOT NULL,
+  PRIMARY KEY (event_id, entry),
+  CHECK ((kind = 'NOTICE') = (message_id IS NOT NULL AND role_key IS NOT NULL AND reason IS NOT NULL)),
+  CHECK (kind = 'NOTICE' OR (message_id IS NULL AND role_key IS NULL AND reason IS NULL)),
+  CHECK ((kind = 'NOTICE' AND substr(event_id, 1, 11) = 'acp-notice:')
+      OR (kind = 'PROBE' AND substr(event_id, 1, 17) = 'acp-notice-probe:')),
+  CHECK (entry <> 'RESENT' OR kind = 'PROBE'),
+  CHECK ((entry = 'IN_DOUBT') = (canonical_json IS NOT NULL)),
+  CHECK (entry <> 'SETTLED' OR receipt_id IS NOT NULL),
+  CHECK (entry NOT IN ('IN_DOUBT','FAILED') OR receipt_id IS NULL),
+  CHECK ((entry = 'FAILED') = (failure IS NOT NULL)),
+  CHECK ((entry IN ('FAILED','RESENT')) = (diagnostics_json IS NOT NULL))
+) WITHOUT ROWID;
+
+-- CP-HI-06 — a delivery entry is the evidence that the CEO was told, or why not; ordinary SQL must
+-- not write one. `acp_peer_message_notice_delivery_authorized` answers 1 only while the outbox holds
+-- the marker for exactly this entry. An IN_DOUBT entry is the first for its event id; a NOTICE one
+-- needs its OWED notice and no REPORTED one — one channel per notice (amendment 1). Every later entry
+-- needs the IN_DOUBT entry with the same digest and subject, and a notice is settled or failed, not
+-- both.
+CREATE TRIGGER IF NOT EXISTS peer_message_notice_deliveries_insert_authority
+BEFORE INSERT ON peer_message_notice_deliveries
+WHEN acp_peer_message_notice_delivery_authorized(
+  NEW.event_id, NEW.entry, NEW.payload_digest, NEW.receipt_id, NEW.failure
+) <> 1
+  OR (NEW.entry = 'IN_DOUBT' AND EXISTS (
+    SELECT 1 FROM peer_message_notice_deliveries WHERE event_id = NEW.event_id))
+  OR (NEW.entry = 'IN_DOUBT' AND NEW.kind = 'NOTICE' AND NOT EXISTS (
+    SELECT 1 FROM peer_message_refusal_notices
+     WHERE message_id = NEW.message_id AND entry = 'OWED' AND role_key = NEW.role_key
+       AND reason = NEW.reason))
+  OR (NEW.entry = 'IN_DOUBT' AND NEW.kind = 'NOTICE' AND EXISTS (
+    SELECT 1 FROM peer_message_refusal_notices
+     WHERE message_id = NEW.message_id AND entry = 'REPORTED'))
+  OR (NEW.entry <> 'IN_DOUBT' AND NOT EXISTS (
+    SELECT 1 FROM peer_message_notice_deliveries
+     WHERE event_id = NEW.event_id AND entry = 'IN_DOUBT' AND payload_digest = NEW.payload_digest
+       AND kind = NEW.kind AND message_id IS NEW.message_id AND role_key IS NEW.role_key
+       AND reason IS NEW.reason))
+  OR (NEW.entry IN ('SETTLED','FAILED') AND EXISTS (
+    SELECT 1 FROM peer_message_notice_deliveries
+     WHERE event_id = NEW.event_id AND entry IN ('SETTLED','FAILED')))
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_DELIVERY_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — one entry of each kind per notice, ever; a second is refused, not merged.
+CREATE TRIGGER IF NOT EXISTS peer_message_notice_deliveries_no_replace
+BEFORE INSERT ON peer_message_notice_deliveries
+WHEN EXISTS (
+  SELECT 1 FROM peer_message_notice_deliveries
+   WHERE event_id = NEW.event_id AND entry = NEW.entry
+)
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_DELIVERY_NO_REPLACE');
+END;
+
+-- CP-HI-08 — a delivery entry is never rewritten.
+CREATE TRIGGER IF NOT EXISTS peer_message_notice_deliveries_immutable
+BEFORE UPDATE ON peer_message_notice_deliveries
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_DELIVERY_IMMUTABLE');
+END;
+
+-- CP-HI-08 — and never removed: a deleted SETTLED entry is a notice sent twice, a deleted IN_DOUBT
+-- one a retry under other bytes.
+CREATE TRIGGER IF NOT EXISTS peer_message_notice_deliveries_no_delete
+BEFORE DELETE ON peer_message_notice_deliveries
+BEGIN
+  SELECT RAISE(ABORT, 'PEER_MESSAGE_NOTICE_DELIVERY_IMMUTABLE');
+END;
+
+-- ---------------------------------------------------------------------------
+-- holder_message_departures  (schema v40, review finding 01)
+--   Lifecycle: one row per outbox message, of any kind, that has ever left PENDING — handed over,
+--   claimed by a delivery loop, sent, acknowledged, rejected, expired, or moved by any other
+--   statement. `TRANSITION`: written by `outbox_holder_message_departs` in the statement that moved
+--   the row, whoever wrote it. `BACKFILL`: written by v40 for a row that had already left PENDING
+--   before the trigger existed; its earlier status was not observed, so `from_status` is null.
+--   Integrity: the outbox row's status, attempts, sent_at and claim_token are ordinary columns any
+--   statement can put back, and so is its kind, so a row that reads as a PENDING holder-claimed
+--   message (`HOLDER_CLAIMED_KINDS`) may still have been claimed — as itself, or as another kind.
+--   "Never claimed" is read here instead: only the holder-claimed hand-over paths read this table,
+--   and a message with a departure is never carried to a successor, never re-addressed and never
+--   handed to a holder again, whatever its row says now. Every kind is recorded so a kind rewritten
+--   before the row left PENDING cannot hide the departure; a generic row that a retry or a lease
+--   reclaim returns to PENDING is not affected, because no generic path reads this table. A
+--   departure is never updated, replaced or deleted. Its INSERT needs no authority: a forged
+--   departure can only make a message ineligible, which fails safe. WITHOUT ROWID: a REPLACE through a
+--   hidden rowid, on a connection whose recursive triggers are off, deleted a genuine departure while
+--   every guard here checked only `message_id`; with no rowid the declared key is the only identity.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS holder_message_departures (
+  message_id   TEXT PRIMARY KEY NOT NULL,
+  from_status  TEXT,
+  to_status    TEXT NOT NULL,
+  departed_at  TEXT NOT NULL,
+  basis        TEXT NOT NULL CHECK (basis IN ('TRANSITION','BACKFILL')),
+  CHECK ((basis = 'TRANSITION') = (from_status IS NOT NULL))
+) WITHOUT ROWID;
+
+-- CP-HI-06 — the departure is recorded by the database for every writer, raw SQL included, the
+-- moment a row first leaves PENDING; a later status write cannot take it back. No kind filter: the
+-- kind is as rewritable as the status, and a row that left PENDING under another kind was claimed
+-- all the same. A second departure of the same message is not attempted, so the no-replace guard
+-- below never refuses a product write, including a generic retry that leaves PENDING again.
+CREATE TRIGGER IF NOT EXISTS outbox_holder_message_departs
+AFTER UPDATE OF status ON outbox
+WHEN OLD.status = 'PENDING' AND NEW.status <> 'PENDING'
+  AND NOT EXISTS (SELECT 1 FROM holder_message_departures WHERE message_id = NEW.message_id)
+BEGIN
+  INSERT INTO holder_message_departures (message_id, from_status, to_status, departed_at, basis)
+  VALUES (NEW.message_id, OLD.status, NEW.status, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'TRANSITION');
+END;
+
+-- CP-HI-06 — a departure names its message by id, so the id is fixed once written: a departed row
+-- renamed and put back to PENDING in one statement fires no departure (it leaves SENT, not PENDING)
+-- and its new id has none, so it would read as a message nobody was ever handed. No product path
+-- writes an outbox row's id after its INSERT.
+CREATE TRIGGER IF NOT EXISTS outbox_message_id_immutable
+BEFORE UPDATE OF message_id ON outbox
+WHEN NEW.message_id IS NOT OLD.message_id
+BEGIN
+  SELECT RAISE(ABORT, 'OUTBOX_MESSAGE_ID_IMMUTABLE');
+END;
+
+-- CP-HI-06 — one departure per message, ever; a second is refused, not merged.
+CREATE TRIGGER IF NOT EXISTS holder_message_departures_no_replace
+BEFORE INSERT ON holder_message_departures
+WHEN EXISTS (
+  SELECT 1 FROM holder_message_departures
+   WHERE message_id = NEW.message_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_NO_REPLACE');
+END;
+
+-- CP-HI-08 — a departure is evidence that the message was claimed: never rewritten.
+CREATE TRIGGER IF NOT EXISTS holder_message_departures_immutable
+BEFORE UPDATE ON holder_message_departures
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — and never removed: a deleted departure would let a reverted row be handed over again.
+CREATE TRIGGER IF NOT EXISTS holder_message_departures_no_delete
+BEFORE DELETE ON holder_message_departures
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+
+-- CP-HI-06 — a row that ever left PENDING is history its departure names. No product path deletes an
+-- outbox row, and deleting this one is the first half of queueing its event again under another id.
+-- (A REPLACE through the outbox's hidden rowid, on a connection whose recursive triggers are off,
+-- still skips this; the event-keyed record below is what refuses the re-queued row.)
+CREATE TRIGGER IF NOT EXISTS outbox_departed_no_delete
+BEFORE DELETE ON outbox
+WHEN EXISTS (SELECT 1 FROM holder_message_departures WHERE message_id = OLD.message_id)
+BEGIN
+  SELECT RAISE(ABORT, 'OUTBOX_DEPARTED_ROW_NO_DELETE');
+END;
+
+-- ---------------------------------------------------------------------------
+-- holder_message_source_departures  (schema v40, review finding 01)
+--   Lifecycle: one row per admitted event — the ingress row's key, as a holder-claimed outbox row's
+--   pointer names it (`ownerMessagePointerOf`) — and reason. `MESSAGE_DEPARTED`: written by
+--   `outbox_holder_message_source_departs` when an outbox row pointing at the event first leaves
+--   PENDING. `TURN_TERMINAL`: written by `inbound_messages_turn_terminal_departs` (and its INSERT
+--   twin) when the event's turn claim first holds a terminal fact — `repliedAt`, `noReplyAt` or
+--   `settledAt`. `BACKFILL`: written by v40 for what had already happened before the triggers.
+--   Integrity: a departure keyed by the message id is not enough. A writer can delete a claimed outbox
+--   row and insert its pointer again under a new id, or copy the pointer beside the original; the
+--   terminal fact lives in `turn_claim_json`, which an ordinary `json_remove` edits and whose row a
+--   REPLACE through its hidden rowid recreates. Keyed by the event itself, this outlives all of them.
+--   The holder's claim, a takeover's retarget and a runtime move refuse a row whose event has a
+--   `MESSAGE_DEPARTED` entry; the restart's carry refuses either reason. WITHOUT ROWID; never updated,
+--   replaced or deleted. Its INSERT needs no authority: a forged entry can only make a message
+--   ineligible, which fails safe.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS holder_message_source_departures (
+  source_channel TEXT NOT NULL,
+  source_nonce   TEXT NOT NULL,
+  reason         TEXT NOT NULL CHECK (reason IN ('MESSAGE_DEPARTED','TURN_TERMINAL')),
+  -- MESSAGE_DEPARTED: the outbox message whose departure spent the event. TURN_TERMINAL: null.
+  message_id     TEXT,
+  recorded_at    TEXT NOT NULL,
+  basis          TEXT NOT NULL CHECK (basis IN ('TRANSITION','BACKFILL')),
+  PRIMARY KEY (source_channel, source_nonce, reason),
+  CHECK ((reason = 'MESSAGE_DEPARTED') = (message_id IS NOT NULL))
+) WITHOUT ROWID;
+
+-- CP-HI-06 — the event an outbox row points at is spent the moment the row first leaves PENDING,
+-- for every writer and every kind, as `outbox_holder_message_departs` records the row itself. The
+-- pointer is read the way `ownerMessagePointerOf` reads it; `CASE` keeps a payload that is not JSON
+-- off json_extract, so such a row still moves and simply names no event.
+CREATE TRIGGER IF NOT EXISTS outbox_holder_message_source_departs
+AFTER UPDATE OF status ON outbox
+WHEN OLD.status = 'PENDING' AND NEW.status <> 'PENDING'
+  AND (CASE WHEN json_valid(NEW.payload_json) = 1
+            THEN json_extract(NEW.payload_json, '$.sourceChannel') = 'buzz'
+                 AND json_type(NEW.payload_json, '$.sourceNonce') = 'text'
+            ELSE 0 END) = 1
+  AND NOT EXISTS (
+    SELECT 1 FROM holder_message_source_departures
+     WHERE source_channel = 'buzz' AND reason = 'MESSAGE_DEPARTED'
+       AND source_nonce = (CASE WHEN json_valid(NEW.payload_json) = 1
+                                THEN json_extract(NEW.payload_json, '$.sourceNonce') END))
+BEGIN
+  INSERT INTO holder_message_source_departures
+    (source_channel, source_nonce, reason, message_id, recorded_at, basis)
+  VALUES ('buzz', json_extract(NEW.payload_json, '$.sourceNonce'), 'MESSAGE_DEPARTED', NEW.message_id,
+          strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'TRANSITION');
+END;
+
+-- CP-HI-06 — one entry per event and reason, ever; a second is refused, not merged.
+CREATE TRIGGER IF NOT EXISTS holder_message_source_departures_no_replace
+BEFORE INSERT ON holder_message_source_departures
+WHEN EXISTS (
+  SELECT 1 FROM holder_message_source_departures
+   WHERE source_channel = NEW.source_channel AND source_nonce = NEW.source_nonce AND reason = NEW.reason
+)
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_SOURCE_DEPARTURE_NO_REPLACE');
+END;
+
+-- CP-HI-08 — an entry is evidence that the event was handed over or answered: never rewritten.
+CREATE TRIGGER IF NOT EXISTS holder_message_source_departures_immutable
+BEFORE UPDATE ON holder_message_source_departures
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_SOURCE_DEPARTURE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — and never removed: a deleted entry would let the event be queued and handed over again.
+CREATE TRIGGER IF NOT EXISTS holder_message_source_departures_no_delete
+BEFORE DELETE ON holder_message_source_departures
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_SOURCE_DEPARTURE_IMMUTABLE');
+END;
+
+-- ---------------------------------------------------------------------------
 -- inbound_messages
 --   Lifecycle: ingress replay defence (§27.1 nonce/idempotency, §27.3 MCP).
 --   Integrity: unique nonce per channel is the whole point.
@@ -1370,6 +1846,58 @@ WHEN (OLD.channel = 'owner-reply-intent' OR NEW.channel = 'owner-reply-intent')
  AND (NEW.channel IS NOT OLD.channel OR NEW.nonce IS NOT OLD.nonce)
 BEGIN
   SELECT RAISE(ABORT, 'INBOUND_OWNER_REPLY_KEY_IMMUTABLE');
+END;
+
+-- CP-HI-06 — a Buzz event's admitted row (ACP-RESTART-02, schema v40) is found by its key alone:
+-- channel 'buzz' and the event's nonce, named by the outbox pointer and by a peer message's carry
+-- record. The payload, REPLACE and DELETE guards above keep the row; they did not keep its key, so
+-- an UPDATE could move the admitted CEO instruction aside and a new row with other words take its
+-- key. No row may leave this channel, enter it, or change its nonce in it by UPDATE. The whole
+-- channel rather than its peer rows alone: nothing moves a Buzz key, and an owner mention's row is
+-- found by its key the same way.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_buzz_source_key_immutable
+BEFORE UPDATE OF channel, nonce ON inbound_messages
+WHEN (OLD.channel = 'buzz' OR NEW.channel = 'buzz')
+ AND (NEW.channel IS NOT OLD.channel OR NEW.nonce IS NOT OLD.nonce)
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE');
+END;
+
+-- CP-HI-06 — an admitted Buzz event's turn is spent the moment its claim first holds a terminal fact,
+-- for every writer; the record stands however the claim JSON, or the row, is rewritten afterwards.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_turn_terminal_departs
+AFTER UPDATE OF turn_claim_json ON inbound_messages
+WHEN NEW.channel = 'buzz' AND NEW.turn_claim_json IS NOT NULL
+  AND (CASE WHEN json_valid(NEW.turn_claim_json) = 1
+            THEN json_type(NEW.turn_claim_json, '$.repliedAt') IS NOT NULL
+              OR json_type(NEW.turn_claim_json, '$.noReplyAt') IS NOT NULL
+              OR json_type(NEW.turn_claim_json, '$.settledAt') IS NOT NULL
+            ELSE 0 END) = 1
+  AND NOT EXISTS (
+    SELECT 1 FROM holder_message_source_departures
+     WHERE source_channel = NEW.channel AND source_nonce = NEW.nonce AND reason = 'TURN_TERMINAL')
+BEGIN
+  INSERT INTO holder_message_source_departures
+    (source_channel, source_nonce, reason, message_id, recorded_at, basis)
+  VALUES (NEW.channel, NEW.nonce, 'TURN_TERMINAL', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'TRANSITION');
+END;
+
+-- CP-HI-06 — the same for an admitted row inserted with its terminal fact already in its claim.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_turn_terminal_departs_on_insert
+AFTER INSERT ON inbound_messages
+WHEN NEW.channel = 'buzz' AND NEW.turn_claim_json IS NOT NULL
+  AND (CASE WHEN json_valid(NEW.turn_claim_json) = 1
+            THEN json_type(NEW.turn_claim_json, '$.repliedAt') IS NOT NULL
+              OR json_type(NEW.turn_claim_json, '$.noReplyAt') IS NOT NULL
+              OR json_type(NEW.turn_claim_json, '$.settledAt') IS NOT NULL
+            ELSE 0 END) = 1
+  AND NOT EXISTS (
+    SELECT 1 FROM holder_message_source_departures
+     WHERE source_channel = NEW.channel AND source_nonce = NEW.nonce AND reason = 'TURN_TERMINAL')
+BEGIN
+  INSERT INTO holder_message_source_departures
+    (source_channel, source_nonce, reason, message_id, recorded_at, basis)
+  VALUES (NEW.channel, NEW.nonce, 'TURN_TERMINAL', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'TRANSITION');
 END;
 
 -- ---------------------------------------------------------------------------

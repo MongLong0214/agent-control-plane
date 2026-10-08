@@ -99,6 +99,123 @@ export const isAdoptedCanonicalRuntime = (
     assignmentId === undefined ? [sessionId] : [sessionId, assignmentId],
   )?.held === 1;
 
+/**
+ * The `actor` the dead-predecessor recovery records when this claim, not the operator door, made
+ * it: this prefix and the conversational actor's id. An audit row's `actor` is text any statement
+ * can write, so it is a label here and never evidence: what a peer-message carry rests on is the
+ * recovery row's exact `event_id`, bound into the carry record by the transaction that wrote both.
+ */
+export const SELF_CLAIM_RECOVERY_ACTOR_PREFIX = "canonical-self-claim:";
+
+/**
+ * One same-conversation restart of a canonical CTO, as the self-claim's dead-predecessor recovery
+ * and the successor's bind established it inside one claim transaction (ACP-PEER-SUCCESSION-01).
+ * Every field is bound into each peer-message carry record that restart writes.
+ */
+export interface PeerMessageSuccession {
+  readonly roleKey: string;
+  readonly fromSessionId: string;
+  readonly fromSessionIncarnation: string;
+  readonly fromGeneration: number;
+  readonly fromAssignmentId: string;
+  readonly toSessionId: string;
+  readonly toSessionIncarnation: string;
+  readonly toGeneration: number;
+  readonly toAssignmentId: string;
+  /** The one conversational actor both generations belong to. */
+  readonly actorId: string;
+  /** That actor's lifetime target: the claimed conversation UUID. */
+  readonly conversationUuid: string;
+  /** The Buzz channel identity both runtimes speak as. */
+  readonly buzzActorId: string;
+  /** The `DEAD_BINDING_RECOVERED` row this transaction wrote for the predecessor. */
+  readonly recoveryAuditEventId: number;
+  /**
+   * Whether `peerMessageSuccessionIsProven` held for the facts above. Only then may a CARRIED
+   * record be written; a REFUSED one (the notice the successor is shown) may be either way.
+   */
+  readonly proven: boolean;
+}
+
+/**
+ * The capability to write peer-message carry records for one succession.
+ *
+ * Minted only by `CanonicalSelfClaim.#mutate`, after its dead-predecessor recovery and the
+ * successor's bind, inside that claim transaction; the class is not exported, so no other module
+ * can make one, and `Db.withPeerMessageCarry` checks the brand before it raises the marker the
+ * record's insert trigger requires. The outbox is handed one to carry with and cannot widen it: the
+ * succession comes from the token, never from its caller.
+ */
+class PeerMessageCarryAuthorityToken {
+  readonly #minted = true;
+  readonly #db: Db;
+  readonly #succession: PeerMessageSuccession;
+
+  constructor(db: Db, succession: PeerMessageSuccession) {
+    this.#db = db;
+    this.#succession = Object.freeze({ ...succession });
+    Object.freeze(this);
+  }
+
+  static successionOf(value: unknown, db: Db): PeerMessageSuccession | null {
+    if (typeof value !== "object" || value === null || !(#minted in value)) return null;
+    return value.#db === db ? value.#succession : null;
+  }
+}
+export type PeerMessageCarryAuthority = PeerMessageCarryAuthorityToken;
+/** The succession a carry authority names, or null when `value` is not one issued for `db`. */
+export const peerMessageCarrySuccessionOf = PeerMessageCarryAuthorityToken.successionOf;
+
+/**
+ * Whether the facts the self-claim gathered are one same-conversation restart, re-read from what
+ * its own transaction just wrote: `from` is generation N, REVOKED, bound to exactly that session
+ * and incarnation by that assignment; `to` is generation N + 1, ACTIVE, the same; both held by the
+ * one conversational actor whose lifetime target is this `SELF_CLAIM_EXECUTOR_KIND` conversation
+ * UUID; both runtimes speak as this Buzz channel identity; and the release is this exact
+ * `DEAD_BINDING_RECOVERED` row for that assignment.
+ *
+ * Asked only by the self-claim, before it mints the carry authority. The hand-over does not ask
+ * it: what it rests on is the carry record (`selfClaimCarriedTo`), which ordinary SQL cannot write,
+ * while every table read here can be.
+ */
+export const peerMessageSuccessionIsProven = (
+  db: Pick<Db, "get">,
+  succession: Omit<PeerMessageSuccession, "proven">,
+): boolean => {
+  const s = succession;
+  if (!Number.isSafeInteger(s.fromGeneration) || s.toGeneration !== s.fromGeneration + 1) return false;
+  if (s.fromSessionId === s.toSessionId || s.buzzActorId.length === 0) return false;
+  return db.get<{ held: number }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM assignments prev
+         JOIN assignments next ON next.assignment_id = ?
+         JOIN sessions prev_s ON prev_s.session_id = prev.session_id
+         JOIN sessions next_s ON next_s.session_id = next.session_id
+         JOIN actor_target_bindings tb ON tb.target_actor_id = prev.actor_id
+         JOIN audit_events e ON e.event_id = ?
+        WHERE prev.assignment_id = ? AND prev.role_key = ? AND prev.role = ?
+          AND prev.binding_generation = ? AND prev.session_id = ? AND prev.session_incarnation = ?
+          AND prev.actor_id = ? AND prev.status = 'REVOKED'
+          AND next.role_key = prev.role_key AND next.role = prev.role
+          AND next.binding_generation = ? AND next.session_id = ? AND next.session_incarnation = ?
+          AND next.actor_id = prev.actor_id AND next.status = 'ACTIVE'
+          AND tb.executor_kind = ? AND tb.target_locator = ?
+          AND prev_s.buzz_actor_id = ? AND next_s.buzz_actor_id = ?
+          AND e.kind = 'DEAD_BINDING_RECOVERED'
+          AND e.role_key = prev.role_key AND e.session_id = prev.session_id
+          AND json_extract(e.evidence_json, '$.assignmentId') = prev.assignment_id
+     ) AS held`,
+    [
+      s.toAssignmentId, s.recoveryAuditEventId,
+      s.fromAssignmentId, s.roleKey, Role.PRIMARY_CTO,
+      s.fromGeneration, s.fromSessionId, s.fromSessionIncarnation, s.actorId,
+      s.toGeneration, s.toSessionId, s.toSessionIncarnation,
+      SELF_CLAIM_EXECUTOR_KIND, s.conversationUuid,
+      s.buzzActorId, s.buzzActorId,
+    ],
+  )?.held === 1;
+};
+
 const MAX_ANCESTRY_HOPS = 64;
 const SUBPROCESS_TIMEOUT_MS = 5_000;
 const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -2111,6 +2228,22 @@ export class CanonicalSelfClaim {
        * claim adopts nothing from it.
        */
       let abandonedRuntimeSessionId: string | null = null;
+      /**
+       * What the dead-predecessor recovery below released, when it ran. Its revoke held the
+       * predecessor's queued peer messages instead of rejecting them, and they are carried to — or
+       * rejected for — the successor once it is bound, in this same transaction. `alreadyCarried`
+       * is filled by that revoke: the queued peer messages it rejected because a previous restart
+       * had already carried them once, which the successor is told about.
+       */
+      let recoveredFrom: {
+        generation: number;
+        sessionId: string;
+        sessionIncarnation: string;
+        assignmentId: string;
+        actorId: string;
+        recoveryAuditEventId: number | null;
+        alreadyCarried: string[];
+      } | null = null;
       // Liveness of a row is not liveness of a process (#831). This branch's subject is a *live*
       // runtime replacing its own revoked attachment, so a predecessor whose recorded
       // `(osPid, start token)` pair no longer resolves to a running process is not its case at
@@ -2156,7 +2289,8 @@ export class CanonicalSelfClaim {
           // The seam `#predecessorProcessIsGone` reads, so the start token is compared in the
           // format this claim recorded it and the two reads cannot disagree about one row.
           const startedAt = (pid: number) => this.#processInspector.snapshot(pid)?.startedAt ?? null;
-          const released = recoverDeadCanonicalBinding(`canonical-self-claim:${incumbent.actor_id}`, {
+          const hold = { alreadyCarried: [] as string[] };
+          const released = recoverDeadCanonicalBinding(`${SELF_CLAIM_RECOVERY_ACTOR_PREFIX}${incumbent.actor_id}`, {
             projectId,
             role: Role.PRIMARY_CTO,
             sessionId: predecessor.sessionId,
@@ -2168,8 +2302,24 @@ export class CanonicalSelfClaim {
             sessions: this.sessions,
             bindings: this.bindings,
             liveness: { signal: this.#processSignal, startedAt },
+            // Policy change (2026-10-03): the revoke this release runs used to reject every queued
+            // PEER_MESSAGE (#1044) and settle its turn, so a CEO instruction queued for this
+            // conversation was lost — silently, to the CEO — on every restart. #1044's rule is that
+            // a peer message is never handed to a *different* runtime; the successor here is the
+            // same conversation. So those rows are held, and carried or rejected after `bind`
+            // below, inside this transaction. Every other revoke still rejects them.
+            holdPeerMessagesForSameActorSuccessor: hold,
           });
           if (!released.allowed) return released as Decision<CanonicalSelfClaimReceipt>;
+          recoveredFrom = {
+            generation: released.value.releasedGeneration,
+            sessionId: predecessor.sessionId,
+            sessionIncarnation: predecessor.incarnation,
+            assignmentId: released.value.assignmentId,
+            actorId: incumbent.actor_id,
+            recoveryAuditEventId: released.value.recoveryAuditEventId,
+            alreadyCarried: hold.alreadyCarried,
+          };
         }
       } else if (incumbent && predecessor &&
           predecessor.lifecycle !== SessionLifecycle.STOPPED && predecessor.lifecycle !== SessionLifecycle.ERROR) {
@@ -2324,6 +2474,44 @@ export class CanonicalSelfClaim {
         authenticatedTarget,
       });
       if (!bound.allowed) return bound as Decision<CanonicalSelfClaimReceipt>;
+
+      // The other half of the hold above, and only once the successor binding exists: every peer
+      // message the release held is carried to this generation once, or rejected with its turn
+      // settled exactly as the revoke would have, and either way recorded (ACP-PEER-SUCCESSION-01).
+      // The record is the hand-over's only evidence of this succession, so the capability to write
+      // one is minted here and nowhere else, for exactly these facts, and a CARRIED record is
+      // possible only when `peerMessageSuccessionIsProven` reads them back from what this
+      // transaction wrote. A denial after this line rolls the carry and its records back with
+      // everything else; a settlement that cannot complete throws, and the throw rolls the whole
+      // claim back too.
+      if (recoveredFrom !== null) {
+        if (recoveredFrom.recoveryAuditEventId === null) {
+          return deny(
+            ReasonCode.AUDIT_WRITE_FAILED,
+            "the recovery's DEAD_BINDING_RECOVERED row has no id, so its held peer messages cannot be recorded",
+            { roleKey, sessionId: recoveredFrom.sessionId },
+          );
+        }
+        const facts: Omit<PeerMessageSuccession, "proven"> = {
+          roleKey,
+          fromSessionId: recoveredFrom.sessionId,
+          fromSessionIncarnation: recoveredFrom.sessionIncarnation,
+          fromGeneration: recoveredFrom.generation,
+          fromAssignmentId: recoveredFrom.assignmentId,
+          toSessionId: created.sessionId,
+          toSessionIncarnation: bound.value.sessionIncarnation,
+          toGeneration: bound.value.bindingGeneration,
+          toAssignmentId: bound.value.assignmentId,
+          actorId: recoveredFrom.actorId,
+          conversationUuid: identity.sessionUuid,
+          buzzActorId: entry.buzzActorId,
+          recoveryAuditEventId: recoveredFrom.recoveryAuditEventId,
+        };
+        this.bindings.carryPeerMessagesToSameActorSuccessor(
+          new PeerMessageCarryAuthorityToken(this.db, { ...facts, proven: peerMessageSuccessionIsProven(this.db, facts) }),
+          recoveredFrom.alreadyCarried,
+        );
+      }
 
       const admitted = allow(ReasonCode.OK, {
         sessionId: created.sessionId,

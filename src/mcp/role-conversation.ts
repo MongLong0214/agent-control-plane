@@ -7,6 +7,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Role, RoleBinding } from "../domain/types.ts";
+import type { PeerMessageRefusalNotice } from "../ingress/buzz-message.ts";
 import type { HolderIdentity, UnresolvedOwnerMessage } from "../outbox/outbox.ts";
 import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "./shared.ts";
 
@@ -150,6 +151,17 @@ export interface OwnerMessageHandover {
    */
   withheld: readonly UnresolvedOwnerMessage[];
   hasMore: boolean;
+  /**
+   * CEO peer messages ACP rejected while they were queued for this role — on a revoke, a takeover
+   * by another runtime, a runtime move, or a canonical restart that did not carry them
+   * (ACP-PEER-SUCCESSION-01, ACP-RESTART-04) — that no holder has reported yet, with the reason.
+   * Shown to the role's current holder whether or not it is the restart's successor; the name is
+   * the restart's, where the first of these came from. The daemon cannot sign Buzz in a canonical
+   * room, so this is how the CEO gets told — the CTO says so in the thread, then reports it with
+   * `reportRefusal`. Message id, source event id, signer and reason only; never the payload.
+   * Absent when there is none.
+   */
+  refusedAtRestart?: readonly PeerMessageRefusalNotice[];
 }
 
 /**
@@ -164,6 +176,8 @@ export interface OwnerMessageLedger {
   claim(holder: HolderIdentity): Decision<OwnerMessageHandover>;
   complete(messageId: string, holder: HolderIdentity): Decision<void>;
   reject(messageId: string, holder: HolderIdentity): Decision<void>;
+  /** The holder told the CEO about one `refusedAtRestart` notice (ACP-RESTART-04). */
+  reportRefusal(messageId: string, holder: HolderIdentity): Decision<void>;
 }
 
 /**
@@ -952,6 +966,20 @@ export class RoleConversationPort {
     const ledger = this.#ledger();
     if (!ledger.allowed) return ledger as Decision<void>;
     return ledger.value.reject(messageId, holder.value);
+  }
+
+  /**
+   * This connection, the role's current holder, takes on telling the CEO about one rejected peer
+   * message it was shown under `refusedAtRestart` (ACP-RESTART-04) — before it tells the CEO. Refused
+   * when the daemon is already telling the CEO itself (acp-daemon-notice/v1, amendment 1: one channel
+   * per notice); the holder then says nothing.
+   */
+  reportPeerMessageRefusal(server: McpServer, roleKey: string, messageId: string): Decision<void> {
+    const holder = this.#holderFor(server, roleKey);
+    if (!holder.allowed) return holder as Decision<void>;
+    const ledger = this.#ledger();
+    if (!ledger.allowed) return ledger as Decision<void>;
+    return ledger.value.reportRefusal(messageId, holder.value);
   }
 
   /**

@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 39;
+export const SCHEMA_VERSION = 40;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -130,6 +130,11 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- CP-HI-06 — DELETE followed by INSERT is also a first claim\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_override_insert_authority[\s\S]*?\nEND;/,
   // v39 alone installs this guard, the owner-reply intent's key (R1056-02).
   /-- CP-HI-06 — an owner reply's recorded intent \(#1036, R1056-02\) is found by its key alone[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_owner_reply_key_immutable[\s\S]*?\nEND;/,
+  // v40 alone creates the peer-message carry record and its guards (ACP-PEER-SUCCESSION-01), the refusal
+  // notices beside them (ACP-RESTART-04), and the holder-message departures with their trigger (finding 01).
+  /-- -{75}\n-- peer_message_carries[\s\S]*?CREATE TRIGGER IF NOT EXISTS holder_message_source_departures_no_delete[\s\S]*?\nEND;/,
+  // v40 alone installs the Buzz source key guard (ACP-RESTART-02) and the turn-terminal records (finding 01).
+  /-- CP-HI-06 — a Buzz event's admitted row \(ACP-RESTART-02, schema v40\)[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_turn_terminal_departs_on_insert[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -2666,6 +2671,172 @@ const v39: SchemaMigration = {
   checksum: () => migrationChecksum("v39-owner-reply-intent-keeps-its-key", SCHEMA_VERSION),
 };
 
+/**
+ * v40's triggers, read from schema.sql by name: over the carry record, over the refusal notices
+ * (ACP-RESTART-04), over a Buzz event's admitted key (ACP-RESTART-02), and the holder-message
+ * departure record with the outbox trigger that writes it (review finding 01).
+ */
+const V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES: readonly string[] = [
+  "peer_message_carries_insert_authority",
+  "peer_message_carries_no_replace",
+  "peer_message_carries_immutable",
+  "peer_message_carries_no_delete",
+  "peer_message_refusal_notices_insert_authority",
+  "peer_message_refusal_notices_no_replace",
+  "peer_message_refusal_notices_immutable",
+  "peer_message_refusal_notices_no_delete",
+  "peer_message_notice_deliveries_insert_authority",
+  "peer_message_notice_deliveries_no_replace",
+  "peer_message_notice_deliveries_immutable",
+  "peer_message_notice_deliveries_no_delete",
+  "inbound_messages_buzz_source_key_immutable",
+  "outbox_holder_message_departs",
+  "outbox_message_id_immutable",
+  "holder_message_departures_no_replace",
+  "holder_message_departures_immutable",
+  "holder_message_departures_no_delete",
+  "outbox_departed_no_delete",
+  "outbox_holder_message_source_departs",
+  "inbound_messages_turn_terminal_departs",
+  "inbound_messages_turn_terminal_departs_on_insert",
+  "holder_message_source_departures_no_replace",
+  "holder_message_source_departures_immutable",
+  "holder_message_source_departures_no_delete",
+];
+
+/** v40's record tables, and the index each has beyond its key, read from schema.sql by pattern. */
+const V40_RECORD_TABLES: ReadonlyArray<{ name: string; table: RegExp; index?: RegExp }> = [
+  {
+    name: "peer_message_carries",
+    table: /CREATE TABLE IF NOT EXISTS peer_message_carries \([\s\S]*?\n\) WITHOUT ROWID;/,
+    index: /CREATE INDEX IF NOT EXISTS peer_message_carries_by_successor[^;]*;/,
+  },
+  {
+    name: "peer_message_refusal_notices",
+    table: /CREATE TABLE IF NOT EXISTS peer_message_refusal_notices \([\s\S]*?\n\) WITHOUT ROWID;/,
+    index: /CREATE INDEX IF NOT EXISTS peer_message_refusal_notices_by_role[^;]*;/,
+  },
+  {
+    name: "peer_message_notice_deliveries",
+    table: /CREATE TABLE IF NOT EXISTS peer_message_notice_deliveries \([\s\S]*?\n\) WITHOUT ROWID;/,
+  },
+  {
+    name: "holder_message_departures",
+    table: /CREATE TABLE IF NOT EXISTS holder_message_departures \([\s\S]*?\n\) WITHOUT ROWID;/,
+  },
+  {
+    name: "holder_message_source_departures",
+    table: /CREATE TABLE IF NOT EXISTS holder_message_source_departures \([\s\S]*?\n\) WITHOUT ROWID;/,
+  },
+];
+
+/**
+ * ACP-PEER-SUCCESSION-01. The canonical self-claim carries a queued CEO peer message to the same
+ * conversation's next generation once, and the peer hand-over accepts that successor only through
+ * the record of the carry. Before this the hand-over trusted an outbox mark and an audit row's
+ * `actor` text, both of which an ordinary statement writes. This creates the record — an append-only
+ * table whose insert needs the self-claim's connection-local carry marker — and its guards.
+ *
+ * Beside it, the notices the CEO is owed for every queued peer message a fence rejects
+ * (ACP-RESTART-04): an append-only table whose insert needs the outbox's connection-local notice
+ * marker. And one guard on an existing table, `inbound_messages`: a Buzz event's admitted row keeps
+ * its key (ACP-RESTART-02), since the carry record names that row by its key.
+ *
+ * And the departure record (review finding 01): whether a holder-claimed message was ever claimed is
+ * not readable from its outbox row, whose status, attempts, sent_at, claim_token and kind any
+ * statement can put back. So an append-only table records every outbox row's first departure from
+ * PENDING, whatever its kind, written by a trigger on `outbox` that fires for every writer; the
+ * carry, the successor retarget, the runtime move and the hand-over refuse a message that has one,
+ * and no generic path reads it. A row that had already left PENDING before v40 gets a BACKFILL
+ * departure here, in the same step, so the first v40 restart cannot carry one a raw writer had
+ * already put back. A departure names its message by id, so v40 also fixes an outbox row's id once
+ * written: renamed, a departed row would read as one with no departure.
+ *
+ * Round-2 review of finding 01: three more ways around a record keyed by the message id. The record
+ * tables are WITHOUT ROWID, so a REPLACE through a hidden rowid cannot delete one. A row that ever
+ * left PENDING cannot be deleted, and the event it pointed at is recorded as spent in a second
+ * append-only table keyed by the event, so a pointer queued again under a new id is refused. The
+ * same table records the first terminal fact of the event's turn, which the restart's carry reads
+ * instead of a claim JSON an ordinary statement can edit.
+ *
+ * Finding 04 (acp-daemon-notice/v1): the daemon delivers each OWED notice to the CEO itself, through
+ * the CEO's existing canonical conversation, and records the delivery append-only — in doubt before
+ * the POST, then settled on a matching receipt or failed — in a fifth table with its own guards.
+ *
+ * Additive: five new tables, an index on two of them, twenty-five triggers, and the backfill rows in the
+ * new departure table; no existing row or object is changed, so every v39 row is kept as it is. A
+ * queued peer message written before this has no record and is carried by nothing until a v40
+ * restart decides it.
+ *
+ * v12 and v13 replay a fixed snapshot that does not contain the tables, but a chain test can build
+ * a v39 image out of a current database, which does. So a table already present is accepted only
+ * when it is exactly schema.sql's and empty — a populated one holds records nothing here vouched
+ * for, and stamping it v40 would make them evidence. The triggers are dropped and recreated, as v39
+ * does for its own, so the chain always ends with schema.sql's bodies.
+ *
+ * A live database at v39 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v40: SchemaMigration = {
+  id: "v40-peer-message-carry-record",
+  fromVersion: 39,
+  toVersion: 40,
+  apply: (raw) => {
+    for (const record of V40_RECORD_TABLES) {
+      const tableDdl = schemaObject(record.table, `the ${record.name} table`, SCHEMA_VERSION);
+      const indexDdl = record.index === undefined
+        ? null
+        : schemaObject(record.index, `the ${record.name} index`, SCHEMA_VERSION);
+      const existing = (raw.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+      ).get(record.name) as { sql: string } | undefined)?.sql;
+      if (existing !== undefined) {
+        const normalise = (sql: string): string => sql
+          .replace(/^CREATE TABLE IF NOT EXISTS /i, "CREATE TABLE ")
+          .replace(/--[^\n]*/g, "").replace(/"/g, "").replace(/;\s*$/, "").replace(/\s+/g, " ").trim();
+        if (normalise(existing) !== normalise(tableDdl)
+            || raw.prepare(`SELECT 1 FROM ${record.name} LIMIT 1`).get()) {
+          throw new Error(`v40 pre-existing ${record.name} table does not match the current schema or is populated`);
+        }
+      } else {
+        raw.exec(tableDdl);
+      }
+      if (indexDdl !== null) raw.exec(indexDdl);
+    }
+    raw.exec(dropsFor(V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES));
+    raw.exec(triggerDdlFor(V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES, SCHEMA_VERSION));
+    // Review finding 01: every row that has already left PENDING, of any kind, departed before the
+    // trigger above existed. The table is empty here (checked above), so no guard refuses a row.
+    raw.exec(`INSERT INTO holder_message_departures (message_id, from_status, to_status, departed_at, basis)
+      SELECT message_id, NULL, status, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'BACKFILL' FROM outbox
+       WHERE status <> 'PENDING'`);
+    // And every event such a row pointed at, once, and every Buzz event whose turn already holds a
+    // terminal fact. The pointer and the facts are read as the triggers above read them.
+    raw.exec(`INSERT INTO holder_message_source_departures
+        (source_channel, source_nonce, reason, message_id, recorded_at, basis)
+      SELECT 'buzz', nonce, 'MESSAGE_DEPARTED', MIN(message_id), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'BACKFILL'
+        FROM (SELECT message_id,
+                     CASE WHEN json_valid(payload_json) = 1
+                           AND json_extract(payload_json, '$.sourceChannel') = 'buzz'
+                           AND json_type(payload_json, '$.sourceNonce') = 'text'
+                          THEN json_extract(payload_json, '$.sourceNonce') END AS nonce
+                FROM outbox WHERE status <> 'PENDING')
+       WHERE nonce IS NOT NULL
+       GROUP BY nonce`);
+    raw.exec(`INSERT INTO holder_message_source_departures
+        (source_channel, source_nonce, reason, message_id, recorded_at, basis)
+      SELECT channel, nonce, 'TURN_TERMINAL', NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'BACKFILL'
+        FROM inbound_messages
+       WHERE channel = 'buzz' AND turn_claim_json IS NOT NULL
+         AND (CASE WHEN json_valid(turn_claim_json) = 1
+                   THEN json_type(turn_claim_json, '$.repliedAt') IS NOT NULL
+                     OR json_type(turn_claim_json, '$.noReplyAt') IS NOT NULL
+                     OR json_type(turn_claim_json, '$.settledAt') IS NOT NULL
+                   ELSE 0 END) = 1`);
+  },
+  checksum: () => migrationChecksum("v40-peer-message-carry-record", SCHEMA_VERSION),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2695,6 +2866,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v37,
   v38,
   v39,
+  v40,
 ]);
 
 interface RequiredTrigger {
@@ -2813,6 +2985,33 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "inbound_messages_delete_authority", sentinel: "INGRESS_MESSAGE_DELETE_AUTHORITY_DENIED", introducedIn: 38 },
   { name: "inbound_claim_authority_markers_insert_guard", sentinel: "INGRESS_OVERRIDE_CLAIM_AUTHORITY_DENIED", introducedIn: 38 },
   { name: "inbound_messages_owner_reply_key_immutable", sentinel: "INBOUND_OWNER_REPLY_KEY_IMMUTABLE", introducedIn: 39 },
+  { name: "peer_message_carries_insert_authority", sentinel: "PEER_MESSAGE_CARRY_AUTHORITY_DENIED", introducedIn: 40 },
+  { name: "peer_message_carries_no_replace", sentinel: "PEER_MESSAGE_CARRY_NO_REPLACE", introducedIn: 40 },
+  { name: "peer_message_carries_immutable", sentinel: "PEER_MESSAGE_CARRY_IMMUTABLE", introducedIn: 40 },
+  { name: "peer_message_carries_no_delete", sentinel: "PEER_MESSAGE_CARRY_IMMUTABLE", introducedIn: 40 },
+  { name: "peer_message_refusal_notices_insert_authority", sentinel: "PEER_MESSAGE_NOTICE_AUTHORITY_DENIED", introducedIn: 40 },
+  { name: "peer_message_refusal_notices_no_replace", sentinel: "PEER_MESSAGE_NOTICE_NO_REPLACE", introducedIn: 40 },
+  { name: "peer_message_refusal_notices_immutable", sentinel: "PEER_MESSAGE_NOTICE_IMMUTABLE", introducedIn: 40 },
+  { name: "peer_message_refusal_notices_no_delete", sentinel: "PEER_MESSAGE_NOTICE_IMMUTABLE", introducedIn: 40 },
+  { name: "peer_message_notice_deliveries_insert_authority", sentinel: "PEER_MESSAGE_NOTICE_DELIVERY_AUTHORITY_DENIED", introducedIn: 40 },
+  { name: "peer_message_notice_deliveries_no_replace", sentinel: "PEER_MESSAGE_NOTICE_DELIVERY_NO_REPLACE", introducedIn: 40 },
+  { name: "peer_message_notice_deliveries_immutable", sentinel: "PEER_MESSAGE_NOTICE_DELIVERY_IMMUTABLE", introducedIn: 40 },
+  { name: "peer_message_notice_deliveries_no_delete", sentinel: "PEER_MESSAGE_NOTICE_DELIVERY_IMMUTABLE", introducedIn: 40 },
+  { name: "inbound_messages_buzz_source_key_immutable", sentinel: "INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE", introducedIn: 40 },
+  // Raises nothing: its load-bearing part is the write, so the write is its sentinel.
+  { name: "outbox_holder_message_departs", sentinel: "INSERT INTO holder_message_departures", introducedIn: 40 },
+  { name: "outbox_message_id_immutable", sentinel: "OUTBOX_MESSAGE_ID_IMMUTABLE", introducedIn: 40 },
+  { name: "holder_message_departures_no_replace", sentinel: "HOLDER_MESSAGE_DEPARTURE_NO_REPLACE", introducedIn: 40 },
+  { name: "holder_message_departures_immutable", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
+  { name: "holder_message_departures_no_delete", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
+  { name: "outbox_departed_no_delete", sentinel: "OUTBOX_DEPARTED_ROW_NO_DELETE", introducedIn: 40 },
+  // Raise nothing: as `outbox_holder_message_departs`, their load-bearing part is the write.
+  { name: "outbox_holder_message_source_departs", sentinel: "INSERT INTO holder_message_source_departures", introducedIn: 40 },
+  { name: "inbound_messages_turn_terminal_departs", sentinel: "INSERT INTO holder_message_source_departures", introducedIn: 40 },
+  { name: "inbound_messages_turn_terminal_departs_on_insert", sentinel: "INSERT INTO holder_message_source_departures", introducedIn: 40 },
+  { name: "holder_message_source_departures_no_replace", sentinel: "HOLDER_MESSAGE_SOURCE_DEPARTURE_NO_REPLACE", introducedIn: 40 },
+  { name: "holder_message_source_departures_immutable", sentinel: "HOLDER_MESSAGE_SOURCE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
+  { name: "holder_message_source_departures_no_delete", sentinel: "HOLDER_MESSAGE_SOURCE_DEPARTURE_IMMUTABLE", introducedIn: 40 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 

@@ -1842,7 +1842,19 @@ export class IngressGuard {
    * measured instance of a redundant check reporting coverage it did not independently have. One
    * enforcement site, the one that actually participates in the write, is what stays.
    */
-  completeNoReplyAndResolveTurn(channel: string, nonce: string): Decision<void> {
+  completeNoReplyAndResolveTurn(
+    channel: string,
+    nonce: string,
+    /**
+     * For a queue fence only (ACP-RESTART-03): the outbox took the holder-claimed row this turn
+     * was waiting on out of the queue with no successor. A fence does not decide the turn, it only
+     * stops waiting on it, so a member whose turn a receipt already settled (`settledAt`, e.g.
+     * `REPLY_OUTBOX`) keeps that settlement untouched — the no-reply fact would contradict an
+     * outcome already recorded — as `repliedAt` and `noReplyAt` already do. A holder's own
+     * completion or rejection passes nothing, and still refuses a settled turn.
+     */
+    options: { keepSettled?: boolean } = {},
+  ): Decision<void> {
     // `txDecision`, not plain `tx` (#664 tx-denial discipline, caught by
     // `scripts/verify-tx-denial-sites.mjs`'s own census): the `updated.changes !== 1` guard below
     // writes `result_json` and can then deny in the same body, and a plain `tx()` treats that
@@ -1853,11 +1865,23 @@ export class IngressGuard {
     // reasoning #664 exists to stop trusting by hand.
     return this.db.txDecision(() => {
       for (const memberNonce of this.#batchNonces(channel, nonce)) {
+        if (options.keepSettled === true && this.#settledHere(channel, memberNonce)) continue;
         const completed = this.#completeNoReplyHere(channel, memberNonce);
         if (!completed.allowed) return completed;
       }
       return allow(ReasonCode.OK, undefined);
     });
+  }
+
+  /** Whether this row's turn claim already carries a receipt's settlement. Only reads. */
+  #settledHere(channel: string, nonce: string): boolean {
+    const current = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    if (!current?.turn_claim_json) return false;
+    const claim = JSON.parse(current.turn_claim_json) as { settledAt?: unknown };
+    return claim.settledAt !== undefined;
   }
 
   #batchNonces(channel: string, nonce: string): readonly string[] {

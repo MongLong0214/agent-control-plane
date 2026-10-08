@@ -40,7 +40,17 @@ import {
   type AdoptedCeoToolAdmission,
 } from "../bootstrap/adopted-ceo-tool-admission.ts";
 import { createHermesGatewayIdentityReader } from "../runtime/hermes-gateway-identity.ts";
-import { createHermesGatewayConversationSender } from "../runtime/hermes-gateway-conversation.ts";
+import {
+  createHermesGatewayConversationSender,
+  createHermesGatewayDaemonNoticeSender,
+} from "../runtime/hermes-gateway-conversation.ts";
+import {
+  type DaemonNoticeDeliveryReport,
+  type DaemonNoticeProbeReport,
+  type DaemonNoticeTargetResolver,
+  deliverOwedPeerMessageNotices,
+  sendDaemonNoticeProbe,
+} from "../runtime/acp-daemon-notice.ts";
 import {
   assertCanonicalSessionsValid,
   canonicalBuzzChannelFor,
@@ -86,7 +96,9 @@ import {
   buzzMessageSigningRequest,
   deliverBuzzMessage,
   ownerMessagePointerOf,
+  peerMessageRefusalNoticeOf,
   peerProofIsCurrent,
+  selfClaimCarriedTo,
   type BuzzMentionRouter,
   type BuzzMessageIngressInput,
   type BuzzMessageTurnPort,
@@ -652,7 +664,7 @@ export const startLocalMcpListeners = async (
           respond(await ctoConversation.registerEndpoint(server, args.endpoint)),
       );
       /*
-       * The three owner-message tools, registered in this same composition — not on a second
+       * The owner-message tools, registered in this same composition — not on a second
        * server, and not against a durable endpoint registry.
        *
        * `roleKey` is the only thing a caller may say, and it is a **lookup key**: it selects
@@ -692,6 +704,18 @@ export const startLocalMcpListeners = async (
         },
         async (args: { roleKey: string; messageId: string }) =>
           respond(ctoConversation.rejectOwnerMessage(server, args.roleKey, args.messageId)),
+      );
+      server.registerTool(
+        "role_owner_message_report_refusal",
+        {
+          description:
+            "Take on telling the CEO about one rejected peer message the claim listed under " +
+            "`refusedAtRestart`. Call it before telling the CEO: when it is refused, the daemon is " +
+            "telling the CEO itself and this connection must not. Later holders are no longer shown it.",
+          inputSchema: { roleKey: z.string().min(1), messageId: z.string().min(1) },
+        },
+        async (args: { roleKey: string; messageId: string }) =>
+          respond(ctoConversation.reportPeerMessageRefusal(server, args.roleKey, args.messageId)),
       );
     }
     return server;
@@ -1799,23 +1823,35 @@ export const withConfiguredHermesGatewayReceipt = (
   return { ...config, hermesGatewayReceipt: { apiKey } };
 };
 
-/** A configured route must never revert to the independently attached MCP peer. */
-export const createConfiguredHermesGatewayConversation = (
+/** The ports the pinned CEO Gateway target reads through; every one is a test seam. */
+interface HermesCeoPinPorts {
+  identityReader?: typeof createHermesGatewayIdentityReader;
+  processStartToken?: typeof readProcessStartToken;
+  processStartedAt?: typeof processStartedAt;
+  authorityHeld?: () => boolean;
+}
+
+/** One pinned CEO Gateway target: the four fields a POST must name, and the fence at its dispatch. */
+interface HermesCeoPin {
+  apiKey: string;
+  expected: GatewayIncumbentProof;
+  preDispatch: () => boolean;
+}
+
+/**
+ * The CEO Gateway target every daemon-to-CEO POST is pinned to: the conversation turn below and the
+ * daemon notice (acp-daemon-notice/v1) alike, so the two cannot disagree about where the CEO is.
+ * Undefined when no Hermes adoption variable is configured; a pin that resolves to null refuses the
+ * POST before it is made.
+ */
+const configuredHermesCeoPin = (
   cp: ControlPlane,
   configuration: Readonly<Record<string, string | undefined>>,
-  ports: {
-    senderFactory?: typeof createHermesGatewayConversationSender;
-    identityReader?: typeof createHermesGatewayIdentityReader;
-    processStartToken?: typeof readProcessStartToken;
-    processStartedAt?: typeof processStartedAt;
-    authorityHeld?: () => boolean;
-  } = {},
-): ((text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>) | undefined => {
+  ports: HermesCeoPinPorts,
+): (() => Promise<HermesCeoPin | null>) | undefined => {
   if (!HERMES_ADOPTION_VARS.some((key) => configuration[key] !== undefined)) return undefined;
   const values = configuredHermesAdoptionValues(configuration);
   const readGateway = values ? lockedGatewayOrigin(values, ports) : null;
-  const refuse = (): CeoTurnOutcome => ({ contact: "NEVER_REACHED",
-    answered: deny(ReasonCode.CEO_CONVERSATION_STALE, "adopted Gateway CEO target unavailable") });
   const currentAuthority = () => {
     if (!values || (ports.authorityHeld && !ports.authorityHeld())) return null;
     const binding = cp.bindings.active("CEO");
@@ -1887,20 +1923,149 @@ export const createConfiguredHermesGatewayConversation = (
     });
     return advanced.allowed ? head.head : null;
   };
-  return async (text, source) => {
+  return async () => {
     const before = currentAuthority();
-    if (!values || !before) return refuse();
+    if (!values || !before) return null;
     const head = await trackedHead(before);
     const pinned = head === null ? null : currentAuthority();
-    if (head === null || pinned === null || pinned.target.head !== head) return refuse();
-    return (ports.senderFactory ?? createHermesGatewayConversationSender)({
-      apiKey: values["ACP_HERMES_GATEWAY_API_KEY"]!, binding: "acp-canonical-ceo",
+    if (head === null || pinned === null || pinned.target.head !== head) return null;
+    return {
+      apiKey: values["ACP_HERMES_GATEWAY_API_KEY"]!,
       expected: { session_id: head,
         lineage_root_digest: values.ACP_HERMES_LINEAGE_ROOT_DIGEST!,
         process_pid: pinned.processPid, process_started_at: pinned.startToken },
       preDispatch: () => sameAuthority(currentAuthority(), pinned),
+    };
+  };
+};
+
+/** A configured route must never revert to the independently attached MCP peer. */
+export const createConfiguredHermesGatewayConversation = (
+  cp: ControlPlane,
+  configuration: Readonly<Record<string, string | undefined>>,
+  ports: HermesCeoPinPorts & { senderFactory?: typeof createHermesGatewayConversationSender } = {},
+): ((text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>) | undefined => {
+  const pin = configuredHermesCeoPin(cp, configuration, ports);
+  if (pin === undefined) return undefined;
+  const refuse = (): CeoTurnOutcome => ({ contact: "NEVER_REACHED",
+    answered: deny(ReasonCode.CEO_CONVERSATION_STALE, "adopted Gateway CEO target unavailable") });
+  return async (text, source) => {
+    const pinned = await pin();
+    if (pinned === null) return refuse();
+    return (ports.senderFactory ?? createHermesGatewayConversationSender)({
+      apiKey: pinned.apiKey, binding: "acp-canonical-ceo", expected: pinned.expected, preDispatch: pinned.preDispatch,
     })(text, source);
   };
+};
+
+/**
+ * acp-daemon-notice/v1 (#1068 finding 04): where the daemon delivers a refusal notice to the CEO — the
+ * same pinned CEO Gateway target as the conversation turn above, with a sender bound to it. Undefined
+ * when no Hermes adoption variable is configured.
+ */
+export const createConfiguredHermesGatewayDaemonNoticeTarget = (
+  cp: ControlPlane,
+  configuration: Readonly<Record<string, string | undefined>>,
+  ports: HermesCeoPinPorts & { noticeSenderFactory?: typeof createHermesGatewayDaemonNoticeSender } = {},
+): DaemonNoticeTargetResolver | undefined => {
+  const pin = configuredHermesCeoPin(cp, configuration, ports);
+  if (pin === undefined) return undefined;
+  return async () => {
+    const pinned = await pin();
+    if (pinned === null) return null;
+    return {
+      destination: { ...pinned.expected },
+      send: (ports.noticeSenderFactory ?? createHermesGatewayDaemonNoticeSender)({
+        apiKey: pinned.apiKey, preDispatch: pinned.preDispatch,
+      }),
+    };
+  };
+};
+
+/** The daemon's notice delivery loop, as the composition holds it. */
+export interface DaemonPeerMessageNoticeDelivery {
+  /** One pass, single-flight: a pass already running is joined, never doubled. */
+  tick(): Promise<DaemonNoticeDeliveryReport | null>;
+  close(): void;
+}
+
+/** Between passes. A delivery waits at most this long after the notice it owes is written. */
+export const PEER_MESSAGE_NOTICE_DELIVERY_INTERVAL_MS = 30_000;
+
+/**
+ * Starts the daemon's own delivery of OWED refusal notices to the CEO (acp-daemon-notice/v1), with no
+ * successor CTO involved: a pass now, then one every interval, never two at once. The lane secret is
+ * held by this closure only for the derivation each pass makes; nothing here logs or stores it.
+ */
+export const startDaemonPeerMessageNoticeDelivery = (
+  cp: ControlPlane,
+  resolveTarget: DaemonNoticeTargetResolver,
+  laneSecret: string,
+  options: { intervalMs?: number; onError?: (error: unknown) => void; startImmediately?: boolean } = {},
+): DaemonPeerMessageNoticeDelivery => {
+  let running: Promise<DaemonNoticeDeliveryReport | null> | null = null;
+  let closed = false;
+  const tick = (): Promise<DaemonNoticeDeliveryReport | null> => {
+    if (closed) return Promise.resolve(null);
+    if (running) return running;
+    running = deliverOwedPeerMessageNotices(cp.outbox, resolveTarget, laneSecret)
+      .catch((error: unknown) => {
+        (options.onError ?? ((failure: unknown) => {
+          process.stderr.write(`peer-message notice delivery: ${failure instanceof Error ? failure.message : String(failure)}\n`);
+        }))(error);
+        return null;
+      })
+      .finally(() => { running = null; });
+    return running;
+  };
+  const timer = setInterval(() => void tick(), options.intervalMs ?? PEER_MESSAGE_NOTICE_DELIVERY_INTERVAL_MS);
+  timer.unref?.();
+  if (options.startImmediately !== false) void tick();
+  return { tick, close: () => { closed = true; clearInterval(timer); } };
+};
+
+/** What the composition started for refusal notices, and why not when it did not. */
+export interface ConfiguredPeerMessageNoticeDelivery {
+  delivery: DaemonPeerMessageNoticeDelivery | null;
+  /** Why no delivery runs; null when it does. */
+  notStarted: string | null;
+  /** The live-acceptance probe, when `ACP_DAEMON_NOTICE_PROBE` asked for one; the first pass waits for it. */
+  probe: Promise<DaemonNoticeProbeReport> | null;
+}
+
+/**
+ * The daemon's refusal-notice delivery as the launch environment configures it (amendment 1).
+ *
+ * Off unless `ACP_DAEMON_NOTICE_ENABLED` is exactly `1`, so ACP can deploy before Hermes enables the
+ * daemon principal and fail no notice meanwhile. It also needs the pinned CEO Gateway target and the
+ * U4 lane secret. With `ACP_DAEMON_NOTICE_PROBE=<nonce>` the synthetic probe is sent first, once per
+ * nonce, and the first delivery pass follows it.
+ */
+export const startConfiguredPeerMessageNoticeDelivery = (
+  cp: ControlPlane,
+  options: {
+    environment: Readonly<Record<string, string | undefined>>;
+    hermesConfiguration: Readonly<Record<string, string | undefined>>;
+    laneSecret: string | null;
+    ports?: Parameters<typeof createConfiguredHermesGatewayDaemonNoticeTarget>[2];
+    intervalMs?: number;
+  },
+): ConfiguredPeerMessageNoticeDelivery => {
+  const off = (notStarted: string): ConfiguredPeerMessageNoticeDelivery => ({ delivery: null, notStarted, probe: null });
+  if (options.environment["ACP_DAEMON_NOTICE_ENABLED"] !== "1") return off("ACP_DAEMON_NOTICE_ENABLED is not 1");
+  const target = createConfiguredHermesGatewayDaemonNoticeTarget(cp, options.hermesConfiguration, options.ports);
+  if (target === undefined) return off("no Hermes Gateway CEO target is configured");
+  if (!options.laneSecret) return off("the U4 lane secret is not configured");
+  const nonce = options.environment["ACP_DAEMON_NOTICE_PROBE"];
+  const probe = nonce === undefined || nonce === ""
+    ? null
+    : sendDaemonNoticeProbe(cp.outbox, target, options.laneSecret, nonce);
+  const delivery = startDaemonPeerMessageNoticeDelivery(cp, target, options.laneSecret, {
+    ...(options.intervalMs === undefined ? {} : { intervalMs: options.intervalMs }),
+    startImmediately: probe === null,
+  });
+  if (probe !== null) void probe.then(() => delivery.tick(), () => delivery.tick());
+  return { delivery, notStarted: null, probe };
 };
 
 /**
@@ -3590,18 +3755,37 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         const ctoChannel = cp.sessions.get(holder.targetSessionId)?.buzzAddress ?? null;
         const taken = cp.outbox.claimForHolder(
           holder,
-          (candidate) =>
-            candidate.kind !== MessageKind.PEER_MESSAGE ||
-            peerProofIsCurrent(admittedPeerSource(cp, candidate.payload), ceo, holder, ctoChannel),
+          (candidate) => {
+            if (candidate.kind !== MessageKind.PEER_MESSAGE) return true;
+            const source = admittedPeerSource(cp, candidate.payload);
+            return peerProofIsCurrent(
+              source,
+              ceo,
+              holder,
+              ctoChannel,
+              // The one holder besides the proof's own: its conversation restarted once, the row
+              // carried to it by the canonical self-claim's recovery (2026-10-03) — accepted only
+              // through that carry's record (ACP-PEER-SUCCESSION-01).
+              selfClaimCarriedTo(cp.db, candidate, holder, source),
+            );
+          },
         );
         const unresolved = taken.unresolved;
         const withheld = taken.withheld;
+        // ACP-PEER-SUCCESSION-01, ACP-RESTART-04: the CEO peer messages ACP rejected while they
+        // were queued for this role — on a revoke, a takeover, a runtime move or a restart that
+        // refused to carry them — that no holder has reported yet, by id, event, signer and reason
+        // and never their text, so the CTO can tell the CEO in the thread and then report it.
+        // Shown to the role's exact current holder only, whether or not it is the carry successor.
+        // Present only when there is one, so a handover without any keeps its shape.
+        const refusals = cp.outbox.peerMessageRefusalNoticesFor(holder).map(peerMessageRefusalNoticeOf);
+        const notices = refusals.length > 0 ? { refusedAtRestart: refusals } : {};
         const message = taken.claimed[0];
         // Nothing new was handed over: either the queue is empty, or an unresolved hand-over is
         // blocking it. Both are reported with metadata only — `UnresolvedOwnerMessage` has no
         // payload field, so "never the payload twice" holds by the shape of what is returned.
         if (!message) {
-          return allow(ReasonCode.OK, { claimed: null, unresolved, withheld, hasMore: taken.hasMore });
+          return allow(ReasonCode.OK, { claimed: null, unresolved, withheld, hasMore: taken.hasMore, ...notices });
         }
         const refuseClaimed = (reasonCode: ReasonCode, why: string): Decision<OwnerMessageHandover> => {
           const burned = cp.outbox.rejectForHolder(message.messageId, holder);
@@ -3670,6 +3854,7 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
           unresolved,
           withheld,
           hasMore: taken.hasMore,
+          ...notices,
         });
       });
       } catch (err) {
@@ -3705,6 +3890,13 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         if (refusal) return refusal;
         return cp.outbox.rejectForHolder(messageId, holder);
       }),
+
+    /**
+     * ACP-RESTART-04 — the role's current holder says it told the CEO about one rejected peer
+     * message listed under `refusedAtRestart`, which retires that notice for every later holder.
+     */
+    reportRefusal: (messageId: string, holder: HolderIdentity): Decision<void> =>
+      cp.outbox.reportPeerMessageRefusal(messageId, holder),
   };
 };
 
@@ -3731,8 +3923,13 @@ const admittedPeerSource = (cp: ControlPlane, outboxPayload: unknown): AdmittedP
     return undefined;
   }
   if (digestOf(payload) !== pointer.sourcePayloadDigest) return undefined;
-  const admitted = payload as { peer?: unknown; conversation?: unknown };
-  return { proof: admitted.peer, author: source.actor, conversation: admitted.conversation };
+  const admitted = payload as { peer?: unknown; conversation?: unknown; mention?: unknown };
+  return {
+    proof: admitted.peer,
+    author: source.actor,
+    conversation: admitted.conversation,
+    mention: admitted.mention,
+  };
 };
 
 /**
@@ -4126,6 +4323,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     };
   });
   let ownerReplies: DaemonOwnerReplyConsumer | null = null;
+  let peerMessageNotices: DaemonPeerMessageNoticeDelivery | null = null;
   let operator: LocalOperatorListener | null = null;
   let canonicalSelfClaim: CanonicalSelfClaimListener | null = null;
   let adoptedCeoTools: CanonicalSelfClaimListener | null = null;
@@ -4147,6 +4345,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     if (hermesAutoAdoptionTimer) clearInterval(hermesAutoAdoptionTimer);
     await telegram?.close();
     ownerReplies?.close();
+    peerMessageNotices?.close();
     await telegramExternal?.close();
     buzzMentionSubscriber?.close();
     await buzzMessageIngress?.close();
@@ -4423,6 +4622,26 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // every deployment, subscriber or not: an item it cannot deliver is still recorded as such.
     ownerReplies = startDaemonOwnerReplyConsumer(cp, buzzMentionSubscriber);
     process.stdout.write("owner-reply consumer started\n");
+    // #1068 finding 04 (acp-daemon-notice/v1): the CEO is told of each refused peer message by the
+    // daemon itself, through its existing canonical conversation, whether or not a CTO holds the role.
+    // The HMAC key is derived from the U4 lane secret; without the lane or the Gateway pin, the
+    // notices stay owed to the role's next holder as before.
+    const notices = startConfiguredPeerMessageNoticeDelivery(cp, {
+      environment: process.env,
+      hermesConfiguration: hermesAdoptionConfiguration,
+      laneSecret: telegramExternalConfig?.sharedSecret ?? null,
+      ports: { authorityHeld: () => daemon.lock.held() },
+    });
+    peerMessageNotices = notices.delivery;
+    process.stdout.write(notices.delivery !== null
+      ? "peer-message notice delivery started\n"
+      : `peer-message notice delivery not started: ${notices.notStarted}\n`);
+    void notices.probe?.then((probe) => {
+      // Ids and outcomes only: the probe's report carries no secret and no message content.
+      process.stdout.write(`daemon notice probe: ${JSON.stringify(probe)}\n`);
+    }, (error: unknown) => {
+      process.stderr.write(`daemon notice probe failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
     if (telegramExternalConfig) {
       // U4: Hermes polls Telegram; ACP only admits, claims and dispatches what Hermes hands it.
       telegramExternal = await startTelegramExternalIngress(cp, stateDir, telegramExternalConfig);
@@ -4470,6 +4689,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // subscriber joins them for the same reason: it holds outbound sockets, and a startup that
     // failed after it opened them would leave a daemon that exited still subscribed.
     ownerReplies?.close();
+    peerMessageNotices?.close();
     buzzMentionSubscriber?.close();
     await buzzMessageIngress?.close();
     await buzzActorIngress?.close();

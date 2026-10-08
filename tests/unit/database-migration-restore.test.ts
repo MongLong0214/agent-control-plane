@@ -454,6 +454,8 @@ const asV34Fixture = (path: string, options: { unresolvedTurn?: boolean } = {}):
       DROP TRIGGER IF EXISTS inbound_messages_delete_authority;
       DROP TRIGGER IF EXISTS inbound_claim_authority_markers_insert_guard;
       DROP TABLE IF EXISTS inbound_claim_authority_markers;
+      -- v40's carry guard reads the admitted payload (ACP-RESTART-02); a v34 image has no v40 guard.
+      DROP TRIGGER IF EXISTS peer_message_carries_insert_authority;
     `);
     const present = raw
       .prepare("SELECT 1 AS present FROM pragma_table_info('inbound_messages') WHERE name = 'payload_json'")
@@ -1236,7 +1238,8 @@ describe("versioned SQLite migration", () => {
         [36, "v36-backfill-ingress-receipt-identities-before-freezing-claims"],
         [37, "v37-seed-claude-cli-executor-kind"],
         [38, "v38-canonical-verified-target-override"],
-        [SCHEMA_VERSION, "v39-owner-reply-intent-keeps-its-key"],
+        [39, "v39-owner-reply-intent-keeps-its-key"],
+        [SCHEMA_VERSION, "v40-peer-message-carry-record"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a
