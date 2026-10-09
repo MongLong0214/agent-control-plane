@@ -24,6 +24,11 @@ export interface ManagedInvocationWrite {
   targetWorktreeId?: string | null;
   runId: string;
   sessionId: string;
+  /**
+   * The incarnation of `sessionId` this invocation runs as (#512). The guard matches the WORKER
+   * binding to the actor's live session and incarnation, so it is part of every writable request.
+   */
+  sessionIncarnation: string;
   bindingGeneration: number;
   actor?: string | null;
 }
@@ -58,11 +63,12 @@ export class GuardedInvocationWriteBroker implements ManagedInvocationWriteBroke
       ["taskId", write.taskId],
       ["taskReceiptId", write.taskReceiptId],
       ["assignedWorktreeId", write.assignedWorktreeId],
+      ["sessionIncarnation", write.sessionIncarnation],
     ].filter(([, value]) => typeof value !== "string" || value.trim().length === 0).map(([name]) => name);
     if (missing.length > 0) {
       return Promise.resolve(deny(
         ReasonCode.WRITE_REQUIRES_MANAGED_RUN,
-        "writable runtime invocation must name its task receipt and assigned worktree",
+        "writable runtime invocation must name its task receipt, assigned worktree and session incarnation",
         { missing },
       ));
     }
@@ -79,6 +85,7 @@ export class GuardedInvocationWriteBroker implements ManagedInvocationWriteBroke
         taskReceiptId: write.taskReceiptId,
         runId: write.runId,
         sessionId: write.sessionId,
+        sessionIncarnation: write.sessionIncarnation,
         bindingGeneration: write.bindingGeneration,
         actor: "runtime-cli",
       },
@@ -218,6 +225,18 @@ export interface InvocationRequest {
    */
   conversation?: ConversationStep;
   /**
+   * #512 — called once, synchronously, as soon as the provider process exists: its pid and the OS
+   * start time read from that process (null when the platform cannot report one). A runtime that
+   * owns the invocation records both, so a restart can find this exact process and never mistake a
+   * later process that reuses the pid for it. Never called for an invocation that spawned nothing.
+   */
+  onSpawn?: (pid: number, startedAt: string | null) => void;
+  /**
+   * #512 — aborting kills the provider's whole process tree. An invocation aborted before it
+   * spawns spawns nothing. The result still arrives, and reports the process as it ended.
+   */
+  signal?: AbortSignal;
+  /**
    * The non-negotiable boundary for a blind-review invocation. It deliberately does
    * not share the more permissive CTO/worker runtime environment: a reviewer may
    * inspect only its immutable packet and has no authority-bearing host tools.
@@ -249,6 +268,11 @@ export interface InvocationResult {
   error: string | null;
   /** Session identity the provider reports for this invocation, when it reports one. */
   providerSessionId: string | null;
+  /**
+   * The provider process's exact standard output, when the adapter ran one. A runtime that has to
+   * account for what a worker produced hashes these bytes rather than the parsed `text`.
+   */
+  stdout?: string;
   /**
    * True only when this adapter actually enforced `InvocationRequest.isolation` for
    * this invocation. A caller must not turn an unattested result into review evidence.
