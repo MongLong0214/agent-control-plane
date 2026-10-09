@@ -302,14 +302,18 @@ describe("#1070 ACP-WORKER-03-FC narrow review 4: no fence is removed by a read 
     lock.release();
   });
 
-  it("a fence an earlier build left at the legacy name is read, refuses while live, and is never removed", async () => {
+  it("a fence an earlier build left at the legacy name is read, refuses while live, and is adopted before it is cleared", async () => {
     const live = await liveGroup();
     const lock = new SingleInstanceLock(join(tempDir("acp-fence-legacy-"), "agentcpd.lock"));
     writeFileSync(lock.fencePath, JSON.stringify({ pid: 1, recordedAt: "2026-10-01T00:00:00.000Z", groups: [{ pgid: live.pgid, leaderStartedAt: live.token }] }));
     expect(lock.acquire(new Date().toISOString()).allowed).toBe(false);
+    expect(existsSync(lock.fencePath), "a live fence at the legacy name was removed").toBe(true);
+    // Narrow review 5: under the lock a legacy file no unique name links is adopted under one first,
+    // so it is cleared like any other fence once every group it names is confirmed gone — both names
+    // of that one file, each only while the path still names it.
     writeFileSync(lock.fencePath, JSON.stringify({ pid: 1, recordedAt: "2026-10-01T00:00:00.000Z", groups: [{ pgid: GONE, leaderStartedAt: null }] }));
     expect(lock.acquire(new Date().toISOString()).allowed).toBe(true);
-    expect(existsSync(lock.fencePath), "a file at a reusable name was removed on a confirmation about what it held").toBe(true);
+    expect(fenceFiles(lock)).toEqual([]);
     lock.release();
   });
 
