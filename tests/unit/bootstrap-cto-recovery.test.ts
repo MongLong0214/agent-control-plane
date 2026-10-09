@@ -6,11 +6,11 @@ import { Role, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { BOOTSTRAP_CTO_RECOVERY_BACKOFF_MS } from "../../src/run/bootstrap-cto-staffing.ts";
 import {
   type BootstrapRuntimeFixture,
-  type HeldCtoConnection,
   openHeldCtoConnection,
   withBootstrapRuntime,
 } from "../helpers/bootstrap-cto-fixture.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
@@ -44,7 +44,7 @@ const history = (f: BootstrapRuntimeFixture, roleKey: string) =>
 const outage = async (f: BootstrapRuntimeFixture) => {
   const dispatched = await f.dispatchBootstrap();
   // The RUN_DISPATCH wake starts a turn of the conversation; let it finish first.
-  await vi.waitFor(() => expect(f.claude.turns).toHaveLength(2));
+  await vi.waitFor(() => expect(f.finishedTurns(dispatched.ownerSessionId)).toBe(2));
   f.loseClaude();
   await f.daemon.reconcileContinuity("claude coverage lost");
   expect(f.harness.cp.bindings.active(dispatched.roleKey)).toBeNull();
@@ -55,7 +55,28 @@ const outage = async (f: BootstrapRuntimeFixture) => {
 describe("C1b: a revoked BOOTSTRAP_CTO is recovered on its own session, in the CEO's order", () => {
   it("outage → restore: probe, rotate (epoch+1, gen+1, same actor and session), deliver, attest, then ACTIVE and RUN_DISPATCH — every turn the same conversation in the same workdir", async () => {
     await withBootstrapRuntime(async (f) => {
+      // Each work turn reads what is addressed to it in band and acknowledges it, over the
+      // connection its relay authenticated with the credential the daemon delivered for that turn.
+      const handled: Array<{ generation: number; acked: unknown }> = [];
+      f.claude.onWorkTurn = async (_request, credential) => {
+        if (!credential) return;
+        const as = { sessionId: credential.sessionId, sessionSecret: credential.sessionSecret, token: credential.token ?? "" };
+        const pending = await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_pending", {});
+        const messages = ((pending["value"] as { messages?: Array<{ messageId: string; runId: string | null; kind: string }> } | undefined)
+          ?.messages ?? []).filter((message) => message.kind === "RUN_DISPATCH");
+        for (const message of messages) {
+          const row = f.harness.cp.outbox.get(message.messageId);
+          const acked = await callMcpToolOverSocket(f.ctoSocket, as, "run_ack", {
+            idempotencyKey: `ack-${message.messageId}`,
+            runId: message.runId,
+            messageId: message.messageId,
+          });
+          handled.push({ generation: row?.bindingGeneration ?? -1, acked: acked["ok"] });
+        }
+      };
       const { runId, ownerSessionId, roleKey } = await outage(f);
+      // The first generation's dispatch was read in band and settled by its own turn.
+      expect(handled).toEqual([{ generation: 1, acked: true }]);
       const before = f.harness.cp.sessions.require(ownerSessionId);
       const actor = actorOf(f, f.harness.cp.bindings.history(roleKey)[0]!.assignmentId);
       expect(before).toMatchObject({ lifecycle: SessionLifecycle.READY, credentialEpoch: 0 });
@@ -85,8 +106,12 @@ describe("C1b: a revoked BOOTSTRAP_CTO is recovered on its own session, in the C
       expect(runDispatches(f, runId)).toEqual(expect.arrayContaining([
         expect.objectContaining({ bindingGeneration: 2 }),
       ]));
-      // The recovered generation's RUN_DISPATCH starts a turn of the same conversation.
+      // The recovered generation's RUN_DISPATCH starts a turn of the same conversation, which reads
+      // it in band — it was never handed to Buzz — and settles it.
       await vi.waitFor(() => expect(f.claude.turns).toHaveLength(5));
+      await vi.waitFor(() => expect(handled).toEqual([{ generation: 1, acked: true }, { generation: 2, acked: true }]));
+      expect(f.harness.cp.outbox.listByRun(runId).filter((message) => message.kind === "RUN_DISPATCH")
+        .map((message) => [message.bindingGeneration, message.status]).sort()).toEqual([[1, "ACKED"], [2, "ACKED"]]);
       const turns = f.claude.turns.map((turn) => ({
         conversation: turn.conversation,
         relay: turn.relay !== null,
@@ -116,46 +141,36 @@ describe("C1b: a revoked BOOTSTRAP_CTO is recovered on its own session, in the C
 
   it("the previous credential is refused at the handshake, and a connection opened before the rotation is refused at its next request", async () => {
     await withBootstrapRuntime(async (f) => {
-      const { runId, ownerSessionId } = await outage(f);
+      const { runId, ownerSessionId, roleKey } = await outage(f);
       const previous = { ...f.claude.credentials.get(ownerSessionId)! };
-      // Held open across the outage, as a relay that outlived its turn would be.
       f.restoreClaude();
-      const opened = await openHeldCtoConnection(f.ctoSocket, previous);
-      // The binding is revoked, so the old credential's connection holds no role yet.
-      expect("refused" in opened).toBe(true);
-
-      // A connection opened while generation 2's runtime is attesting would hold the role, so open
-      // one with the *previous* secret just before the rotation commits.
-      let early: HeldCtoConnection | { refused: Record<string, unknown> } | null = null;
-      const rotate = f.harness.cp.sessions.rotateSecret.bind(f.harness.cp.sessions);
-      vi.spyOn(f.harness.cp.sessions, "rotateSecret").mockImplementationOnce((sessionId, expectedEpoch) => rotate(sessionId, expectedEpoch));
       await f.daemon.reconcileContinuity("claude coverage returned");
       expect(f.harness.cp.runs.require(runId).ownerBindingGeneration).toBe(2);
 
-      const current = f.claude.credentials.get(ownerSessionId)!;
+      const current = { ...f.claude.credentials.get(ownerSessionId)! };
       expect(current.sessionSecret).not.toBe(previous.sessionSecret);
-      // The new credential works.
+      // The new credential works, over a connection held open from here on.
       const live = await openHeldCtoConnection(f.ctoSocket, current);
-      expect("call" in live).toBe(true);
-      const answered = await (live as HeldCtoConnection).call("role_dispatch_pending", {});
-      expect(answered).toMatchObject({ ok: true });
+      if (!("call" in live)) throw new Error(`the new credential was refused: ${JSON.stringify(live.refused)}`);
+      expect(await live.call("role_dispatch_pending", {})).toMatchObject({ ok: true });
       // The previous one is refused at the handshake.
-      early = await openHeldCtoConnection(f.ctoSocket, previous);
-      expect(early).toMatchObject({ refused: { ok: false, reasonCode: ReasonCode.SESSION_SECRET_INVALID } });
+      expect(await openHeldCtoConnection(f.ctoSocket, previous)).toMatchObject({
+        refused: { ok: false, reasonCode: ReasonCode.SESSION_SECRET_INVALID },
+      });
 
-      // A connection that authenticated with the new credential at epoch 1 keeps working until the
-      // next rotation; then its very next request is refused.
-      const roleKey = f.harness.cp.runs.require(runId).ownerRoleKey!;
+      // A second outage and recovery rotate the credential again: the connection that authenticated
+      // at epoch 1 is refused at its very next request, without being reopened.
       f.loseClaude();
       await f.daemon.reconcileContinuity("claude coverage lost again");
       f.restoreClaude();
-      f.harness.clock.advance(BOOTSTRAP_CTO_RECOVERY_BACKOFF_MS + 1);
       await f.daemon.reconcileContinuity("claude coverage returned again");
-      expect(f.harness.cp.bindings.active(roleKey)?.bindingGeneration).toBe(4);
+      expect(f.harness.cp.bindings.active(roleKey)?.bindingGeneration).toBe(3);
       expect(f.harness.cp.sessions.require(ownerSessionId).credentialEpoch).toBe(2);
-      const afterRotation = await (live as HeldCtoConnection).call("role_dispatch_pending", {});
-      expect(afterRotation).toMatchObject({ ok: false, reasonCode: ReasonCode.SESSION_SECRET_INVALID });
-      (live as HeldCtoConnection).close();
+      expect(await live.call("role_dispatch_pending", {})).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.SESSION_SECRET_INVALID,
+      });
+      live.close();
     });
   });
 
@@ -165,7 +180,7 @@ describe("C1b: a revoked BOOTSTRAP_CTO is recovered on its own session, in the C
       f.claude.presentAttestation = false;
       f.restoreClaude();
       const report = await f.daemon.reconcileContinuity("claude coverage returned");
-      expect(report?.restorationDeferred).toContainEqual({ roleKey, reasonCode: ReasonCode.SESSION_NOT_READY });
+      expect(report?.restorationDeferred).toContainEqual({ roleKey, reasonCode: ReasonCode.SESSION_ATTESTATION_FAILED });
       // The probe ran and answered.
       expect(f.claude.turns.at(-2)).toMatchObject({ conversation: "resume", relay: null });
       expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.BLOCKED, ownerBindingGeneration: 1 });
@@ -246,6 +261,10 @@ describe("C1b: each recovery failure point leaves the run BLOCKED, with no dupli
       await f.daemon.reconcileContinuity("next tick");
       expect(f.claude.turns).toHaveLength(turns);
       expect(f.harness.cp.runs.require(runId).state).toBe(RunState.BLOCKED);
+      // A pass that withholds restoration records claim needs instead; a bootstrap CTO has none.
+      expect(f.harness.cp.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'CONTINUITY_RESTORE_AWAITS_CLAIM' AND role_key = ?`, [roleKey],
+      )?.n).toBe(0);
 
       f.harness.clock.advance(BOOTSTRAP_CTO_RECOVERY_BACKOFF_MS + 1);
       await f.daemon.reconcileContinuity("after the backoff");
@@ -318,7 +337,47 @@ describe("C1b: ended runs and stopped sessions are never reactivated", () => {
   });
 });
 
+describe("C1b: a restarted daemon holds no credential, and recovers the same session rather than stranding it", () => {
+  it("the next reconcile revokes and pauses the bootstrap CTO whose credential is gone, and restore recovers it on the same session", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      // What a restart leaves: the row, the binding and the run, and no plaintext in memory.
+      f.harness.cp.sessionRuntime.release(ownerSessionId);
+      expect(f.harness.cp.sessionRuntime.wake(roleKey, [{ id: "after-restart", kind: "test" }])).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.SESSION_RUNTIME_UNAVAILABLE,
+      });
+
+      const first = await f.daemon.reconcileContinuity("first tick after a restart");
+      expect(first?.pausedRuns).toContainEqual(expect.objectContaining({ runId, roleKey }));
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.BLOCKED);
+      expect(f.harness.cp.sessions.require(ownerSessionId).lifecycle).toBe(SessionLifecycle.READY);
+      // The next tick's restore pass is the recovery: no other path starts one.
+      const second = await f.daemon.reconcileContinuity("next tick");
+      expect(second?.restored).toContain(roleKey);
+      expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.ACTIVE, ownerSessionId, ownerBindingGeneration: 2 });
+      expect(f.harness.cp.sessions.require(ownerSessionId).credentialEpoch).toBe(1);
+      expect(f.harness.cp.sessionRuntime.holds(ownerSessionId)).toBe(true);
+    });
+  });
+});
+
 describe("C1-02: continuity records no claim need for a bootstrap CTO", () => {
+  it("a pass that only records claim needs records none for a revoked bootstrap CTO its runtime can cover again", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { roleKey } = await outage(f);
+      f.restoreClaude();
+      await f.harness.cp.continuity.evaluate("claude coverage returned");
+      expect(f.harness.cp.continuity.computeCoveragePlan().restorationPending).toContain(roleKey);
+      expect(f.harness.cp.bootstrapCtos.backingOff(roleKey)).toBe(false);
+      expect(f.harness.cp.continuity.recordClaimNeeds()).toEqual([]);
+      expect(f.harness.cp.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'CONTINUITY_RESTORE_AWAITS_CLAIM' AND role_key = ?`, [roleKey],
+      )?.n).toBe(0);
+    });
+  });
+
   it("restore recovers the role instead of recording CONTINUITY_RESTORE_AWAITS_CLAIM", async () => {
     await withBootstrapRuntime(async (f) => {
       const { roleKey } = await outage(f);

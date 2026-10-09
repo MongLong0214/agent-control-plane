@@ -134,6 +134,12 @@ export const bootstrapRuntimeFixture = async () => {
   };
   /** Claude answers again with a healthy window. */
   const restoreClaude = (): void => claude.setCapacity(null);
+  /** Turns of this session that have finished: the driver records one when a turn returns. */
+  const finishedTurns = (sessionId: string): number =>
+    harness.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_TURN' AND session_id = ?`,
+      [sessionId],
+    )?.n ?? 0;
   return {
     harness,
     claude,
@@ -148,6 +154,7 @@ export const bootstrapRuntimeFixture = async () => {
     dispatchBootstrap,
     loseClaude,
     restoreClaude,
+    finishedTurns,
     close: async () => {
       await listeners.close();
       await launch.close();

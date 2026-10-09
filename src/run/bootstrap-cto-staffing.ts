@@ -80,7 +80,13 @@ export const BOOTSTRAP_CTO_RECOVERY_BACKOFF_MS = 15 * 60_000;
 
 /** What a recovery starts from: the revoked generation, its run, and the session it ran on. */
 interface RecoverableBootstrapCto {
+  /** The role's newest generation, revoked by continuity; the renewal follows it. */
   revoked: RoleBinding;
+  /**
+   * The generation the run is still pinned to: the one the outage revoked. Later generations an
+   * earlier recovery renewed and then abandoned never held the pin.
+   */
+  pinnedGeneration: number;
   run: RunRow;
   session: SessionRecord;
 }
@@ -94,8 +100,9 @@ interface RecoverableBootstrapCto {
  * provider), `ensure` after capacity (spawn a fresh session, or probe the live binding a
  * re-dispatch reuses), and `bindForDispatch` inside the dispatch transaction, which binds, pins
  * and enqueues RUN_DISPATCH together. It mints generation 1 only. A role with any history and no
- * live binding is refused `BINDING_REVOKED`: replacing a bootstrap CTO belongs to continuity, not
- * to a second provisioning, and a retry restores the existing binding rather than minting an actor.
+ * live binding is refused `BINDING_REVOKED`: a bootstrap CTO is never replaced, and getting a
+ * revoked one back belongs to continuity's restore pass (`recover`, #246 C1b), which renews the same
+ * actor on the same session rather than minting another.
  *
  * The session is its own: `BindingRegistry` keeps a BOOTSTRAP_CTO alone on its session in both
  * directions, so it is never promoted, never a reviewer, and two runs get two sessions. It is
@@ -175,7 +182,7 @@ export class BootstrapCtoStaffing {
     if (history.length > 0) {
       return deny(
         ReasonCode.BINDING_REVOKED,
-        "the run's bootstrap CTO role was held before; its replacement belongs to continuity, not a second provisioning",
+        "the run's bootstrap CTO role was held before; it is recovered on its own session by continuity, not provisioned again",
         { runId: run.runId, roleKey, generation: history[history.length - 1]!.bindingGeneration },
       );
     }
@@ -541,7 +548,7 @@ export class BootstrapCtoStaffing {
     if (!adopted.allowed) return abandon(adopted);
     const attested = await recovery.runtime.attest(session.sessionId, "resume");
     if (!attested.allowed) return abandon(attested);
-    const resumed = recovery.runs.resumeRecoveredBootstrap(start.value.run.runId, renewed, revoked.bindingGeneration);
+    const resumed = recovery.runs.resumeRecoveredBootstrap(start.value.run.runId, renewed, start.value.pinnedGeneration);
     if (!resumed.allowed) return abandon(resumed);
     this.audit.record({
       kind: "BOOTSTRAP_CTO_RECOVERED",
@@ -549,7 +556,7 @@ export class BootstrapCtoStaffing {
       sessionId: session.sessionId,
       roleKey,
       evidence: {
-        fromGeneration: revoked.bindingGeneration,
+        fromGeneration: start.value.pinnedGeneration,
         toGeneration: renewed.bindingGeneration,
         credentialEpoch,
       },
@@ -594,19 +601,31 @@ export class BootstrapCtoStaffing {
         state: run.state,
       });
     }
+    // The pin names the generation the outage revoked. Every generation after it is a renewal an
+    // earlier recovery abandoned: same session, same incarnation, same actor, never pinned.
+    const pinned = history.find((held) => held.bindingGeneration === run.ownerBindingGeneration);
+    const actorOf = (held: RoleBinding): string | undefined => this.db.get<{ actor_id: string }>(
+      `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+      [held.assignmentId],
+    )?.actor_id;
+    const sameRuntime = (held: RoleBinding): boolean =>
+      held.status === "REVOKED" &&
+      held.boundSessionId === revoked.boundSessionId &&
+      held.boundSessionIncarnation === revoked.boundSessionIncarnation &&
+      held.sessionId === revoked.boundSessionId &&
+      actorOf(held) === actorOf(revoked);
     if (
+      !pinned ||
       run.ownerRoleKey !== roleKey ||
-      run.ownerBindingGeneration !== revoked.bindingGeneration ||
       run.ownerSessionId !== revoked.boundSessionId ||
-      run.ownerSessionIncarnation !== revoked.boundSessionIncarnation
+      run.ownerSessionIncarnation !== revoked.boundSessionIncarnation ||
+      !history.filter((held) => held.bindingGeneration >= pinned.bindingGeneration).every(sameRuntime)
     ) {
-      return deny(ReasonCode.RUN_OWNER_REVOKED, "the run is not pinned to the generation that was revoked", {
+      return deny(ReasonCode.RUN_OWNER_REVOKED, "the run is not pinned to a generation this session lost", {
         roleKey,
         runId: run.runId,
+        pinnedGeneration: run.ownerBindingGeneration,
       });
-    }
-    if (revoked.sessionId !== revoked.boundSessionId) {
-      return deny(ReasonCode.CONFLICT, "the role's actor moved off the session it was bound on", { roleKey });
     }
     const session = recovery.sessions.get(revoked.boundSessionId);
     if (!session || session.lifecycle !== SessionLifecycle.READY || session.incarnation !== revoked.boundSessionIncarnation) {
@@ -624,7 +643,7 @@ export class BootstrapCtoStaffing {
         model: session.model,
       });
     }
-    return allow(ReasonCode.OK, { revoked, run, session });
+    return allow(ReasonCode.OK, { revoked, pinnedGeneration: pinned.bindingGeneration, run, session });
   }
 
   /**

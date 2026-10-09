@@ -61,6 +61,24 @@ export const callMcpToolOverSocket = (
         return;
       }
     });
+    // A handshake refusal ends the socket after one `{ok:false,…}` line and no reply to the call:
+    // answer that refusal at once rather than waiting out the timer.
+    socket.once("close", () => {
+      clearTimeout(timer);
+      for (const line of buffer.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const refused = JSON.parse(line) as Record<string, unknown>;
+          if (refused["ok"] === false && !("jsonrpc" in refused)) {
+            resolve(refused);
+            return;
+          }
+        } catch {
+          // not a refusal line
+        }
+      }
+      resolve({ ok: false, reasonCode: ReasonCode.INTERNAL_ERROR, message: "the socket closed before the call was answered" });
+    });
     socket.once("error", (error) => {
       clearTimeout(timer);
       reject(error);

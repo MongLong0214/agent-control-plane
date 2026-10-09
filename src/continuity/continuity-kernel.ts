@@ -116,10 +116,19 @@ export const CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX = "continuity failover re
  */
 export const CONTINUITY_RECOVERY_REFUSED_REASON_PREFIX = "continuity recovery refused: ";
 
+/**
+ * #246 C1b — a provisioned session (a run's BOOTSTRAP_CTO) whose credential this daemon does not
+ * hold: a restart dropped it with the rest of the daemon's memory. Its runtime can run no turn and
+ * authenticate nothing, so the binding is revoked and the run paused, and the restore pass recovers
+ * the same session with a rotated credential.
+ */
+export const CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON = "the provisioned runtime's credential is not held by this daemon";
+
 /** The exact reasons above, for the reader that has a `revoked_reason` and needs its origin. */
 export const CONTINUITY_REVOCATION_REASONS: readonly string[] = [
   CONTINUITY_COVERAGE_REVOCATION_REASON,
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
+  CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
 ];
 
 /**

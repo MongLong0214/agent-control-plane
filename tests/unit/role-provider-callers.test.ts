@@ -135,7 +135,8 @@ describe("CTO role caller", () => {
 
 // Exercise the real provisioning boundary without starting a live runtime or dispatching a run.
 describe("continuity role caller", () => {
-  it.each([Role.CEO, Role.PRIMARY_CTO, Role.BOOTSTRAP_CTO, Role.WORKER, Role.BLIND_REVIEWER])(
+  // #246 C1b (C1-02): continuity constitutes no session for a BOOTSTRAP_CTO at all; see below.
+  it.each([Role.CEO, Role.PRIMARY_CTO, Role.WORKER, Role.BLIND_REVIEWER])(
     "provisions and probes only the requested %s identity",
     async (role) => {
       const { cp, clock, scripted } = makeHarness();
@@ -168,6 +169,23 @@ describe("continuity role caller", () => {
       } finally { cp.close(); }
     },
   );
+
+  it("never provisions a BOOTSTRAP_CTO, on its fixed runtime or any other: no adapter is asked to start one", async () => {
+    const { cp, clock, scripted } = makeHarness();
+    try {
+      cp.continuity.attach({ readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) } });
+      const claude = new TestProductionAdapter(clock, "claude");
+      cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
+      const start = vi.spyOn(claude, "startSession");
+      const sharedStart = vi.spyOn(scripted, "startSession");
+      for (const provider of ["claude", "scripted"]) {
+        const refused = await cp.continuity["provisionRoutableSession"](Role.BOOTSTRAP_CTO, provider, "role test");
+        expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_CTO_NOT_REPLACEABLE });
+      }
+      expect(start).not.toHaveBeenCalled();
+      expect(sharedStart).not.toHaveBeenCalled();
+    } finally { cp.close(); }
+  });
 
   it("keeps unscoped provisioning compatible and rejects a different-role-only provider", async () => {
     const { cp, clock, scripted } = makeHarness();

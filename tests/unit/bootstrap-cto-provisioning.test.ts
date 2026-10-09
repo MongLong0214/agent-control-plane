@@ -12,7 +12,7 @@ import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask, fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 import { HeadlessRuntimeDouble } from "../helpers/headless-runtime.ts";
-import { TestProductionAdapter } from "../helpers/production-adapter.ts";
+import type { TestProductionAdapter } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());

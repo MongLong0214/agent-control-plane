@@ -12,8 +12,10 @@ export interface FixedRoleRuntime {
  * work, and Claude's own default worker model (Sonnet) is not Opus.
  *
  * Every writer that constitutes a session for one of these roles reads this table — staffing at
- * provisioning, continuity at failover and restoration — and none substitutes another provider or
- * model for it. A role that its fixed provider cannot cover is uncovered, not moved elsewhere.
+ * provisioning, continuity at a WORKER's failover and restoration — and none substitutes another
+ * provider or model for it. A role that its fixed provider cannot cover is uncovered, not moved
+ * elsewhere. Continuity constitutes no session for a BOOTSTRAP_CTO at all: it is recovered on its
+ * own session (#246 C1b).
  */
 export const FIXED_ROLE_RUNTIME: Readonly<Partial<Record<Role, FixedRoleRuntime>>> = Object.freeze({
   [Role.BOOTSTRAP_CTO]: Object.freeze({ provider: "claude", model: "opus" }),

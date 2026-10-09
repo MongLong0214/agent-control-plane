@@ -534,111 +534,6 @@ export class RunEngine {
   }
 
   /**
-   * #246 C1b — the last step of a bootstrap CTO's same-session recovery, taken only after the
-   * renewed binding's runtime received its rotated credential and attested over an authenticated
-   * connection: in one transaction, the owner pin moves from the revoked generation to `renewed`,
-   * the run goes BLOCKED → ACTIVE, and RUN_DISPATCH is enqueued for the new generation. Refused,
-   * with nothing written, unless the run is still the BLOCKED project-less bootstrap pinned to
-   * exactly `fromGeneration` of the same session, and `renewed` is still its role's active binding.
-   * A terminal run is never touched here; nor is one waiting on a human.
-   */
-  resumeRecoveredBootstrap(runId: string, renewed: RoleBinding, fromGeneration: number): Decision<RunRow> {
-    return this.db.txDecision(() => {
-      const run = this.get(runId);
-      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
-      if (run.kind !== RunKind.PROJECT_BOOTSTRAP || run.projectId !== null) {
-        return deny(ReasonCode.INVALID_ARGUMENT, "only a project-less bootstrap run recovers its bootstrap CTO", { runId });
-      }
-      if (run.state !== RunState.BLOCKED) {
-        return deny(
-          isTerminal(run.state) ? ReasonCode.RUN_ALREADY_TERMINAL : ReasonCode.RUN_TRANSITION_ILLEGAL,
-          `a ${run.state} run is not resumed by a bootstrap CTO recovery`,
-          { runId, state: run.state },
-        );
-      }
-      if (
-        run.ownerRoleKey !== renewed.roleKey ||
-        run.ownerBindingGeneration !== fromGeneration ||
-        run.ownerSessionId !== renewed.boundSessionId ||
-        run.ownerSessionIncarnation !== renewed.boundSessionIncarnation
-      ) {
-        return deny(ReasonCode.RUN_OWNER_REVOKED, "the run is not pinned to the generation this recovery renewed", {
-          runId,
-          pinnedGeneration: run.ownerBindingGeneration,
-          fromGeneration,
-        });
-      }
-      const current = this.db.get<{ assignment_id: string; binding_generation: number }>(
-        `SELECT assignment_id, binding_generation FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
-        [renewed.roleKey],
-      );
-      if (current?.assignment_id !== renewed.assignmentId || current.binding_generation !== renewed.bindingGeneration) {
-        return deny(ReasonCode.BINDING_GENERATION_STALE, "the renewed binding is no longer the role's active one", {
-          runId,
-          renewedGeneration: renewed.bindingGeneration,
-          currentGeneration: current?.binding_generation ?? null,
-        });
-      }
-      const transition = canTransition(run.state, RunState.ACTIVE, run.kind);
-      if (!transition.allowed) return transition as Decision<RunRow>;
-      this.db.applyRunStateTransition(this.#stateTransitions, {
-        runId,
-        toState: RunState.ACTIVE,
-        recordTransitionEvidence: () => {
-          this.audit.record({
-            kind: "RUN_TRANSITION",
-            runId,
-            sessionId: renewed.boundSessionId,
-            roleKey: renewed.roleKey,
-            evidence: {
-              from: run.state,
-              to: RunState.ACTIVE,
-              reason: "bootstrap CTO recovered on its own session",
-              fromGeneration,
-              toGeneration: renewed.bindingGeneration,
-            },
-          });
-          return allow(ReasonCode.OK, undefined);
-        },
-        enqueueTransitionEnvelope: () => {
-          const enqueued = this.outbox.enqueue({
-            idempotencyKey: `run-dispatch:${runId}:${renewed.bindingGeneration}`,
-            roleKey: renewed.roleKey,
-            bindingGeneration: renewed.bindingGeneration,
-            targetSessionId: renewed.sessionId,
-            runId,
-            kind: MessageKind.RUN_DISPATCH,
-            payload: {
-              runId,
-              goal: run.goal,
-              executionMode: run.executionMode,
-              priority: run.priority,
-              contractDigest: run.contractDigest,
-              pinnedManifestDigest: run.pinnedManifestDigest,
-              resumedAfterRecovery: true,
-            },
-          });
-          return enqueued.allowed ? allow(ReasonCode.OK, undefined) : (enqueued as Decision<unknown>);
-        },
-        updateState: () =>
-          this.db.run(
-            `UPDATE runs SET state = 'ACTIVE', state_reason = ?,
-                             owner_session_id = ?, owner_binding_generation = ?,
-                             owner_session_incarnation = ?, owner_role_key = ?
-              WHERE run_id = ?`,
-            [
-              "bootstrap CTO recovered", renewed.boundSessionId, renewed.bindingGeneration,
-              renewed.boundSessionIncarnation, renewed.roleKey, runId,
-            ],
-          ),
-      });
-      // Work a previous generation started is fenced to it, as a takeover fences it.
-      this.tasks.abandonStaleExecutions(runId, renewed.bindingGeneration, "bootstrap CTO recovered at a new generation");
-      return allow(ReasonCode.OK, this.require(runId));
-    });
-  }
-
-  /**
    * Issues the completion capabilities, once per database. The composition root claims them
    * and hands one to the production gate and one to bootstrap activation; a later caller that
    * gets hold of this engine finds them spent.
@@ -1333,6 +1228,111 @@ export class RunEngine {
     if (run.ownerRoleKey) return run.ownerRoleKey;
     if (run.kind === RunKind.PROJECT_BOOTSTRAP) return roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId });
     return run.projectId ? roleKeyFor(Role.PRIMARY_CTO, { projectId: run.projectId }) : null;
+  }
+
+  /**
+   * #246 C1b — the last step of a bootstrap CTO's same-session recovery, taken only after the
+   * renewed binding's runtime received its rotated credential and attested over an authenticated
+   * connection: in one transaction, the owner pin moves from the revoked generation to `renewed`,
+   * the run goes BLOCKED → ACTIVE, and RUN_DISPATCH is enqueued for the new generation. Refused,
+   * with nothing written, unless the run is still the BLOCKED project-less bootstrap pinned to
+   * exactly `fromGeneration` of the same session, and `renewed` is still its role's active binding.
+   * A terminal run is never touched here; nor is one waiting on a human.
+   */
+  resumeRecoveredBootstrap(runId: string, renewed: RoleBinding, fromGeneration: number): Decision<RunRow> {
+    return this.db.txDecision(() => {
+      const run = this.get(runId);
+      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+      if (run.kind !== RunKind.PROJECT_BOOTSTRAP || run.projectId !== null) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "only a project-less bootstrap run recovers its bootstrap CTO", { runId });
+      }
+      if (run.state !== RunState.BLOCKED) {
+        return deny(
+          isTerminal(run.state) ? ReasonCode.RUN_ALREADY_TERMINAL : ReasonCode.RUN_TRANSITION_ILLEGAL,
+          `a ${run.state} run is not resumed by a bootstrap CTO recovery`,
+          { runId, state: run.state },
+        );
+      }
+      if (
+        run.ownerRoleKey !== renewed.roleKey ||
+        run.ownerBindingGeneration !== fromGeneration ||
+        run.ownerSessionId !== renewed.boundSessionId ||
+        run.ownerSessionIncarnation !== renewed.boundSessionIncarnation
+      ) {
+        return deny(ReasonCode.RUN_OWNER_REVOKED, "the run is not pinned to the generation this recovery renewed", {
+          runId,
+          pinnedGeneration: run.ownerBindingGeneration,
+          fromGeneration,
+        });
+      }
+      const current = this.db.get<{ assignment_id: string; binding_generation: number }>(
+        `SELECT assignment_id, binding_generation FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+        [renewed.roleKey],
+      );
+      if (current?.assignment_id !== renewed.assignmentId || current.binding_generation !== renewed.bindingGeneration) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "the renewed binding is no longer the role's active one", {
+          runId,
+          renewedGeneration: renewed.bindingGeneration,
+          currentGeneration: current?.binding_generation ?? null,
+        });
+      }
+      const transition = canTransition(run.state, RunState.ACTIVE, run.kind);
+      if (!transition.allowed) return transition as Decision<RunRow>;
+      this.db.applyRunStateTransition(this.#stateTransitions, {
+        runId,
+        toState: RunState.ACTIVE,
+        recordTransitionEvidence: () => {
+          this.audit.record({
+            kind: "RUN_TRANSITION",
+            runId,
+            sessionId: renewed.boundSessionId,
+            roleKey: renewed.roleKey,
+            evidence: {
+              from: run.state,
+              to: RunState.ACTIVE,
+              reason: "bootstrap CTO recovered on its own session",
+              fromGeneration,
+              toGeneration: renewed.bindingGeneration,
+            },
+          });
+          return allow(ReasonCode.OK, undefined);
+        },
+        enqueueTransitionEnvelope: () => {
+          const enqueued = this.outbox.enqueue({
+            idempotencyKey: `run-dispatch:${runId}:${renewed.bindingGeneration}`,
+            roleKey: renewed.roleKey,
+            bindingGeneration: renewed.bindingGeneration,
+            targetSessionId: renewed.sessionId,
+            runId,
+            kind: MessageKind.RUN_DISPATCH,
+            payload: {
+              runId,
+              goal: run.goal,
+              executionMode: run.executionMode,
+              priority: run.priority,
+              contractDigest: run.contractDigest,
+              pinnedManifestDigest: run.pinnedManifestDigest,
+              resumedAfterRecovery: true,
+            },
+          });
+          return enqueued.allowed ? allow(ReasonCode.OK, undefined) : (enqueued as Decision<unknown>);
+        },
+        updateState: () =>
+          this.db.run(
+            `UPDATE runs SET state = 'ACTIVE', state_reason = ?,
+                             owner_session_id = ?, owner_binding_generation = ?,
+                             owner_session_incarnation = ?, owner_role_key = ?
+              WHERE run_id = ?`,
+            [
+              "bootstrap CTO recovered", renewed.boundSessionId, renewed.bindingGeneration,
+              renewed.boundSessionIncarnation, renewed.roleKey, runId,
+            ],
+          ),
+      });
+      // Work a previous generation started is fenced to it, as a takeover fences it.
+      this.tasks.abandonStaleExecutions(runId, renewed.bindingGeneration, "bootstrap CTO recovered at a new generation");
+      return allow(ReasonCode.OK, this.require(runId));
+    });
   }
 }
 

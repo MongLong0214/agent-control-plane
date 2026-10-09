@@ -111,6 +111,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   -- Never retain the session secret itself. The hash is enough to bind a local
   -- handshake while keeping credentials out of durable state (§31.5).
   session_secret_hash TEXT,
+  -- #246 C1b (schema v42) — how many times this session's credential was rotated in place. It moves
+  -- only together with the secret, by exactly one, on the same READY row and incarnation; see
+  -- `sessions_secret_hash_immutable` and `sessions_credential_epoch_rotation` below.
+  credential_epoch INTEGER NOT NULL DEFAULT 0 CHECK (credential_epoch >= 0),
   os_pid         INTEGER,
   -- CP-HI-04 — a pid alone does not identify a process. Pids are reused, and this column is
   -- resolved back to a session inside assertReviewerIndependence, so a reused pid could hide a
@@ -157,16 +161,51 @@ BEGIN
 END;
 
 -- CP-HI-02 — a rotated secret would let a second peer inherit an established session's authority.
--- An issued session secret cannot be rotated in place or cleared: the peer that holds
--- the plaintext is the only thing that proves an MCP caller is this session, so a
--- rewritable hash would let a local caller mint itself a new credential for an existing
--- session. A respawn issues a new session row instead.
+-- An issued session secret cannot be cleared, and it is replaced only by a rotation: the peer that
+-- holds the plaintext is the only thing that proves an MCP caller is this session, so a hash any
+-- statement could rewrite would let a local caller mint itself a new credential.
+--
+-- #246 C1b (schema v42) — a rotation is the one legitimate replacement: the same statement moves
+-- `credential_epoch` up by exactly one and writes a different, non-null hash, on a READY row that
+-- keeps its session id and incarnation. Every other change of the hash is refused as before. A
+-- respawn still issues a new session row; a rotation keeps the conversation and its row.
 CREATE TRIGGER IF NOT EXISTS sessions_secret_hash_immutable
 BEFORE UPDATE OF session_secret_hash ON sessions
 WHEN OLD.session_secret_hash IS NOT NULL
   AND (NEW.session_secret_hash IS NULL OR NEW.session_secret_hash <> OLD.session_secret_hash)
+  AND NOT (NEW.credential_epoch = OLD.credential_epoch + 1
+           AND NEW.session_id = OLD.session_id
+           AND NEW.incarnation = OLD.incarnation
+           AND OLD.lifecycle = 'READY' AND NEW.lifecycle = 'READY')
 BEGIN
   SELECT RAISE(ABORT, 'SESSION_SECRET_HASH_IMMUTABLE');
+END;
+
+-- CP-HI-02 — #246 C1b (schema v42): the credential epoch is what an authenticated connection is fenced by, so
+-- it moves only as part of a rotation: up by exactly one, together with a new non-null secret, on
+-- the same READY row and incarnation. It never moves back, never skips, and never moves alone.
+CREATE TRIGGER IF NOT EXISTS sessions_credential_epoch_rotation
+BEFORE UPDATE OF credential_epoch ON sessions
+WHEN NEW.credential_epoch <> OLD.credential_epoch
+  AND NOT (NEW.credential_epoch = OLD.credential_epoch + 1
+           AND OLD.session_secret_hash IS NOT NULL
+           AND NEW.session_secret_hash IS NOT NULL
+           AND NEW.session_secret_hash <> OLD.session_secret_hash
+           AND NEW.session_id = OLD.session_id
+           AND NEW.incarnation = OLD.incarnation
+           AND OLD.lifecycle = 'READY' AND NEW.lifecycle = 'READY')
+BEGIN
+  SELECT RAISE(ABORT, 'SESSION_CREDENTIAL_EPOCH_INVALID');
+END;
+
+-- CP-HI-02 — #246 C1b (schema v42): a session row begins at epoch 0; an epoch is a count of rotations this
+-- row went through, and a row inserted ahead of its own history would fence connections by
+-- rotations that never happened.
+CREATE TRIGGER IF NOT EXISTS sessions_credential_epoch_starts_at_zero
+BEFORE INSERT ON sessions
+WHEN NEW.credential_epoch <> 0
+BEGIN
+  SELECT RAISE(ABORT, 'SESSION_CREDENTIAL_EPOCH_INVALID');
 END;
 
 -- Only one *live* session may speak as a given Buzz channel identity. Two live sessions holding the

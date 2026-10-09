@@ -4,7 +4,6 @@ import {
   constants,
   existsSync,
   lstatSync,
-  mkdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -1893,9 +1892,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     } catch {
       return refused("SESSION_TURN_WORKDIR_MISSING: the session's fixed workdir does not exist");
     }
+    // The CLI creates this directory itself on the first turn; the profile only has to let it.
     const transcripts = claudeTranscriptDirectory(workdir);
     if (!transcripts) return refused("SESSION_TURN_TRANSCRIPT_UNADDRESSABLE: the workdir path is too long to name a transcript directory");
-    mkdirSync(transcripts, { recursive: true, mode: 0o700 });
 
     const args = [
       "-p",

@@ -1527,6 +1527,8 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   ACTOR_RUNTIME_NOT_READY: ReasonCode.CONFLICT,
   SESSION_WORKDIR_IMMUTABLE: ReasonCode.CONFLICT,
   SESSION_SECRET_HASH_IMMUTABLE: ReasonCode.CONFLICT,
+  // #246 C1b — the credential epoch moves only as a rotation, by one, with a new secret.
+  SESSION_CREDENTIAL_EPOCH_INVALID: ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE,
 };
 
 /**

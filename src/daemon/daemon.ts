@@ -10,6 +10,7 @@ import {
   CONTINUITY_COVERAGE_REVOCATION_REASON,
   CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
+  CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
   type RequiredRole,
   type RoleCoveragePlan,
 } from "../continuity/continuity-kernel.ts";
@@ -20,6 +21,7 @@ import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
 import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
+import { ProvisionedSessionRuntime } from "../runtime/provisioned-session-runtime.ts";
 import {
   resolveDoctorHealth,
   type DoctorHealthAttempt,
@@ -1695,6 +1697,19 @@ export class Daemon {
         // CEO needs the one-time possession-proven bootstrap path; continuity is allowed
         // to replace an existing authority, not forge generation 1 for an absent one.
         if (!current) continue;
+
+        // #246 C1b — a provisioned session holds its authority through a credential only this
+        // daemon's memory carries. One this daemon does not hold (a restart dropped it) can run no
+        // turn and authenticate nothing, however healthy its provider is: its run is paused and
+        // its binding revoked as owed, and the restore pass recovers the same session with a
+        // rotated credential. Its row is left READY; nothing about the conversation is lost.
+        if (ProvisionedSessionRuntime.drives(required.role)) {
+          if (!this.cp.sessionRuntime.holds(current.sessionId)) {
+            pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON));
+            this.revokePausedBinding(required, CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON);
+            continue;
+          }
+        }
 
         const assignment = plan.assignments.find((candidate) => candidate.roleKey === required.roleKey);
         const session = this.cp.sessions.get(current.sessionId);

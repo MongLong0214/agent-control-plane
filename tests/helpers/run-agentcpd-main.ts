@@ -6,6 +6,7 @@ import { isAcpError } from "../../src/core/errors.ts";
 import { systemClock } from "../../src/core/clock.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
+import { HeadlessRuntimeDouble } from "./headless-runtime.ts";
 import type { TelegramBotTransport } from "../../src/ingress/telegram-polling.ts";
 import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
 import { allow } from "../../src/core/errors.ts";
@@ -160,8 +161,10 @@ class StartupTelegramTransport implements TelegramBotTransport {
 const root = process.env["ACP_STARTUP_TEST_ROOT"];
 if (!root) throw new Error("ACP_STARTUP_TEST_ROOT is required");
 
+// #246 C1b — Claude hosts the bootstrap CTO's headless turns: its double takes the session's
+// credential from main's real launch channel and attests over main's real cto.mcp.sock.
 const adapters = [
-  new StartupAdapter(systemClock, "claude"),
+  new HeadlessRuntimeDouble(systemClock, "claude"),
   new StartupAdapter(systemClock, "gpt"),
 ];
 const config = {

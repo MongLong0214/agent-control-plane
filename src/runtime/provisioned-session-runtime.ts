@@ -272,8 +272,8 @@ export class ProvisionedSessionRuntime {
     const held = this.#held.get(sessionId);
     const adapter = this.#adapterFor(session, held?.role ?? Role.BOOTSTRAP_CTO);
     if (!adapter.allowed) return adapter as Decision<SessionTurnResult>;
-    const runSessionTurn = adapter.value.runSessionTurn;
-    if (!runSessionTurn) {
+    const provider = adapter.value;
+    if (!provider.runSessionTurn) {
       return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "the provider adapter cannot run a session turn", {
         sessionId,
         provider: session.provider,
@@ -308,7 +308,7 @@ export class ProvisionedSessionRuntime {
     }
     let result: SessionTurnResult;
     try {
-      result = await runSessionTurn({
+      result = await provider.runSessionTurn({
         handle,
         conversation,
         prompt,
@@ -333,7 +333,7 @@ export class ProvisionedSessionRuntime {
             kind: "SESSION_CREDENTIAL_NOT_TAKEN",
             reasonCode: ReasonCode.SESSION_ATTESTATION_FAILED,
             sessionId,
-            evidence: { purpose: turn.purpose, conversation },
+            evidence: { purpose: turn.purpose, step: conversation },
           });
         }
       }
@@ -342,22 +342,24 @@ export class ProvisionedSessionRuntime {
       kind: "SESSION_TURN",
       reasonCode: result.ok ? ReasonCode.OK : ReasonCode.SESSION_TURN_FAILED,
       sessionId,
+      // `step` and `sameConversationId`, not "conversation": the audit stores no field named for
+      // a conversation's content, and a key ending in it is redacted as one.
       evidence: {
         purpose: turn.purpose,
-        conversation,
+        step: conversation,
         relay: turn.relay,
         exitCode: result.exitCode,
         durationMs: result.durationMs,
-        sameConversation: result.providerSessionId === handle.externalSessionId,
+        sameConversationId: result.providerSessionId === handle.externalSessionId,
       },
     });
     if (!result.ok) {
       return deny(ReasonCode.SESSION_TURN_FAILED, "the session's turn did not complete as its own conversation", {
         sessionId,
         purpose: turn.purpose,
-        conversation,
+        step: conversation,
         exitCode: result.exitCode,
-        sameConversation: result.providerSessionId === handle.externalSessionId,
+        sameConversationId: result.providerSessionId === handle.externalSessionId,
       });
     }
     return allow(ReasonCode.OK, result);

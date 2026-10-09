@@ -1074,6 +1074,7 @@ describe("baseline boundary contracts", () => {
       "v39-owner-reply-intent-keeps-its-key",
       "v40-peer-message-carry-record",
       "v41-runtime-managed-worker-turns",
+      "v42-session-credential-epoch",
     ]);
   });
 
