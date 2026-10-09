@@ -4,6 +4,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { containedWorkdir, probeSessionHealth } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
 import { Role, type RoleBinding, RunState, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -19,7 +20,10 @@ import type { TaskGraph } from "./task-graph.ts";
  * not ask for — and a provider or model outside this table is refused rather than mapped to one
  * inside it. The model is not the adapter's `defaultModels.worker`, which for Claude is Sonnet.
  */
-export const WORKER_MODEL_BY_PROVIDER: Readonly<Record<string, string>> = Object.freeze({ claude: "opus" });
+export const WORKER_MODEL_BY_PROVIDER: Readonly<Record<string, string>> = Object.freeze({
+  // The one table continuity reads too (#246), so a failover cannot pick a runtime staffing refuses.
+  [FIXED_ROLE_RUNTIME[Role.WORKER]!.provider]: FIXED_ROLE_RUNTIME[Role.WORKER]!.model,
+});
 
 /** The run owner the caller authenticated as, re-derived from durable state on every call. */
 export type WorkerOwnerFence = () => Decision<{ sessionId: string; bindingGeneration: number }>;

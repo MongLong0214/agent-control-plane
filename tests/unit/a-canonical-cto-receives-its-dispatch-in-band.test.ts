@@ -347,8 +347,20 @@ describe("an adopted canonical CTO receives its dispatch in band", () => {
       MessageKind.DRAIN_REQUEST,
       "a replacement request",
       (f: Fixture) => {
-        const drained = f.h.cp.cto.requestReplacement(f.projectId, "operator replacement");
-        if (!drained.allowed) throw new Error(drained.message);
+        // #246 C1-R1 — a replacement request no longer drains a canonical CTO, so this is the row a
+        // build before that guard enqueued for one, in `requestReplacement`'s exact shape.
+        const binding = f.h.cp.bindings.active(f.roleKey);
+        if (!binding) throw new Error("the canonical CTO holds no binding");
+        const queued = f.h.cp.outbox.enqueue({
+          idempotencyKey: `drain:${f.projectId}:${binding.bindingGeneration}`,
+          roleKey: binding.roleKey,
+          bindingGeneration: binding.bindingGeneration,
+          targetSessionId: binding.sessionId,
+          runId: null,
+          kind: MessageKind.DRAIN_REQUEST,
+          payload: { projectId: f.projectId, reason: "operator replacement" },
+        });
+        if (!queued.allowed) throw new Error(queued.message);
       },
     ],
     [
@@ -403,8 +415,20 @@ describe("an adopted canonical CTO receives its dispatch in band", () => {
       const sessionId = session.sessionId;
       const peer = { sessionId, incarnation: h.cp.sessions.require(sessionId).incarnation };
       expect(h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM runs`)?.n).toBe(0);
-      const drained = h.cp.cto.requestReplacement(projectId, "operator replacement");
-      if (!drained.allowed) throw new Error(drained.message);
+      // #246 C1-R1 — a replacement request is refused for a canonical CTO and enqueues nothing; the
+      // drain request below is the row a build before that guard enqueued, in its exact shape.
+      expect(h.cp.cto.requestReplacement(projectId, "operator replacement"))
+        .toMatchObject({ allowed: false, reasonCode: ReasonCode.CANONICAL_CTO_NOT_REPLACEABLE });
+      const queued = h.cp.outbox.enqueue({
+        idempotencyKey: `drain:${projectId}:${bound.bindingGeneration}`,
+        roleKey: bound.roleKey,
+        bindingGeneration: bound.bindingGeneration,
+        targetSessionId: sessionId,
+        runId: null,
+        kind: MessageKind.DRAIN_REQUEST,
+        payload: { projectId, reason: "operator replacement" },
+      });
+      if (!queued.allowed) throw new Error(queued.message);
       const row = h.cp.db.get<{ message_id: string; run_id: string | null }>(
         `SELECT message_id, run_id FROM outbox WHERE kind = 'DRAIN_REQUEST' AND target_session_id = ?`,
         [sessionId],

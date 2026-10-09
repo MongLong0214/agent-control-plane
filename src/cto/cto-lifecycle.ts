@@ -115,6 +115,50 @@ export const containedWorkdir = (reported: string | null | undefined, managedRoo
   return reported === managedRoot || isWithin(managedRoot, reported) ? reported : managedRoot;
 };
 
+/**
+ * Issue #246 C1-04 — the audit kind that records a session spawned for a run's BOOTSTRAP_CTO, under
+ * the run's id, in the transaction that creates the session row: before the launch credential,
+ * Buzz, the probe or readiness can refuse it, and before any bind. It is how the reclaim sweep
+ * (`BootstrapCtoStaffing.reclaim`) finds a spawn that was never bound and whose provider stop
+ * failed. Kept as an append-only audit event, as the native start pin is, because the migration
+ * list is frozen; it nominates a session for a stop and grants nothing, and the sweep still never
+ * stops a session that holds a role.
+ */
+export const BOOTSTRAP_CTO_SPAWN_RECORD = "BOOTSTRAP_CTO_SESSION_SPAWNED";
+
+/** #246 C1-R1 — one project's switchover a canonical CTO was left in, withdrawn. */
+export interface CanonicalSwitchoverWithdrawal {
+  projectId: string;
+  /** The PENDING normal handoffs closed REJECTED. */
+  handoffIds: string[];
+  /** Their replacements, marked ERROR with a provider stop pending. */
+  replacements: string[];
+  /** Whether the canonical holder was DRAINING and is READY again. */
+  restored: boolean;
+}
+
+/** What `CtoLifecycle.settleCanonicalSwitchovers` did in one pass. */
+export interface CanonicalSwitchoverSettlement {
+  withdrawn: CanonicalSwitchoverWithdrawal[];
+  /** Withdrawn replacements the provider did not stop; the next pass asks again. */
+  stopFailed: string[];
+}
+
+/** What `CtoLifecycle.spawn` constitutes: the role it serves, its scope, and the runtime it runs. */
+interface SpawnRequest {
+  /** Selects the role-scoped adapter, so the session runs under that role's credential scope. */
+  role: typeof Role.PRIMARY_CTO | typeof Role.BOOTSTRAP_CTO;
+  /** The project a PRIMARY_CTO, or the run a BOOTSTRAP_CTO, is constituted for. */
+  scope: string;
+  purpose: string;
+  runtime: CtoPreference;
+  canonicalGuard?: { roleKey: string; runId: string | undefined };
+  /** Have the provider stop the session on a refusal after it started, not only record it ERROR. */
+  stopOnRefusal?: boolean;
+  /** Record the session as spawned for this run, with the session row (`BOOTSTRAP_CTO_SPAWN_RECORD`). */
+  spawnedForRun?: string;
+}
+
 export class CtoLifecycle {
   #buzz: BuzzConnector | null = null;
   #readiness: ReadinessProbe | null = null;
@@ -197,7 +241,13 @@ export class CtoLifecycle {
     // A released canonical role is not given a spawned CTO either; its conversation re-claims it.
     const released = this.#releasedCanonicalHolder(projectId, roleKey);
     if (released) return this.#refuseAdoptedCanonical(released, null, null, runId);
-    const created = await this.spawn(projectId, "primary-cto", { roleKey, runId });
+    const created = await this.spawn({
+      role: Role.PRIMARY_CTO,
+      scope: projectId,
+      purpose: "primary-cto",
+      runtime: this.preference,
+      canonicalGuard: { roleKey, runId },
+    });
     if (!created.allowed) return created as Decision<RoleBinding>;
 
     // A canonical claim that landed after `spawn`'s pre-launch check is refused in the transaction
@@ -234,6 +284,11 @@ export class CtoLifecycle {
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
     const current = this.bindings.active(roleKey);
     if (!current) return deny(ReasonCode.NOT_FOUND, "project has no primary CTO", { projectId });
+
+    // #246 C1-R1 — a canonical CTO is never replaced, so it is never drained for a replacement the
+    // handoff would then refuse: refused here, before anything is written, by the switchover guard.
+    const canonical = this.#canonicalHolderOf(projectId, roleKey, current);
+    if (canonical) return this.#canonicalHandoffDenial<{ draining: boolean; activeRuns: number }>(canonical, null);
 
     const drain = this.sessions.transition(current.sessionId, SessionLifecycle.DRAINING, reason);
     if (!drain.allowed) return drain as Decision<{ draining: boolean; activeRuns: number }>;
@@ -301,6 +356,12 @@ export class CtoLifecycle {
     const current = this.bindings.active(roleKey);
     if (!current) return deny(ReasonCode.NOT_FOUND, "project has no primary CTO", { projectId });
 
+    // #246 C1-05 — a canonical CTO is never swapped for a spawned replacement: the guard initial
+    // staffing and recovery takeover use, asked before anything is spawned and again in the
+    // transaction after the spawn's await.
+    const canonical = this.#canonicalHolderOf(projectId, roleKey, current);
+    if (canonical) return this.#canonicalHandoffDenial<{ handoffId: string; incomingSessionId: string }>(canonical, null);
+
     const activeRuns = this.runs.activeRunsOwnedBy(current.sessionId);
     if (activeRuns.length > 0) {
       return deny(
@@ -318,7 +379,12 @@ export class CtoLifecycle {
       });
     }
 
-    const incoming = await this.spawn(projectId, "primary-cto-replacement");
+    const incoming = await this.spawn({
+      role: Role.PRIMARY_CTO,
+      scope: projectId,
+      purpose: "primary-cto-replacement",
+      runtime: this.preference,
+    });
     if (!incoming.allowed) return incoming as Decision<{ handoffId: string; incomingSessionId: string }>;
 
     const handoffId = `hof_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
@@ -330,6 +396,9 @@ export class CtoLifecycle {
       // moment the drain barrier is persisted. A replacement can never revoke a run that
       // appeared while its incoming session was being readied.
       const fresh = this.bindings.active(roleKey);
+      // C1-05 — nor be prepared for a holder that became canonical during that await.
+      const claimed = this.#canonicalHolderOf(projectId, roleKey, fresh);
+      if (claimed) return this.#canonicalHandoffDenial<{ handoffId: string; incomingSessionId: string }>(claimed, null);
       if (
         !fresh ||
         fresh.sessionId !== current.sessionId ||
@@ -406,6 +475,13 @@ export class CtoLifecycle {
     handoffId: string,
     acknowledgement: HandoffAcknowledgement | string,
   ): Decision<RoleBinding> {
+    // #246 C1-R1 — a PENDING handoff whose outgoing holder is canonical can never be acknowledged,
+    // so it is withdrawn here rather than refused and left: the holder leaves DRAINING, the handoff
+    // closes and its replacement is stopped. Done before the transaction below, because a refusal
+    // from inside that one rolls back every write it made.
+    const withdrawn = this.#withdrawCanonicalHandoff(handoffId);
+    if (withdrawn) return withdrawn;
+
     // #664 — this body's own ACKED write must not survive a denial, including one
     // that comes back from the nested `bindings.switchTo` call below.
     return this.db.txDecision(() => {
@@ -481,6 +557,12 @@ export class CtoLifecycle {
           },
         );
       }
+
+      // #246 C1-05 — nor is one acknowledged whose outgoing holder is canonical (prepared by a
+      // build before the preparation guard, or its holder canonical since): the switch below would
+      // replace the canonical conversation and stop its session.
+      const canonical = this.#canonicalHolderOf(row.project_id, roleKeyForAck, currentBinding);
+      if (canonical) return this.#canonicalHandoffDenial<RoleBinding>(canonical, handoffId);
 
       // Re-check the barrier: a run dispatched after prepare would be handed to a session
       // that is about to be stopped.
@@ -563,7 +645,13 @@ export class CtoLifecycle {
     }
 
     const recovery = this.buildRecoveryPackage(projectId, reason);
-    const incoming = await this.spawn(projectId, "acting-cto-recovery", { roleKey, runId });
+    const incoming = await this.spawn({
+      role: Role.PRIMARY_CTO,
+      scope: projectId,
+      purpose: "acting-cto-recovery",
+      runtime: this.preference,
+      canonicalGuard: { roleKey, runId },
+    });
     if (!incoming.allowed) return incoming as Decision<RoleBinding>;
 
     // #664 — this body's own handoff-record write must not survive a denial, including
@@ -855,29 +943,76 @@ export class CtoLifecycle {
   }
 
   /**
-   * Fresh session → Buzz → doctor readiness. Any failed step stops the activation.
+   * Issue #246 — a run's BOOTSTRAP_CTO, constituted by the same spawn a primary CTO is: launch
+   * credential → Buzz → probe → READY → readiness. It runs on the runtime the caller names, which
+   * bootstrap staffing fixes; nothing here substitutes another provider or model. The session is
+   * returned unbound — the dispatch transaction binds and pins it — and a refusal after the provider
+   * session started stops that session rather than leaving it running.
+   */
+  async spawnBootstrapCto(runId: string, runtime: CtoPreference): Promise<Decision<string>> {
+    return this.spawn({
+      role: Role.BOOTSTRAP_CTO,
+      scope: runId,
+      purpose: "bootstrap-cto",
+      runtime,
+      stopOnRefusal: true,
+      spawnedForRun: runId,
+    });
+  }
+
+  /**
+   * Provider proof that a READY session this lifecycle constituted for `role` is still the session
+   * the provider has (§14.3). A row that is not READY is refused without asking.
+   */
+  async probeRoleSession(sessionId: string, role: Role): Promise<Decision<void>> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.lifecycle !== SessionLifecycle.READY) {
+      return deny(ReasonCode.SESSION_NOT_READY, "the bound session is not READY", {
+        sessionId,
+        lifecycle: session?.lifecycle ?? null,
+      });
+    }
+    return this.probeBoundSession(session, role);
+  }
+
+  /**
+   * Stops a session this lifecycle constituted for `role`, through the provider's own handle, and
+   * marks it STOPPED. A failed provider stop leaves it ERROR, audited, and is refused.
+   */
+  async stopRoleSession(sessionId: string, role: Role, reason: string): Promise<Decision<void>> {
+    await this.stopUnusedSession(sessionId, reason, role);
+    const lifecycle = this.sessions.get(sessionId)?.lifecycle ?? null;
+    return lifecycle === SessionLifecycle.STOPPED
+      ? allow(ReasonCode.OK, undefined)
+      : deny(ReasonCode.SESSION_STOP_FAILED, "the provider did not stop the session", { sessionId, lifecycle });
+  }
+
+  /**
+   * Fresh session → launch credential → Buzz → probe → READY → doctor readiness, for `role` on
+   * `runtime`. Any failed step stops the activation.
    *
    * `canonicalGuard` names the role a primary-CTO provisioning fills. The caller checked the role's
    * canonical lineage before calling, and the awaits below can let a canonical claim land (and be
-   * released) after that check, so the lineage is read again immediately before the launch.
+   * released) after that check, so the lineage is read again immediately before the launch. A
+   * BOOTSTRAP_CTO is run-scoped work, never a canonical actor, so it carries no guard and its spawn
+   * neither reads nor replaces any canonical CEO or CTO.
    */
-  private async spawn(
-    projectId: string,
-    purpose: string,
-    canonicalGuard?: { roleKey: string; runId: string | undefined },
-  ): Promise<Decision<string>> {
-    const adapter = this.providers.hasRoleScoped(this.preference.provider)
-      ? this.providers.requireForRole(this.preference.provider, Role.PRIMARY_CTO)
-      : this.providers.get(this.preference.provider);
+  private async spawn(request: SpawnRequest): Promise<Decision<string>> {
+    const { role, scope, purpose, runtime, canonicalGuard } = request;
+    const adapter = this.providers.hasRoleScoped(runtime.provider)
+      ? this.providers.requireForRole(runtime.provider, role)
+      : this.providers.get(runtime.provider);
     if (!adapter) {
       return deny(ReasonCode.NOT_FOUND, "no adapter for the preferred CTO provider", {
-        provider: this.preference.provider,
+        provider: runtime.provider,
+        role,
       });
     }
     const health = await adapter.probeRuntime();
     if (health === "UNAVAILABLE") {
       return deny(ReasonCode.CAPACITY_ADMISSION_SUSPENDED, "CTO provider runtime is unavailable", {
-        provider: this.preference.provider,
+        provider: runtime.provider,
+        role,
       });
     }
 
@@ -890,31 +1025,70 @@ export class CtoLifecycle {
     }
 
     if (canonicalGuard) {
-      const claimed = this.#releasedCanonicalHolder(projectId, canonicalGuard.roleKey);
+      const claimed = this.#releasedCanonicalHolder(scope, canonicalGuard.roleKey);
       if (claimed) return this.#refuseAdoptedCanonical<string>(claimed, null, null, canonicalGuard.runId);
     }
     const handle = await adapter.startSession({
-      model: this.preference.model,
-      effort: this.preference.effort,
+      model: runtime.model,
+      effort: runtime.effort,
       workdir: this.managedRuntimeRoot,
       purpose,
     });
     // Recorded with its native start pinned beside the lstart, read as one snapshot of one process
     // (ACP1045-R2-01, R3-01); see `SessionRegistry.createWithPinnedStart`.
-    const session = this.sessions.createWithPinnedStart({
-      provider: adapter.provider,
-      model: this.preference.model,
-      effort: this.preference.effort,
-      sessionId: `ses_cto_${handle.externalSessionId.replace(/-/g, "").slice(0, 20)}`,
-      incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
-      osPid: handle.pid,
-      // The adapter's answer is accepted only if it is inside the root this daemon manages.
-      // `sessions_workdir_immutable` is BEFORE UPDATE, so whatever is written here becomes a
-      // permanent routing fact — an adapter that echoes its own cwd would pin the session to
-      // it forever. The shipped adapters echo `spec.workdir`; that is caller courtesy, and
-      // this is the check that does not depend on it.
-      workdir: containedWorkdir(handle.workdir, this.managedRuntimeRoot),
-    });
+    let session: ReturnType<SessionRegistry["createWithPinnedStart"]>;
+    try {
+      // The row and, for a run's bootstrap CTO, its spawn record are one write: no refusal below
+      // can leave a session the reclaim sweep has no record of (#246 C1-04).
+      session = this.db.tx(() => {
+        const created = this.sessions.createWithPinnedStart({
+          provider: adapter.provider,
+          model: runtime.model,
+          effort: runtime.effort,
+          sessionId: `ses_cto_${handle.externalSessionId.replace(/-/g, "").slice(0, 20)}`,
+          incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
+          osPid: handle.pid,
+          // The adapter's answer is accepted only if it is inside the root this daemon manages.
+          // `sessions_workdir_immutable` is BEFORE UPDATE, so whatever is written here becomes a
+          // permanent routing fact — an adapter that echoes its own cwd would pin the session to
+          // it forever. The shipped adapters echo `spec.workdir`; that is caller courtesy, and
+          // this is the check that does not depend on it.
+          workdir: containedWorkdir(handle.workdir, this.managedRuntimeRoot),
+        });
+        if (request.spawnedForRun !== undefined) {
+          this.audit.record({
+            kind: BOOTSTRAP_CTO_SPAWN_RECORD,
+            runId: request.spawnedForRun,
+            sessionId: created.sessionId,
+            evidence: { role, provider: adapter.provider, model: runtime.model, purpose },
+          });
+        }
+        return created;
+      });
+    } catch (error) {
+      if (request.stopOnRefusal) await adapter.stopSession(handle).catch(() => undefined);
+      throw error;
+    }
+    // A refusal from here on has a provider session behind it. Every role records it ERROR; a role
+    // that asked for it (a run's bootstrap CTO) also has the provider stop it, so no refused spawn
+    // is left running.
+    const refuse = async <T>(reason: string, refused: Decision<T>): Promise<Decision<T>> => {
+      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, reason);
+      if (request.stopOnRefusal) {
+        try {
+          await adapter.stopSession(handle);
+          this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, `${reason}: stopped`);
+        } catch (error) {
+          this.audit.record({
+            kind: "CTO_UNUSED_SESSION_STOP_FAILED",
+            reasonCode: ReasonCode.SESSION_STOP_FAILED,
+            sessionId: session.sessionId,
+            evidence: { reason, role, error: error instanceof Error ? error.message : String(error) },
+          });
+        }
+      }
+      return refused;
+    };
 
     // `SessionRegistry.create` is intentionally the only issuer of the plaintext secret.
     // The normal daemon attaches a one-time local launch channel, so a freshly spawned
@@ -924,12 +1098,11 @@ export class CtoLifecycle {
     // weaker delivery path here.
     if (this.#sessionLaunch) {
       if (!session.sessionSecret) {
-        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "session secret storage unavailable");
-        return deny(
+        return refuse("session secret storage unavailable", deny<string>(
           ReasonCode.SESSION_SECRET_STORAGE_UNAVAILABLE,
           "a spawned CTO cannot receive its session credential because secret storage is unavailable",
           { sessionId: session.sessionId },
-        );
+        ));
       }
       const provisioned = await this.#sessionLaunch.provision({
         sessionId: session.sessionId,
@@ -938,16 +1111,14 @@ export class CtoLifecycle {
         sessionSecret: session.sessionSecret,
       });
       if (!provisioned.allowed) {
-        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "session launch credential provisioning failed");
-        return provisioned as Decision<string>;
+        return refuse("session launch credential provisioning failed", provisioned as Decision<string>);
       }
     }
 
     if (this.#buzz) {
-      const connected = await this.#buzz.connect(session.sessionId, `${purpose}:${projectId}`);
+      const connected = await this.#buzz.connect(session.sessionId, `${purpose}:${scope}`);
       if (!connected.allowed) {
-        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "buzz connect failed");
-        return connected as Decision<string>;
+        return refuse("buzz connect failed", connected as Decision<string>);
       }
       this.sessions.setBuzzAddress(session.sessionId, connected.value);
     }
@@ -957,8 +1128,7 @@ export class CtoLifecycle {
     // session READY, or the CTO role is handed to a runtime nobody has spoken to.
     const live = await probeSessionHealth(adapter, handle);
     if (!live.allowed) {
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe failed");
-      return live as Decision<string>;
+      return refuse("provider session probe failed", live as Decision<string>);
     }
 
     this.sessions.transition(session.sessionId, SessionLifecycle.READY, "provider session verified");
@@ -966,8 +1136,7 @@ export class CtoLifecycle {
     if (this.#readiness) {
       const ready = await this.#readiness.checkSession(session.sessionId);
       if (!ready.allowed) {
-        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "readiness failed");
-        return ready as Decision<string>;
+        return refuse("readiness failed", ready as Decision<string>);
       }
     }
 
@@ -979,9 +1148,9 @@ export class CtoLifecycle {
    * the session the provider has. The handle is reconstructed from the session record, so
    * the probe addresses the provider's own id rather than the control plane's alias.
    */
-  private async probeBoundSession(session: SessionRecord): Promise<Decision<void>> {
+  private async probeBoundSession(session: SessionRecord, role: Role = Role.PRIMARY_CTO): Promise<Decision<void>> {
     const adapter = this.providers.hasRoleScoped(session.provider)
-      ? this.providers.requireForRole(session.provider, Role.PRIMARY_CTO)
+      ? this.providers.requireForRole(session.provider, role)
       : this.providers.get(session.provider);
     if (!adapter) {
       return deny(ReasonCode.SESSION_NOT_READY, "no adapter can prove the bound CTO session is live", {
@@ -1024,6 +1193,220 @@ export class CtoLifecycle {
       [roleKey, SELF_CLAIM_EXECUTOR_KIND, roleKey],
     );
     return latest ? { projectId, roleKey, ...latest } : null;
+  }
+
+  /**
+   * #246 C1-05 — the canonical holder of a PRIMARY_CTO role, by the guard initial staffing and
+   * recovery takeover use: the active binding's holder when it is an adopted canonical CTO, else the
+   * role's lineage (`#releasedCanonicalHolder`), which also answers for an active canonical actor
+   * whose runtime pointer has moved. Null when the role is not canonical.
+   */
+  #canonicalHolderOf(projectId: string, roleKey: string, current: RoleBinding | null): CanonicalHolder | null {
+    if (current && this.#isAdoptedCanonical(current)) {
+      return {
+        projectId,
+        roleKey,
+        sessionId: current.sessionId,
+        bindingGeneration: current.bindingGeneration,
+        status: current.status,
+      };
+    }
+    return this.#releasedCanonicalHolder(projectId, roleKey);
+  }
+
+  /**
+   * #246 C1-05 — an ordinary handoff never swaps a canonical CTO: it is not prepared (no spawned
+   * replacement, no drain) and not acknowledged (no switch, the original session not stopped). The
+   * canonical conversation keeps the role. It writes nothing, so a transaction can return it, and
+   * like every other handoff refusal it is reported to the caller rather than audited.
+   */
+  #canonicalHandoffDenial<T>(
+    holder: CanonicalHolder,
+    handoffId: string | null,
+    withdrawal?: CanonicalSwitchoverWithdrawal,
+  ): Decision<T> {
+    return deny<T>(
+      ReasonCode.CANONICAL_CTO_NOT_REPLACEABLE,
+      "the outgoing CTO is canonical; a handoff never swaps it for a spawned replacement, its own conversation keeps the role",
+      {
+        projectId: holder.projectId,
+        roleKey: holder.roleKey,
+        sessionId: holder.sessionId,
+        bindingGeneration: holder.bindingGeneration,
+        assignmentStatus: holder.status,
+        handoffId,
+        ...(withdrawal
+          ? { withdrawnHandoffs: withdrawal.handoffIds, stoppingReplacements: withdrawal.replacements, restored: withdrawal.restored }
+          : {}),
+      },
+    );
+  }
+
+  /**
+   * #246 C1-R1 — the daemon's sweep for switchovers a canonical CTO was left in: a PENDING handoff
+   * whose outgoing holder is (or became) canonical, including one a build before the preparation
+   * guard left, and a canonical holder a replacement request drained. Each project's is withdrawn
+   * in one transaction (`#withdrawCanonicalSwitchover`); then every replacement a withdrawal left
+   * ERROR — this pass's, or an earlier one's whose provider stop failed — is stopped through its
+   * provider. A provisioned CTO's switchover is not touched, and nothing is ever switched.
+   */
+  async settleCanonicalSwitchovers(): Promise<CanonicalSwitchoverSettlement> {
+    const candidates = this.db.all<{ project_id: string }>(
+      `SELECT project_id FROM handoffs WHERE kind = 'HANDOFF' AND status = 'PENDING'
+       UNION
+       SELECT a.project_id FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+         JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
+        WHERE a.role = 'PRIMARY_CTO' AND a.status = 'ACTIVE' AND s.lifecycle = 'DRAINING'
+        ORDER BY project_id`,
+    );
+    const withdrawn: CanonicalSwitchoverWithdrawal[] = [];
+    for (const { project_id: projectId } of candidates) {
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      const holder = this.#canonicalHolderOf(projectId, roleKey, this.bindings.active(roleKey));
+      if (!holder) continue;
+      const withdrawal = this.#withdrawCanonicalSwitchover(projectId, "canonical switchover sweep");
+      if (withdrawal.handoffIds.length > 0 || withdrawal.restored) withdrawn.push(withdrawal);
+    }
+    // Every replacement of a withdrawn handoff still waiting for its provider stop.
+    const pendingStops = this.db.all<{ session_id: string }>(
+      `SELECT DISTINCT h.to_session_id AS session_id
+         FROM handoffs h JOIN sessions s ON s.session_id = h.to_session_id
+        WHERE h.kind = 'HANDOFF' AND h.status = 'REJECTED' AND s.lifecycle = 'ERROR'
+        ORDER BY session_id`,
+    ).map((row) => row.session_id);
+    const stopFailed = await this.#stopWithdrawnReplacements(pendingStops, "canonical switchover withdrawn");
+    return { withdrawn, stopFailed };
+  }
+
+  /**
+   * #246 C1-R1 — the acknowledgement path's withdrawal: when `handoffId` is a PENDING normal
+   * handoff whose project's PRIMARY_CTO is canonical, withdraw that project's switchover, start the
+   * replacement's provider stop (the sweep retries one that fails), and answer the refusal. Null
+   * when the handoff is not such a one, so the acknowledgement proceeds as before.
+   *
+   * It runs before the acknowledgement is authenticated, deliberately: the withdrawal grants
+   * nothing and switches nothing, it returns the canonical holder to the state every other path
+   * already requires, so whoever names the handoff can only bring that about sooner.
+   */
+  #withdrawCanonicalHandoff(handoffId: string): Decision<RoleBinding> | null {
+    const row = this.db.get<{ project_id: string; kind: string; status: string }>(
+      `SELECT project_id, kind, status FROM handoffs WHERE handoff_id = ?`,
+      [handoffId],
+    );
+    if (!row || row.kind !== "HANDOFF" || row.status !== "PENDING") return null;
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: row.project_id });
+    const holder = this.#canonicalHolderOf(row.project_id, roleKey, this.bindings.active(roleKey));
+    if (!holder) return null;
+    const withdrawal = this.#withdrawCanonicalSwitchover(row.project_id, `handoff ${handoffId} names a canonical CTO`);
+    void this.#stopWithdrawnReplacements(withdrawal.replacements, "canonical handoff withdrawn").catch(() => undefined);
+    return this.#canonicalHandoffDenial<RoleBinding>(holder, handoffId, withdrawal);
+  }
+
+  /**
+   * #246 C1-R1 — one transaction: every PENDING normal handoff of the project is closed REJECTED;
+   * each replacement it named that holds no role is marked ERROR, its provider stop pending (a
+   * closed handoff's envelope is no longer deliverable, and ERROR fences the rest); and the active
+   * holder, if DRAINING for a switchover (`#drainIsSwitchover`, C1-R2) while its project is not
+   * suspended, is READY again. Its audit row is the reason the handoffs were closed. Only ever
+   * called for a project whose PRIMARY_CTO is canonical; the binding itself is not touched.
+   */
+  #withdrawCanonicalSwitchover(projectId: string, reason: string): CanonicalSwitchoverWithdrawal {
+    return this.db.tx(() => {
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      const pending = this.db.all<{ handoff_id: string; from_session_id: string | null; to_session_id: string }>(
+        `SELECT handoff_id, from_session_id, to_session_id FROM handoffs
+          WHERE project_id = ? AND kind = 'HANDOFF' AND status = 'PENDING'
+          ORDER BY created_at, handoff_id`,
+        [projectId],
+      );
+      const current = this.bindings.active(roleKey);
+      const holding = current ? this.sessions.get(current.sessionId) : null;
+      const draining = holding?.lifecycle === SessionLifecycle.DRAINING ? holding : null;
+      // Attributed before the handoffs below are closed: a PENDING one from the holder is evidence.
+      const switchoverDrain =
+        draining !== null &&
+        this.#drainIsSwitchover(projectId, draining.sessionId, pending.some((handoff) => handoff.from_session_id === draining.sessionId));
+      const replacements: string[] = [];
+      for (const handoff of pending) {
+        this.db.run(`UPDATE handoffs SET status = 'REJECTED' WHERE handoff_id = ? AND status = 'PENDING'`, [handoff.handoff_id]);
+        const replacement = this.sessions.get(handoff.to_session_id);
+        if (!replacement || replacement.lifecycle === SessionLifecycle.STOPPED || this.#holdsAnyRole(replacement.sessionId)) continue;
+        this.sessions.transition(replacement.sessionId, SessionLifecycle.ERROR, `${reason}: handoff withdrawn, provider stop pending`);
+        replacements.push(replacement.sessionId);
+      }
+      const restored =
+        draining !== null &&
+        switchoverDrain &&
+        this.projects.get(projectId)?.suspended !== true &&
+        this.sessions.transition(draining.sessionId, SessionLifecycle.READY, `${reason}: a canonical CTO is not replaced`).allowed;
+      const withdrawal = { projectId, handoffIds: pending.map((handoff) => handoff.handoff_id), replacements, restored };
+      if (withdrawal.handoffIds.length > 0 || restored) {
+        this.audit.record({
+          kind: "CTO_CANONICAL_SWITCHOVER_WITHDRAWN",
+          reasonCode: ReasonCode.CANONICAL_CTO_NOT_REPLACEABLE,
+          projectId,
+          sessionId: current?.sessionId ?? null,
+          roleKey,
+          evidence: { reason, ...withdrawal },
+        });
+      }
+      return withdrawal;
+    });
+  }
+
+  /**
+   * #246 C1-R2 — whether the holder's current drain is a switchover's, by positive evidence only.
+   * Three writers drain a PRIMARY_CTO session: `prepareSwitchover` (with a PENDING handoff from it),
+   * `requestReplacement` (recording CTO_REPLACEMENT_REQUESTED for it right after its drain), and
+   * `suspendProject`, whose RECOVERY package from the session is written before its drain and its
+   * provider stop and is never closed. A suspension's drain stays the suspension's until its
+   * shutdown and revocation settle, whatever resume or a switchover record says; a drain nothing
+   * here attributes — another writer's — is left alone too. A replacement record counts only if it
+   * is newer than the session's latest transition into DRAINING, so it explains that drain and not
+   * an earlier one.
+   */
+  #drainIsSwitchover(projectId: string, sessionId: string, pendingHandoffFromHolder: boolean): boolean {
+    const suspension = this.db.get<{ handoff_id: string }>(
+      `SELECT handoff_id FROM handoffs WHERE kind = 'RECOVERY' AND from_session_id = ? LIMIT 1`,
+      [sessionId],
+    );
+    if (suspension) return false;
+    if (pendingHandoffFromHolder) return true;
+    const drained = this.db.get<{ eventId: number | null }>(
+      `SELECT MAX(event_id) AS eventId FROM audit_events
+        WHERE kind = 'SESSION_LIFECYCLE' AND session_id = ? AND json_extract(evidence_json, '$.to') = ?`,
+      [sessionId, SessionLifecycle.DRAINING],
+    )?.eventId ?? null;
+    if (drained === null) return false;
+    return this.db.get<{ event_id: number }>(
+      `SELECT event_id FROM audit_events
+        WHERE kind = 'CTO_REPLACEMENT_REQUESTED' AND session_id = ? AND project_id = ? AND event_id > ?
+        LIMIT 1`,
+      [sessionId, projectId, drained],
+    ) !== undefined;
+  }
+
+  /** Provider stops for withdrawn replacements; answers the sessions the provider did not stop. */
+  async #stopWithdrawnReplacements(sessionIds: readonly string[], reason: string): Promise<string[]> {
+    const failed: string[] = [];
+    for (const sessionId of sessionIds) {
+      if (this.#holdsAnyRole(sessionId)) continue;
+      await this.stopUnusedSession(sessionId, reason);
+      if (this.sessions.get(sessionId)?.lifecycle !== SessionLifecycle.STOPPED) failed.push(sessionId);
+    }
+    return failed;
+  }
+
+  /** Whether the session holds any active role, by its recorded session or its actor's live runtime. */
+  #holdsAnyRole(sessionId: string): boolean {
+    return this.db.get<{ role_key: string }>(
+      `SELECT a.role_key FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.status = 'ACTIVE' AND (a.session_id = ? OR c.current_session_id = ?)
+        LIMIT 1`,
+      [sessionId, sessionId],
+    ) !== undefined;
   }
 
   /**
@@ -1122,16 +1505,16 @@ export class CtoLifecycle {
    * while the row said STOPPED. `handleFor` rebuilds the provider id from the incarnation, as the
    * bound-session probe already does.
    */
-  private async stopProviderSession(session: SessionRecord): Promise<void> {
-    await this.providers.requireForRole(session.provider, Role.PRIMARY_CTO).stopSession(handleFor(session));
+  private async stopProviderSession(session: SessionRecord, role: Role = Role.PRIMARY_CTO): Promise<void> {
+    await this.providers.requireForRole(session.provider, role).stopSession(handleFor(session));
   }
 
   /** A replacement that never became authoritative must not remain a live orphan. */
-  private async stopUnusedSession(sessionId: string, reason: string): Promise<void> {
+  private async stopUnusedSession(sessionId: string, reason: string, role: Role = Role.PRIMARY_CTO): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session || session.lifecycle === SessionLifecycle.STOPPED) return;
     try {
-      await this.stopProviderSession(session);
+      await this.stopProviderSession(session, role);
       this.sessions.transition(sessionId, SessionLifecycle.STOPPED, reason);
     } catch (error) {
       this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);

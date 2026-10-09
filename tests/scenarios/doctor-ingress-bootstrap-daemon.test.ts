@@ -31,11 +31,13 @@ import {
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
-import { cleanupTempDirs, gitSync, tempDir , seedActor} from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
   type Harness,
   bindCeo,
   bindWorker,
+  completeBootstrapRunUntilC3,
+  dispatchBootstrapRun,
   fixtureManifest,
   makeHarness,
   registerFixtureProject,
@@ -1050,16 +1052,13 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(noReview.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
     expect(harness.cp.projects.get("bootstrap-project")).toBeNull();
 
-    // The bootstrap run produces its own review evidence and reaches CEO review.
-    const bootstrapCto = harness.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
-    harness.cp.sessions.transition(bootstrapCto.sessionId, SessionLifecycle.READY, "test");
-    const bound = harness.cp.bootstrap.bindBootstrapCto(runId, bootstrapCto.sessionId);
-    if (!bound.allowed) throw new Error(bound.message);
-    expect(harness.cp.runs.require(runId).ownerSessionId).toBe(bootstrapCto.sessionId);
-
-    const dispatched = await harness.cp.runs.dispatch(runId);
-    if (!dispatched.allowed) throw new Error(dispatched.message);
+    // The bootstrap run produces its own review evidence and reaches CEO review. Dispatch staffs
+    // and pins its BOOTSTRAP_CTO (#246).
+    const dispatched = await dispatchBootstrapRun(harness.cp, harness.clock, runId);
+    expect(harness.cp.bindings.active(roleKeyFor(Role.BOOTSTRAP_CTO, { runId }))?.sessionId)
+      .toBe(dispatched.ownerSessionId);
     const bootstrapCandidate = recordBootstrapBlindReview(harness, runId);
+    // TODO(C2): the bootstrap review gate moves the run to CEO review; this transition stands in.
     harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "bootstrap reviewed");
 
     // The handoff is opened but not yet acknowledged, so activation is still incomplete —
@@ -1070,6 +1069,10 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(pending.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
     const handoffId = pending.evidence["pendingHandoffId"] as string;
     const primaryCto = harness.cp.bindings.activePrimaryCto("bootstrap-project")!;
+    // #246 — no promotion: activation provisioned a fresh primary CTO, not the bootstrap CTO.
+    expect(primaryCto.sessionId).not.toBe(dispatched.ownerSessionId);
+    expect((pending.evidence["activation"] as { primaryCtoBinding: { promotedFromBootstrap: boolean } })
+      .primaryCtoBinding.promotedFromBootstrap).toBe(false);
     // #330: this is a real READY session, so HANDOFF_ACK_REQUIRED proves recipient ownership
     // rather than an earlier unknown-session refusal.
     const unrelated = harness.cp.sessions.create({ provider: "scripted", model: "unrelated-cto" });
@@ -1095,7 +1098,11 @@ describe("Repo Factory boundary (CP-S52)", () => {
       ceoSessionId,
       rationale: "activation facts rechecked",
     });
-    expect(confirmed.allowed).toBe(true);
+    // Issue #246 PR-C: the bootstrap CONFIRM is shut until C3.
+    expect(confirmed.reasonCode).toBe(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
+    // TODO(C3): confirm through `submitCeoDecision` again once C3 reopens the bootstrap CONFIRM.
+    expect(completeBootstrapRunUntilC3(harness.cp, { runId, candidateSnapshotDigest: bootstrapCandidate, ceoSessionId }).allowed)
+      .toBe(true);
 
     const finalized = await harness.cp.bootstrap.activate(input);
     expect(finalized.allowed).toBe(true);
@@ -1109,7 +1116,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(JSON.stringify(stored?.content)).not.toContain("primaryCto");
   });
 
-  it("a bootstrap CTO that reviewed the run cannot be promoted", async () => {
+  it("#246: a bootstrap CTO is never promoted; its session takes no primary CTO role", async () => {
     const harness = makeHarness();
     const created = harness.cp.runs.create({
       kind: RunKind.PROJECT_BOOTSTRAP,
@@ -1117,31 +1124,16 @@ describe("Repo Factory boundary (CP-S52)", () => {
       contract: CONTRACT,
     });
     if (!created.allowed) throw new Error(created.message);
-
-    const session = harness.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
-    harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test");
-    const bound = harness.cp.bootstrap.bindBootstrapCto(created.value.runId, session.sessionId);
-    expect(bound.allowed).toBe(true);
-    expect(harness.cp.bootstrap.canPromoteBootstrapCto(created.value.runId).allowed).toBe(true);
-
-    // The same session later acted as this run's reviewer.
-    harness.cp.db.run(
-      `INSERT INTO assignments (assignment_id, role_key, role, run_id, actor_id, session_id, session_incarnation,
-                                binding_generation, mode, status, created_at)
-       VALUES ('asg_rev', ?, 'BLIND_REVIEWER', ?, ?, ?, ?, 1, 'PREFERRED', 'REVOKED', ?)`,
-      [
-        `BLIND_REVIEWER:${created.value.runId}`,
-        created.value.runId,
-        seedActor(harness.cp.db, "BLIND_REVIEWER"),
-        session.sessionId,
-        session.incarnation,
-        harness.clock.nowIso(),
-      ],
-    );
-
-    const refused = harness.cp.bootstrap.canPromoteBootstrapCto(created.value.runId);
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION);
+    const dispatched = await dispatchBootstrapRun(harness.cp, harness.clock, created.value.runId);
+    await registerFixtureProject(harness, "promotion-target");
+    const promoted = harness.cp.bindings.bind({
+      role: Role.PRIMARY_CTO,
+      projectId: "promotion-target",
+      sessionId: dispatched.ownerSessionId!,
+    });
+    expect(promoted.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
+    expect(harness.cp.bindings.activePrimaryCto("promotion-target")).toBeNull();
+    expect("canPromoteBootstrapCto" in harness.cp.bootstrap).toBe(false);
   });
 });
 

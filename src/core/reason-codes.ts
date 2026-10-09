@@ -67,6 +67,19 @@ export const ReasonCode = {
    * routes and reviews; the implementer is a separate session (#512).
    */
   WORKER_SESSION_NOT_INDEPENDENT: "WORKER_SESSION_NOT_INDEPENDENT",
+  /**
+   * A BOOTSTRAP_CTO binding named a session that holds another role, or another role named a
+   * session holding a BOOTSTRAP_CTO. A run's bootstrap CTO is its own session, never promoted and
+   * never shared with another run (issue #246, RF PRD:156).
+   */
+  BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT: "BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT",
+  /**
+   * A role with a fixed runtime (a BOOTSTRAP_CTO or a WORKER: Claude Opus) would run on another
+   * provider or model. Continuity asked to constitute one elsewhere is refused before anything
+   * starts, and the daemon pauses the run; a re-dispatch that would reuse a persisted bootstrap CTO
+   * binding on another runtime is refused, and the binding is neither reused nor replaced (C1-01).
+   */
+  ROLE_RUNTIME_SUBSTITUTION_REFUSED: "ROLE_RUNTIME_SUBSTITUTION_REFUSED",
 
   // --- CP-HI-05 Trusted GitHub Credential ---------------------------------
   TRUSTED_CREDENTIAL_UNAVAILABLE: "TRUSTED_CREDENTIAL_UNAVAILABLE",
@@ -344,6 +357,13 @@ export const ReasonCode = {
    * The run stays QUEUED and nothing but the refusal's audit row is written.
    */
   CANONICAL_CTO_AWAITING_RECLAIM: "CANONICAL_CTO_AWAITING_RECLAIM",
+  /**
+   * An ordinary handoff named a canonical CTO as its outgoing holder: preparing it, or
+   * acknowledging one already prepared (issue #246 C1-05). A canonical CTO is never swapped for a
+   * spawned replacement; its own conversation keeps the role. Nothing is spawned, drained or
+   * switched, and the original session is not stopped.
+   */
+  CANONICAL_CTO_NOT_REPLACEABLE: "CANONICAL_CTO_NOT_REPLACEABLE",
   OPERATOR_UNAUTHENTICATED: "OPERATOR_UNAUTHENTICATED",
   OPERATOR_METHOD_NOT_ALLOWED: "OPERATOR_METHOD_NOT_ALLOWED",
   /** An authenticated operator method outlived its execution budget. Not an authentication fact. */
@@ -808,6 +828,11 @@ export const ReasonCode = {
   BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT: "BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT",
   BOOTSTRAP_ACTIVATION_INCOMPLETE: "BOOTSTRAP_ACTIVATION_INCOMPLETE",
   BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION: "BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION",
+  /**
+   * A PROJECT_BOOTSTRAP CONFIRM, which would perform the run's GitHub writes, is refused until the
+   * durable application record (issue #246 PR-C slice C3) exists. Nothing is written or consumed.
+   */
+  BOOTSTRAP_APPLICATION_NOT_AVAILABLE: "BOOTSTRAP_APPLICATION_NOT_AVAILABLE",
   BOOTSTRAP_CONTRACT_DRIFT: "BOOTSTRAP_CONTRACT_DRIFT",
   BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION: "BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION",
   HERMES_BOOTSTRAP_ALREADY_INITIALIZED: "HERMES_BOOTSTRAP_ALREADY_INITIALIZED",

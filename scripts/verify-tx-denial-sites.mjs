@@ -151,6 +151,10 @@ const EXPECTED_CONVERTED_SITES = [
   { file: "cto/cto-lifecycle.ts", symbol: "suspendProject", label: "CtoLifecycle.suspendProject (prepare)", evidence: "direct" },
   { file: "daemon/finalizer.ts", symbol: "acquireAttempt", label: "DaemonFinalizer lease acquisition", evidence: "direct" },
   { file: "run/run-engine.ts", symbol: "invalidateCandidate", label: "RunEngine.invalidateCandidate", evidence: "direct" },
+  // #246 C1 — dispatch's transaction now binds a staffed BOOTSTRAP_CTO before it pins and enqueues,
+  // and can refuse after that bind (the bootstrap staffing re-check, the state edge). It was an
+  // exemption while nothing in it wrote before a returned denial; the bind is such a write.
+  { file: "run/run-engine.ts", symbol: "activateDispatched", label: "RunEngine.dispatch (bind, pin, RUN_DISPATCH)", evidence: "direct" },
   { file: "run/candidate-pipeline.ts", symbol: "acquireAttempt", label: "CandidatePipeline lease acquisition", evidence: "direct" },
   // New to this roster, not new to the tree. This site has always been a `txDecision` whose body
   // writes an audit row and can then refuse, but it reached that opener through a generic
@@ -231,17 +235,6 @@ const EXEMPT = [
       "STOPPED must survive a returned denial. The #692 compensation re-checkpoints any " +
       "CEO-resolved ACTIVE run after STOPPED before revoke; the interleaving regression " +
       "proves that resolveEscalation interleaving no longer makes revoke deny.",
-  },
-  {
-    file: "run/run-engine.ts",
-    marker: "§29/§30.3 — activation, its envelope and its audit record are one operation",
-    reason:
-      "dispatch's recordTransitionEvidence/enqueueTransitionEnvelope callbacks run inside " +
-      "Db.applyRunStateTransition, which converts either denying into a *throw* " +
-      "(`fail(...)`), not a returned Decision — a throw already rolls the whole " +
-      "transaction back via tx()'s ordinary, pre-#664 mechanism. recordDispatchBaseline's " +
-      "own denial is reached before its own write (same shared BaselineRecorder.record " +
-      "shape as below), and nothing in this body denies after the transition commits.",
   },
   {
     file: "run/run-engine.ts",

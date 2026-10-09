@@ -33,6 +33,7 @@ import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
+import { BootstrapCtoStaffing } from "../run/bootstrap-cto-staffing.ts";
 import { WORKER_TURN_PROVIDER, WorkerTurnRunner } from "../run/worker-turn.ts";
 import { WorkerStaffing } from "../run/worker-staffing.ts";
 import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter, type CliAdapterOptions } from "../runtime/cli-adapters.ts";
@@ -279,6 +280,8 @@ export class ControlPlane {
   readonly workerTurns: WorkerTurnRunner;
   /** #512 — the production path that mints a task's first WORKER binding. */
   readonly workers: WorkerStaffing;
+  /** #246 — staffs a project-less bootstrap run's BOOTSTRAP_CTO at dispatch, and reclaims it. */
+  readonly bootstrapCtos: BootstrapCtoStaffing;
   readonly runs: RunEngine;
   readonly verification: VerificationEngine;
   readonly review: BlindReviewGate;
@@ -651,6 +654,13 @@ export class ControlPlane {
         this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox,
       );
 
+      this.bootstrapCtos = new BootstrapCtoStaffing(this.db, this.audit, {
+        bindings: this.bindings,
+        sessions: this.sessions,
+        lifecycle: this.cto,
+        runs: this.runs,
+      });
+
       // Close the dependency cycles with narrow ports.
       this.runs.attach({
         cto: {
@@ -658,6 +668,7 @@ export class ControlPlane {
           isDraining: (projectId) => this.cto.isDraining(projectId),
           plannedProvider: (projectId) => this.cto.plannedProvider(projectId),
         },
+        bootstrapCto: this.bootstrapCtos,
         // The target has to survive the port: dropping it here is what made every dispatch
         // ask "is any provider healthy?" instead of "is the one this run will use healthy?".
         capacity: { refreshForDispatch: (target) => this.capacity.refreshForDispatch(target) },

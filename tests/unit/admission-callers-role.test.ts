@@ -202,10 +202,18 @@ const projectless = (role: Role = Role.BOOTSTRAP_CTO) => {
 };
 
 describe("verified projectless owner role", () => {
-  it("admits the real BOOTSTRAP_CTO binding", async () => {
-    const { h, runId } = projectless();
-    expect(await h.cp.runs.dispatch(runId)).toMatchObject({ allowed: true });
-    expect(h.cp.capacity.currentForRole("scripted", Role.BOOTSTRAP_CTO)?.allocationAdmission).toBe("OPEN");
+  it("admits the BOOTSTRAP_CTO dispatch staffs against its own role-scoped capacity", async () => {
+    // #246 — a project-less bootstrap run is no longer pinned before dispatch: dispatch staffs its
+    // BOOTSTRAP_CTO on the fixed Claude provider, and admission is asked about that role there.
+    const h = makeHarness();
+    const created = h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP,
+      executionMode: ExecutionMode.STANDARD, contract });
+    if (!created.allowed) throw new Error(created.message);
+    const claude = new TestProductionAdapter(h.clock, "claude");
+    claude.setCapacity({ ...capacity(h, "cto"), provider: "claude" });
+    h.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
+    expect(await h.cp.runs.dispatch(created.value.runId)).toMatchObject({ allowed: true });
+    expect(h.cp.capacity.currentForRole("claude", Role.BOOTSTRAP_CTO)?.allocationAdmission).toBe("OPEN");
   });
   it("does not synthesize BOOTSTRAP_CTO from a forged CEO owner pin", async () => {
     const { h, runId } = projectless(Role.CEO);

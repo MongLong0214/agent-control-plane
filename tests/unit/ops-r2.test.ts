@@ -25,6 +25,8 @@ import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
   approveReviewedCandidateForFinalization,
   bindCeo,
+  completeBootstrapRunUntilC3,
+  dispatchBootstrapRun,
   driveToReviewedCandidate,
   fixtureManifest,
   makeHarness,
@@ -166,12 +168,8 @@ const prepareBootstrap = async (harness: Harness, projectId: string) => {
     contract: CONTRACT,
   });
   if (!created.allowed) throw new Error(created.message);
-  const bootstrapCto = harness.cp.sessions.create({ provider: "scripted", model: "bootstrap" });
-  harness.cp.sessions.transition(bootstrapCto.sessionId, SessionLifecycle.READY, "test");
-  const bound = harness.cp.bootstrap.bindBootstrapCto(created.value.runId, bootstrapCto.sessionId);
-  if (!bound.allowed) throw new Error(bound.message);
-  const dispatched = await harness.cp.runs.dispatch(created.value.runId);
-  if (!dispatched.allowed) throw new Error(dispatched.message);
+  // Dispatch staffs the run's BOOTSTRAP_CTO and pins it as the owner (#246).
+  const dispatched = await dispatchBootstrapRun(harness.cp, harness.clock, created.value.runId);
   const candidateSnapshotDigestValue = recordBootstrapBlindReview(harness, created.value.runId);
   harness.cp.runs.transition(created.value.runId, RunState.READY_FOR_CEO_REVIEW, "reviewed");
   const plan = {
@@ -189,7 +187,7 @@ const prepareBootstrap = async (harness: Harness, projectId: string) => {
     runId: created.value.runId,
     plan,
     candidateSnapshotDigest: candidateSnapshotDigestValue,
-    bootstrapCtoSessionId: bootstrapCto.sessionId,
+    bootstrapCtoSessionId: dispatched.ownerSessionId!,
   };
 };
 
@@ -436,7 +434,15 @@ describe("round-2 ops regressions", () => {
       ceoSessionId,
       rationale: "finalize only after recheck",
     });
-    expect(confirmed.allowed).toBe(true);
+    // Issue #246 PR-C: the bootstrap CONFIRM is shut until C3.
+    expect(confirmed.reasonCode).toBe(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
+    // TODO(C3): confirm through `submitCeoDecision` again once C3 reopens the bootstrap CONFIRM.
+    const completed = completeBootstrapRunUntilC3(harness.cp, {
+      runId: prepared.runId,
+      candidateSnapshotDigest: prepared.candidateSnapshotDigest,
+      ceoSessionId,
+    });
+    expect(completed.allowed).toBe(true);
     expect(harness.cp.artifacts.latest<{ ceoConfirm?: { decision?: string } }>(
       prepared.runId,
       "BOOTSTRAP_ACTIVATION_RESULT",

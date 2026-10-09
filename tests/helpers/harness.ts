@@ -1,6 +1,6 @@
 import { join } from "node:path";
 
-import { ManualClock } from "../../src/core/clock.ts";
+import { type Clock, ManualClock } from "../../src/core/clock.ts";
 import { ControlPlane, type ControlPlaneConfig } from "../../src/app/control-plane.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -14,6 +14,7 @@ import type { GitHubClient, GitHubKernelOptions } from "../../src/github/github-
 import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
 import type { BaselineHarnessInput } from "../../src/export/baseline-contract.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
+import type { RunRow } from "../../src/domain/types.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import type { ManagedManifestWrite } from "../../src/registry/project-registry.ts";
@@ -291,6 +292,55 @@ export const makeStartedOperator = async (options: {
     },
   };
 };
+
+const BOOTSTRAP_CTO_DOUBLES = new WeakMap<ControlPlane, TestProductionAdapter>();
+
+/**
+ * Issue #246 — the Claude double a run's BOOTSTRAP_CTO is staffed on, registered for that role
+ * alone: the bootstrap CTO's provider is fixed to Claude (Opus), so a fixture supplies a Claude
+ * adapter rather than pointing staffing at the scripted one. Registered once per control plane.
+ */
+export const bootstrapCtoProvider = (cp: ControlPlane, clock: Clock): TestProductionAdapter => {
+  const existing = BOOTSTRAP_CTO_DOUBLES.get(cp);
+  if (existing) return existing;
+  const claude = new TestProductionAdapter(clock, "claude");
+  cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
+  BOOTSTRAP_CTO_DOUBLES.set(cp, claude);
+  return claude;
+};
+
+/**
+ * A project-less PROJECT_BOOTSTRAP run dispatched the way production dispatches it: dispatch
+ * staffs and pins its BOOTSTRAP_CTO. Replaces the deleted test-only `bindBootstrapCto`.
+ */
+export const dispatchBootstrapRun = async (cp: ControlPlane, clock: Clock, runId: string): Promise<RunRow> => {
+  bootstrapCtoProvider(cp, clock);
+  const dispatched = await cp.runs.dispatch(runId);
+  if (!dispatched.allowed) throw new Error(`bootstrap dispatch refused: ${dispatched.reasonCode}: ${dispatched.message}`);
+  return dispatched.value;
+};
+
+/**
+ * TODO(C3): issue #246 slice C3 reopens the bootstrap CONFIRM. Until then every CONFIRM door refuses
+ * it `BOOTSTRAP_APPLICATION_NOT_AVAILABLE`, so a fixture that needs a COMPLETED bootstrap run does
+ * what that CONFIRM's transaction does — `finalizeBootstrapActivationConfirm`, then COMPLETED under
+ * the bootstrap-activation authority — in one transaction, and names itself. Delete with the guard.
+ */
+export const completeBootstrapRunUntilC3 = (
+  cp: ControlPlane,
+  input: { runId: string; candidateSnapshotDigest: string; ceoSessionId: string },
+) =>
+  cp.db.txDecision(() => {
+    const finalized = cp.bootstrap.finalizeBootstrapActivationConfirm({ ...input, confirmedAt: cp.clock.nowIso() });
+    if (!finalized.allowed) return finalized;
+    return cp.runs.transition(
+      input.runId,
+      RunState.COMPLETED,
+      "CEO CONFIRM (fixture, until C3)",
+      { candidateSnapshotDigest: input.candidateSnapshotDigest },
+      cp.completionAuthoritiesForTests().bootstrapActivation,
+    );
+  });
 
 /**
  * Fixtures model a real worker as its own READY session with the task-scoped binding that

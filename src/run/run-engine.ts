@@ -121,6 +121,28 @@ export interface CtoProvisioner {
   plannedProvider(projectId: string): string | null;
 }
 
+/**
+ * Issue #246 — staffing a project-less PROJECT_BOOTSTRAP run's `BOOTSTRAP_CTO(run)`, which the run
+ * engine only asks for (`BootstrapCtoStaffing` answers). Dispatch calls `admit` before capacity,
+ * `ensure` after it, and `bindForDispatch` inside the transaction that pins the owner; a terminal
+ * transition calls `release` in its own transaction.
+ */
+export interface BootstrapCtoProvisioner {
+  /** The fixed provider a fresh bootstrap CTO is constituted on, for dispatch admission. */
+  readonly provider: string;
+  admit(run: RunRow): Decision<RoleBinding | null>;
+  ensure(runId: string): Promise<Decision<BootstrapCtoStaffedSession>>;
+  bindForDispatch(runId: string, staffed: BootstrapCtoStaffedSession): Decision<RoleBinding>;
+  discard(staffed: BootstrapCtoStaffedSession, reason: string): Promise<void>;
+  release(runId: string, reason: string): void;
+}
+
+/** A session `ensure` staffed: freshly spawned and unbound, or the live binding it reuses. */
+export interface BootstrapCtoStaffedSession {
+  sessionId: string;
+  reused: RoleBinding | null;
+}
+
 /** §14.2 — capacity must be refreshed before dispatch admission. */
 export interface CapacityGate {
   refreshForDispatch(target?: DispatchCapacityTarget): Promise<Decision<void>>;
@@ -160,6 +182,7 @@ export class RunEngine {
   readonly #stateTransitions: RunStateTransitionAuthority;
 
   #cto: CtoProvisioner | null = null;
+  #bootstrapCto: BootstrapCtoProvisioner | null = null;
   #capacity: CapacityGate | null = null;
   #continuity: ContinuityGate | null = null;
   readonly #baseline: BaselineRecorder;
@@ -186,16 +209,29 @@ export class RunEngine {
   /** Wired after construction because the CTO lifecycle also needs the run engine. */
   attach(ports: {
     cto?: CtoProvisioner;
+    bootstrapCto?: BootstrapCtoProvisioner;
     capacity?: CapacityGate;
     continuity?: ContinuityGate;
   }): void {
     if (ports.cto) this.#cto = ports.cto;
+    if (ports.bootstrapCto) this.#bootstrapCto = ports.bootstrapCto;
     if (ports.capacity) this.#capacity = ports.capacity;
     if (ports.continuity) this.#continuity = ports.continuity;
   }
 
   create(input: CreateRunInput): Decision<RunRow> {
     const kind = input.kind ?? RunKind.STANDARD_WORK;
+    // RF PRD:360 — a PROJECT_BOOTSTRAP run creates its project, so it names none and joins no
+    // repository; its owner is the BOOTSTRAP_CTO dispatch staffs. Refused before anything is stored:
+    // a project here would aim the run's activation at an existing project, whose refusal comes
+    // only after the GitHub writes (#246).
+    if (kind === RunKind.PROJECT_BOOTSTRAP && (input.projectId || (input.repositories?.length ?? 0) > 0)) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "a PROJECT_BOOTSTRAP run names no project and joins no repository", {
+        refusal: input.projectId ? "BOOTSTRAP_PROJECT_SUPPLIED" : "BOOTSTRAP_REPOSITORIES_SUPPLIED",
+        projectId: input.projectId ?? null,
+        repositories: input.repositories?.length ?? 0,
+      });
+    }
     const humanGate = deriveHumanGate({
       executionMode: input.executionMode,
       goal: input.contract.goal,
@@ -331,7 +367,16 @@ export class RunEngine {
     }
 
     let binding: RoleBinding | null = null;
-    if (run.projectId) {
+    // Issue #246 — a project-less PROJECT_BOOTSTRAP run's owner is the BOOTSTRAP_CTO this dispatch
+    // staffs: a live binding a re-dispatch reuses, or a fresh one. Refusals that need no provider
+    // (an earlier holder, a foreign pin) come before capacity, as a pinned owner's do.
+    const staffsBootstrapCto = !run.projectId && run.kind === RunKind.PROJECT_BOOTSTRAP;
+    if (staffsBootstrapCto) {
+      if (!this.#bootstrapCto) return deny(ReasonCode.INTERNAL_ERROR, "no bootstrap CTO staffing attached", { runId });
+      const admitted = this.#bootstrapCto.admit(run);
+      if (!admitted.allowed) return admitted as Decision<RunRow>;
+      binding = admitted.value;
+    } else if (run.projectId) {
       if (this.#cto?.isDraining(run.projectId)) {
         // §10.1 — a replacement is under way; the run stays QUEUED rather than being
         // handed to a CTO that is on its way out.
@@ -378,10 +423,49 @@ export class RunEngine {
       binding = provisioned.value;
     }
 
-    return this.db.tx(() => {
+    // §9.5 / RF PRD:156 — the bootstrap CTO is constituted only after its provider passed
+    // admission: spawned fresh (launch credential → Buzz → probe → READY → readiness), or the
+    // reused binding probed live. Binding, pinning and RUN_DISPATCH are then one transaction.
+    let staffed: BootstrapCtoStaffedSession | null = null;
+    if (staffsBootstrapCto) {
+      const ensured = await this.#bootstrapCto!.ensure(runId);
+      if (!ensured.allowed) return ensured as Decision<RunRow>;
+      staffed = ensured.value;
+    }
+
+    let activated: Decision<RunRow>;
+    try {
+      activated = this.activateDispatched(runId, binding, staffed);
+    } catch (error) {
+      if (staffed) await this.#bootstrapCto!.discard(staffed, "bootstrap dispatch failed");
+      throw error;
+    }
+    if (!activated.allowed && staffed) {
+      await this.#bootstrapCto!.discard(staffed, `bootstrap dispatch refused: ${activated.reasonCode}`);
+    }
+    return activated;
+  }
+
+  /**
+   * The dispatch transaction: re-check, bind a staffed bootstrap CTO, pin the owner, then
+   * RUN_DISPATCH. A denial after the bind rolls the bind back with everything else.
+   */
+  private activateDispatched(
+    runId: string,
+    provisioned: RoleBinding | null,
+    staffed: BootstrapCtoStaffedSession | null,
+  ): Decision<RunRow> {
+    return this.db.txDecision(() => {
       const fresh = this.require(runId);
       const transition = canTransition(fresh.state, RunState.ACTIVE);
       if (!transition.allowed) return transition as Decision<RunRow>;
+
+      let binding = provisioned;
+      if (staffed) {
+        const bound = this.#bootstrapCto!.bindForDispatch(runId, staffed);
+        if (!bound.allowed) return bound as Decision<RunRow>;
+        binding = bound.value;
+      }
 
       // A caller may pin a manifest while QUEUED. That immutable pin is the dispatch
       // contract; the current project manifest is used only when no pin exists yet.
@@ -534,9 +618,14 @@ export class RunEngine {
    * rather than as a targetless capacity probe.
    */
   private dispatchCapacityTarget(run: RunRow, binding: RoleBinding | null): Decision<DispatchCapacityTarget | null> {
+    // A bootstrap run staffing a fresh CTO is admitted against the fixed bootstrap provider; one
+    // that reuses its live binding, against that binding's session.
+    const freshBootstrapCto = !run.projectId && run.kind === RunKind.PROJECT_BOOTSTRAP && !binding;
     const provider = run.projectId
       ? (this.#cto?.plannedProvider(run.projectId) ?? null)
-      : this.providerOfPinnedOwner(run.ownerSessionId);
+      : freshBootstrapCto
+        ? (this.#bootstrapCto?.provider ?? null)
+        : this.providerOfPinnedOwner(binding?.boundSessionId ?? run.ownerSessionId);
     if (!provider) return allow(ReasonCode.OK, null);
     let scoped = false;
     if (this.providerScope) {
@@ -552,7 +641,9 @@ export class RunEngine {
     // that exists to protect it (§14.5).
     return allow(ReasonCode.OK, {
       provider, capabilities: [CTO_CAPABILITY], priority: "critical",
-      ...(scoped ? { role: run.projectId ? Role.PRIMARY_CTO : binding!.role } : {}),
+      ...(scoped
+        ? { role: run.projectId ? Role.PRIMARY_CTO : freshBootstrapCto ? Role.BOOTSTRAP_CTO : binding!.role }
+        : {}),
     });
   }
 
@@ -714,6 +805,9 @@ export class RunEngine {
       void applied;
 
       if (terminal) {
+        // Issue #246 — a bootstrap run that ends (CONFIRM → COMPLETED, cancel, fail) gives back its
+        // BOOTSTRAP_CTO in this same transaction; the daemon's reclaim sweep stops the session.
+        if (run.kind === RunKind.PROJECT_BOOTSTRAP) this.#bootstrapCto?.release(runId, `run ${to}`);
         this.claims.releaseRun(runId);
         const durationMs =
           new Date(this.clock.nowIso()).getTime() - new Date(run.createdAt).getTime();

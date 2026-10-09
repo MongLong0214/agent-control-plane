@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
-import { fixtureManifest, makeHarness } from "../helpers/harness.ts";
+import { dispatchBootstrapRun, fixtureManifest, makeHarness } from "../helpers/harness.ts";
 import { applyPassingChange } from "../helpers/harness.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { stableFixtureExecutable } from "../helpers/stable-fixture-executable.ts";
@@ -13,7 +13,7 @@ import { assertPortableManifest, manifestDigest } from "../../src/contracts/mani
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow } from "../../src/core/errors.ts";
-import { ExecutionMode, RunKind, SessionLifecycle } from "../../src/domain/types.ts";
+import { ExecutionMode, RunKind } from "../../src/domain/types.ts";
 import {
   buildCandidateSnapshot,
   candidateSnapshotDigest,
@@ -745,26 +745,28 @@ exec /bin/ps "$@"
     const temporaryPath = makeRepo();
     const temporary = await temporaryHarness.cp.repositories.registerTemporary(temporaryPath, "other-run");
     if (!temporary.allowed) throw new Error(temporary.message);
+    // A PROJECT_BOOTSTRAP run joins no repository at creation (#246); its dispatched owner
+    // attaches the temporary one, as the bootstrap CTO does.
     const temporaryRun = temporaryHarness.cp.runs.create({
       kind: RunKind.PROJECT_BOOTSTRAP,
       executionMode: ExecutionMode.SIMPLE,
       contract,
-      repositories: [{ repositoryId: temporary.value.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
     });
     if (!temporaryRun.allowed) throw new Error(temporaryRun.message);
-    const bootstrapCto = temporaryHarness.cp.sessions.create({ provider: "scripted", model: "temporary-run-owner" });
-    temporaryHarness.cp.sessions.transition(bootstrapCto.sessionId, SessionLifecycle.READY, "test bootstrap owner");
-    const bound = temporaryHarness.cp.bootstrap.bindBootstrapCto(
-      temporaryRun.value.runId,
-      bootstrapCto.sessionId,
-    );
-    if (!bound.allowed) throw new Error(bound.message);
-    const dispatched = await temporaryHarness.cp.runs.dispatch(temporaryRun.value.runId);
-    if (!dispatched.allowed) throw new Error(dispatched.message);
+    const owner = await dispatchBootstrapRun(temporaryHarness.cp, temporaryHarness.clock, temporaryRun.value.runId);
+    const attached = temporaryHarness.cp.runs.attachRepository(temporaryRun.value.runId, {
+      repositoryId: temporary.value.repositoryId,
+      repositoryRole: "primary",
+      baseBranch: "dev",
+      ownerSessionId: owner.ownerSessionId!,
+      ownerBindingGeneration: owner.ownerBindingGeneration!,
+    });
+    if (!attached.allowed) throw new Error(attached.message);
+    const dispatched = temporaryHarness.cp.runs.require(temporaryRun.value.runId);
     const temporarySnapshot = await buildCandidateSnapshot(
       {
-        runId: dispatched.value.runId,
-        contractDigest: dispatched.value.contractDigest,
+        runId: dispatched.runId,
+        contractDigest: dispatched.contractDigest,
         repositories: [{
           identity: temporary.value.identity,
           repositoryRole: "primary",
@@ -776,10 +778,10 @@ exec /bin/ps "$@"
       temporaryHarness.clock,
     );
     const crossRun = await temporaryHarness.cp.verification.verify({
-      runId: dispatched.value.runId,
+      runId: dispatched.runId,
       snapshot: temporarySnapshot,
       commands: [parseVerificationCommand({ id: "temporary", argv: ["node", "-e", "0"] })],
-      contractDigest: dispatched.value.contractDigest,
+      contractDigest: dispatched.contractDigest,
       runScoped: true,
     });
     expect(crossRun).toEqual({
@@ -787,7 +789,7 @@ exec /bin/ps "$@"
       reasonCode: ReasonCode.VERIFICATION_GAP,
       message: "temporary repository is bound to a different run",
       evidence: {
-        runId: dispatched.value.runId,
+        runId: dispatched.runId,
         identity: temporary.value.identity,
         temporaryForRun: "other-run",
       },

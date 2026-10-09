@@ -1161,9 +1161,10 @@ describe("ACP1069-R1-02: a WORKER and another role never share a session, in eit
         .toBe(ReasonCode.OK);
       // A binary before this check let a WORKER reuse the CTO's actor. Reproduce that state with the
       // check stood down for this one write (a binary without the check needs no stand-down), then restore it.
-      const registry = f.harness.cp.bindings as unknown as { assertWorkerSeparation?: () => unknown };
-      const legacy = registry.assertWorkerSeparation
-        ? vi.spyOn(registry as { assertWorkerSeparation: () => unknown }, "assertWorkerSeparation")
+      // #246 generalised the check to every exclusive role and renamed it.
+      const registry = f.harness.cp.bindings as unknown as { assertExclusiveRoleSeparation?: () => unknown };
+      const legacy = registry.assertExclusiveRoleSeparation
+        ? vi.spyOn(registry as { assertExclusiveRoleSeparation: () => unknown }, "assertExclusiveRoleSeparation")
           .mockReturnValue({ allowed: true, reasonCode: ReasonCode.OK, evidence: {}, value: undefined })
         : null;
       // #512 PR-B: from schema v41 the database refuses that state too, so the same write also needs the
