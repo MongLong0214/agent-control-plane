@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import Database from "better-sqlite3";
@@ -20,8 +20,20 @@ import { makeHarness } from "./harness.ts";
  * can be released at once, then publishes `<state>/<id>.result` and stays alive until
  * `<state>/<id>.exit`. While alive it answers `<state>/<id>.ask-<n>` files: `held` reports whether
  * its lock is held, `second-connection` opens and closes another SQLite connection to the lock file.
+ *
+ * Narrow liveness: `<state>/<id>.go` releases one process alone, and `<state>/<id>.entering` is
+ * published the moment an acquisition begins. `shared` takes only the SHARED lock a contender holds
+ * inside its own `BEGIN EXCLUSIVE`, before it asks for RESERVED, and keeps it until asked `release`.
+ *
+ *   <state> <id> contend <lock path> <watched pid>
+ *
+ * `contend` is a competing start in its own process: the real acquisition of the lock at `<lock
+ * path>`, asked again and again until `<state>/<id>.stop`. Each ask notes whether the watched process
+ * was alive before it, and a lock it is granted is kept only while it asks once more whether that
+ * process is alive, then given back; every ask is published to `<state>/<id>.attempts`.
+ * `<state>/<id>.ready` is published once a process is loaded and waiting for its go.
  */
-const [state, id, mode] = process.argv.slice(2) as [string, string, string];
+const [state, id, mode, lockPathArgument, watchedArgument] = process.argv.slice(2) as [string, string, string, string?, string?];
 const publish = (name: string, value: unknown): void => {
   writeFileSync(join(state, `${name}.tmp`), JSON.stringify(value));
   renameSync(join(state, `${name}.tmp`), join(state, name));
@@ -30,8 +42,18 @@ const until = async (condition: () => boolean): Promise<void> => {
   while (!condition()) await new Promise((resolve) => setTimeout(resolve, 5));
 };
 
-const lockPath = join(state, "agentcpd.lock");
+const lockPath = lockPathArgument ?? join(state, "agentcpd.lock");
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
 let lock: SingleInstanceLock;
+/** `shared` mode's connection, held in a cell: it is assigned inside `start`, after the module's own flow. */
+const shared: { db: Database.Database | null } = { db: null };
 let start: () => Promise<{ allowed: boolean; reasonCode: string; message?: string }>;
 if (mode === "lock") {
   lock = new SingleInstanceLock(lockPath);
@@ -49,6 +71,47 @@ if (mode === "lock") {
     } finally {
       raw.close();
     }
+  };
+} else if (mode === "shared") {
+  // A contender's state inside its `BEGIN EXCLUSIVE` at the step the diagnosed schedule needs: SHARED
+  // granted, RESERVED not yet asked for. A deferred read transaction holds exactly that lock.
+  lock = new SingleInstanceLock(lockPath);
+  start = async () => {
+    try {
+      closeSync(openSync(lock.lockDatabasePath, "wx", 0o600));
+    } catch {
+      /* it exists */
+    }
+    // Reported as `raw` reports its own SQLite step: OK once the lock is held, SQLite's code if not.
+    // The lock it holds is SHARED; that is the mode's name, never a reason code.
+    const db = new Database(lock.lockDatabasePath, { timeout: 0 });
+    shared.db = db;
+    try {
+      db.exec("BEGIN");
+      db.prepare("SELECT count(*) FROM sqlite_master").get();
+      return { allowed: db.inTransaction, reasonCode: "OK" };
+    } catch (error) {
+      return { allowed: false, reasonCode: (error as { code?: string }).code ?? "UNKNOWN" };
+    }
+  };
+} else if (mode === "contend") {
+  lock = new SingleInstanceLock(lockPath);
+  start = async () => {
+    const watched = Number(watchedArgument);
+    const attempts: Array<{ at: number; aliveBefore: boolean; taken: boolean; aliveWhileHeld: boolean | null }> = [];
+    while (!existsSync(join(state, `${id}.stop`))) {
+      const at = Date.now();
+      const aliveBefore = isAlive(watched);
+      const taken = lock.acquire(new Date(at).toISOString()).allowed;
+      // Asked while this process still holds what it was granted, so an answer of alive is a
+      // successor holding the lock while the watched process lives, whenever that process ends.
+      const aliveWhileHeld = taken ? isAlive(watched) : null;
+      if (taken) lock.release();
+      attempts.push({ at, aliveBefore, taken, aliveWhileHeld });
+      publish(`${id}.attempts`, attempts);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return { allowed: true, reasonCode: "OK" };
   };
 } else {
   mkdirSync(join(state, `${id}-root`), { recursive: true, mode: 0o700 });
@@ -75,6 +138,7 @@ if (mode === "lock") {
 // other process does meanwhile, it does while this one holds.
 const acquire = lock.acquire.bind(lock);
 lock.acquire = (startedAt: string) => {
+  publish(`${id}.entering`, { pid: process.pid });
   const decision = acquire(startedAt);
   if (mode === "daemon") {
     publish(`${id}.result`, { pid: process.pid, allowed: decision.allowed, reasonCode: decision.reasonCode, held: lock.held() });
@@ -89,7 +153,8 @@ lock.acquire = (startedAt: string) => {
   return decision;
 };
 
-await until(() => existsSync(join(state, "go")));
+publish(`${id}.ready`, { pid: process.pid });
+await until(() => existsSync(join(state, "go")) || existsSync(join(state, `${id}.go`)));
 const returned = await start().then((decision) => ({ allowed: decision.allowed, reasonCode: decision.reasonCode, held: lock.held() }));
 publish(mode === "daemon" ? `${id}.started` : `${id}.result`, { pid: process.pid, ...returned });
 
@@ -117,6 +182,12 @@ while (!existsSync(join(state, `${id}.exit`))) {
       const { closeSync, openSync } = await import("node:fs");
       closeSync(openSync(lock.lockDatabasePath, "r"));
       answer = "closed";
+    }
+    if (question === "release" && shared.db !== null) {
+      shared.db.exec("ROLLBACK");
+      shared.db.close();
+      shared.db = null;
+      answer = "released";
     }
     publish(`${id}.answer-${answered}`, { question, answer });
     answered += 1;

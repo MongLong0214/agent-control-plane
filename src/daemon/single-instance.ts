@@ -42,9 +42,10 @@ export interface LockInfo {
  * #1070 ACP-WORKER-03-LOCK (narrow review 5): the lock is an open exclusive SQLite transaction on a
  * dedicated database beside the holder record, `<lock>.db`, held by one connection for the holder's
  * lifetime. The operating system answers who holds it: a second process's `BEGIN EXCLUSIVE` is
- * SQLITE_BUSY until the holder's connection closes or the holder exits, by any means, SIGKILL
- * included. Nothing is reclaimed by unlinking a path, which let two reclaimers each delete the
- * other's lock and both hold it. The lock file itself is never deleted or replaced by this code.
+ * SQLITE_BUSY, after a bounded wait (`LOCK_WAIT_MS`), until the holder's connection closes or the
+ * holder exits, by any means, SIGKILL included. Nothing is reclaimed by unlinking a path, which let
+ * two reclaimers each delete the other's lock and both hold it. The lock file itself is never
+ * deleted or replaced by this code.
  *
  * `<lock>` is no longer the authority. It is the holder's directory, holding its record
  * `<lock>/holder.json` — pid, start, OS start token — written only by the process holding the lock,
@@ -649,13 +650,35 @@ type Taken =
   | { ok: false; busy: boolean; code: string };
 
 /**
- * Opens the lock database and takes its exclusive lock, or answers who has it. `timeout: 0` makes a
- * held lock an immediate SQLITE_BUSY. `BEGIN EXCLUSIVE` in rollback-journal mode takes the
+ * How long one `BEGIN EXCLUSIVE` waits, through SQLite's busy handler, for the locks other
+ * connections hold on the lock file to go before it answers SQLITE_BUSY.
+ *
+ * Narrow liveness: `BEGIN EXCLUSIVE` climbs SHARED, RESERVED, PENDING, EXCLUSIVE, so every contender
+ * holds SHARED for a moment, and EXCLUSIVE is granted only once no SHARED lock stands. Two starts at
+ * once, traced fcntl call by fcntl call, with no wait: both were granted SHARED, one RESERVED; the
+ * other, refused RESERVED, still held its SHARED lock when the first asked for EXCLUSIVE, so the
+ * first was refused too, and neither held. With this wait the one holding RESERVED and PENDING keeps
+ * them and asks again, while every other contender, refused, lets its SHARED lock go before it
+ * waits; PENDING admits no new SHARED lock, so the first is granted EXCLUSIVE as soon as those few
+ * have gone. Its cost: a process refused because the lock is held answers after this wait, not at
+ * once. Its limit: a SHARED lock held for longer than this wait, by a reader of the lock file rather
+ * than a contender, still refuses the start; nothing in this build reads that file.
+ */
+const LOCK_WAIT_MS = 1_000;
+
+/**
+ * Opens the lock database and takes its exclusive lock, or answers who has it: a held lock is
+ * SQLITE_BUSY once `LOCK_WAIT_MS` has passed. `BEGIN EXCLUSIVE` in rollback-journal mode takes the
  * operating-system lock before it returns, so the lock counts as taken only once that statement has
  * succeeded and the connection reports the transaction open. The lock lasts exactly as long as that
- * transaction: nothing is ever written, so `locking_mode = EXCLUSIVE` does not keep it once the
- * transaction ends (measured: a ROLLBACK alone releases it), and only `release()` ends it. The file
- * locked is then tied to the path: the path's identity must be one this process has open.
+ * transaction, and only `release()` ends it. The file locked is then tied to the path: the path's
+ * identity must be one this process has open.
+ *
+ * The connection uses the normal locking mode. Rejected (narrow liveness): `locking_mode =
+ * EXCLUSIVE`, under which a connection keeps every lock it took until it is closed, a failed
+ * `BEGIN EXCLUSIVE` included. Measured: with no wait, a contender refused RESERVED kept the SHARED
+ * lock that refused the other start EXCLUSIVE; with this wait added and that mode kept, one race in
+ * ten still ended with each contender keeping the lock the other waited for, until both gave up.
  */
 const takeExclusive = (path: string): Taken => {
   let db: Database.Database | undefined;
@@ -674,8 +697,7 @@ const takeExclusive = (path: string): Taken => {
     /* it exists; it is never opened here otherwise */
   }
   try {
-    db = new Database(path, { timeout: 0 });
-    db.pragma("locking_mode = EXCLUSIVE");
+    db = new Database(path, { timeout: LOCK_WAIT_MS });
     db.exec("BEGIN EXCLUSIVE");
   } catch (error) {
     close();
