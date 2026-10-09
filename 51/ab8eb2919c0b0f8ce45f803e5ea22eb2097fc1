@@ -1,0 +1,180 @@
+Limit: a peer message's admission proof is immutable evidence that names the receiving CTO session and generation, so a same-conversation restart cannot rewrite it; the hand-over instead accepts one durable same-actor succession hop proven from assignments and the self-claim's DEAD_BINDING_RECOVERED record
+Warn: only the self-claim's same-actor dead-predecessor recovery holds and carries PENDING peer messages; every other revoke path (operator door, takeover, continuity, CEO) still rejects identity-bound rows, and OUTBOX_RETARGETED on a peer row now also marks a same-conversation carry
+Record-Id: r-peercarry
+Provenance: inherited db17a17058d40cda44dea88642f9b0c0f4a92d8c
+
+Limit: the repository treats raw database writers as in scope, so same-actor succession for a carried peer message is proven only by an append-only peer_message_carries record whose INSERT requires the connection-local carry authority minted inside the claim transaction; the OUTBOX_RETARGETED mark and audit actor strings are not evidence
+Limit: the carry follows the CEO decision of 2026-10-03 19:28Z: only an unclaimed PENDING message, never attempted, sent, claimed or receipted, for the same actor, conversation UUID and signer with DEAD_BINDING_RECOVERED continuity, carried once; already-REJECTED rows are never revived
+Warn: src/db/migrations.ts changed for v40, so its frozen pin must be confirmed by the CEO before the pin test is updated; deploying needs an approved v39 to v40 migration
+Record-Id: r-peercarryv40
+Follows: r-peercarry
+Provenance: inherited 7c750ff06c7c78eff174ea751e064e4850e4ef8f
+
+Limit: the v40 src/db/migrations.ts pin is the digest the CEO computed independently from GitHub for 7c750ff0 (sha256 885e15de..., blob ec13ae15...), approved for those exact bytes only; it is void if the source changes
+Warn: do not recompute this pin from the file in a later change; the next digest must again come from the independent authority
+Record-Id: r-pinv40confirm
+Follows: r-peercarryv40
+Provenance: inherited eb1ac4329b2a376c350050d8babba36cfa4555d3
+
+Limit: the carry record now binds the admitted source payload digest and the hand-over compares the admitted row's bytes against it, because the outbox pointer digest stays raw-writable (finding 01 is not addressed here; its scope is with the CEO)
+Warn: fences that reject an identity-bound peer message keep an existing settled receipt exactly as it was (keepSettled) and owe the sender a notice in peer_message_refusal_notices; the holder's own complete or reject still refuses a settled turn
+Warn: src/db/migrations.ts changed again, so the CEO-confirmed pin 885e15de is void; the new digest must be confirmed by the CEO before the pin test is updated
+Record-Id: r-peercarryv40r1
+Follows: r-pinv40confirm
+Provenance: inherited c706cb5d139ad1cb8d75161e556030df61f402ab
+
+Limit: raw SQL writers are inside this repository's threat model, so finding 01 is closed here rather than split off: a trigger records every outbox row that leaves PENDING in the append-only holder_message_departures ledger, and holder claim, retarget and carry refuse a departed message; a protected lifecycle ledger for the whole outbox is not built
+Ruled-out: dropping a departed row from claimForHolder's SELECT | it is reported as withheld instead, because the existing witness for a raw-reverted row expects withheld
+Warn: holder_message_departures is append-only and never pruned: it gains one row per outbox message of any kind that ever leaves PENDING
+Warn: outbox.message_id is now immutable (OUTBOX_MESSAGE_ID_IMMUTABLE); code that renames an outbox row will be refused
+Warn: a privileged writer can still DROP TRIGGER the departure trigger or the ledger guards, the residual every trigger in this schema carries
+Warn: src/db/migrations.ts changed again, so the frozen pin stays void until the CEO computes the final head's bytes independently
+Record-Id: r-peercarryv40r2
+Follows: r-peercarryv40r1
+Provenance: inherited c421f07eba44ea6ded6a550923d9260c82b1dd4c
+
+Limit: a WORKER turn is stateless: the runtime seatbelt denies the CLI's transcript writes under ~/.claude, so a later turn on the same session remembers nothing; one turn per task is the supported shape
+Ruled-out: an empty setting-source list for WORKER turns | it would also drop the repository's CLAUDE.md, so the self-grant path through .claude settings is closed by a runner rule instead
+Warn: WORKER turns run with --setting-sources project,local and a strict empty MCP config; only invocations carrying a managed write get these flags, so reviewer and read-only turns are unchanged
+Warn: a WORKER turn whose change touches any .claude path or the root .mcp.json fails out of scope and is not committed, even when the claim owns those paths; ignored files there are checked before and after the turn
+Warn: a retry never resets the worktree: every attempt must start from a clean worktree on the claim branch with no unidentified orphan alive, otherwise it is refused
+Record-Id: r-workerrun
+Provenance: inherited a07e685b53efc10a0f56b7939fcfaec8ac1e5948
+
+Limit: control-plane git calls after a WORKER turn pin GIT_DIR and the work tree from the registered repository, disable hooks, fsmonitor, filters, external diff and helpers, and refuse the turn if the .git indirection, effective config or git-dir fingerprint changed; another writer in the git dir during a turn therefore fails it with GIT_DIR_CHANGED
+Warn: a worker process's pid and start token are recorded only under an authority minted in the runner's onSpawn for that exact execution, and released only after the runner confirms it gone; a kill also requires the live command line to carry this execution's --session-id, otherwise the process is left outstanding and blocks its task
+Warn: seatbelt tests skip with a reason, or fail under ACP_REQUIRE_SEATBELT=1, when a deny-rule profile cannot apply; a bare (allow default) probe applies even inside another sandbox and must not be used to decide confinement
+Record-Id: r-workerrunr1
+Follows: r-workerrun
+Provenance: inherited 1577a51725ea37ea71ca6eed9808383dc69e3fef
+
+Limit: WORKER turns refuse any checked-out submodule, clean or dirty, and fail a turn that writes inside, replaces or nests a gitlink; a gitlink is accepted only when nothing is checked out at its path
+Warn: the commit takes the real index.lock exclusively, re-checks the staged-content fence (ls-files -s -v, not the stat cache) under it, and replaces the index only with the committed paths updated; a writer that ignores index.lock is outside what the lock can stop
+Warn: shutdown counts pending admissions from their first step and refuses each one after preparation, at the execution gate and before launch; drain is complete only when admissions and running turns are both zero
+Record-Id: r-workerrunr2
+Follows: r-workerrunr1
+Provenance: inherited 597da0608e95ffbfa08a7940ac1630dace0f86f4
+
+Limit: a WORKER turn's irreversible steps read a live authority fence at the moment they act: before the branch moves (under the index lock, nothing awaited before the ref update) and as the first statement of the success transaction; on a drain timeout every turn still running is marked ABANDONED before the daemon releases its lock
+Warn: preparation copies the real index once and answers both 'anything staged' and the staged baseline from that copy, so staging that lands between the two can no longer become the accepted baseline
+Record-Id: r-workerrunr3
+Follows: r-workerrunr2
+Provenance: inherited 4e77cabf3e13e868f53d9768739e67a6f466d64c
+
+Limit: the integrated src/db/migrations.ts is pinned only by the independent authority in tests/helpers/frozen-authority.ts; until it pins these bytes the sealed-trace pin test fails, and the pin is never recomputed here
+Warn: WORKER_SESSION_NOT_INDEPENDENT is defined once, where #1069 put it; PR-B's second definition was dropped in the merge
+Warn: a #1069 witness that reproduces a WORKER sharing the CTO's actor must stand down schema v41's worker-independence triggers for that write as well as assertWorkerSeparation: from v41 the database refuses that state itself
+Record-Id: r-integworkerrun41
+Follows: r-workerrunr3
+Provenance: inherited c6b39533089cc6d5ed141529ec4a058715d947a2
+
+Limit: a git child that ignores SIGKILL in an uninterruptible kernel wait keeps the lock only until this process exits; if it survives that, it could still act afterwards
+Warn: Daemon.stop() keeps the daemon lock until every git child of an unfinished worker turn has completed or been killed with its exit observed; if a child cannot be confirmed stopped within the bound it keeps the lock (lockRetained) until this process exits
+Warn: worker git children now run as their own process group, so a daemon killed by SIGKILL does not take them with it (already true before this change)
+Record-Id: r-workerrunr4
+Follows: r-integworkerrun41
+Provenance: inherited f4ba6546280977a4d0e02929ee5d2b09477f1310
+
+Limit: the src/db/migrations.ts pin 003ed913 (blob e2ef4816, exact commit c6b39533) was accepted by the CEO on the Hermes CTO's independent computation from GitHub's original bytes, relayed verbatim by the ACP CTO; it is not a CEO direct computation, and it is void if the file's bytes change
+Record-Id: r-pin1070mig
+Follows: r-workerrunr4
+Provenance: inherited 1e3ab0b788548bb0c1efcbdcc0b9395dc7d8340d
+
+Limit: a fence that names no group, or cannot be read, stays until someone removes the fence file by hand; the worker runner always lists its groups, but the reviewer's exit helper produces such a fence
+Warn: a worker git process group stays owned after its leader exits and leaves the registry only when the leader's exit was seen and kill(-pgid, 0) returns ESRCH; shutdown also closes settled turns' and admissions' registries, so a leftover descendant is killed and confirmed gone before the lock is released
+Warn: an incomplete stop writes agentcpd.lock.git-fence.json naming each unconfirmed group and its leader's OS start time, keeps the lock and exits 75; every acquire() refuses while a named group is alive (a reused id with a different start time counts as gone), so supervisors and deploy scripts waiting on the lock now wait while a fence is live
+Record-Id: r-workerrunr5
+Follows: r-pin1070mig
+Provenance: inherited 0441284512364b54ec694ca836b4b70c345d281a
+
+Warn: acquire() reads the git fence again directly after it installs its lock, and on a live or unknown fence releases that lock and refuses; together with the predecessor writing its fence before it exits, no interleaving of fence write, holder read, reclaim and install grants authority while a named mutation group lives
+Warn: an incomplete stop with an empty group list is written as groups: null, and the reader treats an empty or unnamed fence as unknown and keeps it, so such a fence blocks acquisition until someone removes it
+Warn: on macOS a process group whose last member is an unreaped zombie answers kill(-pgid, 0) with EPERM, not ESRCH; the lock counts it as alive, so a fence stands until launchd reaps the zombie
+Record-Id: r-workerrunr6
+Follows: r-workerrunr5
+Provenance: inherited fd1c8bd81fd4b5c1e25a5882b7f3893a4903708f
+
+Limit: a range the gate cannot resolve still passes: a failed rev-list is read as an empty range and prints RESULT: PASS
+Ruled-out: adding notes that copy 04412845's records onto 1e3ab0b7, or rewriting 1e3ab0b7's subject | notes would falsify which commit carried the records and a subject rewrite needs a force-push, so the gate itself was fixed instead
+Warn: the merge-records gate skips a commit whose subject ends (#N) only when it is an ancestor of refs/pull/N/head and not on origin's HEAD; ancestry alone is not enough, because after main is merged into a branch a real squash becomes an ancestor of the PR head
+Warn: the gate asks git ls-remote --exit-code for refs/pull/N/head first: exit 2 (the remote answered the ref is absent, e.g. N is an issue) is not examined as before; any other ls-remote result, a failed fetch, a failed ancestry lookup or an unreadable base refuses and is never read as a skip
+Record-Id: r-gatebranchcommit
+Follows: r-workerrunr6
+Provenance: inherited 379dea371a4e8e485f85d5367b8b0062c7fef49f
+
+Limit: acquire() still unlinks a dead holder's lock path unconditionally when it reclaims, so two reclaimers at once can each delete the other's freshly installed lock and both hold it; this predates the fence work and cannot remove a live fence
+Warn: this supersedes r-workerrunr6's claim that no interleaving grants authority: every git fence is now written once under its own name (<lock>.git-fence.<pid>.<start token>.<random>.json, linked into place without replacing), acquire() scans all of them and refuses on any live, unknown or unreadable fence or an unlistable directory, the pre-install check only reads, and a unique fence file is removed only after this process installed its lock and confirmed every group it names gone
+Warn: <lock>.git-fence.json is only a second hard link to the newest fence; an independent file left there by an earlier build is adopted under a unique name before the name is reused, and the legacy name is removed only when it links to a fence confirmed stale
+Record-Id: r-workerrunr7
+Follows: r-gatebranchcommit
+Provenance: inherited 1f7a18bd3377686ca291beb793ce4c2db5a9d9be
+
+Limit: a squash merged without squash-preserve carries no Provenance lines, so its head is corroborated by the tree alone; a PR over 250 commits fails the completeness check and refuses; local pnpm gates need gh auth, without which any (#N) commit refuses; merge-tree --write-tree needs git 2.38 or later
+Warn: the merge-records gate attributes each (#N) commit from GitHub: 404 is not examined; merged with merge_commit_sha equal to the commit makes it N's squash, compared against an API head.sha accepted only when merging it into the squash's parent reproduces the squash tree, it does not contain the squash, and every Provenance: inherited SHA lies between them; membership in the full, count-checked commit list makes it a branch commit; anything else, and every git, API, page or parse failure, refuses
+Warn: the CI gates step now carries GH_TOKEN from github.token and the job pull-requests: read, because the pulls API needs more than contents: read
+Record-Id: r-gategithubfacts
+Follows: r-workerrunr7
+Provenance: inherited 3cb969a4cb3dd4e15aaef495fcaeed5259aae5f4
+
+Limit: every squash without a Merged-Head line refuses as unverifiable, including all squashes merged before this change, because nothing they preserve names the end of their branch; #1070 itself must be merged with this merge-pr.mjs or main CI refuses its own squash
+Ruled-out: putting Merged-Head inside the git trailer block | commitlore 1.7.3 validate rejects it there as an unknown key (it suggests X-Merged-Head) and merge-pr would refuse every merge, so it is its own paragraph straight after the subject instead
+Warn: merge-records attributes a (#N) commit only from a valid GitHub answer: merged with merge_commit_sha equal to it makes it PR N's squash, anything else is printed as attribution non-target (never as records preserved); a 404 counts as no PR only with GitHub's exact not-found body, and every other API, git or parse failure refuses
+Warn: a squash's branch is read only up to the head named by exactly one Merged-Head line in its message, which scripts/merge-pr.mjs now writes for the head whose CI it checked and passes to --match-head-commit, then reads back (one parent, trailer, tree, records); the pull request's current head.sha is never read
+Record-Id: r-mergedhead
+Follows: r-gategithubfacts
+Provenance: inherited 715bb118fc8e453600ed5ca69b03073bdde1c7c1
+
+Limit: POSIX locks belong to the process, so opening and closing any plain descriptor on agentcpd.lock.db inside the holder silently drops the OS lock and only the holder record then keeps a second daemon out; deleting or replacing both the lock DB and the record allows two holders; better-sqlite3 accepts no URI filename, so the unix-flock VFS is unavailable
+Warn: this supersedes r-workerrunr6 and r-workerrunr7 on reclaim: the daemon lock is an open BEGIN EXCLUSIVE transaction (timeout 0) on agentcpd.lock.db held by one dedicated connection for the holder's lifetime, nothing is reclaimed by unlinking a path, the open file's identity is checked through the process's own descriptor list, and agentcpd.lock keeps pid/start info under the lock where a record naming a running process refuses
+Warn: deploy transition: stop the old daemon before starting the new one, and never delete or replace agentcpd.lock.db; install-launchd.sh already waits for agentcpd.lock to disappear, which release still does
+Record-Id: r-sqlitelock
+Follows: r-gategithubfacts
+Provenance: inherited 32d5f0ee8a344a24b5ea074312fe2beaecb6c7db
+
+Limit: the legacy name can still be removed as a second link to a unique fence confirmed stale, after an identity re-check just before the unlink; a small window remains, reachable only by a writer outside this protocol
+Warn: fences are written, adopted and cleared only under the SQLite daemon lock; a fenced group counts as gone only on a confirmed ESRCH or a readable different start token, and any other probe error, including an id kill() rejects, keeps the fence standing
+Warn: the legacy fence name is created as a link only if absent and never overwritten; the nlink>1 shortcut is gone, and a legacy file that no scanned unique name verifiably links is adopted under a new unique name, or acquisition refuses when that is uncertain
+Record-Id: r-fenceunderlock
+Follows: r-sqlitelock
+Provenance: inherited 934374ebff62aea559a55cf75855b951321c3c8e
+
+Limit: macOS AF_UNIX socket paths are limited to 104 bytes; a HOME rooted under the default TMPDIR (/var/folders/.../T/) makes agentcpd's operator socket path longer than that
+Warn: a test that runs agentcpd main against a temporary HOME must root it under /tmp, not tempDir(), or it fails on the socket path instead of the behaviour under test
+Record-Id: r-n6restartroot
+Provenance: inherited 0836b07999c8e027b894ee7734856dc232ec7025
+
+Limit: an earlier build (main 56c1d019 and before, and 3cb969a4) reclaims a dead holder record by unlinking agentcpd.lock without checking what it removes, so no reclaim this build performs can be safe against a concurrent earlier reclaimer
+Limit: on the empty path a clean stop leaves, an earlier build that reaches its lock before any schema check (earlier agentcpd-state suspend-project, or an earlier daemon whose database open preceded the migration to 41) can still take its pathname lock; this build then refuses, so the two never hold together
+Ruled-out: reclaiming a dead earlier-build record carefully (re-read, rename aside, verify what moved) | an earlier reclaimer that already read it dead unlinks whatever is at the path afterwards, this build's new record included
+Ruled-out: a permanent marker at agentcpd.lock that earlier builds always refuse | install-launchd.sh wait_for_stop and a rolled-back earlier generation both need the path empty after a clean stop
+Warn: this build refuses while an earlier build's record stands at agentcpd.lock, dead or alive, until it is removed by hand once no earlier-build agentcpd or agentcpd-state runs; reclaiming it here reopens the two-holder race
+Warn: this build's holder record must keep no path field and its 2100-01-01 modification time: those are what make an earlier build read it as incomplete and never remove it
+Record-Id: r-earlierbuildapart
+Follows: r-sqlitelock
+Provenance: inherited eb8230641c1bab1255f42d66db74162df5ecf2e6
+
+Warn: a test that needs a dead holder to be reclaimed must seed one of this build's own records (a process that acquires and exits); a dead earlier-format or malformed record is now refused and must stay byte-identical
+Warn: #118 keeps the bounded writer grace (DAEMON_LOCK_LOST within five seconds); only reclaim after the grace changed, to a refusal that leaves the file as it was
+Warn: a migration blocked by a dead earlier-build record proceeds only after the record is removed by hand, once no agentcpd of either build runs
+Record-Id: r-earlierbuildtests
+Follows: r-earlierbuildapart
+Provenance: inherited 385cd987917bb033b17fc31d0724255cab3b3a3f
+
+Warn: a blocking subprocess call in a test goes through boundedSpawnSync or boundedExecFileSync; the tests/ budget map is empty and the census checks it for equality, so one unbounded call fails CI
+Record-Id: r-witnessbounded
+Provenance: inherited c5de2987f87b7c862c0f47b0cf1e0bdc453112ea
+
+Limit: every earlier build (deployed generations 115916ce, 670ca488, 92ab0ad8; main 56c1d019; 3cb969a4; 953a0b8e) holds agentcpd.lock as a regular file and reclaims a dead or unreadable one by unlinking the path blind; none of them can remove or replace a directory there
+Limit: src/db/state-admin.ts daemonIsLive still asserts agentcpd.lock is a regular file, so this build's agentcpd-state refuses with STATE_PATH_INSECURE while a holder directory stands instead of naming the holder
+Ruled-out: reclaiming a dead earlier-build record carefully (re-read, move aside, verify) | an earlier reclaimer that already read it dead unlinks whatever regular file is at the path afterwards
+Ruled-out: a regular-file record earlier builds read as incomplete with its mtime pinned in the future | touch, a copy that does not keep times, or a clock past the pin hands it back to their five-second reclaim while this build still holds
+Warn: this build never removes or replaces an earlier build's record or any file it cannot read as its own holder, running or dead; it reclaims only its own directory, under the SQLite lock, after a directory identity check
+Record-Id: r-lockdirectory
+Supersedes: r-earlierbuildapart
+Provenance: inherited 1f365ac931fcafc11d3bba978eb5fe70a2533683
+
+Limit: holderProvenGone is stricter than the lock's own holderRunning, which still treats EPERM from kill(pid, 0) as a dead holder; the two agree on ESRCH and on a start-token mismatch
+Warn: agentcpd-state goes on past this build's holder directory only when holder.json names a holder proven gone (confirmed ESRCH, or both start tokens read and different); a running holder, EPERM without a token mismatch, or a missing or unreadable record refuses, and it never removes or replaces the directory
+Record-Id: r-stateadminholderdir
+Follows: r-lockdirectory
+Provenance: inherited 1123da29627b8b94c98f47b73a49c99467173730
