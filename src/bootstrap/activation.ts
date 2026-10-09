@@ -18,6 +18,7 @@ import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import { tryRevParse } from "../git/git.ts";
+import { type BootstrapPlanBinding, currentBootstrapPlan, sameBootstrapPlanBinding } from "./bootstrap-plan.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
 import { parseRepoFactoryResult } from "./repo-factory-result.ts";
 
@@ -41,6 +42,12 @@ export interface ACPBootstrapActivationResult {
 
 export interface ActivationInput {
   runId: string;
+  /**
+   * The candidate the CEO's CONFIRM names (#246 C2). Its passing review, bound to the run's current
+   * PLAN, manifest and planned outputs, is what activation rests on. Omitted, it is the run's
+   * current candidate.
+   */
+  candidateSnapshotDigest?: string | null;
   factoryResult: unknown;
   /** The approved manifest whose digest the factory result must match. */
   approvedManifest: ProjectManifest;
@@ -214,13 +221,11 @@ export class BootstrapActivation {
       });
     }
 
-    // 4. Blind review is recorded from the run's own artifact. CEO confirmation is
-    // deliberately not read here: it is the next ordered phase and builds the final
-    // activation result atomically with the COMPLETED transition.
-    const reviewArtifact = this.artifacts.latest<{ verdict: string }>(
-      input.runId,
-      ArtifactKind.BLIND_REVIEW,
-    );
+    // 4. Blind review is the passing review of the confirmed candidate, bound to the run's current
+    // PLAN (#246 C2) — never merely the run's latest review. CEO confirmation is deliberately not
+    // read here: it is the next ordered phase and builds the final activation result atomically
+    // with the COMPLETED transition.
+    const reviewed = this.boundBootstrapReview(input.runId, this.confirmedCandidate(input.runId, input.candidateSnapshotDigest));
 
     // 6. Primary CTO: always a fresh session, provisioned only now that the activation target —
     // the project registered above — is decided (issue #246: no promotion). The bootstrap CTO is
@@ -289,9 +294,7 @@ export class BootstrapActivation {
       projectId,
       projectRegistration: { registered: true, activeManifestDigest: approvedDigest },
       localBindings,
-      blindReview: reviewArtifact
-        ? { verdict: reviewArtifact.content.verdict, digest: reviewArtifact.digest }
-        : null,
+      blindReview: reviewed.allowed ? { verdict: reviewed.value.verdict, digest: reviewed.value.digest } : null,
       ceoConfirm: null,
       primaryCtoBinding,
       buzz: { connected: Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
@@ -371,7 +374,63 @@ export class BootstrapActivation {
       ? this.bindings.assertReviewerIndependence(runId, review.content.reviewerSessionId)
       : deny(ReasonCode.REVIEWER_NOT_INDEPENDENT, "blind review has no reviewer session", { runId });
     if (!reviewer.allowed) return reviewer as Decision<{ digest: string }>;
+    // #246 C2 — and that PASS is of the run's current plan: a PASS for another PLAN, manifest or
+    // planned outputs is never carried to this one.
+    const bound = this.boundBootstrapReview(runId, candidateSnapshotDigest);
+    if (!bound.allowed) return bound as Decision<{ digest: string }>;
     return allow(ReasonCode.OK, { digest: review.digest });
+  }
+
+  /** The candidate a confirmation names, or the run's current one when it names none. */
+  private confirmedCandidate(runId: string, named: string | null | undefined): string | null {
+    return named ?? this.runs.currentCandidate(runId);
+  }
+
+  /**
+   * Issue #246 PR-C slice C2 — the PASS a bootstrap's readiness and confirmation rest on: one for the
+   * candidate confirmed, whose review and the run's current PLAN artifact agree on one binding — the
+   * PLAN, manifest and planned-outputs digests, the last two recomputed from the PLAN itself. A PASS
+   * for another plan answers nothing here, whatever the run's latest review says.
+   */
+  private boundBootstrapReview(
+    runId: string,
+    candidateSnapshotDigest: string | null,
+  ): Decision<{ digest: string; verdict: string; binding: BootstrapPlanBinding }> {
+    const refuse = (message: string, evidence: Record<string, unknown>) =>
+      deny<{ digest: string; verdict: string; binding: BootstrapPlanBinding }>(
+        ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
+        message,
+        { runId, incomplete: ["blindReview"], candidateSnapshotDigest, ...evidence },
+      );
+    const review = candidateSnapshotDigest === null
+      ? null
+      : this.artifacts.latestForSnapshot<{
+          verdict?: string;
+          candidateSnapshotDigest?: string;
+          bootstrapPlan?: BootstrapPlanBinding;
+        }>(runId, ArtifactKind.BLIND_REVIEW, candidateSnapshotDigest);
+    if (!review || review.content.verdict !== "PASS" || review.content.candidateSnapshotDigest !== candidateSnapshotDigest) {
+      return refuse("activation requires a passing blind review of the bootstrap run", {
+        verdict: review?.content.verdict ?? null,
+      });
+    }
+    const current = currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+    if (!current.allowed) {
+      return refuse("the run's current PLAN has no planned outputs, so no passing review is bound to it", {
+        refusal: "BOOTSTRAP_REVIEW_NOT_BOUND",
+        plan: { reasonCode: current.reasonCode, refusal: current.evidence["refusal"] ?? null },
+      });
+    }
+    // The review gate wrote this binding from the PLAN artifact the candidate names, after checking
+    // it against that candidate, so it is the candidate's binding too.
+    if (!sameBootstrapPlanBinding(review.content.bootstrapPlan, current.value.binding)) {
+      return refuse("the passing review is bound to another PLAN, manifest or planned outputs than the run's current ones", {
+        refusal: "BOOTSTRAP_REVIEW_NOT_BOUND",
+        reviewed: review.content.bootstrapPlan ?? null,
+        current: current.value.binding,
+      });
+    }
+    return allow(ReasonCode.OK, { digest: review.digest, verdict: "PASS", binding: current.value.binding });
   }
 
   /**
@@ -879,7 +938,7 @@ export class BootstrapActivation {
       });
     }
     void projectId;
-    return this.readinessForFactoryResult(input.runId, input.handoff);
+    return this.readinessForFactoryResult(input.runId, input.handoff, input.candidateSnapshotDigest);
   }
 
   /**
@@ -887,8 +946,17 @@ export class BootstrapActivation {
    * blind review, and the run at CEO review. Public so a producer that writes to GitHub can be
    * refused *before* its first write when activation would refuse its output anyway (#246) —
    * the same checks `preflight` runs, not a second copy of them.
+   *
+   * The review is the confirmed candidate's (`candidateSnapshotDigest`, or the run's current
+   * candidate when none is named), and its PASS counts only while it is bound to the run's current
+   * PLAN, manifest and planned outputs (#246 C2). Reading the run's latest review instead let a PASS
+   * for one plan stand for a plan submitted after it.
    */
-  readinessForFactoryResult(runId: string, handoff: HandoffPackage): Decision<void> {
+  readinessForFactoryResult(
+    runId: string,
+    handoff: HandoffPackage,
+    candidateSnapshotDigest?: string | null,
+  ): Decision<void> {
     const missing = missingHandoffFields(handoff);
     if (missing.length > 0) {
       return deny(ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, "activation handoff is incomplete", {
@@ -897,14 +965,8 @@ export class BootstrapActivation {
       });
     }
 
-    const review = this.artifacts.latest<{ verdict: string }>(runId, ArtifactKind.BLIND_REVIEW);
-    if (!review || review.content.verdict !== "PASS") {
-      return deny(
-        ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
-        "activation requires a passing blind review of the bootstrap run",
-        { runId, incomplete: ["blindReview"], verdict: review?.content.verdict ?? null },
-      );
-    }
+    const review = this.boundBootstrapReview(runId, this.confirmedCandidate(runId, candidateSnapshotDigest));
+    if (!review.allowed) return review as Decision<void>;
 
     const state = this.runs.get(runId)?.state;
     if (state !== RunState.READY_FOR_CEO_REVIEW) {

@@ -1,5 +1,6 @@
 import type { Clock } from "../core/clock.ts";
 import { randomUUID } from "node:crypto";
+import { verificationKindRunning } from "../bootstrap/repo-factory-producer.ts";
 import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -541,7 +542,13 @@ export class VerificationEngine {
     let worktree: Awaited<ReturnType<WorktreeManager["create"]>> | null = null;
     let outcome: Awaited<ReturnType<typeof runSandboxed>> | null = null;
     try {
-      worktree = await this.worktrees.create(checkoutPath, head, worktreeId, authorization);
+      worktree = await this.worktrees.create(checkoutPath, head, worktreeId, authorization, {
+        // #246 C2v: a command that is one of Repo Factory's fixed git invocations runs git in the
+        // checkout, and a linked worktree's git metadata lives in the original checkout, which the
+        // sandbox denies below. Only those commands get a checkout with its own metadata; every
+        // other command keeps the linked worktree it had.
+        selfContained: verificationKindRunning(command.argv) !== null,
+      });
       this.updateVerificationWorktree(worktreeId, "ACTIVE", "active_at");
       outcome = await runSandboxed({
         command,
