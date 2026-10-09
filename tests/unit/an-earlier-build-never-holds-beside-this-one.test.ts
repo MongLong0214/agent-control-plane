@@ -1,8 +1,10 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
+
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 
 /**
  * #1070 ACP-WORKER-03-LOCK, narrow review 6 — an earlier build and this one never both hold.
@@ -82,7 +84,7 @@ const run = (state: string, id: string, build: "current" | "56c1d019" | "3cb969a
 
 /** A pid that answered once and is now gone. */
 const deadPid = (): number => {
-  const pid = Number(spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout);
+  const pid = Number(boundedSpawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout);
   expect(() => process.kill(pid, 0)).toThrow();
   return pid;
 };
