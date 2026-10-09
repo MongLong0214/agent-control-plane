@@ -4,16 +4,26 @@ import { z } from "zod";
 
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, type Evidence, allow, deny, isAcpError } from "../core/errors.ts";
+import { type Decision, type Evidence, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type ProjectManifest, assertPortableManifest, manifestDigest } from "../contracts/manifest.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
+import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { ArtifactKind, RunKind } from "../domain/types.ts";
+import { ArtifactKind, Role, RunKind, RunState, roleKeyFor, type RunRow } from "../domain/types.ts";
 import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
+import type { ProductionGate } from "../ceo/production-gate.ts";
+import type { ProjectRegistry } from "../registry/project-registry.ts";
+import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
+import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { ACPBootstrapActivationResult, BootstrapActivation } from "./activation.ts";
+import type {
+  BootstrapApplication,
+  BootstrapApplicationReservation,
+  BootstrapApplications,
+} from "./bootstrap-applications.ts";
 import {
   approvedPlanSchema,
   bootstrapActivationHandoff,
@@ -21,13 +31,16 @@ import {
   executableOperationsSchema,
   plannedBootstrapOutputs,
 } from "./bootstrap-plan.ts";
-import type { GitHubWritePort } from "./github-write-port.ts";
+import type { GitHubWritePort, ObservedRepository } from "./github-write-port.ts";
 import {
+  githubLedgerPath,
   preflightGitHubOperations,
+  readGitHubLedger,
+  type GitHubExecutionPlan,
   type GitHubOperation,
   type GitHubWriteAuthority,
 } from "./repo-factory-github.ts";
-import { produceRepoFactoryResult } from "./repo-factory-producer.ts";
+import { occupiedCheckoutLeaf, produceRepoFactoryResult, type RepoFactoryPlanFixture } from "./repo-factory-producer.ts";
 import { parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-result.ts";
 
 /**
@@ -98,6 +111,21 @@ import { parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-r
  * CEO's answer, so the decision never runs on a result that was not produced. A fresh bootstrap's
  * first CONFIRM performs the writes and is refused BOOTSTRAP_ACTIVATION_INCOMPLETE until the
  * primary CTO acknowledges its handoff; the CEO then confirms again, under a new idempotency key.
+ *
+ * The durable application record (issue #246 PR-C slice C3, `bootstrap-applications.ts`). Every
+ * CONFIRM door reaches this one path, in this order: the pre-write checks — the run project-less at
+ * CEO review, its owner pin the ACTIVE BOOTSTRAP_CTO, the CEO admissible, the project not registered
+ * (PROJECT_EXISTS), the repository identity not bound (IDENTITY_COLLISION), no other run's
+ * reservation, the checkout leaf free, and GitHub, observed only, holding no repository at the
+ * target or this run's by the evidence it recorded (RESOURCE_COLLISION) — each refusing with zero
+ * writes and the approval unconsumed; then the approval consumed and the reservation inserted, its
+ * first attempt recorded, in one transaction; the producer, whose ledger records each external write
+ * before it is made; the result and WRITTEN in one transaction; activation; and COMPLETED in the
+ * CEO's completion transaction. A recovery is the CEO re-CONFIRMing the same frozen candidate: it
+ * records another attempt before its first write, and never recreates a repository because the row
+ * says RESERVED nor adopts one because its name matches — a repository is this run's only by the
+ * node id its create was answered with, or its creation receipt. Uncertain attribution strands the
+ * application, keeping the reservation and the evidence; nothing retries it.
  *
  * What production supplies. `defaultConfig()` sets the work root to `<state root>/repo-factory`,
  * and the CTO's `plan_submit` takes each operation in `githubOperationSchema` — the shape this
@@ -197,22 +225,44 @@ export interface ProduceAndActivateInput {
    * else this call does that matters, and the owner approval is consumed for it (RF1050-01).
    */
   candidateSnapshotDigest: string;
+  /**
+   * #246 C3 — the session the CONFIRM is made as. It must be admissible as the deciding CEO before
+   * anything is consumed or written (`ProductionGate.assertCeoDecisionAdmissible`).
+   */
+  ceoSessionId: string;
   ownerApproval: RepoFactoryOwnerApproval | null;
   approvedManifest: ProjectManifest;
   projectName: string;
   handoff: HandoffPackage;
 }
 
+/** The CEO's CONFIRM of a PROJECT_BOOTSTRAP run, as every CONFIRM door hands it to the runner. */
+export interface BootstrapConfirmation {
+  runId: string;
+  candidateSnapshotDigest: string;
+  ceoSessionId: string;
+  rationale?: string;
+}
+
 export interface RepoFactoryBootstrapRunnerDeps {
   runs: Pick<RunEngine, "get" | "currentCandidate">;
   artifacts: Pick<ArtifactStore, "latest" | "list" | "put">;
-  ownerAuthority: Pick<OwnerAuthorityPort, "assertConsumedApproval" | "consumeApproval">;
+  ownerAuthority: Pick<OwnerAuthorityPort, "assertConsumedApproval" | "consumeApproval" | "assertConsumable">;
   bootstrap: Pick<BootstrapActivation, "activate" | "readinessForFactoryResult" | "reviewForConfirmation">;
   /** The production composition passes `createGhCliGitHubWritePort()`; tests pass a double. */
   githubPort: GitHubWritePort;
   /** Each run produces under `<workRoot>/<runId>`. Null means this deployment never configured one. */
   workRoot: string | null;
   clock: Clock;
+  /** #246 C3 — the transaction the approval's consumption, the reservation and its attempt share. */
+  db: Pick<Db, "txDecision">;
+  /** #246 C3 — the durable application record. */
+  applications: BootstrapApplications;
+  /** #246 C3 — the CEO admission every CONFIRM door asks, asked again here before anything is consumed. */
+  ceo: Pick<ProductionGate, "assertCeoDecisionAdmissible">;
+  bindings: Pick<BindingRegistry, "active">;
+  projects: Pick<ProjectRegistry, "get">;
+  repositories: Pick<RepositoryRegistry, "byIdentity">;
 }
 
 type Stage = "precondition" | "approval" | "production" | "activation";
@@ -220,7 +270,27 @@ type Stage = "precondition" | "approval" | "production" | "activation";
 const atStage = <T>(decision: Decision<T>, stage: Stage): Decision<T> =>
   decision.allowed ? decision : { ...decision, evidence: { stage, ...decision.evidence } };
 
+/** A refusal as a STRANDED row or a `last_refusal_json` keeps it. */
+const refusalRecord = (decision: Decision<unknown>, stage: Stage): Record<string, unknown> =>
+  decision.allowed
+    ? {}
+    : { stage, reasonCode: decision.reasonCode, message: decision.message, evidence: decision.evidence };
+
+/** Refusals of the GitHub ledger: the evidence that would attribute a repository cannot be read. */
+const LEDGER_REFUSALS = new Set(["LEDGER_CORRUPT", "LEDGER_FOREIGN", "LEDGER_UNSAFE"]);
+
+/**
+ * What a person does about a STRANDED application. The reservation is never reused and nothing is
+ * deleted automatically, so the recovery is a person's: establish what the repository at the target
+ * is, then cancel this run and bootstrap again under a new project id and repository identity.
+ */
+const STRANDED_RECOVERY =
+  "a person establishes whether the repository at the target is this run's, by comparing its GitHub node id with the attempt ledger named in the evidence; nothing is created, adopted or deleted automatically, the reservation is kept and never reused, so the run is cancelled and the project is bootstrapped again under a new project id and repository identity";
+
 export class RepoFactoryBootstrapRunner {
+  /** #246 C3 — the runs with an application attempt in flight in this process. */
+  readonly #applying = new Set<string>();
+
   constructor(private readonly deps: RepoFactoryBootstrapRunnerDeps) {}
 
   /**
@@ -315,39 +385,15 @@ export class RepoFactoryBootstrapRunner {
   }
 
   /**
-   * The CEO confirm's entry for a PROJECT_BOOTSTRAP run. Until issue #246 slice C3 it refuses every
-   * call `BOOTSTRAP_APPLICATION_NOT_AVAILABLE`, before any approval read, consumption or GitHub
-   * call. What C3 reopens is `produceAndActivateRecordedApproval`: `produceAndActivate` over the
-   * owner's newest recorded approval of this operation, so a later decline supersedes an earlier
-   * approval; with none recorded it refuses as a missing approval, before any GitHub call. A
-   * recorded receipt is still only a claim there; `admitApproval` re-reads the ingress admission
-   * behind it. `candidateSnapshotDigest` is the CONFIRM's own candidate, carried through unchanged.
+   * The CEO confirm's entry for a PROJECT_BOOTSTRAP run, which every CONFIRM door reaches:
+   * `produceAndActivate` over the owner's newest recorded approval of this operation, so a later
+   * decline supersedes an earlier approval; with none recorded it refuses as a missing approval,
+   * before any GitHub call. A recorded receipt is still only a claim there; it is re-read against
+   * the ingress admission behind it before anything is consumed. The CONFIRM's candidate and CEO
+   * session are carried through unchanged.
    */
-  async produceAndActivateApproved(
-    runId: string,
-    candidateSnapshotDigest: string,
-  ): Promise<Decision<ACPBootstrapActivationResult>> {
-    // Issue #246 PR-C — the CEO confirm's own door to the GitHub writes stays shut until slice C3's
-    // durable application record exists. ProductionGate's admission refuses a bootstrap CONFIRM
-    // first; this is the second layer, at the one entry a CONFIRM reaches the producer through, so a
-    // caller that skips admission still writes nothing and consumes nothing. C3 removes it.
-    void candidateSnapshotDigest;
-    return deny(
-      ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
-      "a PROJECT_BOOTSTRAP confirmation cannot be applied until its durable application record exists",
-      { stage: "precondition", refusal: "BOOTSTRAP_APPLICATION_NOT_AVAILABLE", runId },
-    );
-  }
-
-  /**
-   * The body of `produceAndActivateApproved` once slice C3 reopens it: kept private and called by
-   * nothing in production, so no CONFIRM reaches it until then, and C3 restores the door rather than
-   * rewriting what is behind it.
-   */
-  private async produceAndActivateRecordedApproval(
-    runId: string,
-    candidateSnapshotDigest: string,
-  ): Promise<Decision<ACPBootstrapActivationResult>> {
+  async produceAndActivateApproved(confirmation: BootstrapConfirmation): Promise<Decision<ACPBootstrapActivationResult>> {
+    const { runId } = confirmation;
     const missing = (message: string): Decision<ACPBootstrapActivationResult> =>
       deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, message, { stage: "approval", refusal: "APPROVAL_MISSING", runId });
     const newest = this.deps.artifacts
@@ -368,7 +414,8 @@ export class RepoFactoryBootstrapRunner {
     if (!manifest.allowed) return missing("the owner approval recorded for this run carries no usable manifest");
     return this.produceAndActivate({
       runId,
-      candidateSnapshotDigest,
+      candidateSnapshotDigest: confirmation.candidateSnapshotDigest,
+      ceoSessionId: confirmation.ceoSessionId,
       ownerApproval: { owner: recorded.data.owner, visibility: recorded.data.visibility, receipt: recorded.data.receipt },
       approvedManifest: manifest.value,
       projectName: recorded.data.projectName,
@@ -376,7 +423,29 @@ export class RepoFactoryBootstrapRunner {
     });
   }
 
+  /**
+   * One application attempt of a run at a time in this process (#246 C3): a CONFIRM that arrives
+   * while another of the same run is in flight — two re-CONFIRMs racing — consumes nothing, writes
+   * nothing and is told so. The attempt record's compare-and-set states the same rule in the
+   * database, for a writer this process does not see.
+   */
   async produceAndActivate(input: ProduceAndActivateInput): Promise<Decision<ACPBootstrapActivationResult>> {
+    if (this.#applying.has(input.runId)) {
+      return deny(
+        ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+        "an application attempt of this bootstrap run is already in flight; this CONFIRM writes and consumes nothing",
+        { stage: "precondition", refusal: "APPLICATION_IN_PROGRESS", runId: input.runId },
+      );
+    }
+    this.#applying.add(input.runId);
+    try {
+      return await this.apply(input);
+    } finally {
+      this.#applying.delete(input.runId);
+    }
+  }
+
+  private async apply(input: ProduceAndActivateInput): Promise<Decision<ACPBootstrapActivationResult>> {
     const { runId } = input;
     const refuse = (
       reasonCode: ReasonCode,
@@ -393,6 +462,30 @@ export class RepoFactoryBootstrapRunner {
         kind: run.kind,
       });
     }
+    // #246 C3 — the pre-write checks. Every one runs before the owner's approval is consumed, and a
+    // refusal among them writes nothing, consumes nothing and creates no application row. First, the
+    // run: project-less, at CEO review.
+    if (run.projectId !== null) {
+      return refuse(ReasonCode.INVALID_ARGUMENT, "RUN_NOT_PROJECTLESS", "a bootstrap application needs a project-less PROJECT_BOOTSTRAP run", {
+        projectId: run.projectId,
+      });
+    }
+    if (run.state !== RunState.READY_FOR_CEO_REVIEW) {
+      return refuse(ReasonCode.RUN_TRANSITION_ILLEGAL, "RUN_NOT_AT_CEO_REVIEW", "a bootstrap application needs the run at CEO review", {
+        state: run.state,
+      });
+    }
+    // A STRANDED application keeps its reservation and evidence for a person; no CONFIRM retries it.
+    const existing = this.deps.applications.get(runId);
+    if (existing?.phase === "STRANDED") {
+      return refuse(
+        ReasonCode.BOOTSTRAP_APPLICATION_STRANDED,
+        "BOOTSTRAP_APPLICATION_STRANDED",
+        "this bootstrap run's application is STRANDED: what GitHub holds could not be attributed to it, and a person resolves it",
+        { stranded: existing.lastRefusal, projectId: existing.projectId, repositoryIdentity: existing.repositoryIdentity },
+      );
+    }
+
     // #246 C2 — the PLAN artifact and the manifest first: `bootstrapPlanPreflight`, the pure checks
     // this runner used to make inline (same refusals, same evidence), then the GitHub shape and the
     // manifest's remote, all inside `plannedBootstrapOutputs`. They are judged ahead of the review
@@ -415,6 +508,18 @@ export class RepoFactoryBootstrapRunner {
     // write. The check is finalization's own `reviewForConfirmation` rather than a copy of it.
     const reviewed = this.deps.bootstrap.reviewForConfirmation(runId, input.candidateSnapshotDigest);
     if (!reviewed.allowed) return atStage(reviewed as Decision<ACPBootstrapActivationResult>, "precondition");
+
+    // #246 C3 — the run's owner pin is its ACTIVE BOOTSTRAP_CTO, and the CONFIRM is the CEO's.
+    const pinned = this.assertOwnerPin(run);
+    if (!pinned.allowed) return atStage(pinned as Decision<ACPBootstrapActivationResult>, "precondition");
+    const ceo = this.deps.ceo.assertCeoDecisionAdmissible({
+      runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: input.candidateSnapshotDigest,
+      ceoSessionId: input.ceoSessionId,
+      rationale: "bootstrap application",
+    });
+    if (!ceo.allowed) return atStage(ceo as Decision<ACPBootstrapActivationResult>, "precondition");
 
     if (input.ownerApproval === null) {
       return refuse(
@@ -463,31 +568,130 @@ export class RepoFactoryBootstrapRunner {
       if (!isAcpError(error)) throw error;
       return refuse(error.reasonCode, "WORK_ROOT_INSECURE", error.message, error.evidence);
     }
-    // Every call is authorised before anything else it does: the approval is admitted through
-    // ingress and consumed, or re-admitted from that durable consumption on a later call
-    // (PR #1043 review round 3, RF1043-08 — the previous head activated a stored result first).
-    const approval = this.admitApproval(runId, input.candidateSnapshotDigest, input.ownerApproval.receipt, {
+
+    // The owner's receipt must name this run, this operation and exactly these parameters, and
+    // approve them; and it must be consumable for this candidate, or already consumed for it. Asked
+    // without consuming: consumption waits for the last pre-write check (PR #1043 review round 3,
+    // RF1043-08 — every call is authorised before anything else it does, a stored result included).
+    const receipt = this.approvalReceipt(runId, input.ownerApproval.receipt, {
       owner: authority.owner,
       visibility: authority.visibility,
       planDigest: planArtifact.digest,
       githubOperations: operations,
     });
-    if (!approval.allowed) return atStage(approval as Decision<ACPBootstrapActivationResult>, "approval");
+    if (!receipt.allowed) return atStage(receipt as Decision<ACPBootstrapActivationResult>, "approval");
+    // The write scope the owner approved: the digest of exactly these parameters. A recovery may be
+    // authorised by a later owner decision of the same scope (RF1050-04), never by another scope.
+    const approvalDigest = receipt.value.parameterDigest;
+    const retainedApproval = this.deps.ownerAuthority.assertConsumedApproval(receipt.value, input.candidateSnapshotDigest);
+    if (!retainedApproval.allowed) {
+      // A receipt not yet consumed must be consumable for this candidate; a receipt minted for
+      // another candidate, or consumed with none by an earlier head (RF1050-03/-04), is refused here.
+      const consumable = this.deps.ownerAuthority.assertConsumable(receipt.value, input.candidateSnapshotDigest);
+      if (!consumable.allowed) return atStage(consumable as Decision<ACPBootstrapActivationResult>, "approval");
+    }
+    /** Consumes the receipt inside the caller's transaction unless it was already consumed for this candidate. */
+    const consumeIfNew = (): Decision<void> =>
+      retainedApproval.allowed
+        ? allow(ReasonCode.OK, undefined)
+        : this.deps.ownerAuthority.consumeApproval(receipt.value, input.candidateSnapshotDigest);
 
-    // The result this runner stored after producing it, under this same approval, in the control
-    // plane's own artifact store — nothing a caller or a file supplies. Activation follows it on
-    // the call after a handoff is acknowledged, and re-validates it like any other.
-    const retained = this.deps.artifacts.latest<unknown>(runId, ArtifactKind.REPO_FACTORY_RESULT);
-    if (retained !== null) {
+    // What this CONFIRM would reserve: the manifest's project id and the repository it creates,
+    // under the digests of what was confirmed and approved.
+    const reservation: BootstrapApplicationReservation = {
+      runId,
+      projectId: input.approvedManifest.projectId,
+      repositoryIdentity: outputs.target.repositoryIdentity,
+      bootstrapOperationId: outputs.bootstrapOperationId,
+      planDigest: planArtifact.digest,
+      manifestDigest: manifestDigest(input.approvedManifest),
+      plannedOutputsDigest: digestOf(outputs),
+      candidateSnapshotDigest: input.candidateSnapshotDigest,
+      reviewDigest: reviewed.value.digest,
+      approvalDigest,
+    };
+    // Recovery re-applies the frozen candidate under the approval it consumed, and nothing else: no
+    // new write scope is approved by a re-CONFIRM.
+    if (existing !== null) {
+      const drift = (Object.keys(reservation) as Array<keyof BootstrapApplicationReservation>)
+        .filter((field) => existing[field] !== reservation[field]);
+      if (drift.length > 0) {
+        return refuse(
+          ReasonCode.BOOTSTRAP_APPLICATION_FROZEN,
+          "BOOTSTRAP_APPLICATION_FROZEN",
+          "this bootstrap run's application is frozen on the candidate and approval it reserved; a CONFIRM can only re-apply those",
+          { drift, reserved: { ...existing, lastRefusal: undefined }, confirmed: reservation },
+        );
+      }
+    }
+    const held = this.reservationConflicts(reservation, existing);
+    if (!held.allowed) return held as Decision<ACPBootstrapActivationResult>;
+
+    // Production is still owed unless the application is WRITTEN: the leaf it creates must be free,
+    // and what GitHub holds at the target must be nothing, or this run's by the evidence it recorded.
+    if (existing?.phase !== "WRITTEN") {
+      const occupied = occupiedCheckoutLeaf(join(workRoot, runId), executable);
+      if (occupied !== null) {
+        if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(occupied, "precondition"));
+        return atStage(occupied as Decision<ACPBootstrapActivationResult>, "precondition");
+      }
+      const attribution = await this.observedTarget(runId, workRoot, executable, execution.value, existing);
+      if (!attribution.allowed) return attribution as Decision<ACPBootstrapActivationResult>;
+    }
+
+    // The order of operations: consume the approval and INSERT the reservation, with the first
+    // attempt recorded, in one transaction — its UNIQUE constraints close the race the checks above
+    // could not, and a refusal there rolls the consumption back with it. A recovery records its
+    // attempt the same way, before its first external write. A WRITTEN application has none to make.
+    if (existing === null) {
+      const reserved = this.deps.db.txDecision(() => {
+        const applicable = this.stillApplicable(runId);
+        if (!applicable.allowed) return applicable as Decision<BootstrapApplication>;
+        const fresh = this.reservationConflicts(reservation, null);
+        if (!fresh.allowed) return fresh as Decision<BootstrapApplication>;
+        const consumed = consumeIfNew();
+        if (!consumed.allowed) return consumed as Decision<BootstrapApplication>;
+        return this.deps.applications.reserve(reservation);
+      });
+      if (!reserved.allowed) return atStage(reserved as Decision<ACPBootstrapActivationResult>, "approval");
+    } else if (existing.phase === "RESERVED") {
+      const attempt = this.deps.db.txDecision(() => {
+        const applicable = this.stillApplicable(runId);
+        if (!applicable.allowed) return applicable as Decision<BootstrapApplication>;
+        const consumed = consumeIfNew();
+        if (!consumed.allowed) return consumed as Decision<BootstrapApplication>;
+        return this.deps.applications.recordAttempt(runId, existing.attempts);
+      });
+      if (!attempt.allowed) return atStage(attempt as Decision<ACPBootstrapActivationResult>, "precondition");
+    } else {
+      const consumed = this.deps.db.txDecision(consumeIfNew);
+      if (!consumed.allowed) return atStage(consumed as Decision<ACPBootstrapActivationResult>, "approval");
+    }
+
+    // A WRITTEN application's result was stored with WRITTEN, in the control plane's own artifact
+    // store — nothing a caller or a file supplies. Activation follows it on the call after a handoff
+    // is acknowledged, or after a primary CTO could not be provisioned, and re-validates it.
+    if (existing?.phase === "WRITTEN") {
+      const retained = this.deps.artifacts.latest<unknown>(runId, ArtifactKind.REPO_FACTORY_RESULT);
+      if (retained === null) {
+        return refuse(
+          ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
+          "WRITTEN_RESULT_MISSING",
+          "the bootstrap application is WRITTEN and its stored result is missing",
+          {},
+          "activation",
+        );
+      }
       const parsed = parseRepoFactoryResult(retained.content);
       if (!parsed.allowed) return atStage(parsed as Decision<ACPBootstrapActivationResult>, "activation");
       return this.activate(input, parsed.value);
     }
 
-    // Otherwise the ordinary path, for a first call and for every retry alike: the producer
-    // reconciles its ledger against GitHub, performs what is left, and rebuilds the result. A
-    // result that cannot be stored leaves no checkout behind (`persist` runs inside the
-    // producer's cleanup), so the retry takes this same path.
+    // Otherwise the producer, for a first attempt and every recovery alike: it reconciles its ledger
+    // against GitHub — a repository is this run's only by the node id its create was answered with,
+    // or its creation receipt — performs what is left, and rebuilds the result. The result and
+    // WRITTEN are stored in one transaction, inside the producer's cleanup, so a result that could
+    // not be stored leaves no checkout and the next attempt takes this same path.
     const produced = await produceRepoFactoryResult({
       plan: executable,
       workDir: join(workRoot, runId),
@@ -496,26 +700,223 @@ export class RepoFactoryBootstrapRunner {
       // The reviewed files, and the tree the producer reports must be exactly these (#246 C2).
       approvedFiles: outputs.files,
       persist: (result) => {
-        this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, result);
+        const written = this.deps.db.txDecision(() => {
+          this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, result);
+          return this.deps.applications.markWritten(runId);
+        });
+        if (!written.allowed) throw acpError(written.reasonCode, written.message, written.evidence);
       },
     });
-    if (!produced.allowed) return atStage(produced as Decision<ACPBootstrapActivationResult>, "production");
+    if (!produced.allowed) {
+      const refusal = produced.evidence["refusal"];
+      // The repository at the target cannot be attributed to this run: someone else's, a name
+      // reused, a create whose answer was never recorded, or a ledger that cannot be read. After an
+      // attempt, that is STRANDED — never a recreate, never an adoption by name.
+      if (produced.reasonCode === ReasonCode.RESOURCE_COLLISION || (typeof refusal === "string" && LEDGER_REFUSALS.has(refusal))) {
+        return this.strand(runId, "ATTRIBUTION_UNCERTAIN", {
+          production: refusalRecord(produced, "production"),
+          ledgerPath: githubLedgerPath(join(workRoot, runId), executable.repositoryRole),
+        });
+      }
+      this.deps.applications.recordRefusal(runId, refusalRecord(produced, "production"));
+      return atStage(produced as Decision<ACPBootstrapActivationResult>, "production");
+    }
     return this.activate(input, produced.value);
   }
 
   /**
-   * The owner's receipt must name this run, this operation and exactly these parameters, and
-   * approve them. It is consumed once for the candidate the CEO confirms; a retry for the same
-   * candidate is re-admitted from that durable consumption rather than from the ingress replay
-   * cache, which expires, and a CONFIRM naming another candidate is refused.
+   * The run checks again, synchronously, inside the transaction that consumes the approval or
+   * records an attempt: GitHub was awaited since they were first made.
    */
-  private admitApproval(
+  private stillApplicable(runId: string): Decision<void> {
+    const run = this.deps.runs.get(runId);
+    if (run === null || run.projectId !== null || run.state !== RunState.READY_FOR_CEO_REVIEW) {
+      return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "the bootstrap run left CEO review before its application was recorded", {
+        stage: "precondition",
+        refusal: "RUN_NOT_AT_CEO_REVIEW",
+        runId,
+        state: run?.state ?? null,
+      });
+    }
+    return this.assertOwnerPin(run);
+  }
+
+  /** #246 C3 — the run's owner pin is its ACTIVE BOOTSTRAP_CTO, at the pinned generation. */
+  private assertOwnerPin(run: RunRow): Decision<void> {
+    const roleKey = roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId });
+    if (run.ownerSessionId === null || run.ownerBindingGeneration === null || run.ownerRoleKey !== roleKey) {
+      return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "the bootstrap run's owner is not pinned to its BOOTSTRAP_CTO", {
+        refusal: "OWNER_PIN_NOT_BOOTSTRAP_CTO",
+        runId: run.runId,
+        ownerRoleKey: run.ownerRoleKey,
+      });
+    }
+    const active = this.deps.bindings.active(roleKey);
+    if (active === null || active.status !== "ACTIVE" || active.boundSessionId !== run.ownerSessionId) {
+      return deny(ReasonCode.RUN_OWNER_REVOKED, "the bootstrap run's pinned owner is not its ACTIVE BOOTSTRAP_CTO", {
+        refusal: "OWNER_PIN_NOT_ACTIVE",
+        runId: run.runId,
+        ownerSessionId: run.ownerSessionId,
+        activeSessionId: active?.boundSessionId ?? null,
+      });
+    }
+    if (active.bindingGeneration !== run.ownerBindingGeneration) {
+      return deny(ReasonCode.BINDING_GENERATION_STALE, "the bootstrap run's owner pin names a superseded BOOTSTRAP_CTO generation", {
+        refusal: "OWNER_PIN_STALE",
+        runId: run.runId,
+        pinned: run.ownerBindingGeneration,
+        current: active.bindingGeneration,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * #246 C3 — the project id and repository identity this run would reserve: held by no other run,
+   * no such project registered, no such identity bound. A WRITTEN application's own activation may
+   * already have registered both, and only its own: the registries refuse an id or identity another
+   * run reserved. Synchronous, so the reservation transaction asks it again.
+   */
+  private reservationConflicts(
+    reservation: BootstrapApplicationReservation,
+    existing: BootstrapApplication | null,
+  ): Decision<void> {
+    const { runId, projectId, repositoryIdentity } = reservation;
+    const others = this.deps.applications.heldByOthers(runId, { projectId, repositoryIdentity });
+    if (others.length > 0) {
+      return deny(
+        ReasonCode.BOOTSTRAP_APPLICATION_RESERVED,
+        "another bootstrap run holds the reservation for this project id or repository identity",
+        {
+          stage: "precondition",
+          refusal: "BOOTSTRAP_APPLICATION_RESERVED",
+          runId,
+          projectId,
+          repositoryIdentity,
+          heldBy: others.map((other) => ({ runId: other.runId, phase: other.phase })),
+        },
+      );
+    }
+    const ownActivation = existing?.phase === "WRITTEN";
+    if (this.deps.projects.get(projectId) !== null && !ownActivation) {
+      return deny(ReasonCode.PROJECT_EXISTS, "the project the manifest names is already registered", {
+        stage: "precondition",
+        refusal: "PROJECT_EXISTS",
+        runId,
+        projectId,
+      });
+    }
+    const bound = this.deps.repositories.byIdentity(repositoryIdentity);
+    if (bound !== null && !(ownActivation && bound.projectId === projectId)) {
+      return deny(ReasonCode.IDENTITY_COLLISION, "the repository identity this bootstrap creates is already bound", {
+        stage: "precondition",
+        refusal: "IDENTITY_COLLISION",
+        runId,
+        repositoryIdentity,
+        boundTo: bound.projectId,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * #246 C3 — GitHub, observed and never written: the target holds no repository, or one this run
+   * created by the evidence it recorded — the node id its create was answered with in the attempt
+   * ledger, or its creation receipt. A name match is never evidence. Before any reservation a
+   * repository with no such evidence is a RESOURCE_COLLISION and nothing is consumed; after an
+   * attempt was recorded its attribution is uncertain, and the application is STRANDED with no
+   * create.
+   */
+  private async observedTarget(
     runId: string,
-    candidateSnapshotDigest: string,
+    workRoot: string,
+    plan: RepoFactoryPlanFixture,
+    execution: GitHubExecutionPlan,
+    existing: BootstrapApplication | null,
+  ): Promise<Decision<void>> {
+    const ledgerPath = githubLedgerPath(join(workRoot, runId), plan.repositoryRole);
+    const ledger = readGitHubLedger(
+      ledgerPath,
+      { bootstrapOperationId: plan.bootstrapOperationId, requestDigest: plan.requestDigest },
+      execution.operations,
+    );
+    if (!ledger.allowed) {
+      if (existing === null) return atStage(ledger as Decision<void>, "precondition");
+      return this.strand(runId, "ATTRIBUTION_UNCERTAIN", { ledger: refusalRecord(ledger, "precondition"), ledgerPath });
+    }
+    let observed: ObservedRepository | null;
+    try {
+      observed = await this.deps.githubPort.observeRepository(execution.target);
+    } catch (error) {
+      const unanswered = deny(
+        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+        "GitHub did not answer the read that tells whether the target is free; nothing is consumed or written",
+        {
+          stage: "precondition",
+          refusal: "REMOTE_REFUSED",
+          runId,
+          target: `${execution.target.owner}/${execution.target.name}`,
+          remote: { message: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300) },
+          resumable: true,
+        },
+      );
+      if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(unanswered, "precondition"));
+      return unanswered;
+    }
+    if (observed === null) return allow(ReasonCode.OK, undefined);
+    const createOperation = execution.operations.find((operation) => operation.resourceType === "repository");
+    const receipt = createOperation === undefined ? undefined : ledger.value.receipts.get(createOperation.operationId);
+    const pending = createOperation === undefined ? undefined : ledger.value.pending.get(createOperation.operationId);
+    const recordedNodeId = receipt?.resourceType === "repository" ? receipt.observed.nodeId : pending?.respondedNodeId ?? null;
+    if (recordedNodeId !== null && recordedNodeId === observed.nodeId) return allow(ReasonCode.OK, undefined);
+    const evidence = {
+      target: `${execution.target.owner}/${execution.target.name}`,
+      observedNodeId: observed.nodeId,
+      recordedNodeId,
+      createSent: pending !== undefined,
+      ledgerPath,
+    };
+    if (existing === null) {
+      return deny(
+        ReasonCode.RESOURCE_COLLISION,
+        "GitHub already holds a repository at the target, and nothing this run recorded attributes it to this run; it is not adopted, and nothing is consumed or written",
+        { stage: "precondition", refusal: "RESOURCE_COLLISION", runId, ...evidence },
+      );
+    }
+    return this.strand(runId, "ATTRIBUTION_UNCERTAIN", evidence);
+  }
+
+  /**
+   * STRANDED: the reservation and the evidence are kept, nothing is created, adopted, retried or
+   * deleted, and the answer names the cause and the recovery a person performs.
+   */
+  private strand<T>(runId: string, cause: string, evidence: Evidence): Decision<T> {
+    const stranded = { cause, requiredRecovery: STRANDED_RECOVERY, evidence };
+    const marked = this.deps.applications.markStranded(runId, stranded);
+    return deny(
+      ReasonCode.BOOTSTRAP_APPLICATION_STRANDED,
+      "what GitHub holds at this bootstrap's target cannot be attributed to this run; the application is STRANDED and a person resolves it",
+      {
+        stage: "precondition",
+        refusal: "BOOTSTRAP_APPLICATION_STRANDED",
+        runId,
+        ...stranded,
+        recorded: marked.allowed,
+      },
+    );
+  }
+
+  /**
+   * The owner's receipt must name this run, this operation and exactly these parameters, and
+   * approve them. Pure: whether it may be consumed for the candidate the CEO confirms — once, or
+   * re-admitted from that durable consumption on a retry — is asked of the owner authority.
+   */
+  private approvalReceipt(
+    runId: string,
     presented: unknown,
     parameters: Parameters<typeof repoFactoryGitHubWriteParameters>[0],
-  ): Decision<void> {
-    const refuse = (refusal: string, message: string, evidence: Evidence = {}): Decision<void> =>
+  ): Decision<OwnerApprovalReceipt> {
+    const refuse = (refusal: string, message: string, evidence: Evidence = {}): Decision<OwnerApprovalReceipt> =>
       deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, message, { refusal, runId, ...evidence });
     const parsed = ownerApprovalReceiptSchema.safeParse(presented);
     if (!parsed.success) {
@@ -539,16 +940,7 @@ export class RepoFactoryBootstrapRunner {
       );
     }
     if (!receipt.approved) return refuse("APPROVAL_DECLINED", "the owner declined this GitHub write");
-
-    // Consumed for the candidate the CEO confirms rather than the run's candidate pointer, which
-    // an unpromoted bootstrap leaves null and which would let one approval serve two confirmations.
-    // Whether the receipt may authorise that candidate is the owner authority's judgement alone,
-    // made before anything is consumed: a receipt minted for another candidate is refused
-    // (RF1050-03), and so is one an earlier head consumed with no candidate, whose remedy is a new
-    // owner decision (RF1050-04).
-    const retained = this.deps.ownerAuthority.assertConsumedApproval(receipt, candidateSnapshotDigest);
-    if (retained.allowed) return retained;
-    return this.deps.ownerAuthority.consumeApproval(receipt, candidateSnapshotDigest);
+    return allow(ReasonCode.OK, receipt);
   }
 
   private async activate(
@@ -581,6 +973,9 @@ export class RepoFactoryBootstrapRunner {
       projectName: input.projectName,
       handoff: input.handoff,
     });
+    // The WRITTEN application keeps the last refusal activation met — a primary CTO that could not
+    // be provisioned, a handoff not yet acknowledged — and the next CONFIRM activates it again.
+    if (!activated.allowed) this.deps.applications.recordRefusal(input.runId, refusalRecord(activated, "activation"));
     return atStage(activated, "activation");
   }
 }

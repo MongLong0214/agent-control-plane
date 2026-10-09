@@ -335,10 +335,12 @@ export const dispatchBootstrapRun = async (cp: ControlPlane, clock: Clock, runId
 };
 
 /**
- * TODO(C3): issue #246 slice C3 reopens the bootstrap CONFIRM. Until then every CONFIRM door refuses
- * it `BOOTSTRAP_APPLICATION_NOT_AVAILABLE`, so a fixture that needs a COMPLETED bootstrap run does
- * what that CONFIRM's transaction does — `finalizeBootstrapActivationConfirm`, then COMPLETED under
- * the bootstrap-activation authority — in one transaction, and names itself. Delete with the guard.
+ * Issue #246 slice C3 reopened the bootstrap CONFIRM through the Repo Factory runner's full path, and
+ * the gate completes a bootstrap only on the WRITTEN application record that path writes. A fixture
+ * that activates a bootstrap without the runner (`BootstrapActivation.activate` directly) has no such
+ * record, so its CONFIRM is refused `BOOTSTRAP_APPLICATION_NOT_AVAILABLE`; one that needs the run
+ * COMPLETED does what that CONFIRM's transaction does — `finalizeBootstrapActivationConfirm`, then
+ * COMPLETED under the bootstrap-activation authority — in one transaction, and names itself.
  */
 export const completeBootstrapRunUntilC3 = (
   cp: ControlPlane,

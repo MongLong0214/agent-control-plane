@@ -850,10 +850,31 @@ export const ReasonCode = {
   BOOTSTRAP_ACTIVATION_INCOMPLETE: "BOOTSTRAP_ACTIVATION_INCOMPLETE",
   BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION: "BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION",
   /**
-   * A PROJECT_BOOTSTRAP CONFIRM, which would perform the run's GitHub writes, is refused until the
-   * durable application record (issue #246 PR-C slice C3) exists. Nothing is written or consumed.
+   * A PROJECT_BOOTSTRAP CONFIRM completes only on its durable application record (issue #246 PR-C
+   * slice C3) WRITTEN for the candidate it names, which only the Repo Factory runner's full path
+   * writes; a decision that reached the gate without it completes nothing.
    */
   BOOTSTRAP_APPLICATION_NOT_AVAILABLE: "BOOTSTRAP_APPLICATION_NOT_AVAILABLE",
+  /**
+   * #246 C3 — an external write of this bootstrap run's application may have happened (an attempt is
+   * recorded), so its plan is frozen: `plan_submit` and FINAL_REVISE are refused, and a CONFIRM may
+   * only re-apply the same frozen candidate under the same approval.
+   */
+  BOOTSTRAP_APPLICATION_FROZEN: "BOOTSTRAP_APPLICATION_FROZEN",
+  /**
+   * #246 C3 — what GitHub holds at this run's target cannot be attributed to this run by evidence it
+   * recorded (the attempt ledger's node id or the creation receipt). The reservation and the evidence
+   * are kept, nothing is created or adopted, and a person resolves it.
+   */
+  BOOTSTRAP_APPLICATION_STRANDED: "BOOTSTRAP_APPLICATION_STRANDED",
+  /** #246 C3 — another bootstrap run holds the reservation for this project id or repository identity. */
+  BOOTSTRAP_APPLICATION_RESERVED: "BOOTSTRAP_APPLICATION_RESERVED",
+  /** #246 C3 — an application attempt of this run is already in flight; a concurrent CONFIRM writes nothing. */
+  BOOTSTRAP_APPLICATION_IN_PROGRESS: "BOOTSTRAP_APPLICATION_IN_PROGRESS",
+  /** #246 C3 — the project a bootstrap's manifest names is already registered. Nothing is written. */
+  PROJECT_EXISTS: "PROJECT_EXISTS",
+  /** #246 C3 — the repository identity a bootstrap would create is already bound. Nothing is written. */
+  IDENTITY_COLLISION: "IDENTITY_COLLISION",
   BOOTSTRAP_CONTRACT_DRIFT: "BOOTSTRAP_CONTRACT_DRIFT",
   BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION: "BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION",
   HERMES_BOOTSTRAP_ALREADY_INITIALIZED: "HERMES_BOOTSTRAP_ALREADY_INITIALIZED",

@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { BootstrapActivation } from "../bootstrap/activation.ts";
+import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { planForSubmission } from "../bootstrap/bootstrap-plan.ts";
 import { githubOperationSchema } from "../bootstrap/repo-factory-github.ts";
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
@@ -66,6 +67,7 @@ export interface CtoMcpSource extends McpMutationSource {
   readonly runs: RunEngine;
   readonly sessions: SessionRegistry;
   readonly sessionAttestations: SessionAttestations;
+  readonly bootstrapApplications: Pick<BootstrapApplications, "assertNotFrozen">;
   readonly bindings: BindingRegistry;
   readonly tasks: TaskGraph;
   readonly workerTurns: WorkerTurnRunner;
@@ -147,6 +149,10 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     // and against the digest the PLAN names before anything is stored; any other run's is stored
     // exactly as before.
     submitPlan: (runId: string, plan: Record<string, unknown>): Decision<{ digest: string }> => {
+      // #246 C3 — the contract freeze: once an external write of a bootstrap run's application may
+      // have happened, its PLAN is never replaced, so a recovery can only re-apply what was frozen.
+      const frozen = source.bootstrapApplications.assertNotFrozen(runId, "plan_submit");
+      if (!frozen.allowed) return frozen as Decision<{ digest: string }>;
       const admitted = planForSubmission(source.runs.require(runId), plan);
       if (!admitted.allowed) return admitted as Decision<{ digest: string }>;
       return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, admitted.value).digest });

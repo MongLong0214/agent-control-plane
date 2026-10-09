@@ -35,6 +35,14 @@ export interface OwnerAuthorityPort {
    * transition.
    */
   consumeApproval(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void>;
+  /**
+   * Whether `consumeApproval` would consume this receipt for this candidate, answered without
+   * consuming it: the same admission, candidate binding and single-use checks, and no write. A caller
+   * whose consumption must wait for checks it cannot make inside a transaction asks this first
+   * (#246 C3: a bootstrap's pre-write checks), so a receipt that could never be consumed is refused
+   * before anything is observed or written.
+   */
+  assertConsumable(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void>;
 }
 
 /**
@@ -186,20 +194,9 @@ export class OwnerAuthority implements OwnerAuthorityPort {
     candidateSnapshotDigest: string | null,
   ): Decision<void> {
     return this.db.tx(() => {
-      const admitted = this.assertApproval(receipt);
-      if (!admitted.allowed) return admitted;
-
+      const consumable = this.assertConsumable(receipt, candidateSnapshotDigest);
+      if (!consumable.allowed) return consumable;
       const receiptDigest = digestOf(receipt);
-      const prior = this.consumedReceipt(receiptDigest);
-      const bound = this.candidateBinding(receipt, receiptDigest, prior, candidateSnapshotDigest);
-      if (!bound.allowed) return bound;
-      if (prior) {
-        return deny(
-          ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-          "owner approval receipt has already been consumed",
-          { receiptDigest, candidateSnapshotDigest },
-        );
-      }
 
       this.db.run(
         `INSERT INTO audit_events
@@ -227,6 +224,24 @@ export class OwnerAuthority implements OwnerAuthorityPort {
       );
       return allow(ReasonCode.OK, undefined);
     });
+  }
+
+  assertConsumable(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void> {
+    const admitted = this.assertApproval(receipt);
+    if (!admitted.allowed) return admitted;
+
+    const receiptDigest = digestOf(receipt);
+    const prior = this.consumedReceipt(receiptDigest);
+    const bound = this.candidateBinding(receipt, receiptDigest, prior, candidateSnapshotDigest);
+    if (!bound.allowed) return bound;
+    if (prior) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner approval receipt has already been consumed",
+        { receiptDigest, candidateSnapshotDigest },
+      );
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /**

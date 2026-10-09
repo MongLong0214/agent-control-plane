@@ -1041,9 +1041,10 @@ describe("Repo Factory boundary (CP-S52)", () => {
       ceoSessionId,
       rationale: "activation facts rechecked",
     });
-    // Issue #246 PR-C: the bootstrap CONFIRM is shut until C3.
+    // #246 C3: this activation was not produced by the Repo Factory runner, so the run has no WRITTEN
+    // application record and the gate's CONFIRM completes nothing.
     expect(confirmed.reasonCode).toBe(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
-    // TODO(C3): confirm through `submitCeoDecision` again once C3 reopens the bootstrap CONFIRM.
+    // What the CONFIRM's transaction does is done by the fixture, for this runner-less activation.
     expect(completeBootstrapRunUntilC3(harness.cp, { runId, candidateSnapshotDigest: bootstrapCandidate, ceoSessionId }).allowed)
       .toBe(true);
 

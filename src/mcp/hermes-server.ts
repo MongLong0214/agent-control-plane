@@ -133,10 +133,15 @@ export const createHermesMcpPort = (
       if (input.decision === "CONFIRM" && source.runs.get(input.runId)?.kind === RunKind.PROJECT_BOOTSTRAP) {
         const admissible = source.ceo.assertCeoDecisionAdmissible(input);
         if (!admissible.allowed) return admissible as Decision<{ state: RunState }>;
-        const produced = await source.bootstrapProducer.produceAndActivateApproved(
-          input.runId,
-          input.candidateSnapshotDigest,
-        );
+        // #246 C3 — the runner's full path: pre-write checks, reservation, an attempt recorded
+        // before every external write, WRITTEN with the result, activation. It asks the CEO's
+        // admission again itself, so a door that skipped the question above still writes nothing.
+        const produced = await source.bootstrapProducer.produceAndActivateApproved({
+          runId: input.runId,
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          ceoSessionId: input.ceoSessionId,
+          rationale: input.rationale,
+        });
         if (!produced.allowed) return produced as Decision<{ state: RunState }>;
       }
       const decision = source.ceo.submitCeoDecision(input);

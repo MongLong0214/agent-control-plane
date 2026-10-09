@@ -1075,6 +1075,7 @@ describe("baseline boundary contracts", () => {
       "v40-peer-message-carry-record",
       "v41-runtime-managed-worker-turns",
       "v42-session-credential-epoch",
+      "v43-bootstrap-application-record",
     ]);
   });
 

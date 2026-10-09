@@ -23,7 +23,6 @@ import { git } from "../../src/git/git.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import {
   TEST_OWNER,
-  completeBootstrapRunUntilC3,
   dispatchBootstrapRun,
   fixtureManifest,
   makeHarness,
@@ -194,11 +193,22 @@ const prepare = async (
     githubPort: github,
     workRoot,
     clock: harness.cp.clock,
+    // #246 C3 — the application record and the pre-write checks' sources, as composed.
+    db: harness.cp.db,
+    applications: harness.cp.bootstrapApplications,
+    ceo: harness.cp.ceo,
+    bindings: harness.cp.bindings,
+    projects: harness.cp.projects,
+    repositories: harness.cp.repositories,
   });
+  // The CEO's admission, which the runner asks among its pre-write checks, needs a current
+  // continuity evaluation, as the CONFIRM door has before it calls the runner.
+  await harness.cp.continuity.evaluate("bootstrap confirmation");
   const input: ProduceAndActivateInput = {
     runId,
     // The candidate the CEO confirms: the one the blind review above passed.
     candidateSnapshotDigest: snapshotDigest,
+    ceoSessionId: reviewed.ceoSessionId,
     ownerApproval: null,
     approvedManifest: manifest,
     projectName: projectId,
@@ -338,8 +348,9 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     expect((await git(checkout, ["rev-parse", "HEAD"])).stdout.trim()).toBe(remoteHead);
     expect(harness.cp.repositories.byIdentity(IDENTITY)).not.toBeNull();
 
-    // And the CEO confirm completes the run on that activation. Issue #246 PR-C: the bootstrap
-    // CONFIRM is shut until C3, so the gate refuses it and nothing is completed by it.
+    // And the CEO confirm completes the run on that activation, and its WRITTEN application with it
+    // (#246 C3): one attempt, one reservation, COMPLETED in the same transaction as the run.
+    expect(harness.cp.bootstrapApplications.get(runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
     const ceoSessionId = prepared.ceoSessionId;
     await harness.cp.continuity.evaluate("bootstrap confirmation");
     const confirmed = harness.cp.ceo.submitCeoDecision({
@@ -349,15 +360,9 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
       ceoSessionId,
       rationale: "activation driven by produced output",
     });
-    expect(confirmed.reasonCode).toBe(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
-    // TODO(C3): confirm through `submitCeoDecision` again once C3 reopens the bootstrap CONFIRM.
-    const completed = completeBootstrapRunUntilC3(harness.cp, {
-      runId,
-      candidateSnapshotDigest: prepared.snapshotDigest,
-      ceoSessionId,
-    });
-    if (!completed.allowed) throw new Error(`${completed.reasonCode}: ${completed.message}`);
+    if (!confirmed.allowed) throw new Error(`${confirmed.reasonCode}: ${confirmed.message}`);
     expect(harness.cp.runs.require(runId).state).toBe(RunState.COMPLETED);
+    expect(harness.cp.bootstrapApplications.get(runId)).toMatchObject({ phase: "COMPLETED", attempts: 1 });
   });
 
   it("refuses with no owner approval, before any GitHub call", async () => {
@@ -535,9 +540,11 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     prepared.harness.cp.runs.transition(prepared.runId, RunState.REVISION_REQUIRED, "sent back");
     const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: null });
     expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
-    expect(refused.evidence["stage"]).toBe("precondition");
+    // #246 C3 — the first pre-write check: a bootstrap application needs the run at CEO review.
+    expect(refused.reasonCode).toBe(ReasonCode.RUN_TRANSITION_ILLEGAL);
+    expect(refused.evidence).toMatchObject({ stage: "precondition", refusal: "RUN_NOT_AT_CEO_REVIEW" });
     noGitHubCall(prepared);
+    expect(prepared.harness.cp.bootstrapApplications.get(prepared.runId)).toBeNull();
   });
 });
 

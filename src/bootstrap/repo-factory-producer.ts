@@ -1,5 +1,4 @@
 import {
-  existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
@@ -294,6 +293,45 @@ const checkoutMarkerOf = (localRepoPath: string): string | null => {
   } catch {
     return null;
   }
+};
+
+/**
+ * Issue #246 PR-C slice C3 — whether anything already occupies the checkout leaf a plan would
+ * create, as the refusal the producer's own fast path gives for it, or null when the leaf is free.
+ * The runner asks this among its pre-write checks, before the owner's approval is consumed; the
+ * producer asks it again, and the atomic leaf creation below stays the collision authority. Read
+ * with `lstat`, so a symlink, dangling or not, occupies the leaf too. Nothing is removed or reused on
+ * the strength of what this finds.
+ */
+export const occupiedCheckoutLeaf = (
+  workDir: string,
+  plan: Pick<RepoFactoryPlanFixture, "repositoryRole" | "bootstrapOperationId">,
+): Decision<never> | null => {
+  const localRepoPath = repositoryCheckoutPath(workDir, plan.repositoryRole);
+  try {
+    lstatSync(localRepoPath);
+  } catch {
+    return null;
+  }
+  // Said explicitly when the checkout is this operation's own (PR #1043 review, RF1043-02): a
+  // run that stopped without cleaning up — killed, or still running — leaves it. It is named
+  // and kept rather than reclaimed: a matching HEAD does not make its tracked edits, untracked or
+  // ignored files recoverable, and a live run cannot be told from a dead one, so a reclaiming
+  // retry could delete what another retry had just claimed (round 3, RF1043-07). A person
+  // removes it once nothing in it is wanted and no run of this operation is active; the next
+  // run then resumes from the GitHub ledger.
+  if (checkoutMarkerOf(localRepoPath) === plan.bootstrapOperationId) {
+    return deny(
+      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+      "this bootstrap operation's checkout already exists: an earlier run of it stopped without cleaning up, or is still running. It is not removed automatically; remove it once nothing in it is wanted and no run of this operation is active, and the next run resumes from the GitHub ledger",
+      { refusal: "INTERRUPTED_RUN_CHECKOUT", localRepoPath, resumable: false },
+    );
+  }
+  return deny(
+    ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+    "local repository checkout path already exists; a same-named resource with unknown provenance is a collision, not a resume (Integration §13.3)",
+    { localRepoPath },
+  );
 };
 
 /**
@@ -725,27 +763,8 @@ export const produceRepoFactoryResult = async (
   // system runs multiple same-UID producers concurrently as normal operation, and an
   // `existsSync` check has a gap another process's own creation can land in before this one
   // reads it).
-  if (existsSync(localRepoPath)) {
-    // Said explicitly when the checkout is this operation's own (PR #1043 review, RF1043-02): a
-    // run that stopped without cleaning up — killed, or still running — leaves it. It is named
-    // and kept rather than reclaimed: a matching HEAD does not make its tracked edits, untracked or
-    // ignored files recoverable, and a live run cannot be told from a dead one, so a reclaiming
-    // retry could delete what another retry had just claimed (round 3, RF1043-07). A person
-    // removes it once nothing in it is wanted and no run of this operation is active; the next
-    // run then resumes from the GitHub ledger.
-    if (checkoutMarkerOf(localRepoPath) === plan.bootstrapOperationId) {
-      return deny(
-        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-        "this bootstrap operation's checkout already exists: an earlier run of it stopped without cleaning up, or is still running. It is not removed automatically; remove it once nothing in it is wanted and no run of this operation is active, and the next run resumes from the GitHub ledger",
-        { refusal: "INTERRUPTED_RUN_CHECKOUT", localRepoPath, resumable: false },
-      );
-    }
-    return deny(
-      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-      "local repository checkout path already exists; a same-named resource with unknown provenance is a collision, not a resume (Integration §13.3)",
-      { localRepoPath },
-    );
-  }
+  const occupied = occupiedCheckoutLeaf(workDir, plan);
+  if (occupied !== null) return occupied;
 
   const ownershipPrecheck = assertParentChainNotAttackerWritable(workDir, localRepoPath);
   if (!ownershipPrecheck.allowed) return ownershipPrecheck as Decision<RepoFactoryResult>;

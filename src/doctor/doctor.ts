@@ -13,6 +13,7 @@ import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { strandedBootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
@@ -460,6 +461,7 @@ export class Doctor {
     }
     if (scope === "system" || scope === "run") {
       findings.push(...this.checkRuns(target ?? null));
+      findings.push(...this.checkStrandedBootstrapApplications(target ?? null));
       findings.push(...this.checkWorkers());
     }
     if (scope === "system" || scope === "session") {
@@ -714,6 +716,32 @@ export class Doctor {
       }
     }
     return findings;
+  }
+
+  /**
+   * #246 C3 — a bootstrap application whose target GitHub repository could not be attributed to its
+   * run. It keeps its reservation and its evidence, nothing retries or deletes it, and the finding
+   * says why and what a person does. Not blocking: it holds one project id and one repository
+   * identity, and nothing else depends on it.
+   */
+  private checkStrandedBootstrapApplications(runId: string | null): Finding[] {
+    return strandedBootstrapApplications(this.db, runId).map((application) => ({
+      code: "BOOTSTRAP_APPLICATION_STRANDED",
+      severity: "ERROR",
+      scope: `run:${application.runId}`,
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: {
+        projectId: application.projectId,
+        repositoryIdentity: application.repositoryIdentity,
+        attempts: application.attempts,
+        cause: application.lastRefusal?.["cause"] ?? null,
+        evidence: application.lastRefusal?.["evidence"] ?? null,
+      },
+      recommendedAction: typeof application.lastRefusal?.["requiredRecovery"] === "string"
+        ? (application.lastRefusal["requiredRecovery"] as string)
+        : "a person establishes what the repository at the target is; the reservation is kept and never reused",
+    }));
   }
 
   /** CP-S43 — a receipt says RUNNING but no process backs it. */
