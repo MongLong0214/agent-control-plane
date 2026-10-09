@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { afterAll, expect, it, vi } from "vitest";
 import { Daemon } from "../../src/daemon/daemon.ts";
@@ -120,33 +120,40 @@ it("ordinary worker success leaves no tracked git process group and permits norm
 });
 
 it("normal agentcpd main stop/start reuses the same state directory without a git fence", async () => {
-  const root = tempDir("acp-review-normal-restart-");
-  const lock = join(root, ".agent-control-plane", "agentcpd.lock");
-  const environment = { ...process.env, HOME: root, TMPDIR: "/private/tmp", USER: "startup-owner",
-    ACP_MCP_TOKEN: "startup-mcp-token", ACP_OPERATOR_TOKEN: "startup-operator-token",
-    ACP_OPERATOR_ACTOR: "startup-owner", ACP_STARTUP_TEST_ROOT: root };
-  for (const name of Object.keys(environment)) {
-    if (name.startsWith("ACP_TELEGRAM_") || name.startsWith("ACP_CANONICAL_") || name.startsWith("ACP_BUZZ_") ||
-      name.startsWith("ACP_STARTUP_TEST_") && name !== "ACP_STARTUP_TEST_ROOT" || name === "BUZZ_PRIVATE_KEY") {
-      delete (environment as Record<string, string | undefined>)[name];
+  // macOS sockaddr_un paths are short (104 bytes): a root under the runner's default TMPDIR
+  // (/var/folders/.../T/) makes the operator socket path exceed that limit and fails on the wrong
+  // thing. Rooted under /tmp like the other agentcpd main startup tests, whatever TMPDIR is.
+  const root = mkdtempSync(join("/tmp", "acp-normal-restart-"));
+  try {
+    const lock = join(root, ".agent-control-plane", "agentcpd.lock");
+    const environment = { ...process.env, HOME: root, TMPDIR: "/private/tmp", USER: "startup-owner",
+      ACP_MCP_TOKEN: "startup-mcp-token", ACP_OPERATOR_TOKEN: "startup-operator-token",
+      ACP_OPERATOR_ACTOR: "startup-owner", ACP_STARTUP_TEST_ROOT: root };
+    for (const name of Object.keys(environment)) {
+      if (name.startsWith("ACP_TELEGRAM_") || name.startsWith("ACP_CANONICAL_") || name.startsWith("ACP_BUZZ_") ||
+        name.startsWith("ACP_STARTUP_TEST_") && name !== "ACP_STARTUP_TEST_ROOT" || name === "BUZZ_PRIVATE_KEY") {
+        delete (environment as Record<string, string | undefined>)[name];
+      }
     }
-  }
-  for (const seed of ["1", "0"]) {
-    const child = spawn(process.execPath, ["--import", "tsx", "tests/helpers/run-agentcpd-main.ts"], {
-      cwd: process.cwd(), env: { ...environment, ACP_STARTUP_TEST_SEED: seed }, stdio: ["ignore", "pipe", "pipe"],
-    });
-    const output: Buffer[] = [];
-    child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => output.push(chunk));
-    try {
-      const code = await new Promise<number | null>(resolve => child.once("exit", resolve));
-      expect(code, Buffer.concat(output).toString()).toBe(0);
-      expect(Buffer.concat(output).toString()).toContain("shutting down on STARTUP_TEST");
-      expect(existsSync(lock)).toBe(false);
-      expect(existsSync(`${lock}.git-fence.json`)).toBe(false);
-    } finally {
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    for (const seed of ["1", "0"]) {
+      const child = spawn(process.execPath, ["--import", "tsx", "tests/helpers/run-agentcpd-main.ts"], {
+        cwd: process.cwd(), env: { ...environment, ACP_STARTUP_TEST_SEED: seed }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      const output: Buffer[] = [];
+      child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
+      child.stderr.on("data", (chunk: Buffer) => output.push(chunk));
+      try {
+        const code = await new Promise<number | null>(resolve => child.once("exit", resolve));
+        expect(code, Buffer.concat(output).toString()).toBe(0);
+        expect(Buffer.concat(output).toString()).toContain("shutting down on STARTUP_TEST");
+        expect(existsSync(lock)).toBe(false);
+        expect(existsSync(`${lock}.git-fence.json`)).toBe(false);
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 }, 60_000);
 import { spawn } from "node:child_process";
