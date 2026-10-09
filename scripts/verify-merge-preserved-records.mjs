@@ -28,50 +28,53 @@
  * repository does not run. `merge-pr.mjs` already recorded that choice -- "nothing forces a merge
  * through `pnpm merge`; `gh pr merge` still works. The post-merge `pnpm trailers HEAD~1..HEAD`
  * step in CI stays as the loud failure on any other path" (0da07459). This check does not dispute
- * the choice; it disputes that `pnpm trailers` is that failure. On 2026-09-15 it went red only
- * because the dropped lines happened to remain in the text in a paragraph that was no longer the
- * last one. A squash whose body is written by hand leaves nothing unparseable behind and that
- * check passes over the same loss.
+ * the choice; it disputes that `pnpm trailers` is that failure.
  *
  * What this converts is a silent loss into a red `main` that names the lost lines, the commits
  * they came from, and the command that puts them back.
  *
- * Which commits are merges, and what each one's branch carried, comes from GitHub, not from a
- * guess about ancestry. A `(#N)` subject is not proof of a squash: 1e3ab0b7 ("test: pin the
- * integrated migrations.ts ... (#1070)") was an ordinary commit on #1070's branch, and reading it
- * as #1070's squash reported the records of 04412845, a commit made after it, as dropped by it.
- * Ancestry cannot tell them apart either (narrow review 4): a squash on a release base becomes an
- * ancestor of the pull request's head once that base is merged into the branch, and the movable
- * `refs/pull/N/head` can be pushed or force-moved after the merge, which changed the verdict both
- * ways. So, for each single-parent `(#N)` commit S:
+ * Which commit is a squash comes from GitHub, and only from the two facts GitHub records about the
+ * merge itself. A `(#N)` subject is not proof: 1e3ab0b7 ("test: pin the integrated migrations.ts
+ * ... (#1070)") was an ordinary commit on #1070's branch, and reading it as #1070's squash reported
+ * the records of 04412845, a commit made after it, as dropped by it. Ancestry could not tell them
+ * apart (narrow review 4), and neither could #N's commit list, whose completeness a duplicated page
+ * faked (narrow review 5). So, for each single-parent `(#N)` commit S, `GET /repos/{repo}/pulls/N`:
  *
- *   * `GET /repos/{repo}/pulls/N`. 404: N is not a pull request (an issue), nothing to compare —
- *     not examined. Any other failure refuses.
- *   * merged, and `merge_commit_sha` is S: S is #N's squash. Its branch is read up to the head it
- *     squashed, established from what the merge preserved rather than taken from the API: the API's
- *     `head.sha` is accepted only when merging it into S's parent gives exactly S's tree, and every
- *     commit S's records say they were inherited from (`Provenance: inherited <sha>`) lies between
- *     S's parent and it. Otherwise S is refused as unverifiable.
- *   * otherwise, S in #N's complete commit list (every page, and as many as the pull request says
- *     it has): a branch commit of #N — not examined, and said so.
- *   * otherwise S names #N but is neither its squash nor its commit: attribution failed, refused.
+ *   * `merged`, and `merge_commit_sha` is S: S is #N's squash, and its records are checked.
+ *   * a valid answer that is anything else -- not merged, or merged as another commit: S is
+ *     attribution non-target, printed as that. It is not a "records preserved" pass.
+ *   * 404 with GitHub's own not-found body: N is not a pull request (an issue), not examined.
+ *     A 404 whose body is anything else, every other status, a failed call and a body missing what
+ *     this reads all refuse.
  *
- * Every lookup that fails refuses — the range, a message, the trailer parser, the notes, a fetch,
- * the API, a page, a parse. None of them reads as empty evidence.
+ * A squash's branch is read up to the head it was merged from, and that head is the one its own
+ * message names: one `Merged-Head: <full sha>` line, which `merge-pr.mjs` writes from the head whose
+ * required CI it checked and hands GitHub as `--match-head-commit`, so GitHub merged exactly it.
+ * The pull request's `head.sha` is not consulted: it moves after the merge, and every way of
+ * corroborating it from the squash -- the tree it reproduces, the `Provenance: inherited` sources
+ * it contains -- was shown to accept a rewritten or rolled-back head (narrow review 5). A squash
+ * whose message carries no such line, more than one, a malformed one, or one naming a commit that
+ * cannot be fetched and read, is refused as unverifiable. Nothing else a historical squash
+ * preserved names its head (GitHub's composed body does not; `Provenance: inherited` names record
+ * sources, not the boundary), so a historical squash without the line is refused too.
  *
- * The API is `gh api`; `ACP_MERGE_RECORDS_GH` names another executable that answers the same calls,
+ * Every lookup that fails refuses -- the range, a message, the trailer parser, the notes, a fetch,
+ * the API, a parse. None of them reads as empty evidence.
+ *
+ * The API is `gh api`; `ACP_MERGE_RECORDS_GH` names another executable that answers the same call,
  * which is how the tests run it offline. The repository is `GITHUB_REPOSITORY`, or origin's GitHub
- * URL.
+ * URL. `merge-pr.mjs` imports `pullRequest`, `examineSquash` and `mergedHeadIn` to read its own merge
+ * back the way this check will.
  *
  * Usage:  node scripts/verify-merge-preserved-records.mjs [<range>]
  *         default range `HEAD~1..HEAD`, which is what CI hands the trailer check beside it.
  */
 import { spawnSync } from "node:child_process";
-
-const range = process.argv[2]?.trim() || "HEAD~1..HEAD";
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 
 /** A lookup that failed: it refuses the commit it was asked about, never answers it emptily. */
-class Unanswered extends Error {}
+export class Unanswered extends Error {}
 
 /** A git call answered on exit 0, or a refusal naming what could not be read. */
 const git = (what, args, input) => {
@@ -89,6 +92,9 @@ const isAncestor = (sha, of) => {
   if (status === 1) return false;
   throw new Unanswered(`could not tell whether ${sha.slice(0, 8)} is an ancestor of ${of.slice(0, 8)}`);
 };
+
+const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+const isSha = (value) => typeof value === "string" && SHA.test(value);
 
 /**
  * The decision-context keys, because counting `Record-Id` alone misses the losses this check was
@@ -121,19 +127,18 @@ const storedRecordIds = (sha) => new Set(storedTrailers(sha).filter(isRecordLine
 let notes;
 const noteLines = (sha) => {
   if (notes === undefined) {
-    notes = new Map();
+    const listed = new Map();
     const exists = spawnSync("git", ["rev-parse", "--quiet", "--verify", "refs/notes/commitlore"], { stdio: "ignore" }).status;
     if (exists === 0) {
       for (const line of git("the commitlore notes", ["notes", "--ref=commitlore", "list"]).split("\n").filter(Boolean)) {
         const [blob, object] = line.split(" ");
-        if (!/^[0-9a-f]{40,64}$/u.test(blob ?? "") || !/^[0-9a-f]{40,64}$/u.test(object ?? "")) {
-          throw new Unanswered("could not parse the commitlore notes list");
-        }
-        notes.set(object, blob);
+        if (!isSha(blob) || !isSha(object)) throw new Unanswered("could not parse the commitlore notes list");
+        listed.set(object, blob);
       }
     } else if (exists !== 1) {
       throw new Unanswered("could not tell whether a commitlore notes ref exists");
     }
+    notes = listed;
   }
   const blob = notes.get(sha);
   if (blob === undefined) return [];
@@ -148,53 +153,81 @@ const repo = () => {
     const named = process.env["GITHUB_REPOSITORY"]?.trim();
     const url = named ? "" : git("origin's URL", ["remote", "get-url", "origin"]).trim();
     const fromUrl = /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/u.exec(url)?.[1];
-    repository = named || fromUrl;
-    if (!repository || !/^[^/\s]+\/[^/\s]+$/u.test(repository)) throw new Unanswered("could not tell which GitHub repository this is");
+    const found = named || fromUrl;
+    if (!found || !/^[^/\s]+\/[^/\s]+$/u.test(found)) throw new Unanswered("could not tell which GitHub repository this is");
+    repository = found;
   }
   return repository;
 };
 
-const GH = process.env["ACP_MERGE_RECORDS_GH"]?.trim() || "gh";
+/**
+ * GitHub's own answer that nothing is at the path: `{"message":"Not Found",
+ * "documentation_url":..., "status":"404"}`. A 404 is read as "no such pull request" only with
+ * this body; a proxy's HTML page, an empty body or anything else is not an answer about #N.
+ */
+const isNotFoundBody = (body) =>
+  typeof body === "object" && body !== null && body.message === "Not Found" &&
+  Object.keys(body).every((key) => key === "message" || key === "documentation_url" || key === "status") &&
+  (body.documentation_url === undefined || typeof body.documentation_url === "string") &&
+  (body.status === undefined || body.status === "404");
 
-/** `GET /repos/{repo}/pulls/N`: the pull request, or "absent" on 404; any other answer refuses. */
-const pullRequest = (pull) => {
-  const result = spawnSync(GH, ["api", "--include", `repos/${repo()}/pulls/${pull}`], {
+/**
+ * `GET /repos/{repo}/pulls/N`: "absent" on GitHub's own not-found answer, otherwise `merged` and
+ * `merge_commit_sha` from a body that carries both validly. Anything else refuses.
+ */
+export const pullRequest = (pull) => {
+  const gh = process.env["ACP_MERGE_RECORDS_GH"]?.trim() || "gh";
+  const result = spawnSync(gh, ["api", "--include", `repos/${repo()}/pulls/${pull}`], {
     encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
   });
   const out = result.stdout ?? "";
   const status = /^HTTP\/[0-9.]+ (\d{3})/u.exec(out)?.[1];
-  if (status === "404") return "absent";
-  if (result.status !== 0 || status !== "200") {
-    throw new Unanswered(`could not read pull request #${pull} from GitHub (${status ? `HTTP ${status}` : `exit ${result.status ?? result.signal}`})`);
-  }
   const separator = /\r?\n\r?\n/u.exec(out);
   let body;
   try {
-    body = JSON.parse(separator ? out.slice(separator.index + separator[0].length) : "");
+    body = separator ? JSON.parse(out.slice(separator.index + separator[0].length)) : undefined;
   } catch {
-    throw new Unanswered(`could not parse pull request #${pull} from GitHub`);
+    body = undefined;
   }
-  const sha = (value) => typeof value === "string" && /^[0-9a-f]{40,64}$/u.test(value);
-  if (typeof body !== "object" || body === null || typeof body.merged !== "boolean" ||
-      !(body.merge_commit_sha === null || sha(body.merge_commit_sha)) || !sha(body.head?.sha) ||
-      !Number.isSafeInteger(body.commits) || body.commits < 0) {
+  if (status === "404") {
+    // `gh api` exits 1 on any HTTP error status, so a 404 that exited otherwise is not that answer.
+    if (result.status !== 1 || !isNotFoundBody(body)) {
+      throw new Unanswered(`GitHub answered 404 for #${pull} without its not-found body, which is not an answer that #${pull} is no pull request`);
+    }
+    return "absent";
+  }
+  if (result.status !== 0 || status !== "200") {
+    throw new Unanswered(`could not read pull request #${pull} from GitHub (${status ? `HTTP ${status}` : `exit ${result.status ?? result.signal}`})`);
+  }
+  if (body === undefined) throw new Unanswered(`could not parse pull request #${pull} from GitHub`);
+  if (typeof body !== "object" || body === null || body.number !== Number(pull) ||
+      typeof body.merged !== "boolean" || !(body.merge_commit_sha === null || isSha(body.merge_commit_sha)) ||
+      (body.merged && !isSha(body.merge_commit_sha))) {
     throw new Unanswered(`pull request #${pull} from GitHub is missing what this check reads`);
   }
-  return { merged: body.merged, mergeCommit: body.merge_commit_sha, head: body.head.sha, commits: body.commits };
+  return { merged: body.merged, mergeCommit: body.merge_commit_sha };
 };
 
-/** Every commit of #N, every page; refused unless it is as many as the pull request says it has. */
-const pullCommits = (pull, expected) => {
-  const result = spawnSync(GH, ["api", "--paginate", "--jq", ".[].sha", `repos/${repo()}/pulls/${pull}/commits`], {
-    encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (result.status !== 0) throw new Unanswered(`could not list the commits of #${pull} from GitHub (exit ${result.status ?? result.signal})`);
-  const shas = (result.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean);
-  if (shas.some((line) => !/^[0-9a-f]{40,64}$/u.test(line))) throw new Unanswered(`could not parse the commits of #${pull} from GitHub`);
-  if (shas.length !== expected) {
-    throw new Unanswered(`GitHub listed ${shas.length} commit(s) of #${pull}, which says it has ${expected}; the list is incomplete`);
+/** Any line declaring the key, in any case or spacing: each one counts against "exactly one". */
+const DECLARES_MERGED_HEAD = /^\s*merged-head\s*:/iu;
+const MERGED_HEAD = /^Merged-Head: ([0-9a-f]{40}|[0-9a-f]{64})$/u;
+
+/**
+ * The head `message` says it was merged from: exactly one `Merged-Head: <full sha>` line, or a
+ * refusal. Missing, duplicate, conflicting and malformed are all "unverifiable", never a guess.
+ */
+export const mergedHeadIn = (message, what) => {
+  const declared = message.split("\n").filter((line) => DECLARES_MERGED_HEAD.test(line));
+  if (declared.length === 0) {
+    throw new Unanswered(`${what} carries no Merged-Head trailer, and nothing it preserved establishes the head it was merged from — unverifiable`);
   }
-  return new Set(shas);
+  if (declared.length > 1) {
+    const kind = new Set(declared.map((line) => line.trim())).size > 1 ? "conflicting" : "duplicate";
+    throw new Unanswered(`${what} carries ${declared.length} ${kind} Merged-Head trailers where exactly one names its merge-time head — unverifiable`);
+  }
+  const head = MERGED_HEAD.exec(declared[0])?.[1];
+  if (head === undefined) throw new Unanswered(`${what}'s Merged-Head trailer is not one full commit sha — unverifiable`);
+  return head;
 };
 
 /** A commit that exists here, fetched from origin when it does not; a refusal when it cannot be had. */
@@ -202,123 +235,123 @@ const haveCommit = (sha, what) => {
   const present = () => spawnSync("git", ["cat-file", "-e", `${sha}^{commit}`], { stdio: "ignore" }).status === 0;
   if (present()) return;
   spawnSync("git", ["fetch", "--quiet", "--no-tags", "origin", sha], { stdio: "ignore" });
-  if (!present()) throw new Unanswered(`could not fetch ${what} ${sha.slice(0, 8)}`);
+  if (!present()) throw new Unanswered(`could not fetch or read ${what} ${sha.slice(0, 8)}, as a commit — unverifiable`);
 };
 
 /**
- * The head #N's squash S was made from, or a refusal. The API's `head.sha` is a claim; S itself and
- * the records it carries are what the merge preserved. Merging the head into S's parent must give
- * exactly S's tree, and every commit S's records name as their source must lie between S's parent
- * and the head.
+ * #N's squash S against its branch, read from S's parent up to the head S's `Merged-Head` names:
+ * every record line that branch carried, and those S keeps neither as a trailer nor in its note.
  */
-const mergedHead = (squash, pull, claimed) => {
-  haveCommit(claimed, `the head GitHub names for #${pull},`);
-  // A squash is made from a head that does not contain it; one that does (a head moved onto the
-  // squash after the merge) would trivially reproduce its tree.
-  if (isAncestor(squash, claimed)) {
-    throw new Unanswered(`#${pull}'s merge-time head cannot be established: ${claimed.slice(0, 8)}, the head GitHub names, already contains ${squash.slice(0, 8)}`);
+export const examineSquash = (squash, pull) => {
+  const short = squash.slice(0, 8);
+  const head = mergedHeadIn(git(`the message of ${short}`, ["log", "-1", "--format=%B", squash]), short);
+  haveCommit(head, "the commit its Merged-Head trailer names,");
+  // A squash is made from a head with commits its parent lacks; a trailer naming one its parent
+  // already has names no branch, and would pass an empty one. (A head containing the squash needs
+  // no check: the squash's message names it, so it cannot descend from the squash.)
+  const parent = git(`the parent of ${short}`, ["rev-parse", "--verify", `${squash}^1`]).trim();
+  if (isAncestor(head, parent)) {
+    throw new Unanswered(`${short}'s Merged-Head ${head.slice(0, 8)} is already in its parent ${parent.slice(0, 8)}, so it names no branch — unverifiable`);
   }
-  const parent = git(`the parent of ${squash.slice(0, 8)}`, ["rev-parse", "--verify", `${squash}^1`]).trim();
-  const merged = spawnSync("git", ["merge-tree", "--write-tree", parent, claimed], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  const tree = git(`the tree of ${squash.slice(0, 8)}`, ["rev-parse", "--verify", `${squash}^{tree}`]).trim();
-  if (merged.status !== 0 || (merged.stdout ?? "").split("\n")[0]?.trim() !== tree) {
-    throw new Unanswered(`#${pull}'s merge-time head cannot be established: ${claimed.slice(0, 8)}, the head GitHub names, does not merge into ${parent.slice(0, 8)} as ${squash.slice(0, 8)}'s tree`);
+  const branchCommits = git(`#${pull}'s branch`, ["rev-list", `${parent}..${head}`]).trim().split("\n").filter(Boolean);
+  const carried = new Map();
+  for (const branchSha of branchCommits) {
+    for (const line of storedRecordIds(branchSha)) if (!carried.has(line)) carried.set(line, branchSha);
   }
-  const sources = [...storedTrailers(squash), ...noteLines(squash)]
-    .map((line) => /^Provenance:\s*inherited\s+([0-9a-f]{40,64})\s*$/u.exec(line)?.[1])
-    .filter(Boolean);
-  for (const source of new Set(sources)) {
-    if (!isAncestor(source, claimed) || isAncestor(source, parent)) {
-      throw new Unanswered(`#${pull}'s merge-time head cannot be established: ${squash.slice(0, 8)} inherits records from ${source.slice(0, 8)}, which is not between ${parent.slice(0, 8)} and ${claimed.slice(0, 8)}`);
-    }
-  }
-  return { parent, head: claimed };
+  const reachable = new Set([...storedRecordIds(squash), ...notedRecordIds(squash)]);
+  const missing = [...carried].filter(([line]) => !reachable.has(line));
+  return { head, parent, carried, missing };
 };
 
 const out = (line) => process.stdout.write(`${line}\n`);
 
-let commits;
-try {
-  commits = git(`the range ${range}`, ["rev-list", "--no-merges", range]).trim().split("\n").filter(Boolean);
-} catch (error) {
-  out(`verify-merge-preserved-records: ${error.message} — refused.`);
-  out(`RESULT: FAIL — the range ${range} could not be read.`);
-  process.exit(1);
-}
-if (commits.length === 0) {
-  out(`verify-merge-preserved-records: no single-parent commit in ${range} — nothing a squash could have dropped.`);
-  out("RESULT: PASS");
-  process.exit(0);
-}
-
-let refused = 0;
-let unanswered = 0;
-let examined = 0;
-for (const sha of commits) {
-  const short = sha.slice(0, 8);
-  let pull;
+const main = () => {
+  const range = process.argv[2]?.trim() || "HEAD~1..HEAD";
+  let commits;
   try {
-    const subject = git(`the subject of ${short}`, ["log", "-1", "--format=%s", sha]).trim();
-    pull = /\(#(\d+)\)\s*$/u.exec(subject)?.[1];
-    // A commit that does not name a pull request was not composed by the forge, so there is no
-    // branch behind it for this check to compare against.
-    if (!pull) continue;
-
-    const pr = pullRequest(pull);
-    if (pr === "absent") {
-      out(`  ${short}  #${pull}  not examined (no PR #${pull})`);
-      continue;
-    }
-    if (!(pr.merged && pr.mergeCommit === sha)) {
-      if (!pullCommits(pull, pr.commits).has(sha)) {
-        throw new Unanswered(`names #${pull} but is neither its squash nor one of its ${pr.commits} commit(s) — attribution failed`);
-      }
-      out(`  ${short}  skipped: branch commit of #${pull}, not a squash (one of #${pull}'s commits; #${pull} ${pr.merged ? `merged as ${pr.mergeCommit.slice(0, 8)}` : "is not merged"})`);
-      continue;
-    }
-
-    const { parent, head } = mergedHead(sha, pull, pr.head);
-    examined += 1;
-    const branchCommits = git(`#${pull}'s branch`, ["rev-list", `${parent}..${head}`]).trim().split("\n").filter(Boolean);
-    const carried = new Map();
-    for (const branchSha of branchCommits) {
-      for (const line of storedRecordIds(branchSha)) if (!carried.has(line)) carried.set(line, branchSha);
-    }
-    const reachable = new Set([...storedRecordIds(sha), ...notedRecordIds(sha)]);
-    const missing = [...carried].filter(([line]) => !reachable.has(line));
-    if (missing.length === 0) {
-      out(`  #${pull}  ${carried.size} record line(s) on the branch, all reachable from ${short} (the branch read up to its merge-time head ${head.slice(0, 8)})`);
-      continue;
-    }
-    refused += 1;
-    out("");
-    out(`  ${short}  #${pull}  ${missing.length} record line(s) the branch carried and this merge does not keep (the branch read up to its merge-time head ${head.slice(0, 8)}):`);
-    for (const [line, from] of missing.slice(0, 8)) out(`      ${from.slice(0, 8)}  ${line.slice(0, 96)}`);
-    if (missing.length > 8) out(`      ... and ${missing.length - 8} more`);
-    out("      The merge kept only the last paragraph, which is every squash's behaviour.");
-    out(`      Restore:  git fetch origin ${head}`);
-    out(`                git log -1 --format=%B <the commit above> | git interpret-trailers --parse`);
-    out(`                git notes --ref=commitlore add -F - ${short}`);
-    out(`                git push origin refs/notes/commitlore`);
+    commits = git(`the range ${range}`, ["rev-list", "--no-merges", range]).trim().split("\n").filter(Boolean);
   } catch (error) {
-    if (!(error instanceof Unanswered)) throw error;
-    unanswered += 1;
-    out(`  ${short}  ${pull ? `#${pull}  ` : ""}refused: ${error.message}`);
+    out(`verify-merge-preserved-records: ${error.message} — refused.`);
+    out(`RESULT: FAIL — the range ${range} could not be read.`);
+    process.exit(1);
   }
-}
+  if (commits.length === 0) {
+    out(`verify-merge-preserved-records: no single-parent commit in ${range} — nothing a squash could have dropped.`);
+    out("RESULT: PASS");
+    process.exit(0);
+  }
 
-out("");
-out(`verify-merge-preserved-records: ${examined} merge commit(s) examined in ${range}.`);
-if (refused > 0 || unanswered > 0) {
-  if (refused > 0) {
-    out("A merge performed with `gh pr merge` cannot preserve them; `pnpm merge` calls");
-    out("`commitlore squash-preserve` first and is the only merge path here that can.");
+  let refused = 0;
+  let unanswered = 0;
+  let examined = 0;
+  let nonTarget = 0;
+  for (const sha of commits) {
+    const short = sha.slice(0, 8);
+    let pull;
+    try {
+      const subject = git(`the subject of ${short}`, ["log", "-1", "--format=%s", sha]).trim();
+      pull = /\(#(\d+)\)\s*$/u.exec(subject)?.[1];
+      // A commit that does not name a pull request was not composed by the forge, so there is no
+      // branch behind it for this check to compare against.
+      if (!pull) continue;
+
+      const pr = pullRequest(pull);
+      if (pr === "absent") {
+        out(`  ${short}  #${pull}  not examined (no PR #${pull})`);
+        continue;
+      }
+      if (!(pr.merged && pr.mergeCommit === sha)) {
+        nonTarget += 1;
+        out(`  ${short}  #${pull}  attribution non-target (not PR #${pull}'s squash: #${pull} ${pr.merged ? `merged as ${pr.mergeCommit.slice(0, 8)}` : "is not merged"}); its records are not compared`);
+        continue;
+      }
+
+      const { head, carried, missing } = examineSquash(sha, pull);
+      examined += 1;
+      if (missing.length === 0) {
+        out(`  #${pull}  ${carried.size} record line(s) on the branch, all reachable from ${short} (the branch read up to its merge-time head ${head.slice(0, 8)})`);
+        continue;
+      }
+      refused += 1;
+      out("");
+      out(`  ${short}  #${pull}  ${missing.length} record line(s) the branch carried and this merge does not keep (the branch read up to its merge-time head ${head.slice(0, 8)}):`);
+      for (const [line, from] of missing.slice(0, 8)) out(`      ${from.slice(0, 8)}  ${line.slice(0, 96)}`);
+      if (missing.length > 8) out(`      ... and ${missing.length - 8} more`);
+      out("      The merge kept only the last paragraph, which is every squash's behaviour.");
+      out(`      Restore:  git fetch origin ${head}`);
+      out(`                git log -1 --format=%B <the commit above> | git interpret-trailers --parse`);
+      out(`                git notes --ref=commitlore add -F - ${short}`);
+      out(`                git push origin refs/notes/commitlore`);
+    } catch (error) {
+      if (!(error instanceof Unanswered)) throw error;
+      unanswered += 1;
+      out(`  ${short}  ${pull ? `#${pull}  ` : ""}refused: ${error.message}`);
+    }
   }
-  const reasons = [
-    ...(refused > 0 ? [`${refused} merge commit(s) dropped record lines their branch carried`] : []),
-    ...(unanswered > 0 ? [`${unanswered} commit(s) could not be checked`] : []),
-  ];
-  out(`RESULT: FAIL — ${reasons.join("; ")}.`);
-  process.exit(1);
-}
-out("RESULT: PASS");
+
+  out("");
+  out(`verify-merge-preserved-records: ${examined} merge commit(s) examined, ${nonTarget} attribution non-target, in ${range}.`);
+  if (refused > 0 || unanswered > 0) {
+    if (refused > 0) {
+      out("A merge performed with `gh pr merge` cannot preserve them; `pnpm merge` calls");
+      out("`commitlore squash-preserve` first and is the only merge path here that can.");
+    }
+    const reasons = [
+      ...(refused > 0 ? [`${refused} merge commit(s) dropped record lines their branch carried`] : []),
+      ...(unanswered > 0 ? [`${unanswered} commit(s) could not be checked`] : []),
+    ];
+    out(`RESULT: FAIL — ${reasons.join("; ")}.`);
+    process.exit(1);
+  }
+  out("RESULT: PASS");
+};
+
+// Run as a script; imported by `merge-pr.mjs` for its read-back, where nothing here runs on import.
+const invoked = (() => {
+  try {
+    return process.argv[1] !== undefined && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
+  } catch {
+    return false;
+  }
+})();
+if (invoked) main();

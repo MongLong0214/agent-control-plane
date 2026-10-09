@@ -54,28 +54,27 @@ const repositoryWithASquashedBranch = (options: {
   git(work, "commit", "--quiet", "--no-verify", "-m", `feat: the branch commit\n\n${options.branchTrailers}`);
   const head = git(work, "rev-parse", "HEAD").trim();
 
-  // The squash: one parent, a `(#N)` subject, and only what the merge chose to keep.
+  // The squash: one parent, a `(#N)` subject, the head it was merged from as `scripts/merge-pr.mjs`
+  // names it, and only what the merge chose to keep.
   git(work, "checkout", "--quiet", "main");
   git(work, "merge", "--quiet", "--squash", "feature");
-  git(work, "commit", "--quiet", "--no-verify", "-m", `feat: the branch commit (#7)\n\n${options.mergeTrailers}`);
+  git(work, "commit", "--quiet", "--no-verify", "-m", `feat: the branch commit (#7)\n\nMerged-Head: ${head}\n\n${options.mergeTrailers}`);
   const merge = git(work, "rev-parse", "HEAD").trim();
   if (options.note !== undefined) {
     writeFileSync(join(dir, "note.txt"), `${options.note}\n`);
     git(work, "notes", "--ref=commitlore", "add", "-F", join(dir, "note.txt"), merge);
   }
 
-  // The check reaches the branch through the pull request ref, which is what survives the branch
-  // being deleted. `origin` is this repository itself so the fetch it runs resolves offline.
-  git(work, "update-ref", "refs/pull/7/head", head);
+  // `origin` is this repository itself so any fetch the check runs resolves offline.
   git(work, "remote", "add", "origin", work);
   return { root: dir, dir: work, range: `${base}..${merge}`, head, merge };
 };
 
 /** The gate asks GitHub what #7 is; offline, the stand-in answers that it merged as this squash. */
 const run = (repo: ReturnType<typeof repositoryWithASquashedBranch>): { status: number; out: string } => {
-  const env = fakeGitHub(repo.root, { 7: { merged: true, mergeCommit: repo.merge, head: repo.head, commits: [repo.head] } });
+  const env = fakeGitHub(repo.root, { 7: { merged: true, mergeCommit: repo.merge } });
   try {
-    const out = execFileSync("node", [CHECK, repo.range], { cwd: repo.dir, env, encoding: "utf8", timeout: 60_000 });
+    const out = execFileSync(process.execPath, [CHECK, repo.range], { cwd: repo.dir, env, encoding: "utf8", timeout: 60_000 });
     return { status: 0, out };
   } catch (error) {
     const failure = error as { status?: number; stdout?: string; stderr?: string };
