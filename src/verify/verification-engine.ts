@@ -357,6 +357,7 @@ export class VerificationEngine {
           repo.identity,
           record.checkoutPath,
           repo.candidateHead,
+          repo.treeDigest,
           repo.sourceBranch ?? null,
         ));
       }
@@ -513,6 +514,7 @@ export class VerificationEngine {
     identity: string,
     checkoutPath: string,
     head: string,
+    frozenTree: string,
     sourceBranch: string | null,
   ): Promise<VerificationResultRecord> {
     const runId = run.runId;
@@ -548,6 +550,8 @@ export class VerificationEngine {
         // sandbox denies below. Only those commands get a checkout with its own metadata; every
         // other command keeps the linked worktree it had.
         selfContained: verificationKindRunning(command.argv) !== null,
+        // The tree the snapshot froze, which the self-contained copy must hold (RF-REVIEW-03).
+        frozenTree,
       });
       this.updateVerificationWorktree(worktreeId, "ACTIVE", "active_at");
       outcome = await runSandboxed({

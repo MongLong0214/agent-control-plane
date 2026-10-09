@@ -43,6 +43,12 @@ export interface CreateOptions {
    * for a command that runs git in it (#246 C2v). See `createSelfContained`.
    */
   readonly selfContained?: boolean;
+  /**
+   * The tree digest (`git-tree:<sha>`) the candidate snapshot froze. A self-contained checkout must
+   * hold exactly this tree; see `createSelfContained`. The linked flow re-reads the tree from the
+   * source's own object database, which is the same database the snapshot read.
+   */
+  readonly frozenTree?: string;
 }
 
 const WORKTREE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -161,7 +167,7 @@ export class WorktreeManager {
       });
     }
     if (options.selfContained) {
-      return this.createSelfContained(repositoryPath, head, worktreeId, path, authorization);
+      return this.createSelfContained(repositoryPath, head, worktreeId, path, authorization, options.frozenTree);
     }
 
     // Resolve the ref before materialising it. A worktree created for `HEAD` must still
@@ -341,21 +347,31 @@ export class WorktreeManager {
     worktreeId: string,
     path: string,
     authorization: WorktreeAuthorization,
+    frozenTree: string | undefined,
   ): Promise<Worktree> {
     const source = canonical(repositoryPath);
-    // The commit names its tree, so binding the copy to this SHA binds the tree too. (A separate
-    // tree comparison, as the linked flow makes, had no case it alone could catch: a copy whose
-    // HEAD resolves to another tree also shows it as changes in `status`.)
     const expectedHead = await revParse(repositoryPath, head);
+    // The commit SHA does not bind the tree on its own. In the source, `<sha>^{tree}` honours
+    // `refs/replace`, so a replaced commit resolves -- in the snapshot, in freshness and in a linked
+    // worktree -- to the replacement's tree. The copy is fetched by SHA, and the transport ships
+    // the original object, so the copy would hold the original tree under the same HEAD while both
+    // sides report clean (#1072 review, RF-REVIEW-03). The copy is therefore bound to the tree the
+    // snapshot froze, and the source must still resolve the candidate to that tree before and
+    // after the copy. A replaced candidate is refused rather than reproduced: the copy keeps no
+    // refs it did not need, and replace refs would be state copied out of the original.
+    const sourceTree = `git-tree:${await treeOf(repositoryPath, expectedHead)}`;
+    const expectedTree = frozenTree ?? sourceTree;
     // A SHA-256 source cannot be fetched into a SHA-1 repository, so the copy takes its format.
     const objectFormat = (await git(repositoryPath, ["rev-parse", "--show-object-format"])).stdout.trim();
     const prepared = await sourceState(repositoryPath);
-    if (prepared.head !== expectedHead || prepared.status.length > 0) {
+    if (prepared.head !== expectedHead || prepared.status.length > 0 || sourceTree !== expectedTree) {
       fail(ReasonCode.SNAPSHOT_STALE, "the source checkout is not exactly the candidate, so a copy of the candidate would not be it", {
         repositoryPath: source,
         worktreePath: path,
         expectedHead,
         sourceHead: prepared.head,
+        expectedTree,
+        sourceTree,
         sourceStatus: prepared.status.slice(0, STATUS_EVIDENCE_ENTRIES),
         sourceStatusEntries: prepared.status.length,
       });
@@ -377,8 +393,9 @@ export class WorktreeManager {
         await git(path, ["checkout", "--quiet", "--detach", expectedHead], OWN_CONFIG);
       }));
 
-      const [materializedHead, status, commonDir] = await Promise.all([
+      const [materializedHead, materializedTree, status, commonDir] = await Promise.all([
         git(path, ["rev-parse", "--verify", "HEAD^{commit}"], OWN_CONFIG),
+        git(path, ["rev-parse", "HEAD^{tree}"], OWN_CONFIG),
         git(path, ["status", "--porcelain", "--untracked-files=all"], OWN_CONFIG),
         git(path, ["rev-parse", "--git-common-dir"], OWN_CONFIG),
       ]).then((results) => results.map((result) => result.stdout.trim()));
@@ -392,8 +409,11 @@ export class WorktreeManager {
         canonical(resolve(path, commonDir ?? "")) === ownGitDir &&
         lstatOrNull(join(ownGitDir, "objects", "info", "alternates")) === null;
       const after = await sourceState(repositoryPath);
+      const sourceTreeAfter = `git-tree:${await treeOf(repositoryPath, expectedHead)}`;
       if (
         materializedHead !== expectedHead ||
+        `git-tree:${materializedTree ?? ""}` !== expectedTree ||
+        sourceTreeAfter !== expectedTree ||
         copyStatus.length > 0 ||
         !selfContained ||
         after.head !== expectedHead ||
@@ -404,6 +424,9 @@ export class WorktreeManager {
           worktreePath: path,
           expectedHead,
           materializedHead: materializedHead ?? null,
+          expectedTree,
+          materializedTree: `git-tree:${materializedTree ?? ""}`,
+          sourceTree: sourceTreeAfter,
           status: copyStatus.slice(0, STATUS_EVIDENCE_ENTRIES),
           statusEntries: copyStatus.length,
           selfContained,
