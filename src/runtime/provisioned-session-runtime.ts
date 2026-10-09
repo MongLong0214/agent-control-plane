@@ -66,8 +66,16 @@ interface TurnLane {
   roleKey: string | null;
   /** Triggers that arrived while a turn ran; they are served together by one follow-up turn. */
   coalesced: SessionWakeTrigger[];
-  /** Every trigger this session was woken for, run or queued: a second wake for one is refused. */
-  seen: Set<string>;
+  /**
+   * Triggers queued (coalesced) or in the turn running now. A wake for one is refused: it would be a
+   * second turn for work already on its way. Released when its turn ends, however it ended.
+   */
+  claimed: Set<string>;
+  /**
+   * Triggers a turn completed: never run again. A trigger whose turn failed is not here, so the
+   * outbox's re-wake of its still-unacknowledged row runs it again (review ACP-C1B-01).
+   */
+  handled: Set<string>;
 }
 
 /**
@@ -84,10 +92,12 @@ interface TurnLane {
  *   it over a connection authenticated with the delivered credential, and only a settled challenge
  *   answers OK. A turn that exited 0 proves nothing on its own.
  * - **Serialized.** A session runs one turn at a time. A wake that arrives while a turn runs is
- *   coalesced into one follow-up turn; a wake for a trigger already run or queued is refused
- *   `SESSION_TURN_DUPLICATE`. Turns start only from the existing event paths (an in-band dispatch,
- *   an owner message, a wake) and from the control plane's own spawn and recovery; there is no
- *   timer here.
+ *   coalesced into one follow-up turn; a wake for a trigger queued, running or already completed
+ *   by a turn is refused `SESSION_TURN_DUPLICATE`. A trigger whose turn failed is released for the
+ *   next wake that names it — the outbox re-wakes an unacknowledged row after its window — so a
+ *   transient failure delays work and never loses it. Turns start only from the existing event
+ *   paths (an in-band dispatch, an owner message, a wake) and from the control plane's own spawn
+ *   and recovery; there is no timer here.
  *
  * In memory only: a restarted daemon holds no credential, and a session it holds none for cannot
  * run a turn until its credential is rotated and delivered again.
@@ -180,9 +190,10 @@ export class ProvisionedSessionRuntime {
 
   /**
    * Runs a turn for the role's current holder because of `triggers`, or folds them into the turn
-   * that follows the one already running. A trigger this session was already woken for is dropped,
-   * and a wake whose every trigger was is refused `SESSION_TURN_DUPLICATE`. Answers at once with
-   * what happened; the turn itself runs behind the answer.
+   * that follows the one already running. A trigger queued, running, or completed by an earlier
+   * turn is dropped, and a wake whose every trigger is refused `SESSION_TURN_DUPLICATE`; a trigger
+   * whose turn failed is taken again. Answers at once with what happened; the turn itself runs
+   * behind the answer.
    */
   wake(roleKey: string, triggers: readonly SessionWakeTrigger[]): Decision<"STARTED" | "COALESCED"> {
     const binding = this.ports.bindings.active(roleKey);
@@ -197,32 +208,51 @@ export class ProvisionedSessionRuntime {
     }
     const lane = this.#lane(binding.sessionId);
     const fresh = triggers.filter((trigger, index) =>
-      !lane.seen.has(trigger.id) && triggers.findIndex((other) => other.id === trigger.id) === index);
+      !lane.claimed.has(trigger.id) &&
+      !lane.handled.has(trigger.id) &&
+      triggers.findIndex((other) => other.id === trigger.id) === index);
     if (fresh.length === 0) {
-      return deny(ReasonCode.SESSION_TURN_DUPLICATE, "every trigger of this wake already started a turn; none is run twice", {
+      return deny(ReasonCode.SESSION_TURN_DUPLICATE, "every trigger of this wake is queued, running or already handled; none is run twice", {
         roleKey,
         sessionId: binding.sessionId,
         triggers: triggers.map((trigger) => trigger.id),
       });
     }
-    for (const trigger of fresh) lane.seen.add(trigger.id);
+    for (const trigger of fresh) lane.claimed.add(trigger.id);
     lane.roleKey = roleKey;
     if (lane.pending > 0) {
       lane.coalesced.push(...fresh);
       return allow(ReasonCode.OK, "COALESCED");
     }
-    void this.#serialized(binding.sessionId, () => this.#workTurn(binding, fresh));
+    void this.#serialized(binding.sessionId, () => this.#workTurn(binding, fresh, lane));
     return allow(ReasonCode.OK, "STARTED");
   }
 
-  /** One work turn for the role's holder, serving every trigger handed to it. */
-  async #workTurn(binding: RoleBinding, triggers: readonly SessionWakeTrigger[]): Promise<Decision<void>> {
-    const turn = await this.#turn(binding.sessionId, "resume", workPrompt(binding, triggers), {
-      relay: true,
-      timeoutMs: this.options.turnTimeoutMs ?? 30 * 60_000,
-      purpose: "work",
-    });
-    return turn.allowed ? allow(ReasonCode.OK, undefined) : (turn as Decision<void>);
+  /**
+   * One work turn for the role's holder, serving every trigger handed to it. When it ends the
+   * triggers are released; a completed turn marks them handled, a failed one leaves them for the
+   * next wake that names them.
+   */
+  async #workTurn(
+    binding: RoleBinding,
+    triggers: readonly SessionWakeTrigger[],
+    lane: TurnLane,
+  ): Promise<Decision<void>> {
+    let completed = false;
+    try {
+      const turn = await this.#turn(binding.sessionId, "resume", workPrompt(binding, triggers), {
+        relay: true,
+        timeoutMs: this.options.turnTimeoutMs ?? 30 * 60_000,
+        purpose: "work",
+      });
+      completed = turn.allowed;
+      return turn.allowed ? allow(ReasonCode.OK, undefined) : (turn as Decision<void>);
+    } finally {
+      for (const trigger of triggers) {
+        lane.claimed.delete(trigger.id);
+        if (completed) lane.handled.add(trigger.id);
+      }
+    }
   }
 
   /**
@@ -242,8 +272,12 @@ export class ProvisionedSessionRuntime {
       if (lane.pending > 0 || lane.coalesced.length === 0 || this.#lanes.get(sessionId) !== lane) return;
       const binding = lane.roleKey === null ? null : this.ports.bindings.active(lane.roleKey);
       const triggers = lane.coalesced.splice(0);
-      if (!binding || binding.sessionId !== sessionId || !this.holds(sessionId)) return;
-      void this.#serialized(sessionId, () => this.#workTurn(binding, triggers));
+      if (!binding || binding.sessionId !== sessionId || !this.holds(sessionId)) {
+        // Nothing can run them now; they are released, so a later wake that names them is taken.
+        for (const trigger of triggers) lane.claimed.delete(trigger.id);
+        return;
+      }
+      void this.#serialized(sessionId, () => this.#workTurn(binding, triggers, lane));
     });
     return run;
   }
@@ -251,7 +285,7 @@ export class ProvisionedSessionRuntime {
   #lane(sessionId: string): TurnLane {
     let lane = this.#lanes.get(sessionId);
     if (!lane) {
-      lane = { tail: Promise.resolve(), pending: 0, roleKey: null, coalesced: [], seen: new Set() };
+      lane = { tail: Promise.resolve(), pending: 0, roleKey: null, coalesced: [], claimed: new Set(), handled: new Set() };
       this.#lanes.set(sessionId, lane);
     }
     return lane;

@@ -78,6 +78,8 @@ export class HeadlessRuntimeDouble extends TestProductionAdapter {
   presentAttestation = true;
   /** True: the relay presents the credential it held before this turn, not the one it just took. */
   presentStaleCredential = false;
+  /** How many of the next work turns (no challenge) fail as a transient CLI failure would. */
+  failNextWorkTurns = 0;
   /** Called for a work turn (no challenge) with what the relay took. */
   onWorkTurn: ((request: SessionTurnRequest, credential: TakenCredential | null) => Promise<void>) | null = null;
   #inProcess: InProcessAttestation | null = null;
@@ -102,6 +104,10 @@ export class HeadlessRuntimeDouble extends TestProductionAdapter {
       durationMs: 1,
     });
     if ((await this.probeSession(request.handle)) !== "HEALTHY") return failed("No conversation found");
+    if (request.relay && !ATTESTATION_NONCE.test(request.prompt) && this.failNextWorkTurns > 0) {
+      this.failNextWorkTurns -= 1;
+      return failed("transient CLI failure");
+    }
     if (request.relay) {
       const taken = this.takeCredential ? await this.#take(request) : null;
       const previous = taken ? this.credentials.get(taken.sessionId) ?? null : null;

@@ -263,6 +263,75 @@ describe("C1b driver: one turn at a time; concurrent wakes coalesce; a duplicate
     expect(claude.turns).toHaveLength(3);
   });
 
+  it("ACP-C1B-01: a coalesced follow-up turn that fails releases its triggers to the next wake; a completed one never runs again", async () => {
+    const { harness, claude, roleKey } = await dispatched();
+    let release: () => void = () => undefined;
+    let gate = true;
+    claude.onWorkTurn = async () => {
+      if (!gate) return;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    };
+    const runtime = harness.cp.sessionRuntime;
+    expect(runtime.wake(roleKey, [{ id: "m1", kind: "test" }])).toMatchObject({ allowed: true, value: "STARTED" });
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(2));
+    expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }, { id: "m3", kind: "test" }])).toMatchObject({
+      allowed: true,
+      value: "COALESCED",
+    });
+    // The coalesced follow-up turn fails, as a transient CLI failure would.
+    gate = false;
+    claude.failNextWorkTurns = 1;
+    release();
+    await vi.waitFor(() => expect(harness.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_TURN' AND reason_code = ?`,
+      [ReasonCode.SESSION_TURN_FAILED],
+    )?.n).toBe(1));
+    expect(claude.turns).toHaveLength(3);
+    // m1 completed and is never run again; m2 and m3 failed and are taken by the next wake.
+    expect(runtime.wake(roleKey, [{ id: "m1", kind: "test" }])).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_TURN_DUPLICATE });
+    expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }, { id: "m3", kind: "test" }])).toMatchObject({
+      allowed: true,
+      value: "STARTED",
+    });
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(4));
+    await vi.waitFor(() => expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }])).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.SESSION_TURN_DUPLICATE,
+    }));
+  });
+
+  it("ACP-C1B-01: a coalesced follow-up the session can no longer run is released, so a later wake that names it is taken", async () => {
+    const { harness, claude, roleKey, run } = await dispatched();
+    let release: () => void = () => undefined;
+    let gate = true;
+    claude.onWorkTurn = async () => {
+      if (!gate) return;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    };
+    const runtime = harness.cp.sessionRuntime;
+    const sessionId = run.ownerSessionId!;
+    const epoch = harness.cp.sessions.require(sessionId).credentialEpoch;
+    expect(runtime.wake(roleKey, [{ id: "m1", kind: "test" }])).toMatchObject({ allowed: true, value: "STARTED" });
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(2));
+    expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }])).toMatchObject({ allowed: true, value: "COALESCED" });
+    // While m1 runs, the session stops holding its current credential (a rotation it has not
+    // received yet): the follow-up for m2 cannot run when m1 ends.
+    runtime.adopt(sessionId, Role.BOOTSTRAP_CTO, "stale-credential", epoch + 1);
+    gate = false;
+    release();
+    await vi.waitFor(() => expect(runtime.holds(sessionId)).toBe(false));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(claude.turns).toHaveLength(2);
+    // Once the session holds its credential again, the wake that names m2 runs it.
+    runtime.adopt(sessionId, Role.BOOTSTRAP_CTO, "current-credential", epoch);
+    expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }])).toMatchObject({ allowed: true, value: "STARTED" });
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(3));
+  });
+
   it("the credential is offered for exactly one turn and withdrawn after it; an untaken one is recorded", async () => {
     const { harness, claude, roleKey, run } = await dispatched();
     claude.takeCredential = false;

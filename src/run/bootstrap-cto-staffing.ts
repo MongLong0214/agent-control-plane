@@ -72,8 +72,20 @@ export interface BootstrapCtoRecoveryPorts {
   readonly runtime: Pick<ProvisionedSessionRuntime, "probe" | "adopt" | "attest" | "release">;
   readonly sessions: Pick<SessionRegistry, "get" | "rotateSecret">;
   readonly bindings: Pick<BindingRegistry, "renewSameSession" | "revoke">;
-  readonly runs: Pick<RunEngine, "resumeRecoveredBootstrap">;
+  readonly runs: Pick<RunEngine, "restoreRecoveredBootstrapOwner">;
 }
+
+/**
+ * The run states a recovery restores the owner of: continuity's pause (BLOCKED), a hold someone else
+ * placed and keeps (BLOCKED for a CEO decision, AWAITING_HUMAN), and a revision waiting to be
+ * dispatched (REVISION_REQUIRED). `RunEngine.restoreRecoveredBootstrapOwner` decides which of them
+ * resumes.
+ */
+const RECOVERABLE_RUN_STATES: readonly RunState[] = Object.freeze([
+  RunState.BLOCKED,
+  RunState.REVISION_REQUIRED,
+  RunState.AWAITING_HUMAN,
+]);
 
 /** A failed recovery is not tried again on the next restore pass, only after this. */
 export const BOOTSTRAP_CTO_RECOVERY_BACKOFF_MS = 15 * 60_000;
@@ -412,21 +424,23 @@ export class BootstrapCtoStaffing {
    * fixed runtime stopped covering it. Continuity's `restore()` asks for it when coverage returns;
    * nothing else starts it. In order, and nothing is skipped:
    *
-   *   1. the run is still the BLOCKED project-less bootstrap pinned to the revoked generation, and
-   *      the session is still the READY Claude Opus session that generation ran on — a COMPLETED,
-   *      CANCELLED or FAILED run, a run waiting on a human, and a STOPPED or ERROR session are
-   *      never recovered;
+   *   1. the run is still the project-less bootstrap pinned to the revoked generation, in a held
+   *      state (BLOCKED, REVISION_REQUIRED or AWAITING_HUMAN), and the session is still the READY
+   *      Claude Opus session that generation ran on — a COMPLETED, CANCELLED or FAILED run and a
+   *      STOPPED or ERROR session are never recovered;
    *   2. capacity admits the fixed runtime for the role;
    *   3. the session's own conversation answers a `--resume` probe — which alone changes nothing;
    *   4. one transaction rotates the session's credential (epoch exactly +1, a new secret) and
    *      renews the binding at the next generation for the same actor on the same session, while
-   *      the run stays BLOCKED;
+   *      the run keeps its state;
    *   5. the new credential is delivered to that session's runtime and the runtime attests with it
    *      over an authenticated connection;
-   *   6. only then the run is pinned to the new generation, made ACTIVE and sent RUN_DISPATCH.
+   *   6. only then the run is pinned to the new generation. A run continuity itself paused for this
+   *      role is made ACTIVE and sent RUN_DISPATCH; any other hold — a CEO decision, a revision, a
+   *      human gate — is kept, and only the authority comes back (`restoreRecoveredBootstrapOwner`).
    *
    * A refusal at 4 writes nothing. A refusal at 5 or 6 revokes the renewed generation again, as a
-   * continuity revocation so the role stays owed, and the run stays BLOCKED on the old pin: no
+   * continuity revocation so the role stays owed, and the run keeps its state on the old pin: no
    * second holder and no dispatch. Every refusal is recorded, and the next attempt waits out
    * `BOOTSTRAP_CTO_RECOVERY_BACKOFF_MS` rather than spending a provider turn on every pass.
    */
@@ -548,8 +562,8 @@ export class BootstrapCtoStaffing {
     if (!adopted.allowed) return abandon(adopted);
     const attested = await recovery.runtime.attest(session.sessionId, "resume");
     if (!attested.allowed) return abandon(attested);
-    const resumed = recovery.runs.resumeRecoveredBootstrap(start.value.run.runId, renewed, start.value.pinnedGeneration);
-    if (!resumed.allowed) return abandon(resumed);
+    const restored = recovery.runs.restoreRecoveredBootstrapOwner(start.value.run.runId, renewed, start.value.pinnedGeneration);
+    if (!restored.allowed) return abandon(restored);
     this.audit.record({
       kind: "BOOTSTRAP_CTO_RECOVERED",
       runId: start.value.run.runId,
@@ -559,6 +573,8 @@ export class BootstrapCtoStaffing {
         fromGeneration: start.value.pinnedGeneration,
         toGeneration: renewed.bindingGeneration,
         credentialEpoch,
+        resumed: restored.value.resumed,
+        state: restored.value.run.state,
       },
     });
     return allow(ReasonCode.OK, renewed);
@@ -594,8 +610,8 @@ export class BootstrapCtoStaffing {
         state: run.state,
       });
     }
-    if (run.state !== RunState.BLOCKED || run.kind !== RunKind.PROJECT_BOOTSTRAP || run.projectId !== null) {
-      return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "only a BLOCKED project-less bootstrap run is resumed by a recovery", {
+    if (!RECOVERABLE_RUN_STATES.includes(run.state) || run.kind !== RunKind.PROJECT_BOOTSTRAP || run.projectId !== null) {
+      return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "only a held project-less bootstrap run gets its bootstrap CTO back", {
         roleKey,
         runId: run.runId,
         state: run.state,
