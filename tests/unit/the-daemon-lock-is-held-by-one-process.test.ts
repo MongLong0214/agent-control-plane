@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
@@ -154,7 +154,9 @@ describe("#1070 ACP-WORKER-03-LOCK one process holds the daemon lock", () => {
     const first = holder(state, "first", "lock");
     go(state);
     expect((await first.result()).allowed).toBe(true);
-    unlinkSync(join(state, "agentcpd.lock"));
+    // The holder's directory and the record in it, gone together.
+    expect(statSync(join(state, "agentcpd.lock")).isDirectory()).toBe(true);
+    rmSync(join(state, "agentcpd.lock"), { recursive: true });
     const second = await attempt(state, "second");
     expect(second.allowed, "only the holder record was keeping a second process out").toBe(false);
     expect(second.reasonCode).toBe("DAEMON_ALREADY_RUNNING");

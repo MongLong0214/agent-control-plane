@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { Daemon } from "../../src/daemon/daemon.ts";
@@ -21,15 +21,24 @@ import { makeHarness } from "./harness.ts";
  * one holds the start right there, lock held, as a running daemon would: whatever the other process
  * does meanwhile, it does while this one holds. `<state>/check` makes it publish `<id>.held`;
  * `<state>/<id>.exit` lets the start go on, stops the daemon and exits.
+ *
+ * `ACP_WITNESS_NOW`, when set, is the epoch millisecond this process's `Date.now()` answers: a clock
+ * reading moved past whatever a lock record's timestamp says, without changing the system clock.
  */
 const [state, id, build, pause] = process.argv.slice(2) as [string, string, string, string];
 const publish = (name: string, value: unknown): void => {
   writeFileSync(join(state, `.${name}.tmp`), JSON.stringify(value));
   renameSync(join(state, `.${name}.tmp`), join(state, name));
 };
+if (process.env["ACP_WITNESS_NOW"]) {
+  const now = Number(process.env["ACP_WITNESS_NOW"]);
+  Date.now = () => now;
+}
+/** What stands at the lock path: this build's holder record in its directory, or a record file. */
 const record = (): string | null => {
+  const path = join(state, "agentcpd.lock");
   try {
-    return readFileSync(join(state, "agentcpd.lock"), "utf8");
+    return readFileSync(lstatSync(path).isDirectory() ? join(path, "holder.json") : path, "utf8");
   } catch {
     return null;
   }
