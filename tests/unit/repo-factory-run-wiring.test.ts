@@ -14,18 +14,14 @@ import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
 import { type Decision, allow } from "../../src/core/errors.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
+import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { startLocalMcpListeners, startOperatorSocket } from "../../src/daemon/agentcpd.ts";
 import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
-import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { respond } from "../../src/mcp/shared.ts";
-import {
-  CANDIDATE_SNAPSHOT_SCHEMA_ID,
-  candidateSnapshotDigest,
-  type CandidateSnapshot,
-} from "../../src/snapshot/candidate-snapshot.ts";
+import { candidateSnapshotDigest, type CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github-write-port.ts";
 import {
@@ -33,7 +29,6 @@ import {
   TEST_OPERATOR_TOKEN,
   TEST_OWNER,
   bindCeo,
-  bindWorker,
   completeBootstrapRunUntilC3,
   dispatchBootstrapRun,
   fixtureManifest,
@@ -42,7 +37,14 @@ import {
   type Harness,
 } from "../helpers/harness.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
-import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
+import {
+  bootstrapPlan,
+  callCtoToolAsOwner,
+  completeReadyTasks,
+  replanBootstrap,
+  reviewBootstrapPlan,
+  submitBootstrapPlan,
+} from "../helpers/bootstrap-plan.ts";
 
 /**
  * Issue #246 — the two links between the Repo Factory runner and a live control plane:
@@ -59,7 +61,11 @@ import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
  * #246 PR-C slice C1: the bootstrap run's owner is the BOOTSTRAP_CTO its dispatch staffs (no
  * `bindBootstrapCto`), and until slice C3 every bootstrap CONFIRM door refuses
  * `BOOTSTRAP_APPLICATION_NOT_AVAILABLE` with no GitHub call. The runner behind the door is driven
- * by `confirmUntilC3`, and the fixtures C2 replaces are marked TODO(C2).
+ * by `confirmUntilC3`.
+ *
+ * #246 PR-C slice C2: the run reaches CEO review as production gets there — the bootstrap CTO's
+ * `plan_submit` carries the manifest, and `result_submit`'s BOOTSTRAP_PLAN review passes the
+ * planned outputs — rather than through a hand-written review and a state transition.
  */
 
 afterAll(cleanupTempDirs);
@@ -138,76 +144,6 @@ const cleanTreeManifest = (projectId: string): ProjectManifest =>
     verificationProfiles: { simple: ["clean-tree"], standard: ["clean-tree"], guarded: ["clean-tree"] },
   });
 
-/**
- * The blind-reviewed candidate a bootstrap run reaches CEO review with.
- *
- * TODO(C2): the bootstrap blind review (`BOOTSTRAP_PLAN` through the BlindReviewGate) replaces this
- * snapshot-and-`putEvidence` fixture.
- */
-const recordBootstrapBlindReview = (harness: Harness, runId: string): string => {
-  const run = harness.cp.runs.require(runId);
-  const head = gitSync(harness.repoPath, ["rev-parse", "HEAD"]);
-  const snapshot: CandidateSnapshot = {
-    schema: CANDIDATE_SNAPSHOT_SCHEMA_ID,
-    runId,
-    contractDigest: run.contractDigest,
-    repositories: [{
-      identity: IDENTITY,
-      repositoryRole: "primary",
-      baseBranch: "main",
-      baseHead: head,
-      candidateHead: head,
-      treeDigest: `git-tree:${gitSync(harness.repoPath, ["rev-parse", "HEAD^{tree}"])}`,
-      diffDigest: digestOf({ bootstrapCandidate: runId }),
-      worktreeId: null,
-      manifestDigest: null,
-      touchedPaths: [],
-    }],
-    createdAt: harness.clock.nowIso(),
-  };
-  const snapshotDigest = candidateSnapshotDigest(snapshot);
-  harness.cp.artifacts.put(runId, "CANDIDATE_SNAPSHOT", snapshot, snapshotDigest);
-  const reviewer = harness.cp.sessions.create({ provider: "scripted", model: "bootstrap-reviewer" });
-  harness.cp.sessions.transition(reviewer.sessionId, SessionLifecycle.READY, "test reviewer");
-  const reviewerBinding = harness.cp.bindings.bind({
-    role: Role.BLIND_REVIEWER,
-    roleKey: roleKeyFor(Role.BLIND_REVIEWER, { runId }),
-    runId,
-    sessionId: reviewer.sessionId,
-  });
-  if (!reviewerBinding.allowed) throw new Error(reviewerBinding.message);
-  harness.cp.artifacts.putEvidence(harness.cp.evidenceWritersForTests().BLIND_REVIEW, runId, "BLIND_REVIEW", {
-    runId,
-    candidateSnapshotDigest: snapshotDigest,
-    contractDigest: run.contractDigest,
-    reviewerRoleBindingGeneration: reviewerBinding.value.bindingGeneration,
-    reviewerSessionId: reviewer.sessionId,
-    reviewerSessionIncarnation: reviewer.incarnation,
-    reviewerProviderSessionId: reviewer.sessionId,
-    provider: reviewer.provider,
-    model: reviewer.model,
-    effort: reviewer.effort,
-    egressEvidence: testReviewerEgressEvidence(reviewer.provider),
-    inputManifest: {
-      contract: true,
-      snapshotManifest: true,
-      diff: true,
-      verificationEvidence: true,
-      projectContext: true,
-      withheld: [],
-      binaryArtifacts: [],
-    },
-    coveredRepositories: [IDENTITY],
-    coveredFiles: [],
-    omittedItems: [],
-    verdict: "PASS",
-    findings: [],
-    chunked: false,
-    createdAt: harness.clock.nowIso(),
-  }, snapshotDigest);
-  return snapshotDigest;
-};
-
 interface PreparedRun {
   runId: string;
   planDigest: string;
@@ -216,32 +152,16 @@ interface PreparedRun {
   bootstrapCtoSessionId: string;
 }
 
-/** Puts the PLAN on the run and returns its artifact digest. */
-type PlanSubmitter = (
-  harness: Harness,
-  runId: string,
-  manifest: ProjectManifest,
-  cto: { sessionId: string; incarnation: string },
-) => Promise<string>;
-
 /**
- * The PLAN written straight into the artifact store, as the runner's own tests do.
- *
- * TODO(C2): `plan_submit` carrying the full manifest replaces this artifact write.
+ * A PROJECT_BOOTSTRAP run at CEO review (#246 C2): dispatch staffs its BOOTSTRAP_CTO, which submits
+ * the PLAN with its manifest through `plan_submit`; the PLAN's task is done, and `result_submit`'s
+ * BOOTSTRAP_PLAN review passes the planned outputs. With `review: false` the run stops after the
+ * PLAN, still ACTIVE: a PLAN the producer could not execute has no outputs to review.
  */
-const putPlanArtifact: PlanSubmitter = async (harness, runId, manifest) =>
-  harness.cp.artifacts.put(runId, "PLAN", {
-    bootstrapOperationId: "op-bootstrap",
-    requestDigest: digestOf({ request: "bootstrap" }),
-    projectManifestDigest: manifestDigest(manifest),
-    githubOperations: operations(),
-  }).digest;
-
-/** A PROJECT_BOOTSTRAP run at CEO review, holding the PLAN `submitPlan` put on it. */
 const prepareRun = async (
   harness: Harness,
   projectId: string,
-  submitPlan: PlanSubmitter = putPlanArtifact,
+  options: { operations?: unknown[]; review?: boolean } = {},
 ): Promise<PreparedRun> => {
   const created = harness.cp.runs.create({
     kind: RunKind.PROJECT_BOOTSTRAP,
@@ -253,16 +173,16 @@ const prepareRun = async (
   // Dispatch staffs the run's BOOTSTRAP_CTO and pins it as the owner (#246 C1), in place of the
   // deleted test-only `bindBootstrapCto`.
   const dispatched = await dispatchBootstrapRun(harness.cp, harness.clock, runId);
-  const bootstrapCto = harness.cp.sessions.require(dispatched.ownerSessionId!);
+  const bootstrapCtoSessionId = dispatched.ownerSessionId!;
   const manifest = cleanTreeManifest(projectId);
-  const planDigest = await submitPlan(harness, runId, manifest, {
-    sessionId: bootstrapCto.sessionId,
-    incarnation: bootstrapCto.incarnation,
-  });
-  const snapshotDigest = recordBootstrapBlindReview(harness, runId);
-  // TODO(C2): the bootstrap review gate moves the run to CEO review; this transition stands in.
-  harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "reviewed");
-  return { runId, planDigest, snapshotDigest, manifest, bootstrapCtoSessionId: bootstrapCto.sessionId };
+  const plan = bootstrapPlan(manifest, { operations: options.operations ?? operations() });
+  if (options.review === false) {
+    const planDigest = await submitBootstrapPlan(harness, runId, plan);
+    completeReadyTasks(harness, runId);
+    return { runId, planDigest, snapshotDigest: "", manifest, bootstrapCtoSessionId };
+  }
+  const reviewed = await reviewBootstrapPlan(harness, runId, plan);
+  return { runId, planDigest: reviewed.planDigest, snapshotDigest: reviewed.snapshotDigest, manifest, bootstrapCtoSessionId };
 };
 
 interface Wired extends PreparedRun {
@@ -278,7 +198,8 @@ const wire = async (
   options: {
     /** `"default"` composes `defaultConfig(root).repoFactory` — the work root production gets. */
     workRoot?: "default" | string;
-    submitPlan?: PlanSubmitter;
+    operations?: unknown[];
+    review?: boolean;
   } = {},
 ): Promise<Wired> => {
   const bareRoot = mkdtempSync(join(tmpdir(), "acp-246-wiring-"));
@@ -302,7 +223,10 @@ const wire = async (
   const started = await daemon.start();
   if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
   daemons.push(daemon);
-  const prepared = await prepareRun(harness, projectId, options.submitPlan);
+  const prepared = await prepareRun(harness, projectId, {
+    ...(options.operations === undefined ? {} : { operations: options.operations }),
+    ...(options.review === undefined ? {} : { review: options.review }),
+  });
   return { ...prepared, harness, daemon, github, ceoSessionId };
 };
 
@@ -516,16 +440,21 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
     const wired = await wire("wired-plan-replaced");
     const approved = await approve(wired);
     if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
-    wired.harness.cp.artifacts.put(wired.runId, "PLAN", {
-      bootstrapOperationId: "op-bootstrap",
-      requestDigest: digestOf({ request: "bootstrap" }),
-      projectManifestDigest: manifestDigest(wired.manifest),
-      githubOperations: operations({ ...APPROVED_PROTECTION, allowForcePushes: true, allowDeletions: true }),
-    });
+    // #246 C2 — the replacement is a re-plan the CTO submits and the reviewer passes. Its candidate
+    // supersedes the approval recorded for the reviewed one, so the CONFIRM finds no current
+    // approval; a replacement nobody reviewed would be refused earlier, at the review binding.
+    const replanned = await replanBootstrap(
+      wired.harness,
+      wired.runId,
+      { planDigest: wired.planDigest, snapshotDigest: wired.snapshotDigest, ceoSessionId: wired.ceoSessionId },
+      bootstrapPlan(wired.manifest, {
+        operations: operations({ ...APPROVED_PROTECTION, allowForcePushes: true, allowDeletions: true }),
+      }),
+    );
 
-    const refused = await confirmUntilC3(wired, "confirm-replaced-plan");
+    const refused = await confirmUntilC3(wired, "confirm-replaced-plan", { candidateSnapshotDigest: replanned.snapshotDigest });
     expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE });
-    expect(refused["evidence"]).toMatchObject({ stage: "approval", refusal: "APPROVAL_MISMATCH" });
+    expect(refused["evidence"]).toMatchObject({ stage: "approval", refusal: "APPROVAL_MISSING" });
     nothingWrittenOrConsumed(wired);
   });
 
@@ -620,49 +549,6 @@ const callCtoTool = async (
   }
 };
 
-/** Every task the PLAN submitted, driven to SUCCEEDED by its own worker, as a CTO would. */
-const completeTasks = (harness: Harness, runId: string): void => {
-  const ownerBindingGeneration = harness.cp.runs.require(runId).ownerBindingGeneration;
-  if (ownerBindingGeneration === null) throw new Error("the bootstrap run has no owner generation");
-  for (const task of harness.cp.tasks.ready(runId)) {
-    const started = harness.cp.tasks.startExecution({
-      runId,
-      taskId: task.taskId,
-      ownerBindingGeneration,
-      workerSessionId: bindWorker(harness, task.taskId),
-      provider: "scripted",
-      model: "scripted-worker",
-    });
-    if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
-    const finished = harness.cp.tasks.finishExecution(started.value.executionId, {
-      status: "SUCCEEDED",
-      resultDigest: digestOf({ task: task.taskId }),
-    });
-    if (!finished.allowed) throw new Error(`${finished.reasonCode}: ${finished.message}`);
-  }
-};
-
-/** The PLAN through the bootstrap CTO's `plan_submit`, then its task carried to SUCCEEDED. */
-const submitPlanOverCto = (githubOperations: unknown[]): PlanSubmitter => async (harness, runId, manifest, cto) => {
-  const submitted = await callCtoTool(harness, cto, "plan_submit", {
-    idempotencyKey: `plan-${runId}`,
-    runId,
-    plan: {
-      summary: "create the repository the owner approved",
-      bootstrapOperationId: "op-bootstrap",
-      requestDigest: digestOf({ request: "bootstrap" }),
-      projectManifestDigest: manifestDigest(manifest),
-      githubOperations,
-    },
-    tasks: [{ key: "bootstrap", title: "bootstrap the repository", category: "implementation" }],
-  });
-  if (submitted.isError) throw new Error(`plan_submit refused: ${submitted.text}`);
-  completeTasks(harness, runId);
-  const plan = harness.cp.artifacts.latest(runId, "PLAN");
-  if (plan === null) throw new Error("plan_submit stored no PLAN artifact");
-  return plan.digest;
-};
-
 /** Identities only — the shape `plan_submit` accepted before desired state. */
 const identitiesOnly = (ops: ReturnType<typeof operations>) =>
   ops.map(({ operationId, resourceType, resourceIdentity }) => ({ operationId, resourceType, resourceIdentity }));
@@ -730,7 +616,7 @@ describe("#246 production defaults: the work root and an executable plan_submit"
   });
 
   it("plan_submit with desired state → owner approval → CEO confirm → GitHub writes (double) → activation → COMPLETED", async () => {
-    const wired = await wire("cto-plan", { submitPlan: submitPlanOverCto(operations()) });
+    const wired = await wire("cto-plan");
     const plan = wired.harness.cp.artifacts.latest<{ githubOperations: unknown[] }>(wired.runId, "PLAN");
     expect(plan?.content.githubOperations).toEqual(operations());
 
@@ -748,14 +634,29 @@ describe("#246 production defaults: the work root and an executable plan_submit"
       ["plan-identities-only", identitiesOnly(executable)],
       ["plan-mixed", mixed],
     ] as const) {
-      const wired = await wire(projectId, { submitPlan: submitPlanOverCto([...githubOperations]) });
+      const wired = await wire(projectId, { operations: [...githubOperations], review: false });
       const refused = await approve(wired);
       expect(refused.allowed).toBe(false);
       expect(refused.evidence["refusal"]).toBe("PLAN_NOT_EXECUTABLE");
       expect(recordedApprovals(wired)).toEqual([]);
-      const confirm = await confirmUntilC3(wired, `${projectId}-confirm`);
-      expect(confirm["evidence"]).toMatchObject({ stage: "approval", refusal: "APPROVAL_MISSING" });
-      nothingWrittenOrConsumed(wired);
+      // #246 C2 — such a PLAN has no planned outputs, so `result_submit` freezes no candidate and
+      // no review runs: the run never reaches the CEO, and nothing is written or consumed.
+      const submitted = await callCtoToolAsOwner(wired.harness, wired.runId, "result_submit", {
+        idempotencyKey: `${projectId}-result`,
+        runId: wired.runId,
+        resultSummary: "the planned bootstrap outputs",
+        recommendation: "create the repository",
+      });
+      expect(submitted.body).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        evidence: { refusal: "PLAN_NOT_EXECUTABLE" },
+      });
+      expect(wired.harness.cp.runs.require(wired.runId).state).toBe(RunState.ACTIVE);
+      expect(wired.harness.cp.runs.currentCandidate(wired.runId)).toBeNull();
+      expect(wired.github.writes).toEqual([]);
+      expect(wired.github.reads).toEqual([]);
+      expect(consumedApprovals(wired)).toBe(0);
     }
 
     // A desired state the runner would refuse never reaches the PLAN: `githubOperationSchema`
@@ -793,7 +694,9 @@ describe("PR #1050 review witnesses", () => {
 
   it("RF1050-01: a CONFIRM naming a candidate with no passing review consumes nothing and writes nothing (unpromoted run)", async () => {
     const wired = await wire("rf1050-01-unpromoted");
-    expect(wired.harness.cp.runs.currentCandidate(wired.runId)).toBeNull();
+    // #246 C2 — `result_submit` freezes a bootstrap candidate and promotes it like any other, so the
+    // unpromoted pointer this row was written for no longer occurs; the CONFIRM still names its own.
+    expect(wired.harness.cp.runs.currentCandidate(wired.runId)).toBe(wired.snapshotDigest);
     const approved = await approve(wired);
     if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
 
@@ -834,12 +737,22 @@ describe("PR #1050 review witnesses", () => {
     const snapshot = harness.cp.artifacts.latestForSnapshot<CandidateSnapshot>(runId, "CANDIDATE_SNAPSHOT", wired.snapshotDigest);
     const review = harness.cp.artifacts.latestForSnapshot<Record<string, unknown>>(runId, "BLIND_REVIEW", wired.snapshotDigest);
     if (!snapshot || !review) throw new Error("the prepared candidate has no snapshot or no review");
+    // A bootstrap candidate joins no repository (#246 C2), so the second one is told apart by one.
+    const head = gitSync(harness.repoPath, ["rev-parse", "HEAD"]);
     const second: CandidateSnapshot = {
       ...snapshot.content,
-      repositories: snapshot.content.repositories.map((repository) => ({
-        ...repository,
+      repositories: [{
+        identity: IDENTITY,
+        repositoryRole: "primary",
+        baseBranch: "main",
+        baseHead: head,
+        candidateHead: head,
+        treeDigest: `git-tree:${gitSync(harness.repoPath, ["rev-parse", "HEAD^{tree}"])}`,
         diffDigest: digestOf({ bootstrapCandidate: runId, second: true }),
-      })),
+        worktreeId: null,
+        manifestDigest: null,
+        touchedPaths: [],
+      }],
     };
     const digest = candidateSnapshotDigest(second);
     harness.cp.artifacts.put(runId, "CANDIDATE_SNAPSHOT", second, digest);
@@ -886,22 +799,22 @@ describe("PR #1050 review witnesses", () => {
 
   it("RF1050-04: a receipt an earlier head consumed with no candidate is refused by name, and a new owner decision resumes from the ledger", async () => {
     const wired = await wire("rf1050-04-legacy");
-    expect(wired.harness.cp.runs.currentCandidate(wired.runId)).toBeNull();
     const approved = await approve(wired);
     if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
     const legacy = newestReceipt(wired);
 
     // The heads before RF1050-01 consumed the approval for the run's candidate pointer, which an
-    // unpromoted bootstrap leaves null. That admission is replayed here around the real owner
-    // authority, and production fails after the repository is created, as the reviewer's did.
+    // unpromoted bootstrap left null. That admission — consumption with no candidate — is replayed
+    // here around the real owner authority, and production fails after the repository is created,
+    // as the reviewer's did. (#246 C2 freezes and promotes every bootstrap candidate, so the null is
+    // stated rather than read from the pointer.)
     const deps = (wired.harness.cp.bootstrapProducer as unknown as {
       deps: { ownerAuthority: Pick<OwnerAuthorityPort, "assertConsumedApproval" | "consumeApproval"> };
     }).deps;
     const upgraded = deps.ownerAuthority;
-    const pointer = () => wired.harness.cp.runs.currentCandidate(wired.runId);
     deps.ownerAuthority = {
-      assertConsumedApproval: (receipt) => upgraded.assertConsumedApproval(receipt, pointer()),
-      consumeApproval: (receipt) => upgraded.consumeApproval(receipt, pointer()),
+      assertConsumedApproval: (receipt) => upgraded.assertConsumedApproval(receipt, null),
+      consumeApproval: (receipt) => upgraded.consumeApproval(receipt, null),
     };
     wired.github.failNext = "pushBranch";
     const failed = await confirmUntilC3(wired, "rf1050-04-earlier-head");

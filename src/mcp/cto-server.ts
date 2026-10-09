@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { BootstrapActivation } from "../bootstrap/activation.ts";
+import { planForSubmission } from "../bootstrap/bootstrap-plan.ts";
 import { githubOperationSchema } from "../bootstrap/repo-factory-github.ts";
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import type { ProductionGate } from "../ceo/production-gate.ts";
@@ -136,7 +137,14 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
         repositories: source.runs.repositoriesOf(runId),
       };
     },
-    putPlan: (runId: string, plan: unknown) => source.artifacts.put(runId, ArtifactKind.PLAN, plan),
+    // #246 C2 — a project-less bootstrap run's PLAN carries its manifest in full, checked portable
+    // and against the digest the PLAN names before anything is stored; any other run's is stored
+    // exactly as before.
+    submitPlan: (runId: string, plan: Record<string, unknown>): Decision<{ digest: string }> => {
+      const admitted = planForSubmission(source.runs.require(runId), plan);
+      if (!admitted.allowed) return admitted as Decision<{ digest: string }>;
+      return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, admitted.value).digest });
+    },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
     ownerRoleKeyForRun: (runId: string) => source.runs.ownerRoleKeyFor(source.runs.require(runId)),
     acquireClaims: (input: Parameters<ClaimRegistry["acquire"]>[0]) => source.claims.acquire(input),
@@ -342,6 +350,10 @@ const createCtoServerFromPort = (
               resourceIdentity: z.string().min(1),
             }).strict(),
           ])).optional(),
+          // Issue #246 PR-C slice C2 — a project-less bootstrap run's full project manifest. It must be
+          // portable and its digest must be `projectManifestDigest`; the PLAN keeps it, so the PLAN
+          // digest covers it. Any other run's plan never stores it.
+          projectManifest: z.record(z.unknown()).optional(),
         }),
         tasks: z.array(z.object({ key: z.string(), title: z.string(), category: z.enum(["mechanical", "implementation", "investigation", "integration", "test", "review", "docs", "migration", "benchmark", "security"]), dependsOn: z.array(z.string()).default([]), spec: z.record(z.unknown()).default({}) })).min(1),
       },
@@ -349,7 +361,8 @@ const createCtoServerFromPort = (
     async (args) => write("plan_submit", args.idempotencyKey, (peer) => {
       const fenced = owner(peer, args.runId);
       if (!fenced.allowed) return respond(fenced);
-      port.putPlan(args.runId, args.plan);
+      const stored = port.submitPlan(args.runId, args.plan);
+      if (!stored.allowed) return respond(stored);
       return respond(port.submitTasks(args.runId, args.tasks));
     }),
   );

@@ -253,6 +253,14 @@ export class ProductionGate {
       let verificationForPacket: ProductionReadyPacket["verification"];
       let reviewForPacket: ProductionReadyPacket["blindReview"];
 
+      // #246 C2 — a project-less bootstrap candidate joins no repository either, but its planned
+      // outputs are reviewed (BOOTSTRAP_PLAN); its packet carries that review, never a not-applicable
+      // one, and is refused without a PASS bound to the PLAN the candidate names.
+      const bootstrapReview = noParticipatingRepositories && snapshot.value.bootstrapPlan !== undefined
+        ? this.bootstrapPlanReview(input.runId, input.candidateSnapshotDigest, snapshot.value.bootstrapPlan)
+        : null;
+      if (bootstrapReview && !bootstrapReview.allowed) return bootstrapReview as Decision<ProductionReadyPacket>;
+
       if (noParticipatingRepositories) {
         // There is no source, command, or reviewer input in this predicate. Persist the
         // explicit no-op fact in the packet summary fields; the daemon adds the authoritative
@@ -268,20 +276,22 @@ export class ProductionGate {
             candidateSnapshotDigest: input.candidateSnapshotDigest,
           }),
         };
-        reviewForPacket = {
-          verdict: "PASS",
-          digest: digestOf({
-            kind: "NO_PARTICIPATING_REPOSITORIES",
-            runId: input.runId,
-            candidateSnapshotDigest: input.candidateSnapshotDigest,
-            review: "NOT_APPLICABLE",
-          }),
-          provider: "not-applicable",
-          model: "not-applicable",
-          coveredFiles: 0,
-          omittedItems: 0,
-          findings: 0,
-        };
+        reviewForPacket = bootstrapReview?.allowed
+          ? bootstrapReview.value
+          : {
+              verdict: "PASS",
+              digest: digestOf({
+                kind: "NO_PARTICIPATING_REPOSITORIES",
+                runId: input.runId,
+                candidateSnapshotDigest: input.candidateSnapshotDigest,
+                review: "NOT_APPLICABLE",
+              }),
+              provider: "not-applicable",
+              model: "not-applicable",
+              coveredFiles: 0,
+              omittedItems: 0,
+              findings: 0,
+            };
       } else {
         const verificationArtifact = this.artifacts.latestForSnapshot<VerificationReport>(
           input.runId,
@@ -1062,6 +1072,70 @@ export class ProductionGate {
         })
       : { required: declaredItems.length > 0, items: declaredItems };
     return { ...definition, digest: digestOf(definition.items) };
+  }
+
+  /**
+   * Issue #246 PR-C slice C2 — the BOOTSTRAP_PLAN review a bootstrap candidate's packet summarizes:
+   * written by the review gate for this candidate, by an independent reviewer that held the binding,
+   * a PASS with nothing omitted and no blocker, of exactly the PLAN binding the candidate names.
+   */
+  private bootstrapPlanReview(
+    runId: string,
+    candidateSnapshotDigest: string,
+    binding: { planDigest: string; projectManifestDigest: string; plannedOutputsDigest: string },
+  ): Decision<ProductionReadyPacket["blindReview"]> {
+    const reviewArtifact = this.artifacts.latestForSnapshot<ReviewPacket>(
+      runId,
+      ArtifactKind.BLIND_REVIEW,
+      candidateSnapshotDigest,
+    );
+    if (!reviewArtifact || reviewArtifact.producedBy !== "blind-review-gate") {
+      return deny(ReasonCode.REVIEW_REQUIRED, "no bootstrap plan review by the review gate for this candidate", {
+        runId,
+        candidateSnapshotDigest,
+        producedBy: reviewArtifact?.producedBy ?? null,
+      });
+    }
+    const review = reviewArtifact.content;
+    const provenance = this.reviewerProvenance(runId, review);
+    if (!provenance.allowed) return provenance as Decision<ProductionReadyPacket["blindReview"]>;
+    const reviewed = review.bootstrapPlan;
+    if (
+      !reviewed ||
+      reviewed.planDigest !== binding.planDigest ||
+      reviewed.projectManifestDigest !== binding.projectManifestDigest ||
+      reviewed.plannedOutputsDigest !== binding.plannedOutputsDigest
+    ) {
+      return deny(ReasonCode.REVIEW_REQUIRED, "the bootstrap plan review is not of the PLAN this candidate names", {
+        runId,
+        candidateSnapshotDigest,
+        reviewed: reviewed ?? null,
+        candidate: binding,
+      });
+    }
+    if (review.verdict !== "PASS") {
+      return deny(ReasonCode.REVIEW_REQUIRED, "blind review has not passed", { verdict: review.verdict });
+    }
+    if (review.omittedItems.length > 0) {
+      return deny(ReasonCode.COVERAGE_INCOMPLETE, "blind review reports omitted items", {
+        omittedItems: review.omittedItems,
+      });
+    }
+    const blockers = review.findings.filter((finding) => finding.severity === "BLOCKER");
+    if (blockers.length > 0) {
+      return deny(ReasonCode.REVIEW_BLOCK, "candidate has unresolved blocker findings", {
+        blockers: blockers.map((blocker) => blocker.summary),
+      });
+    }
+    return allow(ReasonCode.OK, {
+      verdict: review.verdict,
+      digest: reviewArtifact.digest,
+      provider: review.provider,
+      model: review.model,
+      coveredFiles: review.coveredFiles.length,
+      omittedItems: review.omittedItems.length,
+      findings: review.findings.length,
+    });
   }
 
   /** The reviewer identity in the packet must match a real binding, and be independent. */

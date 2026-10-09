@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { currentBootstrapPlan, isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
@@ -160,8 +161,25 @@ export class CandidatePipeline {
       }),
     );
 
+    // #246 C2 — a project-less bootstrap run joins no repository; its candidate is its PLAN, the
+    // manifest that PLAN carries and the outputs it plans. A PLAN with no plannable outputs freezes
+    // nothing, so nothing can be reviewed or confirmed for it.
+    let bootstrapPlan: Parameters<typeof buildNoRepositoryCandidateSnapshot>[0]["bootstrapPlan"];
+    if (participants.length === 0 && isProjectlessBootstrap(run)) {
+      const current = currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+      if (!current.allowed) return current as Decision<CandidateSnapshot>;
+      bootstrapPlan = current.value.binding;
+    }
+
     const snapshot = participants.length === 0
-      ? buildNoRepositoryCandidateSnapshot({ runId, contractDigest: run.contractDigest }, this.clock)
+      ? buildNoRepositoryCandidateSnapshot(
+          {
+            runId,
+            contractDigest: run.contractDigest,
+            ...(bootstrapPlan === undefined ? {} : { bootstrapPlan }),
+          },
+          this.clock,
+        )
       : await buildCandidateSnapshot(
           {
             runId,
@@ -243,6 +261,24 @@ export class CandidatePipeline {
     // inspect. Publish the explicit no-op packet through the same production gate, then let
     // CEO confirmation and the daemon own completion exactly as for a repository run.
     if (snapshot.repositories.length === 0) {
+      // #246 C2 — except a project-less bootstrap candidate, whose planned outputs are exactly the
+      // blind-review input there is. Its review is as automatic as a candidate's (§18.2): the gate
+      // reloads the outputs from the PLAN artifact, a verdict other than PASS returns the run to its
+      // CTO, and only a PASS reaches the production gate.
+      if (snapshot.bootstrapPlan !== undefined) {
+        const contract = this.pinnedContract(input.runId, run.contractDigest);
+        if (!contract.allowed) return contract as Decision<PipelineOutcome>;
+        const reviewed = await this.invokeReview({
+          kind: "BOOTSTRAP_PLAN",
+          runId: input.runId,
+          snapshot,
+          contract: contract.value,
+          contractDigest: run.contractDigest,
+        });
+        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed);
+        if (unpassed !== null) return unpassed;
+        if (this.#continuity?.evaluate) await this.#continuity.evaluate("pre-completion");
+      }
       const sourceReadLease = this.guard.acquireSourceReadLease(input.runId, []);
       if (!sourceReadLease.allowed) return sourceReadLease as Decision<PipelineOutcome>;
       try {
@@ -328,19 +364,8 @@ export class CandidatePipeline {
       });
     }
 
-    const contract = this.artifacts
-      .list<TaskContract>(input.runId, ArtifactKind.TASK_CONTRACT)
-      .find((artifact) => !artifact.superseded && artifact.digest === run.contractDigest);
-    if (!contract || digestOf(contract.content) !== run.contractDigest) {
-      // #448: nothing was compared — the artifact store has no contract that both matches the
-      // run's pinned digest by name and hashes to it. Not a disagreement; a record that could
-      // not be produced to compare at all.
-      return deny(ReasonCode.CONTRACT_UNVERIFIED, "run's pinned task contract is not retrievable by digest", {
-        runId: input.runId,
-        expected: run.contractDigest,
-        found: contract?.digest ?? null,
-      });
-    }
+    const contract = this.pinnedContract(input.runId, run.contractDigest);
+    if (!contract.allowed) return contract as Decision<PipelineOutcome>;
 
     // §18.2 — automatic, immediately after verification passes.
     const reviewed = await this.invokeReview({
@@ -348,51 +373,13 @@ export class CandidatePipeline {
       projectId: run.projectId,
       executionMode: run.executionMode,
       snapshot,
-      contract: contract.content,
+      contract: contract.value,
       contractDigest: run.contractDigest,
       verification: verified.value,
     });
 
-    if (!reviewed.allowed) {
-      // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
-      // whether a provider/isolation failure waits or moves the system into SURVIVAL.
-      if (this.#continuity?.evaluate) await this.#continuity.evaluate("blind-review-unavailable");
-      // §18.7 — only a reviewer *verdict* enters the CTO revision loop. A lost isolation
-      // or a provider that never answered is an assurance failure the candidate cannot
-      // repair, so the gate is neither lowered nor handed to the CTO to "fix".
-      const isVerdict =
-        reviewed.reasonCode === ReasonCode.REVIEW_REVISE ||
-        reviewed.reasonCode === ReasonCode.REVIEW_BLOCK ||
-        reviewed.reasonCode === ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT;
-
-      if (!isVerdict) {
-        this.audit.record({
-          kind: "BLIND_REVIEW_UNAVAILABLE",
-          runId: input.runId,
-          reasonCode: reviewed.reasonCode,
-          evidence: { candidateSnapshotDigest: snapshotDigest, ...reviewed.evidence },
-        });
-        return allow(ReasonCode.OK, {
-          stage: "REVIEW_UNAVAILABLE",
-          reasonCode: reviewed.reasonCode,
-          snapshotDigest,
-          detail: { message: reviewed.message, evidence: reviewed.evidence },
-        });
-      }
-
-      this.returnToCto(input.runId, reviewed.reasonCode, {
-        stage: "blind-review",
-        candidateSnapshotDigest: snapshotDigest,
-        ...reviewed.evidence,
-      });
-      const packet = this.review.latestPacket(input.runId, snapshotDigest);
-      return allow(ReasonCode.OK, {
-        stage: "REVISION_REQUIRED",
-        reasonCode: reviewed.reasonCode,
-        snapshotDigest,
-        ...(packet ? { review: packet } : {}),
-      });
-    }
+    const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed);
+    if (unpassed !== null) return unpassed;
 
     // Coverage is re-evaluated here, in async context, so the gate's completion check
     // decides on a current mode rather than one that predates a provider outage (§15.6).
@@ -440,6 +427,74 @@ export class CandidatePipeline {
     } finally {
       sourceReadLease.value.release();
     }
+  }
+
+  /** The run's pinned task contract, read back by its digest. */
+  private pinnedContract(runId: string, contractDigest: string): Decision<TaskContract> {
+    const contract = this.artifacts
+      .list<TaskContract>(runId, ArtifactKind.TASK_CONTRACT)
+      .find((artifact) => !artifact.superseded && artifact.digest === contractDigest);
+    if (!contract || digestOf(contract.content) !== contractDigest) {
+      // #448: nothing was compared — the artifact store has no contract that both matches the
+      // run's pinned digest by name and hashes to it. Not a disagreement; a record that could
+      // not be produced to compare at all.
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "run's pinned task contract is not retrievable by digest", {
+        runId,
+        expected: contractDigest,
+        found: contract?.digest ?? null,
+      });
+    }
+    return allow(ReasonCode.OK, contract.content);
+  }
+
+  /**
+   * What a review that did not pass leaves the run with, or null for a PASS: a verdict returns the
+   * run to its CTO, and an assurance failure waits (§18.6, §18.7).
+   */
+  private async unpassedReview(
+    runId: string,
+    snapshotDigest: string,
+    reviewed: Decision<ReviewPacket>,
+  ): Promise<Decision<PipelineOutcome> | null> {
+    if (reviewed.allowed) return null;
+    // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
+    // whether a provider/isolation failure waits or moves the system into SURVIVAL.
+    if (this.#continuity?.evaluate) await this.#continuity.evaluate("blind-review-unavailable");
+    // §18.7 — only a reviewer *verdict* enters the CTO revision loop. A lost isolation
+    // or a provider that never answered is an assurance failure the candidate cannot
+    // repair, so the gate is neither lowered nor handed to the CTO to "fix".
+    const isVerdict =
+      reviewed.reasonCode === ReasonCode.REVIEW_REVISE ||
+      reviewed.reasonCode === ReasonCode.REVIEW_BLOCK ||
+      reviewed.reasonCode === ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT;
+
+    if (!isVerdict) {
+      this.audit.record({
+        kind: "BLIND_REVIEW_UNAVAILABLE",
+        runId,
+        reasonCode: reviewed.reasonCode,
+        evidence: { candidateSnapshotDigest: snapshotDigest, ...reviewed.evidence },
+      });
+      return allow(ReasonCode.OK, {
+        stage: "REVIEW_UNAVAILABLE",
+        reasonCode: reviewed.reasonCode,
+        snapshotDigest,
+        detail: { message: reviewed.message, evidence: reviewed.evidence },
+      });
+    }
+
+    this.returnToCto(runId, reviewed.reasonCode, {
+      stage: "blind-review",
+      candidateSnapshotDigest: snapshotDigest,
+      ...reviewed.evidence,
+    });
+    const packet = this.review.latestPacket(runId, snapshotDigest);
+    return allow(ReasonCode.OK, {
+      stage: "REVISION_REQUIRED",
+      reasonCode: reviewed.reasonCode,
+      snapshotDigest,
+      ...(packet ? { review: packet } : {}),
+    });
   }
 
   /** Durable, per-run fence for the whole asynchronous verification/review attempt. */

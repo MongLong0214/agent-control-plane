@@ -612,6 +612,16 @@ const blindReviewEvidenceSchema = z
     verdict: z.enum(["PASS", "REVISE", "BLOCK"]),
     findings: z.array(z.object({}).passthrough()),
     chunked: z.boolean(),
+    // Issue #246 PR-C slice C2 — a BOOTSTRAP_PLAN review names the PLAN, manifest and planned
+    // outputs it judged, reloaded from the PLAN artifact. A candidate review carries no such key.
+    bootstrapPlan: z
+      .object({
+        planDigest: z.string().min(1),
+        projectManifestDigest: z.string().min(1),
+        plannedOutputsDigest: z.string().min(1),
+      })
+      .strict()
+      .optional(),
     createdAt: z.string().min(1),
   })
   .strict();
