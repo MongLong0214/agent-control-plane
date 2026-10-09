@@ -105,13 +105,63 @@ export interface ReceiptLookupQuery {
   readonly executorSessionIncarnation: string;
 }
 
+/** Why a receipt lookup got no answer this build could read (#1036). */
+export type ReceiptLookupErrorKind =
+  | "HTTP_STATUS"
+  | "CONTENT_TYPE"
+  | "TOO_LARGE"
+  | "TIMEOUT"
+  | "TRANSPORT"
+  | "PARSE"
+  | "SCHEMA";
+
+/**
+ * A lookup that failed, named by its cause. `detail` is a short token from the port's own
+ * vocabulary (a status code, a media type, the first schema check that refused the answer), never
+ * the receipt's content and never a credential.
+ */
+export interface ReceiptLookupError {
+  readonly kind: ReceiptLookupErrorKind;
+  readonly detail: string;
+}
+
+/** The audit kind `reconcileUnresolved` records a lookup error under (#1036). */
+export const CANONICAL_TURN_RECEIPT_LOOKUP_FAILED = "CANONICAL_TURN_RECEIPT_LOOKUP_FAILED";
+
+const RECEIPT_LOOKUP_ERROR_KINDS: ReadonlySet<string> = new Set<ReceiptLookupErrorKind>([
+  "HTTP_STATUS", "CONTENT_TYPE", "TOO_LARGE", "TIMEOUT", "TRANSPORT", "PARSE", "SCHEMA",
+]);
+const RECEIPT_LOOKUP_ERROR_DETAIL = /^[A-Za-z0-9_.:/+-]{1,64}$/;
+
+/**
+ * The latest lookup error recorded for a turn, or null. The latest row is what the sweep compares
+ * a new error against, and what doctor reports for a turn still in doubt.
+ */
+export const latestReceiptLookupError = (
+  db: Db,
+  turnRequestId: string,
+): { kind: string; detail: string; at: string } | null => {
+  const row = db.get<{ kind: unknown; detail: unknown; at: string }>(
+    `SELECT json_extract(evidence_json, '$.kind') AS kind, json_extract(evidence_json, '$.detail') AS detail, at
+       FROM audit_events
+      WHERE kind = ? AND json_extract(evidence_json, '$.turnRequestId') = ?
+      ORDER BY event_id DESC LIMIT 1`,
+    [CANONICAL_TURN_RECEIPT_LOOKUP_FAILED, turnRequestId],
+  );
+  return row ? { kind: String(row.kind), detail: String(row.detail), at: row.at } : null;
+};
+
 /**
  * What a target answers a reconciler. Absence and ambiguity are both "no receipt", never
  * evidence that one exists — the distinction contract 6 draws between a lookup that failed and
  * one that found nothing to say.
+ *
+ * `lookupError` is that distinction made visible (#1036): absent when the target answered that it
+ * holds no terminal receipt, present when the lookup failed or the answer could not be read. Both
+ * leave the turn `IN_DOUBT`; neither is evidence about the turn.
  */
 export type ReceiptLookupResult =
-  | { readonly found: false }
+  | { readonly found: false; readonly lookupError?: ReceiptLookupError }
   | {
       readonly found: true;
       readonly outcome: "COMPLETED" | "ABORTED";
@@ -1774,7 +1824,12 @@ export class ConversationTurnCoordinator {
         failed += 1;
         continue;
       }
-      if (!result.found) continue;
+      if (!result.found) {
+        // A lookup error is not counted in `failed`: the port did answer, and the daemon throws on
+        // a nonzero `failed` every pass. It is written once per cause instead (#1036).
+        if (result.lookupError !== undefined) this.#recordLookupError(candidate, result.lookupError);
+        continue;
+      }
 
       // Every identity field checked below comes from `result` — the port's answer — not from
       // `candidate`. `candidate.turnRequestId` is passed too, but only as *which row this sweep
@@ -1808,6 +1863,47 @@ export class ConversationTurnCoordinator {
       await this.#readTelegramDeliveryEvidence(turnRequestId);
     }
     return { swept: candidates.length, settled, unresolved: candidates.length - settled, failed };
+  }
+
+  /**
+   * Records why a receipt lookup for an `IN_DOUBT` turn got no answer this build could read
+   * (#1036). It records nothing about the turn itself: the turn stays `IN_DOUBT`, nothing settles
+   * and nothing is adjudicated.
+   *
+   * One row per turn per cause: a cause equal to the turn's latest recorded one is not written
+   * again, so a sweep that meets the same error every pass writes it once, and a changed cause is
+   * written when it changes. A turn that settled since its lookup began gets no row. The read and
+   * the write share one transaction, so two overlapping sweeps cannot both write the same cause.
+   *
+   * The port's cause is written only in its bounded form: an unknown kind, or a detail that is not
+   * a short token, could be receipt text, so it is recorded as unrecognized.
+   */
+  #recordLookupError(candidate: ReceiptLookupQuery, error: ReceiptLookupError): void {
+    const kind = RECEIPT_LOOKUP_ERROR_KINDS.has(error.kind) ? error.kind : "UNRECOGNIZED";
+    const detail = typeof error.detail === "string" && RECEIPT_LOOKUP_ERROR_DETAIL.test(error.detail)
+      ? error.detail
+      : "unrecognized";
+    this.db.tx(() => {
+      const turn = this.db.get<{ lifecycle_state: string }>(
+        `SELECT lifecycle_state FROM canonical_turns WHERE turn_request_id = ?`,
+        [candidate.turnRequestId],
+      );
+      if (turn?.lifecycle_state !== "IN_DOUBT") return;
+      const latest = latestReceiptLookupError(this.db, candidate.turnRequestId);
+      if (latest?.kind === kind && latest.detail === detail) return;
+      const source = this.db.get<{ source_nonce: string }>(
+        `SELECT source_nonce FROM canonical_turn_sources WHERE turn_request_id = ?
+          ORDER BY batch_ordinal ASC LIMIT 1`,
+        [candidate.turnRequestId],
+      );
+      const audited = this.audit.record({
+        kind: CANONICAL_TURN_RECEIPT_LOOKUP_FAILED,
+        reasonCode: ReasonCode.CONVERSATION_TURN_RECEIPT_LOOKUP_FAILED,
+        actor: candidate.targetActorId,
+        evidence: { turnRequestId: candidate.turnRequestId, sourceNonce: source?.source_nonce ?? null, kind, detail },
+      });
+      if (!audited.allowed) throw acpError(audited.reasonCode, audited.message, audited.evidence);
+    });
   }
 
   /**

@@ -155,19 +155,20 @@ describe("A3 parser witness: the Gateway receipt's delivery shape", () => {
     const withDelivery = (delivery: Record<string, unknown> | null, status: "COMPLETED" | "ABORTED" = "COMPLETED") =>
       (): GatewayAnswer => ({ kind: "json", body: gatewayReceipt(80, turn, { status, delivery }) });
 
-    const refused: Array<[string, () => GatewayAnswer]> = [
+    // #1036: each refusal is still not a receipt, and names the check that refused it.
+    const refused: Array<[string, () => GatewayAnswer, string]> = [
       // Hermes #84 as first written: no chat and no replied-to message, so nothing to check against the turn.
       ["#84's {obligation_id, state, content_digest}", withDelivery({
         obligation_id: "obligation-80", state: "delivered", content_digest: gatewayReplyDigest(80),
-      })],
-      ["the earlier 5-key shape without obligation_id", withDelivery(gatewayDelivery(80, { obligation_id: undefined }))],
-      ["an unknown seventh key", withDelivery(gatewayDelivery(80, { sent_at: 1 }))],
-      ["a delivery that is not an object", withDelivery([] as unknown as Record<string, unknown>)],
-      ["ABORTED that also reports a delivery", withDelivery(gatewayDelivery(80), "ABORTED")],
+      }), "delivery-keys"],
+      ["the earlier 5-key shape without obligation_id", withDelivery(gatewayDelivery(80, { obligation_id: undefined })), "delivery-keys"],
+      ["an unknown seventh key", withDelivery(gatewayDelivery(80, { sent_at: 1 })), "delivery-keys"],
+      ["a delivery that is not an object", withDelivery([] as unknown as Record<string, unknown>), "delivery-keys"],
+      ["ABORTED that also reports a delivery", withDelivery(gatewayDelivery(80), "ABORTED"), "aborted-with-delivery"],
     ];
-    for (const [name, answer] of refused) {
+    for (const [name, answer, detail] of refused) {
       gateway.answer = answer;
-      await expect(ask(), name).resolves.toEqual({ found: false });
+      await expect(ask(), name).resolves.toEqual({ found: false, lookupError: { kind: "SCHEMA", detail } });
     }
 
     gateway.answer = withDelivery(gatewayDelivery(80));

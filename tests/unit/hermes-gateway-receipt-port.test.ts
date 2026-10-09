@@ -162,7 +162,7 @@ describe("U4 Hermes Gateway receipt port", () => {
     }
   });
 
-  it("RED8: PENDING, NEVER_FOUND, a timeout and every malformed answer are not found", async () => {
+  it("RED8: PENDING, NEVER_FOUND, a timeout and every malformed answer are not found, and only the first two are not errors", async () => {
     const turn: TelegramExternalTurnIdentity = {
       turnRequestId: "tr_query",
       targetActorId: "actor:query",
@@ -181,37 +181,39 @@ describe("U4 Hermes Gateway receipt port", () => {
     const ask = () => receiptPort.lookup(query, new AbortController().signal);
     const valid = gatewayReceipt(80, turn);
     const withoutKey = (key: string) => Object.fromEntries(Object.entries(valid).filter(([name]) => name !== key));
-    const answers: Array<[string, () => ReturnType<FakeGateway["answer"]>]> = [
-      ["pending", () => ({ kind: "json", body: gatewayReceipt(80, turn, { status: "PENDING" }) })],
-      ["never found", () => ({ kind: "json", body: gatewayReceipt(80, turn, { status: "NEVER_FOUND" }) })],
-      ["wrong schema", () => ({ kind: "json", body: { ...valid, schema: "hermes.gateway-turn-receipt/v2" } })],
-      ["another update", () => ({ kind: "json", body: gatewayReceipt(81, turn) })],
-      ["unknown key", () => ({ kind: "json", body: { ...valid, signature: "x" } })],
-      ["missing key", () => ({ kind: "json", body: withoutKey("delivery") })],
-      ["identity with an extra key", () => ({ kind: "json", body: { ...valid, receiptIdentity: { ...turn, extra: 1 } } })],
-      ["two turn ids", () => ({ kind: "json", body: { ...valid, turnRequestId: "tr_other" } })],
-      ["foreign receipt id", () => ({ kind: "json", body: gatewayReceipt(80, turn, { receiptId: "sha256:abc" }) })],
-      ["bad evidence digest", () => ({ kind: "json", body: { ...valid, evidenceDigest: "sha256:short" } })],
-      ["unexpected status", () => ({ kind: "json", body: gatewayReceipt(80, turn, { status: "DONE" as "COMPLETED" }) })],
-      ["not json", () => ({ kind: "raw", body: "{not json" })],
-      ["wrong content type", () => ({ kind: "json", body: valid, contentType: "text/plain" })],
-      ["server error", () => ({ kind: "json", status: 500, body: valid })],
-      ["over 4KB", () => ({ kind: "json", body: { ...valid, content: "x".repeat(5_000) } })],
+    // #1036: a malformed or failed answer is still not found, and now says why.
+    const failed = (kind: string, detail: string) => ({ found: false, lookupError: { kind, detail } });
+    const answers: Array<[string, () => ReturnType<FakeGateway["answer"]>, unknown]> = [
+      ["pending", () => ({ kind: "json", body: gatewayReceipt(80, turn, { status: "PENDING" }) }), { found: false }],
+      ["never found", () => ({ kind: "json", body: gatewayReceipt(80, turn, { status: "NEVER_FOUND" }) }), { found: false }],
+      ["wrong schema", () => ({ kind: "json", body: { ...valid, schema: "hermes.gateway-turn-receipt/v2" } }), failed("SCHEMA", "schema-name")],
+      ["another update", () => ({ kind: "json", body: gatewayReceipt(81, turn) }), failed("SCHEMA", "update_id-mismatch")],
+      ["unknown key", () => ({ kind: "json", body: { ...valid, signature: "x" } }), failed("SCHEMA", "unknown-keys")],
+      ["missing key", () => ({ kind: "json", body: withoutKey("delivery") }), failed("SCHEMA", "missing-key:delivery")],
+      ["identity with an extra key", () => ({ kind: "json", body: { ...valid, receiptIdentity: { ...turn, extra: 1 } } }), failed("SCHEMA", "identity-keys")],
+      ["two turn ids", () => ({ kind: "json", body: { ...valid, turnRequestId: "tr_other" } }), failed("SCHEMA", "turnRequestId-mismatch")],
+      ["foreign receipt id", () => ({ kind: "json", body: gatewayReceipt(80, turn, { receiptId: "sha256:abc" }) }), failed("SCHEMA", "receiptId")],
+      ["bad evidence digest", () => ({ kind: "json", body: { ...valid, evidenceDigest: "sha256:short" } }), failed("SCHEMA", "evidenceDigest")],
+      ["unexpected status", () => ({ kind: "json", body: gatewayReceipt(80, turn, { status: "DONE" as "COMPLETED" }) }), failed("SCHEMA", "status")],
+      ["not json", () => ({ kind: "raw", body: "{not json" }), failed("PARSE", "invalid-json")],
+      ["wrong content type", () => ({ kind: "json", body: valid, contentType: "text/plain" }), failed("CONTENT_TYPE", "text/plain")],
+      ["server error", () => ({ kind: "json", status: 500, body: valid }), failed("HTTP_STATUS", "500")],
+      ["over 4KB", () => ({ kind: "json", body: { ...valid, content: "x".repeat(5_000) } }), failed("TOO_LARGE", "body")],
     ];
-    for (const [name, answer] of answers) {
+    for (const [name, answer, expected] of answers) {
       gateway.answer = answer;
-      await expect(ask(), name).resolves.toEqual({ found: false });
+      await expect(ask(), name).resolves.toEqual(expected);
     }
 
     gateway.answer = () => ({ kind: "hang" });
     const started = Date.now();
-    await expect(ask(), "timeout").resolves.toEqual({ found: false });
+    await expect(ask(), "timeout").resolves.toEqual(failed("TIMEOUT", "no-answer-in-2000ms"));
     expect(Date.now() - started).toBeLessThan(3_000);
 
     const aborted = new AbortController();
     const pending = receiptPort.lookup(query, aborted.signal);
     aborted.abort();
-    await expect(pending, "aborted").resolves.toEqual({ found: false });
+    await expect(pending, "aborted").resolves.toEqual(failed("TIMEOUT", "aborted"));
 
     // A turn with no single Telegram update source is never asked about.
     const asked = gateway.requests.length;
