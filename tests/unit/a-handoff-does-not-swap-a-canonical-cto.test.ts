@@ -10,7 +10,7 @@ import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../../src/registry/canonical-self-claim.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { fixtureManifest, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
+import { TEST_OWNER, fixtureManifest, makeHarness, registerFixtureProject, type Harness } from "../helpers/harness.ts";
 import { callMcpToolOverSocket, claimLaunchedCredential } from "../helpers/mcp-socket.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 
@@ -59,7 +59,8 @@ const fixture = async () => {
   const h = makeHarness();
   const { projectId, repositoryId } = await registerFixtureProject(h);
   // The provider a canonical CTO's dispatch is admitted against; it launched none of them.
-  h.cp.providers.register(new TestProductionAdapter(h.clock, "claude"));
+  const claude = new TestProductionAdapter(h.clock, "claude");
+  h.cp.providers.register(claude);
   const launch = await startSessionLaunchChannel(tempDir("acp-hof-launch-"));
   h.cp.cto.attach({ sessionLaunch: launch });
   // The CEO the Hermes socket authenticates, for cto_replace, run_create and run_dispatch.
@@ -99,6 +100,7 @@ const fixture = async () => {
   };
   return {
     h,
+    claude,
     projectId,
     cto,
     hermes,
@@ -542,6 +544,111 @@ describe("C1-R1: a canonical CTO is never left draining", () => {
       expect(f.h.cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId: f.projectId }))?.sessionId).toBe(incomingSessionId);
       const { dispatched } = await f.dispatchRun();
       expect(dispatched).toMatchObject({ ok: true, value: { state: RunState.ACTIVE, ownerSessionId: incomingSessionId } });
+    });
+  });
+});
+
+/**
+ * #1071 round 3, ACP246-C1-R2 — the settlement withdraws only a drain it can attribute to a
+ * switchover: a PENDING handoff from the holder, or a replacement request recorded after the
+ * holder's current drain. A suspension's drain — its RECOVERY package is written before the drain
+ * and the provider stop — is the suspension's until its shutdown and revocation settle, whatever
+ * resume says; so is any drain nothing attributes.
+ */
+describe("C1-R2: the settlement never clears a drain it cannot attribute to a switchover", () => {
+  /** The owner's suspension, started and held at its provider stop until `release`. */
+  const heldSuspension = async (f: Fixture) => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const stop = vi.spyOn(f.claude, "stopSession").mockImplementationOnce(async () => {
+      await held;
+    });
+    const suspension = f.h.cp.cto.suspendProject(f.projectId, true, "the owner suspends the project", TEST_OWNER);
+    await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(1), { timeout: 10_000, interval: 10 });
+    return { suspension, release };
+  };
+
+  it("a suspension held at its provider stop, then cto_resume: the settlement leaves the holder DRAINING, dispatch stays QUEUED, and the stop completes with nothing stranded", async () => {
+    await withFixture(async (f) => {
+      const { binding, credential } = bindCanonical(f.h, f.projectId);
+      const { suspension, release } = await heldSuspension(f);
+      expect(lifecycleOf(f.h, credential.sessionId)).toBe(SessionLifecycle.DRAINING);
+      expect(await f.hermes("cto_resume", { projectId: f.projectId })).toMatchObject({ ok: true });
+
+      expect(await f.h.cp.cto.settleCanonicalSwitchovers()).toEqual({ withdrawn: [], stopFailed: [] });
+      expect(lifecycleOf(f.h, credential.sessionId)).toBe(SessionLifecycle.DRAINING);
+      const { runId, dispatched } = await f.dispatchRun();
+      expect(dispatched).toMatchObject({ ok: false, reasonCode: ReasonCode.RUN_DISPATCH_BLOCKED_CTO_DRAINING });
+      expect(f.h.cp.runs.require(runId)).toMatchObject({ state: RunState.QUEUED, ownerSessionId: null });
+
+      release();
+      expect(await suspension).toMatchObject({ allowed: true });
+      expect(lifecycleOf(f.h, credential.sessionId)).toBe(SessionLifecycle.STOPPED);
+      expect(f.h.cp.bindings.active(binding.roleKey)).toBeNull();
+      expect(f.h.cp.runs.require(runId)).toMatchObject({ state: RunState.QUEUED, ownerSessionId: null });
+    });
+  });
+
+  it("a suspension layered on a pending canonical handoff: the handoff is withdrawn and its replacement stopped, but the holder stays DRAINING until the suspension settles", async () => {
+    await withFixture(async (f) => {
+      const pending = await pendingCanonicalHandoff(f);
+      const { suspension, release } = await heldSuspension(f);
+      expect(await f.hermes("cto_resume", { projectId: f.projectId })).toMatchObject({ ok: true });
+
+      expect(await f.h.cp.cto.settleCanonicalSwitchovers()).toEqual({
+        withdrawn: [{ projectId: f.projectId, handoffIds: [pending.handoffId], replacements: [pending.incomingSessionId], restored: false }],
+        stopFailed: [],
+      });
+      expect(handoffStatus(f.h, pending.handoffId)).toBe("REJECTED");
+      expect(lifecycleOf(f.h, pending.incomingSessionId)).toBe(SessionLifecycle.STOPPED);
+      expect(lifecycleOf(f.h, pending.credential.sessionId)).toBe(SessionLifecycle.DRAINING);
+
+      release();
+      expect(await suspension).toMatchObject({ allowed: true });
+      expect(lifecycleOf(f.h, pending.credential.sessionId)).toBe(SessionLifecycle.STOPPED);
+      expect(f.h.cp.bindings.active(pending.binding.roleKey)).toBeNull();
+    });
+  });
+
+  it("a drain no switchover record explains is left alone", async () => {
+    await withFixture(async (f) => {
+      const { credential } = bindCanonical(f.h, f.projectId);
+      // A drain from a writer that left no switchover record.
+      expect(f.h.cp.sessions.transition(credential.sessionId, SessionLifecycle.DRAINING, "an unattributed drain").allowed).toBe(true);
+
+      expect(await f.h.cp.cto.settleCanonicalSwitchovers()).toEqual({ withdrawn: [], stopFailed: [] });
+      expect(lifecycleOf(f.h, credential.sessionId)).toBe(SessionLifecycle.DRAINING);
+    });
+  });
+
+  it("a replacement record older than the holder's current drain does not explain it", async () => {
+    await withFixture(async (f) => {
+      const { binding, credential } = liveHolder(f.h, f.projectId);
+      expect(await f.hermes("cto_replace", { projectId: f.projectId, reason: "replace the CTO" })).toMatchObject({ ok: true });
+      becomeCanonical(f.h, binding.assignmentId);
+      expect((await f.h.cp.cto.settleCanonicalSwitchovers()).withdrawn).toEqual([
+        { projectId: f.projectId, handoffIds: [], replacements: [], restored: true },
+      ]);
+      expect(lifecycleOf(f.h, credential.sessionId)).toBe(SessionLifecycle.READY);
+      // Drained again afterwards, by a writer that left no switchover record.
+      expect(f.h.cp.sessions.transition(credential.sessionId, SessionLifecycle.DRAINING, "a later, unattributed drain").allowed).toBe(true);
+
+      expect(await f.h.cp.cto.settleCanonicalSwitchovers()).toEqual({ withdrawn: [], stopFailed: [] });
+      expect(lifecycleOf(f.h, credential.sessionId)).toBe(SessionLifecycle.DRAINING);
+    });
+  });
+
+  it("a suspended project's flag alone keeps a replacement-drained canonical holder DRAINING", async () => {
+    await withFixture(async (f) => {
+      const { binding, credential } = liveHolder(f.h, f.projectId);
+      expect(await f.hermes("cto_replace", { projectId: f.projectId, reason: "replace the CTO" })).toMatchObject({ ok: true });
+      becomeCanonical(f.h, binding.assignmentId);
+      expect(f.h.cp.projects.setSuspended(f.projectId, true, true).allowed).toBe(true);
+
+      expect(await f.h.cp.cto.settleCanonicalSwitchovers()).toEqual({ withdrawn: [], stopFailed: [] });
+      expect(lifecycleOf(f.h, credential.sessionId)).toBe(SessionLifecycle.DRAINING);
     });
   });
 });

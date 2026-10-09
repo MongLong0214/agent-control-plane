@@ -1307,19 +1307,26 @@ export class CtoLifecycle {
    * #246 C1-R1 — one transaction: every PENDING normal handoff of the project is closed REJECTED;
    * each replacement it named that holds no role is marked ERROR, its provider stop pending (a
    * closed handoff's envelope is no longer deliverable, and ERROR fences the rest); and the active
-   * holder, if DRAINING while its project is not suspended (a suspension's drain is the
-   * suspension's), is READY again. Its audit row is the reason the handoffs were closed. Only ever
+   * holder, if DRAINING for a switchover (`#drainIsSwitchover`, C1-R2) while its project is not
+   * suspended, is READY again. Its audit row is the reason the handoffs were closed. Only ever
    * called for a project whose PRIMARY_CTO is canonical; the binding itself is not touched.
    */
   #withdrawCanonicalSwitchover(projectId: string, reason: string): CanonicalSwitchoverWithdrawal {
     return this.db.tx(() => {
       const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
-      const pending = this.db.all<{ handoff_id: string; to_session_id: string }>(
-        `SELECT handoff_id, to_session_id FROM handoffs
+      const pending = this.db.all<{ handoff_id: string; from_session_id: string | null; to_session_id: string }>(
+        `SELECT handoff_id, from_session_id, to_session_id FROM handoffs
           WHERE project_id = ? AND kind = 'HANDOFF' AND status = 'PENDING'
           ORDER BY created_at, handoff_id`,
         [projectId],
       );
+      const current = this.bindings.active(roleKey);
+      const holding = current ? this.sessions.get(current.sessionId) : null;
+      const draining = holding?.lifecycle === SessionLifecycle.DRAINING ? holding : null;
+      // Attributed before the handoffs below are closed: a PENDING one from the holder is evidence.
+      const switchoverDrain =
+        draining !== null &&
+        this.#drainIsSwitchover(projectId, draining.sessionId, pending.some((handoff) => handoff.from_session_id === draining.sessionId));
       const replacements: string[] = [];
       for (const handoff of pending) {
         this.db.run(`UPDATE handoffs SET status = 'REJECTED' WHERE handoff_id = ? AND status = 'PENDING'`, [handoff.handoff_id]);
@@ -1328,12 +1335,11 @@ export class CtoLifecycle {
         this.sessions.transition(replacement.sessionId, SessionLifecycle.ERROR, `${reason}: handoff withdrawn, provider stop pending`);
         replacements.push(replacement.sessionId);
       }
-      const current = this.bindings.active(roleKey);
-      const holding = current ? this.sessions.get(current.sessionId) : null;
       const restored =
-        holding?.lifecycle === SessionLifecycle.DRAINING &&
+        draining !== null &&
+        switchoverDrain &&
         this.projects.get(projectId)?.suspended !== true &&
-        this.sessions.transition(holding.sessionId, SessionLifecycle.READY, `${reason}: a canonical CTO is not replaced`).allowed;
+        this.sessions.transition(draining.sessionId, SessionLifecycle.READY, `${reason}: a canonical CTO is not replaced`).allowed;
       const withdrawal = { projectId, handoffIds: pending.map((handoff) => handoff.handoff_id), replacements, restored };
       if (withdrawal.handoffIds.length > 0 || restored) {
         this.audit.record({
@@ -1347,6 +1353,38 @@ export class CtoLifecycle {
       }
       return withdrawal;
     });
+  }
+
+  /**
+   * #246 C1-R2 — whether the holder's current drain is a switchover's, by positive evidence only.
+   * Three writers drain a PRIMARY_CTO session: `prepareSwitchover` (with a PENDING handoff from it),
+   * `requestReplacement` (recording CTO_REPLACEMENT_REQUESTED for it right after its drain), and
+   * `suspendProject`, whose RECOVERY package from the session is written before its drain and its
+   * provider stop and is never closed. A suspension's drain stays the suspension's until its
+   * shutdown and revocation settle, whatever resume or a switchover record says; a drain nothing
+   * here attributes — another writer's — is left alone too. A replacement record counts only if it
+   * is newer than the session's latest transition into DRAINING, so it explains that drain and not
+   * an earlier one.
+   */
+  #drainIsSwitchover(projectId: string, sessionId: string, pendingHandoffFromHolder: boolean): boolean {
+    const suspension = this.db.get<{ handoff_id: string }>(
+      `SELECT handoff_id FROM handoffs WHERE kind = 'RECOVERY' AND from_session_id = ? LIMIT 1`,
+      [sessionId],
+    );
+    if (suspension) return false;
+    if (pendingHandoffFromHolder) return true;
+    const drained = this.db.get<{ eventId: number | null }>(
+      `SELECT MAX(event_id) AS eventId FROM audit_events
+        WHERE kind = 'SESSION_LIFECYCLE' AND session_id = ? AND json_extract(evidence_json, '$.to') = ?`,
+      [sessionId, SessionLifecycle.DRAINING],
+    )?.eventId ?? null;
+    if (drained === null) return false;
+    return this.db.get<{ event_id: number }>(
+      `SELECT event_id FROM audit_events
+        WHERE kind = 'CTO_REPLACEMENT_REQUESTED' AND session_id = ? AND project_id = ? AND event_id > ?
+        LIMIT 1`,
+      [sessionId, projectId, drained],
+    ) !== undefined;
   }
 
   /** Provider stops for withdrawn replacements; answers the sessions the provider did not stop. */
