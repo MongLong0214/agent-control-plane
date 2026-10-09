@@ -297,6 +297,76 @@ describe("#1036 a receipt lookup error is recorded, not swallowed", () => {
     }
   });
 
+  it("W18: a PENDING that names no message is SCHEMA/message_id-type, the turn stays IN_DOUBT, and doctor names it (R1074-04)", async () => {
+    const fixture = daemonFixture();
+    try {
+      const turn = await claimOne(fixture, 418);
+      // The Gateway writes PENDING only when it admits the message, with that message's id, so its
+      // PENDING always names the message as a positive integer. One naming none is not that answer.
+      answering((updateId) => ({ kind: "json", body: { ...gatewayPending(updateId, turn), message_id: null } }));
+      const swept = await fixture.cp.conversation.reconcileUnresolved(5_000);
+
+      expect(swept).toMatchObject({ swept: 1, settled: 0, failed: 0 });
+      expect(lifecycle(fixture, turn.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+      expect(observationCount(fixture, turn.turnRequestId)).toBe(0);
+      expect(lookupFailures(fixture)).toEqual([{
+        reasonCode: "CONVERSATION_TURN_RECEIPT_LOOKUP_FAILED",
+        actor: turn.targetActorId,
+        evidence: { turnRequestId: turn.turnRequestId, sourceNonce: "update:418", kind: "SCHEMA", detail: "message_id-type" },
+      }]);
+      const found = await inDoubtFinding(fixture);
+      expect(found?.observedEvidence["lookupErrors"]).toEqual([
+        { turnRequestId: turn.turnRequestId, kind: "SCHEMA", detail: "message_id-type", at: fixture.clock.nowIso() },
+      ]);
+      // An unreadable receipt is not a disagreement between records: there is nothing to adjudicate.
+      const adjudicated = fixture.cp.conversation.adjudicate({
+        targetActorId: turn.targetActorId,
+        turnRequestId: turn.turnRequestId,
+        citedObservationIds: [],
+        reasonCode: "OK",
+        evidenceDigest: digestOf("operator"),
+      });
+      expect(adjudicated.allowed).toBe(false);
+    } finally {
+      fixture.cp.close();
+    }
+  });
+
+  it("W19: the production NEVER_FOUND, its update an integer and every other field null, stays a plain not-found (R1074-04)", async () => {
+    const fixture = daemonFixture();
+    try {
+      const turn = await claimOne(fixture, 419);
+      // Written out rather than built by a helper: this is the whole body the Gateway serializes for
+      // an update it holds nothing for. Its null message_id is that answer, not a malformed one.
+      const neverFound = {
+        schema: "hermes.gateway-turn-receipt/v1",
+        update_id: 419,
+        message_id: null,
+        status: "NEVER_FOUND",
+        turnRequestId: null,
+        receiptIdentity: null,
+        receiptId: null,
+        evidenceDigest: null,
+        reasonCode: null,
+        delivery: null,
+      };
+      answering(() => ({ kind: "json", body: neverFound }));
+      const port419 = new HermesGatewayReceiptPort(() => ({ updateId: 419 }), { apiKey: GATEWAY_KEY, port });
+      await expect(port419.lookup(turn, new AbortController().signal)).resolves.toEqual({ found: false });
+
+      expect(await fixture.cp.conversation.reconcileUnresolved(5_000)).toMatchObject({ swept: 1, settled: 0, failed: 0 });
+      expect(gateway.requests).toHaveLength(2);
+      expect(lookupFailures(fixture)).toEqual([]);
+      expect(lifecycle(fixture, turn.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+      expect(observationCount(fixture, turn.turnRequestId)).toBe(0);
+      const found = await inDoubtFinding(fixture);
+      expect(found?.observedEvidence["lookupErrors"]).toBeUndefined();
+      expect(found?.recommendedAction).not.toContain("lookup error");
+    } finally {
+      fixture.cp.close();
+    }
+  });
+
   it("W6: one row per distinct cause per turn, however often it recurs, before or after a restart (R1074-01)", async () => {
     const fixture = daemonFixture();
     try {
@@ -525,6 +595,8 @@ describe("#1036 the Gateway port names every cause", () => {
       [{ ...gatewayNeverFound(80), delivery: gatewayDelivery(80) }, "never-found-field:delivery"],
       [{ ...gatewayNeverFound(80), content: "" }, "never-found-field:content"],
       [gatewayPending(81, turn), "update_id-mismatch"],
+      // A PENDING names the message it admitted, as a positive integer (R1074-04).
+      [{ ...gatewayPending(80, turn), message_id: null }, "message_id-type"],
       [{ ...gatewayPending(80, turn), message_id: "180" }, "message_id-type"],
       [{ ...gatewayPending(80, turn), message_id: 0 }, "message_id-range"],
       [{ ...gatewayPending(80, turn), receiptIdentity: null }, "identity-keys"],
@@ -585,10 +657,10 @@ describe("#1036 the Gateway port names every cause", () => {
     }
 
     // Answers that are not failures: Hermes holds no receipt, or holds one that is not terminal yet.
+    // A PENDING without its message id is not one of them; W10 names it (R1074-04).
     const plain: Array<[string, GatewayAnswer]> = [
       ["NEVER_FOUND", { kind: "json", body: gatewayNeverFound(80) }],
       ["PENDING", { kind: "json", body: gatewayPending(80, turn) }],
-      ["PENDING, no message id", { kind: "json", body: { ...gatewayPending(80, turn), message_id: null } }],
     ];
     for (const [name, answer] of plain) {
       answering(() => answer);

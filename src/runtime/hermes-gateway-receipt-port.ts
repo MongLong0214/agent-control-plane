@@ -206,8 +206,9 @@ const PENDING_EMPTY = ["receiptId", "evidenceDigest", "reasonCode", "delivery"] 
 
 /**
  * The production Gateway's two non-terminal answers, as a plain not-found when they have exactly its
- * shape: `NEVER_FOUND` names the update and nothing else, and `PENDING` names the update, the turn
- * and its eight-field identity and nothing a terminal receipt adds. Anything else in either is named.
+ * shape: `NEVER_FOUND` names the update and nothing else (its `message_id` is null), and `PENDING`
+ * names the update, the message, the turn and its eight-field identity and nothing a terminal
+ * receipt adds. Anything else in either is named.
  */
 const nonTerminal = (
   rest: Record<string, unknown>,
@@ -222,8 +223,11 @@ const nonTerminal = (
     const filled = NEVER_FOUND_EMPTY.find((key) => rest[key] !== null);
     return filled === undefined ? NOT_FOUND : schemaError(`never-found-field:${filled}`);
   }
-  // The message the turn answers, when the Gateway names it.
-  const messageId = rest["message_id"] === null ? null : messageIdFailure(rest["message_id"]);
+  // The message the turn answers. The Gateway writes PENDING only when it admits that message, so
+  // a PENDING always names it, as a positive integer; a null is `message_id-type`, exactly as in a
+  // terminal receipt (R1074-04). Like the terminal path, the id is checked, not compared: the source
+  // row this port reads holds the update id, and the identity below names the turn.
+  const messageId = messageIdFailure(rest["message_id"]);
   if (messageId !== null) return schemaError(messageId);
   const identity = attestedIdentity(rest["receiptIdentity"]);
   if (typeof identity === "string") return schemaError(identity);
