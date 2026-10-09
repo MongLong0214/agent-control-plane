@@ -1244,7 +1244,7 @@ describe("daemon (CP-S58, CP-S59)", () => {
     // Simulate a competing instance: a live pid that is not this process. (A lock held
     // by this very pid is reclaimable, which is what makes in-process restart work.)
     writeFileSync(
-      join(stateDir, "agentcpd.lock"),
+      join(stateDir, "agentcpd.lock", "holder.json"),
       JSON.stringify({ pid: process.ppid, startedAt: harness.clock.nowIso(), path: "x" }),
     );
 

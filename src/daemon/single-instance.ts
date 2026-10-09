@@ -695,6 +695,31 @@ const takeExclusive = (path: string): Taken => {
 };
 
 /**
+ * Whether the process a holder record names is proven gone, for a reader that may only proceed on
+ * proof (`agentcpd-state`): `kill(pid, 0)` answered ESRCH, or the process now holding that pid
+ * started at another time than the record says, both start tokens read. Running, EPERM, an
+ * unreadable token, a record without one, or any other answer is not proof.
+ */
+export const holderProvenGone = (holder: LockInfo): boolean => {
+  if (!Number.isSafeInteger(holder.pid) || holder.pid <= 0) return false;
+  try {
+    process.kill(holder.pid, 0);
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    if (code === "ESRCH") return true;
+    if (code !== "EPERM") return false;
+  }
+  if (!holder.startToken) return false;
+  let current: string | null;
+  try {
+    current = readProcessStartToken(holder.pid);
+  } catch {
+    return false;
+  }
+  return current !== null && current !== holder.startToken;
+};
+
+/**
  * Whether the process a holder record names is running and is that holder. With a start token, the
  * token must match (an unreadable one counts as a match). An earlier build's record has none, and its
  * `startedAt` is a clock reading, not the process's start: its holder counts as running while the pid
