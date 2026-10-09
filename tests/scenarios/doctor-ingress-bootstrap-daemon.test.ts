@@ -25,11 +25,6 @@ import { NO_HUMAN_GATE_DIGEST } from "../../src/github/github-kernel.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import { createHermesBootstrapAuthority } from "../../src/bootstrap/hermes-bootstrap.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
-import {
-  CANDIDATE_SNAPSHOT_SCHEMA_ID,
-  candidateSnapshotDigest,
-  type CandidateSnapshot,
-} from "../../src/snapshot/candidate-snapshot.ts";
 import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
@@ -42,7 +37,7 @@ import {
   makeHarness,
   registerFixtureProject,
 } from "../helpers/harness.ts";
-import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
+import { bootstrapOperations, bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan } from "../helpers/bootstrap-plan.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 
 vi.mock("../../src/runtime/hermes-target-bind.ts", async (original) => ({
@@ -95,71 +90,6 @@ const dispatchedRun = async (harness: Harness) => {
   return { projectId, repositoryId, identity, run: dispatched.value };
 };
 
-const recordBootstrapBlindReview = (harness: Harness, runId: string): string => {
-  const run = harness.cp.runs.require(runId);
-  const head = gitSync(harness.repoPath, ["rev-parse", "HEAD"]);
-  const snapshot: CandidateSnapshot = {
-    schema: CANDIDATE_SNAPSHOT_SCHEMA_ID,
-    runId,
-    contractDigest: run.contractDigest,
-    repositories: [{
-      identity: "github:acme/fixture",
-      repositoryRole: "primary",
-      baseBranch: "dev",
-      baseHead: head,
-      candidateHead: head,
-      treeDigest: `git-tree:${gitSync(harness.repoPath, ["rev-parse", "HEAD^{tree}"])}`,
-      diffDigest: digestOf({ bootstrapCandidate: runId }),
-      worktreeId: null,
-      manifestDigest: null,
-      touchedPaths: [],
-    }],
-    createdAt: harness.clock.nowIso(),
-  };
-  const candidateSnapshotDigestValue = candidateSnapshotDigest(snapshot);
-  harness.cp.artifacts.put(runId, "CANDIDATE_SNAPSHOT", snapshot, candidateSnapshotDigestValue);
-
-  const reviewer = harness.cp.sessions.create({ provider: "scripted", model: "bootstrap-reviewer" });
-  harness.cp.sessions.transition(reviewer.sessionId, SessionLifecycle.READY, "test reviewer");
-  const reviewerBinding = harness.cp.bindings.bind({
-    role: Role.BLIND_REVIEWER,
-    roleKey: roleKeyFor(Role.BLIND_REVIEWER, { runId }),
-    runId,
-    sessionId: reviewer.sessionId,
-  });
-  if (!reviewerBinding.allowed) throw new Error(reviewerBinding.message);
-
-  harness.cp.artifacts.putEvidence(harness.cp.evidenceWritersForTests().BLIND_REVIEW, runId, "BLIND_REVIEW", {
-    runId,
-    candidateSnapshotDigest: candidateSnapshotDigestValue,
-    contractDigest: run.contractDigest,
-    reviewerRoleBindingGeneration: reviewerBinding.value.bindingGeneration,
-    reviewerSessionId: reviewer.sessionId,
-    reviewerSessionIncarnation: reviewer.incarnation,
-    reviewerProviderSessionId: reviewer.sessionId,
-    provider: reviewer.provider,
-    model: reviewer.model,
-    effort: reviewer.effort,
-    egressEvidence: testReviewerEgressEvidence(reviewer.provider),
-    inputManifest: {
-      contract: true,
-      snapshotManifest: true,
-      diff: true,
-      verificationEvidence: true,
-      projectContext: true,
-      withheld: [],
-      binaryArtifacts: [],
-    },
-    coveredRepositories: ["github:acme/fixture"],
-    coveredFiles: [],
-    omittedItems: [],
-    verdict: "PASS",
-    findings: [],
-    chunked: false,
-    createdAt: harness.clock.nowIso(),
-  }, candidateSnapshotDigestValue);
-  return candidateSnapshotDigestValue;
-};
 
 const prepareDaemonHealth = (harness: Harness): void => {
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
@@ -1016,34 +946,46 @@ describe("Repo Factory boundary (CP-S52)", () => {
     if (!created.allowed) throw new Error(created.message);
     const runId = created.value.runId;
 
+    // #246 C2 — an executable bootstrap PLAN carrying its manifest, and a result reporting every
+    // one of its operations and the manifest's one verification at the checkout's head.
+    const manifest = cleanTreeManifest("bootstrap-project");
+    const approvedPlan = bootstrapPlan(manifest, { bootstrapOperationId: "op-1", requestDigest: digestOf({ r: 1 }) });
+    const executableResult = (planDigest: string) =>
+      factoryResult(harness, "bootstrap-project", {
+        runId,
+        planDigest,
+        projectManifestDigest: manifestDigest(manifest),
+        externalWriteReceipts: bootstrapOperations().map((operation) => ({
+          bootstrapOperationId: "op-1",
+          requestDigest: digestOf({ r: 1 }),
+          operationId: operation.operationId,
+          resourceType: operation.resourceType,
+          resourceIdentity: operation.resourceIdentity,
+          preexisting: false,
+          beforeStateDigest: null,
+          afterStateDigest: digestOf({ written: operation.operationId }),
+          createdAt: "2026-08-12T00:00:00.000Z",
+          rereadAt: "2026-08-12T00:00:01.000Z",
+          verified: true,
+        })),
+        bootstrapVerification: [{
+          commandId: "clean-tree",
+          repositoryIdentity: "github:acme/fixture",
+          exactHead: gitSync(harness.repoPath, ["rev-parse", "HEAD"]),
+          status: "PASS",
+        }],
+      });
+
     const input = {
       runId,
-      factoryResult: factoryResult(harness, "bootstrap-project"),
-      approvedManifest: fixtureManifest("bootstrap-project"),
+      factoryResult: executableResult(harness.cp.artifacts.put(runId, "PLAN", approvedPlan).digest),
+      approvedManifest: manifest,
       localBindings: [
         { identity: "github:acme/fixture", checkoutPath: harness.repoPath, repositoryRole: "primary" },
       ],
       projectName: "bootstrap",
       handoff: HANDOFF,
     };
-
-    const approvedPlan = {
-      bootstrapOperationId: "op-1",
-      requestDigest: digestOf({ r: 1 }),
-      projectManifestDigest: manifestDigest(fixtureManifest("bootstrap-project")),
-      githubOperations: [
-        {
-          operationId: "create-repo",
-          resourceType: "repository",
-          resourceIdentity: "github:acme/fixture",
-        },
-      ],
-    };
-    harness.cp.artifacts.put(runId, "PLAN", approvedPlan);
-    input.factoryResult = factoryResult(harness, "bootstrap-project", {
-      runId,
-      planDigest: digestOf(approvedPlan),
-    });
 
     // §26.5 — with no review of the bootstrap candidate there is nothing to activate on,
     // and nothing has been written yet.
@@ -1057,9 +999,12 @@ describe("Repo Factory boundary (CP-S52)", () => {
     const dispatched = await dispatchBootstrapRun(harness.cp, harness.clock, runId);
     expect(harness.cp.bindings.active(roleKeyFor(Role.BOOTSTRAP_CTO, { runId }))?.sessionId)
       .toBe(dispatched.ownerSessionId);
-    const bootstrapCandidate = recordBootstrapBlindReview(harness, runId);
-    // TODO(C2): the bootstrap review gate moves the run to CEO review; this transition stands in.
-    harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "bootstrap reviewed");
+    // #246 C2 — its bootstrap CTO submits the PLAN, and `result_submit`'s BOOTSTRAP_PLAN review
+    // passes the planned outputs: the run reaches CEO review on a review bound to that PLAN.
+    const reviewed = await reviewBootstrapPlan(harness, runId, approvedPlan);
+    const bootstrapCandidate = reviewed.snapshotDigest;
+    expect(harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+    input.factoryResult = executableResult(reviewed.planDigest);
 
     // The handoff is opened but not yet acknowledged, so activation is still incomplete —
     // and the ack has to come from the incoming session itself.
@@ -1089,7 +1034,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(awaitingCeo.value.ceoConfirm).toBeNull();
     expect(harness.cp.artifacts.latest(runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
 
-    const ceoSessionId = bindCeo(harness);
+    const ceoSessionId = reviewed.ceoSessionId;
     await harness.cp.continuity.evaluate("bootstrap confirmation");
     const confirmed = harness.cp.ceo.submitCeoDecision({
       runId,

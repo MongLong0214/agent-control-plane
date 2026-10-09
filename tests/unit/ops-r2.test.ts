@@ -15,25 +15,26 @@ import * as ingressGuardExports from "../../src/ingress/ingress-guard.ts";
 import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import {
-  CANDIDATE_SNAPSHOT_SCHEMA_ID,
-  candidateSnapshotDigest,
-  type CandidateSnapshot,
-} from "../../src/snapshot/candidate-snapshot.ts";
+import { manifestDigest } from "../../src/contracts/manifest.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
   approveReviewedCandidateForFinalization,
-  bindCeo,
   completeBootstrapRunUntilC3,
   dispatchBootstrapRun,
   driveToReviewedCandidate,
-  fixtureManifest,
   makeHarness,
   type Harness,
 } from "../helpers/harness.ts";
+import {
+  BOOTSTRAP_IDENTITY,
+  BOOTSTRAP_REQUEST_DIGEST,
+  bootstrapOperations,
+  bootstrapPlan,
+  cleanTreeManifest,
+  reviewBootstrapPlan,
+} from "../helpers/bootstrap-plan.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
-import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -59,35 +60,39 @@ const HANDOFF: HandoffPackage = {
   recommendedNextAction: "verify",
 };
 
-const validResult = (harness: Harness, runId: string, projectId: string, plan: object) => ({
+/**
+ * A factory result that reports every operation of the bootstrap PLAN `prepareBootstrap` reviews,
+ * and the manifest's one verification at the checkout's head (#246 C2: an executable PLAN).
+ */
+const validResult = (harness: Harness, runId: string, projectId: string, planDigest: string) => ({
   schema: "repo-factory.result.v2",
   runId,
   bootstrapOperationId: "op-bootstrap",
-  planDigest: digestOf(plan),
-  projectManifestDigest: digestOf(fixtureManifest(projectId)),
+  planDigest,
+  projectManifestDigest: manifestDigest(cleanTreeManifest(projectId)),
   repositories: [{
     role: "primary",
-    identity: "github:acme/fixture",
+    identity: BOOTSTRAP_IDENTITY,
     proposedCheckoutPath: harness.repoPath,
     defaultBranch: "dev",
     createdBranches: ["main", "dev"],
   }],
-  externalWriteReceipts: [{
+  externalWriteReceipts: bootstrapOperations().map((operation) => ({
     bootstrapOperationId: "op-bootstrap",
-    requestDigest: digestOf({ request: "bootstrap" }),
-    operationId: "create-repository",
-    resourceType: "repository",
-    resourceIdentity: "github:acme/fixture",
+    requestDigest: BOOTSTRAP_REQUEST_DIGEST,
+    operationId: operation.operationId,
+    resourceType: operation.resourceType,
+    resourceIdentity: operation.resourceIdentity,
     preexisting: false,
     beforeStateDigest: null,
-    afterStateDigest: digestOf({ repository: "created" }),
+    afterStateDigest: digestOf({ written: operation.operationId }),
     createdAt: "2026-08-12T00:00:00.000Z",
     rereadAt: "2026-08-12T00:00:01.000Z",
     verified: true,
-  }],
+  })),
   bootstrapVerification: [{
-    commandId: "verify",
-    repositoryIdentity: "github:acme/fixture",
+    commandId: "clean-tree",
+    repositoryIdentity: BOOTSTRAP_IDENTITY,
     exactHead: gitSync(harness.repoPath, ["rev-parse", "HEAD"]),
     status: "PASS",
   }],
@@ -95,72 +100,10 @@ const validResult = (harness: Harness, runId: string, projectId: string, plan: o
   unresolvedGaps: [],
 });
 
-const recordBootstrapBlindReview = (harness: Harness, runId: string): string => {
-  const run = harness.cp.runs.require(runId);
-  const head = gitSync(harness.repoPath, ["rev-parse", "HEAD"]);
-  const snapshot: CandidateSnapshot = {
-    schema: CANDIDATE_SNAPSHOT_SCHEMA_ID,
-    runId,
-    contractDigest: run.contractDigest,
-    repositories: [{
-      identity: "github:acme/fixture",
-      repositoryRole: "primary",
-      baseBranch: "dev",
-      baseHead: head,
-      candidateHead: head,
-      treeDigest: `git-tree:${gitSync(harness.repoPath, ["rev-parse", "HEAD^{tree}"])}`,
-      diffDigest: digestOf({ bootstrapCandidate: runId }),
-      worktreeId: null,
-      manifestDigest: null,
-      touchedPaths: [],
-    }],
-    createdAt: harness.clock.nowIso(),
-  };
-  const candidateSnapshotDigestValue = candidateSnapshotDigest(snapshot);
-  harness.cp.artifacts.put(runId, "CANDIDATE_SNAPSHOT", snapshot, candidateSnapshotDigestValue);
-
-  const reviewer = harness.cp.sessions.create({ provider: "scripted", model: "bootstrap-reviewer" });
-  harness.cp.sessions.transition(reviewer.sessionId, SessionLifecycle.READY, "test reviewer");
-  const reviewerBinding = harness.cp.bindings.bind({
-    role: Role.BLIND_REVIEWER,
-    roleKey: roleKeyFor(Role.BLIND_REVIEWER, { runId }),
-    runId,
-    sessionId: reviewer.sessionId,
-  });
-  if (!reviewerBinding.allowed) throw new Error(reviewerBinding.message);
-
-  harness.cp.artifacts.putEvidence(harness.cp.evidenceWritersForTests().BLIND_REVIEW, runId, "BLIND_REVIEW", {
-    runId,
-    candidateSnapshotDigest: candidateSnapshotDigestValue,
-    contractDigest: run.contractDigest,
-    reviewerRoleBindingGeneration: reviewerBinding.value.bindingGeneration,
-    reviewerSessionId: reviewer.sessionId,
-    reviewerSessionIncarnation: reviewer.incarnation,
-    reviewerProviderSessionId: reviewer.sessionId,
-    provider: reviewer.provider,
-    model: reviewer.model,
-    effort: reviewer.effort,
-    egressEvidence: testReviewerEgressEvidence(reviewer.provider),
-    inputManifest: {
-      contract: true,
-      snapshotManifest: true,
-      diff: true,
-      verificationEvidence: true,
-      projectContext: true,
-      withheld: [],
-      binaryArtifacts: [],
-    },
-    coveredRepositories: ["github:acme/fixture"],
-    coveredFiles: [],
-    omittedItems: [],
-    verdict: "PASS",
-    findings: [],
-    chunked: false,
-    createdAt: harness.clock.nowIso(),
-  }, candidateSnapshotDigestValue);
-  return candidateSnapshotDigestValue;
-};
-
+/**
+ * A PROJECT_BOOTSTRAP run at CEO review: its BOOTSTRAP_CTO submits the PLAN with its manifest, and
+ * `result_submit`'s BOOTSTRAP_PLAN review passes it (#246 C2), rather than a hand-written review.
+ */
 const prepareBootstrap = async (harness: Harness, projectId: string) => {
   const created = harness.cp.runs.create({
     kind: RunKind.PROJECT_BOOTSTRAP,
@@ -170,31 +113,20 @@ const prepareBootstrap = async (harness: Harness, projectId: string) => {
   if (!created.allowed) throw new Error(created.message);
   // Dispatch staffs the run's BOOTSTRAP_CTO and pins it as the owner (#246).
   const dispatched = await dispatchBootstrapRun(harness.cp, harness.clock, created.value.runId);
-  const candidateSnapshotDigestValue = recordBootstrapBlindReview(harness, created.value.runId);
-  harness.cp.runs.transition(created.value.runId, RunState.READY_FOR_CEO_REVIEW, "reviewed");
-  const plan = {
-    bootstrapOperationId: "op-bootstrap",
-    requestDigest: digestOf({ request: "bootstrap" }),
-    projectManifestDigest: digestOf(fixtureManifest(projectId)),
-    githubOperations: [{
-      operationId: "create-repository",
-      resourceType: "repository",
-      resourceIdentity: "github:acme/fixture",
-    }],
-  };
-  harness.cp.artifacts.put(created.value.runId, "PLAN", plan);
+  const reviewed = await reviewBootstrapPlan(harness, created.value.runId, bootstrapPlan(cleanTreeManifest(projectId)));
   return {
     runId: created.value.runId,
-    plan,
-    candidateSnapshotDigest: candidateSnapshotDigestValue,
+    plan: reviewed.planDigest,
+    candidateSnapshotDigest: reviewed.snapshotDigest,
+    ceoSessionId: reviewed.ceoSessionId,
     bootstrapCtoSessionId: dispatched.ownerSessionId!,
   };
 };
 
-const activationInput = (harness: Harness, runId: string, projectId: string, plan: object) => ({
+const activationInput = (harness: Harness, runId: string, projectId: string, planDigest: string) => ({
   runId,
-  factoryResult: validResult(harness, runId, projectId, plan),
-  approvedManifest: fixtureManifest(projectId),
+  factoryResult: validResult(harness, runId, projectId, planDigest),
+  approvedManifest: cleanTreeManifest(projectId),
   localBindings: [{ identity: "github:acme/fixture", checkoutPath: harness.repoPath, repositoryRole: "primary" }],
   projectName: projectId,
   handoff: HANDOFF,
@@ -425,7 +357,7 @@ describe("round-2 ops regressions", () => {
     expect(preparedForConfirm.allowed).toBe(true);
     expect(harness.cp.artifacts.latest(prepared.runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
 
-    const ceoSessionId = bindCeo(harness);
+    const ceoSessionId = prepared.ceoSessionId;
     await harness.cp.continuity.evaluate("bootstrap confirmation");
     const confirmed = harness.cp.ceo.submitCeoDecision({
       runId: prepared.runId,
@@ -502,10 +434,10 @@ describe("round-2 ops regressions", () => {
 
   it("#106/#203: absent, failed, or skipped bootstrap verification is not parseable evidence", () => {
     const harness = makeHarness();
-    const plan = { bootstrapOperationId: "op-bootstrap", requestDigest: digestOf({ request: "bootstrap" }), projectManifestDigest: digestOf(fixtureManifest("evidence")) };
-    const missing = validResult(harness, "run-evidence", "evidence", plan) as Record<string, unknown>;
+    const planDigest = digestOf({ bootstrapOperationId: "op-bootstrap", requestDigest: BOOTSTRAP_REQUEST_DIGEST });
+    const missing = validResult(harness, "run-evidence", "evidence", planDigest) as Record<string, unknown>;
     delete missing["bootstrapVerification"];
-    const failed = validResult(harness, "run-evidence", "evidence", plan);
+    const failed = validResult(harness, "run-evidence", "evidence", planDigest);
     failed.bootstrapVerification[0]!.status = "FAIL" as "PASS";
     expect(parseRepoFactoryResult(missing).allowed).toBe(false);
     expect(parseRepoFactoryResult(failed).reasonCode).toBe(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT);

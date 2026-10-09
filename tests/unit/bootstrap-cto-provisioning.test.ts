@@ -9,7 +9,8 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { CapacityReading, SessionHandle, SessionSpec } from "../../src/runtime/provider.ts";
 import { BindingRegistry } from "../../src/session/binding-registry.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
-import { bindWorkerForTask, fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
+import { bindWorkerForTask, fixtureManifest, makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
+import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest, completeReadyTasks } from "../helpers/bootstrap-plan.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 import { HeadlessRuntimeDouble } from "../helpers/headless-runtime.ts";
 import type { TestProductionAdapter } from "../helpers/production-adapter.ts";
@@ -198,16 +199,34 @@ const queuedBootstrapRun = (f: Fixture): string => {
 
 /**
  * A dispatched bootstrap run sent back for revision by the CEO's FINAL_REVISE over the Hermes
- * socket, so `run_dispatch` may dispatch it again.
+ * socket, so `run_dispatch` may dispatch it again. It reaches CEO review the way production does
+ * (#246 C2): its bootstrap CTO's `plan_submit` and `result_submit` over `cto.mcp.sock`, the PLAN's
+ * task done, and the BOOTSTRAP_PLAN review passed by the scripted reviewer.
  */
 const revisedBootstrap = async (f: Fixture): Promise<{ runId: string; ownerSessionId: string }> => {
   const dispatched = await f.dispatchBootstrap();
-  // TODO(C2): the bootstrap review gate moves the run to CEO review; this transition stands in.
-  expect(f.harness.cp.runs.transition(dispatched.runId, RunState.READY_FOR_CEO_REVIEW, "reviewed").allowed).toBe(true);
+  const planned = await f.cto(dispatched.ownerSessionId, "plan_submit", {
+    runId: dispatched.runId,
+    plan: bootstrapPlan(cleanTreeManifest("bootstrap-cto-revision")),
+    tasks: [{ key: "bootstrap", title: "bootstrap the repository", category: "implementation" }],
+  });
+  expect(planned).toMatchObject({ ok: true });
+  completeReadyTasks(f.harness, dispatched.runId);
+  f.harness.scripted.script({
+    match: /Bootstrap plan review/,
+    text: reviewerPass(bootstrapCoverageKeys(f.harness, dispatched.runId)),
+  });
+  const submitted = await f.cto(dispatched.ownerSessionId, "result_submit", {
+    runId: dispatched.runId,
+    resultSummary: "the planned bootstrap outputs",
+    recommendation: "create the repository",
+  });
+  expect(submitted).toMatchObject({ ok: true, value: { stage: "COMPLETED_REVIEW" } });
+  expect(f.harness.cp.runs.require(dispatched.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
   const revised = await f.hermes("ceo_decision_submit", {
     runId: dispatched.runId,
     decision: "FINAL_REVISE",
-    candidateSnapshotDigest: "sha256:bootstrap-candidate",
+    candidateSnapshotDigest: f.harness.cp.runs.currentCandidate(dispatched.runId),
     ceoSessionId: f.ceoSessionId,
     rationale: "revise the plan",
   });
