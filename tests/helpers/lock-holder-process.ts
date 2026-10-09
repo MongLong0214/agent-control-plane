@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import Database from "better-sqlite3";
@@ -20,6 +20,10 @@ import { makeHarness } from "./harness.ts";
  * can be released at once, then publishes `<state>/<id>.result` and stays alive until
  * `<state>/<id>.exit`. While alive it answers `<state>/<id>.ask-<n>` files: `held` reports whether
  * its lock is held, `second-connection` opens and closes another SQLite connection to the lock file.
+ *
+ * Narrow liveness: `<state>/<id>.go` releases one process alone, and `<state>/<id>.entering` is
+ * published the moment an acquisition begins. `shared` takes only the SHARED lock a contender holds
+ * inside its own `BEGIN EXCLUSIVE`, before it asks for RESERVED, and keeps it until asked `release`.
  */
 const [state, id, mode] = process.argv.slice(2) as [string, string, string];
 const publish = (name: string, value: unknown): void => {
@@ -32,6 +36,8 @@ const until = async (condition: () => boolean): Promise<void> => {
 
 const lockPath = join(state, "agentcpd.lock");
 let lock: SingleInstanceLock;
+/** `shared` mode's connection, held in a cell: it is assigned inside `start`, after the module's own flow. */
+const shared: { db: Database.Database | null } = { db: null };
 let start: () => Promise<{ allowed: boolean; reasonCode: string; message?: string }>;
 if (mode === "lock") {
   lock = new SingleInstanceLock(lockPath);
@@ -49,6 +55,22 @@ if (mode === "lock") {
     } finally {
       raw.close();
     }
+  };
+} else if (mode === "shared") {
+  // A contender's state inside its `BEGIN EXCLUSIVE` at the step the diagnosed schedule needs: SHARED
+  // granted, RESERVED not yet asked for. A deferred read transaction holds exactly that lock.
+  lock = new SingleInstanceLock(lockPath);
+  start = async () => {
+    try {
+      closeSync(openSync(lock.lockDatabasePath, "wx", 0o600));
+    } catch {
+      /* it exists */
+    }
+    const db = new Database(lock.lockDatabasePath, { timeout: 0 });
+    shared.db = db;
+    db.exec("BEGIN");
+    db.prepare("SELECT count(*) FROM sqlite_master").get();
+    return { allowed: db.inTransaction, reasonCode: "SHARED" };
   };
 } else {
   mkdirSync(join(state, `${id}-root`), { recursive: true, mode: 0o700 });
@@ -75,6 +97,7 @@ if (mode === "lock") {
 // other process does meanwhile, it does while this one holds.
 const acquire = lock.acquire.bind(lock);
 lock.acquire = (startedAt: string) => {
+  publish(`${id}.entering`, { pid: process.pid });
   const decision = acquire(startedAt);
   if (mode === "daemon") {
     publish(`${id}.result`, { pid: process.pid, allowed: decision.allowed, reasonCode: decision.reasonCode, held: lock.held() });
@@ -89,7 +112,7 @@ lock.acquire = (startedAt: string) => {
   return decision;
 };
 
-await until(() => existsSync(join(state, "go")));
+await until(() => existsSync(join(state, "go")) || existsSync(join(state, `${id}.go`)));
 const returned = await start().then((decision) => ({ allowed: decision.allowed, reasonCode: decision.reasonCode, held: lock.held() }));
 publish(mode === "daemon" ? `${id}.started` : `${id}.result`, { pid: process.pid, ...returned });
 
@@ -117,6 +140,12 @@ while (!existsSync(join(state, `${id}.exit`))) {
       const { closeSync, openSync } = await import("node:fs");
       closeSync(openSync(lock.lockDatabasePath, "r"));
       answer = "closed";
+    }
+    if (question === "release" && shared.db !== null) {
+      shared.db.exec("ROLLBACK");
+      shared.db.close();
+      shared.db = null;
+      answer = "released";
     }
     publish(`${id}.answer-${answered}`, { question, answer });
     answered += 1;

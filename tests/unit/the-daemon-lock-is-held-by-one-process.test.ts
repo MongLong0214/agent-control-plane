@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
+import Database from "better-sqlite3";
+
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -33,7 +35,7 @@ const waitFor = async (condition: () => boolean, what: string, timeoutMs = 120_0
 
 interface Result { pid: number; allowed: boolean; reasonCode: string; held: boolean }
 
-const holder = (state: string, id: string, mode: "lock" | "raw" | "daemon" | "startup-failure") => {
+const holder = (state: string, id: string, mode: "lock" | "raw" | "daemon" | "startup-failure" | "shared") => {
   const child = spawn(process.execPath, ["--experimental-transform-types", HELPER, state, id, mode], {
     cwd: process.cwd(), env: { ...process.env, TMPDIR: "/private/tmp" }, stdio: ["ignore", "ignore", "pipe"],
   });
@@ -75,6 +77,26 @@ const attempt = async (state: string, id: string, mode: "lock" | "raw" = "lock")
   return result;
 };
 
+/**
+ * Whether an acquisition stands waiting to escalate: a connection asking for SHARED is refused only
+ * while some process holds PENDING or EXCLUSIVE on the lock file. Asked from this process, which
+ * holds no lock on that file, so closing the probe releases nothing.
+ */
+const escalationStands = (lockFile: string): boolean => {
+  const probe = new Database(lockFile, { timeout: 0, fileMustExist: true });
+  try {
+    probe.exec("BEGIN");
+    probe.prepare("SELECT count(*) FROM sqlite_master").get();
+    return false;
+  } catch (error) {
+    if ((error as { code?: string }).code === "SQLITE_BUSY") return true;
+    throw error;
+  } finally {
+    if (probe.inTransaction) probe.exec("ROLLBACK");
+    probe.close();
+  }
+};
+
 describe("#1070 ACP-WORKER-03-LOCK one process holds the daemon lock", () => {
   it("two processes running a real Daemon.start() at once: exactly one holds", async () => {
     const state = tempDir("acp-lock-race-");
@@ -91,6 +113,45 @@ describe("#1070 ACP-WORKER-03-LOCK one process holds the daemon lock", () => {
     for (const id of ["a", "b"]) writeFileSync(join(state, `${id}.continue`), "continue");
     await a.exit();
     await b.exit();
+  }, 240_000);
+
+  it("the concurrent-start schedule, pinned: a SHARED lock standing while one start escalates still leaves exactly one holder", async () => {
+    // Narrow liveness. Every fcntl lock call on the lock file, traced on 31022ad5 when both starts
+    // refused: both were granted SHARED; B was granted RESERVED and A was refused it; A's failed
+    // connection kept its SHARED lock (`locking_mode = EXCLUSIVE` keeps every lock until close), so B,
+    // granted PENDING, was refused EXCLUSIVE and, with no busy wait, gave up. Neither held. Here a
+    // third process holds that SHARED lock until both real starts have met it, so the schedule is
+    // not left to chance.
+    const state = tempDir("acp-lock-escalation-");
+    const lockFile = new SingleInstanceLock(join(state, "agentcpd.lock")).lockDatabasePath;
+    const shared = holder(state, "shared", "shared");
+    const a = holder(state, "a", "daemon");
+    const b = holder(state, "b", "daemon");
+    writeFileSync(join(state, "shared.go"), "go");
+    expect((await shared.result()).allowed, "the SHARED lock was not taken").toBe(true);
+    for (const id of ["a", "b"]) writeFileSync(join(state, `${id}.go`), "go");
+    const answered = (id: string): boolean => existsSync(join(state, `${id}.result`));
+    const enteredAt = (id: string): number => statSync(join(state, `${id}.entering`), { throwIfNoEntry: false })?.mtimeMs ?? Infinity;
+    // The SHARED lock is let go only once both starts have met it: both have answered, or both are
+    // inside their acquisition and one stands waiting to escalate past it.
+    let escalationWaited = false;
+    await waitFor(() => {
+      if (answered("a") && answered("b")) return true;
+      if (Date.now() - Math.max(enteredAt("a"), enteredAt("b")) < 50) return false;
+      escalationWaited = escalationStands(lockFile);
+      return escalationWaited;
+    }, "both starts to meet the SHARED lock");
+    expect(await shared.ask("release")).toBe("released");
+    const results = [await a.result(), await b.result()];
+    expect(results.filter((result) => result.allowed && result.held), JSON.stringify(results)).toHaveLength(1);
+    const refused = results.find((result) => !result.allowed)!;
+    expect(refused.reasonCode, JSON.stringify(results)).toBe("DAEMON_ALREADY_RUNNING");
+    expect(refused.held).toBe(false);
+    expect(escalationWaited, "no start was ever seen waiting on the SHARED lock").toBe(true);
+    for (const id of ["a", "b"]) writeFileSync(join(state, `${id}.continue`), "continue");
+    await a.exit();
+    await b.exit();
+    await shared.exit();
   }, 240_000);
 
   it("a holder killed with SIGKILL leaves the lock to the next process", async () => {
