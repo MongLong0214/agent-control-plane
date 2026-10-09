@@ -116,9 +116,9 @@ export type ReceiptLookupErrorKind =
   | "SCHEMA";
 
 /**
- * A lookup that failed, named by its cause. `detail` is a short token from the port's own
- * vocabulary (a status code, a media type, the first schema check that refused the answer), never
- * the receipt's content and never a credential.
+ * A lookup that failed, named by its cause. `detail` is a member of `RECEIPT_LOOKUP_DETAILS` for its
+ * kind (or, for `HTTP_STATUS`, a status code with an optional known error token), never text the
+ * network supplied: not the receipt's content, not a header value, not a credential.
  */
 export interface ReceiptLookupError {
   readonly kind: ReceiptLookupErrorKind;
@@ -128,14 +128,76 @@ export interface ReceiptLookupError {
 /** The audit kind `reconcileUnresolved` records a lookup error under (#1036). */
 export const CANONICAL_TURN_RECEIPT_LOOKUP_FAILED = "CANONICAL_TURN_RECEIPT_LOOKUP_FAILED";
 
-const RECEIPT_LOOKUP_ERROR_KINDS: ReadonlySet<string> = new Set<ReceiptLookupErrorKind>([
-  "HTTP_STATUS", "CONTENT_TYPE", "TOO_LARGE", "TIMEOUT", "TRANSPORT", "PARSE", "SCHEMA",
-]);
-const RECEIPT_LOOKUP_ERROR_DETAIL = /^[A-Za-z0-9_.:/+-]{1,64}$/;
+/** The `error` tokens the Hermes Gateway's error answers are known to carry; any other is `other`. */
+export const RECEIPT_LOOKUP_HTTP_ERRORS: readonly string[] = [
+  "canonical_binding_unknown",
+  "canonical_invalid_request",
+  "canonical_event_uncertain",
+  "canonical_unavailable",
+  // A receipt Hermes cannot prove from its preserved evidence (409): the turn stays in doubt.
+  "canonical_receipt_unprovable",
+  "unauthorized",
+];
+/** The connection error codes a transport failure may name; any other is `other`. */
+export const RECEIPT_LOOKUP_TRANSPORT_CODES: readonly string[] = [
+  "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "EPIPE", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EADDRNOTAVAIL",
+];
+/** The Gateway receipt's fields, which a schema check may name. */
+const RECEIPT_FIELDS = [
+  "content", "delivery", "evidenceDigest", "message_id", "reasonCode", "receiptId", "receiptIdentity",
+  "schema", "status", "turnRequestId", "update_id",
+];
+/** The eight identity fields, which a schema check may name. */
+const IDENTITY_FIELDS = [
+  "turnRequestId", "targetActorId", "promptDigest", "bindingGeneration",
+  "targetBindingId", "targetAttestationId", "executorSessionId", "executorSessionIncarnation",
+];
 
 /**
- * The latest lookup error recorded for a turn, or null. The latest row is what the sweep compares
- * a new error against, and what doctor reports for a turn still in doubt.
+ * Every detail a lookup error may carry, per kind, except `HTTP_STATUS` (a status code, with
+ * `:<token>` when the error answer named one; see `RECEIPT_LOOKUP_HTTP_ERRORS`).
+ *
+ * A closed vocabulary, not a shape (R1074-02): a detail that merely looks like a token can still be
+ * a credential, as a `Content-Type` subtype holding the API key did. Each member is a fixed ASCII
+ * token that `redact` leaves as it is, so what is written is what a later sweep compares (R1074-01).
+ */
+export const RECEIPT_LOOKUP_DETAILS: Readonly<Record<Exclude<ReceiptLookupErrorKind, "HTTP_STATUS">, ReadonlySet<string>>> = {
+  CONTENT_TYPE: new Set(["missing", "text", "html", "other"]),
+  TOO_LARGE: new Set(["content-length", "body"]),
+  TIMEOUT: new Set(["no-answer", "aborted"]),
+  TRANSPORT: new Set([...RECEIPT_LOOKUP_TRANSPORT_CODES, "response-aborted", "other"]),
+  PARSE: new Set(["invalid-json"]),
+  SCHEMA: new Set([
+    "not-object", "unknown-keys", "content", "schema-name", "update_id-type", "update_id-mismatch",
+    "message_id-type", "message_id-range", "status", "identity-keys", "turnRequestId-mismatch",
+    "receiptId", "evidenceDigest", "reasonCode", "delivery-keys", "aborted-with-delivery",
+    ...RECEIPT_FIELDS.map((field) => `missing-key:${field}`),
+    ...IDENTITY_FIELDS.map((field) => `identity-field:${field}`),
+    ...RECEIPT_FIELDS.map((field) => `never-found-field:${field}`),
+    ...RECEIPT_FIELDS.map((field) => `pending-field:${field}`),
+  ]),
+};
+const HTTP_STATUS_DETAIL = new RegExp(`^[1-5][0-9]{2}(?::(?:${[...RECEIPT_LOOKUP_HTTP_ERRORS, "other"].join("|")}))?$`);
+
+/**
+ * A lookup error as it may be written or shown: in the vocabulary as it is, a known kind with any
+ * other detail as `other`, and anything else as `UNRECOGNIZED/other`. The coordinator writes only
+ * this, whatever port answered, and doctor shows only this, whatever row it reads.
+ */
+export const receiptLookupCause = (error: { readonly kind: unknown; readonly detail: unknown }): { kind: string; detail: string } => {
+  const { kind, detail } = error;
+  if (kind === "HTTP_STATUS") {
+    return { kind, detail: typeof detail === "string" && HTTP_STATUS_DETAIL.test(detail) ? detail : "other" };
+  }
+  if (typeof kind !== "string" || !Object.hasOwn(RECEIPT_LOOKUP_DETAILS, kind)) return { kind: "UNRECOGNIZED", detail: "other" };
+  const details = RECEIPT_LOOKUP_DETAILS[kind as keyof typeof RECEIPT_LOOKUP_DETAILS];
+  return { kind, detail: typeof detail === "string" && details.has(detail) ? detail : "other" };
+};
+
+/**
+ * The most recently recorded lookup error for a turn, or null; what doctor reports for a turn still
+ * in doubt. One row is written per distinct cause, so after a cause returns this still names the
+ * last new one.
  */
 export const latestReceiptLookupError = (
   db: Db,
@@ -148,7 +210,7 @@ export const latestReceiptLookupError = (
       ORDER BY event_id DESC LIMIT 1`,
     [CANONICAL_TURN_RECEIPT_LOOKUP_FAILED, turnRequestId],
   );
-  return row ? { kind: String(row.kind), detail: String(row.detail), at: row.at } : null;
+  return row ? { ...receiptLookupCause(row), at: row.at } : null;
 };
 
 /**
@@ -1870,27 +1932,28 @@ export class ConversationTurnCoordinator {
    * (#1036). It records nothing about the turn itself: the turn stays `IN_DOUBT`, nothing settles
    * and nothing is adjudicated.
    *
-   * One row per turn per cause: a cause equal to the turn's latest recorded one is not written
-   * again, so a sweep that meets the same error every pass writes it once, and a changed cause is
-   * written when it changes. A turn that settled since its lookup began gets no row. The read and
+   * One row per turn per distinct cause, ever (R1074-01): a cause already recorded for the turn is
+   * not written again, whether it is the latest one, an earlier one that returned, or one recorded
+   * before a restart. The cause is compared in the form it is written, `receiptLookupCause`'s, which
+   * audit stores unchanged. A turn that settled since its lookup began gets no row. The read and
    * the write share one transaction, so two overlapping sweeps cannot both write the same cause.
-   *
-   * The port's cause is written only in its bounded form: an unknown kind, or a detail that is not
-   * a short token, could be receipt text, so it is recorded as unrecognized.
    */
   #recordLookupError(candidate: ReceiptLookupQuery, error: ReceiptLookupError): void {
-    const kind = RECEIPT_LOOKUP_ERROR_KINDS.has(error.kind) ? error.kind : "UNRECOGNIZED";
-    const detail = typeof error.detail === "string" && RECEIPT_LOOKUP_ERROR_DETAIL.test(error.detail)
-      ? error.detail
-      : "unrecognized";
+    const cause = receiptLookupCause(error);
     this.db.tx(() => {
       const turn = this.db.get<{ lifecycle_state: string }>(
         `SELECT lifecycle_state FROM canonical_turns WHERE turn_request_id = ?`,
         [candidate.turnRequestId],
       );
       if (turn?.lifecycle_state !== "IN_DOUBT") return;
-      const latest = latestReceiptLookupError(this.db, candidate.turnRequestId);
-      if (latest?.kind === kind && latest.detail === detail) return;
+      const recorded = this.db.get<{ found: number }>(
+        `SELECT 1 AS found FROM audit_events
+          WHERE kind = ? AND json_extract(evidence_json, '$.turnRequestId') = ?
+            AND json_extract(evidence_json, '$.kind') = ? AND json_extract(evidence_json, '$.detail') = ?
+          LIMIT 1`,
+        [CANONICAL_TURN_RECEIPT_LOOKUP_FAILED, candidate.turnRequestId, cause.kind, cause.detail],
+      );
+      if (recorded) return;
       const source = this.db.get<{ source_nonce: string }>(
         `SELECT source_nonce FROM canonical_turn_sources WHERE turn_request_id = ?
           ORDER BY batch_ordinal ASC LIMIT 1`,
@@ -1900,7 +1963,7 @@ export class ConversationTurnCoordinator {
         kind: CANONICAL_TURN_RECEIPT_LOOKUP_FAILED,
         reasonCode: ReasonCode.CONVERSATION_TURN_RECEIPT_LOOKUP_FAILED,
         actor: candidate.targetActorId,
-        evidence: { turnRequestId: candidate.turnRequestId, sourceNonce: source?.source_nonce ?? null, kind, detail },
+        evidence: { turnRequestId: candidate.turnRequestId, sourceNonce: source?.source_nonce ?? null, ...cause },
       });
       if (!audited.allowed) throw acpError(audited.reasonCode, audited.message, audited.evidence);
     });

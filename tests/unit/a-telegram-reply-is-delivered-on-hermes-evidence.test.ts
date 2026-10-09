@@ -35,6 +35,8 @@ import {
   envelope,
   externalLaneFixture,
   gatewayDelivery,
+  gatewayNeverFound,
+  gatewayPending,
   gatewayReceipt,
   gatewayReplyDigest,
   sendOverSocket,
@@ -373,7 +375,7 @@ describe("A3: a Telegram owner reply is DELIVERED on Hermes' own delivery eviden
       // Still no evidence, or no receipt at all: the item stays parked and is asked about again.
       const asked = requestsFor(121);
       await fixture.cp.conversation.reconcileUnresolved(5_000);
-      answering((updateId) => gatewayReceipt(updateId, turn, { status: "PENDING" }));
+      answering((updateId) => gatewayPending(updateId, turn));
       await fixture.cp.conversation.reconcileUnresolved(5_000);
       expect(requestsFor(121)).toBe(asked + 2);
       expect(ownerReplyFor(fixture.cp.db, turn.turnRequestId)?.status).toBe("PENDING");
@@ -575,7 +577,7 @@ describe("A3 R-A3-02: later reads rotate, so unavailable older receipts cannot s
     try {
       // 24 older replies and one younger, all settled COMPLETED with no delivery evidence yet.
       const turns = new Map<number, TelegramExternalTurnIdentity>();
-      answering((u) => (turns.has(u) ? gatewayReceipt(u, turns.get(u)!, { delivery: null }) : { status: "NEVER_FOUND" }));
+      answering((u) => (turns.has(u) ? gatewayReceipt(u, turns.get(u)!, { delivery: null }) : gatewayNeverFound(u)));
       const youngest = 324;
       for (let updateId = 300; updateId <= youngest; updateId += 1) {
         const answer = await sendOverSocket(ingress.socketPath, envelope(updateId, `질문 ${updateId}`));
@@ -627,7 +629,7 @@ describe("A3 R-A3-03: a stream of new arrivals cannot keep an older reply from b
       const older = 400;
       gateway.answer = (u) => {
         const turn = turns.get(u);
-        if (!turn) return { kind: "json", body: { status: "NEVER_FOUND" } };
+        if (!turn) return { kind: "json", body: gatewayNeverFound(u) };
         const read = (reads.get(u) ?? 0) + 1;
         reads.set(u, read);
         // The older reply: settled with no evidence, no evidence on its first retry, then delivered.

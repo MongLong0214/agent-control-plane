@@ -134,7 +134,9 @@ describe("doctor reads the canonical ledger, not only the ingress claim", () => 
     h.clock.advance(1_000);
     const later = h.clock.nowIso();
     failed(youngest.turnRequestId, "SCHEMA", "update_id-type");
-    failed(middle.turnRequestId, "TIMEOUT", "no-answer-in-2000ms");
+    failed(middle.turnRequestId, "TIMEOUT", "no-answer");
+    // A row written by anything else is shown in the vocabulary too, never as its own text.
+    failed(youngest.turnRequestId, "CONTENT_TYPE", "application/sk-live-the-api-key");
 
     const found = finding(await h.cp.doctor.run("system"), "CANONICAL_TURN_IN_DOUBT");
 
@@ -143,8 +145,8 @@ describe("doctor reads the canonical ledger, not only the ingress claim", () => 
     expect(reported["turnRequestId"]).toBe(oldest.turnRequestId);
     expect(reported["lookupError"]).toBeUndefined();
     expect(found?.observedEvidence["lookupErrors"]).toEqual([
-      { turnRequestId: middle.turnRequestId, kind: "TIMEOUT", detail: "no-answer-in-2000ms", at: later },
-      { turnRequestId: youngest.turnRequestId, kind: "SCHEMA", detail: "update_id-type", at: later },
+      { turnRequestId: middle.turnRequestId, kind: "TIMEOUT", detail: "no-answer", at: later },
+      { turnRequestId: youngest.turnRequestId, kind: "CONTENT_TYPE", detail: "other", at: later },
     ]);
   });
 

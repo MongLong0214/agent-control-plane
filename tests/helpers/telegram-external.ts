@@ -323,7 +323,7 @@ export type GatewayAnswer =
 /** The Gateway's receipt API, answered by the test, on an ephemeral loopback port. */
 export class FakeGateway {
   readonly requests: GatewayRequest[] = [];
-  answer: (updateId: number) => GatewayAnswer = () => ({ kind: "json", body: { status: "NEVER_FOUND" } });
+  answer: (updateId: number) => GatewayAnswer = (updateId) => ({ kind: "json", body: gatewayNeverFound(updateId) });
   #server: Server | null = null;
   #hanging: ServerResponse[] = [];
 
@@ -387,12 +387,55 @@ export const gatewayDelivery = (
   return Object.fromEntries(Object.entries(delivery).filter(([, value]) => value !== undefined));
 };
 
+/**
+ * How the production Gateway writes `update_id`: as a decimal string today, and as an integer once
+ * Hermes' serialization correction lands. Its non-terminal answers are read in either form.
+ */
+export type GatewayUpdateIdForm = "string" | "integer";
+const updateIdIn = (updateId: number, form: GatewayUpdateIdForm): number | string =>
+  form === "string" ? String(updateId) : updateId;
+
+/** The production Gateway's answer for an update it holds no receipt for (hermes.gateway-turn-receipt/v1). */
+export const gatewayNeverFound = (updateId: number, form: GatewayUpdateIdForm = "string"): Record<string, unknown> => ({
+  schema: "hermes.gateway-turn-receipt/v1",
+  update_id: updateIdIn(updateId, form),
+  message_id: null,
+  status: "NEVER_FOUND",
+  turnRequestId: null,
+  receiptIdentity: null,
+  receiptId: null,
+  evidenceDigest: null,
+  reasonCode: null,
+  delivery: null,
+});
+
+/**
+ * The production Gateway's answer for an admitted turn still running: the turn and its eight-field
+ * identity are named, and nothing a terminal receipt carries is filled in yet.
+ */
+export const gatewayPending = (
+  updateId: number,
+  turn: TelegramExternalTurnIdentity,
+  form: GatewayUpdateIdForm = "string",
+): Record<string, unknown> => ({
+  schema: "hermes.gateway-turn-receipt/v1",
+  update_id: updateIdIn(updateId, form),
+  message_id: updateId + 100,
+  status: "PENDING",
+  turnRequestId: turn.turnRequestId,
+  receiptIdentity: { ...turn },
+  receiptId: null,
+  evidenceDigest: null,
+  reasonCode: null,
+  delivery: null,
+});
+
 /** The Gateway's terminal answer for a turn the lane returned, optionally with one field altered. */
 export const gatewayReceipt = (
   updateId: number,
   turn: TelegramExternalTurnIdentity,
   options: {
-    status?: "COMPLETED" | "ABORTED" | "PENDING" | "NEVER_FOUND";
+    status?: "COMPLETED" | "ABORTED";
     identity?: Partial<TelegramExternalTurnIdentity>;
     messageId?: number;
     receiptId?: string;

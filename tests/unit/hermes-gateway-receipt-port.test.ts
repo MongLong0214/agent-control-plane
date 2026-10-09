@@ -14,6 +14,8 @@ import {
   GATEWAY_KEY,
   envelope,
   externalLaneFixture,
+  gatewayNeverFound,
+  gatewayPending,
   gatewayReceipt,
   sendOverSocket,
 } from "../helpers/telegram-external.ts";
@@ -184,8 +186,8 @@ describe("U4 Hermes Gateway receipt port", () => {
     // #1036: a malformed or failed answer is still not found, and now says why.
     const failed = (kind: string, detail: string) => ({ found: false, lookupError: { kind, detail } });
     const answers: Array<[string, () => ReturnType<FakeGateway["answer"]>, unknown]> = [
-      ["pending", () => ({ kind: "json", body: gatewayReceipt(80, turn, { status: "PENDING" }) }), { found: false }],
-      ["never found", () => ({ kind: "json", body: gatewayReceipt(80, turn, { status: "NEVER_FOUND" }) }), { found: false }],
+      ["pending", () => ({ kind: "json", body: gatewayPending(80, turn) }), { found: false }],
+      ["never found", () => ({ kind: "json", body: gatewayNeverFound(80) }), { found: false }],
       ["wrong schema", () => ({ kind: "json", body: { ...valid, schema: "hermes.gateway-turn-receipt/v2" } }), failed("SCHEMA", "schema-name")],
       ["another update", () => ({ kind: "json", body: gatewayReceipt(81, turn) }), failed("SCHEMA", "update_id-mismatch")],
       ["unknown key", () => ({ kind: "json", body: { ...valid, signature: "x" } }), failed("SCHEMA", "unknown-keys")],
@@ -196,7 +198,7 @@ describe("U4 Hermes Gateway receipt port", () => {
       ["bad evidence digest", () => ({ kind: "json", body: { ...valid, evidenceDigest: "sha256:short" } }), failed("SCHEMA", "evidenceDigest")],
       ["unexpected status", () => ({ kind: "json", body: gatewayReceipt(80, turn, { status: "DONE" as "COMPLETED" }) }), failed("SCHEMA", "status")],
       ["not json", () => ({ kind: "raw", body: "{not json" }), failed("PARSE", "invalid-json")],
-      ["wrong content type", () => ({ kind: "json", body: valid, contentType: "text/plain" }), failed("CONTENT_TYPE", "text/plain")],
+      ["wrong content type", () => ({ kind: "json", body: valid, contentType: "text/plain" }), failed("CONTENT_TYPE", "text")],
       ["server error", () => ({ kind: "json", status: 500, body: valid }), failed("HTTP_STATUS", "500")],
       ["over 4KB", () => ({ kind: "json", body: { ...valid, content: "x".repeat(5_000) } }), failed("TOO_LARGE", "body")],
     ];
@@ -207,7 +209,7 @@ describe("U4 Hermes Gateway receipt port", () => {
 
     gateway.answer = () => ({ kind: "hang" });
     const started = Date.now();
-    await expect(ask(), "timeout").resolves.toEqual(failed("TIMEOUT", "no-answer-in-2000ms"));
+    await expect(ask(), "timeout").resolves.toEqual(failed("TIMEOUT", "no-answer"));
     expect(Date.now() - started).toBeLessThan(3_000);
 
     const aborted = new AbortController();
@@ -241,7 +243,7 @@ describe("U4 Hermes Gateway receipt port", () => {
     const fixture = daemonFixture();
     try {
       const turn = await claimOne(fixture, 73);
-      gateway.answer = (updateId) => ({ kind: "json", body: gatewayReceipt(updateId, turn, { status: "PENDING" }) });
+      gateway.answer = (updateId) => ({ kind: "json", body: gatewayPending(updateId, turn) });
       const swept = await fixture.cp.conversation.reconcileUnresolved(5_000);
       expect(swept).toMatchObject({ swept: 1, settled: 0, failed: 0 });
       expect(gateway.requests).toHaveLength(1);

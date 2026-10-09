@@ -730,7 +730,7 @@ export const ReasonCode = {
   CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME: "CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME",
   /**
    * A receipt lookup for an `IN_DOUBT` turn failed, or answered with something this build could
-   * not read as a receipt (#1036): a status other than 200 or 404, the wrong media type, an
+   * not read as a receipt (#1036): any status other than 200 (a 404 included), the wrong media type, an
    * oversized or unparseable body, a timeout, a transport error, or a schema check that refused it.
    * Recorded with the cause, once per turn per cause. Not a not-found, and not evidence about the
    * turn: it stays `IN_DOUBT`.

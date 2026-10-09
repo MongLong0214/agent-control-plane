@@ -1,11 +1,13 @@
-import { request } from "node:http";
+import { type IncomingMessage, request } from "node:http";
 
 import { type TelegramDeliveryReport, telegramChatIdOf } from "../conversation/owner-reply-outbox.ts";
-import type {
-  ReceiptLookupError,
-  ReceiptLookupQuery,
-  ReceiptLookupResult,
-  ReceiptPort,
+import {
+  RECEIPT_LOOKUP_HTTP_ERRORS,
+  RECEIPT_LOOKUP_TRANSPORT_CODES,
+  type ReceiptLookupError,
+  type ReceiptLookupQuery,
+  type ReceiptLookupResult,
+  type ReceiptPort,
 } from "../conversation/turn-coordinator.ts";
 import { isDigest } from "../core/digest.ts";
 import type { Db } from "../db/database.ts";
@@ -23,12 +25,14 @@ import type { Db } from "../db/database.ts";
  * pending, absent, malformed, oversized, slow or refused answer is `found: false`, which leaves the
  * turn in doubt, never evidence that it ran or did not.
  *
- * Those are not one event (#1036). A plain `found: false` is the Gateway saying it has no terminal
- * receipt: a 404, its `{"status":"NEVER_FOUND"}` answer, or a v1 receipt whose status is `PENDING`
- * or `NEVER_FOUND`. Every other `found: false` carries a `lookupError` naming why the answer could
- * not be read, down to the first schema check that refused it, so a receipt the Gateway holds but
- * this build cannot read is visible instead of looking like one that does not exist. The parser is
- * exactly as strict as before; only the reason for a refusal is new.
+ * Those are not one event (#1036). A plain `found: false` is the Gateway saying, in its own v1
+ * shape, that it has no terminal receipt yet: `NEVER_FOUND` for an update it holds nothing for, or
+ * `PENDING` for an admitted turn still running. Every other `found: false` carries a `lookupError`
+ * naming why the answer could not be read, down to the first schema check that refused it, so a
+ * receipt the Gateway holds but this build cannot read is visible instead of looking like one that
+ * does not exist. A 404 is not a not-found: the production Gateway answers an unknown update with
+ * `NEVER_FOUND` and keeps 404 for a binding it does not know. The terminal parser is exactly as
+ * strict as before; only the reason for a refusal is new.
  *
  * A `COMPLETED` receipt also says whether Hermes sent the reply in Telegram (A3). Its `delivery` is
  * read as reported and handed on, unverified: the owner-reply outbox compares it with the turn's
@@ -58,8 +62,8 @@ const NOT_FOUND: ReceiptLookupResult = Object.freeze({ found: false });
 const lookupFailed = (kind: ReceiptLookupError["kind"], detail: string): ReceiptLookupResult =>
   ({ found: false, lookupError: { kind, detail } });
 const schemaError = (check: string): ReceiptLookupResult => lookupFailed("SCHEMA", check);
-/** A media type the cause may name; anything else is reported without its text. */
-const MEDIA_TYPE = /^[a-z0-9_.+-]{1,32}\/[a-z0-9_.+-]{1,32}$/;
+/** The decimal form of an update id, which the Gateway writes as a string before its serialization fix. */
+const DECIMAL = /^\d{1,16}$/;
 
 const RECEIPT_KEYS = [
   "delivery",
@@ -138,58 +142,135 @@ const deliveryReport = (delivery: Record<string, unknown>): TelegramDeliveryRepo
   };
 };
 
+interface AttestedIdentity {
+  turnRequestId: string;
+  targetActorId: string;
+  promptDigest: string;
+  bindingGeneration: number;
+  targetBindingId: string;
+  targetAttestationId: string;
+  executorSessionId: string;
+  executorSessionIncarnation: string;
+}
+
+/** The eight-field identity a receipt attests to, or the first check it fails. */
+const attestedIdentity = (identity: unknown): AttestedIdentity | string => {
+  if (!isRecord(identity) || !sameKeys(identity, IDENTITY_KEYS)) return "identity-keys";
+  const turnRequestId = identity["turnRequestId"];
+  if (!boundedText(turnRequestId)) return "identity-field:turnRequestId";
+  const targetActorId = identity["targetActorId"];
+  if (!boundedText(targetActorId)) return "identity-field:targetActorId";
+  const promptDigest = identity["promptDigest"];
+  if (!isDigest(promptDigest)) return "identity-field:promptDigest";
+  const bindingGeneration = identity["bindingGeneration"];
+  if (typeof bindingGeneration !== "number" || !Number.isSafeInteger(bindingGeneration) || bindingGeneration < 1) {
+    return "identity-field:bindingGeneration";
+  }
+  const targetBindingId = identity["targetBindingId"];
+  if (!boundedText(targetBindingId)) return "identity-field:targetBindingId";
+  const targetAttestationId = identity["targetAttestationId"];
+  if (!boundedText(targetAttestationId)) return "identity-field:targetAttestationId";
+  const executorSessionId = identity["executorSessionId"];
+  if (!boundedText(executorSessionId)) return "identity-field:executorSessionId";
+  const executorSessionIncarnation = identity["executorSessionIncarnation"];
+  if (!boundedText(executorSessionIncarnation)) return "identity-field:executorSessionIncarnation";
+  return {
+    turnRequestId, targetActorId, promptDigest, bindingGeneration,
+    targetBindingId, targetAttestationId, executorSessionId, executorSessionIncarnation,
+  };
+};
+
 /**
- * A terminal answer for exactly this update; a plain not-found for an answer that says there is no
- * terminal receipt yet; otherwise the first check that refused it. Every key is named: an answer
- * carrying a key this build does not know is not a receipt this build can read, and reading it as
- * one would be guessing at what the extra field meant.
+ * Whether the answer names the update this turn consumed. A terminal receipt must name it as an
+ * integer, as it always had to; a non-terminal answer may also name it as its decimal string, which
+ * is how the Gateway writes it until its serialization correction.
+ */
+const updateIdFailure = (value: unknown, updateId: number, decimalString: boolean): string | null => {
+  if (value === updateId || (decimalString && value === String(updateId))) return null;
+  if (typeof value === "number" && Number.isSafeInteger(value)) return "update_id-mismatch";
+  if (decimalString && typeof value === "string" && DECIMAL.test(value)) return "update_id-mismatch";
+  return "update_id-type";
+};
+
+const messageIdFailure = (value: unknown): string | null => {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return "message_id-type";
+  return value < 1 ? "message_id-range" : null;
+};
+
+/**
+ * The fields a `NEVER_FOUND` answer leaves empty: it names an update and nothing else, so its
+ * `turnRequestId` and `receiptIdentity` must be null. A `PENDING` answer, by contrast, must name the
+ * turn and carry its full eight-field identity (Hermes' production contract for both, #1036).
+ */
+const NEVER_FOUND_EMPTY = [
+  "message_id", "turnRequestId", "receiptIdentity", "receiptId", "evidenceDigest", "reasonCode", "delivery",
+] as const;
+/** The fields a `PENDING` answer leaves empty: everything a terminal receipt adds to the turn. */
+const PENDING_EMPTY = ["receiptId", "evidenceDigest", "reasonCode", "delivery"] as const;
+
+/**
+ * The production Gateway's two non-terminal answers, as a plain not-found when they have exactly its
+ * shape: `NEVER_FOUND` names the update and nothing else, and `PENDING` names the update, the turn
+ * and its eight-field identity and nothing a terminal receipt adds. Anything else in either is named.
+ */
+const nonTerminal = (
+  rest: Record<string, unknown>,
+  content: unknown,
+  status: "NEVER_FOUND" | "PENDING",
+  source: TelegramTurnSource,
+): ReceiptLookupResult => {
+  const updateId = updateIdFailure(rest["update_id"], source.updateId, true);
+  if (updateId !== null) return schemaError(updateId);
+  if (status === "NEVER_FOUND") {
+    if (content !== undefined) return schemaError("never-found-field:content");
+    const filled = NEVER_FOUND_EMPTY.find((key) => rest[key] !== null);
+    return filled === undefined ? NOT_FOUND : schemaError(`never-found-field:${filled}`);
+  }
+  // The message the turn answers, when the Gateway names it.
+  const messageId = rest["message_id"] === null ? null : messageIdFailure(rest["message_id"]);
+  if (messageId !== null) return schemaError(messageId);
+  const identity = attestedIdentity(rest["receiptIdentity"]);
+  if (typeof identity === "string") return schemaError(identity);
+  if (rest["turnRequestId"] !== identity.turnRequestId) return schemaError("turnRequestId-mismatch");
+  if (content !== undefined) return schemaError("pending-field:content");
+  const filled = PENDING_EMPTY.find((key) => rest[key] !== null);
+  return filled === undefined ? NOT_FOUND : schemaError(`pending-field:${filled}`);
+};
+
+/**
+ * A terminal answer for exactly this update; a plain not-found for the Gateway's own answer that
+ * there is no terminal receipt yet; otherwise the first check that refused it. Every key is named:
+ * an answer carrying a key this build does not know is not a receipt this build can read, and
+ * reading it as one would be guessing at what the extra field meant.
  *
- * The checks and their order are the ones this function has always made; each refusal now names
- * itself instead of reading as "no receipt". A named check is a fixed token, or a key from this
- * file's own lists: nothing from the answer itself is echoed.
+ * The terminal checks and their order are the ones this function has always made; each refusal now
+ * names itself instead of reading as "no receipt". A named check is a fixed token, or a key from
+ * this file's own lists: nothing from the answer itself is echoed.
  */
 const terminalReceipt = (body: unknown, source: TelegramTurnSource): ReceiptLookupResult => {
   if (!isRecord(body)) return schemaError("not-object");
-  // The Gateway's answer for an update it holds no receipt for.
-  if (sameKeys(body, ["status"]) && body["status"] === "NEVER_FOUND") return NOT_FOUND;
   const { content, ...rest } = body;
   if (Object.keys(rest).some((key) => !RECEIPT_KEY_SET.has(key))) return schemaError("unknown-keys");
   const missing = RECEIPT_KEYS.find((key) => !Object.hasOwn(rest, key));
   if (missing !== undefined) return schemaError(`missing-key:${missing}`);
   if (content !== undefined && typeof content !== "string") return schemaError("content");
   if (rest["schema"] !== HERMES_GATEWAY_TURN_RECEIPT_SCHEMA) return schemaError("schema-name");
-  // The answer has to be about the update this turn consumed. The message id is not compared: the
-  // eight identity fields below already name the turn, and the update id names its source.
-  const updateId = rest["update_id"];
-  if (updateId !== source.updateId) {
-    return schemaError(typeof updateId === "number" && Number.isSafeInteger(updateId) ? "update_id-mismatch" : "update_id-type");
-  }
-  const messageId = rest["message_id"];
-  if (typeof messageId !== "number" || !Number.isSafeInteger(messageId)) return schemaError("message_id-type");
-  if (messageId < 1) return schemaError("message_id-range");
   const status = rest["status"];
   // Not terminal yet, or never started: the Gateway has nothing to settle, which is not a failure.
-  if (status === "PENDING" || status === "NEVER_FOUND") return NOT_FOUND;
+  if (status === "NEVER_FOUND" || status === "PENDING") return nonTerminal(rest, content, status, source);
+  // The answer has to be about the update this turn consumed. The message id is not compared: the
+  // eight identity fields below already name the turn, and the update id names its source.
+  const updateId = updateIdFailure(rest["update_id"], source.updateId, false);
+  if (updateId !== null) return schemaError(updateId);
+  const messageId = messageIdFailure(rest["message_id"]);
+  if (messageId !== null) return schemaError(messageId);
   if (status !== "COMPLETED" && status !== "ABORTED") return schemaError("status");
 
-  const identity = rest["receiptIdentity"];
-  if (!isRecord(identity) || !sameKeys(identity, IDENTITY_KEYS)) return schemaError("identity-keys");
-  const generation = identity["bindingGeneration"];
-  if (!boundedText(identity["turnRequestId"])) return schemaError("identity-field:turnRequestId");
-  if (!boundedText(identity["targetActorId"])) return schemaError("identity-field:targetActorId");
-  if (!isDigest(identity["promptDigest"])) return schemaError("identity-field:promptDigest");
-  if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1) {
-    return schemaError("identity-field:bindingGeneration");
-  }
-  if (!boundedText(identity["targetBindingId"])) return schemaError("identity-field:targetBindingId");
-  if (!boundedText(identity["targetAttestationId"])) return schemaError("identity-field:targetAttestationId");
-  if (!boundedText(identity["executorSessionId"])) return schemaError("identity-field:executorSessionId");
-  if (!boundedText(identity["executorSessionIncarnation"])) {
-    return schemaError("identity-field:executorSessionIncarnation");
-  }
+  const identity = attestedIdentity(rest["receiptIdentity"]);
+  if (typeof identity === "string") return schemaError(identity);
   // The top-level turn id is the Gateway's index into its store; the identity is what it attests.
   // Two different answers in one body are no answer.
-  if (rest["turnRequestId"] !== identity["turnRequestId"]) return schemaError("turnRequestId-mismatch");
+  if (rest["turnRequestId"] !== identity.turnRequestId) return schemaError("turnRequestId-mismatch");
 
   const receiptId = rest["receiptId"];
   if (!boundedText(receiptId) || !receiptId.startsWith("hermes-tg:") || receiptId.length === "hermes-tg:".length) {
@@ -209,14 +290,7 @@ const terminalReceipt = (body: unknown, source: TelegramTurnSource): ReceiptLook
     receiptId,
     evidenceDigest: rest["evidenceDigest"],
     reasonCode: rest["reasonCode"],
-    turnRequestId: identity["turnRequestId"],
-    targetActorId: identity["targetActorId"],
-    promptDigest: identity["promptDigest"],
-    bindingGeneration: generation,
-    targetBindingId: identity["targetBindingId"],
-    targetAttestationId: identity["targetAttestationId"],
-    executorSessionId: identity["executorSessionId"],
-    executorSessionIncarnation: identity["executorSessionIncarnation"],
+    ...identity,
     ...(status === "COMPLETED" ? { delivery: delivery === null ? null : deliveryReport(delivery) } : {}),
   };
 };
@@ -230,15 +304,63 @@ type GatewayReply =
 const requestFailure = (err: unknown): ReceiptLookupResult => {
   const { name, code } = (err ?? {}) as { name?: unknown; code?: unknown };
   if (name === "AbortError") return lookupFailed("TIMEOUT", "aborted");
-  // Node's own error code (`ECONNREFUSED`), never text from the Gateway.
-  return lookupFailed("TRANSPORT", typeof code === "string" ? code : "error");
+  // A known connection error code (`ECONNREFUSED`); any other is `other`.
+  return lookupFailed("TRANSPORT", typeof code === "string" && RECEIPT_LOOKUP_TRANSPORT_CODES.includes(code) ? code : "other");
 };
 
-/** The response's media type when it is token-shaped, so a stray header value is never echoed. */
-const mediaTypeOf = (header: string | undefined): string => {
+/** A JSON body of at most `MAX_BYTES`, or why it could not be read. */
+type BodyRead =
+  | { readonly kind: "JSON"; readonly body: unknown }
+  | { readonly kind: "FAILED"; readonly result: ReceiptLookupResult };
+
+/**
+ * Reads a response's JSON body. `done` can be called more than once (an error that follows a
+ * refusal); only the first call counts, because every caller settles a promise with it.
+ */
+const readJson = (res: IncomingMessage, done: (read: BodyRead) => void): void => {
+  const failed = (result: ReceiptLookupResult): void => {
+    done({ kind: "FAILED", result });
+    res.destroy();
+  };
+  if (Number(res.headers["content-length"] ?? 0) > MAX_BYTES) return failed(lookupFailed("TOO_LARGE", "content-length"));
+  const chunks: Buffer[] = [];
+  let size = 0;
+  res.on("data", (chunk: Buffer) => {
+    size += chunk.length;
+    if (size > MAX_BYTES) failed(lookupFailed("TOO_LARGE", "body"));
+    else chunks.push(chunk);
+  });
+  res.on("end", () => {
+    let body: unknown;
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+    } catch {
+      return done({ kind: "FAILED", result: lookupFailed("PARSE", "invalid-json") });
+    }
+    done({ kind: "JSON", body });
+  });
+  res.on("error", (err) => done({ kind: "FAILED", result: requestFailure(err) }));
+  res.on("aborted", () => done({ kind: "FAILED", result: lookupFailed("TRANSPORT", "response-aborted") }));
+};
+
+/**
+ * A failed status, with the Gateway's error token when its JSON error answer names one it is known
+ * to use (`404:canonical_binding_unknown`), `<status>:other` when it names any other, and the status
+ * alone when there is no readable `error`. The answer's own text is never carried.
+ */
+const statusDetail = (status: number, read: BodyRead): string => {
+  if (read.kind !== "JSON" || !isRecord(read.body) || !Object.hasOwn(read.body, "error")) return String(status);
+  const error = read.body["error"];
+  return `${status}:${typeof error === "string" && RECEIPT_LOOKUP_HTTP_ERRORS.includes(error) ? error : "other"}`;
+};
+
+/** The response's media type, or the category a refusal names for it: never the header's text. */
+const mediaTypeOf = (header: string | undefined): "application/json" | "missing" | "html" | "text" | "other" => {
   const media = (header ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+  if (media === "application/json") return media;
   if (media === "") return "missing";
-  return MEDIA_TYPE.test(media) ? media : "unrecognized";
+  if (media === "text/html") return "html";
+  return media.startsWith("text/") ? "text" : "other";
 };
 
 const getReceipt = (
@@ -264,33 +386,19 @@ const getReceipt = (
         fail(result);
         res.destroy();
       };
-      // The Gateway's own "no such receipt". Its body is not read.
-      if (res.statusCode === 404) return refuse(NOT_FOUND);
-      if (res.statusCode !== 200) return refuse(lookupFailed("HTTP_STATUS", String(res.statusCode ?? 0)));
+      const status = res.statusCode ?? 0;
       const media = mediaTypeOf(res.headers["content-type"]);
+      // Every status but 200 is a failure, a 404 included: the Gateway answers an update it holds
+      // nothing for with NEVER_FOUND, and a 404 names a binding it does not know.
+      if (status !== 200) {
+        if (media !== "application/json") return refuse(lookupFailed("HTTP_STATUS", String(status)));
+        return readJson(res, (read) => fail(lookupFailed("HTTP_STATUS", statusDetail(status, read))));
+      }
       if (media !== "application/json") return refuse(lookupFailed("CONTENT_TYPE", media));
-      if (Number(res.headers["content-length"] ?? 0) > MAX_BYTES) return refuse(lookupFailed("TOO_LARGE", "content-length"));
-      const chunks: Buffer[] = [];
-      let size = 0;
-      res.on("data", (chunk: Buffer) => {
-        size += chunk.length;
-        if (size > MAX_BYTES) refuse(lookupFailed("TOO_LARGE", "body"));
-        else chunks.push(chunk);
-      });
-      res.on("end", () => {
-        let body: unknown;
-        try {
-          body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
-        } catch {
-          return fail(lookupFailed("PARSE", "invalid-json"));
-        }
-        resolve({ kind: "BODY", body });
-      });
-      res.on("error", (err) => fail(requestFailure(err)));
-      res.on("aborted", () => fail(lookupFailed("TRANSPORT", "response-aborted")));
+      readJson(res, (read) => (read.kind === "JSON" ? resolve({ kind: "BODY", body: read.body }) : fail(read.result)));
     });
     const timer = setTimeout(() => {
-      fail(lookupFailed("TIMEOUT", `no-answer-in-${TIMEOUT_MS}ms`));
+      fail(lookupFailed("TIMEOUT", "no-answer"));
       req.destroy();
     }, TIMEOUT_MS);
     req.on("error", (err) => fail(requestFailure(err)));

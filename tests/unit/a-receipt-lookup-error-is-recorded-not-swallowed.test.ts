@@ -1,12 +1,18 @@
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { type AddressInfo, type Socket, createServer as createNetServer } from "node:net";
 
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import type { ReceiptLookupQuery } from "../../src/conversation/turn-coordinator.ts";
-import { CANONICAL_TURN_RECEIPT_LOOKUP_FAILED } from "../../src/conversation/turn-coordinator.ts";
+import {
+  CANONICAL_TURN_RECEIPT_LOOKUP_FAILED,
+  RECEIPT_LOOKUP_DETAILS,
+  RECEIPT_LOOKUP_HTTP_ERRORS,
+  type ReceiptLookupQuery,
+  receiptLookupCause,
+} from "../../src/conversation/turn-coordinator.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { startTelegramExternalIngress, withConfiguredHermesGatewayReceipt } from "../../src/daemon/agentcpd.ts";
+import { redact } from "../../src/db/audit.ts";
 import type { Finding } from "../../src/doctor/doctor.ts";
 import type { TelegramExternalAnswer, TelegramExternalTurnIdentity } from "../../src/ingress/telegram-external.ts";
 import { HermesGatewayReceiptPort } from "../../src/runtime/hermes-gateway-receipt-port.ts";
@@ -18,6 +24,8 @@ import {
   envelope,
   externalLaneFixture,
   gatewayDelivery,
+  gatewayNeverFound,
+  gatewayPending,
   gatewayReceipt,
   sendOverSocket,
 } from "../helpers/telegram-external.ts";
@@ -165,24 +173,82 @@ describe("#1036 a receipt lookup error is recorded, not swallowed", () => {
       expect(swept).toMatchObject({ swept: 1, settled: 0, failed: 0 });
       expect(lifecycle(fixture, turn.turnRequestId).lifecycle_state).toBe("IN_DOUBT");
       expect(lookupFailures(fixture).map((row) => row.evidence)).toEqual([
-        { turnRequestId: turn.turnRequestId, sourceNonce: "update:404", kind: "TIMEOUT", detail: "no-answer-in-2000ms" },
+        { turnRequestId: turn.turnRequestId, sourceNonce: "update:404", kind: "TIMEOUT", detail: "no-answer" },
       ]);
     } finally {
       fixture.cp.close();
     }
   });
 
-  it("W5: a genuine 404 is a plain not-found and writes no lookup error", async () => {
+  it("W5: a 404 naming canonical_binding_unknown is HTTP_STATUS/404:canonical_binding_unknown, not a not-found", async () => {
     const fixture = daemonFixture();
     try {
       const turn = await claimOne(fixture, 405);
-      answering(() => ({ kind: "json", status: 404, body: {} }));
+      answering(() => ({ kind: "json", status: 404, body: { error: "canonical_binding_unknown" } }));
       const swept = await fixture.cp.conversation.reconcileUnresolved(5_000);
 
       expect(swept).toMatchObject({ swept: 1, settled: 0, failed: 0 });
-      expect(gateway.requests).toHaveLength(1);
       expect(lifecycle(fixture, turn.turnRequestId).lifecycle_state).toBe("IN_DOUBT");
-      expect(lookupFailures(fixture)).toEqual([]);
+      expect(lookupFailures(fixture).map((row) => row.evidence)).toEqual([{
+        turnRequestId: turn.turnRequestId,
+        sourceNonce: "update:405",
+        kind: "HTTP_STATUS",
+        detail: "404:canonical_binding_unknown",
+      }]);
+      const found = await inDoubtFinding(fixture);
+      expect((found?.observedEvidence["oldest"] as Record<string, unknown>)["lookupError"])
+        .toMatchObject({ kind: "HTTP_STATUS", detail: "404:canonical_binding_unknown" });
+    } finally {
+      fixture.cp.close();
+    }
+  });
+
+  it("W17: a 409 canonical_receipt_unprovable is HTTP_STATUS/409:canonical_receipt_unprovable and the turn stays IN_DOUBT", async () => {
+    const fixture = daemonFixture();
+    try {
+      const turn = await claimOne(fixture, 417);
+      // Hermes' answer for a receipt it cannot prove from preserved evidence: never a not-found.
+      answering(() => ({ kind: "json", status: 409, body: { error: "canonical_receipt_unprovable" } }));
+      expect(await fixture.cp.conversation.reconcileUnresolved(5_000)).toMatchObject({ swept: 1, settled: 0, failed: 0 });
+      await fixture.cp.conversation.reconcileUnresolved(5_000);
+
+      expect(lifecycle(fixture, turn.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+      expect(observationCount(fixture, turn.turnRequestId)).toBe(0);
+      expect(lookupFailures(fixture)).toEqual([{
+        reasonCode: "CONVERSATION_TURN_RECEIPT_LOOKUP_FAILED",
+        actor: turn.targetActorId,
+        evidence: {
+          turnRequestId: turn.turnRequestId,
+          sourceNonce: "update:417",
+          kind: "HTTP_STATUS",
+          detail: "409:canonical_receipt_unprovable",
+        },
+      }]);
+      const found = await inDoubtFinding(fixture);
+      expect((found?.observedEvidence["oldest"] as Record<string, unknown>)["lookupError"])
+        .toMatchObject({ kind: "HTTP_STATUS", detail: "409:canonical_receipt_unprovable" });
+    } finally {
+      fixture.cp.close();
+    }
+  });
+
+  it("W13: the production Gateway's NEVER_FOUND and PENDING, with update_id as a string or an integer, are plain not-found", async () => {
+    const fixture = daemonFixture();
+    try {
+      const turn = await claimOne(fixture, 413);
+      const answers: Array<[string, GatewayAnswer]> = [
+        ["NEVER_FOUND, string id", { kind: "json", body: gatewayNeverFound(413, "string") }],
+        ["NEVER_FOUND, integer id", { kind: "json", body: gatewayNeverFound(413, "integer") }],
+        ["PENDING, string id", { kind: "json", body: gatewayPending(413, turn, "string") }],
+        ["PENDING, integer id", { kind: "json", body: gatewayPending(413, turn, "integer") }],
+      ];
+      for (const [name, answer] of answers) {
+        answering(() => answer);
+        expect(await fixture.cp.conversation.reconcileUnresolved(5_000), name).toMatchObject({ swept: 1, settled: 0, failed: 0 });
+        expect(lookupFailures(fixture), name).toEqual([]);
+      }
+      expect(gateway.requests).toHaveLength(4);
+      expect(lifecycle(fixture, turn.turnRequestId).lifecycle_state).toBe("IN_DOUBT");
       const found = await inDoubtFinding(fixture);
       expect(found?.observedEvidence["lookupErrors"]).toBeUndefined();
       expect((found?.observedEvidence["oldest"] as Record<string, unknown>)["lookupError"]).toBeUndefined();
@@ -192,47 +258,125 @@ describe("#1036 a receipt lookup error is recorded, not swallowed", () => {
     }
   });
 
-  it("W6: repeated sweeps with the same error write exactly one event, and a changed error one more", async () => {
+  it("W14: a production ABORTED receipt with no receiptId or evidenceDigest is a visible SCHEMA/receiptId and settles nothing", async () => {
+    const fixture = daemonFixture();
+    try {
+      const turn = await claimOne(fixture, 414);
+      // The parser is unchanged: an ABORTED without its receipt id is not read as a receipt (a CEO
+      // decision, separate from #1036). What changes is that the refusal is visible. The reason is
+      // Hermes' own token, not an ACP reason code.
+      const hermesReason = "RECEIPT_UNREADABLE";
+      answering((updateId) => ({
+        kind: "json",
+        body: {
+          ...gatewayReceipt(updateId, turn, { status: "ABORTED", reasonCode: hermesReason }),
+          receiptId: null,
+          evidenceDigest: null,
+        },
+      }));
+      const swept = await fixture.cp.conversation.reconcileUnresolved(5_000);
+
+      expect(swept).toMatchObject({ swept: 1, settled: 0, failed: 0 });
+      expect(lifecycle(fixture, turn.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+      expect(observationCount(fixture, turn.turnRequestId)).toBe(0);
+      expect(lookupFailures(fixture).map((row) => row.evidence)).toEqual([
+        { turnRequestId: turn.turnRequestId, sourceNonce: "update:414", kind: "SCHEMA", detail: "receiptId" },
+      ]);
+    } finally {
+      fixture.cp.close();
+    }
+  });
+
+  it("W6: one row per distinct cause per turn, however often it recurs, before or after a restart (R1074-01)", async () => {
     const fixture = daemonFixture();
     try {
       const turn = await claimOne(fixture, 406);
       const stringId = (updateId: number): GatewayAnswer =>
         ({ kind: "json", body: { ...gatewayReceipt(updateId, turn), update_id: String(updateId) } });
+      const status = (code: number) => (updateId: number): GatewayAnswer =>
+        ({ kind: "json", status: code, body: gatewayReceipt(updateId, turn) });
+      const causes = () => lookupFailures(fixture).map((row) => `${String(row.evidence["kind"])}/${String(row.evidence["detail"])}`);
       answering(stringId);
       for (let sweep = 0; sweep < 4; sweep += 1) await fixture.cp.conversation.reconcileUnresolved(5_000);
       expect(gateway.requests).toHaveLength(4);
-      expect(lookupFailures(fixture).map((row) => row.evidence["detail"])).toEqual(["update_id-type"]);
+      expect(causes()).toEqual(["SCHEMA/update_id-type"]);
 
-      answering((updateId) => ({ kind: "json", status: 500, body: gatewayReceipt(updateId, turn) }));
+      answering(status(500));
       await fixture.cp.conversation.reconcileUnresolved(5_000);
       await fixture.cp.conversation.reconcileUnresolved(5_000);
-      expect(lookupFailures(fixture).map((row) => [row.evidence["kind"], row.evidence["detail"]])).toEqual([
-        ["SCHEMA", "update_id-type"],
-        ["HTTP_STATUS", "500"],
-      ]);
-
       // The same kind with a different detail is a different cause.
-      answering((updateId) => ({ kind: "json", status: 503, body: gatewayReceipt(updateId, turn) }));
+      answering(status(503));
       await fixture.cp.conversation.reconcileUnresolved(5_000);
-      // And a cause that returns after another one is recorded again: the latest row is what is compared.
+      expect(causes()).toEqual(["SCHEMA/update_id-type", "HTTP_STATUS/500", "HTTP_STATUS/503"]);
+
+      // A cause that returns after others is not recorded again: it is not the latest, and still known.
       answering(stringId);
       await fixture.cp.conversation.reconcileUnresolved(5_000);
+      answering(status(500));
       await fixture.cp.conversation.reconcileUnresolved(5_000);
-      expect(lookupFailures(fixture).map((row) => `${String(row.evidence["kind"])}/${String(row.evidence["detail"])}`)).toEqual([
-        "SCHEMA/update_id-type",
-        "HTTP_STATUS/500",
-        "HTTP_STATUS/503",
-        "SCHEMA/update_id-type",
-      ]);
+
+      // Nor after a restart, which keeps no memory of its own: the record set is the memory.
+      fixture.cp.close();
+      fixture.cp = fixture.open();
+      for (const answer of [stringId, status(500), status(503)]) {
+        answering(answer);
+        await fixture.cp.conversation.reconcileUnresolved(5_000);
+      }
+      expect(causes()).toEqual(["SCHEMA/update_id-type", "HTTP_STATUS/500", "HTTP_STATUS/503"]);
       expect(lifecycle(fixture, turn.turnRequestId).lifecycle_state).toBe("IN_DOUBT");
 
-      // Doctor reads the latest one.
+      // Doctor names the most recently recorded cause.
       const found = await inDoubtFinding(fixture);
       expect((found?.observedEvidence["oldest"] as Record<string, unknown>)["lookupError"])
-        .toMatchObject({ kind: "SCHEMA", detail: "update_id-type" });
+        .toMatchObject({ kind: "HTTP_STATUS", detail: "503" });
     } finally {
       fixture.cp.close();
     }
+  });
+
+  it("W15: no header or body text from the network reaches audit or doctor, and a cause that would redact is recorded once (R1074-02)", async () => {
+    const fixture = daemonFixture();
+    try {
+      const turn = await claimOne(fixture, 415);
+      const secretLike = [`application/${GATEWAY_KEY}`, `application/sk-${"a".repeat(20)}`];
+      for (const contentType of secretLike) {
+        answering((updateId) => ({ kind: "json", body: gatewayReceipt(updateId, turn), contentType }));
+        for (let sweep = 0; sweep < 3; sweep += 1) await fixture.cp.conversation.reconcileUnresolved(5_000);
+      }
+      answering((updateId) => ({ kind: "json", status: 503, body: { error: GATEWAY_KEY, at: updateId } }));
+      for (let sweep = 0; sweep < 3; sweep += 1) await fixture.cp.conversation.reconcileUnresolved(5_000);
+
+      expect(lookupFailures(fixture).map((row) => row.evidence)).toEqual([
+        { turnRequestId: turn.turnRequestId, sourceNonce: "update:415", kind: "CONTENT_TYPE", detail: "other" },
+        { turnRequestId: turn.turnRequestId, sourceNonce: "update:415", kind: "HTTP_STATUS", detail: "503:other" },
+      ]);
+      const finding = await inDoubtFinding(fixture);
+      expect(finding?.observedEvidence["lookupErrors"]).toBeDefined();
+      const leaked = (text: string) => text.includes(GATEWAY_KEY) || text.includes("sk-aaaa");
+      expect({
+        audit: leaked(JSON.stringify(fixture.cp.audit.byKind(CANONICAL_TURN_RECEIPT_LOOKUP_FAILED))),
+        doctor: leaked(JSON.stringify(finding)),
+      }).toEqual({ audit: false, doctor: false });
+      expect(lifecycle(fixture, turn.turnRequestId).lifecycle_state).toBe("IN_DOUBT");
+    } finally {
+      fixture.cp.close();
+    }
+  });
+
+  it("W16: every cause the vocabulary admits is stored exactly as written, so the comparison sees what was written", () => {
+    const members = [
+      ...Object.entries(RECEIPT_LOOKUP_DETAILS).flatMap(([kind, details]) => [...details].map((detail) => ({ kind, detail }))),
+      ...Array.from({ length: 500 }, (_, index) => 100 + index).flatMap((code) =>
+        ["", ...RECEIPT_LOOKUP_HTTP_ERRORS.map((token) => `:${token}`), ":other"]
+          .map((suffix) => ({ kind: "HTTP_STATUS", detail: `${code}${suffix}` }))),
+      { kind: "UNRECOGNIZED", detail: "other" },
+    ];
+    for (const member of members) {
+      expect(receiptLookupCause(member), JSON.stringify(member)).toEqual(member);
+      const evidence = { turnRequestId: "tr_x", sourceNonce: "update:1", ...member };
+      expect(redact(evidence), JSON.stringify(member)).toEqual(evidence);
+    }
+    expect(members.length).toBeGreaterThan(3_000);
   });
 
   it("W7: a valid receipt still settles COMPLETED exactly as before, after an error and with none of its own", async () => {
@@ -317,7 +461,8 @@ describe("#1036 the Gateway port names every cause", () => {
     const without = (key: string) => Object.fromEntries(Object.entries(valid()).filter(([name]) => name !== key));
     const cases: Array<[unknown, string]> = [
       [[valid()], "not-object"],
-      // Only the Gateway's bare NEVER_FOUND is an answer; any other one-key status is not a receipt.
+      // A one-key status is not the Gateway's answer, whatever the status.
+      [{ status: "NEVER_FOUND" }, "missing-key:delivery"],
       [{ status: "COMPLETED" }, "missing-key:delivery"],
       [{ ...valid(), signature: "x" }, "unknown-keys"],
       [without("delivery"), "missing-key:delivery"],
@@ -350,22 +495,73 @@ describe("#1036 the Gateway port names every cause", () => {
       [{ ...valid(), delivery: { ...gatewayDelivery(80), extra: 1 } }, "delivery-keys"],
       [{ ...valid(), delivery: "delivered" }, "delivery-keys"],
       [{ ...gatewayReceipt(80, turn, { status: "ABORTED" }), delivery: gatewayDelivery(80) }, "aborted-with-delivery"],
+      // The production ABORTED carries no receipt id or evidence digest; read as before, and named.
+      [{ ...gatewayReceipt(80, turn, { status: "ABORTED" }), receiptId: null, evidenceDigest: null }, "receiptId"],
+      [{ ...gatewayReceipt(80, turn, { status: "ABORTED" }), update_id: "80", receiptId: null }, "update_id-type"],
+      // A non-terminal answer is read in its production shape: update_id as the integer or the decimal string.
+      [gatewayNeverFound(81, "string"), "update_id-mismatch"],
+      [gatewayNeverFound(81, "integer"), "update_id-mismatch"],
+      [{ ...gatewayNeverFound(80), update_id: "8O" }, "update_id-type"],
+      [{ ...gatewayNeverFound(80), update_id: 80.5 }, "update_id-type"],
+      [{ ...gatewayNeverFound(80), update_id: null }, "update_id-type"],
+      [{ ...gatewayNeverFound(80), message_id: 180 }, "never-found-field:message_id"],
+      [{ ...gatewayNeverFound(80), turnRequestId: turn.turnRequestId }, "never-found-field:turnRequestId"],
+      [{ ...gatewayNeverFound(80), receiptIdentity: { ...turn } }, "never-found-field:receiptIdentity"],
+      [{ ...gatewayNeverFound(80), receiptId: "hermes-tg:obligation-80" }, "never-found-field:receiptId"],
+      [{ ...gatewayNeverFound(80), evidenceDigest: digestOf("x") }, "never-found-field:evidenceDigest"],
+      [{ ...gatewayNeverFound(80), reasonCode: "OK" }, "never-found-field:reasonCode"],
+      [{ ...gatewayNeverFound(80), delivery: gatewayDelivery(80) }, "never-found-field:delivery"],
+      [{ ...gatewayNeverFound(80), content: "" }, "never-found-field:content"],
+      [gatewayPending(81, turn), "update_id-mismatch"],
+      [{ ...gatewayPending(80, turn), message_id: "180" }, "message_id-type"],
+      [{ ...gatewayPending(80, turn), message_id: 0 }, "message_id-range"],
+      [{ ...gatewayPending(80, turn), receiptIdentity: null }, "identity-keys"],
+      [{ ...gatewayPending(80, turn), receiptIdentity: { ...turn, promptDigest: "sha256:short" } }, "identity-field:promptDigest"],
+      [{ ...gatewayPending(80, turn), turnRequestId: "tr_other" }, "turnRequestId-mismatch"],
+      [{ ...gatewayPending(80, turn), receiptId: "hermes-tg:obligation-80" }, "pending-field:receiptId"],
+      [{ ...gatewayPending(80, turn), evidenceDigest: digestOf("x") }, "pending-field:evidenceDigest"],
+      [{ ...gatewayPending(80, turn), reasonCode: "OK" }, "pending-field:reasonCode"],
+      [{ ...gatewayPending(80, turn), delivery: gatewayDelivery(80) }, "pending-field:delivery"],
+      [{ ...gatewayPending(80, turn), content: "" }, "pending-field:content"],
     ];
     for (const [body, detail] of cases) {
       answering(() => ({ kind: "json", body }));
       await expect(ask(), detail).resolves.toEqual(schema(detail));
+      // Every check the port names is one the coordinator will write as it is.
+      expect(receiptLookupCause({ kind: "SCHEMA", detail }), detail).toEqual({ kind: "SCHEMA", detail });
     }
     // The control: the unaltered answer is a receipt.
     answering(() => ({ kind: "json", body: valid() }));
     await expect(ask()).resolves.toMatchObject({ found: true, outcome: "COMPLETED" });
   });
 
-  it("W11: a transport, status, type, size or parse failure names its cause, and only a 404 or NEVER_FOUND does not", async () => {
+  it("W11: a transport, status, type, size or parse failure names its cause, and only NEVER_FOUND or PENDING does not", async () => {
+    const status = (code: number, detail: string): unknown => ({ kind: "HTTP_STATUS", detail: `${code}${detail}` });
     const cases: Array<[string, GatewayAnswer, unknown]> = [
-      ["500", { kind: "json", status: 500, body: valid() }, { kind: "HTTP_STATUS", detail: "500" }],
-      ["401", { kind: "json", status: 401, body: {} }, { kind: "HTTP_STATUS", detail: "401" }],
-      ["text/plain", { kind: "json", body: valid(), contentType: "text/plain" }, { kind: "CONTENT_TYPE", detail: "text/plain" }],
-      ["odd type", { kind: "json", body: valid(), contentType: "application/json(x)" }, { kind: "CONTENT_TYPE", detail: "unrecognized" }],
+      ["500", { kind: "json", status: 500, body: valid() }, status(500, "")],
+      ["401", { kind: "json", status: 401, body: {} }, status(401, "")],
+      ["401 unauthorized", { kind: "json", status: 401, body: { error: "unauthorized" } }, status(401, ":unauthorized")],
+      ["401 as text", { kind: "raw", status: 401, body: "Unauthorized", contentType: "text/plain" }, status(401, "")],
+      // The production Gateway's error answers name their cause in `error`.
+      ["404 binding unknown", { kind: "json", status: 404, body: { error: "canonical_binding_unknown" } }, status(404, ":canonical_binding_unknown")],
+      ["400", { kind: "json", status: 400, body: { error: "canonical_invalid_request" } }, status(400, ":canonical_invalid_request")],
+      ["409", { kind: "json", status: 409, body: { error: "canonical_event_uncertain" } }, status(409, ":canonical_event_uncertain")],
+      ["409 unprovable", { kind: "json", status: 409, body: { error: "canonical_receipt_unprovable" } }, status(409, ":canonical_receipt_unprovable")],
+      ["503", { kind: "json", status: 503, body: { error: "canonical_unavailable" } }, status(503, ":canonical_unavailable")],
+      ["404 as html", { kind: "raw", status: 404, body: "<h1>no</h1>", contentType: "text/html" }, status(404, "")],
+      // Only the known error tokens are carried; any other error, token-shaped or not, is `other`.
+      ["unknown error token", { kind: "json", status: 503, body: { error: "canonical_something_new" } }, status(503, ":other")],
+      ["error carrying the key", { kind: "json", status: 401, body: { error: GATEWAY_KEY } }, status(401, ":other")],
+      ["error that is not a token", { kind: "json", status: 503, body: { error: "the gateway said: no" } }, status(503, ":other")],
+      ["error that is not a string", { kind: "json", status: 503, body: { error: { code: "x" } } }, status(503, ":other")],
+      ["error inherited, not named", { kind: "json", status: 503, body: { message: "canonical_unavailable" } }, status(503, "")],
+      ["error body over 4KB", { kind: "json", status: 503, body: { error: "canonical_unavailable", pad: "x".repeat(5_000) } }, status(503, "")],
+      ["error body not json", { kind: "raw", status: 503, body: "{\"error\":" }, status(503, "")],
+      // A media type is named by category, never by its text.
+      ["text/plain", { kind: "json", body: valid(), contentType: "text/plain" }, { kind: "CONTENT_TYPE", detail: "text" }],
+      ["text/html", { kind: "json", body: valid(), contentType: "text/html; charset=utf-8" }, { kind: "CONTENT_TYPE", detail: "html" }],
+      ["odd type", { kind: "json", body: valid(), contentType: "application/json(x)" }, { kind: "CONTENT_TYPE", detail: "other" }],
+      ["key as a subtype", { kind: "json", body: valid(), contentType: `application/${GATEWAY_KEY}` }, { kind: "CONTENT_TYPE", detail: "other" }],
       ["no type", { kind: "json", body: valid(), contentType: "" }, { kind: "CONTENT_TYPE", detail: "missing" }],
       ["streamed over 4KB", { kind: "json", body: { ...valid(), content: "x".repeat(5_000) } }, { kind: "TOO_LARGE", detail: "body" }],
       ["not json", { kind: "raw", body: "{not json" }, { kind: "PARSE", detail: "invalid-json" }],
@@ -373,14 +569,16 @@ describe("#1036 the Gateway port names every cause", () => {
     for (const [name, answer, lookupError] of cases) {
       answering(() => answer);
       await expect(ask(), name).resolves.toEqual({ found: false, lookupError });
+      expect(receiptLookupCause(lookupError as { kind: string; detail: string }), name).toEqual(lookupError);
     }
 
     // Answers that are not failures: Hermes holds no receipt, or holds one that is not terminal yet.
     const plain: Array<[string, GatewayAnswer]> = [
-      ["404", { kind: "json", status: 404, body: {} }],
-      ["bare NEVER_FOUND", { kind: "json", body: { status: "NEVER_FOUND" } }],
-      ["receipt-shaped NEVER_FOUND", { kind: "json", body: gatewayReceipt(80, turn, { status: "NEVER_FOUND" }) }],
-      ["PENDING", { kind: "json", body: gatewayReceipt(80, turn, { status: "PENDING" }) }],
+      ["NEVER_FOUND, string id", { kind: "json", body: gatewayNeverFound(80, "string") }],
+      ["NEVER_FOUND, integer id", { kind: "json", body: gatewayNeverFound(80, "integer") }],
+      ["PENDING, string id", { kind: "json", body: gatewayPending(80, turn, "string") }],
+      ["PENDING, integer id", { kind: "json", body: gatewayPending(80, turn, "integer") }],
+      ["PENDING, no message id", { kind: "json", body: { ...gatewayPending(80, turn), message_id: null } }],
     ];
     for (const [name, answer] of plain) {
       answering(() => answer);
@@ -404,6 +602,22 @@ describe("#1036 the Gateway port names every cause", () => {
     await closed.close();
     await expect(ask(closedPort)).resolves.toEqual({ found: false, lookupError: { kind: "TRANSPORT", detail: "ECONNREFUSED" } });
 
+    // A peer that resets the connection, and one that does not speak HTTP: a code outside the
+    // known set is `other`, never the parser's own text.
+    for (const [name, reply, detail] of [
+      ["reset", (socket: Socket) => socket.resetAndDestroy(), "ECONNRESET"],
+      ["not http", (socket: Socket) => socket.end("NOT HTTP AT ALL\r\n\r\n"), "other"],
+    ] as const) {
+      const raw = createNetServer((socket) => socket.once("data", () => reply(socket)));
+      await new Promise<void>((resolve) => raw.listen(0, "127.0.0.1", resolve));
+      try {
+        await expect(ask((raw.address() as AddressInfo).port), name)
+          .resolves.toEqual({ found: false, lookupError: { kind: "TRANSPORT", detail } });
+      } finally {
+        await new Promise<void>((resolve) => raw.close(() => resolve()));
+      }
+    }
+
     // The connection dropped mid-answer.
     const dropped = await rawServer((_req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
@@ -418,7 +632,7 @@ describe("#1036 the Gateway port names every cause", () => {
 
     answering(() => ({ kind: "hang" }));
     const started = Date.now();
-    await expect(ask()).resolves.toEqual({ found: false, lookupError: { kind: "TIMEOUT", detail: "no-answer-in-2000ms" } });
+    await expect(ask()).resolves.toEqual({ found: false, lookupError: { kind: "TIMEOUT", detail: "no-answer" } });
     expect(Date.now() - started).toBeLessThan(3_000);
 
     const aborted = new AbortController();

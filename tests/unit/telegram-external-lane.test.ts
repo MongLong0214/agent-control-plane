@@ -20,6 +20,8 @@ import {
   crashImage,
   envelope,
   externalLaneFixture,
+  gatewayNeverFound,
+  gatewayPending,
   gatewayReceipt,
   replaceHermesCeo,
   sendOverSocket,
@@ -394,7 +396,7 @@ describe("U4 Telegram external-consumer lane", () => {
       const first = allowed(await sendOverSocket(ingress.socketPath, envelope(60, "첫 턴")));
 
       // While the Gateway still reports the first turn pending, the second is refused and writes nothing.
-      gateway.answer = (updateId) => ({ kind: "json", body: gatewayReceipt(updateId, first.turn, { status: "PENDING" }) });
+      gateway.answer = (updateId) => ({ kind: "json", body: gatewayPending(updateId, first.turn) });
       const before = snapshot(fixture.cp);
       const held = await sendOverSocket(ingress.socketPath, envelope(61, "두 번째 턴"));
       expect(held).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONVERSATION_TURN_IN_DOUBT });
@@ -433,7 +435,7 @@ describe("U4 Telegram external-consumer lane", () => {
       gateway.answer = (updateId) =>
         updateId === 50
           ? { kind: "json", body: gatewayReceipt(50, first.turn, { status: "ABORTED" }) }
-          : { kind: "json", body: { status: "NEVER_FOUND" } };
+          : { kind: "json", body: gatewayNeverFound(updateId) };
       fixture.clock.advance(DAY_AND_AN_HOUR_MS);
       // A4 settles update 50 ABORTED; the admission of 51 then prunes 50's expired, settled ingress row.
       const second = allowed(await sendOverSocket(ingress.socketPath, envelope(51, "두 번째 턴")));
@@ -483,8 +485,8 @@ describe("U4 Telegram external-consumer lane", () => {
       const first = allowed(await sendOverSocket(ingress.socketPath, envelope(50, "첫 턴")));
       gateway.answer = (updateId) =>
         updateId === 50
-          ? { kind: "json", body: gatewayReceipt(50, first.turn, { status: "PENDING" }) }
-          : { kind: "json", body: { status: "NEVER_FOUND" } };
+          ? { kind: "json", body: gatewayPending(50, first.turn) }
+          : { kind: "json", body: gatewayNeverFound(updateId) };
       const replacement = replaceHermesCeo(fixture.cp, 1);
       expect(replacement).not.toBe(first.turn.targetActorId);
       fixture.clock.advance(DAY_AND_AN_HOUR_MS);
@@ -497,7 +499,7 @@ describe("U4 Telegram external-consumer lane", () => {
       gateway.answer = (updateId) =>
         updateId === 50
           ? { kind: "json", body: gatewayReceipt(50, first.turn) }
-          : { kind: "json", body: gatewayReceipt(updateId, second.turn, { status: "PENDING" }) };
+          : { kind: "json", body: gatewayPending(updateId, second.turn) };
       await fixture.cp.conversation.reconcileUnresolved(3_000);
       expect(fixture.cp.db.get<Record<string, unknown>>(
         "SELECT lifecycle_state, outcome_kind FROM canonical_turns WHERE turn_request_id = ?",
