@@ -11,6 +11,7 @@ import {
   readFileSync,
   renameSync,
   unlinkSync,
+  utimesSync,
   writeSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -57,11 +58,33 @@ export interface LockInfo {
  * The connection must stay referenced: better-sqlite3 closes an unreferenced one when it is
  * garbage-collected, which would end the lock. It is held by this object for as long as it holds.
  *
- * Moving from an earlier build: stop the old daemon (the launchd job's bootout), wait until
- * `<lock>` is gone (`install-launchd.sh`'s `wait_for_stop` already does), then start the new one.
- * An old daemon does not know this lock, so the two must never start together; a new daemon
- * refuses while an old one's record names a running process, and an old one refuses while a new
- * one's record names its running holder.
+ * Earlier builds (narrow review 6). An earlier build's lock is the pathname `<lock>` alone: it
+ * reclaims a record naming a dead process by unlinking the path without checking what it removes,
+ * then links its own record into place; it does not know `<lock>.db`. So `<lock>` is where the two
+ * schemes meet, and nothing this build does when it reclaims can stop an earlier reclaimer's blind
+ * unlink. They are kept apart at that path instead:
+ *
+ *   - This build's record is one no earlier build reclaims, alive or dead: it carries no `path`, so
+ *     an earlier build reads it as incomplete, and its modification time is pinned far in the
+ *     future, so the five seconds an earlier build waits for an incomplete record's writer never
+ *     run out. An earlier build therefore always refuses while it stands and never removes it.
+ *   - An empty path is claimed only by linking a complete record into place, which fails if
+ *     anything got there first — the same exclusive step an earlier build takes.
+ *   - Only this build's own record is ever replaced, under the lock, where only a holder writes it.
+ *     An earlier build's record is never removed or replaced, whether its process runs or not:
+ *     this build refuses until it is gone. Stop every earlier-build agentcpd first and let it
+ *     remove its own record (`install-launchd.sh` waits until `<lock>` is gone before it promotes
+ *     a build); a record whose process died without removing it is removed by hand, only once no
+ *     earlier-build agentcpd or agentcpd-state is running.
+ *
+ * A clean release removes this build's record and leaves the path empty, which is what
+ * `install-launchd.sh` waits for, and what an earlier build restored by a rollback starts from.
+ *
+ * Two alternatives were rejected. Reclaiming a dead earlier-build record carefully — reading it
+ * again, moving it aside and checking what moved — was rejected because an earlier reclaimer that
+ * read it dead unlinks whatever is at the path afterwards, this build's new record included. A
+ * permanent marker at `<lock>` that earlier builds always refuse was rejected because
+ * `wait_for_stop` and a rolled-back earlier generation both need the path empty after a clean stop.
  */
 export class SingleInstanceLock {
   /** The dedicated connection whose open exclusive transaction is the lock. */
@@ -166,15 +189,38 @@ export class SingleInstanceLock {
     if (existing && holderRunning(existing)) {
       return refuse(ReasonCode.DAEMON_ALREADY_RUNNING, "another agentcpd instance holds the lock", { holder: existing });
     }
-    if (!existing && existsSync(this.path)) {
+    // What stands at the path decides how this holder's record goes there (narrow review 6): onto an
+    // empty path only by an exclusive link, over this build's own record only, never over anything
+    // an earlier build may be reclaiming at this moment.
+    const standing = recordAt(this.path);
+    let claim: { replace: FileIdentity } | "create";
+    if ((standing.kind === "ours" || standing.kind === "earlier") && holderRunning(standing.info)) {
+      return refuse(ReasonCode.DAEMON_ALREADY_RUNNING, "another agentcpd instance holds the lock", { holder: standing.info });
+    }
+    if (standing.kind === "absent") {
+      claim = "create";
+    } else if (standing.kind === "ours" && standing.pinned) {
+      claim = { replace: standing.identity };
+    } else if (standing.kind === "unreadable" && standing.ageMs < MALFORMED_LOCK_GRACE_MS) {
       // An earlier build wrote its record in place and could leave it truncated for an instant.
-      const ageMs = Date.now() - lstatSync(this.path).mtimeMs;
-      if (ageMs < MALFORMED_LOCK_GRACE_MS) {
-        return refuse(ReasonCode.DAEMON_LOCK_LOST, "lock record is incomplete; waiting for its writer", {
-          path: this.path,
-          retryAfterMs: MALFORMED_LOCK_GRACE_MS - ageMs,
-        });
-      }
+      return refuse(ReasonCode.DAEMON_LOCK_LOST, "lock record is incomplete; waiting for its writer", {
+        path: this.path,
+        retryAfterMs: MALFORMED_LOCK_GRACE_MS - standing.ageMs,
+      });
+    } else {
+      // An earlier build's record whose process is gone, or anything this build cannot verify as its
+      // own pinned record: an earlier build may be reclaiming it right now.
+      return refuse(
+        ReasonCode.DAEMON_ALREADY_RUNNING,
+        standing.kind === "earlier"
+          ? "an earlier build's lock record names a process that is not running. An earlier build reclaims such a record by " +
+            "unlinking the path without checking what it removes, so this build never removes or replaces it: stop every " +
+            "earlier-build agentcpd and agentcpd-state, then remove the record"
+          : "the lock path holds something this build cannot verify as its own record, which an earlier build may reclaim " +
+            "at any moment, so this build does not remove or replace it: stop every earlier-build agentcpd and " +
+            "agentcpd-state, then remove it",
+        { path: this.path, standing: standing.kind, holder: standing.kind === "earlier" ? standing.info : null },
+      );
     }
 
     const info: LockInfo = { pid: process.pid, startedAt, path: this.path, startToken: readProcessStartToken(process.pid) };
@@ -220,14 +266,19 @@ export class SingleInstanceLock {
       );
     }
 
-    // The holder record, replaced under the lock: only the holder writes it.
+    // The holder record: linked onto an empty path, or renamed over this build's own record, which
+    // only a holder of this lock writes. Never over an earlier build's record.
     try {
-      writeRecord(this.path, info);
+      installRecord(this.path, info, claim);
     } catch (error) {
-      return refuse(ReasonCode.DAEMON_LOCK_LOST, "the holder record could not be written", {
-        path: this.path,
-        error: (error as Error).message,
-      });
+      const code = (error as { code?: string }).code;
+      return refuse(
+        code === "EEXIST" || code === "ESTALE" ? ReasonCode.DAEMON_ALREADY_RUNNING : ReasonCode.DAEMON_LOCK_LOST,
+        code === "EEXIST" || code === "ESTALE"
+          ? "another agentcpd instance put its record at the lock path first"
+          : "the holder record could not be written",
+        { path: this.path, error: (error as Error).message },
+      );
     }
     this.#held = info;
     // Asked again after every write: a lock file replaced meanwhile means another process may lock it.
@@ -239,23 +290,9 @@ export class SingleInstanceLock {
     return allow(ReasonCode.OK, info);
   }
 
+  /** The holder record at the path, this build's or an earlier build's, or null when there is none to read. */
   read(): LockInfo | null {
-    if (!existsSync(this.path)) return null;
-    try {
-      const parsed = JSON.parse(readFileSync(this.path, "utf8")) as LockInfo;
-      return (
-        typeof parsed.pid === "number" &&
-        Number.isInteger(parsed.pid) &&
-        parsed.pid > 0 &&
-        typeof parsed.startedAt === "string" &&
-        typeof parsed.path === "string" &&
-        (parsed.startToken === undefined || parsed.startToken === null || typeof parsed.startToken === "string")
-      )
-        ? parsed
-        : null;
-    } catch {
-      return null;
-    }
+    return readHolderRecord(this.path)?.info ?? null;
   }
 
   held(): boolean {
@@ -653,24 +690,110 @@ const holderRunning = (holder: LockInfo): boolean => {
   return current === null || current === holder.startToken;
 };
 
-/** The holder record, written whole and renamed into place. */
-const writeRecord = (path: string, info: LockInfo): void => {
+/** Marks a holder record as this build's. Earlier builds' records have no `scheme`. */
+const RECORD_SCHEME = "agentcpd-lock/sqlite-exclusive";
+
+/**
+ * The modification time every record of this build carries, 2100-01-01T00:00:00Z. An earlier build
+ * reads this build's record as incomplete (it has no `path`) and waits for its writer for five seconds
+ * counted from this time before it would remove it, so it never does.
+ */
+const PINNED_MTIME_SECONDS = 4_102_444_800;
+
+interface HolderRecord {
+  info: LockInfo;
+  /** Written by this build: no `path`, `scheme` set. */
+  ours: boolean;
+}
+
+/**
+ * Reads the record at `path`, in either shape. This build's carries `scheme` and no `path`, which is
+ * what makes an earlier build read it as incomplete; its `path` is the path it was read from.
+ */
+const readHolderRecord = (path: string): HolderRecord | null => {
+  if (!existsSync(path)) return null;
+  let parsed: Partial<LockInfo> & { scheme?: unknown };
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<LockInfo> & { scheme?: unknown };
+  } catch {
+    return null;
+  }
+  if (
+    typeof parsed !== "object" || parsed === null ||
+    typeof parsed.pid !== "number" || !Number.isInteger(parsed.pid) || parsed.pid <= 0 ||
+    typeof parsed.startedAt !== "string" ||
+    !(parsed.startToken === undefined || parsed.startToken === null || typeof parsed.startToken === "string")
+  ) {
+    return null;
+  }
+  if (parsed.scheme === RECORD_SCHEME && parsed.path === undefined) {
+    return { info: { pid: parsed.pid, startedAt: parsed.startedAt, path, startToken: parsed.startToken ?? null }, ours: true };
+  }
+  if (parsed.scheme === undefined && typeof parsed.path === "string") {
+    return { info: parsed as LockInfo, ours: false };
+  }
+  return null;
+};
+
+type StandingRecord =
+  | { kind: "absent" }
+  /** This build's record; `pinned` while its modification time still keeps earlier builds away. */
+  | { kind: "ours"; info: LockInfo; identity: FileIdentity; pinned: boolean }
+  | { kind: "earlier"; info: LockInfo }
+  | { kind: "unreadable"; ageMs: number }
+  /** Not a regular file. */
+  | { kind: "other" };
+
+/** What stands at the holder record's path, read without following a link. */
+const recordAt = (path: string): StandingRecord => {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    return (error as { code?: string }).code === "ENOENT" ? { kind: "absent" } : { kind: "other" };
+  }
+  if (!stat.isFile()) return { kind: "other" };
+  const record = readHolderRecord(path);
+  if (record === null) return { kind: "unreadable", ageMs: Date.now() - stat.mtimeMs };
+  if (!record.ours) return { kind: "earlier", info: record.info };
+  return {
+    kind: "ours",
+    info: record.info,
+    identity: { dev: stat.dev, ino: stat.ino },
+    pinned: stat.mtimeMs - Date.now() > MALFORMED_LOCK_GRACE_MS,
+  };
+};
+
+/**
+ * Puts this holder's record in place, whole, synced and with its modification time pinned before it
+ * is visible: linked onto an empty path, which fails with EEXIST if anything got there first, or
+ * renamed over this build's own record that `replace` names, which fails with ESTALE if the path no
+ * longer names that file. Called only under the lock.
+ */
+const installRecord = (path: string, info: LockInfo, claim: { replace: FileIdentity } | "create"): void => {
   const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
   const fd = openSync(temporary, "wx", 0o600);
   try {
-    writeSync(fd, JSON.stringify(info));
+    writeSync(fd, JSON.stringify({ scheme: RECORD_SCHEME, pid: info.pid, startedAt: info.startedAt, startToken: info.startToken ?? null }));
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
   try {
-    renameSync(temporary, path);
-  } catch (error) {
+    utimesSync(temporary, PINNED_MTIME_SECONDS, PINNED_MTIME_SECONDS);
+    if (claim === "create") {
+      linkSync(temporary, path);
+    } else {
+      if (!sameFile(path, claim.replace)) {
+        throw Object.assign(new Error("the record at the lock path is no longer the one judged under the lock"), { code: "ESTALE" });
+      }
+      renameSync(temporary, path);
+    }
+  } finally {
     try {
       unlinkSync(temporary);
     } catch {
-      /* best effort */
+      /* renamed into place; a linked one leaves this second name */
     }
-    throw error;
   }
 };

@@ -188,7 +188,7 @@ describe("#1070 ACP-WORKER-03-LOCK one process holds the daemon lock", () => {
     expect((await attempt(state, "after-terminate")).allowed).toBe(true);
   }, 240_000);
 
-  it("an earlier build's daemon still running on the pathname lock refuses a new one; a dead one does not", async () => {
+  it("an earlier build's record refuses a new one while its daemon runs and after it died; once removed, this build holds", async () => {
     const state = tempDir("acp-lock-earlier-build-");
     go(state);
     const running = spawn("/bin/sleep", ["60"], { stdio: "ignore" });
@@ -200,7 +200,13 @@ describe("#1070 ACP-WORKER-03-LOCK one process holds the daemon lock", () => {
     expect(refused.reasonCode).toBe("DAEMON_ALREADY_RUNNING");
     running.kill("SIGKILL");
     await waitFor(() => running.exitCode !== null || running.signalCode !== null, "the earlier daemon to end");
-    expect((await attempt(state, "after-it-ended")).allowed).toBe(true);
+    // Narrow review 6: an earlier build reclaims a dead record by unlinking the path blind, so this
+    // build never removes or replaces one; the earlier daemon has to be stopped and its record gone.
+    const afterDeath = await attempt(state, "after-it-ended");
+    expect(afterDeath.allowed, "this build reclaimed a record an earlier build may be reclaiming too").toBe(false);
+    expect(readFileSync(lockPath, "utf8")).toContain(`"pid":${running.pid}`);
+    unlinkSync(lockPath);
+    expect((await attempt(state, "after-it-was-removed")).allowed).toBe(true);
   }, 240_000);
 
   it("the limit, pinned: a plain descriptor closed in the holder drops the OS lock, and the record still refuses", async () => {
