@@ -2944,7 +2944,10 @@ export class Daemon {
     // reclaims once each is gone — matched by group id and its leader's start time, so a reused id
     // never fences forever. A stop that names no group fences until an operator removes the fence.
     const lockRetained = !workers.gitStopped;
-    const fencedGroups = lockRetained ? (workers.unconfirmedGroups ?? null) : [];
+    // ACP-WORKER-03-FC-EMPTY: an incomplete stop that names no group is fenced as an unknown one.
+    const fencedGroups = lockRetained
+      ? (workers.unconfirmedGroups && workers.unconfirmedGroups.length > 0 ? workers.unconfirmedGroups : null)
+      : [];
     if (lockRetained) this.lock.fence(fencedGroups, this.cp.clock.nowIso());
     this.cp.audit.record({
       kind: "DAEMON_STOPPED",

@@ -68,36 +68,9 @@ export class SingleInstanceLock {
     renameSync(temporary, this.fencePath);
   }
 
-  /**
-   * The fence, if any group it names may still be alive. A group is alive while `kill(-pgid, 0)` finds
-   * members, unless a process now holding the group's id started at another time than the recorded
-   * leader — a pid is reused only once its group is empty, so that group is gone. A fence with no
-   * named groups, or one that cannot be read, stands. Once every named group is gone it is removed.
-   */
-  liveFence(): { groups: FencedGroup[] | null; alive: FencedGroup[] } | null {
-    if (!existsSync(this.fencePath)) return null;
-    let groups: FencedGroup[] | null;
-    try {
-      const parsed = JSON.parse(readFileSync(this.fencePath, "utf8")) as { groups?: unknown };
-      groups = Array.isArray(parsed.groups)
-        ? parsed.groups.filter((group): group is FencedGroup =>
-          typeof group === "object" && group !== null &&
-          Number.isSafeInteger((group as FencedGroup).pgid) && (group as FencedGroup).pgid > 0 &&
-          ((group as FencedGroup).leaderStartedAt === null || typeof (group as FencedGroup).leaderStartedAt === "string"))
-        : null;
-      if (Array.isArray(parsed.groups) && groups !== null && groups.length !== parsed.groups.length) groups = null;
-    } catch {
-      groups = null;
-    }
-    if (groups === null) return { groups: null, alive: [] };
-    const alive = groups.filter((group) => fencedGroupAlive(group));
-    if (alive.length > 0) return { groups, alive };
-    try {
-      unlinkSync(this.fencePath);
-    } catch {
-      /* already gone */
-    }
-    return null;
+  /** The fence beside this lock, if it still stands (see `readLiveFence`). */
+  liveFence(): LiveFence | null {
+    return readLiveFence(this.fencePath);
   }
 
   acquire(startedAt: string): Decision<LockInfo> {
@@ -187,6 +160,20 @@ export class SingleInstanceLock {
     }
 
     this.#held = info;
+    // ACP-WORKER-03-FC — asked again now that this lock is installed, and before authority is granted.
+    // A predecessor writes its fence before it exits and keeps its lock until then, so this install
+    // could only follow a reclamation that saw it dead: any fence it wrote is in place by now, however
+    // the two interleaved, and the check above may have run before it was. Read directly, never through
+    // the overridable lookup, so no subclass can answer it from a stale read.
+    const fencedNow = readLiveFence(this.fencePath);
+    if (fencedNow) {
+      this.release();
+      return deny(
+        ReasonCode.DAEMON_ALREADY_RUNNING,
+        "a stopped agentcpd could not confirm a worker git process group finished; authority is not taken while it may still run",
+        { fence: this.fencePath, groups: fencedNow.groups, alive: fencedNow.alive, afterInstall: true },
+      );
+    }
     return allow(ReasonCode.OK, info);
   }
 
@@ -237,6 +224,46 @@ export class SingleInstanceLock {
     this.#held = null;
   }
 }
+
+interface LiveFence {
+  /** The groups the fence names; null when it names none or cannot be read, which fences regardless. */
+  groups: FencedGroup[] | null;
+  alive: FencedGroup[];
+}
+
+/**
+ * The fence, if any group it names may still be alive. A group is alive while `kill(-pgid, 0)` finds
+ * members, unless a process now holding the group's id started at another time than the recorded
+ * leader — a pid is reused only once its group is empty, so that group is gone. A fence that names no
+ * group (`null`, an empty list) or cannot be read stands, as an unknown one. Once every named group is
+ * gone it is removed.
+ */
+const readLiveFence = (fencePath: string): LiveFence | null => {
+  if (!existsSync(fencePath)) return null;
+  let groups: FencedGroup[] | null;
+  try {
+    const parsed = JSON.parse(readFileSync(fencePath, "utf8")) as { groups?: unknown };
+    groups = Array.isArray(parsed.groups)
+      ? parsed.groups.filter((group): group is FencedGroup =>
+        typeof group === "object" && group !== null &&
+        Number.isSafeInteger((group as FencedGroup).pgid) && (group as FencedGroup).pgid > 0 &&
+        ((group as FencedGroup).leaderStartedAt === null || typeof (group as FencedGroup).leaderStartedAt === "string"))
+      : null;
+    if (Array.isArray(parsed.groups) && groups !== null && groups.length !== parsed.groups.length) groups = null;
+  } catch {
+    groups = null;
+  }
+  // ACP-WORKER-03-FC-EMPTY: an incomplete stop that names no group is an unknown one, not a finished one.
+  if (groups === null || groups.length === 0) return { groups: null, alive: [] };
+  const alive = groups.filter((group) => fencedGroupAlive(group));
+  if (alive.length > 0) return { groups, alive };
+  try {
+    unlinkSync(fencePath);
+  } catch {
+    /* already gone */
+  }
+  return null;
+};
 
 const fencedGroupAlive = (group: FencedGroup): boolean => {
   try {
