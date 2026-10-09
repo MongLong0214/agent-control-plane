@@ -1,0 +1,30 @@
+Limit: BEGIN EXCLUSIVE climbs SHARED, RESERVED, PENDING, EXCLUSIVE, so every contender holds SHARED for a moment and EXCLUSIVE is granted only once no SHARED lock stands; with no busy wait two starts at once could each refuse the other and neither held
+Ruled-out: locking_mode = EXCLUSIVE on the lock connection | a failed BEGIN EXCLUSIVE keeps its locks until close: with no wait the refused contender's SHARED lock refused the other start EXCLUSIVE, and with a busy wait added the two could each keep what the other waited for until both gave up
+Warn: a process refused because the daemon lock is held now answers after LOCK_WAIT_MS of SQLite busy wait, not at once; a SHARED lock held longer than that by a reader of agentcpd.lock.db still refuses a start, so nothing may read that file
+Warn: r-sqlitelock's (timeout 0) no longer holds; the lock is still one open BEGIN EXCLUSIVE transaction on agentcpd.lock.db held by one connection, and only how long a contender waits changed
+Record-Id: r-lockliveness
+Follows: r-sqlitelock
+Provenance: inherited 5005d32eee3afc07b692adf10d8faf381d72d1e5
+
+Warn: the concurrent-start witness lets the third process's SHARED lock go only once both starts have answered, or both have entered and one stands waiting on PENDING; letting it go earlier leaves the schedule to chance and the witness then proves nothing
+Record-Id: r-lockwitness
+Follows: r-lockliveness
+Evidence: tests/unit/the-daemon-lock-is-held-by-one-process.test.ts
+Provenance: inherited 3e0dfdeb8614e5e8a78fdbbe858d29ba3f183969
+
+Warn: a lock helper mode reports its SQLite step the way raw does, OK once the lock is held and SQLite's code if not; a lock state such as SHARED is the mode's name and never a reasonCode, which the reason-code census reads as a declared code
+Record-Id: r-lockwitnesscensus
+Follows: r-lockwitness
+Provenance: inherited 1716f1f93ebcfd3a21a219abd9d320b508464137
+
+Limit: an acquisition the held daemon lock refuses first spends the lock's SQLite busy wait synchronously, so a lock probe run in the daemon's own process stalls the event loop the daemon's drain runs on
+Warn: probe the daemon lock during a drain from a separate process (lock-holder-process contend mode), never with an in-process acquire loop; tests/unit/a-worker-git-group-outlives-its-leader.test.ts still asks in-process and blocks its stop for each ask
+Warn: a lock the contender is granted is judged by whether the child is alive while the contender still holds it, not before the ask: an ask begun while the child lived can wait out the drain and be granted the lock the daemon released after the child was gone
+Record-Id: r-drainprobeprocess
+Follows: r-lockliveness
+Provenance: inherited ddc67596b8f3475a5fd8e522120c736e723c5491
+
+Warn: a second migrator now contends for the state lock through SQLite's configured busy wait before it is refused, and takes the lock when the first releases inside that wait; the re-read under the lock is then what refuses it, so that re-read must stay
+Record-Id: r-migrationlockwait
+Follows: r-lockliveness
+Provenance: inherited d8d6e5fa54d33845da092eda9251c840b026d82d
