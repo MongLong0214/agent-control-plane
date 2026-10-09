@@ -642,6 +642,19 @@ export class ProductionGate {
     const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
     if (!independence.allowed) return independence as Decision<{ isBootstrap: boolean }>;
 
+    // Issue #246 PR-C — a bootstrap CONFIRM is what sets off the Repo Factory GitHub writes, and
+    // until slice C3's durable application record (reservation, pre-write checks, attributable
+    // recovery) exists, no bootstrap run may reach them. Here, in admission, so every CONFIRM door
+    // is refused before the runner, before an owner approval is consumed and before any GitHub
+    // call; `submitCeoDecision` asks the same question again. C3 removes this refusal.
+    if (isBootstrap && input.decision === "CONFIRM") {
+      return deny(
+        ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+        "a PROJECT_BOOTSTRAP confirmation cannot be applied until its durable application record exists",
+        { runId: input.runId, decision: input.decision },
+      );
+    }
+
     // The packet records what the owner gate said when it was published, but a later
     // authenticated rejection is authoritative at confirmation time.
     const humanGate = this.humanGateStatus(input.runId);

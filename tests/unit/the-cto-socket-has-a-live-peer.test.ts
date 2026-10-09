@@ -408,7 +408,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     { label: "bootstrap bound first", bootstrapFirst: true },
     { label: "bootstrap bound last", bootstrapFirst: false },
   ])(
-    "reaches every project a single session is the CTO of, and none of them through the bootstrap binding ($label)",
+    "reaches every project a single session is the CTO of; a bootstrap binding never shares that session ($label)",
     async ({ bootstrapFirst }) => {
       const harness = makeHarness();
       const a = await registerFixtureProject(harness, "project-a");
@@ -421,11 +421,13 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       });
       if (!bProject.allowed) throw new Error(`second project failed: ${bProject.message}`);
 
-      // One session, three live bindings — a legal state, not a contrived one. Socket admission
-      // picks exactly one of them to admit the connection under, and which one it picks must not
-      // decide which of this session's roles can be reached. The order is varied because the
-      // choice admission makes is order-dependent.
+      // One session, two live PRIMARY_CTO bindings — a legal state, not a contrived one. Socket
+      // admission picks exactly one of them to admit the connection under, and which one it picks
+      // must not decide which of this session's roles can be reached. A run's BOOTSTRAP_CTO holds its
+      // session alone (#246), in whichever order it is bound, so it lives on a session of its own and
+      // is still never reachable through this one.
       const session = readySession(harness, "multi-bound-cto");
+      const bootstrapSession = readySession(harness, "bootstrap-cto");
       const run = harness.cp.runs.create({
         projectId: a.projectId,
         executionMode: ExecutionMode.STANDARD,
@@ -433,28 +435,22 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
         repositories: [{ repositoryId: a.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
       });
       if (!run.allowed) throw new Error(`run creation failed: ${run.message}`);
-      const bindBootstrap = () =>
-        expect(
-          harness.cp.bindings.bind({
-            role: Role.BOOTSTRAP_CTO,
-            sessionId: session.sessionId,
-            runId: run.value.runId,
-          }).reasonCode,
-        ).toBe(ReasonCode.OK);
-      const bindPrimaries = () => {
-        for (const projectId of [a.projectId, "project-b"]) {
-          expect(
-            harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId })
-              .reasonCode,
-          ).toBe(ReasonCode.OK);
-        }
-      };
+      const bindBootstrap = (sessionId: string) =>
+        harness.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, sessionId, runId: run.value.runId }).reasonCode;
+      const bindPrimaries = (sessionId: string) =>
+        [a.projectId, "project-b"].map((projectId) =>
+          harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId, projectId }).reasonCode);
       if (bootstrapFirst) {
-        bindBootstrap();
-        bindPrimaries();
+        expect(bindBootstrap(bootstrapSession.sessionId)).toBe(ReasonCode.OK);
+        expect(bindPrimaries(bootstrapSession.sessionId)).toEqual([
+          ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT,
+          ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT,
+        ]);
+        expect(bindPrimaries(session.sessionId)).toEqual([ReasonCode.OK, ReasonCode.OK]);
       } else {
-        bindPrimaries();
-        bindBootstrap();
+        expect(bindPrimaries(session.sessionId)).toEqual([ReasonCode.OK, ReasonCode.OK]);
+        expect(bindBootstrap(session.sessionId)).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
+        expect(bindBootstrap(bootstrapSession.sessionId)).toBe(ReasonCode.OK);
       }
 
       const keyA = roleKeyFor(Role.PRIMARY_CTO, { projectId: a.projectId });

@@ -145,6 +145,13 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     anchor: "  ): Decision<RunRow> {\n    return this.db.txDecision(() => {\n      const run = this.require(runId);",
   },
   {
+    // #246 C1 — dispatch binds a staffed BOOTSTRAP_CTO in this transaction before it can refuse;
+    // it was an exemption while nothing in it wrote before a returned denial.
+    label: "RunEngine.dispatch (bind, pin, RUN_DISPATCH)",
+    file: "run/run-engine.ts",
+    anchor: "  ): Decision<RunRow> {\n    return this.db.txDecision(() => {\n      const fresh = this.require(runId);",
+  },
+  {
     label: "CandidatePipeline lease acquisition",
     file: "run/candidate-pipeline.ts",
     anchor: "did not happen and must not leave a row behind.\n    return this.db.txDecision(() => {",
@@ -259,12 +266,6 @@ const NAMED_ENTRIES: Array<{ label: string; file: string; marker: string; expect
     label: "suspendProject's completed tx (EXEMPT, #692)",
     file: "cto/cto-lifecycle.ts",
     marker: "owner session stopped during project suspension",
-    expectStdout: "stale exemption",
-  },
-  {
-    label: "RunEngine.dispatch's applyRunStateTransition callback (EXEMPT)",
-    file: "run/run-engine.ts",
-    marker: "§29/§30.3 — activation, its envelope and its audit record are one operation",
     expectStdout: "stale exemption",
   },
   {

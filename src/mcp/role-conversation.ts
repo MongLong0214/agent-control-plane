@@ -489,11 +489,13 @@ export class RoleConversationPort {
     /*
      * **The connection's slots come from the registry, keyed on who it authenticated as.**
      *
-     * A session legitimately holds several bindings at once — an older `BOOTSTRAP_CTO` and the
-     * `PRIMARY_CTO` of two different projects — and socket admission picks a single one to admit
-     * the connection under. Neither that choice nor the assignment history is authority here: the
-     * first would make whichever role admission happened to pick the only reachable one, and the
-     * second names the session a conversation *was* on rather than the one it is on now.
+     * A session legitimately holds several bindings at once — the `PRIMARY_CTO` of two different
+     * projects — and socket admission picks a single one to admit the connection under. (A
+     * `BOOTSTRAP_CTO` is never among them: it holds its session alone, and a session that once
+     * held one takes no other role; #246.) Neither that choice nor the assignment history is
+     * authority here: the first would make whichever role admission happened to pick the only
+     * reachable one, and the second names the session a conversation *was* on rather than the one
+     * it is on now.
      *
      * So the credential authenticates the session, the registry offers every current binding of
      * this role, and `#isCurrentHolder` — the one enforcement point — keeps the ones whose live

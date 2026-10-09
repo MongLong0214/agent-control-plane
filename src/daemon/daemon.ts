@@ -570,6 +570,8 @@ export class Daemon {
   #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
+  /** One BOOTSTRAP_CTO reclaim pass at a time: `runPeriodic` has no overlap guard of its own. */
+  #reclaimingBootstrapCtos = false;
   // #734 — the last system evaluation that actually finished, and the outcome of the most
   // recent *attempt*, kept apart on purpose: a failed attempt must be visible even while the
   // last success is still inside its freshness window (criterion 3). `resolveDoctorHealth`
@@ -1425,6 +1427,9 @@ export class Daemon {
 
       report.resumedRuns = await this.resumeQueuedRuns();
       report.resumedFinalizations = await this.resumeApprovedRuns();
+      // Issue #246 — a bootstrap run that ended while no daemon was running left its BOOTSTRAP_CTO
+      // bound or its session running; the watchdog repeats this, through the same backoff.
+      await this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
       // #639 contract 6, at the moment it matters most: right after a restart, before the first
       // periodic sweep would otherwise get to it. This genuinely runs and asks — it is not a
       // no-op by omission — but two independent facts limit it today, both stated in full in
@@ -2125,6 +2130,25 @@ export class Daemon {
     return resumed;
   }
 
+  /**
+   * Issue #246 — the BOOTSTRAP_CTO reclaim sweep: a bootstrap run that ended (COMPLETED, CANCELLED,
+   * FAILED) has its binding revoked, if the terminal transition did not, and its session stopped
+   * through the provider. A session holding any role is never stopped. A provider that would not
+   * stop a session fails the pass, so the timer's backoff and DAEMON_TIMER_FAILED record it.
+   */
+  private async reclaimBootstrapCtos(): Promise<void> {
+    if (this.#reclaimingBootstrapCtos) return;
+    this.#reclaimingBootstrapCtos = true;
+    try {
+      const reclaimed = await this.cp.bootstrapCtos.reclaim();
+      if (reclaimed.stopFailed.length > 0) {
+        throw new Error(`the provider did not stop ${reclaimed.stopFailed.length} bootstrap CTO session(s)`);
+      }
+    } finally {
+      this.#reclaimingBootstrapCtos = false;
+    }
+  }
+
   private startTimers(): void {
     const watchdogMs = this.options.watchdogIntervalMs ?? 60_000;
     const deliveryMs = this.options.deliveryIntervalMs ?? 5_000;
@@ -2151,6 +2175,8 @@ export class Daemon {
         const finalized = await this.resumeApprovedRuns();
         if (tick.overdue.length > 0 || finalized.length > 0) this.writeHealth(null);
       });
+      // A failing reclaim backs off on its own and does not cost the watchdog its tick.
+      void this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
     }, watchdogMs);
     watchdog.unref();
     this.#timers.push(watchdog);

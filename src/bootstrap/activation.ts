@@ -5,7 +5,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { type ProjectManifest, manifestDigest } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
-import { ArtifactKind, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import { ArtifactKind, Role, RunKind, RunState, roleKeyFor } from "../domain/types.ts";
 import { missingHandoffFields, type CtoLifecycle, type HandoffPackage } from "../cto/cto-lifecycle.ts";
 import type { Db } from "../db/database.ts";
 import { MessageKind } from "../outbox/envelope.ts";
@@ -94,66 +94,16 @@ export class BootstrapActivation {
   ) {}
 
   /**
-   * §26.2 — a bootstrap run binds `BOOTSTRAP_CTO(run)` for technical feasibility and
-   * lean review. It is run-scoped, so it cannot silently become the project's authority.
+   * Issue #246 — no promotion. A run's `BOOTSTRAP_CTO` is staffed by dispatch on a session of its
+   * own and reclaimed when the run ends; the project's PRIMARY_CTO is always a fresh session
+   * activation provisions, and `BindingRegistry` refuses any other role on a session that served
+   * as a bootstrap CTO. Whether `sessionId` ever served this run's bootstrap CTO, by its recorded
+   * session or its actor's live runtime: what `promotedFromBootstrap` reports.
    */
-  bindBootstrapCto(runId: string, sessionId: string): Decision<{ roleKey: string; generation: number }> {
-    const run = this.runs.get(runId);
-    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
-    if (run.kind !== RunKind.PROJECT_BOOTSTRAP) {
-      return deny(ReasonCode.INVALID_ARGUMENT, "bootstrap CTO requires a PROJECT_BOOTSTRAP run", {
-        runId,
-        kind: run.kind,
-      });
-    }
-    const roleKey = roleKeyFor(Role.BOOTSTRAP_CTO, { runId });
-    const bound = this.bindings.bind({
-      roleKey,
-      role: Role.BOOTSTRAP_CTO,
-      sessionId,
-      runId,
-      projectId: run.projectId,
-      mode: "PREFERRED",
-    });
-    if (!bound.allowed) return bound as Decision<{ roleKey: string; generation: number }>;
-
-    // A bootstrap run has no project, so dispatch admission cannot pin an owner for it.
-    // Without this the run has no owner and every CTO surface call fails assertOwner
-    // (§26.2), which made the PROJECT_BOOTSTRAP path unusable.
-    const pinned = this.runs.reassignOwner(runId, bound.value, "bootstrap CTO bound");
-    if (!pinned.allowed) return pinned as Decision<{ roleKey: string; generation: number }>;
-
-    return allow(ReasonCode.OK, { roleKey, generation: bound.value.bindingGeneration });
-  }
-
-  /**
-   * §26.2 — a bootstrap CTO may be promoted only if its session is healthy and was
-   * never used as a blind reviewer for that run. Otherwise a fresh primary CTO is made.
-   */
-  canPromoteBootstrapCto(runId: string): Decision<string> {
-    const bootstrap = this.bindings.active(roleKeyFor(Role.BOOTSTRAP_CTO, { runId }));
-    if (!bootstrap) {
-      return deny(ReasonCode.NOT_FOUND, "run has no bootstrap CTO binding", { runId });
-    }
-    const session = this.sessions.get(bootstrap.sessionId);
-    if (!session || session.lifecycle !== SessionLifecycle.READY) {
-      return deny(
-        ReasonCode.BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION,
-        "bootstrap CTO session is not healthy",
-        { runId, lifecycle: session?.lifecycle ?? "missing" },
-      );
-    }
-    const reviewedThisRun = this.bindings
-      .byRun(runId)
-      .some((b) => b.role === Role.BLIND_REVIEWER && b.sessionId === bootstrap.sessionId);
-    if (reviewedThisRun) {
-      return deny(
-        ReasonCode.BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION,
-        "bootstrap CTO session was used as this run's blind reviewer",
-        { runId, sessionId: bootstrap.sessionId },
-      );
-    }
-    return allow(ReasonCode.OK, bootstrap.sessionId);
+  private servedAsBootstrapCto(runId: string, sessionId: string): boolean {
+    return this.bindings
+      .history(roleKeyFor(Role.BOOTSTRAP_CTO, { runId }))
+      .some((held) => held.boundSessionId === sessionId || held.sessionId === sessionId);
   }
 
   /** Integration §7 Phase J, steps 1–11. Only this result completes the run. */
@@ -272,13 +222,16 @@ export class BootstrapActivation {
       ArtifactKind.BLIND_REVIEW,
     );
 
-    // 6. Primary CTO: promote the bootstrap CTO if eligible, otherwise create fresh.
-    const promotion = this.canPromoteBootstrapCto(input.runId);
+    // 6. Primary CTO: always a fresh session, provisioned only now that the activation target —
+    // the project registered above — is decided (issue #246: no promotion). The bootstrap CTO is
+    // never bound to the project; it is reclaimed when the run ends.
     let primaryCtoBinding: ACPBootstrapActivationResult["primaryCtoBinding"] = null;
     const primaryRoleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
 
     // A retried activation must not try to bind a role that is already bound. The existing
-    // binding *is* the activation fact; re-binding would burn a generation for nothing.
+    // binding *is* the activation fact; re-binding would burn a generation for nothing. The binding
+    // registry never lets a session that served as a bootstrap CTO take this role, so the fact
+    // reported here is read, not assumed.
     const alreadyBound = this.bindings.active(primaryRoleKey);
     if (alreadyBound) {
       await this.cto.ensureBuzz(alreadyBound.sessionId, `primary-cto:${projectId}`);
@@ -286,25 +239,7 @@ export class BootstrapActivation {
         roleKey: primaryRoleKey,
         sessionId: alreadyBound.sessionId,
         bindingGeneration: alreadyBound.bindingGeneration,
-        promotedFromBootstrap: promotion.allowed && promotion.value === alreadyBound.sessionId,
-      };
-    } else if (promotion.allowed) {
-      const bound = this.bindings.bind({
-        roleKey: primaryRoleKey,
-        role: Role.PRIMARY_CTO,
-        sessionId: promotion.value,
-        projectId,
-        mode: "PREFERRED",
-      });
-      if (!bound.allowed) return bound as Decision<ACPBootstrapActivationResult>;
-      // A promoted session becomes the project's authority, so it needs the same route a
-      // freshly provisioned CTO gets.
-      await this.cto.ensureBuzz(bound.value.sessionId, `primary-cto:${projectId}`);
-      primaryCtoBinding = {
-        roleKey: primaryRoleKey,
-        sessionId: bound.value.sessionId,
-        bindingGeneration: bound.value.bindingGeneration,
-        promotedFromBootstrap: true,
+        promotedFromBootstrap: this.servedAsBootstrapCto(input.runId, alreadyBound.sessionId),
       };
     } else {
       const provisioned = await this.cto.ensurePrimaryCto(projectId, input.runId);
@@ -545,7 +480,7 @@ export class BootstrapActivation {
             roleKey: primary.roleKey,
             sessionId: primary.sessionId,
             bindingGeneration: primary.bindingGeneration,
-            promotedFromBootstrap: primary.sessionId === run.ownerSessionId,
+            promotedFromBootstrap: this.servedAsBootstrapCto(input.runId, primary.sessionId),
           }
         : null,
       buzz: { connected: Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },

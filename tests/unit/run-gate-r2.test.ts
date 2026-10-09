@@ -20,7 +20,14 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { VerificationReport } from "../../src/verify/verification-engine.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
-import { TEST_OWNER, bindCeo, bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import {
+  TEST_OWNER,
+  bindCeo,
+  bindWorker,
+  completeBootstrapRunUntilC3,
+  makeHarness,
+  registerFixtureProject,
+} from "../helpers/harness.ts";
 import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
@@ -761,7 +768,18 @@ describe("round-2 run and production-gate regressions", () => {
       rationale: "incomplete activation",
     });
     expect(confirmed.allowed).toBe(false);
-    expect(confirmed.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+    // Issue #246 PR-C: the bootstrap CONFIRM is shut until C3.
+    expect(confirmed.reasonCode).toBe(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
+    // TODO(C3): assert this through `submitCeoDecision` again once C3 reopens the bootstrap CONFIRM;
+    // until then the finalizer the CONFIRM's transaction runs is asked directly.
+    const finalized = completeBootstrapRunUntilC3(harness.cp, {
+      runId: created.value.runId,
+      candidateSnapshotDigest: "sha256:bootstrap",
+      ceoSessionId,
+    });
+    expect(finalized.allowed).toBe(false);
+    expect(finalized.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+    expect(harness.cp.runs.require(created.value.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
   });
 
   it("#146 transactionally rolls back packet artifacts when the READY transition fails", async () => {

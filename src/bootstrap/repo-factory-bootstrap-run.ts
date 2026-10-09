@@ -341,13 +341,36 @@ export class RepoFactoryBootstrapRunner {
   }
 
   /**
-   * The CEO confirm's entry for a PROJECT_BOOTSTRAP run: `produceAndActivate` over the owner's
-   * newest recorded approval of this operation, so a later decline supersedes an earlier approval.
-   * With none recorded it refuses as a missing approval, before any GitHub call. A recorded
-   * receipt is still only a claim here; `admitApproval` re-reads the ingress admission behind it.
-   * `candidateSnapshotDigest` is the CONFIRM's own candidate, carried through unchanged.
+   * The CEO confirm's entry for a PROJECT_BOOTSTRAP run. Until issue #246 slice C3 it refuses every
+   * call `BOOTSTRAP_APPLICATION_NOT_AVAILABLE`, before any approval read, consumption or GitHub
+   * call. What C3 reopens is `produceAndActivateRecordedApproval`: `produceAndActivate` over the
+   * owner's newest recorded approval of this operation, so a later decline supersedes an earlier
+   * approval; with none recorded it refuses as a missing approval, before any GitHub call. A
+   * recorded receipt is still only a claim there; `admitApproval` re-reads the ingress admission
+   * behind it. `candidateSnapshotDigest` is the CONFIRM's own candidate, carried through unchanged.
    */
   async produceAndActivateApproved(
+    runId: string,
+    candidateSnapshotDigest: string,
+  ): Promise<Decision<ACPBootstrapActivationResult>> {
+    // Issue #246 PR-C — the CEO confirm's own door to the GitHub writes stays shut until slice C3's
+    // durable application record exists. ProductionGate's admission refuses a bootstrap CONFIRM
+    // first; this is the second layer, at the one entry a CONFIRM reaches the producer through, so a
+    // caller that skips admission still writes nothing and consumes nothing. C3 removes it.
+    void candidateSnapshotDigest;
+    return deny(
+      ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+      "a PROJECT_BOOTSTRAP confirmation cannot be applied until its durable application record exists",
+      { stage: "precondition", refusal: "BOOTSTRAP_APPLICATION_NOT_AVAILABLE", runId },
+    );
+  }
+
+  /**
+   * The body of `produceAndActivateApproved` once slice C3 reopens it: kept private and called by
+   * nothing in production, so no CONFIRM reaches it until then, and C3 restores the door rather than
+   * rewriting what is behind it.
+   */
+  private async produceAndActivateRecordedApproval(
     runId: string,
     candidateSnapshotDigest: string,
   ): Promise<Decision<ACPBootstrapActivationResult>> {

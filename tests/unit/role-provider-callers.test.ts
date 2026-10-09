@@ -4,6 +4,7 @@ import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { CtoLifecycle } from "../../src/cto/cto-lifecycle.ts";
+import { FIXED_ROLE_RUNTIME } from "../../src/domain/fixed-role-runtime.ts";
 import { ProviderRegistry } from "../../src/runtime/provider.ts";
 import { join } from "node:path";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -12,12 +13,17 @@ import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
 
+const PREFERENCE = { provider: "scripted", model: "scripted-cto", effort: null };
+
 const makeCto = (harness: ReturnType<typeof makeHarness>, providers: ProviderRegistry) => {
   const { cp, root } = harness;
   return new CtoLifecycle(cp.db, cp.clock, cp.audit, cp.projects, cp.sessions, cp.bindings,
-    providers, cp.outbox, cp.runs, { provider: "scripted", model: "scripted-cto", effort: null },
-    join(root, "caller-runtime"));
+    providers, cp.outbox, cp.runs, PREFERENCE, join(root, "caller-runtime"));
 };
+
+/** The primary-CTO spawn request `ensurePrimaryCto` makes, without its canonical guard. */
+const primaryCtoSpawn = (purpose: string) =>
+  ({ role: Role.PRIMARY_CTO, scope: "project-test", purpose, runtime: PREFERENCE });
 
 describe("CTO role caller", () => {
   it.each(["unscoped", "scoped", "mixed"])("spawns and probes through the %s CTO adapter", async (mode) => {
@@ -37,7 +43,7 @@ describe("CTO role caller", () => {
       const probe = vi.spyOn(selected, "probeSession");
       const wrongStart = vi.spyOn(wrong, "startSession");
       const cto = makeCto(harness, providers);
-      const result = await cto["spawn"]("project-test", "caller test");
+      const result = await cto["spawn"](primaryCtoSpawn("caller test"));
       expect(result.allowed).toBe(true);
       expect(start).toHaveBeenCalledOnce();
       expect(probe).toHaveBeenCalledOnce();
@@ -113,13 +119,13 @@ describe("CTO role caller", () => {
       const providers = new ProviderRegistry();
       const cto = makeCto(harness, providers);
       const session = cp.sessions.create({ provider: "scripted", model: "cto", incarnation: "absent#test" });
-      expect(await cto["spawn"]("project-test", "absent")).toMatchObject({ allowed: false, reasonCode: ReasonCode.NOT_FOUND });
+      expect(await cto["spawn"](primaryCtoSpawn("absent"))).toMatchObject({ allowed: false, reasonCode: ReasonCode.NOT_FOUND });
       expect(await cto["probeBoundSession"](session)).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
       const wrong = new TestProductionAdapter(clock);
       providers.registerForRole(wrong, Role.BLIND_REVIEWER);
       const start = vi.spyOn(wrong, "startSession");
       const probe = vi.spyOn(wrong, "probeSession");
-      await expect(cto["spawn"]("project-test", "wrong role")).rejects.toThrow("no adapter registered");
+      await expect(cto["spawn"](primaryCtoSpawn("wrong role"))).rejects.toThrow("no adapter registered");
       await expect(cto["probeBoundSession"](session)).rejects.toThrow("no adapter registered");
       expect(start).not.toHaveBeenCalled();
       expect(probe).not.toHaveBeenCalled();
@@ -135,17 +141,27 @@ describe("continuity role caller", () => {
       const { cp, clock, scripted } = makeHarness();
       try {
         cp.continuity.attach({ readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) } });
-        const selected = new TestProductionAdapter(clock);
-        const wrong = new TestProductionAdapter(clock);
+        // A BOOTSTRAP_CTO or WORKER is constituted only on its fixed runtime, Claude Opus (#246), so
+        // its role-scoped adapters are Claude's; every other role is exercised on the scripted name.
+        const fixed = FIXED_ROLE_RUNTIME[role];
+        const provider = fixed?.provider ?? "scripted";
+        const selected = new TestProductionAdapter(clock, provider);
+        const wrong = new TestProductionAdapter(clock, provider);
         cp.providers.registerForRole(selected, role);
         cp.providers.registerForRole(wrong, role === Role.BLIND_REVIEWER ? Role.PRIMARY_CTO : Role.BLIND_REVIEWER);
         const start = vi.spyOn(selected, "startSession");
         const probe = vi.spyOn(selected, "probeSession");
         const wrongStart = vi.spyOn(wrong, "startSession");
         const sharedStart = vi.spyOn(scripted, "startSession");
-        const result = await cp.continuity["provisionRoutableSession"](role, "scripted", "role test");
+        if (fixed) {
+          const substituted = await cp.continuity["provisionRoutableSession"](role, "scripted", "role test");
+          expect(substituted.reasonCode).toBe(ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED);
+          expect(sharedStart).not.toHaveBeenCalled();
+        }
+        const result = await cp.continuity["provisionRoutableSession"](role, provider, "role test");
         expect(result.allowed).toBe(true);
         expect(start).toHaveBeenCalledOnce();
+        if (fixed) expect(start.mock.calls[0]![0]).toMatchObject({ model: fixed.model });
         expect(probe).toHaveBeenCalledOnce();
         expect(wrongStart).not.toHaveBeenCalled();
         expect(sharedStart).not.toHaveBeenCalled();

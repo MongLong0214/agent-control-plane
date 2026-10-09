@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ArtifactKind, ExecutionMode, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import { ArtifactKind, ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../../src/doctor/repair.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
@@ -16,7 +16,7 @@ import { runSandboxed, sensitiveReadPaths } from "../../src/verify/sandbox.ts";
 import { WorktreeManager } from "../../src/verify/worktree.ts";
 import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
 import type { WorktreeAuthorization } from "../../src/verify/worktree.ts";
-import { fixtureManifest, makeHarness, TEST_OWNER } from "../helpers/harness.ts";
+import { dispatchBootstrapRun, fixtureManifest, makeHarness, TEST_OWNER } from "../helpers/harness.ts";
 import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { stableFixtureExecutable } from "../helpers/stable-fixture-executable.ts";
 
@@ -83,26 +83,21 @@ const temporaryCandidate = async () => {
   const repository = await harness.cp.repositories.registerTemporary(harness.repoPath, created.value.runId);
   if (!repository.allowed) throw new Error(repository.message);
 
-  const owner = harness.cp.sessions.create({ provider: "scripted", model: "temporary-cto" });
-  harness.cp.sessions.transition(owner.sessionId, SessionLifecycle.READY, "test temporary owner");
-  const bound = harness.cp.bootstrap.bindBootstrapCto(created.value.runId, owner.sessionId);
-  if (!bound.allowed) throw new Error(bound.message);
-
-  const dispatched = await harness.cp.runs.dispatch(created.value.runId);
-  if (!dispatched.allowed) throw new Error(dispatched.message);
+  // Dispatch staffs the run's BOOTSTRAP_CTO and pins it as the owner (#246).
+  const dispatched = await dispatchBootstrapRun(harness.cp, harness.clock, created.value.runId);
   const attached = harness.cp.runs.attachRepository(created.value.runId, {
     repositoryId: repository.value.repositoryId,
     repositoryRole: "primary",
     baseBranch: "dev",
-    ownerSessionId: dispatched.value.ownerSessionId!,
-    ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+    ownerSessionId: dispatched.ownerSessionId!,
+    ownerBindingGeneration: dispatched.ownerBindingGeneration!,
   });
   if (!attached.allowed) throw new Error(attached.message);
 
   const frozen = await harness.cp.pipeline.freeze(created.value.runId);
   if (!frozen.allowed) throw new Error(frozen.message);
 
-  return { harness, run: dispatched.value, snapshot: frozen.value };
+  return { harness, run: dispatched, snapshot: frozen.value };
 };
 
 /** Two active runs on different branches of one registered repository. */

@@ -25,7 +25,15 @@ import {
 import { repositoryCheckoutPath } from "../../src/bootstrap/repo-factory-producer.ts";
 import { git } from "../../src/git/git.ts";
 import { cleanupTempDirs, gitSync } from "../helpers/fixtures.ts";
-import { TEST_OWNER, bindCeo, fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
+import {
+  TEST_OWNER,
+  bindCeo,
+  completeBootstrapRunUntilC3,
+  dispatchBootstrapRun,
+  fixtureManifest,
+  makeHarness,
+  type Harness,
+} from "../helpers/harness.ts";
 import { FakeGitHub } from "../helpers/fake-github-write-port.ts";
 import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
@@ -228,12 +236,8 @@ const prepare = async (
   });
   if (!created.allowed) throw new Error(created.message);
   const runId = created.value.runId;
-  const bootstrapCto = harness.cp.sessions.create({ provider: "scripted", model: "bootstrap" });
-  harness.cp.sessions.transition(bootstrapCto.sessionId, SessionLifecycle.READY, "test");
-  const bound = harness.cp.bootstrap.bindBootstrapCto(runId, bootstrapCto.sessionId);
-  if (!bound.allowed) throw new Error(bound.message);
-  const dispatched = await harness.cp.runs.dispatch(runId);
-  if (!dispatched.allowed) throw new Error(dispatched.message);
+  // Dispatch staffs the run's BOOTSTRAP_CTO and pins it as the owner (#246).
+  await dispatchBootstrapRun(harness.cp, harness.clock, runId);
   const snapshotDigest = recordBootstrapBlindReview(harness, runId);
   harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "reviewed");
 
@@ -389,7 +393,8 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     expect((await git(checkout, ["rev-parse", "HEAD"])).stdout.trim()).toBe(remoteHead);
     expect(harness.cp.repositories.byIdentity(IDENTITY)).not.toBeNull();
 
-    // And the CEO confirm completes the run on that activation.
+    // And the CEO confirm completes the run on that activation. Issue #246 PR-C: the bootstrap
+    // CONFIRM is shut until C3, so the gate refuses it and nothing is completed by it.
     const ceoSessionId = bindCeo(harness);
     await harness.cp.continuity.evaluate("bootstrap confirmation");
     const confirmed = harness.cp.ceo.submitCeoDecision({
@@ -399,7 +404,14 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
       ceoSessionId,
       rationale: "activation driven by produced output",
     });
-    if (!confirmed.allowed) throw new Error(`${confirmed.reasonCode}: ${confirmed.message}`);
+    expect(confirmed.reasonCode).toBe(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
+    // TODO(C3): confirm through `submitCeoDecision` again once C3 reopens the bootstrap CONFIRM.
+    const completed = completeBootstrapRunUntilC3(harness.cp, {
+      runId,
+      candidateSnapshotDigest: prepared.snapshotDigest,
+      ceoSessionId,
+    });
+    if (!completed.allowed) throw new Error(`${completed.reasonCode}: ${completed.message}`);
     expect(harness.cp.runs.require(runId).state).toBe(RunState.COMPLETED);
   });
 

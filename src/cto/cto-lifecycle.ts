@@ -115,6 +115,19 @@ export const containedWorkdir = (reported: string | null | undefined, managedRoo
   return reported === managedRoot || isWithin(managedRoot, reported) ? reported : managedRoot;
 };
 
+/** What `CtoLifecycle.spawn` constitutes: the role it serves, its scope, and the runtime it runs. */
+interface SpawnRequest {
+  /** Selects the role-scoped adapter, so the session runs under that role's credential scope. */
+  role: typeof Role.PRIMARY_CTO | typeof Role.BOOTSTRAP_CTO;
+  /** The project a PRIMARY_CTO, or the run a BOOTSTRAP_CTO, is constituted for. */
+  scope: string;
+  purpose: string;
+  runtime: CtoPreference;
+  canonicalGuard?: { roleKey: string; runId: string | undefined };
+  /** Have the provider stop the session on a refusal after it started, not only record it ERROR. */
+  stopOnRefusal?: boolean;
+}
+
 export class CtoLifecycle {
   #buzz: BuzzConnector | null = null;
   #readiness: ReadinessProbe | null = null;
@@ -197,7 +210,13 @@ export class CtoLifecycle {
     // A released canonical role is not given a spawned CTO either; its conversation re-claims it.
     const released = this.#releasedCanonicalHolder(projectId, roleKey);
     if (released) return this.#refuseAdoptedCanonical(released, null, null, runId);
-    const created = await this.spawn(projectId, "primary-cto", { roleKey, runId });
+    const created = await this.spawn({
+      role: Role.PRIMARY_CTO,
+      scope: projectId,
+      purpose: "primary-cto",
+      runtime: this.preference,
+      canonicalGuard: { roleKey, runId },
+    });
     if (!created.allowed) return created as Decision<RoleBinding>;
 
     // A canonical claim that landed after `spawn`'s pre-launch check is refused in the transaction
@@ -318,7 +337,12 @@ export class CtoLifecycle {
       });
     }
 
-    const incoming = await this.spawn(projectId, "primary-cto-replacement");
+    const incoming = await this.spawn({
+      role: Role.PRIMARY_CTO,
+      scope: projectId,
+      purpose: "primary-cto-replacement",
+      runtime: this.preference,
+    });
     if (!incoming.allowed) return incoming as Decision<{ handoffId: string; incomingSessionId: string }>;
 
     const handoffId = `hof_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
@@ -563,7 +587,13 @@ export class CtoLifecycle {
     }
 
     const recovery = this.buildRecoveryPackage(projectId, reason);
-    const incoming = await this.spawn(projectId, "acting-cto-recovery", { roleKey, runId });
+    const incoming = await this.spawn({
+      role: Role.PRIMARY_CTO,
+      scope: projectId,
+      purpose: "acting-cto-recovery",
+      runtime: this.preference,
+      canonicalGuard: { roleKey, runId },
+    });
     if (!incoming.allowed) return incoming as Decision<RoleBinding>;
 
     // #664 — this body's own handoff-record write must not survive a denial, including
@@ -855,29 +885,75 @@ export class CtoLifecycle {
   }
 
   /**
-   * Fresh session → Buzz → doctor readiness. Any failed step stops the activation.
+   * Issue #246 — a run's BOOTSTRAP_CTO, constituted by the same spawn a primary CTO is: launch
+   * credential → Buzz → probe → READY → readiness. It runs on the runtime the caller names, which
+   * bootstrap staffing fixes; nothing here substitutes another provider or model. The session is
+   * returned unbound — the dispatch transaction binds and pins it — and a refusal after the provider
+   * session started stops that session rather than leaving it running.
+   */
+  async spawnBootstrapCto(runId: string, runtime: CtoPreference): Promise<Decision<string>> {
+    return this.spawn({
+      role: Role.BOOTSTRAP_CTO,
+      scope: runId,
+      purpose: "bootstrap-cto",
+      runtime,
+      stopOnRefusal: true,
+    });
+  }
+
+  /**
+   * Provider proof that a READY session this lifecycle constituted for `role` is still the session
+   * the provider has (§14.3). A row that is not READY is refused without asking.
+   */
+  async probeRoleSession(sessionId: string, role: Role): Promise<Decision<void>> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.lifecycle !== SessionLifecycle.READY) {
+      return deny(ReasonCode.SESSION_NOT_READY, "the bound session is not READY", {
+        sessionId,
+        lifecycle: session?.lifecycle ?? null,
+      });
+    }
+    return this.probeBoundSession(session, role);
+  }
+
+  /**
+   * Stops a session this lifecycle constituted for `role`, through the provider's own handle, and
+   * marks it STOPPED. A failed provider stop leaves it ERROR, audited, and is refused.
+   */
+  async stopRoleSession(sessionId: string, role: Role, reason: string): Promise<Decision<void>> {
+    await this.stopUnusedSession(sessionId, reason, role);
+    const lifecycle = this.sessions.get(sessionId)?.lifecycle ?? null;
+    return lifecycle === SessionLifecycle.STOPPED
+      ? allow(ReasonCode.OK, undefined)
+      : deny(ReasonCode.SESSION_STOP_FAILED, "the provider did not stop the session", { sessionId, lifecycle });
+  }
+
+  /**
+   * Fresh session → launch credential → Buzz → probe → READY → doctor readiness, for `role` on
+   * `runtime`. Any failed step stops the activation.
    *
    * `canonicalGuard` names the role a primary-CTO provisioning fills. The caller checked the role's
    * canonical lineage before calling, and the awaits below can let a canonical claim land (and be
-   * released) after that check, so the lineage is read again immediately before the launch.
+   * released) after that check, so the lineage is read again immediately before the launch. A
+   * BOOTSTRAP_CTO is run-scoped work, never a canonical actor, so it carries no guard and its spawn
+   * neither reads nor replaces any canonical CEO or CTO.
    */
-  private async spawn(
-    projectId: string,
-    purpose: string,
-    canonicalGuard?: { roleKey: string; runId: string | undefined },
-  ): Promise<Decision<string>> {
-    const adapter = this.providers.hasRoleScoped(this.preference.provider)
-      ? this.providers.requireForRole(this.preference.provider, Role.PRIMARY_CTO)
-      : this.providers.get(this.preference.provider);
+  private async spawn(request: SpawnRequest): Promise<Decision<string>> {
+    const { role, scope, purpose, runtime, canonicalGuard } = request;
+    const adapter = this.providers.hasRoleScoped(runtime.provider)
+      ? this.providers.requireForRole(runtime.provider, role)
+      : this.providers.get(runtime.provider);
     if (!adapter) {
       return deny(ReasonCode.NOT_FOUND, "no adapter for the preferred CTO provider", {
-        provider: this.preference.provider,
+        provider: runtime.provider,
+        role,
       });
     }
     const health = await adapter.probeRuntime();
     if (health === "UNAVAILABLE") {
       return deny(ReasonCode.CAPACITY_ADMISSION_SUSPENDED, "CTO provider runtime is unavailable", {
-        provider: this.preference.provider,
+        provider: runtime.provider,
+        role,
       });
     }
 
@@ -890,31 +966,57 @@ export class CtoLifecycle {
     }
 
     if (canonicalGuard) {
-      const claimed = this.#releasedCanonicalHolder(projectId, canonicalGuard.roleKey);
+      const claimed = this.#releasedCanonicalHolder(scope, canonicalGuard.roleKey);
       if (claimed) return this.#refuseAdoptedCanonical<string>(claimed, null, null, canonicalGuard.runId);
     }
     const handle = await adapter.startSession({
-      model: this.preference.model,
-      effort: this.preference.effort,
+      model: runtime.model,
+      effort: runtime.effort,
       workdir: this.managedRuntimeRoot,
       purpose,
     });
     // Recorded with its native start pinned beside the lstart, read as one snapshot of one process
     // (ACP1045-R2-01, R3-01); see `SessionRegistry.createWithPinnedStart`.
-    const session = this.sessions.createWithPinnedStart({
-      provider: adapter.provider,
-      model: this.preference.model,
-      effort: this.preference.effort,
-      sessionId: `ses_cto_${handle.externalSessionId.replace(/-/g, "").slice(0, 20)}`,
-      incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
-      osPid: handle.pid,
-      // The adapter's answer is accepted only if it is inside the root this daemon manages.
-      // `sessions_workdir_immutable` is BEFORE UPDATE, so whatever is written here becomes a
-      // permanent routing fact — an adapter that echoes its own cwd would pin the session to
-      // it forever. The shipped adapters echo `spec.workdir`; that is caller courtesy, and
-      // this is the check that does not depend on it.
-      workdir: containedWorkdir(handle.workdir, this.managedRuntimeRoot),
-    });
+    let session: ReturnType<SessionRegistry["createWithPinnedStart"]>;
+    try {
+      session = this.sessions.createWithPinnedStart({
+        provider: adapter.provider,
+        model: runtime.model,
+        effort: runtime.effort,
+        sessionId: `ses_cto_${handle.externalSessionId.replace(/-/g, "").slice(0, 20)}`,
+        incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
+        osPid: handle.pid,
+        // The adapter's answer is accepted only if it is inside the root this daemon manages.
+        // `sessions_workdir_immutable` is BEFORE UPDATE, so whatever is written here becomes a
+        // permanent routing fact — an adapter that echoes its own cwd would pin the session to
+        // it forever. The shipped adapters echo `spec.workdir`; that is caller courtesy, and
+        // this is the check that does not depend on it.
+        workdir: containedWorkdir(handle.workdir, this.managedRuntimeRoot),
+      });
+    } catch (error) {
+      if (request.stopOnRefusal) await adapter.stopSession(handle).catch(() => undefined);
+      throw error;
+    }
+    // A refusal from here on has a provider session behind it. Every role records it ERROR; a role
+    // that asked for it (a run's bootstrap CTO) also has the provider stop it, so no refused spawn
+    // is left running.
+    const refuse = async <T>(reason: string, refused: Decision<T>): Promise<Decision<T>> => {
+      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, reason);
+      if (request.stopOnRefusal) {
+        try {
+          await adapter.stopSession(handle);
+          this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, `${reason}: stopped`);
+        } catch (error) {
+          this.audit.record({
+            kind: "CTO_UNUSED_SESSION_STOP_FAILED",
+            reasonCode: ReasonCode.SESSION_STOP_FAILED,
+            sessionId: session.sessionId,
+            evidence: { reason, role, error: error instanceof Error ? error.message : String(error) },
+          });
+        }
+      }
+      return refused;
+    };
 
     // `SessionRegistry.create` is intentionally the only issuer of the plaintext secret.
     // The normal daemon attaches a one-time local launch channel, so a freshly spawned
@@ -924,12 +1026,11 @@ export class CtoLifecycle {
     // weaker delivery path here.
     if (this.#sessionLaunch) {
       if (!session.sessionSecret) {
-        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "session secret storage unavailable");
-        return deny(
+        return refuse("session secret storage unavailable", deny<string>(
           ReasonCode.SESSION_SECRET_STORAGE_UNAVAILABLE,
           "a spawned CTO cannot receive its session credential because secret storage is unavailable",
           { sessionId: session.sessionId },
-        );
+        ));
       }
       const provisioned = await this.#sessionLaunch.provision({
         sessionId: session.sessionId,
@@ -938,16 +1039,14 @@ export class CtoLifecycle {
         sessionSecret: session.sessionSecret,
       });
       if (!provisioned.allowed) {
-        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "session launch credential provisioning failed");
-        return provisioned as Decision<string>;
+        return refuse("session launch credential provisioning failed", provisioned as Decision<string>);
       }
     }
 
     if (this.#buzz) {
-      const connected = await this.#buzz.connect(session.sessionId, `${purpose}:${projectId}`);
+      const connected = await this.#buzz.connect(session.sessionId, `${purpose}:${scope}`);
       if (!connected.allowed) {
-        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "buzz connect failed");
-        return connected as Decision<string>;
+        return refuse("buzz connect failed", connected as Decision<string>);
       }
       this.sessions.setBuzzAddress(session.sessionId, connected.value);
     }
@@ -957,8 +1056,7 @@ export class CtoLifecycle {
     // session READY, or the CTO role is handed to a runtime nobody has spoken to.
     const live = await probeSessionHealth(adapter, handle);
     if (!live.allowed) {
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe failed");
-      return live as Decision<string>;
+      return refuse("provider session probe failed", live as Decision<string>);
     }
 
     this.sessions.transition(session.sessionId, SessionLifecycle.READY, "provider session verified");
@@ -966,8 +1064,7 @@ export class CtoLifecycle {
     if (this.#readiness) {
       const ready = await this.#readiness.checkSession(session.sessionId);
       if (!ready.allowed) {
-        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "readiness failed");
-        return ready as Decision<string>;
+        return refuse("readiness failed", ready as Decision<string>);
       }
     }
 
@@ -979,9 +1076,9 @@ export class CtoLifecycle {
    * the session the provider has. The handle is reconstructed from the session record, so
    * the probe addresses the provider's own id rather than the control plane's alias.
    */
-  private async probeBoundSession(session: SessionRecord): Promise<Decision<void>> {
+  private async probeBoundSession(session: SessionRecord, role: Role = Role.PRIMARY_CTO): Promise<Decision<void>> {
     const adapter = this.providers.hasRoleScoped(session.provider)
-      ? this.providers.requireForRole(session.provider, Role.PRIMARY_CTO)
+      ? this.providers.requireForRole(session.provider, role)
       : this.providers.get(session.provider);
     if (!adapter) {
       return deny(ReasonCode.SESSION_NOT_READY, "no adapter can prove the bound CTO session is live", {
@@ -1122,16 +1219,16 @@ export class CtoLifecycle {
    * while the row said STOPPED. `handleFor` rebuilds the provider id from the incarnation, as the
    * bound-session probe already does.
    */
-  private async stopProviderSession(session: SessionRecord): Promise<void> {
-    await this.providers.requireForRole(session.provider, Role.PRIMARY_CTO).stopSession(handleFor(session));
+  private async stopProviderSession(session: SessionRecord, role: Role = Role.PRIMARY_CTO): Promise<void> {
+    await this.providers.requireForRole(session.provider, role).stopSession(handleFor(session));
   }
 
   /** A replacement that never became authoritative must not remain a live orphan. */
-  private async stopUnusedSession(sessionId: string, reason: string): Promise<void> {
+  private async stopUnusedSession(sessionId: string, reason: string, role: Role = Role.PRIMARY_CTO): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session || session.lifecycle === SessionLifecycle.STOPPED) return;
     try {
-      await this.stopProviderSession(session);
+      await this.stopProviderSession(session, role);
       this.sessions.transition(sessionId, SessionLifecycle.STOPPED, reason);
     } catch (error) {
       this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);

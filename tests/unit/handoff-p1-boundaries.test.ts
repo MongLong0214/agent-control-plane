@@ -13,11 +13,12 @@ import {
 import { databaseSidecarPaths } from "../../src/db/state-preflight.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ExecutionMode, RunKind, SessionLifecycle } from "../../src/domain/types.ts";
+import { ExecutionMode, RunKind } from "../../src/domain/types.ts";
 import * as sandbox from "../../src/verify/sandbox.ts";
 import { runSandboxed } from "../../src/verify/sandbox.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
+import { dispatchBootstrapRun } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -272,19 +273,14 @@ describe("handoff P1 child boundaries", () => {
       if (!created.allowed) throw new Error(created.message);
       const registered = await controlPlane.repositories.registerTemporary(repository, created.value.runId);
       if (!registered.allowed) throw new Error(registered.message);
-      const owner = controlPlane.sessions.create({ provider: "scripted", model: "handoff-p1-15-owner" });
-      const ready = controlPlane.sessions.transition(owner.sessionId, SessionLifecycle.READY, "handoff test owner");
-      if (!ready.allowed) throw new Error(ready.message);
-      const bound = controlPlane.bootstrap.bindBootstrapCto(created.value.runId, owner.sessionId);
-      if (!bound.allowed) throw new Error(bound.message);
-      const dispatched = await controlPlane.runs.dispatch(created.value.runId);
-      if (!dispatched.allowed) throw new Error(dispatched.message);
+      // Dispatch staffs the run's BOOTSTRAP_CTO and pins it as the owner (#246).
+      const dispatched = await dispatchBootstrapRun(controlPlane, clock, created.value.runId);
       const attached = controlPlane.runs.attachRepository(created.value.runId, {
         repositoryId: registered.value.repositoryId,
         repositoryRole: "primary",
         baseBranch: "dev",
-        ownerSessionId: dispatched.value.ownerSessionId!,
-        ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+        ownerSessionId: dispatched.ownerSessionId!,
+        ownerBindingGeneration: dispatched.ownerBindingGeneration!,
       });
       if (!attached.allowed) throw new Error(attached.message);
       const frozen = await controlPlane.pipeline.freeze(created.value.runId);

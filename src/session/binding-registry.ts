@@ -123,6 +123,13 @@ export interface BindInput {
   restoreCeo?: { actorId: string; generation: number; sessionId: string; incarnation: string };
 }
 
+/**
+ * Roles that hold their session alone; see `assertExclusiveRoleSeparation`. A WORKER (#512) and a
+ * run's BOOTSTRAP_CTO (#246) are each constituted on a session of their own and share it with no
+ * other role, whichever is bound first.
+ */
+export const EXCLUSIVE_ROLES: readonly Role[] = Object.freeze([Role.WORKER, Role.BOOTSTRAP_CTO]);
+
 const LIVE_RUN_STATES = [
   "QUEUED",
   "ACTIVE",
@@ -263,7 +270,7 @@ export class BindingRegistry {
         : this.actorOwning(claimedTarget);
       if (!reused.allowed) return reused as Decision<RoleBinding>;
       // A reused actor's runtime pointer moves to this session below, carrying every role it holds.
-      const separated = this.assertWorkerSeparation(input, roleKey, reused.value);
+      const separated = this.assertExclusiveRoleSeparation(input, roleKey, reused.value);
       if (!separated.allowed) return separated as Decision<RoleBinding>;
       // Plan a new id before verification so target authentication is the last pre-write step.
       const freshCandidate = `actor:${newAssignmentId()}`;
@@ -509,7 +516,7 @@ export class BindingRegistry {
           [current.assignmentId],
         )?.actor_id ?? null
         : null;
-      const separated = this.assertWorkerSeparation(input, roleKey, movedActor);
+      const separated = this.assertExclusiveRoleSeparation(input, roleKey, movedActor);
       if (!separated.allowed) return separated as Decision<RoleBinding>;
 
       // #493 — the counterpart survived, so only its runtime moves. The binding is not
@@ -1027,57 +1034,128 @@ export class BindingRegistry {
   }
 
   /**
-   * #512 — a WORKER is an implementer, never the session that routes or reviews it, whichever of
-   * the two is bound first.
+   * #512, #246 — a session holding an exclusive role holds nothing else, whichever is bound first.
    *
-   * Refused when, after this write, the incoming session would carry both an active WORKER and an
-   * active role of any other kind — counting an assignment by its recorded session or by its
-   * actor's live runtime — or when a WORKER would land on the owner of its task's run.
-   * `movedActorId` is an existing actor whose runtime pointer the write moves to the incoming
-   * session (a reused actor in `bind`, a surviving conversation in `switchTo`); every role that
-   * actor holds lands there too, so it is counted with the incoming role.
+   * A WORKER is an implementer, never the session that routes or reviews it. A BOOTSTRAP_CTO is one
+   * run's technical owner (RF PRD:156): never promoted into a project's PRIMARY_CTO (activation
+   * provisions a fresh one), never a reviewer or the CEO, and never a second run's bootstrap CTO, so
+   * two runs get two sessions. Two WORKER keys may still share a session, as they could before:
+   * that is one implementer carrying two tasks, not the routing/implementing split this guards.
    *
-   * A backstop under the worker provisioning path, which only ever binds a session it has just
-   * constituted. It does not depend on that caller: every `bind` and `switchTo` asks it.
+   * Refused when, after this write, the incoming session would carry an exclusive role and any other
+   * active role key — counting an assignment by its recorded session or by its actor's live runtime
+   * — or when an exclusive role would land on the owner of a run it does not belong to.
+   * `movedActorId` is an existing actor whose runtime pointer the write moves to the incoming session
+   * (a reused actor in `bind`, a surviving conversation in `switchTo`); every role that actor holds
+   * lands there too, so it is counted with the incoming role.
+   *
+   * A backstop under the worker and bootstrap-CTO provisioning paths, which only ever bind a session
+   * they have just constituted. It does not depend on those callers: every `bind` and `switchTo`
+   * asks it.
    */
-  private assertWorkerSeparation(input: BindInput, roleKey: string, movedActorId: string | null): Decision<void> {
+  private assertExclusiveRoleSeparation(
+    input: BindInput,
+    roleKey: string,
+    movedActorId: string | null,
+  ): Decision<void> {
     const moved = movedActorId === null ? [] : this.db.all<{ role_key: string; role: Role }>(
       `SELECT role_key, role FROM assignments WHERE actor_id = ? AND status = 'ACTIVE' ORDER BY role_key`,
       [movedActorId],
     );
-    const resident = this.db.all<{ role_key: string; role: Role }>(
-      `SELECT a.role_key, a.role
+    // What the session holds now, and — in the same read — every BOOTSTRAP_CTO it ever held, which
+    // the no-promotion rule below needs. One scan, because this runs on every bind and switch.
+    const heldOrServed = this.db.all<{ role_key: string; role: Role; status: "ACTIVE" | "REVOKED" }>(
+      `SELECT a.role_key, a.role, a.status
          FROM assignments a
          LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
-        WHERE a.status = 'ACTIVE'
+        WHERE (a.status = 'ACTIVE' OR a.role = 'BOOTSTRAP_CTO')
           AND (a.session_id = ? OR c.current_session_id = ?)
         ORDER BY a.role_key`,
       [input.sessionId, input.sessionId],
     );
-    const together = [{ role_key: roleKey, role: input.role }, ...moved, ...resident];
-    const worker = together.find((held) => held.role === Role.WORKER);
-    const other = together.find((held) => held.role !== Role.WORKER);
-    if (worker && other) {
-      return deny(
-        ReasonCode.WORKER_SESSION_NOT_INDEPENDENT,
-        "a worker must not share a session with another role",
-        { sessionId: input.sessionId, roleKey: other.role_key, role: other.role, workerRoleKey: worker.role_key },
+    const resident = heldOrServed.filter((held) => held.status === "ACTIVE");
+    // One entry per role key: a surviving move carries the incoming key itself among the actor's.
+    const together = [
+      ...new Map(
+        [{ role_key: roleKey, role: input.role }, ...moved, ...resident].map((held) => [held.role_key, held]),
+      ).values(),
+    ];
+    for (const exclusive of together.filter((held) => EXCLUSIVE_ROLES.includes(held.role))) {
+      const other = together.find(
+        (held) =>
+          held.role_key !== exclusive.role_key &&
+          !(held.role === Role.WORKER && exclusive.role === Role.WORKER),
       );
+      if (!other) continue;
+      const worker = [exclusive, other].find((held) => held.role === Role.WORKER);
+      return worker
+        ? deny(
+            ReasonCode.WORKER_SESSION_NOT_INDEPENDENT,
+            "a worker must not share a session with another role",
+            {
+              sessionId: input.sessionId,
+              roleKey: (worker === exclusive ? other : exclusive).role_key,
+              role: (worker === exclusive ? other : exclusive).role,
+              workerRoleKey: worker.role_key,
+            },
+          )
+        : deny(
+            ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT,
+            "a bootstrap CTO must not share a session with another role",
+            { sessionId: input.sessionId, roleKey: other.role_key, role: other.role, bootstrapCtoRoleKey: exclusive.role_key },
+          );
     }
-    if (input.role !== Role.WORKER) return allow(ReasonCode.OK, undefined);
-    const owned = this.db.get<{ run_id: string }>(
-      `SELECT run_id FROM runs
-        WHERE owner_session_id = ?
-          AND (run_id = ? OR run_id = (SELECT run_id FROM tasks WHERE task_id = ?))
-        LIMIT 1`,
-      [input.sessionId, input.runId ?? null, input.taskId ?? null],
-    );
-    if (owned) {
-      return deny(
-        ReasonCode.WORKER_SESSION_NOT_INDEPENDENT,
-        "a worker session must not be the owner of the task's run",
-        { sessionId: input.sessionId, runId: owned.run_id },
+    if (input.role === Role.WORKER) {
+      const owned = this.db.get<{ run_id: string }>(
+        `SELECT run_id FROM runs
+          WHERE owner_session_id = ?
+            AND (run_id = ? OR run_id = (SELECT run_id FROM tasks WHERE task_id = ?))
+          LIMIT 1`,
+        [input.sessionId, input.runId ?? null, input.taskId ?? null],
       );
+      if (owned) {
+        return deny(
+          ReasonCode.WORKER_SESSION_NOT_INDEPENDENT,
+          "a worker session must not be the owner of the task's run",
+          { sessionId: input.sessionId, runId: owned.run_id },
+        );
+      }
+    }
+    // No promotion, even after the run ends: a session that served as a run's bootstrap CTO, its
+    // binding since revoked, is never given another role. Its own key may still be switched by
+    // continuity, which is the same role on the same run.
+    const servedBootstrap = heldOrServed.find(
+      (held) => held.role === Role.BOOTSTRAP_CTO && held.role_key !== roleKey,
+    );
+    if (servedBootstrap) {
+      // Another run's bootstrap CTO on it would be one session for two runs; any other role is a
+      // promotion, which #246 removed.
+      return input.role === Role.BOOTSTRAP_CTO
+        ? deny(
+            ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT,
+            "a session that served one run's bootstrap CTO is not another run's",
+            { sessionId: input.sessionId, roleKey, bootstrapCtoRoleKey: servedBootstrap.role_key },
+          )
+        : deny(
+            ReasonCode.BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION,
+            "a session that served as a run's bootstrap CTO is never given another role",
+            { sessionId: input.sessionId, roleKey, role: input.role, bootstrapCtoRoleKey: servedBootstrap.role_key },
+          );
+    }
+    if (input.role === Role.BOOTSTRAP_CTO) {
+      // A pin outlives its binding, so a session that owns any other run, live or ended, is that
+      // run's former authority and not a fresh bootstrap CTO.
+      const owned = this.db.get<{ run_id: string }>(
+        `SELECT run_id FROM runs WHERE owner_session_id = ? AND run_id <> ? LIMIT 1`,
+        [input.sessionId, input.runId ?? ""],
+      );
+      if (owned) {
+        return deny(
+          ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT,
+          "a bootstrap CTO session must not be the owner of another run",
+          { sessionId: input.sessionId, runId: owned.run_id, bootstrapRunId: input.runId ?? null },
+        );
+      }
     }
     return allow(ReasonCode.OK, undefined);
   }

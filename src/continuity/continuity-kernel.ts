@@ -15,6 +15,7 @@ import {
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
+import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
@@ -323,7 +324,13 @@ export class ContinuityKernel {
     // Preserve the capability needed by already-running work before reserving a fresh
     // session for a role that is merely expected to become active later.
     for (const role of [...requiredRoles].sort((left, right) => Number(right.inFlight) - Number(left.inFlight))) {
-      const preferred = candidatesFor(role.capability);
+      // #246 — a role with a fixed runtime (a BOOTSTRAP_CTO, a WORKER: Claude Opus) has one
+      // candidate, its own provider. When that provider cannot cover it the role is uncovered and
+      // the daemon pauses its run; it is never planned onto another provider.
+      const fixed = FIXED_ROLE_RUNTIME[role.role];
+      const preferred = fixed
+        ? [fixed.provider].filter((p) => byProvider.has(p) || registered.includes(p))
+        : candidatesFor(role.capability);
       const taken = usedByGroup.get(role.isolationGroup) ?? new Set<string>();
 
       const routable = (provider: string): boolean => {
@@ -537,16 +544,23 @@ export class ContinuityKernel {
     // replacement must take the dedicated provider-switch trigger and re-admit its exact
     // capability immediately before `startSession` (§14.2). Worker failover remains a
     // lower-priority allocation and therefore carries the same dynamic reserve as fan-out.
+    //
+    // #246 — a role with a fixed runtime is admitted against its own role-scoped reading, the one it
+    // was staffed under, so a Claude-to-Claude failover can be admitted at all; every other role
+    // keeps the provider-level admission it had.
+    const fixedRole = FIXED_ROLE_RUNTIME[role] && this.providers.hasRoleScoped(assignment.provider) ? role : undefined;
     const switchTarget: DispatchCapacityTarget =
       required.capability === "worker"
         ? {
             provider: assignment.provider,
+            ...(fixedRole ? { role: fixedRole } : {}),
             capabilities: [required.capability],
             priority: "worker",
-            reserveDemand: this.capacity.workerReserveDemand(assignment.provider),
+            reserveDemand: this.capacity.workerReserveDemand(assignment.provider, fixedRole),
           }
         : {
             provider: assignment.provider,
+            ...(fixedRole ? { role: fixedRole } : {}),
             capabilities: [required.capability],
             priority: "critical",
           };
@@ -1059,6 +1073,17 @@ export class ContinuityKernel {
     provider: string,
     purpose: string,
   ): Promise<Decision<{ sessionId: string }>> {
+    // #246 — a role with a fixed runtime is constituted on exactly that provider and model, at
+    // failover and at restoration alike. The plan never names another provider for it; this
+    // refuses one that reached here anyway, before anything is started.
+    const fixed = FIXED_ROLE_RUNTIME[role];
+    if (fixed && provider !== fixed.provider) {
+      return deny(
+        ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
+        "this role runs on a fixed provider and model; continuity does not move it to another",
+        { role, provider, fixedProvider: fixed.provider, fixedModel: fixed.model },
+      );
+    }
     const adapter = this.providers.requireForRole(provider, role);
     if (!adapter.isProduction) {
       return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "non-production adapter cannot provide continuity", {
@@ -1074,7 +1099,9 @@ export class ContinuityKernel {
         { provider, hasBuzz: Boolean(buzz), hasReadiness: Boolean(readiness) },
       );
     }
-    const model = adapter.defaultModels[
+    // A fixed role's model is its own, never the adapter's default: Claude's default worker model
+    // is Sonnet, and a Claude-to-Claude WORKER failover would otherwise come back on it.
+    const model = fixed?.model ?? adapter.defaultModels[
       role === Role.BLIND_REVIEWER ? "reviewer" : role === Role.CEO ? "ceo" : role === Role.WORKER ? "worker" : "cto"
     ] ?? "default";
     let handle;

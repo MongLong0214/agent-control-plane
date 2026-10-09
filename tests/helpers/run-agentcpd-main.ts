@@ -397,18 +397,15 @@ try {
         });
         if (!created.allowed) throw new Error(created.message);
         const runId = created.value.runId;
-        const bootstrapSession = context.cp.sessions.create({
-          provider: "claude",
-          model: "startup-test-bootstrap-cto",
+        // Dispatch staffs the run's BOOTSTRAP_CTO on the Claude adapter and pins it (#246). A CTO
+        // is constituted only with a Buzz route, and this startup scenario runs with no Buzz
+        // binary; the flow under test is Telegram's, so the CTO lifecycle gets an in-process route.
+        context.cp.cto.attach({
+          buzz: {
+            connect: async (sessionId) => allow(ReasonCode.OK, `startup-test-room:${sessionId}`),
+            disconnect: async () => undefined,
+          },
         });
-        const bootstrapReady = context.cp.sessions.transition(
-          bootstrapSession.sessionId,
-          SessionLifecycle.READY,
-          "startup prompt-flow test",
-        );
-        if (!bootstrapReady.allowed) throw new Error(bootstrapReady.message);
-        const bootstrapBinding = context.cp.bootstrap.bindBootstrapCto(runId, bootstrapSession.sessionId);
-        if (!bootstrapBinding.allowed) throw new Error(bootstrapBinding.message);
         const dispatched = await context.cp.runs.dispatch(runId);
         if (!dispatched.allowed) throw new Error(`${dispatched.reasonCode}: ${dispatched.message}`);
         const candidateSnapshotDigest = digestOf({ runId, candidate: "startup-owner-prompt" });
