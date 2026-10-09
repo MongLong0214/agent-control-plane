@@ -2931,11 +2931,16 @@ export class Daemon {
     this.uninstallContinuityCoordinator();
     // Only its own: a successor that registered after this daemon keeps its supplier.
     this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
+    // ACP-WORKER-03 — and a worker git child it could not confirm stopped (SIGKILL sent, exit never
+    // observed within the bound) keeps the lock: no successor takes authority while a git child of this
+    // daemon may still move a ref or rewrite an index. It stays held until this process exits, when the
+    // lock's own staleness rule (a dead holder pid) frees it.
+    const lockRetained = !workers.gitStopped;
     this.cp.audit.record({
       kind: "DAEMON_STOPPED",
-      evidence: { pid: process.pid, drained: workers.drained, executions: workers.outstanding },
+      evidence: { pid: process.pid, drained: workers.drained, executions: workers.outstanding, gitStopped: workers.gitStopped, lockRetained },
     });
-    this.lock.release();
+    if (!lockRetained) this.lock.release();
   }
 }
 

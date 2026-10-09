@@ -10,7 +10,8 @@ import { type FailureClass, Role, SessionLifecycle, TaskState, roleKeyFor } from
 import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
-import { rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
 import {
   type PinnedRepository,
@@ -25,7 +26,9 @@ import {
   parentOf,
   pinRepository,
   plumbingWorkerCommit,
+  type GitChildrenClosed,
   indexSnapshot,
+  runPinnedGit,
   scanAgainst,
   stagedAgainst,
   stagedContent,
@@ -63,6 +66,8 @@ export const WORKER_TURN_MODEL = "opus";
 const DEFAULT_POLL_MS = 1_000;
 const DEFAULT_PROCESS_SETTLE_MS = 2_000;
 const DEFAULT_SHUTDOWN_BUDGET_MS = 15_000;
+/** How long a stopping daemon waits, after SIGKILL, to see each worker git child's exit (ACP-WORKER-03). */
+const GIT_REAP_BOUND_MS = 5_000;
 
 /** Audit kinds this runner writes; `describe` reads them back. */
 export const WorkerTurnEvent = {
@@ -74,6 +79,8 @@ export const WorkerTurnEvent = {
   ORPHAN_GONE: "TASK_WORKER_ORPHAN_GONE",
   ORPHAN_UNIDENTIFIED: "TASK_WORKER_ORPHAN_UNIDENTIFIED",
   SHUTDOWN_DRAINED: "TASK_WORKER_TURNS_DRAINED",
+  /** A stopping daemon stopped a turn's git and recorded what the repository shows (ACP-WORKER-03). */
+  GIT_STOPPED: "TASK_WORKER_TURN_GIT_STOPPED",
 } as const;
 
 export interface WorkerTurnRequest {
@@ -481,7 +488,9 @@ export class WorkerTurnRunner {
    * the budget, and ends ABANDONED. A process that could not be confirmed gone stays recorded as
    * outstanding — durably, so the next start reconciles it and no retry of its task runs before.
    */
-  async shutdown(budgetMs = DEFAULT_SHUTDOWN_BUDGET_MS): Promise<{ drained: boolean; outstanding: string[] }> {
+  async shutdown(
+    budgetMs = DEFAULT_SHUTDOWN_BUDGET_MS,
+  ): Promise<{ drained: boolean; outstanding: string[]; gitStopped: boolean }> {
     this.#stopping = true;
     // An admission that sees `#stopping` refuses before it opens an execution or registers a turn, so
     // every turn that will ever exist is already in `#turns`; the admissions are waited for too.
@@ -499,19 +508,40 @@ export class WorkerTurnRunner {
       }),
     ]);
     if (timer) clearTimeout(timer);
-    // ACP-WORKER-03: a turn the drain did not finish is ended here, durably, before the daemon gives up
-    // its authority — its execution ABANDONED in the database. A late resume then finds nothing RUNNING
-    // to commit for or succeed (the live fence reads that row), in this process or in any successor.
-    // `#stopping` is never cleared, so the in-process half of the fence holds as well.
+    // ACP-WORKER-03: a turn the drain did not finish is stopped here, before the daemon gives up its
+    // authority. First its git: every git child still running against its repository — an update-ref,
+    // the index update after it, an object write — is killed with its process group and its exit
+    // observed, and the repository is closed, so no git command starts and no index is published for
+    // that turn again. Then what the repository shows is recorded: whether the branch moved. Then the
+    // execution is ended ABANDONED in the database, so a late resume finds nothing RUNNING to commit for
+    // or succeed, in this process or in any successor. `#stopping` is never cleared.
     const fenced: string[] = [];
+    let gitStopped = true;
     for (const turn of turns) {
-      if (turn.settled || !this.isRunning(turn.executionId)) continue;
-      this.fail(turn.facts, turn.executionId, "ABANDONED", "infrastructure", {
-        reason: "DAEMON_STOPPED_UNDRAINED",
-        reasonCode: ReasonCode.INTERNAL_ERROR,
-        detail: "the daemon's drain timed out on this turn; it was ended before the daemon released its authority",
+      if (turn.settled) continue;
+      if (this.isRunning(turn.executionId)) {
+        this.fail(turn.facts, turn.executionId, "ABANDONED", "infrastructure", {
+          reason: "DAEMON_STOPPED_UNDRAINED",
+          reasonCode: ReasonCode.INTERNAL_ERROR,
+          detail: "the daemon's drain timed out on this turn; it was ended, and its git stopped, before the daemon released its authority",
+        });
+        fenced.push(turn.executionId);
+      }
+      const closed = await turn.facts.repo.children.close(GIT_REAP_BOUND_MS);
+      if (!closed.reaped) gitStopped = false;
+      this.ports.audit.record({
+        kind: WorkerTurnEvent.GIT_STOPPED,
+        runId: turn.facts.runId,
+        sessionId: turn.facts.worker.sessionId,
+        roleKey: turn.facts.worker.roleKey,
+        reasonCode: closed.reaped ? ReasonCode.OK : ReasonCode.INTERNAL_ERROR,
+        evidence: {
+          executionId: turn.executionId,
+          taskId: turn.facts.taskId,
+          reason: closed.reaped ? "GIT_STOPPED_AT_SHUTDOWN" : "GIT_NOT_CONFIRMED_STOPPED",
+          ...(await this.repositoryAtStop(turn.facts, closed)),
+        } as Evidence,
       });
-      fenced.push(turn.executionId);
     }
     const outstanding = this.ports.db
       .all<{ execution_id: string }>(
@@ -524,9 +554,32 @@ export class WorkerTurnRunner {
     const drained = finished && pendingStarts === 0 && this.#turns.size === 0;
     this.ports.audit.record({
       kind: WorkerTurnEvent.SHUTDOWN_DRAINED,
-      evidence: { drained, turns: turns.length, admissions: admissions.length, pendingStarts, fenced, executions: outstanding },
+      evidence: { drained, turns: turns.length, admissions: admissions.length, pendingStarts, fenced, gitStopped, executions: outstanding },
     });
-    return { drained: drained && outstanding.length === 0, outstanding };
+    return { drained: drained && outstanding.length === 0 && gitStopped, outstanding, gitStopped };
+  }
+
+  /**
+   * What a turn's repository shows once its git children are stopped: whether the branch moved off the
+   * turn's base, and whether a ref or index lock was left behind. Read by the stopping daemon itself;
+   * the worktree's bytes are not touched.
+   */
+  private async repositoryAtStop(facts: TurnFacts, closed: GitChildrenClosed): Promise<Record<string, unknown>> {
+    const branch = await runPinnedGit(facts.repo, ["rev-parse", "--verify", "-q", `refs/heads/${facts.claim.branch}`], {
+      afterClose: true,
+    });
+    const head = branch.exitCode === 0 ? branch.stdout.trim() : null;
+    return {
+      refMoved: head === null ? null : head !== facts.baseHead,
+      headAtStop: head,
+      baseHead: facts.baseHead,
+      branchLockLeft: existsSync(join(facts.repo.commonDir, "refs", "heads", `${facts.claim.branch}.lock`)),
+      indexLockLeft: existsSync(join(facts.repo.gitDir, "index.lock")),
+      indexLockReleasedByStop: closed.indexLockReleased,
+      gitChildrenKilled: closed.killed.length,
+      gitChildrenReaped: closed.reaped,
+      gitChildrenUnreaped: closed.unreaped,
+    };
   }
 
   /** Read-only: an execution's state, with diagnostics kept apart from the success digest. */

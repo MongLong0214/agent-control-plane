@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -82,7 +82,99 @@ export interface PinnedRepository {
   readonly dotGit: string;
   /** Private: temporary indexes and an empty HOME. Never inside the work tree. */
   readonly scratch: string;
+  /** Every git child running against this repository for the turn, and whether more may start. */
+  readonly children: GitChildren;
 }
+
+/** What closing a repository's git children observed. */
+export interface GitChildrenClosed {
+  /** Every child was seen to exit and its process group is gone. */
+  reaped: boolean;
+  killed: number[];
+  unreaped: number[];
+  /** The real index's lock the commit held, removed here because the commit can no longer. */
+  indexLockReleased: boolean;
+}
+
+/**
+ * The git children a turn has running against its repository (#1070 ACP-WORKER-03).
+ *
+ * Each child is spawned as its own process group, so it can be stopped whole. Closing the registry
+ * stops every child still running — SIGKILL to its group — and waits, bounded, until each one's exit
+ * has actually been observed and its group is gone; from then on no git command starts against the
+ * repository and the commit publishes nothing. A daemon closes the registries of the turns its drain
+ * did not finish before it gives up its authority, so no git child of a stopped daemon can move a ref
+ * or rewrite the index under a successor.
+ */
+export class GitChildren {
+  #closed = false;
+  readonly #live = new Map<number, { child: ChildProcess; exited: () => boolean }>();
+  #heldIndexLock: string | null = null;
+
+  get closed(): boolean {
+    return this.#closed;
+  }
+
+  /** Records a child the moment it is spawned; it leaves the registry when its exit is observed. */
+  track(child: ChildProcess): void {
+    const pid = child.pid;
+    if (pid === undefined) return;
+    let exited = false;
+    child.once("exit", () => {
+      exited = true;
+      this.#live.delete(pid);
+    });
+    this.#live.set(pid, { child, exited: () => exited });
+  }
+
+  /** The commit holds the real index's lock (or has released it: null). */
+  holdIndexLock(lock: string | null): void {
+    this.#heldIndexLock = lock;
+  }
+
+  holdsIndexLock(lock: string): boolean {
+    return this.#heldIndexLock === lock;
+  }
+
+  async close(boundMs: number): Promise<GitChildrenClosed> {
+    this.#closed = true;
+    const entries = [...this.#live.entries()];
+    for (const [pid, { child }] of entries) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        /* the group is already gone */
+      }
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+    const deadline = Date.now() + boundMs;
+    const stopped = (pid: number, exited: () => boolean): boolean => exited() && !groupAlive(pid);
+    while (entries.some(([pid, { exited }]) => !stopped(pid, exited)) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const unreaped = entries.filter(([pid, { exited }]) => !stopped(pid, exited)).map(([pid]) => pid);
+    let indexLockReleased = false;
+    if (this.#heldIndexLock !== null) {
+      rmSync(this.#heldIndexLock, { force: true });
+      this.#heldIndexLock = null;
+      indexLockReleased = true;
+    }
+    return { reaped: unreaped.length === 0, killed: entries.map(([pid]) => pid), unreaped, indexLockReleased };
+  }
+}
+
+const groupAlive = (pid: number): boolean => {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as { code?: string }).code === "EPERM";
+  }
+};
 
 export interface GitRun {
   stdout: string;
@@ -181,7 +273,9 @@ export const pinRepository = (workTree: string, scratch: string): Decision<Pinne
     return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "the pinned git dir has no HEAD", { worktreeId: tree });
   }
   mkdirSync(join(scratch, "home"), { recursive: true, mode: 0o700 });
-  return allow(ReasonCode.OK, Object.freeze({ workTree: tree, gitDir, commonDir, dotGit: dotGitFingerprint(tree)!, scratch }));
+  return allow(ReasonCode.OK, Object.freeze({
+    workTree: tree, gitDir, commonDir, dotGit: dotGitFingerprint(tree)!, scratch, children: new GitChildren(),
+  }));
 };
 
 const lstatOrNull = (path: string): Stats | null => {
@@ -196,9 +290,20 @@ const lstatOrNull = (path: string): Stats | null => {
 export const runPinnedGit = (
   repo: PinnedRepository,
   args: readonly string[],
-  options: { index?: string; input?: string | Buffer; timeoutMs?: number; extraEnv?: Record<string, string> } = {},
+  options: {
+    index?: string;
+    input?: string | Buffer;
+    timeoutMs?: number;
+    extraEnv?: Record<string, string>;
+    /** A read the stopping daemon itself makes after closing the repository: the ref, for its record. */
+    afterClose?: boolean;
+  } = {},
 ): Promise<GitRun> =>
   new Promise((resolveRun) => {
+    if (repo.children.closed && options.afterClose !== true) {
+      resolveRun({ stdout: "", stderr: "the turn's repository was closed by a stopping daemon; no git command starts", exitCode: null });
+      return;
+    }
     const env: NodeJS.ProcessEnv = {
       PATH: process.env["PATH"] ?? "/usr/bin:/bin",
       HOME: join(repo.scratch, "home"),
@@ -220,7 +325,9 @@ export const runPinnedGit = (
     };
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn("git", [...GIT_HARDENING, ...args], { cwd: repo.workTree, env, stdio: ["pipe", "pipe", "pipe"] });
+      // Its own process group, so a stopping daemon can stop it whole (ACP-WORKER-03).
+      child = spawn("git", [...GIT_HARDENING, ...args], { cwd: repo.workTree, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
+      repo.children.track(child);
     } catch (error) {
       resolveRun({ stdout: "", stderr: error instanceof Error ? error.message : String(error), exitCode: null });
       return;
@@ -229,6 +336,11 @@ export const runPinnedGit = (
     const stderr: Buffer[] = [];
     let settled = false;
     const timer = setTimeout(() => {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        /* gone */
+      }
       try {
         child.kill("SIGKILL");
       } catch {
@@ -502,6 +614,7 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
       try {
         writeFileSync(lock, "", { flag: "wx", mode: 0o644 });
         held = true;
+        repo.children.holdIndexLock(lock);
       } catch (error) {
         return deny(ReasonCode.CONFLICT, "the worktree's index is locked by another writer; nothing was committed", {
           error: error instanceof Error ? error.message.slice(0, 300) : String(error),
@@ -536,6 +649,12 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
           error: updated.stderr.slice(0, 500),
         });
       }
+      // A stopping daemon that closed the repository has already let the index lock go: publish nothing.
+      if (repo.children.closed) {
+        return deny(ReasonCode.CONFLICT, "the turn's repository was closed by a stopping daemon; the index was not published", {
+          head: commit,
+        });
+      }
       const descriptor = openSync(lock, "w");
       try {
         writeSync(descriptor, readFileSync(copy));
@@ -545,13 +664,18 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
       }
       renameSync(lock, realIndex);
       held = false;
+      repo.children.holdIndexLock(null);
       return allow(ReasonCode.OK, commit);
     } catch (error) {
       return deny(ReasonCode.INTERNAL_ERROR, "the worker commit could not be written", {
         error: error instanceof Error ? error.message.slice(0, 500) : String(error),
       });
     } finally {
-      if (held) rmSync(lock, { force: true });
+      // Only a lock this commit still holds: one a stopping daemon released may be someone else's by now.
+      if (held && repo.children.holdsIndexLock(lock)) {
+        rmSync(lock, { force: true });
+        repo.children.holdIndexLock(null);
+      }
     }
   },
 };
