@@ -2920,7 +2920,13 @@ export class Daemon {
     waiter?.();
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Stops the daemon. `complete: false` means a worker git process group could not be confirmed
+   * finished: the lock is kept and a durable fence names the groups, so neither this process exiting
+   * nor anyone reclaiming the lock lets a successor take authority while one of them may still run.
+   * A caller that exits must report that, not exit as if the stop were clean.
+   */
+  async stop(): Promise<{ complete: boolean }> {
     // #512 (ACP-WORKER-03) — before this daemon gives up its authority, every worker turn it owns is
     // aborted and drained. A process that would not be confirmed gone stays recorded as outstanding,
     // durably, so the next start reconciles it and no retry of its task runs first.
@@ -2931,16 +2937,24 @@ export class Daemon {
     this.uninstallContinuityCoordinator();
     // Only its own: a successor that registered after this daemon keeps its supplier.
     this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-    // ACP-WORKER-03 — and a worker git child it could not confirm stopped (SIGKILL sent, exit never
-    // observed within the bound) keeps the lock: no successor takes authority while a git child of this
-    // daemon may still move a ref or rewrite an index. It stays held until this process exits, when the
-    // lock's own staleness rule (a dead holder pid) frees it.
+    // ACP-WORKER-03 — a worker git process group it could not confirm empty (SIGKILL sent, members
+    // still found after the bounded retries) keeps the lock, and (ACP-WORKER-03-FC) is written to a
+    // durable fence beside it first. The fence does not depend on this process: when the process exits
+    // and the lock goes stale, acquisition still refuses while any named group may still run, and
+    // reclaims once each is gone — matched by group id and its leader's start time, so a reused id
+    // never fences forever. A stop that names no group fences until an operator removes the fence.
     const lockRetained = !workers.gitStopped;
+    const fencedGroups = lockRetained ? (workers.unconfirmedGroups ?? null) : [];
+    if (lockRetained) this.lock.fence(fencedGroups, this.cp.clock.nowIso());
     this.cp.audit.record({
       kind: "DAEMON_STOPPED",
-      evidence: { pid: process.pid, drained: workers.drained, executions: workers.outstanding, gitStopped: workers.gitStopped, lockRetained },
+      evidence: {
+        pid: process.pid, drained: workers.drained, executions: workers.outstanding, gitStopped: workers.gitStopped, lockRetained,
+        fencedGroups: fencedGroups === null ? null : fencedGroups.map((group) => group.pgid),
+      },
     });
     if (!lockRetained) this.lock.release();
+    return { complete: !lockRetained };
   }
 }
 

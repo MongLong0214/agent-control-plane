@@ -7,6 +7,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -14,7 +15,14 @@ import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+
+/** A process group a stopped daemon could not confirm empty: its id and its leader's OS start time. */
+export interface FencedGroup {
+  pgid: number;
+  leaderStartedAt: string | null;
+}
 
 export interface LockInfo {
   pid: number;
@@ -37,8 +45,72 @@ export class SingleInstanceLock {
 
   constructor(private readonly path: string) {}
 
+  /**
+   * #1070 ACP-WORKER-03-FC — the durable half of a stopping daemon's fence. Written beside the lock
+   * when the daemon could not confirm every worker git process group empty, it outlives the daemon's
+   * process: no lock is acquired, live holder or stale, while any group it names may still mutate a
+   * repository. `null` names none — a stop that could not even say which — and fences until removed.
+   */
+  get fencePath(): string {
+    return `${this.path}.git-fence.json`;
+  }
+
+  fence(groups: readonly FencedGroup[] | null, recordedAt: string): void {
+    mkdirSync(dirname(this.path), { recursive: true });
+    const temporary = join(dirname(this.path), `.${basename(this.fencePath)}.${process.pid}.${randomUUID()}.tmp`);
+    const fd = openSync(temporary, "wx", 0o600);
+    try {
+      writeSync(fd, JSON.stringify({ pid: process.pid, recordedAt, groups }));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, this.fencePath);
+  }
+
+  /**
+   * The fence, if any group it names may still be alive. A group is alive while `kill(-pgid, 0)` finds
+   * members, unless a process now holding the group's id started at another time than the recorded
+   * leader — a pid is reused only once its group is empty, so that group is gone. A fence with no
+   * named groups, or one that cannot be read, stands. Once every named group is gone it is removed.
+   */
+  liveFence(): { groups: FencedGroup[] | null; alive: FencedGroup[] } | null {
+    if (!existsSync(this.fencePath)) return null;
+    let groups: FencedGroup[] | null;
+    try {
+      const parsed = JSON.parse(readFileSync(this.fencePath, "utf8")) as { groups?: unknown };
+      groups = Array.isArray(parsed.groups)
+        ? parsed.groups.filter((group): group is FencedGroup =>
+          typeof group === "object" && group !== null &&
+          Number.isSafeInteger((group as FencedGroup).pgid) && (group as FencedGroup).pgid > 0 &&
+          ((group as FencedGroup).leaderStartedAt === null || typeof (group as FencedGroup).leaderStartedAt === "string"))
+        : null;
+      if (Array.isArray(parsed.groups) && groups !== null && groups.length !== parsed.groups.length) groups = null;
+    } catch {
+      groups = null;
+    }
+    if (groups === null) return { groups: null, alive: [] };
+    const alive = groups.filter((group) => fencedGroupAlive(group));
+    if (alive.length > 0) return { groups, alive };
+    try {
+      unlinkSync(this.fencePath);
+    } catch {
+      /* already gone */
+    }
+    return null;
+  }
+
   acquire(startedAt: string): Decision<LockInfo> {
     mkdirSync(dirname(this.path), { recursive: true });
+
+    const fenced = this.liveFence();
+    if (fenced) {
+      return deny(
+        ReasonCode.DAEMON_ALREADY_RUNNING,
+        "a stopped agentcpd could not confirm a worker git process group finished; authority is not taken while it may still run",
+        { fence: this.fencePath, groups: fenced.groups, alive: fenced.alive },
+      );
+    }
 
     if (this.#fd !== null) {
       return deny(ReasonCode.DAEMON_ALREADY_RUNNING, "this lock is already held", {
@@ -165,6 +237,16 @@ export class SingleInstanceLock {
     this.#held = null;
   }
 }
+
+const fencedGroupAlive = (group: FencedGroup): boolean => {
+  try {
+    process.kill(-group.pgid, 0);
+  } catch (error) {
+    if ((error as { code?: string }).code !== "EPERM") return false;
+  }
+  const holder = readProcessStartToken(group.pgid);
+  return !(holder !== null && group.leaderStartedAt !== null && holder !== group.leaderStartedAt);
+};
 
 const isAlive = (pid: number): boolean => {
   if (!Number.isInteger(pid) || pid <= 0) return false;

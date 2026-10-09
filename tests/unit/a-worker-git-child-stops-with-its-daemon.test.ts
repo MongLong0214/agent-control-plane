@@ -387,7 +387,7 @@ describe("#1070 ACP-WORKER-03 a turn's git children", () => {
     const startedAt = Date.now();
     const closed = await children.close(300);
     expect(closed.reaped).toBe(false);
-    expect(closed.unreaped).toEqual([2_147_483_000]);
+    expect(closed.unreaped.map((group) => group.pgid)).toEqual([2_147_483_000]);
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(300);
   });
 

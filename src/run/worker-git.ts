@@ -20,6 +20,7 @@ import {
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { digestOf, sha256 } from "../core/digest.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
@@ -87,44 +88,75 @@ export interface PinnedRepository {
 }
 
 /** What closing a repository's git children observed. */
+/** A git process group a turn started: its id (the leader's pid) and the leader's OS start time. */
+export interface GitProcessGroup {
+  pgid: number;
+  /** `readProcessStartToken` of the leader when it was spawned; null where the platform cannot say. */
+  leaderStartedAt: string | null;
+}
+
 export interface GitChildrenClosed {
-  /** Every child was seen to exit and its process group is gone. */
+  /** Every group was emptied: its leader seen to exit and no member left (`kill(-pgid, 0)` is ESRCH). */
   reaped: boolean;
   killed: number[];
-  unreaped: number[];
+  /** Groups that still had a member when the bound ran out. */
+  unreaped: GitProcessGroup[];
   /** The real index's lock the commit held, removed here because the commit can no longer. */
   indexLockReleased: boolean;
 }
 
 /**
- * The git children a turn has running against its repository (#1070 ACP-WORKER-03).
+ * The git process groups a turn has started against its repository (#1070 ACP-WORKER-03).
  *
- * Each child is spawned as its own process group, so it can be stopped whole. Closing the registry
- * stops every child still running — SIGKILL to its group — and waits, bounded, until each one's exit
- * has actually been observed and its group is gone; from then on no git command starts against the
- * repository and the commit publishes nothing. A daemon closes the registries of the turns its drain
- * did not finish before it gives up its authority, so no git child of a stopped daemon can move a ref
- * or rewrite the index under a successor.
+ * Each git child is spawned as its own process group, and the registry owns the group, not the child:
+ * a group stays registered after its leader exits for as long as any member is left — a descendant
+ * the leader forked keeps the group, and the right to mutate the repository, alive. A group leaves
+ * the registry only once it is confirmed empty: the leader's exit observed and `kill(-pgid, 0)` ESRCH.
+ *
+ * Closing the registry stops every group still registered — SIGKILL to the group, repeated while it
+ * has members — and waits, bounded, until each is confirmed empty; from then on no git command starts
+ * against the repository and the commit publishes nothing. A stopping daemon closes every registry
+ * its runner has opened, of running turns and settled ones alike, before it gives up its authority.
  */
 export class GitChildren {
   #closed = false;
-  readonly #live = new Map<number, { child: ChildProcess; exited: () => boolean }>();
+  #retired = false;
+  readonly #groups = new Map<number, { child: ChildProcess; leaderExited: boolean; leaderStartedAt: string | null }>();
   #heldIndexLock: string | null = null;
 
   get closed(): boolean {
     return this.#closed;
   }
 
-  /** Records a child the moment it is spawned; it leaves the registry when its exit is observed. */
+  /** Its owner — a turn that settled, an admission that never launched — will start no more git. */
+  retire(): void {
+    this.#retired = true;
+  }
+
+  /** Retired, and no group of it left: nothing here can mutate the repository any more. */
+  get finished(): boolean {
+    return this.#retired && this.liveGroups().length === 0;
+  }
+
+  /** Records a child's group the moment the child is spawned. */
   track(child: ChildProcess): void {
-    const pid = child.pid;
-    if (pid === undefined) return;
-    let exited = false;
+    const pgid = child.pid;
+    if (pgid === undefined) return;
+    const entry = { child, leaderExited: false, leaderStartedAt: readProcessStartToken(pgid) };
+    this.#groups.set(pgid, entry);
     child.once("exit", () => {
-      exited = true;
-      this.#live.delete(pid);
+      entry.leaderExited = true;
+      // Released only when nothing is left in the group; a descendant keeps it registered.
+      if (groupGone(pgid, entry)) this.#groups.delete(pgid);
     });
-    this.#live.set(pid, { child, exited: () => exited });
+  }
+
+  /** Groups still registered after dropping every one confirmed empty. */
+  liveGroups(): GitProcessGroup[] {
+    for (const [pgid, entry] of this.#groups) {
+      if (groupGone(pgid, entry)) this.#groups.delete(pgid);
+    }
+    return [...this.#groups.entries()].map(([pgid, entry]) => ({ pgid, leaderStartedAt: entry.leaderStartedAt }));
   }
 
   /** The commit holds the real index's lock (or has released it: null). */
@@ -138,34 +170,65 @@ export class GitChildren {
 
   async close(boundMs: number): Promise<GitChildrenClosed> {
     this.#closed = true;
-    const entries = [...this.#live.entries()];
-    for (const [pid, { child }] of entries) {
-      try {
-        process.kill(-pid, "SIGKILL");
-      } catch {
-        /* the group is already gone */
+    const entries = [...this.#groups.entries()];
+    const stopped = (pgid: number): boolean => {
+      const entry = this.#groups.get(pgid);
+      return entry === undefined || groupGone(pgid, entry);
+    };
+    const kill = (): void => {
+      for (const [pgid, { child }] of entries) {
+        if (stopped(pgid)) continue;
+        try {
+          process.kill(-pgid, "SIGKILL");
+        } catch {
+          /* the group is already gone */
+        }
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
       }
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* already gone */
-      }
-    }
+    };
+    kill();
     const deadline = Date.now() + boundMs;
-    const stopped = (pid: number, exited: () => boolean): boolean => exited() && !groupAlive(pid);
-    while (entries.some(([pid, { exited }]) => !stopped(pid, exited)) && Date.now() < deadline) {
+    let lastKill = Date.now();
+    while (entries.some(([pgid]) => !stopped(pgid)) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 10));
+      // A member forked between the signal and its delivery joins the same group: signal it again.
+      if (Date.now() - lastKill >= 200) {
+        kill();
+        lastKill = Date.now();
+      }
     }
-    const unreaped = entries.filter(([pid, { exited }]) => !stopped(pid, exited)).map(([pid]) => pid);
+    const unreaped = entries.filter(([pgid]) => !stopped(pgid)).map(([pgid, entry]) => ({ pgid, leaderStartedAt: entry.leaderStartedAt }));
+    for (const [pgid] of entries) if (stopped(pgid)) this.#groups.delete(pgid);
     let indexLockReleased = false;
     if (this.#heldIndexLock !== null) {
       rmSync(this.#heldIndexLock, { force: true });
       this.#heldIndexLock = null;
       indexLockReleased = true;
     }
-    return { reaped: unreaped.length === 0, killed: entries.map(([pid]) => pid), unreaped, indexLockReleased };
+    return { reaped: unreaped.length === 0, killed: entries.map(([pgid]) => pgid), unreaped, indexLockReleased };
   }
 }
+
+/**
+ * Whether a registered group is confirmed empty: its leader's exit was observed and no member is left.
+ * A process holding the group's id once the leader has exited is a new one — a pid cannot be reused
+ * while a group of that id has members — so our group is gone, and that process is never signalled.
+ */
+const groupGone = (pgid: number, entry: { leaderExited: boolean }): boolean =>
+  entry.leaderExited && (!groupAlive(pgid) || processExists(pgid));
+
+const processExists = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as { code?: string }).code === "EPERM";
+  }
+};
 
 const groupAlive = (pid: number): boolean => {
   try {

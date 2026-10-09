@@ -26,7 +26,9 @@ import {
   parentOf,
   pinRepository,
   plumbingWorkerCommit,
+  type GitChildren,
   type GitChildrenClosed,
+  type GitProcessGroup,
   indexSnapshot,
   runPinnedGit,
   scanAgainst,
@@ -68,6 +70,8 @@ const DEFAULT_PROCESS_SETTLE_MS = 2_000;
 const DEFAULT_SHUTDOWN_BUDGET_MS = 15_000;
 /** How long a stopping daemon waits, after SIGKILL, to see each worker git child's exit (ACP-WORKER-03). */
 const GIT_REAP_BOUND_MS = 5_000;
+/** The bounded second attempt for a group the first one could not confirm empty. */
+const GIT_REAP_RETRY_MS = 10_000;
 
 /** Audit kinds this runner writes; `describe` reads them back. */
 export const WorkerTurnEvent = {
@@ -337,6 +341,12 @@ export class WorkerTurnRunner {
   readonly #turns = new Map<string, InFlightTurn>();
   /** Starts still being admitted: preparing, or opening their execution, and not yet a turn. */
   readonly #admissions = new Set<Promise<void>>();
+  /**
+   * Every git registry this runner opened — for running turns, settled ones and admissions alike —
+   * until its owner retired it and it has no group left (ACP-WORKER-03). A settled turn's git child
+   * can leave a descendant in its group; shutdown stops that too before the daemon lets go.
+   */
+  readonly #gitRegistries = new Set<GitChildren>();
   readonly #busyWorktrees = new Set<string>();
   readonly #pollMs: number;
   readonly #processes: WorkerProcessPort;
@@ -409,12 +419,14 @@ export class WorkerTurnRunner {
     this.#busyWorktrees.add(worktree);
     let scratch: string | null = null;
     let launched = false;
+    let preparedRepo: PinnedRepository | null = null;
     try {
       scratch = this.#scratchDir("acp-worker-git-");
       const prepared = await this.prepareWorktree(facts, scratch);
       if (this.#stopping) return this.stoppingRefusal(request.taskId);
       if (!prepared.allowed) return prepared as Decision<{ executionId: string }>;
       const turn = prepared.value;
+      preparedRepo = turn.repo;
       const started = await this.ports.tasks.startWorkerExecution({
         runId: turn.runId,
         taskId: turn.taskId,
@@ -463,6 +475,8 @@ export class WorkerTurnRunner {
       };
       inFlight.promise = this.execute(adapter, turn, executionId, timeoutMs, inFlight).finally(() => {
         inFlight.settled = true;
+        turn.repo.children.retire();
+        this.pruneGitRegistries();
         this.#busyWorktrees.delete(worktree);
         this.#turns.delete(executionId);
         rmSync(turnScratch, { recursive: true, force: true });
@@ -473,6 +487,7 @@ export class WorkerTurnRunner {
       if (!launched) {
         this.#busyWorktrees.delete(worktree);
         if (scratch) rmSync(scratch, { recursive: true, force: true });
+        (preparedRepo as PinnedRepository | null)?.children.retire();
       }
     }
   }
@@ -490,7 +505,7 @@ export class WorkerTurnRunner {
    */
   async shutdown(
     budgetMs = DEFAULT_SHUTDOWN_BUDGET_MS,
-  ): Promise<{ drained: boolean; outstanding: string[]; gitStopped: boolean }> {
+  ): Promise<{ drained: boolean; outstanding: string[]; gitStopped: boolean; unconfirmedGroups: GitProcessGroup[] }> {
     this.#stopping = true;
     // An admission that sees `#stopping` refuses before it opens an execution or registers a turn, so
     // every turn that will ever exist is already in `#turns`; the admissions are waited for too.
@@ -516,7 +531,6 @@ export class WorkerTurnRunner {
     // execution is ended ABANDONED in the database, so a late resume finds nothing RUNNING to commit for
     // or succeed, in this process or in any successor. `#stopping` is never cleared.
     const fenced: string[] = [];
-    let gitStopped = true;
     for (const turn of turns) {
       if (turn.settled) continue;
       if (this.isRunning(turn.executionId)) {
@@ -528,7 +542,6 @@ export class WorkerTurnRunner {
         fenced.push(turn.executionId);
       }
       const closed = await turn.facts.repo.children.close(GIT_REAP_BOUND_MS);
-      if (!closed.reaped) gitStopped = false;
       this.ports.audit.record({
         kind: WorkerTurnEvent.GIT_STOPPED,
         runId: turn.facts.runId,
@@ -543,6 +556,20 @@ export class WorkerTurnRunner {
         } as Evidence,
       });
     }
+    // Then every other registry this runner opened: a settled turn's, a refused admission's. A git child
+    // that exited can have left a descendant in its group, and that group is still this daemon's to stop.
+    let lingeringGroupsKilled = 0;
+    for (const registry of this.#gitRegistries) {
+      if (registry.closed) continue;
+      lingeringGroupsKilled += (await registry.close(GIT_REAP_BOUND_MS)).killed.length;
+    }
+    // A bounded second attempt for any group that is not yet confirmed empty, then the verdict.
+    for (const registry of this.#gitRegistries) {
+      if (registry.liveGroups().length > 0) await registry.close(GIT_REAP_RETRY_MS);
+    }
+    const unconfirmedGroups = [...this.#gitRegistries].flatMap((registry) => registry.liveGroups());
+    const gitStopped = unconfirmedGroups.length === 0;
+    this.pruneGitRegistries();
     const outstanding = this.ports.db
       .all<{ execution_id: string }>(
         `SELECT execution_id FROM task_executions
@@ -554,9 +581,17 @@ export class WorkerTurnRunner {
     const drained = finished && pendingStarts === 0 && this.#turns.size === 0;
     this.ports.audit.record({
       kind: WorkerTurnEvent.SHUTDOWN_DRAINED,
-      evidence: { drained, turns: turns.length, admissions: admissions.length, pendingStarts, fenced, gitStopped, executions: outstanding },
+      evidence: {
+        drained, turns: turns.length, admissions: admissions.length, pendingStarts, fenced, gitStopped,
+        lingeringGroupsKilled, unconfirmedGroups: unconfirmedGroups.map((group) => group.pgid), executions: outstanding,
+      },
     });
-    return { drained: drained && outstanding.length === 0 && gitStopped, outstanding, gitStopped };
+    return { drained: drained && outstanding.length === 0 && gitStopped, outstanding, gitStopped, unconfirmedGroups };
+  }
+
+  /** Drops every registry whose owner retired it and whose groups are all confirmed empty. */
+  private pruneGitRegistries(): void {
+    for (const registry of this.#gitRegistries) if (registry.finished) this.#gitRegistries.delete(registry);
   }
 
   /**
@@ -969,9 +1004,27 @@ export class WorkerTurnRunner {
    * and the git dir are recorded last, as the baseline the turn is held to.
    */
   private async prepareWorktree(facts: DurableFacts, scratch: string): Promise<Decision<TurnFacts>> {
+    let opened: GitChildren | null = null;
+    const prepared = await this.prepareWorktreeOnce(facts, scratch, (children) => {
+      opened = children;
+    });
+    // A preparation that refuses starts no more git against the repository it pinned.
+    if (!prepared.allowed) (opened as GitChildren | null)?.retire();
+    return prepared;
+  }
+
+  private async prepareWorktreeOnce(
+    facts: DurableFacts,
+    scratch: string,
+    onOpened: (children: GitChildren) => void,
+  ): Promise<Decision<TurnFacts>> {
     const worktree = facts.claim.worktree;
     try {
       const pinned = pinRepository(worktree, scratch);
+      if (pinned.allowed) {
+        this.#gitRegistries.add(pinned.value.children);
+        onOpened(pinned.value.children);
+      }
       if (!pinned.allowed) return pinned as Decision<never>;
       const repo = pinned.value;
       const objectFormat = await objectFormatOf(repo);
