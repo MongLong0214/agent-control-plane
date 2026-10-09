@@ -74,8 +74,10 @@ const authorizeGitMutation = async (
  * 120s is chosen from what this wrapper is actually used for, measured rather than guessed: every
  * call site is local. `grep` across `src/` finds rev-parse, status, diff, show, cat-file, ls-tree,
  * merge-base, symbolic-ref, remote, branch, init, add, and worktree add/remove/list/prune — and
- * **no** fetch, clone, push, pull or ls-remote. So no legitimate use waits on a network, and the
- * slowest plausible one is `worktree add --detach` writing a working tree.
+ * **no** clone, push, pull or ls-remote. The one fetch is the self-contained verification checkout
+ * (`verify/worktree.ts`), which fetches one commit from a local checkout path, not from a network.
+ * So no legitimate use waits on a network, and the slowest plausible one is writing a working
+ * tree (`worktree add --detach`, or that checkout's fetch and checkout).
  *
  * A caller that needs longer passes `timeoutMs`. That is the affordance a blanket bound has to
  * have: the alternative to a per-call override is picking one number large enough for the worst
@@ -97,7 +99,7 @@ const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 export const git = async (
   cwd: string,
   args: readonly string[],
-  options: { allowFailure?: boolean; timeoutMs?: number } = {},
+  options: { allowFailure?: boolean; timeoutMs?: number; isolatedConfig?: boolean } = {},
 ): Promise<GitResult> => {
   // `?? ` would pass a caller's `0` straight through, and Node reads `timeout: 0` as *no*
   // timeout — so the one value that removes the bound would still census as bounded, because
@@ -117,7 +119,7 @@ export const git = async (
       maxBuffer: MAX_BUFFER,
       encoding: "utf8",
       timeout,
-      env: { ...sanitizedGitEnv() },
+      env: { ...sanitizedGitEnv(), ...(options.isolatedConfig ? ISOLATED_CONFIG_ENV : {}) },
     });
     return { stdout, stderr, exitCode: 0 };
   } catch (err) {
@@ -193,7 +195,20 @@ const sanitizedGitEnv = (): NodeJS.ProcessEnv => ({
   GIT_CONFIG_NOSYSTEM: "1",
 });
 
-export const revParse = async (cwd: string, ref: string): Promise<string> =>
+/**
+ * Git reading no configuration but the repository's own: not the operator's ~/.gitconfig or XDG
+ * config, and not the global ignore or attributes files that live beside it. This is what the
+ * verification sandbox sees (its HOME is an empty scratch directory), and it is what keeps an
+ * operator-wide filter, hook path or line-ending rule from running in, or reshaping, a
+ * verification checkout ACP materialises. Measured on a real operator machine: the global config
+ * carried credential helpers, a required `filter.lfs` process and `core.autocrlf`.
+ */
+const ISOLATED_CONFIG_ENV: NodeJS.ProcessEnv = {
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  XDG_CONFIG_HOME: "/dev/null",
+};
+
+export const revParse =async (cwd: string, ref: string): Promise<string> =>
   (await git(cwd, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim();
 
 export const tryRevParse = async (
