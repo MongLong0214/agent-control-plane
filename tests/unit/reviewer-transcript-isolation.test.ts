@@ -8,6 +8,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { __testing } from "../../src/runtime/cli-adapters.ts";
 import { disposableWorkspaceLocation } from "../../src/core/disposable-workspace-root.ts";
 import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
+import { assertSeatbeltApplied, requireSeatbelt } from "../helpers/seatbelt.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -96,23 +97,28 @@ describe("a reviewer cannot read producer transcripts (CP-HI-04, #360)", () => {
     expect(plain.status).toBe(0);
   });
 
-  it("refuses a read of ~/.claude under the real seatbelt profile", () => {
+  it("refuses a read of ~/.claude under the real seatbelt profile", (ctx) => {
+    requireSeatbelt(ctx);
     const result = readUnderSandbox(buildProfile(home, packetRoot), transcript, home);
+    assertSeatbeltApplied(result);
     expect(result.status, `sandbox-exec allowed the read: ${result.stdout}${result.stderr}`).not.toBe(0);
     expect(`${result.stdout}${result.stderr}`).not.toContain(SECRET);
   });
 
-  it("refuses ~/.codex on the same profile", () => {
+  it("refuses ~/.codex on the same profile", (ctx) => {
+    requireSeatbelt(ctx);
     const codex = join(home, ".codex", "history.jsonl");
     mkdirSync(join(home, ".codex"), { recursive: true });
     writeFileSync(codex, SECRET, { mode: 0o600 });
 
     const result = readUnderSandbox(buildProfile(home, packetRoot), codex, home);
+    assertSeatbeltApplied(result);
     expect(result.status, `sandbox-exec allowed the read: ${result.stdout}${result.stderr}`).not.toBe(0);
     expect(`${result.stdout}${result.stderr}`).not.toContain(SECRET);
   });
 
-  it("still allows the packet the reviewer is meant to read", () => {
+  it("still allows the packet the reviewer is meant to read", (ctx) => {
+    requireSeatbelt(ctx);
     // The opposite failure: a boundary that also blocks the review's own input is not
     // isolation, it is a reviewer that cannot work.
     const packetFile = join(packetRoot, "packet.json");
@@ -132,7 +138,8 @@ describe("the rest of the withheld list is enforced, not just declared (#360)", 
   const home = tempDir("reviewer-home-2");
   const packetRoot = tempDir("reviewer-packet-2");
 
-  it("refuses to execute a shell under the no-tools profile", () => {
+  it("refuses to execute a shell under the no-tools profile", (ctx) => {
+    requireSeatbelt(ctx);
     // `tools: "none"` is `(deny process-exec*)` plus an allowlist of the provider binary and
     // node. A reviewer that can spawn /bin/sh is an ordinary local agent wearing the label.
     const result = boundedSpawnSync(
@@ -146,13 +153,15 @@ describe("the rest of the withheld list is enforced, not just declared (#360)", 
       ],
       { encoding: "utf8", env: { ...process.env, HOME: home } },
     );
+    assertSeatbeltApplied(result);
     expect(result.status, `the sandbox executed a shell: ${result.stdout}`).not.toBe(0);
     // stdout only: a failed execFileSync dumps the argv it attempted, so stderr necessarily
     // echoes the marker. Only stdout distinguishes "the shell ran" from "the shell was refused".
     expect(result.stdout).not.toContain("tools-were-available");
   });
 
-  it("refuses outbound TCP to anywhere but the egress port", async () => {
+  it("refuses outbound TCP to anywhere but the egress port", async (ctx) => {
+    requireSeatbelt(ctx);
     // `network: "provider-only"` is implemented by denying outbound and re-allowing exactly
     // one localhost port. This binds a real listener on a *different* port: reaching it means
     // the profile did not constrain the network, whatever the packet says.
@@ -175,6 +184,7 @@ describe("the rest of the withheld list is enforced, not just declared (#360)", 
         ],
         { encoding: "utf8", env: { ...process.env, HOME: home } },
       );
+      assertSeatbeltApplied(result);
       expect(`${result.stdout}${result.stderr}`).not.toContain("network-was-open");
     } finally {
       server.close();
@@ -210,27 +220,32 @@ describe("the reviewer may write to the per-user temp directory and nowhere new 
       { encoding: "utf8", env: { ...process.env, HOME: home } },
     );
 
-  it("permits a write into the per-user temp directory", () => {
+  it("permits a write into the per-user temp directory", (ctx) => {
+    requireSeatbelt(ctx);
     // Removing the allowance turns this red, and codex stops initialising for the same reason:
     // the app-server's first write is the one this covers.
     const result = writeUnderSandbox(join(realpathSync(tmpdir()), `acp-489-${process.pid}.tmp`));
     expect(result.status, `sandbox-exec refused the per-user temp write: ${result.stderr}`).toBe(0);
   });
 
-  it("still refuses a write into daemon state", () => {
+  it("still refuses a write into daemon state", (ctx) => {
+    requireSeatbelt(ctx);
     // What the profile actually protects, and what the no-tools probe now targets for the same
     // reason: the packet's sibling directory was only ever incidentally refused.
     const result = writeUnderSandbox(
       join(realpathSync(homedir()), ".agent-control-plane", `acp-489-escape-${process.pid}.txt`),
     );
+    assertSeatbeltApplied(result);
     expect(result.status, "the reviewer wrote into daemon state").not.toBe(0);
   });
 
-  it("does not open the sibling per-user cache directory", () => {
+  it("does not open the sibling per-user cache directory", (ctx) => {
+    requireSeatbelt(ctx);
     // `…/C` was measured as unnecessary. Opening the `<hash>` parent would have covered both,
     // which is why the parent was not used.
     const cache = join(dirname(realpathSync(tmpdir())), "C");
     const result = writeUnderSandbox(join(cache, `acp-489-${process.pid}.tmp`));
+    assertSeatbeltApplied(result);
     expect(result.status, "the reviewer wrote into the per-user cache directory").not.toBe(0);
   });
 
@@ -247,7 +262,8 @@ describe("the reviewer may write to the per-user temp directory and nowhere new 
     expect(profile.indexOf(writeDenial)).toBeGreaterThan(profile.indexOf(temporaryAllowance));
   });
 
-  it("keeps the disposable allocator unreadable and unwritable to the reviewer", () => {
+  it("keeps the disposable allocator unreadable and unwritable to the reviewer", (ctx) => {
+    requireSeatbelt(ctx);
     const allocator = disposableWorkspaceLocation().workspaceRoot;
     mkdirSync(allocator, { recursive: true, mode: 0o700 });
     const existing = join(allocator, `acp-655-read-${process.pid}.txt`);
@@ -266,6 +282,8 @@ describe("the reviewer may write to the per-user temp directory and nowhere new 
 
       const read = readUnderSandbox(profile, existing, home);
       const write = writeUnderSandbox(attempted);
+      assertSeatbeltApplied(read);
+      assertSeatbeltApplied(write);
       expect(read.status, "the reviewer read disposable-realm evidence").not.toBe(0);
       expect(write.status, "the reviewer wrote into the disposable allocator").not.toBe(0);
       expect(existsSync(attempted)).toBe(false);

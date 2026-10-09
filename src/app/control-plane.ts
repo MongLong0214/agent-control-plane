@@ -33,6 +33,7 @@ import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
+import { WORKER_TURN_PROVIDER, WorkerTurnRunner } from "../run/worker-turn.ts";
 import { WorkerStaffing } from "../run/worker-staffing.ts";
 import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter, type CliAdapterOptions } from "../runtime/cli-adapters.ts";
 import {
@@ -274,6 +275,8 @@ export class ControlPlane {
   readonly worktrees: WorktreeManager;
   readonly guard: ManagedWriteGuard;
   readonly tasks: TaskGraph;
+  /** #512 — runs one worker turn for a task the CTO chose, and owns its receipts and evidence. */
+  readonly workerTurns: WorkerTurnRunner;
   /** #512 — the production path that mints a task's first WORKER binding. */
   readonly workers: WorkerStaffing;
   readonly runs: RunEngine;
@@ -549,6 +552,16 @@ export class ControlPlane {
           workerReserveDemand: (provider, role) => this.capacity.workerReserveDemand(provider, role),
           hasRoleScoped: (provider) => this.providers.hasRoleScoped(provider),
         },
+      });
+      // #512 — the worker turn launches through the WORKER role's adapter, whose writable invocation
+      // passes the same guard-backed broker as every other runtime write.
+      this.workerTurns = new WorkerTurnRunner({
+        db: this.db,
+        clock: this.clock,
+        audit: this.audit,
+        tasks: this.tasks,
+        guard: this.guard,
+        workerAdapter: () => this.providers.requireForRole(WORKER_TURN_PROVIDER, Role.WORKER),
       });
       this.review.attach({
         capacity: { refreshForBlindReview: (target) => this.capacity.refreshForBlindReview(target) },

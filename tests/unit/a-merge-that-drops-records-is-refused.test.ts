@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { fakeGitHub } from "../helpers/fake-github-pulls.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -34,7 +35,7 @@ const repositoryWithASquashedBranch = (options: {
   readonly branchTrailers: string;
   readonly mergeTrailers: string;
   readonly note?: string;
-}): { readonly dir: string; readonly range: string } => {
+}): { readonly root: string; readonly dir: string; readonly range: string; readonly head: string; readonly merge: string } => {
   const dir = tempDir("acp-merge-records-");
   mkdirSync(join(dir, "work"), { recursive: true });
   const work = join(dir, "work");
@@ -53,26 +54,27 @@ const repositoryWithASquashedBranch = (options: {
   git(work, "commit", "--quiet", "--no-verify", "-m", `feat: the branch commit\n\n${options.branchTrailers}`);
   const head = git(work, "rev-parse", "HEAD").trim();
 
-  // The squash: one parent, a `(#N)` subject, and only what the merge chose to keep.
+  // The squash: one parent, a `(#N)` subject, the head it was merged from as `scripts/merge-pr.mjs`
+  // names it, and only what the merge chose to keep.
   git(work, "checkout", "--quiet", "main");
   git(work, "merge", "--quiet", "--squash", "feature");
-  git(work, "commit", "--quiet", "--no-verify", "-m", `feat: the branch commit (#7)\n\n${options.mergeTrailers}`);
+  git(work, "commit", "--quiet", "--no-verify", "-m", `feat: the branch commit (#7)\n\nMerged-Head: ${head}\n\n${options.mergeTrailers}`);
   const merge = git(work, "rev-parse", "HEAD").trim();
   if (options.note !== undefined) {
     writeFileSync(join(dir, "note.txt"), `${options.note}\n`);
     git(work, "notes", "--ref=commitlore", "add", "-F", join(dir, "note.txt"), merge);
   }
 
-  // The check reaches the branch through the pull request ref, which is what survives the branch
-  // being deleted. `origin` is this repository itself so the fetch it runs resolves offline.
-  git(work, "update-ref", "refs/pull/7/head", head);
+  // `origin` is this repository itself so any fetch the check runs resolves offline.
   git(work, "remote", "add", "origin", work);
-  return { dir: work, range: `${base}..${merge}` };
+  return { root: dir, dir: work, range: `${base}..${merge}`, head, merge };
 };
 
-const run = (cwd: string, range: string): { status: number; out: string } => {
+/** The gate asks GitHub what #7 is; offline, the stand-in answers that it merged as this squash. */
+const run = (repo: ReturnType<typeof repositoryWithASquashedBranch>): { status: number; out: string } => {
+  const env = fakeGitHub(repo.root, { 7: { merged: true, mergeCommit: repo.merge } });
   try {
-    const out = execFileSync("node", [CHECK, range], { cwd, encoding: "utf8", timeout: 60_000 });
+    const out = execFileSync(process.execPath, [CHECK, repo.range], { cwd: repo.dir, env, encoding: "utf8", timeout: 60_000 });
     return { status: 0, out };
   } catch (error) {
     const failure = error as { status?: number; stdout?: string; stderr?: string };
@@ -89,7 +91,7 @@ describe("a merge that drops records is refused", () => {
       branchTrailers: `${LIMIT}\n${WARN}`,
       mergeTrailers: "Blast: local",
     });
-    const result = run(repo.dir, repo.range);
+    const result = run(repo);
     expect(result.status).toBe(1);
     expect(result.out).toContain("2 record line(s) the branch carried and this merge does not keep");
     expect(result.out).toContain(LIMIT);
@@ -105,7 +107,7 @@ describe("a merge that drops records is refused", () => {
       mergeTrailers: WARN,
       note: LIMIT,
     });
-    const result = run(repo.dir, repo.range);
+    const result = run(repo);
     expect(result.out).not.toContain("does not keep");
     expect(result.status).toBe(0);
   });
@@ -117,7 +119,7 @@ describe("a merge that drops records is refused", () => {
       branchTrailers: `${LIMIT}\n${WARN}`,
       mergeTrailers: "Blast: local",
     });
-    const result = run(repo.dir, repo.range);
+    const result = run(repo);
     expect(result.out).not.toContain("0 record line(s) on the branch");
     expect(result.status).toBe(1);
   });
@@ -127,7 +129,7 @@ describe("a merge that drops records is refused", () => {
       branchTrailers: `${LIMIT}\n${WARN}`,
       mergeTrailers: `${LIMIT}\n${WARN}`,
     });
-    const result = run(repo.dir, repo.range);
+    const result = run(repo);
     expect(result.status).toBe(0);
     expect(result.out).toContain("2 record line(s) on the branch, all reachable");
   });

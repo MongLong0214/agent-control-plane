@@ -1624,10 +1624,15 @@ export class Daemon {
       }
     }
 
+    // #512 — a worker turn this control plane launched is never re-invoked. Its recorded process is
+    // killed only when pid, OS start time and ownership all match; otherwise nothing is killed and
+    // the task is blocked from another turn. Either way the execution ends ABANDONED.
+    const orphanedExecutions: string[] = (await this.cp.workerTurns.reconcileAfterRestart())
+      .map((orphan) => orphan.executionId);
+
     // A receipt that says RUNNING across a restart has no live worker behind it.
-    const orphanedExecutions: string[] = [];
     for (const row of this.cp.db.all<{ execution_id: string; worker_process_id: number | null }>(
-      `SELECT execution_id, worker_process_id FROM task_executions WHERE status = 'RUNNING'`,
+      `SELECT execution_id, worker_process_id FROM task_executions WHERE status = 'RUNNING' AND runtime_managed = 0`,
     )) {
       if (row.worker_process_id == null || !isAlive(row.worker_process_id)) {
         this.cp.tasks.finishExecution(row.execution_id, {
@@ -2915,15 +2920,44 @@ export class Daemon {
     waiter?.();
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Stops the daemon. `complete: false` means a worker git process group could not be confirmed
+   * finished: the lock is kept and a durable fence names the groups, so neither this process exiting
+   * nor anyone reclaiming the lock lets a successor take authority while one of them may still run.
+   * A caller that exits must report that, not exit as if the stop were clean.
+   */
+  async stop(): Promise<{ complete: boolean }> {
+    // #512 (ACP-WORKER-03) — before this daemon gives up its authority, every worker turn it owns is
+    // aborted and drained. A process that would not be confirmed gone stays recorded as outstanding,
+    // durably, so the next start reconciles it and no retry of its task runs first.
+    const workers = await this.cp.workerTurns.shutdown();
     this.wakeBootstrap("ABANDONED");
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
     this.uninstallContinuityCoordinator();
     // Only its own: a successor that registered after this daemon keeps its supplier.
     this.cp.doctor.clearSupplementalFindings(this.#doctorSupplier);
-    this.cp.audit.record({ kind: "DAEMON_STOPPED", evidence: { pid: process.pid } });
-    this.lock.release();
+    // ACP-WORKER-03 — a worker git process group it could not confirm empty (SIGKILL sent, members
+    // still found after the bounded retries) keeps the lock, and (ACP-WORKER-03-FC) is written to a
+    // durable fence beside it first. The fence does not depend on this process: when the process exits
+    // and the lock goes stale, acquisition still refuses while any named group may still run, and
+    // reclaims once each is gone — matched by group id and its leader's start time, so a reused id
+    // never fences forever. A stop that names no group fences until an operator removes the fence.
+    const lockRetained = !workers.gitStopped;
+    // ACP-WORKER-03-FC-EMPTY: an incomplete stop that names no group is fenced as an unknown one.
+    const fencedGroups = lockRetained
+      ? (workers.unconfirmedGroups && workers.unconfirmedGroups.length > 0 ? workers.unconfirmedGroups : null)
+      : [];
+    if (lockRetained) this.lock.fence(fencedGroups, this.cp.clock.nowIso());
+    this.cp.audit.record({
+      kind: "DAEMON_STOPPED",
+      evidence: {
+        pid: process.pid, drained: workers.drained, executions: workers.outstanding, gitStopped: workers.gitStopped, lockRetained,
+        fencedGroups: fencedGroups === null ? null : fencedGroups.map((group) => group.pgid),
+      },
+    });
+    if (!lockRetained) this.lock.release();
+    return { complete: !lockRetained };
   }
 }
 

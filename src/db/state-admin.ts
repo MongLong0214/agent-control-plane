@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { closeSync, existsSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { isAcpError } from "../core/errors.ts";
 import { systemClock } from "../core/clock.ts";
 import { readOwnerIdentities } from "../app/control-plane.ts";
-import { SingleInstanceLock } from "../daemon/single-instance.ts";
+import { SingleInstanceLock, holderProvenGone } from "../daemon/single-instance.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { realWorkspaceProbe } from "../guard/workspace-probe.ts";
 import { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
@@ -234,10 +234,41 @@ const parse = (argv: string[]): Parsed => {
   };
 };
 
+/**
+ * Who holds the state lock, or null when nobody can. This build's daemon holds `agentcpd.lock` as a
+ * private directory with its record in `holder.json` (#1070); an earlier build's lock is that path as
+ * a regular file. Fail closed on the directory: this command goes on only when the record names a
+ * holder proven gone (`holderProvenGone`: a confirmed ESRCH or a readable start token that differs);
+ * a running or unprovable holder is returned so the caller refuses naming it, and a missing or
+ * unreadable record refuses. The directory is only read here, never removed or replaced. Anything
+ * else at the path that is not a regular file — a symbolic link, a socket — is refused as insecure.
+ */
 const daemonIsLive = (databasePath: string): { pid: number; startedAt: string } | null => {
   ensurePrivateDirectory(dirname(databasePath));
   const lockPath = join(dirname(databasePath), "agentcpd.lock");
-  if (!existsSync(lockPath)) return null;
+  let standing;
+  try {
+    standing = lstatSync(lockPath);
+  } catch (error) {
+    if ((error as { code?: string }).code === "ENOENT") return null;
+    throw error;
+  }
+  if (standing.isDirectory()) {
+    assertPrivatePath(lockPath, "directory");
+    const recordPath = join(lockPath, "holder.json");
+    if (!existsSync(recordPath)) {
+      throw new Error(
+        "agentcpd's lock directory holds no holder record, so whether a daemon holds it cannot be shown; start agentcpd " +
+          "once to reclaim it, or remove it only after confirming no agentcpd is running",
+      );
+    }
+    assertPrivatePath(recordPath, "file");
+    const holder = new SingleInstanceLock(lockPath).read();
+    if (!holder) {
+      throw new Error("agentcpd's holder record cannot be read; remove the lock directory only after confirming no agentcpd is running");
+    }
+    return holderProvenGone(holder) ? null : { pid: holder.pid, startedAt: holder.startedAt };
+  }
   assertPrivatePath(lockPath, "file");
   const lock = new SingleInstanceLock(lockPath).read();
   if (!lock) {

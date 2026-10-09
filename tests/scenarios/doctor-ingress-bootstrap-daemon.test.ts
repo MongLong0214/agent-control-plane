@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -29,6 +30,7 @@ import {
   candidateSnapshotDigest,
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
+import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, gitSync, tempDir , seedActor} from "../helpers/fixtures.ts";
 import {
   type Harness,
@@ -1242,7 +1244,7 @@ describe("daemon (CP-S58, CP-S59)", () => {
     // Simulate a competing instance: a live pid that is not this process. (A lock held
     // by this very pid is reclaimable, which is what makes in-process restart work.)
     writeFileSync(
-      join(stateDir, "agentcpd.lock"),
+      join(stateDir, "agentcpd.lock", "holder.json"),
       JSON.stringify({ pid: process.ppid, startedAt: harness.clock.nowIso(), path: "x" }),
     );
 
@@ -1264,11 +1266,12 @@ describe("daemon (CP-S58, CP-S59)", () => {
     await first.stop();
   });
 
-  it("a lock left by a dead process is reclaimable", () => {
+  it("a lock this build's holder left when its process died is reclaimable", () => {
     const dir = tempDir("acp-lock-");
     mkdirSync(dir, { recursive: true });
     const path = join(dir, "agentcpd.lock");
-    writeFileSync(path, JSON.stringify({ pid: 2_147_483_600, startedAt: "x", path }));
+    const dead = deadHolderOfThisBuild(path);
+    expect(new SingleInstanceLock(path).read()?.pid).toBe(dead);
 
     const lock = new SingleInstanceLock(path);
     const acquired = lock.acquire("2026-08-12T00:00:00.000Z");
@@ -1276,7 +1279,44 @@ describe("daemon (CP-S58, CP-S59)", () => {
     expect(lock.read()?.pid).toBe(process.pid);
     lock.release();
   });
+
+  it("an earlier build's lock naming a dead process is refused and left as it was (ACP-WORKER-03-LOCK)", () => {
+    // #1070 narrow review 6: an earlier build reclaims such a record by unlinking the path without
+    // checking what it removes, so this build never removes or replaces one; it is removed by hand
+    // once no earlier-build agentcpd runs (deploy/README.md).
+    const dir = tempDir("acp-lock-");
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "agentcpd.lock");
+    writeFileSync(path, JSON.stringify({ pid: 2_147_483_600, startedAt: "x", path }));
+    const before = readFileSync(path);
+
+    const lock = new SingleInstanceLock(path);
+    const refused = lock.acquire("2026-08-12T00:00:00.000Z");
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.DAEMON_ALREADY_RUNNING);
+    expect(lock.held()).toBe(false);
+    expect(readFileSync(path).equals(before), "the earlier build's record was rewritten").toBe(true);
+  });
 });
+
+/**
+ * A record of this build's own format whose holder is gone: a separate process takes the lock and
+ * exits without releasing it, leaving its record as a killed daemon would (ACP-WORKER-03-LOCK).
+ */
+function deadHolderOfThisBuild(lockPath: string): number {
+  const lockModule = fileURLToPath(new URL("../../src/daemon/single-instance.ts", import.meta.url));
+  const child = boundedSpawnSync(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", `
+    import { SingleInstanceLock } from ${JSON.stringify(lockModule)};
+    const taken = new SingleInstanceLock(process.argv[1]).acquire(new Date().toISOString());
+    if (!taken.allowed) process.exit(3);
+    process.stdout.write(String(process.pid));
+    process.exit(0);
+  `, lockPath], { encoding: "utf8" });
+  expect(child.status, child.stderr).toBe(0);
+  const pid = Number(child.stdout);
+  expect(() => process.kill(pid, 0), "the holder is still running").toThrow();
+  return pid;
+}
 
 const HANDOFF: HandoffPackage = {
   projectStatus: "ACTIVE/HEALTHY",
