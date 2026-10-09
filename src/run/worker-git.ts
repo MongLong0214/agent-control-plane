@@ -418,11 +418,26 @@ const gitlinkIsEmpty = (workTree: string, path: string): boolean => {
 export const stagedContent = async (repo: PinnedRepository, index?: string): Promise<string> =>
   digestOf((await must(repo, ["ls-files", "-s", "-v", "-z"], index ? { index } : {})).split("\0").filter(Boolean));
 
-/** Paths the real index stages against a tree; read from the index alone, never the worktree. */
-export const stagedAgainst = async (repo: PinnedRepository, treeIsh: string): Promise<string[]> =>
-  (await must(repo, ["diff-index", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "-z", treeIsh]))
+/** Paths an index stages against a tree; read from the index alone, never the worktree. */
+export const stagedAgainst = async (repo: PinnedRepository, treeIsh: string, index?: string): Promise<string[]> =>
+  (await must(repo, ["diff-index", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "-z", treeIsh], index ? { index } : {}))
     .split("\0")
     .filter(Boolean);
+
+/**
+ * One copy of the real index, taken in a single read (ACP-WORKER-06). Git replaces an index by
+ * renaming a new file over it, never by rewriting it in place, so the copy is one whole index: every
+ * question preparation asks of the index — is anything staged, what is the baseline — is asked of this
+ * one snapshot, and nothing staged between two reads can become the baseline. An absent index is an
+ * empty one, which stages the deletion of every tracked path and so is never clean.
+ */
+export const indexSnapshot = (repo: PinnedRepository, label: string): string => {
+  const snapshot = join(repo.scratch, `${label}.snapshot.index`);
+  rmSync(snapshot, { force: true });
+  const real = join(repo.gitDir, "index");
+  if (lstatOrNull(real)) copyFileSync(real, snapshot);
+  return snapshot;
+};
 
 /** The control plane's commit of a verified change. Injectable so a failing commit can be measured. */
 export interface WorkerCommitPort {
@@ -436,6 +451,11 @@ export interface WorkerCommitPort {
       format: "sha1" | "sha256";
       /** `stagedContent` of the real index before the turn; the commit refuses if it has changed. */
       stagedBaseline: string;
+      /**
+       * The live authority fence (ACP-WORKER-03), asked under the index lock immediately before the
+       * branch moves. A refusal commits nothing.
+       */
+      stillAuthorized: () => Decision<void>;
     },
   ): Promise<Decision<string>>;
 }
@@ -491,6 +511,12 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
       if (lstatOrNull(realIndex)) copyFileSync(realIndex, copy);
       if ((await stagedContent(repo, copy)) !== input.stagedBaseline) {
         return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the index's staged content changed during the turn; nothing was committed", {});
+      }
+      // Asked last, with nothing awaited between it and the ref update: authority withdrawn at any
+      // earlier point — a daemon that began to stop, an execution ended elsewhere — commits nothing.
+      const authority = input.stillAuthorized();
+      if (!authority.allowed) {
+        return deny(authority.reasonCode, `${authority.message}; nothing was committed`, { ...authority.evidence, committed: false });
       }
       const moved = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: worker commit", `refs/heads/${input.branch}`, commit, input.baseHead]);
       if (moved.exitCode !== 0) {

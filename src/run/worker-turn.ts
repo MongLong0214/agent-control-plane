@@ -25,6 +25,7 @@ import {
   parentOf,
   pinRepository,
   plumbingWorkerCommit,
+  indexSnapshot,
   scanAgainst,
   stagedAgainst,
   stagedContent,
@@ -218,6 +219,10 @@ interface InFlightTurn {
   controller: AbortController;
   /** Set by `shutdown`: the turn ends ABANDONED with the daemon, not FAILED. */
   stopping: boolean;
+  executionId: string;
+  facts: TurnFacts;
+  /** Whether `promise` has settled; a drain that times out fences the turns still running. */
+  settled: boolean;
 }
 
 type CommitOutcome =
@@ -441,8 +446,16 @@ export class WorkerTurnRunner {
       });
       launched = true;
       const turnScratch = scratch;
-      const inFlight: InFlightTurn = { promise: Promise.resolve(), controller: new AbortController(), stopping: false };
+      const inFlight: InFlightTurn = {
+        promise: Promise.resolve(),
+        controller: new AbortController(),
+        stopping: false,
+        executionId,
+        facts: turn,
+        settled: false,
+      };
       inFlight.promise = this.execute(adapter, turn, executionId, timeoutMs, inFlight).finally(() => {
+        inFlight.settled = true;
         this.#busyWorktrees.delete(worktree);
         this.#turns.delete(executionId);
         rmSync(turnScratch, { recursive: true, force: true });
@@ -486,6 +499,20 @@ export class WorkerTurnRunner {
       }),
     ]);
     if (timer) clearTimeout(timer);
+    // ACP-WORKER-03: a turn the drain did not finish is ended here, durably, before the daemon gives up
+    // its authority — its execution ABANDONED in the database. A late resume then finds nothing RUNNING
+    // to commit for or succeed (the live fence reads that row), in this process or in any successor.
+    // `#stopping` is never cleared, so the in-process half of the fence holds as well.
+    const fenced: string[] = [];
+    for (const turn of turns) {
+      if (turn.settled || !this.isRunning(turn.executionId)) continue;
+      this.fail(turn.facts, turn.executionId, "ABANDONED", "infrastructure", {
+        reason: "DAEMON_STOPPED_UNDRAINED",
+        reasonCode: ReasonCode.INTERNAL_ERROR,
+        detail: "the daemon's drain timed out on this turn; it was ended before the daemon released its authority",
+      });
+      fenced.push(turn.executionId);
+    }
     const outstanding = this.ports.db
       .all<{ execution_id: string }>(
         `SELECT execution_id FROM task_executions
@@ -497,7 +524,7 @@ export class WorkerTurnRunner {
     const drained = finished && pendingStarts === 0 && this.#turns.size === 0;
     this.ports.audit.record({
       kind: WorkerTurnEvent.SHUTDOWN_DRAINED,
-      evidence: { drained, turns: turns.length, admissions: admissions.length, pendingStarts, executions: outstanding },
+      evidence: { drained, turns: turns.length, admissions: admissions.length, pendingStarts, fenced, executions: outstanding },
     });
     return { drained: drained && outstanding.length === 0, outstanding };
   }
@@ -904,7 +931,11 @@ export class WorkerTurnRunner {
           observed: branch,
         });
       }
-      const staged = await stagedAgainst(repo, head);
+      // ACP-WORKER-06: one snapshot of the index answers both questions — is anything staged, and what
+      // is the baseline the turn is held to — so nothing staged between two reads becomes the baseline.
+      // Staging after the snapshot differs from the baseline, which observation and the commit refuse.
+      const snapshot = indexSnapshot(repo, "prepare");
+      const staged = await stagedAgainst(repo, head, snapshot);
       const scan = await scanAgainst(repo, head, objectFormat, "prepare");
       // ACP-WORKER-05: a checked-out submodule keeps its state in another repository, which this
       // runner never runs git inside, so it cannot verify one is clean or that a turn left it alone.
@@ -934,7 +965,7 @@ export class WorkerTurnRunner {
         );
       }
       const config = await effectiveConfig(repo);
-      const stagedBaseline = await stagedContent(repo);
+      const stagedBaseline = await stagedContent(repo, snapshot);
       return allow(ReasonCode.OK, {
         ...facts,
         repo,
@@ -1071,7 +1102,7 @@ export class WorkerTurnRunner {
       this.refuseLate(facts, executionId, { ...evidence, reason: "EXECUTION_NO_LONGER_RUNNING" });
       return;
     }
-    if (turn.stopping) {
+    if (turn.stopping || this.#stopping) {
       this.fail(facts, executionId, "ABANDONED", "infrastructure", { ...evidence, reason: "DAEMON_STOPPING", reasonCode: ReasonCode.INTERNAL_ERROR });
       return;
     }
@@ -1139,6 +1170,17 @@ export class WorkerTurnRunner {
 
     await this.#beforeCommit?.();
     const committed = await this.commitVerified(facts, executionId, observed);
+    if (!committed.ok && this.authorityFor(executionId).allowed === false) {
+      // Authority went while the commit was being made: the live fence refused it (nothing committed)
+      // or something after it failed. Either way the turn ends with the daemon, never FAILED on its own.
+      this.endWithoutAuthority(facts, executionId, {
+        ...evidence,
+        detail: committed.message,
+        commitReason: committed.reason,
+        commitHead: committed.head,
+      });
+      return;
+    }
     if (!committed.ok) {
       this.fail(facts, executionId, "FAILED", committed.failureClass, {
         ...evidence,
@@ -1165,10 +1207,17 @@ export class WorkerTurnRunner {
     };
     const resultDigest = workerSuccessDigest(inputs);
     // A holder, not a `let`: the transaction body assigns it, and a narrowed local would hide that.
-    const step: { failedAt: "finish" | "evidence" | null } = { failedAt: null };
+    const step: { failedAt: "authority" | "finish" | "evidence" | null } = { failedAt: null };
     let finished: Decision<unknown>;
     try {
       finished = this.ports.db.txDecision(() => {
+        // ACP-WORKER-03: asked inside the transaction that would write SUCCEEDED, and nowhere earlier
+        // that a later await could make stale.
+        const authority = this.authorityFor(executionId);
+        if (!authority.allowed) {
+          step.failedAt = "authority";
+          return authority;
+        }
         const done = this.ports.tasks.finishExecution(executionId, { status: "SUCCEEDED", resultDigest }, facts.runId);
         if (!done.allowed) {
           step.failedAt = "finish";
@@ -1198,6 +1247,11 @@ export class WorkerTurnRunner {
       finished = deny(ReasonCode.AUDIT_WRITE_FAILED, "the success evidence could not be written", { error: errorText(error).slice(0, 300) });
     }
     if (finished.allowed) return;
+    if (step.failedAt === "authority") {
+      // The commit exists; success is not written for it once authority is gone.
+      this.endWithoutAuthority(facts, executionId, { ...evidence, commitHead: committed.head });
+      return;
+    }
     if (step.failedAt === "finish") {
       this.refuseLate(facts, executionId, {
         ...evidence,
@@ -1268,6 +1322,7 @@ export class WorkerTurnRunner {
           message: commitMessage(facts),
           format: facts.objectFormat,
           stagedBaseline: facts.stagedBaseline,
+          stillAuthorized: () => this.authorityFor(executionId),
         });
         if (!committed.allowed) {
           const head = typeof committed.evidence["head"] === "string" ? committed.evidence["head"] : null;
@@ -1524,6 +1579,30 @@ export class WorkerTurnRunner {
   }
 
   /** A result for an execution that is no longer RUNNING is refused, and recorded with its diagnostics. */
+  /**
+   * The live authority fence (ACP-WORKER-03), read at the moment of an irreversible step and never
+   * copied: the runner is not stopping, and the execution is still RUNNING in the database — which a
+   * drain that timed out has already, durably, ended before the daemon released its authority.
+   */
+  private authorityFor(executionId: string): Decision<void> {
+    if (this.#stopping) {
+      return deny(ReasonCode.CONFLICT, "the daemon is stopping; a worker turn commits and succeeds nothing now", { executionId });
+    }
+    if (!this.isRunning(executionId)) {
+      return deny(ReasonCode.CONFLICT, "the execution is no longer running", { executionId });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /** A turn whose authority went before it could finish: ABANDONED with the daemon, or refused as late. */
+  private endWithoutAuthority(facts: TurnFacts, executionId: string, evidence: Record<string, unknown>): void {
+    if (this.isRunning(executionId)) {
+      this.fail(facts, executionId, "ABANDONED", "infrastructure", { ...evidence, reason: "DAEMON_STOPPING", reasonCode: ReasonCode.INTERNAL_ERROR });
+    } else {
+      this.refuseLate(facts, executionId, { ...evidence, reason: "AUTHORITY_WITHDRAWN" });
+    }
+  }
+
   private refuseLate(facts: TurnFacts, executionId: string, evidence: Record<string, unknown>): void {
     this.ports.audit.record({
       kind: WorkerTurnEvent.LATE_RESULT_REFUSED,
