@@ -1,15 +1,17 @@
 import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { sha256 } from "../core/digest.ts";
+import { type Decision, allow, deny } from "../core/errors.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import {
   isVerificationCommandRefused,
+  resolveVerificationExecutable,
   verificationExecutableRefusalMessage,
   type VerificationCommand,
 } from "../contracts/verification-command.ts";
@@ -293,6 +295,96 @@ export const memoryLimitForPlatform = (
   platform: NodeJS.Platform = process.platform,
 ): "hard" | "observed" => (platform === "darwin" ? "observed" : "hard");
 
+/**
+ * macOS ships `/usr/bin/git` as an xcrun stub, not as git: it looks up the active developer
+ * directory and then the tool inside it. Measured: for a developer directory that is not the
+ * Command Line Tools -- an Xcode.app, as `xcode-select` names on GitHub's macOS runners -- that
+ * lookup spawns `xcodebuild`, and when the spawn fails the stub exits 71 (EX_OSERR) before git ever
+ * runs. Inside the sandbox it must fail: the candidate runs under RLIMIT_NPROC 1, which refuses
+ * every spawn. So the stub is resolved here, outside the sandbox, and the sandbox execs the tool
+ * itself. Nothing is added to the profile: the tool is read and executed exactly as the stub would
+ * have exec'd it, and the sandbox no longer runs xcrun at all.
+ *
+ * Resolving outside also fixes which `git` runs. Inside, the sandbox PATH lists the worktree before
+ * `/usr/bin`, so a candidate that commits an executable named `git` at its root was run in place of
+ * git -- measured: `git status --porcelain` printed the candidate's output and exited 0 -- while the
+ * allowlist outside had approved `/usr/bin/git`.
+ */
+const XCRUN_STUBS: ReadonlySet<string> = new Set(["/usr/bin/git"]);
+const XCRUN = "/usr/bin/xcrun";
+/**
+ * A bound, not a measurement: a warm `xcrun --find` answers in milliseconds, and a cold one on an
+ * Xcode host runs `xcodebuild` first, which is the slow case this leaves room for.
+ */
+const XCRUN_FIND_TIMEOUT_MS = 30_000;
+
+type DeveloperToolFinder = (name: string) => Promise<string>;
+
+const xcrunFind: DeveloperToolFinder = async (name) => {
+  const { stdout } = await exec(XCRUN, ["--find", name], {
+    encoding: "utf8",
+    timeout: XCRUN_FIND_TIMEOUT_MS,
+    // The daemon's own developer-directory choice, and nothing else of its environment.
+    env: {
+      PATH: process.env["PATH"] ?? "/usr/bin:/bin",
+      HOME: process.env["HOME"] ?? "",
+      ...(process.env["DEVELOPER_DIR"] ? { DEVELOPER_DIR: process.env["DEVELOPER_DIR"] } : {}),
+    },
+  });
+  return stdout.trim();
+};
+
+let findDeveloperTool: DeveloperToolFinder = xcrunFind;
+
+const executableFileAt = (path: string): boolean => {
+  try {
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The argv the sandbox execs: the command's own, except that an xcrun stub at argv[0] is replaced by
+ * the absolute path of the tool it stands for. A tool that cannot be located, or a location that is
+ * not an executable of the same name, is a refusal -- falling back to the stub would only move the
+ * failure inside the sandbox, where it cannot say why.
+ */
+export const sandboxLaunchArgv = async (
+  argv: readonly string[],
+  context: { cwd: string; additionalRoots: readonly string[] },
+): Promise<Decision<readonly string[]>> => {
+  const resolved = resolveVerificationExecutable(argv[0] ?? "", context).resolvedPath;
+  if (resolved === null || !XCRUN_STUBS.has(resolved)) return allow(ReasonCode.OK, argv);
+  const name = basename(resolved);
+  let found: string;
+  try {
+    found = await findDeveloperTool(name);
+  } catch (error) {
+    const failed = error as { stderr?: string; message?: string };
+    return deny(ReasonCode.INVALID_ARGUMENT, `could not locate developer tool '${name}' outside the sandbox`, {
+      stub: resolved,
+      detail: (failed.stderr || failed.message || String(error)).trim().slice(0, 2_000),
+    });
+  }
+  let target: string | null = null;
+  try {
+    target = isAbsolute(found) ? realpathSync(found) : null;
+  } catch {
+    target = null;
+  }
+  if (target === null || XCRUN_STUBS.has(target) || basename(target) !== name || !executableFileAt(target)) {
+    return deny(ReasonCode.INVALID_ARGUMENT, `the located developer tool is not an executable '${name}'`, {
+      stub: resolved,
+      located: found,
+      target,
+    });
+  }
+  return allow(ReasonCode.OK, [target, ...argv.slice(1)]);
+};
+
 /** Test-only scope for the independent descendant-fencing regression. */
 export const __testing = Object.freeze({
   withProcessCountLimitDisabled: async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -302,6 +394,16 @@ export const __testing = Object.freeze({
       return await operation();
     } finally {
       enforceProcessCountLimit = previous;
+    }
+  },
+  /** Stand in for `xcrun --find`, to place the developer tool where another host would have it. */
+  withDeveloperToolFinder: async <T>(finder: DeveloperToolFinder, operation: () => Promise<T>): Promise<T> => {
+    const previous = findDeveloperTool;
+    findDeveloperTool = finder;
+    try {
+      return await operation();
+    } finally {
+      findDeveloperTool = previous;
     }
   },
 });
@@ -412,6 +514,18 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     rmSync(scratch, { recursive: true, force: true });
     return refused(command, startedMs, startedAt, mechanism, targets.reasonCode, targets.reason);
   }
+  const launch = await sandboxLaunchArgv(command.argv, executableContext);
+  if (!launch.allowed) {
+    rmSync(scratch, { recursive: true, force: true });
+    return refused(
+      command,
+      startedMs,
+      startedAt,
+      mechanism,
+      launch.reasonCode,
+      `${launch.message}: ${JSON.stringify(launch.evidence)}`,
+    );
+  }
   const env = buildSandboxEnvironment(command, scratch, request.env, targets.worktree);
   if (!existsSync(RESOURCE_WRAPPER)) {
     rmSync(scratch, { recursive: true, force: true });
@@ -435,7 +549,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     String(command.maxCpuSeconds ?? command.timeoutSeconds),
     String(hardMemoryLimit ? command.maxMemoryMb * 1024 * 1024 : 0),
     enforceProcessCountLimit ? "1" : "0",
-    ...command.argv,
+    ...launch.value,
   ];
   const file = "/usr/bin/sandbox-exec";
   const argv = [

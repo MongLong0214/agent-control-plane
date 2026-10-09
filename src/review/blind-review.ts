@@ -2,6 +2,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
+import {
+  type BootstrapPlanBinding,
+  type PlannedBootstrapOutputs,
+  bootstrapPlanCoverageTargets,
+  currentBootstrapPlan,
+  isProjectlessBootstrap,
+  sameBootstrapPlanBinding,
+} from "../bootstrap/bootstrap-plan.ts";
 import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
@@ -86,6 +94,11 @@ export interface ReviewPacket {
   verdict: ReviewVerdict;
   findings: ReviewFinding[];
   chunked: boolean;
+  /**
+   * Issue #246 PR-C slice C2 — present only on a BOOTSTRAP_PLAN review: the PLAN, manifest and
+   * planned outputs the reviewer judged, as the gate reloaded them from the PLAN artifact.
+   */
+  bootstrapPlan?: BootstrapPlanBinding;
   createdAt: string;
 }
 
@@ -96,6 +109,8 @@ export interface ReviewerPreference {
 }
 
 export interface BlindReviewRequest {
+  /** A candidate review: the frozen repositories' diffs and their verification. The default. */
+  kind?: "CANDIDATE";
   runId: string;
   projectId: string | null;
   executionMode: ExecutionMode;
@@ -105,13 +120,48 @@ export interface BlindReviewRequest {
   verification: VerificationReport;
 }
 
+/**
+ * Issue #246 PR-C slice C2 — the review a project-less PROJECT_BOOTSTRAP candidate gets before any
+ * write: its planned outputs judged against the task contract and the project manifest.
+ *
+ * Like a candidate request, this is a transport envelope. The gate trusts only the run, the
+ * candidate the run is on and the PLAN artifact that candidate names; the planned outputs and the
+ * manifest it reviews are reloaded from that artifact (`currentBootstrapPlan`). Anything a caller
+ * puts in `plannedOutputs` or `manifest` is never read.
+ */
+export interface BootstrapPlanReviewRequest {
+  kind: "BOOTSTRAP_PLAN";
+  runId: string;
+  snapshot: CandidateSnapshot;
+  contract: TaskContract;
+  contractDigest: string;
+  plannedOutputs?: unknown;
+  manifest?: unknown;
+}
+
 /** The composition root supplies the capacity admission that reviewer allocation needs. */
 export interface BlindReviewCapacityGate {
   refreshForBlindReview(target?: DispatchCapacityTarget): Promise<Decision<void>>;
 }
 
 /** Narrow capability the composition root hands to CandidatePipeline, not to agents. */
-export type BlindReviewInvoker = (request: BlindReviewRequest) => Promise<Decision<ReviewPacket>>;
+export type BlindReviewInvoker = (
+  request: BlindReviewRequest | BootstrapPlanReviewRequest,
+) => Promise<Decision<ReviewPacket>>;
+
+/** What every reviewer constituted for a run needs to know about the request. */
+type ReviewSubject = Pick<BlindReviewRequest, "runId" | "snapshot">;
+
+/** A BOOTSTRAP_PLAN request once its trusted inputs have been reloaded. */
+interface TrustedBootstrapPlanReview {
+  runId: string;
+  snapshot: CandidateSnapshot;
+  contract: TaskContract;
+  contractDigest: string;
+  binding: BootstrapPlanBinding;
+  outputs: PlannedBootstrapOutputs;
+  manifest: unknown;
+}
 
 const VERDICT_SCHEMA = {
   type: "object",
@@ -240,12 +290,17 @@ export class BlindReviewGate {
   }
 
   async review(
-    request: BlindReviewRequest,
+    request: BlindReviewRequest | BootstrapPlanReviewRequest,
     capability?: symbol,
   ): Promise<Decision<ReviewPacket>> {
     if (capability !== this.#pipelineCapability) {
       return this.manualInvocation("unscoped-review-call", request.runId) as Decision<ReviewPacket>;
     }
+    if (request.kind === "BOOTSTRAP_PLAN") return this.reviewBootstrapPlan(request);
+    return this.reviewCandidate(request);
+  }
+
+  private async reviewCandidate(request: BlindReviewRequest): Promise<Decision<ReviewPacket>> {
     const snapshotDigest = candidateSnapshotDigest(request.snapshot);
 
     // The caller's JSON is a transport envelope, never evidence. In particular, a caller
@@ -277,134 +332,218 @@ export class BlindReviewGate {
         const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
-        outcome = await this.singleReview(request, diffs, reviewer.value);
+        outcome = await this.singleReview(request, this.buildPrompt(request, diffs), reviewer.value);
       }
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
-      const authoritativeReviewer = outcome.value.reviewer;
-
-      // A reviewer binding is a fencing token. If something replaced it while the
-      // provider was working, its verdict is no longer attributable to the active role.
-      if (!this.bindings.isCurrent(authoritativeReviewer.roleKey, authoritativeReviewer.generation)) {
-        return deny(ReasonCode.BINDING_GENERATION_STALE, "reviewer binding changed during review", {
-          runId: request.runId,
-          roleKey: authoritativeReviewer.roleKey,
-          generation: authoritativeReviewer.generation,
-        });
-      }
-
-      const packet = this.assemble({
-        request,
+      return this.settle({
+        runId: request.runId,
+        contractDigest: request.contractDigest,
         snapshotDigest,
-        reviewer: authoritativeReviewer,
+        outcome: outcome.value,
         chunked,
-        raw: outcome.value.verdict,
-        providerSessionId: outcome.value.providerSessionId,
         expected,
         binaryArtifacts,
-        egressEvidence: outcome.value.egressEvidence,
+        bootstrapPlan: null,
       });
-
-      // §18.4 / CP-HI-04 — re-check independence at packet time: a session can join the
-      // producer set after the reviewer was bound.
-      const independence = this.bindings.assertReviewerIndependence(
-        request.runId,
-        authoritativeReviewer.sessionId,
-      );
-      if (!independence.allowed) {
-        this.audit.record({
-          kind: "BLIND_REVIEW_REJECTED",
-          runId: request.runId,
-          sessionId: authoritativeReviewer.sessionId,
-          reasonCode: independence.reasonCode,
-          evidence: independence.evidence,
-        });
-        return independence as Decision<ReviewPacket>;
-      }
-
-      const validated = this.validateCoverage(packet, expected);
-      this.artifacts.putEvidence(
-        this.evidenceWriter,
-        request.runId,
-        ArtifactKind.BLIND_REVIEW,
-        validated,
-        snapshotDigest,
-      );
-
-      this.audit.record({
-        kind: "BLIND_REVIEW_COMPLETED",
-        runId: request.runId,
-        sessionId: authoritativeReviewer.sessionId,
-        roleKey: authoritativeReviewer.roleKey,
-        reasonCode:
-          validated.verdict === "PASS"
-            ? ReasonCode.REVIEW_PASS
-            : validated.verdict === "REVISE"
-              ? ReasonCode.REVIEW_REVISE
-              : ReasonCode.REVIEW_BLOCK,
-        evidence: {
-          candidateSnapshotDigest: snapshotDigest,
-          verdict: validated.verdict,
-          provider: authoritativeReviewer.preference.provider,
-          model: authoritativeReviewer.preference.model,
-          effort: authoritativeReviewer.preference.effort,
-          coveredFiles: validated.coveredFiles.length,
-          omittedItems: validated.omittedItems,
-          chunked,
-          findings: validated.findings.length,
-          egressRecords: validated.egressEvidence.length,
-          egressProviders: [...new Set(validated.egressEvidence.map((record) => record.provider))],
-          // The final reviewer is the packet authority. Persist the distinct chunk
-          // reviewers too, because they are the sessions that actually saw the diff.
-          chunkReviewerSessions: outcome.value.chunkReviewers.map((chunkReviewer) => ({
-            sessionId: chunkReviewer.sessionId,
-            incarnation: chunkReviewer.incarnation,
-            providerSessionId: chunkReviewer.providerSessionId,
-            generation: chunkReviewer.generation,
-            provider: chunkReviewer.provider,
-          })),
-        },
-      });
-
-      this.telemetry.record({
-        scope: "quality",
-        name: "blind_review",
-        runId: request.runId,
-        text: validated.verdict,
-        dims: {
-          provider: authoritativeReviewer.preference.provider,
-          model: authoritativeReviewer.preference.model,
-          chunked,
-          findingCategories: validated.findings.map((f) => f.category),
-        },
-      });
-
-      if (validated.verdict !== "PASS") {
-        return deny(
-          validated.verdict === "REVISE" ? ReasonCode.REVIEW_REVISE : ReasonCode.REVIEW_BLOCK,
-          `blind review returned ${validated.verdict}`,
-          { runId: request.runId, packet: validated },
-        );
-      }
-      if (validated.omittedItems.length > 0) {
-        return deny(ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT, "PASS requires zero omitted items", {
-          runId: request.runId,
-          omittedItems: validated.omittedItems,
-        });
-      }
-      return allow(ReasonCode.REVIEW_PASS, validated);
     } finally {
-      // Do not revoke a replacement owned by another attempt. Every reviewer constituted
-      // by this attempt is stopped explicitly, including a chunk reviewer on an error path
-      // before a final reviewer exists.
-      const latestReviewer = reviewers.at(-1);
-      if (latestReviewer && this.bindings.isCurrent(latestReviewer.roleKey, latestReviewer.generation)) {
-        this.bindings.revoke(latestReviewer.roleKey, "blind review complete");
-      }
-      for (const reviewer of reviewers) {
-        this.sessions.transition(reviewer.sessionId, SessionLifecycle.STOPPED, "blind review complete");
-        rmSync(reviewer.workdir, { recursive: true, force: true });
-      }
+      this.release(reviewers);
+    }
+  }
+
+  /**
+   * Issue #246 PR-C slice C2 — the BOOTSTRAP_PLAN review. The planned outputs and the manifest come
+   * from the PLAN artifact the run's current candidate names, never from the request; the reviewer
+   * is constituted, isolated, egress-checked and judged for coverage exactly as a candidate's is,
+   * and its packet is stored through the same evidence writer with the PLAN binding it judged.
+   */
+  private async reviewBootstrapPlan(request: BootstrapPlanReviewRequest): Promise<Decision<ReviewPacket>> {
+    const snapshotDigest = candidateSnapshotDigest(request.snapshot);
+    const trusted = this.trustedBootstrapPlanInputs(request, snapshotDigest);
+    if (!trusted.allowed) return trusted as Decision<ReviewPacket>;
+    const inputs = trusted.value;
+    const expected = bootstrapPlanCoverageTargets(inputs.outputs);
+
+    const reviewers: ReviewerBinding[] = [];
+    try {
+      const reviewer = await this.constituteReviewer(inputs);
+      if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
+      reviewers.push(reviewer.value);
+      const outcome = await this.singleReview(
+        inputs,
+        this.buildBootstrapPlanPrompt(inputs, expected),
+        reviewer.value,
+        BOOTSTRAP_PLAN_REVIEWER_SYSTEM_PROMPT,
+      );
+      if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
+      // Review round 1 (RF-REVIEW-02) — the reviewer answered asynchronously, and `plan_submit` may
+      // have replaced the PLAN meanwhile. The trusted inputs are reloaded before the verdict is kept:
+      // a verdict on a PLAN the run no longer has is stale (EVIDENCE_STALE) and is not stored, so
+      // only a review of the current PLAN can make its candidate ready. `settle` does not await, so
+      // nothing can replace the PLAN between this reload and the packet it stores.
+      const stillCurrent = this.trustedBootstrapPlanInputs(request, snapshotDigest);
+      if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+      return this.settle({
+        runId: inputs.runId,
+        contractDigest: inputs.contractDigest,
+        snapshotDigest,
+        outcome: outcome.value,
+        chunked: false,
+        expected,
+        binaryArtifacts: [],
+        bootstrapPlan: inputs.binding,
+      });
+    } finally {
+      this.release(reviewers);
+    }
+  }
+
+  /**
+   * What every review does with a verdict once a reviewer has answered: the reviewer's binding is
+   * still the current one, the packet is assembled, independence is asked again, coverage decides
+   * whether a PASS stands, and the packet is stored as BLIND_REVIEW evidence before the verdict is
+   * returned.
+   */
+  private settle(input: {
+    runId: string;
+    contractDigest: string;
+    snapshotDigest: string;
+    outcome: ReviewOutcome;
+    chunked: boolean;
+    expected: Array<{ identity: string; path: string }>;
+    binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
+    bootstrapPlan: BootstrapPlanBinding | null;
+  }): Decision<ReviewPacket> {
+    const { runId, snapshotDigest, outcome, chunked, expected } = input;
+    const authoritativeReviewer = outcome.reviewer;
+
+    // A reviewer binding is a fencing token. If something replaced it while the
+    // provider was working, its verdict is no longer attributable to the active role.
+    if (!this.bindings.isCurrent(authoritativeReviewer.roleKey, authoritativeReviewer.generation)) {
+      return deny(ReasonCode.BINDING_GENERATION_STALE, "reviewer binding changed during review", {
+        runId,
+        roleKey: authoritativeReviewer.roleKey,
+        generation: authoritativeReviewer.generation,
+      });
+    }
+
+    const packet = this.assemble({
+      request: { runId, contractDigest: input.contractDigest },
+      snapshotDigest,
+      reviewer: authoritativeReviewer,
+      chunked,
+      raw: outcome.verdict,
+      providerSessionId: outcome.providerSessionId,
+      expected,
+      binaryArtifacts: input.binaryArtifacts,
+      egressEvidence: outcome.egressEvidence,
+      bootstrapPlan: input.bootstrapPlan,
+    });
+
+    // §18.4 / CP-HI-04 — re-check independence at packet time: a session can join the
+    // producer set after the reviewer was bound.
+    const independence = this.bindings.assertReviewerIndependence(
+      runId,
+      authoritativeReviewer.sessionId,
+    );
+    if (!independence.allowed) {
+      this.audit.record({
+        kind: "BLIND_REVIEW_REJECTED",
+        runId,
+        sessionId: authoritativeReviewer.sessionId,
+        reasonCode: independence.reasonCode,
+        evidence: independence.evidence,
+      });
+      return independence as Decision<ReviewPacket>;
+    }
+
+    const validated = this.validateCoverage(packet, expected);
+    this.artifacts.putEvidence(
+      this.evidenceWriter,
+      runId,
+      ArtifactKind.BLIND_REVIEW,
+      validated,
+      snapshotDigest,
+    );
+
+    this.audit.record({
+      kind: "BLIND_REVIEW_COMPLETED",
+      runId,
+      sessionId: authoritativeReviewer.sessionId,
+      roleKey: authoritativeReviewer.roleKey,
+      reasonCode:
+        validated.verdict === "PASS"
+          ? ReasonCode.REVIEW_PASS
+          : validated.verdict === "REVISE"
+            ? ReasonCode.REVIEW_REVISE
+            : ReasonCode.REVIEW_BLOCK,
+      evidence: {
+        candidateSnapshotDigest: snapshotDigest,
+        verdict: validated.verdict,
+        provider: authoritativeReviewer.preference.provider,
+        model: authoritativeReviewer.preference.model,
+        effort: authoritativeReviewer.preference.effort,
+        coveredFiles: validated.coveredFiles.length,
+        omittedItems: validated.omittedItems,
+        chunked,
+        findings: validated.findings.length,
+        egressRecords: validated.egressEvidence.length,
+        egressProviders: [...new Set(validated.egressEvidence.map((record) => record.provider))],
+        // The final reviewer is the packet authority. Persist the distinct chunk
+        // reviewers too, because they are the sessions that actually saw the diff.
+        chunkReviewerSessions: outcome.chunkReviewers.map((chunkReviewer) => ({
+          sessionId: chunkReviewer.sessionId,
+          incarnation: chunkReviewer.incarnation,
+          providerSessionId: chunkReviewer.providerSessionId,
+          generation: chunkReviewer.generation,
+          provider: chunkReviewer.provider,
+        })),
+        ...(input.bootstrapPlan === null ? {} : { reviewKind: "BOOTSTRAP_PLAN" }),
+      },
+    });
+
+    this.telemetry.record({
+      scope: "quality",
+      name: "blind_review",
+      runId,
+      text: validated.verdict,
+      dims: {
+        provider: authoritativeReviewer.preference.provider,
+        model: authoritativeReviewer.preference.model,
+        chunked,
+        findingCategories: validated.findings.map((f) => f.category),
+      },
+    });
+
+    if (validated.verdict !== "PASS") {
+      return deny(
+        validated.verdict === "REVISE" ? ReasonCode.REVIEW_REVISE : ReasonCode.REVIEW_BLOCK,
+        `blind review returned ${validated.verdict}`,
+        { runId, packet: validated },
+      );
+    }
+    if (validated.omittedItems.length > 0) {
+      return deny(ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT, "PASS requires zero omitted items", {
+        runId,
+        omittedItems: validated.omittedItems,
+      });
+    }
+    return allow(ReasonCode.REVIEW_PASS, validated);
+  }
+
+  /**
+   * Do not revoke a replacement owned by another attempt. Every reviewer constituted by this
+   * attempt is stopped explicitly, including a chunk reviewer on an error path before a final
+   * reviewer exists.
+   */
+  private release(reviewers: readonly ReviewerBinding[]): void {
+    const latestReviewer = reviewers.at(-1);
+    if (latestReviewer && this.bindings.isCurrent(latestReviewer.roleKey, latestReviewer.generation)) {
+      this.bindings.revoke(latestReviewer.roleKey, "blind review complete");
+    }
+    for (const reviewer of reviewers) {
+      this.sessions.transition(reviewer.sessionId, SessionLifecycle.STOPPED, "blind review complete");
+      rmSync(reviewer.workdir, { recursive: true, force: true });
     }
   }
 
@@ -415,7 +554,7 @@ export class BlindReviewGate {
    * reviewer can be constituted the gate is not lowered — the caller waits.
    */
   private async constituteReviewer(
-    request: BlindReviewRequest,
+    request: ReviewSubject,
     purpose: "blind-review" | "blind-review-chunk" | "blind-review-final" = "blind-review",
   ): Promise<
     Decision<{
@@ -700,14 +839,15 @@ export class BlindReviewGate {
   }
 
   private reviewInvocation(
-    request: BlindReviewRequest,
+    request: ReviewSubject,
     reviewer: ReviewerBinding,
     prompt: string,
     correlationId: string,
+    systemPrompt: string = REVIEWER_SYSTEM_PROMPT,
   ): IsolatedInvocationRequest {
     return {
       prompt,
-      systemPrompt: REVIEWER_SYSTEM_PROMPT,
+      systemPrompt,
       workdir: reviewer.workdir,
       timeoutMs: REVIEW_TIMEOUT_MS,
       model: reviewer.preference.model,
@@ -720,7 +860,7 @@ export class BlindReviewGate {
     };
   }
 
-  private reviewerIsolation(request: BlindReviewRequest, workdir: string): ReviewerIsolation {
+  private reviewerIsolation(request: ReviewSubject, workdir: string): ReviewerIsolation {
     // Canonical, not as-configured: the sandbox profile matches kernel-resolved paths and
     // filters this list against the *realpath* of the packet root. A symlink alias — the
     // `/var` → `/private/var` case every macOS temp path takes — would compile to a deny
@@ -813,9 +953,10 @@ export class BlindReviewGate {
   }
 
   private async singleReview(
-    request: BlindReviewRequest,
-    diffs: Array<{ identity: string; diff: string; files: string[] }>,
+    request: ReviewSubject,
+    prompt: string,
     reviewer: ReviewerBinding,
+    systemPrompt: string = REVIEWER_SYSTEM_PROMPT,
   ): Promise<Decision<ReviewOutcome>> {
     const adapter = this.providers.requireForRole(reviewer.preference.provider, Role.BLIND_REVIEWER);
     const capacity = await this.admitReviewer(reviewer.preference.provider);
@@ -823,8 +964,9 @@ export class BlindReviewGate {
     const result = await adapter.invoke(this.reviewInvocation(
       request,
       reviewer,
-      this.buildPrompt(request, diffs),
+      prompt,
       `${request.runId}:${reviewer.sessionId}`,
+      systemPrompt,
     ));
     const isolation = this.assertIsolationAttested(request.runId, reviewer, result);
     if (!isolation.allowed) return isolation as Decision<ReviewOutcome>;
@@ -1150,8 +1292,70 @@ export class BlindReviewGate {
     return sections.filter(Boolean).join("\n");
   }
 
+  /**
+   * Issue #246 PR-C slice C2 — the reviewer is asked to judge the planned outputs against the task
+   * contract and the project manifest, and to account for every planned file and operation.
+   */
+  private buildBootstrapPlanPrompt(
+    inputs: TrustedBootstrapPlanReview,
+    expected: Array<{ identity: string; path: string }>,
+  ): string {
+    const contract = inputs.contract;
+    return [
+      "# Bootstrap plan review",
+      "",
+      "A new project's repository has not been created yet. Below is everything this plan would",
+      "produce: the files with their exact content, the GitHub operations in the order they run, the",
+      "default branch and the repository they target, the verification command and the handoff to the",
+      "project's first CTO. Judge whether these outputs are what the task contract and the project",
+      "manifest ask for, and whether anything in them is unsafe, wrong or missing.",
+      "",
+      "## Task contract",
+      `Goal: ${contract.goal}`,
+      `Why: ${contract.why}`,
+      `Scope: ${contract.scope.join("; ") || "(unspecified)"}`,
+      `Non-goals: ${contract.nonGoals.join("; ") || "(none)"}`,
+      "Acceptance criteria:",
+      ...contract.acceptance.map((a) => `- ${a}`),
+      "",
+      "## Project manifest",
+      "```json",
+      JSON.stringify(inputs.manifest, null, 2),
+      "```",
+      "",
+      "## Planned outputs",
+      `Plan digest: ${inputs.binding.planDigest}`,
+      `Manifest digest: ${inputs.binding.projectManifestDigest}`,
+      `Planned outputs digest: ${inputs.binding.plannedOutputsDigest}`,
+      "```json",
+      JSON.stringify(inputs.outputs, null, 2),
+      "```",
+      "",
+      "## Required coverage",
+      ...expected.map((target) => `- ${target.identity}:${target.path}`),
+      "",
+      "## Required response",
+      "Return a single JSON object and nothing else — no prose before or after it:",
+      "```json",
+      JSON.stringify(
+        {
+          verdict: "PASS | REVISE | BLOCK",
+          coveredFiles: ["<repository-identity>:<path or #operation/...>"],
+          omittedItems: [],
+          findings: [],
+        },
+        null,
+        2,
+      ),
+      "```",
+      "`coveredFiles` must list every required coverage item you actually examined, exactly as written above.",
+      "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
+      "`findings` may be empty. Everything you need is above; you have no tools and are not expected to look anything up.",
+    ].join("\n");
+  }
+
   private assemble(input: {
-    request: BlindReviewRequest;
+    request: Pick<BlindReviewRequest, "runId" | "contractDigest">;
     snapshotDigest: string;
     reviewer: ReviewerBinding;
     chunked: boolean;
@@ -1160,7 +1364,10 @@ export class BlindReviewGate {
     expected: Array<{ identity: string; path: string }>;
     binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
     egressEvidence: ReviewerEgressRecord[];
+    /** A BOOTSTRAP_PLAN review's binding; null for a candidate review, whose packet has no such key. */
+    bootstrapPlan: BootstrapPlanBinding | null;
   }): ReviewPacket {
+    const bootstrap = input.bootstrapPlan !== null;
     return {
       runId: input.request.runId,
       candidateSnapshotDigest: input.snapshotDigest,
@@ -1173,12 +1380,14 @@ export class BlindReviewGate {
       model: input.reviewer.preference.model,
       effort: input.reviewer.preference.effort,
       egressEvidence: input.egressEvidence,
+      // A BOOTSTRAP_PLAN reviewer reads the planned outputs and the project manifest, not a diff
+      // or verification evidence: there is no repository yet to diff or to verify.
       inputManifest: {
         contract: true,
         snapshotManifest: true,
-        diff: true,
-        verificationEvidence: true,
-        projectContext: false,
+        diff: !bootstrap,
+        verificationEvidence: !bootstrap,
+        projectContext: bootstrap,
         withheld: [...LOGICAL_WITHHELD_INPUTS],
         binaryArtifacts: input.binaryArtifacts,
       },
@@ -1194,6 +1403,7 @@ export class BlindReviewGate {
       verdict: input.raw.verdict,
       findings: input.raw.findings,
       chunked: input.chunked,
+      ...(input.bootstrapPlan === null ? {} : { bootstrapPlan: input.bootstrapPlan }),
       createdAt: this.clock.nowIso(),
     };
   }
@@ -1307,6 +1517,97 @@ export class BlindReviewGate {
       });
     }
     return allow(ReasonCode.OK, { ...request, contract: contract.content, verification: report });
+  }
+
+  /**
+   * Issue #246 PR-C slice C2 — reloads what a BOOTSTRAP_PLAN reviewer may be shown. Trusted: the
+   * run row, the candidate the run is on (whose digest covers its PLAN binding), the pinned task
+   * contract, and the PLAN artifact that binding names. The planned outputs and the manifest are
+   * recomputed from that artifact; the request's own `plannedOutputs` and `manifest` are not read.
+   */
+  private trustedBootstrapPlanInputs(
+    request: BootstrapPlanReviewRequest,
+    snapshotDigest: string,
+  ): Decision<TrustedBootstrapPlanReview> {
+    const run = this.db.get<{
+      contract_digest: string;
+      current_candidate_digest: string | null;
+      kind: string;
+      project_id: string | null;
+    }>(
+      `SELECT contract_digest, current_candidate_digest, kind, project_id FROM runs WHERE run_id = ?`,
+      [request.runId],
+    );
+    if (!run || request.snapshot.runId !== request.runId) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "review request is not bound to a persisted run", {
+        runId: request.runId,
+        snapshotRunId: request.snapshot.runId,
+      });
+    }
+    if (!isProjectlessBootstrap({ kind: run.kind, projectId: run.project_id })) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "a BOOTSTRAP_PLAN review is for a project-less PROJECT_BOOTSTRAP run", {
+        runId: request.runId,
+        kind: run.kind,
+        projectId: run.project_id,
+      });
+    }
+    if (run.current_candidate_digest !== snapshotDigest) {
+      return deny(ReasonCode.EVIDENCE_STALE, "review request is not the run's current candidate", {
+        runId: request.runId,
+        currentCandidate: run.current_candidate_digest,
+        snapshotDigest,
+      });
+    }
+    if (request.snapshot.contractDigest !== run.contract_digest || request.contractDigest !== run.contract_digest) {
+      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "review request is not pinned to the run contract", {
+        runContractDigest: run.contract_digest,
+        snapshotContractDigest: request.snapshot.contractDigest,
+        suppliedContractDigest: request.contractDigest,
+      });
+    }
+    const contract = this.artifacts
+      .list<TaskContract>(request.runId, ArtifactKind.TASK_CONTRACT)
+      .find((artifact) => !artifact.superseded && artifact.digest === run.contract_digest);
+    if (!contract || digestOf(contract.content) !== run.contract_digest) {
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "the run's pinned task contract is not retrievable by digest", {
+        runId: request.runId,
+        expected: run.contract_digest,
+        found: contract?.digest ?? null,
+      });
+    }
+    if (digestOf(request.contract) !== run.contract_digest) {
+      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "the supplied task contract is not the run's immutable contract", {
+        runId: request.runId,
+        expected: run.contract_digest,
+        found: contract.digest,
+      });
+    }
+    const named = request.snapshot.bootstrapPlan;
+    if (request.snapshot.repositories.length > 0 || named === undefined) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "a BOOTSTRAP_PLAN candidate names its PLAN and joins no repository", {
+        runId: request.runId,
+        repositories: request.snapshot.repositories.length,
+        bootstrapPlan: named ?? null,
+      });
+    }
+    const current = currentBootstrapPlan(request.runId, this.artifacts.latest<unknown>(request.runId, ArtifactKind.PLAN));
+    if (!current.allowed) return current as Decision<TrustedBootstrapPlanReview>;
+    if (!sameBootstrapPlanBinding(current.value.binding, named)) {
+      return deny(ReasonCode.EVIDENCE_STALE, "the candidate names a PLAN, manifest or planned outputs that are not the run's current ones", {
+        runId: request.runId,
+        candidate: named,
+        current: current.value.binding,
+      });
+    }
+    return allow(ReasonCode.OK, {
+      runId: request.runId,
+      snapshot: request.snapshot,
+      contract: contract.content,
+      contractDigest: run.contract_digest,
+      binding: current.value.binding,
+      outputs: current.value.outputs,
+      manifest: current.value.manifest,
+    });
   }
 
   /** Registry uncertainty must remain distinct from fallback-eligible capacity denial. */
@@ -1460,6 +1761,16 @@ const REVIEWER_SYSTEM_PROMPT = [
   "Judge only the candidate diff against the stated contract and the verification evidence.",
   "Attack the result: look for correctness defects, regressions, security issues, scope creep,",
   "missing evidence and stale claims. Do not praise. Do not restate the diff.",
+  "If you could not examine something, say so in omittedItems rather than guessing.",
+].join(" ");
+
+/** The same independent reviewer, told that the candidate is a plan's outputs rather than a diff. */
+const BOOTSTRAP_PLAN_REVIEWER_SYSTEM_PROMPT = [
+  "You are an independent blind reviewer for a production gate.",
+  "You did not write this plan and you have no access to how it was produced.",
+  "Judge only the planned outputs against the stated task contract and the project manifest.",
+  "Attack the result: look for correctness defects, security issues, scope creep, outputs the",
+  "manifest does not call for and outputs it calls for that are missing. Do not praise.",
   "If you could not examine something, say so in omittedItems rather than guessing.",
 ].join(" ");
 

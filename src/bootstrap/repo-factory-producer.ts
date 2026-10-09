@@ -7,6 +7,7 @@ import {
   writeFileSync,
   type Stats,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 
 import { z } from "zod";
@@ -136,6 +137,58 @@ export const repoFactoryPlanFixtureSchema = z
 
 export type RepoFactoryPlanFixture = z.infer<typeof repoFactoryPlanFixtureSchema>;
 
+/**
+ * Issue #246 PR-C slice C2 — one file a bootstrap plan says the produced repository holds, with its
+ * exact bytes and git mode. The producer writes exactly these and nothing else into the commit, and
+ * the tree at the produced head must then equal them (`producedTreeDrift`).
+ */
+export interface PlannedBootstrapFile {
+  path: string;
+  mode: "100644";
+  content: string;
+}
+
+/** The one content file this producer commits. Its name is fixed; only its bytes vary by plan. */
+export const BOOTSTRAP_CONTENT_FILE = ".repo-factory-bootstrap.json";
+
+/**
+ * The files a plan produces, rendered from the plan alone. `plannedBootstrapOutputs` lists exactly
+ * these for review, and the producer writes exactly these, so the reviewed outputs and the produced
+ * ones cannot be two renderings. That sharing is not the verification: the produced tree is read
+ * back at its exact head and compared with the approved files (`producedTreeDrift`).
+ */
+export const plannedBootstrapFiles = (
+  plan: Pick<RepoFactoryPlanFixture, "runId" | "repositoryRole">,
+): PlannedBootstrapFile[] => [
+  {
+    path: BOOTSTRAP_CONTENT_FILE,
+    mode: "100644",
+    content: `${JSON.stringify({ runId: plan.runId, repositoryRole: plan.repositoryRole }, null, 2)}\n`,
+  },
+];
+
+/**
+ * A planned file is written at the checkout's root. A name with a separator, `.`/`..`, git's own
+ * directory or this producer's bookkeeping marker is refused before anything is written: the
+ * producer writes only what a reviewer could read as a plain file of the new repository.
+ */
+const plannedFileSchema = z
+  .object({
+    path: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]+$/, "a planned file is a single file name at the repository root")
+      .refine((path) => path !== "." && path !== ".." && path !== ".git", "a planned file cannot name git's own entries")
+      .refine((path) => path !== OPERATION_MARKER_NAME, "a planned file cannot name the producer's marker"),
+    mode: z.literal("100644"),
+    content: z.string(),
+  })
+  .strict();
+
+const plannedFilesSchema = z
+  .array(plannedFileSchema)
+  .min(1)
+  .refine((files) => new Set(files.map((file) => file.path)).size === files.length, "a planned file is named twice");
+
 export interface RepoFactoryGitHubInput {
   port: GitHubWritePort;
   /** What the owner approved — supplied by the caller, never read from the plan. */
@@ -154,7 +207,79 @@ export interface RepoFactoryProducerInput {
    * failure does, and propagates.
    */
   persist?: (result: RepoFactoryResult) => void;
+  /**
+   * Issue #246 PR-C slice C2 — the files the approved plan names (`plannedBootstrapOutputs`). The
+   * producer commits exactly these, and refuses `BOOTSTRAP_CONTRACT_DRIFT` unless the tree at the
+   * head it reports is exactly these. Omitted, they are `plannedBootstrapFiles(plan)`.
+   */
+  approvedFiles?: readonly PlannedBootstrapFile[];
 }
+
+/** The blob id git gives `content`, in the object format the repository's own ids use. */
+const blobId = (content: string, objectFormat: "sha1" | "sha256"): string => {
+  const bytes = Buffer.from(content, "utf8");
+  return createHash(objectFormat).update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+};
+
+/**
+ * Issue #246 PR-C slice C2 — the CEO's correction: rendering the reviewed outputs and the produced
+ * ones from one function is not verification. The tree at the exact head this run reports is read
+ * back with `git ls-tree` and must be the approved files exactly — every path, mode and blob, no
+ * file missing and none extra. Whatever stood between the write and that head (a hook, a filter, a
+ * resumed push that reset onto the commit GitHub holds) is caught here rather than activated.
+ *
+ * Review round 2 (RF-REVIEW-04) — the tree is read with `--no-replace-objects`. A replacement
+ * (`refs/replace/<id>`, under whatever `GIT_REPLACE_REF_BASE` names) changes what a local read of
+ * `<id>` returns and nothing else: `git push` packs the objects themselves, so a hook that committed
+ * unreviewed bytes and then replaced that commit with an approved one passed this check while the
+ * unreviewed bytes were published. Reading unreplaced is reading what the transport sends, whichever
+ * namespace or mechanism the replacement came from; refusing replacement refs instead would have to
+ * enumerate a configurable namespace, and would still read through a replacement made after it looked.
+ */
+export const producedTreeDrift = async (
+  checkoutPath: string,
+  head: string,
+  approved: readonly PlannedBootstrapFile[],
+): Promise<Decision<void>> => {
+  const listed = await git(checkoutPath, ["--no-replace-objects", "ls-tree", "-r", "-z", "--full-tree", head], {
+    allowFailure: true,
+  });
+  if (listed.exitCode !== 0) {
+    return deny(
+      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+      "the produced tree could not be read back at its exact head; refusing to report it as the approved outputs",
+      { head, stderr: listed.stderr },
+    );
+  }
+  // A 64-hex head is a SHA-256 repository; the blob ids are then SHA-256 as well.
+  const objectFormat = head.length === 64 ? "sha256" : "sha1";
+  const observed = new Map<string, { mode: string; type: string; id: string }>();
+  for (const entry of listed.stdout.split("\0").filter((line) => line.length > 0)) {
+    const tab = entry.indexOf("\t");
+    const [mode = "", type = "", id = ""] = entry.slice(0, tab).split(" ");
+    observed.set(entry.slice(tab + 1), { mode, type, id });
+  }
+  const expected = new Map(approved.map((file) => [file.path, { mode: file.mode, type: "blob", id: blobId(file.content, objectFormat) }]));
+  const missing = [...expected.keys()].filter((path) => !observed.has(path)).sort();
+  const extra = [...observed.keys()].filter((path) => !expected.has(path)).sort();
+  const changed = [...expected.entries()]
+    .flatMap(([path, want]) => {
+      const got = observed.get(path);
+      if (!got || (got.mode === want.mode && got.type === want.type && got.id === want.id)) return [];
+      return [{ path, expected: want, observed: got }];
+    })
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  if (missing.length > 0 || extra.length > 0 || changed.length > 0) {
+    return deny(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "the produced tree is not the approved outputs", {
+      refusal: "BOOTSTRAP_CONTRACT_DRIFT",
+      head,
+      missing,
+      extra,
+      changed,
+    });
+  }
+  return allow(ReasonCode.OK, undefined);
+};
 
 /** Single source of truth for where a role's local checkout lives under `workDir`. */
 export const repositoryCheckoutPath = (workDir: string, repositoryRole: string): string =>
@@ -536,8 +661,9 @@ export const trackedFilesOrDeny = (tracked: GitResult): Decision<string[]> => {
 /**
  * Builds one `repo-factory.result.v2` from a real local filesystem/git run — no GitHub
  * write, no hand-authored result. Every fact this returns is something the run actually
- * observed: `bootstrapVerification[].exactHead` is a real `git rev-parse HEAD` read back
- * after the write, and the `externalWriteReceipt` describes the local git repository this
+ * observed: `bootstrapVerification[].exactHead` is the commit this run checked and published (on a
+ * resume, the head GitHub holds as the push step receipted it), and a real `git rev-parse HEAD`
+ * read back after the verification must equal it, and the `externalWriteReceipt` describes the local git repository this
  * call created, not a GitHub resource it never touched.
  *
  * Things this deliberately refuses to fabricate rather than fill because the schema demands
@@ -570,6 +696,13 @@ export const produceRepoFactoryResult = async (
   }
   const plan = parsedPlan.data;
   const clock = input.clock ?? systemClock;
+  const parsedFiles = plannedFilesSchema.safeParse(input.approvedFiles ?? plannedBootstrapFiles(plan));
+  if (!parsedFiles.success) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "the approved files failed validation", {
+      issues: parsedFiles.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
+    });
+  }
+  const approvedFiles = parsedFiles.data;
 
   if (plan.githubOperations.length > 0 && input.github === undefined) {
     return deny(
@@ -707,14 +840,12 @@ export const produceRepoFactoryResult = async (
   // against a produced repository and asserting its output is empty.
   writeFileSync(join(localRepoPath, ".git", "info", "exclude"), `${OPERATION_MARKER_NAME}\n`, { flag: "a" });
 
-  writeFileSync(
-    join(localRepoPath, ".repo-factory-bootstrap.json"),
-    `${JSON.stringify({ runId: plan.runId, repositoryRole: plan.repositoryRole }, null, 2)}\n`,
-  );
+  // The approved files and nothing else (#246 C2): the bytes the plan's review read.
+  for (const file of approvedFiles) writeFileSync(join(localRepoPath, file.path), file.content);
 
-  // Only the bootstrap content file is tracked — the ownership marker above is bookkeeping
-  // for this function's own retry/cleanup logic, not part of the repository's real content.
-  await gitOrCleanup(["add", ".repo-factory-bootstrap.json"]);
+  // Only the approved files are tracked — the ownership marker above is bookkeeping for this
+  // function's own retry/cleanup logic, not part of the repository's real content.
+  await gitOrCleanup(["add", "--", ...approvedFiles.map((file) => file.path)]);
   const commit = await gitOrCleanup(
     [
       "-c", "user.email=repo-factory@local",
@@ -731,6 +862,39 @@ export const produceRepoFactoryResult = async (
       { stderr: commit.stderr },
     );
   }
+
+  // #246 C2, review round 1 (RF-REVIEW-01) — the commit just made is compared with the approved
+  // files before anything reaches GitHub. Checked only after the GitHub operations, a tree a hook
+  // had changed was refused once the repository existed with those bytes pushed, its default branch
+  // set and its branch protected; a refusal undoes none of that. A head GitHub already holds is
+  // checked the same way once it is checked out (`approvedTree` below), and the head this run
+  // finally reports once more after.
+  //
+  // Review round 3 (RF-REVIEW-01) — what is checked is a commit id, and that id is what is published:
+  // the push sends `validatedHead` and the result reports the head the push step receipted. HEAD is
+  // read once, here, before any await on GitHub; read again later it could name a commit that moved
+  // in while GitHub was awaited, which nothing had checked.
+  const approvedTree = (at: string): Promise<Decision<void>> => producedTreeDrift(localRepoPath, at, approvedFiles);
+  const checkedCommit = async (): Promise<Decision<string>> => {
+    const committed = await tryRevParse(localRepoPath, "HEAD");
+    if (!committed) {
+      return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "local repository has no exact HEAD after commit", { localRepoPath });
+    }
+    const committedDrift = await approvedTree(committed);
+    return committedDrift.allowed ? allow(ReasonCode.OK, committed) : (committedDrift as Decision<string>);
+  };
+  let validated: Decision<string>;
+  try {
+    validated = await checkedCommit();
+  } catch (thrown) {
+    cleanup();
+    throw thrown;
+  }
+  if (!validated.allowed) {
+    cleanup();
+    return validated as Decision<RepoFactoryResult>;
+  }
+  const validatedHead = validated.value;
 
   // GitHub's half, between the commit and the verification: the verified head below must be
   // the head GitHub holds. On a resumed push the commit just made is not that head — its
@@ -759,6 +923,8 @@ export const produceRepoFactoryResult = async (
           }),
         ledgerPath,
         clock,
+        approvedTree,
+        validatedHead,
       });
     } catch (thrown) {
       cleanup();
@@ -771,14 +937,24 @@ export const produceRepoFactoryResult = async (
     applied = outcome.value;
   }
 
-  const head = await tryRevParse(localRepoPath, "HEAD");
-  if (!head) {
+  // The head this run reports is the one it published — the checked commit, or on a resume the head
+  // GitHub holds as the push step receipted it after checking it — never HEAD read back after the
+  // awaits above (RF-REVIEW-01, round 3). The re-read after verification below refuses a checkout
+  // that is not at it.
+  const head = applied === null ? validatedHead : applied.publishedHead;
+
+  // #246 C2 — the head this run reports, GitHub's own on a resumed push, must hold exactly the
+  // approved files. A drifted tree is refused before it is verified, receipted or activated.
+  let drift: Decision<void>;
+  try {
+    drift = await approvedTree(head);
+  } catch (thrown) {
     cleanup();
-    return deny(
-      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-      "local repository has no exact HEAD after commit",
-      { localRepoPath },
-    );
+    throw thrown;
+  }
+  if (!drift.allowed) {
+    cleanup();
+    return drift as Decision<RepoFactoryResult>;
   }
 
   // The real verification kind this run promises `bootstrapVerification` about. A judge
@@ -803,7 +979,7 @@ export const produceRepoFactoryResult = async (
     );
   }
 
-  const trackedRun = await gitOrCleanup(["ls-tree", "-r", "--name-only", "HEAD"], { allowFailure: true });
+  const trackedRun = await gitOrCleanup(["ls-tree", "-r", "--name-only", head], { allowFailure: true });
   const tracked = trackedFilesOrDeny(trackedRun);
   if (!tracked.allowed) {
     cleanup();

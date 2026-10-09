@@ -44,6 +44,22 @@ export const snapshotRepositorySchema = z
     }
   });
 
+/**
+ * Issue #246 PR-C slice C2 — what a project-less PROJECT_BOOTSTRAP candidate is: its run's PLAN, the
+ * manifest that PLAN carries and the outputs it plans, each by digest. A bootstrap run joins no
+ * repository, so without this every re-plan froze the same empty candidate under the same digest,
+ * and a review of one plan answered for the next.
+ */
+export const snapshotBootstrapPlanSchema = z
+  .object({
+    planDigest: z.string().min(1),
+    projectManifestDigest: z.string().min(1),
+    plannedOutputsDigest: z.string().min(1),
+  })
+  .strict();
+
+export type SnapshotBootstrapPlan = z.infer<typeof snapshotBootstrapPlanSchema>;
+
 export const candidateSnapshotSchema = z
   .object({
     schema: z.literal(CANDIDATE_SNAPSHOT_SCHEMA_ID),
@@ -54,6 +70,8 @@ export const candidateSnapshotSchema = z
     // keeping the schema able to represent the explicit no-op case lets that fact be
     // persisted and re-read by the CEO gate and daemon finalizer.
     repositories: z.array(snapshotRepositorySchema),
+    /** Present only on a project-less bootstrap candidate; every other snapshot omits the key. */
+    bootstrapPlan: snapshotBootstrapPlanSchema.optional(),
     createdAt: z.string().min(1),
   })
   .strict()
@@ -110,6 +128,10 @@ export const duplicateRepositoryRoles = (
  * candidate, so re-freezing an unchanged candidate must produce the same digest,
  * while any moved head, tree, pinned manifest, or frozen source lineage must produce
  * a different one.
+ *
+ * A bootstrap candidate's PLAN, manifest and planned outputs are part of its identity (#246 C2):
+ * a re-plan is a different candidate. A snapshot without `bootstrapPlan` digests exactly the four
+ * fields it always did — the key is left out, not set to null — so no existing digest moves.
  */
 export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
   digestOf({
@@ -117,6 +139,7 @@ export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
     runId: snapshot.runId,
     contractDigest: snapshot.contractDigest,
     repositories: snapshot.repositories,
+    ...(snapshot.bootstrapPlan === undefined ? {} : { bootstrapPlan: snapshot.bootstrapPlan }),
   });
 
 export const buildCandidateSnapshot = async (
@@ -186,7 +209,7 @@ export const buildCandidateSnapshot = async (
  * digest-bound candidate that says there is nothing to merge.
  */
 export const buildNoRepositoryCandidateSnapshot = (
-  params: { runId: string; contractDigest: string },
+  params: { runId: string; contractDigest: string; bootstrapPlan?: SnapshotBootstrapPlan },
   clock: Clock,
 ): CandidateSnapshot =>
   candidateSnapshotSchema.parse({
@@ -194,6 +217,7 @@ export const buildNoRepositoryCandidateSnapshot = (
     runId: params.runId,
     contractDigest: params.contractDigest,
     repositories: [],
+    ...(params.bootstrapPlan === undefined ? {} : { bootstrapPlan: params.bootstrapPlan }),
     createdAt: clock.nowIso(),
   });
 
