@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -204,11 +205,26 @@ describe("a migration that would run while another process holds the state", () 
     expect(schemaVersionOf(databasePath)).toBe(11);
     expect(existsSync(migrationApprovalPath(databasePath))).toBe(true);
 
+    const lockPath = join(dirname(databasePath), "agentcpd.lock");
+    const record = readFileSync(lockPath);
     holder.kill("SIGKILL");
     await new Promise<void>((resolve) => holder.once("exit", () => resolve()));
 
-    // And once the holder is gone the same approval still works: the lock is exclusivity for
-    // the migration, not a second thing to approve.
+    // #1070 ACP-WORKER-03-LOCK (narrow review 6): the holder is gone, but its record is an earlier
+    // build's, which an earlier build reclaims by unlinking the path blind, so this build still
+    // refuses and leaves it exactly as it was.
+    const stillRefused = refusalFrom(databasePath);
+    expect(stillRefused.reasonCode).toBe(ReasonCode.DAEMON_ALREADY_RUNNING);
+    expect(schemaVersionOf(databasePath)).toBe(11);
+    expect(existsSync(migrationApprovalPath(databasePath))).toBe(true);
+    expect(readFileSync(lockPath).equals(record), "the dead holder's record was rewritten").toBe(true);
+
+    // Removed the way deploy/README.md says: only once no agentcpd of either build runs.
+    expect(() => process.kill(holder.pid!, 0), "the holder is still running").toThrow();
+    unlinkSync(lockPath);
+
+    // And once the holder and its record are gone the same approval still works: the lock is
+    // exclusivity for the migration, not a second thing to approve.
     openDb(databasePath).close();
     expect(schemaVersionOf(databasePath)).toBe(SCHEMA_VERSION);
   }, 60_000);

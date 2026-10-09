@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { join } from "node:path";
 
@@ -10,17 +10,18 @@ import { sha256 } from "../../src/core/digest.ts";
 import { ClaudeCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
 import type { ReviewerEgressConfig } from "../../src/runtime/provider.ts";
 import { acquireReviewerEgress } from "../../src/runtime/reviewer-egress.ts";
-import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { requireSeatbelt } from "../helpers/seatbelt.ts";
 
 afterAll(cleanupTempDirs);
 
-const seatbeltCanApply = (): boolean =>
-  process.platform === "darwin" &&
-  existsSync("/usr/bin/sandbox-exec") &&
-  boundedSpawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
-
-const liveIt = seatbeltCanApply() ? it : it.skip;
+/** A live seatbelt test: skipped loudly, with the reason, where the seatbelt cannot apply; never passed. */
+const liveIt = (name: string, body: () => Promise<void>, timeout?: number): void => {
+  it(name, async (ctx) => {
+    requireSeatbelt(ctx);
+    await body();
+  }, timeout);
+};
 
 const freePort = async (): Promise<number> => new Promise((resolve, reject) => {
   const server = createServer();

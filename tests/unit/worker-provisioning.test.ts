@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 
@@ -1166,9 +1167,13 @@ describe("ACP1069-R1-02: a WORKER and another role never share a session, in eit
         ? vi.spyOn(registry as { assertExclusiveRoleSeparation: () => unknown }, "assertExclusiveRoleSeparation")
           .mockReturnValue({ allowed: true, reasonCode: ReasonCode.OK, evidence: {}, value: undefined })
         : null;
+      // #512 PR-B: from schema v41 the database refuses that state too, so the same write also needs the
+      // v41 worker-independence triggers stood down — a database from before v41 — and put back after.
+      const schemaBefore41 = standDownV41WorkerIndependence(f.harness.cp.db.file);
       const mixed = readySession(f, "mixed-runtime");
       expect(f.harness.cp.bindings.bind({ role: Role.WORKER, taskId: f.taskId, runId: f.runId, sessionId: mixed, verifiedTarget: target }).reasonCode)
         .toBe(ReasonCode.OK);
+      schemaBefore41.restore();
       legacy?.mockRestore();
       const fresh = readySession(f, "move-target");
       const refused = f.harness.cp.bindings.switchTo({
@@ -1193,6 +1198,36 @@ describe("ACP1069-R1-02: a WORKER and another role never share a session, in eit
     });
   });
 });
+
+/**
+ * Takes schema v41's worker-independence triggers (#512 PR-B) off a harness database for one legacy
+ * write, as a database from before v41 has them, and puts the exact same definitions back.
+ */
+const standDownV41WorkerIndependence = (file: string): { restore: () => void } => {
+  const names = [
+    "assignments_worker_session_independent",
+    "assignments_worker_session_independent_on_activate",
+    "conversational_actors_worker_session_independent",
+    "assignments_session_holds_no_worker",
+    "assignments_session_holds_no_worker_on_activate",
+    "conversational_actors_session_holds_no_worker",
+    "runs_owner_session_not_its_worker",
+  ];
+  const raw = new Database(file);
+  const definitions = raw.prepare(
+    `SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name IN (${names.map(() => "?").join(", ")})`,
+  ).all(...names) as Array<{ sql: string }>;
+  expect(definitions).toHaveLength(names.length);
+  for (const name of names) raw.exec(`DROP TRIGGER ${name}`);
+  raw.close();
+  return {
+    restore: () => {
+      const back = new Database(file);
+      for (const { sql } of definitions) back.exec(sql);
+      back.close();
+    },
+  };
+};
 
 describe("ACP1069-R1-03: a worker receipt is admitted and recorded as its session's own provider and model", () => {
   const started = (f: Fixture, workerSessionId: string, fields: Record<string, unknown> = {}) =>

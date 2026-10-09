@@ -1034,6 +1034,30 @@ export class BindingRegistry {
   }
 
   /**
+   * #246 C1-01 — the exclusive-role rule `bind` and `switchTo` apply to an incoming session, asked
+   * of a binding that already exists: whether the session it was bound on, and its actor's live
+   * runtime, still hold it alone. A caller about to reuse a binding rather than mint one admits it
+   * as a fresh bind would have been admitted, so a state an earlier build allowed (a bootstrap CTO
+   * sharing its session with a PRIMARY_CTO) is refused at reuse rather than carried forward. Reads
+   * only; the binding and whatever shares its session are left as they are.
+   */
+  assertHeldAlone(binding: RoleBinding): Decision<void> {
+    const actorId = this.db.get<{ actor_id: string }>(
+      `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+      [binding.assignmentId],
+    )?.actor_id ?? null;
+    for (const sessionId of new Set([binding.boundSessionId, binding.sessionId])) {
+      const separated = this.assertExclusiveRoleSeparation(
+        { role: binding.role, sessionId, projectId: binding.projectId, runId: binding.runId, taskId: binding.taskId },
+        binding.roleKey,
+        actorId,
+      );
+      if (!separated.allowed) return separated;
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
    * #512, #246 — a session holding an exclusive role holds nothing else, whichever is bound first.
    *
    * A WORKER is an implementer, never the session that routes or reviews it. A BOOTSTRAP_CTO is one

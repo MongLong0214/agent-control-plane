@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
 import { disposableWorkspaceLocation } from "../core/disposable-workspace-root.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
 import { assertReviewerCodexHome, claimReviewerCodexHome, type ReviewerCodexHome } from "./reviewer-codex-home.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -309,6 +310,11 @@ export const readCapacityFile = (
  */
 const sanctionedSettings = (): string => JSON.stringify({ hooks: {}, enabledPlugins: {} });
 
+/** #512 — the setting sources a WORKER turn reads: the claimed worktree's, never the operator's. */
+export const WORKER_SETTING_SOURCES = "project,local";
+/** #512 — with `--strict-mcp-config`, the only MCP servers a WORKER turn may start: none. */
+export const WORKER_MCP_CONFIG = JSON.stringify({ mcpServers: {} });
+
 /**
  * macOS rejects nested `sandbox-exec` applications, so the owner egress profile and the
  * generated packet profile are composed into one per-invocation file. The resulting child
@@ -387,6 +393,10 @@ const productionRunCli = async (
     reviewerProvider?: string;
     /** Handshake and verdict processes produce separately labelled JSONL records. */
     reviewerEgressPhase?: ReviewerEgressRecord["phase"];
+    /** #512 — the spawned process's pid and the OS start time read from it; see `InvocationRequest.onSpawn`. */
+    onSpawn?: InvocationRequest["onSpawn"];
+    /** #512 — aborting kills the child's process group; an abort before the spawn spawns nothing. */
+    signal?: AbortSignal;
   },
 ): Promise<{
   stdout: string;
@@ -519,6 +529,10 @@ const productionRunCli = async (
       egressLost: boolean;
     }>((resolve) => {
       let child: ReturnType<typeof spawn>;
+      if (options.signal?.aborted) {
+        resolve({ stdout: "", stderr: "invocation aborted before the provider was spawned", exitCode: null, timedOut: false, egressLost: false });
+        return;
+      }
       try {
         if (options.reviewerPrivateHome) assertReviewerCodexHome(options.reviewerPrivateHome);
         child = spawn("/usr/bin/sandbox-exec", reviewerSandboxArgs(
@@ -550,13 +564,27 @@ const productionRunCli = async (
         timedOut = true;
         killChildTree(child);
       }, options.timeoutMs);
+      const abort = (): void => killChildTree(child);
+      options.signal?.addEventListener("abort", abort, { once: true });
       const finish = (exitCode: number | null): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         stopWatchingEgress?.();
+        options.signal?.removeEventListener("abort", abort);
         resolve({ stdout, stderr, exitCode, timedOut, egressLost });
       };
+      // #512 — reported before anything else can happen to the child, so a runtime that owns this
+      // invocation has recorded the process before it could outlive the daemon. The start time is
+      // read from the process itself; null where the platform cannot report one.
+      if (child.pid !== undefined && options.onSpawn) {
+        try {
+          options.onSpawn(child.pid, readProcessStartToken(child.pid));
+        } catch {
+          // A recorder that throws must not leave the provider running unaccounted for.
+          killChildTree(child);
+        }
+      }
       child.stdout?.on("data", (buffer: Buffer) => (stdout += buffer.toString("utf8")));
       child.stderr?.on("data", (buffer: Buffer) => (stderr += buffer.toString("utf8")));
       if (options.stdin !== undefined) child.stdin?.write(options.stdin);
@@ -1625,6 +1653,27 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     // Make the invocation *be* the constituted session, so the identity the independence
     // check was performed against is the identity that produces the answer.
     if (request.externalSessionId) args.push("--session-id", request.externalSessionId);
+    if (!request.readOnly && !request.isolation && request.managedWrite) {
+      // #512 — a writable worker turn edits files without asking, and gets nothing else: no
+      // `--allowedTools`, no Bash grant and no network grant are added. Its file writes reach only
+      // the target the guard-backed broker authorised for this one invocation (the seatbelt below).
+      args.push("--permission-mode", "acceptEdits");
+      // #512 — and it is not the operator. A task-bound write is a WORKER's (the guard's own
+      // definition), and only `task_worker_run` sends one, so these apply to WORKER turns alone.
+      // Measured on claude 2.1.283 before this: the turn loaded the operator's `~/.claude/CLAUDE.md`,
+      // the user settings (whose permission rules allow Bash), the user's plugins and started every
+      // user MCP server. `--setting-sources project,local` drops the user source — settings,
+      // permission rules, enabled plugins and the user CLAUDE.md with them — and the strict, empty
+      // MCP config starts no MCP server from any scope. Authentication is untouched: it is not a
+      // setting source, and HOME and the config directory are left as they are.
+      args.push(
+        "--setting-sources",
+        WORKER_SETTING_SOURCES,
+        "--mcp-config",
+        WORKER_MCP_CONFIG,
+        "--strict-mcp-config",
+      );
+    }
     if (request.readOnly || request.isolation) {
       // §18.3 — a blind reviewer judges exactly the inputs it was given. Granting it
       // repository tools invites it to go exploring, which both changes what it saw and
@@ -1660,6 +1709,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       reviewerEgress: request.isolation ? this.#reviewerEgress : undefined,
       reviewerProvider: request.isolation ? this.provider : undefined,
       reviewerEgressPhase: request.isolation ? "reviewer-invocation" : undefined,
+      onSpawn: request.onSpawn,
+      signal: request.signal,
     });
 
     let result: Awaited<ReturnType<typeof runCli>>;
@@ -1718,6 +1769,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
           : result.stderr.slice(0, 2000),
       providerSessionId:
         typeof envelope?.["session_id"] === "string" ? (envelope["session_id"] as string) : null,
+      stdout: result.stdout,
       isolationAttested: request.isolation !== undefined && result.isolationEnforced,
       isolationReasonCode:
         request.isolation !== undefined && !result.isolationEnforced ? ReasonCode.ISOLATION_LOST : undefined,

@@ -1,6 +1,6 @@
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import type { CtoLifecycle, CtoPreference } from "../cto/cto-lifecycle.ts";
+import { BOOTSTRAP_CTO_SPAWN_RECORD, type CtoLifecycle, type CtoPreference } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
@@ -42,7 +42,7 @@ export interface BootstrapCtoReclaimReport {
 }
 
 export interface BootstrapCtoStaffingPorts {
-  readonly bindings: Pick<BindingRegistry, "active" | "history" | "bind" | "revoke">;
+  readonly bindings: Pick<BindingRegistry, "active" | "history" | "bind" | "revoke" | "assertHeldAlone">;
   readonly sessions: Pick<SessionRegistry, "get">;
   readonly lifecycle: Pick<CtoLifecycle, "spawnBootstrapCto" | "probeRoleSession" | "stopRoleSession">;
   readonly runs: { get(runId: string): RunRow | null };
@@ -79,10 +79,19 @@ export class BootstrapCtoStaffing {
 
   /**
    * The refusals that need no provider: the run is a project-less PROJECT_BOOTSTRAP, its role was
-   * never held or is held now, and any owner pin names exactly that binding. Answers the live
-   * binding a re-dispatch would reuse, or null when a fresh one is to be staffed.
+   * never held or is held now, any owner pin names exactly that binding, and a binding to be reused
+   * passes the admission a fresh one would (`#admitReuse`). Answers the live binding a re-dispatch
+   * would reuse, or null when a fresh one is to be staffed.
    */
   admit(run: RunRow): Decision<RoleBinding | null> {
+    const role = this.#admitRole(run);
+    if (!role.allowed || !role.value) return role;
+    const reusable = this.#admitReuse(role.value);
+    return reusable.allowed ? role : (reusable as Decision<RoleBinding | null>);
+  }
+
+  /** `admit` without the reuse admission: the run, its role's history, and the owner pin. */
+  #admitRole(run: RunRow): Decision<RoleBinding | null> {
     if (run.kind !== RunKind.PROJECT_BOOTSTRAP || run.projectId !== null) {
       return deny(ReasonCode.INVALID_ARGUMENT, "a bootstrap CTO is staffed only for a project-less PROJECT_BOOTSTRAP run", {
         runId: run.runId,
@@ -129,6 +138,35 @@ export class BootstrapCtoStaffing {
   }
 
   /**
+   * #246 C1-01 — a binding a re-dispatch would reuse is admitted as a fresh bind is: on the fixed
+   * runtime, Claude Opus, by the session it was bound on and its actor's live runtime alike, and
+   * alone on that session (`BindingRegistry.assertHeldAlone`, the rule `bind` applies). A persisted
+   * binding that is not — one an earlier build or a raw write left — is refused with its reason. It
+   * is never reused and never replaced here, and nothing it shares a session with is touched.
+   */
+  #admitReuse(binding: RoleBinding): Decision<void> {
+    for (const sessionId of new Set([binding.boundSessionId, binding.sessionId])) {
+      const session = this.ports.sessions.get(sessionId);
+      if (session?.provider !== BOOTSTRAP_CTO_RUNTIME.provider || session.model !== BOOTSTRAP_CTO_RUNTIME.model) {
+        return deny(
+          ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
+          "the run's bootstrap CTO binding is not on the fixed Claude Opus runtime, so it is not reused",
+          {
+            runId: binding.runId,
+            roleKey: binding.roleKey,
+            sessionId,
+            provider: session?.provider ?? null,
+            model: session?.model ?? null,
+            fixedProvider: BOOTSTRAP_CTO_RUNTIME.provider,
+            fixedModel: BOOTSTRAP_CTO_RUNTIME.model,
+          },
+        );
+      }
+    }
+    return this.ports.bindings.assertHeldAlone(binding);
+  }
+
+  /**
    * After capacity admission: probe and reuse the live binding a re-dispatch finds, or spawn a
    * fresh session on the fixed runtime (launch credential → Buzz → probe → READY → readiness). A
    * reused binding whose session the provider no longer has is refused, not replaced.
@@ -149,15 +187,16 @@ export class BootstrapCtoStaffing {
   }
 
   /**
-   * Inside the dispatch transaction: ask `admit` again — the awaits since can let another dispatch
-   * bind, or a revocation land — then bind generation 1 on the fresh session, or confirm the
-   * reused binding is still the one probed. The answer is the binding the run is pinned to, by its
-   * binding-time runtime (#493), which is what the owner pin's foreign key resolves against.
+   * Inside the dispatch transaction: ask `admit`'s role checks again — the awaits since can let
+   * another dispatch bind, or a revocation land — then bind generation 1 on the fresh session, or
+   * confirm the reused binding is still the one probed and still passes the reuse admission (C1-01).
+   * The answer is the binding the run is pinned to, by its binding-time runtime (#493), which is what
+   * the owner pin's foreign key resolves against.
    */
   bindForDispatch(runId: string, staffed: BootstrapCtoStaffed): Decision<RoleBinding> {
     const run = this.ports.runs.get(runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
-    const admitted = this.admit(run);
+    const admitted = this.#admitRole(run);
     if (!admitted.allowed) return admitted as Decision<RoleBinding>;
     if (staffed.reused) {
       const current = admitted.value;
@@ -173,6 +212,9 @@ export class BootstrapCtoStaffing {
           currentGeneration: current?.bindingGeneration ?? null,
         });
       }
+      // The same binding, asked again here: the probe's await can let its session take another role.
+      const reusable = this.#admitReuse(current);
+      if (!reusable.allowed) return reusable as Decision<RoleBinding>;
       return allow(ReasonCode.OK, {
         ...current,
         sessionId: current.boundSessionId,
@@ -204,7 +246,9 @@ export class BootstrapCtoStaffing {
 
   /**
    * Stops a session `ensure` spawned and the dispatch did not bind. A reused one is left alone, and
-   * so is any session that holds a role, whatever produced it.
+   * so is any session that holds a role, whatever produced it. A stop the provider refuses leaves
+   * the session ERROR; its spawn record (`BOOTSTRAP_CTO_SPAWN_RECORD`) is how `reclaim` finds it to
+   * ask again (C1-04).
    */
   async discard(staffed: BootstrapCtoStaffed, reason: string): Promise<void> {
     if (staffed.reused || this.#holdsRole(staffed.sessionId)) return;
@@ -241,9 +285,12 @@ export class BootstrapCtoStaffing {
 
   /**
    * The daemon sweep. Revokes any BOOTSTRAP_CTO whose run has ended (or is gone) that the terminal
-   * transition did not, then has the provider stop every session that served an ended run's
-   * bootstrap CTO and holds no active role now. A session holding any role — by its recorded
-   * session or its actor's live runtime — is never stopped here.
+   * transition did not, then has the provider stop the sessions that are left over: every session
+   * that served a bootstrap CTO binding since revoked, once its run has ended, and every session
+   * spawned for a run's bootstrap CTO (C1-04) — found by the spawn record written before anything
+   * could refuse it — once its run has ended or once it can never be bound. A session holding any
+   * role — by its recorded session or its actor's live runtime — is never stopped here, and neither
+   * is a spawn a live run's dispatch may still be staffing.
    */
   async reclaim(): Promise<BootstrapCtoReclaimReport> {
     const report: BootstrapCtoReclaimReport = { revoked: [], stopped: [], stopFailed: [] };
@@ -256,25 +303,36 @@ export class BootstrapCtoStaffing {
       if (revoked.allowed) report.revoked.push(row.role_key);
     }
 
-    const served = this.db.all<{ session_id: string; run_id: string | null }>(
+    const candidates = this.db.all<{ session_id: string; run_id: string | null }>(
       `SELECT a.session_id AS session_id, a.run_id AS run_id
-         FROM assignments a
-        WHERE a.role = 'BOOTSTRAP_CTO' AND a.status = 'REVOKED'
+         FROM assignments a JOIN sessions s ON s.session_id = a.session_id
+        WHERE a.role = 'BOOTSTRAP_CTO' AND a.status = 'REVOKED' AND s.lifecycle <> 'STOPPED'
        UNION
        SELECT c.current_session_id AS session_id, a.run_id AS run_id
-         FROM assignments a JOIN conversational_actors c ON c.actor_id = a.actor_id
-        WHERE a.role = 'BOOTSTRAP_CTO' AND a.status = 'REVOKED' AND c.current_session_id IS NOT NULL
+         FROM assignments a
+         JOIN conversational_actors c ON c.actor_id = a.actor_id
+         JOIN sessions s ON s.session_id = c.current_session_id
+        WHERE a.role = 'BOOTSTRAP_CTO' AND a.status = 'REVOKED' AND s.lifecycle <> 'STOPPED'
+       UNION
+       SELECT e.session_id AS session_id, e.run_id AS run_id
+         FROM audit_events e JOIN sessions s ON s.session_id = e.session_id
+        WHERE e.kind = ? AND s.lifecycle <> 'STOPPED'
         ORDER BY session_id`,
+      [BOOTSTRAP_CTO_SPAWN_RECORD],
     );
-    const seen = new Set<string>();
-    for (const { session_id: sessionId, run_id: runId } of served) {
-      if (seen.has(sessionId)) continue;
-      const run = runId === null ? null : this.ports.runs.get(runId);
-      if (run && !isTerminal(run.state)) continue;
-      seen.add(sessionId);
+    const runsOf = new Map<string, Array<string | null>>();
+    for (const { session_id: sessionId, run_id: runId } of candidates) {
+      runsOf.set(sessionId, [...(runsOf.get(sessionId) ?? []), runId]);
+    }
+    for (const [sessionId, runIds] of runsOf) {
       const session = this.ports.sessions.get(sessionId);
       if (!session || session.lifecycle === SessionLifecycle.STOPPED) continue;
       if (this.#holdsRole(sessionId)) continue;
+      const runEnded = runIds.every((runId) => {
+        const run = runId === null ? null : this.ports.runs.get(runId);
+        return !run || isTerminal(run.state);
+      });
+      if (!runEnded && !this.#neverBindable(sessionId, session.lifecycle)) continue;
       const stopped = await this.ports.lifecycle.stopRoleSession(
         sessionId,
         Role.BOOTSTRAP_CTO,
@@ -295,6 +353,22 @@ export class BootstrapCtoStaffing {
       });
     }
     return report;
+  }
+
+  /**
+   * A spawned session that is ERROR and never held any role, by its recorded session or as an
+   * actor's runtime: it can never be bound (ERROR leads only to STOPPED), so it is stopped whatever
+   * its run is doing. A session that held a role waits for its run to end, and one still STARTING or
+   * READY may be the spawn a live run's dispatch is about to bind.
+   */
+  #neverBindable(sessionId: string, lifecycle: SessionLifecycle): boolean {
+    return lifecycle === SessionLifecycle.ERROR && this.db.get<{ role_key: string }>(
+      `SELECT a.role_key FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.session_id = ? OR c.current_session_id = ?
+        LIMIT 1`,
+      [sessionId, sessionId],
+    ) === undefined;
   }
 
   /** Whether the session holds any active role, by its recorded session or its actor's live runtime. */

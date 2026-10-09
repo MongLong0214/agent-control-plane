@@ -1073,6 +1073,7 @@ describe("baseline boundary contracts", () => {
       "v38-canonical-verified-target-override",
       "v39-owner-reply-intent-keeps-its-key",
       "v40-peer-message-carry-record",
+      "v41-runtime-managed-worker-turns",
     ]);
   });
 
