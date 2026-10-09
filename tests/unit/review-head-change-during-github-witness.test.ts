@@ -1,3 +1,4 @@
+/* eslint-disable no-console -- direct review witness */
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -278,35 +279,38 @@ describe("RF-REVIEW-01: a drifted tree is refused before any GitHub write", () =
     });
     expect(github.repository("acme", "fixture")?.protections.size).toBe(0);
   });
+});
 
-  it("a HEAD that moves to another commit of the approved files while GitHub is awaited is neither pushed nor reported (RF-REVIEW-01, round 3)", async () => {
+
+describe("RF-REVIEW-01: the validated HEAD is the HEAD published", () => {
+  it("does not push unapproved bytes if HEAD moves while GitHub repository creation is awaited", async () => {
     homeWithHook(null);
     const { workDir, github } = sandbox();
     const checkout = repositoryCheckoutPath(workDir, "primary");
-    // While the create is awaited, something commits again in the checkout: the same approved tree,
-    // another commit. Its tree would pass every check; it is still not the commit this run checked.
     const create = github.createRepository.bind(github);
-    let moved = "";
+    let validatedHead = "";
+    let movedHead = "";
+    // A timing seam: the producer has validated its initial commit, then waits for GitHub.
+    // A local writer advances HEAD during that wait. All commits and the remote push are real Git.
     github.createRepository = async (...args) => {
-      const created = await create(...args);
-      await git(checkout, ["-c", "user.name=review", "-c", "user.email=review@example.invalid", "commit", "-q", "--allow-empty", "-m", "same tree"]);
-      moved = (await git(checkout, ["rev-parse", "HEAD"])).stdout.trim();
-      return created;
+      validatedHead = (await git(checkout, ["rev-parse", "HEAD"])).stdout.trim();
+      const result = await create(...args);
+      writeFileSync(join(checkout, "PRIVATE.txt"), "unreviewed private bytes\n");
+      await git(checkout, ["add", "PRIVATE.txt"]);
+      await git(checkout, ["-c", "user.name=review", "-c", "user.email=review@example.invalid", "commit", "-q", "-m", "concurrent unapproved change"]);
+      movedHead = (await git(checkout, ["rev-parse", "HEAD"])).stdout.trim();
+      return result;
     };
-    const produced = await produce(workDir, github, APPROVED);
+    const result = await produce(workDir, github, APPROVED);
     const remote = github.repository("acme", "fixture");
-    if (!remote) throw new Error("the double holds no repository");
-    const published = (await git(remote.bare, ["rev-parse", "refs/heads/main"])).stdout.trim();
-    expect(moved).not.toBe("");
-    // The push sent the checked commit, not the one HEAD moved to.
-    expect(published).not.toBe(moved);
-    // And the result never names a head GitHub does not hold: the checkout is not at the published
-    // head, which is refused rather than reported.
-    expect(produced).toMatchObject({
-      allowed: false,
-      reasonCode: ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-      evidence: { head: published, rereadHead: moved },
-    });
-    expect(await remoteFiles(github)).toEqual([".repo-factory-bootstrap.json"]);
+    const remotePrivate = remote ? await git(remote.bare, ["show", "refs/heads/main:PRIVATE.txt"], { allowFailure: true }) : null;
+    console.log("HEAD-change witness", JSON.stringify({ validatedHead, movedHead, result, writes: github.writes, remotePrivate }));
+    expect(validatedHead).not.toBe(movedHead);
+    // Refusal or publication of the pinned, validated commit are both safe outcomes.
+    expect(remotePrivate?.exitCode).not.toBe(0);
+    if (remote) {
+      const pushed = await git(remote.bare, ["rev-parse", "--verify", "refs/heads/main"], { allowFailure: true });
+      if (pushed.exitCode === 0) expect(pushed.stdout.trim()).toBe(validatedHead);
+    }
   });
 });

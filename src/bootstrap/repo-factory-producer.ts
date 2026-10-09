@@ -661,8 +661,9 @@ export const trackedFilesOrDeny = (tracked: GitResult): Decision<string[]> => {
 /**
  * Builds one `repo-factory.result.v2` from a real local filesystem/git run — no GitHub
  * write, no hand-authored result. Every fact this returns is something the run actually
- * observed: `bootstrapVerification[].exactHead` is a real `git rev-parse HEAD` read back
- * after the write, and the `externalWriteReceipt` describes the local git repository this
+ * observed: `bootstrapVerification[].exactHead` is the commit this run checked and published (on a
+ * resume, the head GitHub holds as the push step receipted it), and a real `git rev-parse HEAD`
+ * read back after the verification must equal it, and the `externalWriteReceipt` describes the local git repository this
  * call created, not a GitHub resource it never touched.
  *
  * Things this deliberately refuses to fabricate rather than fill because the schema demands
@@ -868,21 +869,32 @@ export const produceRepoFactoryResult = async (
   // set and its branch protected; a refusal undoes none of that. A head GitHub already holds is
   // checked the same way once it is checked out (`approvedTree` below), and the head this run
   // finally reports once more after.
+  //
+  // Review round 3 (RF-REVIEW-01) — what is checked is a commit id, and that id is what is published:
+  // the push sends `validatedHead` and the result reports the head the push step receipted. HEAD is
+  // read once, here, before any await on GitHub; read again later it could name a commit that moved
+  // in while GitHub was awaited, which nothing had checked.
   const approvedTree = (at: string): Promise<Decision<void>> => producedTreeDrift(localRepoPath, at, approvedFiles);
-  let committedDrift: Decision<void>;
-  try {
+  const checkedCommit = async (): Promise<Decision<string>> => {
     const committed = await tryRevParse(localRepoPath, "HEAD");
-    committedDrift = committed
-      ? await approvedTree(committed)
-      : deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "local repository has no exact HEAD after commit", { localRepoPath });
+    if (!committed) {
+      return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "local repository has no exact HEAD after commit", { localRepoPath });
+    }
+    const committedDrift = await approvedTree(committed);
+    return committedDrift.allowed ? allow(ReasonCode.OK, committed) : (committedDrift as Decision<string>);
+  };
+  let validated: Decision<string>;
+  try {
+    validated = await checkedCommit();
   } catch (thrown) {
     cleanup();
     throw thrown;
   }
-  if (!committedDrift.allowed) {
+  if (!validated.allowed) {
     cleanup();
-    return committedDrift as Decision<RepoFactoryResult>;
+    return validated as Decision<RepoFactoryResult>;
   }
+  const validatedHead = validated.value;
 
   // GitHub's half, between the commit and the verification: the verified head below must be
   // the head GitHub holds. On a resumed push the commit just made is not that head — its
@@ -912,6 +924,7 @@ export const produceRepoFactoryResult = async (
         ledgerPath,
         clock,
         approvedTree,
+        validatedHead,
       });
     } catch (thrown) {
       cleanup();
@@ -924,15 +937,11 @@ export const produceRepoFactoryResult = async (
     applied = outcome.value;
   }
 
-  const head = await tryRevParse(localRepoPath, "HEAD");
-  if (!head) {
-    cleanup();
-    return deny(
-      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-      "local repository has no exact HEAD after commit",
-      { localRepoPath },
-    );
-  }
+  // The head this run reports is the one it published — the checked commit, or on a resume the head
+  // GitHub holds as the push step receipted it after checking it — never HEAD read back after the
+  // awaits above (RF-REVIEW-01, round 3). The re-read after verification below refuses a checkout
+  // that is not at it.
+  const head = applied === null ? validatedHead : applied.publishedHead;
 
   // #246 C2 — the head this run reports, GitHub's own on a resumed push, must hold exactly the
   // approved files. A drifted tree is refused before it is verified, receipted or activated.
@@ -970,7 +979,7 @@ export const produceRepoFactoryResult = async (
     );
   }
 
-  const trackedRun = await gitOrCleanup(["ls-tree", "-r", "--name-only", "HEAD"], { allowFailure: true });
+  const trackedRun = await gitOrCleanup(["ls-tree", "-r", "--name-only", head], { allowFailure: true });
   const tracked = trackedFilesOrDeny(trackedRun);
   if (!tracked.allowed) {
     cleanup();
