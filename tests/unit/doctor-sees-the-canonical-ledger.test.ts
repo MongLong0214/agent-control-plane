@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import type { ConversationTurnCoordinator} from "../../src/conversation/turn-coordinator.ts";
-import { type TurnPermit } from "../../src/conversation/turn-coordinator.ts";
+import { CANONICAL_TURN_RECEIPT_LOOKUP_FAILED, type TurnPermit } from "../../src/conversation/turn-coordinator.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { DoctorReport } from "../../src/doctor/doctor.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -112,6 +112,42 @@ describe("doctor reads the canonical ledger, not only the ingress claim", () => 
       oldestAgeMinutes: 3,
       oldest: { turnRequestId: permit.turnRequestId, actor: actorId },
     });
+  });
+
+  /**
+   * #1036. The receipt sweep records why it could not read a turn's receipt; doctor reports each
+   * in-doubt turn's latest cause beside it, and names none for a turn that has none.
+   */
+  it("names each in-doubt turn's own latest receipt lookup error, and none for a turn without one", async () => {
+    const h = makeHarness();
+    const oldest = claim(h, target(h, "a"), "n1");
+    h.clock.advance(60_000);
+    const middle = claim(h, target(h, "b"), "n2");
+    h.clock.advance(60_000);
+    const youngest = claim(h, target(h, "c"), "n3");
+    const failed = (turnRequestId: string, kind: string, detail: string) =>
+      h.cp.audit.record({
+        kind: CANONICAL_TURN_RECEIPT_LOOKUP_FAILED,
+        evidence: { turnRequestId, sourceNonce: null, kind, detail },
+      });
+    failed(middle.turnRequestId, "HTTP_STATUS", "500");
+    h.clock.advance(1_000);
+    const later = h.clock.nowIso();
+    failed(youngest.turnRequestId, "SCHEMA", "update_id-type");
+    failed(middle.turnRequestId, "TIMEOUT", "no-answer");
+    // A row written by anything else is shown in the vocabulary too, never as its own text.
+    failed(youngest.turnRequestId, "CONTENT_TYPE", "application/sk-live-the-api-key");
+
+    const found = finding(await h.cp.doctor.run("system"), "CANONICAL_TURN_IN_DOUBT");
+
+    expect(found?.observedEvidence["outstanding"]).toBe(3);
+    const reported = found?.observedEvidence["oldest"] as Record<string, unknown>;
+    expect(reported["turnRequestId"]).toBe(oldest.turnRequestId);
+    expect(reported["lookupError"]).toBeUndefined();
+    expect(found?.observedEvidence["lookupErrors"]).toEqual([
+      { turnRequestId: middle.turnRequestId, kind: "TIMEOUT", detail: "no-answer", at: later },
+      { turnRequestId: youngest.turnRequestId, kind: "CONTENT_TYPE", detail: "other", at: later },
+    ]);
   });
 
   it("escalates once the turn is older than the threshold", async () => {

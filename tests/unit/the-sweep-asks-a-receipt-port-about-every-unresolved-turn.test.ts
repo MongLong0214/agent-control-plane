@@ -303,6 +303,56 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
     );
   });
 
+  /**
+   * #1036. The audit row is the coordinator's write, whatever port answered: a cause outside the
+   * vocabulary, or a detail that is not a short token, could be the receipt's own text, so it is
+   * recorded as unrecognized rather than stored.
+   */
+  it("W9: records a port's lookup error only in its bounded form, once per turn per cause, and leaves the turn IN_DOUBT", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const free = claim(c, target(c, "free", 1), "m1");
+    const first = claim(c, target(c, "first", 1), "m2");
+    const second = claim(c, target(c, "second", 1), "m3");
+    port.answer(free.turnRequestId, {
+      found: false,
+      lookupError: { kind: "SOMETHING_ELSE", detail: "the reply text the owner was sent" },
+    } as unknown as ReceiptLookupResult);
+    // Two turns meeting the same cause are two turns, each recorded once.
+    port.answer(first.turnRequestId, { found: false, lookupError: { kind: "TRANSPORT", detail: "ECONNRESET" } });
+    port.answer(second.turnRequestId, { found: false, lookupError: { kind: "TRANSPORT", detail: "ECONNRESET" } });
+
+    expect(await c.coordinator.reconcileUnresolved()).toEqual({ swept: 3, settled: 0, unresolved: 3, failed: 0 });
+    await c.coordinator.reconcileUnresolved();
+    // The same detail under another kind is another cause. A known kind keeps its kind, and any
+    // detail outside its vocabulary, an HTTP status's included, is written as `other`.
+    port.answer(free.turnRequestId, { found: false, lookupError: { kind: "CONTENT_TYPE", detail: "application/the-api-key" } });
+    port.answer(first.turnRequestId, { found: false, lookupError: { kind: "HTTP_STATUS", detail: "404:sk-live-the-api-key" } });
+    port.answer(second.turnRequestId, {
+      found: false,
+      lookupError: { kind: "toString", detail: "x" },
+    } as unknown as ReceiptLookupResult);
+    await c.coordinator.reconcileUnresolved();
+
+    const rows = c.audit.byKind("CANONICAL_TURN_RECEIPT_LOOKUP_FAILED");
+    // Turns claimed in one instant are swept in turn-id order, so each pass's rows are a set.
+    expect(rows).toHaveLength(6);
+    expect(rows.slice(0, 3).map((row) => row.evidence)).toEqual(expect.arrayContaining([
+      { turnRequestId: free.turnRequestId, sourceNonce: "m1", kind: "UNRECOGNIZED", detail: "other" },
+      { turnRequestId: first.turnRequestId, sourceNonce: "m2", kind: "TRANSPORT", detail: "ECONNRESET" },
+      { turnRequestId: second.turnRequestId, sourceNonce: "m3", kind: "TRANSPORT", detail: "ECONNRESET" },
+    ]));
+    expect(rows.slice(3).map((row) => row.evidence)).toEqual(expect.arrayContaining([
+      { turnRequestId: free.turnRequestId, sourceNonce: "m1", kind: "CONTENT_TYPE", detail: "other" },
+      { turnRequestId: first.turnRequestId, sourceNonce: "m2", kind: "HTTP_STATUS", detail: "other" },
+      { turnRequestId: second.turnRequestId, sourceNonce: "m3", kind: "UNRECOGNIZED", detail: "other" },
+    ]));
+    expect(rows.map((row) => row.reasonCode)).toEqual(Array(6).fill(ReasonCode.CONVERSATION_TURN_RECEIPT_LOOKUP_FAILED));
+    for (const permit of [free, first, second]) {
+      expect(stateOf(c, permit.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+    }
+  });
+
   it("leaves every unresolved turn exactly where it was when the port never finds anything — the state before #638 lands", async () => {
     const c = withCoordinator(NEVER_FOUND_RECEIPT_PORT);
     const actorId = target(c, "untouched", 1);
