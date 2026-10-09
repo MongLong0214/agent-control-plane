@@ -405,10 +405,12 @@ describe("#246 C3 W2: a failure after the repository was created", () => {
         evidence: { recordedNodeId: null, createSent: true },
       });
 
-      // Nothing retries it: another CONFIRM writes nothing and changes nothing.
+      // Nothing retries it: another CONFIRM writes nothing, does not even look at GitHub, and changes nothing.
+      const readsBefore = f.github.reads.length;
       const again = await confirm(f, run);
       expect(again).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_STRANDED });
       expect(writesOf(f)).toEqual(["createRepository"]);
+      expect(f.github.reads).toHaveLength(readsBefore);
       expect(applicationOf(f, run.runId)).toEqual(application);
 
       // The doctor states the cause and the recovery a person performs.
