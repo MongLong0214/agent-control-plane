@@ -210,7 +210,9 @@ describe("#1070 ACP-WORKER-03-FC every interleaving of a fenced stop and an acqu
     expect(paused).toBe(true);
     expect(await p.exited()).toBe(75);
     expect(decision.allowed, "authority was granted across a fence written during the acquisition").toBe(false);
-    expect(decision.allowed ? null : decision.evidence["afterInstall"]).toBe(true);
+    // Since narrow review 5 the holder is read only after the lock is asked for: the running
+    // predecessor held it, so the refusal is the lock's own (SQLITE_BUSY), and the fence stands.
+    expect(decision.allowed ? null : decision.evidence["sqlite"]).toBe("SQLITE_BUSY");
     expectFenced(p, successor);
     await expectReclaimedAfterTheGroupEnds(p);
   }, 360_000);
