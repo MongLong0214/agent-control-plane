@@ -1,7 +1,8 @@
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
-import type { ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { Daemon } from "../../src/daemon/daemon.ts";
@@ -30,8 +31,12 @@ const isolatedHome = vi.hoisted(() => {
 
 const adapters: FakeWorkerAdapter[] = [];
 const paused: number[] = [];
+const contenders: ChildProcess[] = [];
 afterEach(() => {
   for (const adapter of adapters.splice(0)) adapter.killAll();
+  for (const contender of contenders.splice(0)) {
+    if (contender.exitCode === null && contender.signalCode === null) contender.kill("SIGKILL");
+  }
   for (const pid of paused.splice(0)) {
     try {
       process.kill(-pid, "SIGKILL");
@@ -129,11 +134,12 @@ const daemonWorld = () => {
   const stateDir = tempDir("acp-daemon-git-");
   const daemon = new Daemon(h.cp, { stateDir });
   expect(daemon.lock.acquire(h.cp.clock.nowIso()).allowed).toBe(true);
+  const lockPath = join(stateDir, "agentcpd.lock");
   const successor = (): SingleInstanceLock | null => {
-    const lock = new SingleInstanceLock(join(stateDir, "agentcpd.lock"));
+    const lock = new SingleInstanceLock(lockPath);
     return lock.acquire(h.cp.clock.nowIso()).allowed ? lock : null;
   };
-  return { h, world, runner, daemon, successor };
+  return { h, world, runner, daemon, successor, lockPath };
 };
 
 const head = (repo: string): string => gitSync(repo, ["rev-parse", "HEAD"]);
@@ -142,41 +148,84 @@ const head = (repo: string): string => gitSync(repo, ["rev-parse", "HEAD"]);
 const stopDiagnostic = (world: ReturnType<typeof daemonWorld>["world"], executionId: string) =>
   world.audit.byKind(WorkerTurnEvent.GIT_STOPPED).filter((row) => row.evidence["executionId"] === executionId).at(-1)?.evidence;
 
+const HELPER = fileURLToPath(new URL("../helpers/lock-holder-process.ts", import.meta.url));
+
+/** One ask of a competing start: when it began, whether the watched child was alive then, and after. */
+interface ContendedAsk { at: number; aliveBefore: boolean; taken: boolean; aliveWhileHeld: boolean | null }
+
 /**
- * Runs `daemon.stop()` while asking, every few milliseconds, whether a successor could take the lock;
- * returns how often that was asked while the paused child was still alive. Every such ask must fail.
+ * A competing start in its own process (the lock holder helper's `contend` mode), asking for the
+ * daemon lock with the real acquisition again and again while noting whether `watched` is alive.
+ * Its own process, because an ask the held lock refuses first spends the lock's busy wait: spent in
+ * this process, every ask would stall the event loop the daemon's drain runs on.
+ */
+const contender = async (lockPath: string, watched: number) => {
+  const control = tempDir("acp-lock-contender-");
+  const child = spawn(process.execPath, ["--experimental-transform-types", HELPER, control, "contender", "contend", lockPath, String(watched)], {
+    cwd: process.cwd(), env: { ...process.env, TMPDIR: "/private/tmp" }, stdio: ["ignore", "ignore", "pipe"],
+  });
+  contenders.push(child);
+  const errors: Buffer[] = [];
+  child.stderr!.on("data", (chunk: Buffer) => errors.push(chunk));
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  const file = (name: string): string => join(control, `contender.${name}`);
+  await waitFor(() => existsSync(file("ready")) || child.exitCode !== null, "the contender to load");
+  if (!existsSync(file("ready"))) throw new Error(`the contender exited: ${Buffer.concat(errors).toString()}`);
+  const asks = (): ContendedAsk[] =>
+    existsSync(file("attempts")) ? JSON.parse(readFileSync(file("attempts"), "utf8")) as ContendedAsk[] : [];
+  return {
+    go: (): void => writeFileSync(file("go"), "go"),
+    asks,
+    stop: async (): Promise<ContendedAsk[]> => {
+      writeFileSync(file("stop"), "stop");
+      await waitFor(() => existsSync(file("result")) || child.exitCode !== null, "the contender to stop");
+      writeFileSync(file("exit"), "exit");
+      await exited;
+      return asks();
+    },
+  };
+};
+
+/**
+ * Runs `daemon.stop()` while a competing start in another process asks, again and again, whether it
+ * can take the lock; returns how often it asked while the paused child was still alive, and whether it
+ * was ever granted the lock while that child lived. Every such ask must fail. `whileStopping` is
+ * told, every few milliseconds, how many asks the lock has refused while the child was alive.
+ *
+ * A granted lock is judged by whether the child is alive while the contender still holds it, not
+ * before the ask: an ask that began while the child lived can wait out the drain inside the lock's
+ * busy wait and be granted the lock the stopped daemon released after the child was gone.
  */
 const stopWatchingTheLock = async (
   daemon: Daemon,
-  successor: () => SingleInstanceLock | null,
+  lockPath: string,
   child: number,
-  whileStopping?: () => void,
+  whileStopping?: (refusedWhileChildAlive: number) => void,
 ): Promise<{ askedWhileChildAlive: number; heldThroughout: boolean }> => {
+  const competing = await contender(lockPath, child);
   let done = false;
+  let stoppedAt = Infinity;
   const stopping = daemon.stop().finally(() => {
     done = true;
+    stoppedAt = Date.now();
   });
-  let askedWhileChildAlive = 0;
-  let heldThroughout = true;
+  competing.go();
   while (!done) {
-    const childAlive = alive(child);
-    const taken = successor();
-    if (taken) {
-      // Taken while stop() had not returned: only acceptable once the child is confirmed gone.
-      taken.release();
-      if (childAlive) heldThroughout = false;
-    }
-    if (childAlive) askedWhileChildAlive += 1;
-    whileStopping?.();
+    whileStopping?.(competing.asks().filter((ask) => ask.aliveBefore && !ask.taken).length);
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   await stopping;
-  return { askedWhileChildAlive, heldThroughout };
+  // The asks made while stop() had not returned, as before.
+  const asks = (await competing.stop()).filter((ask) => ask.at <= stoppedAt);
+  return {
+    askedWhileChildAlive: asks.filter((ask) => ask.aliveBefore).length,
+    heldThroughout: !asks.some((ask) => ask.taken && ask.aliveWhileHeld === true),
+  };
 };
 
 describe("#1070 ACP-WORKER-03 a stopping daemon owns its turns' git through the release of its authority", () => {
   it("an update-ref child paused past the fence is killed and reaped before the successor can take the lock, and the branch never moves", async () => {
-    const { world, runner, daemon, successor } = daemonWorld();
+    const { world, runner, daemon, successor, lockPath } = daemonWorld();
     const base = head(world.repoPath);
     const git = pausingGit("update-ref -m agent-control-plane: worker commit");
     const path = process.env["PATH"];
@@ -193,7 +242,7 @@ describe("#1070 ACP-WORKER-03 a stopping daemon owns its turns' git through the 
       const child = git.pid();
       paused.push(child);
 
-      const watched = await stopWatchingTheLock(daemon, successor, child);
+      const watched = await stopWatchingTheLock(daemon, lockPath, child);
       expect(watched.askedWhileChildAlive, "the lock was never observed while the child lived").toBeGreaterThan(0);
       expect(watched.heldThroughout, "a successor took the lock while the update-ref child was alive").toBe(true);
       // Before anyone else can take the lock: the paused child and its whole group are gone.
@@ -278,7 +327,7 @@ describe("#1070 ACP-WORKER-03 a stopping daemon owns its turns' git through the 
   }, 120_000);
 
   it("an update-ref child released during the drain completes under the daemon's authority, and nothing moves after the lock is released", async () => {
-    const { world, runner, daemon, successor } = daemonWorld();
+    const { world, runner, daemon, successor, lockPath } = daemonWorld();
     const base = head(world.repoPath);
     const git = pausingGit("update-ref -m agent-control-plane: worker commit");
     const path = process.env["PATH"];
@@ -297,10 +346,12 @@ describe("#1070 ACP-WORKER-03 a stopping daemon owns its turns' git through the 
 
       // The test chooses the order: the lock is asked for while the child is alive, then the child is
       // let go inside the drain, so it completes — moves the branch — while the daemon still holds it.
-      let asks = 0;
-      const watched = await stopWatchingTheLock(daemon, successor, child, () => {
-        asks += 1;
-        if (asks === 20) git.release();
+      // It is let go once the competing start has been refused the lock while the child was alive.
+      let released = false;
+      const watched = await stopWatchingTheLock(daemon, lockPath, child, (refusedWhileChildAlive) => {
+        if (released || refusedWhileChildAlive === 0) return;
+        released = true;
+        git.release();
       });
       expect(watched.askedWhileChildAlive).toBeGreaterThan(0);
       expect(watched.heldThroughout, "a successor took the lock while the update-ref child was alive").toBe(true);
