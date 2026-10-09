@@ -1,9 +1,10 @@
-import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
@@ -235,7 +236,7 @@ describe("#1070 ACP-WORKER-03-FC-EMPTY a fence that names no group stands", () =
     lock.fence([], new Date().toISOString());
     expect(lock.acquire(new Date().toISOString()).allowed).toBe(false);
     expect(existsSync(lock.fencePath)).toBe(true);
-    expect(lock.liveFence()).toEqual({ groups: null, alive: [] });
+    expect(lock.liveFence()).toMatchObject({ groups: null, alive: [] });
   });
 
   it("an incomplete stop that reports an empty group list is fenced as an unknown one", async () => {
@@ -255,5 +256,97 @@ describe("#1070 ACP-WORKER-03-FC-EMPTY a fence that names no group stands", () =
     expect(successor.acquire(h.cp.clock.nowIso()).allowed).toBe(false);
     expect(existsSync(successor.fencePath)).toBe(true);
     expect(alive(process.pid)).toBe(true);
+  });
+});
+
+describe("#1070 ACP-WORKER-03-FC narrow review 4: no fence is removed by a read it was not about", () => {
+  /** A group id no process holds: `kill(-pgid, 0)` answers ESRCH. */
+  const GONE = 2_147_483_000;
+  const fenceFiles = (lock: SingleInstanceLock): string[] => {
+    const name = `${lock.fencePath.slice(dirname(lock.fencePath).length + 1, -"json".length)}`;
+    return readdirSync(dirname(lock.fencePath)).filter((file) => file.startsWith(name) && file.endsWith(".json"));
+  };
+  const liveGroup = async (): Promise<{ pgid: number; token: string | null }> => {
+    const child = spawn("/bin/sh", ["-c", "/bin/sleep 60"], { detached: true, stdio: "ignore" });
+    cleanups.push(() => {
+      try {
+        process.kill(-child.pid!, "SIGKILL");
+      } catch {
+        /* gone */
+      }
+    });
+    await waitFor(() => readProcessStartToken(child.pid!) !== null, "the live group to start");
+    return { pgid: child.pid!, token: readProcessStartToken(child.pid!) };
+  };
+
+  it("each fence write is its own file, and the legacy name is a second link to the newest", () => {
+    const lock = new SingleInstanceLock(join(tempDir("acp-fence-unique-"), "agentcpd.lock"));
+    lock.fence([{ pgid: GONE, leaderStartedAt: null }], new Date().toISOString());
+    lock.fence([{ pgid: GONE - 1, leaderStartedAt: null }], new Date().toISOString());
+    const files = fenceFiles(lock);
+    expect(files.filter((file) => file !== "agentcpd.lock.git-fence.json")).toHaveLength(2);
+    expect(files).toContain("agentcpd.lock.git-fence.json");
+  });
+
+  it("a lookup that finds a fence's groups gone answers no fence, and removes nothing", () => {
+    const lock = new SingleInstanceLock(join(tempDir("acp-fence-lookup-"), "agentcpd.lock"));
+    lock.fence([{ pgid: GONE, leaderStartedAt: null }], new Date().toISOString());
+    const before = fenceFiles(lock);
+    expect(lock.liveFence()).toBeNull();
+    expect(fenceFiles(lock)).toEqual(before);
+    // Only an acquisition, under the lock it installed, removes it.
+    expect(lock.acquire(new Date().toISOString()).allowed).toBe(true);
+    expect(fenceFiles(lock)).toEqual([]);
+    lock.release();
+  });
+
+  it("a fence an earlier build left at the legacy name is read, refuses while live, and is never removed", async () => {
+    const live = await liveGroup();
+    const lock = new SingleInstanceLock(join(tempDir("acp-fence-legacy-"), "agentcpd.lock"));
+    writeFileSync(lock.fencePath, JSON.stringify({ pid: 1, recordedAt: "2026-10-01T00:00:00.000Z", groups: [{ pgid: live.pgid, leaderStartedAt: live.token }] }));
+    expect(lock.acquire(new Date().toISOString()).allowed).toBe(false);
+    writeFileSync(lock.fencePath, JSON.stringify({ pid: 1, recordedAt: "2026-10-01T00:00:00.000Z", groups: [{ pgid: GONE, leaderStartedAt: null }] }));
+    expect(lock.acquire(new Date().toISOString()).allowed).toBe(true);
+    expect(existsSync(lock.fencePath), "a file at a reusable name was removed on a confirmation about what it held").toBe(true);
+    lock.release();
+  });
+
+  it("a new fence adopts an earlier build's live fence at the legacy name instead of replacing it", async () => {
+    const live = await liveGroup();
+    const lock = new SingleInstanceLock(join(tempDir("acp-fence-adopt-"), "agentcpd.lock"));
+    writeFileSync(lock.fencePath, JSON.stringify({ pid: 1, recordedAt: "2026-10-01T00:00:00.000Z", groups: [{ pgid: live.pgid, leaderStartedAt: live.token }] }));
+    lock.fence([{ pgid: GONE, leaderStartedAt: null }], new Date().toISOString());
+    const refused = lock.acquire(new Date().toISOString());
+    expect(refused.allowed, "the earlier build's live fence was lost when the legacy name was reused").toBe(false);
+    expect(refused.allowed ? [] : refused.evidence["alive"]).toEqual([{ pgid: live.pgid, leaderStartedAt: live.token }]);
+  });
+
+  // `uchg` makes unlink fail for the owner too; macOS only (Linux needs root for `chattr +i`).
+  it.skipIf(process.platform !== "darwin")("a stale fence that cannot be removed refuses rather than being passed over", () => {
+    const lock = new SingleInstanceLock(join(tempDir("acp-fence-unremovable-"), "agentcpd.lock"));
+    lock.fence([{ pgid: GONE, leaderStartedAt: null }], new Date().toISOString());
+    const unique = fenceFiles(lock).find((file) => file !== "agentcpd.lock.git-fence.json")!;
+    const path = join(dirname(lock.fencePath), unique);
+    execFileSync("/usr/bin/chflags", ["uchg", path], { timeout: 10_000 });
+    try {
+      const refused = lock.acquire(new Date().toISOString());
+      expect(refused.allowed, "a fence that could not be removed was passed over").toBe(false);
+      expect(lock.held()).toBe(false);
+    } finally {
+      execFileSync("/usr/bin/chflags", ["nouchg", path], { timeout: 10_000 });
+      lock.release();
+    }
+  });
+
+  it("a fence directory that cannot be listed refuses", () => {
+    const directory = tempDir("acp-fence-unlistable-");
+    const lock = new SingleInstanceLock(join(directory, "agentcpd.lock"));
+    chmodSync(directory, 0o300);
+    try {
+      expect(lock.acquire(new Date().toISOString()).allowed).toBe(false);
+    } finally {
+      chmodSync(directory, 0o700);
+      lock.release();
+    }
   });
 });

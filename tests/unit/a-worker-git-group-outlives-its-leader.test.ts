@@ -309,17 +309,19 @@ describe("#1070 ACP-WORKER-03-FC an unconfirmed group fences the lock beyond the
   }, 60_000);
 
   it("a fenced group id since reused by an unrelated process does not fence forever", async () => {
-    const stateDir = tempDir("acp-fence-reuse-");
     const unrelated = spawn("/bin/sh", ["-c", "/bin/sleep 30"], { detached: true, stdio: "ignore" });
     groups.push(unrelated.pid!);
     await waitFor(() => readProcessStartToken(unrelated.pid!) !== null, "the unrelated process to start");
-    const lock = new SingleInstanceLock(join(stateDir, "agentcpd.lock"));
 
     // Recorded with its own start time, the group is the fenced one: refused.
-    lock.fence([{ pgid: unrelated.pid!, leaderStartedAt: readProcessStartToken(unrelated.pid!) }], new Date().toISOString());
-    expect(lock.acquire(new Date().toISOString()).allowed).toBe(false);
+    const fenced = new SingleInstanceLock(join(tempDir("acp-fence-reuse-"), "agentcpd.lock"));
+    fenced.fence([{ pgid: unrelated.pid!, leaderStartedAt: readProcessStartToken(unrelated.pid!) }], new Date().toISOString());
+    expect(fenced.acquire(new Date().toISOString()).allowed).toBe(false);
 
     // Recorded with another start time, the id belongs to someone else now: the fenced group is gone.
+    // Its own state directory: a fence is never overwritten (narrow review 4), so the fence above
+    // still stands beside its lock, as it should while that group runs.
+    const lock = new SingleInstanceLock(join(tempDir("acp-fence-reuse-"), "agentcpd.lock"));
     lock.fence([{ pgid: unrelated.pid!, leaderStartedAt: "darwin-tv:1.000000" }], new Date().toISOString());
     const acquired = lock.acquire(new Date().toISOString());
     expect(acquired.allowed, acquired.allowed ? "" : acquired.message).toBe(true);

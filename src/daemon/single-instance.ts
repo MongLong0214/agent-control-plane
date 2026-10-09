@@ -1,11 +1,13 @@
 import {
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -50,14 +52,23 @@ export class SingleInstanceLock {
    * when the daemon could not confirm every worker git process group empty, it outlives the daemon's
    * process: no lock is acquired, live holder or stale, while any group it names may still mutate a
    * repository. `null` names none — a stop that could not even say which — and fences until removed.
+   *
+   * Narrow review 4: every write is its own file, `<lock>.git-fence.<pid>.<start token>.<random>.json`,
+   * linked into place without replacing anything, so a name is written once and a replacement fence is
+   * always another name. `fencePath` (`<lock>.git-fence.json`) is only a second link to the newest of
+   * them, where operators and tooling look; a file an earlier build wrote there is read as a fence too.
    */
   get fencePath(): string {
     return `${this.path}.git-fence.json`;
   }
 
   fence(groups: readonly FencedGroup[] | null, recordedAt: string): void {
-    mkdirSync(dirname(this.path), { recursive: true });
-    const temporary = join(dirname(this.path), `.${basename(this.fencePath)}.${process.pid}.${randomUUID()}.tmp`);
+    const directory = dirname(this.path);
+    const lockName = basename(this.path);
+    mkdirSync(directory, { recursive: true });
+    const token = (readProcessStartToken(process.pid) ?? "unknown").replace(/[^A-Za-z0-9_-]/gu, "-");
+    const unique = join(directory, `${lockName}${FENCE_INFIX}${process.pid}.${token}.${randomUUID()}.json`);
+    const temporary = join(directory, `.${lockName}${FENCE_INFIX}${process.pid}.${randomUUID()}.tmp`);
     const fd = openSync(temporary, "wx", 0o600);
     try {
       writeSync(fd, JSON.stringify({ pid: process.pid, recordedAt, groups }));
@@ -65,12 +76,50 @@ export class SingleInstanceLock {
     } finally {
       closeSync(fd);
     }
-    renameSync(temporary, this.fencePath);
+    try {
+      linkSync(temporary, unique);
+    } finally {
+      try {
+        unlinkSync(temporary);
+      } catch {
+        /* the fence is the unique name; the temporary is not read */
+      }
+    }
+    // The legacy name becomes a second link to this file. A file already there that is no other
+    // fence's link is first given a unique name of its own, so replacing the name loses no fence. Any
+    // failure leaves the legacy name as it was: the unique file is the fence.
+    const mirror = join(directory, `.${lockName}${FENCE_INFIX}${process.pid}.${randomUUID()}.link.tmp`);
+    try {
+      let replaceable = true;
+      try {
+        if (lstatSync(this.fencePath).nlink === 1) {
+          linkSync(this.fencePath, join(directory, `${lockName}${FENCE_INFIX}adopted.${randomUUID()}.json`));
+        }
+      } catch (error) {
+        if ((error as { code?: string }).code !== "ENOENT") replaceable = false;
+      }
+      if (replaceable) {
+        linkSync(unique, mirror);
+        renameSync(mirror, this.fencePath);
+      }
+    } catch {
+      /* the legacy name is a view; the unique file already fences */
+    } finally {
+      try {
+        unlinkSync(mirror);
+      } catch {
+        /* renamed into place, or never made */
+      }
+    }
   }
 
-  /** The fence beside this lock, if it still stands (see `readLiveFence`). */
+  /**
+   * Every fence file beside this lock that still stands, together (see `assessFences`). Only ever
+   * reads: a fence whose groups are all gone answers null here and stays on disk. Fence files are
+   * removed only by `acquire()`, under the lock it has just installed.
+   */
   liveFence(): LiveFence | null {
-    return readLiveFence(this.fencePath);
+    return assessFences(this.path).standing;
   }
 
   acquire(startedAt: string): Decision<LockInfo> {
@@ -162,17 +211,36 @@ export class SingleInstanceLock {
     this.#held = info;
     // ACP-WORKER-03-FC — asked again now that this lock is installed, and before authority is granted.
     // A predecessor writes its fence before it exits and keeps its lock until then, so this install
-    // could only follow a reclamation that saw it dead: any fence it wrote is in place by now, however
-    // the two interleaved, and the check above may have run before it was. Read directly, never through
-    // the overridable lookup, so no subclass can answer it from a stale read.
-    const fencedNow = readLiveFence(this.fencePath);
-    if (fencedNow) {
+    // followed a reclamation that saw it dead and any fence it wrote is in place by now, however the
+    // two interleaved. Read directly, never through the overridable lookup, so no subclass can answer
+    // it from a stale read.
+    //
+    // This is the only place fence files are removed (narrow review 4), and only these: a unique file
+    // whose every group this read confirmed gone, and the legacy name when it is a link to such a file.
+    // A unique name is never written twice, so a fence written after this read is another name and
+    // cannot be removed here; and removing the legacy name only drops a second link. Anything this read
+    // cannot establish refuses, and a removal that fails refuses too.
+    const underLock = assessFences(this.path);
+    if (underLock.standing) {
       this.release();
       return deny(
         ReasonCode.DAEMON_ALREADY_RUNNING,
         "a stopped agentcpd could not confirm a worker git process group finished; authority is not taken while it may still run",
-        { fence: this.fencePath, groups: fencedNow.groups, alive: fencedNow.alive, afterInstall: true },
+        { fence: this.fencePath, groups: underLock.standing.groups, alive: underLock.standing.alive, files: underLock.standing.files, afterInstall: true },
       );
+    }
+    for (const stale of underLock.stale) {
+      try {
+        unlinkSync(stale);
+      } catch (error) {
+        if ((error as { code?: string }).code === "ENOENT") continue;
+        this.release();
+        return deny(
+          ReasonCode.DAEMON_ALREADY_RUNNING,
+          "a git fence whose groups have ended could not be removed; authority is not taken",
+          { fence: stale, afterInstall: true },
+        );
+      }
     }
     return allow(ReasonCode.OK, info);
   }
@@ -225,24 +293,47 @@ export class SingleInstanceLock {
   }
 }
 
+const FENCE_INFIX = ".git-fence.";
+
 interface LiveFence {
-  /** The groups the fence names; null when it names none or cannot be read, which fences regardless. */
+  /** The groups the standing fences name; null when any of them names none or cannot be read. */
   groups: FencedGroup[] | null;
   alive: FencedGroup[];
+  /** The fence files that stand. */
+  files: string[];
+}
+
+/** A fence file as read: which file it is and the groups it names (null: an unknown fence). */
+interface FenceRead {
+  ino: number | null;
+  groups: FencedGroup[] | null;
 }
 
 /**
- * The fence, if any group it names may still be alive. A group is alive while `kill(-pgid, 0)` finds
- * members, unless a process now holding the group's id started at another time than the recorded
- * leader — a pid is reused only once its group is empty, so that group is gone. A fence that names no
- * group (`null`, an empty list) or cannot be read stands, as an unknown one. Once every named group is
- * gone it is removed.
+ * Reads one fence file, or null when it is not there. Never removes anything. A file that exists but
+ * cannot be opened, read or parsed reads as an unknown fence (`groups: null`), which stands.
  */
-const readLiveFence = (fencePath: string): LiveFence | null => {
-  if (!existsSync(fencePath)) return null;
+const readFence = (path: string): FenceRead | null => {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch (error) {
+    if ((error as { code?: string }).code === "ENOENT") return null;
+    return { ino: null, groups: null };
+  }
+  let ino: number;
+  let text: string;
+  try {
+    ino = fstatSync(fd).ino;
+    text = readFileSync(fd, "utf8");
+  } catch {
+    return { ino: null, groups: null };
+  } finally {
+    closeSync(fd);
+  }
   let groups: FencedGroup[] | null;
   try {
-    const parsed = JSON.parse(readFileSync(fencePath, "utf8")) as { groups?: unknown };
+    const parsed = JSON.parse(text) as { groups?: unknown };
     groups = Array.isArray(parsed.groups)
       ? parsed.groups.filter((group): group is FencedGroup =>
         typeof group === "object" && group !== null &&
@@ -253,16 +344,77 @@ const readLiveFence = (fencePath: string): LiveFence | null => {
   } catch {
     groups = null;
   }
-  // ACP-WORKER-03-FC-EMPTY: an incomplete stop that names no group is an unknown one, not a finished one.
-  if (groups === null || groups.length === 0) return { groups: null, alive: [] };
-  const alive = groups.filter((group) => fencedGroupAlive(group));
-  if (alive.length > 0) return { groups, alive };
+  return { ino, groups };
+};
+
+/**
+ * Every fence file beside `lockPath`: the unique ones, adopted ones, and the legacy name. A fence
+ * stands while any group it names may be alive. A group is alive while `kill(-pgid, 0)` finds members
+ * (EPERM included), unless a process now holding the group's id started at another time than the
+ * recorded leader — a pid is reused only once its group is empty, so that group is gone. A fence that
+ * names no group (`null`, an empty list) or cannot be read stands, as an unknown one
+ * (ACP-WORKER-03-FC-EMPTY), and so does a directory that cannot be listed.
+ *
+ * `stale` lists what may be removed under the lock, and nothing else: each unique file whose every
+ * group is confirmed gone, and the legacy name when it is a link to one of them. A legacy file that is
+ * no unique file's link (an earlier build's) is read like any fence but never listed: its name may be
+ * written again, so a confirmation read here may not be about the file a removal would reach.
+ */
+const assessFences = (lockPath: string): { standing: LiveFence | null; stale: string[] } => {
+  const directory = dirname(lockPath);
+  const prefix = `${basename(lockPath)}${FENCE_INFIX}`;
+  const legacy = `${lockPath}.git-fence.json`;
+  let names: string[];
   try {
-    unlinkSync(fencePath);
+    names = readdirSync(directory).filter((name) => name.startsWith(prefix) && name.endsWith(".json")).sort();
   } catch {
-    /* already gone */
+    return { standing: { groups: null, alive: [], files: [directory] }, stale: [] };
   }
-  return null;
+  const judged = new Map<number, LiveFence | null>();
+  const standingFiles: { path: string; ino: number | null; fence: LiveFence }[] = [];
+  const staleUnique = new Map<number, string[]>();
+  let staleLegacy: { path: string; ino: number } | null = null;
+  for (const name of names) {
+    const path = join(directory, name);
+    const read = readFence(path);
+    if (read === null) continue;
+    let verdict: LiveFence | null;
+    if (read.groups === null || read.groups.length === 0) {
+      verdict = { groups: null, alive: [], files: [path] };
+    } else if (read.ino !== null && judged.has(read.ino)) {
+      verdict = judged.get(read.ino)!;
+    } else {
+      const groups = read.groups;
+      const alive = groups.filter((group) => fencedGroupAlive(group));
+      verdict = alive.length > 0 ? { groups, alive, files: [path] } : null;
+      if (read.ino !== null) judged.set(read.ino, verdict);
+    }
+    if (verdict !== null) {
+      standingFiles.push({ path, ino: read.ino, fence: verdict });
+      continue;
+    }
+    if (read.ino === null) continue;
+    if (path === legacy) {
+      staleLegacy = { path, ino: read.ino };
+    } else {
+      staleUnique.set(read.ino, [...(staleUnique.get(read.ino) ?? []), path]);
+    }
+  }
+  const stale = [...staleUnique.values()].flat();
+  if (staleLegacy !== null && staleUnique.has(staleLegacy.ino)) stale.push(staleLegacy.path);
+  if (standingFiles.length === 0) return { standing: null, stale };
+  // One fence per file, not per name: the legacy name may be a second link to a unique file.
+  const seen = new Set<number>();
+  const fences = standingFiles.filter(({ ino }) => ino === null || (!seen.has(ino) && seen.add(ino) !== undefined));
+  const unknown = fences.some(({ fence }) => fence.groups === null);
+  return {
+    standing: {
+      groups: unknown ? null : fences.flatMap(({ fence }) => fence.groups ?? []),
+      alive: fences.flatMap(({ fence }) => fence.alive),
+      files: standingFiles.map(({ path }) => path),
+    },
+    stale,
+  };
 };
 
 const fencedGroupAlive = (group: FencedGroup): boolean => {
