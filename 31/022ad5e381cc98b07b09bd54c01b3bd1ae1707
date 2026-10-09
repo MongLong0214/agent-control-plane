@@ -1,0 +1,65 @@
+Limit: C1 provisions and reclaims BOOTSTRAP_CTO but every bootstrap CONFIRM is refused BOOTSTRAP_APPLICATION_NOT_AVAILABLE with zero GitHub writes until C3 adds the pre-write checks and durable recovery
+Warn: BOOTSTRAP_CTO and WORKER are fixed to Claude Opus in src/domain/fixed-role-runtime.ts; continuity never fails them over to another provider or model, it leaves the role uncovered and pauses the run, so a paused bootstrap or worker run stays BLOCKED
+Warn: a session that ever served as a bootstrap CTO can never take another role, and BOOTSTRAP_CTO shares a session with nothing; there is no promotion, activation always provisions a fresh PRIMARY_CTO
+Record-Id: r-bootstrapcto
+Provenance: inherited c315463e395c55f2bd3494fdd3c961006aa4631b
+
+Limit: continuity-created BOOTSTRAP_CTO replacements still get no launch credential and a revoked bootstrap run still has no recovery path (review C1-02, C1-03); slice C1b adds the real headless runtime and same-session recovery the CEO approved
+Limit: a spawn left STARTING by a daemon crash mid-spawn for a live run is not swept
+Ruled-out: an audit row for a refused canonical handoff | the tx-denial census matches acknowledgeHandoff's exact txDecision opener, so the refusal is reported to the caller only like every other handoff refusal
+Warn: the BOOTSTRAP_CTO_SESSION_SPAWNED audit event that nominates an unbound spawn for cleanup can be forged by a raw database writer; the sweep still never stops a session that holds a role
+Warn: a canonical claim that lands while prepareSwitchover awaits its spawn launches one replacement, which the in-transaction re-check then stops
+Record-Id: r-bootstrapctofix1
+Provenance: inherited 5adb6228115bb7bb31367545d8305dcba1204ab5
+
+Limit: a project Repo Factory bootstraps cannot pass verification in a later run: CLEAN_TREE runs git in a verification worktree whose .git points into the original checkout, which the verification sandbox denies, so ops-r2 RF-S18 stays RED until the verification-checkout slice gives the checkout its own git metadata
+Warn: plan_submit still stores the PLAN before it submits tasks; readiness refuses a PLAN replaced at READY, and C3's freeze is what closes it fully
+Warn: the BOOTSTRAP_PLAN review always uses a single reviewer with no chunking, and the approved files must be top-level names
+Record-Id: r-bootstrapreview
+Provenance: inherited 3f7b246754de09cb1f9b65fbb2fd37b2c70c29f1
+
+Limit: a DRAIN_REQUEST a pre-fix cto_replace already queued for a canonical CTO is not cancelled; it expires on its TTL and switches nothing
+Warn: settleCanonicalSwitchovers runs at daemon startup and on every watchdog tick: when the role's holder is canonical it closes pending handoffs REJECTED, marks role-less replacements ERROR with a provider stop pending, and returns a DRAINING holder to READY unless the project is suspended
+Warn: the handoff_ack withdrawal runs before the acknowledgement is authenticated and its provider stop is fire-and-forget; the replacement is already ERROR in the transaction, so the sweep retries a failed stop
+Record-Id: r-bootstrapctofix2
+Follows: r-bootstrapctofix1
+Provenance: inherited 3c7601650392d23cd2a6117b870c066f541af9c4
+
+Warn: settleCanonicalSwitchovers returns a canonical holder to READY only on positive switchover evidence (a pending handoff from it, or a CTO_REPLACEMENT_REQUESTED audit newer than its current drain) and never while a RECOVERY handoff row from suspendProject exists, even after cto_resume; any drain nothing explains is left alone
+Warn: a raw database writer can forge the CTO_REPLACEMENT_REQUESTED audit row; the worst a forgery does is return a canonical holder with no suspension record to READY, it cannot switch the role or override a suspension
+Record-Id: r-bootstrapctofix3
+Follows: r-bootstrapctofix2
+Provenance: inherited 14a9edb8bfaa1e20173a97ed4b9816c7bec0a033
+
+Limit: only a verification command whose argv is exactly Repo Factory's git status --porcelain (CLEAN_TREE) gets the self-contained checkout; any other git-running verification command still runs in a linked worktree and fails the same way, and the copy holds one commit, so a command that needs history would not see it
+Ruled-out: a separate tree comparison of the copy and --no-tags on the fetch | both survived their mutations, so they were removed rather than kept: a bare-SHA fetch stores no ref and follows no tags, and a copy whose HEAD resolved to a different tree already shows up in status
+Warn: the snapshot freshness check isClean still runs git status in the source with the source's own config, so a repo-configured core.fsmonitor program or clean filter runs outside the sandbox; the new source read in the verification checkout turns fsmonitor off but isClean is unchanged
+Warn: ignored files are not candidate state: the dirty and untracked contract refuses tracked, staged and untracked changes (untracked-files=all, so status.showUntrackedFiles=no cannot hide one) but accepts ignored files, which the producer relies on for its .git/info/exclude ownership marker
+Record-Id: r-verifycheckout
+Follows: r-bootstrapreview
+Provenance: inherited 742e9047e9f57c2e899ddbc3921ba511502a3ebb
+
+Warn: the producer checks a new commit's tree against the approved planned outputs before any GitHub step, and the branch step re-checks after every fetch/reset on retry; a retry whose own commit drifts (for example a hook still present) is refused with zero writes instead of resuming onto a head GitHub already holds
+Warn: a bootstrap PLAN replaced while its blind review is in flight is caught three times: the review reloads its trusted inputs before storing a verdict, the candidate pipeline re-checks the PLAN after the review and at publication, and the production gate refuses a stale candidate EVIDENCE_STALE before reading its review
+Record-Id: r-bootstrapreviewr1
+Follows: r-bootstrapreview
+Provenance: inherited afcde4d84f5d2de134ad16ceff1363f8dacf7061
+
+Warn: the r-verifycheckout ruled-out claim that a separate tree comparison was redundant was wrong: with git replace the snapshot freezes the replacement tree while a by-SHA fetch gets the original, so the self-contained CLEAN_TREE copy is now bound to the snapshot's frozen tree before and after the copy and refused SNAPSHOT_STALE on any mismatch
+Warn: in the verification sandbox /usr/bin/git is the xcrun stub, which under an Xcode.app developer dir spawns xcodebuild and exits 71 under the process limit of 1; the sandbox now runs the git that xcrun --find git resolves outside the sandbox, by absolute path, and refuses rather than falling back to the stub
+Warn: the sandbox PATH puts the worktree before /usr/bin, so a candidate could commit its own executable named git and pass CLEAN_TREE; running the resolved git by absolute path closes that for /usr/bin/git only, and a host whose git resolves elsewhere (for example /usr/local/bin/git) keeps the exposure
+Record-Id: r-verifycheckoutr1
+Follows: r-verifycheckout
+Provenance: inherited 21fedf7f4a03047b0ff9c0249131ce0fb11ccb46
+
+Ruled-out: rejecting replace refs in the producer checkout | weaker: it lists a namespace GIT_REPLACE_REF_BASE can move and misses a replacement created after the listing, while reading unreplaced checks exactly what the transport sends
+Warn: every bootstrap verdict outcome (revision request, reviewer-unavailable record, packet) is preceded by a PLAN freshness check with no await between the check and its effect; repository runs pass no check and keep their behaviour
+Warn: the producer's tree checks (before GitHub, after fetch/reset on retry, and at the reported head) all read with git --no-replace-objects, so a local replace ref cannot make the checked tree differ from the objects push sends
+Record-Id: r-bootstrapreviewr2
+Follows: r-bootstrapreviewr1
+Provenance: inherited c2e38ae983f3eeed806e6dab30d257649878fcea
+
+Warn: the producer hands the SHA whose tree it checked (validatedHead) to applyGitHubOperations, a first push sends exactly that SHA, and the result reports the branch receipt's head (publishedHead); no HEAD read after an await decides what is published, and a local checkout that moved is refused after the push
+Record-Id: r-bootstrapreviewr3
+Follows: r-bootstrapreviewr2
+Provenance: inherited a3f85a2b3dc1dd3a3e6fadae270a490b09b62af3
