@@ -10,6 +10,7 @@ import type { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { REVIEWER_PROVIDER_ENDPOINTS } from "../../src/runtime/provider.ts";
 import { BuzzAdapter, InMemoryBuzzTransport, type BuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { TestProductionAdapter } from "./production-adapter.ts";
+import { HeadlessRuntimeDouble, inProcessLaunchChannel } from "./headless-runtime.ts";
 import type { GitHubClient, GitHubKernelOptions } from "../../src/github/github-kernel.ts";
 import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
 import type { BaselineHarnessInput } from "../../src/export/baseline-contract.ts";
@@ -293,18 +294,31 @@ export const makeStartedOperator = async (options: {
   };
 };
 
-const BOOTSTRAP_CTO_DOUBLES = new WeakMap<ControlPlane, TestProductionAdapter>();
+const BOOTSTRAP_CTO_DOUBLES = new WeakMap<ControlPlane, HeadlessRuntimeDouble>();
 
 /**
  * Issue #246 — the Claude double a run's BOOTSTRAP_CTO is staffed on, registered for that role
  * alone: the bootstrap CTO's provider is fixed to Claude (Opus), so a fixture supplies a Claude
  * adapter rather than pointing staffing at the scripted one. Registered once per control plane.
+ *
+ * C1b: a bootstrap CTO runs on the headless runtime, whose readiness is an authenticated
+ * attestation. A fixture with no sockets gets the in-process form of that runtime's two transports
+ * — a take-once launch channel and the attestation registry the `session_attest` tool calls — so
+ * the spawn still has to deliver the credential and the double still has to present it.
  */
-export const bootstrapCtoProvider = (cp: ControlPlane, clock: Clock): TestProductionAdapter => {
+export const bootstrapCtoProvider = (cp: ControlPlane, clock: Clock): HeadlessRuntimeDouble => {
   const existing = BOOTSTRAP_CTO_DOUBLES.get(cp);
   if (existing) return existing;
-  const claude = new TestProductionAdapter(clock, "claude");
+  const launch = inProcessLaunchChannel();
+  const claude = new HeadlessRuntimeDouble(clock, "claude").useInProcess({
+    launch,
+    attest: (peer, nonce) => cp.sessionAttestations.attest(peer, nonce),
+  });
   cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
+  cp.sessionRuntime.attach({
+    delivery: launch,
+    route: { launchSocketPath: "in-process:launch", mcpSocketPath: "in-process:cto" },
+  });
   BOOTSTRAP_CTO_DOUBLES.set(cp, claude);
   return claude;
 };

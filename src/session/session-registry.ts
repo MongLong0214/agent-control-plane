@@ -35,9 +35,22 @@ export interface SessionRecord {
    */
   osProcessStartedAt: string | null;
   workdir: string | null;
+  /**
+   * #246 C1b — how many times this session's credential has been rotated in place. A connection
+   * records the epoch it authenticated at and is refused at its next request once this moves; the
+   * schema allows a rotation only as exactly `+1` with a new secret, on the same session row and
+   * incarnation (`SessionRegistry.rotateSecret`). 0 for a row whose credential was never rotated.
+   */
+  credentialEpoch: number;
   createdAt: string;
   updatedAt: string;
   stoppedAt: string | null;
+}
+
+/** A rotated credential: the plaintext exists here and in the runtime it is delivered to, nowhere else. */
+export interface RotatedSessionCredential {
+  session: SessionRecord;
+  sessionSecret: string;
 }
 
 /**
@@ -221,6 +234,63 @@ export class SessionRegistry {
       });
     }
     return allow(ReasonCode.OK, hydrate(row));
+  }
+
+  /**
+   * #246 C1b — replaces a READY session's credential in place: a fresh secret, the epoch exactly
+   * one higher, the same session row and incarnation. The previous secret stops verifying in the
+   * same statement, so a connection that authenticated with it is refused at its next request
+   * (`verifySecret` runs on every request), and a connection that somehow presented the new one
+   * before this commit cannot exist. `expectedEpoch` is a compare-and-set: two rotations racing
+   * for one session produce one rotation and one refusal, never two live secrets.
+   *
+   * The plaintext is returned once and kept nowhere; the hash is what the row stores. Callers run
+   * this inside the transaction that also advances the session's binding generation, so the
+   * epoch, the secret and the generation move together or not at all.
+   */
+  rotateSecret(sessionId: string, expectedEpoch: number): Decision<RotatedSessionCredential> {
+    if (!this.secretStorageAvailable() || !this.credentialEpochAvailable()) {
+      return deny(
+        ReasonCode.SESSION_SECRET_STORAGE_UNAVAILABLE,
+        "credential rotation needs the sessions.credential_epoch migration",
+        { sessionId },
+      );
+    }
+    const session = this.get(sessionId);
+    if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
+    if (session.lifecycle !== SessionLifecycle.READY) {
+      return deny(ReasonCode.SESSION_NOT_READY, `a ${session.lifecycle} session's credential is not rotated`, {
+        sessionId,
+        lifecycle: session.lifecycle,
+      });
+    }
+    if (session.credentialEpoch !== expectedEpoch) {
+      return deny(ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE, "the session's credential epoch moved", {
+        sessionId,
+        expectedEpoch,
+        currentEpoch: session.credentialEpoch,
+      });
+    }
+    const sessionSecret = randomBytes(SESSION_SECRET_BYTES).toString("base64url");
+    const changes = this.db.run(
+      `UPDATE sessions
+          SET session_secret_hash = ?, credential_epoch = credential_epoch + 1, updated_at = ?
+        WHERE session_id = ? AND credential_epoch = ? AND lifecycle = 'READY'
+          AND session_secret_hash IS NOT NULL`,
+      [hashSessionSecret(sessionSecret).toString("hex"), this.clock.nowIso(), sessionId, expectedEpoch],
+    ).changes;
+    if (changes !== 1) {
+      return deny(ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE, "the session's credential changed before it could be rotated", {
+        sessionId,
+        expectedEpoch,
+      });
+    }
+    this.audit.record({
+      kind: "SESSION_CREDENTIAL_ROTATED",
+      sessionId,
+      evidence: { fromEpoch: expectedEpoch, toEpoch: expectedEpoch + 1 },
+    });
+    return allow(ReasonCode.OK, { session: this.require(sessionId), sessionSecret });
   }
 
   transition(sessionId: string, to: SessionLifecycle, reason?: string): Decision<SessionRecord> {
@@ -625,6 +695,12 @@ export class SessionRegistry {
       .all<{ name: string }>(`PRAGMA table_info(sessions)`)
       .some((column) => column.name === "session_secret_hash");
   }
+
+  private credentialEpochAvailable(): boolean {
+    return this.db
+      .all<{ name: string }>(`PRAGMA table_info(sessions)`)
+      .some((column) => column.name === "credential_epoch");
+  }
 }
 
 interface RawSession {
@@ -639,6 +715,8 @@ interface RawSession {
   os_pid: number | null;
   os_process_started_at: string | null;
   workdir: string | null;
+  /** Absent only on a database older than the migration that added it. */
+  credential_epoch?: number | null;
   created_at: string;
   updated_at: string;
   stopped_at: string | null;
@@ -656,6 +734,7 @@ const hydrate = (row: RawSession): SessionRecord => ({
   osPid: row.os_pid,
   osProcessStartedAt: row.os_process_started_at,
   workdir: row.workdir,
+  credentialEpoch: row.credential_epoch ?? 0,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
   stoppedAt: row.stopped_at,

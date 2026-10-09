@@ -67,11 +67,15 @@ export const callMcpToolOverSocket = (
     });
   });
 
-/** Reads a launched runtime's one-time local credential exactly as the runtime would. */
+/**
+ * Reads a launched runtime's one-time local credential exactly as the runtime would. A channel
+ * started with `mcpToken` also hands back the socket gate (#246 C1b), and every reply names the
+ * session's incarnation.
+ */
 export const claimLaunchedCredential = (
   socketPath: string,
   externalSessionId: string,
-): Promise<{ sessionId: string; sessionSecret: string }> =>
+): Promise<{ sessionId: string; sessionSecret: string; sessionIncarnation?: string; token?: string }> =>
   new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
     let received = "";
@@ -81,12 +85,23 @@ export const claimLaunchedCredential = (
       received += chunk;
       if (!received.includes("\n")) return;
       socket.end();
-      const body = JSON.parse(received.trim()) as { ok?: unknown; sessionId?: unknown; sessionSecret?: unknown };
+      const body = JSON.parse(received.trim()) as {
+        ok?: unknown;
+        sessionId?: unknown;
+        sessionSecret?: unknown;
+        sessionIncarnation?: unknown;
+        token?: unknown;
+      };
       if (body.ok !== true || typeof body.sessionId !== "string" || typeof body.sessionSecret !== "string") {
         reject(new Error("launch credential was not available"));
         return;
       }
-      resolve({ sessionId: body.sessionId, sessionSecret: body.sessionSecret });
+      resolve({
+        sessionId: body.sessionId,
+        sessionSecret: body.sessionSecret,
+        ...(typeof body.sessionIncarnation === "string" ? { sessionIncarnation: body.sessionIncarnation } : {}),
+        ...(typeof body.token === "string" ? { token: body.token } : {}),
+      });
     });
     socket.once("error", reject);
   });

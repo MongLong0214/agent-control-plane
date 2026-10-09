@@ -198,6 +198,35 @@ export const ReasonCode = {
   SESSION_BUZZ_ACTOR_IMMUTABLE: "SESSION_BUZZ_ACTOR_IMMUTABLE",
   HANDOFF_ACK_REQUIRED: "HANDOFF_ACK_REQUIRED",
   HANDOFF_ACK_AUTHENTICATION_FAILED: "HANDOFF_ACK_AUTHENTICATION_FAILED",
+  /**
+   * #246 C1b — a session's credential epoch is not the one the caller expected: a rotation lost a
+   * race for it, or a connection authenticated before a rotation made another request after it.
+   */
+  SESSION_CREDENTIAL_EPOCH_STALE: "SESSION_CREDENTIAL_EPOCH_STALE",
+  /**
+   * #246 C1b — no headless runtime can drive this provisioned session: none is attached, it has no
+   * route to the daemon, the provider adapter cannot run a session turn, or the daemon holds no
+   * credential to deliver to it. Nothing is substituted for the runtime that is missing.
+   */
+  SESSION_RUNTIME_UNAVAILABLE: "SESSION_RUNTIME_UNAVAILABLE",
+  /**
+   * #246 C1b — a provisioned session's turn ran and the daemon did not receive the authenticated
+   * attestation that turn was asked for: the relay never took its credential, never authenticated,
+   * or never presented the challenge. Readiness is never inferred from the turn's exit alone.
+   */
+  SESSION_ATTESTATION_FAILED: "SESSION_ATTESTATION_FAILED",
+  /** #246 C1b — a provisioned session's headless turn failed or answered as another conversation. */
+  SESSION_TURN_FAILED: "SESSION_TURN_FAILED",
+  /** #246 C1b — this trigger already started a turn for the session; it is never run twice. */
+  SESSION_TURN_DUPLICATE: "SESSION_TURN_DUPLICATE",
+  /**
+   * #246 C1b — continuity never constitutes a replacement session for a run's BOOTSTRAP_CTO. Owner
+   * loss revokes its authority and pauses the run; the same session is recovered, with a rotated
+   * credential, when its fixed runtime can cover it again.
+   */
+  BOOTSTRAP_CTO_NOT_REPLACEABLE: "BOOTSTRAP_CTO_NOT_REPLACEABLE",
+  /** #246 C1b — a bootstrap CTO recovery failed recently; the next restore pass waits out the backoff. */
+  BOOTSTRAP_CTO_RECOVERY_BACKOFF: "BOOTSTRAP_CTO_RECOVERY_BACKOFF",
   HANDOFF_PACKAGE_INCOMPLETE: "HANDOFF_PACKAGE_INCOMPLETE",
   RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER:
     "RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER",

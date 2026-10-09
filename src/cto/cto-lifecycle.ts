@@ -92,6 +92,17 @@ export interface SessionLaunchChannel {
   provision(input: SessionLaunchCredential): Promise<Decision<void>>;
 }
 
+/**
+ * #246 C1b — the real headless runtime a provisioned (non-canonical) CTO session runs on
+ * (`ProvisionedSessionRuntime`), as spawn and probe use it: take custody of the session's
+ * credential, prove readiness by an authenticated attestation turn, ask the conversation to answer.
+ */
+export interface ProvisionedRuntimePort {
+  adopt(sessionId: string, role: Role, sessionSecret: string, credentialEpoch: number): Decision<void>;
+  attest(sessionId: string, conversation: "new" | "resume"): Promise<Decision<void>>;
+  release(sessionId: string): void;
+}
+
 export interface CtoPreference {
   provider: string;
   model: string;
@@ -147,6 +158,7 @@ export class CtoLifecycle {
   #ownerAuthority: OwnerAuthorityPort | null = null;
   #handoffAuthentication: HandoffAuthentication | null = null;
   #sessionLaunch: SessionLaunchChannel | null = null;
+  #sessionRuntime: ProvisionedRuntimePort | null = null;
 
   constructor(
     private readonly db: Db,
@@ -170,7 +182,9 @@ export class CtoLifecycle {
     ownerAuthority?: OwnerAuthorityPort;
     handoffAuthentication?: HandoffAuthentication;
     sessionLaunch?: SessionLaunchChannel;
+    sessionRuntime?: ProvisionedRuntimePort;
   }): void {
+    if (ports.sessionRuntime) this.#sessionRuntime = ports.sessionRuntime;
     if (ports.buzz) this.#buzz = ports.buzz;
     if (ports.readiness) this.#readiness = ports.readiness;
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
@@ -913,11 +927,13 @@ export class CtoLifecycle {
   }
 
   /**
-   * Issue #246 — a run's BOOTSTRAP_CTO, constituted by the same spawn a primary CTO is: launch
-   * credential → Buzz → probe → READY → readiness. It runs on the runtime the caller names, which
-   * bootstrap staffing fixes; nothing here substitutes another provider or model. The session is
-   * returned unbound — the dispatch transaction binds and pins it — and a refusal after the provider
-   * session started stops that session rather than leaving it running.
+   * Issue #246 — a run's BOOTSTRAP_CTO, constituted by the same spawn a primary CTO is, on the real
+   * headless runtime (C1b): its own fixed workdir, its credential in the runtime driver's custody →
+   * Buzz → an authenticated attestation turn that opens its conversation → READY → readiness. It
+   * runs on the runtime the caller names, which bootstrap staffing fixes; nothing here substitutes
+   * another provider or model. The session is returned unbound — the dispatch transaction binds
+   * and pins it — and a refusal after the provider session started stops that session rather than
+   * leaving it running.
    */
   async spawnBootstrapCto(runId: string, runtime: CtoPreference): Promise<Decision<string>> {
     return this.spawn({
@@ -942,6 +958,13 @@ export class CtoLifecycle {
         lifecycle: session?.lifecycle ?? null,
       });
     }
+    // #246 C1b — a session on the headless runtime is asked by an authenticated attestation turn
+    // that continues its conversation: opening its id again is refused by the provider, and an
+    // unauthenticated answer would say nothing about the credential the daemon holds for it.
+    if (role === Role.BOOTSTRAP_CTO) {
+      if (!this.#sessionRuntime) return runtimeUnavailable(sessionId, role);
+      return notProvenReady(sessionId, await this.#sessionRuntime.attest(sessionId, "resume"));
+    }
     return this.probeBoundSession(session, role);
   }
 
@@ -952,6 +975,7 @@ export class CtoLifecycle {
   async stopRoleSession(sessionId: string, role: Role, reason: string): Promise<Decision<void>> {
     await this.stopUnusedSession(sessionId, reason, role);
     const lifecycle = this.sessions.get(sessionId)?.lifecycle ?? null;
+    if (lifecycle === SessionLifecycle.STOPPED) this.#sessionRuntime?.release(sessionId);
     return lifecycle === SessionLifecycle.STOPPED
       ? allow(ReasonCode.OK, undefined)
       : deny(ReasonCode.SESSION_STOP_FAILED, "the provider did not stop the session", { sessionId, lifecycle });
@@ -969,6 +993,10 @@ export class CtoLifecycle {
    */
   private async spawn(request: SpawnRequest): Promise<Decision<string>> {
     const { role, scope, purpose, runtime, canonicalGuard } = request;
+    // #246 C1b — a BOOTSTRAP_CTO runs on the real headless runtime, and is refused before anything
+    // starts when there is none: readiness then has nothing that could authenticate it.
+    const headless = role === Role.BOOTSTRAP_CTO ? this.#sessionRuntime : null;
+    if (role === Role.BOOTSTRAP_CTO && !headless) return runtimeUnavailable(null, role);
     const adapter = this.providers.hasRoleScoped(runtime.provider)
       ? this.providers.requireForRole(runtime.provider, role)
       : this.providers.get(runtime.provider);
@@ -998,10 +1026,16 @@ export class CtoLifecycle {
       const claimed = this.#releasedCanonicalHolder(scope, canonicalGuard.roleKey);
       if (claimed) return this.#refuseAdoptedCanonical<string>(claimed, null, null, canonicalGuard.runId);
     }
+    // A headless session's conversation is addressed per working directory, so it gets one of its
+    // own, fixed for its life (`sessions_workdir_immutable`), below the managed root.
+    const workdir = headless
+      ? join(this.managedRuntimeRoot, "sessions", randomUUID())
+      : this.managedRuntimeRoot;
+    if (headless) ensurePrivateDirectory(workdir);
     const handle = await adapter.startSession({
       model: runtime.model,
       effort: runtime.effort,
-      workdir: this.managedRuntimeRoot,
+      workdir,
       purpose,
     });
     // Recorded with its native start pinned beside the lstart, read as one snapshot of one process
@@ -1043,6 +1077,7 @@ export class CtoLifecycle {
     // that asked for it (a run's bootstrap CTO) also has the provider stop it, so no refused spawn
     // is left running.
     const refuse = async <T>(reason: string, refused: Decision<T>): Promise<Decision<T>> => {
+      headless?.release(session.sessionId);
       this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, reason);
       if (request.stopOnRefusal) {
         try {
@@ -1066,7 +1101,19 @@ export class CtoLifecycle {
     // A direct in-process composition (for example, an offline diagnostic) has no runtime
     // to provision and therefore leaves this optional rather than manufacturing a second,
     // weaker delivery path here.
-    if (this.#sessionLaunch) {
+    if (headless) {
+      // The plaintext goes into the runtime driver's custody and nowhere else; each of the
+      // session's turns is offered it on the launch channel for that turn alone.
+      if (!session.sessionSecret) {
+        return refuse("session secret storage unavailable", deny<string>(
+          ReasonCode.SESSION_SECRET_STORAGE_UNAVAILABLE,
+          "a spawned CTO cannot receive its session credential because secret storage is unavailable",
+          { sessionId: session.sessionId },
+        ));
+      }
+      const adopted = headless.adopt(session.sessionId, role, session.sessionSecret, session.credentialEpoch);
+      if (!adopted.allowed) return refuse("session runtime refused the credential", adopted as Decision<string>);
+    } else if (this.#sessionLaunch) {
       if (!session.sessionSecret) {
         return refuse("session secret storage unavailable", deny<string>(
           ReasonCode.SESSION_SECRET_STORAGE_UNAVAILABLE,
@@ -1095,10 +1142,15 @@ export class CtoLifecycle {
 
     // A started session is not a reachable one: `probeRuntime` above only proved the
     // binary answers. Only an authenticated answer about *this* handle may turn the
-    // session READY, or the CTO role is handed to a runtime nobody has spoken to.
-    const live = await probeSessionHealth(adapter, handle);
+    // session READY, or the CTO role is handed to a runtime nobody has spoken to. On the
+    // headless runtime that answer is the attestation: the first turn of the session's own
+    // conversation, whose relay authenticates with the delivered credential and presents a
+    // challenge the daemon minted (#246 C1b).
+    const live = headless
+      ? notProvenReady(session.sessionId, await headless.attest(session.sessionId, "new"))
+      : await probeSessionHealth(adapter, handle);
     if (!live.allowed) {
-      return refuse("provider session probe failed", live as Decision<string>);
+      return refuse(headless ? "session attestation failed" : "provider session probe failed", live as Decision<string>);
     }
 
     this.sessions.transition(session.sessionId, SessionLifecycle.READY, "provider session verified");
@@ -1323,6 +1375,26 @@ export class CtoLifecycle {
     }
   }
 }
+
+/**
+ * A headless session whose attestation did not settle is, to its caller, a session that was not
+ * proven ready — the same answer a failed provider probe gives — with the runtime's own reason kept
+ * beside it as the cause.
+ */
+const notProvenReady = (sessionId: string, attested: Decision<void>): Decision<void> =>
+  attested.allowed
+    ? attested
+    : deny(ReasonCode.SESSION_NOT_READY, "the session's runtime did not prove it is ready", {
+        sessionId,
+        cause: attested.reasonCode,
+      });
+
+/** The refusal for a headless-runtime role with no runtime driver attached to drive it. */
+const runtimeUnavailable = <T>(sessionId: string | null, role: Role): Decision<T> =>
+  deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "no headless runtime is attached to drive this role's session", {
+    sessionId,
+    role,
+  });
 
 /** The holder a canonical refusal names: the active binding, or the released role's latest assignment. */
 type CanonicalHolder = Pick<RoleBinding, "projectId" | "roleKey" | "sessionId" | "bindingGeneration" | "status">;

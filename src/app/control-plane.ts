@@ -51,6 +51,8 @@ import {
 } from "../runtime/hermes-gateway-receipt-port.ts";
 import { BindingRegistry } from "../session/binding-registry.ts";
 import { SessionRegistry } from "../session/session-registry.ts";
+import { SessionAttestations } from "../session/session-attestations.ts";
+import { ProvisionedSessionRuntime } from "../runtime/provisioned-session-runtime.ts";
 import { Telemetry } from "../telemetry/telemetry.ts";
 import { VerificationEngine } from "../verify/verification-engine.ts";
 import { WorktreeManager } from "../verify/worktree.ts";
@@ -279,6 +281,14 @@ export class ControlPlane {
   readonly workers: WorkerStaffing;
   /** #246 — staffs a project-less bootstrap run's BOOTSTRAP_CTO at dispatch, and reclaims it. */
   readonly bootstrapCtos: BootstrapCtoStaffing;
+  /** #246 C1b — the challenges a provisioned session answers over its authenticated connection. */
+  readonly sessionAttestations: SessionAttestations;
+  /**
+   * #246 C1b — the real headless runtime of provisioned CTO sessions: their credential custody,
+   * their serialized turns and their authenticated readiness. The daemon attaches its launch
+   * channel and socket paths; until it does, no such session can run a turn.
+   */
+  readonly sessionRuntime: ProvisionedSessionRuntime;
   readonly runs: RunEngine;
   readonly verification: VerificationEngine;
   readonly review: BlindReviewGate;
@@ -641,11 +651,40 @@ export class ControlPlane {
         this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox,
       );
 
+      this.sessionAttestations = new SessionAttestations(this.sessions, this.audit);
+      this.sessionRuntime = new ProvisionedSessionRuntime({
+        providers: this.providers,
+        sessions: this.sessions,
+        bindings: this.bindings,
+        attestations: this.sessionAttestations,
+        audit: this.audit,
+      });
+      this.cto.attach({ sessionRuntime: this.sessionRuntime });
+
       this.bootstrapCtos = new BootstrapCtoStaffing(this.db, this.audit, {
         bindings: this.bindings,
         sessions: this.sessions,
         lifecycle: this.cto,
         runs: this.runs,
+      });
+      // #246 C1b — a revoked bootstrap CTO is recovered on its own session, from continuity's
+      // restore pass only: capacity, a resume probe, rotation, delivery, attestation, then its run.
+      this.bootstrapCtos.attach({
+        recovery: {
+          clock: this.clock,
+          capacity: this.capacity,
+          providerScope: { hasRoleScoped: (provider) => this.providers.hasRoleScoped(provider) },
+          runtime: this.sessionRuntime,
+          sessions: this.sessions,
+          bindings: this.bindings,
+          runs: this.runs,
+        },
+      });
+      this.continuity.attach({
+        bootstrapRecovery: {
+          recover: (roleKey) => this.bootstrapCtos.recover(roleKey),
+          backingOff: (roleKey) => this.bootstrapCtos.backingOff(roleKey),
+        },
       });
 
       // Close the dependency cycles with narrow ports.
