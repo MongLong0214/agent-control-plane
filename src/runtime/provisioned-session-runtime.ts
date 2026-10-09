@@ -5,6 +5,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import { Role, type RoleBinding } from "../domain/types.ts";
+import type { Outbox } from "../outbox/outbox.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionAttestations } from "../session/session-attestations.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -34,6 +35,12 @@ export interface ProvisionedSessionRuntimePorts {
   readonly bindings: Pick<BindingRegistry, "active">;
   readonly attestations: SessionAttestations;
   readonly audit: AuditLog;
+  /**
+   * Where an in-band envelope's settlement is read. A trigger that names an outbox row is done when
+   * that row has left PENDING — acknowledged over the authenticated relay, or rejected or expired —
+   * and not when a turn for it exited 0.
+   */
+  readonly outbox: Pick<Outbox, "get">;
 }
 
 export interface ProvisionedSessionRuntimeOptions {
@@ -72,8 +79,11 @@ interface TurnLane {
    */
   claimed: Set<string>;
   /**
-   * Triggers a turn completed: never run again. A trigger whose turn failed is not here, so the
-   * outbox's re-wake of its still-unacknowledged row runs it again (review ACP-C1B-01).
+   * Triggers that name no outbox row (an owner-message wake) whose turn completed: never run again.
+   * An envelope trigger is never here: whether it is done is the outbox row's status, read at each
+   * wake, so one a completed turn left PENDING — the model made no tool call, or its relay never
+   * took the credential — is run again by the outbox's re-wake (review ROUND1-ESCAPE-01), and one a
+   * failed turn left PENDING is too (review ACP-C1B-01).
    */
   handled: Set<string>;
 }
@@ -92,12 +102,15 @@ interface TurnLane {
  *   it over a connection authenticated with the delivered credential, and only a settled challenge
  *   answers OK. A turn that exited 0 proves nothing on its own.
  * - **Serialized.** A session runs one turn at a time. A wake that arrives while a turn runs is
- *   coalesced into one follow-up turn; a wake for a trigger queued, running or already completed
- *   by a turn is refused `SESSION_TURN_DUPLICATE`. A trigger whose turn failed is released for the
- *   next wake that names it — the outbox re-wakes an unacknowledged row after its window — so a
- *   transient failure delays work and never loses it. Turns start only from the existing event
- *   paths (an in-band dispatch, an owner message, a wake) and from the control plane's own spawn
- *   and recovery; there is no timer here.
+ *   coalesced into one follow-up turn; a wake for a trigger queued or running is refused
+ *   `SESSION_TURN_DUPLICATE`, and so is one for an envelope already settled or for an owner-message
+ *   trigger a turn completed. **Settled is the outbox's word, not the CLI's:** a turn that exited 0
+ *   without acknowledging its envelope settled nothing, so when its turn ends, however it ended, a
+ *   still-PENDING envelope is released for the next wake that names it. That wake is the outbox's
+ *   own re-wake, at most once per row per `IN_BAND_REWAKE_MS` and never past the row's TTL, so
+ *   unacknowledged work is retried at that pace and never in a loop here. Turns start only from
+ *   the existing event paths (an in-band dispatch, an owner message, a wake) and from the control
+ *   plane's own spawn and recovery; there is no timer here.
  *
  * In memory only: a restarted daemon holds no credential, and a session it holds none for cannot
  * run a turn until its credential is rotated and delivered again.
@@ -210,9 +223,10 @@ export class ProvisionedSessionRuntime {
     const fresh = triggers.filter((trigger, index) =>
       !lane.claimed.has(trigger.id) &&
       !lane.handled.has(trigger.id) &&
+      !this.#settled(trigger.id) &&
       triggers.findIndex((other) => other.id === trigger.id) === index);
     if (fresh.length === 0) {
-      return deny(ReasonCode.SESSION_TURN_DUPLICATE, "every trigger of this wake is queued, running or already handled; none is run twice", {
+      return deny(ReasonCode.SESSION_TURN_DUPLICATE, "every trigger of this wake is queued, running, settled or already handled; none is run twice", {
         roleKey,
         sessionId: binding.sessionId,
         triggers: triggers.map((trigger) => trigger.id),
@@ -230,8 +244,9 @@ export class ProvisionedSessionRuntime {
 
   /**
    * One work turn for the role's holder, serving every trigger handed to it. When it ends the
-   * triggers are released; a completed turn marks them handled, a failed one leaves them for the
-   * next wake that names them.
+   * triggers are released. A completed turn marks handled only the triggers that name no outbox
+   * row; an envelope's own status says whether it is done, so one the turn did not settle is left
+   * for the next wake that names it, as is every trigger of a failed turn.
    */
   async #workTurn(
     binding: RoleBinding,
@@ -248,11 +263,22 @@ export class ProvisionedSessionRuntime {
       completed = turn.allowed;
       return turn.allowed ? allow(ReasonCode.OK, undefined) : (turn as Decision<void>);
     } finally {
-      for (const trigger of triggers) {
-        lane.claimed.delete(trigger.id);
-        if (completed) lane.handled.add(trigger.id);
+      for (const trigger of triggers) lane.claimed.delete(trigger.id);
+      if (completed) {
+        for (const trigger of triggers) if (!this.#isEnvelope(trigger.id)) lane.handled.add(trigger.id);
       }
     }
+  }
+
+  /** Whether this trigger names an outbox row: its settlement is then the row's, not this lane's. */
+  #isEnvelope(triggerId: string): boolean {
+    return this.ports.outbox.get(triggerId) !== null;
+  }
+
+  /** An envelope that has left PENDING — acknowledged, rejected or expired — has nothing left to run. */
+  #settled(triggerId: string): boolean {
+    const envelope = this.ports.outbox.get(triggerId);
+    return envelope !== null && envelope.status !== "PENDING";
   }
 
   /**
