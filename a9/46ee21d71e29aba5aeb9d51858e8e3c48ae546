@@ -1,0 +1,26 @@
+Limit: C1 provisions and reclaims BOOTSTRAP_CTO but every bootstrap CONFIRM is refused BOOTSTRAP_APPLICATION_NOT_AVAILABLE with zero GitHub writes until C3 adds the pre-write checks and durable recovery
+Warn: BOOTSTRAP_CTO and WORKER are fixed to Claude Opus in src/domain/fixed-role-runtime.ts; continuity never fails them over to another provider or model, it leaves the role uncovered and pauses the run, so a paused bootstrap or worker run stays BLOCKED
+Warn: a session that ever served as a bootstrap CTO can never take another role, and BOOTSTRAP_CTO shares a session with nothing; there is no promotion, activation always provisions a fresh PRIMARY_CTO
+Record-Id: r-bootstrapcto
+Provenance: inherited c315463e395c55f2bd3494fdd3c961006aa4631b
+
+Limit: continuity-created BOOTSTRAP_CTO replacements still get no launch credential and a revoked bootstrap run still has no recovery path (review C1-02, C1-03); slice C1b adds the real headless runtime and same-session recovery the CEO approved
+Limit: a spawn left STARTING by a daemon crash mid-spawn for a live run is not swept
+Ruled-out: an audit row for a refused canonical handoff | the tx-denial census matches acknowledgeHandoff's exact txDecision opener, so the refusal is reported to the caller only like every other handoff refusal
+Warn: the BOOTSTRAP_CTO_SESSION_SPAWNED audit event that nominates an unbound spawn for cleanup can be forged by a raw database writer; the sweep still never stops a session that holds a role
+Warn: a canonical claim that lands while prepareSwitchover awaits its spawn launches one replacement, which the in-transaction re-check then stops
+Record-Id: r-bootstrapctofix1
+Provenance: inherited 5adb6228115bb7bb31367545d8305dcba1204ab5
+
+Limit: a DRAIN_REQUEST a pre-fix cto_replace already queued for a canonical CTO is not cancelled; it expires on its TTL and switches nothing
+Warn: settleCanonicalSwitchovers runs at daemon startup and on every watchdog tick: when the role's holder is canonical it closes pending handoffs REJECTED, marks role-less replacements ERROR with a provider stop pending, and returns a DRAINING holder to READY unless the project is suspended
+Warn: the handoff_ack withdrawal runs before the acknowledgement is authenticated and its provider stop is fire-and-forget; the replacement is already ERROR in the transaction, so the sweep retries a failed stop
+Record-Id: r-bootstrapctofix2
+Follows: r-bootstrapctofix1
+Provenance: inherited 3c7601650392d23cd2a6117b870c066f541af9c4
+
+Warn: settleCanonicalSwitchovers returns a canonical holder to READY only on positive switchover evidence (a pending handoff from it, or a CTO_REPLACEMENT_REQUESTED audit newer than its current drain) and never while a RECOVERY handoff row from suspendProject exists, even after cto_resume; any drain nothing explains is left alone
+Warn: a raw database writer can forge the CTO_REPLACEMENT_REQUESTED audit row; the worst a forgery does is return a canonical holder with no suspension record to READY, it cannot switch the role or override a suspension
+Record-Id: r-bootstrapctofix3
+Follows: r-bootstrapctofix2
+Provenance: inherited 14a9edb8bfaa1e20173a97ed4b9816c7bec0a033
