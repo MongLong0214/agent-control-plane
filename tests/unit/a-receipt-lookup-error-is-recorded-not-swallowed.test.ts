@@ -232,27 +232,37 @@ describe("#1036 a receipt lookup error is recorded, not swallowed", () => {
     }
   });
 
-  it("W13: the production Gateway's NEVER_FOUND and PENDING, with update_id as a string or an integer, are plain not-found", async () => {
+  it("W13: the production NEVER_FOUND and PENDING are plain not-found with an integer update_id, and SCHEMA/update_id-type with a string one (R1074-03)", async () => {
     const fixture = daemonFixture();
     try {
       const turn = await claimOne(fixture, 413);
-      const answers: Array<[string, GatewayAnswer]> = [
-        ["NEVER_FOUND, string id", { kind: "json", body: gatewayNeverFound(413, "string") }],
-        ["NEVER_FOUND, integer id", { kind: "json", body: gatewayNeverFound(413, "integer") }],
-        ["PENDING, string id", { kind: "json", body: gatewayPending(413, turn, "string") }],
-        ["PENDING, integer id", { kind: "json", body: gatewayPending(413, turn, "integer") }],
-      ];
-      for (const [name, answer] of answers) {
+      for (const [name, answer] of [
+        ["NEVER_FOUND", { kind: "json", body: gatewayNeverFound(413) }],
+        ["PENDING", { kind: "json", body: gatewayPending(413, turn) }],
+      ] as Array<[string, GatewayAnswer]>) {
         answering(() => answer);
         expect(await fixture.cp.conversation.reconcileUnresolved(5_000), name).toMatchObject({ swept: 1, settled: 0, failed: 0 });
         expect(lookupFailures(fixture), name).toEqual([]);
       }
-      expect(gateway.requests).toHaveLength(4);
-      expect(lifecycle(fixture, turn.turnRequestId).lifecycle_state).toBe("IN_DOUBT");
       const found = await inDoubtFinding(fixture);
       expect(found?.observedEvidence["lookupErrors"]).toBeUndefined();
       expect((found?.observedEvidence["oldest"] as Record<string, unknown>)["lookupError"]).toBeUndefined();
       expect(found?.recommendedAction).not.toContain("lookup error");
+
+      // The same answers with update_id as its decimal string are not read as answers at all.
+      for (const answer of [
+        { kind: "json", body: gatewayNeverFound(413, "string") },
+        { kind: "json", body: gatewayPending(413, turn, "string") },
+      ] as GatewayAnswer[]) {
+        answering(() => answer);
+        await fixture.cp.conversation.reconcileUnresolved(5_000);
+      }
+      expect(gateway.requests).toHaveLength(4);
+      expect(lookupFailures(fixture).map((row) => row.evidence)).toEqual([
+        { turnRequestId: turn.turnRequestId, sourceNonce: "update:413", kind: "SCHEMA", detail: "update_id-type" },
+      ]);
+      expect(lifecycle(fixture, turn.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+      expect(observationCount(fixture, turn.turnRequestId)).toBe(0);
     } finally {
       fixture.cp.close();
     }
@@ -498,9 +508,11 @@ describe("#1036 the Gateway port names every cause", () => {
       // The production ABORTED carries no receipt id or evidence digest; read as before, and named.
       [{ ...gatewayReceipt(80, turn, { status: "ABORTED" }), receiptId: null, evidenceDigest: null }, "receiptId"],
       [{ ...gatewayReceipt(80, turn, { status: "ABORTED" }), update_id: "80", receiptId: null }, "update_id-type"],
-      // A non-terminal answer is read in its production shape: update_id as the integer or the decimal string.
-      [gatewayNeverFound(81, "string"), "update_id-mismatch"],
-      [gatewayNeverFound(81, "integer"), "update_id-mismatch"],
+      // A non-terminal answer names its update as the integer, exactly as a terminal one must (R1074-03).
+      [gatewayNeverFound(80, "string"), "update_id-type"],
+      [gatewayPending(80, turn, "string"), "update_id-type"],
+      [gatewayNeverFound(81, "string"), "update_id-type"],
+      [gatewayNeverFound(81), "update_id-mismatch"],
       [{ ...gatewayNeverFound(80), update_id: "8O" }, "update_id-type"],
       [{ ...gatewayNeverFound(80), update_id: 80.5 }, "update_id-type"],
       [{ ...gatewayNeverFound(80), update_id: null }, "update_id-type"],
@@ -574,10 +586,8 @@ describe("#1036 the Gateway port names every cause", () => {
 
     // Answers that are not failures: Hermes holds no receipt, or holds one that is not terminal yet.
     const plain: Array<[string, GatewayAnswer]> = [
-      ["NEVER_FOUND, string id", { kind: "json", body: gatewayNeverFound(80, "string") }],
-      ["NEVER_FOUND, integer id", { kind: "json", body: gatewayNeverFound(80, "integer") }],
-      ["PENDING, string id", { kind: "json", body: gatewayPending(80, turn, "string") }],
-      ["PENDING, integer id", { kind: "json", body: gatewayPending(80, turn, "integer") }],
+      ["NEVER_FOUND", { kind: "json", body: gatewayNeverFound(80) }],
+      ["PENDING", { kind: "json", body: gatewayPending(80, turn) }],
       ["PENDING, no message id", { kind: "json", body: { ...gatewayPending(80, turn), message_id: null } }],
     ];
     for (const [name, answer] of plain) {

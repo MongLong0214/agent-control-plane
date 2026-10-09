@@ -388,15 +388,15 @@ export const gatewayDelivery = (
 };
 
 /**
- * How the production Gateway writes `update_id`: as a decimal string today, and as an integer once
- * Hermes' serialization correction lands. Its non-terminal answers are read in either form.
+ * How an answer writes `update_id`. The production Gateway writes the integer since its
+ * serialization correction; the string form is what it wrote before, and is read as no answer.
  */
 export type GatewayUpdateIdForm = "string" | "integer";
 const updateIdIn = (updateId: number, form: GatewayUpdateIdForm): number | string =>
   form === "string" ? String(updateId) : updateId;
 
 /** The production Gateway's answer for an update it holds no receipt for (hermes.gateway-turn-receipt/v1). */
-export const gatewayNeverFound = (updateId: number, form: GatewayUpdateIdForm = "string"): Record<string, unknown> => ({
+export const gatewayNeverFound = (updateId: number, form: GatewayUpdateIdForm = "integer"): Record<string, unknown> => ({
   schema: "hermes.gateway-turn-receipt/v1",
   update_id: updateIdIn(updateId, form),
   message_id: null,
@@ -416,7 +416,7 @@ export const gatewayNeverFound = (updateId: number, form: GatewayUpdateIdForm = 
 export const gatewayPending = (
   updateId: number,
   turn: TelegramExternalTurnIdentity,
-  form: GatewayUpdateIdForm = "string",
+  form: GatewayUpdateIdForm = "integer",
 ): Record<string, unknown> => ({
   schema: "hermes.gateway-turn-receipt/v1",
   update_id: updateIdIn(updateId, form),

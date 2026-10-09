@@ -62,8 +62,6 @@ const NOT_FOUND: ReceiptLookupResult = Object.freeze({ found: false });
 const lookupFailed = (kind: ReceiptLookupError["kind"], detail: string): ReceiptLookupResult =>
   ({ found: false, lookupError: { kind, detail } });
 const schemaError = (check: string): ReceiptLookupResult => lookupFailed("SCHEMA", check);
-/** The decimal form of an update id, which the Gateway writes as a string before its serialization fix. */
-const DECIMAL = /^\d{1,16}$/;
 
 const RECEIPT_KEYS = [
   "delivery",
@@ -181,15 +179,13 @@ const attestedIdentity = (identity: unknown): AttestedIdentity | string => {
 };
 
 /**
- * Whether the answer names the update this turn consumed. A terminal receipt must name it as an
- * integer, as it always had to; a non-terminal answer may also name it as its decimal string, which
- * is how the Gateway writes it until its serialization correction.
+ * Whether the answer names the update this turn consumed, as the integer it is, whatever its status
+ * (R1074-03). A string is not read as one, not even its decimal form: the parser is not relaxed for
+ * any answer, and the Gateway writes the integer since its serialization correction.
  */
-const updateIdFailure = (value: unknown, updateId: number, decimalString: boolean): string | null => {
-  if (value === updateId || (decimalString && value === String(updateId))) return null;
-  if (typeof value === "number" && Number.isSafeInteger(value)) return "update_id-mismatch";
-  if (decimalString && typeof value === "string" && DECIMAL.test(value)) return "update_id-mismatch";
-  return "update_id-type";
+const updateIdFailure = (value: unknown, updateId: number): string | null => {
+  if (value === updateId) return null;
+  return typeof value === "number" && Number.isSafeInteger(value) ? "update_id-mismatch" : "update_id-type";
 };
 
 const messageIdFailure = (value: unknown): string | null => {
@@ -219,7 +215,7 @@ const nonTerminal = (
   status: "NEVER_FOUND" | "PENDING",
   source: TelegramTurnSource,
 ): ReceiptLookupResult => {
-  const updateId = updateIdFailure(rest["update_id"], source.updateId, true);
+  const updateId = updateIdFailure(rest["update_id"], source.updateId);
   if (updateId !== null) return schemaError(updateId);
   if (status === "NEVER_FOUND") {
     if (content !== undefined) return schemaError("never-found-field:content");
@@ -260,7 +256,7 @@ const terminalReceipt = (body: unknown, source: TelegramTurnSource): ReceiptLook
   if (status === "NEVER_FOUND" || status === "PENDING") return nonTerminal(rest, content, status, source);
   // The answer has to be about the update this turn consumed. The message id is not compared: the
   // eight identity fields below already name the turn, and the update id names its source.
-  const updateId = updateIdFailure(rest["update_id"], source.updateId, false);
+  const updateId = updateIdFailure(rest["update_id"], source.updateId);
   if (updateId !== null) return schemaError(updateId);
   const messageId = messageIdFailure(rest["message_id"]);
   if (messageId !== null) return schemaError(messageId);
