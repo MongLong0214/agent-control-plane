@@ -1,0 +1,26 @@
+Limit: the plain not-found set (no audit row) is a 404, a bare {status: NEVER_FOUND}, and a well-formed v1 body with status PENDING or NEVER_FOUND; that is taken from the repository's Gateway fixtures, not from Hermes' own code
+Warn: the Hermes receipt port now reports why a receipt was not read (kind HTTP_STATUS, CONTENT_TYPE, TOO_LARGE, TIMEOUT, TRANSPORT, PARSE or SCHEMA with the first failing check) and the sweep records CANONICAL_TURN_RECEIPT_LOOKUP_FAILED once per turn per cause while the turn stays IN_DOUBT; nothing settles on a malformed receipt and the parser accepts exactly what it accepted before
+Warn: a lookup error does not count in reconcileUnresolved's failed total, because the daemon throws and backs off whenever failed is above zero; an unexpected throw from a port now does count
+Record-Id: r-receiptlookupdiag
+Provenance: inherited 13e9e3c7159c7254b66ac6ab27565ad6e8256b27
+
+Limit: doctor shows the most recently recorded cause, and since a cause is never recorded twice a sequence A, B, A still shows B
+Warn: this supersedes r-receiptlookupdiag's limit: the plain not-found set is now exactly the production v1 NEVER_FOUND body (only the update named, every other field null) and the v1 PENDING body (turnRequestId and the 8-field identity filled, receipt fields null); a 404 and every other non-200 is a lookup error, detailed as <status>:<token> only for a fixed list of Hermes error tokens
+Warn: lookup-error details come from a closed vocabulary (RECEIPT_LOOKUP_DETAILS in turn-coordinator.ts) applied before writing and again when doctor reads rows back; no header text or other network text is ever persisted, and one row is kept per turn per (kind, detail) for good, checked against every earlier row in the same transaction
+Record-Id: r-receiptlookupdiag2
+Follows: r-receiptlookupdiag
+Provenance: inherited 27aaeff835c40d96df9e9eb86d97c5a2ba8f41d7
+
+Warn: this supersedes r-receiptlookupdiag2 on update_id: every receipt answer, PENDING and NEVER_FOUND included, must carry update_id as the requested integer; a decimal string is SCHEMA update_id-type and a different integer is update_id-mismatch, now that the Gateway serializes valid ids as integers (Hermes ee2f5f175d)
+Record-Id: r-receiptlookupdiag3
+Follows: r-receiptlookupdiag2
+Provenance: inherited fc67490b6403128655446287f72567dfa9e6f044
+
+Limit: the Gateway creates PENDING only through claim_pending with message_id=str(event.message_id), serialized via _wire_id as a positive integer, so a production PENDING always names its message
+Warn: this supersedes r-receiptlookupdiag2 on PENDING: a PENDING must name message_id as a positive safe integer; a null message_id is SCHEMA message_id-type (audited, shown by doctor), exactly as in a terminal receipt (R1074-04)
+Warn: do not make a NEVER_FOUND with a null message_id a SCHEMA error: that null is the production NEVER_FOUND shape (only update_id filled), so refusing it would turn every real NEVER_FOUND into a contract error; it stays a plain not-found
+Warn: PENDING's message_id is checked, not compared, like the terminal path: the source row the port reads holds only the update id, and the eight-field identity names the turn
+Unverified: the Hermes producer code was not read in this change; the PENDING and NEVER_FOUND wire shapes are taken from the delegating packet's reading of Hermes ee2f5f175d01
+Record-Id: r-receiptlookupdiag4
+Follows: r-receiptlookupdiag3
+Provenance: inherited f7689af44b843e8b5ac6c9fad81dd24a326b9784
