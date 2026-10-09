@@ -127,8 +127,10 @@ export interface DbOpenOptions {
    * Not a boolean. `migrationLockHeld?: true` would be a claim any caller could make while holding
    * nothing; the lock itself can only be obtained by acquiring it, and `held()` is true only for
    * the instance whose descriptor is open. Supplied so a command that must take the lock *before*
-   * it opens anything does not then deadlock against this class taking the same lock again — the
-   * lock denies rather than waits, so the second acquisition refused with the caller's own pid.
+   * it opens anything does not then contend with this class taking the same lock again — a second
+   * acquisition contends for the lock through SQLite's busy wait, as configured by `LOCK_WAIT_MS`
+   * in `single-instance.ts`, and while the caller still holds it is then refused with the caller's
+   * own pid.
    */
   migrationLock?: SingleInstanceLock;
   /** Test-only fault injection that proves a committed migration is restored from its backup. */
@@ -138,11 +140,13 @@ export interface DbOpenOptions {
    * has read the on-disk version and validated its approval, and before it acquires
    * exclusivity (#747).
    *
-   * `SingleInstanceLock.acquire` denies rather than blocking, so the interleaving that the
-   * re-read below exists for cannot be produced by starting two processes and hoping — the
-   * second one has to arrive *after* the first released, still holding a version it read
-   * before the first committed. This seam schedules that window; it does not simulate it. What
-   * runs inside it is a real second process taking the real lock and running the real chain.
+   * `SingleInstanceLock.acquire` contends only through SQLite's configured busy wait and then
+   * denies; it does not queue behind a holder. So the interleaving that the re-read below exists
+   * for is not reliably produced by starting two processes and hoping — the second one has to
+   * take the lock *after* the first released, still holding a version it read before the first
+   * committed, and it does so only when that release falls inside its busy wait. This seam
+   * schedules that window; it does not simulate it. What runs inside it is a real second process
+   * taking the real lock and running the real chain.
    */
   beforeMigrationExclusivity?: () => void;
   /**
