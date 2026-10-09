@@ -33,7 +33,7 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   // The ordering is a `LIMIT 1` that picks which row is named in a v35 refusal message, so the
   // consequence of the tie is a person sent to the wrong nonce — real, and still not a reason to
   // edit a frozen input without the authority that froze it.
-  ["src/db/migrations.ts:2319", "ORDER BY received_at ASC"],
+  ["src/db/migrations.ts:2323", "ORDER BY received_at ASC"],
   ["src/cto/cto-lifecycle.ts:892", "ORDER BY created_at DESC"],
   // `currentPendingNormalHandoff` was here, re-keyed from 1956 to 1918 and due to move again. Four
   // changes in a row went red on it and none of them touched the query: the entry is keyed to a

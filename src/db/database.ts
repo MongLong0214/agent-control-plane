@@ -27,6 +27,12 @@ import {
   peerMessageNoticeEntryOf,
 } from "../outbox/outbox.ts";
 import {
+  type WorkerProcessAuthority,
+  type WorkerProcessIdentity,
+  workerProcessRecordOf,
+  workerProcessReleaseOf,
+} from "../run/worker-turn.ts";
+import {
   DEFAULT_BACKUP_RETENTION,
   assertIntegrity,
   backupDatabase,
@@ -304,6 +310,10 @@ export class Db {
   #peerMessageCarryMarkers: PeerMessageSuccession[] = [];
   /** The one refusal-notice entry the outbox may write, while it writes it (ACP-RESTART-04). */
   #peerMessageNoticeMarkers: PeerMessageNoticeEntry[] = [];
+  /** The one worker process the runner's provider reported at spawn, while it records it (#1070). */
+  #workerProcessRecordMarkers: WorkerProcessIdentity[] = [];
+  /** The one worker process the runner has confirmed gone, while it records the release (#1070). */
+  #workerProcessReleaseMarkers: WorkerProcessIdentity[] = [];
   /** The one notice-delivery entry the outbox may write, while it writes it (acp-daemon-notice/v1). */
   #peerMessageNoticeDeliveryMarkers: PeerMessageNoticeDeliveryEntry[] = [];
 
@@ -476,6 +486,31 @@ export class Db {
         marker.bindingGeneration === bindingGeneration &&
         marker.sessionId === sessionId &&
         marker.sessionIncarnation === sessionIncarnation
+        ? 1
+        : 0;
+    });
+    // #1070 ACP-WORKER-03: a worker process is recorded only for the exact execution, pid and OS start
+    // time the runner's provider reported at spawn, and released only for the exact one the runner has
+    // just confirmed gone.
+    this.#raw.function("acp_worker_process_record_authorized", (
+      executionId: unknown, pid: unknown, startedAt: unknown,
+    ) => {
+      const marker = this.#workerProcessRecordMarkers[this.#workerProcessRecordMarkers.length - 1];
+      return marker &&
+        marker.executionId === executionId &&
+        marker.pid === pid &&
+        marker.startedAt === startedAt
+        ? 1
+        : 0;
+    });
+    this.#raw.function("acp_worker_process_release_authorized", (
+      executionId: unknown, pid: unknown, startedAt: unknown,
+    ) => {
+      const marker = this.#workerProcessReleaseMarkers[this.#workerProcessReleaseMarkers.length - 1];
+      return marker &&
+        marker.executionId === executionId &&
+        marker.pid === pid &&
+        marker.startedAt === startedAt
         ? 1
         : 0;
     });
@@ -1101,6 +1136,41 @@ export class Db {
   }
 
   /**
+   * Records a worker process released (#1070 ACP-WORKER-03) under the marker its trigger requires.
+   *
+   * The authority is minted only by the worker runner, at the moment it has confirmed that exact
+   * process gone, and names the execution, pid and OS start time; this checks the brand and takes
+   * all three from the token, never from the caller. A raw statement cannot release a process, and a
+   * holder of one release cannot release another.
+   */
+  withWorkerProcessRelease<T>(authority: WorkerProcessAuthority, write: () => T): T {
+    const release = workerProcessReleaseOf(authority, this);
+    if (release === null) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "TASK_EXECUTION_WORKER_PROCESS_RELEASE_AUTHORITY_DENIED", {});
+    }
+    this.#workerProcessReleaseMarkers.push(release);
+    try { return write(); } finally { this.#workerProcessReleaseMarkers.pop(); }
+  }
+
+  /**
+   * Records the process a runtime-managed execution launched (#1070 ACP-WORKER-03) under the marker
+   * its trigger requires.
+   *
+   * The authority is minted only by the worker runner, in the spawn report of its own invocation, and
+   * names the execution, pid and OS start time the provider reported; this takes all three from the
+   * token, never from the caller. A raw statement cannot record a process — and so cannot point a
+   * restart's kill at one — and a holder of one record cannot write another.
+   */
+  withWorkerProcessRecord<T>(authority: WorkerProcessAuthority, write: () => T): T {
+    const record = workerProcessRecordOf(authority, this);
+    if (record === null) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "TASK_EXECUTION_WORKER_PROCESS_RECORD_AUTHORITY_DENIED", {});
+    }
+    this.#workerProcessRecordMarkers.push(record);
+    try { return write(); } finally { this.#workerProcessRecordMarkers.pop(); }
+  }
+
+  /**
    * Writes one notice-delivery entry (acp-daemon-notice/v1) under the marker its insert trigger
    * requires. The authority is minted only by the outbox for that one entry; this checks the brand and
    * takes the entry from the token, never from the caller, so a raw statement cannot record a notice
@@ -1333,6 +1403,16 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   ACTOR_REGISTRATION_GENERATION_NOT_MONOTONIC: ReasonCode.CONFLICT,
   ACTOR_REGISTRATION_RETIREMENT_TERMINAL: ReasonCode.CONFLICT,
   TASK_EXECUTION_WORKER_BINDING_REQUIRED: ReasonCode.WORKER_BINDING_REQUIRED,
+  // #512 (v41) — a WORKER binding, or a WORKER actor's live pointer, named a session that owns the
+  // task's run or holds another role.
+  WORKER_SESSION_NOT_INDEPENDENT: ReasonCode.WORKER_SESSION_NOT_INDEPENDENT,
+  // #1070 ACP-WORKER-03 — a worker process is released only by the runner that confirmed it gone,
+  // and its record is never rewritten, cleared or deleted while it may still run.
+  TASK_EXECUTION_WORKER_PROCESS_RECORD_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  TASK_EXECUTION_WORKER_PROCESS_RELEASE_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  TASK_EXECUTION_WORKER_PROCESS_IMMUTABLE: ReasonCode.CONFLICT,
+  // and whether the runtime launched an execution is fixed at insert.
+  TASK_EXECUTION_RUNTIME_MANAGED_IMMUTABLE: ReasonCode.CONFLICT,
   TASK_EXECUTION_WORKER_IDENTITY_IMMUTABLE: ReasonCode.CONFLICT,
   TASK_INSERT_RUN_SEALED: ReasonCode.RUN_TRANSITION_ILLEGAL,
   PINNED_MANIFEST_IMMUTABLE: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,

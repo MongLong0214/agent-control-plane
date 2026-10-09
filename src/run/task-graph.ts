@@ -4,7 +4,7 @@ import type {
   WorkerFanoutCapacityTarget,
 } from "../capacity/capacity-monitor.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, allow, deny, fail } from "../core/errors.ts";
+import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
 import { newTaskId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -25,6 +25,7 @@ import {
 } from "../export/baseline-contract.ts";
 import { BaselineRecorder } from "../export/baseline-recorder.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
+import type { WorkerProcessAuthority } from "./worker-turn.ts";
 
 export interface TaskSpec {
   /** Caller-chosen local key used to express dependencies within one submission. */
@@ -74,6 +75,11 @@ export interface ExecutionStart {
   contextPacketDigest?: string | null;
   /** Must match the immutable run harness when the caller knows it. */
   harnessDigest?: string | null;
+  /**
+   * #512 — the control plane launches and owns this execution (`task_worker_run`). Its receipts
+   * are the runtime's; the CTO's task_receipt_submit may neither open nor close it.
+   */
+  runtimeManaged?: boolean;
 }
 
 /**
@@ -109,6 +115,15 @@ export interface ExecutionRecord {
   model: string;
   workerSessionId: string;
   ownerBindingGeneration: number;
+  /** #512 — launched and owned by the control plane rather than reported by the CTO. */
+  runtimeManaged: boolean;
+  workerProcessId: number | null;
+  /** The OS start time the spawned process reported, never the database clock. */
+  workerProcessStartedAt: string | null;
+  /** When the recorded process was confirmed gone; null while it is outstanding (or none was recorded). */
+  workerProcessReleasedAt: string | null;
+  repositoryId: string | null;
+  worktreeId: string | null;
 }
 
 /** The worker allocator must admit its exact lower-priority allocation before recording it. */
@@ -420,12 +435,14 @@ export class TaskGraph {
       this.db.run(
         `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
                                       worker_session_id, worker_process_id, provider, model,
-                                      repository_id, worktree_id, concurrency_width, started_at, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING')`,
+                                      repository_id, worktree_id, concurrency_width, started_at, status,
+                                      runtime_managed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?)`,
         [
           executionId, input.runId, input.taskId, attempt, input.ownerBindingGeneration,
           input.workerSessionId, input.workerProcessId ?? null, input.provider, input.model,
           input.repositoryId ?? null, input.worktreeId ?? null, input.concurrencyWidth ?? null, now,
+          input.runtimeManaged === true ? 1 : 0,
         ],
       );
       this.db.run(
@@ -444,6 +461,7 @@ export class TaskGraph {
           model: input.model,
           worktreeId: input.worktreeId ?? null,
           ownerBindingGeneration: input.ownerBindingGeneration,
+          runtimeManaged: input.runtimeManaged === true,
         },
       });
 
@@ -458,7 +476,14 @@ export class TaskGraph {
    * the synchronous receipt primitive used by tests and recovery import; the MCP worker
    * allocator is deliberately routed only through this admission method.
    */
-  async startWorkerExecution(input: WorkerExecutionStart): Promise<Decision<ExecutionRecord>> {
+  async startWorkerExecution(
+    input: WorkerExecutionStart,
+    /**
+     * #1070 ACP-WORKER-03 — asked once more after the capacity probe, before the execution is opened:
+     * a caller whose admission was withdrawn while the probe ran (a daemon that began to stop) opens none.
+     */
+    stillAdmitting: () => boolean = () => true,
+  ): Promise<Decision<ExecutionRecord>> {
     // Do not ask capacity to allocate a worker whose durable identity is already invalid.
     // `startExecution` repeats this check inside its transaction after the async probe.
     const workerBinding = this.assertLiveWorkerBinding(input);
@@ -473,6 +498,9 @@ export class TaskGraph {
       taskId: input.taskId,
     });
     if (!capacity.allowed) return capacity as Decision<ExecutionRecord>;
+    if (!stillAdmitting()) {
+      return deny(ReasonCode.CONFLICT, "the admission was withdrawn before the execution was opened", { runId: input.runId, taskId: input.taskId });
+    }
     return this.recordExecution({ ...input, ...identity.value }, identity.value);
   }
 
@@ -709,6 +737,72 @@ export class TaskGraph {
 
       return allow(ReasonCode.OK, this.execution(executionId)!);
     });
+  }
+
+  /**
+   * #512 — the process a runtime-managed execution spawned, as the process itself reported it.
+   *
+   * Written once, while the execution is still RUNNING, so a restart can find the worker and tell
+   * it apart from a later process that reuses its pid. `startedAt` is the OS start time read from
+   * the process; a null one is recorded as unknown, which a restart treats as unidentifiable.
+   *
+   * #1070 — only under the record authority the worker runner mints in its own invocation's spawn
+   * report. The database refuses the write otherwise, and for any execution, pid or start time other
+   * than the ones the authority names, so no other writer can point a restart's kill at a process.
+   */
+  recordWorkerProcess(
+    executionId: string,
+    pid: number,
+    startedAt: string | null,
+    authority: WorkerProcessAuthority,
+  ): Decision<void> {
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "a worker process id must be a positive integer", { executionId, pid });
+    }
+    let written: number;
+    try {
+      written = this.db.withWorkerProcessRecord(authority, () => this.db.run(
+        `UPDATE task_executions SET worker_process_id = ?, worker_process_started_at = ?
+          WHERE execution_id = ? AND status = 'RUNNING' AND runtime_managed = 1 AND worker_process_id IS NULL`,
+        [pid, startedAt, executionId],
+      ).changes);
+    } catch (error) {
+      if (isAcpError(error)) return deny(error.reasonCode, error.message, { executionId, pid });
+      throw error;
+    }
+    if (written !== 1) {
+      return deny(ReasonCode.CONFLICT, "only a running runtime-managed execution records its process, once", {
+        executionId,
+        pid,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * #512 — the recorded worker process was confirmed gone. Written once, whatever the execution's
+   * status is by then: the process and the receipt end at different moments.
+   *
+   * #1070 — only under the release authority the worker runner mints when it has confirmed that exact
+   * process gone. The database refuses the write otherwise, and refuses it for any execution, pid or
+   * start time other than the ones the authority names.
+   */
+  releaseWorkerProcess(executionId: string, authority: WorkerProcessAuthority): Decision<void> {
+    let released: number;
+    try {
+      released = this.db.withWorkerProcessRelease(authority, () => this.db.run(
+        `UPDATE task_executions SET worker_process_released_at = ?
+          WHERE execution_id = ? AND worker_process_id IS NOT NULL AND worker_process_released_at IS NULL`,
+        [this.clock.nowIso(), executionId],
+      ).changes);
+    } catch (error) {
+      if (isAcpError(error)) return deny(error.reasonCode, error.message, { executionId });
+      throw error;
+    }
+    if (released !== 1) {
+      return deny(ReasonCode.CONFLICT, "only an outstanding worker process is released, once", { executionId });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /** §25.2 — a long job records a low-frequency activity lease, not a heartbeat. */
@@ -1041,6 +1135,12 @@ interface RawExecution {
   model: string;
   worker_session_id: string;
   owner_binding_generation: number;
+  runtime_managed: number;
+  worker_process_id: number | null;
+  worker_process_started_at: string | null;
+  worker_process_released_at: string | null;
+  repository_id: string | null;
+  worktree_id: string | null;
 }
 
 const hydrateExecution = (row: RawExecution): ExecutionRecord => ({
@@ -1058,4 +1158,10 @@ const hydrateExecution = (row: RawExecution): ExecutionRecord => ({
   model: row.model,
   workerSessionId: row.worker_session_id,
   ownerBindingGeneration: row.owner_binding_generation,
+  runtimeManaged: row.runtime_managed === 1,
+  workerProcessId: row.worker_process_id,
+  workerProcessStartedAt: row.worker_process_started_at,
+  workerProcessReleasedAt: row.worker_process_released_at,
+  repositoryId: row.repository_id,
+  worktreeId: row.worktree_id,
 });

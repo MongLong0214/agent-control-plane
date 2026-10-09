@@ -1636,14 +1636,16 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     approveMigration(path, "ACP-PEER-SUCCESSION-01 v38 fixture");
     const migrated = openDb(path);
     try {
-      expect(SCHEMA_VERSION).toBe(40);
-      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(40);
+      // v41 (#512) follows on the same approved chain.
+      expect(SCHEMA_VERSION).toBe(41);
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 38 ORDER BY version`,
       )).toEqual([
         { version: 38, migration_id: "bootstrap-v38" },
         { version: 39, migration_id: "v39-owner-reply-intent-keeps-its-key" },
         { version: 40, migration_id: "v40-peer-message-carry-record" },
+        { version: 41, migration_id: "v41-runtime-managed-worker-turns" },
       ]);
       expect(migrated.all<{ name: string }>(
         `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'peer_message_carries' ORDER BY name`,
@@ -1740,7 +1742,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     approveMigration(path, "finding 01 v39 backfill fixture");
     const migrated = openDb(path);
     try {
-      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(40);
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all(`SELECT * FROM holder_message_departures ORDER BY message_id`)).toEqual([
         { message_id: "msg_dispatch_sent", from_status: null, to_status: "SENT", departed_at: expect.any(String), basis: "BACKFILL" },
         { message_id: "msg_owner_acked", from_status: null, to_status: "ACKED", departed_at: expect.any(String), basis: "BACKFILL" },

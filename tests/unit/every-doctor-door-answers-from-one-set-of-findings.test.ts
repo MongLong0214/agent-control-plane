@@ -344,7 +344,7 @@ describe("only the daemon holding the lock supplies the findings every door answ
       // A competing instance, the way CP-S59 makes one in a single process: a live pid that is not
       // this one holds the lock file.
       writeFileSync(
-        join(stateDir, "agentcpd.lock"),
+        join(stateDir, "agentcpd.lock", "holder.json"),
         JSON.stringify({ pid: process.ppid, startedAt: harness.clock.nowIso(), path: "x" }),
       );
       const second = new Daemon(harness.cp, { stateDir });

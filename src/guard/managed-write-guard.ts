@@ -217,6 +217,12 @@ export interface GuardRequest {
   /** Managed run identity claimed by the caller. */
   runId?: string | null;
   sessionId?: string | null;
+  /**
+   * The incarnation of `sessionId` the caller acts as (#512). A task-bound write must name it: the
+   * WORKER binding is matched to the actor's live session *and* incarnation, so a process left over
+   * from an earlier incarnation of the same session id cannot write as the current one.
+   */
+  sessionIncarnation?: string | null;
   bindingGeneration?: number | null;
   /** Worker task identity required by the local runtime write boundary. */
   taskId?: string | null;
@@ -241,6 +247,7 @@ export interface GuardGrant {
   operation: GuardOperation;
   runId: string | null;
   sessionId: string | null;
+  sessionIncarnation: string | null;
   roleKey: string | null;
   bindingGeneration: number | null;
   repositoryIdentity: string | null;
@@ -270,6 +277,7 @@ interface RunAuthRow {
   project_id: string | null;
   owner_session_id: string | null;
   owner_binding_generation: number | null;
+  owner_session_incarnation: string | null;
   owner_role_key: string | null;
 }
 
@@ -305,6 +313,9 @@ interface TaskReceiptRow {
   worktree_id: string | null;
   repository_identity: string | null;
   repository_checkout_path: string | null;
+  /** The live WORKER binding the receipt's write is attributed to (#512). */
+  worker_role_key: string;
+  worker_binding_generation: number;
 }
 
 interface HeldGrant {
@@ -784,6 +795,7 @@ export class ManagedWriteGuard {
       projectId: facts.projectId,
       runId: facts.runId,
       sessionId: facts.sessionId,
+      sessionIncarnation: facts.sessionIncarnation,
       bindingGeneration: facts.bindingGeneration,
       claimedClassification: request.claimedClassification ?? null,
       actor: request.actor ?? null,
@@ -901,6 +913,7 @@ export class ManagedWriteGuard {
     return {
       runId: grant.runId,
       sessionId: grant.sessionId,
+      sessionIncarnation: grant.sessionIncarnation,
       roleKey: grant.roleKey,
       bindingGeneration: grant.bindingGeneration,
       operation: grant.operation,
@@ -1395,8 +1408,10 @@ export class ManagedWriteGuard {
         { operation, assignedWorktreeId: request.assignedWorktreeId },
       );
     }
+    // #512 — the control plane's commit of a worker's verified change is bound to the same task
+    // receipt and WORKER identity as the provider's file writes, so it is task-bound too.
     const taskBoundRuntimeWrite =
-      operation === WriteOperation.FILE_MUTATION &&
+      (operation === WriteOperation.FILE_MUTATION || operation === WriteOperation.GIT_COMMIT) &&
       (request.actor === "runtime-cli" ||
         request.taskId != null ||
         request.taskReceiptId != null ||
@@ -1406,6 +1421,7 @@ export class ManagedWriteGuard {
         ["taskId", request.taskId],
         ["taskReceiptId", request.taskReceiptId],
         ["assignedWorktreeId", request.assignedWorktreeId],
+        ["sessionIncarnation", request.sessionIncarnation],
       ].filter(([, value]) => typeof value !== "string" || value.trim().length === 0).map(([name]) => name);
       if (missing.length > 0) {
         return deny(
@@ -1516,6 +1532,7 @@ export class ManagedWriteGuard {
         operation,
         runId: null,
         sessionId: null,
+        sessionIncarnation: null,
         roleKey: null,
         bindingGeneration: null,
         repositoryIdentity: null,
@@ -1564,6 +1581,7 @@ export class ManagedWriteGuard {
         operation,
         runId: null,
         sessionId: null,
+        sessionIncarnation: null,
         roleKey: null,
         bindingGeneration: null,
         repositoryIdentity: request.repositoryIdentity ?? null,
@@ -1589,7 +1607,8 @@ export class ManagedWriteGuard {
     }
 
     const run = this.db.get<RunAuthRow>(
-      `SELECT run_id, state, project_id, owner_session_id, owner_binding_generation, owner_role_key
+      `SELECT run_id, state, project_id, owner_session_id, owner_binding_generation,
+              owner_session_incarnation, owner_role_key
          FROM runs WHERE run_id = ?`,
       [request.runId],
     );
@@ -1625,6 +1644,7 @@ export class ManagedWriteGuard {
         operation,
         runId: run.run_id,
         sessionId: request.sessionId!,
+        sessionIncarnation: request.sessionIncarnation ?? null,
         roleKey: identity.value.roleKey,
         bindingGeneration: identity.value.generation,
         repositoryIdentity: null,
@@ -1686,7 +1706,7 @@ export class ManagedWriteGuard {
       });
     }
 
-    const identity = this.authorizeSession(run, request);
+    const identity = this.authorizeSession(run, request, taskReceipt.value);
     if (!identity.allowed) return identity as Decision<GuardGrant>;
 
     const resources = this.authorizeResources({
@@ -1714,6 +1734,7 @@ export class ManagedWriteGuard {
         operation,
         runId: run.run_id,
         sessionId: request.sessionId,
+        sessionIncarnation: request.sessionIncarnation ?? null,
         roleKey: identity.value.roleKey,
         bindingGeneration: identity.value.generation,
         repositoryIdentity: target.value.identity,
@@ -1750,6 +1771,7 @@ export class ManagedWriteGuard {
         operation: request.operation,
         runId: null,
         sessionId: null,
+        sessionIncarnation: null,
         roleKey: null,
         bindingGeneration: null,
         repositoryIdentity,
@@ -1776,6 +1798,7 @@ export class ManagedWriteGuard {
   private authorizeSession(
     run: RunAuthRow,
     request: GuardRequest,
+    taskReceipt: TaskReceiptRow | null = null,
   ): Decision<{ roleKey: string; role: string; generation: number }> {
     if (!run.owner_session_id || run.owner_binding_generation == null || !run.owner_role_key) {
       return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "run has no pinned owner binding", {
@@ -1783,16 +1806,45 @@ export class ManagedWriteGuard {
       });
     }
 
-    const ownerCurrent = this.db.get<{ binding_generation: number }>(
-      `SELECT binding_generation FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+    // The run owner is fenced by its whole pinned tuple, not by a generation number alone: the
+    // role's current ACTIVE binding must be the very binding the run pins — generation, session and
+    // incarnation — for any write to run under it, the worker's included (#512).
+    const ownerCurrent = this.db.get<{
+      binding_generation: number;
+      session_id: string;
+      session_incarnation: string;
+    }>(
+      `SELECT binding_generation, session_id, session_incarnation
+         FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
       [run.owner_role_key],
     );
-    if (!ownerCurrent || ownerCurrent.binding_generation !== run.owner_binding_generation) {
-      return deny(ReasonCode.RUN_OWNER_REVOKED, "the run's pinned owner generation is revoked", {
+    if (
+      !ownerCurrent ||
+      ownerCurrent.binding_generation !== run.owner_binding_generation ||
+      ownerCurrent.session_id !== run.owner_session_id ||
+      ownerCurrent.session_incarnation !== run.owner_session_incarnation
+    ) {
+      return deny(ReasonCode.RUN_OWNER_REVOKED, "the run's pinned owner binding is no longer its current one", {
         runId: run.run_id,
         ownerRoleKey: run.owner_role_key,
         pinned: run.owner_binding_generation,
         current: ownerCurrent?.binding_generation ?? null,
+        pinnedSessionMatches: ownerCurrent ? ownerCurrent.session_id === run.owner_session_id : null,
+        pinnedIncarnationMatches: ownerCurrent
+          ? ownerCurrent.session_incarnation === run.owner_session_incarnation
+          : null,
+      });
+    }
+
+    // #512 — a task-bound write is the WORKER's, and the WORKER binding the receipt check matched
+    // (role key, run, task, ACTIVE, the actor's live session and incarnation, the claimed generation)
+    // is its identity. The first-generation-match search below is for non-task writes only: run
+    // against a worker session it can pick an unrelated binding whose counter happens to agree.
+    if (taskReceipt) {
+      return allow(ReasonCode.OK, {
+        roleKey: taskReceipt.worker_role_key,
+        role: Role.WORKER,
+        generation: taskReceipt.worker_binding_generation,
       });
     }
 
@@ -1899,7 +1951,7 @@ export class ManagedWriteGuard {
         { runId: run.run_id, taskId: request.taskId ?? null, taskReceiptId: request.taskReceiptId ?? null },
       );
     }
-    const receipt = this.db.get<TaskReceiptRow>(
+    const receipt = this.db.get<Omit<TaskReceiptRow, "worker_role_key" | "worker_binding_generation">>(
       `SELECT e.execution_id, e.run_id, e.task_id, e.owner_binding_generation,
               e.worker_session_id, e.status, e.worktree_id,
               r.identity AS repository_identity, r.checkout_path AS repository_checkout_path
@@ -1921,10 +1973,12 @@ export class ManagedWriteGuard {
         status: receipt.status,
       });
     }
+    // The receipt was opened under the run owner's current generation, and by this session. The
+    // WORKER's own generation is a different counter (one per `WORKER:<taskId>` role key) and is
+    // checked against the WORKER binding below, never against the owner's (#512).
     if (
       receipt.worker_session_id !== request.sessionId ||
-      receipt.owner_binding_generation !== run.owner_binding_generation ||
-      receipt.owner_binding_generation !== request.bindingGeneration
+      receipt.owner_binding_generation !== run.owner_binding_generation
     ) {
       return deny(ReasonCode.WRITE_BINDING_GENERATION_STALE, "task receipt is bound to a stale worker generation", {
         taskReceiptId: receipt.execution_id,
@@ -1935,18 +1989,34 @@ export class ManagedWriteGuard {
         requestGeneration: request.bindingGeneration,
       });
     }
-    const workerBinding = this.db.get<{ binding_generation: number }>(
-      `SELECT binding_generation FROM assignments
-        WHERE run_id = ? AND task_id = ? AND session_id = ? AND role = 'WORKER' AND status = 'ACTIVE'`,
-      [run.run_id, request.taskId, request.sessionId],
+    // #512 — the WORKER binding is found by its role key, run and task, ACTIVE, and through the
+    // actor's *live* runtime: the session and incarnation the actor serves now. The binding-time
+    // `assignments.session_id` is not it — after a failover that column still names the session that
+    // died, and matching it let the old session keep writing as the worker.
+    const workerBinding = this.db.get<{ role_key: string; binding_generation: number }>(
+      `SELECT a.role_key, a.binding_generation
+         FROM assignments a
+         JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.role_key = 'WORKER:' || ? AND a.role = 'WORKER' AND a.status = 'ACTIVE'
+          AND a.run_id = ? AND a.task_id = ?
+          AND c.current_session_id = ? AND c.current_session_incarnation = ?`,
+      [request.taskId, run.run_id, request.taskId, request.sessionId, request.sessionIncarnation ?? null],
     );
-    if (!workerBinding || workerBinding.binding_generation !== request.bindingGeneration) {
-      return deny(ReasonCode.BINDING_REVOKED, "task receipt's worker binding is not active", {
+    if (!workerBinding) {
+      return deny(ReasonCode.BINDING_REVOKED, "task receipt's worker binding is not active for this live session", {
         runId: run.run_id,
         taskId: request.taskId,
         sessionId: request.sessionId,
         requestGeneration: request.bindingGeneration,
-        currentGeneration: workerBinding?.binding_generation ?? null,
+      });
+    }
+    if (workerBinding.binding_generation !== request.bindingGeneration) {
+      return deny(ReasonCode.WRITE_BINDING_GENERATION_STALE, "the worker binding generation is superseded", {
+        runId: run.run_id,
+        taskId: request.taskId,
+        roleKey: workerBinding.role_key,
+        requestGeneration: request.bindingGeneration,
+        currentGeneration: workerBinding.binding_generation,
       });
     }
     if (!receipt.worktree_id || !receipt.repository_identity || !receipt.repository_checkout_path) {
@@ -2000,7 +2070,11 @@ export class ManagedWriteGuard {
         receiptRepository: receipt.repository_identity,
       });
     }
-    return allow(ReasonCode.OK, receipt);
+    return allow(ReasonCode.OK, {
+      ...receipt,
+      worker_role_key: workerBinding.role_key,
+      worker_binding_generation: workerBinding.binding_generation,
+    });
   }
 
   /** Binds the operation to exactly one repository participating in the run. */
