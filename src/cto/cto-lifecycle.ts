@@ -115,6 +115,17 @@ export const containedWorkdir = (reported: string | null | undefined, managedRoo
   return reported === managedRoot || isWithin(managedRoot, reported) ? reported : managedRoot;
 };
 
+/**
+ * Issue #246 C1-04 — the audit kind that records a session spawned for a run's BOOTSTRAP_CTO, under
+ * the run's id, in the transaction that creates the session row: before the launch credential,
+ * Buzz, the probe or readiness can refuse it, and before any bind. It is how the reclaim sweep
+ * (`BootstrapCtoStaffing.reclaim`) finds a spawn that was never bound and whose provider stop
+ * failed. Kept as an append-only audit event, as the native start pin is, because the migration
+ * list is frozen; it nominates a session for a stop and grants nothing, and the sweep still never
+ * stops a session that holds a role.
+ */
+export const BOOTSTRAP_CTO_SPAWN_RECORD = "BOOTSTRAP_CTO_SESSION_SPAWNED";
+
 /** What `CtoLifecycle.spawn` constitutes: the role it serves, its scope, and the runtime it runs. */
 interface SpawnRequest {
   /** Selects the role-scoped adapter, so the session runs under that role's credential scope. */
@@ -126,6 +137,8 @@ interface SpawnRequest {
   canonicalGuard?: { roleKey: string; runId: string | undefined };
   /** Have the provider stop the session on a refusal after it started, not only record it ERROR. */
   stopOnRefusal?: boolean;
+  /** Record the session as spawned for this run, with the session row (`BOOTSTRAP_CTO_SPAWN_RECORD`). */
+  spawnedForRun?: string;
 }
 
 export class CtoLifecycle {
@@ -320,6 +333,12 @@ export class CtoLifecycle {
     const current = this.bindings.active(roleKey);
     if (!current) return deny(ReasonCode.NOT_FOUND, "project has no primary CTO", { projectId });
 
+    // #246 C1-05 — a canonical CTO is never swapped for a spawned replacement: the guard initial
+    // staffing and recovery takeover use, asked before anything is spawned and again in the
+    // transaction after the spawn's await.
+    const canonical = this.#canonicalHolderOf(projectId, roleKey, current);
+    if (canonical) return this.#canonicalHandoffDenial<{ handoffId: string; incomingSessionId: string }>(canonical, null);
+
     const activeRuns = this.runs.activeRunsOwnedBy(current.sessionId);
     if (activeRuns.length > 0) {
       return deny(
@@ -354,6 +373,9 @@ export class CtoLifecycle {
       // moment the drain barrier is persisted. A replacement can never revoke a run that
       // appeared while its incoming session was being readied.
       const fresh = this.bindings.active(roleKey);
+      // C1-05 — nor be prepared for a holder that became canonical during that await.
+      const claimed = this.#canonicalHolderOf(projectId, roleKey, fresh);
+      if (claimed) return this.#canonicalHandoffDenial<{ handoffId: string; incomingSessionId: string }>(claimed, null);
       if (
         !fresh ||
         fresh.sessionId !== current.sessionId ||
@@ -505,6 +527,12 @@ export class CtoLifecycle {
           },
         );
       }
+
+      // #246 C1-05 — nor is one acknowledged whose outgoing holder is canonical (prepared by a
+      // build before the preparation guard, or its holder canonical since): the switch below would
+      // replace the canonical conversation and stop its session.
+      const canonical = this.#canonicalHolderOf(row.project_id, roleKeyForAck, currentBinding);
+      if (canonical) return this.#canonicalHandoffDenial<RoleBinding>(canonical, handoffId);
 
       // Re-check the barrier: a run dispatched after prepare would be handed to a session
       // that is about to be stopped.
@@ -898,6 +926,7 @@ export class CtoLifecycle {
       purpose: "bootstrap-cto",
       runtime,
       stopOnRefusal: true,
+      spawnedForRun: runId,
     });
   }
 
@@ -979,19 +1008,32 @@ export class CtoLifecycle {
     // (ACP1045-R2-01, R3-01); see `SessionRegistry.createWithPinnedStart`.
     let session: ReturnType<SessionRegistry["createWithPinnedStart"]>;
     try {
-      session = this.sessions.createWithPinnedStart({
-        provider: adapter.provider,
-        model: runtime.model,
-        effort: runtime.effort,
-        sessionId: `ses_cto_${handle.externalSessionId.replace(/-/g, "").slice(0, 20)}`,
-        incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
-        osPid: handle.pid,
-        // The adapter's answer is accepted only if it is inside the root this daemon manages.
-        // `sessions_workdir_immutable` is BEFORE UPDATE, so whatever is written here becomes a
-        // permanent routing fact — an adapter that echoes its own cwd would pin the session to
-        // it forever. The shipped adapters echo `spec.workdir`; that is caller courtesy, and
-        // this is the check that does not depend on it.
-        workdir: containedWorkdir(handle.workdir, this.managedRuntimeRoot),
+      // The row and, for a run's bootstrap CTO, its spawn record are one write: no refusal below
+      // can leave a session the reclaim sweep has no record of (#246 C1-04).
+      session = this.db.tx(() => {
+        const created = this.sessions.createWithPinnedStart({
+          provider: adapter.provider,
+          model: runtime.model,
+          effort: runtime.effort,
+          sessionId: `ses_cto_${handle.externalSessionId.replace(/-/g, "").slice(0, 20)}`,
+          incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
+          osPid: handle.pid,
+          // The adapter's answer is accepted only if it is inside the root this daemon manages.
+          // `sessions_workdir_immutable` is BEFORE UPDATE, so whatever is written here becomes a
+          // permanent routing fact — an adapter that echoes its own cwd would pin the session to
+          // it forever. The shipped adapters echo `spec.workdir`; that is caller courtesy, and
+          // this is the check that does not depend on it.
+          workdir: containedWorkdir(handle.workdir, this.managedRuntimeRoot),
+        });
+        if (request.spawnedForRun !== undefined) {
+          this.audit.record({
+            kind: BOOTSTRAP_CTO_SPAWN_RECORD,
+            runId: request.spawnedForRun,
+            sessionId: created.sessionId,
+            evidence: { role, provider: adapter.provider, model: runtime.model, purpose },
+          });
+        }
+        return created;
       });
     } catch (error) {
       if (request.stopOnRefusal) await adapter.stopSession(handle).catch(() => undefined);
@@ -1121,6 +1163,46 @@ export class CtoLifecycle {
       [roleKey, SELF_CLAIM_EXECUTOR_KIND, roleKey],
     );
     return latest ? { projectId, roleKey, ...latest } : null;
+  }
+
+  /**
+   * #246 C1-05 — the canonical holder of a PRIMARY_CTO role, by the guard initial staffing and
+   * recovery takeover use: the active binding's holder when it is an adopted canonical CTO, else the
+   * role's lineage (`#releasedCanonicalHolder`), which also answers for an active canonical actor
+   * whose runtime pointer has moved. Null when the role is not canonical.
+   */
+  #canonicalHolderOf(projectId: string, roleKey: string, current: RoleBinding | null): CanonicalHolder | null {
+    if (current && this.#isAdoptedCanonical(current)) {
+      return {
+        projectId,
+        roleKey,
+        sessionId: current.sessionId,
+        bindingGeneration: current.bindingGeneration,
+        status: current.status,
+      };
+    }
+    return this.#releasedCanonicalHolder(projectId, roleKey);
+  }
+
+  /**
+   * #246 C1-05 — an ordinary handoff never swaps a canonical CTO: it is not prepared (no spawned
+   * replacement, no drain) and not acknowledged (no switch, the original session not stopped). The
+   * canonical conversation keeps the role. It writes nothing, so a transaction can return it, and
+   * like every other handoff refusal it is reported to the caller rather than audited.
+   */
+  #canonicalHandoffDenial<T>(holder: CanonicalHolder, handoffId: string | null): Decision<T> {
+    return deny<T>(
+      ReasonCode.CANONICAL_CTO_NOT_REPLACEABLE,
+      "the outgoing CTO is canonical; a handoff never swaps it for a spawned replacement, its own conversation keeps the role",
+      {
+        projectId: holder.projectId,
+        roleKey: holder.roleKey,
+        sessionId: holder.sessionId,
+        bindingGeneration: holder.bindingGeneration,
+        assignmentStatus: holder.status,
+        handoffId,
+      },
+    );
   }
 
   /**

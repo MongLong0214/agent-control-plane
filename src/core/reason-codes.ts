@@ -74,8 +74,10 @@ export const ReasonCode = {
    */
   BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT: "BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT",
   /**
-   * Continuity was asked to constitute a role with a fixed runtime (a BOOTSTRAP_CTO or a WORKER:
-   * Claude Opus) on another provider. Refused before anything starts; the daemon pauses the run.
+   * A role with a fixed runtime (a BOOTSTRAP_CTO or a WORKER: Claude Opus) would run on another
+   * provider or model. Continuity asked to constitute one elsewhere is refused before anything
+   * starts, and the daemon pauses the run; a re-dispatch that would reuse a persisted bootstrap CTO
+   * binding on another runtime is refused, and the binding is neither reused nor replaced (C1-01).
    */
   ROLE_RUNTIME_SUBSTITUTION_REFUSED: "ROLE_RUNTIME_SUBSTITUTION_REFUSED",
 
@@ -355,6 +357,13 @@ export const ReasonCode = {
    * The run stays QUEUED and nothing but the refusal's audit row is written.
    */
   CANONICAL_CTO_AWAITING_RECLAIM: "CANONICAL_CTO_AWAITING_RECLAIM",
+  /**
+   * An ordinary handoff named a canonical CTO as its outgoing holder: preparing it, or
+   * acknowledging one already prepared (issue #246 C1-05). A canonical CTO is never swapped for a
+   * spawned replacement; its own conversation keeps the role. Nothing is spawned, drained or
+   * switched, and the original session is not stopped.
+   */
+  CANONICAL_CTO_NOT_REPLACEABLE: "CANONICAL_CTO_NOT_REPLACEABLE",
   OPERATOR_UNAUTHENTICATED: "OPERATOR_UNAUTHENTICATED",
   OPERATOR_METHOD_NOT_ALLOWED: "OPERATOR_METHOD_NOT_ALLOWED",
   /** An authenticated operator method outlived its execution budget. Not an authentication fact. */
