@@ -50,8 +50,28 @@ const fixture = (count = 8) => {
   expect(rendered.status, rendered.stderr).toBe(0);
   const body = join(dir, "body");
   writeFileSync(body, "Summary.\n");
-  return { dir, git, tree, head, env, expected, message, body };
+  return { dir, git, tree, base, head, env, expected, message, body };
 };
+
+/**
+ * The official bytes `scripts/merge-pr.mjs` sends for `fixture()`: its draft is the subject, then
+ * the `Merged-Head` paragraph naming the head it checked, then the body, through the same
+ * `squash-preserve`. Everything after that paragraph is `fixture().expected`'s composition.
+ */
+const officialWithMergedHead = (f: ReturnType<typeof fixture>): string => {
+  const path = join(f.dir, "official-merged-head.message");
+  writeFileSync(path, `merge fixture\n\nMerged-Head: ${f.head}\n\nSummary.\n`);
+  const rendered = run("commitlore", ["squash-preserve", `${f.base}..${f.head}`, "--message-file", path, "--json"], f.dir, f.env);
+  expect(rendered.status, rendered.stderr).toBe(0);
+  return path;
+};
+
+/**
+ * After merging, `merge-pr.mjs` reads the merge commit back. The `gh` fixture composes no merge
+ * commit and answers no API read, so that read-back refuses loudly once the merge call is made;
+ * a-merge-names-the-head-it-checked.test.ts reads a real one back.
+ */
+const READ_BACK_REFUSED = "RESULT: FAIL — #1 is merged, and reading it back does not match what was checked";
 
 // Copy exact production modules into a disposable module root. No production
 // resolver seam, inherited PATH, HOME installation or repository node_modules is used.
@@ -145,8 +165,12 @@ officialIntegration("the merge helper preserves the official record paragraphs",
   it("carries eight official records byte-for-byte through the outgoing body and raw Git object", () => {
     const f = fixture();
     const result = run(process.execPath, [join(ROOT, "scripts/merge-pr.mjs"), "1", "--subject", "merge fixture", "--body-file", f.body], ROOT, f.env);
-    expect(result.status, result.stdout + result.stderr).toBe(0);
-    const official = readFileSync(f.expected);
+    expect(result.stdout).toContain(READ_BACK_REFUSED);
+    expect(result.status, result.stdout + result.stderr).toBe(1);
+    const official = readFileSync(officialWithMergedHead(f));
+    expect(official.toString("utf8").startsWith(`merge fixture\n\nMerged-Head: ${f.head}\n\nSummary.\n\n`)).toBe(true);
+    expect(official.toString("utf8").slice(`merge fixture\n\nMerged-Head: ${f.head}\n\n`.length))
+      .toBe(readFileSync(f.expected, "utf8").slice("merge fixture\n\n".length));
     expect(readFileSync(f.message)).toEqual(official);
     const parsed = JSON.parse(run("commitlore", ["parse", "--message-file", f.message, "--json"], f.dir, f.env).stdout);
     expect(parsed.blocks).toHaveLength(8);
@@ -207,8 +231,9 @@ officialIntegration("preservation is not a semantic exemption", () => {
   it("keeps ordinary Git trailer parsing for one record", () => {
     const f = fixture(1);
     const result = run(process.execPath, [join(ROOT, "scripts/merge-pr.mjs"), "1", "--subject", "merge fixture", "--body-file", f.body], ROOT, f.env);
-    expect(result.status, result.stdout + result.stderr).toBe(0);
-    expect(readFileSync(f.message)).toEqual(readFileSync(f.expected));
+    expect(result.stdout).toContain(READ_BACK_REFUSED);
+    expect(result.status, result.stdout + result.stderr).toBe(1);
+    expect(readFileSync(f.message)).toEqual(readFileSync(officialWithMergedHead(f)));
     const message = readFileSync(f.message, "utf8");
     const parsed = run("git", ["interpret-trailers", "--parse"], f.dir, f.env, message).stdout;
     expect(message.endsWith(parsed)).toBe(true);

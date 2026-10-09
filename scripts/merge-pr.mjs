@@ -37,6 +37,17 @@
  * 20 branches declared none and could not be checked — a pass that conserved nothing. Inheriting
  * the records fixes the loss; it does not make the check able to see it.
  *
+ * The squash names the head it was made from. `verify-merge-preserved-records.mjs` reads a
+ * squash's branch up to that head, and nothing GitHub keeps after the merge says which head that
+ * was: the pull request's `head.sha` moves, and the squash's tree and inherited sources were shown
+ * to accept a rewritten or rolled-back one. So the message carries `Merged-Head: <sha>`, the exact
+ * head whose required CI this script checked, and the same sha goes to `--match-head-commit`, so
+ * GitHub merges that head or nothing. It is its own paragraph straight after the subject:
+ * `commitlore validate` refuses an unknown key inside the trailer block (`unknown-key`), and a
+ * paragraph there is outside the record region `verify-trailers-are-parsable.mjs` requires to end
+ * the message. After the merge the commit is read back — the trailer, the tree and the records the
+ * gate will check — and any mismatch fails loudly, because the merge itself cannot be undone.
+ *
  * Usage:
  *   merge-pr.mjs <number> --subject <text> --body-file <path> [--dry-run]
  */
@@ -47,6 +58,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { RECORD_TRAILER_KEY_PATTERN } from "./lib/record-trailer-keys.mjs";
+import { examineSquash, mergedHeadIn, pullRequest, Unanswered } from "./verify-merge-preserved-records.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const run = (file, args, input) =>
@@ -86,12 +98,17 @@ try {
 if (pr.state !== "OPEN") fail(`#${number} is ${pr.state}.`);
 
 const head = pr.headRefOid;
+// The head is written into history as the squash's `Merged-Head`, so it must be one full sha.
+if (typeof head !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(head)) {
+  fail(`#${number}'s head from GitHub is not one full commit sha (${String(head)}).`);
+}
 
 // 2. The branch's own records, carried onto the merge rather than retyped into it. `squash-preserve`
 //    rewrites the draft in place; the merged body is whatever it produces, which is the point —
-//    a hand-written summary cannot be the only carrier of a record.
+//    a hand-written summary cannot be the only carrier of a record. The draft opens with the
+//    `Merged-Head` paragraph naming the head checked below, so the official bytes carry it.
 const draft = join(mkdtempSync(join(tmpdir(), "acp-merge-")), "message");
-writeFileSync(draft, `${subject}\n\n${readFileSync(bodyFile === "-" ? 0 : bodyFile, "utf8")}`);
+writeFileSync(draft, `${subject}\n\nMerged-Head: ${head}\n\n${readFileSync(bodyFile === "-" ? 0 : bodyFile, "utf8")}`);
 try {
   run("commitlore", ["squash-preserve", `${pr.baseRefOid}..${head}`, "--message-file", draft]);
 } catch (error) {
@@ -105,7 +122,16 @@ try {
 const expected = `${draft}.official`;
 writeFileSync(expected, readFileSync(draft));
 
-// 3. Semantic validity and byte preservation are separate from Git trailer parsing.
+// 3. Semantic validity and byte preservation are separate from Git trailer parsing. First, the
+//    composed message names the checked head once and only once — a body that already carries a
+//    `Merged-Head` line would make the squash unverifiable for good, so it refuses here.
+try {
+  const named = mergedHeadIn(readFileSync(draft, "utf8"), "the merge message");
+  if (named !== head) throw new Unanswered(`the merge message names ${named.slice(0, 8)} as its Merged-Head, not the head checked, ${head.slice(0, 8)}`);
+} catch (error) {
+  if (!(error instanceof Unanswered)) throw error;
+  fail(`${error.message}. Refusing before it becomes history.`);
+}
 try {
   run("commitlore", ["validate", "--message-file", draft]);
   process.stdout.write(run("node", ["scripts/verify-trailers-are-parsable.mjs", "--message-file", draft,
@@ -189,7 +215,26 @@ if (dryRun) {
 }
 
 // 4. Merge the head that was checked, not whatever the head is by now, with the body that was checked.
+//    The body opens with `Merged-Head: ${head}`; the same sha is the head GitHub must match.
 run("gh", ["pr", "merge", number, "--squash", "--match-head-commit", head, "--subject", subject, "--body-file", bodyOut]);
+
+// Everything after this point reads back a merge that cannot be undone, so a refusal says so.
+const failMerged = (why) => {
+  process.stdout.write(`\nRESULT: FAIL — #${number} is merged, and reading it back does not match what was checked: ${why}\n`);
+  process.exit(1);
+};
+
+// The merge commit, as GitHub answers it to the merge-records gate: merged, with its sha.
+let merged;
+try {
+  process.chdir(ROOT);
+  const answer = pullRequest(number);
+  if (answer === "absent" || !answer.merged) throw new Unanswered(`GitHub does not report #${number} as merged`);
+  merged = answer.mergeCommit;
+} catch (error) {
+  if (!(error instanceof Unanswered)) throw error;
+  failMerged(`${error.message}. Read it back by hand: \`pnpm merge-records <merge commit>~1..<merge commit>\`.`);
+}
 
 // 5. The same records, onto the notes ref. The message above carries them as trailers and git
 //    keeps only the last paragraph of them — `squash-preserve` says so itself when it composes the
@@ -199,22 +244,49 @@ run("gh", ["pr", "merge", number, "--squash", "--match-head-commit", head, "--su
 //    survives there whatever git does with the message.
 //
 //    After the merge because the target is the merge commit, which does not exist until now. A
-//    failure here is reported and does not fail the merge: the merge is done and irreversible, and
-//    the recovery is `commitlore squash-preserve <range> --target <sha>` run again by hand.
-const merged = run("gh", ["pr", "view", number, "--json", "mergeCommit", "--jq", ".mergeCommit.oid"]).trim();
-if (!/^[0-9a-f]{40}$/u.test(merged)) {
-  process.stdout.write(`\n  WARN  could not read the merge commit id (${merged || "empty"}); records are on the message only.\n`);
-} else {
+//    failure to write the note is reported here, and the read-back below then refuses if the merge
+//    no longer carries every record; the recovery is `commitlore squash-preserve <range> --target
+//    <sha>` run again by hand.
+try {
+  run("git", ["fetch", "origin", "--quiet"]);
+  process.stdout.write(run("commitlore", ["squash-preserve", `${pr.baseRefOid}..${head}`, "--target", merged]));
+  run("commitlore", ["sync"]);
+  process.stdout.write(`  records mirrored onto ${merged.slice(0, 7)} and published\n`);
+} catch (error) {
+  process.stdout.write(String(error.stdout ?? error.stderr ?? ""));
+  process.stdout.write(`\n  WARN  the note for ${merged.slice(0, 7)} was not written. Recover with:\n`);
+  process.stdout.write(`        commitlore squash-preserve ${pr.baseRefOid}..${head} --target ${merged} && commitlore sync\n`);
+}
+
+// 6. Read the merge back the way `pnpm merge-records` will: one parent, a `Merged-Head` naming the
+//    head checked above, a tree that is that head merged onto the parent, and every record line
+//    the branch carried reachable from the merge as a trailer or in its note.
+const mismatches = [];
+try {
+  const parents = run("git", ["rev-list", "--parents", "-n", "1", merged]).trim().split(" ").slice(1);
+  if (parents.length !== 1) mismatches.push(`${merged.slice(0, 8)} has ${parents.length} parent(s), not the one a squash has`);
+  const { head: named, parent, carried, missing } = examineSquash(merged, number);
+  if (named !== head) mismatches.push(`its Merged-Head is ${named.slice(0, 8)}, not the head checked, ${head.slice(0, 8)}`);
+  const tree = run("git", ["rev-parse", "--verify", `${merged}^{tree}`]).trim();
+  let rebuilt = "";
   try {
-    run("git", ["fetch", "origin", "--quiet"]);
-    process.stdout.write(run("commitlore", ["squash-preserve", `${pr.baseRefOid}..${head}`, "--target", merged]));
-    run("commitlore", ["sync"]);
-    process.stdout.write(`  records mirrored onto ${merged.slice(0, 7)} and published\n`);
-  } catch (error) {
-    process.stdout.write(String(error.stdout ?? error.stderr ?? ""));
-    process.stdout.write(`\n  WARN  the note for ${merged.slice(0, 7)} was not written. Recover with:\n`);
-    process.stdout.write(`        commitlore squash-preserve ${pr.baseRefOid}..${head} --target ${merged} && commitlore sync\n`);
+    rebuilt = run("git", ["merge-tree", "--write-tree", parent, head]).split("\n")[0]?.trim() ?? "";
+  } catch {
+    rebuilt = "";
   }
+  if (rebuilt !== tree) {
+    mismatches.push(`its tree ${tree.slice(0, 8)} is not ${head.slice(0, 8)} merged onto its parent ${parent.slice(0, 8)} (${rebuilt ? rebuilt.slice(0, 8) : "that merge does not resolve"})`);
+  }
+  for (const [line, from] of missing) mismatches.push(`it does not keep ${from.slice(0, 8)}'s record line "${line.slice(0, 96)}"`);
+  if (mismatches.length === 0) {
+    process.stdout.write(`  read back ${merged.slice(0, 7)}: Merged-Head ${head.slice(0, 7)}, tree ${tree.slice(0, 7)}, ${carried.size} record line(s) all reachable\n`);
+  }
+} catch (error) {
+  if (!(error instanceof Unanswered) && error?.status === undefined) throw error;
+  mismatches.push(error instanceof Unanswered ? error.message : `git could not read ${merged.slice(0, 8)} back`);
+}
+if (mismatches.length > 0) {
+  failMerged(`\n${mismatches.map((line) => `    ${line}`).join("\n")}\n  Recover records with: commitlore squash-preserve ${pr.baseRefOid}..${head} --target ${merged} && commitlore sync`);
 }
 
 process.stdout.write(`\nRESULT: PASS — #${number} merged at ${head.slice(0, 7)}.\n`);
