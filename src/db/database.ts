@@ -20,7 +20,10 @@ import {
 import { digestOf } from "../core/digest.ts";
 import {
   type PeerMessageNoticeAuthority,
+  type PeerMessageNoticeDeliveryAuthority,
+  type PeerMessageNoticeDeliveryEntry,
   type PeerMessageNoticeEntry,
+  peerMessageNoticeDeliveryEntryOf,
   peerMessageNoticeEntryOf,
 } from "../outbox/outbox.ts";
 import {
@@ -311,6 +314,8 @@ export class Db {
   #workerProcessRecordMarkers: WorkerProcessIdentity[] = [];
   /** The one worker process the runner has confirmed gone, while it records the release (#1070). */
   #workerProcessReleaseMarkers: WorkerProcessIdentity[] = [];
+  /** The one notice-delivery entry the outbox may write, while it writes it (acp-daemon-notice/v1). */
+  #peerMessageNoticeDeliveryMarkers: PeerMessageNoticeDeliveryEntry[] = [];
 
   /**
    * The file this connection opened. Capability issuance is keyed by it: two `Db` objects
@@ -506,6 +511,21 @@ export class Db {
         marker.executionId === executionId &&
         marker.pid === pid &&
         marker.startedAt === startedAt
+        ? 1
+        : 0;
+    });
+    // acp-daemon-notice/v1: a delivery entry is accepted only while the outbox holds the marker for
+    // exactly this entry — its notice id, kind, digest, receipt and failure category.
+    this.#raw.function("acp_peer_message_notice_delivery_authorized", (
+      eventId: unknown, entry: unknown, payloadDigest: unknown, receiptId: unknown, failure: unknown,
+    ) => {
+      const marker = this.#peerMessageNoticeDeliveryMarkers[this.#peerMessageNoticeDeliveryMarkers.length - 1];
+      return marker &&
+        marker.eventId === eventId &&
+        marker.entry === entry &&
+        marker.payloadDigest === payloadDigest &&
+        marker.receiptId === receiptId &&
+        marker.failure === failure
         ? 1
         : 0;
     });
@@ -1150,6 +1170,24 @@ export class Db {
     try { return write(); } finally { this.#workerProcessRecordMarkers.pop(); }
   }
 
+  /**
+   * Writes one notice-delivery entry (acp-daemon-notice/v1) under the marker its insert trigger
+   * requires. The authority is minted only by the outbox for that one entry; this checks the brand and
+   * takes the entry from the token, never from the caller, so a raw statement cannot record a notice
+   * as delivered, and a holder of the authority cannot record any other entry.
+   */
+  withPeerMessageNoticeDelivery<T>(authority: PeerMessageNoticeDeliveryAuthority, write: () => T): T {
+    const entry = peerMessageNoticeDeliveryEntryOf(authority, this);
+    if (entry === null) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "PEER_MESSAGE_NOTICE_DELIVERY_AUTHORITY_DENIED", {});
+    }
+    if (!this.#raw.inTransaction) {
+      return fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "a notice delivery entry requires the outbox's transaction", {});
+    }
+    this.#peerMessageNoticeDeliveryMarkers.push(entry);
+    try { return write(); } finally { this.#peerMessageNoticeDeliveryMarkers.pop(); }
+  }
+
   /** The ingress guard alone may remove expired or superseded replay evidence. */
   withIngressDelete<T>(authority: IngressDeleteAuthority, channel: string, write: () => T): T {
     if (!isIngressDeleteAuthority(authority, this, channel)) {
@@ -1413,6 +1451,10 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   PEER_MESSAGE_NOTICE_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   PEER_MESSAGE_NOTICE_NO_REPLACE: ReasonCode.CONFLICT,
   PEER_MESSAGE_NOTICE_IMMUTABLE: ReasonCode.CONFLICT,
+  // acp-daemon-notice/v1 — the daemon's delivery of a notice is evidence only the outbox may write.
+  PEER_MESSAGE_NOTICE_DELIVERY_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  PEER_MESSAGE_NOTICE_DELIVERY_NO_REPLACE: ReasonCode.CONFLICT,
+  PEER_MESSAGE_NOTICE_DELIVERY_IMMUTABLE: ReasonCode.CONFLICT,
   INBOUND_BUZZ_SOURCE_KEY_IMMUTABLE: ReasonCode.CONFLICT,
   // Review finding 01 — a holder-claimed message's departure from PENDING is never rewritten,
   // replaced or removed.
@@ -1420,6 +1462,10 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   HOLDER_MESSAGE_DEPARTURE_IMMUTABLE: ReasonCode.CONFLICT,
   // and the outbox row's id, which names the departure, is fixed once written.
   OUTBOX_MESSAGE_ID_IMMUTABLE: ReasonCode.CONFLICT,
+  // A row that left PENDING is not deleted, and the event a departed row pointed at stays spent.
+  OUTBOX_DEPARTED_ROW_NO_DELETE: ReasonCode.CONFLICT,
+  HOLDER_MESSAGE_SOURCE_DEPARTURE_NO_REPLACE: ReasonCode.CONFLICT,
+  HOLDER_MESSAGE_SOURCE_DEPARTURE_IMMUTABLE: ReasonCode.CONFLICT,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

@@ -111,10 +111,13 @@ export interface OwnerReplyItem {
    * Read back byte for byte, CR and CRLF included (R1056-05).
    */
   readonly replyText?: string;
-  /** `PENDING` until a sender records the transport's acceptance; then `DELIVERED`, for good. */
+  /**
+   * `PENDING` until a delivery is recorded: a Buzz sender's transport accepted it, or Hermes'
+   * receipt proved its Telegram send (A3). Then `DELIVERED`, for good.
+   */
   readonly status: OwnerReplyStatus;
   readonly enqueuedAt: string;
-  /** Only on a `DELIVERED` item: what the transport accepted, and the digest over it. */
+  /** Only on a `DELIVERED` item: what was delivered, and the digest over it. */
   readonly delivery?: OwnerReplyDelivery;
 }
 
@@ -123,11 +126,14 @@ export type OwnerReplyStatus = "PENDING" | "DELIVERED";
 /** The acknowledgements a delivery can record. Nothing outside this list is ever stored. */
 export type OwnerReplyRelayAck = "ACCEPTED" | "DUPLICATE";
 
+/** A stored delivery record. `transport` says which of the two it is; nothing else is read. */
+export type OwnerReplyDelivery = OwnerReplyBuzzDelivery | OwnerReplyTelegramDelivery;
+
 /**
  * What a sender records when the transport accepted a reply (#1036). `evidenceDigest` is
  * `digestOf` over every other field, so the record names exactly what was accepted.
  */
-export interface OwnerReplyDelivery {
+export interface OwnerReplyBuzzDelivery {
   readonly transport: "buzz";
   readonly eventId: string;
   readonly signer: string;
@@ -143,6 +149,53 @@ export interface OwnerReplyDelivery {
   readonly contentDigest: string;
   readonly deliveredAt: string;
   readonly evidenceDigest: string;
+}
+
+/**
+ * A Telegram reply Hermes sent, as its own Gateway receipt proved it (A3). ACP holds no Telegram
+ * transport and sent nothing: this is the receipt's delivery evidence, recorded once every field
+ * of it matched the item (`recordTelegramReplyDeliveryEvidence`). `evidenceDigest` is `digestOf`
+ * over every other field.
+ */
+export interface OwnerReplyTelegramDelivery {
+  readonly transport: "telegram";
+  /** Who sent it. Only Hermes sends a Telegram owner reply. */
+  readonly carrier: "hermes";
+  /** The chat the turn's message was admitted from, which the receipt named. */
+  readonly chatId: number;
+  /** The owner's message the reply answers, which the receipt named. */
+  readonly replyToMessageId: number;
+  /** The Telegram messages Hermes sent, in send order. */
+  readonly messageIds: readonly number[];
+  /** The digest of the text sent. Equal to the item's receipt `evidenceDigest`. */
+  readonly contentDigest: string;
+  /** The receipt that proved the turn and its delivery. Equal to the item's receipt id. */
+  readonly receiptId: string;
+  /** Hermes' own name for the reply obligation it discharged. */
+  readonly obligationId: string;
+  readonly deliveredAt: string;
+  readonly evidenceDigest: string;
+}
+
+/**
+ * What a Hermes Gateway receipt reports about its reply's Telegram delivery (A3), as the receipt
+ * port read it: each field is the receipt's own value when it has the right type, and `null` when
+ * it does not. Nothing here is verified yet; `recordTelegramReplyDeliveryEvidence` compares it with
+ * the item and the turn's admitted message.
+ */
+export interface TelegramDeliveryReport {
+  /** Whether the receipt's `state` was the one token that says Hermes' send succeeded. */
+  readonly confirmed: boolean;
+  /** A non-empty, bounded string. */
+  readonly obligationId: string | null;
+  /** A `sha256:` digest. */
+  readonly contentDigest: string | null;
+  /** A safe integer of either sign, the domain Telegram admission accepts (`telegramChatIdOf`). */
+  readonly chatId: number | null;
+  /** A positive safe integer. */
+  readonly replyToMessageId: number | null;
+  /** A non-empty array of positive safe integers. */
+  readonly messageIds: readonly number[] | null;
 }
 
 export interface EnqueueOwnerReplyInput {
@@ -330,6 +383,16 @@ const textOf = (value: unknown): string | null => {
   if (typeof value !== "string") return null;
   return value.trim() === "" ? null : value;
 };
+
+/**
+ * A Telegram chat id in exactly the domain Telegram admission accepts one in: any safe integer,
+ * negative included, because a group or supergroup chat id is negative and may be allowlisted
+ * (`TelegramIngress.authenticatedRequest` admits `Number.isSafeInteger(message.chat.id)`). The
+ * receipt port and the stored-record reader both read a chat id through this, so neither can refuse
+ * a chat admission let in. A message id stays a positive safe integer (`positiveIdOf`).
+ */
+export const telegramChatIdOf = (value: unknown): number | null =>
+  typeof value === "number" && Number.isSafeInteger(value) ? value : null;
 
 const positiveIdOf = (value: unknown): number | null => {
   if (typeof value !== "number") return null;
@@ -646,10 +709,56 @@ const DELIVERY_TEXT_FIELDS = [
   "eventId", "signer", "conversation", "replyToEventId", "relayUrl", "contentDigest", "deliveredAt", "evidenceDigest",
 ] as const;
 
-/** A stored delivery record with every field present and a string, or `null`. */
+/** Every field a stored Telegram delivery record has, and nothing else. */
+const TELEGRAM_DELIVERY_FIELDS = [
+  "carrier", "chatId", "contentDigest", "deliveredAt", "evidenceDigest", "messageIds", "obligationId", "receiptId",
+  "replyToMessageId", "transport",
+] as const;
+
+/** A non-empty array of positive safe integers, copied, or `null`. */
+const positiveIdsOf = (value: unknown): number[] | null => {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const ids: number[] = [];
+  for (const id of value as unknown[]) {
+    const positive = positiveIdOf(id);
+    if (positive === null) return null;
+    ids.push(positive);
+  }
+  return ids;
+};
+
+/** A stored Telegram delivery record with exactly its fields, each of its type, or `null`. */
+const telegramDeliveryOf = (fields: Record<string, unknown>): OwnerReplyTelegramDelivery | null => {
+  if (JSON.stringify(Object.keys(fields).sort()) !== JSON.stringify(TELEGRAM_DELIVERY_FIELDS)) return null;
+  const { contentDigest, receiptId, obligationId, deliveredAt, evidenceDigest } = fields;
+  const chatId = telegramChatIdOf(fields["chatId"]);
+  const replyToMessageId = positiveIdOf(fields["replyToMessageId"]);
+  const messageIds = positiveIdsOf(fields["messageIds"]);
+  if (fields["carrier"] !== "hermes" || chatId === null || replyToMessageId === null || messageIds === null) return null;
+  if (typeof contentDigest !== "string" || typeof receiptId !== "string" || typeof obligationId !== "string") return null;
+  if (typeof deliveredAt !== "string" || typeof evidenceDigest !== "string") return null;
+  return {
+    transport: "telegram",
+    carrier: "hermes",
+    chatId,
+    replyToMessageId,
+    messageIds,
+    contentDigest,
+    receiptId,
+    obligationId,
+    deliveredAt,
+    evidenceDigest,
+  };
+};
+
+/**
+ * A stored delivery record of one of the two transports, with every field present and of its
+ * type, or `null`. A record of any other shape is unreadable, which `itemOf` reports by throwing.
+ */
 const deliveryOf = (value: unknown): OwnerReplyDelivery | null => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const fields = value as Record<string, unknown>;
+  if (fields["transport"] === "telegram") return telegramDeliveryOf(fields);
   if (fields["transport"] !== "buzz") return null;
   const relayAck = fields["relayAck"];
   if (relayAck !== "ACCEPTED" && relayAck !== "DUPLICATE") return null;
@@ -982,16 +1091,16 @@ export const recordOwnerReplyDelivered = (
   clock: Clock,
   audit: AuditLog,
   turnRequestId: string,
-  accepted: Omit<OwnerReplyDelivery, "deliveredAt" | "evidenceDigest">,
-): Decision<OwnerReplyDelivery> => {
+  accepted: Omit<OwnerReplyBuzzDelivery, "deliveredAt" | "evidenceDigest">,
+): Decision<OwnerReplyBuzzDelivery> => {
   assertDeliveryAuthority(authority, db, turnRequestId);
   return db.txDecision(() => {
     const row = db.get<{ payload_json: string | null; result_json: string | null; received_at: string }>(
       `SELECT payload_json, result_json, received_at FROM inbound_messages WHERE channel = ? AND nonce = ?`,
       [OWNER_REPLY_OUTBOX_CHANNEL, turnRequestId],
     );
-    const item = row ? itemOf(turnRequestId, row) : null;
-    if (item?.delivery?.eventId === accepted.eventId) return allow(ReasonCode.OK, item.delivery);
+    const delivered = row ? itemOf(turnRequestId, row).delivery : undefined;
+    if (delivered?.transport === "buzz" && delivered.eventId === accepted.eventId) return allow(ReasonCode.OK, delivered);
     const state = row ? deliveryStateOf(turnRequestId, row.result_json) : null;
     if (state?.status !== "PENDING") return notPending(turnRequestId, state);
     const recorded = ownerReplyIntent(db, turnRequestId);
@@ -1215,4 +1324,256 @@ export const owedOwnerReplyTurns = (db: Db): readonly string[] =>
         AND json_extract(result_json, '$.status') IS NOT 'DELIVERED'
       ORDER BY received_at ASC, nonce ASC`,
     [OWNER_REPLY_OUTBOX_CHANNEL],
+  ).map((row) => row.nonce);
+
+/* ------------------------------------------------- Telegram delivery from Hermes' evidence (A3) */
+
+/**
+ * Why a receipt's delivery evidence did not prove an item delivered. A fixed vocabulary: each is
+ * audited once per item, and no value the receipt reported is ever written beside it.
+ */
+export type TelegramDeliveryEvidenceCause =
+  /** The receipt is not the one that created the obligation: another id or another reply digest. */
+  | "receipt-is-not-the-items-receipt"
+  /** `state` is not the token that says Hermes' send succeeded. */
+  | "delivery-state-not-confirmed"
+  /** `content_digest` is not the digest of the reply the receipt proved. */
+  | "delivery-content-digest-mismatch"
+  /** `chat_id` is not the chat the turn's message was admitted from. */
+  | "delivery-chat-mismatch"
+  /** `reply_to_message_id` is not the owner's message the turn answers. */
+  | "delivery-reply-to-mismatch"
+  /** `message_ids` is not a non-empty list of positive safe integers. */
+  | "delivery-message-ids-invalid"
+  /** `obligation_id` is not a non-empty, bounded string. */
+  | "delivery-obligation-id-invalid";
+
+/**
+ * What one receipt's delivery evidence did to one item. Every verdict is final for that read:
+ * `REFUSED` and `CONFLICT` are recorded and audited, never thrown, so the settlement they may run
+ * inside still commits.
+ *
+ * - `DELIVERED`: the evidence matched, and the item is `DELIVERED` from now on.
+ * - `ALREADY_DELIVERED`: the item was already delivered on this same evidence. Nothing changed.
+ * - `NOT_OWED`: no item for the turn, or an item that is not a Telegram reply. Nothing changed.
+ * - `NO_EVIDENCE`: the receipt reported no delivery. The item stays as it was.
+ * - `REFUSED`: the evidence does not prove this item delivered. The item stays `PENDING`.
+ * - `CONFLICT`: the item is already delivered on different evidence. The record stands.
+ */
+export type TelegramDeliveryEvidenceVerdict =
+  | { readonly status: "DELIVERED" | "ALREADY_DELIVERED"; readonly delivery: OwnerReplyTelegramDelivery }
+  | { readonly status: "NOT_OWED" | "NO_EVIDENCE" }
+  | {
+      readonly status: "REFUSED";
+      readonly reasonCode: typeof ReasonCode.OWNER_REPLY_DELIVERY_EVIDENCE_REJECTED;
+      readonly cause: TelegramDeliveryEvidenceCause;
+      /** Whether this read wrote the cause's one audit row; `false` when an earlier read had. */
+      readonly audited: boolean;
+    }
+  | { readonly status: "CONFLICT"; readonly reasonCode: typeof ReasonCode.OWNER_REPLY_DELIVERY_EVIDENCE_CONFLICT };
+
+type RefusedEvidence = Extract<TelegramDeliveryEvidenceVerdict, { readonly status: "REFUSED" }>;
+type ConflictingEvidence = Extract<TelegramDeliveryEvidenceVerdict, { readonly status: "CONFLICT" }>;
+
+/** Evidence that does not prove the item delivered, with the code its audit row carries. */
+const refusedEvidence = (cause: TelegramDeliveryEvidenceCause, audited: boolean): RefusedEvidence =>
+  ({ status: "REFUSED", reasonCode: ReasonCode.OWNER_REPLY_DELIVERY_EVIDENCE_REJECTED, cause, audited });
+
+/** Evidence that differs from the delivery already recorded, with the code its audit row carries. */
+const conflictingEvidence = (): ConflictingEvidence =>
+  ({ status: "CONFLICT", reasonCode: ReasonCode.OWNER_REPLY_DELIVERY_EVIDENCE_CONFLICT });
+
+export interface TelegramDeliveryEvidenceInput {
+  readonly turnRequestId: string;
+  /** The receipt the evidence came in, already matched to the turn on all eight identity fields. */
+  readonly receipt: { readonly receiptId: string; readonly evidenceDigest: string };
+  /** `null` when the receipt reported no delivery. */
+  readonly delivery: TelegramDeliveryReport | null;
+}
+
+type TelegramDeliveryEvidence = Omit<OwnerReplyTelegramDelivery, "deliveredAt" | "evidenceDigest">;
+
+/**
+ * The record the evidence proves for this item, or the first reason it does not.
+ *
+ * Checked against what ACP stored, never against the receipt alone: the item's receipt (the one
+ * that created the obligation), and the address `ownerReplyAddressFor` derived from the turn's
+ * admitted Telegram payload, whose `conversation` is that payload's chat id and whose
+ * `replyToMessageId` is its message id.
+ */
+const telegramEvidenceFor = (
+  item: OwnerReplyItem,
+  receipt: TelegramDeliveryEvidenceInput["receipt"],
+  report: TelegramDeliveryReport,
+): { readonly cause: TelegramDeliveryEvidenceCause } | { readonly evidence: TelegramDeliveryEvidence } => {
+  if (receipt.receiptId !== item.receipt.receiptId || receipt.evidenceDigest !== item.receipt.evidenceDigest) {
+    return { cause: "receipt-is-not-the-items-receipt" };
+  }
+  if (!report.confirmed) return { cause: "delivery-state-not-confirmed" };
+  if (report.contentDigest === null || report.contentDigest !== item.receipt.evidenceDigest) {
+    return { cause: "delivery-content-digest-mismatch" };
+  }
+  if (report.chatId === null || String(report.chatId) !== item.address.conversation) {
+    return { cause: "delivery-chat-mismatch" };
+  }
+  if (report.replyToMessageId === null || report.replyToMessageId !== item.address.replyToMessageId) {
+    return { cause: "delivery-reply-to-mismatch" };
+  }
+  if (report.messageIds === null) return { cause: "delivery-message-ids-invalid" };
+  if (report.obligationId === null) return { cause: "delivery-obligation-id-invalid" };
+  return {
+    evidence: {
+      transport: "telegram",
+      carrier: "hermes",
+      chatId: report.chatId,
+      replyToMessageId: report.replyToMessageId,
+      messageIds: [...report.messageIds],
+      contentDigest: report.contentDigest,
+      receiptId: item.receipt.receiptId,
+      obligationId: report.obligationId,
+    },
+  };
+};
+
+/** The part of a Telegram delivery record the evidence decides; when it was recorded is not part. */
+const telegramEvidenceKey = (evidence: TelegramDeliveryEvidence): string => canonicalJson({
+  chatId: evidence.chatId,
+  replyToMessageId: evidence.replyToMessageId,
+  messageIds: evidence.messageIds,
+  contentDigest: evidence.contentDigest,
+  receiptId: evidence.receiptId,
+  obligationId: evidence.obligationId,
+});
+
+/**
+ * Settles one Telegram owner-reply item from the delivery evidence in the turn's own Hermes Gateway
+ * receipt (A3). The one function that does, whether the evidence arrives in the receipt that
+ * settles the turn (and so inside that settlement's transaction) or in a later read of it.
+ *
+ * ACP holds no Telegram transport: Hermes sends the reply in Telegram itself, and its receipt says
+ * so. The evidence proves the item delivered only when all of it matches what ACP stored: the
+ * receipt is the item's own, `state` is Hermes' confirmed token, `content_digest` is the reply the
+ * receipt proved, `chat_id` and `reply_to_message_id` are the chat and the message the turn's
+ * Telegram update was admitted with, `message_ids` is a non-empty list of positive safe integers,
+ * and `obligation_id` names the obligation. Anything else leaves the item `PENDING` with one
+ * `OWNER_REPLY_UNDELIVERED` row naming the first failed check, once per cause per item, in the
+ * same `audited` set the sender uses (R1056-06).
+ *
+ * Exactly once: an item already delivered on the same evidence is left alone, and one delivered on
+ * different evidence is never rewritten; the conflicting read is audited and refused.
+ *
+ * Held to the owner-reply authority, which only the turn coordinator holds, because only the
+ * coordinator's sealed receipt port and its eight-field match make the evidence the turn's own.
+ * Runs in the caller's transaction when there is one, and in its own otherwise. It returns a
+ * verdict rather than a denial, so the settlement around it is never rolled back by it.
+ */
+export const recordTelegramReplyDeliveryEvidence = (
+  authority: OwnerReplyAuthority,
+  db: Db,
+  clock: Clock,
+  audit: AuditLog,
+  input: TelegramDeliveryEvidenceInput,
+): TelegramDeliveryEvidenceVerdict => {
+  const { turnRequestId } = input;
+  assertAuthority(authority, db, turnRequestId);
+  return db.tx((): TelegramDeliveryEvidenceVerdict => {
+    const row = db.get<{ payload_json: string | null; result_json: string | null; received_at: string }>(
+      `SELECT payload_json, result_json, received_at FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [OWNER_REPLY_OUTBOX_CHANNEL, turnRequestId],
+    );
+    if (!row) return { status: "NOT_OWED" };
+    const item = itemOf(turnRequestId, row);
+    // A Buzz item is its sender's to deliver, whatever a receipt says.
+    if (item.address.channel !== "telegram") return { status: "NOT_OWED" };
+    if (input.delivery === null) return { status: "NO_EVIDENCE" };
+    const proved = telegramEvidenceFor(item, input.receipt, input.delivery);
+
+    if (item.status === "DELIVERED") {
+      const recorded = item.delivery;
+      if (recorded?.transport === "telegram" && "evidence" in proved &&
+          telegramEvidenceKey(recorded) === telegramEvidenceKey(proved.evidence)) {
+        return { status: "ALREADY_DELIVERED", delivery: recorded };
+      }
+      // Never rewritten. The row names the stored record, not what this receipt said.
+      const conflict = conflictingEvidence();
+      audit.record({
+        kind: "OWNER_REPLY_DELIVERY_CONFLICT",
+        reasonCode: conflict.reasonCode,
+        evidence: {
+          turnRequestId,
+          channel: "telegram",
+          cause: "evidence-differs-from-recorded-delivery",
+          receiptId: item.receipt.receiptId,
+          ...(recorded === undefined ? {} : { recordedEvidenceDigest: recorded.evidenceDigest }),
+        },
+      });
+      return conflict;
+    }
+
+    const state = deliveryStateOf(turnRequestId, row.result_json);
+    if ("cause" in proved) {
+      const key = `${ReasonCode.OWNER_REPLY_DELIVERY_EVIDENCE_REJECTED}:${proved.cause}`;
+      if (state.audited.includes(key)) return refusedEvidence(proved.cause, false);
+      const refused = refusedEvidence(proved.cause, true);
+      writeResult(db, turnRequestId, pendingStateJson({ ...state, audited: [...state.audited, key] }));
+      audit.record({
+        kind: "OWNER_REPLY_UNDELIVERED",
+        reasonCode: refused.reasonCode,
+        evidence: {
+          turnRequestId,
+          channel: "telegram",
+          cause: proved.cause,
+          transient: false,
+          receiptId: item.receipt.receiptId,
+        },
+      });
+      return refused;
+    }
+
+    const evidence = { ...proved.evidence, deliveredAt: clock.nowIso() };
+    const delivery: OwnerReplyTelegramDelivery = { ...evidence, evidenceDigest: digestOf(evidence) };
+    writeResult(db, turnRequestId, canonicalJson({
+      status: "DELIVERED",
+      delivery,
+      ...(state.attempts === 0 ? {} : { attempts: state.attempts }),
+      ...(state.audited.length === 0 ? {} : { audited: state.audited }),
+    }));
+    // No chat id here: a Telegram chat is not written to the audit log in the clear.
+    audit.record({
+      kind: "OWNER_REPLY_DELIVERED",
+      reasonCode: ReasonCode.OK,
+      actor: "hermes",
+      evidence: {
+        turnRequestId,
+        channel: "telegram",
+        carrier: "hermes",
+        receiptId: delivery.receiptId,
+        replyToMessageId: delivery.replyToMessageId,
+        messageIds: delivery.messageIds,
+        contentDigest: delivery.contentDigest,
+        evidenceDigest: delivery.evidenceDigest,
+      },
+    });
+    return { status: "DELIVERED", delivery };
+  });
+};
+
+/**
+ * The turn ids of every completed canonical turn whose Telegram reply is still `PENDING` and has
+ * no verdict on delivery evidence yet, oldest first: the items a later receipt read may still
+ * settle (A3). An item whose evidence was refused once is not asked about again; it stays parked.
+ */
+export const telegramRepliesAwaitingDeliveryEvidence = (db: Db): readonly string[] =>
+  db.all<{ nonce: string }>(
+    `SELECT item.nonce FROM inbound_messages AS item
+      WHERE item.channel = ?
+        AND json_extract(item.result_json, '$.status') = 'PENDING'
+        AND json_extract(item.payload_json, '$.ledger') = 'CANONICAL_TURN'
+        AND json_extract(item.payload_json, '$.address.channel') = 'telegram'
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(item.result_json, '$.audited') AS seen
+           WHERE instr(seen.value, ?) = 1
+        )
+      ORDER BY item.received_at ASC, item.nonce ASC`,
+    [OWNER_REPLY_OUTBOX_CHANNEL, `${ReasonCode.OWNER_REPLY_DELIVERY_EVIDENCE_REJECTED}:`],
   ).map((row) => row.nonce);

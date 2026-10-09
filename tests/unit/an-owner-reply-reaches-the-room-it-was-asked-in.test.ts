@@ -559,8 +559,7 @@ describe("an owner reply on Buzz", () => {
     expect(relay.stored.size).toBe(1);
     const item = ownerReplyFor(after.db, turn);
     expect(item?.status).toBe("DELIVERED");
-    expect(item?.delivery?.eventId).toBe(sent.event.id);
-    expect(item?.delivery?.relayAck).toBe("DUPLICATE");
+    expect(item?.delivery).toMatchObject({ transport: "buzz", eventId: sent.event.id, relayAck: "DUPLICATE" });
     expect(auditRows(after, "OWNER_REPLY_DELIVERED", turn)).toHaveLength(1);
   });
 
@@ -867,7 +866,7 @@ describe("the #1056 review's six findings", () => {
     expect(w.relay.received.map((sent) => sent.event.id)).toEqual([recorded.id, recorded.id]);
     expect(attempts).toEqual(["refused"]);
     expect(outbox.ownerReplyIntent(w.db, turn)).toMatchObject({ status: "RECORDED", intent: { eventId: recorded.id } });
-    expect(ownerReplyFor(w.db, turn)?.delivery?.eventId).toBe(recorded.id);
+    expect(ownerReplyFor(w.db, turn)?.delivery).toMatchObject({ transport: "buzz", eventId: recorded.id });
   });
 
   it.each([
@@ -1152,7 +1151,7 @@ describe("the #1056 review's six findings", () => {
     await w.consumer.wake("DUE");
     await quiesce(w);
 
-    expect(ownerReplyFor(w.db, turn)?.delivery?.relayAck).toBe("ACCEPTED");
+    expect(ownerReplyFor(w.db, turn)?.delivery).toMatchObject({ transport: "buzz", relayAck: "ACCEPTED" });
     expect(markerRows(w)).toBe(0);
   });
 

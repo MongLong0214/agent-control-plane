@@ -98,7 +98,8 @@ describe("U4 Hermes Gateway receipt port", () => {
     const fixture = daemonFixture();
     try {
       const turn = await claimOne(fixture, 71);
-      gateway.answer = (updateId) => ({ kind: "json", body: gatewayReceipt(updateId, turn) });
+      // No delivery evidence, so the reply stays owed (A3 records it DELIVERED when there is some).
+      gateway.answer = (updateId) => ({ kind: "json", body: gatewayReceipt(updateId, turn, { delivery: null }) });
       await fixture.cp.conversation.reconcileUnresolved(5_000);
       expect(turnRow(fixture, turn.turnRequestId)).toEqual({
         lifecycle_state: "SETTLED",

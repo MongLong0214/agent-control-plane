@@ -1,5 +1,6 @@
 import { request } from "node:http";
 
+import { type TelegramDeliveryReport, telegramChatIdOf } from "../conversation/owner-reply-outbox.ts";
 import type { ReceiptLookupQuery, ReceiptLookupResult, ReceiptPort } from "../conversation/turn-coordinator.ts";
 import { isDigest } from "../core/digest.ts";
 import type { Db } from "../db/database.ts";
@@ -16,6 +17,10 @@ import type { Db } from "../db/database.ts";
  * attests to, and `#settleFromReceipt` compares all eight fields against the turn it claimed. A
  * pending, absent, malformed, oversized, slow or refused answer is `found: false`, which leaves the
  * turn in doubt, never evidence that it ran or did not.
+ *
+ * A `COMPLETED` receipt also says whether Hermes sent the reply in Telegram (A3). Its `delivery` is
+ * read as reported and handed on, unverified: the owner-reply outbox compares it with the turn's
+ * admitted chat and message and with the reply digest before it records anything.
  */
 
 export interface HermesGatewayReceiptPortOptions {
@@ -61,7 +66,25 @@ const IDENTITY_KEYS = [
   "targetBindingId",
   "turnRequestId",
 ] as const;
-const DELIVERY_KEYS = ["chat_id", "content_digest", "message_ids", "reply_to_message_id", "state"] as const;
+/**
+ * The `delivery.state` Hermes writes once the reply's Telegram send succeeded: the one value that
+ * confirms a delivery (A3). Hermes' token, not ACP's, so it is named here and nowhere else.
+ */
+export const HERMES_DELIVERY_CONFIRMED_STATE = "delivered";
+/**
+ * Every key of a `COMPLETED` receipt's `delivery`, and nothing else (hermes.gateway-turn-receipt/v1,
+ * as Hermes and ACP agreed it for #1036). Hermes' earlier `{obligation_id, state, content_digest}`
+ * names no chat and no replied-to message, so nothing could be checked against the turn, and it is
+ * not read as a receipt at all.
+ */
+const DELIVERY_KEYS = [
+  "chat_id",
+  "content_digest",
+  "message_ids",
+  "obligation_id",
+  "reply_to_message_id",
+  "state",
+] as const;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -71,6 +94,31 @@ const sameKeys = (value: Record<string, unknown>, keys: readonly string[]): bool
 
 const boundedText = (value: unknown, max = 512): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= max && !/[\x00-\x1f\x7f]/.test(value);
+
+const positiveId = (value: unknown): number | null =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+
+/**
+ * What the receipt says about the reply's Telegram delivery, each field kept only when it has the
+ * type the contract gives it. A value of the wrong type is `null` rather than a refusal of the whole
+ * receipt: the turn did complete, and the outbox records the delivery evidence as rejected instead.
+ */
+const deliveryReport = (delivery: Record<string, unknown>): TelegramDeliveryReport => {
+  const ids = delivery["message_ids"];
+  const messageIds = Array.isArray(ids) && ids.length > 0 && ids.every((id) => positiveId(id) !== null)
+    ? (ids as number[]).slice()
+    : null;
+  const obligationId = delivery["obligation_id"];
+  const contentDigest = delivery["content_digest"];
+  return {
+    confirmed: delivery["state"] === HERMES_DELIVERY_CONFIRMED_STATE,
+    obligationId: boundedText(obligationId) ? obligationId : null,
+    contentDigest: isDigest(contentDigest) ? contentDigest : null,
+    chatId: telegramChatIdOf(delivery["chat_id"]),
+    replyToMessageId: positiveId(delivery["reply_to_message_id"]),
+    messageIds,
+  };
+};
 
 /**
  * A terminal answer for exactly this update, or null. Every key is named: an answer carrying a key
@@ -111,6 +159,9 @@ const terminalReceipt = (body: unknown, source: TelegramTurnSource): ReceiptLook
   if (!isDigest(rest["evidenceDigest"]) || !boundedText(rest["reasonCode"], 128)) return NOT_FOUND;
   const delivery = rest["delivery"];
   if (delivery !== null && (!isRecord(delivery) || !sameKeys(delivery, DELIVERY_KEYS))) return NOT_FOUND;
+  // An aborted turn sent no reply. One that says it both aborted and delivered says two things,
+  // and settling it ABORTED would permit a re-run of a turn the owner was already answered for.
+  if (status === "ABORTED" && delivery !== null) return NOT_FOUND;
 
   return {
     found: true,
@@ -126,6 +177,7 @@ const terminalReceipt = (body: unknown, source: TelegramTurnSource): ReceiptLook
     targetAttestationId: identity["targetAttestationId"],
     executorSessionId: identity["executorSessionId"],
     executorSessionIncarnation: identity["executorSessionIncarnation"],
+    ...(status === "COMPLETED" ? { delivery: delivery === null ? null : deliveryReport(delivery) } : {}),
   };
 };
 
@@ -180,6 +232,8 @@ const getReceipt = (
   });
 
 export class HermesGatewayReceiptPort implements ReceiptPort {
+  /** Its `COMPLETED` receipts carry Hermes' Telegram delivery evidence (A3). */
+  readonly reportsTelegramDelivery = true;
   readonly #apiKey: string;
   readonly #port: number;
   readonly #sourceOf: TelegramTurnSourceResolver;

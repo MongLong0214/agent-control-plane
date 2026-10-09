@@ -969,8 +969,10 @@ export class RoleConversationPort {
   }
 
   /**
-   * Records that this connection, the role's current holder, told the CEO about one rejected peer
-   * message it was shown under `refusedAtRestart` (ACP-RESTART-04).
+   * This connection, the role's current holder, takes on telling the CEO about one rejected peer
+   * message it was shown under `refusedAtRestart` (ACP-RESTART-04) — before it tells the CEO. Refused
+   * when the daemon is already telling the CEO itself (acp-daemon-notice/v1, amendment 1: one channel
+   * per notice); the holder then says nothing.
    */
   reportPeerMessageRefusal(server: McpServer, roleKey: string, messageId: string): Decision<void> {
     const holder = this.#holderFor(server, roleKey);

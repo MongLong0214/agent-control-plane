@@ -103,6 +103,8 @@ export const forgeWorkerProcessRecord = (path: string, executionId: string, pid:
 /** A capacity gate that admits: provider capacity is PR-A's change (B1), not what these witnesses measure. */
 export const admittingCapacity = {
   refreshForWorkerFanout: async () => allow(ReasonCode.OK, undefined),
+  // #1069 — a provider-only admission; this gate admits either way.
+  hasRoleScoped: () => false,
   workerReserveDemand: (): DynamicReserveDemand => ({
     criticalRoleInvocations: 0,
     expectedReviews: 0,

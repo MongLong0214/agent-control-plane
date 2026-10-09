@@ -1,0 +1,66 @@
+{
+  "contract": "acp-daemon-notice/v1",
+  "note": "Shared test vector. The IKM is a test constant and never a real lane secret. canonical is the exact string whose UTF-8 bytes are digested and MACed; canonical_utf8_hex is those bytes.",
+  "ikm_utf8": "acp-daemon-notice/v1 shared test vector IKM (a test constant, never a real secret)",
+  "hkdf": {
+    "hash": "SHA-256",
+    "salt_utf8": "acp-hermes-lane",
+    "info_utf8": "acp-daemon-notice/v1",
+    "length": 32
+  },
+  "derived_key_hex": "15393ef8fa8577e26874638116794b9abb3f20db0a4ed3556adf8beefb517863",
+  "vectors": [
+    {
+      "name": "metadata-notice",
+      "event_id_input": {
+        "message_id": "msg_0000000000000000000000vector",
+        "role_key": "PRIMARY_CTO:vector-project",
+        "reason_code": "REVOKED"
+      },
+      "event_id_preimage_utf8": "msg_0000000000000000000000vector\nPRIMARY_CTO:vector-project\nREVOKED",
+      "body_fields": {
+        "protocol": "acp-daemon-notice/v1",
+        "principal": "acp-daemon",
+        "binding": "acp-canonical-ceo",
+        "event_id": "acp-notice:378729ab40e2ae7d4456399eda633a93c151a02d69bc45f514b2086ae1e646d5",
+        "destination": {
+          "session_id": "20261004_000000_vector",
+          "lineage_root_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "process_pid": 424242,
+          "process_started_at": "darwin-tv:1790000000.000001"
+        },
+        "text": "ACP refused a queued peer message addressed to the CTO; it was not delivered. message_id=msg_0000000000000000000000vector source_event_id=event-vector signer=npub-vector-ceo reason=REVOKED at=2026-10-04T00:00:00.000Z"
+      },
+      "canonical": "{\"binding\":\"acp-canonical-ceo\",\"destination\":{\"lineage_root_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"process_pid\":424242,\"process_started_at\":\"darwin-tv:1790000000.000001\",\"session_id\":\"20261004_000000_vector\"},\"event_id\":\"acp-notice:378729ab40e2ae7d4456399eda633a93c151a02d69bc45f514b2086ae1e646d5\",\"principal\":\"acp-daemon\",\"protocol\":\"acp-daemon-notice/v1\",\"text\":\"ACP refused a queued peer message addressed to the CTO; it was not delivered. message_id=msg_0000000000000000000000vector source_event_id=event-vector signer=npub-vector-ceo reason=REVOKED at=2026-10-04T00:00:00.000Z\"}",
+      "canonical_utf8_hex": "7b2262696e64696e67223a226163702d63616e6f6e6963616c2d63656f222c2264657374696e6174696f6e223a7b226c696e656167655f726f6f745f646967657374223a227368613235363a63636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363222c2270726f636573735f706964223a3432343234322c2270726f636573735f737461727465645f6174223a2264617277696e2d74763a313739303030303030302e303030303031222c2273657373696f6e5f6964223a2232303236313030345f3030303030305f766563746f72227d2c226576656e745f6964223a226163702d6e6f746963653a33373837323961623430653261653764343435363339396564613633336139336331353161303264363962633435663531346232303836616531653634366435222c227072696e636970616c223a226163702d6461656d6f6e222c2270726f746f636f6c223a226163702d6461656d6f6e2d6e6f746963652f7631222c2274657874223a2241435020726566757365642061207175657565642070656572206d6573736167652061646472657373656420746f207468652043544f3b20697420776173206e6f742064656c6976657265642e206d6573736167655f69643d6d73675f30303030303030303030303030303030303030303030766563746f7220736f757263655f6576656e745f69643d6576656e742d766563746f72207369676e65723d6e7075622d766563746f722d63656f20726561736f6e3d5245564f4b45442061743d323032362d31302d30345430303a30303a30302e3030305a227d",
+      "payload_digest": "sha256:e24429dd40eb0684c25988d6128c2fe15d5b65cd477a351b26a605c74c752fdb",
+      "signature": "hmac-sha256:c65390855b521bbbf16b5032e616d3093d06c8b4b984140d738501d2beb07bc8"
+    },
+    {
+      "name": "escaping",
+      "event_id_input": {
+        "message_id": "msg_escaping",
+        "role_key": "PRIMARY_CTO:vector-project",
+        "reason_code": "ALREADY_CLAIMED"
+      },
+      "event_id_preimage_utf8": "msg_escaping\nPRIMARY_CTO:vector-project\nALREADY_CLAIMED",
+      "body_fields": {
+        "protocol": "acp-daemon-notice/v1",
+        "principal": "acp-daemon",
+        "binding": "acp-canonical-ceo",
+        "event_id": "acp-notice:768732d672fbe033208e506f4ab643c6f195a8ebb38601c944b490178a602249",
+        "destination": {
+          "session_id": "20261004_000000_vector",
+          "lineage_root_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "process_pid": 424242,
+          "process_started_at": "darwin-tv:1790000000.000001"
+        },
+        "text": "quote \" backslash \\ newline \n tab \t ctrl \u0001 del  한국어 é 😀 </>"
+      },
+      "canonical": "{\"binding\":\"acp-canonical-ceo\",\"destination\":{\"lineage_root_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"process_pid\":424242,\"process_started_at\":\"darwin-tv:1790000000.000001\",\"session_id\":\"20261004_000000_vector\"},\"event_id\":\"acp-notice:768732d672fbe033208e506f4ab643c6f195a8ebb38601c944b490178a602249\",\"principal\":\"acp-daemon\",\"protocol\":\"acp-daemon-notice/v1\",\"text\":\"quote \\\" backslash \\\\ newline \\n tab \\t ctrl \\u0001 del  한국어 é 😀 </>\"}",
+      "canonical_utf8_hex": "7b2262696e64696e67223a226163702d63616e6f6e6963616c2d63656f222c2264657374696e6174696f6e223a7b226c696e656167655f726f6f745f646967657374223a227368613235363a63636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363222c2270726f636573735f706964223a3432343234322c2270726f636573735f737461727465645f6174223a2264617277696e2d74763a313739303030303030302e303030303031222c2273657373696f6e5f6964223a2232303236313030345f3030303030305f766563746f72227d2c226576656e745f6964223a226163702d6e6f746963653a37363837333264363732666265303333323038653530366634616236343363366631393561386562623338363031633934346234393031373861363032323439222c227072696e636970616c223a226163702d6461656d6f6e222c2270726f746f636f6c223a226163702d6461656d6f6e2d6e6f746963652f7631222c2274657874223a2271756f7465205c22206261636b736c617368205c5c206e65776c696e65205c6e20746162205c74206374726c205c75303030312064656c207f20ed959ceab5adec96b420c3a920f09f9880203c2f3e227d",
+      "payload_digest": "sha256:61099405c1eb273103cafb6fa9c5dfa32f41a88b7a93c4df2f9964d5c9a25c2a",
+      "signature": "hmac-sha256:9c08c50eb67d7ee98acaa2dd079189a234d7a1a90a16e41a619835f02495a394"
+    }
+  ]
+}

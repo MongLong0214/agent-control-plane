@@ -11,6 +11,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import {
   type FailureClass,
+  Role,
   RunState,
   type TaskCategory,
   type TaskClass,
@@ -81,6 +82,15 @@ export interface ExecutionStart {
   runtimeManaged?: boolean;
 }
 
+/**
+ * A worker receipt names its session. Provider and model are that session's: the receipt may omit
+ * them, and a receipt that states either must state the session's own (#512).
+ */
+export type WorkerExecutionStart = Omit<ExecutionStart, "provider" | "model"> & {
+  provider?: string | undefined;
+  model?: string | undefined;
+};
+
 export interface ExecutionOutcome {
   status: "SUCCEEDED" | "FAILED" | "ABANDONED" | "TIMEOUT";
   resultDigest?: string | null;
@@ -119,7 +129,12 @@ export interface ExecutionRecord {
 /** The worker allocator must admit its exact lower-priority allocation before recording it. */
 export interface WorkerCapacityGate {
   refreshForWorkerFanout(target?: WorkerFanoutCapacityTarget): Promise<Decision<void>>;
-  workerReserveDemand(provider: string): DynamicReserveDemand;
+  workerReserveDemand(provider: string, role?: Role): DynamicReserveDemand;
+  /**
+   * Whether the provider's adapters, and so its capacity, are registered per role. Such a
+   * provider is admitted only against a named role: provider-only admission refuses it.
+   */
+  hasRoleScoped(provider: string): boolean;
 }
 
 /**
@@ -307,6 +322,18 @@ export class TaskGraph {
   }
 
   startExecution(input: ExecutionStart): Decision<ExecutionRecord> {
+    return this.recordExecution(input, null);
+  }
+
+  /**
+   * `admitted` is the worker identity capacity admitted, when this records a worker execution: it
+   * is read again here, inside the transaction that records it, and the labels written are that
+   * identity's, so what was admitted and what is recorded cannot differ.
+   */
+  private recordExecution(
+    input: ExecutionStart,
+    admitted: { provider: string; model: string } | null,
+  ): Decision<ExecutionRecord> {
     return this.db.tx(() => {
       const task = this.get(input.taskId);
       if (!task) return deny(ReasonCode.NOT_FOUND, "unknown task", { taskId: input.taskId });
@@ -320,6 +347,10 @@ export class TaskGraph {
       }
       const workerBinding = this.assertLiveWorkerBinding(input);
       if (!workerBinding.allowed) return workerBinding as Decision<ExecutionRecord>;
+      if (admitted) {
+        const identity = this.workerIdentity({ ...input, ...admitted });
+        if (!identity.allowed) return identity as Decision<ExecutionRecord>;
+      }
       if (task.state !== TaskState.READY && task.state !== TaskState.FAILED) {
         return deny(
           ReasonCode.TASK_DEPENDENCY_UNSATISFIED,
@@ -446,7 +477,7 @@ export class TaskGraph {
    * allocator is deliberately routed only through this admission method.
    */
   async startWorkerExecution(
-    input: ExecutionStart,
+    input: WorkerExecutionStart,
     /**
      * #1070 ACP-WORKER-03 — asked once more after the capacity probe, before the execution is opened:
      * a caller whose admission was withdrawn while the probe ran (a daemon that began to stop) opens none.
@@ -457,27 +488,91 @@ export class TaskGraph {
     // `startExecution` repeats this check inside its transaction after the async probe.
     const workerBinding = this.assertLiveWorkerBinding(input);
     if (!workerBinding.allowed) return workerBinding as Decision<ExecutionRecord>;
-    if (!this.#capacity) {
-      return deny(
-        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
-        "worker execution has no attached capacity admission gate",
-        { runId: input.runId, taskId: input.taskId, provider: input.provider },
-      );
-    }
-    const target: WorkerFanoutCapacityTarget = {
-      provider: input.provider,
-      capabilities: [this.workerCapability(input.model)],
-      priority: "worker",
-      // The monitor reads durable role/running-work facts. Passing the complete demand on
-      // this production path makes worker priority explicit instead of caller-optional.
-      reserveDemand: this.#capacity.workerReserveDemand(input.provider),
-    };
-    const capacity = await this.#capacity.refreshForWorkerFanout(target);
+    // #512 — capacity is admitted for the provider and model the bound session runs, never for
+    // ones the receipt names: a receipt could otherwise spend another provider's quota, or none
+    // that was probed, on this worker.
+    const identity = this.workerIdentity(input);
+    if (!identity.allowed) return identity as Decision<ExecutionRecord>;
+    const capacity = await this.admitWorkerFanout(identity.value.provider, identity.value.model, {
+      runId: input.runId,
+      taskId: input.taskId,
+    });
     if (!capacity.allowed) return capacity as Decision<ExecutionRecord>;
     if (!stillAdmitting()) {
       return deny(ReasonCode.CONFLICT, "the admission was withdrawn before the execution was opened", { runId: input.runId, taskId: input.taskId });
     }
-    return this.startExecution(input);
+    return this.recordExecution({ ...input, ...identity.value }, identity.value);
+  }
+
+  /**
+   * The provider and model a worker execution is admitted and recorded under: the bound worker
+   * session's own. A receipt that states either must state the session's.
+   */
+  private workerIdentity(
+    input: Pick<WorkerExecutionStart, "runId" | "taskId" | "workerSessionId" | "provider" | "model">,
+  ): Decision<{ provider: string; model: string }> {
+    const session = this.db.get<{ provider: string; model: string }>(
+      `SELECT provider, model FROM sessions WHERE session_id = ?`,
+      [input.workerSessionId],
+    );
+    if (!session) {
+      return deny(ReasonCode.WORKER_BINDING_REQUIRED, "worker execution names an unknown session", {
+        runId: input.runId,
+        taskId: input.taskId,
+        workerSessionId: input.workerSessionId,
+      });
+    }
+    if (
+      (input.provider !== undefined && input.provider !== session.provider) ||
+      (input.model !== undefined && input.model !== session.model)
+    ) {
+      return deny(ReasonCode.CONFLICT, "the receipt names a provider or model its worker session does not run", {
+        runId: input.runId,
+        taskId: input.taskId,
+        workerSessionId: input.workerSessionId,
+        provider: input.provider ?? null,
+        model: input.model ?? null,
+        sessionProvider: session.provider,
+        sessionModel: session.model,
+      });
+    }
+    return allow(ReasonCode.OK, { provider: session.provider, model: session.model });
+  }
+
+  /**
+   * §14.2/§14.5 — the one worker fan-out admission, shared by execution start and by worker
+   * provisioning (`worker-staffing.ts`), so both ask capacity the same question.
+   *
+   * A provider whose adapters are registered per role (Claude, under the deployment's ambient
+   * OAuth identity) is admitted as `Role.WORKER`: the fresh reading is that role binding's own
+   * probe, and the reserve demand carries the binding it was measured for. Provider-only
+   * admission refuses such a provider outright, which is what left every Claude worker
+   * unroutable. Naming the role does not relax anything: an unknown, stale or unreadable reading
+   * still refuses as `CAPACITY_UNKNOWN_NOT_ROUTABLE`, and the dynamic reserve still applies.
+   */
+  async admitWorkerFanout(
+    provider: string,
+    model: string,
+    evidence: Record<string, unknown> = {},
+  ): Promise<Decision<void>> {
+    if (!this.#capacity) {
+      return deny(
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "worker execution has no attached capacity admission gate",
+        { ...evidence, provider },
+      );
+    }
+    const role = this.#capacity.hasRoleScoped(provider) ? Role.WORKER : undefined;
+    const target: WorkerFanoutCapacityTarget = {
+      provider,
+      ...(role === undefined ? {} : { role }),
+      capabilities: [this.workerCapability(model)],
+      priority: "worker",
+      // The monitor reads durable role/running-work facts. Passing the complete demand on
+      // this production path makes worker priority explicit instead of caller-optional.
+      reserveDemand: this.#capacity.workerReserveDemand(provider, role),
+    };
+    return this.#capacity.refreshForWorkerFanout(target);
   }
 
   finishExecution(
