@@ -852,6 +852,28 @@ export const produceRepoFactoryResult = async (
     );
   }
 
+  // #246 C2, review round 1 (RF-REVIEW-01) — the commit just made is compared with the approved
+  // files before anything reaches GitHub. Checked only after the GitHub operations, a tree a hook
+  // had changed was refused once the repository existed with those bytes pushed, its default branch
+  // set and its branch protected; a refusal undoes none of that. A head GitHub already holds is
+  // checked the same way once it is checked out (`approvedTree` below), and the head this run
+  // finally reports once more after.
+  const approvedTree = (at: string): Promise<Decision<void>> => producedTreeDrift(localRepoPath, at, approvedFiles);
+  let committedDrift: Decision<void>;
+  try {
+    const committed = await tryRevParse(localRepoPath, "HEAD");
+    committedDrift = committed
+      ? await approvedTree(committed)
+      : deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "local repository has no exact HEAD after commit", { localRepoPath });
+  } catch (thrown) {
+    cleanup();
+    throw thrown;
+  }
+  if (!committedDrift.allowed) {
+    cleanup();
+    return committedDrift as Decision<RepoFactoryResult>;
+  }
+
   // GitHub's half, between the commit and the verification: the verified head below must be
   // the head GitHub holds. On a resumed push the commit just made is not that head — its
   // timestamp differs from the one GitHub holds — so the push step fetches the receipted
@@ -879,6 +901,7 @@ export const produceRepoFactoryResult = async (
           }),
         ledgerPath,
         clock,
+        approvedTree,
       });
     } catch (thrown) {
       cleanup();
@@ -905,7 +928,7 @@ export const produceRepoFactoryResult = async (
   // approved files. A drifted tree is refused before it is verified, receipted or activated.
   let drift: Decision<void>;
   try {
-    drift = await producedTreeDrift(localRepoPath, head, approvedFiles);
+    drift = await approvedTree(head);
   } catch (thrown) {
     cleanup();
     throw thrown;

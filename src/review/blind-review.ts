@@ -376,6 +376,13 @@ export class BlindReviewGate {
         BOOTSTRAP_PLAN_REVIEWER_SYSTEM_PROMPT,
       );
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
+      // Review round 1 (RF-REVIEW-02) — the reviewer answered asynchronously, and `plan_submit` may
+      // have replaced the PLAN meanwhile. The trusted inputs are reloaded before the verdict is kept:
+      // a verdict on a PLAN the run no longer has is stale (EVIDENCE_STALE) and is not stored, so
+      // only a review of the current PLAN can make its candidate ready. `settle` does not await, so
+      // nothing can replace the PLAN between this reload and the packet it stores.
+      const stillCurrent = this.trustedBootstrapPlanInputs(request, snapshotDigest);
+      if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
       return this.settle({
         runId: inputs.runId,
         contractDigest: inputs.contractDigest,

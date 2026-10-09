@@ -624,6 +624,14 @@ export interface ApplyGitHubOperationsInput {
   clock: Clock;
   /** Mints the marker a create puts in the repository's description. */
   newMarker?: () => string;
+  /**
+   * Issue #246 C2, review round 1 (RF-REVIEW-01) — whether the tree at `head` is exactly the approved
+   * files. The commit this run makes is asked before this function is called at all, so a first push
+   * sends only an approved tree. A head GitHub already holds — a resumed push's receipted head, or a
+   * lost push's recorded one — was not, so it is asked once it is checked out, before any later
+   * operation writes on its strength.
+   */
+  approvedTree: (head: string) => Promise<Decision<void>>;
 }
 
 export interface AppliedGitHubOperations {
@@ -1000,6 +1008,13 @@ export const applyGitHubOperations = async (
       const local = await tryRevParse(input.checkoutPath, "HEAD");
       if (local !== head) {
         return localFailure("the local checkout is not at the pushed commit", { head: local, pushed: head }) as Decision<void>;
+      }
+      // The pushed head is what the setting and the protection after it are applied to, and what the
+      // result reports; one that is not the approved files stops here, before either is written
+      // (RF-REVIEW-01). The tree check's own evidence — its refusal and the differing paths — is kept.
+      const approved = await input.approvedTree(head);
+      if (!approved.allowed) {
+        return stop(approved.reasonCode, "PUSHED_HEAD_NOT_APPROVED", approved.message, id, approved.evidence, false);
       }
       return allow(ReasonCode.OK, undefined);
     };

@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 
 import { deriveHumanGate } from "./human-gate.ts";
+import { currentBootstrapPlan, sameBootstrapPlanBinding } from "../bootstrap/bootstrap-plan.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
@@ -1084,6 +1085,19 @@ export class ProductionGate {
     candidateSnapshotDigest: string,
     binding: { planDigest: string; projectManifestDigest: string; plannedOutputsDigest: string },
   ): Decision<ProductionReadyPacket["blindReview"]> {
+    // Review round 1 (RF-REVIEW-02) — the candidate's PLAN must still be the run's. A review of the
+    // PLAN the candidate names is not a review of a PLAN that replaced it; comparing the review with
+    // the frozen candidate alone cannot tell, since both still name the replaced one.
+    const current = currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+    const currentBinding = current.allowed ? current.value.binding : null;
+    if (!sameBootstrapPlanBinding(currentBinding, binding)) {
+      return deny(ReasonCode.EVIDENCE_STALE, "the candidate names a PLAN, manifest or planned outputs that are not the run's current ones", {
+        runId,
+        candidateSnapshotDigest,
+        candidate: binding,
+        current: currentBinding,
+      });
+    }
     const reviewArtifact = this.artifacts.latestForSnapshot<ReviewPacket>(
       runId,
       ArtifactKind.BLIND_REVIEW,
