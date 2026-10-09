@@ -176,8 +176,11 @@ describe("a merge is judged by the newest project-ci run on the head", () => {
       },
     });
 
-    expect(result.status, result.stdout).toBe(0);
-    expect(result.merges).toHaveLength(1);
+    expect(result.merges, result.stdout).toHaveLength(1);
     expect(result.merges[0]).toEqual(expect.arrayContaining(["--match-head-commit", HEAD]));
+    // This world has no merge commit for the read-back to find, so after merging the script fails
+    // loudly rather than claim it; a-merge-names-the-head-it-checked.test.ts reads a real one back.
+    expect(result.stdout).toContain("RESULT: FAIL — #1 is merged, and reading it back does not match what was checked");
+    expect(result.status).toBe(1);
   });
 });

@@ -10,7 +10,8 @@ import { type FailureClass, Role, SessionLifecycle, TaskState, roleKeyFor } from
 import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
-import { rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
 import {
   type PinnedRepository,
@@ -25,7 +26,11 @@ import {
   parentOf,
   pinRepository,
   plumbingWorkerCommit,
+  type GitChildren,
+  type GitChildrenClosed,
+  type GitProcessGroup,
   indexSnapshot,
+  runPinnedGit,
   scanAgainst,
   stagedAgainst,
   stagedContent,
@@ -63,6 +68,10 @@ export const WORKER_TURN_MODEL = "opus";
 const DEFAULT_POLL_MS = 1_000;
 const DEFAULT_PROCESS_SETTLE_MS = 2_000;
 const DEFAULT_SHUTDOWN_BUDGET_MS = 15_000;
+/** How long a stopping daemon waits, after SIGKILL, to see each worker git child's exit (ACP-WORKER-03). */
+const GIT_REAP_BOUND_MS = 5_000;
+/** The bounded second attempt for a group the first one could not confirm empty. */
+const GIT_REAP_RETRY_MS = 10_000;
 
 /** Audit kinds this runner writes; `describe` reads them back. */
 export const WorkerTurnEvent = {
@@ -74,6 +83,8 @@ export const WorkerTurnEvent = {
   ORPHAN_GONE: "TASK_WORKER_ORPHAN_GONE",
   ORPHAN_UNIDENTIFIED: "TASK_WORKER_ORPHAN_UNIDENTIFIED",
   SHUTDOWN_DRAINED: "TASK_WORKER_TURNS_DRAINED",
+  /** A stopping daemon stopped a turn's git and recorded what the repository shows (ACP-WORKER-03). */
+  GIT_STOPPED: "TASK_WORKER_TURN_GIT_STOPPED",
 } as const;
 
 export interface WorkerTurnRequest {
@@ -330,6 +341,12 @@ export class WorkerTurnRunner {
   readonly #turns = new Map<string, InFlightTurn>();
   /** Starts still being admitted: preparing, or opening their execution, and not yet a turn. */
   readonly #admissions = new Set<Promise<void>>();
+  /**
+   * Every git registry this runner opened — for running turns, settled ones and admissions alike —
+   * until its owner retired it and it has no group left (ACP-WORKER-03). A settled turn's git child
+   * can leave a descendant in its group; shutdown stops that too before the daemon lets go.
+   */
+  readonly #gitRegistries = new Set<GitChildren>();
   readonly #busyWorktrees = new Set<string>();
   readonly #pollMs: number;
   readonly #processes: WorkerProcessPort;
@@ -402,12 +419,14 @@ export class WorkerTurnRunner {
     this.#busyWorktrees.add(worktree);
     let scratch: string | null = null;
     let launched = false;
+    let preparedRepo: PinnedRepository | null = null;
     try {
       scratch = this.#scratchDir("acp-worker-git-");
       const prepared = await this.prepareWorktree(facts, scratch);
       if (this.#stopping) return this.stoppingRefusal(request.taskId);
       if (!prepared.allowed) return prepared as Decision<{ executionId: string }>;
       const turn = prepared.value;
+      preparedRepo = turn.repo;
       const started = await this.ports.tasks.startWorkerExecution({
         runId: turn.runId,
         taskId: turn.taskId,
@@ -456,6 +475,8 @@ export class WorkerTurnRunner {
       };
       inFlight.promise = this.execute(adapter, turn, executionId, timeoutMs, inFlight).finally(() => {
         inFlight.settled = true;
+        turn.repo.children.retire();
+        this.pruneGitRegistries();
         this.#busyWorktrees.delete(worktree);
         this.#turns.delete(executionId);
         rmSync(turnScratch, { recursive: true, force: true });
@@ -466,6 +487,7 @@ export class WorkerTurnRunner {
       if (!launched) {
         this.#busyWorktrees.delete(worktree);
         if (scratch) rmSync(scratch, { recursive: true, force: true });
+        (preparedRepo as PinnedRepository | null)?.children.retire();
       }
     }
   }
@@ -481,7 +503,9 @@ export class WorkerTurnRunner {
    * the budget, and ends ABANDONED. A process that could not be confirmed gone stays recorded as
    * outstanding — durably, so the next start reconciles it and no retry of its task runs before.
    */
-  async shutdown(budgetMs = DEFAULT_SHUTDOWN_BUDGET_MS): Promise<{ drained: boolean; outstanding: string[] }> {
+  async shutdown(
+    budgetMs = DEFAULT_SHUTDOWN_BUDGET_MS,
+  ): Promise<{ drained: boolean; outstanding: string[]; gitStopped: boolean; unconfirmedGroups: GitProcessGroup[] }> {
     this.#stopping = true;
     // An admission that sees `#stopping` refuses before it opens an execution or registers a turn, so
     // every turn that will ever exist is already in `#turns`; the admissions are waited for too.
@@ -499,20 +523,53 @@ export class WorkerTurnRunner {
       }),
     ]);
     if (timer) clearTimeout(timer);
-    // ACP-WORKER-03: a turn the drain did not finish is ended here, durably, before the daemon gives up
-    // its authority — its execution ABANDONED in the database. A late resume then finds nothing RUNNING
-    // to commit for or succeed (the live fence reads that row), in this process or in any successor.
-    // `#stopping` is never cleared, so the in-process half of the fence holds as well.
+    // ACP-WORKER-03: a turn the drain did not finish is stopped here, before the daemon gives up its
+    // authority. First its git: every git child still running against its repository — an update-ref,
+    // the index update after it, an object write — is killed with its process group and its exit
+    // observed, and the repository is closed, so no git command starts and no index is published for
+    // that turn again. Then what the repository shows is recorded: whether the branch moved. Then the
+    // execution is ended ABANDONED in the database, so a late resume finds nothing RUNNING to commit for
+    // or succeed, in this process or in any successor. `#stopping` is never cleared.
     const fenced: string[] = [];
     for (const turn of turns) {
-      if (turn.settled || !this.isRunning(turn.executionId)) continue;
-      this.fail(turn.facts, turn.executionId, "ABANDONED", "infrastructure", {
-        reason: "DAEMON_STOPPED_UNDRAINED",
-        reasonCode: ReasonCode.INTERNAL_ERROR,
-        detail: "the daemon's drain timed out on this turn; it was ended before the daemon released its authority",
+      if (turn.settled) continue;
+      if (this.isRunning(turn.executionId)) {
+        this.fail(turn.facts, turn.executionId, "ABANDONED", "infrastructure", {
+          reason: "DAEMON_STOPPED_UNDRAINED",
+          reasonCode: ReasonCode.INTERNAL_ERROR,
+          detail: "the daemon's drain timed out on this turn; it was ended, and its git stopped, before the daemon released its authority",
+        });
+        fenced.push(turn.executionId);
+      }
+      const closed = await turn.facts.repo.children.close(GIT_REAP_BOUND_MS);
+      this.ports.audit.record({
+        kind: WorkerTurnEvent.GIT_STOPPED,
+        runId: turn.facts.runId,
+        sessionId: turn.facts.worker.sessionId,
+        roleKey: turn.facts.worker.roleKey,
+        reasonCode: closed.reaped ? ReasonCode.OK : ReasonCode.INTERNAL_ERROR,
+        evidence: {
+          executionId: turn.executionId,
+          taskId: turn.facts.taskId,
+          reason: closed.reaped ? "GIT_STOPPED_AT_SHUTDOWN" : "GIT_NOT_CONFIRMED_STOPPED",
+          ...(await this.repositoryAtStop(turn.facts, closed)),
+        } as Evidence,
       });
-      fenced.push(turn.executionId);
     }
+    // Then every other registry this runner opened: a settled turn's, a refused admission's. A git child
+    // that exited can have left a descendant in its group, and that group is still this daemon's to stop.
+    let lingeringGroupsKilled = 0;
+    for (const registry of this.#gitRegistries) {
+      if (registry.closed) continue;
+      lingeringGroupsKilled += (await registry.close(GIT_REAP_BOUND_MS)).killed.length;
+    }
+    // A bounded second attempt for any group that is not yet confirmed empty, then the verdict.
+    for (const registry of this.#gitRegistries) {
+      if (registry.liveGroups().length > 0) await registry.close(GIT_REAP_RETRY_MS);
+    }
+    const unconfirmedGroups = [...this.#gitRegistries].flatMap((registry) => registry.liveGroups());
+    const gitStopped = unconfirmedGroups.length === 0;
+    this.pruneGitRegistries();
     const outstanding = this.ports.db
       .all<{ execution_id: string }>(
         `SELECT execution_id FROM task_executions
@@ -524,9 +581,40 @@ export class WorkerTurnRunner {
     const drained = finished && pendingStarts === 0 && this.#turns.size === 0;
     this.ports.audit.record({
       kind: WorkerTurnEvent.SHUTDOWN_DRAINED,
-      evidence: { drained, turns: turns.length, admissions: admissions.length, pendingStarts, fenced, executions: outstanding },
+      evidence: {
+        drained, turns: turns.length, admissions: admissions.length, pendingStarts, fenced, gitStopped,
+        lingeringGroupsKilled, unconfirmedGroups: unconfirmedGroups.map((group) => group.pgid), executions: outstanding,
+      },
     });
-    return { drained: drained && outstanding.length === 0, outstanding };
+    return { drained: drained && outstanding.length === 0 && gitStopped, outstanding, gitStopped, unconfirmedGroups };
+  }
+
+  /** Drops every registry whose owner retired it and whose groups are all confirmed empty. */
+  private pruneGitRegistries(): void {
+    for (const registry of this.#gitRegistries) if (registry.finished) this.#gitRegistries.delete(registry);
+  }
+
+  /**
+   * What a turn's repository shows once its git children are stopped: whether the branch moved off the
+   * turn's base, and whether a ref or index lock was left behind. Read by the stopping daemon itself;
+   * the worktree's bytes are not touched.
+   */
+  private async repositoryAtStop(facts: TurnFacts, closed: GitChildrenClosed): Promise<Record<string, unknown>> {
+    const branch = await runPinnedGit(facts.repo, ["rev-parse", "--verify", "-q", `refs/heads/${facts.claim.branch}`], {
+      afterClose: true,
+    });
+    const head = branch.exitCode === 0 ? branch.stdout.trim() : null;
+    return {
+      refMoved: head === null ? null : head !== facts.baseHead,
+      headAtStop: head,
+      baseHead: facts.baseHead,
+      branchLockLeft: existsSync(join(facts.repo.commonDir, "refs", "heads", `${facts.claim.branch}.lock`)),
+      indexLockLeft: existsSync(join(facts.repo.gitDir, "index.lock")),
+      indexLockReleasedByStop: closed.indexLockReleased,
+      gitChildrenKilled: closed.killed.length,
+      gitChildrenReaped: closed.reaped,
+      gitChildrenUnreaped: closed.unreaped,
+    };
   }
 
   /** Read-only: an execution's state, with diagnostics kept apart from the success digest. */
@@ -916,9 +1004,27 @@ export class WorkerTurnRunner {
    * and the git dir are recorded last, as the baseline the turn is held to.
    */
   private async prepareWorktree(facts: DurableFacts, scratch: string): Promise<Decision<TurnFacts>> {
+    let opened: GitChildren | null = null;
+    const prepared = await this.prepareWorktreeOnce(facts, scratch, (children) => {
+      opened = children;
+    });
+    // A preparation that refuses starts no more git against the repository it pinned.
+    if (!prepared.allowed) (opened as GitChildren | null)?.retire();
+    return prepared;
+  }
+
+  private async prepareWorktreeOnce(
+    facts: DurableFacts,
+    scratch: string,
+    onOpened: (children: GitChildren) => void,
+  ): Promise<Decision<TurnFacts>> {
     const worktree = facts.claim.worktree;
     try {
       const pinned = pinRepository(worktree, scratch);
+      if (pinned.allowed) {
+        this.#gitRegistries.add(pinned.value.children);
+        onOpened(pinned.value.children);
+      }
       if (!pinned.allowed) return pinned as Decision<never>;
       const repo = pinned.value;
       const objectFormat = await objectFormatOf(repo);

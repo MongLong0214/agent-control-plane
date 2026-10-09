@@ -777,6 +777,14 @@ export const ReasonCode = {
    * receipt is not evidence about this claim, not a contradiction of it.
    */
   CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME: "CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME",
+  /**
+   * A receipt lookup for an `IN_DOUBT` turn failed, or answered with something this build could
+   * not read as a receipt (#1036): any status other than 200 (a 404 included), the wrong media type, an
+   * oversized or unparseable body, a timeout, a transport error, or a schema check that refused it.
+   * Recorded with the cause, once per turn per cause. Not a not-found, and not evidence about the
+   * turn: it stays `IN_DOUBT`.
+   */
+  CONVERSATION_TURN_RECEIPT_LOOKUP_FAILED: "CONVERSATION_TURN_RECEIPT_LOOKUP_FAILED",
   // --- disposable acceptance realm ------------------------------------------
   /**
    * A path the acceptance realm would use resolves inside production, or outside its own state

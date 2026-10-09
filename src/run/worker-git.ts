@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -20,6 +20,7 @@ import {
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { digestOf, sha256 } from "../core/digest.ts";
+import { readProcessStartToken } from "../core/process-argv.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
@@ -82,7 +83,161 @@ export interface PinnedRepository {
   readonly dotGit: string;
   /** Private: temporary indexes and an empty HOME. Never inside the work tree. */
   readonly scratch: string;
+  /** Every git child running against this repository for the turn, and whether more may start. */
+  readonly children: GitChildren;
 }
+
+/** What closing a repository's git children observed. */
+/** A git process group a turn started: its id (the leader's pid) and the leader's OS start time. */
+export interface GitProcessGroup {
+  pgid: number;
+  /** `readProcessStartToken` of the leader when it was spawned; null where the platform cannot say. */
+  leaderStartedAt: string | null;
+}
+
+export interface GitChildrenClosed {
+  /** Every group was emptied: its leader seen to exit and no member left (`kill(-pgid, 0)` is ESRCH). */
+  reaped: boolean;
+  killed: number[];
+  /** Groups that still had a member when the bound ran out. */
+  unreaped: GitProcessGroup[];
+  /** The real index's lock the commit held, removed here because the commit can no longer. */
+  indexLockReleased: boolean;
+}
+
+/**
+ * The git process groups a turn has started against its repository (#1070 ACP-WORKER-03).
+ *
+ * Each git child is spawned as its own process group, and the registry owns the group, not the child:
+ * a group stays registered after its leader exits for as long as any member is left — a descendant
+ * the leader forked keeps the group, and the right to mutate the repository, alive. A group leaves
+ * the registry only once it is confirmed empty: the leader's exit observed and `kill(-pgid, 0)` ESRCH.
+ *
+ * Closing the registry stops every group still registered — SIGKILL to the group, repeated while it
+ * has members — and waits, bounded, until each is confirmed empty; from then on no git command starts
+ * against the repository and the commit publishes nothing. A stopping daemon closes every registry
+ * its runner has opened, of running turns and settled ones alike, before it gives up its authority.
+ */
+export class GitChildren {
+  #closed = false;
+  #retired = false;
+  readonly #groups = new Map<number, { child: ChildProcess; leaderExited: boolean; leaderStartedAt: string | null }>();
+  #heldIndexLock: string | null = null;
+
+  get closed(): boolean {
+    return this.#closed;
+  }
+
+  /** Its owner — a turn that settled, an admission that never launched — will start no more git. */
+  retire(): void {
+    this.#retired = true;
+  }
+
+  /** Retired, and no group of it left: nothing here can mutate the repository any more. */
+  get finished(): boolean {
+    return this.#retired && this.liveGroups().length === 0;
+  }
+
+  /** Records a child's group the moment the child is spawned. */
+  track(child: ChildProcess): void {
+    const pgid = child.pid;
+    if (pgid === undefined) return;
+    const entry = { child, leaderExited: false, leaderStartedAt: readProcessStartToken(pgid) };
+    this.#groups.set(pgid, entry);
+    child.once("exit", () => {
+      entry.leaderExited = true;
+      // Released only when nothing is left in the group; a descendant keeps it registered.
+      if (groupGone(pgid, entry)) this.#groups.delete(pgid);
+    });
+  }
+
+  /** Groups still registered after dropping every one confirmed empty. */
+  liveGroups(): GitProcessGroup[] {
+    for (const [pgid, entry] of this.#groups) {
+      if (groupGone(pgid, entry)) this.#groups.delete(pgid);
+    }
+    return [...this.#groups.entries()].map(([pgid, entry]) => ({ pgid, leaderStartedAt: entry.leaderStartedAt }));
+  }
+
+  /** The commit holds the real index's lock (or has released it: null). */
+  holdIndexLock(lock: string | null): void {
+    this.#heldIndexLock = lock;
+  }
+
+  holdsIndexLock(lock: string): boolean {
+    return this.#heldIndexLock === lock;
+  }
+
+  async close(boundMs: number): Promise<GitChildrenClosed> {
+    this.#closed = true;
+    const entries = [...this.#groups.entries()];
+    const stopped = (pgid: number): boolean => {
+      const entry = this.#groups.get(pgid);
+      return entry === undefined || groupGone(pgid, entry);
+    };
+    const kill = (): void => {
+      for (const [pgid, { child }] of entries) {
+        if (stopped(pgid)) continue;
+        try {
+          process.kill(-pgid, "SIGKILL");
+        } catch {
+          /* the group is already gone */
+        }
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    };
+    kill();
+    const deadline = Date.now() + boundMs;
+    let lastKill = Date.now();
+    while (entries.some(([pgid]) => !stopped(pgid)) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // A member forked between the signal and its delivery joins the same group: signal it again.
+      if (Date.now() - lastKill >= 200) {
+        kill();
+        lastKill = Date.now();
+      }
+    }
+    const unreaped = entries.filter(([pgid]) => !stopped(pgid)).map(([pgid, entry]) => ({ pgid, leaderStartedAt: entry.leaderStartedAt }));
+    for (const [pgid] of entries) if (stopped(pgid)) this.#groups.delete(pgid);
+    let indexLockReleased = false;
+    if (this.#heldIndexLock !== null) {
+      rmSync(this.#heldIndexLock, { force: true });
+      this.#heldIndexLock = null;
+      indexLockReleased = true;
+    }
+    return { reaped: unreaped.length === 0, killed: entries.map(([pgid]) => pgid), unreaped, indexLockReleased };
+  }
+}
+
+/**
+ * Whether a registered group is confirmed empty: its leader's exit was observed and no member is left.
+ * A process holding the group's id once the leader has exited is a new one — a pid cannot be reused
+ * while a group of that id has members — so our group is gone, and that process is never signalled.
+ */
+const groupGone = (pgid: number, entry: { leaderExited: boolean }): boolean =>
+  entry.leaderExited && (!groupAlive(pgid) || processExists(pgid));
+
+const processExists = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as { code?: string }).code === "EPERM";
+  }
+};
+
+const groupAlive = (pid: number): boolean => {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as { code?: string }).code === "EPERM";
+  }
+};
 
 export interface GitRun {
   stdout: string;
@@ -181,7 +336,9 @@ export const pinRepository = (workTree: string, scratch: string): Decision<Pinne
     return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "the pinned git dir has no HEAD", { worktreeId: tree });
   }
   mkdirSync(join(scratch, "home"), { recursive: true, mode: 0o700 });
-  return allow(ReasonCode.OK, Object.freeze({ workTree: tree, gitDir, commonDir, dotGit: dotGitFingerprint(tree)!, scratch }));
+  return allow(ReasonCode.OK, Object.freeze({
+    workTree: tree, gitDir, commonDir, dotGit: dotGitFingerprint(tree)!, scratch, children: new GitChildren(),
+  }));
 };
 
 const lstatOrNull = (path: string): Stats | null => {
@@ -196,9 +353,20 @@ const lstatOrNull = (path: string): Stats | null => {
 export const runPinnedGit = (
   repo: PinnedRepository,
   args: readonly string[],
-  options: { index?: string; input?: string | Buffer; timeoutMs?: number; extraEnv?: Record<string, string> } = {},
+  options: {
+    index?: string;
+    input?: string | Buffer;
+    timeoutMs?: number;
+    extraEnv?: Record<string, string>;
+    /** A read the stopping daemon itself makes after closing the repository: the ref, for its record. */
+    afterClose?: boolean;
+  } = {},
 ): Promise<GitRun> =>
   new Promise((resolveRun) => {
+    if (repo.children.closed && options.afterClose !== true) {
+      resolveRun({ stdout: "", stderr: "the turn's repository was closed by a stopping daemon; no git command starts", exitCode: null });
+      return;
+    }
     const env: NodeJS.ProcessEnv = {
       PATH: process.env["PATH"] ?? "/usr/bin:/bin",
       HOME: join(repo.scratch, "home"),
@@ -220,7 +388,9 @@ export const runPinnedGit = (
     };
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn("git", [...GIT_HARDENING, ...args], { cwd: repo.workTree, env, stdio: ["pipe", "pipe", "pipe"] });
+      // Its own process group, so a stopping daemon can stop it whole (ACP-WORKER-03).
+      child = spawn("git", [...GIT_HARDENING, ...args], { cwd: repo.workTree, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
+      repo.children.track(child);
     } catch (error) {
       resolveRun({ stdout: "", stderr: error instanceof Error ? error.message : String(error), exitCode: null });
       return;
@@ -229,6 +399,11 @@ export const runPinnedGit = (
     const stderr: Buffer[] = [];
     let settled = false;
     const timer = setTimeout(() => {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        /* gone */
+      }
       try {
         child.kill("SIGKILL");
       } catch {
@@ -502,6 +677,7 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
       try {
         writeFileSync(lock, "", { flag: "wx", mode: 0o644 });
         held = true;
+        repo.children.holdIndexLock(lock);
       } catch (error) {
         return deny(ReasonCode.CONFLICT, "the worktree's index is locked by another writer; nothing was committed", {
           error: error instanceof Error ? error.message.slice(0, 300) : String(error),
@@ -536,6 +712,12 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
           error: updated.stderr.slice(0, 500),
         });
       }
+      // A stopping daemon that closed the repository has already let the index lock go: publish nothing.
+      if (repo.children.closed) {
+        return deny(ReasonCode.CONFLICT, "the turn's repository was closed by a stopping daemon; the index was not published", {
+          head: commit,
+        });
+      }
       const descriptor = openSync(lock, "w");
       try {
         writeSync(descriptor, readFileSync(copy));
@@ -545,13 +727,18 @@ export const plumbingWorkerCommit: WorkerCommitPort = {
       }
       renameSync(lock, realIndex);
       held = false;
+      repo.children.holdIndexLock(null);
       return allow(ReasonCode.OK, commit);
     } catch (error) {
       return deny(ReasonCode.INTERNAL_ERROR, "the worker commit could not be written", {
         error: error instanceof Error ? error.message.slice(0, 500) : String(error),
       });
     } finally {
-      if (held) rmSync(lock, { force: true });
+      // Only a lock this commit still holds: one a stopping daemon released may be someone else's by now.
+      if (held && repo.children.holdsIndexLock(lock)) {
+        rmSync(lock, { force: true });
+        repo.children.holdIndexLock(null);
+      }
     }
   },
 };

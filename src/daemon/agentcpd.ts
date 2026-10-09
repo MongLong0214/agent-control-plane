@@ -151,6 +151,9 @@ import { recordedStartIsLive } from "../session/runtime-lineage.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 import { daemonCtoBindingRuntime, type CtoBindingRuntime } from "./cto-binding-runtime.ts";
 
+/** The exit status of a stop that could not confirm every worker git process group finished. */
+const STOP_INCOMPLETE_EXIT_CODE = 75;
+
 /**
  * The bound on one message: the bytes of a single line, terminator excluded, measured after the
  * newline that ends it has been found. Only the two readers that serve a stream of messages —
@@ -4485,11 +4488,18 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     await hermesBootstrap?.close();
     await listeners?.close();
     await sessionLaunch.close();
-    await daemon.stop();
+    const stopped = await daemon.stop();
     // Before `start()` returns, the control plane is still unwinding it — `daemon.stop()` has
     // released the lock, which is what a supervisor is waiting for, and closing the database
     // out from under that unwind would only turn a clean stop into an error.
     if (startCompleted) cp.close();
+    // #1070 ACP-WORKER-03-FC — an incomplete stop is reported, never exited as clean. The lock and the
+    // durable fence beside it stay, so exiting here does not let a successor take authority while a
+    // worker git process group may still run; the exit status tells the supervisor why.
+    if (!stopped.complete) {
+      process.stderr.write("agentcpd: a worker git process group was not confirmed finished; the daemon lock stays fenced\n");
+      process.exit(STOP_INCOMPLETE_EXIT_CODE);
+    }
     process.exit(0);
     })();
     return shuttingDown;
