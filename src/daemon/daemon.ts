@@ -535,7 +535,8 @@ export interface TelegramIngressController {
  * reconciliation is deterministic: reload bindings, runs, outbox and claims; reconcile
  * sessions against real processes; expire stale leases; run a scoped doctor; resume
  * dispatch idempotently. Because dispatch is keyed by
- * `run-dispatch:<runId>:<generation>`, resuming cannot produce a duplicate (CP-S58).
+ * `run-dispatch:<runId>:<generation>` (with `:r<n>` for revision cycle n, so a revision is a new
+ * dispatch and not a replay of the first), resuming cannot produce a duplicate (CP-S58).
  */
 export class Daemon {
   readonly lock: SingleInstanceLock;
@@ -1711,7 +1712,10 @@ export class Daemon {
         if (ProvisionedSessionRuntime.drives(required.role)) {
           if (!this.cp.sessionRuntime.holds(current.sessionId)) {
             pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON));
-            this.revokePausedBinding(required, CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON);
+            // A run held for a revision or a human keeps that hold, and its owner is recovered all
+            // the same (review ACP-C1B-03); `revokePausedBinding`'s BLOCKED-only exception would
+            // leave the binding with no credential behind it and nothing to recover.
+            this.revokePausedBinding(required, CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON, { allowHeldRuns: true });
             continue;
           }
         }
@@ -1979,7 +1983,8 @@ export class Daemon {
     const paused: ContinuityReconcileReport["pausedRuns"] = [];
     for (const run of affected) {
       if (run.state === RunState.ACTIVE) {
-        const blocked = this.cp.runs.transition(run.runId, RunState.BLOCKED, reason, {
+        // Recorded as continuity's own hold (#246 C1b): a bootstrap CTO's recovery resumes only this.
+        const blocked = this.cp.runs.pauseForContinuity(run.runId, required.roleKey, reason, {
           roleKey: required.roleKey,
           continuityAction: "PAUSE_NEW_WORK",
         });
@@ -2127,10 +2132,13 @@ export class Daemon {
    * resume it through a late message. BindingRegistry fences queued/in-flight outbox rows
    * in the same transaction; blocked runs are the documented revocation exception.
    */
-  private revokePausedBinding(required: RequiredRole, reason: string): void {
+  private revokePausedBinding(required: RequiredRole, reason: string, options: { allowHeldRuns?: boolean } = {}): void {
     const current = this.cp.bindings.active(required.roleKey);
     if (!current) return;
-    const revoked = this.cp.bindings.revoke(required.roleKey, reason, { allowBlockedRuns: true });
+    const revoked = this.cp.bindings.revoke(required.roleKey, reason, {
+      allowBlockedRuns: true,
+      ...(options.allowHeldRuns === true ? { allowHeldRuns: true } : {}),
+    });
     if (!revoked.allowed) {
       this.cp.audit.record({
         kind: "CONTINUITY_REVOKE_DEFERRED",

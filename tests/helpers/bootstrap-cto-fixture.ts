@@ -164,6 +164,42 @@ export const bootstrapRuntimeFixture = async () => {
 
 export type BootstrapRuntimeFixture = Awaited<ReturnType<typeof bootstrapRuntimeFixture>>;
 
+/** What one work turn read in band and settled: the row's kind, generation and the ack's answer. */
+export interface HandledInBand {
+  kind: string;
+  generation: number;
+  acked: unknown;
+}
+
+/**
+ * Makes every work turn behave as the CTO's prompt asks: read what is addressed to it in band
+ * (`role_dispatch_pending`) and acknowledge each row — `run_ack` for a row that names a run,
+ * `role_dispatch_ack` otherwise — over the connection its relay authenticated for that turn.
+ */
+export const acknowledgeInBandOnWorkTurns = (f: BootstrapRuntimeFixture): HandledInBand[] => {
+  const handled: HandledInBand[] = [];
+  let keys = 0;
+  f.claude.onWorkTurn = async (_request, credential) => {
+    if (!credential) return;
+    const as = { sessionId: credential.sessionId, sessionSecret: credential.sessionSecret, token: credential.token ?? "" };
+    const pending = await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_pending", {});
+    const messages = (pending["value"] as { messages?: Array<{ messageId: string; runId: string | null; kind: string }> } | undefined)
+      ?.messages ?? [];
+    for (const message of messages) {
+      const generation = f.harness.cp.outbox.get(message.messageId)?.bindingGeneration ?? -1;
+      const acked = message.runId
+        ? await callMcpToolOverSocket(f.ctoSocket, as, "run_ack", {
+            idempotencyKey: `inband-ack-${++keys}-${message.messageId}`,
+            runId: message.runId,
+            messageId: message.messageId,
+          })
+        : await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId });
+      handled.push({ kind: message.kind, generation, acked: acked["ok"] });
+    }
+  };
+  return handled;
+};
+
 export const withBootstrapRuntime = async (body: (f: BootstrapRuntimeFixture) => Promise<void>): Promise<void> => {
   const f = await bootstrapRuntimeFixture();
   try {

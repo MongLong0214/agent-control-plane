@@ -577,6 +577,11 @@ CREATE TABLE IF NOT EXISTS runs (
   dispatched_at             TEXT,
   ended_at                  TEXT,
   state_reason              TEXT,
+  -- #246 C1b (schema v42) — the role whose loss continuity paused this run for, while it holds the
+  -- run BLOCKED; NULL for every other state and every other reason a run is BLOCKED (a CEO decision,
+  -- for one). Written only in the statement that moves the run's state, under that transition's
+  -- authority; see the `runs_continuity_hold_*` guards below.
+  continuity_hold_role_key  TEXT,
   -- owner pinning is all-or-nothing
   CHECK ((owner_session_id IS NULL) = (owner_binding_generation IS NULL)),
   CHECK ((owner_session_id IS NULL) = (owner_session_incarnation IS NULL)),
@@ -692,6 +697,37 @@ WHEN NEW.state <> OLD.state
  AND acp_run_state_transition_authorized(NEW.run_id, NEW.state) <> 1
 BEGIN
   SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-02 — #246 C1b (schema v42): which hold continuity placed is daemon authority. A bootstrap
+-- CTO's recovery resumes a run to ACTIVE only when continuity itself paused it; a run BLOCKED for
+-- any other reason keeps its hold. So the hold changes only inside the transition that moves the
+-- run's state — the same connection-local marker `runs_state_transition_authority_guard` reads —
+-- and a raw UPDATE cannot mark a CEO-decision hold as continuity's.
+CREATE TRIGGER IF NOT EXISTS runs_continuity_hold_authority
+BEFORE UPDATE OF continuity_hold_role_key ON runs
+WHEN NEW.continuity_hold_role_key IS NOT OLD.continuity_hold_role_key
+ AND acp_run_state_transition_authorized(NEW.run_id, NEW.state) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_CONTINUITY_HOLD_DENIED');
+END;
+
+-- CP-HI-02 — #246 C1b (schema v42): a continuity hold exists only while the run is BLOCKED, so
+-- every transition out of BLOCKED ends it in the same statement, and a stale hold cannot outlive the
+-- pause it recorded into a later, unrelated one.
+CREATE TRIGGER IF NOT EXISTS runs_continuity_hold_only_while_blocked
+BEFORE UPDATE ON runs
+WHEN NEW.continuity_hold_role_key IS NOT NULL AND NEW.state <> 'BLOCKED'
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_CONTINUITY_HOLD_DENIED');
+END;
+
+-- CP-HI-02 — #246 C1b (schema v42): a run is never created held; only continuity's pause holds one.
+CREATE TRIGGER IF NOT EXISTS runs_continuity_hold_not_inserted
+BEFORE INSERT ON runs
+WHEN NEW.continuity_hold_role_key IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_CONTINUITY_HOLD_DENIED');
 END;
 
 -- CP-HI-03 — dispatch/pinning may fill an empty pin once; no later operation may

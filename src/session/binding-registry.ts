@@ -823,6 +823,13 @@ export class BindingRegistry {
     options: {
       allowBlockedRuns?: boolean;
       /**
+       * #246 C1b — also admit runs held for a revision or a human (REVISION_REQUIRED,
+       * AWAITING_HUMAN) besides BLOCKED: states in which the owner does no work until someone
+       * releases the hold. Only continuity's revocation of a provisioned session whose credential
+       * this daemon lost passes it, and that session's recovery gives the same owner back.
+       */
+      allowHeldRuns?: boolean;
+      /**
        * Leave this generation's queued, never-carried peer messages addressed to the outgoing
        * runtime PENDING instead of rejecting them (`Outbox.retargetOrReject`'s hold). Only the
        * canonical self-claim's dead-predecessor recovery passes it, and only because it binds the
@@ -838,9 +845,10 @@ export class BindingRegistry {
       const current = this.active(roleKey);
       if (!current) return deny(ReasonCode.NOT_FOUND, "no active binding", { roleKey });
       const ownedRuns = this.liveRunsOwnedBy(current);
-      const orphaned = options.allowBlockedRuns
-        ? ownedRuns.filter((run) => run.state !== "BLOCKED")
-        : ownedRuns;
+      const held: readonly string[] = options.allowHeldRuns
+        ? ["BLOCKED", "REVISION_REQUIRED", "AWAITING_HUMAN"]
+        : options.allowBlockedRuns ? ["BLOCKED"] : [];
+      const orphaned = ownedRuns.filter((run) => !held.includes(run.state));
       if (orphaned.length > 0) {
         return deny(
           ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
