@@ -66,11 +66,17 @@ if (mode === "lock") {
     } catch {
       /* it exists */
     }
+    // Reported as `raw` reports its own SQLite step: OK once the lock is held, SQLite's code if not.
+    // The lock it holds is SHARED; that is the mode's name, never a reason code.
     const db = new Database(lock.lockDatabasePath, { timeout: 0 });
     shared.db = db;
-    db.exec("BEGIN");
-    db.prepare("SELECT count(*) FROM sqlite_master").get();
-    return { allowed: db.inTransaction, reasonCode: "SHARED" };
+    try {
+      db.exec("BEGIN");
+      db.prepare("SELECT count(*) FROM sqlite_master").get();
+      return { allowed: db.inTransaction, reasonCode: "OK" };
+    } catch (error) {
+      return { allowed: false, reasonCode: (error as { code?: string }).code ?? "UNKNOWN" };
+    }
   };
 } else {
   mkdirSync(join(state, `${id}-root`), { recursive: true, mode: 0o700 });
