@@ -574,6 +574,8 @@ export class Daemon {
   #continuityReconciling = false;
   /** One BOOTSTRAP_CTO reclaim pass at a time: `runPeriodic` has no overlap guard of its own. */
   #reclaimingBootstrapCtos = false;
+  /** One canonical switchover settlement pass at a time, for the same reason. */
+  #settlingCanonicalSwitchovers = false;
   // #734 — the last system evaluation that actually finished, and the outcome of the most
   // recent *attempt*, kept apart on purpose: a failed attempt must be visible even while the
   // last success is still inside its freshness window (criterion 3). `resolveDoctorHealth`
@@ -1427,6 +1429,9 @@ export class Daemon {
         }
       }
 
+      // Issue #246 C1-R1 — before queued runs are resumed: a canonical CTO a pre-fix handoff or
+      // replacement left DRAINING would hold every one of its project's runs back.
+      await this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
       report.resumedRuns = await this.resumeQueuedRuns();
       report.resumedFinalizations = await this.resumeApprovedRuns();
       // Issue #246 — a bootstrap run that ended while no daemon was running left its BOOTSTRAP_CTO
@@ -2156,6 +2161,25 @@ export class Daemon {
    * through the provider. A session holding any role is never stopped. A provider that would not
    * stop a session fails the pass, so the timer's backoff and DAEMON_TIMER_FAILED record it.
    */
+  /**
+   * Issue #246 C1-R1 — withdraws the switchover a canonical CTO was left in (a PENDING handoff, a
+   * replacement drain), so it is READY again and its replacement stopped; see
+   * `CtoLifecycle.settleCanonicalSwitchovers`. A provider that would not stop a replacement fails the
+   * pass, so the timer's backoff and DAEMON_TIMER_FAILED record it.
+   */
+  private async settleCanonicalSwitchovers(): Promise<void> {
+    if (this.#settlingCanonicalSwitchovers) return;
+    this.#settlingCanonicalSwitchovers = true;
+    try {
+      const settled = await this.cp.cto.settleCanonicalSwitchovers();
+      if (settled.stopFailed.length > 0) {
+        throw new Error(`the provider did not stop ${settled.stopFailed.length} withdrawn CTO replacement(s)`);
+      }
+    } finally {
+      this.#settlingCanonicalSwitchovers = false;
+    }
+  }
+
   private async reclaimBootstrapCtos(): Promise<void> {
     if (this.#reclaimingBootstrapCtos) return;
     this.#reclaimingBootstrapCtos = true;
@@ -2197,6 +2221,7 @@ export class Daemon {
       });
       // A failing reclaim backs off on its own and does not cost the watchdog its tick.
       void this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
+      void this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
     }, watchdogMs);
     watchdog.unref();
     this.#timers.push(watchdog);

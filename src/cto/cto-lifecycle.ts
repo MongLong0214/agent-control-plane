@@ -137,6 +137,24 @@ export const containedWorkdir = (reported: string | null | undefined, managedRoo
  */
 export const BOOTSTRAP_CTO_SPAWN_RECORD = "BOOTSTRAP_CTO_SESSION_SPAWNED";
 
+/** #246 C1-R1 — one project's switchover a canonical CTO was left in, withdrawn. */
+export interface CanonicalSwitchoverWithdrawal {
+  projectId: string;
+  /** The PENDING normal handoffs closed REJECTED. */
+  handoffIds: string[];
+  /** Their replacements, marked ERROR with a provider stop pending. */
+  replacements: string[];
+  /** Whether the canonical holder was DRAINING and is READY again. */
+  restored: boolean;
+}
+
+/** What `CtoLifecycle.settleCanonicalSwitchovers` did in one pass. */
+export interface CanonicalSwitchoverSettlement {
+  withdrawn: CanonicalSwitchoverWithdrawal[];
+  /** Withdrawn replacements the provider did not stop; the next pass asks again. */
+  stopFailed: string[];
+}
+
 /** What `CtoLifecycle.spawn` constitutes: the role it serves, its scope, and the runtime it runs. */
 interface SpawnRequest {
   /** Selects the role-scoped adapter, so the session runs under that role's credential scope. */
@@ -280,6 +298,11 @@ export class CtoLifecycle {
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
     const current = this.bindings.active(roleKey);
     if (!current) return deny(ReasonCode.NOT_FOUND, "project has no primary CTO", { projectId });
+
+    // #246 C1-R1 — a canonical CTO is never replaced, so it is never drained for a replacement the
+    // handoff would then refuse: refused here, before anything is written, by the switchover guard.
+    const canonical = this.#canonicalHolderOf(projectId, roleKey, current);
+    if (canonical) return this.#canonicalHandoffDenial<{ draining: boolean; activeRuns: number }>(canonical, null);
 
     const drain = this.sessions.transition(current.sessionId, SessionLifecycle.DRAINING, reason);
     if (!drain.allowed) return drain as Decision<{ draining: boolean; activeRuns: number }>;
@@ -466,6 +489,13 @@ export class CtoLifecycle {
     handoffId: string,
     acknowledgement: HandoffAcknowledgement | string,
   ): Decision<RoleBinding> {
+    // #246 C1-R1 — a PENDING handoff whose outgoing holder is canonical can never be acknowledged,
+    // so it is withdrawn here rather than refused and left: the holder leaves DRAINING, the handoff
+    // closes and its replacement is stopped. Done before the transaction below, because a refusal
+    // from inside that one rolls back every write it made.
+    const withdrawn = this.#withdrawCanonicalHandoff(handoffId);
+    if (withdrawn) return withdrawn;
+
     // #664 — this body's own ACKED write must not survive a denial, including one
     // that comes back from the nested `bindings.switchTo` call below.
     return this.db.txDecision(() => {
@@ -1242,7 +1272,11 @@ export class CtoLifecycle {
    * canonical conversation keeps the role. It writes nothing, so a transaction can return it, and
    * like every other handoff refusal it is reported to the caller rather than audited.
    */
-  #canonicalHandoffDenial<T>(holder: CanonicalHolder, handoffId: string | null): Decision<T> {
+  #canonicalHandoffDenial<T>(
+    holder: CanonicalHolder,
+    handoffId: string | null,
+    withdrawal?: CanonicalSwitchoverWithdrawal,
+  ): Decision<T> {
     return deny<T>(
       ReasonCode.CANONICAL_CTO_NOT_REPLACEABLE,
       "the outgoing CTO is canonical; a handoff never swaps it for a spawned replacement, its own conversation keeps the role",
@@ -1253,8 +1287,178 @@ export class CtoLifecycle {
         bindingGeneration: holder.bindingGeneration,
         assignmentStatus: holder.status,
         handoffId,
+        ...(withdrawal
+          ? { withdrawnHandoffs: withdrawal.handoffIds, stoppingReplacements: withdrawal.replacements, restored: withdrawal.restored }
+          : {}),
       },
     );
+  }
+
+  /**
+   * #246 C1-R1 — the daemon's sweep for switchovers a canonical CTO was left in: a PENDING handoff
+   * whose outgoing holder is (or became) canonical, including one a build before the preparation
+   * guard left, and a canonical holder a replacement request drained. Each project's is withdrawn
+   * in one transaction (`#withdrawCanonicalSwitchover`); then every replacement a withdrawal left
+   * ERROR — this pass's, or an earlier one's whose provider stop failed — is stopped through its
+   * provider. A provisioned CTO's switchover is not touched, and nothing is ever switched.
+   */
+  async settleCanonicalSwitchovers(): Promise<CanonicalSwitchoverSettlement> {
+    const candidates = this.db.all<{ project_id: string }>(
+      `SELECT project_id FROM handoffs WHERE kind = 'HANDOFF' AND status = 'PENDING'
+       UNION
+       SELECT a.project_id FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+         JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
+        WHERE a.role = 'PRIMARY_CTO' AND a.status = 'ACTIVE' AND s.lifecycle = 'DRAINING'
+        ORDER BY project_id`,
+    );
+    const withdrawn: CanonicalSwitchoverWithdrawal[] = [];
+    for (const { project_id: projectId } of candidates) {
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      const holder = this.#canonicalHolderOf(projectId, roleKey, this.bindings.active(roleKey));
+      if (!holder) continue;
+      const withdrawal = this.#withdrawCanonicalSwitchover(projectId, "canonical switchover sweep");
+      if (withdrawal.handoffIds.length > 0 || withdrawal.restored) withdrawn.push(withdrawal);
+    }
+    // Every replacement of a withdrawn handoff still waiting for its provider stop.
+    const pendingStops = this.db.all<{ session_id: string }>(
+      `SELECT DISTINCT h.to_session_id AS session_id
+         FROM handoffs h JOIN sessions s ON s.session_id = h.to_session_id
+        WHERE h.kind = 'HANDOFF' AND h.status = 'REJECTED' AND s.lifecycle = 'ERROR'
+        ORDER BY session_id`,
+    ).map((row) => row.session_id);
+    const stopFailed = await this.#stopWithdrawnReplacements(pendingStops, "canonical switchover withdrawn");
+    return { withdrawn, stopFailed };
+  }
+
+  /**
+   * #246 C1-R1 — the acknowledgement path's withdrawal: when `handoffId` is a PENDING normal
+   * handoff whose project's PRIMARY_CTO is canonical, withdraw that project's switchover, start the
+   * replacement's provider stop (the sweep retries one that fails), and answer the refusal. Null
+   * when the handoff is not such a one, so the acknowledgement proceeds as before.
+   *
+   * It runs before the acknowledgement is authenticated, deliberately: the withdrawal grants
+   * nothing and switches nothing, it returns the canonical holder to the state every other path
+   * already requires, so whoever names the handoff can only bring that about sooner.
+   */
+  #withdrawCanonicalHandoff(handoffId: string): Decision<RoleBinding> | null {
+    const row = this.db.get<{ project_id: string; kind: string; status: string }>(
+      `SELECT project_id, kind, status FROM handoffs WHERE handoff_id = ?`,
+      [handoffId],
+    );
+    if (!row || row.kind !== "HANDOFF" || row.status !== "PENDING") return null;
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: row.project_id });
+    const holder = this.#canonicalHolderOf(row.project_id, roleKey, this.bindings.active(roleKey));
+    if (!holder) return null;
+    const withdrawal = this.#withdrawCanonicalSwitchover(row.project_id, `handoff ${handoffId} names a canonical CTO`);
+    void this.#stopWithdrawnReplacements(withdrawal.replacements, "canonical handoff withdrawn").catch(() => undefined);
+    return this.#canonicalHandoffDenial<RoleBinding>(holder, handoffId, withdrawal);
+  }
+
+  /**
+   * #246 C1-R1 — one transaction: every PENDING normal handoff of the project is closed REJECTED;
+   * each replacement it named that holds no role is marked ERROR, its provider stop pending (a
+   * closed handoff's envelope is no longer deliverable, and ERROR fences the rest); and the active
+   * holder, if DRAINING for a switchover (`#drainIsSwitchover`, C1-R2) while its project is not
+   * suspended, is READY again. Its audit row is the reason the handoffs were closed. Only ever
+   * called for a project whose PRIMARY_CTO is canonical; the binding itself is not touched.
+   */
+  #withdrawCanonicalSwitchover(projectId: string, reason: string): CanonicalSwitchoverWithdrawal {
+    return this.db.tx(() => {
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      const pending = this.db.all<{ handoff_id: string; from_session_id: string | null; to_session_id: string }>(
+        `SELECT handoff_id, from_session_id, to_session_id FROM handoffs
+          WHERE project_id = ? AND kind = 'HANDOFF' AND status = 'PENDING'
+          ORDER BY created_at, handoff_id`,
+        [projectId],
+      );
+      const current = this.bindings.active(roleKey);
+      const holding = current ? this.sessions.get(current.sessionId) : null;
+      const draining = holding?.lifecycle === SessionLifecycle.DRAINING ? holding : null;
+      // Attributed before the handoffs below are closed: a PENDING one from the holder is evidence.
+      const switchoverDrain =
+        draining !== null &&
+        this.#drainIsSwitchover(projectId, draining.sessionId, pending.some((handoff) => handoff.from_session_id === draining.sessionId));
+      const replacements: string[] = [];
+      for (const handoff of pending) {
+        this.db.run(`UPDATE handoffs SET status = 'REJECTED' WHERE handoff_id = ? AND status = 'PENDING'`, [handoff.handoff_id]);
+        const replacement = this.sessions.get(handoff.to_session_id);
+        if (!replacement || replacement.lifecycle === SessionLifecycle.STOPPED || this.#holdsAnyRole(replacement.sessionId)) continue;
+        this.sessions.transition(replacement.sessionId, SessionLifecycle.ERROR, `${reason}: handoff withdrawn, provider stop pending`);
+        replacements.push(replacement.sessionId);
+      }
+      const restored =
+        draining !== null &&
+        switchoverDrain &&
+        this.projects.get(projectId)?.suspended !== true &&
+        this.sessions.transition(draining.sessionId, SessionLifecycle.READY, `${reason}: a canonical CTO is not replaced`).allowed;
+      const withdrawal = { projectId, handoffIds: pending.map((handoff) => handoff.handoff_id), replacements, restored };
+      if (withdrawal.handoffIds.length > 0 || restored) {
+        this.audit.record({
+          kind: "CTO_CANONICAL_SWITCHOVER_WITHDRAWN",
+          reasonCode: ReasonCode.CANONICAL_CTO_NOT_REPLACEABLE,
+          projectId,
+          sessionId: current?.sessionId ?? null,
+          roleKey,
+          evidence: { reason, ...withdrawal },
+        });
+      }
+      return withdrawal;
+    });
+  }
+
+  /**
+   * #246 C1-R2 — whether the holder's current drain is a switchover's, by positive evidence only.
+   * Three writers drain a PRIMARY_CTO session: `prepareSwitchover` (with a PENDING handoff from it),
+   * `requestReplacement` (recording CTO_REPLACEMENT_REQUESTED for it right after its drain), and
+   * `suspendProject`, whose RECOVERY package from the session is written before its drain and its
+   * provider stop and is never closed. A suspension's drain stays the suspension's until its
+   * shutdown and revocation settle, whatever resume or a switchover record says; a drain nothing
+   * here attributes — another writer's — is left alone too. A replacement record counts only if it
+   * is newer than the session's latest transition into DRAINING, so it explains that drain and not
+   * an earlier one.
+   */
+  #drainIsSwitchover(projectId: string, sessionId: string, pendingHandoffFromHolder: boolean): boolean {
+    const suspension = this.db.get<{ handoff_id: string }>(
+      `SELECT handoff_id FROM handoffs WHERE kind = 'RECOVERY' AND from_session_id = ? LIMIT 1`,
+      [sessionId],
+    );
+    if (suspension) return false;
+    if (pendingHandoffFromHolder) return true;
+    const drained = this.db.get<{ eventId: number | null }>(
+      `SELECT MAX(event_id) AS eventId FROM audit_events
+        WHERE kind = 'SESSION_LIFECYCLE' AND session_id = ? AND json_extract(evidence_json, '$.to') = ?`,
+      [sessionId, SessionLifecycle.DRAINING],
+    )?.eventId ?? null;
+    if (drained === null) return false;
+    return this.db.get<{ event_id: number }>(
+      `SELECT event_id FROM audit_events
+        WHERE kind = 'CTO_REPLACEMENT_REQUESTED' AND session_id = ? AND project_id = ? AND event_id > ?
+        LIMIT 1`,
+      [sessionId, projectId, drained],
+    ) !== undefined;
+  }
+
+  /** Provider stops for withdrawn replacements; answers the sessions the provider did not stop. */
+  async #stopWithdrawnReplacements(sessionIds: readonly string[], reason: string): Promise<string[]> {
+    const failed: string[] = [];
+    for (const sessionId of sessionIds) {
+      if (this.#holdsAnyRole(sessionId)) continue;
+      await this.stopUnusedSession(sessionId, reason);
+      if (this.sessions.get(sessionId)?.lifecycle !== SessionLifecycle.STOPPED) failed.push(sessionId);
+    }
+    return failed;
+  }
+
+  /** Whether the session holds any active role, by its recorded session or its actor's live runtime. */
+  #holdsAnyRole(sessionId: string): boolean {
+    return this.db.get<{ role_key: string }>(
+      `SELECT a.role_key FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.status = 'ACTIVE' AND (a.session_id = ? OR c.current_session_id = ?)
+        LIMIT 1`,
+      [sessionId, sessionId],
+    ) !== undefined;
   }
 
   /**
