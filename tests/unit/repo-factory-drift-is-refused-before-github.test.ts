@@ -57,6 +57,18 @@ const homeWithHook = (hook: string | null): void => {
   process.env["HOME"] = home;
 };
 
+/** A HOME whose git configuration runs `script` after every commit. */
+const homeWithPostCommit = (script: string): void => {
+  const home = mkdtempSync(join(tmpdir(), "acp-rf04-home-"));
+  roots.push(home);
+  const hooks = join(home, "hooks");
+  mkdirSync(hooks);
+  writeFileSync(join(hooks, "post-commit"), `#!/bin/sh\nset -e\n${script}\n`);
+  chmodSync(join(hooks, "post-commit"), 0o755);
+  writeFileSync(join(home, ".gitconfig"), `[core]\n\thooksPath = ${hooks}\n`);
+  process.env["HOME"] = home;
+};
+
 const sandbox = (): { workDir: string; github: FakeGitHub } => {
   const root = mkdtempSync(join(tmpdir(), "acp-rf01-github-"));
   roots.push(root);
@@ -227,5 +239,43 @@ describe("RF-REVIEW-01: a drifted tree is refused before any GitHub write", () =
     });
     expect(github.repository("acme", "fixture")?.protections.size).toBe(0);
     expect(readFileSync(ledgerPath(workDir), "utf8")).toBe(ledgerBefore);
+  });
+
+  it("a resumed push whose receipted head a local replacement makes read as the approved files is refused after the fetch, before any further write (RF-REVIEW-04)", async () => {
+    homeWithHook(null);
+    const { workDir, github } = sandbox();
+    github.failNext = "setDefaultBranch";
+    const first = await produce(workDir, github, APPROVED_WITH_SECOND);
+    expect(first, JSON.stringify(first)).toMatchObject({ allowed: false, evidence: { refusal: "REMOTE_REFUSED", resumable: true } });
+    const remote = github.repository("acme", "fixture");
+    if (!remote) throw new Error("the double holds no repository");
+    const pushed = (await git(remote.bare, ["rev-parse", "refs/heads/main"])).stdout.trim();
+    expect(await remoteFiles(github)).toEqual([".repo-factory-bootstrap.json", "SECOND.md"]);
+
+    // The retry's own commit is the one approved file. After it, a hook points a replacement for the
+    // head GitHub holds at a commit of that approved tree: once fetched, the head reads locally as
+    // the approved files, and GitHub still holds SECOND.md.
+    homeWithPostCommit(
+      [
+        'approved=$(git rev-parse "HEAD^{tree}")',
+        'replacement=$(git -c user.name=review -c user.email=review@example.invalid commit-tree "$approved" -m approved-replacement)',
+        `git update-ref refs/replace/${pushed} "$replacement"`,
+      ].join("\n"),
+    );
+    github.writes.length = 0;
+    const retry = await produce(workDir, github, APPROVED, "2026-10-09T00:05:00.000Z");
+    expect(github.writes).toEqual([]);
+    expect(retry).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+      evidence: {
+        refusal: "BOOTSTRAP_CONTRACT_DRIFT",
+        failedOperationId: "push-default-branch:fixture",
+        head: pushed,
+        extra: ["SECOND.md"],
+        resumable: false,
+      },
+    });
+    expect(github.repository("acme", "fixture")?.protections.size).toBe(0);
   });
 });

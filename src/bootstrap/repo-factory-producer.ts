@@ -227,13 +227,23 @@ const blobId = (content: string, objectFormat: "sha1" | "sha256"): string => {
  * back with `git ls-tree` and must be the approved files exactly — every path, mode and blob, no
  * file missing and none extra. Whatever stood between the write and that head (a hook, a filter, a
  * resumed push that reset onto the commit GitHub holds) is caught here rather than activated.
+ *
+ * Review round 2 (RF-REVIEW-04) — the tree is read with `--no-replace-objects`. A replacement
+ * (`refs/replace/<id>`, under whatever `GIT_REPLACE_REF_BASE` names) changes what a local read of
+ * `<id>` returns and nothing else: `git push` packs the objects themselves, so a hook that committed
+ * unreviewed bytes and then replaced that commit with an approved one passed this check while the
+ * unreviewed bytes were published. Reading unreplaced is reading what the transport sends, whichever
+ * namespace or mechanism the replacement came from; refusing replacement refs instead would have to
+ * enumerate a configurable namespace, and would still read through a replacement made after it looked.
  */
 export const producedTreeDrift = async (
   checkoutPath: string,
   head: string,
   approved: readonly PlannedBootstrapFile[],
 ): Promise<Decision<void>> => {
-  const listed = await git(checkoutPath, ["ls-tree", "-r", "-z", "--full-tree", head], { allowFailure: true });
+  const listed = await git(checkoutPath, ["--no-replace-objects", "ls-tree", "-r", "-z", "--full-tree", head], {
+    allowFailure: true,
+  });
   if (listed.exitCode !== 0) {
     return deny(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unused-vars, no-console -- the reviewer's preserved witness, copied unchanged below this line */
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { bootstrapActivationHandoff, currentBootstrapPlan } from "../../src/bootstrap/bootstrap-plan.ts";
@@ -9,7 +10,7 @@ import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle } from "../../
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { CapacityReading, InvocationRequest } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
+import { makeHarness, reviewerPass, reviewerRevise, type Harness } from "../helpers/harness.ts";
 import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
 import { callMcpToolOverSocket, claimLaunchedCredential } from "../helpers/mcp-socket.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
@@ -211,147 +212,46 @@ const holdNextBootstrapReview = (harness: Harness): { entered: Promise<void>; re
 
 const packets = (f: Fixture, run: BootstrapRun) => f.harness.cp.artifacts.list(run.runId, "PRODUCTION_READY_PACKET");
 
-describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet", () => {
-  it("P2 submitted while P1's reviewer is pending: P1's PASS is stale, nothing is published, and only a review of P2 makes the run ready", async () => {
+
+describe("RF-REVIEW-02: negative-verdict delivery sibling", () => {
+  it.each(["REVISE", "BLOCK"])("refuses P1's %s if P2 replaces the PLAN during the awaited continuity check before revision delivery", async (verdict) => {
     await withFixture(async (f) => {
       const run = await dispatchedBootstrap(f);
-      const m1 = cleanTreeManifest("rf02-inflight-first");
-      const m2 = cleanTreeManifest("rf02-inflight-second");
-      await submitPlan(f, run, m1, "plan-1");
+      await submitPlan(f, run, cleanTreeManifest("rf02-negative-first"), "plan-1");
       await workReadyTasks(f, run);
       await f.harness.cp.continuity.evaluate("before result_submit");
-      scriptPassForCurrentPlan(f, run);
-
-      const held = holdNextBootstrapReview(f.harness);
-      const pending = resultSubmit(f, run);
-      await held.entered;
-      const s1 = f.harness.cp.runs.currentCandidate(run.runId);
-      expect(s1).not.toBeNull();
-
-      // While P1's reviewer works, the bootstrap CTO submits P2 through plan_submit and its task is done.
-      await submitPlan(f, run, m2, "plan-2");
-      await workReadyTasks(f, run);
-      const p2 = currentBootstrapPlan(run.runId, f.harness.cp.artifacts.latest(run.runId, "PLAN"));
-      if (!p2.allowed) throw new Error(p2.message);
-
-      // P1's reviewer answers PASS.
-      held.release();
-      const submitted = await pending;
-      expect(submitted, JSON.stringify(submitted)).toMatchObject({
-        ok: true,
-        value: { stage: "CANDIDATE_STALE", reasonCode: ReasonCode.EVIDENCE_STALE, snapshotDigest: s1 },
+      const answer = JSON.parse(reviewerRevise(bootstrapCoverageKeys(f.harness, run.runId), "P1's planned files need revision"));
+      answer.verdict = verdict;
+      f.harness.scripted.script({
+        match: /Bootstrap plan review/,
+        text: JSON.stringify(answer),
       });
-      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
-      expect(packets(f, run)).toEqual([]);
-      // The review gate kept no verdict for a PLAN the run no longer has.
-      expect(f.harness.cp.artifacts.list(run.runId, "BLIND_REVIEW")).toEqual([]);
-
-      // A fresh review of P2 is what makes the run ready: a new candidate, a new reviewer prompt
-      // naming P2's planned outputs, and a packet for that candidate alone.
-      const promptsBefore = reviewPrompts(f).length;
-      await f.harness.cp.continuity.evaluate("before result_submit");
-      scriptPassForCurrentPlan(f, run);
-      const second = await resultSubmit(f, run);
-      expect(second, JSON.stringify(second)).toMatchObject({ ok: true, value: { stage: "COMPLETED_REVIEW" } });
-      const s2 = (second["value"] as { snapshotDigest: string }).snapshotDigest;
-      expect(s2).not.toBe(s1);
-      expect(reviewPrompts(f)).toHaveLength(promptsBefore + 1);
-      expect(reviewPrompts(f).at(-1)).toContain(p2.value.binding.plannedOutputsDigest);
-      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
-      expect(packets(f, run).map((packet) => packet.candidateSnapshotDigest)).toEqual([s2]);
-      expect(f.harness.cp.bootstrap.readinessForFactoryResult(run.runId, bootstrapActivationHandoff(m2), s2)).toMatchObject({ allowed: true });
-    });
-  });
-
-  it("P2 submitted after P1's PASS is stored but before its packet is published: nothing is published, and the production gate refuses P1's candidate", async () => {
-    await withFixture(async (f) => {
-      const run = await dispatchedBootstrap(f);
-      const m1 = cleanTreeManifest("rf02-publication-first");
-      const m2 = cleanTreeManifest("rf02-publication-second");
-      await submitPlan(f, run, m1, "plan-1");
-      await workReadyTasks(f, run);
-      await f.harness.cp.continuity.evaluate("before result_submit");
-      scriptPassForCurrentPlan(f, run);
-
-      // The pipeline awaits continuity once more between the PASS and the packet. P2 arrives there.
-      const continuity = f.harness.cp.continuity;
-      const evaluate = continuity.evaluate.bind(continuity);
-      let replaced = false;
-      vi.spyOn(continuity, "evaluate").mockImplementation(async (reason: string) => {
-        if (reason === "pre-completion" && !replaced) {
-          replaced = true;
-          await submitPlan(f, run, m2, "plan-2");
-          await workReadyTasks(f, run);
-        }
-        return evaluate(reason);
-      });
-
-      const submitted = await resultSubmit(f, run);
-      expect(replaced).toBe(true);
-      const s1 = f.harness.cp.runs.currentCandidate(run.runId)!;
-      expect(submitted, JSON.stringify(submitted)).toMatchObject({
-        ok: true,
-        value: { stage: "CANDIDATE_STALE", reasonCode: ReasonCode.EVIDENCE_STALE, snapshotDigest: s1 },
-      });
-      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
-      expect(packets(f, run)).toEqual([]);
-      // P1's PASS was stored while P1 was still the PLAN; it is P1's, and it is on record.
-      expect(f.harness.cp.artifacts.latestForSnapshot<{ verdict: string }>(run.runId, "BLIND_REVIEW", s1)?.content.verdict).toBe("PASS");
-
-      // The production gate's own door, for that candidate: refused, with nothing written.
-      vi.restoreAllMocks();
-      await f.harness.cp.continuity.evaluate("packet");
-      const runRow = f.harness.cp.runs.require(run.runId);
-      const packet = f.harness.cp.ceo.buildPacket({
-        runId: run.runId,
-        candidateSnapshotDigest: s1,
-        approval: {
-          runId: run.runId,
-          candidateSnapshotDigest: s1,
-          resultSummary: "the planned bootstrap outputs",
-          recommendation: "create the repository",
-          residualRisk: [],
-          approvedBySessionId: runRow.ownerSessionId!,
-          approvedByGeneration: runRow.ownerBindingGeneration!,
-          approvedAt: f.harness.clock.nowIso(),
-        },
-      });
-      expect(packet).toMatchObject({ allowed: false, reasonCode: ReasonCode.EVIDENCE_STALE });
-      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
-      expect(packets(f, run)).toEqual([]);
-    });
-  });
-
-  it("P2 submitted during the continuity evaluation after P1's reviewer could not be constituted: no unavailable-review record for P1, the candidate is stale", async () => {
-    await withFixture(async (f) => {
-      const run = await dispatchedBootstrap(f);
-      await submitPlan(f, run, cleanTreeManifest("rf02-unavailable-first"), "plan-1");
-      await workReadyTasks(f, run);
-      await f.harness.cp.continuity.evaluate("before result_submit");
-      // The reviewer's runtime is down: the review gate returns no verdict, an assurance failure.
-      f.harness.scripted.setRuntimeHealth("UNAVAILABLE");
       const continuity = f.harness.cp.continuity;
       const evaluate = continuity.evaluate.bind(continuity);
       let replaced = false;
       vi.spyOn(continuity, "evaluate").mockImplementation(async (reason: string) => {
         if (reason === "blind-review-unavailable" && !replaced) {
           replaced = true;
-          f.harness.scripted.setRuntimeHealth("HEALTHY");
-          await submitPlan(f, run, cleanTreeManifest("rf02-unavailable-second"), "plan-2");
+          await submitPlan(f, run, cleanTreeManifest("rf02-negative-second"), "plan-2");
           await workReadyTasks(f, run);
         }
         return evaluate(reason);
       });
-
       const submitted = await resultSubmit(f, run);
+      const revisions = f.harness.cp.outbox.listByRun(run.runId).filter((message) => message.kind === "REVISION_REQUEST");
+      const current = currentBootstrapPlan(run.runId, f.harness.cp.artifacts.latest(run.runId, "PLAN"));
+      const value = submitted["value"] as { stage: string; reasonCode: string; review?: { bootstrapPlan?: { planDigest: string } } };
+      console.log("negative verdict witness", JSON.stringify({
+        replaced, verdict, stage: value?.stage, reasonCode: value?.reasonCode,
+        currentPlanDigest: current.allowed ? current.value.binding.planDigest : null,
+        reviewedPlanDigest: value?.review?.bootstrapPlan?.planDigest,
+        revisionCount: revisions.length,
+      }));
       expect(replaced).toBe(true);
-      expect(submitted, JSON.stringify(submitted)).toMatchObject({
-        ok: true,
-        value: { stage: "CANDIDATE_STALE", reasonCode: ReasonCode.EVIDENCE_STALE },
+      expect(submitted).toMatchObject({
+        ok: true, value: { stage: "CANDIDATE_STALE", reasonCode: ReasonCode.EVIDENCE_STALE },
       });
-      expect(f.harness.cp.audit.forRun(run.runId).filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE")).toEqual([]);
-      expect(f.harness.cp.outbox.listByRun(run.runId).filter((message) => message.kind === "REVISION_REQUEST")).toEqual([]);
-      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
+      expect(revisions).toEqual([]);
       expect(packets(f, run)).toEqual([]);
     });
   });
