@@ -154,15 +154,16 @@ export interface CeoDecisionInput {
   ceoSessionId: string;
   rationale: string;
   /**
-   * #246 B2-b — the session the MCP door authenticated for this call, passed through by the door and
-   * never taken from a tool argument. A CONTRACT_CHANGE grant requires it to be the CEO session the
-   * decision names. Absent for an in-process caller.
+   * #246 B2-b — the session the MCP door authenticated for this call and the key of the MCP mutation it
+   * runs under, passed through by the door and never taken from a tool argument. A CONTRACT_CHANGE
+   * CONFIRM requires it, in flight now and naming the live CEO session the decision names; an
+   * in-process caller has none and issues no grant.
    */
   ingress?: CeoDecisionIngress;
 }
 
 /** #246 B2-b — the grant authority a CONTRACT_CHANGE CONFIRM admits against and issues through. */
-export type ManifestGrantsPort = Pick<ManifestActivationGrants, "admitConfirm" | "issue">;
+export type ManifestGrantsPort = Pick<ManifestActivationGrants, "admitConfirm" | "issue" | "bindConsumer">;
 
 export class ProductionGate {
   #continuity: ContinuityGate | null = null;
@@ -554,6 +555,8 @@ export class ProductionGate {
    * between packet and confirm, the confirm is void rather than approximately right.
    */
   submitCeoDecision(input: CeoDecisionInput): Decision<{ state: RunState }> {
+    const reentry = this.contractChangeConsumerReentry(input);
+    if (reentry) return reentry;
     const admitted = this.admitCeoDecision(input, "decide");
     if (!admitted.allowed) return admitted as Decision<{ state: RunState }>;
     const { isBootstrap } = admitted.value;
@@ -683,6 +686,54 @@ export class ProductionGate {
   }
 
   /**
+   * #246 B2-b, CEO ruling 2 — a CONFIRM of a CONTRACT_CHANGE already confirmed and finalizing does not
+   * decide again: it makes the calling live CEO session the consumer of the run's unconsumed grant, so
+   * a re-adopted CEO resumes consumption without a new approval. The same CEO-role checks a CONFIRM
+   * asks apply; null when the call is not such a re-entry.
+   */
+  private contractChangeConsumerReentry(input: CeoDecisionInput): Decision<{ state: RunState }> | null {
+    if (input.decision !== "CONFIRM") return null;
+    const run = this.runs.get(input.runId);
+    if (
+      run?.kind !== RunKind.CONTRACT_CHANGE ||
+      (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING && run.state !== RunState.POST_MERGE_VERIFYING)
+    ) {
+      return null;
+    }
+    const continuity = this.assertCompletionAllowed(input.runId);
+    if (!continuity.allowed) return continuity as Decision<{ state: RunState }>;
+    const holds = this.assertCurrentCeo(input.ceoSessionId);
+    if (!holds.allowed) return holds as Decision<{ state: RunState }>;
+    const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
+    if (!independence.allowed) return independence as Decision<{ state: RunState }>;
+    const grants = this.#manifestGrants;
+    if (!grants) {
+      return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "manifest activation grants are not configured", { runId: input.runId });
+    }
+    return this.db.txDecision(() => {
+      const bound = grants.bindConsumer({
+        runId: input.runId,
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+        ceoSessionId: input.ceoSessionId,
+        ...(input.ingress === undefined ? {} : { ingress: input.ingress }),
+      });
+      if (!bound.allowed) return bound as Decision<{ state: RunState }>;
+      this.audit.record({
+        kind: "MANIFEST_ACTIVATION_CONSUMER_BOUND",
+        runId: input.runId,
+        sessionId: input.ceoSessionId,
+        evidence: {
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          grantId: bound.value.grantId,
+          consumer: bound.value.consumer,
+          rationale: input.rationale,
+        },
+      });
+      return allow(ReasonCode.OK, { state: run.state });
+    });
+  }
+
+  /**
    * The checks a CEO decision passes before it changes anything. Read-only, so a caller with
    * asynchronous work to do ahead of the decision can ask first: a PROJECT_BOOTSTRAP CONFIRM
    * runs Repo Factory's GitHub writes before `submitCeoDecision` (issue #246), and a decision
@@ -780,7 +831,10 @@ export class ProductionGate {
     if (run.kind === RunKind.CONTRACT_CHANGE && input.decision === "CONFIRM") {
       const grants = this.#manifestGrants;
       const admissible = grants
-        ? grants.admitConfirm(input.runId, input.candidateSnapshotDigest)
+        ? grants.admitConfirm(input.runId, input.candidateSnapshotDigest, {
+            ceoSessionId: input.ceoSessionId,
+            ...(input.ingress === undefined ? {} : { ingress: input.ingress }),
+          })
         : deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "manifest activation grants are not configured", { runId: input.runId });
       if (!admissible.allowed) return admissible as Decision<{ isBootstrap: boolean }>;
     }

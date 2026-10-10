@@ -22,6 +22,11 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ManagedManifestWrite } from "../../src/registry/project-registry.ts";
 import type { HermesReceiptPortOptions } from "../../src/runtime/hermes-receipt-port.ts";
 import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
+import { type Decision, allow } from "../../src/core/errors.ts";
+import type { CeoDecision } from "../../src/domain/types.ts";
 import { commitAll, gitSync, makeRepo, tempDir, writeFiles } from "./fixtures.ts";
 
 /** The single allowlisted owner identity of the fixture deployment. */
@@ -749,6 +754,72 @@ export const carryContractChange = (
 };
 
 /**
+ * #246 B2-b — a CEO decision the way an MCP door submits it: a Hermes server over an in-memory
+ * transport whose peer is `sessionId` (by default the session the call names, else the live CEO), the
+ * call running under its own idempotency reservation. A CONTRACT_CHANGE CONFIRM issues a grant only
+ * through such an entry; an in-process `submitCeoDecision` issues none.
+ */
+let hermesDecisionKeys = 0;
+export const decideThroughHermes = async (
+  harness: Harness,
+  input: {
+    runId: string;
+    decision?: CeoDecision;
+    candidateSnapshotDigest: string;
+    ceoSessionId?: string;
+    rationale?: string;
+  },
+  options: {
+    /** The session the door authenticates; defaults to the one the call names. */
+    peerSessionId?: string;
+    idempotencyKey?: string;
+    onCeoApproved?: (runId: string) => void | Promise<unknown>;
+  } = {},
+): Promise<Decision<{ state: RunState }>> => {
+  const ceoSessionId = input.ceoSessionId ?? harness.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId;
+  const peerSessionId = options.peerSessionId ?? ceoSessionId;
+  const peer = {
+    actor: peerSessionId,
+    sessionId: peerSessionId,
+    sessionIncarnation: harness.cp.sessions.require(peerSessionId).incarnation,
+  };
+  const server = createHermesServer(
+    createHermesMcpPort(harness.cp, options.onCeoApproved ? { onCeoApproved: options.onCeoApproved } : {}),
+    () => allow(ReasonCode.OK, peer),
+  );
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  const client = new Client({ name: "test-ceo-door", version: "1" });
+  await client.connect(clientTransport);
+  try {
+    hermesDecisionKeys += 1;
+    const result = await client.callTool({
+      name: "ceo_decision_submit",
+      arguments: {
+        idempotencyKey: options.idempotencyKey ?? `test-ceo-decision-${hermesDecisionKeys}`,
+        runId: input.runId,
+        decision: input.decision ?? "CONFIRM",
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+        ceoSessionId,
+        rationale: input.rationale ?? "test decision through the Hermes door",
+      },
+    });
+    const body = result.structuredContent as {
+      ok: boolean;
+      reasonCode: ReasonCode;
+      message?: string;
+      evidence?: Record<string, unknown>;
+      value?: { state: RunState };
+    };
+    return body.ok
+      ? { allowed: true, reasonCode: body.reasonCode, evidence: body.evidence ?? {}, value: body.value! }
+      : { allowed: false, reasonCode: body.reasonCode, evidence: body.evidence ?? {}, message: body.message ?? "" };
+  } finally {
+    await client.close();
+  }
+};
+
+/**
  * Drives an empty participation set through the production candidate packet, CEO confirmation,
  * and lock-held daemon finalizer. The registry tests use this instead of manually advancing
  * the state machine with a completion capability. Since #246 B2-a the run's PLAN carries the
@@ -792,7 +863,8 @@ export const finalizeNoRepositoryRun = async (
   await harness.cp.continuity.evaluate("empty run finalization");
   const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
   if (!ceo) throw new Error("fixture CEO binding missing");
-  const confirmed = harness.cp.ceo.submitCeoDecision({
+  // #246 B2-b — through the Hermes door: a CONTRACT_CHANGE CONFIRM issues its grant only there.
+  const confirmed = await decideThroughHermes(harness, {
     runId: created.value.runId,
     decision: "CONFIRM",
     candidateSnapshotDigest,

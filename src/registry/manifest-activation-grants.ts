@@ -8,6 +8,7 @@ import type { Db } from "../db/database.ts";
 import { ArtifactKind, Role, RunKind, RunState, type RunRow, roleKeyFor } from "../domain/types.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
+import { isMcpReservationInFlight } from "../ingress/ingress-guard.ts";
 import {
   type ContractChangeWorkflowEvidence,
   currentContractChangePlan,
@@ -62,6 +63,17 @@ export interface ManifestActivationGrant {
   grantDigest: string;
   consumedAt: string | null;
   consumedAttemptId: string | null;
+  /**
+   * The authenticated CEO session whose call drives consumption (CEO ruling 2): the confirming session
+   * at issue, re-bound only by a live CEO session's admitted re-entry. Not part of the grant's digest.
+   */
+  consumer: GrantConsumer;
+}
+
+/** A CEO session, by id and incarnation, as an admitted MCP call authenticated it. */
+export interface GrantConsumer {
+  sessionId: string;
+  sessionIncarnation: string;
 }
 
 /** What a verified grant activates: the manifest its PLAN carries and the workflows that manifest names. */
@@ -118,12 +130,15 @@ export const sameWorkflowCoverage = (
 };
 
 /**
- * The CEO call's transport identity, as the MCP door that admitted it authenticated it: never a tool
- * argument. Absent for an in-process caller.
+ * The CEO call's transport identity, as the MCP door that admitted it authenticated it, and the key of
+ * the MCP mutation that call is running under: never a tool argument. A CONTRACT_CHANGE CONFIRM without
+ * it, or whose mutation is not in flight in this process, issues nothing.
  */
 export interface CeoDecisionIngress {
+  actor: string | null;
   sessionId: string | null;
   sessionIncarnation: string | null;
+  idempotencyKey: string | null;
 }
 
 interface RawGrant {
@@ -144,6 +159,9 @@ interface RawGrant {
   grant_digest: string;
   consumed_at: string | null;
   consumed_attempt_id: string | null;
+  consumer_session_id: string;
+  consumer_session_incarnation: string;
+  consumer_bound_at: string;
 }
 
 interface LiveCeo {
@@ -172,10 +190,11 @@ const hydrate = (row: RawGrant): ManifestActivationGrant => ({
   grantDigest: row.grant_digest,
   consumedAt: row.consumed_at,
   consumedAttemptId: row.consumed_attempt_id,
+  consumer: { sessionId: row.consumer_session_id, sessionIncarnation: row.consumer_session_incarnation },
 });
 
 /** The digest a grant's identity columns recompute to; a row whose columns moved no longer matches it. */
-const grantDigestOf = (grant: Omit<ManifestActivationGrant, "grantDigest" | "consumedAt" | "consumedAttemptId">): string =>
+const grantDigestOf = (grant: Omit<ManifestActivationGrant, "grantDigest" | "consumedAt" | "consumedAttemptId" | "consumer">): string =>
   digestOf({
     schema: GRANT_SCHEMA,
     grantId: grant.grantId,
@@ -215,10 +234,17 @@ export class ManifestActivationGrants {
 
   /**
    * The read-only half of a CONTRACT_CHANGE CONFIRM's admission, asked before the decision changes
-   * anything: the base is still the active manifest (CEO ruling 1), and the candidate is still the one
-   * its PLAN, its review and its packet bind.
+   * anything: the call is an admitted MCP mutation authenticated as the live CEO session it names, the
+   * base is still the active manifest (CEO ruling 1), and the candidate is still the one its PLAN, its
+   * review and its packet bind.
    */
-  admitConfirm(runId: string, candidateSnapshotDigest: string): Decision<{ planDigest: string; manifestDigest: string; fromManifestDigest: string; packetDigest: string }> {
+  admitConfirm(
+    runId: string,
+    candidateSnapshotDigest: string,
+    caller: { ceoSessionId: string; ingress?: CeoDecisionIngress },
+  ): Decision<{ planDigest: string; manifestDigest: string; fromManifestDigest: string; packetDigest: string }> {
+    const authenticated = this.authenticateCaller(runId, caller);
+    if (!authenticated.allowed) return authenticated as Decision<never>;
     const run = this.runs.get(runId);
     if (!run || run.kind !== RunKind.CONTRACT_CHANGE || !run.projectId) {
       return deny(ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN, "a manifest activation grant is issued only for a CONTRACT_CHANGE run of a project", {
@@ -253,9 +279,9 @@ export class ManifestActivationGrants {
 
   /**
    * Issues the run's one grant. Called only by the production gate, inside the CONFIRM transaction,
-   * after the run moved to CEO_APPROVED, so a refusal here undoes the decision. The CEO authority it
-   * records is the live binding's, and when the call came through an MCP door, the session that door
-   * authenticated must be that binding's session and incarnation as well as the one the call names.
+   * after the run moved to CEO_APPROVED, so a refusal here undoes the decision. The call must be an
+   * admitted MCP mutation, in flight now, whose door authenticated the live CEO binding's session and
+   * incarnation, and that session must be the one the call names; it becomes the grant's consumer.
    */
   issue(input: {
     runId: string;
@@ -286,25 +312,9 @@ export class ManifestActivationGrants {
     const target = this.boundTarget(run, input.candidateSnapshotDigest);
     if (!target.allowed) return target as Decision<ManifestActivationGrant>;
 
-    const ceo = this.liveCeo();
-    if (!ceo || ceo.sessionId !== input.ceoSessionId) {
-      return deny(ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_STALE, "the confirming session is not the live CEO binding", {
-        runId: input.runId,
-        ceoSessionId: input.ceoSessionId,
-        liveCeoSessionId: ceo?.sessionId ?? null,
-      });
-    }
-    if (input.ingress !== undefined) {
-      const ingress = input.ingress;
-      if (ingress.sessionId !== input.ceoSessionId || ingress.sessionIncarnation !== ceo.sessionIncarnation) {
-        return deny(ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_STALE, "the authenticated caller is not the CEO session the decision names", {
-          runId: input.runId,
-          ceoSessionId: input.ceoSessionId,
-          authenticatedSessionId: ingress.sessionId,
-          authenticatedIncarnationMatches: ingress.sessionIncarnation === ceo.sessionIncarnation,
-        });
-      }
-    }
+    const authenticated = this.authenticateCaller(input.runId, input);
+    if (!authenticated.allowed) return authenticated as Decision<ManifestActivationGrant>;
+    const ceo = authenticated.value;
 
     const issuedAt = this.clock.nowIso();
     const identity = {
@@ -323,18 +333,25 @@ export class ManifestActivationGrants {
       ceoBindingGeneration: ceo.bindingGeneration,
       issuedAt,
     };
-    const grant: ManifestActivationGrant = { ...identity, grantDigest: grantDigestOf(identity), consumedAt: null, consumedAttemptId: null };
+    const grant: ManifestActivationGrant = {
+      ...identity,
+      grantDigest: grantDigestOf(identity),
+      consumedAt: null,
+      consumedAttemptId: null,
+      consumer: { sessionId: ceo.sessionId, sessionIncarnation: ceo.sessionIncarnation },
+    };
     this.db.run(
       `INSERT INTO manifest_activation_grants
          (grant_id, run_id, project_id, run_kind, manifest_digest, from_manifest_digest, plan_digest,
           candidate_snapshot_digest, packet_digest, ceo_assignment_id, ceo_actor_id, ceo_session_id,
-          ceo_session_incarnation, ceo_binding_generation, issued_at, grant_digest)
-       VALUES (?, ?, ?, 'CONTRACT_CHANGE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ceo_session_incarnation, ceo_binding_generation, issued_at, grant_digest,
+          consumer_session_id, consumer_session_incarnation, consumer_bound_at)
+       VALUES (?, ?, ?, 'CONTRACT_CHANGE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         grant.grantId, grant.runId, grant.projectId, grant.manifestDigest, grant.fromManifestDigest,
         grant.planDigest, grant.candidateSnapshotDigest, grant.packetDigest, grant.ceoAssignmentId,
         grant.ceoActorId, grant.ceoSessionId, grant.ceoSessionIncarnation, grant.ceoBindingGeneration,
-        grant.issuedAt, grant.grantDigest,
+        grant.issuedAt, grant.grantDigest, grant.consumer.sessionId, grant.consumer.sessionIncarnation, issuedAt,
       ],
     );
     return allow(ReasonCode.OK, grant);
@@ -344,16 +361,18 @@ export class ManifestActivationGrants {
    * Every fact the run's grant names, re-derived: the grant is the run's and unaltered, the run is the
    * CONTRACT_CHANGE it was issued for, on the same candidate, in a state this phase admits; the
    * candidate still binds the PLAN, its manifest and its base; the packet still exists; the project's
-   * active manifest is still the base (compare-and-set); and the CEO authority that confirmed still
-   * holds the role (CEO ruling 2). Unconsumed, always: a consumed grant activates nothing again.
+   * active manifest is still the base (compare-and-set); the CEO authority that confirmed still holds
+   * the role; and the grant's consumer is the live CEO binding's session and incarnation, and the one
+   * the asking finalization attempt started for (CEO ruling 2). Unconsumed, always: a consumed grant
+   * activates nothing again.
    */
-  verify(runId: string, phase: ManifestGrantPhase): Decision<ManifestActivationTarget> {
+  verify(runId: string, phase: ManifestGrantPhase, attemptConsumer: GrantConsumer | null): Decision<ManifestActivationTarget> {
     const grant = this.get(runId);
     if (!grant) {
       return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "this CONTRACT_CHANGE run holds no activation grant from a CEO CONFIRM", { runId, phase });
     }
     const evidence = { runId, phase, grantId: grant.grantId };
-    const { grantDigest, consumedAt: _consumedAt, consumedAttemptId: _consumedAttemptId, ...identity } = grant;
+    const { grantDigest, consumedAt: _consumedAt, consumedAttemptId: _consumedAttemptId, consumer: _consumer, ...identity } = grant;
     if (grantDigestOf(identity) !== grantDigest) {
       return deny(ReasonCode.MANIFEST_ACTIVATION_TARGET_STALE, "the grant's columns no longer recompute to its digest", evidence);
     }
@@ -407,10 +426,70 @@ export class ManifestActivationGrants {
     }
     const authority = this.currentAuthority(grant);
     if (!authority.allowed) return deny(authority.reasonCode, authority.message, { ...evidence, ...authority.evidence });
+    const consuming = this.liveConsumer(grant, attemptConsumer);
+    if (!consuming.allowed) return deny(consuming.reasonCode, consuming.message, { ...evidence, ...consuming.evidence });
 
     const manifest = this.currentPlan(run);
     if (!manifest.allowed) return manifest as Decision<ManifestActivationTarget>;
     return allow(ReasonCode.OK, { grant, manifest: manifest.value.manifest, workflowEvidence: manifest.value.workflowEvidence });
+  }
+
+  /** The grant's consumer as it stands, which a finalization attempt takes as its own when it starts. */
+  consumerOf(runId: string): GrantConsumer | null {
+    return this.get(runId)?.consumer ?? null;
+  }
+
+  /**
+   * CEO ruling 2's other half: a live CEO session re-enters a confirmed CONTRACT_CHANGE whose grant is
+   * unconsumed — after an official re-adoption left the grant's consumer an earlier session — and
+   * becomes its consumer, with no new approval. It is the CEO's CONFIRM of the same run and candidate,
+   * admitted as an MCP mutation in flight now and authenticated as the live binding, of the actor that
+   * confirmed or its re-adopted successor. A finalization attempt started for the earlier consumer can
+   * no longer consume; the next one does, for this one.
+   */
+  bindConsumer(input: {
+    runId: string;
+    candidateSnapshotDigest: string;
+    ceoSessionId: string;
+    ingress?: CeoDecisionIngress;
+  }): Decision<ManifestActivationGrant> {
+    const authenticated = this.authenticateCaller(input.runId, input);
+    if (!authenticated.allowed) return authenticated as Decision<ManifestActivationGrant>;
+    const ceo = authenticated.value;
+    const grant = this.get(input.runId);
+    if (!grant) {
+      return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "this CONTRACT_CHANGE run holds no activation grant from a CEO CONFIRM", { runId: input.runId });
+    }
+    if (grant.consumedAt !== null) {
+      return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED, "this grant has already been consumed", { runId: input.runId, consumedAt: grant.consumedAt });
+    }
+    const run = this.runs.get(input.runId);
+    if (!run || !PHASE_STATES.PRE_MERGE.includes(run.state)) {
+      return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "a grant's consumer is re-bound only while its run finalizes", {
+        runId: input.runId,
+        state: run?.state ?? null,
+      });
+    }
+    if (input.candidateSnapshotDigest !== grant.candidateSnapshotDigest || this.runs.currentCandidate(input.runId) !== grant.candidateSnapshotDigest) {
+      return deny(ReasonCode.MANIFEST_ACTIVATION_TARGET_STALE, "the call does not name the candidate the grant was issued for", {
+        runId: input.runId,
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+        grantCandidate: grant.candidateSnapshotDigest,
+      });
+    }
+    const authority = this.currentAuthority(grant);
+    if (!authority.allowed) return authority as Decision<ManifestActivationGrant>;
+    const consumer = { sessionId: ceo.sessionId, sessionIncarnation: ceo.sessionIncarnation };
+    const changed = this.db.run(
+      `UPDATE manifest_activation_grants
+          SET consumer_session_id = ?, consumer_session_incarnation = ?, consumer_bound_at = ?
+        WHERE run_id = ? AND consumed_at IS NULL`,
+      [consumer.sessionId, consumer.sessionIncarnation, this.clock.nowIso(), input.runId],
+    ).changes;
+    if (changed !== 1) {
+      return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED, "this grant has already been consumed", { runId: input.runId });
+    }
+    return allow(ReasonCode.OK, { ...grant, consumer });
   }
 
   /**
@@ -445,6 +524,74 @@ export class ManifestActivationGrants {
       return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED, "this grant has already been consumed", { runId, attemptId });
     }
     return allow(ReasonCode.OK, { ...grant, consumedAt, consumedAttemptId: attemptId });
+  }
+
+  /**
+   * The caller of a CONFIRM that issues a grant or re-binds its consumer: an MCP mutation whose handler
+   * is running now (the reservation is in this process's in-flight set, its row unanswered), whose door
+   * authenticated the live CEO binding's session and incarnation, and that session is the one the call
+   * names. An in-process call, which carries no ingress, is refused.
+   */
+  private authenticateCaller(runId: string, caller: { ceoSessionId: string; ingress?: CeoDecisionIngress }): Decision<LiveCeo> {
+    const ingress = caller.ingress;
+    if (!ingress || !ingress.actor || !ingress.sessionId || !ingress.sessionIncarnation || !ingress.idempotencyKey) {
+      return deny(ReasonCode.GATE_AUTHORITY_DENIED, "a CONTRACT_CHANGE confirmation must arrive as an authenticated MCP call", {
+        runId,
+        ingress: ingress ? "INCOMPLETE" : "ABSENT",
+      });
+    }
+    const reserved = this.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM inbound_messages
+        WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND result_json IS NULL`,
+      [ingress.idempotencyKey, ingress.actor],
+    );
+    if (!isMcpReservationInFlight(this.db, ingress.idempotencyKey) || (reserved?.n ?? 0) !== 1) {
+      return deny(ReasonCode.GATE_AUTHORITY_DENIED, "the confirmation is not an MCP mutation in flight in this process", {
+        runId,
+        idempotencyKey: ingress.idempotencyKey,
+      });
+    }
+    const ceo = this.liveCeo();
+    if (
+      !ceo ||
+      ingress.sessionId !== caller.ceoSessionId ||
+      ingress.sessionId !== ceo.sessionId ||
+      ingress.sessionIncarnation !== ceo.sessionIncarnation
+    ) {
+      return deny(ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_STALE, "the authenticated caller is not the live CEO session the decision names", {
+        runId,
+        ceoSessionId: caller.ceoSessionId,
+        authenticatedSessionId: ingress.sessionId,
+        liveCeoSessionId: ceo?.sessionId ?? null,
+        authenticatedIncarnationMatches: ceo !== null && ingress.sessionIncarnation === ceo.sessionIncarnation,
+      });
+    }
+    return allow(ReasonCode.OK, ceo);
+  }
+
+  /**
+   * CEO ruling 2: the grant's consumer is the live CEO binding's session and incarnation now, and the
+   * finalization attempt asking is the one started for that consumer. An attempt started for an earlier
+   * session, or a consumer an official re-adoption has since replaced, consumes nothing.
+   */
+  private liveConsumer(grant: ManifestActivationGrant, attemptConsumer: GrantConsumer | null): Decision<void> {
+    const ceo = this.liveCeo();
+    const evidence = {
+      consumerSessionId: grant.consumer.sessionId,
+      attemptConsumerSessionId: attemptConsumer?.sessionId ?? null,
+      liveCeoSessionId: ceo?.sessionId ?? null,
+    };
+    if (
+      !attemptConsumer ||
+      attemptConsumer.sessionId !== grant.consumer.sessionId ||
+      attemptConsumer.sessionIncarnation !== grant.consumer.sessionIncarnation
+    ) {
+      return deny(ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_STALE, "this finalization attempt was not started for the grant's current consumer", evidence);
+    }
+    if (!ceo || ceo.sessionId !== grant.consumer.sessionId || ceo.sessionIncarnation !== grant.consumer.sessionIncarnation) {
+      return deny(ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_STALE, "the grant's consumer is not the live CEO session; a live CEO session must re-enter", evidence);
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /** CEO ruling 1: a CONTRACT_CHANGE replaces only the manifest it was judged against. */

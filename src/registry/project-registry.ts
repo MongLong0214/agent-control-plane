@@ -14,6 +14,7 @@ import { type Activity, type Availability, Role } from "../domain/types.ts";
 import { type CompletionAuthority, isDaemonFinalizerCompletion } from "../run/run-engine.ts";
 import {
   type ActivatedWorkflowEvidence,
+  type GrantConsumer,
   type ManifestActivationGrants,
   sameWorkflowCoverage,
 } from "./manifest-activation-grants.ts";
@@ -155,7 +156,9 @@ export class ProjectRegistry {
    * is audited. Any refusal leaves all of it as it was.
    *
    * `workflows` is what the finalizer read, outside this transaction, of every workflow the manifest
-   * points to (CEO ruling 6); it must cover each one exactly.
+   * points to (CEO ruling 6); it must cover each one exactly. `consumer` is the authenticated CEO
+   * session the finalization attempt started for; it must still be the grant's consumer and the live
+   * CEO binding when this transaction commits (CEO ruling 2).
    */
   activateManifest(
     runId: string,
@@ -163,6 +166,7 @@ export class ProjectRegistry {
       completion: CompletionAuthority;
       attemptId: string;
       workflows: readonly ActivatedWorkflowEvidence[];
+      consumer: GrantConsumer | null;
     },
   ): Decision<{ from: string; to: string; grantId: string }> {
     if (!isDaemonFinalizerCompletion(input.completion)) {
@@ -173,7 +177,7 @@ export class ProjectRegistry {
       return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "manifest activation grants are not configured", { runId });
     }
     return this.db.txDecision(() => {
-      const target = grants.verify(runId, "ACTIVATION");
+      const target = grants.verify(runId, "ACTIVATION", input.consumer);
       if (!target.allowed) return target as Decision<{ from: string; to: string; grantId: string }>;
       const { grant, manifest } = target.value;
       const covered = sameWorkflowCoverage(target.value.workflowEvidence, input.workflows);
@@ -219,6 +223,7 @@ export class ProjectRegistry {
           grantId: grant.grantId,
           grantDigest: grant.grantDigest,
           attemptId: input.attemptId,
+          consumer: grant.consumer,
           candidateSnapshotDigest: grant.candidateSnapshotDigest,
           workflows: input.workflows.map((workflow) => ({ ...workflow })),
         },

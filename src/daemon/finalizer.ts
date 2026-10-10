@@ -19,6 +19,7 @@ import { verifySnapshotFreshness } from "../snapshot/candidate-snapshot.ts";
 import type { CompletionAuthority } from "../run/run-engine.ts";
 import type {
   ActivatedWorkflowEvidence,
+  GrantConsumer,
   ManifestActivationTarget,
 } from "../registry/manifest-activation-grants.ts";
 
@@ -228,9 +229,13 @@ export class ApprovedRunFinalizer {
     const acquired = this.acquireAttempt(runId, candidateDigest);
     if (!acquired.allowed) return acquired as Decision<FinalizationResult>;
     const attemptId = acquired.value;
+    // #246 B2-b, CEO ruling 2 — the attempt runs for the CONTRACT_CHANGE grant's consumer as it stands
+    // now: the authenticated CEO session whose call confirmed, or that re-entered since. Read in the
+    // same synchronous step as the acquisition, and required again when activation commits.
+    const consumer = initial.kind === RunKind.CONTRACT_CHANGE ? this.cp.manifestGrants.consumerOf(runId) : null;
     let completed = false;
     try {
-      const plans = await this.reconfirmAndPlan(runId, candidateDigest);
+      const plans = await this.reconfirmAndPlan(runId, candidateDigest, consumer);
       if (!plans.allowed) return this.handleFailure(runId, attemptId, plans as Decision<unknown>);
 
       const prepared: PlannedRepository[] = [];
@@ -296,6 +301,7 @@ export class ApprovedRunFinalizer {
         const done = await this.complete(
           runId,
           attemptId,
+          consumer,
           "daemon finalized run with nothing to merge",
           noMergeEvidence,
         );
@@ -376,6 +382,7 @@ export class ApprovedRunFinalizer {
           const done = await this.complete(
             runId,
             attemptId,
+            consumer,
             "all ordered merges passed exact post-merge verification",
             { attemptId, merged },
           );
@@ -413,6 +420,7 @@ export class ApprovedRunFinalizer {
   private async reconfirmAndPlan(
     runId: string,
     candidateDigest: string,
+    consumer: GrantConsumer | null,
   ): Promise<Decision<ConfirmedMergePlan[]>> {
     const run = this.cp.runs.get(runId);
     if (!run || !this.isFinalizingState(run.state)) {
@@ -426,7 +434,7 @@ export class ApprovedRunFinalizer {
     // #246 B2-b — a CONTRACT_CHANGE finalizes only on the grant its CEO CONFIRM issued, asked before any
     // GitHub write: a run that reached CEO_APPROVED any other way, a base another activation moved, or a
     // CEO authority that no longer holds the role merges nothing.
-    const granted = run.kind === RunKind.CONTRACT_CHANGE ? this.cp.manifestGrants.verify(runId, "PRE_MERGE") : null;
+    const granted = run.kind === RunKind.CONTRACT_CHANGE ? this.cp.manifestGrants.verify(runId, "PRE_MERGE", consumer) : null;
     if (granted && !granted.allowed) return granted as Decision<ConfirmedMergePlan[]>;
     if (this.cp.runs.currentCandidate(runId) !== candidateDigest) {
       return deny(ReasonCode.EVIDENCE_STALE, "candidate changed after the finalization lease was acquired", {
@@ -514,6 +522,7 @@ export class ApprovedRunFinalizer {
   private async complete(
     runId: string,
     attemptId: string,
+    consumer: GrantConsumer | null,
     reason: string,
     evidence: Record<string, unknown>,
   ): Promise<Decision<unknown>> {
@@ -526,7 +535,7 @@ export class ApprovedRunFinalizer {
         attemptId,
         refusal: { reasonCode: cause.reasonCode, message: cause.message, evidence: cause.evidence },
       });
-    const target = this.cp.manifestGrants.verify(runId, "ACTIVATION");
+    const target = this.cp.manifestGrants.verify(runId, "ACTIVATION", consumer);
     if (!target.allowed) return refused(target);
     const workflows = await this.compareActivationWorkflows(runId, target.value);
     if (!workflows.allowed) return refused(workflows);
@@ -535,6 +544,7 @@ export class ApprovedRunFinalizer {
         completion: this.#completionAuthority,
         attemptId,
         workflows: workflows.value,
+        consumer,
       });
       if (!activated.allowed) return activated as Decision<unknown>;
       return this.cp.runs.transition(

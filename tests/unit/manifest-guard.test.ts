@@ -99,6 +99,7 @@ describe("manifest mutations are guard-bound", () => {
       completion: undefined as never,
       attemptId: "finalize_none",
       workflows: [],
+      consumer: null,
     });
     expect(withoutCapability.allowed).toBe(false);
     expect(withoutCapability.reasonCode).toBe(ReasonCode.COMPLETION_AUTHORITY_DENIED);
@@ -106,6 +107,7 @@ describe("manifest mutations are guard-bound", () => {
       completion: harness.cp.daemonFinalizationAuthorities().completion,
       attemptId: "finalize_none",
       workflows: [],
+      consumer: null,
     });
     expect(withoutGrant.allowed).toBe(false);
     expect(withoutGrant.reasonCode).toBe(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING);

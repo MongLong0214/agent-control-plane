@@ -33,6 +33,7 @@ import {
   bindWorker,
   bindCeo,
   carryContractChange,
+  decideThroughHermes,
   finalizeNoRepositoryRun,
   makeHarness,
   makeStartedOperator,
@@ -149,7 +150,8 @@ describe("host-anchored redacted run-evidence export", () => {
     const candidateSnapshotDigest = cp.runs.currentCandidate(created.value.runId)!;
     await cp.continuity.evaluate("completed-run finalization");
     const ceo = cp.bindings.active(roleKeyFor(Role.CEO))!;
-    const confirmed = cp.ceo.submitCeoDecision({
+    // #246 B2-b — a CONTRACT_CHANGE CONFIRM issues its activation grant only through the Hermes door.
+    const confirmed = await decideThroughHermes(harness, {
       runId: created.value.runId, decision: "CONFIRM", candidateSnapshotDigest,
       ceoSessionId: ceo.sessionId, rationale: "administrative capacity witness",
     });

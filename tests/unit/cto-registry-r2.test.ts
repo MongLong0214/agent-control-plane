@@ -291,6 +291,7 @@ describe("round-2 registry regressions", () => {
       completion: harness.cp.daemonFinalizationAuthorities().completion,
       attemptId: grant.consumedAttemptId!,
       workflows: [],
+      consumer: null,
     });
     expect(again.allowed).toBe(false);
     expect(again.reasonCode).toBe(ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED);

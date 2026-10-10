@@ -1485,6 +1485,12 @@ CREATE TABLE IF NOT EXISTS manifest_activation_grants (
   ceo_binding_generation    INTEGER NOT NULL CHECK (ceo_binding_generation > 0),
   issued_at                 TEXT NOT NULL,
   grant_digest              TEXT NOT NULL UNIQUE,
+  -- The authenticated CEO session whose call drives consumption: the confirming session at issue, and
+  -- after that only a live CEO session that re-entered through an admitted MCP call. Consumption
+  -- requires it to be the live CEO binding. It changes only while the grant is unconsumed.
+  consumer_session_id          TEXT NOT NULL,
+  consumer_session_incarnation TEXT NOT NULL,
+  consumer_bound_at            TEXT NOT NULL,
   -- Set once, by the finalization attempt that activated the manifest.
   consumed_at               TEXT,
   consumed_attempt_id       TEXT,
@@ -1535,10 +1541,12 @@ BEGIN
   SELECT RAISE(ABORT, 'MANIFEST_GRANT_IMMUTABLE');
 END;
 
--- CP-HI-02 — #246 B2-b: a grant is consumed once, from unconsumed to consumed, and never back.
+-- CP-HI-02 — #246 B2-b: a grant is consumed once, from unconsumed to consumed, and never back; once
+-- consumed nothing in it changes, its consumer included.
 CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_consumed_once
 BEFORE UPDATE ON manifest_activation_grants
-WHEN OLD.consumed_at IS NOT NULL OR NEW.consumed_at IS NULL OR NEW.consumed_attempt_id IS NULL
+WHEN OLD.consumed_at IS NOT NULL
+  OR (NEW.consumed_at IS NULL) <> (NEW.consumed_attempt_id IS NULL)
 BEGIN
   SELECT RAISE(ABORT, 'MANIFEST_GRANT_CONSUMED');
 END;

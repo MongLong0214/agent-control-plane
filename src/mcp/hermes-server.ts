@@ -148,7 +148,11 @@ export const createHermesMcpPort = (
       // Hermes owns the CEO decision, not GitHub finalization. The daemon supplies this
       // internal callback at composition time so a live daemon begins the durable sequence
       // immediately after confirmation instead of waiting for a restart scan.
-      if (decision.allowed && decision.value.state === RunState.CEO_APPROVED && options.onCeoApproved) {
+      // #246 B2-b — a CONTRACT_CHANGE consumer re-entry answers with the run's finalizing state, and it too
+      // starts the daemon's sequence.
+      const finalizing = decision.allowed && (decision.value.state === RunState.CEO_APPROVED
+        || decision.value.state === RunState.MERGING || decision.value.state === RunState.POST_MERGE_VERIFYING);
+      if (finalizing && options.onCeoApproved) {
         void Promise.resolve(options.onCeoApproved(input.runId)).catch(() => undefined);
       }
       return decision;
@@ -350,11 +354,15 @@ const createHermesServerFromPort = (
     { description: "Submit the CEO's final decision.", inputSchema: { ...mutation, runId: z.string(), decision: z.enum(["CONFIRM", "FINAL_REVISE", "OWNER_DECISION_REQUIRED"]), candidateSnapshotDigest: z.string(), ceoSessionId: z.string(), rationale: z.string() } },
     async (args) => write(args.idempotencyKey, async () => {
       // #246 B2-b — the door's authenticated session travels with the decision, never an argument, so a
-      // CONTRACT_CHANGE grant is issued only when it is the CEO session the call names.
+      // CONTRACT_CHANGE grant is issued, or its consumer re-bound, only when it is the CEO session the call
+      // names and this mutation is in flight.
       const peer = authenticateMcpPeer(authenticate);
-      const ingress = peer.allowed
-        ? { sessionId: peer.value.sessionId ?? null, sessionIncarnation: peer.value.sessionIncarnation ?? null }
-        : { sessionId: null, sessionIncarnation: null };
+      const ingress = {
+        actor: peer.allowed ? peer.value.actor : null,
+        sessionId: peer.allowed ? peer.value.sessionId ?? null : null,
+        sessionIncarnation: peer.allowed ? peer.value.sessionIncarnation ?? null : null,
+        idempotencyKey: args.idempotencyKey,
+      };
       return respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale, ingress }));
     }),
   );

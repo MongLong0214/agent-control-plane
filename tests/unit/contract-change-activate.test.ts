@@ -20,6 +20,7 @@ import {
   applyPassingChange,
   bindWorker,
   carryContractChange,
+  decideThroughHermes,
   driveToReviewedCandidate,
   makeHarness,
   registerFixtureProject,
@@ -112,13 +113,14 @@ const readyContractChange = async (
   return { run, proposed, candidate: h.cp.runs.currentCandidate(run.runId)! };
 };
 
+/** A CEO CONFIRM through the Hermes door, as the live CEO (or `ceoSessionId`), under its own MCP reservation. */
 const confirm = async (h: Harness, runId: string, candidate: string, ceoSessionId?: string) => {
   await h.cp.continuity.evaluate("confirm the contract change");
-  return h.cp.ceo.submitCeoDecision({
+  return decideThroughHermes(h, {
     runId,
     decision: "CONFIRM",
     candidateSnapshotDigest: candidate,
-    ceoSessionId: ceoSessionId ?? h.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId,
+    ...(ceoSessionId === undefined ? {} : { ceoSessionId }),
     rationale: "contract change witness",
   });
 };
@@ -214,26 +216,59 @@ describe("the normal path: CONFIRM → grant → one transaction that activates,
     expect(next.base.ciWorkflows.map((workflow) => workflow.checkName)).toEqual(["unit-tests"]);
   });
 
-  it("E2E (Hermes MCP port): the door's authenticated session is the grant's CEO session", async () => {
+  it("E2E (Hermes MCP port): the door's authenticated session is the grant's CEO session and its first consumer", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness, "cc-e2e-port");
     const { run, proposed, candidate } = await readyContractChange(harness, projectId);
     const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
-    await harness.cp.continuity.evaluate("port confirm");
-    const port = createHermesMcpPort(harness.cp);
-    const confirmed = await port.submitCeoDecision({
+    const confirmed = await confirm(harness, run.runId, candidate);
+    expect(confirmed, JSON.stringify(confirmed)).toMatchObject({ allowed: true, value: { state: RunState.CEO_APPROVED } });
+    await runDaemon(harness);
+    expect(stateOf(harness, run.runId)).toBe(RunState.COMPLETED);
+    expect(activeManifest(harness, projectId)).toBe(manifestDigest(proposed));
+    expect(grantRow(harness, run.runId)).toMatchObject({
+      ceo_session_id: ceo.sessionId,
+      consumer_session_id: ceo.sessionId,
+      consumer_session_incarnation: ceo.sessionIncarnation,
+    });
+  });
+});
+
+describe("b2b-r1-01: a CONTRACT_CHANGE grant is issued only to an authenticated MCP call in flight", () => {
+  it("REPRO_NO_INGRESS: an in-process CONFIRM naming the live CEO session, with no ingress, issues no grant", async () => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "r1-no-ingress");
+    const { run, candidate } = await readyContractChange(h, projectId);
+    await h.cp.continuity.evaluate("no ingress");
+    const result = h.cp.ceo.submitCeoDecision({
+      runId: run.runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: candidate,
+      ceoSessionId: h.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId,
+      rationale: "an internal caller with the CEO's id and no door",
+    });
+    expect(result.allowed).toBe(false);
+    expect(stateOf(h, run.runId)).toBe(RunState.READY_FOR_CEO_REVIEW);
+    expect(grantRow(h, run.runId)).toBeNull();
+  });
+
+  it("a port call carrying a well-formed ingress but no MCP mutation in flight issues no grant", async () => {
+    const h = makeHarness();
+    const { projectId } = await registerFixtureProject(h, "r1-not-in-flight");
+    const { run, candidate } = await readyContractChange(h, projectId);
+    const ceo = h.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    await h.cp.continuity.evaluate("not in flight");
+    const result = await createHermesMcpPort(h.cp).submitCeoDecision({
       runId: run.runId,
       decision: "CONFIRM",
       candidateSnapshotDigest: candidate,
       ceoSessionId: ceo.sessionId,
-      rationale: "through the Hermes port",
-      ingress: { sessionId: ceo.sessionId, sessionIncarnation: ceo.sessionIncarnation },
+      rationale: "an ingress that no admitted call is running under",
+      ingress: { actor: ceo.sessionId, sessionId: ceo.sessionId, sessionIncarnation: ceo.sessionIncarnation, idempotencyKey: "never-reserved" },
     });
-    expect(confirmed, JSON.stringify(confirmed)).toMatchObject({ allowed: true, value: { state: RunState.CEO_APPROVED } });
-    expect(grantRow(harness, run.runId)!.ceo_session_id).toBe(ceo.sessionId);
-    await runDaemon(harness);
-    expect(stateOf(harness, run.runId)).toBe(RunState.COMPLETED);
-    expect(activeManifest(harness, projectId)).toBe(manifestDigest(proposed));
+    expect(result).toMatchObject({ allowed: false, reasonCode: "GATE_AUTHORITY_DENIED" });
+    expect(stateOf(h, run.runId)).toBe(RunState.READY_FOR_CEO_REVIEW);
+    expect(grantRow(h, run.runId)).toBeNull();
   });
 });
 
@@ -325,6 +360,7 @@ describe("a grant is consumed once, and a refusal leaves nothing partial", () =>
       completion: harness.cp.daemonFinalizationAuthorities().completion,
       attemptId: consumed.consumed_attempt_id!,
       workflows: [],
+      consumer: harness.cp.manifestGrants.consumerOf(run.runId),
     });
     expect(direct).toMatchObject({ allowed: false, reasonCode: "MANIFEST_ACTIVATION_GRANT_CONSUMED" });
     expect(() =>
@@ -376,6 +412,32 @@ describe("a grant is consumed once, and a refusal leaves nothing partial", () =>
     expect(stateOf(harness, run.runId)).toBe(RunState.COMPLETED);
     expect(activeManifest(harness, projectId)).toBe(manifestDigest(proposed));
     expect(grantRow(harness, run.runId)!.consumed_at).not.toBeNull();
+  });
+
+  it("b2b-r1-04: a refusal at the COMPLETED transition after activation returns rolls back pointer, grant, manifest, drift, audit and state", async () => {
+    const h = makeHarness();
+    const { projectId, repositoryId } = await registerFixtureProject(h, "r1-after-activation-denial");
+    const { run, proposed, candidate } = await readyContractChange(h, projectId);
+    expect((await confirm(h, run.runId, candidate)).allowed).toBe(true);
+    const repositoryBefore = h.cp.repositories.byId(repositoryId)!;
+    const transition = h.cp.runs.transition.bind(h.cp.runs);
+    let completedCalls = 0;
+    vi.spyOn(h.cp.runs, "transition").mockImplementation((...args) => {
+      if (args[1] === RunState.COMPLETED) {
+        completedCalls++;
+        return { allowed: false, reasonCode: "CONFLICT", message: "injected refusal after activation", evidence: {} };
+      }
+      return transition(...args);
+    });
+    const result = await new ApprovedRunFinalizer(h.cp).finalizeApprovedRun(run.runId);
+    expect(completedCalls).toBe(1);
+    expect(result.allowed).toBe(false);
+    expect(activeManifest(h, projectId)).toBe(run.baseDigest);
+    expect(grantRow(h, run.runId)!.consumed_at).toBeNull();
+    expect(h.cp.repositories.byId(repositoryId)).toMatchObject({ activeManifestDigest: repositoryBefore.activeManifestDigest, driftState: repositoryBefore.driftState });
+    expect(activations(h)).toEqual([]);
+    expect(h.cp.projects.manifest(manifestDigest(proposed))).toBeNull();
+    expect(stateOf(h, run.runId)).toBe(RunState.POST_MERGE_VERIFYING);
   });
 
   it("W13b: a finalizer that skips activation cannot complete a CONTRACT_CHANGE — refused by code, and by the v44 trigger", async () => {
@@ -486,19 +548,83 @@ describe("ruling 2: consumption authenticates the live CEO binding", () => {
     expect(activeManifest(harness, projectId)).toBe(run.baseDigest);
   });
 
-  it("an official same-actor re-adoption (a new generation) is not a reason to re-approve: the grant activates", async () => {
+  it("an official same-actor re-adoption is not a reason to re-approve: the re-adopted CEO's CONFIRM re-entry consumes the same grant", async () => {
     const harness = makeHarness();
     const ceo = bindRestorableCeo(harness);
     const { projectId } = await registerFixtureProject(harness, "cc-ceo-readopted");
     const { run, proposed, candidate } = await readyContractChange(harness, projectId);
     expect((await confirm(harness, run.runId, candidate, ceo.old.sessionId)).allowed).toBe(true);
+    const issued = grantRow(harness, run.runId)!;
     const restored = readoptSameActor(harness, ceo);
     expect(restored.bindingGeneration).toBeGreaterThan(ceo.generation);
     expect(harness.cp.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE assignment_id = ?", [restored.assignmentId])!.actor_id).toBe(ceo.actorId);
 
+    // The grant's consumer is the earlier session: nothing finalizes for it once it no longer holds the role.
     await runDaemon(harness);
+    expect(stateOf(harness, run.runId)).toBe(RunState.CEO_APPROVED);
+    expect(lastFailure(harness, run.runId)?.reasonCode).toBe("MANIFEST_ACTIVATION_AUTHORITY_STALE");
+    expect(activeManifest(harness, projectId)).toBe(run.baseDigest);
+
+    // The re-adopted CEO, authenticated through the door, re-enters with a CONFIRM of the same candidate.
+    let triggered: Promise<unknown> | null = null;
+    const finalizer = new ApprovedRunFinalizer(harness.cp, "current-consumer");
+    const reentered = await decideThroughHermes(
+      harness,
+      { runId: run.runId, decision: "CONFIRM", candidateSnapshotDigest: candidate, ceoSessionId: restored.sessionId },
+      { onCeoApproved: (id) => { triggered = finalizer.finalizeApprovedRun(id); return triggered; } },
+    );
+    expect(reentered).toMatchObject({ allowed: true, value: { state: RunState.CEO_APPROVED } });
+    expect(triggered).not.toBeNull();
+    await triggered;
     expect(stateOf(harness, run.runId)).toBe(RunState.COMPLETED);
     expect(activeManifest(harness, projectId)).toBe(manifestDigest(proposed));
+    // The same grant, never re-approved: its identity is the original CONFIRM's, its consumer the re-adopted session.
+    expect(grantRow(harness, run.runId)).toMatchObject({
+      grant_id: issued.grant_id,
+      grant_digest: issued.grant_digest,
+      ceo_session_id: ceo.old.sessionId,
+      consumer_session_id: restored.sessionId,
+    });
+    expect(harness.cp.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM manifest_activation_grants WHERE run_id = ?", [run.runId])!.n).toBe(1);
+  });
+
+  it("REPRO_STALE_CONSUMER: an earlier-session call already in flight does not consume after official re-adoption", async () => {
+    const { github, harness: h } = githubHarness();
+    const ceo = bindRestorableCeo(h);
+    const { projectId } = await registerFixtureProject(h, "r1-stale-consumer");
+    publishOnDev(h, github);
+    const { run, candidate } = await readyContractChange(h, projectId, stricter);
+    let entered!: () => void;
+    const atRead = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const resume = new Promise<void>((resolve) => { release = resolve; });
+    const read = h.cp.github.workflowDigestAt.bind(h.cp.github);
+    let reads = 0;
+    vi.spyOn(h.cp.github, "workflowDigestAt").mockImplementation(async (...args) => {
+      if (++reads === 1) { entered(); await resume; }
+      return read(...args);
+    });
+    let pending: ReturnType<ApprovedRunFinalizer["finalizeApprovedRun"]> | undefined;
+    const listeners = await startDaemonMcpListeners(h.cp, tempDir("r1-stale-socket-"), "witness-mcp-token", {
+      finalizeApprovedRun: (id) => { pending = new ApprovedRunFinalizer(h.cp, "earlier-session-call").finalizeApprovedRun(id); },
+    });
+    const connection = openMcp(listeners.socketPaths[0]!, { sessionId: ceo.old.sessionId, sessionSecret: ceo.old.sessionSecret! });
+    try {
+      expect(await connection.initialized()).not.toBeNull();
+      await h.cp.continuity.evaluate("stale consumer socket");
+      expect(await connection.call(10, { idempotencyKey: "r1-stale-confirm", runId: run.runId, decision: "CONFIRM",
+        candidateSnapshotDigest: candidate, ceoSessionId: ceo.old.sessionId, rationale: "old session" })).toMatchObject({ ok: true });
+      await atRead;
+      const restored = readoptSameActor(h, ceo);
+      expect(restored.sessionId).not.toBe(ceo.old.sessionId);
+      release();
+      const result = await pending!;
+      expect(result.allowed).toBe(false);
+      expect(JSON.stringify(result)).toContain("MANIFEST_ACTIVATION_AUTHORITY_STALE");
+      expect(grantRow(h, run.runId)!.consumed_at).toBeNull();
+      expect(activeManifest(h, projectId)).toBe(run.baseDigest);
+      expect(stateOf(h, run.runId)).not.toBe(RunState.COMPLETED);
+    } finally { release(); connection.close(); await listeners.close(); }
   });
 
   it("a stale call from the earlier session after re-adoption is refused at CONFIRM: no grant", async () => {
@@ -586,11 +712,12 @@ describe("ruling 6: every workflow the manifest points to is compared before act
     expect(lastFailure(harness, run.runId)!.reasonCode).toBe("MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED");
   });
 
-  it("no workflow changed: the base's exact-byte approval is reused and GitHub is not read", async () => {
+  it("an unchanged declaration is read again at the exact revision: an equal entry in the base is no evidence of its bytes", async () => {
     const { github, harness } = githubHarness();
-    const { projectId } = await registerFixtureProject(harness, "cc-workflow-reused", {
+    const { projectId } = await registerFixtureProject(harness, "cc-workflow-reread", {
       ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "unit-tests", approvedDigest: sha256(WORKFLOW), unapprovedFirstActivation: false, repositoryRole: "primary" }],
     });
+    const devHead = publishOnDev(harness, github, WORKFLOW);
     const requests = recordRequests(github);
     const { run, proposed, candidate } = await readyContractChange(harness, projectId, postMergeAdded("extra-check"));
     expect((await confirm(harness, run.runId, candidate)).allowed).toBe(true);
@@ -598,9 +725,43 @@ describe("ruling 6: every workflow the manifest points to is compared before act
     expect(stateOf(harness, run.runId)).toBe(RunState.COMPLETED);
     expect(activeManifest(harness, projectId)).toBe(manifestDigest(proposed));
     expect(activations(harness)[0]!.evidence["workflows"]).toEqual([
-      expect.objectContaining({ path: WORKFLOW_PATH, evidence: "REUSED", revision: null, observedDigest: null }),
+      expect.objectContaining({ path: WORKFLOW_PATH, evidence: "READ", revision: devHead, observedDigest: sha256(WORKFLOW) }),
     ]);
-    expect(requests.filter((request) => /\/contents\/|\/git\/ref\/heads\//.test(request))).toEqual([]);
+    expect(requests.filter((request) => /\/git\/ref\/heads\/dev$/.test(request)).length).toBeGreaterThan(0);
+  });
+
+  it("REPRO_REUSED_WORKFLOW: an unchanged declaration is not evidence for different current workflow bytes", async () => {
+    const { github, harness: h } = githubHarness();
+    const { projectId } = await registerFixtureProject(h, "r1-reused-tampered", {
+      ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "unit-tests", approvedDigest: sha256(WORKFLOW), unapprovedFirstActivation: false, repositoryRole: "primary" }],
+    });
+    publishOnDev(h, github, WORKFLOW);
+    const first = await readyContractChange(h, projectId, commitloreRequired);
+    expect((await confirm(h, first.run.runId, first.candidate)).allowed).toBe(true);
+    expect((await new ApprovedRunFinalizer(h.cp).finalizeApprovedRun(first.run.runId)).allowed).toBe(true);
+    // A normal repository revision changes the workflow bytes while its declaration stays put.
+    const tampered = `${WORKFLOW}# changed repository revision\n`;
+    publishOnDev(h, github, tampered);
+    const { run, candidate } = await readyContractChange(h, projectId, postMergeAdded("extra-check"));
+    expect((await confirm(h, run.runId, candidate)).allowed).toBe(true);
+    const result = await new ApprovedRunFinalizer(h.cp).finalizeApprovedRun(run.runId);
+    expect(result.allowed).toBe(false);
+    expect(activeManifest(h, projectId)).toBe(run.baseDigest);
+    expect(grantRow(h, run.runId)!.consumed_at).toBeNull();
+  });
+
+  it("REPRO_UNAPPROVED_REUSED: a base's explicitly unapproved workflow cannot become reusable approval", async () => {
+    const { harness: h } = githubHarness();
+    const { projectId } = await registerFixtureProject(h, "r1-reused-unapproved", {
+      ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "unit-tests", approvedDigest: null, unapprovedFirstActivation: true, repositoryRole: "primary" }],
+    });
+    const { run, candidate } = await readyContractChange(h, projectId, commitloreRequired);
+    expect((await confirm(h, run.runId, candidate)).allowed).toBe(true);
+    const result = await new ApprovedRunFinalizer(h.cp).finalizeApprovedRun(run.runId);
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe("MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED");
+    expect(grantRow(h, run.runId)!.consumed_at).toBeNull();
+    expect(activeManifest(h, projectId)).toBe(run.baseDigest);
   });
 });
 
@@ -678,10 +839,12 @@ describe("forged rows and raw writes", () => {
       `INSERT INTO manifest_activation_grants
          (grant_id, run_id, project_id, run_kind, manifest_digest, from_manifest_digest, plan_digest,
           candidate_snapshot_digest, packet_digest, ceo_assignment_id, ceo_actor_id, ceo_session_id,
-          ceo_session_incarnation, ceo_binding_generation, issued_at, grant_digest)
-       VALUES (?, ?, ?, 'CONTRACT_CHANGE', ?, ?, ?, ?, ?, ?, 'actor:forged', ?, ?, ?, ?, ?)`,
+          ceo_session_incarnation, ceo_binding_generation, issued_at, grant_digest,
+          consumer_session_id, consumer_session_incarnation, consumer_bound_at)
+       VALUES (?, ?, ?, 'CONTRACT_CHANGE', ?, ?, ?, ?, ?, ?, 'actor:forged', ?, ?, ?, ?, ?, ?, ?, ?)`,
       ["mag_forged", run.runId, projectId, manifestDigest(proposed), run.baseDigest, plan.digest, candidate, packet.digest,
-        ceo.assignmentId, ceo.sessionId, ceo.sessionIncarnation, ceo.bindingGeneration, harness.clock.nowIso(), "sha256:forged"],
+        ceo.assignmentId, ceo.sessionId, ceo.sessionIncarnation, ceo.bindingGeneration, harness.clock.nowIso(), "sha256:forged",
+        ceo.sessionId, ceo.sessionIncarnation, harness.clock.nowIso()],
     );
     await runDaemon(harness);
     // The run is not in a finalization state, so nothing consumes the row; its own CONFIRM now
@@ -837,14 +1000,12 @@ describe("ruling 9: a CONTRACT_CHANGE CONFIRM and another ceoSessionId", () => {
     const { run, candidate } = await readyContractChange(harness, projectId);
     const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
     await harness.cp.continuity.evaluate("ingress confirm");
-    const refused = await createHermesMcpPort(harness.cp).submitCeoDecision({
-      runId: run.runId,
-      decision: "CONFIRM",
-      candidateSnapshotDigest: candidate,
-      ceoSessionId: ceo.sessionId,
-      rationale: "a door that did not pin the CEO binding",
-      ingress: { sessionId: run.ownerSessionId, sessionIncarnation: ceo.sessionIncarnation },
-    });
+    // A door that did not pin the CEO binding: it authenticated the run's CTO, which names the CEO.
+    const refused = await decideThroughHermes(
+      harness,
+      { runId: run.runId, decision: "CONFIRM", candidateSnapshotDigest: candidate, ceoSessionId: ceo.sessionId },
+      { peerSessionId: run.ownerSessionId },
+    );
     expect(refused).toMatchObject({ allowed: false, reasonCode: "MANIFEST_ACTIVATION_AUTHORITY_STALE" });
     expect(stateOf(harness, run.runId)).toBe(RunState.READY_FOR_CEO_REVIEW);
     expect(grantRow(harness, run.runId)).toBeNull();
@@ -952,7 +1113,7 @@ describe("with a repository: merge first, then activate", () => {
     expect(stateOf(harness, change.run.runId)).toBe(RunState.COMPLETED);
     expect(activeManifest(harness, change.registered.projectId)).toBe(manifestDigest(change.m1));
     expect(activations(harness)[0]!.evidence["workflows"]).toEqual([
-      expect.objectContaining({ path: PROJECT_WORKFLOW_PATH, evidence: "REUSED" }),
+      expect.objectContaining({ path: PROJECT_WORKFLOW_PATH, evidence: "READ", revision: change.candidateHead, observedDigest: sha256(PROJECT_WORKFLOW) }),
       expect.objectContaining({ path: WORKFLOW_PATH, evidence: "READ", revision: change.candidateHead, observedDigest: sha256(WORKFLOW) }),
     ]);
   });
@@ -986,7 +1147,7 @@ describe("with a repository: merge first, then activate", () => {
     expect(stateOf(harness, recovery.run.runId)).toBe(RunState.COMPLETED);
     expect(activeManifest(harness, change.registered.projectId)).toBe(manifestDigest(change.m1));
     expect(activations(harness)[0]!.evidence["workflows"]).toEqual([
-      expect.objectContaining({ path: PROJECT_WORKFLOW_PATH, evidence: "REUSED" }),
+      expect.objectContaining({ path: PROJECT_WORKFLOW_PATH, evidence: "READ", revision: change.candidateHead, observedDigest: sha256(PROJECT_WORKFLOW) }),
       expect.objectContaining({ path: WORKFLOW_PATH, evidence: "READ", revision: change.candidateHead, observedDigest: sha256(WORKFLOW) }),
     ]);
     expect(stateOf(harness, change.run.runId)).toBe(RunState.BLOCKED_POST_MERGE);

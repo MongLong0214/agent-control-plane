@@ -425,6 +425,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
       completion,
       attemptId: "finalize_none",
       workflows: [],
+      consumer: null,
     });
     expect(unknownRun.allowed).toBe(false);
     expect(unknownRun.reasonCode).toBe(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING);
