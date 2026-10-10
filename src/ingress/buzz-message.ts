@@ -5,6 +5,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { Db } from "../db/database.ts";
 import { SELF_CLAIM_EXECUTOR_KIND } from "../registry/canonical-self-claim.ts";
+import { carriesBuzzOwnerApprovalMarker } from "../buzz/buzz-owner-approval.ts";
 
 import type { IngressGuard, IngressRequest, TurnClaim, TurnIdentity } from "./ingress-guard.ts";
 
@@ -752,6 +753,19 @@ export class BuzzMessageIngress {
       return deny(
         ReasonCode.INVALID_ARGUMENT,
         "buzz message ingress requires an actor, conversation, event id and text",
+      );
+    }
+    // #246 — text carrying the owner-approval marker, in any spelling, is never a message, whoever
+    // presents it and whichever path it came by: an approval is judged only by the owner's own Nostr
+    // signature on the subscriber's approval route, and this envelope is attested by the relay's
+    // secret, not by that signature. Refused ahead of the guard rather than after it, with nothing
+    // written, as the peer rule refuses: no replay slot, no row holding the text, no journal. So a
+    // forged envelope carrying the marker is refused for its text, and no audit row records the forgery.
+    if (carriesBuzzOwnerApprovalMarker(input.text)) {
+      return deny(
+        ReasonCode.BUZZ_OWNER_APPROVAL_NOT_A_MESSAGE,
+        "text carrying the owner-approval marker is never delivered as a message; an approval is a signed reply to its prompt",
+        { channel: "buzz" },
       );
     }
     if (!this.#ownerActors.has(input.actor.trim())) {
