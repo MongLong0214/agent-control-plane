@@ -495,6 +495,7 @@ const workerFailover = async (
   harness: Harness,
   run: ActiveRun,
   duringAdmission: () => Promise<void> = async () => undefined,
+  duringReadiness: () => Promise<void> = async () => undefined,
 ) => {
   const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskIds[0]! });
   const plan = await harness.cp.continuity.evaluate("worker replacement planned while the turn ran");
@@ -508,7 +509,12 @@ const workerFailover = async (
   });
   harness.cp.continuity.attach({
     buzz: { connect: async () => allow(ReasonCode.OK, "test-route") },
-    readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+    readiness: {
+      checkSession: async () => {
+        await duringReadiness();
+        return allow(ReasonCode.OK, undefined);
+      },
+    },
   });
   try {
     return await harness.cp.continuity.failover(
@@ -539,7 +545,7 @@ const runningWorker = async (harness: Harness) => {
   if (!execution.allowed) throw new Error(execution.message);
   const claude = new ClaudeWorkerDouble(harness.clock);
   harness.cp.providers.registerForRole(claude, Role.WORKER);
-  return { run, workerSessionId, roleKey: roleKeyFor(Role.WORKER, { taskId: run.taskIds[0]! }) };
+  return { run, workerSessionId, claude, roleKey: roleKeyFor(Role.WORKER, { taskId: run.taskIds[0]! }) };
 };
 
 const claudeSessions = (harness: Harness) =>
@@ -564,6 +570,47 @@ describe("review round 1: a terminal run's WORKER never comes back ACTIVE (wr-r1
     expect(harness.cp.bindings.active(roleKey)).toBeNull();
     expect(harness.cp.bindings.history(roleKey).map((binding) => binding.status)).toEqual(["REVOKED"]);
     expect(claudeSessions(harness).filter((session) => session.lifecycle !== SessionLifecycle.STOPPED)).toEqual([]);
+  });
+
+  it("cancel during provisioning: the session the failover started is stopped once through its provider, then STOPPED", async () => {
+    const harness = gatedHarness();
+    const { run, roleKey, claude } = await runningWorker(harness);
+    const result = await workerFailover(harness, run, async () => undefined, async () => {
+      expect(harness.cp.runs.cancel(run.runId, "cancelled while the replacement was provisioned").allowed).toBe(true);
+    });
+    await harness.cp.workerRetirement.settled();
+
+    expect(result.reasonCode).toBe(ReasonCode.RUN_ALREADY_TERMINAL);
+    expect(harness.cp.bindings.active(roleKey)).toBeNull();
+    const started = claudeSessions(harness);
+    expect(started).toHaveLength(1);
+    const replacement = harness.cp.sessions.get(started[0]!.session_id)!;
+    expect(claude.stopped).toEqual([replacement.incarnation.split("#")[0]]);
+    expect(replacement.lifecycle).toBe(SessionLifecycle.STOPPED);
+  });
+
+  it("cancel during provisioning, provider stop fails: the session is not marked STOPPED and is recorded as remaining", async () => {
+    const harness = gatedHarness();
+    const { run, roleKey, claude } = await runningWorker(harness);
+    const stop = vi.spyOn(claude, "stopSession").mockRejectedValue(new Error("provider would not stop the session"));
+    try {
+      const result = await workerFailover(harness, run, async () => undefined, async () => {
+        expect(harness.cp.runs.cancel(run.runId, "cancelled while the replacement was provisioned").allowed).toBe(true);
+      });
+      await harness.cp.workerRetirement.settled();
+
+      expect(result.reasonCode).toBe(ReasonCode.RUN_ALREADY_TERMINAL);
+      expect(harness.cp.bindings.active(roleKey)).toBeNull();
+      const started = claudeSessions(harness);
+      expect(started).toHaveLength(1);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(started[0]!.lifecycle).not.toBe(SessionLifecycle.STOPPED);
+      expect(harness.cp.audit.byKind("CONTINUITY_UNBOUND_SESSION_STOP_FAILED")
+        .filter((entry) => entry.sessionId === started[0]!.session_id)
+        .map((entry) => entry.evidence)).toEqual([expect.objectContaining({ status: "PROCESS_UNVERIFIED" })]);
+    } finally {
+      stop.mockRestore();
+    }
   });
 
   it("failover first: the WORKER it binds is retired by the cancel that follows", async () => {

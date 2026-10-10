@@ -625,10 +625,11 @@ export class ContinuityKernel {
     }
     const provisioned = await this.provisionRoutableSession(role, assignment.provider, `continuity:${role}`);
     if (!provisioned.allowed) return provisioned as Decision<{ provider: string; generation: number }>;
-    // #512 — nor one whose run ended while its session was provisioned; that session is never bound.
+    // #512 — nor one whose run ended while its session was provisioned; that session is never bound,
+    // and is stopped through its provider.
     const endedAfterSpawn = this.#workerRunEnded(role, scope);
     if (endedAfterSpawn) {
-      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "the worker's run ended");
+      await this.#stopUnboundWorkerSession(provisioned.value.sessionId, role, "the worker's run ended");
       return endedAfterSpawn;
     }
 
@@ -704,6 +705,43 @@ export class ContinuityKernel {
       runId: run.run_id,
       state: run.state,
     });
+  }
+
+  /**
+   * #512 — stops the one session this failover attempt provisioned for a WORKER and will not bind,
+   * through the adapter that constituted it, with the handle its row records. STOPPED is recorded
+   * only once the provider's stop has returned. A stop that throws leaves the session ERROR and is
+   * recorded as remaining, its process unverified. A session that holds any role is not touched.
+   */
+  async #stopUnboundWorkerSession(sessionId: string, role: Role, reason: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.lifecycle === SessionLifecycle.STOPPED) return;
+    if (this.bindings.bySession(sessionId).some((binding) => binding.status === "ACTIVE")) return;
+    try {
+      await this.providers.requireForRole(session.provider, role).stopSession({
+        externalSessionId: session.incarnation.split("#")[0] ?? session.sessionId,
+        provider: session.provider,
+        model: session.model,
+        effort: session.effort,
+        pid: session.osPid,
+        ...(session.workdir ? { workdir: session.workdir } : {}),
+      });
+    } catch (error) {
+      this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);
+      this.audit.record({
+        kind: "CONTINUITY_UNBOUND_SESSION_STOP_FAILED",
+        reasonCode: ReasonCode.SESSION_STOP_FAILED,
+        sessionId,
+        evidence: {
+          reason,
+          role,
+          status: "PROCESS_UNVERIFIED",
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+      return;
+    }
+    this.sessions.transition(sessionId, SessionLifecycle.STOPPED, reason);
   }
 
   /**
