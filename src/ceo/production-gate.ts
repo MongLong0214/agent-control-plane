@@ -93,6 +93,16 @@ export interface Escalation {
  */
 export type BootstrapApplicationsPort = Pick<BootstrapApplications, "get" | "assertNotFrozen" | "markCompleted">;
 
+/**
+ * #246 C3, review 1076-R1-02 — the chain a WRITTEN bootstrap application completes on, verified by
+ * the Repo Factory runner: the approval anchored as its execution's identity and the stored result
+ * attributed to the attempt ledger. A WRITTEN phase and a stored result are database rows, so the
+ * decision that completes the run asks for the chain itself rather than trusting the phase.
+ */
+export interface BootstrapCompletionChainPort {
+  verifyCompletionChain(runId: string, candidateSnapshotDigest: string): Decision<void>;
+}
+
 export interface BootstrapActivationFinalizer {
   finalizeBootstrapActivationConfirm(input: {
     runId: string;
@@ -148,6 +158,7 @@ export class ProductionGate {
   #continuity: ContinuityGate | null = null;
   #ownerAuthority: OwnerAuthorityPort | null = null;
   #bootstrapApplications: BootstrapApplicationsPort | null = null;
+  #bootstrapCompletionChain: BootstrapCompletionChainPort | null = null;
   #bootstrapActivation: BootstrapActivationFinalizer | null = null;
   #sourceReadLeases: SourceReadLeasePort | null = null;
 
@@ -172,12 +183,14 @@ export class ProductionGate {
     ownerAuthority?: OwnerAuthorityPort;
     bootstrapActivation?: BootstrapActivationFinalizer;
     bootstrapApplications?: BootstrapApplicationsPort;
+    bootstrapCompletionChain?: BootstrapCompletionChainPort;
     sourceReadLeases?: SourceReadLeasePort;
   }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
     if (ports.bootstrapActivation) this.#bootstrapActivation = ports.bootstrapActivation;
     if (ports.bootstrapApplications) this.#bootstrapApplications = ports.bootstrapApplications;
+    if (ports.bootstrapCompletionChain) this.#bootstrapCompletionChain = ports.bootstrapCompletionChain;
     if (ports.sourceReadLeases) this.#sourceReadLeases = ports.sourceReadLeases;
   }
 
@@ -571,6 +584,15 @@ export class ProductionGate {
               { runId: input.runId },
             );
           }
+          // #246 C3, review 1076-R1-02 — the finalizer runs only on the verified chain, asked again
+          // inside the transaction that completes the run and its application.
+          const chain = this.#bootstrapCompletionChain;
+          const verified = chain
+            ? chain.verifyCompletionChain(input.runId, input.candidateSnapshotDigest)
+            : deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, "the bootstrap completion chain verifier is not configured", {
+                runId: input.runId,
+              });
+          if (!verified.allowed) return verified as Decision<{ state: RunState }>;
           const finalized = finalizer.finalizeBootstrapActivationConfirm({
             runId: input.runId,
             candidateSnapshotDigest: input.candidateSnapshotDigest,
@@ -702,6 +724,15 @@ export class ProductionGate {
           },
         );
       }
+      // Review 1076-R1-02 — the WRITTEN phase is a row; the chain behind it is what completes the run,
+      // the same chain the runner requires: the anchored approval and the result the ledger attributes.
+      const chain = this.#bootstrapCompletionChain;
+      const verified = chain
+        ? chain.verifyCompletionChain(input.runId, input.candidateSnapshotDigest)
+        : deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, "the bootstrap completion chain verifier is not configured", {
+            runId: input.runId,
+          });
+      if (!verified.allowed) return verified as Decision<{ isBootstrap: boolean }>;
     }
     // #246 C3 — the contract freeze: once an external write of the application may have happened,
     // the run cannot be sent back for another plan.

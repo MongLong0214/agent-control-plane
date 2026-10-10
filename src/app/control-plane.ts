@@ -792,6 +792,8 @@ export class ControlPlane {
           finalizeBootstrapActivationConfirm: (input) => this.bootstrap.finalizeBootstrapActivationConfirm(input),
         },
         bootstrapApplications: this.bootstrapApplications,
+        // #246 C3, review 1076-R1-02 — the chain the CEO decision and its finalizer complete on.
+        bootstrapCompletionChain: this.bootstrapProducer,
         sourceReadLeases: this.guard,
         continuity: {
           mode: () => this.continuity.mode(),

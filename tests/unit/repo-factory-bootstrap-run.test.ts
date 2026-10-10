@@ -207,6 +207,8 @@ const prepare = async (
   // production. A new attempt after an earlier one asks both.
   const thisProcess = { pid: process.pid, startToken: readProcessStartToken(process.pid), startedAt: new Date().toISOString() };
   runner.attachWriterLock(() => true, () => thisProcess);
+  // The CEO decision completes a bootstrap on the chain this runner verifies, as composed (#246 C3).
+  harness.cp.ceo.attach({ bootstrapCompletionChain: runner });
   // The CEO's admission, which the runner asks among its pre-write checks, needs a current
   // continuity evaluation, as the CONFIRM door has before it calls the runner.
   await harness.cp.continuity.evaluate("bootstrap confirmation");
@@ -501,7 +503,9 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
   it("a partial failure resumes on the same approval, writing only what was left", async () => {
     const prepared = await prepare("partial-resume");
     const input = { ...prepared.input, ownerApproval: ownerApproval(prepared) };
-    prepared.github.failNext = "protectBranch";
+    // GitHub fails the read that precedes the protection request, so that request is never sent
+    // (#246 C3, review 1076-R1-03: a request sent and never answered is not sent again).
+    vi.spyOn(prepared.github, "observeBranchProtection").mockRejectedValueOnce(new Error("HTTP 502 injected on observeBranchProtection"));
     const first = await prepared.runner.produceAndActivate(input);
     expect(first.allowed).toBe(false);
     expect(first.evidence["stage"]).toBe("production");
@@ -512,6 +516,36 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     const second = await prepared.runner.produceAndActivate(input);
     expect(second.evidence["stage"]).toBe("activation");
     expect(prepared.github.writes.map((write) => write.method)).toEqual(["protectBranch"]);
+  });
+
+  it("a request that failed without proof is never sent again: IN_DOUBT until GitHub shows its effect, then adopted with no write (#246 C3, review 1076-R1-03)", async () => {
+    const prepared = await prepare("pending-protection");
+    const input = { ...prepared.input, ownerApproval: ownerApproval(prepared) };
+    const protect = prepared.github.protectBranch.bind(prepared.github);
+    let held: (() => Promise<void>) | null = null;
+    vi.spyOn(prepared.github, "protectBranch").mockImplementationOnce(async (target, branch, desired) => {
+      held = () => protect(target, branch, desired);
+      throw new Error("client timeout; the server still holds the request");
+    });
+    const first = await prepared.runner.produceAndActivate(input);
+    expect(first.evidence["refusal"]).toBe("REMOTE_REFUSED");
+
+    prepared.github.writes.length = 0;
+    const second = await prepared.runner.produceAndActivate(input);
+    expect(second).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+      evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST", unsettled: [expect.objectContaining({ resourceType: "branch-protection" })] },
+    });
+    expect(prepared.github.writes).toEqual([]);
+
+    // The held request lands: GitHub shows the approved protection, and the resume adopts it.
+    if (held === null) throw new Error("the protection request never reached the server");
+    await (held as () => Promise<void>)();
+    prepared.github.writes.length = 0;
+    const third = await prepared.runner.produceAndActivate(input);
+    expect(third.evidence["stage"]).toBe("activation");
+    expect(prepared.github.writes).toEqual([]);
   });
 
   it("the control plane composes the runner with the production port, and an unconfigured work root refuses before it", async () => {
@@ -613,6 +647,7 @@ describe("PR #1043 review witnesses — the run path", () => {
     const prepared = await prepare("rf1043-02-result", {
       artifacts: (real) => ({
         latest: (...args: Parameters<ArtifactsPort["latest"]>) => real.latest(...args),
+        list: (...args: Parameters<ArtifactsPort["list"]>) => real.list(...args),
         put: (...args: Parameters<ArtifactsPort["put"]>) => {
           if (args[1] === "REPO_FACTORY_RESULT" && failOnce) {
             failOnce = false;

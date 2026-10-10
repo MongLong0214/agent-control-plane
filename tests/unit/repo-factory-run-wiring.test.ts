@@ -789,10 +789,12 @@ describe("PR #1050 review witnesses", () => {
       consumeApproval: (receipt) => upgraded.consumeApproval(receipt, null),
       assertConsumable: (receipt) => upgraded.assertConsumable(receipt, null),
     };
-    wired.github.failNext = "pushBranch";
+    // GitHub fails the read before the push, so the push is never sent: a request sent and never
+    // answered would not be sent again (#246 C3, review 1076-R1-03).
+    vi.spyOn(wired.github, "observeBranch").mockRejectedValueOnce(new Error("HTTP 502 injected on observeBranch"));
     const failed = await confirm(wired, "rf1050-04-earlier-head");
     expect((failed["evidence"] as Record<string, unknown>)["stage"]).toBe("production");
-    expect(wired.github.writes.map((write) => write.method)).toEqual(["createRepository", "pushBranch"]);
+    expect(wired.github.writes.map((write) => write.method)).toEqual(["createRepository"]);
     expect(consumedApprovals(wired)).toBe(1);
     deps.ownerAuthority = upgraded;
 

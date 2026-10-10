@@ -620,7 +620,8 @@ describe("#246 C3 W5: an attempt freezes the plan", () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w5-frozen"));
       await approveWrites(f, run);
-      f.github.failNext = "pushBranch";
+      // The read before the push fails, so the push is never sent and nothing is left in doubt.
+      vi.spyOn(f.github, "observeBranch").mockRejectedValueOnce(new Error("HTTP 502 injected on observeBranch"));
       const attempted = await confirm(f, run);
       expect(attempted).toMatchObject({ ok: false, evidence: { stage: "production" } });
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
@@ -1004,10 +1005,13 @@ describe("#246 C3 decision (d): the WRITTEN chain is verified at the execution b
       forgeApplication(f, run, "WRITTEN", 1);
       f.harness.cp.artifacts.put(run.runId, ArtifactKind.REPO_FACTORY_RESULT, forgedResult(f, run));
       const refused = await confirm(f, run);
+      // No approval was ever anchored for this execution: refused at the approval, before its result
+      // is read (review 1076-R1-02). A real WRITTEN application with an altered result is refused as
+      // WRITTEN_RESULT_UNATTRIBUTED; that is witnessed under "R1-02" below.
       expect(refused, JSON.stringify(refused)).toMatchObject({
         ok: false,
-        reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
-        evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" },
+        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        evidence: { refusal: "APPROVAL_UNANCHORED" },
       });
       nothingExternal(f, run);
       expect(f.harness.cp.repositories.byIdentity(BOOTSTRAP_IDENTITY)).toBeNull();
@@ -1083,9 +1087,11 @@ const movesDuring = async <T>(roots: readonly string[], action: () => Promise<T>
 
 /**
  * An application attempt that dies mid-production, as a killed daemon leaves it: the first CONFIRM
- * reserves, creates the repository and commits in attempt 1's own checkout, and its push never
- * answers. `whileInFlight` runs then. The attempt is then let fail, and its checkout stays where it
- * is — the producer keeps it, as a dead process would have left it.
+ * reserves, creates the repository and commits in attempt 1's own checkout, and the read it makes
+ * before its push never answers. `whileInFlight` runs then. The attempt is then let fail, and its
+ * checkout stays where it is — the producer keeps it, as a dead process would have left it. The push
+ * was never sent, so nothing it left pending is in doubt (review 1076-R1-03: a request sent and never
+ * answered is not sent again).
  */
 const interruptedAttempt = async (
   f: Fixture,
@@ -1094,14 +1100,14 @@ const interruptedAttempt = async (
 ): Promise<{ workDir: string; first: string }> => {
   const first = attemptPath(f, run, 1);
   const hung = deferred();
-  const push = vi.spyOn(f.github, "pushBranch").mockImplementationOnce(() => hung.promise);
+  const read = vi.spyOn(f.github, "observeBranch").mockImplementationOnce(() => hung.promise as never);
   const confirming = confirm(f, run);
-  await vi.waitFor(() => expect(push).toHaveBeenCalled(), { timeout: 30_000, interval: 20 });
+  await vi.waitFor(() => expect(read).toHaveBeenCalled(), { timeout: 30_000, interval: 20 });
   await whileInFlight(first);
-  hung.reject(new Error("the daemon died while the push was in flight"));
+  hung.reject(new Error("the daemon died while its read before the push was in flight"));
   const failed = await confirming;
   expect(failed["ok"], JSON.stringify(failed)).toBe(false);
-  push.mockRestore();
+  read.mockRestore();
   expect(existsSync(join(first, MARKER))).toBe(true);
   expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
   // GitHub saw the create; the push never reached it.
@@ -1709,22 +1715,22 @@ describe("#246 C3: a resume inherits the same execution and nothing else", () =>
     });
   });
 
-  it("a new owner approval of the same scope is not admitted for the same execution, and is not consumed", async () => {
+  it("the owner approving the same scope again is not another approval: not consumed, not the identity, and the execution resumes on its own receipt", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-i-same-scope"));
       await approveWrites(f, run);
       const { first } = await interruptedAttempt(f, run);
+      const identity = f.harness.cp.bootstrapApplications.approvalIdentity(run.runId);
+      expect(identity).toBe(digestOf(recordedApproval(f, run.runId).receipt));
       const before = footprint(first);
       await approveWrites(f, run);
-      const refused = await confirm(f, run);
-      expect(refused, JSON.stringify(refused)).toMatchObject({
-        ok: false,
-        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        evidence: { stage: "approval", refusal: "APPROVAL_NOT_THIS_EXECUTION" },
-      });
+      expect(digestOf(recordedApproval(f, run.runId).receipt)).not.toBe(identity);
+      const resumed = await confirm(f, run);
+      expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
       expect(consumedApprovals(f, run.runId)).toBe(1);
-      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
-      expect(writesOf(f)).toEqual(["createRepository"]);
+      expect(f.harness.cp.bootstrapApplications.approvalIdentity(run.runId)).toBe(identity);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
       expect(footprint(first)).toEqual(before);
     });
   });
@@ -1822,6 +1828,427 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
       expect(writesOf(f)).toEqual(WRITE_METHODS);
       // Attempt 2 is recorded with this daemon as its writer.
       expect(f.harness.cp.bootstrapApplications.attemptWriters(run.runId).get(2)).toMatchObject({ pid: process.pid });
+    });
+  });
+});
+
+/** The GitHub ledger of the run's primary repository, as the producer wrote it. */
+const ledgerOf = (f: Fixture, run: ReviewedRun): { receipts: Array<Record<string, unknown>>; pending: Array<Record<string, unknown>> } =>
+  JSON.parse(readFileSync(join(f.workRoot, run.runId, "github-ledger", "primary.json"), "utf8"));
+
+/** The write receipts of the run's newest stored Repo Factory result. */
+const resultReceiptsOf = (f: Fixture, run: ReviewedRun): Array<Record<string, unknown>> =>
+  f.harness.cp.artifacts.latest<{ externalWriteReceipts: Array<Record<string, unknown>> }>(run.runId, ArtifactKind.REPO_FACTORY_RESULT)!
+    .content.externalWriteReceipts;
+
+/** The active CEO replaced by another session, as an operator's switch does. */
+const replaceCeo = (f: Fixture): void => {
+  const replacement = f.harness.cp.sessions.create({ provider: "scripted", model: "replacement-ceo" });
+  f.harness.cp.sessions.transition(replacement.sessionId, SessionLifecycle.READY, "replacement");
+  const bound = f.harness.cp.bindings.switchTo({
+    role: Role.CEO,
+    sessionId: replacement.sessionId,
+    reason: "the CEO changed while the CONFIRM was in flight",
+    conversation: "REPLACED",
+  });
+  expect(bound.allowed, JSON.stringify(bound)).toBe(true);
+};
+
+/**
+ * Review 1076-R1-01 — a legitimate resume after time has advanced. A resume observes each completed
+ * write again and its receipt carries that later time, while the ledger keeps the first observation;
+ * the receipts are compared on everything else, so the time alone does not make the result foreign.
+ */
+describe("#246 C3 review 1076-R1-01: a resume after time advances completes, and only observation time may differ", () => {
+  it("a partial recovery: attempt 1 created the repository, the clock moves on, attempt 2 writes the rest, and the next CONFIRM completes", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-01-partial"));
+      await approveWrites(f, run);
+      await interruptedAttempt(f, run);
+      f.harness.clock.advance(1000);
+      const second = await confirm(f, run);
+      expect(second, JSON.stringify(second)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+      await acknowledgeHandoff(f, run, second);
+      // The repository receipt attempt 2 resumed was observed again: its time is not the ledger's.
+      const ledger = ledgerOf(f, run);
+      const resumed = resultReceiptsOf(f, run).find((receipt) => receipt["resourceType"] === "repository")!;
+      const recorded = ledger.receipts.find((receipt) => receipt["resourceType"] === "repository")!;
+      expect(resumed["rereadAt"]).not.toBe(recorded["rereadAt"]);
+      const third = await confirm(f, run);
+      expect(third, JSON.stringify(third)).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+    });
+  });
+
+  it("a fully receipted recovery: every write landed, the clock moves on, and the repository, branch, setting and protection resumes complete", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-01-full"));
+      await approveWrites(f, run);
+      const written = vi.spyOn(f.harness.cp.bootstrapApplications, "markWritten").mockImplementationOnce(() => {
+        throw new Error("the daemon died before WRITTEN was stored");
+      });
+      expect((await confirm(f, run))["ok"]).toBe(false);
+      written.mockRestore();
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+      f.harness.clock.advance(1000);
+      const second = await confirm(f, run);
+      expect(second, JSON.stringify(second)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      await acknowledgeHandoff(f, run, second);
+      // Every one of the four resumed receipts was observed again.
+      const ledger = ledgerOf(f, run);
+      const recordedAt = new Map(ledger.receipts.map((receipt) => [receipt["operationId"], receipt["rereadAt"]]));
+      const results = resultReceiptsOf(f, run);
+      expect(results.map((receipt) => receipt["resourceType"]).sort()).toEqual(["branch", "branch-protection", "repository", "setting"]);
+      for (const receipt of results) expect(receipt["rereadAt"]).not.toBe(recordedAt.get(receipt["operationId"]));
+      const third = await confirm(f, run);
+      expect(third, JSON.stringify(third)).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+    });
+  });
+
+  it("the tamper control: a receipt naming another target, operation, result or time is refused at the runner and at the CEO decision, and one differing only in its observation time completes", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-01-tamper"));
+      await approveWrites(f, run);
+      await interruptedAttempt(f, run);
+      f.harness.clock.advance(1000);
+      const second = await confirm(f, run);
+      await acknowledgeHandoff(f, run, second);
+      const original = structuredClone(f.harness.cp.artifacts.latest<Record<string, unknown>>(run.runId, ArtifactKind.REPO_FACTORY_RESULT)!.content);
+      const tampers: Array<[string, unknown]> = [
+        ["resourceIdentity", "github:acme/another"],
+        ["operationId", "op-another"],
+        ["afterStateDigest", digestOf({ another: "result" })],
+        ["createdAt", "2020-01-01T00:00:00.000Z"],
+      ];
+      for (const [field, value] of tampers) {
+        const tampered = structuredClone(original);
+        (tampered["externalWriteReceipts"] as Array<Record<string, unknown>>)[0]![field] = value;
+        f.harness.cp.artifacts.put(run.runId, ArtifactKind.REPO_FACTORY_RESULT, tampered);
+        const runner = await confirm(f, run);
+        expect(runner, `${field}: ${JSON.stringify(runner)}`).toMatchObject({ ok: false });
+        expect(f.harness.cp.ceo.submitCeoDecision({
+          runId: run.runId,
+          decision: "CONFIRM",
+          candidateSnapshotDigest: run.candidate,
+          ceoSessionId: f.ceoSessionId,
+          rationale: `a receipt with another ${field}`,
+        }).allowed, field).toBe(false);
+        expect(f.harness.cp.runs.require(run.runId).state, field).toBe(RunState.READY_FOR_CEO_REVIEW);
+        expect(applicationOf(f, run.runId), field).toMatchObject({ phase: "WRITTEN" });
+      }
+      // The control: the result differing from its ledger only in when a receipt was last observed is
+      // the attempt's own, and completes.
+      const observedLater = structuredClone(original);
+      (observedLater["externalWriteReceipts"] as Array<Record<string, unknown>>)[0]!["rereadAt"] = "2099-01-01T00:00:00.000Z";
+      f.harness.cp.artifacts.put(run.runId, ArtifactKind.REPO_FACTORY_RESULT, observedLater);
+      const completed = await confirm(f, run);
+      expect(completed, JSON.stringify(completed)).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+    });
+  });
+});
+
+/**
+ * Review 1076-R1-02 — the OWNER_APPROVAL_CONSUMED row is an ordinary audit row, and a WRITTEN phase an
+ * ordinary column: neither is the authority for an execution or a completion. The approval anchor the
+ * runner writes when it consumes a receipt from live ingress is, and every completion entry asks for
+ * the same chain.
+ */
+describe("#246 C3 review 1076-R1-02: a database row stands in for neither the approval nor the chain", () => {
+  it("a forged consumption row, identity row, RESERVED row and approval record authorise nothing: zero writes, still RESERVED", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-consumption"));
+      const approvalDigest = forgeApplication(f, run, "RESERVED", 0);
+      forgeApprovalRecord(f, run, approvalDigest);
+      const receipt = recordedApproval(f, run.runId).receipt;
+      f.harness.cp.db.run(
+        `INSERT INTO audit_events (at, kind, reason_code, run_id, actor, evidence_json) VALUES (?, 'OWNER_APPROVAL_CONSUMED', NULL, ?, ?, ?)`,
+        [f.harness.clock.nowIso(), run.runId, `cli:${TEST_OWNER.actor}`, JSON.stringify({ receiptDigest: digestOf(receipt), candidateSnapshotDigest: run.candidate })],
+      );
+      f.harness.cp.db.run(
+        `INSERT INTO audit_events (at, kind, reason_code, run_id, actor, evidence_json) VALUES (?, 'BOOTSTRAP_APPLICATION_APPROVAL', NULL, ?, NULL, ?)`,
+        [f.harness.clock.nowIso(), run.runId, JSON.stringify({ approvalReceiptDigest: digestOf(receipt) })],
+      );
+      expect(f.harness.cp.ownerAuthority.assertApproval(receipt as never).allowed).toBe(false);
+      expect(f.harness.cp.ownerAuthority.assertConsumedApproval(receipt as never, run.candidate).allowed).toBe(true);
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { stage: "approval", refusal: "NEW_OWNER_APPROVAL_REQUIRED" } });
+      expect(writesOf(f)).toEqual([]);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 0 });
+      expect(f.harness.cp.bindings.activePrimaryCto(run.manifest.projectId)).toBeNull();
+    });
+  });
+
+  it("a forged WRITTEN phase beside a genuine activation completes nothing at the CEO decision", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-direct"));
+      const result = forgedResult(f, run);
+      const activated = await f.harness.cp.bootstrap.activate({
+        runId: run.runId,
+        candidateSnapshotDigest: run.candidate,
+        factoryResult: result as never,
+        approvedManifest: run.manifest,
+        localBindings: (result["repositories"] as Array<{ identity: string; role: string; proposedCheckoutPath: string }>).map((repository) => ({
+          identity: repository.identity,
+          repositoryRole: repository.role,
+          checkoutPath: repository.proposedCheckoutPath,
+        })),
+        projectName: "fixture",
+        handoff: bootstrapActivationHandoff(run.manifest),
+      });
+      expect(activated.allowed).toBe(false);
+      await acknowledgeHandoff(f, run, activated as unknown as Record<string, unknown>);
+      forgeApplication(f, run, "WRITTEN", 1);
+      await f.harness.cp.continuity.evaluate("completion boundary");
+      const answer = f.harness.cp.ceo.submitCeoDecision({
+        runId: run.runId,
+        decision: "CONFIRM",
+        candidateSnapshotDigest: run.candidate,
+        ceoSessionId: f.ceoSessionId,
+        rationale: "a WRITTEN phase is no chain",
+      });
+      expect(answer, JSON.stringify(answer)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_UNANCHORED" } });
+      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN" });
+    });
+  });
+
+  it("a stored result altered before its first activation is refused by the runner before anything is provisioned", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-before-activation"));
+      await approveWrites(f, run);
+      // The primary CTO's provider is down: WRITTEN, and nothing activated yet.
+      f.harness.scripted.setNextSessionHealth("UNAVAILABLE");
+      const first = await confirm(f, run);
+      expect(first, JSON.stringify(first)).toMatchObject({ ok: false, evidence: { stage: "activation" } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
+      expect(f.harness.cp.bindings.activePrimaryCto(run.manifest.projectId)).toBeNull();
+      const factory = structuredClone(f.harness.cp.artifacts.latest<Record<string, unknown>>(run.runId, ArtifactKind.REPO_FACTORY_RESULT)!.content);
+      (factory["externalWriteReceipts"] as Array<Record<string, unknown>>)[0]!["afterStateDigest"] = digestOf({ forged: "before activation" });
+      f.harness.cp.artifacts.put(run.runId, ArtifactKind.REPO_FACTORY_RESULT, factory);
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" } });
+      expect(f.harness.cp.bindings.activePrimaryCto(run.manifest.projectId)).toBeNull();
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+    });
+  });
+
+  it("a database-only alteration of a stored receipt is refused by the runner and by the CEO decision alike", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-attribution"));
+      await approveWrites(f, run);
+      const activation = await confirm(f, run);
+      await acknowledgeHandoff(f, run, activation);
+      const factory = structuredClone(f.harness.cp.artifacts.latest<Record<string, unknown>>(run.runId, ArtifactKind.REPO_FACTORY_RESULT)!.content);
+      (factory["externalWriteReceipts"] as Array<Record<string, unknown>>)[0]!["afterStateDigest"] = digestOf({ forged: "attribution" });
+      f.harness.cp.artifacts.put(run.runId, ArtifactKind.REPO_FACTORY_RESULT, factory);
+      const runner = await confirm(f, run);
+      expect(runner, JSON.stringify(runner)).toMatchObject({ ok: false, evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" } });
+      const answer = f.harness.cp.ceo.submitCeoDecision({
+        runId: run.runId,
+        decision: "CONFIRM",
+        candidateSnapshotDigest: run.candidate,
+        ceoSessionId: f.ceoSessionId,
+        rationale: "the same altered receipt at the other door",
+      });
+      expect(answer, JSON.stringify(answer)).toMatchObject({ allowed: false, evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" } });
+      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+    });
+  });
+});
+
+/**
+ * Review 1076-R1-03 — a request a client gave up on may still land. Until GitHub shows it settled, a
+ * new attempt sends nothing; when it lands, the resume adopts it.
+ */
+describe("#246 C3 review 1076-R1-03: a pending request is never sent twice", () => {
+  it("a protection request the server still holds: the next CONFIRM is IN_DOUBT with no request; once it lands, the resume adopts it — one request, one effect", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-03-protection"));
+      await approveWrites(f, run);
+      const protect = f.github.protectBranch.bind(f.github);
+      let late: (() => Promise<void>) | undefined;
+      let sent = 0;
+      let effects = 0;
+      vi.spyOn(f.github, "protectBranch").mockImplementation(async (target, branch, desired) => {
+        sent += 1;
+        if (sent === 1) {
+          late = async () => {
+            await protect(target, branch, desired);
+            effects += 1;
+          };
+          throw new Error("client timeout; the server still holds this pending request");
+        }
+        await protect(target, branch, desired);
+        effects += 1;
+      });
+      const first = await confirm(f, run);
+      expect(first["ok"]).toBe(false);
+      expect(ledgerOf(f, run).pending).toHaveLength(1);
+      const second = await confirm(f, run);
+      expect(second, JSON.stringify(second)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+        evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST", unsettled: [expect.objectContaining({ resourceType: "branch-protection" })] },
+      });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+      if (!late) throw new Error("the first request never reached the server");
+      await late();
+      const third = await confirm(f, run);
+      expect(third, JSON.stringify(third)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+      expect(sent, "no second protection request before the first is shown settled").toBe(1);
+      expect(effects, "no duplicate protection").toBe(1);
+    });
+  });
+});
+
+describe("#246 C3 review 1076-R1-03: the guarded port is the backstop", () => {
+  it("a protection request the server still holds while another protection is applied meanwhile: nothing is sent, and the application stays in doubt", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-03-guard"));
+      await approveWrites(f, run);
+      const protect = f.github.protectBranch.bind(f.github);
+      let held: Parameters<FakeGitHub["protectBranch"]> | undefined;
+      let sent = 0;
+      vi.spyOn(f.github, "protectBranch").mockImplementation(async (...args: Parameters<FakeGitHub["protectBranch"]>) => {
+        sent += 1;
+        if (sent === 1) {
+          held = args;
+          throw new Error("client timeout; the server still holds this pending request");
+        }
+        await protect(...args);
+      });
+      expect((await confirm(f, run))["ok"]).toBe(false);
+      if (held === undefined) throw new Error("the first request never reached the server");
+      // Someone applies a protection that is not the approved one; the held request has not landed.
+      const [target, branch, desired] = held;
+      const approved = desired as Record<string, unknown>;
+      await protect(target, branch, { ...approved, enforceAdmins: !approved["enforceAdmins"] });
+      const second = await confirm(f, run);
+      expect(second, JSON.stringify(second)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+        evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST", resourceType: "branch-protection" },
+      });
+      expect(sent, "the held request is not sent again").toBe(1);
+    });
+  });
+});
+
+/**
+ * The owner's decision recorded again while an execution runs: the same decision is idempotent and
+ * the run is not stuck; a decline still stops it before its next write.
+ */
+describe("#246 C3: an approval recorded twice does not strand the execution", () => {
+  it("the same approval recorded again while the attempt is in flight: the attempt goes on, and the next CONFIRM completes, with one consumption", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-double-approve"));
+      await approveWrites(f, run);
+      const observe = f.github.observeBranch.bind(f.github);
+      vi.spyOn(f.github, "observeBranch").mockImplementationOnce(async (...args) => {
+        await approveWrites(f, run);
+        return observe(...args);
+      });
+      const written = await confirm(f, run);
+      expect(written, JSON.stringify(written)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
+      await acknowledgeHandoff(f, run, written);
+      const completed = await confirm(f, run);
+      expect(completed, JSON.stringify(completed)).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
+      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+    });
+  });
+
+  it("a decline recorded while the attempt is in flight still stops it before its next write; what was written is settled", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-decline-in-flight"));
+      await approveWrites(f, run);
+      const observe = f.github.observeBranch.bind(f.github);
+      vi.spyOn(f.github, "observeBranch").mockImplementationOnce(async (...args) => {
+        await approveWrites(f, run, { decline: true });
+        return observe(...args);
+      });
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { stage: "production", refusal: "APPROVAL_SUPERSEDED" } });
+      expect(writesOf(f)).toEqual(["createRepository"]);
+      expect(ledgerOf(f, run).pending).toEqual([]);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+    });
+  });
+});
+
+/**
+ * Review 1076-R1-04 — the CEO admission and the approval are asked again where they are relied on
+ * after an await: inside the transaction that consumes the approval or records an attempt, and before
+ * every external write.
+ */
+describe("#246 C3 review 1076-R1-04: authority is admitted again after every await", () => {
+  it("the CEO replaced while GitHub is read before the first reservation: nothing consumed, reserved or written", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-04-first"));
+      await approveWrites(f, run);
+      const observe = f.github.observeRepository.bind(f.github);
+      let swapped = false;
+      vi.spyOn(f.github, "observeRepository").mockImplementation(async (target) => {
+        if (!swapped) {
+          swapped = true;
+          replaceCeo(f);
+        }
+        return observe(target);
+      });
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { refusal: "CEO_ADMISSION_LOST" } });
+      expect(writesOf(f)).toEqual([]);
+      expect(consumedApprovals(f, run.runId)).toBe(0);
+      expect(applicationOf(f, run.runId)).toBeNull();
+    });
+  });
+
+  it("the CEO replaced while GitHub is read before a RESERVED retry: no attempt recorded, nothing consumed or written", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-04-retry"));
+      await approveWrites(f, run);
+      await interruptedAttempt(f, run);
+      const observe = f.github.observeRepository.bind(f.github);
+      let swapped = false;
+      vi.spyOn(f.github, "observeRepository").mockImplementation(async (target) => {
+        if (!swapped) {
+          swapped = true;
+          replaceCeo(f);
+        }
+        return observe(target);
+      });
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { refusal: "CEO_ADMISSION_LOST" } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(writesOf(f)).toEqual(["createRepository"]);
+    });
+  });
+
+  it("the CEO replaced between two writes: the write made is recorded, and nothing further is sent", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-04-between"));
+      await approveWrites(f, run);
+      const push = f.github.pushBranch.bind(f.github);
+      vi.spyOn(f.github, "pushBranch").mockImplementationOnce(async (...args) => {
+        replaceCeo(f);
+        await push(...args);
+      });
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { stage: "production", refusal: "CEO_ADMISSION_LOST" } });
+      expect(writesOf(f)).toEqual(["createRepository", "pushBranch"]);
+      // The push that happened is settled in the ledger; nothing is left pending.
+      const ledger = ledgerOf(f, run);
+      expect(ledger.receipts.map((receipt) => receipt["resourceType"]).sort()).toEqual(["branch", "repository"]);
+      expect(ledger.pending).toEqual([]);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+      expect(f.harness.cp.bindings.activePrimaryCto(run.manifest.projectId)).toBeNull();
     });
   });
 });
