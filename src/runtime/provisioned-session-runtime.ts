@@ -395,6 +395,16 @@ export class ProvisionedSessionRuntime {
   }
 
   /**
+   * #246 C4-R2 — gives up custody of exactly one credential: the session's, at this incarnation and
+   * credential epoch. The held credential and its attestation are dropped only when they are for
+   * that very epoch; a newer one adopted since, its attestation and the session's lane are kept.
+   */
+  relinquish(sessionId: string, incarnation: string, credentialEpoch: number): void {
+    if (this.#held.get(sessionId)?.credentialEpoch === credentialEpoch) this.#held.delete(sessionId);
+    this.#withdrawAttestation(sessionId, { incarnation, credentialEpoch });
+  }
+
+  /**
    * Proves the session's runtime is reachable and holds its current credential: one turn of its
    * own conversation whose relay presents a fresh challenge over an authenticated connection.
    */

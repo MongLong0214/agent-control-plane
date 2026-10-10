@@ -1865,7 +1865,8 @@ export class CtoLifecycle {
     if (!adopted.allowed) return adopted as Decision<RoleBinding>;
     const attested = await ports.runtime.attest(session.sessionId, "resume");
     if (!attested.allowed) {
-      ports.runtime.release(session.sessionId);
+      // Only this recovery's own credential is given up: one adopted for a later epoch stays held.
+      ports.runtime.relinquish(session.sessionId, session.incarnation, rotated.value);
       return notProvenReady(session.sessionId, attested) as Decision<RoleBinding>;
     }
     this.audit.record({
@@ -1977,7 +1978,7 @@ export interface DrivenPrimaryRecoveryPorts {
       role?: Role;
     }): Promise<Decision<void>>;
   };
-  readonly runtime: Pick<ProvisionedSessionRuntime, "probe" | "holds" | "adopt" | "attest" | "release">;
+  readonly runtime: Pick<ProvisionedSessionRuntime, "probe" | "holds" | "adopt" | "attest" | "relinquish">;
 }
 
 /** #246 C4 — the refusal for a session whose driven-spawn record does not add up: fail closed. */
