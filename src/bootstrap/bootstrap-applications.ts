@@ -34,24 +34,32 @@ import type { Db } from "../db/database.ts";
  * operations it is about to execute, and checks the target and visibility against the plan; the
  * reserved digest is only compared with that, so a CONFIRM of another scope is refused.
  *
- * The freeze (CEO decision (b)). It starts at the reservation: from the transaction that inserts
- * the row, the run's plan cannot be replaced by `plan_submit` or by a FINAL_REVISE that would send
- * it back for one (BOOTSTRAP_APPLICATION_FROZEN), and a CONFIRM may only re-apply the reserved
- * candidate under the reserved write scope. A scope change never reuses the approval the
- * reservation consumed: an approval of another scope is refused, not substituted. What releases it:
- * - Failure (a refused, timed-out or crashed attempt): nothing. The application stays RESERVED and
- *   frozen, and the next CEO CONFIRM of the same candidate under the same scope resumes it from the
- *   attempt ledger. A checkout the interrupted attempt left behind is first preserved by the repair
+ * The freeze (CEO decision (b), as corrected 2026-10-10). It starts at the reservation: from the
+ * transaction that inserts the row, the run's plan cannot be replaced by `plan_submit` or by a
+ * FINAL_REVISE that would send it back for one (BOOTSTRAP_APPLICATION_FROZEN), and a CONFIRM may only
+ * re-apply the reserved candidate under the reserved write scope; the scope that approval and its
+ * attempts carry never changes. A scope change never reuses the approval the reservation consumed:
+ * an approval of another scope is refused, not substituted. On failure, cancel and recovery:
+ * - Failure (a refused, timed-out or crashed attempt): the application stays RESERVED and frozen,
+ *   and the next CEO CONFIRM of the same candidate under the same scope resumes it from the attempt
+ *   ledger. A checkout the interrupted attempt left behind is first preserved by the repair
  *   `preserve_interrupted_bootstrap_checkout` (moved aside, never deleted); that repair authorises
  *   nothing, so the resuming CONFIRM is a new one and passes every check again.
- * - Cancel: nothing. A cancelled run cannot be confirmed again, and its application, with its
- *   project id and repository identity, stays reserved; the project is bootstrapped again under a
- *   new project id and repository identity.
- * - Recovery: nothing. A recovery is the same CONFIRM again, never a new plan or a new scope.
+ * - Recovery: the same CONFIRM again, never a new plan or a new scope.
+ * - Cancel: the run is cancelled first, and then the repair `release_bootstrap_reservation` releases
+ *   its reservation, only when no attempt is in flight, this process is the only control-plane
+ *   writer, the attempt ledger records no write that landed, and GitHub, read at the release, holds
+ *   no repository at the target. The row becomes RELEASED and keeps everything it recorded, with the
+ *   release record beside it; it no longer holds the project id or repository identity, so a new
+ *   run may reserve them under its own new approval. The old approval cannot serve that run: it
+ *   names the cancelled run, which can never be confirmed again. When the external effect cannot be
+ *   told — a write sent and unanswered beside a repository at the target, a ledger that cannot be
+ *   read, or a GitHub read that fails — nothing is released, and the reservation is kept RESERVED
+ *   with RELEASE_IN_DOUBT as its last refusal.
  * - STRANDED and COMPLETED are terminal: the reservation is never released or reused.
  */
 
-export type BootstrapApplicationPhase = "RESERVED" | "WRITTEN" | "COMPLETED" | "STRANDED";
+export type BootstrapApplicationPhase = "RESERVED" | "WRITTEN" | "COMPLETED" | "STRANDED" | "RELEASED";
 
 /** What a reservation names, fixed for the life of the row. */
 export interface BootstrapApplicationReservation {
@@ -142,8 +150,9 @@ export const bootstrapApplicationOf = (db: Pick<Db, "get">, runId: string): Boot
 };
 
 /**
- * Every reservation that holds this project id or this repository identity, whatever its phase: a
- * COMPLETED or STRANDED reservation is never released. The registries ask this before they register.
+ * Every reservation that holds this project id or this repository identity: every phase but
+ * RELEASED, so a COMPLETED or STRANDED reservation holds its name for good. The registries ask this
+ * before they register.
  */
 export const bootstrapReservationsHolding = (
   db: Pick<Db, "all">,
@@ -152,7 +161,7 @@ export const bootstrapReservationsHolding = (
   db
     .all<ApplicationRow>(
       `SELECT ${COLUMNS} FROM bootstrap_applications
-        WHERE project_id = ? OR repository_identity = ?
+        WHERE (project_id = ? OR repository_identity = ?) AND phase <> 'RELEASED'
         ORDER BY run_id`,
       [held.projectId ?? null, held.repositoryIdentity ?? null],
     )
@@ -289,6 +298,15 @@ export class BootstrapApplications {
       );
     }
     return this.move(runId, "WRITTEN", "COMPLETED", null, "BOOTSTRAP_APPLICATION_COMPLETED");
+  }
+
+  /**
+   * CEO decision (b) — a cancelled run's reservation released: the row and its record are kept, and
+   * only its hold on the project id and repository identity ends. The caller has shown that no
+   * external effect happened.
+   */
+  markReleased(runId: string, release: Record<string, unknown>): Decision<BootstrapApplication> {
+    return this.move(runId, "RESERVED", "RELEASED", { ...release }, "BOOTSTRAP_APPLICATION_RELEASED");
   }
 
   /** Keeps the reservation and the evidence; nothing is created, adopted or deleted afterwards. */

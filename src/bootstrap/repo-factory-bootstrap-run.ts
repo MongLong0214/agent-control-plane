@@ -30,6 +30,7 @@ import {
   bootstrapActivationHandoff,
   executablePlanOf,
   executableOperationsSchema,
+  type PlannedBootstrapOutputs,
   plannedBootstrapOutputs,
 } from "./bootstrap-plan.ts";
 import type { GitHubWritePort, ObservedRepository } from "./github-write-port.ts";
@@ -342,6 +343,48 @@ export interface InterruptedCheckoutPreservation {
   checkoutInode: number;
   /** `preservedPath` with every symlink resolved, as it was when checked: where it has to arrive. */
   preservedRealPath: string;
+}
+
+/**
+ * #246 C3, CEO decision (b) as corrected — the preconditions of releasing a cancelled run's
+ * reservation, in the order the repair catalog lists them. Each must be verified; one that cannot be
+ * is unmet, and nothing is released.
+ */
+export const RESERVATION_RELEASE_PRECONDITIONS = [
+  "the run is a cancelled PROJECT_BOOTSTRAP run, so the approval its reservation consumed, which names that run, can never be presented again; and its application is RESERVED",
+  "no application attempt of the run is in flight, and this process holds the control plane's single-writer lock",
+  "the attempt ledger records no write that landed: it is absent, or this operation's own with no receipt",
+  "GitHub, read now, holds no repository at the reserved target, so no write the attempts sent took effect",
+] as const;
+
+/** A reservation release, with the evidence that its application had no external effect. */
+export interface ReservationRelease {
+  runId: string;
+  projectId: string;
+  repositoryIdentity: string;
+  bootstrapOperationId: string;
+  attempts: number;
+  approvalDigest: string;
+  ledgerPath: string | null;
+  /** Writes the attempts sent and GitHub never answered; settled by the read of the target. */
+  unansweredWrites: string[];
+  target: string;
+  githubReadAt: string;
+}
+
+export interface ReservationReleaseInspection {
+  preconditions: CheckoutRecoveryPrecondition[];
+  /** Why the external effect cannot be told, when it cannot: the reservation is then kept, in doubt. */
+  inDoubt: Record<string, unknown> | null;
+  release: ReservationRelease | null;
+}
+
+/** What a release can check without GitHub, asked again synchronously at the release itself. */
+interface ReleaseLocalState {
+  application: BootstrapApplication;
+  ledgerPath: string | null;
+  unansweredWrites: string[];
+  target: { owner: string; name: string };
 }
 
 /**
@@ -1337,20 +1380,174 @@ export class RepoFactoryBootstrapRunner {
    * the leaf itself: a real directory of this account, under a parent chain no other account can
    * write, whose marker names the application's bootstrap operation.
    */
-  private placedCheckout(application: BootstrapApplication): Decision<PlacedCheckout> {
+  /**
+   * #246 C3, CEO decision (b) as corrected — whether a cancelled run's reservation can be released,
+   * asked without changing anything but GitHub's read of the target. Released only when no attempt
+   * is in flight here, this process is the only control-plane writer, the attempt ledger records no
+   * write that landed, and GitHub holds nothing at the target, which settles any write the attempts
+   * sent and never had answered. A ledger that cannot be read as this operation's, a GitHub read that
+   * fails, or a repository at the target makes the effect unclear: `inDoubt` says why, and nothing is
+   * released.
+   */
+  async inspectReservationRelease(runId: string | null): Promise<ReservationReleaseInspection> {
+    const preconditions: CheckoutRecoveryPrecondition[] = [];
+    const local = this.releaseLocalState(runId, preconditions);
+    const unmetFromHere = (inDoubt: Record<string, unknown> | null = null): ReservationReleaseInspection => {
+      for (const precondition of RESERVATION_RELEASE_PRECONDITIONS.slice(preconditions.length)) {
+        preconditions.push({ precondition, satisfied: false, evidence: { notChecked: "an earlier precondition is unmet" } });
+      }
+      return { preconditions, inDoubt, release: null };
+    };
+    if (!local.allowed) return unmetFromHere(local.evidence["inDoubt"] === true ? { ...local.evidence } : null);
+    const { application, ledgerPath, unansweredWrites, target } = local.value;
+    const targetName = `${target.owner}/${target.name}`;
+    let observed: ObservedRepository | null;
+    try {
+      observed = await this.deps.githubPort.observeRepository(target);
+    } catch (error) {
+      const inDoubt = {
+        cause: "GITHUB_UNREAD",
+        target: targetName,
+        message: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+      };
+      preconditions.push({ precondition: RESERVATION_RELEASE_PRECONDITIONS[3], satisfied: false, evidence: inDoubt });
+      return { preconditions, inDoubt, release: null };
+    }
+    if (observed !== null) {
+      const inDoubt = { cause: "REPOSITORY_AT_TARGET", target: targetName, observedNodeId: observed.nodeId, unansweredWrites };
+      preconditions.push({ precondition: RESERVATION_RELEASE_PRECONDITIONS[3], satisfied: false, evidence: inDoubt });
+      return { preconditions, inDoubt, release: null };
+    }
+    const githubReadAt = this.deps.clock.nowIso();
+    preconditions.push({
+      precondition: RESERVATION_RELEASE_PRECONDITIONS[3],
+      satisfied: true,
+      evidence: { target: targetName, repository: null, readAt: githubReadAt },
+    });
+    return {
+      preconditions,
+      inDoubt: null,
+      release: {
+        runId: application.runId,
+        projectId: application.projectId,
+        repositoryIdentity: application.repositoryIdentity,
+        bootstrapOperationId: application.bootstrapOperationId,
+        attempts: application.attempts,
+        approvalDigest: application.approvalDigest,
+        ledgerPath,
+        unansweredWrites,
+        target: targetName,
+        githubReadAt,
+      },
+    };
+  }
+
+  /**
+   * The release itself: everything but GitHub verified again, synchronously, and refused unless it
+   * is still what the plan's inspection found (`planned`); then the row becomes RELEASED with the
+   * release record. Nothing is deleted, no approval is consumed or re-admitted, and the cancelled
+   * run can never be confirmed again.
+   */
+  releaseReservation(runId: string | null, planned: ReservationRelease | null): Decision<ReservationRelease> {
+    const refuse = (refusal: string, message: string, evidence: Evidence): Decision<ReservationRelease> =>
+      deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, message, { refusal, runId, ...evidence });
+    const preconditions: CheckoutRecoveryPrecondition[] = [];
+    const local = this.releaseLocalState(runId, preconditions);
+    if (!local.allowed || planned === null) {
+      return refuse("RELEASE_PRECONDITION_UNMET", "the reservation's release preconditions do not hold; nothing is released", {
+        preconditions,
+      });
+    }
+    const { application, ledgerPath, unansweredWrites } = local.value;
+    if (
+      planned.runId !== application.runId ||
+      planned.attempts !== application.attempts ||
+      planned.ledgerPath !== ledgerPath ||
+      digestOf(planned.unansweredWrites) !== digestOf(unansweredWrites)
+    ) {
+      return refuse("RELEASE_PLAN_CHANGED", "the reservation changed since the release was planned; nothing is released", {
+        planned,
+        attempts: application.attempts,
+        unansweredWrites,
+      });
+    }
+    const released = this.deps.applications.markReleased(application.runId, {
+      cause: "RELEASED",
+      requiredRecovery: "none: a new run reserves the project id and repository identity again under its own owner approval",
+      evidence: { ...planned, releasedAt: this.deps.clock.nowIso() },
+    });
+    if (!released.allowed) return released as Decision<ReservationRelease>;
+    return allow(ReasonCode.OK, planned);
+  }
+
+  /** CEO decision (b): a release refused because the external effect cannot be told keeps the reservation, marked so. */
+  recordReleaseInDoubt(runId: string, inDoubt: Record<string, unknown>): void {
+    this.deps.applications.recordRefusal(runId, { stage: "release", refusal: "RELEASE_IN_DOUBT", ...inDoubt });
+  }
+
+  /** Preconditions 1–3 of a release, appended to `preconditions` as they are checked. */
+  private releaseLocalState(runId: string | null, preconditions: CheckoutRecoveryPrecondition[]): Decision<ReleaseLocalState> {
+    const met = (satisfied: boolean, evidence: unknown): boolean => {
+      preconditions.push({ precondition: RESERVATION_RELEASE_PRECONDITIONS[preconditions.length]!, satisfied, evidence });
+      return satisfied;
+    };
+    const unmet = (evidence: Evidence = {}): Decision<ReleaseLocalState> =>
+      deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, "a release precondition is unmet", { runId, ...evidence });
+    const run = runId === null ? null : this.deps.runs.get(runId);
+    const application = runId === null ? null : this.deps.applications.get(runId);
+    if (
+      !met(
+        run !== null && run.kind === RunKind.PROJECT_BOOTSTRAP && run.state === RunState.CANCELLED &&
+          application !== null && application.phase === "RESERVED",
+        { runId, kind: run?.kind ?? null, state: run?.state ?? null, phase: application?.phase ?? null },
+      ) ||
+      runId === null ||
+      application === null
+    ) {
+      return unmet();
+    }
+    const attemptInFlight = this.#applying.has(runId);
+    const writerLockHeld = this.#writerLockHeld?.() === true;
+    if (!met(!attemptInFlight && writerLockHeld, { attemptInFlight, writerLockHeld })) return unmet();
+
+    // Which ledger an attempt of this application wrote, from what it reserved; if that cannot be
+    // said, the attempts' effects cannot be either.
+    const inDoubt = (cause: string, evidence: Evidence): Decision<ReleaseLocalState> => {
+      met(false, { cause, ...evidence });
+      return unmet({ inDoubt: true, cause, ...evidence });
+    };
+    const outputs = this.reservedOutputs(application, ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
+    if (!outputs.allowed) return inDoubt("RESERVED_PLAN_UNREADABLE", { plan: outputs.evidence });
+    const match = /^github:([^/]+)\/([^/]+)$/.exec(outputs.value.target.repositoryIdentity);
+    if (match === null) return inDoubt("TARGET_UNREADABLE", { repositoryIdentity: outputs.value.target.repositoryIdentity });
+    const target = { owner: match[1]!, name: match[2]! };
+    const workRoot = this.deps.workRoot;
+    if (workRoot === null || !PATH_SAFE_RUN_ID.test(runId)) return inDoubt("WORK_ROOT_UNCONFIGURED", { workRoot });
+    const ledgerPath = githubLedgerPath(join(workRoot, runId), outputs.value.target.repositoryRole);
+    const ledger = readGitHubLedger(
+      ledgerPath,
+      { bootstrapOperationId: outputs.value.bootstrapOperationId, requestDigest: outputs.value.requestDigest },
+      outputs.value.githubOperations,
+    );
+    if (!ledger.allowed) return inDoubt("LEDGER_UNREADABLE", { ledgerPath, ledger: refusalRecord(ledger, "precondition") });
+    const receipted = [...ledger.value.receipts.keys()].sort();
+    const unansweredWrites = [...ledger.value.pending.keys()].sort();
+    // A receipt is a write that landed: an external effect, not a doubt. The reservation is kept.
+    if (!met(receipted.length === 0, { ledgerPath, receipted, unansweredWrites })) {
+      return unmet({ cause: "WRITE_LANDED", receipted });
+    }
+    return allow(ReasonCode.OK, { application, ledgerPath, unansweredWrites, target });
+  }
+
+  /**
+   * The planned outputs an application reserved, derived again from the run's PLAN artifact and the
+   * manifest an owner approval of the run carried, and matched to the reservation by digest — the
+   * PLAN, the manifest and the outputs — so a record's own claims decide nothing.
+   */
+  private reservedOutputs(application: BootstrapApplication, reasonCode: ReasonCode): Decision<PlannedBootstrapOutputs> {
     const { runId } = application;
     const refuse = (refusal: string, message: string, evidence: Evidence = {}) =>
-      deny(ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED, message, { refusal, runId, ...evidence }) as Decision<PlacedCheckout>;
-    const workRoot = this.deps.workRoot;
-    if (workRoot === null) return refuse("WORK_ROOT_UNCONFIGURED", "this deployment has no Repo Factory work root");
-    if (!PATH_SAFE_RUN_ID.test(runId)) return refuse("RUN_ID_NOT_PATH_SAFE", "the run id cannot name a work directory");
-    if (!pathOccupied(workRoot)) return refuse("WORK_ROOT_ABSENT", "the Repo Factory work root does not exist", { workRoot });
-    try {
-      ensurePrivateDirectory(workRoot);
-    } catch (error) {
-      if (!isAcpError(error)) throw error;
-      return refuse("WORK_ROOT_INSECURE", error.message, error.evidence);
-    }
+      deny(reasonCode, message, { refusal, runId, ...evidence }) as Decision<PlannedBootstrapOutputs>;
     const planArtifact = this.deps.artifacts.latest<unknown>(runId, ArtifactKind.PLAN);
     if (planArtifact === null || planArtifact.digest !== application.planDigest) {
       return refuse("PLAN_NOT_RESERVED", "the run's PLAN artifact is not the one its application reserved", {
@@ -1382,6 +1579,26 @@ export class RepoFactoryBootstrapRunner {
         reserved: application.bootstrapOperationId,
       });
     }
+    return allow(ReasonCode.OK, outputs);
+  }
+
+  private placedCheckout(application: BootstrapApplication): Decision<PlacedCheckout> {
+    const { runId } = application;
+    const refuse = (refusal: string, message: string, evidence: Evidence = {}) =>
+      deny(ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED, message, { refusal, runId, ...evidence }) as Decision<PlacedCheckout>;
+    const workRoot = this.deps.workRoot;
+    if (workRoot === null) return refuse("WORK_ROOT_UNCONFIGURED", "this deployment has no Repo Factory work root");
+    if (!PATH_SAFE_RUN_ID.test(runId)) return refuse("RUN_ID_NOT_PATH_SAFE", "the run id cannot name a work directory");
+    if (!pathOccupied(workRoot)) return refuse("WORK_ROOT_ABSENT", "the Repo Factory work root does not exist", { workRoot });
+    try {
+      ensurePrivateDirectory(workRoot);
+    } catch (error) {
+      if (!isAcpError(error)) throw error;
+      return refuse("WORK_ROOT_INSECURE", error.message, error.evidence);
+    }
+    const reserved = this.reservedOutputs(application, ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED);
+    if (!reserved.allowed) return reserved as Decision<PlacedCheckout>;
+    const outputs = reserved.value;
     const workDir = join(workRoot, runId);
     const checkoutPath = repositoryCheckoutPath(workDir, outputs.target.repositoryRole);
     let leaf;

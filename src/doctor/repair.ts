@@ -21,6 +21,7 @@ import type { WorktreeAuthorization, WorktreeManager } from "../verify/worktree.
 import { canonical } from "../guard/workspace-probe.ts";
 import {
   INTERRUPTED_CHECKOUT_PRECONDITIONS,
+  RESERVATION_RELEASE_PRECONDITIONS,
   type RepoFactoryBootstrapRunner,
 } from "../bootstrap/repo-factory-bootstrap-run.ts";
 
@@ -164,6 +165,20 @@ export class RepairService {
         "the checkout is kept, unchanged, at <work dir>/preserved/<role>-attempt-<n>; INTERRUPTED_RUN_CHECKOUT no longer refuses the run, and a new CEO CONFIRM of the same frozen candidate resumes it from the GitHub ledger under a current approval of the same scope",
       undo: "move the preserved directory back to the path the receipt names; nothing in it was changed or removed",
       preconditions: [...INTERRUPTED_CHECKOUT_PRECONDITIONS],
+    },
+    // #246 C3, CEO decision (b) as corrected — a cancelled run's reservation released once its
+    // application is shown to have had no external effect, so a new run may reserve the same name
+    // under its own approval. It changes nothing outside the database and authorises nothing.
+    release_bootstrap_reservation: {
+      id: "release_bootstrap_reservation",
+      risk: "MEDIUM",
+      authorization: "HERMES",
+      description:
+        "Release a cancelled PROJECT_BOOTSTRAP run's reservation of its project id and repository identity",
+      expectedEffect:
+        "the application becomes RELEASED and keeps its record; a new run may reserve the same project id and repository identity under its own owner approval; when the external effect cannot be told nothing is released and the reservation is kept, RELEASE_IN_DOUBT",
+      undo: "none needed: nothing outside the database changed, and the released run cannot be confirmed again",
+      preconditions: [...RESERVATION_RELEASE_PRECONDITIONS],
     },
   };
 
@@ -500,6 +515,29 @@ export class RepairService {
           },
         };
       }
+      case "release_bootstrap_reservation": {
+        const recovery = this.#bootstrapRecovery;
+        const runId = request.runId ?? null;
+        if (recovery === null) {
+          return {
+            preconditions: operation.preconditions.map((precondition) =>
+              checked(precondition, false, { notChecked: "no bootstrap runner is attached to verify it" })),
+            perform: async () => ({ changes: 0, evidence: null }),
+          };
+        }
+        const inspected = await recovery.inspectReservationRelease(runId);
+        // An unclear external effect keeps the reservation, and says so on it; a dry run records nothing.
+        if (inspected.inDoubt !== null && runId !== null && !request.dryRun) recovery.recordReleaseInDoubt(runId, inspected.inDoubt);
+        return {
+          preconditions: inspected.preconditions,
+          perform: async (dryRun) => {
+            if (dryRun) return { changes: 1, evidence: inspected.release };
+            const released = recovery.releaseReservation(runId, inspected.release);
+            if (!released.allowed) return { changes: 0, evidence: released.evidence, refusal: released as Decision<never> };
+            return { changes: 1, evidence: released.value };
+          },
+        };
+      }
       default:
         throw new Error(`missing repair plan for ${operation.id}`);
     }
@@ -579,7 +617,11 @@ interface RepairPlan {
 /** #246 C3 — the bootstrap runner's interrupted-checkout recovery, as the repair catalog uses it. */
 export type BootstrapCheckoutRecoveryPort = Pick<
   RepoFactoryBootstrapRunner,
-  "inspectInterruptedCheckout" | "preserveInterruptedCheckout"
+  | "inspectInterruptedCheckout"
+  | "preserveInterruptedCheckout"
+  | "inspectReservationRelease"
+  | "releaseReservation"
+  | "recordReleaseInDoubt"
 >;
 
 const checked = (precondition: string, satisfied: boolean, evidence: unknown): RepairReceipt["preconditionsChecked"][number] => ({

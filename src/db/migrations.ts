@@ -3108,9 +3108,11 @@ const V43_BOOTSTRAP_APPLICATION_TRIGGER_NAMES: readonly string[] = [
  * in the transaction that consumes the owner's approval; an attempt recorded before every attempt's
  * first external write; the produced result stored with WRITTEN in one transaction; COMPLETED in the
  * CEO's completion transaction; or STRANDED, keeping the reservation and the evidence, when what
- * GitHub holds cannot be attributed to the run.
+ * GitHub holds cannot be attributed to the run; or RELEASED, keeping the row, when a cancelled run's
+ * application is shown to have had no external effect, so that a new run may reserve the name.
  *
- * Additive: one new table and its five guards; no existing row or object is touched, and there is no
+ * Additive: one new table, its two partial unique indexes (one unreleased reservation per project id
+ * and per repository identity) and its five guards; no existing row or object is touched, and there is no
  * backfill — a run confirmed before this has no application to record. A chain test can build a v42
  * image out of a current database, which already has the table; it is accepted only with schema.sql's
  * exact shape and no row, never repaired: a populated or reshaped table holds reservations nothing
@@ -3143,6 +3145,13 @@ const v43: SchemaMigration = {
       }
     } else {
       raw.exec(tableDdl);
+    }
+    // One unreleased reservation per project id and per repository identity (CEO decision (b)).
+    for (const [index, what] of [
+      [/CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_project_held[^;]*;/, "the bootstrap_applications project index"],
+      [/CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_identity_held[^;]*;/, "the bootstrap_applications identity index"],
+    ] as const) {
+      raw.exec(schemaObject(index, what, SCHEMA_VERSION));
     }
     raw.exec(dropsFor(V43_BOOTSTRAP_APPLICATION_TRIGGER_NAMES));
     raw.exec(triggerDdlFor(V43_BOOTSTRAP_APPLICATION_TRIGGER_NAMES, SCHEMA_VERSION));

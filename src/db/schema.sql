@@ -1336,11 +1336,15 @@ CREATE INDEX IF NOT EXISTS handoffs_project ON handoffs(project_id, status);
 --   transaction that consumes the approval; every later attempt is recorded before that attempt's
 --   first external write. WRITTEN in the transaction that stores the produced result; COMPLETED in the
 --   CEO's completion transaction; or STRANDED when what GitHub holds at the target cannot be
---   attributed to this run by the evidence it recorded.
+--   attributed to this run by the evidence it recorded. RELEASED when a cancelled run's reservation is
+--   released after its application is shown to have had no external effect (CEO decision (b)): the row
+--   and its release record are kept, and only its hold on the project id and repository identity ends.
 --   Integrity: the reservation closes the race two runs would otherwise run to one project id or
---   repository identity (UNIQUE on both); the identity and the digests it was reserved under never
---   change, so a recovery can only re-apply the candidate it froze; the phase only moves forward, and
---   a STRANDED row keeps its evidence. Never replaced, never deleted: a reservation is never reused.
+--   repository identity (one unreleased row each, by the partial unique indexes below); the identity
+--   and the digests it was reserved under never change, so a recovery can only re-apply the candidate
+--   it froze, under the scope its approval named; the phase only moves forward, and a STRANDED or
+--   RELEASED row keeps its evidence. Never replaced, never deleted: a released reservation is not
+--   reused, a new run reserves the name again under its own approval.
 --   WITHOUT ROWID, so no REPLACE through a hidden rowid deletes a row.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS bootstrap_applications (
@@ -1358,17 +1362,23 @@ CREATE TABLE IF NOT EXISTS bootstrap_applications (
   candidate_snapshot_digest TEXT NOT NULL,
   review_digest             TEXT NOT NULL,
   approval_digest           TEXT NOT NULL,
-  phase                     TEXT NOT NULL CHECK (phase IN ('RESERVED','WRITTEN','COMPLETED','STRANDED')),
+  phase                     TEXT NOT NULL CHECK (phase IN ('RESERVED','WRITTEN','COMPLETED','STRANDED','RELEASED')),
   -- Application attempts recorded, each before that attempt's first external write.
   attempts                  INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-  -- The last refusal an attempt met; on a STRANDED row, the cause and the evidence.
+  -- The last refusal an attempt met; on a STRANDED row, the cause and the evidence; on a RELEASED
+  -- row, the release record and the evidence that no external effect happened.
   last_refusal_json         TEXT,
   reserved_at               TEXT NOT NULL,
-  UNIQUE (project_id),
-  UNIQUE (repository_identity),
   CHECK (phase = 'RESERVED' OR attempts >= 1),
-  CHECK (phase <> 'STRANDED' OR last_refusal_json IS NOT NULL)
+  CHECK (phase <> 'STRANDED' OR last_refusal_json IS NOT NULL),
+  CHECK (phase <> 'RELEASED' OR last_refusal_json IS NOT NULL)
 ) WITHOUT ROWID;
+-- One unreleased reservation per project id and per repository identity: a RELEASED row keeps its
+-- record and no longer holds the name.
+CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_project_held
+  ON bootstrap_applications(project_id) WHERE phase <> 'RELEASED';
+CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_identity_held
+  ON bootstrap_applications(repository_identity) WHERE phase <> 'RELEASED';
 
 -- CP-HI-02 — #246 C3: a reservation is born RESERVED with no attempt and no refusal; every later
 -- phase is reached by an update the phase guard below admits, never written directly.
@@ -1379,13 +1389,16 @@ BEGIN
   SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_PHASE_INVALID');
 END;
 
--- CP-HI-01 — #246 C3: one reservation per run, per project id and per repository identity, ever; a
--- second is refused, not merged, and a REPLACE cannot take an existing reservation's place.
+-- CP-HI-01 — #246 C3: one reservation per run, ever, and one unreleased reservation per project id and
+-- per repository identity; a second is refused, not merged, and a REPLACE cannot take an existing
+-- reservation's place. A RELEASED row no longer holds its name, and a new run may reserve it.
 CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_replace
 BEFORE INSERT ON bootstrap_applications
 WHEN EXISTS (
   SELECT 1 FROM bootstrap_applications
-   WHERE run_id = NEW.run_id OR project_id = NEW.project_id OR repository_identity = NEW.repository_identity
+   WHERE run_id = NEW.run_id
+      OR (project_id = NEW.project_id AND phase <> 'RELEASED')
+      OR (repository_identity = NEW.repository_identity AND phase <> 'RELEASED')
 )
 BEGIN
   SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_NO_REPLACE');
@@ -1411,8 +1424,9 @@ BEGIN
 END;
 
 -- CP-HI-02 — #246 C3: the phase only moves forward. A RESERVED row records one more attempt at a
--- time, or a refusal; it becomes WRITTEN only after an attempt, or STRANDED with its evidence. A
--- WRITTEN row records a refusal or becomes COMPLETED. COMPLETED and STRANDED are terminal.
+-- time, or a refusal; it becomes WRITTEN only after an attempt, STRANDED with its evidence, or
+-- RELEASED with its release record. A WRITTEN row records a refusal or becomes COMPLETED. COMPLETED,
+-- STRANDED and RELEASED are terminal.
 CREATE TRIGGER IF NOT EXISTS bootstrap_applications_phase_forward
 BEFORE UPDATE ON bootstrap_applications
 WHEN NOT (
@@ -1420,6 +1434,8 @@ WHEN NOT (
   OR (OLD.phase IN ('RESERVED','WRITTEN') AND NEW.phase = OLD.phase AND NEW.attempts = OLD.attempts)
   OR (OLD.phase = 'RESERVED' AND NEW.phase = 'WRITTEN' AND NEW.attempts = OLD.attempts AND OLD.attempts >= 1)
   OR (OLD.phase = 'RESERVED' AND NEW.phase = 'STRANDED' AND NEW.attempts = OLD.attempts
+      AND NEW.last_refusal_json IS NOT NULL)
+  OR (OLD.phase = 'RESERVED' AND NEW.phase = 'RELEASED' AND NEW.attempts = OLD.attempts
       AND NEW.last_refusal_json IS NOT NULL)
   OR (OLD.phase = 'WRITTEN' AND NEW.phase = 'COMPLETED' AND NEW.attempts = OLD.attempts)
 )

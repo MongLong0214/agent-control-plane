@@ -277,3 +277,55 @@ describe("v43: the bootstrap application record (#246 C3)", () => {
     }
   });
 });
+
+describe("v43 as corrected by CEO decision (b): a cancelled run's reservation can be released", () => {
+  it("a RELEASED reservation keeps its row and record, is terminal, and no longer holds its project id or identity", () => {
+    const { world } = currentDatabase();
+    const db = world.db;
+    const copyRun = (runId: string): void => {
+      db.run(
+        `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest,
+                           owner_session_id, owner_binding_generation, owner_session_incarnation, owner_role_key, created_at)
+         SELECT ?, project_id, kind, execution_mode, priority, state, goal, contract_digest,
+                owner_session_id, owner_binding_generation, owner_session_incarnation, owner_role_key, created_at
+           FROM runs WHERE run_id = ?`,
+        [runId, world.runId],
+      );
+    };
+    const second = `${world.runId}_second`;
+    const third = `${world.runId}_third`;
+    try {
+      copyRun(second);
+      copyRun(third);
+      db.run(insert(), reservation(world.runId));
+      db.run(`UPDATE bootstrap_applications SET attempts = attempts + 1 WHERE run_id = ?`, [world.runId]);
+      // Held while unreleased: another run's reservation of the same name is refused.
+      expect(() => db.run(insert(), reservation(second))).toThrow(/BOOTSTRAP_APPLICATION_NO_REPLACE/);
+      // RELEASED only with its record.
+      expect(() => db.run(`UPDATE bootstrap_applications SET phase = 'RELEASED' WHERE run_id = ?`, [world.runId]))
+        .toThrow(/BOOTSTRAP_APPLICATION_PHASE_INVALID|CHECK constraint/);
+      db.run(
+        `UPDATE bootstrap_applications SET phase = 'RELEASED', last_refusal_json = '{"cause":"RELEASED"}' WHERE run_id = ?`,
+        [world.runId],
+      );
+      for (const backwards of ["RESERVED", "WRITTEN", "STRANDED", "COMPLETED"]) {
+        expect(() => db.run(`UPDATE bootstrap_applications SET phase = ? WHERE run_id = ?`, [backwards, world.runId]), backwards)
+          .toThrow(/BOOTSTRAP_APPLICATION_PHASE_INVALID/);
+      }
+      expect(() => db.run(`DELETE FROM bootstrap_applications WHERE run_id = ?`, [world.runId])).toThrow(/BOOTSTRAP_APPLICATION_IMMUTABLE/);
+      // The run id is held for good; the name is free for one new run, and then held by it.
+      for (const verb of ["INSERT", "INSERT OR REPLACE", "REPLACE"]) {
+        expect(() => db.run(insert(verb), reservation(world.runId, { project_id: "prj_other", repository_identity: "github:acme/other" })), verb)
+          .toThrow(/BOOTSTRAP_APPLICATION_NO_REPLACE/);
+      }
+      db.run(insert(), reservation(second));
+      expect(() => db.run(insert(), reservation(third))).toThrow(/BOOTSTRAP_APPLICATION_NO_REPLACE/);
+      expect(() => db.run(insert("INSERT OR REPLACE"), reservation(third))).toThrow(/BOOTSTRAP_APPLICATION_NO_REPLACE/);
+      expect(db.all<{ run_id: string; phase: string }>(
+        `SELECT run_id, phase FROM bootstrap_applications WHERE project_id = 'prj_reserved' ORDER BY phase`,
+      )).toEqual([{ run_id: world.runId, phase: "RELEASED" }, { run_id: second, phase: "RESERVED" }]);
+    } finally {
+      db.close();
+    }
+  });
+});

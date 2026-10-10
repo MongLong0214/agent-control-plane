@@ -1371,3 +1371,136 @@ describe("#246 C3 decision (c): the official recovery of an interrupted attempt'
     });
   });
 });
+
+/**
+ * The CEO cancels the run over the Hermes socket. A run at CEO review is cancelled the way the run
+ * state machine allows: the CEO hands the decision to the owner, and the run is then cancelled.
+ */
+const cancelRun = async (f: Fixture, run: ReviewedRun): Promise<void> => {
+  await f.harness.cp.continuity.evaluate("bootstrap cancellation");
+  const held = await f.hermes("ceo_decision_submit", {
+    runId: run.runId,
+    decision: "OWNER_DECISION_REQUIRED",
+    candidateSnapshotDigest: run.candidate,
+    ceoSessionId: f.ceoSessionId,
+    rationale: "the bootstrap is abandoned",
+  });
+  expect(held, JSON.stringify(held)).toMatchObject({ ok: true, value: { state: RunState.AWAITING_HUMAN } });
+  const cancelled = await f.hermes("run_cancel", { runId: run.runId, reason: "the bootstrap is abandoned" });
+  expect(cancelled, JSON.stringify(cancelled)).toMatchObject({ ok: true });
+  expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.CANCELLED);
+};
+
+/** The release, as the CEO runs it: the allowlisted repair over the Hermes socket. */
+const releaseReservation = (f: Fixture, run: ReviewedRun, dryRun = false) =>
+  f.hermes("repair_execute", {
+    operationId: "release_bootstrap_reservation",
+    parameters: {},
+    authorizedBy: "HERMES",
+    dryRun,
+    runId: run.runId,
+  });
+
+describe("#246 C3 decision (b) as corrected: a cancelled run's reservation is released only when nothing happened outside", () => {
+  it("a cancelled run whose create never landed is released, keeps its record, and a new run reserves the same name under its own approval", async () => {
+    await withFixture(async (f) => {
+      const first = await reservedRun(f, "c3-b-release");
+      const firstApproval = recordedApproval(f, first.runId);
+      await cancelRun(f, first);
+
+      const dry = await releaseReservation(f, first, true);
+      expect(dry, JSON.stringify(dry)).toMatchObject({ ok: true, value: { dryRun: true, changes: 1 } });
+      expect(applicationOf(f, first.runId)).toMatchObject({ phase: "RESERVED" });
+
+      const released = await releaseReservation(f, first);
+      expect(released, JSON.stringify(released)).toMatchObject({ ok: true, value: { changes: 1 } });
+      const record = applicationOf(f, first.runId);
+      expect(record).toMatchObject({ phase: "RELEASED", attempts: 1, projectId: "c3-b-release", repositoryIdentity: BOOTSTRAP_IDENTITY });
+      expect(record?.lastRefusal).toMatchObject({ cause: "RELEASED", evidence: { target: "acme/fixture", attempts: 1 } });
+      // The released run is never confirmed again.
+      expect((await confirm(f, first))["ok"]).toBe(false);
+
+      // A new run, the same project id and repository name, under its own new approval.
+      const second = await reviewedBootstrap(f, cleanTreeManifest("c3-b-release"), "second");
+      const reused = await applyWith(f, second, { owner: firstApproval.owner, visibility: firstApproval.visibility, receipt: firstApproval.receipt });
+      expect(reused, JSON.stringify(reused)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_MISMATCH" } });
+      await approveWrites(f, second);
+      const applied = await confirm(f, second);
+      expect(applied, JSON.stringify(applied)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+      expect(applicationOf(f, second.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1, projectId: "c3-b-release" });
+      await acknowledgeHandoff(f, second, applied);
+      expect(await confirm(f, second)).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
+      // Nothing was deleted: the released row stays beside the new one.
+      expect(f.harness.cp.db.all<{ run_id: string; phase: string }>(
+        `SELECT run_id, phase FROM bootstrap_applications WHERE project_id = ? ORDER BY phase`, ["c3-b-release"],
+      )).toEqual([{ run_id: second.runId, phase: "COMPLETED" }, { run_id: first.runId, phase: "RELEASED" }]);
+    });
+  });
+
+  it("refuses while an attempt of the run is in flight, and releases once it has ended with nothing at the target", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-inflight"));
+      await approveWrites(f, run);
+      const hung = deferred();
+      const create = vi.spyOn(f.github, "createRepository").mockImplementationOnce(() => hung.promise);
+      const confirming = confirm(f, run);
+      await vi.waitFor(() => expect(create).toHaveBeenCalled(), { timeout: 30_000, interval: 20 });
+      await cancelRun(f, run);
+      const inFlight = await releaseReservation(f, run);
+      expect(inFlight, JSON.stringify(inFlight)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(inFlight, 1)).toMatchObject({ satisfied: false, evidence: { attemptInFlight: true } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED" });
+
+      hung.reject(new Error("the create never reached GitHub"));
+      expect((await confirming)["ok"]).toBe(false);
+      create.mockRestore();
+      const released = await releaseReservation(f, run);
+      expect(released, JSON.stringify(released)).toMatchObject({ ok: true, value: { changes: 1 } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RELEASED" });
+    });
+  });
+
+  it("a create that landed is an external effect: nothing is released and the reservation keeps its name", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-landed"));
+      await approveWrites(f, run);
+      f.github.failNext = "pushBranch";
+      expect((await confirm(f, run))["ok"]).toBe(false);
+      expect(f.github.repository("acme", "fixture")).toBeDefined();
+      await cancelRun(f, run);
+      const refused = await releaseReservation(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(refused, 2)).toMatchObject({ satisfied: false, evidence: { receipted: [expect.any(String)] } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+      const project = await registerFixtureProject(f.harness, "c3-b-landed").catch((error: Error) => error);
+      expect(String(project)).toMatch(/reserved by another bootstrap run/);
+    });
+  });
+
+  it("a create whose answer was lost leaves the effect unclear: nothing is released, and the reservation is kept IN_DOUBT", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-doubt"));
+      await approveWrites(f, run);
+      f.github.failAfter = { method: "createRepository", mode: "response" };
+      expect((await confirm(f, run))["ok"]).toBe(false);
+      await cancelRun(f, run);
+      const refused = await releaseReservation(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(refused, 3)).toMatchObject({ satisfied: false, evidence: { cause: "REPOSITORY_AT_TARGET" } });
+      const application = applicationOf(f, run.runId);
+      expect(application).toMatchObject({ phase: "RESERVED", attempts: 1 });
+      expect(application?.lastRefusal).toMatchObject({ refusal: "RELEASE_IN_DOUBT", cause: "REPOSITORY_AT_TARGET" });
+    });
+  });
+
+  it("a run that is not cancelled is not released", async () => {
+    await withFixture(async (f) => {
+      const run = await reservedRun(f, "c3-b-active");
+      const refused = await releaseReservation(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(refused, 0)).toMatchObject({ satisfied: false, evidence: { state: RunState.READY_FOR_CEO_REVIEW } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+    });
+  });
+});
