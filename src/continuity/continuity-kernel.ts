@@ -17,12 +17,13 @@ import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
 import { isTerminal } from "../domain/run-state.ts";
+import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
-import type { SessionRegistry } from "../session/session-registry.ts";
+import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 
 export type CoverageOutcome = "FULL_COVERAGE" | "PARTIAL_COVERAGE" | "NO_VALID_COVERAGE";
@@ -715,14 +716,44 @@ export class ContinuityKernel {
 
   /**
    * #512 — stops the one session this failover attempt provisioned for a WORKER and will not bind,
-   * through the adapter that constituted it, with the handle its row records. STOPPED is recorded
-   * only once the provider's stop has returned. A stop that throws leaves the session ERROR and is
-   * recorded as remaining, its process unverified. A session that holds any role is not touched.
+   * through the adapter that constituted it, with the handle its row records.
+   *
+   * The session is reserved before the stop is awaited: in one transaction it must still be READY and
+   * held by no ACTIVE assignment, by its own row or an actor's live runtime, and it leaves READY for
+   * ERROR. Every bind, switch and renewal requires READY, so none can take it while the provider
+   * answers, and ERROR can only go on to STOPPED. A session another holder took first is left as it
+   * is and nothing is stopped.
+   *
+   * STOPPED is recorded only once the stop has returned and the session's own recorded process, if it
+   * has one, is gone. Otherwise the session stays ERROR and is recorded as remaining.
    */
   async #stopUnboundWorkerSession(sessionId: string, role: Role, reason: string): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.lifecycle === SessionLifecycle.STOPPED) return;
-    if (this.bindings.bySession(sessionId).some((binding) => binding.status === "ACTIVE")) return;
+    const reserved = this.db.txDecision<SessionRecord>(() => {
+      const session = this.sessions.get(sessionId);
+      if (!session || session.lifecycle !== SessionLifecycle.READY) {
+        return deny(ReasonCode.SESSION_NOT_READY, "the session is not the READY one this attempt provisioned", { sessionId });
+      }
+      const held = this.db.get<{ n: number }>(
+        `SELECT 1 AS n FROM assignments a
+           LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+          WHERE a.status = 'ACTIVE' AND (a.session_id = ? OR c.current_session_id = ?)
+          LIMIT 1`,
+        [sessionId, sessionId],
+      );
+      if (held) return deny(ReasonCode.CONFLICT, "another holder took the session first", { sessionId });
+      const moved = this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: stopping`);
+      return moved.allowed ? allow(ReasonCode.OK, session) : (moved as Decision<SessionRecord>);
+    });
+    if (!reserved.allowed) return;
+    const session = reserved.value;
+    const remaining = (status: string, error: string | null): void => {
+      this.audit.record({
+        kind: "CONTINUITY_UNBOUND_SESSION_STOP_FAILED",
+        reasonCode: ReasonCode.SESSION_STOP_FAILED,
+        sessionId,
+        evidence: { reason, role, status, error },
+      });
+    };
     try {
       await this.providers.requireForRole(session.provider, role).stopSession({
         externalSessionId: session.incarnation.split("#")[0] ?? session.sessionId,
@@ -733,19 +764,15 @@ export class ContinuityKernel {
         ...(session.workdir ? { workdir: session.workdir } : {}),
       });
     } catch (error) {
-      this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);
-      this.audit.record({
-        kind: "CONTINUITY_UNBOUND_SESSION_STOP_FAILED",
-        reasonCode: ReasonCode.SESSION_STOP_FAILED,
-        sessionId,
-        evidence: {
-          reason,
-          role,
-          status: "PROCESS_UNVERIFIED",
-          error: error instanceof Error ? error.message : String(error),
-        },
-      });
+      remaining("PROCESS_UNVERIFIED", error instanceof Error ? error.message : String(error));
       return;
+    }
+    if (session.osPid !== null) {
+      const liveness = probeSessionLiveness(session.osPid, session.osProcessStartedAt);
+      if (liveness !== "DEAD") {
+        remaining(liveness === "ALIVE" ? "PROCESS_RUNNING" : "PROCESS_UNVERIFIED", null);
+        return;
+      }
     }
     this.sessions.transition(sessionId, SessionLifecycle.STOPPED, reason);
   }
