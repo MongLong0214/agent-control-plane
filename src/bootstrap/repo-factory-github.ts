@@ -108,7 +108,18 @@ export const githubOperationSchema = z.discriminatedUnion("resourceType", [
     .object({
       ...operationIdentity,
       resourceType: z.literal("repository"),
-      desiredState: z.object({ visibility: z.enum(["public", "private"]) }).strict(),
+      desiredState: z
+        .object({
+          visibility: z.enum(["public", "private"]),
+          /**
+           * #246 C5 — `true` makes the plan create-only: the create asks GitHub to initialize the
+           * repository, the initialized default branch and its head are read back, and nothing is
+           * pushed. Absent or `false`, the create asks for no initialization and the plan must push
+           * the bootstrap commit. Optional with no default, so a plan without it keeps its digest.
+           */
+          autoInit: z.boolean().optional(),
+        })
+        .strict(),
     })
     .strict(),
   /** Pushes the bootstrap commit this producer made to `<identity>#<defaultBranch>`. */
@@ -131,6 +142,14 @@ export const githubOperationSchema = z.discriminatedUnion("resourceType", [
 ]);
 
 export type GitHubOperation = z.infer<typeof githubOperationSchema>;
+
+/**
+ * #246 C5 — whether a plan's create is create-only (`autoInit: true`): GitHub makes the default
+ * branch's first commit, and the plan pushes nothing. Only the approved plan's own create says so;
+ * every relaxation of the pushed-head checks below is gated on it, and on nothing else.
+ */
+export const isCreateOnlyPlan = (operations: readonly GitHubOperation[]): boolean =>
+  operations.some((operation) => (operation.resourceType === "repository" ? operation.desiredState.autoInit === true : false));
 
 /**
  * What the owner approved, supplied by the caller rather than read from the plan. A plan that
@@ -163,7 +182,10 @@ export interface GitHubExecutionPlan {
   repositoryIdentity: string;
   visibility: GitHubVisibility;
   operations: GitHubOperation[];
-  pushOperationId: string;
+  /** #246 C5 — GitHub initializes the default branch; nothing is pushed (`isCreateOnlyPlan`). */
+  createOnly: boolean;
+  /** The push of the bootstrap commit; null exactly when the plan is create-only. */
+  pushOperationId: string | null;
 }
 
 const refuse = <T>(reasonCode: ReasonCode, refusal: string, message: string, evidence: Evidence = {}): Decision<T> =>
@@ -277,7 +299,10 @@ export const preflightGitHubOperations = (
     );
   }
 
-  let pushIndex = -1;
+  // #246 C5 — a create-only create leaves the default branch existing, at the commit GitHub made;
+  // otherwise the branch exists only once the plan's push has run.
+  const createOnly = first.desiredState.autoInit === true;
+  let pushIndex = createOnly ? 0 : -1;
   let pushOperationId: string | null = null;
   for (const [index, operation] of operations.entries()) {
     if (index === 0) continue;
@@ -298,6 +323,12 @@ export const preflightGitHubOperations = (
       return shape("a plan creates exactly one repository", { operationId: operation.operationId });
     }
     if (operation.resourceType === "branch") {
+      if (createOnly) {
+        return shape(
+          "a create-only plan pushes nothing: its default branch is the one GitHub initialized, and a push to it would be a direct push to the default branch",
+          { operationId: operation.operationId },
+        );
+      }
       if (pushOperationId !== null) {
         return shape("a plan pushes the bootstrap commit once", { operationId: operation.operationId });
       }
@@ -337,11 +368,14 @@ export const preflightGitHubOperations = (
     }
   }
   // A repository with no pushed commit would make the result report a verified exact head in
-  // `github:<owner>/<name>` that GitHub does not have.
+  // `github:<owner>/<name>` that GitHub does not have — unless GitHub made that commit itself, which a
+  // create-only create reads back before anything is reported (`applyGitHubOperations`).
   if (pushOperationId === null) {
-    return shape("a GitHub-provisioned repository must receive the bootstrap commit", {
-      repository: first.resourceIdentity,
-    });
+    if (!createOnly) {
+      return shape("a GitHub-provisioned repository must receive the bootstrap commit", {
+        repository: first.resourceIdentity,
+      });
+    }
   }
 
   return allow(ReasonCode.OK, {
@@ -349,6 +383,7 @@ export const preflightGitHubOperations = (
     repositoryIdentity: first.resourceIdentity,
     visibility: authority.visibility,
     operations,
+    createOnly,
     pushOperationId,
   });
 };
@@ -385,7 +420,18 @@ export const githubOperationReceiptSchema = z.discriminatedUnion("resourceType",
       ...receiptCommon,
       resourceType: z.literal("repository"),
       observed: z
-        .object({ nodeId: z.string().min(1), fullName: z.string().min(1), visibility: z.string().min(1) })
+        .object({
+          nodeId: z.string().min(1),
+          fullName: z.string().min(1),
+          visibility: z.string().min(1),
+          /**
+           * #246 C5 — a create-only create's receipt only: the default branch GitHub initialized and
+           * that branch's head, as read back after the create. Absent from every other receipt, so the
+           * digest of a push-mode receipt is what it was.
+           */
+          defaultBranch: z.string().min(1).optional(),
+          initializedHead: z.string().min(1).optional(),
+        })
         .strict(),
     })
     .strict(),
@@ -638,9 +684,11 @@ export interface ApplyGitHubOperationsInput {
    * Review round 3 (RF-REVIEW-01) — the commit this run made and checked with `approvedTree` before
    * calling this function: the only commit a first push sends, by its id. The checkout's HEAD is never
    * read back to choose what to push: every GitHub call before the push is awaited, and anything
-   * that moves HEAD meanwhile would otherwise be pushed unchecked.
+   * that moves HEAD meanwhile would otherwise be pushed unchecked. Null exactly for a create-only
+   * plan (#246 C5), which makes no commit: its head is the one GitHub initialized, read back by the
+   * create's own step.
    */
-  validatedHead: string;
+  validatedHead: string | null;
 }
 
 export interface AppliedGitHubOperations {
@@ -651,7 +699,8 @@ export interface AppliedGitHubOperations {
   resumed: string[];
   /**
    * The head GitHub holds once the push step is done, as its receipt read it back: `validatedHead`
-   * when this attempt pushed it, or the receipted or recorded head a retry fetched and checked.
+   * when this attempt pushed it, or the receipted or recorded head a retry fetched and checked. For a
+   * create-only plan, the initialized head the create's receipt read back and this run checked out.
    */
   publishedHead: string;
 }
@@ -699,7 +748,8 @@ export const applyGitHubOperations = async (
   const resumed: string[] = [];
   let repositoryNodeId: string | null = null;
   // Every successful attempt has exactly one branch receipt (`preflightGitHubOperations` requires the
-  // push), which sets this to the head GitHub holds.
+  // push), which sets this to the head GitHub holds — or, create-only, exactly one repository receipt
+  // carrying the initialized head, which sets it instead.
   let publishedHead = input.validatedHead;
 
   const persist = (): void => input.record({ receipts: [...receipts.values()], pending: [...pending.values()] });
@@ -958,7 +1008,8 @@ export const applyGitHubOperations = async (
       pushedHead: null,
     };
     begin(intent);
-    const created = await remote(id, () => port.createRepository(target, execution.visibility, marker));
+    // The initialization option is always stated, never left to the port's default (#246 C5).
+    const created = await remote(id, () => port.createRepository(target, execution.visibility, marker, execution.createOnly));
     if (!created.allowed) return created as Decision<Step>;
     begin({ ...intent, respondedNodeId: created.value.nodeId });
     const createdJudged = judgeRepository(created.value, id);
@@ -1000,6 +1051,145 @@ export const applyGitHubOperations = async (
         rereadAt: clock.nowIso(),
       },
       outcome: "written",
+    });
+  };
+
+  /**
+   * #246 C5 — a create-only create's step: the create judged exactly as `repositoryStep` judges any
+   * create (written, adopted only by the node id its own response named, or resumed from its receipt
+   * by node id), then its initialized default branch and head read back and added to the receipt.
+   *
+   * The head is never assumed from the plan or from GitHub's documented behaviour. The repository
+   * must still be the one this operation created, by node id; it must report the plan's default
+   * branch; that branch must exist; its head is fetched into this run's checkout and must be a commit
+   * with no parent — the commit GitHub's initialization made, not one pushed on top of it; and on a
+   * resume it must still be the head the receipt recorded. This is the one place a head this producer
+   * did not make is accepted, and only for a plan whose approved create asked for the initialization.
+   */
+  const initializedRepositoryStep = async (
+    operation: Extract<GitHubOperation, { resourceType: "repository" }>,
+  ): Promise<Decision<Step>> => {
+    const id = operation.operationId;
+    const branch = input.defaultBranch;
+    const created = await repositoryStep(operation);
+    if (!created.allowed) return created;
+    const { receipt, outcome } = created.value;
+    if (receipt.resourceType !== "repository") return corruptPrior(id);
+    let receiptedHead: string | null = null;
+    if (outcome === "resumed") {
+      const prior = input.prior.receipts.get(id);
+      const recorded = prior?.resourceType === "repository" ? prior.observed.initializedHead : undefined;
+      if (recorded === undefined) {
+        return stop(
+          ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+          "LEDGER_CORRUPT",
+          `the ledger's receipt for ${id} records no initialized head, and this plan's create asked for one`,
+          id,
+          {},
+          false,
+        );
+      }
+      receiptedHead = recorded;
+    }
+    const unobserved = (message: string, evidence: Evidence): Decision<Step> =>
+      stop(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "INITIALIZED_HEAD_UNOBSERVED", message, id, evidence, true);
+    const localFailure = (message: string, evidence: Evidence): Decision<Step> =>
+      stop(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "LOCAL_CHECKOUT_FAILED", message, id, evidence, true);
+
+    const observed = await remote(id, () => port.observeRepository(target));
+    if (!observed.allowed) return observed as Decision<Step>;
+    if (observed.value === null) {
+      return stop(
+        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        "RESUMED_RESOURCE_ABSENT",
+        `${target.owner}/${target.name} is absent from GitHub after this operation's create`,
+        id,
+        { recordedNodeId: receipt.observed.nodeId },
+        false,
+      );
+    }
+    if (observed.value.nodeId !== receipt.observed.nodeId) {
+      return stop(
+        ReasonCode.RESOURCE_COLLISION,
+        "WRONG_TARGET",
+        `${target.owner}/${target.name} is not the repository this operation created; the name was reused`,
+        id,
+        { recordedNodeId: receipt.observed.nodeId, observedNodeId: observed.value.nodeId },
+        false,
+      );
+    }
+    const judged = judgeRepository(observed.value, id);
+    if (!judged.allowed) return judged as Decision<Step>;
+    const reportedDefault = observed.value.defaultBranch;
+    if (reportedDefault === null) {
+      return unobserved(`GitHub reports no default branch for ${target.owner}/${target.name} after a create that asked it to initialize one`, {
+        planned: branch,
+      });
+    }
+    if (reportedDefault !== branch) {
+      return stop(
+        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        "INITIALIZED_BRANCH_MISMATCH",
+        `GitHub initialized ${reportedDefault} as the default branch, and the plan's default branch is ${branch}`,
+        id,
+        { observed: reportedDefault, planned: branch },
+        false,
+      );
+    }
+    const head = await remote(id, () => port.observeBranch(target, branch));
+    if (!head.allowed) return head as Decision<Step>;
+    if (head.value === null) {
+      return unobserved(`${branch} is absent from ${target.owner}/${target.name}, which GitHub reports as its default branch`, { branch });
+    }
+    const named = sameBranch(head.value.name, branch, id);
+    if (!named.allowed) return named as Decision<Step>;
+    const initializedHead = head.value.headSha;
+    if (receiptedHead !== null) {
+      if (initializedHead !== receiptedHead) {
+        return stop(
+          ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+          "RESUMED_RESOURCE_DRIFTED",
+          `${branch} has moved since this operation's create initialized it`,
+          id,
+          { recordedHead: receiptedHead, observedHead: initializedHead },
+          false,
+        );
+      }
+    }
+
+    // The checkout is fresh on every attempt; the commit GitHub made is brought into it.
+    const fetched = await remote(id, () => port.fetchBranch(target, branch, input.checkoutPath));
+    if (!fetched.allowed) return fetched as Decision<Step>;
+    const reset = await git(input.checkoutPath, ["reset", "-q", "--hard", initializedHead], { allowFailure: true });
+    if (reset.exitCode !== 0) {
+      return localFailure("the initialized commit could not be checked out locally", { stderr: reset.stderr });
+    }
+    const local = await tryRevParse(input.checkoutPath, "HEAD");
+    if (local !== initializedHead) {
+      return localFailure("the local checkout is not at the initialized commit", { head: local, initialized: initializedHead });
+    }
+    // Read unreplaced, as `producedTreeDrift` reads a tree: a replacement ref changes what a local read
+    // of a commit returns and nothing GitHub holds.
+    const listed = await git(input.checkoutPath, ["--no-replace-objects", "rev-list", "--max-count=1", "--parents", initializedHead], {
+      allowFailure: true,
+    });
+    if (listed.exitCode !== 0) {
+      return localFailure("the initialized commit's parents could not be read", { stderr: listed.stderr });
+    }
+    const parents = listed.stdout.trim().split(/\s+/).slice(1);
+    if (parents.length > 0) {
+      return stop(
+        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        "INITIALIZED_HEAD_HAS_PARENT",
+        `${branch}'s head has a parent, so it is not the commit GitHub's initialization made`,
+        id,
+        { head: initializedHead, parents },
+        false,
+      );
+    }
+    return allow(ReasonCode.OK, {
+      receipt: { ...receipt, observed: { ...readbackOf(observed.value), defaultBranch: branch, initializedHead } },
+      outcome,
     });
   };
 
@@ -1106,6 +1296,10 @@ export const applyGitHubOperations = async (
     }
     // The checked commit, by its id — not a HEAD read now, after the awaited calls above (RF-REVIEW-01).
     const localHead = input.validatedHead;
+    if (localHead === null) {
+      // A create-only plan makes no commit, and `preflightGitHubOperations` refuses its push.
+      return localFailure("a push needs the commit this run made and checked, and this run made none", {});
+    }
     const createdAt = clock.nowIso();
     begin({
       operationId: id,
@@ -1361,7 +1555,9 @@ export const applyGitHubOperations = async (
   for (const operation of execution.operations) {
     const step: Decision<Step> =
       operation.resourceType === "repository"
-        ? await repositoryStep(operation)
+        ? execution.createOnly
+          ? await initializedRepositoryStep(operation)
+          : await repositoryStep(operation)
         : operation.resourceType === "branch"
           ? await branchStep(operation)
           : operation.resourceType === "setting"
@@ -1369,7 +1565,10 @@ export const applyGitHubOperations = async (
             : await protectionStep(operation);
     if (!step.allowed) return step as Decision<AppliedGitHubOperations>;
     const { receipt, outcome } = step.value;
-    if (receipt.resourceType === "repository") repositoryNodeId = receipt.observed.nodeId;
+    if (receipt.resourceType === "repository") {
+      repositoryNodeId = receipt.observed.nodeId;
+      if (execution.createOnly) publishedHead = receipt.observed.initializedHead ?? null;
+    }
     if (receipt.resourceType === "branch") publishedHead = receipt.observed.headSha;
     completed.push(receipt);
     if (outcome === "resumed") {
@@ -1396,6 +1595,17 @@ export const applyGitHubOperations = async (
       `GitHub reports the default branch as ${final.value.defaultBranch ?? "unset"}, and the result would report ${input.defaultBranch}`,
       null,
       { observed: final.value.defaultBranch, reported: input.defaultBranch },
+      false,
+    );
+  }
+  if (publishedHead === null) {
+    // Neither a push nor an initialization receipted a head: there is nothing to report.
+    return stop(
+      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+      "INITIALIZED_HEAD_UNOBSERVED",
+      "no head was pushed or read back, so the result would report one GitHub was never shown to hold",
+      null,
+      {},
       false,
     );
   }

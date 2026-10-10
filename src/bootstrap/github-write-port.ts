@@ -96,12 +96,15 @@ export interface GitHubWritePort {
   observeRepository(target: GitHubRepositoryTarget): Promise<ObservedRepository | null>;
   /**
    * Returns GitHub's response to the create. The producer still re-reads it separately.
-   * `description` carries the producer's create marker, recorded before the call.
+   * `description` carries the producer's create marker, recorded before the call. `autoInit` is the
+   * create's initialization option, sent as stated: `true` only for a create-only plan (#246 C5),
+   * whose default branch GitHub then initializes; absent, the request states `auto_init: false`.
    */
   createRepository(
     target: GitHubRepositoryTarget,
     visibility: GitHubVisibility,
     description: string,
+    autoInit?: boolean,
   ): Promise<ObservedRepository>;
   observeBranch(target: GitHubRepositoryTarget, branch: string): Promise<ObservedBranch | null>;
   pushBranch(target: GitHubRepositoryTarget, branch: string, checkoutPath: string, commitSha: string): Promise<void>;
@@ -281,7 +284,7 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         repositoryFrom(await client.request<RepositoryDocument>("GET", repoPath(target)), repoPath(target)),
       ),
 
-    async createRepository(target, visibility, description) {
+    async createRepository(target, visibility, description, autoInit = false) {
       // The endpoint decides the owner, so it is chosen from what GitHub says the owner is —
       // never assumed. `POST user/repos` creates under whoever is authenticated, whatever the
       // plan named; that is the user/organization confusion this refuses rather than risks.
@@ -306,7 +309,7 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         description,
         private: visibility === "private",
         visibility,
-        auto_init: false,
+        auto_init: autoInit,
       });
       return repositoryFrom(created, path);
     },
