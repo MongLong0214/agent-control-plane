@@ -303,3 +303,28 @@ it("1084-R1-05 (record failure): a cleanup record that cannot be written is thro
       .rejects.toThrow(/REMAINING_STOP_FAILED and could not be recorded/);
   });
 });
+
+it("recovery refuses a session whose own record names the role but whose creation actor no longer holds it, before any provider work", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const cp = f.harness.cp;
+    const { binding } = await drivenPrimary(f, "review-rebound-actor");
+    // The same session is bound again by a fresh actor: its one spawn record still names this role
+    // and project, but the creation assignment's actor is not the holder, so it is not DRIVEN.
+    expect(cp.bindings.revoke(binding.roleKey, "fixture rebind with a fresh actor").allowed).toBe(true);
+    const rebound = cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "review-rebound-actor", sessionId: binding.sessionId });
+    if (!rebound.allowed) throw new Error(rebound.message);
+    expect(cp.outbox.drivenModeOf(binding.sessionId)).toBe("CONTRADICTED");
+    cp.sessionRuntime.release(binding.sessionId);
+    const capacity = vi.spyOn(cp.capacity, "refreshForDispatch");
+    const turns = f.claude.turns.length;
+    const recovered = await cp.cto.recoverDrivenPrimaryCto(binding.roleKey, { capacity: cp.capacity, runtime: cp.sessionRuntime });
+    expect(recovered).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+    expect(capacity).not.toHaveBeenCalled();
+    expect(f.claude.turns.length).toBe(turns);
+    expect(cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_TURN_REFUSED' AND session_id = ?`,
+      [binding.sessionId],
+    )?.n).toBe(0);
+  });
+});
+
