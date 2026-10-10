@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -9,8 +9,10 @@ import {
   collectExecutableTestDeclarations,
   main,
   passedScenarioReferences,
+  REPO_FACTORY_EXTERNAL_EVIDENCE,
   traceabilityPasses,
   type ExecutableTestDeclaration,
+  type ExternalScenarioEvidence,
   type Requirement,
   type VitestJsonReport,
 } from "../../src/tools/traceability.ts";
@@ -243,5 +245,223 @@ describe("traceability executed-test coverage", () => {
       repoFactoryScenariosWithPassedDeclarations: 1,
       repoFactoryScenariosMissing: [missingRepoFactoryScenarioId],
     });
+  });
+});
+
+describe("Repo Factory scenarios count in the verdict", () => {
+  // `pnpm trace` used to exit 0 while Repo Factory scenarios were uncovered: the pass check read
+  // only the CP side. These drive `main` over a fixture tree, so the verdict is the one the CLI
+  // returns. Every id here is assembled at run time, for the reason given at the top of the file.
+  const cp = ["CP", "S01"].join("-");
+  const first = ["RF", "S01"].join("-");
+  const second = ["RF", "S02"].join("-");
+  const noExternal: ExternalScenarioEvidence = { repository: "", revision: "", ciRun: "", scenarios: [] };
+  const elsewhere = (scenarios: ExternalScenarioEvidence["scenarios"]): ExternalScenarioEvidence => ({
+    repository: "example/other-repository",
+    revision: "0123456789abcdef0123456789abcdef01234567",
+    ciRun: "42",
+    scenarios,
+  });
+
+  /** A tree with one CP scenario and two Repo Factory ones, and a result set for the given leaves. */
+  const traceFixture = (
+    leaves: Array<{ id: string; status: string }>,
+    external: ExternalScenarioEvidence,
+    run: Partial<{ writeEvidence: boolean; emitOutput: boolean }> = {},
+  ) => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "acp-trace-rf-"));
+    try {
+      mkdirSync(join(fixtureRoot, "docs", "prd"), { recursive: true });
+      mkdirSync(join(fixtureRoot, "tests", "scenarios"), { recursive: true });
+      writeFileSync(
+        join(fixtureRoot, "docs", "prd", "AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md"),
+        `| CP-001 | fixture requirement | P0 |\n\n| CP-001 | ${cp} | fixture evidence | P0 |\n\n**${cp}:** fixture scenario\n`,
+      );
+      writeFileSync(
+        join(fixtureRoot, "docs", "prd", "REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md"),
+        `- **${first}:** first factory scenario\n- **${second}:** second factory scenario\n`,
+      );
+      const testFile = join(fixtureRoot, "tests", "scenarios", "fixture.test.ts");
+      const all = [{ id: cp, status: "passed" }, ...leaves];
+      writeFileSync(
+        testFile,
+        `import { it } from "vitest";\n${all.map(({ id }) => `it(${JSON.stringify(`${id}: leaf`)}, () => {});`).join("\n")}\n`,
+      );
+      const result = main({
+        root: fixtureRoot,
+        vitest: {
+          success: true,
+          numTotalTests: all.length,
+          numPassedTests: all.filter(({ status }) => status === "passed").length,
+          numFailedTests: 0,
+          numPendingTests: all.filter(({ status }) => status !== "passed").length,
+          testResults: [
+            { name: testFile, assertionResults: all.map(({ id, status }) => ({ fullName: `${id}: leaf`, status })) },
+          ],
+        },
+        writeEvidence: run.writeEvidence ?? false,
+        emitOutput: run.emitOutput ?? false,
+        external,
+      });
+      const markdown = run.writeEvidence ? readFileSync(join(fixtureRoot, "evidence", "traceability.md"), "utf8") : "";
+      return { ...result, markdown };
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  };
+
+  it("fails main when a Repo Factory scenario has no passed declaration, though every CP scenario passed", () => {
+    const result = traceFixture([{ id: first, status: "passed" }], noExternal);
+
+    expect(result.report.summary.scenariosMissing).toEqual([]);
+    expect(result.report.summary.requirementsWithGaps).toBe(0);
+    expect(result.report.summary.repoFactoryScenariosMissing).toEqual([second]);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("fails main when a Repo Factory scenario's only declaration did not pass", () => {
+    const result = traceFixture([{ id: first, status: "passed" }, { id: second, status: "skipped" }], noExternal);
+
+    expect(result.report.testRun.success).toBe(true);
+    expect(result.report.summary.repoFactoryScenariosMissing).toEqual([second]);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("passes main when every Repo Factory scenario passed here (the control for the two above)", () => {
+    const result = traceFixture([{ id: first, status: "passed" }, { id: second, status: "passed" }], noExternal);
+
+    expect(result.report.summary.repoFactoryScenariosWithPassedDeclarations).toBe(2);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("reports an externally judged scenario as EXTERNAL with its test ids, counts it as nothing, and names it on every run", () => {
+    const external = elsewhere([{ id: second, arm: null, tests: ["tests/test_x.py::test_second"] }]);
+    const writes: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      const result = traceFixture([{ id: first, status: "passed" }], external, { emitOutput: true, writeEvidence: true });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.report.summary).toMatchObject({
+        repoFactoryScenariosWithPassedDeclarations: 1,
+        repoFactoryScenariosMissing: [],
+        repoFactoryScenariosExternal: [second],
+        repoFactoryScenariosDuplicated: [],
+      });
+      const row = result.report.repoFactoryScenarios.find((candidate) => candidate.id === second);
+      expect(row).toMatchObject({ status: "EXTERNAL", tests: [] });
+      expect(row?.external).toEqual([
+        expect.objectContaining({
+          arm: null,
+          tests: ["tests/test_x.py::test_second"],
+          repository: "example/other-repository",
+          revision: external.revision,
+          ciRun: "42",
+          acpUnattendedRun: "NOT_SUPPORTED",
+        }),
+      ]);
+      // Not silent: the exit code is 0, so the run has to say what it did not judge.
+      expect(writes.join("")).toContain(`EXTERNAL`);
+      expect(writes.join("")).toContain(second);
+      expect(result.markdown).toContain(`| ${second} | EXTERNAL |`);
+      expect(result.markdown).toContain("tests/test_x.py::test_second");
+    } finally {
+      stderr.mockRestore();
+      stdout.mockRestore();
+    }
+  });
+
+  it("fails main when a scenario is declared here and also listed as judged elsewhere", () => {
+    const external = elsewhere([{ id: first, arm: null, tests: ["tests/test_x.py::test_first"] }]);
+
+    const passedHere = traceFixture([{ id: first, status: "passed" }, { id: second, status: "passed" }], external);
+    expect(passedHere.report.summary.repoFactoryScenariosDuplicated).toEqual([first]);
+    expect(passedHere.exitCode).toBe(1);
+
+    // A declaration that did not pass is still a second judge, not a gap the external entry fills.
+    const skippedHere = traceFixture([{ id: first, status: "skipped" }, { id: second, status: "passed" }], external);
+    expect(skippedHere.report.summary.repoFactoryScenariosDuplicated).toEqual([first]);
+    expect(skippedHere.exitCode).toBe(1);
+  });
+
+  it("fails main when one scenario is listed whole twice, or the same arm twice", () => {
+    const twice = elsewhere([
+      { id: second, arm: null, tests: ["tests/test_x.py::test_a"] },
+      { id: second, arm: null, tests: ["tests/test_x.py::test_b"] },
+    ]);
+    expect(traceFixture([{ id: first, status: "passed" }], twice).report.summary.repoFactoryScenariosDuplicated).toEqual([
+      second,
+    ]);
+
+    const armTwice = elsewhere([
+      { id: second, arm: "two repositories", tests: ["tests/test_x.py::test_a"] },
+      { id: second, arm: "two repositories", tests: ["tests/test_x.py::test_b"] },
+    ]);
+    const result = traceFixture([{ id: first, status: "passed" }, { id: second, status: "passed" }], armTwice);
+    expect(result.report.summary.repoFactoryScenariosDuplicated).toEqual([second]);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("an arm judged elsewhere never covers a scenario by itself, and is reported beside a passed declaration", () => {
+    const external = elsewhere([{ id: second, arm: "two repositories", tests: ["tests/test_x.py::test_arm"] }]);
+
+    const alone = traceFixture([{ id: first, status: "passed" }], external);
+    expect(alone.report.summary.repoFactoryScenariosMissing).toEqual([second]);
+    expect(alone.exitCode).toBe(1);
+
+    const withDeclaration = traceFixture([{ id: first, status: "passed" }, { id: second, status: "passed" }], external, {
+      writeEvidence: true,
+    });
+    expect(withDeclaration.exitCode).toBe(0);
+    const row = withDeclaration.report.repoFactoryScenarios.find((candidate) => candidate.id === second);
+    expect(row?.status).toBe("DECLARATION_COVERED");
+    expect(row?.external).toEqual([
+      expect.objectContaining({ arm: "two repositories", acpUnattendedRun: "NOT_SUPPORTED" }),
+    ]);
+    expect(withDeclaration.markdown).toContain("two repositories arm: example/other-repository@0123456789ab");
+  });
+
+  it("fails main on an external entry it cannot use: an unknown scenario, no test id, or a short revision", () => {
+    const unknown = ["RF", "S99"].join("-");
+    const cases: ExternalScenarioEvidence[] = [
+      elsewhere([{ id: unknown, arm: null, tests: ["tests/test_x.py::test_a"] }]),
+      elsewhere([{ id: second, arm: null, tests: [] }]),
+      { ...elsewhere([{ id: second, arm: null, tests: ["tests/test_x.py::test_a"] }]), revision: "309e2e6" },
+    ];
+    for (const external of cases) {
+      const result = traceFixture([{ id: first, status: "passed" }, { id: second, status: "passed" }], external);
+      expect(result.report.summary.repoFactoryExternalEvidenceProblems, JSON.stringify(external)).not.toEqual([]);
+      expect(result.exitCode).toBe(1);
+    }
+  });
+
+  it("no longer claims that CI recomputes the committed report", () => {
+    const result = traceFixture([{ id: first, status: "passed" }, { id: second, status: "passed" }], noExternal, {
+      writeEvidence: true,
+    });
+
+    expect(result.markdown).not.toMatch(/CI recomputes/);
+    expect(result.markdown).toContain("CI does not run `pnpm trace`");
+  });
+
+  it("the committed external list is usable as written, and no test here also judges one of its whole scenarios", () => {
+    // Read against this repository's own PRD and declarations, with an empty result set: only the
+    // two checks that do not depend on a run are asserted.
+    const { report } = main({
+      vitest: { success: true, numTotalTests: 0, numPassedTests: 0, numFailedTests: 0, numPendingTests: 0, testResults: [] },
+      writeEvidence: false,
+      emitOutput: false,
+    });
+
+    expect(report.summary.repoFactoryExternalEvidenceProblems).toEqual([]);
+    expect(report.summary.repoFactoryScenariosDuplicated).toEqual([]);
+    expect(REPO_FACTORY_EXTERNAL_EVIDENCE.scenarios.length).toBeGreaterThan(0);
+    expect(report.summary.repoFactoryScenariosExternal).toEqual(
+      REPO_FACTORY_EXTERNAL_EVIDENCE.scenarios.filter((entry) => entry.arm === null).map((entry) => entry.id),
+    );
   });
 });

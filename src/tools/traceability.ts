@@ -73,6 +73,131 @@ interface ScenarioRow {
   status: "DECLARATION_COVERED" | "DECLARATION_MISSING";
 }
 
+/** One Repo Factory scenario, or one arm of one, whose tests live in another repository. */
+export interface ExternalScenario {
+  readonly id: string;
+  /**
+   * `null` when the whole scenario is judged there. Otherwise the one arm judged there: the rest
+   * still needs a passed declaration in this repository, and the arm alone covers nothing.
+   */
+  readonly arm: string | null;
+  /** The other repository's own test ids (pytest node ids), as its CI runs them. */
+  readonly tests: readonly string[];
+  /** What the external evidence does not show, stated beside it rather than left out. */
+  readonly limit?: string;
+}
+
+export interface ExternalScenarioEvidence {
+  readonly repository: string;
+  /** The exact commit the listed tests are the evidence at. */
+  readonly revision: string;
+  /** The CI run that judged that commit. */
+  readonly ciRun: string;
+  readonly scenarios: readonly ExternalScenario[];
+}
+
+/** An external entry as one report row carries it: where the evidence is, and what it covers. */
+export interface ExternalScenarioReference extends ExternalScenario {
+  readonly repository: string;
+  readonly revision: string;
+  readonly ciRun: string;
+  /** Recorded with the entry, never measured here: the ACP producer does not implement it. */
+  readonly acpUnattendedRun: "NOT_SUPPORTED";
+}
+
+/**
+ * Repo Factory scenarios whose execution evidence is in the Python repo-factory repository.
+ *
+ * ACP's own bootstrap producer (`src/bootstrap/repo-factory-producer.ts` and what it calls)
+ * creates one repository and checks a clean tree. It selects no artifacts by profile, renders no
+ * CI, runs no lean review, computes no PlanCore digest and has no CommitLore step. These
+ * scenarios therefore cannot run in this repository, and ACP's unattended bootstrap run does not
+ * support them. Their ownership was assigned to repo-factory; this constant is where that
+ * assignment is written down, and the one thing to change if it moves.
+ *
+ * What the report does with an entry:
+ * - `arm: null` makes the scenario EXTERNAL. It is listed with these test ids, the revision and
+ *   the CI run, and it is never counted as a passed declaration. This tool cannot read that run,
+ *   so an entry points at evidence; it is not evidence.
+ * - an `arm` names the one part judged there. The scenario's verdict still comes from this
+ *   repository's own declarations, and the arm is reported as not supported by the ACP run.
+ * - a scenario that is listed whole and also declared by a test here, or listed whole twice, is
+ *   DUPLICATE and fails. Each scenario has exactly one judge.
+ *
+ * repo-factory's CI step (`pytest tests/ -q`) keeps no per-test result, only its summary line
+ * (`852 passed, 3 skipped` for the run below). Each listed id was seen to pass in a junit run of
+ * the same revision; the CI run shows that the suite as a whole passed there.
+ */
+export const REPO_FACTORY_EXTERNAL_EVIDENCE: ExternalScenarioEvidence = {
+  repository: "MongLong0214/repo-factory",
+  revision: "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
+  ciRun: "36937509727",
+  scenarios: [
+    {
+      id: "RF-S02",
+      arm: null,
+      tests: ["tests/test_slice1_plan.py::test_simple_materializes_no_formal_documents_without_optional_requests"],
+    },
+    {
+      id: "RF-S03",
+      arm: null,
+      tests: [
+        "tests/test_slice1_plan.py::test_standard_lean_revision_preserves_product_scope_and_required_artifacts",
+        "tests/test_slice1_plan.py::test_lean_review_refuses_product_scope_and_required_artifact_removal",
+        "tests/test_slice1_plan.py::test_lean_decision_refuses_planning",
+      ],
+      limit:
+        "a lean verdict is applied when one is supplied; nothing requires or produces one, so an " +
+        "over-designed STANDARD request without a review compiles unchanged",
+    },
+    {
+      id: "RF-S04",
+      arm: null,
+      tests: ["tests/test_slice1_plan.py::test_rf_s04_a_different_timestamp_is_the_same_plan"],
+    },
+    {
+      id: "RF-S08",
+      arm: null,
+      tests: ["tests/test_slice2_stack_ci.py::test_node_workflow_installs_dependencies_on_both_declared_runtimes"],
+      limit:
+        "a static check of the rendered workflow; the only real lower/latest install is a recorded " +
+        "Actions run (32256790243), which no gate re-runs",
+    },
+    {
+      id: "RF-S16",
+      arm: "two repositories",
+      tests: [
+        "tests/test_slice3_apply.py::test_a_partial_apply_reports_what_completed_rather_than_claiming_atomicity",
+        "tests/test_slice3_apply.py::test_resume_after_a_partial_apply_starts_from_the_verified_receipt",
+      ],
+    },
+    {
+      id: "RF-S19",
+      arm: null,
+      tests: ["tests/test_publish.py::test_simple_missing_commitlore_warns_and_continues_with_a_receipt"],
+    },
+    {
+      id: "RF-S20",
+      arm: null,
+      tests: ["tests/test_publish.py::test_standard_missing_commitlore_refuses_before_push_for_revision"],
+    },
+    {
+      id: "RF-S21",
+      arm: null,
+      tests: ["tests/test_publish.py::test_guarded_missing_commitlore_refuses_before_push_as_blocking"],
+    },
+  ],
+};
+
+interface RepoFactoryScenarioRow {
+  id: string;
+  description: string;
+  /** Passed declarations in this repository's result set. */
+  tests: TestReference[];
+  status: "DECLARATION_COVERED" | "DECLARATION_MISSING" | "EXTERNAL" | "DUPLICATE";
+  external: ExternalScenarioReference[];
+}
+
 export interface TraceabilityReport {
   generatedFrom: string[];
   /**
@@ -106,12 +231,20 @@ export interface TraceabilityReport {
     scenariosWithPassedDeclarations: number;
     scenariosMissing: string[];
     repoFactoryScenarios: number;
+    /** Passed in this result set. External scenarios are never counted here. */
     repoFactoryScenariosWithPassedDeclarations: number;
+    /** No passed declaration here and no external entry: these fail, as a missing CP scenario does. */
     repoFactoryScenariosMissing: string[];
+    /** Judged by another repository's tests, listed by id; not verified by this result set. */
+    repoFactoryScenariosExternal: string[];
+    /** Claimed by more than one judge: these fail. */
+    repoFactoryScenariosDuplicated: string[];
+    /** An external entry this report cannot use as written: these fail. */
+    repoFactoryExternalEvidenceProblems: string[];
   };
   requirements: RequirementRow[];
   scenarios: ScenarioRow[];
-  repoFactoryScenarios: ScenarioRow[];
+  repoFactoryScenarios: RepoFactoryScenarioRow[];
 }
 
 const readPrd = (root: string, name: string): string => readFileSync(join(root, "docs", "prd", name), "utf8");
@@ -350,13 +483,68 @@ const measuredCommit = (): string => {
   return dirty.status === 0 && dirty.stdout.trim().length > 0 ? `${sha} (working tree modified)` : sha;
 };
 
+const NO_EXTERNAL_EVIDENCE: ExternalScenarioEvidence = { repository: "", revision: "", ciRun: "", scenarios: [] };
+
+/** What makes an external entry unusable. Each problem fails the report rather than being skipped. */
+const externalEvidenceProblems = (
+  external: ExternalScenarioEvidence,
+  repoFactoryScenarios: ReadonlyMap<string, string>,
+): string[] => {
+  if (external.scenarios.length === 0) return [];
+  const problems: string[] = [];
+  if (!external.repository) problems.push("the external evidence names no repository");
+  if (!/^[0-9a-f]{40}$/.test(external.revision)) {
+    problems.push(`the external evidence revision is not a full commit SHA: '${external.revision}'`);
+  }
+  if (!external.ciRun) problems.push("the external evidence names no CI run");
+  for (const entry of external.scenarios) {
+    if (!repoFactoryScenarios.has(entry.id)) problems.push(`${entry.id} is not a Repo Factory scenario in the PRD`);
+    if (entry.tests.length === 0 || entry.tests.some((test) => test.trim() === "")) {
+      problems.push(`${entry.id} names no external test id`);
+    }
+    if (entry.arm !== null && entry.arm.trim() === "") problems.push(`${entry.id} names an empty arm`);
+  }
+  return problems;
+};
+
+/**
+ * One judge per scenario. A passed declaration here covers it; an external entry with no arm hands
+ * it to the other repository; both at once, or two whole entries, or the same arm twice, is a
+ * duplicate. An arm entry hands over only that arm, so it never covers a scenario by itself.
+ * `declared` is every scenario a test here declares, passed or not: a failing declaration of an
+ * externally judged scenario is still a second judge.
+ */
+const repoFactoryVerdict = (
+  passed: boolean,
+  declared: boolean,
+  entries: readonly ExternalScenario[],
+): RepoFactoryScenarioRow["status"] => {
+  const whole = entries.filter((entry) => entry.arm === null).length;
+  const arms = entries.filter((entry) => entry.arm !== null).map((entry) => entry.arm);
+  if (whole > 1 || (whole === 1 && (declared || arms.length > 0)) || new Set(arms).size !== arms.length) {
+    return "DUPLICATE";
+  }
+  if (whole === 1) return "EXTERNAL";
+  return passed ? "DECLARATION_COVERED" : "DECLARATION_MISSING";
+};
+
+export interface RepoFactoryJudgementOptions {
+  /** Defaults to none, so a caller that supplies nothing gets every unproven scenario reported missing. */
+  external?: ExternalScenarioEvidence;
+  /** Defaults to the scenarios in `tests`, i.e. those with a passed declaration. */
+  declaredScenarioIds?: ReadonlySet<string>;
+}
+
 export const buildTraceabilityReport = (
   requirements: Iterable<Requirement>,
   scenarios: Map<string, string>,
   repoFactoryScenarios: Map<string, string>,
   tests: Map<string, TestReference[]>,
   vitest: VitestJsonReport,
+  options: RepoFactoryJudgementOptions = {},
 ): TraceabilityReport => {
+  const external = options.external ?? NO_EXTERNAL_EVIDENCE;
+  const declaredScenarioIds = options.declaredScenarioIds ?? new Set(tests.keys());
   const requirementRows: RequirementRow[] = [...requirements].map((requirement) => {
     const covered = requirement.scenarios.filter((id) => (tests.get(id) ?? []).length > 0);
     const missing = requirement.scenarios.filter((id) => (tests.get(id) ?? []).length === 0);
@@ -380,12 +568,25 @@ export const buildTraceabilityReport = (
     status: (tests.get(id) ?? []).length > 0 ? "DECLARATION_COVERED" : "DECLARATION_MISSING",
   }));
 
-  const rfScenarioRows: ScenarioRow[] = [...repoFactoryScenarios.entries()].map(([id, description]) => ({
-    id,
-    description,
-    tests: tests.get(id) ?? [],
-    status: (tests.get(id) ?? []).length > 0 ? "DECLARATION_COVERED" : "DECLARATION_MISSING",
-  }));
+  const rfScenarioRows: RepoFactoryScenarioRow[] = [...repoFactoryScenarios.entries()].map(([id, description]) => {
+    const entries = external.scenarios.filter((entry) => entry.id === id);
+    const passed = (tests.get(id) ?? []).length > 0;
+    return {
+      id,
+      description,
+      tests: tests.get(id) ?? [],
+      status: repoFactoryVerdict(passed, passed || declaredScenarioIds.has(id), entries),
+      external: entries.map((entry) => ({
+        ...entry,
+        repository: external.repository,
+        revision: external.revision,
+        ciRun: external.ciRun,
+        acpUnattendedRun: "NOT_SUPPORTED" as const,
+      })),
+    };
+  });
+  const rfIds = (status: RepoFactoryScenarioRow["status"]): string[] =>
+    rfScenarioRows.filter((row) => row.status === status).map((row) => row.id);
 
   return {
     generatedFrom: [
@@ -409,12 +610,11 @@ export const buildTraceabilityReport = (
       scenariosWithPassedDeclarations: scenarioRows.filter((row) => row.status === "DECLARATION_COVERED").length,
       scenariosMissing: scenarioRows.filter((row) => row.status === "DECLARATION_MISSING").map((row) => row.id),
       repoFactoryScenarios: rfScenarioRows.length,
-      repoFactoryScenariosWithPassedDeclarations: rfScenarioRows.filter(
-        (row) => row.status === "DECLARATION_COVERED",
-      ).length,
-      repoFactoryScenariosMissing: rfScenarioRows
-        .filter((row) => row.status === "DECLARATION_MISSING")
-        .map((row) => row.id),
+      repoFactoryScenariosWithPassedDeclarations: rfIds("DECLARATION_COVERED").length,
+      repoFactoryScenariosMissing: rfIds("DECLARATION_MISSING"),
+      repoFactoryScenariosExternal: rfIds("EXTERNAL"),
+      repoFactoryScenariosDuplicated: rfIds("DUPLICATE"),
+      repoFactoryExternalEvidenceProblems: externalEvidenceProblems(external, repoFactoryScenarios),
     },
     requirements: requirementRows,
     scenarios: scenarioRows,
@@ -422,10 +622,19 @@ export const buildTraceabilityReport = (
   };
 };
 
+/**
+ * Repo Factory scenarios count the way CP scenarios do: a missing or failed one fails the report.
+ * This used to read only the CP side, so `pnpm trace` exited 0 with 13 of 25 Repo Factory
+ * scenarios uncovered, and the exit code was an all-clear nobody could rely on. External
+ * scenarios do not fail it, and do not pass it silently either: `main` names them on every run.
+ */
 export const traceabilityPasses = (report: TraceabilityReport): boolean =>
   report.testRun.success &&
   report.summary.scenariosMissing.length === 0 &&
-  report.summary.requirementsWithGaps === 0;
+  report.summary.requirementsWithGaps === 0 &&
+  report.summary.repoFactoryScenariosMissing.length === 0 &&
+  report.summary.repoFactoryScenariosDuplicated.length === 0 &&
+  report.summary.repoFactoryExternalEvidenceProblems.length === 0;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -527,9 +736,11 @@ const markdownReport = (report: TraceabilityReport): string => [
   "coverage are not measured, so this report is not proof that a requirement is met in the",
   "running system.",
   "",
-  `Measured at \`${report.measuredAt}\`. The copy committed to the repository is only as current`,
-  "as its last regeneration — `pnpm trace` recomputes it, and CI recomputes it on every run, so",
-  "a reader comparing this file against a later tree should re-run rather than trust the counts.",
+  `Measured at \`${report.measuredAt}\`: the declarations are read from that tree, and the statuses`,
+  "come from the Vitest result set supplied through `ACP_VITEST_RESULTS`, which has to be from a run",
+  "of that same tree. CI does not run `pnpm trace`, so the copy committed to the repository changes",
+  "only when someone regenerates and commits it. A reader comparing this file against a later tree",
+  "should re-run it rather than trust the counts.",
   "",
   `- Vitest result set: ${report.testRun.passed}/${report.testRun.total} passed; ${report.testRun.failed} failed; ${report.testRun.pending} pending`,
   `- Requirements: ${report.summary.requirements} (declaration coverage ${report.summary.requirementsWithDeclarationCoverage}, gaps ${report.summary.requirementsWithGaps})`,
@@ -537,10 +748,17 @@ const markdownReport = (report: TraceabilityReport): string => [
   report.summary.scenariosMissing.length > 0
     ? `- Missing scenarios: ${report.summary.scenariosMissing.join(", ")}`
     : "- Missing scenarios: none",
-  `- Repo Factory scenarios: ${report.summary.repoFactoryScenarios} (passed declarations ${report.summary.repoFactoryScenariosWithPassedDeclarations})`,
+  `- Repo Factory scenarios: ${report.summary.repoFactoryScenarios} (passed declarations ${report.summary.repoFactoryScenariosWithPassedDeclarations}, external ${report.summary.repoFactoryScenariosExternal.length}, missing ${report.summary.repoFactoryScenariosMissing.length}, duplicated ${report.summary.repoFactoryScenariosDuplicated.length})`,
   report.summary.repoFactoryScenariosMissing.length > 0
     ? `- Missing Repo Factory scenarios: ${report.summary.repoFactoryScenariosMissing.join(", ")}`
     : "- Missing Repo Factory scenarios: none",
+  report.summary.repoFactoryScenariosExternal.length > 0
+    ? `- External Repo Factory scenarios, judged by another repository's tests and not verified by this result set: ${report.summary.repoFactoryScenariosExternal.join(", ")}`
+    : "- External Repo Factory scenarios: none",
+  ...(report.summary.repoFactoryScenariosDuplicated.length > 0
+    ? [`- Duplicated Repo Factory scenarios: ${report.summary.repoFactoryScenariosDuplicated.join(", ")}`]
+    : []),
+  ...report.summary.repoFactoryExternalEvidenceProblems.map((problem) => `- External evidence problem: ${problem}`),
   "",
   "| Requirement | Blocking | Declared scenarios | Declaration status |",
   "|---|---|---|---|",
@@ -558,12 +776,25 @@ const markdownReport = (report: TraceabilityReport): string => [
       `| ${row.id} | ${row.status} | ${row.tests.map((test) => `${test.file} › ${test.title}`).join("<br>") || "—"} |`,
   ),
   "",
-  "| Repo Factory scenario | Declaration status | Passed executable test declarations |",
-  "|---|---|---|",
-  ...report.repoFactoryScenarios.map(
-    (row) =>
-      `| ${row.id} | ${row.status} | ${row.tests.map((test) => `${test.file} › ${test.title}`).join("<br>") || "—"} |`,
-  ),
+  "A Repo Factory scenario is judged here by a passed declaration, or by another repository's tests",
+  "when it is listed in `REPO_FACTORY_EXTERNAL_EVIDENCE` (`src/tools/traceability.ts`). An EXTERNAL",
+  "row is a pointer to that repository's run, which this report does not read, and it is not",
+  "counted as passed. The last column is recorded with the entry, not measured: `—` means nothing",
+  "is recorded as unsupported, and this report does not measure the unattended run either way.",
+  "",
+  "| Repo Factory scenario | Verdict | Passed executable test declarations | Judged by another repository | Not supported by the ACP unattended run |",
+  "|---|---|---|---|---|",
+  ...report.repoFactoryScenarios.map((row) => {
+    const externally = row.external
+      .map(
+        (entry) =>
+          `${entry.arm === null ? "" : `${entry.arm} arm: `}${entry.repository}@${entry.revision.slice(0, 12)} ` +
+          `(CI run ${entry.ciRun}): ${entry.tests.join(", ")}${entry.limit ? ` (limit: ${entry.limit})` : ""}`,
+      )
+      .join("<br>");
+    const unsupported = row.external.map((entry) => entry.arm ?? "whole scenario").join(", ");
+    return `| ${row.id} | ${row.status} | ${row.tests.map((test) => `${test.file} › ${test.title}`).join("<br>") || "—"} | ${externally || "—"} | ${unsupported || "—"} |`;
+  }),
 ].join("\n");
 
 export interface TraceabilityMainOptions {
@@ -571,6 +802,8 @@ export interface TraceabilityMainOptions {
   vitest?: VitestJsonReport;
   writeEvidence?: boolean;
   emitOutput?: boolean;
+  /** Defaults to `REPO_FACTORY_EXTERNAL_EVIDENCE`. */
+  external?: ExternalScenarioEvidence;
 }
 
 export interface TraceabilityMainResult {
@@ -587,8 +820,12 @@ export const main = (options: TraceabilityMainOptions = {}): TraceabilityMainRes
   const scenarios = parseScenarioCatalogue(acpPrd, "CP");
   const rfScenarios = parseScenarioCatalogue(rfPrd, "RF");
   const vitest = options.vitest ?? runVitestJson(root);
-  const tests = passedScenarioReferences(collectExecutableTestDeclarations(root), vitest);
-  const report = buildTraceabilityReport(requirements.values(), scenarios, rfScenarios, tests, vitest);
+  const declarations = collectExecutableTestDeclarations(root);
+  const tests = passedScenarioReferences(declarations, vitest);
+  const report = buildTraceabilityReport(requirements.values(), scenarios, rfScenarios, tests, vitest, {
+    external: options.external ?? REPO_FACTORY_EXTERNAL_EVIDENCE,
+    declaredScenarioIds: new Set(declarations.flatMap((declaration) => declaration.scenarioIds)),
+  });
 
   if (options.writeEvidence ?? true) {
     mkdirSync(join(root, "evidence"), { recursive: true });
@@ -599,12 +836,29 @@ export const main = (options: TraceabilityMainOptions = {}): TraceabilityMainRes
   const passes = traceabilityPasses(report);
   if (options.emitOutput ?? true) {
     process.stdout.write(`${JSON.stringify(report.summary, null, 2)}\n`);
+    // Every run, passing or not: an external scenario that only appeared inside the JSON would
+    // pass silently, which is the thing it must never do.
+    const external = report.summary.repoFactoryScenariosExternal;
+    if (external.length > 0) {
+      process.stderr.write(
+        `${external.length} Repo Factory scenarios are EXTERNAL, judged by another repository's tests that ` +
+          `this result set does not contain: ${external.join(", ")}\n`,
+      );
+    }
     if (!passes) {
       process.stderr.write(
         report.testRun.success
           ? "traceability declaration gaps present; behavioural coverage is not measured\n"
           : "Vitest result set contains failures; declaration traceability cannot claim a passing suite\n",
       );
+      const { repoFactoryScenariosMissing: missing, repoFactoryScenariosDuplicated: duplicated } = report.summary;
+      if (missing.length > 0) process.stderr.write(`Repo Factory scenarios missing: ${missing.join(", ")}\n`);
+      if (duplicated.length > 0) {
+        process.stderr.write(`Repo Factory scenarios with more than one judge: ${duplicated.join(", ")}\n`);
+      }
+      for (const problem of report.summary.repoFactoryExternalEvidenceProblems) {
+        process.stderr.write(`external evidence: ${problem}\n`);
+      }
     }
   }
   return { report, exitCode: passes ? 0 : 1 };
