@@ -881,7 +881,10 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
       await fixture.relayDelivers(elsewhere);
       expect(fixture.writes()).toBe(before);
       expect(fixture.admitted(elsewhere.id)).toBeUndefined();
-      expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_CHANNEL_MISMATCH)).toBe(1);
+      // Refused by the subscriber before the seam: the event's room is not the room the CTO's
+      // session answers in. The seam's own channel rule (BUZZ_PEER_CHANNEL_MISMATCH) stays behind it.
+      expect(fixture.subscriber.counters().rejections["event-room-not-bound"]).toBe(1);
+      expect(fixture.refusedWith(ReasonCode.BUZZ_PEER_CHANNEL_MISMATCH)).toBe(0);
       // The bare bucket is what health used to say; the reason code is now part of the key.
       expect(fixture.subscriber.counters().rejections["admission-refused"]).toBeUndefined();
 

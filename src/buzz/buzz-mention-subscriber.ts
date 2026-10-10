@@ -1057,6 +1057,14 @@ type BuzzMentionRejection =
   | "event-wrong-kind"
   | "event-not-addressed"
   | "event-conversation-unusable"
+  /**
+   * The event's single room is not the room the bound session answers in, as the registry stores
+   * it (`sessions.buzz_address`). Checked here rather than trusted to the relay's `#h` filter, the
+   * same way the `p` tag is: a relay that widened the filter would otherwise hand this identity a
+   * mention from a room its CTO does not answer in. Deterministic, so it neither reconnects nor
+   * moves the window, and nothing is consumed on anyone's behalf.
+   */
+  | "event-room-not-bound"
   | "role-not-held";
 
 /** A rejection as the tally keys it: one of the fixed reasons, or a refusal with its reason code. */
@@ -1967,6 +1975,11 @@ class BuzzMentionSubscription {
     // binding that has moved since this line.
     if (!sameBinding(pinned, fresh.binding)) this.#binding = fresh.binding;
     const bound = fresh.binding;
+
+    // Exactly the stored room, and one this identity subscribes in. The room tag's cardinality was
+    // checked above (none and several are refused); this is its value, against the binding just
+    // judged rather than against the relay's filter or the `p` tag.
+    if (conversation !== bound.room || !this.#rooms.includes(conversation)) return rejected("event-room-not-bound");
 
     // An event the seam already refused as preceding this role's binding is not submitted again.
     // The refusal is permanent for the role — a later binding generation is created later, so it
