@@ -1852,6 +1852,17 @@ export class Outbox {
     ) !== undefined;
   }
 
+  /**
+   * Whether this admitted event is spent: an outbox row pointing at it, of any kind, has left
+   * PENDING (`MESSAGE_DEPARTED`), or its turn has held a terminal fact (`TURN_TERMINAL`). The event
+   * half of `handOverEligibleSql`, read from the same append-only record, so a `true` here means no
+   * hand-over path can give the event to any holder again. Keyed by the event the caller names,
+   * never by an outbox row's current pointer or status.
+   */
+  sourceEventSpent(channel: string, nonce: string): boolean {
+    return this.#sourceSpent(channel, nonce, ["MESSAGE_DEPARTED", "TURN_TERMINAL"]);
+  }
+
   /** Whether this admitted event was spent for any of `reasons`: `sourceNeverSpentSql`, as a read. */
   #sourceSpent(channel: string, nonce: string, reasons: readonly SourceSpentReason[]): boolean {
     return this.db.get<{ present: number }>(

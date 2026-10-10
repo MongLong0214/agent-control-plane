@@ -11,6 +11,7 @@ import {
   sameBootstrapPlanBinding,
 } from "../bootstrap/bootstrap-plan.ts";
 import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
+import type { ProjectManifest } from "../contracts/manifest.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -29,6 +30,15 @@ import {
 } from "../domain/types.ts";
 import { diffPatch } from "../git/git.ts";
 import { canonical } from "../guard/workspace-probe.ts";
+import {
+  type ContractChangeBinding,
+  type ContractChangeWorkflowEvidence,
+  contractChangeCoverageTarget,
+  currentContractChangePlan,
+  isContractChangeRun,
+  sameContractChangeBinding,
+  storedManifest,
+} from "../registry/contract-change-plan.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
   ProviderSessionProvisionError,
@@ -99,7 +109,17 @@ export interface ReviewPacket {
    * planned outputs the reviewer judged, as the gate reloaded them from the PLAN artifact.
    */
   bootstrapPlan?: BootstrapPlanBinding;
+  /**
+   * Issue #246 B2-a — present only on a CONTRACT_CHANGE review: the PLAN, the manifest it carries and
+   * the base it changes, as the gate reloaded them, and the CI workflows a later activation verifies.
+   */
+  contractChange?: ContractChangeReviewBinding;
   createdAt: string;
+}
+
+/** What a CONTRACT_CHANGE review records it judged (#246 B2-a). */
+export interface ContractChangeReviewBinding extends ContractChangeBinding {
+  workflowEvidence: ContractChangeWorkflowEvidence[];
 }
 
 export interface ReviewerPreference {
@@ -139,6 +159,23 @@ export interface BootstrapPlanReviewRequest {
   manifest?: unknown;
 }
 
+/**
+ * Issue #246 B2-a — the review a CONTRACT_CHANGE candidate that joins no repository gets: the
+ * manifest its PLAN carries judged against the task contract and the base it changes. A
+ * CONTRACT_CHANGE candidate with repositories gets the candidate review, which then covers the
+ * manifest as well. As with the other requests, only the run, its current candidate and the PLAN
+ * that candidate names are trusted; `manifest` and `baseManifest` here are never read.
+ */
+export interface ContractChangeReviewRequest {
+  kind: "CONTRACT_CHANGE";
+  runId: string;
+  snapshot: CandidateSnapshot;
+  contract: TaskContract;
+  contractDigest: string;
+  manifest?: unknown;
+  baseManifest?: unknown;
+}
+
 /** The composition root supplies the capacity admission that reviewer allocation needs. */
 export interface BlindReviewCapacityGate {
   refreshForBlindReview(target?: DispatchCapacityTarget): Promise<Decision<void>>;
@@ -146,7 +183,7 @@ export interface BlindReviewCapacityGate {
 
 /** Narrow capability the composition root hands to CandidatePipeline, not to agents. */
 export type BlindReviewInvoker = (
-  request: BlindReviewRequest | BootstrapPlanReviewRequest,
+  request: BlindReviewRequest | BootstrapPlanReviewRequest | ContractChangeReviewRequest,
 ) => Promise<Decision<ReviewPacket>>;
 
 /** What every reviewer constituted for a run needs to know about the request. */
@@ -162,6 +199,35 @@ interface TrustedBootstrapPlanReview {
   outputs: PlannedBootstrapOutputs;
   manifest: unknown;
 }
+
+/** A CONTRACT_CHANGE candidate's change once it has been reloaded from the PLAN it names. */
+interface TrustedContractChange {
+  projectId: string;
+  binding: ContractChangeBinding;
+  manifest: ProjectManifest;
+  baseManifest: ProjectManifest;
+  workflowEvidence: ContractChangeWorkflowEvidence[];
+  /** `<projectId>:#manifest/<manifestDigest>`, the coverage item the reviewer must account for. */
+  target: { identity: string; path: string };
+}
+
+/** A CONTRACT_CHANGE request once its run, candidate, contract and change have been reloaded. */
+interface TrustedContractChangeReview {
+  runId: string;
+  snapshot: CandidateSnapshot;
+  contract: TaskContract;
+  contractDigest: string;
+  change: TrustedContractChange;
+}
+
+/** Every coverage item a candidate review must account for: its files, and a contract change's manifest. */
+const candidateCoverageTargets = (
+  snapshot: CandidateSnapshot,
+  change: TrustedContractChange | null,
+): Array<{ identity: string; path: string }> => [
+  ...snapshotCoverageTargets(snapshot),
+  ...(change === null ? [] : [change.target]),
+];
 
 const VERDICT_SCHEMA = {
   type: "object",
@@ -205,12 +271,12 @@ const REVIEW_TIMEOUT_MS = 20 * 60 * 1000;
  * actual candidate heads and diffs; coverage targets make omissions mechanically visible
  * to the reviewer before it answers.
  */
-const reviewPacketDigest = (request: BlindReviewRequest): string =>
+const reviewPacketDigest = (request: BlindReviewRequest, change: TrustedContractChange | null = null): string =>
   digestOf({
     candidateSnapshotDigest: candidateSnapshotDigest(request.snapshot),
     contractDigest: request.contractDigest,
     verificationDigest: digestOf(request.verification),
-    coverageTargets: snapshotCoverageTargets(request.snapshot).map(({ identity, path }) => `${identity}:${path}`),
+    coverageTargets: candidateCoverageTargets(request.snapshot, change).map(({ identity, path }) => `${identity}:${path}`),
   });
 
 /**
@@ -290,13 +356,14 @@ export class BlindReviewGate {
   }
 
   async review(
-    request: BlindReviewRequest | BootstrapPlanReviewRequest,
+    request: BlindReviewRequest | BootstrapPlanReviewRequest | ContractChangeReviewRequest,
     capability?: symbol,
   ): Promise<Decision<ReviewPacket>> {
     if (capability !== this.#pipelineCapability) {
       return this.manualInvocation("unscoped-review-call", request.runId) as Decision<ReviewPacket>;
     }
     if (request.kind === "BOOTSTRAP_PLAN") return this.reviewBootstrapPlan(request);
+    if (request.kind === "CONTRACT_CHANGE") return this.reviewContractChangePlan(request);
     return this.reviewCandidate(request);
   }
 
@@ -310,8 +377,13 @@ export class BlindReviewGate {
     const trusted = this.trustedInputs(request, snapshotDigest);
     if (!trusted.allowed) return trusted as Decision<ReviewPacket>;
     request = trusted.value;
+    // #246 B2-a — a CONTRACT_CHANGE candidate's review covers the manifest its PLAN carries as well
+    // as its files, reloaded from that PLAN rather than taken from the request.
+    const changed = this.contractChangeForCandidate(request.runId, request.snapshot);
+    if (!changed.allowed) return changed as Decision<ReviewPacket>;
+    const change = changed.value;
 
-    const expected = snapshotCoverageTargets(request.snapshot);
+    const expected = candidateCoverageTargets(request.snapshot, change);
     const reviewers: ReviewerBinding[] = [];
     const rememberReviewer = (reviewer: ReviewerBinding): void => {
       reviewers.push(reviewer);
@@ -322,20 +394,26 @@ export class BlindReviewGate {
       if (!collected.allowed) return collected as Decision<ReviewPacket>;
       const { diffs, binaryArtifacts } = collected.value;
 
-      const totalChars = diffs.reduce((n, d) => n + d.diff.length, 0) + this.promptOverhead(request);
+      const totalChars = diffs.reduce((n, d) => n + d.diff.length, 0) + this.promptOverhead(request, change);
       const chunked = totalChars > CHUNK_THRESHOLD_CHARS;
 
       let outcome: Decision<ReviewOutcome>;
       if (chunked) {
-        outcome = await this.chunkedReview(request, diffs, rememberReviewer);
+        outcome = await this.chunkedReview(request, diffs, rememberReviewer, change);
       } else {
         const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
-        outcome = await this.singleReview(request, this.buildPrompt(request, diffs), reviewer.value);
+        outcome = await this.singleReview(request, this.buildPrompt(request, diffs, undefined, change), reviewer.value);
       }
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
+      // The reviewer answered asynchronously and `plan_submit` may have replaced the PLAN meanwhile:
+      // a verdict on a PLAN the run no longer has is stale and is not stored. `settle` does not await.
+      if (change !== null) {
+        const stillCurrent = this.contractChangeForCandidate(request.runId, request.snapshot);
+        if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+      }
       return this.settle({
         runId: request.runId,
         contractDigest: request.contractDigest,
@@ -345,6 +423,8 @@ export class BlindReviewGate {
         expected,
         binaryArtifacts,
         bootstrapPlan: null,
+        contractChange: change === null ? null : { ...change.binding, workflowEvidence: change.workflowEvidence },
+        planReview: false,
       });
     } finally {
       this.release(reviewers);
@@ -392,6 +472,53 @@ export class BlindReviewGate {
         expected,
         binaryArtifacts: [],
         bootstrapPlan: inputs.binding,
+        contractChange: null,
+        planReview: true,
+      });
+    } finally {
+      this.release(reviewers);
+    }
+  }
+
+  /**
+   * Issue #246 B2-a — the review of a CONTRACT_CHANGE candidate that joins no repository: the manifest
+   * its PLAN carries and the base it changes, both reloaded by digest, judged by a reviewer that is
+   * constituted, isolated, egress-checked and held to coverage exactly as a candidate's is. The packet
+   * is stored through the same evidence writer with the change it judged.
+   */
+  private async reviewContractChangePlan(request: ContractChangeReviewRequest): Promise<Decision<ReviewPacket>> {
+    const snapshotDigest = candidateSnapshotDigest(request.snapshot);
+    const trusted = this.trustedContractChangeInputs(request, snapshotDigest);
+    if (!trusted.allowed) return trusted as Decision<ReviewPacket>;
+    const inputs = trusted.value;
+    const expected = [inputs.change.target];
+
+    const reviewers: ReviewerBinding[] = [];
+    try {
+      const reviewer = await this.constituteReviewer(inputs);
+      if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
+      reviewers.push(reviewer.value);
+      const outcome = await this.singleReview(
+        inputs,
+        this.buildContractChangePrompt(inputs, expected),
+        reviewer.value,
+        CONTRACT_CHANGE_REVIEWER_SYSTEM_PROMPT,
+      );
+      if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
+      // As for a bootstrap PLAN: reloaded after the reviewer answered, before the verdict is kept.
+      const stillCurrent = this.trustedContractChangeInputs(request, snapshotDigest);
+      if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
+      return this.settle({
+        runId: inputs.runId,
+        contractDigest: inputs.contractDigest,
+        snapshotDigest,
+        outcome: outcome.value,
+        chunked: false,
+        expected,
+        binaryArtifacts: [],
+        bootstrapPlan: null,
+        contractChange: { ...inputs.change.binding, workflowEvidence: inputs.change.workflowEvidence },
+        planReview: true,
       });
     } finally {
       this.release(reviewers);
@@ -413,6 +540,9 @@ export class BlindReviewGate {
     expected: Array<{ identity: string; path: string }>;
     binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
     bootstrapPlan: BootstrapPlanBinding | null;
+    contractChange: ContractChangeReviewBinding | null;
+    /** The reviewer read a PLAN's outputs or manifest, not a diff and its verification. */
+    planReview: boolean;
   }): Decision<ReviewPacket> {
     const { runId, snapshotDigest, outcome, chunked, expected } = input;
     const authoritativeReviewer = outcome.reviewer;
@@ -438,6 +568,8 @@ export class BlindReviewGate {
       binaryArtifacts: input.binaryArtifacts,
       egressEvidence: outcome.egressEvidence,
       bootstrapPlan: input.bootstrapPlan,
+      contractChange: input.contractChange,
+      planReview: input.planReview,
     });
 
     // §18.4 / CP-HI-04 — re-check independence at packet time: a session can join the
@@ -499,6 +631,7 @@ export class BlindReviewGate {
           provider: chunkReviewer.provider,
         })),
         ...(input.bootstrapPlan === null ? {} : { reviewKind: "BOOTSTRAP_PLAN" }),
+        ...(input.contractChange === null ? {} : { reviewKind: "CONTRACT_CHANGE" }),
       },
     });
 
@@ -1007,19 +1140,31 @@ export class BlindReviewGate {
     request: BlindReviewRequest,
     diffs: Array<{ identity: string; diff: string; files: string[] }>,
     rememberReviewer: (reviewer: ReviewerBinding) => void,
+    change: TrustedContractChange | null = null,
   ): Promise<Decision<ReviewOutcome>> {
     // A chunk adds repository/file fences and the chunk heading beyond the empty-prompt
     // measurement. Reserve a bounded envelope so the complete serialized prompt, not only
     // the patch body, remains inside the review budget.
-    const chunkBudget = CHUNK_THRESHOLD_CHARS - this.promptOverhead(request) - 4_096;
+    const chunkBudget = CHUNK_THRESHOLD_CHARS - this.promptOverhead(request, change) - 4_096;
     if (chunkBudget <= 0) {
       return deny(ReasonCode.EVIDENCE_MISSING, "review prompt metadata exceeds the reviewer context budget", {
         runId: request.runId,
-        overhead: this.promptOverhead(request),
+        overhead: this.promptOverhead(request, change),
         budget: CHUNK_THRESHOLD_CHARS,
       });
     }
     const chunks = splitDiffs(diffs, chunkBudget);
+    // #246 B2-a — every chunk prompt carries the contract change; the first chunk's reviewer is the
+    // one that may claim the manifest, so the reducer can tell whether any reviewer covered it.
+    if (change !== null && chunks.length > 0) {
+      const key = `${change.target.identity}:${change.target.path}`;
+      chunks[0]!.push({
+        identity: change.target.identity,
+        diff: "",
+        files: [change.target.path],
+        coverageTargets: [{ file: key, slice: `${key}:whole` }],
+      });
+    }
     const coveredFiles = new Set<string>();
     const coveredSlices = new Set<string>();
     const expectedSlices = new Map<string, string>();
@@ -1033,7 +1178,7 @@ export class BlindReviewGate {
     let worst: ReviewVerdict = "PASS";
 
     for (const [index, chunk] of chunks.entries()) {
-      const prompt = this.buildPrompt(request, chunk, { chunk: index + 1, of: chunks.length });
+      const prompt = this.buildPrompt(request, chunk, { chunk: index + 1, of: chunks.length }, change);
       if (prompt.length > CHUNK_THRESHOLD_CHARS) {
         return deny(ReasonCode.EVIDENCE_MISSING, "a review chunk exceeds the context budget", {
           runId: request.runId,
@@ -1093,7 +1238,7 @@ export class BlindReviewGate {
     // Coverage reducer: every touched file must have been seen by at least one chunk,
     // and every range slice of an oversized file must have been claimed by the chunk
     // that actually contained it. A first-slice claim cannot cover later slices.
-    const expected = snapshotCoverageTargets(request.snapshot).map((t) => `${t.identity}:${t.path}`);
+    const expected = candidateCoverageTargets(request.snapshot, change).map((t) => `${t.identity}:${t.path}`);
     const unseenFiles = expected.filter((key) => !coveredFiles.has(key));
     const unseenSlices = [...expectedSlices.entries()]
       .filter(([slice]) => !coveredSlices.has(slice))
@@ -1113,7 +1258,7 @@ export class BlindReviewGate {
     if (!finalReviewer.allowed) return finalReviewer as Decision<never>;
     rememberReviewer(finalReviewer.value);
 
-    const finalPrompt = this.buildFinalPrompt(request, reduced, chunks.length);
+    const finalPrompt = this.buildFinalPrompt(request, reduced, chunks.length, change);
     if (finalPrompt.length > CHUNK_THRESHOLD_CHARS) {
       return deny(ReasonCode.EVIDENCE_MISSING, "the reduced final-review prompt exceeds the context budget", {
         runId: request.runId,
@@ -1190,6 +1335,7 @@ export class BlindReviewGate {
     request: BlindReviewRequest,
     reduced: RawVerdict,
     chunkCount: number,
+    change: TrustedContractChange | null = null,
   ): string {
     return [
       `# Final review over a reduced ${chunkCount}-chunk result`,
@@ -1201,9 +1347,9 @@ export class BlindReviewGate {
       `Goal: ${request.contract.goal}`,
       "",
       "## Packet identity and required coverage",
-      `Packet digest: ${reviewPacketDigest(request)}`,
+      `Packet digest: ${reviewPacketDigest(request, change)}`,
       "Required coverage:",
-      ...snapshotCoverageTargets(request.snapshot).map((target) => `- ${target.identity}:${target.path}`),
+      ...candidateCoverageTargets(request.snapshot, change).map((target) => `- ${target.identity}:${target.path}`),
       "Acceptance criteria:",
       ...request.contract.acceptance.map((a) => `- ${a}`),
       "",
@@ -1222,6 +1368,7 @@ export class BlindReviewGate {
     request: BlindReviewRequest,
     diffs: Array<{ identity: string; diff: string; files: string[] }>,
     chunk?: { chunk: number; of: number },
+    change: TrustedContractChange | null = null,
   ): string {
     const sections = [
       chunk ? `# Review chunk ${chunk.chunk} of ${chunk.of}` : "# Candidate review",
@@ -1240,10 +1387,11 @@ export class BlindReviewGate {
       "```",
       "",
       "## Packet identity and required coverage",
-      `Packet digest: ${reviewPacketDigest(request)}`,
+      `Packet digest: ${reviewPacketDigest(request, change)}`,
       "Required coverage:",
-      ...snapshotCoverageTargets(request.snapshot).map((target) => `- ${target.identity}:${target.path}`),
+      ...candidateCoverageTargets(request.snapshot, change).map((target) => `- ${target.identity}:${target.path}`),
       "",
+      ...(change === null ? [] : contractChangeSection(change)),
       "## Deterministic verification evidence",
       "```json",
       JSON.stringify(request.verification, null, 2),
@@ -1351,6 +1499,54 @@ export class BlindReviewGate {
     ].join("\n");
   }
 
+  /**
+   * Issue #246 B2-a — the reviewer is asked to judge the manifest a CONTRACT_CHANGE PLAN carries
+   * against the task contract and the base it changes, and to account for the manifest item.
+   */
+  private buildContractChangePrompt(
+    inputs: TrustedContractChangeReview,
+    expected: Array<{ identity: string; path: string }>,
+  ): string {
+    const contract = inputs.contract;
+    return [
+      "# Contract change review",
+      "",
+      "This run changes the project's contract and joins no repository. Below are the manifest it",
+      "proposes and the base manifest it would replace. Judge whether the proposed manifest is what the",
+      "task contract asks for, and whether anything it requires, runs or trusts is unsafe, wrong or missing.",
+      "",
+      "## Task contract",
+      `Goal: ${contract.goal}`,
+      `Why: ${contract.why}`,
+      `Scope: ${contract.scope.join("; ") || "(unspecified)"}`,
+      `Non-goals: ${contract.nonGoals.join("; ") || "(none)"}`,
+      "Acceptance criteria:",
+      ...contract.acceptance.map((a) => `- ${a}`),
+      "",
+      ...contractChangeSection(inputs.change),
+      "## Required coverage",
+      ...expected.map((target) => `- ${target.identity}:${target.path}`),
+      "",
+      "## Required response",
+      "Return a single JSON object and nothing else — no prose before or after it:",
+      "```json",
+      JSON.stringify(
+        {
+          verdict: "PASS | REVISE | BLOCK",
+          coveredFiles: ["<project-id>:#manifest/<digest>"],
+          omittedItems: [],
+          findings: [],
+        },
+        null,
+        2,
+      ),
+      "```",
+      "`coveredFiles` must list every required coverage item you actually examined, exactly as written above.",
+      "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
+      "`findings` may be empty. Everything you need is above; you have no tools and are not expected to look anything up.",
+    ].join("\n");
+  }
+
   private assemble(input: {
     request: Pick<BlindReviewRequest, "runId" | "contractDigest">;
     snapshotDigest: string;
@@ -1363,8 +1559,11 @@ export class BlindReviewGate {
     egressEvidence: ReviewerEgressRecord[];
     /** A BOOTSTRAP_PLAN review's binding; null for a candidate review, whose packet has no such key. */
     bootstrapPlan: BootstrapPlanBinding | null;
+    /** A CONTRACT_CHANGE review's binding; null for any other review, whose packet has no such key. */
+    contractChange: ContractChangeReviewBinding | null;
+    planReview: boolean;
   }): ReviewPacket {
-    const bootstrap = input.bootstrapPlan !== null;
+    const planReview = input.planReview;
     return {
       runId: input.request.runId,
       candidateSnapshotDigest: input.snapshotDigest,
@@ -1382,9 +1581,9 @@ export class BlindReviewGate {
       inputManifest: {
         contract: true,
         snapshotManifest: true,
-        diff: !bootstrap,
-        verificationEvidence: !bootstrap,
-        projectContext: bootstrap,
+        diff: !planReview,
+        verificationEvidence: !planReview,
+        projectContext: planReview || input.contractChange !== null,
         withheld: [...LOGICAL_WITHHELD_INPUTS],
         binaryArtifacts: input.binaryArtifacts,
       },
@@ -1401,6 +1600,7 @@ export class BlindReviewGate {
       findings: input.raw.findings,
       chunked: input.chunked,
       ...(input.bootstrapPlan === null ? {} : { bootstrapPlan: input.bootstrapPlan }),
+      ...(input.contractChange === null ? {} : { contractChange: input.contractChange }),
       createdAt: this.clock.nowIso(),
     };
   }
@@ -1607,6 +1807,125 @@ export class BlindReviewGate {
     });
   }
 
+  /**
+   * Issue #246 B2-a — a candidate's contract change, reloaded. A CONTRACT_CHANGE run's candidate must
+   * name the change its current PLAN implies, and is judged against it; any other run's candidate
+   * names none (null). The manifest and the base come from the PLAN artifact and the stored manifest
+   * by digest, never from a request.
+   */
+  private contractChangeForCandidate(runId: string, snapshot: CandidateSnapshot): Decision<TrustedContractChange | null> {
+    const run = this.db.get<{ kind: string; project_id: string | null; pinned_manifest_digest: string | null }>(
+      `SELECT kind, project_id, pinned_manifest_digest FROM runs WHERE run_id = ?`,
+      [runId],
+    );
+    if (!run || !isContractChangeRun(run)) {
+      if (snapshot.contractChange === undefined) return allow(ReasonCode.OK, null);
+      return deny(ReasonCode.INVALID_ARGUMENT, "only a CONTRACT_CHANGE run's candidate names a contract change", {
+        runId,
+        kind: run?.kind ?? null,
+      });
+    }
+    const named = snapshot.contractChange;
+    if (named === undefined || run.project_id === null) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "a CONTRACT_CHANGE candidate names the PLAN and manifest it changes", {
+        runId,
+        contractChange: named ?? null,
+      });
+    }
+    const current = currentContractChangePlan(
+      { kind: run.kind, projectId: run.project_id, pinnedManifestDigest: run.pinned_manifest_digest },
+      this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN),
+      (digest) => storedManifest(this.db, digest),
+    );
+    if (!current.allowed) return current as Decision<TrustedContractChange | null>;
+    if (!sameContractChangeBinding(current.value.binding, named)) {
+      return deny(ReasonCode.EVIDENCE_STALE, "the candidate names a PLAN or manifest that is not the run's current one", {
+        runId,
+        candidate: named,
+        current: current.value.binding,
+      });
+    }
+    return allow(ReasonCode.OK, {
+      projectId: run.project_id,
+      binding: current.value.binding,
+      manifest: current.value.manifest,
+      baseManifest: current.value.baseManifest,
+      workflowEvidence: current.value.workflowEvidence,
+      target: contractChangeCoverageTarget(run.project_id, current.value.binding),
+    });
+  }
+
+  /**
+   * Issue #246 B2-a — what a no-repository CONTRACT_CHANGE reviewer may be shown. Trusted: the run row,
+   * the candidate the run is on (whose digest covers its contract change), the pinned task contract,
+   * and the change that candidate names, reloaded by `contractChangeForCandidate`.
+   */
+  private trustedContractChangeInputs(
+    request: ContractChangeReviewRequest,
+    snapshotDigest: string,
+  ): Decision<TrustedContractChangeReview> {
+    const run = this.db.get<{ contract_digest: string; current_candidate_digest: string | null }>(
+      `SELECT contract_digest, current_candidate_digest FROM runs WHERE run_id = ?`,
+      [request.runId],
+    );
+    if (!run || request.snapshot.runId !== request.runId) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "review request is not bound to a persisted run", {
+        runId: request.runId,
+        snapshotRunId: request.snapshot.runId,
+      });
+    }
+    if (run.current_candidate_digest !== snapshotDigest) {
+      return deny(ReasonCode.EVIDENCE_STALE, "review request is not the run's current candidate", {
+        runId: request.runId,
+        currentCandidate: run.current_candidate_digest,
+        snapshotDigest,
+      });
+    }
+    if (request.snapshot.contractDigest !== run.contract_digest || request.contractDigest !== run.contract_digest) {
+      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "review request is not pinned to the run contract", {
+        runContractDigest: run.contract_digest,
+        snapshotContractDigest: request.snapshot.contractDigest,
+        suppliedContractDigest: request.contractDigest,
+      });
+    }
+    const contract = this.artifacts
+      .list<TaskContract>(request.runId, ArtifactKind.TASK_CONTRACT)
+      .find((artifact) => !artifact.superseded && artifact.digest === run.contract_digest);
+    if (!contract || digestOf(contract.content) !== run.contract_digest) {
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "the run's pinned task contract is not retrievable by digest", {
+        runId: request.runId,
+        expected: run.contract_digest,
+        found: contract?.digest ?? null,
+      });
+    }
+    if (digestOf(request.contract) !== run.contract_digest) {
+      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "the supplied task contract is not the run's immutable contract", {
+        runId: request.runId,
+        expected: run.contract_digest,
+        found: contract.digest,
+      });
+    }
+    if (request.snapshot.repositories.length > 0 || request.snapshot.contractChange === undefined) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "a CONTRACT_CHANGE plan review is for a candidate that names its change and joins no repository", {
+        runId: request.runId,
+        repositories: request.snapshot.repositories.length,
+        contractChange: request.snapshot.contractChange ?? null,
+      });
+    }
+    const change = this.contractChangeForCandidate(request.runId, request.snapshot);
+    if (!change.allowed) return change as Decision<TrustedContractChangeReview>;
+    if (change.value === null) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "a CONTRACT_CHANGE review is for a CONTRACT_CHANGE run", { runId: request.runId });
+    }
+    return allow(ReasonCode.OK, {
+      runId: request.runId,
+      snapshot: request.snapshot,
+      contract: contract.content,
+      contractDigest: run.contract_digest,
+      change: change.value,
+    });
+  }
+
   /** Registry uncertainty must remain distinct from fallback-eligible capacity denial. */
   private reviewerScope(provider: string): Decision<boolean> {
     try {
@@ -1667,8 +1986,8 @@ export class BlindReviewGate {
     return allow(ReasonCode.OK, undefined);
   }
 
-  private promptOverhead(request: BlindReviewRequest): number {
-    return this.buildPrompt(request, []).length;
+  private promptOverhead(request: BlindReviewRequest, change: TrustedContractChange | null = null): number {
+    return this.buildPrompt(request, [], undefined, change).length;
   }
 
   /**
@@ -1770,6 +2089,46 @@ const BOOTSTRAP_PLAN_REVIEWER_SYSTEM_PROMPT = [
   "manifest does not call for and outputs it calls for that are missing. Do not praise.",
   "If you could not examine something, say so in omittedItems rather than guessing.",
 ].join(" ");
+
+/** The same independent reviewer, told that the candidate is a proposed project manifest (#246 B2-a). */
+const CONTRACT_CHANGE_REVIEWER_SYSTEM_PROMPT = [
+  "You are an independent blind reviewer for a production gate.",
+  "You did not write this change and you have no access to how it was produced.",
+  "Judge only the proposed project manifest against the stated task contract and the base manifest it replaces.",
+  "Attack the result: look for commands that do not check what they claim, evidence the manifest stops",
+  "requiring, CI workflows it trusts without reason, scope creep and anything missing. Do not praise.",
+  "If you could not examine something, say so in omittedItems rather than guessing.",
+].join(" ");
+
+/**
+ * Issue #246 B2-a — the proposed and base manifests a CONTRACT_CHANGE reviewer judges, both as the
+ * gate reloaded them by digest, and the CI workflows a later activation will check.
+ */
+const contractChangeSection = (change: TrustedContractChange): string[] => [
+  "## Contract change",
+  "This run proposes a new project manifest. It replaces the base manifest only if it is approved and",
+  "later activated; until then every run, this one included, is verified against the base.",
+  `Plan digest: ${change.binding.planDigest}`,
+  `Proposed manifest digest: ${change.binding.manifestDigest}`,
+  `Base manifest digest: ${change.binding.baseManifestDigest}`,
+  `Coverage item for the proposed manifest: ${change.target.identity}:${change.target.path}`,
+  "",
+  "### Proposed manifest",
+  "```json",
+  JSON.stringify(change.manifest, null, 2),
+  "```",
+  "",
+  "### Base manifest",
+  "```json",
+  JSON.stringify(change.baseManifest, null, 2),
+  "```",
+  "",
+  "### CI workflows a later activation must verify",
+  "```json",
+  JSON.stringify(change.workflowEvidence, null, 2),
+  "```",
+  "",
+];
 
 const parseVerdict = (input: unknown): RawVerdict | null => {
   const value =
@@ -1974,7 +2333,9 @@ export const reviewerWithheldIsLogicalOnly = (withheld: readonly string[]): bool
   );
 
 const splitCoverageKey = (key: string): { identity: string; path: string } | null => {
-  const separator = key.lastIndexOf(":");
+  // A manifest item's path is `#manifest/<digest>`, and a digest has a colon of its own (#246 B2-a).
+  const manifest = key.indexOf(":#manifest/");
+  const separator = manifest > 0 ? manifest : key.lastIndexOf(":");
   if (separator <= 0 || separator === key.length - 1) return null;
   return { identity: key.slice(0, separator), path: key.slice(separator + 1) };
 };

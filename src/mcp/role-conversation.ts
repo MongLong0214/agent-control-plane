@@ -129,6 +129,53 @@ export interface RoleBindingSource {
  * cannot: it is `Outbox`'s own payload-free projection, so "never the payload twice" is a property
  * of the type rather than of this port remembering not to fill one in.
  */
+/**
+ * A claimed message's stored provenance. Each field is `null` when admission did not store it for
+ * this message: unknown, never inferred.
+ */
+export interface OwnerMessageProvenance {
+  /** The ingress channel the source row was admitted on. */
+  channel: string;
+  /** The Buzz room (`h` tag) from the stored signed payload's `conversation`. */
+  room: string | null;
+  /**
+   * The signer's key as the digest-covered stored payload records it. Admission does not put the
+   * signer in that payload today, so this is `null`: unknown, not unsigned.
+   */
+  senderKey: null;
+  /**
+   * The source row's `actor` column as stored. **Unverified**: the column is written by admission
+   * from the authenticated envelope but is not covered by the payload digest the claim checks, and a
+   * raw edit of it shows here. Never a basis for owner judgement, approval or authority.
+   */
+  storedActorUnverified: string | null;
+  /** The original Buzz event id, from the source row's nonce. */
+  eventId: string | null;
+  /**
+   * The event this one replied to. Admission does not store an event's reply or thread tags, so
+   * this is always `null`: unknown. A thread is never taken as correlation from the text either.
+   */
+  replyToEventId: null;
+}
+
+/**
+ * What a wake caused by one verified Buzz mention carries: the channel identity the mention named,
+ * the role it was admitted for, the room it arrived in and its event id, as the daemon's own
+ * subscriber verified and admitted them. Supplied only by that delivery path; no other wake has one.
+ */
+export interface MentionWakeContext {
+  readonly actorId: string;
+  readonly roleKey: string;
+  readonly room: string;
+  readonly eventId: string;
+}
+
+/**
+ * Whether a mention's wake may still be handed to `binding`'s holder: the identity, the role and
+ * the room the mention was admitted for still stand behind that holder, as the composition judges.
+ */
+export type MentionWakeGate = (binding: RoleBinding, mention: MentionWakeContext) => boolean;
+
 export interface OwnerMessageHandover {
   claimed: {
     messageId: string;
@@ -142,6 +189,12 @@ export interface OwnerMessageHandover {
      * approval, and its completion settles its own turn and nothing the owner is owed.
      */
     principal: "owner" | "peer";
+    /**
+     * Where the claimed message came from, read only from what admission authenticated and stored
+     * for this message's own source row, never from its text or tags and never from another
+     * event. Informational: it changes no principal, approval or execution authority.
+     */
+    provenance: OwnerMessageProvenance;
   } | null;
   unresolved: readonly UnresolvedOwnerMessage[];
   /**
@@ -150,6 +203,13 @@ export interface OwnerMessageHandover {
    * Metadata only. Nothing was written for them; `reject` by id is what retires one.
    */
   withheld: readonly UnresolvedOwnerMessage[];
+  /**
+   * The withheld owner messages that came from a verified Buzz mention whose gate does not hold at
+   * claim time, each with the fixed reason `MENTION_NOT_ELIGIBLE`: the holder's identity for the
+   * mention's role, the mention's original room or the subscriber's eligibility no longer agree.
+   * Absent when there is none. Like every withheld row, nothing was written for them.
+   */
+  mentionWithheld?: readonly { readonly messageId: string; readonly reason: "MENTION_NOT_ELIGIBLE" }[];
   hasMore: boolean;
   /**
    * CEO peer messages ACP rejected while they were queued for this role — on a revoke, a takeover
@@ -432,6 +492,19 @@ export class RoleConversationPort {
    */
   readonly #endpointDir: string | null;
   readonly #wakeTimeoutMs: number;
+  /**
+   * The daemon's write transaction, when the composition supplies it. A wake's final holder check
+   * and its frame handoff run inside it, so every database writer, in this process or outside it,
+   * commits wholly before the check or wholly after the handoff. Absent, the two still run in one
+   * synchronous section, which orders them against this process alone.
+   */
+  readonly #serializeWake: (<T>(body: () => T) => T) | null;
+  /**
+   * The gate a mention-caused wake must pass, at its start and again inside the serialized
+   * handoff. Only a wake that carries a `MentionWakeContext` meets it; every other wake keeps the
+   * current-holder check alone. Absent, a mention wake is refused rather than sent ungated.
+   */
+  #mentionWakeGate: MentionWakeGate | null = null;
 
   constructor(
     role: Role,
@@ -440,17 +513,36 @@ export class RoleConversationPort {
       endpointDir?: string;
       wakeTimeoutMs?: number;
       ownerMessages?: OwnerMessageLedger;
+      serializeWake?: <T>(body: () => T) => T;
     } = {},
   ) {
     this.#role = role;
     this.#bindings = bindings;
+    this.#serializeWake = options.serializeWake ?? null;
     this.#ownerMessages = options.ownerMessages ?? null;
     this.#endpointDir = options.endpointDir === undefined ? null : resolvePath(options.endpointDir);
     this.#wakeTimeoutMs = options.wakeTimeoutMs ?? DEFAULT_ROLE_WAKE_TIMEOUT_MS;
   }
 
+  /** Installs the gate a mention-caused wake must pass. Read on every mention wake. */
+  useMentionWakeGate(gate: MentionWakeGate): void {
+    this.#mentionWakeGate = gate;
+  }
+
   get role(): Role {
     return this.#role;
+  }
+
+  /**
+   * Whether the wake begun for `peer` may still be written: the same live connection is attached for
+   * `roleKey`, on the same registration and endpoint, and it re-authenticates as the registry's
+   * current holder of that exact assignment, generation, session and incarnation.
+   */
+  #stillTheHolderToWake(roleKey: string, peer: LivePeer, registration: number, endpoint: string | null): boolean {
+    if (this.#live.get(roleKey) !== peer) return false;
+    if (peer.registration !== registration || peer.endpoint === null || peer.endpoint !== endpoint) return false;
+    const identity = peer.authenticate();
+    return identity.allowed && this.#isCurrentHolder(peer.binding, identity.value);
   }
 
   /**
@@ -997,7 +1089,7 @@ export class RoleConversationPort {
    * `connect`, and no filesystem check available here can prevent it — and it is not asked to:
    * the constant token is what makes winning the race worth nothing.
    */
-  async wake(roleKey: string): Promise<Decision<void>> {
+  async wake(roleKey: string, mention?: MentionWakeContext): Promise<Decision<void>> {
     const peer = this.#live.get(roleKey);
     if (!peer) {
       return deny(ReasonCode.ROLE_PEER_ABSENT, "no session is currently attached for this role", {
@@ -1022,14 +1114,27 @@ export class RoleConversationPort {
     }
     const revalidated = this.#validateEndpointPath(peer.endpoint);
     if (!revalidated.allowed) return revalidated as Decision<void>;
+    // A wake caused by a mention also needs the mention's identity, role and room to stand behind
+    // this holder, now and again at the handoff below. Any other wake (in-band work, a peer turn
+    // from the local socket, a registration's drain) keeps the current-holder check alone.
+    const mentionHolds = (): boolean =>
+      mention === undefined || (this.#mentionWakeGate !== null && this.#mentionWakeGate(peer.binding, mention));
+    if (!mentionHolds()) {
+      return deny(ReasonCode.ROLE_PEER_STALE, "the mention's identity, role or room no longer stands behind this holder", {
+        role: this.#role,
+        roleKey,
+      });
+    }
 
     // Read before the connect and compared after it. What this delivery is about is the
     // registration in force when it began; by the time it completes the holder may have registered
     // again, and a completion that wrote into the current registration's memory would be reporting
     // the previous endpoint's delivery as this one's. Both directions of that were reproduced.
     const registration = peer.registration;
+    const endpoint = peer.endpoint;
+    let outcome: "written" | "stale" | "unsettled";
     try {
-      await new Promise<void>((resolveWake, rejectWake: (failure: WakeFailure) => void) => {
+      outcome = await new Promise<"written" | "stale" | "unsettled">((resolveWake, rejectWake: (failure: WakeFailure) => void) => {
         const socket = connect(revalidated.value);
         const fail = (failure: WakeFailure): void => {
           socket.destroy();
@@ -1051,10 +1156,47 @@ export class RoleConversationPort {
           }),
         );
         socket.once("connect", () => {
-          // `end` rather than `write` then leaving it open: the peer's read side sees EOF, so a
-          // reader does not have to know the frame's length to know the wake is complete. This is
-          // what C0 measured the runtime accepting.
-          socket.end(ROLE_WAKE_FRAME, () => resolveWake());
+          // The holder is judged again here, in the same synchronous section as the write, and not
+          // only before the connect: the connect is asynchronous, and a revoke, a takeover or a new
+          // registration committed while it was in flight would otherwise be woken on the strength
+          // of a check that no longer holds (1080-N1-01). Nothing between this check and `end` can
+          // run another task. A mismatch writes no frame and discards this wake attempt only: the
+          // durable message and its outbox row are untouched, and the current holder's own
+          // registration or wake is what reaches it.
+          //
+          // With `serializeWake` the check and the handoff run inside the daemon's write
+          // transaction, which orders them against writers outside this process too: a revoke
+          // commits before the check or after the handoff. Nothing in the transaction waits on the
+          // network: `end` queues the frame with the kernel and returns, and its flush is observed
+          // after the commit. A transaction that fails is not a wake, whatever was queued.
+          let handedOff = false;
+          const handOff = (): void => {
+            if (!this.#stillTheHolderToWake(roleKey, peer, registration, endpoint)) return;
+            // For a mention's wake, its identity, role and room still stand behind the holder: a
+            // room lost or changed, or an exclusion, during the delayed connect hands off nothing.
+            // Read here, inside the same serialized section.
+            if (!mentionHolds()) return;
+            // `end` rather than `write` then leaving it open: the peer's read side sees EOF, so a
+            // reader does not have to know the frame's length to know the wake is complete. This
+            // is what C0 measured the runtime accepting.
+            socket.end(ROLE_WAKE_FRAME, () => {
+              if (handedOff) resolveWake("written");
+            });
+            handedOff = true;
+          };
+          try {
+            if (this.#serializeWake !== null) this.#serializeWake(handOff);
+            else handOff();
+          } catch {
+            handedOff = false;
+            socket.destroy();
+            resolveWake("unsettled");
+            return;
+          }
+          if (!handedOff) {
+            socket.destroy();
+            resolveWake("stale");
+          }
         });
       });
     } catch (failure) {
@@ -1074,6 +1216,20 @@ export class RoleConversationPort {
         role: this.#role,
         roleKey,
         shape: (failure as WakeFailure).shape,
+      });
+    }
+    // Neither is an endpoint failure, so nothing is remembered against the registration.
+    if (outcome === "stale") {
+      return deny(
+        ReasonCode.ROLE_PEER_STALE,
+        "the role's holder changed while the wake was connecting; the wake was not written",
+        { role: this.#role, roleKey },
+      );
+    }
+    if (outcome === "unsettled") {
+      return deny(ReasonCode.ROLE_PEER_FAILED, "the wake's transaction failed, so it is not recorded as written", {
+        role: this.#role,
+        roleKey,
       });
     }
     // A wake that landed is the contradiction of an earlier one that did not, so the memory goes --
