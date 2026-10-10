@@ -93,10 +93,11 @@ const start = async () => {
       },
       author.secretKey,
     ) as BuzzMentionEvent;
-  const claim = (): OwnerMessageHandover["claimed"] => {
+  const claim = (): OwnerMessageHandover["claimed"] => handover().claimed;
+  const handover = (): OwnerMessageHandover => {
     const taken = port.claimOwnerMessage(server, ROLE_KEY);
     if (!taken.allowed) throw new Error(`claim refused: ${taken.message}`);
-    return taken.value.claimed;
+    return taken.value;
   };
   const complete = (messageId: string): void => {
     expect(port.completeOwnerMessage(server, ROLE_KEY, messageId).allowed).toBe(true);
@@ -110,7 +111,10 @@ const start = async () => {
     subscriber,
     mention,
     claim,
+    handover,
     complete,
+    subscriberHandle: subscriber,
+    sessionId: session.sessionId,
     close: async () => {
       subscriber.close();
       await ingress.close();
@@ -228,4 +232,38 @@ describe("a claimed mention's provenance", () => {
       await f.close();
     }
   });
+
+});
+
+describe("a mention's message at claim time (1080-N5)", () => {
+  const ownerMessageStatus = (f: Awaited<ReturnType<typeof start>>) =>
+    f.h.cp.db.all<{ status: string }>(`SELECT status FROM outbox WHERE kind = 'OWNER_MESSAGE'`);
+
+  for (const rejudged of [true, false]) {
+    it(`withholds it while its room no longer holds${rejudged ? "" : ", with no re-judgement"}, and hands it over once it holds again`, async () => {
+      const f = await start();
+      try {
+        f.h.clock.advance(1_000);
+        const event = f.mention(f.owner, "claim me only from my room");
+        f.relay.publish(event);
+        await f.relay.drain(f.subscriber);
+        // The holder's session moves to a room its identity does not subscribe in.
+        f.h.cp.sessions.setBuzzAddress(f.sessionId, "room-elsewhere");
+        if (rejudged) f.subscriberHandle.rejudge();
+
+        const refused = f.handover();
+        expect(refused.claimed).toBeNull();
+        expect(refused.mentionWithheld).toEqual([{ messageId: refused.withheld[0]!.messageId, reason: "MENTION_NOT_ELIGIBLE" }]);
+        expect(ownerMessageStatus(f)).toEqual([{ status: "PENDING" }]);
+
+        f.h.cp.sessions.setBuzzAddress(f.sessionId, ROOM);
+        f.subscriberHandle.rejudge();
+        const claimed = f.claim();
+        expect(claimed?.provenance.eventId).toBe(event.id);
+        expect(ownerMessageStatus(f)).toEqual([{ status: "SENT" }]);
+      } finally {
+        await f.close();
+      }
+    });
+  }
 });

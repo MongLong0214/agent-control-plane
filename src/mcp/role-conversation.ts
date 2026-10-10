@@ -203,6 +203,13 @@ export interface OwnerMessageHandover {
    * Metadata only. Nothing was written for them; `reject` by id is what retires one.
    */
   withheld: readonly UnresolvedOwnerMessage[];
+  /**
+   * The withheld owner messages that came from a verified Buzz mention whose gate does not hold at
+   * claim time, each with the fixed reason `MENTION_NOT_ELIGIBLE`: the holder's identity for the
+   * mention's role, the mention's original room or the subscriber's eligibility no longer agree.
+   * Absent when there is none. Like every withheld row, nothing was written for them.
+   */
+  mentionWithheld?: readonly { readonly messageId: string; readonly reason: "MENTION_NOT_ELIGIBLE" }[];
   hasMore: boolean;
   /**
    * CEO peer messages ACP rejected while they were queued for this role — on a revoke, a takeover

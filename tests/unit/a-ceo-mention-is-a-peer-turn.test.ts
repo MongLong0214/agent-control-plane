@@ -370,7 +370,7 @@ const rotateCeo = (
 const replaceCto = (
   fixture: PeerFixture,
   options: { conversation: "REPLACED" | "SURVIVED"; takeIdentity?: boolean },
-): { sessionId: string; incarnation: string } => {
+): { sessionId: string; sessionSecret: string; incarnation: string } => {
   const { harness } = fixture;
   const next = readySession(harness, "cto-next", PROJECT_ROOM);
   const switched = harness.cp.bindings.switchTo({
@@ -1145,7 +1145,9 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
       const claim = JSON.parse(fixture.admitted(peerEvent.id)!.turn_claim_json!) as Record<string, unknown>;
       expect(claim["noReplyAt"]).toEqual(expect.any(String));
 
-      // ... while the owner's message follows the role once, as it always has.
+      // ... while the owner's message follows the role once, together with the mention's identity:
+      // a successor that does not carry the channel identity the mention named is withheld it
+      // (1080-N5), and takes it once the identity is its own.
       const successor = {
         roleKey: fixture.ctoRoleKey,
         bindingGeneration: harness.cp.bindings.active(fixture.ctoRoleKey)!.bindingGeneration,
@@ -1153,6 +1155,11 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
         sessionIncarnation: next.incarnation,
       };
       const ledger = ownerMessageLedger(harness.cp);
+      const withheld = ledger.claim(successor);
+      expect(withheld.allowed && withheld.value.claimed).toBe(null);
+      expect(withheld.allowed && withheld.value.mentionWithheld?.map((row) => row.reason)).toEqual(["MENTION_NOT_ELIGIBLE"]);
+      expect(harness.cp.sessions.transition(fixture.ctoSession.sessionId, SessionLifecycle.STOPPED, "replaced").reasonCode).toBe(ReasonCode.OK);
+      bindChannelIdentity(harness, next, fixture.cto.pubkey);
       const taken = ledger.claim(successor);
       expect(claimOf(taken.allowed ? taken.value : null).claimed).toMatchObject({
         text: "주인의 메시지",
@@ -1181,12 +1188,19 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
       const claim = JSON.parse(fixture.admitted(peerEvent.id)!.turn_claim_json!) as Record<string, unknown>;
       expect(claim["noReplyAt"]).toEqual(expect.any(String));
 
-      const taken = ownerMessageLedger(harness.cp).claim({
+      // The owner's message is carried, and is the successor's to take once the mention's channel
+      // identity is its own (1080-N5); before that it is withheld.
+      const successor = {
         roleKey: fixture.ctoRoleKey,
         bindingGeneration: generation,
         targetSessionId: next.sessionId,
         sessionIncarnation: next.incarnation,
-      });
+      };
+      const withheld = ownerMessageLedger(harness.cp).claim(successor);
+      expect(withheld.allowed && withheld.value.mentionWithheld?.map((row) => row.reason)).toEqual(["MENTION_NOT_ELIGIBLE"]);
+      expect(harness.cp.sessions.transition(fixture.ctoSession.sessionId, SessionLifecycle.STOPPED, "replaced").reasonCode).toBe(ReasonCode.OK);
+      bindChannelIdentity(harness, next, fixture.cto.pubkey);
+      const taken = ownerMessageLedger(harness.cp).claim(successor);
       expect(claimOf(taken.allowed ? taken.value : null).claimed).toMatchObject({
         text: "주인의 메시지",
         principal: "owner",

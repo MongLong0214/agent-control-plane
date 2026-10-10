@@ -4155,6 +4155,42 @@ export const ownerMessageProvenanceOf = (
   };
 };
 
+/**
+ * Whether an owner message may be handed to `holder` now, as far as the Buzz mention it came from
+ * is concerned. The mention is read from the message's own verified stored provenance: the source
+ * row's payload, checked against the digest the message was enqueued for, whose `mention` is the
+ * channel identity the event was addressed to and whose `conversation` is the room it arrived in.
+ * When a configured subscriber identity has that key, the holder's current session must carry it,
+ * for this role, and the subscriber must judge it admitted in that same room. Anything else (no
+ * mention, another channel, no configured identity of that key, no subscriber running, a source
+ * the claim itself will refuse) is not this gate's to withhold. The row's unverified `actor`
+ * column is never read.
+ */
+const buzzMentionClaimHolds = (cp: ControlPlane, holder: HolderIdentity, pointerPayload: unknown): boolean => {
+  const pointer = ownerMessagePointerOf(pointerPayload);
+  if (!pointer || pointer.sourceChannel !== "buzz") return true;
+  const source = cp.db.get<{ payload_json: string | null }>(
+    `SELECT payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+    [pointer.sourceChannel, pointer.sourceNonce],
+  );
+  let payload: unknown;
+  try {
+    payload = source?.payload_json ? (JSON.parse(source.payload_json) as unknown) : null;
+  } catch {
+    return true;
+  }
+  if (payload === null || digestOf(payload) !== pointer.sourcePayloadDigest) return true;
+  const { mention, conversation } = payload as { mention?: unknown; conversation?: unknown };
+  if (typeof mention !== "string" || mention.length === 0 || typeof conversation !== "string") return true;
+  const running = runningMentionSubscribers.get(cp) ?? null;
+  const eligibility = running?.deliveryEligibility({ actorId: mention, roleKey: holder.roleKey }) ?? null;
+  if (eligibility === null) return true;
+  const actorId = cp.db.get<{ buzz_actor_id: string | null }>(`SELECT buzz_actor_id FROM sessions WHERE session_id = ?`, [
+    holder.targetSessionId,
+  ])?.buzz_actor_id ?? null;
+  return actorId === mention && eligibility.eligible && eligibility.room === conversation;
+};
+
 export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
   /** The pointer on one owner-message row, or a denial naming what is wrong with it. */
   const pointerOn = (messageId: string) => {
@@ -4202,9 +4238,17 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         // handed over and not written to — and reported by id so the holder can reject it.
         const ceo = buzzPeerRegistry(cp).currentCeo();
         const ctoChannel = cp.sessions.get(holder.targetSessionId)?.buzzAddress ?? null;
+        // The owner messages withheld because the mention they came from no longer stands behind
+        // this holder, so the handover can name the reason.
+        const mentionGated = new Set<string>();
         const taken = cp.outbox.claimForHolder(
           holder,
           (candidate) => {
+            if (candidate.kind === MessageKind.OWNER_MESSAGE) {
+              if (buzzMentionClaimHolds(cp, holder, candidate.payload)) return true;
+              mentionGated.add(candidate.messageId);
+              return false;
+            }
             if (candidate.kind !== MessageKind.PEER_MESSAGE) return true;
             const source = admittedPeerSource(cp, candidate.payload);
             return peerProofIsCurrent(
@@ -4228,7 +4272,13 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         // Shown to the role's exact current holder only, whether or not it is the carry successor.
         // Present only when there is one, so a handover without any keeps its shape.
         const refusals = cp.outbox.peerMessageRefusalNoticesFor(holder).map(peerMessageRefusalNoticeOf);
-        const notices = refusals.length > 0 ? { refusedAtRestart: refusals } : {};
+        const gatedMentions = withheld
+          .filter((row) => mentionGated.has(row.messageId))
+          .map((row) => ({ messageId: row.messageId, reason: "MENTION_NOT_ELIGIBLE" as const }));
+        const notices = {
+          ...(refusals.length > 0 ? { refusedAtRestart: refusals } : {}),
+          ...(gatedMentions.length > 0 ? { mentionWithheld: gatedMentions } : {}),
+        };
         const message = taken.claimed[0];
         // Nothing new was handed over: either the queue is empty, or an unresolved hand-over is
         // blocking it. Both are reported with metadata only — `UnresolvedOwnerMessage` has no

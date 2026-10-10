@@ -502,6 +502,9 @@ export class ProvisionedSessionRuntime {
     lane: TurnLane,
   ): Promise<Decision<void>> {
     let completed = false;
+    // The mention triggers whose gate did not hold at the final check. The turn may still run for
+    // the others, but these were not served by it: they are released, never marked handled.
+    const notAdmitted = new Set<string>();
     try {
       // A refused turn is not a completed one: its triggers are released, never marked handled.
       const turn = await this.#turn(binding.sessionId, "resume", workPrompt(binding, triggers), {
@@ -510,14 +513,22 @@ export class ProvisionedSessionRuntime {
         purpose: "work",
         // Served while any trigger still holds: an ordinary one always does, and a mention's holds
         // only while its gate does, read at the final check below.
-        admissible: () => triggers.some((trigger) => trigger.stillAdmissible === undefined || trigger.stillAdmissible()),
+        admissible: () => {
+          notAdmitted.clear();
+          for (const trigger of triggers) {
+            if (trigger.stillAdmissible !== undefined && !trigger.stillAdmissible()) notAdmitted.add(trigger.id);
+          }
+          return triggers.some((trigger) => !notAdmitted.has(trigger.id));
+        },
       });
       completed = turn.allowed;
       return turn.allowed ? allow(ReasonCode.OK, undefined) : (turn as Decision<void>);
     } finally {
       for (const trigger of triggers) lane.claimed.delete(trigger.id);
       if (completed) {
-        for (const trigger of triggers) if (!this.#isEnvelope(trigger.id)) lane.handled.add(trigger.id);
+        for (const trigger of triggers) {
+          if (!this.#isEnvelope(trigger.id) && !notAdmitted.has(trigger.id)) lane.handled.add(trigger.id);
+        }
       }
     }
   }
