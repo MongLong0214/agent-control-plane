@@ -462,6 +462,18 @@ export class RoleConversationPort {
    * key, never for this one), and the generation has to still be current (a superseded holder is
    * a former one). None of it is taken from the peer's own claim.
    */
+  /**
+   * Whether the wake begun for `peer` may still be written: the same live connection is attached for
+   * `roleKey`, on the same registration and endpoint, and it re-authenticates as the registry's
+   * current holder of that exact assignment, generation, session and incarnation.
+   */
+  #stillTheHolderToWake(roleKey: string, peer: LivePeer, registration: number, endpoint: string | null): boolean {
+    if (this.#live.get(roleKey) !== peer) return false;
+    if (peer.registration !== registration || peer.endpoint === null || peer.endpoint !== endpoint) return false;
+    const identity = peer.authenticate();
+    return identity.allowed && this.#isCurrentHolder(peer.binding, identity.value);
+  }
+
   #isCurrentHolder(binding: RoleBinding, peer: AuthenticatedMcpPeer): boolean {
     if (binding.role !== this.#role) return false;
     const current = this.#bindings.active(binding.roleKey);
@@ -1028,8 +1040,10 @@ export class RoleConversationPort {
     // again, and a completion that wrote into the current registration's memory would be reporting
     // the previous endpoint's delivery as this one's. Both directions of that were reproduced.
     const registration = peer.registration;
+    const endpoint = peer.endpoint;
+    let written: boolean;
     try {
-      await new Promise<void>((resolveWake, rejectWake: (failure: WakeFailure) => void) => {
+      written = await new Promise<boolean>((resolveWake, rejectWake: (failure: WakeFailure) => void) => {
         const socket = connect(revalidated.value);
         const fail = (failure: WakeFailure): void => {
           socket.destroy();
@@ -1051,10 +1065,22 @@ export class RoleConversationPort {
           }),
         );
         socket.once("connect", () => {
+          // The holder is judged again here, in the same synchronous section as the write, and not
+          // only before the connect: the connect is asynchronous, and a revoke, a takeover or a new
+          // registration committed while it was in flight would otherwise be woken on the strength
+          // of a check that no longer holds (1080-N1-01). Nothing between this check and `end` can
+          // run another task. A mismatch writes no frame and discards this wake attempt only: the
+          // durable message and its outbox row are untouched, and the current holder's own
+          // registration or wake is what reaches it.
+          if (!this.#stillTheHolderToWake(roleKey, peer, registration, endpoint)) {
+            socket.destroy();
+            resolveWake(false);
+            return;
+          }
           // `end` rather than `write` then leaving it open: the peer's read side sees EOF, so a
           // reader does not have to know the frame's length to know the wake is complete. This is
           // what C0 measured the runtime accepting.
-          socket.end(ROLE_WAKE_FRAME, () => resolveWake());
+          socket.end(ROLE_WAKE_FRAME, () => resolveWake(true));
         });
       });
     } catch (failure) {
@@ -1075,6 +1101,15 @@ export class RoleConversationPort {
         roleKey,
         shape: (failure as WakeFailure).shape,
       });
+    }
+    if (!written) {
+      // Not an endpoint failure, so nothing is remembered against the registration: the holder the
+      // wake was begun for is no longer the one to wake.
+      return deny(
+        ReasonCode.ROLE_PEER_STALE,
+        "the role's holder changed while the wake was connecting; the wake was not written",
+        { role: this.#role, roleKey },
+      );
     }
     // A wake that landed is the contradiction of an earlier one that did not, so the memory goes --
     // and only the memory of the registration this delivery belonged to. A success completing after
