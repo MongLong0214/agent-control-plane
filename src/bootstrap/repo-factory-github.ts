@@ -18,6 +18,7 @@ import { type Decision, type Evidence, allow, deny, isAcpError } from "../core/e
 import { ReasonCode } from "../core/reason-codes.ts";
 import { git, tryRevParse } from "../git/git.ts";
 import {
+  isGitHubNodeId,
   parseGitHubIdentity,
   sameGitHubName,
   type BranchProtectionState,
@@ -1035,6 +1036,19 @@ export const applyGitHubOperations = async (
     // The initialization option is always stated, never left to the port's default (#246 C5).
     const created = await remote(id, () => port.createRepository(target, execution.visibility, marker, execution.createOnly));
     if (!created.allowed) return created as Decision<Step>;
+    // Review C5I-R1-03 — an answer that names no valid repository identity is not an answer: the create
+    // may still have landed, so it is neither recorded as the create's identity nor accepted, and the
+    // intent stays pending with no answer, in doubt, never sent again.
+    if (!isGitHubNodeId(created.value.nodeId)) {
+      return stop(
+        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+        "UNIDENTIFIED_CREATE_ANSWER",
+        `GitHub's answer to ${id}'s create names no valid repository identity; the create may have landed, and it is not accepted or sent again`,
+        id,
+        { indeterminate: true },
+        false,
+      );
+    }
     begin({ ...intent, respondedNodeId: created.value.nodeId });
     const createdJudged = judgeRepository(created.value, id);
     if (!createdJudged.allowed) return createdJudged as Decision<Step>;

@@ -175,14 +175,30 @@ interface RepositoryDocument {
   default_branch?: unknown;
 }
 
+/**
+ * #246 C5, review C5I-R1-03 — a provider identity this port reports: non-empty printable ASCII with no
+ * whitespace, as every GitHub node id is. An empty or malformed one is no identity at all, so it can
+ * neither attribute a repository nor be recorded as the one a create was answered with.
+ */
+export const isGitHubNodeId = (value: unknown): value is string =>
+  typeof value === "string" ? /^[\x21-\x7e]{1,256}$/.test(value) : false;
+
+/** A full commit id: 40 hex digits (SHA-1) or 64 (SHA-256). */
+const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
 const repositoryFrom = (document: RepositoryDocument, path: string): ObservedRepository => {
   const nodeId = document.node_id;
   const fullName = document.full_name;
-  if (typeof nodeId !== "string") {
-    throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's repository answer carries no node id", { path });
+  // Review C5I-R1-03 — checked here, before any caller can record or accept the answer: an answer
+  // with no valid identity throws, and the caller keeps the request it answered in doubt.
+  if (!isGitHubNodeId(nodeId)) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's repository answer carries no valid node id", { path });
   }
   if (typeof fullName !== "string") {
     throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's repository answer carries no full name", { path });
+  }
+  if (!/^[^/\s]+\/[^/\s]+$/.test(fullName)) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's repository answer carries no owner/name full name", { path });
   }
   // `visibility` is the field; `private` is the older one GitHub still sends. Neither is
   // invented when both are missing — an unknown visibility cannot match an approved one.
@@ -323,6 +339,13 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         const sha = document.commit?.sha;
         if (typeof sha !== "string") {
           throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's branch answer carries no head", {
+            path: branchPath(target, branch),
+          });
+        }
+        // Review C5I-R1-03 — the head is an identity the producer records and compares; an empty or
+        // partial one is no head.
+        if (!COMMIT_ID.test(sha)) {
+          throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's branch answer carries no full commit id", {
             path: branchPath(target, branch),
           });
         }
