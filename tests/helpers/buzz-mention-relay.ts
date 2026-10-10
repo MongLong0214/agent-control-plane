@@ -38,6 +38,17 @@ export interface StoringRelay {
   openFor(pubkey: string): RelayConnection[];
   /** Runs the subscriber's queue until the relay has nothing more to say. */
   drain(handle: BuzzMentionSubscriberHandle): Promise<void>;
+  /** Every EVENT a client sent, in order, when the relay accepts publishes (#246). */
+  readonly published: BuzzMentionEvent[];
+}
+
+export interface StoringRelayOptions {
+  /**
+   * #246 — answer a client's EVENT the way the live relay does: store it, push it to every matching
+   * subscription, and say `OK`, or `duplicate:` for an id it already holds. Off by default, so a
+   * client's EVENT is ignored as it always was here.
+   */
+  readonly acceptPublishes?: boolean;
 }
 
 export interface RelayConnection {
@@ -53,7 +64,7 @@ const tagValues = (event: BuzzMentionEvent, name: string): string[] =>
 const matches = (filter: Record<string, unknown>, event: BuzzMentionEvent): boolean => {
   const kinds = filter["kinds"] as readonly number[] | undefined;
   if (kinds && !kinds.includes(event.kind)) return false;
-  for (const name of ["p", "h"]) {
+  for (const name of ["p", "h", "e"]) {
     const wanted = filter[`#${name}`] as readonly string[] | undefined;
     if (wanted && !tagValues(event, name).some((value) => wanted.includes(value))) return false;
   }
@@ -61,8 +72,9 @@ const matches = (filter: Record<string, unknown>, event: BuzzMentionEvent): bool
   return typeof since !== "number" || event.created_at >= since;
 };
 
-export const storingRelay = (): StoringRelay => {
+export const storingRelay = (options: StoringRelayOptions = {}): StoringRelay => {
   const stored: BuzzMentionEvent[] = [];
+  const published: BuzzMentionEvent[] = [];
   const requested: { pubkey: string; filter: Record<string, unknown> }[] = [];
   const connections: RelayConnection[] = [];
   let traffic = 0;
@@ -86,6 +98,14 @@ export const storingRelay = (): StoringRelay => {
           const auth = frame[1] as { id: string; pubkey: string };
           connection.authenticatedAs = auth.pubkey;
           queueMicrotask(() => say(connection, ["OK", auth.id, true, ""]));
+        } else if (frame[0] === "CLOSE") {
+          connection.subscriptions.delete(frame[1] as string);
+        } else if (frame[0] === "EVENT" && options.acceptPublishes === true) {
+          const event = frame[1] as BuzzMentionEvent;
+          published.push(event);
+          const duplicate = stored.some((held) => held.id === event.id);
+          queueMicrotask(() => say(connection, ["OK", event.id, true, duplicate ? "duplicate: already have this event" : ""]));
+          if (!duplicate) relayPublish(event);
         } else if (frame[0] === "REQ") {
           const id = frame[1] as string;
           const filter = frame[2] as Record<string, unknown>;
@@ -105,18 +125,21 @@ export const storingRelay = (): StoringRelay => {
     };
   };
 
+  function relayPublish(event: BuzzMentionEvent): void {
+    stored.push(event);
+    for (const connection of connections) {
+      for (const [id, filter] of connection.subscriptions) {
+        if (matches(filter, event)) say(connection, ["EVENT", id, event]);
+      }
+    }
+  }
+
   return {
     factory,
     requested,
     connections,
-    publish: (event) => {
-      stored.push(event);
-      for (const connection of connections) {
-        for (const [id, filter] of connection.subscriptions) {
-          if (matches(filter, event)) say(connection, ["EVENT", id, event]);
-        }
-      }
-    },
+    published,
+    publish: relayPublish,
     openFor: (pubkey) => connections.filter((one) => !one.closed && one.authenticatedAs === pubkey),
     drain: async (handle) => {
       for (let round = 0; round < 50; round += 1) {
