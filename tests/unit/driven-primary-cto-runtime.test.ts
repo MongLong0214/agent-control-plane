@@ -81,6 +81,38 @@ const markersFor = (f: BootstrapRuntimeFixture, sessionId: string): Array<{ run_
     [DRIVEN_PRIMARY_CTO_SPAWN_RECORD, sessionId],
   );
 
+/** The work turn the prompt asks for: read what is addressed in band, accept a handoff, acknowledge. */
+const actOnWorkTurns = (f: BootstrapRuntimeFixture, sessionId: string): void => {
+  let keys = 0;
+  f.claude.onWorkTurn = async (_request, credential) => {
+    if (!credential || credential.sessionId !== sessionId) return;
+    const as = { sessionId: credential.sessionId, sessionSecret: credential.sessionSecret, token: credential.token ?? "" };
+    const pending = await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_pending", {});
+    const messages = (pending["value"] as { messages?: Array<{ messageId: string; kind: string; payload: { handoffId?: string } }> } | undefined)
+      ?.messages ?? [];
+    for (const message of messages) {
+      const row = f.harness.cp.outbox.get(message.messageId)!;
+      if (message.kind === MessageKind.HANDOFF_PACKAGE) {
+        await callMcpToolOverSocket(f.ctoSocket, as, "handoff_ack", {
+          idempotencyKey: `stale-ready-ack-${++keys}`,
+          handoffId: message.payload.handoffId,
+          messageId: message.messageId,
+          payloadDigest: row.payloadDigest,
+          bindingGeneration: row.bindingGeneration,
+        });
+      }
+      await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId });
+    }
+  };
+};
+
+/** Work turns (relay, no challenge) of one session's conversation. */
+const workTurnsOf = (f: BootstrapRuntimeFixture, sessionId: string): number => {
+  const external = f.harness.cp.sessions.require(sessionId).incarnation.split("#")[0];
+  return f.claude.turns.filter((turn) =>
+    turn.handle.externalSessionId === external && turn.relay !== null && !/session_attest/.test(turn.prompt)).length;
+};
+
 const attestationTurns = (f: BootstrapRuntimeFixture, sessionId: string): SessionTurnRequest[] => {
   const external = f.harness.cp.sessions.require(sessionId).incarnation.split("#")[0];
   return f.claude.turns.filter((turn) => turn.handle.externalSessionId === external && /session_attest/.test(turn.prompt));
@@ -316,6 +348,55 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       expect(cp.bindings.active(binding.roleKey)).toMatchObject({ sessionId: binding.sessionId, bindingGeneration: 1 });
       expect(f.claude.started.length).toBe(startedBefore);
       expect(countAudit(f, "CTO_SESSION_PROBE_FAILED", binding.sessionId)).toBe(1);
+    });
+  });
+
+  it("runs no work on a stale READY after its attestation failed, and runs it once one succeeds", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const { bootstrap, binding } = await drivenPrimary(f, "stale-project");
+      actOnWorkTurns(f, binding.sessionId);
+
+      // The relay still takes the credential, but the model never answers the challenge.
+      f.claude.presentAttestation = false;
+      const refused = await cp.cto.ensurePrimaryCto("stale-project", "cto_start");
+      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+      expect(cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+      expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(true);
+
+      // The activation's handoff arrives: its wake is refused and no turn runs on the stale READY.
+      const opened = openActivationHandoff(f)("stale-project", bootstrap.runId, binding.sessionId, HANDOFF);
+      if (!opened.allowed) throw new Error(opened.message);
+      const messageId = cp.db.get<{ message_id: string }>(
+        `SELECT message_id FROM outbox WHERE idempotency_key = ?`,
+        [`bootstrap-handoff:${opened.value.handoffId}`],
+      )!.message_id;
+      await vi.waitFor(() => expect(cp.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'OUTBOX_IN_BAND_WAKE_FAILED' AND role_key = ?`,
+        [binding.roleKey],
+      )?.n).toBe(1), { timeout: 10_000 });
+      const conversation = { wake: async () => allow(ReasonCode.OK, undefined) };
+      expect(await wakeRoleHolder(cp, conversation, binding.roleKey, { kind: "in-band dispatch", ids: [messageId] })).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.SESSION_NOT_READY,
+      });
+      expect(workTurnsOf(f, binding.sessionId)).toBe(0);
+      expect(cp.outbox.get(messageId)?.status).toBe("PENDING");
+      expect(cp.db.get<{ status: string }>(`SELECT status FROM handoffs WHERE handoff_id = ?`, [opened.value.handoffId])?.status)
+        .toBe("PENDING");
+
+      // A current attestation reopens the boundary; the outbox's re-wake then runs the turn once.
+      f.claude.presentAttestation = true;
+      const reattested = await cp.cto.ensurePrimaryCto("stale-project", "cto_start");
+      expect(reattested.allowed).toBe(true);
+      f.harness.clock.advance(10 * 60_000);
+      const turnsBefore = f.finishedTurns(binding.sessionId);
+      await cp.outbox.wakeInBandPending();
+      await vi.waitFor(() => expect(f.finishedTurns(binding.sessionId)).toBe(turnsBefore + 1), { timeout: 10_000 });
+      expect(workTurnsOf(f, binding.sessionId)).toBe(1);
+      expect(cp.outbox.get(messageId)?.status).toBe("ACKED");
+      expect(cp.db.get<{ status: string }>(`SELECT status FROM handoffs WHERE handoff_id = ?`, [opened.value.handoffId])?.status)
+        .toBe("ACKED");
     });
   });
 });

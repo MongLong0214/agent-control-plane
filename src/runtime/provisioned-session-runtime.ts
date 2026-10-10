@@ -139,6 +139,8 @@ export class ProvisionedSessionRuntime {
   #delivery: SessionCredentialDelivery | null = null;
   #route: SessionRelayRoute | null = null;
   readonly #held = new Map<string, HeldCredential>();
+  /** The incarnation and epoch each session last proved by an attestation; a failed one clears it. */
+  readonly #attested = new Map<string, { incarnation: string; credentialEpoch: number }>();
   readonly #lanes = new Map<string, TurnLane>();
 
   constructor(
@@ -167,6 +169,18 @@ export class ProvisionedSessionRuntime {
     return this.ports.audit.byKind(DRIVEN_PRIMARY_CTO_SPAWN_RECORD).some((row) => row.sessionId === sessionId);
   }
 
+  /**
+   * #246 C4 — whether a driven PRIMARY_CTO session may run work now: its last attestation, for its
+   * current incarnation and credential epoch, succeeded. READY is what was last written about the
+   * session; a failed attestation since then is newer than it, and no work turn runs past it.
+   */
+  #attestedNow(sessionId: string): boolean {
+    const attested = this.#attested.get(sessionId);
+    const session = this.ports.sessions.get(sessionId);
+    return attested !== undefined && session !== null &&
+      attested.incarnation === session.incarnation && attested.credentialEpoch === session.credentialEpoch;
+  }
+
   /** The daemon's launch channel and socket paths. Until both are attached no turn can run. */
   attach(ports: { delivery?: SessionCredentialDelivery; route?: SessionRelayRoute }): void {
     if (ports.delivery) this.#delivery = ports.delivery;
@@ -191,12 +205,15 @@ export class ProvisionedSessionRuntime {
       });
     }
     this.#held.set(sessionId, { role, sessionSecret, credentialEpoch });
+    // A credential nobody has presented yet is not attested, whatever the last one was.
+    this.#attested.delete(sessionId);
     return allow(ReasonCode.OK, undefined);
   }
 
   /** Forgets a session's credential and the record of its triggers; a running turn finishes. */
   release(sessionId: string): void {
     this.#held.delete(sessionId);
+    this.#attested.delete(sessionId);
     this.#lanes.delete(sessionId);
   }
 
@@ -215,10 +232,18 @@ export class ProvisionedSessionRuntime {
         purpose: "attestation",
       });
       if (!turn.allowed) {
+        this.#attested.delete(sessionId);
         this.ports.attestations.withdraw(sessionId, nonce);
         return turn as Decision<void>;
       }
-      return this.ports.attestations.settle(sessionId, nonce);
+      const settled = this.ports.attestations.settle(sessionId, nonce);
+      const session = this.ports.sessions.get(sessionId);
+      if (settled.allowed && session) {
+        this.#attested.set(sessionId, { incarnation: session.incarnation, credentialEpoch: session.credentialEpoch });
+      } else {
+        this.#attested.delete(sessionId);
+      }
+      return settled;
     });
   }
 
@@ -251,6 +276,14 @@ export class ProvisionedSessionRuntime {
     }
     if (!this.holds(binding.sessionId)) {
       return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "the daemon holds no current credential for this session", {
+        roleKey,
+        sessionId: binding.sessionId,
+      });
+    }
+    // #246 C4 — a driven PRIMARY_CTO only, rather than every provisioned role: a BOOTSTRAP_CTO's
+    // turns keep the contract C1b shipped, and widening the gate to it is that role's change to make.
+    if (binding.role === Role.PRIMARY_CTO && !this.#attestedNow(binding.sessionId)) {
+      return deny(ReasonCode.SESSION_NOT_READY, "the session has no current attestation; a stale READY runs no work", {
         roleKey,
         sessionId: binding.sessionId,
       });
@@ -291,6 +324,12 @@ export class ProvisionedSessionRuntime {
   ): Promise<Decision<void>> {
     let completed = false;
     try {
+      // A follow-up queued before an attestation failed is not run after it.
+      if (binding.role === Role.PRIMARY_CTO && !this.#attestedNow(binding.sessionId)) {
+        return deny(ReasonCode.SESSION_NOT_READY, "the session has no current attestation; a stale READY runs no work", {
+          sessionId: binding.sessionId,
+        });
+      }
       const turn = await this.#turn(binding.sessionId, "resume", workPrompt(binding, triggers), {
         relay: true,
         timeoutMs: this.options.turnTimeoutMs ?? 30 * 60_000,
