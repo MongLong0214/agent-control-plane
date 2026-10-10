@@ -123,7 +123,6 @@ import {
 } from "../ingress/telegram-external.ts";
 import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
-import { ProvisionedSessionRuntime } from "../runtime/provisioned-session-runtime.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
@@ -340,7 +339,20 @@ export const wakeRoleHolder = async (
   cause: { kind: string; ids: readonly string[] },
 ): Promise<Decision<void>> => {
   const holder = cp.bindings.active(roleKey);
-  if (!holder || !ProvisionedSessionRuntime.drives(holder.role)) return conversation.wake(roleKey);
+  // #246 C4 — a PRIMARY_CTO whose driven-spawn record exists but does not make it DRIVEN is neither
+  // driven nor interactive: refused here, before the conversation port makes any socket contact.
+  if (holder?.role === Role.PRIMARY_CTO) {
+    const mode = cp.sessionRuntime.drivenModeOf(holder.sessionId);
+    if (mode !== "NONE" && mode !== "DRIVEN") {
+      return deny(ReasonCode.CONFLICT, "the role's holder has a driven-spawn record that does not name the binding it holds", {
+        roleKey,
+        sessionId: holder.sessionId,
+        drivenMode: mode,
+      });
+    }
+  }
+  // #246 C4 — a PRIMARY_CTO is driven only when its own spawn recorded it so, never by its role.
+  if (!holder || !cp.sessionRuntime.drivesSession(holder.sessionId, holder.role)) return conversation.wake(roleKey);
   const ids = cause.ids.length > 0 ? cause.ids : [`${cause.kind}:${randomUUID()}`];
   const woke = cp.sessionRuntime.wake(roleKey, ids.map((id) => ({ id, kind: cause.kind })));
   return woke.allowed ? allow(ReasonCode.OK, undefined) : (woke as Decision<void>);
@@ -663,12 +675,15 @@ export const startLocalMcpListeners = async (
    * One CTO MCP server for one admitted connection, whichever door admitted it: `cto.mcp.sock` by
    * the session secret, or the canonical CTO's reattach socket by the process tree (#1037). `auth`
    * is binding-scoped tool authority; `connectionAuth` is the binding-free standing the conversation
-   * port re-asks on delivery. Neither door's server differs from the other's in anything else.
+   * port re-asks on delivery. `door` is which of the two admitted the connection, named by that
+   * door's code; the reattach door's server also tells its client the tool list changed after each
+   * wake registration is answered. Neither door's server differs from the other's in anything else.
    */
   const ctoServer = (
     auth: McpPeerAuthenticator,
     opening: BoundSocketPeer,
     connectionAuth: () => McpPeerAuthenticator,
+    door: "session-secret" | "canonical-reattach",
   ): ReturnType<typeof createCtoServer> => {
     // `auth` stays binding-scoped: MCP tool authority *is* authority over the one assignment
     // this connection was admitted under, and `createCtoServer` must keep getting it.
@@ -767,6 +782,68 @@ export const startLocalMcpListeners = async (
           respond(ctoConversation.reportPeerMessageRefusal(server, args.roleKey, args.messageId)),
       );
     }
+    /*
+     * `notifications/tools/list_changed`, so a client carried across a daemon restart re-lists.
+     *
+     * A canonical CTO's relay carries its client across a restart by replaying the client's
+     * `initialize`, its `notifications/initialized` and its last wake registration on a new
+     * connection through the reattach door, and answers every client request with "reattaching"
+     * until the last of those is answered (src/cli/attach-relay.ts `restore`). The client never
+     * re-lists on its own, so a restart onto a build with other tools left it holding the old list.
+     *
+     * Every connection is told at `initialized`, whatever ids it uses, so no client goes without
+     * one. A connection the reattach door admitted is told again after the answer to each wake
+     * registration on it: that is the point a relay replaying a registration goes live, and the
+     * notification sent at `initialized` may have reached its client while the relay was still
+     * refusing requests. Which door admitted the connection is `door`, set by the door's own code
+     * after its admission, never by anything the client sends.
+     *
+     * The notification decides nothing. It follows a refused registration as it follows an
+     * accepted one, it does not touch the wake slot, and the list the client then asks for is
+     * answered under this connection's own authentication like any other request. A send that
+     * fails is written to stderr and is not retried.
+     */
+    const refreshToolList = (): void => {
+      server.server.sendToolListChanged().catch(() => {
+        process.stderr.write("cto tool list change notification not sent\n");
+      });
+    };
+    server.server.oninitialized = refreshToolList;
+    if (door === "canonical-reattach") {
+      // The registration is read on the transport, before the SDK dispatches it, so its answer is
+      // known whichever way the SDK answers it (a result, a refusal, or a request it rejects). The
+      // notification is sent once that answer is written, so it is behind it on the wire.
+      const registrations = new Set<string | number>();
+      const observeInbound = (message: JSONRPCMessage): void => {
+        if (!("method" in message) || !("id" in message) || message.method !== "tools/call") return;
+        if ((message.params as { name?: unknown } | undefined)?.name !== "role_wake_endpoint_register") return;
+        registrations.add(message.id);
+      };
+      const observeSent = (message: JSONRPCMessage): void => {
+        if ("method" in message || !("id" in message) || message.id === undefined || message.id === null) return;
+        if (registrations.delete(message.id)) refreshToolList();
+      };
+      const connect = server.connect.bind(server);
+      server.connect = (transport: Transport): Promise<void> => {
+        const observed: Transport = {
+          start: () => {
+            transport.onmessage = (message, extra) => {
+              observeInbound(message);
+              observed.onmessage?.(message, extra);
+            };
+            transport.onclose = () => observed.onclose?.();
+            transport.onerror = (error) => observed.onerror?.(error);
+            return transport.start();
+          },
+          send: async (message, options) => {
+            await transport.send(message, options);
+            observeSent(message);
+          },
+          close: () => transport.close(),
+        };
+        return connect(observed);
+      };
+    }
     return server;
   };
   let cto: Server;
@@ -778,14 +855,19 @@ export const startLocalMcpListeners = async (
       [Role.PRIMARY_CTO, Role.BOOTSTRAP_CTO],
       handshakeTimeoutMs,
       (auth, opening, credential) =>
-        ctoServer(auth, opening, () =>
-          conversationPeerAuthenticator(
-            cp,
-            credential,
-            opening.sessionIncarnation,
-            opening.credentialEpoch,
-            ctoConversation.role,
-          )),
+        ctoServer(
+          auth,
+          opening,
+          () =>
+            conversationPeerAuthenticator(
+              cp,
+              credential,
+              opening.sessionIncarnation,
+              opening.credentialEpoch,
+              ctoConversation.role,
+            ),
+          "session-secret",
+        ),
       { pendingHandoffAck: true, pendingAttestation: true },
       options.attachments ? { authority: options.attachments, port: ctoConversation } : undefined,
     );
@@ -842,6 +924,7 @@ export const startLocalMcpListeners = async (
             credentialEpoch: cp.sessions.get(binding.sessionId)?.credentialEpoch ?? 0,
           },
           () => () => admission.connection(admitted),
+          "canonical-reattach",
         );
         void server.connect(new SocketTransport(socket, Buffer.alloc(0))).catch((err: unknown) => {
           socket.destroy(err instanceof Error ? err : new Error(String(err)));

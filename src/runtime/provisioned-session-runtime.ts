@@ -4,7 +4,8 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
-import { Role, type RoleBinding } from "../domain/types.ts";
+import type { Db } from "../db/database.ts";
+import { Role, type RoleBinding, SessionLifecycle } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionAttestations } from "../session/session-attestations.ts";
@@ -40,7 +41,7 @@ export interface ProvisionedSessionRuntimePorts {
    * that row has left PENDING — acknowledged over the authenticated relay, or rejected or expired —
    * and not when a turn for it exited 0.
    */
-  readonly outbox: Pick<Outbox, "get">;
+  readonly outbox: Pick<Outbox, "get" | "drivenModeOf" | "drivenSpawnRecordOf">;
 }
 
 export interface ProvisionedSessionRuntimeOptions {
@@ -49,14 +50,142 @@ export interface ProvisionedSessionRuntimeOptions {
   turnTimeoutMs?: number;
 }
 
+/** What a turn is for; each has its own conditions, read again immediately before the provider call. */
+export type TurnPurpose = "attestation" | "probe" | "work";
+
+/**
+ * #246 C4 — the one spawn attestation a driven PRIMARY_CTO's own spawn runs. It is the only thing
+ * that lets a turn run for a session not yet bound (`PENDING`), and every field must equal the
+ * current state exactly: the purpose it permits, the project and role key and the creation
+ * generation its spawn record names, and the session row, incarnation and credential epoch the spawn
+ * created. No partial match counts — an incarnation is not unique, and only the session id names one
+ * row. No actor or assignment exists yet to name: the bind mints them after READY, as the assignment
+ * at this role key and creation generation, and the bind re-checks that assignment and its actor.
+ */
+export interface SpawnAttestation {
+  purpose: "spawn-attestation";
+  projectId: string;
+  roleKey: string;
+  sessionId: string;
+  incarnation: string;
+  credentialEpoch: number;
+  creationGeneration: number;
+}
+
+/** What a session's one driven-spawn record names, if it has exactly one. */
+export interface DrivenSpawnRecord {
+  projectId: string | null;
+  roleKey: string | null;
+  creationGeneration: number | null;
+}
+
 /** One reason a role's session is woken; `id` is what makes a second wake for it a duplicate. */
 export interface SessionWakeTrigger {
   id: string;
   kind: string;
 }
 
-/** The roles whose sessions this runtime drives. Wired for BOOTSTRAP_CTO; never a canonical role. */
+/** The roles all of whose sessions this runtime drives: a run's BOOTSTRAP_CTO. Never a canonical role. */
 const DRIVEN_ROLES: ReadonlySet<Role> = new Set([Role.BOOTSTRAP_CTO]);
+
+/**
+ * #246 C4 — the audit kind that records a PRIMARY_CTO session spawned, for a bootstrap activation,
+ * to be driven by this runtime. Written by `CtoLifecycle.spawn` in the transaction that creates the
+ * session row, before its credential is adopted or anything can refuse it, and attributed there to
+ * its project (`project_id`), role key (`role_key`), session (`session_id`) and the binding
+ * generation it is created for (`evidence.creationGeneration`). The actor does not exist yet in that
+ * transaction — the bind mints it after the session is READY — so the record names the creation
+ * assignment instead, and that immutable row (`assignments_generation_immutable`) carries the actor.
+ *
+ * It proves the driving mode and nothing else: execution still needs the ACTIVE binding, a READY
+ * session and a current attestation. `audit_events` is append only (`audit_events_append_only`,
+ * `audit_events_no_delete`), so the fact can neither be added later nor taken back.
+ *
+ * An append-only spawn record rather than a new column or the shape of the session's workdir: the
+ * schema is not changed for this, and a path is not a fact anybody recorded.
+ */
+export const DRIVEN_PRIMARY_CTO_SPAWN_RECORD = "PRIMARY_CTO_DRIVEN_SESSION_SPAWNED";
+
+/**
+ * What a session's spawn record says about driving it, read the same way by every reader.
+ *
+ * - `NONE`: no record. Never driven here; an interactive or canonical CTO's own path.
+ * - `PENDING`: exactly one record, and the session holds no binding and its creation generation has
+ *   not been granted yet: spawned driven, not yet bound. Only the spawn's own custody accepts it.
+ * - `DRIVEN`: exactly one record; the creation assignment it names (role key, creation generation)
+ *   was granted to this very session in its project; and the role's ACTIVE binding is held by this
+ *   session for that assignment's actor, at the creation generation or a later one. A credential
+ *   epoch change touches none of that, and neither does a renewal on the same session and actor.
+ * - `CONTRADICTED`: a record that is anything else — a second one, another session's creation,
+ *   another generation, another project, a session that no longer holds the role. Every reader
+ *   fails closed on it: it is neither driven nor taken for interactive.
+ */
+export type DrivenMode = "NONE" | "PENDING" | "DRIVEN" | "CONTRADICTED";
+
+/** SQL: the `DrivenMode` of the session `sessionExpr` names. */
+export const drivenModeSql = (sessionExpr: string): string => `(CASE
+  WHEN NOT EXISTS (
+    SELECT 1 FROM audit_events dm_any
+     WHERE dm_any.kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}' AND dm_any.session_id = ${sessionExpr}
+  ) THEN 'NONE'
+  WHEN (
+    SELECT COUNT(*) FROM audit_events dm_n
+     WHERE dm_n.kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}' AND dm_n.session_id = ${sessionExpr}
+  ) <> 1 THEN 'CONTRADICTED'
+  WHEN EXISTS (
+    SELECT 1 FROM audit_events dm
+      JOIN assignments dm_c
+        ON dm_c.role_key = dm.role_key
+       AND dm_c.binding_generation = json_extract(dm.evidence_json, '$.creationGeneration')
+       AND dm_c.role = 'PRIMARY_CTO'
+       AND dm_c.project_id = dm.project_id
+       AND dm_c.session_id = dm.session_id
+      JOIN assignments dm_a
+        ON dm_a.role_key = dm.role_key
+       AND dm_a.status = 'ACTIVE'
+       AND dm_a.actor_id = dm_c.actor_id
+       AND dm_a.binding_generation >= dm_c.binding_generation
+      LEFT JOIN conversational_actors dm_h ON dm_h.actor_id = dm_a.actor_id
+     WHERE dm.kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}' AND dm.session_id = ${sessionExpr}
+       AND COALESCE(dm_h.current_session_id, dm_a.session_id) = dm.session_id
+  ) THEN 'DRIVEN'
+  WHEN EXISTS (
+    SELECT 1 FROM audit_events dm
+     WHERE dm.kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}' AND dm.session_id = ${sessionExpr}
+       AND dm.project_id IS NOT NULL
+       AND dm.role_key = 'PRIMARY_CTO:' || dm.project_id
+       AND json_type(dm.evidence_json, '$.creationGeneration') = 'integer'
+       AND NOT EXISTS (SELECT 1 FROM assignments dm_x WHERE dm_x.session_id = dm.session_id)
+       AND NOT EXISTS (SELECT 1 FROM conversational_actors dm_y WHERE dm_y.current_session_id = dm.session_id)
+       AND NOT EXISTS (
+         SELECT 1 FROM assignments dm_z
+          WHERE dm_z.role_key = dm.role_key
+            AND dm_z.binding_generation >= json_extract(dm.evidence_json, '$.creationGeneration')
+       )
+  ) THEN 'PENDING'
+  ELSE 'CONTRADICTED'
+END)`;
+
+/** What the session's one driven-spawn record names, or null when it has none or more than one. */
+export const drivenSpawnRecordOf = (db: Pick<Db, "all">, sessionId: string): DrivenSpawnRecord | null => {
+  const records = db.all<{ project_id: string | null; role_key: string | null; generation: unknown }>(
+    `SELECT project_id, role_key, json_extract(evidence_json, '$.creationGeneration') AS generation
+       FROM audit_events WHERE kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}' AND session_id = ?`,
+    [sessionId],
+  );
+  const [only] = records;
+  if (records.length !== 1 || !only) return null;
+  return {
+    projectId: only.project_id,
+    roleKey: only.role_key,
+    creationGeneration: typeof only.generation === "number" ? only.generation : null,
+  };
+};
+
+/** `drivenModeSql` for one session id. */
+export const drivenModeOf = (db: Pick<Db, "get">, sessionId: string): DrivenMode =>
+  db.get<{ mode: DrivenMode }>(`SELECT ${drivenModeSql("q.sid")} AS mode FROM (SELECT ? AS sid) q`, [sessionId])
+    ?.mode ?? "CONTRADICTED";
 
 interface HeldCredential {
   role: Role;
@@ -119,6 +248,8 @@ export class ProvisionedSessionRuntime {
   #delivery: SessionCredentialDelivery | null = null;
   #route: SessionRelayRoute | null = null;
   readonly #held = new Map<string, HeldCredential>();
+  /** The incarnation and epoch each session last proved by an attestation; a failed one clears it. */
+  readonly #attested = new Map<string, { incarnation: string; credentialEpoch: number }>();
   readonly #lanes = new Map<string, TurnLane>();
 
   constructor(
@@ -126,9 +257,90 @@ export class ProvisionedSessionRuntime {
     private readonly options: ProvisionedSessionRuntimeOptions = {},
   ) {}
 
-  /** Whether sessions of this role are driven here. */
+  /**
+   * Whether every session of this role is driven here (a run's BOOTSTRAP_CTO). A PRIMARY_CTO is
+   * driven per session, never per role: ask `drivesSession`.
+   */
   static drives(role: Role): boolean {
     return DRIVEN_ROLES.has(role);
+  }
+
+  /**
+   * Whether this runtime drives `sessionId` holding `role`: every BOOTSTRAP_CTO, and a PRIMARY_CTO
+   * only when its spawn record makes it `DRIVEN` — a missing or contradicted record never does.
+   */
+  /** #246 C4 — the session's `DrivenMode`, read as the outbox reads it. */
+  drivenModeOf(sessionId: string): DrivenMode {
+    return this.ports.outbox.drivenModeOf(sessionId);
+  }
+
+  drivesSession(sessionId: string, role: Role): boolean {
+    if (DRIVEN_ROLES.has(role)) return true;
+    return role === Role.PRIMARY_CTO && this.ports.outbox.drivenModeOf(sessionId) === "DRIVEN";
+  }
+
+  /**
+   * #246 C4 — whether a driven PRIMARY_CTO session may run work now: its last attestation, for its
+   * current incarnation and credential epoch, succeeded. READY is what was last written about the
+   * session; a failed attestation since then is newer than it, and no work turn runs past it.
+   */
+  #attestedNow(sessionId: string): boolean {
+    const attested = this.#attested.get(sessionId);
+    const session = this.ports.sessions.get(sessionId);
+    return attested !== undefined && session !== null &&
+      attested.incarnation === session.incarnation && attested.credentialEpoch === session.credentialEpoch;
+  }
+
+  /**
+   * #246 C4 — whether a turn for `purpose` may run on this session now, read from current state and
+   * never carried over from an earlier answer: `#turn` asks it immediately before the provider call,
+   * after every awaited preparation; `wake` and `attest` ask it first, so a refusal costs nothing;
+   * and `attest` asks it once more before it counts the turn.
+   *
+   * A session with no driven-spawn record (a run's BOOTSTRAP_CTO) keeps the contract C1b shipped and
+   * is answered yes. A driven PRIMARY_CTO's turn needs its record to be `DRIVEN` — the current
+   * creation and actor, holding the role's ACTIVE binding — and a READY or DRAINING session; work
+   * also needs a current attestation. The one exception is `PENDING`: only an attestation of a new
+   * conversation, carrying the exact `SpawnAttestation` of the spawn that created this STARTING
+   * session, may run on it. No work, no probe, and no other session or spawn.
+   */
+  turnEligibility(
+    sessionId: string,
+    purpose: TurnPurpose,
+    conversation: ConversationStep = "resume",
+    spawn: SpawnAttestation | null = null,
+  ): Decision<void> {
+    const mode = this.ports.outbox.drivenModeOf(sessionId);
+    if (mode === "NONE" && spawn === null) return allow(ReasonCode.OK, undefined);
+    const session = this.ports.sessions.get(sessionId);
+    const refuse = (reasonCode: ReasonCode, message: string): Decision<void> =>
+      deny(reasonCode, message, { sessionId, purpose, drivenMode: mode, lifecycle: session?.lifecycle ?? null });
+    if (!session) return refuse(ReasonCode.NOT_FOUND, "unknown session");
+    if (mode === "PENDING") {
+      const record = this.ports.outbox.drivenSpawnRecordOf(sessionId);
+      const own = spawn !== null && record !== null && purpose === "attestation" && conversation === "new" &&
+        session.lifecycle === SessionLifecycle.STARTING &&
+        spawn.purpose === "spawn-attestation" &&
+        spawn.projectId === record.projectId &&
+        spawn.roleKey === record.roleKey &&
+        spawn.sessionId === sessionId &&
+        spawn.incarnation === session.incarnation &&
+        spawn.credentialEpoch === session.credentialEpoch &&
+        spawn.creationGeneration === record.creationGeneration;
+      return own
+        ? allow(ReasonCode.OK, undefined)
+        : refuse(ReasonCode.CONFLICT, "a driven session not yet bound runs only the attestation of the spawn that created it");
+    }
+    if (mode !== "DRIVEN" || spawn !== null) {
+      return refuse(ReasonCode.CONFLICT, "the session's driven-spawn record does not name a binding it holds");
+    }
+    if (session.lifecycle !== SessionLifecycle.READY && session.lifecycle !== SessionLifecycle.DRAINING) {
+      return refuse(ReasonCode.SESSION_NOT_READY, "the session is not READY");
+    }
+    if (purpose === "work" && !this.#attestedNow(sessionId)) {
+      return refuse(ReasonCode.SESSION_NOT_READY, "the session has no current attestation; a stale READY runs no work");
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /** The daemon's launch channel and socket paths. Until both are attached no turn can run. */
@@ -148,19 +360,24 @@ export class ProvisionedSessionRuntime {
    * rotation just replaced it with. Replaces any earlier one for the session.
    */
   adopt(sessionId: string, role: Role, sessionSecret: string, credentialEpoch: number): Decision<void> {
-    if (!ProvisionedSessionRuntime.drives(role)) {
-      return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "this runtime drives provisioned bootstrap CTO sessions only", {
+    const mode = role === Role.PRIMARY_CTO ? this.ports.outbox.drivenModeOf(sessionId) : null;
+    if (!DRIVEN_ROLES.has(role) && mode !== "PENDING" && mode !== "DRIVEN") {
+      return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "this runtime drives provisioned sessions only: a bootstrap CTO, or a primary CTO spawned driven", {
         sessionId,
         role,
+        drivenMode: mode,
       });
     }
     this.#held.set(sessionId, { role, sessionSecret, credentialEpoch });
+    // A credential nobody has presented yet is not attested, whatever the last one was.
+    this.#attested.delete(sessionId);
     return allow(ReasonCode.OK, undefined);
   }
 
   /** Forgets a session's credential and the record of its triggers; a running turn finishes. */
   release(sessionId: string): void {
     this.#held.delete(sessionId);
+    this.#attested.delete(sessionId);
     this.#lanes.delete(sessionId);
   }
 
@@ -168,8 +385,16 @@ export class ProvisionedSessionRuntime {
    * Proves the session's runtime is reachable and holds its current credential: one turn of its
    * own conversation whose relay presents a fresh challenge over an authenticated connection.
    */
-  async attest(sessionId: string, conversation: ConversationStep): Promise<Decision<void>> {
+  async attest(
+    sessionId: string,
+    conversation: ConversationStep,
+    spawn: SpawnAttestation | null = null,
+  ): Promise<Decision<void>> {
     return this.#serialized(sessionId, async () => {
+      // Refused before any turn: nothing was learned about the runtime, so an attestation it already
+      // has stands — a turn it may not run is no evidence against the one it ran.
+      const eligible = this.turnEligibility(sessionId, "attestation", conversation, spawn);
+      if (!eligible.allowed) return eligible;
       const challenge = this.ports.attestations.challenge(sessionId);
       if (!challenge.allowed) return challenge as Decision<void>;
       const nonce = challenge.value.nonce;
@@ -177,12 +402,23 @@ export class ProvisionedSessionRuntime {
         relay: true,
         timeoutMs: this.options.attestTimeoutMs ?? 5 * 60_000,
         purpose: "attestation",
+        spawn,
       });
-      if (!turn.allowed) {
+      // The turn awaited; whatever made it eligible is read again before the answer counts.
+      const still = turn.allowed ? this.turnEligibility(sessionId, "attestation", conversation, spawn) : turn;
+      if (!still.allowed) {
+        this.#attested.delete(sessionId);
         this.ports.attestations.withdraw(sessionId, nonce);
-        return turn as Decision<void>;
+        return still as Decision<void>;
       }
-      return this.ports.attestations.settle(sessionId, nonce);
+      const settled = this.ports.attestations.settle(sessionId, nonce);
+      const session = this.ports.sessions.get(sessionId);
+      if (settled.allowed && session) {
+        this.#attested.set(sessionId, { incarnation: session.incarnation, credentialEpoch: session.credentialEpoch });
+      } else {
+        this.#attested.delete(sessionId);
+      }
+      return settled;
     });
   }
 
@@ -210,7 +446,7 @@ export class ProvisionedSessionRuntime {
    */
   wake(roleKey: string, triggers: readonly SessionWakeTrigger[]): Decision<"STARTED" | "COALESCED"> {
     const binding = this.ports.bindings.active(roleKey);
-    if (!binding || !ProvisionedSessionRuntime.drives(binding.role)) {
+    if (!binding || !this.drivesSession(binding.sessionId, binding.role)) {
       return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "no provisioned session holds this role", { roleKey });
     }
     if (!this.holds(binding.sessionId)) {
@@ -219,6 +455,11 @@ export class ProvisionedSessionRuntime {
         sessionId: binding.sessionId,
       });
     }
+    // #246 C4 — a driven PRIMARY_CTO only, rather than every provisioned role: a BOOTSTRAP_CTO's
+    // turns keep the contract C1b shipped, and widening the gate to it is that role's change to make.
+    // Admission only: the turn asks again when it runs (`#turn`).
+    const eligible = this.turnEligibility(binding.sessionId, "work");
+    if (!eligible.allowed) return eligible as Decision<"STARTED" | "COALESCED">;
     const lane = this.#lane(binding.sessionId);
     const fresh = triggers.filter((trigger, index) =>
       !lane.claimed.has(trigger.id) &&
@@ -255,6 +496,7 @@ export class ProvisionedSessionRuntime {
   ): Promise<Decision<void>> {
     let completed = false;
     try {
+      // A refused turn is not a completed one: its triggers are released, never marked handled.
       const turn = await this.#turn(binding.sessionId, "resume", workPrompt(binding, triggers), {
         relay: true,
         timeoutMs: this.options.turnTimeoutMs ?? 30 * 60_000,
@@ -325,8 +567,17 @@ export class ProvisionedSessionRuntime {
     sessionId: string,
     conversation: ConversationStep,
     prompt: string,
-    turn: { relay: boolean; timeoutMs: number; purpose: string },
+    turn: { relay: boolean; timeoutMs: number; purpose: TurnPurpose; spawn?: SpawnAttestation | null },
   ): Promise<Decision<SessionTurnResult>> {
+    const refused = (decision: Decision<void>): Decision<SessionTurnResult> => {
+      this.ports.audit.record({
+        kind: "SESSION_TURN_REFUSED",
+        reasonCode: decision.reasonCode,
+        sessionId,
+        evidence: { purpose: turn.purpose, step: conversation },
+      });
+      return decision as Decision<SessionTurnResult>;
+    };
     const session = this.ports.sessions.get(sessionId);
     if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
     const held = this.#held.get(sessionId);
@@ -365,6 +616,26 @@ export class ProvisionedSessionRuntime {
       });
       if (!provisioned.allowed) return provisioned as Decision<SessionTurnResult>;
       delivered = true;
+    }
+    // #246 C4 — immediately before the provider call, after every await above: the answer on entry
+    // is not reused. A turn refused here never reaches the provider, and its credential is taken back.
+    // The credential it prepared must still be the session's: the same epoch (no rotation during the
+    // awaits) and the same custody (nothing adopted over it or released).
+    if (turn.relay) {
+      const current = this.ports.sessions.get(sessionId);
+      if (current?.credentialEpoch !== session.credentialEpoch || this.#held.get(sessionId) !== held) {
+        if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
+        return refused(deny(ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE, "the credential this turn prepared is no longer the session's", {
+          sessionId,
+          preparedEpoch: session.credentialEpoch,
+          currentEpoch: current?.credentialEpoch ?? null,
+        }));
+      }
+    }
+    const now = this.turnEligibility(sessionId, turn.purpose, conversation, turn.spawn ?? null);
+    if (!now.allowed) {
+      if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
+      return refused(now);
     }
     let result: SessionTurnResult;
     try {
@@ -464,5 +735,6 @@ const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[
     `The control plane woke you for: ${[...new Set(triggers.map((trigger) => trigger.kind))].join(", ")}.`,
     "Your only interface is the acp-cto tools. Call mcp__acp-cto__role_dispatch_pending to read the messages addressed to you.",
     "Act on each message as its kind requires, using the acp-cto tools, and acknowledge each one with mcp__acp-cto__run_ack (or mcp__acp-cto__role_dispatch_ack when it names no run).",
+    "A HANDOFF_PACKAGE is accepted with mcp__acp-cto__handoff_ack for its handoffId before it is acknowledged.",
     "When nothing addressed to you remains, reply with a one-line summary of what you did.",
   ].join("\n");

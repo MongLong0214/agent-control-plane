@@ -12,12 +12,14 @@ import { type SessionLiveness, probeSessionLiveness } from "../daemon/dead-bindi
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import { DRIVEN_PRIMARY_CTO_RUNTIME } from "../domain/fixed-role-runtime.ts";
+import { Role, type RoleBinding, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
+import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type DrivenMode, type SpawnAttestation, drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -99,7 +101,7 @@ export interface SessionLaunchChannel {
  */
 export interface ProvisionedRuntimePort {
   adopt(sessionId: string, role: Role, sessionSecret: string, credentialEpoch: number): Decision<void>;
-  attest(sessionId: string, conversation: "new" | "resume"): Promise<Decision<void>>;
+  attest(sessionId: string, conversation: "new" | "resume", spawn?: SpawnAttestation | null): Promise<Decision<void>>;
   release(sessionId: string): void;
 }
 
@@ -168,6 +170,11 @@ interface SpawnRequest {
   stopOnRefusal?: boolean;
   /** Record the session as spawned for this run, with the session row (`BOOTSTRAP_CTO_SPAWN_RECORD`). */
   spawnedForRun?: string;
+  /**
+   * #246 C4 — a PRIMARY_CTO for the project this bootstrap run activates, driven on the headless
+   * runtime: recorded so with the session row (`DRIVEN_PRIMARY_CTO_SPAWN_RECORD`), under this run.
+   */
+  drivenForActivation?: string;
 }
 
 export class CtoLifecycle {
@@ -215,10 +222,42 @@ export class CtoLifecycle {
    * fresh session → Buzz → doctor readiness → binding → project ACTIVE → dispatch.
    */
   async ensurePrimaryCto(projectId: string, runId: string): Promise<Decision<RoleBinding>> {
+    return this.#ensurePrimaryCto(projectId, runId, false);
+  }
+
+  /**
+   * #246 C4 — the PRIMARY_CTO a bootstrap activation provisions for the project it activates: the
+   * same lineage checks, spawn and binding as `ensurePrimaryCto`, but the spawn is a fresh session
+   * of its own, in its own workdir, on Claude Opus (`DRIVEN_PRIMARY_CTO_RUNTIME`), driven by the
+   * headless runtime and recorded so with its session row. Only a PROJECT_BOOTSTRAP run asks for
+   * one. An existing binding is answered exactly as `ensurePrimaryCto` answers it.
+   *
+   * A door of its own rather than the run's kind read inside `ensurePrimaryCto`: the caller states
+   * that it is an activation, and the activation switches to this door together with its fixtures.
+   */
+  async ensureDrivenPrimaryCto(projectId: string, bootstrapRunId: string): Promise<Decision<RoleBinding>> {
+    const run = this.runs.get(bootstrapRunId);
+    if (run?.kind !== RunKind.PROJECT_BOOTSTRAP) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "only a bootstrap activation provisions a driven primary CTO", {
+        projectId,
+        runId: bootstrapRunId,
+        kind: run?.kind ?? null,
+      });
+    }
+    return this.#ensurePrimaryCto(projectId, bootstrapRunId, true);
+  }
+
+  async #ensurePrimaryCto(projectId: string, runId: string, driven: boolean): Promise<Decision<RoleBinding>> {
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
     const existing = this.bindings.active(roleKey);
     if (existing) {
       const session = this.sessions.get(existing.sessionId);
+      // #246 C4 — a driven session is asked by an authenticated attestation turn that resumes its
+      // conversation, never by opening its id again, and is never replaced by another session. A
+      // spawn record that does not add up is refused outright: neither driven nor interactive.
+      const mode = this.#drivenMode(existing.sessionId);
+      if (mode === "DRIVEN") return this.#reuseDrivenPrimaryCto(existing, session, runId);
+      if (mode !== "NONE") return this.#refuseDrivenRecord(existing, mode, runId);
       if (session?.lifecycle === SessionLifecycle.READY) {
         // READY is what the control plane last wrote about the session, not proof that the
         // provider still has one. Reusing a session on that alone is the false-ready path
@@ -255,12 +294,14 @@ export class CtoLifecycle {
     // A released canonical role is not given a spawned CTO either; its conversation re-claims it.
     const released = this.#releasedCanonicalHolder(projectId, roleKey);
     if (released) return this.#refuseAdoptedCanonical(released, null, null, runId);
+    const runtime: CtoPreference = driven ? { ...DRIVEN_PRIMARY_CTO_RUNTIME, effort: null } : this.preference;
     const created = await this.spawn({
       role: Role.PRIMARY_CTO,
       scope: projectId,
       purpose: "primary-cto",
-      runtime: this.preference,
+      runtime,
       canonicalGuard: { roleKey, runId },
+      ...(driven ? { drivenForActivation: runId } : {}),
     });
     if (!created.allowed) return created as Decision<RoleBinding>;
 
@@ -270,7 +311,17 @@ export class CtoLifecycle {
       if (this.#releasedCanonicalHolder(projectId, roleKey)) {
         return deny<RoleBinding>(ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM, "the role became canonical during provisioning", { projectId });
       }
-      return this.bindings.bind({ roleKey, role: Role.PRIMARY_CTO, sessionId: created.value, projectId, mode: "PREFERRED" });
+      const binding = this.bindings.bind({ roleKey, role: Role.PRIMARY_CTO, sessionId: created.value, projectId, mode: "PREFERRED" });
+      // #246 C4 — the binding just granted must be the creation its spawn record names (project, role
+      // key, session, generation); otherwise the whole bind rolls back and the session is not used.
+      if (binding.allowed && driven && this.#drivenMode(created.value) !== "DRIVEN") {
+        return deny<RoleBinding>(ReasonCode.CONFLICT, "the driven primary CTO's spawn record does not name the binding granted to it", {
+          projectId,
+          sessionId: created.value,
+          bindingGeneration: binding.value.bindingGeneration,
+        });
+      }
+      return binding;
     });
     if (!bound.allowed && bound.reasonCode === ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM) {
       const claimed = this.#releasedCanonicalHolder(projectId, roleKey);
@@ -278,6 +329,7 @@ export class CtoLifecycle {
       return claimed ? this.#refuseAdoptedCanonical(claimed, null, null, runId) : bound;
     }
     if (!bound.allowed) {
+      if (driven) this.#sessionRuntime?.release(created.value);
       this.sessions.transition(created.value, SessionLifecycle.STOPPED, "binding refused");
       return bound;
     }
@@ -288,9 +340,68 @@ export class CtoLifecycle {
       runId,
       sessionId: created.value,
       roleKey,
-      evidence: { generation: bound.value.bindingGeneration, provider: this.preference.provider },
+      evidence: {
+        generation: bound.value.bindingGeneration,
+        provider: runtime.provider,
+        ...(driven ? { driven: true } : {}),
+      },
     });
     return bound;
+  }
+
+  /**
+   * #246 C4 — an existing binding held by a driven PRIMARY_CTO: reused when an attestation turn that
+   * resumes its own conversation proves the daemon still drives it with its current credential, and
+   * refused otherwise. Never `--session-id` (the provider refuses to open a conversation it already
+   * has), never marked ERROR and never taken over by another session: a driven session is recovered
+   * on itself.
+   */
+  async #reuseDrivenPrimaryCto(
+    existing: RoleBinding,
+    session: SessionRecord | null,
+    runId: string,
+  ): Promise<Decision<RoleBinding>> {
+    if (session?.lifecycle === SessionLifecycle.DRAINING) {
+      return deny(ReasonCode.RUN_DISPATCH_BLOCKED_CTO_DRAINING, "primary CTO is draining", {
+        projectId: existing.projectId,
+        sessionId: existing.sessionId,
+      });
+    }
+    const live = await this.probeRoleSession(existing.sessionId, Role.PRIMARY_CTO);
+    if (live.allowed) return allow(ReasonCode.OK, existing);
+    this.audit.record({
+      kind: "CTO_SESSION_PROBE_FAILED",
+      reasonCode: live.reasonCode,
+      projectId: existing.projectId,
+      runId,
+      sessionId: existing.sessionId,
+      roleKey: existing.roleKey,
+      evidence: { provider: session?.provider ?? null, driven: true, ...live.evidence },
+    });
+    return live as Decision<RoleBinding>;
+  }
+
+  /** What this session's spawn record says about driving it (`DrivenMode`). */
+  #drivenMode(sessionId: string): DrivenMode {
+    return drivenModeOf(this.db, sessionId);
+  }
+
+  /**
+   * #246 C4 — a bound session whose driven-spawn record is missing its creation, names another
+   * session, generation or project, or is not alone: refused, audited, and left exactly as it is.
+   * It is not probed as an interactive session, marked ERROR or taken over.
+   */
+  #refuseDrivenRecord(existing: RoleBinding, mode: DrivenMode, runId: string): Decision<RoleBinding> {
+    this.audit.record({
+      kind: "CTO_SESSION_PROBE_FAILED",
+      reasonCode: ReasonCode.CONFLICT,
+      projectId: existing.projectId,
+      runId,
+      sessionId: existing.sessionId,
+      roleKey: existing.roleKey,
+      evidence: { drivenMode: mode },
+    });
+    return drivenRecordContradicted(existing.sessionId, mode);
   }
 
   /** §10.1 — replacement requested: the outgoing CTO drains, new runs queue. */
@@ -991,10 +1102,14 @@ export class CtoLifecycle {
     // #246 C1b — a session on the headless runtime is asked by an authenticated attestation turn
     // that continues its conversation: opening its id again is refused by the provider, and an
     // unauthenticated answer would say nothing about the credential the daemon holds for it.
-    if (role === Role.BOOTSTRAP_CTO) {
+    // #246 C4 — and so is a PRIMARY_CTO whose spawn record makes it driven; never by its role alone,
+    // and one whose record does not add up is refused, not asked as an interactive session.
+    const mode = role === Role.PRIMARY_CTO ? this.#drivenMode(sessionId) : "NONE";
+    if (role === Role.BOOTSTRAP_CTO || mode === "DRIVEN") {
       if (!this.#sessionRuntime) return runtimeUnavailable(sessionId, role);
       return notProvenReady(sessionId, await this.#sessionRuntime.attest(sessionId, "resume"));
     }
+    if (mode !== "NONE") return drivenRecordContradicted(sessionId, mode);
     return this.probeBoundSession(session, role);
   }
 
@@ -1024,9 +1139,11 @@ export class CtoLifecycle {
   private async spawn(request: SpawnRequest): Promise<Decision<string>> {
     const { role, scope, purpose, runtime, canonicalGuard } = request;
     // #246 C1b — a BOOTSTRAP_CTO runs on the real headless runtime, and is refused before anything
-    // starts when there is none: readiness then has nothing that could authenticate it.
-    const headless = role === Role.BOOTSTRAP_CTO ? this.#sessionRuntime : null;
-    if (role === Role.BOOTSTRAP_CTO && !headless) return runtimeUnavailable(null, role);
+    // starts when there is none: readiness then has nothing that could authenticate it. #246 C4 — so
+    // does a PRIMARY_CTO a bootstrap activation asked for driven; any other PRIMARY_CTO does not.
+    const driven = role === Role.BOOTSTRAP_CTO || (role === Role.PRIMARY_CTO && request.drivenForActivation !== undefined);
+    const headless = driven ? this.#sessionRuntime : null;
+    if (driven && !headless) return runtimeUnavailable(null, role);
     const adapter = this.providers.hasRoleScoped(runtime.provider)
       ? this.providers.requireForRole(runtime.provider, role)
       : this.providers.get(runtime.provider);
@@ -1071,6 +1188,8 @@ export class CtoLifecycle {
     // Recorded with its native start pinned beside the lstart, read as one snapshot of one process
     // (ACP1045-R2-01, R3-01); see `SessionRegistry.createWithPinnedStart`.
     let session: ReturnType<SessionRegistry["createWithPinnedStart"]>;
+    // #246 C4 — the generation a driven PRIMARY_CTO's spawn record names, for its own attestation.
+    let creationGeneration: number | null = null;
     try {
       // The row and, for a run's bootstrap CTO, its spawn record are one write: no refusal below
       // can leave a session the reclaim sweep has no record of (#246 C1-04).
@@ -1095,6 +1214,25 @@ export class CtoLifecycle {
             runId: request.spawnedForRun,
             sessionId: created.sessionId,
             evidence: { role, provider: adapter.provider, model: runtime.model, purpose },
+          });
+        }
+        // #246 C4 — the one fact that makes a PRIMARY_CTO driven, written with its session row and
+        // attributed to its project, role key, session and the generation it is created for: the
+        // runtime adopts its credential, the outbox routes to it in band and its probes resume its
+        // conversation only while this row names the binding it holds. Append-only, never added later.
+        if (headless && role === Role.PRIMARY_CTO) {
+          const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: scope });
+          creationGeneration = this.db.get<{ next: number }>(
+            `SELECT COALESCE(MAX(binding_generation), 0) + 1 AS next FROM assignments WHERE role_key = ?`,
+            [roleKey],
+          )?.next ?? 1;
+          this.audit.record({
+            kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+            runId: request.drivenForActivation ?? null,
+            projectId: scope,
+            sessionId: created.sessionId,
+            roleKey,
+            evidence: { role, provider: adapter.provider, model: runtime.model, purpose, creationGeneration },
           });
         }
         return created;
@@ -1177,7 +1315,24 @@ export class CtoLifecycle {
     // conversation, whose relay authenticates with the delivered credential and presents a
     // challenge the daemon minted (#246 C1b).
     const live = headless
-      ? notProvenReady(session.sessionId, await headless.attest(session.sessionId, "new"))
+      ? notProvenReady(session.sessionId, await headless.attest(
+          session.sessionId,
+          "new",
+          // A driven PRIMARY_CTO's first turn is the one turn its not-yet-bound session may run, and
+          // only for exactly this spawn: its project, role key and creation generation, and this
+          // session row, incarnation and epoch.
+          creationGeneration === null
+            ? null
+            : {
+                purpose: "spawn-attestation",
+                projectId: scope,
+                roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: scope }),
+                sessionId: session.sessionId,
+                incarnation: session.incarnation,
+                credentialEpoch: session.credentialEpoch,
+                creationGeneration,
+              },
+        ))
       : await probeSessionHealth(adapter, handle);
     if (!live.allowed) {
       return refuse(headless ? "session attestation failed" : "provider session probe failed", live as Decision<string>);
@@ -1594,6 +1749,13 @@ const notProvenReady = (sessionId: string, attested: Decision<void>): Decision<v
         sessionId,
         cause: attested.reasonCode,
       });
+
+/** #246 C4 — the refusal for a session whose driven-spawn record does not add up: fail closed. */
+const drivenRecordContradicted = <T>(sessionId: string, mode: DrivenMode): Decision<T> =>
+  deny(ReasonCode.CONFLICT, "the session's driven-spawn record does not name the binding it holds", {
+    sessionId,
+    drivenMode: mode,
+  });
 
 /** The refusal for a headless-runtime role with no runtime driver attached to drive it. */
 const runtimeUnavailable = <T>(sessionId: string | null, role: Role): Decision<T> =>
