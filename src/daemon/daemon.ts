@@ -60,6 +60,7 @@ import {
   wakeTransportQualifiedLabels,
 } from "../mcp/role-conversation.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
+import { readProcessGroup } from "../bootstrap/attempt-writer-group.ts";
 
 /**
  * How often the sensor tick refreshes capacity and re-evaluates continuity.
@@ -1399,15 +1400,17 @@ export class Daemon {
     this.cp.doctor.setSupplementalFindings(this.#doctorSupplier);
     // #246 C3 — the same rule for the bootstrap runner's question "is this process the only
     // control-plane writer": answered by this daemon's lock, and only once the lock is this daemon's.
-    // Its identity is the lock's own holder record — this process's pid and OS start token — which
-    // the runner records with each application attempt so a later one can prove it ended.
+    // Its identity is the lock's own holder record — this process's pid and OS start token — and the
+    // process group its git and gh subprocesses run in (review 1076-R2), which the runner records with
+    // each application attempt so a later one can prove the attempt and its subprocesses ended.
+    const processGroup = readProcessGroup(process.pid);
     this.cp.bootstrapProducer.attachWriterLock(
       () => this.lock.held(),
       () => {
         if (!this.lock.held()) return null;
         const holder = this.lock.read();
         if (holder === null || holder.pid !== process.pid) return null;
-        return { pid: holder.pid, startToken: holder.startToken ?? null, startedAt: holder.startedAt };
+        return { pid: holder.pid, startToken: holder.startToken ?? null, startedAt: holder.startedAt, processGroup };
       },
     );
 

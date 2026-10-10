@@ -21,6 +21,7 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { ACPBootstrapActivationResult, BootstrapActivation } from "./activation.ts";
+import { type GroupMember, ownGroupSubprocesses, processGroupEmpty } from "./attempt-writer-group.ts";
 import { type OwnerApprovalAnchor, readApprovalAnchor, writeApprovalAnchor } from "./bootstrap-approval-anchor.ts";
 import type {
   AttemptWriter,
@@ -1250,11 +1251,16 @@ export class RepoFactoryBootstrapRunner {
    * attempt has returned, or a process proven gone: no process at that pid, or one with another start
    * token. That needs this process to hold the single-writer lock and to know its own identity.
    * Only the daemon writes an attempt's checkout: a provisioned BOOTSTRAP_CTO's turns run restricted
-   * and sandboxed, with the deployment's state root denied to them. Its git and gh subprocesses are not
-   * recorded, so one a killed daemon left running is seen only through the lock files it holds in an
-   * earlier checkout's .git; and the checkouts directory and every earlier checkout must be plain
-   * directories. An attempt with no recorded writer, a writer still running, or anything unreadable
-   * is IN_DOUBT, and nothing is attempted. Nothing here touches an earlier checkout.
+   * and sandboxed, with the deployment's state root denied to them. The holder gone is not its
+   * subprocesses gone (review 1076-R2): its git and gh subprocesses run in the process group recorded
+   * with the attempt, and each must be shown gone through it — for a writer that has exited, a group
+   * it led with no member left; for this process, no subprocess of its own left in its group. A
+   * subprocess that left the group, or a group id reused by another process, is not seen through it;
+   * the second refuses rather than admits. No lock file may be left in an earlier checkout's .git,
+   * and the checkouts directory and every earlier checkout must be plain directories. An attempt with
+   * no recorded writer or group, a writer or subprocess still running, or anything unreadable is
+   * IN_DOUBT, and no new attempt executes. Nothing here signals a process or touches an earlier
+   * checkout.
    */
   private earlierAttemptsEnded(application: BootstrapApplication, workDir: string, repositoryRole: string): Decision<void> {
     const writerLockHeld = this.#writerLockHeld?.() === true;
@@ -1276,6 +1282,8 @@ export class RepoFactoryBootstrapRunner {
       gitLockFiles: string[] | null;
       writer: AttemptWriter | null;
       writerEnded: "THIS_PROCESS" | "PROVEN_GONE" | "NOT_PROVEN_GONE" | "UNRECORDED";
+      subprocesses: "GONE" | "RUNNING" | "NOT_LED_BY_WRITER" | "UNRECORDED" | "UNREADABLE";
+      running?: GroupMember[];
     }> = [];
     for (let attempt = 1; attempt <= application.attempts; attempt += 1) {
       const path = attemptCheckoutPath(workDir, repositoryRole, attempt);
@@ -1296,7 +1304,24 @@ export class RepoFactoryBootstrapRunner {
             : holderProvenGone({ pid: writer.pid, startedAt: writer.startedAt, startToken: writer.startToken, path: "" })
               ? "PROVEN_GONE"
               : "NOT_PROVEN_GONE";
-      earlier.push({ attempt, path, kind, gitLockFiles: locks, writer, writerEnded });
+      const group = writer?.processGroup ?? null;
+      let subprocesses: (typeof earlier)[number]["subprocesses"];
+      let running: GroupMember[] | undefined;
+      if (writer === null || group === null) {
+        subprocesses = "UNRECORDED";
+      } else if (writerEnded === "THIS_PROCESS") {
+        // This process's own group: none of its subprocesses may still be running.
+        const members = current?.processGroup === group ? ownGroupSubprocesses(group) : null;
+        running = members ?? undefined;
+        subprocesses = members === null ? "UNREADABLE" : members.length === 0 ? "GONE" : "RUNNING";
+      } else if (group !== writer.pid) {
+        // A group the writer did not lead holds other processes too; its subprocesses cannot be told apart.
+        subprocesses = "NOT_LED_BY_WRITER";
+      } else {
+        const empty = processGroupEmpty(group);
+        subprocesses = empty === null ? "UNREADABLE" : empty ? "GONE" : "RUNNING";
+      }
+      earlier.push({ attempt, path, kind, gitLockFiles: locks, writer, writerEnded, subprocesses, ...(running?.length ? { running } : {}) });
     }
     if (
       writerLockHeld &&
@@ -1307,7 +1332,8 @@ export class RepoFactoryBootstrapRunner {
         (entry) =>
           entry.gitLockFiles !== null &&
           entry.gitLockFiles.length === 0 &&
-          (entry.writerEnded === "THIS_PROCESS" || entry.writerEnded === "PROVEN_GONE"),
+          (entry.writerEnded === "THIS_PROCESS" || entry.writerEnded === "PROVEN_GONE") &&
+          entry.subprocesses === "GONE",
       )
     ) {
       return allow(ReasonCode.OK, undefined);

@@ -94,6 +94,11 @@ export interface AttemptWriter {
   pid: number;
   startToken: string | null;
   startedAt: string;
+  /**
+   * The process group the writer ran its git and gh subprocesses in (review 1076-R2), or null when it
+   * could not be read. Its subprocesses are proven gone only through it.
+   */
+  processGroup: number | null;
 }
 
 /** What else a reservation records beside its row: the approval it consumed and who made its first attempt. */
@@ -301,7 +306,10 @@ export class BootstrapApplications {
         evidence: {
           attempt: application.attempts,
           candidateSnapshotDigest: application.candidateSnapshotDigest,
-          writer: writer === null ? null : { pid: writer.pid, processStart: writer.startToken, startedAt: writer.startedAt },
+          writer:
+            writer === null
+              ? null
+              : { pid: writer.pid, processStart: writer.startToken, startedAt: writer.startedAt, processGroup: writer.processGroup },
         },
       });
       return allow(ReasonCode.OK, application);
@@ -415,7 +423,15 @@ export class BootstrapApplications {
         typeof writer["pid"] === "number" &&
         typeof writer["startedAt"] === "string" &&
         validStart;
-      writers.set(attempt, valid ? { pid: writer["pid"] as number, startToken: processStart as string | null, startedAt: writer["startedAt"] as string } : null);
+      // A record with no process group, or none shaped like one, names no group: its subprocesses are unprovable.
+      const group = writer?.["processGroup"];
+      const processGroup = typeof group === "number" && Number.isSafeInteger(group) && group > 0 ? group : null;
+      writers.set(
+        attempt,
+        valid
+          ? { pid: writer["pid"] as number, startToken: processStart as string | null, startedAt: writer["startedAt"] as string, processGroup }
+          : null,
+      );
     }
     return writers;
   }

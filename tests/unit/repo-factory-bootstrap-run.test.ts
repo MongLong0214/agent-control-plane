@@ -7,6 +7,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
+import { readProcessGroup } from "../../src/bootstrap/attempt-writer-group.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
@@ -205,7 +206,12 @@ const prepare = async (
   // #246 C3 — no daemon runs here: the test process is the only control-plane writer, and every
   // attempt runs in it, which a daemon's single-instance lock and its holder record attest in
   // production. A new attempt after an earlier one asks both.
-  const thisProcess = { pid: process.pid, startToken: readProcessStartToken(process.pid), startedAt: new Date().toISOString() };
+  const thisProcess = {
+    pid: process.pid,
+    startToken: readProcessStartToken(process.pid),
+    startedAt: new Date().toISOString(),
+    processGroup: readProcessGroup(process.pid),
+  };
   runner.attachWriterLock(() => true, () => thisProcess);
   // The CEO decision completes a bootstrap on the chain this runner verifies, as composed (#246 C3).
   harness.cp.ceo.attach({ bootstrapCompletionChain: runner });

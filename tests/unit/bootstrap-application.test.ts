@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import type * as FsModule from "node:fs";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
@@ -15,6 +16,7 @@ import {
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
+import { processGroupEmpty, readProcessGroup } from "../../src/bootstrap/attempt-writer-group.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { type ProjectManifest, manifestDigest } from "../../src/contracts/manifest.ts";
 import { startLocalMcpListeners, startOperatorSocket, startSessionLaunchChannel } from "../../src/daemon/agentcpd.ts";
@@ -22,7 +24,6 @@ import { Daemon } from "../../src/daemon/daemon.ts";
 import { ArtifactKind, ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
-import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github-write-port.ts";
 import { HeadlessRuntimeDouble } from "../helpers/headless-runtime.ts";
@@ -1674,14 +1675,51 @@ const attributionRecords = (f: Fixture, run: ReviewedRun) =>
 /** The daemon's own identity, as it attaches it: its lock holder record. */
 const daemonWriter = (f: Fixture) => () => {
   const holder = f.daemon.lock.read();
-  return holder === null ? null : { pid: holder.pid, startToken: holder.startToken ?? null, startedAt: holder.startedAt };
+  return holder === null
+    ? null
+    : { pid: holder.pid, startToken: holder.startToken ?? null, startedAt: holder.startedAt, processGroup: readProcessGroup(process.pid) };
 };
 
-/** A process that answered once and is now gone. */
-const exitedProcess = () => {
-  const pid = Number(boundedSpawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout);
+/** A process that led its own process group, answered once and is gone, its group with it. */
+const exitedProcess = async () => {
+  const child = spawn(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  const output: Buffer[] = [];
+  child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
+  await new Promise((resolveExit) => child.once("close", resolveExit));
+  const pid = Number(Buffer.concat(output).toString("utf8"));
   expect(() => process.kill(pid, 0)).toThrow();
-  return { pid, startToken: null, startedAt: "2026-10-10T00:00:00.000Z" };
+  expect(processGroupEmpty(pid)).toBe(true);
+  return { pid, startToken: null, startedAt: "2026-10-10T00:00:00.000Z", processGroup: pid };
+};
+
+/**
+ * A writer that leads its own process group and has started a subprocess in it, as a daemon running
+ * a git fetch does. The writer alone can then be killed, leaving its subprocess running in the group.
+ */
+const writerWithSubprocess = async () => {
+  const childCode = "setInterval(() => {}, 1000);";
+  const parentCode = `const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(childCode)}], { stdio: "ignore" }); process.stdout.write(String(child.pid) + "\\n"); setInterval(() => {}, 1000);`;
+  const parent = spawn(process.execPath, ["-e", parentCode], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  const subprocess = await new Promise<number>((resolveChild, reject) => {
+    parent.stdout.once("data", (data: Buffer) => resolveChild(Number(String(data).trim())));
+    parent.once("error", reject);
+  });
+  const writer = { pid: parent.pid!, startToken: readProcessStartToken(parent.pid!), startedAt: new Date().toISOString(), processGroup: parent.pid! };
+  const killWriter = async () => {
+    if (parent.exitCode !== null || parent.signalCode !== null) return;
+    const exited = new Promise((resolveExit) => parent.once("exit", resolveExit));
+    parent.kill("SIGKILL");
+    await exited;
+  };
+  const endSubprocess = async () => {
+    try {
+      process.kill(subprocess, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+    await vi.waitFor(() => expect(processGroupEmpty(writer.processGroup)).toBe(true), { timeout: 10_000, interval: 20 });
+  };
+  return { writer, subprocess, killWriter, endSubprocess };
 };
 
 describe("#246 C3: a resume inherits the same execution and nothing else", () => {
@@ -1781,7 +1819,12 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-live"));
       await approveWrites(f, run);
       // Attempt 1 is recorded as made by another process that is still running: this test's parent.
-      const live = { pid: process.ppid, startToken: readProcessStartToken(process.ppid), startedAt: "2026-10-10T00:00:00.000Z" };
+      const live = {
+        pid: process.ppid,
+        startToken: readProcessStartToken(process.ppid),
+        startedAt: "2026-10-10T00:00:00.000Z",
+        processGroup: readProcessGroup(process.ppid),
+      };
       expect(live.startToken).not.toBeNull();
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), () => live);
       const { first } = await interruptedAttempt(f, run);
@@ -1812,11 +1855,92 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
     });
   });
 
+  it("a writer proven gone whose subprocess still runs in its group keeps the new attempt IN_DOUBT with no attempt made; once the group is empty it proceeds (review 1076-R2)", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-orphan"));
+      await approveWrites(f, run);
+      const writer = await writerWithSubprocess();
+      try {
+        f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), () => writer.writer);
+        const { first } = await interruptedAttempt(f, run);
+        f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), daemonWriter(f));
+        // The writer is killed; its subprocess, like a git fetch a killed daemon leaves, runs on.
+        await writer.killWriter();
+        expect(() => process.kill(writer.subprocess, 0)).not.toThrow();
+        const refused = await confirm(f, run);
+        earlierInDoubt(f, run, refused);
+        expect(refused).toMatchObject({
+          evidence: { earlier: [{ attempt: 1, writerEnded: "PROVEN_GONE", subprocesses: "RUNNING", gitLockFiles: [] }] },
+        });
+        expect(checkoutsIn(f, run)).toEqual(["primary.attempt-1"]);
+        expect(existsSync(first)).toBe(true);
+        // The subprocess ends and the group is empty: the new attempt goes ahead.
+        await writer.endSubprocess();
+        const resumed = await confirm(f, run);
+        expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+        expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+      } finally {
+        await writer.killWriter().catch(() => undefined);
+        await writer.endSubprocess().catch(() => undefined);
+      }
+    });
+  });
+
+  it("a writer proven gone whose process group was not recorded, or that did not lead its group, keeps the new attempt IN_DOUBT", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-group"));
+      await approveWrites(f, run);
+      const gone = await exitedProcess();
+      f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), () => ({ ...gone, processGroup: null }));
+      await interruptedAttempt(f, run);
+      f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), daemonWriter(f));
+      const unrecorded = await confirm(f, run);
+      earlierInDoubt(f, run, unrecorded);
+      expect(unrecorded).toMatchObject({ evidence: { earlier: [{ writerEnded: "PROVEN_GONE", subprocesses: "UNRECORDED" }] } });
+    });
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-not-led"));
+      await approveWrites(f, run);
+      // A group the writer did not lead — here this test's own — holds other processes too.
+      const gone = { ...(await exitedProcess()), processGroup: readProcessGroup(process.pid) };
+      f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), () => gone);
+      await interruptedAttempt(f, run);
+      f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), daemonWriter(f));
+      const notLed = await confirm(f, run);
+      earlierInDoubt(f, run, notLed);
+      expect(notLed).toMatchObject({ evidence: { earlier: [{ writerEnded: "PROVEN_GONE", subprocesses: "NOT_LED_BY_WRITER" }] } });
+    });
+  });
+
+  it("this daemon's own subprocess still running keeps the next attempt IN_DOUBT; once it has ended the attempt proceeds", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-own-subprocess"));
+      await approveWrites(f, run);
+      await interruptedAttempt(f, run);
+      // A subprocess of this process, in its group, that has not ended.
+      const running = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+      try {
+        const refused = await confirm(f, run);
+        earlierInDoubt(f, run, refused);
+        expect(refused).toMatchObject({
+          evidence: { earlier: [{ writerEnded: "THIS_PROCESS", subprocesses: "RUNNING", running: [expect.objectContaining({ pid: running.pid })] }] },
+        });
+      } finally {
+        const exited = new Promise((resolveExit) => running.once("exit", resolveExit));
+        running.kill("SIGKILL");
+        await exited;
+      }
+      const resumed = await confirm(f, run);
+      expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+    });
+  });
+
   it("an earlier attempt whose writer process is proven gone lets the new attempt proceed", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-gone"));
       await approveWrites(f, run);
-      const gone = exitedProcess();
+      const gone = await exitedProcess();
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), () => gone);
       const { first } = await interruptedAttempt(f, run);
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), daemonWriter(f));
