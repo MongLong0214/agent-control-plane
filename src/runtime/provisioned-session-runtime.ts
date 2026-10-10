@@ -83,6 +83,21 @@ export interface DrivenSpawnRecord {
 export interface SessionWakeTrigger {
   id: string;
   kind: string;
+  /**
+   * A trigger caused by a verified Buzz mention carries the mention's gate: whether the mention's
+   * identity, role and room still stand behind the role's current holder. It is asked again at the
+   * turn's final check, immediately before the provider call, and a turn none of whose triggers
+   * still holds is refused there. Absent on every other trigger, which the final check never asks.
+   */
+  stillAdmissible?: () => boolean;
+  /**
+   * For a mention's trigger: whether the work it stands for was taken up, which for a mention is
+   * whether its event is spent. Read when its turn has ended: such a trigger is marked handled only
+   * when this answers true; otherwise it is released, as a refused turn's are. Read again when a
+   * wake names it, and at its turn's final check before the provider call: a true answer refuses
+   * it as a duplicate, however its event came to be spent.
+   */
+  served?: () => boolean;
 }
 
 /** The roles all of whose sessions this runtime drives: a run's BOOTSTRAP_CTO. Never a canonical role. */
@@ -232,9 +247,10 @@ interface TurnLane {
  *   answers OK. A turn that exited 0 proves nothing on its own.
  * - **Serialized.** A session runs one turn at a time. A wake that arrives while a turn runs is
  *   coalesced into one follow-up turn; a wake for a trigger queued or running is refused
- *   `SESSION_TURN_DUPLICATE`, and so is one for an envelope already settled or for an owner-message
- *   trigger a turn completed. **Settled is the outbox's word, not the CLI's:** a turn that exited 0
- *   without acknowledging its envelope settled nothing, so when its turn ends, however it ended, a
+ *   `SESSION_TURN_DUPLICATE`, and so is one for an envelope already settled, for an owner-message
+ *   trigger a turn completed, or for a mention whose event is already spent. **Settled is the
+ *   outbox's word, not the CLI's:** a turn that exited 0 without acknowledging its envelope
+ *   settled nothing, so when its turn ends, however it ended, a
  *   still-PENDING envelope is released for the next wake that names it. That wake is the outbox's
  *   own re-wake, at most once per row per `IN_BAND_REWAKE_MS` and never past the row's TTL, so
  *   unacknowledged work is retried at that pace and never in a loop here. Turns start only from
@@ -468,9 +484,9 @@ export class ProvisionedSessionRuntime {
   /**
    * Runs a turn for the role's current holder because of `triggers`, or folds them into the turn
    * that follows the one already running. A trigger queued, running, or completed by an earlier
-   * turn is dropped, and a wake whose every trigger is refused `SESSION_TURN_DUPLICATE`; a trigger
-   * whose turn failed is taken again. Answers at once with what happened; the turn itself runs
-   * behind the answer.
+   * turn is dropped, as is one whose `served` already answers true, and a wake whose every trigger
+   * is refused `SESSION_TURN_DUPLICATE`; a trigger whose turn failed is taken again. Answers at
+   * once with what happened; the turn itself runs behind the answer.
    */
   wake(roleKey: string, triggers: readonly SessionWakeTrigger[]): Decision<"STARTED" | "COALESCED"> {
     const binding = this.ports.bindings.active(roleKey);
@@ -493,6 +509,7 @@ export class ProvisionedSessionRuntime {
       !lane.claimed.has(trigger.id) &&
       !lane.handled.has(trigger.id) &&
       !this.#settled(trigger.id) &&
+      !this.#servedAlready(trigger, lane) &&
       triggers.findIndex((other) => other.id === trigger.id) === index);
     if (fresh.length === 0) {
       return deny(ReasonCode.SESSION_TURN_DUPLICATE, "every trigger of this wake is queued, running, settled or already handled; none is run twice", {
@@ -523,19 +540,56 @@ export class ProvisionedSessionRuntime {
     lane: TurnLane,
   ): Promise<Decision<void>> {
     let completed = false;
+    // The mention triggers whose gate did not hold at the final check. The turn may still run for
+    // the others, but these were not served by it: they are released, never marked handled.
+    const notAdmitted = new Set<string>();
+    // The triggers whose `served` already answered true at the final check: spent by another turn
+    // (a running one that claimed a coalesced mention's message), so this turn drops them and they
+    // are marked handled whether or not it runs for the others.
+    const servedBefore = new Set<string>();
     try {
       // A refused turn is not a completed one: its triggers are released, never marked handled.
       const turn = await this.#turn(binding.sessionId, "resume", workPrompt(binding, triggers), {
         relay: true,
         timeoutMs: this.options.turnTimeoutMs ?? 30 * 60_000,
         purpose: "work",
+        // Served while any trigger still wants it: an ordinary one always does, and a mention's
+        // only while it is not already served and its gate holds, read at the final check below.
+        admissible: () => {
+          notAdmitted.clear();
+          servedBefore.clear();
+          for (const trigger of triggers) {
+            if (trigger.served?.() === true) servedBefore.add(trigger.id);
+            else if (trigger.stillAdmissible !== undefined && !trigger.stillAdmissible()) notAdmitted.add(trigger.id);
+          }
+          if (triggers.some((trigger) => !notAdmitted.has(trigger.id) && !servedBefore.has(trigger.id))) {
+            return allow(ReasonCode.OK, undefined);
+          }
+          return notAdmitted.size > 0
+            ? deny(ReasonCode.ROLE_PEER_STALE, "the mention that woke this turn no longer stands behind its holder", {
+                sessionId: binding.sessionId,
+                purpose: "work",
+              })
+            : deny(ReasonCode.SESSION_TURN_DUPLICATE, "every trigger of this turn was already served before its provider call", {
+                sessionId: binding.sessionId,
+                triggers: [...servedBefore],
+              });
+        },
       });
       completed = turn.allowed;
       return turn.allowed ? allow(ReasonCode.OK, undefined) : (turn as Decision<void>);
     } finally {
       for (const trigger of triggers) lane.claimed.delete(trigger.id);
+      for (const id of servedBefore) lane.handled.add(id);
       if (completed) {
-        for (const trigger of triggers) if (!this.#isEnvelope(trigger.id)) lane.handled.add(trigger.id);
+        for (const trigger of triggers) {
+          if (this.#isEnvelope(trigger.id) || notAdmitted.has(trigger.id)) continue;
+          // A mention's trigger is handled by what actually happened in the turn, not by the gate's
+          // answer before the provider call: a claim refused mid-turn, or never made, leaves its
+          // message PENDING and the trigger released.
+          if (trigger.stillAdmissible !== undefined && trigger.served?.() !== true) continue;
+          lane.handled.add(trigger.id);
+        }
       }
     }
   }
@@ -543,6 +597,19 @@ export class ProvisionedSessionRuntime {
   /** Whether this trigger names an outbox row: its settlement is then the row's, not this lane's. */
   #isEnvelope(triggerId: string): boolean {
     return this.ports.outbox.get(triggerId) !== null;
+  }
+
+  /**
+   * A trigger whose `served` already answers true has nothing left to run, whichever turn served it
+   * (a mention released mid-call whose event a later ordinary turn claimed included), rather than
+   * only one this lane's own turn marked handled: a wake that names it is a duplicate, and it is
+   * marked handled so the next one is refused without asking again. A trigger with no `served`
+   * (every ordinary one) is never judged here.
+   */
+  #servedAlready(trigger: SessionWakeTrigger, lane: TurnLane): boolean {
+    if (trigger.served?.() !== true) return false;
+    lane.handled.add(trigger.id);
+    return true;
   }
 
   /** An envelope that has left PENDING — acknowledged, rejected or expired — has nothing left to run. */
@@ -595,7 +662,14 @@ export class ProvisionedSessionRuntime {
     sessionId: string,
     conversation: ConversationStep,
     prompt: string,
-    turn: { relay: boolean; timeoutMs: number; purpose: TurnPurpose; spawn?: SpawnAttestation | null },
+    turn: {
+      relay: boolean;
+      timeoutMs: number;
+      purpose: TurnPurpose;
+      spawn?: SpawnAttestation | null;
+      /** Whether the turn's triggers still want it, asked last before the provider call; a refusal is the turn's. */
+      admissible?: () => Decision<void>;
+    },
   ): Promise<Decision<SessionTurnResult>> {
     const refused = (decision: Decision<void>): Decision<SessionTurnResult> => {
       this.ports.audit.record({
@@ -669,6 +743,15 @@ export class ProvisionedSessionRuntime {
     if (!now.allowed) {
       if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
       return refused(now);
+    }
+    // And, last, the triggers' own gate: a turn left with no trigger to serve (woken only by
+    // mentions whose identity, role or room no longer stands behind this holder, or that another
+    // turn has already served) is refused here with the gate's own answer, after every await and
+    // with no provider contact. Like every refusal above it is not a completed turn.
+    const wanted = turn.admissible?.();
+    if (wanted !== undefined && !wanted.allowed) {
+      if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
+      return refused(wanted);
     }
     let result: SessionTurnResult;
     try {

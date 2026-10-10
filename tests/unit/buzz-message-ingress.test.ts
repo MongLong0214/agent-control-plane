@@ -206,8 +206,10 @@ const readyBoundSession = (
   model: string,
   mention: string,
   projectIds: readonly string[],
+  /** The room the session answers in; the mention subscriber admits an identity only with one. */
+  buzzAddress: string | null = null,
 ): { sessionId: string; incarnation: string; sessionSecret: string } => {
-  const session = harness.cp.sessions.create({ provider: "scripted", model });
+  const session = harness.cp.sessions.create({ provider: "scripted", model, buzzAddress });
   expect(
     harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test").reasonCode,
   ).toBe(ReasonCode.OK);
@@ -1498,7 +1500,7 @@ describe("the daemon's Buzz message ingress", () => {
     const ownerKey = generateSecretKey();
     const ownerPubkey = getPublicKey(ownerKey);
 
-    const session = readyBoundSession(harness, "cto-relay-peer", ctoPubkey, [projectId]);
+    const session = readyBoundSession(harness, "cto-relay-peer", ctoPubkey, [projectId], "buzz-cto-room");
 
     const mcpStateDir = tempDir("acp-buzz-relay-mcp-");
     chmodSync(mcpStateDir, 0o700);
@@ -1688,7 +1690,7 @@ describe("the daemon's Buzz message ingress", () => {
     // Not on the owner list. It holds nothing but the ability to sign, which is all anyone needs.
     const strangerKey = generateSecretKey();
 
-    readyBoundSession(harness, "cto-cursor-peer", ctoPubkey, [projectId]);
+    readyBoundSession(harness, "cto-cursor-peer", ctoPubkey, [projectId], "buzz-cto-room");
 
     const mcpStateDir = tempDir("acp-buzz-cursor-mcp-");
     chmodSync(mcpStateDir, 0o700);

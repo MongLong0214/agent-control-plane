@@ -182,10 +182,12 @@ describe("a wake belongs to the registration it began under", () => {
       expect((await registerSecond).allowed).toBe(true);
       expect(causes(port)).toEqual(["registered-endpoint-refused-the-wake"]);
 
-      // A's delivery completes, late and successfully.
+      // A's connection completes, late. A is no longer the registration in force, so its wake is
+      // not written to the endpoint the holder stopped naming (1080-N1-01): the write re-checks the
+      // holder and its registration, and a mismatch discards the attempt.
       wakes.dialled[0]?.succeed();
       expect((await registerFirst).allowed).toBe(true);
-      expect(wakes.dialled[0]?.frame).not.toBeNull();
+      expect(wakes.dialled[0]?.frame).toBeNull();
 
       // B's refusal is still the current fact about this holder.
       expect(causes(port)).toEqual(["registered-endpoint-refused-the-wake"]);
