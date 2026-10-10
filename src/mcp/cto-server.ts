@@ -404,7 +404,8 @@ const createCtoServerFromPort = (
           ])).optional(),
           // Issue #246 PR-C slice C2 — a project-less bootstrap run's full project manifest. It must be
           // portable and its digest must be `projectManifestDigest`; the PLAN keeps it, so the PLAN
-          // digest covers it. Any other run's plan never stores it.
+          // digest covers it. #246 B2-a — a CONTRACT_CHANGE run's PLAN must carry it, under the same
+          // rules and checked against the run's pinned manifest. Any other run's plan never stores it.
           projectManifest: z.record(z.unknown()).optional(),
         }),
         tasks: z.array(z.object({ key: z.string(), title: z.string(), category: z.enum(["mechanical", "implementation", "investigation", "integration", "test", "review", "docs", "migration", "benchmark", "security"]), dependsOn: z.array(z.string()).default([]), spec: z.record(z.unknown()).default({}) })).min(1),
