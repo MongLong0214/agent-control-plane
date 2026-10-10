@@ -94,8 +94,9 @@ const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 /**
  * One time bound shared by several git invocations that answer one question together (#1082
  * R3-01). `endsAt` is on the monotonic `performance.now()` clock, so a wall-clock step cannot
- * lengthen or shorten it. The bound is a logical budget: each invocation is given what remains of
- * it, none is started once it is spent, and an answer that settles after it is a timeout. How
+ * lengthen or shorten it, and it is carried as an absolute instant to every check. The bound is a
+ * logical budget: each invocation is given what remains of it at its launch instant, none is
+ * started once it is spent, and an answer that settles at or after `endsAt` is a timeout. How
  * promptly the operating system delivers the kill and the answer is not part of what it promises.
  */
 interface GitDeadline {
@@ -121,12 +122,12 @@ const deadlineAfter = (cwd: string, timeoutMs: number | undefined): GitDeadline 
 };
 
 /**
- * What remains of `deadline` for the next invocation, in whole milliseconds because that is what
- * Node's `timeout` takes. Under one millisecond is spent: Node reads `timeout: 0` as no bound at
- * all, so the next process is refused rather than started.
+ * What remains of `deadline` at `at`, in whole milliseconds because that is what Node's `timeout`
+ * takes. Under one millisecond is spent: Node reads `timeout: 0` as no bound at all, so the next
+ * process is refused rather than started.
  */
-const remainingOf = (deadline: GitDeadline, cwd: string, args: readonly string[]): number => {
-  const remaining = Math.floor(deadline.endsAt - performance.now());
+const remainingAt = (deadline: GitDeadline, at: number, cwd: string, args: readonly string[]): number => {
+  const remaining = Math.floor(deadline.endsAt - at);
   if (remaining < 1) {
     fail(
       ReasonCode.GIT_TIMEOUT,
@@ -153,9 +154,16 @@ export const git = async (
   // No caller passes 0 today; this refuses the affordance rather than waiting for one to.
   const requested = options.timeoutMs;
   if (requested !== undefined) positiveBound(cwd, args, requested);
-  const timeout = options.deadline
-    ? remainingOf(options.deadline, cwd, args)
-    : requested ?? DEFAULT_GIT_TIMEOUT_MS;
+  const deadline = options.deadline;
+  // A shared deadline already spent starts nothing, before any other work is done for this call.
+  if (deadline) remainingAt(deadline, performance.now(), cwd, args);
+  // The launch instant, read with nothing awaited between it and the spawn. Under a shared deadline
+  // the process's own bound is recomputed from this one sample, not carried from the check above:
+  // a scheduling gap between the two would otherwise be budget the deadline never granted (#1082
+  // R3-01, round 4 -- measured, a status sampled at 500 of a 1000ms deadline, started at 750 and
+  // settled at 1001 read clean, its own elapsed 251 being under the 500 it was given).
+  const startedAt = performance.now();
+  const timeout = deadline ? remainingAt(deadline, startedAt, cwd, args) : requested ?? DEFAULT_GIT_TIMEOUT_MS;
   // A settlement at or after the bound is not git answering (#1082 R3-01). Node's kill timer fires
   // only once `timeout` has elapsed since the spawn, and it destroys the output pipes before it
   // signals, so a child that outlives the signal -- one that ignores SIGTERM, or whose exit races
@@ -163,9 +171,13 @@ export const git = async (
   // that ignored SIGTERM: one with nothing to write settled with its own exit code, 0 read as
   // success and 1 handed back by `allowFailure` as git saying no; one still writing died of
   // SIGPIPE on the destroyed pipe and read as an outside signal. `startedAt` is read before the
-  // spawn, so every settlement the timer could have touched reads as at least `timeout` here.
-  const startedAt = performance.now();
-  const late = (): boolean => performance.now() - startedAt >= timeout;
+  // spawn, so every settlement the timer could have touched reads as at least `timeout` here. A
+  // shared deadline is also compared absolutely, so whatever order the callbacks run in, nothing
+  // settling at or after `endsAt` is counted.
+  const late = (): boolean => {
+    const now = performance.now();
+    return now - startedAt >= timeout || (deadline !== undefined && now >= deadline.endsAt);
+  };
   let settled: { stdout: string; stderr: string };
   try {
     settled = await exec("git", ["-C", cwd, ...args], {

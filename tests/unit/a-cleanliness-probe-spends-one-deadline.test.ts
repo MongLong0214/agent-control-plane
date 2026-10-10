@@ -15,14 +15,17 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { git, isClean } from "../../src/git/git.ts";
 import { cleanupTempDirs, gitSync, makeRepo } from "../helpers/fixtures.ts";
 import { stableFixtureBinDir } from "../helpers/stable-fixture-executable.ts";
 
-afterEach(cleanupTempDirs);
+afterEach(() => {
+  vi.restoreAllMocks();
+  cleanupTempDirs();
+});
 
 /**
  * A git that is slow to answer one kind of call, configuration discovery unless told otherwise.
@@ -152,5 +155,79 @@ describe("#1082 R3-01: one deadline bounds a cleanliness probe", () => {
     expect(calls).toHaveLength(1);
     // `before` is what the same settlement was reported as when a late settlement was counted.
     expect(result, `previously ${JSON.stringify(before)}`).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
+  });
+
+  /**
+   * #1082 R3-01, round 4 — the shared deadline is an absolute instant on one monotonic clock, and a
+   * scheduling gap between computing what remains and launching the process grants nothing. These
+   * are a closure review's two witnesses, with its assertions: one models the clock exactly, one
+   * uses real monotonic time with a pause injected after the remaining-time sample. Both run real
+   * git. The sample positions are: the deadline, then per process its pre-check, its launch
+   * instant and its settlement.
+   */
+  const withClock = async (samples: readonly number[]) => {
+    const repo = makeRepo();
+    const observed: number[] = [];
+    vi.spyOn(performance, "now").mockImplementation(() => {
+      const next = samples[observed.length] ?? samples[samples.length - 1]!;
+      observed.push(next);
+      return next;
+    });
+    let result: unknown;
+    try {
+      result = { clean: await isClean(repo, { timeoutMs: 1000 }) };
+    } catch (error) {
+      const e = error as { reasonCode: unknown; evidence: unknown };
+      result = { reasonCode: e.reasonCode, evidence: e.evidence };
+    } finally {
+      vi.mocked(performance.now).mockRestore();
+    }
+    return { observed, result };
+  };
+
+  it("RF-S22 arm:validator #1082 R3-01: a status answer after the shared deadline cannot become success after a scheduling gap", async () => {
+    // Discovery: deadline 1000, checked at 1, launched at 1, settles at 2. Status: checked at 500,
+    // launched at 750, settles at 1001. Its own elapsed 251 is under the 500 the check saw.
+    const samples = [0, 1, 1, 2, 500, 750, 1001];
+    const { observed, result } = await withClock(samples);
+    expect(observed).toEqual(samples);
+    expect(result).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
+  });
+
+  it("RF-S22 arm:validator #1082 R3-01: a settlement exactly at the shared deadline is a timeout, and one just before it is an answer", async () => {
+    const at = await withClock([0, 1, 1, 2, 500, 750, 1000]);
+    expect(at.result).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
+    const before = await withClock([0, 1, 1, 2, 500, 750, 999]);
+    expect(before.result, "the control: the same sequence one millisecond earlier").toEqual({ clean: true });
+  });
+
+  it("RF-S22 arm:validator #1082 R3-01: a launch instant at or past the shared deadline starts nothing", async () => {
+    // The status check at 500 sees budget; the gap before its launch spends all of it.
+    const { result } = await withClock([0, 1, 1, 2, 500, 1000]);
+    expect(result).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT, evidence: { started: false } });
+  });
+
+  it("RF-S22 arm:validator #1082 R3-01: real monotonic time after a scheduling pause still cannot become clean", async () => {
+    const repo = makeRepo();
+    const realNow = performance.now.bind(performance);
+    const observed: number[] = [];
+    // A pause just after status samples its remaining budget. Every timestamp is real monotonic
+    // time; only the pause is injected, and it is longer than the whole budget.
+    vi.spyOn(performance, "now").mockImplementation(() => {
+      const sampled = realNow();
+      observed.push(sampled);
+      if (observed.length === 5) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      return sampled;
+    });
+    let result: unknown;
+    try {
+      result = { clean: await isClean(repo, { timeoutMs: 1000 }) };
+    } catch (error) {
+      const e = error as { reasonCode: unknown; evidence: unknown };
+      result = { reasonCode: e.reasonCode, evidence: e.evidence };
+    } finally {
+      vi.mocked(performance.now).mockRestore();
+    }
+    expect(result, JSON.stringify({ observed, result })).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
   });
 });
