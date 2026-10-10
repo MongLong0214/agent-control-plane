@@ -1949,14 +1949,12 @@ const wakeForMention = (
   if (!stillAdmissible()) {
     return Promise.resolve(deny(ReasonCode.ROLE_PEER_STALE, "the mention's identity, role or room no longer stands behind this holder", { roleKey }));
   }
-  // Served once the mention's own message has left PENDING: claimed, or settled by a fence. Read
-  // when the driven turn ends, so a claim refused mid-turn leaves the trigger released.
-  const served = (): boolean =>
-    (cp.db.get<{ status: string }>(
-      `SELECT status FROM outbox WHERE kind = ? AND json_extract(payload_json, '$.sourceChannel') = 'buzz'
-          AND json_extract(payload_json, '$.sourceNonce') = ?`,
-      [MessageKind.OWNER_MESSAGE, buzzMessageNonce(mention.eventId)],
-    )?.status ?? "PENDING") !== "PENDING";
+  // Served once this mention's own event is spent: a row pointing at it left PENDING (its claim, the
+  // holder's rejection or a fence), whatever its kind (an owner's mention is an OWNER_MESSAGE, the
+  // CEO's a PEER_MESSAGE), or its turn held a terminal fact. Keyed by the verified event and read
+  // from the append-only departure record the hand-over rule refuses on, rather than from a row's
+  // writable pointer or status. A claim refused mid-turn spends nothing, so the trigger is released.
+  const served = (): boolean => cp.outbox.sourceEventSpent("buzz", buzzMessageNonce(mention.eventId));
   return wakeRoleHolder(cp, { wake: (key) => roleConversation.wake(key, mention) }, roleKey, {
     kind: "owner message",
     ids: [],
