@@ -167,56 +167,100 @@ describe("W17: lowering the verification bar is detected against the pin and ref
   const lowered = (answer: Record<string, unknown>) =>
     ((answer["evidence"] as { lowered: Array<{ kind: string }> }).lowered).map((entry) => entry.kind);
 
-  const cases: Array<[string, (base: ProjectManifest) => unknown, string[]]> = [
+  const BAR = "CONTRACT_CHANGE_VERIFICATION_BAR_LOWERED";
+  const DIGEST_CHANGED = "CONTRACT_CHANGE_WORKFLOW_DIGEST_CHANGED";
+  const withCommand = (base: ProjectManifest, id: string, change: Partial<ProjectManifest["verificationCommands"][number]>) =>
+    base.verificationCommands.map((command) => (command.id === id ? { ...command, ...change } : command));
+
+  const cases: Array<[string, (base: ProjectManifest) => unknown, string, string[]]> = [
     ["a removed required command", (base) => ({
       ...base,
       verificationCommands: base.verificationCommands.filter((command) => command.id !== "unit-tests"),
       verificationProfiles: { simple: ["verify"], standard: ["verify"], guarded: ["verify"] },
       ciWorkflows: [],
-    }), ["COMMAND_REMOVED", "PROFILE_COMMAND_REMOVED", "PROFILE_COMMAND_REMOVED", "CI_WORKFLOW_DROPPED"]],
+    }), BAR, ["COMMAND_REMOVED", "CI_WORKFLOW_DROPPED"]],
     ["a downgraded evidenceMode", (base) => ({
       ...base,
-      verificationCommands: base.verificationCommands.map((command) => command.id === "unit-tests" ? { ...command, evidenceMode: "LOCAL_COMMAND" } : command),
-    }), ["EVIDENCE_MODE_DOWNGRADED"]],
-    ["an unapproved CI workflow", (base) => ({
-      ...base,
-      ciWorkflows: [{ ...WORKFLOW_ENTRY, approvedDigest: null, unapprovedFirstActivation: true }],
-    }), ["CI_WORKFLOW_UNAPPROVED"]],
-    ["a dropped ciWorkflows entry", (base) => ({ ...base, ciWorkflows: [] }), ["CI_WORKFLOW_DROPPED"]],
+      verificationCommands: withCommand(base, "unit-tests", { evidenceMode: "LOCAL_COMMAND" }),
+    }), BAR, ["EVIDENCE_MODE_DOWNGRADED"]],
     ["a command whose argv no longer checks the same thing", (base) => ({
       ...base,
-      verificationCommands: base.verificationCommands.map((command) => command.id === "unit-tests" ? { ...command, argv: ["node", "--version"] } : command),
-    }), ["COMMAND_REPLACED"]],
-    ["a dropped post-merge command", (base) => ({ ...base, postMergeCommands: [] }), ["POST_MERGE_COMMAND_REMOVED"]],
-    ["a lower CommitLore mode", (base) => ({ ...base, commitlore: { mode: "preferred" } }), ["COMMITLORE_MODE_DOWNGRADED"]],
+      verificationCommands: withCommand(base, "unit-tests", { argv: ["node", "--version"] }),
+    }), BAR, ["COMMAND_REPLACED"]],
+    ["a command run with a different environment", (base) => ({
+      ...base,
+      verificationCommands: withCommand(base, "verify", { envAllowlist: ["CI", "NODE_OPTIONS"] }),
+    }), BAR, ["COMMAND_REPLACED"]],
+    ["a raised timeout", (base) => ({
+      ...base,
+      verificationCommands: withCommand(base, "verify", { timeoutSeconds: 600 }),
+    }), BAR, ["COMMAND_LIMIT_RAISED"]],
+    ["a renamed command whose CI evidence is matched by its id", (base) => ({
+      ...base,
+      verificationCommands: withCommand(base, "unit-tests", { id: "unit-tests-renamed" }),
+      verificationProfiles: { simple: ["verify"], standard: ["verify", "unit-tests-renamed"], guarded: ["verify", "unit-tests-renamed"] },
+    }), BAR, ["COMMAND_REMOVED"]],
+    ["a command dropped from one profile while kept in the others", (base) => ({
+      ...base,
+      verificationProfiles: { ...base.verificationProfiles, guarded: ["verify"] },
+    }), BAR, ["PROFILE_COMMAND_REMOVED"]],
+    ["a dropped post-merge command", (base) => ({ ...base, postMergeCommands: [] }), BAR, ["POST_MERGE_COMMAND_REMOVED"]],
+    ["a dropped ciWorkflows entry", (base) => ({ ...base, ciWorkflows: [] }), BAR, ["CI_WORKFLOW_DROPPED"]],
+    ["a workflow added beside commands that already take CI evidence", (base) => ({
+      ...base,
+      ciWorkflows: [...base.ciWorkflows, { ...WORKFLOW_ENTRY, checkName: "lint", path: ".github/workflows/lint.yml" }],
+    }), BAR, ["CI_WORKFLOW_ADDED_BESIDE_CI_EVIDENCE"]],
+    ["a lower CommitLore mode", (base) => ({ ...base, commitlore: { mode: "preferred" } }), BAR, ["COMMITLORE_MODE_DOWNGRADED"]],
+    ["a retained workflow with a new approved digest", (base) => ({
+      ...base,
+      ciWorkflows: [{ ...WORKFLOW_ENTRY, approvedDigest: sha256(WORKFLOW.replace("node --test", "node --version")) }],
+    }), DIGEST_CHANGED, ["CI_WORKFLOW_DIGEST_CHANGED"]],
+    ["a retained workflow made unapproved", (base) => ({
+      ...base,
+      ciWorkflows: [{ ...WORKFLOW_ENTRY, approvedDigest: null, unapprovedFirstActivation: true }],
+    }), DIGEST_CHANGED, ["CI_WORKFLOW_DIGEST_CHANGED"]],
   ];
 
-  for (const [name, change, kinds] of cases) {
+  for (const [name, change, refusal, kinds] of cases) {
     it(`refuses ${name} with no owner binding`, async () => {
       const harness = makeHarness();
       const run = await contractChangeProject(harness, "cc-lowered", richBase("cc-lowered"));
       const proposed = normalized(change(run.base));
-      const answer = await expectRefused(harness, run, planCarrying(proposed), ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT, "CONTRACT_CHANGE_VERIFICATION_BAR_LOWERED");
+      const answer = await expectRefused(harness, run, planCarrying(proposed), ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT, refusal);
       expect(lowered(answer)).toEqual(kinds);
       expect(answer["evidence"]).toMatchObject({ baseManifestDigest: run.baseDigest, ownerApproval: "NOT_AVAILABLE" });
     });
   }
+
+  it("refuses a new workflow that is unapproved, even where no command takes CI evidence yet", async () => {
+    const harness = makeHarness();
+    const run = await contractChangeProject(harness, "cc-unapproved-new");
+    const proposed = normalized({ ...run.base, ciWorkflows: [{ ...WORKFLOW_ENTRY, approvedDigest: null, unapprovedFirstActivation: true }] });
+    const answer = await expectRefused(harness, run, planCarrying(proposed), ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT, BAR);
+    expect(lowered(answer)).toEqual(["CI_WORKFLOW_UNAPPROVED"]);
+  });
 
   it("allows a stricter change and an equivalent one", async () => {
     const harness = makeHarness();
     const run = await contractChangeProject(harness, "cc-stricter", richBase("cc-stricter"));
     const stricterStill = normalized({
       ...run.base,
-      verificationCommands: run.base.verificationCommands.map((command) =>
-        command.id === "verify" ? { ...command, evidenceMode: "BOTH_REQUIRED" } : command,
-      ),
+      verificationCommands: withCommand(run.base, "verify", { evidenceMode: "BOTH_REQUIRED", timeoutSeconds: 60 }),
       postMergeCommands: ["verify", "unit-tests"],
     });
     expect((await planSubmit(harness, run, planCarrying(stricterStill)))["ok"]).toBe(true);
-    // Equivalent: the bar is the same, the timeout is not part of it.
+    // Equivalent: `verify` takes local evidence only, so its id is a label. Renamed everywhere it is
+    // referenced, and every list reordered, it resolves to the same obligations in every mode.
+    const renamed = (id: string) => (id === "verify" ? "verify-renamed" : id);
     const equivalent = normalized({
       ...run.base,
-      verificationCommands: run.base.verificationCommands.map((command) => ({ ...command, timeoutSeconds: command.timeoutSeconds + 60 })),
+      verificationCommands: [...withCommand(run.base, "verify", { id: "verify-renamed" })].reverse(),
+      verificationProfiles: {
+        simple: run.base.verificationProfiles.simple.map(renamed).reverse(),
+        standard: run.base.verificationProfiles.standard.map(renamed).reverse(),
+        guarded: run.base.verificationProfiles.guarded.map(renamed).reverse(),
+      },
+      postMergeCommands: run.base.postMergeCommands.map(renamed).reverse(),
     });
     expect((await planSubmit(harness, run, planCarrying(equivalent)))["ok"]).toBe(true);
     expect(storedPlan(harness, run.runId)!.content["projectManifestDigest"]).toBe(manifestDigest(equivalent));

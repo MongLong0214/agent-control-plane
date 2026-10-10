@@ -36,6 +36,12 @@ export const ContractChangeRefusal = {
   NO_CHANGE: "CONTRACT_CHANGE_NO_CHANGE",
   /** The carried manifest lowers the verification bar; no owner approval can be bound to it yet. */
   VERIFICATION_BAR_LOWERED: "CONTRACT_CHANGE_VERIFICATION_BAR_LOWERED",
+  /**
+   * The carried manifest changes the approved digest of a workflow the base already declares. Nothing
+   * in this slice can show the new bytes check as much as the old, and no owner evidence can be bound
+   * to the change yet, so any change is refused; it waits for the owner-evidence path.
+   */
+  WORKFLOW_DIGEST_CHANGED: "CONTRACT_CHANGE_WORKFLOW_DIGEST_CHANGED",
   /** The run has no pinned manifest, or the pinned manifest cannot be read back by its digest. */
   BASE_UNAVAILABLE: "CONTRACT_CHANGE_BASE_UNAVAILABLE",
 } as const;
@@ -67,10 +73,13 @@ export interface VerificationBarLowering {
     | "COMMAND_REMOVED"
     | "COMMAND_REPLACED"
     | "EVIDENCE_MODE_DOWNGRADED"
+    | "COMMAND_LIMIT_RAISED"
     | "PROFILE_COMMAND_REMOVED"
     | "POST_MERGE_COMMAND_REMOVED"
     | "CI_WORKFLOW_DROPPED"
+    | "CI_WORKFLOW_DIGEST_CHANGED"
     | "CI_WORKFLOW_UNAPPROVED"
+    | "CI_WORKFLOW_ADDED_BESIDE_CI_EVIDENCE"
     | "COMMITLORE_MODE_DOWNGRADED";
   detail: Record<string, string | null>;
 }
@@ -120,72 +129,150 @@ const COMMITLORE_RANK: Readonly<Record<ProjectManifest["commitlore"]["mode"], nu
 
 const PROFILES = ["simple", "standard", "guarded"] as const;
 
-const workflowKey = (workflow: ProjectManifest["ciWorkflows"][number]): string =>
-  `${workflow.repositoryRole}\u0000${workflow.checkName}`;
+type Command = ProjectManifest["verificationCommands"][number];
+type Workflow = ProjectManifest["ciWorkflows"][number];
+
+const workflowKey = (workflow: Workflow): string =>
+  `${workflow.repositoryRole}\u0000${workflow.checkName}\u0000${workflow.path}`;
+
+const sourcesOf = (command: Command): readonly string[] => EVIDENCE_SOURCES[command.evidenceMode];
+
+const hasCiEvidence = (command: Command): boolean => sourcesOf(command).includes("ci");
+
+/**
+ * What a command checks, resolved from its specification: what runs, where, with which environment
+ * and network. Its id is not part of it unless CI evidence is required: a CI result is matched to a
+ * command by its check name, which is the command id, so renaming such a command changes the check
+ * that counts. Evidence and resource limits are compared separately, because more of either is
+ * stricter rather than different.
+ */
+const executionIdentity = (command: Command, withId: boolean): string =>
+  canonicalJson({
+    ...(withId ? { id: command.id } : {}),
+    argv: command.argv,
+    repositoryRole: command.repositoryRole,
+    cwd: command.cwd,
+    envAllowlist: [...new Set(command.envAllowlist)].sort(),
+    network: command.network,
+    networkAllowlist: [...new Set(command.networkAllowlist)].sort(),
+    required: command.required,
+  });
+
+/** The limits a command runs under; a tighter one fails sooner, a looser one admits more. */
+const limitsOf = (command: Command) => ({
+  timeoutSeconds: command.timeoutSeconds,
+  maxOutputBytes: command.maxOutputBytes,
+  maxMemoryMb: command.maxMemoryMb,
+  // Absent, the timeout is also the CPU budget.
+  maxCpuSeconds: command.maxCpuSeconds ?? command.timeoutSeconds,
+});
+
+const sameExecution = (base: Command, next: Command): boolean =>
+  executionIdentity(base, hasCiEvidence(base)) === executionIdentity(next, hasCiEvidence(base));
+
+const keepsEvidence = (base: Command, next: Command): boolean =>
+  sourcesOf(base).every((source) => sourcesOf(next).includes(source));
+
+const keepsLimits = (base: Command, next: Command): boolean => {
+  const before = limitsOf(base);
+  const after = limitsOf(next);
+  return (Object.keys(before) as Array<keyof typeof before>).every((key) => after[key] <= before[key]);
+};
+
+/** Whether `next` discharges the obligation `base` stated: the same check, at least as strict. */
+const discharges = (base: Command, next: Command): boolean =>
+  sameExecution(base, next) && keepsEvidence(base, next) && keepsLimits(base, next);
+
+/** The commands a profile selects, as `commandsForMode` resolves them. */
+const selected = (manifest: ProjectManifest, ids: readonly string[]): Command[] => {
+  const wanted = new Set(ids);
+  return manifest.verificationCommands.filter((command) => wanted.has(command.id));
+};
 
 /**
  * Every way `proposed` asks less of a candidate than `base` did, found by comparison rather than
- * declared. A command, profile entry, post-merge command or CI workflow the base requires has to be
- * required by the proposal too, with at least the same evidence, under the same argv, cwd and
- * repository; a CI workflow may not become unapproved, and the CommitLore mode may not drop.
- * Anything added is stricter. Resource limits, network, environment and branch profile are not
- * judged here.
+ * declared. Obligations are compared by what they resolve to rather than by name: each base command, each
+ * command a profile selects and each post-merge entry that names a command has to be discharged by a
+ * proposed command that checks the same thing (`executionIdentity`) with at least the same evidence
+ * and no looser limits. A post-merge entry that names no command is a check name and is kept by name.
+ * A workflow the base declares must stay, at the same role, check name and path, with the same
+ * approved digest; a new one may not be unapproved, nor be added beside commands that already take
+ * CI evidence, since a check from any approved workflow can supply that evidence. The CommitLore mode
+ * may not drop. The branch profile is not judged.
  */
 export const verificationBarLowerings = (
   base: ProjectManifest,
   proposed: ProjectManifest,
 ): VerificationBarLowering[] => {
   const lowered: VerificationBarLowering[] = [];
-  const proposedCommands = new Map(proposed.verificationCommands.map((command) => [command.id, command]));
+  const kept = (command: Command, candidates: readonly Command[]): boolean =>
+    candidates.some((next) => discharges(command, next));
+
   for (const command of base.verificationCommands) {
-    const next = proposedCommands.get(command.id);
-    if (!next) {
-      lowered.push({ kind: "COMMAND_REMOVED", detail: { commandId: command.id } });
-      continue;
-    }
-    if (
-      canonicalJson(next.argv) !== canonicalJson(command.argv) ||
-      next.cwd !== command.cwd ||
-      next.repositoryRole !== command.repositoryRole
-    ) {
-      lowered.push({ kind: "COMMAND_REPLACED", detail: { commandId: command.id } });
-    }
-    const kept = EVIDENCE_SOURCES[next.evidenceMode];
-    if (EVIDENCE_SOURCES[command.evidenceMode].some((source) => !kept.includes(source))) {
+    if (kept(command, proposed.verificationCommands)) continue;
+    const same = proposed.verificationCommands.filter((next) => sameExecution(command, next));
+    const named = same.find((next) => next.id === command.id) ?? same[0];
+    if (named && same.some((next) => keepsEvidence(command, next))) {
+      lowered.push({ kind: "COMMAND_LIMIT_RAISED", detail: { commandId: command.id } });
+    } else if (named) {
       lowered.push({
         kind: "EVIDENCE_MODE_DOWNGRADED",
-        detail: { commandId: command.id, from: command.evidenceMode, to: next.evidenceMode },
+        detail: { commandId: command.id, from: command.evidenceMode, to: named.evidenceMode },
       });
+    } else if (proposed.verificationCommands.some((next) => next.id === command.id)) {
+      lowered.push({ kind: "COMMAND_REPLACED", detail: { commandId: command.id } });
+    } else {
+      lowered.push({ kind: "COMMAND_REMOVED", detail: { commandId: command.id } });
     }
   }
+  // A profile or post-merge entry is reported only when the command it selects is kept elsewhere;
+  // a command that is gone or weakened is reported once, above.
+  const keptAnywhere = (command: Command): boolean => kept(command, proposed.verificationCommands);
   for (const profile of PROFILES) {
-    const kept = new Set(proposed.verificationProfiles[profile]);
-    for (const commandId of base.verificationProfiles[profile]) {
-      if (!kept.has(commandId)) lowered.push({ kind: "PROFILE_COMMAND_REMOVED", detail: { profile, commandId } });
+    const next = selected(proposed, proposed.verificationProfiles[profile]);
+    for (const command of selected(base, base.verificationProfiles[profile])) {
+      if (keptAnywhere(command) && !kept(command, next)) {
+        lowered.push({ kind: "PROFILE_COMMAND_REMOVED", detail: { profile, commandId: command.id } });
+      }
     }
   }
   const keptPostMerge = new Set(proposed.postMergeCommands);
-  for (const commandId of base.postMergeCommands) {
-    if (!keptPostMerge.has(commandId)) lowered.push({ kind: "POST_MERGE_COMMAND_REMOVED", detail: { commandId } });
+  const nextPostMerge = selected(proposed, proposed.postMergeCommands);
+  for (const entry of base.postMergeCommands) {
+    // The entry is the name of a check required after merge, so keeping the name keeps it; an entry
+    // that names a command may also be kept by an entry naming a command that discharges it.
+    const commands = selected(base, [entry]);
+    const removed = !keptPostMerge.has(entry) &&
+      (commands.length === 0 || commands.some((command) => keptAnywhere(command) && !kept(command, nextPostMerge)));
+    if (removed) lowered.push({ kind: "POST_MERGE_COMMAND_REMOVED", detail: { commandId: entry } });
   }
-  const proposedWorkflows = new Map(proposed.ciWorkflows.map((workflow) => [workflowKey(workflow), workflow]));
-  const baseWorkflows = new Set(base.ciWorkflows.map((workflow) => canonicalJson(workflow)));
-  for (const workflow of base.ciWorkflows) {
-    const next = proposedWorkflows.get(workflowKey(workflow));
-    if (!next || next.path !== workflow.path) {
-      lowered.push({
-        kind: "CI_WORKFLOW_DROPPED",
-        detail: { repositoryRole: workflow.repositoryRole, checkName: workflow.checkName, path: workflow.path },
-      });
-    }
-  }
+
+  const proposedWorkflows = new Map<string, Workflow[]>();
   for (const workflow of proposed.ciWorkflows) {
-    if (workflow.unapprovedFirstActivation && !baseWorkflows.has(canonicalJson(workflow))) {
+    proposedWorkflows.set(workflowKey(workflow), [...(proposedWorkflows.get(workflowKey(workflow)) ?? []), workflow]);
+  }
+  const baseKeys = new Set(base.ciWorkflows.map(workflowKey));
+  for (const workflow of base.ciWorkflows) {
+    const next = proposedWorkflows.get(workflowKey(workflow)) ?? [];
+    const detail = { repositoryRole: workflow.repositoryRole, checkName: workflow.checkName, path: workflow.path };
+    if (next.length === 0) {
+      lowered.push({ kind: "CI_WORKFLOW_DROPPED", detail });
+    } else if (!next.every((entry) => canonicalJson(entry) === canonicalJson(workflow))) {
+      // A newly declared digest is the proposal's own claim about bytes this slice cannot read, so it
+      // is no authority for the change, whichever way the digest moved.
+      const changed = next.find((entry) => canonicalJson(entry) !== canonicalJson(workflow))!;
       lowered.push({
-        kind: "CI_WORKFLOW_UNAPPROVED",
-        detail: { repositoryRole: workflow.repositoryRole, checkName: workflow.checkName, path: workflow.path },
+        kind: "CI_WORKFLOW_DIGEST_CHANGED",
+        detail: { ...detail, from: workflow.approvedDigest, to: changed.approvedDigest },
       });
     }
+  }
+  const baseTakesCiEvidence = base.verificationCommands.some(hasCiEvidence);
+  for (const workflow of proposed.ciWorkflows) {
+    if (baseKeys.has(workflowKey(workflow))) continue;
+    const detail = { repositoryRole: workflow.repositoryRole, checkName: workflow.checkName, path: workflow.path };
+    if (workflow.unapprovedFirstActivation) lowered.push({ kind: "CI_WORKFLOW_UNAPPROVED", detail });
+    if (baseTakesCiEvidence) lowered.push({ kind: "CI_WORKFLOW_ADDED_BESIDE_CI_EVIDENCE", detail });
   }
   if (COMMITLORE_RANK[proposed.commitlore.mode] < COMMITLORE_RANK[base.commitlore.mode]) {
     lowered.push({
@@ -299,9 +386,13 @@ const validateContractChangePlan = (
   const lowered = verificationBarLowerings(base.value, manifest.value);
   if (lowered.length > 0) {
     // Lowering the bar needs the owner's approval bound to these exact lowerings. Nothing can bind
-    // one yet, so every lowering is refused; a stricter or equivalent manifest is not.
-    return deny(ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT, "the carried manifest lowers the verification bar of the run's pinned manifest", {
-      refusal: ContractChangeRefusal.VERIFICATION_BAR_LOWERED,
+    // one yet, so every lowering is refused; a stricter or equivalent manifest is not. A changed
+    // workflow digest is refused under its own code: whether it lowers the bar is not decidable here.
+    const workflowChanged = lowered.some((entry) => entry.kind === "CI_WORKFLOW_DIGEST_CHANGED");
+    return deny(ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT, workflowChanged
+      ? "the carried manifest changes the approved digest of a workflow the run's pinned manifest declares"
+      : "the carried manifest lowers the verification bar of the run's pinned manifest", {
+      refusal: workflowChanged ? ContractChangeRefusal.WORKFLOW_DIGEST_CHANGED : ContractChangeRefusal.VERIFICATION_BAR_LOWERED,
       baseManifestDigest: baseDigest,
       manifestDigest: supplied,
       lowered: lowered.map((entry) => ({ kind: entry.kind, ...entry.detail })),

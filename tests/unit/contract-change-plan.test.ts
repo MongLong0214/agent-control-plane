@@ -85,6 +85,41 @@ describe("verificationBarLowerings", () => {
     expect(verificationBarLowerings(base, ciOnly).map((entry) => entry.kind)).toEqual(["EVIDENCE_MODE_DOWNGRADED"]);
   });
 
+  it("compares what a command resolves to, not its name: a local-only rename is equivalent, a looser limit is not", () => {
+    const renamed = projectManifestSchema.parse({
+      ...base,
+      verificationCommands: base.verificationCommands.map((command) => ({ ...command, id: "verify-renamed" })),
+      verificationProfiles: { simple: ["verify-renamed"], standard: ["verify-renamed"], guarded: ["verify-renamed"] },
+    });
+    expect(verificationBarLowerings(base, renamed)).toEqual([]);
+    const tighter = projectManifestSchema.parse({
+      ...base,
+      verificationCommands: base.verificationCommands.map((command) => ({ ...command, timeoutSeconds: 30, maxMemoryMb: 512 })),
+    });
+    expect(verificationBarLowerings(base, tighter)).toEqual([]);
+    for (const looser of [{ maxOutputBytes: 2_097_152 }, { maxMemoryMb: 4096 }, { maxCpuSeconds: 600 }]) {
+      const proposal = projectManifestSchema.parse({
+        ...base,
+        verificationCommands: base.verificationCommands.map((command) => ({ ...command, ...looser })),
+      });
+      expect(verificationBarLowerings(base, proposal).map((entry) => entry.kind)).toEqual(["COMMAND_LIMIT_RAISED"]);
+    }
+  });
+
+  it("keeps a post-merge check by its name, or by a command that discharges the one it named", () => {
+    const withPostMerge = projectManifestSchema.parse({ ...base, postMergeCommands: ["verify", "external-check"] });
+    // The check name kept while the command is renamed: the same check is still required.
+    const nameKept = projectManifestSchema.parse({
+      ...withPostMerge,
+      verificationCommands: withPostMerge.verificationCommands.map((command) => ({ ...command, id: "verify-renamed" })),
+      verificationProfiles: { simple: ["verify-renamed"], standard: ["verify-renamed"], guarded: ["verify-renamed"] },
+    });
+    expect(verificationBarLowerings(withPostMerge, nameKept)).toEqual([]);
+    // A name that is no command is a check name only, and renaming it removes it.
+    const external = projectManifestSchema.parse({ ...withPostMerge, postMergeCommands: ["verify", "other-check"] });
+    expect(verificationBarLowerings(withPostMerge, external).map((entry) => entry.kind)).toEqual(["POST_MERGE_COMMAND_REMOVED"]);
+  });
+
   it("treats a moved workflow path as dropping the approved one", () => {
     const withWorkflow = projectManifestSchema.parse({ ...base, ciWorkflows: [workflow] });
     const moved = projectManifestSchema.parse({ ...base, ciWorkflows: [{ ...workflow, path: ".github/workflows/other.yml" }] });
