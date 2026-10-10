@@ -20,6 +20,13 @@ import {
   peerMessageCarrySuccessionOf,
 } from "../registry/canonical-self-claim.ts";
 import {
+  type DrivenMode,
+  type DrivenSpawnRecord,
+  drivenModeOf,
+  drivenModeSql,
+  drivenSpawnRecordOf,
+} from "../runtime/provisioned-session-runtime.ts";
+import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
   IDENTITY_BOUND_KINDS,
@@ -264,6 +271,23 @@ export const IN_BAND_KIND_SQL = [...IN_BAND_KINDS]
   .map((kind) => `'${kind.replace(/'/g, "''")}'`)
   .join(", ");
 
+/**
+ * #246 C4 — the kinds a provisioned (driven) runtime receives in band: every `IN_BAND_KINDS` kind,
+ * and `HANDOFF_PACKAGE`. An activation's handoff is addressed to the PRIMARY_CTO it has already
+ * bound (`bootstrap-handoff:<id>`), so unlike a switchover's its recipient *is* the role's holder; a
+ * driven session has no process between turns for a Buzz send to reach, so the row stays PENDING,
+ * the wake runs a turn, and that turn reads it and settles it over its authenticated connection.
+ * The outbox key keeps a re-delivery to one row and the row's own status keeps it to one effect.
+ */
+export const PROVISIONED_IN_BAND_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
+  ...IN_BAND_KINDS,
+  MessageKind.HANDOFF_PACKAGE,
+]);
+
+const PROVISIONED_IN_BAND_KIND_SQL = [...PROVISIONED_IN_BAND_KINDS]
+  .map((kind) => `'${kind.replace(/'/g, "''")}'`)
+  .join(", ");
+
 /** A pending in-band row is woken for at most once per this window, per row. */
 export const IN_BAND_REWAKE_MS = 5 * 60 * 1000;
 
@@ -289,28 +313,44 @@ export interface InBandDispatch {
  * canonical runtime. `claimDeliverable` excludes it, and every in-band read below selects it.
  */
 const inBandRow = (outboxAlias: "o" | "outbox"): string =>
-  `(${outboxAlias}.kind IN (${IN_BAND_KIND_SQL})
-    AND (${adoptedCanonicalRuntimeSql(`${outboxAlias}.target_session_id`)}
-      OR ${provisionedRuntimeSql(`${outboxAlias}.target_session_id`)}))`;
+  `((${outboxAlias}.kind IN (${IN_BAND_KIND_SQL})
+     AND ${adoptedCanonicalRuntimeSql(`${outboxAlias}.target_session_id`)})
+    OR (${outboxAlias}.kind IN (${PROVISIONED_IN_BAND_KIND_SQL})
+     AND ${provisionedRuntimeSql(`${outboxAlias}.target_session_id`)}))`;
 
 /**
  * #246 C1b — a provisioned session on the headless runtime: the current holder of an ACTIVE
- * BOOTSTRAP_CTO binding. Like an adopted canonical CTO it has nothing a Buzz send could reach — it
- * has no live process at all between turns — so its in-band kinds stay PENDING, the wake starts a
- * turn of its own conversation, and that turn reads and settles them over its authenticated
- * connection exactly as a canonical CTO does.
+ * BOOTSTRAP_CTO binding, or (#246 C4) of an ACTIVE PRIMARY_CTO binding whose session's spawn record
+ * makes it `DRIVEN` — never a PRIMARY_CTO by its role alone, and never on a missing or contradicted
+ * record. Like an adopted canonical CTO it has
+ * nothing a Buzz send could reach — it has no live process at all between turns — so its in-band
+ * kinds stay PENDING, the wake starts a turn of its own conversation, and that turn reads and
+ * settles them over its authenticated connection exactly as a canonical CTO does.
  */
 const provisionedRuntimeSql = (sessionExpr: string): string => `EXISTS (
   SELECT 1 FROM assignments prov_a
     LEFT JOIN conversational_actors prov_c ON prov_c.actor_id = prov_a.actor_id
-   WHERE prov_a.role = 'BOOTSTRAP_CTO' AND prov_a.status = 'ACTIVE'
+   WHERE prov_a.status = 'ACTIVE'
      AND COALESCE(prov_c.current_session_id, prov_a.session_id) = ${sessionExpr}
+     AND (prov_a.role = 'BOOTSTRAP_CTO'
+       OR (prov_a.role = 'PRIMARY_CTO'
+         AND ${drivenModeSql("COALESCE(prov_c.current_session_id, prov_a.session_id)")} = 'DRIVEN'))
 )`;
 
-/** `inBandRow`'s target half, as a read: an adopted canonical runtime or a provisioned one. */
-const receivesInBand = (db: Pick<Db, "get">, sessionId: string): boolean =>
-  isAdoptedCanonicalRuntime(db, sessionId) ||
-  db.get<{ held: number }>(`SELECT ${provisionedRuntimeSql("?")} AS held`, [sessionId])?.held === 1;
+/**
+ * #246 C4 — a target whose driven-spawn record is contradicted (or names a session not yet bound) is
+ * neither in band nor sent: the delivery sweep withholds its rows exactly as it withholds an in-band
+ * row, so a record that does not add up fails closed rather than falling back to a Buzz send.
+ */
+const withheldFromSweep = (outboxAlias: "o" | "outbox"): string =>
+  `(${inBandRow(outboxAlias)}
+    OR ${drivenModeSql(`${outboxAlias}.target_session_id`)} NOT IN ('NONE', 'DRIVEN'))`;
+
+/** `inBandRow`, as a read of one kind and target: the same two halves, the same kind sets. */
+const deliveredInBand = (db: Pick<Db, "get">, kind: string, sessionId: string): boolean =>
+  (IN_BAND_KINDS.has(kind as MessageKind) && isAdoptedCanonicalRuntime(db, sessionId)) ||
+  (PROVISIONED_IN_BAND_KINDS.has(kind as MessageKind) &&
+    db.get<{ held: number }>(`SELECT ${provisionedRuntimeSql("?")} AS held`, [sessionId])?.held === 1);
 
 /**
  * Which runtime holds a role *right now* — one notion of it, shared by every predicate below.
@@ -592,7 +632,7 @@ export class Outbox {
     // An in-band row is never transmitted, so the role is told it has something to read — after
     // the enclosing transaction commits, so a wake cannot reach the CTO before the row it points
     // at is visible, and a rollback discards it.
-    if (IN_BAND_KINDS.has(message.kind) && receivesInBand(this.db, message.targetSessionId)) {
+    if (deliveredInBand(this.db, message.kind, message.targetSessionId)) {
       this.db.afterCommit(() => {
         void this.#wakeInBand([{ messageId: message.messageId, roleKey: message.roleKey }], "enqueue");
       });
@@ -642,7 +682,7 @@ export class Outbox {
             -- CTO already holds an authenticated connection to this daemon. It stays PENDING and
             -- the CTO reads it in band (pendingInBandFor), for the same reason as the line above:
             -- nothing here may transmit what only its exact target may read.
-            AND NOT ${inBandRow("o")}
+            AND NOT ${withheldFromSweep("o")}
             AND o.expires_at > ?
             -- A deferred retry is not deliverable until its window opens; the deferral is
             -- durable, so a restarted loop honours it instead of retrying immediately.
@@ -663,7 +703,7 @@ export class Outbox {
         const updated = this.db.run(
           `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = ?, claimed_at = ?
             WHERE message_id = ? AND status = 'PENDING'
-              AND NOT ${inBandRow("outbox")}
+              AND NOT ${withheldFromSweep("outbox")}
               AND ${liveDeliveryTarget("outbox")}`,
           [token, now, row.message_id],
         );
@@ -1259,9 +1299,22 @@ export class Outbox {
     });
   }
 
-  /** In-band, in `claimDeliverable`'s terms: an in-band kind addressed to a canonical runtime. */
+  /**
+   * #246 C4 — the `DrivenMode` of a session, by the one predicate the in-band routing above reads, so
+   * the runtime that drives a session and the outbox that routes to it never disagree about it.
+   */
+  drivenModeOf(sessionId: string): DrivenMode {
+    return drivenModeOf(this.db, sessionId);
+  }
+
+  /** #246 C4 — what a session's one driven-spawn record names (`drivenSpawnRecordOf`). */
+  drivenSpawnRecordOf(sessionId: string): DrivenSpawnRecord | null {
+    return drivenSpawnRecordOf(this.db, sessionId);
+  }
+
+  /** In-band, in `claimDeliverable`'s terms: an in-band kind addressed to a canonical or provisioned runtime. */
   #isInBand(row: RawOutbox): boolean {
-    return IN_BAND_KINDS.has(row.kind as MessageKind) && receivesInBand(this.db, row.target_session_id);
+    return deliveredInBand(this.db, row.kind, row.target_session_id);
   }
 
   /**
