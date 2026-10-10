@@ -1,5 +1,6 @@
+import type * as FsModule from "node:fs";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -39,6 +40,36 @@ import { callMcpToolOverSocket, claimLaunchedCredential } from "../helpers/mcp-s
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
+
+/**
+ * Review 1076-R1-05 — every rename this process attempts, recorded as it is attempted. A final-state
+ * comparison cannot see an entry moved aside and moved back; this log does. Plain functions rather
+ * than mocks, so restoring mocks between tests leaves them in place.
+ */
+const renames = vi.hoisted(() => ({ attempted: [] as Array<{ from: string; to: string }> }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof FsModule>();
+  const note = (from: unknown, to: unknown): void => {
+    renames.attempted.push({ from: String(from), to: String(to) });
+  };
+  const renameSync: typeof actual.renameSync = (from, to) => {
+    note(from, to);
+    actual.renameSync(from, to);
+  };
+  const rename = ((from: Parameters<typeof actual.rename>[0], to: Parameters<typeof actual.rename>[1], callback: Parameters<typeof actual.rename>[2]) => {
+    note(from, to);
+    actual.rename(from, to, callback);
+  }) as typeof actual.rename;
+  const promises = {
+    ...actual.promises,
+    rename: async (from: Parameters<typeof actual.promises.rename>[0], to: Parameters<typeof actual.promises.rename>[1]) => {
+      note(from, to);
+      await actual.promises.rename(from, to);
+    },
+  };
+  const wrapped = { ...actual, renameSync, rename, promises };
+  return { ...wrapped, default: wrapped };
+});
 
 /**
  * Issue #246 PR-C slice C3 — the durable application of a project-less PROJECT_BOOTSTRAP run's
@@ -1028,6 +1059,28 @@ const footprint = (path: string): unknown => {
   return { dev: stat.dev, ino: stat.ino, tree };
 };
 
+/** Whether `path` is `root` or inside it, by the path as given and as resolved. */
+const isUnder = (path: string, root: string): boolean => {
+  const roots = [resolve(root)];
+  try {
+    roots.push(realpathSync(root));
+  } catch {
+    // A root that is gone is compared as given.
+  }
+  return roots.some((candidate) => resolve(path) === candidate || resolve(path).startsWith(`${candidate}${sep}`));
+};
+
+/**
+ * Every rename attempted while `action` ran whose source or destination is under one of `roots` —
+ * an earlier attempt's checkout, the checkouts directory, or a foreign entry (review 1076-R1-05).
+ */
+const movesDuring = async <T>(roots: readonly string[], action: () => Promise<T>): Promise<{ value: T; moves: Array<{ from: string; to: string }> }> => {
+  const start = renames.attempted.length;
+  const value = await action();
+  const moves = renames.attempted.slice(start).filter(({ from, to }) => roots.some((root) => isUnder(from, root) || isUnder(to, root)));
+  return { value, moves };
+};
+
 /**
  * An application attempt that dies mid-production, as a killed daemon leaves it: the first CONFIRM
  * reserves, creates the repository and commits in attempt 1's own checkout, and its push never
@@ -1080,10 +1133,11 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
       const { first } = await interruptedAttempt(f, run);
       const before = footprint(first);
 
-      const resumed = await confirm(f, run);
+      const { value: resumed, moves } = await movesDuring([first], () => confirm(f, run));
       expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
-      // Attempt 1's checkout: not moved, not reused, not changed.
+      // Attempt 1's checkout: no move of it attempted, not reused, not changed (review 1076-R1-05).
+      expect(moves).toEqual([]);
       expect(footprint(first)).toEqual(before);
       // Attempt 2's: created by it, owned by this operation, and the one the stored result proposes.
       const second = attemptPath(f, run, 2);
@@ -1243,7 +1297,10 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
       symlinkSync(elsewhere, first);
       const target = footprint(elsewhere);
       const real = footprint(aside);
-      earlierInDoubt(f, run, await confirm(f, run));
+      const { value: refused, moves } = await movesDuring([dirname(first), aside, elsewhere], () => confirm(f, run));
+      earlierInDoubt(f, run, refused);
+      // Zero moves attempted, not merely the same final state (review 1076-R1-05).
+      expect(moves).toEqual([]);
       expect(readlinkSync(first)).toBe(elsewhere);
       expect(footprint(elsewhere)).toEqual(target);
       expect(footprint(aside)).toEqual(real);
@@ -1264,8 +1321,9 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
       symlinkSync(decoy, repositories);
       const decoyBefore = footprint(decoy);
       const real = footprint(`${repositories}.real`);
-      const refused = await confirm(f, run);
+      const { value: refused, moves } = await movesDuring([repositories, `${repositories}.real`, decoy], () => confirm(f, run));
       earlierInDoubt(f, run, refused);
+      expect(moves).toEqual([]);
       expect(refused).toMatchObject({ evidence: { checkoutsDirKind: "symlink" } });
       expect(footprint(decoy)).toEqual(decoyBefore);
       expect(footprint(`${repositories}.real`)).toEqual(real);
@@ -1283,8 +1341,9 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
       writeFileSync(join(first, "impostor"), "not the checkout\n");
       const impostor = footprint(first);
       const real = footprint(aside);
-      const resumed = await confirm(f, run);
+      const { value: resumed, moves } = await movesDuring([dirname(first), aside], () => confirm(f, run));
       expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(moves).toEqual([]);
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
       expect(footprint(first)).toEqual(impostor);
       expect(footprint(aside)).toEqual(real);
