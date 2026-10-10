@@ -624,6 +624,21 @@ export interface ApplyGitHubOperationsInput {
   clock: Clock;
   /** Mints the marker a create puts in the repository's description. */
   newMarker?: () => string;
+  /**
+   * Issue #246 C2, review round 1 (RF-REVIEW-01) — whether the tree at `head` is exactly the approved
+   * files. The commit this run makes is asked before this function is called at all, so a first push
+   * sends only an approved tree. A head GitHub already holds — a resumed push's receipted head, or a
+   * lost push's recorded one — was not, so it is asked once it is checked out, before any later
+   * operation writes on its strength.
+   */
+  approvedTree: (head: string) => Promise<Decision<void>>;
+  /**
+   * Review round 3 (RF-REVIEW-01) — the commit this run made and checked with `approvedTree` before
+   * calling this function: the only commit a first push sends, by its id. The checkout's HEAD is never
+   * read back to choose what to push: every GitHub call before the push is awaited, and anything
+   * that moves HEAD meanwhile would otherwise be pushed unchecked.
+   */
+  validatedHead: string;
 }
 
 export interface AppliedGitHubOperations {
@@ -632,6 +647,11 @@ export interface AppliedGitHubOperations {
   written: string[];
   adopted: string[];
   resumed: string[];
+  /**
+   * The head GitHub holds once the push step is done, as its receipt read it back: `validatedHead`
+   * when this attempt pushed it, or the receipted or recorded head a retry fetched and checked.
+   */
+  publishedHead: string;
 }
 
 type Step = { receipt: GitHubOperationReceipt; outcome: "written" | "adopted" | "resumed" };
@@ -676,6 +696,9 @@ export const applyGitHubOperations = async (
   const adopted: string[] = [];
   const resumed: string[] = [];
   let repositoryNodeId: string | null = null;
+  // Every successful attempt has exactly one branch receipt (`preflightGitHubOperations` requires the
+  // push), which sets this to the head GitHub holds.
+  let publishedHead = input.validatedHead;
 
   const persist = (): void => input.record({ receipts: [...receipts.values()], pending: [...pending.values()] });
   /** Before a write, and again with GitHub's answer: what a retry reconciles against. */
@@ -1001,6 +1024,13 @@ export const applyGitHubOperations = async (
       if (local !== head) {
         return localFailure("the local checkout is not at the pushed commit", { head: local, pushed: head }) as Decision<void>;
       }
+      // The pushed head is what the setting and the protection after it are applied to, and what the
+      // result reports; one that is not the approved files stops here, before either is written
+      // (RF-REVIEW-01). The tree check's own evidence — its refusal and the differing paths — is kept.
+      const approved = await input.approvedTree(head);
+      if (!approved.allowed) {
+        return stop(approved.reasonCode, "PUSHED_HEAD_NOT_APPROVED", approved.message, id, approved.evidence, false);
+      }
       return allow(ReasonCode.OK, undefined);
     };
     if (prior !== undefined) {
@@ -1072,8 +1102,8 @@ export const applyGitHubOperations = async (
         outcome: "adopted",
       });
     }
-    const localHead = await tryRevParse(input.checkoutPath, "HEAD");
-    if (localHead === null) return localFailure("the local checkout has no commit to push", {});
+    // The checked commit, by its id — not a HEAD read now, after the awaited calls above (RF-REVIEW-01).
+    const localHead = input.validatedHead;
     const createdAt = clock.nowIso();
     begin({
       operationId: id,
@@ -1338,6 +1368,7 @@ export const applyGitHubOperations = async (
     if (!step.allowed) return step as Decision<AppliedGitHubOperations>;
     const { receipt, outcome } = step.value;
     if (receipt.resourceType === "repository") repositoryNodeId = receipt.observed.nodeId;
+    if (receipt.resourceType === "branch") publishedHead = receipt.observed.headSha;
     completed.push(receipt);
     if (outcome === "resumed") {
       resumed.push(receipt.operationId);
@@ -1366,5 +1397,5 @@ export const applyGitHubOperations = async (
       false,
     );
   }
-  return allow(ReasonCode.OK, { receipts: completed, written, adopted, resumed });
+  return allow(ReasonCode.OK, { receipts: completed, written, adopted, resumed, publishedHead });
 };

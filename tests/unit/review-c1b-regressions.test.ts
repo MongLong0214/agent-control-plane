@@ -137,6 +137,72 @@ describe("ACP-C1B-01: a failed work turn does not suppress its retry", () => {
   );
 });
 
+/**
+ * Review round 2 (PR #1073), ROUND1-ESCAPE-01 — the reviewer's own witnesses are
+ * `review-r2-witnesses.test.ts`, unchanged. These pin the rest of the rule: an envelope is done
+ * when the outbox says it is, whatever any turn's exit said, and unacknowledged work waits for the
+ * outbox's own window rather than looping.
+ */
+describe("ROUND1-ESCAPE-01: an envelope is settled by the outbox, not by a turn's exit", () => {
+  const dispatchOf = (f: BootstrapRuntimeFixture, runId: string) =>
+    f.harness.cp.outbox.listByRun(runId).find((message) => message.kind === MessageKind.RUN_DISPATCH)!;
+
+  it("a completed turn that left its RUN_DISPATCH PENDING runs nothing more until the outbox's window passes", async () => {
+    await withBootstrapRuntime(async (f) => {
+      // No acknowledgement handler: the work turn exits 0 having made no tool call.
+      const { runId, ownerSessionId } = await f.dispatchBootstrap();
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      expect(dispatchOf(f, runId).status).toBe("PENDING");
+      await f.harness.cp.outbox.wakeInBandPending();
+      f.harness.clock.advance(IN_BAND_REWAKE_MS - 1);
+      await f.harness.cp.outbox.wakeInBandPending();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(countKind(f, "OUTBOX_IN_BAND_WAKE_FAILED")).toBe(0);
+      // The window passes: exactly one more turn, which settles it.
+      const handled = acknowledgeInBandOnWorkTurns(f);
+      f.harness.clock.advance(1);
+      await f.harness.cp.outbox.wakeInBandPending();
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
+      await vi.waitFor(() => expect(dispatchOf(f, runId).status).toBe("ACKED"));
+      expect(handled).toEqual([{ kind: MessageKind.RUN_DISPATCH, generation: 1, acked: true }]);
+      expect(f.finishedTurns(ownerSessionId)).toBe(3);
+    });
+  });
+
+  it("a wake naming an envelope already acknowledged is refused and runs no turn", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, ownerSessionId, roleKey } = await dispatchedAndAcked(f);
+      const dispatch = dispatchOf(f, runId);
+      expect(dispatch.status).toBe("ACKED");
+      expect(f.harness.cp.sessionRuntime.wake(roleKey, [{ id: dispatch.messageId, kind: "in-band dispatch" }])).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.SESSION_TURN_DUPLICATE,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+    });
+  });
+
+  it("a wake naming an envelope that expired unacknowledged is refused and runs no turn", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      const pending = dispatchOf(f, runId);
+      expect(pending.status).toBe("PENDING");
+      f.harness.clock.advance(Date.parse(pending.expiresAt) - Date.parse(f.harness.clock.nowIso()));
+      expect(f.harness.cp.outbox.expireOverdue()).toBeGreaterThanOrEqual(1);
+      expect(dispatchOf(f, runId).status).toBe("EXPIRED");
+      expect(f.harness.cp.sessionRuntime.wake(roleKey, [{ id: pending.messageId, kind: "in-band dispatch" }])).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.SESSION_TURN_DUPLICATE,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+    });
+  });
+});
+
 describe("ACP-C1B-02: recovery restores the bootstrap CTO's authority and keeps a CEO decision hold", () => {
   it.each(["credential lost at a restart", "provider outage"] as const)(
     "after %s, a run BLOCKED on CEO_DECISION_REQUIRED stays BLOCKED for the CEO, with its owner renewed",

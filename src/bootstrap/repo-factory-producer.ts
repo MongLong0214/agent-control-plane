@@ -226,13 +226,23 @@ const blobId = (content: string, objectFormat: "sha1" | "sha256"): string => {
  * back with `git ls-tree` and must be the approved files exactly — every path, mode and blob, no
  * file missing and none extra. Whatever stood between the write and that head (a hook, a filter, a
  * resumed push that reset onto the commit GitHub holds) is caught here rather than activated.
+ *
+ * Review round 2 (RF-REVIEW-04) — the tree is read with `--no-replace-objects`. A replacement
+ * (`refs/replace/<id>`, under whatever `GIT_REPLACE_REF_BASE` names) changes what a local read of
+ * `<id>` returns and nothing else: `git push` packs the objects themselves, so a hook that committed
+ * unreviewed bytes and then replaced that commit with an approved one passed this check while the
+ * unreviewed bytes were published. Reading unreplaced is reading what the transport sends, whichever
+ * namespace or mechanism the replacement came from; refusing replacement refs instead would have to
+ * enumerate a configurable namespace, and would still read through a replacement made after it looked.
  */
 export const producedTreeDrift = async (
   checkoutPath: string,
   head: string,
   approved: readonly PlannedBootstrapFile[],
 ): Promise<Decision<void>> => {
-  const listed = await git(checkoutPath, ["ls-tree", "-r", "-z", "--full-tree", head], { allowFailure: true });
+  const listed = await git(checkoutPath, ["--no-replace-objects", "ls-tree", "-r", "-z", "--full-tree", head], {
+    allowFailure: true,
+  });
   if (listed.exitCode !== 0) {
     return deny(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
@@ -689,8 +699,9 @@ export const trackedFilesOrDeny = (tracked: GitResult): Decision<string[]> => {
 /**
  * Builds one `repo-factory.result.v2` from a real local filesystem/git run — no GitHub
  * write, no hand-authored result. Every fact this returns is something the run actually
- * observed: `bootstrapVerification[].exactHead` is a real `git rev-parse HEAD` read back
- * after the write, and the `externalWriteReceipt` describes the local git repository this
+ * observed: `bootstrapVerification[].exactHead` is the commit this run checked and published (on a
+ * resume, the head GitHub holds as the push step receipted it), and a real `git rev-parse HEAD`
+ * read back after the verification must equal it, and the `externalWriteReceipt` describes the local git repository this
  * call created, not a GitHub resource it never touched.
  *
  * Things this deliberately refuses to fabricate rather than fill because the schema demands
@@ -871,6 +882,39 @@ export const produceRepoFactoryResult = async (
     );
   }
 
+  // #246 C2, review round 1 (RF-REVIEW-01) — the commit just made is compared with the approved
+  // files before anything reaches GitHub. Checked only after the GitHub operations, a tree a hook
+  // had changed was refused once the repository existed with those bytes pushed, its default branch
+  // set and its branch protected; a refusal undoes none of that. A head GitHub already holds is
+  // checked the same way once it is checked out (`approvedTree` below), and the head this run
+  // finally reports once more after.
+  //
+  // Review round 3 (RF-REVIEW-01) — what is checked is a commit id, and that id is what is published:
+  // the push sends `validatedHead` and the result reports the head the push step receipted. HEAD is
+  // read once, here, before any await on GitHub; read again later it could name a commit that moved
+  // in while GitHub was awaited, which nothing had checked.
+  const approvedTree = (at: string): Promise<Decision<void>> => producedTreeDrift(localRepoPath, at, approvedFiles);
+  const checkedCommit = async (): Promise<Decision<string>> => {
+    const committed = await tryRevParse(localRepoPath, "HEAD");
+    if (!committed) {
+      return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "local repository has no exact HEAD after commit", { localRepoPath });
+    }
+    const committedDrift = await approvedTree(committed);
+    return committedDrift.allowed ? allow(ReasonCode.OK, committed) : (committedDrift as Decision<string>);
+  };
+  let validated: Decision<string>;
+  try {
+    validated = await checkedCommit();
+  } catch (thrown) {
+    cleanup();
+    throw thrown;
+  }
+  if (!validated.allowed) {
+    cleanup();
+    return validated as Decision<RepoFactoryResult>;
+  }
+  const validatedHead = validated.value;
+
   // GitHub's half, between the commit and the verification: the verified head below must be
   // the head GitHub holds. On a resumed push the commit just made is not that head — its
   // timestamp differs from the one GitHub holds — so the push step fetches the receipted
@@ -898,6 +942,8 @@ export const produceRepoFactoryResult = async (
           }),
         ledgerPath,
         clock,
+        approvedTree,
+        validatedHead,
       });
     } catch (thrown) {
       cleanup();
@@ -910,21 +956,17 @@ export const produceRepoFactoryResult = async (
     applied = outcome.value;
   }
 
-  const head = await tryRevParse(localRepoPath, "HEAD");
-  if (!head) {
-    cleanup();
-    return deny(
-      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-      "local repository has no exact HEAD after commit",
-      { localRepoPath },
-    );
-  }
+  // The head this run reports is the one it published — the checked commit, or on a resume the head
+  // GitHub holds as the push step receipted it after checking it — never HEAD read back after the
+  // awaits above (RF-REVIEW-01, round 3). The re-read after verification below refuses a checkout
+  // that is not at it.
+  const head = applied === null ? validatedHead : applied.publishedHead;
 
   // #246 C2 — the head this run reports, GitHub's own on a resumed push, must hold exactly the
   // approved files. A drifted tree is refused before it is verified, receipted or activated.
   let drift: Decision<void>;
   try {
-    drift = await producedTreeDrift(localRepoPath, head, approvedFiles);
+    drift = await approvedTree(head);
   } catch (thrown) {
     cleanup();
     throw thrown;
@@ -956,7 +998,7 @@ export const produceRepoFactoryResult = async (
     );
   }
 
-  const trackedRun = await gitOrCleanup(["ls-tree", "-r", "--name-only", "HEAD"], { allowFailure: true });
+  const trackedRun = await gitOrCleanup(["ls-tree", "-r", "--name-only", head], { allowFailure: true });
   const tracked = trackedFilesOrDeny(trackedRun);
   if (!tracked.allowed) {
     cleanup();

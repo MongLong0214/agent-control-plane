@@ -75,8 +75,7 @@ const reviewFixture = async () => {
   const harness = makeHarness();
   const launch = await startSessionLaunchChannel(tempDir("acp-c2-launch-"), { mcpToken: TOKEN });
   harness.cp.cto.attach({ sessionLaunch: launch });
-  // Claude Opus staffs the bootstrap CTO and the workers; the reviewer is the harness's own. The
-  // bootstrap CTO runs as a headless runtime (#246 C1b), which takes its own credential.
+  // Claude Opus staffs the bootstrap CTO and the workers; the reviewer is the harness's own.
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
   harness.cp.providers.registerForRole(claude, Role.WORKER);
@@ -107,11 +106,12 @@ const reviewFixture = async () => {
       ...args,
     });
   // C1b: a bootstrap CTO's credential is the one its runtime took from the launch channel during its
-  // attestation turn; a row acts as that runtime by presenting it, as the runtime's relay would. Any
-  // other CTO (a project run's PRIMARY_CTO) still claims its own from the launch channel.
+  // attestation turn; a row acts as that runtime by presenting it, as the runtime's relay would. A
+  // session no runtime drives (a project run's CTO) still has its credential claimed from the channel.
   const claimed = new Map<string, { sessionId: string; sessionSecret: string }>();
   const cto = async (sessionId: string, name: string, args: Record<string, unknown>) => {
-    let credential: { sessionId: string; sessionSecret: string } | undefined = claude.credentials.get(sessionId) ?? claimed.get(sessionId);
+    let credential: { sessionId: string; sessionSecret: string } | undefined =
+      claude.credentials.get(sessionId) ?? claimed.get(sessionId);
     if (!credential) {
       const session = harness.cp.sessions.require(sessionId);
       credential = await claimLaunchedCredential(launch.socketPath, session.incarnation.split("#", 1)[0]!);

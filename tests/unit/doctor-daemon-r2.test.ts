@@ -1,6 +1,7 @@
-import { readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { readFileSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
@@ -17,7 +18,7 @@ import { ExecutionMode, Role, RunState, SessionLifecycle } from "../../src/domai
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { buzzActorBindingSigningRequest, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import { boundedExecFileSync } from "../helpers/bounded-sync-child.ts";
+import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
@@ -419,16 +420,34 @@ describe("round 2 daemon regressions", () => {
     await daemon.stop();
   });
 
-  it("#118: a stale malformed lock is reclaimed after the bounded writer grace", () => {
+  it("#118: a malformed lock waits out the bounded writer grace, and after it is refused, not reclaimed (ACP-WORKER-03-LOCK)", () => {
     const stateDir = tempDir("acp-lock-r2-");
     const path = join(stateDir, "agentcpd.lock");
     writeFileSync(path, "{");
+    const lock = new SingleInstanceLock(path);
+
+    // Within the grace: its writer may still be completing it.
+    const waiting = lock.acquire("2026-08-12T00:00:00.000Z");
+    expect(waiting.allowed).toBe(false);
+    expect(waiting.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
+    expect((waiting.evidence as { retryAfterMs?: number }).retryAfterMs).toBeGreaterThan(0);
+
+    // #1070 ACP-WORKER-03-LOCK (narrow review 6) changes only what follows the grace: an earlier
+    // build reclaims an unreadable record by unlinking the path blind, so this build no longer
+    // replaces one. It refuses and leaves the file exactly as it was, until it is removed by hand.
     const old = new Date(Date.now() - 10_000);
     utimesSync(path, old, old);
+    const refused = lock.acquire("2026-08-12T00:00:00.000Z");
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.DAEMON_ALREADY_RUNNING);
+    expect(lock.held()).toBe(false);
+    expect(readFileSync(path, "utf8")).toBe("{");
 
-    const lock = new SingleInstanceLock(path);
+    // A dead holder still does not wedge the daemon: one of this build's own records is reclaimed.
+    unlinkSync(path);
+    const dead = deadHolderOfThisBuild(path);
+    expect(lock.read()?.pid).toBe(dead);
     const acquired = lock.acquire("2026-08-12T00:00:00.000Z");
-
     expect(acquired.allowed).toBe(true);
     expect(lock.read()?.pid).toBe(process.pid);
     lock.release();
@@ -1060,3 +1079,22 @@ describe("round 2 daemon regressions", () => {
     expect(backoff.reasonCode).toBe(ReasonCode.DAEMON_BACKOFF_ACTIVE);
   });
 });
+
+/**
+ * A record of this build's own format whose holder is gone: a separate process takes the lock and
+ * exits without releasing it, leaving its record as a killed daemon would (ACP-WORKER-03-LOCK).
+ */
+function deadHolderOfThisBuild(lockPath: string): number {
+  const lockModule = fileURLToPath(new URL("../../src/daemon/single-instance.ts", import.meta.url));
+  const child = boundedSpawnSync(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", `
+    import { SingleInstanceLock } from ${JSON.stringify(lockModule)};
+    const taken = new SingleInstanceLock(process.argv[1]).acquire(new Date().toISOString());
+    if (!taken.allowed) process.exit(3);
+    process.stdout.write(String(process.pid));
+    process.exit(0);
+  `, lockPath], { encoding: "utf8" });
+  expect(child.status, child.stderr).toBe(0);
+  const pid = Number(child.stdout);
+  expect(() => process.kill(pid, 0), "the holder is still running").toThrow();
+  return pid;
+}

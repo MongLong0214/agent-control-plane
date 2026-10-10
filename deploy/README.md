@@ -217,6 +217,42 @@ ordered schema step runs.
 deploy/install-launchd.sh upgrade --app-root /absolute/release --node /absolute/node
 ```
 
+**Moving to or from the SQLite daemon lock** (#1070; builds up to main `56c1d019`, and every
+generation deployed so far, hold the pathname lock). The order is always: the old holder stops,
+`agentcpd.lock` disappears, then the new holder acquires. `upgrade` and `rollback` already do exactly
+that — bootout, `wait_for_stop` until `agentcpd.lock` is gone, then promote and start — so do not
+start either build's `agentcpd` by hand beside the other, and do not run an earlier build's
+`agentcpd-state` against this state directory. The two schemes meet only at `agentcpd.lock`: an
+earlier build holds it as a regular file, reclaims one naming a dead process (or an unreadable one
+five seconds after its modification time) by unlinking the path without checking what it removes,
+and does not know the SQLite lock on `agentcpd.lock.db`. They are kept apart there:
+
+- The new build holds `agentcpd.lock` as a **directory**, with its record in
+  `agentcpd.lock/holder.json`. An earlier build's `unlink` cannot remove a directory and its `link`
+  cannot replace one, so its `agentcpd` refuses (`DAEMON_LOCK_LOST` or `DAEMON_ALREADY_RUNNING`), and
+  its `agentcpd-state` refuses the path as not a regular file, whether the new holder runs or was
+  killed. Timestamps play no part: `touch`, a copy that does not keep times, or a clock far ahead
+  change nothing.
+- The new build takes an empty path with `mkdir`, which fails if an earlier build linked its record
+  first, as that link fails once the directory exists. It never removes or replaces an earlier
+  build's record, running or dead: a dead one (an earlier daemon killed without a clean stop) makes it
+  refuse with `DAEMON_ALREADY_RUNNING` until the record is gone. Stop every earlier-build `agentcpd`
+  and `agentcpd-state`, then remove `agentcpd.lock`. `upgrade` stops at `wait_for_stop` in that
+  state anyway.
+- Once the database is at schema 41, an earlier `agentcpd` refuses at database open, before it
+  reaches its lock ("database schema is newer than this build").
+
+A clean stop of the new build removes its record and then the directory, leaving `agentcpd.lock`
+absent, which is what `wait_for_stop` (`[[ ! -e … ]]`) and a restored earlier generation need, so a
+rollback has no marker to remove. On that empty path an earlier build can still take its own lock
+where it reaches the lock before any schema check — `agentcpd-state suspend-project`, which then
+refuses on the schema version, or an earlier daemon whose database open came before the migration to
+41 — and the new build then refuses while that record stands, so the two never hold together. If the
+new build was killed, its directory stays, keeping earlier builds out, and `rollback` stops at
+`wait_for_stop` as for any record left behind; the next start of the new build reclaims it. To roll
+back instead, remove `agentcpd.lock` (`rm -r`) only after confirming that no `agentcpd` of either
+build is running (`agentcpd.lock/holder.json` names the pid), then run the rollback again.
+
 Database snapshots are available through the dedicated maintenance executable. A backup is
 online; restore requires the job to be stopped and an explicit confirmation. Restore validates
 the backup's private mode, manifest checksum, SQLite integrity, and load-bearing triggers before

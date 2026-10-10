@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { currentBootstrapPlan, isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
+import { currentBootstrapPlan, isProjectlessBootstrap, sameBootstrapPlanBinding } from "../bootstrap/bootstrap-plan.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
@@ -275,13 +275,29 @@ export class CandidatePipeline {
           contract: contract.value,
           contractDigest: run.contractDigest,
         });
-        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed);
+        // Review rounds 1 and 2 (RF-REVIEW-02) — the review is asynchronous, and `plan_submit` can
+        // replace the PLAN while it runs or while anything after it is awaited. A candidate whose PLAN
+        // was replaced is stale whatever the verdict: a PASS is not P2's review, and a REVISE or BLOCK
+        // is not the CTO's next instruction for P2. So the PLAN is checked after the last await before
+        // each thing this path does — the revision request or unavailable-review record
+        // (`unpassedReview`), and the packet (below) — never only once after the review.
+        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, () =>
+          this.bootstrapPlanStillCurrent(input.runId, snapshot),
+        );
         if (unpassed !== null) return unpassed;
         if (this.#continuity?.evaluate) await this.#continuity.evaluate("pre-completion");
       }
       const sourceReadLease = this.guard.acquireSourceReadLease(input.runId, []);
       if (!sourceReadLease.allowed) return sourceReadLease as Decision<PipelineOutcome>;
       try {
+        // And again at publication, as a repository candidate's source is: continuity was awaited
+        // since, and nothing below awaits before the packet is built.
+        if (snapshot.bootstrapPlan !== undefined) {
+          const planAtPublication = this.bootstrapPlanStillCurrent(input.runId, snapshot);
+          if (!planAtPublication.allowed) {
+            return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
+          }
+        }
         const built = this.ceo.buildPacket({
           runId: input.runId,
           candidateSnapshotDigest: snapshotDigest,
@@ -455,11 +471,23 @@ export class CandidatePipeline {
     runId: string,
     snapshotDigest: string,
     reviewed: Decision<ReviewPacket>,
+    /**
+     * Whether the candidate is still the one to act on, asked after the last await and before
+     * anything is delivered or recorded. A repository candidate's verdict is delivered as before.
+     */
+    stillCurrent: () => Decision<void> = () => allow(ReasonCode.OK, undefined),
   ): Promise<Decision<PipelineOutcome> | null> {
     if (reviewed.allowed) return null;
     // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
     // whether a provider/isolation failure waits or moves the system into SURVIVAL.
     if (this.#continuity?.evaluate) await this.#continuity.evaluate("blind-review-unavailable");
+    // #246 C2, review round 2 (RF-REVIEW-02) — the review and the evaluation above were awaited, and
+    // a bootstrap PLAN replaced during either makes this outcome stale: no revision request and no
+    // unavailable-review record is produced for it. Nothing below awaits before either is written.
+    const current = stillCurrent();
+    if (!current.allowed) {
+      return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: current.reasonCode, snapshotDigest });
+    }
     // §18.7 — only a reviewer *verdict* enters the CTO revision loop. A lost isolation
     // or a provider that never answered is an assurance failure the candidate cannot
     // repair, so the gate is neither lowered nor handed to the CTO to "fix".
@@ -722,6 +750,24 @@ export class CandidatePipeline {
       if (pinned) return commandsForMode(pinned, mode);
     }
     return [...(runScoped ?? [])];
+  }
+
+  /**
+   * #246 C2, review round 1 (RF-REVIEW-02) — a project-less bootstrap candidate's freshness: the PLAN
+   * binding it froze is still the one the run's current PLAN artifact implies. A current PLAN with no
+   * plannable outputs has no binding, and is not the candidate's either.
+   */
+  private bootstrapPlanStillCurrent(runId: string, snapshot: CandidateSnapshot): Decision<void> {
+    const current = currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+    const currentBinding = current.allowed ? current.value.binding : null;
+    if (!sameBootstrapPlanBinding(currentBinding, snapshot.bootstrapPlan)) {
+      return deny(ReasonCode.EVIDENCE_STALE, "the PLAN this candidate names was replaced while it was being judged", {
+        runId,
+        candidate: snapshot.bootstrapPlan ?? null,
+        current: currentBinding,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /** Re-reads every frozen repository and reports drift (§16.2). */

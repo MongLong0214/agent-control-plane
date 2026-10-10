@@ -675,6 +675,7 @@ export class ControlPlane {
         bindings: this.bindings,
         attestations: this.sessionAttestations,
         audit: this.audit,
+        outbox: this.outbox,
       });
       this.cto.attach({ sessionRuntime: this.sessionRuntime });
 

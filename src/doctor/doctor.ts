@@ -11,6 +11,7 @@ import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import { RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
+import { latestReceiptLookupError } from "../conversation/turn-coordinator.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { strandedBootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
@@ -40,6 +41,9 @@ const exec = promisify(execFile);
  * getting old, which is why `IngressGuard.prune` exempts these rows too.
  */
 const UNRESOLVED_TURN_ESCALATION_MINUTES = 15;
+
+/** How many in-doubt turns `CANONICAL_TURN_IN_DOUBT` names with their latest receipt lookup error. */
+const MAX_REPORTED_LOOKUP_ERRORS = 10;
 
 export type Severity = "INFO" | "WARN" | "ERROR" | "CRITICAL";
 
@@ -1573,6 +1577,15 @@ export class Doctor {
         0,
         Math.round((Date.parse(this.clock.nowIso()) - Date.parse(oldest.claimed_at)) / 60_000),
       );
+      // Why the receipt sweep could not read an answer for a turn, when it recorded why (#1036). A
+      // lookup error says the answer was unreadable, not that the turn did or did not run.
+      const lookupErrors = inDoubt.flatMap((turn) => {
+        const latest = latestReceiptLookupError(this.db, turn.turn_request_id);
+        return latest ? [{ turnRequestId: turn.turn_request_id, ...latest }] : [];
+      });
+      const oldestLookupError = lookupErrors[0]?.turnRequestId === oldest.turn_request_id
+        ? { kind: lookupErrors[0].kind, detail: lookupErrors[0].detail, at: lookupErrors[0].at }
+        : null;
       findings.push({
         code: "CANONICAL_TURN_IN_DOUBT",
         // Age is the only thing separating a turn in flight from a wedged conversation, and
@@ -1588,13 +1601,20 @@ export class Doctor {
             turnRequestId: oldest.turn_request_id,
             actor: oldest.target_actor_id,
             claimedAt: oldest.claimed_at,
+            ...(oldestLookupError ? { lookupError: oldestLookupError } : {}),
           },
+          ...(lookupErrors.length > 0
+            ? { lookupErrors: lookupErrors.slice(0, MAX_REPORTED_LOOKUP_ERRORS) }
+            : {}),
         },
         // Names the command, because for a while it did not and there was none to name. A turn
         // held across a restart has no permit and no disagreement, so neither settlement port nor
         // `conversation adjudicate` can take it — the remedy read as actionable and was not (#668).
         recommendedAction:
-          "establish what happened to the turn and record it as an observation. If nothing can — the permit died with the process that issued it — `agentctl conversation resolve <actor> <turn> <reason-code> <evidence-digest>` settles it ABORTED, which permits a retry. The conversation refuses later turns until one arrives",
+          "establish what happened to the turn and record it as an observation. If nothing can — the permit died with the process that issued it — `agentctl conversation resolve <actor> <turn> <reason-code> <evidence-digest>` settles it ABORTED, which permits a retry. The conversation refuses later turns until one arrives" +
+          (lookupErrors.length > 0
+            ? ". A lookup error means the target's receipt could not be read (its kind and detail name why), not that the turn did not run"
+            : ""),
       });
     }
 

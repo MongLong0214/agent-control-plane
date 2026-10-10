@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { produceRepoFactoryResult, VERIFICATION_KINDS } from "../../src/bootstrap/repo-factory-producer.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
@@ -13,12 +13,45 @@ import { REPAIR_OWNER_APPROVAL_OPERATION } from "../../src/doctor/repair.ts";
 import { ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
 import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
-import { runSandboxed } from "../../src/verify/sandbox.ts";
+import { __testing as sandboxTesting, runSandboxed, sandboxLaunchArgv, type SandboxOutcome } from "../../src/verify/sandbox.ts";
+import type * as SandboxModule from "../../src/verify/sandbox.ts";
+import { buildCandidateSnapshot, verifySnapshotFreshness } from "../../src/snapshot/candidate-snapshot.ts";
+import { ManualClock } from "../../src/core/clock.ts";
 import { WorktreeManager, type WorktreeAuthorization } from "../../src/verify/worktree.ts";
 import { dispatchBootstrapRun, makeHarness, TEST_OWNER, type Harness } from "../helpers/harness.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
+import { stableFixtureLink } from "../helpers/stable-fixture-executable.ts";
 
 afterEach(cleanupTempDirs);
+
+/**
+ * Every sandbox run in this file is observed, so a failure can say what the sandboxed command
+ * printed. The engine keeps only an output digest, and CI once reported four of these cases as a
+ * bare exit code (#1072, run 37878091993) with nothing to diagnose them by.
+ */
+vi.mock("../../src/verify/sandbox.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof SandboxModule>();
+  return { ...actual, runSandboxed: vi.fn(actual.runSandboxed) };
+});
+
+beforeEach(() => {
+  vi.mocked(runSandboxed).mockClear();
+});
+
+/** What every sandbox run in this case that did not PASS printed to stderr. */
+const sandboxFailures = async (): Promise<string> => {
+  const outcomes = await Promise.all(
+    vi.mocked(runSandboxed).mock.results.map((result) => result.value as Promise<SandboxOutcome>),
+  );
+  return outcomes
+    .filter((outcome) => outcome.status !== "PASS")
+    .map((outcome) => `sandbox ${outcome.status} exit=${outcome.exitCode} stderr: ${outcome.stderr.trim().slice(-2_000)}`)
+    .join("\n");
+};
+
+/** A sandbox outcome described with its stderr, for an assertion message. */
+const described = (outcome: SandboxOutcome): string =>
+  `sandbox ${outcome.status} exit=${outcome.exitCode} reason=${outcome.reasonCode ?? "none"} stderr: ${outcome.stderr.trim().slice(-2_000)}`;
 
 /**
  * #246 C2v. A project Repo Factory bootstraps declares exactly one verification, CLEAN_TREE
@@ -157,17 +190,19 @@ describe("a self-contained verification checkout (#246 C2v)", () => {
     ];
 
     const gitDir = await sandboxed(own.path, "git-dir", ["git", "rev-parse", "--git-dir"]);
-    expect(gitDir).toMatchObject({ status: "PASS", exitCode: 0 });
+    expect(gitDir.status, described(gitDir)).toBe("PASS");
+    expect(gitDir.exitCode, described(gitDir)).toBe(0);
     expect(gitDir.stdout.trim()).toBe(".git");
     const status = await sandboxed(own.path, "clean-tree", ["git", "status", "--porcelain"]);
-    expect(status).toMatchObject({ status: "PASS", exitCode: 0, stdout: "" });
+    expect(status.status, described(status)).toBe("PASS");
+    expect(status).toMatchObject({ exitCode: 0, stdout: "" });
     const original = await sandboxed(own.path, "read-original", readOriginal);
-    expect(original.exitCode).toBe(3);
+    expect(original.exitCode, described(original)).toBe(3);
     expect(original.stdout.trim()).toBe("denied EPERM");
 
     // The defect, kept visible: the same command in a linked worktree cannot find its metadata.
     const linkedStatus = await sandboxed(linked.path, "clean-tree", ["git", "status", "--porcelain"]);
-    expect(linkedStatus.exitCode).toBe(128);
+    expect(linkedStatus.exitCode, described(linkedStatus)).toBe(128);
     expect(linkedStatus.stderr).toContain("not a git repository");
 
     await manager.destroy(repository, own.path, authorizationFor(manager, repository, "own"));
@@ -750,7 +785,7 @@ describe("the verification engine gives CLEAN_TREE, and only it, a self-containe
   sandboxIt("passes CLEAN_TREE through the real engine and sandbox, and leaves nothing behind", async () => {
     const candidate = await temporaryCandidate();
     const verified = await verifyCleanTree(candidate);
-    if (!verified.allowed) throw new Error(`${verified.reasonCode}: ${verified.message}`);
+    if (!verified.allowed) throw new Error(`${verified.reasonCode}: ${verified.message}\n${await sandboxFailures()}`);
     expect(verified.value).toMatchObject({ status: "PASS", results: [{ commandId: "clean-tree", status: "PASS" }] });
     const tree = latestVerificationTree(candidate.harness, candidate.run.runId);
     expect(tree.state).toBe("DESTROYED");
@@ -790,7 +825,7 @@ describe("the verification engine gives CLEAN_TREE, and only it, a self-containe
       timeoutSeconds: 30,
     });
     const verified = await verifyCleanTree(candidate, command);
-    if (!verified.allowed) throw new Error(`${verified.reasonCode}: ${verified.message}`);
+    if (!verified.allowed) throw new Error(`${verified.reasonCode}: ${verified.message}\n${await sandboxFailures()}`);
     expect(verified.value).toMatchObject({ status: "PASS", results: [{ commandId: "clean-tree", status: "PASS" }] });
     expect(latestVerificationTree(candidate.harness, candidate.run.runId).state).toBe("DESTROYED");
   });
@@ -811,7 +846,7 @@ describe("the verification engine gives CLEAN_TREE, and only it, a self-containe
     const create = vi.spyOn(candidate.harness.cp.worktrees, "create");
     await verifyCleanTree(candidate, parseVerificationCommand({ id: "node-suite", argv: ["node", "-e", "process.exit(0)"], timeoutSeconds: 30 }));
     expect(create).toHaveBeenCalledOnce();
-    expect(create.mock.calls[0]?.[4]).toEqual({ selfContained: false });
+    expect(create.mock.calls[0]?.[4]).toMatchObject({ selfContained: false });
   });
 
   it("an interrupted teardown stays DESTROYING, and the orphan sweep removes the checkout once its owner is gone", async () => {
@@ -836,5 +871,242 @@ describe("the verification engine gives CLEAN_TREE, and only it, a self-containe
     expect(swept.value.changes).toBe(1);
     expect(existsSync(tree.worktree_path)).toBe(false);
     expect(existsSync(registration)).toBe(false);
+  });
+});
+
+/**
+ * #1072 CI (run 37878091993): on GitHub's macos-15 runner every sandboxed `git` exited 71 before
+ * git ran. `/usr/bin/git` is an xcrun stub; where the active developer directory is an Xcode.app
+ * rather than the Command Line Tools, its lookup spawns `xcodebuild`, which the candidate's
+ * RLIMIT_NPROC 1 refuses. The sandbox now locates git outside and execs it directly.
+ */
+describe("the sandbox runs the located git, never the xcrun stub or a candidate's git (#1072 CI)", () => {
+  /** The git this host's developer directory holds, located the way the sandbox locates it. */
+  const hostGit = (): string =>
+    execFileSync("/usr/bin/xcrun", ["--find", "git"], { encoding: "utf8", timeout: 30_000 }).trim();
+
+  /**
+   * A developer directory where another host keeps git -- the Xcode.app layout GitHub's runner
+   * selects -- holding a git that announces itself on stderr and then runs this host's git.
+   */
+  const anotherHostsGit = (): string => {
+    const git = join(tempDir("acp-other-host-"), "Xcode_16.4.app", "Contents", "Developer", "usr", "bin", "git");
+    mkdirSync(dirname(git), { recursive: true });
+    // A hard link to one cached script, so each run does not exec a fresh inode (syspolicyd).
+    return stableFixtureLink(git, `#!/bin/sh\necho located-developer-git >&2\nexec ${JSON.stringify(hostGit())} "$@"\n`);
+  };
+
+  const sandboxedGit = (worktreePath: string, argv: string[]) =>
+    runSandboxed({
+      command: parseVerificationCommand({ id: "clean-tree", argv, timeoutSeconds: 30 }),
+      worktreePath,
+      denyReadPaths: [],
+    });
+
+  sandboxIt("runs git from wherever the developer directory keeps it, without the stub", async () => {
+    const repository = makeRepo();
+    const manager = new WorktreeManager(tempDir("acp-own-checkout-"));
+    const checkout = await manager.create(repository, "HEAD", "other-host", authorizationFor(manager, repository, "other-host"), {
+      selfContained: true,
+    });
+    const located = anotherHostsGit();
+    const finder = vi.fn(async () => located);
+    await sandboxTesting.withDeveloperToolFinder(finder, async () => {
+      const gitDir = await sandboxedGit(checkout.path, ["git", "rev-parse", "--git-dir"]);
+      expect(gitDir.status, described(gitDir)).toBe("PASS");
+      expect(gitDir.stdout.trim()).toBe(".git");
+      // The located binary is what ran, not `/usr/bin/git`.
+      expect(gitDir.stderr).toContain("located-developer-git");
+      const status = await sandboxedGit(checkout.path, ["git", "status", "--porcelain"]);
+      expect(status.status, described(status)).toBe("PASS");
+      expect(status.stdout).toBe("");
+    });
+    expect(finder).toHaveBeenCalledWith("git");
+    await manager.destroy(repository, checkout.path, authorizationFor(manager, repository, "other-host"));
+  });
+
+  sandboxIt("never runs a candidate's own executable named git", async () => {
+    const repository = makeRepo();
+    executable(join(repository, "git"), "#!/bin/sh\necho candidate-git\nexit 0\n");
+    commitAll(repository, "a candidate that ships its own git");
+    const outcome = await sandboxedGit(repository, ["git", "status", "--porcelain"]);
+    expect(outcome.status, described(outcome)).toBe("PASS");
+    // Real git: the committed file is tracked and the tree is clean, so it prints nothing.
+    expect(outcome.stdout).not.toContain("candidate-git");
+    expect(outcome.stdout).toBe("");
+  });
+
+  sandboxIt("refuses, and says why, when git cannot be located outside the sandbox", async () => {
+    const repository = makeRepo();
+    const unavailable = Object.assign(new Error("xcrun exited 72"), {
+      stderr: "xcrun: error: unable to find utility \"git\", not a developer tool or in PATH",
+    });
+    const outcome = await sandboxTesting.withDeveloperToolFinder(
+      async () => { throw unavailable; },
+      () => sandboxedGit(repository, ["git", "status", "--porcelain"]),
+    );
+    expect(outcome).toMatchObject({ status: "ERROR", reasonCode: ReasonCode.INVALID_ARGUMENT });
+    expect(outcome.stderr).toContain("could not locate developer tool 'git'");
+    expect(outcome.stderr).toContain("unable to find utility");
+  });
+
+  sandboxIt("refuses a located tool that is not git", async () => {
+    const repository = makeRepo();
+    const outcome = await sandboxTesting.withDeveloperToolFinder(
+      async () => "/bin/sh",
+      () => sandboxedGit(repository, ["git", "status", "--porcelain"]),
+    );
+    expect(outcome).toMatchObject({ status: "ERROR", reasonCode: ReasonCode.INVALID_ARGUMENT });
+    expect(outcome.stderr).toContain("is not an executable 'git'");
+  });
+
+  it("leaves every other executable as the command declared it", async () => {
+    const finder = vi.fn(async () => "/bin/sh");
+    const context = { cwd: makeRepo(), additionalRoots: [] };
+    const launched = await sandboxTesting.withDeveloperToolFinder(finder, () =>
+      sandboxLaunchArgv(["node", "-e", "process.exit(0)"], context),
+    );
+    expect(launched).toMatchObject({ allowed: true, value: ["node", "-e", "process.exit(0)"] });
+    expect(finder).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * #1072 review RF-REVIEW-03. With `git replace A B` and a clean checkout at HEAD A, the snapshot
+ * freezes B's tree -- `A^{tree}` honours the replacement in the source -- and freshness agrees,
+ * while a copy fetched by SHA holds A's own tree under the same HEAD, and both report clean.
+ */
+describe("a self-contained checkout holds the tree the snapshot froze (#1072 RF-REVIEW-03)", () => {
+  /** A clean checkout at HEAD A whose commit is replaced by B's, so `A^{tree}` resolves to B's tree. */
+  const replaced = (repository: string) => {
+    const candidate = gitSync(repository, ["rev-parse", "HEAD"]);
+    const branch = gitSync(repository, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    const ownTree = gitSync(repository, ["rev-parse", `${candidate}^{tree}`]);
+    gitSync(repository, ["checkout", "-q", "-b", "replacement"]);
+    writeFiles(repository, { "README.md": "# the replacement's content\n" });
+    const replacement = commitAll(repository, "replacement");
+    gitSync(repository, ["checkout", "-q", branch]);
+    gitSync(repository, ["replace", candidate, replacement]);
+    gitSync(repository, ["reset", "-q", "--hard", "HEAD"]);
+    return { candidate, ownTree, replacedTree: gitSync(repository, ["rev-parse", `${candidate}^{tree}`]) };
+  };
+
+  const unreplaced = (repository: string, candidate: string): void => {
+    gitSync(repository, ["replace", "-d", candidate]);
+    gitSync(repository, ["reset", "-q", "--hard", "HEAD"]);
+  };
+
+  const freeze = async (repository: string) =>
+    buildCandidateSnapshot(
+      {
+        runId: "run-rf-review-03",
+        contractDigest: "sha256:contract",
+        repositories: [{ identity: "local:rf-review-03", repositoryRole: "primary", checkoutPath: repository, baseBranch: "dev" }],
+      },
+      new ManualClock("2026-10-09T00:00:00.000Z"),
+    );
+
+  it("refuses a copy whose tree is not the frozen one, where a linked worktree holds the frozen tree", async () => {
+    const repository = makeRepo();
+    const { candidate, ownTree, replacedTree } = replaced(repository);
+    expect(replacedTree).not.toBe(ownTree);
+    expect(gitSync(repository, ["status", "--porcelain"])).toBe("");
+
+    const snapshot = await freeze(repository);
+    const frozen = snapshot.repositories[0]!;
+    expect(frozen).toMatchObject({ candidateHead: candidate, treeDigest: `git-tree:${replacedTree}` });
+    expect((await verifySnapshotFreshness(snapshot, [{ identity: frozen.identity, checkoutPath: repository }])).allowed).toBe(true);
+
+    const manager = new WorktreeManager(tempDir("acp-own-checkout-"));
+    // The linked sibling reads the source's own object database, replacement included.
+    const linked = await manager.create(repository, frozen.candidateHead, "linked-replaced", authorizationFor(manager, repository, "linked-replaced"));
+    expect(gitSync(linked.path, ["rev-parse", "HEAD^{tree}"])).toBe(replacedTree);
+    await manager.destroy(repository, linked.path, authorizationFor(manager, repository, "linked-replaced"));
+
+    const refused = await refusal(manager.create(
+      repository,
+      frozen.candidateHead,
+      "replaced",
+      authorizationFor(manager, repository, "replaced"),
+      { selfContained: true, frozenTree: frozen.treeDigest },
+    ));
+    expect(refused.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
+    expect(refused.evidence).toMatchObject({
+      expectedHead: candidate,
+      materializedHead: candidate,
+      expectedTree: `git-tree:${replacedTree}`,
+      materializedTree: `git-tree:${ownTree}`,
+      status: [],
+    });
+    expect(existsSync(manager.pathFor("replaced"))).toBe(false);
+    expect(existsSync(registrationOf(manager, "replaced"))).toBe(false);
+  });
+
+  it("refuses before copying when the source no longer resolves the candidate to the frozen tree", async () => {
+    const repository = makeRepo();
+    const { candidate, ownTree } = replaced(repository);
+    const frozenTree = `git-tree:${ownTree}`;
+    const manager = new WorktreeManager(tempDir("acp-own-checkout-"));
+    let copyStarted = false;
+    const refused = await refusal(manager.create(
+      repository,
+      candidate,
+      "unstable-before",
+      authorizationFor(manager, repository, "unstable-before", {
+        // Were the copy to start, the source would turn back into the frozen tree in time for it.
+        before: { [WorktreeAction.ADD]: () => { copyStarted = true; unreplaced(repository, candidate); } },
+      }),
+      { selfContained: true, frozenTree },
+    ));
+    expect(refused.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
+    expect(copyStarted).toBe(false);
+    expect(refused.evidence).toMatchObject({ expectedTree: frozenTree });
+    expect(refused.evidence?.["sourceTree"]).not.toBe(frozenTree);
+  });
+
+  it("refuses when the source's tree for the candidate changes while it is copied", async () => {
+    const repository = makeRepo();
+    const candidate = gitSync(repository, ["rev-parse", "HEAD"]);
+    const frozenTree = `git-tree:${gitSync(repository, ["rev-parse", `${candidate}^{tree}`])}`;
+    const manager = new WorktreeManager(tempDir("acp-own-checkout-"));
+    const refused = await refusal(manager.create(
+      repository,
+      candidate,
+      "unstable-during",
+      authorizationFor(manager, repository, "unstable-during", {
+        before: { [WorktreeAction.ADD]: () => { replaced(repository); } },
+      }),
+      { selfContained: true, frozenTree },
+    ));
+    expect(refused.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
+    // Same head, the frozen tree in the copy, clean on both sides: only the source's tree moved.
+    expect(refused.evidence).toMatchObject({ materializedHead: candidate, materializedTree: frozenTree, status: [], sourceStatus: [] });
+    expect(refused.evidence?.["sourceTree"]).not.toBe(frozenTree);
+  });
+
+  sandboxIt("does not pass CLEAN_TREE over a replaced candidate through the real engine", async () => {
+    const repository = makeRepo();
+    replaced(repository);
+    const candidate = await temporaryCandidate({ path: repository, baseBranch: "dev" });
+    const refused = await refusal(verifyCleanTree(candidate));
+    expect(refused.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
+    expect(latestVerificationTree(candidate.harness, candidate.run.runId).state).toBe("FAILED");
+  });
+
+  sandboxIt("binds the copy to the snapshot's tree, not to what the source holds when the copy is made", async () => {
+    const repository = makeRepo();
+    const { candidate: head } = replaced(repository);
+    const candidate = await temporaryCandidate({ path: repository, baseBranch: "dev" });
+    // After the freeze and its freshness check, the source turns back into the commit's own tree:
+    // clean, same head, and exactly what a copy by SHA holds -- but not what the snapshot froze.
+    const realCreate = candidate.harness.cp.worktrees.create.bind(candidate.harness.cp.worktrees);
+    vi.spyOn(candidate.harness.cp.worktrees, "create").mockImplementation(async (...args) => {
+      unreplaced(repository, head);
+      return realCreate(...args);
+    });
+    const refused = await refusal(verifyCleanTree(candidate));
+    expect(refused.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
+    // Refused while materialising, before any command ran -- not afterwards by the freshness recheck.
+    expect(latestVerificationTree(candidate.harness, candidate.run.runId).state).toBe("FAILED");
   });
 });
