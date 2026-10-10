@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
+import { digestOfSet } from "../core/digest.ts";
 import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
 import { newSessionId } from "../core/ids.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
@@ -8,7 +9,7 @@ import { nativeStartIsInLstartSecond, processStartedAt } from "../core/process-i
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { SessionLifecycle } from "../domain/types.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { HOLDER_CLAIMED_KIND_SQL } from "../outbox/outbox.ts";
 import { isBuzzKeyPossession, type BuzzKeyPossession } from "../buzz/buzz-bind-challenge.ts";
 import { isAdmittedRuntime, type AdmittedRuntime } from "./runtime-lineage.ts";
@@ -106,6 +107,53 @@ export interface AdmittedBindBuzzActorInput {
 export interface PossessedBindBuzzActorInput {
   possession: BuzzKeyPossession;
 }
+
+/**
+ * The other session rows carrying one Buzz channel identity, sorted by `SessionRegistry.buzzActorHolders`
+ * into the earlier CEO rows the possession-proven recovery may take the key past and everything else.
+ */
+export interface BuzzActorHolders {
+  /** Terminal rows of the CEO role's binding history that no ACTIVE assignment names, in id order. */
+  readonly history: readonly string[];
+  /** The first other row that is not history — live, of another lineage, or still named ACTIVE. */
+  readonly blocking: string | null;
+}
+
+/**
+ * A key the CEO took past earlier CEO rows (CEO 1791632040), as its record states it. The rows it
+ * was proven against are stated losslessly as their count and `digestOfSet` of their ids — the
+ * record's `recoveredFrom` list is for a reader, and the audit log keeps at most 200 of an array's
+ * elements, so it is never what membership is decided by (review ceobuzz-r1-02).
+ */
+export interface BuzzActorRecovery {
+  /** The recovery's audit time, by this daemon's clock. */
+  readonly at: string;
+  /** The verified challenge answer's signed `created_at`, in seconds (`BuzzKeyPossession`). */
+  readonly answerSignedAt: number;
+  readonly count: number;
+  readonly digest: string;
+}
+
+/** A recovery record's evidence, read the one way the writer's readback and every reader read it. */
+const recoveryOf = (at: string, evidenceJson: string): BuzzActorRecovery | null => {
+  let evidence: unknown;
+  try {
+    evidence = JSON.parse(evidenceJson) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof evidence !== "object" || evidence === null) return null;
+  const fields = evidence as Record<string, unknown>;
+  const count = fields["recoveredCount"];
+  const digest = fields["recoveredDigest"];
+  const answerSignedAt = fields["answerSignedAt"];
+  if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 1) return null;
+  if (typeof digest !== "string" || digest.length === 0) return null;
+  if (typeof answerSignedAt !== "number" || !Number.isSafeInteger(answerSignedAt)) return null;
+  return { at, answerSignedAt, count, digest };
+};
+
+const CEO_ROLE_KEY = roleKeyFor(Role.CEO);
 
 /** The creation response is the only time a runtime receives its session secret. */
 export interface CreatedSession extends SessionRecord {
@@ -511,8 +559,9 @@ export class SessionRegistry {
 
   /**
    * The possession form's proof and allowlist, then the refusals the admitted ingress gives before it
-   * writes — a terminal runtime, a different identity already held, a key any other row carries —
-   * and the same write. The identity the session already holds is answered as bound, unwritten.
+   * writes — a terminal runtime, a different identity already held — and its own transactional
+   * write, which refuses a key any other row carries unless every such row is history. The identity
+   * the session already holds is answered as bound, unwritten.
    */
   #bindPossessedBuzzActor(
     possession: BuzzKeyPossession,
@@ -545,12 +594,110 @@ export class SessionRegistry {
         sessionId,
       });
     }
-    if (this.otherSessionCarrying(actorId, sessionId) !== null) {
-      return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another session row already carries this identity", {
+    return this.#writePossessedBuzzActor(possession, actorId);
+  }
+
+  /**
+   * The possession form's write, in one transaction (CEO 1791632040). Every fact it binds on is read
+   * again inside it, under the write lock, so a re-adoption or another holder committed after the
+   * challenge store's check is seen here rather than written past:
+   *
+   *   - the CEO binding is still this runtime, at this incarnation, at the generation the challenge
+   *     was minted under;
+   *   - every other row carrying the key is history (`buzzActorHolders`) — none, for a first binding;
+   *     terminal earlier CEO rows, for a recovery;
+   *   - and the UPDATE itself is conditional on the row still being that live, unbound incarnation.
+   *
+   * Earlier rows are never written: their column is write-once and stays as the key's history. A
+   * recovery's audit row states them as a count and a set digest (`BuzzActorRecovery`) together with
+   * the verified answer's signed time, which is what #1038's peer rule reads; the row is read back
+   * inside the transaction and anything but those exact values refuses and rolls the binding back.
+   */
+  #writePossessedBuzzActor(possession: BuzzKeyPossession, actorId: string): Decision<SessionRecord> {
+    const sessionId = possession.runtime.sessionId;
+    const incarnation = possession.runtime.sessionIncarnation;
+    return this.db.txDecision((): Decision<SessionRecord> => {
+      const ceo = this.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM assignments a
+           LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+          WHERE a.role_key = ? AND a.status = 'ACTIVE' AND a.binding_generation = ?
+            AND COALESCE(c.current_session_id, a.session_id) = ?
+            AND COALESCE(c.current_session_incarnation, a.session_incarnation) = ?`,
+        [CEO_ROLE_KEY, possession.ceoBindingGeneration, sessionId, incarnation],
+      )?.n ?? 0;
+      if (ceo !== 1) {
+        return deny(
+          ReasonCode.BINDING_GENERATION_STALE,
+          "the CEO binding's runtime or generation changed since the challenge was minted",
+          { sessionId },
+        );
+      }
+      const holders = this.buzzActorHolders(actorId, sessionId);
+      if (holders.blocking !== null) {
+        return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another session row already carries this identity", {
+          sessionId,
+        });
+      }
+      let changes: number;
+      try {
+        changes = this.db.run(
+          `UPDATE sessions SET buzz_actor_id = ?, updated_at = ?
+            WHERE session_id = ? AND incarnation = ? AND buzz_actor_id IS NULL
+              AND lifecycle IN ('READY','DRAINING')`,
+          [actorId, this.clock.nowIso(), sessionId, incarnation],
+        ).changes;
+      } catch (err) {
+        if (isAcpError(err) && err.reasonCode === ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND) {
+          return deny(err.reasonCode, err.message, { sessionId, buzzActorId: actorId });
+        }
+        throw err;
+      }
+      if (changes !== 1) {
+        return deny(ReasonCode.SESSION_NOT_READY, "the runtime is no longer a live, unbound row of this incarnation", {
+          sessionId,
+        });
+      }
+      if (holders.history.length === 0) {
+        this.audit.record({
+          kind: "SESSION_BUZZ_ACTOR_BOUND",
+          sessionId,
+          actor: `buzz:${actorId}`,
+          evidence: { channel: "buzz" },
+        });
+        return allow(ReasonCode.OK, this.require(sessionId));
+      }
+      const count = holders.history.length;
+      const digest = digestOfSet(holders.history);
+      const recorded = this.audit.record({
+        kind: "SESSION_BUZZ_ACTOR_BOUND",
         sessionId,
+        actor: `buzz:${actorId}`,
+        evidence: {
+          channel: "buzz",
+          recoveredFrom: [...holders.history],
+          recoveredCount: count,
+          recoveredDigest: digest,
+          answerSignedAt: possession.answerSignedAt,
+          generation: possession.ceoBindingGeneration,
+        },
       });
-    }
-    return this.#writeBuzzActor(sessionId, authenticated, actorId);
+      const persisted = recorded.allowed
+        ? this.db.get<{ at: string; evidence_json: string }>(
+          `SELECT at, evidence_json FROM audit_events WHERE event_id = ?`,
+          [recorded.value],
+        )
+        : undefined;
+      const readBack = persisted ? recoveryOf(persisted.at, persisted.evidence_json) : null;
+      if (
+        readBack === null ||
+        readBack.count !== count ||
+        readBack.digest !== digest ||
+        readBack.answerSignedAt !== possession.answerSignedAt
+      ) {
+        return deny(ReasonCode.CONFLICT, "the recovery's record did not persist as written", { sessionId });
+      }
+      return allow(ReasonCode.OK, this.require(sessionId));
+    });
   }
 
   /**
@@ -629,7 +776,9 @@ export class SessionRegistry {
   /**
    * Another session row that carries this Buzz channel identity, live or not; a read for refusing
    * early. A stopped row keeps the column, and #1038's peer rule reads any other holder of a key as
-   * making that key's events ambiguous, so a binding onto it would bind nothing usable.
+   * making that key's events ambiguous unless the key was recovered past it by possession, so a
+   * relay-signed binding onto it would bind nothing usable. Only the possession form may take a key
+   * past earlier rows (`buzzActorHolders`): a relay's envelope proves the relay, not the key.
    */
   otherSessionCarrying(buzzActorId: string, sessionId: string): string | null {
     const row = this.db.get<{ session_id: string }>(
@@ -637,6 +786,60 @@ export class SessionRegistry {
       [buzzActorId, sessionId],
     );
     return row?.session_id ?? null;
+  }
+
+  /**
+   * The other rows carrying this identity, sorted (CEO 1791632040). A row is history only when it can
+   * never speak again and was the CEO's: terminal (STOPPED or ERROR, which no transition leaves), the
+   * bound runtime of at least one CEO assignment, and neither the bound nor the live runtime of any
+   * ACTIVE assignment. Anything else — a live row, a row that never served the CEO role, a terminal
+   * row an ACTIVE assignment still names — is `blocking`. A runtime the CEO reached only by a runtime
+   * move, with no assignment naming it, is not read as history.
+   */
+  buzzActorHolders(buzzActorId: string, sessionId: string): BuzzActorHolders {
+    const rows = this.db.all<{ session_id: string; history: number }>(
+      `SELECT s.session_id,
+              (s.lifecycle IN ('STOPPED','ERROR')
+                AND EXISTS (SELECT 1 FROM assignments a
+                             WHERE a.session_id = s.session_id AND a.role_key = ? AND a.role = 'CEO')
+                AND NOT EXISTS (SELECT 1 FROM assignments a
+                                  LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+                                 WHERE a.status = 'ACTIVE'
+                                   AND (a.session_id = s.session_id OR c.current_session_id = s.session_id))
+              ) AS history
+         FROM sessions s
+        WHERE s.buzz_actor_id = ? AND s.session_id <> ?
+        ORDER BY s.session_id`,
+      [CEO_ROLE_KEY, buzzActorId, sessionId],
+    );
+    return {
+      history: rows.filter((row) => row.history === 1).map((row) => row.session_id),
+      blocking: rows.find((row) => row.history !== 1)?.session_id ?? null,
+    };
+  }
+
+  /**
+   * The recovery this session's binding of this identity was, when it was one: the first
+   * `SESSION_BUZZ_ACTOR_BOUND` record for the pair. Null for a first binding, or for a record whose
+   * evidence does not state a recovery's count, digest and answer time.
+   */
+  buzzActorRecovery(sessionId: string, buzzActorId: string): BuzzActorRecovery | null {
+    const row = this.db.get<{ at: string; evidence_json: string }>(
+      `SELECT at, evidence_json FROM audit_events
+        WHERE kind = 'SESSION_BUZZ_ACTOR_BOUND' AND session_id = ? AND actor = ?
+        ORDER BY event_id LIMIT 1`,
+      [sessionId, `buzz:${buzzActorId}`],
+    );
+    return row ? recoveryOf(row.at, row.evidence_json) : null;
+  }
+
+  /**
+   * Whether a recovery was proven against exactly these history rows (`buzzActorHolders().history`,
+   * recomputed now): the same count and the same set digest. A row the record does not name, or a
+   * named row that is no longer history, makes the answer no.
+   */
+  buzzActorRecoveryNames(recovery: BuzzActorRecovery, history: readonly string[]): boolean {
+    return recovery.count === history.length && recovery.digest === digestOfSet(history);
   }
 
   setBuzzAddress(sessionId: string, address: string | null): void {
