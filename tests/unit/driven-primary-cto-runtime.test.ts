@@ -986,6 +986,9 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
     });
   });
 
+  // Removing any one of these four protections turns its witness below RED. The in-band half of the
+  // sweep's withholding is witnessed by that test alone; the creation-actor comparison, the bind
+  // re-check and the attestation check on queued work also turn earlier witnesses in this file RED.
   describe("each protection the first review found unwitnessed", () => {
     it("does not let a replacement actor on the same session inherit DRIVEN from the creation assignment", async () => {
       await withBootstrapRuntime(async (f) => {
