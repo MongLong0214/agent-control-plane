@@ -1,4 +1,6 @@
 import { chmodSync } from "node:fs";
+
+import Database from "better-sqlite3";
 import type * as NodeNet from "node:net";
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
@@ -13,6 +15,7 @@ import {
   rejudgeBuzzMentionSubscriberOnBindingSwitch,
   startBuzzMessageIngressListener,
   startDaemonBuzzMentionSubscriber,
+  startLocalMcpListeners,
 } from "../../src/daemon/agentcpd.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
@@ -45,6 +48,9 @@ const wakes = vi.hoisted(() => {
       return this;
     }
     end(frame: string, flushed: () => void): this {
+      // Runs at the handoff itself, before the frame is taken: what a writer outside the daemon
+      // does at that instant is ordered before the handoff if it commits.
+      atHandoff.run?.();
       this.frame = frame;
       this.#flushed = flushed;
       return this;
@@ -64,8 +70,9 @@ const wakes = vi.hoisted(() => {
       this.listeners.get("error")?.(error);
     }
   }
+  const atHandoff: { run: (() => void) | null } = { run: null };
   const dialled: PendingWake[] = [];
-  return { dialled, open: () => dialled[dialled.push(new PendingWake()) - 1]! };
+  return { dialled, atHandoff, open: () => dialled[dialled.push(new PendingWake()) - 1]! };
 });
 
 vi.mock("node:net", async (importOriginal) => ({
@@ -97,7 +104,7 @@ const dialled = async (count: number): Promise<void> => {
   expect(wakes.dialled).toHaveLength(count);
 };
 
-const start = async () => {
+const start = async (options: { production?: boolean; serializeWake?: <T>(body: () => T) => T } = {}) => {
   const dir = tempDir("acp-wkr-");
   chmodSync(dir, 0o700);
   const cto = channelKey(dir, "cto.key");
@@ -114,13 +121,15 @@ const start = async () => {
   expect(h.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId: PROJECT }).allowed).toBe(true);
   writeSubscriberConfig(dir, [{ keyFile: cto.keyFile, rooms: [ROOM] }]);
   const policy = { allowedActors: [owner.pubkey], secret: "buzz-wake-after-revoke-secret" };
-  const conversation = new RoleConversationPort(Role.PRIMARY_CTO, {
+  // `production` takes the CTO port exactly as the daemon builds it, with its write-transaction hook.
+  const listeners = options.production ? await startLocalMcpListeners(h.cp, dir, "wake-witness-mcp-token") : null;
+  const conversation = listeners?.ctoConversation ?? new RoleConversationPort(Role.PRIMARY_CTO, {
     active: (key) => h.cp.bindings.active(key),
     currentCandidates: () => {
       const binding = h.cp.bindings.activePrimaryCto(PROJECT);
       return binding ? [binding] : [];
     },
-  }, { endpointDir: dir });
+  }, { endpointDir: dir, ...(options.serializeWake ? { serializeWake: options.serializeWake } : {}) });
   const ingress = await startBuzzMessageIngressListener(h.cp, dir, policy, {
     ceoConversation: new CeoConversationPort(),
     ownerActors: [owner.pubkey],
@@ -163,8 +172,10 @@ const start = async () => {
     close: async () => {
       for (const wake of wakes.dialled) if (wake.frame === null && !wake.destroyed) wake.refuse();
       await new Promise<void>((resolve) => endpoint.close(() => resolve()));
+      wakes.atHandoff.run = null;
       subscriber.close();
       await ingress.close();
+      await listeners?.close();
       h.cp.close();
     },
   };
@@ -232,6 +243,79 @@ it("refuses the claim of a holder revoked after its wake landed, and leaves the 
     expect(claimed.reasonCode).toBe(ReasonCode.ROLE_PEER_STALE);
     expect(f.ownerMessages()).toHaveLength(1);
     expect(f.ownerMessages()[0]!.status).not.toBe("ACKED");
+  } finally {
+    await f.close();
+  }
+});
+
+/**
+ * A writer outside the daemon: a separate SQLite connection that takes no daemon lock, as a raw
+ * database edit would. It tries to commit a revoke at the instant of the handoff, after the holder
+ * was re-checked. The daemon's port runs that check and the handoff inside its write transaction,
+ * so the revoke cannot commit between them: it is refused while the transaction is open and lands
+ * after the handoff, and the frame went to the holder that was current when it was handed off.
+ *
+ * What this does not show, and does not claim: the transaction and the socket's delivery are not
+ * atomic, so a revoke committed after the handoff still finds the frame on its way.
+ */
+it("orders an outside writer's revoke after the handoff, never between the re-check and the frame", async () => {
+  const f = await start({ production: true });
+  const outside = new Database(f.h.cp.config.databasePath);
+  outside.pragma("busy_timeout = 0");
+  const revoke = outside.prepare(
+    `UPDATE assignments SET status = 'REVOKED', revoked_at = ?, revoked_reason = ? WHERE role_key = ? AND status = 'ACTIVE'`,
+  );
+  try {
+    const before = wakes.dialled.length;
+    f.h.clock.advance(1_000);
+    f.relay.publish(f.mention("raced by a raw writer"));
+    await dialled(before + 1);
+    const pending = wakes.dialled.at(-1)!;
+
+    const atHandoff: { committed: boolean; refusedBusy: boolean } = { committed: false, refusedBusy: false };
+    wakes.atHandoff.run = () => {
+      wakes.atHandoff.run = null;
+      try {
+        atHandoff.committed = revoke.run(f.h.cp.clock.nowIso(), "raw revoke at the handoff", f.roleKey).changes === 1;
+      } catch (error) {
+        atHandoff.refusedBusy = (error as { code?: string }).code === "SQLITE_BUSY";
+      }
+    };
+    pending.succeed();
+    await f.relay.drain(f.subscriber);
+
+    // Never both: a revoke committed before the handoff with the frame still handed to that holder.
+    expect(atHandoff.committed && pending.frame !== null, "a revoke committed between the re-check and the handoff").toBe(false);
+    expect(atHandoff.refusedBusy).toBe(true);
+    expect(pending.frame).toBe(ROLE_WAKE_FRAME);
+    // Once the transaction has closed, the same writer's revoke commits: it is ordered after.
+    expect(revoke.run(f.h.cp.clock.nowIso(), "raw revoke after the handoff", f.roleKey).changes).toBe(1);
+    expect(f.h.cp.bindings.active(f.roleKey)).toBeNull();
+  } finally {
+    outside.close();
+    await f.close();
+  }
+});
+
+it("does not report a wake as written when its transaction fails, even after the frame was queued", async () => {
+  let failCommit = false;
+  const f = await start({
+    serializeWake: (body) => {
+      const out = body();
+      if (failCommit) throw new Error("the commit failed");
+      return out;
+    },
+  });
+  try {
+    failCommit = true;
+    const before = wakes.dialled.length;
+    const woken = f.conversation.wake(f.roleKey);
+    await dialled(before + 1);
+    wakes.dialled.at(-1)!.succeed();
+    const decision = await woken;
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.ROLE_PEER_FAILED);
+    expect(wakes.dialled.at(-1)!.destroyed).toBe(true);
   } finally {
     await f.close();
   }

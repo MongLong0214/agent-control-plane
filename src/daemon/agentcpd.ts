@@ -616,7 +616,8 @@ export const startLocalMcpListeners = async (
     // and `cto.mcp.sock` are already in, two lines above. It is passed rather than derived inside
     // the port so the port never has to know what a deployment's layout is, and so a test that
     // wants a different directory gets one without moving the daemon's.
-    { endpointDir: stateDir, ownerMessages: ownerMessageLedger(cp) },
+    // The wake's final holder check and its frame handoff run in the daemon's write transaction.
+    { endpointDir: stateDir, ownerMessages: ownerMessageLedger(cp), serializeWake: (body) => cp.db.tx(body) },
   );
   const hermes = await startMcpSocket(
     hermesPath,

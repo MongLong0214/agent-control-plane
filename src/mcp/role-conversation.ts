@@ -467,6 +467,13 @@ export class RoleConversationPort {
    */
   readonly #endpointDir: string | null;
   readonly #wakeTimeoutMs: number;
+  /**
+   * The daemon's write transaction, when the composition supplies it. A wake's final holder check
+   * and its frame handoff run inside it, so every database writer, in this process or outside it,
+   * commits wholly before the check or wholly after the handoff. Absent, the two still run in one
+   * synchronous section, which orders them against this process alone.
+   */
+  readonly #serializeWake: (<T>(body: () => T) => T) | null;
 
   constructor(
     role: Role,
@@ -475,10 +482,12 @@ export class RoleConversationPort {
       endpointDir?: string;
       wakeTimeoutMs?: number;
       ownerMessages?: OwnerMessageLedger;
+      serializeWake?: <T>(body: () => T) => T;
     } = {},
   ) {
     this.#role = role;
     this.#bindings = bindings;
+    this.#serializeWake = options.serializeWake ?? null;
     this.#ownerMessages = options.ownerMessages ?? null;
     this.#endpointDir = options.endpointDir === undefined ? null : resolvePath(options.endpointDir);
     this.#wakeTimeoutMs = options.wakeTimeoutMs ?? DEFAULT_ROLE_WAKE_TIMEOUT_MS;
@@ -488,15 +497,6 @@ export class RoleConversationPort {
     return this.#role;
   }
 
-  /**
-   * Whether `binding` is, right now, the exact holder this port may deliver to.
-   *
-   * Three separate questions, because each one alone lets a wrong target through: the role has
-   * to be the one this port serves (a `BOOTSTRAP_CTO` is not the canonical CTO), the registry's
-   * current holder has to be this same assignment (another project's key answers for its own
-   * key, never for this one), and the generation has to still be current (a superseded holder is
-   * a former one). None of it is taken from the peer's own claim.
-   */
   /**
    * Whether the wake begun for `peer` may still be written: the same live connection is attached for
    * `roleKey`, on the same registration and endpoint, and it re-authenticates as the registry's
@@ -509,6 +509,15 @@ export class RoleConversationPort {
     return identity.allowed && this.#isCurrentHolder(peer.binding, identity.value);
   }
 
+  /**
+   * Whether `binding` is, right now, the exact holder this port may deliver to.
+   *
+   * Three separate questions, because each one alone lets a wrong target through: the role has
+   * to be the one this port serves (a `BOOTSTRAP_CTO` is not the canonical CTO), the registry's
+   * current holder has to be this same assignment (another project's key answers for its own
+   * key, never for this one), and the generation has to still be current (a superseded holder is
+   * a former one). None of it is taken from the peer's own claim.
+   */
   #isCurrentHolder(binding: RoleBinding, peer: AuthenticatedMcpPeer): boolean {
     if (binding.role !== this.#role) return false;
     const current = this.#bindings.active(binding.roleKey);
@@ -1076,9 +1085,9 @@ export class RoleConversationPort {
     // the previous endpoint's delivery as this one's. Both directions of that were reproduced.
     const registration = peer.registration;
     const endpoint = peer.endpoint;
-    let written: boolean;
+    let outcome: "written" | "stale" | "unsettled";
     try {
-      written = await new Promise<boolean>((resolveWake, rejectWake: (failure: WakeFailure) => void) => {
+      outcome = await new Promise<"written" | "stale" | "unsettled">((resolveWake, rejectWake: (failure: WakeFailure) => void) => {
         const socket = connect(revalidated.value);
         const fail = (failure: WakeFailure): void => {
           socket.destroy();
@@ -1107,15 +1116,36 @@ export class RoleConversationPort {
           // run another task. A mismatch writes no frame and discards this wake attempt only: the
           // durable message and its outbox row are untouched, and the current holder's own
           // registration or wake is what reaches it.
-          if (!this.#stillTheHolderToWake(roleKey, peer, registration, endpoint)) {
+          //
+          // With `serializeWake` the check and the handoff run inside the daemon's write
+          // transaction, which orders them against writers outside this process too: a revoke
+          // commits before the check or after the handoff. Nothing in the transaction waits on the
+          // network: `end` queues the frame with the kernel and returns, and its flush is observed
+          // after the commit. A transaction that fails is not a wake, whatever was queued.
+          let handedOff = false;
+          const handOff = (): void => {
+            if (!this.#stillTheHolderToWake(roleKey, peer, registration, endpoint)) return;
+            // `end` rather than `write` then leaving it open: the peer's read side sees EOF, so a
+            // reader does not have to know the frame's length to know the wake is complete. This
+            // is what C0 measured the runtime accepting.
+            socket.end(ROLE_WAKE_FRAME, () => {
+              if (handedOff) resolveWake("written");
+            });
+            handedOff = true;
+          };
+          try {
+            if (this.#serializeWake !== null) this.#serializeWake(handOff);
+            else handOff();
+          } catch {
+            handedOff = false;
             socket.destroy();
-            resolveWake(false);
+            resolveWake("unsettled");
             return;
           }
-          // `end` rather than `write` then leaving it open: the peer's read side sees EOF, so a
-          // reader does not have to know the frame's length to know the wake is complete. This is
-          // what C0 measured the runtime accepting.
-          socket.end(ROLE_WAKE_FRAME, () => resolveWake(true));
+          if (!handedOff) {
+            socket.destroy();
+            resolveWake("stale");
+          }
         });
       });
     } catch (failure) {
@@ -1137,14 +1167,19 @@ export class RoleConversationPort {
         shape: (failure as WakeFailure).shape,
       });
     }
-    if (!written) {
-      // Not an endpoint failure, so nothing is remembered against the registration: the holder the
-      // wake was begun for is no longer the one to wake.
+    // Neither is an endpoint failure, so nothing is remembered against the registration.
+    if (outcome === "stale") {
       return deny(
         ReasonCode.ROLE_PEER_STALE,
         "the role's holder changed while the wake was connecting; the wake was not written",
         { role: this.#role, roleKey },
       );
+    }
+    if (outcome === "unsettled") {
+      return deny(ReasonCode.ROLE_PEER_FAILED, "the wake's transaction failed, so it is not recorded as written", {
+        role: this.#role,
+        roleKey,
+      });
     }
     // A wake that landed is the contradiction of an earlier one that did not, so the memory goes --
     // and only the memory of the registration this delivery belonged to. A success completing after
