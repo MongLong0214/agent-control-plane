@@ -182,6 +182,14 @@ export const bootstrapPlanPreflight = (input: {
       ciWorkflows: manifest.ciWorkflows.map((workflow) => workflow.checkName),
     });
   }
+  // G0a (RF-018) — the same for CommitLore: this producer installs no CommitLore hook and observes no
+  // record, so a manifest that requires it would activate with the requirement silently unmet.
+  // `preferred` activates, with the activation result naming CommitLore as not observed.
+  if (manifest.commitlore.mode === "required") {
+    return unsupported("the manifest requires CommitLore, and this producer neither installs it nor observes any record", {
+      commitloreMode: manifest.commitlore.mode,
+    });
+  }
   const command = manifest.verificationCommands[0];
   if (manifest.verificationCommands.length !== 1) {
     return unsupported("this producer runs exactly one verification, and the manifest requires a different count", {
