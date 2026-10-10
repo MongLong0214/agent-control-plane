@@ -1,0 +1,59 @@
+Limit: a WORKER's workdir is the managed runtime root under the read-denied state root, so a Claude session probe whose cwd is that workdir runs a CLI that cannot read its own cwd and exits 1
+Warn: a HEALTHY session probe now proves only that the session answers from the invocation's private scratch; it does not prove a turn can reach a checkout, and a WORKER turn still runs in its claimed worktree
+Warn: keep the probe in the scratch runCli allocates (cwd undefined); widening the runtime profile to re-open the session workdir would lift the read deny on daemon state for the probe
+Record-Id: r-workerprobecwd
+Provenance: inherited 8b9e3fdfc13fa45437883635eb625c61a749ef58
+
+Limit: a descendant that leaves the probe's process group (setsid, setpgid) is outside it and is not reaped; the reap reports the group empty while such a process may still run
+Warn: only the Claude session probe sets reapProcessGroup; worker turns, reviewer and every other invocation keep their own process lifetimes
+Warn: the reap signals only while the group is provably the probe's: a live process holding the leader's pid with another start token is never signalled, and a live pid whose start token cannot be compared is reported unconfirmed, which makes the probe UNAVAILABLE
+Warn: EPERM from kill(-pgid, 0) counts as a live member, because on macOS a group whose last member is an unreaped zombie answers EPERM until launchd reaps it
+Unverified: an authenticated real-CLI probe was not observed; under a temporary HOME the CLI answered Not logged in, so descendants of a full provider turn and of operator settings were not measured
+Record-Id: r-workerprobereap
+Follows: r-workerprobecwd
+Provenance: inherited 0b71e495b572148f49402e6cc7eefbf0ff7c829d
+
+Limit: the probe-group ownership check and the signal are two system calls; if every member exits between them and the pid allocator wraps round to give the same id to a new group leader, the signal reaches that group, and neither the free pid nor a start token closes that window
+Limit: claude 2.1.283, logged out and with a HOME of its own, still starts a user-scope MCP server and runs user and plugin hooks before it answers, so a probe without the isolation flags runs operator configuration
+Warn: a probe reap judged ID_REUSED or UNVERIFIABLE signals nothing and is never counted as cleaned up: the probe throws ProbeProcessGroupUnconfirmed and callers carry the named group into the refusal evidence
+Warn: the session probe carries the WORKER turn's isolation, the sanctioned --settings then operatorConfigurationExcluded(); keep the two in step through that helper rather than repeating the flags
+Unverified: the isolation and reap behaviour were observed with the CLI logged out under a temporary HOME; a logged-in probe under an operator's real configuration was not run
+Record-Id: r-workerprobeisolation
+Follows: r-workerprobereap
+Provenance: inherited ac4d7b047b6d21880b426187a0a44bcc4ece382c
+
+Limit: libuv reaps every exited child of a batch before it runs any exit callback, and other children's exit callbacks and their microtasks run in between, so a no-exit-recorded check proves the holder unreaped only in the check phase (setImmediate); the probe's group is signalled from there alone
+Limit: the ownership proof assumes nothing in the process reaps children other than libuv's per-pid waits; a waitpid(-1) or a debugger attached to the holder would break it
+Limit: measured on claude 2.1.283 logged out: --setting-sources project,local alone stopped the user MCP server, user hooks and plugin hooks; the strict empty MCP config alone stopped only the user MCP server; the sanctioned --settings alone stopped none of them
+Warn: never move endHeldGroup out of its setImmediate callback; a check made from an exit handler or its microtasks would prove nothing
+Warn: if the holder is lost before the group is signalled, nothing is signalled; the probe is UNAVAILABLE with the group reported as possibly holding its processes, never counted as cleaned up; this supersedes the earlier non-atomic token-check window
+Unverified: a logged-in probe under an operator's real HOME and configuration was not run
+Record-Id: r-workerprobeholder
+Follows: r-workerprobeisolation
+Provenance: inherited 2caaed2901869f0eb1f0641c4ee35819e5a190b8
+
+Limit: a probe's group is signalled only when, in the same check-phase turn and before every attempt, the holder has no recorded exit and still carries the start token read at spawn; a null, unreadable or different token means no attempt and an UNAVAILABLE result naming the group, and a zombie's token cannot be read, so nothing is sent once the holder has died
+Warn: reaped is true only with HELD ownership, at least one delivered signal and an observed ESRCH; a failed attempt stays in signals even when a later one is delivered, and delivered counts the successes separately
+Warn: the holder is /bin/ksh because ksh93 reports a signal death as 256 plus the signal number, which keeps the CLI's status exact; its own stderr goes to /dev/null and the CLI gets the original stderr on fd 5, so do not switch shells or drop those redirections
+Record-Id: r-workerprobetoken
+Follows: r-workerprobeholder
+Provenance: inherited f3b7441657f96f3c68a7f1e411184b01854b0022
+
+Limit: after the last signal ACP waits up to 100 ms, sending nothing, for members to become zombies; a member still live after that is reported as possibly remaining rather than waited on
+Warn: when ownership stops verifying between attempts, or a member is still live once ACP stops signalling, the probe answers at once as UNAVAILABLE with every attempt and the delivered count kept; it must not wait on the live holder, because endRequested blocks the timeout and abort from ending it again
+Record-Id: r-workerprobesettle
+Follows: r-workerprobetoken
+Provenance: inherited f3f4cf58eaf1081c839dc59ddcd9f1ec77d86796
+
+Limit: a group observation other than ESRCH or success, EPERM and EIO included, is UNOBSERVABLE: it never counts as the holder being dead, never extends a wait and never justifies another signal
+Limit: a probe asked to end answers within 2000 ms of the first end request, the existing reap bound, whatever its observations say; later requests and observation errors never move that deadline, and an unconfirmed answer is UNAVAILABLE with reaped false and every attempt kept
+Warn: the first delivered SIGKILL ends the attempts and nothing is signalled after the probe has answered; an undelivered attempt is repeated only while a signallable member is observed and the token still verifies
+Record-Id: r-workerprobedeadline
+Follows: r-workerprobesettle
+Provenance: inherited f465682a1ffd1f8d11b53d04843ce56ed0fc10bb
+
+Limit: the 2000 ms settle deadline is logical: armed once at the first end request on the monotonic clock and cleared only when the answer is committed; after it no answer can be a cleanup or a HEALTHY probe, but the answer itself arrives when the event loop runs the deadline callback
+Warn: every holding-probe answer goes through answerOnce; cleanup progress (attempts, ownership, exit, observation, close) is kept apart from the answered flag, and a success needs an ESRCH seen and answered before the deadline on the same clock, not timer order
+Record-Id: r-workerprobeenforce
+Follows: r-workerprobedeadline
+Provenance: inherited eeb1d51d80c5e2491c9647472f209c80c090206e
