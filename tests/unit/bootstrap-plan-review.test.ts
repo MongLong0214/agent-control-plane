@@ -291,15 +291,21 @@ describe("#246 C2 W5: a PASS for one plan never stands for another", () => {
       expect(f.harness.cp.bootstrap.readinessForFactoryResult(run.runId, bootstrapActivationHandoff(m2), s1))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
       expect(f.harness.cp.bootstrap.reviewForConfirmation(run.runId, s1)).toMatchObject({ allowed: false });
-      // C1 still holds: CONFIRM of a bootstrap run is refused until C3, whatever the review says.
+      // #246 C3 reopens the CONFIRM through the runner's full path; with no owner approval of the
+      // GitHub writes recorded, it is refused there, writing nothing and reserving nothing.
       const confirm = await f.hermes("ceo_decision_submit", {
         runId: run.runId,
         decision: "CONFIRM",
         candidateSnapshotDigest: s2,
         ceoSessionId: f.ceoSessionId,
-        rationale: "C1 door",
+        rationale: "C3 door",
       });
-      expect(confirm).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE });
+      expect(confirm).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        evidence: { stage: "approval", refusal: "APPROVAL_MISSING" },
+      });
+      expect(f.harness.cp.bootstrapApplications.get(run.runId)).toBeNull();
     });
   });
 });

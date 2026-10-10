@@ -35,6 +35,14 @@ export interface OwnerAuthorityPort {
    * transition.
    */
   consumeApproval(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void>;
+  /**
+   * Whether `consumeApproval` would consume this receipt for this candidate, answered without
+   * consuming it: the same admission, candidate binding and single-use checks, and no write. A caller
+   * whose consumption must wait for checks it cannot make inside a transaction asks this first
+   * (#246 C3: a bootstrap's pre-write checks), so a receipt that could never be consumed is refused
+   * before anything is observed or written.
+   */
+  assertConsumable(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void>;
 }
 
 /**
@@ -130,8 +138,8 @@ export class OwnerAuthority implements OwnerAuthorityPort {
       );
     }
 
-    const inbound = this.db.get<{ actor: string }>(
-      `SELECT actor FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+    const inbound = this.db.get<{ actor: string; payload_json: string | null }>(
+      `SELECT actor, payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
       [receipt.channel, receipt.inboundNonce],
     );
     if (!inbound || inbound.actor !== receipt.actor) {
@@ -143,6 +151,23 @@ export class OwnerAuthority implements OwnerAuthorityPort {
     }
 
     const expected = admittedEnvelopeDigest(receipt);
+    // #246 C3, review 1076-R1-02 — the issuance evidence is the payload the ingress message was
+    // admitted with: that row cannot be inserted by a connection ACP did not open, and its payload is
+    // write-once. The INGRESS_ADMITTED audit row checked below is an ordinary row such a connection can
+    // insert, so on its own it would let a forged envelope ride on any recent message of the owner's.
+    let admittedPayload: string | null = null;
+    try {
+      admittedPayload = inbound.payload_json === null ? null : digestOf(JSON.parse(inbound.payload_json));
+    } catch {
+      admittedPayload = null;
+    }
+    if (admittedPayload !== expected) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner approval receipt is not the payload its ingress message was admitted with",
+        { channel: receipt.channel, actor: receipt.actor, inboundNonce: receipt.inboundNonce },
+      );
+    }
     const admitted = this.db
       .all<{ evidence_json: string }>(
         `SELECT evidence_json FROM audit_events
@@ -186,20 +211,9 @@ export class OwnerAuthority implements OwnerAuthorityPort {
     candidateSnapshotDigest: string | null,
   ): Decision<void> {
     return this.db.tx(() => {
-      const admitted = this.assertApproval(receipt);
-      if (!admitted.allowed) return admitted;
-
+      const consumable = this.assertConsumable(receipt, candidateSnapshotDigest);
+      if (!consumable.allowed) return consumable;
       const receiptDigest = digestOf(receipt);
-      const prior = this.consumedReceipt(receiptDigest);
-      const bound = this.candidateBinding(receipt, receiptDigest, prior, candidateSnapshotDigest);
-      if (!bound.allowed) return bound;
-      if (prior) {
-        return deny(
-          ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-          "owner approval receipt has already been consumed",
-          { receiptDigest, candidateSnapshotDigest },
-        );
-      }
 
       this.db.run(
         `INSERT INTO audit_events
@@ -227,6 +241,24 @@ export class OwnerAuthority implements OwnerAuthorityPort {
       );
       return allow(ReasonCode.OK, undefined);
     });
+  }
+
+  assertConsumable(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void> {
+    const admitted = this.assertApproval(receipt);
+    if (!admitted.allowed) return admitted;
+
+    const receiptDigest = digestOf(receipt);
+    const prior = this.consumedReceipt(receiptDigest);
+    const bound = this.candidateBinding(receipt, receiptDigest, prior, candidateSnapshotDigest);
+    if (!bound.allowed) return bound;
+    if (prior) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner approval receipt has already been consumed",
+        { receiptDigest, candidateSnapshotDigest },
+      );
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /**
