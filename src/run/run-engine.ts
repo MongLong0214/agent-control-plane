@@ -497,7 +497,7 @@ export class RunEngine {
         enqueueTransitionEnvelope: () => {
           if (!binding) return allow(ReasonCode.OK, undefined);
           const enqueued = this.outbox.enqueue({
-            idempotencyKey: `run-dispatch:${runId}:${binding.bindingGeneration}`,
+            idempotencyKey: dispatchIdempotencyKey(runId, binding.bindingGeneration, fresh.revisionCount),
             roleKey: binding.roleKey,
             bindingGeneration: binding.bindingGeneration,
             targetSessionId: binding.sessionId,
@@ -731,6 +731,33 @@ export class RunEngine {
     evidence: Record<string, unknown> = {},
     authority?: CompletionAuthority,
   ): Decision<RunRow> {
+    return this.#transition(runId, to, reason, evidence, authority, null);
+  }
+
+  /**
+   * #246 C1b (review ACP-C1B-02) — continuity's pause of an ACTIVE run because it can no longer
+   * staff `roleKey`: ACTIVE → BLOCKED, recording in the same statement, under the same transition
+   * authority, that this hold is continuity's and which role it lost. A bootstrap CTO's recovery
+   * reads it to know the run may be resumed; a run BLOCKED any other way records no hold and is
+   * never resumed by a recovery.
+   */
+  pauseForContinuity(
+    runId: string,
+    roleKey: string,
+    reason: string,
+    evidence: Record<string, unknown> = {},
+  ): Decision<RunRow> {
+    return this.#transition(runId, RunState.BLOCKED, reason, evidence, undefined, roleKey);
+  }
+
+  #transition(
+    runId: string,
+    to: RunState,
+    reason: string,
+    evidence: Record<string, unknown>,
+    authority: CompletionAuthority | undefined,
+    continuityHold: string | null,
+  ): Decision<RunRow> {
     if (to === RunState.COMPLETED && !CompletionAuthorityToken.isValid(authority)) {
       return deny(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
@@ -794,12 +821,17 @@ export class RunEngine {
           return allow(ReasonCode.OK, undefined);
         },
         enqueueTransitionEnvelope: () => allow(ReasonCode.OK, undefined),
+        // Every edge rewrites the continuity hold: it is set only by continuity's own pause, and any
+        // other edge — out of BLOCKED above all — ends it in this same statement.
         updateState: () =>
           this.db.run(
             `UPDATE runs SET state = ?, state_reason = ?, ended_at = ?,
-                             revision_count = revision_count + ?
+                             revision_count = revision_count + ?, continuity_hold_role_key = ?
               WHERE run_id = ?`,
-            [to, reason, terminal ? this.clock.nowIso() : null, to === RunState.REVISION_REQUIRED ? 1 : 0, runId],
+            [
+              to, reason, terminal ? this.clock.nowIso() : null, to === RunState.REVISION_REQUIRED ? 1 : 0,
+              to === RunState.BLOCKED ? continuityHold : null, runId,
+            ],
           ),
       });
       void applied;
@@ -1229,7 +1261,163 @@ export class RunEngine {
     if (run.kind === RunKind.PROJECT_BOOTSTRAP) return roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId });
     return run.projectId ? roleKeyFor(Role.PRIMARY_CTO, { projectId: run.projectId }) : null;
   }
+
+  /**
+   * #246 C1b — the last step of a bootstrap CTO's same-session recovery, taken only after the
+   * renewed binding's runtime received its rotated credential and attested over an authenticated
+   * connection. In one transaction the owner pin moves from the revoked generation to `renewed`;
+   * what else happens is decided by the hold the run is in, never by the recovery (review
+   * ACP-C1B-02, -03):
+   *
+   * - BLOCKED under continuity's own hold (`pauseForContinuity`), whichever of the run's roles it
+   *   lost: the pause is released — BLOCKED → ACTIVE, the hold cleared, and RUN_DISPATCH enqueued
+   *   for the new generation in this dispatch cycle. The pause was continuity's answer to lost
+   *   coverage, and a recovery runs only from its restore pass once the fixed runtime covers the
+   *   role again; the renewed CTO decides what any other role it lost needs (a fresh worker, say).
+   * - BLOCKED for anything else (a CEO decision), REVISION_REQUIRED or AWAITING_HUMAN: only the
+   *   owner's authority comes back. The run keeps its state and its reason, nothing is dispatched,
+   *   and whoever releases that hold — the CEO's resolution, a redispatch — reaches the renewed
+   *   generation.
+   *
+   * Refused, with nothing written, unless the run is the project-less bootstrap pinned to exactly
+   * `fromGeneration` of the same session and `renewed` is still its role's active binding. A
+   * terminal run is never touched here, and no other live state is either.
+   */
+  restoreRecoveredBootstrapOwner(
+    runId: string,
+    renewed: RoleBinding,
+    fromGeneration: number,
+  ): Decision<{ run: RunRow; resumed: boolean }> {
+    return this.db.txDecision(() => {
+      const run = this.get(runId);
+      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+      if (run.kind !== RunKind.PROJECT_BOOTSTRAP || run.projectId !== null) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "only a project-less bootstrap run recovers its bootstrap CTO", { runId });
+      }
+      if (!RECOVERABLE_BOOTSTRAP_STATES.includes(run.state)) {
+        return deny(
+          isTerminal(run.state) ? ReasonCode.RUN_ALREADY_TERMINAL : ReasonCode.RUN_TRANSITION_ILLEGAL,
+          `a ${run.state} run's bootstrap CTO is not recovered`,
+          { runId, state: run.state },
+        );
+      }
+      if (
+        run.ownerRoleKey !== renewed.roleKey ||
+        run.ownerBindingGeneration !== fromGeneration ||
+        run.ownerSessionId !== renewed.boundSessionId ||
+        run.ownerSessionIncarnation !== renewed.boundSessionIncarnation
+      ) {
+        return deny(ReasonCode.RUN_OWNER_REVOKED, "the run is not pinned to the generation this recovery renewed", {
+          runId,
+          pinnedGeneration: run.ownerBindingGeneration,
+          fromGeneration,
+        });
+      }
+      const current = this.db.get<{ assignment_id: string; binding_generation: number }>(
+        `SELECT assignment_id, binding_generation FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+        [renewed.roleKey],
+      );
+      if (current?.assignment_id !== renewed.assignmentId || current.binding_generation !== renewed.bindingGeneration) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "the renewed binding is no longer the role's active one", {
+          runId,
+          renewedGeneration: renewed.bindingGeneration,
+          currentGeneration: current?.binding_generation ?? null,
+        });
+      }
+      const pin = [
+        renewed.boundSessionId, renewed.bindingGeneration, renewed.boundSessionIncarnation, renewed.roleKey,
+      ];
+      const resumes = run.state === RunState.BLOCKED && (run.continuityHoldRoleKey ?? null) !== null;
+      if (resumes) {
+        const transition = canTransition(run.state, RunState.ACTIVE, run.kind);
+        if (!transition.allowed) return transition as Decision<{ run: RunRow; resumed: boolean }>;
+        this.db.applyRunStateTransition(this.#stateTransitions, {
+          runId,
+          toState: RunState.ACTIVE,
+          recordTransitionEvidence: () => {
+            this.audit.record({
+              kind: "RUN_TRANSITION",
+              runId,
+              sessionId: renewed.boundSessionId,
+              roleKey: renewed.roleKey,
+              evidence: {
+                from: run.state,
+                to: RunState.ACTIVE,
+                reason: "bootstrap CTO recovered on its own session",
+                fromGeneration,
+                toGeneration: renewed.bindingGeneration,
+              },
+            });
+            return allow(ReasonCode.OK, undefined);
+          },
+          enqueueTransitionEnvelope: () => {
+            const enqueued = this.outbox.enqueue({
+              idempotencyKey: dispatchIdempotencyKey(runId, renewed.bindingGeneration, run.revisionCount),
+              roleKey: renewed.roleKey,
+              bindingGeneration: renewed.bindingGeneration,
+              targetSessionId: renewed.sessionId,
+              runId,
+              kind: MessageKind.RUN_DISPATCH,
+              payload: {
+                runId,
+                goal: run.goal,
+                executionMode: run.executionMode,
+                priority: run.priority,
+                contractDigest: run.contractDigest,
+                pinnedManifestDigest: run.pinnedManifestDigest,
+                resumedAfterRecovery: true,
+              },
+            });
+            return enqueued.allowed ? allow(ReasonCode.OK, undefined) : (enqueued as Decision<unknown>);
+          },
+          updateState: () =>
+            this.db.run(
+              `UPDATE runs SET state = 'ACTIVE', state_reason = ?, continuity_hold_role_key = NULL,
+                               owner_session_id = ?, owner_binding_generation = ?,
+                               owner_session_incarnation = ?, owner_role_key = ?
+                WHERE run_id = ?`,
+              ["bootstrap CTO recovered", ...pin, runId],
+            ),
+        });
+      } else {
+        // The run's own hold stands; only who holds the run's authority changes.
+        this.db.run(
+          `UPDATE runs SET owner_session_id = ?, owner_binding_generation = ?,
+                           owner_session_incarnation = ?, owner_role_key = ?
+            WHERE run_id = ?`,
+          [...pin, runId],
+        );
+        this.audit.record({
+          kind: "RUN_OWNER_RENEWED",
+          runId,
+          sessionId: renewed.boundSessionId,
+          roleKey: renewed.roleKey,
+          evidence: {
+            state: run.state,
+            reason: run.stateReason,
+            fromGeneration,
+            toGeneration: renewed.bindingGeneration,
+          },
+        });
+      }
+      // Work a previous generation started is fenced to it, as a takeover fences it.
+      this.tasks.abandonStaleExecutions(runId, renewed.bindingGeneration, "bootstrap CTO recovered at a new generation");
+      return allow(ReasonCode.OK, { run: this.require(runId), resumed: resumes });
+    });
+  }
 }
+
+/**
+ * #246 C1b — the live states a bootstrap run can be in while its CTO is recovered: continuity's own
+ * pause (BLOCKED), a hold someone else placed (BLOCKED for a CEO decision, AWAITING_HUMAN), and a
+ * run waiting to be dispatched again (REVISION_REQUIRED). No other state has a revoked owner that
+ * continuity is waiting to give back.
+ */
+const RECOVERABLE_BOOTSTRAP_STATES: readonly RunState[] = Object.freeze([
+  RunState.BLOCKED,
+  RunState.REVISION_REQUIRED,
+  RunState.AWAITING_HUMAN,
+]);
 
 interface RawRun {
   run_id: string;
@@ -1252,6 +1440,8 @@ interface RawRun {
   dispatched_at: string | null;
   ended_at: string | null;
   state_reason: string | null;
+  /** Absent only on a database older than v42. */
+  continuity_hold_role_key?: string | null;
 }
 
 const hydrate = (row: RawRun): RunRow => ({
@@ -1274,4 +1464,17 @@ const hydrate = (row: RawRun): RunRow => ({
   dispatchedAt: row.dispatched_at,
   endedAt: row.ended_at,
   stateReason: row.state_reason,
+  continuityHoldRoleKey: row.continuity_hold_role_key ?? null,
 });
+
+/**
+ * #246 C1b (review ACP-C1B-04) — the idempotency key of a dispatch: one per binding generation and
+ * per dispatch cycle. A run sent back for revision is dispatched again, possibly to the same
+ * generation, and that is a new dispatch, not a replay of the first: each revision is its own cycle,
+ * numbered by `revision_count`. The first cycle keeps the key every dispatch had before, so a retry
+ * inside any cycle is still one envelope (CP-S58), and nothing already queued changes meaning.
+ */
+export const dispatchIdempotencyKey = (runId: string, bindingGeneration: number, revisionCount: number): string =>
+  revisionCount === 0
+    ? `run-dispatch:${runId}:${bindingGeneration}`
+    : `run-dispatch:${runId}:${bindingGeneration}:r${revisionCount}`;

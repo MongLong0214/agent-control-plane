@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 41;
+export const SCHEMA_VERSION = 42;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -139,6 +139,13 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- -{75}\n-- worker session independence[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_owner_session_not_its_worker[\s\S]*?\nEND;/,
   // v41 alone installs the worker-process record guards (#1070): they name columns v41 adds.
   /-- -{75}\n-- worker process record[\s\S]*?CREATE TRIGGER IF NOT EXISTS task_executions_outstanding_process_no_delete[\s\S]*?\nEND;/,
+  // v42 alone installs the credential-epoch guards (#246 C1b): they name the column v42 adds. The
+  // rewritten `sessions_secret_hash_immutable` is not here: every image older than v42 already has
+  // that trigger under its earlier body, so the replay's IF NOT EXISTS leaves it, and v42 replaces it.
+  /-- CP-HI-02 — #246 C1b \(schema v42\): the credential epoch is what an authenticated connection is fenced by[\s\S]*?CREATE TRIGGER IF NOT EXISTS sessions_credential_epoch_rotation[\s\S]*?\nEND;/,
+  /-- CP-HI-02 — #246 C1b \(schema v42\): a session row begins at epoch 0[\s\S]*?CREATE TRIGGER IF NOT EXISTS sessions_credential_epoch_starts_at_zero[\s\S]*?\nEND;/,
+  // v42 alone installs the continuity-hold guards (#246 C1b, review ACP-C1B-02): they name the column it adds.
+  /-- CP-HI-02 — #246 C1b \(schema v42\): which hold continuity placed is daemon authority[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_continuity_hold_not_inserted[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -2991,6 +2998,98 @@ const v41: SchemaMigration = {
   checksum: () => migrationChecksum("v41-runtime-managed-worker-turns", SCHEMA_VERSION),
 };
 
+/**
+ * v42's guards, read from schema.sql by name: the rewritten secret-hash guard, which now admits one
+ * replacement — a rotation — the two that keep the credential epoch a count of rotations, and the
+ * three that keep a run's continuity hold continuity's own.
+ */
+const V42_TRIGGER_NAMES: readonly string[] = [
+  "sessions_secret_hash_immutable",
+  "sessions_credential_epoch_rotation",
+  "sessions_credential_epoch_starts_at_zero",
+  "runs_continuity_hold_authority",
+  "runs_continuity_hold_only_while_blocked",
+  "runs_continuity_hold_not_inserted",
+];
+
+/** v42's added columns, each with the shape schema.sql declares for it. */
+const V42_COLUMNS: ReadonlyArray<{
+  table: string;
+  name: string;
+  type: string;
+  notnull: number;
+  defaultValue: string | null;
+  /** Rows a database may already hold under this column without anything here having written them. */
+  unvouched: string;
+}> = [
+  { table: "sessions", name: "credential_epoch", type: "INTEGER", notnull: 1, defaultValue: "0", unvouched: "credential_epoch <> 0" },
+  { table: "runs", name: "continuity_hold_role_key", type: "TEXT", notnull: 0, defaultValue: null, unvouched: "continuity_hold_role_key IS NOT NULL" },
+];
+
+/**
+ * #246 C1b. A run's BOOTSTRAP_CTO that continuity revoked during a Claude outage is recovered on its
+ * own session — the same row, incarnation, actor and conversation — and must not come back holding
+ * the credential the daemon lost or that a connection opened before the outage still holds. So its
+ * credential is rotated in place, and the database says what a rotation is.
+ *
+ * `sessions.credential_epoch` counts a row's rotations from 0. The secret-hash guard keeps its name
+ * and sentinel and keeps refusing every change of the hash but one: the same statement moving the
+ * epoch up by exactly one, with a different non-null hash, on a READY row whose session id and
+ * incarnation do not change. Two new guards keep the epoch honest: it moves only as that rotation,
+ * and a row is inserted at 0. `sessions_incarnation_immutable` is unchanged and still absolute — a
+ * rotation keeps the incarnation, so nothing here needed it weakened. A connection records the epoch
+ * it authenticated at, and the transport refuses its next request once the epoch has moved.
+ *
+ * And which hold continuity placed (review ACP-C1B-02). A run BLOCKED because continuity lost its
+ * owner and a run BLOCKED for a CEO decision were the same row; a recovery that resumed every BLOCKED
+ * bootstrap run cleared the CEO's decision. `runs.continuity_hold_role_key` names the role continuity
+ * paused the run for, written only in the statement that moves the run's state and under that
+ * transition's own authority, present only while the run is BLOCKED, never at insert. A recovery
+ * resumes only a run it names; any other hold is kept, and only the owner's authority comes back.
+ *
+ * Additive: two nullable-or-defaulted columns — every existing session starts at epoch 0, the epoch
+ * of a credential never rotated, and every existing run holds nothing — one trigger rewritten and
+ * five added. A chain test can build a v41 image out of a current database, which already has the
+ * columns; each is accepted only with schema.sql's exact shape and no value this step did not write,
+ * and the triggers are dropped and recreated, as v41 does for its own. A run continuity paused before
+ * v42 carries no hold, so its bootstrap CTO's recovery restores authority without resuming it.
+ *
+ * A live database at v41 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v42: SchemaMigration = {
+  id: "v42-session-credential-epoch",
+  fromVersion: 41,
+  toVersion: 42,
+  apply: (raw) => {
+    for (const column of V42_COLUMNS) {
+      const existing = (raw.pragma(`table_xinfo(${column.table})`) as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        dflt_value: string | null;
+      }>).find((present) => present.name === column.name);
+      if (existing !== undefined) {
+        if (existing.type.toUpperCase() !== column.type || existing.notnull !== column.notnull
+            || existing.dflt_value !== column.defaultValue
+            || raw.prepare(`SELECT 1 FROM ${column.table} WHERE ${column.unvouched} LIMIT 1`).get()) {
+          throw new Error(`v42 pre-existing ${column.table}.${column.name} does not match the current schema or is populated`);
+        }
+        continue;
+      }
+      const definition = schemaObject(
+        new RegExp(`^\\s*${column.name}\\s+${column.type}\\b[^\\n]*?(?=,\\n)`, "m"),
+        `the ${column.table}.${column.name} column`,
+        SCHEMA_VERSION,
+      ).trim();
+      raw.exec(`ALTER TABLE ${column.table} ADD COLUMN ${definition}`);
+    }
+    raw.exec(dropsFor(V42_TRIGGER_NAMES));
+    raw.exec(triggerDdlFor(V42_TRIGGER_NAMES, SCHEMA_VERSION));
+  },
+  checksum: () => migrationChecksum("v42-session-credential-epoch", SCHEMA_VERSION),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -3022,6 +3121,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v39,
   v40,
   v41,
+  v42,
 ]);
 
 interface RequiredTrigger {
@@ -3058,6 +3158,11 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "manifests_immutable", sentinel: "MANIFEST_IMMUTABLE" },
   { name: "sessions_incarnation_immutable", sentinel: "SESSION_INCARNATION_IMMUTABLE" },
   { name: "sessions_secret_hash_immutable", sentinel: "SESSION_SECRET_HASH_IMMUTABLE" },
+  { name: "sessions_credential_epoch_rotation", sentinel: "SESSION_CREDENTIAL_EPOCH_INVALID", introducedIn: 42 },
+  { name: "sessions_credential_epoch_starts_at_zero", sentinel: "SESSION_CREDENTIAL_EPOCH_INVALID", introducedIn: 42 },
+  { name: "runs_continuity_hold_authority", sentinel: "RUN_CONTINUITY_HOLD_DENIED", introducedIn: 42 },
+  { name: "runs_continuity_hold_only_while_blocked", sentinel: "RUN_CONTINUITY_HOLD_DENIED", introducedIn: 42 },
+  { name: "runs_continuity_hold_not_inserted", sentinel: "RUN_CONTINUITY_HOLD_DENIED", introducedIn: 42 },
   { name: "sessions_buzz_actor_immutable", sentinel: "SESSION_BUZZ_ACTOR_IMMUTABLE" },
   { name: "conversational_actors_retirement_terminal", sentinel: "ACTOR_RETIREMENT_TERMINAL", introducedIn: 18 },
   { name: "conversational_actors_runtime_ready", sentinel: "ACTOR_RUNTIME_NOT_READY", introducedIn: 18 },

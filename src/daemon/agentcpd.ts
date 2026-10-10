@@ -123,6 +123,7 @@ import {
 } from "../ingress/telegram-external.ts";
 import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
+import { ProvisionedSessionRuntime } from "../runtime/provisioned-session-runtime.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
@@ -318,9 +319,31 @@ export const startDaemonMcpListeners = async (
   // the same port a role-addressed Buzz message wakes it through. Then one pass for rows that were
   // queued while no port existed (before a restart, or before these listeners opened); the
   // daemon's delivery tick repeats it, at most once per row per window.
-  cp.outbox.attachInBandWake((roleKey) => listeners.ctoConversation.wake(roleKey));
+  cp.outbox.attachInBandWake((roleKey, messageIds) => wakeRoleHolder(cp, listeners.ctoConversation, roleKey, {
+    kind: "in-band dispatch",
+    ids: messageIds ?? [],
+  }));
   void cp.outbox.wakeInBandPending();
   return listeners;
+};
+
+/**
+ * #246 C1b — one wake, routed by who holds the role now: a provisioned session's headless runtime
+ * runs (or coalesces) a turn of its conversation; anyone else is knocked on through the conversation
+ * port as before. A wake names what it is for, so the runtime can refuse one it already ran; a wake
+ * that names nothing (an owner message arrives as a role wake) is its own trigger.
+ */
+export const wakeRoleHolder = async (
+  cp: Pick<ControlPlane, "bindings" | "sessionRuntime">,
+  conversation: Pick<RoleConversationPort, "wake">,
+  roleKey: string,
+  cause: { kind: string; ids: readonly string[] },
+): Promise<Decision<void>> => {
+  const holder = cp.bindings.active(roleKey);
+  if (!holder || !ProvisionedSessionRuntime.drives(holder.role)) return conversation.wake(roleKey);
+  const ids = cause.ids.length > 0 ? cause.ids : [`${cause.kind}:${randomUUID()}`];
+  const woke = cp.sessionRuntime.wake(roleKey, ids.map((id) => ({ id, kind: cause.kind })));
+  return woke.allowed ? allow(ReasonCode.OK, undefined) : (woke as Decision<void>);
 };
 
 /** Tests shorten the deadline without weakening the daemon's production default. */
@@ -338,7 +361,22 @@ export interface LocalSessionLaunchChannel {
   socketPath: string;
   prepare(): Promise<Decision<void>>;
   provision(input: SessionLaunchCredential): Promise<Decision<void>>;
+  /**
+   * #246 C1b — removes a credential still waiting for its runtime. True when one was there to
+   * remove: the runtime never took it. False when none was: it was taken, or never offered.
+   */
+  withdraw(externalSessionId: string): boolean;
   close(): Promise<void>;
+}
+
+/** What a launch channel hands a runtime besides its session credential. */
+export interface SessionLaunchChannelOptions {
+  /**
+   * #246 C1b — the deployment's MCP socket gate (`ACP_MCP_TOKEN`), handed with the credential so
+   * a provisioned session's relay can present both on `cto.mcp.sock` without either reaching its
+   * argv or environment. Omitted, a reply carries the credential alone, as before.
+   */
+  mcpToken?: string;
 }
 
 /** A daemon-owned local hop from the authenticated Buzz relay to SessionRegistry. */
@@ -428,7 +466,10 @@ interface PendingLaunchCredential {
  * key. The channel lives on an owner-only socket, retains no credential durably, and deletes
  * an entry before replying, so a runtime can obtain its MCP proof exactly once.
  */
-export const startSessionLaunchChannel = async (stateDir: string): Promise<LocalSessionLaunchChannel> => {
+export const startSessionLaunchChannel = async (
+  stateDir: string,
+  options: SessionLaunchChannelOptions = {},
+): Promise<LocalSessionLaunchChannel> => {
   const socketPath = join(stateDir, "cto.launch.sock");
   const pending = new Map<string, PendingLaunchCredential>();
   let server: Server | null = null;
@@ -457,7 +498,7 @@ export const startSessionLaunchChannel = async (stateDir: string): Promise<Local
         // under the daemon lock. A losing daemon can therefore never unlink the winner's
         // live launch socket while it is merely attempting startup.
         removeStaleSocket(socketPath);
-        candidate = createServer((socket) => serveSessionLaunchCredential(socket, pending));
+        candidate = createServer((socket) => serveSessionLaunchCredential(socket, pending, options.mcpToken));
         await listenSocket(candidate, socketPath);
         if (closed) {
           await closeSocketServer(candidate);
@@ -504,6 +545,7 @@ export const startSessionLaunchChannel = async (stateDir: string): Promise<Local
       });
       return allow(ReasonCode.OK, undefined);
     },
+    withdraw: (externalSessionId) => pending.delete(externalSessionId),
     close: async () => {
       if (closing) return closing;
       closed = true;
@@ -633,7 +675,11 @@ export const startLocalMcpListeners = async (
     const server = createCtoServer(
       ctoPort,
       auth,
-      opening.kind === "PENDING_HANDOFF_ACK" ? { pendingHandoffId: opening.handoffId } : undefined,
+      opening.kind === "PENDING_HANDOFF_ACK"
+        ? { pendingHandoffId: opening.handoffId }
+        : opening.kind === "PENDING_ATTESTATION"
+          ? { attestationOnly: true }
+          : undefined,
     );
     // The line the CEO socket has had and this one did not. The binding the connection was
     // admitted under is what the port keys and verifies on: this socket also admits
@@ -733,8 +779,14 @@ export const startLocalMcpListeners = async (
       handshakeTimeoutMs,
       (auth, opening, credential) =>
         ctoServer(auth, opening, () =>
-          conversationPeerAuthenticator(cp, credential, opening.sessionIncarnation, ctoConversation.role)),
-      true,
+          conversationPeerAuthenticator(
+            cp,
+            credential,
+            opening.sessionIncarnation,
+            opening.credentialEpoch,
+            ctoConversation.role,
+          )),
+      { pendingHandoffAck: true, pendingAttestation: true },
       options.attachments ? { authority: options.attachments, port: ctoConversation } : undefined,
     );
   } catch (err) {
@@ -783,7 +835,12 @@ export const startLocalMcpListeners = async (
         }
         const server = ctoServer(
           () => admission.authenticate(admitted),
-          { kind: "BOUND", binding, sessionIncarnation: admitted.sessionIncarnation },
+          {
+            kind: "BOUND",
+            binding,
+            sessionIncarnation: admitted.sessionIncarnation,
+            credentialEpoch: cp.sessions.get(binding.sessionId)?.credentialEpoch ?? 0,
+          },
           () => () => admission.connection(admitted),
         );
         void server.connect(new SocketTransport(socket, Buffer.alloc(0))).catch((err: unknown) => {
@@ -1250,7 +1307,7 @@ export const startBuzzMessageIngressListener = async (
     },
     wakeRole: async (roleKey) =>
       roleConversation
-        ? await roleConversation.wake(roleKey)
+        ? await wakeRoleHolder(cp, roleConversation, roleKey, { kind: "owner message", ids: [] })
         : deny(ReasonCode.ROLE_PEER_ABSENT, "no role conversation listener is configured", {
             roleKey,
           }),
@@ -2379,7 +2436,7 @@ const startMcpSocket = async (
     opening: BoundSocketPeer,
     credential: PeerCredential,
   ) => ReturnType<typeof createHermesServer>,
-  permitPendingHandoffAck = false,
+  admission: UnboundPeerAdmission = {},
   attachments?: { authority: RoleAttachmentCredentials; port: RoleConversationPort },
 ): Promise<Server> => {
   removeStaleSocket(path);
@@ -2416,7 +2473,7 @@ const startMcpSocket = async (
       }
       // One server per authenticated connection: the peer identity belongs to the
       // transport, so it can never be re-declared by a tool argument (§21, §27.3).
-      const opening = authenticateSocketPeer(cp, accepted.credential, expectedRoles, permitPendingHandoffAck);
+      const opening = authenticateSocketPeer(cp, accepted.credential, expectedRoles, admission);
       if (!opening.allowed) {
         endWithDecision(socket, opening);
         return;
@@ -2663,6 +2720,7 @@ const authenticateOperatorPeer = (
 const serveSessionLaunchCredential = (
   socket: Socket,
   pending: Map<string, PendingLaunchCredential>,
+  mcpToken: string | undefined,
 ): void => {
   let buffer = Buffer.alloc(0);
   let settled = false;
@@ -2701,6 +2759,7 @@ const serveSessionLaunchCredential = (
       sessionId: launch.credential.sessionId,
       sessionIncarnation: launch.credential.sessionIncarnation,
       sessionSecret: launch.credential.sessionSecret,
+      ...(mcpToken === undefined ? {} : { token: mcpToken }),
     });
   };
   socket.on("data", receive);
@@ -3012,17 +3071,37 @@ interface ActiveBoundSocketPeer {
   kind: "BOUND";
   binding: RoleBinding;
   sessionIncarnation: string;
+  /** The credential epoch this connection authenticated at; a rotation since refuses it (#246 C1b). */
+  credentialEpoch: number;
 }
 
-/** The sole unbound peer shape: a recipient of one current normal handoff. */
+/** An unbound peer shape: a recipient of one current normal handoff. */
 interface PendingHandoffSocketPeer {
   kind: "PENDING_HANDOFF_ACK";
   handoffId: string;
   sessionIncarnation: string;
   fromGeneration: number;
+  credentialEpoch: number;
 }
 
-type BoundSocketPeer = ActiveBoundSocketPeer | PendingHandoffSocketPeer;
+/**
+ * #246 C1b — the other unbound peer shape: a provisioned session the runtime driver asked to attest,
+ * which may answer that challenge (`session_attest`) and nothing else. A spawn attests before it is
+ * READY or bound, so a STARTING session is admitted here and nowhere else.
+ */
+interface PendingAttestationSocketPeer {
+  kind: "PENDING_ATTESTATION";
+  sessionIncarnation: string;
+  credentialEpoch: number;
+}
+
+type BoundSocketPeer = ActiveBoundSocketPeer | PendingHandoffSocketPeer | PendingAttestationSocketPeer;
+
+/** Which unbound peers a socket admits besides its bound role holders. */
+interface UnboundPeerAdmission {
+  pendingHandoffAck?: boolean;
+  pendingAttestation?: boolean;
+}
 
 interface PendingNormalHandoff {
   handoffId: string;
@@ -3037,10 +3116,23 @@ const authenticateSocketPeer = (
   cp: ControlPlane,
   credential: PeerCredential,
   expectedRoles: readonly Role[],
-  permitPendingHandoffAck = false,
+  admission: UnboundPeerAdmission = {},
 ): Decision<BoundSocketPeer> => {
   const session = cp.sessions.verifySecret(credential.sessionId, credential.sessionSecret);
   if (!session.allowed) return session as Decision<BoundSocketPeer>;
+  const attesting = (): Decision<BoundSocketPeer> | null =>
+    admission.pendingAttestation &&
+    cp.sessionAttestations.isPending(credential.sessionId, session.value.incarnation, session.value.credentialEpoch)
+      ? allow(ReasonCode.OK, {
+          kind: "PENDING_ATTESTATION",
+          sessionIncarnation: session.value.incarnation,
+          credentialEpoch: session.value.credentialEpoch,
+        })
+      : null;
+  if (session.value.lifecycle === SessionLifecycle.STARTING) {
+    const admitted = attesting();
+    if (admitted) return admitted;
+  }
   if (
     session.value.lifecycle !== SessionLifecycle.READY &&
     session.value.lifecycle !== SessionLifecycle.DRAINING
@@ -3061,7 +3153,7 @@ const authenticateSocketPeer = (
       binding.sessionIncarnation === session.value.incarnation,
   );
   if (!candidate) {
-    if (permitPendingHandoffAck && session.value.lifecycle === SessionLifecycle.READY) {
+    if (admission.pendingHandoffAck && session.value.lifecycle === SessionLifecycle.READY) {
       const pending = currentPendingNormalHandoff(cp, credential.sessionId);
       if (pending.allowed) {
         return allow(ReasonCode.OK, {
@@ -3069,8 +3161,13 @@ const authenticateSocketPeer = (
           handoffId: pending.value.handoffId,
           fromGeneration: pending.value.fromGeneration,
           sessionIncarnation: session.value.incarnation,
+          credentialEpoch: session.value.credentialEpoch,
         });
       }
+    }
+    if (session.value.lifecycle === SessionLifecycle.READY) {
+      const admitted = attesting();
+      if (admitted) return admitted;
     }
     return deny(ReasonCode.BINDING_GENERATION_STALE, "session does not hold this socket's current role", {
       sessionId: credential.sessionId,
@@ -3103,6 +3200,7 @@ const authenticateSocketPeer = (
     kind: "BOUND",
     binding: authenticated.value,
     sessionIncarnation: session.value.incarnation,
+    credentialEpoch: session.value.credentialEpoch,
   });
 };
 
@@ -3258,6 +3356,24 @@ const peerAuthenticator =
         current: session.value.incarnation,
       });
     }
+    // #246 C1b — a rotation ends the authority of every connection opened before it, at that
+    // connection's next request: the secret check above already fails for the replaced secret,
+    // and the epoch says so even of a connection whose secret somehow still verified.
+    if (session.value.credentialEpoch !== opening.credentialEpoch) {
+      return deny(ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE, "the session's credential was rotated since this connection authenticated", {
+        sessionId: credential.sessionId,
+        handshakeEpoch: opening.credentialEpoch,
+        currentEpoch: session.value.credentialEpoch,
+      });
+    }
+    if (opening.kind === "PENDING_ATTESTATION") {
+      if (!cp.sessionAttestations.isPending(credential.sessionId, session.value.incarnation, session.value.credentialEpoch)) {
+        return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "the attestation this connection was admitted for is no longer pending", {
+          sessionId: credential.sessionId,
+        });
+      }
+      return allow(ReasonCode.OK, authenticatedPeer(credential, opening.sessionIncarnation));
+    }
     if (opening.kind === "PENDING_HANDOFF_ACK") {
       if (session.value.lifecycle !== SessionLifecycle.READY) {
         return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "pending handoff recipient is not READY", {
@@ -3332,7 +3448,13 @@ const peerAuthenticator =
  * authority, and denying it here would silently drop delivery to a holder the registry still names.
  */
 const conversationPeerAuthenticator =
-  (cp: ControlPlane, credential: PeerCredential, sessionIncarnation: string, role: Role): McpPeerAuthenticator =>
+  (
+    cp: ControlPlane,
+    credential: PeerCredential,
+    sessionIncarnation: string,
+    credentialEpoch: number,
+    role: Role,
+  ): McpPeerAuthenticator =>
   () => {
     const session = cp.sessions.verifySecret(credential.sessionId, credential.sessionSecret);
     if (!session.allowed) return session as Decision<AuthenticatedMcpPeer>;
@@ -3341,6 +3463,13 @@ const conversationPeerAuthenticator =
         sessionId: credential.sessionId,
         handshake: sessionIncarnation,
         current: session.value.incarnation,
+      });
+    }
+    if (session.value.credentialEpoch !== credentialEpoch) {
+      return deny(ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE, "the session's credential was rotated since this connection authenticated", {
+        sessionId: credential.sessionId,
+        handshakeEpoch: credentialEpoch,
+        currentEpoch: session.value.credentialEpoch,
       });
     }
     if (!lifecyclePermitsBoundSocket(session.value.lifecycle, role)) {
@@ -4209,7 +4338,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
 
   let sessionLaunch: LocalSessionLaunchChannel;
   try {
-    sessionLaunch = await startSessionLaunchChannel(stateDir);
+    sessionLaunch = await startSessionLaunchChannel(stateDir, { mcpToken });
   } catch (err) {
     cp.close();
     throw err;
@@ -4505,6 +4634,14 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       process.stdout.write("canonical self-claim listener started\n");
     }
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
+    // #246 C1b — a provisioned session's turns reach the daemon only through these two sockets,
+    // so its runtime gets them once both are listening. Until then (the queued-run resume inside
+    // `daemon.start()` included) a bootstrap dispatch is refused SESSION_RUNTIME_UNAVAILABLE before
+    // any provider turn is spent, and its run stays QUEUED.
+    cp.sessionRuntime.attach({
+      delivery: sessionLaunch,
+      route: { launchSocketPath: sessionLaunch.socketPath, mcpSocketPath: join(stateDir, "cto.mcp.sock") },
+    });
     // #1037 — only where the canonical claim is configured: reattaching is that claim's sequel.
     if (canonicalSessions !== null) {
       // The same set, resolver and purpose the claim is given, so the room a reattach corrects a

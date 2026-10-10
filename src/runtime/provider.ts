@@ -218,6 +218,13 @@ export interface InvocationRequest {
    */
   externalSessionId?: string;
   /**
+   * #246 C1b — whether this invocation opens the conversation `externalSessionId` names
+   * (`--session-id`) or continues it (`--resume`). Stated by the caller, never inferred from
+   * whether a transcript happens to exist. Absent reads as "new", which is exactly what every
+   * caller that predates this field (blind review, worker) has always asked for.
+   */
+  conversation?: ConversationStep;
+  /**
    * #512 — called once, synchronously, as soon as the provider process exists: its pid and the OS
    * start time read from that process (null when the platform cannot report one). A runtime that
    * owns the invocation records both, so a restart can find this exact process and never mistake a
@@ -287,6 +294,50 @@ export interface InvocationResult {
    * invocation setting. Used only by adapters that can make this a measured fact.
    */
   effortAttested?: boolean;
+}
+
+/**
+ * #246 C1b — the first call of a provider conversation opens it under its constituted id; every
+ * later call (turns, probes, recovery) continues it. A CLI refuses to open an id whose transcript
+ * already exists in the same working directory, and continuing one that was never opened has
+ * nothing to continue, so the step is part of the request rather than a guess.
+ */
+export type ConversationStep = "new" | "resume";
+
+/**
+ * How a provisioned session's runtime reaches the daemon during a turn: the acp-cto relay, the
+ * only MCP server the turn is given. The relay takes the session credential from the daemon's
+ * take-once launch channel and presents it on the CTO MCP socket, so neither path carries it.
+ */
+export interface SessionRelayRoute {
+  /** The daemon's owner-only launch channel (`cto.launch.sock`). */
+  launchSocketPath: string;
+  /** The daemon's CTO MCP socket (`cto.mcp.sock`). */
+  mcpSocketPath: string;
+}
+
+/** One headless turn of a provisioned session's own conversation (#246 C1b). */
+export interface SessionTurnRequest {
+  /** The constituted session: its provider id, model and fixed workdir. */
+  handle: SessionHandle;
+  conversation: ConversationStep;
+  /** Sent over stdin, never argv. */
+  prompt: string;
+  timeoutMs: number;
+  correlationId: string;
+  /** Null for a turn that must reach nothing at all, such as a liveness probe. */
+  relay: SessionRelayRoute | null;
+}
+
+export interface SessionTurnResult {
+  /** The CLI exited 0, did not time out, reported no error, and answered as this conversation. */
+  ok: boolean;
+  text: string;
+  exitCode: number | null;
+  error: string | null;
+  /** The conversation id the provider reported, when it reported one. */
+  providerSessionId: string | null;
+  durationMs: number;
 }
 
 export interface SessionSpec {
@@ -439,6 +490,12 @@ export interface ProviderAdapter {
    */
   probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE">;
   probeCapacity(): Promise<CapacityReading>;
+  /**
+   * #246 C1b — one turn of a provisioned session's own conversation, with the acp-cto relay as
+   * its only MCP server. Optional: an adapter without it cannot host a provisioned CTO, and the
+   * runtime that drives such sessions refuses rather than standing something else in.
+   */
+  runSessionTurn?(request: SessionTurnRequest): Promise<SessionTurnResult>;
 }
 
 /**
@@ -550,6 +607,26 @@ class CapacityObservedAdapter implements ProviderAdapter {
 
   async probeCapacity(): Promise<CapacityReading> {
     return this.inner.probeCapacity();
+  }
+
+  /**
+   * Present exactly when the wrapped adapter has it, so "can this adapter host a provisioned
+   * session" reads the same through the registry as on the adapter itself. A failed turn is
+   * provider-failure evidence as a failed invocation is.
+   */
+  get runSessionTurn(): ProviderAdapter["runSessionTurn"] {
+    const inner = this.inner.runSessionTurn?.bind(this.inner);
+    if (!inner) return undefined;
+    return async (request: SessionTurnRequest): Promise<SessionTurnResult> => {
+      try {
+        const result = await inner(request);
+        if (!result.ok) await this.observe("PROVIDER_SWITCH_OR_FAILURE");
+        return result;
+      } catch (err) {
+        await this.observe("PROVIDER_SWITCH_OR_FAILURE");
+        throw err;
+      }
+    };
   }
 
   private async observe(trigger: RuntimeRefreshTrigger): Promise<void> {

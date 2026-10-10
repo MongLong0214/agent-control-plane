@@ -109,10 +109,26 @@ export const CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON =
 /** The prefix of the third such reason, whose tail is the refused failover's reason code. */
 export const CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX = "continuity failover refused: ";
 
+/**
+ * #246 C1b — the fourth: a bootstrap CTO's same-session recovery renewed the binding and then could
+ * not finish (delivery, attestation, or the run's resume refused). The renewed generation is revoked
+ * with this reason so the role stays owed to the next restore pass; the tail is the reason code.
+ */
+export const CONTINUITY_RECOVERY_REFUSED_REASON_PREFIX = "continuity recovery refused: ";
+
+/**
+ * #246 C1b — a provisioned session (a run's BOOTSTRAP_CTO) whose credential this daemon does not
+ * hold: a restart dropped it with the rest of the daemon's memory. Its runtime can run no turn and
+ * authenticate nothing, so the binding is revoked and the run paused, and the restore pass recovers
+ * the same session with a rotated credential.
+ */
+export const CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON = "the provisioned runtime's credential is not held by this daemon";
+
 /** The exact reasons above, for the reader that has a `revoked_reason` and needs its origin. */
 export const CONTINUITY_REVOCATION_REASONS: readonly string[] = [
   CONTINUITY_COVERAGE_REVOCATION_REASON,
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
+  CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
 ];
 
 /**
@@ -121,7 +137,19 @@ export const CONTINUITY_REVOCATION_REASONS: readonly string[] = [
  */
 export const isContinuityRevocationReason = (reason: string | null): boolean =>
   reason !== null && (CONTINUITY_REVOCATION_REASONS.includes(reason) ||
-    reason.startsWith(CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX));
+    reason.startsWith(CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX) ||
+    reason.startsWith(CONTINUITY_RECOVERY_REFUSED_REASON_PREFIX));
+
+/**
+ * #246 C1b — how a revoked bootstrap CTO gets its authority back: the same session, a rotated
+ * credential, an authenticated attestation, and only then its run. Attached by the composition
+ * root (`BootstrapCtoStaffing`); continuity calls it from `restore()` and from nowhere else.
+ */
+export interface BootstrapCtoRecoveryPort {
+  recover(roleKey: string): Promise<Decision<unknown>>;
+  /** Whether a recent failed recovery of this role is still in its backoff window. */
+  backingOff(roleKey: string): boolean;
+}
 
 /** Preferred normal binding (§15.1) in priority order per capability. */
 const PREFERENCE: Readonly<Record<string, readonly string[]>> = {
@@ -141,6 +169,7 @@ const PREFERENCE: Readonly<Record<string, readonly string[]>> = {
 export class ContinuityKernel {
   #readiness: { checkSession(sessionId: string): Promise<Decision<void>> } | null = null;
   #buzz: { connect(sessionId: string, purpose: string): Promise<Decision<string>> } | null = null;
+  #bootstrapRecovery: BootstrapCtoRecoveryPort | null = null;
 
   /**
    * §15.7 requires the new session to be READY *before* the switch. Without a readiness
@@ -150,9 +179,11 @@ export class ContinuityKernel {
   attach(ports: {
     readiness?: { checkSession(sessionId: string): Promise<Decision<void>> };
     buzz?: { connect(sessionId: string, purpose: string): Promise<Decision<string>> };
+    bootstrapRecovery?: BootstrapCtoRecoveryPort;
   }): void {
     if (ports.readiness) this.#readiness = ports.readiness;
     if (ports.buzz) this.#buzz = ports.buzz;
+    if (ports.bootstrapRecovery) this.#bootstrapRecovery = ports.bootstrapRecovery;
   }
 
   constructor(
@@ -528,6 +559,10 @@ export class ContinuityKernel {
     scope: { projectId?: string | null; runId?: string | null; taskId?: string | null },
     reason: string,
   ): Promise<Decision<{ provider: string; generation: number }>> {
+    // #246 C1-02 — a run's bootstrap CTO is never replaced by another session: a replacement would
+    // be a new conversation with no credential its runtime could present. Owner loss revokes and
+    // pauses instead (the daemon's refusal path), and `restore()` recovers the same session.
+    if (role === Role.BOOTSTRAP_CTO) return bootstrapCtoNotReplaceable(roleKey);
     const plan = await this.evaluate(`failover:${roleKey}`);
     const assignment = plan.assignments.find((a) => a.roleKey === roleKey);
     const required = plan.requiredRoles.find((candidate) => candidate.roleKey === roleKey);
@@ -723,6 +758,17 @@ export class ContinuityKernel {
     // Read coverage after bound-role provisioning: its probe may have contradicted the first plan.
     // A role no provider can staff remains in `uncovered` and is not awaiting a claim.
     for (const assignment of this.claimNeedsFromCurrentCoverage()) {
+      // #246 C1b — a bootstrap CTO is owed no claim: nothing can claim it. Its own session is
+      // recovered here, when its fixed runtime covers it again, and only by the recovery port —
+      // capacity, a `--resume` probe, a rotated credential delivered and attested, then its run.
+      if (assignment.role === Role.BOOTSTRAP_CTO) {
+        const recovered = this.#bootstrapRecovery
+          ? await this.#bootstrapRecovery.recover(assignment.roleKey)
+          : deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "no bootstrap CTO recovery is attached", {});
+        if (recovered.allowed) restored.push(assignment.roleKey);
+        else deferred.push({ roleKey: assignment.roleKey, reasonCode: recovered.reasonCode });
+        continue;
+      }
       deferred.push({ roleKey: assignment.roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
       if (!this.recordRestorationAwaitsClaim(assignment.roleKey, assignment.provider)) alreadyRecorded += 1;
     }
@@ -759,6 +805,9 @@ export class ContinuityKernel {
    * meaning could drift from the record it is supposed to be about.
    */
   restorationNeedRecorded(roleKey: string): boolean {
+    // #246 C1b — a bootstrap CTO's need is its recovery, and a recovery that just failed has
+    // nothing to gain from another pass before its backoff ends.
+    if (this.#bootstrapRecovery?.backingOff(roleKey) === true) return true;
     return this.db.get<{ one: number }>(
       `SELECT 1 AS one FROM audit_events
         WHERE kind = 'CONTINUITY_RESTORE_AWAITS_CLAIM' AND role_key = ?
@@ -789,6 +838,8 @@ export class ContinuityKernel {
   recordClaimNeeds(): Array<{ roleKey: string; reasonCode: string }> {
     const recorded: Array<{ roleKey: string; reasonCode: string }> = [];
     for (const assignment of this.claimNeedsFromCurrentCoverage()) {
+      // A bootstrap CTO is recovered by `restore()`, never claimed; there is no claim need to record.
+      if (assignment.role === Role.BOOTSTRAP_CTO) continue;
       if (this.recordRestorationAwaitsClaim(assignment.roleKey, assignment.provider)) {
         recorded.push({ roleKey: assignment.roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
       }
@@ -796,11 +847,12 @@ export class ContinuityKernel {
     return recorded;
   }
 
-  private claimNeedsFromCurrentCoverage(): Array<{ roleKey: string; provider: string }> {
+  private claimNeedsFromCurrentCoverage(): Array<{ roleKey: string; role: Role; provider: string }> {
     const plan = this.computeCoveragePlan();
     return plan.restorationPending.flatMap((roleKey) => {
       const provider = plan.assignments.find((assignment) => assignment.roleKey === roleKey)?.provider;
-      return provider ? [{ roleKey, provider }] : [];
+      const role = plan.requiredRoles.find((required) => required.roleKey === roleKey)?.role;
+      return provider && role ? [{ roleKey, role, provider }] : [];
     });
   }
 
@@ -1076,6 +1128,7 @@ export class ContinuityKernel {
     // #246 — a role with a fixed runtime is constituted on exactly that provider and model, at
     // failover and at restoration alike. The plan never names another provider for it; this
     // refuses one that reached here anyway, before anything is started.
+    if (role === Role.BOOTSTRAP_CTO) return bootstrapCtoNotReplaceable(null);
     const fixed = FIXED_ROLE_RUNTIME[role];
     if (fixed && provider !== fixed.provider) {
       return deny(
@@ -1184,3 +1237,11 @@ export class ContinuityKernel {
     return "PAUSE_NEW_WORK";
   }
 }
+
+/** #246 C1-02 — continuity's one answer for a bootstrap CTO replacement: none is constituted. */
+const bootstrapCtoNotReplaceable = <T>(roleKey: string | null): Decision<T> =>
+  deny(
+    ReasonCode.BOOTSTRAP_CTO_NOT_REPLACEABLE,
+    "a run's bootstrap CTO is never replaced; its authority is revoked and its own session recovered",
+    { roleKey },
+  );

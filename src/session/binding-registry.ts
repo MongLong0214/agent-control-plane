@@ -698,6 +698,106 @@ export class BindingRegistry {
     });
   }
 
+  /**
+   * #246 C1b — the next generation of a revoked provisioned role, for the same actor on the same
+   * session and incarnation: the same conversation regaining its authority after an outage, with
+   * nothing about who it is changed. It is never a replacement (continuity refuses one for this
+   * role) and never a second holder: the role must have no active binding, its newest generation
+   * must be exactly `expectedGeneration`, revoked, on this session and incarnation, its actor must
+   * be live and still running there, and the session must be READY and hold nothing else
+   * (`assertExclusiveRoleSeparation`, as every bind asks).
+   *
+   * Callers run this in the transaction that rotates the session's credential, so the epoch, the
+   * secret and the generation move together. A run pinned to the revoked generation stays pinned to
+   * it: moving the owner pin is the run's own decision, taken only after the renewed holder proves
+   * itself (`RunEngine.resumeRecoveredBootstrap`).
+   */
+  renewSameSession(input: {
+    roleKey: string;
+    expectedGeneration: number;
+    sessionId: string;
+    sessionIncarnation: string;
+    reason: string;
+  }): Decision<RoleBinding> {
+    return this.db.txDecision(() => {
+      const refuse = (reasonCode: ReasonCode, message: string, evidence: Record<string, unknown> = {}): Decision<RoleBinding> =>
+        deny(reasonCode, message, { roleKey: input.roleKey, expectedGeneration: input.expectedGeneration, ...evidence });
+      if (this.active(input.roleKey)) return refuse(ReasonCode.BINDING_ALREADY_ACTIVE, "the role already has an active binding");
+      const latest = this.db.get<{
+        assignment_id: string; role: Role; project_id: string | null; run_id: string | null; task_id: string | null;
+        actor_id: string; session_id: string; session_incarnation: string; binding_generation: number;
+        status: string; mode: "PREFERRED" | "FALLBACK";
+      }>(
+        `SELECT assignment_id, role, project_id, run_id, task_id, actor_id, session_id, session_incarnation,
+                binding_generation, status, mode
+           FROM assignments WHERE role_key = ? ORDER BY binding_generation DESC LIMIT 1`,
+        [input.roleKey],
+      );
+      if (!latest) return refuse(ReasonCode.NOT_FOUND, "the role was never bound");
+      if (latest.role !== Role.BOOTSTRAP_CTO) {
+        return refuse(ReasonCode.CONFLICT, "only a provisioned bootstrap CTO renews its own generation", { role: latest.role });
+      }
+      if (
+        latest.status !== "REVOKED" ||
+        latest.binding_generation !== input.expectedGeneration ||
+        latest.session_id !== input.sessionId ||
+        latest.session_incarnation !== input.sessionIncarnation
+      ) {
+        return refuse(ReasonCode.BINDING_GENERATION_STALE, "the role's newest generation is not the revoked one named", {
+          currentGeneration: latest.binding_generation,
+          status: latest.status,
+        });
+      }
+      const actor = this.db.get<{ current_session_id: string; current_session_incarnation: string; retired_at: string | null }>(
+        `SELECT current_session_id, current_session_incarnation, retired_at FROM conversational_actors WHERE actor_id = ?`,
+        [latest.actor_id],
+      );
+      if (
+        !actor ||
+        actor.retired_at !== null ||
+        actor.current_session_id !== input.sessionId ||
+        actor.current_session_incarnation !== input.sessionIncarnation
+      ) {
+        return refuse(ReasonCode.CONFLICT, "the role's actor is retired or no longer runs on this session");
+      }
+      const session = this.sessions.get(input.sessionId);
+      if (!session || session.lifecycle !== SessionLifecycle.READY || session.incarnation !== input.sessionIncarnation) {
+        return refuse(ReasonCode.SESSION_NOT_READY, "the session is not the READY incarnation the role held", {
+          sessionId: input.sessionId,
+          lifecycle: session?.lifecycle ?? null,
+        });
+      }
+      const separated = this.assertExclusiveRoleSeparation(
+        { role: latest.role, sessionId: input.sessionId, projectId: latest.project_id, runId: latest.run_id, taskId: latest.task_id },
+        input.roleKey,
+        latest.actor_id,
+      );
+      if (!separated.allowed) return separated as Decision<RoleBinding>;
+      const generation = this.nextGeneration(input.roleKey);
+      this.db.run(
+        `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, task_id,
+                                  actor_id, session_id, session_incarnation, binding_generation,
+                                  mode, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
+        [
+          newAssignmentId(), input.roleKey, latest.role, latest.project_id, latest.run_id, latest.task_id,
+          latest.actor_id, input.sessionId, input.sessionIncarnation, generation, latest.mode, this.clock.nowIso(),
+        ],
+      );
+      this.audit.record({
+        kind: "BINDING_RENEWED",
+        roleKey: input.roleKey,
+        sessionId: input.sessionId,
+        runId: latest.run_id,
+        projectId: latest.project_id,
+        evidence: { reason: input.reason, fromGeneration: latest.binding_generation, toGeneration: generation },
+      });
+      const renewed = this.require(input.roleKey);
+      this.#notifySwitch(renewed);
+      return allow(ReasonCode.OK, renewed);
+    });
+  }
+
   #notifySwitch(binding: RoleBinding, movedActorId?: string): void {
     // Every currency-changing route (bind, both switchTo exits, revoke) publishes here.
     // Revocation keeps the scope identity but publishes status REVOKED so it also ends authority.
@@ -723,6 +823,13 @@ export class BindingRegistry {
     options: {
       allowBlockedRuns?: boolean;
       /**
+       * #246 C1b — also admit runs held for a revision or a human (REVISION_REQUIRED,
+       * AWAITING_HUMAN) besides BLOCKED: states in which the owner does no work until someone
+       * releases the hold. Only continuity's revocation of a provisioned session whose credential
+       * this daemon lost passes it, and that session's recovery gives the same owner back.
+       */
+      allowHeldRuns?: boolean;
+      /**
        * Leave this generation's queued, never-carried peer messages addressed to the outgoing
        * runtime PENDING instead of rejecting them (`Outbox.retargetOrReject`'s hold). Only the
        * canonical self-claim's dead-predecessor recovery passes it, and only because it binds the
@@ -738,9 +845,10 @@ export class BindingRegistry {
       const current = this.active(roleKey);
       if (!current) return deny(ReasonCode.NOT_FOUND, "no active binding", { roleKey });
       const ownedRuns = this.liveRunsOwnedBy(current);
-      const orphaned = options.allowBlockedRuns
-        ? ownedRuns.filter((run) => run.state !== "BLOCKED")
-        : ownedRuns;
+      const held: readonly string[] = options.allowHeldRuns
+        ? ["BLOCKED", "REVISION_REQUIRED", "AWAITING_HUMAN"]
+        : options.allowBlockedRuns ? ["BLOCKED"] : [];
+      const orphaned = ownedRuns.filter((run) => !held.includes(run.state));
       if (orphaned.length > 0) {
         return deny(
           ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,

@@ -33,8 +33,8 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   // The ordering is a `LIMIT 1` that picks which row is named in a v35 refusal message, so the
   // consequence of the tie is a person sent to the wrong nonce — real, and still not a reason to
   // edit a frozen input without the authority that froze it.
-  ["src/db/migrations.ts:2323", "ORDER BY received_at ASC"],
-  ["src/cto/cto-lifecycle.ts:892", "ORDER BY created_at DESC"],
+  ["src/db/migrations.ts:2330", "ORDER BY received_at ASC"],
+  ["src/cto/cto-lifecycle.ts:906", "ORDER BY created_at DESC"],
   // `currentPendingNormalHandoff` was here, re-keyed from 1956 to 1918 and due to move again. Four
   // changes in a row went red on it and none of them touched the query: the entry is keyed to a
   // line, so every edit above it moves it. Re-keying a fifth time fixes today's tree and not that,
@@ -43,5 +43,5 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   // tiebreaker changes no decision; what it removes is this file's claim on an unrelated edit.
   ["src/github/github-kernel.ts:3419", "ORDER BY created_at DESC"],
   ["src/github/github-kernel.ts:3845", "ORDER BY created_at"],
-  ["src/run/run-engine.ts:1169", "ORDER BY created_at"],
+  ["src/run/run-engine.ts:1201", "ORDER BY created_at"],
 ]);

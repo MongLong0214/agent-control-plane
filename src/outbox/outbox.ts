@@ -267,8 +267,12 @@ export const IN_BAND_KIND_SQL = [...IN_BAND_KINDS]
 /** A pending in-band row is woken for at most once per this window, per row. */
 export const IN_BAND_REWAKE_MS = 5 * 60 * 1000;
 
-/** Knocks on a role's registered wake endpoint; carries nothing (`RoleConversationPort.wake`). */
-export type InBandWake = (roleKey: string) => Promise<Decision<void>>;
+/**
+ * Knocks on a role's registered wake endpoint; carries nothing (`RoleConversationPort.wake`). The
+ * rows it is woken for are named so a provisioned runtime can refuse a wake it already ran a turn
+ * for (#246 C1b); a canonical CTO's wake port ignores them.
+ */
+export type InBandWake = (roleKey: string, messageIds?: readonly string[]) => Promise<Decision<void>>;
 
 /** What an adopted canonical CTO is shown of a row addressed to it in band. */
 export interface InBandDispatch {
@@ -286,7 +290,27 @@ export interface InBandDispatch {
  */
 const inBandRow = (outboxAlias: "o" | "outbox"): string =>
   `(${outboxAlias}.kind IN (${IN_BAND_KIND_SQL})
-    AND ${adoptedCanonicalRuntimeSql(`${outboxAlias}.target_session_id`)})`;
+    AND (${adoptedCanonicalRuntimeSql(`${outboxAlias}.target_session_id`)}
+      OR ${provisionedRuntimeSql(`${outboxAlias}.target_session_id`)}))`;
+
+/**
+ * #246 C1b — a provisioned session on the headless runtime: the current holder of an ACTIVE
+ * BOOTSTRAP_CTO binding. Like an adopted canonical CTO it has nothing a Buzz send could reach — it
+ * has no live process at all between turns — so its in-band kinds stay PENDING, the wake starts a
+ * turn of its own conversation, and that turn reads and settles them over its authenticated
+ * connection exactly as a canonical CTO does.
+ */
+const provisionedRuntimeSql = (sessionExpr: string): string => `EXISTS (
+  SELECT 1 FROM assignments prov_a
+    LEFT JOIN conversational_actors prov_c ON prov_c.actor_id = prov_a.actor_id
+   WHERE prov_a.role = 'BOOTSTRAP_CTO' AND prov_a.status = 'ACTIVE'
+     AND COALESCE(prov_c.current_session_id, prov_a.session_id) = ${sessionExpr}
+)`;
+
+/** `inBandRow`'s target half, as a read: an adopted canonical runtime or a provisioned one. */
+const receivesInBand = (db: Pick<Db, "get">, sessionId: string): boolean =>
+  isAdoptedCanonicalRuntime(db, sessionId) ||
+  db.get<{ held: number }>(`SELECT ${provisionedRuntimeSql("?")} AS held`, [sessionId])?.held === 1;
 
 /**
  * Which runtime holds a role *right now* — one notion of it, shared by every predicate below.
@@ -568,7 +592,7 @@ export class Outbox {
     // An in-band row is never transmitted, so the role is told it has something to read — after
     // the enclosing transaction commits, so a wake cannot reach the CTO before the row it points
     // at is visible, and a rollback discards it.
-    if (IN_BAND_KINDS.has(message.kind) && isAdoptedCanonicalRuntime(this.db, message.targetSessionId)) {
+    if (IN_BAND_KINDS.has(message.kind) && receivesInBand(this.db, message.targetSessionId)) {
       this.db.afterCommit(() => {
         void this.#wakeInBand([{ messageId: message.messageId, roleKey: message.roleKey }], "enqueue");
       });
@@ -1237,7 +1261,7 @@ export class Outbox {
 
   /** In-band, in `claimDeliverable`'s terms: an in-band kind addressed to a canonical runtime. */
   #isInBand(row: RawOutbox): boolean {
-    return IN_BAND_KINDS.has(row.kind as MessageKind) && isAdoptedCanonicalRuntime(this.db, row.target_session_id);
+    return IN_BAND_KINDS.has(row.kind as MessageKind) && receivesInBand(this.db, row.target_session_id);
   }
 
   /**
@@ -1407,7 +1431,7 @@ export class Outbox {
         let refused: ReasonCode | null = null;
         let threw = false;
         try {
-          const woke = await wake(roleKey);
+          const woke = await wake(roleKey, messageIds);
           if (!woke.allowed) refused = woke.reasonCode;
         } catch {
           refused = ReasonCode.ROLE_PEER_FAILED;

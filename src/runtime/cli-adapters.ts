@@ -12,6 +12,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 import type { Clock } from "../core/clock.ts";
 import { disposableWorkspaceLocation } from "../core/disposable-workspace-root.ts";
@@ -28,6 +29,7 @@ import {
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
 import {
   type CapacityReading,
+  type ConversationStep,
   type ManagedInvocationWrite,
   type ManagedInvocationWriteBroker,
   type InvocationRequest,
@@ -40,6 +42,8 @@ import {
   type ReviewerEgressRecord,
   type SessionHandle,
   type SessionSpec,
+  type SessionTurnRequest,
+  type SessionTurnResult,
   extractJson,
 } from "./provider.ts";
 import {
@@ -375,6 +379,12 @@ const productionRunCli = async (
     denyReadPaths?: readonly string[];
     providerCredentialDir?: string;
     writablePaths?: readonly string[];
+    /**
+     * #246 C1b — paths re-opened for reading after the profile's denies: whole subtrees, and single
+     * files with only the metadata of their ancestors. For a provisioned session's turn, its fixed
+     * workdir and the relay's script and interpreter, which may sit under the read-denied state root.
+     */
+    readablePaths?: RuntimeReadablePaths;
     /** Strict packet-only reviewer boundary, distinct from normal agent containment. */
     isolation?: NonNullable<InvocationRequest["isolation"]>;
     /** Provider state the reviewer CLI must read to authenticate, never inherited wholesale. */
@@ -472,6 +482,7 @@ const productionRunCli = async (
           options.denyReadPaths ?? [],
           options.writablePaths ?? [],
           options.providerCredentialDir,
+          options.readablePaths,
         );
     const composedProfilePath = isolated && egress
       ? join(scratch, "reviewer-composed.sb")
@@ -1300,12 +1311,19 @@ const hostCredentialPaths = (providerCredentialDir?: string): string[] => {
 export const scopedProviderCredentials = (): string | null =>
   process.env["ACP_PROVIDER_CREDENTIAL_DIR"] ?? process.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] ?? null;
 
+/** What `runtimeProfile` re-opens for reading after its denies; see `productionRunCli`. */
+export interface RuntimeReadablePaths {
+  subtrees?: readonly string[];
+  files?: readonly string[];
+}
+
 const runtimeProfile = (
   workdir: string,
   scratch: string,
   denyReadPaths: readonly string[],
   writablePaths: readonly string[],
   providerCredentialDir?: string,
+  readable: RuntimeReadablePaths = {},
 ): string => {
   const sensitive = [
     ...denyReadPaths,
@@ -1330,6 +1348,14 @@ const runtimeProfile = (
     // the whole credential tree, so the exemption is stated for the one directory instead. SBPL
     // takes the last matching rule, so this re-opens `scratch` and nothing above it.
     `(allow file-read* (subpath ${quote(scratch)}))`,
+    // #246 C1b — SBPL takes the last matching rule, so each of these re-opens exactly the path it
+    // names and nothing above it. A file is opened with only the metadata of its ancestors: the
+    // interpreter resolves a script's real path by `lstat`-ing every directory on the way to it
+    // (measured: without the ancestors the relay dies on `EPERM, lstat ~/.agent-control-plane`).
+    ...(readable.subtrees ?? []).map((path) => `(allow file-read* (subpath ${quote(resolvePath(path))}))`),
+    ...(readable.files ?? []).map((path) => `(allow file-read* (literal ${quote(resolvePath(path))}))`),
+    ...[...new Set([...(readable.subtrees ?? []), ...(readable.files ?? [])].flatMap((path) => ancestorsOf(resolvePath(path))))]
+      .map((ancestor) => `(allow file-read-metadata (literal ${quote(ancestor)}))`),
     "(deny file-write*)",
     `(allow file-write* (subpath ${quote(scratch)}))`,
     // `workdir` is intentionally absent. A provider gets a writable checkout only when
@@ -1464,6 +1490,15 @@ const reviewerProfile = (
     }
   }
   return lines.join("\n");
+};
+
+/** Every directory above `path`, nearest first, up to and including the root. */
+const ancestorsOf = (path: string): string[] => {
+  const out: string[] = [];
+  for (let parent = dirname(path); ; parent = dirname(parent)) {
+    out.push(parent);
+    if (parent === dirname(parent)) return out;
+  }
 };
 
 const resolvePath = (path: string): string => {
@@ -1651,8 +1686,11 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     // Hooks and plugins are the operator's, not this run's; see `sanctionedSettings`.
     args.push("--settings", sanctionedSettings());
     // Make the invocation *be* the constituted session, so the identity the independence
-    // check was performed against is the identity that produces the answer.
-    if (request.externalSessionId) args.push("--session-id", request.externalSessionId);
+    // check was performed against is the identity that produces the answer. Whether that opens
+    // the conversation or continues it is the caller's statement (#246 C1b); absent is "new".
+    if (request.externalSessionId) {
+      args.push(conversationFlag(request.conversation ?? "new"), request.externalSessionId);
+    }
     if (!request.readOnly && !request.isolation && request.managedWrite) {
       // #512 — a writable worker turn edits files without asking, and gets nothing else: no
       // `--allowedTools`, no Bash grant and no network grant are added. Its file writes reach only
@@ -1816,7 +1854,149 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       () => this.measureRuntime(),
     );
   }
+
+  /**
+   * #246 C1b — one turn of a provisioned session's own conversation.
+   *
+   * The turn runs in the session's fixed workdir under the ordinary runtime profile, with three
+   * narrow additions and nothing else: the session's transcript directory is writable (a
+   * transcript the CLI cannot write is a conversation `--resume` cannot find — measured: the
+   * profile's write deny left `--session-id` reusable and `--resume` answering "No conversation
+   * found"), and the relay's own script and interpreter plus the workdir are readable, because
+   * the deployment's state root, where an installed generation lives, is read-denied.
+   *
+   * `--restricted` drops the operator's user, project and local settings files — hooks and
+   * plugins included — and the code-running tools; `--settings` still applies the sanctioned
+   * empty hooks and plugins. `--strict-mcp-config` with the one inline server makes the acp-cto
+   * relay the only MCP server, `--allowedTools` admits its tools, and `--permission-prompts none`
+   * denies anything else that would have asked. The relay is named by path and socket paths
+   * only: the session credential reaches it over the daemon's take-once launch channel, never
+   * through argv, the environment or a file.
+   */
+  async runSessionTurn(request: SessionTurnRequest): Promise<SessionTurnResult> {
+    const started = Date.now();
+    const refused = (error: string): SessionTurnResult => ({
+      ok: false,
+      text: "",
+      exitCode: null,
+      error,
+      providerSessionId: null,
+      durationMs: Date.now() - started,
+    });
+    const { handle } = request;
+    if (handle.provider !== this.provider) return refused("SESSION_TURN_PROVIDER_MISMATCH");
+    if (!handle.workdir) return refused("SESSION_TURN_WORKDIR_MISSING: a provisioned session runs in its fixed workdir");
+    let workdir: string;
+    try {
+      workdir = realpathSync(handle.workdir);
+    } catch {
+      return refused("SESSION_TURN_WORKDIR_MISSING: the session's fixed workdir does not exist");
+    }
+    // The CLI creates this directory itself on the first turn; the profile only has to let it.
+    const transcripts = claudeTranscriptDirectory(workdir);
+    if (!transcripts) return refused("SESSION_TURN_TRANSCRIPT_UNADDRESSABLE: the workdir path is too long to name a transcript directory");
+
+    const args = [
+      "-p",
+      "--output-format",
+      "json",
+      "--model",
+      handle.model,
+      "--settings",
+      sanctionedSettings(),
+      "--restricted",
+      "--strict-mcp-config",
+      "--permission-prompts",
+      "none",
+    ];
+    const relayScript = sessionRelayScript();
+    if (request.relay) {
+      args.push(
+        "--mcp-config",
+        JSON.stringify({
+          mcpServers: {
+            [SESSION_RELAY_SERVER]: {
+              type: "stdio",
+              command: process.execPath,
+              args: [
+                relayScript,
+                "--launch", request.relay.launchSocketPath,
+                "--mcp", request.relay.mcpSocketPath,
+                "--session", handle.externalSessionId,
+              ],
+            },
+          },
+        }),
+        "--allowedTools",
+        `mcp__${SESSION_RELAY_SERVER}`,
+      );
+    }
+    args.push(conversationFlag(request.conversation), handle.externalSessionId);
+
+    const result = await runCli(this.#binary, args, {
+      cwd: workdir,
+      timeoutMs: request.timeoutMs,
+      stdin: request.prompt,
+      environmentAllowlist: this.#environmentAllowlist,
+      denyReadPaths: this.#denyReadPaths,
+      providerCredentialDir: this.#providerCredentialDir,
+      writablePaths: [transcripts],
+      readablePaths: {
+        subtrees: [workdir],
+        files: request.relay ? [relayScript, process.execPath] : [],
+      },
+    });
+    const envelope = safeParse(result.stdout);
+    const text = typeof envelope?.["result"] === "string" ? (envelope["result"] as string) : "";
+    const providerSessionId =
+      typeof envelope?.["session_id"] === "string" ? (envelope["session_id"] as string) : null;
+    const answeredAsThisConversation = providerSessionId === handle.externalSessionId;
+    const ok = result.exitCode === 0 && !result.timedOut && envelope?.["is_error"] !== true && answeredAsThisConversation;
+    return {
+      ok,
+      text,
+      exitCode: result.exitCode,
+      error: ok
+        ? null
+        : result.timedOut
+          ? "timeout"
+          : result.exitCode === 0 && !answeredAsThisConversation
+            ? "SESSION_TURN_CONVERSATION_MISMATCH: the provider answered as a different conversation"
+            : result.stderr.slice(0, 2000) || (envelope?.["is_error"] === true ? text.slice(0, 2000) : "turn failed"),
+      providerSessionId,
+      durationMs: Date.now() - started,
+    };
+  }
 }
+
+/** `--session-id` opens a conversation under its constituted id; `--resume` continues it. */
+const conversationFlag = (step: ConversationStep): "--session-id" | "--resume" =>
+  step === "resume" ? "--resume" : "--session-id";
+
+/** The one MCP server a provisioned session's turn is given; its tools are `mcp__acp-cto__*`. */
+export const SESSION_RELAY_SERVER = "acp-cto";
+
+/**
+ * The acp-cto relay this build ships, beside this module: `src/cli/session-relay.ts` when the
+ * daemon runs from source, `dist/cli/session-relay.js` when it runs from an installed generation.
+ * Self-contained on purpose — it imports only Node built-ins — so the turn's profile has to make
+ * exactly this one file readable for it to run.
+ */
+export const sessionRelayScript = (): string => {
+  const extension = import.meta.url.endsWith(".ts") ? ".ts" : ".js";
+  return fileURLToPath(new URL(`../cli/session-relay${extension}`, import.meta.url));
+};
+
+/**
+ * Where Claude Code keeps the transcripts of conversations run in `workdir`: one directory per
+ * working directory, named by replacing every character outside `[A-Za-z0-9]` with `-` (measured on
+ * 2.1.283). Null for a path whose name the CLI would shorten, which this does not try to predict.
+ */
+export const claudeTranscriptDirectory = (workdir: string): string | null => {
+  const name = workdir.replace(/[^a-zA-Z0-9]/g, "-");
+  if (name.length > 200) return null;
+  return join(homedir(), ".claude", "projects", name);
+};
 
 /**
  * A quota file cannot vouch for the runtime. When the sensor failed, or the file did not

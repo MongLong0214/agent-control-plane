@@ -198,7 +198,9 @@ describe("an adopted canonical CTO receives its dispatch in band", () => {
       expect(outboxRow(f.h, f.messageId)?.status).toBe("PENDING");
 
       expect(f.wake).toHaveBeenCalledTimes(1);
-      expect(f.wake).toHaveBeenCalledWith(f.roleKey);
+      // The wake names the rows it is for (#246 C1b), so a provisioned runtime can tell a retry of
+      // unacknowledged work from a duplicate; a canonical CTO's port ignores the second argument.
+      expect(f.wake).toHaveBeenCalledWith(f.roleKey, [f.messageId]);
       // The wake ran after the dispatch's transaction committed, and saw the row it points at.
       expect(committedAtWake).toEqual({ inTransaction: false, status: "PENDING" });
 

@@ -7,12 +7,12 @@ import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { startLocalMcpListeners, startSessionLaunchChannel } from "../../src/daemon/agentcpd.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import type { CapacityReading, InvocationRequest } from "../../src/runtime/provider.ts";
+import type { CapacityReading, InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
 import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
-import { callMcpToolOverSocket, claimLaunchedCredential } from "../helpers/mcp-socket.ts";
-import { TestProductionAdapter } from "../helpers/production-adapter.ts";
+import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
+import { HeadlessRuntimeDouble } from "../helpers/headless-runtime.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
@@ -65,9 +65,9 @@ const claudeReading = (harness: Harness, remainingPercent: number, minutesAgo = 
 
 const fixture = async () => {
   const harness = makeHarness();
-  const launch = await startSessionLaunchChannel(tempDir("acp-rf02-launch-"));
+  const launch = await startSessionLaunchChannel(tempDir("acp-rf02-launch-"), { mcpToken: TOKEN });
   harness.cp.cto.attach({ sessionLaunch: launch });
-  const claude = new TestProductionAdapter(harness.clock, "claude");
+  const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
   harness.cp.providers.registerForRole(claude, Role.WORKER);
   claude.setCapacity(claudeReading(harness, 81, 3));
@@ -84,21 +84,28 @@ const fixture = async () => {
   const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-rf02-mcp-"), TOKEN);
   const [hermesSocket, ctoSocket] = listeners.socketPaths;
   if (!hermesSocket || !ctoSocket) throw new Error("the MCP listeners were not started");
+  // C1b: the bootstrap CTO's runtime reaches the daemon over these two sockets.
+  harness.cp.sessionRuntime.attach({
+    delivery: launch,
+    route: { launchSocketPath: launch.socketPath, mcpSocketPath: ctoSocket },
+  });
   let keys = 0;
   const hermes = (name: string, args: Record<string, unknown>) =>
     callMcpToolOverSocket(hermesSocket, { token: TOKEN, sessionId: ceo.sessionId, sessionSecret: ceoSecret }, name, {
       idempotencyKey: `rf02-${++keys}`,
       ...args,
     });
-  const credentials = new Map<string, { sessionId: string; sessionSecret: string }>();
+  // C1b: the credential is the one the session's runtime took from the launch channel during its
+  // attestation turn; a row acts as that runtime by presenting it, as the runtime's relay would.
   const cto = async (sessionId: string, name: string, args: Record<string, unknown>) => {
-    let credential = credentials.get(sessionId);
-    if (!credential) {
-      const session = harness.cp.sessions.require(sessionId);
-      credential = await claimLaunchedCredential(launch.socketPath, session.incarnation.split("#", 1)[0]!);
-      credentials.set(sessionId, credential);
-    }
-    return callMcpToolOverSocket(ctoSocket, { token: TOKEN, ...credential }, name, { idempotencyKey: `rf02-${++keys}`, ...args });
+    const credential = claude.credentials.get(sessionId);
+    if (!credential) throw new Error("the session's runtime never took its credential");
+    return callMcpToolOverSocket(
+      ctoSocket,
+      { token: TOKEN, sessionId: credential.sessionId, sessionSecret: credential.sessionSecret },
+      name,
+      { idempotencyKey: `rf02-${++keys}`, ...args },
+    );
   };
   return {
     harness,
@@ -186,7 +193,12 @@ const reviewPrompts = (f: Fixture): string[] =>
  * Holds the next bootstrap-plan reviewer invocation until `release` is called. The reviewer's answer
  * is the one scripted before; only its timing is the test's.
  */
-const holdNextBootstrapReview = (harness: Harness): { entered: Promise<void>; release: () => void } => {
+const holdNextBootstrapReview = (harness: Harness): {
+  entered: Promise<void>;
+  release: () => void;
+  /** 1073-N1-01 — the held invocation and what the reviewer answered it, once it has. */
+  answered: Promise<{ request: InvocationRequest; result: InvocationResult }>;
+} => {
   const scripted = harness.scripted;
   const original = scripted.invoke.bind(scripted);
   let release!: () => void;
@@ -197,16 +209,23 @@ const holdNextBootstrapReview = (harness: Harness): { entered: Promise<void>; re
   const entered = new Promise<void>((resolve) => {
     enter = resolve;
   });
+  let answer!: (answered: { request: InvocationRequest; result: InvocationResult }) => void;
+  const answered = new Promise<{ request: InvocationRequest; result: InvocationResult }>((resolve) => {
+    answer = resolve;
+  });
   let held = false;
   vi.spyOn(scripted, "invoke").mockImplementation(async (request: InvocationRequest) => {
     if (!held && /Bootstrap plan review/.test(request.prompt)) {
       held = true;
       enter();
       await released;
+      const result = await original(request);
+      answer({ request, result });
+      return result;
     }
     return original(request);
   });
-  return { entered, release };
+  return { entered, release, answered };
 };
 
 const packets = (f: Fixture, run: BootstrapRun) => f.harness.cp.artifacts.list(run.runId, "PRODUCTION_READY_PACKET");
@@ -219,10 +238,22 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
       const m2 = cleanTreeManifest("rf02-inflight-second");
       await submitPlan(f, run, m1, "plan-1");
       await workReadyTasks(f, run);
+      // 1073-N1-01 — P1's PLAN binding, read before anything can replace it.
+      const p1 = currentBootstrapPlan(run.runId, f.harness.cp.artifacts.latest(run.runId, "PLAN"));
+      if (!p1.allowed) throw new Error(p1.message);
       await f.harness.cp.continuity.evaluate("before result_submit");
       scriptPassForCurrentPlan(f, run);
 
       const held = holdNextBootstrapReview(f.harness);
+      // 1073-N1-01 — what the review gate answers the pipeline, in order: P1's review first.
+      const gate = f.harness.cp.review;
+      const reviewThroughGate = gate.review.bind(gate);
+      const gateAnswers: Array<Awaited<ReturnType<typeof gate.review>>> = [];
+      vi.spyOn(gate, "review").mockImplementation(async (request, capability) => {
+        const answer = await reviewThroughGate(request, capability);
+        gateAnswers.push(answer);
+        return answer;
+      });
       const pending = resultSubmit(f, run);
       await held.entered;
       const s1 = f.harness.cp.runs.currentCandidate(run.runId);
@@ -245,6 +276,18 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
       expect(packets(f, run)).toEqual([]);
       // The review gate kept no verdict for a PLAN the run no longer has.
       expect(f.harness.cp.artifacts.list(run.runId, "BLIND_REVIEW")).toEqual([]);
+      // 1073-N1-01 — the assertions above also hold if P1's reviewer gave no verdict at all. It did:
+      // asked about P1's plan, it answered PASS, and the gate refused that PASS because P2 had
+      // replaced P1, not for an assurance failure (that returns before the PLAN is read again).
+      const p1Review = await held.answered;
+      expect(p1Review.request.prompt).toContain(`Plan digest: ${p1.value.binding.planDigest}`);
+      expect(p1Review.result.ok).toBe(true);
+      expect(JSON.parse(p1Review.result.text)).toMatchObject({ verdict: "PASS" });
+      expect(gateAnswers[0]).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.EVIDENCE_STALE,
+        evidence: { candidate: p1.value.binding, current: p2.value.binding },
+      });
 
       // A fresh review of P2 is what makes the run ready: a new candidate, a new reviewer prompt
       // naming P2's planned outputs, and a packet for that candidate alone.
@@ -353,6 +396,11 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
       expect(f.harness.cp.outbox.listByRun(run.runId).filter((message) => message.kind === "REVISION_REQUEST")).toEqual([]);
       expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.ACTIVE);
       expect(packets(f, run)).toEqual([]);
+      // 1073-N1-01 — the assertions above also hold if P1's reviewer had answered REVISE or BLOCK,
+      // which reaches the same continuity evaluation. It did not answer: no reviewer was asked, and
+      // the review gate stored nothing.
+      expect(reviewPrompts(f)).toEqual([]);
+      expect(f.harness.cp.artifacts.list(run.runId, "BLIND_REVIEW")).toEqual([]);
     });
   });
 });

@@ -26,6 +26,7 @@ import { WORKER_TURN_MAX_TIMEOUT_MS, type WorkerTurnRequest, type WorkerTurnRunn
 import type { WorkerProvisionRequest, WorkerStaffing } from "../run/worker-staffing.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
+import type { AttestingPeer, SessionAttestations } from "../session/session-attestations.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import {
   authenticateMcpPeer,
@@ -64,6 +65,7 @@ export interface CtoMcpSource extends McpMutationSource {
   readonly review: BlindReviewGate;
   readonly runs: RunEngine;
   readonly sessions: SessionRegistry;
+  readonly sessionAttestations: SessionAttestations;
   readonly bindings: BindingRegistry;
   readonly tasks: TaskGraph;
   readonly workerTurns: WorkerTurnRunner;
@@ -127,6 +129,8 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     // The same authority `run_ack` reaches for an in-band row, without a run.
     acknowledgeInBand: (messageId: string, sessionId: string, sessionIncarnation: string) =>
       source.outbox.acknowledgeInBand(messageId, sessionId, sessionIncarnation),
+    // #246 C1b — the connection's own session answers its own pending challenge.
+    attestSession: (peer: AttestingPeer, nonce: string) => source.sessionAttestations.attest(peer, nonce),
     contractForRun: (runId: string) => {
       const run = source.runs.require(runId);
       const manifest = run.pinnedManifestDigest ? source.projects.manifest(run.pinnedManifestDigest) : null;
@@ -205,6 +209,11 @@ export type CtoMcpPort = ReturnType<typeof createCtoMcpPort>;
  */
 export interface CtoMcpAccess {
   pendingHandoffId?: string;
+  /**
+   * #246 C1b — the connection was admitted only to answer its session's pending attestation: it
+   * holds no binding, so `session_attest` is the one tool it may reach.
+   */
+  attestationOnly?: boolean;
 }
 
 interface SessionSecretPeer extends AuthenticatedMcpPeer {
@@ -242,6 +251,13 @@ const createCtoServerFromPort = (
         ReasonCode.MCP_PEER_UNAUTHENTICATED,
         "an unbound handoff recipient may only acknowledge its pending handoff",
         { handoffId: access.pendingHandoffId, toolName },
+      );
+    }
+    if (access.attestationOnly && toolName !== "session_attest") {
+      return deny(
+        ReasonCode.MCP_PEER_UNAUTHENTICATED,
+        "a session admitted to attest may only answer its attestation",
+        { toolName },
       );
     }
     return peer;
@@ -322,6 +338,26 @@ const createCtoServerFromPort = (
         return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP session incarnation is not current", { sessionId }));
       }
       return respond(port.acknowledgeInBand(args.messageId, sessionId, sessionIncarnation));
+    }),
+  );
+  server.registerTool(
+    "session_attest",
+    {
+      description:
+        "Answer the control plane's readiness challenge for this session with the nonce your turn was given. Proves this connection authenticated with the session's current credential.",
+      inputSchema: { nonce: z.string().min(1) },
+    },
+    // The session, incarnation and secret are the authenticated connection's, never arguments; the
+    // attestation registry verifies the secret again and compares the challenge in constant time.
+    async (args) => guarded(() => {
+      const peer = peerFor("session_attest");
+      if (!peer.allowed) return respond(peer);
+      const { sessionId, sessionIncarnation } = peer.value;
+      const sessionSecret = (peer.value as SessionSecretPeer).sessionSecret;
+      if (!sessionId || !sessionIncarnation || !sessionSecret) {
+        return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "only a connection authenticated with a session credential can attest"));
+      }
+      return respond(port.attestSession({ sessionId, sessionIncarnation, sessionSecret }, args.nonce));
     }),
   );
   server.registerTool(

@@ -10,6 +10,7 @@ import {
   CONTINUITY_COVERAGE_REVOCATION_REASON,
   CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
+  CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
   type RequiredRole,
   type RoleCoveragePlan,
 } from "../continuity/continuity-kernel.ts";
@@ -20,6 +21,7 @@ import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
 import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
+import { ProvisionedSessionRuntime } from "../runtime/provisioned-session-runtime.ts";
 import {
   resolveDoctorHealth,
   type DoctorHealthAttempt,
@@ -533,7 +535,8 @@ export interface TelegramIngressController {
  * reconciliation is deterministic: reload bindings, runs, outbox and claims; reconcile
  * sessions against real processes; expire stale leases; run a scoped doctor; resume
  * dispatch idempotently. Because dispatch is keyed by
- * `run-dispatch:<runId>:<generation>`, resuming cannot produce a duplicate (CP-S58).
+ * `run-dispatch:<runId>:<generation>` (with `:r<n>` for revision cycle n, so a revision is a new
+ * dispatch and not a replay of the first), resuming cannot produce a duplicate (CP-S58).
  */
 export class Daemon {
   readonly lock: SingleInstanceLock;
@@ -1701,6 +1704,22 @@ export class Daemon {
         // to replace an existing authority, not forge generation 1 for an absent one.
         if (!current) continue;
 
+        // #246 C1b — a provisioned session holds its authority through a credential only this
+        // daemon's memory carries. One this daemon does not hold (a restart dropped it) can run no
+        // turn and authenticate nothing, however healthy its provider is: its run is paused and
+        // its binding revoked as owed, and the restore pass recovers the same session with a
+        // rotated credential. Its row is left READY; nothing about the conversation is lost.
+        if (ProvisionedSessionRuntime.drives(required.role)) {
+          if (!this.cp.sessionRuntime.holds(current.sessionId)) {
+            pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON));
+            // A run held for a revision or a human keeps that hold, and its owner is recovered all
+            // the same (review ACP-C1B-03); `revokePausedBinding`'s BLOCKED-only exception would
+            // leave the binding with no credential behind it and nothing to recover.
+            this.revokePausedBinding(required, CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON, { allowHeldRuns: true });
+            continue;
+          }
+        }
+
         const assignment = plan.assignments.find((candidate) => candidate.roleKey === required.roleKey);
         const session = this.cp.sessions.get(current.sessionId);
         // The role's question, not the provider's. This check holds `required.role` and was asking
@@ -1964,7 +1983,8 @@ export class Daemon {
     const paused: ContinuityReconcileReport["pausedRuns"] = [];
     for (const run of affected) {
       if (run.state === RunState.ACTIVE) {
-        const blocked = this.cp.runs.transition(run.runId, RunState.BLOCKED, reason, {
+        // Recorded as continuity's own hold (#246 C1b): a bootstrap CTO's recovery resumes only this.
+        const blocked = this.cp.runs.pauseForContinuity(run.runId, required.roleKey, reason, {
           roleKey: required.roleKey,
           continuityAction: "PAUSE_NEW_WORK",
         });
@@ -2112,10 +2132,13 @@ export class Daemon {
    * resume it through a late message. BindingRegistry fences queued/in-flight outbox rows
    * in the same transaction; blocked runs are the documented revocation exception.
    */
-  private revokePausedBinding(required: RequiredRole, reason: string): void {
+  private revokePausedBinding(required: RequiredRole, reason: string, options: { allowHeldRuns?: boolean } = {}): void {
     const current = this.cp.bindings.active(required.roleKey);
     if (!current) return;
-    const revoked = this.cp.bindings.revoke(required.roleKey, reason, { allowBlockedRuns: true });
+    const revoked = this.cp.bindings.revoke(required.roleKey, reason, {
+      allowBlockedRuns: true,
+      ...(options.allowHeldRuns === true ? { allowHeldRuns: true } : {}),
+    });
     if (!revoked.allowed) {
       this.cp.audit.record({
         kind: "CONTINUITY_REVOKE_DEFERRED",

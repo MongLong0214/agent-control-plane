@@ -290,6 +290,11 @@ export interface RunRow {
   dispatchedAt: string | null;
   endedAt: string | null;
   stateReason: string | null;
+  /**
+   * #246 C1b — the role whose loss continuity paused this run for, while that pause holds it
+   * BLOCKED; null otherwise, including a run BLOCKED for a CEO decision (schema v42).
+   */
+  continuityHoldRoleKey?: string | null;
 }
 
 export interface RoleScope {

@@ -11,8 +11,9 @@ import { BindingRegistry } from "../../src/session/binding-registry.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask, fixtureManifest, makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
 import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest, completeReadyTasks } from "../helpers/bootstrap-plan.ts";
-import { callMcpToolOverSocket, claimLaunchedCredential } from "../helpers/mcp-socket.ts";
-import { TestProductionAdapter } from "../helpers/production-adapter.ts";
+import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
+import { HeadlessRuntimeDouble } from "../helpers/headless-runtime.ts";
+import type { TestProductionAdapter } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
@@ -50,7 +51,7 @@ type DefaultModels = { cto: string; reviewer: string; worker: string; ceo: strin
  * model production would give it — for Claude, Opus for a CTO and Sonnet for a worker. A row may
  * override a default, to make a fallback to it visible where the shipped one would hide it.
  */
-class ProviderDouble extends TestProductionAdapter {
+class ProviderDouble extends HeadlessRuntimeDouble {
   readonly started: SessionSpec[] = [];
   readonly stopped: string[] = [];
 
@@ -84,7 +85,7 @@ interface FixtureOptions {
 
 const bootstrapFixture = async (options: FixtureOptions = {}) => {
   const harness = makeHarness();
-  const launch = await startSessionLaunchChannel(tempDir("acp-bcto-launch-"));
+  const launch = await startSessionLaunchChannel(tempDir("acp-bcto-launch-"), { mcpToken: TOKEN });
   harness.cp.cto.attach({ sessionLaunch: launch });
   const claude = new ProviderDouble(harness.clock, "claude", options.claudeDefaults);
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
@@ -101,6 +102,11 @@ const bootstrapFixture = async (options: FixtureOptions = {}) => {
   const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-bcto-mcp-"), TOKEN);
   const [hermesSocket, ctoSocket] = listeners.socketPaths;
   if (!hermesSocket || !ctoSocket) throw new Error("the MCP listeners were not started");
+  // C1b: the bootstrap CTO's runtime reaches the daemon over these two sockets.
+  harness.cp.sessionRuntime.attach({
+    delivery: launch,
+    route: { launchSocketPath: launch.socketPath, mcpSocketPath: ctoSocket },
+  });
   let keys = 0;
   const hermes = (name: string, args: Record<string, unknown>) =>
     callMcpToolOverSocket(
@@ -109,18 +115,17 @@ const bootstrapFixture = async (options: FixtureOptions = {}) => {
       name,
       { idempotencyKey: `bcto-${++keys}`, ...args },
     );
-  const credentials = new Map<string, { sessionId: string; sessionSecret: string }>();
+  // C1b: the credential is the one the session's runtime took from the launch channel during its
+  // attestation turn; a row acts as that runtime by presenting it, as the runtime's relay would.
   const cto = async (sessionId: string, name: string, args: Record<string, unknown>) => {
-    let credential = credentials.get(sessionId);
-    if (!credential) {
-      const session = harness.cp.sessions.require(sessionId);
-      credential = await claimLaunchedCredential(launch.socketPath, session.incarnation.split("#", 1)[0]!);
-      credentials.set(sessionId, credential);
-    }
-    return callMcpToolOverSocket(ctoSocket, { token: TOKEN, ...credential }, name, {
-      idempotencyKey: `bcto-${++keys}`,
-      ...args,
-    });
+    const credential = claude.credentials.get(sessionId);
+    if (!credential) throw new Error("the session's runtime never took its credential");
+    return callMcpToolOverSocket(
+      ctoSocket,
+      { token: TOKEN, sessionId: credential.sessionId, sessionSecret: credential.sessionSecret },
+      name,
+      { idempotencyKey: `bcto-${++keys}`, ...args },
+    );
   };
   const createBootstrap = async (): Promise<string> => {
     const created = await hermes("run_create", {
@@ -434,6 +439,8 @@ const providerSession = async (f: Fixture, adapter: TestProductionAdapter, model
     incarnation: `${handle.externalSessionId}#${f.harness.clock.nowIso()}`,
   });
   f.harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "provider session verified");
+  // C1b: a spawn hands the new credential to the headless runtime's custody; so does this.
+  f.harness.cp.sessionRuntime.adopt(session.sessionId, Role.BOOTSTRAP_CTO, session.sessionSecret!, 0);
   return session.sessionId;
 };
 
@@ -1046,22 +1053,23 @@ describe("C1: continuity never substitutes a fixed role runtime", () => {
     });
   });
 
-  it.each([Role.BOOTSTRAP_CTO, Role.WORKER] as const)(
+  // C1b (C1-02): a BOOTSTRAP_CTO has no Claude-to-Claude replacement to keep on Opus — continuity
+  // constitutes none for it (see the C1-02 row below) — so only the WORKER row remains here.
+  it.each([Role.WORKER] as const)(
     "%s, Claude to Claude: the replacement stays on Claude Opus, never the adapter's default model",
     async (role) => {
       // The adapter's default for the role must not be Opus, or a replacement that fell back to it
-      // would pass too. Claude's shipped WORKER default is Sonnet already; its CTO default, which a
-      // BOOTSTRAP_CTO falls back to, is Opus, so this row's double answers Sonnet for it instead.
-      const defaultKey = role === Role.WORKER ? "worker" : "cto";
+      // would pass too. Claude's shipped WORKER default is Sonnet already.
       await withFixture(async (f) => {
-        expect(f.claude.defaultModels[defaultKey]).not.toBe("opus");
+        expect(f.claude.defaultModels.worker).not.toBe("opus");
         const { gpt, daemon } = standby(f);
-        const { runId, ownerSessionId } = await f.dispatchBootstrap();
-        const worker = role === Role.WORKER ? runningWorker(f, runId, 1) : null;
-        if (worker) await primeClaudeWorkerBurn(f);
-        const roleKey = worker?.roleKey ?? roleKeyFor(Role.BOOTSTRAP_CTO, { runId });
+        const { runId } = await f.dispatchBootstrap();
+        const worker = runningWorker(f, runId, 1);
+        await primeClaudeWorkerBurn(f);
+        const roleKey = worker.roleKey;
+        expect(roleKey).toBe(roleKeyFor(role, { taskId: worker.taskId }));
         // The incumbent's runtime is gone; Claude still covers the role.
-        f.harness.cp.sessions.transition(worker?.workerSessionId ?? ownerSessionId, SessionLifecycle.ERROR, "process gone");
+        f.harness.cp.sessions.transition(worker.workerSessionId, SessionLifecycle.ERROR, "process gone");
 
         const report = await daemon.reconcileContinuity("incumbent runtime gone");
         expect(report?.reassigned).toContainEqual(expect.objectContaining({ roleKey, provider: "claude", toGeneration: 2 }));
@@ -1071,7 +1079,7 @@ describe("C1: continuity never substitutes a fixed role runtime", () => {
         ]);
         expect(gpt.started).toEqual([]);
         expect(f.claude.started.at(-1)).toMatchObject({ model: "opus" });
-      }, role === Role.BOOTSTRAP_CTO ? { claudeDefaults: { cto: "sonnet" } } : {});
+      });
     },
   );
 
@@ -1096,10 +1104,60 @@ describe("C1: continuity never substitutes a fixed role runtime", () => {
       });
 
       const report = await daemon.reconcileContinuity("claude coverage lost");
-      expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED });
+      // C1b (C1-02): refused before any provider is even considered — a bootstrap CTO is never
+      // replaced, by another provider or by its own.
+      expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.BOOTSTRAP_CTO_NOT_REPLACEABLE });
       expect(gpt.started).toEqual([]);
       expect(holders(f, roleKey)).toEqual([{ generation: 1, provider: "claude", model: "opus", status: "REVOKED" }]);
       expect(f.harness.cp.runs.require(runId).state).toBe(RunState.BLOCKED);
+    });
+  });
+
+  it("C1-02: a BOOTSTRAP_CTO whose runtime is gone is never replaced, by Claude or anything else: revoked, run paused, no new session", async () => {
+    await withFixture(async (f) => {
+      const { gpt, daemon } = standby(f);
+      const { runId, ownerSessionId } = await f.dispatchBootstrap();
+      const roleKey = roleKeyFor(Role.BOOTSTRAP_CTO, { runId });
+      const actor = actorOf(f, f.harness.cp.bindings.active(roleKey)!.assignmentId);
+      const spawned = f.claude.started.length;
+      // The incumbent's row is not READY; Claude still covers the role. Before C1b this failed the
+      // role over to a fresh Claude session that could never authenticate (C1-02).
+      f.harness.cp.sessions.transition(ownerSessionId, SessionLifecycle.ERROR, "process gone");
+
+      const report = await daemon.reconcileContinuity("incumbent runtime gone");
+      expect(report?.reassigned).toEqual([]);
+      expect(report?.unresolved).toContainEqual({ roleKey, reasonCode: ReasonCode.BOOTSTRAP_CTO_NOT_REPLACEABLE });
+      expect(f.claude.started).toHaveLength(spawned);
+      expect(gpt.started).toEqual([]);
+      expect(holders(f, roleKey)).toEqual([{ generation: 1, provider: "claude", model: "opus", status: "REVOKED" }]);
+      expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.BLOCKED, ownerSessionId, ownerBindingGeneration: 1 });
+      // The actor is not retired: the role's conversation is still the one that may come back.
+      expect(f.harness.cp.db.get<{ retired_at: string | null }>(
+        `SELECT retired_at FROM conversational_actors WHERE actor_id = ?`, [actor!],
+      )?.retired_at).toBeNull();
+    });
+  });
+
+  it("C1-02: a Claude outage revokes and pauses but never marks the bootstrap CTO's session ERROR; its row, actor and conversation stay", async () => {
+    await withFixture(async (f) => {
+      const { daemon } = standby(f);
+      const { runId, ownerSessionId } = await f.dispatchBootstrap();
+      const roleKey = roleKeyFor(Role.BOOTSTRAP_CTO, { runId });
+      const before = f.harness.cp.sessions.require(ownerSessionId);
+      loseClaude(f);
+
+      await daemon.reconcileContinuity("claude coverage lost");
+      expect(f.harness.cp.bindings.active(roleKey)).toBeNull();
+      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.BLOCKED);
+      expect(f.harness.cp.sessions.require(ownerSessionId)).toMatchObject({
+        lifecycle: SessionLifecycle.READY,
+        incarnation: before.incarnation,
+        workdir: before.workdir,
+      });
+      // Nothing was recorded as owed to a claim: no claim can create a bootstrap CTO.
+      expect(f.harness.cp.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'CONTINUITY_RESTORE_AWAITS_CLAIM' AND role_key = ?`, [roleKey],
+      )?.n).toBe(0);
     });
   });
 });

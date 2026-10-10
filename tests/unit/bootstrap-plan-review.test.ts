@@ -24,7 +24,7 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness, registerFixtureProject, reviewerPass, reviewerRevise, type Harness } from "../helpers/harness.ts";
 import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
 import { callMcpToolOverSocket, claimLaunchedCredential } from "../helpers/mcp-socket.ts";
-import { TestProductionAdapter } from "../helpers/production-adapter.ts";
+import { HeadlessRuntimeDouble } from "../helpers/headless-runtime.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
@@ -73,10 +73,10 @@ const claudeReading = (harness: Harness, remainingPercent: number, minutesAgo = 
 
 const reviewFixture = async () => {
   const harness = makeHarness();
-  const launch = await startSessionLaunchChannel(tempDir("acp-c2-launch-"));
+  const launch = await startSessionLaunchChannel(tempDir("acp-c2-launch-"), { mcpToken: TOKEN });
   harness.cp.cto.attach({ sessionLaunch: launch });
   // Claude Opus staffs the bootstrap CTO and the workers; the reviewer is the harness's own.
-  const claude = new TestProductionAdapter(harness.clock, "claude");
+  const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
   harness.cp.providers.registerForRole(claude, Role.WORKER);
   // A Claude WORKER allocation needs one earlier reading through the role's own probe (#512).
@@ -94,21 +94,35 @@ const reviewFixture = async () => {
   const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-c2-mcp-"), TOKEN);
   const [hermesSocket, ctoSocket] = listeners.socketPaths;
   if (!hermesSocket || !ctoSocket) throw new Error("the MCP listeners were not started");
+  // C1b: the bootstrap CTO's runtime reaches the daemon over these two sockets.
+  harness.cp.sessionRuntime.attach({
+    delivery: launch,
+    route: { launchSocketPath: launch.socketPath, mcpSocketPath: ctoSocket },
+  });
   let keys = 0;
   const hermes = (name: string, args: Record<string, unknown>) =>
     callMcpToolOverSocket(hermesSocket, { token: TOKEN, sessionId: ceo.sessionId, sessionSecret: ceoSecret }, name, {
       idempotencyKey: `c2-${++keys}`,
       ...args,
     });
-  const credentials = new Map<string, { sessionId: string; sessionSecret: string }>();
+  // C1b: a bootstrap CTO's credential is the one its runtime took from the launch channel during its
+  // attestation turn; a row acts as that runtime by presenting it, as the runtime's relay would. A
+  // session no runtime drives (a project run's CTO) still has its credential claimed from the channel.
+  const claimed = new Map<string, { sessionId: string; sessionSecret: string }>();
   const cto = async (sessionId: string, name: string, args: Record<string, unknown>) => {
-    let credential = credentials.get(sessionId);
+    let credential: { sessionId: string; sessionSecret: string } | undefined =
+      claude.credentials.get(sessionId) ?? claimed.get(sessionId);
     if (!credential) {
       const session = harness.cp.sessions.require(sessionId);
       credential = await claimLaunchedCredential(launch.socketPath, session.incarnation.split("#", 1)[0]!);
-      credentials.set(sessionId, credential);
+      claimed.set(sessionId, credential);
     }
-    return callMcpToolOverSocket(ctoSocket, { token: TOKEN, ...credential }, name, { idempotencyKey: `c2-${++keys}`, ...args });
+    return callMcpToolOverSocket(
+      ctoSocket,
+      { token: TOKEN, sessionId: credential.sessionId, sessionSecret: credential.sessionSecret },
+      name,
+      { idempotencyKey: `c2-${++keys}`, ...args },
+    );
   };
   return {
     harness,

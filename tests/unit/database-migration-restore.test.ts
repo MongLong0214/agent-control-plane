@@ -1240,7 +1240,8 @@ describe("versioned SQLite migration", () => {
         [38, "v38-canonical-verified-target-override"],
         [39, "v39-owner-reply-intent-keeps-its-key"],
         [40, "v40-peer-message-carry-record"],
-        [SCHEMA_VERSION, "v41-runtime-managed-worker-turns"],
+        [41, "v41-runtime-managed-worker-turns"],
+        [SCHEMA_VERSION, "v42-session-credential-epoch"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

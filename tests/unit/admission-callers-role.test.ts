@@ -6,7 +6,7 @@ import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.t
 import { BlindReviewGate } from "../../src/review/blind-review.ts";
 import type { VerificationReport } from "../../src/verify/verification-engine.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { bootstrapCtoProvider, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 import { applyPassingChange, bindWorker, reviewerPass } from "../helpers/harness.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 
@@ -209,9 +209,9 @@ describe("verified projectless owner role", () => {
     const created = h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP,
       executionMode: ExecutionMode.STANDARD, contract });
     if (!created.allowed) throw new Error(created.message);
-    const claude = new TestProductionAdapter(h.clock, "claude");
+    // C1b: the role runs on the headless runtime, so its Claude double is the one that can attest.
+    const claude = bootstrapCtoProvider(h.cp, h.clock);
     claude.setCapacity({ ...capacity(h, "cto"), provider: "claude" });
-    h.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
     expect(await h.cp.runs.dispatch(created.value.runId)).toMatchObject({ allowed: true });
     expect(h.cp.capacity.currentForRole("claude", Role.BOOTSTRAP_CTO)?.allocationAdmission).toBe("OPEN");
   });
