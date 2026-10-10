@@ -855,13 +855,32 @@ describe("a probe ends its own process group on every completion, and only its o
 /* ------------------------------------------------------------------------------------------------ */
 
 /** Records every group signal ACP's code sends, and lets a row make the first one fail as EPERM. */
-const watchGroupSignals = (options: { failFirstWithEperm?: boolean; afterFirstAttempt?: () => void } = {}) => {
+interface ObservationFault {
+  code: "EPERM" | "EIO";
+  /** Observations after the first attempt left unfaulted before the faults begin. */
+  skip: number;
+  /** How many observations then fail; "all" fails every one after that. */
+  count: number | "all";
+}
+
+const watchGroupSignals = (options: { failFirstWithEperm?: boolean; afterFirstAttempt?: () => void; observationFault?: ObservationFault } = {}) => {
   const nativeKill = process.kill.bind(process);
-  const attempts: { pid: number; signal: string | number }[] = [];
+  const attempts: { pid: number; signal: string | number; at: number }[] = [];
+  const observationErrors: string[] = [];
+  let observationsAfterFirstAttempt = 0;
   let failed = false;
   const spy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
+    const fault = options.observationFault;
+    if (pid < 0 && signal === 0 && fault && attempts.length > 0) {
+      observationsAfterFirstAttempt += 1;
+      const index = observationsAfterFirstAttempt - fault.skip;
+      if (index >= 1 && (fault.count === "all" || index <= fault.count)) {
+        observationErrors.push(fault.code);
+        throw Object.assign(new Error(`kill ${fault.code}`), { code: fault.code, errno: -1, syscall: "kill" });
+      }
+    }
     if (pid < 0 && signal !== 0 && signal !== undefined) {
-      attempts.push({ pid, signal });
+      attempts.push({ pid, signal, at: Date.now() });
       if (attempts.length === 1) options.afterFirstAttempt?.();
       if (options.failFirstWithEperm && !failed) {
         failed = true;
@@ -870,7 +889,7 @@ const watchGroupSignals = (options: { failFirstWithEperm?: boolean; afterFirstAt
     }
     return nativeKill(pid, signal as NodeJS.Signals);
   }) as typeof process.kill);
-  return { attempts, nativeKill, restore: () => spy.mockRestore() };
+  return { attempts, observationErrors, nativeKill, restore: () => spy.mockRestore() };
 };
 
 describe("ownership needs the holder's start token; a failed attempt is never a cleanup; the holder adds no output", () => {
@@ -1063,6 +1082,178 @@ describe("ownership needs the holder's start token; a failed attempt is never a 
       }
     },
   );
+
+  /** Kills, as the test, every live member of a row's own group: what the probe was right to leave. */
+  const clearRowGroup = (mark: number): void => {
+    const own = sandboxed[mark];
+    if (own?.pid === undefined) return;
+    for (const line of liveMembersOf(own.pid)) {
+      const pid = Number(line.split(/\s+/)[0]);
+      if (pid > 0) process.kill(pid, "SIGKILL");
+    }
+  };
+
+  for (const code of ["EPERM", "EIO"] as const) {
+    it.for(["timeout", "abort"] as const)(`transient ${code} observations after the token is lost: the %s answers at once, UNVERIFIABLE`, async (route, ctx) => {
+      requireSeatbelt(ctx);
+      const marker = `acp-probe-descendant-${randomUUID()}`;
+      const stubs = tempDir("acp-session-probe-stub-");
+      tokenRead.mode = "native";
+      // The reviewer's arrangement: a live holder and group, a failed first attempt, the token lost
+      // after it, and the next two group observations failing with ${code}.
+      const watch = watchGroupSignals({
+        failFirstWithEperm: true,
+        afterFirstAttempt: () => { tokenRead.mode = "null"; },
+        observationFault: { code, skip: 1, count: 2 },
+      });
+      const mark = sandboxed.length;
+      try {
+        const controller = new AbortController();
+        const started = Date.now();
+        const pending = __testing.productionRunCli(claudeWithDescendant(stubs, "hang", marker), [marker], {
+          cwd: undefined, timeoutMs: route === "timeout" ? 200 : 60_000, signal: controller.signal, reapProcessGroup: true,
+        });
+        let requestedAt = started + 200;
+        if (route === "abort") {
+          expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 10_000)).toBe(true);
+          requestedAt = Date.now();
+          controller.abort();
+        }
+        const outcome = await Promise.race([pending, new Promise<"PENDING">((resolve) => setTimeout(() => resolve("PENDING"), requestedAt - Date.now() + 750))]);
+        const settleMs = Date.now() - requestedAt;
+        const holder = sandboxed[mark]!.pid!;
+        const holderAlive = alive(holder);
+        console.error(`WITNESS transient-observation ${JSON.stringify({ code, route, outcome: outcome === "PENDING" ? "PENDING" : outcome.processGroup, attempts: watch.attempts.length, observationErrors: watch.observationErrors, settleMs, holderAlive })}`);
+        expect(outcome).not.toBe("PENDING");
+        if (outcome === "PENDING") return;
+        expect(settleMs).toBeLessThan(1_000);
+        expect(holderAlive).toBe(true);
+        expect(outcome.processGroup).toMatchObject({ pgid: holder, reaped: false, signalled: true, signals: ["EPERM"], delivered: 0, ownership: "UNVERIFIABLE" });
+        expectConsistentReap(outcome.processGroup);
+        expect(watch.attempts).toHaveLength(1);
+      } finally {
+        watch.restore();
+        tokenRead.mode = "native";
+        clearRowGroup(mark);
+        killMarked(marker);
+      }
+    });
+
+    it(`an undelivered attempt with the group unobservable (${code}) answers at once, with no second attempt`, async (ctx) => {
+      requireSeatbelt(ctx);
+      const marker = `acp-probe-descendant-${randomUUID()}`;
+      const stubs = tempDir("acp-session-probe-stub-");
+      const watch = watchGroupSignals({ failFirstWithEperm: true, observationFault: { code, skip: 0, count: "all" } });
+      const mark = sandboxed.length;
+      try {
+        const controller = new AbortController();
+        const pending = __testing.productionRunCli(claudeWithDescendant(stubs, "hang", marker), [marker], {
+          cwd: undefined, timeoutMs: 60_000, signal: controller.signal, reapProcessGroup: true,
+        });
+        expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 10_000)).toBe(true);
+        const requestedAt = Date.now();
+        controller.abort();
+        const outcome = await Promise.race([pending, new Promise<"PENDING">((resolve) => setTimeout(() => resolve("PENDING"), 750))]);
+        expect(outcome).not.toBe("PENDING");
+        if (outcome === "PENDING") return;
+        expect(Date.now() - requestedAt).toBeLessThan(1_000);
+        // Unknown is not "dead" and not a reason to signal again: one attempt, nothing delivered.
+        expect(outcome.processGroup).toMatchObject({ reaped: false, signals: ["EPERM"], delivered: 0, ownership: "HELD" });
+        expectConsistentReap(outcome.processGroup);
+        expect(watch.attempts).toHaveLength(1);
+        expect(alive(sandboxed[mark]!.pid!)).toBe(true);
+      } finally {
+        watch.restore();
+        clearRowGroup(mark);
+        killMarked(marker);
+      }
+    });
+
+    it.for(["timeout", "abort"] as const)(`persistent ${code} observations after a delivered signal: the %s answers by the deadline, not as a cleanup`, async (route, ctx) => {
+      requireSeatbelt(ctx);
+      const marker = `acp-probe-descendant-${randomUUID()}`;
+      const stubs = tempDir("acp-session-probe-stub-");
+      const watch = watchGroupSignals({ observationFault: { code, skip: 0, count: "all" } });
+      const mark = sandboxed.length;
+      try {
+        const controller = new AbortController();
+        const timeoutMs = 1_000;
+        const started = Date.now();
+        const pending = __testing.productionRunCli(claudeWithDescendant(stubs, "hang", marker), [marker], {
+          cwd: undefined, timeoutMs: route === "timeout" ? timeoutMs : 60_000, signal: controller.signal, reapProcessGroup: true,
+        });
+        expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 10_000)).toBe(true);
+        let requestedAt = started + timeoutMs;
+        if (route === "abort") {
+          requestedAt = Date.now();
+          controller.abort();
+        }
+        const result = await pending;
+        const settledAt = Date.now();
+        const attemptsAtSettle = watch.attempts.length;
+        const probe = sandboxed[mark]!;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const observed = {
+          code, route, settleMsFromRequest: settledAt - requestedAt, processGroup: result.processGroup,
+          attemptsAtSettle, attemptsAfterSettle: watch.attempts.length - attemptsAtSettle,
+          observationErrors: watch.observationErrors.length, groupMembersByPs: liveMembersOf(probe.pid!).length,
+        };
+        console.error(`WITNESS persistent-observation ${JSON.stringify(observed)}`);
+        // The deadline is the existing 2 s reap bound, counted from the first end request.
+        expect(observed.settleMsFromRequest).toBeGreaterThanOrEqual(1_900);
+        expect(observed.settleMsFromRequest).toBeLessThan(2_400);
+        expect(result.processGroup).toMatchObject({ pgid: probe.pid, reaped: false, signals: ["sent"], delivered: 1, ownership: "HELD" });
+        expect(result.processGroup!.detail).toEqual(expect.stringContaining(`process group ${probe.pid}`));
+        expectConsistentReap(result.processGroup);
+        expect(observed.attemptsAtSettle).toBe(1);
+        expect(observed.attemptsAfterSettle).toBe(0);
+        // The group is in fact gone (ps): an observation that never answered ESRCH still is not a cleanup.
+        expect(observed.groupMembersByPs).toBe(0);
+      } finally {
+        watch.restore();
+        clearRowGroup(mark);
+        killMarked(marker);
+      }
+    });
+  }
+
+  it("repeated end requests: one answer, by the deadline fixed at the first request, and no signal after it", async (ctx) => {
+    requireSeatbelt(ctx);
+    const marker = `acp-probe-descendant-${randomUUID()}`;
+    const stubs = tempDir("acp-session-probe-stub-");
+    const watch = watchGroupSignals({ observationFault: { code: "EIO", skip: 0, count: "all" } });
+    const mark = sandboxed.length;
+    try {
+      const controller = new AbortController();
+      const started = Date.now();
+      let answers = 0;
+      const pending = __testing.productionRunCli(claudeWithDescendant(stubs, "hang", marker), [marker], {
+        cwd: undefined, timeoutMs: 1_500, signal: controller.signal, reapProcessGroup: true,
+      });
+      void pending.then(() => { answers += 1; });
+      expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 10_000)).toBe(true);
+      // First request: the abort. The timeout at 1.5 s and the observation errors come after it.
+      const firstRequest = Date.now();
+      controller.abort();
+      controller.abort();
+      const result = await pending;
+      const settledAt = Date.now();
+      const attemptsAtSettle = watch.attempts.length;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      console.error(`WITNESS repeated-requests ${JSON.stringify({ sinceStart: firstRequest - started, settleMsFromFirstRequest: settledAt - firstRequest, answers, attemptsAtSettle, attemptsAfterSettle: watch.attempts.length - attemptsAtSettle, processGroup: result.processGroup })}`);
+      expect(settledAt - firstRequest).toBeGreaterThanOrEqual(1_900);
+      expect(settledAt - firstRequest).toBeLessThan(2_400);
+      expect(answers).toBe(1);
+      expect(attemptsAtSettle).toBe(1);
+      expect(watch.attempts.length).toBe(attemptsAtSettle);
+      expect(result.processGroup).toMatchObject({ reaped: false, signals: ["sent"], delivered: 1, ownership: "HELD" });
+      expectConsistentReap(result.processGroup);
+    } finally {
+      watch.restore();
+      clearRowGroup(mark);
+      killMarked(marker);
+    }
+  });
 
   it.for(["exit0", "exit7", "sigterm"] as const)("%s: stdout, stderr and status are what running the CLI directly answers", async (mode, ctx) => {
     requireSeatbelt(ctx);
