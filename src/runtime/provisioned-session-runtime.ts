@@ -343,6 +343,19 @@ export class ProvisionedSessionRuntime {
     return allow(ReasonCode.OK, undefined);
   }
 
+  /**
+   * #246 C4-R2 — takes back the attestation a failed attempt would have proved, and only that one:
+   * the stored attestation is cleared when it is for the attempt's own incarnation and credential
+   * epoch. One a newer epoch earned while this attempt was still out is left exactly as it is.
+   */
+  #withdrawAttestation(sessionId: string, attempt: { incarnation: string; credentialEpoch: number } | null): void {
+    const stored = this.#attested.get(sessionId);
+    if (!stored || !attempt) return;
+    if (stored.incarnation === attempt.incarnation && stored.credentialEpoch === attempt.credentialEpoch) {
+      this.#attested.delete(sessionId);
+    }
+  }
+
   /** The daemon's launch channel and socket paths. Until both are attached no turn can run. */
   attach(ports: { delivery?: SessionCredentialDelivery; route?: SessionRelayRoute }): void {
     if (ports.delivery) this.#delivery = ports.delivery;
@@ -395,6 +408,11 @@ export class ProvisionedSessionRuntime {
       // has stands — a turn it may not run is no evidence against the one it ran.
       const eligible = this.turnEligibility(sessionId, "attestation", conversation, spawn);
       if (!eligible.allowed) return eligible;
+      // #246 C4-R2 — the incarnation and credential epoch this attempt proves, fixed before it awaits
+      // anything. Its outcome is written for exactly these and nothing newer: a late failure of an
+      // earlier epoch never takes back an attestation a later epoch has since earned.
+      const before = this.ports.sessions.get(sessionId);
+      const attempt = before ? { incarnation: before.incarnation, credentialEpoch: before.credentialEpoch } : null;
       const challenge = this.ports.attestations.challenge(sessionId);
       if (!challenge.allowed) return challenge as Decision<void>;
       const nonce = challenge.value.nonce;
@@ -407,16 +425,16 @@ export class ProvisionedSessionRuntime {
       // The turn awaited; whatever made it eligible is read again before the answer counts.
       const still = turn.allowed ? this.turnEligibility(sessionId, "attestation", conversation, spawn) : turn;
       if (!still.allowed) {
-        this.#attested.delete(sessionId);
+        this.#withdrawAttestation(sessionId, attempt);
         this.ports.attestations.withdraw(sessionId, nonce);
         return still as Decision<void>;
       }
       const settled = this.ports.attestations.settle(sessionId, nonce);
-      const session = this.ports.sessions.get(sessionId);
-      if (settled.allowed && session) {
-        this.#attested.set(sessionId, { incarnation: session.incarnation, credentialEpoch: session.credentialEpoch });
+      // `settle` refuses a challenge whose epoch moved, so a settled attempt is the current one.
+      if (settled.allowed && attempt) {
+        this.#attested.set(sessionId, attempt);
       } else {
-        this.#attested.delete(sessionId);
+        this.#withdrawAttestation(sessionId, attempt);
       }
       return settled;
     });
