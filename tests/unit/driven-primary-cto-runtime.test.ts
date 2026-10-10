@@ -471,6 +471,24 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       });
       const reattested = await cp.cto.ensurePrimaryCto("marker-project", "cto_start");
       expect(reattested).toMatchObject({ allowed: true, value: { sessionId: binding.sessionId, bindingGeneration: 1 } });
+
+      // A second record on the driven session itself, even one naming the same creation, is not one
+      // record: the session's mode is contradicted and it fails closed like the others.
+      cp.audit.record({
+        kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+        projectId: "marker-project",
+        roleKey: binding.roleKey,
+        sessionId: binding.sessionId,
+        evidence: { creationGeneration: 1 },
+      });
+      expect(cp.sessionRuntime.drivesSession(binding.sessionId, Role.PRIMARY_CTO)).toBe(false);
+      expect(cp.outbox.drivenModeOf(binding.sessionId)).toBe("CONTRADICTED");
+      expect(await cp.cto.ensurePrimaryCto("marker-project", "cto_start")).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.CONFLICT,
+      });
+      expect(cp.bindings.active(binding.roleKey)).toMatchObject({ sessionId: binding.sessionId, bindingGeneration: 1 });
+      expect(probedAsInteractive).not.toHaveBeenCalled();
     });
   });
 
@@ -520,6 +538,25 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       expect(cp.outbox.get(messageId)?.status).toBe("ACKED");
       expect(cp.db.get<{ status: string }>(`SELECT status FROM handoffs WHERE handoff_id = ?`, [opened.value.handoffId])?.status)
         .toBe("ACKED");
+
+      // An attestation whose turn fails outright closes the boundary the same way.
+      vi.spyOn(f.claude, "runSessionTurn").mockResolvedValueOnce({
+        ok: false,
+        text: "",
+        exitCode: 1,
+        error: "transient CLI failure",
+        providerSessionId: null,
+        durationMs: 1,
+      });
+      expect(await cp.cto.ensurePrimaryCto("stale-project", "cto_start")).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.SESSION_NOT_READY,
+      });
+      expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "after-a-failed-attestation-turn", kind: "test" }])).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.SESSION_NOT_READY,
+      });
+      expect(workTurnsOf(f, binding.sessionId)).toBe(1);
     });
   });
 });
