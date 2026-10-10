@@ -41,9 +41,10 @@ export const recordingMcpClient = (
   let nextId = 1;
   let held = "";
 
-  const request = (method: string, params: unknown): Promise<RecordedWire> =>
+  /** A request under the next number, or under `id` when the caller names one: any JSON-RPC id is legal. */
+  const request = (method: string, params: unknown, chosenId?: string | number): Promise<RecordedWire> =>
     new Promise((resolve, reject) => {
-      const id = nextId++;
+      const id = chosenId ?? nextId++;
       const key = JSON.stringify(id);
       const timer = setTimeout(() => {
         pending.delete(key);
@@ -87,9 +88,9 @@ export const recordingMcpClient = (
     /** Every `list_changed` the client was sent, by position in `received`. */
     listChanged: (): number[] =>
       received.flatMap((message, index) => (message.id === undefined && message.method === LIST_CHANGED ? [index] : [])),
-    /** `initialize` under `clientInfo`, then `notifications/initialized`. */
-    initialize: async (clientInfo: unknown): Promise<RecordedWire> => {
-      const init = await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo });
+    /** `initialize` under `clientInfo` (and under `id` when one is named), then `notifications/initialized`. */
+    initialize: async (clientInfo: unknown, id?: string | number): Promise<RecordedWire> => {
+      const init = await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo }, id);
       io.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
       return init;
     },
