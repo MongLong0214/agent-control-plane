@@ -2188,6 +2188,14 @@ export interface BuzzMentionSubscriberHandle {
    * session change, revoke). Idempotent, and a no-op once closed.
    */
   rejudge(): void;
+  /**
+   * Whether the configured identity behind a role's holder may be woken for delivery right now, and
+   * the room its session answers in: judged afresh against the registry and required admitted here
+   * too. The identity is found by its channel key, or else by the role it is pinned to. `null`
+   * when no configured identity stands behind that holder, so there is nothing of this
+   * subscriber's to judge.
+   */
+  deliveryEligibility(holder: { readonly actorId: string | null; readonly roleKey: string }): BuzzMentionDeliveryEligibility | null;
   readonly relayUrl: string | null;
   /** The roles this daemon's admitted identities are pinned to right now, in config order. */
   readonly roleKeys: readonly string[];
@@ -2225,6 +2233,13 @@ export interface BuzzSubscriberIdentityRooms {
   readonly rooms: readonly string[];
 }
 
+/** A holder's delivery eligibility, as the wake's final check reads it. */
+export interface BuzzMentionDeliveryEligibility {
+  readonly eligible: boolean;
+  /** The room the holder's session answers in when eligible; `null` otherwise. */
+  readonly room: string | null;
+}
+
 /** The disabled outcome, stated rather than implied by a null. */
 const NO_ADMISSION: BuzzMentionAdmissionSnapshot = Object.freeze({
   continuity: "NONE",
@@ -2240,6 +2255,7 @@ const DISABLED: BuzzMentionSubscriberHandle = {
   rejudge: () => {
     /* nothing is configured to judge */
   },
+  deliveryEligibility: () => null,
   relayUrl: null,
   roleKeys: [],
   rooms: [],
@@ -2472,6 +2488,17 @@ export const startBuzzMentionSubscriber = (
       };
     },
     admission,
+    deliveryEligibility: (holder) => {
+      const subscription =
+        (holder.actorId === null ? undefined : prepared.find((one) => one.pubkey === holder.actorId)) ??
+        prepared.find((one) => one.roleKey === holder.roleKey);
+      if (subscription === undefined) return null;
+      if (closed) return { eligible: false, room: null };
+      const judged = subscription.judge();
+      const eligible =
+        subscription.admitted && judged.verdict === "ADMITTED" && judged.binding.roleKey === holder.roleKey;
+      return { eligible, room: eligible && judged.verdict === "ADMITTED" ? judged.binding.room : null };
+    },
     rejudge: () => {
       if (closed) return;
       // Every answer read first, as at startup; then the identities that are not admissible are

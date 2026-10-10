@@ -158,6 +158,22 @@ export interface OwnerMessageProvenance {
   replyToEventId: null;
 }
 
+/** A holder's delivery eligibility as the composition reports it to the wake. */
+export interface WakeEligibility {
+  readonly eligible: boolean;
+  readonly room: string | null;
+}
+
+/**
+ * Whether the eligibility read at the handoff still allows the wake begun under `atStart`: when
+ * either reading names an identity, it must be eligible now and answer in the same room.
+ */
+const eligibilityHolds = (atStart: WakeEligibility | null, now: WakeEligibility | null): boolean => {
+  if (atStart === null && now === null) return true;
+  if (now === null || !now.eligible) return false;
+  return atStart === null || atStart.room === now.room;
+};
+
 export interface OwnerMessageHandover {
   claimed: {
     messageId: string;
@@ -474,6 +490,12 @@ export class RoleConversationPort {
    * synchronous section, which orders them against this process alone.
    */
   readonly #serializeWake: (<T>(body: () => T) => T) | null;
+  /**
+   * The delivery eligibility of a holder's identity, when the composition has one to consult: the
+   * mention subscriber's own judgement of the identity behind the holder, with the room its
+   * session answers in. `null` from it means no such identity stands behind the holder.
+   */
+  #wakeEligibility: ((binding: RoleBinding) => WakeEligibility | null) | null = null;
 
   constructor(
     role: Role,
@@ -491,6 +513,14 @@ export class RoleConversationPort {
     this.#ownerMessages = options.ownerMessages ?? null;
     this.#endpointDir = options.endpointDir === undefined ? null : resolvePath(options.endpointDir);
     this.#wakeTimeoutMs = options.wakeTimeoutMs ?? DEFAULT_ROLE_WAKE_TIMEOUT_MS;
+  }
+
+  /**
+   * Installs the eligibility the wake's final check consults. Set once the composition has what
+   * answers it (the mention subscriber starts after this port), and read on every wake.
+   */
+  useWakeEligibility(eligibility: (binding: RoleBinding) => WakeEligibility | null): void {
+    this.#wakeEligibility = eligibility;
   }
 
   get role(): Role {
@@ -1078,6 +1108,15 @@ export class RoleConversationPort {
     }
     const revalidated = this.#validateEndpointPath(peer.endpoint);
     if (!revalidated.allowed) return revalidated as Decision<void>;
+    // The identity behind the holder, and the room it answers in, as they stand when the wake
+    // begins. An identity not eligible now is not woken at all; the final check below asks again.
+    const eligibilityAtStart = this.#wakeEligibility?.(peer.binding) ?? null;
+    if (eligibilityAtStart !== null && !eligibilityAtStart.eligible) {
+      return deny(ReasonCode.ROLE_PEER_STALE, "the holder's identity is not eligible for delivery", {
+        role: this.#role,
+        roleKey,
+      });
+    }
 
     // Read before the connect and compared after it. What this delivery is about is the
     // registration in force when it began; by the time it completes the holder may have registered
@@ -1125,6 +1164,10 @@ export class RoleConversationPort {
           let handedOff = false;
           const handOff = (): void => {
             if (!this.#stillTheHolderToWake(roleKey, peer, registration, endpoint)) return;
+            // And the identity behind it is still eligible for delivery, in the same room it was
+            // when the wake began: a room lost or changed, or an exclusion, during the delayed
+            // connect hands off nothing. Read here, inside the same serialized section.
+            if (!eligibilityHolds(eligibilityAtStart, this.#wakeEligibility?.(peer.binding) ?? null)) return;
             // `end` rather than `write` then leaving it open: the peer's read side sees EOF, so a
             // reader does not have to know the frame's length to know the wake is complete. This
             // is what C0 measured the runtime accepting.

@@ -138,6 +138,7 @@ import {
   type OwnerMessageHandover,
   type OwnerMessageLedger,
   type OwnerMessageProvenance,
+  type WakeEligibility,
 } from "../mcp/role-conversation.ts";
 import { digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
@@ -1856,6 +1857,22 @@ export const buzzMentionBindingMoved = (
   if (!current) return true;
   if (binding.bindingGeneration !== null && current.bindingGeneration !== binding.bindingGeneration) return true;
   return binding.sessionId !== null && current.sessionId !== binding.sessionId;
+};
+
+/**
+ * The wake's delivery eligibility for a role's holder: the mention subscriber's own judgement of the
+ * configured identity behind it, found by the holder session's channel key or else by the role it
+ * is pinned to. `null` when no subscriber runs or no configured identity stands behind the holder.
+ */
+export const buzzMentionWakeEligibility = (
+  cp: ControlPlane,
+  running: () => Pick<BuzzMentionSubscriberHandle, "deliveryEligibility"> | null,
+) => (binding: RoleBinding): WakeEligibility | null => {
+  const actorId =
+    cp.db.get<{ buzz_actor_id: string | null }>(`SELECT buzz_actor_id FROM sessions WHERE session_id = ?`, [
+      binding.sessionId,
+    ])?.buzz_actor_id ?? null;
+  return running()?.deliveryEligibility({ actorId, roleKey: binding.roleKey }) ?? null;
 };
 
 /**
@@ -4951,6 +4968,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           canonical: canonicalSessions === null ? null : { sessions: canonicalSessions },
         });
         rejudgeBuzzMentionSubscriberOnBindingSwitch(cp, () => buzzMentionSubscriber);
+        listeners.ctoConversation.useWakeEligibility(buzzMentionWakeEligibility(cp, () => buzzMentionSubscriber));
         process.stdout.write(
           `Buzz mention subscriber configured identities: ${buzzMentionSubscriber.socketCount}\n`,
         );

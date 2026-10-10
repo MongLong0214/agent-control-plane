@@ -12,6 +12,7 @@ import type { BuzzMentionEvent } from "../../src/buzz/buzz-mention-subscriber.ts
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
+  buzzMentionWakeEligibility,
   rejudgeBuzzMentionSubscriberOnBindingSwitch,
   startBuzzMessageIngressListener,
   startDaemonBuzzMentionSubscriber,
@@ -142,6 +143,8 @@ const start = async (options: { production?: boolean; serializeWake?: <T>(body: 
     reportAdmission: () => undefined,
   });
   rejudgeBuzzMentionSubscriberOnBindingSwitch(h.cp, () => subscriber);
+  // main()'s line: the daemon-built port's wake consults the subscriber's delivery eligibility.
+  if (listeners !== null) listeners.ctoConversation.useWakeEligibility(buzzMentionWakeEligibility(h.cp, () => subscriber));
   await relay.drain(subscriber);
 
   // The holder attaches over the port and registers its endpoint; the registration's own wake lands.
@@ -316,6 +319,62 @@ it("does not report a wake as written when its transaction fails, even after the
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.ROLE_PEER_FAILED);
     expect(wakes.dialled.at(-1)!.destroyed).toBe(true);
+  } finally {
+    await f.close();
+  }
+});
+
+/**
+ * 1080-N1-01, the room half (the closure review's counterexample). The wake's final check, inside
+ * the serialized handoff, includes the delivery eligibility of the identity behind the holder and
+ * the room its session answers in. A room lost or changed during the delayed connect hands off no
+ * frame. The message itself is untouched: no revoke ran, so it stays PENDING.
+ */
+for (const [change, room, reason] of [
+  ["lost", null, "ROOM_MISSING"],
+  ["changed", "room-somewhere-else", "ROOM_NOT_SUBSCRIBED"],
+] as const) {
+  it(`hands no wake frame when the holder's room is ${change} during the delayed connect`, async () => {
+    const f = await start({ production: true });
+    try {
+      const before = wakes.dialled.length;
+      f.h.clock.advance(1_000);
+      f.relay.publish(f.mention(`room ${change} during connect`));
+      await dialled(before + 1);
+      const pending = wakes.dialled.at(-1)!;
+      const holder = f.h.cp.bindings.active(f.roleKey)!;
+      f.h.cp.sessions.setBuzzAddress(holder.sessionId, room);
+      f.subscriber.rejudge();
+      expect(f.subscriber.admission().identities[0]).toMatchObject({ state: "EXCLUDED", reason });
+
+      pending.succeed();
+      await f.relay.drain(f.subscriber);
+      expect(pending.frame, "a holder whose room no longer holds received ROLE_WAKE_FRAME").toBeNull();
+      expect(f.ownerMessages()).toEqual([{ status: "PENDING" }]);
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+it("hands no wake frame when the room changes during the connect with no re-judgement, read inside the handoff", async () => {
+  const f = await start({ production: true });
+  try {
+    const before = wakes.dialled.length;
+    f.h.clock.advance(1_000);
+    f.relay.publish(f.mention("room rewritten, nobody re-judged"));
+    await dialled(before + 1);
+    const pending = wakes.dialled.at(-1)!;
+    // A raw rewrite of the room with no rejudge: the cached admission still says ADMITTED, and only
+    // the fresh judgement inside the handoff can see it.
+    f.h.cp.db.run(`UPDATE sessions SET buzz_address = ? WHERE session_id = ?`, [
+      "room-somewhere-else",
+      f.h.cp.bindings.active(f.roleKey)!.sessionId,
+    ]);
+    expect(f.subscriber.admission().identities[0]?.state).toBe("ADMITTED");
+    pending.succeed();
+    await f.relay.drain(f.subscriber);
+    expect(pending.frame).toBeNull();
   } finally {
     await f.close();
   }
