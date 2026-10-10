@@ -18,6 +18,7 @@ import { ATTACH_EXIT, runAdoptedCeoAttachRelay } from "../../src/cli/attach-rela
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
+  buzzPeerRegistry,
   createDaemonBuzzBindChallenges,
   startAdoptedCeoToolSocket,
   startBuzzMessageIngressListener,
@@ -790,12 +791,14 @@ describe("the re-adopted CEO recovers its own key from a terminal earlier CEO se
       [f.ceo.pubkey],
     )!.n;
 
-  it("recovers the key a revoked, terminal earlier CEO session carries, and leaves that row as it was", async () => {
+  it("recovers the key a revoked, terminal earlier CEO session carries, leaves that row as it was, and admits the CEO's next mention as a peer", async () => {
     const earlier = earlierHolder({ lifecycle: "ERROR", ceoLineage: true });
     const f = await startBindFixture({ history: earlier.history });
     const before = rowOf(f, earlier.sessionId());
     expect(before).toMatchObject({ buzz_actor_id: f.ceo.pubkey, lifecycle: "ERROR" });
     expect(f.ceoIdentity()).toBeNull();
+    // The window the peer rule then reads starts at the recovery, not at the generation's start.
+    f.h.clock.advance(120_000);
 
     const token = await f.mint();
     await f.relayDelivers(f.mention(f.ceo, `채널 신원 복구: ${token}`));
@@ -809,6 +812,22 @@ describe("the re-adopted CEO recovers its own key from a terminal earlier CEO se
         actor: `buzz:${f.ceo.pubkey}`,
         evidence: expect.objectContaining({ channel: "buzz", recoveredFrom: [earlier.sessionId()] }),
       })]);
+    expect(buzzPeerRegistry(f.h.cp).currentCeo()).toMatchObject({
+      sessionId: f.ceoSessionId,
+      channelIdentity: f.ceo.pubkey,
+      channelIdentityReused: false,
+    });
+
+    // Signed before the recovery, inside the generation: not this CEO's for certain, so refused.
+    const stale = f.mention(f.ceo, "복구 전에 서명됨", f.nowSeconds() - 60);
+    await f.relayDelivers(stale);
+    expect(f.refusedWith(ReasonCode.BUZZ_PEER_EVENT_OUTSIDE_GENERATION)).toBe(1);
+    expect(f.inbound(stale.id)).toBeUndefined();
+
+    const after = f.mention(f.ceo, "CTO, 이 작업을 맡아 주세요", f.nowSeconds() + 1);
+    await f.relayDelivers(after);
+    expect(f.inbound(after.id)).toBeDefined();
+    expect(f.peerRows()).toHaveLength(1);
   });
 
   it("refuses the key while another session holding it is live, and when a terminal holder is not of the CEO lineage", async () => {

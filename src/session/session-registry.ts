@@ -118,6 +118,12 @@ export interface BuzzActorHolders {
   readonly blocking: string | null;
 }
 
+/** A key the CEO took past earlier CEO rows (CEO 1791632040): when, and which rows it was proven against. */
+export interface BuzzActorRecovery {
+  readonly at: string;
+  readonly from: readonly string[];
+}
+
 const CEO_ROLE_KEY = roleKeyFor(Role.CEO);
 
 /** The creation response is the only time a runtime receives its session secret. */
@@ -708,7 +714,9 @@ export class SessionRegistry {
   /**
    * Another session row that carries this Buzz channel identity, live or not; a read for refusing
    * early. A stopped row keeps the column, and #1038's peer rule reads any other holder of a key as
-   * making that key's events ambiguous, so a binding onto it would bind nothing usable.
+   * making that key's events ambiguous unless the key was recovered past it by possession, so a
+   * relay-signed binding onto it would bind nothing usable. Only the possession form may take a key
+   * past earlier rows (`buzzActorHolders`): a relay's envelope proves the relay, not the key.
    */
   otherSessionCarrying(buzzActorId: string, sessionId: string): string | null {
     const row = this.db.get<{ session_id: string }>(
@@ -746,6 +754,32 @@ export class SessionRegistry {
       history: rows.filter((row) => row.history === 1).map((row) => row.session_id),
       blocking: rows.find((row) => row.history !== 1)?.session_id ?? null,
     };
+  }
+
+  /**
+   * The recovery this session's binding of this identity was, when it was one: the first
+   * `SESSION_BUZZ_ACTOR_BOUND` record for the pair, with the earlier rows it was proven against.
+   * Null for a first binding, or for a record whose evidence does not name them.
+   */
+  buzzActorRecovery(sessionId: string, buzzActorId: string): BuzzActorRecovery | null {
+    const row = this.db.get<{ at: string; evidence_json: string }>(
+      `SELECT at, evidence_json FROM audit_events
+        WHERE kind = 'SESSION_BUZZ_ACTOR_BOUND' AND session_id = ? AND actor = ?
+        ORDER BY event_id LIMIT 1`,
+      [sessionId, `buzz:${buzzActorId}`],
+    );
+    if (!row) return null;
+    let evidence: unknown;
+    try {
+      evidence = JSON.parse(row.evidence_json) as unknown;
+    } catch {
+      return null;
+    }
+    if (typeof evidence !== "object" || evidence === null) return null;
+    const from = (evidence as Record<string, unknown>)["recoveredFrom"];
+    if (!Array.isArray(from) || from.length === 0) return null;
+    if (!from.every((id): id is string => typeof id === "string")) return null;
+    return { at: row.at, from };
   }
 
   setBuzzAddress(sessionId: string, address: string | null): void {

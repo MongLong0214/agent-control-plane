@@ -128,14 +128,20 @@ export interface BuzzPeerCurrentCeo {
    * binds one, and #1037 is what issues the credential that lets `bindActor` do it.
    */
   readonly channelIdentity: string | null;
-  /** When this generation's assignment was created. */
+  /**
+   * When this generation's assignment was created — or, for an identity this runtime recovered past
+   * terminal earlier CEO rows by proving possession (CEO 1791632040), when it was recovered, if that
+   * is later: the earliest moment an event signed with the identity is this generation's.
+   */
   readonly generationStartedAt: string;
   /**
    * Whether that identity is anything but this generation's alone (#1044): another session row —
    * of any lifecycle — carries it, or this runtime carried it while serving an earlier CEO
    * generation. Either way an event signed with it may be an earlier holder's, and nothing in the
    * event can say which, so every event signed with it is refused. A fresh identity per CEO
-   * generation is the remedy.
+   * generation is one remedy; the other is the possession-proven recovery (CEO 1791632040), after
+   * which terminal earlier CEO rows the recovery names are history, not reuse, and the window above
+   * starts at the recovery. A live second holder, or any other row, is still reuse.
    *
    * It is the identity's history, not the runtime's: a runtime that served an earlier generation
    * with no identity and took this one only afterwards holds an identity no earlier generation used.
@@ -704,8 +710,9 @@ export class BuzzMessageIngress {
       );
     }
     // In whole seconds (`signedSince`). Truncating admits the fraction of the start second before
-    // the start, and only for an identity no earlier generation held — so it reopens nothing for an
-    // earlier generation.
+    // the start. For an identity no earlier generation held that reopens nothing for an earlier
+    // generation; for a recovered one the start is the recovery, which every earlier holder's row
+    // was already terminal at.
     const signedAt = signedSince(input.createdAt, ceo.generationStartedAt);
     if (signedAt === null || signedAt * 1000 > peers.nowMs() + BUZZ_PEER_FUTURE_SKEW_SECONDS * 1000) {
       return deny(
