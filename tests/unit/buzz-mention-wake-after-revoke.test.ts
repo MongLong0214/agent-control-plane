@@ -200,7 +200,7 @@ it("writes the wake to the holder that is still current when its connection comp
   }
 });
 
-it("writes no wake to a holder revoked while the wake was connecting, and leaves the message durable", async () => {
+it("hands no wake frame to a holder revoked while the wake was connecting; the revoke's existing fence settles the message REJECTED", async () => {
   const f = await start();
   try {
     const before = wakes.dialled.length;
@@ -215,10 +215,11 @@ it("writes no wake to a holder revoked while the wake was connecting, and leaves
     await f.relay.drain(f.subscriber);
     expect(pending.frame, "a revoked holder received ROLE_WAKE_FRAME").toBeNull();
     expect(pending.destroyed).toBe(true);
-    // The wake attempt is all that was discarded: the message was admitted and is not marked
-    // delivered or completed by the wake that was not written.
-    expect(f.ownerMessages()).toHaveLength(1);
-    expect(f.ownerMessages()[0]!.status).not.toBe("ACKED");
+    // The wake frame and the message are two things. The wake attempt is all the port discarded;
+    // the message was settled by the ordinary revoke's existing terminal fence, which rejects a
+    // queued row of the released generation and settles its ingress claim. It was never handed to
+    // the revoked holder, and it was not delivered or completed.
+    expect(f.ownerMessages()).toEqual([{ status: "REJECTED" }]);
   } finally {
     await f.close();
   }
@@ -229,7 +230,7 @@ it("writes no wake to a holder revoked while the wake was connecting, and leaves
  * goes through that session's own authenticated connection, and each such call judges the holder
  * again when it is made. A former holder that was woken before its revoke finds nothing to take.
  */
-it("refuses the claim of a holder revoked after its wake landed, and leaves the message for the next holder", async () => {
+it("refuses the claim of a holder revoked after its wake frame landed; the ordinary revoke settles the message REJECTED", async () => {
   const f = await start();
   try {
     const before = wakes.dialled.length;
@@ -244,8 +245,9 @@ it("refuses the claim of a holder revoked after its wake landed, and leaves the 
     const claimed = f.conversation.claimOwnerMessage(f.server, f.roleKey);
     expect(claimed.allowed).toBe(false);
     expect(claimed.reasonCode).toBe(ReasonCode.ROLE_PEER_STALE);
-    expect(f.ownerMessages()).toHaveLength(1);
-    expect(f.ownerMessages()[0]!.status).not.toBe("ACKED");
+    // The frame reached the endpoint before the revoke (the Limit: a wake already handed off is not
+    // recalled); the message did not reach the holder, and the revoke's fence settled it.
+    expect(f.ownerMessages()).toEqual([{ status: "REJECTED" }]);
   } finally {
     await f.close();
   }
@@ -294,6 +296,11 @@ it("orders an outside writer's revoke after the handoff, never between the re-ch
     // Once the transaction has closed, the same writer's revoke commits: it is ordered after.
     expect(revoke.run(f.h.cp.clock.nowIso(), "raw revoke after the handoff", f.roleKey).changes).toBe(1);
     expect(f.h.cp.bindings.active(f.roleKey)).toBeNull();
+    // A raw revoke runs no fence, so the message stays PENDING; the stale holder's claim is refused.
+    expect(f.ownerMessages()).toEqual([{ status: "PENDING" }]);
+    const claimed = f.conversation.claimOwnerMessage(f.server, f.roleKey);
+    expect(claimed.allowed).toBe(false);
+    expect(claimed.reasonCode).toBe(ReasonCode.ROLE_PEER_STALE);
   } finally {
     outside.close();
     await f.close();
