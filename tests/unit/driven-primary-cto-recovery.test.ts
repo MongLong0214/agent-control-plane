@@ -1,8 +1,9 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { Role, SessionLifecycle } from "../../src/domain/types.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { IN_BAND_REWAKE_MS } from "../../src/outbox/outbox.ts";
+import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD } from "../../src/runtime/provisioned-session-runtime.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import {
   DRIVEN_HANDOFF,
@@ -16,7 +17,7 @@ import {
   workTurnsOf,
 } from "../helpers/driven-primary-cto.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { fixtureManifest } from "../helpers/harness.ts";
+import { fixtureManifest, registerFixtureProject } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -303,6 +304,149 @@ describe("#246 C4-R2 — a driven PRIMARY_CTO is recovered on its own session, a
       expect(cp.sessions.require(binding.sessionId).credentialEpoch).toBe(epoch);
       expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(false);
       expect(countAudit(f, "PRIMARY_CTO_RECOVERED", binding.sessionId)).toBe(0);
+    });
+  });
+});
+
+const CLEANUP = "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP";
+
+const cleanupOutcomes = (f: BootstrapRuntimeFixture, sessionId: string): string[] =>
+  f.harness.cp.db.all<{ outcome: string }>(
+    `SELECT json_extract(evidence_json, '$.outcome') AS outcome FROM audit_events
+      WHERE kind = ? AND session_id = ? ORDER BY event_id`,
+    [CLEANUP, sessionId],
+  ).map((row) => row.outcome);
+
+/** The session a project's driven spawn created, read from its spawn record. */
+const spawnedSession = (f: BootstrapRuntimeFixture, projectId: string): string =>
+  f.harness.cp.db.get<{ session_id: string }>(
+    `SELECT session_id FROM audit_events WHERE kind = ? AND project_id = ? ORDER BY event_id DESC LIMIT 1`,
+    [DRIVEN_PRIMARY_CTO_SPAWN_RECORD, projectId],
+  )!.session_id;
+
+/** Provisions a driven PRIMARY_CTO, running `interpose` at its readiness check: after READY, before the bind. */
+const provisionAround = async (
+  f: BootstrapRuntimeFixture,
+  projectId: string,
+  interpose: (sessionId: string) => void,
+) => {
+  const cp = f.harness.cp;
+  cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+  await registerFixtureProject(f.harness, projectId);
+  const bootstrap = await f.dispatchBootstrap();
+  const readiness = cp.doctor.sessionReadiness.bind(cp.doctor);
+  vi.spyOn(cp.doctor, "sessionReadiness").mockImplementationOnce(async (sessionId: string) => {
+    interpose(sessionId);
+    return readiness(sessionId);
+  });
+  const result = await cp.cto.ensureDrivenPrimaryCto(projectId, bootstrap.runId);
+  return { result, sessionId: spawnedSession(f, projectId), roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId }) };
+};
+
+describe("#246 C4-R2 — a driven spawn cleans up only what it created", () => {
+  it("stops the session of a refused spawn at the provider", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+      await registerFixtureProject(f.harness, "refused-spawn");
+      const bootstrap = await f.dispatchBootstrap();
+      f.claude.presentAttestation = false;
+      const refused = await cp.cto.ensureDrivenPrimaryCto("refused-spawn", bootstrap.runId);
+      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+      const loser = spawnedSession(f, "refused-spawn");
+      expect(f.claude.stopped).toEqual([externalOf(f, loser)]);
+      expect(cp.sessions.require(loser).lifecycle).toBe(SessionLifecycle.STOPPED);
+      expect(cleanupOutcomes(f, loser)).toEqual(["STOPPED"]);
+    });
+  });
+
+  it("stops the spawn that lost the race and leaves the winner untouched", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const winner = cp.sessions.create({ provider: "scripted", model: "winner-cto" });
+      cp.sessions.transition(winner.sessionId, SessionLifecycle.READY, "fixture: the winner");
+      const scriptedStops = vi.spyOn(f.harness.scripted, "stopSession");
+      const { result, sessionId: loser, roleKey } = await provisionAround(f, "lost-race", () => {
+        const won = cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "lost-race", sessionId: winner.sessionId });
+        if (!won.allowed) throw new Error(won.message);
+      });
+      expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_ALREADY_ACTIVE });
+      // The loser, and only the loser, is stopped at the provider and recorded so.
+      expect(f.claude.stopped).toEqual([externalOf(f, loser)]);
+      expect(cp.sessions.require(loser).lifecycle).toBe(SessionLifecycle.STOPPED);
+      expect(cp.sessionRuntime.holds(loser)).toBe(false);
+      expect(cleanupOutcomes(f, loser)).toEqual(["STOPPED"]);
+      // The winner keeps its binding, its READY session and every resource it has.
+      expect(cp.bindings.active(roleKey)).toMatchObject({ sessionId: winner.sessionId });
+      expect(cp.sessions.require(winner.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+      expect(scriptedStops).not.toHaveBeenCalled();
+      expect(cleanupOutcomes(f, winner.sessionId)).toEqual([]);
+    });
+  });
+
+  it("records a failed stop as remaining, never as cleaned up", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const winner = cp.sessions.create({ provider: "scripted", model: "winner-cto" });
+      cp.sessions.transition(winner.sessionId, SessionLifecycle.READY, "fixture: the winner");
+      vi.spyOn(f.claude, "stopSession").mockRejectedValueOnce(new Error("provider stop failed"));
+      const { result, sessionId: loser } = await provisionAround(f, "stop-failed", () => {
+        const won = cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "stop-failed", sessionId: winner.sessionId });
+        if (!won.allowed) throw new Error(won.message);
+      });
+      expect(result.allowed).toBe(false);
+      expect(cleanupOutcomes(f, loser)).toEqual(["REMAINING_STOP_FAILED"]);
+      expect(cp.sessions.require(loser).lifecycle).toBe(SessionLifecycle.ERROR);
+      expect(countAudit(f, "CTO_UNUSED_SESSION_STOP_FAILED", loser)).toBe(1);
+    });
+  });
+
+  it("records a failed stop of a refused spawn as remaining as well", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+      await registerFixtureProject(f.harness, "refused-stop-failed");
+      const bootstrap = await f.dispatchBootstrap();
+      f.claude.presentAttestation = false;
+      vi.spyOn(f.claude, "stopSession").mockRejectedValueOnce(new Error("provider stop failed"));
+      expect((await cp.cto.ensureDrivenPrimaryCto("refused-stop-failed", bootstrap.runId)).allowed).toBe(false);
+      const loser = spawnedSession(f, "refused-stop-failed");
+      expect(cleanupOutcomes(f, loser)).toEqual(["REMAINING_STOP_FAILED"]);
+      expect(cp.sessions.require(loser).lifecycle).toBe(SessionLifecycle.ERROR);
+    });
+  });
+
+  it("stops nothing whose ownership it cannot prove, and records it as remaining", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      // The spawning session itself comes to hold the role before the bind: it is now a holder.
+      const { result, sessionId: spawned, roleKey } = await provisionAround(f, "unverified", (sessionId) => {
+        const held = cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "unverified", sessionId });
+        if (!held.allowed) throw new Error(held.message);
+      });
+      expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_ALREADY_ACTIVE });
+      expect(cleanupOutcomes(f, spawned)).toEqual(["REMAINING_OWNERSHIP_UNVERIFIED"]);
+      expect(f.claude.stopped).toEqual([]);
+      expect(cp.sessions.require(spawned).lifecycle).toBe(SessionLifecycle.READY);
+      expect(cp.bindings.active(roleKey)).toMatchObject({ sessionId: spawned });
+    });
+  });
+
+  it("stops nothing when the spawned session carries a second spawn record, and records it as remaining", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const { result, sessionId: spawned } = await provisionAround(f, "two-records", (sessionId) => {
+        cp.audit.record({
+          kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+          projectId: "two-records",
+          roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: "two-records" }),
+          sessionId,
+          evidence: { creationGeneration: 1 },
+        });
+      });
+      expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+      expect(cleanupOutcomes(f, spawned)).toEqual(["REMAINING_OWNERSHIP_UNVERIFIED"]);
+      expect(f.claude.stopped).toEqual([]);
     });
   });
 });

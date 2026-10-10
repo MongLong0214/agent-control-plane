@@ -301,7 +301,7 @@ export class CtoLifecycle {
       purpose: "primary-cto",
       runtime,
       canonicalGuard: { roleKey, runId },
-      ...(driven ? { drivenForActivation: runId } : {}),
+      ...(driven ? { drivenForActivation: runId, stopOnRefusal: true } : {}),
     });
     if (!created.allowed) return created as Decision<RoleBinding>;
 
@@ -325,12 +325,12 @@ export class CtoLifecycle {
     });
     if (!bound.allowed && bound.reasonCode === ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM) {
       const claimed = this.#releasedCanonicalHolder(projectId, roleKey);
-      await this.stopUnusedSession(created.value, "canonical role claimed during provisioning");
+      await (driven ? this.#cleanUpDrivenSpawn(created.value, runId, "canonical role claimed during provisioning") : this.stopUnusedSession(created.value, "canonical role claimed during provisioning"));
       return claimed ? this.#refuseAdoptedCanonical(claimed, null, null, runId) : bound;
     }
     if (!bound.allowed) {
-      if (driven) this.#sessionRuntime?.release(created.value);
-      this.sessions.transition(created.value, SessionLifecycle.STOPPED, "binding refused");
+      if (driven) await this.#cleanUpDrivenSpawn(created.value, runId, "binding refused");
+      else this.sessions.transition(created.value, SessionLifecycle.STOPPED, "binding refused");
       return bound;
     }
 
@@ -1244,6 +1244,10 @@ export class CtoLifecycle {
     // A refusal from here on has a provider session behind it. Every role records it ERROR; a role
     // that asked for it (a run's bootstrap CTO) also has the provider stop it, so no refused spawn
     // is left running.
+    // #246 C4-R2 — a driven PRIMARY_CTO's refused spawn reports what its cleanup did. The handle it
+    // stops is the one this attempt's own `startSession` returned, so ownership is proven by
+    // construction; a stop that fails leaves the session REMAINING, never counted as cleaned up.
+    const drivenSpawn = role === Role.PRIMARY_CTO && request.drivenForActivation !== undefined;
     const refuse = async <T>(reason: string, refused: Decision<T>): Promise<Decision<T>> => {
       headless?.release(session.sessionId);
       this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, reason);
@@ -1251,6 +1255,7 @@ export class CtoLifecycle {
         try {
           await adapter.stopSession(handle);
           this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, `${reason}: stopped`);
+          if (drivenSpawn) this.#recordSpawnCleanup(session.sessionId, request.drivenForActivation ?? null, "STOPPED", reason);
         } catch (error) {
           this.audit.record({
             kind: "CTO_UNUSED_SESSION_STOP_FAILED",
@@ -1258,6 +1263,7 @@ export class CtoLifecycle {
             sessionId: session.sessionId,
             evidence: { reason, role, error: error instanceof Error ? error.message : String(error) },
           });
+          if (drivenSpawn) this.#recordSpawnCleanup(session.sessionId, request.drivenForActivation ?? null, "REMAINING_STOP_FAILED", reason);
         }
       }
       return refused;
@@ -1715,6 +1721,66 @@ export class CtoLifecycle {
    * bound-session probe already does.
    */
   /**
+   * #246 C4-R2 — cleans up a driven PRIMARY_CTO spawn that lost its bind (another holder won the
+   * role, a canonical claim landed, or its record did not name the binding granted): stops only the
+   * provider session this attempt is proven to have created, and says what it did.
+   *
+   * Proven means all of: the session has exactly the one driven-spawn record its spawn wrote; the session
+   * holds no ACTIVE role, by its own row or as an actor's runtime, so it is not a winner or anyone's
+   * current holder; and it is not an adopted canonical runtime. Anything less is recorded `REMAINING_OWNERSHIP_UNVERIFIED` and
+   * nothing is stopped or released. A provider stop that fails leaves the session ERROR and recorded
+   * `REMAINING_STOP_FAILED`; only a stop that returned is recorded `STOPPED`.
+   */
+  async #cleanUpDrivenSpawn(sessionId: string, runId: string, reason: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    // The spawn wrote exactly one record for its session, naming its run; a second is not its own.
+    const records = this.db.all<{ run_id: string | null }>(
+      `SELECT run_id FROM audit_events WHERE kind = ? AND session_id = ?`,
+      [DRIVEN_PRIMARY_CTO_SPAWN_RECORD, sessionId],
+    );
+    const holdsRole = this.db.get<{ held: number }>(
+      `SELECT 1 AS held FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.status = 'ACTIVE' AND (a.session_id = ? OR c.current_session_id = ?)
+        LIMIT 1`,
+      [sessionId, sessionId],
+    ) !== undefined;
+    const owned = session !== null && session.lifecycle !== SessionLifecycle.STOPPED &&
+      records.length === 1 &&
+      !holdsRole && !isAdoptedCanonicalRuntime(this.db, sessionId);
+    if (!owned) {
+      this.#recordSpawnCleanup(sessionId, runId, "REMAINING_OWNERSHIP_UNVERIFIED", reason);
+      return;
+    }
+    this.#sessionRuntime?.release(sessionId);
+    try {
+      await this.stopProviderSession(session, Role.PRIMARY_CTO);
+      this.sessions.transition(sessionId, SessionLifecycle.STOPPED, `${reason}: stopped`);
+      this.#recordSpawnCleanup(sessionId, runId, "STOPPED", reason);
+    } catch (error) {
+      this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);
+      this.audit.record({
+        kind: "CTO_UNUSED_SESSION_STOP_FAILED",
+        reasonCode: ReasonCode.SESSION_STOP_FAILED,
+        sessionId,
+        evidence: { reason, role: Role.PRIMARY_CTO, error: error instanceof Error ? error.message : String(error) },
+      });
+      this.#recordSpawnCleanup(sessionId, runId, "REMAINING_STOP_FAILED", reason);
+    }
+  }
+
+  /** #246 C4-R2 — one record of what a driven spawn's cleanup did; only `STOPPED` is a cleanup. */
+  #recordSpawnCleanup(sessionId: string, runId: string | null, outcome: DrivenSpawnCleanupOutcome, reason: string): void {
+    this.audit.record({
+      kind: DRIVEN_PRIMARY_CTO_SPAWN_CLEANUP,
+      reasonCode: outcome === "STOPPED" ? ReasonCode.OK : ReasonCode.SESSION_STOP_FAILED,
+      runId,
+      sessionId,
+      evidence: { outcome, reason },
+    });
+  }
+
+  /**
    * #246 C4-R2 — recovers a driven PRIMARY_CTO on its own session after the daemon lost the
    * credential it held for it (a crash or restart before the session acknowledged its handoff).
    * The binding stays ACTIVE throughout, so no other session is ever spawned or bound for the role,
@@ -1888,6 +1954,15 @@ const notProvenReady = (sessionId: string, attested: Decision<void>): Decision<v
         sessionId,
         cause: attested.reasonCode,
       });
+
+/** #246 C4-R2 — the audit kind that says what a driven PRIMARY_CTO spawn's cleanup did. */
+export const DRIVEN_PRIMARY_CTO_SPAWN_CLEANUP = "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP";
+
+/**
+ * What a driven spawn's cleanup did: `STOPPED` is the only cleanup. `REMAINING_STOP_FAILED` and
+ * `REMAINING_OWNERSHIP_UNVERIFIED` name a provider session that may still exist.
+ */
+export type DrivenSpawnCleanupOutcome = "STOPPED" | "REMAINING_STOP_FAILED" | "REMAINING_OWNERSHIP_UNVERIFIED";
 
 /** #246 C4-R2 — how long a refused same-session recovery of a driven PRIMARY_CTO waits before the next. */
 export const DRIVEN_PRIMARY_CTO_RECOVERY_BACKOFF_MS = 15 * 60_000;
