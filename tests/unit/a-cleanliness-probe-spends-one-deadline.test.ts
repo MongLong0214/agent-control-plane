@@ -34,13 +34,10 @@ const SLOW_DISCOVERY_GIT = [
   "#!/bin/sh",
   'if [ "$1" = "-C" ] && [ -f "$2/.git/acp-fixture-git" ]; then',
   '  . "$2/.git/acp-fixture-git"',
+  // Ignore SIGTERM before anything else, so a kill that lands early still finds it ignored.
+  "  case \"$*\" in *\"$DELAY_ON\"*) if [ -n \"$IGNORE_TERM\" ]; then trap '' TERM; fi;; esac",
   "  printf '%s\\n' \"$*\" >> \"$2/.git/acp-fixture-git-calls\"",
-  '  case "$*" in',
-  '    *"$DELAY_ON"*)',
-  "      if [ -n \"$IGNORE_TERM\" ]; then trap '' TERM; fi",
-  '      /bin/sleep "$DELAY"',
-  "      ;;",
-  "  esac",
+  '  case "$*" in *"$DELAY_ON"*) /bin/sleep "$DELAY";; esac',
   "fi",
   'exec "${REAL_GIT:-/usr/bin/git}" "$@"',
   "",
@@ -86,6 +83,16 @@ const withSlowDiscovery = async <T>(
 
 const statusCalls = (calls: readonly string[]): string[] => calls.filter((call) => call.includes(" status "));
 
+/**
+ * The bound and delay of the cases that need the slow child to outlive its kill. The bound is
+ * logical; what it has to leave room for is the wrapper's own prologue -- `sh` starting, reading
+ * its settings and ignoring SIGTERM -- before the kill lands. Measured on a loaded host at 50ms, 8
+ * of 12 concurrent runs had `sh` killed before it got that far, so the case measured an ordinary
+ * kill, not a late settlement. 250ms leaves that room, and the delay is four times the bound.
+ */
+const LATE_BOUND_MS = 250;
+const LATE_DELAY_SECONDS = 1;
+
 describe("#1082 R3-01: one deadline bounds a cleanliness probe", () => {
   it("RF-S22 arm:validator #1082 R3-01: isClean caller timeout also bounds its newly added config discovery", async () => {
     const repo = makeRepo();
@@ -111,11 +118,11 @@ describe("#1082 R3-01: one deadline bounds a cleanliness probe", () => {
   });
 
   it("RF-S22 arm:validator #1082 R3-01: a discovery that settles after the deadline is not counted, and status is never started", async () => {
-    // The discovery ignores SIGTERM, so the bound's kill does not end it: it finishes its 350ms
-    // and exits 0, and Node settles that as a success. The deadline is spent by then.
+    // The discovery ignores SIGTERM, so the bound's kill does not end it: it finishes its delay and
+    // exits, and Node settles that as an answer. The deadline is spent by then.
     const repo = makeRepo();
-    const { result, calls } = await withSlowDiscovery(repo, { delaySeconds: 0.35, ignoreTerm: true }, () =>
-      isClean(repo, { timeoutMs: 50 }),
+    const { result, calls } = await withSlowDiscovery(repo, { delaySeconds: LATE_DELAY_SECONDS, ignoreTerm: true }, () =>
+      isClean(repo, { timeoutMs: LATE_BOUND_MS }),
     );
     expect(result).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
     expect(calls.filter((call) => call.includes("config --name-only"))).toHaveLength(1);
@@ -138,9 +145,11 @@ describe("#1082 R3-01: one deadline bounds a cleanliness probe", () => {
     const args = delayOn === "status --porcelain"
       ? ["status", "--porcelain"]
       : ["config", "--name-only", "--get-regexp", "^filter\\."];
-    const { result } = await withSlowDiscovery(repo, { delaySeconds: 0.3, ignoreTerm: true, delayOn }, () =>
-      git(repo, args, { timeoutMs: 50, allowFailure: true }),
+    const { result, calls } = await withSlowDiscovery(repo, { delaySeconds: LATE_DELAY_SECONDS, ignoreTerm: true, delayOn }, () =>
+      git(repo, args, { timeoutMs: LATE_BOUND_MS, allowFailure: true }),
     );
+    // The child got far enough to ignore the kill, so this is the late settlement, not a plain kill.
+    expect(calls).toHaveLength(1);
     // `before` is what the same settlement was reported as when a late settlement was counted.
     expect(result, `previously ${JSON.stringify(before)}`).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
   });
