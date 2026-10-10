@@ -75,11 +75,32 @@ const drivenPrimary = async (f: BootstrapRuntimeFixture, projectId: string) => {
   return { bootstrap, binding: bound.value };
 };
 
-const markersFor = (f: BootstrapRuntimeFixture, sessionId: string): Array<{ run_id: string | null; project_id: string | null }> =>
+interface MarkerRow {
+  run_id: string | null;
+  project_id: string | null;
+  role_key: string | null;
+  creation_generation: number | null;
+}
+
+const markersFor = (f: BootstrapRuntimeFixture, sessionId: string): MarkerRow[] =>
   f.harness.cp.db.all(
-    `SELECT run_id, project_id FROM audit_events WHERE kind = ? AND session_id = ?`,
+    `SELECT run_id, project_id, role_key,
+            json_extract(evidence_json, '$.creationGeneration') AS creation_generation
+       FROM audit_events WHERE kind = ? AND session_id = ?`,
     [DRIVEN_PRIMARY_CTO_SPAWN_RECORD, sessionId],
   );
+
+/** A project with a manifest and no repository: enough for its PRIMARY_CTO to be provisioned. */
+const registerBareProject = (f: BootstrapRuntimeFixture, projectId: string): void => {
+  const manifest = fixtureManifest(projectId);
+  const project = f.harness.cp.projects.register({
+    projectId,
+    name: projectId,
+    manifest,
+    authorization: f.harness.cp.manifestAuthorizationForTests(manifest),
+  });
+  if (!project.allowed) throw new Error(project.message);
+};
 
 /** The work turn the prompt asks for: read what is addressed in band, accept a handoff, acknowledge. */
 const actOnWorkTurns = (f: BootstrapRuntimeFixture, sessionId: string): void => {
@@ -157,7 +178,25 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       const { bootstrap, binding } = await drivenPrimary(f, "driven-project");
 
       // The fact is the session's own spawn record, written once, under the activating run.
-      expect(markersFor(f, binding.sessionId)).toEqual([{ run_id: bootstrap.runId, project_id: "driven-project" }]);
+      // Attributed to its project, role key, session and creation generation; the creation
+      // assignment that generation names was granted to this session, and carries the actor.
+      expect(markersFor(f, binding.sessionId)).toEqual([{
+        run_id: bootstrap.runId,
+        project_id: "driven-project",
+        role_key: binding.roleKey,
+        creation_generation: 1,
+      }]);
+      const holder = cp.db.get<{ actor_id: string }>(
+        `SELECT a.actor_id FROM assignments a
+           JOIN conversational_actors c ON c.actor_id = a.actor_id AND c.current_session_id = ?
+          WHERE a.assignment_id = ?`,
+        [binding.sessionId, binding.assignmentId],
+      )!;
+      expect(cp.db.get(
+        `SELECT session_id, project_id, actor_id FROM assignments WHERE role_key = ? AND binding_generation = 1`,
+        [binding.roleKey],
+      )).toEqual({ session_id: binding.sessionId, project_id: "driven-project", actor_id: holder.actor_id });
+      expect(cp.outbox.drivenModeOf(binding.sessionId)).toBe("DRIVEN");
       const session = cp.sessions.require(binding.sessionId);
       expect(session).toMatchObject({ provider: "claude", model: "opus", lifecycle: SessionLifecycle.READY });
       expect(binding).toMatchObject({ role: Role.PRIMARY_CTO, bindingGeneration: 1 });
@@ -348,6 +387,90 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       expect(cp.bindings.active(binding.roleKey)).toMatchObject({ sessionId: binding.sessionId, bindingGeneration: 1 });
       expect(f.claude.started.length).toBe(startedBefore);
       expect(countAudit(f, "CTO_SESSION_PROBE_FAILED", binding.sessionId)).toBe(1);
+    });
+  });
+
+  it("fails closed on a missing or contradicted spawn record, and keeps its record across an epoch change", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const { binding } = await drivenPrimary(f, "marker-project");
+      registerBareProject(f, "other-session-project");
+      registerBareProject(f, "other-generation-project");
+      const otherSession = await cp.cto.ensurePrimaryCto("other-session-project", "cto_start");
+      const otherGeneration = await cp.cto.ensurePrimaryCto("other-generation-project", "cto_start");
+      if (!otherSession.allowed || !otherGeneration.allowed) throw new Error("interactive primary CTOs were refused");
+
+      // Missing: an interactive session has no record, so nothing drives it — custody is refused.
+      const missing = otherSession.value.sessionId;
+      expect(cp.sessionRuntime.drivesSession(missing, Role.PRIMARY_CTO)).toBe(false);
+      expect(cp.sessionRuntime.adopt(missing, Role.PRIMARY_CTO, "not-its-credential", 0)).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.SESSION_RUNTIME_UNAVAILABLE,
+      });
+
+      // Contradicted: a record on a session naming another session's creation (the driven project's
+      // generation 1), and one naming a generation its own role key never granted.
+      cp.audit.record({
+        kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+        projectId: "marker-project",
+        roleKey: binding.roleKey,
+        sessionId: otherSession.value.sessionId,
+        evidence: { creationGeneration: 1 },
+      });
+      cp.audit.record({
+        kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+        projectId: "other-generation-project",
+        roleKey: otherGeneration.value.roleKey,
+        sessionId: otherGeneration.value.sessionId,
+        evidence: { creationGeneration: 2 },
+      });
+      const probedAsInteractive = vi.spyOn(f.harness.scripted, "probeSession");
+      for (const contradicted of [otherSession.value, otherGeneration.value]) {
+        expect(cp.sessionRuntime.drivesSession(contradicted.sessionId, Role.PRIMARY_CTO)).toBe(false);
+        expect(cp.sessionRuntime.adopt(contradicted.sessionId, Role.PRIMARY_CTO, "not-its-credential", 0).allowed).toBe(false);
+        expect(cp.outbox.drivenModeOf(contradicted.sessionId)).toBe("CONTRADICTED");
+        // Neither driven nor taken for interactive: refused, left READY and bound, nothing spawned.
+        const refused = await cp.cto.ensurePrimaryCto(contradicted.projectId!, "cto_start");
+        expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+        expect(await cp.cto.probeRoleSession(contradicted.sessionId, Role.PRIMARY_CTO)).toMatchObject({
+          allowed: false,
+          reasonCode: ReasonCode.CONFLICT,
+        });
+        expect(cp.sessions.require(contradicted.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+        expect(cp.bindings.active(contradicted.roleKey)).toMatchObject({ sessionId: contradicted.sessionId, bindingGeneration: 1 });
+        // Its rows are neither in band nor sent.
+        const row = cp.outbox.enqueue({
+          idempotencyKey: `handoff:contradicted-${contradicted.sessionId}`,
+          roleKey: contradicted.roleKey,
+          bindingGeneration: contradicted.bindingGeneration,
+          targetSessionId: contradicted.sessionId,
+          runId: null,
+          kind: MessageKind.HANDOFF_PACKAGE,
+          payload: { handoffId: "hof_contradicted", projectId: contradicted.projectId, handoff: HANDOFF },
+        });
+        if (!row.allowed) throw new Error(row.message);
+        expect(cp.outbox.claimDeliverable(50).map((claimed) => claimed.messageId)).not.toContain(row.value.messageId);
+        expect(cp.outbox.pendingInBandFor(contradicted.sessionId, contradicted.sessionIncarnation)).toEqual([]);
+      }
+      expect(probedAsInteractive).not.toHaveBeenCalled();
+      // The record on another session took nothing from the session whose creation it names.
+      expect(cp.outbox.drivenModeOf(binding.sessionId)).toBe("DRIVEN");
+
+      // An epoch change keeps the same session, incarnation, actor and binding, so the record still
+      // applies; the new credential is not attested until a turn presents it.
+      const before = cp.sessions.require(binding.sessionId);
+      const rotated = cp.sessions.rotateSecret(binding.sessionId, before.credentialEpoch);
+      if (!rotated.allowed) throw new Error(rotated.message);
+      expect(cp.sessionRuntime.adopt(binding.sessionId, Role.PRIMARY_CTO, rotated.value.sessionSecret, rotated.value.session.credentialEpoch).allowed).toBe(true);
+      expect(rotated.value.session).toMatchObject({ incarnation: before.incarnation, credentialEpoch: before.credentialEpoch + 1 });
+      expect(cp.outbox.drivenModeOf(binding.sessionId)).toBe("DRIVEN");
+      expect(cp.sessionRuntime.drivesSession(binding.sessionId, Role.PRIMARY_CTO)).toBe(true);
+      expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "after-rotation", kind: "test" }])).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.SESSION_NOT_READY,
+      });
+      const reattested = await cp.cto.ensurePrimaryCto("marker-project", "cto_start");
+      expect(reattested).toMatchObject({ allowed: true, value: { sessionId: binding.sessionId, bindingGeneration: 1 } });
     });
   });
 

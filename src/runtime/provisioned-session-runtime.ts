@@ -4,6 +4,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
+import type { Db } from "../db/database.ts";
 import { Role, type RoleBinding } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -40,7 +41,7 @@ export interface ProvisionedSessionRuntimePorts {
    * that row has left PENDING — acknowledged over the authenticated relay, or rejected or expired —
    * and not when a turn for it exited 0.
    */
-  readonly outbox: Pick<Outbox, "get">;
+  readonly outbox: Pick<Outbox, "get" | "drivenModeOf">;
 }
 
 export interface ProvisionedSessionRuntimeOptions {
@@ -61,22 +62,85 @@ const DRIVEN_ROLES: ReadonlySet<Role> = new Set([Role.BOOTSTRAP_CTO]);
 /**
  * #246 C4 — the audit kind that records a PRIMARY_CTO session spawned, for a bootstrap activation,
  * to be driven by this runtime. Written by `CtoLifecycle.spawn` in the transaction that creates the
- * session row, before its credential is adopted or anything can refuse it. `audit_events` is append
- * only, so the fact can neither be added later nor taken back, and a session that does not carry it
- * — every interactive PRIMARY_CTO, every adopted canonical CTO — is never driven here, whatever its
- * role. The role alone never makes a PRIMARY_CTO driven.
+ * session row, before its credential is adopted or anything can refuse it, and attributed there to
+ * its project (`project_id`), role key (`role_key`), session (`session_id`) and the binding
+ * generation it is created for (`evidence.creationGeneration`). The actor does not exist yet in that
+ * transaction — the bind mints it after the session is READY — so the record names the creation
+ * assignment instead, and that immutable row (`assignments_generation_immutable`) carries the actor.
+ *
+ * It proves the driving mode and nothing else: execution still needs the ACTIVE binding, a READY
+ * session and a current attestation. `audit_events` is append only (`audit_events_append_only`,
+ * `audit_events_no_delete`), so the fact can neither be added later nor taken back.
  *
  * An append-only spawn record rather than a new column or the shape of the session's workdir: the
  * schema is not changed for this, and a path is not a fact anybody recorded.
  */
 export const DRIVEN_PRIMARY_CTO_SPAWN_RECORD = "PRIMARY_CTO_DRIVEN_SESSION_SPAWNED";
 
-/** SQL: whether the session `sessionExpr` names was spawned as a driven PRIMARY_CTO. */
-export const drivenPrimaryCtoSessionSql = (sessionExpr: string): string => `EXISTS (
-  SELECT 1 FROM audit_events driven_e
-   WHERE driven_e.kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}'
-     AND driven_e.session_id = ${sessionExpr}
-)`;
+/**
+ * What a session's spawn record says about driving it, read the same way by every reader.
+ *
+ * - `NONE`: no record. Never driven here; an interactive or canonical CTO's own path.
+ * - `PENDING`: exactly one record, and the session holds no binding and its creation generation has
+ *   not been granted yet: spawned driven, not yet bound. Only the spawn's own custody accepts it.
+ * - `DRIVEN`: exactly one record; the creation assignment it names (role key, creation generation)
+ *   was granted to this very session in its project; and the role's ACTIVE binding is held by this
+ *   session for that assignment's actor, at the creation generation or a later one. A credential
+ *   epoch change touches none of that, and neither does a renewal on the same session and actor.
+ * - `CONTRADICTED`: a record that is anything else — a second one, another session's creation,
+ *   another generation, another project, a session that no longer holds the role. Every reader
+ *   fails closed on it: it is neither driven nor taken for interactive.
+ */
+export type DrivenMode = "NONE" | "PENDING" | "DRIVEN" | "CONTRADICTED";
+
+/** SQL: the `DrivenMode` of the session `sessionExpr` names. */
+export const drivenModeSql = (sessionExpr: string): string => `(CASE
+  WHEN NOT EXISTS (
+    SELECT 1 FROM audit_events dm_any
+     WHERE dm_any.kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}' AND dm_any.session_id = ${sessionExpr}
+  ) THEN 'NONE'
+  WHEN (
+    SELECT COUNT(*) FROM audit_events dm_n
+     WHERE dm_n.kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}' AND dm_n.session_id = ${sessionExpr}
+  ) <> 1 THEN 'CONTRADICTED'
+  WHEN EXISTS (
+    SELECT 1 FROM audit_events dm
+      JOIN assignments dm_c
+        ON dm_c.role_key = dm.role_key
+       AND dm_c.binding_generation = json_extract(dm.evidence_json, '$.creationGeneration')
+       AND dm_c.role = 'PRIMARY_CTO'
+       AND dm_c.project_id = dm.project_id
+       AND dm_c.session_id = dm.session_id
+      JOIN assignments dm_a
+        ON dm_a.role_key = dm.role_key
+       AND dm_a.status = 'ACTIVE'
+       AND dm_a.actor_id = dm_c.actor_id
+       AND dm_a.binding_generation >= dm_c.binding_generation
+      LEFT JOIN conversational_actors dm_h ON dm_h.actor_id = dm_a.actor_id
+     WHERE dm.kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}' AND dm.session_id = ${sessionExpr}
+       AND COALESCE(dm_h.current_session_id, dm_a.session_id) = dm.session_id
+  ) THEN 'DRIVEN'
+  WHEN EXISTS (
+    SELECT 1 FROM audit_events dm
+     WHERE dm.kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}' AND dm.session_id = ${sessionExpr}
+       AND dm.project_id IS NOT NULL
+       AND dm.role_key = 'PRIMARY_CTO:' || dm.project_id
+       AND json_type(dm.evidence_json, '$.creationGeneration') = 'integer'
+       AND NOT EXISTS (SELECT 1 FROM assignments dm_x WHERE dm_x.session_id = dm.session_id)
+       AND NOT EXISTS (SELECT 1 FROM conversational_actors dm_y WHERE dm_y.current_session_id = dm.session_id)
+       AND NOT EXISTS (
+         SELECT 1 FROM assignments dm_z
+          WHERE dm_z.role_key = dm.role_key
+            AND dm_z.binding_generation >= json_extract(dm.evidence_json, '$.creationGeneration')
+       )
+  ) THEN 'PENDING'
+  ELSE 'CONTRADICTED'
+END)`;
+
+/** `drivenModeSql` for one session id. */
+export const drivenModeOf = (db: Pick<Db, "get">, sessionId: string): DrivenMode =>
+  db.get<{ mode: DrivenMode }>(`SELECT ${drivenModeSql("q.sid")} AS mode FROM (SELECT ? AS sid) q`, [sessionId])
+    ?.mode ?? "CONTRADICTED";
 
 interface HeldCredential {
   role: Role;
@@ -158,15 +222,11 @@ export class ProvisionedSessionRuntime {
 
   /**
    * Whether this runtime drives `sessionId` holding `role`: every BOOTSTRAP_CTO, and a PRIMARY_CTO
-   * only when its own spawn recorded it driven (`DRIVEN_PRIMARY_CTO_SPAWN_RECORD`).
+   * only when its spawn record makes it `DRIVEN` — a missing or contradicted record never does.
    */
   drivesSession(sessionId: string, role: Role): boolean {
     if (DRIVEN_ROLES.has(role)) return true;
-    return role === Role.PRIMARY_CTO && this.#spawnedDriven(sessionId);
-  }
-
-  #spawnedDriven(sessionId: string): boolean {
-    return this.ports.audit.byKind(DRIVEN_PRIMARY_CTO_SPAWN_RECORD).some((row) => row.sessionId === sessionId);
+    return role === Role.PRIMARY_CTO && this.ports.outbox.drivenModeOf(sessionId) === "DRIVEN";
   }
 
   /**
@@ -198,10 +258,12 @@ export class ProvisionedSessionRuntime {
    * rotation just replaced it with. Replaces any earlier one for the session.
    */
   adopt(sessionId: string, role: Role, sessionSecret: string, credentialEpoch: number): Decision<void> {
-    if (!this.drivesSession(sessionId, role)) {
+    const mode = role === Role.PRIMARY_CTO ? this.ports.outbox.drivenModeOf(sessionId) : null;
+    if (!DRIVEN_ROLES.has(role) && mode !== "PENDING" && mode !== "DRIVEN") {
       return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "this runtime drives provisioned sessions only: a bootstrap CTO, or a primary CTO spawned driven", {
         sessionId,
         role,
+        drivenMode: mode,
       });
     }
     this.#held.set(sessionId, { role, sessionSecret, credentialEpoch });

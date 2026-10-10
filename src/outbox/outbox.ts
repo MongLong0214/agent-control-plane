@@ -19,7 +19,7 @@ import {
   isAdoptedCanonicalRuntime,
   peerMessageCarrySuccessionOf,
 } from "../registry/canonical-self-claim.ts";
-import { drivenPrimaryCtoSessionSql } from "../runtime/provisioned-session-runtime.ts";
+import { type DrivenMode, drivenModeOf, drivenModeSql } from "../runtime/provisioned-session-runtime.ts";
 import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
@@ -314,8 +314,9 @@ const inBandRow = (outboxAlias: "o" | "outbox"): string =>
 
 /**
  * #246 C1b — a provisioned session on the headless runtime: the current holder of an ACTIVE
- * BOOTSTRAP_CTO binding, or (#246 C4) of an ACTIVE PRIMARY_CTO binding whose session's own spawn
- * recorded it driven — never a PRIMARY_CTO by its role alone. Like an adopted canonical CTO it has
+ * BOOTSTRAP_CTO binding, or (#246 C4) of an ACTIVE PRIMARY_CTO binding whose session's spawn record
+ * makes it `DRIVEN` — never a PRIMARY_CTO by its role alone, and never on a missing or contradicted
+ * record. Like an adopted canonical CTO it has
  * nothing a Buzz send could reach — it has no live process at all between turns — so its in-band
  * kinds stay PENDING, the wake starts a turn of its own conversation, and that turn reads and
  * settles them over its authenticated connection exactly as a canonical CTO does.
@@ -327,8 +328,17 @@ const provisionedRuntimeSql = (sessionExpr: string): string => `EXISTS (
      AND COALESCE(prov_c.current_session_id, prov_a.session_id) = ${sessionExpr}
      AND (prov_a.role = 'BOOTSTRAP_CTO'
        OR (prov_a.role = 'PRIMARY_CTO'
-         AND ${drivenPrimaryCtoSessionSql("COALESCE(prov_c.current_session_id, prov_a.session_id)")}))
+         AND ${drivenModeSql("COALESCE(prov_c.current_session_id, prov_a.session_id)")} = 'DRIVEN'))
 )`;
+
+/**
+ * #246 C4 — a target whose driven-spawn record is contradicted (or names a session not yet bound) is
+ * neither in band nor sent: the delivery sweep withholds its rows exactly as it withholds an in-band
+ * row, so a record that does not add up fails closed rather than falling back to a Buzz send.
+ */
+const withheldFromSweep = (outboxAlias: "o" | "outbox"): string =>
+  `(${inBandRow(outboxAlias)}
+    OR ${drivenModeSql(`${outboxAlias}.target_session_id`)} NOT IN ('NONE', 'DRIVEN'))`;
 
 /** `inBandRow`, as a read of one kind and target: the same two halves, the same kind sets. */
 const deliveredInBand = (db: Pick<Db, "get">, kind: string, sessionId: string): boolean =>
@@ -666,7 +676,7 @@ export class Outbox {
             -- CTO already holds an authenticated connection to this daemon. It stays PENDING and
             -- the CTO reads it in band (pendingInBandFor), for the same reason as the line above:
             -- nothing here may transmit what only its exact target may read.
-            AND NOT ${inBandRow("o")}
+            AND NOT ${withheldFromSweep("o")}
             AND o.expires_at > ?
             -- A deferred retry is not deliverable until its window opens; the deferral is
             -- durable, so a restarted loop honours it instead of retrying immediately.
@@ -687,7 +697,7 @@ export class Outbox {
         const updated = this.db.run(
           `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = ?, claimed_at = ?
             WHERE message_id = ? AND status = 'PENDING'
-              AND NOT ${inBandRow("outbox")}
+              AND NOT ${withheldFromSweep("outbox")}
               AND ${liveDeliveryTarget("outbox")}`,
           [token, now, row.message_id],
         );
@@ -1281,6 +1291,14 @@ export class Outbox {
       if (!row) return deny(ReasonCode.NOT_FOUND, "unknown message", { messageId });
       return this.#acknowledgeInBandInTx(row, sessionId, sessionIncarnation);
     });
+  }
+
+  /**
+   * #246 C4 — the `DrivenMode` of a session, by the one predicate the in-band routing above reads, so
+   * the runtime that drives a session and the outbox that routes to it never disagree about it.
+   */
+  drivenModeOf(sessionId: string): DrivenMode {
+    return drivenModeOf(this.db, sessionId);
   }
 
   /** In-band, in `claimDeliverable`'s terms: an in-band kind addressed to a canonical or provisioned runtime. */
