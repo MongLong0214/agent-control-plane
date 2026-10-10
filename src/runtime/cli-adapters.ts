@@ -318,6 +318,18 @@ const sanctionedSettings = (): string => JSON.stringify({ hooks: {}, enabledPlug
 export const WORKER_SETTING_SOURCES = "project,local";
 /** #512 — with `--strict-mcp-config`, the only MCP servers a WORKER turn may start: none. */
 export const WORKER_MCP_CONFIG = JSON.stringify({ mcpServers: {} });
+/**
+ * #512 — the operator's setting sources and MCP servers left out: the claimed worktree's setting
+ * sources only, and a strict, empty MCP config. A WORKER turn carries these after the sanctioned
+ * `--settings`, and so does a session probe (#1077).
+ */
+const operatorConfigurationExcluded = (): string[] => [
+  "--setting-sources",
+  WORKER_SETTING_SOURCES,
+  "--mcp-config",
+  WORKER_MCP_CONFIG,
+  "--strict-mcp-config",
+];
 
 /**
  * macOS rejects nested `sandbox-exec` applications, so the owner egress profile and the
@@ -367,6 +379,212 @@ const killChildTree = (child: ReturnType<typeof spawn>): void => {
   }
 };
 
+/**
+ * #1077 — what ACP could establish about the probe's process group when it was asked to end it.
+ *
+ * - `HELD`: the holder, which leads the group, was ACP's own unreaped child and still carried the
+ *   start token read at spawn before every signal sent (see `endHeldGroup`).
+ * - `UNVERIFIABLE`: the holder had no recorded exit, but its start token was missing, unreadable or
+ *   different — before the first attempt (nothing sent) or after an undelivered attempt (the attempts
+ *   made are kept, none follows). The probe returned without waiting for the group.
+ * - `HOLDER_LOST`: the holder exited before ACP could end the group. Nothing was signalled.
+ */
+export type ProcessGroupOwnership = "HELD" | "UNVERIFIABLE" | "HOLDER_LOST";
+
+/** What ending one probe invocation's own process group observed (#1077). */
+export interface ProcessGroupReap {
+  /** The group's id: the pid of the holder this invocation spawned, which leads it. */
+  pgid: number;
+  /**
+   * The cleanup outcome. True only when ownership was `HELD`, at least one signal was delivered and
+   * the group was then observed with no member (`kill(-pgid, 0)` ESRCH) before the settle deadline.
+   * False in every other case: no delivered signal, an observation that never saw ESRCH (EPERM, EIO
+   * and every other error are unknown, not empty), the deadline, `UNVERIFIABLE` and `HOLDER_LOST`.
+   */
+  reaped: boolean;
+  /** Whether ACP attempted any signal to the group: exactly `signals.length > 0`. */
+  signalled: boolean;
+  /**
+   * Every signal ACP attempted on the group, in order, and what `kill(-pgid, SIGKILL)` answered:
+   * "sent", or the errno code. A failed attempt stays here even when a later one was delivered.
+   * Only `endHeldGroup` signals a probe's group, so this is all of them.
+   */
+  signals: string[];
+  /** How many of `signals` were delivered ("sent"). */
+  delivered: number;
+  ownership: ProcessGroupOwnership;
+  /** What may be left and why; null only when `reaped`. */
+  detail: string | null;
+}
+
+/**
+ * #1077 — a session probe whose own process group could not be confirmed empty. The probe is
+ * UNAVAILABLE, and the group that may still hold its processes is named, never counted as cleaned.
+ */
+export class ProbeProcessGroupUnconfirmed extends Error {
+  readonly reap: ProcessGroupReap;
+
+  constructor(reap: ProcessGroupReap) {
+    super(`session probe UNAVAILABLE (${reap.ownership}): ${reap.detail ?? `process group ${reap.pgid} was not confirmed empty`}`);
+    this.name = "ProbeProcessGroupUnconfirmed";
+    this.reap = reap;
+  }
+}
+
+/**
+ * How long a probe's group may take to be seen empty: once its holder has exited, when nothing asked
+ * for the end; otherwise this is also the settle deadline, counted from the first end request.
+ */
+const PROBE_GROUP_REAP_BOUND_MS = 2_000;
+/**
+ * The logical settle deadline of a probe that has been asked to end, counted on the monotonic clock
+ * from the first request: after it no answer can be a cleanup, and its timer answers UNAVAILABLE
+ * without waiting for any observation. It is the existing reap bound, so no route allows longer than it
+ * already did. It is not a guarantee of returning at exactly that time if the event loop stalls.
+ */
+const PROBE_END_SETTLE_BOUND_MS = PROBE_GROUP_REAP_BOUND_MS;
+/** How long, inside the one turn that holds ownership, undelivered attempts may be repeated. */
+const PROBE_GROUP_SIGNAL_SPIN_MS = 50;
+/** How long a probe's pipes may stay open after its holder exited before they are closed. */
+const PROBE_STDIO_DRAIN_MS = 1_000;
+
+/**
+ * #1077 — the probe's group leader, run by `/bin/ksh` inside the same sandbox as the CLI, under the
+ * same profile and environment, so it adds no authority. It moves its own stderr to /dev/null and
+ * keeps the original on fd 5 for the CLI alone, so nothing the holder says — a job-status line for a
+ * CLI killed by a signal, for one — reaches the CLI's stderr. It runs the CLI as its child, in its
+ * own group, with stdin, stdout and that stderr, and with fds 3, 4 and 5 closed for it; reports the
+ * CLI's status on fd 3; and then blocks reading fd 4, which ACP never writes, so it holds the
+ * group's id until ACP has signalled the group.
+ *
+ * ksh93 reports a CLI ended by a signal as 256 + the signal number, which no exit code can be, so
+ * the status is exact: `holderStatus` turns it back into what running the CLI directly answers.
+ */
+const PROBE_HOLDER_SCRIPT =
+  'exec 5>&2 2>/dev/null; "$@" 2>&5 5>&- 3>&- 4<&-; s=$?; printf \'exit %s\\n\' "$s" >&3; read -r _ <&4';
+
+/** The holder's report as the direct-execution exit code: a number, or null for a signal. */
+const holderStatus = (reported: number | null): number | null =>
+  reported === null || reported >= 256 ? null : reported;
+
+/**
+ * What `kill(-pgid, 0)` says about the group's members. PRESENT: a member ACP may signal. ABSENT: no
+ * process has the group id (ESRCH). UNOBSERVABLE: any other answer — EPERM, which on macOS is a group of
+ * unreaped zombies or a live member ACP may not signal, EIO, anything. UNOBSERVABLE is unknown: it is
+ * never read as dead, never extends a wait and never justifies a signal.
+ */
+type GroupLiveness = "PRESENT" | "ABSENT" | "UNOBSERVABLE";
+const groupLiveness = (pgid: number): GroupLiveness => {
+  try {
+    process.kill(-pgid, 0);
+    return "PRESENT";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH" ? "ABSENT" : "UNOBSERVABLE";
+  }
+};
+
+/** No process has this group id at all: only ESRCH. An observation; it signals nothing. */
+const groupIsEmpty = (pgid: number): boolean => {
+  try {
+    process.kill(-pgid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+};
+
+/**
+ * #1077 — signals the holder's group, only while ownership is provable, and answers what it could
+ * establish. Call it only from a `setImmediate` callback.
+ *
+ * Before every attempt, in the same synchronous turn: the holder has no recorded exit, its start
+ * token was read at spawn, and it reads back the same now. A null, unreadable or different token
+ * means no attempt (`UNVERIFIABLE`). The first delivered SIGKILL ends the attempts; an undelivered one
+ * is repeated only while a signallable member is observed (`groupLiveness` PRESENT) and the token
+ * still verifies. With nothing delivered the probe answers at once; with a delivery it answers once
+ * the group is observed gone, and in every case by the settle deadline fixed at the first request.
+ *
+ * Why no recorded exit means an unreaped holder, on macOS with the libuv 1.52.1 in Node 24.18.0:
+ * - libuv reaps a registered child only inside `uv__io_poll`: a kqueue `EVFILT_PROC`/`NOTE_EXIT`
+ *   event marks it and `uv__wait_children` then calls `waitpid` (src/unix/kqueue.c,
+ *   src/unix/process.c). The spawn-error path waits only for the child it was creating.
+ * - `uv__wait_children` reaps every exited child first and only then calls each exit callback, and
+ *   Node's `ProcessWrap::OnExit` runs JS `onexit`, which sets `exitCode`/`signalCode` before it emits
+ *   `exit` (src/process_wrap.cc, lib/internal/child_process.js). So while those callbacks run — and
+ *   the ticks and microtasks each one drains — a child reaped in the same batch has no exit recorded
+ *   yet. Measured: inside one child's `exit` handler, a sibling reaped with it answers ESRCH while its
+ *   `exitCode` is still null. A check made from there would prove nothing.
+ * - The check phase (`setImmediate`) runs after `uv__io_poll` has returned (src/unix/core.c `uv_run`),
+ *   so by then every child libuv has reaped has had its exit recorded. No exit recorded here means the
+ *   holder is not reaped: live, or a zombie whose pid XNU keeps in its pid hash.
+ * - XNU hands out no pid that is in the pid hash (live or zombie), names a process group or names a
+ *   session (bsd/kern/kern_fork.c), and removes a pid from the hash only when it is reaped
+ *   (bsd/kern/kern_exit.c `reap_child_locked`). A new group takes the id of the process creating it,
+ *   and a process can join a group only in its own session (bsd/kern/kern_prot.c `setpgid`,
+ *   `setsid_internal`). So while the holder is unreaped, a group with its id is the group it created
+ *   in its own session — the probe's — and no other.
+ * The whole turn is synchronous, so the holder stays unreaped through every signal sent here.
+ *
+ * Limit: the proof assumes nothing else in this process reaps children: libuv waits only for the
+ * pids it spawned, and no `waitpid(-1)` may be added. A debugger attached to the holder could reap
+ * it, and that case is not covered.
+ * Limit: a descendant that leaves the group (`setsid`, `setpgid`) is outside it and is not ended.
+ * Limit: if ownership cannot be established, nothing is signalled at all; the result is UNAVAILABLE
+ * and the group is reported as possibly still holding the probe's processes.
+ */
+const endHeldGroup = (
+  child: ReturnType<typeof spawn>,
+  pgid: number,
+  holderStartedAt: string | null,
+  signals: string[],
+): { ownership: ProcessGroupOwnership; settleNow: boolean } => {
+  if (child.exitCode !== null || child.signalCode !== null) return { ownership: "HOLDER_LOST", settleNow: false };
+  const owned = (): boolean =>
+    child.exitCode === null &&
+    child.signalCode === null &&
+    holderStartedAt !== null &&
+    readProcessStartToken(pgid) === holderStartedAt;
+  if (!owned()) return { ownership: "UNVERIFIABLE", settleNow: true };
+  // One delivered SIGKILL is the end: the group is then judged on the observation after the holder's
+  // exit. An undelivered attempt is repeated only while a signallable member is observed and the
+  // token still verifies; an unobservable group or a failed verification ends the attempts.
+  const deadline = Date.now() + PROBE_GROUP_SIGNAL_SPIN_MS;
+  let verificationFailed = false;
+  for (;;) {
+    try {
+      process.kill(-pgid, "SIGKILL");
+      signals.push("sent");
+    } catch (error) {
+      signals.push((error as NodeJS.ErrnoException).code ?? "error");
+    }
+    if (signals[signals.length - 1] === "sent") break;
+    if (groupLiveness(pgid) !== "PRESENT" || Date.now() >= deadline) break;
+    if (!owned()) {
+      verificationFailed = true;
+      break;
+    }
+  }
+  // Nothing delivered: this can no longer become a cleanup, so the probe answers now, whatever any
+  // observation might say later.
+  const delivered = signals.filter((result) => result === "sent").length;
+  return { ownership: verificationFailed ? "UNVERIFIABLE" : "HELD", settleNow: delivered === 0 };
+};
+
+/**
+ * Observes, after the holder has exited, whether the group has emptied, until `until`. Sends no
+ * signal. The deadline is checked before every observation, and an ESRCH is returned with the time it
+ * was seen, so the caller can require it to precede the deadline.
+ */
+const observeGroupEmpty = async (pgid: number, until: number): Promise<{ empty: boolean; at: number }> => {
+  // `until` and `at` are `performance.now()` readings: the same monotonic clock as the deadline.
+  for (;;) {
+    const now = performance.now();
+    if (now >= until) return { empty: false, at: now };
+    if (groupIsEmpty(pgid)) return { empty: true, at: performance.now() };
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
 const productionRunCli = async (
   file: string,
   args: readonly string[],
@@ -407,6 +625,13 @@ const productionRunCli = async (
     onSpawn?: InvocationRequest["onSpawn"];
     /** #512 — aborting kills the child's process group; an abort before the spawn spawns nothing. */
     signal?: AbortSignal;
+    /**
+     * #1077 — the invocation intends no process to outlive it. It runs under `PROBE_HOLDER_SCRIPT`,
+     * and once the CLI has exited, timed out or been aborted, its group is signalled only while the
+     * holder provably still holds it (`endHeldGroup`); otherwise nothing is signalled and the result
+     * says so. Set only by a session probe; turns and every other invocation are unchanged.
+     */
+    reapProcessGroup?: boolean;
   },
 ): Promise<{
   stdout: string;
@@ -415,6 +640,8 @@ const productionRunCli = async (
   timedOut: boolean;
   isolationEnforced: boolean;
   egressEvidence?: ReviewerEgressRecord[];
+  /** Present when `reapProcessGroup` was asked for and the child was spawned and exited. */
+  processGroup?: ProcessGroupReap;
 }> => {
   const scratch = acpScratchDir("acp-runtime-");
   if (!existsSync("/usr/bin/sandbox-exec")) {
@@ -538,25 +765,29 @@ const productionRunCli = async (
       exitCode: number | null;
       timedOut: boolean;
       egressLost: boolean;
+      processGroup?: ProcessGroupReap;
     }>((resolve) => {
       let child: ReturnType<typeof spawn>;
       if (options.signal?.aborted) {
         resolve({ stdout: "", stderr: "invocation aborted before the provider was spawned", exitCode: null, timedOut: false, egressLost: false });
         return;
       }
+      // #1077 — a probe runs under a holder that leads its process group and does not exit on its
+      // own, so the group's id stays the probe's until ACP has signalled it (see `endHeldGroup`).
+      const holding = options.reapProcessGroup === true;
       try {
         if (options.reviewerPrivateHome) assertReviewerCodexHome(options.reviewerPrivateHome);
         child = spawn("/usr/bin/sandbox-exec", reviewerSandboxArgs(
           profile,
-          file,
-          args,
+          holding ? "/bin/ksh" : file,
+          holding ? ["-c", PROBE_HOLDER_SCRIPT, "acp-probe-holder", file, ...args] : args,
           egress ?? undefined,
           composedProfilePath,
         ), {
           cwd: workdir,
           env: environment,
           detached: true,
-          stdio: ["pipe", "pipe", "pipe"],
+          stdio: holding ? ["pipe", "pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
         });
       } catch (error) {
         resolve({ stdout: "", stderr: error instanceof Error ? error.message : String(error), exitCode: null, timedOut: false, egressLost: false });
@@ -566,20 +797,159 @@ const productionRunCli = async (
       let stderr = "";
       let timedOut = false;
       let egressLost = false;
-      let settled = false;
+      let answered = false;
+      const pgid = holding ? child.pid : undefined;
+      // The holder's identity, read before anything else can happen to it; required before every signal.
+      const holderStartedAt = pgid === undefined ? null : readProcessStartToken(pgid);
+      // The CLI's own exit status, as the holder reported it; null until it has.
+      let reported: number | null = null;
+      let endRequested = false;
+      const signals: string[] = [];
+      let ownership: ProcessGroupOwnership | null = null;
+      // #1077 — two separate states. Cleanup progress: the attempts, ownership, the holder's exit, its
+      // observation and the pipes' close. The caller's answer: `answered`, set once by `answerOnce`,
+      // which every route goes through — the deadline, a settle-now decision, or the holder's exit
+      // with its observation and the close. After it, nothing changes the answer and nothing is sent.
+      let deadlineAt: number | null = null;
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      let closed = false;
+      let observation: { empty: boolean; at: number } | null = null;
+      const delivered = (): number => signals.filter((result) => result === "sent").length;
+      const answerOnce = (processGroup: ProcessGroupReap): void => {
+        if (answered) return;
+        answered = true;
+        clearTimeout(timer);
+        // The deadline timer is cleared only here, when the answer is committed.
+        if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        stopWatchingEgress?.();
+        options.signal?.removeEventListener("abort", abort);
+        // The CLI's status is the holder's report; the holder's own exit is ACP's signal.
+        resolve({ stdout, stderr, exitCode: holderStatus(reported), timedOut, egressLost, processGroup });
+      };
+      // A probe answer that is not a cleanup: every attempt and the delivered count kept, the group
+      // named as possibly still holding the probe's processes, and no further signal.
+      const unconfirmed = (why: string): ProcessGroupReap => {
+        const sent = delivered();
+        const attempts = signals.length === 0
+          ? "was not signalled"
+          : `got ${signals.length} attempt(s), ${sent} delivered (${signals.join(", ")}), and no further signal`;
+        return {
+          pgid: pgid ?? -1,
+          reaped: false,
+          signalled: signals.length > 0,
+          signals: [...signals],
+          delivered: sent,
+          ownership: ownership ?? "UNVERIFIABLE",
+          detail: `${why}; process group ${pgid ?? "unknown"} ${attempts} and may still hold the probe's processes`,
+        };
+      };
+      // The answer from the holder's exit: a cleanup only with HELD ownership, a delivered signal and
+      // an ESRCH seen strictly before the deadline, on the same monotonic clock.
+      const answerFromObservation = (): void => {
+        if (!closed || observation === null || pgid === undefined) return;
+        const seen = observation;
+        const held = ownership === "HELD";
+        const sent = delivered();
+        // Not timer order: the clock. A success is answered only before the deadline, and only on an
+        // ESRCH seen before it.
+        const now = performance.now();
+        const inTime = seen.empty && (deadlineAt === null || (seen.at < deadlineAt && now < deadlineAt));
+        if (held && sent > 0 && inTime) {
+          answerOnce({ pgid, reaped: true, signalled: true, signals: [...signals], delivered: sent, ownership: "HELD", detail: null });
+          return;
+        }
+        answerOnce({
+          ...unconfirmed(
+            !held
+              ? `the probe's holder (pid ${pgid}) exited before ACP could end its group`
+              : sent === 0
+                ? `no signal to process group ${pgid} was delivered`
+                : seen.empty
+                  ? `process group ${pgid} was first observed empty ${Math.round(seen.at - (deadlineAt ?? seen.at))} ms after the deadline`
+                  : `process group ${pgid} was not observed empty (ESRCH) before the deadline`,
+          ),
+          ownership: held ? "HELD" : "HOLDER_LOST",
+        });
+      };
+      // Every route to the end — the CLI's exit, the timeout, an abort, an egress loss, a recorder
+      // failure — asks for the same thing: the held group ended in the check phase, the only place
+      // ownership is proven. When it cannot be proven, nothing is sent and the probe answers now,
+      // naming the group it is leaving behind rather than waiting on it.
+      const requestEnd = (): void => {
+        if (!holding) {
+          killChildTree(child);
+          return;
+        }
+        // No holder pid means nothing was spawned: there is no group of ours to signal.
+        if (pgid === undefined || endRequested) return;
+        endRequested = true;
+        // A logical deadline, armed once at the first request on the monotonic clock and cleared only
+        // when the answer is committed: a later request, the close, an observation starting or failing
+        // never moves or disarms it. It is not a promise to return at that instant if the event loop
+        // stalls; it is the point after which no answer can be a cleanup or a HEALTHY probe.
+        deadlineAt = performance.now() + PROBE_END_SETTLE_BOUND_MS;
+        deadlineTimer = setTimeout(() => {
+          answerOnce(unconfirmed(
+            `process group ${pgid} was not confirmed empty within ${PROBE_END_SETTLE_BOUND_MS} ms of the first end request`,
+          ));
+        }, PROBE_END_SETTLE_BOUND_MS);
+        setImmediate(() => {
+          // Nothing is ever signalled after the probe has answered.
+          if (answered) return;
+          const ended = endHeldGroup(child, pgid, holderStartedAt, signals);
+          ownership = ended.ownership;
+          if (!ended.settleNow) return;
+          answerOnce(unconfirmed(
+            ended.ownership === "UNVERIFIABLE"
+              ? `the probe's holder (pid ${pgid}) has no recorded exit but its start token was ${holderStartedAt === null ? "not read at spawn" : "unreadable or different"}`
+              : `no signal to process group ${pgid} was delivered`,
+          ));
+        });
+      };
+      if (holding && pgid !== undefined) {
+        let report = "";
+        child.stdio[3]?.on("data", (buffer: Buffer) => {
+          report += buffer.toString("utf8");
+          const status = /^exit (\d+)\n/.exec(report);
+          if (status && reported === null) {
+            reported = Number(status[1]);
+            requestEnd();
+          }
+        });
+        child.stdio[3]?.on("error", () => undefined);
+        child.stdio[4]?.on("error", () => undefined);
+        child.once("exit", () => {
+          // Nothing is signalled from here on; the group is only observed — until the deadline when
+          // an end was asked for, else for the reap bound — and a lost holder is never a cleanup.
+          const until = deadlineAt ?? performance.now() + PROBE_GROUP_REAP_BOUND_MS;
+          void observeGroupEmpty(pgid, until).then((seen) => {
+            observation = seen;
+            answerFromObservation();
+          });
+          // A process that left the group can hold the pipes open; the result does not wait on it.
+          setTimeout(() => {
+            for (const stream of child.stdio) stream?.destroy();
+          }, PROBE_STDIO_DRAIN_MS).unref();
+        });
+      }
       const stopWatchingEgress = egress?.onDeath(() => {
         egressLost = true;
-        killChildTree(child);
+        requestEnd();
       });
       const timer = setTimeout(() => {
         timedOut = true;
-        killChildTree(child);
+        requestEnd();
       }, options.timeoutMs);
-      const abort = (): void => killChildTree(child);
+      const abort = (): void => requestEnd();
       options.signal?.addEventListener("abort", abort, { once: true });
       const finish = (exitCode: number | null): void => {
-        if (settled) return;
-        settled = true;
+        if (holding) {
+          closed = true;
+          answerFromObservation();
+          return;
+        }
+        if (answered) return;
+        answered = true;
         clearTimeout(timer);
         stopWatchingEgress?.();
         options.signal?.removeEventListener("abort", abort);
@@ -593,7 +963,7 @@ const productionRunCli = async (
           options.onSpawn(child.pid, readProcessStartToken(child.pid));
         } catch {
           // A recorder that throws must not leave the provider running unaccounted for.
-          killChildTree(child);
+          requestEnd();
         }
       }
       child.stdout?.on("data", (buffer: Buffer) => (stdout += buffer.toString("utf8")));
@@ -602,6 +972,10 @@ const productionRunCli = async (
       child.stdin?.end();
       child.on("error", (error) => {
         stderr += error.message;
+        if (holding) {
+          answerOnce(unconfirmed(`the probe's holder (pid ${pgid ?? "unknown"}) failed: ${error.message}`));
+          return;
+        }
         finish(null);
       });
       child.on("close", (code) => finish(code));
@@ -1704,13 +2078,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       // permission rules, enabled plugins and the user CLAUDE.md with them — and the strict, empty
       // MCP config starts no MCP server from any scope. Authentication is untouched: it is not a
       // setting source, and HOME and the config directory are left as they are.
-      args.push(
-        "--setting-sources",
-        WORKER_SETTING_SOURCES,
-        "--mcp-config",
-        WORKER_MCP_CONFIG,
-        "--strict-mcp-config",
-      );
+      args.push(...operatorConfigurationExcluded());
     }
     if (request.readOnly || request.isolation) {
       // §18.3 — a blind reviewer judges exactly the inputs it was given. Granting it
@@ -1835,15 +2203,33 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     if (handle.provider !== this.provider) return "UNAVAILABLE";
     const result = await runCli(this.#binary, [
       "-p", "--output-format", "json", "--model", handle.model, "--session-id", handle.externalSessionId,
+      // #1077 — the probe runs to completion now, so it runs as a WORKER turn does: the sanctioned
+      // settings (no hooks, no plugins), the scratch's setting sources only and no MCP server. The
+      // operator's hooks, plugins and user MCP servers would otherwise start inside every probe.
+      "--settings", sanctionedSettings(), ...operatorConfigurationExcluded(),
     ], {
-      cwd: handle.workdir ?? process.cwd(),
+      // This invocation's private scratch — the one directory its profile re-opens — not the
+      // session's workdir. A WORKER's workdir is the managed runtime root under the read-denied
+      // state root, so a probe spawned there ran a CLI that could not read its own cwd and exited 1
+      // at once; every worker provisioning then failed its probe. The profile is not widened to
+      // the workdir, and an answer from here proves the session answers, not that its turns can
+      // reach a checkout: a WORKER turn still runs in its claimed worktree.
+      cwd: undefined,
       timeoutMs: 30_000,
       stdin: "Reply with READY.",
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
       providerCredentialDir: this.#providerCredentialDir,
+      // #1077 — nothing a probe starts is meant to outlive it, whether it answers or not. A failed
+      // provisioning then stops a session with nothing of it left running: `stopSession` has no
+      // process to stop for a headless session, so the probe's own group is ended here.
+      reapProcessGroup: true,
     });
-    if (result.exitCode !== 0 || result.timedOut) return "UNAVAILABLE";
+    // A group that could not be confirmed empty is not a clean answer, whatever the CLI said, and
+    // what may be left is named rather than dropped: every caller fails a throwing probe closed and
+    // carries its message into the refusal's evidence.
+    if (result.processGroup && !result.processGroup.reaped) throw new ProbeProcessGroupUnconfirmed(result.processGroup);
+    if (result.exitCode !== 0 || result.timedOut || !result.processGroup) return "UNAVAILABLE";
     const sessionId = safeParse(result.stdout)?.["session_id"];
     return sessionId !== undefined && sessionId !== handle.externalSessionId ? "DEGRADED" : "HEALTHY";
   }
@@ -2652,6 +3038,10 @@ export const __testing = Object.freeze({
   codexReviewerArgs,
   codexThreadId,
   codexLastAgentMessage,
+  // #1077: the probe's own process group is ended on every completion, and only while its holder is
+  // provably unreaped. Exposed so a test can drive the timeout and abort routes in less than the
+  // probe's 30 s, and lose the holder on purpose to show nothing is signalled after that.
+  productionRunCli,
   setRunCli: (stub: typeof productionRunCli | null): void => {
     runCli = stub ?? productionRunCli;
   },

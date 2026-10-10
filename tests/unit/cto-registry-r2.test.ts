@@ -19,6 +19,7 @@ import {
   registerFixtureProject,
 } from "../helpers/harness.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
+import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -90,8 +91,10 @@ const completeContractChangeWithGrant = async (
   harness: Harness,
   projectId: string,
   manifestDigest: string,
+  /** #246 B2-a — the manifest the run's PLAN carries. */
+  manifest: ProjectManifest,
 ) => {
-  const finalized = await finalizeNoRepositoryRun(harness, projectId, CONTRACT);
+  const finalized = await finalizeNoRepositoryRun(harness, projectId, CONTRACT, { manifest });
   const { runId, candidateSnapshotDigest } = finalized;
 
   const grant = {
@@ -314,7 +317,7 @@ describe("round-2 registry regressions", () => {
     const manifestB = { ...fixtureManifest(projectId), postMergeCommands: ["other"] };
     const storedA = harness.cp.projects.storeManifest(manifestA, harness.cp.manifestAuthorizationForTests(manifestA));
     if (!storedA.allowed) throw new Error(storedA.message);
-    const runId = await completeContractChangeWithGrant(harness, projectId, storedA.value);
+    const runId = await completeContractChangeWithGrant(harness, projectId, storedA.value, manifestA);
 
     const refused = harness.cp.projects.activateManifest(projectId, manifestB, {
       runKind: "CONTRACT_CHANGE",
@@ -330,7 +333,7 @@ describe("round-2 registry regressions", () => {
     const revised = { ...fixtureManifest(projectId), postMergeCommands: ["verify"] };
     const stored = harness.cp.projects.storeManifest(revised, harness.cp.manifestAuthorizationForTests(revised));
     if (!stored.allowed) throw new Error(stored.message);
-    const runId = await completeContractChangeWithGrant(harness, projectId, stored.value);
+    const runId = await completeContractChangeWithGrant(harness, projectId, stored.value, revised);
 
     const activated = harness.cp.projects.activateManifest(projectId, revised, {
       runKind: "CONTRACT_CHANGE",

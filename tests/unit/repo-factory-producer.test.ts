@@ -169,6 +169,8 @@ describe("repo factory producer (#246)", () => {
   });
 
   it("is rejected by the real overclaim check when a forbidden activation claim is added to genuine producer output", async () => {
+    // RF-S17 arm:result: a RepoFactoryResult carrying a CTO or Doctor field is refused, on genuine producer output.
+    // That ACP's activation result supplies those fields is witnessed in the bootstrap daemon scenario, not here.
     const { workDir } = makeSandbox();
     const produced = await produceRepoFactoryResult({
       plan: basePlan(),
@@ -177,12 +179,21 @@ describe("repo factory producer (#246)", () => {
     });
     expect(produced.allowed).toBe(true);
     if (!produced.allowed) return;
+    expect(parseRepoFactoryResult(produced.value).allowed).toBe(true);
 
-    const overclaiming = { ...produced.value, activity: "ACTIVE" };
-    const parsed = parseRepoFactoryResult(overclaiming);
-    expect(parsed.allowed).toBe(false);
-    if (parsed.allowed) return;
-    expect(parsed.reasonCode).toBe(ReasonCode.BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION);
+    // Each field on its own, so a parser that let one of them through cannot hide behind another.
+    const claims: Array<[string, unknown]> = [
+      ["primaryCto", { role: "PRIMARY_CTO", bindingGeneration: 1 }],
+      ["doctor", { status: "PASS" }],
+      ["activity", "ACTIVE"],
+    ];
+    for (const [field, value] of claims) {
+      const parsed = parseRepoFactoryResult({ ...produced.value, [field]: value });
+      expect(parsed.allowed, field).toBe(false);
+      if (parsed.allowed) return;
+      expect(parsed.reasonCode, field).toBe(ReasonCode.BOOTSTRAP_RESULT_OVERCLAIMS_ACTIVATION);
+      expect(parsed.evidence["overclaims"], field).toEqual([field]);
+    }
   });
 
   it("refuses a plan that requires a GitHub write instead of fabricating a receipt for one", async () => {
