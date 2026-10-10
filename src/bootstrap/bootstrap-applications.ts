@@ -16,9 +16,7 @@ import type { Db } from "../db/database.ts";
  *   the race two runs would run to one of them is closed by the database), and the digests of what
  *   was confirmed: PLAN, manifest, planned outputs, candidate, review and approval. A recovery can
  *   only re-apply that candidate; nothing about it can be changed afterwards.
- * - Every later attempt is recorded (`attempts` + 1) before that attempt's first external write. From
- *   the first one an external write may have happened, so the run's plan is frozen
- *   (BOOTSTRAP_APPLICATION_FROZEN): neither `plan_submit` nor FINAL_REVISE can replace it.
+ * - Every later attempt is recorded (`attempts` + 1) before that attempt's first external write.
  * - WRITTEN, in the transaction that stores the produced result.
  * - COMPLETED, in the CEO's completion transaction.
  * - STRANDED, when what GitHub holds at the target cannot be attributed to this run by the evidence
@@ -27,6 +25,30 @@ import type { Db } from "../db/database.ts";
  *
  * The phase only moves forward and the row is never replaced or deleted, which schema v43's
  * triggers enforce for every writer; this class is the one that writes it.
+ *
+ * What `approval_digest` is (CEO decision (a), 2026-10-10). It is the write scope the owner
+ * approved: the parameter digest of the approval receipt, over owner, visibility, the PLAN and its
+ * operations. It is not an approval and never stands in for one. Every CONFIRM, a recovery
+ * included, re-admits the official receipt itself (its ingress admission, or its durable
+ * consumption for this candidate), recomputes the scope from the owner, visibility, PLAN and
+ * operations it is about to execute, and checks the target and visibility against the plan; the
+ * reserved digest is only compared with that, so a CONFIRM of another scope is refused.
+ *
+ * The freeze (CEO decision (b)). It starts at the reservation: from the transaction that inserts
+ * the row, the run's plan cannot be replaced by `plan_submit` or by a FINAL_REVISE that would send
+ * it back for one (BOOTSTRAP_APPLICATION_FROZEN), and a CONFIRM may only re-apply the reserved
+ * candidate under the reserved write scope. A scope change never reuses the approval the
+ * reservation consumed: an approval of another scope is refused, not substituted. What releases it:
+ * - Failure (a refused, timed-out or crashed attempt): nothing. The application stays RESERVED and
+ *   frozen, and the next CEO CONFIRM of the same candidate under the same scope resumes it from the
+ *   attempt ledger. A checkout the interrupted attempt left behind is first preserved by the repair
+ *   `preserve_interrupted_bootstrap_checkout` (moved aside, never deleted); that repair authorises
+ *   nothing, so the resuming CONFIRM is a new one and passes every check again.
+ * - Cancel: nothing. A cancelled run cannot be confirmed again, and its application, with its
+ *   project id and repository identity, stays reserved; the project is bootstrapped again under a
+ *   new project id and repository identity.
+ * - Recovery: nothing. A recovery is the same CONFIRM again, never a new plan or a new scope.
+ * - STRANDED and COMPLETED are terminal: the reservation is never released or reused.
  */
 
 export type BootstrapApplicationPhase = "RESERVED" | "WRITTEN" | "COMPLETED" | "STRANDED";
@@ -147,9 +169,12 @@ export const strandedBootstrapApplications = (db: Pick<Db, "all">, runId: string
     )
     .map(toApplication);
 
-/** Whether an external write of this application may have happened: an attempt is recorded. */
-export const applicationIsFrozen = (application: BootstrapApplication | null): boolean =>
-  application !== null && (application.attempts > 0 || application.phase !== "RESERVED");
+/**
+ * Whether the run's plan is frozen: from the reservation on (CEO decision (b)). The reservation and
+ * its first attempt share a transaction, so every row this class writes has one; a row with none
+ * was written by something else, and freezes the plan all the same.
+ */
+export const applicationIsFrozen = (application: BootstrapApplication | null): boolean => application !== null;
 
 export class BootstrapApplications {
   constructor(
@@ -168,16 +193,15 @@ export class BootstrapApplications {
   }
 
   /**
-   * The contract freeze: from the moment an external write of this run's application may have
-   * happened — an attempt is recorded — its plan cannot be replaced, by `plan_submit` or by a
-   * FINAL_REVISE that would send it back for one.
+   * The contract freeze: from the reservation of this run's application on, its plan cannot be
+   * replaced, by `plan_submit` or by a FINAL_REVISE that would send it back for one.
    */
   assertNotFrozen(runId: string, via: "plan_submit" | "FINAL_REVISE"): Decision<void> {
     const application = this.get(runId);
     if (!applicationIsFrozen(application)) return allow(ReasonCode.OK, undefined);
     return deny(
       ReasonCode.BOOTSTRAP_APPLICATION_FROZEN,
-      "an external write of this bootstrap run's application may have happened, so its plan is frozen; only the same candidate can be confirmed again",
+      "this bootstrap run's application is reserved, so its plan is frozen; only the same candidate can be confirmed again, under the same approved write scope",
       {
         refusal: "BOOTSTRAP_APPLICATION_FROZEN",
         runId,
@@ -287,6 +311,27 @@ export class BootstrapApplications {
     } catch (error) {
       if (!isAcpError(error)) throw error;
     }
+  }
+
+  /**
+   * #246 C3, CEO decision (c) — the record of an interrupted attempt's checkout moved aside by the
+   * official recovery: where it was, where it is kept, and the application it belongs to. The row
+   * itself is not touched: preserving a checkout moves no phase and records no attempt.
+   */
+  recordCheckoutPreserved(preserved: {
+    runId: string;
+    bootstrapOperationId: string;
+    attempts: number;
+    candidateSnapshotDigest: string;
+    originalPath: string;
+    preservedPath: string;
+  }): void {
+    this.audit.record({
+      kind: "BOOTSTRAP_CHECKOUT_PRESERVED",
+      runId: preserved.runId,
+      projectId: null,
+      evidence: { ...preserved },
+    });
   }
 
   private move(

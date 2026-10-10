@@ -1,15 +1,22 @@
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
+import { bootstrapActivationHandoff, plannedBootstrapOutputs } from "../../src/bootstrap/bootstrap-plan.ts";
+import {
+  REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND,
+  type RepoFactoryOwnerApproval,
+  repoFactoryGitHubWriteParameters,
+} from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
+import { repositoryCheckoutPath } from "../../src/bootstrap/repo-factory-producer.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import type { ProjectManifest } from "../../src/contracts/manifest.ts";
+import { type ProjectManifest, manifestDigest } from "../../src/contracts/manifest.ts";
 import { startLocalMcpListeners, startOperatorSocket, startSessionLaunchChannel } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ArtifactKind, ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -227,8 +234,16 @@ const reviewedBootstrap = async (f: Fixture, manifest: ProjectManifest, taskKey 
   };
 };
 
-/** The owner's approval of the GitHub writes: agentctl over the operator socket, with the owner token. */
-const approveWrites = async (f: Fixture, run: ReviewedRun): Promise<void> => {
+/**
+ * The owner's approval of the GitHub writes: agentctl over the operator socket, with the owner token.
+ * By default the approval the plan needs; `githubOwner`, `visibility` and `decline` make it another
+ * owner decision, still minted the official way.
+ */
+const approveWrites = async (
+  f: Fixture,
+  run: ReviewedRun,
+  options: { githubOwner?: string; visibility?: string; decline?: boolean } = {},
+): Promise<void> => {
   const manifestPath = join(tempDir("acp-c3-manifest-"), "project.json");
   writeFileSync(manifestPath, JSON.stringify(run.manifest));
   const client = createOperatorClient({ socketPath: f.operatorSocket, token: TEST_OPERATOR_TOKEN });
@@ -239,15 +254,16 @@ const approveWrites = async (f: Fixture, run: ReviewedRun): Promise<void> => {
       "repo-factory-github-write",
       run.runId,
       "--github-owner",
-      "acme",
+      options.githubOwner ?? "acme",
       "--visibility",
-      "public",
+      options.visibility ?? "public",
       "--plan-digest",
       run.planDigest,
       "--manifest",
       manifestPath,
       "--project-name",
       "fixture project",
+      ...(options.decline ? ["--decline"] : []),
     ], false);
     expect(exit).toBe(0);
   } finally {
@@ -598,6 +614,541 @@ describe("#246 C3 W5: an attempt freezes the plan", () => {
       expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
       expect(writesOf(f, "createRepository")).toHaveLength(1);
       expect(existsSync(join(f.workRoot, run.runId, "repositories", "primary"))).toBe(true);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// #246 C3 — the CEO's decisions on the slice's four open choices (2026-10-10): (a) the approval
+// digest an application keeps is the approved write scope, never an approval; (b) the freeze starts
+// at the reservation, and a scope change never reuses the approval it consumed; (c) the checkout an
+// interrupted attempt left behind is recovered officially — verified, preserved, never deleted, and
+// authorising nothing; (d) a row a raw SQL writer forges never authorises an external execution.
+
+interface RecordedApproval {
+  owner: string;
+  visibility: "public" | "private";
+  receipt: Record<string, unknown>;
+}
+
+/** The owner's newest recorded approval of the GitHub writes, as the CONFIRM door reads it. */
+const recordedApproval = (f: Fixture, runId: string): RecordedApproval => {
+  const recorded = f.harness.cp.artifacts
+    .list<Record<string, unknown>>(runId, ArtifactKind.APPROVAL)
+    .filter((artifact) => artifact.content["kind"] === REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND)
+    .at(-1);
+  if (!recorded) throw new Error("no owner approval is recorded");
+  return recorded.content as unknown as RecordedApproval;
+};
+
+/** The CEO's CONFIRM straight at the runner's door, carrying whatever approval the caller presents. */
+const applyWith = async (f: Fixture, run: ReviewedRun, ownerApproval: RepoFactoryOwnerApproval | null) => {
+  await f.harness.cp.continuity.evaluate("bootstrap confirmation");
+  return f.harness.cp.bootstrapProducer.produceAndActivate({
+    runId: run.runId,
+    candidateSnapshotDigest: run.candidate,
+    ceoSessionId: f.ceoSessionId,
+    ownerApproval,
+    approvedManifest: run.manifest,
+    projectName: "fixture project",
+    handoff: bootstrapActivationHandoff(run.manifest),
+  });
+};
+
+/** Reviewed and approved; its first CONFIRM reserved the application and GitHub refused the create. */
+const reservedRun = async (f: Fixture, projectId: string): Promise<ReviewedRun> => {
+  const run = await reviewedBootstrap(f, cleanTreeManifest(projectId));
+  await approveWrites(f, run);
+  f.github.failNext = "createRepository";
+  const attempted = await confirm(f, run);
+  expect(attempted, JSON.stringify(attempted)).toMatchObject({ ok: false, evidence: { stage: "production" } });
+  expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+  expect(consumedApprovals(f, run.runId)).toBe(1);
+  f.github.writes.length = 0;
+  return run;
+};
+
+/** Nothing written to GitHub since, no other approval consumed, the application where it was. */
+const nothingMore = (f: Fixture, run: ReviewedRun): void => {
+  expect(writesOf(f)).toEqual([]);
+  expect(consumedApprovals(f, run.runId)).toBe(1);
+  expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+  expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+};
+
+describe("#246 C3 decision (a): the approval digest an application keeps is not an approval", () => {
+  it("a receipt no ingress admitted, carrying the reserved approval digest, is refused before any write", async () => {
+    await withFixture(async (f) => {
+      const run = await reservedRun(f, "c3-a-forged");
+      const recorded = recordedApproval(f, run.runId);
+      const forged: Record<string, unknown> = { ...recorded.receipt, inboundNonce: "never-admitted", idempotencyKey: "forged" };
+      expect(forged["parameterDigest"]).toBe(applicationOf(f, run.runId)?.approvalDigest);
+      const refused = await applyWith(f, run, { owner: recorded.owner, visibility: recorded.visibility, receipt: forged });
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        evidence: { stage: "approval" },
+      });
+      nothingMore(f, run);
+    });
+  });
+
+  it("no receipt at all is refused before any write, though the application is reserved", async () => {
+    await withFixture(async (f) => {
+      const run = await reservedRun(f, "c3-a-missing");
+      const refused = await applyWith(f, run, null);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        evidence: { stage: "approval", refusal: "APPROVAL_MISSING" },
+      });
+      nothingMore(f, run);
+    });
+  });
+
+  it("the admitted receipt whose digest matches the reservation, presented for another target, is refused before any write", async () => {
+    await withFixture(async (f) => {
+      const run = await reservedRun(f, "c3-a-target");
+      const recorded = recordedApproval(f, run.runId);
+      expect(recorded.receipt["parameterDigest"]).toBe(applicationOf(f, run.runId)?.approvalDigest);
+      const refused = await applyWith(f, run, { owner: "someone-else", visibility: recorded.visibility, receipt: recorded.receipt });
+      expect(refused, JSON.stringify(refused)).toMatchObject({ allowed: false, evidence: { refusal: "OWNER_MISMATCH" } });
+      nothingMore(f, run);
+    });
+  });
+
+  it("the admitted receipt whose digest matches the reservation, presented with another visibility, is refused before any write", async () => {
+    await withFixture(async (f) => {
+      const run = await reservedRun(f, "c3-a-visibility");
+      const recorded = recordedApproval(f, run.runId);
+      const refused = await applyWith(f, run, { owner: recorded.owner, visibility: "private", receipt: recorded.receipt });
+      expect(refused, JSON.stringify(refused)).toMatchObject({ allowed: false, evidence: { refusal: "VISIBILITY_MISMATCH" } });
+      nothingMore(f, run);
+    });
+  });
+});
+
+describe("#246 C3 decision (b): the freeze starts at the reservation", () => {
+  it("an owner approval of another write scope is refused, not substituted, and the reserved approval is not reused for it", async () => {
+    await withFixture(async (f) => {
+      const run = await reservedRun(f, "c3-b-scope");
+      // The same GitHub owner by name, and so past the plan's own check, but another write scope.
+      await approveWrites(f, run, { githubOwner: "ACME" });
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_FROZEN,
+        evidence: { drift: ["approvalDigest"] },
+      });
+      nothingMore(f, run);
+    });
+  });
+});
+
+/**
+ * What the runner would reserve for this run, computed as a raw database writer with read access
+ * could compute it: the PLAN, manifest, planned outputs, candidate, review and write scope.
+ */
+const reservationOf = (f: Fixture, run: ReviewedRun) => {
+  const plan = f.harness.cp.artifacts.latest<unknown>(run.runId, ArtifactKind.PLAN);
+  const planned = plannedBootstrapOutputs({ runId: run.runId, planArtifact: plan }, run.manifest);
+  if (!planned.allowed || plan === null) throw new Error("the fixture's PLAN has no planned outputs");
+  const reviewed = f.harness.cp.bootstrap.reviewForConfirmation(run.runId, run.candidate);
+  if (!reviewed.allowed) throw new Error(reviewed.message);
+  const parameters = repoFactoryGitHubWriteParameters({
+    owner: "acme",
+    visibility: "public",
+    planDigest: plan.digest,
+    githubOperations: planned.value.githubOperations,
+  });
+  return [
+    run.runId,
+    run.manifest.projectId,
+    planned.value.target.repositoryIdentity,
+    planned.value.bootstrapOperationId,
+    plan.digest,
+    manifestDigest(run.manifest),
+    digestOf(planned.value),
+    run.candidate,
+    reviewed.value.digest,
+    digestOf(parameters),
+  ] as const;
+};
+
+/** bootstrap_applications rows as a raw SQL writer writes them: no runner, no approval, no attempt of its own. */
+const forgeApplication = (f: Fixture, run: ReviewedRun, phase: "RESERVED" | "WRITTEN" | "COMPLETED", attempts: number): string => {
+  const reservation = reservationOf(f, run);
+  const db = f.harness.cp.db;
+  db.run(
+    `INSERT INTO bootstrap_applications (run_id, project_id, repository_identity, bootstrap_operation_id, plan_digest,
+                                         manifest_digest, planned_outputs_digest, candidate_snapshot_digest, review_digest,
+                                         approval_digest, phase, attempts, last_refusal_json, reserved_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RESERVED', 0, NULL, ?)`,
+    [...reservation, f.harness.clock.nowIso()],
+  );
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    db.run(`UPDATE bootstrap_applications SET attempts = attempts + 1 WHERE run_id = ?`, [run.runId]);
+  }
+  if (phase !== "RESERVED") db.run(`UPDATE bootstrap_applications SET phase = 'WRITTEN' WHERE run_id = ?`, [run.runId]);
+  if (phase === "COMPLETED") db.run(`UPDATE bootstrap_applications SET phase = 'COMPLETED' WHERE run_id = ?`, [run.runId]);
+  return reservation[9];
+};
+
+/** An approval record whose receipt has the admitted shape and the reserved digest, and that no ingress admitted. */
+const forgeApprovalRecord = (f: Fixture, run: ReviewedRun, approvalDigest: string): void => {
+  f.harness.cp.artifacts.put(run.runId, ArtifactKind.APPROVAL, {
+    kind: REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND,
+    owner: "acme",
+    visibility: "public",
+    planDigest: run.planDigest,
+    approvedManifest: run.manifest,
+    projectName: "fixture project",
+    receipt: {
+      channel: "cli",
+      actor: TEST_OWNER.actor,
+      inboundNonce: "never-admitted",
+      runId: run.runId,
+      candidateSnapshotDigest: run.candidate,
+      operation: "repo_factory_github_write",
+      parameterDigest: approvalDigest,
+      idempotencyKey: "forged",
+      approved: true,
+    },
+  }, run.candidate);
+};
+
+/** Nothing outside the database happened: no GitHub read or write, no checkout, no project, no primary CTO. */
+const nothingExternal = (f: Fixture, run: ReviewedRun): void => {
+  expect(f.github.writes).toEqual([]);
+  expect(f.github.reads).toEqual([]);
+  expect(existsSync(join(f.workRoot, run.runId))).toBe(false);
+  expect(consumedApprovals(f, run.runId)).toBe(0);
+  expect(f.harness.cp.projects.get(run.manifest.projectId)).toBeNull();
+  expect(f.harness.cp.bindings.activePrimaryCto(run.manifest.projectId)).toBeNull();
+  expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+};
+
+/**
+ * Unlike the blocks above, this one writes to the database directly, on purpose: it is the raw SQL
+ * writer the v43 triggers do not stop from inserting RESERVED or moving a phase forward.
+ */
+describe("#246 C3 decision (d): a row a raw SQL writer forges authorises no external execution", () => {
+  it("a forged RESERVED row, with no official approval, writes nothing, consumes nothing and freezes the plan", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-d-reserved"));
+      const approvalDigest = forgeApplication(f, run, "RESERVED", 0);
+
+      // The freeze starts at the reservation, whoever wrote it, attempt or no attempt.
+      const replanned = await f.cto(run.owner, "plan_submit", {
+        runId: run.runId,
+        plan: bootstrapPlan(cleanTreeManifest("c3-d-another")),
+        tasks: [{ key: "replan", title: "replan", category: "implementation" }],
+      });
+      expect(replanned, JSON.stringify(replanned)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_FROZEN });
+      await f.harness.cp.continuity.evaluate("bootstrap revision");
+      const revised = await f.hermes("ceo_decision_submit", {
+        runId: run.runId,
+        decision: "FINAL_REVISE",
+        candidateSnapshotDigest: run.candidate,
+        ceoSessionId: f.ceoSessionId,
+        rationale: "plan another manifest",
+      });
+      expect(revised, JSON.stringify(revised)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_FROZEN });
+
+      const unapproved = await confirm(f, run);
+      expect(unapproved, JSON.stringify(unapproved)).toMatchObject({ ok: false, evidence: { stage: "approval", refusal: "APPROVAL_MISSING" } });
+
+      forgeApprovalRecord(f, run, approvalDigest);
+      const forged = await confirm(f, run);
+      expect(forged, JSON.stringify(forged)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        evidence: { stage: "approval" },
+      });
+      // An attempt the same writer records changes nothing either.
+      f.harness.cp.db.run(`UPDATE bootstrap_applications SET attempts = attempts + 1 WHERE run_id = ?`, [run.runId]);
+      const again = await confirm(f, run);
+      expect(again).toMatchObject({ ok: false, reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, evidence: { stage: "approval" } });
+
+      nothingExternal(f, run);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+    });
+  });
+
+  it("a forged WRITTEN row, with no official approval, activates nothing and writes nothing", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-d-written"));
+      const approvalDigest = forgeApplication(f, run, "WRITTEN", 1);
+      const unapproved = await confirm(f, run);
+      expect(unapproved, JSON.stringify(unapproved)).toMatchObject({ ok: false, evidence: { stage: "approval", refusal: "APPROVAL_MISSING" } });
+      forgeApprovalRecord(f, run, approvalDigest);
+      const forged = await confirm(f, run);
+      expect(forged, JSON.stringify(forged)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        evidence: { stage: "approval" },
+      });
+      nothingExternal(f, run);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
+    });
+  });
+
+  it("a forged COMPLETED row beside a run at CEO review is refused before any write, even under the owner's own approval", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-d-completed"));
+      await approveWrites(f, run);
+      forgeApplication(f, run, "COMPLETED", 1);
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+        evidence: { refusal: "APPLICATION_PHASE_INCONSISTENT", phase: "COMPLETED" },
+      });
+      nothingExternal(f, run);
+    });
+  });
+});
+
+const deferred = () => {
+  let reject!: (error: Error) => void;
+  const promise = new Promise<never>((_resolve, rejectWith) => {
+    reject = rejectWith;
+  });
+  return { promise, reject };
+};
+
+/**
+ * An application attempt that dies mid-production, left as a killed daemon leaves it: the first
+ * CONFIRM reserves, creates the repository and commits, and its push never answers. `whileInFlight`
+ * runs then. The checkout is copied as it stands; the attempt is let fail, its producer cleaning up as
+ * a live process does; and the copy is put back where the dead process would have left it.
+ */
+const interruptedAttempt = async (
+  f: Fixture,
+  run: ReviewedRun,
+  whileInFlight: (checkoutPath: string) => Promise<void> = async () => {},
+): Promise<{ workDir: string; checkoutPath: string; preservedPath: string }> => {
+  const workDir = join(f.workRoot, run.runId);
+  const checkoutPath = repositoryCheckoutPath(workDir, "primary");
+  const hung = deferred();
+  const push = vi.spyOn(f.github, "pushBranch").mockImplementationOnce(() => hung.promise);
+  const confirming = confirm(f, run);
+  await vi.waitFor(() => expect(push).toHaveBeenCalled(), { timeout: 30_000, interval: 20 });
+  await whileInFlight(checkoutPath);
+  const copy = join(tempDir("acp-c3-interrupted-"), "checkout");
+  cpSync(checkoutPath, copy, { recursive: true });
+  hung.reject(new Error("the daemon died while the push was in flight"));
+  const failed = await confirming;
+  expect(failed["ok"], JSON.stringify(failed)).toBe(false);
+  push.mockRestore();
+  expect(existsSync(checkoutPath)).toBe(false);
+  cpSync(copy, checkoutPath, { recursive: true });
+  expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+  return { workDir, checkoutPath, preservedPath: join(workDir, "preserved", "primary-attempt-1") };
+};
+
+/** The official recovery, as the CEO runs it: the allowlisted repair over the Hermes socket. */
+const preserveCheckout = (f: Fixture, run: ReviewedRun, dryRun = false) =>
+  f.hermes("repair_execute", {
+    operationId: "preserve_interrupted_bootstrap_checkout",
+    parameters: {},
+    authorizedBy: "HERMES",
+    dryRun,
+    runId: run.runId,
+  });
+
+const MARKER = ".repo-factory-operation.json";
+
+const preservedRecords = (f: Fixture) => f.harness.cp.audit.byKind("BOOTSTRAP_CHECKOUT_PRESERVED").map((row) => row.evidence);
+
+/** The precondition at `index` of a refused repair, as its evidence reports it. */
+const preconditionOf = (refused: Record<string, unknown>, index: number) =>
+  ((refused["evidence"] as { preconditions: Array<{ satisfied: boolean; evidence: Record<string, unknown> }> }).preconditions)[index];
+
+/** The checkout is where the dead attempt left it, unmoved, and nothing was preserved. */
+const leftInPlace = (f: Fixture, checkout: { checkoutPath: string; preservedPath: string }): void => {
+  expect(existsSync(join(checkout.checkoutPath, MARKER))).toBe(true);
+  expect(existsSync(join(checkout.checkoutPath, ".git"))).toBe(true);
+  expect(existsSync(checkout.preservedPath)).toBe(false);
+  expect(preservedRecords(f)).toEqual([]);
+};
+
+describe("#246 C3 decision (c): the official recovery of an interrupted attempt's checkout", () => {
+  it("verifies the owner and an ended attempt, preserves the checkout, authorises nothing, and a new CONFIRM then completes", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-happy"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      // The push never reached GitHub: only the create did.
+      const writesBefore = writesOf(f);
+      expect(writesBefore).toEqual(["createRepository"]);
+
+      // Fail-closed stays: the leftover checkout refuses a CONFIRM by name.
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { refusal: "INTERRUPTED_RUN_CHECKOUT" } });
+
+      // A dry run verifies and moves nothing.
+      const dry = await preserveCheckout(f, run, true);
+      expect(dry, JSON.stringify(dry)).toMatchObject({ ok: true, value: { dryRun: true, changes: 1 } });
+      leftInPlace(f, checkout);
+
+      const preserved = await preserveCheckout(f, run);
+      expect(preserved, JSON.stringify(preserved)).toMatchObject({ ok: true, value: { dryRun: false, changes: 1 } });
+      const checked = (preserved["value"] as { preconditionsChecked: Array<{ satisfied: boolean }> }).preconditionsChecked;
+      expect(checked.map((precondition) => precondition.satisfied)).toEqual([true, true, true, true]);
+      // Moved, not deleted: the same checkout, marker and history, at the recorded place.
+      const application = applicationOf(f, run.runId)!;
+      expect(existsSync(checkout.checkoutPath)).toBe(false);
+      expect(JSON.parse(readFileSync(join(checkout.preservedPath, MARKER), "utf8"))).toEqual({
+        bootstrapOperationId: application.bootstrapOperationId,
+      });
+      expect(existsSync(join(checkout.preservedPath, ".git", "HEAD"))).toBe(true);
+      expect(preservedRecords(f)).toEqual([{
+        runId: run.runId,
+        bootstrapOperationId: application.bootstrapOperationId,
+        attempts: 1,
+        candidateSnapshotDigest: run.candidate,
+        originalPath: checkout.checkoutPath,
+        preservedPath: checkout.preservedPath,
+      }]);
+      expect(f.harness.cp.artifacts.latest(run.runId, ArtifactKind.REPAIR_RECEIPT)?.content).toMatchObject({
+        operationId: "preserve_interrupted_bootstrap_checkout",
+        changes: 1,
+      });
+      // It authorised nothing: no write, no approval consumed, no attempt recorded, no phase moved.
+      expect(writesOf(f)).toEqual(writesBefore);
+      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(application).toMatchObject({ phase: "RESERVED", attempts: 1 });
+
+      // Only a new CEO CONFIRM resumes it, from the attempt ledger: still one create.
+      const resumed = await confirm(f, run);
+      expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(writesOf(f, "createRepository")).toHaveLength(1);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+      await acknowledgeHandoff(f, run, resumed);
+      const completed = await confirm(f, run);
+      expect(completed, JSON.stringify(completed)).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
+      expect(existsSync(join(checkout.preservedPath, MARKER))).toBe(true);
+    });
+  });
+
+  it("refuses a checkout whose marker names another operation, and leaves it in place", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-owner"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      writeFileSync(join(checkout.checkoutPath, MARKER), `${JSON.stringify({ bootstrapOperationId: "another-operation" })}\n`);
+      const refused = await preserveCheckout(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(refused, 1)).toMatchObject({ satisfied: false, evidence: { refusal: "CHECKOUT_NOT_THIS_APPLICATION" } });
+      leftInPlace(f, checkout);
+    });
+  });
+
+  it("refuses while an attempt is in flight, while a git lock is held, or while this process is not the only writer", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-live"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run, async (checkoutPath) => {
+        const inFlight = await preserveCheckout(f, run);
+        expect(inFlight, JSON.stringify(inFlight)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+        expect(preconditionOf(inFlight, 2)).toMatchObject({ satisfied: false, evidence: { attemptInFlight: true } });
+        expect(existsSync(join(checkoutPath, MARKER))).toBe(true);
+      });
+
+      const lock = join(checkout.checkoutPath, ".git", "index.lock");
+      writeFileSync(lock, "");
+      const locked = await preserveCheckout(f, run);
+      expect(locked, JSON.stringify(locked)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(locked, 2)).toMatchObject({ satisfied: false, evidence: { gitLockFiles: [".git/index.lock"] } });
+      leftInPlace(f, checkout);
+      // The fixture's own lock file, not the checkout's content: taken away again before the last case.
+      unlinkSync(lock);
+
+      // No lock the runner can see is held for it: nothing shows the dead attempt has ended.
+      f.harness.cp.bootstrapProducer.attachWriterLock(() => false);
+      const unlocked = await preserveCheckout(f, run);
+      expect(unlocked, JSON.stringify(unlocked)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(unlocked, 2)).toMatchObject({ satisfied: false, evidence: { writerLockHeld: false } });
+      leftInPlace(f, checkout);
+    });
+  });
+
+  it("refuses when the move fails, with the checkout intact where it was", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-move"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      // The checkout cannot leave its parent: rename needs to write the directory it leaves.
+      const repositories = join(checkout.workDir, "repositories");
+      chmodSync(repositories, 0o500);
+      let refused: Record<string, unknown>;
+      try {
+        refused = await preserveCheckout(f, run);
+      } finally {
+        chmodSync(repositories, 0o700);
+      }
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED,
+        evidence: { refusal: "MOVE_FAILED", originalPath: checkout.checkoutPath },
+      });
+      leftInPlace(f, checkout);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+    });
+  });
+
+  it("refuses when the preservation location is taken, and moves nothing into it", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-collision"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      mkdirSync(join(checkout.workDir, "preserved"), { mode: 0o700 });
+      mkdirSync(checkout.preservedPath, { mode: 0o700 });
+      const refused = await preserveCheckout(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(refused, 3)).toMatchObject({ satisfied: false, evidence: { occupied: true } });
+      expect(existsSync(join(checkout.checkoutPath, MARKER))).toBe(true);
+      expect(existsSync(join(checkout.preservedPath, MARKER))).toBe(false);
+      expect(preservedRecords(f)).toEqual([]);
+    });
+  });
+
+  it("after the recovery, a CONFIRM under another write scope is refused", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-scope"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      expect(await preserveCheckout(f, run)).toMatchObject({ ok: true });
+      const writesBefore = writesOf(f);
+      await approveWrites(f, run, { githubOwner: "ACME" });
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_FROZEN,
+        evidence: { drift: ["approvalDigest"] },
+      });
+      expect(writesOf(f)).toEqual(writesBefore);
+      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+      expect(existsSync(checkout.checkoutPath)).toBe(false);
+    });
+  });
+
+  it("the recovery never revives the approval it found: after an owner's decline, the CONFIRM is refused", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-revive"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      expect(await preserveCheckout(f, run)).toMatchObject({ ok: true });
+      const writesBefore = writesOf(f);
+      await approveWrites(f, run, { decline: true });
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { stage: "approval", refusal: "APPROVAL_DECLINED" } });
+      expect(writesOf(f)).toEqual(writesBefore);
+      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+      expect(existsSync(checkout.checkoutPath)).toBe(false);
     });
   });
 });

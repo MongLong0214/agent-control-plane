@@ -864,11 +864,17 @@ export const ReasonCode = {
    */
   BOOTSTRAP_APPLICATION_NOT_AVAILABLE: "BOOTSTRAP_APPLICATION_NOT_AVAILABLE",
   /**
-   * #246 C3 — an external write of this bootstrap run's application may have happened (an attempt is
-   * recorded), so its plan is frozen: `plan_submit` and FINAL_REVISE are refused, and a CONFIRM may
-   * only re-apply the same frozen candidate under the same approval.
+   * #246 C3 — this bootstrap run's application is reserved, so its plan is frozen: `plan_submit` and
+   * FINAL_REVISE are refused, and a CONFIRM may only re-apply the same frozen candidate under the
+   * same approved write scope.
    */
   BOOTSTRAP_APPLICATION_FROZEN: "BOOTSTRAP_APPLICATION_FROZEN",
+  /**
+   * #246 C3 — the official recovery of a checkout an interrupted bootstrap application left behind
+   * could not verify what it was asked to preserve, or could not move it; the checkout is left
+   * exactly where it was, and nothing is deleted.
+   */
+  BOOTSTRAP_CHECKOUT_NOT_PRESERVED: "BOOTSTRAP_CHECKOUT_NOT_PRESERVED",
   /**
    * #246 C3 — what GitHub holds at this run's target cannot be attributed to this run by evidence it
    * recorded (the attempt ledger's node id or the creation receipt). The reservation and the evidence

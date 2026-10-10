@@ -290,10 +290,11 @@ const localRepositoryIdentity = (repositoryRole: string): string => `local:${rep
 const OPERATION_MARKER_NAME = ".repo-factory-operation.json";
 
 /**
- * The bootstrap operation an existing checkout's marker names, or null. Read only to word a
- * refusal: nothing is removed or reused on its strength, so a forged marker changes a message.
+ * The bootstrap operation an existing checkout's marker names, or null. Nothing is removed or
+ * reused on its strength: it words a refusal, and the interrupted-checkout recovery (#246 C3) asks
+ * it as one of several checks before it moves a checkout aside, never before it deletes one.
  */
-const checkoutMarkerOf = (localRepoPath: string): string | null => {
+export const checkoutMarkerOf = (localRepoPath: string): string | null => {
   try {
     if (!lstatSync(localRepoPath).isDirectory()) return null;
     const marker = JSON.parse(readFileSync(join(localRepoPath, OPERATION_MARKER_NAME), "utf8")) as {
@@ -327,13 +328,15 @@ export const occupiedCheckoutLeaf = (
   // run that stopped without cleaning up — killed, or still running — leaves it. It is named
   // and kept rather than reclaimed: a matching HEAD does not make its tracked edits, untracked or
   // ignored files recoverable, and a live run cannot be told from a dead one, so a reclaiming
-  // retry could delete what another retry had just claimed (round 3, RF1043-07). A person
-  // removes it once nothing in it is wanted and no run of this operation is active; the next
-  // run then resumes from the GitHub ledger.
+  // retry could delete what another retry had just claimed (round 3, RF1043-07). Nothing here
+  // removes it. A bootstrap application's checkout is recovered by the repair
+  // `preserve_interrupted_bootstrap_checkout` (#246 C3), which verifies the application owns it and
+  // that no attempt is running, moves it aside rather than deleting it, and authorises nothing: the
+  // next run, a new CEO CONFIRM, then resumes from the GitHub ledger.
   if (checkoutMarkerOf(localRepoPath) === plan.bootstrapOperationId) {
     return deny(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-      "this bootstrap operation's checkout already exists: an earlier run of it stopped without cleaning up, or is still running. It is not removed automatically; remove it once nothing in it is wanted and no run of this operation is active, and the next run resumes from the GitHub ledger",
+      "this bootstrap operation's checkout already exists: an earlier run of it stopped without cleaning up, or is still running. It is not removed; once no run of this operation is active, the repair preserve_interrupted_bootstrap_checkout moves it aside, and the next run resumes from the GitHub ledger",
       { refusal: "INTERRUPTED_RUN_CHECKOUT", localRepoPath, resumable: false },
     );
   }
@@ -457,7 +460,7 @@ const judgeRealDirectoryEntry = (
  * meaningfully defend against; the guarantee here is narrower on purpose: it refuses to
  * operate in a namespace a *different* user or group could tamper with.
  */
-const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: string): Decision<void> => {
+export const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: string): Decision<void> => {
   if (typeof process.getuid !== "function") {
     return deny(
       ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,

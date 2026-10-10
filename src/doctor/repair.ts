@@ -19,6 +19,10 @@ import {
 } from "../guard/managed-write-guard.ts";
 import type { WorktreeAuthorization, WorktreeManager } from "../verify/worktree.ts";
 import { canonical } from "../guard/workspace-probe.ts";
+import {
+  INTERRUPTED_CHECKOUT_PRECONDITIONS,
+  type RepoFactoryBootstrapRunner,
+} from "../bootstrap/repo-factory-bootstrap-run.ts";
 
 export type RepairAuthorization = "HERMES" | "OWNER";
 
@@ -147,6 +151,20 @@ export class RepairService {
       undo: "re-observe the repository",
       preconditions: ["the repository is readable"],
     },
+    // #246 C3, CEO decision (c) — the official recovery of a checkout an interrupted bootstrap
+    // application left behind. It moves, never deletes, and authorises nothing: the application
+    // resumes only through a new CEO CONFIRM that passes every check again.
+    preserve_interrupted_bootstrap_checkout: {
+      id: "preserve_interrupted_bootstrap_checkout",
+      risk: "MEDIUM",
+      authorization: "HERMES",
+      description:
+        "Move the checkout an interrupted bootstrap application attempt left behind to a preservation location in the run's own work directory",
+      expectedEffect:
+        "the checkout is kept, unchanged, at <work dir>/preserved/<role>-attempt-<n>; INTERRUPTED_RUN_CHECKOUT no longer refuses the run, and a new CEO CONFIRM of the same frozen candidate resumes it from the GitHub ledger under a current approval of the same scope",
+      undo: "move the preserved directory back to the path the receipt names; nothing in it was changed or removed",
+      preconditions: [...INTERRUPTED_CHECKOUT_PRECONDITIONS],
+    },
   };
 
   constructor(
@@ -162,9 +180,11 @@ export class RepairService {
   ) {}
 
   #ownerAuthority: OwnerAuthorityPort | null = null;
+  #bootstrapRecovery: BootstrapCheckoutRecoveryPort | null = null;
 
-  attach(ports: { ownerAuthority?: OwnerAuthorityPort }): void {
+  attach(ports: { ownerAuthority?: OwnerAuthorityPort; bootstrapRecovery?: BootstrapCheckoutRecoveryPort }): void {
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
+    if (ports.bootstrapRecovery) this.#bootstrapRecovery = ports.bootstrapRecovery;
   }
 
   catalog(): RepairOperation[] {
@@ -231,6 +251,17 @@ export class RepairService {
     }
 
     const outcome = await plan.perform(request.dryRun);
+    // A repair whose effect was refused at the moment of acting changed nothing, and says so.
+    if (outcome.refusal !== undefined) {
+      this.audit.record({
+        kind: "REPAIR_REFUSED",
+        reasonCode: outcome.refusal.reasonCode,
+        runId: request.runId ?? null,
+        actor: request.authorizedBy,
+        evidence: { operationId: operation.id, refusal: outcome.refusal.evidence },
+      });
+      return outcome.refusal;
+    }
 
     const receipt: RepairReceipt = {
       operationId: operation.id,
@@ -447,6 +478,28 @@ export class RepairService {
           },
         };
       }
+      case "preserve_interrupted_bootstrap_checkout": {
+        const recovery = this.#bootstrapRecovery;
+        const runId = request.runId ?? null;
+        if (recovery === null) {
+          return {
+            preconditions: operation.preconditions.map((precondition) =>
+              checked(precondition, false, { notChecked: "no bootstrap runner is attached to verify it" })),
+            perform: async () => ({ changes: 0, evidence: null }),
+          };
+        }
+        const inspected = recovery.inspectInterruptedCheckout(runId);
+        return {
+          preconditions: inspected.preconditions,
+          perform: async (dryRun) => {
+            if (dryRun) return { changes: 1, evidence: inspected.move };
+            // Verified again, synchronously, by the move itself: this plan was made before an await.
+            const preserved = recovery.preserveInterruptedCheckout(runId);
+            if (!preserved.allowed) return { changes: 0, evidence: preserved.evidence, refusal: preserved as Decision<never> };
+            return { changes: 1, evidence: preserved.value };
+          },
+        };
+      }
       default:
         throw new Error(`missing repair plan for ${operation.id}`);
     }
@@ -519,8 +572,15 @@ export class RepairService {
 
 interface RepairPlan {
   preconditions: RepairReceipt["preconditionsChecked"];
-  perform(dryRun: boolean): Promise<{ changes: number; evidence: unknown }>;
+  /** `refusal` when the effect itself was refused at the moment of acting: nothing changed. */
+  perform(dryRun: boolean): Promise<{ changes: number; evidence: unknown; refusal?: Decision<never> }>;
 }
+
+/** #246 C3 — the bootstrap runner's interrupted-checkout recovery, as the repair catalog uses it. */
+export type BootstrapCheckoutRecoveryPort = Pick<
+  RepoFactoryBootstrapRunner,
+  "inspectInterruptedCheckout" | "preserveInterruptedCheckout"
+>;
 
 const checked = (precondition: string, satisfied: boolean, evidence: unknown): RepairReceipt["preconditionsChecked"][number] => ({
   precondition,

@@ -1397,6 +1397,9 @@ export class Daemon {
     // line. Registering before the lock is what let a daemon that was then refused replace the
     // live daemon's supplier.
     this.cp.doctor.setSupplementalFindings(this.#doctorSupplier);
+    // #246 C3 — the same rule for the bootstrap runner's question "is this process the only
+    // control-plane writer": answered by this daemon's lock, and only once the lock is this daemon's.
+    this.cp.bootstrapProducer.attachWriterLock(() => this.lock.held());
 
     try {
       this.installContinuityCoordinator();
