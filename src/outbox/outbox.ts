@@ -21,9 +21,10 @@ import {
 } from "../registry/canonical-self-claim.ts";
 import {
   type DrivenMode,
-  drivenCreationGenerationOf,
+  type DrivenSpawnRecord,
   drivenModeOf,
   drivenModeSql,
+  drivenSpawnRecordOf,
 } from "../runtime/provisioned-session-runtime.ts";
 import {
   type FencedEnvelope,
@@ -1306,9 +1307,9 @@ export class Outbox {
     return drivenModeOf(this.db, sessionId);
   }
 
-  /** #246 C4 — the creation generation a session's one driven-spawn record names (`drivenCreationGenerationOf`). */
-  drivenCreationGenerationOf(sessionId: string): number | null {
-    return drivenCreationGenerationOf(this.db, sessionId);
+  /** #246 C4 — what a session's one driven-spawn record names (`drivenSpawnRecordOf`). */
+  drivenSpawnRecordOf(sessionId: string): DrivenSpawnRecord | null {
+    return drivenSpawnRecordOf(this.db, sessionId);
   }
 
   /** In-band, in `claimDeliverable`'s terms: an in-band kind addressed to a canonical or provisioned runtime. */

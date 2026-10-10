@@ -1319,10 +1319,19 @@ export class CtoLifecycle {
           session.sessionId,
           "new",
           // A driven PRIMARY_CTO's first turn is the one turn its not-yet-bound session may run, and
-          // only for exactly this spawn: this session row, incarnation, epoch and creation generation.
+          // only for exactly this spawn: its project, role key and creation generation, and this
+          // session row, incarnation and epoch.
           creationGeneration === null
             ? null
-            : { incarnation: session.incarnation, credentialEpoch: session.credentialEpoch, creationGeneration },
+            : {
+                purpose: "spawn-attestation",
+                projectId: scope,
+                roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: scope }),
+                sessionId: session.sessionId,
+                incarnation: session.incarnation,
+                credentialEpoch: session.credentialEpoch,
+                creationGeneration,
+              },
         ))
       : await probeSessionHealth(adapter, handle);
     if (!live.allowed) {

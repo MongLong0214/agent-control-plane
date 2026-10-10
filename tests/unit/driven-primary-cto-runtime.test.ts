@@ -882,12 +882,83 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         expect(withdrawn).toEqual([true]);
       });
     });
+
+    /** Runs a resume attestation whose credential changes while it is being provisioned. */
+    const changeDuringProvision = async (f: BootstrapRuntimeFixture, sessionId: string, change: () => void) => {
+      const withdrawn: boolean[] = [];
+      let provisioned = 0;
+      f.harness.cp.sessionRuntime.attach({
+        delivery: {
+          prepare: () => f.launch.prepare(),
+          provision: async (credential) => {
+            const result = await f.launch.provision(credential);
+            provisioned += 1;
+            if (provisioned === 1) change();
+            return result;
+          },
+          withdraw: (externalSessionId) => {
+            const untaken = f.launch.withdraw(externalSessionId);
+            if (provisioned > 0) withdrawn.push(untaken);
+            return untaken;
+          },
+        },
+      });
+      const before = f.claude.turns.length;
+      const result = await f.harness.cp.sessionRuntime.attest(sessionId, "resume");
+      return { result, calls: f.claude.turns.length - before, withdrawn };
+    };
+
+    it("never calls the provider with a credential rotated away while it was being provisioned", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { binding } = await drivenPrimary(f, "rotated-during-provision");
+        const old = f.claude.credentials.get(binding.sessionId)!.sessionSecret;
+        let rotated = "";
+        const { result, calls, withdrawn } = await changeDuringProvision(f, binding.sessionId, () => {
+          const next = cp.sessions.rotateSecret(binding.sessionId, cp.sessions.require(binding.sessionId).credentialEpoch);
+          if (!next.allowed) throw new Error(next.message);
+          rotated = next.value.sessionSecret;
+        });
+        expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE });
+        expect(calls).toBe(0);
+        expect(withdrawn).toEqual([true]);
+        // Neither credential appears in what the refusal reports or records.
+        const recorded = cp.db.all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE session_id = ?`, [binding.sessionId]);
+        for (const secret of [old, rotated]) {
+          expect(JSON.stringify(result)).not.toContain(secret);
+          expect(recorded.some((row) => row.evidence_json.includes(secret))).toBe(false);
+        }
+      });
+    });
+
+    it("never calls the provider with a credential released from custody while it was being provisioned", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { binding } = await drivenPrimary(f, "released-during-provision");
+        const { result, calls, withdrawn } = await changeDuringProvision(f, binding.sessionId, () => {
+          cp.sessionRuntime.release(binding.sessionId);
+        });
+        expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE });
+        expect(calls).toBe(0);
+        expect(withdrawn).toEqual([true]);
+      });
+    });
   });
 
   describe("a session not yet bound runs only its own spawn's attestation", () => {
-    const ticketOf = (f: BootstrapRuntimeFixture, sessionId: string, creationGeneration = 1): SpawnAttestation => {
+    /** The ticket a spawn would hand over for this session: every field read from current state. */
+    const ticketOf = (f: BootstrapRuntimeFixture, sessionId: string): SpawnAttestation => {
       const session = f.harness.cp.sessions.require(sessionId);
-      return { incarnation: session.incarnation, credentialEpoch: session.credentialEpoch, creationGeneration };
+      const record = f.harness.cp.outbox.drivenSpawnRecordOf(sessionId)!;
+      return {
+        purpose: "spawn-attestation",
+        projectId: record.projectId!,
+        roleKey: record.roleKey!,
+        sessionId,
+        incarnation: session.incarnation,
+        credentialEpoch: session.credentialEpoch,
+        creationGeneration: record.creationGeneration!,
+      };
     };
 
     it("refuses work, a probe and any other attestation on the spawn's own pending session, and the spawn still binds", async () => {
@@ -967,8 +1038,13 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         const exact = ticketOf(f, other.sessionId);
         const spawned = cp.sessions.require(binding.sessionId);
         const before = f.claude.turns.length;
+        // Each ticket differs from the exact one in one field only.
         for (const ticket of [
           null,
+          { ...exact, purpose: "work" as unknown as SpawnAttestation["purpose"] },
+          { ...exact, projectId: "pending-spawned" },
+          { ...exact, roleKey: binding.roleKey },
+          { ...exact, sessionId: spawned.sessionId },
           { ...exact, incarnation: spawned.incarnation },
           { ...exact, credentialEpoch: exact.credentialEpoch + 1 },
           { ...exact, creationGeneration: 2 },
@@ -982,6 +1058,56 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         expect(f.claude.turns.length).toBe(before);
         // The one ticket that matches every field is the only one the exception would take.
         expect(cp.sessionRuntime.turnEligibility(other.sessionId, "attestation", "new", exact).allowed).toBe(true);
+      });
+    });
+
+    it("refuses the spawn's own ticket to another pending session with its incarnation, epoch and generation, in another project or the same", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+        registerBareProject(f, "ticket-source");
+        registerBareProject(f, "ticket-other-project");
+        const bootstrap = await f.dispatchBootstrap();
+        const attest = cp.sessionRuntime.attest.bind(cp.sessionRuntime);
+        const seen: Array<{ project: string; reasonCode: string; calls: number }> = [];
+        vi.spyOn(cp.sessionRuntime, "attest").mockImplementation(async (sessionId, conversation, spawn) => {
+          if (spawn && seen.length === 0) {
+            // While the genuine spawn is about to attest: two other STARTING sessions sharing its
+            // incarnation, epoch and creation generation, each recorded PENDING, each in custody.
+            const source = cp.sessions.require(sessionId);
+            for (const projectId of ["ticket-other-project", "ticket-source"]) {
+              const collision = cp.sessions.create({
+                provider: source.provider,
+                model: source.model,
+                incarnation: source.incarnation,
+                ...(source.workdir ? { workdir: source.workdir } : {}),
+              });
+              cp.audit.record({
+                kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+                projectId,
+                roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId }),
+                sessionId: collision.sessionId,
+                evidence: { creationGeneration: spawn.creationGeneration },
+              });
+              expect(collision.sessionId).not.toBe(sessionId);
+              expect(collision.credentialEpoch).toBe(source.credentialEpoch);
+              expect(cp.outbox.drivenModeOf(collision.sessionId)).toBe("PENDING");
+              expect(cp.sessionRuntime.adopt(collision.sessionId, Role.PRIMARY_CTO, collision.sessionSecret!, collision.credentialEpoch).allowed)
+                .toBe(true);
+              const before = f.claude.turns.length;
+              const result = await attest(collision.sessionId, "new", spawn);
+              seen.push({ project: projectId, reasonCode: result.reasonCode, calls: f.claude.turns.length - before });
+            }
+          }
+          return attest(sessionId, conversation, spawn);
+        });
+        const spawned = await cp.cto.ensureDrivenPrimaryCto("ticket-source", bootstrap.runId);
+        expect(seen).toEqual([
+          { project: "ticket-other-project", reasonCode: ReasonCode.CONFLICT, calls: 0 },
+          { project: "ticket-source", reasonCode: ReasonCode.CONFLICT, calls: 0 },
+        ]);
+        // The ticket still served the spawn it was issued for.
+        expect(spawned.allowed).toBe(true);
       });
     });
   });

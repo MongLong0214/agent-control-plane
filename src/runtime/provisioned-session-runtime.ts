@@ -41,7 +41,7 @@ export interface ProvisionedSessionRuntimePorts {
    * that row has left PENDING — acknowledged over the authenticated relay, or rejected or expired —
    * and not when a turn for it exited 0.
    */
-  readonly outbox: Pick<Outbox, "get" | "drivenModeOf" | "drivenCreationGenerationOf">;
+  readonly outbox: Pick<Outbox, "get" | "drivenModeOf" | "drivenSpawnRecordOf">;
 }
 
 export interface ProvisionedSessionRuntimeOptions {
@@ -54,14 +54,29 @@ export interface ProvisionedSessionRuntimeOptions {
 export type TurnPurpose = "attestation" | "probe" | "work";
 
 /**
- * #246 C4 — the one spawn attestation a driven PRIMARY_CTO's own spawn runs, for exactly the session
- * row, incarnation and credential epoch it created and the generation its spawn record names. It is
- * the only thing that lets a turn run for a session not yet bound (`PENDING`).
+ * #246 C4 — the one spawn attestation a driven PRIMARY_CTO's own spawn runs. It is the only thing
+ * that lets a turn run for a session not yet bound (`PENDING`), and every field must equal the
+ * current state exactly: the purpose it permits, the project and role key and the creation
+ * generation its spawn record names, and the session row, incarnation and credential epoch the spawn
+ * created. No partial match counts — an incarnation is not unique, and only the session id names one
+ * row. No actor or assignment exists yet to name: the bind mints them after READY, as the assignment
+ * at this role key and creation generation, and the bind re-checks that assignment and its actor.
  */
 export interface SpawnAttestation {
+  purpose: "spawn-attestation";
+  projectId: string;
+  roleKey: string;
+  sessionId: string;
   incarnation: string;
   credentialEpoch: number;
   creationGeneration: number;
+}
+
+/** What a session's one driven-spawn record names, if it has exactly one. */
+export interface DrivenSpawnRecord {
+  projectId: string | null;
+  roleKey: string | null;
+  creationGeneration: number | null;
 }
 
 /** One reason a role's session is woken; `id` is what makes a second wake for it a duplicate. */
@@ -151,14 +166,20 @@ export const drivenModeSql = (sessionExpr: string): string => `(CASE
   ELSE 'CONTRADICTED'
 END)`;
 
-/** The creation generation the session's one spawn record names, or null without exactly one. */
-export const drivenCreationGenerationOf = (db: Pick<Db, "get">, sessionId: string): number | null => {
-  const read = db.get<{ n: number; generation: number | null }>(
-    `SELECT COUNT(*) AS n, MAX(json_extract(evidence_json, '$.creationGeneration')) AS generation
+/** What the session's one driven-spawn record names, or null when it has none or more than one. */
+export const drivenSpawnRecordOf = (db: Pick<Db, "all">, sessionId: string): DrivenSpawnRecord | null => {
+  const records = db.all<{ project_id: string | null; role_key: string | null; generation: unknown }>(
+    `SELECT project_id, role_key, json_extract(evidence_json, '$.creationGeneration') AS generation
        FROM audit_events WHERE kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}' AND session_id = ?`,
     [sessionId],
   );
-  return read?.n === 1 && typeof read.generation === "number" ? read.generation : null;
+  const [only] = records;
+  if (records.length !== 1 || !only) return null;
+  return {
+    projectId: only.project_id,
+    roleKey: only.role_key,
+    creationGeneration: typeof only.generation === "number" ? only.generation : null,
+  };
 };
 
 /** `drivenModeSql` for one session id. */
@@ -291,11 +312,16 @@ export class ProvisionedSessionRuntime {
       deny(reasonCode, message, { sessionId, purpose, drivenMode: mode, lifecycle: session?.lifecycle ?? null });
     if (!session) return refuse(ReasonCode.NOT_FOUND, "unknown session");
     if (mode === "PENDING") {
-      const own = spawn !== null && purpose === "attestation" && conversation === "new" &&
+      const record = this.ports.outbox.drivenSpawnRecordOf(sessionId);
+      const own = spawn !== null && record !== null && purpose === "attestation" && conversation === "new" &&
         session.lifecycle === SessionLifecycle.STARTING &&
+        spawn.purpose === "spawn-attestation" &&
+        spawn.projectId === record.projectId &&
+        spawn.roleKey === record.roleKey &&
+        spawn.sessionId === sessionId &&
         spawn.incarnation === session.incarnation &&
         spawn.credentialEpoch === session.credentialEpoch &&
-        spawn.creationGeneration === this.ports.outbox.drivenCreationGenerationOf(sessionId);
+        spawn.creationGeneration === record.creationGeneration;
       return own
         ? allow(ReasonCode.OK, undefined)
         : refuse(ReasonCode.CONFLICT, "a driven session not yet bound runs only the attestation of the spawn that created it");
@@ -588,6 +614,19 @@ export class ProvisionedSessionRuntime {
     }
     // #246 C4 — immediately before the provider call, after every await above: the answer on entry
     // is not reused. A turn refused here never reaches the provider, and its credential is taken back.
+    // The credential it prepared must still be the session's: the same epoch (no rotation during the
+    // awaits) and the same custody (nothing adopted over it or released).
+    if (turn.relay) {
+      const current = this.ports.sessions.get(sessionId);
+      if (current?.credentialEpoch !== session.credentialEpoch || this.#held.get(sessionId) !== held) {
+        if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
+        return refused(deny(ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE, "the credential this turn prepared is no longer the session's", {
+          sessionId,
+          preparedEpoch: session.credentialEpoch,
+          currentEpoch: current?.credentialEpoch ?? null,
+        }));
+      }
+    }
     const now = this.turnEligibility(sessionId, turn.purpose, conversation, turn.spawn ?? null);
     if (!now.allowed) {
       if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
