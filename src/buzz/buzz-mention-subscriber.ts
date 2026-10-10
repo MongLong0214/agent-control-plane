@@ -348,7 +348,55 @@ export interface BuzzMentionRoleBinding {
   readonly roleKey: string;
   /** `sessions.buzz_actor_id` as stored, so this module can compare it rather than trust a lookup. */
   readonly buzzActorId: string;
+  /**
+   * The binding's generation and the session serving it, when the registry reports them. The
+   * subscriber pins what it was admitted under, re-reads both immediately before every delivery,
+   * and hands the sink the pair it read, so a sink can refuse a binding that moved after that read.
+   */
+  readonly bindingGeneration?: number;
+  readonly sessionId?: string;
+  /** The project the role belongs to, when reported. The role key must name exactly this project. */
+  readonly projectId?: string;
+  /**
+   * The room the bound session answers in (`sessions.buzz_address`), when the registry reports one.
+   * It must be one of the rooms this identity subscribes in: a CTO routed to a room its own
+   * identity does not listen in would be admitted and never hear a mention.
+   */
+  readonly room?: string | null;
 }
+
+/**
+ * One identity's admission, as the registry judges it.
+ *
+ * `EXCLUDED` carries a fixed reason code, never a value read from a request, so it can be written to
+ * health and to the daemon's log as it is.
+ */
+export type BuzzMentionIdentityJudgement =
+  | { readonly verdict: "ADMITTED"; readonly binding: BuzzMentionRoleBinding }
+  | { readonly verdict: "EXCLUDED"; readonly reason: string };
+
+/**
+ * Why a configured identity is not delivering, when this module rather than the registry decided
+ * it. A registry that judges (`judgeIdentity`) supplies its own codes; these are the subscriber's.
+ */
+export const BuzzMentionExclusion = {
+  /** The registry answered `null`: no live PRIMARY_CTO binding carries this identity. */
+  NO_LIVE_PRIMARY_CTO_BINDING: "NO_LIVE_PRIMARY_CTO_BINDING",
+  /** The registry threw, or answered in a shape this module cannot read. */
+  BINDING_UNVERIFIABLE: "BINDING_UNVERIFIABLE",
+  /** The binding's stored channel identity is not the one this identity's key derives. */
+  ACTOR_MISMATCH: "ACTOR_MISMATCH",
+  /** The binding names a project its role key does not. */
+  PROJECT_MISMATCH: "PROJECT_MISMATCH",
+  /** The bound session answers in a room this identity does not subscribe in. */
+  ROOM_NOT_SUBSCRIBED: "ROOM_NOT_SUBSCRIBED",
+  /** Another configured identity already holds this role. */
+  ROLE_HELD_BY_ANOTHER_IDENTITY: "ROLE_HELD_BY_ANOTHER_IDENTITY",
+  /** A live connection found its pinned role no longer held, or held as a different role. */
+  ROLE_NOT_HELD: "ROLE_NOT_HELD",
+  /** The subscriber was closed; nothing is delivering. */
+  SUBSCRIBER_CLOSED: "SUBSCRIBER_CLOSED",
+} as const;
 
 /**
  * The registry question this subscriber asks, supplied rather than reached for.
@@ -362,6 +410,12 @@ export interface BuzzMentionRoleBinding {
  */
 export interface BuzzMentionRegistry {
   primaryCtoBindingFor(pubkey: string): BuzzMentionRoleBinding | null;
+  /**
+   * The same question with its answer's reason, and without diagnostics of its own: the subscriber
+   * asks it at startup, on every re-judgement and before every delivery, and records the reason in
+   * health. Absent, `primaryCtoBindingFor` is asked and a `null` is `NO_LIVE_PRIMARY_CTO_BINDING`.
+   */
+  judgeIdentity?(pubkey: string): BuzzMentionIdentityJudgement;
   /**
    * The CEO binding and this role's binding as they stand right now — read when a frame *arrives*,
    * before it waits behind another frame's admission (#1044). Reads only. Absent, or answering
@@ -447,6 +501,20 @@ export interface BuzzMentionAdmissionRequest {
    * generation it arrived under rather than the one it was processed under.
    */
   readonly receipt: BuzzPeerBinding | null;
+  /**
+   * The binding generation and serving session the registry answered **immediately before this
+   * call**, when it reports them. The subscriber has already refused a binding that was not held; a
+   * sink that re-reads the binding when it writes can refuse one that moved since, so a session that
+   * stopped holding the role between the two reads is never woken. Absent on an envelope built
+   * outside the subscriber.
+   */
+  readonly binding?: BuzzMentionDeliveryBinding;
+}
+
+/** What a delivery was judged against: the pinned binding's generation and serving session. */
+export interface BuzzMentionDeliveryBinding {
+  readonly bindingGeneration: number | null;
+  readonly sessionId: string | null;
 }
 
 /** Where a verified event goes. The daemon's composition is the only production implementation. */
@@ -469,6 +537,73 @@ export interface BuzzMentionVerdict {
 
 /** A reason code is a fixed catalogue string; anything else stays out of the health key space. */
 const REASON_CODE_SHAPE = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+const excluded = (reason: string): BuzzMentionIdentityJudgement => ({ verdict: "EXCLUDED", reason });
+
+/**
+ * One identity's admission: the registry's answer, and then this module's own checks on it.
+ *
+ * Each identity is judged alone. A paused, revoked or unverifiable identity is excluded with its
+ * reason and nothing else is: the other identities' admission does not read this answer.
+ *
+ * The checks after the registry's answer are the ones this module can make without database
+ * authority: the stored channel identity is the one this key derives, the role key names the
+ * project the binding reports, and the room the bound session answers in is one this identity
+ * subscribes in. Whether the assignment is ACTIVE and the session live is the registry's answer;
+ * neither alone is enough, and the registry is the one place that reads both.
+ */
+const judgeIdentity = (
+  registry: BuzzMentionRegistry,
+  pubkey: string,
+  rooms: readonly string[],
+): BuzzMentionIdentityJudgement => {
+  let answer: BuzzMentionIdentityJudgement | null | undefined;
+  try {
+    if (registry.judgeIdentity) {
+      answer = registry.judgeIdentity(pubkey);
+    } else {
+      const bound = registry.primaryCtoBindingFor(pubkey);
+      answer = bound ? { verdict: "ADMITTED", binding: bound } : excluded(BuzzMentionExclusion.NO_LIVE_PRIMARY_CTO_BINDING);
+    }
+  } catch {
+    return excluded(BuzzMentionExclusion.BINDING_UNVERIFIABLE);
+  }
+  // A registry is supplied, not trusted to be well-formed: an answer this module cannot read is an
+  // identity it cannot verify, and that is an exclusion rather than a throw that takes the others.
+  if (typeof answer !== "object" || answer === null) return excluded(BuzzMentionExclusion.BINDING_UNVERIFIABLE);
+  if (answer.verdict === "EXCLUDED") {
+    return excluded(
+      typeof answer.reason === "string" && REASON_CODE_SHAPE.test(answer.reason)
+        ? answer.reason
+        : BuzzMentionExclusion.BINDING_UNVERIFIABLE,
+    );
+  }
+  const binding = answer.verdict === "ADMITTED" ? answer.binding : null;
+  if (!isPlainObject(binding) || typeof binding.roleKey !== "string" || typeof binding.buzzActorId !== "string") {
+    return excluded(BuzzMentionExclusion.BINDING_UNVERIFIABLE);
+  }
+  return checkedBinding(binding, pubkey, rooms);
+};
+
+/** This module's own checks on a binding the registry answered with. */
+const checkedBinding = (
+  binding: BuzzMentionRoleBinding,
+  pubkey: string,
+  rooms: readonly string[],
+): BuzzMentionIdentityJudgement => {
+  if (!constantTimeEquals(binding.buzzActorId, pubkey)) return excluded(BuzzMentionExclusion.ACTOR_MISMATCH);
+  if (binding.projectId !== undefined && binding.roleKey !== `PRIMARY_CTO:${binding.projectId}`) {
+    return excluded(BuzzMentionExclusion.PROJECT_MISMATCH);
+  }
+  if (typeof binding.room === "string" && !rooms.includes(binding.room)) {
+    return excluded(BuzzMentionExclusion.ROOM_NOT_SUBSCRIBED);
+  }
+  return { verdict: "ADMITTED", binding: Object.freeze({ ...binding }) };
+};
+
+/** Whether two answers name one binding: the same role, generation and serving session. */
+const sameBinding = (a: BuzzMentionRoleBinding, b: BuzzMentionRoleBinding): boolean =>
+  a.roleKey === b.roleKey && a.bindingGeneration === b.bindingGeneration && a.sessionId === b.sessionId;
 
 /** The half of a socket this module drives. */
 export interface BuzzRelaySocket {
@@ -511,6 +646,54 @@ export interface BuzzMentionRoleNotHeldReport {
  * key file's secret half.
  */
 export type BuzzMentionRoleNotHeldReporter = (report: BuzzMentionRoleNotHeldReport) => void;
+
+/**
+ * One identity leaving or rejoining the admitted set, as judgement decided it.
+ *
+ * Reported on a change only: an identity excluded for the same reason at every re-judgement is
+ * reported once, and an identity admitted at startup is not reported at all.
+ */
+export interface BuzzMentionAdmissionChange {
+  /** The identity's ordinal in the config, `identities[<n>]`. Never its key path. */
+  readonly identity: string;
+  /** The channel identity. Public material: it is the `p` tag on the wire. */
+  readonly identityPubkey: string;
+  readonly state: "EXCLUDED" | "ADMITTED";
+  /** The exclusion's reason code; `null` for an admission. */
+  readonly reason: string | null;
+  /** The role an admission pinned; `null` for an exclusion. */
+  readonly roleKey: string | null;
+}
+
+export type BuzzMentionAdmissionReporter = (change: BuzzMentionAdmissionChange) => void;
+
+/** One configured identity's admission, as health shows it. */
+export interface BuzzMentionIdentityAdmission {
+  readonly identity: string;
+  readonly identityPubkey: string;
+  readonly state: "ADMITTED" | "EXCLUDED";
+  /** Why it is not delivering; `null` while admitted. */
+  readonly reason: string | null;
+  /** The role it is pinned to, or `null` if it has never been admitted. */
+  readonly roleKey: string | null;
+  readonly bindingGeneration: number | null;
+  /** Local wall-clock seconds at which the current exclusion began; `null` while admitted. */
+  readonly excludedSinceSeconds: number | null;
+}
+
+/**
+ * Whether the configured identities are all delivering, and which are not and why.
+ *
+ * `continuity` is the one word an operator should read before any count: `PARTIAL` means at least
+ * one configured identity is excluded, however many sockets are open. `socketCount` and
+ * `configuredIdentities` count configuration, and neither says the subscriber is whole.
+ */
+export interface BuzzMentionAdmissionSnapshot {
+  readonly continuity: "FULL" | "PARTIAL" | "NONE";
+  readonly configuredIdentities: number;
+  readonly admittedIdentities: number;
+  readonly identities: readonly BuzzMentionIdentityAdmission[];
+}
 
 /**
  * The timer seam. Injected so the reconnect schedule is a thing a test can *step*, rather than a
@@ -643,6 +826,23 @@ const nativeRoleNotHeldReporter: BuzzMentionRoleNotHeldReporter = (report) => {
     `Buzz mention subscriber: ${report.identityPubkey} has not held ${report.roleKey} for ` +
       `${report.consecutive} consecutive relay events; mentions for that role are not being ` +
       "delivered. The subscriber keeps reconnecting; a fresh role claim is what ends this.\n",
+  );
+};
+
+/**
+ * `process.stderr`, beside the role-not-held report. The exclusion line keeps the words the
+ * all-or-none refusal used for the same condition, so a search an operator already runs still
+ * finds it, and adds what changed: the other identities are still subscribing.
+ */
+const nativeAdmissionReporter: BuzzMentionAdmissionReporter = (change) => {
+  process.stderr.write(
+    change.state === "EXCLUDED"
+      ? `Buzz mention subscriber excluded ${change.identity} (${change.reason ?? "UNKNOWN"}): ` +
+          `${change.identity} does not currently hold a live PRIMARY_CTO binding; continuing without Buzz ` +
+          "mention subscriber delivery for that identity. The other configured identities keep subscribing, " +
+          "and it is re-judged on the next role claim, revoke or session change.\n"
+      : `Buzz mention subscriber admitted ${change.identity} for ${change.roleKey ?? "UNKNOWN"}; ` +
+          "its mentions are delivered again from its preserved window.\n",
   );
 };
 
@@ -871,6 +1071,12 @@ export interface BuzzMentionCounters {
    * fourth term is the stale tail, deliberately unattributed; see the branch in `#admitEvent`.
    */
   readonly rejections: Readonly<Record<string, number>>;
+  /**
+   * Which configured identities are delivering, and why the others are not. On the handle's
+   * counters only, because that is the object the daemon writes into `health.json`: receipt beside
+   * admission, so "nothing arrived" is never read off an identity that was never admitted.
+   */
+  readonly admission?: BuzzMentionAdmissionSnapshot;
 }
 
 /** Accumulates one subscription's outcomes. Plain counters: no sampling, no decay, no reset. */
@@ -923,6 +1129,8 @@ interface SubscriptionDeps {
   readonly reportRoleNotHeld: BuzzMentionRoleNotHeldReporter;
   /** Told each time a connection authenticates, so a sender can retry what waited for it (#1036). */
   readonly authenticated: () => void;
+  /** Re-judges one excluded identity against the registry and its siblings; the judgement timer's work. */
+  readonly rejudge: (subscription: BuzzMentionSubscription) => void;
 }
 
 /** A publish waiting for the relay's `OK`, tied to the connection it was sent on. */
@@ -942,11 +1150,30 @@ interface PendingPublish {
  */
 class BuzzMentionSubscription {
   readonly #deps: SubscriptionDeps;
+  /** `identities[<n>]`: how this identity is named in health and in the log. Never its key path. */
+  readonly #ordinal: string;
   readonly #pubkey: string;
   readonly #secretKey: Uint8Array;
-  readonly #roleKey: string;
   readonly #rooms: readonly string[];
   readonly #subscriptionId = randomUUID().replace(/-/gu, "");
+
+  /**
+   * The binding this identity was last admitted under, or `null` if it never has been.
+   *
+   * Kept through an exclusion, so health can say which role an excluded identity last held, and
+   * replaced only by a later admission. A connection opens only once this is set.
+   */
+  #binding: BuzzMentionRoleBinding | null = null;
+  /** Why this identity is not delivering, and since when; `null` while it is. */
+  #exclusion: { readonly reason: string; readonly sinceSeconds: number } | null = null;
+  /**
+   * Excluded by judgement, with no connection and the judgement timer in place of the reconnect
+   * one. Distinct from `#stopped`: a suspended identity is re-judged and comes back, with `#since`
+   * where it was, which is the whole of "preserve the cursor across a reconfiguration".
+   */
+  #suspended = false;
+  /** The last exclusion reason the operator was told, so one reason is reported once. */
+  #reportedReason: string | null = null;
 
   #socket: BuzzRelaySocket | null = null;
   /**
@@ -985,13 +1212,124 @@ class BuzzMentionSubscription {
 
   constructor(
     deps: SubscriptionDeps,
-    identity: { pubkey: string; secretKey: Uint8Array; roleKey: string; rooms: readonly string[] },
+    identity: { ordinal: string; pubkey: string; secretKey: Uint8Array; rooms: readonly string[] },
   ) {
     this.#deps = deps;
+    this.#ordinal = identity.ordinal;
     this.#pubkey = identity.pubkey;
     this.#secretKey = identity.secretKey;
-    this.#roleKey = identity.roleKey;
     this.#rooms = identity.rooms;
+  }
+
+  get ordinal(): string {
+    return this.#ordinal;
+  }
+
+  /** The role this identity is pinned to, or `null` if it has never been admitted. */
+  get roleKey(): string | null {
+    return this.#binding?.roleKey ?? null;
+  }
+
+  /** Admitted and delivering: pinned, and neither excluded by judgement nor in a role-not-held run. */
+  get admitted(): boolean {
+    return this.#binding !== null && this.#exclusion === null && !this.#stopped;
+  }
+
+  /** Pinned and not suspended: this subscriber listens as this identity, connected or reconnecting. */
+  get listening(): boolean {
+    return this.#binding !== null && !this.#suspended && !this.#stopped;
+  }
+
+  admission(): BuzzMentionIdentityAdmission {
+    const admitted = this.admitted;
+    return {
+      identity: this.#ordinal,
+      identityPubkey: this.#pubkey,
+      state: admitted ? "ADMITTED" : "EXCLUDED",
+      reason: admitted ? null : (this.#exclusion?.reason ?? BuzzMentionExclusion.SUBSCRIBER_CLOSED),
+      roleKey: this.#binding?.roleKey ?? null,
+      bindingGeneration: this.#binding?.bindingGeneration ?? null,
+      excludedSinceSeconds: this.#exclusion?.sinceSeconds ?? null,
+    };
+  }
+
+  /**
+   * Admits this identity under `binding`, and reconnects it if judgement had suspended it.
+   *
+   * Returns whether it was excluded before, which is when an admission is worth reporting. The
+   * window (`#since`) is not touched: a suspended identity resumes asking from where it stopped,
+   * and one never admitted before asks from the beginning, as a first subscription always has.
+   */
+  admit(binding: BuzzMentionRoleBinding): boolean {
+    const wasExcluded = this.#exclusion !== null;
+    this.#binding = binding;
+    this.#exclusion = null;
+    this.#reportedReason = null;
+    if (this.#suspended) {
+      this.#suspended = false;
+      this.#clearTimer();
+      this.#attempt = 0;
+      this.open();
+    }
+    return wasExcluded;
+  }
+
+  /**
+   * Excludes this identity: its connection goes, nothing of its is asked for or consumed, and the
+   * judgement timer asks the registry again on the reconnect schedule.
+   *
+   * Returns whether the reason is one the operator has not been told yet.
+   */
+  exclude(reason: string): boolean {
+    this.#noteExclusion(reason);
+    if (!this.#suspended) {
+      this.#suspended = true;
+      this.#clearTimer();
+      this.#drop();
+    }
+    this.#scheduleJudgement();
+    if (this.#reportedReason === reason) return false;
+    this.#reportedReason = reason;
+    return true;
+  }
+
+  /** Records an exclusion, keeping the time the current one began. */
+  #noteExclusion(reason: string): void {
+    if (this.#exclusion?.reason === reason) return;
+    this.#exclusion = {
+      reason,
+      sinceSeconds: this.#exclusion?.sinceSeconds ?? this.#deps.scheduler.nowSeconds(),
+    };
+  }
+
+  #clearTimer(): void {
+    if (this.#timer === null) return;
+    this.#deps.scheduler.clearTimer(this.#timer);
+    this.#timer = null;
+  }
+
+  /**
+   * The judgement timer: an excluded identity is asked about again on the same capped schedule a
+   * dropped connection is reconnected on, and with no socket open while it waits.
+   *
+   * The daemon also re-judges on every committed binding switch; this timer is what still notices
+   * a change no switch announces, such as a session taking its channel identity after its binding.
+   */
+  #scheduleJudgement(): void {
+    if (this.#stopped || this.#timer !== null) return;
+    const step = Math.min(this.#attempt, RELAY_RECONNECT_BACKOFF_MS.length - 1);
+    const delay = RELAY_RECONNECT_BACKOFF_MS[step] ?? 30_000;
+    this.#attempt += 1;
+    this.#timer = this.#deps.scheduler.setTimer(delay, () => {
+      this.#timer = null;
+      if (this.#stopped || !this.#suspended) return;
+      this.#deps.rejudge(this);
+    });
+  }
+
+  /** The judgement this identity would get right now, before any sibling is consulted. */
+  judge(): BuzzMentionIdentityJudgement {
+    return judgeIdentity(this.#deps.registry, this.#pubkey, this.#rooms);
   }
 
   /** The volatile high-water mark, for the rows that assert a redelivery window rather than a file. */
@@ -1119,7 +1457,10 @@ class BuzzMentionSubscription {
   }
 
   open(): void {
-    if (this.#stopped || this.#socket !== null) return;
+    // An identity is never connected without a binding it was admitted under, and never while
+    // judgement has it excluded: a connection asks the relay for its mail, and an excluded
+    // identity's mail stays with the relay until it is admitted again.
+    if (this.#stopped || this.#socket !== null || this.#suspended || this.#binding === null) return;
     this.#authEventId = null;
     this.#subscribed = false;
     // Claimed before the socket exists, so every callback the factory registers is already fenced
@@ -1250,8 +1591,10 @@ class BuzzMentionSubscription {
    * admission (#1044).
    */
   #peerReceipt(): BuzzPeerBinding | null {
+    const roleKey = this.#binding?.roleKey;
+    if (roleKey === undefined) return null;
     try {
-      return this.#deps.registry.peerReceiptFor?.(this.#roleKey) ?? null;
+      return this.#deps.registry.peerReceiptFor?.(roleKey) ?? null;
     } catch {
       return null;
     }
@@ -1286,7 +1629,7 @@ class BuzzMentionSubscription {
     if (this.#roleNotHeldRun !== ROLE_NOT_HELD_REPORT_AFTER) return;
     this.#deps.reportRoleNotHeld({
       identityPubkey: this.#pubkey,
-      roleKey: this.#roleKey,
+      roleKey: this.#binding?.roleKey ?? "",
       consecutive: this.#roleNotHeldRun,
     });
   }
@@ -1507,23 +1850,34 @@ class BuzzMentionSubscription {
       return rejected("event-conversation-unusable");
     }
 
-    // Re-checked here, not only at startup. The role can move between the preflight and this
-    // event — that is ordinary operation — and a subscriber that spoke for a role it no longer
-    // holds would be admitting an owner's message against a stale binding.
-    const bound = this.#deps.registry.primaryCtoBindingFor(this.#pubkey);
-    if (!bound || bound.roleKey !== this.#roleKey || !constantTimeEquals(bound.buzzActorId, this.#pubkey)) {
+    // Re-judged here, immediately before delivery, not only at startup. The role can move between
+    // the preflight and this event — that is ordinary operation — and a subscriber that spoke for a
+    // role it no longer holds would be admitting an owner's message against a stale binding. The
+    // judgement is the whole admission rule (actor, project, room, live binding), not a subset.
+    const pinned = this.#binding;
+    const fresh = this.judge();
+    if (fresh.verdict !== "ADMITTED" || pinned === null || fresh.binding.roleKey !== pinned.roleKey) {
       // A race, not a refusal: the cursor is preserved and the socket goes, so the same event is
-      // asked for again once the registry has settled.
+      // asked for again once the registry has settled. Nothing of this identity's is consumed.
       //
       // Counted, because "the registry has settled" is a thing this loop asserts and never checks.
       // The reconnect policy is unchanged and correct — what was missing is any way to tell a
-      // settling registry from one that has nothing left to settle into.
+      // settling registry from one that has nothing left to settle into. Health shows the identity
+      // excluded for as long as the run lasts; judgement (`exclude`) is what takes the socket away.
+      this.#noteExclusion(fresh.verdict === "EXCLUDED" ? fresh.reason : BuzzMentionExclusion.ROLE_NOT_HELD);
       this.#noteRoleNotHeld();
       this.#reconnect(generation);
       return rejected("role-not-held");
     }
     // The run ends here and only here: the binding answered, so whatever it was, it was a race.
     this.#roleNotHeldRun = 0;
+    this.#exclusion = null;
+    // The same role under a later generation or another serving session is a re-claim or a session
+    // change: the pin follows it, and this delivery names the binding just read, never the one the
+    // connection was opened under. A sink that reads the registry again when it writes refuses a
+    // binding that has moved since this line.
+    if (!sameBinding(pinned, fresh.binding)) this.#binding = fresh.binding;
+    const bound = fresh.binding;
 
     const frozen: BuzzMentionEvent = deepFreeze(event);
     const answer = await this.#deps.sink.admit({
@@ -1532,6 +1886,7 @@ class BuzzMentionSubscription {
       conversation,
       event: frozen,
       receipt,
+      binding: { bindingGeneration: bound.bindingGeneration ?? null, sessionId: bound.sessionId ?? null },
     });
     const admission = typeof answer === "string" ? answer : answer.admission;
 
@@ -1697,19 +2052,29 @@ export interface BuzzMentionSubscriberHandle {
    * How many identities this daemon was *configured* to subscribe as, fixed at startup.
    *
    * Not a liveness signal, and it used to be documented as one ("how many relay connections this
-   * daemon holds open"). It is `prepared.length`, captured once; a socket that later dropped, an
-   * authentication that never completed, a `REQ` the relay refused — none of them move it. Read
-   * `counters()` for what this subscriber has actually seen (#841).
+   * daemon holds open"). It is the configured identity count, captured once; a socket that later
+   * dropped, an authentication that never completed, a `REQ` the relay refused, an identity
+   * excluded for want of a live binding — none of them move it. Read `counters()` for what this
+   * subscriber has actually seen (#841), and `admission()` for which identities are delivering.
    */
   readonly socketCount: number;
   /**
-   * Receipt, summed across every identity. `framesHandled === 0` on a subscriber that has been up
-   * for a while is the reading that separates "connected and receiving nothing" from "receiving
-   * and refusing", which no number here could distinguish before.
+   * Receipt, summed across every identity, with `admission` beside it. `framesHandled === 0` on a
+   * subscriber that has been up for a while is the reading that separates "connected and receiving
+   * nothing" from "receiving and refusing", which no number here could distinguish before.
    */
   counters(): BuzzMentionCounters;
+  /** Which configured identities are delivering, and why each other one is not. */
+  admission(): BuzzMentionAdmissionSnapshot;
+  /**
+   * Judges every configured identity again: an excluded one whose binding is now admissible is
+   * connected from its preserved window, and an admitted one whose binding is gone is disconnected
+   * with its window kept. The daemon calls this on every committed binding switch (bind, re-claim,
+   * session change, revoke). Idempotent, and a no-op once closed.
+   */
+  rejudge(): void;
   readonly relayUrl: string | null;
-  /** The roles this daemon subscribes for, in config order. */
+  /** The roles this daemon's admitted identities are pinned to right now, in config order. */
   readonly roleKeys: readonly string[];
   /**
    * Every room named across every configured identity, deduplicated. Empty exactly when
@@ -1719,10 +2084,16 @@ export interface BuzzMentionSubscriberHandle {
    */
   readonly rooms: readonly string[];
   /**
-   * Each configured identity's channel identity (the public key its file derives) and the rooms
-   * its own `REQ` is scoped to, in config order. `rooms` above is their union, and a union cannot
-   * say which identity hears which room: a caller that routes one identity's mentions to a room of
-   * its choosing (a canonical CTO's `buzzAddress`) has to find that room in that identity's list.
+   * Each identity this subscriber **listens as** (admitted, connected or reconnecting) — its channel identity (the public key its file derives) and the rooms
+   * its own `REQ` is scoped to, in config order, as they stand when read. `rooms` above is the
+   * configured union, and a union cannot say which identity hears which room: a caller that routes
+   * one identity's mentions to a room of its choosing (a canonical CTO's `buzzAddress`) has to find
+   * that room in that identity's list.
+   *
+   * Admitted only, because the question a caller asks of it is "does this subscriber listen as this
+   * identity, and where", and an excluded identity is not listened as: the answer for it is the
+   * same absence a deployment with no subscriber gives. Its room is checked when it is admitted
+   * again, by the admission rule itself (`ROOM_NOT_SUBSCRIBED`).
    */
   readonly identityRooms: readonly BuzzSubscriberIdentityRooms[];
   /** Settles once every frame delivered so far has been handled. For tests; production ignores it. */
@@ -1740,9 +2111,20 @@ export interface BuzzSubscriberIdentityRooms {
 }
 
 /** The disabled outcome, stated rather than implied by a null. */
+const NO_ADMISSION: BuzzMentionAdmissionSnapshot = Object.freeze({
+  continuity: "NONE",
+  configuredIdentities: 0,
+  admittedIdentities: 0,
+  identities: Object.freeze([]),
+});
+
 const DISABLED: BuzzMentionSubscriberHandle = {
   socketCount: 0,
   counters: () => ({ framesHandled: 0, admitted: 0, rejections: {} }),
+  admission: () => NO_ADMISSION,
+  rejudge: () => {
+    /* nothing is configured to judge */
+  },
   relayUrl: null,
   roleKeys: [],
   rooms: [],
@@ -1762,6 +2144,8 @@ export interface BuzzMentionSubscriberOptions {
   readonly scheduler?: BuzzSubscriberScheduler;
   /** Defaulted, never absent: an omitted reporter would restore the silence, not opt out of it. */
   readonly reportRoleNotHeld?: BuzzMentionRoleNotHeldReporter;
+  /** Defaulted for the same reason: an excluded identity the operator is not told of is a silent one. */
+  readonly reportAdmission?: BuzzMentionAdmissionReporter;
 }
 
 /** A role between holders refuses subscription without making daemon startup fatal. */
@@ -1772,16 +2156,64 @@ export class BuzzMentionBindingUnavailableError extends Error {
 }
 
 /**
- * Every identity is preflighted before the first socket opens, and any failure opens none.
+ * The configuration is all-or-none; binding admission is per identity.
  *
- * The ordering is the whole of it. A loop that opened each socket as it validated would leave a
- * deployment with three of five identities subscribed and an error in the log — which is the state
- * an operator reads as "it started". Preflight is therefore a complete pass with no side effect,
- * and the sockets are opened afterwards or not at all.
+ * Two passes, both complete before the first socket opens. The **configuration** pass refuses the
+ * whole start on any error — a key path named twice, one file under two names, a key that cannot be
+ * opened safely — because an operator who wrote a wrong file meant something this build cannot do.
+ *
+ * The **admission** pass judges each identity's binding alone. One that is paused, revoked or
+ * unverifiable is excluded with its reason, opens no socket and has none of its mail asked for;
+ * every other identity is admitted and opens. That split is the repair: one canonical CTO without a
+ * live binding used to refuse the subscriber for all of them, and the others fell back to polling.
+ *
+ * A partial start is not allowed to read as a whole one. The exclusions are reported as they are
+ * decided, and `admission()` — written into health beside the counters — says `PARTIAL` with each
+ * excluded identity's reason for as long as any is excluded.
  */
 export const startBuzzMentionSubscriber = (
   options: BuzzMentionSubscriberOptions,
 ): BuzzMentionSubscriberHandle => {
+  const reportAdmission = options.reportAdmission ?? nativeAdmissionReporter;
+  const authenticatedListeners = new Set<() => void>();
+  const prepared: BuzzMentionSubscription[] = [];
+  let closed = false;
+
+  /**
+   * Whether `roleKey` is pinned to an admitted identity other than `self`. The rule two identities
+   * resolving to one role has always had, applied per identity: the one already admitted keeps it,
+   * and the later claimant is excluded rather than the whole subscriber refused.
+   */
+  const roleHeldByAnother = (roleKey: string, self: BuzzMentionSubscription): boolean =>
+    prepared.some((other) => other !== self && other.admitted && other.roleKey === roleKey);
+
+  /** Applies one judgement to one identity and reports what changed. */
+  const apply = (subscription: BuzzMentionSubscription, judgement: BuzzMentionIdentityJudgement): void => {
+    if (judgement.verdict === "ADMITTED" && !roleHeldByAnother(judgement.binding.roleKey, subscription)) {
+      if (subscription.admit(judgement.binding)) {
+        reportAdmission({
+          identity: subscription.ordinal,
+          identityPubkey: subscription.pubkey,
+          state: "ADMITTED",
+          reason: null,
+          roleKey: judgement.binding.roleKey,
+        });
+      }
+      return;
+    }
+    const reason =
+      judgement.verdict === "EXCLUDED" ? judgement.reason : BuzzMentionExclusion.ROLE_HELD_BY_ANOTHER_IDENTITY;
+    if (subscription.exclude(reason)) {
+      reportAdmission({
+        identity: subscription.ordinal,
+        identityPubkey: subscription.pubkey,
+        state: "EXCLUDED",
+        reason,
+        roleKey: null,
+      });
+    }
+  };
+
   const deps: SubscriptionDeps = {
     relayUrl: options.config.relayUrl,
     sink: options.sink,
@@ -1801,18 +2233,18 @@ export const startBuzzMentionSubscriber = (
         });
       }
     },
+    rejudge: (subscription) => {
+      if (!closed) apply(subscription, subscription.judge());
+    },
   };
-  const authenticatedListeners = new Set<() => void>();
 
   const seenPaths = new Set<string>();
   const seenFiles = new Set<string>();
   const seenPubkeys = new Set<string>();
-  const seenRoles = new Set<string>();
-  const prepared: BuzzMentionSubscription[] = [];
-  const roleKeys: string[] = [];
   const rooms = new Set<string>();
   const identityRooms: BuzzSubscriberIdentityRooms[] = [];
 
+  // The configuration pass. Every failure here refuses the whole start, before any judgement.
   options.config.identities.forEach((identity, index) => {
     const what = `identities[${index}]`;
     // The path is compared as configured. Two entries naming one path are one identity written
@@ -1833,29 +2265,36 @@ export const startBuzzMentionSubscriber = (
     }
     seenPubkeys.add(material.pubkey);
 
-    const bound = deps.registry.primaryCtoBindingFor(material.pubkey);
-    if (!bound) {
-      throw new BuzzMentionBindingUnavailableError(what);
-    }
-    if (!constantTimeEquals(bound.buzzActorId, material.pubkey)) {
-      throw new Error(`${what} resolves to a session bound to a different channel identity`);
-    }
-    if (seenRoles.has(bound.roleKey)) {
-      throw new Error(`${what} holds a role another identity already holds`);
-    }
-    seenRoles.add(bound.roleKey);
-
-    roleKeys.push(bound.roleKey);
+    // Recorded for every configured identity; the handle answers for the admitted ones.
     for (const room of identity.rooms) rooms.add(room);
     identityRooms.push(Object.freeze({ actorId: material.pubkey, rooms: Object.freeze([...identity.rooms]) }));
     prepared.push(
       new BuzzMentionSubscription(deps, {
+        ordinal: what,
         pubkey: material.pubkey,
         secretKey: material.secretKey,
-        roleKey: bound.roleKey,
         rooms: identity.rooms,
       }),
     );
+  });
+
+  // The admission pass: every judgement read before anything is applied, so the role-uniqueness
+  // rule sees one consistent answer per identity rather than one the previous identity moved.
+  const judgements = prepared.map((subscription) => subscription.judge());
+  const startupRoles = new Set<string>();
+  const startupDecisions = judgements.map((judgement): BuzzMentionIdentityJudgement => {
+    if (judgement.verdict !== "ADMITTED") return judgement;
+    if (startupRoles.has(judgement.binding.roleKey)) {
+      return excluded(BuzzMentionExclusion.ROLE_HELD_BY_ANOTHER_IDENTITY);
+    }
+    startupRoles.add(judgement.binding.roleKey);
+    return judgement;
+  });
+  // Pinned, or marked excluded, with no socket and no timer yet: the sockets open below or not at
+  // all, and an exclusion's timer and report wait until the start is known to have succeeded.
+  startupDecisions.forEach((decision, index) => {
+    const subscription = prepared[index]!;
+    if (decision.verdict === "ADMITTED") subscription.admit(decision.binding);
   });
 
   // All-or-none, and this is the half the preflight cannot cover.
@@ -1881,15 +2320,34 @@ export const startBuzzMentionSubscriber = (
   try {
     for (const subscription of prepared) subscription.open();
   } catch (err) {
+    closed = true;
     for (const subscription of prepared) subscription.close();
     throw err;
   }
+
+  // Only now, with the start certain: each excluded identity is reported once, and its judgement
+  // timer starts asking the registry again.
+  startupDecisions.forEach((decision, index) => {
+    if (decision.verdict === "EXCLUDED") apply(prepared[index]!, decision);
+  });
+
+  const admission = (): BuzzMentionAdmissionSnapshot => {
+    const identities = prepared.map((subscription) => subscription.admission());
+    const admittedIdentities = identities.filter((one) => one.state === "ADMITTED").length;
+    return {
+      continuity:
+        admittedIdentities === identities.length ? "FULL" : admittedIdentities === 0 ? "NONE" : "PARTIAL",
+      configuredIdentities: identities.length,
+      admittedIdentities,
+      identities,
+    };
+  };
 
   return {
     socketCount: prepared.length,
     // Summed rather than per-identity: the operator question this answers is "is anything
     // arriving at all", and a per-identity breakdown is a later refinement of an answer that does
-    // not exist yet.
+    // not exist yet. Admission is the per-identity part, and it rides beside the sums.
     counters: () => {
       const totals = prepared.map((subscription) => subscription.counters());
       const rejections: Record<string, number> = {};
@@ -1902,12 +2360,35 @@ export const startBuzzMentionSubscriber = (
         framesHandled: totals.reduce((sum, one) => sum + one.framesHandled, 0),
         admitted: totals.reduce((sum, one) => sum + one.admitted, 0),
         rejections,
+        admission: admission(),
       };
     },
+    admission,
+    rejudge: () => {
+      if (closed) return;
+      // Every answer read first, as at startup; then the identities that are not admissible are
+      // excluded before any is admitted, so a role moving from one identity to another is released
+      // by the first before the second asks for it.
+      const fresh = prepared.map((subscription) => subscription.judge());
+      prepared.forEach((subscription, index) => {
+        const judgement = fresh[index]!;
+        if (judgement.verdict === "EXCLUDED") apply(subscription, judgement);
+      });
+      prepared.forEach((subscription, index) => {
+        const judgement = fresh[index]!;
+        if (judgement.verdict === "ADMITTED") apply(subscription, judgement);
+      });
+    },
     relayUrl: options.config.relayUrl,
-    roleKeys,
+    get roleKeys(): readonly string[] {
+      return prepared.flatMap((subscription) =>
+        subscription.admitted && subscription.roleKey !== null ? [subscription.roleKey] : [],
+      );
+    },
     rooms: [...rooms],
-    identityRooms,
+    get identityRooms(): readonly BuzzSubscriberIdentityRooms[] {
+      return identityRooms.filter((_, index) => prepared[index]?.listening === true);
+    },
     settled: async () => {
       for (const subscription of prepared) await subscription.settled();
     },
@@ -1935,6 +2416,7 @@ export const startBuzzMentionSubscriber = (
       },
     },
     close: () => {
+      closed = true;
       for (const subscription of prepared) subscription.close();
     },
   };

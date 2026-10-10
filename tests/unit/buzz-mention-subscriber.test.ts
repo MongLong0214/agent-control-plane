@@ -15,6 +15,7 @@ import {
   parseBuzzSubscriberConfig,
   startBuzzMentionSubscriberFromStateDir,
   type BuzzMentionAdmission,
+  type BuzzMentionAdmissionChange,
   type BuzzMentionRegistry,
   type BuzzMentionRoleNotHeldReport,
   type BuzzMentionSink,
@@ -1244,7 +1245,7 @@ describe("the buzz mention subscriber's config authority", () => {
     expect(transport.sockets).toEqual([]);
   });
 
-  it("refuses two identities that resolve to one role", () => {
+  it("admits the first of two identities that resolve to one role and excludes the second", () => {
     const keys = tempDir("acp-buzz-keys-dup-role-");
     const first = hexIdentity(keys, "a.key");
     const second = hexIdentity(keys, "b.key");
@@ -1257,21 +1258,38 @@ describe("the buzz mention subscriber's config authority", () => {
       ]),
     );
     const transport = manualTransport();
-    expect(() =>
-      startBuzzMentionSubscriberFromStateDir(stateDir, {
-        registry: registryHolding({
-          [first.pubkey]: { roleKey: ROLE_KEY, buzzActorId: first.pubkey },
-          [second.pubkey]: { roleKey: ROLE_KEY, buzzActorId: second.pubkey },
-        }),
-        sink: recordingSink(),
-        openSocket: transport.factory,
-        scheduler: virtualClock().scheduler,
+    const changes: BuzzMentionAdmissionChange[] = [];
+    const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+      registry: registryHolding({
+        [first.pubkey]: { roleKey: ROLE_KEY, buzzActorId: first.pubkey },
+        [second.pubkey]: { roleKey: ROLE_KEY, buzzActorId: second.pubkey },
       }),
-    ).toThrow(/holds a role another identity already holds/u);
-    expect(transport.sockets).toEqual([]);
+      sink: recordingSink(),
+      openSocket: transport.factory,
+      scheduler: virtualClock().scheduler,
+      reportAdmission: (change) => changes.push(change),
+    });
+    try {
+      // Two claimants for one binding would race for every message, so one of them is left out —
+      // and only that one: the other is not taken down with it.
+      expect(transport.sockets).toHaveLength(1);
+      expect(handle.roleKeys).toEqual([ROLE_KEY]);
+      expect(handle.admission().continuity).toBe("PARTIAL");
+      expect(changes).toEqual([
+        {
+          identity: "identities[1]",
+          identityPubkey: second.pubkey,
+          state: "EXCLUDED",
+          reason: "ROLE_HELD_BY_ANOTHER_IDENTITY",
+          roleKey: null,
+        },
+      ]);
+    } finally {
+      handle.close();
+    }
   });
 
-  it("refuses an identity that holds no live PRIMARY_CTO binding, and opens no socket for its sibling", () => {
+  it("excludes an identity that holds no live PRIMARY_CTO binding, and still opens its sibling", () => {
     const keys = tempDir("acp-buzz-keys-unbound-");
     const bound = hexIdentity(keys, "bound.key");
     const unbound = hexIdentity(keys, "unbound.key");
@@ -1284,39 +1302,53 @@ describe("the buzz mention subscriber's config authority", () => {
       ]),
     );
     const transport = manualTransport();
-    expect(() =>
-      startBuzzMentionSubscriberFromStateDir(stateDir, {
-        registry: registryHolding({
-          [bound.pubkey]: { roleKey: ROLE_KEY, buzzActorId: bound.pubkey },
-        }),
-        sink: recordingSink(),
-        openSocket: transport.factory,
-        scheduler: virtualClock().scheduler,
+    const changes: BuzzMentionAdmissionChange[] = [];
+    const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+      registry: registryHolding({
+        [bound.pubkey]: { roleKey: ROLE_KEY, buzzActorId: bound.pubkey },
       }),
-    ).toThrow(/does not currently hold a live PRIMARY_CTO binding/u);
-    // The whole of the "before socket 1" requirement: the first identity was perfectly good and
-    // still opened nothing, because the pass had not finished.
-    expect(transport.sockets).toEqual([]);
+      sink: recordingSink(),
+      openSocket: transport.factory,
+      scheduler: virtualClock().scheduler,
+      reportAdmission: (change) => changes.push(change),
+    });
+    try {
+      // One socket, the bound identity's. The unbound one opened nothing, so nothing addressed to
+      // it was asked for, and the operator was told which entry and why.
+      expect(transport.sockets).toHaveLength(1);
+      expect(handle.socketCount).toBe(2);
+      expect(changes.map((change) => [change.identity, change.reason])).toEqual([
+        ["identities[1]", "NO_LIVE_PRIMARY_CTO_BINDING"],
+      ]);
+    } finally {
+      handle.close();
+    }
   });
 
-  it("refuses an identity whose session is bound to a different channel identity", () => {
+  it("excludes an identity whose session is bound to a different channel identity", () => {
     const keys = tempDir("acp-buzz-keys-mismatch-");
     const identity = hexIdentity(keys, "cto.key");
     const other = hexIdentity(keys, "other.key");
     const stateDir = tempDir("acp-buzz-sub-mismatch-");
     writeConfig(stateDir, configFor([{ keyFile: identity.keyFile, encoding: "hex" }]));
     const transport = manualTransport();
-    expect(() =>
-      startBuzzMentionSubscriberFromStateDir(stateDir, {
-        registry: registryHolding({
-          [identity.pubkey]: { roleKey: ROLE_KEY, buzzActorId: other.pubkey },
-        }),
-        sink: recordingSink(),
-        openSocket: transport.factory,
-        scheduler: virtualClock().scheduler,
+    const changes: BuzzMentionAdmissionChange[] = [];
+    const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+      registry: registryHolding({
+        [identity.pubkey]: { roleKey: ROLE_KEY, buzzActorId: other.pubkey },
       }),
-    ).toThrow(/bound to a different channel identity/u);
-    expect(transport.sockets).toEqual([]);
+      sink: recordingSink(),
+      openSocket: transport.factory,
+      scheduler: virtualClock().scheduler,
+      reportAdmission: (change) => changes.push(change),
+    });
+    try {
+      expect(transport.sockets).toEqual([]);
+      expect(handle.admission().continuity).toBe("NONE");
+      expect(changes.map((change) => change.reason)).toEqual(["ACTOR_MISMATCH"]);
+    } finally {
+      handle.close();
+    }
   });
 
   /**
