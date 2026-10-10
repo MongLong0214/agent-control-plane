@@ -22,3 +22,26 @@ export const writeWholeSync = (descriptor: number, text: string): void => {
     offset += written;
   }
 };
+
+/**
+ * #246 C3, review 1076-R5 — the bytes a record is written as: its JSON, indented by two, and the
+ * newline that ends it. Every record the bootstrap relies on before a request is written in exactly
+ * this framing, so a reader can tell a record written whole from one cut short.
+ */
+export const frameRecord = (content: unknown): string => `${JSON.stringify(content, null, 2)}\n`;
+
+/**
+ * The content of a record read back, or null unless its bytes are exactly the framing of what they
+ * parse to, the closing newline included. A write cut short leaves a prefix; the one prefix that
+ * still parses — every byte but that final newline — is not the record, so it is refused rather than
+ * repaired: nothing is appended, trimmed or otherwise normalised before the comparison.
+ */
+export const unframeRecord = (bytes: Buffer): unknown => {
+  let content: unknown;
+  try {
+    content = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return null;
+  }
+  return Buffer.from(frameRecord(content), "utf8").equals(bytes) ? content : null;
+};

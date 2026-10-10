@@ -25,6 +25,7 @@ import { type GroupMember, processGroupEmpty, processGroupMembership } from "./a
 import { type BootstrapWriteRequest, runUnderWriteGuard } from "./bootstrap-write-guard.ts";
 import {
   type OwnerApprovalAnchor,
+  acceptApprovalAnchor,
   consumeWithheldExemption,
   readApprovalAnchor,
   readWithheldIntent,
@@ -897,7 +898,14 @@ export class RepoFactoryBootstrapRunner {
     // visibility, PLAN, manifest or write scope, needs a new owner approval too: those are refused
     // above, by the receipt's run and parameters and by the freeze.
     if (existing !== null) {
-      const identity = this.anchoredIdentity(existing, join(workRoot, runId));
+      // Accepted, not only read (review 1076-R5): the anchor and its directory synced now, before
+      // anything is written on it. A sync that fails refuses with nothing sent; it is not taken for an
+      // anchor that is missing, so no other approval is consumed in its place.
+      const identity = this.anchoredIdentity(existing, join(workRoot, runId), true);
+      if (!identity.allowed && identity.evidence["refusal"] === "APPROVAL_ANCHOR_UNSYNCED") {
+        this.deps.applications.recordRefusal(runId, refusalRecord(identity, "approval"));
+        return atStage(identity as Decision<ACPBootstrapActivationResult>, "approval");
+      }
       if (identity.allowed) {
         if (presentedReceiptDigest !== identity.value.receiptDigest) {
           return refuse(
@@ -1216,12 +1224,46 @@ export class RepoFactoryBootstrapRunner {
    * candidate recorded beside it. A database row — the recorded identity, the consumption — is never
    * enough on its own; without the anchor the identity is unproven.
    */
-  private anchoredIdentity(application: BootstrapApplication, workDir: string): Decision<OwnerApprovalAnchor> {
+  private anchoredIdentity(application: BootstrapApplication, workDir: string, accepted = false): Decision<OwnerApprovalAnchor> {
     const { runId } = application;
     const unproven = (refusal: string, message: string, evidence: Evidence = {}): Decision<OwnerApprovalAnchor> =>
       deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, message, { refusal, runId, ...evidence });
     const identity = this.deps.applications.approvalIdentity(runId);
     if (identity === null) return unproven("APPROVAL_UNANCHORED", "this bootstrap application records no approval identity");
+    const attributes = (anchor: OwnerApprovalAnchor): Decision<void> => {
+      if (
+        anchor.runId !== runId ||
+        anchor.receipt.runId !== runId ||
+        anchor.bootstrapOperationId !== application.bootstrapOperationId ||
+        anchor.candidateSnapshotDigest !== application.candidateSnapshotDigest ||
+        anchor.receipt.parameterDigest !== application.approvalDigest ||
+        anchor.reservationDigest !== reservationDigestOf(application)
+      ) {
+        return unproven("APPROVAL_ANCHOR_MISMATCH", "the approval anchor names another run, operation, candidate, write scope or reservation", {
+          approvalIdentity: identity,
+        }) as Decision<void>;
+      }
+      const consumed = this.deps.ownerAuthority.assertConsumedApproval(anchor.receipt, application.candidateSnapshotDigest);
+      if (!consumed.allowed) {
+        return unproven("APPROVAL_ANCHOR_UNCONSUMED", "the anchored approval has no recorded consumption for this candidate", {
+          approvalIdentity: identity,
+          consumption: refusalRecord(consumed, "approval"),
+        }) as Decision<void>;
+      }
+      return allow(ReasonCode.OK, undefined);
+    };
+    // Review 1076-R5 — where writes rely on it, the anchor is accepted through the one door its writer
+    // uses too, which syncs it and its directory now; elsewhere it is read and attributed only.
+    if (accepted) {
+      const anchor = acceptApprovalAnchor(workDir, identity, attributes);
+      if (anchor.allowed) return anchor;
+      if (anchor.evidence["refusal"] === "APPROVAL_UNANCHORED") {
+        return unproven("APPROVAL_UNANCHORED", "the approval this bootstrap application records was never anchored when it was consumed", {
+          approvalIdentity: identity,
+        });
+      }
+      return { ...anchor, evidence: { runId, approvalIdentity: identity, ...anchor.evidence } } as Decision<OwnerApprovalAnchor>;
+    }
     const read = readApprovalAnchor(workDir, identity);
     if (!read.allowed) return { ...read, evidence: { runId, approvalIdentity: identity, ...read.evidence } } as Decision<OwnerApprovalAnchor>;
     if (read.value === null) {
@@ -1229,27 +1271,8 @@ export class RepoFactoryBootstrapRunner {
         approvalIdentity: identity,
       });
     }
-    const anchor = read.value;
-    if (
-      anchor.runId !== runId ||
-      anchor.receipt.runId !== runId ||
-      anchor.bootstrapOperationId !== application.bootstrapOperationId ||
-      anchor.candidateSnapshotDigest !== application.candidateSnapshotDigest ||
-      anchor.receipt.parameterDigest !== application.approvalDigest ||
-      anchor.reservationDigest !== reservationDigestOf(application)
-    ) {
-      return unproven("APPROVAL_ANCHOR_MISMATCH", "the approval anchor names another run, operation, candidate, write scope or reservation", {
-        approvalIdentity: identity,
-      });
-    }
-    const consumed = this.deps.ownerAuthority.assertConsumedApproval(anchor.receipt, application.candidateSnapshotDigest);
-    if (!consumed.allowed) {
-      return unproven("APPROVAL_ANCHOR_UNCONSUMED", "the anchored approval has no recorded consumption for this candidate", {
-        approvalIdentity: identity,
-        consumption: refusalRecord(consumed, "approval"),
-      });
-    }
-    return allow(ReasonCode.OK, anchor);
+    const attributed = attributes(read.value);
+    return attributed.allowed ? allow(ReasonCode.OK, read.value) : (attributed as Decision<OwnerApprovalAnchor>);
   }
 
   /**
@@ -1638,7 +1661,14 @@ export class RepoFactoryBootstrapRunner {
     }
     if (snapshot.anchorWorkDir !== null) {
       const application = this.deps.applications.get(runId);
-      const identity = application === null ? null : this.anchoredIdentity(application, snapshot.anchorWorkDir);
+      // Accepted at every write it authorises (review 1076-R5): synced now, whatever was synced before.
+      const identity = application === null ? null : this.anchoredIdentity(application, snapshot.anchorWorkDir, true);
+      if (identity !== null && !identity.allowed && identity.evidence["refusal"] === "APPROVAL_ANCHOR_UNSYNCED") {
+        return lost(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "APPROVAL_ANCHOR_UNSYNCED", "the approval this CONFIRM runs on is anchored, but its anchor could not be synced now", {
+          executionReceipt: executionDigest,
+          anchor: refusalRecord(identity, "approval"),
+        });
+      }
       if (identity === null || !identity.allowed || identity.value.receiptDigest !== executionDigest) {
         return lost(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "APPROVAL_IDENTITY_CHANGED", "the approval this CONFIRM runs on is no longer this execution's anchored identity", {
           executionReceipt: executionDigest,

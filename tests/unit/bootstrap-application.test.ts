@@ -16,7 +16,7 @@ import {
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
-import { readWithheldIntent, withheldUnsent, writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
+import { readWithheldIntent, withheldUnsent, writeApprovalAnchor, writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
 import { processGroupEmpty, readProcessGroup } from "../../src/bootstrap/attempt-writer-group.ts";
@@ -3398,6 +3398,310 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
     // What the limit let through is kept, cut short, and it proves neither an unused exemption nor an unsent request.
     expect(recordBytes).toBeGreaterThan(0);
     expect(recordBytes).toBeLessThan(Buffer.byteLength(JSON.stringify({ ...base, attempt: 2 })));
+    expect(readWithheldIntent(workDir, key)).toBeNull();
+    expect(withheldUnsent(readWithheldIntent(workDir, key))).toBe(false);
+  });
+  // Review 1076-R5 — a record that parses is not a record that was written whole, and an anchor on
+  // disk is not an anchor persisted now. Each body counts the external requests made.
+  const anchorFile = (path: string): boolean => /owner-approval\/[0-9a-f]{64}\.json$/.test(path);
+  const anchorDirectory = (path: string): boolean => /owner-approval$/.test(path);
+  const ioError = (message: string): Error => Object.assign(new Error(message), { code: "EIO" });
+
+  /** The production port's create, counting the POSTs that start; each is answered as lost. */
+  const productionCreateCounting = (f: Fixture) => {
+    const state = { posts: 0 };
+    const port = createBootstrapGitHubWritePort({
+      async request<T>(method: string): Promise<T> {
+        if (method === "GET") return { type: "Organization" } as T;
+        state.posts += 1;
+        throw new Error("POST started; response lost");
+      },
+    });
+    vi.spyOn(f.github, "createRepository").mockImplementation(port.createRepository as never);
+    return state;
+  };
+
+  it("R5 resume after anchor fsync failure never uses an unsynced anchor for a request", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r5-anchor-fsync-resume"));
+      await approveWrites(f, run);
+      let failedSyncs = 0;
+      fsFaults.fsyncSync = (path) => {
+        if (anchorFile(path)) {
+          failedSyncs += 1;
+          throw ioError("anchor fsync EIO persists");
+        }
+      };
+      await confirm(f, run);
+      expect(writesOf(f)).toEqual([]);
+      // Its complete JSON is on disk: readable, and not persisted.
+      const [anchorName] = readdirSync(join(f.workRoot, run.runId, "owner-approval"));
+      expect(() => JSON.parse(readFileSync(join(f.workRoot, run.runId, "owner-approval", anchorName!), "utf8"))).not.toThrow();
+      await f.restartDaemon();
+      const second = await confirm(f, run);
+      fsFaults.fsyncSync = null;
+      expect(second, JSON.stringify(second)).toMatchObject({ ok: false, evidence: { refusal: "APPROVAL_ANCHOR_UNSYNCED" } });
+      expect(failedSyncs).toBeGreaterThanOrEqual(2);
+      expect(writesOf(f), "anchor persistence never succeeded: no request may follow").toEqual([]);
+    });
+  });
+
+  for (const record of [
+    { name: "anchor-directory", matches: anchorDirectory },
+    { name: "ledger-directory", matches: (path: string) => /github-ledger$/.test(path) },
+  ]) {
+    it(`R5 ${record.name} fsync failure then resume sends no requests`, async () => {
+      await withFixture(async (f) => {
+        const run = await reviewedBootstrap(f, cleanTreeManifest(`r5-${record.name}`));
+        await approveWrites(f, run);
+        fsFaults.fsyncSync = (path) => {
+          if (record.matches(path)) throw ioError("directory fsync EIO persists");
+        };
+        await confirm(f, run);
+        expect(writesOf(f)).toEqual([]);
+        await f.restartDaemon();
+        await confirm(f, run);
+        fsFaults.fsyncSync = null;
+        expect(writesOf(f), "required directory persistence failed, no request may follow").toEqual([]);
+      });
+    });
+  }
+
+  for (const failure of ["file", "directory"] as const) {
+    it(`R5 guarded production POST after ${failure} anchor fsync failure stays at zero sends`, async () => {
+      await withFixture(async (f) => {
+        const run = await reviewedBootstrap(f, cleanTreeManifest(`r5-production-anchor-${failure}`));
+        await approveWrites(f, run);
+        const sends = productionCreateCounting(f);
+        fsFaults.fsyncSync = (path) => {
+          if (failure === "file" ? anchorFile(path) : anchorDirectory(path)) throw ioError("required anchor fsync EIO persists");
+        };
+        await confirm(f, run);
+        expect(sends.posts).toBe(0);
+        await f.restartDaemon();
+        const second = await confirm(f, run);
+        fsFaults.fsyncSync = null;
+        expect(second, JSON.stringify(second)).toMatchObject({ ok: false, evidence: { refusal: "APPROVAL_ANCHOR_UNSYNCED", failed: failure } });
+        expect(sends.posts, "the guarded production client must wait for successful anchor fsync").toBe(0);
+      });
+    });
+  }
+
+  it("R5 once the anchor syncs again the resume accepts it, with evidence, and writes each operation once", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r5-anchor-sync-recovers"));
+      await approveWrites(f, run);
+      fsFaults.fsyncSync = (path) => {
+        if (anchorFile(path)) throw ioError("anchor fsync EIO, then the disk recovers");
+      };
+      await confirm(f, run);
+      fsFaults.fsyncSync = null;
+      expect(writesOf(f)).toEqual([]);
+      await f.restartDaemon();
+      const resumed = await confirm(f, run);
+      expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+      expect(consumedApprovals(f, run.runId)).toBe(1);
+    });
+  });
+
+  it("R5 an anchor that synced once and fails to sync now stops the next request: no PUT", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r5-anchor-sync-fails-later"));
+      await approveWrites(f, run);
+      const setDefault = f.github.setDefaultBranch.bind(f.github);
+      vi.spyOn(f.github, "setDefaultBranch").mockImplementation(async (...args) => {
+        // From here on the anchor's sync fails: the syncs it passed before do not stand in for it.
+        fsFaults.fsyncSync = (path) => {
+          if (anchorFile(path)) throw ioError("anchor fsync EIO from now on");
+        };
+        return setDefault(...args);
+      });
+      const answer = await confirm(f, run);
+      fsFaults.fsyncSync = null;
+      expect(answer, JSON.stringify(answer)).toMatchObject({ ok: false, evidence: { refusal: "APPROVAL_ANCHOR_UNSYNCED" } });
+      expect(writesOf(f)).toEqual(["createRepository", "pushBranch", "setDefaultBranch"]);
+      expect(writesOf(f, "protectBranch")).toEqual([]);
+    });
+  });
+
+  for (const failure of ["file", "directory"] as const) {
+    it(`R5 an anchor found already there is accepted only once its ${failure} syncs now`, async () => {
+      await withFixture(async (f) => {
+        const run = await reviewedBootstrap(f, cleanTreeManifest(`r5-anchor-eexist-${failure}`));
+        await approveWrites(f, run);
+        await confirm(f, run);
+        const workDir = join(f.workRoot, run.runId);
+        const [anchorName] = readdirSync(join(workDir, "owner-approval"));
+        const written = JSON.parse(readFileSync(join(workDir, "owner-approval", anchorName!), "utf8")) as Record<string, unknown>;
+        const { schema: _schema, receiptDigest: _digest, ...input } = written;
+        // The same anchor written again finds it there (EEXIST): accepted only through the same syncs, now.
+        let failed = 0;
+        fsFaults.fsyncSync = (path) => {
+          if (failure === "file" ? anchorFile(path) : anchorDirectory(path)) {
+            failed += 1;
+            throw ioError("anchor fsync EIO on EEXIST");
+          }
+        };
+        const again = writeApprovalAnchor(workDir, { ...input, anchoredAt: "2026-10-10T00:00:01.000Z" } as Parameters<typeof writeApprovalAnchor>[1]);
+        fsFaults.fsyncSync = null;
+        expect(failed).toBe(1);
+        expect(again, JSON.stringify(again)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_ANCHOR_UNSYNCED", failed: failure } });
+        // With the syncs passing it is the anchor the first write made, unchanged.
+        const accepted = writeApprovalAnchor(workDir, { ...input, anchoredAt: "2026-10-10T00:00:02.000Z" } as Parameters<typeof writeApprovalAnchor>[1]);
+        expect(accepted).toMatchObject({ allowed: true, value: { anchoredAt: written["anchoredAt"] } });
+      });
+    });
+  }
+
+  it("R5 an anchor cut short by only its final newline is not an anchor: the resume refuses, and no POST is sent", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r5-anchor-newline-tail"));
+      await approveWrites(f, run);
+      const sends = productionCreateCounting(f);
+      let writes = 0;
+      fsFaults.writeSync = (path, bytes) => {
+        if (!anchorFile(path)) return undefined;
+        writes += 1;
+        if (writes === 1) return bytes.length - 1;
+        throw fileTooLarge();
+      };
+      await confirm(f, run);
+      fsFaults.writeSync = null;
+      const [anchorName] = readdirSync(join(f.workRoot, run.runId, "owner-approval"));
+      const path = join(f.workRoot, run.runId, "owner-approval", anchorName!);
+      const kept = readFileSync(path);
+      expect(kept.toString("utf8").endsWith("}")).toBe(true);
+      expect(() => JSON.parse(kept.toString("utf8"))).not.toThrow();
+      await f.restartDaemon();
+      const resumed = await confirm(f, run);
+      expect(resumed["ok"], JSON.stringify(resumed)).toBe(false);
+      expect(sends.posts).toBe(0);
+      expect(writesOf(f)).toEqual([]);
+      expect(readFileSync(path).equals(kept), "the cut-short anchor is kept as it was").toBe(true);
+    });
+  });
+
+  for (const failure of ["partial-error", "zero", "newline-tail"] as const) {
+    it(`R5 truncated withheld ${failure} remains doubt and never sends on resume`, async () => {
+      await withFixture(async (f) => {
+        const run = await reviewedBootstrap(f, cleanTreeManifest(`r5-withheld-${failure}`));
+        await approveWrites(f, run);
+        let replacement: string | null = null;
+        let count = 0;
+        const held = heldRequests(
+          f,
+          "protectBranch",
+          (call) => {
+            if (call === 1) replacement = replaceCeo(f);
+          },
+          () => true,
+        );
+        fsFaults.writeSync = (path, bytes) => {
+          if (!/withheld-requests\/[0-9a-f]{64}\/withheld-1\.json$/.test(path)) return undefined;
+          count += 1;
+          if (failure === "zero") return 0;
+          if (count === 1) return failure === "newline-tail" ? bytes.length - 1 : 120;
+          throw Object.assign(new Error("withheld write EIO"), { code: "EIO" });
+        };
+        await confirm(f, run);
+        fsFaults.writeSync = null;
+        const dir = join(f.workRoot, run.runId, "withheld-requests");
+        const names = (readdirSync(dir, { recursive: true }) as string[]).filter((name) => name.endsWith("withheld-1.json"));
+        expect(names).toHaveLength(1);
+        const path = join(dir, names[0]!);
+        const before = readFileSync(path);
+        for (const round of [1, 2]) {
+          const resumed = await resumeUnder(f, run, replacement!);
+          expect(resumed, `resume ${round}: ${JSON.stringify(resumed)}`).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_RECORD_UNREADABLE" } });
+          expect(held.state.sent).toBe(0);
+          expect(before.equals(readFileSync(path))).toBe(true);
+        }
+      });
+    });
+  }
+
+  it("R5 a complete withheld record, its newline included, is the proof it was: the request is made once", async () => {
+    await withFixture(async (f) => {
+      const state = await withheldProtection(f, "r5-complete-withheld-control");
+      const [withheld] = withheldRecordsOf(f, state.run, state.intent["operationId"] as string);
+      expect(withheld).toMatchObject({ attempt: 1 });
+      const made = await resumeUnder(f, state.run, state.ceo());
+      expect(made, JSON.stringify(made)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(state.held.state.sent).toBe(1);
+      expect(state.held.state.effects).toBe(1);
+      expect(applicationOf(f, state.run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+    });
+  });
+
+  for (const directory of ["intent", "parent"] as const) {
+    it(`R5 consumption ${directory} directory fsync failure prevents sending and resending`, async () => {
+      await withFixture(async (f) => {
+        const state = await withheldProtection(f, `r5-consumption-${directory}`);
+        fsFaults.fsyncSync = (path) => {
+          if (directory === "intent" ? /withheld-requests\/[0-9a-f]{64}$/.test(path) : /withheld-requests$/.test(path)) {
+            throw ioError("consumption directory sync EIO");
+          }
+        };
+        const first = await resumeUnder(f, state.run, state.ceo());
+        fsFaults.fsyncSync = null;
+        const second = await resumeUnder(f, state.run, state.ceo());
+        expect(first).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_EXEMPTION_UNCONSUMED" } });
+        expect(second).toMatchObject({ allowed: false, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST" } });
+        expect(state.held.state.sent).toBe(0);
+      });
+    });
+  }
+
+  it("R5 a withheld record cut short by a real file-size limit at its final newline is not a proof the request was never sent", async () => {
+    const workDir = join(tempDir("r5-real-tail-"), "run");
+    const module = resolve("src/bootstrap/bootstrap-approval-anchor.ts");
+    const script = `
+      const { openSync, writeSync, closeSync, unlinkSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const { writeWithheldRequest, WITHHELD_REQUEST_SCHEMA_ID } = await import(${JSON.stringify(module)});
+      const workDir = ${JSON.stringify(workDir)};
+      // The limit this process runs under, measured: the first write of a file larger than it is cut there.
+      const probe = join(${JSON.stringify(dirname(workDir))}, "probe");
+      const fd = openSync(probe, "w", 0o600);
+      const limit = writeSync(fd, Buffer.alloc(1 << 16, 32));
+      closeSync(fd);
+      unlinkSync(probe);
+      // A record exactly one byte longer than the limit: every byte but its closing newline fits.
+      const base = { runId: "r5-real-tail-run", resourceType: "branch-protection", intentDigest: "sha256:" + "a".repeat(64),
+        attemptedAt: "2026-10-10T00:00:00.000Z", attempt: 1, withheldAt: "2026-10-10T00:00:00.000Z", refusal: "CEO_ADMISSION_LOST" };
+      const size = (operationId) => Buffer.byteLength(JSON.stringify({ schema: WITHHELD_REQUEST_SCHEMA_ID, ...base, operationId }, null, 2) + "\\n");
+      let operationId = "op-";
+      while (size(operationId) < limit + 1) operationId += "x";
+      const answer = { limit, expected: size(operationId), operationId };
+      try {
+        writeWithheldRequest(workDir, { ...base, operationId });
+        answer.returned = true;
+      } catch (error) {
+        answer.threw = error.code ?? String(error);
+      }
+      process.stdout.write(JSON.stringify(answer));
+    `;
+    const child = spawn("/bin/sh", ["-c", 'ulimit -f 1 && exec "$0" --experimental-transform-types --no-warnings --input-type=module -e "$1"', process.execPath, script], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, NODE_DISABLE_COMPILE_CACHE: "1" },
+    });
+    const output: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
+    const exit = await new Promise<number | null>((resolveExit) => child.once("close", resolveExit));
+    const answer = JSON.parse(Buffer.concat(output).toString("utf8")) as { limit: number; expected: number; operationId: string; returned?: boolean; threw?: string };
+    expect(exit).toBe(0);
+    expect(answer.expected).toBe(answer.limit + 1);
+    expect(answer.returned, JSON.stringify(answer)).toBeUndefined();
+    expect(answer.threw).toBe("EFBIG");
+    const root = join(workDir, "withheld-requests");
+    const [name] = (readdirSync(root, { recursive: true }) as string[]).filter((entry) => entry.endsWith("withheld-1.json"));
+    const bytes = readFileSync(join(root, name!));
+    // What the limit let through is every byte but the newline: its JSON parses, and it is still not the record.
+    expect(bytes.length).toBe(answer.limit);
+    expect(bytes.toString("utf8").endsWith("}")).toBe(true);
+    expect(() => JSON.parse(bytes.toString("utf8"))).not.toThrow();
+    const key = { operationId: answer.operationId, intentDigest: `sha256:${"a".repeat(64)}` };
     expect(readWithheldIntent(workDir, key)).toBeNull();
     expect(withheldUnsent(readWithheldIntent(workDir, key))).toBe(false);
   });

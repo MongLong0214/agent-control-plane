@@ -29,7 +29,7 @@ import {
   type ObservedRepository,
 } from "./github-write-port.ts";
 import type { ExternalWriteReceipt } from "./repo-factory-result.ts";
-import { writeWholeSync } from "./whole-write.ts";
+import { frameRecord, writeWholeSync } from "./whole-write.ts";
 
 /**
  * Issue #246 — the repo factory producer's GitHub half: which planned operations may run, in
@@ -583,7 +583,7 @@ const writeOwnFile = (path: string, content: unknown): void => {
   const scratch = `${path}.partial`;
   const descriptor = openSync(scratch, "w", 0o600);
   try {
-    writeWholeSync(descriptor, `${JSON.stringify(content, null, 2)}\n`);
+    writeWholeSync(descriptor, frameRecord(content));
     fsyncSync(descriptor);
   } finally {
     closeSync(descriptor);

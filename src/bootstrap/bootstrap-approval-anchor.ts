@@ -1,4 +1,4 @@
-import { type Stats, closeSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync } from "node:fs";
+import { type Stats, closeSync, constants, fsyncSync, lstatSync, openSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { z } from "zod";
@@ -8,7 +8,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { writeWholeSync } from "./whole-write.ts";
+import { frameRecord, unframeRecord, writeWholeSync } from "./whole-write.ts";
 
 /**
  * #246 C3 (review 1076-R1-02) — the owner approval an application's execution runs on, anchored
@@ -78,8 +78,9 @@ const unanchored = <T>(refusal: string, message: string, evidence: Record<string
 
 /**
  * The anchor of `receiptDigest`, or null when there is none. A symlink, a non-file, another
- * account's file, one writable by others, unreadable JSON or a file that does not describe exactly
- * that receipt is a refusal, never an absence.
+ * account's file, one writable by others, a file that is not the whole record — its JSON and the
+ * newline that ends it, byte for byte (review 1076-R5) — or one that does not describe exactly that
+ * receipt is a refusal, never an absence. Reading it is not accepting it: see `acceptApprovalAnchor`.
  */
 export const readApprovalAnchor = (workDir: string, receiptDigest: string): Decision<OwnerApprovalAnchor | null> => {
   const path = approvalAnchorPath(workDir, receiptDigest);
@@ -102,9 +103,14 @@ export const readApprovalAnchor = (workDir: string, receiptDigest: string): Deci
   }
   let content: unknown;
   try {
-    content = JSON.parse(readFileSync(path, "utf8"));
+    content = unframeRecord(readFileSync(path));
   } catch (error) {
-    return unanchored("APPROVAL_ANCHOR_UNREADABLE", "the approval anchor is not readable JSON", { path, message: (error as Error).message });
+    return unanchored("APPROVAL_ANCHOR_UNREADABLE", "the approval anchor could not be read", { path, message: (error as Error).message });
+  }
+  if (content === null) {
+    return unanchored("APPROVAL_ANCHOR_UNREADABLE", "the approval anchor is not a whole record: its bytes are not its JSON and the newline that ends it", {
+      path,
+    });
   }
   const parsed = ownerApprovalAnchorSchema.safeParse(content);
   if (!parsed.success || parsed.data.receiptDigest !== receiptDigest || digestOf(parsed.data.receipt) !== receiptDigest) {
@@ -114,9 +120,59 @@ export const readApprovalAnchor = (workDir: string, receiptDigest: string): Deci
 };
 
 /**
- * Writes the anchor once, exclusively, and syncs it and its directory. Nothing is renamed or
- * replaced: an anchor of the same receipt already there is accepted only when it says exactly the
- * same, so a second consumption cannot rewrite what the first one anchored.
+ * #246 C3, review 1076-R5 — the one door an approval anchor is accepted through before anything may
+ * rely on it: when it has just been written, when one is found already there, and on every resume and
+ * every write an execution makes on it. The anchor is read whole and exact, `attributes` checks what
+ * it names, and then the file and the directory that holds it are synced, now. Only then is it
+ * accepted. A sync that fails refuses, APPROVAL_ANCHOR_UNSYNCED, and the caller sends nothing: an
+ * anchor that is on disk and readable, or one that was synced before, is not one that is persisted
+ * now. Nothing is written, renamed or removed here.
+ */
+export const acceptApprovalAnchor = (
+  workDir: string,
+  receiptDigest: string,
+  attributes: (anchor: OwnerApprovalAnchor) => Decision<void>,
+): Decision<OwnerApprovalAnchor> => {
+  const read = readApprovalAnchor(workDir, receiptDigest);
+  if (!read.allowed) return read as Decision<OwnerApprovalAnchor>;
+  if (read.value === null) {
+    return unanchored("APPROVAL_UNANCHORED", "the approval was never anchored when it was consumed", { receiptDigest });
+  }
+  const attributed = attributes(read.value);
+  if (!attributed.allowed) return attributed as Decision<OwnerApprovalAnchor>;
+  const path = approvalAnchorPath(workDir, receiptDigest)!;
+  const directory = join(workDir, "owner-approval");
+  let synced: "file" | "directory" | null = null;
+  try {
+    const file = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      fsyncSync(file);
+    } finally {
+      closeSync(file);
+    }
+    synced = "file";
+    const handle = openSync(directory, constants.O_RDONLY);
+    try {
+      fsyncSync(handle);
+    } finally {
+      closeSync(handle);
+    }
+    synced = "directory";
+  } catch (error) {
+    return unanchored("APPROVAL_ANCHOR_UNSYNCED", "the approval anchor and its directory could not be synced now, so nothing may rely on it", {
+      path,
+      failed: synced === null ? "file" : "directory",
+      message: (error as Error).message,
+    });
+  }
+  return allow(ReasonCode.OK, read.value);
+};
+
+/**
+ * Writes the anchor once, exclusively and whole, and accepts it through `acceptApprovalAnchor`, which
+ * syncs it and its directory. Nothing is renamed or replaced: an anchor of the same receipt already
+ * there is accepted only when it says exactly the same, so a second consumption cannot rewrite what
+ * the first one anchored — and only through the same door, its syncs included (review 1076-R5).
  */
 export const writeApprovalAnchor = (
   workDir: string,
@@ -126,6 +182,10 @@ export const writeApprovalAnchor = (
   const anchor: OwnerApprovalAnchor = { schema: OWNER_APPROVAL_ANCHOR_SCHEMA_ID, ...input, receiptDigest, receipt: { ...input.receipt } };
   const path = approvalAnchorPath(workDir, receiptDigest);
   if (path === null) return unanchored("APPROVAL_ANCHOR_UNWRITTEN", "the receipt digest cannot name an anchor", { receiptDigest });
+  const same = (present: OwnerApprovalAnchor): Decision<void> =>
+    digestOf({ ...present, anchoredAt: null }) === digestOf({ ...anchor, anchoredAt: null })
+      ? allow(ReasonCode.OK, undefined)
+      : unanchored("APPROVAL_ANCHOR_CONFLICT", "an anchor of this receipt already names another execution", { path });
   try {
     ensurePrivateDirectory(workDir);
     ensurePrivateDirectory(join(workDir, "owner-approval"));
@@ -134,31 +194,17 @@ export const writeApprovalAnchor = (
       descriptor = openSync(path, "wx", 0o600);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const present = readApprovalAnchor(workDir, receiptDigest);
-      const same =
-        present.allowed &&
-        present.value !== null &&
-        digestOf({ ...present.value, anchoredAt: null }) === digestOf({ ...anchor, anchoredAt: null });
-      return same
-        ? allow(ReasonCode.OK, present.value!)
-        : unanchored("APPROVAL_ANCHOR_CONFLICT", "an anchor of this receipt already names another execution", { path });
+      return acceptApprovalAnchor(workDir, receiptDigest, same);
     }
     try {
-      writeWholeSync(descriptor, `${JSON.stringify(anchor, null, 2)}\n`);
-      fsyncSync(descriptor);
+      writeWholeSync(descriptor, frameRecord(anchor));
     } finally {
       closeSync(descriptor);
-    }
-    const directory = openSync(join(workDir, "owner-approval"), "r");
-    try {
-      fsyncSync(directory);
-    } finally {
-      closeSync(directory);
     }
   } catch (error) {
     return unanchored("APPROVAL_ANCHOR_UNWRITTEN", "the approval anchor could not be written", { path, message: (error as Error).message });
   }
-  return allow(ReasonCode.OK, anchor);
+  return acceptApprovalAnchor(workDir, receiptDigest, same);
 };
 
 /**
@@ -260,7 +306,9 @@ export const readWithheldIntent = (workDir: string, key: WithheldIntentKey): Wit
     const path = join(directory, name);
     try {
       if (!privateEntry(lstatSync(path), "file")) return null;
-      const content: unknown = JSON.parse(readFileSync(path, "utf8"));
+      // Review 1076-R5 — whole and exact, the closing newline included: a prefix that parses is not the record.
+      const content = unframeRecord(readFileSync(path));
+      if (content === null) return null;
       const parsed = named[1] === "withheld" ? withheldRequestSchema.safeParse(content) : withheldConsumptionSchema.safeParse(content);
       if (
         !parsed.success ||
@@ -310,7 +358,7 @@ const writeWithheldRecord = (workDir: string, key: WithheldIntentKey, name: stri
   ensurePrivateDirectory(directory);
   const descriptor = openSync(join(directory, name), "wx", 0o600);
   try {
-    writeWholeSync(descriptor, `${JSON.stringify(record, null, 2)}\n`);
+    writeWholeSync(descriptor, frameRecord(record));
     fsyncSync(descriptor);
   } finally {
     closeSync(descriptor);
