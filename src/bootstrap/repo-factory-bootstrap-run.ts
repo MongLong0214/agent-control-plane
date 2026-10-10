@@ -980,9 +980,13 @@ export class RepoFactoryBootstrapRunner {
       // proven above to be the identity anchored for it, and its result is proved here to be the
       // attempt's own, before anything is activated (CEO decision (d), review 1076-R1-02): a WRITTEN
       // row and a stored result are database rows, and a database writer can write both. That is
-      // the chain the completion entries ask for. Nothing is consumed.
-      const written = this.writtenChain(existing, workRoot, executable, execution.value);
-      if (!written.allowed) return written as Decision<ACPBootstrapActivationResult>;
+      // the chain the completion entries ask for, the owner's current decision included. Nothing is
+      // consumed. A refusal leaves the application WRITTEN with its writes as recorded.
+      const written = this.completionChain(existing);
+      if (!written.allowed) {
+        this.deps.applications.recordRefusal(runId, refusalRecord(written, "precondition"));
+        return written as Decision<ACPBootstrapActivationResult>;
+      }
       return this.activate(input, written.value);
     }
 
@@ -1155,8 +1159,9 @@ export class RepoFactoryBootstrapRunner {
    * #246 C3, review 1076-R1-02 — the chain a WRITTEN application completes on, the same at every
    * completion entry: the runner's own, the CEO decision that completes the run, and the activation
    * finalizer inside it. The approval anchored as the execution's identity; the planned outputs the
-   * application reserved, rebuilt from the run's PLAN and the approved manifest; and the stored result,
-   * attributed to the attempt ledger receipt by receipt.
+   * application reserved, rebuilt from the run's PLAN and the approved manifest; the owner's current
+   * decision, which must still be that approval (review 1076-R2: a decline recorded after the writes
+   * completes nothing); and the stored result, attributed to the attempt ledger receipt by receipt.
    */
   private completionChain(application: BootstrapApplication): Decision<RepoFactoryResult> {
     const { runId } = application;
@@ -1170,6 +1175,8 @@ export class RepoFactoryBootstrapRunner {
     }
     const identity = this.anchoredIdentity(application, join(workRoot, runId));
     if (!identity.allowed) return atStage(identity as Decision<RepoFactoryResult>, "approval");
+    const current = this.currentOwnerDecision(runId, identity.value.receipt);
+    if (!current.allowed) return current as Decision<RepoFactoryResult>;
     const manifest = assertPortableManifest(identity.value.approvedManifest);
     if (!manifest.allowed) return atStage(manifest as Decision<RepoFactoryResult>, "approval");
     const outputs = this.reservedOutputs(application, ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, manifest.value);
@@ -1186,6 +1193,34 @@ export class RepoFactoryBootstrapRunner {
     });
     if (!execution.allowed) return atStage(execution as Decision<RepoFactoryResult>, "precondition");
     return this.writtenChain(application, workRoot, executable, execution.value);
+  }
+
+  /**
+   * #246 C3, review 1076-R2 — the owner's current decision on the run, which an execution completes
+   * on: its newest recorded Repo Factory decision must be the approval the execution runs on, or the
+   * same decision recorded again (idempotent). A decline, or a decision of another scope, refuses: an
+   * approval the owner has since declined authorises no completion. External writes already made are
+   * not undone by this; they stay as the WRITTEN application and its ledger record them.
+   */
+  private currentOwnerDecision(runId: string, approval: OwnerApprovalReceipt): Decision<void> {
+    const newest = this.newestRecordedApproval(runId);
+    if (newest === null || newest.digest === digestOf(approval)) return allow(ReasonCode.OK, undefined);
+    if (newest.receipt !== null && sameOwnerDecision(newest.receipt, approval)) return allow(ReasonCode.OK, undefined);
+    const declined = newest.receipt !== null && newest.receipt.approved === false;
+    return deny(
+      ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+      declined
+        ? "the owner declined after this execution's approval; the writes already made stay as recorded, and nothing is completed on the earlier approval"
+        : "the owner's newest decision is not the approval this execution runs on; the writes already made stay as recorded, and nothing is completed",
+      {
+        stage: "approval",
+        refusal: declined ? "APPROVAL_DECLINED" : "APPROVAL_SUPERSEDED",
+        runId,
+        approval: digestOf(approval),
+        newest: newest.digest,
+        writtenEffectsKept: true,
+      },
+    );
   }
 
   /**

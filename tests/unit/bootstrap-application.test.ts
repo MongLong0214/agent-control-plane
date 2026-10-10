@@ -2359,3 +2359,49 @@ describe("#246 C3 review 1076-R1-02: issuance is the admitted payload, not an au
     });
   });
 });
+
+/**
+ * Review 1076-R2 — the owner's current decision completes nothing it has declined: the runner, the CEO
+ * decision and the activation finalizer ask the same question. The writes already made are kept as
+ * the WRITTEN application and its ledger record them; the decline does not undo them.
+ */
+describe("#246 C3 review 1076-R2: a decline after the writes completes nothing at any completion entry", () => {
+  it("after WRITTEN and the handoff acknowledgement the owner declines: the runner, the CEO decision and the finalizer each refuse, and the writes stay recorded", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r2-decline-after-written"));
+      await approveWrites(f, run);
+      const activation = await confirm(f, run);
+      await acknowledgeHandoff(f, run, activation);
+      await approveWrites(f, run, { decline: true });
+
+      const runner = await confirm(f, run);
+      expect(runner, JSON.stringify(runner)).toMatchObject({ ok: false, evidence: { refusal: "APPROVAL_DECLINED" } });
+      expect(f.harness.cp.bootstrapProducer.verifyCompletionChain(run.runId, run.candidate)).toMatchObject({
+        allowed: false,
+        evidence: { refusal: "APPROVAL_DECLINED", writtenEffectsKept: true },
+      });
+      const gate = f.harness.cp.ceo.submitCeoDecision({
+        runId: run.runId,
+        decision: "CONFIRM",
+        candidateSnapshotDigest: run.candidate,
+        ceoSessionId: f.ceoSessionId,
+        rationale: "complete on the approval the owner has since declined",
+      });
+      expect(gate, JSON.stringify(gate)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_DECLINED" } });
+      const finalized = f.harness.cp.db.txDecision(() =>
+        f.harness.cp.bootstrap.finalizeBootstrapActivationConfirm({
+          runId: run.runId,
+          candidateSnapshotDigest: run.candidate,
+          ceoSessionId: f.ceoSessionId,
+          confirmedAt: f.harness.clock.nowIso(),
+        }),
+      );
+      expect(finalized, JSON.stringify(finalized)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_DECLINED" } });
+
+      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+      expect(ledgerOf(f, run).receipts).toHaveLength(4);
+    });
+  });
+});
