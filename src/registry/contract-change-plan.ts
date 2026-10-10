@@ -79,10 +79,14 @@ export interface VerificationBarLowering {
     | "COMMAND_REPLACED"
     | "EVIDENCE_MODE_DOWNGRADED"
     | "COMMAND_LIMIT_RAISED"
+    | "COMMAND_COLLAPSED"
+    | "COMMAND_ID_DUPLICATED"
     | "PROFILE_COMMAND_REMOVED"
     | "POST_MERGE_COMMAND_REMOVED"
     | "CI_WORKFLOW_DROPPED"
     | "CI_WORKFLOW_DIGEST_CHANGED"
+    | "CI_WORKFLOW_ORDER_CHANGED"
+    | "CI_WORKFLOW_CHECK_NAME_SHADOWED"
     | "CI_WORKFLOW_UNAPPROVED"
     | "CI_WORKFLOW_ADDED_BESIDE_CI_EVIDENCE"
     | "COMMITLORE_MODE_DOWNGRADED";
@@ -195,29 +199,62 @@ const selected = (manifest: ProjectManifest, ids: readonly string[]): Command[] 
 };
 
 /**
+ * A one-to-one assignment of base obligations to proposed ones (augmenting paths), rather than a match
+ * any proposed item may serve several times: each base item gets its own proposed item that `fits` it,
+ * or null when no assignment leaves one for it. One proposed command can therefore discharge one base
+ * command only, so two required commands that check the same thing cannot collapse into one; `fits`
+ * is an order rather than an equality, which is why a greedy choice is not enough.
+ */
+const assign = <B, P>(bases: readonly B[], proposals: readonly P[], fits: (base: B, proposal: P) => boolean): Array<P | null> => {
+  const holder = proposals.map((): number => -1);
+  const assigned = bases.map((): number => -1);
+  const place = (index: number, seen: boolean[]): boolean => {
+    for (let candidate = 0; candidate < proposals.length; candidate++) {
+      if (seen[candidate] || !fits(bases[index]!, proposals[candidate]!)) continue;
+      seen[candidate] = true;
+      if (holder[candidate] === -1 || place(holder[candidate]!, seen)) {
+        holder[candidate] = index;
+        assigned[index] = candidate;
+        return true;
+      }
+    }
+    return false;
+  };
+  bases.forEach((_, index) => place(index, proposals.map(() => false)));
+  return assigned.map((candidate) => (candidate === -1 ? null : proposals[candidate]!));
+};
+
+/**
  * Every way `proposed` asks less of a candidate than `base` did, found by comparison rather than
- * declared. Obligations are compared by what they resolve to rather than by name: each base command, each
- * command a profile selects and each post-merge entry that names a command has to be discharged by a
- * proposed command that checks the same thing (`executionIdentity`) with at least the same evidence
- * and no looser limits. A post-merge entry that names no command is a check name and is kept by name.
- * A workflow the base declares must stay, at the same role, check name and path, with the same
- * approved digest; a new one may not be unapproved, nor be added beside commands that already take
- * CI evidence, since a check from any approved workflow can supply that evidence. The CommitLore mode
- * may not drop. The branch profile is not judged.
+ * declared. Obligations are compared by what they resolve to rather than by name, one to one: each
+ * base command, each command a profile selects and each post-merge check has to be discharged by its
+ * own proposed counterpart, which for a command checks the same thing (`executionIdentity`) with at
+ * least the same evidence and no looser limits. A post-merge entry is a check name, which the
+ * consumer deduplicates: each distinct base name is kept by the same name, or, when it names a
+ * command, by a distinct name naming a command that discharges it. A workflow the base declares must
+ * stay, at the same role, check name and path, with the same approved digest, and keep its place
+ * among entries sharing its role and check name, because a check is matched to the first such entry.
+ * A new workflow may not be unapproved, may not share a role and check name with another entry, and
+ * may not be added beside commands that already take CI evidence, since a check from any approved
+ * workflow can supply that evidence. A command id may not be declared twice. The CommitLore mode may
+ * not drop. The branch profile is not judged.
  */
 export const verificationBarLowerings = (
   base: ProjectManifest,
   proposed: ProjectManifest,
 ): VerificationBarLowering[] => {
   const lowered: VerificationBarLowering[] = [];
-  const kept = (command: Command, candidates: readonly Command[]): boolean =>
-    candidates.some((next) => discharges(command, next));
 
-  for (const command of base.verificationCommands) {
-    if (kept(command, proposed.verificationCommands)) continue;
+  const commandMatch = assign(base.verificationCommands, proposed.verificationCommands, discharges);
+  const matched = new Set(base.verificationCommands.filter((_, index) => commandMatch[index] !== null));
+  base.verificationCommands.forEach((command, index) => {
+    if (commandMatch[index] !== null) return;
     const same = proposed.verificationCommands.filter((next) => sameExecution(command, next));
     const named = same.find((next) => next.id === command.id) ?? same[0];
-    if (named && same.some((next) => keepsEvidence(command, next))) {
+    if (proposed.verificationCommands.some((next) => discharges(command, next))) {
+      // A proposed command checks this, but it is already the counterpart of another base command.
+      lowered.push({ kind: "COMMAND_COLLAPSED", detail: { commandId: command.id } });
+    } else if (named && same.some((next) => keepsEvidence(command, next))) {
       lowered.push({ kind: "COMMAND_LIMIT_RAISED", detail: { commandId: command.id } });
     } else if (named) {
       lowered.push({
@@ -229,28 +266,41 @@ export const verificationBarLowerings = (
     } else {
       lowered.push({ kind: "COMMAND_REMOVED", detail: { commandId: command.id } });
     }
-  }
-  // A profile or post-merge entry is reported only when the command it selects is kept elsewhere;
-  // a command that is gone or weakened is reported once, above.
-  const keptAnywhere = (command: Command): boolean => kept(command, proposed.verificationCommands);
-  for (const profile of PROFILES) {
-    const next = selected(proposed, proposed.verificationProfiles[profile]);
-    for (const command of selected(base, base.verificationProfiles[profile])) {
-      if (keptAnywhere(command) && !kept(command, next)) {
-        lowered.push({ kind: "PROFILE_COMMAND_REMOVED", detail: { profile, commandId: command.id } });
-      }
+  });
+  // An id names one command for every consumer keyed by it (CI results, result rows, limits).
+  const baseIds = base.verificationCommands.map((command) => command.id);
+  const proposedIds = proposed.verificationCommands.map((command) => command.id);
+  for (const id of new Set(proposedIds.filter((id, index) => proposedIds.indexOf(id) !== index))) {
+    if (baseIds.filter((baseId) => baseId === id).length < proposedIds.filter((next) => next === id).length) {
+      lowered.push({ kind: "COMMAND_ID_DUPLICATED", detail: { commandId: id } });
     }
   }
-  const keptPostMerge = new Set(proposed.postMergeCommands);
-  const nextPostMerge = selected(proposed, proposed.postMergeCommands);
-  for (const entry of base.postMergeCommands) {
-    // The entry is the name of a check required after merge, so keeping the name keeps it; an entry
-    // that names a command may also be kept by an entry naming a command that discharges it.
-    const commands = selected(base, [entry]);
-    const removed = !keptPostMerge.has(entry) &&
-      (commands.length === 0 || commands.some((command) => keptAnywhere(command) && !kept(command, nextPostMerge)));
-    if (removed) lowered.push({ kind: "POST_MERGE_COMMAND_REMOVED", detail: { commandId: entry } });
+  // A profile or post-merge obligation is reported only when its command kept a counterpart; a
+  // command that is gone, weakened or collapsed is reported once, above.
+  for (const profile of PROFILES) {
+    const before = selected(base, base.verificationProfiles[profile]);
+    const profileMatch = assign(before, selected(proposed, proposed.verificationProfiles[profile]), discharges);
+    before.forEach((command, index) => {
+      if (profileMatch[index] === null && matched.has(command)) {
+        lowered.push({ kind: "PROFILE_COMMAND_REMOVED", detail: { profile, commandId: command.id } });
+      }
+    });
   }
+  const baseChecks = [...new Set(base.postMergeCommands)];
+  const proposedChecks = [...new Set(proposed.postMergeCommands)];
+  const checkMatch = assign(baseChecks, proposedChecks, (name, next) => {
+    if (name === next) return true;
+    const commands = selected(base, [name]);
+    const candidates = selected(proposed, [next]);
+    return commands.length > 0 && candidates.length > 0 &&
+      commands.every((command) => candidates.some((candidate) => discharges(command, candidate)));
+  });
+  baseChecks.forEach((name, index) => {
+    if (checkMatch[index] !== null) return;
+    const commands = selected(base, [name]);
+    if (commands.length > 0 && !commands.some((command) => matched.has(command))) return;
+    lowered.push({ kind: "POST_MERGE_COMMAND_REMOVED", detail: { commandId: name } });
+  });
 
   const proposedWorkflows = new Map<string, Workflow[]>();
   for (const workflow of proposed.ciWorkflows) {
@@ -272,11 +322,28 @@ export const verificationBarLowerings = (
       });
     }
   }
+  // Post-merge trust takes the first workflow matching a check's role and name, so the order of
+  // entries sharing both decides which bytes a check is compared against.
+  const checkSlot = (workflow: Workflow): string => `${workflow.repositoryRole}\u0000${workflow.checkName}`;
+  const pathsIn = (manifest: ProjectManifest, slot: string): string[] =>
+    manifest.ciWorkflows.filter((workflow) => checkSlot(workflow) === slot).map((workflow) => workflow.path);
+  for (const slot of new Set(base.ciWorkflows.map(checkSlot))) {
+    const before = pathsIn(base, slot);
+    if (before.length < 2) continue;
+    const after = pathsIn(proposed, slot).filter((path) => before.includes(path));
+    if (canonicalJson(after) !== canonicalJson(before.filter((path) => after.includes(path)))) {
+      const [repositoryRole, checkName] = slot.split("\u0000");
+      lowered.push({ kind: "CI_WORKFLOW_ORDER_CHANGED", detail: { repositoryRole: repositoryRole!, checkName: checkName! } });
+    }
+  }
   const baseTakesCiEvidence = base.verificationCommands.some(hasCiEvidence);
   for (const workflow of proposed.ciWorkflows) {
     if (baseKeys.has(workflowKey(workflow))) continue;
     const detail = { repositoryRole: workflow.repositoryRole, checkName: workflow.checkName, path: workflow.path };
     if (workflow.unapprovedFirstActivation) lowered.push({ kind: "CI_WORKFLOW_UNAPPROVED", detail });
+    if (proposed.ciWorkflows.some((other) => other !== workflow && checkSlot(other) === checkSlot(workflow))) {
+      lowered.push({ kind: "CI_WORKFLOW_CHECK_NAME_SHADOWED", detail });
+    }
     if (baseTakesCiEvidence) lowered.push({ kind: "CI_WORKFLOW_ADDED_BESIDE_CI_EVIDENCE", detail });
   }
   if (COMMITLORE_RANK[proposed.commitlore.mode] < COMMITLORE_RANK[base.commitlore.mode]) {

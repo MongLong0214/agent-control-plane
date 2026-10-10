@@ -232,6 +232,39 @@ describe("W17: lowering the verification bar is detected against the pin and ref
     });
   }
 
+  it("refuses collapsing two required commands that check the same thing into one", async () => {
+    const harness = makeHarness();
+    const verify = fixtureManifest("cc-collapsed").verificationCommands[0]!;
+    const run = await contractChangeProject(harness, "cc-collapsed", {
+      verificationCommands: [{ ...verify, id: "verify-a" }, { ...verify, id: "verify-b" }],
+      verificationProfiles: { simple: ["verify-a", "verify-b"], standard: ["verify-a", "verify-b"], guarded: ["verify-a", "verify-b"] },
+      postMergeCommands: ["verify-a", "verify-b"],
+    });
+    const proposed = normalized({
+      ...run.base,
+      verificationCommands: [{ ...verify, id: "verify-a" }],
+      verificationProfiles: { simple: ["verify-a"], standard: ["verify-a"], guarded: ["verify-a"] },
+      postMergeCommands: ["verify-a"],
+    });
+    const answer = await expectRefused(harness, run, planCarrying(proposed), ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT, BAR);
+    expect(lowered(answer)).toEqual(["COMMAND_COLLAPSED"]);
+  });
+
+  it("refuses a new workflow that shares a retained workflow's role and check name, whatever the commands' evidence", async () => {
+    const harness = makeHarness();
+    const run = await contractChangeProject(harness, "cc-shadowed", { ciWorkflows: [WORKFLOW_ENTRY], postMergeCommands: ["unit-tests"] });
+    expect(run.base.verificationCommands.every((command) => command.evidenceMode === "LOCAL_COMMAND")).toBe(true);
+    const shadow = { ...WORKFLOW_ENTRY, path: ".github/workflows/shadow.yml", approvedDigest: sha256(WORKFLOW.replace("node --test", "node --version")) };
+    for (const ciWorkflows of [[shadow, WORKFLOW_ENTRY], [WORKFLOW_ENTRY, shadow]]) {
+      const answer = await expectRefused(harness, run, planCarrying(normalized({ ...run.base, ciWorkflows })), ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT, BAR);
+      expect(lowered(answer)).toEqual(["CI_WORKFLOW_CHECK_NAME_SHADOWED"]);
+    }
+    // A new workflow under its own check name is a new obligation, and stays allowed on a base whose
+    // commands take no CI evidence.
+    const distinct = normalized({ ...run.base, ciWorkflows: [WORKFLOW_ENTRY, { ...shadow, checkName: "lint" }] });
+    expect((await planSubmit(harness, run, planCarrying(distinct)))["ok"]).toBe(true);
+  });
+
   it("refuses a new workflow that is unapproved, even where no command takes CI evidence yet", async () => {
     const harness = makeHarness();
     const run = await contractChangeProject(harness, "cc-unapproved-new");

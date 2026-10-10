@@ -120,6 +120,41 @@ describe("verificationBarLowerings", () => {
     expect(verificationBarLowerings(withPostMerge, external).map((entry) => entry.kind)).toEqual(["POST_MERGE_COMMAND_REMOVED"]);
   });
 
+  it("matches obligations one to one, without a greedy choice blocking a valid assignment", () => {
+    const verify = base.verificationCommands[0]!;
+    const pair = projectManifestSchema.parse({
+      ...base,
+      verificationCommands: [{ ...verify, id: "slow", timeoutSeconds: 100 }, { ...verify, id: "fast", timeoutSeconds: 50 }],
+      verificationProfiles: { simple: ["slow", "fast"], standard: ["slow", "fast"], guarded: ["slow", "fast"] },
+    });
+    // Listed fast first: a greedy pass would give it to `slow` and leave nothing for `fast`.
+    const swapped = projectManifestSchema.parse({
+      ...pair,
+      verificationCommands: [{ ...verify, id: "fast", timeoutSeconds: 50 }, { ...verify, id: "slow", timeoutSeconds: 100 }],
+    });
+    expect(verificationBarLowerings(pair, swapped)).toEqual([]);
+    // A profile that selects one of the two where it selected both has lost an evidence input.
+    const thinner = projectManifestSchema.parse({ ...pair, verificationProfiles: { ...pair.verificationProfiles, guarded: ["slow"] } });
+    expect(verificationBarLowerings(pair, thinner).map((entry) => entry.kind)).toEqual(["PROFILE_COMMAND_REMOVED"]);
+    // Two post-merge checks naming commands that check the same thing are two checks.
+    const checks = projectManifestSchema.parse({ ...pair, postMergeCommands: ["slow", "fast"] });
+    const oneCheck = projectManifestSchema.parse({ ...checks, postMergeCommands: ["fast"] });
+    expect(verificationBarLowerings(checks, oneCheck).map((entry) => entry.kind)).toEqual(["POST_MERGE_COMMAND_REMOVED"]);
+  });
+
+  it("refuses a command id declared twice, and a reorder of workflows that share a role and check name", () => {
+    const verify = base.verificationCommands[0]!;
+    const twice = projectManifestSchema.parse({ ...base, verificationCommands: [verify, { ...verify, argv: ["node", "--version"] }] });
+    expect(verificationBarLowerings(base, twice).map((entry) => entry.kind)).toEqual(["COMMAND_ID_DUPLICATED"]);
+    const second = { ...workflow, path: ".github/workflows/ci-2.yml", approvedDigest: sha256("ci-2") };
+    const pair = projectManifestSchema.parse({ ...base, ciWorkflows: [workflow, second] });
+    const swapped = projectManifestSchema.parse({ ...pair, ciWorkflows: [second, workflow] });
+    expect(verificationBarLowerings(pair, swapped).map((entry) => entry.kind)).toEqual(["CI_WORKFLOW_ORDER_CHANGED"]);
+    const other = { ...workflow, checkName: "other", path: ".github/workflows/other.yml" };
+    const distinct = projectManifestSchema.parse({ ...base, ciWorkflows: [workflow, other] });
+    expect(verificationBarLowerings(distinct, projectManifestSchema.parse({ ...distinct, ciWorkflows: [other, workflow] }))).toEqual([]);
+  });
+
   it("treats a moved workflow path as dropping the approved one", () => {
     const withWorkflow = projectManifestSchema.parse({ ...base, ciWorkflows: [workflow] });
     const moved = projectManifestSchema.parse({ ...base, ciWorkflows: [{ ...workflow, path: ".github/workflows/other.yml" }] });
