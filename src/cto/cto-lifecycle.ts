@@ -19,7 +19,7 @@ import type { Outbox } from "../outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
-import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type DrivenMode, drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
+import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type DrivenMode, type SpawnAttestation, drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -101,7 +101,7 @@ export interface SessionLaunchChannel {
  */
 export interface ProvisionedRuntimePort {
   adopt(sessionId: string, role: Role, sessionSecret: string, credentialEpoch: number): Decision<void>;
-  attest(sessionId: string, conversation: "new" | "resume"): Promise<Decision<void>>;
+  attest(sessionId: string, conversation: "new" | "resume", spawn?: SpawnAttestation | null): Promise<Decision<void>>;
   release(sessionId: string): void;
 }
 
@@ -1188,6 +1188,8 @@ export class CtoLifecycle {
     // Recorded with its native start pinned beside the lstart, read as one snapshot of one process
     // (ACP1045-R2-01, R3-01); see `SessionRegistry.createWithPinnedStart`.
     let session: ReturnType<SessionRegistry["createWithPinnedStart"]>;
+    // #246 C4 — the generation a driven PRIMARY_CTO's spawn record names, for its own attestation.
+    let creationGeneration: number | null = null;
     try {
       // The row and, for a run's bootstrap CTO, its spawn record are one write: no refusal below
       // can leave a session the reclaim sweep has no record of (#246 C1-04).
@@ -1220,7 +1222,7 @@ export class CtoLifecycle {
         // conversation only while this row names the binding it holds. Append-only, never added later.
         if (headless && role === Role.PRIMARY_CTO) {
           const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: scope });
-          const creationGeneration = this.db.get<{ next: number }>(
+          creationGeneration = this.db.get<{ next: number }>(
             `SELECT COALESCE(MAX(binding_generation), 0) + 1 AS next FROM assignments WHERE role_key = ?`,
             [roleKey],
           )?.next ?? 1;
@@ -1313,7 +1315,15 @@ export class CtoLifecycle {
     // conversation, whose relay authenticates with the delivered credential and presents a
     // challenge the daemon minted (#246 C1b).
     const live = headless
-      ? notProvenReady(session.sessionId, await headless.attest(session.sessionId, "new"))
+      ? notProvenReady(session.sessionId, await headless.attest(
+          session.sessionId,
+          "new",
+          // A driven PRIMARY_CTO's first turn is the one turn its not-yet-bound session may run, and
+          // only for exactly this spawn: this session row, incarnation, epoch and creation generation.
+          creationGeneration === null
+            ? null
+            : { incarnation: session.incarnation, credentialEpoch: session.credentialEpoch, creationGeneration },
+        ))
       : await probeSessionHealth(adapter, handle);
     if (!live.allowed) {
       return refuse(headless ? "session attestation failed" : "provider session probe failed", live as Decision<string>);

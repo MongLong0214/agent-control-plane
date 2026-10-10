@@ -6,7 +6,7 @@ import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { wakeRoleHolder } from "../../src/daemon/agentcpd.ts";
 import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor, type RoleBinding } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
-import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD } from "../../src/runtime/provisioned-session-runtime.ts";
+import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type SpawnAttestation } from "../../src/runtime/provisioned-session-runtime.ts";
 import type { SessionHandle, SessionTurnRequest, SessionTurnResult } from "../../src/runtime/provider.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -133,6 +133,10 @@ const workTurnsOf = (f: BootstrapRuntimeFixture, sessionId: string): number => {
   return f.claude.turns.filter((turn) =>
     turn.handle.externalSessionId === external && turn.relay !== null && !/session_attest/.test(turn.prompt)).length;
 };
+
+/** The provider's own conversation id for a session row. */
+const externalOfRow = (f: BootstrapRuntimeFixture, sessionId: string): string =>
+  f.harness.cp.sessions.require(sessionId).incarnation.split("#")[0]!;
 
 const attestationTurns = (f: BootstrapRuntimeFixture, sessionId: string): SessionTurnRequest[] => {
   const external = f.harness.cp.sessions.require(sessionId).incarnation.split("#")[0];
@@ -674,6 +678,310 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
           [sessionId],
         ).map((row) => row.actor_id)).toEqual([creationActor]);
         expectNothingUsable(f, refused, sessionId, roleKey);
+      });
+    });
+  });
+
+  describe("the execution boundary reads eligibility immediately before the provider call", () => {
+    const externalOf = (f: BootstrapRuntimeFixture, sessionId: string): string =>
+      f.harness.cp.sessions.require(sessionId).incarnation.split("#")[0]!;
+
+    /** Turns this session ran to completion, by purpose: the runtime records each one it executed. */
+    const executed = (f: BootstrapRuntimeFixture, sessionId: string, purpose: string): number =>
+      f.harness.cp.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM audit_events
+          WHERE kind = 'SESSION_TURN' AND session_id = ? AND json_extract(evidence_json, '$.purpose') = ?`,
+        [sessionId, purpose],
+      )?.n ?? 0;
+
+    /** Turns refused at the boundary, by purpose: none of them reached the provider. */
+    const refusedTurns = (f: BootstrapRuntimeFixture, sessionId: string, purpose: string): number =>
+      f.harness.cp.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM audit_events
+          WHERE kind = 'SESSION_TURN_REFUSED' AND session_id = ? AND json_extract(evidence_json, '$.purpose') = ?`,
+        [sessionId, purpose],
+      )?.n ?? 0;
+
+    /** Provider calls of this session's conversation, by kind of prompt. */
+    const providerCalls = (f: BootstrapRuntimeFixture, sessionId: string): { attestation: number; other: number } => {
+      const external = externalOf(f, sessionId);
+      const mine = f.claude.turns.filter((turn) => turn.handle.externalSessionId === external);
+      const attestation = mine.filter((turn) => /session_attest/.test(turn.prompt)).length;
+      return { attestation, other: mine.length - attestation };
+    };
+
+    /** Holds this session's next attestation turn inside the provider until `release`. */
+    const holdNextAttestation = (f: BootstrapRuntimeFixture, sessionId: string) => {
+      let release!: () => void;
+      const barrier = new Promise<void>((resolve) => { release = resolve; });
+      let entered = false;
+      const original = f.claude.runSessionTurn.bind(f.claude);
+      f.claude.runSessionTurn = async (request) => {
+        if (!entered && request.handle.externalSessionId === externalOf(f, sessionId) && /session_attest/.test(request.prompt)) {
+          entered = true;
+          await barrier;
+        }
+        return original(request);
+      };
+      return { release: () => release(), entered: () => entered };
+    };
+
+    /** The activation's handoff envelope, PENDING, with nothing woken for it yet. */
+    const pendingHandoff = (f: BootstrapRuntimeFixture, projectId: string, runId: string, sessionId: string): string => {
+      f.harness.cp.outbox.attachInBandWake(async () => allow(ReasonCode.OK, undefined));
+      const opened = openActivationHandoff(f)(projectId, runId, sessionId, HANDOFF);
+      if (!opened.allowed) throw new Error(opened.message);
+      return f.harness.cp.outbox.byIdempotencyKey(`bootstrap-handoff:${opened.value.handoffId}`)!.messageId;
+    };
+
+    /** A refused work turn reached no provider, executed nothing and settled nothing. */
+    const expectRefusedWork = (f: BootstrapRuntimeFixture, sessionId: string, messageId: string, otherCallsBefore: number) => {
+      const cp = f.harness.cp;
+      expect(providerCalls(f, sessionId).other).toBe(otherCallsBefore);
+      expect(executed(f, sessionId, "work")).toBe(0);
+      expect(refusedTurns(f, sessionId, "work")).toBe(1);
+      expect(cp.outbox.get(messageId)?.status).not.toBe("ACKED");
+      expect(countAudit(f, "OUTBOX_ACKED_IN_BAND", sessionId)).toBe(0);
+      expect(countAudit(f, "HANDOFF_ACK", sessionId)).toBe(0);
+    };
+
+    it("refuses a queued turn whose spawn record became contradicted, and refuses the attestation it waited behind", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { bootstrap, binding } = await drivenPrimary(f, "queued-contradicted");
+        actOnWorkTurns(f, binding.sessionId);
+        const messageId = pendingHandoff(f, "queued-contradicted", bootstrap.runId, binding.sessionId);
+        const held = holdNextAttestation(f, binding.sessionId);
+        const reattest = cp.cto.ensurePrimaryCto("queued-contradicted", "cto_start");
+        await vi.waitFor(() => expect(held.entered()).toBe(true));
+        expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: messageId, kind: "in-band dispatch" }])).toMatchObject({
+          allowed: true,
+          value: "COALESCED",
+        });
+        cp.audit.record({
+          kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+          projectId: "queued-contradicted",
+          roleKey: binding.roleKey,
+          sessionId: binding.sessionId,
+          evidence: { creationGeneration: 1 },
+        });
+        const before = providerCalls(f, binding.sessionId).other;
+        held.release();
+        // The attestation ran while the record was still one; it is not counted once it is two.
+        expect(await reattest).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+        await vi.waitFor(() => expect(refusedTurns(f, binding.sessionId, "work")).toBe(1));
+        expectRefusedWork(f, binding.sessionId, messageId, before);
+        expect(cp.outbox.get(messageId)?.status).toBe("PENDING");
+      });
+    });
+
+    it("refuses a turn whose binding was revoked after the wake admitted it", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { bootstrap, binding } = await drivenPrimary(f, "queued-revoked");
+        actOnWorkTurns(f, binding.sessionId);
+        const messageId = pendingHandoff(f, "queued-revoked", bootstrap.runId, binding.sessionId);
+        const before = providerCalls(f, binding.sessionId).other;
+        expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: messageId, kind: "in-band dispatch" }])).toMatchObject({
+          allowed: true,
+          value: "STARTED",
+        });
+        expect(cp.bindings.revoke(binding.roleKey, "fixture: revoked between wake and turn").allowed).toBe(true);
+        await vi.waitFor(() => expect(refusedTurns(f, binding.sessionId, "work")).toBe(1));
+        expectRefusedWork(f, binding.sessionId, messageId, before);
+      });
+    });
+
+    it("refuses a queued turn whose session went ERROR, and refuses a wake for an ERROR session at admission", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { bootstrap, binding } = await drivenPrimary(f, "queued-error");
+        actOnWorkTurns(f, binding.sessionId);
+        const messageId = pendingHandoff(f, "queued-error", bootstrap.runId, binding.sessionId);
+        const held = holdNextAttestation(f, binding.sessionId);
+        const reattest = cp.cto.ensurePrimaryCto("queued-error", "cto_start");
+        await vi.waitFor(() => expect(held.entered()).toBe(true));
+        expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: messageId, kind: "in-band dispatch" }])).toMatchObject({
+          allowed: true,
+          value: "COALESCED",
+        });
+        expect(cp.sessions.transition(binding.sessionId, SessionLifecycle.ERROR, "fixture: runtime failure").allowed).toBe(true);
+        const before = providerCalls(f, binding.sessionId).other;
+        held.release();
+        expect((await reattest).allowed).toBe(false);
+        await vi.waitFor(() => expect(refusedTurns(f, binding.sessionId, "work")).toBe(1));
+        // The envelope is the outbox's to retire (its target is no longer live); no turn settled it.
+        expectRefusedWork(f, binding.sessionId, messageId, before);
+        expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "after-error", kind: "test" }])).toMatchObject({
+          allowed: false,
+          reasonCode: ReasonCode.SESSION_NOT_READY,
+        });
+        expect(providerCalls(f, binding.sessionId).other).toBe(before);
+      });
+    });
+
+    it("refuses a direct probe and attestation of a session whose spawn record is contradicted", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { binding } = await drivenPrimary(f, "direct-contradicted");
+        cp.audit.record({
+          kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+          projectId: "direct-contradicted",
+          roleKey: binding.roleKey,
+          sessionId: binding.sessionId,
+          evidence: { creationGeneration: 1 },
+        });
+        const before = f.claude.turns.length;
+        expect(await cp.sessionRuntime.probe(binding.sessionId)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+        expect(await cp.sessionRuntime.attest(binding.sessionId, "resume")).toMatchObject({
+          allowed: false,
+          reasonCode: ReasonCode.CONFLICT,
+        });
+        expect(f.claude.turns.length).toBe(before);
+      });
+    });
+
+    it("refuses a turn that became ineligible while its credential delivery was being prepared", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { binding } = await drivenPrimary(f, "prepared-then-refused");
+        let armed = true;
+        const withdrawn: boolean[] = [];
+        let provisioned = 0;
+        cp.sessionRuntime.attach({
+          delivery: {
+            prepare: async () => {
+              const prepared = await f.launch.prepare();
+              if (armed) {
+                armed = false;
+                cp.sessions.transition(binding.sessionId, SessionLifecycle.ERROR, "fixture: failed during preparation");
+              }
+              return prepared;
+            },
+            provision: async (credential) => {
+              provisioned += 1;
+              return f.launch.provision(credential);
+            },
+            withdraw: (externalSessionId) => {
+              const untaken = f.launch.withdraw(externalSessionId);
+              if (provisioned > 0) withdrawn.push(untaken);
+              return untaken;
+            },
+          },
+        });
+        const before = providerCalls(f, binding.sessionId).other;
+        expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "prepared-then-refused", kind: "test" }])).toMatchObject({
+          allowed: true,
+          value: "STARTED",
+        });
+        await vi.waitFor(() => expect(refusedTurns(f, binding.sessionId, "work")).toBe(1));
+        expect(providerCalls(f, binding.sessionId).other).toBe(before);
+        expect(executed(f, binding.sessionId, "work")).toBe(0);
+        // The credential offered for the turn was taken back untouched.
+        expect(provisioned).toBe(1);
+        expect(withdrawn).toEqual([true]);
+      });
+    });
+  });
+
+  describe("a session not yet bound runs only its own spawn's attestation", () => {
+    const ticketOf = (f: BootstrapRuntimeFixture, sessionId: string, creationGeneration = 1): SpawnAttestation => {
+      const session = f.harness.cp.sessions.require(sessionId);
+      return { incarnation: session.incarnation, credentialEpoch: session.credentialEpoch, creationGeneration };
+    };
+
+    it("refuses work, a probe and any other attestation on the spawn's own pending session, and the spawn still binds", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+        await registerFixtureProject(f.harness, "pending-misuse");
+        const bootstrap = await f.dispatchBootstrap();
+        const seen: Record<string, unknown> = {};
+        // While the spawn's own attestation runs: STARTING, PENDING, holding the exact ticket.
+        const original = f.claude.runSessionTurn.bind(f.claude);
+        let inside = false;
+        f.claude.runSessionTurn = async (request) => {
+          const marker = cp.db.get<{ session_id: string }>(
+            `SELECT session_id FROM audit_events WHERE kind = ? AND project_id = 'pending-misuse'`,
+            [DRIVEN_PRIMARY_CTO_SPAWN_RECORD],
+          );
+          if (!inside && marker && request.handle.externalSessionId === externalOfRow(f, marker.session_id)) {
+            inside = true;
+            const ticket = ticketOf(f, marker.session_id);
+            seen["mode"] = cp.outbox.drivenModeOf(marker.session_id);
+            seen["own"] = cp.sessionRuntime.turnEligibility(marker.session_id, "attestation", "new", ticket).allowed;
+            seen["work"] = cp.sessionRuntime.turnEligibility(marker.session_id, "work", "new", ticket).reasonCode;
+            seen["probe"] = cp.sessionRuntime.turnEligibility(marker.session_id, "probe", "new", ticket).reasonCode;
+            seen["resume"] = cp.sessionRuntime.turnEligibility(marker.session_id, "attestation", "resume", ticket).reasonCode;
+            seen["noTicket"] = cp.sessionRuntime.turnEligibility(marker.session_id, "attestation", "new", null).reasonCode;
+          }
+          return original(request);
+        };
+        // After it: READY, still PENDING, before the bind. Each misuse is refused with no provider call.
+        const readiness = cp.doctor.sessionReadiness.bind(cp.doctor);
+        vi.spyOn(cp.doctor, "sessionReadiness").mockImplementationOnce(async (sessionId: string) => {
+          const before = f.claude.turns.length;
+          seen["readyMode"] = cp.outbox.drivenModeOf(sessionId);
+          seen["probeRun"] = (await cp.sessionRuntime.probe(sessionId)).reasonCode;
+          seen["attestRun"] = (await cp.sessionRuntime.attest(sessionId, "new")).reasonCode;
+          seen["replayRun"] = (await cp.sessionRuntime.attest(sessionId, "new", ticketOf(f, sessionId))).reasonCode;
+          seen["calls"] = f.claude.turns.length - before;
+          return readiness(sessionId);
+        });
+        const bound = await cp.cto.ensureDrivenPrimaryCto("pending-misuse", bootstrap.runId);
+        if (!bound.allowed) throw new Error(`the spawn was refused: ${bound.reasonCode}`);
+        expect(seen).toEqual({
+          mode: "PENDING",
+          own: true,
+          work: ReasonCode.CONFLICT,
+          probe: ReasonCode.CONFLICT,
+          resume: ReasonCode.CONFLICT,
+          noTicket: ReasonCode.CONFLICT,
+          readyMode: "PENDING",
+          probeRun: ReasonCode.CONFLICT,
+          attestRun: ReasonCode.CONFLICT,
+          replayRun: ReasonCode.CONFLICT,
+          calls: 0,
+        });
+        // The misuse took nothing from the spawn: it bound driven, and its own attestation still stands.
+        expect(cp.outbox.drivenModeOf(bound.value.sessionId)).toBe("DRIVEN");
+        expect(cp.sessionRuntime.wake(bound.value.roleKey, [{ id: "after-the-misuse", kind: "test" }]).allowed).toBe(true);
+      });
+    });
+
+    it("refuses another session's use of the exception, for each field of the ticket", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { binding } = await drivenPrimary(f, "pending-spawned");
+        registerBareProject(f, "pending-other");
+        const other = cp.sessions.create({ provider: "claude", model: "opus" });
+        cp.audit.record({
+          kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+          projectId: "pending-other",
+          roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: "pending-other" }),
+          sessionId: other.sessionId,
+          evidence: { creationGeneration: 1 },
+        });
+        expect(cp.outbox.drivenModeOf(other.sessionId)).toBe("PENDING");
+        expect(cp.sessionRuntime.adopt(other.sessionId, Role.PRIMARY_CTO, other.sessionSecret!, other.credentialEpoch).allowed).toBe(true);
+        const exact = ticketOf(f, other.sessionId);
+        const spawned = cp.sessions.require(binding.sessionId);
+        const before = f.claude.turns.length;
+        for (const ticket of [
+          null,
+          { ...exact, incarnation: spawned.incarnation },
+          { ...exact, credentialEpoch: exact.credentialEpoch + 1 },
+          { ...exact, creationGeneration: 2 },
+        ]) {
+          expect(await cp.sessionRuntime.attest(other.sessionId, "new", ticket)).toMatchObject({
+            allowed: false,
+            reasonCode: ReasonCode.CONFLICT,
+          });
+        }
+        expect(await cp.sessionRuntime.probe(other.sessionId)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+        expect(f.claude.turns.length).toBe(before);
+        // The one ticket that matches every field is the only one the exception would take.
+        expect(cp.sessionRuntime.turnEligibility(other.sessionId, "attestation", "new", exact).allowed).toBe(true);
       });
     });
   });

@@ -19,7 +19,12 @@ import {
   isAdoptedCanonicalRuntime,
   peerMessageCarrySuccessionOf,
 } from "../registry/canonical-self-claim.ts";
-import { type DrivenMode, drivenModeOf, drivenModeSql } from "../runtime/provisioned-session-runtime.ts";
+import {
+  type DrivenMode,
+  drivenCreationGenerationOf,
+  drivenModeOf,
+  drivenModeSql,
+} from "../runtime/provisioned-session-runtime.ts";
 import {
   type FencedEnvelope,
   HOLDER_CLAIMED_KINDS,
@@ -1299,6 +1304,11 @@ export class Outbox {
    */
   drivenModeOf(sessionId: string): DrivenMode {
     return drivenModeOf(this.db, sessionId);
+  }
+
+  /** #246 C4 — the creation generation a session's one driven-spawn record names (`drivenCreationGenerationOf`). */
+  drivenCreationGenerationOf(sessionId: string): number | null {
+    return drivenCreationGenerationOf(this.db, sessionId);
   }
 
   /** In-band, in `claimDeliverable`'s terms: an in-band kind addressed to a canonical or provisioned runtime. */
