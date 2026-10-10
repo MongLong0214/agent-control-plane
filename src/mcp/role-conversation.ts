@@ -138,8 +138,17 @@ export interface OwnerMessageProvenance {
   channel: string;
   /** The Buzz room (`h` tag) from the stored signed payload's `conversation`. */
   room: string | null;
-  /** The sender admission authenticated, from the source row's `actor`, on the Buzz channel only. */
-  senderKey: string | null;
+  /**
+   * The signer's key as the digest-covered stored payload records it. Admission does not put the
+   * signer in that payload today, so this is `null`: unknown, not unsigned.
+   */
+  senderKey: null;
+  /**
+   * The source row's `actor` column as stored. **Unverified**: the column is written by admission
+   * from the authenticated envelope but is not covered by the payload digest the claim checks, and a
+   * raw edit of it shows here. Never a basis for owner judgement, approval or authority.
+   */
+  storedActorUnverified: string | null;
   /** The original Buzz event id, from the source row's nonce. */
   eventId: string | null;
   /**

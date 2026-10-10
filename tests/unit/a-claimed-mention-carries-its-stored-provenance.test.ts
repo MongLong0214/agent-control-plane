@@ -136,7 +136,8 @@ describe("a claimed mention's provenance", () => {
       expect(claimed?.provenance).toEqual({
         channel: "buzz",
         room: ROOM,
-        senderKey: f.owner.pubkey,
+        senderKey: null,
+        storedActorUnverified: f.owner.pubkey,
         eventId: forged.id,
         replyToEventId: null,
       });
@@ -161,10 +162,10 @@ describe("a claimed mention's provenance", () => {
       await f.relay.drain(f.subscriber);
 
       const first = f.claim()!;
-      expect(first.provenance).toMatchObject({ senderKey: f.owner.pubkey, eventId: fromFirst.id, room: ROOM });
+      expect(first.provenance).toMatchObject({ storedActorUnverified: f.owner.pubkey, eventId: fromFirst.id, room: ROOM });
       f.complete(first.messageId);
       const second = f.claim()!;
-      expect(second.provenance).toMatchObject({ senderKey: f.secondOwner.pubkey, eventId: fromSecond.id, room: ROOM });
+      expect(second.provenance).toMatchObject({ storedActorUnverified: f.secondOwner.pubkey, eventId: fromSecond.id, room: ROOM });
     } finally {
       await f.close();
     }
@@ -195,10 +196,34 @@ describe("a claimed mention's provenance", () => {
       expect(claimed?.provenance).toEqual({
         channel: "buzz",
         room: null,
-        senderKey: f.owner.pubkey,
+        senderKey: null,
+        storedActorUnverified: f.owner.pubkey,
         eventId: null,
         replyToEventId: null,
       });
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("never reports a raw edit of the stored actor as a verified sender", async () => {
+    const f = await start();
+    try {
+      f.h.clock.advance(1_000);
+      const event = f.mention(f.owner, "the actor column is about to be rewritten");
+      f.relay.publish(event);
+      await f.relay.drain(f.subscriber);
+      // A raw writer rewrites the source row's actor: the column carries no trigger and no digest.
+      f.h.cp.db.run(`UPDATE inbound_messages SET actor = ? WHERE channel = 'buzz' AND nonce = ?`, [
+        f.secondOwner.pubkey,
+        `buzz-message:${event.id}`,
+      ]);
+
+      const claimed = f.claim();
+      expect(claimed?.provenance.senderKey).toBeNull();
+      // The rewritten value is visible, and only under the field that says it is unverified.
+      expect(claimed?.provenance.storedActorUnverified).toBe(f.secondOwner.pubkey);
+      expect(claimed?.principal).toBe("owner");
     } finally {
       await f.close();
     }

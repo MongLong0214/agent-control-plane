@@ -4030,8 +4030,9 @@ export const deliverAsCeoTurn = async (
  */
 /**
  * A claimed message's provenance, from its own stored source row: the digest-checked payload's
- * room, the row's authenticated actor and the row's nonce. Buzz fields are read on the Buzz channel
- * only, and anything absent or unreadable is `null` rather than inferred.
+ * room and the row's nonce, with the row's `actor` beside them labelled unverified because no digest
+ * covers it. Buzz fields are read on the Buzz channel only, and anything absent or unreadable is
+ * `null` rather than inferred.
  */
 export const ownerMessageProvenanceOf = (
   channel: string,
@@ -4048,7 +4049,9 @@ export const ownerMessageProvenanceOf = (
   return {
     channel,
     room: buzz && typeof conversation === "string" && conversation.length > 0 ? conversation : null,
-    senderKey: buzz && actor.length > 0 ? actor : null,
+    // The digest-covered payload carries no signer, so there is no verified sender to report.
+    senderKey: null,
+    storedActorUnverified: actor.length > 0 ? actor : null,
     eventId: buzz && eventId.length > 0 ? eventId : null,
     replyToEventId: null,
   };
