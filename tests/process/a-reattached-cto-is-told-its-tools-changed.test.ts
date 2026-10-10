@@ -1,16 +1,17 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
-import { createServer, type Server, type Socket } from "node:net";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 
-import { Server as McpProtocolServer } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ATTACH_EXIT, runAttachRelay, type ReattachPolicy, type SessionMessaging } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startLocalMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
-import { WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { Role, SessionLifecycle } from "../../src/domain/types.ts";
+import { RoleConversationPort, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { count } from "../helpers/adopted-ceo.ts";
 import {
   canonicalCtoFixture,
@@ -22,6 +23,7 @@ import {
 } from "../helpers/canonical-cto-reattach.ts";
 import { doorTap } from "../helpers/door-tap.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { fixtureManifest } from "../helpers/harness.ts";
 import {
   LIST_CHANGED,
   recordingMcpClient,
@@ -32,15 +34,17 @@ import {
 
 /**
  * A canonical CTO's relay carries its client across a daemon restart by replaying `initialize`,
- * `notifications/initialized` and the last wake registration on the new connection, and only then
- * stops answering the client's requests with "reattaching" (src/cli/attach-relay.ts `restore`). The
- * client never asks for the tool list again on its own, so a restart onto a build with other tools
- * leaves it holding the old list. The daemon now tells it `notifications/tools/list_changed`, and
- * these cases measure that the client can act on it: the client here records every notification
- * and sends `tools/list` the moment it reads one.
+ * `notifications/initialized` and the last wake registration on a new connection through the
+ * reattach door, and only then stops answering the client's requests with "reattaching"
+ * (src/cli/attach-relay.ts `restore`). The client never asks for the tool list again on its own, so
+ * a restart onto a build with other tools leaves it holding the old list. The daemon tells it
+ * `notifications/tools/list_changed`: every connection at `initialized`, whatever ids it uses, and
+ * a connection the reattach door admitted again after each wake registration is answered.
  *
- * What this measures is the recording client. Whether Claude Code itself re-lists on the
- * notification is a separate question this file does not answer.
+ * The client here records every notification and sends `tools/list` the moment it reads one. What
+ * these cases measure is that client, the real relay and the real daemon listeners. Whether Claude
+ * Code itself re-lists on the notification, or keeps working after a refresh the relay refused,
+ * is a separate question this file does not answer.
  *
  * The daemon is the real listener pair and reattach door, closed and opened again on one state
  * directory the way a restart does. The relay is the real one: in this process (where the kernel
@@ -235,183 +239,48 @@ const servesTheList = (answer: RecordedWire): void => {
   expect(toolNames(answer)).toContain("role_owner_message_claim");
 };
 
-describe("W1: a fresh connection is told its tool list changed once it is initialized", () => {
-  for (const proxied of [false, true]) {
-    it(`and a tools/list sent on receipt is answered (${proxied ? "with" : "without"} a wake proxy)`, async () => {
-      const f = await started();
-      const r = inProcessRelay(f, proxied ? f.messaging : undefined);
-      expect((await r.client.initialize(qualified)).error).toBeUndefined();
-      servesTheList(await refreshed(r.client, 1));
-      await pause(200);
-      expect(r.client.listChanged()).toHaveLength(1);
-      await r.finish();
-    });
-  }
-});
 
-describe("W2: a reattach that re-registers its wake endpoint", () => {
-  it("tells the client after the re-registration, and a tools/list sent on receipt is answered, not refused", async () => {
-    // The live setup: the relay's wake proxy listens, so the relay re-registers it before going live.
-    const f = await started();
-    const r = inProcessRelay(f, f.messaging);
-    expect((await r.client.initialize(qualified)).error).toBeUndefined();
-    await refreshed(r.client, 1);
-    expect(await until(() => f.endpoint() !== null)).toBe(true);
-    const before = tuple(f);
+/** Waits until exactly `n` list_changed have arrived and each tools/list they prompted is answered. */
+const settled = async (client: RecordingMcpClient, n: number, budgetMs = 10_000): Promise<void> => {
+  expect(await until(() => client.listChanged().length >= n && client.refreshes.length >= n, budgetMs)).toBe(true);
+  await pause(250);
+  expect(client.listChanged()).toHaveLength(n);
+  expect(client.refreshes).toHaveLength(n);
+};
 
-    await f.restart();
-    const answer = await refreshed(r.client, 2);
-    expect(answer.error?.code).not.toBe(RELAY_REATTACHING_ERROR_CODE);
-    servesTheList(answer);
-    expect(f.endpoint()).not.toBeNull();
-    await pause(200);
-    // One for the fresh connection and one for the reattach: nothing early to be refused.
-    expect(r.client.listChanged()).toHaveLength(2);
-    expect([answerTo(r.client, 1)?.error, answerTo(r.client, 2)?.error]).toEqual([undefined, undefined]);
-    expect(tuple(f)).toEqual(before);
-    expect(before.sessionCount).toBe(1);
-    expect(before.claims).toBe(0);
-    await r.finish();
+const wakeRegistration = (endpoint: string) => ({ name: "role_wake_endpoint_register", arguments: { endpoint } });
+
+/**
+ * A client on the reattach door itself, not a relay: the door admits it because this process runs
+ * under the stated claude, exactly as it admits an in-process relay.
+ */
+const reattachDoorClient = (f: Started) => {
+  const socket = createConnection(f.paths.reattachPath);
+  socket.on("error", () => undefined);
+  closers.push(async () => {
+    socket.destroy();
   });
+  return recordingMcpClient({ stdin: socket, stdout: socket });
+};
 
-  it("after a refused re-registration, refreshes the list and records no wake endpoint", async () => {
-    const f = await started();
-    const r = inProcessRelay(f, f.messaging);
-    expect((await r.client.initialize(qualified)).error).toBeUndefined();
-    await refreshed(r.client, 1);
-    // The client's own registration, which the relay keeps and replays in place of its proxy's.
-    const registered = await r.client.request("tools/call", {
-      name: "role_wake_endpoint_register",
-      arguments: { endpoint: f.wakeEndpoint },
-    });
-    expect(registered.result?.structuredContent).toMatchObject({ ok: true });
-    const before = tuple(f);
-
-    // The endpoint is gone when the daemon returns, so the replayed registration is refused.
-    await f.closeWake();
-    await f.restart();
-    servesTheList(await refreshed(r.client, 2));
-    expect(r.err()).toContain("attach: wake re-registration refused");
-    // The refresh is not a wake: the restarted daemon holds no endpoint for the role.
-    expect(f.endpoint()).toBeNull();
-    await pause(200);
-    expect(r.client.listChanged()).toHaveLength(2);
-    expect(tuple(f)).toEqual(before);
-    await r.finish();
+/** A PRIMARY_CTO of another project on `cto.mcp.sock`, admitted by its session secret. */
+const secretDoorClient = async (f: Started) => {
+  const { h } = f.subject;
+  const projectId = "secret-door-project";
+  const manifest = fixtureManifest(projectId);
+  expect(h.cp.projects.register({ projectId, name: "fixture", manifest, authorization: h.cp.manifestAuthorizationForTests(manifest) }).allowed).toBe(true);
+  const session = h.cp.sessions.create({ provider: "scripted", model: "secret-door-peer" });
+  expect(h.cp.sessions.transition(session.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+  expect(h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId, sessionId: session.sessionId }).allowed).toBe(true);
+  const socket = createConnection(f.paths.ctoPath);
+  socket.on("error", () => undefined);
+  closers.push(async () => {
+    socket.destroy();
   });
-
-  it("with no proxy, the client's own registration replayed: the last notification follows it and is served", async () => {
-    // A relay with no proxy replays the client's own bytes, so the daemon cannot tell this replay
-    // from a fresh connection at `initialized`; it tells the client then, and again once the
-    // relay's re-registration is answered.
-    const f = await started();
-    const r = inProcessRelay(f);
-    expect((await r.client.initialize(qualified)).error).toBeUndefined();
-    await refreshed(r.client, 1);
-    const registered = await r.client.request("tools/call", {
-      name: "role_wake_endpoint_register",
-      arguments: { endpoint: f.wakeEndpoint },
-    });
-    expect(registered.result?.structuredContent).toMatchObject({ ok: true });
-    const before = tuple(f);
-
-    await f.restart();
-    servesTheList(await refreshed(r.client, 3));
-    expect(f.endpoint()).toBe(f.wakeEndpoint);
-    await pause(200);
-    expect(r.client.listChanged()).toHaveLength(3);
-    expect(tuple(f)).toEqual(before);
-    await r.finish();
-  });
-});
-
-describe("W3: a reattach with no wake registration", () => {
-  it("tells the client once the replay is in, and a tools/list sent on receipt is answered", async () => {
-    const f = await started();
-    const r = inProcessRelay(f);
-    expect((await r.client.initialize(qualified)).error).toBeUndefined();
-    await refreshed(r.client, 1);
-    const before = tuple(f);
-
-    await f.restart();
-    servesTheList(await refreshed(r.client, 2));
-    expect(f.endpoint()).toBeNull();
-    await pause(200);
-    expect(r.client.listChanged()).toHaveLength(2);
-    expect(tuple(f)).toEqual(before);
-    await r.finish();
-  });
-});
-
-describe("W4: on the door socket", () => {
-  it("list_changed leaves after the answer to the replayed wake registration, and only then", async () => {
-    const f = await started({ tap: true });
-    const r = inProcessRelay(f, f.messaging);
-    expect((await r.client.initialize(qualified)).error).toBeUndefined();
-    await refreshed(r.client, 1);
-    expect(await until(() => f.endpoint() !== null)).toBe(true);
-
-    await f.restart();
-    await refreshed(r.client, 2);
-    const tap = f.tap!;
-    const reattached = tap.connections() - 1;
-    expect(reattached).toBeGreaterThan(0);
-    const lines = tap.of(reattached);
-    const sent = lines.filter((line) => line.direction === "toDaemon").map((line) => line.message);
-    // The relay's replay, in order: initialize, initialized, the wake registration.
-    expect(sent.slice(0, 3).map((message) => message["method"])).toEqual([
-      "initialize",
-      "notifications/initialized",
-      "tools/call",
-    ]);
-    const wakeId = sent[2]!["id"];
-    expect((sent[2]!["params"] as { name?: string }).name).toBe("role_wake_endpoint_register");
-    const answered = lines.findIndex((line) => line.direction === "fromDaemon" && line.message["id"] === wakeId);
-    const told = lines.flatMap((line, index) =>
-      line.direction === "fromDaemon" && line.message["method"] === LIST_CHANGED ? [index] : []);
-    expect(answered).toBeGreaterThan(-1);
-    expect(told).toHaveLength(1);
-    expect(told[0]).toBeGreaterThan(answered);
-    await r.finish();
-  });
-
-  it("on a fresh connection, list_changed leaves after initialized", async () => {
-    const f = await started({ tap: true });
-    const r = inProcessRelay(f);
-    expect((await r.client.initialize(qualified)).error).toBeUndefined();
-    await refreshed(r.client, 1);
-    const lines = f.tap!.of(0);
-    const initialized = lines.findIndex((line) => line.message["method"] === "notifications/initialized");
-    const told = lines.findIndex((line) => line.message["method"] === LIST_CHANGED);
-    expect(initialized).toBeGreaterThan(-1);
-    expect(told).toBeGreaterThan(initialized);
-    await r.finish();
-  });
-});
-
-describe("a notification that cannot be sent", () => {
-  it("is written to stderr, reaches no client, and the connection serves on", async () => {
-    const f = await started();
-    vi.spyOn(McpProtocolServer.prototype, "sendToolListChanged").mockRejectedValue(new Error("fixture: send failed"));
-    const diagnostics: string[] = [];
-    const write = process.stderr.write.bind(process.stderr);
-    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array, ...rest: never[]) => {
-      if (typeof chunk === "string" && chunk.startsWith("cto tool list")) {
-        diagnostics.push(chunk);
-        return true;
-      }
-      return write(chunk, ...rest);
-    }) as typeof process.stderr.write);
-    const r = inProcessRelay(f, f.messaging);
-    expect((await r.client.initialize(qualified)).error).toBeUndefined();
-    expect(await until(() => diagnostics.length === 1)).toBe(true);
-    expect(diagnostics).toEqual(["cto tool list change notification not sent\n"]);
-    // The line names no session, connection or error text.
-    servesTheList(await r.client.request("tools/list", {}));
-    expect(r.client.listChanged()).toEqual([]);
-    await r.finish();
-  });
-});
+  await new Promise<void>((resolve) => socket.once("connect", () => resolve()));
+  socket.write(`${JSON.stringify({ token: TOKEN, sessionId: session.sessionId, sessionSecret: session.sessionSecret })}\n`);
+  return recordingMcpClient({ stdin: socket, stdout: socket });
+};
 
 /**
  * The relay as the process Claude Code spawns, from this tree and from any other tree named in
@@ -475,29 +344,373 @@ const processRelay = (f: Started, root: string, messaging: boolean) => {
   };
 };
 
+/** Holds every wake registration the daemon answers until `release`, and says when one arrived. */
+const withholdRegistrations = () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const held = { entered: false, release: () => release() };
+  const original = RoleConversationPort.prototype.registerEndpoint;
+  vi.spyOn(RoleConversationPort.prototype, "registerEndpoint").mockImplementation(async function (
+    this: RoleConversationPort,
+    server,
+    endpoint,
+  ) {
+    held.entered = true;
+    await gate;
+    return original.call(this, server, endpoint);
+  });
+  return held;
+};
+
+describe("every connection is told at initialized, whatever ids it uses", () => {
+  it("W1: a fresh relay connection with no wake proxy, once, and the tools/list sent on receipt is answered", async () => {
+    const f = await started();
+    const r = inProcessRelay(f);
+    expect((await r.client.initialize(qualified)).error).toBeUndefined();
+    servesTheList(await refreshed(r.client, 1));
+    await settled(r.client, 1);
+    await r.finish();
+  });
+
+  it("W1: a fresh relay connection with a wake proxy, at initialized and after the proxy's registration is answered", async () => {
+    const f = await started();
+    const r = inProcessRelay(f, f.messaging);
+    expect((await r.client.initialize(qualified)).error).toBeUndefined();
+    servesTheList(await refreshed(r.client, 1));
+    servesTheList(await refreshed(r.client, 2));
+    expect(f.endpoint()).not.toBeNull();
+    await settled(r.client, 2);
+    await r.finish();
+  });
+
+  it("a legal client whose initialize id is the relay's reinitialize shape is told, fresh and after a restart", async () => {
+    // Review 1078-N1-01: deciding a replay by this id shape rather than by the door that admitted
+    // the connection let a client that never registers a wake go without any notification.
+    const f = await started();
+    const r = inProcessRelay(f);
+    expect((await r.client.initialize(qualified, "acp-relay-reinitialize-client-choice")).error).toBeUndefined();
+    servesTheList(await refreshed(r.client, 1));
+    await settled(r.client, 1);
+    const before = tuple(f);
+
+    await f.restart();
+    servesTheList(await refreshed(r.client, 2));
+    await settled(r.client, 2);
+    expect(tuple(f)).toEqual(before);
+    await r.finish();
+  });
+
+  it("on the session-secret door, relay-shaped ids neither withhold a notification nor add one, and grant nothing", async () => {
+    const f = await started();
+    const client = await secretDoorClient(f);
+    const before = tuple(f);
+    expect((await client.initialize(qualified, "acp-relay-reinitialize-spoof")).error).toBeUndefined();
+    servesTheList(await refreshed(client, 1));
+    for (const id of ["acp-relay-rewake-spoof", "acp-relay-wake-proxy-spoof"]) {
+      const refused = await client.request("tools/call", wakeRegistration(join(f.dir, "missing.sock")), id);
+      expect(refused.result?.structuredContent).toMatchObject({ ok: false });
+    }
+    await settled(client, 1);
+    expect(f.endpoint()).toBeNull();
+    expect(tuple(f)).toEqual(before);
+    expect(before.claims).toBe(0);
+  });
+
+  it("on the reattach door, a notification follows each registration's answer whatever its id, and grants nothing", async () => {
+    const f = await started();
+    const before = tuple(f);
+    const client = reattachDoorClient(f);
+    expect((await client.initialize(qualified, "acp-relay-reinitialize-spoof")).error).toBeUndefined();
+    servesTheList(await refreshed(client, 1));
+    const ids: Array<string | number> = ["acp-relay-rewake-spoof", 41];
+    for (const [index, id] of ids.entries()) {
+      const refused = await client.request("tools/call", wakeRegistration(join(f.dir, "missing.sock")), id);
+      expect(refused.result?.structuredContent).toMatchObject({ ok: false });
+      servesTheList(await refreshed(client, index + 2));
+    }
+    await settled(client, 3);
+    // A refused registration's notification is a refresh, not a wake: the role has no endpoint.
+    expect(f.endpoint()).toBeNull();
+    expect(tuple(f)).toEqual(before);
+    expect(before.claims).toBe(0);
+  });
+});
+
+describe("W2: a reattach that re-registers its wake endpoint", () => {
+  it("the live setup (wake proxy): the notification after the re-registration's answer is answered, not refused", async () => {
+    const f = await started();
+    const r = inProcessRelay(f, f.messaging);
+    expect((await r.client.initialize(qualified)).error).toBeUndefined();
+    await refreshed(r.client, 2);
+    expect(f.endpoint()).not.toBeNull();
+    await settled(r.client, 2);
+    const before = tuple(f);
+
+    await f.restart();
+    // At initialized, then after the replayed registration's answer; the first may meet a relay
+    // still replaying (the withheld-registration controls below make that deterministic).
+    const last = await refreshed(r.client, 4);
+    expect(last.error?.code).not.toBe(RELAY_REATTACHING_ERROR_CODE);
+    servesTheList(last);
+    expect(f.endpoint()).not.toBeNull();
+    await settled(r.client, 4);
+    expect(tuple(f)).toEqual(before);
+    expect(before.sessionCount).toBe(1);
+    expect(before.claims).toBe(0);
+    await r.finish();
+  });
+
+  it("after a refused re-registration, refreshes the list and records no wake endpoint", async () => {
+    const f = await started();
+    const r = inProcessRelay(f, f.messaging);
+    expect((await r.client.initialize(qualified)).error).toBeUndefined();
+    await refreshed(r.client, 2);
+    // The client's own registration, which the relay keeps and replays in place of its proxy's.
+    const registered = await r.client.request("tools/call", wakeRegistration(f.wakeEndpoint));
+    expect(registered.result?.structuredContent).toMatchObject({ ok: true });
+    await settled(r.client, 3);
+    const before = tuple(f);
+
+    // The endpoint is gone when the daemon returns, so the replayed registration is refused.
+    await f.closeWake();
+    await f.restart();
+    servesTheList(await refreshed(r.client, 5));
+    expect(r.err()).toContain("attach: wake re-registration refused");
+    // The refresh is not a wake: the restarted daemon holds no endpoint for the role.
+    expect(f.endpoint()).toBeNull();
+    await settled(r.client, 5);
+    expect(tuple(f)).toEqual(before);
+    await r.finish();
+  });
+
+  it("with no proxy, the client's own registration replayed: the notification after its answer is served", async () => {
+    const f = await started();
+    const r = inProcessRelay(f);
+    expect((await r.client.initialize(qualified)).error).toBeUndefined();
+    await refreshed(r.client, 1);
+    const registered = await r.client.request("tools/call", wakeRegistration(f.wakeEndpoint));
+    expect(registered.result?.structuredContent).toMatchObject({ ok: true });
+    await settled(r.client, 2);
+    const before = tuple(f);
+
+    await f.restart();
+    servesTheList(await refreshed(r.client, 4));
+    expect(f.endpoint()).toBe(f.wakeEndpoint);
+    await settled(r.client, 4);
+    expect(tuple(f)).toEqual(before);
+    await r.finish();
+  });
+});
+
+describe("W3: a reattach with no wake registration", () => {
+  it("is told once the replay is in, and a tools/list sent on receipt is answered", async () => {
+    const f = await started();
+    const r = inProcessRelay(f);
+    expect((await r.client.initialize(qualified)).error).toBeUndefined();
+    await settled(r.client, 1);
+    const before = tuple(f);
+
+    await f.restart();
+    servesTheList(await refreshed(r.client, 2));
+    expect(f.endpoint()).toBeNull();
+    await settled(r.client, 2);
+    expect(tuple(f)).toEqual(before);
+    await r.finish();
+  });
+});
+
+describe("W4: on the door socket", () => {
+  it("on a reattach, one list_changed follows initialized and the last follows the replayed registration's answer", async () => {
+    const f = await started({ tap: true });
+    const r = inProcessRelay(f, f.messaging);
+    expect((await r.client.initialize(qualified)).error).toBeUndefined();
+    await refreshed(r.client, 2);
+    expect(f.endpoint()).not.toBeNull();
+
+    await f.restart();
+    await refreshed(r.client, 4);
+    await settled(r.client, 4);
+    const tap = f.tap!;
+    const reattached = tap.connections() - 1;
+    expect(reattached).toBeGreaterThan(0);
+    const lines = tap.of(reattached);
+    const sent = lines.filter((line) => line.direction === "toDaemon").map((line) => line.message);
+    // The relay's replay, in order: initialize, initialized, the wake registration.
+    expect(sent.slice(0, 3).map((message) => message["method"])).toEqual([
+      "initialize",
+      "notifications/initialized",
+      "tools/call",
+    ]);
+    expect((sent[2]!["params"] as { name?: string }).name).toBe("role_wake_endpoint_register");
+    const wakeId = sent[2]!["id"];
+    const initialized = lines.findIndex((line) => line.direction === "toDaemon" && line.message["method"] === "notifications/initialized");
+    const answered = lines.findIndex((line) => line.direction === "fromDaemon" && line.message["id"] === wakeId);
+    const told = lines.flatMap((line, index) =>
+      line.direction === "fromDaemon" && line.message["method"] === LIST_CHANGED ? [index] : []);
+    expect(answered).toBeGreaterThan(-1);
+    expect(told).toHaveLength(2);
+    expect(told[0]).toBeGreaterThan(initialized);
+    expect(told[1]).toBeGreaterThan(answered);
+    await r.finish();
+  });
+
+  it("on a fresh connection, list_changed leaves after initialized", async () => {
+    const f = await started({ tap: true });
+    const r = inProcessRelay(f);
+    expect((await r.client.initialize(qualified)).error).toBeUndefined();
+    await settled(r.client, 1);
+    const lines = f.tap!.of(0);
+    const initialized = lines.findIndex((line) => line.message["method"] === "notifications/initialized");
+    const told = lines.findIndex((line) => line.message["method"] === LIST_CHANGED);
+    expect(initialized).toBeGreaterThan(-1);
+    expect(told).toBeGreaterThan(initialized);
+    await r.finish();
+  });
+});
+
+describe("a notification that cannot be sent", () => {
+  it("is written to stderr, reaches no client, and the connection goes on answering", async () => {
+    const f = await started();
+    let rejectedSends = 0;
+    const connect = McpServer.prototype.connect;
+    vi.spyOn(McpServer.prototype, "connect").mockImplementation(async function (this: McpServer, transport) {
+      const send = transport.send.bind(transport);
+      transport.send = async (message, options) => {
+        if ("method" in message && message.method === LIST_CHANGED) {
+          rejectedSends += 1;
+          throw new Error("fixture: the transport refused this send");
+        }
+        return send(message, options);
+      };
+      return connect.call(this, transport);
+    });
+    const diagnostics: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array, ...rest: never[]) => {
+      if (typeof chunk === "string" && chunk.startsWith("cto tool list")) {
+        diagnostics.push(chunk);
+        return true;
+      }
+      return write(chunk, ...rest);
+    }) as typeof process.stderr.write);
+    const r = inProcessRelay(f);
+    expect((await r.client.initialize(qualified)).error).toBeUndefined();
+    expect(await until(() => diagnostics.length === 1)).toBe(true);
+    // The line names no session, connection or error text.
+    expect(diagnostics).toEqual(["cto tool list change notification not sent\n"]);
+    expect((await r.client.request("acp/no-such-method", {})).error?.code).toBe(-32601);
+    expect((await r.client.request("tools/call", {})).error).toBeDefined();
+    servesTheList(await r.client.request("tools/list", {}));
+    expect(rejectedSends).toBe(1);
+    expect(r.client.listChanged()).toEqual([]);
+    await r.finish();
+  });
+});
+
 describe("the relay as a process, across a restart", () => {
   for (const { name, root } of relayRoots) {
     for (const proxied of [true, false]) {
-      it(`${name}: told on the fresh connection and again after the reattach, each answered (${proxied ? "W2, wake proxy" : "W3, no registration"})`, async () => {
+      it(`${name}: the last notification after the reattach is answered (${proxied ? "W2, wake proxy" : "W3, no registration"})`, async () => {
         const f = await started();
         const r = processRelay(f, root, proxied);
         const init = await r.client.initialize(qualified);
         expect(init.error, r.err()).toBeUndefined();
-        servesTheList(await refreshed(r.client, 1));
+        const fresh = proxied ? 2 : 1;
+        servesTheList(await refreshed(r.client, fresh));
         if (proxied) expect(await until(() => f.endpoint() !== null)).toBe(true);
+        await settled(r.client, fresh);
         const before = tuple(f);
 
         await f.restart();
-        const answer = await refreshed(r.client, 2, 30_000);
-        expect(answer.error?.code).not.toBe(RELAY_REATTACHING_ERROR_CODE);
-        servesTheList(answer);
+        const last = await refreshed(r.client, fresh * 2, 30_000);
+        expect(last.error?.code).not.toBe(RELAY_REATTACHING_ERROR_CODE);
+        servesTheList(last);
         expect(f.endpoint() !== null).toBe(proxied);
-        await pause(300);
-        expect(r.client.listChanged()).toHaveLength(2);
+        await settled(r.client, fresh * 2);
         expect(tuple(f)).toEqual(before);
         expect(before.claims).toBe(0);
         await r.finish();
       }, 60_000);
     }
+  }
+});
+
+/**
+ * Controls that hold the daemon's answer to the replayed registration until the relay's state has
+ * been measured. While it is held the relay is still replaying, so a refresh sent then is refused;
+ * the one that is served is the one after the answer.
+ */
+describe("withheld registration answers", () => {
+  for (const { name, root } of relayRoots) {
+    it(`${name}: a proxied replay's served notification is the one after the held registration is answered`, async () => {
+      const f = await started();
+      const r = processRelay(f, root, true);
+      expect((await r.client.initialize(qualified)).error).toBeUndefined();
+      await refreshed(r.client, 2);
+      expect(await until(() => f.endpoint() !== null)).toBe(true);
+      await settled(r.client, 2);
+      const before = tuple(f);
+      const held = withholdRegistrations();
+      try {
+        await f.restart();
+        expect(await until(() => held.entered)).toBe(true);
+        expect((await r.client.request("tools/list", {})).error?.code).toBe(RELAY_REATTACHING_ERROR_CODE);
+        expect((await refreshed(r.client, 3)).error?.code).toBe(RELAY_REATTACHING_ERROR_CODE);
+        await pause(250);
+        expect(r.client.listChanged()).toHaveLength(3);
+        held.release();
+        servesTheList(await refreshed(r.client, 4));
+        await settled(r.client, 4);
+        expect(tuple(f)).toEqual(before);
+        await r.finish();
+      } finally {
+        held.release();
+      }
+    }, 60_000);
+
+    it(`${name}: no proxy, the client's own registration held: an early refused refresh, then a served one`, async () => {
+      const f = await started();
+      const r = processRelay(f, root, false);
+      expect((await r.client.initialize(qualified)).error).toBeUndefined();
+      await refreshed(r.client, 1);
+      expect((await r.client.request("tools/call", wakeRegistration(f.wakeEndpoint))).result?.structuredContent)
+        .toMatchObject({ ok: true });
+      await settled(r.client, 2);
+      const before = tuple(f);
+      const held = withholdRegistrations();
+      try {
+        await f.restart();
+        expect((await refreshed(r.client, 3)).error?.code).toBe(RELAY_REATTACHING_ERROR_CODE);
+        held.release();
+        servesTheList(await refreshed(r.client, 4));
+        await settled(r.client, 4);
+        expect(tuple(f)).toEqual(before);
+        await r.finish();
+      } finally {
+        held.release();
+      }
+    }, 60_000);
+
+    it(`${name}: a refused re-registration is followed by a served refresh, with no wake endpoint and no claim`, async () => {
+      const f = await started();
+      const r = processRelay(f, root, true);
+      expect((await r.client.initialize(qualified)).error).toBeUndefined();
+      await refreshed(r.client, 2);
+      expect((await r.client.request("tools/call", wakeRegistration(f.wakeEndpoint))).result?.structuredContent)
+        .toMatchObject({ ok: true });
+      await settled(r.client, 3);
+      const before = tuple(f);
+      await f.closeWake();
+      await f.restart();
+      servesTheList(await refreshed(r.client, 5, 30_000));
+      expect(r.err()).toContain("attach: wake re-registration refused");
+      expect(f.endpoint()).toBeNull();
+      await settled(r.client, 5);
+      expect(tuple(f)).toEqual(before);
+      expect(before.claims).toBe(0);
+      await r.finish();
+    }, 60_000);
   }
 });
