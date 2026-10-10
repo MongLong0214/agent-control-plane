@@ -4,7 +4,7 @@ import { type Decision, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { wakeRoleHolder } from "../../src/daemon/agentcpd.ts";
-import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor, type RoleBinding } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD } from "../../src/runtime/provisioned-session-runtime.ts";
 import type { SessionHandle, SessionTurnRequest, SessionTurnResult } from "../../src/runtime/provider.ts";
@@ -557,6 +557,124 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         reasonCode: ReasonCode.SESSION_NOT_READY,
       });
       expect(workTurnsOf(f, binding.sessionId)).toBe(1);
+    });
+  });
+
+  describe("the bind re-checks the spawn record against the binding it grants", () => {
+    /**
+     * Provisions a driven PRIMARY_CTO, and while its spawn waits on the session's readiness — after
+     * the spawn record named its creation generation and before the bind — runs `interpose`, which
+     * makes the role's generations move under it. Nothing is timed: readiness is the spawn's last
+     * await before the bind transaction.
+     */
+    const provisionAround = async (
+      f: BootstrapRuntimeFixture,
+      projectId: string,
+      interpose: (sessionId: string) => void,
+    ) => {
+      const cp = f.harness.cp;
+      cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+      await registerFixtureProject(f.harness, projectId);
+      const bootstrap = await f.dispatchBootstrap();
+      const readiness = cp.doctor.sessionReadiness.bind(cp.doctor);
+      vi.spyOn(cp.doctor, "sessionReadiness").mockImplementationOnce(async (sessionId: string) => {
+        interpose(sessionId);
+        return readiness(sessionId);
+      });
+      const startedBefore = f.claude.started.length;
+      const refused = await cp.cto.ensureDrivenPrimaryCto(projectId, bootstrap.runId);
+      const sessionId = cp.db.get<{ session_id: string }>(
+        `SELECT session_id FROM audit_events WHERE kind = ? AND project_id = ? ORDER BY event_id DESC LIMIT 1`,
+        [DRIVEN_PRIMARY_CTO_SPAWN_RECORD, projectId],
+      )!.session_id;
+      expect(f.claude.started.length).toBe(startedBefore + 1);
+      return { refused, sessionId, roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId }) };
+    };
+
+    /** Refused, rolled back, and nothing left that could run: no binding, custody, attestation or turn. */
+    const expectNothingUsable = (f: BootstrapRuntimeFixture, refused: Decision<RoleBinding>, sessionId: string, roleKey: string) => {
+      const cp = f.harness.cp;
+      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+      expect(cp.bindings.active(roleKey)).toBeNull();
+      expect(cp.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+        [roleKey],
+      )?.n).toBe(0);
+      expect(cp.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM assignments WHERE role_key = ? AND binding_generation = 2`,
+        [roleKey],
+      )?.n).toBe(0);
+      expect(cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+      expect(cp.sessionRuntime.holds(sessionId)).toBe(false);
+      expect(cp.sessionRuntime.drivesSession(sessionId, Role.PRIMARY_CTO)).toBe(false);
+      expect(cp.sessionRuntime.wake(roleKey, [{ id: "after-a-refused-bind", kind: "test" }])).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.SESSION_RUNTIME_UNAVAILABLE,
+      });
+      expect(workTurnsOf(f, sessionId)).toBe(0);
+    };
+
+    it("refuses when the generation the record names went to another session", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const other = cp.sessions.create({ provider: "scripted", model: "other-cto" });
+        cp.sessions.transition(other.sessionId, SessionLifecycle.READY, "fixture: another session");
+        const { refused, sessionId, roleKey } = await provisionAround(f, "generation-project", () => {
+          const taken = cp.bindings.bind({
+            roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: "generation-project" }),
+            role: Role.PRIMARY_CTO,
+            sessionId: other.sessionId,
+            projectId: "generation-project",
+            mode: "PREFERRED",
+          });
+          if (!taken.allowed) throw new Error(taken.message);
+          const revoked = cp.bindings.revoke(taken.value.roleKey, "fixture: generation 1 went elsewhere");
+          if (!revoked.allowed) throw new Error(revoked.message);
+        });
+        // The record names generation 1; generation 1 is the other session's, revoked.
+        expect(markersFor(f, sessionId)).toMatchObject([{ creation_generation: 1 }]);
+        expect(cp.db.get(
+          `SELECT session_id, status FROM assignments WHERE role_key = ? AND binding_generation = 1`,
+          [roleKey],
+        )).toEqual({ session_id: other.sessionId, status: "REVOKED" });
+        expectNothingUsable(f, refused, sessionId, roleKey);
+      });
+    });
+
+    it("refuses when the assignment the record names is its own but revoked, held by another actor", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        let creationActor: string | null = null;
+        const { refused, sessionId, roleKey } = await provisionAround(f, "actor-project", (spawned) => {
+          const own = cp.bindings.bind({
+            roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: "actor-project" }),
+            role: Role.PRIMARY_CTO,
+            sessionId: spawned,
+            projectId: "actor-project",
+            mode: "PREFERRED",
+          });
+          if (!own.allowed) throw new Error(own.message);
+          creationActor = cp.db.get<{ actor_id: string }>(
+            `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+            [own.value.assignmentId],
+          )!.actor_id;
+          const revoked = cp.bindings.revoke(own.value.roleKey, "fixture: the creation assignment is revoked");
+          if (!revoked.allowed) throw new Error(revoked.message);
+        });
+        // Session, project, role key and generation all match the record; the creation assignment
+        // is REVOKED, and the bind would have minted another actor at generation 2.
+        expect(markersFor(f, sessionId)).toMatchObject([{ project_id: "actor-project", role_key: roleKey, creation_generation: 1 }]);
+        expect(cp.db.get(
+          `SELECT session_id, actor_id, status FROM assignments WHERE role_key = ? AND binding_generation = 1`,
+          [roleKey],
+        )).toEqual({ session_id: sessionId, actor_id: creationActor, status: "REVOKED" });
+        // The rolled-back bind left no second actor behind on the session.
+        expect(cp.db.all<{ actor_id: string }>(
+          `SELECT actor_id FROM conversational_actors WHERE current_session_id = ?`,
+          [sessionId],
+        ).map((row) => row.actor_id)).toEqual([creationActor]);
+        expectNothingUsable(f, refused, sessionId, roleKey);
+      });
     });
   });
 });
