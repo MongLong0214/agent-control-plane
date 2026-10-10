@@ -41,6 +41,13 @@ const attemptGuard = new AsyncLocalStorage<BootstrapWriteGuard>();
 export const runUnderWriteGuard = <T>(guard: BootstrapWriteGuard, work: () => Promise<T>): Promise<T> =>
   attemptGuard.run(guard, work);
 
+/**
+ * #246 C5, review C5I-R1-02 — whether the caller runs in a bootstrap attempt's call chain. Inside one,
+ * the attempt consumes a withheld request's exemption before the request starts; outside one, nothing
+ * does unless the caller itself consumes it.
+ */
+export const withinBootstrapAttempt = (): boolean => attemptGuard.getStore() !== undefined;
+
 const ask = (request: BootstrapWriteRequest): void => {
   const guard = attemptGuard.getStore();
   if (guard === undefined) {
