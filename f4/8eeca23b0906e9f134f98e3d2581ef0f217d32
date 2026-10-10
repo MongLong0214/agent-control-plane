@@ -1,0 +1,330 @@
+Limit: a peer message's admission proof is immutable evidence that names the receiving CTO session and generation, so a same-conversation restart cannot rewrite it; the hand-over instead accepts one durable same-actor succession hop proven from assignments and the self-claim's DEAD_BINDING_RECOVERED record
+Warn: only the self-claim's same-actor dead-predecessor recovery holds and carries PENDING peer messages; every other revoke path (operator door, takeover, continuity, CEO) still rejects identity-bound rows, and OUTBOX_RETARGETED on a peer row now also marks a same-conversation carry
+Record-Id: r-peercarry
+Provenance: inherited db17a17058d40cda44dea88642f9b0c0f4a92d8c
+
+Limit: the repository treats raw database writers as in scope, so same-actor succession for a carried peer message is proven only by an append-only peer_message_carries record whose INSERT requires the connection-local carry authority minted inside the claim transaction; the OUTBOX_RETARGETED mark and audit actor strings are not evidence
+Limit: the carry follows the CEO decision of 2026-10-03 19:28Z: only an unclaimed PENDING message, never attempted, sent, claimed or receipted, for the same actor, conversation UUID and signer with DEAD_BINDING_RECOVERED continuity, carried once; already-REJECTED rows are never revived
+Warn: src/db/migrations.ts changed for v40, so its frozen pin must be confirmed by the CEO before the pin test is updated; deploying needs an approved v39 to v40 migration
+Record-Id: r-peercarryv40
+Follows: r-peercarry
+Provenance: inherited 7c750ff06c7c78eff174ea751e064e4850e4ef8f
+
+Limit: the v40 src/db/migrations.ts pin is the digest the CEO computed independently from GitHub for 7c750ff0 (sha256 885e15de..., blob ec13ae15...), approved for those exact bytes only; it is void if the source changes
+Warn: do not recompute this pin from the file in a later change; the next digest must again come from the independent authority
+Record-Id: r-pinv40confirm
+Follows: r-peercarryv40
+Provenance: inherited eb1ac4329b2a376c350050d8babba36cfa4555d3
+
+Limit: the carry record now binds the admitted source payload digest and the hand-over compares the admitted row's bytes against it, because the outbox pointer digest stays raw-writable (finding 01 is not addressed here; its scope is with the CEO)
+Warn: fences that reject an identity-bound peer message keep an existing settled receipt exactly as it was (keepSettled) and owe the sender a notice in peer_message_refusal_notices; the holder's own complete or reject still refuses a settled turn
+Warn: src/db/migrations.ts changed again, so the CEO-confirmed pin 885e15de is void; the new digest must be confirmed by the CEO before the pin test is updated
+Record-Id: r-peercarryv40r1
+Follows: r-pinv40confirm
+Provenance: inherited c706cb5d139ad1cb8d75161e556030df61f402ab
+
+Limit: raw SQL writers are inside this repository's threat model, so finding 01 is closed here rather than split off: a trigger records every outbox row that leaves PENDING in the append-only holder_message_departures ledger, and holder claim, retarget and carry refuse a departed message; a protected lifecycle ledger for the whole outbox is not built
+Ruled-out: dropping a departed row from claimForHolder's SELECT | it is reported as withheld instead, because the existing witness for a raw-reverted row expects withheld
+Warn: holder_message_departures is append-only and never pruned: it gains one row per outbox message of any kind that ever leaves PENDING
+Warn: outbox.message_id is now immutable (OUTBOX_MESSAGE_ID_IMMUTABLE); code that renames an outbox row will be refused
+Warn: a privileged writer can still DROP TRIGGER the departure trigger or the ledger guards, the residual every trigger in this schema carries
+Warn: src/db/migrations.ts changed again, so the frozen pin stays void until the CEO computes the final head's bytes independently
+Record-Id: r-peercarryv40r2
+Follows: r-peercarryv40r1
+Provenance: inherited c421f07eba44ea6ded6a550923d9260c82b1dd4c
+
+Limit: a WORKER turn is stateless: the runtime seatbelt denies the CLI's transcript writes under ~/.claude, so a later turn on the same session remembers nothing; one turn per task is the supported shape
+Ruled-out: an empty setting-source list for WORKER turns | it would also drop the repository's CLAUDE.md, so the self-grant path through .claude settings is closed by a runner rule instead
+Warn: WORKER turns run with --setting-sources project,local and a strict empty MCP config; only invocations carrying a managed write get these flags, so reviewer and read-only turns are unchanged
+Warn: a WORKER turn whose change touches any .claude path or the root .mcp.json fails out of scope and is not committed, even when the claim owns those paths; ignored files there are checked before and after the turn
+Warn: a retry never resets the worktree: every attempt must start from a clean worktree on the claim branch with no unidentified orphan alive, otherwise it is refused
+Record-Id: r-workerrun
+Provenance: inherited a07e685b53efc10a0f56b7939fcfaec8ac1e5948
+
+Limit: control-plane git calls after a WORKER turn pin GIT_DIR and the work tree from the registered repository, disable hooks, fsmonitor, filters, external diff and helpers, and refuse the turn if the .git indirection, effective config or git-dir fingerprint changed; another writer in the git dir during a turn therefore fails it with GIT_DIR_CHANGED
+Warn: a worker process's pid and start token are recorded only under an authority minted in the runner's onSpawn for that exact execution, and released only after the runner confirms it gone; a kill also requires the live command line to carry this execution's --session-id, otherwise the process is left outstanding and blocks its task
+Warn: seatbelt tests skip with a reason, or fail under ACP_REQUIRE_SEATBELT=1, when a deny-rule profile cannot apply; a bare (allow default) probe applies even inside another sandbox and must not be used to decide confinement
+Record-Id: r-workerrunr1
+Follows: r-workerrun
+Provenance: inherited 1577a51725ea37ea71ca6eed9808383dc69e3fef
+
+Limit: WORKER turns refuse any checked-out submodule, clean or dirty, and fail a turn that writes inside, replaces or nests a gitlink; a gitlink is accepted only when nothing is checked out at its path
+Warn: the commit takes the real index.lock exclusively, re-checks the staged-content fence (ls-files -s -v, not the stat cache) under it, and replaces the index only with the committed paths updated; a writer that ignores index.lock is outside what the lock can stop
+Warn: shutdown counts pending admissions from their first step and refuses each one after preparation, at the execution gate and before launch; drain is complete only when admissions and running turns are both zero
+Record-Id: r-workerrunr2
+Follows: r-workerrunr1
+Provenance: inherited 597da0608e95ffbfa08a7940ac1630dace0f86f4
+
+Limit: a WORKER turn's irreversible steps read a live authority fence at the moment they act: before the branch moves (under the index lock, nothing awaited before the ref update) and as the first statement of the success transaction; on a drain timeout every turn still running is marked ABANDONED before the daemon releases its lock
+Warn: preparation copies the real index once and answers both 'anything staged' and the staged baseline from that copy, so staging that lands between the two can no longer become the accepted baseline
+Record-Id: r-workerrunr3
+Follows: r-workerrunr2
+Provenance: inherited 4e77cabf3e13e868f53d9768739e67a6f466d64c
+
+Limit: C1 provisions and reclaims BOOTSTRAP_CTO but every bootstrap CONFIRM is refused BOOTSTRAP_APPLICATION_NOT_AVAILABLE with zero GitHub writes until C3 adds the pre-write checks and durable recovery
+Warn: BOOTSTRAP_CTO and WORKER are fixed to Claude Opus in src/domain/fixed-role-runtime.ts; continuity never fails them over to another provider or model, it leaves the role uncovered and pauses the run, so a paused bootstrap or worker run stays BLOCKED
+Warn: a session that ever served as a bootstrap CTO can never take another role, and BOOTSTRAP_CTO shares a session with nothing; there is no promotion, activation always provisions a fresh PRIMARY_CTO
+Record-Id: r-bootstrapcto
+Provenance: inherited c315463e395c55f2bd3494fdd3c961006aa4631b
+
+Limit: continuity-created BOOTSTRAP_CTO replacements still get no launch credential and a revoked bootstrap run still has no recovery path (review C1-02, C1-03); slice C1b adds the real headless runtime and same-session recovery the CEO approved
+Limit: a spawn left STARTING by a daemon crash mid-spawn for a live run is not swept
+Ruled-out: an audit row for a refused canonical handoff | the tx-denial census matches acknowledgeHandoff's exact txDecision opener, so the refusal is reported to the caller only like every other handoff refusal
+Warn: the BOOTSTRAP_CTO_SESSION_SPAWNED audit event that nominates an unbound spawn for cleanup can be forged by a raw database writer; the sweep still never stops a session that holds a role
+Warn: a canonical claim that lands while prepareSwitchover awaits its spawn launches one replacement, which the in-transaction re-check then stops
+Record-Id: r-bootstrapctofix1
+Provenance: inherited 5adb6228115bb7bb31367545d8305dcba1204ab5
+
+Limit: a project Repo Factory bootstraps cannot pass verification in a later run: CLEAN_TREE runs git in a verification worktree whose .git points into the original checkout, which the verification sandbox denies, so ops-r2 RF-S18 stays RED until the verification-checkout slice gives the checkout its own git metadata
+Warn: plan_submit still stores the PLAN before it submits tasks; readiness refuses a PLAN replaced at READY, and C3's freeze is what closes it fully
+Warn: the BOOTSTRAP_PLAN review always uses a single reviewer with no chunking, and the approved files must be top-level names
+Record-Id: r-bootstrapreview
+Provenance: inherited 3f7b246754de09cb1f9b65fbb2fd37b2c70c29f1
+
+Limit: the integrated src/db/migrations.ts is pinned only by the independent authority in tests/helpers/frozen-authority.ts; until it pins these bytes the sealed-trace pin test fails, and the pin is never recomputed here
+Warn: WORKER_SESSION_NOT_INDEPENDENT is defined once, where #1069 put it; PR-B's second definition was dropped in the merge
+Warn: a #1069 witness that reproduces a WORKER sharing the CTO's actor must stand down schema v41's worker-independence triggers for that write as well as assertWorkerSeparation: from v41 the database refuses that state itself
+Record-Id: r-integworkerrun41
+Follows: r-workerrunr3
+Provenance: inherited c6b39533089cc6d5ed141529ec4a058715d947a2
+
+Limit: a DRAIN_REQUEST a pre-fix cto_replace already queued for a canonical CTO is not cancelled; it expires on its TTL and switches nothing
+Warn: settleCanonicalSwitchovers runs at daemon startup and on every watchdog tick: when the role's holder is canonical it closes pending handoffs REJECTED, marks role-less replacements ERROR with a provider stop pending, and returns a DRAINING holder to READY unless the project is suspended
+Warn: the handoff_ack withdrawal runs before the acknowledgement is authenticated and its provider stop is fire-and-forget; the replacement is already ERROR in the transaction, so the sweep retries a failed stop
+Record-Id: r-bootstrapctofix2
+Follows: r-bootstrapctofix1
+Provenance: inherited 3c7601650392d23cd2a6117b870c066f541af9c4
+
+Warn: settleCanonicalSwitchovers returns a canonical holder to READY only on positive switchover evidence (a pending handoff from it, or a CTO_REPLACEMENT_REQUESTED audit newer than its current drain) and never while a RECOVERY handoff row from suspendProject exists, even after cto_resume; any drain nothing explains is left alone
+Warn: a raw database writer can forge the CTO_REPLACEMENT_REQUESTED audit row; the worst a forgery does is return a canonical holder with no suspension record to READY, it cannot switch the role or override a suspension
+Record-Id: r-bootstrapctofix3
+Follows: r-bootstrapctofix2
+Provenance: inherited 14a9edb8bfaa1e20173a97ed4b9816c7bec0a033
+
+Limit: only a verification command whose argv is exactly Repo Factory's git status --porcelain (CLEAN_TREE) gets the self-contained checkout; any other git-running verification command still runs in a linked worktree and fails the same way, and the copy holds one commit, so a command that needs history would not see it
+Ruled-out: a separate tree comparison of the copy and --no-tags on the fetch | both survived their mutations, so they were removed rather than kept: a bare-SHA fetch stores no ref and follows no tags, and a copy whose HEAD resolved to a different tree already shows up in status
+Warn: the snapshot freshness check isClean still runs git status in the source with the source's own config, so a repo-configured core.fsmonitor program or clean filter runs outside the sandbox; the new source read in the verification checkout turns fsmonitor off but isClean is unchanged
+Warn: ignored files are not candidate state: the dirty and untracked contract refuses tracked, staged and untracked changes (untracked-files=all, so status.showUntrackedFiles=no cannot hide one) but accepts ignored files, which the producer relies on for its .git/info/exclude ownership marker
+Record-Id: r-verifycheckout
+Follows: r-bootstrapreview
+Provenance: inherited 742e9047e9f57c2e899ddbc3921ba511502a3ebb
+
+Limit: a BOOTSTRAP_CTO turn cannot yet claim an OWNER_MESSAGE: the owner-message wake starts a turn, but the claim tools only serve PRIMARY_CTO
+Limit: only a BLOCKED bootstrap run is recovered on the same session; a run paused from CEO review (AWAITING_HUMAN) is not
+Warn: a provisioned BOOTSTRAP_CTO runs as headless claude -p turns: the first call of its conversation uses --session-id and every later call uses --resume; reusing --session-id in the same cwd is refused 'already in use' by the CLI
+Warn: v42 lets sessions_secret_hash_immutable accept a new secret hash only together with credential_epoch exactly +1 on a READY row with the same session id and incarnation; a rotation never changes the incarnation
+Warn: the launch channel is keyed by the conversation id, which same-user processes can see in argv, so one could take the credential and the MCP token first; take-once turns that race into a failed attestation rather than a silent one
+Warn: after a daemon restart the plaintext credential is gone: the next reconcile tick revokes and pauses that session's run and the following tick's restore recovers it on the same session, so recovery takes two ticks
+Record-Id: r-bootstrapruntime
+Follows: r-bootstrapctofix1
+Provenance: inherited 5a375edff4c3245bc1f83a62d2dbde2a7ed7610a
+
+Warn: the partial timestamp-ordering exclusions are keyed to source lines; after bringing #1071's final C1 (R1/R2 canonical switchover settlement) into C1b they are re-measured at src/db/migrations.ts:2328 and src/cto/cto-lifecycle.ts:906, and any edit above those lines moves them again
+Record-Id: r-c1bmergec1final
+Follows: r-bootstrapruntime
+Provenance: inherited efc3597f4ec6b7d7bc75d4b269c0d9d585bbf49d
+
+Warn: C2's bootstrap fixtures were written against C1: a fixture that dispatches a project-less run must stage its BOOTSTRAP_CTO on C1b's HeadlessRuntimeDouble and attach sessionRuntime to the launch and CTO sockets, or run_dispatch refuses SESSION_NOT_READY with SESSION_RUNTIME_UNAVAILABLE; a project run's PRIMARY_CTO still claims its credential from the launch channel
+Record-Id: r-c3mergec2c2v
+Follows: r-c1bmergec1final
+Provenance: inherited d30c667ce34bdf119599ec98d3a797724269a7be
+
+Limit: a provisioned-session turn whose CLI succeeded but did not acknowledge its message counts as done and is not retried; the message stays PENDING until its TTL, and the completed-work list grows for the life of the session
+Limit: a run paused before v42 has no recorded continuity hold, so its recovery restores authority without resuming it
+Warn: runs.continuity_hold_role_key records the hold continuity itself placed (written only by pauseForContinuity, kept only while BLOCKED, never on insert); same-session recovery resumes a run only when continuity placed its hold, and otherwise restores the owner's authority alone, so a CEO_DECISION_REQUIRED block stays BLOCKED
+Warn: this supersedes r-bootstrapruntime's limit that an AWAITING_HUMAN run is not recovered: credential-loss recovery now also covers REVISION_REQUIRED and AWAITING_HUMAN runs, restoring authority without changing their state
+Warn: the RUN_DISPATCH idempotency key is run-dispatch:<run>:<gen> for the first cycle and gains :r<n> for revision n, shared by bootstrap and project/canonical dispatch, so a revision redispatch on the same generation enqueues new work instead of replaying the acked envelope
+Record-Id: r-bootstrapruntimer1
+Follows: r-c1bmergec1final
+Provenance: inherited e5778184fe193f7e90b63e1c9111475fe7d35c6d
+
+Warn: the partial timestamp-ordering exclusion for the v35 refusal query is keyed to a source line; with C1b's v42 continuity-hold replay exclude and C3's v43 one both above it, it is now src/db/migrations.ts:2332, and any edit above that line moves it again
+Record-Id: r-c3mergec1br1
+Follows: r-c3mergec2c2v
+Provenance: inherited 5b28db97eddd29b21dde4ec659d19330710a327c
+
+Limit: src/db/migrations.ts is unchanged by this merge (sha256 4d95187e, blob f4033d99): v40 to v42 are byte-identical to main's CEO-accepted v42 pin b3884573 and v43 is the only addition, so the v43 bytes still need their own independent pin
+Warn: the partial timestamp-ordering exclusion for the v35 refusal query stays keyed to src/db/migrations.ts:2332; any edit above that line moves it again
+Record-Id: r-c3mergemainf1789
+Follows: r-c3mergec1br1
+Provenance: inherited dad63bbf2b82c74cbf0cf7682f30903b78bdd970
+
+Warn: this v40 test pins SCHEMA_VERSION and every migration ledger row from v38 on, so each new migration has to extend it, as it does a-v39-database-reaches-v41.test.ts and database-migration-restore.test.ts
+Record-Id: r-c3v43carrychain
+Follows: r-c3mergemainf1789
+Provenance: inherited b384df66cad30168afd1d9e7aafe63058b81198f
+
+Limit: a raw SQL writer can still insert a RESERVED bootstrap_applications row or move a phase forward: the v43 triggers check the row's shape and the phase order, and there is no insert-authority marker
+Limit: the FROZEN_BLOBS pin for src/db/migrations.ts (sha256 4d95187e, blob f4033d99) was transcribed from the CTO's message and matches this checkout's own computation; it is not yet the independent second-party computation the CEO accepts a pin on, and it is void if the file's bytes change
+Warn: after a real crash, re-CONFIRM is refused INTERRUPTED_RUN_CHECKOUT until a person removes the leftover checkout; nothing reclaims it automatically, and this is an open choice awaiting the CEO
+Warn: bootstrap_applications.approval_digest holds the approved parameter digest (the write scope), not the owner approval receipt's digest; this scope is an open choice awaiting the CEO
+Warn: the plan freeze (BOOTSTRAP_APPLICATION_FROZEN) starts at reservation, because the reservation and its first attempt are recorded in one transaction; this is an open choice awaiting the CEO
+Unverified: W1, the full live path, still needs a real runtime for the fresh PRIMARY_CTO that activation provisions (credential delivery and attestation, then a turn on the HANDOFF_PACKAGE that calls handoff_ack) and task_worker_run driven by the WORKER headless double; that is a separate slice, C4
+Record-Id: r-c3bootstrapapply
+Follows: r-c3v43carrychain
+Provenance: inherited 833011752d9debb2b54c602b048913d0a428efc8
+
+Limit: decision (d): a raw SQL writer can still insert a RESERVED bootstrap_applications row or move its phase forward, and no insert-authority marker is added because the same writer could forge it; no such row authorises an external execution, since every CONFIRM re-admits the official approval receipt against the current write scope first, and a phase a run at CEO review cannot have is refused
+Limit: the v43 src/db/migrations.ts pin (sha256 4d95187e, blob f4033d99) is accepted by the CEO conditionally on the reported evidence; a second party's computation relayed to the CEO is not the CEO's own, and the pin is void if the file's bytes change
+Limit: decision (c): that an interrupted attempt has ended is shown only by the in-process attempt set and the daemon's single-instance lock; a git process a killed daemon left running is seen only through the lock files it holds in the checkout's .git, and a stale lock file left by a host crash keeps the recovery refused
+Ruled-out: recovering an interrupted application by a person deleting its leftover checkout | the CEO did not accept it as an operational contract; the checkout is verified and moved aside rather than deleted
+Warn: decision (a): bootstrap_applications.approval_digest is the approved write scope (the receipt's parameter digest), never an approval; letting that digest or any application row stand in for re-admitting the official receipt reopens what the decision closed
+Warn: decision (b): the plan freeze starts at the reservation and nothing releases it; failure, cancel and recovery leave the application reserved and frozen, a scope change is refused rather than applied under the approval the reservation consumed, and a cancelled run's project id and repository identity stay reserved for good
+Warn: decision (c): INTERRUPTED_RUN_CHECKOUT stays fail-closed and its only recovery is the HERMES repair preserve_interrupted_bootstrap_checkout, which verifies before it moves, moves rather than deletes, and authorises nothing; no code path may delete a leftover checkout
+Unverified: W1, the full live path, still needs a real runtime for the fresh PRIMARY_CTO that activation provisions and task_worker_run driven by the WORKER headless double; that is slice C4
+Record-Id: r-c3ceodecisions
+Follows: r-c3bootstrapapply
+Supersedes: r-c3bootstrapapply
+Provenance: inherited 8c5c0c697de37b7cc1f6ecbf51a50eac03255c69
+
+Limit: what a raw SQL writer can forge: every bootstrap_applications row and phase the v43 triggers admit, the REPO_FACTORY_RESULT and APPROVAL artifacts, the attempt count and the audit trail; what it cannot from the database alone: the ingress admission of an owner receipt that its consumption check re-reads, the attempt ledger and the checkout in the run's work directory, and GitHub's own state
+Limit: the WRITTEN chain rests on the attempt ledger file; a writer that can also write files as this account can fabricate a ledger and a checkout that pass it, which is outside the raw SQL writer this guards against
+Warn: a WRITTEN application is activated only after its stored result is proved to be its own attempt's by the attempt ledger and its own checkout leaf, before the approval is consumed; checking the row, the stored result or any other database record instead reopens the defect the CEO ruled blocking
+Record-Id: r-c3writtenchain
+Follows: r-c3ceodecisions
+Provenance: inherited 9290d724493c4f34a4e4eed147d48e7fcf5c7e91
+
+Limit: the recovery cannot stop another process of this account from changing the tree between its last check and its rename; it detects the change after the rename by device, inode and resolved path, moves what it took back only if the original place is still free, and otherwise leaves it in the claimed preservation directory named in the refusal
+Warn: a git lock file in an interrupted checkout is never removed by the recovery; it keeps the repair refused until it is gone, and its absence alone proves nothing: the attempt set and the daemon's single-writer lock are asked too
+Warn: the preserve_interrupted_bootstrap_checkout repair is witnessed on temporary directories only and has not been run against a live checkout; running it live is outside what was approved
+Record-Id: r-c3recoveryswap
+Follows: r-c3writtenchain
+Provenance: inherited a1e994c946f8f2cca23185270801f7bb4267a5ac
+
+Limit: the release reads GitHub once, in the repair's plan; a create sent by a process the daemon lost before that read and landing after it is not seen, and the new run's CONFIRM then finds a repository at the target with no evidence of its own and is refused RESOURCE_COLLISION, never adopting it
+Limit: a PROJECT_BOOTSTRAP run at CEO review cannot move to CANCELLED directly; it is cancelled through OWNER_DECISION_REQUIRED and then run_cancel, and only a cancelled run's reservation is released
+Limit: v43 changed after the CEO's conditional acceptance of its pin: src/db/migrations.ts is now sha256 04bb01d5, blob fdec6ce5, so the sealed-trace pin test fails until a second party computes the new bytes independently; v40 to v42 are unchanged
+Warn: decision (b) as corrected: a reservation is released only for a cancelled run with no attempt in flight, under the single-writer lock, with no landed write in its attempt ledger and nothing at the target on GitHub; any unclear effect keeps it RESERVED with RELEASE_IN_DOUBT, and a released row is never deleted or reused
+Record-Id: r-c3release
+Follows: r-c3recoveryswap
+Provenance: inherited 02538d6509a6abc6c2618485539d14d8d41215b8
+
+Limit: the FROZEN_BLOBS pin for src/db/migrations.ts (sha256 04bb01d5, blob fdec6ce5) was computed independently by a second party at 02538d65 and matches this checkout's own computation; the CEO's acceptance of it is pending, and it is void if the file's bytes change
+Record-Id: r-c3pinrelease
+Follows: r-c3release
+Provenance: inherited 934eb30974de7680ec6bdd906cc1e2c3e9201247
+
+Limit: the interrupted-checkout move cannot close the window between its identity check through the held parent and the rename: macOS has no rename conditional on the identity of what it moves, so another process of this account replacing the checkout's entry inside the run's private work directory in that instant is detected only after the rename, refused and left where it landed, with nothing restored; whether the move should then be disabled altogether is the CEO's decision
+Limit: the release proof reads the attempt ledger and the last attempt's recorded outcome; that outcome is a database row a raw SQL writer could write, but such a writer can already mark the row RELEASED itself, so the proof guards against a daemon that died mid-attempt, not against database forgery
+Warn: a reservation is never released on GitHub's absence: only a ledger showing no request sent, together with the last attempt's own recorded outcome, releases it; a pending request or an unrecorded outcome keeps it RELEASE_IN_DOUBT
+Warn: the interrupted-checkout recovery moves only through descriptors held on verified objects, by RENAME_EXCL, and never restores or moves anything back; a path-resolving rename here reopens the steering the CEO ruled a wrong-target side effect
+Record-Id: r-c3releaseproof
+Follows: r-c3pinrelease
+Provenance: inherited 908c0671a0259e1ac6a06e211d42ee4dbb2b4828
+
+Limit: a git process a killed daemon left running is seen only through the lock files it holds in an earlier checkout's .git, and a stale lock file left by a host crash keeps every new attempt refused until it is gone
+Limit: a new attempt still resumes the run's GitHub ledger, reconciled against GitHub by the node id or commit each receipt recorded, and the consumed owner receipt is re-admitted after its scope is checked against the current PLAN; neither is taken from the earlier checkout
+Warn: decision (c), final: an earlier attempt's checkout is preserved in place and never renamed, deleted, reused or overwritten; every attempt creates its own repositories/<role>.attempt-<n> exclusively, and a path already taken refuses the CONFIRM
+Warn: a new attempt starts only when every earlier one is shown ended with no writer left: the run's in-process slot, the single-writer lock, no git lock file in an earlier checkout, and plain directories throughout; anything unclear is EARLIER_ATTEMPT_IN_DOUBT and nothing is recorded or written
+Record-Id: r-c3attemptcheckout
+Follows: r-c3releaseproof
+Provenance: inherited 556413a43728d9104e2b81ce5cb72322cdca81e0
+
+Limit: the ledger-stage record, like the attempt count and the outcome, is a database row a raw SQL writer could write; such a writer can already mark the reservation RELEASED itself, so the proof guards against a daemon that died mid-attempt, not against database forgery
+Warn: decision (b), narrowed: a missing ledger is never evidence that nothing was sent; a release is proven only when no attempt durably recorded reaching its first ledger write and no ledger exists, or when the ledger those attempts wrote holds no receipt and no pending request; anything else is RELEASE_IN_DOUBT
+Warn: the producer must call beforeLedgerWrite, and it must record durably, before the first GitHub ledger write of every attempt; a ledger write ahead of that record would let a release mistake a sent request for none
+Record-Id: r-c3ledgerstage
+Follows: r-c3attemptcheckout
+Provenance: inherited 21c297d7d3927279d4add3bbd1f6087ed1a34c15
+
+Limit: termination is proven only for the daemon process recorded with each attempt; a git or gh child that outlived it is not recorded, so its absence is not proven
+Warn: the writer's start token is recorded as processStart because the audit log redacts any key that names a token; recorded as startToken it reads [redacted], and a live writer then looks proven gone
+Warn: a resume verifies the owner receipt its reservation consumed and never consumes it again; any other approval presented for the same execution is refused, and an approval already consumed never stands in for an identity that cannot be proven
+Record-Id: r-c3resumeidentity
+Follows: r-c3ledgerstage
+Provenance: inherited 435ad0eefaf9b7e18fa4be2069444e092f1e003d
+
+Limit: the admitted payload is kept only as long as the ingress replay cache keeps its row, so assertApproval proves a live admission only; a consumed approval must be proven afterwards by evidence its consumer kept
+Limit: this guards against a raw SQL writer on another connection; code running on ACP's own connection can still insert an ingress row
+Warn: an INGRESS_ADMITTED audit row is not issuance evidence on its own: a connection ACP did not open can insert it, while it cannot insert the inbound_messages row whose write-once payload is compared here
+Record-Id: r-c3admittedpayload
+Follows: r-c3resumeidentity
+Provenance: inherited 836992eaac5a8690117f51afa38878bcc97ce391
+
+Warn: the move log sees renames made by this process through node:fs; a rename done by a child process, such as git, is not recorded, so these witnesses prove no in-process move only
+Record-Id: r-c3movecount
+Follows: r-c3admittedpayload
+Provenance: inherited 7c21b95b8f2760861e3d7bfb2a0bfebdd80d7242
+
+Limit: the anchor's trust boundary is the GitHub ledger's: a writer that can write files as this account can fabricate both
+Limit: a request withheld because an earlier attempt left it pending stays IN_DOUBT until GitHub shows its effect, and no repair settles it yet; a request GitHub really refused needs a person, who cancels the run and bootstraps again
+Limit: the activation finalizer does not verify the chain itself; it is reached only through the CEO decision, which verifies it in the same transaction, and on its own it completes neither the run nor the application
+Ruled-out: completing a bootstrap on its WRITTEN phase | the phase and the stored result are database rows a raw SQL writer can write; the CEO decision asks for the chain the runner verifies
+Warn: an execution's approval is proven only by the anchor the runner writes after the consumption commits and before the attempt's first ledger write; the consumption and identity rows are never enough, and a crash between the commit and the anchor leaves the execution needing a new owner approval
+Warn: rereadAt is the one receipt field not compared between a stored result and the attempt ledger; every other field, the digest of the observed state included, must agree
+Warn: authority is asked before a request's intent reaches the ledger, not at the request alone; asked only at the request, a refusal would leave an intent pending that was never sent, and the application could then only be IN_DOUBT
+Record-Id: r-c3reviewr1
+Follows: r-c3movecount
+Provenance: inherited fd22c215e197fb16b672047549e34aeeab27a568
+
+Warn: every bootstrap completion entry asks for the same chain: the runner, the CEO decision at admission and in its transaction, and the activation finalizer itself; a new caller of the finalizer inherits the check rather than having to repeat it
+Warn: completeBootstrapRunUntilC3 replaces the finalizer's chain verifier for its one call; a fixture that completes a bootstrap any other way without the runner is refused BOOTSTRAP_APPLICATION_NOT_AVAILABLE or by the chain
+Record-Id: r-c3finalizerchain
+Follows: r-c3reviewr1
+Provenance: inherited b2ab41eb58fc09e601966350f4655ef6c328803a
+
+Limit: src/db/migrations.ts and src/db/schema.sql are unchanged by this merge; migrations.ts stays at the pinned v43 bytes (sha256 04bb01d5, blob fdec6ce5)
+Warn: the timestamp-ordering census keeps two line-keyed entries, src/db/migrations.ts:2332 and src/cto/cto-lifecycle.ts:1017; an edit above either line moves it again
+Record-Id: r-c3mergemain8d0a
+Follows: r-c3finalizerchain
+Provenance: inherited da201d03375856eb5033cc9a682eee3162f52cf2
+
+Warn: a decline after the writes completes nothing but reverts nothing: the application stays WRITTEN with its receipts, and recovery is a person's cancel and a new bootstrap
+Warn: the identical approval recorded again is the same decision and does not refuse completion; only a decline or a decision of another scope does
+Record-Id: r-c3currentdecision
+Follows: r-c3mergemain8d0a
+Provenance: inherited fa44902f4ff465ce39089ac06162c34cd210459b
+
+Limit: a subprocess that leaves the group, by setsid or setpgid, is not seen through it; git and gh do not, and nothing the daemon spawns detached writes a checkout
+Limit: a group id reused by an unrelated process reads as a running member, so the attempt stays in doubt until it ends; it never admits
+Limit: a daemon that does not lead its own process group, as one started from a shell without exec would not, leaves every earlier attempt's subprocesses unprovable once it exits, and its applications stay in doubt
+Warn: no code path signals a process group to make it empty; an attempt waits for its group to empty by itself, and a person ends a stuck subprocess
+Record-Id: r-c3writergroup
+Follows: r-c3currentdecision
+Provenance: inherited 64660576d5d6c331884863c9eb088017c21230ab
+
+Limit: the withheld-request record has the anchor's trust boundary: a writer that can write files as this account can fabricate one, and so cause a request to be sent again
+Warn: the production port must be createBootstrapGitHubWritePort: a port composed over an unguarded client asks authority only when its method is called, not after the reads the method awaits before writing
+Warn: a withheld-request record settles one ledger intent as unsent, by its operation and the time it was begun; a request that had already started is not withheld and is never retried
+Record-Id: r-c3requestguard
+Follows: r-c3writergroup
+Provenance: inherited da916da4a2e99bdea2c3fb0e2444ccba35a1958f
+
+Limit: the membership listing is a snapshot of the group; a subprocess that leaves it by setsid or setpgid, or a group id reused later, is outside what it proves
+Limit: any other process in the live daemon's own group, another run's git or gh or a non-detached child of another subsystem, keeps an in-process recovery waiting until it ends or the daemon restarts
+Limit: a daemon that does not lead its process group cannot prove its own earlier attempt ended while it runs; the recovery waits for this daemon to exit and one that leads its group to resume
+Limit: the group is listed with ps -g, which selects by process group on macOS; elsewhere the listing is refused and the application stays in doubt
+Ruled-out: counting only the live writer's descendants by parent id | an orphan whose parent exited is reparented and leaves every ancestry while it stays in the group; the group's membership is asked instead
+Warn: the in-process path that admits a recovery is exercised in tests through a real group-leading process asking for its own group's members; the runner's own THIS_PROCESS admission cannot run under a vitest worker, which never leads its group
+Record-Id: r-c3livegroup
+Follows: r-c3requestguard
+Provenance: inherited df233c95282fa11a80a77c4b44ca119997276d26
+
+Limit: withheld and consumption records have the anchor's trust boundary: a writer that can write files as this account can fabricate or remove one
+Limit: a request whose exemption was consumed, and whose attempt then crashed or lost the answer, stays IN_DOUBT until GitHub shows its effect; no repair settles it yet, as for any request sent and never answered
+Limit: withheld records in the earlier format, keyed by operation and time, are not read; an intent one covered stays in doubt
+Ruled-out: keeping the withheld identity as the operation and the time the intent was begun | a later attempt reuses both for the same intent, so the record matched a request that had since been sent; the exact intent and its generation are bound instead
+Warn: an exemption is consumed when the port method is called, before it runs, so a port without the request-start guard still has the consumption recorded before anything is sent; a refusal at the request start then writes a withheld record of the same generation
+Record-Id: r-c3withheldonce
+Follows: r-c3livegroup
+Provenance: inherited b8f9ab31942b4a247cc85197b3cbe432a7a9e2ed
+
+Limit: a consumption record whose bytes reached the file but whose fsync failed reads as a consumption with no withheld record of its generation, so the request stays IN_DOUBT though it was not sent; a person resolves it
+Limit: a withheld or consumption record that cannot be read refuses every later attempt of the run until a person resolves it; nothing removes or repairs it
+Limit: a consumption that fails before its file is opened leaves no record, so the exemption stays unused and the next attempt may make the request once; the failed attempt sent nothing
+Limit: the daemon's single-instance holder record keeps its own single writeSync; no GitHub request waits on it, and it is outside this change
+Ruled-out: a single writeSync whose count is ignored, followed by fsync | a short write returns its count and fsync then succeeds on the part written, so a record cut short was reported written; the remainder is written until none is left instead
+Warn: whole-write.ts is the writer for every record a bootstrap request waits on; a new such record must be written through it, never with a bare writeSync
+Record-Id: r-c3wholewrite
+Follows: r-c3withheldonce
+Provenance: inherited c47932201ae3eebcc8c68c42cb02431baeb6e97a
+
+Limit: an anchor whose fsync keeps failing keeps the application refused APPROVAL_ANCHOR_UNSYNCED with nothing sent until the disk syncs it; the syncs are repeated at the resume and before every request
+Limit: an anchor refused as cut short, its closing newline included, leaves the execution needing a new owner approval, as any unreadable anchor does
+Limit: the GitHub ledger reader does not compare framing; the ledger is replaced only by renaming a scratch file written whole and synced, so a write cut short never reaches the path it reads
+Ruled-out: accepting a record because its JSON parses | the one prefix of a record that parses is every byte but its closing newline, so a write cut there read as whole; its bytes are compared with the record's own framing instead
+Ruled-out: accepting an anchor already on disk without syncing it again | a file whose fsync failed holds complete JSON and reads as an anchor; every acceptance syncs the file and its directory now instead
+Warn: acceptApprovalAnchor is the one door an anchor authorises a write through; readApprovalAnchor alone authorises nothing
+Record-Id: r-c3anchorsync
+Follows: r-c3wholewrite
+Provenance: inherited 5888d2517375b725651e2a15672dcf5baf044ead
