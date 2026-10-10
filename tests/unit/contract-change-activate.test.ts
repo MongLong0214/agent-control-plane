@@ -161,24 +161,25 @@ describe("the normal path: CONFIRM → grant → one transaction that activates,
     const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
     const confirmed = await confirm(harness, run.runId, candidate);
     expect(confirmed, JSON.stringify(confirmed)).toMatchObject({ allowed: true, value: { state: RunState.CEO_APPROVED } });
-    const issued = grantRow(harness, run.runId)!;
-    expect(issued).toMatchObject({
-      project_id: projectId,
-      manifest_digest: m1,
-      from_manifest_digest: m0,
-      candidate_snapshot_digest: candidate,
-      ceo_session_id: ceo.sessionId,
-      ceo_binding_generation: ceo.bindingGeneration,
-      consumed_at: null,
-    });
+    // What CONFIRM issued, read before anything finalizes (asserted below, after the behaviour).
+    const issued = harness.cp.manifestGrants?.get(run.runId) ?? null;
     const decision = harness.cp.audit.forRun(run.runId).find((entry) => entry.kind === "CEO_DECISION")!;
-    expect(decision.evidence["manifestActivationGrantDigest"]).toBe(issued.grant_digest);
     // Confirmed, not yet activated.
     expect(activeManifest(harness, projectId)).toBe(m0);
 
     await runDaemon(harness);
     expect(stateOf(harness, run.runId)).toBe(RunState.COMPLETED);
     expect(activeManifest(harness, projectId)).toBe(m1);
+    expect(issued).toMatchObject({
+      projectId,
+      manifestDigest: m1,
+      fromManifestDigest: m0,
+      candidateSnapshotDigest: candidate,
+      ceoSessionId: ceo.sessionId,
+      ceoBindingGeneration: ceo.bindingGeneration,
+      consumedAt: null,
+    });
+    expect(decision.evidence["manifestActivationGrantDigest"]).toBe(issued!.grantDigest);
     const consumed = grantRow(harness, run.runId)!;
     const attempt = harness.cp.db.get<{ attempt_id: string; state: string }>(
       `SELECT attempt_id, state FROM finalization_attempts WHERE run_id = ?`,
@@ -276,7 +277,6 @@ describe("a stale pin, a base mismatch and two CONTRACT_CHANGEs on one base", ()
     const rb = await readyContractChange(harness, projectId, postMergeAdded("rb-check"));
     expect((await confirm(harness, ra.run.runId, ra.candidate)).allowed).toBe(true);
     expect((await confirm(harness, rb.run.runId, rb.candidate)).allowed).toBe(true);
-    expect(grantRow(harness, ra.run.runId)!.from_manifest_digest).toBe(grantRow(harness, rb.run.runId)!.from_manifest_digest);
 
     // Concurrent: the second finalization does not start while the first is under way.
     const [a, b] = await Promise.all([
@@ -292,8 +292,8 @@ describe("a stale pin, a base mismatch and two CONTRACT_CHANGEs on one base", ()
     const later = await new ApprovedRunFinalizer(harness.cp, "witness-b-later").finalizeApprovedRun(rb.run.runId);
     expect(later).toMatchObject({ allowed: false, reasonCode: "MANIFEST_PIN_SUPERSEDED" });
     expect(stateOf(harness, rb.run.runId)).toBe(RunState.CEO_APPROVED);
-    expect(grantRow(harness, rb.run.runId)!.consumed_at).toBeNull();
     expect(activations(harness)).toHaveLength(1);
+    expect(grantRow(harness, rb.run.runId)).toMatchObject({ consumed_at: null, from_manifest_digest: grantRow(harness, ra.run.runId)!.from_manifest_digest });
     expect(activeManifest(harness, projectId)).toBe(manifestDigest(ra.proposed));
     expect(requests.filter((request) => !request.startsWith("GET"))).toEqual([]);
 
@@ -313,8 +313,8 @@ describe("a grant is consumed once, and a refusal leaves nothing partial", () =>
     expect((await confirm(harness, run.runId, candidate)).allowed).toBe(true);
     await runDaemon(harness);
     const m1 = manifestDigest(proposed);
-    const consumed = grantRow(harness, run.runId)!;
     expect(activeManifest(harness, projectId)).toBe(m1);
+    const consumed = grantRow(harness, run.runId)!;
     const auditBefore = harness.cp.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'PROJECT_MANIFEST_ACTIVATED'")!.n;
 
     await runDaemon(harness, "acp-cc-twice-again-");
@@ -457,15 +457,18 @@ describe("ruling 2: consumption authenticates the live CEO binding", () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness, "cc-ceo-moved");
     const { run, candidate } = await readyContractChange(harness, projectId);
+    const confirmingActor = harness.cp.db.get<{ actor_id: string }>(
+      "SELECT actor_id FROM assignments WHERE role_key = 'CEO' AND status = 'ACTIVE'",
+    )!.actor_id;
     expect((await confirm(harness, run.runId, candidate)).allowed).toBe(true);
-    const granted = grantRow(harness, run.runId)!;
     switchToAnotherCeo(harness, "another-ceo");
     expect(harness.cp.db.get<{ actor_id: string }>(
       "SELECT actor_id FROM assignments WHERE role_key = 'CEO' AND status = 'ACTIVE'",
-    )!.actor_id).not.toBe(granted.ceo_actor_id);
+    )!.actor_id).not.toBe(confirmingActor);
 
     await runDaemon(harness);
     expect(stateOf(harness, run.runId)).toBe(RunState.CEO_APPROVED);
+    expect(grantRow(harness, run.runId)!.ceo_actor_id).toBe(confirmingActor);
     expect(lastFailure(harness, run.runId)?.reasonCode).toBe("MANIFEST_ACTIVATION_AUTHORITY_STALE");
     expect(activeManifest(harness, projectId)).toBe(run.baseDigest);
     expect(grantRow(harness, run.runId)!.consumed_at).toBeNull();
