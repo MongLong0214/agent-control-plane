@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +7,8 @@ import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
+import { processGroupEmpty } from "../../src/bootstrap/attempt-writer-group.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
@@ -15,15 +18,14 @@ import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import {
   REPO_FACTORY_GITHUB_WRITE_OPERATION,
   RepoFactoryBootstrapRunner,
+  attemptCheckoutPath,
   repoFactoryGitHubWriteParameters,
   type ProduceAndActivateInput,
 } from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
-import { repositoryCheckoutPath } from "../../src/bootstrap/repo-factory-producer.ts";
 import { git } from "../../src/git/git.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import {
   TEST_OWNER,
-  completeBootstrapRunUntilC3,
   dispatchBootstrapRun,
   fixtureManifest,
   makeHarness,
@@ -194,11 +196,44 @@ const prepare = async (
     githubPort: github,
     workRoot,
     clock: harness.cp.clock,
+    // #246 C3 — the application record and the pre-write checks' sources, as composed.
+    db: harness.cp.db,
+    applications: harness.cp.bootstrapApplications,
+    ceo: harness.cp.ceo,
+    bindings: harness.cp.bindings,
+    projects: harness.cp.projects,
+    repositories: harness.cp.repositories,
   });
+  // #246 C3 — no daemon runs here: the test process is the only control-plane writer, which a
+  // daemon's single-instance lock and its holder record attest in production. A new attempt after an
+  // earlier one asks both. Review 1076-R3: every attempt is recorded with a daemon that has since
+  // exited — a real process that led its own process group, its start token read while it ran, its
+  // group empty — since a vitest worker does not lead its group, and a live writer in a group it does
+  // not lead is never shown to have no subprocess left.
+  const exited = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { detached: true, stdio: "ignore" });
+  const writer = {
+    pid: exited.pid!,
+    startToken: readProcessStartToken(exited.pid!),
+    startedAt: new Date().toISOString(),
+    processGroup: exited.pid!,
+  };
+  const gone = new Promise((resolveExit) => exited.once("exit", resolveExit));
+  exited.kill("SIGKILL");
+  await gone;
+  await vi.waitFor(() => expect(processGroupEmpty(writer.processGroup)).toBe(true), { timeout: 10_000, interval: 20 });
+  expect(writer.startToken).not.toBeNull();
+  runner.attachWriterLock(() => true, () => writer);
+  // The CEO decision completes a bootstrap on the chain this runner verifies, as composed (#246 C3).
+  harness.cp.ceo.attach({ bootstrapCompletionChain: runner });
+  harness.cp.bootstrap.attachCompletionChain(runner);
+  // The CEO's admission, which the runner asks among its pre-write checks, needs a current
+  // continuity evaluation, as the CONFIRM door has before it calls the runner.
+  await harness.cp.continuity.evaluate("bootstrap confirmation");
   const input: ProduceAndActivateInput = {
     runId,
     // The candidate the CEO confirms: the one the blind review above passed.
     candidateSnapshotDigest: snapshotDigest,
+    ceoSessionId: reviewed.ceoSessionId,
     ownerApproval: null,
     approvedManifest: manifest,
     projectName: projectId,
@@ -257,7 +292,7 @@ const ownerApproval = (
 const noGitHubCall = (prepared: Prepared): void => {
   expect(prepared.github.writes).toEqual([]);
   expect(prepared.github.reads).toEqual([]);
-  expect(existsSync(repositoryCheckoutPath(join(prepared.workRoot, prepared.runId), "primary"))).toBe(false);
+  expect(existsSync(attemptCheckoutPath(join(prepared.workRoot, prepared.runId), "primary", 1))).toBe(false);
   expect(prepared.harness.cp.artifacts.latest(prepared.runId, "REPO_FACTORY_RESULT")).toBeNull();
 };
 
@@ -328,7 +363,7 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     expect(github.writes).toEqual([]);
 
     // The bound checkout is the one the producer made, at the head GitHub holds.
-    const checkout = repositoryCheckoutPath(join(prepared.workRoot, runId), "primary");
+    const checkout = attemptCheckoutPath(join(prepared.workRoot, runId), "primary", 1);
     expect(second.value.localBindings).toEqual([
       expect.objectContaining({ identity: IDENTITY, repositoryRole: "primary" }),
     ]);
@@ -338,8 +373,9 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     expect((await git(checkout, ["rev-parse", "HEAD"])).stdout.trim()).toBe(remoteHead);
     expect(harness.cp.repositories.byIdentity(IDENTITY)).not.toBeNull();
 
-    // And the CEO confirm completes the run on that activation. Issue #246 PR-C: the bootstrap
-    // CONFIRM is shut until C3, so the gate refuses it and nothing is completed by it.
+    // And the CEO confirm completes the run on that activation, and its WRITTEN application with it
+    // (#246 C3): one attempt, one reservation, COMPLETED in the same transaction as the run.
+    expect(harness.cp.bootstrapApplications.get(runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
     const ceoSessionId = prepared.ceoSessionId;
     await harness.cp.continuity.evaluate("bootstrap confirmation");
     const confirmed = harness.cp.ceo.submitCeoDecision({
@@ -349,15 +385,9 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
       ceoSessionId,
       rationale: "activation driven by produced output",
     });
-    expect(confirmed.reasonCode).toBe(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
-    // TODO(C3): confirm through `submitCeoDecision` again once C3 reopens the bootstrap CONFIRM.
-    const completed = completeBootstrapRunUntilC3(harness.cp, {
-      runId,
-      candidateSnapshotDigest: prepared.snapshotDigest,
-      ceoSessionId,
-    });
-    if (!completed.allowed) throw new Error(`${completed.reasonCode}: ${completed.message}`);
+    if (!confirmed.allowed) throw new Error(`${confirmed.reasonCode}: ${confirmed.message}`);
     expect(harness.cp.runs.require(runId).state).toBe(RunState.COMPLETED);
+    expect(harness.cp.bootstrapApplications.get(runId)).toMatchObject({ phase: "COMPLETED", attempts: 1 });
   });
 
   it("refuses with no owner approval, before any GitHub call", async () => {
@@ -490,7 +520,9 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
   it("a partial failure resumes on the same approval, writing only what was left", async () => {
     const prepared = await prepare("partial-resume");
     const input = { ...prepared.input, ownerApproval: ownerApproval(prepared) };
-    prepared.github.failNext = "protectBranch";
+    // GitHub fails the read that precedes the protection request, so that request is never sent
+    // (#246 C3, review 1076-R1-03: a request sent and never answered is not sent again).
+    vi.spyOn(prepared.github, "observeBranchProtection").mockRejectedValueOnce(new Error("HTTP 502 injected on observeBranchProtection"));
     const first = await prepared.runner.produceAndActivate(input);
     expect(first.allowed).toBe(false);
     expect(first.evidence["stage"]).toBe("production");
@@ -501,6 +533,36 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     const second = await prepared.runner.produceAndActivate(input);
     expect(second.evidence["stage"]).toBe("activation");
     expect(prepared.github.writes.map((write) => write.method)).toEqual(["protectBranch"]);
+  });
+
+  it("a request that failed without proof is never sent again: IN_DOUBT until GitHub shows its effect, then adopted with no write (#246 C3, review 1076-R1-03)", async () => {
+    const prepared = await prepare("pending-protection");
+    const input = { ...prepared.input, ownerApproval: ownerApproval(prepared) };
+    const protect = prepared.github.protectBranch.bind(prepared.github);
+    let held: (() => Promise<void>) | null = null;
+    vi.spyOn(prepared.github, "protectBranch").mockImplementationOnce(async (target, branch, desired) => {
+      held = () => protect(target, branch, desired);
+      throw new Error("client timeout; the server still holds the request");
+    });
+    const first = await prepared.runner.produceAndActivate(input);
+    expect(first.evidence["refusal"]).toBe("REMOTE_REFUSED");
+
+    prepared.github.writes.length = 0;
+    const second = await prepared.runner.produceAndActivate(input);
+    expect(second).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+      evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST", unsettled: [expect.objectContaining({ resourceType: "branch-protection" })] },
+    });
+    expect(prepared.github.writes).toEqual([]);
+
+    // The held request lands: GitHub shows the approved protection, and the resume adopts it.
+    if (held === null) throw new Error("the protection request never reached the server");
+    await (held as () => Promise<void>)();
+    prepared.github.writes.length = 0;
+    const third = await prepared.runner.produceAndActivate(input);
+    expect(third.evidence["stage"]).toBe("activation");
+    expect(prepared.github.writes).toEqual([]);
   });
 
   it("the control plane composes the runner with the production port, and an unconfigured work root refuses before it", async () => {
@@ -535,9 +597,11 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     prepared.harness.cp.runs.transition(prepared.runId, RunState.REVISION_REQUIRED, "sent back");
     const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: null });
     expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
-    expect(refused.evidence["stage"]).toBe("precondition");
+    // #246 C3 — the first pre-write check: a bootstrap application needs the run at CEO review.
+    expect(refused.reasonCode).toBe(ReasonCode.RUN_TRANSITION_ILLEGAL);
+    expect(refused.evidence).toMatchObject({ stage: "precondition", refusal: "RUN_NOT_AT_CEO_REVIEW" });
     noGitHubCall(prepared);
+    expect(prepared.harness.cp.bootstrapApplications.get(prepared.runId)).toBeNull();
   });
 });
 
@@ -600,6 +664,7 @@ describe("PR #1043 review witnesses — the run path", () => {
     const prepared = await prepare("rf1043-02-result", {
       artifacts: (real) => ({
         latest: (...args: Parameters<ArtifactsPort["latest"]>) => real.latest(...args),
+        list: (...args: Parameters<ArtifactsPort["list"]>) => real.list(...args),
         put: (...args: Parameters<ArtifactsPort["put"]>) => {
           if (args[1] === "REPO_FACTORY_RESULT" && failOnce) {
             failOnce = false;

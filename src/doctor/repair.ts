@@ -19,6 +19,10 @@ import {
 } from "../guard/managed-write-guard.ts";
 import type { WorktreeAuthorization, WorktreeManager } from "../verify/worktree.ts";
 import { canonical } from "../guard/workspace-probe.ts";
+import {
+  RESERVATION_RELEASE_PRECONDITIONS,
+  type RepoFactoryBootstrapRunner,
+} from "../bootstrap/repo-factory-bootstrap-run.ts";
 
 export type RepairAuthorization = "HERMES" | "OWNER";
 
@@ -147,6 +151,20 @@ export class RepairService {
       undo: "re-observe the repository",
       preconditions: ["the repository is readable"],
     },
+    // #246 C3, CEO decision (b) as corrected — a cancelled run's reservation released once its
+    // application is shown to have had no external effect, so a new run may reserve the same name
+    // under its own approval. It changes nothing outside the database and authorises nothing.
+    release_bootstrap_reservation: {
+      id: "release_bootstrap_reservation",
+      risk: "MEDIUM",
+      authorization: "HERMES",
+      description:
+        "Release a cancelled PROJECT_BOOTSTRAP run's reservation of its project id and repository identity",
+      expectedEffect:
+        "the application becomes RELEASED and keeps its record; a new run may reserve the same project id and repository identity under its own owner approval; when no external effect can be proven nothing is released and the reservation is kept, RELEASE_IN_DOUBT",
+      undo: "none needed: nothing outside the database changed, and the released run cannot be confirmed again",
+      preconditions: [...RESERVATION_RELEASE_PRECONDITIONS],
+    },
   };
 
   constructor(
@@ -162,9 +180,11 @@ export class RepairService {
   ) {}
 
   #ownerAuthority: OwnerAuthorityPort | null = null;
+  #bootstrapRecovery: BootstrapCheckoutRecoveryPort | null = null;
 
-  attach(ports: { ownerAuthority?: OwnerAuthorityPort }): void {
+  attach(ports: { ownerAuthority?: OwnerAuthorityPort; bootstrapRecovery?: BootstrapCheckoutRecoveryPort }): void {
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
+    if (ports.bootstrapRecovery) this.#bootstrapRecovery = ports.bootstrapRecovery;
   }
 
   catalog(): RepairOperation[] {
@@ -231,6 +251,17 @@ export class RepairService {
     }
 
     const outcome = await plan.perform(request.dryRun);
+    // A repair whose effect was refused at the moment of acting changed nothing, and says so.
+    if (outcome.refusal !== undefined) {
+      this.audit.record({
+        kind: "REPAIR_REFUSED",
+        reasonCode: outcome.refusal.reasonCode,
+        runId: request.runId ?? null,
+        actor: request.authorizedBy,
+        evidence: { operationId: operation.id, refusal: outcome.refusal.evidence },
+      });
+      return outcome.refusal;
+    }
 
     const receipt: RepairReceipt = {
       operationId: operation.id,
@@ -447,6 +478,29 @@ export class RepairService {
           },
         };
       }
+      case "release_bootstrap_reservation": {
+        const recovery = this.#bootstrapRecovery;
+        const runId = request.runId ?? null;
+        if (recovery === null) {
+          return {
+            preconditions: operation.preconditions.map((precondition) =>
+              checked(precondition, false, { notChecked: "no bootstrap runner is attached to verify it" })),
+            perform: async () => ({ changes: 0, evidence: null }),
+          };
+        }
+        const inspected = recovery.inspectReservationRelease(runId);
+        // An unclear external effect keeps the reservation, and says so on it; a dry run records nothing.
+        if (inspected.inDoubt !== null && runId !== null && !request.dryRun) recovery.recordReleaseInDoubt(runId, inspected.inDoubt);
+        return {
+          preconditions: inspected.preconditions,
+          perform: async (dryRun) => {
+            if (dryRun) return { changes: 1, evidence: inspected.release };
+            const released = recovery.releaseReservation(runId, inspected.release);
+            if (!released.allowed) return { changes: 0, evidence: released.evidence, refusal: released as Decision<never> };
+            return { changes: 1, evidence: released.value };
+          },
+        };
+      }
       default:
         throw new Error(`missing repair plan for ${operation.id}`);
     }
@@ -519,8 +573,15 @@ export class RepairService {
 
 interface RepairPlan {
   preconditions: RepairReceipt["preconditionsChecked"];
-  perform(dryRun: boolean): Promise<{ changes: number; evidence: unknown }>;
+  /** `refusal` when the effect itself was refused at the moment of acting: nothing changed. */
+  perform(dryRun: boolean): Promise<{ changes: number; evidence: unknown; refusal?: Decision<never> }>;
 }
+
+/** #246 C3 — the bootstrap runner's reservation release, as the repair catalog uses it. */
+export type BootstrapCheckoutRecoveryPort = Pick<
+  RepoFactoryBootstrapRunner,
+  "inspectReservationRelease" | "releaseReservation" | "recordReleaseInDoubt"
+>;
 
 const checked = (precondition: string, satisfied: boolean, evidence: unknown): RepairReceipt["preconditionsChecked"][number] => ({
   precondition,

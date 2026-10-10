@@ -18,6 +18,7 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { RunRow } from "../../src/domain/types.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { digestOf } from "../../src/core/digest.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ManagedManifestWrite } from "../../src/registry/project-registry.ts";
 import type { HermesReceiptPortOptions } from "../../src/runtime/hermes-receipt-port.ts";
 import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
@@ -336,26 +337,38 @@ export const dispatchBootstrapRun = async (cp: ControlPlane, clock: Clock, runId
 };
 
 /**
- * TODO(C3): issue #246 slice C3 reopens the bootstrap CONFIRM. Until then every CONFIRM door refuses
- * it `BOOTSTRAP_APPLICATION_NOT_AVAILABLE`, so a fixture that needs a COMPLETED bootstrap run does
- * what that CONFIRM's transaction does — `finalizeBootstrapActivationConfirm`, then COMPLETED under
- * the bootstrap-activation authority — in one transaction, and names itself. Delete with the guard.
+ * Issue #246 slice C3 reopened the bootstrap CONFIRM through the Repo Factory runner's full path, and
+ * the gate completes a bootstrap only on the WRITTEN application record that path writes. A fixture
+ * that activates a bootstrap without the runner (`BootstrapActivation.activate` directly) has no such
+ * record, so its CONFIRM is refused `BOOTSTRAP_APPLICATION_NOT_AVAILABLE`; one that needs the run
+ * COMPLETED does what that CONFIRM's transaction does — `finalizeBootstrapActivationConfirm`, then
+ * COMPLETED under the bootstrap-activation authority — in one transaction, and names itself.
  */
 export const completeBootstrapRunUntilC3 = (
   cp: ControlPlane,
   input: { runId: string; candidateSnapshotDigest: string; ceoSessionId: string },
-) =>
-  cp.db.txDecision(() => {
-    const finalized = cp.bootstrap.finalizeBootstrapActivationConfirm({ ...input, confirmedAt: cp.clock.nowIso() });
-    if (!finalized.allowed) return finalized;
-    return cp.runs.transition(
-      input.runId,
-      RunState.COMPLETED,
-      "CEO CONFIRM (fixture, until C3)",
-      { candidateSnapshotDigest: input.candidateSnapshotDigest },
-      cp.completionAuthoritiesForTests().bootstrapActivation,
-    );
+) => {
+  // Such a fixture has no runner, so no anchored approval and no attempt ledger: the finalizer's
+  // completion chain (#246 C3, review 1076-R1-02) is stood in for, by name and for this call only.
+  const production = cp.bootstrap.attachCompletionChain({
+    verifyCompletionChain: () => ({ allowed: true, reasonCode: ReasonCode.OK, evidence: {}, value: undefined }),
   });
+  try {
+    return cp.db.txDecision(() => {
+      const finalized = cp.bootstrap.finalizeBootstrapActivationConfirm({ ...input, confirmedAt: cp.clock.nowIso() });
+      if (!finalized.allowed) return finalized;
+      return cp.runs.transition(
+        input.runId,
+        RunState.COMPLETED,
+        "CEO CONFIRM (fixture, until C3)",
+        { candidateSnapshotDigest: input.candidateSnapshotDigest },
+        cp.completionAuthoritiesForTests().bootstrapActivation,
+      );
+    });
+  } finally {
+    cp.bootstrap.attachCompletionChain(production);
+  }
+};
 
 /**
  * Fixtures model a real worker as its own READY session with the task-scoped binding that

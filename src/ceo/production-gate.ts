@@ -7,6 +7,7 @@ import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "./owner-authority.ts";
+import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
@@ -85,6 +86,23 @@ export interface Escalation {
   openedAt: string;
 }
 
+/**
+ * #246 C3 — the bootstrap application record, as the CEO decision reads and completes it: a CONFIRM
+ * completes a bootstrap only on a WRITTEN application of that candidate, and a FINAL_REVISE is
+ * refused once the application is frozen.
+ */
+export type BootstrapApplicationsPort = Pick<BootstrapApplications, "get" | "assertNotFrozen" | "markCompleted">;
+
+/**
+ * #246 C3, review 1076-R1-02 — the chain a WRITTEN bootstrap application completes on, verified by
+ * the Repo Factory runner: the approval anchored as its execution's identity and the stored result
+ * attributed to the attempt ledger. A WRITTEN phase and a stored result are database rows, so the
+ * decision that completes the run asks for the chain itself rather than trusting the phase.
+ */
+export interface BootstrapCompletionChainPort {
+  verifyCompletionChain(runId: string, candidateSnapshotDigest: string): Decision<void>;
+}
+
 export interface BootstrapActivationFinalizer {
   finalizeBootstrapActivationConfirm(input: {
     runId: string;
@@ -139,6 +157,8 @@ export interface CeoDecisionInput {
 export class ProductionGate {
   #continuity: ContinuityGate | null = null;
   #ownerAuthority: OwnerAuthorityPort | null = null;
+  #bootstrapApplications: BootstrapApplicationsPort | null = null;
+  #bootstrapCompletionChain: BootstrapCompletionChainPort | null = null;
   #bootstrapActivation: BootstrapActivationFinalizer | null = null;
   #sourceReadLeases: SourceReadLeasePort | null = null;
 
@@ -162,11 +182,15 @@ export class ProductionGate {
     continuity?: ContinuityGate;
     ownerAuthority?: OwnerAuthorityPort;
     bootstrapActivation?: BootstrapActivationFinalizer;
+    bootstrapApplications?: BootstrapApplicationsPort;
+    bootstrapCompletionChain?: BootstrapCompletionChainPort;
     sourceReadLeases?: SourceReadLeasePort;
   }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
     if (ports.bootstrapActivation) this.#bootstrapActivation = ports.bootstrapActivation;
+    if (ports.bootstrapApplications) this.#bootstrapApplications = ports.bootstrapApplications;
+    if (ports.bootstrapCompletionChain) this.#bootstrapCompletionChain = ports.bootstrapCompletionChain;
     if (ports.sourceReadLeases) this.#sourceReadLeases = ports.sourceReadLeases;
   }
 
@@ -517,7 +541,7 @@ export class ProductionGate {
    * between packet and confirm, the confirm is void rather than approximately right.
    */
   submitCeoDecision(input: CeoDecisionInput): Decision<{ state: RunState }> {
-    const admitted = this.admitCeoDecision(input);
+    const admitted = this.admitCeoDecision(input, "decide");
     if (!admitted.allowed) return admitted as Decision<{ state: RunState }>;
     const { isBootstrap } = admitted.value;
 
@@ -560,6 +584,15 @@ export class ProductionGate {
               { runId: input.runId },
             );
           }
+          // #246 C3, review 1076-R1-02 — the finalizer runs only on the verified chain, asked again
+          // inside the transaction that completes the run and its application.
+          const chain = this.#bootstrapCompletionChain;
+          const verified = chain
+            ? chain.verifyCompletionChain(input.runId, input.candidateSnapshotDigest)
+            : deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, "the bootstrap completion chain verifier is not configured", {
+                runId: input.runId,
+              });
+          if (!verified.allowed) return verified as Decision<{ state: RunState }>;
           const finalized = finalizer.finalizeBootstrapActivationConfirm({
             runId: input.runId,
             candidateSnapshotDigest: input.candidateSnapshotDigest,
@@ -579,6 +612,18 @@ export class ProductionGate {
             : undefined,
         );
         if (!transition.allowed) return transition as Decision<{ state: RunState }>;
+
+        // #246 C3 — the application that produced this activation is COMPLETED with the run, in
+        // this transaction; a refusal here undoes the run's COMPLETED as well.
+        if (input.decision === "CONFIRM" && isBootstrap) {
+          const applications = this.#bootstrapApplications;
+          const completed = applications
+            ? applications.markCompleted(input.runId, input.candidateSnapshotDigest)
+            : deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, "the bootstrap application record is not configured", {
+                runId: input.runId,
+              });
+          if (!completed.allowed) throw acpError(completed.reasonCode, completed.message, completed.evidence);
+        }
 
         this.audit.record({
           kind: "CEO_DECISION",
@@ -612,11 +657,17 @@ export class ProductionGate {
    * `submitCeoDecision` asks the same question again, so passing here admits nothing by itself.
    */
   assertCeoDecisionAdmissible(input: CeoDecisionInput): Decision<void> {
-    const admitted = this.admitCeoDecision(input);
+    const admitted = this.admitCeoDecision(input, "apply");
     return admitted.allowed ? allow(ReasonCode.OK, undefined) : (admitted as Decision<void>);
   }
 
-  private admitCeoDecision(input: CeoDecisionInput): Decision<{ isBootstrap: boolean }> {
+  /**
+   * `stage` is where the question is asked. A bootstrap CONFIRM is asked twice: before its
+   * application runs (`apply` — the CONFIRM door and the Repo Factory runner, which perform the
+   * writes before the decision), and again by the decision itself (`decide`), which completes the
+   * run only on the WRITTEN application of the candidate it names (#246 C3).
+   */
+  private admitCeoDecision(input: CeoDecisionInput, stage: "apply" | "decide"): Decision<{ isBootstrap: boolean }> {
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
     if (run.state !== RunState.READY_FOR_CEO_REVIEW) {
@@ -653,17 +704,41 @@ export class ProductionGate {
     const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
     if (!independence.allowed) return independence as Decision<{ isBootstrap: boolean }>;
 
-    // Issue #246 PR-C — a bootstrap CONFIRM is what sets off the Repo Factory GitHub writes, and
-    // until slice C3's durable application record (reservation, pre-write checks, attributable
-    // recovery) exists, no bootstrap run may reach them. Here, in admission, so every CONFIRM door
-    // is refused before the runner, before an owner approval is consumed and before any GitHub
-    // call; `submitCeoDecision` asks the same question again. C3 removes this refusal.
-    if (isBootstrap && input.decision === "CONFIRM") {
-      return deny(
-        ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
-        "a PROJECT_BOOTSTRAP confirmation cannot be applied until its durable application record exists",
-        { runId: input.runId, decision: input.decision },
-      );
+    // Issue #246 PR-C slice C3 — a bootstrap CONFIRM sets off the Repo Factory GitHub writes, and
+    // only the runner's full path performs them: the pre-write checks, the reservation, an attempt
+    // recorded before every external write, WRITTEN with the result, then activation. The decision
+    // itself completes the run only on the WRITTEN application of the candidate it names, so a
+    // CONFIRM that skipped that path completes nothing.
+    if (isBootstrap && input.decision === "CONFIRM" && stage === "decide") {
+      const application = this.#bootstrapApplications?.get(input.runId) ?? null;
+      if (application?.phase !== "WRITTEN" || application.candidateSnapshotDigest !== input.candidateSnapshotDigest) {
+        return deny(
+          ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+          "a PROJECT_BOOTSTRAP confirmation completes only on its WRITTEN application record, which the Repo Factory runner writes",
+          {
+            runId: input.runId,
+            decision: input.decision,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+            applicationPhase: application?.phase ?? null,
+            applicationCandidate: application?.candidateSnapshotDigest ?? null,
+          },
+        );
+      }
+      // Review 1076-R1-02 — the WRITTEN phase is a row; the chain behind it is what completes the run,
+      // the same chain the runner requires: the anchored approval and the result the ledger attributes.
+      const chain = this.#bootstrapCompletionChain;
+      const verified = chain
+        ? chain.verifyCompletionChain(input.runId, input.candidateSnapshotDigest)
+        : deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, "the bootstrap completion chain verifier is not configured", {
+            runId: input.runId,
+          });
+      if (!verified.allowed) return verified as Decision<{ isBootstrap: boolean }>;
+    }
+    // #246 C3 — the contract freeze: once an external write of the application may have happened,
+    // the run cannot be sent back for another plan.
+    if (isBootstrap && input.decision === "FINAL_REVISE") {
+      const frozen = this.#bootstrapApplications?.assertNotFrozen(input.runId, "FINAL_REVISE");
+      if (frozen !== undefined && !frozen.allowed) return frozen as Decision<{ isBootstrap: boolean }>;
     }
 
     // The packet records what the owner gate said when it was published, but a later

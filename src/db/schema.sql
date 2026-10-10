@@ -1330,6 +1330,128 @@ CREATE TABLE IF NOT EXISTS handoffs (
 CREATE INDEX IF NOT EXISTS handoffs_project ON handoffs(project_id, status);
 
 -- ---------------------------------------------------------------------------
+-- bootstrap_applications  (schema v43, issue #246 PR-C slice C3)
+--   Lifecycle: one row per project-less PROJECT_BOOTSTRAP run whose CEO CONFIRM consumed the owner's
+--   approval of its GitHub writes. Inserted RESERVED, with its first attempt recorded, in the
+--   transaction that consumes the approval; every later attempt is recorded before that attempt's
+--   first external write. WRITTEN in the transaction that stores the produced result; COMPLETED in the
+--   CEO's completion transaction; or STRANDED when what GitHub holds at the target cannot be
+--   attributed to this run by the evidence it recorded. RELEASED when a cancelled run's reservation is
+--   released after its application is shown to have had no external effect (CEO decision (b)): the row
+--   and its release record are kept, and only its hold on the project id and repository identity ends.
+--   Integrity: the reservation closes the race two runs would otherwise run to one project id or
+--   repository identity (one unreleased row each, by the partial unique indexes below); the identity
+--   and the digests it was reserved under never change, so a recovery can only re-apply the candidate
+--   it froze, under the scope its approval named; the phase only moves forward, and a STRANDED or
+--   RELEASED row keeps its evidence. Never replaced, never deleted: a released reservation is not
+--   reused, a new run reserves the name again under its own approval.
+--   WITHOUT ROWID, so no REPLACE through a hidden rowid deletes a row.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bootstrap_applications (
+  run_id                    TEXT NOT NULL PRIMARY KEY REFERENCES runs(run_id),
+  -- What the run reserves: the manifest's project id and the repository identity it creates.
+  project_id                TEXT NOT NULL,
+  repository_identity       TEXT NOT NULL,
+  bootstrap_operation_id    TEXT NOT NULL,
+  -- What the CEO confirmed and the owner approved, by digest: the PLAN artifact, its manifest, its
+  -- planned outputs, the candidate snapshot, the passing BOOTSTRAP_PLAN review, and the write scope
+  -- the owner approved (the approval receipt's parameter digest).
+  plan_digest               TEXT NOT NULL,
+  manifest_digest           TEXT NOT NULL,
+  planned_outputs_digest    TEXT NOT NULL,
+  candidate_snapshot_digest TEXT NOT NULL,
+  review_digest             TEXT NOT NULL,
+  approval_digest           TEXT NOT NULL,
+  phase                     TEXT NOT NULL CHECK (phase IN ('RESERVED','WRITTEN','COMPLETED','STRANDED','RELEASED')),
+  -- Application attempts recorded, each before that attempt's first external write.
+  attempts                  INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  -- The last refusal an attempt met; on a STRANDED row, the cause and the evidence; on a RELEASED
+  -- row, the release record and the evidence that no external effect happened.
+  last_refusal_json         TEXT,
+  reserved_at               TEXT NOT NULL,
+  CHECK (phase = 'RESERVED' OR attempts >= 1),
+  CHECK (phase <> 'STRANDED' OR last_refusal_json IS NOT NULL),
+  CHECK (phase <> 'RELEASED' OR last_refusal_json IS NOT NULL)
+) WITHOUT ROWID;
+-- One unreleased reservation per project id and per repository identity: a RELEASED row keeps its
+-- record and no longer holds the name.
+CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_project_held
+  ON bootstrap_applications(project_id) WHERE phase <> 'RELEASED';
+CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_identity_held
+  ON bootstrap_applications(repository_identity) WHERE phase <> 'RELEASED';
+
+-- CP-HI-02 — #246 C3: a reservation is born RESERVED with no attempt and no refusal; every later
+-- phase is reached by an update the phase guard below admits, never written directly.
+CREATE TRIGGER IF NOT EXISTS bootstrap_applications_born_reserved
+BEFORE INSERT ON bootstrap_applications
+WHEN NEW.phase <> 'RESERVED' OR NEW.attempts <> 0 OR NEW.last_refusal_json IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_PHASE_INVALID');
+END;
+
+-- CP-HI-01 — #246 C3: one reservation per run, ever, and one unreleased reservation per project id and
+-- per repository identity; a second is refused, not merged, and a REPLACE cannot take an existing
+-- reservation's place. A RELEASED row no longer holds its name, and a new run may reserve it.
+CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_replace
+BEFORE INSERT ON bootstrap_applications
+WHEN EXISTS (
+  SELECT 1 FROM bootstrap_applications
+   WHERE run_id = NEW.run_id
+      OR (project_id = NEW.project_id AND phase <> 'RELEASED')
+      OR (repository_identity = NEW.repository_identity AND phase <> 'RELEASED')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_NO_REPLACE');
+END;
+
+-- CP-HI-03 — #246 C3: what was reserved, and under which digests, is fixed once written, so a
+-- recovery can only re-apply the candidate the reservation froze.
+CREATE TRIGGER IF NOT EXISTS bootstrap_applications_identity_immutable
+BEFORE UPDATE ON bootstrap_applications
+WHEN NEW.run_id IS NOT OLD.run_id
+  OR NEW.project_id IS NOT OLD.project_id
+  OR NEW.repository_identity IS NOT OLD.repository_identity
+  OR NEW.bootstrap_operation_id IS NOT OLD.bootstrap_operation_id
+  OR NEW.plan_digest IS NOT OLD.plan_digest
+  OR NEW.manifest_digest IS NOT OLD.manifest_digest
+  OR NEW.planned_outputs_digest IS NOT OLD.planned_outputs_digest
+  OR NEW.candidate_snapshot_digest IS NOT OLD.candidate_snapshot_digest
+  OR NEW.review_digest IS NOT OLD.review_digest
+  OR NEW.approval_digest IS NOT OLD.approval_digest
+  OR NEW.reserved_at IS NOT OLD.reserved_at
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+
+-- CP-HI-02 — #246 C3: the phase only moves forward. A RESERVED row records one more attempt at a
+-- time, or a refusal; it becomes WRITTEN only after an attempt, STRANDED with its evidence, or
+-- RELEASED with its release record. A WRITTEN row records a refusal or becomes COMPLETED. COMPLETED,
+-- STRANDED and RELEASED are terminal.
+CREATE TRIGGER IF NOT EXISTS bootstrap_applications_phase_forward
+BEFORE UPDATE ON bootstrap_applications
+WHEN NOT (
+     (OLD.phase = 'RESERVED' AND NEW.phase = 'RESERVED' AND NEW.attempts = OLD.attempts + 1)
+  OR (OLD.phase IN ('RESERVED','WRITTEN') AND NEW.phase = OLD.phase AND NEW.attempts = OLD.attempts)
+  OR (OLD.phase = 'RESERVED' AND NEW.phase = 'WRITTEN' AND NEW.attempts = OLD.attempts AND OLD.attempts >= 1)
+  OR (OLD.phase = 'RESERVED' AND NEW.phase = 'STRANDED' AND NEW.attempts = OLD.attempts
+      AND NEW.last_refusal_json IS NOT NULL)
+  OR (OLD.phase = 'RESERVED' AND NEW.phase = 'RELEASED' AND NEW.attempts = OLD.attempts
+      AND NEW.last_refusal_json IS NOT NULL)
+  OR (OLD.phase = 'WRITTEN' AND NEW.phase = 'COMPLETED' AND NEW.attempts = OLD.attempts)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_PHASE_INVALID');
+END;
+
+-- CP-HI-06 — #246 C3: never removed. A deleted reservation would free its project id and identity
+-- for reuse, and a deleted STRANDED row would take its evidence with it.
+CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_delete
+BEFORE DELETE ON bootstrap_applications
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+
+-- ---------------------------------------------------------------------------
 -- verification_results  (PRD §17.6, §17.7)
 --   Lifecycle: one row per (snapshot, command, repository) execution.
 --   Integrity: the completeness gate counts these rows; a JSON blob cannot be
