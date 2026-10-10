@@ -1,0 +1,46 @@
+Warn: an ordinary run's finalization is released by any CEO_DECISION audit row naming its candidate: a raw-inserted row, with CEO_APPROVED reached through the in-process generic transition, merges and completes the run; the test pins this as a Limit candidate, so closing the gap flips it
+Warn: neither CEO door compares ceoSessionId with the authenticated peer; they agree only because each door re-checks that the peer holds the CEO binding and the gate requires the argument to be that binding, so a door whose authenticator does not pin the binding reopens it
+Unverified: the adopted CEO door was driven in process through the production admission and Hermes server, not over its socket
+Record-Id: r-b2astep0
+Provenance: inherited 330f82467247ef172c1e816772875fd34dc44b01
+
+Limit: each refusal's own code is evidence.refusal; the top-level reason code is an existing one, the way a bootstrap PLAN's refusals are named
+Ruled-out: storing a CONTRACT_CHANGE PLAN without its manifest, as plan_submit did for every non-bootstrap run | the PLAN is refused rather than stored without it, so nothing reviewed or later activated can name a manifest the PLAN does not carry
+Warn: every lowering of the verification bar against the run's pin is refused, because nothing can bind the owner's approval to the exact lowerings yet; a later binding must keep the mechanical comparison as the trigger, not a human-gate declaration alone
+Warn: the lowering comparison does not judge resource limits, network, environment or the branch profile
+Record-Id: r-b2acarry
+Follows: r-b2astep0
+Provenance: inherited e100449928eab37db511566c2a8d96ab549994a7
+
+Limit: PLAN freshness is checked after the review and at publication only; a PLAN replaced after the packet is published is left for the CEO confirmation path to refuse
+Ruled-out: verifying a CONTRACT_CHANGE candidate against the manifest its PLAN proposes | a candidate could then set its own bar; the carried manifest is only reviewed and later activated, and verification stays on the run's dispatch pin instead
+Warn: the production gate's packet for a no-repository CONTRACT_CHANGE candidate still summarizes its review as not applicable; the BLIND_REVIEW artifact, which carries the contractChange binding, is the review, and the packet builder should be taught it
+Warn: a manifest coverage key is <projectId>:#manifest/<digest>, and a digest has its own colon, so coverage keys split at :#manifest/ before the last colon
+Record-Id: r-b2abind
+Follows: r-b2acarry
+Provenance: inherited c6641e37520fb796869dedf4886399df86bf2979
+
+Limit: any change to the approved digest of a workflow the base declares is refused under CONTRACT_CHANGE_WORKFLOW_DIGEST_CHANGED, because nothing in this slice reads the new bytes and no owner evidence can be bound to the change yet; workflow content changes wait for the owner-evidence path
+Limit: a workflow added beside commands that already take CI evidence is refused, since a check from any approved workflow can supply that evidence; adding a workflow to a base with no CI-evidenced command stays allowed
+Ruled-out: comparing verification obligations by command id | an equivalent rename of a local-only command was refused as a removal; commands, profiles and post-merge entries are compared by the specification they resolve to instead
+Warn: a command whose evidence includes CI keeps its id in its identity, because a CI result is matched to a command by its check name, which is the command id; renaming one is a removal
+Warn: a post-merge entry is the name of a check required after merge, so keeping the name keeps it, and an entry that names a command may also be kept by an entry naming a command that discharges it
+Warn: resource limits, environment and network are now part of the comparison: a looser limit is a lowering and a tighter one is stricter; only the branch profile is not judged, which supersedes the earlier warning that limits, network and environment were not
+Record-Id: r-b2acompare
+Follows: r-b2abind
+Supersedes: r-b2acarry
+Provenance: inherited 2b82f12029afd0f6e255281a8fdb3147a258d328
+
+Limit: each CONTRACT_CHANGE refusal's own code is evidence.refusal; the top-level reason code is an existing one, the way a bootstrap PLAN's refusals are named, and the catalogue in core/reason-codes.ts gains no entry for them
+Ruled-out: storing a CONTRACT_CHANGE PLAN without its manifest, as plan_submit did for every non-bootstrap run | the PLAN is refused rather than stored without it, so nothing reviewed or later activated can name a manifest the PLAN does not carry
+Record-Id: r-b2acarryrestate
+Follows: r-b2acompare
+Provenance: inherited 0c73a6fc55a8dd07e3d04faae0e49f661d12b6f0
+
+Ruled-out: matching base obligations to proposed ones with a many-to-one some | one proposed command discharged several base commands, so two required commands checking the same thing collapsed into one evidence input; a one-to-one assignment is used instead, for commands, profile selections and distinct post-merge check names
+Warn: post-merge trust takes the first ciWorkflows entry matching a check's role and name, so a new entry may not share a retained entry's role and check name, and base entries that share one must keep their relative order
+Warn: post-merge entries are check names the consumer deduplicates, so each distinct base name needs its own proposed name: the same name, or one naming a command that discharges the command it named
+Warn: a command id the proposal declares more often than the base does is refused, because CI results, result rows and memory limits are keyed by id
+Record-Id: r-b2aassign
+Follows: r-b2acarryrestate
+Provenance: inherited 53326423b1e20fe25421b9be6e13f79d3c4fbf8b
