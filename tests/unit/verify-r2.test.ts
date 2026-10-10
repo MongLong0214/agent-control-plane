@@ -9,6 +9,8 @@ import { dispatchBootstrapRun, fixtureManifest, makeHarness } from "../helpers/h
 import { applyPassingChange } from "../helpers/harness.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { stableFixtureExecutable } from "../helpers/stable-fixture-executable.ts";
+import { normalized, planCarrying } from "../helpers/contract-change.ts";
+import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
 import {
   assertPortableManifest,
   GATE_ENTRY_MODULE_FORMAT_UNPINNED,
@@ -130,6 +132,8 @@ const frozenPinnedCandidate = async (options: {
   candidateChange?: (repositoryPath: string) => void;
   /** Runs after the candidate commit and before the freeze. */
   beforeFreeze?: (repositoryPath: string) => void;
+  /** Runs after dispatch, with the run: where a CONTRACT_CHANGE run submits its PLAN (#246 B2-a). */
+  afterDispatch?: (harness: ReturnType<typeof makeHarness>, runId: string) => void;
   kind?: RunKind;
 } = {}) => {
   const harness = makeHarness();
@@ -165,6 +169,7 @@ const frozenPinnedCandidate = async (options: {
   if (!created.allowed) throw new Error(created.message);
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);
   if (!dispatched.allowed) throw new Error(dispatched.message);
+  options.afterDispatch?.(harness, created.value.runId);
   if (options.candidateChange) {
     gitSync(harness.repoPath, ["checkout", "-q", "-b", options.workBranch ?? "task/verify-r2"]);
     options.candidateChange(harness.repoPath);
@@ -977,19 +982,25 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
 
   it("RF-S22 arm:validator: a CONTRACT_CHANGE run is judged by the current gate, not the gate it proposes", async () => {
     const proposed = "const app = require('../src/app.js');\nprocess.exit(app() >= 1 ? 0 : 1);\n";
+    const proposedManifest = { ...ENTRY_ONLY, gateEntries: [entry("gate/check.cjs", proposed)] };
     const candidate = await frozenPinnedCandidate({
       kind: RunKind.CONTRACT_CHANGE,
       manifest: ENTRY_ONLY,
       beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      // #246 B2-a: a CONTRACT_CHANGE run proposes its manifest in full on its PLAN, which the freeze
+      // binds; the proposal is the new gate, through the same door a CTO uses.
+      afterDispatch: (harness, runId) => {
+        const submitted = createCtoMcpPort(harness.cp).submitPlan(runId, planCarrying(proposedManifest));
+        if (!submitted.allowed) throw new Error(submitted.message);
+      },
       candidateChange: (repo) => writeFiles(repo, {
         "gate/check.cjs": proposed,
-        ".agent-control-plane/project.json": `${JSON.stringify({
-          ...ENTRY_ONLY,
-          gateEntries: [entry("gate/check.cjs", proposed)],
-        }, null, 2)}\n`,
+        ".agent-control-plane/project.json": `${JSON.stringify(proposedManifest, null, 2)}\n`,
       }),
     });
     expect(candidate.run.kind).toBe(RunKind.CONTRACT_CHANGE);
+    // The proposal is bound to the run, and the pin it would replace is still the one that judges.
+    expect(candidate.snapshot.contractChange).toMatchObject({ manifestDigest: manifestDigest(normalized(proposedManifest)) });
 
     expect(await verifyPinned(candidate)).toMatchObject({
       allowed: false,
