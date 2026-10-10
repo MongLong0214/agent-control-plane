@@ -64,7 +64,8 @@ import { frameRecord, writeWholeSync } from "./whole-write.ts";
  * answers with an identity, again with that answer. A retry reconciles a pending write against
  * GitHub before anything else: a create by the node id its response named; a push by the commit
  * it pushed; a setting or protection by whether GitHub already holds the requested state. A
- * pending write that GitHub shows no trace of is retried. One whose outcome the ledger cannot
+ * pending write that GitHub shows no trace of is retried — except a create that recorded no answer,
+ * which is sent again only on C3's proof that it never was (#246 C5, review C5I-R1-02). One whose outcome the ledger cannot
  * settle — a create whose response never arrived, with a repository now at the name — is refused
  * with `indeterminate: true`, rather than adopted by the marker the create put in the repository's
  * description: that marker is public once the repository exists, so a replacement can carry it
@@ -673,6 +674,12 @@ export interface ApplyGitHubOperationsInput {
   /** Mints the marker a create puts in the repository's description. */
   newMarker?: () => string;
   /**
+   * #246 C5, review C5I-R1-02 — whether a pending create that recorded no answer is proven never sent:
+   * C3's withheld-request record of exactly that intent (`readWithheldRequest`). Without that proof the
+   * create stays in doubt and is not sent again.
+   */
+  provenUnsent: (intent: PendingWrite) => boolean;
+  /**
    * Issue #246 C2, review round 1 (RF-REVIEW-01) — whether the tree at `head` is exactly the approved
    * files. The commit this run makes is asked before this function is called at all, so a first push
    * sends only an approved tree. A head GitHub already holds — a resumed push's receipted head, or a
@@ -992,6 +999,23 @@ export const applyGitHubOperations = async (
         { recordedNodeId: pendingWrite?.respondedNodeId ?? null },
         false,
       );
+    }
+    // #246 C5, review C5I-R1-02 — a create this operation sent and never saw answered may still land: a
+    // client that gave up proves nothing about the server, and no repository at the name now proves
+    // nothing about a request still in flight. It is sent again only on C3's proof that it never was
+    // (`provenUnsent`); otherwise it stays in doubt, the same judgement the runner makes before any
+    // attempt (review 1076-R1-03).
+    if (pendingWrite !== undefined) {
+      if (!input.provenUnsent(pendingWrite)) {
+        return stop(
+          ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+          "UNCONFIRMED_PENDING_REQUEST",
+          `${id}'s create was sent and never answered, and nothing proves it was not; it is not sent again, and the operation stays in doubt`,
+          id,
+          { indeterminate: true, attemptedAt: pendingWrite.attemptedAt },
+          false,
+        );
+      }
     }
 
     const createdAt = clock.nowIso();
