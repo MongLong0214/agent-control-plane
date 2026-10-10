@@ -17,6 +17,7 @@ import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import { ArtifactKind } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
+import { contractChangePlanForSubmission, isContractChangeRun } from "../registry/contract-change-plan.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { BlindReviewGate } from "../review/blind-review.ts";
 import type { CandidatePipeline } from "../run/candidate-pipeline.ts";
@@ -144,10 +145,14 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       };
     },
     // #246 C2 — a project-less bootstrap run's PLAN carries its manifest in full, checked portable
-    // and against the digest the PLAN names before anything is stored; any other run's is stored
-    // exactly as before.
+    // and against the digest the PLAN names before anything is stored. #246 B2-a — so does a
+    // CONTRACT_CHANGE run's, checked against the run's pinned manifest as well. Any other run's is
+    // stored exactly as before.
     submitPlan: (runId: string, plan: Record<string, unknown>): Decision<{ digest: string }> => {
-      const admitted = planForSubmission(source.runs.require(runId), plan);
+      const run = source.runs.require(runId);
+      const admitted = isContractChangeRun(run)
+        ? contractChangePlanForSubmission(run, plan, (digest) => source.projects.manifest(digest))
+        : planForSubmission(run, plan);
       if (!admitted.allowed) return admitted as Decision<{ digest: string }>;
       return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, admitted.value).digest });
     },
