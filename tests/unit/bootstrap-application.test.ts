@@ -16,6 +16,9 @@ import {
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
+import { readWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
+import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
+import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
 import { processGroupEmpty, readProcessGroup } from "../../src/bootstrap/attempt-writer-group.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { type ProjectManifest, manifestDigest } from "../../src/contracts/manifest.ts";
@@ -1966,7 +1969,7 @@ const resultReceiptsOf = (f: Fixture, run: ReviewedRun): Array<Record<string, un
     .content.externalWriteReceipts;
 
 /** The active CEO replaced by another session, as an operator's switch does. */
-const replaceCeo = (f: Fixture): void => {
+const replaceCeo = (f: Fixture): string => {
   const replacement = f.harness.cp.sessions.create({ provider: "scripted", model: "replacement-ceo" });
   f.harness.cp.sessions.transition(replacement.sessionId, SessionLifecycle.READY, "replacement");
   const bound = f.harness.cp.bindings.switchTo({
@@ -1976,6 +1979,7 @@ const replaceCeo = (f: Fixture): void => {
     conversation: "REPLACED",
   });
   expect(bound.allowed, JSON.stringify(bound)).toBe(true);
+  return replacement.sessionId;
 };
 
 /**
@@ -2528,4 +2532,83 @@ describe("#246 C3 review 1076-R2: a decline after the writes completes nothing a
       expect(ledgerOf(f, run).receipts).toHaveLength(4);
     });
   });
+});
+
+/**
+ * Review 1076-R2 — the production port reads the owner, and for a user account the authenticated user,
+ * before its create POST. The CEO replaced during either read stops the POST: authority is asked at the
+ * moment the request would start. The intent the ledger holds for it is recorded as withheld, so the
+ * next attempt may make the create rather than hold it in doubt.
+ */
+describe("#246 C3 review 1076-R2: authority is asked when a write request starts, after the port's own reads", () => {
+  const productionCreate = (
+    f: Fixture,
+    lookups: Record<string, () => unknown>,
+  ): { posts: string[]; create: GitHubWritePort["createRepository"] } => {
+    const create = f.github.createRepository.bind(f.github);
+    const posts: string[] = [];
+    const port = createBootstrapGitHubWritePort({
+      async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+        if (method === "GET" && lookups[path] !== undefined) return lookups[path]!() as T;
+        if (method === "POST") {
+          posts.push(path);
+          const requested = body as { description: string; visibility: "public" | "private" };
+          const repo = await create({ owner: "acme", name: "fixture" }, requested.visibility, requested.description);
+          return {
+            node_id: repo.nodeId,
+            full_name: repo.fullName,
+            visibility: repo.visibility,
+            private: repo.visibility === "private",
+            description: repo.description,
+            default_branch: repo.defaultBranch,
+          } as T;
+        }
+        throw new Error(`unexpected request ${method} ${path}`);
+      },
+    });
+    return { posts, create: port.createRepository };
+  };
+
+  for (const branch of ["organization", "user"] as const) {
+    it(`the CEO replaced during the ${branch} owner lookup: no POST, nothing created, and the next attempt creates it once`, async () => {
+      await withFixture(async (f) => {
+        const run = await reviewedBootstrap(f, cleanTreeManifest(`r2-port-${branch}`));
+        await approveWrites(f, run);
+        let replacement: string | null = null;
+        const replace = () => {
+          replacement ??= replaceCeo(f);
+        };
+        const lookups: Record<string, () => unknown> =
+          branch === "organization"
+            ? { "users/acme": () => (replace(), { type: "Organization" }) }
+            : { "users/acme": () => ({ type: "User" }), user: () => (replace(), { login: "acme" }) };
+        const port = productionCreate(f, lookups);
+        vi.spyOn(f.github, "createRepository").mockImplementation(port.create as never);
+        const refused = await confirm(f, run);
+        expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { refusal: "CEO_ADMISSION_LOST" } });
+        expect(port.posts).toEqual([]);
+        expect(writesOf(f)).toEqual([]);
+        expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+        // The create's intent is in the ledger and was never sent: recorded as withheld.
+        const [intent] = ledgerOf(f, run).pending;
+        expect(intent).toMatchObject({ resourceType: "repository", respondedNodeId: null });
+        expect(readWithheldRequest(join(f.workRoot, run.runId), intent!["operationId"] as string, intent!["attemptedAt"] as string)).toMatchObject({
+          attempt: 1,
+          refusal: "CEO_ADMISSION_LOST",
+        });
+
+        // The current CEO confirms: the withheld create is made, once.
+        await f.harness.cp.continuity.evaluate("the replacement CEO confirms");
+        const resumed = await f.harness.cp.bootstrapProducer.produceAndActivateApproved({
+          runId: run.runId,
+          candidateSnapshotDigest: run.candidate,
+          ceoSessionId: replacement!,
+        });
+        expect(resumed, JSON.stringify(resumed)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+        expect(port.posts).toHaveLength(1);
+        expect(writesOf(f)).toEqual(WRITE_METHODS);
+        expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+      });
+    });
+  }
 });

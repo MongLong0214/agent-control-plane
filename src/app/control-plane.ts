@@ -64,7 +64,8 @@ import { Doctor } from "../doctor/doctor.ts";
 import { Watchdog } from "../doctor/watchdog.ts";
 import { RepairService } from "../doctor/repair.ts";
 import { BootstrapActivation } from "../bootstrap/activation.ts";
-import { createGhCliGitHubWritePort, type GitHubWritePort } from "../bootstrap/github-write-port.ts";
+import type { GitHubWritePort } from "../bootstrap/github-write-port.ts";
+import { createBootstrapGitHubWritePort } from "../bootstrap/bootstrap-write-guard.ts";
 import { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { Daemon, type DaemonOptions } from "../daemon/daemon.ts";
@@ -730,7 +731,9 @@ export class ControlPlane {
         artifacts: this.artifacts,
         ownerAuthority: this.ownerAuthority,
         bootstrap: this.bootstrap,
-        githubPort: config.repoFactory?.githubPort ?? createGhCliGitHubWritePort(),
+        // #246 C3, review 1076-R2 — the production port asks the attempt's authority at the moment each
+        // write request starts, after any read the port method makes first.
+        githubPort: config.repoFactory?.githubPort ?? createBootstrapGitHubWritePort(),
         workRoot: config.repoFactory?.workRoot ?? null,
         clock: this.clock,
         // #246 C3 — the application record and the pre-write checks' sources.

@@ -159,3 +159,76 @@ export const writeApprovalAnchor = (
   }
   return allow(ReasonCode.OK, anchor);
 };
+
+/**
+ * #246 C3, review 1076-R2 — a request the attempt refused at the moment it would have started, because
+ * its authority no longer held: written by the runner, once, before it throws, so the request is known
+ * never to have been sent. A later attempt finds the intent the ledger keeps for it pending; this record
+ * of exactly that intent — its operation and the time it was begun — settles it as unsent, so the
+ * request may be made then rather than held in doubt forever. Same trust boundary as the anchor.
+ */
+export const WITHHELD_REQUEST_SCHEMA_ID = "acp.bootstrap.withheld-request.v1";
+
+export const withheldRequestSchema = z
+  .object({
+    schema: z.literal(WITHHELD_REQUEST_SCHEMA_ID),
+    runId: z.string().min(1),
+    attempt: z.number().int().positive(),
+    operationId: z.string().min(1),
+    resourceType: z.string().min(1),
+    attemptedAt: z.string().min(1),
+    withheldAt: z.string().min(1),
+    refusal: z.string().min(1),
+  })
+  .strict();
+
+export type WithheldRequest = z.infer<typeof withheldRequestSchema>;
+
+const withheldRequestPath = (workDir: string, operationId: string, attemptedAt: string): string =>
+  join(workDir, "withheld-requests", `${digestOf({ operationId, attemptedAt }).replace(/^sha256:/, "")}.json`);
+
+/** The withheld-request record of exactly this intent, or null when there is none or it is not a private, exact record. */
+export const readWithheldRequest = (workDir: string, operationId: string, attemptedAt: string): WithheldRequest | null => {
+  const path = withheldRequestPath(workDir, operationId, attemptedAt);
+  let stat: Stats;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return null;
+  }
+  if (
+    stat.isSymbolicLink() ||
+    !stat.isFile() ||
+    typeof process.getuid !== "function" ||
+    stat.uid !== process.getuid() ||
+    (stat.mode & 0o022) !== 0
+  ) {
+    return null;
+  }
+  try {
+    const parsed = withheldRequestSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
+    return parsed.success && parsed.data.operationId === operationId && parsed.data.attemptedAt === attemptedAt ? parsed.data : null;
+  } catch {
+    return null;
+  }
+};
+
+/** Writes the record once, exclusively, synced. Throws when it cannot: the caller then refuses without it. */
+export const writeWithheldRequest = (workDir: string, record: Omit<WithheldRequest, "schema">): void => {
+  const directory = join(workDir, "withheld-requests");
+  ensurePrivateDirectory(workDir);
+  ensurePrivateDirectory(directory);
+  const descriptor = openSync(withheldRequestPath(workDir, record.operationId, record.attemptedAt), "wx", 0o600);
+  try {
+    writeSync(descriptor, `${JSON.stringify({ schema: WITHHELD_REQUEST_SCHEMA_ID, ...record }, null, 2)}\n`);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  const handle = openSync(directory, "r");
+  try {
+    fsyncSync(handle);
+  } finally {
+    closeSync(handle);
+  }
+};

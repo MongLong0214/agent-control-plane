@@ -22,7 +22,14 @@ import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { ACPBootstrapActivationResult, BootstrapActivation } from "./activation.ts";
 import { type GroupMember, ownGroupSubprocesses, processGroupEmpty } from "./attempt-writer-group.ts";
-import { type OwnerApprovalAnchor, readApprovalAnchor, writeApprovalAnchor } from "./bootstrap-approval-anchor.ts";
+import { type BootstrapWriteRequest, runUnderWriteGuard } from "./bootstrap-write-guard.ts";
+import {
+  type OwnerApprovalAnchor,
+  readApprovalAnchor,
+  readWithheldRequest,
+  writeApprovalAnchor,
+  writeWithheldRequest,
+} from "./bootstrap-approval-anchor.ts";
 import type {
   AttemptWriter,
   BootstrapApplication,
@@ -264,7 +271,7 @@ export interface RepoFactoryBootstrapRunnerDeps {
   artifacts: Pick<ArtifactStore, "latest" | "list" | "put">;
   ownerAuthority: Pick<OwnerAuthorityPort, "assertConsumedApproval" | "consumeApproval" | "assertConsumable">;
   bootstrap: Pick<BootstrapActivation, "activate" | "readinessForFactoryResult" | "reviewForConfirmation">;
-  /** The production composition passes `createGhCliGitHubWritePort()`; tests pass a double. */
+  /** The production composition passes `createBootstrapGitHubWritePort()`; tests pass a double. */
   githubPort: GitHubWritePort;
   /** Each run produces under `<workRoot>/<runId>`. Null means this deployment never configured one. */
   workRoot: string | null;
@@ -301,6 +308,15 @@ const WRITE_REQUEST_KIND = {
   setDefaultBranch: "setting",
   protectBranch: "branch-protection",
 } as const satisfies Record<string, PendingWrite["resourceType"]>;
+
+/** The kind of ledger intent a GitHub request at its start belongs to, or null for one that is none. */
+const requestKind = (request: BootstrapWriteRequest): PendingWrite["resourceType"] | null => {
+  if (request.kind === "git") return request.method === "push" ? "branch" : null;
+  if (request.method === "POST") return "repository";
+  if (request.method === "PATCH") return "setting";
+  if (request.method === "PUT") return "branch-protection";
+  return null;
+};
 
 /** What a CONFIRM was admitted on, asked again where it is relied on after an await (review 1076-R1-04). */
 interface AuthoritySnapshot {
@@ -1014,16 +1030,38 @@ export class RepoFactoryBootstrapRunner {
 
     // Before every external write the attempt makes: its authority still holds (R1-04), and no request
     // an earlier attempt left pending is sent again (R1-03). The first is asked before the request's
-    // pending intent reaches the ledger, so a refusal leaves nothing pending; the guarded port asks
-    // both again at the request itself. A write already made is still recorded when it returns.
+    // pending intent reaches the ledger, so a refusal leaves nothing pending; then again by the
+    // guarded port when the method is called, and once more at the moment the request itself starts,
+    // after any read the port method awaited first (review 1076-R2). A refusal there leaves an intent
+    // in the ledger that was never sent, so it is recorded as withheld: a later attempt may make it.
+    // A write already started is recorded when it returns, and is never retried.
     let staleAuthority: Decision<void> | null = null;
     let withheld: Evidence | null = null;
     const knownPending = new Set(pendingAtStart.keys());
-    const githubPort = this.guardedPort(pendingAtStart, () => {
+    let ledgerPending: readonly PendingWrite[] = [...pendingAtStart.values()];
+    const beforeWrite = (kind: PendingWrite["resourceType"] | null): void => {
       const holds = authorityHolds(true);
-      if (!holds.allowed) staleAuthority ??= holds;
-      return holds;
-    }, (evidence) => {
+      if (holds.allowed) return;
+      staleAuthority ??= holds;
+      const intent = kind === null ? undefined : ledgerPending.find((pending) => pending.resourceType === kind);
+      if (intent !== undefined) {
+        try {
+          writeWithheldRequest(workDir, {
+            runId,
+            attempt,
+            operationId: intent.operationId,
+            resourceType: intent.resourceType,
+            attemptedAt: intent.attemptedAt,
+            withheldAt: this.deps.clock.nowIso(),
+            refusal: typeof holds.evidence["refusal"] === "string" ? holds.evidence["refusal"] : "AUTHORITY_LOST",
+          });
+        } catch {
+          // Unrecorded, the intent stays in doubt: nothing is sent either way.
+        }
+      }
+      throw acpError(holds.reasonCode, holds.message, holds.evidence);
+    };
+    const githubPort = this.guardedPort(pendingAtStart, beforeWrite, (evidence) => {
       withheld ??= evidence;
     });
 
@@ -1033,7 +1071,8 @@ export class RepoFactoryBootstrapRunner {
     // checkout of this attempt's own, created exclusively and kept if the attempt fails; nothing an
     // earlier attempt left is reused. The result and WRITTEN are stored in one transaction.
     let ledgerStageRecorded = false;
-    const produced = await produceRepoFactoryResult({
+    const writeGuard = { beforeRequest: (request: BootstrapWriteRequest) => beforeWrite(requestKind(request)) };
+    const produced = await runUnderWriteGuard(writeGuard, () => produceRepoFactoryResult({
       plan: executable,
       workDir,
       checkoutPath: attemptCheckoutPath(workDir, executable.repositoryRole, attempt),
@@ -1062,6 +1101,7 @@ export class RepoFactoryBootstrapRunner {
           }
           for (const intent of intents) knownPending.add(intent.operationId);
         }
+        ledgerPending = state.pending;
       },
       clock: this.deps.clock,
       github: { port: githubPort, authority },
@@ -1074,7 +1114,7 @@ export class RepoFactoryBootstrapRunner {
         });
         if (!written.allowed) throw acpError(written.reasonCode, written.message, written.evidence);
       },
-    }).catch((error: unknown): Decision<RepoFactoryResult> => {
+    })).catch((error: unknown): Decision<RepoFactoryResult> => {
       // The attempt stopped itself before a request: answered below, by what stopped it.
       if (staleAuthority === null && withheld === null) throw error;
       return deny(ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS, "the attempt stopped before its next request", { stage: "production" });
@@ -1554,7 +1594,7 @@ export class RepoFactoryBootstrapRunner {
    */
   private guardedPort(
     pendingAtStart: ReadonlyMap<string, PendingWrite>,
-    authorityHolds: () => Decision<void>,
+    beforeWrite: (kind: PendingWrite["resourceType"]) => void,
     onWithheld: (evidence: Evidence) => void,
   ): GitHubWritePort {
     const port = this.deps.githubPort;
@@ -1574,8 +1614,7 @@ export class RepoFactoryBootstrapRunner {
             onWithheld(evidence);
             throw acpError(ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS, "a request an earlier attempt left pending is not sent again", evidence);
           }
-          const holds = authorityHolds();
-          if (!holds.allowed) throw acpError(holds.reasonCode, holds.message, holds.evidence);
+          beforeWrite(kind);
           return (value as (...args: unknown[]) => Promise<unknown>).apply(target, args);
         };
       },
@@ -1707,8 +1746,15 @@ export class RepoFactoryBootstrapRunner {
     const createOperation = execution.operations.find((operation) => operation.resourceType === "repository");
     const receipt = createOperation === undefined ? undefined : ledger.value.receipts.get(createOperation.operationId);
     const pending = createOperation === undefined ? undefined : ledger.value.pending.get(createOperation.operationId);
-    // The requests an earlier attempt sent and never receipted.
-    const pendingAtStart = new Map([...ledger.value.pending].filter(([operationId]) => !ledger.value.receipts.has(operationId)));
+    // The requests an earlier attempt sent and never receipted. An intent the runner recorded as withheld
+    // at the moment its request would have started was never sent (review 1076-R2), so it is not one.
+    const pendingAtStart = new Map(
+      [...ledger.value.pending].filter(
+        ([operationId, intent]) =>
+          !ledger.value.receipts.has(operationId) &&
+          readWithheldRequest(join(workRoot, runId), operationId, intent.attemptedAt) === null,
+      ),
+    );
     // #246 C3, review 1076-R1-03 — a request an earlier attempt sent and never saw answered may still
     // land: a client that gave up proves nothing about the server. Unless GitHub now shows its effect,
     // or main's resume would stop on it without sending, it is not sent again, and the application
