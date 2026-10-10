@@ -253,7 +253,6 @@ export const ReasonCode = {
   BUZZ_MENTION_NOT_RESOLVED: "BUZZ_MENTION_NOT_RESOLVED",
 
   // --- registries ----------------------------------------------------------
-  MANIFEST_ACTIVATION_EVIDENCE_MISSING: "MANIFEST_ACTIVATION_EVIDENCE_MISSING",
   MANIFEST_ACTIVATION_GRANT_CONSUMED: "MANIFEST_ACTIVATION_GRANT_CONSUMED",
   /**
    * #246 B2-b — a CONTRACT_CHANGE run has no activation grant: its CEO CONFIRM never issued one. A

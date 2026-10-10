@@ -80,7 +80,7 @@ describe("manifest mutations are guard-bound", () => {
     expect(harness.cp.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM manifests")!.n).toBe(before);
   });
 
-  it("a rejecting activation guard leaves both the active project and manifest store unchanged", () => {
+  it("a refused activation leaves both the active project and manifest store unchanged", () => {
     const harness = makeHarness();
     const original = fixtureManifest("manifest-activation-denied");
     const registered = harness.cp.projects.register({
@@ -90,22 +90,25 @@ describe("manifest mutations are guard-bound", () => {
       authorization: harness.cp.manifestAuthorizationForTests(original),
     });
     expect(registered.allowed).toBe(true);
-    const revised = { ...original, postMergeCommands: ["verify-revised"] };
-    const rejectingGuard = {
-      evaluate: () => deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "activation guard refusal"),
-      consume: () => deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "activation guard refusal"),
-    } as unknown as ManagedWriteGuard;
-    const registry = new ProjectRegistry(harness.cp.db, harness.clock, harness.cp.audit, rejectingGuard);
+    // #246 B2-b — the store guard above still binds manifest writes; activation is bound instead by the
+    // CONTRACT_CHANGE grant and the daemon finalizer's completion capability, and refuses without them.
+    const registry = new ProjectRegistry(harness.cp.db, harness.clock, harness.cp.audit, harness.cp.guard);
     const beforeActive = harness.cp.projects.require(original.projectId).activeManifestDigest;
     const beforeManifests = harness.cp.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM manifests")!.n;
-    const refused = registry.activateManifest(
-      original.projectId,
-      revised,
-      { runKind: "CONTRACT_CHANGE", runId: null },
-      harness.cp.manifestAuthorizationForTests(revised),
-    );
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);
+    const withoutCapability = registry.activateManifest("run_without_grant", {
+      completion: undefined as never,
+      attemptId: "finalize_none",
+      workflows: [],
+    });
+    expect(withoutCapability.allowed).toBe(false);
+    expect(withoutCapability.reasonCode).toBe(ReasonCode.COMPLETION_AUTHORITY_DENIED);
+    const withoutGrant = harness.cp.projects.activateManifest("run_without_grant", {
+      completion: harness.cp.daemonFinalizationAuthorities().completion,
+      attemptId: "finalize_none",
+      workflows: [],
+    });
+    expect(withoutGrant.allowed).toBe(false);
+    expect(withoutGrant.reasonCode).toBe(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING);
     expect(harness.cp.projects.require(original.projectId).activeManifestDigest).toBe(beforeActive);
     expect(harness.cp.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM manifests")!.n).toBe(beforeManifests);
   });

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { ControlPlane } from "../app/control-plane.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { ArtifactKind, RunState } from "../domain/types.ts";
+import { ArtifactKind, RunKind, RunState } from "../domain/types.ts";
 import { currentBranch } from "../git/git.ts";
 import type { DaemonFinalizerAuthority } from "../guard/managed-write-guard.ts";
 import {
@@ -17,6 +17,10 @@ import {
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import { verifySnapshotFreshness } from "../snapshot/candidate-snapshot.ts";
 import type { CompletionAuthority } from "../run/run-engine.ts";
+import type {
+  ActivatedWorkflowEvidence,
+  ManifestActivationTarget,
+} from "../registry/manifest-activation-grants.ts";
 
 const FINALIZATION_LEASE_TTL_MS = 30 * 60_000;
 
@@ -276,14 +280,13 @@ export class ApprovedRunFinalizer {
             }),
           );
         }
-        const done = this.cp.runs.transition(
+        const done = await this.complete(
           runId,
-          RunState.COMPLETED,
+          attemptId,
           "daemon finalized run with nothing to merge",
           noMergeEvidence,
-          this.#completionAuthority,
         );
-        if (!done.allowed) return this.handleFailure(runId, attemptId, done as Decision<unknown>);
+        if (!done.allowed) return this.handleFailure(runId, attemptId, done);
         this.completeAttempt(runId, attemptId);
         completed = true;
         this.cp.audit.record({
@@ -357,14 +360,13 @@ export class ApprovedRunFinalizer {
         if (!verified.allowed) return this.handleFailure(runId, attemptId, verified as Decision<unknown>);
 
         if (index === prepared.length - 1) {
-          const done = this.cp.runs.transition(
+          const done = await this.complete(
             runId,
-            RunState.COMPLETED,
+            attemptId,
             "all ordered merges passed exact post-merge verification",
             { attemptId, merged },
-            this.#completionAuthority,
           );
-          if (!done.allowed) return this.handleFailure(runId, attemptId, done as Decision<unknown>);
+          if (!done.allowed) return this.handleFailure(runId, attemptId, done);
         }
       }
 
@@ -408,6 +410,11 @@ export class ApprovedRunFinalizer {
     }
     const ceoConfirmation = this.cp.ceo.currentCeoConfirmation(runId, candidateDigest);
     if (!ceoConfirmation.allowed) return ceoConfirmation as Decision<ConfirmedMergePlan[]>;
+    // #246 B2-b — a CONTRACT_CHANGE finalizes only on the grant its CEO CONFIRM issued, asked before any
+    // GitHub write: a run that reached CEO_APPROVED any other way, a base another activation moved, or a
+    // CEO authority that no longer holds the role merges nothing.
+    const granted = run.kind === RunKind.CONTRACT_CHANGE ? this.cp.manifestGrants.verify(runId, "PRE_MERGE") : null;
+    if (granted && !granted.allowed) return granted as Decision<ConfirmedMergePlan[]>;
     if (this.cp.runs.currentCandidate(runId) !== candidateDigest) {
       return deny(ReasonCode.EVIDENCE_STALE, "candidate changed after the finalization lease was acquired", {
         runId,
@@ -435,6 +442,14 @@ export class ApprovedRunFinalizer {
       })),
     );
     if (!freshness.allowed) return freshness as Decision<ConfirmedMergePlan[]>;
+
+    // #246 B2-b — the workflows the manifest names are compared at the candidate before anything is
+    // merged, so a workflow that would refuse activation refuses here, with nothing written; activation
+    // compares them again at the merge commit.
+    if (granted?.allowed) {
+      const workflows = await this.compareActivationWorkflows(runId, granted.value, snapshotArtifact.content);
+      if (!workflows.allowed) return workflows as Decision<ConfirmedMergePlan[]>;
+    }
 
     const humanGate = this.cp.ceo.currentHumanGateDecisionDigest(runId);
     if (!humanGate.allowed) return humanGate as Decision<ConfirmedMergePlan[]>;
@@ -473,6 +488,120 @@ export class ApprovedRunFinalizer {
       plans.push(plan.value);
     }
     return allow(ReasonCode.OK, plans);
+  }
+
+  /**
+   * COMPLETED, after the last exact post-merge verification. A CONTRACT_CHANGE run completes only in
+   * the one transaction that consumes its grant and moves the project's active manifest (#246 B2-b):
+   * the grant is verified, every workflow the manifest points to is compared at the exact repository and
+   * revision first — reads, outside the transaction — and then activation and COMPLETED commit together
+   * or not at all. A refusal is MANIFEST_ACTIVATION_REFUSED; after a merge the caller's failure path
+   * makes that BLOCKED_POST_MERGE, and the active manifest has not moved.
+   */
+  private async complete(
+    runId: string,
+    attemptId: string,
+    reason: string,
+    evidence: Record<string, unknown>,
+  ): Promise<Decision<unknown>> {
+    if (this.cp.runs.get(runId)?.kind !== RunKind.CONTRACT_CHANGE) {
+      return this.cp.runs.transition(runId, RunState.COMPLETED, reason, evidence, this.#completionAuthority);
+    }
+    const refused = (cause: { reasonCode: ReasonCode; message: string; evidence: Record<string, unknown> }): Decision<unknown> =>
+      deny(ReasonCode.MANIFEST_ACTIVATION_REFUSED, "the CONTRACT_CHANGE manifest was not activated, and the active manifest did not move", {
+        runId,
+        attemptId,
+        refusal: { reasonCode: cause.reasonCode, message: cause.message, evidence: cause.evidence },
+      });
+    const target = this.cp.manifestGrants.verify(runId, "ACTIVATION");
+    if (!target.allowed) return refused(target);
+    const workflows = await this.compareActivationWorkflows(runId, target.value);
+    if (!workflows.allowed) return refused(workflows);
+    const done = this.cp.db.txDecision(() => {
+      const activated = this.cp.projects.activateManifest(runId, {
+        completion: this.#completionAuthority,
+        attemptId,
+        workflows: workflows.value,
+      });
+      if (!activated.allowed) return activated as Decision<unknown>;
+      return this.cp.runs.transition(
+        runId,
+        RunState.COMPLETED,
+        reason,
+        { ...evidence, manifestActivation: activated.value },
+        this.#completionAuthority,
+      ) as Decision<unknown>;
+    });
+    return done.allowed ? done : refused(done);
+  }
+
+  /**
+   * CEO ruling 6 — before activation, every workflow the manifest points to is compared at the exact
+   * repository its role names and the revision this finalization verified: the merge commit, for a
+   * repository this run merged (its candidate head, when asked before the merge); otherwise the commit
+   * the manifest's default branch names now. An entry
+   * the base declares byte for byte reuses the base's exact-byte approval. One that cannot be read or
+   * does not hash to its approved digest refuses activation: a contract that cannot be verified is
+   * never activated.
+   */
+  private async compareActivationWorkflows(
+    runId: string,
+    target: ManifestActivationTarget,
+    /** Before any merge: the candidate, whose head stands in for the merge commit of each repository it carries. */
+    beforeMerge?: CandidateSnapshot,
+  ): Promise<Decision<ActivatedWorkflowEvidence[]>> {
+    const repositories = this.cp.repositories
+      .byProject(target.grant.projectId)
+      .filter((repository) => repository.registration === "REGISTERED");
+    const compared: ActivatedWorkflowEvidence[] = [];
+    for (const workflow of target.workflowEvidence) {
+      const entry = {
+        repositoryRole: workflow.repositoryRole,
+        repositoryIdentity: workflow.repositoryRemote,
+        path: workflow.path,
+        checkName: workflow.checkName,
+        approvedDigest: workflow.approvedDigest,
+      };
+      if (workflow.unchangedFromBase) {
+        compared.push({ ...entry, evidence: "REUSED", revision: null, observedDigest: null });
+        continue;
+      }
+      const unverified = (message: string, detail: Record<string, unknown> = {}): Decision<ActivatedWorkflowEvidence[]> =>
+        deny(ReasonCode.MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED, message, { runId, workflow: entry, ...detail });
+      if (workflow.approvedDigest === null || workflow.unapprovedFirstActivation) {
+        return unverified("the workflow names no approved digest to compare against");
+      }
+      const repository = repositories.find((candidate) => candidate.repositoryRole === workflow.repositoryRole);
+      if (!repository || repository.identity !== workflow.repositoryRemote) {
+        return unverified("no registered repository of the project is the exact repository the workflow names", {
+          registeredIdentity: repository?.identity ?? null,
+        });
+      }
+      const receipt = beforeMerge ? null : this.mergeReceipt(runId, repository.identity);
+      const merged = beforeMerge
+        ? beforeMerge.repositories.find((candidate) => candidate.identity === repository.identity)?.candidateHead ?? null
+        : receipt?.status === "APPLIED" && receipt.verified === 1 ? this.mergeSha(receipt) : null;
+      const read = await this.cp.github.workflowDigestAt(
+        repository.identity,
+        merged ? { sha: merged } : { branch: target.manifest.branchProfile.defaultBranch },
+        workflow.path,
+      );
+      if (!read.allowed) {
+        return unverified("the workflow could not be read at the exact revision", {
+          revision: merged ?? null,
+          branch: merged ? null : target.manifest.branchProfile.defaultBranch,
+          cause: { reasonCode: read.reasonCode, message: read.message, evidence: read.evidence },
+        });
+      }
+      if (read.value.workflowDigest !== workflow.approvedDigest) {
+        return unverified("the workflow's bytes at the exact revision are not the ones the manifest approves", {
+          revision: read.value.revision,
+          observedDigest: read.value.workflowDigest,
+        });
+      }
+      compared.push({ ...entry, evidence: "READ", revision: read.value.revision, observedDigest: read.value.workflowDigest });
+    }
+    return allow(ReasonCode.OK, compared);
   }
 
   private acquireAttempt(runId: string, candidateDigest: string): Decision<string> {

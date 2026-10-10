@@ -348,7 +348,15 @@ const createHermesServerFromPort = (
   server.registerTool(
     "ceo_decision_submit",
     { description: "Submit the CEO's final decision.", inputSchema: { ...mutation, runId: z.string(), decision: z.enum(["CONFIRM", "FINAL_REVISE", "OWNER_DECISION_REQUIRED"]), candidateSnapshotDigest: z.string(), ceoSessionId: z.string(), rationale: z.string() } },
-    async (args) => write(args.idempotencyKey, async () => respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale }))),
+    async (args) => write(args.idempotencyKey, async () => {
+      // #246 B2-b — the door's authenticated session travels with the decision, never an argument, so a
+      // CONTRACT_CHANGE grant is issued only when it is the CEO session the call names.
+      const peer = authenticateMcpPeer(authenticate);
+      const ingress = peer.allowed
+        ? { sessionId: peer.value.sessionId ?? null, sessionIncarnation: peer.value.sessionIncarnation ?? null }
+        : { sessionId: null, sessionIncarnation: null };
+      return respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale, ingress }));
+    }),
   );
 
   server.registerTool(

@@ -11,6 +11,12 @@ import type { AuditLog } from "../db/audit.ts";
 import { bootstrapReservationsHolding } from "../bootstrap/bootstrap-applications.ts";
 import type { Db } from "../db/database.ts";
 import { type Activity, type Availability, Role } from "../domain/types.ts";
+import { type CompletionAuthority, isDaemonFinalizerCompletion } from "../run/run-engine.ts";
+import {
+  type ActivatedWorkflowEvidence,
+  type ManifestActivationGrants,
+  sameWorkflowCoverage,
+} from "./manifest-activation-grants.ts";
 import {
   type BootstrapManifestAuthority,
   type GuardRequest,
@@ -46,6 +52,8 @@ export interface ManagedManifestWrite {
  * canonical digest, and the project points at whichever digest is currently active.
  */
 export class ProjectRegistry {
+  #grants: ManifestActivationGrants | null = null;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -136,93 +144,93 @@ export class ProjectRegistry {
   }
 
   /**
-   * Activating a new contract is a deliberate act. A candidate that edits the manifest
-   * during a run does not change what judges it — that requires a dedicated
-   * CONTRACT_CHANGE run (§10.4, CP-HI-03).
+   * #246 B2-b — the one path that moves an existing project's active manifest.
+   *
+   * Activating a new contract is a deliberate act. A candidate that edits the manifest during a run
+   * does not change what judges it — that requires a dedicated CONTRACT_CHANGE run (§10.4, CP-HI-03)
+   * whose CEO CONFIRM issued it a grant. Only the daemon finalizer calls this, with its completion
+   * capability and its running attempt, in the transaction that also completes the run: the grant is
+   * verified there, consumed, and the pointer moves from the run's pin to the manifest the run's PLAN
+   * carries — the caller supplies no manifest. The repository bindings are marked drifted, and the move
+   * is audited. Any refusal leaves all of it as it was.
+   *
+   * `workflows` is what the finalizer read, outside this transaction, of every workflow the manifest
+   * points to (CEO ruling 6); it must cover each one exactly.
    */
   activateManifest(
-    projectId: string,
-    manifest: ProjectManifest,
-    via: { runKind: string; runId: string | null },
-    authorization: ManagedManifestWrite,
-  ): Decision<string> {
-    const project = this.get(projectId);
-    if (!project) return deny(ReasonCode.NOT_FOUND, "unknown project", { projectId });
-
-    if (via.runKind !== "CONTRACT_CHANGE" && via.runKind !== "PROJECT_BOOTSTRAP") {
-      return deny(
-        ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN,
-        "manifest activation requires a CONTRACT_CHANGE or PROJECT_BOOTSTRAP run",
-        { projectId, current: project.activeManifestDigest, viaRunKind: via.runKind },
-      );
+    runId: string,
+    input: {
+      completion: CompletionAuthority;
+      attemptId: string;
+      workflows: readonly ActivatedWorkflowEvidence[];
+    },
+  ): Decision<{ from: string; to: string; grantId: string }> {
+    if (!isDaemonFinalizerCompletion(input.completion)) {
+      return deny(ReasonCode.COMPLETION_AUTHORITY_DENIED, "only the daemon finalizer activates a CONTRACT_CHANGE manifest", { runId });
     }
-
-    if (!authorization || authorization.projectId !== projectId || authorization.runId !== via.runId) {
-      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "manifest activation proof does not bind this project and run", {
-        projectId,
-        viaRunId: via.runId,
-        authorizedProjectId: authorization?.projectId ?? null,
-        authorizedRunId: authorization?.runId ?? null,
-      });
+    const grants = this.#grants;
+    if (!grants) {
+      return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "manifest activation grants are not configured", { runId });
     }
+    return this.db.txDecision(() => {
+      const target = grants.verify(runId, "ACTIVATION");
+      if (!target.allowed) return target as Decision<{ from: string; to: string; grantId: string }>;
+      const { grant, manifest } = target.value;
+      const covered = sameWorkflowCoverage(target.value.workflowEvidence, input.workflows);
+      if (!covered) {
+        return deny(ReasonCode.MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED, "activation must carry a comparison for every workflow the manifest names", {
+          runId,
+          expected: target.value.workflowEvidence.map((workflow) => `${workflow.repositoryRole}:${workflow.path}`),
+          supplied: input.workflows.map((workflow) => `${workflow.repositoryRole}:${workflow.path}`),
+        });
+      }
+      const consumed = grants.consume(runId, input.attemptId);
+      if (!consumed.allowed) return consumed as Decision<{ from: string; to: string; grantId: string }>;
 
-    // Authorise the activation effect before storing the candidate. Activation has a
-    // distinct grant from the manifest-store effect, and a rejected activation must not
-    // leave even the new manifest row behind as a side effect.
-    const portable = assertPortableManifest(manifest);
-    if (!portable.allowed) return portable as Decision<string>;
-    const activationAuthorized = this.authorizeManifestWrite(portable.value, authorization);
-    if (!activationAuthorized.allowed) return activationAuthorized as Decision<string>;
-
-    const stored = this.storeManifest(portable.value, authorization);
-    if (!stored.allowed) return stored;
-    if (project.activeManifestDigest === stored.value) return stored;
-
-    return this.db.tx(() => {
-      const fresh = this.get(projectId);
-      if (!fresh) return deny(ReasonCode.NOT_FOUND, "unknown project", { projectId });
-      if (fresh.activeManifestDigest === stored.value) return stored;
-
-      // A run label and a terminal state are not authorization for an arbitrary new
-      // contract. The production gate must issue an immutable grant that names this
-      // project, run kind, candidate, and exact manifest digest.
-      const grant = this.activationGrant(projectId, stored.value, via);
-      if (!grant.allowed) return grant;
-      if (this.activationGrantConsumed(grant.value.artifactDigest)) {
-        return deny(
-          ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED,
-          "manifest activation grant has already been consumed",
-          { projectId, runId: via.runId, activationGrantDigest: grant.value.artifactDigest },
+      // Content-addressed and immutable: the PLAN's manifest was checked portable and to hash to the
+      // grant's digest when the PLAN was stored, and again by `verify` just above.
+      if (!this.db.get(`SELECT 1 FROM manifests WHERE digest = ?`, [grant.manifestDigest])) {
+        this.db.run(
+          `INSERT INTO manifests (digest, schema_id, content_json, created_at) VALUES (?, ?, ?, ?)`,
+          [grant.manifestDigest, manifest.schema, JSON.stringify(manifest), this.clock.nowIso()],
         );
       }
-
       this.db.run(`UPDATE projects SET active_manifest_digest = ? WHERE project_id = ?`, [
-        stored.value,
-        projectId,
+        grant.manifestDigest,
+        grant.projectId,
       ]);
-      // Repository bindings are local evidence of the formerly active contract. A new
-      // project digest invalidates that evidence until each checkout is re-read and a
-      // managed operation acknowledges the resulting head.
+      // Repository bindings are local evidence of the formerly active contract. A new project digest
+      // invalidates that evidence until each checkout is re-read and a managed operation acknowledges
+      // the resulting head.
       this.db.run(
         `UPDATE repositories
             SET active_manifest_digest = ?, drift_state = 'DRIFTED'
           WHERE project_id = ?`,
-        [stored.value, projectId],
+        [grant.manifestDigest, grant.projectId],
       );
       this.audit.record({
         kind: "PROJECT_MANIFEST_ACTIVATED",
-        projectId,
-        runId: via.runId,
+        projectId: grant.projectId,
+        runId,
         evidence: {
-          from: fresh.activeManifestDigest,
-          to: stored.value,
-          viaRunKind: via.runKind,
-          activationGrantDigest: grant.value.artifactDigest,
-          candidateSnapshotDigest: grant.value.candidateSnapshotDigest,
+          from: grant.fromManifestDigest,
+          to: grant.manifestDigest,
+          viaRunKind: "CONTRACT_CHANGE",
+          grantId: grant.grantId,
+          grantDigest: grant.grantDigest,
+          attemptId: input.attemptId,
+          candidateSnapshotDigest: grant.candidateSnapshotDigest,
+          workflows: input.workflows.map((workflow) => ({ ...workflow })),
         },
       });
-      return stored;
+      return allow(ReasonCode.OK, { from: grant.fromManifestDigest, to: grant.manifestDigest, grantId: grant.grantId });
     });
+  }
+
+  /** #246 B2-b — wired once by the composition root; activation reads its grants through nothing else. */
+  attachManifestGrants(grants: ManifestActivationGrants): void {
+    if (this.#grants) throw new Error("manifest activation grants are already attached");
+    this.#grants = grants;
   }
 
   get(projectId: string): ProjectRecord | null {
@@ -314,92 +322,6 @@ export class ProjectRegistry {
     return allow(ReasonCode.WRITE_ALLOWED, undefined);
   }
 
-  private activationGrant(
-    projectId: string,
-    manifestDigestValue: string,
-    via: { runKind: string; runId: string | null },
-  ): Decision<{ artifactDigest: string; candidateSnapshotDigest: string }> {
-    const run = via.runId
-      ? this.db.get<{
-          kind: string;
-          state: string;
-          project_id: string | null;
-          current_candidate_digest: string | null;
-        }>(
-          `SELECT kind, state, project_id, current_candidate_digest FROM runs WHERE run_id = ?`,
-          [via.runId],
-        )
-      : null;
-    if (
-      !run ||
-      run.project_id !== projectId ||
-      run.kind !== via.runKind ||
-      run.state !== "COMPLETED" ||
-      !run.current_candidate_digest
-    ) {
-      return deny(
-        ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN,
-        "manifest activation requires a completed dedicated run with a current candidate",
-        {
-          projectId,
-          runId: via.runId,
-          observed: run
-            ? {
-                kind: run.kind,
-                state: run.state,
-                projectId: run.project_id,
-                currentCandidateDigest: run.current_candidate_digest,
-              }
-            : null,
-        },
-      );
-    }
-
-    const grants = this.db.all<RawActivationGrant>(
-      `SELECT digest, candidate_snapshot_digest, content_json FROM run_artifacts
-        WHERE run_id = ? AND kind = 'APPROVAL' AND produced_by = 'production-gate'
-          AND superseded = 0
-        ORDER BY created_at DESC, rowid DESC`,
-      [via.runId],
-    );
-    const grant = grants.find((row) => {
-      const content = parseActivationGrant(row.content_json);
-      return (
-        content?.projectId === projectId &&
-        content.runId === via.runId &&
-        content.runKind === via.runKind &&
-        content.manifestDigest === manifestDigestValue &&
-        content.candidateSnapshotDigest === run.current_candidate_digest &&
-        row.candidate_snapshot_digest === run.current_candidate_digest
-      );
-    });
-    if (!grant) {
-      return deny(
-        ReasonCode.MANIFEST_ACTIVATION_EVIDENCE_MISSING,
-        "no production-gate activation grant proves this exact manifest and candidate",
-        { projectId, runId: via.runId, runKind: via.runKind, manifestDigest: manifestDigestValue },
-      );
-    }
-    return allow(ReasonCode.OK, {
-      artifactDigest: grant.digest,
-      candidateSnapshotDigest: run.current_candidate_digest,
-    });
-  }
-
-  private activationGrantConsumed(artifactDigest: string): boolean {
-    return this.db
-      .all<{ evidence_json: string }>(
-        `SELECT evidence_json FROM audit_events WHERE kind = 'PROJECT_MANIFEST_ACTIVATED'`,
-      )
-      .some((row) => {
-        try {
-          return (JSON.parse(row.evidence_json) as { activationGrantDigest?: unknown }).activationGrantDigest === artifactDigest;
-        } catch {
-          return false;
-        }
-      });
-  }
-
   private hydrate(row: RawProject): ProjectRecord {
     const bound = this.db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM assignments
@@ -426,37 +348,3 @@ interface RawProject {
   suspended: number;
   created_at: string;
 }
-
-interface RawActivationGrant {
-  digest: string;
-  candidate_snapshot_digest: string | null;
-  content_json: string;
-}
-
-interface ActivationGrant {
-  schema: "acp.manifest-activation-grant.v1";
-  projectId: string;
-  runId: string;
-  runKind: "CONTRACT_CHANGE" | "PROJECT_BOOTSTRAP";
-  manifestDigest: string;
-  candidateSnapshotDigest: string;
-}
-
-const parseActivationGrant = (content: string): ActivationGrant | null => {
-  try {
-    const value = JSON.parse(content) as Partial<ActivationGrant>;
-    if (
-      value.schema !== "acp.manifest-activation-grant.v1" ||
-      typeof value.projectId !== "string" ||
-      typeof value.runId !== "string" ||
-      (value.runKind !== "CONTRACT_CHANGE" && value.runKind !== "PROJECT_BOOTSTRAP") ||
-      typeof value.manifestDigest !== "string" ||
-      typeof value.candidateSnapshotDigest !== "string"
-    ) {
-      return null;
-    }
-    return value as ActivationGrant;
-  } catch {
-    return null;
-  }
-};
