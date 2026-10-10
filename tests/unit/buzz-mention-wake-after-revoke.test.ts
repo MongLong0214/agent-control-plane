@@ -154,6 +154,8 @@ const start = async () => {
     roleKey,
     relay,
     subscriber,
+    conversation,
+    server,
     mention: (text: string): BuzzMentionEvent =>
       signedMention({ author: owner.secretKey, addressedTo: cto.pubkey, room: ROOM, createdAt: secondsOf(h.cp.clock.nowIso()), text }),
     ownerMessages: () =>
@@ -201,6 +203,33 @@ it("writes no wake to a holder revoked while the wake was connecting, and leaves
     expect(pending.destroyed).toBe(true);
     // The wake attempt is all that was discarded: the message was admitted and is not marked
     // delivered or completed by the wake that was not written.
+    expect(f.ownerMessages()).toHaveLength(1);
+    expect(f.ownerMessages()[0]!.status).not.toBe("ACKED");
+  } finally {
+    await f.close();
+  }
+});
+
+/**
+ * The receiving side. A wake carries no authority: everything it can lead a session to do with ACP
+ * goes through that session's own authenticated connection, and each such call judges the holder
+ * again when it is made. A former holder that was woken before its revoke finds nothing to take.
+ */
+it("refuses the claim of a holder revoked after its wake landed, and leaves the message for the next holder", async () => {
+  const f = await start();
+  try {
+    const before = wakes.dialled.length;
+    f.h.clock.advance(1_000);
+    f.relay.publish(f.mention("woken, then revoked"));
+    await dialled(before + 1);
+    wakes.dialled.at(-1)!.succeed();
+    await f.relay.drain(f.subscriber);
+    expect(wakes.dialled.at(-1)!.frame).toBe(ROLE_WAKE_FRAME);
+
+    expect(f.h.cp.bindings.revoke(f.roleKey, "revoked after the wake landed").allowed).toBe(true);
+    const claimed = f.conversation.claimOwnerMessage(f.server, f.roleKey);
+    expect(claimed.allowed).toBe(false);
+    expect(claimed.reasonCode).toBe(ReasonCode.ROLE_PEER_STALE);
     expect(f.ownerMessages()).toHaveLength(1);
     expect(f.ownerMessages()[0]!.status).not.toBe("ACKED");
   } finally {
