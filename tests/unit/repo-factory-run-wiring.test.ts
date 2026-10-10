@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,10 +9,12 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { defaultConfig } from "../../src/app/control-plane.ts";
+import { processGroupEmpty } from "../../src/bootstrap/attempt-writer-group.ts";
 import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../../src/ceo/owner-authority.ts";
 import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
 import { allow } from "../../src/core/errors.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
@@ -771,6 +774,17 @@ describe("PR #1050 review witnesses", () => {
 
   it("RF1050-04: a receipt an earlier head consumed with no candidate is refused by name, and a new owner decision resumes from the ledger", async () => {
     const wired = await wire("rf1050-04-legacy");
+    // Review 1076-R3 — the failed attempt is recorded with a daemon that has exited by the time a new
+    // decision resumes it: a real process that led its own group, its group empty. The test process
+    // cannot stand for a daemon recovering its own attempt, since a vitest worker does not lead its group.
+    const exited = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { detached: true, stdio: "ignore" });
+    const writer = { pid: exited.pid!, startToken: readProcessStartToken(exited.pid!), startedAt: new Date().toISOString(), processGroup: exited.pid! };
+    const gone = new Promise((resolveExit) => exited.once("exit", resolveExit));
+    exited.kill("SIGKILL");
+    await gone;
+    await vi.waitFor(() => expect(processGroupEmpty(writer.processGroup)).toBe(true), { timeout: 10_000, interval: 20 });
+    expect(writer.startToken).not.toBeNull();
+    wired.harness.cp.bootstrapProducer.attachWriterLock(() => wired.daemon.lock.held(), () => writer);
     const approved = await approve(wired);
     if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
     const legacy = newestReceipt(wired);

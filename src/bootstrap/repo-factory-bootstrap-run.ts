@@ -21,7 +21,7 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { ACPBootstrapActivationResult, BootstrapActivation } from "./activation.ts";
-import { type GroupMember, ownGroupSubprocesses, processGroupEmpty } from "./attempt-writer-group.ts";
+import { type GroupMember, processGroupEmpty, processGroupMembership } from "./attempt-writer-group.ts";
 import { type BootstrapWriteRequest, runUnderWriteGuard } from "./bootstrap-write-guard.ts";
 import {
   type OwnerApprovalAnchor,
@@ -1296,7 +1296,16 @@ export class RepoFactoryBootstrapRunner {
    * with the attempt, and each must be shown gone through it — for a writer that has exited, a group
    * it led with no member left; for this process, no subprocess of its own left in its group. A
    * subprocess that left the group, or a group id reused by another process, is not seen through it;
-   * the second refuses rather than admits. No lock file may be left in an earlier checkout's .git,
+   * the second refuses rather than admits. Review 1076-R3: the group is attributed first, for every
+   * writer, the live one included — it must be the group the writer led, by the pid and start token
+   * recorded with it — and its emptiness is asked by membership, never by ancestry: a subprocess whose
+   * parent exited stays in the group. An exited writer's group must have no member at all; this
+   * process's own group, no member but this process. The question is asked while this CONFIRM holds
+   * the run's in-process slot, so the earlier attempt's call has returned and has no code path left
+   * to start a subprocess from; an exited writer has none at all, and a group with no member gains
+   * one only through a member. It is a snapshot of the group, not a proof that nothing joins it
+   * later: a process that leaves the group, or a reused group id, is outside it, as stated above.
+   * No lock file may be left in an earlier checkout's .git,
    * and the checkouts directory and every earlier checkout must be plain directories. An attempt with
    * no recorded writer or group, a writer or subprocess still running, or anything unreadable is
    * IN_DOUBT, and no new attempt executes. Nothing here signals a process or touches an earlier
@@ -1339,7 +1348,11 @@ export class RepoFactoryBootstrapRunner {
       const writerEnded =
         writer === null
           ? "UNRECORDED"
-          : current !== null && current.startToken !== null && writer.pid === current.pid && writer.startToken === current.startToken
+          : current !== null &&
+              current.startToken !== null &&
+              current.pid === process.pid &&
+              writer.pid === current.pid &&
+              writer.startToken === current.startToken
             ? "THIS_PROCESS"
             : holderProvenGone({ pid: writer.pid, startedAt: writer.startedAt, startToken: writer.startToken, path: "" })
               ? "PROVEN_GONE"
@@ -1349,14 +1362,24 @@ export class RepoFactoryBootstrapRunner {
       let running: GroupMember[] | undefined;
       if (writer === null || group === null) {
         subprocesses = "UNRECORDED";
-      } else if (writerEnded === "THIS_PROCESS") {
-        // This process's own group: none of its subprocesses may still be running.
-        const members = current?.processGroup === group ? ownGroupSubprocesses(group) : null;
-        running = members ?? undefined;
-        subprocesses = members === null ? "UNREADABLE" : members.length === 0 ? "GONE" : "RUNNING";
       } else if (group !== writer.pid) {
-        // A group the writer did not lead holds other processes too; its subprocesses cannot be told apart.
+        // Asked first, of the live writer too (review 1076-R3): a group the writer did not lead holds
+        // other processes as well, and its subprocesses cannot be told apart from them.
         subprocesses = "NOT_LED_BY_WRITER";
+      } else if (writerEnded === "THIS_PROCESS") {
+        // The group this process leads: no member but this process, by membership — a subprocess
+        // orphaned from a parent that exited is still a member. Anything else running in it, the
+        // daemon's own unrelated subprocesses included, keeps the attempt waiting.
+        const membership = processGroupMembership(group);
+        running = membership?.others;
+        subprocesses =
+          membership === null
+            ? "UNREADABLE"
+            : !membership.includesThisProcess
+              ? "NOT_LED_BY_WRITER"
+              : membership.others.length === 0
+                ? "GONE"
+                : "RUNNING";
       } else {
         const empty = processGroupEmpty(group);
         subprocesses = empty === null ? "UNREADABLE" : empty ? "GONE" : "RUNNING";

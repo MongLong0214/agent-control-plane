@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,7 +8,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
-import { readProcessGroup } from "../../src/bootstrap/attempt-writer-group.ts";
+import { processGroupEmpty } from "../../src/bootstrap/attempt-writer-group.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
@@ -203,16 +204,25 @@ const prepare = async (
     projects: harness.cp.projects,
     repositories: harness.cp.repositories,
   });
-  // #246 C3 — no daemon runs here: the test process is the only control-plane writer, and every
-  // attempt runs in it, which a daemon's single-instance lock and its holder record attest in
-  // production. A new attempt after an earlier one asks both.
-  const thisProcess = {
-    pid: process.pid,
-    startToken: readProcessStartToken(process.pid),
+  // #246 C3 — no daemon runs here: the test process is the only control-plane writer, which a
+  // daemon's single-instance lock and its holder record attest in production. A new attempt after an
+  // earlier one asks both. Review 1076-R3: every attempt is recorded with a daemon that has since
+  // exited — a real process that led its own process group, its start token read while it ran, its
+  // group empty — since a vitest worker does not lead its group, and a live writer in a group it does
+  // not lead is never shown to have no subprocess left.
+  const exited = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { detached: true, stdio: "ignore" });
+  const writer = {
+    pid: exited.pid!,
+    startToken: readProcessStartToken(exited.pid!),
     startedAt: new Date().toISOString(),
-    processGroup: readProcessGroup(process.pid),
+    processGroup: exited.pid!,
   };
-  runner.attachWriterLock(() => true, () => thisProcess);
+  const gone = new Promise((resolveExit) => exited.once("exit", resolveExit));
+  exited.kill("SIGKILL");
+  await gone;
+  await vi.waitFor(() => expect(processGroupEmpty(writer.processGroup)).toBe(true), { timeout: 10_000, interval: 20 });
+  expect(writer.startToken).not.toBeNull();
+  runner.attachWriterLock(() => true, () => writer);
   // The CEO decision completes a bootstrap on the chain this runner verifies, as composed (#246 C3).
   harness.cp.ceo.attach({ bootstrapCompletionChain: runner });
   harness.cp.bootstrap.attachCompletionChain(runner);
