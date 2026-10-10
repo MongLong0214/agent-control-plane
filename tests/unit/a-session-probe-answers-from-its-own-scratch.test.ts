@@ -1,4 +1,5 @@
 import type * as ChildProcessModule from "node:child_process";
+import type * as ProcessArgvModule from "../../src/core/process-argv.ts";
 import { execFileSync, spawn as spawnChild } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -39,6 +40,24 @@ interface SandboxedSpawn {
   stderr: string;
 }
 const sandboxed = vi.hoisted((): SandboxedSpawn[] => []);
+
+/**
+ * How the adapter's start-token reads answer: as the kernel does ("native"), never ("null"), or as the
+ * kernel did at spawn and differently afterwards ("mismatch-after-spawn", once `tokenRead.spawned`).
+ */
+const tokenRead = vi.hoisted(() => ({ mode: "native" as "native" | "null" | "mismatch-after-spawn", spawned: false }));
+vi.mock("../../src/core/process-argv.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof ProcessArgvModule>();
+  return {
+    ...actual,
+    readProcessStartToken: (pid: number): string | null => {
+      if (tokenRead.mode === "null") return null;
+      const token = actual.readProcessStartToken(pid);
+      if (tokenRead.mode === "mismatch-after-spawn" && tokenRead.spawned && token !== null) return `${token}0`;
+      return token;
+    },
+  };
+});
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof ChildProcessModule>();
@@ -477,15 +496,17 @@ const liveMembersOf = (pgid: number): string[] =>
 const expectConsistentReap = (reap: ProcessGroupReap | undefined): void => {
   expect(reap).toBeDefined();
   expect(reap!.signalled).toBe(reap!.signals.length > 0);
+  expect(reap!.delivered).toBe(reap!.signals.filter((result) => result === "sent").length);
   if (reap!.reaped) {
     expect(reap!.ownership).toBe("HELD");
-    expect(reap!.signals[0]).toBe("sent");
+    expect(reap!.delivered).toBeGreaterThan(0);
     expect(reap!.detail).toBeNull();
+  } else {
+    expect(reap!.detail).toEqual(expect.stringContaining(`process group ${reap!.pgid}`));
   }
-  if (reap!.ownership === "HOLDER_LOST") {
+  if (reap!.ownership !== "HELD") {
     expect(reap!.reaped).toBe(false);
     expect(reap!.signals).toEqual([]);
-    expect(reap!.detail).toEqual(expect.stringContaining(`process group ${reap!.pgid}`));
   }
 };
 
@@ -623,7 +644,7 @@ describe("a probe ends its own process group on every completion, and only its o
       if (route === "abort") controller.abort();
       const result = await pending;
       expect(result.timedOut).toBe(route === "timeout");
-      expect(result.processGroup).toEqual({ pgid: probe.pid, reaped: true, signalled: true, signals: expect.arrayContaining(["sent"]), ownership: "HELD", detail: null });
+      expect(result.processGroup).toEqual({ pgid: probe.pid, reaped: true, signalled: true, signals: expect.arrayContaining(["sent"]), delivered: expect.any(Number), ownership: "HELD", detail: null });
       expectConsistentReap(result.processGroup);
       expect(alive(cliPids(probe)[0]!)).toBe(false);
       expect(alive(probe.pid!)).toBe(false);
@@ -665,7 +686,7 @@ describe("a probe ends its own process group on every completion, and only its o
       };
       console.error(`WITNESS holder-lost ${JSON.stringify(observed)}`);
       expect(result.processGroup).toEqual({
-        pgid: probe.pid, reaped: false, signalled: false, signals: [], ownership: "HOLDER_LOST",
+        pgid: probe.pid, reaped: false, signalled: false, signals: [], delivered: 0, ownership: "HOLDER_LOST",
         detail: expect.stringContaining(`process group ${probe.pid} was not signalled and may still hold the probe's processes`),
       });
       expectConsistentReap(result.processGroup);
@@ -714,7 +735,7 @@ describe("a probe ends its own process group on every completion, and only its o
       const result = await pending;
       expect(result.timedOut).toBe(route === "timeout");
       expect(result.processGroup).toEqual({
-        pgid: probe.pid, reaped: false, signalled: false, signals: [], ownership: "HOLDER_LOST",
+        pgid: probe.pid, reaped: false, signalled: false, signals: [], delivered: 0, ownership: "HOLDER_LOST",
         detail: expect.stringContaining(`process group ${probe.pid} was not signalled`),
       });
       expectConsistentReap(result.processGroup);
@@ -782,7 +803,7 @@ describe("a probe ends its own process group on every completion, and only its o
       console.error(`WITNESS held-group-reap ${JSON.stringify(observed)}`);
       // The CLI's own status reaches the caller through the holder.
       expect(observed.exitCode).toBe(1);
-      expect(result.processGroup).toEqual({ pgid: probe.pid, reaped: true, signalled: true, signals: expect.arrayContaining(["sent"]), ownership: "HELD", detail: null });
+      expect(result.processGroup).toEqual({ pgid: probe.pid, reaped: true, signalled: true, signals: expect.arrayContaining(["sent"]), delivered: expect.any(Number), ownership: "HELD", detail: null });
       expectConsistentReap(result.processGroup);
       expect(observed.holderAlive).toBe(false);
       expect(observed.cliAlive).toBe(false);
@@ -798,7 +819,7 @@ describe("a probe ends its own process group on every completion, and only its o
 
   it("a probe whose group cannot be confirmed empty is refused, names what may be left, and is not a cleanup", async () => {
     const unconfirmed = {
-      pgid: 424242, reaped: false, signalled: false, signals: [], ownership: "HOLDER_LOST" as const,
+      pgid: 424242, reaped: false, signalled: false, signals: [], delivered: 0, ownership: "HOLDER_LOST" as const,
       detail: "the probe's holder (pid 424242) exited before ACP could end its group; process group 424242 was not signalled and may still hold the probe's processes",
     };
     __testing.setRunCli(async () => ({
@@ -828,5 +849,180 @@ describe("a probe ends its own process group on every completion, and only its o
       __testing.setRunCli(null);
       world.close();
     }
+  });
+});
+
+/* ------------------------------------------------------------------------------------------------ */
+/* #1077 N2-01 / N3-01 / N3-02 — the token is required, a failed attempt stays visible, output is the CLI's */
+/* ------------------------------------------------------------------------------------------------ */
+
+/** Records every group signal ACP's code sends, and lets a row make the first one fail as EPERM. */
+const watchGroupSignals = (options: { failFirstWithEperm?: boolean } = {}) => {
+  const nativeKill = process.kill.bind(process);
+  const attempts: { pid: number; signal: string | number }[] = [];
+  let failed = false;
+  const spy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
+    if (pid < 0 && signal !== 0 && signal !== undefined) {
+      attempts.push({ pid, signal });
+      if (options.failFirstWithEperm && !failed) {
+        failed = true;
+        throw Object.assign(new Error("kill EPERM"), { code: "EPERM", errno: -1, syscall: "kill" });
+      }
+    }
+    return nativeKill(pid, signal as NodeJS.Signals);
+  }) as typeof process.kill);
+  return { attempts, nativeKill, restore: () => spy.mockRestore() };
+};
+
+describe("ownership needs the holder's start token; a failed attempt is never a cleanup; the holder adds no output", () => {
+  for (const mode of ["null", "mismatch-after-spawn"] as const) {
+    it.for(["timeout", "abort"] as const)(`a ${mode} start token: the %s sends no signal and answers UNAVAILABLE naming the group`, async (route, ctx) => {
+      requireSeatbelt(ctx);
+      const marker = `acp-probe-descendant-${randomUUID()}`;
+      const stubs = tempDir("acp-session-probe-stub-");
+      tokenRead.mode = mode;
+      tokenRead.spawned = false;
+      const watch = watchGroupSignals();
+      try {
+        const controller = new AbortController();
+        const mark = sandboxed.length;
+        const pending = __testing.productionRunCli(claudeWithDescendant(stubs, "hang", marker), [marker], {
+          cwd: undefined,
+          timeoutMs: route === "timeout" ? 2_000 : 60_000,
+          signal: controller.signal,
+          reapProcessGroup: true,
+        });
+        expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 10_000)).toBe(true);
+        tokenRead.spawned = true;
+        const probe = sandboxed[mark]!;
+        if (route === "abort") controller.abort();
+        const result = await pending;
+        const observed = { route, mode, attempts: watch.attempts, processGroup: result.processGroup, cliAlive: alive(cliPids(probe)[0]!) };
+        console.error(`WITNESS unverifiable-token ${JSON.stringify(observed)}`);
+        expect(watch.attempts).toEqual([]);
+        expect(result.timedOut).toBe(route === "timeout");
+        expect(result.processGroup).toEqual({
+          pgid: probe.pid, reaped: false, signalled: false, signals: [], delivered: 0, ownership: "UNVERIFIABLE",
+          detail: expect.stringContaining(`process group ${probe.pid} was not signalled and may still hold the probe's processes`),
+        });
+        expectConsistentReap(result.processGroup);
+        // Left as it was: the probe's processes are still running, and the result says so.
+        expect(observed.cliAlive).toBe(true);
+      } finally {
+        watch.restore();
+        tokenRead.mode = "native";
+        tokenRead.spawned = false;
+        // The test, not ACP, removes what the probe was right to leave: the holder, its CLI and the
+        // descendant, each found as a live member of this row's own group.
+        const own = sandboxed[sandboxed.length - 1];
+        if (own?.pid !== undefined) {
+          for (const line of liveMembersOf(own.pid)) {
+            const pid = Number(line.split(/\s+/)[0]);
+            if (pid > 0) process.kill(pid, "SIGKILL");
+          }
+        }
+        killMarked(marker);
+      }
+    });
+  }
+
+  it("a first attempt that fails stays in the record; a later delivered one ends the group and the cleanup counts", async (ctx) => {
+    requireSeatbelt(ctx);
+    const marker = `acp-probe-descendant-${randomUUID()}`;
+    const stubs = tempDir("acp-session-probe-stub-");
+    const watch = watchGroupSignals({ failFirstWithEperm: true });
+    try {
+      const mark = sandboxed.length;
+      const result = await __testing.productionRunCli(claudeWithDescendant(stubs, "refuse", marker), [marker], {
+        cwd: undefined,
+        timeoutMs: 20_000,
+        reapProcessGroup: true,
+      });
+      const probe = sandboxed[mark]!;
+      console.error(`WITNESS injected-first-eperm ${JSON.stringify({ attempts: watch.attempts, processGroup: result.processGroup })}`);
+      expect(result.processGroup!.signals[0]).toBe("EPERM");
+      expect(result.processGroup!.delivered).toBeGreaterThan(0);
+      expect(result.processGroup).toMatchObject({ pgid: probe.pid, reaped: true, ownership: "HELD", detail: null });
+      expectConsistentReap(result.processGroup);
+      expect(watch.attempts.length).toBe(result.processGroup!.signals.length);
+      expect(alive(descendantPids(probe)[0]!)).toBe(false);
+    } finally {
+      watch.restore();
+      killMarked(marker);
+    }
+  });
+
+  it("a group already dead to a real kernel EPERM before ACP's first attempt is not counted as cleaned up", async (ctx) => {
+    requireSeatbelt(ctx);
+    const marker = `acp-probe-descendant-${randomUUID()}`;
+    const stubs = tempDir("acp-session-probe-stub-");
+    const watch = watchGroupSignals();
+    try {
+      const controller = new AbortController();
+      const mark = sandboxed.length;
+      const pending = __testing.productionRunCli(claudeWithDescendant(stubs, "hang", marker), [marker], {
+        cwd: undefined,
+        timeoutMs: 60_000,
+        signal: controller.signal,
+        reapProcessGroup: true,
+      });
+      expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 10_000)).toBe(true);
+      const pgid = sandboxed[mark]!.pid!;
+      const before: { groupAnswer?: string } = {};
+      // Queued ahead of ACP's own check-phase turn: the whole group dies from outside, and this turn
+      // waits until the kernel answers EPERM for it — every member a zombie, the holder still unreaped.
+      setImmediate(() => {
+        watch.nativeKill(-pgid, "SIGKILL");
+        const deadline = Date.now() + 2_000;
+        for (;;) {
+          try {
+            watch.nativeKill(-pgid, 0);
+          } catch (error) {
+            before.groupAnswer = (error as NodeJS.ErrnoException).code;
+            break;
+          }
+          if (Date.now() > deadline) break;
+        }
+      });
+      controller.abort();
+      const result = await pending;
+      console.error(`WITNESS kernel-eperm ${JSON.stringify({ before, attempts: watch.attempts, processGroup: result.processGroup })}`);
+      expect(before.groupAnswer).toBe("EPERM");
+      expect(result.processGroup!.reaped).toBe(false);
+      expect(result.processGroup!.delivered).toBe(0);
+      expect(result.processGroup!.detail).toEqual(expect.stringContaining(`process group ${pgid}`));
+      expectConsistentReap(result.processGroup);
+    } finally {
+      watch.restore();
+      killMarked(marker);
+    }
+  });
+
+  it.for(["exit0", "exit7", "sigterm"] as const)("%s: stdout, stderr and status are what running the CLI directly answers", async (mode, ctx) => {
+    requireSeatbelt(ctx);
+    const stubs = tempDir("acp-session-probe-stub-");
+    const binary = join(stubs, "claude-output.cjs");
+    writeFileSync(binary, `#!${process.execPath}
+const mode = process.argv[2];
+process.stdout.write("stdout line\\nno trailing newline", () => {
+  process.stderr.write("stderr line\\n", () => {
+    if (mode === "exit0") process.exit(0);
+    if (mode === "exit7") process.exit(7);
+    process.kill(process.pid, "SIGTERM");
+  });
+});
+`);
+    chmodSync(binary, 0o700);
+    const direct = await __testing.productionRunCli(binary, [mode], { cwd: undefined, timeoutMs: 10_000 });
+    const held = await __testing.productionRunCli(binary, [mode], { cwd: undefined, timeoutMs: 10_000, reapProcessGroup: true });
+    console.error(`WITNESS output-parity ${JSON.stringify({ mode, direct: { stdout: direct.stdout, stderr: direct.stderr, exitCode: direct.exitCode }, held: { stdout: held.stdout, stderr: held.stderr, exitCode: held.exitCode } })}`);
+    expect(direct.stdout).toBe("stdout line\nno trailing newline");
+    expect(direct.stderr).toBe("stderr line\n");
+    expect(held.stdout).toBe(direct.stdout);
+    expect(held.stderr).toBe(direct.stderr);
+    expect(held.exitCode).toBe(direct.exitCode);
+    expect(direct.exitCode).toBe(mode === "exit0" ? 0 : mode === "exit7" ? 7 : null);
+    expectConsistentReap(held.processGroup);
+    expect(held.processGroup!.reaped).toBe(true);
   });
 });

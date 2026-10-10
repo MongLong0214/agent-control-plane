@@ -49,7 +49,7 @@ const captureArgv = async (run: (adapter: ClaudeCliAdapter) => Promise<unknown>)
       exitCode: 0,
       timedOut: false,
       isolationEnforced: false,
-      processGroup: { pgid: 1, reaped: true, signalled: true, signals: ["sent"], ownership: "HELD", detail: null },
+      processGroup: { pgid: 1, reaped: true, signalled: true, signals: ["sent"], delivered: 1, ownership: "HELD", detail: null },
     };
   });
   const broker: ManagedInvocationWriteBroker = { authorize: async (_write, effect) => allow(ReasonCode.WRITE_ALLOWED, await effect()) };

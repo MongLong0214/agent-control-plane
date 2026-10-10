@@ -1196,9 +1196,11 @@ export class CtoLifecycle {
   }
 
   /**
-   * §14.3 / §25.6 — provider proof that the session behind an existing binding is still
-   * the session the provider has. The handle is reconstructed from the session record, so
-   * the probe addresses the provider's own id rather than the control plane's alias.
+   * §14.3 / §25.6 — asks the provider to answer, authenticated, under the bound session's own
+   * id. The handle is reconstructed from the session record, so the probe addresses the
+   * provider's own id rather than the control plane's alias. For Claude that answer comes from a
+   * fresh `--session-id` probe run in its own scratch (#1077): it shows the provider accepts and
+   * answers for that id, not that an existing conversation under it is reachable or resumable.
    */
   private async probeBoundSession(session: SessionRecord, role: Role = Role.PRIMARY_CTO): Promise<Decision<void>> {
     const adapter = this.providers.hasRoleScoped(session.provider)
