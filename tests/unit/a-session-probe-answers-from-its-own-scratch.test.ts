@@ -1488,10 +1488,12 @@ describe("the settle deadline is enforced: whichever answers first wins, and not
       expect(answers).toBe(1);
       expectConsistentReap(result.processGroup);
       if (result.processGroup!.reaped) {
-        // A success was both observed and answered before the deadline, on the monotonic clock.
-        expect(observed.answerMs).toBeLessThan(2_000);
+        // A success rests on an ESRCH seen before the deadline, on the monotonic clock. The adapter
+        // also checks the clock when it answers; this row sees the answer only after the scratch is
+        // removed and the promise settles, so its delivery time gets a small allowance.
         expect(observed.firstEsrchMs).not.toBeNull();
         expect(observed.firstEsrchMs!).toBeLessThan(2_000);
+        expect(observed.answerMs).toBeLessThan(2_150);
       } else {
         expect(result.processGroup!.detail).toEqual(expect.stringContaining(`process group ${result.processGroup!.pgid}`));
       }
