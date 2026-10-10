@@ -318,6 +318,18 @@ const sanctionedSettings = (): string => JSON.stringify({ hooks: {}, enabledPlug
 export const WORKER_SETTING_SOURCES = "project,local";
 /** #512 — with `--strict-mcp-config`, the only MCP servers a WORKER turn may start: none. */
 export const WORKER_MCP_CONFIG = JSON.stringify({ mcpServers: {} });
+/**
+ * #512 — the operator's setting sources and MCP servers left out: the claimed worktree's setting
+ * sources only, and a strict, empty MCP config. A WORKER turn carries these after the sanctioned
+ * `--settings`, and so does a session probe (#1077).
+ */
+const operatorConfigurationExcluded = (): string[] => [
+  "--setting-sources",
+  WORKER_SETTING_SOURCES,
+  "--mcp-config",
+  WORKER_MCP_CONFIG,
+  "--strict-mcp-config",
+];
 
 /**
  * macOS rejects nested `sandbox-exec` applications, so the owner egress profile and the
@@ -367,14 +379,50 @@ const killChildTree = (child: ReturnType<typeof spawn>): void => {
   }
 };
 
+/**
+ * How a reap judged whether the process group is the probe's: the judgement it last signalled the
+ * group under or, when it sent nothing, its final one.
+ *
+ * - `LEADER_EXITED`: no process holds the leader's pid. The kernel hands out no pid while a group
+ *   of that id has members, and only the process with that pid can create a group of that id, so a
+ *   member found now is in the group our leader created. The leader's start token is not needed,
+ *   and once it has exited cannot be read; the judgement rests on the pid being free.
+ * - `LEADER_LIVE`: the pid is held by a process whose start token equals the leader's at spawn.
+ * - `ID_REUSED`: the pid is held by a process with another start token — someone else's.
+ * - `UNVERIFIABLE`: the pid is held, and one of the two tokens cannot be read to compare.
+ */
+export type ProcessGroupOwnership = "LEADER_EXITED" | "LEADER_LIVE" | "ID_REUSED" | "UNVERIFIABLE";
+
 /** What ending one invocation's own process group observed (#1077). */
 export interface ProcessGroupReap {
-  /** No member of the group is left, or the id provably names another process's group now. */
+  /** The group's id: the pid of the child this invocation spawned. */
+  pgid: number;
+  /** `readProcessStartToken` of the child, read straight after the spawn; null when it could not be. */
+  leaderStartedAt: string | null;
+  /**
+   * The group was confirmed to have no member. False whenever that was not observed, including
+   * when ownership could not be established and nothing was signalled: never a successful cleanup.
+   */
   reaped: boolean;
   /** Whether a signal was sent to the group. */
   signalled: boolean;
-  /** Why the group counts as gone without a signal, or why it could not be confirmed empty. */
+  ownership: ProcessGroupOwnership;
+  /** Why the group could not be confirmed empty, naming what may be left; null when it was. */
   detail: string | null;
+}
+
+/**
+ * #1077 — a session probe whose own process group could not be confirmed empty. The probe is
+ * UNAVAILABLE, and the group that may still hold its processes is named, never counted as cleaned.
+ */
+export class ProbeProcessGroupUnconfirmed extends Error {
+  readonly reap: ProcessGroupReap;
+
+  constructor(reap: ProcessGroupReap) {
+    super(`session probe UNAVAILABLE (${reap.ownership}): ${reap.detail ?? `process group ${reap.pgid} was not confirmed empty`}`);
+    this.name = "ProbeProcessGroupUnconfirmed";
+    this.reap = reap;
+  }
 }
 
 /** How long a probe's own process group may take to empty once its leader has exited. */
@@ -408,15 +456,18 @@ const groupHasMembers = (pgid: number): boolean => {
  *
  * The group is this invocation's own: the child is spawned `detached`, so it leads a new session and
  * a group whose id is its pid, and only its own descendants are in that session to be in the group.
- * Ownership is decided before every signal. The kernel never hands out a pid while a group of that
- * id has members, so a live process holding the leader's pid once the leader has exited means our
- * group has emptied and the id now belongs to someone else; told apart by its start token, it is
- * never signalled. When the pid is live and its start token cannot be compared, nothing is
- * signalled and the group is reported unconfirmed rather than gone.
+ * Ownership is judged again before every signal (see `ProcessGroupOwnership`). Only `LEADER_EXITED`
+ * and `LEADER_LIVE` are signalled. `ID_REUSED` and `UNVERIFIABLE` send nothing and report the group
+ * unconfirmed, naming it as possibly left behind; neither is counted as cleaned up.
  *
  * The group is signalled whole, again every 200 ms for a member forked between a signal and its
  * delivery, and polled until `kill(-pgid, 0)` is ESRCH or the bound runs out.
  *
+ * Limit: the ownership check and the signal are two system calls. If, between them, every member
+ * of the group exits and the pid allocator wraps all the way round to hand the same id to a new
+ * process that makes itself a group leader, the signal reaches that group. Neither the free pid nor
+ * a start token closes that window; only its width — two adjacent system calls against a full cycle
+ * of the pid space — does.
  * Limit: a descendant that leaves the group (`setsid`, `setpgid`) is outside it and is not reaped.
  */
 const reapOwnedProcessGroup = async (
@@ -426,25 +477,38 @@ const reapOwnedProcessGroup = async (
 ): Promise<ProcessGroupReap> => {
   const deadline = Date.now() + boundMs;
   let signalled = false;
+  let signalledAs: ProcessGroupOwnership | null = null;
   let lastSignal = Number.NEGATIVE_INFINITY;
+  // A refusal to signal reports itself; otherwise the judgement a signal was last sent under.
+  const answer = (reaped: boolean, ownership: ProcessGroupOwnership, detail: string | null): ProcessGroupReap => ({
+    pgid,
+    leaderStartedAt,
+    reaped,
+    signalled,
+    ownership: ownership === "ID_REUSED" || ownership === "UNVERIFIABLE" ? ownership : (signalledAs ?? ownership),
+    detail,
+  });
   for (;;) {
+    let ownership: ProcessGroupOwnership = "LEADER_EXITED";
     if (pidExists(pgid)) {
       const startedAt = readProcessStartToken(pgid);
       if (leaderStartedAt === null || startedAt === null) {
-        return { reaped: false, signalled, detail: `pid ${pgid} is live and its start token cannot be compared; its group was not signalled` };
+        return answer(false, "UNVERIFIABLE", `pid ${pgid} is held and a start token cannot be read to compare; process group ${pgid} was not signalled and may still hold the probe's processes`);
       }
       if (startedAt !== leaderStartedAt) {
-        return { reaped: true, signalled, detail: `pid ${pgid} now names another process; its group was not signalled` };
+        return answer(false, "ID_REUSED", `pid ${pgid} is held by another process; process group ${pgid} was not signalled, so whether any of the probe's processes are left is not established`);
       }
+      ownership = "LEADER_LIVE";
     }
-    if (!groupHasMembers(pgid)) return { reaped: true, signalled, detail: null };
+    if (!groupHasMembers(pgid)) return answer(true, ownership, null);
     if (Date.now() >= deadline) {
-      return { reaped: false, signalled, detail: `process group ${pgid} still had a member after ${boundMs} ms` };
+      return answer(false, ownership, `process group ${pgid} still had a member after ${boundMs} ms`);
     }
     if (Date.now() - lastSignal >= 200) {
       try {
         process.kill(-pgid, "SIGKILL");
         signalled = true;
+        signalledAs = ownership;
       } catch {
         /* emptied between the check and the signal */
       }
@@ -1814,13 +1878,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       // permission rules, enabled plugins and the user CLAUDE.md with them — and the strict, empty
       // MCP config starts no MCP server from any scope. Authentication is untouched: it is not a
       // setting source, and HOME and the config directory are left as they are.
-      args.push(
-        "--setting-sources",
-        WORKER_SETTING_SOURCES,
-        "--mcp-config",
-        WORKER_MCP_CONFIG,
-        "--strict-mcp-config",
-      );
+      args.push(...operatorConfigurationExcluded());
     }
     if (request.readOnly || request.isolation) {
       // §18.3 — a blind reviewer judges exactly the inputs it was given. Granting it
@@ -1945,6 +2003,10 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     if (handle.provider !== this.provider) return "UNAVAILABLE";
     const result = await runCli(this.#binary, [
       "-p", "--output-format", "json", "--model", handle.model, "--session-id", handle.externalSessionId,
+      // #1077 — the probe runs to completion now, so it runs as a WORKER turn does: the sanctioned
+      // settings (no hooks, no plugins), the scratch's setting sources only and no MCP server. The
+      // operator's hooks, plugins and user MCP servers would otherwise start inside every probe.
+      "--settings", sanctionedSettings(), ...operatorConfigurationExcluded(),
     ], {
       // This invocation's private scratch — the one directory its profile re-opens — not the
       // session's workdir. A WORKER's workdir is the managed runtime root under the read-denied
@@ -1963,9 +2025,11 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       // process to stop for a headless session, so the probe's own group is ended here.
       reapProcessGroup: true,
     });
-    if (result.exitCode !== 0 || result.timedOut) return "UNAVAILABLE";
-    // A group that could not be confirmed empty is not a clean answer, whatever the CLI said.
-    if (result.processGroup?.reaped !== true) return "UNAVAILABLE";
+    // A group that could not be confirmed empty is not a clean answer, whatever the CLI said, and
+    // what may be left is named rather than dropped: every caller fails a throwing probe closed and
+    // carries its message into the refusal's evidence.
+    if (result.processGroup && !result.processGroup.reaped) throw new ProbeProcessGroupUnconfirmed(result.processGroup);
+    if (result.exitCode !== 0 || result.timedOut || !result.processGroup) return "UNAVAILABLE";
     const sessionId = safeParse(result.stdout)?.["session_id"];
     return sessionId !== undefined && sessionId !== handle.externalSessionId ? "DEGRADED" : "HEALTHY";
   }

@@ -602,7 +602,9 @@ describe("a probe ends its own process group on every completion, and only its o
       if (route === "abort") controller.abort();
       const result = await pending;
       expect(result.timedOut).toBe(route === "timeout");
-      expect(result.processGroup).toEqual({ reaped: true, signalled: expect.any(Boolean), detail: null });
+      expect(result.processGroup).toEqual({
+        pgid: probe.pid, leaderStartedAt: expect.any(String), reaped: true, signalled: expect.any(Boolean), ownership: "LEADER_EXITED", detail: null,
+      });
       expect(alive(probe.pid!)).toBe(false);
       expect(alive(descendant)).toBe(false);
       expect(liveMembersOf(probe.pid!)).toEqual([]);
@@ -612,7 +614,7 @@ describe("a probe ends its own process group on every completion, and only its o
     }
   });
 
-  it("never signals a group whose id now names another process, and does not claim an unprovable group gone", async () => {
+  it("never signals a group whose id now names another process, and never counts that as cleaned up", async () => {
     const marker = `acp-probe-decoy-${randomUUID()}`;
     // A live process in a group of its own: its pid is a group id the reaper could be handed.
     const decoy = startBystander(marker, true);
@@ -621,26 +623,108 @@ describe("a probe ends its own process group on every completion, and only its o
       expect(await waitFor(() => readProcessStartToken(pid) !== null, 5_000)).toBe(true);
       const startedAt = readProcessStartToken(pid)!;
 
-      // The id is held by a process with another start token: it is someone else's group now.
+      // The id is held by a process with another start token: someone else's. Nothing is signalled,
+      // and the probe's own cleanup is not claimed.
       const reused = await __testing.reapOwnedProcessGroup(pid, "darwin-tv:1.000001", 500);
-      expect(reused).toEqual({ reaped: true, signalled: false, detail: expect.stringContaining("now names another process") });
+      expect(reused).toEqual({
+        pgid: pid, leaderStartedAt: "darwin-tv:1.000001", reaped: false, signalled: false, ownership: "ID_REUSED",
+        detail: expect.stringContaining("was not signalled"),
+      });
       expect(alive(pid)).toBe(true);
       expect(readProcessStartToken(pid)).toBe(startedAt);
       expect(liveMembersOf(pid)).toHaveLength(1);
 
       // Without a start token to compare, nothing is signalled and nothing is claimed.
       const unknown = await __testing.reapOwnedProcessGroup(pid, null, 500);
-      expect(unknown).toEqual({ reaped: false, signalled: false, detail: expect.stringContaining("cannot be compared") });
+      expect(unknown).toEqual({
+        pgid: pid, leaderStartedAt: null, reaped: false, signalled: false, ownership: "UNVERIFIABLE",
+        detail: expect.stringContaining("may still hold the probe's processes"),
+      });
       expect(alive(pid)).toBe(true);
       expect(readProcessStartToken(pid)).toBe(startedAt);
 
       // Control: with the identity that matches, the same group is signalled and confirmed empty.
       const owned = await __testing.reapOwnedProcessGroup(pid, startedAt, 2_000);
-      expect(owned).toEqual({ reaped: true, signalled: true, detail: null });
+      expect(owned).toEqual({ pgid: pid, leaderStartedAt: startedAt, reaped: true, signalled: true, ownership: "LEADER_LIVE", detail: null });
       expect(alive(pid)).toBe(false);
       expect(liveMembersOf(pid)).toEqual([]);
     } finally {
       killMarked(marker);
+    }
+  });
+  it("reaps a surviving descendant on the real path after its parent exited, when the parent's token can no longer be read", async (ctx) => {
+    requireSeatbelt(ctx);
+    const marker = `acp-probe-descendant-${randomUUID()}`;
+    const bystanderMarker = `acp-probe-bystander-${randomUUID()}`;
+    const decoy = startBystander(bystanderMarker, true);
+    const stubs = tempDir("acp-session-probe-stub-");
+    try {
+      const mark = sandboxed.length;
+      const result = await __testing.productionRunCli(claudeWithDescendant(stubs, "refuse", marker), [], {
+        cwd: undefined,
+        timeoutMs: 20_000,
+        reapProcessGroup: true,
+      });
+      const probe = sandboxed[mark]!;
+      const descendant = descendantPids(probe)[0]!;
+      const observed = {
+        exitCode: result.exitCode,
+        processGroup: result.processGroup,
+        parentAlive: alive(probe.pid!),
+        parentTokenNow: readProcessStartToken(probe.pid!),
+        descendantAlive: alive(descendant),
+        liveMembersOfProbeGroup: liveMembersOf(probe.pid!),
+        decoyAlive: alive(decoy.pid!),
+      };
+      console.error(`WITNESS leader-exited-reap ${JSON.stringify(observed)}`);
+      expect(result.exitCode).toBe(1);
+      // The parent has exited and its token is unreadable: the group was judged the probe's because
+      // no process holds its id, signalled, and seen empty. The descendant is gone with it.
+      expect(observed.parentAlive).toBe(false);
+      expect(observed.parentTokenNow).toBeNull();
+      expect(result.processGroup).toMatchObject({ pgid: probe.pid, reaped: true, signalled: true, ownership: "LEADER_EXITED", detail: null });
+      expect(observed.descendantAlive).toBe(false);
+      expect(observed.liveMembersOfProbeGroup).toEqual([]);
+      expect(processesNaming(marker)).toEqual([]);
+      // A process in a group of its own, outside the probe, is untouched.
+      expect(observed.decoyAlive).toBe(true);
+    } finally {
+      killMarked(marker);
+      killMarked(bystanderMarker);
+    }
+  });
+
+  it("a probe whose group cannot be confirmed empty is refused, names what may be left, and is not a cleanup", async () => {
+    const unconfirmed = {
+      pgid: 424242, leaderStartedAt: "darwin-tv:1.000001", reaped: false, signalled: false, ownership: "ID_REUSED" as const,
+      detail: "pid 424242 is held by another process; process group 424242 was not signalled, so whether any of the probe's processes are left is not established",
+    };
+    __testing.setRunCli(async () => ({
+      stdout: JSON.stringify({ type: "result", session_id: "x", result: "READY" }),
+      stderr: "", exitCode: 0, timedOut: false, isolationEnforced: false, processGroup: unconfirmed,
+    }));
+    const world = await provisioningWorld((_root, stubs) => refusingClaude(stubs));
+    try {
+      const adapter = new ClaudeCliAdapter({
+        clock: { nowIso: () => "2026-08-12T00:00:00.000Z" } as never,
+        capacityFile: join(STATE_ROOT, "capacity.fixture"),
+        binary: process.execPath,
+      });
+      // Even a CLI that answered READY with exit 0 is not HEALTHY when its group was not confirmed.
+      await expect(adapter.probeSession({
+        externalSessionId: randomUUID(), provider: "claude", model: "opus", effort: null, pid: null,
+      })).rejects.toThrow(/UNAVAILABLE \(ID_REUSED\): .*process group 424242 was not signalled/);
+
+      const refused = await world.provision();
+      expect(refused.allowed).toBe(false);
+      expect(refused.reasonCode).toBe(ReasonCode.SESSION_NOT_READY);
+      expect(String(refused.evidence["probeError"])).toContain("process group 424242 was not signalled");
+      const sessions = claudeSessions(world.harness);
+      expect(sessions.map((session) => session.lifecycle)).toEqual([SessionLifecycle.STOPPED]);
+      expect(world.harness.cp.db.all(`SELECT * FROM assignments WHERE role_key = ?`, [roleKeyFor(Role.WORKER, { taskId: world.taskId })])).toEqual([]);
+    } finally {
+      __testing.setRunCli(null);
+      world.close();
     }
   });
 });
