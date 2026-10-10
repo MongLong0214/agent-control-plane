@@ -19,7 +19,7 @@ import type { Outbox } from "../outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
-import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type DrivenMode, type ProvisionedSessionRuntime, type SpawnAttestation, drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
+import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type DrivenMode, type ProvisionedSessionRuntime, type SpawnAttestation, drivenModeOf, drivenSpawnRecordOf } from "../runtime/provisioned-session-runtime.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -1851,6 +1851,8 @@ export class CtoLifecycle {
     const rotated = this.db.txDecision<number>(() => {
       const again = this.#recoverableDriven(roleKey, ports.runtime);
       if (!again.allowed) return again as Decision<number>;
+      const moved = bindingMoved<number>(binding, again.value.binding);
+      if (moved) return moved;
       const credential = this.sessions.rotateSecret(session.sessionId, session.credentialEpoch);
       if (!credential.allowed) return credential as Decision<number>;
       sessionSecret = credential.value.sessionSecret;
@@ -1858,16 +1860,22 @@ export class CtoLifecycle {
     });
     if (!rotated.allowed) return rotated as Decision<RoleBinding>;
 
-    // Adopted in the same turn of the event loop as the rotation, so against the binding it checked;
-    // the attestation reads the binding again on entry and after its turn (`turnEligibility`).
+    // Adoption and completion are conditional on the same binding: the one the recovery started from,
+    // still the role's ACTIVE binding on this session and incarnation.
+    const movedBeforeAdoption = bindingMoved<RoleBinding>(binding, this.bindings.active(roleKey));
+    if (movedBeforeAdoption) {
+      sessionSecret = "";
+      return movedBeforeAdoption;
+    }
     const adopted = ports.runtime.adopt(session.sessionId, Role.PRIMARY_CTO, sessionSecret, rotated.value);
     sessionSecret = "";
     if (!adopted.allowed) return adopted as Decision<RoleBinding>;
     const attested = await ports.runtime.attest(session.sessionId, "resume");
-    if (!attested.allowed) {
+    const movedBeforeCompletion = attested.allowed ? bindingMoved<RoleBinding>(binding, this.bindings.active(roleKey)) : null;
+    if (!attested.allowed || movedBeforeCompletion) {
       // Only this recovery's own credential is given up: one adopted for a later epoch stays held.
       ports.runtime.relinquish(session.sessionId, session.incarnation, rotated.value);
-      return notProvenReady(session.sessionId, attested) as Decision<RoleBinding>;
+      return movedBeforeCompletion ?? (notProvenReady(session.sessionId, attested) as Decision<RoleBinding>);
     }
     this.audit.record({
       kind: "PRIMARY_CTO_RECOVERED",
@@ -1893,6 +1901,12 @@ export class CtoLifecycle {
     }
     const mode = this.#drivenMode(binding.sessionId);
     if (mode !== "DRIVEN") return drivenRecordContradicted(binding.sessionId, mode);
+    // The session's spawn record must be this role's own, not another binding's that the same
+    // session now serves.
+    const record = drivenSpawnRecordOf(this.db, binding.sessionId);
+    if (record?.roleKey !== roleKey || record.projectId !== binding.projectId) {
+      return drivenRecordContradicted(binding.sessionId, "CONTRADICTED");
+    }
     // Its lifecycle is the probe's and the rotation's to judge: neither runs on a session not READY.
     const session = this.sessions.get(binding.sessionId);
     if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { roleKey, sessionId: binding.sessionId });
@@ -1980,6 +1994,24 @@ export interface DrivenPrimaryRecoveryPorts {
   };
   readonly runtime: Pick<ProvisionedSessionRuntime, "probe" | "holds" | "adopt" | "attest" | "relinquish">;
 }
+
+/**
+ * #246 C4-R2 — refuses when the role's current binding is not exactly the one a recovery started from:
+ * the same assignment, generation, session and incarnation. Null when it is.
+ */
+const bindingMoved = <T>(started: RoleBinding, current: RoleBinding | null): Decision<T> | null =>
+  current &&
+  current.assignmentId === started.assignmentId &&
+  current.bindingGeneration === started.bindingGeneration &&
+  current.sessionId === started.sessionId &&
+  current.sessionIncarnation === started.sessionIncarnation
+    ? null
+    : deny(ReasonCode.BINDING_GENERATION_STALE, "the role's binding is no longer the one this recovery started from", {
+        roleKey: started.roleKey,
+        sessionId: started.sessionId,
+        startedGeneration: started.bindingGeneration,
+        currentGeneration: current?.bindingGeneration ?? null,
+      });
 
 /** #246 C4 — the refusal for a session whose driven-spawn record does not add up: fail closed. */
 const drivenRecordContradicted = <T>(sessionId: string, mode: DrivenMode): Decision<T> =>
