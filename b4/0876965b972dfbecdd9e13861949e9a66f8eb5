@@ -1,0 +1,21 @@
+Warn: a client driving an in-process relay over in-memory streams must not answer inside the relay's own event-loop turn: those streams can deliver synchronously, so such a client measures the stream rather than the relay; recordingMcpClient defers each chunk by one setImmediate for that case (separateProcess)
+Warn: doorTap forwards from the test process, so a door that admits by the kernel's peer record sees the test process as the peer, as it does for an in-process relay; a relay child process behind the tap is admitted on this process's stated ancestry, not its own
+Record-Id: r-lcrecclient
+Provenance: inherited 8b5421d061bc2f7db3513ed9f4f7d6d9dc1c65ee
+
+Limit: a relay with no wake proxy replays the client's initialize under the client's own id, byte-identical to a fresh connection, so at initialized the daemon cannot tell whether that replay will re-register a wake endpoint before it goes live; such a replay is told once at initialized, where the tools/list it prompts can be refused as reattaching, and again after the re-registration is answered
+Warn: the daemon recognises the relay's replay only by the id prefixes acp-relay-reinitialize- and acp-relay-rewake- that src/cli/attach-relay.ts gives its own requests; renaming them in the relay sends a proxied replay's notification at initialized again, where the client's tools/list is refused as reattaching
+Warn: the notification follows the replayed registration's answer whether it was accepted or refused; it is not a wake success, touches no wake slot and grants nothing
+Unverified: only a client that re-lists the moment it reads list_changed was measured; whether Claude Code re-lists on the notification, or recovers after a refused tools/list, was not
+Record-Id: r-ctolistchanged
+Follows: r-lcrecclient
+Provenance: inherited 5958cf8d1a86bfa59aad8148d76f55825f0c35a1
+
+Limit: during a relay replay the notification sent at initialized can reach the client while the relay still refuses its requests as reattaching, so the tools/list it prompts can be refused; the refresh the relay serves is the one sent after the replayed registration is answered
+Ruled-out: deciding a relay replay by the request id shape acp-relay-reinitialize- | any client may legally choose that id, and one that never registers a wake endpoint then received no notification at all (review 1078-N1-01); the door that admitted the connection decides instead
+Warn: which door admitted a CTO connection is passed to ctoServer by that door's own code after admission (session-secret or canonical-reattach); nothing a client sends sets it, and only canonical-reattach connections are told again after each wake registration answer
+Warn: the notification after a wake registration answer follows a refusal as it follows an acceptance; it is a tool-list refresh only, never a wake success or a grant
+Unverified: only a client that re-lists the moment it reads list_changed was measured, against this tree's relay and an exported 670ca488 relay; whether Claude Code re-lists, and keeps working after the early refused refresh, was not measured
+Record-Id: r-ctolcdoor
+Supersedes: r-ctolistchanged
+Provenance: inherited 2b1133d4e98e457165fe09bc1826d1049cd72f91
