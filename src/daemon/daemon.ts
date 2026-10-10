@@ -2234,6 +2234,10 @@ export class Daemon {
       });
       // A failing reclaim backs off on its own and does not cost the watchdog its tick.
       void this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
+      // #512 — and a retired worker's session left live while its process ran is settled on a later tick.
+      void this.runPeriodic("worker_retirement", async () => {
+        await this.cp.workerRetirement.reconcile();
+      });
       void this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
     }, watchdogMs);
     watchdog.unref();

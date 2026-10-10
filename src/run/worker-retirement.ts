@@ -95,6 +95,8 @@ const LIVE_LIFECYCLES: readonly string[] = [SessionLifecycle.STARTING, SessionLi
 export class WorkerRetirement {
   /** One settle at a time, in order; `settled()` waits for the tail. */
   #tail: Promise<void> = Promise.resolve();
+  /** The reconcile pass queued or running now, if any. */
+  #pass: Promise<WorkerRetirementReport> | null = null;
   readonly #processes: Pick<WorkerProcessPort, "alive" | "groupAlive" | "startToken">;
   readonly #sessionLiveness: (osPid: number | null, startedAt: string | null) => SessionLiveness;
 
@@ -121,18 +123,27 @@ export class WorkerRetirement {
     return revoked;
   }
 
-  /** The daemon's reconcile pass. Retires what an ended run left behind; a repeat writes nothing. */
-  async reconcile(): Promise<WorkerRetirementReport> {
-    return this.#enqueue(async () => {
+  /**
+   * The daemon's reconcile pass, at start and on every watchdog tick. Retires what an ended run left
+   * behind and settles a session once what kept it live has ended; a repeat over unchanged state
+   * writes nothing. A pass asked for while one is still queued or running is that pass, so ticks
+   * that outrun a slow provider stop do not pile up behind it.
+   */
+  reconcile(): Promise<WorkerRetirementReport> {
+    if (this.#pass) return this.#pass;
+    const pass = this.#enqueue(async () => {
       const { revoked, deferred } = this.#revokeEnded("reconcile", null);
       const settled = await this.#settle(null);
       const report: WorkerRetirementReport = { revoked, deferred, ...settled };
-      if (revoked.length + settled.stopped.length + settled.remaining.length + settled.stopFailed.length > 0) {
+      // What remains and what is deferred are recorded by their own deduplicated events; the summary
+      // is written only for a pass that changed something.
+      if (revoked.length + settled.stopped.length + settled.stopFailed.length > 0) {
         this.audit.record({
           kind: WORKER_RETIREMENT_RECONCILED,
           reasonCode: settled.stopFailed.length > 0 ? ReasonCode.SESSION_STOP_FAILED : ReasonCode.OK,
           evidence: {
             revoked: revoked.length,
+            deferred: deferred.length,
             stopped: settled.stopped.length,
             remaining: settled.remaining.length,
             stopFailed: settled.stopFailed.length,
@@ -141,6 +152,12 @@ export class WorkerRetirement {
       }
       return report;
     });
+    this.#pass = pass;
+    const clear = (): void => {
+      if (this.#pass === pass) this.#pass = null;
+    };
+    pass.then(clear, clear);
+    return pass;
   }
 
   /** Resolves once every settle queued so far has finished. */

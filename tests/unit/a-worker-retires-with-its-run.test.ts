@@ -660,6 +660,64 @@ describe("review round 1: an ABANDONED receipt is not exit evidence (wr-r1-04)",
   });
 });
 
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe("review round 1: retirement is retried by the watchdog (wr-r1-01)", () => {
+  it("a watchdog pass settles a retired worker once its process has exited, and repeated passes write nothing", async () => {
+    const harness = gatedHarness();
+    const run = await activeRun(harness);
+    const workerSessionId = bindWorker(harness, run.taskIds[0]!);
+    const worker = liveWorkerProcess();
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-worker-retire-ticks-"), watchdogIntervalMs: 25 });
+    const tick = vi.spyOn(harness.cp.watchdog, "tick");
+    const ticksAfter = async (count: number): Promise<void> => {
+      const target = tick.mock.calls.length + count;
+      const deadline = Date.now() + 10_000;
+      while (tick.mock.calls.length < target && Date.now() < deadline) await delay(20);
+      expect(tick.mock.calls.length).toBeGreaterThanOrEqual(target);
+      await harness.cp.workerRetirement.settled();
+    };
+    try {
+      const execution = harness.cp.tasks.startExecution({
+        runId: run.runId,
+        taskId: run.taskIds[0]!,
+        ownerBindingGeneration: run.ownerBindingGeneration,
+        workerSessionId,
+        workerProcessId: worker.pid!,
+        provider: "scripted",
+        model: "scripted-worker",
+        repositoryId: run.repositoryId,
+      });
+      if (!execution.allowed) throw new Error(execution.message);
+      const started = await daemon.start();
+      if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
+
+      expect(harness.cp.runs.cancel(run.runId, "cancelled while its worker process runs").allowed).toBe(true);
+      await harness.cp.workerRetirement.settled();
+      expect(lifecycleOf(harness, workerSessionId)).toBe(SessionLifecycle.READY);
+
+      // While the process runs, passes leave the session live and record what remains once.
+      await ticksAfter(3);
+      expect(lifecycleOf(harness, workerSessionId)).toBe(SessionLifecycle.READY);
+      expect(remainingFor(harness, workerSessionId)).toHaveLength(1);
+
+      // Once it has exited, the next pass settles the session, with no restart and no manual call.
+      await killChild(worker);
+      await ticksAfter(3);
+      expect(lifecycleOf(harness, workerSessionId)).toBe(SessionLifecycle.STOPPED);
+
+      // Further passes write nothing.
+      const written = harness.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM audit_events WHERE kind LIKE 'WORKER_%' OR (kind = 'SESSION_LIFECYCLE' AND session_id = ?)`, [workerSessionId])!.n;
+      await ticksAfter(3);
+      expect(harness.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM audit_events WHERE kind LIKE 'WORKER_%' OR (kind = 'SESSION_LIFECYCLE' AND session_id = ?)`, [workerSessionId])!.n).toBe(written);
+    } finally {
+      await killChild(worker);
+      await daemon.stop();
+      tick.mockRestore();
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // The ordinary finalization path, as tests/unit/ordinary-finalization-authority.test.ts drives it.
 
