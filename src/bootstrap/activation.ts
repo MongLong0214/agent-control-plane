@@ -11,7 +11,7 @@ import type { Db } from "../db/database.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { Doctor, DoctorReport } from "../doctor/doctor.ts";
-import type { ProductionGate } from "../ceo/production-gate.ts";
+import type { BootstrapCompletionChainPort, ProductionGate } from "../ceo/production-gate.ts";
 import type { ManagedManifestWrite, ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -99,6 +99,21 @@ export class BootstrapActivation {
     private readonly ceo: ProductionGate,
     private readonly outbox: Outbox,
   ) {}
+
+  #completionChain: BootstrapCompletionChainPort | null = null;
+
+  /**
+   * #246 C3, review 1076-R1-02 — the chain a bootstrap completes on: the approval anchored as its
+   * execution's identity and the stored result attributed to the attempt ledger, verified by the Repo
+   * Factory runner. The finalizer asks for it itself, inside the CEO completion transaction, so no
+   * caller of the finalizer completes a bootstrap on a WRITTEN row or a stored result alone. With none
+   * attached, nothing is finalized. Returns the port it replaces.
+   */
+  attachCompletionChain(chain: BootstrapCompletionChainPort | null): BootstrapCompletionChainPort | null {
+    const replaced = this.#completionChain;
+    this.#completionChain = chain;
+    return replaced;
+  }
 
   /**
    * Issue #246 — no promotion. A run's `BOOTSTRAP_CTO` is staffed by dispatch on a session of its
@@ -457,6 +472,16 @@ export class BootstrapActivation {
         state: run.state,
       });
     }
+
+    // #246 C3, review 1076-R1-02 — the same verified chain every completion entry requires, asked here
+    // in the transaction that completes the run, before anything this finalizer reads or writes.
+    const chain = this.#completionChain;
+    const verified = chain
+      ? chain.verifyCompletionChain(input.runId, input.candidateSnapshotDigest)
+      : deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, "the bootstrap completion chain verifier is not configured", {
+          runId: input.runId,
+        });
+    if (!verified.allowed) return verified as Decision<ACPBootstrapActivationResult>;
 
     const review = this.reviewForConfirmation(input.runId, input.candidateSnapshotDigest);
     if (!review.allowed) return review as Decision<ACPBootstrapActivationResult>;

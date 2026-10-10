@@ -6,6 +6,7 @@ import { allow, deny, fail, isAcpError, type Decision } from "../core/errors.ts"
 import { newRepositoryId, normalizeRemoteIdentity } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
+import { bootstrapReservationsHolding } from "../bootstrap/bootstrap-applications.ts";
 import type { Db } from "../db/database.ts";
 import { isClean, remoteUrl, toplevel, tryRevParse } from "../git/git.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
@@ -201,6 +202,11 @@ export class RepositoryRegistry {
       return allow(ReasonCode.OK, existing);
     }
 
+    // #246 C3 — an identity a bootstrap run reserved is bound into that run's project alone, which only
+    // its activation registers; every other binding of it is refused, whatever the reservation's phase.
+    const reserved = this.reservedForAnother(identity, input.projectId ?? null);
+    if (!reserved.allowed) return reserved as Decision<RepositoryRecord>;
+
     const record: RepositoryRecord = {
       repositoryId: newRepositoryId(),
       identity,
@@ -239,6 +245,22 @@ export class RepositoryRegistry {
   }
 
   /**
+   * #246 C3 — whether a bootstrap reservation holds `identity` for a project other than `projectId`.
+   * A reservation's identity is bound only into the project the same reservation holds, which only
+   * that run's activation registers (`ProjectRegistry.register` refuses everyone else).
+   */
+  private reservedForAnother(identity: string, projectId: string | null): Decision<void> {
+    const reservedBy = bootstrapReservationsHolding(this.db, { repositoryIdentity: identity })
+      .filter((reservation) => reservation.repositoryIdentity === identity && reservation.projectId !== projectId);
+    if (reservedBy.length === 0) return allow(ReasonCode.OK, undefined);
+    return deny(ReasonCode.BOOTSTRAP_APPLICATION_RESERVED, "the repository identity is reserved by a bootstrap run", {
+      identity,
+      projectId,
+      reservedBy: reservedBy.map((reservation) => ({ runId: reservation.runId, phase: reservation.phase })),
+    });
+  }
+
+  /**
    * PRD §16.3 — an unregistered local repository can be touched by a run. It gets a
    * run-scoped temporary identity and binding, and is deliberately *not* promoted to an
    * active project.
@@ -268,6 +290,9 @@ export class RepositoryRegistry {
       );
     }
     if (existing) return this.assertRunScope(existing.repositoryId, runId);
+    // #246 C3 — a run-scoped temporary binding of an identity a bootstrap run reserved is refused.
+    const reserved = this.reservedForAnother(identity, null);
+    if (!reserved.allowed) return reserved as Decision<RepositoryRecord>;
 
     const repositoryId = newRepositoryId();
     this.db.run(
