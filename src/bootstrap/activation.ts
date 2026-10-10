@@ -210,12 +210,19 @@ export class BootstrapActivation {
         authorization: manifestAuthorization,
       });
       if (!registered.allowed) return registered as Decision<ACPBootstrapActivationResult>;
+    } else if (existing.activeManifestDigest === approvedDigest) {
+      // A resumed or repeated activation finds the project this run already registered, on the approved
+      // manifest: nothing moves, and the run's authority to write that manifest is asked again.
+      const authorized = this.projects.storeManifest(input.approvedManifest, manifestAuthorization);
+      if (!authorized.allowed) return authorized as Decision<ACPBootstrapActivationResult>;
     } else {
-      const activated = this.projects.activateManifest(projectId, input.approvedManifest, {
-        runKind: RunKind.PROJECT_BOOTSTRAP,
-        runId: input.runId,
-      }, manifestAuthorization);
-      if (!activated.allowed) return activated as Decision<ACPBootstrapActivationResult>;
+      // #246 B2-b — a bootstrap never moves an existing project's active manifest. That move is a
+      // CONTRACT_CHANGE run's alone, on the grant its CEO CONFIRM issued.
+      return deny(
+        ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN,
+        "a PROJECT_BOOTSTRAP run never changes an existing project's manifest; that is a CONTRACT_CHANGE run",
+        { runId: input.runId, projectId, activeManifestDigest: existing.activeManifestDigest, approvedManifestDigest: approvedDigest },
+      );
     }
 
     // 3. Create local repository bindings. The committed manifest never holds a path.

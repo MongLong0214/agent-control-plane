@@ -63,6 +63,14 @@ const MCP_RESERVATION_TTL_MS = 60_000;
 const mcpReservationsInFlight = new WeakMap<Db, Set<string>>();
 
 /**
+ * #246 B2-b — whether the MCP mutation reserved under `nonce` is running its handler in this process
+ * now. A CONTRACT_CHANGE activation grant is issued, or its consumer re-bound, only inside such a call:
+ * the set is this module's own, so a caller outside an admitted MCP mutation cannot make it true.
+ */
+export const isMcpReservationInFlight = (db: Db, nonce: string): boolean =>
+  mcpReservationsInFlight.get(db)?.has(nonce) === true;
+
+/**
  * Run only the mutation that acquired this reservation; no delete capability leaves this module.
  *
  * A failed run deletes only a row this call inserted. A reservation it took over by renewal is put

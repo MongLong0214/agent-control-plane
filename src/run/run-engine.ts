@@ -83,6 +83,13 @@ class CompletionAuthorityToken {
 
 export type CompletionAuthority = CompletionAuthorityToken;
 
+/**
+ * #246 B2-b — whether `value` is the daemon finalizer's completion capability. A CONTRACT_CHANGE's
+ * manifest is activated only in the transaction that completes the run, by the holder of this token.
+ */
+export const isDaemonFinalizerCompletion = (value: unknown): value is CompletionAuthority =>
+  CompletionAuthorityToken.hasSource(value, "daemon-finalizer");
+
 export interface CompletionAuthoritySet {
   /** Held only by the daemon finalizer for ordinary production runs. */
   readonly daemonFinalizer: CompletionAuthority;
@@ -800,6 +807,25 @@ export class RunEngine {
             "bootstrap activation may complete only from CEO review",
             { runId, kind: run.kind, state: run.state },
           );
+        }
+        // #246 B2-b — a CONTRACT_CHANGE completes only in the transaction that consumed its grant for
+        // its current candidate and moved the project's active manifest to the one the grant names. The
+        // v44 trigger `runs_contract_change_completes_activated` refuses the same write.
+        if (run.kind === RunKind.CONTRACT_CHANGE) {
+          const activated = this.db.get<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM manifest_activation_grants g
+               JOIN projects p ON p.project_id = g.project_id
+              WHERE g.run_id = ? AND g.candidate_snapshot_digest IS ? AND g.consumed_at IS NOT NULL
+                AND p.active_manifest_digest IS g.manifest_digest`,
+            [runId, this.currentCandidate(runId)],
+          );
+          if ((activated?.n ?? 0) !== 1) {
+            return deny(
+              ReasonCode.CONTRACT_CHANGE_NOT_ACTIVATED,
+              "a CONTRACT_CHANGE run completes only once its grant is consumed and its manifest is active",
+              { runId, candidateSnapshotDigest: this.currentCandidate(runId) },
+            );
+          }
         }
       }
       const check = canTransition(run.state, to, run.kind);

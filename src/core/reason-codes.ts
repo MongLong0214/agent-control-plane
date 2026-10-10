@@ -253,8 +253,45 @@ export const ReasonCode = {
   BUZZ_MENTION_NOT_RESOLVED: "BUZZ_MENTION_NOT_RESOLVED",
 
   // --- registries ----------------------------------------------------------
-  MANIFEST_ACTIVATION_EVIDENCE_MISSING: "MANIFEST_ACTIVATION_EVIDENCE_MISSING",
   MANIFEST_ACTIVATION_GRANT_CONSUMED: "MANIFEST_ACTIVATION_GRANT_CONSUMED",
+  /**
+   * #246 B2-b — a CONTRACT_CHANGE run has no activation grant: its CEO CONFIRM never issued one. A
+   * run that reached a finalization state any other way merges and completes nothing.
+   */
+  MANIFEST_ACTIVATION_GRANT_MISSING: "MANIFEST_ACTIVATION_GRANT_MISSING",
+  /**
+   * #246 B2-b — what a grant names no longer holds: the candidate, its PLAN, the manifest that PLAN
+   * carries, the published packet, or the base the activation compares-and-sets from.
+   */
+  MANIFEST_ACTIVATION_TARGET_STALE: "MANIFEST_ACTIVATION_TARGET_STALE",
+  /**
+   * #246 B2-b — the CEO authority a grant records is not the live CEO binding: the role is held by
+   * another actor, by nobody, or by a session that is not live, or the confirming call's
+   * authenticated session is not the one it names.
+   */
+  MANIFEST_ACTIVATION_AUTHORITY_STALE: "MANIFEST_ACTIVATION_AUTHORITY_STALE",
+  /** #246 B2-b — a project's active manifest moved by anything but a consumed grant (v44 guard). */
+  MANIFEST_ACTIVATION_AUTHORITY_DENIED: "MANIFEST_ACTIVATION_AUTHORITY_DENIED",
+  /**
+   * #246 B2-b — a workflow the manifest points to does not carry its approved bytes at the exact
+   * repository and revision activation reads, or cannot be read there. Nothing is activated.
+   */
+  MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED: "MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED",
+  /**
+   * #246 B2-b — activation was refused after a merge. The run ends BLOCKED_POST_MERGE naming this,
+   * the active manifest does not move, and the recovery is a new CONTRACT_CHANGE run with no
+   * repositories carrying the manifest.
+   */
+  MANIFEST_ACTIVATION_REFUSED: "MANIFEST_ACTIVATION_REFUSED",
+  /**
+   * #246 B2-b — a CONTRACT_CHANGE whose base (its dispatch pin) is no longer the project's active
+   * manifest: it would replace a contract it was not judged against.
+   */
+  MANIFEST_PIN_SUPERSEDED: "MANIFEST_PIN_SUPERSEDED",
+  /** #246 B2-b — another CONTRACT_CHANGE of the project is already confirmed and finalizing. */
+  CONTRACT_CHANGE_FINALIZATION_OVERLAP: "CONTRACT_CHANGE_FINALIZATION_OVERLAP",
+  /** #246 B2-b — a CONTRACT_CHANGE run completes only in the transaction that activates its grant. */
+  CONTRACT_CHANGE_NOT_ACTIVATED: "CONTRACT_CHANGE_NOT_ACTIVATED",
   REPOSITORY_CHECKOUT_ALREADY_REGISTERED: "REPOSITORY_CHECKOUT_ALREADY_REGISTERED",
   REPOSITORY_BINDING_CHANGE_REQUIRES_ACTIVATION:
     "REPOSITORY_BINDING_CHANGE_REQUIRES_ACTIVATION",

@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { digestOf } from "../../src/core/digest.ts";
+import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ExecutionMode, RunState, SessionLifecycle, roleKeyFor, Role } from "../../src/domain/types.ts";
 import type { HandoffAcknowledgement, HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
@@ -13,7 +13,6 @@ import {
   finalizeNoRepositoryRun,
   fixtureManifest,
   makeHarness,
-  manifestAuthorizationForRun,
   ownerDecisionReceipt,
   registerFixtureProject,
 } from "../helpers/harness.ts";
@@ -417,85 +416,42 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
     const revised = { ...fixtureManifest(projectId), postMergeCommands: ["verify"] };
+    const before = harness.cp.projects.require(projectId).activeManifestDigest;
+    const completion = harness.cp.daemonFinalizationAuthorities().completion;
 
-    const refused = harness.cp.projects.activateManifest(projectId, revised, {
-      runKind: "STANDARD_WORK",
-      runId: null,
-    }, harness.cp.manifestAuthorizationForTests(revised));
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN);
+    // #246 B2-b — activation takes no manifest from its caller, only a run whose CEO CONFIRM issued
+    // it a grant. A run that does not exist, or one that holds none, activates nothing.
+    const unknownRun = harness.cp.projects.activateManifest("run_does_not_exist", {
+      completion,
+      attemptId: "finalize_none",
+      workflows: [],
+      consumer: null,
+    });
+    expect(unknownRun.allowed).toBe(false);
+    expect(unknownRun.reasonCode).toBe(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING);
+    expect(harness.cp.projects.require(projectId).activeManifestDigest).toBe(before);
 
-    // A CONTRACT_CHANGE *label* is not enough: the change must be carried by a real
-    // contract-change run for this project that completed.
-    const unbacked = harness.cp.projects.activateManifest(projectId, revised, {
-      runKind: "CONTRACT_CHANGE",
-      runId: null,
-    }, harness.cp.manifestAuthorizationForTests(revised));
-    expect(unbacked.allowed).toBe(false);
-    expect(unbacked.reasonCode).toBe(ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN);
-
-    const revisedDigest = harness.cp.projects.storeManifest(revised, harness.cp.manifestAuthorizationForTests(revised));
-    if (!revisedDigest.allowed) throw new Error(revisedDigest.message);
+    // The production path: plan_submit carries the manifest, review, packet, CEO CONFIRM issues the
+    // grant, and the daemon finalizer consumes it with COMPLETED in one transaction.
     const finalized = await finalizeNoRepositoryRun(
       harness,
       projectId,
       { ...CONTRACT, goal: "revise the project contract" },
       { manifest: revised },
     );
-    const { runId, candidateSnapshotDigest } = finalized;
-    const grant = {
-      schema: "acp.manifest-activation-grant.v1",
-      projectId,
-      runId,
-      runKind: "CONTRACT_CHANGE",
-      manifestDigest: revisedDigest.value,
-      candidateSnapshotDigest,
-    };
-    harness.cp.db.run(
-      `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
-                                  content_json, produced_by, created_at)
-       VALUES (?, ?, 'APPROVAL', ?, ?, ?, 'production-gate', ?)`,
-      [
-        `art_manifest_${runId.slice(-12)}`,
-        runId,
-        digestOf(grant),
-        candidateSnapshotDigest,
-        JSON.stringify(grant),
-        harness.clock.nowIso(),
-      ],
-    );
-
-    const unknownRun = harness.cp.projects.activateManifest(projectId, revised, {
-      runKind: "CONTRACT_CHANGE",
-      runId: "run_does_not_exist",
-    }, harness.cp.manifestAuthorizationForTests(revised));
-    expect(unknownRun.allowed).toBe(false);
-
-    const consumedBeforeActivation = harness.cp.audit.byKind("MANAGED_WRITE_GUARD_CONSUMED").length;
-    const allowed = harness.cp.projects.activateManifest(projectId, revised, {
-      runKind: "CONTRACT_CHANGE",
-      runId,
-    }, manifestAuthorizationForRun(harness, projectId, revised, runId));
-    expect(allowed.allowed).toBe(true);
-    const activationGrants = harness.cp.audit
-      .byKind("MANAGED_WRITE_GUARD_CONSUMED")
-      .slice(consumedBeforeActivation);
-    expect(activationGrants).toHaveLength(2);
-    expect(activationGrants.map((event) => event.evidence)).toEqual([
-      expect.objectContaining({
-        operation: "MANIFEST_CHANGE",
-        projectId,
-        resolvedPath: null,
-        targetBranch: null,
-        targetWorktreeId: null,
-      }),
-      expect.objectContaining({
-        operation: "MANIFEST_CHANGE",
-        projectId,
-        resolvedPath: null,
-        targetBranch: null,
-        targetWorktreeId: null,
-      }),
-    ]);
+    expect(harness.cp.projects.require(projectId).activeManifestDigest).toBe(manifestDigest(revised));
+    const grant = harness.cp.manifestGrants.get(finalized.runId)!;
+    const activated = harness.cp.audit.byKind("PROJECT_MANIFEST_ACTIVATED");
+    expect(activated).toHaveLength(1);
+    expect(activated[0]!.runId).toBe(finalized.runId);
+    expect(activated[0]!.evidence).toMatchObject({
+      from: before,
+      to: manifestDigest(revised),
+      viaRunKind: "CONTRACT_CHANGE",
+      grantId: grant.grantId,
+      grantDigest: grant.grantDigest,
+      attemptId: grant.consumedAttemptId,
+      candidateSnapshotDigest: finalized.candidateSnapshotDigest,
+    });
   });
 });

@@ -2,7 +2,6 @@ import { afterAll, describe, expect, it } from "vitest";
 import { join } from "node:path";
 
 import { type HandoffAcknowledgement, type HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
-import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -15,11 +14,10 @@ import {
   finalizeNoRepositoryRun,
   fixtureManifest,
   makeHarness,
-  manifestAuthorizationForRun,
   registerFixtureProject,
 } from "../helpers/harness.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import type { ProjectManifest } from "../../src/contracts/manifest.ts";
+import { manifestDigest } from "../../src/contracts/manifest.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -85,40 +83,6 @@ const deliveredAck = (
     payloadDigest: message.payloadDigest,
     sessionSecret: "test-session-secret",
   };
-};
-
-const completeContractChangeWithGrant = async (
-  harness: Harness,
-  projectId: string,
-  manifestDigest: string,
-  /** #246 B2-a — the manifest the run's PLAN carries. */
-  manifest: ProjectManifest,
-) => {
-  const finalized = await finalizeNoRepositoryRun(harness, projectId, CONTRACT, { manifest });
-  const { runId, candidateSnapshotDigest } = finalized;
-
-  const grant = {
-    schema: "acp.manifest-activation-grant.v1",
-    projectId,
-    runId,
-    runKind: "CONTRACT_CHANGE",
-    manifestDigest,
-    candidateSnapshotDigest,
-  };
-  harness.cp.db.run(
-    `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
-                                content_json, produced_by, created_at)
-     VALUES (?, ?, 'APPROVAL', ?, ?, ?, 'production-gate', ?)`,
-    [
-      `art_manifest_${runId.slice(-12)}`,
-      runId,
-      digestOf(grant),
-      candidateSnapshotDigest,
-      JSON.stringify(grant),
-      harness.clock.nowIso(),
-    ],
-  );
-  return runId;
 };
 
 describe("round-2 CTO lifecycle regressions", () => {
@@ -310,38 +274,38 @@ describe("round-2 CTO lifecycle regressions", () => {
 });
 
 describe("round-2 registry regressions", () => {
-  it("#152 refuses to activate manifest B with a completed run's grant for manifest A", async () => {
+  it("#152 activates only the manifest its own PLAN carried, once: the completed run's grant cannot activate another", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
     const manifestA = { ...fixtureManifest(projectId), postMergeCommands: ["verify"] };
-    const manifestB = { ...fixtureManifest(projectId), postMergeCommands: ["other"] };
-    const storedA = harness.cp.projects.storeManifest(manifestA, harness.cp.manifestAuthorizationForTests(manifestA));
-    if (!storedA.allowed) throw new Error(storedA.message);
-    const runId = await completeContractChangeWithGrant(harness, projectId, storedA.value, manifestA);
+    const finalized = await finalizeNoRepositoryRun(harness, projectId, CONTRACT, { manifest: manifestA });
+    // #246 B2-b — the CEO CONFIRM issued the grant and the finalizer consumed it with COMPLETED.
+    expect(harness.cp.projects.require(projectId).activeManifestDigest).toBe(manifestDigest(manifestA));
+    const grant = harness.cp.manifestGrants.get(finalized.runId)!;
+    expect(grant.manifestDigest).toBe(manifestDigest(manifestA));
+    expect(grant.consumedAt).not.toBeNull();
 
-    const refused = harness.cp.projects.activateManifest(projectId, manifestB, {
-      runKind: "CONTRACT_CHANGE",
-      runId,
-    }, manifestAuthorizationForRun(harness, projectId, manifestB, runId));
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.MANIFEST_ACTIVATION_EVIDENCE_MISSING);
+    // No caller can name a manifest to activate: activation loads it from the grant's PLAN, and the
+    // grant is consumed, so asking again moves nothing.
+    const again = harness.cp.projects.activateManifest(finalized.runId, {
+      completion: harness.cp.daemonFinalizationAuthorities().completion,
+      attemptId: grant.consumedAttemptId!,
+      workflows: [],
+      consumer: null,
+    });
+    expect(again.allowed).toBe(false);
+    expect(again.reasonCode).toBe(ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED);
+    expect(harness.cp.projects.require(projectId).activeManifestDigest).toBe(manifestDigest(manifestA));
   });
 
   it("#153 marks every project repository drifted with the activated manifest digest", async () => {
     const harness = makeHarness();
     const { projectId, repositoryId } = await registerFixtureProject(harness);
     const revised = { ...fixtureManifest(projectId), postMergeCommands: ["verify"] };
-    const stored = harness.cp.projects.storeManifest(revised, harness.cp.manifestAuthorizationForTests(revised));
-    if (!stored.allowed) throw new Error(stored.message);
-    const runId = await completeContractChangeWithGrant(harness, projectId, stored.value, revised);
+    await finalizeNoRepositoryRun(harness, projectId, CONTRACT, { manifest: revised });
 
-    const activated = harness.cp.projects.activateManifest(projectId, revised, {
-      runKind: "CONTRACT_CHANGE",
-      runId,
-    }, manifestAuthorizationForRun(harness, projectId, revised, runId));
-    expect(activated.allowed).toBe(true);
     const repository = harness.cp.repositories.byId(repositoryId)!;
-    expect(repository.activeManifestDigest).toBe(stored.value);
+    expect(repository.activeManifestDigest).toBe(manifestDigest(revised));
     expect(repository.driftState).toBe("DRIFTED");
   });
 

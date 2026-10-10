@@ -27,6 +27,7 @@ import {
 import { type WorkspaceProbe, realWorkspaceProbe } from "../guard/workspace-probe.ts";
 import { Outbox } from "../outbox/outbox.ts";
 import { ProjectRegistry, type ManagedManifestWrite } from "../registry/project-registry.ts";
+import { ManifestActivationGrants } from "../registry/manifest-activation-grants.ts";
 import { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { ConversationalActorRegistry } from "../registry/conversational-actor-registry.ts";
 import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review.ts";
@@ -271,6 +272,8 @@ export class ControlPlane {
   readonly telemetry: Telemetry;
   readonly outbox: Outbox;
   readonly projects: ProjectRegistry;
+  /** #246 B2-b — the CONTRACT_CHANGE activation grants: issued by the CEO CONFIRM, consumed by the finalizer. */
+  readonly manifestGrants: ManifestActivationGrants;
   readonly repositories: RepositoryRegistry;
   readonly sessions: SessionRegistry;
   readonly bindings: BindingRegistry;
@@ -544,6 +547,8 @@ export class ControlPlane {
         { hasRoleScoped: (provider) => this.providers.hasRoleScoped(provider) },
       );
       this.#completionAuthorities = this.runs.issueCompletionAuthorities();
+      this.manifestGrants = new ManifestActivationGrants(this.db, this.clock, this.artifacts, this.runs, this.bindings);
+      this.projects.attachManifestGrants(this.manifestGrants);
       this.verification = new VerificationEngine(
         this.db, this.clock, this.audit, this.artifacts, this.#evidenceWriters.VERIFICATION,
         this.repositories, this.worktrees, this.claims, this.guard, this.telemetry,
@@ -800,6 +805,8 @@ export class ControlPlane {
         // #246 C3, review 1076-R1-02 — the chain the CEO decision completes on; its finalizer asks too.
         bootstrapCompletionChain: this.bootstrapProducer,
         sourceReadLeases: this.guard,
+        // #246 B2-b — a CONTRACT_CHANGE CONFIRM admits against and issues its activation grant here.
+        manifestGrants: this.manifestGrants,
         continuity: {
           mode: () => this.continuity.mode(),
           modeAgeMs: () => this.continuity.modeAgeMs(),
