@@ -60,6 +60,21 @@ export const snapshotBootstrapPlanSchema = z
 
 export type SnapshotBootstrapPlan = z.infer<typeof snapshotBootstrapPlanSchema>;
 
+/**
+ * Issue #246 B2-a — what a CONTRACT_CHANGE candidate changes: its run's PLAN, the manifest that PLAN
+ * carries and the base it changes (the run's pinned manifest), each by digest. Present only on a
+ * CONTRACT_CHANGE candidate, with or without repositories.
+ */
+export const snapshotContractChangeSchema = z
+  .object({
+    planDigest: z.string().min(1),
+    manifestDigest: z.string().min(1),
+    baseManifestDigest: z.string().min(1),
+  })
+  .strict();
+
+export type SnapshotContractChange = z.infer<typeof snapshotContractChangeSchema>;
+
 export const candidateSnapshotSchema = z
   .object({
     schema: z.literal(CANDIDATE_SNAPSHOT_SCHEMA_ID),
@@ -72,10 +87,19 @@ export const candidateSnapshotSchema = z
     repositories: z.array(snapshotRepositorySchema),
     /** Present only on a project-less bootstrap candidate; every other snapshot omits the key. */
     bootstrapPlan: snapshotBootstrapPlanSchema.optional(),
+    /** Present only on a CONTRACT_CHANGE candidate; every other snapshot omits the key. */
+    contractChange: snapshotContractChangeSchema.optional(),
     createdAt: z.string().min(1),
   })
   .strict()
   .superRefine((snapshot, ctx) => {
+    if (snapshot.bootstrapPlan !== undefined && snapshot.contractChange !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "a candidate is a bootstrap plan or a contract change, never both",
+        path: ["contractChange"],
+      });
+    }
     for (const duplicate of duplicateRepositoryRoles(snapshot.repositories)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -131,7 +155,8 @@ export const duplicateRepositoryRoles = (
  *
  * A bootstrap candidate's PLAN, manifest and planned outputs are part of its identity (#246 C2):
  * a re-plan is a different candidate. A snapshot without `bootstrapPlan` digests exactly the four
- * fields it always did — the key is left out, not set to null — so no existing digest moves.
+ * fields it always did — the key is left out, not set to null — so no existing digest moves. The
+ * same holds for a CONTRACT_CHANGE candidate's `contractChange` (#246 B2-a).
  */
 export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
   digestOf({
@@ -140,6 +165,7 @@ export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
     contractDigest: snapshot.contractDigest,
     repositories: snapshot.repositories,
     ...(snapshot.bootstrapPlan === undefined ? {} : { bootstrapPlan: snapshot.bootstrapPlan }),
+    ...(snapshot.contractChange === undefined ? {} : { contractChange: snapshot.contractChange }),
   });
 
 export const buildCandidateSnapshot = async (
@@ -147,6 +173,7 @@ export const buildCandidateSnapshot = async (
     runId: string;
     contractDigest: string;
     repositories: readonly SnapshotRepositoryInput[];
+    contractChange?: SnapshotContractChange;
   },
   clock: Clock,
 ): Promise<CandidateSnapshot> => {
@@ -198,6 +225,7 @@ export const buildCandidateSnapshot = async (
     runId: params.runId,
     contractDigest: params.contractDigest,
     repositories,
+    ...(params.contractChange === undefined ? {} : { contractChange: params.contractChange }),
     createdAt: clock.nowIso(),
   });
 };
@@ -209,7 +237,12 @@ export const buildCandidateSnapshot = async (
  * digest-bound candidate that says there is nothing to merge.
  */
 export const buildNoRepositoryCandidateSnapshot = (
-  params: { runId: string; contractDigest: string; bootstrapPlan?: SnapshotBootstrapPlan },
+  params: {
+    runId: string;
+    contractDigest: string;
+    bootstrapPlan?: SnapshotBootstrapPlan;
+    contractChange?: SnapshotContractChange;
+  },
   clock: Clock,
 ): CandidateSnapshot =>
   candidateSnapshotSchema.parse({
@@ -218,6 +251,7 @@ export const buildNoRepositoryCandidateSnapshot = (
     contractDigest: params.contractDigest,
     repositories: [],
     ...(params.bootstrapPlan === undefined ? {} : { bootstrapPlan: params.bootstrapPlan }),
+    ...(params.contractChange === undefined ? {} : { contractChange: params.contractChange }),
     createdAt: clock.nowIso(),
   });
 

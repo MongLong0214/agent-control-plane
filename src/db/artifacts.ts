@@ -622,6 +622,30 @@ const blindReviewEvidenceSchema = z
       })
       .strict()
       .optional(),
+    // Issue #246 B2-a — a CONTRACT_CHANGE review names the PLAN, the manifest it carries and the base
+    // it changes, as the gate reloaded them, and the CI workflows a later activation must verify.
+    // Every other review carries no such key.
+    contractChange: z
+      .object({
+        planDigest: z.string().min(1),
+        manifestDigest: z.string().min(1),
+        baseManifestDigest: z.string().min(1),
+        workflowEvidence: z.array(
+          z
+            .object({
+              repositoryRole: z.string().min(1),
+              repositoryRemote: z.string().min(1).nullable(),
+              path: z.string().min(1),
+              checkName: z.string().min(1),
+              approvedDigest: z.string().min(1).nullable(),
+              unapprovedFirstActivation: z.boolean(),
+              unchangedFromBase: z.boolean(),
+            })
+            .strict(),
+        ),
+      })
+      .strict()
+      .optional(),
     createdAt: z.string().min(1),
   })
   .strict();
