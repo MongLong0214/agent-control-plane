@@ -16,6 +16,7 @@ import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ProductionGate, ProductionReadyPacket } from "../ceo/production-gate.ts";
+import { currentContractChangePlan, isContractChangeRun, sameContractChangeBinding } from "../registry/contract-change-plan.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
@@ -170,6 +171,20 @@ export class CandidatePipeline {
       if (!current.allowed) return current as Decision<CandidateSnapshot>;
       bootstrapPlan = current.value.binding;
     }
+    // #246 B2-a — a CONTRACT_CHANGE candidate, with or without repositories, is also its PLAN: the
+    // manifest that PLAN carries and the base it changes. A run whose PLAN carries none freezes nothing.
+    // The carried manifest is what is reviewed, and what a later activation may install; the bar this
+    // run is verified against stays its dispatch pin, rather than a contract the candidate proposes.
+    let contractChange: Parameters<typeof buildNoRepositoryCandidateSnapshot>[0]["contractChange"];
+    if (isContractChangeRun(run)) {
+      const current = currentContractChangePlan(
+        run,
+        this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN),
+        (digest) => this.projects.manifest(digest),
+      );
+      if (!current.allowed) return current as Decision<CandidateSnapshot>;
+      contractChange = current.value.binding;
+    }
 
     const snapshot = participants.length === 0
       ? buildNoRepositoryCandidateSnapshot(
@@ -177,6 +192,7 @@ export class CandidatePipeline {
             runId,
             contractDigest: run.contractDigest,
             ...(bootstrapPlan === undefined ? {} : { bootstrapPlan }),
+            ...(contractChange === undefined ? {} : { contractChange }),
           },
           this.clock,
         )
@@ -185,6 +201,7 @@ export class CandidatePipeline {
             runId,
             contractDigest: run.contractDigest,
             repositories,
+            ...(contractChange === undefined ? {} : { contractChange }),
           },
           this.clock,
         );
@@ -286,6 +303,25 @@ export class CandidatePipeline {
         );
         if (unpassed !== null) return unpassed;
         if (this.#continuity?.evaluate) await this.#continuity.evaluate("pre-completion");
+      } else if (snapshot.contractChange !== undefined) {
+        // #246 B2-a — a no-repository CONTRACT_CHANGE candidate is reviewed as a bootstrap plan is: the
+        // manifest its PLAN carries is the review input, and a PLAN replaced since makes it stale. The
+        // packet the production gate builds for it still summarizes its review as not applicable, as for
+        // any no-repository candidate that is not a bootstrap plan's; the BLIND_REVIEW is the review.
+        const contract = this.pinnedContract(input.runId, run.contractDigest);
+        if (!contract.allowed) return contract as Decision<PipelineOutcome>;
+        const reviewed = await this.invokeReview({
+          kind: "CONTRACT_CHANGE",
+          runId: input.runId,
+          snapshot,
+          contract: contract.value,
+          contractDigest: run.contractDigest,
+        });
+        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, () =>
+          this.contractChangePlanStillCurrent(input.runId, snapshot),
+        );
+        if (unpassed !== null) return unpassed;
+        if (this.#continuity?.evaluate) await this.#continuity.evaluate("pre-completion");
       }
       const sourceReadLease = this.guard.acquireSourceReadLease(input.runId, []);
       if (!sourceReadLease.allowed) return sourceReadLease as Decision<PipelineOutcome>;
@@ -294,6 +330,12 @@ export class CandidatePipeline {
         // since, and nothing below awaits before the packet is built.
         if (snapshot.bootstrapPlan !== undefined) {
           const planAtPublication = this.bootstrapPlanStillCurrent(input.runId, snapshot);
+          if (!planAtPublication.allowed) {
+            return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
+          }
+        }
+        if (snapshot.contractChange !== undefined) {
+          const planAtPublication = this.contractChangePlanStillCurrent(input.runId, snapshot);
           if (!planAtPublication.allowed) {
             return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
           }
@@ -394,7 +436,13 @@ export class CandidatePipeline {
       verification: verified.value,
     });
 
-    const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed);
+    // #246 B2-a — a CONTRACT_CHANGE candidate's verdict is for the PLAN it names; one replaced since
+    // gets no revision request. Any other candidate's verdict is delivered as before.
+    const unpassed = snapshot.contractChange === undefined
+      ? await this.unpassedReview(input.runId, snapshotDigest, reviewed)
+      : await this.unpassedReview(input.runId, snapshotDigest, reviewed, () =>
+          this.contractChangePlanStillCurrent(input.runId, snapshot),
+        );
     if (unpassed !== null) return unpassed;
 
     // Coverage is re-evaluated here, in async context, so the gate's completion check
@@ -416,6 +464,13 @@ export class CandidatePipeline {
           reasonCode: stillFreshAfterReview.reasonCode,
           snapshotDigest,
         });
+      }
+      // #246 B2-a — and its PLAN, as a no-repository candidate's is; nothing below awaits.
+      if (snapshot.contractChange !== undefined) {
+        const planAtPublication = this.contractChangePlanStillCurrent(input.runId, snapshot);
+        if (!planAtPublication.allowed) {
+          return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: planAtPublication.reasonCode, snapshotDigest });
+        }
       }
 
       const built = this.ceo.buildPacket({
@@ -764,6 +819,27 @@ export class CandidatePipeline {
       return deny(ReasonCode.EVIDENCE_STALE, "the PLAN this candidate names was replaced while it was being judged", {
         runId,
         candidate: snapshot.bootstrapPlan ?? null,
+        current: currentBinding,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * #246 B2-a — a CONTRACT_CHANGE candidate's freshness: the change it froze is still the one the
+   * run's latest PLAN implies, against the same base. Asked after review and at publication; a PLAN
+   * replaced after the packet is published is not refused here, but at the CEO's confirmation.
+   */
+  private contractChangePlanStillCurrent(runId: string, snapshot: CandidateSnapshot): Decision<void> {
+    const run = this.runs.get(runId);
+    const current = run
+      ? currentContractChangePlan(run, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN), (digest) => this.projects.manifest(digest))
+      : null;
+    const currentBinding = current?.allowed ? current.value.binding : null;
+    if (!sameContractChangeBinding(currentBinding, snapshot.contractChange)) {
+      return deny(ReasonCode.EVIDENCE_STALE, "the PLAN this candidate names was replaced while it was being judged", {
+        runId,
+        candidate: snapshot.contractChange ?? null,
         current: currentBinding,
       });
     }
