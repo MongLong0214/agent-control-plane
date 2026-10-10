@@ -32,6 +32,7 @@ import { migrationChainFrom, SCHEMA_VERSION } from "../../src/db/migrations.ts";
 import {
   bindWorker,
   bindCeo,
+  carryContractChange,
   finalizeNoRepositoryRun,
   makeHarness,
   makeStartedOperator,
@@ -90,7 +91,8 @@ describe("host-anchored redacted run-evidence export", () => {
     scripted.setCapacity({
       provider: "scripted", sensorHealth: "HEALTHY", runtimeHealth: "HEALTHY",
       observedAt: clock.nowIso(), source: "scripted-before-observation",
-      buckets: [{ id: "scripted-window", remainingPercent: 90, resetAt: null, capabilities: ["worker", "cto"] }],
+      // #246 B2-a — the run is a CONTRACT_CHANGE, so its candidate is blind-reviewed.
+      buckets: [{ id: "scripted-window", remainingPercent: 90, resetAt: null, capabilities: ["worker", "cto", "blind-review"] }],
     });
     const created = cp.runs.create({
       projectId,
@@ -104,6 +106,8 @@ describe("host-anchored redacted run-evidence export", () => {
     const dispatched = await cp.runs.dispatch(created.value.runId);
     expect(dispatched.allowed).toBe(true);
     if (!dispatched.allowed) return;
+    // #246 B2-a — a CONTRACT_CHANGE run's PLAN carries the manifest it proposes.
+    carryContractChange(harness, created.value.runId);
     const submitted = cp.tasks.submit(created.value.runId, [
       { key: "capacity-witness", title: "capacity witness", category: "test" },
     ]);
@@ -124,7 +128,7 @@ describe("host-anchored redacted run-evidence export", () => {
     const observed = await cp.capacity.observe({
       provider: "scripted", observedAt, runtimeHealth: "HEALTHY",
       actor: "fixture-operator", source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
-      buckets: [{ id: "operator-window", remainingPercent: 80, resetAt: null, capabilities: ["worker", "cto"] }],
+      buckets: [{ id: "operator-window", remainingPercent: 80, resetAt: null, capabilities: ["worker", "cto", "blind-review"] }],
     });
     expect(observed.allowed).toBe(true);
     expect(cp.capacity.current("scripted")?.operatorObservation).toBeDefined();

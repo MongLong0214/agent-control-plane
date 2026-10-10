@@ -18,6 +18,7 @@ import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import { ArtifactKind } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
+import { contractChangePlanForSubmission, isContractChangeRun } from "../registry/contract-change-plan.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { BlindReviewGate } from "../review/blind-review.ts";
 import type { CandidatePipeline } from "../run/candidate-pipeline.ts";
@@ -146,14 +147,18 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       };
     },
     // #246 C2 — a project-less bootstrap run's PLAN carries its manifest in full, checked portable
-    // and against the digest the PLAN names before anything is stored; any other run's is stored
-    // exactly as before.
+    // and against the digest the PLAN names before anything is stored. #246 B2-a — so does a
+    // CONTRACT_CHANGE run's, checked against the run's pinned manifest as well. Any other run's is
+    // stored exactly as before.
     submitPlan: (runId: string, plan: Record<string, unknown>): Decision<{ digest: string }> => {
       // #246 C3 — the contract freeze: once an external write of a bootstrap run's application may
       // have happened, its PLAN is never replaced, so a recovery can only re-apply what was frozen.
       const frozen = source.bootstrapApplications.assertNotFrozen(runId, "plan_submit");
       if (!frozen.allowed) return frozen as Decision<{ digest: string }>;
-      const admitted = planForSubmission(source.runs.require(runId), plan);
+      const run = source.runs.require(runId);
+      const admitted = isContractChangeRun(run)
+        ? contractChangePlanForSubmission(run, plan, (digest) => source.projects.manifest(digest))
+        : planForSubmission(run, plan);
       if (!admitted.allowed) return admitted as Decision<{ digest: string }>;
       return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, admitted.value).digest });
     },
@@ -405,7 +410,8 @@ const createCtoServerFromPort = (
           ])).optional(),
           // Issue #246 PR-C slice C2 — a project-less bootstrap run's full project manifest. It must be
           // portable and its digest must be `projectManifestDigest`; the PLAN keeps it, so the PLAN
-          // digest covers it. Any other run's plan never stores it.
+          // digest covers it. #246 B2-a — a CONTRACT_CHANGE run's PLAN must carry it, under the same
+          // rules and checked against the run's pinned manifest. Any other run's plan never stores it.
           projectManifest: z.record(z.unknown()).optional(),
         }),
         tasks: z.array(z.object({ key: z.string(), title: z.string(), category: z.enum(["mechanical", "implementation", "investigation", "integration", "test", "review", "docs", "migration", "benchmark", "security"]), dependsOn: z.array(z.string()).default([]), spec: z.record(z.unknown()).default({}) })).min(1),

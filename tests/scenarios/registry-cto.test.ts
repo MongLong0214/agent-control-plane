@@ -440,6 +440,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
       harness,
       projectId,
       { ...CONTRACT, goal: "revise the project contract" },
+      { manifest: revised },
     );
     const { runId, candidateSnapshotDigest } = finalized;
     const grant = {

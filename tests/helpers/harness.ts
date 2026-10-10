@@ -21,6 +21,7 @@ import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ManagedManifestWrite } from "../../src/registry/project-registry.ts";
 import type { HermesReceiptPortOptions } from "../../src/runtime/hermes-receipt-port.ts";
+import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
 import { commitAll, gitSync, makeRepo, tempDir, writeFiles } from "./fixtures.ts";
 
 /** The single allowlisted owner identity of the fixture deployment. */
@@ -712,16 +713,53 @@ export const installDaemonFinalizerGitHubFixture = (harness: Harness): void => {
 };
 
 /**
+ * A manifest that asks strictly more than `active`: the CommitLore mode raised to `required`, or,
+ * when it already is, one more post-merge command. A CONTRACT_CHANGE PLAN may not carry its base.
+ */
+export const stricterManifest = (active: ProjectManifest): ProjectManifest =>
+  active.commitlore.mode !== "required"
+    ? { ...active, commitlore: { mode: "required" } }
+    : { ...active, postMergeCommands: [...active.postMergeCommands, `contract-change-${active.postMergeCommands.length}`] };
+
+/**
+ * #246 B2-a — a dispatched CONTRACT_CHANGE run's PLAN, carrying `manifest` (by default one stricter
+ * than the run's pinned manifest), submitted through the CTO MCP port's own routing, and a scripted
+ * blind-review PASS that covers the manifest. Returns the manifest carried.
+ */
+export const carryContractChange = (
+  harness: Harness,
+  runId: string,
+  manifest?: ProjectManifest,
+): ProjectManifest => {
+  const run = harness.cp.runs.require(runId);
+  const pinned = run.pinnedManifestDigest ? harness.cp.projects.manifest(run.pinnedManifestDigest) : null;
+  if (!run.projectId || !pinned) throw new Error("a CONTRACT_CHANGE fixture needs a dispatched project run");
+  const carried = manifest ?? stricterManifest(pinned);
+  const submitted = createCtoMcpPort(harness.cp).submitPlan(runId, {
+    summary: "change the project contract",
+    projectManifestDigest: manifestDigest(carried),
+    projectManifest: carried,
+  });
+  if (!submitted.allowed) throw new Error(`${submitted.reasonCode}: ${submitted.message}`);
+  harness.scripted.script({
+    match: /Contract change review/,
+    text: reviewerPass([`${run.projectId}:#manifest/${manifestDigest(carried)}`]),
+  });
+  return carried;
+};
+
+/**
  * Drives an empty participation set through the production candidate packet, CEO confirmation,
  * and lock-held daemon finalizer. The registry tests use this instead of manually advancing
- * the state machine with a completion capability.
+ * the state machine with a completion capability. Since #246 B2-a the run's PLAN carries the
+ * manifest it proposes (`options.manifest`, by default a stricter one) and its review covers it.
  */
 export const finalizeNoRepositoryRun = async (
   harness: Harness,
   projectId: string,
   contract: TaskContract,
   /** Baseline exports only count a run whose harness identity attests production evidence. */
-  options: { baselineHarness?: BaselineHarnessInput } = {},
+  options: { baselineHarness?: BaselineHarnessInput; manifest?: ProjectManifest } = {},
 ): Promise<{ runId: string; candidateSnapshotDigest: string }> => {
   bindCeo(harness);
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
@@ -738,6 +776,7 @@ export const finalizeNoRepositoryRun = async (
   if (!created.allowed) throw new Error(created.message);
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);
   if (!dispatched.allowed) throw new Error(dispatched.message);
+  carryContractChange(harness, created.value.runId, options.manifest);
   await harness.cp.continuity.evaluate("empty run candidate packet");
   const submitted = await harness.cp.pipeline.submitResult({
     runId: created.value.runId,

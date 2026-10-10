@@ -30,6 +30,7 @@ import {
 } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
+import { ContractChangeRefusal } from "../registry/contract-change-plan.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
@@ -230,6 +231,14 @@ export class RunEngine {
         refusal: input.projectId ? "BOOTSTRAP_PROJECT_SUPPLIED" : "BOOTSTRAP_REPOSITORIES_SUPPLIED",
         projectId: input.projectId ?? null,
         repositories: input.repositories?.length ?? 0,
+      });
+    }
+    // #246 B2-a — a CONTRACT_CHANGE changes a project's contract, so it names the project. Refused
+    // here, before anything is stored, rather than first at plan_submit.
+    if (kind === RunKind.CONTRACT_CHANGE && !input.projectId) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "a CONTRACT_CHANGE run names the project whose contract it changes", {
+        refusal: ContractChangeRefusal.PROJECT_MISSING,
+        projectId: null,
       });
     }
     const humanGate = deriveHumanGate({
