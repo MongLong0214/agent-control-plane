@@ -339,6 +339,18 @@ export const wakeRoleHolder = async (
   cause: { kind: string; ids: readonly string[] },
 ): Promise<Decision<void>> => {
   const holder = cp.bindings.active(roleKey);
+  // #246 C4 — a PRIMARY_CTO whose driven-spawn record exists but does not make it DRIVEN is neither
+  // driven nor interactive: refused here, before the conversation port makes any socket contact.
+  if (holder?.role === Role.PRIMARY_CTO) {
+    const mode = cp.sessionRuntime.drivenModeOf(holder.sessionId);
+    if (mode !== "NONE" && mode !== "DRIVEN") {
+      return deny(ReasonCode.CONFLICT, "the role's holder has a driven-spawn record that does not name the binding it holds", {
+        roleKey,
+        sessionId: holder.sessionId,
+        drivenMode: mode,
+      });
+    }
+  }
   // #246 C4 — a PRIMARY_CTO is driven only when its own spawn recorded it so, never by its role.
   if (!holder || !cp.sessionRuntime.drivesSession(holder.sessionId, holder.role)) return conversation.wake(roleKey);
   const ids = cause.ids.length > 0 ? cause.ids : [`${cause.kind}:${randomUUID()}`];

@@ -269,6 +269,11 @@ export class ProvisionedSessionRuntime {
    * Whether this runtime drives `sessionId` holding `role`: every BOOTSTRAP_CTO, and a PRIMARY_CTO
    * only when its spawn record makes it `DRIVEN` — a missing or contradicted record never does.
    */
+  /** #246 C4 — the session's `DrivenMode`, read as the outbox reads it. */
+  drivenModeOf(sessionId: string): DrivenMode {
+    return this.ports.outbox.drivenModeOf(sessionId);
+  }
+
   drivesSession(sessionId: string, role: Role): boolean {
     if (DRIVEN_ROLES.has(role)) return true;
     return role === Role.PRIMARY_CTO && this.ports.outbox.drivenModeOf(sessionId) === "DRIVEN";

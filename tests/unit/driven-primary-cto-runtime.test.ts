@@ -1,15 +1,20 @@
+import { chmodSync } from "node:fs";
+import { createConnection, createServer } from "node:net";
+import { join } from "node:path";
+
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { type Decision, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
-import { wakeRoleHolder } from "../../src/daemon/agentcpd.ts";
+import { startLocalMcpListeners, wakeRoleHolder } from "../../src/daemon/agentcpd.ts";
 import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor, type RoleBinding } from "../../src/domain/types.ts";
+import { WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type SpawnAttestation } from "../../src/runtime/provisioned-session-runtime.ts";
 import type { SessionHandle, SessionTurnRequest, SessionTurnResult } from "../../src/runtime/provider.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest, registerFixtureProject } from "../helpers/harness.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 
@@ -1207,6 +1212,127 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         expect(cp.outbox.get(messageId)?.status).toBe("PENDING");
         expect(cp.outbox.claimDeliverable(50).map((row) => row.messageId)).not.toContain(messageId);
         expect(cp.outbox.get(messageId)?.status).toBe("PENDING");
+      });
+    });
+  });
+
+  describe("the daemon's wake refuses a contradicted holder before any socket contact", () => {
+    const KNOCK_TOKEN = "driven-knock-token";
+
+    /** A wake endpoint that counts every connection made to it: one knock is one connection. */
+    const recordingWakeEndpoint = async (path: string) => {
+      let connections = 0;
+      const server = createServer((socket) => {
+        connections += 1;
+        socket.resume();
+      });
+      await new Promise<void>((resolveListen, reject) => {
+        server.once("error", reject);
+        server.listen(path, () => resolveListen());
+      });
+      return {
+        path,
+        connections: () => connections,
+        close: () => new Promise<void>((resolveClose) => server.close(() => resolveClose())),
+      };
+    };
+
+    /** A CTO MCP connection as a qualified client build, kept open, with one tool call at a time. */
+    const openQualifiedPeer = async (socketPath: string, credential: { sessionId: string; sessionSecret: string }) => {
+      const socket = createConnection(socketPath);
+      await new Promise<void>((resolveConnect, reject) => {
+        socket.once("connect", () => resolveConnect());
+        socket.once("error", reject);
+      });
+      socket.on("error", () => undefined);
+      const pending = new Map<number, (body: Record<string, unknown>) => void>();
+      let buffer = "";
+      let nextId = 2;
+      socket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString();
+        for (let newline = buffer.indexOf("\n"); newline >= 0; newline = buffer.indexOf("\n")) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          let message: { id?: number; result?: { structuredContent?: Record<string, unknown> } };
+          try {
+            message = JSON.parse(line) as typeof message;
+          } catch {
+            continue;
+          }
+          const settle = message.id === undefined ? undefined : pending.get(message.id);
+          if (!settle || message.id === undefined) continue;
+          pending.delete(message.id);
+          settle(message.result?.structuredContent ?? { ok: false });
+        }
+      });
+      socket.write(`${[
+        { token: KNOCK_TOKEN, ...credential },
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: WAKE_TRANSPORT_QUALIFIED_CLIENTS[0] },
+        },
+        { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+      ].map((line) => JSON.stringify(line)).join("\n")}\n`);
+      return {
+        callTool: (name: string, args: Record<string, unknown>) =>
+          new Promise<Record<string, unknown>>((resolveCall) => {
+            const id = nextId++;
+            pending.set(id, resolveCall);
+            socket.write(`${JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } })}\n`);
+          }),
+        close: () => socket.destroy(),
+      };
+    };
+
+    it("refuses a CONTRADICTED driven PRIMARY_CTO without knocking on its registered wake endpoint", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { binding } = await drivenPrimary(f, "knock-contradicted");
+        const stateDir = tempDir("acp-c4-knock-");
+        chmodSync(stateDir, 0o700);
+        const listeners = await startLocalMcpListeners(cp, stateDir, KNOCK_TOKEN);
+        const endpoint = await recordingWakeEndpoint(join(stateDir, "cto.wake.sock"));
+        const credential = f.claude.credentials.get(binding.sessionId)!;
+        const peer = await openQualifiedPeer(listeners.socketPaths[1]!, {
+          sessionId: credential.sessionId,
+          sessionSecret: credential.sessionSecret,
+        });
+        try {
+          // The holder is attached on the real conversation port, with a live wake endpoint.
+          await vi.waitFor(() => expect(listeners.ctoConversation.connected(binding.roleKey)).toBe(true));
+          const registered = await peer.callTool("role_wake_endpoint_register", { endpoint: endpoint.path });
+          expect(registered["ok"]).toBe(true);
+          await vi.waitFor(() => expect(endpoint.connections()).toBeGreaterThan(0));
+          const settled = endpoint.connections();
+
+          cp.audit.record({
+            kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+            projectId: "knock-contradicted",
+            roleKey: binding.roleKey,
+            sessionId: binding.sessionId,
+            evidence: { creationGeneration: 1 },
+          });
+          expect(cp.outbox.drivenModeOf(binding.sessionId)).toBe("CONTRADICTED");
+          const providerBefore = f.claude.turns.length;
+          const refused = await wakeRoleHolder(cp, listeners.ctoConversation, binding.roleKey, {
+            kind: "in-band dispatch",
+            ids: ["contradicted-knock"],
+          });
+          expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
+          expect(endpoint.connections()).toBe(settled);
+          expect(f.claude.turns.length).toBe(providerBefore);
+
+          // Control: the same port, asked directly, does reach the endpoint — so the 0 above is the
+          // refusal's, not a dead endpoint's.
+          expect((await listeners.ctoConversation.wake(binding.roleKey)).allowed).toBe(true);
+          await vi.waitFor(() => expect(endpoint.connections()).toBe(settled + 1));
+        } finally {
+          peer.close();
+          await listeners.close();
+          await endpoint.close();
+        }
       });
     });
   });
