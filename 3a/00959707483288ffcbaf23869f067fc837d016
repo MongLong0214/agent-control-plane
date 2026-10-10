@@ -1,0 +1,50 @@
+Limit: the RF-S17 and RF-S25 labels each cover one arm: a RepoFactoryResult refusing activation facts, and the visibility the owner approved; the other arm of each is witnessed in another test file and is not labelled by this commit
+Limit: RF-S16 is labelled on its single-repository arm only, because this producer creates one repository by construction; the two-repository arm is judged in repo-factory
+Warn: keep these labels in the test body rather than the title: the title is the key a recorded result set is matched by, and with the titles unchanged a result set taken before this commit still matches
+Record-Id: r-3e57bc259598
+Provenance: inherited f9e906df9c82734ed01f768e324b977c27c784f0
+
+Limit: src/contracts/manifest.ts is a repo-factory contract entryPoint and was left unedited, so a Buzz npub1, a numeric Telegram chat id or a channel UUID inside a value is still not detected; these rows do not claim it
+Warn: a key is refused by the strict schema as INVALID_ARGUMENT and a value by the portability patterns as MANIFEST_NOT_PORTABLE; each row pins its own code, so do not merge the two paths into one assertion
+Record-Id: r-2525b0c73dfa
+Provenance: inherited 753d54eef9733a162e3c910e9703fd0f862ae8c5
+
+Limit: this tool cannot read the repo-factory run, so an EXTERNAL row points at evidence and is not evidence; and repo-factory's CI keeps no per-test result, only its summary line
+Limit: the not-supported-by-the-ACP-run fact is recorded with each external entry, not measured: the ACP producer does not implement those scenarios
+Warn: summary.repoFactoryScenariosMissing no longer lists external scenarios; they are in repoFactoryScenariosExternal, and only missing, duplicated or unusable entries fail the report
+Warn: an arm entry never covers a scenario by itself, and a declaration here of a scenario listed whole is a duplicate even when it did not pass
+Record-Id: r-870b473f3995
+Provenance: inherited bf1763a0c1f3bbcc7d7d987928c68d5369f46c01
+
+Limit: the statuses in this copy come from a local full run of bf1763a0 (gate PASS, 4571 passed, 12 skipped, 0 failed across 317 files), not from a run a CI gate judged; the gate-judged result set of run 38019531558 is for b4087696
+Warn: CI does not run pnpm trace, so this file is stale again as soon as the tree moves; regenerate it from a result set of the same commit before quoting its counts
+Record-Id: r-3409ebd01ed7
+Provenance: inherited dad6398b0f5c1d114fca51cd0847050e5675c18e
+
+Limit: the activation arm of RF-S17 and the owner-authority arm of RF-S25 are witnessed only in in-flight test files (doctor-ingress-bootstrap-daemon, repo-factory-run-wiring) that this change does not edit, so both scenarios stay missing until those leaves carry their arm labels
+Limit: RF-S22 lists a validator arm that nothing here witnesses, so RF-S22 is missing rather than covered by its manifest and workflow arms
+Ruled-out: letting a bare scenario id in a comment count as the whole scenario | the qualifier around it had no effect, so a single-repository retry covered the two-repository scenario and the verdict did not change when the external entry disappeared
+Warn: an arm label on a leaf also narrows any bare mention of the same scenario on that leaf, title included, so adding RF-Sxx arm:<name> to a test whose title names RF-Sxx turns it from a whole claim into an arm
+Warn: a whole-scenario label still covers a scenario that has listed arms; label a test whole only when it exercises every listed arm
+Record-Id: r-b9126f91fc07
+Provenance: inherited 8153202f2f63f98dd0fdc2dea36bfb2751a96fe0
+
+Limit: the dated RF-S08 install record survives only as residual JSON and its Actions run answers 404, so it cannot be verified remotely; the local install witness in repo-factory PR #56 is not merged, and its evidence will be a local run, not a GitHub Actions pass
+Record-Id: r-31cc090ec71e
+Provenance: inherited 6c9fabdd1d003c46e239495378b9467e38bae468
+
+Limit: the statuses come from a local full run of 6c9fabdd (gate PASS, 4598 passed, 12 skipped, 0 failed, 318 files), not from a run a CI gate judged
+Warn: pnpm trace exits 1 on this tree by design: RF-S17, RF-S22 and RF-S25 are missing, and that is the measured state, not a regression to silence
+Record-Id: r-4d68812cd0b4
+Provenance: inherited 4d83a53dc18f2f17ca9fb47f239d16597502a3c4
+
+Limit: only RF-S03 and RF-S08 moved to new repo-factory revisions; the other external entries stay at 309e2e6b47 because their ids were not re-run at the new main
+Limit: RF-S08's install witness is a local offline file: tarball install on one runtime (Node 22), not GitHub Actions setup-node; the declared lower runtime, Node 20, is checked only in the rendered workflow
+Warn: on Node 24, outside the template's declared runtimes, two RF-S08 cases fail on an assertion that expects node --test's TAP output; the install itself succeeds there, and all cases pass on Node 22
+Warn: an entry that names its own revision must also name the CI run that judged it; the default CI run belongs to the default revision
+Record-Id: r-51dd15bbf45d
+Provenance: inherited b0187e9d2d13cfebd40c056eb9c715dfa7316d04
+
+Limit: the statuses come from a local full run of b0187e9d (gate PASS, 4599 passed, 12 skipped, 0 failed, 318 files), not from a run a CI gate judged
+Record-Id: r-8ef7c20078c1
+Provenance: inherited 06fae3d68d71b39d2f564b5bc8bbe7be73dbb0a2
