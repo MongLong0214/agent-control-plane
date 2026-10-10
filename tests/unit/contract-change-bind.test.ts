@@ -351,6 +351,32 @@ describe("snapshot and review bind the manifest and its base", () => {
     expect(harness.cp.artifacts.list(run.runId, "BLIND_REVIEW")).toEqual([]);
     expect(harness.cp.artifacts.list(run.runId, "PRODUCTION_READY_PACKET")).toEqual([]);
   });
+
+  it("W12: a repository CONTRACT_CHANGE whose PLAN is replaced after its PASS is stale at publication", async () => {
+    const harness = makeHarness();
+    const { registered, run, m1 } = await repositoryChange(harness, "cc-repository-publication");
+    harness.scripted.script({
+      match: /# Candidate review/,
+      text: reviewerPass([
+        `${registered.identity}:src/app.js`,
+        `${registered.identity}:${WORKFLOW_PATH}`,
+        manifestKey(run.projectId, m1),
+      ]),
+    });
+    const continuity = harness.cp.continuity;
+    const evaluate = continuity.evaluate.bind(continuity);
+    const m2 = normalized({ ...m1, commitlore: { mode: "required" } });
+    vi.spyOn(continuity, "evaluate").mockImplementation(async (reason: string) => {
+      if (reason === "pre-completion") {
+        expect(createCtoMcpPort(harness.cp).submitPlan(run.runId, planCarrying(m2)).allowed).toBe(true);
+      }
+      return evaluate(reason);
+    });
+    const outcome = await submit(harness, run);
+    expect(outcome.allowed && outcome.value.stage).toBe("CANDIDATE_STALE");
+    expect(harness.cp.artifacts.list(run.runId, "BLIND_REVIEW")).toHaveLength(1);
+    expect(harness.cp.artifacts.list(run.runId, "PRODUCTION_READY_PACKET")).toEqual([]);
+  });
 });
 
 /** Answers every reviewer the way an honest one would: each chunk claims exactly the items it was given. */
