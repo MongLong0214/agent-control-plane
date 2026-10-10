@@ -169,6 +169,8 @@ describe("repo factory producer (#246)", () => {
   });
 
   it("is rejected by the real overclaim check when a forbidden activation claim is added to genuine producer output", async () => {
+    // RF-S17, result arm: a RepoFactoryResult may not assert an activation fact, on genuine producer output.
+    // That ACP's activation result supplies those fields is witnessed in the bootstrap daemon scenario, not here.
     const { workDir } = makeSandbox();
     const produced = await produceRepoFactoryResult({
       plan: basePlan(),

@@ -1350,6 +1350,7 @@ describe("issue projection", () => {
   });
 
   it("#76: a projection GitHub did not persist is refused and its reservation stays open", async () => {
+    // RF-S14: an issue create is re-read; an acknowledged write GitHub did not persist is refused.
     const fixture = await setup();
     const original = fixture.github.request.bind(fixture.github);
     let written = 0;
@@ -2443,6 +2444,7 @@ describe("trusted CI evidence (CP-S29)", () => {
   });
 
   it("CP-S29: an unapproved workflow digest or untrusted creator is also refused", async () => {
+    // RF-S22, workflow arm: CI from a candidate-edited workflow digest is refused; the approved one stays the contract.
     const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);
     const repo = snapshot.repositories[0]!;
