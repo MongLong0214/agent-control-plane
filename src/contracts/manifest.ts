@@ -1,3 +1,5 @@
+import { posix } from "node:path";
+
 import { z } from "zod";
 
 import { canonicalJson, digestOf } from "../core/digest.ts";
@@ -105,11 +107,22 @@ export const projectManifestSchema = z
       )
       .default([]),
     /**
-     * RF-S22 (PRD §14.2, RF-019): the files that hold the decision logic a pinned command or a
-     * pinned workflow `run:` executes as a gate, each bound by the sha256 of its bytes.
-     * `verify()` compares every entry at the candidate head before anything runs, so a candidate
-     * that rewrites a declared gate script to `process.exit(0)` is refused rather than judged by
-     * its own copy.
+     * RF-S22 (PRD §14.2, RF-019): the files that hold the decision logic a pinned verification
+     * command executes as a gate, each bound by the sha256 of its bytes, so a candidate that
+     * rewrites a declared gate script to `process.exit(0)` is refused rather than judged by its
+     * own copy.
+     *
+     * An entry is bound to the command that runs it, never to the project. An entry without
+     * `loadedBy` must be invoked directly: some verification command of its repository must name
+     * it as its first argument (`node gate/check.mjs`). A command that reaches a script through
+     * selection configuration the candidate owns -- `node --run verify`, `npm test`, a package
+     * script -- does not bind it, because the candidate can re-point that configuration without
+     * touching the script, so such a declaration is refused rather than accepted as protection.
+     * An entry with `loadedBy` is a helper that the named declared entry loads for its decision;
+     * it is checked wherever its root is. For a TRUSTED_CI command the argv is ACP's statement of
+     * what the approved workflow runs: ACP does not parse the workflow, so the approved workflow
+     * must itself run that argv, and a workflow `run:` that goes through a package script is
+     * selection configuration this binding does not reach.
      *
      * `.optional()` with no default is load-bearing. `manifestDigest` digests the parsed object,
      * so a defaulted `[]` would change the digest of every manifest written before this field
@@ -123,7 +136,9 @@ export const projectManifestSchema = z
      * through imports, and project code, tests and dependencies stay the candidate's (§14.2).
      * A helper an entry imports for its decision is outside the guarantee until it is declared
      * too; an entry that loads any undeclared candidate file in-process can be short-circuited
-     * through that file, so a gate entry means something only when it is self-contained.
+     * through that file, so a gate entry means something only when it is self-contained. A
+     * helper is trusted to be loaded by a path its root's pinned bytes name; a loader that
+     * resolves it through candidate configuration (a package.json `imports` map) is not bound.
      */
     gateEntries: z
       .array(
@@ -135,6 +150,8 @@ export const projectManifestSchema = z
             repositoryRole: z.string().min(1).default("primary"),
             /** `sha256:<hex>` of the file's bytes, the convention `approvedDigest` uses. */
             digest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+            /** The declared entry, in the same repository, that loads this one for its decision. */
+            loadedBy: z.string().min(1).optional(),
           })
           .strict(),
       )
@@ -189,11 +206,34 @@ export const projectManifestSchema = z
         });
       }
     }
-    for (const entry of manifest.gateEntries ?? []) {
+    const entries = manifest.gateEntries ?? [];
+    const declared = new Map(entries.map((entry) => [gateEntryKey(entry.repositoryRole, entry.path), entry]));
+    if (declared.size !== entries.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "a gateEntry is declared more than once for the same repository and path",
+        path: ["gateEntries"],
+      });
+    }
+    for (const entry of entries) {
       if (!roles.has(entry.repositoryRole)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: `gateEntry '${entry.path}' targets unknown repositoryRole '${entry.repositoryRole}'`,
+          path: ["gateEntries"],
+        });
+      }
+      const root = gateEntryRoot(entry, declared);
+      if (root === null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `gateEntry '${entry.path}' names a loadedBy chain that does not end at a declared entry`,
+          path: ["gateEntries"],
+        });
+      } else if (!manifest.verificationCommands.some((command) => invokesDirectly(command, root))) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `gateEntry '${root.path}' is invoked directly by no verification command of repositoryRole '${root.repositoryRole}': a command must name it as its first argument`,
           path: ["gateEntries"],
         });
       }
@@ -282,6 +322,54 @@ export const assertPortableManifest = (manifest: unknown): Decision<ProjectManif
 };
 
 export const manifestDigest = (manifest: ProjectManifest): string => digestOf(manifest);
+
+type GateEntry = NonNullable<ProjectManifest["gateEntries"]>[number];
+type VerificationCommandShape = ReturnType<typeof verificationCommandSchema.parse>;
+
+const gateEntryKey = (repositoryRole: string, path: string): string => `${repositoryRole}\0${path}`;
+
+/**
+ * The entry a `loadedBy` chain ends at, or null when the chain names an undeclared entry or
+ * loops. Kept as a lookup of declared entries only, so a chain can never leave the manifest.
+ */
+const gateEntryRoot = (entry: GateEntry, declared: ReadonlyMap<string, GateEntry>): GateEntry | null => {
+  let current = entry;
+  const seen = new Set<string>();
+  while (current.loadedBy !== undefined) {
+    if (seen.has(current.path)) return null;
+    seen.add(current.path);
+    const next = declared.get(gateEntryKey(entry.repositoryRole, current.loadedBy));
+    if (!next) return null;
+    current = next;
+  }
+  return current;
+};
+
+/**
+ * RF-S22 — whether a command runs `entry` itself rather than through selection configuration:
+ * its first argument, resolved against its cwd, is the entry's path. An option there
+ * (`node --run verify`) or any other position names something the interpreter or a package
+ * manager resolves, which the candidate controls.
+ */
+const invokesDirectly = (command: VerificationCommandShape, entry: GateEntry): boolean => {
+  const first = command.argv[1];
+  if (command.repositoryRole !== entry.repositoryRole || first === undefined || first.startsWith("-")) return false;
+  return posix.normalize(posix.join(command.cwd, first)) === entry.path;
+};
+
+/**
+ * The gate entries a selected command must find unchanged before it runs: the ones it invokes
+ * directly, and every declared helper whose `loadedBy` chain ends at one of them. A command that
+ * invokes no entry has none, so a run is never held to a gate it does not execute (#1082 R1-03).
+ */
+export const gateEntriesFor = (manifest: ProjectManifest, command: VerificationCommandShape): GateEntry[] => {
+  const entries = manifest.gateEntries ?? [];
+  const declared = new Map(entries.map((entry) => [gateEntryKey(entry.repositoryRole, entry.path), entry]));
+  return entries.filter((entry) => {
+    const root = gateEntryRoot(entry, declared);
+    return root !== null && invokesDirectly(command, root);
+  });
+};
 
 /** Commands selected by an execution mode, resolved through the profile map. */
 export const commandsForMode = (

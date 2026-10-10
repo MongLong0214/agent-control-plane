@@ -14,12 +14,13 @@ import {
 import { classifyBranch, validateBranchContract } from "../../src/github/branch-contract.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { candidateSnapshotDigest, type CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
-import { cleanupTempDirs, commitAll, gitSync, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, makeRepo, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import {
   type Harness,
   approveReviewedCandidateForFinalization,
   driveToReviewedCandidate,
+  fixtureManifest,
   installDaemonFinalizerGitHubFixture,
   makeHarness,
   registerFixtureProject,
@@ -2647,7 +2648,7 @@ describe("trusted CI evidence (CP-S29)", () => {
     return { harness, runId: created.value.runId, snapshot: snapshot.value, fetch, verify };
   };
 
-  it("RF-S22 W1: a candidate that rewrites the gate script a pinned workflow runs is refused before CI is read", async () => {
+  it("RF-S22 arm:validator W1: a candidate that rewrites the gate script a pinned workflow runs is refused before CI is read", async () => {
     // Workflow bytes and argv are untouched; only the script the workflow executes changes.
     const candidate = await gatePinnedCandidate({ "scripts/gate.mjs": "process.exit(0);\n" });
 
@@ -2668,7 +2669,7 @@ describe("trusted CI evidence (CP-S29)", () => {
     ).toBeNull();
   });
 
-  it("RF-S22 W2: nothing but the declared entry is frozen — project code, tests and dependencies may change", async () => {
+  it("RF-S22 arm:validator W2: nothing but the declared entry is frozen — project code, tests and dependencies may change", async () => {
     const candidate = await gatePinnedCandidate({
       "src/app.js": "module.exports = () => 2;\n",
       "tests/app.test.js": "require('node:assert').strictEqual(require('../src/app.js')(), 2);\n",
@@ -2680,6 +2681,127 @@ describe("trusted CI evidence (CP-S29)", () => {
     expect(verified.allowed, verified.allowed ? "" : `${verified.reasonCode}: ${verified.message}`).toBe(true);
     expect(verified.allowed && verified.value.status).toBe("PASS");
     expect(candidate.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * #1082 R1-03 — gate obligations follow the run's participants and its selected procedure. The
+   * project has a primary and a secondary repository, each with a gate its own command runs.
+   */
+  const SECONDARY_GATE = "process.exit(1);\n";
+  const participation = async (options: { selected: string[]; secondaryInRun: boolean }) => {
+    const harness = makeHarness();
+    writeFiles(harness.repoPath, { "scripts/gate.mjs": GATE_SCRIPT });
+    commitAll(harness.repoPath, "add the primary gate");
+    const secondaryPath = makeRepo({ "other-gate.mjs": SECONDARY_GATE, "src/app.js": "module.exports = () => 1;\n" });
+    const manifest = fixtureManifest("participation-project", {
+      repositories: [
+        { role: "primary", remote: "github:acme/fixture", manifestRoot: "." },
+        { role: "secondary", remote: "github:acme/secondary", manifestRoot: "." },
+      ],
+      verificationProfiles: { simple: options.selected, standard: options.selected, guarded: options.selected },
+      verificationCommands: [
+        GATE_CI_COMMANDS[0]!,
+        parseVerificationCommand({
+          id: "secondary-ci",
+          argv: ["node", "other-gate.mjs"],
+          repositoryRole: "secondary",
+          evidenceMode: "TRUSTED_CI",
+          timeoutSeconds: 60,
+        }),
+      ],
+      gateEntries: [
+        { path: "scripts/gate.mjs", repositoryRole: "primary", digest: sha256(GATE_SCRIPT) },
+        { path: "other-gate.mjs", repositoryRole: "secondary", digest: sha256(SECONDARY_GATE) },
+      ],
+    });
+    const project = harness.cp.projects.register({
+      projectId: manifest.projectId,
+      name: "participation",
+      manifest,
+      authorization: harness.cp.manifestAuthorizationForTests(manifest),
+    });
+    if (!project.allowed) throw new Error(project.message);
+    const participants = [];
+    for (const [role, checkoutPath, identity] of [
+      ["primary", harness.repoPath, "github:acme/fixture"],
+      ...(options.secondaryInRun ? [["secondary", secondaryPath, "github:acme/secondary"]] : []),
+    ] as Array<[string, string, string]>) {
+      const registered = await harness.cp.repositories.register({
+        checkoutPath,
+        projectId: manifest.projectId,
+        repositoryRole: role,
+        activeManifestDigest: project.value.activeManifestDigest,
+        identity,
+      });
+      if (!registered.allowed) throw new Error(registered.message);
+      participants.push({ repositoryId: registered.value.repositoryId, repositoryRole: role, baseBranch: "dev" });
+    }
+    const created = harness.cp.runs.create({
+      projectId: manifest.projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract: CONTRACT,
+      repositories: participants,
+    });
+    if (!created.allowed) throw new Error(created.message);
+    const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+    if (!dispatched.allowed) throw new Error(dispatched.message);
+    for (const checkoutPath of options.secondaryInRun ? [harness.repoPath, secondaryPath] : [harness.repoPath]) {
+      gitSync(checkoutPath, ["checkout", "-q", "-b", "feature/F1-gate"]);
+      writeFiles(checkoutPath, { "src/app.js": "module.exports = () => 2;\n" });
+      commitAll(checkoutPath, "product change");
+    }
+    const snapshot = await harness.cp.pipeline.freeze(created.value.runId);
+    if (!snapshot.allowed) throw new Error(snapshot.message);
+    const fetched: string[] = [];
+    harness.cp.verification.attachCi({
+      fetch: async (repositoryIdentity: string, head: string) => {
+        fetched.push(repositoryIdentity);
+        return [{
+          commandId: repositoryIdentity === "github:acme/fixture" ? "project-ci" : "secondary-ci",
+          repositoryIdentity,
+          head,
+          conclusion: "success" as const,
+          workflowDigest: "sha256:approved",
+          creatorIdentity: "github-actions",
+          completedAt: "2026-08-12T00:00:00.000Z",
+          nonVacuous: true,
+        }];
+      },
+      approvedWorkflowDigests: async () => ["sha256:approved"],
+      trustedCreators: async () => ["github-actions"],
+    });
+    const verified = await harness.cp.verification.verify({
+      runId: created.value.runId,
+      snapshot: snapshot.value,
+      commands: commandsOf(manifest, options.selected),
+      contractDigest: snapshot.value.contractDigest,
+    });
+    return { verified, fetched };
+  };
+  const commandsOf = (manifest: ReturnType<typeof fixtureManifest>, ids: readonly string[]) =>
+    manifest.verificationCommands.filter((command) => ids.includes(command.id));
+
+  it("RF-S22 arm:validator #1082 R1-03: a primary-only run is not held to a secondary gate its procedure does not run", async () => {
+    const { verified, fetched } = await participation({ selected: ["project-ci"], secondaryInRun: false });
+    expect(verified.allowed, verified.allowed ? "" : `${verified.reasonCode}: ${verified.message}`).toBe(true);
+    expect(verified.allowed && verified.value.status).toBe("PASS");
+    expect(fetched).toEqual(["github:acme/fixture"]);
+  });
+
+  it("RF-S22 arm:validator #1082 R1-03: a procedure that runs the secondary gate still requires the secondary repository", async () => {
+    const { verified } = await participation({ selected: ["project-ci", "secondary-ci"], secondaryInRun: false });
+    expect(verified).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.VERIFICATION_GAP,
+      evidence: { report: { status: "INCOMPLETE", expectedInputs: 2, observedInputs: 1 } },
+    });
+  });
+
+  it("RF-S22 arm:validator #1082 R1-03: a run with both repositories checks and passes both gates", async () => {
+    const { verified, fetched } = await participation({ selected: ["project-ci", "secondary-ci"], secondaryInRun: true });
+    expect(verified.allowed, verified.allowed ? "" : `${verified.reasonCode}: ${verified.message}`).toBe(true);
+    expect(verified.allowed && verified.value.status).toBe("PASS");
+    expect([...fetched].sort()).toEqual(["github:acme/fixture", "github:acme/secondary"]);
   });
 
   it("CP-S29: a CI result at the exact head from an approved workflow is accepted", async () => {

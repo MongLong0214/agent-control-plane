@@ -5,12 +5,14 @@ import { canonicalJson, digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type VerificationCommand, verificationCommandSchema } from "../contracts/verification-command.ts";
-import { type ProjectManifest, commandsForMode } from "../contracts/manifest.ts";
+import { type ProjectManifest, commandsForMode, gateEntriesFor } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunRow } from "../domain/types.ts";
 import { git } from "../git/git.ts";
+import { type Stats, lstatSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
@@ -155,6 +157,60 @@ const gateEntryAt = async (checkoutPath: string, head: string, path: string): Pr
   return { state: "FILE", digest: sha256(bytes) };
 };
 
+type GateEntry = NonNullable<ProjectManifest["gateEntries"]>[number];
+
+/**
+ * Reads one gate entry as the command about to run will find it: the file in the materialised
+ * verification worktree (#1082 R1-01). The object read above says what the candidate committed;
+ * this says what preparation actually wrote, after attributes, filters and anything else between
+ * the two. Every component of the path is lstat'd, so a symlink anywhere on it is refused rather
+ * than followed, and the bytes are read raw.
+ */
+const materializedGateEntryAt = (worktreePath: string, path: string): GateEntryObservation => {
+  const parts = path.split("/");
+  for (const [index] of parts.entries()) {
+    const current = join(worktreePath, ...parts.slice(0, index + 1));
+    let stat: Stats;
+    try {
+      stat = lstatSync(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") {
+        return { state: "ABSENT" };
+      }
+      return { state: "UNREADABLE", detail: (error as Error).message };
+    }
+    const last = index === parts.length - 1;
+    if (stat.isSymbolicLink() || (last ? !stat.isFile() : !stat.isDirectory())) {
+      return { state: "NOT_A_REGULAR_FILE", mode: (stat.mode & 0o170000).toString(8).padStart(6, "0"), type: "filesystem" };
+    }
+  }
+  return { state: "FILE", digest: sha256(readFileSync(join(worktreePath, ...parts))) };
+};
+
+/** The refusal an observation earns against its pin, or null when it is the pinned file. */
+const gateEntryRefusal = (
+  observed: GateEntryObservation,
+  entry: GateEntry,
+  evidence: Record<string, unknown>,
+  where: string,
+): Decision<never> | null => {
+  const base = { ...evidence, repositoryRole: entry.repositoryRole, path: entry.path, expected: entry.digest };
+  if (observed.state === "UNREADABLE") {
+    // Nothing was compared, so this must not read as "compared and differs" (#448).
+    return deny(ReasonCode.CONTRACT_UNVERIFIED, `a gate entry the pinned manifest binds could not be read ${where}`, {
+      ...base,
+      detail: observed.detail,
+    });
+  }
+  if (observed.state === "FILE" && observed.digest === entry.digest) return null;
+  return deny(ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT, `a gate entry the pinned manifest binds differs ${where}`, {
+    ...base,
+    observed: observed.state === "FILE" ? observed.digest : null,
+    observedState: observed.state,
+    ...(observed.state === "NOT_A_REGULAR_FILE" ? { observedMode: observed.mode, observedType: observed.type } : {}),
+  });
+};
+
 /**
  * PRD §17.
  *
@@ -206,10 +262,19 @@ export class VerificationEngine {
   /**
    * RF-S22 (PRD §14.2 "Candidate Gate Logic 변경은 이전 Trusted Contract로 판정", RF-019).
    *
-   * Every gate entry the pinned manifest declares must be, at the candidate head, a regular file
-   * whose bytes have the pinned digest. It runs before any sandbox, worktree or CI read, so this
-   * one site covers LOCAL_COMMAND and TRUSTED_CI alike. Post-merge verification in the GitHub
-   * kernel does not repeat it.
+   * What this guarantees, and where (#1082). Each selected command's gate entries
+   * (`gateEntriesFor`: the entry its argv runs directly and the helpers declared under it) are
+   * checked twice for a LOCAL_COMMAND: here, in git objects at the candidate head, before any
+   * worktree, sandbox or CI read; and again in `runLocal`, in that command's materialised
+   * worktree, immediately before it runs. For TRUSTED_CI only the first check exists: it binds the
+   * committed bytes at the exact head the evidence must report, and it runs before that evidence
+   * is accepted, not before CI ran. What CI's own checkout made of those bytes is not observed.
+   * Post-merge verification and its cached receipts do not repeat either check.
+   *
+   * Obligations follow the selected procedure and the run's participants, not the manifest as a
+   * whole: a command that is not selected, or whose repository is not in the run, holds the run
+   * to nothing here, and a selected command whose repository cannot be resolved is the gap the
+   * command loop already reports (#1082 R1-03).
    *
    * The basis is the run's pinned manifest, never the candidate's copy. `pinned` is loaded from
    * the trusted store by the run's dispatch-time digest, every snapshot repository has just been
@@ -227,47 +292,24 @@ export class VerificationEngine {
    */
   private async pinnedGateEntriesHold(
     runId: string,
-    pinned: ProjectManifest,
+    commands: readonly VerificationCommand[],
+    obligations: ReadonlyMap<string, readonly GateEntry[]>,
     snapshot: CandidateSnapshot,
   ): Promise<Decision<void>> {
-    for (const entry of pinned.gateEntries ?? []) {
-      const matching = snapshot.repositories.filter((repo) => repo.repositoryRole === entry.repositoryRole);
+    for (const command of commands) {
+      const matching = snapshot.repositories.filter((repo) => repo.repositoryRole === command.repositoryRole);
       const repo = matching.length === 1 ? matching[0]! : null;
       const record = repo ? this.repositories.byIdentity(repo.identity) : null;
-      if (!repo || !record) {
-        return deny(
-          ReasonCode.VERIFICATION_GAP,
-          "a gate entry the pinned manifest binds has no single bound candidate repository to be read from",
-          { runId, path: entry.path, repositoryRole: entry.repositoryRole, identity: repo?.identity ?? null },
+      if (!repo || !record) continue;
+      for (const entry of obligations.get(command.id) ?? []) {
+        const observed = await gateEntryAt(record.checkoutPath, repo.candidateHead, entry.path);
+        const refused = gateEntryRefusal(
+          observed,
+          entry,
+          { runId, commandId: command.id, identity: repo.identity, candidateHead: repo.candidateHead, checkedIn: "GIT_OBJECTS" },
+          "at the candidate head",
         );
-      }
-      const observed = await gateEntryAt(record.checkoutPath, repo.candidateHead, entry.path);
-      const evidence = {
-        runId,
-        identity: repo.identity,
-        repositoryRole: entry.repositoryRole,
-        path: entry.path,
-        candidateHead: repo.candidateHead,
-        expected: entry.digest,
-      };
-      if (observed.state === "UNREADABLE") {
-        // Nothing was compared, so this must not read as "compared and differs" (#448).
-        return deny(ReasonCode.CONTRACT_UNVERIFIED, "a gate entry the pinned manifest binds could not be read at the candidate head", {
-          ...evidence,
-          detail: observed.detail,
-        });
-      }
-      if (observed.state !== "FILE" || observed.digest !== entry.digest) {
-        return deny(
-          ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
-          "a gate entry the pinned manifest binds differs at the candidate head",
-          {
-            ...evidence,
-            observed: observed.state === "FILE" ? observed.digest : null,
-            observedState: observed.state,
-            ...(observed.state === "NOT_A_REGULAR_FILE" ? { observedMode: observed.mode, observedType: observed.type } : {}),
-          },
-        );
+        if (refused) return refused;
       }
     }
     return allow(ReasonCode.OK, undefined);
@@ -304,6 +346,8 @@ export class VerificationEngine {
     }
 
     let commands: readonly VerificationCommand[];
+    /** RF-S22 — the pinned gate entries each selected command runs; none for a run-scoped run. */
+    const gateObligations = new Map<string, readonly GateEntry[]>();
     if (run.pinnedManifestDigest) {
       if (options.runScoped) {
         return deny(
@@ -368,7 +412,8 @@ export class VerificationEngine {
         );
       }
       // RF-S22 — the gate logic the pinned manifest binds, before any command runs.
-      const gateLogic = await this.pinnedGateEntriesHold(runId, pinned, snapshot);
+      for (const command of expected) gateObligations.set(command.id, gateEntriesFor(pinned, command));
+      const gateLogic = await this.pinnedGateEntriesHold(runId, expected, gateObligations, snapshot);
       if (!gateLogic.allowed) return gateLogic as Decision<VerificationReport>;
     } else {
       if (!options.runScoped) {
@@ -480,7 +525,7 @@ export class VerificationEngine {
       if (command.evidenceMode !== "TRUSTED_CI") {
         const claim = this.ensureVerificationClaim(run, repo.identity);
         if (!claim.allowed) return claim as Decision<VerificationReport>;
-        results.push(await this.runLocal(
+        const local = await this.runLocal(
           run,
           snapshotDigest,
           command,
@@ -489,7 +534,10 @@ export class VerificationEngine {
           repo.candidateHead,
           repo.treeDigest,
           repo.sourceBranch ?? null,
-        ));
+          gateObligations.get(command.id) ?? [],
+        );
+        if (!local.allowed) return local as Decision<VerificationReport>;
+        results.push(local.value);
       }
       if (command.evidenceMode !== "LOCAL_COMMAND") {
         results.push(await this.collectCi(runId, snapshotDigest, command, repo.identity, repo.candidateHead));
@@ -646,7 +694,8 @@ export class VerificationEngine {
     head: string,
     frozenTree: string,
     sourceBranch: string | null,
-  ): Promise<VerificationResultRecord> {
+    gateEntries: readonly GateEntry[],
+  ): Promise<Decision<VerificationResultRecord>> {
     const runId = run.runId;
     const worktreeId = `verify-${runId}-${command.id}-${head.slice(0, 8)}-${randomUUID().replaceAll("-", "")}`;
     const path = this.worktrees.pathFor(worktreeId);
@@ -673,6 +722,7 @@ export class VerificationEngine {
 
     let worktree: Awaited<ReturnType<WorktreeManager["create"]>> | null = null;
     let outcome: Awaited<ReturnType<typeof runSandboxed>> | null = null;
+    let gateRefusal: Decision<never> | null = null;
     try {
       worktree = await this.worktrees.create(checkoutPath, head, worktreeId, authorization, {
         // #246 C2v: a command that is one of Repo Factory's fixed git invocations runs git in the
@@ -684,6 +734,22 @@ export class VerificationEngine {
         frozenTree,
       });
       this.updateVerificationWorktree(worktreeId, "ACTIVE", "active_at");
+      // RF-S22 (#1082 R1-01) — the bytes this command is about to execute, read in its own
+      // worktree after preparation and immediately before it runs. Every command gets a fresh
+      // worktree, so nothing an earlier command ran can stand between this read and this run
+      // except a writer that reaches this worktree from outside its own confinement. Such a
+      // writer -- on a host without write confinement, or anything outside the sandbox -- can
+      // still change the file between this read and the exec: the window is narrowed, not closed.
+      for (const entry of gateEntries) {
+        gateRefusal = gateEntryRefusal(
+          materializedGateEntryAt(worktree.path, entry.path),
+          entry,
+          { runId, commandId: command.id, identity, candidateHead: head, checkedIn: "VERIFICATION_WORKTREE" },
+          "in the materialised verification worktree",
+        );
+        if (gateRefusal) break;
+      }
+      if (gateRefusal) return gateRefusal;
       outcome = await runSandboxed({
         command,
         worktreePath: worktree.path,
@@ -732,7 +798,7 @@ export class VerificationEngine {
       enforcement: outcome.enforcement,
     };
     this.writeResultRow(runId, snapshotDigest, record);
-    return record;
+    return allow(ReasonCode.OK, record);
   }
 
   /**
