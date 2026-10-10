@@ -1,0 +1,74 @@
+Limit: only CtoLifecycle.ensureDrivenPrimaryCto spawns a driven PRIMARY_CTO and BootstrapActivation still calls ensurePrimaryCto, so an activation provisions an interactive PRIMARY_CTO until the activation slice switches that call together with fixtures that register a Claude adapter for the PRIMARY_CTO role
+Ruled-out: reading the run's PROJECT_BOOTSTRAP kind inside ensurePrimaryCto instead of a separate door | the activation fixtures register no Claude adapter for PRIMARY_CTO, so every existing activation test would throw in requireForRole, and activation.ts belongs to a later slice
+Ruled-out: a new sessions column or the per-session workdir's path shape as the driven marker rather than an append-only spawn record | the schema is not changed in this slice, and a path is inferred, not recorded
+Warn: whether a PRIMARY_CTO is driven is DRIVEN_PRIMARY_CTO_SPAWN_RECORD on its session (drivesSession, drivenPrimaryCtoSessionSql); a new reader that decides it from Role.PRIMARY_CTO alone drives every interactive and canonical CTO
+Warn: a driven binding whose resumed attestation fails is refused and left READY and bound, never marked ERROR or taken over; until same-session recovery is wired for it, nothing recovers it
+Record-Id: r-ac09ae88c2dd
+Provenance: inherited f1c195674b02d5d0aeb94ea30732c585d9b1b7c8
+
+Limit: role_dispatch_pending lists no payloadDigest or bindingGeneration for a row, and handoff_ack for a BOOTSTRAP handoff still checks only the recipient session; the attributable ACK checks (message, digest, generation, the turn's attested session, incarnation and epoch) are the activation slice's
+Limit: the daemon's lost-credential check still revokes and pauses only a BOOTSTRAP_CTO; a driven PRIMARY_CTO whose credential a restart dropped stays bound and its wakes are refused SESSION_RUNTIME_UNAVAILABLE until same-session recovery covers it
+Warn: PROVISIONED_IN_BAND_KINDS differs from IN_BAND_KINDS only by HANDOFF_PACKAGE and applies to provisioned targets only; an adopted canonical CTO and an interactive PRIMARY_CTO still receive a HANDOFF_PACKAGE outside the in-band path
+Record-Id: r-92f4253758c2
+Provenance: inherited e5bc76b87ad0656c0665599b7c267c6ba04288b9
+
+Warn: these witnesses reach BootstrapActivation.openActivationHandoff through a cast and call ensureDrivenPrimaryCto directly, because activation does not call it yet; once it does, drive activate() itself and drop the cast
+Record-Id: r-b6e9c193f3c8
+Provenance: inherited f9ad846cdb2b93036f662caa2528853780b3e64a
+
+Warn: latestHandoff now breaks a same-millisecond created_at tie by rowid, so it names the last inserted handoff rather than whichever row the planner returns; the line-keyed exclusion for it is deleted, not moved, so later edits above it no longer turn the census red
+Record-Id: r-1d5545718a6d
+Provenance: inherited 6b7bb9ea68bebbd0e4596a228a3a7fd6d71026d5
+
+Limit: the attested state is in daemon memory like the credential it proves; a restarted daemon holds neither, and the driven PRIMARY_CTO runs nothing until same-session recovery delivers and attests a credential again
+Ruled-out: gating every provisioned role on a current attestation rather than a driven PRIMARY_CTO only | a BOOTSTRAP_CTO's turns keep the contract C1b shipped, whose callers adopt and wake without a fresh attestation
+Warn: a driven PRIMARY_CTO runs work only while its last attestation, for its current incarnation and credential epoch, succeeded; adopt, release and any failed attestation clear it, so a path that adopts a credential must attest before it expects a work turn
+Record-Id: r-17a2ce12fa8b
+Provenance: inherited 9d8ddaf6f505c8091835c5d936d6947f03396a57
+
+Limit: the actor does not exist in the transaction that writes the session row, because the bind mints it after the session is READY; the record names its creation assignment by role key and creation generation, and that immutable assignment row carries the actor that every DRIVEN decision compares with the ACTIVE holder
+Limit: wakeRoleHolder still knocks the conversation port for a session whose record is contradicted, since it asks drivesSession for a yes or no; the knock carries nothing, the outbox withholds that session's rows from both the in-band read and the delivery sweep, and the runtime refuses its turns
+Warn: drivenModeSql is the one reading of the record; a reader that treats CONTRADICTED or PENDING as interactive instead of refusing re-opens the --session-id probe and the takeover a driven session must never get
+Warn: the record proves only the driving mode: any in-process audit writer can add one, so execution must keep requiring the ACTIVE binding, a READY session and a current attestation
+Record-Id: r-29a57f383add
+Provenance: inherited 7504fe17aec489091bf74463c1365af9f802c247
+
+Warn: latestHandoff keeps its single-term ORDER BY created_at DESC exactly as before; its census exclusion is keyed by line, so an edit above cto-lifecycle.ts:1017 moves the query and turns the census red until the key follows it
+Record-Id: r-5945e31d360e
+Provenance: inherited 04955f614ae6c7136a8235d7400696fdca85c695
+
+Warn: the attestation gate has two clearing paths, a turn that fails and a challenge left unanswered; each now has its own witness, so a change that drops either clear turns this file red
+Record-Id: r-2ea825431230
+Provenance: inherited b94e0ecb3ba88ba8719a0169116cc572d837d539
+
+Limit: an actor mismatch at the record's own generation cannot be constructed: the bind that grants that generation is the creation assignment itself, so another actor can only hold the role at a later generation after the named assignment was revoked; the witnesses cover that case and the case where the named generation went to another session
+Warn: these witnesses move the role's generations from inside the spawn's readiness check, its last await before the bind transaction; a change that adds an await between readiness and the bind, or drops the readiness check, must keep a deterministic point between the spawn record and the bind for them
+Record-Id: r-c4e49203bdb3
+Provenance: inherited cbfeef229c28dad6dee37b26dc317573dc72932d
+
+Limit: a session with no driven-spawn record is answered yes, so a run's BOOTSTRAP_CTO keeps its existing contract: its queued work is not re-checked against a revoked binding or an ERROR session here
+Limit: a driven PRIMARY_CTO whose binding was revoked reads CONTRADICTED, so its probe and attestation are refused; same-session recovery must define its own eligibility for a revoked lineage instead of reusing this one
+Warn: turnEligibility is read immediately before the provider call because every await before it (credential delivery, an earlier turn in the lane) can change the record, binding or session; a new await added between that check and runSessionTurn needs the check moved after it
+Warn: an attestation refused before any turn leaves an existing attestation standing; only an attestation whose turn ran and failed, or whose eligibility no longer holds after it, clears it
+Record-Id: r-37bbca666019
+Provenance: inherited 75c5aa3a037bf437b898e3fb4ac9f33f4257acd5
+
+Warn: each of these four witnesses is the only one in the file that fails when its protection is removed (the creation-actor comparison, the bind re-check, the attestation check on queued work, the in-band half of the sweep's withholding); removing one leaves its protection unwitnessed again
+Record-Id: r-918d544dcf27
+Provenance: inherited 8cb40b63d052b4491fcbe6a41b372aa6039ba6a5
+
+Warn: removing any one of the creation-actor comparison, the bind re-check, the attestation check on queued work or the in-band half of the sweep's withholding turns its own witness in the last block RED; only the sweep half is witnessed by that test alone, the other three also turn earlier witnesses in the file RED
+Record-Id: r-a76c1a6c86dc
+Supersedes: r-918d544dcf27
+Provenance: inherited a7722d95b141b044853e19c7ab0241afc651b698
+
+Limit: the ticket names no actor or assignment: none exists while the session is PENDING, because the bind mints them after READY; the ticket names the creation assignment by role key and creation generation, and the bind re-check verifies that assignment's actor
+Warn: the spawn ticket is compared field by field against current state, the session id included; an incarnation is not unique (SessionRegistry.create takes one), so a ticket check that drops the session id lets another PENDING session with the same incarnation, epoch and generation run a turn
+Warn: a relay turn is refused immediately before the provider call when the credential it prepared is no longer the session's: another epoch (rotated during the awaits) or another custody (adopted over or released); this applies to every relay turn, a run's BOOTSTRAP_CTO included
+Record-Id: r-c908636047d2
+Provenance: inherited 7bf57e49749c86bb7cf8027f7d57c8822039361b
+
+Limit: the refusal lives only in wakeRoleHolder; the conversation port's own construction and any wake hook added there are untouched, so a caller that wakes the port directly is not covered by this check
+Warn: wakeRoleHolder refuses a PRIMARY_CTO holder whose driven-spawn record exists but is not DRIVEN before it reaches conversation.wake; a holder with no record still takes the conversation path, so a later wake re-check added in this function must keep this refusal ahead of the port
+Record-Id: r-07b13c6d5581
+Provenance: inherited d812e8f83c59674aa4506564105e205679e985f9
