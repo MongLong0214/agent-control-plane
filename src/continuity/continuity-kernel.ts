@@ -636,26 +636,29 @@ export class ContinuityKernel {
     const provisioned = await this.provisionRoutableSession(role, assignment.provider, `continuity:${role}`);
     if (!provisioned.allowed) return provisioned as Decision<{ provider: string; generation: number }>;
 
-    // This catches a newer binding that arrived while session creation, route connection,
-    // or readiness was awaited. BindingRegistry still performs the final generation check
-    // transactionally (see the handoff for the required cross-owner parameter).
     const current = this.bindings.active(roleKey);
-    if (
-      current?.assignmentId !== expected?.assignmentId ||
-      current?.bindingGeneration !== expected?.bindingGeneration
-    ) {
+    // #246 C4-R2 — first, a holder with a driven-spawn record is never replaced, however it came to hold.
+    if (role === Role.PRIMARY_CTO && current && drivenModeOf(this.db, current.sessionId) !== "NONE") {
+      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "the holder is a driven primary CTO");
+      return drivenPrimaryNotReplaceable(roleKey, current.sessionId);
+    }
+
+    // This catches a newer binding that arrived while session creation, route connection,
+    // or readiness was awaited. #246 C4-R2 — for a PRIMARY_CTO, the whole holder (assignment,
+    // generation, runtime and incarnation), since a surviving move keeps the first two, and
+    // BindingRegistry checks the same exact binding again at the switch's own write boundary
+    // (`expectedCurrent`). Other roles keep the generation check: a CEO whose runtime moves right
+    // before the switch is replaced, as #649 specifies.
+    const superseded = role === Role.PRIMARY_CTO
+      ? !sameHolder(expected, current)
+      : current?.assignmentId !== expected?.assignmentId || current?.bindingGeneration !== expected?.bindingGeneration;
+    if (superseded) {
       this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "coverage plan superseded");
       return deny(ReasonCode.BINDING_GENERATION_STALE, "coverage plan was superseded by a newer binding", {
         roleKey,
         expectedGeneration: expected?.bindingGeneration ?? null,
         actualGeneration: current?.bindingGeneration ?? null,
       });
-    }
-
-    // #246 C4-R2 — at the switch itself, a holder with a driven-spawn record is still never replaced.
-    if (role === Role.PRIMARY_CTO && current && drivenModeOf(this.db, current.sessionId) !== "NONE") {
-      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "the holder is a driven primary CTO");
-      return drivenPrimaryNotReplaceable(roleKey, current.sessionId);
     }
 
     const switched = this.bindings.switchTo({
@@ -672,6 +675,9 @@ export class ContinuityKernel {
       conversation: "SURVIVED",
       requireCurrentTargetAttestation: true,
       expectedCurrentGeneration: expected?.bindingGeneration,
+      ...(role === Role.PRIMARY_CTO && expected
+        ? { expectedCurrent: { assignmentId: expected.assignmentId, sessionId: expected.sessionId, sessionIncarnation: expected.sessionIncarnation } }
+        : {}),
       // A failover of a role that still owns live work is a takeover: the runs move to the
       // new generation in the same transaction rather than being orphaned.
       takeover: true,
