@@ -1,9 +1,10 @@
+import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
 
-import { readProcessGroup } from "../../src/bootstrap/attempt-writer-group.ts";
+import { processGroupEmpty } from "../../src/bootstrap/attempt-writer-group.ts";
 import { writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
 import { plannedBootstrapOutputs } from "../../src/bootstrap/bootstrap-plan.ts";
 import {
@@ -164,13 +165,22 @@ export const prepareBootstrapRun = async (
     projects: harness.cp.projects,
     repositories: harness.cp.repositories,
   });
-  const thisProcess = {
-    pid: process.pid,
-    startToken: readProcessStartToken(process.pid),
+  // As the runner's own witnesses do (#246 C3, review 1076-R3): every attempt is recorded with a writer
+  // that has since exited — a real process that led its own group, its start token read while it ran,
+  // its group empty — since a vitest worker does not lead its group.
+  const exited = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { detached: true, stdio: "ignore" });
+  const writer = {
+    pid: exited.pid!,
+    startToken: readProcessStartToken(exited.pid!),
     startedAt: new Date().toISOString(),
-    processGroup: readProcessGroup(process.pid),
+    processGroup: exited.pid!,
   };
-  runner.attachWriterLock(() => true, () => thisProcess);
+  const gone = new Promise((resolveExit) => exited.once("exit", resolveExit));
+  exited.kill("SIGKILL");
+  await gone;
+  await vi.waitFor(() => expect(processGroupEmpty(writer.processGroup)).toBe(true), { timeout: 10_000, interval: 20 });
+  expect(writer.startToken).not.toBeNull();
+  runner.attachWriterLock(() => true, () => writer);
   harness.cp.ceo.attach({ bootstrapCompletionChain: runner });
   harness.cp.bootstrap.attachCompletionChain(runner);
   await harness.cp.continuity.evaluate("bootstrap confirmation");
@@ -276,21 +286,23 @@ export const activateAndConfirm = async (
 
 /**
  * C3's proof that a request was never sent, for every intent the GitHub ledger in `workDir` holds
- * pending: the withheld-request record the runner writes when it refuses a request at its start. A
- * producer row whose double refused a request before mutating anything writes it to say exactly that,
- * so the producer may send the request again (#246 C5, review C5I-R1-02).
+ * pending: the withheld record the runner writes, for the digest of the whole intent and a request
+ * generation, when it refuses a request at its start. A producer row whose double refused a request
+ * before mutating anything writes it to say exactly that, so the producer may send the request again
+ * (#246 C5, review C5I-R1-02). `attempt` is the request generation that withheld it.
  */
-export const withholdPending = (workDir: string, role = "primary"): Array<{ operationId: string; resourceType: string; attemptedAt: string }> => {
+export const withholdPending = (workDir: string, attempt = 1, role = "primary"): Array<Record<string, unknown>> => {
   const ledger = JSON.parse(readFileSync(join(workDir, "github-ledger", `${role}.json`), "utf8")) as {
-    pending: Array<{ operationId: string; resourceType: string; attemptedAt: string }>;
+    pending: Array<Record<string, unknown> & { operationId: string; resourceType: string; attemptedAt: string }>;
   };
   for (const intent of ledger.pending) {
     writeWithheldRequest(workDir, {
       runId: "run_withheld_fixture",
-      attempt: 1,
       operationId: intent.operationId,
       resourceType: intent.resourceType,
+      intentDigest: digestOf(intent),
       attemptedAt: intent.attemptedAt,
+      attempt,
       withheldAt: intent.attemptedAt,
       refusal: "WITHHELD_BEFORE_SEND",
     });

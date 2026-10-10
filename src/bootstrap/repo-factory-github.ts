@@ -676,10 +676,17 @@ export interface ApplyGitHubOperationsInput {
   newMarker?: () => string;
   /**
    * #246 C5, review C5I-R1-02 — whether a pending intent GitHub does not show settled is proven never
-   * sent: C3's withheld-request record of exactly that intent (`readWithheldRequest`). Without that
-   * proof the request stays in doubt and is not sent again, whichever step made it (`unresolvedPending`).
+   * sent: C3's withheld records of exactly that intent (`withheldUnsent` over `readWithheldIntent`).
+   * Without that proof the request stays in doubt and is not sent again, whichever step made it
+   * (`unresolvedPending`).
    */
   provenUnsent: (intent: PendingWrite) => boolean;
+  /**
+   * Records, durably, that the exemption `provenUnsent` found has been used, before the request it
+   * allows can start; throws when it cannot, and then nothing is sent. C3's one-time consumption: a
+   * request sent on the exemption that goes unanswered is in doubt from then on.
+   */
+  consumeExemption: (intent: PendingWrite) => void;
   /**
    * Issue #246 C2, review round 1 (RF-REVIEW-01) — whether the tree at `head` is exactly the approved
    * files. The commit this run makes is asked before this function is called at all, so a first push
@@ -874,12 +881,28 @@ export const applyGitHubOperations = async (
    * about the server, and GitHub not showing its effect now proves nothing about a request still in
    * flight. A step adopts an effect GitHub does show; anything else is sent again only on C3's proof
    * that exactly this intent was never sent (`provenUnsent`), and then as a new request, under a new
-   * begin time, which that proof does not cover. Without the proof it stays in doubt: null when the
-   * step may send, the refusal otherwise.
+   * begin time for a create or a push, under the same intent for a setting or a protection. The proof is
+   * used once: its consumption is recorded before the request can start (`consumeExemption`), so a
+   * request sent on it that goes unanswered is in doubt from then on, even one begun at the same time.
+   * Without the proof it stays in doubt: null when the step may send, the refusal otherwise.
    */
   const unresolvedPending = (pendingWrite: PendingWrite | undefined): Decision<Step> | null => {
     if (pendingWrite === undefined) return null;
-    if (input.provenUnsent(pendingWrite)) return null;
+    if (input.provenUnsent(pendingWrite)) {
+      try {
+        input.consumeExemption(pendingWrite);
+      } catch (error) {
+        return stop(
+          ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+          "WITHHELD_EXEMPTION_UNCONSUMED",
+          `the exemption of ${pendingWrite.operationId}'s withheld request could not be recorded as consumed, so the request is not sent`,
+          pendingWrite.operationId,
+          { indeterminate: true, resourceType: pendingWrite.resourceType, remote: describeFailure(error) },
+          false,
+        );
+      }
+      return null;
+    }
     return stop(
       ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
       "UNCONFIRMED_PENDING_REQUEST",
@@ -1456,8 +1479,8 @@ export const applyGitHubOperations = async (
     // A setting sent and never answered, which GitHub does not show: in doubt unless proven unsent.
     const settingInDoubt = unresolvedPending(pendingWrite);
     if (settingInDoubt !== null) return settingInDoubt;
-    const createdAt = clock.nowIso();
-    const intent: PendingWrite = pendingWrite !== undefined ? { ...pendingWrite, attemptedAt: createdAt } : {
+    const createdAt = pendingWrite?.attemptedAt ?? clock.nowIso();
+    const intent: PendingWrite = pendingWrite ?? {
       operationId: id,
       resourceType: "setting",
       resourceIdentity: operation.resourceIdentity,
@@ -1562,7 +1585,7 @@ export const applyGitHubOperations = async (
     const protectionInDoubt = unresolvedPending(pendingWrite);
     if (protectionInDoubt !== null) return protectionInDoubt;
     const before = current.value;
-    const intent: PendingWrite = pendingWrite !== undefined ? { ...pendingWrite, attemptedAt: clock.nowIso() } : {
+    const intent: PendingWrite = pendingWrite ?? {
       operationId: id,
       resourceType: "branch-protection",
       resourceIdentity: operation.resourceIdentity,

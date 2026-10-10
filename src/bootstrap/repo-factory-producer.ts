@@ -16,7 +16,8 @@ import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { git, tryRevParse, type GitResult } from "../git/git.ts";
-import { readWithheldRequest } from "./bootstrap-approval-anchor.ts";
+import { consumeWithheldExemption, readWithheldIntent, withheldUnsent } from "./bootstrap-approval-anchor.ts";
+import { withinBootstrapAttempt } from "./bootstrap-write-guard.ts";
 import type { GitHubWritePort } from "./github-write-port.ts";
 import {
   GITHUB_LEDGER_SCHEMA_ID,
@@ -980,6 +981,7 @@ export const produceRepoFactoryResult = async (
   let applied: AppliedGitHubOperations | null = null;
   if (github !== null) {
     const ledgerPath = github.ledgerPath;
+    const insideAttempt = withinBootstrapAttempt();
     let outcome: Decision<AppliedGitHubOperations>;
     try {
       outcome = await applyGitHubOperations({
@@ -1000,9 +1002,29 @@ export const produceRepoFactoryResult = async (
         ledgerPath,
         clock,
         // Review C5I-R1-02 — the one proof that a pending request was never sent, for a standalone call
-        // and the runner's attempts alike: C3's withheld-request record of exactly that intent, which
-        // the runner writes in this same work directory when it refuses a request at its start.
-        provenUnsent: (intent) => readWithheldRequest(workDir, intent.operationId, intent.attemptedAt) !== null,
+        // and the runner's attempts alike: C3's withheld records of exactly that intent, keyed by the
+        // digest of the whole intent and judged by `withheldUnsent`, the predicate the runner uses to
+        // find an intent exempt. The runner consumes the exemption, durably, before the request starts.
+        provenUnsent: (intent) =>
+          withheldUnsent(readWithheldIntent(workDir, { operationId: intent.operationId, intentDigest: digestOf(intent) })),
+        // Inside a bootstrap attempt, the attempt records the consumption under its own generation before
+        // the request starts. Outside one, nothing would: this call records it under the next generation
+        // the intent's records name, so the exemption is used once whoever calls.
+        consumeExemption: insideAttempt
+          ? () => undefined
+          : (intent) => {
+              const key = { operationId: intent.operationId, intentDigest: digestOf(intent) };
+              const records = readWithheldIntent(workDir, key);
+              if (records === null) throw new Error("the withheld records of this intent cannot be read");
+              const generations = [...records.withheld, ...records.consumed].map((record) => record.attempt);
+              consumeWithheldExemption(workDir, {
+                runId: plan.runId,
+                ...key,
+                resourceType: intent.resourceType,
+                attempt: Math.max(0, ...generations) + 1,
+                consumedAt: clock.nowIso(),
+              });
+            },
         approvedTree,
         validatedHead,
       });

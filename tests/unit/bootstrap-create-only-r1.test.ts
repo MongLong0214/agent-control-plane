@@ -1,12 +1,14 @@
-import { readFileSync } from "node:fs";
+import { chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 
+import { readWithheldIntent } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
 import { createBootstrapGitHubWritePort, runUnderWriteGuard } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import { createGitHubApiWritePort } from "../../src/bootstrap/github-write-port.ts";
 import { produceRepoFactoryResult, type RepoFactoryPlanFixture } from "../../src/bootstrap/repo-factory-producer.ts";
 import { ManualClock } from "../../src/core/clock.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { acpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
@@ -180,35 +182,58 @@ for (const [method, resourceType] of [
   ["setDefaultBranch", "setting"],
   ["protectBranch", "branch-protection"],
 ] as const) {
-  it(`C5I-R1-02: a ${resourceType} request with no answer is held in doubt with no resend; only C3's withheld proof lets it be sent, once per proof`, async () => {
+  it(`C5I-R1-02: a ${resourceType} request with no answer is held in doubt with no resend; C3's withheld proof lets it be sent once, even within one clock tick`, async () => {
     const root = tempDir("acp-c5-r1-pending-");
     const github = new InitializingGitHub(root);
     // GitHub's first-push default would settle the setting by itself; here only the setting sets it.
     github.pushSetsDefault = false;
     const workDir = join(root, "work");
+    // Every call at the same instant: a request begun again begins at the time the withheld one was.
+    const at = "2026-10-10T00:01:00.000Z";
     const sent = (): number => github.writes.filter((write) => write.method === method).length;
     const inDoubt = { allowed: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST", indeterminate: true, resourceType } };
 
     github.failNext = method;
-    expect((await producePushMode(workDir, github, "2026-10-10T00:01:00.000Z")).evidence["refusal"]).toBe("REMOTE_REFUSED");
+    expect((await producePushMode(workDir, github, at)).evidence["refusal"]).toBe("REMOTE_REFUSED");
     expect(sent()).toBe(1);
     // No answer and no proof: in doubt, nothing sent.
-    expect(await producePushMode(workDir, github, "2026-10-10T00:02:00.000Z")).toMatchObject(inDoubt);
+    expect(await producePushMode(workDir, github, at)).toMatchObject(inDoubt);
     expect(sent()).toBe(1);
-    // The proof covers exactly that intent: the request is sent once more, as a new request, and that
-    // one fails unanswered too.
-    withholdPending(workDir);
+    // The proof covers exactly that intent: the request is sent once more, its exemption consumed first,
+    // and that one fails unanswered too.
+    const [intent] = withholdPending(workDir).filter((pending) => pending["resourceType"] === resourceType);
     github.failNext = method;
-    expect((await producePushMode(workDir, github, "2026-10-10T00:03:00.000Z")).evidence["refusal"]).toBe("REMOTE_REFUSED");
+    expect((await producePushMode(workDir, github, at)).evidence["refusal"]).toBe("REMOTE_REFUSED");
     expect(sent()).toBe(2);
-    // The earlier proof does not cover the new request: in doubt again, nothing sent.
-    expect(await producePushMode(workDir, github, "2026-10-10T00:04:00.000Z")).toMatchObject(inDoubt);
+    const records = readWithheldIntent(workDir, { operationId: intent!["operationId"] as string, intentDigest: digestOf(intent) });
+    expect(records?.consumed.map((consumption) => consumption.attempt)).toEqual([2]);
+    // The proof is spent: in doubt from then on, whatever the clock says, and nothing is sent.
+    expect(await producePushMode(workDir, github, at)).toMatchObject(inDoubt);
+    expect(await producePushMode(workDir, github, at)).toMatchObject(inDoubt);
     expect(sent()).toBe(2);
-    // A proof of the new request lets it be sent, and the operation completes.
-    withholdPending(workDir);
-    const done = await producePushMode(workDir, github, "2026-10-10T00:05:00.000Z");
-    if (!done.allowed) throw new Error(`${done.reasonCode}: ${done.message} ${JSON.stringify(done.evidence)}`);
-    expect(sent()).toBe(3);
     expect(github.createRequests).toHaveLength(1);
   });
 }
+
+it("C5I-R1-02: a proof whose consumption cannot be recorded sends nothing", async () => {
+  const root = tempDir("acp-c5-r1-unconsumed-");
+  const github = new InitializingGitHub(root);
+  const workDir = join(root, "work");
+  const at = "2026-10-10T00:01:00.000Z";
+  github.failNext = "protectBranch";
+  expect((await producePushMode(workDir, github, at)).evidence["refusal"]).toBe("REMOTE_REFUSED");
+  withholdPending(workDir);
+  // The records directory is no longer private to this account, so no consumption can be written in it.
+  chmodSync(join(workDir, "withheld-requests"), 0o500);
+  try {
+    const refused = await producePushMode(workDir, github, at);
+    expect(refused, JSON.stringify(refused)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+      evidence: { refusal: "WITHHELD_EXEMPTION_UNCONSUMED", resourceType: "branch-protection" },
+    });
+  } finally {
+    chmodSync(join(workDir, "withheld-requests"), 0o700);
+  }
+  expect(github.writes.filter((write) => write.method === "protectBranch")).toHaveLength(1);
+});

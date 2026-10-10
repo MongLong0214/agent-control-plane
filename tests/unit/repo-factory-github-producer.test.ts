@@ -15,7 +15,6 @@ import {
   repositoryCheckoutPath,
   type RepoFactoryPlanFixture,
 } from "../../src/bootstrap/repo-factory-producer.ts";
-import { writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
 import { git } from "../../src/git/git.ts";
 import { withholdPending } from "../helpers/bootstrap-runner.ts";
 import { FakeGitHub, type Protection } from "../helpers/fake-github-write-port.ts";
@@ -781,15 +780,7 @@ describe("pending writes and readback fidelity (#1043 review follow-through)", (
 
     const [intent] = marker.pending;
     if (intent === undefined) throw new Error("no pending create");
-    writeWithheldRequest(workDir, {
-      runId: "run_bootstrap_246",
-      attempt: 1,
-      operationId: intent.operationId,
-      resourceType: "repository",
-      attemptedAt: intent.attemptedAt,
-      withheldAt: "2026-10-02T00:00:01.000Z",
-      refusal: "CEO_ADMISSION_LOST",
-    });
+    withholdPending(workDir);
     const retry = await produce(workDir, github, { at: "2026-10-02T00:10:00.000Z" });
     if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message}`);
     expect(github.writes.map((write) => write.method).filter((method) => method === "createRepository")).toHaveLength(1);
