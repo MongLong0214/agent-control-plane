@@ -494,7 +494,7 @@ export class RepairService {
           perform: async (dryRun) => {
             if (dryRun) return { changes: 1, evidence: inspected.move };
             // Verified again, synchronously, by the move itself: this plan was made before an await.
-            const preserved = recovery.preserveInterruptedCheckout(runId);
+            const preserved = recovery.preserveInterruptedCheckout(runId, inspected.move);
             if (!preserved.allowed) return { changes: 0, evidence: preserved.evidence, refusal: preserved as Decision<never> };
             return { changes: 1, evidence: preserved.value };
           },

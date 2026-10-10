@@ -1,4 +1,4 @@
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +8,7 @@ import { bootstrapActivationHandoff, plannedBootstrapOutputs } from "../../src/b
 import {
   REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND,
   type RepoFactoryOwnerApproval,
+  checkoutRecoveryFiles,
   repoFactoryGitHubWriteParameters,
 } from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
 import { repositoryCheckoutPath } from "../../src/bootstrap/repo-factory-producer.ts";
@@ -1073,14 +1074,14 @@ describe("#246 C3 decision (c): the official recovery of an interrupted attempt'
         bootstrapOperationId: application.bootstrapOperationId,
       });
       expect(existsSync(join(checkout.preservedPath, ".git", "HEAD"))).toBe(true);
-      expect(preservedRecords(f)).toEqual([{
+      expect(preservedRecords(f)).toEqual([expect.objectContaining({
         runId: run.runId,
         bootstrapOperationId: application.bootstrapOperationId,
         attempts: 1,
         candidateSnapshotDigest: run.candidate,
         originalPath: checkout.checkoutPath,
         preservedPath: checkout.preservedPath,
-      }]);
+      })]);
       expect(f.harness.cp.artifacts.latest(run.runId, ArtifactKind.REPAIR_RECEIPT)?.content).toMatchObject({
         operationId: "preserve_interrupted_bootstrap_checkout",
         changes: 1,
@@ -1115,31 +1116,53 @@ describe("#246 C3 decision (c): the official recovery of an interrupted attempt'
     });
   });
 
-  it("refuses while an attempt is in flight, while a git lock is held, or while this process is not the only writer", async () => {
+  it("refuses while an attempt of the run is in flight, and leaves its checkout alone", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-live"));
       await approveWrites(f, run);
-      const checkout = await interruptedAttempt(f, run, async (checkoutPath) => {
+      await interruptedAttempt(f, run, async (checkoutPath) => {
         const inFlight = await preserveCheckout(f, run);
         expect(inFlight, JSON.stringify(inFlight)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
         expect(preconditionOf(inFlight, 2)).toMatchObject({ satisfied: false, evidence: { attemptInFlight: true } });
         expect(existsSync(join(checkoutPath, MARKER))).toBe(true);
+        expect(preservedRecords(f)).toEqual([]);
       });
+    });
+  });
 
+  it("a git lock file held in the checkout keeps the recovery refused, and is never removed", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-gitlock"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
       const lock = join(checkout.checkoutPath, ".git", "index.lock");
       writeFileSync(lock, "");
-      const locked = await preserveCheckout(f, run);
-      expect(locked, JSON.stringify(locked)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
-      expect(preconditionOf(locked, 2)).toMatchObject({ satisfied: false, evidence: { gitLockFiles: [".git/index.lock"] } });
+      for (const attempt of [1, 2]) {
+        const locked = await preserveCheckout(f, run);
+        expect(locked, `${attempt}: ${JSON.stringify(locked)}`).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+        expect(preconditionOf(locked, 2)).toMatchObject({
+          satisfied: false,
+          evidence: { attemptInFlight: false, writerLockHeld: true, gitLockFiles: [".git/index.lock"] },
+        });
+        expect(existsSync(lock)).toBe(true);
+      }
       leftInPlace(f, checkout);
-      // The fixture's own lock file, not the checkout's content: taken away again before the last case.
-      unlinkSync(lock);
+    });
+  });
 
-      // No lock the runner can see is held for it: nothing shows the dead attempt has ended.
+  it("refuses while this process does not hold the single-writer lock, whatever the git lock files say", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-writer"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      // No git lock file and no attempt in flight here; only the lock the daemon holds is missing.
       f.harness.cp.bootstrapProducer.attachWriterLock(() => false);
       const unlocked = await preserveCheckout(f, run);
       expect(unlocked, JSON.stringify(unlocked)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
-      expect(preconditionOf(unlocked, 2)).toMatchObject({ satisfied: false, evidence: { writerLockHeld: false } });
+      expect(preconditionOf(unlocked, 2)).toMatchObject({
+        satisfied: false,
+        evidence: { attemptInFlight: false, writerLockHeld: false, gitLockFiles: [] },
+      });
       leftInPlace(f, checkout);
     });
   });
@@ -1219,6 +1242,132 @@ describe("#246 C3 decision (c): the official recovery of an interrupted attempt'
       expect(consumedApprovals(f, run.runId)).toBe(1);
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
       expect(existsSync(checkout.checkoutPath)).toBe(false);
+    });
+  });
+
+  /** A swap another process makes between the recovery's last check and its rename. */
+  const swapBeforeRename = (swap: () => void) =>
+    vi.spyOn(checkoutRecoveryFiles, "rename").mockImplementationOnce((from, to) => {
+      swap();
+      renameSync(from, to);
+    });
+
+  /** The refusal a swap between the check and the rename gets: what arrived was moved back. */
+  const movedBack = (refused: Record<string, unknown>): void => {
+    expect(refused, JSON.stringify(refused)).toMatchObject({
+      ok: false,
+      reasonCode: ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED,
+      evidence: { refusal: "MOVED_OBJECT_MISMATCH", movedBack: true },
+    });
+  };
+
+  it("the checkout replaced by another directory between the check and the rename: refused, and that directory moved back", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-replaced"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      const aside = `${checkout.checkoutPath}.real`;
+      swapBeforeRename(() => {
+        renameSync(checkout.checkoutPath, aside);
+        mkdirSync(checkout.checkoutPath, { mode: 0o700 });
+        cpSync(join(aside, MARKER), join(checkout.checkoutPath, MARKER));
+        writeFileSync(join(checkout.checkoutPath, "impostor"), "not the checkout\n");
+      });
+      movedBack(await preserveCheckout(f, run));
+      expect(existsSync(join(checkout.checkoutPath, "impostor"))).toBe(true);
+      expect(existsSync(join(aside, ".git", "HEAD"))).toBe(true);
+      expect(existsSync(checkout.preservedPath)).toBe(false);
+      expect(preservedRecords(f)).toEqual([]);
+    });
+  });
+
+  it("the checkout swapped for a symlink between the check and the rename: refused, the symlink left in place, its target untouched", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-symlink"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      const elsewhere = makeRepo({ [MARKER]: readFileSync(join(checkout.checkoutPath, MARKER), "utf8") }, "main");
+      const aside = `${checkout.checkoutPath}.real`;
+      swapBeforeRename(() => {
+        renameSync(checkout.checkoutPath, aside);
+        symlinkSync(elsewhere, checkout.checkoutPath);
+      });
+      // A symlink cannot replace the directory the recovery claimed, so the rename itself fails;
+      // had it landed, the check after it would have found no directory there.
+      const refused = await preserveCheckout(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED,
+        evidence: { refusal: "MOVE_FAILED" },
+      });
+      expect(existsSync(checkout.preservedPath)).toBe(false);
+      expect(readFileSync(join(checkout.checkoutPath, MARKER), "utf8")).toBe(readFileSync(join(elsewhere, MARKER), "utf8"));
+      expect(existsSync(join(elsewhere, ".git", "HEAD"))).toBe(true);
+      expect(existsSync(join(aside, ".git", "HEAD"))).toBe(true);
+      expect(preservedRecords(f)).toEqual([]);
+    });
+  });
+
+  it("the checkout's parent swapped for a symlink between the check and the rename: refused, and what was taken put back", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-parent"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      const repositories = join(checkout.workDir, "repositories");
+      const decoy = tempDir("acp-c3-decoy-");
+      mkdirSync(join(decoy, "primary"));
+      writeFileSync(join(decoy, "primary", MARKER), readFileSync(join(checkout.checkoutPath, MARKER)));
+      swapBeforeRename(() => {
+        renameSync(repositories, `${repositories}.real`);
+        symlinkSync(decoy, repositories);
+      });
+      movedBack(await preserveCheckout(f, run));
+      expect(existsSync(join(decoy, "primary", MARKER))).toBe(true);
+      expect(existsSync(join(`${repositories}.real`, "primary", ".git", "HEAD"))).toBe(true);
+      expect(preservedRecords(f)).toEqual([]);
+    });
+  });
+
+  it("the preservation directory swapped for a symlink between the check and the rename: refused, and the checkout moved back", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-destination"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      const preservedRoot = join(checkout.workDir, "preserved");
+      const outside = tempDir("acp-c3-outside-");
+      swapBeforeRename(() => {
+        renameSync(preservedRoot, `${preservedRoot}.real`);
+        symlinkSync(outside, preservedRoot);
+      });
+      movedBack(await preserveCheckout(f, run));
+      expect(existsSync(join(checkout.checkoutPath, ".git", "HEAD"))).toBe(true);
+      expect(readdirSync(outside)).toEqual([]);
+      expect(preservedRecords(f)).toEqual([]);
+    });
+  });
+
+  it("a destination taken between the repair's plan and its move: refused, and nothing moved", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-raced"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      const runner = f.harness.cp.bootstrapProducer;
+      const inspect = runner.inspectInterruptedCheckout.bind(runner);
+      vi.spyOn(runner, "inspectInterruptedCheckout").mockImplementationOnce((runId) => {
+        const planned = inspect(runId);
+        mkdirSync(join(checkout.workDir, "preserved"), { mode: 0o700 });
+        mkdirSync(checkout.preservedPath, { mode: 0o700 });
+        return planned;
+      });
+      const refused = await preserveCheckout(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED,
+        evidence: { refusal: "PRECONDITION_UNMET" },
+      });
+      expect(existsSync(join(checkout.checkoutPath, MARKER))).toBe(true);
+      expect(readdirSync(checkout.preservedPath)).toEqual([]);
+      expect(preservedRecords(f)).toEqual([]);
     });
   });
 });

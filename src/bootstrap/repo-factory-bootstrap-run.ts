@@ -1,4 +1,4 @@
-import { lstatSync, mkdirSync, readdirSync, renameSync, rmdirSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, realpathSync, renameSync, rmdirSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 
 import { z } from "zod";
@@ -309,6 +309,16 @@ export const INTERRUPTED_CHECKOUT_PRECONDITIONS = [
   "the preservation location is free",
 ] as const;
 
+/** The checkout an application's reserved PLAN places, as `placedCheckout` verified it. */
+interface PlacedCheckout {
+  workDir: string;
+  checkoutPath: string;
+  repositoryRole: string;
+  checkoutDevice: number;
+  checkoutInode: number;
+  realWorkDir: string;
+}
+
 /** Where preserved checkouts are kept: beside the run's checkouts, in the run's own work directory. */
 const PRESERVED_DIRECTORY = "preserved";
 
@@ -327,7 +337,25 @@ export interface InterruptedCheckoutPreservation {
   candidateSnapshotDigest: string;
   originalPath: string;
   preservedPath: string;
+  /** The checked checkout directory itself, by device and inode: what has to arrive at `preservedPath`. */
+  checkoutDevice: number;
+  checkoutInode: number;
+  /** `preservedPath` with every symlink resolved, as it was when checked: where it has to arrive. */
+  preservedRealPath: string;
 }
+
+/**
+ * The file operations the interrupted-checkout recovery acts with, in one object: another process
+ * can change the tree between any two of them, and a witness puts that change exactly there.
+ * Production uses node:fs unchanged.
+ */
+export const checkoutRecoveryFiles = {
+  lstat: lstatSync,
+  mkdir: mkdirSync,
+  realpath: realpathSync,
+  rename: renameSync,
+  rmdir: rmdirSync,
+};
 
 export interface InterruptedCheckoutInspection {
   preconditions: CheckoutRecoveryPrecondition[];
@@ -1159,7 +1187,7 @@ export class RepoFactoryBootstrapRunner {
     if (!met(placed.allowed, placed.allowed ? placed.value : { message: placed.message, ...placed.evidence }) || !placed.allowed) {
       return unmetFromHere();
     }
-    const { workDir, checkoutPath, repositoryRole } = placed.value;
+    const { workDir, checkoutPath, repositoryRole, checkoutDevice, checkoutInode, realWorkDir } = placed.value;
 
     const attemptInFlight = this.#applying.has(runId);
     const writerLockHeld = this.#writerLockHeld?.() === true;
@@ -1174,7 +1202,8 @@ export class RepoFactoryBootstrapRunner {
       return unmetFromHere();
     }
 
-    const preservedPath = join(workDir, PRESERVED_DIRECTORY, `${repositoryRole}-attempt-${application.attempts}`);
+    const preservedName = `${repositoryRole}-attempt-${application.attempts}`;
+    const preservedPath = join(workDir, PRESERVED_DIRECTORY, preservedName);
     const occupied = pathOccupied(preservedPath);
     if (!met(!occupied, { preservedPath, occupied })) return unmetFromHere();
 
@@ -1187,23 +1216,36 @@ export class RepoFactoryBootstrapRunner {
         candidateSnapshotDigest: application.candidateSnapshotDigest,
         originalPath: checkoutPath,
         preservedPath,
+        checkoutDevice,
+        checkoutInode,
+        preservedRealPath: join(realWorkDir, PRESERVED_DIRECTORY, preservedName),
       },
     };
   }
 
   /**
    * #246 C3, CEO decision (c) — the official recovery of an interrupted application's checkout:
-   * verified again here, synchronously and immediately before anything moves, then moved — never
-   * deleted — to `<work dir>/preserved/<role>-attempt-<n>`, whose name is claimed by an exclusive
-   * mkdir first so the move can only land in a place this call created empty. The original path, the
-   * preserved location and the run's attribution are recorded. Refused, with the checkout exactly
-   * where it was, when a precondition does not hold, the location is taken, or the move fails.
+   * verified again here, synchronously and immediately before anything moves, and refused unless it
+   * is still exactly what the repair's plan verified (`planned`). Then moved — never deleted — to
+   * `<work dir>/preserved/<role>-attempt-<n>`, whose name is claimed first by an exclusive mkdir so
+   * the move can only land in a place this call created empty. Another process can still change the
+   * tree between the last check and the rename — replace the checkout, swap it or a parent for a
+   * symlink, or move the destination — so what arrived is checked after the rename: the same
+   * directory by device and inode, at the preservation path with every symlink resolved. Anything
+   * else is moved back to where it came from if that place is still free, and refused; nothing is
+   * deleted in either case. On success the original path, the preserved location and the run's
+   * attribution are recorded.
    *
    * It authorises nothing. No approval is consumed or re-admitted, no attempt is recorded and no
    * phase moves: the application resumes only through a new CEO CONFIRM, which passes every check
-   * again — the official receipt against the current write scope among them.
+   * again — the official receipt against the current write scope among them. A git lock file in the
+   * checkout is never removed: it keeps the recovery refused until it is gone.
    */
-  preserveInterruptedCheckout(runId: string | null): Decision<InterruptedCheckoutPreservation> {
+  preserveInterruptedCheckout(
+    runId: string | null,
+    planned: InterruptedCheckoutPreservation | null = null,
+  ): Decision<InterruptedCheckoutPreservation> {
+    const files = checkoutRecoveryFiles;
     const refuse = (refusal: string, message: string, evidence: Evidence): Decision<InterruptedCheckoutPreservation> =>
       deny(ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED, message, { refusal, runId, ...evidence });
     const inspected = this.inspectInterruptedCheckout(runId);
@@ -1213,13 +1255,19 @@ export class RepoFactoryBootstrapRunner {
         preconditions: inspected.preconditions,
       });
     }
+    if (planned !== null && digestOf(planned) !== digestOf(move)) {
+      return refuse("PLAN_CHANGED", "what is there now is not what the repair's plan verified; nothing is moved", {
+        planned,
+        current: move,
+      });
+    }
     const preservedRoot = dirname(move.preservedPath);
     const ensured = ensureDirectoryLevel(preservedRoot);
     if (!ensured.allowed) {
       return refuse("PRESERVATION_LOCATION_UNSAFE", ensured.message, { ...move, ...ensured.evidence });
     }
     try {
-      mkdirSync(move.preservedPath, { mode: 0o700 });
+      files.mkdir(move.preservedPath, { mode: 0o700 });
     } catch (error) {
       return refuse("PRESERVATION_TARGET_EXISTS", "the preservation location is already taken; nothing is moved", {
         ...move,
@@ -1227,11 +1275,11 @@ export class RepoFactoryBootstrapRunner {
       });
     }
     try {
-      renameSync(move.originalPath, move.preservedPath);
+      files.rename(move.originalPath, move.preservedPath);
     } catch (error) {
       // Only the empty directory this call claimed is given back; the checkout never left its place.
       try {
-        rmdirSync(move.preservedPath);
+        files.rmdir(move.preservedPath);
       } catch {
         // An empty claimed directory left behind holds nothing and is named in the refusal.
       }
@@ -1240,8 +1288,46 @@ export class RepoFactoryBootstrapRunner {
         error: (error as Error).message.slice(0, 300),
       });
     }
+    const arrived = this.arrivedIntact(move);
+    if (!arrived.intact) {
+      let movedBack = false;
+      if (!pathOccupied(move.originalPath)) {
+        try {
+          files.rename(move.preservedPath, move.originalPath);
+          movedBack = true;
+        } catch {
+          // Left where it landed, which the refusal names; nothing is deleted.
+        }
+      }
+      return refuse(
+        "MOVED_OBJECT_MISMATCH",
+        "what the move took is not the checkout that was verified, or it did not land in the preservation location; it was moved back where it came from if that place was still free, and nothing was deleted",
+        { ...move, arrived: arrived.evidence, movedBack },
+      );
+    }
     this.deps.applications.recordCheckoutPreserved(move);
     return allow(ReasonCode.OK, move);
+  }
+
+  /** Whether the directory now at `preservedPath` is the checked checkout, at the checked place. */
+  private arrivedIntact(move: InterruptedCheckoutPreservation): { intact: boolean; evidence: Evidence } {
+    const files = checkoutRecoveryFiles;
+    let landed: { device: number; inode: number; directory: boolean } | null = null;
+    let realPath: string | null = null;
+    try {
+      const stat = files.lstat(move.preservedPath);
+      landed = { device: stat.dev, inode: stat.ino, directory: stat.isDirectory() };
+      realPath = files.realpath(move.preservedPath);
+    } catch {
+      // Nothing readable arrived; reported as such.
+    }
+    const intact =
+      landed !== null &&
+      landed.directory &&
+      landed.device === move.checkoutDevice &&
+      landed.inode === move.checkoutInode &&
+      realPath === move.preservedRealPath;
+    return { intact, evidence: { landed, realPath } };
   }
 
   /**
@@ -1251,16 +1337,10 @@ export class RepoFactoryBootstrapRunner {
    * the leaf itself: a real directory of this account, under a parent chain no other account can
    * write, whose marker names the application's bootstrap operation.
    */
-  private placedCheckout(
-    application: BootstrapApplication,
-  ): Decision<{ workDir: string; checkoutPath: string; repositoryRole: string }> {
+  private placedCheckout(application: BootstrapApplication): Decision<PlacedCheckout> {
     const { runId } = application;
     const refuse = (refusal: string, message: string, evidence: Evidence = {}) =>
-      deny(ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED, message, { refusal, runId, ...evidence }) as Decision<{
-        workDir: string;
-        checkoutPath: string;
-        repositoryRole: string;
-      }>;
+      deny(ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED, message, { refusal, runId, ...evidence }) as Decision<PlacedCheckout>;
     const workRoot = this.deps.workRoot;
     if (workRoot === null) return refuse("WORK_ROOT_UNCONFIGURED", "this deployment has no Repo Factory work root");
     if (!PATH_SAFE_RUN_ID.test(runId)) return refuse("RUN_ID_NOT_PATH_SAFE", "the run id cannot name a work directory");
@@ -1328,7 +1408,20 @@ export class RepoFactoryBootstrapRunner {
         bootstrapOperationId: application.bootstrapOperationId,
       });
     }
-    return allow(ReasonCode.OK, { workDir, checkoutPath, repositoryRole: outputs.target.repositoryRole });
+    let realWorkDir: string;
+    try {
+      realWorkDir = realpathSync(workDir);
+    } catch {
+      return refuse("WORK_DIR_UNREADABLE", "the run's work directory cannot be resolved", { workDir });
+    }
+    return allow(ReasonCode.OK, {
+      workDir,
+      checkoutPath,
+      repositoryRole: outputs.target.repositoryRole,
+      checkoutDevice: leaf.dev,
+      checkoutInode: leaf.ino,
+      realWorkDir,
+    });
   }
 
   /**
