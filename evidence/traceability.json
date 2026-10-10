@@ -3,14 +3,14 @@
     "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
     "docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md"
   ],
-  "measuredAt": "230f070567fa5b137b562fb35e19b4e17683159d (working tree modified)",
+  "measuredAt": "bf1763a0c1f3bbcc7d7d987928c68d5369f46c01",
   "testRun": {
     "reporter": "vitest-json",
-    "success": false,
-    "total": 3876,
-    "passed": 3846,
-    "failed": 19,
-    "pending": 11
+    "success": true,
+    "total": 4583,
+    "passed": 4571,
+    "failed": 0,
+    "pending": 12
   },
   "summary": {
     "requirements": 22,
@@ -20,30 +20,19 @@
     "scenariosWithPassedDeclarations": 59,
     "scenariosMissing": [],
     "repoFactoryScenarios": 25,
-    "repoFactoryScenariosWithPassedDeclarations": 4,
-    "repoFactoryScenariosMissing": [
-      "RF-S01",
+    "repoFactoryScenariosWithPassedDeclarations": 18,
+    "repoFactoryScenariosMissing": [],
+    "repoFactoryScenariosExternal": [
       "RF-S02",
       "RF-S03",
       "RF-S04",
-      "RF-S06",
       "RF-S08",
-      "RF-S09",
-      "RF-S12",
-      "RF-S13",
-      "RF-S14",
-      "RF-S15",
-      "RF-S16",
-      "RF-S17",
-      "RF-S18",
       "RF-S19",
       "RF-S20",
-      "RF-S21",
-      "RF-S22",
-      "RF-S23",
-      "RF-S24",
-      "RF-S25"
-    ]
+      "RF-S21"
+    ],
+    "repoFactoryScenariosDuplicated": [],
+    "repoFactoryExternalEvidenceProblems": []
   },
   "requirements": [
     {
@@ -830,7 +819,7 @@
       "tests": [
         {
           "file": "tests/unit/trusted-core.test.ts",
-          "title": "CP-S27: a candidate command cannot read authority secrets from the environment"
+          "title": "CP-S27 / RF-S23: a candidate command cannot read authority secrets from the environment"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -865,10 +854,6 @@
         {
           "file": "tests/scenarios/github-kernel.test.ts",
           "title": "a CI result belonging to another repository is not evidence for this one"
-        },
-        {
-          "file": "tests/scenarios/github-kernel.test.ts",
-          "title": "CP-HI-03: a command list that does not match the pinned manifest is refused"
         },
         {
           "file": "tests/scenarios/github-kernel.test.ts",
@@ -1084,7 +1069,7 @@
       "tests": [
         {
           "file": "tests/scenarios/github-kernel.test.ts",
-          "title": "CP-S41: a tag on an unaccepted commit and a conflicting existing tag are both refused"
+          "title": "CP-S41 / RF-S12: a tag on an unaccepted commit and a conflicting existing tag are both refused"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -1095,7 +1080,7 @@
       "tests": [
         {
           "file": "tests/scenarios/github-kernel.test.ts",
-          "title": "CP-S42: a hotfix missing from an active release reports propagation incomplete"
+          "title": "CP-S42 / RF-S13: a hotfix missing from an active release reports propagation incomplete"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -1261,7 +1246,7 @@
         },
         {
           "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
-          "title": "a bootstrap CTO that reviewed the run cannot be promoted"
+          "title": "#246: a bootstrap CTO is never promoted; its session takes no primary CTO role"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -1347,7 +1332,11 @@
         },
         {
           "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
-          "title": "a lock left by a dead process is reclaimable"
+          "title": "a lock this build's holder left when its process died is reclaimable"
+        },
+        {
+          "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "an earlier build's lock naming a dead process is refused and left as it was (ACP-WORKER-03-LOCK)"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -1362,7 +1351,15 @@
         },
         {
           "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
-          "title": "a lock left by a dead process is reclaimable"
+          "title": "a lock this build's holder left when its process died is reclaimable"
+        },
+        {
+          "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "an earlier build's lock naming a dead process is refused and left as it was (ACP-WORKER-03-LOCK)"
+        },
+        {
+          "file": "tests/unit/every-doctor-door-answers-from-one-set-of-findings.test.ts",
+          "title": "a second daemon refused the lock leaves the live daemon's doors carrying its holder's finding"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -1372,26 +1369,74 @@
     {
       "id": "RF-S01",
       "description": "DIRECT 논의가 실제 생성 요청 시에만 Managed로 승격된다.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/unit/telegram-ingress.test.ts",
+          "title": "RF-S01: discussion stays DIRECT until an explicit creation tool request creates a PROJECT_BOOTSTRAP run"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S02",
       "description": "SIMPLE 프로젝트에 필요 없는 PRD·ADR·Ticket이 생성되지 않는다.",
       "tests": [],
-      "status": "DECLARATION_MISSING"
+      "status": "EXTERNAL",
+      "external": [
+        {
+          "id": "RF-S02",
+          "arm": null,
+          "tests": [
+            "tests/test_slice1_plan.py::test_simple_materializes_no_formal_documents_without_optional_requests"
+          ],
+          "repository": "MongLong0214/repo-factory",
+          "revision": "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
+          "ciRun": "36937509727",
+          "acpUnattendedRun": "NOT_SUPPORTED"
+        }
+      ]
     },
     {
       "id": "RF-S03",
       "description": "STANDARD 과설계 명세가 제품 Scope 변경 없이 Lean하게 축소된다.",
       "tests": [],
-      "status": "DECLARATION_MISSING"
+      "status": "EXTERNAL",
+      "external": [
+        {
+          "id": "RF-S03",
+          "arm": null,
+          "tests": [
+            "tests/test_slice1_plan.py::test_standard_lean_revision_preserves_product_scope_and_required_artifacts",
+            "tests/test_slice1_plan.py::test_lean_review_refuses_product_scope_and_required_artifact_removal",
+            "tests/test_slice1_plan.py::test_lean_decision_refuses_planning"
+          ],
+          "limit": "a lean verdict is applied when one is supplied; nothing requires or produces one, so an over-designed STANDARD request without a review compiles unchanged",
+          "repository": "MongLong0214/repo-factory",
+          "revision": "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
+          "ciRun": "36937509727",
+          "acpUnattendedRun": "NOT_SUPPORTED"
+        }
+      ]
     },
     {
       "id": "RF-S04",
       "description": "Timestamp가 달라도 같은 PlanCore는 같은 Digest를 만든다.",
       "tests": [],
-      "status": "DECLARATION_MISSING"
+      "status": "EXTERNAL",
+      "external": [
+        {
+          "id": "RF-S04",
+          "arm": null,
+          "tests": [
+            "tests/test_slice1_plan.py::test_rf_s04_a_different_timestamp_is_the_same_plan"
+          ],
+          "repository": "MongLong0214/repo-factory",
+          "revision": "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
+          "ciRun": "36937509727",
+          "acpUnattendedRun": "NOT_SUPPORTED"
+        }
+      ]
     },
     {
       "id": "RF-S05",
@@ -1400,15 +1445,38 @@
         {
           "file": "tests/unit/trusted-core.test.ts",
           "title": "CP-S04 / RF-S05: rejects absolute paths and session identifiers"
+        },
+        {
+          "file": "tests/unit/trusted-core.test.ts",
+          "title": "RF-S05: refuses a provider API key inside a value"
+        },
+        {
+          "file": "tests/unit/trusted-core.test.ts",
+          "title": "RF-S05: refuses a provider quota snapshot, as a key and inside a value"
+        },
+        {
+          "file": "tests/unit/trusted-core.test.ts",
+          "title": "RF-S05: refuses a Telegram identity, as a key and inside a value"
+        },
+        {
+          "file": "tests/unit/trusted-core.test.ts",
+          "title": "RF-S05: refuses a Buzz channel identity, as a key and inside a value"
         }
       ],
-      "status": "DECLARATION_COVERED"
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S06",
       "description": "Candidate가 Verification을 `true`로 바꾸지만 현재 Run은 이전 Contract를 사용한다.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/unit/verify-r2.test.ts",
+          "title": "RF-S06: changing verification to an unconditional pass does not change the current run's pinned contract"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S07",
@@ -1419,19 +1487,40 @@
           "title": "RF-S07: accepts argv and rejects shell pipelines"
         }
       ],
-      "status": "DECLARATION_COVERED"
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S08",
       "description": "Node Template이 Lower/Latest Runtime과 Dependency를 실제 설치한다.",
       "tests": [],
-      "status": "DECLARATION_MISSING"
+      "status": "EXTERNAL",
+      "external": [
+        {
+          "id": "RF-S08",
+          "arm": null,
+          "tests": [
+            "tests/test_slice2_stack_ci.py::test_node_workflow_installs_dependencies_on_both_declared_runtimes"
+          ],
+          "limit": "a static check of the rendered workflow; the only real lower/latest install is a recorded Actions run (32256790243), which no gate re-runs",
+          "repository": "MongLong0214/repo-factory",
+          "revision": "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
+          "ciRun": "36937509727",
+          "acpUnattendedRun": "NOT_SUPPORTED"
+        }
+      ]
     },
     {
       "id": "RF-S09",
       "description": "Unresolved Placeholder가 Bootstrap 완료를 막는다.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "RF-S09: an unresolved template placeholder blocks bootstrap before activation state exists"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S10",
@@ -1474,7 +1563,8 @@
           "title": "refuses a PR when the project contract requires issue linkage and none is supplied"
         }
       ],
-      "status": "DECLARATION_COVERED"
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S11",
@@ -1517,91 +1607,234 @@
           "title": "refuses a PR when the project contract requires issue linkage and none is supplied"
         }
       ],
-      "status": "DECLARATION_COVERED"
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S12",
       "description": "Exact `main` Merge Commit이 아닌 Release Tag 거부.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "CP-S41 / RF-S12: a tag on an unaccepted commit and a conflicting existing tag are both refused"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S13",
       "description": "Active Release에 Hotfix가 없으면 완료 거부.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "CP-S42 / RF-S13: a hotfix missing from an active release reports propagation incomplete"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S14",
       "description": "Repo/Branch/Issue 생성 후 GitHub 재조회 검증.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "#76: a projection GitHub did not persist is refused and its reservation stays open"
+        },
+        {
+          "file": "tests/unit/github-write-port.test.ts",
+          "title": "reads a branch head, sets the default branch, and protects and re-reads a branch in the port's own vocabulary"
+        },
+        {
+          "file": "tests/unit/repo-factory-github-producer.test.ts",
+          "title": "performs each planned operation through the port and receipts what GitHub answered, not what the plan said"
+        },
+        {
+          "file": "tests/unit/repo-factory-github-producer.test.ts",
+          "title": "a readback that disagrees with what was asked is a failure, not a receipt"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S15",
       "description": "무관한 Same-name Repo는 `RESOURCE_COLLISION`, 무변경.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/unit/repo-factory-github-producer.test.ts",
+          "title": "refuses a same-named repository that exists with no receipt from this operation, and writes nothing"
+        },
+        {
+          "file": "tests/unit/repo-factory-github-producer.test.ts",
+          "title": "refuses to resume onto a repository whose name was reused after our receipt — node id differs — and writes nothing"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S16",
       "description": "2-Repo Bootstrap Partial Failure 후 결정적 Resume.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/unit/repo-factory-github-producer.test.ts",
+          "title": "records what succeeded, stops at the failure, and the retry performs only what is left"
+        },
+        {
+          "file": "tests/unit/repo-factory-github-producer.test.ts",
+          "title": "a failure at the push leaves only the repository receipted, and the retry pushes a fresh commit to it"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": [
+        {
+          "id": "RF-S16",
+          "arm": "two repositories",
+          "tests": [
+            "tests/test_slice3_apply.py::test_a_partial_apply_reports_what_completed_rather_than_claiming_atomicity",
+            "tests/test_slice3_apply.py::test_resume_after_a_partial_apply_starts_from_the_verified_receipt"
+          ],
+          "repository": "MongLong0214/repo-factory",
+          "revision": "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
+          "ciRun": "36937509727",
+          "acpUnattendedRun": "NOT_SUPPORTED"
+        }
+      ]
     },
     {
       "id": "RF-S17",
       "description": "RepoFactoryResult에 CTO/Doctor Field가 없고 ACPActivationResult가 공급한다.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/unit/repo-factory-producer.test.ts",
+          "title": "is rejected by the real overclaim check when a forbidden activation claim is added to genuine producer output"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S18",
       "description": "Post-bootstrap Ticket Projection은 ACP를 통해 동기화된다.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/unit/ops-r2.test.ts",
+          "title": "#109 / RF-S18: a confirmed activation projects tickets through ACP without restarting Repo Factory"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S19",
       "description": "SIMPLE Optional CommitLore 부재 → Warning.",
       "tests": [],
-      "status": "DECLARATION_MISSING"
+      "status": "EXTERNAL",
+      "external": [
+        {
+          "id": "RF-S19",
+          "arm": null,
+          "tests": [
+            "tests/test_publish.py::test_simple_missing_commitlore_warns_and_continues_with_a_receipt"
+          ],
+          "repository": "MongLong0214/repo-factory",
+          "revision": "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
+          "ciRun": "36937509727",
+          "acpUnattendedRun": "NOT_SUPPORTED"
+        }
+      ]
     },
     {
       "id": "RF-S20",
       "description": "STANDARD Required CommitLore 부재 → Revision.",
       "tests": [],
-      "status": "DECLARATION_MISSING"
+      "status": "EXTERNAL",
+      "external": [
+        {
+          "id": "RF-S20",
+          "arm": null,
+          "tests": [
+            "tests/test_publish.py::test_standard_missing_commitlore_refuses_before_push_for_revision"
+          ],
+          "repository": "MongLong0214/repo-factory",
+          "revision": "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
+          "ciRun": "36937509727",
+          "acpUnattendedRun": "NOT_SUPPORTED"
+        }
+      ]
     },
     {
       "id": "RF-S21",
       "description": "GUARDED Required Decision Memory 부재 → Blocking.",
       "tests": [],
-      "status": "DECLARATION_MISSING"
+      "status": "EXTERNAL",
+      "external": [
+        {
+          "id": "RF-S21",
+          "arm": null,
+          "tests": [
+            "tests/test_publish.py::test_guarded_missing_commitlore_refuses_before_push_as_blocking"
+          ],
+          "repository": "MongLong0214/repo-factory",
+          "revision": "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
+          "ciRun": "36937509727",
+          "acpUnattendedRun": "NOT_SUPPORTED"
+        }
+      ]
     },
     {
       "id": "RF-S22",
       "description": "Candidate가 Validator/Workflow/Manifest를 약화해도 Trusted Gate는 이전 Contract를 유지한다.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "CP-S29: an unapproved workflow digest or untrusted creator is also refused"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "CP-HI-03 / RF-S22: a command list that does not match the pinned manifest is refused"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S23",
       "description": "Candidate Verification이 Provider/GitHub/Telegram/Buzz Secret을 읽지 못한다.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/unit/trusted-core.test.ts",
+          "title": "CP-S27 / RF-S23: a candidate command cannot read authority secrets from the environment"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S24",
       "description": "Plan Authorization 없는 외부 Write 거부.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/unit/repo-factory-github-producer.test.ts",
+          "title": "refuses a planned operation the approval does not cover"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     },
     {
       "id": "RF-S25",
       "description": "Hermes 승인 Plan이라도 Public 노출은 Owner에게 Escalation.",
-      "tests": [],
-      "status": "DECLARATION_MISSING"
+      "tests": [
+        {
+          "file": "tests/unit/repo-factory-github-producer.test.ts",
+          "title": "refuses a plan whose repository visibility differs from the approved visibility, with no GitHub call"
+        }
+      ],
+      "status": "DECLARATION_COVERED",
+      "external": []
     }
   ]
 }
