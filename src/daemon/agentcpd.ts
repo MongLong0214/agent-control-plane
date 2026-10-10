@@ -138,7 +138,8 @@ import {
   type OwnerMessageHandover,
   type OwnerMessageLedger,
   type OwnerMessageProvenance,
-  type WakeEligibility,
+  type MentionWakeContext,
+  type MentionWakeGate,
 } from "../mcp/role-conversation.ts";
 import { digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
@@ -413,6 +414,8 @@ export interface LocalBuzzMessageIngress {
   readonly seam: {
     readonly ingress: BuzzMessageIngress;
     readonly port: BuzzMessageTurnPort;
+    /** The role port `port.wakeRole` wakes, so a mention's wake can carry its context to it. */
+    readonly roleConversation: RoleConversationPort | null;
   };
   close(): Promise<void>;
 }
@@ -620,9 +623,9 @@ export const startLocalMcpListeners = async (
     // The wake's final holder check and its frame handoff run in the daemon's write transaction.
     { endpointDir: stateDir, ownerMessages: ownerMessageLedger(cp), serializeWake: (body) => cp.db.tx(body) },
   );
-  // And consult the delivery eligibility of the identity behind the holder, from whichever mention
-  // subscriber runs over this control plane, so the daemon-built port gates its wakes by itself.
-  ctoConversation.useWakeEligibility(buzzMentionWakeEligibility(cp, () => runningMentionSubscribers.get(cp) ?? null));
+  // A wake caused by a verified mention is gated on that mention's identity, role and room, judged by
+  // whichever mention subscriber runs over this control plane. No other wake meets this gate.
+  ctoConversation.useMentionWakeGate(buzzMentionWakeGate(cp, () => runningMentionSubscribers.get(cp) ?? null));
   const hermes = await startMcpSocket(
     hermesPath,
     token,
@@ -1406,7 +1409,7 @@ export const startBuzzMessageIngressListener = async (
 
   return {
     socketPath,
-    seam: { ingress, port },
+    seam: { ingress, port, roleConversation },
     close: async () => {
       await closeSocketServer(server);
       try {
@@ -1830,9 +1833,21 @@ export const startDaemonBuzzMentionSubscriber = (
       if (request.binding !== undefined && buzzMentionBindingMoved(cp, request.roleKey, request.binding)) {
         return "RETRY";
       }
+      // The seam's own port, with its wake replaced for this one delivery: the wake this admission
+      // causes is a mention's, and carries the context this path verified. Nothing a caller says
+      // decides that; only this path builds it.
+      const mention: MentionWakeContext = {
+        actorId: request.identityPubkey,
+        roleKey: request.roleKey,
+        room: request.conversation,
+        eventId: request.event.id,
+      };
       const delivered = await deliverBuzzMessage(
         messageIngress.seam.ingress,
-        messageIngress.seam.port,
+        {
+          ...messageIngress.seam.port,
+          wakeRole: (roleKey) => wakeForMention(messageIngress.seam.roleConversation, roleKey, mention),
+        },
         buzzMentionInputFor(messageIngress.seam.ingress, secret, request),
       );
       return buzzMentionVerdictOf(delivered);
@@ -1871,19 +1886,38 @@ export const buzzMentionBindingMoved = (
 };
 
 /**
- * The wake's delivery eligibility for a role's holder: the mention subscriber's own judgement of the
- * configured identity behind it, found by the holder session's channel key or else by the role it
- * is pinned to. `null` when no subscriber runs or no configured identity stands behind the holder.
+ * The gate a mention's wake must pass: the holder's current session carries exactly the channel
+ * identity the mention named, for the role it was admitted for, and the mention subscriber judges
+ * that identity admitted, answering in the room the mention arrived in. The holder's own identity
+ * is read from its current session; no other subscription's role pin stands in for it.
  */
-export const buzzMentionWakeEligibility = (
+export const buzzMentionWakeGate = (
   cp: ControlPlane,
   running: () => Pick<BuzzMentionSubscriberHandle, "deliveryEligibility"> | null,
-) => (binding: RoleBinding): WakeEligibility | null => {
+): MentionWakeGate => (binding, mention) => {
   const actorId =
     cp.db.get<{ buzz_actor_id: string | null }>(`SELECT buzz_actor_id FROM sessions WHERE session_id = ?`, [
       binding.sessionId,
     ])?.buzz_actor_id ?? null;
-  return running()?.deliveryEligibility({ actorId, roleKey: binding.roleKey }) ?? null;
+  if (actorId !== mention.actorId || binding.roleKey !== mention.roleKey) return false;
+  const eligibility = running()?.deliveryEligibility({ actorId, roleKey: binding.roleKey }) ?? null;
+  return eligibility !== null && eligibility.eligible && eligibility.room === mention.room;
+};
+
+/**
+ * The wake for a mention the daemon's own subscriber delivered, carrying that mention's verified
+ * context. A context this path cannot state, or no role port to give it to, refuses the wake; it
+ * never falls through to an ordinary wake.
+ */
+const wakeForMention = (
+  roleConversation: Pick<RoleConversationPort, "wake"> | null,
+  roleKey: string,
+  mention: MentionWakeContext,
+): Promise<Decision<void>> => {
+  if (roleConversation === null || mention.roleKey !== roleKey || [mention.actorId, mention.room, mention.eventId].some((value) => value.length === 0)) {
+    return Promise.resolve(deny(ReasonCode.ROLE_PEER_STALE, "a mention's wake carried no usable mention context", { roleKey }));
+  }
+  return roleConversation.wake(roleKey, mention);
 };
 
 /**

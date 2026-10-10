@@ -517,9 +517,9 @@ export interface BuzzMentionAdmissionRequest {
   /**
    * The binding generation and serving session the registry answered **immediately before this
    * call**, when it reports them. The subscriber has already refused a binding that was not held; a
-   * sink that re-reads the binding when it writes can refuse one that moved since, so a session that
-   * stopped holding the role between the two reads is never woken. Absent on an envelope built
-   * outside the subscriber.
+   * sink that re-reads the binding when it writes can refuse one that moved since, so a binding that
+   * moved between the two reads gets no admission. Absent on an envelope built outside the
+   * subscriber.
    */
   readonly binding?: BuzzMentionDeliveryBinding;
 }
@@ -2189,13 +2189,12 @@ export interface BuzzMentionSubscriberHandle {
    */
   rejudge(): void;
   /**
-   * Whether the configured identity behind a role's holder may be woken for delivery right now, and
-   * the room its session answers in: judged afresh against the registry and required admitted here
-   * too. The identity is found by its channel key, or else by the role it is pinned to. `null`
-   * when no configured identity stands behind that holder, so there is nothing of this
-   * subscriber's to judge.
+   * Whether the configured identity with channel key `actorId` may be woken for delivery to
+   * `roleKey` right now, and the room its session answers in: judged afresh against the registry
+   * and required admitted here too. Found by the key alone; no other identity's role pin stands in
+   * for it. `null` when no configured identity has that key, or the subscriber is closed.
    */
-  deliveryEligibility(holder: { readonly actorId: string | null; readonly roleKey: string }): BuzzMentionDeliveryEligibility | null;
+  deliveryEligibility(holder: { readonly actorId: string; readonly roleKey: string }): BuzzMentionDeliveryEligibility | null;
   readonly relayUrl: string | null;
   /** The roles this daemon's admitted identities are pinned to right now, in config order. */
   readonly roleKeys: readonly string[];
@@ -2489,9 +2488,7 @@ export const startBuzzMentionSubscriber = (
     },
     admission,
     deliveryEligibility: (holder) => {
-      const subscription =
-        (holder.actorId === null ? undefined : prepared.find((one) => one.pubkey === holder.actorId)) ??
-        prepared.find((one) => one.roleKey === holder.roleKey);
+      const subscription = prepared.find((one) => one.pubkey === holder.actorId);
       // A closed subscriber judges nothing and gates nothing.
       if (subscription === undefined || closed) return null;
       const judged = subscription.judge();

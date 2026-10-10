@@ -158,21 +158,23 @@ export interface OwnerMessageProvenance {
   replyToEventId: null;
 }
 
-/** A holder's delivery eligibility as the composition reports it to the wake. */
-export interface WakeEligibility {
-  readonly eligible: boolean;
-  readonly room: string | null;
+/**
+ * What a wake caused by one verified Buzz mention carries: the channel identity the mention named,
+ * the role it was admitted for, the room it arrived in and its event id, as the daemon's own
+ * subscriber verified and admitted them. Supplied only by that delivery path; no other wake has one.
+ */
+export interface MentionWakeContext {
+  readonly actorId: string;
+  readonly roleKey: string;
+  readonly room: string;
+  readonly eventId: string;
 }
 
 /**
- * Whether the eligibility read at the handoff still allows the wake begun under `atStart`: when
- * either reading names an identity, it must be eligible now and answer in the same room.
+ * Whether a mention's wake may still be handed to `binding`'s holder: the identity, the role and
+ * the room the mention was admitted for still stand behind that holder, as the composition judges.
  */
-const eligibilityHolds = (atStart: WakeEligibility | null, now: WakeEligibility | null): boolean => {
-  if (atStart === null && now === null) return true;
-  if (now === null || !now.eligible) return false;
-  return atStart === null || atStart.room === now.room;
-};
+export type MentionWakeGate = (binding: RoleBinding, mention: MentionWakeContext) => boolean;
 
 export interface OwnerMessageHandover {
   claimed: {
@@ -491,11 +493,11 @@ export class RoleConversationPort {
    */
   readonly #serializeWake: (<T>(body: () => T) => T) | null;
   /**
-   * The delivery eligibility of a holder's identity, when the composition has one to consult: the
-   * mention subscriber's own judgement of the identity behind the holder, with the room its
-   * session answers in. `null` from it means no such identity stands behind the holder.
+   * The gate a mention-caused wake must pass, at its start and again inside the serialized
+   * handoff. Only a wake that carries a `MentionWakeContext` meets it; every other wake keeps the
+   * current-holder check alone. Absent, a mention wake is refused rather than sent ungated.
    */
-  #wakeEligibility: ((binding: RoleBinding) => WakeEligibility | null) | null = null;
+  #mentionWakeGate: MentionWakeGate | null = null;
 
   constructor(
     role: Role,
@@ -515,12 +517,9 @@ export class RoleConversationPort {
     this.#wakeTimeoutMs = options.wakeTimeoutMs ?? DEFAULT_ROLE_WAKE_TIMEOUT_MS;
   }
 
-  /**
-   * Installs the eligibility the wake's final check consults. Set once the composition has what
-   * answers it (the mention subscriber starts after this port), and read on every wake.
-   */
-  useWakeEligibility(eligibility: (binding: RoleBinding) => WakeEligibility | null): void {
-    this.#wakeEligibility = eligibility;
+  /** Installs the gate a mention-caused wake must pass. Read on every mention wake. */
+  useMentionWakeGate(gate: MentionWakeGate): void {
+    this.#mentionWakeGate = gate;
   }
 
   get role(): Role {
@@ -1083,7 +1082,7 @@ export class RoleConversationPort {
    * `connect`, and no filesystem check available here can prevent it — and it is not asked to:
    * the constant token is what makes winning the race worth nothing.
    */
-  async wake(roleKey: string): Promise<Decision<void>> {
+  async wake(roleKey: string, mention?: MentionWakeContext): Promise<Decision<void>> {
     const peer = this.#live.get(roleKey);
     if (!peer) {
       return deny(ReasonCode.ROLE_PEER_ABSENT, "no session is currently attached for this role", {
@@ -1108,11 +1107,13 @@ export class RoleConversationPort {
     }
     const revalidated = this.#validateEndpointPath(peer.endpoint);
     if (!revalidated.allowed) return revalidated as Decision<void>;
-    // The identity behind the holder, and the room it answers in, as they stand when the wake
-    // begins. An identity not eligible now is not woken at all; the final check below asks again.
-    const eligibilityAtStart = this.#wakeEligibility?.(peer.binding) ?? null;
-    if (eligibilityAtStart !== null && !eligibilityAtStart.eligible) {
-      return deny(ReasonCode.ROLE_PEER_STALE, "the holder's identity is not eligible for delivery", {
+    // A wake caused by a mention also needs the mention's identity, role and room to stand behind
+    // this holder, now and again at the handoff below. Any other wake (in-band work, a peer turn
+    // from the local socket, a registration's drain) keeps the current-holder check alone.
+    const mentionHolds = (): boolean =>
+      mention === undefined || (this.#mentionWakeGate !== null && this.#mentionWakeGate(peer.binding, mention));
+    if (!mentionHolds()) {
+      return deny(ReasonCode.ROLE_PEER_STALE, "the mention's identity, role or room no longer stands behind this holder", {
         role: this.#role,
         roleKey,
       });
@@ -1164,10 +1165,10 @@ export class RoleConversationPort {
           let handedOff = false;
           const handOff = (): void => {
             if (!this.#stillTheHolderToWake(roleKey, peer, registration, endpoint)) return;
-            // And the identity behind it is still eligible for delivery, in the same room it was
-            // when the wake began: a room lost or changed, or an exclusion, during the delayed
-            // connect hands off nothing. Read here, inside the same serialized section.
-            if (!eligibilityHolds(eligibilityAtStart, this.#wakeEligibility?.(peer.binding) ?? null)) return;
+            // For a mention's wake, its identity, role and room still stand behind the holder: a
+            // room lost or changed, or an exclusion, during the delayed connect hands off nothing.
+            // Read here, inside the same serialized section.
+            if (!mentionHolds()) return;
             // `end` rather than `write` then leaving it open: the peer's read side sees EOF, so a
             // reader does not have to know the frame's length to know the wake is complete. This
             // is what C0 measured the runtime accepting.

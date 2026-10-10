@@ -12,6 +12,7 @@ import type { BuzzMentionEvent } from "../../src/buzz/buzz-mention-subscriber.ts
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
+  buzzMentionWakeGate,
   rejudgeBuzzMentionSubscriberOnBindingSwitch,
   startBuzzMessageIngressListener,
   startDaemonBuzzMentionSubscriber,
@@ -30,8 +31,9 @@ afterAll(cleanupTempDirs);
 /**
  * 1080-N1-01. A mention's wake goes through the daemon's own subscriber, sink, admission seam and
  * role port; only the wake connection's completion is held, so a revoke can be committed while it
- * is in flight. The holder is checked before the connect, and must be checked again at the write:
- * a revoked session is never woken. The durable message is not the wake's to settle.
+ * is in flight. The holder is checked before the connect and again at the handoff, so no new wake
+ * frame is handed off to a holder that is no longer valid at that check. A frame handed off before
+ * a revoke, or one that arrives late, is not recalled. The durable message is not the wake's to settle.
  */
 
 const wakes = vi.hoisted(() => {
@@ -142,6 +144,9 @@ const start = async (options: { production?: boolean; serializeWake?: <T>(body: 
     reportAdmission: () => undefined,
   });
   rejudgeBuzzMentionSubscriberOnBindingSwitch(h.cp, () => subscriber);
+  // A port this fixture builds itself gets the gate the daemon-built port installs on its own: a
+  // mention's wake is refused, never sent ungated, by a port without one.
+  if (listeners === null) conversation.useMentionWakeGate(buzzMentionWakeGate(h.cp, () => subscriber));
   await relay.drain(subscriber);
 
   // The holder attaches over the port and registers its endpoint; the registration's own wake lands.
