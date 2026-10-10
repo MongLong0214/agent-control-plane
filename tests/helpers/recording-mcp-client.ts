@@ -20,8 +20,9 @@ export const LIST_CHANGED = "notifications/tools/list_changed";
 
 /**
  * An MCP client on a relay's stdio that records every line it is sent — notifications included,
- * which the relay tests' own clients drop — and does what Claude Code does on
- * `notifications/tools/list_changed`: asks `tools/list` at once, on receipt, and keeps the answer.
+ * which the relay tests' own clients drop — and on `notifications/tools/list_changed` asks
+ * `tools/list` at once, on receipt, and keeps the answer. That is the client this models; whether
+ * Claude Code re-lists on the notification, and when, is not something this client measures.
  *
  * `separateProcess` is for a relay run in this process over in-memory streams. A real client is
  * another process across a pipe, so it can never answer inside the relay's own turn of the event
@@ -86,7 +87,7 @@ export const recordingMcpClient = (
     /** Every `list_changed` the client was sent, by position in `received`. */
     listChanged: (): number[] =>
       received.flatMap((message, index) => (message.id === undefined && message.method === LIST_CHANGED ? [index] : [])),
-    /** `initialize` under `clientInfo`, then `notifications/initialized`, as Claude Code starts. */
+    /** `initialize` under `clientInfo`, then `notifications/initialized`. */
     initialize: async (clientInfo: unknown): Promise<RecordedWire> => {
       const init = await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo });
       io.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
