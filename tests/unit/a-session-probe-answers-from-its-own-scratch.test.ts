@@ -1,5 +1,5 @@
 import type * as ChildProcessModule from "node:child_process";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn as spawnChild } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -9,7 +9,8 @@ import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ACP_SCRATCH_ROOT } from "../../src/core/scratch-root.ts";
 import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { ClaudeCliAdapter } from "../../src/runtime/cli-adapters.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
+import { ClaudeCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
 import type { CapacityReading, SessionHandle } from "../../src/runtime/provider.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -417,6 +418,229 @@ describe("worker provisioning probes from scratch, and a refused probe leaves no
       expect(readdirSync(ACP_SCRATCH_ROOT)).toEqual([]);
     } finally {
       world.close();
+    }
+  });
+});
+
+/* ------------------------------------------------------------------------------------------------ */
+/* #1077 N1-01 — nothing a probe starts outlives it, and nothing that is not the probe's is touched  */
+/* ------------------------------------------------------------------------------------------------ */
+
+type DescendantMode = "refuse" | "answer" | "hang";
+
+/**
+ * A `claude` stand-in that first starts a real descendant in its own process group — stdio ignored,
+ * so nothing ties it to the probe's pipes — and reports its pid on stderr. It then refuses (exit 1),
+ * answers as the session (exit 0) or hangs until it is killed. The descendant carries `marker` in its
+ * argv so `ps` can find it independently of anything the adapter records.
+ */
+const claudeWithDescendant = (dir: string, mode: DescendantMode, marker: string): string => {
+  const binary = join(dir, `claude-descendant-${mode}.cjs`);
+  writeFileSync(binary, `#!${process.execPath}
+const { spawn } = require("node:child_process");
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", ${JSON.stringify(marker)}], { stdio: "ignore" });
+child.unref();
+const argv = process.argv.slice(2);
+process.stderr.write("descendant-pid=" + child.pid + "\\n", () => {
+  if (${JSON.stringify(mode)} === "refuse") process.exit(1);
+  if (${JSON.stringify(mode)} === "hang") { setInterval(() => {}, 1000); return; }
+  const sessionId = argv[argv.indexOf("--session-id") + 1];
+  process.stdin.resume();
+  process.stdin.on("end", () => {
+    process.stdout.write(JSON.stringify({ type: "result", session_id: sessionId, result: "READY" }), () => process.exit(0));
+  });
+});
+`);
+  chmodSync(binary, 0o700);
+  return binary;
+};
+
+const descendantPids = (spawned: SandboxedSpawn): number[] =>
+  [...spawned.stderr.matchAll(/descendant-pid=(\d+)/g)].map((match) => Number(match[1]));
+
+/** Members of a process group that are not zombies, read from `ps`. */
+const liveMembersOf = (pgid: number): string[] =>
+  execFileSync("/bin/ps", ["-axo", "pid=,pgid=,stat=,command="], { encoding: "utf8", timeout: 10_000 })
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => {
+      const [, group, stat] = line.split(/\s+/);
+      return Number(group) === pgid && stat !== undefined && !stat.startsWith("Z");
+    });
+
+/** Kills only processes carrying this test's own marker: a RED run must not leave its leak behind. */
+const killMarked = (marker: string): void => {
+  for (const line of processesNaming(marker)) {
+    const pid = Number(line.trim().split(/\s+/)[0]);
+    if (Number.isSafeInteger(pid) && pid > 0) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+};
+
+/** A process of the test's own, outside any probe: it must still be running after every reap. */
+const startBystander = (marker: string, detached: boolean): ChildProcessModule.ChildProcess => {
+  const child = spawnChild(process.execPath, ["-e", "setInterval(() => {}, 1000)", marker], { stdio: "ignore", detached });
+  child.unref();
+  return child;
+};
+
+const waitFor = async (condition: () => boolean, boundMs: number): Promise<boolean> => {
+  const deadline = Date.now() + boundMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return true;
+};
+
+describe("a probe ends its own process group on every completion, and only its own (#1077 N1-01)", () => {
+  it("a refused provisioning leaves no process: parent and same-group descendant gone, session STOPPED, nothing bound", async (ctx) => {
+    requireSeatbelt(ctx);
+    const marker = `acp-probe-descendant-${randomUUID()}`;
+    const bystanderMarker = `acp-probe-bystander-${randomUUID()}`;
+    const bystander = startBystander(bystanderMarker, false);
+    const world = await provisioningWorld((_root, stubs) => claudeWithDescendant(stubs, "refuse", marker));
+    try {
+      const mark = sandboxed.length;
+      const refused = await world.provision();
+      const probes = spawnedSince(mark);
+      const sessions = claudeSessions(world.harness);
+      const sessionId = sessions[0]?.session_id ?? "";
+      const parent = probes[0]?.pid ?? -1;
+      const descendants = probes[0] ? descendantPids(probes[0]) : [];
+      const observed = {
+        reasonCode: refused.reasonCode,
+        sessions,
+        lifecycle: world.harness.cp.audit.byKind("SESSION_LIFECYCLE").filter((row) => row.sessionId === sessionId).map((row) => row.evidence),
+        assignments: world.harness.cp.db.all(`SELECT status, session_id FROM assignments WHERE role_key = ?`, [roleKeyFor(Role.WORKER, { taskId: world.taskId })]),
+        rowsNamingSession: rowsNaming(world.harness, sessionId),
+        parent: { pid: parent, alive: alive(parent) },
+        descendants: descendants.map((pid) => ({ pid, alive: alive(pid) })),
+        liveMembersOfProbeGroup: liveMembersOf(parent),
+        processesNamingMarker: processesNaming(marker),
+        bystanderAlive: bystander.pid !== undefined && alive(bystander.pid),
+        scratchRoot: readdirSync(ACP_SCRATCH_ROOT),
+      };
+      console.error(`WITNESS refused-provision-descendant ${JSON.stringify(observed)}`);
+
+      expect(refused.reasonCode).toBe(ReasonCode.SESSION_NOT_READY);
+      expect(probes).toHaveLength(1);
+      expect(descendants).toHaveLength(1);
+      // The process: the probe and the descendant it started are both gone, by pid and by group.
+      expect(observed.parent.alive).toBe(false);
+      expect(observed.descendants).toEqual([{ pid: descendants[0], alive: false }]);
+      expect(observed.liveMembersOfProbeGroup).toEqual([]);
+      expect(observed.processesNamingMarker).toEqual([]);
+      // Nothing that is not the probe's was touched.
+      expect(observed.bystanderAlive).toBe(true);
+      // The session, the binding and every other row, and the scratch.
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0]!.lifecycle).toBe(SessionLifecycle.STOPPED);
+      expect(observed.lifecycle).toEqual([
+        expect.objectContaining({ to: SessionLifecycle.STOPPED, reason: "provider worker session probe failed" }),
+      ]);
+      expect(observed.assignments).toEqual([]);
+      expect(observed.rowsNamingSession).toEqual({});
+      expect(observed.scratchRoot).toEqual([]);
+    } finally {
+      world.close();
+      killMarked(marker);
+      killMarked(bystanderMarker);
+    }
+  });
+
+  it("a probe that answers HEALTHY leaves no descendant either", async (ctx) => {
+    requireSeatbelt(ctx);
+    const { runtimeRoot } = deniedStateRoot();
+    const marker = `acp-probe-descendant-${randomUUID()}`;
+    const stubs = tempDir("acp-session-probe-stub-");
+    try {
+      const adapter = new ClaudeCliAdapter({
+        clock: { nowIso: () => "2026-08-12T00:00:00.000Z" } as never,
+        capacityFile: join(STATE_ROOT, "capacity.fixture"),
+        binary: claudeWithDescendant(stubs, "answer", marker),
+      });
+      const mark = sandboxed.length;
+      const health = await adapter.probeSession({
+        externalSessionId: randomUUID(), provider: "claude", model: "opus", effort: null, pid: null, workdir: runtimeRoot,
+      });
+      const probe = spawnedSince(mark)[0]!;
+      const descendants = descendantPids(probe);
+      expect(health, probe.stderr).toBe("HEALTHY");
+      expect(descendants).toHaveLength(1);
+      expect(alive(probe.pid!)).toBe(false);
+      expect(alive(descendants[0]!)).toBe(false);
+      expect(liveMembersOf(probe.pid!)).toEqual([]);
+      expect(processesNaming(marker)).toEqual([]);
+    } finally {
+      killMarked(marker);
+    }
+  });
+
+  it.for(["timeout", "abort"] as const)("the %s route reaps the probe's group the same way", async (route, ctx) => {
+    requireSeatbelt(ctx);
+    const marker = `acp-probe-descendant-${randomUUID()}`;
+    const stubs = tempDir("acp-session-probe-stub-");
+    try {
+      const controller = new AbortController();
+      const mark = sandboxed.length;
+      const pending = __testing.productionRunCli(claudeWithDescendant(stubs, "hang", marker), [], {
+        cwd: undefined,
+        timeoutMs: route === "timeout" ? 3_000 : 60_000,
+        signal: controller.signal,
+        reapProcessGroup: true,
+      });
+      expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 10_000)).toBe(true);
+      const probe = sandboxed[mark]!;
+      const descendant = descendantPids(probe)[0]!;
+      expect(alive(descendant)).toBe(true);
+      if (route === "abort") controller.abort();
+      const result = await pending;
+      expect(result.timedOut).toBe(route === "timeout");
+      expect(result.processGroup).toEqual({ reaped: true, signalled: expect.any(Boolean), detail: null });
+      expect(alive(probe.pid!)).toBe(false);
+      expect(alive(descendant)).toBe(false);
+      expect(liveMembersOf(probe.pid!)).toEqual([]);
+      expect(processesNaming(marker)).toEqual([]);
+    } finally {
+      killMarked(marker);
+    }
+  });
+
+  it("never signals a group whose id now names another process, and does not claim an unprovable group gone", async () => {
+    const marker = `acp-probe-decoy-${randomUUID()}`;
+    // A live process in a group of its own: its pid is a group id the reaper could be handed.
+    const decoy = startBystander(marker, true);
+    try {
+      const pid = decoy.pid!;
+      expect(await waitFor(() => readProcessStartToken(pid) !== null, 5_000)).toBe(true);
+      const startedAt = readProcessStartToken(pid)!;
+
+      // The id is held by a process with another start token: it is someone else's group now.
+      const reused = await __testing.reapOwnedProcessGroup(pid, "darwin-tv:1.000001", 500);
+      expect(reused).toEqual({ reaped: true, signalled: false, detail: expect.stringContaining("now names another process") });
+      expect(alive(pid)).toBe(true);
+      expect(readProcessStartToken(pid)).toBe(startedAt);
+      expect(liveMembersOf(pid)).toHaveLength(1);
+
+      // Without a start token to compare, nothing is signalled and nothing is claimed.
+      const unknown = await __testing.reapOwnedProcessGroup(pid, null, 500);
+      expect(unknown).toEqual({ reaped: false, signalled: false, detail: expect.stringContaining("cannot be compared") });
+      expect(alive(pid)).toBe(true);
+      expect(readProcessStartToken(pid)).toBe(startedAt);
+
+      // Control: with the identity that matches, the same group is signalled and confirmed empty.
+      const owned = await __testing.reapOwnedProcessGroup(pid, startedAt, 2_000);
+      expect(owned).toEqual({ reaped: true, signalled: true, detail: null });
+      expect(alive(pid)).toBe(false);
+      expect(liveMembersOf(pid)).toEqual([]);
+    } finally {
+      killMarked(marker);
     }
   });
 });

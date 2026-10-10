@@ -367,6 +367,93 @@ const killChildTree = (child: ReturnType<typeof spawn>): void => {
   }
 };
 
+/** What ending one invocation's own process group observed (#1077). */
+export interface ProcessGroupReap {
+  /** No member of the group is left, or the id provably names another process's group now. */
+  reaped: boolean;
+  /** Whether a signal was sent to the group. */
+  signalled: boolean;
+  /** Why the group counts as gone without a signal, or why it could not be confirmed empty. */
+  detail: string | null;
+}
+
+/** How long a probe's own process group may take to empty once its leader has exited. */
+const PROBE_GROUP_REAP_BOUND_MS = 2_000;
+
+/** `kill(pid, 0)` found a process; EPERM is one that exists but is not ours to signal. */
+const pidExists = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+/**
+ * Whether the group has any member. EPERM counts as a member: on macOS a group whose last member is
+ * an unreaped zombie answers EPERM, not ESRCH, until launchd reaps it.
+ */
+const groupHasMembers = (pgid: number): boolean => {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+};
+
+/**
+ * #1077 — ends the process group a single invocation's spawn created, after its leader has exited.
+ *
+ * The group is this invocation's own: the child is spawned `detached`, so it leads a new session and
+ * a group whose id is its pid, and only its own descendants are in that session to be in the group.
+ * Ownership is decided before every signal. The kernel never hands out a pid while a group of that
+ * id has members, so a live process holding the leader's pid once the leader has exited means our
+ * group has emptied and the id now belongs to someone else; told apart by its start token, it is
+ * never signalled. When the pid is live and its start token cannot be compared, nothing is
+ * signalled and the group is reported unconfirmed rather than gone.
+ *
+ * The group is signalled whole, again every 200 ms for a member forked between a signal and its
+ * delivery, and polled until `kill(-pgid, 0)` is ESRCH or the bound runs out.
+ *
+ * Limit: a descendant that leaves the group (`setsid`, `setpgid`) is outside it and is not reaped.
+ */
+const reapOwnedProcessGroup = async (
+  pgid: number,
+  leaderStartedAt: string | null,
+  boundMs: number,
+): Promise<ProcessGroupReap> => {
+  const deadline = Date.now() + boundMs;
+  let signalled = false;
+  let lastSignal = Number.NEGATIVE_INFINITY;
+  for (;;) {
+    if (pidExists(pgid)) {
+      const startedAt = readProcessStartToken(pgid);
+      if (leaderStartedAt === null || startedAt === null) {
+        return { reaped: false, signalled, detail: `pid ${pgid} is live and its start token cannot be compared; its group was not signalled` };
+      }
+      if (startedAt !== leaderStartedAt) {
+        return { reaped: true, signalled, detail: `pid ${pgid} now names another process; its group was not signalled` };
+      }
+    }
+    if (!groupHasMembers(pgid)) return { reaped: true, signalled, detail: null };
+    if (Date.now() >= deadline) {
+      return { reaped: false, signalled, detail: `process group ${pgid} still had a member after ${boundMs} ms` };
+    }
+    if (Date.now() - lastSignal >= 200) {
+      try {
+        process.kill(-pgid, "SIGKILL");
+        signalled = true;
+      } catch {
+        /* emptied between the check and the signal */
+      }
+      lastSignal = Date.now();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+};
+
 const productionRunCli = async (
   file: string,
   args: readonly string[],
@@ -407,6 +494,12 @@ const productionRunCli = async (
     onSpawn?: InvocationRequest["onSpawn"];
     /** #512 — aborting kills the child's process group; an abort before the spawn spawns nothing. */
     signal?: AbortSignal;
+    /**
+     * #1077 — the invocation intends no process to outlive it: once the child exits, by any route,
+     * the process group it created is ended and confirmed empty before the result is returned. Set
+     * only by a session probe; turns and every other invocation keep their own lifetimes.
+     */
+    reapProcessGroup?: boolean;
   },
 ): Promise<{
   stdout: string;
@@ -415,6 +508,8 @@ const productionRunCli = async (
   timedOut: boolean;
   isolationEnforced: boolean;
   egressEvidence?: ReviewerEgressRecord[];
+  /** Present when `reapProcessGroup` was asked for and the child was spawned and exited. */
+  processGroup?: ProcessGroupReap;
 }> => {
   const scratch = acpScratchDir("acp-runtime-");
   if (!existsSync("/usr/bin/sandbox-exec")) {
@@ -538,6 +633,7 @@ const productionRunCli = async (
       exitCode: number | null;
       timedOut: boolean;
       egressLost: boolean;
+      processGroup?: ProcessGroupReap;
     }>((resolve) => {
       let child: ReturnType<typeof spawn>;
       if (options.signal?.aborted) {
@@ -562,6 +658,16 @@ const productionRunCli = async (
         resolve({ stdout: "", stderr: error instanceof Error ? error.message : String(error), exitCode: null, timedOut: false, egressLost: false });
         return;
       }
+      // #1077 — the identity of the group this spawn created, read before anything can happen to it.
+      const reapedPid = options.reapProcessGroup ? child.pid : undefined;
+      const leaderStartedAt = reapedPid === undefined ? null : readProcessStartToken(reapedPid);
+      let groupReap: Promise<ProcessGroupReap> | undefined;
+      // Whichever way the child ends — its own exit, a failure, the timeout or an abort — the same
+      // reap runs once it has: any descendant still in its group is ended and the group seen empty.
+      // Ending them also closes any pipe a descendant held, so `close` is not left waiting on it.
+      child.once("exit", () => {
+        if (reapedPid !== undefined) groupReap = reapOwnedProcessGroup(reapedPid, leaderStartedAt, PROBE_GROUP_REAP_BOUND_MS);
+      });
       let stdout = "";
       let stderr = "";
       let timedOut = false;
@@ -583,7 +689,11 @@ const productionRunCli = async (
         clearTimeout(timer);
         stopWatchingEgress?.();
         options.signal?.removeEventListener("abort", abort);
-        resolve({ stdout, stderr, exitCode, timedOut, egressLost });
+        if (!groupReap) {
+          resolve({ stdout, stderr, exitCode, timedOut, egressLost });
+          return;
+        }
+        void groupReap.then((processGroup) => resolve({ stdout, stderr, exitCode, timedOut, egressLost, processGroup }));
       };
       // #512 — reported before anything else can happen to the child, so a runtime that owns this
       // invocation has recorded the process before it could outlive the daemon. The start time is
@@ -1848,8 +1958,14 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
       providerCredentialDir: this.#providerCredentialDir,
+      // #1077 — nothing a probe starts is meant to outlive it, whether it answers or not. A failed
+      // provisioning then stops a session with nothing of it left running: `stopSession` has no
+      // process to stop for a headless session, so the probe's own group is ended here.
+      reapProcessGroup: true,
     });
     if (result.exitCode !== 0 || result.timedOut) return "UNAVAILABLE";
+    // A group that could not be confirmed empty is not a clean answer, whatever the CLI said.
+    if (result.processGroup?.reaped !== true) return "UNAVAILABLE";
     const sessionId = safeParse(result.stdout)?.["session_id"];
     return sessionId !== undefined && sessionId !== handle.externalSessionId ? "DEGRADED" : "HEALTHY";
   }
@@ -2658,6 +2774,11 @@ export const __testing = Object.freeze({
   codexReviewerArgs,
   codexThreadId,
   codexLastAgentMessage,
+  // #1077: the probe's own process group is ended on every completion, and only while it is
+  // provably ours. Exposed so a test can drive the timeout and abort routes in less than the probe's
+  // 30 s, and show a live process holding the id with another start token is never signalled.
+  productionRunCli,
+  reapOwnedProcessGroup,
   setRunCli: (stub: typeof productionRunCli | null): void => {
     runCli = stub ?? productionRunCli;
   },
