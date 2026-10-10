@@ -559,6 +559,8 @@ describe("portable project manifest (Integration §10.2)", () => {
   });
 
   it("CP-S04 / RF-S05: rejects absolute paths and session identifiers", () => {
+    // RF-S05 arm:absolute-path
+    // RF-S05 arm:session
     const withPath = { ...base, repositories: [{ role: "primary", remote: "/Users/example/x", manifestRoot: "." }] };
     const decision = assertPortableManifest(withPath);
     expect(decision.allowed).toBe(false);
@@ -566,6 +568,53 @@ describe("portable project manifest (Integration §10.2)", () => {
 
     const withSession = { ...base, projectId: "ses_abcdefgh12345678" };
     expect(assertPortableManifest(withSession).allowed).toBe(false);
+  });
+
+  // The provider and channel classes. Each is refused in both places it can appear: as a key, by
+  // the strict schema (INVALID_ARGUMENT, before any portability pattern runs), and inside a value,
+  // by the portability patterns (MANIFEST_NOT_PORTABLE, naming the class). Each value row first
+  // shows the same position with a harmless value is accepted, so the refusal is the pattern's.
+  // Not claimed here: a Buzz `npub1…`, a numeric Telegram chat id or a channel UUID inside a value
+  // matches no pattern today. That is a detection gap in the validator, not a witness gap.
+  const withArgvValue = (value: string) => ({
+    ...base,
+    verificationCommands: [{ ...base.verificationCommands[0]!, argv: ["npm", "test", "--", value] }],
+  });
+  const expectNotPortable = (manifest: unknown, violation: string) => {
+    expect(assertPortableManifest(withArgvValue("--reporter=dot")).allowed).toBe(true);
+    const decision = assertPortableManifest(manifest);
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.MANIFEST_NOT_PORTABLE);
+    expect(decision.evidence["violations"]).toContain(violation);
+  };
+  const expectRefusedBySchema = (manifest: unknown, key: string) => {
+    const decision = assertPortableManifest(manifest);
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    expect(JSON.stringify(decision.evidence["issues"])).toContain(key);
+  };
+
+  it("RF-S05: refuses a provider API key inside a value", () => {
+    // RF-S05 arm:provider
+    expectNotPortable(withArgvValue(`sk-${"a1B2".repeat(6)}`), "provider api key");
+  });
+
+  it("RF-S05: refuses a provider quota snapshot, as a key and inside a value", () => {
+    // RF-S05 arm:provider
+    expectRefusedBySchema({ ...base, remainingPercent: 42 }, "remainingPercent");
+    expectNotPortable(withArgvValue("--remainingPercent=42"), "provider quota snapshot");
+  });
+
+  it("RF-S05: refuses a Telegram identity, as a key and inside a value", () => {
+    // RF-S05 arm:channel
+    expectRefusedBySchema({ ...base, telegramChatId: "123456789" }, "telegramChatId");
+    expectNotPortable(withArgvValue("--telegramChatId=123456789"), "telegram identity");
+  });
+
+  it("RF-S05: refuses a Buzz channel identity, as a key and inside a value", () => {
+    // RF-S05 arm:channel
+    expectRefusedBySchema({ ...base, buzzChannel: "acp-cto" }, "buzzChannel");
+    expectNotPortable(withArgvValue("--buzzChannel=acp-cto"), "buzz channel identity");
   });
 
   it("rejects a profile that references an unknown command", () => {
