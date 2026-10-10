@@ -91,9 +91,10 @@ export interface SessionWakeTrigger {
    */
   stillAdmissible?: () => boolean;
   /**
-   * For a mention's trigger: whether the work it stands for was taken up, read when its turn has
-   * ended, which for a mention is whether its message has left PENDING. Such a trigger is marked
-   * handled only when this answers true; otherwise it is released, as a refused turn's are.
+   * For a mention's trigger: whether the work it stands for was taken up, which for a mention is
+   * whether its event is spent. Read when its turn has ended: such a trigger is marked handled only
+   * when this answers true; otherwise it is released, as a refused turn's are. Read again when a
+   * wake names it: a true answer refuses it as a duplicate, however its event came to be spent.
    */
   served?: () => boolean;
 }
@@ -245,9 +246,10 @@ interface TurnLane {
  *   answers OK. A turn that exited 0 proves nothing on its own.
  * - **Serialized.** A session runs one turn at a time. A wake that arrives while a turn runs is
  *   coalesced into one follow-up turn; a wake for a trigger queued or running is refused
- *   `SESSION_TURN_DUPLICATE`, and so is one for an envelope already settled or for an owner-message
- *   trigger a turn completed. **Settled is the outbox's word, not the CLI's:** a turn that exited 0
- *   without acknowledging its envelope settled nothing, so when its turn ends, however it ended, a
+ *   `SESSION_TURN_DUPLICATE`, and so is one for an envelope already settled, for an owner-message
+ *   trigger a turn completed, or for a mention whose event is already spent. **Settled is the
+ *   outbox's word, not the CLI's:** a turn that exited 0 without acknowledging its envelope
+ *   settled nothing, so when its turn ends, however it ended, a
  *   still-PENDING envelope is released for the next wake that names it. That wake is the outbox's
  *   own re-wake, at most once per row per `IN_BAND_REWAKE_MS` and never past the row's TTL, so
  *   unacknowledged work is retried at that pace and never in a loop here. Turns start only from
@@ -453,9 +455,9 @@ export class ProvisionedSessionRuntime {
   /**
    * Runs a turn for the role's current holder because of `triggers`, or folds them into the turn
    * that follows the one already running. A trigger queued, running, or completed by an earlier
-   * turn is dropped, and a wake whose every trigger is refused `SESSION_TURN_DUPLICATE`; a trigger
-   * whose turn failed is taken again. Answers at once with what happened; the turn itself runs
-   * behind the answer.
+   * turn is dropped, as is one whose `served` already answers true, and a wake whose every trigger
+   * is refused `SESSION_TURN_DUPLICATE`; a trigger whose turn failed is taken again. Answers at
+   * once with what happened; the turn itself runs behind the answer.
    */
   wake(roleKey: string, triggers: readonly SessionWakeTrigger[]): Decision<"STARTED" | "COALESCED"> {
     const binding = this.ports.bindings.active(roleKey);
@@ -478,6 +480,7 @@ export class ProvisionedSessionRuntime {
       !lane.claimed.has(trigger.id) &&
       !lane.handled.has(trigger.id) &&
       !this.#settled(trigger.id) &&
+      !this.#servedAlready(trigger, lane) &&
       triggers.findIndex((other) => other.id === trigger.id) === index);
     if (fresh.length === 0) {
       return deny(ReasonCode.SESSION_TURN_DUPLICATE, "every trigger of this wake is queued, running, settled or already handled; none is run twice", {
@@ -547,6 +550,19 @@ export class ProvisionedSessionRuntime {
   /** Whether this trigger names an outbox row: its settlement is then the row's, not this lane's. */
   #isEnvelope(triggerId: string): boolean {
     return this.ports.outbox.get(triggerId) !== null;
+  }
+
+  /**
+   * A trigger whose `served` already answers true has nothing left to run, whichever turn served it
+   * (a mention released mid-call whose event a later ordinary turn claimed included), rather than
+   * only one this lane's own turn marked handled: a wake that names it is a duplicate, and it is
+   * marked handled so the next one is refused without asking again. A trigger with no `served`
+   * (every ordinary one) is never judged here.
+   */
+  #servedAlready(trigger: SessionWakeTrigger, lane: TurnLane): boolean {
+    if (trigger.served?.() !== true) return false;
+    lane.handled.add(trigger.id);
+    return true;
   }
 
   /** An envelope that has left PENDING — acknowledged, rejected or expired — has nothing left to run. */
