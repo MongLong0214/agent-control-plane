@@ -1103,6 +1103,11 @@ export const applyGitHubOperations = async (
    * with no parent — the commit GitHub's initialization made, not one pushed on top of it; and on a
    * resume it must still be the head the receipt recorded. This is the one place a head this producer
    * did not make is accepted, and only for a plan whose approved create asked for the initialization.
+   *
+   * Limit (review C5I-R1-01): a same-account forged bootstrap ledger can make a preexisting repository
+   * pass the create-only readback. A resumed receipt is a ledger file, and the ledger's ownership and
+   * mode checks say only that this account wrote it, not that this operation's create made what it
+   * names; a receipt naming a preexisting repository's node id and head reads back as this one.
    */
   const initializedRepositoryStep = async (
     operation: Extract<GitHubOperation, { resourceType: "repository" }>,
