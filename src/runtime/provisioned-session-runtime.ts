@@ -83,6 +83,13 @@ export interface DrivenSpawnRecord {
 export interface SessionWakeTrigger {
   id: string;
   kind: string;
+  /**
+   * A trigger caused by a verified Buzz mention carries the mention's gate: whether the mention's
+   * identity, role and room still stand behind the role's current holder. It is asked again at the
+   * turn's final check, immediately before the provider call, and a turn none of whose triggers
+   * still holds is refused there. Absent on every other trigger, which the final check never asks.
+   */
+  stillAdmissible?: () => boolean;
 }
 
 /** The roles all of whose sessions this runtime drives: a run's BOOTSTRAP_CTO. Never a canonical role. */
@@ -501,6 +508,9 @@ export class ProvisionedSessionRuntime {
         relay: true,
         timeoutMs: this.options.turnTimeoutMs ?? 30 * 60_000,
         purpose: "work",
+        // Served while any trigger still holds: an ordinary one always does, and a mention's holds
+        // only while its gate does, read at the final check below.
+        admissible: () => triggers.some((trigger) => trigger.stillAdmissible === undefined || trigger.stillAdmissible()),
       });
       completed = turn.allowed;
       return turn.allowed ? allow(ReasonCode.OK, undefined) : (turn as Decision<void>);
@@ -567,7 +577,14 @@ export class ProvisionedSessionRuntime {
     sessionId: string,
     conversation: ConversationStep,
     prompt: string,
-    turn: { relay: boolean; timeoutMs: number; purpose: TurnPurpose; spawn?: SpawnAttestation | null },
+    turn: {
+      relay: boolean;
+      timeoutMs: number;
+      purpose: TurnPurpose;
+      spawn?: SpawnAttestation | null;
+      /** Whether the turn's triggers still want it, asked last before the provider call. */
+      admissible?: () => boolean;
+    },
   ): Promise<Decision<SessionTurnResult>> {
     const refused = (decision: Decision<void>): Decision<SessionTurnResult> => {
       this.ports.audit.record({
@@ -636,6 +653,16 @@ export class ProvisionedSessionRuntime {
     if (!now.allowed) {
       if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
       return refused(now);
+    }
+    // And, last, the triggers' own gate: a turn woken only by mentions whose identity, role or room
+    // no longer stands behind this holder is refused here, after every await and with no provider
+    // contact. Like every refusal above it is not a completed turn, so nothing is marked handled.
+    if (turn.admissible !== undefined && !turn.admissible()) {
+      if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
+      return refused(deny(ReasonCode.ROLE_PEER_STALE, "the mention that woke this turn no longer stands behind its holder", {
+        sessionId,
+        purpose: turn.purpose,
+      }));
     }
     let result: SessionTurnResult;
     try {

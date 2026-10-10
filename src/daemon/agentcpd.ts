@@ -343,7 +343,7 @@ export const wakeRoleHolder = async (
   cp: Pick<ControlPlane, "bindings" | "sessionRuntime">,
   conversation: Pick<RoleConversationPort, "wake">,
   roleKey: string,
-  cause: { kind: string; ids: readonly string[] },
+  cause: { kind: string; ids: readonly string[]; stillAdmissible?: () => boolean },
 ): Promise<Decision<void>> => {
   const holder = cp.bindings.active(roleKey);
   // #246 C4 — a PRIMARY_CTO whose driven-spawn record exists but does not make it DRIVEN is neither
@@ -361,7 +361,12 @@ export const wakeRoleHolder = async (
   // #246 C4 — a PRIMARY_CTO is driven only when its own spawn recorded it so, never by its role.
   if (!holder || !cp.sessionRuntime.drivesSession(holder.sessionId, holder.role)) return conversation.wake(roleKey);
   const ids = cause.ids.length > 0 ? cause.ids : [`${cause.kind}:${randomUUID()}`];
-  const woke = cp.sessionRuntime.wake(roleKey, ids.map((id) => ({ id, kind: cause.kind })));
+  const woke = cp.sessionRuntime.wake(roleKey, ids.map((id) => ({
+    id,
+    kind: cause.kind,
+    // A mention's gate rides with its trigger to the runtime's final check before the provider call.
+    ...(cause.stillAdmissible === undefined ? {} : { stillAdmissible: cause.stillAdmissible }),
+  })));
   return woke.allowed ? allow(ReasonCode.OK, undefined) : (woke as Decision<void>);
 };
 
@@ -1924,7 +1929,7 @@ export const buzzMentionWakeGate = (
  * to, refuses the wake; it never falls through to an ordinary wake.
  */
 const wakeForMention = (
-  cp: Pick<ControlPlane, "bindings" | "sessionRuntime">,
+  cp: ControlPlane,
   roleConversation: Pick<RoleConversationPort, "wake"> | null,
   roleKey: string,
   mention: MentionWakeContext,
@@ -1932,7 +1937,22 @@ const wakeForMention = (
   if (roleConversation === null || mention.roleKey !== roleKey || [mention.actorId, mention.room, mention.eventId].some((value) => value.length === 0)) {
     return Promise.resolve(deny(ReasonCode.ROLE_PEER_STALE, "a mention's wake carried no usable mention context", { roleKey }));
   }
-  return wakeRoleHolder(cp, { wake: (key) => roleConversation.wake(key, mention) }, roleKey, { kind: "owner message", ids: [] });
+  // The same gate the conversation port applies, for the driven route: it rides with the runtime
+  // trigger and is asked again immediately before the provider call. Judged against the role's
+  // current holder each time it is asked.
+  const gate = buzzMentionWakeGate(cp, () => runningMentionSubscribers.get(cp) ?? null);
+  const stillAdmissible = (): boolean => {
+    const holder = cp.bindings.active(roleKey);
+    return holder !== null && gate(holder, mention);
+  };
+  if (!stillAdmissible()) {
+    return Promise.resolve(deny(ReasonCode.ROLE_PEER_STALE, "the mention's identity, role or room no longer stands behind this holder", { roleKey }));
+  }
+  return wakeRoleHolder(cp, { wake: (key) => roleConversation.wake(key, mention) }, roleKey, {
+    kind: "owner message",
+    ids: [],
+    stillAdmissible,
+  });
 };
 
 /**
