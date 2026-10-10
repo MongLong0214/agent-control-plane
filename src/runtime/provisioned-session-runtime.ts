@@ -94,7 +94,8 @@ export interface SessionWakeTrigger {
    * For a mention's trigger: whether the work it stands for was taken up, which for a mention is
    * whether its event is spent. Read when its turn has ended: such a trigger is marked handled only
    * when this answers true; otherwise it is released, as a refused turn's are. Read again when a
-   * wake names it: a true answer refuses it as a duplicate, however its event came to be spent.
+   * wake names it, and at its turn's final check before the provider call: a true answer refuses
+   * it as a duplicate, however its event came to be spent.
    */
   served?: () => boolean;
 }
@@ -514,26 +515,44 @@ export class ProvisionedSessionRuntime {
     // The mention triggers whose gate did not hold at the final check. The turn may still run for
     // the others, but these were not served by it: they are released, never marked handled.
     const notAdmitted = new Set<string>();
+    // The triggers whose `served` already answered true at the final check: spent by another turn
+    // (a running one that claimed a coalesced mention's message), so this turn drops them and they
+    // are marked handled whether or not it runs for the others.
+    const servedBefore = new Set<string>();
     try {
       // A refused turn is not a completed one: its triggers are released, never marked handled.
       const turn = await this.#turn(binding.sessionId, "resume", workPrompt(binding, triggers), {
         relay: true,
         timeoutMs: this.options.turnTimeoutMs ?? 30 * 60_000,
         purpose: "work",
-        // Served while any trigger still holds: an ordinary one always does, and a mention's holds
-        // only while its gate does, read at the final check below.
+        // Served while any trigger still wants it: an ordinary one always does, and a mention's
+        // only while it is not already served and its gate holds, read at the final check below.
         admissible: () => {
           notAdmitted.clear();
+          servedBefore.clear();
           for (const trigger of triggers) {
-            if (trigger.stillAdmissible !== undefined && !trigger.stillAdmissible()) notAdmitted.add(trigger.id);
+            if (trigger.served?.() === true) servedBefore.add(trigger.id);
+            else if (trigger.stillAdmissible !== undefined && !trigger.stillAdmissible()) notAdmitted.add(trigger.id);
           }
-          return triggers.some((trigger) => !notAdmitted.has(trigger.id));
+          if (triggers.some((trigger) => !notAdmitted.has(trigger.id) && !servedBefore.has(trigger.id))) {
+            return allow(ReasonCode.OK, undefined);
+          }
+          return notAdmitted.size > 0
+            ? deny(ReasonCode.ROLE_PEER_STALE, "the mention that woke this turn no longer stands behind its holder", {
+                sessionId: binding.sessionId,
+                purpose: "work",
+              })
+            : deny(ReasonCode.SESSION_TURN_DUPLICATE, "every trigger of this turn was already served before its provider call", {
+                sessionId: binding.sessionId,
+                triggers: [...servedBefore],
+              });
         },
       });
       completed = turn.allowed;
       return turn.allowed ? allow(ReasonCode.OK, undefined) : (turn as Decision<void>);
     } finally {
       for (const trigger of triggers) lane.claimed.delete(trigger.id);
+      for (const id of servedBefore) lane.handled.add(id);
       if (completed) {
         for (const trigger of triggers) {
           if (this.#isEnvelope(trigger.id) || notAdmitted.has(trigger.id)) continue;
@@ -620,8 +639,8 @@ export class ProvisionedSessionRuntime {
       timeoutMs: number;
       purpose: TurnPurpose;
       spawn?: SpawnAttestation | null;
-      /** Whether the turn's triggers still want it, asked last before the provider call. */
-      admissible?: () => boolean;
+      /** Whether the turn's triggers still want it, asked last before the provider call; a refusal is the turn's. */
+      admissible?: () => Decision<void>;
     },
   ): Promise<Decision<SessionTurnResult>> {
     const refused = (decision: Decision<void>): Decision<SessionTurnResult> => {
@@ -692,15 +711,14 @@ export class ProvisionedSessionRuntime {
       if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
       return refused(now);
     }
-    // And, last, the triggers' own gate: a turn woken only by mentions whose identity, role or room
-    // no longer stands behind this holder is refused here, after every await and with no provider
-    // contact. Like every refusal above it is not a completed turn, so nothing is marked handled.
-    if (turn.admissible !== undefined && !turn.admissible()) {
+    // And, last, the triggers' own gate: a turn left with no trigger to serve (woken only by
+    // mentions whose identity, role or room no longer stands behind this holder, or that another
+    // turn has already served) is refused here with the gate's own answer, after every await and
+    // with no provider contact. Like every refusal above it is not a completed turn.
+    const wanted = turn.admissible?.();
+    if (wanted !== undefined && !wanted.allowed) {
       if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
-      return refused(deny(ReasonCode.ROLE_PEER_STALE, "the mention that woke this turn no longer stands behind its holder", {
-        sessionId,
-        purpose: turn.purpose,
-      }));
+      return refused(wanted);
     }
     let result: SessionTurnResult;
     try {
