@@ -7,7 +7,7 @@ import {
   type Stats,
 } from "node:fs";
 import { createHash } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import { z } from "zod";
 
@@ -212,6 +212,19 @@ export interface RepoFactoryProducerInput {
    * head it reports is exactly these. Omitted, they are `plannedBootstrapFiles(plan)`.
    */
   approvedFiles?: readonly PlannedBootstrapFile[];
+  /**
+   * Issue #246 PR-C slice C3, CEO decision (c) — the checkout leaf this call creates, which its
+   * caller binds to the run and the attempt. It sits beside the default leaf, in the same
+   * `repositories` directory; it must not exist, and is created exclusively, so no earlier attempt's
+   * checkout is ever reused, moved or overwritten. Omitted, it is `repositoryCheckoutPath(workDir,
+   * role)`.
+   */
+  checkoutPath?: string;
+  /**
+   * #246 C3, CEO decision (c) — keep this call's checkout when it fails, rather than removing it:
+   * the caller's next attempt creates a checkout of its own, so this one is preserved where it is.
+   */
+  keepCheckoutOnFailure?: boolean;
 }
 
 /** The blob id git gives `content`, in the object format the repository's own ids use. */
@@ -291,8 +304,8 @@ const OPERATION_MARKER_NAME = ".repo-factory-operation.json";
 
 /**
  * The bootstrap operation an existing checkout's marker names, or null. Nothing is removed or
- * reused on its strength: it words a refusal, and the interrupted-checkout recovery (#246 C3) asks
- * it as one of several checks before it moves a checkout aside, never before it deletes one.
+ * reused on its strength: it words a refusal, and a WRITTEN bootstrap application's activation
+ * (#246 C3) asks it as one of several checks that the stored result's checkout is its own.
  */
 export const checkoutMarkerOf = (localRepoPath: string): string | null => {
   try {
@@ -317,8 +330,9 @@ export const checkoutMarkerOf = (localRepoPath: string): string | null => {
 export const occupiedCheckoutLeaf = (
   workDir: string,
   plan: Pick<RepoFactoryPlanFixture, "repositoryRole" | "bootstrapOperationId">,
+  leafPath: string = repositoryCheckoutPath(workDir, plan.repositoryRole),
 ): Decision<never> | null => {
-  const localRepoPath = repositoryCheckoutPath(workDir, plan.repositoryRole);
+  const localRepoPath = leafPath;
   try {
     lstatSync(localRepoPath);
   } catch {
@@ -329,14 +343,13 @@ export const occupiedCheckoutLeaf = (
   // and kept rather than reclaimed: a matching HEAD does not make its tracked edits, untracked or
   // ignored files recoverable, and a live run cannot be told from a dead one, so a reclaiming
   // retry could delete what another retry had just claimed (round 3, RF1043-07). Nothing here
-  // removes it. A bootstrap application's checkout is recovered by the repair
-  // `preserve_interrupted_bootstrap_checkout` (#246 C3), which verifies the application owns it and
-  // that no attempt is running, moves it aside rather than deleting it, and authorises nothing: the
-  // next run, a new CEO CONFIRM, then resumes from the GitHub ledger.
+  // removes, moves or reuses it. A bootstrap application never meets its own earlier checkout here:
+  // each attempt creates a leaf of its own, bound to the run and the attempt (#246 C3), and earlier
+  // ones stay where they are.
   if (checkoutMarkerOf(localRepoPath) === plan.bootstrapOperationId) {
     return deny(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-      "this bootstrap operation's checkout already exists: an earlier run of it stopped without cleaning up, or is still running. It is not removed; once no run of this operation is active, the repair preserve_interrupted_bootstrap_checkout moves it aside, and the next run resumes from the GitHub ledger",
+      "this bootstrap operation's checkout already exists at this path: an earlier run of it stopped without cleaning up, or is still running. It is not removed, moved or reused",
       { refusal: "INTERRUPTED_RUN_CHECKOUT", localRepoPath, resumable: false },
     );
   }
@@ -460,7 +473,7 @@ const judgeRealDirectoryEntry = (
  * meaningfully defend against; the guarantee here is narrower on purpose: it refuses to
  * operate in a namespace a *different* user or group could tamper with.
  */
-export const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: string): Decision<void> => {
+const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: string): Decision<void> => {
   if (typeof process.getuid !== "function") {
     return deny(
       ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
@@ -768,8 +781,16 @@ export const produceRepoFactoryResult = async (
   const ledgerOwner = { bootstrapOperationId: plan.bootstrapOperationId, requestDigest: plan.requestDigest };
 
   const workDir = resolve(input.workDir);
-  const localRepoPath = repositoryCheckoutPath(workDir, plan.repositoryRole);
+  const defaultLeaf = repositoryCheckoutPath(workDir, plan.repositoryRole);
+  const localRepoPath = input.checkoutPath === undefined ? defaultLeaf : resolve(input.checkoutPath);
   const repositoriesDir = dirname(localRepoPath);
+  // A caller's leaf is another name in the same `repositories` directory, never a path elsewhere.
+  if (repositoriesDir !== dirname(defaultLeaf) || basename(localRepoPath).length === 0) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "the checkout leaf must be a name in this run's repositories directory", {
+      checkoutPath: input.checkoutPath ?? null,
+      repositoriesDir: dirname(defaultLeaf),
+    });
+  }
 
   // Fast-path only — refusing early avoids the containment/ownership/creation work below for
   // the common, non-concurrent case. It is NOT the collision authority: see the atomic
@@ -777,7 +798,7 @@ export const produceRepoFactoryResult = async (
   // system runs multiple same-UID producers concurrently as normal operation, and an
   // `existsSync` check has a gap another process's own creation can land in before this one
   // reads it).
-  const occupied = occupiedCheckoutLeaf(workDir, plan);
+  const occupied = occupiedCheckoutLeaf(workDir, plan, localRepoPath);
   if (occupied !== null) return occupied;
 
   const ownershipPrecheck = assertParentChainNotAttackerWritable(workDir, localRepoPath);
@@ -802,7 +823,10 @@ export const produceRepoFactoryResult = async (
     join(localRepoPath, OPERATION_MARKER_NAME),
     `${JSON.stringify({ bootstrapOperationId: plan.bootstrapOperationId })}\n`,
   );
-  const cleanup = (): void => cleanupOwnedCheckout(workDir, localRepoPath, plan.bootstrapOperationId);
+  const cleanup = (): void => {
+    if (input.keepCheckoutOnFailure === true) return;
+    cleanupOwnedCheckout(workDir, localRepoPath, plan.bootstrapOperationId);
+  };
   /**
    * Every git call below, with the cleanup its denial paths already run.
    *

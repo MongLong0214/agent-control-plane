@@ -42,9 +42,10 @@ import type { Db } from "../db/database.ts";
  * an approval of another scope is refused, not substituted. On failure, cancel and recovery:
  * - Failure (a refused, timed-out or crashed attempt): the application stays RESERVED and frozen,
  *   and the next CEO CONFIRM of the same candidate under the same scope resumes it from the attempt
- *   ledger. A checkout the interrupted attempt left behind is first preserved by the repair
- *   `preserve_interrupted_bootstrap_checkout` (moved aside, never deleted); that repair authorises
- *   nothing, so the resuming CONFIRM is a new one and passes every check again.
+ *   ledger, once the earlier attempts are shown to have ended with no writer left. Each attempt
+ *   creates a checkout of its own, bound to the run and the attempt; an earlier attempt's checkout is
+ *   preserved where it is, never moved, reused or removed, and the resuming CONFIRM passes every check
+ *   again.
  * - Recovery: the same CONFIRM again, never a new plan or a new scope.
  * - Cancel: the run is cancelled first, and then the repair `release_bootstrap_reservation` releases
  *   its reservation, only on positive proof of no external effect: no attempt is in flight, this
@@ -331,27 +332,6 @@ export class BootstrapApplications {
     } catch (error) {
       if (!isAcpError(error)) throw error;
     }
-  }
-
-  /**
-   * #246 C3, CEO decision (c) — the record of an interrupted attempt's checkout moved aside by the
-   * official recovery: where it was, where it is kept, and the application it belongs to. The row
-   * itself is not touched: preserving a checkout moves no phase and records no attempt.
-   */
-  recordCheckoutPreserved(preserved: {
-    runId: string;
-    bootstrapOperationId: string;
-    attempts: number;
-    candidateSnapshotDigest: string;
-    originalPath: string;
-    preservedPath: string;
-  }): void {
-    this.audit.record({
-      kind: "BOOTSTRAP_CHECKOUT_PRESERVED",
-      runId: preserved.runId,
-      projectId: null,
-      evidence: { ...preserved },
-    });
   }
 
   private move(

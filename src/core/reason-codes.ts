@@ -870,12 +870,6 @@ export const ReasonCode = {
    */
   BOOTSTRAP_APPLICATION_FROZEN: "BOOTSTRAP_APPLICATION_FROZEN",
   /**
-   * #246 C3 — the official recovery of a checkout an interrupted bootstrap application left behind
-   * could not verify what it was asked to preserve, or could not move it; the checkout is left
-   * exactly where it was, and nothing is deleted.
-   */
-  BOOTSTRAP_CHECKOUT_NOT_PRESERVED: "BOOTSTRAP_CHECKOUT_NOT_PRESERVED",
-  /**
    * #246 C3 — what GitHub holds at this run's target cannot be attributed to this run by evidence it
    * recorded (the attempt ledger's node id or the creation receipt). The reservation and the evidence
    * are kept, nothing is created or adopted, and a person resolves it.

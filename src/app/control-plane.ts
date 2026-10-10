@@ -784,7 +784,7 @@ export class ControlPlane {
           },
         },
       });
-      // #246 C3 — the interrupted-checkout recovery is a repair the bootstrap runner verifies and performs.
+      // #246 C3 — the reservation release is a repair the bootstrap runner verifies and performs.
       this.repair.attach({ ownerAuthority: this.ownerAuthority, bootstrapRecovery: this.bootstrapProducer });
       this.ceo.attach({
         ownerAuthority: this.ownerAuthority,

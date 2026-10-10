@@ -15,10 +15,10 @@ import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import {
   REPO_FACTORY_GITHUB_WRITE_OPERATION,
   RepoFactoryBootstrapRunner,
+  attemptCheckoutPath,
   repoFactoryGitHubWriteParameters,
   type ProduceAndActivateInput,
 } from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
-import { repositoryCheckoutPath } from "../../src/bootstrap/repo-factory-producer.ts";
 import { git } from "../../src/git/git.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import {
@@ -201,6 +201,9 @@ const prepare = async (
     projects: harness.cp.projects,
     repositories: harness.cp.repositories,
   });
+  // #246 C3 — no daemon runs here: the test process is the only control-plane writer, which a
+  // daemon's single-instance lock attests in production. A new attempt after an earlier one asks it.
+  runner.attachWriterLock(() => true);
   // The CEO's admission, which the runner asks among its pre-write checks, needs a current
   // continuity evaluation, as the CONFIRM door has before it calls the runner.
   await harness.cp.continuity.evaluate("bootstrap confirmation");
@@ -267,7 +270,7 @@ const ownerApproval = (
 const noGitHubCall = (prepared: Prepared): void => {
   expect(prepared.github.writes).toEqual([]);
   expect(prepared.github.reads).toEqual([]);
-  expect(existsSync(repositoryCheckoutPath(join(prepared.workRoot, prepared.runId), "primary"))).toBe(false);
+  expect(existsSync(attemptCheckoutPath(join(prepared.workRoot, prepared.runId), "primary", 1))).toBe(false);
   expect(prepared.harness.cp.artifacts.latest(prepared.runId, "REPO_FACTORY_RESULT")).toBeNull();
 };
 
@@ -338,7 +341,7 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     expect(github.writes).toEqual([]);
 
     // The bound checkout is the one the producer made, at the head GitHub holds.
-    const checkout = repositoryCheckoutPath(join(prepared.workRoot, runId), "primary");
+    const checkout = attemptCheckoutPath(join(prepared.workRoot, runId), "primary", 1);
     expect(second.value.localBindings).toEqual([
       expect.objectContaining({ identity: IDENTITY, repositoryRole: "primary" }),
     ]);

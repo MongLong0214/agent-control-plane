@@ -1,5 +1,5 @@
 import { lstatSync, readdirSync } from "node:fs";
-import { basename, dirname, join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 
 import { z } from "zod";
 
@@ -10,7 +10,6 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { type ProjectManifest, assertPortableManifest, manifestDigest } from "../contracts/manifest.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
-import { RollbackFilesystem } from "../db/fd-vfs.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { ArtifactKind, Role, RunKind, RunState, roleKeyFor, type RunRow } from "../domain/types.ts";
 import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
@@ -45,9 +44,7 @@ import {
   type GitHubWriteAuthority,
 } from "./repo-factory-github.ts";
 import {
-  assertParentChainNotAttackerWritable,
   checkoutMarkerOf,
-  ensureDirectoryLevel,
   occupiedCheckoutLeaf,
   produceRepoFactoryResult,
   repositoryCheckoutPath,
@@ -113,7 +110,8 @@ import { type ExternalWriteReceipt, parseRepoFactoryResult, type RepoFactoryResu
  * There is no other copy and no shortcut around the approval (PR #1043 review round 3, RF1043-08):
  * a result that could not be stored leaves no checkout, and its retry takes the ordinary path —
  * approval, then the ledger reconciled against GitHub, then the result rebuilt. A checkout left by
- * a run that died is refused by name and kept for a person (RF1043-07).
+ * a run that died is never removed, moved or reused (RF1043-07): each attempt of a bootstrap
+ * application creates a checkout of its own, bound to the run and the attempt (#246 C3).
  *
  * Who calls this. The owner mints the receipt through the operator socket's
  * `repoFactory.githubWrite.approve` (the owner token; `approvalBinding` computes what it binds), and
@@ -299,60 +297,11 @@ const LEDGER_REFUSALS = new Set(["LEDGER_CORRUPT", "LEDGER_FOREIGN", "LEDGER_UNS
 const STRANDED_RECOVERY =
   "a person establishes whether the repository at the target is this run's, by comparing its GitHub node id with the attempt ledger named in the evidence; nothing is created, adopted or deleted automatically, the reservation is kept and never reused, so the run is cancelled and the project is bootstrapped again under a new project id and repository identity";
 
-/**
- * #246 C3, CEO decision (c) — the preconditions of the official recovery of a checkout an
- * interrupted application left behind, in the order the repair catalog lists them. Each must be
- * verified; one that cannot be is unmet, and nothing moves.
- */
-export const INTERRUPTED_CHECKOUT_PRECONDITIONS = [
-  "the run is a project-less PROJECT_BOOTSTRAP run at CEO review whose application is RESERVED with an attempt recorded",
-  "the checkout is the one the application's reserved PLAN places, a directory of this account under a private parent chain, whose marker names the application's bootstrap operation",
-  "no application attempt of the run is in flight, this process holds the control plane's single-writer lock, and no git lock file is held in the checkout",
-  "the preservation location is free",
-] as const;
-
-/** The checkout an application's reserved PLAN places, as `placedCheckout` verified it. */
-interface PlacedCheckout {
-  workDir: string;
-  checkoutPath: string;
-  repositoryRole: string;
-  /** Exact (dev, ino) of the checkout, its parent and the work directory, as decimal text. */
-  checkoutDevice: string;
-  checkoutInode: string;
-  checkoutParentDevice: string;
-  checkoutParentInode: string;
-  workDirDevice: string;
-  workDirInode: string;
-}
-
-/** Where preserved checkouts are kept: beside the run's checkouts, in the run's own work directory. */
-const PRESERVED_DIRECTORY = "preserved";
-
 /** One precondition as a repair receipt keeps it. */
 export interface CheckoutRecoveryPrecondition {
   precondition: string;
   satisfied: boolean;
   evidence: unknown;
-}
-
-/** What preserving an interrupted checkout moved, from where to where, and whose it was. */
-export interface InterruptedCheckoutPreservation {
-  runId: string;
-  bootstrapOperationId: string;
-  attempts: number;
-  candidateSnapshotDigest: string;
-  originalPath: string;
-  preservedPath: string;
-  /**
-   * The verified objects, by exact (dev, ino) as decimal text: the checkout, the directory holding it,
-   * and the run's work directory. The move acts only through descriptors held on these, re-verified.
-   */
-  checkoutDevice: string;
-  checkoutInode: string;
-  checkoutParentDevice: string;
-  checkoutParentInode: string;
-  workDirDevice: string;
-  workDirInode: string;
 }
 
 /**
@@ -391,12 +340,6 @@ export interface ReservationReleaseInspection {
   release: ReservationRelease | null;
 }
 
-
-export interface InterruptedCheckoutInspection {
-  preconditions: CheckoutRecoveryPrecondition[];
-  /** The move every precondition allows; null unless all of them hold. */
-  move: InterruptedCheckoutPreservation | null;
-}
 
 /** Whether anything at all is at `path`. An answer that cannot be read is taken as occupied. */
 const pathOccupied = (path: string): boolean => {
@@ -441,6 +384,14 @@ const gitLockFiles = (checkoutPath: string): string[] | null => {
   return walk(gitDir, 0) ? found.sort() : null;
 };
 
+/**
+ * #246 C3, CEO decision (c) — the checkout leaf attempt `attempt` of a run creates: a name of its
+ * own beside the producer's default leaf, bound to the run (its work directory) and the attempt. No
+ * attempt ever reuses, moves or removes another attempt's checkout; an earlier one stays where it is.
+ */
+export const attemptCheckoutPath = (workDir: string, repositoryRole: string, attempt: number): string =>
+  join(dirname(repositoryCheckoutPath(workDir, repositoryRole)), `${repositoryRole}.attempt-${attempt}`);
+
 export class RepoFactoryBootstrapRunner {
   /** #246 C3 — the runs with an application attempt in flight in this process. */
   readonly #applying = new Set<string>();
@@ -452,7 +403,8 @@ export class RepoFactoryBootstrapRunner {
   /**
    * #246 C3 — the daemon attaches its single-instance lock once it holds it. While it is held no
    * other control-plane process runs, so an application attempt not in flight in this one has
-   * ended. Never attached, that cannot be shown, and the interrupted-checkout recovery refuses.
+   * ended. Never attached, that cannot be shown: a new attempt after an earlier one, and a release,
+   * are refused.
    */
   attachWriterLock(held: () => boolean): void {
     this.#writerLockHeld = held;
@@ -808,10 +760,21 @@ export class RepoFactoryBootstrapRunner {
     const held = this.reservationConflicts(reservation, existing);
     if (!held.allowed) return held as Decision<ACPBootstrapActivationResult>;
 
-    // Production is still owed unless the application is WRITTEN: the leaf it creates must be free,
-    // and what GitHub holds at the target must be nothing, or this run's by the evidence it recorded.
+    // Production is still owed unless the application is WRITTEN. A new attempt starts only once every
+    // earlier one is shown to have ended with no writer left (CEO decision (c)); the checkout it will
+    // create — its own, bound to the run and the attempt — must be free; and what GitHub holds at the
+    // target must be nothing, or this run's by the evidence it recorded.
+    const workDir = join(workRoot, runId);
+    const nextAttempt = (existing?.attempts ?? 0) + 1;
     if (existing?.phase !== "WRITTEN") {
-      const occupied = occupiedCheckoutLeaf(join(workRoot, runId), executable);
+      if (existing !== null) {
+        const ended = this.earlierAttemptsEnded(existing, workDir, executable.repositoryRole);
+        if (!ended.allowed) {
+          this.deps.applications.recordRefusal(runId, refusalRecord(ended, "precondition"));
+          return atStage(ended as Decision<ACPBootstrapActivationResult>, "precondition");
+        }
+      }
+      const occupied = occupiedCheckoutLeaf(workDir, executable, attemptCheckoutPath(workDir, executable.repositoryRole, nextAttempt));
       if (occupied !== null) {
         if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(occupied, "precondition"));
         return atStage(occupied as Decision<ACPBootstrapActivationResult>, "precondition");
@@ -824,6 +787,7 @@ export class RepoFactoryBootstrapRunner {
     // attempt recorded, in one transaction — its UNIQUE constraints close the race the checks above
     // could not, and a refusal there rolls the consumption back with it. A recovery records its
     // attempt the same way, before its first external write. A WRITTEN application has none to make.
+    let attempt: number;
     if (existing === null) {
       const reserved = this.deps.db.txDecision(() => {
         const applicable = this.stillApplicable(runId);
@@ -835,15 +799,17 @@ export class RepoFactoryBootstrapRunner {
         return this.deps.applications.reserve(reservation);
       });
       if (!reserved.allowed) return atStage(reserved as Decision<ACPBootstrapActivationResult>, "approval");
+      attempt = reserved.value.attempts;
     } else if (existing.phase === "RESERVED") {
-      const attempt = this.deps.db.txDecision(() => {
+      const recorded = this.deps.db.txDecision(() => {
         const applicable = this.stillApplicable(runId);
         if (!applicable.allowed) return applicable as Decision<BootstrapApplication>;
         const consumed = consumeIfNew();
         if (!consumed.allowed) return consumed as Decision<BootstrapApplication>;
         return this.deps.applications.recordAttempt(runId, existing.attempts);
       });
-      if (!attempt.allowed) return atStage(attempt as Decision<ACPBootstrapActivationResult>, "precondition");
+      if (!recorded.allowed) return atStage(recorded as Decision<ACPBootstrapActivationResult>, "precondition");
+      attempt = recorded.value.attempts;
     } else {
       // A WRITTEN application activates the result its own attempt stored, on the call after a
       // handoff is acknowledged or after a primary CTO could not be provisioned. That result is
@@ -859,12 +825,14 @@ export class RepoFactoryBootstrapRunner {
 
     // Otherwise the producer, for a first attempt and every recovery alike: it reconciles its ledger
     // against GitHub — a repository is this run's only by the node id its create was answered with,
-    // or its creation receipt — performs what is left, and rebuilds the result. The result and
-    // WRITTEN are stored in one transaction, inside the producer's cleanup, so a result that could
-    // not be stored leaves no checkout and the next attempt takes this same path.
+    // or its creation receipt — performs what is left, and rebuilds the result. It builds that in a
+    // checkout of this attempt's own, created exclusively and kept if the attempt fails; nothing an
+    // earlier attempt left is reused. The result and WRITTEN are stored in one transaction.
     const produced = await produceRepoFactoryResult({
       plan: executable,
-      workDir: join(workRoot, runId),
+      workDir,
+      checkoutPath: attemptCheckoutPath(workDir, executable.repositoryRole, attempt),
+      keepCheckoutOnFailure: true,
       clock: this.deps.clock,
       github: { port: this.deps.githubPort, authority },
       // The reviewed files, and the tree the producer reports must be exactly these (#246 C2).
@@ -885,13 +853,61 @@ export class RepoFactoryBootstrapRunner {
       if (produced.reasonCode === ReasonCode.RESOURCE_COLLISION || (typeof refusal === "string" && LEDGER_REFUSALS.has(refusal))) {
         return this.strand(runId, "ATTRIBUTION_UNCERTAIN", {
           production: refusalRecord(produced, "production"),
-          ledgerPath: githubLedgerPath(join(workRoot, runId), executable.repositoryRole),
+          ledgerPath: githubLedgerPath(workDir, executable.repositoryRole),
         });
       }
       this.deps.applications.recordRefusal(runId, refusalRecord(produced, "production"));
       return atStage(produced as Decision<ACPBootstrapActivationResult>, "production");
     }
     return this.activate(input, produced.value);
+  }
+
+  /**
+   * #246 C3, CEO decision (c) — whether every earlier attempt of this application has ended with no
+   * writer left, asked before a new one starts. This CONFIRM holds the run's in-process slot
+   * (`produceAndActivate`), so no attempt of the run runs here; this process holding the control
+   * plane's single-writer lock means no other control-plane process runs, so an attempt a dead
+   * daemon started has ended; and no git lock file in any earlier attempt's checkout means no git
+   * process is still writing there. An earlier checkout that is not a plain directory of ours, or
+   * that cannot be read in full, cannot be shown to be still: unclear is IN_DOUBT, and nothing is
+   * attempted. Nothing here touches an earlier checkout.
+   */
+  private earlierAttemptsEnded(application: BootstrapApplication, workDir: string, repositoryRole: string): Decision<void> {
+    const writerLockHeld = this.#writerLockHeld?.() === true;
+    // The directory every attempt's checkout is in: absent, or a real directory, never a symlink.
+    const checkoutsDir = dirname(attemptCheckoutPath(workDir, repositoryRole, 1));
+    let checkoutsDirKind: string;
+    try {
+      const stat = lstatSync(checkoutsDir);
+      checkoutsDirKind = stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "directory" : "other";
+    } catch (error) {
+      checkoutsDirKind = (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable";
+    }
+    const earlier: Array<{ attempt: number; path: string; kind: string; gitLockFiles: string[] | null }> = [];
+    for (let attempt = 1; attempt <= application.attempts; attempt += 1) {
+      const path = attemptCheckoutPath(workDir, repositoryRole, attempt);
+      let kind: string;
+      try {
+        const stat = lstatSync(path);
+        kind = stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "directory" : "other";
+      } catch (error) {
+        kind = (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable";
+      }
+      const locks = kind === "directory" ? gitLockFiles(path) : kind === "absent" ? [] : null;
+      earlier.push({ attempt, path, kind, gitLockFiles: locks });
+    }
+    if (
+      writerLockHeld &&
+      (checkoutsDirKind === "directory" || checkoutsDirKind === "absent") &&
+      earlier.every((entry) => entry.gitLockFiles !== null && entry.gitLockFiles.length === 0)
+    ) {
+      return allow(ReasonCode.OK, undefined);
+    }
+    return deny(
+      ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+      "an earlier attempt of this bootstrap run cannot be shown to have ended with no writer left, so no new attempt starts; it stays in doubt",
+      { refusal: "EARLIER_ATTEMPT_IN_DOUBT", runId: application.runId, writerLockHeld, checkoutsDir, checkoutsDirKind, earlier },
+    );
   }
 
   /**
@@ -970,7 +986,8 @@ export class RepoFactoryBootstrapRunner {
     if (digestOf(inOrder(result.externalWriteReceipts)) !== digestOf(expected)) {
       return unattributed("the stored result's write receipts are not the ones the attempt ledger holds", { ledgerPath });
     }
-    const checkoutPath = repositoryCheckoutPath(workDir, plan.repositoryRole);
+    // The checkout the attempt that wrote it created: the application's last attempt.
+    const checkoutPath = attemptCheckoutPath(workDir, plan.repositoryRole, application.attempts);
     const repositories = result.repositories;
     if (
       repositories.length !== 1 ||
@@ -1168,244 +1185,6 @@ export class RepoFactoryBootstrapRunner {
     );
   }
 
-  /**
-   * #246 C3, CEO decision (c) — whether the checkout an interrupted application attempt left behind
-   * can be preserved, asked without changing anything. A process that died mid-attempt leaves its
-   * checkout, and every later CONFIRM is refused INTERRUPTED_RUN_CHECKOUT (fail-closed, and kept so).
-   * The official recovery moves that checkout aside, and only after each precondition is verified:
-   * the run and its RESERVED application; the checkout is exactly the one that application's
-   * reserved PLAN places and carries its marker; no attempt of the run is in flight here, and this
-   * process is the only control-plane writer, so the attempt that left it has ended; no git lock
-   * file is held in it; and the preservation location is free. Whatever cannot be verified is unmet.
-   */
-  inspectInterruptedCheckout(runId: string | null): InterruptedCheckoutInspection {
-    const preconditions: CheckoutRecoveryPrecondition[] = [];
-    const met = (satisfied: boolean, evidence: unknown): boolean => {
-      preconditions.push({ precondition: INTERRUPTED_CHECKOUT_PRECONDITIONS[preconditions.length]!, satisfied, evidence });
-      return satisfied;
-    };
-    const unmetFromHere = (): InterruptedCheckoutInspection => {
-      for (const precondition of INTERRUPTED_CHECKOUT_PRECONDITIONS.slice(preconditions.length)) {
-        preconditions.push({ precondition, satisfied: false, evidence: { notChecked: "an earlier precondition is unmet" } });
-      }
-      return { preconditions, move: null };
-    };
-
-    const run = runId === null ? null : this.deps.runs.get(runId);
-    const application = runId === null ? null : this.deps.applications.get(runId);
-    if (
-      !met(
-        runId !== null &&
-          run !== null &&
-          run.kind === RunKind.PROJECT_BOOTSTRAP &&
-          run.projectId === null &&
-          run.state === RunState.READY_FOR_CEO_REVIEW &&
-          application !== null &&
-          application.phase === "RESERVED" &&
-          application.attempts >= 1,
-        {
-          runId,
-          kind: run?.kind ?? null,
-          projectId: run?.projectId ?? null,
-          state: run?.state ?? null,
-          phase: application?.phase ?? null,
-          attempts: application?.attempts ?? null,
-        },
-      ) ||
-      runId === null ||
-      application === null
-    ) {
-      return unmetFromHere();
-    }
-
-    const placed = this.placedCheckout(application);
-    if (!met(placed.allowed, placed.allowed ? placed.value : { message: placed.message, ...placed.evidence }) || !placed.allowed) {
-      return unmetFromHere();
-    }
-    const { workDir, checkoutPath, repositoryRole } = placed.value;
-
-    const attemptInFlight = this.#applying.has(runId);
-    const writerLockHeld = this.#writerLockHeld?.() === true;
-    const locks = gitLockFiles(checkoutPath);
-    if (
-      !met(!attemptInFlight && writerLockHeld && locks !== null && locks.length === 0, {
-        attemptInFlight,
-        writerLockHeld,
-        gitLockFiles: locks ?? "the checkout's git directory could not be read in full",
-      })
-    ) {
-      return unmetFromHere();
-    }
-
-    const preservedName = `${repositoryRole}-attempt-${application.attempts}`;
-    const preservedPath = join(workDir, PRESERVED_DIRECTORY, preservedName);
-    const occupied = pathOccupied(preservedPath);
-    if (!met(!occupied, { preservedPath, occupied })) return unmetFromHere();
-
-    return {
-      preconditions,
-      move: {
-        runId,
-        bootstrapOperationId: application.bootstrapOperationId,
-        attempts: application.attempts,
-        candidateSnapshotDigest: application.candidateSnapshotDigest,
-        originalPath: checkoutPath,
-        preservedPath,
-        checkoutDevice: placed.value.checkoutDevice,
-        checkoutInode: placed.value.checkoutInode,
-        checkoutParentDevice: placed.value.checkoutParentDevice,
-        checkoutParentInode: placed.value.checkoutParentInode,
-        workDirDevice: placed.value.workDirDevice,
-        workDirInode: placed.value.workDirInode,
-      },
-    };
-  }
-
-  /**
-   * #246 C3, CEO decision (c) — the official recovery of an interrupted application's checkout. It
-   * is verified again here, synchronously, and refused unless it is still exactly what the repair's
-   * plan verified (`planned`). Then it is moved — never deleted — to
-   * `<work dir>/preserved/<role>-attempt-<n>`, and only through held descriptors: the work directory,
-   * the directory holding the checkout and the preservation directory are each opened no-follow and
-   * required to be the very objects verified, by (dev, ino); the checkout is then required, through
-   * its held parent and without following a symlink, to be the verified directory; and the rename
-   * is made between the held descriptors with RENAME_EXCL, so it cannot be steered through a swapped
-   * parent or symlink, and cannot land on anything already there. Any difference refuses before
-   * anything moves. Nothing is restored and no other path is touched on any refusal.
-   *
-   * One window stays open, and is stated rather than hidden: between the identity check through
-   * the held parent and the rename itself, another process of this account could replace the
-   * checkout's entry inside the run's private work directory. macOS has no rename that is
-   * conditional on the identity of what it moves, so no primitive here closes it; the identity is
-   * read again through the held preservation directory right after, and a mismatch is refused and
-   * left exactly where the rename put it.
-   *
-   * It authorises nothing. No approval is consumed or re-admitted, no attempt is recorded and no
-   * phase moves: the application resumes only through a new CEO CONFIRM, which passes every check
-   * again — the official receipt against the current write scope among them. A git lock file in the
-   * checkout is never removed: it keeps the recovery refused until it is gone.
-   */
-  preserveInterruptedCheckout(
-    runId: string | null,
-    planned: InterruptedCheckoutPreservation | null = null,
-  ): Decision<InterruptedCheckoutPreservation> {
-    const refuse = (refusal: string, message: string, evidence: Evidence): Decision<InterruptedCheckoutPreservation> =>
-      deny(ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED, message, { refusal, runId, ...evidence });
-    const inspected = this.inspectInterruptedCheckout(runId);
-    const move = inspected.move;
-    if (move === null) {
-      return refuse("PRECONDITION_UNMET", "the interrupted checkout's recovery preconditions do not hold; nothing is moved", {
-        preconditions: inspected.preconditions,
-      });
-    }
-    if (planned !== null && digestOf(planned) !== digestOf(move)) {
-      return refuse("PLAN_CHANGED", "what is there now is not what the repair's plan verified; nothing is moved", {
-        planned,
-        current: move,
-      });
-    }
-    const ensured = ensureDirectoryLevel(dirname(move.preservedPath));
-    if (!ensured.allowed) {
-      return refuse("PRESERVATION_LOCATION_UNSAFE", ensured.message, { ...move, ...ensured.evidence });
-    }
-    let files: RollbackFilesystem;
-    try {
-      files = RollbackFilesystem.load();
-    } catch (error) {
-      return refuse("ANCHOR_UNAVAILABLE", "the held-descriptor file operations are unavailable; nothing is moved", {
-        ...move,
-        error: (error as Error).message.slice(0, 300),
-      });
-    }
-    try {
-      const moved = this.anchoredMove(files, move);
-      if (!moved.allowed) return refuse(String(moved.evidence["refusal"]), moved.message, { ...move, ...moved.evidence });
-    } finally {
-      files.dispose();
-    }
-    this.deps.applications.recordCheckoutPreserved(move);
-    return allow(ReasonCode.OK, move);
-  }
-
-  /** The move itself, through held descriptors only; see `preserveInterruptedCheckout`. */
-  private anchoredMove(files: RollbackFilesystem, move: InterruptedCheckoutPreservation): Decision<void> {
-    const stop = (refusal: string, message: string, evidence: Evidence = {}): Decision<void> =>
-      deny(ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED, message, { refusal, ...evidence });
-    const is = (entry: { dev: bigint; ino: bigint } | null, dev: string, ino: string): boolean =>
-      entry !== null && entry.dev === BigInt(dev) && entry.ino === BigInt(ino);
-    const parentPath = dirname(move.originalPath);
-    const workDir = dirname(parentPath);
-    const parentName = basename(parentPath);
-    const leafName = basename(move.originalPath);
-    const preservedRootName = basename(dirname(move.preservedPath));
-    const preservedName = basename(move.preservedPath);
-    if (dirname(dirname(move.preservedPath)) !== workDir) {
-      return stop("ANCHOR_MISMATCH", "the preservation location is not in the run's work directory; nothing is moved");
-    }
-    let work: ReturnType<RollbackFilesystem["openParent"]>;
-    let parent: ReturnType<RollbackFilesystem["openParent"]>;
-    let preserved: ReturnType<RollbackFilesystem["openParent"]>;
-    let leaf: ReturnType<RollbackFilesystem["stat"]>;
-    try {
-      work = files.openParent(workDir);
-      if (!is(work, move.workDirDevice, move.workDirInode)) {
-        return stop("ANCHOR_MISMATCH", "the run's work directory is not the one that was verified; nothing is moved");
-      }
-      parent = files.openParent(parentPath);
-      if (!is(parent, move.checkoutParentDevice, move.checkoutParentInode) || !is(files.stat(work, parentName), move.checkoutParentDevice, move.checkoutParentInode)) {
-        return stop("ANCHOR_MISMATCH", "the directory holding the checkout is not the one that was verified; nothing is moved");
-      }
-      preserved = files.openParent(dirname(move.preservedPath));
-      const preservedEntry = files.stat(work, preservedRootName);
-      if (preservedEntry === null || preservedEntry.type !== "dir" || preservedEntry.dev !== preserved.dev || preservedEntry.ino !== preserved.ino) {
-        return stop("ANCHOR_MISMATCH", "the preservation directory is not the one in the run's work directory; nothing is moved");
-      }
-      leaf = files.stat(parent, leafName);
-      if (leaf === null || leaf.type !== "dir" || !is(leaf, move.checkoutDevice, move.checkoutInode)) {
-        return stop("CHECKOUT_CHANGED", "the checkout is no longer the directory that was verified; nothing is moved", {
-          found: leaf === null ? null : { type: leaf.type, dev: String(leaf.dev), ino: String(leaf.ino) },
-        });
-      }
-      if (files.stat(preserved, preservedName) !== null) {
-        return stop("PRESERVATION_TARGET_EXISTS", "the preservation location is already taken; nothing is moved");
-      }
-    } catch (error) {
-      return stop("ANCHOR_FAILED", "a held descriptor could not be taken on a verified directory, without following a symlink; nothing is moved", {
-        error: (error as Error).message.slice(0, 300),
-        reason: isAcpError(error) ? error.evidence["reason"] ?? null : null,
-      });
-    }
-    try {
-      files.renameExclusive(parent, leafName, preserved, preservedName);
-    } catch (error) {
-      return stop("MOVE_FAILED", "the checkout could not be moved to its preservation location; it is left where it was", {
-        error: (error as Error).message.slice(0, 300),
-        errno: isAcpError(error) ? error.evidence["errno"] ?? null : null,
-      });
-    }
-    let arrived: ReturnType<RollbackFilesystem["stat"]> = null;
-    try {
-      arrived = files.stat(preserved, preservedName);
-    } catch {
-      // Unreadable is not the verified directory; refused below, and nothing is restored.
-    }
-    if (arrived === null || arrived.type !== "dir" || !is(arrived, move.checkoutDevice, move.checkoutInode)) {
-      return stop(
-        "MOVED_OBJECT_MISMATCH",
-        "what the rename moved is not the verified checkout: another process replaced it between the check and the rename; it is left where the rename put it, and no other path is touched",
-        { arrived: arrived === null ? null : { type: arrived.type, dev: String(arrived.dev), ino: String(arrived.ino) } },
-      );
-    }
-    return allow(ReasonCode.OK, undefined);
-  }
-
-  /**
-   * The checkout the application's reserved PLAN places, verified against the reservation by digest:
-   * the PLAN artifact is the reserved one, the manifest is one an owner approval of this run carried
-   * whose digest is the reserved one, and the planned outputs they give are the reserved ones. Then
-   * the leaf itself: a real directory of this account, under a parent chain no other account can
-   * write, whose marker names the application's bootstrap operation.
-   */
   /**
    * #246 C3, CEO decision (b) as corrected twice — whether a cancelled run's reservation can be
    * released, asked without changing anything. Released only on positive proof that the application
@@ -1611,68 +1390,6 @@ export class RepoFactoryBootstrapRunner {
     return allow(ReasonCode.OK, outputs);
   }
 
-  private placedCheckout(application: BootstrapApplication): Decision<PlacedCheckout> {
-    const { runId } = application;
-    const refuse = (refusal: string, message: string, evidence: Evidence = {}) =>
-      deny(ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED, message, { refusal, runId, ...evidence }) as Decision<PlacedCheckout>;
-    const workRoot = this.deps.workRoot;
-    if (workRoot === null) return refuse("WORK_ROOT_UNCONFIGURED", "this deployment has no Repo Factory work root");
-    if (!PATH_SAFE_RUN_ID.test(runId)) return refuse("RUN_ID_NOT_PATH_SAFE", "the run id cannot name a work directory");
-    if (!pathOccupied(workRoot)) return refuse("WORK_ROOT_ABSENT", "the Repo Factory work root does not exist", { workRoot });
-    try {
-      ensurePrivateDirectory(workRoot);
-    } catch (error) {
-      if (!isAcpError(error)) throw error;
-      return refuse("WORK_ROOT_INSECURE", error.message, error.evidence);
-    }
-    const reserved = this.reservedOutputs(application, ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED);
-    if (!reserved.allowed) return reserved as Decision<PlacedCheckout>;
-    const outputs = reserved.value;
-    const workDir = join(workRoot, runId);
-    const checkoutPath = repositoryCheckoutPath(workDir, outputs.target.repositoryRole);
-    let leaf;
-    let parentOf;
-    let work;
-    try {
-      leaf = lstatSync(checkoutPath, { bigint: true });
-      parentOf = lstatSync(dirname(checkoutPath), { bigint: true });
-      work = lstatSync(workDir, { bigint: true });
-    } catch (error) {
-      return refuse(
-        (error as NodeJS.ErrnoException).code === "ENOENT" ? "CHECKOUT_ABSENT" : "CHECKOUT_UNREADABLE",
-        "there is no readable checkout of this application to preserve",
-        { checkoutPath },
-      );
-    }
-    if (!leaf.isDirectory()) return refuse("CHECKOUT_NOT_A_DIRECTORY", "the checkout leaf is not a directory", { checkoutPath });
-    if (typeof process.getuid !== "function" || leaf.uid !== BigInt(process.getuid())) {
-      return refuse("CHECKOUT_FOREIGN_OWNER", "the checkout is not this account's", { checkoutPath, uid: String(leaf.uid) });
-    }
-    const chain = assertParentChainNotAttackerWritable(workDir, checkoutPath);
-    if (!chain.allowed) return refuse("CHECKOUT_PARENT_UNSAFE", chain.message, { checkoutPath, ...chain.evidence });
-    const marker = checkoutMarkerOf(checkoutPath);
-    if (marker !== application.bootstrapOperationId) {
-      return refuse("CHECKOUT_NOT_THIS_APPLICATION", "the checkout's marker does not name this application's bootstrap operation", {
-        checkoutPath,
-        marker,
-        bootstrapOperationId: application.bootstrapOperationId,
-      });
-    }
-    if (!parentOf.isDirectory() || !work.isDirectory()) {
-      return refuse("CHECKOUT_PARENT_UNSAFE", "the checkout's parent or the work directory is not a directory", { checkoutPath });
-    }
-    return allow(ReasonCode.OK, {
-      workDir,
-      checkoutPath,
-      repositoryRole: outputs.target.repositoryRole,
-      checkoutDevice: String(leaf.dev),
-      checkoutInode: String(leaf.ino),
-      checkoutParentDevice: String(parentOf.dev),
-      checkoutParentInode: String(parentOf.ino),
-      workDirDevice: String(work.dev),
-      workDirInode: String(work.ino),
-    });
-  }
 
   /**
    * The owner's receipt must name this run, this operation and exactly these parameters, and

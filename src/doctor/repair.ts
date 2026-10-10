@@ -20,7 +20,6 @@ import {
 import type { WorktreeAuthorization, WorktreeManager } from "../verify/worktree.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import {
-  INTERRUPTED_CHECKOUT_PRECONDITIONS,
   RESERVATION_RELEASE_PRECONDITIONS,
   type RepoFactoryBootstrapRunner,
 } from "../bootstrap/repo-factory-bootstrap-run.ts";
@@ -151,20 +150,6 @@ export class RepairService {
       expectedEffect: "the drift warning clears; pending candidates stay stale regardless",
       undo: "re-observe the repository",
       preconditions: ["the repository is readable"],
-    },
-    // #246 C3, CEO decision (c) — the official recovery of a checkout an interrupted bootstrap
-    // application left behind. It moves, never deletes, and authorises nothing: the application
-    // resumes only through a new CEO CONFIRM that passes every check again.
-    preserve_interrupted_bootstrap_checkout: {
-      id: "preserve_interrupted_bootstrap_checkout",
-      risk: "MEDIUM",
-      authorization: "HERMES",
-      description:
-        "Move the checkout an interrupted bootstrap application attempt left behind to a preservation location in the run's own work directory",
-      expectedEffect:
-        "the checkout is kept, unchanged, at <work dir>/preserved/<role>-attempt-<n>; INTERRUPTED_RUN_CHECKOUT no longer refuses the run, and a new CEO CONFIRM of the same frozen candidate resumes it from the GitHub ledger under a current approval of the same scope",
-      undo: "move the preserved directory back to the path the receipt names; nothing in it was changed or removed",
-      preconditions: [...INTERRUPTED_CHECKOUT_PRECONDITIONS],
     },
     // #246 C3, CEO decision (b) as corrected — a cancelled run's reservation released once its
     // application is shown to have had no external effect, so a new run may reserve the same name
@@ -493,28 +478,6 @@ export class RepairService {
           },
         };
       }
-      case "preserve_interrupted_bootstrap_checkout": {
-        const recovery = this.#bootstrapRecovery;
-        const runId = request.runId ?? null;
-        if (recovery === null) {
-          return {
-            preconditions: operation.preconditions.map((precondition) =>
-              checked(precondition, false, { notChecked: "no bootstrap runner is attached to verify it" })),
-            perform: async () => ({ changes: 0, evidence: null }),
-          };
-        }
-        const inspected = recovery.inspectInterruptedCheckout(runId);
-        return {
-          preconditions: inspected.preconditions,
-          perform: async (dryRun) => {
-            if (dryRun) return { changes: 1, evidence: inspected.move };
-            // Verified again, synchronously, by the move itself: this plan was made before an await.
-            const preserved = recovery.preserveInterruptedCheckout(runId, inspected.move);
-            if (!preserved.allowed) return { changes: 0, evidence: preserved.evidence, refusal: preserved as Decision<never> };
-            return { changes: 1, evidence: preserved.value };
-          },
-        };
-      }
       case "release_bootstrap_reservation": {
         const recovery = this.#bootstrapRecovery;
         const runId = request.runId ?? null;
@@ -614,14 +577,10 @@ interface RepairPlan {
   perform(dryRun: boolean): Promise<{ changes: number; evidence: unknown; refusal?: Decision<never> }>;
 }
 
-/** #246 C3 — the bootstrap runner's interrupted-checkout recovery, as the repair catalog uses it. */
+/** #246 C3 — the bootstrap runner's reservation release, as the repair catalog uses it. */
 export type BootstrapCheckoutRecoveryPort = Pick<
   RepoFactoryBootstrapRunner,
-  | "inspectInterruptedCheckout"
-  | "preserveInterruptedCheckout"
-  | "inspectReservationRelease"
-  | "releaseReservation"
-  | "recordReleaseInDoubt"
+  "inspectReservationRelease" | "releaseReservation" | "recordReleaseInDoubt"
 >;
 
 const checked = (precondition: string, satisfied: boolean, evidence: unknown): RepairReceipt["preconditionsChecked"][number] => ({
