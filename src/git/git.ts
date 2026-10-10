@@ -239,9 +239,10 @@ export const remoteUrl = async (cwd: string, remote = "origin"): Promise<string 
 };
 
 /**
- * Options that keep one git invocation from running a program the repository's configuration
- * names, and from reading replaced objects (#1082 R1-01). Every git read that prepares or judges a
- * candidate for verification takes them.
+ * Options that keep one git invocation from running the programs listed below, and from reading
+ * replaced objects (#1082 R1-01). Every git read that prepares or judges a candidate for
+ * verification takes them. The claim is exactly this list, each item measured against a real
+ * program; it is not a claim that no other git setting can select a program.
  *
  * - `--no-replace-objects`: the objects the candidate commit actually names. A replace ref changes
  *   what a local read returns and nothing else.
@@ -257,8 +258,10 @@ export const remoteUrl = async (cwd: string, remote = "origin"): Promise<string 
  * - `core.fsmonitor=false`: the fsmonitor hook is a program the configuration names.
  * - `core.hooksPath=/dev/null`: `git status` writes the index and so runs `post-index-change`.
  *
- * Status reads also pass `--ignore-submodules=dirty`: otherwise git runs `git status` inside every
- * populated submodule with that repository's own configuration, which none of the above reaches.
+ * These reach the repository git is run in and nothing nested in it. Status reads therefore also
+ * pass `--ignore-submodules=dirty`: otherwise git runs `git status` inside every populated
+ * submodule with that repository's own configuration, and that repository's fsmonitor and hooks
+ * run -- measured. Patch reads pass `PATCH_WITHOUT_PROGRAMS` for the same reason.
  */
 export const withoutRepositoryPrograms = async (cwd: string): Promise<string[]> => {
   const listed = await git(cwd, ["config", "--name-only", "--get-regexp", "^filter\\."], { allowFailure: true });
@@ -302,15 +305,28 @@ export const mergeBase = async (cwd: string, a: string, b: string): Promise<stri
   return out.exitCode === 0 ? out.stdout.trim() : null;
 };
 
+/**
+ * Options every diff of a candidate takes (#1082 R1-01), so the patch is the stored bytes and no
+ * program renders it.
+ *
+ * - `--no-ext-diff`: `diff.external`, or a `diff=<driver>` attribute's `command`, would run.
+ * - `--no-textconv`: a `diff=<driver>` attribute the candidate commits selects the textconv program
+ *   the repository's configuration names.
+ * - `--submodule=short`: a changed gitlink is one `Subproject commit` line. A repository's
+ *   `diff.submodule=diff` otherwise makes git diff the populated nested repository's two commits
+ *   in a child git that reads the nested repository's own configuration, and neither option above
+ *   reaches that child. Measured: the nested repository's textconv and `diff.external` programs
+ *   both ran through `diffDigest`, and neither runs with this option. `short` is git's default,
+ *   so a repository without that setting digests the same bytes as before.
+ */
+const PATCH_WITHOUT_PROGRAMS = ["--no-ext-diff", "--no-textconv", "--submodule=short"] as const;
+
 /** Stable digest of the exact patch between two commits. */
 export const diffDigest = async (cwd: string, base: string, head: string): Promise<string> => {
   const out = await git(cwd, [
     "diff",
     "--no-color",
-    "--no-ext-diff",
-    // A `diff=<driver>` attribute the candidate commits selects a textconv program the
-    // repository's configuration names; the patch is the stored bytes, not a program's view.
-    "--no-textconv",
+    ...PATCH_WITHOUT_PROGRAMS,
     "--full-index",
     "--binary",
     `${base}..${head}`,
@@ -319,15 +335,21 @@ export const diffDigest = async (cwd: string, base: string, head: string): Promi
 };
 
 export const diffText = async (cwd: string, base: string, head: string): Promise<string> =>
-  (await git(cwd, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--full-index", `${base}..${head}`]))
+  (await git(cwd, ["diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", `${base}..${head}`]))
     .stdout;
 
+/**
+ * The paths a candidate changes. `--name-only` renders no patch, so the options that keep a patch
+ * read from running programs have nothing to act on here -- measured, a nested repository's
+ * `diff.external` and textconv did not run through this read without them. They are passed anyway
+ * so the read does not depend on that.
+ */
 export const changedPaths = async (
   cwd: string,
   base: string,
   head: string,
 ): Promise<string[]> => {
-  const out = await git(cwd, ["diff", "--name-only", `${base}..${head}`]);
+  const out = await git(cwd, ["diff", "--name-only", ...PATCH_WITHOUT_PROGRAMS, `${base}..${head}`]);
   return out.stdout.split("\n").map((l) => l.trim()).filter(Boolean).sort();
 };
 

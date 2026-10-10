@@ -269,9 +269,9 @@ export class VerificationEngine {
    * runs. Only commands that run locally carry gate entries -- LOCAL_COMMAND, and BOTH_REQUIRED,
    * whose CI evidence is collected in addition to a checked local run. The manifest refuses a gate
    * entry on a TRUSTED_CI-only command, because CI runs it where neither check can reach. The
-   * source checkout itself is read under `withoutRepositoryPrograms`, so freshness runs nothing the
-   * repository or the candidate selects. Post-merge verification and its cached receipts do not
-   * repeat either check.
+   * source checkout itself is read under `withoutRepositoryPrograms`, so freshness runs none of the
+   * programs that function lists, measured one by one -- not a claim about every git setting.
+   * Post-merge verification and its cached receipts do not repeat either check.
    *
    * Obligations follow the selected procedure and the run's participants, not the manifest as a
    * whole: a command that is not selected, or whose repository is not in the run, holds the run

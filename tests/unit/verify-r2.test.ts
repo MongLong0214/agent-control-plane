@@ -1291,6 +1291,43 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     expect(verified).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
   });
 
+  it("RF-S22 arm:validator #1082 R1-01: a populated submodule's own textconv and external diff never run while the candidate is frozen or verified", async () => {
+    // The freeze digests the patch between base and candidate. With `diff.submodule=diff`, a moved
+    // gitlink is rendered by a child git reading the nested repository's own configuration, which
+    // `--no-textconv` and `--no-ext-diff` do not reach (round-3 review, 1082-R1-01).
+    const programs = tempDir("acp-submodule-diff-");
+    const counter = join(programs, "executions");
+    const program = join(programs, "program.sh");
+    writeFileSync(program, `echo "$*" >> '${counter}'\n[ -f "$2" ] && cat "$2" || cat\n`);
+    const nestedOf = (repo: string): string => join(repo, "vendor", "nested");
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: (repo) => {
+        commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER })(repo);
+        // A nested repository recorded as a gitlink on the base branch and left populated.
+        gitSync(repo, ["init", "-q", "vendor/nested"]);
+        writeFiles(nestedOf(repo), { "data.txt": "old\n", ".gitattributes": "data.txt diff=inner\n" });
+        commitAll(nestedOf(repo), "nested base");
+        commitAll(repo, "record the nested repository");
+      },
+      // The candidate moves the gitlink to a new nested commit.
+      candidateChange: (repo) => {
+        writeFiles(nestedOf(repo), { "data.txt": "new\n" });
+        commitAll(nestedOf(repo), "nested candidate");
+      },
+      beforeFreeze: (repo) => {
+        gitSync(nestedOf(repo), ["config", "diff.external", `sh '${program}' external`]);
+        gitSync(nestedOf(repo), ["config", "diff.inner.textconv", `sh '${program}' textconv`]);
+        gitSync(repo, ["config", "diff.submodule", "diff"]);
+      },
+    });
+    expect(candidate.snapshot.repositories[0]!.touchedPaths).toContain("vendor/nested");
+    const { executed } = await verifyObservingGate(candidate);
+    const ran = existsSync(counter) ? readFileSync(counter, "utf8").split("\n").filter(Boolean) : [];
+    expect(ran, "nested-configuration program executions").toEqual([]);
+    expect(executed).toEqual([GATE_ENTRY]);
+  });
+
   it("RF-S22 arm:validator #1082: a gate that preparation writes differently from its pin is refused before it runs", async () => {
     // The object check passes: the committed blob is the pinned one. The checkout then converts
     // it, so the bytes the command would execute are not the pinned bytes.
