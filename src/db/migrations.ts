@@ -3169,6 +3169,7 @@ const V44_MANIFEST_ACTIVATION_TRIGGER_NAMES: readonly string[] = [
   "manifest_activation_grants_immutable",
   "manifest_activation_grants_consumed_once",
   "manifest_activation_grants_no_delete",
+  "projects_no_replace",
   "projects_active_manifest_moves_by_grant",
   "runs_contract_change_completes_activated",
 ];
@@ -3180,9 +3181,10 @@ const V44_MANIFEST_ACTIVATION_TRIGGER_NAMES: readonly string[] = [
  * existing project's active manifest: the one caller of `activateManifest` could never satisfy it, and
  * the only APPROVAL row its reader accepted was one written with raw SQL.
  *
- * Additive: one new table and its five guards, and two guards over existing tables — `projects`, whose
- * active manifest now moves only with a consumed grant naming the move, and `runs`, whose CONTRACT_CHANGE
- * rows complete only with their own grant consumed. No existing row is touched and there is no backfill:
+ * Additive: one new table and its five guards, and three guards over existing tables — `projects`, whose
+ * active manifest now moves only with a consumed grant naming the move and whose rows are never replaced
+ * (REPLACE would rewrite the pointer with no UPDATE), and `runs`, whose CONTRACT_CHANGE rows complete only
+ * with their own grant consumed. No existing row is touched and there is no backfill:
  * a CONTRACT_CHANGE run confirmed before this has no grant, cannot complete, and is listed by doctor; its
  * artifacts are kept. A chain test can build a v43 image out of a current database, which already has
  * the table; it is accepted only with schema.sql's exact shape and no row, never repaired, as v43 does.
@@ -3435,6 +3437,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "manifest_activation_grants_immutable", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 44 },
   { name: "manifest_activation_grants_consumed_once", sentinel: "MANIFEST_GRANT_CONSUMED", introducedIn: 44 },
   { name: "manifest_activation_grants_no_delete", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 44 },
+  { name: "projects_no_replace", sentinel: "PROJECT_NO_REPLACE", introducedIn: 44 },
   { name: "projects_active_manifest_moves_by_grant", sentinel: "MANIFEST_ACTIVATION_AUTHORITY_DENIED", introducedIn: 44 },
   { name: "runs_contract_change_completes_activated", sentinel: "CONTRACT_CHANGE_NOT_ACTIVATED", introducedIn: 44 },
 ];

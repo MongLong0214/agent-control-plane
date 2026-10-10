@@ -1550,6 +1550,15 @@ BEGIN
   SELECT RAISE(ABORT, 'MANIFEST_GRANT_IMMUTABLE');
 END;
 
+-- CP-HI-06 — #246 B2-b: the pointer guard below watches UPDATE, and REPLACE rewrites a row by its key
+-- without one, so a project row is never replaced.
+CREATE TRIGGER IF NOT EXISTS projects_no_replace
+BEFORE INSERT ON projects
+WHEN EXISTS (SELECT 1 FROM projects WHERE project_id = NEW.project_id)
+BEGIN
+  SELECT RAISE(ABORT, 'PROJECT_NO_REPLACE');
+END;
+
 -- CP-HI-03 — #246 B2-b: a project's active manifest moves only by a consumed grant that names exactly
 -- this move, which is what the activation transaction writes before it moves the pointer. Registering
 -- a project inserts its first manifest and is not an update.

@@ -1478,6 +1478,7 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   // #246 B2-b — a manifest activation grant is one per run, fixed once written, consumed once; the
   // project's pointer moves only with a consumed grant, and a CONTRACT_CHANGE completes only with its own.
   MANIFEST_GRANT_NO_REPLACE: ReasonCode.CONFLICT,
+  PROJECT_NO_REPLACE: ReasonCode.CONFLICT,
   MANIFEST_GRANT_IMMUTABLE: ReasonCode.CONFLICT,
   MANIFEST_GRANT_CONSUMED: ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED,
   MANIFEST_ACTIVATION_AUTHORITY_DENIED: ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_DENIED,
