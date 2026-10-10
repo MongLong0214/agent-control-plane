@@ -535,6 +535,36 @@ export const ReasonCode = {
    */
   BUZZ_MENTION_PRECEDES_BINDING: "BUZZ_MENTION_PRECEDES_BINDING",
 
+  // --- #246 owner approval of a bootstrap's GitHub writes by a Buzz reply ----
+  /**
+   * An envelope whose text carries the owner-approval marker, in any spelling, reached the message
+   * seam. Approval replies are judged only by their Nostr signature, on the subscriber's approval
+   * route; the seam's relay-attested envelopes can neither approve nor be delivered as work.
+   */
+  BUZZ_OWNER_APPROVAL_NOT_A_MESSAGE: "BUZZ_OWNER_APPROVAL_NOT_A_MESSAGE",
+  /** The approval event's verified signer is not a declared `buzz` owner key. Nothing is written. */
+  BUZZ_APPROVAL_NOT_OWNER: "BUZZ_APPROVAL_NOT_OWNER",
+  /** The event carries the approval marker but not exactly one well-formed token and nothing else like it. */
+  BUZZ_APPROVAL_MALFORMED: "BUZZ_APPROVAL_MALFORMED",
+  /** No single reply reference names a stored approval prompt. */
+  BUZZ_APPROVAL_PROMPT_UNRESOLVED: "BUZZ_APPROVAL_PROMPT_UNRESOLVED",
+  /** The reply's room, or the identity that received it, is not the prompt's. */
+  BUZZ_APPROVAL_PROMPT_WRONG_ROOM: "BUZZ_APPROVAL_PROMPT_WRONG_ROOM",
+  /** The token's code is not the code of the prompt the reply references. */
+  BUZZ_APPROVAL_PROMPT_CODE_MISMATCH: "BUZZ_APPROVAL_PROMPT_CODE_MISMATCH",
+  /** The prompt was cancelled: its run left review, its scope changed, or it was re-issued. */
+  BUZZ_APPROVAL_PROMPT_CANCELLED: "BUZZ_APPROVAL_PROMPT_CANCELLED",
+  /** The prompt already holds a different answer; a prompt is answered once. */
+  BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED: "BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED",
+  /** The prompt's server-stored expiry has passed, or the reply was signed before the prompt existed. */
+  BUZZ_APPROVAL_PROMPT_EXPIRED: "BUZZ_APPROVAL_PROMPT_EXPIRED",
+  /** The run's current approval scope is no longer the one the prompt binds; the evidence names the field. */
+  BUZZ_APPROVAL_PROMPT_STALE: "BUZZ_APPROVAL_PROMPT_STALE",
+  /** The run is not awaiting an owner decision on this scope, so nothing is minted. */
+  BUZZ_APPROVAL_RUN_NOT_AWAITING_APPROVAL: "BUZZ_APPROVAL_RUN_NOT_AWAITING_APPROVAL",
+  /** No prompt can be posted now: the approval identity is unset, not admitted, not held or not connected. */
+  BUZZ_APPROVAL_IDENTITY_UNAVAILABLE: "BUZZ_APPROVAL_IDENTITY_UNAVAILABLE",
+
   // --- canonical turns -----------------------------------------------------
   /**
    * No verified target binding exists for this actor, so no turn can be claimed for it.
@@ -942,6 +972,7 @@ export const isReasonCode = (value: string): value is ReasonCode => ALL.has(valu
  */
 export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.BINDING_GENERATION_STALE,
+  ReasonCode.BUZZ_APPROVAL_PROMPT_STALE,
   ReasonCode.BUZZ_PEER_GENERATION_STALE,
   ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
   ReasonCode.CAPACITY_SENSOR_FILE_STALE,
