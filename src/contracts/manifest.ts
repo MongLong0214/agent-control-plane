@@ -133,12 +133,12 @@ export const projectManifestSchema = z
      * refusal code `GATE_ENTRY_MODULE_FORMAT_UNPINNED`; nothing is renamed or loaded another way on
      * the producer's behalf.
      *
-     * A declared file is reached by a path its loader's pinned bytes name, relative to it. The
-     * package.json Node consults for a declared file -- the nearest one at or above its directory --
-     * must define none of `imports`, `exports` and `main`, or verification refuses CONTRACT_UNVERIFIED
-     * before anything runs: those fields let package configuration, not pinned bytes, choose which
-     * file a `#name`, self-reference or directory specifier loads (round 4). A project whose root
-     * package.json defines them puts a package.json without them beside its gate files.
+     * A gate command runs under ACP's loader (verify/gate-resolution-hook.ts, round 5): in-process
+     * it may load only its declared files, each by a relative path that names the file exactly, and
+     * node builtins other than `worker_threads`. A `#name`, a bare specifier, a directory, extension
+     * probing, candidate code and dependencies are all refused at load, so the gate fails rather
+     * than letting package configuration or candidate code choose what decides. A gate judges the
+     * candidate by reading its files as data. That is what "self-contained" below means.
      *
      * `.optional()` with no default is load-bearing. `manifestDigest` digests the parsed object,
      * so a defaulted `[]` would change the digest of every manifest written before this field
@@ -150,12 +150,10 @@ export const projectManifestSchema = z
      *
      * Only declared files are bound. Nothing is discovered from workflow YAML or followed
      * through imports, and project code, tests and dependencies stay the candidate's (§14.2).
-     * A helper an entry imports for its decision is outside the guarantee until it is declared
-     * too; an entry that loads any undeclared candidate file in-process can be short-circuited
-     * through that file, so a gate entry means something only when it is self-contained. The
-     * same holds for a program the entry runs by name: the sandbox PATH lists the worktree, so a
-     * name can resolve to a file the candidate commits. A bare specifier resolves through the
-     * candidate's node_modules, which is the candidate's dependency tree and is not bound either.
+     * A helper an entry imports for its decision must be declared too: an undeclared one is now
+     * refused at load rather than trusted. Files a gate reads as data, and a program it runs by
+     * name -- the sandbox PATH lists the worktree, though the sandbox also refuses every spawn --
+     * are the gate's own business, not bound by this field.
      */
     gateEntries: z
       .array(

@@ -11,8 +11,8 @@ import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunRow } from "../domain/types.ts";
 import { git } from "../git/git.ts";
-import { type Stats, lstatSync, readFileSync } from "node:fs";
-import { join, posix } from "node:path";
+import { type Stats, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
@@ -23,6 +23,7 @@ import {
   verifySnapshotFreshness,
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
+import { gateResolutionPreload } from "./gate-resolution-hook.ts";
 import { type SandboxEnforcement, runSandboxed } from "./sandbox.ts";
 import type { WorktreeAuthorization, WorktreeManager } from "./worktree.ts";
 
@@ -122,16 +123,6 @@ const REGULAR_FILE_MODES = new Set(["100644", "100755"]);
  * invalid byte in the same place.
  */
 const gateEntryAt = async (checkoutPath: string, head: string, path: string): Promise<GateEntryObservation> => {
-  const read = await committedFileAt(checkoutPath, head, path);
-  return read.state === "FILE" ? { state: "FILE", digest: sha256(read.bytes) } : read;
-};
-
-/** `gateEntryAt`'s read, returning the exact committed bytes rather than their digest. */
-const committedFileAt = async (
-  checkoutPath: string,
-  head: string,
-  path: string,
-): Promise<Exclude<GateEntryObservation, { state: "FILE" }> | { state: "FILE"; bytes: Buffer }> => {
   const listed = await git(
     checkoutPath,
     ["--no-replace-objects", "ls-tree", "-z", "--full-tree", head, "--", path],
@@ -164,75 +155,10 @@ const committedFileAt = async (
       detail: "the file's bytes could not be read exactly: it is not UTF-8 text, or its object is unreadable",
     };
   }
-  return { state: "FILE", bytes };
+  return { state: "FILE", digest: sha256(bytes) };
 };
 
 type GateEntry = NonNullable<ProjectManifest["gateEntries"]>[number];
-
-/**
- * The package.json fields that let package configuration, rather than a declared file's pinned
- * bytes, choose which file a specifier loads: `imports` (a `#name` specifier), `exports` (a
- * package's own name, through self-reference) and `main` (a directory specifier).
- */
-const RESOLUTION_FIELDS = ["imports", "exports", "main"] as const;
-
-/**
- * RF-S22 (#1082 R1-02, round 4) — the refusal a declared gate file earns when the package.json
- * Node consults for it lets package configuration choose what it loads, or null.
- *
- * Node looks a file's package scope up as the nearest package.json at or above its directory, and
- * reads `imports` and self-reference `exports` from that one only -- measured on Node 24.18 and
- * 22.23: with a `{}` package.json beside the gate, `#decide` and a self-reference both stopped
- * resolving while the root's map still named them. A closure review's counterexample left the gate
- * and its declared helper unchanged and changed only the candidate's `imports` map, and the gate's
- * `require('#decide')` loaded a new bypass file instead. So such a route is refused outright,
- * whether the map is unchanged or not: nothing here compares against a reference, so a candidate
- * has no hash to declare, and no package.json outside a declared file's own scope is frozen.
- *
- * Read from git objects at the candidate head, before anything is prepared. The worktree is a
- * checkout of that commit with every filter emptied, and the conversions that remain (line endings,
- * `ident`, a working-tree encoding) cannot add a field to JSON; one that makes the file unreadable
- * fails node's own read, so the gate fails rather than passes.
- */
-const resolutionScopeRefusal = async (
-  checkoutPath: string,
-  head: string,
-  path: string,
-  evidence: Record<string, unknown>,
-): Promise<Decision<never> | null> => {
-  for (let dir = posix.dirname(path); ; dir = posix.dirname(dir)) {
-    const packageJson = dir === "." ? "package.json" : `${dir}/package.json`;
-    const read = await committedFileAt(checkoutPath, head, packageJson);
-    if (read.state !== "ABSENT") {
-      const base = { ...evidence, path, packageJson };
-      if (read.state !== "FILE") {
-        return deny(ReasonCode.CONTRACT_UNVERIFIED, "the package.json node consults for a gate file is not a readable file", {
-          ...base,
-          observedState: read.state,
-        });
-      }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(read.bytes.toString("utf8"));
-      } catch {
-        parsed = undefined;
-      }
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-        return deny(ReasonCode.CONTRACT_UNVERIFIED, "the package.json node consults for a gate file is not a JSON object", base);
-      }
-      const fields = RESOLUTION_FIELDS.filter((field) => Object.hasOwn(parsed as object, field));
-      if (fields.length > 0) {
-        return deny(
-          ReasonCode.CONTRACT_UNVERIFIED,
-          "the package.json node consults for a gate file lets package configuration choose what it loads",
-          { ...base, fields },
-        );
-      }
-      return null;
-    }
-    if (dir === ".") return null;
-  }
-};
 
 /**
  * Reads one gate entry as the command about to run will find it: the file in the materialised
@@ -364,10 +290,9 @@ export class VerificationEngine {
    *
    * A pinned manifest that declares no entries passes this check vacuously. That is not RF-S22
    * compliance — none of its gate logic is pinned — and nothing here or in the report says
-   * otherwise. Only declared files are bound: a helper an entry imports, or any other candidate
-   * file it loads in-process, is outside the guarantee until it is declared as well. Each declared
-   * file's package scope is checked here too (`resolutionScopeRefusal`), so package configuration
-   * cannot choose which file a declared file's specifier loads.
+   * otherwise. Only declared files are bound, and they are the only files a gate command may load
+   * in-process: `runLocal` launches it under ACP's loader (gate-resolution-hook.ts), which refuses
+   * any other module, so an undeclared helper or candidate code fails the gate rather than deciding it.
    */
   private async pinnedGateEntriesHold(
     runId: string,
@@ -381,10 +306,13 @@ export class VerificationEngine {
       const record = repo ? this.repositories.byIdentity(repo.identity) : null;
       if (!repo || !record) continue;
       for (const entry of obligations.get(command.id) ?? []) {
-        const evidence = { runId, commandId: command.id, identity: repo.identity, candidateHead: repo.candidateHead, checkedIn: "GIT_OBJECTS" };
         const observed = await gateEntryAt(record.checkoutPath, repo.candidateHead, entry.path);
-        const refused = gateEntryRefusal(observed, entry, evidence, "at the candidate head")
-          ?? await resolutionScopeRefusal(record.checkoutPath, repo.candidateHead, entry.path, evidence);
+        const refused = gateEntryRefusal(
+          observed,
+          entry,
+          { runId, commandId: command.id, identity: repo.identity, candidateHead: repo.candidateHead, checkedIn: "GIT_OBJECTS" },
+          "at the candidate head",
+        );
         if (refused) return refused;
       }
     }
@@ -826,8 +754,20 @@ export class VerificationEngine {
         if (gateRefusal) break;
       }
       if (gateRefusal) return gateRefusal;
+      const worktreeRoot = realpathSync(worktree.path);
       outcome = await runSandboxed({
-        command,
+        // RF-S22 (#1082 R1-02, round 5) -- a command that runs a gate entry runs under ACP's loader,
+        // which lets it load only its declared gate files, by the relative paths that name them,
+        // and node builtins. The manifest admitted no option before the entry, so ACP's is the only
+        // one. See gate-resolution-hook.ts.
+        command: gateEntries.length === 0 ? command : {
+          ...command,
+          argv: [
+            command.argv[0]!,
+            gateResolutionPreload(gateEntries.map((entry) => join(worktreeRoot, ...entry.path.split("/")))),
+            ...command.argv.slice(1),
+          ],
+        },
         worktreePath: worktree.path,
         // §33.3 — the control plane's own secret store and state must be unreadable to a
         // candidate, as must every other checkout on this machine.

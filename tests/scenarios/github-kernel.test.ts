@@ -2581,10 +2581,11 @@ describe("trusted CI evidence (CP-S29)", () => {
    * always `success` from the approved workflow digest, which is exactly what a workflow running a
    * gate the candidate rewrote would report.
    */
+  // Reads the candidate's code as data: under ACP's loader a gate cannot load it (#1082 R1-02, round 5).
   const GATE_SCRIPT = [
-    "import { createRequire } from 'node:module';",
-    "const app = createRequire(import.meta.url)('../src/app.js');",
-    "if (app() !== 2) { console.error('gate: app() must return 2'); process.exit(1); }",
+    "import { readFileSync } from 'node:fs';",
+    "const source = readFileSync(new URL('../src/app.js', import.meta.url), 'utf8');",
+    "if (!/=>\\s*2\\b/.test(source)) { console.error('gate: app() must return 2'); process.exit(1); }",
     "",
   ].join("\n");
   const GATE_CI_COMMANDS = [
@@ -2693,9 +2694,8 @@ describe("trusted CI evidence (CP-S29)", () => {
    * project has a primary and a secondary repository, each with a gate its own command runs.
    */
   const SECONDARY_GATE = [
-    "import { createRequire } from 'node:module';",
-    "const app = createRequire(import.meta.url)('./src/app.js');",
-    "if (app() !== 2) process.exit(1);",
+    "import { readFileSync } from 'node:fs';",
+    "if (!/=>\\s*2\\b/.test(readFileSync(new URL('./src/app.js', import.meta.url), 'utf8'))) process.exit(1);",
     "",
   ].join("\n");
   const participation = async (options: { selected: string[]; secondaryInRun: boolean }) => {
