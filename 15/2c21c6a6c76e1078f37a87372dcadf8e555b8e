@@ -1,0 +1,101 @@
+Limit: a manifest with no gateEntries is not RF-S22 compliant: none of its gate logic is pinned, and the absence is never reported as a pass
+Limit: only declared files are bound; a helper an entry imports, or any other undeclared candidate file it loads in-process, can short-circuit the gate until it is declared too
+Limit: a gate entry must be UTF-8 text: git output reaches the engine decoded as UTF-8, so an entry whose bytes cannot be read exactly is refused CONTRACT_UNVERIFIED instead of being compared
+Ruled-out: reading a gate entry from a verification worktree | the comparison reads git objects at the exact candidate head before any worktree or sandbox exists
+Warn: a legitimate edit to a gate entry is a contract change: the run carrying it is judged by the current pin and refused, and the new digest applies only after that contract is approved and activated
+Warn: src/contracts/manifest.ts is a repo-factory contract entryPoint, so the repo-factory contract lock must advance once this merges
+Unverified: the exact-path filter on the ls-tree output has no witness: taking the first listed entry instead leaves every RF-S22 case green, since a portable path lists one entry
+Record-Id: r-pingateentries
+Provenance: inherited 74bd0c8c26faab018aad3ba85f352efb33d68e92
+
+Ruled-out: reproducing a replaced candidate in a linked verification worktree | it materialised a replacement tree, with a different gate script, under the candidate's own SHA
+Warn: LFS content is no longer fetched into a linked verification worktree: every configured filter driver is emptied during preparation, so a command sees the pointer files
+Record-Id: r-preparegateunreplaced
+Provenance: inherited a7dd57de7605f55bd5d842aff791378e61a11f31
+
+Limit: for TRUSTED_CI the gate check binds the committed bytes at the exact head the evidence reports and runs before the evidence is accepted, not before CI ran; what CI's own checkout made of those bytes is not observed
+Limit: post-merge verification and its cached receipts do not repeat either gate check
+Limit: a writer that reaches a gate command's worktree from outside its confinement can still change the file between the materialised check and the exec; the window is narrowed, not closed
+Limit: a TRUSTED_CI command's argv is ACP's statement of what the approved workflow runs; ACP does not parse the workflow, so a workflow run line that goes through a package script is not reached by the direct-invocation binding
+Limit: a declared helper is trusted to be loaded by a path its root's pinned bytes name; a loader that resolves it through candidate configuration such as a package.json imports map is not bound
+Ruled-out: accepting a gate entry that a pinned command reaches through a package script or option | the candidate can re-point that selection configuration without touching the entry
+Unverified: the ordering witness models a writer reaching the gate command's worktree after preparation with a spy; no earlier command was made to escape confinement
+Record-Id: r-gatewhereitruns
+Follows: r-pingateentries
+Provenance: inherited 1b5ac65181bbdfa5e826b90cf7e996add7702720
+
+Limit: a checkout reset onto a replace ref is not clean when read unreplaced, so such a candidate is now refused by snapshot freshness rather than reaching preparation
+Warn: in a repository that uses LFS, a source file whose stat information is stale is compared raw against its pointer under the program-free status and reads as modified, so its candidate can be refused SNAPSHOT_STALE; verification worktrees keep LFS pointers
+Warn: isClean no longer counts dirt inside a populated submodule's own working tree; a submodule whose checked-out commit differs from the recorded one still counts
+Record-Id: r-sourcereadnoprograms
+Follows: r-preparegateunreplaced
+Provenance: inherited 5c945c9dbd0eb885e80e7b07036cc2b03500514b
+
+Limit: the validator arm binds local execution only: a gate entry on a TRUSTED_CI-only command is refused, and BOTH_REQUIRED is admitted because its local run is checked
+Limit: node is the only admitted gate launcher; python3 and deno are left out because CPython can run an unchecked hash-based .pyc in place of a declared helper and Deno resolves imports through a deno.json the candidate can commit
+Limit: a program a gate runs by name can resolve to a file the candidate commits, because the sandbox PATH lists the worktree
+Ruled-out: requiring the approved workflow to carry a run line equal to the pinned argv | it binds the line, not what ran before it in the same job, where a dependency install's lifecycle scripts or a local action can rewrite the entry
+Record-Id: r-gatelaunchlocalonly
+Follows: r-gatewhereitruns
+Provenance: inherited 7e21e43c311249c1961d8d1dcc69d369f2c3af83
+
+Limit: the review path's own reviewer diff text (src/review/blind-review.ts) still honours the repository's textconv and diff.submodule; it is not on the snapshot, verification, freshness or doctor paths this change sweeps
+Limit: the claim is the measured list -- filter drivers, fsmonitor, hooks, replace objects, textconv, external diff and the nested diff -- not that no git setting can select a program
+Ruled-out: passing --no-textconv and --no-ext-diff through to the nested git | git offers no option that reaches the child it starts for diff.submodule=diff, so the route is closed by not taking it rather than by guarding it
+Warn: a snapshot frozen before this change in a repository with diff.submodule=diff and a moved gitlink digests differently now, so its blind review refuses it EVIDENCE_STALE and it has to be frozen again
+Record-Id: r-patchreadshortsubmodule
+Follows: r-sourcereadnoprograms
+Provenance: inherited 8549fb6cab4531c7b117fb4977697b3826b7815c
+
+Limit: the bound is a logical budget: no process is started once it is spent and a settlement after it is GIT_TIMEOUT, but how promptly the operating system delivers the kill and the answer is not bounded, so a 20ms request takes as long as the kill takes to land
+Limit: only isClean's pair shares one deadline; the verification checkout's source read (tryRevParse, discovery, status) still gives each process its own bound
+Ruled-out: passing the caller's timeoutMs to discovery and again to status | the pair could then take twice the budget the doctor allotted, the overrun the review measured one step smaller, rather than the one bound the caller asked for
+Warn: git() now refuses any settlement at or after its bound as GIT_TIMEOUT, including an exit 0 and a numeric exit under allowFailure, so a caller that used to read a slow git's late exit code gets a refusal instead
+Record-Id: r-cleanprobeonedeadline
+Follows: r-sourcereadnoprograms
+Provenance: inherited 299f9d80299021f8740000b8fb601dd28a47af0b
+
+Limit: an explicit extension fixes the module format, not resolution through candidate configuration: a helper loaded by an #imports specifier or a bare package name is still outside the guarantee
+Limit: the refusal code is carried on the manifest issue under INVALID_ARGUMENT, not as a new top-level reason code
+Limit: verification reads a stored manifest without re-validating it, so a manifest stored with a .js entry before this change would still be byte-checked and run; gateEntries has not merged, so none exists outside a development database
+Ruled-out: binding the candidate's package.json type into the pin | node takes the nearest package.json of each file, which can sit in any directory up to and beyond the worktree, and with no type it decides by the file's syntax, so the pin would cover a search and a detection rule rather than a field, instead of the one extension the manifest already names
+Warn: a producer that declares gateEntries must rename .js gate files to .mjs or .cjs and re-pin their digests; repo-factory advances governance/acp-contract.lock.json through CONTRACT_CHANGE once this merges
+Record-Id: r-gateentrymoduleformat
+Follows: r-gatelaunchlocalonly
+Provenance: inherited cf30ecd6a98b872b2e7c9b7f5235aa2db780f32f
+
+Limit: a reviewer diff now matches the frozen patch byte for byte; in a repository with diff.submodule=diff the reviewer sees one Subproject commit line per moved gitlink, not the nested repository's changes
+Warn: a repository with diff.submodule=diff and a moved gitlink, or with a textconv driver on a touched file, gets a different reviewer prompt; a binary file textconv used to render as text now adds a git-binary-patch artifact to the packet, and a binary file inside a nested repository no longer produces the section that was refused EVIDENCE_MISSING; packets already stored are not recomputed
+Record-Id: r-reviewdiffisfrozenpatch
+Follows: r-patchreadshortsubmodule
+Provenance: inherited ddb383a32867a1a82a560fa537cb319598bfd903
+
+Limit: the bound is logical; a gap after the launch instant, between the sample and the kernel's spawn, is not observable here, and a settlement that the kill races is judged only once it is delivered
+Ruled-out: carrying only the pre-check sample into the spawn | a gap between that sample and the launch would again be budget the deadline never granted, rather than one instant both the bound and the launch are read from
+Record-Id: r-absolutedeadline
+Follows: r-cleanprobeonedeadline
+Provenance: inherited 09c0739098e8040719d716a213fefa1dcc73c48c
+
+Limit: a declared file reached through a bare specifier or a directory whose package.json lies outside every declared file's scope still resolves through candidate files; declared helpers are bound when their loader names them by a relative path
+Limit: a project whose root package.json defines imports, exports or main must put a package.json without them beside its gate files, or every run is refused CONTRACT_UNVERIFIED
+Ruled-out: byte-comparing the scope package.json files with the run's base revision | a candidate could then never change them through ACP, not even after a CONTRACT_CHANGE, because the base rather than the contract would be the reference, whereas refusing the route freezes nothing
+Warn: the reviewer's .mjs and .cjs helper controls now split: a package.json type flip and sibling files still run the pinned helper, while a package.json carrying imports or exports in the gate's scope is refused before anything runs
+Record-Id: r-gatefileresolution
+Follows: r-gateentrymoduleformat
+Provenance: inherited 9ef86758ad10ff8477c9b14751ec50f3ce2becef
+
+Limit: a string-code failure that lands after the bound is reported as GIT_TIMEOUT, so its own code (maxBuffer, ENOENT) is no longer in the evidence of a late settlement
+Record-Id: r-everysettlementdeadline
+Follows: r-absolutedeadline
+Provenance: inherited 235e5e63e82b30c399baba884c882438a2e645d3
+
+Limit: a gate can no longer load candidate code, tests or dependencies in-process, and the sandbox refuses every spawn, so a gate judges the candidate by reading its files as data; a protected repo-factory gate that requires project code or a package must be rewritten
+Limit: refusal happens at load inside the run, so the verdict is FAIL with ACP_GATE_RESOLUTION_REFUSED on stderr, not a refusal before anything runs
+Limit: files a gate reads as data, and candidate text it evaluates itself with vm or eval, are the gate's own decision inputs and are not bound
+Limit: module.registerHooks needs node 22.15 or later; an older node fails the loader and the gate, it never runs unhooked
+Ruled-out: admitting any declared file as a resolution target | a candidate could then re-point a map or a package main from one declared file to another declared file, instead of the file the pinned bytes name
+Ruled-out: keeping the nearest-package.json refusal beside the loader | the loader refuses every route it guarded, and it refused gates for root package.json fields they never used, rather than for what they loaded
+Warn: gates committed against the previous contract that require ../src/app.js or a dependency now fail; they must read candidate files as data
+Record-Id: r-gateloader
+Follows: r-gatefileresolution
+Provenance: inherited 05db7112dfce75e98e2951dc3327126015422aee
