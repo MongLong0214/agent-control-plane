@@ -408,7 +408,7 @@ describe("a Buzz mention signed before its role's binding generation", () => {
     }
   });
 
-  it("is refused again on every redelivery without a reconnect, and the window moves past it", async () => {
+  it("is refused once and not submitted again on a redelivery without a reconnect, and the window moves past it", async () => {
     const f = await start();
     try {
       const old = f.mention(f.owner, HISTORY_SECONDS, "@cto-lpm 점검. 정확히 ALIVE 만 답해");
@@ -419,7 +419,10 @@ describe("a Buzz mention signed before its role's binding generation", () => {
 
       expect(f.footprint()).toEqual(before);
       expect(f.admitted(old.id)).toBeUndefined();
-      expect(f.precedesBinding()).toBe(2);
+      // The seam is asked once; the redelivery is recognised from the refusal's record and not
+      // submitted again, so the refusal cannot be retried without end.
+      expect(f.precedesBinding()).toBe(1);
+      expect(f.subscriber.counters().rejections["precedes-binding-not-resubmitted"]).toBe(1);
       // Terminal: nothing to retry, so the connection stays and no reconnect is scheduled.
       expect(f.live().closed).toBe(false);
       expect(f.timersPending()).toBe(0);

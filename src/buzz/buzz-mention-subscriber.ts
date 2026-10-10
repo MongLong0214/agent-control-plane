@@ -89,6 +89,16 @@ export const RELAY_RECONNECT_BACKOFF_MS: readonly number[] = [1_000, 2_000, 4_00
  */
 export const ROLE_NOT_HELD_REPORT_AFTER = 5;
 
+/**
+ * How many events refused as preceding their role's binding one identity remembers.
+ *
+ * A remembered event is not submitted to the seam again when the inclusive window hands it back,
+ * so the seam is asked about it once rather than once per reconnect; and its id and reason stay
+ * readable in health. Bounded because a first subscription can be handed a room's whole history:
+ * the oldest record goes first, and an evicted event that comes back is asked about once more.
+ */
+export const PRECEDES_BINDING_RECORD_LIMIT = 64;
+
 /** How an identity's secret key is written in its file. Declared, never sniffed. */
 export type BuzzSubscriberKeyEncoding = "hex" | "nsec";
 
@@ -679,6 +689,33 @@ export interface BuzzMentionIdentityAdmission {
   readonly bindingGeneration: number | null;
   /** Local wall-clock seconds at which the current exclusion began; `null` while admitted. */
   readonly excludedSinceSeconds: number | null;
+  /** Events this identity was handed and the seam refused as preceding the role's binding, newest last. */
+  readonly notDelivered: readonly BuzzMentionNotDelivered[];
+}
+
+/**
+ * One event the seam refused because it was signed before the addressed role's binding generation
+ * was created — typically a mention sent while its CTO was excluded, handed back after a re-claim.
+ *
+ * It was not delivered and is not processed: the seam wrote nothing for it, and nothing here
+ * promotes it into work for the binding that refused it. The record keeps only the event id and
+ * the refusal, never the words; the relay keeps the room's history.
+ */
+export interface BuzzMentionNotDelivered {
+  readonly eventId: string;
+  readonly roleKey: string;
+  /** The binding generation the refusal was made against. A later one is created later, so it refuses too. */
+  readonly bindingGeneration: number | null;
+  readonly conversation: string;
+  /** The event's own signed `created_at`. */
+  readonly signedAtSeconds: number;
+  readonly outcome: "NOT_DELIVERED";
+  readonly reason: "PRECEDES_BINDING";
+  /** How many times the seam was asked about it: one while the record is held. */
+  readonly seamRefusals: number;
+  /** How many later redeliveries were recognised and not submitted again. */
+  readonly redeliveriesNotResubmitted: number;
+  readonly firstRefusedAtSeconds: number;
 }
 
 /**
@@ -998,6 +1035,13 @@ type BuzzMentionRejection =
    * because a first subscription can be handed a room's whole history.
    */
   | "admission-precedes-binding"
+  /**
+   * An event the seam already refused as preceding the binding, handed back by the inclusive window
+   * on a reconnect and recognised from its record: not submitted again. Counted apart from
+   * `admission-precedes-binding`, which counts the seam's own refusals, so the two say how often
+   * the seam was asked and how often it was spared.
+   */
+  | "precedes-binding-not-resubmitted"
   | "frame-too-large"
   | "frame-not-json"
   | "frame-not-a-message"
@@ -1174,6 +1218,12 @@ class BuzzMentionSubscription {
   #suspended = false;
   /** The last exclusion reason the operator was told, so one reason is reported once. */
   #reportedReason: string | null = null;
+  /**
+   * Events the seam refused as preceding their role's binding, by event id, oldest first. Volatile
+   * and bounded (`PRECEDES_BINDING_RECORD_LIMIT`). Not a replay authority: nothing admitted is ever
+   * recorded here, and the seam stays the one place that decides what is durable.
+   */
+  readonly #notDelivered = new Map<string, { -readonly [K in keyof BuzzMentionNotDelivered]: BuzzMentionNotDelivered[K] }>();
 
   #socket: BuzzRelaySocket | null = null;
   /**
@@ -1250,7 +1300,35 @@ class BuzzMentionSubscription {
       roleKey: this.#binding?.roleKey ?? null,
       bindingGeneration: this.#binding?.bindingGeneration ?? null,
       excludedSinceSeconds: this.#exclusion?.sinceSeconds ?? null,
+      notDelivered: [...this.#notDelivered.values()].map((record) => ({ ...record })),
     };
+  }
+
+  /** Records the seam's precedes-binding refusal of one event, evicting the oldest past the limit. */
+  #recordNotDelivered(event: RelayEvent, conversation: string, bound: BuzzMentionRoleBinding): void {
+    const known = this.#notDelivered.get(event.id);
+    if (known !== undefined && known.roleKey === bound.roleKey) {
+      known.seamRefusals += 1;
+      return;
+    }
+    this.#notDelivered.delete(event.id);
+    this.#notDelivered.set(event.id, {
+      eventId: event.id,
+      roleKey: bound.roleKey,
+      bindingGeneration: bound.bindingGeneration ?? null,
+      conversation,
+      signedAtSeconds: event.created_at,
+      outcome: "NOT_DELIVERED",
+      reason: "PRECEDES_BINDING",
+      seamRefusals: 1,
+      redeliveriesNotResubmitted: 0,
+      firstRefusedAtSeconds: this.#deps.scheduler.nowSeconds(),
+    });
+    while (this.#notDelivered.size > PRECEDES_BINDING_RECORD_LIMIT) {
+      const oldest = this.#notDelivered.keys().next().value;
+      if (oldest === undefined) break;
+      this.#notDelivered.delete(oldest);
+    }
   }
 
   /**
@@ -1879,6 +1957,16 @@ class BuzzMentionSubscription {
     if (!sameBinding(pinned, fresh.binding)) this.#binding = fresh.binding;
     const bound = fresh.binding;
 
+    // An event the seam already refused as preceding this role's binding is not submitted again.
+    // The refusal is permanent for the role — a later binding generation is created later, so it
+    // refuses the same event — and asking on every reconnect is a retry with no end. Keyed by role:
+    // an identity re-pinned to another role's binding has another floor, and that one is asked.
+    const refusedBefore = this.#notDelivered.get(event.id);
+    if (refusedBefore !== undefined && refusedBefore.roleKey === bound.roleKey) {
+      refusedBefore.redeliveriesNotResubmitted += 1;
+      return rejected("precedes-binding-not-resubmitted");
+    }
+
     const frozen: BuzzMentionEvent = deepFreeze(event);
     const answer = await this.#deps.sink.admit({
       roleKey: bound.roleKey,
@@ -1889,6 +1977,9 @@ class BuzzMentionSubscription {
       binding: { bindingGeneration: bound.bindingGeneration ?? null, sessionId: bound.sessionId ?? null },
     });
     const admission = typeof answer === "string" ? answer : answer.admission;
+    // A fact about this event and this role, whichever connection asked: recorded before the
+    // stale-tail check below, so a refusal answered after its connection went is still kept.
+    if (admission === "PRECEDES_BINDING") this.#recordNotDelivered(event, conversation, bound);
 
     // **The suspension point.** Admission is the one genuinely slow thing this module does — it
     // reaches a database and a live peer — and it is therefore the window in which this
