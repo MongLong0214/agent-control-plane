@@ -1636,8 +1636,8 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     approveMigration(path, "ACP-PEER-SUCCESSION-01 v38 fixture");
     const migrated = openDb(path);
     try {
-      // v41 (#512) and v42 (#246 C1b) follow on the same approved chain.
-      expect(SCHEMA_VERSION).toBe(42);
+      // v41 (#512), v42 (#246 C1b) and v43 (#246 C3) follow on the same approved chain.
+      expect(SCHEMA_VERSION).toBe(43);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 38 ORDER BY version`,
@@ -1647,6 +1647,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
         { version: 40, migration_id: "v40-peer-message-carry-record" },
         { version: 41, migration_id: "v41-runtime-managed-worker-turns" },
         { version: 42, migration_id: "v42-session-credential-epoch" },
+        { version: 43, migration_id: "v43-bootstrap-application-record" },
       ]);
       expect(migrated.all<{ name: string }>(
         `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'peer_message_carries' ORDER BY name`,

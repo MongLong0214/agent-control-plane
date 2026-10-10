@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,10 +9,12 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { defaultConfig } from "../../src/app/control-plane.ts";
+import { processGroupEmpty } from "../../src/bootstrap/attempt-writer-group.ts";
 import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../../src/ceo/owner-authority.ts";
 import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
-import { type Decision, allow } from "../../src/core/errors.ts";
+import { allow } from "../../src/core/errors.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
@@ -20,7 +23,6 @@ import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../s
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
-import { respond } from "../../src/mcp/shared.ts";
 import { candidateSnapshotDigest, type CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github-write-port.ts";
@@ -29,7 +31,6 @@ import {
   TEST_OPERATOR_TOKEN,
   TEST_OWNER,
   bindCeo,
-  completeBootstrapRunUntilC3,
   dispatchBootstrapRun,
   fixtureManifest,
   makeHarness,
@@ -59,9 +60,8 @@ import {
  * refusal asserts no GitHub call and no consumption of an owner approval.
  *
  * #246 PR-C slice C1: the bootstrap run's owner is the BOOTSTRAP_CTO its dispatch staffs (no
- * `bindBootstrapCto`), and until slice C3 every bootstrap CONFIRM door refuses
- * `BOOTSTRAP_APPLICATION_NOT_AVAILABLE` with no GitHub call. The runner behind the door is driven
- * by `confirmUntilC3`.
+ * `bindBootstrapCto`). Slice C3 reopens the bootstrap CONFIRM through the runner's full path, so
+ * every CONFIRM below goes through the CEO's Hermes door.
  *
  * #246 PR-C slice C2: the run reaches CEO review as production gets there — the bootstrap CTO's
  * `plan_submit` carries the manifest, and `result_submit`'s BOOTSTRAP_PLAN review passes the
@@ -288,40 +288,15 @@ const ceoDecision = async (
 };
 
 /**
- * TODO(C3): what a PROJECT_BOOTSTRAP CONFIRM ran before #246 PR-C shut it. The CEO's CONFIRM door
- * (the Hermes tool) is asked first and must refuse `BOOTSTRAP_APPLICATION_NOT_AVAILABLE` having
- * written and consumed nothing — or pass through an earlier refusal of its own, such as a session
- * that does not hold the CEO role. Then the producer behind the door is driven directly, so its
- * refusals stay witnessed, and a complete activation is finalized the way the CONFIRM's own
- * transaction did. C3 reopens the door and replaces every call with `ceoDecision`.
+ * #246 PR-C slice C3 — the CEO's CONFIRM through the Hermes door, which runs the Repo Factory
+ * runner's full path (pre-write checks, reservation, attempt record, producer, WRITTEN, activation)
+ * before the decision, and completes the run on the WRITTEN application.
  */
-const confirmUntilC3 = async (
+const confirm = (
   wired: Wired,
   key: string,
   overrides: { ceoSessionId?: string; candidateSnapshotDigest?: string } = {},
-): Promise<Record<string, unknown>> => {
-  const writesBefore = wired.github.writes.length;
-  const readsBefore = wired.github.reads.length;
-  const consumedBefore = consumedApprovals(wired);
-  const door = await ceoDecision(wired, key, overrides);
-  expect(wired.github.writes).toHaveLength(writesBefore);
-  expect(wired.github.reads).toHaveLength(readsBefore);
-  expect(consumedApprovals(wired)).toBe(consumedBefore);
-  if (door["reasonCode"] !== ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE) return door;
-  const candidateSnapshotDigest = overrides.candidateSnapshotDigest ?? wired.snapshotDigest;
-  const runner = wired.harness.cp.bootstrapProducer as unknown as {
-    produceAndActivateRecordedApproval(runId: string, candidate: string): Promise<Decision<unknown>>;
-  };
-  const produced = await runner.produceAndActivateRecordedApproval(wired.runId, candidateSnapshotDigest);
-  if (!produced.allowed) return respond(produced).structuredContent ?? {};
-  const completed = completeBootstrapRunUntilC3(wired.harness.cp, {
-    runId: wired.runId,
-    candidateSnapshotDigest,
-    ceoSessionId: overrides.ceoSessionId ?? wired.ceoSessionId,
-  });
-  return respond(completed.allowed ? allow(ReasonCode.OK, { state: completed.value.state }) : completed)
-    .structuredContent ?? {};
-};
+): Promise<Record<string, unknown>> => ceoDecision(wired, key, overrides);
 
 const consumedApprovals = (wired: Pick<Wired, "harness" | "runId">): number =>
   wired.harness.cp.db.get<{ n: number }>(
@@ -353,7 +328,7 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
     expect(consumedApprovals(wired)).toBe(0);
     expect(wired.github.writes).toEqual([]);
 
-    const first = await confirmUntilC3(wired, "confirm-1");
+    const first = await confirm(wired, "confirm-1");
     // A fresh bootstrap stops once, after the writes: the incoming CTO has not acknowledged.
     expect(first).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     expect((first["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
@@ -373,7 +348,7 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
     expect(wired.harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primary.sessionId).allowed).toBe(true);
 
     wired.github.writes.length = 0;
-    const second = await confirmUntilC3(wired, "confirm-2");
+    const second = await confirm(wired, "confirm-2");
     expect(second).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
     expect(wired.github.writes).toEqual([]);
     expect(consumedApprovals(wired)).toBe(1);
@@ -388,7 +363,7 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
 
   it("a CEO confirm with no owner approval is refused by the runner; no GitHub call, nothing consumed, not COMPLETED", async () => {
     const wired = await wire("wired-unapproved");
-    const refused = await confirmUntilC3(wired, "confirm-unapproved");
+    const refused = await confirm(wired, "confirm-unapproved");
     expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE });
     expect(refused["evidence"]).toMatchObject({ stage: "approval", refusal: "APPROVAL_MISSING" });
     nothingWrittenOrConsumed(wired);
@@ -408,7 +383,7 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
     expect(minted.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE });
     expect(recordedApprovals(wired)).toEqual([]);
 
-    const refused = await confirmUntilC3(wired, "confirm-after-ceo-mint");
+    const refused = await confirm(wired, "confirm-after-ceo-mint");
     expect(refused["evidence"]).toMatchObject({ stage: "approval", refusal: "APPROVAL_MISSING" });
     nothingWrittenOrConsumed(wired);
   });
@@ -431,7 +406,7 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
     expect(minted.reasonCode).toBe(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED);
     expect(recordedApprovals(wired)).toEqual([]);
 
-    const refused = await confirmUntilC3(wired, "confirm-after-cto-mint");
+    const refused = await confirm(wired, "confirm-after-cto-mint");
     expect(refused["evidence"]).toMatchObject({ stage: "approval", refusal: "APPROVAL_MISSING" });
     nothingWrittenOrConsumed(wired);
   });
@@ -452,7 +427,7 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
       }),
     );
 
-    const refused = await confirmUntilC3(wired, "confirm-replaced-plan", { candidateSnapshotDigest: replanned.snapshotDigest });
+    const refused = await confirm(wired, "confirm-replaced-plan", { candidateSnapshotDigest: replanned.snapshotDigest });
     expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE });
     expect(refused["evidence"]).toMatchObject({ stage: "approval", refusal: "APPROVAL_MISSING" });
     nothingWrittenOrConsumed(wired);
@@ -557,7 +532,7 @@ const identitiesOnly = (ops: ReturnType<typeof operations>) =>
 const approveAndConfirm = async (wired: Wired, projectId: string): Promise<void> => {
   const approved = await approve(wired);
   if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
-  const first = await confirmUntilC3(wired, `${projectId}-confirm-1`);
+  const first = await confirm(wired, `${projectId}-confirm-1`);
   expect(first).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
   expect(wired.github.writes.map((write) => write.method)).toEqual([
     "createRepository",
@@ -569,7 +544,7 @@ const approveAndConfirm = async (wired: Wired, projectId: string): Promise<void>
   if (!primary) throw new Error("activation bound no primary CTO");
   const handoffId = (first["evidence"] as Record<string, unknown>)["pendingHandoffId"] as string;
   expect(wired.harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primary.sessionId).allowed).toBe(true);
-  const second = await confirmUntilC3(wired, `${projectId}-confirm-2`);
+  const second = await confirm(wired, `${projectId}-confirm-2`);
   expect(second).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
   expect(wired.harness.cp.runs.require(wired.runId).state).toBe(RunState.COMPLETED);
 };
@@ -604,7 +579,7 @@ describe("#246 production defaults: the work root and an executable plan_submit"
       const wired = await wire(projectId, { workRoot });
       const approved = await approve(wired);
       if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
-      const refused = await confirmUntilC3(wired, `${projectId}-confirm`);
+      const refused = await confirm(wired, `${projectId}-confirm`);
       expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.STATE_PATH_INSECURE });
       expect(refused["evidence"]).toMatchObject({ stage: "precondition", refusal: "WORK_ROOT_INSECURE" });
       nothingWrittenOrConsumed(wired);
@@ -700,13 +675,13 @@ describe("PR #1050 review witnesses", () => {
     const approved = await approve(wired);
     if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
 
-    const refused = await confirmUntilC3(wired, "rf1050-01-unreviewed", { candidateSnapshotDigest: unreviewed });
+    const refused = await confirm(wired, "rf1050-01-unreviewed", { candidateSnapshotDigest: unreviewed });
     expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     expect(refused["evidence"]).toMatchObject({ stage: "precondition", candidateSnapshotDigest: unreviewed });
     nothingWrittenOrConsumed(wired);
 
     // The reviewed candidate is still confirmed: the first CONFIRM writes and waits on the handoff.
-    const reviewed = await confirmUntilC3(wired, "rf1050-01-reviewed");
+    const reviewed = await confirm(wired, "rf1050-01-reviewed");
     expect(reviewed).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     expect((reviewed["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
     expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
@@ -719,11 +694,11 @@ describe("PR #1050 review witnesses", () => {
     const approved = await approve(wired);
     if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
 
-    const refused = await confirmUntilC3(wired, "rf1050-01p-unreviewed", { candidateSnapshotDigest: unreviewed });
+    const refused = await confirm(wired, "rf1050-01p-unreviewed", { candidateSnapshotDigest: unreviewed });
     expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     nothingWrittenOrConsumed(wired);
 
-    const reviewed = await confirmUntilC3(wired, "rf1050-01p-reviewed");
+    const reviewed = await confirm(wired, "rf1050-01p-reviewed");
     expect((reviewed["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
     expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
   });
@@ -780,7 +755,7 @@ describe("PR #1050 review witnesses", () => {
     // Both candidates pass the review check, so only the owner admission can tell them apart.
     expect(wired.harness.cp.bootstrap.reviewForConfirmation(wired.runId, other).allowed).toBe(true);
 
-    const refused = await confirmUntilC3(wired, "rf1050-03-other", { candidateSnapshotDigest: other });
+    const refused = await confirm(wired, "rf1050-03-other", { candidateSnapshotDigest: other });
     expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.EVIDENCE_STALE });
     expect(refused["evidence"]).toMatchObject({
       stage: "approval",
@@ -790,7 +765,7 @@ describe("PR #1050 review witnesses", () => {
     nothingWrittenOrConsumed(wired);
 
     // The receipt was not spent on the other candidate: the CONFIRM naming its own candidate writes.
-    const own = await confirmUntilC3(wired, "rf1050-03-own");
+    const own = await confirm(wired, "rf1050-03-own");
     expect(own).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     expect((own["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
     expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
@@ -799,6 +774,17 @@ describe("PR #1050 review witnesses", () => {
 
   it("RF1050-04: a receipt an earlier head consumed with no candidate is refused by name, and a new owner decision resumes from the ledger", async () => {
     const wired = await wire("rf1050-04-legacy");
+    // Review 1076-R3 — the failed attempt is recorded with a daemon that has exited by the time a new
+    // decision resumes it: a real process that led its own group, its group empty. The test process
+    // cannot stand for a daemon recovering its own attempt, since a vitest worker does not lead its group.
+    const exited = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { detached: true, stdio: "ignore" });
+    const writer = { pid: exited.pid!, startToken: readProcessStartToken(exited.pid!), startedAt: new Date().toISOString(), processGroup: exited.pid! };
+    const gone = new Promise((resolveExit) => exited.once("exit", resolveExit));
+    exited.kill("SIGKILL");
+    await gone;
+    await vi.waitFor(() => expect(processGroupEmpty(writer.processGroup)).toBe(true), { timeout: 10_000, interval: 20 });
+    expect(writer.startToken).not.toBeNull();
+    wired.harness.cp.bootstrapProducer.attachWriterLock(() => wired.daemon.lock.held(), () => writer);
     const approved = await approve(wired);
     if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
     const legacy = newestReceipt(wired);
@@ -809,23 +795,26 @@ describe("PR #1050 review witnesses", () => {
     // as the reviewer's did. (#246 C2 freezes and promotes every bootstrap candidate, so the null is
     // stated rather than read from the pointer.)
     const deps = (wired.harness.cp.bootstrapProducer as unknown as {
-      deps: { ownerAuthority: Pick<OwnerAuthorityPort, "assertConsumedApproval" | "consumeApproval"> };
+      deps: { ownerAuthority: Pick<OwnerAuthorityPort, "assertConsumedApproval" | "consumeApproval" | "assertConsumable"> };
     }).deps;
     const upgraded = deps.ownerAuthority;
     deps.ownerAuthority = {
       assertConsumedApproval: (receipt) => upgraded.assertConsumedApproval(receipt, null),
       consumeApproval: (receipt) => upgraded.consumeApproval(receipt, null),
+      assertConsumable: (receipt) => upgraded.assertConsumable(receipt, null),
     };
-    wired.github.failNext = "pushBranch";
-    const failed = await confirmUntilC3(wired, "rf1050-04-earlier-head");
+    // GitHub fails the read before the push, so the push is never sent: a request sent and never
+    // answered would not be sent again (#246 C3, review 1076-R1-03).
+    vi.spyOn(wired.github, "observeBranch").mockRejectedValueOnce(new Error("HTTP 502 injected on observeBranch"));
+    const failed = await confirm(wired, "rf1050-04-earlier-head");
     expect((failed["evidence"] as Record<string, unknown>)["stage"]).toBe("production");
-    expect(wired.github.writes.map((write) => write.method)).toEqual(["createRepository", "pushBranch"]);
+    expect(wired.github.writes.map((write) => write.method)).toEqual(["createRepository"]);
     expect(consumedApprovals(wired)).toBe(1);
     deps.ownerAuthority = upgraded;
 
     // After the upgrade that consumption authorises no candidate, and the refusal names its remedy.
     wired.github.writes.length = 0;
-    const refused = await confirmUntilC3(wired, "rf1050-04-upgraded");
+    const refused = await confirm(wired, "rf1050-04-upgraded");
     expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.EVIDENCE_STALE });
     expect(refused["evidence"]).toMatchObject({
       stage: "approval",
@@ -840,7 +829,7 @@ describe("PR #1050 review witnesses", () => {
     // resumes from the GitHub ledger without creating the repository again.
     const reapproved = await approve(wired);
     if (!reapproved.allowed) throw new Error(`${reapproved.reasonCode}: ${reapproved.message}`);
-    const resumed = await confirmUntilC3(wired, "rf1050-04-new-decision");
+    const resumed = await confirm(wired, "rf1050-04-new-decision");
     expect(resumed).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     expect((resumed["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
     expect(wired.github.writes.map((write) => write.method)).toEqual(["pushBranch", "setDefaultBranch", "protectBranch"]);
@@ -911,7 +900,7 @@ describe("PR #1050 review witnesses", () => {
     expect(recordedApprovals(wired)).toHaveLength(3);
     expect(newestDecision(wired)).toBe(true);
 
-    const first = await confirmUntilC3(wired, "rf1050-02-confirm");
+    const first = await confirm(wired, "rf1050-02-confirm");
     expect(first).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     expect((first["evidence"] as Record<string, unknown>)["stage"]).toBe("activation");
     expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
@@ -930,7 +919,7 @@ describe("PR #1050 review witnesses", () => {
     }
     expect(recordedApprovals(wired)).toHaveLength(2);
     expect(newestDecision(wired)).toBe(false);
-    const refused = await confirmUntilC3(wired, "rf1050-02-declined");
+    const refused = await confirm(wired, "rf1050-02-declined");
     expect(refused["evidence"]).toMatchObject({ stage: "approval", refusal: "APPROVAL_DECLINED" });
     nothingWrittenOrConsumed(wired);
   });
@@ -983,51 +972,56 @@ describe("#246 wiring: agentctl approve repo-factory-github-write", () => {
 });
 
 /**
- * #246 PR-C slice C1 — until slice C3's durable application record exists, the bootstrap path
- * cannot reach the producer's GitHub writes. Each door refuses with an owner approval on record:
- * the GitHub double records no call, the approval is not consumed, the run is not COMPLETED. The
- * gate's admission and the runner's CONFIRM entry are two layers, each with a row of its own.
+ * #246 PR-C slice C3 — every bootstrap CONFIRM door goes through the runner's one full path: the
+ * Hermes socket and the runner's own entry perform the writes under the reservation, and the
+ * production gate on its own completes nothing without a WRITTEN application.
  */
-describe("#246 C1: every bootstrap CONFIRM door is shut until C3", () => {
-  it("the CEO's ceo_decision_submit over hermes.mcp.sock refuses BOOTSTRAP_APPLICATION_NOT_AVAILABLE: zero GitHub calls, approval not consumed", async () => {
-    const wired = await wire("c1-door-hermes-socket");
+describe("#246 C3: every bootstrap CONFIRM door goes through the same path", () => {
+  it("the CEO's ceo_decision_submit over hermes.mcp.sock runs the full path: the writes under a reservation, one approval consumed", async () => {
+    const wired = await wire("c3-door-hermes-socket");
     const approved = await approve(wired);
     if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
     // The creation response is the only place a session secret exists, so the CEO the socket
     // authenticates is one created here and switched in.
-    const ceo = wired.harness.cp.sessions.create({ provider: "scripted", model: "c1-wire-ceo" });
+    const ceo = wired.harness.cp.sessions.create({ provider: "scripted", model: "c3-wire-ceo" });
     if (!ceo.sessionSecret) throw new Error("the CEO session has no secret");
-    wired.harness.cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY, "c1 wire CEO");
+    wired.harness.cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY, "c3 wire CEO");
     const switched = wired.harness.cp.bindings.switchTo({
-      role: Role.CEO, sessionId: ceo.sessionId, reason: "c1 wire CEO", conversation: "REPLACED",
+      role: Role.CEO, sessionId: ceo.sessionId, reason: "c3 wire CEO", conversation: "REPLACED",
     });
     if (!switched.allowed) throw new Error(switched.message);
     await wired.harness.cp.continuity.evaluate("bootstrap confirmation");
-    const listeners = await startLocalMcpListeners(wired.harness.cp, tempDir("acp-246-c1-mcp-"), TEST_MCP_TOKEN);
+    const listeners = await startLocalMcpListeners(wired.harness.cp, tempDir("acp-246-c3-mcp-"), TEST_MCP_TOKEN);
     try {
-      const refused = await callMcpToolOverSocket(
+      const first = await callMcpToolOverSocket(
         listeners.socketPaths[0]!,
         { token: TEST_MCP_TOKEN, sessionId: ceo.sessionId, sessionSecret: ceo.sessionSecret },
         "ceo_decision_submit",
         {
-          idempotencyKey: "c1-door-hermes-socket",
+          idempotencyKey: "c3-door-hermes-socket",
           runId: wired.runId,
           decision: "CONFIRM",
           candidateSnapshotDigest: wired.snapshotDigest,
           ceoSessionId: ceo.sessionId,
-          rationale: "issue #246 C1 door",
+          rationale: "issue #246 C3 door",
         },
       );
-      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE });
+      expect(first).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     } finally {
       await listeners.close();
     }
-    nothingWrittenOrConsumed(wired);
-    expect(recordedApprovals(wired)).toHaveLength(1);
+    expect(wired.github.writes.map((write) => write.method)).toEqual([
+      "createRepository",
+      "pushBranch",
+      "setDefaultBranch",
+      "protectBranch",
+    ]);
+    expect(consumedApprovals(wired)).toBe(1);
+    expect(wired.harness.cp.bootstrapApplications.get(wired.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
   });
 
-  it("ProductionGate.submitCeoDecision refuses a bootstrap CONFIRM BOOTSTRAP_APPLICATION_NOT_AVAILABLE before anything else it would do", async () => {
-    const wired = await wire("c1-door-gate");
+  it("ProductionGate.submitCeoDecision completes nothing without the runner: no WRITTEN application, BOOTSTRAP_APPLICATION_NOT_AVAILABLE", async () => {
+    const wired = await wire("c3-door-gate");
     const approved = await approve(wired);
     if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
     await wired.harness.cp.continuity.evaluate("bootstrap confirmation");
@@ -1036,21 +1030,38 @@ describe("#246 C1: every bootstrap CONFIRM door is shut until C3", () => {
       decision: "CONFIRM" as const,
       candidateSnapshotDigest: wired.snapshotDigest,
       ceoSessionId: wired.ceoSessionId,
-      rationale: "issue #246 C1 door",
+      rationale: "issue #246 C3 door",
     };
-    expect(wired.harness.cp.ceo.assertCeoDecisionAdmissible(input).reasonCode)
-      .toBe(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
+    // The CEO is admissible to apply the CONFIRM; the decision on its own completes nothing.
+    expect(wired.harness.cp.ceo.assertCeoDecisionAdmissible(input).allowed).toBe(true);
     expect(wired.harness.cp.ceo.submitCeoDecision(input).reasonCode).toBe(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
     nothingWrittenOrConsumed(wired);
+    expect(wired.harness.cp.bootstrapApplications.get(wired.runId)).toBeNull();
     expect(wired.harness.cp.artifacts.latest(wired.runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
   });
 
-  it("the runner's CONFIRM entry produceAndActivateApproved refuses BOOTSTRAP_APPLICATION_NOT_AVAILABLE even with a usable approval", async () => {
-    const wired = await wire("c1-door-runner");
+  it("the runner's CONFIRM entry produceAndActivateApproved is the same path, and asks the CEO's admission itself", async () => {
+    const wired = await wire("c3-door-runner");
     const approved = await approve(wired);
     if (!approved.allowed) throw new Error(`${approved.reasonCode}: ${approved.message}`);
-    const refused = await wired.harness.cp.bootstrapProducer.produceAndActivateApproved(wired.runId, wired.snapshotDigest);
-    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE });
+    await wired.harness.cp.continuity.evaluate("bootstrap confirmation");
+    // A session that does not hold the CEO role sets off nothing, even at the runner's own door.
+    const notCeo = await wired.harness.cp.bootstrapProducer.produceAndActivateApproved({
+      runId: wired.runId,
+      candidateSnapshotDigest: wired.snapshotDigest,
+      ceoSessionId: wired.bootstrapCtoSessionId,
+    });
+    expect(notCeo).toMatchObject({ allowed: false, reasonCode: ReasonCode.GATE_AUTHORITY_DENIED });
     nothingWrittenOrConsumed(wired);
+    expect(wired.harness.cp.bootstrapApplications.get(wired.runId)).toBeNull();
+
+    const applied = await wired.harness.cp.bootstrapProducer.produceAndActivateApproved({
+      runId: wired.runId,
+      candidateSnapshotDigest: wired.snapshotDigest,
+      ceoSessionId: wired.ceoSessionId,
+    });
+    expect(applied).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    expect(wired.github.writes.map((write) => write.method)).toContain("createRepository");
+    expect(wired.harness.cp.bootstrapApplications.get(wired.runId)).toMatchObject({ phase: "WRITTEN" });
   });
 });
