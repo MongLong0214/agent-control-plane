@@ -237,19 +237,13 @@ describe("the normal path: CONFIRM → grant → one transaction that activates,
 });
 
 describe("a stale pin, a base mismatch and two CONTRACT_CHANGEs on one base", () => {
-  it("ruling 1 / W14: a second CONFIRM while the first finalizes is an overlap; after activation it is MANIFEST_PIN_SUPERSEDED; a recreated run works", async () => {
+  it("ruling 1: a CONTRACT_CHANGE judged against a superseded base is refused at CONFIRM (MANIFEST_PIN_SUPERSEDED); recreated, it works", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness, "cc-stale-pin");
     const ra = await readyContractChange(harness, projectId, commitloreRequired);
     const rb = await readyContractChange(harness, projectId, postMergeAdded("rb-check"));
     expect(rb.run.baseDigest).toBe(ra.run.baseDigest);
-
     expect((await confirm(harness, ra.run.runId, ra.candidate)).allowed).toBe(true);
-    const overlap = await confirm(harness, rb.run.runId, rb.candidate);
-    expect(overlap).toMatchObject({ allowed: false, reasonCode: "CONTRACT_CHANGE_FINALIZATION_OVERLAP" });
-    expect(stateOf(harness, rb.run.runId)).toBe(RunState.READY_FOR_CEO_REVIEW);
-    expect(grantRow(harness, rb.run.runId)).toBeNull();
-
     await runDaemon(harness);
     const m1 = manifestDigest(ra.proposed);
     expect(activeManifest(harness, projectId)).toBe(m1);
@@ -260,13 +254,13 @@ describe("a stale pin, a base mismatch and two CONTRACT_CHANGEs on one base", ()
     expect(stale.evidence).toMatchObject({ base: ra.run.baseDigest, active: m1 });
     expect(stateOf(harness, rb.run.runId)).toBe(RunState.READY_FOR_CEO_REVIEW);
     expect(grantRow(harness, rb.run.runId)).toBeNull();
-    expect(rb.run.base).toEqual(harness.cp.projects.manifest(ra.run.baseDigest));
+    expect(harness.cp.runs.require(rb.run.runId).pinnedManifestDigest).toBe(ra.run.baseDigest);
 
     // Recreated, it pins M1 and finalizes normally.
     const again = await readyContractChange(harness, projectId, postMergeAdded("rb-check"));
     expect(again.run.baseDigest).toBe(m1);
     expect((await confirm(harness, again.run.runId, again.candidate)).allowed).toBe(true);
-    await runDaemon(harness);
+    await runDaemon(harness, "acp-cc-stale-pin-again-");
     expect(activeManifest(harness, projectId)).toBe(manifestDigest(again.proposed));
     expect(activations(harness).map((entry) => [entry.evidence["from"], entry.evidence["to"]])).toEqual([
       [ra.run.baseDigest, m1],
@@ -274,35 +268,40 @@ describe("a stale pin, a base mismatch and two CONTRACT_CHANGEs on one base", ()
     ]);
   });
 
-  it("base compare-and-set: two grants on one base racing past the overlap check — the pointer moves once, the loser activates nothing", async () => {
-    const harness = makeHarness();
+  it("base compare-and-set: two grants on one base — one finalizes at a time, the second is refused on its base before any write, the pointer moves once", async () => {
+    const { github, harness } = githubHarness();
+    const requests = recordRequests(github);
     const { projectId } = await registerFixtureProject(harness, "cc-cas");
     const ra = await readyContractChange(harness, projectId, commitloreRequired);
     const rb = await readyContractChange(harness, projectId, postMergeAdded("rb-check"));
-    // Simulates two CONFIRMs admitted before either saw the other finalizing.
-    vi.spyOn(harness.cp.manifestGrants, "finalizingContractChanges").mockReturnValue([]);
     expect((await confirm(harness, ra.run.runId, ra.candidate)).allowed).toBe(true);
     expect((await confirm(harness, rb.run.runId, rb.candidate)).allowed).toBe(true);
     expect(grantRow(harness, ra.run.runId)!.from_manifest_digest).toBe(grantRow(harness, rb.run.runId)!.from_manifest_digest);
 
-    const finalizerA = new ApprovedRunFinalizer(harness.cp, "witness-a");
-    const finalizerB = new ApprovedRunFinalizer(harness.cp, "witness-b");
-    const [a, b] = await Promise.all([finalizerA.finalizeApprovedRun(ra.run.runId), finalizerB.finalizeApprovedRun(rb.run.runId)]);
-    const results = [
-      { runId: ra.run.runId, outcome: a, proposed: ra.proposed },
-      { runId: rb.run.runId, outcome: b, proposed: rb.proposed },
-    ];
-    const winners = results.filter((entry) => entry.outcome.allowed);
-    const losers = results.filter((entry) => !entry.outcome.allowed);
-    expect(winners).toHaveLength(1);
-    expect(losers).toHaveLength(1);
-    expect(activeManifest(harness, projectId)).toBe(manifestDigest(winners[0]!.proposed));
+    // Concurrent: the second finalization does not start while the first is under way.
+    const [a, b] = await Promise.all([
+      new ApprovedRunFinalizer(harness.cp, "witness-a").finalizeApprovedRun(ra.run.runId),
+      new ApprovedRunFinalizer(harness.cp, "witness-b").finalizeApprovedRun(rb.run.runId),
+    ]);
+    expect(a.allowed).toBe(true);
+    expect(b).toMatchObject({ allowed: false, reasonCode: "CONTRACT_CHANGE_FINALIZATION_OVERLAP" });
+    expect(harness.cp.db.get(`SELECT 1 FROM finalization_attempts WHERE run_id = ?`, [rb.run.runId])).toBeUndefined();
+    expect(activeManifest(harness, projectId)).toBe(manifestDigest(ra.proposed));
+
+    // Afterwards the second grant's base is no longer active: refused at PRE_MERGE, before any write.
+    const later = await new ApprovedRunFinalizer(harness.cp, "witness-b-later").finalizeApprovedRun(rb.run.runId);
+    expect(later).toMatchObject({ allowed: false, reasonCode: "MANIFEST_PIN_SUPERSEDED" });
+    expect(stateOf(harness, rb.run.runId)).toBe(RunState.CEO_APPROVED);
+    expect(grantRow(harness, rb.run.runId)!.consumed_at).toBeNull();
     expect(activations(harness)).toHaveLength(1);
-    const loser = losers[0]!;
-    expect(stateOf(harness, loser.runId)).not.toBe(RunState.COMPLETED);
-    expect(grantRow(harness, loser.runId)!.consumed_at).toBeNull();
-    // Refused on the base, whether at PRE_MERGE or inside the activation transaction.
-    expect(JSON.stringify(loser.outcome)).toContain("MANIFEST_PIN_SUPERSEDED");
+    expect(activeManifest(harness, projectId)).toBe(manifestDigest(ra.proposed));
+    expect(requests.filter((request) => !request.startsWith("GET"))).toEqual([]);
+
+    // A run stuck at CEO_APPROVED does not hold up the project's next contract change.
+    const next = await readyContractChange(harness, projectId, postMergeAdded("next-check"));
+    expect((await confirm(harness, next.run.runId, next.candidate)).allowed).toBe(true);
+    await runDaemon(harness);
+    expect(activeManifest(harness, projectId)).toBe(manifestDigest(next.proposed));
   });
 });
 

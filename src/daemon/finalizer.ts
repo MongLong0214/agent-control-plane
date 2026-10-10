@@ -212,6 +212,19 @@ export class ApprovedRunFinalizer {
       return deny(ReasonCode.EVIDENCE_MISSING, "CEO-approved run has no current candidate", { runId });
     }
 
+    // #246 B2-b — one CONTRACT_CHANGE of a project finalizes at a time. Asked synchronously with the
+    // attempt's acquisition and before any GitHub write, so a second grant on the same base waits rather
+    // than merging; the compare-and-set at PRE_MERGE then refuses it once the first has activated.
+    if (initial.kind === RunKind.CONTRACT_CHANGE && initial.projectId) {
+      const finalizing = this.cp.manifestGrants.finalizingContractChanges(initial.projectId, runId);
+      if (finalizing.length > 0) {
+        return deny(ReasonCode.CONTRACT_CHANGE_FINALIZATION_OVERLAP, "another CONTRACT_CHANGE of this project is finalizing", {
+          runId,
+          projectId: initial.projectId,
+          finalizing,
+        });
+      }
+    }
     const acquired = this.acquireAttempt(runId, candidateDigest);
     if (!acquired.allowed) return acquired as Decision<FinalizationResult>;
     const attemptId = acquired.value;

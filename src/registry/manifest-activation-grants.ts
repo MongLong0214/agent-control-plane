@@ -40,7 +40,7 @@ const PHASE_STATES: Readonly<Record<ManifestGrantPhase, readonly RunState[]>> = 
   ACTIVATION: [RunState.POST_MERGE_VERIFYING],
 };
 
-/** The states a confirmed CONTRACT_CHANGE finalizes through; a second one may not be confirmed beside it. */
+/** The states a confirmed CONTRACT_CHANGE finalizes through. */
 const FINALIZING_STATES: readonly RunState[] = PHASE_STATES.PRE_MERGE;
 
 export interface ManifestActivationGrant {
@@ -215,8 +215,8 @@ export class ManifestActivationGrants {
 
   /**
    * The read-only half of a CONTRACT_CHANGE CONFIRM's admission, asked before the decision changes
-   * anything: the base is still the active manifest (CEO ruling 1), no other CONTRACT_CHANGE of the
-   * project is confirmed and finalizing, and the candidate is still the one its PLAN and its packet bind.
+   * anything: the base is still the active manifest (CEO ruling 1), and the candidate is still the one
+   * its PLAN, its review and its packet bind.
    */
   admitConfirm(runId: string, candidateSnapshotDigest: string): Decision<{ planDigest: string; manifestDigest: string; fromManifestDigest: string; packetDigest: string }> {
     const run = this.runs.get(runId);
@@ -229,29 +229,25 @@ export class ManifestActivationGrants {
     }
     const pinned = this.pinStillActive(run);
     if (!pinned.allowed) return pinned as Decision<never>;
-    const overlap = this.finalizingContractChanges(run.projectId, runId);
-    if (overlap.length > 0) {
-      return deny(ReasonCode.CONTRACT_CHANGE_FINALIZATION_OVERLAP, "another CONTRACT_CHANGE of this project is confirmed and finalizing", {
-        runId,
-        projectId: run.projectId,
-        finalizing: overlap,
-      });
-    }
     return this.boundTarget(run, candidateSnapshotDigest);
   }
 
   /**
-   * The project's other CONTRACT_CHANGE runs already confirmed and finalizing. Two grants on one base
-   * would race to the same compare-and-set; refusing the second CONFIRM keeps that race from reaching a
-   * merge, and the compare-and-set at activation still decides it if it ever does.
+   * The project's other CONTRACT_CHANGE runs whose finalization is under way: merging, verifying after
+   * a merge, or holding a live finalization attempt. Two grants on one base race to the same
+   * compare-and-set, so the finalizer starts a CONTRACT_CHANGE only when none is, which keeps the loser
+   * from merging anything; the compare-and-set then refuses it before its first GitHub write. A run
+   * merely confirmed, or stuck at CEO_APPROVED, is not counted, so it never blocks the project.
    */
   finalizingContractChanges(projectId: string, exceptRunId: string): Array<{ runId: string; state: string }> {
     return this.db.all<{ run_id: string; state: string }>(
-      `SELECT run_id, state FROM runs
-        WHERE project_id = ? AND kind = 'CONTRACT_CHANGE' AND run_id <> ?
-          AND state IN (${FINALIZING_STATES.map(() => "?").join(",")})
-        ORDER BY run_id`,
-      [projectId, exceptRunId, ...FINALIZING_STATES],
+      `SELECT r.run_id, r.state FROM runs r
+        WHERE r.project_id = ? AND r.kind = 'CONTRACT_CHANGE' AND r.run_id <> ?
+          AND (r.state IN ('MERGING','POST_MERGE_VERIFYING')
+               OR EXISTS (SELECT 1 FROM finalization_attempts f
+                           WHERE f.run_id = r.run_id AND f.state = 'RUNNING' AND f.deadline_at > ?))
+        ORDER BY r.run_id`,
+      [projectId, exceptRunId, this.clock.nowIso()],
     ).map((row) => ({ runId: row.run_id, state: row.state }));
   }
 
