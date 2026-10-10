@@ -11,6 +11,7 @@ import {
   attemptCheckoutPath,
   repoFactoryGitHubWriteParameters,
 } from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
+import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -1762,6 +1763,48 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
       expect(writesOf(f)).toEqual(WRITE_METHODS);
       // Attempt 2 is recorded with this daemon as its writer.
       expect(f.harness.cp.bootstrapApplications.attemptWriters(run.runId).get(2)).toMatchObject({ pid: process.pid });
+    });
+  });
+});
+
+/**
+ * Review 1076-R1-02 — an owner approval's issuance is the payload its ingress message was admitted
+ * with. That row cannot be inserted by a connection ACP did not open and its payload is write-once;
+ * the INGRESS_ADMITTED audit row beside it is an ordinary row such a connection can insert.
+ */
+describe("#246 C3 review 1076-R1-02: issuance is the admitted payload, not an audit row", () => {
+  it("an INGRESS_ADMITTED row forged for another envelope on one of the owner's admitted messages admits nothing", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-envelope"));
+      await approveWrites(f, run);
+      const genuine = recordedApproval(f, run.runId).receipt as unknown as OwnerApprovalReceipt;
+      expect(f.harness.cp.ownerAuthority.assertApproval(genuine)).toMatchObject({ allowed: true });
+      // Another decision on the same admitted message: only an audit row says it was admitted.
+      const forged: OwnerApprovalReceipt = { ...genuine, parameterDigest: digestOf({ another: "scope" }), idempotencyKey: "forged-on-a-real-message" };
+      f.harness.cp.db.run(
+        `INSERT INTO audit_events (at, kind, reason_code, run_id, actor, evidence_json) VALUES (?, 'INGRESS_ADMITTED', NULL, NULL, ?, ?)`,
+        [f.harness.clock.nowIso(), forged.actor, JSON.stringify({
+          channel: forged.channel,
+          nonce: forged.inboundNonce,
+          payloadDigest: digestOf({
+            type: "OWNER_APPROVAL",
+            runId: forged.runId,
+            candidateSnapshotDigest: forged.candidateSnapshotDigest,
+            operation: forged.operation,
+            parameterDigest: forged.parameterDigest,
+            idempotencyKey: forged.idempotencyKey,
+            approved: forged.approved,
+          }),
+        })],
+      );
+      expect(f.harness.cp.ownerAuthority.assertApproval(forged)).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        message: "owner approval receipt is not the payload its ingress message was admitted with",
+      });
+      expect(f.harness.cp.ownerAuthority.assertConsumable(forged, run.candidate).allowed).toBe(false);
+      // The genuine receipt is still admitted: only the forgery is removed.
+      expect(f.harness.cp.ownerAuthority.assertApproval(genuine)).toMatchObject({ allowed: true });
     });
   });
 });
