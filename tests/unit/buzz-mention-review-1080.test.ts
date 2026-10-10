@@ -175,7 +175,7 @@ describe("1080-N1-03: admission requires the session's recorded room", () => {
 });
 
 describe("1080-N1-04: an exclusion found at delivery suspends the identity", () => {
-  it("requests no more of its mail on later ticks, and resumes from the same window once it is admitted again", async () => {
+  it("requests no more of its mail on later ticks while it stays excluded", async () => {
     const f = await start();
     try {
       // A pause with no binding switch: the runtime stops, its assignment stays ACTIVE.
@@ -192,6 +192,25 @@ describe("1080-N1-04: an exclusion found at delivery suspends the identity", () 
       }
       expect(f.requestsFor("repoFactory")).toBe(requests);
       expect(f.ownerMessagesFor("repoFactory")).toBe(0);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("judges before a reconnect: a binding that went away while the relay was down opens nothing", async () => {
+    const f = await start();
+    try {
+      const requests = f.requestsFor("repoFactory");
+      const connection = f.relay.openFor(f.keys.repoFactory.pubkey)[0]!;
+      connection.closed = true;
+      connection.handlers.onClose();
+      // Gone while it was down, with no binding switch and no event to notice it by.
+      expect(f.h.cp.sessions.transition(f.sessions.repoFactory, SessionLifecycle.STOPPED, "stopped while down").allowed).toBe(true);
+      f.clock.fireAll();
+      await f.relay.drain(f.subscriber);
+      expect(f.relay.openFor(f.keys.repoFactory.pubkey)).toHaveLength(0);
+      expect(f.requestsFor("repoFactory")).toBe(requests);
+      expect(f.subscriber.admission().identities[1]).toMatchObject({ state: "EXCLUDED", reason: "NO_LIVE_SESSION" });
     } finally {
       await f.close();
     }
