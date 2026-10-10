@@ -36,9 +36,18 @@ export interface TestReference {
   title: string;
 }
 
+/** One part of a scenario, declared as `RF-S14 arm:issue`. */
+export interface ScenarioArm {
+  id: string;
+  arm: string;
+}
+
 export interface ExecutableTestDeclaration extends TestReference {
   fullName: string;
+  /** Scenarios this leaf claims whole. */
   scenarioIds: string[];
+  /** Parts of scenarios this leaf witnesses. An arm never covers its scenario by itself. */
+  scenarioArms?: ScenarioArm[];
 }
 
 export interface VitestAssertionResult {
@@ -73,14 +82,9 @@ interface ScenarioRow {
   status: "DECLARATION_COVERED" | "DECLARATION_MISSING";
 }
 
-/** One Repo Factory scenario, or one arm of one, whose tests live in another repository. */
+/** One Repo Factory scenario whose tests live in another repository. */
 export interface ExternalScenario {
   readonly id: string;
-  /**
-   * `null` when the whole scenario is judged there. Otherwise the one arm judged there: the rest
-   * still needs a passed declaration in this repository, and the arm alone covers nothing.
-   */
-  readonly arm: string | null;
   /** The other repository's own test ids (pytest node ids), as its CI runs them. */
   readonly tests: readonly string[];
   /** What the external evidence does not show, stated beside it rather than left out. */
@@ -110,19 +114,19 @@ export interface ExternalScenarioReference extends ExternalScenario {
  *
  * ACP's own bootstrap producer (`src/bootstrap/repo-factory-producer.ts` and what it calls)
  * creates one repository and checks a clean tree. It selects no artifacts by profile, renders no
- * CI, runs no lean review, computes no PlanCore digest and has no CommitLore step. These
- * scenarios therefore cannot run in this repository, and ACP's unattended bootstrap run does not
- * support them. Their ownership was assigned to repo-factory; this constant is where that
- * assignment is written down, and the one thing to change if it moves.
+ * CI, runs no lean review, computes no PlanCore digest, has no CommitLore step and cannot apply
+ * across two repositories. These scenarios therefore cannot run in this repository, and ACP's
+ * unattended bootstrap run does not support them. Their ownership was assigned to repo-factory;
+ * this constant is where that assignment is written down, and the one thing to change if it moves.
  *
  * What the report does with an entry:
- * - `arm: null` makes the scenario EXTERNAL. It is listed with these test ids, the revision and
- *   the CI run, and it is never counted as a passed declaration. This tool cannot read that run,
- *   so an entry points at evidence; it is not evidence.
- * - an `arm` names the one part judged there. The scenario's verdict still comes from this
- *   repository's own declarations, and the arm is reported as not supported by the ACP run.
- * - a scenario that is listed whole and also declared by a test here, or listed whole twice, is
- *   DUPLICATE and fails. Each scenario has exactly one judge.
+ * - the scenario is EXTERNAL. It is listed with these test ids, the revision and the CI run, and
+ *   it is never counted as a passed declaration. This tool cannot read that run, so an entry
+ *   points at evidence; it is not evidence.
+ * - an arm label here for the same scenario (RF-S16's single-repository retries) is reported in
+ *   the row and covers nothing; the entry stays the scenario's only judge.
+ * - a scenario that is listed and also covered here, by a whole label or a complete set of arms,
+ *   or listed twice, is DUPLICATE and fails. Each scenario has exactly one judge.
  *
  * repo-factory's CI step (`pytest tests/ -q`) keeps no per-test result, only its summary line
  * (`852 passed, 3 skipped` for the run below). Each listed id was seen to pass in a junit run of
@@ -135,12 +139,10 @@ export const REPO_FACTORY_EXTERNAL_EVIDENCE: ExternalScenarioEvidence = {
   scenarios: [
     {
       id: "RF-S02",
-      arm: null,
       tests: ["tests/test_slice1_plan.py::test_simple_materializes_no_formal_documents_without_optional_requests"],
     },
     {
       id: "RF-S03",
-      arm: null,
       tests: [
         "tests/test_slice1_plan.py::test_standard_lean_revision_preserves_product_scope_and_required_artifacts",
         "tests/test_slice1_plan.py::test_lean_review_refuses_product_scope_and_required_artifact_removal",
@@ -152,20 +154,16 @@ export const REPO_FACTORY_EXTERNAL_EVIDENCE: ExternalScenarioEvidence = {
     },
     {
       id: "RF-S04",
-      arm: null,
       tests: ["tests/test_slice1_plan.py::test_rf_s04_a_different_timestamp_is_the_same_plan"],
     },
     {
       id: "RF-S08",
-      arm: null,
       tests: ["tests/test_slice2_stack_ci.py::test_node_workflow_installs_dependencies_on_both_declared_runtimes"],
       limit:
         "a static check of the rendered workflow; the only real lower/latest install is a recorded " +
-        "Actions run (32256790243), which no gate re-runs",
-    },
+        "Actions run (32256790243), which no gate re-runs",    },
     {
       id: "RF-S16",
-      arm: "two repositories",
       tests: [
         "tests/test_slice3_apply.py::test_a_partial_apply_reports_what_completed_rather_than_claiming_atomicity",
         "tests/test_slice3_apply.py::test_resume_after_a_partial_apply_starts_from_the_verified_receipt",
@@ -173,27 +171,48 @@ export const REPO_FACTORY_EXTERNAL_EVIDENCE: ExternalScenarioEvidence = {
     },
     {
       id: "RF-S19",
-      arm: null,
       tests: ["tests/test_publish.py::test_simple_missing_commitlore_warns_and_continues_with_a_receipt"],
     },
     {
       id: "RF-S20",
-      arm: null,
       tests: ["tests/test_publish.py::test_standard_missing_commitlore_refuses_before_push_for_revision"],
     },
     {
       id: "RF-S21",
-      arm: null,
       tests: ["tests/test_publish.py::test_guarded_missing_commitlore_refuses_before_push_as_blocking"],
     },
   ],
 };
 
+/**
+ * The arms a Repo Factory scenario is made of, where its PRD text names parts that no single test
+ * here covers at once. A label `RF-Sxx arm:<name>` witnesses one of them. A scenario is covered by
+ * a passed whole-scenario label, or by a passed label for every arm listed here; any other arm
+ * evidence is reported and covers nothing. An arm label whose name is not listed for its scenario
+ * fails the report, so a misspelt arm cannot quietly stand in for a missing one.
+ */
+export const REPO_FACTORY_SCENARIO_ARMS: Readonly<Record<string, readonly string[]>> = {
+  // Absolute path, session id, provider id, channel id.
+  "RF-S05": ["absolute-path", "session", "provider", "channel"],
+  // Re-read after creating a repository, a branch, an issue.
+  "RF-S14": ["repository", "branch", "issue"],
+  // RepoFactoryResult carries no CTO/Doctor fields; ACPActivationResult supplies them.
+  "RF-S17": ["result", "activation"],
+  // A candidate weakening the validator, the workflow or the manifest keeps the old contract.
+  "RF-S22": ["manifest", "workflow", "validator"],
+  // Public exposure is bound to the approval, and that approval is the Owner's, not Hermes'.
+  "RF-S25": ["visibility", "owner-authority"],
+};
+
 interface RepoFactoryScenarioRow {
   id: string;
   description: string;
-  /** Passed declarations in this repository's result set. */
+  /** Passed whole-scenario declarations in this repository's result set. */
   tests: TestReference[];
+  /** Passed arm declarations here, by arm. */
+  arms: Array<{ arm: string; tests: TestReference[] }>;
+  /** Arms listed for this scenario with no passed declaration. */
+  missingArms: string[];
   status: "DECLARATION_COVERED" | "DECLARATION_MISSING" | "EXTERNAL" | "DUPLICATE";
   external: ExternalScenarioReference[];
 }
@@ -241,6 +260,8 @@ export interface TraceabilityReport {
     repoFactoryScenariosDuplicated: string[];
     /** An external entry this report cannot use as written: these fail. */
     repoFactoryExternalEvidenceProblems: string[];
+    /** An arm label or arm list this report cannot use as written: these fail. */
+    repoFactoryArmProblems: string[];
   };
   requirements: RequirementRow[];
   scenarios: ScenarioRow[];
@@ -323,8 +344,21 @@ const walk = (dir: string): string[] => {
   return out;
 };
 
-const scenarioIdsIn = (title: string): string[] =>
-  [...title.matchAll(/\b((?:CP|RF)-S\d+)\b/g)].map((match) => match[1]!.replace(/-S(\d)$/, "-S0$1"));
+const normalizeScenarioId = (id: string): string => id.replace(/-S(\d)$/, "-S0$1");
+
+/**
+ * Whole-scenario labels. An id written in arm form (`RF-S16 arm:single-repository`) is not one:
+ * a comment saying "this is one arm" used to count as the whole scenario, because a bare id was
+ * all this looked for, and the qualifier around it had no effect.
+ */
+const scenarioIdsIn = (text: string): string[] =>
+  [...text.matchAll(/\b((?:CP|RF)-S\d+)\b(?!\s+arm:)/g)].map((match) => normalizeScenarioId(match[1]!));
+
+const scenarioArmsIn = (text: string): ScenarioArm[] =>
+  [...text.matchAll(/\b((?:CP|RF)-S\d+)\s+arm:([a-z0-9]+(?:-[a-z0-9]+)*)/g)].map((match) => ({
+    id: normalizeScenarioId(match[1]!),
+    arm: match[2]!,
+  }));
 
 const callBaseName = (expression: ts.Expression): string | null => {
   if (ts.isIdentifier(expression)) return expression.text;
@@ -348,6 +382,10 @@ const callbackBody = (call: ts.CallExpression): ts.ConciseBody | null => {
  * Reads test declarations through the TypeScript AST. A label is associated only with a leaf
  * test's title/body or an enclosing suite, never with file scope. A suite label is inherited only
  * by a leaf test that has no own label; an explicit leaf label always wins.
+ *
+ * Arm labels are read on leaves only. A leaf's arm label for a scenario also narrows any bare
+ * mention of that same scenario on the leaf, inherited or its own, so a title that names the
+ * scenario and a body that says which arm it is read as the arm.
  */
 export const collectExecutableTestDeclarations = (root: string = repoRoot): ExecutableTestDeclaration[] => {
   const declarations: ExecutableTestDeclaration[] = [];
@@ -369,14 +407,20 @@ export const collectExecutableTestDeclarations = (root: string = repoRoot): Exec
         }
         if (title && (baseName === "it" || baseName === "test")) {
           const body = callbackBody(node);
-          const ownScenarioIds = [
-            ...new Set([...scenarioIdsIn(title), ...(body ? scenarioIdsIn(body.getFullText(source)) : [])]),
+          const text = [title, body ? body.getFullText(source) : ""];
+          const ownScenarioIds = [...new Set(text.flatMap(scenarioIdsIn))];
+          const scenarioArms = [
+            ...new Map(text.flatMap(scenarioArmsIn).map((arm) => [`${arm.id}\u0000${arm.arm}`, arm])).values(),
           ];
+          const narrowed = new Set(scenarioArms.map((arm) => arm.id));
           declarations.push({
             file: fileName,
             title,
             fullName: [...ancestors, title].join(" "),
-            scenarioIds: ownScenarioIds.length > 0 ? ownScenarioIds : inheritedScenarioIds,
+            scenarioIds: (ownScenarioIds.length > 0 ? ownScenarioIds : inheritedScenarioIds).filter(
+              (id) => !narrowed.has(id),
+            ),
+            scenarioArms,
           });
           return;
         }
@@ -428,10 +472,10 @@ const resultKey = (file: string, fullName: string, known: ReadonlySet<string>): 
  * Failed, skipped, todo, unmatched and suite-only declarations intentionally contribute no
  * coverage.
  */
-export const passedScenarioReferences = (
+const passedDeclarations = (
   declarations: readonly ExecutableTestDeclaration[],
   result: VitestJsonReport,
-): Map<string, TestReference[]> => {
+): ExecutableTestDeclaration[] => {
   // The files this run actually found, which is what an absolute path from another machine is
   // matched back onto. Built before the result set is read, because it is the reference.
   const known = new Set(declarations.map((declaration) => declaration.file.split(sep).join("/")));
@@ -445,16 +489,40 @@ export const passedScenarioReferences = (
     }
   }
 
+  return declarations.filter((declaration) =>
+    statuses.get(resultKey(declaration.file, declaration.fullName, known))?.has("passed"),
+  );
+};
+
+const addReference = (rows: TestReference[], declaration: ExecutableTestDeclaration): TestReference[] => {
+  if (!rows.some((row) => row.file === declaration.file && row.title === declaration.title)) {
+    rows.push({ file: declaration.file, title: declaration.title });
+  }
+  return rows;
+};
+
+export const passedScenarioReferences = (
+  declarations: readonly ExecutableTestDeclaration[],
+  result: VitestJsonReport,
+): Map<string, TestReference[]> => {
   const references = new Map<string, TestReference[]>();
-  for (const declaration of declarations) {
-    const status = statuses.get(resultKey(declaration.file, declaration.fullName, known));
-    if (!status?.has("passed")) continue;
-    for (const id of declaration.scenarioIds) {
-      const rows = references.get(id) ?? [];
-      if (!rows.some((row) => row.file === declaration.file && row.title === declaration.title)) {
-        rows.push({ file: declaration.file, title: declaration.title });
-      }
-      references.set(id, rows);
+  for (const declaration of passedDeclarations(declarations, result)) {
+    for (const id of declaration.scenarioIds) references.set(id, addReference(references.get(id) ?? [], declaration));
+  }
+  return references;
+};
+
+/** Passed arm declarations, by scenario and then by arm. Matched exactly as whole labels are. */
+export const passedScenarioArmReferences = (
+  declarations: readonly ExecutableTestDeclaration[],
+  result: VitestJsonReport,
+): Map<string, Map<string, TestReference[]>> => {
+  const references = new Map<string, Map<string, TestReference[]>>();
+  for (const declaration of passedDeclarations(declarations, result)) {
+    for (const { id, arm } of declaration.scenarioArms ?? []) {
+      const arms = references.get(id) ?? new Map<string, TestReference[]>();
+      arms.set(arm, addReference(arms.get(arm) ?? [], declaration));
+      references.set(id, arms);
     }
   }
   return references;
@@ -502,37 +570,66 @@ const externalEvidenceProblems = (
     if (entry.tests.length === 0 || entry.tests.some((test) => test.trim() === "")) {
       problems.push(`${entry.id} names no external test id`);
     }
-    if (entry.arm !== null && entry.arm.trim() === "") problems.push(`${entry.id} names an empty arm`);
+  }
+  return problems;
+};
+
+/** What makes an arm label or an arm list unusable. Each problem fails the report. */
+const armProblems = (
+  declarations: readonly ExecutableTestDeclaration[],
+  requiredArms: Readonly<Record<string, readonly string[]>>,
+  repoFactoryScenarios: ReadonlyMap<string, string>,
+): string[] => {
+  const problems: string[] = [];
+  for (const [id, arms] of Object.entries(requiredArms)) {
+    if (!repoFactoryScenarios.has(id)) problems.push(`arms are listed for ${id}, which is not a Repo Factory scenario in the PRD`);
+    if (arms.length < 2) problems.push(`${id} lists ${arms.length} arm(s); a scenario of one part is labelled whole`);
+    if (new Set(arms).size !== arms.length) problems.push(`${id} lists the same arm twice`);
+  }
+  for (const declaration of declarations) {
+    for (const { id, arm } of declaration.scenarioArms ?? []) {
+      const listed = requiredArms[id];
+      if (listed && !listed.includes(arm)) {
+        problems.push(
+          `${declaration.file} › ${declaration.title}: ${id} arm '${arm}' is not one of ${listed.join(", ")}`,
+        );
+      }
+    }
   }
   return problems;
 };
 
 /**
- * One judge per scenario. A passed declaration here covers it; an external entry with no arm hands
- * it to the other repository; both at once, or two whole entries, or the same arm twice, is a
- * duplicate. An arm entry hands over only that arm, so it never covers a scenario by itself.
- * `declared` is every scenario a test here declares, passed or not: a failing declaration of an
- * externally judged scenario is still a second judge.
+ * One judge per scenario. A passed whole-scenario declaration here covers it, and so does a passed
+ * declaration for every arm listed for it; an external entry hands it to the other repository.
+ * An external entry together with either of those, or two external entries, is a duplicate.
+ * `declared` is every scenario a test here labels whole, passed or not: a failing declaration of
+ * an externally judged scenario is still a second judge. Arm evidence that does not complete a
+ * listed set is reported and decides nothing.
  */
 const repoFactoryVerdict = (
   passed: boolean,
   declared: boolean,
+  armsComplete: boolean,
   entries: readonly ExternalScenario[],
 ): RepoFactoryScenarioRow["status"] => {
-  const whole = entries.filter((entry) => entry.arm === null).length;
-  const arms = entries.filter((entry) => entry.arm !== null).map((entry) => entry.arm);
-  if (whole > 1 || (whole === 1 && (declared || arms.length > 0)) || new Set(arms).size !== arms.length) {
-    return "DUPLICATE";
-  }
-  if (whole === 1) return "EXTERNAL";
-  return passed ? "DECLARATION_COVERED" : "DECLARATION_MISSING";
+  if (entries.length > 1 || (entries.length === 1 && (declared || armsComplete))) return "DUPLICATE";
+  if (entries.length === 1) return "EXTERNAL";
+  return passed || armsComplete ? "DECLARATION_COVERED" : "DECLARATION_MISSING";
 };
 
 export interface RepoFactoryJudgementOptions {
   /** Defaults to none, so a caller that supplies nothing gets every unproven scenario reported missing. */
   external?: ExternalScenarioEvidence;
-  /** Defaults to the scenarios in `tests`, i.e. those with a passed declaration. */
-  declaredScenarioIds?: ReadonlySet<string>;
+  /**
+   * Every declaration the tree holds, passed or not. Defaults to none: the whole-scenario labels
+   * are then taken from `tests`, i.e. those with a passed declaration.
+   */
+  declarations?: readonly ExecutableTestDeclaration[];
+  /** Passed arm declarations, from `passedScenarioArmReferences`. Defaults to none. */
+  armTests?: ReadonlyMap<string, ReadonlyMap<string, TestReference[]>>;
+  /** Defaults to none, so no scenario can be covered by arms unless its arms are listed. */
+  requiredArms?: Readonly<Record<string, readonly string[]>>;
 }
 
 export const buildTraceabilityReport = (
@@ -544,7 +641,11 @@ export const buildTraceabilityReport = (
   options: RepoFactoryJudgementOptions = {},
 ): TraceabilityReport => {
   const external = options.external ?? NO_EXTERNAL_EVIDENCE;
-  const declaredScenarioIds = options.declaredScenarioIds ?? new Set(tests.keys());
+  const declaredScenarioIds = options.declarations
+    ? new Set(options.declarations.flatMap((declaration) => declaration.scenarioIds))
+    : new Set(tests.keys());
+  const armTests = options.armTests ?? new Map<string, Map<string, TestReference[]>>();
+  const requiredArms = options.requiredArms ?? {};
   const requirementRows: RequirementRow[] = [...requirements].map((requirement) => {
     const covered = requirement.scenarios.filter((id) => (tests.get(id) ?? []).length > 0);
     const missing = requirement.scenarios.filter((id) => (tests.get(id) ?? []).length === 0);
@@ -571,11 +672,17 @@ export const buildTraceabilityReport = (
   const rfScenarioRows: RepoFactoryScenarioRow[] = [...repoFactoryScenarios.entries()].map(([id, description]) => {
     const entries = external.scenarios.filter((entry) => entry.id === id);
     const passed = (tests.get(id) ?? []).length > 0;
+    const passedArms = armTests.get(id) ?? new Map<string, TestReference[]>();
+    const listed = requiredArms[id] ?? [];
+    const missingArms = listed.filter((arm) => (passedArms.get(arm) ?? []).length === 0);
+    const armsComplete = listed.length > 0 && missingArms.length === 0;
     return {
       id,
       description,
       tests: tests.get(id) ?? [],
-      status: repoFactoryVerdict(passed, passed || declaredScenarioIds.has(id), entries),
+      arms: [...passedArms.entries()].map(([arm, armReferences]) => ({ arm, tests: armReferences })),
+      missingArms,
+      status: repoFactoryVerdict(passed, passed || declaredScenarioIds.has(id), armsComplete, entries),
       external: entries.map((entry) => ({
         ...entry,
         repository: external.repository,
@@ -615,6 +722,7 @@ export const buildTraceabilityReport = (
       repoFactoryScenariosExternal: rfIds("EXTERNAL"),
       repoFactoryScenariosDuplicated: rfIds("DUPLICATE"),
       repoFactoryExternalEvidenceProblems: externalEvidenceProblems(external, repoFactoryScenarios),
+      repoFactoryArmProblems: armProblems(options.declarations ?? [], requiredArms, repoFactoryScenarios),
     },
     requirements: requirementRows,
     scenarios: scenarioRows,
@@ -634,7 +742,8 @@ export const traceabilityPasses = (report: TraceabilityReport): boolean =>
   report.summary.requirementsWithGaps === 0 &&
   report.summary.repoFactoryScenariosMissing.length === 0 &&
   report.summary.repoFactoryScenariosDuplicated.length === 0 &&
-  report.summary.repoFactoryExternalEvidenceProblems.length === 0;
+  report.summary.repoFactoryExternalEvidenceProblems.length === 0 &&
+  report.summary.repoFactoryArmProblems.length === 0;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -759,6 +868,7 @@ const markdownReport = (report: TraceabilityReport): string => [
     ? [`- Duplicated Repo Factory scenarios: ${report.summary.repoFactoryScenariosDuplicated.join(", ")}`]
     : []),
   ...report.summary.repoFactoryExternalEvidenceProblems.map((problem) => `- External evidence problem: ${problem}`),
+  ...report.summary.repoFactoryArmProblems.map((problem) => `- Arm label problem: ${problem}`),
   "",
   "| Requirement | Blocking | Declared scenarios | Declaration status |",
   "|---|---|---|---|",
@@ -776,24 +886,36 @@ const markdownReport = (report: TraceabilityReport): string => [
       `| ${row.id} | ${row.status} | ${row.tests.map((test) => `${test.file} › ${test.title}`).join("<br>") || "—"} |`,
   ),
   "",
-  "A Repo Factory scenario is judged here by a passed declaration, or by another repository's tests",
-  "when it is listed in `REPO_FACTORY_EXTERNAL_EVIDENCE` (`src/tools/traceability.ts`). An EXTERNAL",
-  "row is a pointer to that repository's run, which this report does not read, and it is not",
-  "counted as passed. The last column is recorded with the entry, not measured: `—` means nothing",
-  "is recorded as unsupported, and this report does not measure the unattended run either way.",
+  "A Repo Factory scenario is covered here by a passed whole-scenario declaration, or by a passed",
+  "declaration for every arm `REPO_FACTORY_SCENARIO_ARMS` lists for it. An arm label",
+  "(`RF-Sxx arm:<name>`) witnesses one part and never covers the scenario by itself. A scenario",
+  "listed in `REPO_FACTORY_EXTERNAL_EVIDENCE` is EXTERNAL: the row points at that repository's run,",
+  "which this report does not read, and it is not counted as passed. The last column is recorded",
+  "with the external entry, not measured: `—` means nothing is recorded as unsupported, and this",
+  "report does not measure the unattended run either way.",
   "",
-  "| Repo Factory scenario | Verdict | Passed executable test declarations | Judged by another repository | Not supported by the ACP unattended run |",
-  "|---|---|---|---|---|",
+  "| Repo Factory scenario | Verdict | Passed whole-scenario declarations | Passed arm declarations | Arms with no passed declaration | Judged by another repository | Not supported by the ACP unattended run |",
+  "|---|---|---|---|---|---|---|",
   ...report.repoFactoryScenarios.map((row) => {
+    const references = (tests: TestReference[]) => tests.map((test) => `${test.file} › ${test.title}`);
+    const arms = row.arms.flatMap(({ arm, tests }) => references(tests).map((reference) => `${arm}: ${reference}`));
     const externally = row.external
       .map(
         (entry) =>
-          `${entry.arm === null ? "" : `${entry.arm} arm: `}${entry.repository}@${entry.revision.slice(0, 12)} ` +
-          `(CI run ${entry.ciRun}): ${entry.tests.join(", ")}${entry.limit ? ` (limit: ${entry.limit})` : ""}`,
+          `${entry.repository}@${entry.revision.slice(0, 12)} (CI run ${entry.ciRun}): ${entry.tests.join(", ")}` +
+          `${entry.limit ? ` (limit: ${entry.limit})` : ""}`,
       )
       .join("<br>");
-    const unsupported = row.external.map((entry) => entry.arm ?? "whole scenario").join(", ");
-    return `| ${row.id} | ${row.status} | ${row.tests.map((test) => `${test.file} › ${test.title}`).join("<br>") || "—"} | ${externally || "—"} | ${unsupported || "—"} |`;
+    const cells = [
+      row.id,
+      row.status,
+      references(row.tests).join("<br>") || "—",
+      arms.join("<br>") || "—",
+      row.missingArms.join(", ") || "—",
+      externally || "—",
+      row.external.length > 0 ? "whole scenario" : "—",
+    ];
+    return `| ${cells.join(" | ")} |`;
   }),
 ].join("\n");
 
@@ -804,6 +926,8 @@ export interface TraceabilityMainOptions {
   emitOutput?: boolean;
   /** Defaults to `REPO_FACTORY_EXTERNAL_EVIDENCE`. */
   external?: ExternalScenarioEvidence;
+  /** Defaults to `REPO_FACTORY_SCENARIO_ARMS`. */
+  requiredArms?: Readonly<Record<string, readonly string[]>>;
 }
 
 export interface TraceabilityMainResult {
@@ -824,7 +948,9 @@ export const main = (options: TraceabilityMainOptions = {}): TraceabilityMainRes
   const tests = passedScenarioReferences(declarations, vitest);
   const report = buildTraceabilityReport(requirements.values(), scenarios, rfScenarios, tests, vitest, {
     external: options.external ?? REPO_FACTORY_EXTERNAL_EVIDENCE,
-    declaredScenarioIds: new Set(declarations.flatMap((declaration) => declaration.scenarioIds)),
+    declarations,
+    armTests: passedScenarioArmReferences(declarations, vitest),
+    requiredArms: options.requiredArms ?? REPO_FACTORY_SCENARIO_ARMS,
   });
 
   if (options.writeEvidence ?? true) {
@@ -859,6 +985,7 @@ export const main = (options: TraceabilityMainOptions = {}): TraceabilityMainRes
       for (const problem of report.summary.repoFactoryExternalEvidenceProblems) {
         process.stderr.write(`external evidence: ${problem}\n`);
       }
+      for (const problem of report.summary.repoFactoryArmProblems) process.stderr.write(`arm label: ${problem}\n`);
     }
   }
   return { report, exitCode: passes ? 0 : 1 };

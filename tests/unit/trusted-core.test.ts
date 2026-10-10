@@ -559,6 +559,8 @@ describe("portable project manifest (Integration §10.2)", () => {
   });
 
   it("CP-S04 / RF-S05: rejects absolute paths and session identifiers", () => {
+    // RF-S05 arm:absolute-path
+    // RF-S05 arm:session
     const withPath = { ...base, repositories: [{ role: "primary", remote: "/Users/example/x", manifestRoot: "." }] };
     const decision = assertPortableManifest(withPath);
     expect(decision.allowed).toBe(false);
@@ -593,20 +595,24 @@ describe("portable project manifest (Integration §10.2)", () => {
   };
 
   it("RF-S05: refuses a provider API key inside a value", () => {
+    // RF-S05 arm:provider
     expectNotPortable(withArgvValue(`sk-${"a1B2".repeat(6)}`), "provider api key");
   });
 
   it("RF-S05: refuses a provider quota snapshot, as a key and inside a value", () => {
+    // RF-S05 arm:provider
     expectRefusedBySchema({ ...base, remainingPercent: 42 }, "remainingPercent");
     expectNotPortable(withArgvValue("--remainingPercent=42"), "provider quota snapshot");
   });
 
   it("RF-S05: refuses a Telegram identity, as a key and inside a value", () => {
+    // RF-S05 arm:channel
     expectRefusedBySchema({ ...base, telegramChatId: "123456789" }, "telegramChatId");
     expectNotPortable(withArgvValue("--telegramChatId=123456789"), "telegram identity");
   });
 
   it("RF-S05: refuses a Buzz channel identity, as a key and inside a value", () => {
+    // RF-S05 arm:channel
     expectRefusedBySchema({ ...base, buzzChannel: "acp-cto" }, "buzzChannel");
     expectNotPortable(withArgvValue("--buzzChannel=acp-cto"), "buzz channel identity");
   });

@@ -129,7 +129,6 @@ describe("GitHub write port over the REST API (#246)", () => {
   });
 
   it("reads a branch head, sets the default branch, and protects and re-reads a branch in the port's own vocabulary", async () => {
-    // RF-S14: the protection is re-read after the write and reported as GitHub holds it, not as it was asked for.
     const client = scriptedClient({
       "GET repos/acme/fixture/branches/main": { name: "main", commit: { sha: "a".repeat(40) } },
       "PATCH repos/acme/fixture": {},

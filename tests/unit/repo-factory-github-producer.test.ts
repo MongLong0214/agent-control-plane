@@ -141,7 +141,8 @@ const evidenceOf = (decision: { allowed: boolean; evidence: Record<string, unkno
 
 describe("repo factory producer performs planned GitHub operations (#246)", () => {
   it("performs each planned operation through the port and receipts what GitHub answered, not what the plan said", async () => {
-    // RF-S14: every receipt is GitHub's re-read after the write (its owner spelling, node id and head), not the plan's request.
+    // RF-S14 arm:repository: the created repository's receipt is GitHub's re-read (its owner spelling, node id), not the plan's request.
+    // RF-S14 arm:branch: the pushed branch's receipt is the head GitHub holds on re-read, not the commit this process made.
     const { workDir, github } = makeSandbox();
     // GitHub spells the owner its own way. A receipt that copied the plan would say `acme`.
     github.canonicalOwner = "Acme";
@@ -312,8 +313,6 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
     });
 
     it("refuses a plan whose repository visibility differs from the approved visibility, with no GitHub call", async () => {
-      // RF-S25, visibility arm: the exposure is bound to the visibility in the owner's approval, before any GitHub call.
-      // That only the owner can give that approval is witnessed at the runner, not in this file.
       const { workDir, github } = makeSandbox();
       const ops = operations();
       ops[0] = { ...ops[0]!, desiredState: { visibility: "private" } } as unknown as Operation;
@@ -324,6 +323,23 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
       expect(produced.allowed).toBe(false);
       expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
       expect(evidenceOf(produced).refusal).toBe("VISIBILITY_MISMATCH");
+      expect(github.writes).toEqual([]);
+      expect(github.reads).toEqual([]);
+    });
+
+    it("refuses a public repository when the approval covers only a private one, with no GitHub call", async () => {
+      // RF-S25 arm:visibility: exposure cannot exceed what the approval names. The plan asks for a
+      // public repository and the approval says private, so nothing is read or written.
+      // That the approval has to be the owner's, never Hermes', is witnessed at the runner.
+      const { workDir, github } = makeSandbox();
+      const produced = await produce(workDir, github, { authority: authority({ visibility: "private" }) });
+      expect(produced.allowed).toBe(false);
+      expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
+      expect(evidenceOf(produced)).toMatchObject({
+        refusal: "VISIBILITY_MISMATCH",
+        planned: "public",
+        approved: "private",
+      });
       expect(github.writes).toEqual([]);
       expect(github.reads).toEqual([]);
     });
@@ -404,8 +420,8 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
 
   describe("partial failure leaves exact receipts and a resumable state, never a rollback", () => {
     it("records what succeeded, stops at the failure, and the retry performs only what is left", async () => {
-      // RF-S16, single-repository arm only: this producer creates one repository by construction.
-      // The two-repository arm is judged in repo-factory (REPO_FACTORY_EXTERNAL_EVIDENCE in src/tools/traceability.ts).
+      // RF-S16 arm:single-repository: retries across one repository's operations. This producer creates one
+      // repository by construction, so the scenario itself is judged in repo-factory (REPO_FACTORY_EXTERNAL_EVIDENCE).
       const { workDir, github } = makeSandbox();
       github.failNext = "protectBranch";
       const first = await produce(workDir, github);
@@ -448,7 +464,7 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
     });
 
     it("a failure at the push leaves only the repository receipted, and the retry pushes a fresh commit to it", async () => {
-      // RF-S16, single-repository arm only (see the test above).
+      // RF-S16 arm:single-repository (see the test above).
       const { workDir, github } = makeSandbox();
       github.failNext = "pushBranch";
       const first = await produce(workDir, github);
@@ -463,7 +479,6 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
     });
 
     it("a readback that disagrees with what was asked is a failure, not a receipt", async () => {
-      // RF-S14: the re-read after a write decides; a write GitHub kept differently is refused, not receipted.
       const { workDir, github } = makeSandbox();
       // The write call returns, and GitHub keeps something weaker than was requested.
       github.keepProtection = (requested) => ({ ...(requested as Protection), enforceAdmins: false });
