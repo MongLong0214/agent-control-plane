@@ -8,11 +8,13 @@ import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { isTerminal } from "../domain/run-state.ts";
 import {
   PRODUCER_ROLES,
   ROLE_SCOPE,
   Role,
   type RoleBinding,
+  type RunState,
   SessionLifecycle,
   roleKeyFor,
 } from "../domain/types.ts";
@@ -808,11 +810,15 @@ export class BindingRegistry {
    * managed write guard reads the row's `run_id`, and retirement reads the task's, so a row whose two
    * disagree would let one run's end revoke another run's live worker. A task with no row has
    * nothing to derive from and is left as it was.
+   *
+   * And a task whose run has ended gets no WORKER: retirement revokes a terminal run's WORKERs in the
+   * transaction that ends it, so whichever of the two transactions commits first, no WORKER of an
+   * ended run is ACTIVE after both. Only WORKER is fenced here; no other role reads its run this way.
    */
   #assertWorkerScope(input: BindInput): Decision<void> {
     if (input.role !== Role.WORKER || !input.taskId) return allow(ReasonCode.OK, undefined);
-    const task = this.db.get<{ run_id: string; project_id: string | null }>(
-      `SELECT t.run_id, r.project_id FROM tasks t LEFT JOIN runs r ON r.run_id = t.run_id WHERE t.task_id = ?`,
+    const task = this.db.get<{ run_id: string; project_id: string | null; state: RunState | null }>(
+      `SELECT t.run_id, r.project_id, r.state FROM tasks t LEFT JOIN runs r ON r.run_id = t.run_id WHERE t.task_id = ?`,
       [input.taskId],
     );
     if (!task) return allow(ReasonCode.OK, undefined);
@@ -825,6 +831,13 @@ export class BindingRegistry {
         projectId: input.projectId ?? null,
         taskRunId: task.run_id,
         taskProjectId: task.project_id,
+      });
+    }
+    if (task.state !== null && isTerminal(task.state)) {
+      return deny(ReasonCode.RUN_ALREADY_TERMINAL, "the WORKER's run has ended; it is not bound again", {
+        taskId: input.taskId,
+        runId: task.run_id,
+        state: task.state,
       });
     }
     return allow(ReasonCode.OK, undefined);

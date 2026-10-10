@@ -16,6 +16,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
+import { isTerminal } from "../domain/run-state.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
@@ -601,6 +602,9 @@ export class ContinuityKernel {
           };
     const switchAdmission = await this.capacity.refreshForProviderSwitch(switchTarget);
     if (!switchAdmission.allowed) return switchAdmission as Decision<{ provider: string; generation: number }>;
+    // #512 — a WORKER whose run ended while the admission was awaited is not staffed again.
+    const endedBeforeSpawn = this.#workerRunEnded(role, scope);
+    if (endedBeforeSpawn) return endedBeforeSpawn;
 
     const expected = this.bindings.active(roleKey);
     // #954 — a role continuity revoked for want of coverage gets its binding back only from a claim
@@ -621,6 +625,12 @@ export class ContinuityKernel {
     }
     const provisioned = await this.provisionRoutableSession(role, assignment.provider, `continuity:${role}`);
     if (!provisioned.allowed) return provisioned as Decision<{ provider: string; generation: number }>;
+    // #512 — nor one whose run ended while its session was provisioned; that session is never bound.
+    const endedAfterSpawn = this.#workerRunEnded(role, scope);
+    if (endedAfterSpawn) {
+      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "the worker's run ended");
+      return endedAfterSpawn;
+    }
 
     // This catches a newer binding that arrived while session creation, route connection,
     // or readiness was awaited. BindingRegistry still performs the final generation check
@@ -671,6 +681,28 @@ export class ContinuityKernel {
     return allow(ReasonCode.OK, {
       provider: assignment.provider,
       generation: switched.value.bindingGeneration,
+    });
+  }
+
+  /**
+   * #512 — the refusal for failing over a WORKER whose task's run has ended, or null. Asked after each
+   * of the failover's awaits; the registry's bind and switch refuse the same WORKER in their own
+   * transactions, which is what holds when the run ends between this check and the switch.
+   */
+  #workerRunEnded(
+    role: Role,
+    scope: { taskId?: string | null },
+  ): Decision<{ provider: string; generation: number }> | null {
+    if (role !== Role.WORKER || !scope.taskId) return null;
+    const run = this.db.get<{ run_id: string; state: RunState }>(
+      `SELECT r.run_id, r.state FROM tasks t JOIN runs r ON r.run_id = t.run_id WHERE t.task_id = ?`,
+      [scope.taskId],
+    );
+    if (!run || !isTerminal(run.state)) return null;
+    return deny(ReasonCode.RUN_ALREADY_TERMINAL, "the worker's run has ended; it is not failed over", {
+      taskId: scope.taskId,
+      runId: run.run_id,
+      state: run.state,
     });
   }
 

@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { sha256 } from "../../src/core/digest.ts";
 import { allow } from "../../src/core/errors.ts";
@@ -267,10 +267,12 @@ describe("the reconcile pass retires a WORKER whose run already ended", () => {
   it("revokes an ACTIVE WORKER of an already-CANCELLED run at daemon start, and a second pass is a no-op", async () => {
     const harness = gatedHarness();
     const run = await activeRun(harness);
-    expect(harness.cp.runs.cancel(run.runId, "owner cancelled the run").allowed).toBe(true);
-    // A WORKER bound after the run ended, by a binder that is not the staffing path: the state an
-    // ended run left behind before retirement existed.
     const workerSessionId = bindWorker(harness, run.taskIds[0]!);
+    // The state a run that ended before retirement existed left behind: its terminal transition
+    // retired nothing, so its WORKER is still ACTIVE on a CANCELLED run.
+    harness.cp.runs.attach({ workerRetirement: { retireRun: () => [] } });
+    expect(harness.cp.runs.cancel(run.runId, "owner cancelled the run").allowed).toBe(true);
+    harness.cp.runs.attach({ workerRetirement: harness.cp.workerRetirement });
     expect(workerAssignment(harness, run.taskIds[0]!)?.status).toBe("ACTIVE");
 
     await runDaemonOnce(harness, "acp-worker-retire-reconcile-1-");
@@ -481,6 +483,124 @@ describe("review round 1: a WORKER's run is its task's run (wr-r1-03)", () => {
     expect(harness.cp.audit.byKind("WORKER_RETIREMENT_DEFERRED")
       .filter((entry) => entry.roleKey === roleKey)
       .map((entry) => entry.evidence)).toEqual([expect.objectContaining({ refusal: "WORKER_SCOPE_CONFLICT" })]);
+  });
+});
+
+/**
+ * A continuity failover of `WORKER:<task>` from a coverage plan taken while the task's execution was
+ * RUNNING, on a Claude double, with route and readiness answered. `duringAdmission` runs inside the
+ * provider-switch admission, the failover's first await after the plan.
+ */
+const workerFailover = async (
+  harness: Harness,
+  run: ActiveRun,
+  duringAdmission: () => Promise<void> = async () => undefined,
+) => {
+  const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskIds[0]! });
+  const plan = await harness.cp.continuity.evaluate("worker replacement planned while the turn ran");
+  expect(plan.requiredRoles.some((role) => role.roleKey === roleKey)).toBe(true);
+  plan.assignments = plan.assignments.map((assignment) =>
+    assignment.roleKey === roleKey ? { ...assignment, provider: "claude", reason: "preferred" } : assignment);
+  const evaluate = vi.spyOn(harness.cp.continuity, "evaluate").mockResolvedValue(plan);
+  const admission = vi.spyOn(harness.cp.capacity, "refreshForProviderSwitch").mockImplementation(async () => {
+    await duringAdmission();
+    return allow(ReasonCode.OK, undefined as never);
+  });
+  harness.cp.continuity.attach({
+    buzz: { connect: async () => allow(ReasonCode.OK, "test-route") },
+    readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+  });
+  try {
+    return await harness.cp.continuity.failover(
+      roleKey,
+      Role.WORKER,
+      { projectId: run.projectId, runId: run.runId, taskId: run.taskIds[0]! },
+      "worker runtime lost",
+    );
+  } finally {
+    evaluate.mockRestore();
+    admission.mockRestore();
+  }
+};
+
+/** A run whose task has a bound WORKER with a RUNNING receipt, and a Claude double for its failover. */
+const runningWorker = async (harness: Harness) => {
+  const run = await activeRun(harness);
+  const workerSessionId = bindWorker(harness, run.taskIds[0]!);
+  const execution = harness.cp.tasks.startExecution({
+    runId: run.runId,
+    taskId: run.taskIds[0]!,
+    ownerBindingGeneration: run.ownerBindingGeneration,
+    workerSessionId,
+    provider: "scripted",
+    model: "scripted-worker",
+    repositoryId: run.repositoryId,
+  });
+  if (!execution.allowed) throw new Error(execution.message);
+  const claude = new ClaudeWorkerDouble(harness.clock);
+  harness.cp.providers.registerForRole(claude, Role.WORKER);
+  return { run, workerSessionId, roleKey: roleKeyFor(Role.WORKER, { taskId: run.taskIds[0]! }) };
+};
+
+const claudeSessions = (harness: Harness) =>
+  harness.cp.db.all<{ session_id: string; lifecycle: string }>(
+    `SELECT session_id, lifecycle FROM sessions WHERE provider = 'claude' ORDER BY session_id`,
+  );
+
+describe("review round 1: a terminal run's WORKER never comes back ACTIVE (wr-r1-02)", () => {
+  it("cancel first: a failover the cancel overtakes during its admission binds nothing and leaves no session", async () => {
+    const harness = gatedHarness();
+    const { run, roleKey } = await runningWorker(harness);
+    const result = await workerFailover(harness, run, async () => {
+      expect(harness.cp.runs.cancel(run.runId, "cancelled during the failover's admission").allowed).toBe(true);
+      await harness.cp.workerRetirement.settled();
+      expect(harness.cp.bindings.active(roleKey)).toBeNull();
+    });
+    await harness.cp.workerRetirement.settled();
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.RUN_ALREADY_TERMINAL);
+    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.CANCELLED);
+    expect(harness.cp.bindings.active(roleKey)).toBeNull();
+    expect(harness.cp.bindings.history(roleKey).map((binding) => binding.status)).toEqual(["REVOKED"]);
+    expect(claudeSessions(harness).filter((session) => session.lifecycle !== SessionLifecycle.STOPPED)).toEqual([]);
+  });
+
+  it("failover first: the WORKER it binds is retired by the cancel that follows", async () => {
+    const harness = gatedHarness();
+    const { run, roleKey } = await runningWorker(harness);
+    const result = await workerFailover(harness, run);
+    if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
+    expect(result.value.generation).toBe(2);
+    const replacement = harness.cp.bindings.active(roleKey)!;
+
+    expect(harness.cp.runs.cancel(run.runId, "cancelled after the failover").allowed).toBe(true);
+    await harness.cp.workerRetirement.settled();
+
+    expect(harness.cp.bindings.active(roleKey)).toBeNull();
+    expect(harness.cp.bindings.history(roleKey).map((binding) => binding.status)).toEqual(["REVOKED", "REVOKED"]);
+    expect(workerAssignment(harness, run.taskIds[0]!)?.revoked_reason).toMatch(/run ended CANCELLED/);
+    expect(lifecycleOf(harness, replacement.sessionId)).toBe(SessionLifecycle.STOPPED);
+  });
+
+  it("the registry refuses to bind or switch a WORKER whose task's run has ended", async () => {
+    const harness = gatedHarness();
+    const run = await activeRun(harness);
+    expect(harness.cp.runs.cancel(run.runId, "ended before anything was bound").allowed).toBe(true);
+    const session = harness.cp.sessions.create({ provider: "scripted", model: "scripted-worker" });
+    harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "worker ready");
+
+    const bound = harness.cp.bindings.bind({ role: Role.WORKER, sessionId: session.sessionId, taskId: run.taskIds[0]! });
+    const switched = harness.cp.bindings.switchTo({
+      role: Role.WORKER,
+      sessionId: session.sessionId,
+      taskId: run.taskIds[0]!,
+      reason: "switch onto an ended run",
+      conversation: "REPLACED",
+    });
+
+    expect([bound.reasonCode, switched.reasonCode]).toEqual([ReasonCode.RUN_ALREADY_TERMINAL, ReasonCode.RUN_ALREADY_TERMINAL]);
+    expect(harness.cp.bindings.history(roleKeyFor(Role.WORKER, { taskId: run.taskIds[0]! }))).toEqual([]);
   });
 });
 
