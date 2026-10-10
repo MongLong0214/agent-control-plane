@@ -792,8 +792,8 @@ describe("portable project manifest (Integration §10.2)", () => {
   });
 
   it("RF-S22 arm:validator #1082 R1-02: a gate file names its module format in its extension, or is refused with its own code", () => {
-    // Node runs `.js`, `.ts` and extensionless files as CommonJS or as an ES module according to the
-    // candidate's package.json, so pinned bytes alone do not fix what they decide.
+    // Every declared file, entry or helper, is exactly .mjs or .cjs: the only two extensions whose
+    // module format node takes from the extension alone (round 4: an allowlist, not a denylist).
     const refusals = (manifest: unknown): string[] => {
       const decision = assertPortableManifest(manifest);
       if (decision.allowed) return [];
@@ -810,12 +810,16 @@ describe("portable project manifest (Integration §10.2)", () => {
 
     const gated = runsGate(["node", "scripts/gate.mjs"]);
     const withHelper = (path: string) => ({ ...gated, gateEntries: [gate, { ...gate, path, loadedBy: "scripts/gate.mjs" }] });
-    for (const path of ["scripts/decide.js", "scripts/decide.ts", "scripts/decide", "scripts/decide.JS"]) {
+    // `.txt` and `.json` included: `require` runs an unknown extension as JavaScript, and that node
+    // can load a file is no reason to admit it.
+    for (const path of [
+      "scripts/decide.js", "scripts/decide.ts", "scripts/decide", "scripts/decide.JS",
+      "scripts/decide.txt", "scripts/thresholds.json", "scripts/decide.MJS", "scripts/decide.node",
+    ]) {
       expect(refusals(withHelper(path)), path).toEqual([GATE_ENTRY_MODULE_FORMAT_UNPINNED]);
+      expect(refusedAt(withHelper(path)), path).toEqual(["gateEntries"]);
     }
-    // A helper whose format is its extension's alone stays declarable: code as .mjs or .cjs, and
-    // data Node reads the same way under every package setting.
-    for (const path of ["scripts/decide.mjs", "scripts/decide.cjs", "scripts/thresholds.json"]) {
+    for (const path of ["scripts/decide.mjs", "scripts/decide.cjs"]) {
       expect(assertPortableManifest(withHelper(path)).allowed, path).toBe(true);
     }
     // The code belongs to this refusal only: every other gateEntries refusal carries none.

@@ -125,14 +125,20 @@ export const projectManifestSchema = z
      * refused: CI runs it after earlier steps of the approved job that ACP cannot see, so nothing
      * ACP checks binds what CI executed. BOTH_REQUIRED is admitted because its local run is checked.
      *
-     * Every declared file names its module format in its extension (#1082 R1-02, round 3). An
-     * entry is `.mjs` or `.cjs`; a helper may not be `.js`, `.ts` or extensionless, and a JavaScript
-     * helper is therefore `.mjs` or `.cjs` too. Node runs a `.js` file as CommonJS or as an ES
-     * module according to the nearest package.json `"type"` and, with no type, the file's own
-     * syntax, so a candidate that changes only its package.json could change what unchanged pinned
-     * bytes decide. Anything else is refused with the issue refusal code
-     * `GATE_ENTRY_MODULE_FORMAT_UNPINNED`; nothing is renamed or loaded another way on the
-     * producer's behalf.
+     * Every declared file -- entry and helper alike -- is `.mjs` or `.cjs`, exactly (#1082 R1-02,
+     * rounds 3 and 4). Node runs a `.js` file as CommonJS or as an ES module according to the
+     * nearest package.json `"type"` and, with no type, the file's own syntax, so a candidate that
+     * changes only its package.json could change what unchanged pinned bytes decide; and `require`
+     * runs a file of any unknown extension as JavaScript. Anything else is refused with the issue
+     * refusal code `GATE_ENTRY_MODULE_FORMAT_UNPINNED`; nothing is renamed or loaded another way on
+     * the producer's behalf.
+     *
+     * A declared file is reached by a path its loader's pinned bytes name, relative to it. The
+     * package.json Node consults for a declared file -- the nearest one at or above its directory --
+     * must define none of `imports`, `exports` and `main`, or verification refuses CONTRACT_UNVERIFIED
+     * before anything runs: those fields let package configuration, not pinned bytes, choose which
+     * file a `#name`, self-reference or directory specifier loads (round 4). A project whose root
+     * package.json defines them puts a package.json without them beside its gate files.
      *
      * `.optional()` with no default is load-bearing. `manifestDigest` digests the parsed object,
      * so a defaulted `[]` would change the digest of every manifest written before this field
@@ -148,9 +154,8 @@ export const projectManifestSchema = z
      * too; an entry that loads any undeclared candidate file in-process can be short-circuited
      * through that file, so a gate entry means something only when it is self-contained. The
      * same holds for a program the entry runs by name: the sandbox PATH lists the worktree, so a
-     * name can resolve to a file the candidate commits. A helper is trusted to be loaded by a
-     * path its root's pinned bytes name; a loader that resolves it through candidate
-     * configuration (a package.json `imports` map) is not bound.
+     * name can resolve to a file the candidate commits. A bare specifier resolves through the
+     * candidate's node_modules, which is the candidate's dependency tree and is not bound either.
      */
     gateEntries: z
       .array(
@@ -394,42 +399,33 @@ const gateEntryRoot = (entry: GateEntry, declared: ReadonlyMap<string, GateEntry
  */
 export const GATE_ENTRY_MODULE_FORMAT_UNPINNED = "GATE_ENTRY_MODULE_FORMAT_UNPINNED";
 
-/** The extensions whose module format Node takes from the extension alone. */
-const EXPLICIT_MODULE_EXTENSIONS: ReadonlySet<string> = new Set([".mjs", ".cjs"]);
-
 /**
- * The extensions whose module format Node takes from the candidate's tree instead: `.js`, `.ts`
- * (type stripping follows `.js`) and none. Measured on Node 24.18 and 22.23, loading one file by a
- * relative path from a `.cjs` and from an `.mjs` loader under `"type": "commonjs"`, `"module"` and
- * no type: each of these three ran as CommonJS or as an ES module according to the nearest
- * package.json, and a `.txt` file ran the same way under all three (CommonJS through `require`,
- * refused by `import`). With no `type`, Node also decides `.js` from the file's own syntax.
+ * The only extensions a declared gate file -- entry or helper -- may have (#1082 R1-02, round 4):
+ * the two whose module format Node takes from the extension alone. An allowlist, not a list of the
+ * extensions known to vary: a closure review declared a `gate/decide.txt` helper, which a denylist
+ * of `.js`, `.ts` and extensionless admitted, and node's `require` ran it as JavaScript through its
+ * fallback loader. That node can run a file is never a reason to admit it.
  */
-const PACKAGE_CLASSIFIED_EXTENSIONS: ReadonlySet<string> = new Set([".js", ".ts", ""]);
+const EXPLICIT_MODULE_EXTENSIONS: ReadonlySet<string> = new Set([".mjs", ".cjs"]);
 
 /**
  * Why `entry` cannot be pinned by its bytes alone, or null. The same bytes run as CommonJS or as
  * an ES module depending on files the candidate owns, and the two can decide differently: measured,
  * an unchanged `.js` gate that exits 1 under `{"type":"commonjs"}` exited 0 when the candidate
- * changed only `package.json` to `{"type":"module"}`. So an entry, which `node` executes, must be
- * `.mjs` or `.cjs`, and a helper must not have an extension whose format the package decides. No
- * existing declaration is rewritten to another extension or run through another loader: it is
- * refused, and the producer renames the file and re-pins it.
+ * changed only `package.json` to `{"type":"module"}`. So every declared file must be `.mjs` or
+ * `.cjs`, exactly. No existing declaration is rewritten to another extension or run through
+ * another loader: it is refused, and the producer renames the file and re-pins it.
  */
 const moduleFormatRefusal = (entry: GateEntry): string | null => {
   const extension = posix.extname(entry.path);
-  if (entry.loadedBy === undefined) {
-    return EXPLICIT_MODULE_EXTENSIONS.has(extension)
-      ? null
-      : `gateEntry '${entry.path}' must name its module format in its extension (.mjs or .cjs): node decides how ` +
-          `'${extension || "an extensionless file"}' runs from the candidate's package.json "type" and the file's own ` +
-          "syntax, so the same pinned bytes can decide differently";
-  }
-  return PACKAGE_CLASSIFIED_EXTENSIONS.has(extension.toLowerCase())
-    ? `gateEntry '${entry.path}' (loaded by '${entry.loadedBy}') must name its module format in its extension (.mjs ` +
-        `or .cjs): '${extension || "an extensionless file"}' is loaded as CommonJS or as an ES module according to ` +
-        "the candidate's package.json"
-    : null;
+  if (EXPLICIT_MODULE_EXTENSIONS.has(extension)) return null;
+  const named = `'${extension || "an extensionless file"}'`;
+  return entry.loadedBy === undefined
+    ? `gateEntry '${entry.path}' must name its module format in its extension (.mjs or .cjs): node decides how ` +
+        `${named} runs from the candidate's package.json "type" and the file's own syntax, so the same pinned ` +
+        "bytes can decide differently"
+    : `gateEntry '${entry.path}' (loaded by '${entry.loadedBy}') must be .mjs or .cjs: ${named} is not an extension ` +
+        "that fixes how node loads the file";
 };
 
 /**

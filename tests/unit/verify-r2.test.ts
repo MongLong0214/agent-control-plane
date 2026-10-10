@@ -1105,49 +1105,179 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     expect(result).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
   });
 
+  /** Runs `verifyPinned`, probing the gate with real node in its worktree if a command is launched. */
+  const verifyProbing = async (candidate: Awaited<ReturnType<typeof frozenPinnedCandidate>>, entryPath: string) => {
+    let probe: ReturnType<typeof nodeProbe> | undefined;
+    const real = vi.mocked(runSandboxed).getMockImplementation()!;
+    vi.mocked(runSandboxed).mockImplementation(async (input) => {
+      probe = nodeProbe(input.worktreePath, entryPath, candidate.manifest.verificationCommands[0]!);
+      return real(input);
+    });
+    try {
+      return { result: await verifyPinned(candidate), probe, launched: vi.mocked(runSandboxed).mock.calls.length };
+    } finally {
+      vi.mocked(runSandboxed).mockImplementation(real);
+    }
+  };
+  const WEAK = "console.log('HELPER_BYPASS'); process.exit(0);\n";
+
   it.each([
     ["mjs", "import { passes } from './decide.mjs';\nif (!passes) process.exit(1);\n", "export const passes = false;\n"],
     ["cjs", "const { passes } = require('./decide.cjs');\nif (!passes) process.exit(1);\n", "module.exports = { passes: false };\n"],
   ] as const)("RF-S22 arm:validator #1082 R1-02: a declared .%s helper is loaded by its pinned path whatever the candidate's package configuration says", async (ext, gate, helper) => {
     // The control the CEO asked to keep: with explicit extensions, neither the entry nor the helper
-    // it names by relative path is re-pointed by a package.json type flip, an imports or exports
-    // map, or a sibling with another extension. (A helper loaded through an `#imports` specifier
-    // remains outside the guarantee, as the gateEntries contract says.)
+    // it names by relative path is re-pointed by a package.json type flip or a sibling with another
+    // extension -- the gate runs and decides with its pinned helper. A package.json that also
+    // carries an imports or exports map is refused before anything runs (round 4), whatever the
+    // gate's specifiers are, because that configuration could choose the helper.
     const entryPath = `gate/check.${ext}`, helperPath = `gate/decide.${ext}`;
     const m = gateManifest([entry(entryPath, gate), entry(helperPath, helper, entryPath)]);
     m.verificationCommands = [{ ...m.verificationCommands[0]!, argv: ["node", entryPath] }];
-    const weak = "console.log('HELPER_BYPASS'); process.exit(0);\n";
-    const c = await frozenPinnedCandidate({
+    const candidateWith = (maps: boolean) => frozenPinnedCandidate({
       manifest: m,
       beforeRun: (repo) => {
         writeFiles(repo, { [entryPath]: gate, [helperPath]: helper });
         commitAll(repo, "gate and helper");
       },
       candidateChange: (repo) => writeFiles(repo, {
-        "package.json": JSON.stringify({ type: ext === "mjs" ? "commonjs" : "module", imports: { "#decide": "./bypass.mjs" }, exports: "./bypass.mjs" }),
-        "bypass.mjs": weak,
-        "gate/decide.js": weak,
-        "gate/decide": weak,
-        [`gate/decide.${ext === "mjs" ? "cjs" : "mjs"}`]: weak,
-        [`${helperPath}.js`]: weak,
+        "package.json": JSON.stringify({
+          type: ext === "mjs" ? "commonjs" : "module",
+          ...(maps ? { imports: { "#decide": "./bypass.mjs" }, exports: "./bypass.mjs" } : {}),
+        }),
+        "bypass.mjs": WEAK,
+        "gate/decide.js": WEAK,
+        "gate/decide": WEAK,
+        [`gate/decide.${ext === "mjs" ? "cjs" : "mjs"}`]: WEAK,
+        [`${helperPath}.js`]: WEAK,
       }),
     });
-    let probe: ReturnType<typeof nodeProbe> | undefined;
-    const real = vi.mocked(runSandboxed).getMockImplementation()!;
-    vi.mocked(runSandboxed).mockImplementation(async (input) => {
-      probe = nodeProbe(input.worktreePath, entryPath, m.verificationCommands[0]!);
-      return real(input);
+
+    const flipped = await verifyProbing(await candidateWith(false), entryPath);
+    expect(flipped.probe, "the gate ran").toBeDefined();
+    expect(flipped.probe!.stdout).not.toContain("HELPER_BYPASS");
+    expect(flipped.probe!.exit).toBe(1);
+    expect(flipped.result).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+
+    const mapped = await verifyProbing(await candidateWith(true), entryPath);
+    expect(mapped.result).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CONTRACT_UNVERIFIED,
+      evidence: { packageJson: "package.json", fields: ["imports", "exports"] },
     });
-    let result;
-    try {
-      result = await verifyPinned(c);
-    } finally {
-      vi.mocked(runSandboxed).mockImplementation(real);
-    }
-    expect(probe, "the gate ran").toBeDefined();
-    expect(probe!.stdout).not.toContain("HELPER_BYPASS");
-    expect(probe!.exit).toBe(1);
-    expect(result).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+    expect(mapped.launched, "nothing ran").toBe(0);
+  });
+
+  it("RF-S22 arm:validator #1082 R1-02: every declared executable helper must use .mjs or .cjs, without a fallback loader", () => {
+    // A closure review's witness: a `.txt` helper that a denylist admitted, and that node's
+    // `require` runs as JavaScript. It is refused where it is declared, before any run exists.
+    const code = "module.exports = false;\n";
+    const gate = "if (!require('./decide.txt')) { console.log('DECLARED_TXT_HELPER_EXECUTED'); process.exit(1); }\n";
+    const manifest = gateManifest([entry("gate/check.cjs", gate), entry("gate/decide.txt", code, "gate/check.cjs")]);
+    const repo = makeRepo({ "gate/check.cjs": gate, "gate/decide.txt": code });
+    // What admitting it would mean: node runs the declared .txt helper as code.
+    expect(nodeProbe(repo, "gate/check.cjs", manifest.verificationCommands[0]!).stdout).toContain("DECLARED_TXT_HELPER_EXECUTED");
+    const unpinned = { issues: expect.arrayContaining([expect.objectContaining({ refusal: GATE_ENTRY_MODULE_FORMAT_UNPINNED })]) };
+    expect(assertPortableManifest(manifest)).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: unpinned });
+    const harness = makeHarness();
+    expect(harness.cp.projects.register({
+      projectId: manifest.projectId,
+      name: "helper-format",
+      manifest,
+      authorization: harness.cp.manifestAuthorizationForTests(manifest),
+    })).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: unpinned });
+  });
+
+  /**
+   * #1082 R1-02 (round 4) — a closure review's counterexample: an unchanged gate requires its
+   * unchanged declared helper as `#decide`, and the candidate changes only the imports map, to a
+   * bypass file it adds. Raw node follows the map. Verification refuses the route outright, before
+   * anything runs, whether the candidate changed the map or not.
+   */
+  const MAPPED_GATE = "if (!require('#decide').passes) process.exit(1);\n";
+  const MAPPED_HELPER = "module.exports = { passes: false };\n";
+  const MAPPED = gateManifest([entry("gate/check.cjs", MAPPED_GATE), entry("gate/decide.cjs", MAPPED_HELPER, "gate/check.cjs")]);
+  const commitMappedGate = (repo: string): void => {
+    writeFiles(repo, {
+      "gate/check.cjs": MAPPED_GATE,
+      "gate/decide.cjs": MAPPED_HELPER,
+      "package.json": JSON.stringify({ type: "commonjs", imports: { "#decide": "./gate/decide.cjs" } }),
+    });
+    commitAll(repo, "a gate that loads its helper through the imports map");
+  };
+
+  it("RF-S22 arm:validator #1082 R1-02: candidate imports configuration must not redirect a declared explicit helper", async () => {
+    let before: ReturnType<typeof nodeProbe> | undefined;
+    const swap = { "package.json": JSON.stringify({ type: "commonjs", imports: { "#decide": "./bypass.cjs" } }), "bypass.cjs": "console.log('DECLARED_HELPER_PACKAGE_MAP_BYPASS'); process.exit(0);\n" };
+    const candidate = await frozenPinnedCandidate({
+      manifest: MAPPED,
+      beforeRun: (repo) => {
+        commitMappedGate(repo);
+        before = nodeProbe(repo, "gate/check.cjs", MAPPED.verificationCommands[0]!);
+      },
+      candidateChange: (repo) => writeFiles(repo, swap),
+    });
+    // Raw node: the same two pinned files decide differently once only the map changes.
+    const after = nodeProbe(candidate.harness.repoPath, "gate/check.cjs", MAPPED.verificationCommands[0]!);
+    expect(before!.exit).toBe(1);
+    expect(after.exit).toBe(0);
+    expect(after.stdout).toContain("DECLARED_HELPER_PACKAGE_MAP_BYPASS");
+
+    const { result, launched } = await verifyProbing(candidate, "gate/check.cjs");
+    expect(result).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CONTRACT_UNVERIFIED,
+      evidence: { path: "gate/check.cjs", packageJson: "package.json", fields: ["imports"] },
+    });
+    expect(launched, "candidate configuration chose the helper and nothing ran").toBe(0);
+  });
+
+  it.each([
+    ["an unchanged imports map", commitMappedGate, (repo: string) => writeFiles(repo, { "src/app.js": "module.exports = () => 2;\n" }), "package.json", ["imports"]],
+    ["a package.json the candidate adds beside the gate", commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      (repo: string) => writeFiles(repo, { "gate/package.json": JSON.stringify({ main: "../bypass.cjs" }) }), "gate/package.json", ["main"]],
+  ] as const)("RF-S22 arm:validator #1082 R1-02: a gate whose package scope routes by configuration is refused before it runs: %s", async (_, beforeRun, candidateChange, packageJson, fields) => {
+    const manifest = beforeRun === commitMappedGate ? MAPPED : ENTRY_AND_HELPER;
+    const candidate = await frozenPinnedCandidate({ manifest, beforeRun, candidateChange });
+    const { result, launched } = await verifyProbing(candidate, "gate/check.cjs");
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONTRACT_UNVERIFIED, evidence: { packageJson, fields: [...fields] } });
+    expect(launched).toBe(0);
+  });
+
+  it("RF-S22 arm:validator #1082 R1-02: a normal gate passes while the project's own package.json changes, and a gate-local scope shields it from the root's maps", async () => {
+    // The control: a package.json that sets no resolution field binds nothing, so the candidate may
+    // change it -- version, dependencies -- and the pinned gate runs and passes on the candidate's code.
+    const plain = await frozenPinnedCandidate({
+      manifest: ENTRY_AND_HELPER,
+      beforeRun: (repo) => {
+        commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER, "package.json": '{"name":"fixture","private":true}\n' })(repo);
+      },
+      candidateChange: (repo) => writeFiles(repo, {
+        "src/app.js": "module.exports = () => 2;\n",
+        "package.json": `${JSON.stringify({ name: "fixture", private: true, version: "2.0.0", dependencies: { "left-pad": "1.3.0" } })}\n`,
+      }),
+    });
+    const passed = await verifyProbing(plain, "gate/check.cjs");
+    expect(passed.launched).toBe(1);
+    expect(passed.result.allowed && passed.result.value.status, JSON.stringify(passed.result)).toBe("PASS");
+
+    // A root package.json may define exports and main for the project when the gate has its own
+    // package scope: node stops at the nearest package.json, so the root's fields never reach it.
+    const shielded = await frozenPinnedCandidate({
+      manifest: ENTRY_AND_HELPER,
+      beforeRun: commitGate({
+        "gate/check.cjs": GATE_ENTRY,
+        "gate/decide.cjs": GATE_HELPER,
+        "gate/package.json": "{}\n",
+        "package.json": `${JSON.stringify({ name: "fixture", main: "src/app.js", exports: "./src/app.js" })}\n`,
+      }),
+      candidateChange: (repo) => writeFiles(repo, {
+        "src/app.js": "module.exports = () => 2;\n",
+        "package.json": `${JSON.stringify({ name: "fixture", main: "src/app.js", exports: { ".": "./src/app.js" }, imports: { "#x": "./bypass.cjs" } })}\n`,
+      }),
+    });
+    const scoped = await verifyProbing(shielded, "gate/check.cjs");
+    expect(scoped.launched).toBe(1);
+    expect(scoped.result.allowed && scoped.result.value.status, JSON.stringify(scoped.result)).toBe("PASS");
   });
 
   it("RF-S22 arm:validator W5: a pinned gate entry absent at the candidate head is refused, not skipped", async () => {
