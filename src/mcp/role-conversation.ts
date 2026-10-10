@@ -129,6 +129,26 @@ export interface RoleBindingSource {
  * cannot: it is `Outbox`'s own payload-free projection, so "never the payload twice" is a property
  * of the type rather than of this port remembering not to fill one in.
  */
+/**
+ * A claimed message's stored provenance. Each field is `null` when admission did not store it for
+ * this message: unknown, never inferred.
+ */
+export interface OwnerMessageProvenance {
+  /** The ingress channel the source row was admitted on. */
+  channel: string;
+  /** The Buzz room (`h` tag) from the stored signed payload's `conversation`. */
+  room: string | null;
+  /** The sender admission authenticated, from the source row's `actor`, on the Buzz channel only. */
+  senderKey: string | null;
+  /** The original Buzz event id, from the source row's nonce. */
+  eventId: string | null;
+  /**
+   * The event this one replied to. Admission does not store an event's reply or thread tags, so
+   * this is always `null`: unknown. A thread is never taken as correlation from the text either.
+   */
+  replyToEventId: null;
+}
+
 export interface OwnerMessageHandover {
   claimed: {
     messageId: string;
@@ -142,6 +162,12 @@ export interface OwnerMessageHandover {
      * approval, and its completion settles its own turn and nothing the owner is owed.
      */
     principal: "owner" | "peer";
+    /**
+     * Where the claimed message came from, read only from what admission authenticated and stored
+     * for this message's own source row, never from its text or tags and never from another
+     * event. Informational: it changes no principal, approval or execution authority.
+     */
+    provenance: OwnerMessageProvenance;
   } | null;
   unresolved: readonly UnresolvedOwnerMessage[];
   /**

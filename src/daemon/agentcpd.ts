@@ -94,6 +94,7 @@ import {
   type IngressPolicy,
 } from "../ingress/ingress-guard.ts";
 import {
+  BUZZ_MESSAGE_NONCE_PREFIX,
   BuzzMessageIngress,
   buzzMessageNonce,
   buzzMessageSigningRequest,
@@ -136,6 +137,7 @@ import {
   RoleConversationPort,
   type OwnerMessageHandover,
   type OwnerMessageLedger,
+  type OwnerMessageProvenance,
 } from "../mcp/role-conversation.ts";
 import { digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
@@ -4026,6 +4028,32 @@ export const deliverAsCeoTurn = async (
  * site that reports coverage it does not independently have: it would settle the two transitions
  * the outbox already settles, and none of the three it does not.
  */
+/**
+ * A claimed message's provenance, from its own stored source row: the digest-checked payload's
+ * room, the row's authenticated actor and the row's nonce. Buzz fields are read on the Buzz channel
+ * only, and anything absent or unreadable is `null` rather than inferred.
+ */
+export const ownerMessageProvenanceOf = (
+  channel: string,
+  nonce: string,
+  actor: string,
+  payload: unknown,
+): OwnerMessageProvenance => {
+  const buzz = channel === "buzz";
+  const conversation =
+    typeof payload === "object" && payload !== null && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)["conversation"]
+      : undefined;
+  const eventId = nonce.startsWith(BUZZ_MESSAGE_NONCE_PREFIX) ? nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length) : "";
+  return {
+    channel,
+    room: buzz && typeof conversation === "string" && conversation.length > 0 ? conversation : null,
+    senderKey: buzz && actor.length > 0 ? actor : null,
+    eventId: buzz && eventId.length > 0 ? eventId : null,
+    replyToEventId: null,
+  };
+};
+
 export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
   /** The pointer on one owner-message row, or a denial naming what is wrong with it. */
   const pointerOn = (messageId: string) => {
@@ -4129,8 +4157,8 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
             "this owner message does not carry a readable source pointer",
           );
         }
-        const source = cp.db.get<{ payload_json: string | null }>(
-          `SELECT payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        const source = cp.db.get<{ payload_json: string | null; actor: string }>(
+          `SELECT payload_json, actor FROM inbound_messages WHERE channel = ? AND nonce = ?`,
           [pointer.sourceChannel, pointer.sourceNonce],
         );
         if (!source?.payload_json) {
@@ -4170,6 +4198,8 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
             createdAt: message.createdAt,
             // #1038. From the row's kind — the daemon's own fact — and never from the payload.
             principal: message.kind === MessageKind.PEER_MESSAGE ? "peer" : "owner",
+            // From this message's own source row, read in the same transaction as its text.
+            provenance: ownerMessageProvenanceOf(pointer.sourceChannel, pointer.sourceNonce, source.actor, payload),
           },
           unresolved,
           withheld,
