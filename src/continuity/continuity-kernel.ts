@@ -639,7 +639,7 @@ export class ContinuityKernel {
     const current = this.bindings.active(roleKey);
     // #246 C4-R2 — first, a holder with a driven-spawn record is never replaced, however it came to hold.
     if (role === Role.PRIMARY_CTO && current && drivenModeOf(this.db, current.sessionId) !== "NONE") {
-      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "the holder is a driven primary CTO");
+      await this.#retireUnusedReplacement(provisioned.value.sessionId, role, "the holder is a driven primary CTO");
       return drivenPrimaryNotReplaceable(roleKey, current.sessionId);
     }
 
@@ -653,7 +653,7 @@ export class ContinuityKernel {
       ? !sameHolder(expected, current)
       : current?.assignmentId !== expected?.assignmentId || current?.bindingGeneration !== expected?.bindingGeneration;
     if (superseded) {
-      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "coverage plan superseded");
+      await this.#retireUnusedReplacement(provisioned.value.sessionId, role, "coverage plan superseded");
       return deny(ReasonCode.BINDING_GENERATION_STALE, "coverage plan was superseded by a newer binding", {
         roleKey,
         expectedGeneration: expected?.bindingGeneration ?? null,
@@ -683,7 +683,7 @@ export class ContinuityKernel {
       takeover: true,
     });
     if (!switched.allowed) {
-      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "failover rejected");
+      await this.#retireUnusedReplacement(provisioned.value.sessionId, role, "failover rejected");
       return switched as Decision<{ provider: string; generation: number }>;
     }
 
@@ -1249,6 +1249,57 @@ export class ContinuityKernel {
       return checked as Decision<{ sessionId: string }>;
     }
     return allow(ReasonCode.OK, { sessionId: session.sessionId });
+  }
+
+  /**
+   * #246 C4-R2 — retires the replacement session this failover provisioned and will not use, through
+   * the provider's own stop, never by a row transition alone. It holds no role, by its row or as an
+   * actor's runtime — proven, and the session moved out of READY, in one transaction before the stop
+   * is awaited, so no bind or actor move can adopt it meanwhile and the concurrent holder is never the
+   * target. Only a stop that returned is recorded STOPPED; a failed stop leaves it ERROR, recorded
+   * `REMAINING_STOP_FAILED`, and one that could not be proven unused is left alone and recorded
+   * `REMAINING_OWNERSHIP_UNVERIFIED`.
+   */
+  async #retireUnusedReplacement(sessionId: string, role: Role, reason: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    const record = (outcome: "STOPPED" | "REMAINING_STOP_FAILED" | "REMAINING_OWNERSHIP_UNVERIFIED"): void => {
+      this.audit.record({
+        kind: "CONTINUITY_REPLACEMENT_CLEANUP",
+        reasonCode: outcome === "STOPPED" ? ReasonCode.OK : ReasonCode.SESSION_STOP_FAILED,
+        sessionId,
+        evidence: { outcome, reason, role },
+      });
+    };
+    const reserved = this.db.txDecision<void>(() => {
+      const holds = this.db.get<{ held: number }>(
+        `SELECT 1 AS held FROM assignments a
+           LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+          WHERE a.status = 'ACTIVE' AND (a.session_id = ? OR c.current_session_id = ?)
+          LIMIT 1`,
+        [sessionId, sessionId],
+      ) !== undefined;
+      if (!session || holds) return deny<void>(ReasonCode.CONFLICT, "the replacement holds a role", { sessionId });
+      const moved = this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: stopping`);
+      return moved.allowed ? allow(ReasonCode.OK, undefined) : (moved as Decision<unknown> as Decision<void>);
+    });
+    if (!reserved.allowed || !session) {
+      record("REMAINING_OWNERSHIP_UNVERIFIED");
+      return;
+    }
+    try {
+      await this.providers.requireForRole(session.provider, role).stopSession({
+        externalSessionId: session.incarnation.split("#")[0] ?? session.sessionId,
+        provider: session.provider,
+        model: session.model,
+        effort: session.effort,
+        pid: session.osPid,
+        ...(session.workdir ? { workdir: session.workdir } : {}),
+      });
+      this.sessions.transition(sessionId, SessionLifecycle.STOPPED, `${reason}: stopped`);
+      record("STOPPED");
+    } catch {
+      record("REMAINING_STOP_FAILED");
+    }
   }
 
   private partialAction(byProvider: Map<string, ProviderCapacity>): CoverageAction {
