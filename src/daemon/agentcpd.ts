@@ -766,6 +766,93 @@ export const startLocalMcpListeners = async (
         async (args: { roleKey: string; messageId: string }) =>
           respond(ctoConversation.reportPeerMessageRefusal(server, args.roleKey, args.messageId)),
       );
+      /*
+       * `notifications/tools/list_changed`, sent when this connection can serve the `tools/list` it
+       * prompts, and not before.
+       *
+       * A canonical CTO's relay carries its client across a daemon restart by replaying the client's
+       * `initialize`, its `notifications/initialized` and its last wake registration on the new
+       * connection, and answers every client request with "reattaching" until the last of those is
+       * answered (src/cli/attach-relay.ts `restore`). The client never re-lists on its own, so a
+       * restart onto a build with other tools left it holding the old list. Sent at `initialized`
+       * alone, the notification reaches the client while the relay still waits on that
+       * registration, and the `tools/list` it prompts is refused.
+       *
+       * Which point that is, the request stream says:
+       * - an `initialize` under the relay's own id (`acp-relay-reinitialize-N`) is a replay by a relay
+       *   whose wake proxy listens — the only case in which it renames one — and that relay always
+       *   sends a wake registration after `initialized` and goes live once it is answered. The
+       *   notification follows that answer.
+       * - any other `initialize` is a fresh connection, live already, or a replay by a relay with no
+       *   proxy, which renames nothing and is byte-identical to a fresh one. The notification
+       *   follows `initialized`.
+       * - that proxy-less replay re-registers the client's own endpoint, if the client had one,
+       *   under `acp-relay-rewake-N` before going live. Nothing at `initialized` says it will, so the
+       *   notification sent then was early, and another follows the registration's answer.
+       *
+       * The notification decides nothing. It is sent whether the registration was accepted or
+       * refused, it does not touch the wake slot, and the list the client then asks for is answered
+       * under this connection's own authentication like any other request. A send that fails is
+       * written to stderr and is not retried.
+       *
+       * The stream is read on the transport, before the SDK dispatches a line: `initialized` and the
+       * registration usually arrive in one read, and the SDK runs a notification handler only
+       * after the rest of that read has been dispatched.
+       */
+      let proxiedReplay = false;
+      let awaitingReplayedRegistration = false;
+      let refreshAfter: { id: string | number } | null = null;
+      const refreshToolList = (): void => {
+        server.server.sendToolListChanged().catch(() => {
+          process.stderr.write("cto tool list change notification not sent\n");
+        });
+      };
+      const observeInbound = (message: JSONRPCMessage): void => {
+        if (!("method" in message)) return;
+        if (!("id" in message)) {
+          if (message.method !== "notifications/initialized") return;
+          if (proxiedReplay) awaitingReplayedRegistration = true;
+          else refreshToolList();
+          return;
+        }
+        const id = message.id;
+        if (message.method === "initialize") {
+          proxiedReplay = typeof id === "string" && id.startsWith("acp-relay-reinitialize-");
+          return;
+        }
+        if (message.method !== "tools/call") return;
+        if ((message.params as { name?: unknown } | undefined)?.name !== "role_wake_endpoint_register") return;
+        if (!awaitingReplayedRegistration && !(typeof id === "string" && id.startsWith("acp-relay-rewake-"))) return;
+        awaitingReplayedRegistration = false;
+        refreshAfter = { id };
+      };
+      const observeSent = (message: JSONRPCMessage): void => {
+        if (refreshAfter === null || "method" in message || !("id" in message)) return;
+        if (message.id !== refreshAfter.id) return;
+        refreshAfter = null;
+        refreshToolList();
+      };
+      const connect = server.connect.bind(server);
+      server.connect = (transport: Transport): Promise<void> => {
+        const observed: Transport = {
+          start: () => {
+            transport.onmessage = (message, extra) => {
+              observeInbound(message);
+              observed.onmessage?.(message, extra);
+            };
+            transport.onclose = () => observed.onclose?.();
+            transport.onerror = (error) => observed.onerror?.(error);
+            return transport.start();
+          },
+          // After the answer is written, so the notification is behind it on the wire.
+          send: async (message, options) => {
+            await transport.send(message, options);
+            observeSent(message);
+          },
+          close: () => transport.close(),
+        };
+        return connect(observed);
+      };
     }
     return server;
   };
