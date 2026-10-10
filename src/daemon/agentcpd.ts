@@ -123,7 +123,6 @@ import {
 } from "../ingress/telegram-external.ts";
 import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
-import { ProvisionedSessionRuntime } from "../runtime/provisioned-session-runtime.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
@@ -340,7 +339,8 @@ export const wakeRoleHolder = async (
   cause: { kind: string; ids: readonly string[] },
 ): Promise<Decision<void>> => {
   const holder = cp.bindings.active(roleKey);
-  if (!holder || !ProvisionedSessionRuntime.drives(holder.role)) return conversation.wake(roleKey);
+  // #246 C4 — a PRIMARY_CTO is driven only when its own spawn recorded it so, never by its role.
+  if (!holder || !cp.sessionRuntime.drivesSession(holder.sessionId, holder.role)) return conversation.wake(roleKey);
   const ids = cause.ids.length > 0 ? cause.ids : [`${cause.kind}:${randomUUID()}`];
   const woke = cp.sessionRuntime.wake(roleKey, ids.map((id) => ({ id, kind: cause.kind })));
   return woke.allowed ? allow(ReasonCode.OK, undefined) : (woke as Decision<void>);
