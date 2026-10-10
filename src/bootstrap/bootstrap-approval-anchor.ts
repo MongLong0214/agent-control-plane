@@ -1,4 +1,4 @@
-import { type Stats, closeSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync, writeSync } from "node:fs";
+import { type Stats, closeSync, fsyncSync, lstatSync, openSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { z } from "zod";
@@ -8,6 +8,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
+import { writeWholeSync } from "./whole-write.ts";
 
 /**
  * #246 C3 (review 1076-R1-02) — the owner approval an application's execution runs on, anchored
@@ -143,7 +144,7 @@ export const writeApprovalAnchor = (
         : unanchored("APPROVAL_ANCHOR_CONFLICT", "an anchor of this receipt already names another execution", { path });
     }
     try {
-      writeSync(descriptor, `${JSON.stringify(anchor, null, 2)}\n`);
+      writeWholeSync(descriptor, `${JSON.stringify(anchor, null, 2)}\n`);
       fsyncSync(descriptor);
     } finally {
       closeSync(descriptor);
@@ -226,7 +227,8 @@ export interface WithheldIntent {
   consumed: WithheldConsumption[];
 }
 
-const withheldIntentDirectory = (workDir: string, key: WithheldIntentKey): string =>
+/** The directory that holds every record of one exact intent. */
+export const withheldIntentDirectory = (workDir: string, key: WithheldIntentKey): string =>
   join(workDir, "withheld-requests", digestOf({ operationId: key.operationId, intentDigest: key.intentDigest }).replace(/^sha256:/, ""));
 
 const WITHHELD_RECORD_NAME = /^(withheld|consumed)-([1-9][0-9]*)\.json$/;
@@ -296,7 +298,10 @@ const syncDirectory = (path: string): void => {
   }
 };
 
-/** One record, written once, exclusively, and synced with the directories that name it. Throws when it cannot. */
+/**
+ * One record, written once, exclusively, whole, and synced with the directories that name it. Throws
+ * when it cannot — a write cut short included (review 1076-R4) — and then nothing relies on it.
+ */
 const writeWithheldRecord = (workDir: string, key: WithheldIntentKey, name: string, record: unknown): void => {
   const parent = join(workDir, "withheld-requests");
   const directory = withheldIntentDirectory(workDir, key);
@@ -305,7 +310,7 @@ const writeWithheldRecord = (workDir: string, key: WithheldIntentKey, name: stri
   ensurePrivateDirectory(directory);
   const descriptor = openSync(join(directory, name), "wx", 0o600);
   try {
-    writeSync(descriptor, `${JSON.stringify(record, null, 2)}\n`);
+    writeWholeSync(descriptor, `${JSON.stringify(record, null, 2)}\n`);
     fsyncSync(descriptor);
   } finally {
     closeSync(descriptor);

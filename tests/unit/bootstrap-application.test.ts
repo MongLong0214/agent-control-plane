@@ -16,6 +16,7 @@ import {
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
+import { readWithheldIntent, withheldUnsent, writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
 import { processGroupEmpty, readProcessGroup } from "../../src/bootstrap/attempt-writer-group.ts";
@@ -46,6 +47,8 @@ afterAll(cleanupTempDirs);
 afterEach(() => {
   vi.restoreAllMocks();
   fsFaults.openSync = null;
+  fsFaults.writeSync = null;
+  fsFaults.fsyncSync = null;
 });
 
 /**
@@ -54,14 +57,51 @@ afterEach(() => {
  * than mocks, so restoring mocks between tests leaves them in place.
  */
 const renames = vi.hoisted(() => ({ attempted: [] as Array<{ from: string; to: string }> }));
-/** Review 1076-R3 — a fault a test injects into a file open, by path; none unless a test sets one. */
-const fsFaults = vi.hoisted(() => ({ openSync: null as ((path: string) => void) | null }));
+/**
+ * Reviews 1076-R3 and -R4 — faults a test injects into the file calls a record is written with, by the
+ * path its descriptor was opened on; none unless a test sets one. `writeSync` is told the bytes a call
+ * was asked to write and answers how many of them are written — fewer is a short write, as a file-size
+ * limit makes one — or throws; undefined leaves the call as it is.
+ */
+const fsFaults = vi.hoisted(() => ({
+  openSync: null as ((path: string) => void) | null,
+  writeSync: null as ((path: string, bytes: Buffer) => number | undefined) | null,
+  fsyncSync: null as ((path: string) => void) | null,
+}));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof FsModule>();
+  const opened = new Map<number, string>();
   const openSync = ((path: Parameters<typeof actual.openSync>[0], ...rest: unknown[]) => {
     fsFaults.openSync?.(String(path));
-    return (actual.openSync as (...args: unknown[]) => number)(path, ...rest);
+    const descriptor = (actual.openSync as (...args: unknown[]) => number)(path, ...rest);
+    opened.set(descriptor, String(path));
+    return descriptor;
   }) as typeof actual.openSync;
+  const closeSync: typeof actual.closeSync = (descriptor) => {
+    opened.delete(descriptor);
+    actual.closeSync(descriptor);
+  };
+  const writeSync = ((descriptor: number, data: string | NodeJS.ArrayBufferView, ...rest: unknown[]) => {
+    const path = opened.get(descriptor);
+    const pass = () => (actual.writeSync as (...args: unknown[]) => number)(descriptor, data, ...rest);
+    if (fsFaults.writeSync === null || path === undefined) return pass();
+    const bytes =
+      typeof data === "string"
+        ? Buffer.from(data, "utf8")
+        : Buffer.from(
+            data.buffer,
+            data.byteOffset + (typeof rest[0] === "number" ? rest[0] : 0),
+            typeof rest[1] === "number" ? rest[1] : data.byteLength - (typeof rest[0] === "number" ? rest[0] : 0),
+          );
+    const count = fsFaults.writeSync(path, bytes);
+    if (count === undefined) return pass();
+    return count === 0 ? 0 : actual.writeSync(descriptor, bytes, 0, count);
+  }) as typeof actual.writeSync;
+  const fsyncSync: typeof actual.fsyncSync = (descriptor) => {
+    const path = opened.get(descriptor);
+    if (path !== undefined) fsFaults.fsyncSync?.(path);
+    actual.fsyncSync(descriptor);
+  };
   const note = (from: unknown, to: unknown): void => {
     renames.attempted.push({ from: String(from), to: String(to) });
   };
@@ -80,7 +120,7 @@ vi.mock("node:fs", async (importOriginal) => {
       await actual.promises.rename(from, to);
     },
   };
-  const wrapped = { ...actual, openSync, renameSync, rename, promises };
+  const wrapped = { ...actual, openSync, closeSync, writeSync, fsyncSync, renameSync, rename, promises };
   return { ...wrapped, default: wrapped };
 });
 
@@ -3122,5 +3162,243 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
       expect(sent).toBe(1);
       expect(second).toMatchObject({ allowed: false, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST" } });
     });
+  });
+  // Review 1076-R4 — a record the runner relies on before it lets a request start is reported written
+  // only when every byte of it was written and synced. Each body counts the external requests made.
+  const consumptionOfAttempt2 = (path: string): boolean => /withheld-requests\/[0-9a-f]{64}\/consumed-2\.json$/.test(path);
+  const fileTooLarge = (): Error => Object.assign(new Error("EFBIG: file too large"), { code: "EFBIG" });
+
+  /** Attempt 1 withholds the protection PUT under the production port; every later send lands at once. */
+  const withheldProtection = async (f: Fixture, name: string, beforeSecondCall: () => void = () => {}) => {
+    const run = await reviewedBootstrap(f, cleanTreeManifest(name));
+    await approveWrites(f, run);
+    let replacement: string | null = null;
+    const held = heldRequests(
+      f,
+      "protectBranch",
+      (call) => {
+        if (call === 1) replacement = replaceCeo(f);
+        else beforeSecondCall();
+      },
+      () => true,
+    );
+    const withheld = await confirm(f, run);
+    expect(withheld, JSON.stringify(withheld)).toMatchObject({ ok: false, evidence: { refusal: "CEO_ADMISSION_LOST" } });
+    expect(held.state.sent).toBe(0);
+    const intent = pendingIntentOf(f, run, "branch-protection");
+    const consumptionPath = () => {
+      const root = join(f.workRoot, run.runId, "withheld-requests");
+      const found = (readdirSync(root, { recursive: true }) as string[]).filter((name) => name.endsWith("consumed-2.json"));
+      return found.length === 1 ? join(root, found[0]!) : null;
+    };
+    return { run, held, intent, consumptionPath, ceo: () => replacement! };
+  };
+
+  it("R4 a consumption record written short and then completed is whole before the request is sent, once", async () => {
+    await withFixture(async (f) => {
+      let wholeAtSend: boolean | null = null;
+      const state = await withheldProtection(f, "r4-short-then-complete", () => {
+        const path = state.consumptionPath();
+        try {
+          wholeAtSend = path !== null && JSON.parse(readFileSync(path, "utf8"))["attempt"] === 2;
+        } catch {
+          wholeAtSend = false;
+        }
+      });
+      const calls: number[] = [];
+      fsFaults.writeSync = (path, bytes) => {
+        if (!consumptionOfAttempt2(path)) return undefined;
+        calls.push(bytes.length);
+        // The first write is cut short; the call after it writes what is left.
+        return calls.length === 1 ? 200 : undefined;
+      };
+      const made = await resumeUnder(f, state.run, state.ceo());
+      fsFaults.writeSync = null;
+      expect(made, JSON.stringify(made)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(calls.length).toBeGreaterThanOrEqual(2);
+      expect(calls[1]).toBe(calls[0]! - 200);
+      expect(wholeAtSend, "the consumption record is whole when the request is sent").toBe(true);
+      expect(withheldRecordsOf(f, state.run, state.intent["operationId"] as string, "withheld-consumption")).toEqual([
+        expect.objectContaining({ attempt: 2, intentDigest: digestOf(state.intent) }),
+      ]);
+      expect(state.held.state.sent).toBe(1);
+      expect(state.held.state.effects).toBe(1);
+      expect(applicationOf(f, state.run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+    });
+  });
+
+  it("R4 a short consumption-record write sends zero requests", async () => {
+    await withFixture(async (f) => {
+      const state = await withheldProtection(f, "r4-short-consumption");
+      const held = state.held;
+      const writes: Array<{ expected: number; written: number; bytes: string }> = [];
+      // A file-size limit: the write that reaches it is cut short at 200 bytes, and any write past it fails.
+      fsFaults.writeSync = (path, bytes) => {
+        if (!consumptionOfAttempt2(path)) return undefined;
+        if (writes.length > 0) throw fileTooLarge();
+        writes.push({ expected: bytes.length, written: 200, bytes: bytes.subarray(0, 200).toString("utf8") });
+        return 200;
+      };
+      const made = await resumeUnder(f, state.run, state.ceo());
+      fsFaults.writeSync = null;
+      const records = [readFileSync(state.consumptionPath()!, "utf8")];
+      expect(made, JSON.stringify(made)).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_EXEMPTION_UNCONSUMED", attempt: 2 } });
+      expect(writes).toHaveLength(1);
+      expect(writes[0]!.written).toBeLessThan(writes[0]!.expected);
+      expect(() => JSON.parse(records[0]!)).toThrow();
+      expect(held.state.sent, "An incomplete consumption record must stop the request before any send").toBe(0);
+    });
+  });
+
+  it("R4 an error after part of the consumption record is written sends zero requests, and the part is kept", async () => {
+    await withFixture(async (f) => {
+      const state = await withheldProtection(f, "r4-partial-then-error");
+      let writes = 0;
+      fsFaults.writeSync = (path) => {
+        if (!consumptionOfAttempt2(path)) return undefined;
+        writes += 1;
+        if (writes === 1) return 120;
+        throw Object.assign(new Error("EIO: i/o error, write"), { code: "EIO" });
+      };
+      const made = await resumeUnder(f, state.run, state.ceo());
+      fsFaults.writeSync = null;
+      expect(made, JSON.stringify(made)).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_EXEMPTION_UNCONSUMED", attempt: 2 } });
+      expect(state.held.state.calls).toBe(1);
+      expect(state.held.state.sent).toBe(0);
+      expect(lstatSync(state.consumptionPath()!).size).toBe(120);
+    });
+  });
+
+  it("R4 a consumption-record write that writes nothing sends zero requests", async () => {
+    await withFixture(async (f) => {
+      const state = await withheldProtection(f, "r4-zero-byte-write");
+      fsFaults.writeSync = (path) => (consumptionOfAttempt2(path) ? 0 : undefined);
+      const made = await resumeUnder(f, state.run, state.ceo());
+      fsFaults.writeSync = null;
+      expect(made, JSON.stringify(made)).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_EXEMPTION_UNCONSUMED", attempt: 2 } });
+      expect(state.held.state.calls).toBe(1);
+      expect(state.held.state.sent).toBe(0);
+      expect(lstatSync(state.consumptionPath()!).size).toBe(0);
+      // Resumed over that empty record: refused by name, nothing sent.
+      const resumed = await resumeUnder(f, state.run, state.ceo());
+      expect(resumed, JSON.stringify(resumed)).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_RECORD_UNREADABLE" } });
+      expect(state.held.state.sent).toBe(0);
+    });
+  });
+
+  it("R4 a consumption record whose fsync fails sends zero requests, and the resume does not send it either", async () => {
+    await withFixture(async (f) => {
+      const state = await withheldProtection(f, "r4-fsync-failure");
+      fsFaults.fsyncSync = (path) => {
+        if (consumptionOfAttempt2(path)) throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" });
+      };
+      const made = await resumeUnder(f, state.run, state.ceo());
+      fsFaults.fsyncSync = null;
+      expect(made, JSON.stringify(made)).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_EXEMPTION_UNCONSUMED", attempt: 2 } });
+      expect(state.held.state.calls).toBe(1);
+      expect(state.held.state.sent).toBe(0);
+      // Its bytes reached the file though its sync failed: a consumption, unanswered, so the request is in doubt.
+      const resumed = await resumeUnder(f, state.run, state.ceo());
+      expect(resumed, JSON.stringify(resumed)).toMatchObject({ allowed: false, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST" } });
+      expect(state.held.state.calls).toBe(1);
+      expect(state.held.state.sent).toBe(0);
+    });
+  });
+
+  it("R4 a resume after an incomplete consumption record refuses by name, keeps the record, and never sends", async () => {
+    await withFixture(async (f) => {
+      const state = await withheldProtection(f, "r4-resume-incomplete");
+      let writes = 0;
+      fsFaults.writeSync = (path) => {
+        if (!consumptionOfAttempt2(path)) return undefined;
+        writes += 1;
+        if (writes === 1) return 200;
+        throw fileTooLarge();
+      };
+      await resumeUnder(f, state.run, state.ceo());
+      fsFaults.writeSync = null;
+      const path = state.consumptionPath()!;
+      const kept = readFileSync(path);
+      expect(() => JSON.parse(kept.toString("utf8"))).toThrow();
+      for (const round of [1, 2]) {
+        const resumed = await resumeUnder(f, state.run, state.ceo());
+        expect(resumed, `resume ${round}: ${JSON.stringify(resumed)}`).toMatchObject({
+          allowed: false,
+          evidence: { refusal: "WITHHELD_RECORD_UNREADABLE", operationId: state.intent["operationId"] },
+        });
+        expect(state.held.state.calls).toBe(1);
+        expect(state.held.state.sent).toBe(0);
+        expect(readFileSync(path).equals(kept), "the incomplete record is kept as it was").toBe(true);
+      }
+      expect(applicationOf(f, state.run.runId)).toMatchObject({ phase: "RESERVED", attempts: 2 });
+    });
+  });
+
+  for (const record of [
+    { name: "the GitHub ledger", matches: (path: string) => /github-ledger\/[^/]+\.json\.partial$/.test(path) },
+    { name: "the approval anchor", matches: (path: string) => /owner-approval\/[0-9a-f]{64}\.json$/.test(path) },
+  ]) {
+    it(`R4 ${record.name} written short before the first request sends zero requests`, async () => {
+      await withFixture(async (f) => {
+        const run = await reviewedBootstrap(f, cleanTreeManifest(`r4-short-${record.name.split(" ").at(-1)}`));
+        await approveWrites(f, run);
+        let writes = 0;
+        fsFaults.writeSync = (path) => {
+          if (!record.matches(path)) return undefined;
+          writes += 1;
+          if (writes === 1) return 200;
+          throw fileTooLarge();
+        };
+        const answer = await confirm(f, run);
+        fsFaults.writeSync = null;
+        expect(writes).toBeGreaterThanOrEqual(1);
+        expect(answer["ok"], JSON.stringify(answer)).toBe(false);
+        expect(writesOf(f), `a ${record.name} cut short is no record: no request may follow it`).toEqual([]);
+      });
+    });
+  }
+
+  it("R4 a consumption record under a real file-size limit is not reported written, and nothing relies on it", async () => {
+    const workDir = join(tempDir("r4-real-fsize-"), "run");
+    // An operation id long enough that the record outgrows one block of the limit below.
+    const key = { operationId: `op-${"x".repeat(1500)}`, intentDigest: digestOf({ intent: "r4-real-fsize" }) };
+    const base = { runId: "r4-real-fsize-run", resourceType: "branch-protection", ...key };
+    writeWithheldRequest(workDir, { ...base, attemptedAt: "2026-10-10T00:00:00.000Z", attempt: 1, withheldAt: "2026-10-10T00:00:00.000Z", refusal: "CEO_ADMISSION_LOST" });
+    expect(withheldUnsent(readWithheldIntent(workDir, key))).toBe(true);
+    const module = resolve("src/bootstrap/bootstrap-approval-anchor.ts");
+    const script = `
+      const { consumeWithheldExemption } = await import(${JSON.stringify(module)});
+      const answer = {};
+      try {
+        consumeWithheldExemption(${JSON.stringify(workDir)}, { ...${JSON.stringify(base)}, attempt: 2, consumedAt: "2026-10-10T00:00:01.000Z" });
+        answer.returned = true;
+        answer.sent = 1;
+      } catch (error) {
+        answer.threw = error.code ?? String(error);
+        answer.sent = 0;
+      }
+      process.stdout.write(JSON.stringify(answer));
+    `;
+    // The real limit, as the kernel applies it: \`ulimit -f 1\` caps every file this process writes.
+    const child = spawn("/bin/sh", ["-c", 'ulimit -f 1 && exec "$0" --experimental-transform-types --no-warnings --input-type=module -e "$1"', process.execPath, script], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, NODE_DISABLE_COMPILE_CACHE: "1" },
+    });
+    const output: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
+    const exit = await new Promise<number | null>((resolveExit) => child.once("close", resolveExit));
+    const answer = JSON.parse(Buffer.concat(output).toString("utf8")) as { returned?: boolean; threw?: string; sent: number };
+    expect(exit).toBe(0);
+    expect(answer.returned, JSON.stringify(answer)).toBeUndefined();
+    expect(answer.threw).toBe("EFBIG");
+    expect(answer.sent).toBe(0);
+    const root = join(workDir, "withheld-requests");
+    const [consumption] = (readdirSync(root, { recursive: true }) as string[]).filter((name) => name.endsWith("consumed-2.json"));
+    const recordBytes = lstatSync(join(root, consumption!)).size;
+    // What the limit let through is kept, cut short, and it proves neither an unused exemption nor an unsent request.
+    expect(recordBytes).toBeGreaterThan(0);
+    expect(recordBytes).toBeLessThan(Buffer.byteLength(JSON.stringify({ ...base, attempt: 2 })));
+    expect(readWithheldIntent(workDir, key)).toBeNull();
+    expect(withheldUnsent(readWithheldIntent(workDir, key))).toBe(false);
   });
 });

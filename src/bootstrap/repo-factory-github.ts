@@ -6,7 +6,6 @@ import {
   openSync,
   readFileSync,
   renameSync,
-  writeSync,
   type Stats,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -30,6 +29,7 @@ import {
   type ObservedRepository,
 } from "./github-write-port.ts";
 import type { ExternalWriteReceipt } from "./repo-factory-result.ts";
+import { writeWholeSync } from "./whole-write.ts";
 
 /**
  * Issue #246 — the repo factory producer's GitHub half: which planned operations may run, in
@@ -575,13 +575,15 @@ export const readGitHubLedger = (
 /**
  * Atomic and durable: write a scratch file, fsync it, rename it over the target, fsync the
  * directory. A crash mid-write leaves the previous version whole, so the resume point the
- * ledger exists to keep is never the thing a crash destroys.
+ * ledger exists to keep is never the thing a crash destroys. The scratch file is written whole or
+ * not renamed at all (#246 C3, review 1076-R4): a short write throws before the rename, and the
+ * request the ledger was being written for is not sent.
  */
 const writeOwnFile = (path: string, content: unknown): void => {
   const scratch = `${path}.partial`;
   const descriptor = openSync(scratch, "w", 0o600);
   try {
-    writeSync(descriptor, `${JSON.stringify(content, null, 2)}\n`);
+    writeWholeSync(descriptor, `${JSON.stringify(content, null, 2)}\n`);
     fsyncSync(descriptor);
   } finally {
     closeSync(descriptor);

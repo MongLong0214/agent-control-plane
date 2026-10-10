@@ -28,6 +28,7 @@ import {
   consumeWithheldExemption,
   readApprovalAnchor,
   readWithheldIntent,
+  withheldIntentDirectory,
   withheldUnsent,
   writeApprovalAnchor,
   writeWithheldRequest,
@@ -1830,10 +1831,28 @@ export class RepoFactoryBootstrapRunner {
     // the exemption since having withheld it again (review 1076-R3). Such an intent is exempt, once.
     const pendingAtStart = new Map<string, PendingWrite>();
     const exemptAtStart = new Map<string, PendingWrite>();
+    const unreadable: Array<{ operationId: string; resourceType: PendingWrite["resourceType"]; recordDirectory: string }> = [];
     for (const [operationId, intent] of ledger.value.pending) {
       if (ledger.value.receipts.has(operationId)) continue;
-      const records = readWithheldIntent(join(workRoot, runId), { operationId, intentDigest: digestOf(intent) });
+      const key = { operationId, intentDigest: digestOf(intent) };
+      const records = readWithheldIntent(join(workRoot, runId), key);
+      if (records === null) {
+        unreadable.push({ operationId, resourceType: intent.resourceType, recordDirectory: withheldIntentDirectory(join(workRoot, runId), key) });
+      }
       (withheldUnsent(records) ? exemptAtStart : pendingAtStart).set(operationId, intent);
+    }
+    // Review 1076-R4 — a withheld or consumption record of a pending intent that cannot be read, a
+    // record cut short by a write that stopped included, is neither a proof that the request was
+    // never sent nor an exemption still unused. It is kept where it is, and the attempt is refused by
+    // name, with nothing sent, whatever GitHub shows; a person resolves it.
+    if (existing !== null && unreadable.length > 0) {
+      const refused = deny(
+        ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+        "a record of whether a pending request was sent cannot be read; it is kept, nothing is sent, and the application stays in doubt",
+        { stage: "precondition", refusal: "WITHHELD_RECORD_UNREADABLE", runId, operationId: unreadable[0]!.operationId, unreadable },
+      );
+      this.deps.applications.recordRefusal(runId, refusalRecord(refused, "precondition"));
+      return refused as Decision<PendingAtStart>;
     }
     // #246 C3, review 1076-R1-03 — a request an earlier attempt sent and never saw answered may still
     // land: a client that gave up proves nothing about the server. Unless GitHub now shows its effect,
