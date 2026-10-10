@@ -985,4 +985,100 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       });
     });
   });
+
+  describe("each protection the first review found unwitnessed", () => {
+    it("does not let a replacement actor on the same session inherit DRIVEN from the creation assignment", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { binding } = await drivenPrimary(f, "actor-rebind");
+        const first = cp.db.get<{ actor_id: string }>(`SELECT actor_id FROM assignments WHERE assignment_id = ?`, [binding.assignmentId])!;
+        expect(cp.bindings.revoke(binding.roleKey, "fixture: rebind with a fresh actor").allowed).toBe(true);
+        const rebound = cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "actor-rebind", sessionId: binding.sessionId });
+        if (!rebound.allowed) throw new Error(rebound.message);
+        const second = cp.db.get<{ actor_id: string }>(`SELECT actor_id FROM assignments WHERE assignment_id = ?`, [rebound.value.assignmentId])!;
+        expect(second.actor_id).not.toBe(first.actor_id);
+        expect(cp.outbox.drivenModeOf(binding.sessionId)).toBe("CONTRADICTED");
+        expect(cp.sessionRuntime.drivesSession(binding.sessionId, Role.PRIMARY_CTO)).toBe(false);
+        expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "fresh-actor-work", kind: "test" }]).allowed).toBe(false);
+      });
+    });
+
+    it("rolls the bind back when its spawn record is contradicted inside the bind transaction", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+        registerBareProject(f, "bind-rollback");
+        const bootstrap = await f.dispatchBootstrap();
+        const actorsBefore = cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM conversational_actors`)!.n;
+        const bind = cp.bindings.bind.bind(cp.bindings);
+        vi.spyOn(cp.bindings, "bind").mockImplementation((input) => {
+          const granted = bind(input);
+          if (input.projectId === "bind-rollback") {
+            cp.audit.record({
+              kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+              projectId: input.projectId,
+              roleKey: input.roleKey,
+              sessionId: input.sessionId,
+              evidence: { creationGeneration: 1 },
+            });
+          }
+          return granted;
+        });
+        expect(await cp.cto.ensureDrivenPrimaryCto("bind-rollback", bootstrap.runId)).toMatchObject({
+          allowed: false,
+          reasonCode: ReasonCode.CONFLICT,
+        });
+        expect(cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId: "bind-rollback" }))).toBeNull();
+        expect(cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM conversational_actors`)!.n).toBe(actorsBefore);
+        expect(cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM assignments WHERE project_id = ?`, ["bind-rollback"])!.n).toBe(0);
+      });
+    });
+
+    it("does not run work queued behind a resume attestation that failed", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { binding } = await drivenPrimary(f, "queued-failed-attestation");
+        let release!: () => void;
+        const barrier = new Promise<void>((resolve) => { release = resolve; });
+        let entered = false;
+        const external = cp.sessions.require(binding.sessionId).incarnation.split("#")[0];
+        const original = f.claude.runSessionTurn.bind(f.claude);
+        f.claude.runSessionTurn = async (request) => {
+          if (!entered && request.handle.externalSessionId === external && /session_attest/.test(request.prompt)) {
+            entered = true;
+            await barrier;
+          }
+          return original(request);
+        };
+        f.claude.presentAttestation = false;
+        const reattest = cp.cto.ensurePrimaryCto("queued-failed-attestation", "cto_start");
+        await vi.waitFor(() => expect(entered).toBe(true));
+        expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "queued-during-failed-resume", kind: "test" }])).toMatchObject({
+          allowed: true,
+          value: "COALESCED",
+        });
+        release();
+        expect(await reattest).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+        await vi.waitFor(() => expect(cp.db.get<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_TURN_REFUSED' AND session_id = ?`,
+          [binding.sessionId],
+        )?.n).toBe(1));
+        expect(workTurnsOf(f, binding.sessionId)).toBe(0);
+      });
+    });
+
+    it("withholds a pending driven handoff from the delivery sweep", async () => {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const { bootstrap, binding } = await drivenPrimary(f, "pending-handoff-sweep");
+        cp.outbox.attachInBandWake(async () => allow(ReasonCode.OK, undefined));
+        const opened = openActivationHandoff(f)("pending-handoff-sweep", bootstrap.runId, binding.sessionId, HANDOFF);
+        if (!opened.allowed) throw new Error(opened.message);
+        const messageId = cp.outbox.byIdempotencyKey(`bootstrap-handoff:${opened.value.handoffId}`)!.messageId;
+        expect(cp.outbox.get(messageId)?.status).toBe("PENDING");
+        expect(cp.outbox.claimDeliverable(50).map((row) => row.messageId)).not.toContain(messageId);
+        expect(cp.outbox.get(messageId)?.status).toBe("PENDING");
+      });
+    });
+  });
 });
