@@ -1,0 +1,147 @@
+Limit: a peer message's admission proof is immutable evidence that names the receiving CTO session and generation, so a same-conversation restart cannot rewrite it; the hand-over instead accepts one durable same-actor succession hop proven from assignments and the self-claim's DEAD_BINDING_RECOVERED record
+Warn: only the self-claim's same-actor dead-predecessor recovery holds and carries PENDING peer messages; every other revoke path (operator door, takeover, continuity, CEO) still rejects identity-bound rows, and OUTBOX_RETARGETED on a peer row now also marks a same-conversation carry
+Record-Id: r-peercarry
+Provenance: inherited db17a17058d40cda44dea88642f9b0c0f4a92d8c
+
+Limit: the repository treats raw database writers as in scope, so same-actor succession for a carried peer message is proven only by an append-only peer_message_carries record whose INSERT requires the connection-local carry authority minted inside the claim transaction; the OUTBOX_RETARGETED mark and audit actor strings are not evidence
+Limit: the carry follows the CEO decision of 2026-10-03 19:28Z: only an unclaimed PENDING message, never attempted, sent, claimed or receipted, for the same actor, conversation UUID and signer with DEAD_BINDING_RECOVERED continuity, carried once; already-REJECTED rows are never revived
+Warn: src/db/migrations.ts changed for v40, so its frozen pin must be confirmed by the CEO before the pin test is updated; deploying needs an approved v39 to v40 migration
+Record-Id: r-peercarryv40
+Follows: r-peercarry
+Provenance: inherited 7c750ff06c7c78eff174ea751e064e4850e4ef8f
+
+Limit: the v40 src/db/migrations.ts pin is the digest the CEO computed independently from GitHub for 7c750ff0 (sha256 885e15de..., blob ec13ae15...), approved for those exact bytes only; it is void if the source changes
+Warn: do not recompute this pin from the file in a later change; the next digest must again come from the independent authority
+Record-Id: r-pinv40confirm
+Follows: r-peercarryv40
+Provenance: inherited eb1ac4329b2a376c350050d8babba36cfa4555d3
+
+Limit: the carry record now binds the admitted source payload digest and the hand-over compares the admitted row's bytes against it, because the outbox pointer digest stays raw-writable (finding 01 is not addressed here; its scope is with the CEO)
+Warn: fences that reject an identity-bound peer message keep an existing settled receipt exactly as it was (keepSettled) and owe the sender a notice in peer_message_refusal_notices; the holder's own complete or reject still refuses a settled turn
+Warn: src/db/migrations.ts changed again, so the CEO-confirmed pin 885e15de is void; the new digest must be confirmed by the CEO before the pin test is updated
+Record-Id: r-peercarryv40r1
+Follows: r-pinv40confirm
+Provenance: inherited c706cb5d139ad1cb8d75161e556030df61f402ab
+
+Limit: raw SQL writers are inside this repository's threat model, so finding 01 is closed here rather than split off: a trigger records every outbox row that leaves PENDING in the append-only holder_message_departures ledger, and holder claim, retarget and carry refuse a departed message; a protected lifecycle ledger for the whole outbox is not built
+Ruled-out: dropping a departed row from claimForHolder's SELECT | it is reported as withheld instead, because the existing witness for a raw-reverted row expects withheld
+Warn: holder_message_departures is append-only and never pruned: it gains one row per outbox message of any kind that ever leaves PENDING
+Warn: outbox.message_id is now immutable (OUTBOX_MESSAGE_ID_IMMUTABLE); code that renames an outbox row will be refused
+Warn: a privileged writer can still DROP TRIGGER the departure trigger or the ledger guards, the residual every trigger in this schema carries
+Warn: src/db/migrations.ts changed again, so the frozen pin stays void until the CEO computes the final head's bytes independently
+Record-Id: r-peercarryv40r2
+Follows: r-peercarryv40r1
+Provenance: inherited c421f07eba44ea6ded6a550923d9260c82b1dd4c
+
+Limit: a WORKER turn is stateless: the runtime seatbelt denies the CLI's transcript writes under ~/.claude, so a later turn on the same session remembers nothing; one turn per task is the supported shape
+Ruled-out: an empty setting-source list for WORKER turns | it would also drop the repository's CLAUDE.md, so the self-grant path through .claude settings is closed by a runner rule instead
+Warn: WORKER turns run with --setting-sources project,local and a strict empty MCP config; only invocations carrying a managed write get these flags, so reviewer and read-only turns are unchanged
+Warn: a WORKER turn whose change touches any .claude path or the root .mcp.json fails out of scope and is not committed, even when the claim owns those paths; ignored files there are checked before and after the turn
+Warn: a retry never resets the worktree: every attempt must start from a clean worktree on the claim branch with no unidentified orphan alive, otherwise it is refused
+Record-Id: r-workerrun
+Provenance: inherited a07e685b53efc10a0f56b7939fcfaec8ac1e5948
+
+Limit: control-plane git calls after a WORKER turn pin GIT_DIR and the work tree from the registered repository, disable hooks, fsmonitor, filters, external diff and helpers, and refuse the turn if the .git indirection, effective config or git-dir fingerprint changed; another writer in the git dir during a turn therefore fails it with GIT_DIR_CHANGED
+Warn: a worker process's pid and start token are recorded only under an authority minted in the runner's onSpawn for that exact execution, and released only after the runner confirms it gone; a kill also requires the live command line to carry this execution's --session-id, otherwise the process is left outstanding and blocks its task
+Warn: seatbelt tests skip with a reason, or fail under ACP_REQUIRE_SEATBELT=1, when a deny-rule profile cannot apply; a bare (allow default) probe applies even inside another sandbox and must not be used to decide confinement
+Record-Id: r-workerrunr1
+Follows: r-workerrun
+Provenance: inherited 1577a51725ea37ea71ca6eed9808383dc69e3fef
+
+Limit: WORKER turns refuse any checked-out submodule, clean or dirty, and fail a turn that writes inside, replaces or nests a gitlink; a gitlink is accepted only when nothing is checked out at its path
+Warn: the commit takes the real index.lock exclusively, re-checks the staged-content fence (ls-files -s -v, not the stat cache) under it, and replaces the index only with the committed paths updated; a writer that ignores index.lock is outside what the lock can stop
+Warn: shutdown counts pending admissions from their first step and refuses each one after preparation, at the execution gate and before launch; drain is complete only when admissions and running turns are both zero
+Record-Id: r-workerrunr2
+Follows: r-workerrunr1
+Provenance: inherited 597da0608e95ffbfa08a7940ac1630dace0f86f4
+
+Limit: a WORKER turn's irreversible steps read a live authority fence at the moment they act: before the branch moves (under the index lock, nothing awaited before the ref update) and as the first statement of the success transaction; on a drain timeout every turn still running is marked ABANDONED before the daemon releases its lock
+Warn: preparation copies the real index once and answers both 'anything staged' and the staged baseline from that copy, so staging that lands between the two can no longer become the accepted baseline
+Record-Id: r-workerrunr3
+Follows: r-workerrunr2
+Provenance: inherited 4e77cabf3e13e868f53d9768739e67a6f466d64c
+
+Limit: C1 provisions and reclaims BOOTSTRAP_CTO but every bootstrap CONFIRM is refused BOOTSTRAP_APPLICATION_NOT_AVAILABLE with zero GitHub writes until C3 adds the pre-write checks and durable recovery
+Warn: BOOTSTRAP_CTO and WORKER are fixed to Claude Opus in src/domain/fixed-role-runtime.ts; continuity never fails them over to another provider or model, it leaves the role uncovered and pauses the run, so a paused bootstrap or worker run stays BLOCKED
+Warn: a session that ever served as a bootstrap CTO can never take another role, and BOOTSTRAP_CTO shares a session with nothing; there is no promotion, activation always provisions a fresh PRIMARY_CTO
+Record-Id: r-bootstrapcto
+Provenance: inherited c315463e395c55f2bd3494fdd3c961006aa4631b
+
+Limit: continuity-created BOOTSTRAP_CTO replacements still get no launch credential and a revoked bootstrap run still has no recovery path (review C1-02, C1-03); slice C1b adds the real headless runtime and same-session recovery the CEO approved
+Limit: a spawn left STARTING by a daemon crash mid-spawn for a live run is not swept
+Ruled-out: an audit row for a refused canonical handoff | the tx-denial census matches acknowledgeHandoff's exact txDecision opener, so the refusal is reported to the caller only like every other handoff refusal
+Warn: the BOOTSTRAP_CTO_SESSION_SPAWNED audit event that nominates an unbound spawn for cleanup can be forged by a raw database writer; the sweep still never stops a session that holds a role
+Warn: a canonical claim that lands while prepareSwitchover awaits its spawn launches one replacement, which the in-transaction re-check then stops
+Record-Id: r-bootstrapctofix1
+Provenance: inherited 5adb6228115bb7bb31367545d8305dcba1204ab5
+
+Limit: the integrated src/db/migrations.ts is pinned only by the independent authority in tests/helpers/frozen-authority.ts; until it pins these bytes the sealed-trace pin test fails, and the pin is never recomputed here
+Warn: WORKER_SESSION_NOT_INDEPENDENT is defined once, where #1069 put it; PR-B's second definition was dropped in the merge
+Warn: a #1069 witness that reproduces a WORKER sharing the CTO's actor must stand down schema v41's worker-independence triggers for that write as well as assertWorkerSeparation: from v41 the database refuses that state itself
+Record-Id: r-integworkerrun41
+Follows: r-workerrunr3
+Provenance: inherited c6b39533089cc6d5ed141529ec4a058715d947a2
+
+Limit: a DRAIN_REQUEST a pre-fix cto_replace already queued for a canonical CTO is not cancelled; it expires on its TTL and switches nothing
+Warn: settleCanonicalSwitchovers runs at daemon startup and on every watchdog tick: when the role's holder is canonical it closes pending handoffs REJECTED, marks role-less replacements ERROR with a provider stop pending, and returns a DRAINING holder to READY unless the project is suspended
+Warn: the handoff_ack withdrawal runs before the acknowledgement is authenticated and its provider stop is fire-and-forget; the replacement is already ERROR in the transaction, so the sweep retries a failed stop
+Record-Id: r-bootstrapctofix2
+Follows: r-bootstrapctofix1
+Provenance: inherited 3c7601650392d23cd2a6117b870c066f541af9c4
+
+Warn: settleCanonicalSwitchovers returns a canonical holder to READY only on positive switchover evidence (a pending handoff from it, or a CTO_REPLACEMENT_REQUESTED audit newer than its current drain) and never while a RECOVERY handoff row from suspendProject exists, even after cto_resume; any drain nothing explains is left alone
+Warn: a raw database writer can forge the CTO_REPLACEMENT_REQUESTED audit row; the worst a forgery does is return a canonical holder with no suspension record to READY, it cannot switch the role or override a suspension
+Record-Id: r-bootstrapctofix3
+Follows: r-bootstrapctofix2
+Provenance: inherited 14a9edb8bfaa1e20173a97ed4b9816c7bec0a033
+
+Limit: a BOOTSTRAP_CTO turn cannot yet claim an OWNER_MESSAGE: the owner-message wake starts a turn, but the claim tools only serve PRIMARY_CTO
+Limit: only a BLOCKED bootstrap run is recovered on the same session; a run paused from CEO review (AWAITING_HUMAN) is not
+Warn: a provisioned BOOTSTRAP_CTO runs as headless claude -p turns: the first call of its conversation uses --session-id and every later call uses --resume; reusing --session-id in the same cwd is refused 'already in use' by the CLI
+Warn: v42 lets sessions_secret_hash_immutable accept a new secret hash only together with credential_epoch exactly +1 on a READY row with the same session id and incarnation; a rotation never changes the incarnation
+Warn: the launch channel is keyed by the conversation id, which same-user processes can see in argv, so one could take the credential and the MCP token first; take-once turns that race into a failed attestation rather than a silent one
+Warn: after a daemon restart the plaintext credential is gone: the next reconcile tick revokes and pauses that session's run and the following tick's restore recovers it on the same session, so recovery takes two ticks
+Record-Id: r-bootstrapruntime
+Follows: r-bootstrapctofix1
+Provenance: inherited 5a375edff4c3245bc1f83a62d2dbde2a7ed7610a
+
+Warn: the partial timestamp-ordering exclusions are keyed to source lines; after bringing #1071's final C1 (R1/R2 canonical switchover settlement) into C1b they are re-measured at src/db/migrations.ts:2328 and src/cto/cto-lifecycle.ts:906, and any edit above those lines moves them again
+Record-Id: r-c1bmergec1final
+Follows: r-bootstrapruntime
+Provenance: inherited efc3597f4ec6b7d7bc75d4b269c0d9d585bbf49d
+
+Limit: a provisioned-session turn whose CLI succeeded but did not acknowledge its message counts as done and is not retried; the message stays PENDING until its TTL, and the completed-work list grows for the life of the session
+Limit: a run paused before v42 has no recorded continuity hold, so its recovery restores authority without resuming it
+Warn: runs.continuity_hold_role_key records the hold continuity itself placed (written only by pauseForContinuity, kept only while BLOCKED, never on insert); same-session recovery resumes a run only when continuity placed its hold, and otherwise restores the owner's authority alone, so a CEO_DECISION_REQUIRED block stays BLOCKED
+Warn: this supersedes r-bootstrapruntime's limit that an AWAITING_HUMAN run is not recovered: credential-loss recovery now also covers REVISION_REQUIRED and AWAITING_HUMAN runs, restoring authority without changing their state
+Warn: the RUN_DISPATCH idempotency key is run-dispatch:<run>:<gen> for the first cycle and gains :r<n> for revision n, shared by bootstrap and project/canonical dispatch, so a revision redispatch on the same generation enqueues new work instead of replaying the acked envelope
+Record-Id: r-bootstrapruntimer1
+Follows: r-c1bmergec1final
+Provenance: inherited e5778184fe193f7e90b63e1c9111475fe7d35c6d
+
+Limit: owner-message wakes have no outbox row, so a completed turn that did not claim one is still marked done and not re-run; a BOOTSTRAP_CTO still cannot claim owner messages
+Warn: this supersedes r-bootstrapruntimer1's limit that a turn whose CLI succeeded without acknowledging is not retried: an envelope trigger now counts as done only when its outbox row has left PENDING; a turn that exits 0 with no tool call or whose relay never took the credential leaves it PENDING, and the outbox's existing re-wake retries it at most once per IN_BAND_REWAKE_MS and never past its TTL
+Record-Id: r-bootstrapruntimer2
+Follows: r-bootstrapruntimer1
+Provenance: inherited 76764ed67e82d802e33e15a54b10cd0309bc9572
+
+Limit: the v42 src/db/migrations.ts pin b3884573 (blob 4112346e, exact commit 76764ed6) was accepted by the CEO after comparing the Hermes CTO's independent computation from GitHub's original bytes with the CTO's prior value; it is not a CEO direct computation, and it is void if the file's bytes change
+Record-Id: r-pin1073mig
+Follows: r-bootstrapruntimer2
+Provenance: inherited b05f62e73425f7713285fc3ffb26b2b56436eb30
+
+Limit: src/db/migrations.ts is unchanged from b05f62e7 by this merge, so the CEO-accepted v42 pin b3884573 (blob 4112346e) still describes it; any later edit voids that pin
+Warn: the partial timestamp-ordering exclusions stay keyed to src/db/migrations.ts:2330, src/cto/cto-lifecycle.ts:906 and src/run/run-engine.ts:1201; any edit above those lines moves them again
+Record-Id: r-c1bmergecto1070final
+Follows: r-c1bmergec1final
+Provenance: inherited d03f2b9abe2961951300e7c77bb3a56f49df4d91
+
+Warn: a test fixture that staffs a BOOTSTRAP_CTO must give Claude a HeadlessRuntimeDouble and attach cp.sessionRuntime; claiming the launch credential itself, as C1 fixtures did, now ends in run_dispatch SESSION_NOT_READY
+Record-Id: r-c1bmerge1072
+Follows: r-c1bmergecto1070final
+Provenance: inherited 63bfee79a2797dd62be6dae26ba1203dd608dc9f
+
+Warn: a row whose continuity hook keys on "blind-review-unavailable" passes for a verdict and for an assurance failure alike; it must prove which one it received, from the BLIND_REVIEW packet or the reviewer invocation
+Record-Id: r-c1bn101verdict
+Follows: r-c1bmerge1072
+Provenance: inherited 4e9e294489be57386bf9e3fdca3bb00589418e3a
