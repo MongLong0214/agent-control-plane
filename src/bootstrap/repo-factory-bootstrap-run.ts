@@ -1,5 +1,5 @@
-import { lstatSync, mkdirSync, readdirSync, realpathSync, renameSync, rmdirSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { lstatSync, readdirSync } from "node:fs";
+import { basename, dirname, join, relative } from "node:path";
 
 import { z } from "zod";
 
@@ -10,6 +10,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { type ProjectManifest, assertPortableManifest, manifestDigest } from "../contracts/manifest.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
+import { RollbackFilesystem } from "../db/fd-vfs.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { ArtifactKind, Role, RunKind, RunState, roleKeyFor, type RunRow } from "../domain/types.ts";
 import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
@@ -315,9 +316,13 @@ interface PlacedCheckout {
   workDir: string;
   checkoutPath: string;
   repositoryRole: string;
-  checkoutDevice: number;
-  checkoutInode: number;
-  realWorkDir: string;
+  /** Exact (dev, ino) of the checkout, its parent and the work directory, as decimal text. */
+  checkoutDevice: string;
+  checkoutInode: string;
+  checkoutParentDevice: string;
+  checkoutParentInode: string;
+  workDirDevice: string;
+  workDirInode: string;
 }
 
 /** Where preserved checkouts are kept: beside the run's checkouts, in the run's own work directory. */
@@ -338,23 +343,30 @@ export interface InterruptedCheckoutPreservation {
   candidateSnapshotDigest: string;
   originalPath: string;
   preservedPath: string;
-  /** The checked checkout directory itself, by device and inode: what has to arrive at `preservedPath`. */
-  checkoutDevice: number;
-  checkoutInode: number;
-  /** `preservedPath` with every symlink resolved, as it was when checked: where it has to arrive. */
-  preservedRealPath: string;
+  /**
+   * The verified objects, by exact (dev, ino) as decimal text: the checkout, the directory holding it,
+   * and the run's work directory. The move acts only through descriptors held on these, re-verified.
+   */
+  checkoutDevice: string;
+  checkoutInode: string;
+  checkoutParentDevice: string;
+  checkoutParentInode: string;
+  workDirDevice: string;
+  workDirInode: string;
 }
 
 /**
- * #246 C3, CEO decision (b) as corrected — the preconditions of releasing a cancelled run's
- * reservation, in the order the repair catalog lists them. Each must be verified; one that cannot be
- * is unmet, and nothing is released.
+ * #246 C3, CEO decision (b) as corrected twice — the preconditions of releasing a cancelled run's
+ * reservation, in the order the repair catalog lists them. Release needs positive proof that the
+ * application had no external effect; GitHub's present state is not that proof, because a
+ * repository absent now says nothing about a create request that may still land. Each precondition
+ * must be verified; one that cannot be is unmet, and nothing is released.
  */
 export const RESERVATION_RELEASE_PRECONDITIONS = [
   "the run is a cancelled PROJECT_BOOTSTRAP run, so the approval its reservation consumed, which names that run, can never be presented again; and its application is RESERVED",
   "no application attempt of the run is in flight, and this process holds the control plane's single-writer lock",
-  "the attempt ledger records no write that landed: it is absent, or this operation's own with no receipt",
-  "GitHub, read now, holds no repository at the reserved target, so no write the attempts sent took effect",
+  "the attempt ledger, which records every GitHub request before it is sent, shows none was ever sent: it is absent, or this operation's own with no receipt and no pending request",
+  "the last attempt's own outcome is recorded: it ended in a production refusal that names this ledger and no request issued or completed",
 ] as const;
 
 /** A reservation release, with the evidence that its application had no external effect. */
@@ -365,40 +377,20 @@ export interface ReservationRelease {
   bootstrapOperationId: string;
   attempts: number;
   approvalDigest: string;
-  ledgerPath: string | null;
-  /** Writes the attempts sent and GitHub never answered; settled by the read of the target. */
-  unansweredWrites: string[];
-  target: string;
-  githubReadAt: string;
+  ledgerPath: string;
+  /** Whether the ledger file exists at all; when it does, it holds no receipt and no pending request. */
+  ledgerPresent: boolean;
+  /** The last attempt's recorded outcome, as the application row keeps it. */
+  lastAttemptOutcome: { attempt: number; refusal: string | null; reasonCode: string | null };
 }
 
 export interface ReservationReleaseInspection {
   preconditions: CheckoutRecoveryPrecondition[];
-  /** Why the external effect cannot be told, when it cannot: the reservation is then kept, in doubt. */
+  /** Why the external effect cannot be proven absent, when it cannot: the reservation is then kept, in doubt. */
   inDoubt: Record<string, unknown> | null;
   release: ReservationRelease | null;
 }
 
-/** What a release can check without GitHub, asked again synchronously at the release itself. */
-interface ReleaseLocalState {
-  application: BootstrapApplication;
-  ledgerPath: string | null;
-  unansweredWrites: string[];
-  target: { owner: string; name: string };
-}
-
-/**
- * The file operations the interrupted-checkout recovery acts with, in one object: another process
- * can change the tree between any two of them, and a witness puts that change exactly there.
- * Production uses node:fs unchanged.
- */
-export const checkoutRecoveryFiles = {
-  lstat: lstatSync,
-  mkdir: mkdirSync,
-  realpath: realpathSync,
-  rename: renameSync,
-  rmdir: rmdirSync,
-};
 
 export interface InterruptedCheckoutInspection {
   preconditions: CheckoutRecoveryPrecondition[];
@@ -1230,7 +1222,7 @@ export class RepoFactoryBootstrapRunner {
     if (!met(placed.allowed, placed.allowed ? placed.value : { message: placed.message, ...placed.evidence }) || !placed.allowed) {
       return unmetFromHere();
     }
-    const { workDir, checkoutPath, repositoryRole, checkoutDevice, checkoutInode, realWorkDir } = placed.value;
+    const { workDir, checkoutPath, repositoryRole } = placed.value;
 
     const attemptInFlight = this.#applying.has(runId);
     const writerLockHeld = this.#writerLockHeld?.() === true;
@@ -1259,25 +1251,34 @@ export class RepoFactoryBootstrapRunner {
         candidateSnapshotDigest: application.candidateSnapshotDigest,
         originalPath: checkoutPath,
         preservedPath,
-        checkoutDevice,
-        checkoutInode,
-        preservedRealPath: join(realWorkDir, PRESERVED_DIRECTORY, preservedName),
+        checkoutDevice: placed.value.checkoutDevice,
+        checkoutInode: placed.value.checkoutInode,
+        checkoutParentDevice: placed.value.checkoutParentDevice,
+        checkoutParentInode: placed.value.checkoutParentInode,
+        workDirDevice: placed.value.workDirDevice,
+        workDirInode: placed.value.workDirInode,
       },
     };
   }
 
   /**
-   * #246 C3, CEO decision (c) — the official recovery of an interrupted application's checkout:
-   * verified again here, synchronously and immediately before anything moves, and refused unless it
-   * is still exactly what the repair's plan verified (`planned`). Then moved — never deleted — to
-   * `<work dir>/preserved/<role>-attempt-<n>`, whose name is claimed first by an exclusive mkdir so
-   * the move can only land in a place this call created empty. Another process can still change the
-   * tree between the last check and the rename — replace the checkout, swap it or a parent for a
-   * symlink, or move the destination — so what arrived is checked after the rename: the same
-   * directory by device and inode, at the preservation path with every symlink resolved. Anything
-   * else is moved back to where it came from if that place is still free, and refused; nothing is
-   * deleted in either case. On success the original path, the preserved location and the run's
-   * attribution are recorded.
+   * #246 C3, CEO decision (c) — the official recovery of an interrupted application's checkout. It
+   * is verified again here, synchronously, and refused unless it is still exactly what the repair's
+   * plan verified (`planned`). Then it is moved — never deleted — to
+   * `<work dir>/preserved/<role>-attempt-<n>`, and only through held descriptors: the work directory,
+   * the directory holding the checkout and the preservation directory are each opened no-follow and
+   * required to be the very objects verified, by (dev, ino); the checkout is then required, through
+   * its held parent and without following a symlink, to be the verified directory; and the rename
+   * is made between the held descriptors with RENAME_EXCL, so it cannot be steered through a swapped
+   * parent or symlink, and cannot land on anything already there. Any difference refuses before
+   * anything moves. Nothing is restored and no other path is touched on any refusal.
+   *
+   * One window stays open, and is stated rather than hidden: between the identity check through
+   * the held parent and the rename itself, another process of this account could replace the
+   * checkout's entry inside the run's private work directory. macOS has no rename that is
+   * conditional on the identity of what it moves, so no primitive here closes it; the identity is
+   * read again through the held preservation directory right after, and a mismatch is refused and
+   * left exactly where the rename put it.
    *
    * It authorises nothing. No approval is consumed or re-admitted, no attempt is recorded and no
    * phase moves: the application resumes only through a new CEO CONFIRM, which passes every check
@@ -1288,7 +1289,6 @@ export class RepoFactoryBootstrapRunner {
     runId: string | null,
     planned: InterruptedCheckoutPreservation | null = null,
   ): Decision<InterruptedCheckoutPreservation> {
-    const files = checkoutRecoveryFiles;
     const refuse = (refusal: string, message: string, evidence: Evidence): Decision<InterruptedCheckoutPreservation> =>
       deny(ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED, message, { refusal, runId, ...evidence });
     const inspected = this.inspectInterruptedCheckout(runId);
@@ -1304,73 +1304,99 @@ export class RepoFactoryBootstrapRunner {
         current: move,
       });
     }
-    const preservedRoot = dirname(move.preservedPath);
-    const ensured = ensureDirectoryLevel(preservedRoot);
+    const ensured = ensureDirectoryLevel(dirname(move.preservedPath));
     if (!ensured.allowed) {
       return refuse("PRESERVATION_LOCATION_UNSAFE", ensured.message, { ...move, ...ensured.evidence });
     }
+    let files: RollbackFilesystem;
     try {
-      files.mkdir(move.preservedPath, { mode: 0o700 });
+      files = RollbackFilesystem.load();
     } catch (error) {
-      return refuse("PRESERVATION_TARGET_EXISTS", "the preservation location is already taken; nothing is moved", {
+      return refuse("ANCHOR_UNAVAILABLE", "the held-descriptor file operations are unavailable; nothing is moved", {
         ...move,
         error: (error as Error).message.slice(0, 300),
       });
     }
     try {
-      files.rename(move.originalPath, move.preservedPath);
-    } catch (error) {
-      // Only the empty directory this call claimed is given back; the checkout never left its place.
-      try {
-        files.rmdir(move.preservedPath);
-      } catch {
-        // An empty claimed directory left behind holds nothing and is named in the refusal.
-      }
-      return refuse("MOVE_FAILED", "the checkout could not be moved to its preservation location; it is left where it was", {
-        ...move,
-        error: (error as Error).message.slice(0, 300),
-      });
-    }
-    const arrived = this.arrivedIntact(move);
-    if (!arrived.intact) {
-      let movedBack = false;
-      if (!pathOccupied(move.originalPath)) {
-        try {
-          files.rename(move.preservedPath, move.originalPath);
-          movedBack = true;
-        } catch {
-          // Left where it landed, which the refusal names; nothing is deleted.
-        }
-      }
-      return refuse(
-        "MOVED_OBJECT_MISMATCH",
-        "what the move took is not the checkout that was verified, or it did not land in the preservation location; it was moved back where it came from if that place was still free, and nothing was deleted",
-        { ...move, arrived: arrived.evidence, movedBack },
-      );
+      const moved = this.anchoredMove(files, move);
+      if (!moved.allowed) return refuse(String(moved.evidence["refusal"]), moved.message, { ...move, ...moved.evidence });
+    } finally {
+      files.dispose();
     }
     this.deps.applications.recordCheckoutPreserved(move);
     return allow(ReasonCode.OK, move);
   }
 
-  /** Whether the directory now at `preservedPath` is the checked checkout, at the checked place. */
-  private arrivedIntact(move: InterruptedCheckoutPreservation): { intact: boolean; evidence: Evidence } {
-    const files = checkoutRecoveryFiles;
-    let landed: { device: number; inode: number; directory: boolean } | null = null;
-    let realPath: string | null = null;
-    try {
-      const stat = files.lstat(move.preservedPath);
-      landed = { device: stat.dev, inode: stat.ino, directory: stat.isDirectory() };
-      realPath = files.realpath(move.preservedPath);
-    } catch {
-      // Nothing readable arrived; reported as such.
+  /** The move itself, through held descriptors only; see `preserveInterruptedCheckout`. */
+  private anchoredMove(files: RollbackFilesystem, move: InterruptedCheckoutPreservation): Decision<void> {
+    const stop = (refusal: string, message: string, evidence: Evidence = {}): Decision<void> =>
+      deny(ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED, message, { refusal, ...evidence });
+    const is = (entry: { dev: bigint; ino: bigint } | null, dev: string, ino: string): boolean =>
+      entry !== null && entry.dev === BigInt(dev) && entry.ino === BigInt(ino);
+    const parentPath = dirname(move.originalPath);
+    const workDir = dirname(parentPath);
+    const parentName = basename(parentPath);
+    const leafName = basename(move.originalPath);
+    const preservedRootName = basename(dirname(move.preservedPath));
+    const preservedName = basename(move.preservedPath);
+    if (dirname(dirname(move.preservedPath)) !== workDir) {
+      return stop("ANCHOR_MISMATCH", "the preservation location is not in the run's work directory; nothing is moved");
     }
-    const intact =
-      landed !== null &&
-      landed.directory &&
-      landed.device === move.checkoutDevice &&
-      landed.inode === move.checkoutInode &&
-      realPath === move.preservedRealPath;
-    return { intact, evidence: { landed, realPath } };
+    let work: ReturnType<RollbackFilesystem["openParent"]>;
+    let parent: ReturnType<RollbackFilesystem["openParent"]>;
+    let preserved: ReturnType<RollbackFilesystem["openParent"]>;
+    let leaf: ReturnType<RollbackFilesystem["stat"]>;
+    try {
+      work = files.openParent(workDir);
+      if (!is(work, move.workDirDevice, move.workDirInode)) {
+        return stop("ANCHOR_MISMATCH", "the run's work directory is not the one that was verified; nothing is moved");
+      }
+      parent = files.openParent(parentPath);
+      if (!is(parent, move.checkoutParentDevice, move.checkoutParentInode) || !is(files.stat(work, parentName), move.checkoutParentDevice, move.checkoutParentInode)) {
+        return stop("ANCHOR_MISMATCH", "the directory holding the checkout is not the one that was verified; nothing is moved");
+      }
+      preserved = files.openParent(dirname(move.preservedPath));
+      const preservedEntry = files.stat(work, preservedRootName);
+      if (preservedEntry === null || preservedEntry.type !== "dir" || preservedEntry.dev !== preserved.dev || preservedEntry.ino !== preserved.ino) {
+        return stop("ANCHOR_MISMATCH", "the preservation directory is not the one in the run's work directory; nothing is moved");
+      }
+      leaf = files.stat(parent, leafName);
+      if (leaf === null || leaf.type !== "dir" || !is(leaf, move.checkoutDevice, move.checkoutInode)) {
+        return stop("CHECKOUT_CHANGED", "the checkout is no longer the directory that was verified; nothing is moved", {
+          found: leaf === null ? null : { type: leaf.type, dev: String(leaf.dev), ino: String(leaf.ino) },
+        });
+      }
+      if (files.stat(preserved, preservedName) !== null) {
+        return stop("PRESERVATION_TARGET_EXISTS", "the preservation location is already taken; nothing is moved");
+      }
+    } catch (error) {
+      return stop("ANCHOR_FAILED", "a held descriptor could not be taken on a verified directory, without following a symlink; nothing is moved", {
+        error: (error as Error).message.slice(0, 300),
+        reason: isAcpError(error) ? error.evidence["reason"] ?? null : null,
+      });
+    }
+    try {
+      files.renameExclusive(parent, leafName, preserved, preservedName);
+    } catch (error) {
+      return stop("MOVE_FAILED", "the checkout could not be moved to its preservation location; it is left where it was", {
+        error: (error as Error).message.slice(0, 300),
+        errno: isAcpError(error) ? error.evidence["errno"] ?? null : null,
+      });
+    }
+    let arrived: ReturnType<RollbackFilesystem["stat"]> = null;
+    try {
+      arrived = files.stat(preserved, preservedName);
+    } catch {
+      // Unreadable is not the verified directory; refused below, and nothing is restored.
+    }
+    if (arrived === null || arrived.type !== "dir" || !is(arrived, move.checkoutDevice, move.checkoutInode)) {
+      return stop(
+        "MOVED_OBJECT_MISMATCH",
+        "what the rename moved is not the verified checkout: another process replaced it between the check and the rename; it is left where the rename put it, and no other path is touched",
+        { arrived: arrived === null ? null : { type: arrived.type, dev: String(arrived.dev), ino: String(arrived.ino) } },
+      );
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /**
@@ -1381,118 +1407,84 @@ export class RepoFactoryBootstrapRunner {
    * write, whose marker names the application's bootstrap operation.
    */
   /**
-   * #246 C3, CEO decision (b) as corrected — whether a cancelled run's reservation can be released,
-   * asked without changing anything but GitHub's read of the target. Released only when no attempt
-   * is in flight here, this process is the only control-plane writer, the attempt ledger records no
-   * write that landed, and GitHub holds nothing at the target, which settles any write the attempts
-   * sent and never had answered. A ledger that cannot be read as this operation's, a GitHub read that
-   * fails, or a repository at the target makes the effect unclear: `inDoubt` says why, and nothing is
-   * released.
+   * #246 C3, CEO decision (b) as corrected twice — whether a cancelled run's reservation can be
+   * released, asked without changing anything. Released only on positive proof that the application
+   * had no external effect: no attempt in flight here and this process the only control-plane
+   * writer; the attempt ledger — written and synced before every GitHub request is sent — showing
+   * that none was ever sent; and the last attempt's own recorded outcome agreeing. A pending request
+   * (sent, and its outcome never recorded), a ledger that cannot be read as this operation's, or an
+   * attempt whose outcome was never recorded — a daemon that died mid-attempt — cannot be proven to
+   * have had no effect: `inDoubt` says why, and nothing is released. GitHub is not read: that a
+   * repository is absent now does not prove a request sent earlier will not land.
    */
-  async inspectReservationRelease(runId: string | null): Promise<ReservationReleaseInspection> {
+  inspectReservationRelease(runId: string | null): ReservationReleaseInspection {
     const preconditions: CheckoutRecoveryPrecondition[] = [];
-    const local = this.releaseLocalState(runId, preconditions);
-    const unmetFromHere = (inDoubt: Record<string, unknown> | null = null): ReservationReleaseInspection => {
-      for (const precondition of RESERVATION_RELEASE_PRECONDITIONS.slice(preconditions.length)) {
-        preconditions.push({ precondition, satisfied: false, evidence: { notChecked: "an earlier precondition is unmet" } });
-      }
-      return { preconditions, inDoubt, release: null };
-    };
-    if (!local.allowed) return unmetFromHere(local.evidence["inDoubt"] === true ? { ...local.evidence } : null);
-    const { application, ledgerPath, unansweredWrites, target } = local.value;
-    const targetName = `${target.owner}/${target.name}`;
-    let observed: ObservedRepository | null;
-    try {
-      observed = await this.deps.githubPort.observeRepository(target);
-    } catch (error) {
-      const inDoubt = {
-        cause: "GITHUB_UNREAD",
-        target: targetName,
-        message: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
-      };
-      preconditions.push({ precondition: RESERVATION_RELEASE_PRECONDITIONS[3], satisfied: false, evidence: inDoubt });
-      return { preconditions, inDoubt, release: null };
+    const proven = this.releaseProof(runId, preconditions);
+    if (proven.allowed) return { preconditions, inDoubt: null, release: proven.value };
+    for (const precondition of RESERVATION_RELEASE_PRECONDITIONS.slice(preconditions.length)) {
+      preconditions.push({ precondition, satisfied: false, evidence: { notChecked: "an earlier precondition is unmet" } });
     }
-    if (observed !== null) {
-      const inDoubt = { cause: "REPOSITORY_AT_TARGET", target: targetName, observedNodeId: observed.nodeId, unansweredWrites };
-      preconditions.push({ precondition: RESERVATION_RELEASE_PRECONDITIONS[3], satisfied: false, evidence: inDoubt });
-      return { preconditions, inDoubt, release: null };
-    }
-    const githubReadAt = this.deps.clock.nowIso();
-    preconditions.push({
-      precondition: RESERVATION_RELEASE_PRECONDITIONS[3],
-      satisfied: true,
-      evidence: { target: targetName, repository: null, readAt: githubReadAt },
-    });
     return {
       preconditions,
-      inDoubt: null,
-      release: {
-        runId: application.runId,
-        projectId: application.projectId,
-        repositoryIdentity: application.repositoryIdentity,
-        bootstrapOperationId: application.bootstrapOperationId,
-        attempts: application.attempts,
-        approvalDigest: application.approvalDigest,
-        ledgerPath,
-        unansweredWrites,
-        target: targetName,
-        githubReadAt,
-      },
+      inDoubt: proven.evidence["inDoubt"] === true ? { ...proven.evidence } : null,
+      release: null,
     };
   }
 
   /**
-   * The release itself: everything but GitHub verified again, synchronously, and refused unless it
-   * is still what the plan's inspection found (`planned`); then the row becomes RELEASED with the
-   * release record. Nothing is deleted, no approval is consumed or re-admitted, and the cancelled
-   * run can never be confirmed again.
+   * The release itself: the proof taken again, synchronously, and refused unless it is still what
+   * the repair's plan found (`planned`); then the row becomes RELEASED with the release record.
+   * Nothing is deleted, no approval is consumed or re-admitted, and the cancelled run can never be
+   * confirmed again.
    */
   releaseReservation(runId: string | null, planned: ReservationRelease | null): Decision<ReservationRelease> {
     const refuse = (refusal: string, message: string, evidence: Evidence): Decision<ReservationRelease> =>
       deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, message, { refusal, runId, ...evidence });
     const preconditions: CheckoutRecoveryPrecondition[] = [];
-    const local = this.releaseLocalState(runId, preconditions);
-    if (!local.allowed || planned === null) {
+    const proven = this.releaseProof(runId, preconditions);
+    if (!proven.allowed || planned === null) {
       return refuse("RELEASE_PRECONDITION_UNMET", "the reservation's release preconditions do not hold; nothing is released", {
         preconditions,
       });
     }
-    const { application, ledgerPath, unansweredWrites } = local.value;
-    if (
-      planned.runId !== application.runId ||
-      planned.attempts !== application.attempts ||
-      planned.ledgerPath !== ledgerPath ||
-      digestOf(planned.unansweredWrites) !== digestOf(unansweredWrites)
-    ) {
+    if (digestOf(proven.value) !== digestOf(planned)) {
       return refuse("RELEASE_PLAN_CHANGED", "the reservation changed since the release was planned; nothing is released", {
         planned,
-        attempts: application.attempts,
-        unansweredWrites,
+        current: proven.value,
       });
     }
-    const released = this.deps.applications.markReleased(application.runId, {
+    const released = this.deps.applications.markReleased(proven.value.runId, {
       cause: "RELEASED",
       requiredRecovery: "none: a new run reserves the project id and repository identity again under its own owner approval",
-      evidence: { ...planned, releasedAt: this.deps.clock.nowIso() },
+      evidence: { ...proven.value, releasedAt: this.deps.clock.nowIso() },
     });
     if (!released.allowed) return released as Decision<ReservationRelease>;
-    return allow(ReasonCode.OK, planned);
+    return allow(ReasonCode.OK, proven.value);
   }
 
-  /** CEO decision (b): a release refused because the external effect cannot be told keeps the reservation, marked so. */
+  /**
+   * CEO decision (b): a release refused because no effect can be proven keeps the reservation, marked
+   * so. The last attempt's own outcome is kept inside the mark (`attemptOutcome`), so a doubt that
+   * later clears does not erase the record a later release needs.
+   */
   recordReleaseInDoubt(runId: string, inDoubt: Record<string, unknown>): void {
-    this.deps.applications.recordRefusal(runId, { stage: "release", refusal: "RELEASE_IN_DOUBT", ...inDoubt });
+    const last = this.deps.applications.get(runId)?.lastRefusal ?? null;
+    const attemptOutcome = last?.["stage"] === "release" ? (last["attemptOutcome"] ?? null) : last;
+    this.deps.applications.recordRefusal(runId, { stage: "release", refusal: "RELEASE_IN_DOUBT", ...inDoubt, attemptOutcome });
   }
 
-  /** Preconditions 1–3 of a release, appended to `preconditions` as they are checked. */
-  private releaseLocalState(runId: string | null, preconditions: CheckoutRecoveryPrecondition[]): Decision<ReleaseLocalState> {
+  /** The release preconditions, appended to `preconditions` as they are checked. */
+  private releaseProof(runId: string | null, preconditions: CheckoutRecoveryPrecondition[]): Decision<ReservationRelease> {
     const met = (satisfied: boolean, evidence: unknown): boolean => {
       preconditions.push({ precondition: RESERVATION_RELEASE_PRECONDITIONS[preconditions.length]!, satisfied, evidence });
       return satisfied;
     };
-    const unmet = (evidence: Evidence = {}): Decision<ReleaseLocalState> =>
+    const unmet = (evidence: Evidence = {}): Decision<ReservationRelease> =>
       deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, "a release precondition is unmet", { runId, ...evidence });
+    const inDoubt = (cause: string, evidence: Evidence): Decision<ReservationRelease> => {
+      met(false, { cause, ...evidence });
+      return unmet({ inDoubt: true, cause, ...evidence });
+    };
     const run = runId === null ? null : this.deps.runs.get(runId);
     const application = runId === null ? null : this.deps.applications.get(runId);
     if (
@@ -1510,17 +1502,10 @@ export class RepoFactoryBootstrapRunner {
     const writerLockHeld = this.#writerLockHeld?.() === true;
     if (!met(!attemptInFlight && writerLockHeld, { attemptInFlight, writerLockHeld })) return unmet();
 
-    // Which ledger an attempt of this application wrote, from what it reserved; if that cannot be
-    // said, the attempts' effects cannot be either.
-    const inDoubt = (cause: string, evidence: Evidence): Decision<ReleaseLocalState> => {
-      met(false, { cause, ...evidence });
-      return unmet({ inDoubt: true, cause, ...evidence });
-    };
+    // Which ledger the attempts wrote, from what the application reserved; if that cannot be said,
+    // neither can what they sent.
     const outputs = this.reservedOutputs(application, ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
     if (!outputs.allowed) return inDoubt("RESERVED_PLAN_UNREADABLE", { plan: outputs.evidence });
-    const match = /^github:([^/]+)\/([^/]+)$/.exec(outputs.value.target.repositoryIdentity);
-    if (match === null) return inDoubt("TARGET_UNREADABLE", { repositoryIdentity: outputs.value.target.repositoryIdentity });
-    const target = { owner: match[1]!, name: match[2]! };
     const workRoot = this.deps.workRoot;
     if (workRoot === null || !PATH_SAFE_RUN_ID.test(runId)) return inDoubt("WORK_ROOT_UNCONFIGURED", { workRoot });
     const ledgerPath = githubLedgerPath(join(workRoot, runId), outputs.value.target.repositoryRole);
@@ -1531,12 +1516,56 @@ export class RepoFactoryBootstrapRunner {
     );
     if (!ledger.allowed) return inDoubt("LEDGER_UNREADABLE", { ledgerPath, ledger: refusalRecord(ledger, "precondition") });
     const receipted = [...ledger.value.receipts.keys()].sort();
-    const unansweredWrites = [...ledger.value.pending.keys()].sort();
+    const pending = [...ledger.value.pending.keys()].sort();
+    // A pending request was sent and its outcome never recorded: whatever GitHub shows now, it may
+    // still land. That is a doubt, not a release.
+    if (pending.length > 0) return inDoubt("UNRESOLVED_REQUEST", { ledgerPath, pending, receipted });
     // A receipt is a write that landed: an external effect, not a doubt. The reservation is kept.
-    if (!met(receipted.length === 0, { ledgerPath, receipted, unansweredWrites })) {
+    if (!met(receipted.length === 0, { cause: receipted.length === 0 ? null : "WRITE_LANDED", ledgerPath, receipted })) {
       return unmet({ cause: "WRITE_LANDED", receipted });
     }
-    return allow(ReasonCode.OK, { application, ledgerPath, unansweredWrites, target });
+    const ledgerPresent = pathOccupied(ledgerPath);
+
+    // The last attempt's own outcome: recorded by the attempt itself when it returned. An attempt
+    // whose outcome was never recorded — its daemon died — proves nothing about what it sent.
+    const last = application.lastRefusal;
+    const outcome = (last?.["stage"] === "release" ? (last["attemptOutcome"] ?? null) : last) as Record<string, unknown> | null;
+    const evidence = (outcome?.["evidence"] ?? null) as Record<string, unknown> | null;
+    const listed = (key: string): unknown[] | null => {
+      const value = evidence?.[key];
+      return Array.isArray(value) ? value : null;
+    };
+    const recordedLedger = evidence?.["ledgerPath"];
+    const ended =
+      outcome !== null &&
+      outcome["stage"] === "production" &&
+      outcome["attempt"] === application.attempts &&
+      (recordedLedger === undefined || recordedLedger === ledgerPath) &&
+      (listed("pendingOperationIds") ?? []).length === 0 &&
+      (listed("completedOperationIds") ?? []).length === 0;
+    const lastAttemptOutcome = {
+      attempt: application.attempts,
+      refusal: typeof outcome?.["refusal"] === "string" ? outcome["refusal"] : typeof evidence?.["refusal"] === "string" ? evidence["refusal"] : null,
+      reasonCode: typeof outcome?.["reasonCode"] === "string" ? outcome["reasonCode"] : null,
+    };
+    if (!ended) {
+      return inDoubt("ATTEMPT_OUTCOME_UNRECORDED", {
+        attempts: application.attempts,
+        recorded: outcome === null ? null : { stage: outcome["stage"] ?? null, attempt: outcome["attempt"] ?? null },
+      });
+    }
+    met(true, { lastAttemptOutcome });
+    return allow(ReasonCode.OK, {
+      runId: application.runId,
+      projectId: application.projectId,
+      repositoryIdentity: application.repositoryIdentity,
+      bootstrapOperationId: application.bootstrapOperationId,
+      attempts: application.attempts,
+      approvalDigest: application.approvalDigest,
+      ledgerPath,
+      ledgerPresent,
+      lastAttemptOutcome,
+    });
   }
 
   /**
@@ -1602,8 +1631,12 @@ export class RepoFactoryBootstrapRunner {
     const workDir = join(workRoot, runId);
     const checkoutPath = repositoryCheckoutPath(workDir, outputs.target.repositoryRole);
     let leaf;
+    let parentOf;
+    let work;
     try {
-      leaf = lstatSync(checkoutPath);
+      leaf = lstatSync(checkoutPath, { bigint: true });
+      parentOf = lstatSync(dirname(checkoutPath), { bigint: true });
+      work = lstatSync(workDir, { bigint: true });
     } catch (error) {
       return refuse(
         (error as NodeJS.ErrnoException).code === "ENOENT" ? "CHECKOUT_ABSENT" : "CHECKOUT_UNREADABLE",
@@ -1612,8 +1645,8 @@ export class RepoFactoryBootstrapRunner {
       );
     }
     if (!leaf.isDirectory()) return refuse("CHECKOUT_NOT_A_DIRECTORY", "the checkout leaf is not a directory", { checkoutPath });
-    if (typeof process.getuid !== "function" || leaf.uid !== process.getuid()) {
-      return refuse("CHECKOUT_FOREIGN_OWNER", "the checkout is not this account's", { checkoutPath, uid: leaf.uid });
+    if (typeof process.getuid !== "function" || leaf.uid !== BigInt(process.getuid())) {
+      return refuse("CHECKOUT_FOREIGN_OWNER", "the checkout is not this account's", { checkoutPath, uid: String(leaf.uid) });
     }
     const chain = assertParentChainNotAttackerWritable(workDir, checkoutPath);
     if (!chain.allowed) return refuse("CHECKOUT_PARENT_UNSAFE", chain.message, { checkoutPath, ...chain.evidence });
@@ -1625,19 +1658,19 @@ export class RepoFactoryBootstrapRunner {
         bootstrapOperationId: application.bootstrapOperationId,
       });
     }
-    let realWorkDir: string;
-    try {
-      realWorkDir = realpathSync(workDir);
-    } catch {
-      return refuse("WORK_DIR_UNREADABLE", "the run's work directory cannot be resolved", { workDir });
+    if (!parentOf.isDirectory() || !work.isDirectory()) {
+      return refuse("CHECKOUT_PARENT_UNSAFE", "the checkout's parent or the work directory is not a directory", { checkoutPath });
     }
     return allow(ReasonCode.OK, {
       workDir,
       checkoutPath,
       repositoryRole: outputs.target.repositoryRole,
-      checkoutDevice: leaf.dev,
-      checkoutInode: leaf.ino,
-      realWorkDir,
+      checkoutDevice: String(leaf.dev),
+      checkoutInode: String(leaf.ino),
+      checkoutParentDevice: String(parentOf.dev),
+      checkoutParentInode: String(parentOf.ino),
+      workDirDevice: String(work.dev),
+      workDirInode: String(work.ino),
     });
   }
 

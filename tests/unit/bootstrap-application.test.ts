@@ -1,4 +1,4 @@
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -8,7 +8,6 @@ import { bootstrapActivationHandoff, plannedBootstrapOutputs } from "../../src/b
 import {
   REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND,
   type RepoFactoryOwnerApproval,
-  checkoutRecoveryFiles,
   repoFactoryGitHubWriteParameters,
 } from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
 import { repositoryCheckoutPath } from "../../src/bootstrap/repo-factory-producer.ts";
@@ -17,6 +16,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { type ProjectManifest, manifestDigest } from "../../src/contracts/manifest.ts";
 import { startLocalMcpListeners, startOperatorSocket, startSessionLaunchChannel } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
+import { RollbackFilesystem } from "../../src/db/fd-vfs.ts";
 import { ArtifactKind, ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
@@ -1245,70 +1245,81 @@ describe("#246 C3 decision (c): the official recovery of an interrupted attempt'
     });
   });
 
-  /** A swap another process makes between the recovery's last check and its rename. */
-  const swapBeforeRename = (swap: () => void) =>
-    vi.spyOn(checkoutRecoveryFiles, "rename").mockImplementationOnce((from, to) => {
+  /**
+   * A swap another process makes after the move's own re-check and before it takes its held
+   * descriptors: the moment a path-resolving move would be steered.
+   */
+  const swapBeforeAnchoring = (swap: () => void) => {
+    const open = RollbackFilesystem.prototype.openParent;
+    return vi.spyOn(RollbackFilesystem.prototype, "openParent").mockImplementationOnce(function (this: RollbackFilesystem, path: string) {
       swap();
-      renameSync(from, to);
-    });
-
-  /** The refusal a swap between the check and the rename gets: what arrived was moved back. */
-  const movedBack = (refused: Record<string, unknown>): void => {
-    expect(refused, JSON.stringify(refused)).toMatchObject({
-      ok: false,
-      reasonCode: ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED,
-      evidence: { refusal: "MOVED_OBJECT_MISMATCH", movedBack: true },
+      return open.call(this, path);
     });
   };
 
-  it("the checkout replaced by another directory between the check and the rename: refused, and that directory moved back", async () => {
+  /** What a path holds, by identity and content: the witness that nothing foreign was touched. */
+  const footprint = (path: string) => {
+    const stat = lstatSync(path, { bigint: true });
+    return {
+      dev: stat.dev,
+      ino: stat.ino,
+      kind: stat.isSymbolicLink() ? `symlink:${readlinkSync(path)}` : stat.isDirectory() ? "dir" : "file",
+      entries: stat.isDirectory() && !stat.isSymbolicLink() ? readdirSync(path).sort() : null,
+    };
+  };
+
+  /** Refused before anything moved: nothing preserved, nothing recorded. */
+  const refusedUnmoved = (f: Fixture, refused: Record<string, unknown>, refusal: string | RegExp, checkout: { preservedPath: string }): void => {
+    expect(refused, JSON.stringify(refused)).toMatchObject({
+      ok: false,
+      reasonCode: ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED,
+      evidence: { refusal },
+    });
+    expect(existsSync(checkout.preservedPath)).toBe(false);
+    expect(preservedRecords(f)).toEqual([]);
+  };
+
+  it("the checkout replaced by another directory before the move: refused before anything moves, the other directory untouched", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-replaced"));
       await approveWrites(f, run);
       const checkout = await interruptedAttempt(f, run);
       const aside = `${checkout.checkoutPath}.real`;
-      swapBeforeRename(() => {
+      let foreign: ReturnType<typeof footprint> | null = null;
+      swapBeforeAnchoring(() => {
         renameSync(checkout.checkoutPath, aside);
         mkdirSync(checkout.checkoutPath, { mode: 0o700 });
         cpSync(join(aside, MARKER), join(checkout.checkoutPath, MARKER));
         writeFileSync(join(checkout.checkoutPath, "impostor"), "not the checkout\n");
+        foreign = footprint(checkout.checkoutPath);
       });
-      movedBack(await preserveCheckout(f, run));
-      expect(existsSync(join(checkout.checkoutPath, "impostor"))).toBe(true);
+      refusedUnmoved(f, await preserveCheckout(f, run), "CHECKOUT_CHANGED", checkout);
+      expect(footprint(checkout.checkoutPath)).toEqual(foreign);
+      expect(readFileSync(join(checkout.checkoutPath, "impostor"), "utf8")).toBe("not the checkout\n");
       expect(existsSync(join(aside, ".git", "HEAD"))).toBe(true);
-      expect(existsSync(checkout.preservedPath)).toBe(false);
-      expect(preservedRecords(f)).toEqual([]);
     });
   });
 
-  it("the checkout swapped for a symlink between the check and the rename: refused, the symlink left in place, its target untouched", async () => {
+  it("the checkout swapped for a symlink before the move: refused before anything moves, the symlink and its target untouched", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-symlink"));
       await approveWrites(f, run);
       const checkout = await interruptedAttempt(f, run);
       const elsewhere = makeRepo({ [MARKER]: readFileSync(join(checkout.checkoutPath, MARKER), "utf8") }, "main");
       const aside = `${checkout.checkoutPath}.real`;
-      swapBeforeRename(() => {
+      swapBeforeAnchoring(() => {
         renameSync(checkout.checkoutPath, aside);
         symlinkSync(elsewhere, checkout.checkoutPath);
       });
-      // A symlink cannot replace the directory the recovery claimed, so the rename itself fails;
-      // had it landed, the check after it would have found no directory there.
-      const refused = await preserveCheckout(f, run);
-      expect(refused, JSON.stringify(refused)).toMatchObject({
-        ok: false,
-        reasonCode: ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED,
-        evidence: { refusal: "MOVE_FAILED" },
-      });
-      expect(existsSync(checkout.preservedPath)).toBe(false);
-      expect(readFileSync(join(checkout.checkoutPath, MARKER), "utf8")).toBe(readFileSync(join(elsewhere, MARKER), "utf8"));
-      expect(existsSync(join(elsewhere, ".git", "HEAD"))).toBe(true);
+      const target = footprint(elsewhere);
+      refusedUnmoved(f, await preserveCheckout(f, run), "CHECKOUT_CHANGED", checkout);
+      expect(footprint(checkout.checkoutPath).kind).toBe(`symlink:${elsewhere}`);
+      expect(footprint(elsewhere)).toEqual(target);
       expect(existsSync(join(aside, ".git", "HEAD"))).toBe(true);
-      expect(preservedRecords(f)).toEqual([]);
     });
   });
 
-  it("the checkout's parent swapped for a symlink between the check and the rename: refused, and what was taken put back", async () => {
+  it("the checkout's parent swapped for a symlink before the move: refused before anything moves, what it points at untouched", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-parent"));
       await approveWrites(f, run);
@@ -1317,31 +1328,110 @@ describe("#246 C3 decision (c): the official recovery of an interrupted attempt'
       const decoy = tempDir("acp-c3-decoy-");
       mkdirSync(join(decoy, "primary"));
       writeFileSync(join(decoy, "primary", MARKER), readFileSync(join(checkout.checkoutPath, MARKER)));
-      swapBeforeRename(() => {
+      const decoyBefore = footprint(join(decoy, "primary"));
+      swapBeforeAnchoring(() => {
         renameSync(repositories, `${repositories}.real`);
         symlinkSync(decoy, repositories);
       });
-      movedBack(await preserveCheckout(f, run));
-      expect(existsSync(join(decoy, "primary", MARKER))).toBe(true);
+      refusedUnmoved(f, await preserveCheckout(f, run), /ANCHOR_FAILED|ANCHOR_MISMATCH/, checkout);
+      expect(footprint(join(decoy, "primary"))).toEqual(decoyBefore);
+      expect(footprint(repositories).kind).toBe(`symlink:${decoy}`);
       expect(existsSync(join(`${repositories}.real`, "primary", ".git", "HEAD"))).toBe(true);
-      expect(preservedRecords(f)).toEqual([]);
     });
   });
 
-  it("the preservation directory swapped for a symlink between the check and the rename: refused, and the checkout moved back", async () => {
+  it("the checkout's parent replaced by another real directory before the move: refused before anything moves, that directory untouched", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-parent-dir"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      const repositories = join(checkout.workDir, "repositories");
+      const decoy = join(checkout.workDir, "decoy");
+      mkdirSync(decoy, { mode: 0o700 });
+      mkdirSync(join(decoy, "primary"), { mode: 0o700 });
+      writeFileSync(join(decoy, "primary", MARKER), readFileSync(join(checkout.checkoutPath, MARKER)));
+      let decoyBefore: ReturnType<typeof footprint> | null = null;
+      swapBeforeAnchoring(() => {
+        renameSync(repositories, `${repositories}.real`);
+        renameSync(decoy, repositories);
+        decoyBefore = footprint(join(repositories, "primary"));
+      });
+      refusedUnmoved(f, await preserveCheckout(f, run), "ANCHOR_MISMATCH", checkout);
+      expect(footprint(join(repositories, "primary"))).toEqual(decoyBefore);
+      expect(existsSync(join(`${repositories}.real`, "primary", ".git", "HEAD"))).toBe(true);
+    });
+  });
+
+  it("the preservation directory swapped for a symlink before the move: refused before anything moves, where it points untouched", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-destination"));
       await approveWrites(f, run);
       const checkout = await interruptedAttempt(f, run);
       const preservedRoot = join(checkout.workDir, "preserved");
       const outside = tempDir("acp-c3-outside-");
-      swapBeforeRename(() => {
+      const checkoutBefore = footprint(checkout.checkoutPath);
+      swapBeforeAnchoring(() => {
         renameSync(preservedRoot, `${preservedRoot}.real`);
         symlinkSync(outside, preservedRoot);
       });
-      movedBack(await preserveCheckout(f, run));
-      expect(existsSync(join(checkout.checkoutPath, ".git", "HEAD"))).toBe(true);
+      const refused = await preserveCheckout(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED,
+        evidence: { refusal: expect.stringMatching(/ANCHOR_FAILED|ANCHOR_MISMATCH/) },
+      });
       expect(readdirSync(outside)).toEqual([]);
+      expect(footprint(checkout.checkoutPath)).toEqual(checkoutBefore);
+      expect(preservedRecords(f)).toEqual([]);
+    });
+  });
+
+  it("a destination another process creates before the move: refused before anything moves, its directory untouched", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-taken"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      const checkoutBefore = footprint(checkout.checkoutPath);
+      let taken: ReturnType<typeof footprint> | null = null;
+      swapBeforeAnchoring(() => {
+        mkdirSync(checkout.preservedPath, { mode: 0o700 });
+        taken = footprint(checkout.preservedPath);
+      });
+      const refused = await preserveCheckout(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED,
+        evidence: { refusal: "PRESERVATION_TARGET_EXISTS" },
+      });
+      expect(footprint(checkout.preservedPath)).toEqual(taken);
+      expect(footprint(checkout.checkoutPath)).toEqual(checkoutBefore);
+      expect(preservedRecords(f)).toEqual([]);
+    });
+  });
+
+  it("the one window no available primitive closes — a replacement between the held-parent check and the rename — is refused and left as the rename put it, with nothing restored", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-window"));
+      await approveWrites(f, run);
+      const checkout = await interruptedAttempt(f, run);
+      const aside = `${checkout.checkoutPath}.real`;
+      const rename = RollbackFilesystem.prototype.renameExclusive;
+      const renames = vi.spyOn(RollbackFilesystem.prototype, "renameExclusive").mockImplementationOnce(function (this: RollbackFilesystem, ...args: Parameters<RollbackFilesystem["renameExclusive"]>) {
+        renameSync(checkout.checkoutPath, aside);
+        mkdirSync(checkout.checkoutPath, { mode: 0o700 });
+        writeFileSync(join(checkout.checkoutPath, "impostor"), "not the checkout\n");
+        return rename.apply(this, args);
+      });
+      const refused = await preserveCheckout(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_CHECKOUT_NOT_PRESERVED,
+        evidence: { refusal: "MOVED_OBJECT_MISMATCH" },
+      });
+      // One rename, no second one to put anything back: nothing else was touched.
+      expect(renames).toHaveBeenCalledTimes(1);
+      expect(readFileSync(join(checkout.preservedPath, "impostor"), "utf8")).toBe("not the checkout\n");
+      expect(existsSync(join(aside, ".git", "HEAD"))).toBe(true);
       expect(preservedRecords(f)).toEqual([]);
     });
   });
@@ -1401,10 +1491,31 @@ const releaseReservation = (f: Fixture, run: ReviewedRun, dryRun = false) =>
     runId: run.runId,
   });
 
-describe("#246 C3 decision (b) as corrected: a cancelled run's reservation is released only when nothing happened outside", () => {
-  it("a cancelled run whose create never landed is released, keeps its record, and a new run reserves the same name under its own approval", async () => {
+/**
+ * The first CONFIRM reserves and records its attempt; then the producer's first read of GitHub — before
+ * any request that writes — is refused. The attempt ends with nothing sent, and records so.
+ */
+const attemptEndsBeforeAnyRequest = async (f: Fixture, run: ReviewedRun): Promise<void> => {
+  const observe = f.github.observeRepository.bind(f.github);
+  let reads = 0;
+  vi.spyOn(f.github, "observeRepository").mockImplementation(async (target) => {
+    reads += 1;
+    if (reads === 2) throw new Error("HTTP 502 on the producer's first read");
+    return observe(target);
+  });
+  const ended = await confirm(f, run);
+  expect(ended, JSON.stringify(ended)).toMatchObject({ ok: false, evidence: { stage: "production", refusal: "REMOTE_REFUSED" } });
+  vi.mocked(f.github.observeRepository).mockRestore();
+  expect(f.github.writes).toEqual([]);
+  expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
+};
+
+describe("#246 C3 decision (b) as corrected: a reservation is released only on proof that nothing was sent", () => {
+  it("a cancelled run whose attempt provably sent nothing is released, keeps its record, and a new run reserves the same name under its own approval", async () => {
     await withFixture(async (f) => {
-      const first = await reservedRun(f, "c3-b-release");
+      const first = await reviewedBootstrap(f, cleanTreeManifest("c3-b-release"));
+      await approveWrites(f, first);
+      await attemptEndsBeforeAnyRequest(f, first);
       const firstApproval = recordedApproval(f, first.runId);
       await cancelRun(f, first);
 
@@ -1412,12 +1523,17 @@ describe("#246 C3 decision (b) as corrected: a cancelled run's reservation is re
       expect(dry, JSON.stringify(dry)).toMatchObject({ ok: true, value: { dryRun: true, changes: 1 } });
       expect(applicationOf(f, first.runId)).toMatchObject({ phase: "RESERVED" });
 
+      const readsBefore = f.github.reads.length;
       const released = await releaseReservation(f, first);
       expect(released, JSON.stringify(released)).toMatchObject({ ok: true, value: { changes: 1 } });
+      // The proof is the ledger and the attempt's own outcome; GitHub is not asked.
+      expect(f.github.reads).toHaveLength(readsBefore);
       const record = applicationOf(f, first.runId);
       expect(record).toMatchObject({ phase: "RELEASED", attempts: 1, projectId: "c3-b-release", repositoryIdentity: BOOTSTRAP_IDENTITY });
-      expect(record?.lastRefusal).toMatchObject({ cause: "RELEASED", evidence: { target: "acme/fixture", attempts: 1 } });
-      // The released run is never confirmed again.
+      expect(record?.lastRefusal).toMatchObject({
+        cause: "RELEASED",
+        evidence: { attempts: 1, lastAttemptOutcome: { attempt: 1, refusal: "REMOTE_REFUSED" } },
+      });
       expect((await confirm(f, first))["ok"]).toBe(false);
 
       // A new run, the same project id and repository name, under its own new approval.
@@ -1431,30 +1547,70 @@ describe("#246 C3 decision (b) as corrected: a cancelled run's reservation is re
       expect(applicationOf(f, second.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1, projectId: "c3-b-release" });
       await acknowledgeHandoff(f, second, applied);
       expect(await confirm(f, second)).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
-      // Nothing was deleted: the released row stays beside the new one.
       expect(f.harness.cp.db.all<{ run_id: string; phase: string }>(
         `SELECT run_id, phase FROM bootstrap_applications WHERE project_id = ? ORDER BY phase`, ["c3-b-release"],
       )).toEqual([{ run_id: second.runId, phase: "COMPLETED" }, { run_id: first.runId, phase: "RELEASED" }]);
     });
   });
 
-  it("refuses while an attempt of the run is in flight, and releases once it has ended with nothing at the target", async () => {
+  it("a create request sent and never resolved stays IN_DOUBT, though GitHub shows nothing at the target", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-unresolved"));
+      await approveWrites(f, run);
+      // The create is sent and refused with a 502: its effect is unknown, and nothing is at the target.
+      f.github.failNext = "createRepository";
+      expect((await confirm(f, run))["ok"]).toBe(false);
+      expect(f.github.repository("acme", "fixture")).toBeUndefined();
+      await cancelRun(f, run);
+      const refused = await releaseReservation(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(refused, 2)).toMatchObject({ satisfied: false, evidence: { cause: "UNRESOLVED_REQUEST", pending: [expect.any(String)] } });
+      const application = applicationOf(f, run.runId);
+      expect(application).toMatchObject({ phase: "RESERVED", attempts: 1 });
+      expect(application?.lastRefusal).toMatchObject({ refusal: "RELEASE_IN_DOUBT", cause: "UNRESOLVED_REQUEST" });
+    });
+  });
+
+  it("an attempt whose daemon died before recording its outcome stays IN_DOUBT, though its ledger shows nothing sent", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-dead"));
+      await approveWrites(f, run);
+      // The daemon dies after the attempt is recorded and before it records how the attempt ended.
+      const recorded = vi.spyOn(f.harness.cp.bootstrapApplications, "recordRefusal").mockImplementation(() => undefined);
+      await attemptEndsBeforeAnyRequest(f, run);
+      recorded.mockRestore();
+      expect(applicationOf(f, run.runId)?.lastRefusal).toBeNull();
+      await cancelRun(f, run);
+      const refused = await releaseReservation(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(refused, 3)).toMatchObject({ satisfied: false, evidence: { cause: "ATTEMPT_OUTCOME_UNRECORDED" } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1, lastRefusal: { refusal: "RELEASE_IN_DOUBT" } });
+    });
+  });
+
+  it("refuses while an attempt of the run is in flight, and releases once it has ended with nothing sent", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-inflight"));
       await approveWrites(f, run);
+      const observe = f.github.observeRepository.bind(f.github);
       const hung = deferred();
-      const create = vi.spyOn(f.github, "createRepository").mockImplementationOnce(() => hung.promise);
+      let reads = 0;
+      const read = vi.spyOn(f.github, "observeRepository").mockImplementation(async (target) => {
+        reads += 1;
+        return reads === 2 ? hung.promise : observe(target);
+      });
       const confirming = confirm(f, run);
-      await vi.waitFor(() => expect(create).toHaveBeenCalled(), { timeout: 30_000, interval: 20 });
+      await vi.waitFor(() => expect(reads).toBe(2), { timeout: 30_000, interval: 20 });
       await cancelRun(f, run);
       const inFlight = await releaseReservation(f, run);
       expect(inFlight, JSON.stringify(inFlight)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
       expect(preconditionOf(inFlight, 1)).toMatchObject({ satisfied: false, evidence: { attemptInFlight: true } });
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED" });
 
-      hung.reject(new Error("the create never reached GitHub"));
+      hung.reject(new Error("the read never answered"));
       expect((await confirming)["ok"]).toBe(false);
-      create.mockRestore();
+      read.mockRestore();
+      expect(f.github.writes).toEqual([]);
       const released = await releaseReservation(f, run);
       expect(released, JSON.stringify(released)).toMatchObject({ ok: true, value: { changes: 1 } });
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RELEASED" });
@@ -1465,20 +1621,24 @@ describe("#246 C3 decision (b) as corrected: a cancelled run's reservation is re
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-landed"));
       await approveWrites(f, run);
-      f.github.failNext = "pushBranch";
+      // Every write lands and is receipted; the transaction that would store the result and WRITTEN dies.
+      const written = vi.spyOn(f.harness.cp.bootstrapApplications, "markWritten").mockImplementationOnce(() => {
+        throw new Error("the daemon died before WRITTEN was stored");
+      });
       expect((await confirm(f, run))["ok"]).toBe(false);
-      expect(f.github.repository("acme", "fixture")).toBeDefined();
+      written.mockRestore();
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
       await cancelRun(f, run);
       const refused = await releaseReservation(f, run);
       expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
-      expect(preconditionOf(refused, 2)).toMatchObject({ satisfied: false, evidence: { receipted: [expect.any(String)] } });
+      expect(preconditionOf(refused, 2)).toMatchObject({ satisfied: false, evidence: { cause: "WRITE_LANDED", receipted: expect.arrayContaining([expect.any(String)]) } });
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
       const project = await registerFixtureProject(f.harness, "c3-b-landed").catch((error: Error) => error);
       expect(String(project)).toMatch(/reserved by another bootstrap run/);
     });
   });
 
-  it("a create whose answer was lost leaves the effect unclear: nothing is released, and the reservation is kept IN_DOUBT", async () => {
+  it("a create whose answer was lost, with a repository now at the target, stays IN_DOUBT", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-doubt"));
       await approveWrites(f, run);
@@ -1487,10 +1647,8 @@ describe("#246 C3 decision (b) as corrected: a cancelled run's reservation is re
       await cancelRun(f, run);
       const refused = await releaseReservation(f, run);
       expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
-      expect(preconditionOf(refused, 3)).toMatchObject({ satisfied: false, evidence: { cause: "REPOSITORY_AT_TARGET" } });
-      const application = applicationOf(f, run.runId);
-      expect(application).toMatchObject({ phase: "RESERVED", attempts: 1 });
-      expect(application?.lastRefusal).toMatchObject({ refusal: "RELEASE_IN_DOUBT", cause: "REPOSITORY_AT_TARGET" });
+      expect(preconditionOf(refused, 2)).toMatchObject({ satisfied: false, evidence: { cause: "UNRESOLVED_REQUEST" } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1, lastRefusal: { refusal: "RELEASE_IN_DOUBT" } });
     });
   });
 

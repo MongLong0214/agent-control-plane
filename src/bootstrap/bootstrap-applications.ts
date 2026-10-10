@@ -47,15 +47,16 @@ import type { Db } from "../db/database.ts";
  *   nothing, so the resuming CONFIRM is a new one and passes every check again.
  * - Recovery: the same CONFIRM again, never a new plan or a new scope.
  * - Cancel: the run is cancelled first, and then the repair `release_bootstrap_reservation` releases
- *   its reservation, only when no attempt is in flight, this process is the only control-plane
- *   writer, the attempt ledger records no write that landed, and GitHub, read at the release, holds
- *   no repository at the target. The row becomes RELEASED and keeps everything it recorded, with the
- *   release record beside it; it no longer holds the project id or repository identity, so a new
- *   run may reserve them under its own new approval. The old approval cannot serve that run: it
- *   names the cancelled run, which can never be confirmed again. When the external effect cannot be
- *   told — a write sent and unanswered beside a repository at the target, a ledger that cannot be
- *   read, or a GitHub read that fails — nothing is released, and the reservation is kept RESERVED
- *   with RELEASE_IN_DOUBT as its last refusal.
+ *   its reservation, only on positive proof of no external effect: no attempt is in flight, this
+ *   process is the only control-plane writer, the attempt ledger (written and synced before every
+ *   GitHub request is sent) shows that no request was ever sent, and the last attempt's own recorded
+ *   outcome agrees. GitHub's present state is not that proof. The row becomes RELEASED and keeps
+ *   everything it recorded, with the release record beside it; it no longer holds the project id or
+ *   repository identity, so a new run may reserve them under its own new approval. The old approval
+ *   cannot serve that run: it names the cancelled run, which can never be confirmed again. A request
+ *   sent whose outcome was never recorded, a ledger that cannot be read, or an attempt whose own
+ *   outcome was never recorded keeps the reservation RESERVED with RELEASE_IN_DOUBT as its last
+ *   refusal; a write that landed keeps it as it is.
  * - STRANDED and COMPLETED are terminal: the reservation is never released or reused.
  */
 
@@ -316,13 +317,14 @@ export class BootstrapApplications {
 
   /**
    * The last refusal an attempt met, on a row still RESERVED or WRITTEN; its phase and attempts are
-   * unchanged. A write that fails is reported rather than thrown: the refusal it records is already
-   * the caller's answer.
+   * unchanged. It is stamped with the attempt count at the moment it is recorded (`attempt`), so a
+   * refusal an attempt recorded when it ended can be told from one an earlier attempt left. A write
+   * that fails is reported rather than thrown: the refusal it records is already the caller's answer.
    */
   recordRefusal(runId: string, refusal: Record<string, unknown>): void {
     try {
       this.db.run(
-        `UPDATE bootstrap_applications SET last_refusal_json = ?
+        `UPDATE bootstrap_applications SET last_refusal_json = json_set(?, '$.attempt', attempts)
           WHERE run_id = ? AND phase IN ('RESERVED','WRITTEN')`,
         [JSON.stringify(refusal), runId],
       );

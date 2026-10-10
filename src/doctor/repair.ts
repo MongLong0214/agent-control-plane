@@ -176,7 +176,7 @@ export class RepairService {
       description:
         "Release a cancelled PROJECT_BOOTSTRAP run's reservation of its project id and repository identity",
       expectedEffect:
-        "the application becomes RELEASED and keeps its record; a new run may reserve the same project id and repository identity under its own owner approval; when the external effect cannot be told nothing is released and the reservation is kept, RELEASE_IN_DOUBT",
+        "the application becomes RELEASED and keeps its record; a new run may reserve the same project id and repository identity under its own owner approval; when no external effect can be proven nothing is released and the reservation is kept, RELEASE_IN_DOUBT",
       undo: "none needed: nothing outside the database changed, and the released run cannot be confirmed again",
       preconditions: [...RESERVATION_RELEASE_PRECONDITIONS],
     },
@@ -525,7 +525,7 @@ export class RepairService {
             perform: async () => ({ changes: 0, evidence: null }),
           };
         }
-        const inspected = await recovery.inspectReservationRelease(runId);
+        const inspected = recovery.inspectReservationRelease(runId);
         // An unclear external effect keeps the reservation, and says so on it; a dry run records nothing.
         if (inspected.inDoubt !== null && runId !== null && !request.dryRun) recovery.recordReleaseInDoubt(runId, inspected.inDoubt);
         return {
