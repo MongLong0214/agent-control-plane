@@ -1656,6 +1656,11 @@ export class Daemon {
       }
     }
 
+    // #512 — a run that ended while no daemon ran, or before retirement existed, left its WORKER
+    // bindings ACTIVE and their sessions live. Retired here, after the receipts above are settled and
+    // before the doctor counts; a session whose process remains is left live and recorded.
+    await this.cp.workerRetirement.reconcile();
+
     const activeBindings = this.cp.db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM assignments WHERE status = 'ACTIVE'`,
     );

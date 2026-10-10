@@ -263,6 +263,38 @@ describe("a run that reaches a terminal state retires its WORKER bindings", () =
   });
 });
 
+describe("the reconcile pass retires a WORKER whose run already ended", () => {
+  it("revokes an ACTIVE WORKER of an already-CANCELLED run at daemon start, and a second pass is a no-op", async () => {
+    const harness = gatedHarness();
+    const run = await activeRun(harness);
+    expect(harness.cp.runs.cancel(run.runId, "owner cancelled the run").allowed).toBe(true);
+    // A WORKER bound after the run ended, by a binder that is not the staffing path: the state an
+    // ended run left behind before retirement existed.
+    const workerSessionId = bindWorker(harness, run.taskIds[0]!);
+    expect(workerAssignment(harness, run.taskIds[0]!)?.status).toBe("ACTIVE");
+
+    await runDaemonOnce(harness, "acp-worker-retire-reconcile-1-");
+
+    const first = workerAssignment(harness, run.taskIds[0]!)!;
+    expect(first.status).toBe("REVOKED");
+    expect(first.revoked_reason).toMatch(/run ended CANCELLED/);
+    expect(retiredFor(harness, run.runId)).toHaveLength(1);
+    expect(retiredFor(harness, run.runId)[0]).toMatchObject({ evidence: { trigger: "reconcile" } });
+    expect(lifecycleOf(harness, workerSessionId)).toBe(SessionLifecycle.STOPPED);
+    const lifecycleEvents = harness.cp.audit.byKind("SESSION_LIFECYCLE")
+      .filter((entry) => entry.sessionId === workerSessionId).length;
+
+    await runDaemonOnce(harness, "acp-worker-retire-reconcile-2-");
+    const report = await harness.cp.workerRetirement.reconcile();
+
+    expect(report).toEqual({ revoked: [], stopped: [], remaining: [], stopFailed: [] });
+    expect(workerAssignment(harness, run.taskIds[0]!)).toEqual(first);
+    expect(retiredFor(harness, run.runId)).toHaveLength(1);
+    expect(harness.cp.audit.byKind("SESSION_LIFECYCLE")
+      .filter((entry) => entry.sessionId === workerSessionId)).toHaveLength(lifecycleEvents);
+  });
+});
+
 describe("a late provisioning cannot leave a WORKER on an ended run", () => {
   it("a provisioning the cancel overtakes before its bind binds nothing and stops the session it started", async () => {
     const harness = gatedHarness();
@@ -373,7 +405,7 @@ describe("what retirement leaves alone", () => {
       const exited = once(worker, "exit");
       worker.kill("SIGKILL");
       await exited;
-      expect((await harness.cp.workerRetirement.reconcile()).stopped).toEqual([workerSessionId]);
+      await runDaemonOnce(harness, "acp-worker-retire-remaining-");
       expect(lifecycleOf(harness, workerSessionId)).toBe(SessionLifecycle.STOPPED);
     } finally {
       if (worker.exitCode === null && worker.signalCode === null) worker.kill("SIGKILL");
