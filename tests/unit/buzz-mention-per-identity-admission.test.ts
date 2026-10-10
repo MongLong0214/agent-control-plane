@@ -221,6 +221,28 @@ describe("with the Logic identity excluded for want of a live binding", () => {
   });
 });
 
+describe("re-judgement of the admitted set", () => {
+  it("leaves a role with the identity already admitted for it when a second identity is judged to hold it too", async () => {
+    const d = deploy(["repoFactory"]);
+    try {
+      await d.relay.drain(d.handle);
+      // Not a state a consistent registry reaches; the rule is that the holder keeps the role and
+      // the later claimant is excluded, rather than two connections racing for one role's mail.
+      d.registry.hold(d.keys.commitlore.pubkey, { ...bindingOf("repoFactory", d.keys.commitlore), buzzActorId: d.keys.commitlore.pubkey });
+      d.handle.rejudge();
+      await d.relay.drain(d.handle);
+      expect(d.handle.admission().identities.map((one) => [one.identity, one.state, one.reason])).toEqual([
+        ["identities[0]", "EXCLUDED", "NO_LIVE_PRIMARY_CTO_BINDING"],
+        ["identities[1]", "ADMITTED", null],
+        ["identities[2]", "EXCLUDED", "ROLE_HELD_BY_ANOTHER_IDENTITY"],
+      ]);
+      expect(d.relay.openFor(d.keys.commitlore.pubkey)).toHaveLength(0);
+    } finally {
+      d.handle.close();
+    }
+  });
+});
+
 describe("re-judgement right before delivery", () => {
   it("refuses delivery after a revoke, and after a re-claim delivers only to the new binding", async () => {
     const d = deploy(["repoFactory"]);
