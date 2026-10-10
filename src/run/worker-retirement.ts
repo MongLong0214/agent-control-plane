@@ -11,8 +11,10 @@ import { type WorkerProcessPort, osWorkerProcesses } from "./worker-turn.ts";
 
 /** One WORKER binding revoked because its run ended. */
 export const WORKER_RETIRED = "WORKER_RETIRED";
-/** A revoke the registry refused; the reconcile pass asks again. */
+/** A WORKER of an ended run left ACTIVE: its revoke was refused, or its scope is not its task's. */
 export const WORKER_RETIREMENT_DEFERRED = "WORKER_RETIREMENT_DEFERRED";
+/** A WORKER row whose recorded run is not its task's run: never revoked by either run's end. */
+export const WORKER_SCOPE_CONFLICT = "WORKER_SCOPE_CONFLICT";
 /** A retired worker's session left live because a recorded process or an open receipt remains. */
 export const WORKER_PROCESS_REMAINING = "WORKER_PROCESS_REMAINING";
 /** A retired worker's session the provider did not stop; it is left ERROR. */
@@ -36,6 +38,8 @@ export interface RemainingWorkerProcess {
 export interface WorkerRetirementReport {
   /** Role keys whose WORKER binding was revoked because their run had ended. */
   revoked: string[];
+  /** Role keys left ACTIVE: the revoke was refused, or the row's run label is not its task's run. */
+  deferred: string[];
   /** Worker sessions the provider stopped, now STOPPED. */
   stopped: string[];
   /** What kept a retired worker's session live; the next pass asks again. */
@@ -108,7 +112,7 @@ export class WorkerRetirement {
    * it commits, settle their sessions. A rolled-back transition discards both.
    */
   retireRun(runId: string, state: RunState): string[] {
-    const revoked = this.#revokeEnded("terminal-transition", runId);
+    const { revoked } = this.#revokeEnded("terminal-transition", runId);
     this.db.afterCommit(() => {
       void this.#enqueue(async () => {
         await this.#settle(runId);
@@ -120,9 +124,9 @@ export class WorkerRetirement {
   /** The daemon's reconcile pass. Retires what an ended run left behind; a repeat writes nothing. */
   async reconcile(): Promise<WorkerRetirementReport> {
     return this.#enqueue(async () => {
-      const revoked = this.#revokeEnded("reconcile", null);
+      const { revoked, deferred } = this.#revokeEnded("reconcile", null);
       const settled = await this.#settle(null);
-      const report: WorkerRetirementReport = { revoked, ...settled };
+      const report: WorkerRetirementReport = { revoked, deferred, ...settled };
       if (revoked.length + settled.stopped.length + settled.remaining.length + settled.stopFailed.length > 0) {
         this.audit.record({
           kind: WORKER_RETIREMENT_RECONCILED,
@@ -150,20 +154,28 @@ export class WorkerRetirement {
     return next;
   }
 
-  /** ACTIVE WORKER assignments whose run is terminal (`runId`'s alone, when named), revoked. */
-  #revokeEnded(trigger: Trigger, runId: string | null): string[] {
+  /**
+   * ACTIVE WORKER assignments whose task's run is terminal (`runId`'s alone, when named), revoked.
+   *
+   * The task's run is the authority, never the row's own `run_id`: that column is a label the
+   * registry did not check before #512's scope fence, and a row whose label is not its task's run is
+   * deferred and recorded once, never revoked, because the label may name a run whose work is live.
+   */
+  #revokeEnded(trigger: Trigger, runId: string | null): { revoked: string[]; deferred: string[] } {
     const rows = this.db.all<{
       role_key: string;
       session_id: string;
-      task_id: string | null;
+      task_id: string;
       binding_generation: number;
+      label_run_id: string | null;
       run_id: string;
       state: RunState;
     }>(
-      `SELECT a.role_key, a.session_id, a.task_id, a.binding_generation, r.run_id, r.state
+      `SELECT a.role_key, a.session_id, a.task_id, a.binding_generation, a.run_id AS label_run_id,
+              t.run_id, r.state
          FROM assignments a
-         LEFT JOIN tasks t ON t.task_id = a.task_id
-         JOIN runs r ON r.run_id = COALESCE(a.run_id, t.run_id)
+         JOIN tasks t ON t.task_id = a.task_id
+         JOIN runs r ON r.run_id = t.run_id
         WHERE a.role = 'WORKER' AND a.status = 'ACTIVE'
           AND r.state IN (${TERMINAL_SQL})
           AND (? IS NULL OR r.run_id = ?)
@@ -171,18 +183,18 @@ export class WorkerRetirement {
       [...TERMINAL_RUN_STATES, runId, runId],
     );
     const revoked: string[] = [];
+    const deferred: string[] = [];
     for (const row of rows) {
       const reason = workerRetirementReason(row.state);
+      if (row.label_run_id !== null && row.label_run_id !== row.run_id) {
+        this.#defer(row, trigger, WORKER_SCOPE_CONFLICT, ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, reason);
+        deferred.push(row.role_key);
+        continue;
+      }
       const decision = this.ports.bindings.revoke(row.role_key, reason);
       if (!decision.allowed) {
-        this.audit.record({
-          kind: WORKER_RETIREMENT_DEFERRED,
-          reasonCode: decision.reasonCode,
-          runId: row.run_id,
-          roleKey: row.role_key,
-          sessionId: row.session_id,
-          evidence: { trigger, to: row.state, reason },
-        });
+        this.#defer(row, trigger, decision.reasonCode, decision.reasonCode, reason);
+        deferred.push(row.role_key);
         continue;
       }
       this.audit.record({
@@ -195,26 +207,61 @@ export class WorkerRetirement {
       });
       revoked.push(row.role_key);
     }
-    return revoked;
+    return { revoked, deferred };
+  }
+
+  /** Records a deferral once per assignment generation and refusal, so repeated passes write nothing. */
+  #defer(
+    row: { role_key: string; session_id: string; binding_generation: number; label_run_id: string | null; run_id: string; state: RunState },
+    trigger: Trigger,
+    refusal: string,
+    reasonCode: ReasonCode,
+    reason: string,
+  ): void {
+    const recorded = this.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM audit_events
+        WHERE kind = ? AND role_key = ?
+          AND json_extract(evidence_json, '$.generation') = ? AND json_extract(evidence_json, '$.refusal') = ?
+        LIMIT 1`,
+      [WORKER_RETIREMENT_DEFERRED, row.role_key, row.binding_generation, refusal],
+    );
+    if (recorded) return;
+    this.audit.record({
+      kind: WORKER_RETIREMENT_DEFERRED,
+      reasonCode,
+      runId: row.run_id,
+      roleKey: row.role_key,
+      sessionId: row.session_id,
+      evidence: {
+        trigger,
+        to: row.state,
+        refusal,
+        generation: row.binding_generation,
+        labelRunId: row.label_run_id,
+        reason,
+      },
+    });
   }
 
   /**
    * Stops the live sessions of revoked WORKERs whose run has ended (`runId`'s alone, when named): by
    * the session each binding recorded and by its actor's live runtime.
    */
-  async #settle(runId: string | null): Promise<Omit<WorkerRetirementReport, "revoked">> {
-    const report: Omit<WorkerRetirementReport, "revoked"> = { stopped: [], remaining: [], stopFailed: [] };
+  async #settle(runId: string | null): Promise<Omit<WorkerRetirementReport, "revoked" | "deferred">> {
+    const report: Omit<WorkerRetirementReport, "revoked" | "deferred"> = { stopped: [], remaining: [], stopFailed: [] };
     const candidates = this.db.all<{ session_id: string }>(
       `SELECT DISTINCT w.session_id
-         FROM (SELECT a.session_id AS session_id, COALESCE(a.run_id, t.run_id) AS run_id
-                 FROM assignments a LEFT JOIN tasks t ON t.task_id = a.task_id
+         FROM (SELECT a.session_id AS session_id, t.run_id AS run_id
+                 FROM assignments a JOIN tasks t ON t.task_id = a.task_id
                 WHERE a.role = 'WORKER' AND a.status = 'REVOKED'
+                  AND (a.run_id IS NULL OR a.run_id = t.run_id)
                UNION
-               SELECT c.current_session_id AS session_id, COALESCE(a.run_id, t.run_id) AS run_id
+               SELECT c.current_session_id AS session_id, t.run_id AS run_id
                  FROM assignments a
                  JOIN conversational_actors c ON c.actor_id = a.actor_id
-                 LEFT JOIN tasks t ON t.task_id = a.task_id
-                WHERE a.role = 'WORKER' AND a.status = 'REVOKED' AND c.current_session_id IS NOT NULL) w
+                 JOIN tasks t ON t.task_id = a.task_id
+                WHERE a.role = 'WORKER' AND a.status = 'REVOKED' AND c.current_session_id IS NOT NULL
+                  AND (a.run_id IS NULL OR a.run_id = t.run_id)) w
          JOIN sessions s ON s.session_id = w.session_id
          JOIN runs r ON r.run_id = w.run_id
         WHERE s.lifecycle IN ('STARTING','READY','DRAINING')
@@ -229,7 +276,7 @@ export class WorkerRetirement {
     return report;
   }
 
-  async #settleSession(sessionId: string, report: Omit<WorkerRetirementReport, "revoked">): Promise<void> {
+  async #settleSession(sessionId: string, report: Omit<WorkerRetirementReport, "revoked" | "deferred">): Promise<void> {
     const session = this.ports.sessions.get(sessionId);
     if (!session || !LIVE_LIFECYCLES.includes(session.lifecycle)) return;
     if (!this.#retiredOnly(sessionId)) return;
@@ -272,7 +319,7 @@ export class WorkerRetirement {
 
   /**
    * The session holds no ACTIVE role, by its recorded session or its actor's live runtime, and every
-   * WORKER it served belongs to a run that has ended.
+   * WORKER it served belongs, by its task, to a run that has ended, with no run label that disagrees.
    */
   #retiredOnly(sessionId: string): boolean {
     const held = this.db.get<{ n: number }>(
@@ -287,9 +334,10 @@ export class WorkerRetirement {
       `SELECT 1 AS n FROM assignments a
          LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
          LEFT JOIN tasks t ON t.task_id = a.task_id
-         LEFT JOIN runs r ON r.run_id = COALESCE(a.run_id, t.run_id)
+         LEFT JOIN runs r ON r.run_id = t.run_id
         WHERE a.role = 'WORKER' AND (a.session_id = ? OR c.current_session_id = ?)
-          AND (r.run_id IS NULL OR r.state NOT IN (${TERMINAL_SQL}))
+          AND (r.run_id IS NULL OR r.state NOT IN (${TERMINAL_SQL})
+               OR (a.run_id IS NOT NULL AND a.run_id <> t.run_id))
         LIMIT 1`,
       [sessionId, sessionId, ...TERMINAL_RUN_STATES],
     );
@@ -355,7 +403,7 @@ export class WorkerRetirement {
   #recordRemaining(
     session: SessionRecord,
     remaining: RemainingWorkerProcess[],
-    report: Omit<WorkerRetirementReport, "revoked">,
+    report: Omit<WorkerRetirementReport, "revoked" | "deferred">,
   ): void {
     this.audit.record({
       kind: WORKER_PROCESS_REMAINING,

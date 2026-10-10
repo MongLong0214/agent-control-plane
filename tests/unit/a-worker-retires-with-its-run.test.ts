@@ -287,7 +287,7 @@ describe("the reconcile pass retires a WORKER whose run already ended", () => {
     await runDaemonOnce(harness, "acp-worker-retire-reconcile-2-");
     const report = await harness.cp.workerRetirement.reconcile();
 
-    expect(report).toEqual({ revoked: [], stopped: [], remaining: [], stopFailed: [] });
+    expect([report.revoked, report.stopped, report.remaining, report.stopFailed]).toEqual([[], [], [], []]);
     expect(workerAssignment(harness, run.taskIds[0]!)).toEqual(first);
     expect(retiredFor(harness, run.runId)).toHaveLength(1);
     expect(harness.cp.audit.byKind("SESSION_LIFECYCLE")
@@ -410,6 +410,77 @@ describe("what retirement leaves alone", () => {
     } finally {
       if (worker.exitCode === null && worker.signalCode === null) worker.kill("SIGKILL");
     }
+  });
+});
+
+describe("review round 1: a WORKER's run is its task's run (wr-r1-03)", () => {
+  it("a WORKER bound with another run's or project's scope is refused, by bind and by switchTo", async () => {
+    const harness = gatedHarness();
+    const live = await activeRun(harness);
+    const other = await activeRun(harness, ["other"], live);
+    const session = harness.cp.sessions.create({ provider: "scripted", model: "scripted-worker" });
+    harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "worker ready");
+    const taskId = live.taskIds[0]!;
+
+    const wrongRun = harness.cp.bindings.bind({ role: Role.WORKER, sessionId: session.sessionId, taskId, runId: other.runId, projectId: live.projectId });
+    const wrongProject = harness.cp.bindings.bind({ role: Role.WORKER, sessionId: session.sessionId, taskId, runId: live.runId, projectId: "another-project" });
+    const wrongSwitch = harness.cp.bindings.switchTo({
+      role: Role.WORKER,
+      sessionId: session.sessionId,
+      taskId,
+      runId: other.runId,
+      reason: "switch with another run's scope",
+      conversation: "REPLACED",
+    });
+
+    expect([wrongRun.reasonCode, wrongProject.reasonCode, wrongSwitch.reasonCode]).toEqual([
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+    ]);
+    expect(harness.cp.bindings.history(roleKeyFor(Role.WORKER, { taskId }))).toEqual([]);
+    // The task's own scope is accepted.
+    expect(harness.cp.bindings.bind({ role: Role.WORKER, sessionId: session.sessionId, taskId, runId: live.runId, projectId: live.projectId }).allowed).toBe(true);
+  });
+
+  it("a legacy WORKER row naming another run is never revoked by that run's end, and its own run's end defers it once", async () => {
+    const harness = gatedHarness();
+    const live = await activeRun(harness);
+    const labelled = await activeRun(harness, ["other"], live);
+    const workerSessionId = bindWorker(harness, live.taskIds[0]!);
+    const roleKey = roleKeyFor(Role.WORKER, { taskId: live.taskIds[0]! });
+    // A row the registry accepted before it checked a WORKER's scope: task of run `live`, labelled
+    // with run `labelled`. Written here directly, because the registry now refuses it.
+    const first = harness.cp.bindings.active(roleKey)!;
+    const actor = harness.cp.db.get<{ actor_id: string }>(`SELECT actor_id FROM assignments WHERE assignment_id = ?`, [first.assignmentId])!;
+    harness.cp.db.tx(() => {
+      harness.cp.db.run(`UPDATE assignments SET status = 'REVOKED', revoked_at = ?, revoked_reason = 'legacy fixture' WHERE assignment_id = ?`, [harness.clock.nowIso(), first.assignmentId]);
+      harness.cp.db.run(
+        `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, task_id, actor_id, session_id,
+                                  session_incarnation, binding_generation, mode, status, created_at)
+         VALUES ('asg_legacy_scope', ?, 'WORKER', ?, ?, ?, ?, ?, ?, 2, 'PREFERRED', 'ACTIVE', ?)`,
+        [roleKey, live.projectId, labelled.runId, live.taskIds[0]!, actor.actor_id, workerSessionId, first.sessionIncarnation, harness.clock.nowIso()],
+      );
+    });
+    expect(harness.cp.bindings.active(roleKey)?.runId).toBe(labelled.runId);
+
+    // The labelled run ends: the task's run is live, so its WORKER is not touched.
+    expect(harness.cp.runs.cancel(labelled.runId, "the labelled run ends").allowed).toBe(true);
+    await harness.cp.workerRetirement.settled();
+    expect(workerAssignment(harness, live.taskIds[0]!)).toMatchObject({ status: "ACTIVE" });
+    expect(lifecycleOf(harness, workerSessionId)).toBe(SessionLifecycle.READY);
+
+    // The task's own run ends: the label disagrees, so the row is deferred and recorded, not revoked.
+    expect(harness.cp.runs.cancel(live.runId, "the task's run ends").allowed).toBe(true);
+    await harness.cp.workerRetirement.settled();
+    const report = await harness.cp.workerRetirement.reconcile();
+    expect(report.deferred).toEqual([roleKey]);
+    expect(report.revoked).toEqual([]);
+    expect(workerAssignment(harness, live.taskIds[0]!)).toMatchObject({ status: "ACTIVE" });
+    expect(lifecycleOf(harness, workerSessionId)).toBe(SessionLifecycle.READY);
+    expect(harness.cp.audit.byKind("WORKER_RETIREMENT_DEFERRED")
+      .filter((entry) => entry.roleKey === roleKey)
+      .map((entry) => entry.evidence)).toEqual([expect.objectContaining({ refusal: "WORKER_SCOPE_CONFLICT" })]);
   });
 });
 
