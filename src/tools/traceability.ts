@@ -160,8 +160,11 @@ export const REPO_FACTORY_EXTERNAL_EVIDENCE: ExternalScenarioEvidence = {
       id: "RF-S08",
       tests: ["tests/test_slice2_stack_ci.py::test_node_workflow_installs_dependencies_on_both_declared_runtimes"],
       limit:
-        "a static check of the rendered workflow; the only real lower/latest install is a recorded " +
-        "Actions run (32256790243), which no gate re-runs",    },
+        "a static check of the rendered workflow, which installs nothing. The dated install record " +
+        "(Actions run 32256790243, 2026-08-19) survives only as residual JSON: the run answers 404, so " +
+        "it cannot be verified remotely. A local install witness is pending in repo-factory PR #56, " +
+        "not merged; its evidence is a local run, not a GitHub Actions pass",
+    },
     {
       id: "RF-S16",
       tests: [
