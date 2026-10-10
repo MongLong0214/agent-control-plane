@@ -99,6 +99,12 @@ export const normalizeBuzzActor = (actor: string): string | null => {
 export interface BuzzKeyPossession {
   readonly runtime: AdmittedRuntime;
   readonly buzzActorId: string;
+  /**
+   * The CEO binding generation the challenge was minted under. The writer re-reads the CEO binding
+   * inside its write transaction and binds only while it is still this runtime at this generation,
+   * because a re-adoption can commit between this store's own check and the write.
+   */
+  readonly ceoBindingGeneration: number;
 }
 
 const POSSESSIONS = new WeakSet<object>();
@@ -298,7 +304,11 @@ export class BuzzBindChallenges {
     if (this.#pendingBySession.get(challenge.runtime.sessionId) === nonce) {
       this.#pendingBySession.delete(challenge.runtime.sessionId);
     }
-    const possession: BuzzKeyPossession = Object.freeze({ runtime: challenge.runtime, buzzActorId: challenge.actor });
+    const possession: BuzzKeyPossession = Object.freeze({
+      runtime: challenge.runtime,
+      buzzActorId: challenge.actor,
+      ceoBindingGeneration: challenge.ceoBindingGeneration,
+    });
     POSSESSIONS.add(possession);
     const bound = this.#ports.bind(possession);
     consumedNow.settlement = bound;

@@ -8,7 +8,7 @@ import { nativeStartIsInLstartSecond, processStartedAt } from "../core/process-i
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { SessionLifecycle } from "../domain/types.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { HOLDER_CLAIMED_KIND_SQL } from "../outbox/outbox.ts";
 import { isBuzzKeyPossession, type BuzzKeyPossession } from "../buzz/buzz-bind-challenge.ts";
 import { isAdmittedRuntime, type AdmittedRuntime } from "./runtime-lineage.ts";
@@ -106,6 +106,19 @@ export interface AdmittedBindBuzzActorInput {
 export interface PossessedBindBuzzActorInput {
   possession: BuzzKeyPossession;
 }
+
+/**
+ * The other session rows carrying one Buzz channel identity, sorted by `SessionRegistry.buzzActorHolders`
+ * into the earlier CEO rows the possession-proven recovery may take the key past and everything else.
+ */
+export interface BuzzActorHolders {
+  /** Terminal rows of the CEO role's binding history that no ACTIVE assignment names, in id order. */
+  readonly history: readonly string[];
+  /** The first other row that is not history — live, of another lineage, or still named ACTIVE. */
+  readonly blocking: string | null;
+}
+
+const CEO_ROLE_KEY = roleKeyFor(Role.CEO);
 
 /** The creation response is the only time a runtime receives its session secret. */
 export interface CreatedSession extends SessionRecord {
@@ -511,8 +524,9 @@ export class SessionRegistry {
 
   /**
    * The possession form's proof and allowlist, then the refusals the admitted ingress gives before it
-   * writes — a terminal runtime, a different identity already held, a key any other row carries —
-   * and the same write. The identity the session already holds is answered as bound, unwritten.
+   * writes — a terminal runtime, a different identity already held — and its own transactional
+   * write, which refuses a key any other row carries unless every such row is history. The identity
+   * the session already holds is answered as bound, unwritten.
    */
   #bindPossessedBuzzActor(
     possession: BuzzKeyPossession,
@@ -545,12 +559,77 @@ export class SessionRegistry {
         sessionId,
       });
     }
-    if (this.otherSessionCarrying(actorId, sessionId) !== null) {
-      return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another session row already carries this identity", {
+    return this.#writePossessedBuzzActor(possession, actorId);
+  }
+
+  /**
+   * The possession form's write, in one transaction (CEO 1791632040). Every fact it binds on is read
+   * again inside it, under the write lock, so a re-adoption or another holder committed after the
+   * challenge store's check is seen here rather than written past:
+   *
+   *   - the CEO binding is still this runtime, at this incarnation, at the generation the challenge
+   *     was minted under;
+   *   - every other row carrying the key is history (`buzzActorHolders`) — none, for a first binding;
+   *     terminal earlier CEO rows, for a recovery;
+   *   - and the UPDATE itself is conditional on the row still being that live, unbound incarnation.
+   *
+   * Earlier rows are never written: their column is write-once and stays as the key's history, and a
+   * recovery's audit row names them (`recoveredFrom`), which is what #1038's peer rule reads.
+   */
+  #writePossessedBuzzActor(possession: BuzzKeyPossession, actorId: string): Decision<SessionRecord> {
+    const sessionId = possession.runtime.sessionId;
+    const incarnation = possession.runtime.sessionIncarnation;
+    return this.db.txDecision((): Decision<SessionRecord> => {
+      const ceo = this.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM assignments a
+           LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+          WHERE a.role_key = ? AND a.status = 'ACTIVE' AND a.binding_generation = ?
+            AND COALESCE(c.current_session_id, a.session_id) = ?
+            AND COALESCE(c.current_session_incarnation, a.session_incarnation) = ?`,
+        [CEO_ROLE_KEY, possession.ceoBindingGeneration, sessionId, incarnation],
+      )?.n ?? 0;
+      if (ceo !== 1) {
+        return deny(
+          ReasonCode.BINDING_GENERATION_STALE,
+          "the CEO binding's runtime or generation changed since the challenge was minted",
+          { sessionId },
+        );
+      }
+      const holders = this.buzzActorHolders(actorId, sessionId);
+      if (holders.blocking !== null) {
+        return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another session row already carries this identity", {
+          sessionId,
+        });
+      }
+      let changes: number;
+      try {
+        changes = this.db.run(
+          `UPDATE sessions SET buzz_actor_id = ?, updated_at = ?
+            WHERE session_id = ? AND incarnation = ? AND buzz_actor_id IS NULL
+              AND lifecycle IN ('READY','DRAINING')`,
+          [actorId, this.clock.nowIso(), sessionId, incarnation],
+        ).changes;
+      } catch (err) {
+        if (isAcpError(err) && err.reasonCode === ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND) {
+          return deny(err.reasonCode, err.message, { sessionId, buzzActorId: actorId });
+        }
+        throw err;
+      }
+      if (changes !== 1) {
+        return deny(ReasonCode.SESSION_NOT_READY, "the runtime is no longer a live, unbound row of this incarnation", {
+          sessionId,
+        });
+      }
+      this.audit.record({
+        kind: "SESSION_BUZZ_ACTOR_BOUND",
         sessionId,
+        actor: `buzz:${actorId}`,
+        evidence: holders.history.length === 0
+          ? { channel: "buzz" }
+          : { channel: "buzz", recoveredFrom: [...holders.history], generation: possession.ceoBindingGeneration },
       });
-    }
-    return this.#writeBuzzActor(sessionId, authenticated, actorId);
+      return allow(ReasonCode.OK, this.require(sessionId));
+    });
   }
 
   /**
@@ -637,6 +716,36 @@ export class SessionRegistry {
       [buzzActorId, sessionId],
     );
     return row?.session_id ?? null;
+  }
+
+  /**
+   * The other rows carrying this identity, sorted (CEO 1791632040). A row is history only when it can
+   * never speak again and was the CEO's: terminal (STOPPED or ERROR, which no transition leaves), the
+   * bound runtime of at least one CEO assignment, and neither the bound nor the live runtime of any
+   * ACTIVE assignment. Anything else — a live row, a row that never served the CEO role, a terminal
+   * row an ACTIVE assignment still names — is `blocking`. A runtime the CEO reached only by a runtime
+   * move, with no assignment naming it, is not read as history.
+   */
+  buzzActorHolders(buzzActorId: string, sessionId: string): BuzzActorHolders {
+    const rows = this.db.all<{ session_id: string; history: number }>(
+      `SELECT s.session_id,
+              (s.lifecycle IN ('STOPPED','ERROR')
+                AND EXISTS (SELECT 1 FROM assignments a
+                             WHERE a.session_id = s.session_id AND a.role_key = ? AND a.role = 'CEO')
+                AND NOT EXISTS (SELECT 1 FROM assignments a
+                                  LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+                                 WHERE a.status = 'ACTIVE'
+                                   AND (a.session_id = s.session_id OR c.current_session_id = s.session_id))
+              ) AS history
+         FROM sessions s
+        WHERE s.buzz_actor_id = ? AND s.session_id <> ?
+        ORDER BY s.session_id`,
+      [CEO_ROLE_KEY, buzzActorId, sessionId],
+    );
+    return {
+      history: rows.filter((row) => row.history === 1).map((row) => row.session_id),
+      blocking: rows.find((row) => row.history !== 1)?.session_id ?? null,
+    };
   }
 
   setBuzzAddress(sessionId: string, address: string | null): void {

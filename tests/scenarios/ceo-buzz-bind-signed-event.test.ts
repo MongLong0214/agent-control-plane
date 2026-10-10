@@ -36,7 +36,7 @@ import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { adoptedFixture, CEO, DIGEST, GATEWAY, LIVE, type AdoptedCeoFixture } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { registerFixtureProject } from "../helpers/harness.ts";
+import { fixtureManifest, registerFixtureProject, type Harness } from "../helpers/harness.ts";
 
 /**
  * The adopted Hermes CEO binds its Buzz channel identity by proving it holds that identity's key.
@@ -196,18 +196,25 @@ const scheduler = () => {
  * subscriber sharing one challenge store, as `main` wires them. The relay allowlist holds every key,
  * the stranger's included, so no refusal below is the relay credential's.
  */
-const startBindFixture = async (options: { challengeStore?: boolean } = {}) => {
-  const fixture = adoptedFixture();
-  fixtures.push(fixture);
-  const { h } = fixture;
-  // The kernel reports this test process as the tool socket's peer; it sits under the Gateway.
-  fixture.parents.set(process.pid, GATEWAY);
+const startBindFixture = async (
+  options: {
+    challengeStore?: boolean;
+    /** Earlier CEO history, written before the Gateway is bound; it is handed the CEO's key. */
+    history?: (h: Harness, ceoKey: string) => void;
+  } = {},
+) => {
   const owner = newKey();
   const ceo = newKey();
   const cto = newKey();
   const stranger = newKey();
   /** A second key the relay credential admits, for the relay-signed form to bind first. */
   const otherCeoKey = newKey();
+  const history = options.history;
+  const fixture = adoptedFixture(history ? { history: (h) => history(h, ceo.pubkey) } : {});
+  fixtures.push(fixture);
+  const { h } = fixture;
+  // The kernel reports this test process as the tool socket's peer; it sits under the Gateway.
+  fixture.parents.set(process.pid, GATEWAY);
 
   const { projectId } = await registerFixtureProject(h);
   const ctoRoleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
@@ -561,7 +568,11 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
     const sessions = f.sessionsRows();
     // A real lineage admission and an allowlisted key, in the possession proof's shape: built here,
     // not by the code that verified a signed answer, so it proves nothing.
-    const forged = { runtime: admitted.value.runtime, buzzActorId: f.ceo.pubkey };
+    const forged = {
+      runtime: admitted.value.runtime,
+      buzzActorId: f.ceo.pubkey,
+      ceoBindingGeneration: f.h.cp.bindings.active(CEO)!.bindingGeneration,
+    };
     const refused = f.h.cp.sessions.bindBuzzActor({ possession: forged }, { isAllowedActor: () => true });
     expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
     expect(f.sessionsRows()).toEqual(sessions);
@@ -721,5 +732,224 @@ describe("ACP1055: a binding-shaped message is never delivered, and a refused bi
     expect(() => store.settle(answer)).toThrow("the writer failed mid-write");
     expect(store.settle(answer)).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
     expect(writes).toBe(1);
+  });
+});
+
+/**
+ * CEO 1791632040: the live state after a CEO re-adoption onto a new session. The earlier CEO
+ * generation's runtime row still carries the CEO's key — terminal, its assignment revoked, and the
+ * column write-once — and the re-adopted runtime carries none. The recovery is the same signed
+ * challenge: possession of the key is proven by the answer, the CEO binding is re-read inside the
+ * write, and the earlier row is never touched.
+ */
+describe("the re-adopted CEO recovers its own key from a terminal earlier CEO session", () => {
+  /** Who carries the key before the Gateway is bound. Every write is a production registry's. */
+  const earlierHolder = (shape: {
+    lifecycle: "ERROR" | "STOPPED" | "READY";
+    ceoLineage: boolean;
+    /** Left the bound runtime of an ACTIVE PRIMARY_CTO assignment after its CEO one was revoked. */
+    activeElsewhere?: boolean;
+  }) => {
+    let sessionId = "";
+    const history = (h: Harness, ceoKey: string): void => {
+      const earlier = h.cp.sessions.create({ provider: "hermes", model: "hermes-runtime" });
+      sessionId = earlier.sessionId;
+      expect(h.cp.sessions.transition(earlier.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+      if (shape.ceoLineage) {
+        expect(h.cp.bindings.bind({ role: Role.CEO, sessionId: earlier.sessionId }).allowed).toBe(true);
+      }
+      expect(h.cp.sessions.bindBuzzActor(
+        { sessionId: earlier.sessionId, sessionSecret: earlier.sessionSecret!, buzzActorId: ceoKey },
+        { isAllowedActor: () => true },
+      ).allowed).toBe(true);
+      if (shape.ceoLineage) expect(h.cp.bindings.revoke(CEO, "continuity: the Gateway died").allowed).toBe(true);
+      if (shape.activeElsewhere) {
+        const manifest = fixtureManifest("earlier-project");
+        expect(h.cp.projects.register({
+          projectId: "earlier-project",
+          name: "earlier",
+          manifest,
+          authorization: h.cp.manifestAuthorizationForTests(manifest),
+        }).allowed).toBe(true);
+        expect(h.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: earlier.sessionId, projectId: "earlier-project" }))
+          .toMatchObject({ allowed: true });
+      }
+      if (shape.lifecycle !== "READY") {
+        expect(h.cp.sessions.transition(earlier.sessionId, SessionLifecycle[shape.lifecycle], "runtime gone").allowed)
+          .toBe(true);
+      }
+    };
+    return { history, sessionId: () => sessionId };
+  };
+
+  const rowOf = (f: BindFixture, sessionId: string) =>
+    f.h.cp.db.get(`SELECT * FROM sessions WHERE session_id = ?`, [sessionId]);
+  const liveHolders = (f: BindFixture): number =>
+    f.h.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM sessions WHERE buzz_actor_id = ? AND lifecycle IN ('STARTING','READY','DRAINING')`,
+      [f.ceo.pubkey],
+    )!.n;
+
+  it("recovers the key a revoked, terminal earlier CEO session carries, and leaves that row as it was", async () => {
+    const earlier = earlierHolder({ lifecycle: "ERROR", ceoLineage: true });
+    const f = await startBindFixture({ history: earlier.history });
+    const before = rowOf(f, earlier.sessionId());
+    expect(before).toMatchObject({ buzz_actor_id: f.ceo.pubkey, lifecycle: "ERROR" });
+    expect(f.ceoIdentity()).toBeNull();
+
+    const token = await f.mint();
+    await f.relayDelivers(f.mention(f.ceo, `채널 신원 복구: ${token}`));
+
+    expect(f.ceoIdentity()).toBe(f.ceo.pubkey);
+    expect(rowOf(f, earlier.sessionId())).toEqual(before);
+    expect(liveHolders(f)).toBe(1);
+    expect(f.refusalRows()).toEqual([]);
+    expect(f.h.cp.audit.byKind("SESSION_BUZZ_ACTOR_BOUND").filter((row) => row.sessionId === f.ceoSessionId))
+      .toEqual([expect.objectContaining({
+        actor: `buzz:${f.ceo.pubkey}`,
+        evidence: expect.objectContaining({ channel: "buzz", recoveredFrom: [earlier.sessionId()] }),
+      })]);
+  });
+
+  it("refuses the key while another session holding it is live, and when a terminal holder is not of the CEO lineage", async () => {
+    for (const shape of [
+      { lifecycle: "READY", ceoLineage: true },
+      { lifecycle: "STOPPED", ceoLineage: false },
+      { lifecycle: "ERROR", ceoLineage: false },
+      { lifecycle: "ERROR", ceoLineage: true, activeElsewhere: true },
+    ] as const) {
+      const earlier = earlierHolder(shape);
+      const f = await startBindFixture({ history: earlier.history });
+      const rows = f.sessionsRows();
+      const wire = await f.callBind({ actor: f.ceo.pubkey });
+      expect(wire.result?.structuredContent).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND,
+      });
+      expect(f.sessionsRows()).toEqual(rows);
+      expect(f.ceoIdentity()).toBeNull();
+    }
+  });
+
+  it("refuses at the writer a key another session took while the challenge was open", async () => {
+    const earlier = earlierHolder({ lifecycle: "ERROR", ceoLineage: true });
+    const f = await startBindFixture({ history: earlier.history });
+    const token = await f.mint();
+    // The earlier row is terminal, so a live session can take the key through the secret path.
+    const taker = f.h.cp.sessions.create({ provider: "scripted", model: "taker" });
+    expect(f.h.cp.sessions.transition(taker.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+    expect(f.h.cp.sessions.bindBuzzActor(
+      { sessionId: taker.sessionId, sessionSecret: taker.sessionSecret!, buzzActorId: f.ceo.pubkey },
+      { isAllowedActor: () => true },
+    ).allowed).toBe(true);
+    const rows = f.sessionsRows();
+
+    await f.relayDelivers(f.mention(f.ceo, `채널 신원 복구: ${token}`));
+    expect(f.ceoIdentity()).toBeNull();
+    expect(f.sessionsRows()).toEqual(rows);
+    expect(liveHolders(f)).toBe(1);
+    expect(f.refusalRows()).toEqual([expect.objectContaining({
+      reasonCode: ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND,
+      cause: "write-refused",
+    })]);
+  });
+
+  it("refuses to recover the key onto a stale (terminal) CEO session, at the challenge and at the writer", async () => {
+    const earlier = earlierHolder({ lifecycle: "ERROR", ceoLineage: true });
+    const f = await startBindFixture({ history: earlier.history });
+    const admitted = await f.fixture.admit();
+    if (!admitted.allowed) throw new Error(JSON.stringify(admitted));
+    const runtime = admitted.value.runtime;
+    const generation = f.h.cp.bindings.active(CEO)!.bindingGeneration;
+    const token = await f.mint();
+    // A store that still reads the runtime as live, so only the writer stands between it and the row.
+    const store = new BuzzBindChallenges({
+      nowMs: () => f.h.clock.now().getTime(),
+      currentCeo: () => ({
+        sessionId: runtime.sessionId,
+        sessionIncarnation: runtime.sessionIncarnation,
+        bindingGeneration: generation,
+        live: true,
+      }),
+      bindable: () => allow(ReasonCode.OK, undefined),
+      bind: (possession) => f.h.cp.sessions.bindBuzzActor({ possession }, { isAllowedActor: () => true }),
+      recordRefusal: () => undefined,
+    });
+    const minted = store.mint(runtime, f.ceo.pubkey);
+    if (!minted.allowed) throw new Error(JSON.stringify(minted));
+
+    expect(f.h.cp.sessions.transition(f.ceoSessionId, SessionLifecycle.ERROR, "the Gateway died").allowed).toBe(true);
+    const rows = f.sessionsRows();
+    await f.relayDelivers(f.mention(f.ceo, `채널 신원 복구: ${token}`));
+    expect(f.refusedWith(ReasonCode.BINDING_GENERATION_STALE)).toBe(1);
+    expect(store.settle(f.mention(f.ceo, `채널 신원 복구: ${minted.value.challenge}`))).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.SESSION_NOT_READY,
+    });
+    expect(f.sessionsRows()).toEqual(rows);
+    expect(f.ceoIdentity()).toBeNull();
+    expect(liveHolders(f)).toBe(0);
+  });
+
+  it("race: two answers queued together bind once, and the earlier row is untouched", async () => {
+    const earlier = earlierHolder({ lifecycle: "ERROR", ceoLineage: true });
+    const f = await startBindFixture({ history: earlier.history });
+    const before = rowOf(f, earlier.sessionId());
+    const token = await f.mint();
+    const first = f.mention(f.ceo, `복구 하나: ${token}`);
+    const second = f.mention(f.ceo, `복구 둘: ${token}`, f.nowSeconds() + 1);
+
+    await Promise.all([f.relayDelivers(first), f.relayDelivers(second)]);
+    expect(f.ceoIdentity()).toBe(f.ceo.pubkey);
+    expect(f.boundRows()).toBe(1);
+    expect(liveHolders(f)).toBe(1);
+    expect(rowOf(f, earlier.sessionId())).toEqual(before);
+    expect(f.refusalRows()).toEqual([expect.objectContaining({ cause: "challenge-consumed" })]);
+  });
+
+  it.each([
+    ["recovering it from a terminal earlier CEO session", true],
+    ["binding it fresh", false],
+  ])("race: a CEO re-adoption landing between the challenge check and the write leaves the key unbound, %s", async (_shape, withHistory) => {
+    const earlier = earlierHolder({ lifecycle: "ERROR", ceoLineage: true });
+    const f = await startBindFixture(withHistory ? { history: earlier.history } : {});
+    const admitted = await f.fixture.admit();
+    if (!admitted.allowed) throw new Error(JSON.stringify(admitted));
+    const runtime = admitted.value.runtime;
+    const generation = f.h.cp.bindings.active(CEO)!.bindingGeneration;
+    let readopted = "";
+    const store = new BuzzBindChallenges({
+      nowMs: () => f.h.clock.now().getTime(),
+      currentCeo: () => ({
+        sessionId: runtime.sessionId,
+        sessionIncarnation: runtime.sessionIncarnation,
+        bindingGeneration: generation,
+        live: true,
+      }),
+      bindable: () => allow(ReasonCode.OK, undefined),
+      bind: (possession) => {
+        // The re-adoption commits after the store's own check and before the writer runs.
+        expect(f.h.cp.bindings.revoke(CEO, "re-adoption").allowed).toBe(true);
+        const next = f.h.cp.sessions.create({ provider: "hermes", model: "hermes-runtime" });
+        expect(f.h.cp.sessions.transition(next.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+        expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId: next.sessionId }).allowed).toBe(true);
+        readopted = next.sessionId;
+        return f.h.cp.sessions.bindBuzzActor({ possession }, { isAllowedActor: () => true });
+      },
+      recordRefusal: () => undefined,
+    });
+    const minted = store.mint(runtime, f.ceo.pubkey);
+    if (!minted.allowed) throw new Error(JSON.stringify(minted));
+    const before = withHistory ? rowOf(f, earlier.sessionId()) : undefined;
+
+    expect(store.settle(f.mention(f.ceo, `채널 신원 복구: ${minted.value.challenge}`))).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+    });
+    expect(f.h.cp.bindings.active(CEO)).toMatchObject({ sessionId: readopted, bindingGeneration: generation + 1 });
+    expect(f.ceoIdentity()).toBeNull();
+    expect(liveHolders(f)).toBe(0);
+    if (withHistory) expect(rowOf(f, earlier.sessionId())).toEqual(before);
+    expect(f.boundRows()).toBe(0);
   });
 });

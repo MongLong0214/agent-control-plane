@@ -104,9 +104,15 @@ export const adoptedFixture = (
      * no native start pinned. Every admission refuses it; re-adoption is what pins it.
      */
     unpinned?: { lstart: string };
+    /**
+     * Earlier CEO history, written through the production registries before the Gateway's runtime
+     * row exists and before it is bound, so the Gateway's binding is the newest generation.
+     */
+    history?: (h: Harness) => void;
   } = {},
 ): AdoptedCeoFixture => {
   const h = makeHarness();
+  bound.history?.(h);
   const parents = new Map<number, number>([
     [RELAY, SHELL],
     [SHELL, GATEWAY],
@@ -158,7 +164,7 @@ export const adoptedFixture = (
     },
   });
   expect(binding.allowed).toBe(true);
-  const actor = h.cp.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE role_key = ?", [CEO])!;
+  const actor = h.cp.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE role_key = ? AND status = 'ACTIVE'", [CEO])!;
   const proof: GatewayIncumbentProof = {
     session_id: LIVE,
     lineage_root_digest: DIGEST,

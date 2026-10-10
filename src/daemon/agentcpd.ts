@@ -1770,7 +1770,9 @@ export const createDaemonBuzzBindChallenges = (cp: ControlPlane, policy: Ingress
           sessionId,
         });
       }
-      if (cp.sessions.otherSessionCarrying(actor, sessionId) !== null) {
+      // A terminal earlier CEO row is history the possession-proven write may take the key past
+      // (CEO 1791632040); any other holder is refused here, before a challenge exists.
+      if (cp.sessions.buzzActorHolders(actor, sessionId).blocking !== null) {
         return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another session row already carries this identity", {
           sessionId,
         });
