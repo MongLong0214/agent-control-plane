@@ -18,7 +18,13 @@ import {
   verifySnapshotFreshness,
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
-import { assertPortableManifest, gateEntriesFor, manifestDigest, PROJECT_MANIFEST_SCHEMA_ID } from "../../src/contracts/manifest.ts";
+import {
+  assertPortableManifest,
+  GATE_ENTRY_MODULE_FORMAT_UNPINNED,
+  gateEntriesFor,
+  manifestDigest,
+  PROJECT_MANIFEST_SCHEMA_ID,
+} from "../../src/contracts/manifest.ts";
 import {
   __testing as sandboxTesting,
   buildSandboxEnvironment,
@@ -697,8 +703,9 @@ describe("portable project manifest (Integration §10.2)", () => {
   it("RF-S22 arm:validator W5: a gate entry names a repository-relative file of a known repository by its sha256", () => {
     expect(assertPortableManifest({ ...runsGate(["node", "scripts/gate.mjs"]), gateEntries: [gate] }).allowed).toBe(true);
 
-    // A helper's path is in no argv, so its own portability check is the one that refuses it.
-    for (const path of ["/abs/x", "../x", "scripts/../x", "~/x", "C:\\x"]) {
+    // A helper's path is in no argv, so its own portability check is the one that refuses it. Each
+    // names its module format, so that refusal is the only one (#1082 R1-02, round 3).
+    for (const path of ["/abs/x.mjs", "../x.mjs", "scripts/../x.mjs", "~/x.mjs", "C:\\x.mjs"]) {
       const helper = { ...gate, path, loadedBy: "scripts/gate.mjs" };
       expect(assertPortableManifest({ ...runsGate(["node", "scripts/gate.mjs"]), gateEntries: [gate, helper] }), path).toMatchObject({
         allowed: false,
@@ -782,6 +789,37 @@ describe("portable project manifest (Integration §10.2)", () => {
     const [test, lint] = parsed.value.verificationCommands;
     expect(gateEntriesFor(parsed.value, test!).map((entry) => entry.path)).toEqual(["scripts/gate.mjs", "scripts/decide.mjs"]);
     expect(gateEntriesFor(parsed.value, lint!)).toEqual([]);
+  });
+
+  it("RF-S22 arm:validator #1082 R1-02: a gate file names its module format in its extension, or is refused with its own code", () => {
+    // Node runs `.js`, `.ts` and extensionless files as CommonJS or as an ES module according to the
+    // candidate's package.json, so pinned bytes alone do not fix what they decide.
+    const refusals = (manifest: unknown): string[] => {
+      const decision = assertPortableManifest(manifest);
+      if (decision.allowed) return [];
+      return (decision.evidence.issues as Array<{ refusal?: string }>).flatMap((issue) => (issue.refusal ? [issue.refusal] : []));
+    };
+    for (const path of ["scripts/gate.js", "scripts/gate.ts", "scripts/gate", "scripts/gate.MJS", "scripts/gate.json", "scripts/gate.txt"]) {
+      const manifest = { ...runsGate(["node", path]), gateEntries: [{ ...gate, path }] };
+      expect(refusals(manifest), path).toEqual([GATE_ENTRY_MODULE_FORMAT_UNPINNED]);
+      expect(refusedAt(manifest), path).toEqual(["gateEntries"]);
+    }
+    for (const path of ["scripts/gate.mjs", "scripts/gate.cjs"]) {
+      expect(assertPortableManifest({ ...runsGate(["node", path]), gateEntries: [{ ...gate, path }] }).allowed, path).toBe(true);
+    }
+
+    const gated = runsGate(["node", "scripts/gate.mjs"]);
+    const withHelper = (path: string) => ({ ...gated, gateEntries: [gate, { ...gate, path, loadedBy: "scripts/gate.mjs" }] });
+    for (const path of ["scripts/decide.js", "scripts/decide.ts", "scripts/decide", "scripts/decide.JS"]) {
+      expect(refusals(withHelper(path)), path).toEqual([GATE_ENTRY_MODULE_FORMAT_UNPINNED]);
+    }
+    // A helper whose format is its extension's alone stays declarable: code as .mjs or .cjs, and
+    // data Node reads the same way under every package setting.
+    for (const path of ["scripts/decide.mjs", "scripts/decide.cjs", "scripts/thresholds.json"]) {
+      expect(assertPortableManifest(withHelper(path)).allowed, path).toBe(true);
+    }
+    // The code belongs to this refusal only: every other gateEntries refusal carries none.
+    expect(refusals({ ...gated, gateEntries: [gate, gate] })).toEqual([]);
   });
 });
 

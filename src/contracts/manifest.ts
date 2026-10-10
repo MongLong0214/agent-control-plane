@@ -125,6 +125,15 @@ export const projectManifestSchema = z
      * refused: CI runs it after earlier steps of the approved job that ACP cannot see, so nothing
      * ACP checks binds what CI executed. BOTH_REQUIRED is admitted because its local run is checked.
      *
+     * Every declared file names its module format in its extension (#1082 R1-02, round 3). An
+     * entry is `.mjs` or `.cjs`; a helper may not be `.js`, `.ts` or extensionless, and a JavaScript
+     * helper is therefore `.mjs` or `.cjs` too. Node runs a `.js` file as CommonJS or as an ES
+     * module according to the nearest package.json `"type"` and, with no type, the file's own
+     * syntax, so a candidate that changes only its package.json could change what unchanged pinned
+     * bytes decide. Anything else is refused with the issue refusal code
+     * `GATE_ENTRY_MODULE_FORMAT_UNPINNED`; nothing is renamed or loaded another way on the
+     * producer's behalf.
+     *
      * `.optional()` with no default is load-bearing. `manifestDigest` digests the parsed object,
      * so a defaulted `[]` would change the digest of every manifest written before this field
      * and break every stored pin. Absent stays absent, and every existing digest is unchanged.
@@ -226,6 +235,15 @@ export const projectManifestSchema = z
           path: ["gateEntries"],
         });
       }
+      const unpinnedFormat = moduleFormatRefusal(entry);
+      if (unpinnedFormat !== null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: unpinnedFormat,
+          path: ["gateEntries"],
+          params: { refusal: GATE_ENTRY_MODULE_FORMAT_UNPINNED },
+        });
+      }
       const root = gateEntryRoot(entry, declared);
       if (root === null) {
         ctx.addIssue({
@@ -285,7 +303,15 @@ export const assertPortableManifest = (manifest: unknown): Decision<ProjectManif
   const parsed = projectManifestSchema.safeParse(manifest);
   if (!parsed.success) {
     return deny(ReasonCode.INVALID_ARGUMENT, "manifest failed schema validation", {
-      issues: parsed.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
+      issues: parsed.error.issues.map((i) => ({
+        path: i.path.join("."),
+        message: i.message,
+        // A refusal a producer has to act on in a particular way names itself, so it can be told
+        // apart from a typo without matching on the message.
+        ...(i.code === z.ZodIssueCode.custom && typeof i.params?.["refusal"] === "string"
+          ? { refusal: i.params["refusal"] as string }
+          : {}),
+      })),
     });
   }
 
@@ -362,6 +388,51 @@ const gateEntryRoot = (entry: GateEntry, declared: ReadonlyMap<string, GateEntry
 };
 
 /**
+ * RF-S22 (#1082 R1-02, round 3) — the refusal code a manifest issue carries when a declared gate
+ * file does not fix its own module format. Part of the producer contract: a producer matches on
+ * it, not on the message.
+ */
+export const GATE_ENTRY_MODULE_FORMAT_UNPINNED = "GATE_ENTRY_MODULE_FORMAT_UNPINNED";
+
+/** The extensions whose module format Node takes from the extension alone. */
+const EXPLICIT_MODULE_EXTENSIONS: ReadonlySet<string> = new Set([".mjs", ".cjs"]);
+
+/**
+ * The extensions whose module format Node takes from the candidate's tree instead: `.js`, `.ts`
+ * (type stripping follows `.js`) and none. Measured on Node 24.18 and 22.23, loading one file by a
+ * relative path from a `.cjs` and from an `.mjs` loader under `"type": "commonjs"`, `"module"` and
+ * no type: each of these three ran as CommonJS or as an ES module according to the nearest
+ * package.json, and a `.txt` file ran the same way under all three (CommonJS through `require`,
+ * refused by `import`). With no `type`, Node also decides `.js` from the file's own syntax.
+ */
+const PACKAGE_CLASSIFIED_EXTENSIONS: ReadonlySet<string> = new Set([".js", ".ts", ""]);
+
+/**
+ * Why `entry` cannot be pinned by its bytes alone, or null. The same bytes run as CommonJS or as
+ * an ES module depending on files the candidate owns, and the two can decide differently: measured,
+ * an unchanged `.js` gate that exits 1 under `{"type":"commonjs"}` exited 0 when the candidate
+ * changed only `package.json` to `{"type":"module"}`. So an entry, which `node` executes, must be
+ * `.mjs` or `.cjs`, and a helper must not have an extension whose format the package decides. No
+ * existing declaration is rewritten to another extension or run through another loader: it is
+ * refused, and the producer renames the file and re-pins it.
+ */
+const moduleFormatRefusal = (entry: GateEntry): string | null => {
+  const extension = posix.extname(entry.path);
+  if (entry.loadedBy === undefined) {
+    return EXPLICIT_MODULE_EXTENSIONS.has(extension)
+      ? null
+      : `gateEntry '${entry.path}' must name its module format in its extension (.mjs or .cjs): node decides how ` +
+          `'${extension || "an extensionless file"}' runs from the candidate's package.json "type" and the file's own ` +
+          "syntax, so the same pinned bytes can decide differently";
+  }
+  return PACKAGE_CLASSIFIED_EXTENSIONS.has(extension.toLowerCase())
+    ? `gateEntry '${entry.path}' (loaded by '${entry.loadedBy}') must name its module format in its extension (.mjs ` +
+        `or .cjs): '${extension || "an extensionless file"}' is loaded as CommonJS or as an ES module according to ` +
+        "the candidate's package.json"
+    : null;
+};
+
+/**
  * RF-S22 — the file a command's launch form executes as-is, or null when its launcher picks what
  * runs from anything else (#1082 R1-02).
  *
@@ -380,6 +451,9 @@ const gateEntryRoot = (entry: GateEntry, declared: ReadonlyMap<string, GateEntry
  * hash-based .pyc in place of a declared helper's source, and Deno resolves imports through a
  * deno.json it discovers in the candidate tree.
  */
+// The entry this returns is matched against the declarations, and those are refused unless they
+// end in `.mjs` or `.cjs` (`moduleFormatRefusal`), so the launch form and the bytes it executes are
+// both fixed by the manifest, not by the candidate's package.json.
 const launchedEntry = (command: VerificationCommandShape): string | null => {
   const [launcher, operand] = command.argv;
   if (launcher !== "node" || operand === undefined || operand.startsWith("-")) return null;

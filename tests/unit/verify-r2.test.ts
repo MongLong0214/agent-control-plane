@@ -9,7 +9,12 @@ import { dispatchBootstrapRun, fixtureManifest, makeHarness } from "../helpers/h
 import { applyPassingChange } from "../helpers/harness.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { stableFixtureExecutable } from "../helpers/stable-fixture-executable.ts";
-import { assertPortableManifest, manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
+import {
+  assertPortableManifest,
+  GATE_ENTRY_MODULE_FORMAT_UNPINNED,
+  manifestDigest,
+  type ProjectManifest,
+} from "../../src/contracts/manifest.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -830,7 +835,7 @@ exec /bin/ps "$@"
 /**
  * RF-S22 (PRD §14.2, RF-019): the candidate does not control the gate logic that judges it.
  *
- * The pinned command runs `gate/check.js`, which decides through `gate/decide.js`. Both are
+ * The pinned command runs `gate/check.cjs`, which decides through `gate/decide.cjs`. Both are
  * committed on the base branch before the run is dispatched, so the pinned digests name the
  * bytes the trusted contract approved. The base `src/app.js` returns 1, which this gate refuses,
  * so a candidate that leaves `src/app.js` alone can pass only by weakening the gate.
@@ -838,7 +843,7 @@ exec /bin/ps "$@"
 describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMMAND)", () => {
   const GATE_HELPER = "module.exports = (value) => value === 2;\n";
   const GATE_ENTRY = [
-    "const decide = require('./decide.js');",
+    "const decide = require('./decide.cjs');",
     "const app = require('../src/app.js');",
     "if (!decide(app())) { console.error('gate: app() must return 2'); process.exit(1); }",
     "console.log('gate ok');",
@@ -856,7 +861,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     const base = fixtureManifest("verify-r2-project");
     return {
       ...base,
-      verificationCommands: [{ ...base.verificationCommands[0]!, argv: ["node", "gate/check.js"] }],
+      verificationCommands: [{ ...base.verificationCommands[0]!, argv: ["node", "gate/check.cjs"] }],
       ...(gateEntries ? { gateEntries } : {}),
     };
   };
@@ -864,10 +869,10 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     writeFiles(repositoryPath, files);
     commitAll(repositoryPath, "add the gate the contract pins");
   };
-  const ENTRY_ONLY = gateManifest([entry("gate/check.js", GATE_ENTRY)]);
+  const ENTRY_ONLY = gateManifest([entry("gate/check.cjs", GATE_ENTRY)]);
   const ENTRY_AND_HELPER = gateManifest([
-    entry("gate/check.js", GATE_ENTRY),
-    entry("gate/decide.js", GATE_HELPER, "gate/check.js"),
+    entry("gate/check.cjs", GATE_ENTRY),
+    entry("gate/decide.cjs", GATE_HELPER, "gate/check.cjs"),
   ]);
 
   const verifyPinned = async (
@@ -892,8 +897,8 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
   it("RF-S22 arm:validator W3: a candidate that rewrites a pinned gate entry to exit 0 is refused before anything runs", async () => {
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
-      candidateChange: (repo) => writeFiles(repo, { "gate/check.js": UNCONDITIONAL_PASS }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: (repo) => writeFiles(repo, { "gate/check.cjs": UNCONDITIONAL_PASS }),
     });
 
     const refused = await verifyPinned(candidate);
@@ -901,7 +906,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
       allowed: false,
       reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
       evidence: {
-        path: "gate/check.js",
+        path: "gate/check.cjs",
         repositoryRole: "primary",
         expected: sha256(GATE_ENTRY),
         observed: sha256(UNCONDITIONAL_PASS),
@@ -920,7 +925,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
   it("RF-S22 arm:validator control: an untouched gate runs and judges the candidate, which may change its own code", async () => {
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_AND_HELPER,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
       candidateChange: (repo) => writeFiles(repo, {
         "src/app.js": "module.exports = () => 2;\n",
         "tests/app.test.js": "require('node:assert').strictEqual(require('../src/app.js')(), 2);\n",
@@ -942,16 +947,16 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     }],
     ["rewrites the entry's digest in", (pinned: ProjectManifest): ProjectManifest => ({
       ...structuredClone(pinned),
-      gateEntries: [entry("gate/check.js", UNCONDITIONAL_PASS)],
+      gateEntries: [entry("gate/check.cjs", UNCONDITIONAL_PASS)],
     })],
   ])("RF-S22 arm:validator: a candidate that %s its own manifest copy is still judged by the active pin", async (_, ownCopy) => {
     const own = assertPortableManifest(ownCopy(ENTRY_ONLY));
     if (!own.allowed) throw new Error(own.message);
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
       candidateChange: (repo) => writeFiles(repo, {
-        "gate/check.js": UNCONDITIONAL_PASS,
+        "gate/check.cjs": UNCONDITIONAL_PASS,
         ".agent-control-plane/project.json": `${JSON.stringify(own.value, null, 2)}\n`,
       }),
     });
@@ -960,7 +965,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     expect(await verifyPinned(candidate)).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
-      evidence: { path: "gate/check.js", expected: sha256(GATE_ENTRY), observed: sha256(UNCONDITIONAL_PASS) },
+      evidence: { path: "gate/check.cjs", expected: sha256(GATE_ENTRY), observed: sha256(UNCONDITIONAL_PASS) },
     });
     // Naming its own manifest's digest does not select it either.
     expect(await verifyPinned(candidate, { pinnedManifestDigest: manifestDigest(own.value) })).toMatchObject({
@@ -975,12 +980,12 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     const candidate = await frozenPinnedCandidate({
       kind: RunKind.CONTRACT_CHANGE,
       manifest: ENTRY_ONLY,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
       candidateChange: (repo) => writeFiles(repo, {
-        "gate/check.js": proposed,
+        "gate/check.cjs": proposed,
         ".agent-control-plane/project.json": `${JSON.stringify({
           ...ENTRY_ONLY,
-          gateEntries: [entry("gate/check.js", proposed)],
+          gateEntries: [entry("gate/check.cjs", proposed)],
         }, null, 2)}\n`,
       }),
     });
@@ -989,19 +994,19 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     expect(await verifyPinned(candidate)).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
-      evidence: { path: "gate/check.js", expected: sha256(GATE_ENTRY), observed: sha256(proposed) },
+      evidence: { path: "gate/check.cjs", expected: sha256(GATE_ENTRY), observed: sha256(proposed) },
     });
     expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
   });
 
   it("RF-S22 arm:validator: a helper the entry decides through is bound only when it is declared", async () => {
-    const helperChange = (repo: string): void => writeFiles(repo, { "gate/decide.js": UNCONDITIONAL_PASS });
+    const helperChange = (repo: string): void => writeFiles(repo, { "gate/decide.cjs": UNCONDITIONAL_PASS });
 
     // Limit, measured: with only the entry declared, rewriting the helper it requires to exit 0
     // short-circuits the gate. An undeclared helper is outside the guarantee.
     const undeclared = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
       candidateChange: helperChange,
     });
     const bypassed = await verifyPinned(undeclared);
@@ -1010,30 +1015,143 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
 
     const declared = await frozenPinnedCandidate({
       manifest: ENTRY_AND_HELPER,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
       candidateChange: helperChange,
     });
     expect(await verifyPinned(declared)).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
-      evidence: { path: "gate/decide.js", expected: sha256(GATE_HELPER), observed: sha256(UNCONDITIONAL_PASS) },
+      evidence: { path: "gate/decide.cjs", expected: sha256(GATE_HELPER), observed: sha256(UNCONDITIONAL_PASS) },
     });
     expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+  });
+
+  /**
+   * #1082 R1-02 (round 3) — what pinned bytes decide must not depend on how the candidate's package
+   * configuration classifies them. A merge-gate review's counterexample: this self-contained gate
+   * exits 1 as CommonJS, where a sloppy-mode function's `this` is the global object, and exits 0
+   * as an ES module, where it is undefined. Pinned as `.js`, the candidate changed only
+   * package.json and flipped the verdict of unchanged bytes.
+   */
+  const CLASSIFIED_GATE = "if ((function () { return this; })()) process.exit(1);\nconsole.log('PACKAGE_TYPE_BYPASS');\n";
+  /** `node <path>` in `cwd`, with the environment the sandbox builds for `command`. */
+  const nodeProbe = (cwd: string, path: string, command: ProjectManifest["verificationCommands"][number]) => {
+    const ran = boundedSpawnSync(process.execPath, [path], {
+      cwd,
+      encoding: "utf8",
+      timeout: 5_000,
+      env: buildSandboxEnvironment(command, tempDir("acp-node-env-"), undefined, cwd),
+    });
+    return { exit: ran.status, stdout: ran.stdout };
+  };
+
+  it("RF-S22 arm:validator #1082 R1-02: package type can change the verdict of an unchanged self-contained js gate", async () => {
+    // The review's declaration, `.js`, is refused where it is declared, before any run exists.
+    const asJs = gateManifest([entry("gate/check.js", CLASSIFIED_GATE)]);
+    asJs.verificationCommands = [{ ...asJs.verificationCommands[0]!, argv: ["node", "gate/check.js"] }];
+    const unpinned = { issues: expect.arrayContaining([expect.objectContaining({ path: "gateEntries", refusal: GATE_ENTRY_MODULE_FORMAT_UNPINNED })]) };
+    expect(assertPortableManifest(asJs)).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: unpinned });
+    vi.mocked(runSandboxed).mockClear();
+    const harness = makeHarness();
+    expect(harness.cp.projects.register({
+      projectId: asJs.projectId,
+      name: "package-type",
+      manifest: asJs,
+      authorization: harness.cp.manifestAuthorizationForTests(asJs),
+    })).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: unpinned });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+
+    // The same bytes declared as `.cjs`: the review's run and its assertions. The candidate's
+    // package.json type no longer reaches them.
+    const path = "gate/check.cjs";
+    const m = gateManifest([entry(path, CLASSIFIED_GATE)]);
+    m.verificationCommands = [{ ...m.verificationCommands[0]!, argv: ["node", path] }];
+    let old: ReturnType<typeof nodeProbe> | undefined;
+    const c = await frozenPinnedCandidate({
+      manifest: m,
+      beforeRun: (repo) => {
+        writeFiles(repo, { [path]: CLASSIFIED_GATE, "package.json": '{"type":"commonjs"}\n' });
+        commitAll(repo, "strict gate");
+        old = nodeProbe(repo, path, m.verificationCommands[0]!);
+      },
+      candidateChange: (repo) => writeFiles(repo, { "package.json": '{"type":"module"}\n' }),
+    });
+    let observed: { probe: ReturnType<typeof nodeProbe>; bytes: string } | undefined;
+    const real = vi.mocked(runSandboxed).getMockImplementation()!;
+    vi.mocked(runSandboxed).mockImplementation(async (input) => {
+      observed = { probe: nodeProbe(input.worktreePath, path, m.verificationCommands[0]!), bytes: readFileSync(join(input.worktreePath, path), "utf8") };
+      return real(input);
+    });
+    let result;
+    try {
+      result = await verifyPinned(c);
+    } finally {
+      vi.mocked(runSandboxed).mockImplementation(real);
+    }
+    expect(old!.exit).toBe(1);
+    expect(observed!.bytes).toBe(CLASSIFIED_GATE);
+    expect(observed!.probe.exit, "candidate package type must not change trusted gate execution").toBe(1);
+    expect(result).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+  });
+
+  it.each([
+    ["mjs", "import { passes } from './decide.mjs';\nif (!passes) process.exit(1);\n", "export const passes = false;\n"],
+    ["cjs", "const { passes } = require('./decide.cjs');\nif (!passes) process.exit(1);\n", "module.exports = { passes: false };\n"],
+  ] as const)("RF-S22 arm:validator #1082 R1-02: a declared .%s helper is loaded by its pinned path whatever the candidate's package configuration says", async (ext, gate, helper) => {
+    // The control the CEO asked to keep: with explicit extensions, neither the entry nor the helper
+    // it names by relative path is re-pointed by a package.json type flip, an imports or exports
+    // map, or a sibling with another extension. (A helper loaded through an `#imports` specifier
+    // remains outside the guarantee, as the gateEntries contract says.)
+    const entryPath = `gate/check.${ext}`, helperPath = `gate/decide.${ext}`;
+    const m = gateManifest([entry(entryPath, gate), entry(helperPath, helper, entryPath)]);
+    m.verificationCommands = [{ ...m.verificationCommands[0]!, argv: ["node", entryPath] }];
+    const weak = "console.log('HELPER_BYPASS'); process.exit(0);\n";
+    const c = await frozenPinnedCandidate({
+      manifest: m,
+      beforeRun: (repo) => {
+        writeFiles(repo, { [entryPath]: gate, [helperPath]: helper });
+        commitAll(repo, "gate and helper");
+      },
+      candidateChange: (repo) => writeFiles(repo, {
+        "package.json": JSON.stringify({ type: ext === "mjs" ? "commonjs" : "module", imports: { "#decide": "./bypass.mjs" }, exports: "./bypass.mjs" }),
+        "bypass.mjs": weak,
+        "gate/decide.js": weak,
+        "gate/decide": weak,
+        [`gate/decide.${ext === "mjs" ? "cjs" : "mjs"}`]: weak,
+        [`${helperPath}.js`]: weak,
+      }),
+    });
+    let probe: ReturnType<typeof nodeProbe> | undefined;
+    const real = vi.mocked(runSandboxed).getMockImplementation()!;
+    vi.mocked(runSandboxed).mockImplementation(async (input) => {
+      probe = nodeProbe(input.worktreePath, entryPath, m.verificationCommands[0]!);
+      return real(input);
+    });
+    let result;
+    try {
+      result = await verifyPinned(c);
+    } finally {
+      vi.mocked(runSandboxed).mockImplementation(real);
+    }
+    expect(probe, "the gate ran").toBeDefined();
+    expect(probe!.stdout).not.toContain("HELPER_BYPASS");
+    expect(probe!.exit).toBe(1);
+    expect(result).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
   });
 
   it("RF-S22 arm:validator W5: a pinned gate entry absent at the candidate head is refused, not skipped", async () => {
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
       candidateChange: (repo) => {
-        rmSync(join(repo, "gate", "check.js"));
+        rmSync(join(repo, "gate", "check.cjs"));
         writeFiles(repo, { "src/app.js": "module.exports = () => 2;\n" });
       },
     });
     expect(await verifyPinned(candidate)).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
-      evidence: { path: "gate/check.js", expected: sha256(GATE_ENTRY), observed: null, observedState: "ABSENT" },
+      evidence: { path: "gate/check.cjs", expected: sha256(GATE_ENTRY), observed: null, observedState: "ABSENT" },
     });
     expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
   });
@@ -1043,23 +1161,23 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     // the pinned digest. The target is a file the candidate controls, so following it would run
     // the candidate's gate. This gate's text is a single path component so the link resolves.
     const STRICT_GATE = "process.exit(1)";
-    const manifest = gateManifest([entry("gate/check.js", STRICT_GATE)]);
+    const manifest = gateManifest([entry("gate/check.cjs", STRICT_GATE)]);
     const candidate = await frozenPinnedCandidate({
       manifest,
-      beforeRun: commitGate({ "gate/check.js": STRICT_GATE }),
+      beforeRun: commitGate({ "gate/check.cjs": STRICT_GATE }),
       candidateChange: (repo) => {
         writeFiles(repo, { [`gate/${STRICT_GATE}`]: UNCONDITIONAL_PASS });
-        rmSync(join(repo, "gate", "check.js"));
-        symlinkSync(STRICT_GATE, join(repo, "gate", "check.js"));
+        rmSync(join(repo, "gate", "check.cjs"));
+        symlinkSync(STRICT_GATE, join(repo, "gate", "check.cjs"));
       },
     });
-    expect(gitSync(candidate.harness.repoPath, ["ls-tree", "HEAD", "--", "gate/check.js"])).toMatch(/^120000 blob /);
-    expect(gitSync(candidate.harness.repoPath, ["cat-file", "blob", "HEAD:gate/check.js"])).toBe(STRICT_GATE);
+    expect(gitSync(candidate.harness.repoPath, ["ls-tree", "HEAD", "--", "gate/check.cjs"])).toMatch(/^120000 blob /);
+    expect(gitSync(candidate.harness.repoPath, ["cat-file", "blob", "HEAD:gate/check.cjs"])).toBe(STRICT_GATE);
 
     expect(await verifyPinned(candidate)).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
-      evidence: { path: "gate/check.js", observed: null, observedState: "NOT_A_REGULAR_FILE", observedMode: "120000" },
+      evidence: { path: "gate/check.cjs", observed: null, observedState: "NOT_A_REGULAR_FILE", observedMode: "120000" },
     });
     expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
   });
@@ -1069,17 +1187,17 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     // decode alike. The engine re-derives the blob id to tell them apart.
     const PINNED = "// � marks the pinned bytes\nprocess.exit(1);\n";
     const candidate = await frozenPinnedCandidate({
-      manifest: gateManifest([entry("gate/check.js", PINNED)]),
-      beforeRun: commitGate({ "gate/check.js": PINNED }),
+      manifest: gateManifest([entry("gate/check.cjs", PINNED)]),
+      beforeRun: commitGate({ "gate/check.cjs": PINNED }),
       candidateChange: (repo) => writeFileSync(
-        join(repo, "gate", "check.js"),
+        join(repo, "gate", "check.cjs"),
         Buffer.concat([Buffer.from("// "), Buffer.from([0xff]), Buffer.from(" marks the pinned bytes\nprocess.exit(1);\n")]),
       ),
     });
     expect(await verifyPinned(candidate)).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.CONTRACT_UNVERIFIED,
-      evidence: { path: "gate/check.js", expected: sha256(PINNED) },
+      evidence: { path: "gate/check.cjs", expected: sha256(PINNED) },
     });
 
     const verifyAltered = (alter: (repository: (typeof candidate.snapshot.repositories)[number]) => void) => {
@@ -1108,7 +1226,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     const real = vi.mocked(runSandboxed).getMockImplementation()!;
     const executed: string[] = [];
     vi.mocked(runSandboxed).mockImplementation(async (input) => {
-      executed.push(readFileSync(join(input.worktreePath, "gate", "check.js"), "utf8"));
+      executed.push(readFileSync(join(input.worktreePath, "gate", "check.cjs"), "utf8"));
       return real(input);
     });
     try {
@@ -1138,16 +1256,16 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     // Run through sh rather than exec'd, so no fresh executable is minted per run.
     writeFileSync(join(programs, "smudge.sh"), `touch '${ran}'\nprintf 'process.exit(0);\\n'\n`);
     const candidate = await frozenPinnedCandidate({
-      manifest: gateManifest([entry("gate/check.js", pinned)]),
+      manifest: gateManifest([entry("gate/check.cjs", pinned)]),
       beforeRun: (repo) => {
-        commitGate({ "gate/check.js": pinned, "gate/decide.js": GATE_HELPER })(repo);
+        commitGate({ "gate/check.cjs": pinned, "gate/decide.cjs": GATE_HELPER })(repo);
         gitSync(repo, ["config", `filter.${driver}.smudge`, `sh '${join(programs, "smudge.sh")}'`]);
         gitSync(repo, ["config", `filter.${driver}.clean`, "cat"]);
         if (required) gitSync(repo, ["config", `filter.${driver}.required`, "true"]);
       },
       // The candidate only selects the driver; app() still returns 1, and a pointer is not a
       // program, so the pinned gate refuses this candidate either way.
-      candidateChange: (repo) => writeFiles(repo, { ".gitattributes": `gate/check.js filter=${driver}\n` }),
+      candidateChange: (repo) => writeFiles(repo, { ".gitattributes": `gate/check.cjs filter=${driver}\n` }),
     });
 
     const { verified, executed } = await verifyObservingGate(candidate);
@@ -1164,12 +1282,12 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
   ])("RF-S22 arm:validator #1082: a replace ref planted before the freeze, %s, cannot put a replacement gate in the worktree", async (_, reset) => {
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
       candidateChange: (repo) => writeFiles(repo, { "src/app.js": "module.exports = () => 1;\n// candidate\n" }),
       beforeFreeze: (repo) => {
         const head = gitSync(repo, ["rev-parse", "HEAD"]);
-        writeFiles(repo, { "gate/check.js": UNCONDITIONAL_PASS });
-        gitSync(repo, ["add", "gate/check.js"]);
+        writeFiles(repo, { "gate/check.cjs": UNCONDITIONAL_PASS });
+        gitSync(repo, ["add", "gate/check.cjs"]);
         const replacement = gitSync(repo, ["commit-tree", gitSync(repo, ["write-tree"]), "-p", head, "-m", "replacement"]);
         gitSync(repo, ["reset", "-q", "--hard", head]);
         gitSync(repo, ["replace", head, replacement]);
@@ -1177,8 +1295,8 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
       },
     });
     // The raw candidate still carries the pinned gate; only a replacement-honouring read differs.
-    expect(gitSync(candidate.harness.repoPath, ["--no-replace-objects", "show", "HEAD:gate/check.js"])).toBe(GATE_ENTRY.trimEnd());
-    expect(gitSync(candidate.harness.repoPath, ["show", "HEAD:gate/check.js"])).toBe(UNCONDITIONAL_PASS.trimEnd());
+    expect(gitSync(candidate.harness.repoPath, ["--no-replace-objects", "show", "HEAD:gate/check.cjs"])).toBe(GATE_ENTRY.trimEnd());
+    expect(gitSync(candidate.harness.repoPath, ["show", "HEAD:gate/check.cjs"])).toBe(UNCONDITIONAL_PASS.trimEnd());
 
     vi.mocked(runSandboxed).mockClear();
     const outcome = await verifyPinned(candidate).catch((error: unknown) => error);
@@ -1189,12 +1307,12 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
   it("RF-S22 arm:validator #1082: a replace ref planted and removed around preparation cannot either", async () => {
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
     });
     const repo = candidate.harness.repoPath;
     const head = gitSync(repo, ["rev-parse", "HEAD"]);
-    writeFiles(repo, { "gate/check.js": UNCONDITIONAL_PASS });
-    gitSync(repo, ["add", "gate/check.js"]);
+    writeFiles(repo, { "gate/check.cjs": UNCONDITIONAL_PASS });
+    gitSync(repo, ["add", "gate/check.cjs"]);
     const replacement = gitSync(repo, ["commit-tree", gitSync(repo, ["write-tree"]), "-p", head, "-m", "race replacement"]);
     gitSync(repo, ["reset", "-q", "--hard", head]);
     const create = candidate.harness.cp.worktrees.create.bind(candidate.harness.cp.worktrees);
@@ -1228,14 +1346,14 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     writeFileSync(join(programs, "filter.sh"), `touch '${ran}'\n${processFilter ? "exit 1" : "cat"}\n`);
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
-      candidateChange: (repo) => writeFiles(repo, { ".gitattributes": "gate/check.js filter=outside\n" }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: (repo) => writeFiles(repo, { ".gitattributes": "gate/check.cjs filter=outside\n" }),
     });
     const repo = candidate.harness.repoPath;
     gitSync(repo, ["config", `filter.outside.${processFilter ? "process" : "clean"}`, `sh '${join(programs, "filter.sh")}'`]);
     if (processFilter) gitSync(repo, ["config", "filter.outside.required", "true"]);
     const later = new Date(Date.now() + 60_000);
-    utimesSync(join(repo, "gate", "check.js"), later, later);
+    utimesSync(join(repo, "gate", "check.cjs"), later, later);
 
     const { verified, executed } = await verifyObservingGate(candidate);
     expect(existsSync(ran), "a candidate-selected filter program ran while the source was read").toBe(false);
@@ -1250,7 +1368,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
       beforeRun: (repo) => {
-        commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER })(repo);
+        commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER })(repo);
         gitSync(repo, ["config", "diff.outside.textconv", `sh '${join(programs, "textconv.sh")}'`]);
       },
       candidateChange: (repo) => writeFiles(repo, {
@@ -1271,7 +1389,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     writeFileSync(join(programs, "filter.sh"), `touch '${ran}'\ncat\n`);
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
       // A nested repository the candidate commits as a gitlink, left populated in the source.
       candidateChange: (repo) => {
         gitSync(repo, ["init", "-q", "vendor/nested"]);
@@ -1303,7 +1421,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
       beforeRun: (repo) => {
-        commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER })(repo);
+        commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER })(repo);
         // A nested repository recorded as a gitlink on the base branch and left populated.
         gitSync(repo, ["init", "-q", "vendor/nested"]);
         writeFiles(nestedOf(repo), { "data.txt": "old\n", ".gitattributes": "data.txt diff=inner\n" });
@@ -1333,15 +1451,15 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     // it, so the bytes the command would execute are not the pinned bytes.
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
-      candidateChange: (repo) => writeFiles(repo, { ".gitattributes": "gate/check.js text eol=crlf\n" }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: (repo) => writeFiles(repo, { ".gitattributes": "gate/check.cjs text eol=crlf\n" }),
     });
     expect(await verifyPinned(candidate)).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
       evidence: {
         commandId: "verify",
-        path: "gate/check.js",
+        path: "gate/check.cjs",
         checkedIn: "VERIFICATION_WORKTREE",
         expected: sha256(GATE_ENTRY),
         observed: sha256(GATE_ENTRY.replaceAll("\n", "\r\n")),
@@ -1352,7 +1470,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
   });
 
   it("RF-S22 arm:validator #1082: each gate command is checked immediately before it runs, after every earlier command", async () => {
-    const base = gateManifest([entry("gate/check.js", GATE_ENTRY)]);
+    const base = gateManifest([entry("gate/check.cjs", GATE_ENTRY)]);
     const manifest: ProjectManifest = {
       ...base,
       verificationProfiles: { simple: ["prepare", "verify"], standard: ["prepare", "verify"], guarded: ["prepare", "verify"] },
@@ -1363,7 +1481,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     };
     const candidate = await frozenPinnedCandidate({
       manifest,
-      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
     });
     // Modelled, not executed: on a host where an earlier command is not write-confined, whatever
     // it left running can reach the gate command's worktree once preparation has written it. The
@@ -1371,7 +1489,7 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     const create = candidate.harness.cp.worktrees.create.bind(candidate.harness.cp.worktrees);
     vi.spyOn(candidate.harness.cp.worktrees, "create").mockImplementation(async (...args) => {
       const worktree = await create(...args);
-      if (args[2].includes("-verify-")) writeFileSync(join(worktree.path, "gate", "check.js"), UNCONDITIONAL_PASS);
+      if (args[2].includes("-verify-")) writeFileSync(join(worktree.path, "gate", "check.cjs"), UNCONDITIONAL_PASS);
       return worktree;
     });
 
