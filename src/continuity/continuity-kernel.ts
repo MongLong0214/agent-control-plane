@@ -668,7 +668,13 @@ export class ContinuityKernel {
       takeover: true,
     });
     if (!switched.allowed) {
-      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "failover rejected");
+      // #512 — the registry's own fence refused a WORKER whose run ended after the check above: the
+      // session this attempt provisioned is stopped through its provider, as for that check.
+      if (role === Role.WORKER && switched.reasonCode === ReasonCode.RUN_ALREADY_TERMINAL) {
+        await this.#stopUnboundWorkerSession(provisioned.value.sessionId, role, "failover rejected: the worker's run ended");
+      } else {
+        this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "failover rejected");
+      }
       return switched as Decision<{ provider: string; generation: number }>;
     }
 

@@ -765,6 +765,110 @@ describe("review round 1: retirement is retried by the watchdog (wr-r1-01)", () 
   });
 });
 
+/**
+ * Runs the official cancel immediately before the real `BindingRegistry.switchTo` of a WORKER: the
+ * cancel commits after the failover's last read of the run and before the binding transaction, so it
+ * is the registry's own fence that refuses.
+ */
+const cancelAtTheSwitch = (harness: Harness, run: ActiveRun) => {
+  const realSwitch = harness.cp.bindings.switchTo.bind(harness.cp.bindings);
+  const reached = { count: 0 };
+  const spy = vi.spyOn(harness.cp.bindings, "switchTo").mockImplementation((input) => {
+    if (input.role === Role.WORKER) {
+      reached.count += 1;
+      expect(harness.cp.runs.cancel(run.runId, "cancel commits just before the binding transaction").allowed).toBe(true);
+    }
+    return realSwitch(input);
+  });
+  return { reached, restore: () => spy.mockRestore() };
+};
+
+describe("review round 2: a registry refusal stops the failover's session through its provider (wr-r1-02)", () => {
+  it("the registry refuses the switch: the exact session the failover started is stopped once through its provider, then STOPPED", async () => {
+    const harness = gatedHarness();
+    const { run, roleKey, claude } = await runningWorker(harness);
+    const boundary = cancelAtTheSwitch(harness, run);
+    try {
+      const result = await workerFailover(harness, run);
+      await harness.cp.workerRetirement.settled();
+
+      expect(boundary.reached.count).toBe(1);
+      expect(result.reasonCode).toBe(ReasonCode.RUN_ALREADY_TERMINAL);
+      expect(harness.cp.bindings.active(roleKey)).toBeNull();
+      const started = claudeSessions(harness);
+      expect(started).toHaveLength(1);
+      const session = harness.cp.sessions.get(started[0]!.session_id)!;
+      expect(claude.stopped).toEqual([session.incarnation.split("#")[0]]);
+      expect(session.lifecycle).toBe(SessionLifecycle.STOPPED);
+    } finally {
+      boundary.restore();
+    }
+  });
+
+  it("the registry refuses the switch and the provider stop fails: the session is ERROR, recorded PROCESS_UNVERIFIED, never STOPPED", async () => {
+    const harness = gatedHarness();
+    const { run, roleKey, claude } = await runningWorker(harness);
+    const stop = vi.spyOn(claude, "stopSession").mockRejectedValue(new Error("boundary stop failed"));
+    const boundary = cancelAtTheSwitch(harness, run);
+    try {
+      const result = await workerFailover(harness, run);
+      await harness.cp.workerRetirement.settled();
+
+      expect(result.reasonCode).toBe(ReasonCode.RUN_ALREADY_TERMINAL);
+      expect(harness.cp.bindings.active(roleKey)).toBeNull();
+      const started = claudeSessions(harness);
+      expect(started).toHaveLength(1);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(started[0]!.lifecycle).toBe(SessionLifecycle.ERROR);
+      expect(harness.cp.audit.byKind("CONTINUITY_UNBOUND_SESSION_STOP_FAILED")
+        .filter((entry) => entry.sessionId === started[0]!.session_id)
+        .map((entry) => entry.evidence)).toEqual([expect.objectContaining({ status: "PROCESS_UNVERIFIED", error: "boundary stop failed" })]);
+    } finally {
+      boundary.restore();
+      stop.mockRestore();
+    }
+  });
+
+  it("the registry refuses the switch of a replacement with a real process: the process is stopped by its provider before STOPPED", async () => {
+    const harness = gatedHarness();
+    const { run, roleKey, claude } = await runningWorker(harness);
+    const child = liveWorkerProcess();
+    await once(child, "spawn");
+    const startSession = claude.startSession.bind(claude);
+    const start = vi.spyOn(claude, "startSession").mockImplementation(async (spec) => ({ ...(await startSession(spec)), pid: child.pid! }));
+    const stopSession = claude.stopSession.bind(claude);
+    // The provider's stop is what ends the replacement's process; nothing else signals it.
+    const stop = vi.spyOn(claude, "stopSession").mockImplementation(async (handle) => {
+      await killChild(child);
+      await stopSession(handle);
+    });
+    const boundary = cancelAtTheSwitch(harness, run);
+    try {
+      const result = await workerFailover(harness, run);
+      await harness.cp.workerRetirement.settled();
+      const replacement = harness.cp.sessions.get(claudeSessions(harness)[0]!.session_id)!;
+      let alive = true;
+      try {
+        process.kill(child.pid!, 0);
+      } catch {
+        alive = false;
+      }
+
+      expect(result.reasonCode).toBe(ReasonCode.RUN_ALREADY_TERMINAL);
+      expect(harness.cp.bindings.active(roleKey)).toBeNull();
+      expect(replacement.osPid).toBe(child.pid);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(alive).toBe(false);
+      expect(replacement.lifecycle).toBe(SessionLifecycle.STOPPED);
+    } finally {
+      boundary.restore();
+      start.mockRestore();
+      stop.mockRestore();
+      await killChild(child);
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // The ordinary finalization path, as tests/unit/ordinary-finalization-authority.test.ts drives it.
 
