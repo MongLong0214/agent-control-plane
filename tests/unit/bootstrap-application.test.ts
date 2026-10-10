@@ -2015,6 +2015,71 @@ describe("#246 C3 review 1076-R1-02: a database row stands in for neither the ap
     });
   });
 
+  it("the activation finalizer called directly finalizes nothing on a forged WRITTEN phase", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-finalizer-forged"));
+      const result = forgedResult(f, run);
+      const activated = await f.harness.cp.bootstrap.activate({
+        runId: run.runId,
+        candidateSnapshotDigest: run.candidate,
+        factoryResult: result as never,
+        approvedManifest: run.manifest,
+        localBindings: (result["repositories"] as Array<{ identity: string; role: string; proposedCheckoutPath: string }>).map((repository) => ({
+          identity: repository.identity,
+          repositoryRole: repository.role,
+          checkoutPath: repository.proposedCheckoutPath,
+        })),
+        projectName: "fixture",
+        handoff: bootstrapActivationHandoff(run.manifest),
+      });
+      await acknowledgeHandoff(f, run, activated as unknown as Record<string, unknown>);
+      forgeApplication(f, run, "WRITTEN", 1);
+      const before = f.harness.cp.artifacts.list(run.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT).length;
+      const finalized = f.harness.cp.db.txDecision(() =>
+        f.harness.cp.bootstrap.finalizeBootstrapActivationConfirm({
+          runId: run.runId,
+          candidateSnapshotDigest: run.candidate,
+          ceoSessionId: f.ceoSessionId,
+          confirmedAt: f.harness.clock.nowIso(),
+        }),
+      );
+      expect(finalized, JSON.stringify(finalized)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_UNANCHORED" } });
+      expect(f.harness.cp.artifacts.list(run.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT)).toHaveLength(before);
+      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+    });
+  });
+
+  it("the activation finalizer called directly finalizes nothing on an altered result, and finalizes the attempt's own", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-finalizer-altered"));
+      await approveWrites(f, run);
+      const activation = await confirm(f, run);
+      await acknowledgeHandoff(f, run, activation);
+      const original = structuredClone(f.harness.cp.artifacts.latest<Record<string, unknown>>(run.runId, ArtifactKind.REPO_FACTORY_RESULT)!.content);
+      const finalize = () =>
+        f.harness.cp.db.txDecision(() =>
+          f.harness.cp.bootstrap.finalizeBootstrapActivationConfirm({
+            runId: run.runId,
+            candidateSnapshotDigest: run.candidate,
+            ceoSessionId: f.ceoSessionId,
+            confirmedAt: f.harness.clock.nowIso(),
+          }),
+        );
+      const altered = structuredClone(original);
+      (altered["externalWriteReceipts"] as Array<Record<string, unknown>>)[0]!["afterStateDigest"] = digestOf({ forged: "at the finalizer" });
+      f.harness.cp.artifacts.put(run.runId, ArtifactKind.REPO_FACTORY_RESULT, altered);
+      const before = f.harness.cp.artifacts.list(run.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT).length;
+      const refused = finalize();
+      expect(refused, JSON.stringify(refused)).toMatchObject({ allowed: false, evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" } });
+      expect(f.harness.cp.artifacts.list(run.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT)).toHaveLength(before);
+      // The control: the attempt's own result, observed later, is finalized.
+      const observedLater = structuredClone(original);
+      (observedLater["externalWriteReceipts"] as Array<Record<string, unknown>>)[0]!["rereadAt"] = "2099-01-01T00:00:00.000Z";
+      f.harness.cp.artifacts.put(run.runId, ArtifactKind.REPO_FACTORY_RESULT, observedLater);
+      expect(finalize()).toMatchObject({ allowed: true });
+    });
+  });
+
   it("a stored result altered before its first activation is refused by the runner before anything is provisioned", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-before-activation"));

@@ -784,6 +784,8 @@ export class ControlPlane {
           },
         },
       });
+      // #246 C3, review 1076-R1-02 — the activation finalizer completes only on the chain the runner verifies.
+      this.bootstrap.attachCompletionChain(this.bootstrapProducer);
       // #246 C3 — the reservation release is a repair the bootstrap runner verifies and performs.
       this.repair.attach({ ownerAuthority: this.ownerAuthority, bootstrapRecovery: this.bootstrapProducer });
       this.ceo.attach({
@@ -792,7 +794,7 @@ export class ControlPlane {
           finalizeBootstrapActivationConfirm: (input) => this.bootstrap.finalizeBootstrapActivationConfirm(input),
         },
         bootstrapApplications: this.bootstrapApplications,
-        // #246 C3, review 1076-R1-02 — the chain the CEO decision and its finalizer complete on.
+        // #246 C3, review 1076-R1-02 — the chain the CEO decision completes on; its finalizer asks too.
         bootstrapCompletionChain: this.bootstrapProducer,
         sourceReadLeases: this.guard,
         continuity: {

@@ -209,6 +209,7 @@ const prepare = async (
   runner.attachWriterLock(() => true, () => thisProcess);
   // The CEO decision completes a bootstrap on the chain this runner verifies, as composed (#246 C3).
   harness.cp.ceo.attach({ bootstrapCompletionChain: runner });
+  harness.cp.bootstrap.attachCompletionChain(runner);
   // The CEO's admission, which the runner asks among its pre-write checks, needs a current
   // continuity evaluation, as the CONFIRM door has before it calls the runner.
   await harness.cp.continuity.evaluate("bootstrap confirmation");

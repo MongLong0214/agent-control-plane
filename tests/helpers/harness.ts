@@ -18,6 +18,7 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { RunRow } from "../../src/domain/types.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { digestOf } from "../../src/core/digest.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ManagedManifestWrite } from "../../src/registry/project-registry.ts";
 import type { HermesReceiptPortOptions } from "../../src/runtime/hermes-receipt-port.ts";
 import { commitAll, gitSync, makeRepo, tempDir, writeFiles } from "./fixtures.ts";
@@ -345,18 +346,28 @@ export const dispatchBootstrapRun = async (cp: ControlPlane, clock: Clock, runId
 export const completeBootstrapRunUntilC3 = (
   cp: ControlPlane,
   input: { runId: string; candidateSnapshotDigest: string; ceoSessionId: string },
-) =>
-  cp.db.txDecision(() => {
-    const finalized = cp.bootstrap.finalizeBootstrapActivationConfirm({ ...input, confirmedAt: cp.clock.nowIso() });
-    if (!finalized.allowed) return finalized;
-    return cp.runs.transition(
-      input.runId,
-      RunState.COMPLETED,
-      "CEO CONFIRM (fixture, until C3)",
-      { candidateSnapshotDigest: input.candidateSnapshotDigest },
-      cp.completionAuthoritiesForTests().bootstrapActivation,
-    );
+) => {
+  // Such a fixture has no runner, so no anchored approval and no attempt ledger: the finalizer's
+  // completion chain (#246 C3, review 1076-R1-02) is stood in for, by name and for this call only.
+  const production = cp.bootstrap.attachCompletionChain({
+    verifyCompletionChain: () => ({ allowed: true, reasonCode: ReasonCode.OK, evidence: {}, value: undefined }),
   });
+  try {
+    return cp.db.txDecision(() => {
+      const finalized = cp.bootstrap.finalizeBootstrapActivationConfirm({ ...input, confirmedAt: cp.clock.nowIso() });
+      if (!finalized.allowed) return finalized;
+      return cp.runs.transition(
+        input.runId,
+        RunState.COMPLETED,
+        "CEO CONFIRM (fixture, until C3)",
+        { candidateSnapshotDigest: input.candidateSnapshotDigest },
+        cp.completionAuthoritiesForTests().bootstrapActivation,
+      );
+    });
+  } finally {
+    cp.bootstrap.attachCompletionChain(production);
+  }
+};
 
 /**
  * Fixtures model a real worker as its own READY session with the task-scoped binding that
