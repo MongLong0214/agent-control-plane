@@ -19,7 +19,7 @@ import type { Outbox } from "../outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
-import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type DrivenMode, type SpawnAttestation, drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
+import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type DrivenMode, type ProvisionedSessionRuntime, type SpawnAttestation, drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -1714,6 +1714,145 @@ export class CtoLifecycle {
    * while the row said STOPPED. `handleFor` rebuilds the provider id from the incarnation, as the
    * bound-session probe already does.
    */
+  /**
+   * #246 C4-R2 — recovers a driven PRIMARY_CTO on its own session after the daemon lost the
+   * credential it held for it (a crash or restart before the session acknowledged its handoff).
+   * The binding stays ACTIVE throughout, so no other session is ever spawned or bound for the role,
+   * and nothing queued for it is lost: an in-band envelope stays PENDING and is redelivered under its
+   * outbox key once the session attests again.
+   *
+   * Capacity → a real `--resume` probe of the session's own conversation → the credential rotated to
+   * epoch + 1 → adopted → attested. The rotation is conditional on the role's ACTIVE binding still
+   * being the one the recovery started from, read again inside its transaction, and so are the
+   * adoption and the result. A refusal at any step spawns nothing, rebinds nothing, and is recorded;
+   * the next attempt waits out `DRIVEN_PRIMARY_CTO_RECOVERY_BACKOFF_MS`.
+   */
+  readonly #recoveringDriven = new Set<string>();
+
+  async recoverDrivenPrimaryCto(roleKey: string, ports: DrivenPrimaryRecoveryPorts): Promise<Decision<RoleBinding>> {
+    if (this.#recoveringDriven.has(roleKey)) {
+      return deny(ReasonCode.CONFLICT, "a recovery of this primary CTO is already running", { roleKey });
+    }
+    const start = this.#recoverableDriven(roleKey, ports.runtime);
+    if (!start.allowed) return start as Decision<RoleBinding>;
+    if (this.#drivenRecoveryBackingOff(roleKey)) {
+      return deny(ReasonCode.DAEMON_BACKOFF_ACTIVE, "a recent recovery of this primary CTO failed; waiting out its backoff", {
+        roleKey,
+        backoffMs: DRIVEN_PRIMARY_CTO_RECOVERY_BACKOFF_MS,
+      });
+    }
+    this.#recoveringDriven.add(roleKey);
+    try {
+      const recovered = await this.#recoverDriven(roleKey, ports, start.value);
+      if (!recovered.allowed) {
+        this.audit.record({
+          kind: "PRIMARY_CTO_RECOVERY_REFUSED",
+          reasonCode: recovered.reasonCode,
+          roleKey,
+          sessionId: start.value.session.sessionId,
+          evidence: { backoffMs: DRIVEN_PRIMARY_CTO_RECOVERY_BACKOFF_MS },
+        });
+      }
+      return recovered;
+    } finally {
+      this.#recoveringDriven.delete(roleKey);
+    }
+  }
+
+  async #recoverDriven(
+    roleKey: string,
+    ports: DrivenPrimaryRecoveryPorts,
+    start: { binding: RoleBinding; session: SessionRecord },
+  ): Promise<Decision<RoleBinding>> {
+    const { binding, session } = start;
+    const admitted = await ports.capacity.refreshForDispatch({
+      provider: session.provider,
+      capabilities: ["cto"],
+      priority: "critical",
+      ...(this.providers.hasRoleScoped(session.provider) ? { role: Role.PRIMARY_CTO } : {}),
+    });
+    if (!admitted.allowed) return admitted as Decision<RoleBinding>;
+
+    // A real turn of the session's own conversation, resumed: the provider still has it. Proves
+    // access to the conversation, nothing about authority, and grants none.
+    const probed = await ports.runtime.probe(session.sessionId);
+    if (!probed.allowed) return probed as Decision<RoleBinding>;
+
+    let sessionSecret = "";
+    // The rotation is conditional on what the probe was asked under: the role's ACTIVE driven binding
+    // on this READY session, read again inside the transaction, and the epoch the recovery started
+    // from, which `rotateSecret` compares and moves by exactly one.
+    const rotated = this.db.txDecision<number>(() => {
+      const again = this.#recoverableDriven(roleKey, ports.runtime);
+      if (!again.allowed) return again as Decision<number>;
+      const credential = this.sessions.rotateSecret(session.sessionId, session.credentialEpoch);
+      if (!credential.allowed) return credential as Decision<number>;
+      sessionSecret = credential.value.sessionSecret;
+      return allow(ReasonCode.OK, credential.value.session.credentialEpoch);
+    });
+    if (!rotated.allowed) return rotated as Decision<RoleBinding>;
+
+    // Adopted in the same turn of the event loop as the rotation, so against the binding it checked;
+    // the attestation reads the binding again on entry and after its turn (`turnEligibility`).
+    const adopted = ports.runtime.adopt(session.sessionId, Role.PRIMARY_CTO, sessionSecret, rotated.value);
+    sessionSecret = "";
+    if (!adopted.allowed) return adopted as Decision<RoleBinding>;
+    const attested = await ports.runtime.attest(session.sessionId, "resume");
+    if (!attested.allowed) {
+      ports.runtime.release(session.sessionId);
+      return notProvenReady(session.sessionId, attested) as Decision<RoleBinding>;
+    }
+    this.audit.record({
+      kind: "PRIMARY_CTO_RECOVERED",
+      sessionId: session.sessionId,
+      projectId: binding.projectId,
+      roleKey,
+      evidence: { generation: binding.bindingGeneration, fromEpoch: session.credentialEpoch, toEpoch: rotated.value },
+    });
+    return allow(ReasonCode.OK, binding);
+  }
+
+  /** The role's ACTIVE driven binding and its session, with no current credential held for it. */
+  #recoverableDriven(
+    roleKey: string,
+    runtime: DrivenPrimaryRecoveryPorts["runtime"],
+  ): Decision<{ binding: RoleBinding; session: SessionRecord }> {
+    const binding = this.bindings.active(roleKey);
+    if (!binding) {
+      return deny(ReasonCode.NOT_FOUND, "the primary CTO role has no active binding to recover on its own session", { roleKey });
+    }
+    if (binding.role !== Role.PRIMARY_CTO) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "only a driven primary CTO is recovered here", { roleKey, role: binding.role });
+    }
+    const mode = this.#drivenMode(binding.sessionId);
+    if (mode !== "DRIVEN") return drivenRecordContradicted(binding.sessionId, mode);
+    // Its lifecycle is the probe's and the rotation's to judge: neither runs on a session not READY.
+    const session = this.sessions.get(binding.sessionId);
+    if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { roleKey, sessionId: binding.sessionId });
+    if (runtime.holds(session.sessionId)) {
+      return deny(ReasonCode.CONFLICT, "the daemon still holds this session's current credential; there is nothing to recover", {
+        roleKey,
+        sessionId: session.sessionId,
+      });
+    }
+    return allow(ReasonCode.OK, { binding, session });
+  }
+
+  /** Whether this role's latest recovery, since its latest success, failed less than a backoff ago. */
+  #drivenRecoveryBackingOff(roleKey: string): boolean {
+    const refused = this.db.get<{ at: string }>(
+      `SELECT refused.at FROM audit_events refused
+        WHERE refused.kind = 'PRIMARY_CTO_RECOVERY_REFUSED' AND refused.role_key = ?
+          AND refused.event_id > COALESCE(
+                (SELECT MAX(ok.event_id) FROM audit_events ok
+                  WHERE ok.kind = 'PRIMARY_CTO_RECOVERED' AND ok.role_key = ?), 0)
+        ORDER BY refused.event_id DESC LIMIT 1`,
+      [roleKey, roleKey],
+    );
+    if (!refused) return false;
+    return Date.parse(this.clock.nowIso()) - Date.parse(refused.at) < DRIVEN_PRIMARY_CTO_RECOVERY_BACKOFF_MS;
+  }
+
   private async stopProviderSession(session: SessionRecord, role: Role = Role.PRIMARY_CTO): Promise<void> {
     await this.providers.requireForRole(session.provider, role).stopSession(handleFor(session));
   }
@@ -1749,6 +1888,22 @@ const notProvenReady = (sessionId: string, attested: Decision<void>): Decision<v
         sessionId,
         cause: attested.reasonCode,
       });
+
+/** #246 C4-R2 — how long a refused same-session recovery of a driven PRIMARY_CTO waits before the next. */
+export const DRIVEN_PRIMARY_CTO_RECOVERY_BACKOFF_MS = 15 * 60_000;
+
+/** What `CtoLifecycle.recoverDrivenPrimaryCto` needs from the daemon: capacity and the runtime driver. */
+export interface DrivenPrimaryRecoveryPorts {
+  readonly capacity: {
+    refreshForDispatch(target: {
+      provider: string;
+      capabilities: ["cto"];
+      priority: "critical";
+      role?: Role;
+    }): Promise<Decision<void>>;
+  };
+  readonly runtime: Pick<ProvisionedSessionRuntime, "probe" | "holds" | "adopt" | "attest" | "release">;
+}
 
 /** #246 C4 — the refusal for a session whose driven-spawn record does not add up: fail closed. */
 const drivenRecordContradicted = <T>(sessionId: string, mode: DrivenMode): Decision<T> =>

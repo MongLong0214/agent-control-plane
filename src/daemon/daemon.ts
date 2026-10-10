@@ -32,7 +32,7 @@ import {
 } from "../doctor/doctor.ts";
 import { REPO_FACTORY_GITHUB_WRITE_OPERATION } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
-import { RunState, SessionLifecycle } from "../domain/types.ts";
+import { Role, RunState, SessionLifecycle } from "../domain/types.ts";
 import { buildAcceptanceReport } from "../export/acceptance-report.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
 import {
@@ -1709,6 +1709,23 @@ export class Daemon {
         // turn and authenticate nothing, however healthy its provider is: its run is paused and
         // its binding revoked as owed, and the restore pass recovers the same session with a
         // rotated credential. Its row is left READY; nothing about the conversation is lost.
+        // #246 C4-R2 — a PRIMARY_CTO with a driven-spawn record is never revoked for coverage, failed
+        // over or replaced: its conversation lives in its own session. One whose credential this
+        // daemon does not hold is recovered on that session, its binding kept ACTIVE so nothing queued
+        // for it is lost; a refusal leaves it as it is, recorded, for the next pass after its backoff.
+        // A record that does not make it DRIVEN is left untouched as well.
+        // It is kept bound rather than revoked and renewed as a run's BOOTSTRAP_CTO is: with no ACTIVE
+        // binding the next dispatch would spawn a new session for the role, and its handoff is pinned.
+        if (required.role === Role.PRIMARY_CTO && this.cp.sessionRuntime.drivenModeOf(current.sessionId) !== "NONE") {
+          if (this.cp.sessionRuntime.drivesSession(current.sessionId, required.role) && !this.cp.sessionRuntime.holds(current.sessionId)) {
+            const recovered = await this.cp.cto.recoverDrivenPrimaryCto(required.roleKey, {
+              capacity: this.cp.capacity,
+              runtime: this.cp.sessionRuntime,
+            });
+            if (!recovered.allowed) unresolved.push({ roleKey: required.roleKey, reasonCode: recovered.reasonCode });
+          }
+          continue;
+        }
         if (ProvisionedSessionRuntime.drives(required.role)) {
           if (!this.cp.sessionRuntime.holds(current.sessionId)) {
             pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON));

@@ -599,7 +599,12 @@ export class ProvisionedSessionRuntime {
     const session = this.ports.sessions.get(sessionId);
     if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
     const held = this.#held.get(sessionId);
-    const adapter = this.#adapterFor(session, held?.role ?? Role.BOOTSTRAP_CTO);
+    // With no credential held (a recovery's `probe`), the adapter is the one for the role the session
+    // was spawned for: a driven PRIMARY_CTO's own role-scoped adapter, never the bootstrap CTO's.
+    const adapter = this.#adapterFor(
+      session,
+      held?.role ?? (this.ports.outbox.drivenModeOf(sessionId) === "NONE" ? Role.BOOTSTRAP_CTO : Role.PRIMARY_CTO),
+    );
     if (!adapter.allowed) return adapter as Decision<SessionTurnResult>;
     const provider = adapter.value;
     if (!provider.runSessionTurn) {

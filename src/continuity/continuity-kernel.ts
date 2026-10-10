@@ -19,6 +19,7 @@ import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
+import { drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
@@ -563,6 +564,16 @@ export class ContinuityKernel {
     // be a new conversation with no credential its runtime could present. Owner loss revokes and
     // pauses instead (the daemon's refusal path), and `restore()` recovers the same session.
     if (role === Role.BOOTSTRAP_CTO) return bootstrapCtoNotReplaceable(roleKey);
+    // #246 C4-R2 — nor is a PRIMARY_CTO whose holder has a driven-spawn record: its conversation lives
+    // in its own session, which is recovered on itself (`CtoLifecycle.recoverDrivenPrimaryCto`).
+    const holder = role === Role.PRIMARY_CTO ? this.bindings.active(roleKey) : null;
+    if (holder && drivenModeOf(this.db, holder.sessionId) !== "NONE") {
+      return deny(
+        ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
+        "a driven primary CTO is never failed over to another session; it is recovered on its own",
+        { roleKey, sessionId: holder.sessionId },
+      );
+    }
     const plan = await this.evaluate(`failover:${roleKey}`);
     const assignment = plan.assignments.find((a) => a.roleKey === roleKey);
     const required = plan.requiredRoles.find((candidate) => candidate.roleKey === roleKey);
