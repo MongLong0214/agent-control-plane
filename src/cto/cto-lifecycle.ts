@@ -1727,9 +1727,11 @@ export class CtoLifecycle {
    *
    * Proven means all of: the session has exactly the one driven-spawn record its spawn wrote; the session
    * holds no ACTIVE role, by its own row or as an actor's runtime, so it is not a winner or anyone's
-   * current holder; and it is not an adopted canonical runtime. Anything less is recorded `REMAINING_OWNERSHIP_UNVERIFIED` and
-   * nothing is stopped or released. A provider stop that fails leaves the session ERROR and recorded
-   * `REMAINING_STOP_FAILED`; only a stop that returned is recorded `STOPPED`.
+   * current holder; and it is not an adopted canonical runtime. The proof and the session's move to
+   * ERROR are one transaction, so it stays this attempt's until the stop begins.
+   * Anything less is recorded `REMAINING_OWNERSHIP_UNVERIFIED` and nothing is stopped or released. A
+   * provider stop that fails leaves the session ERROR and recorded `REMAINING_STOP_FAILED`; only a
+   * stop that returned is recorded `STOPPED`.
    */
   async #cleanUpDrivenSpawn(sessionId: string, runId: string, reason: string): Promise<void> {
     const session = this.sessions.get(sessionId);
@@ -1738,17 +1740,25 @@ export class CtoLifecycle {
       `SELECT run_id FROM audit_events WHERE kind = ? AND session_id = ?`,
       [DRIVEN_PRIMARY_CTO_SPAWN_RECORD, sessionId],
     );
-    const holdsRole = this.db.get<{ held: number }>(
+    const holdsRole = (): boolean => this.db.get<{ held: number }>(
       `SELECT 1 AS held FROM assignments a
          LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
         WHERE a.status = 'ACTIVE' AND (a.session_id = ? OR c.current_session_id = ?)
         LIMIT 1`,
       [sessionId, sessionId],
     ) !== undefined;
-    const owned = session !== null && session.lifecycle !== SessionLifecycle.STOPPED &&
-      records.length === 1 &&
-      !holdsRole && !isAdoptedCanonicalRuntime(this.db, sessionId);
-    if (!owned) {
+    // Ownership is proven and the session taken out of READY in one transaction, before anything is
+    // awaited: every bind, renewal and actor move admits only a READY session, so from here no path
+    // can make it a holder, and the stop below can never reach a session that won the role.
+    const reserved = this.db.txDecision<void>(() => {
+      const owned = session !== null &&
+        records.length === 1 &&
+        !holdsRole() && !isAdoptedCanonicalRuntime(this.db, sessionId);
+      if (!owned) return deny<void>(ReasonCode.CONFLICT, "this attempt has not proven it owns the session", { sessionId });
+      const moved = this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: stopping`);
+      return moved.allowed ? allow(ReasonCode.OK, undefined) : (moved as Decision<unknown> as Decision<void>);
+    });
+    if (!reserved.allowed || !session) {
       this.#recordSpawnCleanup(sessionId, runId, "REMAINING_OWNERSHIP_UNVERIFIED", reason);
       return;
     }
@@ -1758,7 +1768,7 @@ export class CtoLifecycle {
       this.sessions.transition(sessionId, SessionLifecycle.STOPPED, `${reason}: stopped`);
       this.#recordSpawnCleanup(sessionId, runId, "STOPPED", reason);
     } catch (error) {
-      this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);
+      // Already ERROR since the reservation; it stays so, recorded as a provider session still there.
       this.audit.record({
         kind: "CTO_UNUSED_SESSION_STOP_FAILED",
         reasonCode: ReasonCode.SESSION_STOP_FAILED,

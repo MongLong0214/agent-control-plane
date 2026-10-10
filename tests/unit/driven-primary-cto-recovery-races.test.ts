@@ -1,11 +1,11 @@
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { Role } from "../../src/domain/types.ts";
+import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { drivenPrimary, externalOf, holdNextAttestation } from "../helpers/driven-primary-cto.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { fixtureManifest } from "../helpers/harness.ts";
+import { fixtureManifest, registerFixtureProject } from "../helpers/harness.ts";
 
 /**
  * #246 PR-C C4-R2 — the races review 1 of the recovery slice found, kept as repository witnesses.
@@ -53,6 +53,53 @@ it("1084-R1-01: late recovery failure must retain the newer credential and attes
     expect((await late).allowed).toBe(false);
     expect.soft(cp.sessionRuntime.holds(binding.sessionId)).toBe(true);
     expect.soft(cp.sessionRuntime.turnEligibility(binding.sessionId, "work").allowed).toBe(true);
+  });
+});
+
+/**
+ * The review's reproduction let the concurrent winner relinquish and bind the cleanup target while
+ * its stop was pending, then expected cleanup not to stop it. Its harness calls the provider stop
+ * itself after that bind, so no product behaviour could make it pass; the fix it asked for is that
+ * the target cannot be adopted once its cleanup has proven ownership. So the same race is driven
+ * here, and what is asserted is that closure: the target is out of READY when its stop begins, the
+ * concurrent bind of it is refused, and no ACTIVE assignment is left on a stopped session.
+ */
+it("1084-R1-02: cleanup must exclude a session that becomes a holder while stop is pending", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const cp = f.harness.cp;
+    cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+    await registerFixtureProject(f.harness, "review-stop-race");
+    const bootstrap = await f.dispatchBootstrap();
+    const winner = cp.sessions.create({ provider: "scripted", model: "winner" });
+    cp.sessions.transition(winner.sessionId, SessionLifecycle.READY, "fixture");
+    let spawned = "";
+    const readiness = cp.doctor.sessionReadiness.bind(cp.doctor);
+    vi.spyOn(cp.doctor, "sessionReadiness").mockImplementationOnce(async (id) => {
+      spawned = id;
+      const bound = cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "review-stop-race", sessionId: winner.sessionId });
+      if (!bound.allowed) throw new Error(bound.message);
+      return readiness(id);
+    });
+    const roleKey = "PRIMARY_CTO:review-stop-race";
+    const stop = f.claude.stopSession.bind(f.claude);
+    let lifecycleAtStop: string | null = null;
+    let bindDuringStop: boolean | null = null;
+    vi.spyOn(f.claude, "stopSession").mockImplementationOnce(async (handle) => {
+      lifecycleAtStop = cp.sessions.require(spawned).lifecycle;
+      expect(cp.bindings.revoke(roleKey, "fixture concurrent winner relinquishes").allowed).toBe(true);
+      bindDuringStop = cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "review-stop-race", sessionId: spawned }).allowed;
+      await stop(handle);
+    });
+    expect((await cp.cto.ensureDrivenPrimaryCto("review-stop-race", bootstrap.runId)).allowed).toBe(false);
+    expect(lifecycleAtStop).not.toBe(SessionLifecycle.READY);
+    expect(bindDuringStop).toBe(false);
+    expect(cp.bindings.active(roleKey)).toBeNull();
+    expect(cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM assignments a JOIN sessions s ON s.session_id = a.session_id
+        WHERE a.status = 'ACTIVE' AND s.lifecycle = 'STOPPED'`,
+    )?.n).toBe(0);
+    // The winner was never stopped: the one stop that ran was the cleanup target's.
+    expect(f.claude.stopped).toEqual([externalOf(f, spawned)]);
   });
 });
 
