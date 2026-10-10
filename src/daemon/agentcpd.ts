@@ -64,11 +64,13 @@ import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import { BuzzBindChallenges, buzzBindContentOf } from "../buzz/buzz-bind-challenge.ts";
 import {
   BUZZ_MENTION_ADDRESSED_TO,
-  BuzzMentionBindingUnavailableError,
   nativeSubscriberScheduler,
   startBuzzMentionSubscriberFromStateDir,
   type BuzzMentionAdmission,
+  type BuzzMentionAdmissionReporter,
   type BuzzMentionAdmissionRequest,
+  type BuzzMentionDeliveryBinding,
+  type BuzzMentionIdentityJudgement,
   type BuzzMentionRegistry,
   type BuzzMentionSink,
   type BuzzMentionSubscriberHandle,
@@ -1367,6 +1369,83 @@ export const startDaemonBuzzMessageIngress = (
     roleConversation: listeners.ctoConversation,
   });
 
+/** The canonical session entries, when canonical activation is configured: one per CTO identity. */
+export interface BuzzMentionCanonicalEntries {
+  readonly sessions: readonly CanonicalAdoptableSession[];
+}
+
+/**
+ * One identity's admission, with the line `primaryCtoBindingFor` prints when it refuses.
+ *
+ * Every condition is read here, in one place, because neither half is enough alone: an ACTIVE
+ * PRIMARY_CTO assignment whose live runtime is not this READY session, and a READY session holding
+ * no such assignment, are both refused. When canonical activation names this identity, the
+ * binding's project must also be the one its entry names. The session's room is reported, and the
+ * subscriber requires it to be one of the rooms its identity listens in.
+ */
+const judgeBuzzMentionIdentity = (
+  cp: ControlPlane,
+  canonical: BuzzMentionCanonicalEntries | null,
+  pubkey: string,
+): { judgement: BuzzMentionIdentityJudgement; said: string; detail: Record<string, unknown> } => {
+  const refuse = (reason: string, said: string, detail: Record<string, unknown> = {}) => ({
+    judgement: { verdict: "EXCLUDED", reason } as const,
+    said,
+    detail,
+  });
+  const channelIdentity = pubkey.trim();
+  if (channelIdentity.length === 0) return refuse("CHANNEL_IDENTITY_EMPTY", "the channel identity is empty");
+  const session = cp.db.get<{ session_id: string; buzz_actor_id: string | null; buzz_address: string | null }>(
+    `SELECT session_id, buzz_actor_id, buzz_address FROM sessions
+      WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
+    [channelIdentity],
+  );
+  if (!session || session.buzz_actor_id === null) {
+    return refuse("NO_LIVE_SESSION", "no READY or DRAINING session carries this channel identity", {
+      sessionsWithThisActor: cp.db.all<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM sessions WHERE buzz_actor_id = ?`,
+        [channelIdentity],
+      )[0]?.n ?? 0,
+    });
+  }
+  const held = currentBindingsForRoles(cp, MENTIONABLE_ROLES).filter(
+    (binding) => binding.sessionId === session.session_id,
+  );
+  const only = held.length === 1 ? held[0] : undefined;
+  if (!only) {
+    return refuse("NO_SINGLE_MENTIONABLE_ROLE", "that session holds no single mentionable role", {
+      heldForSession: held.length,
+      roles: held.map((binding) => binding.role),
+      projects: cp.projects.list().length,
+    });
+  }
+  if (only.role !== Role.PRIMARY_CTO) {
+    return refuse("NOT_PRIMARY_CTO", "the one role that session holds is not PRIMARY_CTO", { role: only.role });
+  }
+  const entry = canonical?.sessions.find((one) => one.buzzActorId === channelIdentity);
+  if (entry && entry.projectId !== only.projectId) {
+    return refuse("PROJECT_MISMATCH", "the binding's project is not the one its canonical entry names");
+  }
+  // The stored column travels back with the answer rather than being assumed equal to the lookup
+  // key. `WHERE buzz_actor_id = ?` is SQLite's comparison, and the subscriber re-runs it in
+  // constant time before it will speak for the role.
+  return {
+    judgement: {
+      verdict: "ADMITTED",
+      binding: {
+        roleKey: only.roleKey,
+        buzzActorId: session.buzz_actor_id,
+        bindingGeneration: only.bindingGeneration,
+        sessionId: only.sessionId,
+        ...(only.projectId === null ? {} : { projectId: only.projectId }),
+        room: session.buzz_address,
+      },
+    },
+    said: "",
+    detail: {},
+  };
+};
+
 /**
  * The registry answer the relay subscriber preflights against (#760 Part C).
  *
@@ -1378,9 +1457,13 @@ export const startDaemonBuzzMessageIngress = (
  * connection, and an identity with a second role has no single thing to assert.
  *
  * So: a live session, exactly one mentionable binding, and that binding a `PRIMARY_CTO`. Anything
- * else is `null`, and `null` at startup is a subscriber that does not open.
+ * else is `null` (or, asked through `judgeIdentity`, an exclusion with its reason), and it excludes
+ * that identity alone: the subscriber's other identities are judged on their own answers.
  */
-export const buzzMentionSubscriberRegistry = (cp: ControlPlane): BuzzMentionRegistry => ({
+export const buzzMentionSubscriberRegistry = (
+  cp: ControlPlane,
+  canonical: BuzzMentionCanonicalEntries | null = null,
+): BuzzMentionRegistry => ({
   // Four ways to answer `null`, and until 2026-09-16 they were one silent `null` between them.
   //
   // Measured that day: the subscriber refused at every start with "identities[0] does not currently
@@ -1397,46 +1480,14 @@ export const buzzMentionSubscriberRegistry = (cp: ControlPlane): BuzzMentionRegi
   // read from the request, and the numbers are counts — a pubkey is public but this stays a
   // diagnostic about the deployment's own shape rather than an echo of its input.
   primaryCtoBindingFor: (pubkey) => {
-    const channelIdentity = pubkey.trim();
-    const refuse = (reason: string, detail: Record<string, unknown> = {}): null => {
-      process.stderr.write(
-        `Buzz mention binding lookup refused: ${reason} ${JSON.stringify(detail)}\n`,
-      );
-      return null;
-    };
-    if (channelIdentity.length === 0) return refuse("the channel identity is empty");
-    const session = cp.db.get<{ session_id: string; buzz_actor_id: string | null }>(
-      `SELECT session_id, buzz_actor_id FROM sessions
-        WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
-      [channelIdentity],
-    );
-    if (!session || session.buzz_actor_id === null) {
-      return refuse("no READY or DRAINING session carries this channel identity", {
-        sessionsWithThisActor: cp.db.all<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM sessions WHERE buzz_actor_id = ?`,
-          [channelIdentity],
-        )[0]?.n ?? 0,
-      });
-    }
-    const held = currentBindingsForRoles(cp, MENTIONABLE_ROLES).filter(
-      (binding) => binding.sessionId === session.session_id,
-    );
-    const only = held.length === 1 ? held[0] : undefined;
-    if (!only) {
-      return refuse("that session holds no single mentionable role", {
-        heldForSession: held.length,
-        roles: held.map((binding) => binding.role),
-        projects: cp.projects.list().length,
-      });
-    }
-    if (only.role !== Role.PRIMARY_CTO) {
-      return refuse("the one role that session holds is not PRIMARY_CTO", { role: only.role });
-    }
-    // The stored column travels back with the answer rather than being assumed equal to the
-    // lookup key. `WHERE buzz_actor_id = ?` is SQLite's comparison, and the subscriber re-runs
-    // it in constant time before it will speak for the role.
-    return { roleKey: only.roleKey, buzzActorId: session.buzz_actor_id };
+    const judged = judgeBuzzMentionIdentity(cp, canonical, pubkey);
+    if (judged.judgement.verdict === "ADMITTED") return judged.judgement.binding;
+    process.stderr.write(`Buzz mention binding lookup refused: ${judged.said} ${JSON.stringify(judged.detail)}\n`);
+    return null;
   },
+  // The same judgement with its reason code and without the line above: the subscriber asks it at
+  // startup, on every re-judgement and before every delivery, and writes the reason into health.
+  judgeIdentity: (pubkey) => judgeBuzzMentionIdentity(cp, canonical, pubkey).judgement,
   // #1044. Read when a frame arrives, before it queues: the CEO binding and this role's binding as
   // they stand at that moment. The seam compares it with the registry when the frame is processed.
   peerReceiptFor: (roleKey) => {
@@ -1636,6 +1687,10 @@ export const startDaemonBuzzMentionSubscriber = (
     scheduler?: BuzzSubscriberScheduler;
     /** The adopted CEO's pending Buzz binding challenges, shared with its tool socket. */
     bindChallenges?: BuzzBindChallenges;
+    /** The canonical session entries, so an identity's binding must be on its entry's project. */
+    canonical?: BuzzMentionCanonicalEntries | null;
+    /** Where admission changes are reported; the subscriber's own stderr line when absent. */
+    reportAdmission?: BuzzMentionAdmissionReporter;
   } = {},
 ): BuzzMentionSubscriberHandle => {
   const secret = policy.secret?.trim() ?? "";
@@ -1653,6 +1708,13 @@ export const startDaemonBuzzMentionSubscriber = (
             deny(ReasonCode.INVALID_ARGUMENT, "this daemon serves no Buzz binding challenge"),
         );
       }
+      // The subscriber judged this delivery against the binding it names, immediately before
+      // calling here. Read once more before the seam's first write: a re-claim or a session change
+      // committed in between makes this a retry, never a delivery on the strength of a binding that
+      // has moved. The retry asks the relay again and is judged against the binding that holds then.
+      if (request.binding !== undefined && buzzMentionBindingMoved(cp, request.roleKey, request.binding)) {
+        return "RETRY";
+      }
       const delivered = await deliverBuzzMessage(
         messageIngress.seam.ingress,
         messageIngress.seam.port,
@@ -1662,10 +1724,46 @@ export const startDaemonBuzzMentionSubscriber = (
     },
   };
   return startBuzzMentionSubscriberFromStateDir(stateDir, {
-    registry: buzzMentionSubscriberRegistry(cp),
+    registry: buzzMentionSubscriberRegistry(cp, options.canonical ?? null),
     sink,
     ...(options.openSocket ? { openSocket: options.openSocket } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
+    ...(options.reportAdmission ? { reportAdmission: options.reportAdmission } : {}),
+  });
+};
+
+/**
+ * Whether `roleKey`'s live binding is no longer the generation and serving session a delivery names.
+ * Exported so the sink's last check is a row a test can write without racing the subscriber.
+ */
+export const buzzMentionBindingMoved = (
+  cp: ControlPlane,
+  roleKey: string,
+  binding: BuzzMentionDeliveryBinding,
+): boolean => {
+  const current = cp.bindings.active(roleKey);
+  if (!current) return true;
+  if (binding.bindingGeneration !== null && current.bindingGeneration !== binding.bindingGeneration) return true;
+  return binding.sessionId !== null && current.sessionId !== binding.sessionId;
+};
+
+/**
+ * Re-judges the mention subscriber's identities after every committed binding switch: a bind, a
+ * re-claim, a session change and a revoke all publish one (`BindingRegistry.onSwitch`). Off the
+ * committing call stack, and against whichever subscriber is running when it fires, so a switch
+ * before the subscriber starts or after it closes does nothing.
+ *
+ * The subscriber's own judgement timer covers what no switch announces — a session taking its
+ * channel identity, or its room, after its binding — on the reconnect schedule.
+ */
+export const rejudgeBuzzMentionSubscriberOnBindingSwitch = (
+  cp: ControlPlane,
+  running: () => Pick<BuzzMentionSubscriberHandle, "rejudge"> | null,
+): void => {
+  cp.bindings.onSwitch(() => {
+    setImmediate(() => {
+      running()?.rejudge();
+    });
   });
 };
 
@@ -1716,24 +1814,6 @@ export const startDaemonOwnerReplyConsumer = (
       consumer.close();
     },
   };
-};
-
-/** Like Telegram's refusal path: a missing prerequisite disables only this ingress. */
-const startDaemonBuzzMentionSubscriberOrRefuse = (
-  ...args: Parameters<typeof startDaemonBuzzMentionSubscriber>
-): BuzzMentionSubscriberHandle | null => {
-  try {
-    return startDaemonBuzzMentionSubscriber(...args);
-  } catch (error) {
-    if (!(error instanceof BuzzMentionBindingUnavailableError)) throw error;
-    // Dead-binding recovery deliberately leaves the role unbound. Keep the claim door
-    // available, while preserving the subscriber's all-or-none preflight and delivery checks.
-    process.stderr.write(
-      `Buzz mention subscriber refused: ${error.message}; continuing without Buzz mention subscriber. ` +
-        "After a fresh role claim, restart the daemon to enable mentions.\n",
-    );
-    return null;
-  }
 };
 
 /**
@@ -4720,22 +4800,33 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         // beside the daemon's other state this opens nothing and reports zero sockets, which is
         // every deployment until an operator writes that file. A malformed one is a startup
         // error rather than a quiet zero, because an operator who wrote the file meant it.
-        // An unbound role instead warns and skips the subscriber until the next daemon start.
-        buzzMentionSubscriber = startDaemonBuzzMentionSubscriberOrRefuse(
-          cp,
-          stateDir,
-          buzzActorIngressPolicy,
-          buzzMessageIngress,
-          buzzBindChallenges === undefined ? {} : { bindChallenges: buzzBindChallenges },
-        );
+        //
+        // An identity without a live binding no longer refuses the subscriber: it is excluded,
+        // reported, and re-judged on every binding switch and on the subscriber's own schedule,
+        // while every other identity subscribes. One paused CTO used to silence all of them.
+        buzzMentionSubscriber = startDaemonBuzzMentionSubscriber(cp, stateDir, buzzActorIngressPolicy, buzzMessageIngress, {
+          ...(buzzBindChallenges === undefined ? {} : { bindChallenges: buzzBindChallenges }),
+          canonical: canonicalSessions === null ? null : { sessions: canonicalSessions },
+        });
+        rejudgeBuzzMentionSubscriberOnBindingSwitch(cp, () => buzzMentionSubscriber);
         process.stdout.write(
-          `Buzz mention subscriber configured identities: ${buzzMentionSubscriber?.socketCount ?? 0}\n`,
+          `Buzz mention subscriber configured identities: ${buzzMentionSubscriber.socketCount}\n`,
         );
+        // The configured count above is not continuity. This line is: how many of them are
+        // delivering, and the one word that says whether that is all of them.
+        if (buzzMentionSubscriber.socketCount > 0) {
+          const admission = buzzMentionSubscriber.admission();
+          process.stdout.write(
+            `Buzz mention subscriber admitted identities: ${admission.admittedIdentities} of ` +
+              `${admission.configuredIdentities} (${admission.continuity})\n`,
+          );
+        }
         // Hand `doctor` the counters, not this number. The line above is what the subscriber was
         // *configured* to be and is printed once; `doctor` needs what it has actually received,
         // and that is the only thing that can tell "connected and silent" from "receiving and
         // refusing" (#674, #841). Only when a subscriber exists: a deployment without one has
-        // nothing to be silent about.
+        // nothing to be silent about. The counters carry `admission` beside them, so health.json
+        // shows a PARTIAL subscriber and each excluded identity's reason, read when it is written.
         // Captured into a const: `buzzMentionSubscriber` is a `let` the startup path reassigns,
         // and a closure over it would read whatever it holds when `doctor` runs rather than the
         // subscriber this block is about — which is also why TypeScript refuses to narrow it here.

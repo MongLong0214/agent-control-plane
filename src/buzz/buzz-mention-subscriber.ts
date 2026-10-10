@@ -815,8 +815,8 @@ export const nativeRelaySocketFactory: BuzzRelaySocketFactory = (url, handlers) 
 /**
  * `process.stderr`, which is what the daemon already reports an unbound role on.
  *
- * The same subject reaches an operator by the same route whether it was refused at startup
- * (`BuzzMentionBindingUnavailableError`, reported by `agentcpd`) or went away afterwards, and
+ * The same subject reaches an operator by the same route whether its identity was excluded by
+ * judgement (`nativeAdmissionReporter`) or its binding went away under a live connection, and
  * launchd captures that stream for both. A queryable `daemon.status` field was the alternative
  * and is not this change: it would make the subscriber a second authority on its own health,
  * reachable only by someone who already suspected something, and the defect was that nobody did.
@@ -2146,13 +2146,6 @@ export interface BuzzMentionSubscriberOptions {
   readonly reportRoleNotHeld?: BuzzMentionRoleNotHeldReporter;
   /** Defaulted for the same reason: an excluded identity the operator is not told of is a silent one. */
   readonly reportAdmission?: BuzzMentionAdmissionReporter;
-}
-
-/** A role between holders refuses subscription without making daemon startup fatal. */
-export class BuzzMentionBindingUnavailableError extends Error {
-  constructor(identity: string) {
-    super(`${identity} does not currently hold a live PRIMARY_CTO binding`);
-  }
 }
 
 /**

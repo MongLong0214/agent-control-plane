@@ -611,7 +611,8 @@ describe("a claim or a correction that reaches the daemon before its rooms are c
   it.each([
     ["no buzz-nostr-subscriber.json is configured", { subscriber: "absent" } as const, "Buzz mention subscriber configured identities: 0"],
     ["no buzz owner identity is declared", { buzzOwner: false }, "Buzz message ingress not started"],
-    ["the subscriber identity holds no live role", { subscriber: "unbound" } as const, "Buzz mention subscriber configured identities: 0"],
+    // Excluded rather than refused: the subscriber runs with this identity left out, and listens as nobody.
+    ["the subscriber identity holds no live role", { subscriber: "unbound" } as const, "Buzz mention subscriber admitted identities: 0 of 1 (NONE)"],
   ])("releases the claim and the correction when %s", async (_label, shape, line) => {
     // The subscriber identity listens in DEFAULT_ROOM alone, which would refuse ITS_ROOM if it ran.
     const { config, pubkey, printed, buzzCalls } = deployment([DEFAULT_ROOM], { canonical: true, ...shape });
