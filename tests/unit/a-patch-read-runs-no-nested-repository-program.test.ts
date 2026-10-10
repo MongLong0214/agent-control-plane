@@ -123,7 +123,7 @@ describe("#1082 R1-01: a candidate read runs no nested repository's program", ()
     expect(executions(counter), "nested-configuration program executions").toBe(0);
   });
 
-  it("RF-S22 arm:validator #1082 R1-01: every snapshot, verification, freshness and doctor read runs zero nested-configuration programs", async () => {
+  it("RF-S22 arm:validator #1082 R1-01: every snapshot, verification, freshness, doctor and blind-review read runs zero nested-configuration programs", async () => {
     const harness = makeHarness();
     const repo = harness.repoPath, nested = join(repo, "vendor/nested");
     const marker = tempDir("nested-sweep-"), counter = join(marker, "executions"), program = join(marker, "program.sh");
@@ -182,6 +182,19 @@ describe("#1082 R1-01: a candidate read runs no nested repository's program", ()
     reads.doctor = (await harness.cp.doctor.run("system")).findings
       .filter((finding) => finding.scope === "repository:local:nested-sweep")
       .map((finding) => finding.code);
+    // Blind review: the reviewer's diff of the frozen candidate, checked against the freeze digest.
+    const reviewDiffs = await (harness.cp.review as unknown as {
+      collectDiffs: (snapshot: unknown) => Promise<{ allowed: boolean; value?: { diffs: Array<{ diff: string }> } }>;
+    }).collectDiffs({
+      repositories: [{
+        identity: "local:nested-sweep",
+        baseHead: base,
+        candidateHead: head,
+        diffDigest: reads.diffDigest,
+        touchedPaths: reads.changedPaths,
+      }],
+    });
+    reads.review = reviewDiffs.allowed ? reviewDiffs.value!.diffs.map((entry) => entry.diff.includes("Subproject commit")) : reviewDiffs;
     // Verification: both checkout kinds, prepared from the source and torn down again.
     const manager = new WorktreeManager(tempDir("nested-sweep-worktrees-"));
     for (const [id, selfContained] of [["linked", false], ["own", true]] as const) {
@@ -195,6 +208,7 @@ describe("#1082 R1-01: a candidate read runs no nested repository's program", ()
     expect(executions(hookCounter), "nested hook executions").toBe(0);
     // The reads answered, rather than counting zero by failing first.
     expect(reads.changedPaths).toEqual(["vendor/nested"]);
+    expect(reads.review, "the reviewer reads the frozen patch, a gitlink line").toEqual([true]);
     expect(reads.isClean).toBe(true);
     expect(reads.linked).toBe(false);
     expect(reads.own).toBe(false);

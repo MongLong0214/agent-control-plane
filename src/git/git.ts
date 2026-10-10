@@ -401,18 +401,17 @@ export const mergeBase = async (cwd: string, a: string, b: string): Promise<stri
  */
 const PATCH_WITHOUT_PROGRAMS = ["--no-ext-diff", "--no-textconv", "--submodule=short"] as const;
 
+/**
+ * The exact patch between two commits: the bytes the freeze digests and the blind reviewer reads,
+ * so what is reviewed is what was frozen.
+ */
+export const diffPatch = async (cwd: string, base: string, head: string): Promise<string> =>
+  (await git(cwd, ["diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", "--binary", `${base}..${head}`]))
+    .stdout;
+
 /** Stable digest of the exact patch between two commits. */
-export const diffDigest = async (cwd: string, base: string, head: string): Promise<string> => {
-  const out = await git(cwd, [
-    "diff",
-    "--no-color",
-    ...PATCH_WITHOUT_PROGRAMS,
-    "--full-index",
-    "--binary",
-    `${base}..${head}`,
-  ]);
-  return sha256(out.stdout);
-};
+export const diffDigest = async (cwd: string, base: string, head: string): Promise<string> =>
+  sha256(await diffPatch(cwd, base, head));
 
 export const diffText = async (cwd: string, base: string, head: string): Promise<string> =>
   (await git(cwd, ["diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", `${base}..${head}`]))

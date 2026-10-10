@@ -27,7 +27,7 @@ import {
   SessionLifecycle,
   roleKeyFor,
 } from "../domain/types.ts";
-import { diffDigest, git } from "../git/git.ts";
+import { diffPatch } from "../git/git.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
@@ -797,16 +797,13 @@ export class BlindReviewGate {
         );
       }
 
-      const diff = (await git(record.checkoutPath, [
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--full-index",
-        "--binary",
-        `${repo.baseHead}..${repo.candidateHead}`,
-      ])).stdout;
-      // The diff must be the one the frozen candidate describes.
-      const observedDigest = await diffDigest(record.checkoutPath, repo.baseHead, repo.candidateHead);
+      // The patch the freeze digested, read the same way (#1082 R1-01): no external diff, no textconv,
+      // and a moved gitlink as one `Subproject commit` line. This read used to pass `--no-ext-diff`
+      // alone, so a candidate's `diff=<driver>` textconv and, under `diff.submodule=diff`, a populated
+      // nested repository's own textconv and external diff ran while the reviewer's diff was built.
+      const diff = await diffPatch(record.checkoutPath, repo.baseHead, repo.candidateHead);
+      // The diff must be the one the frozen candidate describes, and these are the bytes reviewed.
+      const observedDigest = sha256(diff);
       if (observedDigest !== repo.diffDigest) {
         return deny(ReasonCode.EVIDENCE_STALE, "diff no longer matches the frozen candidate", {
           identity: repo.identity,
