@@ -1,0 +1,188 @@
+Limit: configuration errors (a key path named twice, one key file under two names, two entries deriving one identity, a key file that cannot be opened safely) still refuse the whole start; only binding admission is per identity
+Limit: no duplicate execution across an exclusion rests on the admission seam's replay refusal; the subscriber keeps no seen-set and its window lives in memory, so a daemon restart asks from the beginning as before
+Limit: a mention signed while its identity was excluded and before the re-claimed binding was created is refused by the seam as preceding that binding; the preserved window asks for it again and the seam still refuses it
+Limit: a connection whose binding goes away between judgements keeps the existing role-not-held reconnect loop and consumes nothing; only a judgement takes its socket away
+Ruled-out: keeping the all-or-none refusal and restarting the daemon after a fresh claim | one paused CTO then silences every other CTO's mention wake until a restart
+Ruled-out: a seen-set or cursor file per identity in the subscriber | replay refusal already has one authority, the admission seam, and a second answer would disagree after a restore or a restart
+Ruled-out: closing the socket on a single role-not-held answer instead of reconnecting | a registry mid-settle answers that once, and a closed socket would wait for the next judgement instead of the next event
+Warn: identityRooms now lists only identities the subscriber listens as, so a claim for an excluded identity is not checked against its rooms; the admission rule checks the room again when it is re-admitted
+Warn: roleKeys is read when asked and changes as identities are admitted or excluded
+Unverified: no live relay or live daemon was run; the witnesses use an in-process relay that stores events and a sink modelling the seam's replay refusal
+Record-Id: r-mentionperidentity
+Provenance: inherited 1ac845a4709326574312a5a47a2a1c822b3d633f
+
+Limit: BUZZ_MENTION_SUBSCRIBER_SILENT still reads configuredIdentities and framesHandled only, so a subscriber with every identity excluded can raise it after the grace period; health.json's buzzMention.admission says why
+Limit: the room an admitted identity's session answers in must be one of that identity's rooms, so a holder whose buzz_address is stale is excluded until the reattach correction moves it and the judgement timer asks again
+Limit: the startup room cross-check and the claim's room check see only identities the subscriber listens as; an excluded identity's room is checked by the admission rule when it is judged admissible again
+Ruled-out: re-judging inside startDaemonBuzzMentionSubscriber on every binding switch | every composition that starts the subscriber directly would then drop a revoked identity's socket on the switch event, changing the reconnect behaviour those callers measure; main() wires it once instead
+Ruled-out: checking the canonical entry's room in the registry against sessions.buzz_address | a holder whose row still names the old room would be excluded before startup's room cross-check, so a misconfigured identity would start instead of refusing the start
+Warn: rejudgeBuzzMentionSubscriberOnBindingSwitch registers a BindingRegistry.onSwitch listener with no unsubscribe; it is called once per main() and reads the running subscriber when it fires
+Unverified: no live relay or live daemon was run; the daemon witnesses use the in-process storing relay over a real control plane, sink and admission seam
+Record-Id: r-mentionperidentitywire
+Follows: r-mentionperidentity
+Provenance: inherited d51d094e34ed773b724ece2b437985daa1d25ebc
+
+Limit: the record is volatile and holds the newest 64 events per identity; after a restart, or for an evicted event, the seam is asked once more and the record is rebuilt
+Limit: the relay still hands the boundary event back on each reconnect while it is the newest in the window, because the window is inclusive; it is recognised and dropped without reaching the seam
+Ruled-out: an audit row per precedes-binding refusal | a first subscription can be handed a room's whole history, which is why the floor writes nothing, and the delivery seam is not widened
+Ruled-out: moving the window one second past a refused event | another event signed in the same second would never be asked for
+Warn: the record is keyed by event id and role and is not a replay authority: nothing admitted is recorded, and an identity re-pinned to another role's binding asks the seam about the event again
+Unverified: no live relay or live daemon was run; the witness drives the daemon's composition over a real control plane and seam with the in-process storing relay
+Record-Id: r-mentionfloorrecord
+Follows: r-mentionperidentitywire
+Provenance: inherited 8ce10fc7f03dabcb85b3e28f9af00a72877ad027
+
+Limit: r-mentionperidentitywire's Limit that the startup room cross-check and the claim's room check see only identities the subscriber listens as was true when written and is false after this commit: identityRooms lists every configured identity
+Limit: an identity whose configuration routes it to a room it does not subscribe in now refuses the whole start while it is excluded too, as it did while admitted
+Limit: the periodic re-judgement rides main()'s existing health tick, which runs only when no waitForShutdown hook is given, so the startup tests that drive main() do not exercise it
+Limit: a single failed delivery judgement is not reported; the exclusion is reported when the judgement timer finds it again, and a race the next judgement answers is never reported
+Ruled-out: a separate periodic judgement timer per admitted identity | it would add a polling loop beside the existing health tick and a timer every stepped-clock reconnect test would have to account for
+Ruled-out: admitting a session with no recorded room as unchecked | a session that cannot be shown to answer where its mentions arrive is unverifiable, and absence passed where a wrong room was refused
+Warn: identityRooms is a room restriction for the paths that write a room; filtering it by admission turns a configured restriction into permission
+Unverified: no live relay or live daemon was run; the witnesses drive the daemon's composition over a real control plane, sink and seam with the in-process storing relay
+Record-Id: r-mention1080n1
+Follows: r-mentionfloorrecord
+Provenance: inherited 0f70427a0594caa761568a118d1e17ad7dadd34c
+
+Limit: the check and the frame write run in one synchronous section, so no task can change the binding between them; a revoke committed after the frame is handed to the socket is not recalled, and that wake is the last one the old holder receives
+Limit: a superseded registration's late wake is no longer written to the endpoint the holder stopped naming; the late-wake row that expected that frame now expects none
+Ruled-out: a stale-frame refusal on the receiving side | the frame is a constant token that carries no sender, event or generation, so a receiver has nothing to compare, and the write-time check closes the window without it
+Warn: any check added before the connect belongs in the write-time check too; a check that runs only before the connect is a check on a holder that may already be gone
+Unverified: no real provider wake was run; the witness holds only the wake connection's completion and runs the daemon's subscriber, sink, admission seam, binding registry and role port
+Record-Id: r-wakeholderatwrite
+Follows: r-mention1080n1
+Provenance: inherited 20c6194e3b8ba9826a1b13be27d29a362ad37146
+
+Limit: a CEO mention from another project's room is now refused by the subscriber, before the seam's own BUZZ_PEER_CHANNEL_MISMATCH rule can see it; that rule stays behind the subscriber for envelopes from the local socket
+Limit: an identity configured in several rooms is delivered mentions only from the one its session's row names, not from its other rooms
+Ruled-out: checking the room only against the identity's configured rooms | an identity may listen in several rooms while its CTO answers in one, so a configured room is not the canonical room
+Warn: the room is compared with the binding judged immediately before delivery; a check against a pinned room would miss a reattach correction that moved the session's room
+Unverified: no live relay was run; the witness hands frames straight to the subscriber's connection, past any relay filter
+Record-Id: r-mentionroomtag
+Follows: r-wakeholderatwrite
+Provenance: inherited fd3a70a23deecec7950ee267594fa54f8ad91430
+
+Limit: replyToEventId is always null; storing an event's reply or thread tag would need a change to the admission seam's envelope, which this commit does not make
+Limit: the sender is the inbound row's actor column, which admission writes from the authenticated envelope; unlike the payload it carries no update trigger and is not inside the payload digest the claim checks
+Ruled-out: reading room, sender or reply from the message text or the event's tags | both are written by the sender, so either would let a mention name a room, a sender or a thread it does not have
+Warn: provenance is information for the holder and grants nothing; an approval, an owner gate or a reply still has to come through its own authenticated path
+Unverified: the witnesses claim through RoleConversationPort.claimOwnerMessage, the function the MCP tool calls, not over a JSON-RPC connection
+Record-Id: r-claimprovenance
+Follows: r-mentionroomtag
+Provenance: inherited b19204a0ed27fb7a63984494e50485c5fa5eb11f
+
+Limit: r-claimprovenance's Limit that the sender is the inbound row's actor column was true when written and is false after this commit: senderKey is null and the actor is reported only as storedActorUnverified
+Limit: a verified sender needs the signer key inside the digest-covered stored payload, which is a change to the admission seam's storage format and is not made here
+Limit: claim provenance is not a full pass: the sender is unknown, thread attribution is unknown, and nothing here protects any field against a raw database edit
+Ruled-out: keeping the stored actor as senderKey | a value no digest covers reads as verified provenance, and a raw edit of the column showed as the sender
+Warn: storedActorUnverified must never be read as who signed the message
+Record-Id: r-claimprovenance2
+Follows: r-claimprovenance
+Provenance: inherited d2557021717c89817cc3bedcfe53bcb01e6fcc64
+
+Limit: r-wakeholderatwrite's Limit that one synchronous section leaves no way to change the binding between the check and the write held for this process only; a writer outside it could, and this commit closes that with the write transaction
+Limit: the database transaction and the socket's delivery are not atomic; a revoke committed after the handoff, or a frame that arrives late, still reaches the old holder's endpoint, so the claim is only that the re-check to handoff race is closed, not that no wake follows a revoke
+Limit: a writer that bypasses SQLite's own locking is outside what any transaction can order
+Ruled-out: r-wakeholderatwrite's reason for no receiving-side check, that the frame carries no generation | the receiving side is covered because every action a wake can lead to goes through the session's authenticated connection, which re-checks the holder; a holder revoked after its wake landed is refused ROLE_PEER_STALE on claim and the message stays pending
+Warn: the hook runs in the connect callback; it must stay non-blocking, with no connection wait, drain or acknowledgement inside the transaction
+Unverified: no real provider wake was run; the witness holds the wake connection's completion and races a separate SQLite connection against the production port
+Record-Id: r-wakeserialized
+Follows: r-claimprovenance2
+Provenance: inherited 5ac857a36041296a0ca4b3374702bb808e62c7bb
+
+Limit: a wake is contentless and shared by every message kind, so the room checked is the room the holder's session answers in at the start and at the handoff, not the room of the particular mention that caused it
+Limit: an in-band dispatch to a CTO whose mention identity is excluded is not woken either; its message stays queued for the holder's next registration or claim
+Limit: the transaction and the socket's delivery are not atomic, so a room change or exclusion committed after the handoff still finds the frame on its way
+Ruled-out: carrying the mention's own room through the admission seam's wakeRole call | the seam's port carries no context and is outside this change; the holder's current room and eligibility are read where the handoff is made instead
+Warn: useWakeEligibility must be installed on the daemon-built CTO port; without it the wake checks the holder and not the identity or room
+Unverified: main()'s installation line is not exercised by a test that drives main(); the witnesses install the same helper on the daemon-built port
+Record-Id: r-wakeeligibility
+Follows: r-wakeserialized
+Provenance: inherited 6c6885f695c981d7ca41018e55f828ddf5f7f15e
+
+Limit: r-wakeholderatwrite's Ruled-out reason that the message stays pending, and the late-claim witness that said it stayed for the next holder, were overstatements: an ordinary revoke settles the message REJECTED by the existing fence; only a raw revoke leaves it PENDING
+Limit: the guarantee is that at the final check no new wake frame is handed off to a holder that is no longer valid, and that after a revoke a stale holder's claim and work authority are refused; a frame handed off before a revoke, or one that arrives late, still reaches the old endpoint
+Warn: a wake frame reaching an endpoint is not a delivery; the message reaches a holder only through its authenticated claim
+Record-Id: r-latewakestatus
+Follows: r-wakeeligibility
+Provenance: inherited baa86d2c29718179f31476b759aa46cb0c9d1892
+
+Limit: r-wakeeligibility's Unverified that main()'s installation line is not exercised was superseded: the installation is now part of the daemon-built port, which the witnesses use directly
+Limit: the subscriber is found through a per-control-plane map that the latest start overwrites; two subscribers started over one control plane would gate wakes by the second
+Warn: a composition that builds its own RoleConversationPort rather than the daemon's does not get this gate
+Record-Id: r-wakeeligibilityinstall
+Follows: r-latewakestatus
+Provenance: inherited 82de50ab48bd0e5cafdc2804c42d544364fd2b42
+
+Limit: r-wakeeligibility's Limit that an in-band dispatch to a CTO whose mention identity is excluded is not woken was true at 6c6885f6 and is false after this commit: only a mention's wake is gated
+Limit: r-wakeeligibility's Limit that the room checked is the holder's current room and not the mention's own is superseded: the gate compares the holder's judged room with the room the mention arrived in
+Limit: a mention's wake now goes to the role port directly rather than through wakeRoleHolder; the subscriber admits only PRIMARY_CTO bindings, which wakeRoleHolder wakes through the same port
+Ruled-out: carrying the mention context through AsyncLocalStorage | a context lost across an await is indistinguishable from a non-mention wake, which would let a mention fall through to an ordinary wake
+Ruled-out: resolving an unmatched holder through a subscription's retained role pin | a former identity's pin is not evidence that it stands behind a different current actor
+Warn: only the subscriber's sink may build a MentionWakeContext; a caller that supplies one decides nothing, because the gate re-judges the holder's own identity and room
+Unverified: no real provider wake was run; the witnesses hold the wake connection's completion on the daemon-built port
+Record-Id: r-wakescope
+Follows: r-wakeeligibilityinstall
+Provenance: inherited 061d8ee1ebb33572d92fc0a3a99222145b47e2d6
+
+Limit: r-wakescope's Limit that a mention's wake goes to the role port directly rather than through wakeRoleHolder was true at 061d8ee1 and is false after this commit
+Limit: a driven holder's mention wake goes to its session runtime, which re-checks the binding before each provider call but does not apply the mention gate's identity and room check
+Warn: the mention context reaches only the conversation port's wake; a new branch in wakeRoleHolder that wakes some other way does not carry it
+Unverified: the witnesses stub the session runtime's driven-mode answers rather than spawning a driven holder
+Record-Id: r-mentionwakerouting
+Follows: r-wakescope
+Provenance: inherited 1c3e8fc990a380eb2df0502f53b952923b5b82ca
+
+Limit: r-mentionwakerouting's Limit that a driven holder's mention wake skips the mention gate was true at 1c3e8fc9 and is false after this commit
+Limit: a turn that serves a mention trigger and an ordinary trigger together runs for the ordinary one, and its holder may then claim the mention's message through the claim tool, as an interactive holder woken by ordinary work may
+Limit: the gate is asked before the provider call; a change committed after that call starts reaches a turn already running
+Warn: an await added between this check and runSessionTurn needs the check moved after it, as r-37bbca666019 says of turnEligibility
+Unverified: no real provider ran; the witness drives a real driven PRIMARY_CTO through the production bootstrap, attestation, credential and socket paths with a provider double
+Record-Id: r-drivenmentiongate
+Follows: r-mentionwakerouting
+Provenance: inherited a6b60c054f7442937ba528f41a92156a8e464205
+
+Limit: a mention-originated owner message carried to a takeover's successor is withheld until the successor's session carries the mention's channel identity; two existing takeover rows now assert that and then the hand-over
+Limit: the gate applies only while a mention subscriber runs over the control plane and configures the mention's identity; with neither, the claim is as it was
+Limit: r-drivenmentiongate's Limit that a mixed turn's holder may claim the mention's message is false after this commit for messages whose mention names a configured identity
+Ruled-out: deciding the gate from the claim's input or the stored actor column | neither is covered by the digest the message was enqueued for
+Warn: buzzMentionClaimHolds runs inside claimForHolder's admits predicate, which must only read
+Unverified: no real provider ran; the driven rows use a real driven PRIMARY_CTO with a provider double, and the interactive rows claim through RoleConversationPort.claimOwnerMessage
+Record-Id: r-mentionclaimgate
+Follows: r-drivenmentiongate
+Provenance: inherited e526a4d592def2ad08fdf572e7333387c3e494c7
+
+Limit: r-mentionclaimgate's statement that a mention trigger whose gate does not hold at the final check is released covered the check before the call only; this commit extends release to a claim refused or not made during the call
+Limit: a released owner-message trigger has a random id and nothing re-wakes it by itself; its message stays PENDING for the holder's next claim, which the claim-time gate governs
+Ruled-out: deciding handled from the gate's answer before the provider call | eligibility can change during the call, and the claim is where the message is actually taken or refused
+Warn: served reads the outbox row by its source nonce; a change to how an owner message points at its source has to keep that lookup
+Unverified: no real provider ran; the witnesses use a real driven PRIMARY_CTO with a provider double
+Record-Id: r-mentionhandledbyoutcome
+Follows: r-mentionclaimgate
+Provenance: inherited e07360be7c7b91b4694d1ff923f0e0babad1239d
+
+Limit: r-mentionhandledbyoutcome's Warn that served reads the outbox row by its source nonce was true at e07360be and is false after this commit: served reads the event's own departure record through Outbox.sourceEventSpent
+Limit: a departure entry's INSERT needs no authority, so a raw-SQL write of one for an event makes its mention trigger served and its message unclaimable; under the owner-local threat model that write is a Limit, and it fails toward fewer provider turns, never more
+Ruled-out: reading served from the OWNER_MESSAGE row found by its payload sourceNonce and that row's current status | a CEO's mention is a PEER_MESSAGE the kind filter never found, so its real claim released the trigger and a re-wake ran another provider call; and a row's pointer and status are writable, while the departure record is append-only and keyed by the event
+Warn: served is true for any spent event, a fence's REJECTED or EXPIRED included; a new path that moves a holder-claimed row out of PENDING, or writes a turn's terminal fact, without a claim or a settlement would mark a mention served without its work being taken up. The generic ACK routes refuse holder-claimed kinds today, and that refusal is what keeps an ordinary ACK from spending a mention
+Unverified: no real provider ran; the witnesses use a real driven PRIMARY_CTO with a provider double
+Record-Id: r-mentionservedbyevent
+Follows: r-mentionhandledbyoutcome
+Provenance: inherited 98109689f1f02f60ab914cd1fb72a166ec497bf1
+
+Limit: admission only: a mention trigger coalesced behind a running turn that then claims its event still gets its follow-up turn, because that turn's final check asks stillAdmissible and not served
+Limit: r-mentionhandledbyoutcome's Limit that a released owner-message trigger has a random id and nothing re-wakes it by itself still holds; this commit only refuses a re-wake of it once some turn has spent its event
+Ruled-out: keeping admission to the lane's own claimed, handled and settled checks | a mention released mid-call and then claimed by an ordinary turn was never marked handled by any turn, so a wake naming its trigger started another provider turn
+Warn: only a trigger that carries served is judged by it at admission; ordinary triggers keep exactly the claimed, handled and settled checks, so giving served to another trigger kind makes that kind's admission depend on its callback
+Unverified: no real provider ran; the witnesses use a real driven PRIMARY_CTO with a provider double
+Record-Id: r-mentionadmissionserved
+Follows: r-mentionservedbyevent
+Provenance: inherited 6db0cb0937eb07f76dce9688a508450b7964c3e5
+
+Limit: r-mentionadmissionserved's Limit that a mention trigger coalesced behind a running turn that then claims its event still gets its follow-up turn was true at 6db0cb09 and is false after this commit: the follow-up's final check drops every trigger whose served answers true and marks it handled, and a follow-up left with no trigger is refused with no provider call
+Warn: the final check now returns the gate's own refusal: SESSION_TURN_DUPLICATE when every trigger was already served, ROLE_PEER_STALE when a mention's gate failed and nothing else remains; a SESSION_TURN_REFUSED audit carrying SESSION_TURN_DUPLICATE is a dropped duplicate, not a failed turn
+Warn: served is asked before stillAdmissible at the final check, so a served mention is handled even when its gate no longer holds; a mention that is not served and whose gate fails is still released, and ordinary triggers carry no served and are judged exactly as before
+Unverified: no real provider ran; the witness uses a real driven PRIMARY_CTO with a provider double
+Record-Id: r-mentionfollowupserved
+Follows: r-mentionadmissionserved
+Provenance: inherited 758bbd06c5d0fa756ba1953b62d2a0696495e857
