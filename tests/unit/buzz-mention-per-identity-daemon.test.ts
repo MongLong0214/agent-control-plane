@@ -7,6 +7,7 @@ import type { BuzzMentionEvent } from "../../src/buzz/buzz-mention-subscriber.ts
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   buzzMentionBindingMoved,
+  buzzMentionSubscriberRegistry,
   rejudgeBuzzMentionSubscriberOnBindingSwitch,
   startBuzzMessageIngressListener,
   startDaemonBuzzMentionSubscriber,
@@ -251,6 +252,41 @@ describe("re-judgement through the binding registry's own switch events", () => 
 
       expect(f.h.cp.bindings.revoke(roleKey, "test revoke").allowed).toBe(true);
       expect(buzzMentionBindingMoved(f.h.cp, roleKey, { bindingGeneration: judged.bindingGeneration + 1, sessionId: next })).toBe(true);
+    } finally {
+      await f.close();
+    }
+  });
+});
+
+describe("the registry's judgement of one identity", () => {
+  it("names each reason it excludes for, and requires a canonical identity's binding on its entry's project", async () => {
+    const f = await start({ logicBound: true });
+    try {
+      const key = f.keys.repoFactory.pubkey;
+      const entry = { sessionUuid: "11111111-1111-4111-8111-111111111111", buzzActorId: key };
+      const onItsProject = buzzMentionSubscriberRegistry(f.h.cp, { sessions: [{ ...entry, projectId: PROJECT.repoFactory }] });
+      const onAnother = buzzMentionSubscriberRegistry(f.h.cp, { sessions: [{ ...entry, projectId: PROJECT.commitlore }] });
+
+      expect(onItsProject.judgeIdentity!(key)).toEqual({
+        verdict: "ADMITTED",
+        binding: {
+          roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: PROJECT.repoFactory }),
+          buzzActorId: key,
+          bindingGeneration: f.h.cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId: PROJECT.repoFactory }))!.bindingGeneration,
+          sessionId: f.sessions.repoFactory,
+          projectId: PROJECT.repoFactory,
+          room: ROOM.repoFactory,
+        },
+      });
+      expect(onAnother.judgeIdentity!(key)).toEqual({ verdict: "EXCLUDED", reason: "PROJECT_MISMATCH" });
+
+      // Paused by stopping its session: the ACTIVE assignment alone is not enough.
+      expect(f.h.cp.sessions.transition(f.sessions.repoFactory, SessionLifecycle.STOPPED, "paused").reasonCode).toBe(ReasonCode.OK);
+      expect(onItsProject.judgeIdentity!(key)).toEqual({ verdict: "EXCLUDED", reason: "NO_LIVE_SESSION" });
+      // And a READY session whose binding was revoked: the READY row alone is not enough.
+      const commitloreKey = f.keys.commitlore.pubkey;
+      expect(f.h.cp.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId: PROJECT.commitlore }), "test").allowed).toBe(true);
+      expect(onItsProject.judgeIdentity!(commitloreKey)).toEqual({ verdict: "EXCLUDED", reason: "NO_SINGLE_MENTIONABLE_ROLE" });
     } finally {
       await f.close();
     }

@@ -153,6 +153,29 @@ describe("with the Logic identity excluded for want of a live binding", () => {
     }
   });
 
+  it("admits Logic on the judgement timer when its binding returns with no switch to announce it", async () => {
+    const d = deploy(["repoFactory", "commitlore"]);
+    try {
+      await d.relay.drain(d.handle);
+      const toLogic = d.mention("logic", 1_800_000_020, "Logic, waiting");
+      d.relay.publish(toLogic);
+      // A session that takes its channel identity after its binding publishes no switch; only the
+      // subscriber's own schedule notices it.
+      d.registry.hold(d.keys.logic.pubkey, bindingOf("logic", d.keys.logic));
+      expect(d.relay.openFor(d.keys.logic.pubkey)).toHaveLength(0);
+      d.clock.fireAll();
+      await d.relay.drain(d.handle);
+      expect(d.relay.openFor(d.keys.logic.pubkey)).toHaveLength(1);
+      expect(executedIds(d.sink)).toEqual([toLogic.id]);
+      expect(d.changes.map((change) => `${change.identity}:${change.state}`)).toEqual([
+        "identities[0]:EXCLUDED",
+        "identities[0]:ADMITTED",
+      ]);
+    } finally {
+      d.handle.close();
+    }
+  });
+
   it("reports the exclusion once, by ordinal and reason, and is silent about the identities it admitted", async () => {
     const d = deploy(["repoFactory", "commitlore"]);
     try {
