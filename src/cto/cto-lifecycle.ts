@@ -982,7 +982,7 @@ export class CtoLifecycle {
 
   latestHandoff(projectId: string): (HandoffPackage & { handoffId: string; status: string }) | null {
     const row = this.db.get<RawHandoff>(
-      `SELECT * FROM handoffs WHERE project_id = ? ORDER BY created_at DESC LIMIT 1`,
+      `SELECT * FROM handoffs WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
       [projectId],
     );
     if (!row) return null;
