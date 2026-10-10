@@ -18,7 +18,7 @@ import {
   verifySnapshotFreshness,
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
-import { assertPortableManifest, PROJECT_MANIFEST_SCHEMA_ID } from "../../src/contracts/manifest.ts";
+import { assertPortableManifest, manifestDigest, PROJECT_MANIFEST_SCHEMA_ID } from "../../src/contracts/manifest.ts";
 import {
   __testing as sandboxTesting,
   buildSandboxEnvironment,
@@ -609,6 +609,49 @@ describe("portable project manifest (Integration §10.2)", () => {
       assertPortableManifest(firstActivation).allowed,
       "a first activation has no digest to state and must still be able to say so",
     ).toBe(true);
+  });
+
+  it("RF-S22 W4: a manifest without gate entries keeps the digest it had before the field existed", () => {
+    // Golden values measured at b4087696, before `gateEntries` was added. Every stored
+    // `pinned_manifest_digest` and `active_manifest_digest` is one of these digests, so a default
+    // that made an absent field present would break every one of them.
+    const parsed = assertPortableManifest(base);
+    if (!parsed.allowed) throw new Error(parsed.message);
+    expect("gateEntries" in parsed.value).toBe(false);
+    expect(manifestDigest(parsed.value)).toBe("sha256:65bd321ae60be501826cfd667cfbf39385997c9a1b488a79b78c55c87c947bfc");
+
+    // The same for a manifest that leaves every defaulted field to the schema.
+    const minimal = assertPortableManifest({
+      schema: PROJECT_MANIFEST_SCHEMA_ID,
+      projectId: "minimal",
+      repositories: [{ role: "primary", remote: "github:acme/minimal" }],
+      branchProfile: {},
+      verificationProfiles: {},
+    });
+    if (!minimal.allowed) throw new Error(minimal.message);
+    expect("gateEntries" in minimal.value).toBe(false);
+    expect(manifestDigest(minimal.value)).toBe("sha256:ca1dc49e1f7a4724d696210edeeb89cb586a0e9a887a97bdfec77e1d7e5c47a2");
+  });
+
+  it("RF-S22 W5: a gate entry names a repository-relative file of a known repository by its sha256", () => {
+    const gate = { path: "scripts/gate.mjs", repositoryRole: "primary", digest: `sha256:${"a".repeat(64)}` };
+    expect(assertPortableManifest({ ...base, gateEntries: [gate] }).allowed).toBe(true);
+
+    for (const path of ["/abs/x", "../x", "scripts/../x", "~/x", "C:\\x"]) {
+      expect(assertPortableManifest({ ...base, gateEntries: [{ ...gate, path }] }), path).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.MANIFEST_NOT_PORTABLE,
+      });
+    }
+    // An empty list would read as a declaration that binds nothing; absent is the only "none".
+    const refusedAt = (manifest: unknown) => {
+      const decision = assertPortableManifest(manifest);
+      expect(decision).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+      return (decision.evidence.issues as Array<{ path: string; message: string }>).map((issue) => issue.path);
+    };
+    expect(refusedAt({ ...base, gateEntries: [] })).toEqual(["gateEntries"]);
+    expect(refusedAt({ ...base, gateEntries: [{ ...gate, repositoryRole: "secondary" }] })).toEqual(["gateEntries"]);
+    expect(refusedAt({ ...base, gateEntries: [{ ...gate, digest: "a".repeat(64) }] })).toEqual(["gateEntries.0.digest"]);
   });
 });
 

@@ -2569,6 +2569,119 @@ describe("trusted CI evidence (CP-S29)", () => {
     expect(refused.reasonCode).toBe(ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT);
   });
 
+  /**
+   * RF-S22 (PRD §14.2, RF-019) — the TRUSTED_CI arm. The approved workflow runs
+   * `node scripts/gate.mjs`, and the pinned manifest declares that script as a gate entry. CI
+   * evidence for the candidate is always `success` from the approved workflow digest, which is
+   * exactly what a workflow running a gate the candidate rewrote would report.
+   */
+  const GATE_SCRIPT = [
+    "import { createRequire } from 'node:module';",
+    "const app = createRequire(import.meta.url)('../src/app.js');",
+    "if (app() !== 2) { console.error('gate: app() must return 2'); process.exit(1); }",
+    "",
+  ].join("\n");
+  const GATE_CI_COMMANDS = [
+    parseVerificationCommand({
+      id: "project-ci",
+      argv: ["node", "scripts/gate.mjs"],
+      repositoryRole: "primary",
+      evidenceMode: "TRUSTED_CI",
+      timeoutSeconds: 60,
+    }),
+  ];
+  const gatePinnedCandidate = async (change: Record<string, string>) => {
+    const harness = makeHarness();
+    writeFiles(harness.repoPath, {
+      "scripts/gate.mjs": GATE_SCRIPT,
+      // A project script beside the gate that the manifest does not declare.
+      "scripts/release.mjs": "console.log('release');\n",
+      ".github/workflows/ci.yml": "on: [push]\njobs:\n  project-ci:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node scripts/gate.mjs\n",
+      "package.json": `${JSON.stringify({ name: "fixture", private: true, dependencies: {} }, null, 2)}\n`,
+    });
+    commitAll(harness.repoPath, "add the gate script the approved workflow runs");
+    const { projectId, repositoryId } = await registerFixtureProject(harness, "gate-entry-project", {
+      ciWorkflows: CI_WORKFLOWS,
+      verificationProfiles: { simple: ["project-ci"], standard: ["project-ci"], guarded: ["project-ci"] },
+      verificationCommands: GATE_CI_COMMANDS,
+      gateEntries: [{ path: "scripts/gate.mjs", repositoryRole: "primary", digest: sha256(GATE_SCRIPT) }],
+    });
+    const created = harness.cp.runs.create({
+      projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract: CONTRACT,
+      repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+    if (!dispatched.allowed) throw new Error(dispatched.message);
+    gitSync(harness.repoPath, ["checkout", "-q", "-b", "feature/F1-gate"]);
+    writeFiles(harness.repoPath, change);
+    commitAll(harness.repoPath, "candidate change");
+    const snapshot = await harness.cp.pipeline.freeze(created.value.runId);
+    if (!snapshot.allowed) throw new Error(snapshot.message);
+
+    const fetch = vi.fn(async (repositoryIdentity: string, head: string) => [
+      {
+        commandId: "project-ci",
+        repositoryIdentity,
+        head,
+        conclusion: "success" as const,
+        workflowDigest: "sha256:approved",
+        creatorIdentity: "github-actions",
+        completedAt: "2026-08-12T00:00:00.000Z",
+        nonVacuous: true,
+      },
+    ]);
+    harness.cp.verification.attachCi({
+      fetch,
+      approvedWorkflowDigests: async () => ["sha256:approved"],
+      trustedCreators: async () => ["github-actions"],
+    });
+    const verify = () => harness.cp.verification.verify({
+      runId: created.value.runId,
+      snapshot: snapshot.value,
+      commands: GATE_CI_COMMANDS,
+      contractDigest: snapshot.value.contractDigest,
+    });
+    return { harness, runId: created.value.runId, snapshot: snapshot.value, fetch, verify };
+  };
+
+  it("RF-S22 W1: a candidate that rewrites the gate script a pinned workflow runs is refused before CI is read", async () => {
+    // Workflow bytes and argv are untouched; only the script the workflow executes changes.
+    const candidate = await gatePinnedCandidate({ "scripts/gate.mjs": "process.exit(0);\n" });
+
+    const refused = await candidate.verify();
+    expect(refused).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+      evidence: {
+        path: "scripts/gate.mjs",
+        repositoryRole: "primary",
+        expected: sha256(GATE_SCRIPT),
+        observed: sha256("process.exit(0);\n"),
+      },
+    });
+    expect(candidate.fetch).not.toHaveBeenCalled();
+    expect(
+      candidate.harness.cp.verification.latestReport(candidate.runId, candidateSnapshotDigest(candidate.snapshot)),
+    ).toBeNull();
+  });
+
+  it("RF-S22 W2: nothing but the declared entry is frozen — project code, tests and dependencies may change", async () => {
+    const candidate = await gatePinnedCandidate({
+      "src/app.js": "module.exports = () => 2;\n",
+      "tests/app.test.js": "require('node:assert').strictEqual(require('../src/app.js')(), 2);\n",
+      "package.json": `${JSON.stringify({ name: "fixture", private: true, dependencies: { "left-pad": "1.3.0" } }, null, 2)}\n`,
+      "scripts/release.mjs": "process.exit(0);\n",
+    });
+
+    const verified = await candidate.verify();
+    expect(verified.allowed, verified.allowed ? "" : `${verified.reasonCode}: ${verified.message}`).toBe(true);
+    expect(verified.allowed && verified.value.status).toBe("PASS");
+    expect(candidate.fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("CP-S29: a CI result at the exact head from an approved workflow is accepted", async () => {
     const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);

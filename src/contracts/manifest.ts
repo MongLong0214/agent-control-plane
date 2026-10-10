@@ -104,6 +104,42 @@ export const projectManifestSchema = z
           .strict(),
       )
       .default([]),
+    /**
+     * RF-S22 (PRD §14.2, RF-019): the files that hold the decision logic a pinned command or a
+     * pinned workflow `run:` executes as a gate, each bound by the sha256 of its bytes.
+     * `verify()` compares every entry at the candidate head before anything runs, so a candidate
+     * that rewrites a declared gate script to `process.exit(0)` is refused rather than judged by
+     * its own copy.
+     *
+     * `.optional()` with no default is load-bearing. `manifestDigest` digests the parsed object,
+     * so a defaulted `[]` would change the digest of every manifest written before this field
+     * and break every stored pin. Absent stays absent, and every existing digest is unchanged.
+     *
+     * That makes the field optional, not the guarantee: a manifest with no `gateEntries` is NOT
+     * RF-S22 compliant. Nothing about its gate logic is pinned, and the absence must never be
+     * reported as a pass. `.min(1)` keeps an empty list from looking like a declaration.
+     *
+     * Only declared files are bound. Nothing is discovered from workflow YAML or followed
+     * through imports, and project code, tests and dependencies stay the candidate's (§14.2).
+     * A helper an entry imports for its decision is outside the guarantee until it is declared
+     * too; an entry that loads any undeclared candidate file in-process can be short-circuited
+     * through that file, so a gate entry means something only when it is self-contained.
+     */
+    gateEntries: z
+      .array(
+        z
+          .object({
+            /** Repository-relative path of the file, as git names it at the candidate head. */
+            path: z.string().min(1),
+            /** The repository the file belongs to, mirroring `ciWorkflows` (#512). */
+            repositoryRole: z.string().min(1).default("primary"),
+            /** `sha256:<hex>` of the file's bytes, the convention `approvedDigest` uses. */
+            digest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+          })
+          .strict(),
+      )
+      .min(1)
+      .optional(),
     commitlore: z
       .object({ mode: z.enum(["required", "preferred", "off"]).default("preferred") })
       .strict()
@@ -150,6 +186,15 @@ export const projectManifestSchema = z
           code: z.ZodIssueCode.custom,
           message: `ciWorkflow '${workflow.checkName}' targets unknown repositoryRole '${workflow.repositoryRole}'`,
           path: ["ciWorkflows"],
+        });
+      }
+    }
+    for (const entry of manifest.gateEntries ?? []) {
+      if (!roles.has(entry.repositoryRole)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `gateEntry '${entry.path}' targets unknown repositoryRole '${entry.repositoryRole}'`,
+          path: ["gateEntries"],
         });
       }
     }
@@ -204,6 +249,11 @@ export const assertPortableManifest = (manifest: unknown): Decision<ProjectManif
   for (const workflow of parsed.data.ciWorkflows) {
     if (!isPortableRepositoryPath(workflow.path)) {
       violations.push(`CI workflow '${workflow.checkName}' path must be repository-relative`);
+    }
+  }
+  for (const entry of parsed.data.gateEntries ?? []) {
+    if (!isPortableRepositoryPath(entry.path)) {
+      violations.push(`gate entry '${entry.path}' path must be repository-relative`);
     }
   }
   for (const command of parsed.data.verificationCommands) {

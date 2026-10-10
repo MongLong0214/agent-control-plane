@@ -1,7 +1,7 @@
 import type { Clock } from "../core/clock.ts";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { verificationKindRunning } from "../bootstrap/repo-factory-producer.ts";
-import { canonicalJson, digestOf } from "../core/digest.ts";
+import { canonicalJson, digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type VerificationCommand, verificationCommandSchema } from "../contracts/verification-command.ts";
@@ -10,6 +10,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunRow } from "../domain/types.ts";
+import { git } from "../git/git.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
@@ -98,6 +99,62 @@ const memoryEvidenceReason = (
   return peakRssMb > maxMemoryMb ? ReasonCode.SANDBOX_RESOURCE_LIMIT_EXCEEDED : null;
 };
 
+/** What a declared gate entry is at a candidate head (RF-S22). */
+type GateEntryObservation =
+  | { state: "FILE"; digest: string }
+  | { state: "ABSENT" }
+  | { state: "NOT_A_REGULAR_FILE"; mode: string; type: string }
+  | { state: "UNREADABLE"; detail: string };
+
+/** A symlink (120000), gitlink (160000) or tree is not a file whose bytes a pin can name. */
+const REGULAR_FILE_MODES = new Set(["100644", "100755"]);
+
+/**
+ * Reads one gate entry's bytes at an exact commit, from git objects rather than a working tree.
+ *
+ * Unreplaced, as the producer's tree read is (`producedTreeDrift`): a replace ref changes what a
+ * local read of an object returns. `git()` decodes stdout as UTF-8, which is lossy for bytes
+ * that are not UTF-8, so the blob id is re-derived from the decoded text: only when it equals
+ * the id `ls-tree` named are the bytes hashed below exactly the committed bytes. Without that, a
+ * pinned file carrying a literal U+FFFD would share its digest with a candidate that put an
+ * invalid byte in the same place.
+ */
+const gateEntryAt = async (checkoutPath: string, head: string, path: string): Promise<GateEntryObservation> => {
+  const listed = await git(
+    checkoutPath,
+    ["--no-replace-objects", "ls-tree", "-z", "--full-tree", head, "--", path],
+    { allowFailure: true },
+  );
+  if (listed.exitCode !== 0) return { state: "UNREADABLE", detail: listed.stderr.trim() };
+  const entry = listed.stdout
+    .split("\0")
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const tab = line.indexOf("\t");
+      const [mode = "", type = "", id = ""] = line.slice(0, tab).split(" ");
+      return { mode, type, id, path: line.slice(tab + 1) };
+    })
+    .find((listedEntry) => listedEntry.path === path);
+  if (!entry) return { state: "ABSENT" };
+  if (entry.type !== "blob" || !REGULAR_FILE_MODES.has(entry.mode)) {
+    return { state: "NOT_A_REGULAR_FILE", mode: entry.mode, type: entry.type };
+  }
+  // A failed read leaves stdout empty, which the blob-id comparison below refuses as well.
+  const blob = await git(checkoutPath, ["--no-replace-objects", "cat-file", "blob", entry.id], {
+    allowFailure: true,
+  });
+  const bytes = Buffer.from(blob.stdout, "utf8");
+  const objectFormat = entry.id.length === 64 ? "sha256" : "sha1";
+  const rederived = createHash(objectFormat).update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+  if (rederived !== entry.id) {
+    return {
+      state: "UNREADABLE",
+      detail: "the file's bytes could not be read exactly: it is not UTF-8 text, or its object is unreadable",
+    };
+  }
+  return { state: "FILE", digest: sha256(bytes) };
+};
+
 /**
  * PRD §17.
  *
@@ -144,6 +201,76 @@ export class VerificationEngine {
 
   attachRuns(loader: (runId: string) => RunRow | null): void {
     this.runs = loader;
+  }
+
+  /**
+   * RF-S22 (PRD §14.2 "Candidate Gate Logic 변경은 이전 Trusted Contract로 판정", RF-019).
+   *
+   * Every gate entry the pinned manifest declares must be, at the candidate head, a regular file
+   * whose bytes have the pinned digest. It runs before any sandbox, worktree or CI read, so this
+   * one site covers LOCAL_COMMAND and TRUSTED_CI alike. Post-merge verification in the GitHub
+   * kernel does not repeat it.
+   *
+   * The basis is the run's pinned manifest, never the candidate's copy. `pinned` is loaded from
+   * the trusted store by the run's dispatch-time digest, every snapshot repository has just been
+   * required to carry that digest, and the freshness check that follows refuses a snapshot whose
+   * repository's active manifest has since moved — so nothing runs unless it is the current
+   * active contract. A candidate that deletes an entry from its committed manifest, rewrites an
+   * entry's digest there, or carries a different manifest in its PLAN changes nothing read here.
+   * A CONTRACT_CHANGE run is judged the same way: a new entry digest applies only once that
+   * contract has been approved and activated.
+   *
+   * A pinned manifest that declares no entries passes this check vacuously. That is not RF-S22
+   * compliance — none of its gate logic is pinned — and nothing here or in the report says
+   * otherwise. Only declared files are bound: a helper an entry imports, or any other candidate
+   * file it loads in-process, is outside the guarantee until it is declared as well.
+   */
+  private async pinnedGateEntriesHold(
+    runId: string,
+    pinned: ProjectManifest,
+    snapshot: CandidateSnapshot,
+  ): Promise<Decision<void>> {
+    for (const entry of pinned.gateEntries ?? []) {
+      const matching = snapshot.repositories.filter((repo) => repo.repositoryRole === entry.repositoryRole);
+      const repo = matching.length === 1 ? matching[0]! : null;
+      const record = repo ? this.repositories.byIdentity(repo.identity) : null;
+      if (!repo || !record) {
+        return deny(
+          ReasonCode.VERIFICATION_GAP,
+          "a gate entry the pinned manifest binds has no single bound candidate repository to be read from",
+          { runId, path: entry.path, repositoryRole: entry.repositoryRole, identity: repo?.identity ?? null },
+        );
+      }
+      const observed = await gateEntryAt(record.checkoutPath, repo.candidateHead, entry.path);
+      const evidence = {
+        runId,
+        identity: repo.identity,
+        repositoryRole: entry.repositoryRole,
+        path: entry.path,
+        candidateHead: repo.candidateHead,
+        expected: entry.digest,
+      };
+      if (observed.state === "UNREADABLE") {
+        // Nothing was compared, so this must not read as "compared and differs" (#448).
+        return deny(ReasonCode.CONTRACT_UNVERIFIED, "a gate entry the pinned manifest binds could not be read at the candidate head", {
+          ...evidence,
+          detail: observed.detail,
+        });
+      }
+      if (observed.state !== "FILE" || observed.digest !== entry.digest) {
+        return deny(
+          ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+          "a gate entry the pinned manifest binds differs at the candidate head",
+          {
+            ...evidence,
+            observed: observed.state === "FILE" ? observed.digest : null,
+            observedState: observed.state,
+            ...(observed.state === "NOT_A_REGULAR_FILE" ? { observedMode: observed.mode, observedType: observed.type } : {}),
+          },
+        );
+      }
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   async verify(options: VerifyOptions): Promise<Decision<VerificationReport>> {
@@ -240,6 +367,9 @@ export class VerificationEngine {
           },
         );
       }
+      // RF-S22 — the gate logic the pinned manifest binds, before any command runs.
+      const gateLogic = await this.pinnedGateEntriesHold(runId, pinned, snapshot);
+      if (!gateLogic.allowed) return gateLogic as Decision<VerificationReport>;
     } else {
       if (!options.runScoped) {
         return deny(ReasonCode.VERIFICATION_GAP, "run-scoped commands require a temporary repository run", {
