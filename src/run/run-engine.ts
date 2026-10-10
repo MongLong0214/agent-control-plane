@@ -138,6 +138,14 @@ export interface BootstrapCtoProvisioner {
   release(runId: string, reason: string): void;
 }
 
+/**
+ * #512 — retiring a run's WORKER bindings when the run ends, which the run engine only asks for
+ * (`WorkerRetirement` answers). A terminal transition calls `retireRun` in its own transaction.
+ */
+export interface WorkerRetirementPort {
+  retireRun(runId: string, state: RunState): unknown;
+}
+
 /** A session `ensure` staffed: freshly spawned and unbound, or the live binding it reuses. */
 export interface BootstrapCtoStaffedSession {
   sessionId: string;
@@ -184,6 +192,7 @@ export class RunEngine {
 
   #cto: CtoProvisioner | null = null;
   #bootstrapCto: BootstrapCtoProvisioner | null = null;
+  #workerRetirement: WorkerRetirementPort | null = null;
   #capacity: CapacityGate | null = null;
   #continuity: ContinuityGate | null = null;
   readonly #baseline: BaselineRecorder;
@@ -211,11 +220,13 @@ export class RunEngine {
   attach(ports: {
     cto?: CtoProvisioner;
     bootstrapCto?: BootstrapCtoProvisioner;
+    workerRetirement?: WorkerRetirementPort;
     capacity?: CapacityGate;
     continuity?: ContinuityGate;
   }): void {
     if (ports.cto) this.#cto = ports.cto;
     if (ports.bootstrapCto) this.#bootstrapCto = ports.bootstrapCto;
+    if (ports.workerRetirement) this.#workerRetirement = ports.workerRetirement;
     if (ports.capacity) this.#capacity = ports.capacity;
     if (ports.continuity) this.#continuity = ports.continuity;
   }
@@ -849,6 +860,9 @@ export class RunEngine {
         // Issue #246 — a bootstrap run that ends (CONFIRM → COMPLETED, cancel, fail) gives back its
         // BOOTSTRAP_CTO in this same transaction; the daemon's reclaim sweep stops the session.
         if (run.kind === RunKind.PROJECT_BOOTSTRAP) this.#bootstrapCto?.release(runId, `run ${to}`);
+        // #512 — and every run's WORKER bindings end with it, in this same transaction; their
+        // sessions are stopped after it commits, unless something they ran is still running.
+        this.#workerRetirement?.retireRun(runId, to);
         this.claims.releaseRun(runId);
         const durationMs =
           new Date(this.clock.nowIso()).getTime() - new Date(run.createdAt).getTime();
