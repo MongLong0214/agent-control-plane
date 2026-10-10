@@ -8,6 +8,7 @@ import {
   manifestDigest,
 } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
+import { bootstrapReservationsHolding } from "../bootstrap/bootstrap-applications.ts";
 import type { Db } from "../db/database.ts";
 import { type Activity, type Availability, Role } from "../domain/types.ts";
 import {
@@ -61,6 +62,16 @@ export class ProjectRegistry {
     const projectId = input.projectId ?? newProjectId();
     if (this.db.get(`SELECT 1 FROM projects WHERE project_id = ?`, [projectId])) {
       return deny(ReasonCode.CONFLICT, "project already registered", { projectId });
+    }
+    // #246 C3 — a project id a bootstrap run reserved is registered by that run's activation alone;
+    // every other registration of it is refused, whatever its phase: a reservation is never reused.
+    const reservedBy = bootstrapReservationsHolding(this.db, { projectId })
+      .filter((reservation) => reservation.projectId === projectId && reservation.runId !== input.authorization?.runId);
+    if (reservedBy.length > 0) {
+      return deny(ReasonCode.BOOTSTRAP_APPLICATION_RESERVED, "the project id is reserved by another bootstrap run", {
+        projectId,
+        reservedBy: reservedBy.map((reservation) => ({ runId: reservation.runId, phase: reservation.phase })),
+      });
     }
 
     let digest: string | null = null;

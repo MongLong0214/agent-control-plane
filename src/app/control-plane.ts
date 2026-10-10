@@ -64,8 +64,10 @@ import { Doctor } from "../doctor/doctor.ts";
 import { Watchdog } from "../doctor/watchdog.ts";
 import { RepairService } from "../doctor/repair.ts";
 import { BootstrapActivation } from "../bootstrap/activation.ts";
-import { createGhCliGitHubWritePort, type GitHubWritePort } from "../bootstrap/github-write-port.ts";
+import type { GitHubWritePort } from "../bootstrap/github-write-port.ts";
+import { createBootstrapGitHubWritePort } from "../bootstrap/bootstrap-write-guard.ts";
 import { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
+import { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { Daemon, type DaemonOptions } from "../daemon/daemon.ts";
 import type { DaemonFinalizationAuthorities } from "../daemon/finalizer.ts";
 
@@ -309,6 +311,8 @@ export class ControlPlane {
   readonly bootstrap: BootstrapActivation;
   /** Issue #246 — performs a bootstrap plan's GitHub writes, then hands the result to `bootstrap`. */
   readonly bootstrapProducer: RepoFactoryBootstrapRunner;
+  /** Issue #246 PR-C slice C3 — the durable record of each bootstrap run's application. */
+  readonly bootstrapApplications: BootstrapApplications;
 
   /**
    * The evidence writer capabilities, minted here and nowhere else. Kept in a `#private`
@@ -659,6 +663,7 @@ export class ControlPlane {
         },
       );
       this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
+      this.bootstrapApplications = new BootstrapApplications(this.db, this.clock, this.audit);
       this.bootstrap = new BootstrapActivation(
         this.db, this.clock, this.audit, this.artifacts, this.projects, this.repositories,
         this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox,
@@ -726,9 +731,18 @@ export class ControlPlane {
         artifacts: this.artifacts,
         ownerAuthority: this.ownerAuthority,
         bootstrap: this.bootstrap,
-        githubPort: config.repoFactory?.githubPort ?? createGhCliGitHubWritePort(),
+        // #246 C3, review 1076-R2 — the production port asks the attempt's authority at the moment each
+        // write request starts, after any read the port method makes first.
+        githubPort: config.repoFactory?.githubPort ?? createBootstrapGitHubWritePort(),
         workRoot: config.repoFactory?.workRoot ?? null,
         clock: this.clock,
+        // #246 C3 — the application record and the pre-write checks' sources.
+        db: this.db,
+        applications: this.bootstrapApplications,
+        ceo: this.ceo,
+        bindings: this.bindings,
+        projects: this.projects,
+        repositories: this.repositories,
       });
       // The GitHub kernel binds the production gate's single human-gate predicate to its
       // payload. It never reinterprets APPROVAL artifacts or ingress receipts itself.
@@ -773,12 +787,18 @@ export class ControlPlane {
           },
         },
       });
-      this.repair.attach({ ownerAuthority: this.ownerAuthority });
+      // #246 C3, review 1076-R1-02 — the activation finalizer completes only on the chain the runner verifies.
+      this.bootstrap.attachCompletionChain(this.bootstrapProducer);
+      // #246 C3 — the reservation release is a repair the bootstrap runner verifies and performs.
+      this.repair.attach({ ownerAuthority: this.ownerAuthority, bootstrapRecovery: this.bootstrapProducer });
       this.ceo.attach({
         ownerAuthority: this.ownerAuthority,
         bootstrapActivation: {
           finalizeBootstrapActivationConfirm: (input) => this.bootstrap.finalizeBootstrapActivationConfirm(input),
         },
+        bootstrapApplications: this.bootstrapApplications,
+        // #246 C3, review 1076-R1-02 — the chain the CEO decision completes on; its finalizer asks too.
+        bootstrapCompletionChain: this.bootstrapProducer,
         sourceReadLeases: this.guard,
         continuity: {
           mode: () => this.continuity.mode(),

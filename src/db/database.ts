@@ -1470,6 +1470,11 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   OUTBOX_DEPARTED_ROW_NO_DELETE: ReasonCode.CONFLICT,
   HOLDER_MESSAGE_SOURCE_DEPARTURE_NO_REPLACE: ReasonCode.CONFLICT,
   HOLDER_MESSAGE_SOURCE_DEPARTURE_IMMUTABLE: ReasonCode.CONFLICT,
+  // #246 C3 — a bootstrap application's reservation is held by one run, never replaced, reused or
+  // removed; its identity and digests are fixed and its phase only moves forward.
+  BOOTSTRAP_APPLICATION_NO_REPLACE: ReasonCode.BOOTSTRAP_APPLICATION_RESERVED,
+  BOOTSTRAP_APPLICATION_IMMUTABLE: ReasonCode.CONFLICT,
+  BOOTSTRAP_APPLICATION_PHASE_INVALID: ReasonCode.CONFLICT,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

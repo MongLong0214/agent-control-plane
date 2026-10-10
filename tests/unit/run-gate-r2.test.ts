@@ -768,10 +768,10 @@ describe("round-2 run and production-gate regressions", () => {
       rationale: "incomplete activation",
     });
     expect(confirmed.allowed).toBe(false);
-    // Issue #246 PR-C: the bootstrap CONFIRM is shut until C3.
+    // #246 C3: this activation was not produced by the Repo Factory runner, so the run has no WRITTEN
+    // application record and the gate's CONFIRM completes nothing.
     expect(confirmed.reasonCode).toBe(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE);
-    // TODO(C3): assert this through `submitCeoDecision` again once C3 reopens the bootstrap CONFIRM;
-    // until then the finalizer the CONFIRM's transaction runs is asked directly.
+    // The finalizer the CONFIRM's transaction runs is asked directly, as it was before C3.
     const finalized = completeBootstrapRunUntilC3(harness.cp, {
       runId: created.value.runId,
       candidateSnapshotDigest: "sha256:bootstrap",

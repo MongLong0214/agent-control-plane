@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 42;
+export const SCHEMA_VERSION = 43;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -146,6 +146,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- CP-HI-02 — #246 C1b \(schema v42\): a session row begins at epoch 0[\s\S]*?CREATE TRIGGER IF NOT EXISTS sessions_credential_epoch_starts_at_zero[\s\S]*?\nEND;/,
   // v42 alone installs the continuity-hold guards (#246 C1b, review ACP-C1B-02): they name the column it adds.
   /-- CP-HI-02 — #246 C1b \(schema v42\): which hold continuity placed is daemon authority[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_continuity_hold_not_inserted[\s\S]*?\nEND;/,
+  // v43 alone creates the bootstrap application record and its guards (#246 C3).
+  /-- -{75}\n-- bootstrap_applications[\s\S]*?CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_delete[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -3090,6 +3092,73 @@ const v42: SchemaMigration = {
   checksum: () => migrationChecksum("v42-session-credential-epoch", SCHEMA_VERSION),
 };
 
+/** v43's guards over the bootstrap application record, read from schema.sql by name. */
+const V43_BOOTSTRAP_APPLICATION_TRIGGER_NAMES: readonly string[] = [
+  "bootstrap_applications_born_reserved",
+  "bootstrap_applications_no_replace",
+  "bootstrap_applications_identity_immutable",
+  "bootstrap_applications_phase_forward",
+  "bootstrap_applications_no_delete",
+];
+
+/**
+ * #246 PR-C slice C3. A project-less PROJECT_BOOTSTRAP run's CEO CONFIRM performs GitHub writes, and
+ * `createRepository` can succeed and then crash or time out before its result is stored. So the
+ * application is recorded durably: a reservation of the project id and repository identity, inserted
+ * in the transaction that consumes the owner's approval; an attempt recorded before every attempt's
+ * first external write; the produced result stored with WRITTEN in one transaction; COMPLETED in the
+ * CEO's completion transaction; or STRANDED, keeping the reservation and the evidence, when what
+ * GitHub holds cannot be attributed to the run; or RELEASED, keeping the row, when a cancelled run's
+ * application is shown to have had no external effect, so that a new run may reserve the name.
+ *
+ * Additive: one new table, its two partial unique indexes (one unreleased reservation per project id
+ * and per repository identity) and its five guards; no existing row or object is touched, and there is no
+ * backfill — a run confirmed before this has no application to record. A chain test can build a v42
+ * image out of a current database, which already has the table; it is accepted only with schema.sql's
+ * exact shape and no row, never repaired: a populated or reshaped table holds reservations nothing
+ * here vouched for, and stamping it v43 would make them authority. The triggers are dropped and
+ * recreated, as v42 does for its own.
+ *
+ * A live database at v42 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v43: SchemaMigration = {
+  id: "v43-bootstrap-application-record",
+  fromVersion: 42,
+  toVersion: 43,
+  apply: (raw) => {
+    const tableDdl = schemaObject(
+      /CREATE TABLE IF NOT EXISTS bootstrap_applications \([\s\S]*?\n\) WITHOUT ROWID;/,
+      "the bootstrap_applications table",
+      SCHEMA_VERSION,
+    );
+    const existing = (raw.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bootstrap_applications'",
+    ).get() as { sql: string } | undefined)?.sql;
+    if (existing !== undefined) {
+      const normalise = (sql: string): string => sql
+        .replace(/^CREATE TABLE IF NOT EXISTS /i, "CREATE TABLE ")
+        .replace(/--[^\n]*/g, "").replace(/"/g, "").replace(/;\s*$/, "").replace(/\s+/g, " ").trim();
+      if (normalise(existing) !== normalise(tableDdl)
+          || raw.prepare("SELECT 1 FROM bootstrap_applications LIMIT 1").get()) {
+        throw new Error("v43 pre-existing bootstrap_applications table does not match the current schema or is populated");
+      }
+    } else {
+      raw.exec(tableDdl);
+    }
+    // One unreleased reservation per project id and per repository identity (CEO decision (b)).
+    for (const [index, what] of [
+      [/CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_project_held[^;]*;/, "the bootstrap_applications project index"],
+      [/CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_identity_held[^;]*;/, "the bootstrap_applications identity index"],
+    ] as const) {
+      raw.exec(schemaObject(index, what, SCHEMA_VERSION));
+    }
+    raw.exec(dropsFor(V43_BOOTSTRAP_APPLICATION_TRIGGER_NAMES));
+    raw.exec(triggerDdlFor(V43_BOOTSTRAP_APPLICATION_TRIGGER_NAMES, SCHEMA_VERSION));
+  },
+  checksum: () => migrationChecksum("v43-bootstrap-application-record", SCHEMA_VERSION),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -3122,6 +3191,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v40,
   v41,
   v42,
+  v43,
 ]);
 
 interface RequiredTrigger {
@@ -3287,6 +3357,13 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "task_executions_runtime_managed_immutable", sentinel: "TASK_EXECUTION_RUNTIME_MANAGED_IMMUTABLE", introducedIn: 41 },
   { name: "task_executions_outstanding_process_no_delete", sentinel: "TASK_EXECUTION_WORKER_PROCESS_IMMUTABLE", introducedIn: 41 },
   { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
+  // #246 C3 — the bootstrap application record: born RESERVED, never replaced, its identity and
+  // digests fixed, its phase only forward, never deleted.
+  { name: "bootstrap_applications_born_reserved", sentinel: "BOOTSTRAP_APPLICATION_PHASE_INVALID", introducedIn: 43 },
+  { name: "bootstrap_applications_no_replace", sentinel: "BOOTSTRAP_APPLICATION_NO_REPLACE", introducedIn: 43 },
+  { name: "bootstrap_applications_identity_immutable", sentinel: "BOOTSTRAP_APPLICATION_IMMUTABLE", introducedIn: 43 },
+  { name: "bootstrap_applications_phase_forward", sentinel: "BOOTSTRAP_APPLICATION_PHASE_INVALID", introducedIn: 43 },
+  { name: "bootstrap_applications_no_delete", sentinel: "BOOTSTRAP_APPLICATION_IMMUTABLE", introducedIn: 43 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
