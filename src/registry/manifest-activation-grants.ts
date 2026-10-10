@@ -374,7 +374,8 @@ export class ManifestActivationGrants {
     const evidence = { runId, phase, grantId: grant.grantId };
     const { grantDigest, consumedAt: _consumedAt, consumedAttemptId: _consumedAttemptId, consumer: _consumer, ...identity } = grant;
     if (grantDigestOf(identity) !== grantDigest) {
-      return deny(ReasonCode.MANIFEST_ACTIVATION_TARGET_STALE, "the grant's columns no longer recompute to its digest", evidence);
+      // An altered row, not a newer generation: a failure, never a staleness verdict.
+      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "the grant's columns no longer recompute to its digest", evidence);
     }
     if (grant.consumedAt !== null) {
       return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED, "this grant has already been consumed", {

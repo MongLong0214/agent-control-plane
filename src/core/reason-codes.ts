@@ -987,6 +987,11 @@ export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.DOCTOR_HEALTH_STALE,
   ReasonCode.EVIDENCE_STALE,
   ReasonCode.FINALIZATION_ATTEMPT_STALE,
+  // #246 B2-b — a CONTRACT_CHANGE grant compared with what is current now: its candidate, PLAN, review
+  // or packet was replaced, or the CEO binding or the grant's consumer moved on. Re-derived by a new
+  // CONFIRM or a current CEO's re-entry, never repaired.
+  ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_STALE,
+  ReasonCode.MANIFEST_ACTIVATION_TARGET_STALE,
   ReasonCode.MERGE_BASE_STALE,
   ReasonCode.MERGE_HEAD_STALE,
   ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
