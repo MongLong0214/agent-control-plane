@@ -999,7 +999,7 @@ export const produceRepoFactoryResult = async (
         },
         ledgerPath,
         clock,
-        // Review C5I-R1-02 — the one proof that a pending create was never sent, for a standalone call
+        // Review C5I-R1-02 — the one proof that a pending request was never sent, for a standalone call
         // and the runner's attempts alike: C3's withheld-request record of exactly that intent, which
         // the runner writes in this same work directory when it refuses a request at its start.
         provenUnsent: (intent) => readWithheldRequest(workDir, intent.operationId, intent.attemptedAt) !== null,

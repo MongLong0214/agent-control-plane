@@ -10,7 +10,7 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { acpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
-import { InitializingGitHub, type Operation } from "../helpers/bootstrap-runner.ts";
+import { InitializingGitHub, type Operation, withholdPending } from "../helpers/bootstrap-runner.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -147,3 +147,68 @@ it("C5I-R1-03: the production port refuses an answer whose node id, full name or
   answers["GET repos/acme/fixture/branches/main"] = { name: "main", commit: { sha: "a".repeat(40) } };
   expect(await port.observeBranch(target, "main")).toEqual({ name: "main", headSha: "a".repeat(40) });
 });
+
+// ── C5I-R1-02: the same pending judgement in every step that sends a request ─────────────────────────
+
+const pushOps: Operation[] = [
+  { operationId: "create-repository:fixture", resourceType: "repository", resourceIdentity: "github:acme/fixture", desiredState: { visibility: "public" } },
+  { operationId: "push-default-branch:fixture", resourceType: "branch", resourceIdentity: "github:acme/fixture#main" },
+  { operationId: "set-default-branch:fixture", resourceType: "setting", resourceIdentity: "github:acme/fixture#default-branch", desiredState: { defaultBranch: "main" } },
+  {
+    operationId: "protect-default-branch:fixture",
+    resourceType: "branch-protection",
+    resourceIdentity: "github:acme/fixture#main",
+    desiredState: { requiredStatusChecks: null, enforceAdmins: true, requiredApprovingReviewCount: 1, allowForcePushes: false, allowDeletions: false },
+  },
+];
+const producePushMode = (workDir: string, port: InitializingGitHub, at: string) =>
+  produceRepoFactoryResult({
+    plan: { ...plan, githubOperations: pushOps } as RepoFactoryPlanFixture,
+    workDir,
+    clock: new ManualClock(at),
+    github: {
+      port,
+      authority: {
+        ...authority,
+        approvedOperations: pushOps.map(({ operationId, resourceType, resourceIdentity }) => ({ operationId, resourceType, resourceIdentity })),
+      },
+    },
+  });
+
+for (const [method, resourceType] of [
+  ["pushBranch", "branch"],
+  ["setDefaultBranch", "setting"],
+  ["protectBranch", "branch-protection"],
+] as const) {
+  it(`C5I-R1-02: a ${resourceType} request with no answer is held in doubt with no resend; only C3's withheld proof lets it be sent, once per proof`, async () => {
+    const root = tempDir("acp-c5-r1-pending-");
+    const github = new InitializingGitHub(root);
+    // GitHub's first-push default would settle the setting by itself; here only the setting sets it.
+    github.pushSetsDefault = false;
+    const workDir = join(root, "work");
+    const sent = (): number => github.writes.filter((write) => write.method === method).length;
+    const inDoubt = { allowed: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST", indeterminate: true, resourceType } };
+
+    github.failNext = method;
+    expect((await producePushMode(workDir, github, "2026-10-10T00:01:00.000Z")).evidence["refusal"]).toBe("REMOTE_REFUSED");
+    expect(sent()).toBe(1);
+    // No answer and no proof: in doubt, nothing sent.
+    expect(await producePushMode(workDir, github, "2026-10-10T00:02:00.000Z")).toMatchObject(inDoubt);
+    expect(sent()).toBe(1);
+    // The proof covers exactly that intent: the request is sent once more, as a new request, and that
+    // one fails unanswered too.
+    withholdPending(workDir);
+    github.failNext = method;
+    expect((await producePushMode(workDir, github, "2026-10-10T00:03:00.000Z")).evidence["refusal"]).toBe("REMOTE_REFUSED");
+    expect(sent()).toBe(2);
+    // The earlier proof does not cover the new request: in doubt again, nothing sent.
+    expect(await producePushMode(workDir, github, "2026-10-10T00:04:00.000Z")).toMatchObject(inDoubt);
+    expect(sent()).toBe(2);
+    // A proof of the new request lets it be sent, and the operation completes.
+    withholdPending(workDir);
+    const done = await producePushMode(workDir, github, "2026-10-10T00:05:00.000Z");
+    if (!done.allowed) throw new Error(`${done.reasonCode}: ${done.message} ${JSON.stringify(done.evidence)}`);
+    expect(sent()).toBe(3);
+    expect(github.createRequests).toHaveLength(1);
+  });
+}

@@ -21,6 +21,7 @@ import {
   type PreparedBootstrapRun,
   activateAndConfirm,
   noGitHubCall,
+  withholdPending,
   ownerApprovalFor,
   prepareBootstrapRun,
   writesOf,
@@ -405,6 +406,9 @@ describe("#246 C5 create-only bootstrap: GitHub initializes the default branch a
     github.failNext = "protectBranch";
     const first = await produce(workDir, github, ops);
     expect(first, JSON.stringify(first)).toMatchObject({ allowed: false, evidence: { refusal: "REMOTE_REFUSED", completedOperationIds: ["create-repository:fixture"] } });
+    // The protection's intent is pending; the double refused it before mutating, which C3's
+    // withheld-request record states, so the resume may send it (review C5I-R1-02).
+    withholdPending(workDir);
     const resumed = await produce(workDir, github, ops);
     if (!resumed.allowed) throw new Error(`${resumed.reasonCode}: ${resumed.message} ${JSON.stringify(resumed.evidence)}`);
     expect(resumed.value.bootstrapVerification[0]?.exactHead).toBe(await remoteHead(github));

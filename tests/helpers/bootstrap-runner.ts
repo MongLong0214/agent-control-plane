@@ -1,9 +1,10 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { expect } from "vitest";
 
 import { readProcessGroup } from "../../src/bootstrap/attempt-writer-group.ts";
+import { writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
 import { plannedBootstrapOutputs } from "../../src/bootstrap/bootstrap-plan.ts";
 import {
   REPO_FACTORY_GITHUB_WRITE_OPERATION,
@@ -271,4 +272,28 @@ export const activateAndConfirm = async (
   const final = harness.cp.artifacts.latest<Record<string, unknown>>(runId, "BOOTSTRAP_ACTIVATION_RESULT");
   if (final === null) throw new Error("no BOOTSTRAP_ACTIVATION_RESULT");
   return { beforeConfirm: second.value as unknown as Record<string, unknown>, final: final.content };
+};
+
+/**
+ * C3's proof that a request was never sent, for every intent the GitHub ledger in `workDir` holds
+ * pending: the withheld-request record the runner writes when it refuses a request at its start. A
+ * producer row whose double refused a request before mutating anything writes it to say exactly that,
+ * so the producer may send the request again (#246 C5, review C5I-R1-02).
+ */
+export const withholdPending = (workDir: string, role = "primary"): Array<{ operationId: string; resourceType: string; attemptedAt: string }> => {
+  const ledger = JSON.parse(readFileSync(join(workDir, "github-ledger", `${role}.json`), "utf8")) as {
+    pending: Array<{ operationId: string; resourceType: string; attemptedAt: string }>;
+  };
+  for (const intent of ledger.pending) {
+    writeWithheldRequest(workDir, {
+      runId: "run_withheld_fixture",
+      attempt: 1,
+      operationId: intent.operationId,
+      resourceType: intent.resourceType,
+      attemptedAt: intent.attemptedAt,
+      withheldAt: intent.attemptedAt,
+      refusal: "WITHHELD_BEFORE_SEND",
+    });
+  }
+  return ledger.pending;
 };

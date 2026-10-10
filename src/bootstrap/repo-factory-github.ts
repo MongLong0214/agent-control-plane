@@ -65,8 +65,8 @@ import { frameRecord, writeWholeSync } from "./whole-write.ts";
  * answers with an identity, again with that answer. A retry reconciles a pending write against
  * GitHub before anything else: a create by the node id its response named; a push by the commit
  * it pushed; a setting or protection by whether GitHub already holds the requested state. A
- * pending write that GitHub shows no trace of is retried — except a create that recorded no answer,
- * which is sent again only on C3's proof that it never was (#246 C5, review C5I-R1-02). One whose outcome the ledger cannot
+ * pending write that GitHub shows no trace of is sent again only on C3's proof that it never was
+ * (#246 C5, review C5I-R1-02); without it, it stays in doubt. One whose outcome the ledger cannot
  * settle — a create whose response never arrived, with a repository now at the name — is refused
  * with `indeterminate: true`, rather than adopted by the marker the create put in the repository's
  * description: that marker is public once the repository exists, so a replacement can carry it
@@ -675,9 +675,9 @@ export interface ApplyGitHubOperationsInput {
   /** Mints the marker a create puts in the repository's description. */
   newMarker?: () => string;
   /**
-   * #246 C5, review C5I-R1-02 — whether a pending create that recorded no answer is proven never sent:
-   * C3's withheld-request record of exactly that intent (`readWithheldRequest`). Without that proof the
-   * create stays in doubt and is not sent again.
+   * #246 C5, review C5I-R1-02 — whether a pending intent GitHub does not show settled is proven never
+   * sent: C3's withheld-request record of exactly that intent (`readWithheldRequest`). Without that
+   * proof the request stays in doubt and is not sent again, whichever step made it (`unresolvedPending`).
    */
   provenUnsent: (intent: PendingWrite) => boolean;
   /**
@@ -867,6 +867,29 @@ export const applyGitHubOperations = async (
     return allow(ReasonCode.OK, observed.value);
   };
 
+  /**
+   * #246 C5, review C5I-R1-02 — the one pending judgement every step makes before it would send a
+   * request again, the same one the runner makes before any attempt (review 1076-R1-03). A request an
+   * earlier call began and never saw answered may still land: a client that gave up proves nothing
+   * about the server, and GitHub not showing its effect now proves nothing about a request still in
+   * flight. A step adopts an effect GitHub does show; anything else is sent again only on C3's proof
+   * that exactly this intent was never sent (`provenUnsent`), and then as a new request, under a new
+   * begin time, which that proof does not cover. Without the proof it stays in doubt: null when the
+   * step may send, the refusal otherwise.
+   */
+  const unresolvedPending = (pendingWrite: PendingWrite | undefined): Decision<Step> | null => {
+    if (pendingWrite === undefined) return null;
+    if (input.provenUnsent(pendingWrite)) return null;
+    return stop(
+      ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+      "UNCONFIRMED_PENDING_REQUEST",
+      `${pendingWrite.operationId}'s ${pendingWrite.resourceType} request was sent and never answered, and nothing proves it was not; it is not sent again, and the operation stays in doubt`,
+      pendingWrite.operationId,
+      { indeterminate: true, resourceType: pendingWrite.resourceType, attemptedAt: pendingWrite.attemptedAt },
+      false,
+    );
+  };
+
   const corruptPrior = (operationId: string): Decision<Step> =>
     stop(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
@@ -1001,23 +1024,9 @@ export const applyGitHubOperations = async (
         false,
       );
     }
-    // #246 C5, review C5I-R1-02 — a create this operation sent and never saw answered may still land: a
-    // client that gave up proves nothing about the server, and no repository at the name now proves
-    // nothing about a request still in flight. It is sent again only on C3's proof that it never was
-    // (`provenUnsent`); otherwise it stays in doubt, the same judgement the runner makes before any
-    // attempt (review 1076-R1-03).
-    if (pendingWrite !== undefined) {
-      if (!input.provenUnsent(pendingWrite)) {
-        return stop(
-          ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
-          "UNCONFIRMED_PENDING_REQUEST",
-          `${id}'s create was sent and never answered, and nothing proves it was not; it is not sent again, and the operation stays in doubt`,
-          id,
-          { indeterminate: true, attemptedAt: pendingWrite.attemptedAt },
-          false,
-        );
-      }
-    }
+    // A create sent and never answered, with no repository at the name: in doubt unless proven unsent.
+    const createInDoubt = unresolvedPending(pendingWrite);
+    if (createInDoubt !== null) return createInDoubt;
 
     const createdAt = clock.nowIso();
     const marker = pendingWrite?.marker ?? newMarker();
@@ -1337,6 +1346,9 @@ export const applyGitHubOperations = async (
         outcome: "adopted",
       });
     }
+    // A push sent and never answered, with no branch on GitHub: in doubt unless proven unsent.
+    const pushInDoubt = unresolvedPending(pendingWrite);
+    if (pushInDoubt !== null) return pushInDoubt;
     // The checked commit, by its id — not a HEAD read now, after the awaited calls above (RF-REVIEW-01).
     const localHead = input.validatedHead;
     if (localHead === null) {
@@ -1441,8 +1453,11 @@ export const applyGitHubOperations = async (
         });
       }
     }
-    const createdAt = pendingWrite?.attemptedAt ?? clock.nowIso();
-    const intent: PendingWrite = pendingWrite ?? {
+    // A setting sent and never answered, which GitHub does not show: in doubt unless proven unsent.
+    const settingInDoubt = unresolvedPending(pendingWrite);
+    if (settingInDoubt !== null) return settingInDoubt;
+    const createdAt = clock.nowIso();
+    const intent: PendingWrite = pendingWrite !== undefined ? { ...pendingWrite, attemptedAt: createdAt } : {
       operationId: id,
       resourceType: "setting",
       resourceIdentity: operation.resourceIdentity,
@@ -1542,8 +1557,12 @@ export const applyGitHubOperations = async (
         });
       }
     }
+    // A protection sent and never answered, which GitHub does not show as approved: in doubt unless
+    // proven unsent.
+    const protectionInDoubt = unresolvedPending(pendingWrite);
+    if (protectionInDoubt !== null) return protectionInDoubt;
     const before = current.value;
-    const intent: PendingWrite = pendingWrite ?? {
+    const intent: PendingWrite = pendingWrite !== undefined ? { ...pendingWrite, attemptedAt: clock.nowIso() } : {
       operationId: id,
       resourceType: "branch-protection",
       resourceIdentity: operation.resourceIdentity,

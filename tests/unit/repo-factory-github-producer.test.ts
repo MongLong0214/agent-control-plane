@@ -17,6 +17,7 @@ import {
 } from "../../src/bootstrap/repo-factory-producer.ts";
 import { writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
 import { git } from "../../src/git/git.ts";
+import { withholdPending } from "../helpers/bootstrap-runner.ts";
 import { FakeGitHub, type Protection } from "../helpers/fake-github-write-port.ts";
 
 /**
@@ -453,6 +454,14 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
       expect(existsSync(repositoryCheckoutPath(workDir, "primary"))).toBe(false);
 
       github.writes.length = 0;
+      // #246 C5, review C5I-R1-02 — a protection sent and never answered stays in doubt with no request
+      // made, until C3's withheld-request record proves this intent was never sent.
+      expect(await produce(workDir, github, { at: "2026-10-02T00:04:00.000Z" })).toMatchObject({
+        allowed: false,
+        evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST", resourceType: "branch-protection" },
+      });
+      expect(github.writes).toEqual([]);
+      withholdPending(workDir);
       const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
       if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message} ${JSON.stringify(retry.evidence)}`);
       expect(github.writes.map((write) => write.method)).toEqual(["protectBranch"]);
@@ -474,6 +483,13 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
       expect(readLedger(workDir).receipts.map((receipt) => receipt.resourceType)).toEqual(["repository"]);
 
       github.writes.length = 0;
+      // #246 C5, review C5I-R1-02 — the push's intent is pending: in doubt until proven never sent.
+      expect(await produce(workDir, github, { at: "2026-10-02T00:04:00.000Z" })).toMatchObject({
+        allowed: false,
+        evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST", resourceType: "branch" },
+      });
+      expect(github.writes).toEqual([]);
+      withholdPending(workDir);
       const retry = await produce(workDir, github, { at: "2026-10-02T00:05:00.000Z" });
       if (!retry.allowed) throw new Error(`${retry.reasonCode}: ${retry.message}`);
       expect(github.writes.map((write) => write.method)).toEqual(["pushBranch", "setDefaultBranch", "protectBranch"]);
