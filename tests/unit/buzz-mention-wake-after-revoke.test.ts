@@ -12,7 +12,6 @@ import type { BuzzMentionEvent } from "../../src/buzz/buzz-mention-subscriber.ts
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
-  buzzMentionWakeEligibility,
   rejudgeBuzzMentionSubscriberOnBindingSwitch,
   startBuzzMessageIngressListener,
   startDaemonBuzzMentionSubscriber,
@@ -143,8 +142,6 @@ const start = async (options: { production?: boolean; serializeWake?: <T>(body: 
     reportAdmission: () => undefined,
   });
   rejudgeBuzzMentionSubscriberOnBindingSwitch(h.cp, () => subscriber);
-  // main()'s line: the daemon-built port's wake consults the subscriber's delivery eligibility.
-  if (listeners !== null) listeners.ctoConversation.useWakeEligibility(buzzMentionWakeEligibility(h.cp, () => subscriber));
   await relay.drain(subscriber);
 
   // The holder attaches over the port and registers its endpoint; the registration's own wake lands.

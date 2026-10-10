@@ -2492,8 +2492,8 @@ export const startBuzzMentionSubscriber = (
       const subscription =
         (holder.actorId === null ? undefined : prepared.find((one) => one.pubkey === holder.actorId)) ??
         prepared.find((one) => one.roleKey === holder.roleKey);
-      if (subscription === undefined) return null;
-      if (closed) return { eligible: false, room: null };
+      // A closed subscriber judges nothing and gates nothing.
+      if (subscription === undefined || closed) return null;
       const judged = subscription.judge();
       const eligible =
         subscription.admitted && judged.verdict === "ADMITTED" && judged.binding.roleKey === holder.roleKey;

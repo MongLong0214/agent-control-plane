@@ -620,6 +620,9 @@ export const startLocalMcpListeners = async (
     // The wake's final holder check and its frame handoff run in the daemon's write transaction.
     { endpointDir: stateDir, ownerMessages: ownerMessageLedger(cp), serializeWake: (body) => cp.db.tx(body) },
   );
+  // And consult the delivery eligibility of the identity behind the holder, from whichever mention
+  // subscriber runs over this control plane, so the daemon-built port gates its wakes by itself.
+  ctoConversation.useWakeEligibility(buzzMentionWakeEligibility(cp, () => runningMentionSubscribers.get(cp) ?? null));
   const hermes = await startMcpSocket(
     hermesPath,
     token,
@@ -1835,14 +1838,22 @@ export const startDaemonBuzzMentionSubscriber = (
       return buzzMentionVerdictOf(delivered);
     },
   };
-  return startBuzzMentionSubscriberFromStateDir(stateDir, {
+  const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
     registry: buzzMentionSubscriberRegistry(cp, options.canonical ?? null),
     sink,
     ...(options.openSocket ? { openSocket: options.openSocket } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
     ...(options.reportAdmission ? { reportAdmission: options.reportAdmission } : {}),
   });
+  runningMentionSubscribers.set(cp, handle);
+  return handle;
 };
+
+/**
+ * The mention subscriber started over each control plane, read by the CTO port's wake eligibility.
+ * The latest start wins; a closed subscriber answers no eligibility, so it gates nothing.
+ */
+const runningMentionSubscribers = new WeakMap<ControlPlane, BuzzMentionSubscriberHandle>();
 
 /**
  * Whether `roleKey`'s live binding is no longer the generation and serving session a delivery names.
@@ -4968,7 +4979,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           canonical: canonicalSessions === null ? null : { sessions: canonicalSessions },
         });
         rejudgeBuzzMentionSubscriberOnBindingSwitch(cp, () => buzzMentionSubscriber);
-        listeners.ctoConversation.useWakeEligibility(buzzMentionWakeEligibility(cp, () => buzzMentionSubscriber));
         process.stdout.write(
           `Buzz mention subscriber configured identities: ${buzzMentionSubscriber.socketCount}\n`,
         );
