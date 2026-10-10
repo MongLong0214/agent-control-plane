@@ -141,6 +141,8 @@ const evidenceOf = (decision: { allowed: boolean; evidence: Record<string, unkno
 
 describe("repo factory producer performs planned GitHub operations (#246)", () => {
   it("performs each planned operation through the port and receipts what GitHub answered, not what the plan said", async () => {
+    // RF-S14 arm:repository: the created repository's receipt is GitHub's re-read (its owner spelling, node id), not the plan's request.
+    // RF-S14 arm:branch: the pushed branch's receipt is the head GitHub holds on re-read, not the commit this process made.
     const { workDir, github } = makeSandbox();
     // GitHub spells the owner its own way. A receipt that copied the plan would say `acme`.
     github.canonicalOwner = "Acme";
@@ -232,6 +234,7 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
 
   describe("an operation outside the approved plan is refused before any GitHub call", () => {
     it("refuses a planned operation the approval does not cover", async () => {
+      // RF-S24: a planned write the approval does not cover is refused before any GitHub read or write.
       const { workDir, github } = makeSandbox();
       const produced = await produce(workDir, github, {
         authority: authority({ approvedOperations: approvedTriples(operations().slice(0, 3)) }),
@@ -324,6 +327,23 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
       expect(github.reads).toEqual([]);
     });
 
+    it("refuses a public repository when the approval covers only a private one, with no GitHub call", async () => {
+      // RF-S25 arm:visibility: exposure cannot exceed what the approval names. The plan asks for a
+      // public repository and the approval says private, so nothing is read or written.
+      // That the approval has to be the owner's, never Hermes', is witnessed at the runner.
+      const { workDir, github } = makeSandbox();
+      const produced = await produce(workDir, github, { authority: authority({ visibility: "private" }) });
+      expect(produced.allowed).toBe(false);
+      expect(produced.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
+      expect(evidenceOf(produced)).toMatchObject({
+        refusal: "VISIBILITY_MISMATCH",
+        planned: "public",
+        approved: "private",
+      });
+      expect(github.writes).toEqual([]);
+      expect(github.reads).toEqual([]);
+    });
+
     it("stops after a create that GitHub reports under a different owner, and receipts nothing as success", async () => {
       const { workDir, github } = makeSandbox();
       github.createUnderOwner = "octocat";
@@ -366,6 +386,7 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
 
   describe("wrong target — an existing repository is ours only if a receipt's node id says so", () => {
     it("refuses a same-named repository that exists with no receipt from this operation, and writes nothing", async () => {
+      // RF-S15: an unrelated repository of the same name is RESOURCE_COLLISION, and nothing is written.
       const { workDir, github } = makeSandbox();
       const foreign = await github.seedForeign("acme", "fixture");
       const produced = await produce(workDir, github);
@@ -379,6 +400,7 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
     });
 
     it("refuses to resume onto a repository whose name was reused after our receipt — node id differs — and writes nothing", async () => {
+      // RF-S15: the same on resume: a reused name with another node id is a collision, and nothing is written.
       const { workDir, github } = makeSandbox();
       github.failNext = "pushBranch";
       expect((await produce(workDir, github)).allowed).toBe(false);
@@ -398,6 +420,8 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
 
   describe("partial failure leaves exact receipts and a resumable state, never a rollback", () => {
     it("records what succeeded, stops at the failure, and the retry performs only what is left", async () => {
+      // RF-S16 arm:single-repository: retries across one repository's operations. This producer creates one
+      // repository by construction, so the scenario itself is judged in repo-factory (REPO_FACTORY_EXTERNAL_EVIDENCE).
       const { workDir, github } = makeSandbox();
       github.failNext = "protectBranch";
       const first = await produce(workDir, github);
@@ -440,6 +464,7 @@ describe("repo factory producer performs planned GitHub operations (#246)", () =
     });
 
     it("a failure at the push leaves only the repository receipted, and the retry pushes a fresh commit to it", async () => {
+      // RF-S16 arm:single-repository (see the test above).
       const { workDir, github } = makeSandbox();
       github.failNext = "pushBranch";
       const first = await produce(workDir, github);
