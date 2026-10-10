@@ -21,3 +21,11 @@ export const FIXED_ROLE_RUNTIME: Readonly<Partial<Record<Role, FixedRoleRuntime>
   [Role.BOOTSTRAP_CTO]: Object.freeze({ provider: "claude", model: "opus" }),
   [Role.WORKER]: Object.freeze({ provider: "claude", model: "opus" }),
 });
+
+/**
+ * #246 C4 — the runtime of a PRIMARY_CTO a bootstrap activation provisions on the headless runtime:
+ * Claude Opus, like the BOOTSTRAP_CTO that built the project. Not a `FIXED_ROLE_RUNTIME` entry: the
+ * role is not fixed. Every other PRIMARY_CTO, interactive or canonical, keeps the deployment's CTO
+ * preference, and only a spawn recorded driven reads this.
+ */
+export const DRIVEN_PRIMARY_CTO_RUNTIME: FixedRoleRuntime = Object.freeze({ provider: "claude", model: "opus" });
