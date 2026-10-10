@@ -19,7 +19,7 @@ import { Daemon } from "../../src/daemon/daemon.ts";
 import { ArtifactKind, ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github-write-port.ts";
 import { HeadlessRuntimeDouble } from "../helpers/headless-runtime.ts";
 import {
@@ -905,6 +905,76 @@ describe("#246 C3 decision (d): a row a raw SQL writer forges authorises no exte
         evidence: { refusal: "APPLICATION_PHASE_INCONSISTENT", phase: "COMPLETED" },
       });
       nothingExternal(f, run);
+    });
+  });
+});
+
+/**
+ * A stored Repo Factory result as a raw database writer could write it: well-formed, naming this
+ * run, its operation, its PLAN and every planned operation, and proposing as its checkout a real git
+ * repository that is already on the machine. Nothing in it came from a write this run made.
+ */
+const forgedResult = (f: Fixture, run: ReviewedRun): Record<string, unknown> => {
+  const plan = f.harness.cp.artifacts.latest<unknown>(run.runId, ArtifactKind.PLAN);
+  const planned = plannedBootstrapOutputs({ runId: run.runId, planArtifact: plan }, run.manifest);
+  if (!planned.allowed || plan === null) throw new Error("the fixture's PLAN has no planned outputs");
+  const outputs = planned.value;
+  const checkout = makeRepo({ "README.md": "# a repository already on this machine\n" }, outputs.defaultBranch);
+  const head = gitSync(checkout, ["rev-parse", "HEAD"]);
+  const at = f.harness.clock.nowIso();
+  return {
+    schema: "repo-factory.result.v2",
+    runId: run.runId,
+    bootstrapOperationId: outputs.bootstrapOperationId,
+    planDigest: plan.digest,
+    projectManifestDigest: manifestDigest(run.manifest),
+    repositories: [{
+      role: outputs.target.repositoryRole,
+      identity: outputs.target.repositoryIdentity,
+      proposedCheckoutPath: checkout,
+      defaultBranch: outputs.defaultBranch,
+      createdBranches: [],
+    }],
+    externalWriteReceipts: outputs.githubOperations.map((operation) => ({
+      bootstrapOperationId: outputs.bootstrapOperationId,
+      requestDigest: outputs.requestDigest,
+      operationId: operation.operationId,
+      resourceType: operation.resourceType,
+      resourceIdentity: operation.resourceIdentity,
+      preexisting: false,
+      beforeStateDigest: null,
+      afterStateDigest: digestOf({ forged: operation.operationId }),
+      createdAt: at,
+      rereadAt: at,
+      verified: true,
+    })),
+    bootstrapVerification: [{
+      commandId: outputs.verification.commandId,
+      repositoryIdentity: outputs.target.repositoryIdentity,
+      exactHead: head,
+      status: "PASS",
+    }],
+    ciEvidence: [],
+    unresolvedGaps: [],
+  };
+};
+
+describe("#246 C3 decision (d): the WRITTEN chain is verified at the execution boundary", () => {
+  it("a forged WRITTEN row and a forged stored result, under the owner's own approval, consume nothing, provision nothing and write nothing", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-d-result"));
+      await approveWrites(f, run);
+      forgeApplication(f, run, "WRITTEN", 1);
+      f.harness.cp.artifacts.put(run.runId, ArtifactKind.REPO_FACTORY_RESULT, forgedResult(f, run));
+      const refused = await confirm(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+        evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" },
+      });
+      nothingExternal(f, run);
+      expect(f.harness.cp.repositories.byIdentity(BOOTSTRAP_IDENTITY)).toBeNull();
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
     });
   });
 });

@@ -37,6 +37,7 @@ import {
   githubLedgerPath,
   preflightGitHubOperations,
   readGitHubLedger,
+  toExternalWriteReceipt,
   type GitHubExecutionPlan,
   type GitHubOperation,
   type GitHubWriteAuthority,
@@ -50,7 +51,7 @@ import {
   repositoryCheckoutPath,
   type RepoFactoryPlanFixture,
 } from "./repo-factory-producer.ts";
-import { parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-result.ts";
+import { type ExternalWriteReceipt, parseRepoFactoryResult, type RepoFactoryResult } from "./repo-factory-result.ts";
 
 /**
  * Issue #246 — the PROJECT_BOOTSTRAP run path that performs a Repo Factory plan's GitHub writes
@@ -781,27 +782,16 @@ export class RepoFactoryBootstrapRunner {
       });
       if (!attempt.allowed) return atStage(attempt as Decision<ACPBootstrapActivationResult>, "precondition");
     } else {
+      // A WRITTEN application activates the result its own attempt stored, on the call after a
+      // handoff is acknowledged or after a primary CTO could not be provisioned. That result is
+      // proved to be the attempt's own before the approval is consumed or anything is activated
+      // (CEO decision (d)): a WRITTEN row and a stored result are database rows, and a database
+      // writer can write both.
+      const written = this.writtenChain(existing, workRoot, executable, execution.value);
+      if (!written.allowed) return written as Decision<ACPBootstrapActivationResult>;
       const consumed = this.deps.db.txDecision(consumeIfNew);
       if (!consumed.allowed) return atStage(consumed as Decision<ACPBootstrapActivationResult>, "approval");
-    }
-
-    // A WRITTEN application's result was stored with WRITTEN, in the control plane's own artifact
-    // store — nothing a caller or a file supplies. Activation follows it on the call after a handoff
-    // is acknowledged, or after a primary CTO could not be provisioned, and re-validates it.
-    if (existing?.phase === "WRITTEN") {
-      const retained = this.deps.artifacts.latest<unknown>(runId, ArtifactKind.REPO_FACTORY_RESULT);
-      if (retained === null) {
-        return refuse(
-          ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
-          "WRITTEN_RESULT_MISSING",
-          "the bootstrap application is WRITTEN and its stored result is missing",
-          {},
-          "activation",
-        );
-      }
-      const parsed = parseRepoFactoryResult(retained.content);
-      if (!parsed.allowed) return atStage(parsed as Decision<ACPBootstrapActivationResult>, "activation");
-      return this.activate(input, parsed.value);
+      return this.activate(input, written.value);
     }
 
     // Otherwise the producer, for a first attempt and every recovery alike: it reconciles its ledger
@@ -839,6 +829,98 @@ export class RepoFactoryBootstrapRunner {
       return atStage(produced as Decision<ACPBootstrapActivationResult>, "production");
     }
     return this.activate(input, produced.value);
+  }
+
+  /**
+   * #246 C3, CEO decision (d) — the chain a WRITTEN application is activated on, verified at the
+   * execution boundary: reservation, attempt, the writes that attempt actually made, and the result
+   * it stored. The row and the stored result are database rows a raw SQL writer can write, so neither
+   * is taken as evidence of the other. The writes are evidenced outside the database, by the
+   * attempt ledger the producer keeps in the run's work directory (each write recorded before it is
+   * made and receipted with GitHub's readback after it), and the stored result must be exactly what
+   * the producer derives from that ledger: this run, operation, PLAN and manifest; a receipt for
+   * every planned write and none pending; its write receipts equal to the ledger's as the producer
+   * states them; and its checkout this run's own leaf, carrying this operation's marker. A result
+   * that is not is refused before any approval is consumed and before anything is activated.
+   */
+  private writtenChain(
+    application: BootstrapApplication,
+    workRoot: string,
+    plan: RepoFactoryPlanFixture,
+    execution: GitHubExecutionPlan,
+  ): Decision<RepoFactoryResult> {
+    const { runId } = application;
+    const unattributed = (message: string, evidence: Evidence = {}): Decision<RepoFactoryResult> =>
+      deny(ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE, message, {
+        stage: "precondition",
+        refusal: "WRITTEN_RESULT_UNATTRIBUTED",
+        runId,
+        ...evidence,
+      });
+    const retained = this.deps.artifacts.latest<unknown>(runId, ArtifactKind.REPO_FACTORY_RESULT);
+    if (retained === null) {
+      return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE, "the bootstrap application is WRITTEN and its stored result is missing", {
+        stage: "activation",
+        refusal: "WRITTEN_RESULT_MISSING",
+        runId,
+      });
+    }
+    const parsed = parseRepoFactoryResult(retained.content);
+    if (!parsed.allowed) return atStage(parsed, "activation");
+    const result = parsed.value;
+    if (
+      result.runId !== runId ||
+      result.bootstrapOperationId !== application.bootstrapOperationId ||
+      result.planDigest !== application.planDigest ||
+      result.projectManifestDigest !== application.manifestDigest
+    ) {
+      return unattributed("the stored result names another run, operation, PLAN or manifest than the application it is activated for", {
+        result: {
+          runId: result.runId,
+          bootstrapOperationId: result.bootstrapOperationId,
+          planDigest: result.planDigest,
+          projectManifestDigest: result.projectManifestDigest,
+        },
+      });
+    }
+    const workDir = join(workRoot, runId);
+    const ledgerPath = githubLedgerPath(workDir, plan.repositoryRole);
+    const owner = { bootstrapOperationId: plan.bootstrapOperationId, requestDigest: plan.requestDigest };
+    const ledger = readGitHubLedger(ledgerPath, owner, execution.operations);
+    if (!ledger.allowed) {
+      return unattributed("the attempt ledger cannot be read as this operation's own", {
+        ledgerPath,
+        ledger: refusalRecord(ledger, "precondition"),
+      });
+    }
+    const receipts = execution.operations.map((operation) => ledger.value.receipts.get(operation.operationId));
+    if (ledger.value.pending.size > 0 || receipts.some((receipt) => receipt === undefined)) {
+      return unattributed("the attempt ledger does not hold a receipt for every planned write", {
+        ledgerPath,
+        receipted: [...ledger.value.receipts.keys()],
+        pending: [...ledger.value.pending.keys()],
+      });
+    }
+    const inOrder = (list: readonly ExternalWriteReceipt[]): ExternalWriteReceipt[] =>
+      [...list].sort((left, right) => left.operationId.localeCompare(right.operationId));
+    const expected = inOrder(receipts.map((receipt) => toExternalWriteReceipt(receipt!, owner)));
+    if (digestOf(inOrder(result.externalWriteReceipts)) !== digestOf(expected)) {
+      return unattributed("the stored result's write receipts are not the ones the attempt ledger holds", { ledgerPath });
+    }
+    const checkoutPath = repositoryCheckoutPath(workDir, plan.repositoryRole);
+    const repositories = result.repositories;
+    if (
+      repositories.length !== 1 ||
+      repositories[0]!.proposedCheckoutPath !== checkoutPath ||
+      repositories[0]!.identity !== application.repositoryIdentity ||
+      checkoutMarkerOf(checkoutPath) !== application.bootstrapOperationId
+    ) {
+      return unattributed("the stored result's checkout is not this run's own, carrying this operation's marker", {
+        checkoutPath,
+        proposed: repositories.map((repository) => repository.proposedCheckoutPath),
+      });
+    }
+    return allow(ReasonCode.OK, result);
   }
 
   /**
