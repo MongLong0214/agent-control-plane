@@ -18,12 +18,17 @@ import { RunKind } from "../domain/types.ts";
 
 /**
  * Why a CONTRACT_CHANGE PLAN was refused: one stable code per refusal, in `evidence.refusal`, the way a
- * bootstrap PLAN's refusals are named. The top-level reason code each one carries is an existing one.
+ * bootstrap PLAN's refusals are named. The top-level reason code each one carries is an existing one;
+ * the catalogue in core/reason-codes.ts gains no entry for these refusals.
  */
 export const ContractChangeRefusal = {
   /** The run names no project, so there is no contract to change. */
   PROJECT_MISSING: "CONTRACT_CHANGE_PROJECT_MISSING",
-  /** The PLAN carries no full manifest. It is refused rather than stored without one. */
+  /**
+   * The PLAN carries no full manifest. It is refused rather than stored without one, as plan_submit
+   * stored every non-bootstrap PLAN, so nothing reviewed or later activated can name a manifest the
+   * PLAN does not carry.
+   */
   MANIFEST_MISSING: "CONTRACT_CHANGE_MANIFEST_MISSING",
   MANIFEST_NOT_PORTABLE: "CONTRACT_CHANGE_MANIFEST_NOT_PORTABLE",
   /** The carried manifest is not the one `projectManifestDigest` names. */
