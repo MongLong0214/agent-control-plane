@@ -187,3 +187,39 @@ it("1084-R1-03 (record of another role): recovery does not start on a session wh
     expect(f.claude.turns.length).toBe(turns);
   });
 });
+
+it("1084-R1-05: stop failure after session-row creation fails must record the remaining resource", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const cp = f.harness.cp;
+    cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+    await registerFixtureProject(f.harness, "review-row-failure");
+    const bootstrap = await f.dispatchBootstrap();
+    const before = f.claude.started.length;
+    vi.spyOn(cp.sessions, "createWithPinnedStart").mockImplementationOnce(() => { throw new Error("fixture session-row write failure"); });
+    const stop = vi.spyOn(f.claude, "stopSession").mockRejectedValueOnce(new Error("fixture provider stop failure"));
+    await expect(cp.cto.ensureDrivenPrimaryCto("review-row-failure", bootstrap.runId)).rejects.toThrow("fixture session-row write failure");
+    expect(f.claude.started.length).toBe(before + 1);
+    expect(stop).toHaveBeenCalledTimes(1);
+    const records = cp.db.all<{ outcome: string }>(
+      "SELECT json_extract(evidence_json, '$.outcome') AS outcome FROM audit_events WHERE kind = 'PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP' AND run_id = ?", [bootstrap.runId]);
+    expect(records.map((r) => r.outcome)).toContain("REMAINING_STOP_FAILED");
+  });
+});
+
+it("1084-R1-05 (record failure): a cleanup record that cannot be written is thrown, never passed over", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const cp = f.harness.cp;
+    cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+    await registerFixtureProject(f.harness, "review-record-failure");
+    const bootstrap = await f.dispatchBootstrap();
+    vi.spyOn(cp.sessions, "createWithPinnedStart").mockImplementationOnce(() => { throw new Error("fixture session-row write failure"); });
+    vi.spyOn(f.claude, "stopSession").mockRejectedValueOnce(new Error("fixture provider stop failure"));
+    const record = cp.audit.record.bind(cp.audit);
+    vi.spyOn(cp.audit, "record").mockImplementation((entry) =>
+      entry.kind === "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP"
+        ? { allowed: false, reasonCode: ReasonCode.INTERNAL_ERROR, message: "fixture audit write failure", evidence: {} }
+        : record(entry));
+    await expect(cp.cto.ensureDrivenPrimaryCto("review-record-failure", bootstrap.runId))
+      .rejects.toThrow(/REMAINING_STOP_FAILED and could not be recorded/);
+  });
+});

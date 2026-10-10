@@ -1238,7 +1238,15 @@ export class CtoLifecycle {
         return created;
       });
     } catch (error) {
-      if (request.stopOnRefusal) await adapter.stopSession(handle).catch(() => undefined);
+      if (request.stopOnRefusal) {
+        // #246 C4-R2 — no session row exists to carry it, so a driven spawn's cleanup is recorded under
+        // its run and the provider resource itself, and a failed stop is never left unrecorded.
+        let stopped = true;
+        await adapter.stopSession(handle).catch(() => { stopped = false; });
+        if (role === Role.PRIMARY_CTO && request.drivenForActivation !== undefined) {
+          this.#recordUnpersistedSpawnCleanup(request.drivenForActivation, scope, adapter.provider, handle.externalSessionId, stopped);
+        }
+      }
       throw error;
     }
     // A refusal from here on has a provider session behind it. Every role records it ERROR; a role
@@ -1776,6 +1784,27 @@ export class CtoLifecycle {
         evidence: { reason, role: Role.PRIMARY_CTO, error: error instanceof Error ? error.message : String(error) },
       });
       this.#recordSpawnCleanup(sessionId, runId, "REMAINING_STOP_FAILED", reason);
+    }
+  }
+
+  /**
+   * #246 C4-R2 — the cleanup of a driven spawn whose session row was never written: recorded under its
+   * run and project, naming the provider resource (provider and its conversation id, no secret).
+   * The spawn is failing either way; if this record itself cannot be written, that is thrown rather
+   * than leaving the resource untracked behind an error that never mentions it.
+   */
+  #recordUnpersistedSpawnCleanup(runId: string, projectId: string, provider: string, externalSessionId: string, stopped: boolean): void {
+    const outcome: DrivenSpawnCleanupOutcome = stopped ? "STOPPED" : "REMAINING_STOP_FAILED";
+    const recorded = this.audit.record({
+      kind: DRIVEN_PRIMARY_CTO_SPAWN_CLEANUP,
+      reasonCode: stopped ? ReasonCode.OK : ReasonCode.SESSION_STOP_FAILED,
+      runId,
+      projectId,
+      sessionId: null,
+      evidence: { outcome, reason: "the session row was not written", provider, externalSessionId },
+    });
+    if (!recorded.allowed) {
+      throw new Error(`a driven spawn's provider session (${provider} ${externalSessionId}) is ${outcome} and could not be recorded`);
     }
   }
 
