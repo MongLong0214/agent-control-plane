@@ -1,0 +1,43 @@
+Limit: a bootstrap whose manifest requires CommitLore cannot run on this producer: it installs no CommitLore hook and observes no record, so the manifest must say preferred or off until something does
+Warn: at CEO confirmation the CommitLore warning is computed from the project's active manifest, and when activation answers before it from the approved manifest; a later manifest change does not rewrite a stored BOOTSTRAP_ACTIVATION_RESULT
+Record-Id: r-c5commitlore
+Provenance: inherited dd510936fdac36e77e4fb85a96af6f7c81ec6296
+
+Limit: a create-only head's tree is GitHub's initialization and is compared with no planned file; what is checked is that it is the parentless commit at the default branch of the repository this operation created, read back after the create
+Limit: GitHub initializes the owner account's default-branch name; when it is not the manifest's branchProfile.defaultBranch the bootstrap is refused INITIALIZED_BRANCH_MISMATCH and the manifest has to change
+Warn: a head this producer did not make is accepted only in initializedRepositoryStep, for a plan whose approved create says autoInit: true; the push step's UNRECEIPTED_RESOURCE refusal and the approved-tree check stay in force for every push-mode plan
+Unverified: GitHub's own auto_init is exercised only through the bare-repository double; whether the create's answer or the first read already shows the initialized branch is unmeasured, and if it does not the attempt stops INITIALIZED_HEAD_UNOBSERVED, resumable, and a producer retry adopts the create by its node id
+Record-Id: r-c5createonly
+Provenance: inherited e97033fad449c917c668b8cccedd2d6c637f24b0
+
+Limit: the only proof that a pending create was never sent is C3's withheld-request record of exactly that intent, which carries the anchor's trust boundary: an account that can write the run's work directory can fabricate one and so cause the create to be sent again
+Warn: a standalone producer call still sends a pending push, default-branch setting or protection again when GitHub shows no trace of it; only the runner's pending judgement stops those, and only the create is held in doubt here
+Record-Id: r-c5pendingcreate
+Follows: r-c5createonly
+Provenance: inherited e8f44806c856e2b2c7b3c1e86070aef1fcebe4e9
+
+Limit: a valid node id is judged by shape only (non-empty printable ASCII with no whitespace); GitHub's node id format is not pinned further, so a well-formed but wrong id is caught only by the node-id comparisons, not here
+Warn: a create whose answer was unusable leaves its repository, if it landed, unattributed: the next attempt refuses it as WRONG_TARGET with indeterminate: true, and the runner strands the application for a person
+Record-Id: r-c5provideridentity
+Follows: r-c5pendingcreate
+Provenance: inherited ab164b56fb86ab3ca9992690644aa293e772f589
+
+Limit: a same-account forged bootstrap ledger can make a preexisting repository pass the create-only readback
+Record-Id: r-c5forgedledger
+Follows: r-c5createonly
+Provenance: inherited b1889d87a7c9d4ea264b7cdf99d7954a39f8bbbe
+
+Limit: the new begin time a request sent on the withheld proof gets comes from the clock; two attempts within one clock tick give it the old begin time, and the old proof would cover it again until C3's rework consumes a proof once
+Warn: every step that may send a request again must ask unresolvedPending after adopting an effect GitHub shows and before beginning its intent, and must begin a request it sends on the proof under a new begin time; reusing the pending intent unchanged lets one proof send a request twice
+Record-Id: r-c5pendingall
+Follows: r-c5pendingcreate
+Provenance: inherited 5cd960e3a3ef30702d5cd1b56290a46c2031f3dd
+
+Limit: the only proof that a pending request was never sent is C3's withheld records of exactly that intent, with the anchor's trust boundary: an account that can write the run's work directory can fabricate them and so cause the request to be sent once more
+Warn: every step that may send a pending request again must ask unresolvedPending after adopting an effect GitHub shows and before beginning its intent; a setting or a protection is sent again under the same intent, so its proof survives an attempt that stopped before consuming it
+Warn: the exemption is consumed by the attempt inside a bootstrap attempt and by the producer outside one, chosen by withinBootstrapAttempt; a caller that runs the producer under another write guard, or outside one with the runner's records, changes who consumes it
+Record-Id: r-c5withheldv2
+Follows: r-c5pendingall
+Supersedes: r-c5pendingall
+Supersedes: r-c5pendingcreate
+Provenance: inherited 1224e8cab2b4c17dd9d058288e76202e683c7751
