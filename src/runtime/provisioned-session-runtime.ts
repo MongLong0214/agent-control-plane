@@ -359,6 +359,19 @@ export class ProvisionedSessionRuntime {
     return allow(ReasonCode.OK, undefined);
   }
 
+  /**
+   * #246 C4-R2 — takes back the attestation a failed attempt would have proved, and only that one:
+   * the stored attestation is cleared when it is for the attempt's own incarnation and credential
+   * epoch. One a newer epoch earned while this attempt was still out is left exactly as it is.
+   */
+  #withdrawAttestation(sessionId: string, attempt: { incarnation: string; credentialEpoch: number } | null): void {
+    const stored = this.#attested.get(sessionId);
+    if (!stored || !attempt) return;
+    if (stored.incarnation === attempt.incarnation && stored.credentialEpoch === attempt.credentialEpoch) {
+      this.#attested.delete(sessionId);
+    }
+  }
+
   /** The daemon's launch channel and socket paths. Until both are attached no turn can run. */
   attach(ports: { delivery?: SessionCredentialDelivery; route?: SessionRelayRoute }): void {
     if (ports.delivery) this.#delivery = ports.delivery;
@@ -398,6 +411,16 @@ export class ProvisionedSessionRuntime {
   }
 
   /**
+   * #246 C4-R2 — gives up custody of exactly one credential: the session's, at this incarnation and
+   * credential epoch. The held credential and its attestation are dropped only when they are for
+   * that very epoch; a newer one adopted since, its attestation and the session's lane are kept.
+   */
+  relinquish(sessionId: string, incarnation: string, credentialEpoch: number): void {
+    if (this.#held.get(sessionId)?.credentialEpoch === credentialEpoch) this.#held.delete(sessionId);
+    this.#withdrawAttestation(sessionId, { incarnation, credentialEpoch });
+  }
+
+  /**
    * Proves the session's runtime is reachable and holds its current credential: one turn of its
    * own conversation whose relay presents a fresh challenge over an authenticated connection.
    */
@@ -411,6 +434,11 @@ export class ProvisionedSessionRuntime {
       // has stands — a turn it may not run is no evidence against the one it ran.
       const eligible = this.turnEligibility(sessionId, "attestation", conversation, spawn);
       if (!eligible.allowed) return eligible;
+      // #246 C4-R2 — the incarnation and credential epoch this attempt proves, fixed before it awaits
+      // anything. Its outcome is written for exactly these and nothing newer: a late failure of an
+      // earlier epoch never takes back an attestation a later epoch has since earned.
+      const before = this.ports.sessions.get(sessionId);
+      const attempt = before ? { incarnation: before.incarnation, credentialEpoch: before.credentialEpoch } : null;
       const challenge = this.ports.attestations.challenge(sessionId);
       if (!challenge.allowed) return challenge as Decision<void>;
       const nonce = challenge.value.nonce;
@@ -423,16 +451,16 @@ export class ProvisionedSessionRuntime {
       // The turn awaited; whatever made it eligible is read again before the answer counts.
       const still = turn.allowed ? this.turnEligibility(sessionId, "attestation", conversation, spawn) : turn;
       if (!still.allowed) {
-        this.#attested.delete(sessionId);
+        this.#withdrawAttestation(sessionId, attempt);
         this.ports.attestations.withdraw(sessionId, nonce);
         return still as Decision<void>;
       }
       const settled = this.ports.attestations.settle(sessionId, nonce);
-      const session = this.ports.sessions.get(sessionId);
-      if (settled.allowed && session) {
-        this.#attested.set(sessionId, { incarnation: session.incarnation, credentialEpoch: session.credentialEpoch });
+      // `settle` refuses a challenge whose epoch moved, so a settled attempt is the current one.
+      if (settled.allowed && attempt) {
+        this.#attested.set(sessionId, attempt);
       } else {
-        this.#attested.delete(sessionId);
+        this.#withdrawAttestation(sessionId, attempt);
       }
       return settled;
     });
@@ -655,7 +683,12 @@ export class ProvisionedSessionRuntime {
     const session = this.ports.sessions.get(sessionId);
     if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
     const held = this.#held.get(sessionId);
-    const adapter = this.#adapterFor(session, held?.role ?? Role.BOOTSTRAP_CTO);
+    // With no credential held (a recovery's `probe`), the adapter is the one for the role the session
+    // was spawned for: a driven PRIMARY_CTO's own role-scoped adapter, never the bootstrap CTO's.
+    const adapter = this.#adapterFor(
+      session,
+      held?.role ?? (this.ports.outbox.drivenModeOf(sessionId) === "NONE" ? Role.BOOTSTRAP_CTO : Role.PRIMARY_CTO),
+    );
     if (!adapter.allowed) return adapter as Decision<SessionTurnResult>;
     const provider = adapter.value;
     if (!provider.runSessionTurn) {

@@ -17,9 +17,11 @@ import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
 import { isTerminal } from "../domain/run-state.ts";
-import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import { ContinuityMode, Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
+import { drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
+import { isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
@@ -564,6 +566,12 @@ export class ContinuityKernel {
     // be a new conversation with no credential its runtime could present. Owner loss revokes and
     // pauses instead (the daemon's refusal path), and `restore()` recovers the same session.
     if (role === Role.BOOTSTRAP_CTO) return bootstrapCtoNotReplaceable(roleKey);
+    // #246 C4-R2 — nor is a PRIMARY_CTO whose holder has a driven-spawn record: its conversation lives
+    // in its own session, which is recovered on itself (`CtoLifecycle.recoverDrivenPrimaryCto`).
+    // The holder read here is the one this failover may replace: fenced before the first await, so
+    // a binding that arrives while evaluation or admission is awaited is refused, never replaced.
+    const fenced = role === Role.PRIMARY_CTO ? this.bindings.active(roleKey) : null;
+    if (fenced && drivenModeOf(this.db, fenced.sessionId) !== "NONE") return drivenPrimaryNotReplaceable(roleKey, fenced.sessionId);
     const plan = await this.evaluate(`failover:${roleKey}`);
     const assignment = plan.assignments.find((a) => a.roleKey === roleKey);
     const required = plan.requiredRoles.find((candidate) => candidate.roleKey === roleKey);
@@ -607,6 +615,13 @@ export class ContinuityKernel {
     if (endedBeforeSpawn) return endedBeforeSpawn;
 
     const expected = this.bindings.active(roleKey);
+    if (role === Role.PRIMARY_CTO && !sameHolder(fenced, expected)) {
+      return deny(ReasonCode.BINDING_GENERATION_STALE, "the role's binding changed while the failover was admitted; it is not replaced", {
+        roleKey,
+        fencedGeneration: fenced?.bindingGeneration ?? null,
+        currentGeneration: expected?.bindingGeneration ?? null,
+      });
+    }
     // #954 — a role continuity revoked for want of coverage gets its binding back only from a claim
     // (see `restore()`). With no active binding `switchTo` has no current row to replace, reads the
     // unmatched attestation as a replacement, and inserts a fresh assignment, so this public method
@@ -633,15 +648,24 @@ export class ContinuityKernel {
       return endedAfterSpawn;
     }
 
-    // This catches a newer binding that arrived while session creation, route connection,
-    // or readiness was awaited. BindingRegistry still performs the final generation check
-    // transactionally (see the handoff for the required cross-owner parameter).
     const current = this.bindings.active(roleKey);
-    if (
-      current?.assignmentId !== expected?.assignmentId ||
-      current?.bindingGeneration !== expected?.bindingGeneration
-    ) {
-      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "coverage plan superseded");
+    // #246 C4-R2 — first, a holder with a driven-spawn record is never replaced, however it came to hold.
+    if (role === Role.PRIMARY_CTO && current && drivenModeOf(this.db, current.sessionId) !== "NONE") {
+      await this.#retireUnusedReplacement(provisioned.value.sessionId, role, "the holder is a driven primary CTO");
+      return drivenPrimaryNotReplaceable(roleKey, current.sessionId);
+    }
+
+    // This catches a newer binding that arrived while session creation, route connection,
+    // or readiness was awaited. #246 C4-R2 — for a PRIMARY_CTO, the whole holder (assignment,
+    // generation, runtime and incarnation), since a surviving move keeps the first two, and
+    // BindingRegistry checks the same exact binding again at the switch's own write boundary
+    // (`expectedCurrent`). Other roles keep the generation check: a CEO whose runtime moves right
+    // before the switch is replaced, as #649 specifies.
+    const superseded = role === Role.PRIMARY_CTO
+      ? !sameHolder(expected, current)
+      : current?.assignmentId !== expected?.assignmentId || current?.bindingGeneration !== expected?.bindingGeneration;
+    if (superseded) {
+      await this.#retireUnusedReplacement(provisioned.value.sessionId, role, "coverage plan superseded");
       return deny(ReasonCode.BINDING_GENERATION_STALE, "coverage plan was superseded by a newer binding", {
         roleKey,
         expectedGeneration: expected?.bindingGeneration ?? null,
@@ -663,17 +687,21 @@ export class ContinuityKernel {
       conversation: "SURVIVED",
       requireCurrentTargetAttestation: true,
       expectedCurrentGeneration: expected?.bindingGeneration,
+      ...(role === Role.PRIMARY_CTO && expected
+        ? { expectedCurrent: { assignmentId: expected.assignmentId, sessionId: expected.sessionId, sessionIncarnation: expected.sessionIncarnation } }
+        : {}),
       // A failover of a role that still owns live work is a takeover: the runs move to the
       // new generation in the same transaction rather than being orphaned.
       takeover: true,
     });
     if (!switched.allowed) {
       // #512 — the registry's own fence refused a WORKER whose run ended after the check above: the
-      // session this attempt provisioned is stopped through its provider, as for that check.
+      // session this attempt provisioned is stopped through its provider, as for that check. Any
+      // other refused switch retires its replacement the same way (#246 C4-R2).
       if (role === Role.WORKER && switched.reasonCode === ReasonCode.RUN_ALREADY_TERMINAL) {
         await this.#stopUnboundWorkerSession(provisioned.value.sessionId, role, "failover rejected: the worker's run ended");
       } else {
-        this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "failover rejected");
+        await this.#retireUnusedReplacement(provisioned.value.sessionId, role, "failover rejected");
       }
       return switched as Decision<{ provider: string; generation: number }>;
     }
@@ -1250,6 +1278,8 @@ export class ContinuityKernel {
     }
     // Recorded with its native start pinned beside the lstart, read as one snapshot of one process
     // (ACP1045-R2-01, R3-01); see `SessionRegistry.createWithPinnedStart`.
+    // #246 C4-R2 — from here the provider has a session this attempt started; every refusal below
+    // stops it through the provider (`#retireUnusedReplacement`), not by marking its row alone.
     const session = this.sessions.createWithPinnedStart({
       provider: adapter.provider,
       model,
@@ -1267,7 +1297,7 @@ export class ContinuityKernel {
     });
     const connected = await buzz.connect(session.sessionId, purpose);
     if (!connected.allowed) {
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "buzz connect failed");
+      await this.#retireUnusedReplacement(session.sessionId, role, "buzz connect failed");
       return connected as Decision<{ sessionId: string }>;
     }
     this.sessions.setBuzzAddress(session.sessionId, connected.value);
@@ -1276,7 +1306,7 @@ export class ContinuityKernel {
       runtime = await adapter.probeSession(handle);
     } catch (err) {
       await this.capacity.refresh(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, [provider]);
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe threw");
+      await this.#retireUnusedReplacement(session.sessionId, role, "provider session probe threw");
       return deny(ReasonCode.SESSION_NOT_READY, "provider session probe did not complete", {
         provider,
         error: (err as Error).message,
@@ -1285,7 +1315,7 @@ export class ContinuityKernel {
     }
     if (runtime !== "HEALTHY") {
       await this.capacity.refresh(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, [provider]);
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe failed");
+      await this.#retireUnusedReplacement(session.sessionId, role, "provider session probe failed");
       return deny(ReasonCode.SESSION_NOT_READY, "provider cannot prove the constituted session is ready", {
         provider,
         runtime,
@@ -1295,10 +1325,66 @@ export class ContinuityKernel {
     this.sessions.transition(session.sessionId, SessionLifecycle.READY, "provider session and route verified");
     const checked = await readiness.checkSession(session.sessionId);
     if (!checked.allowed) {
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "readiness failed");
+      await this.#retireUnusedReplacement(session.sessionId, role, "readiness failed");
       return checked as Decision<{ sessionId: string }>;
     }
     return allow(ReasonCode.OK, { sessionId: session.sessionId });
+  }
+
+  /**
+   * #246 C4-R2 — retires a session this continuity attempt started and will not use (a refused
+   * failover, or a provisioning that failed after the provider started it), through the provider's
+   * own stop, never by a row transition alone. It holds no role, by its row or as an actor's
+   * runtime, and is no adopted canonical runtime — proven, and the session moved out of READY, in one
+   * transaction before the stop is awaited, so no bind or actor move can adopt it meanwhile and no
+   * other holder is ever the target. Only a stop that returned is recorded STOPPED; a failed stop
+   * leaves it ERROR, recorded `REMAINING_STOP_FAILED`, and one that could not be proven unused is
+   * left alone and recorded `REMAINING_OWNERSHIP_UNVERIFIED`.
+   */
+  async #retireUnusedReplacement(sessionId: string, role: Role, reason: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    const record = (outcome: "STOPPED" | "REMAINING_STOP_FAILED" | "REMAINING_OWNERSHIP_UNVERIFIED"): void => {
+      this.audit.record({
+        kind: "CONTINUITY_REPLACEMENT_CLEANUP",
+        reasonCode: outcome === "STOPPED" ? ReasonCode.OK : ReasonCode.SESSION_STOP_FAILED,
+        sessionId,
+        evidence: { outcome, reason, role },
+      });
+    };
+    const reserved = this.db.txDecision<void>(() => {
+      const holds = this.db.get<{ held: number }>(
+        `SELECT 1 AS held FROM assignments a
+           LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+          WHERE a.status = 'ACTIVE' AND (a.session_id = ? OR c.current_session_id = ?)
+          LIMIT 1`,
+        [sessionId, sessionId],
+      ) !== undefined;
+      // An adopted canonical runtime is never this attempt's to stop, whatever its assignments say: a
+      // canonical actor may still point at it with every assignment revoked.
+      if (!session || holds || isAdoptedCanonicalRuntime(this.db, sessionId)) {
+        return deny<void>(ReasonCode.CONFLICT, "the replacement holds a role or is a canonical runtime", { sessionId });
+      }
+      const moved = this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: stopping`);
+      return moved.allowed ? allow(ReasonCode.OK, undefined) : (moved as Decision<unknown> as Decision<void>);
+    });
+    if (!reserved.allowed || !session) {
+      record("REMAINING_OWNERSHIP_UNVERIFIED");
+      return;
+    }
+    try {
+      await this.providers.requireForRole(session.provider, role).stopSession({
+        externalSessionId: session.incarnation.split("#")[0] ?? session.sessionId,
+        provider: session.provider,
+        model: session.model,
+        effort: session.effort,
+        pid: session.osPid,
+        ...(session.workdir ? { workdir: session.workdir } : {}),
+      });
+      this.sessions.transition(sessionId, SessionLifecycle.STOPPED, `${reason}: stopped`);
+      record("STOPPED");
+    } catch {
+      record("REMAINING_STOP_FAILED");
+    }
   }
 
   private partialAction(byProvider: Map<string, ProviderCapacity>): CoverageAction {
@@ -1313,6 +1399,24 @@ export class ContinuityKernel {
     return "PAUSE_NEW_WORK";
   }
 }
+
+/** #246 C4-R2 — continuity's answer for replacing a driven PRIMARY_CTO: it is recovered on its own session. */
+const drivenPrimaryNotReplaceable = <T>(roleKey: string, sessionId: string): Decision<T> =>
+  deny(
+    ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
+    "a driven primary CTO is never failed over to another session; it is recovered on its own",
+    { roleKey, sessionId },
+  );
+
+/** #246 C4-R2 — the same holder: no binding at all on both sides, or the same assignment on the same runtime. */
+const sameHolder = (fenced: RoleBinding | null, current: RoleBinding | null): boolean =>
+  fenced === null
+    ? current === null
+    : current !== null &&
+      current.assignmentId === fenced.assignmentId &&
+      current.bindingGeneration === fenced.bindingGeneration &&
+      current.sessionId === fenced.sessionId &&
+      current.sessionIncarnation === fenced.sessionIncarnation;
 
 /** #246 C1-02 — continuity's one answer for a bootstrap CTO replacement: none is constituted. */
 const bootstrapCtoNotReplaceable = <T>(roleKey: string | null): Decision<T> =>
