@@ -10,6 +10,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { type ProjectManifest, assertPortableManifest, manifestDigest } from "../contracts/manifest.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
+import { holderProvenGone } from "../daemon/single-instance.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { ArtifactKind, Role, RunKind, RunState, roleKeyFor, type RunRow } from "../domain/types.ts";
 import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
@@ -21,6 +22,7 @@ import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { ACPBootstrapActivationResult, BootstrapActivation } from "./activation.ts";
 import type {
+  AttemptWriter,
   BootstrapApplication,
   BootstrapApplicationReservation,
   BootstrapApplications,
@@ -396,6 +398,8 @@ export class RepoFactoryBootstrapRunner {
   readonly #applying = new Set<string>();
   /** #246 C3 — whether this process holds the control plane's single-writer lock; see `attachWriterLock`. */
   #writerLockHeld: (() => boolean) | null = null;
+  /** #246 C3 — the identity of the daemon process holding that lock; see `attachWriterLock`. */
+  #writerIdentity: (() => AttemptWriter | null) | null = null;
 
   constructor(private readonly deps: RepoFactoryBootstrapRunnerDeps) {}
 
@@ -405,8 +409,17 @@ export class RepoFactoryBootstrapRunner {
    * ended. Never attached, that cannot be shown: a new attempt after an earlier one, and a release,
    * are refused.
    */
-  attachWriterLock(held: () => boolean): void {
+  attachWriterLock(held: () => boolean, identity: (() => AttemptWriter | null) | null = null): void {
     this.#writerLockHeld = held;
+    this.#writerIdentity = identity;
+  }
+
+  /**
+   * The daemon process this attempt runs in, as its lock holder record names it, recorded with the
+   * attempt so a later one can prove it has ended. Null when no identity is attached.
+   */
+  private currentWriter(): AttemptWriter | null {
+    return this.#writerIdentity?.() ?? null;
   }
 
   /**
@@ -722,11 +735,20 @@ export class RepoFactoryBootstrapRunner {
       const consumable = this.deps.ownerAuthority.assertConsumable(receipt.value, input.candidateSnapshotDigest);
       if (!consumable.allowed) return atStage(consumable as Decision<ACPBootstrapActivationResult>, "approval");
     }
-    /** Consumes the receipt inside the caller's transaction unless it was already consumed for this candidate. */
-    const consumeIfNew = (): Decision<void> =>
-      retainedApproval.allowed
-        ? allow(ReasonCode.OK, undefined)
-        : this.deps.ownerAuthority.consumeApproval(receipt.value, input.candidateSnapshotDigest);
+    const presentedReceiptDigest = digestOf(receipt.value);
+    /** Set when an existing execution's approval identity was unproven and this new approval becomes it. */
+    let approvalToRecord: string | null = null;
+    /**
+     * Consumes the receipt inside the caller's transaction unless it was already consumed for this
+     * candidate. A resume of an existing execution never gets here with a receipt to consume: it runs
+     * on the receipt its reservation consumed, verified, not consumed again.
+     */
+    const consumeIfNew = (): Decision<void> => {
+      if (retainedApproval.allowed) return allow(ReasonCode.OK, undefined);
+      const consumed = this.deps.ownerAuthority.consumeApproval(receipt.value, input.candidateSnapshotDigest);
+      if (consumed.allowed && approvalToRecord !== null) this.deps.applications.recordApprovalIdentity(runId, approvalToRecord);
+      return consumed;
+    };
 
     // What this CONFIRM would reserve: the manifest's project id and the repository it creates,
     // under the digests of what was confirmed and approved.
@@ -754,6 +776,42 @@ export class RepoFactoryBootstrapRunner {
           "this bootstrap run's application is frozen on the candidate and approval it reserved; a CONFIRM can only re-apply those",
           { drift, reserved: { ...existing, lastRefusal: undefined }, confirmed: reservation },
         );
+      }
+    }
+    // #246 C3, the CEO's ruling on inheritance — a CONFIRM of an existing application resumes the SAME
+    // approved execution. The owner receipt its reservation consumed is its basis: verified here
+    // against its durable consumption for this candidate, never consumed, re-issued or admitted again,
+    // and no other approval is admitted for the same execution. A new owner approval is required only
+    // when that identity cannot be proven; it is then consumed and recorded as the identity. A new run,
+    // and any change of target, owner, visibility, PLAN, manifest or write scope, needs a new owner
+    // approval too: those are refused above, by the receipt's run and parameters and by the freeze.
+    if (existing !== null) {
+      const identity = this.provenApprovalIdentity(
+        runId,
+        input.candidateSnapshotDigest,
+        presentedReceiptDigest,
+        retainedApproval.allowed,
+      );
+      if (identity !== null) {
+        if (presentedReceiptDigest !== identity) {
+          return refuse(
+            ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+            "APPROVAL_NOT_THIS_EXECUTION",
+            "this bootstrap application resumes on the owner approval its reservation consumed; another approval is not admitted for the same execution",
+            { approvalIdentity: identity, presented: presentedReceiptDigest },
+            "approval",
+          );
+        }
+      } else if (retainedApproval.allowed) {
+        return refuse(
+          ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+          "NEW_OWNER_APPROVAL_REQUIRED",
+          "this bootstrap application's approval identity cannot be proven, so it continues only under a new owner approval; an approval already consumed is not taken for it",
+          { presented: presentedReceiptDigest },
+          "approval",
+        );
+      } else {
+        approvalToRecord = presentedReceiptDigest;
       }
     }
     const held = this.reservationConflicts(reservation, existing);
@@ -795,7 +853,10 @@ export class RepoFactoryBootstrapRunner {
         if (!fresh.allowed) return fresh as Decision<BootstrapApplication>;
         const consumed = consumeIfNew();
         if (!consumed.allowed) return consumed as Decision<BootstrapApplication>;
-        return this.deps.applications.reserve(reservation);
+        return this.deps.applications.reserve(reservation, {
+          approvalReceiptDigest: presentedReceiptDigest,
+          writer: this.currentWriter(),
+        });
       });
       if (!reserved.allowed) return atStage(reserved as Decision<ACPBootstrapActivationResult>, "approval");
       attempt = reserved.value.attempts;
@@ -805,7 +866,7 @@ export class RepoFactoryBootstrapRunner {
         if (!applicable.allowed) return applicable as Decision<BootstrapApplication>;
         const consumed = consumeIfNew();
         if (!consumed.allowed) return consumed as Decision<BootstrapApplication>;
-        return this.deps.applications.recordAttempt(runId, existing.attempts);
+        return this.deps.applications.recordAttempt(runId, existing.attempts, this.currentWriter());
       });
       if (!recorded.allowed) return atStage(recorded as Decision<ACPBootstrapActivationResult>, "precondition");
       attempt = recorded.value.attempts;
@@ -827,13 +888,27 @@ export class RepoFactoryBootstrapRunner {
     // or its creation receipt — performs what is left, and rebuilds the result. It builds that in a
     // checkout of this attempt's own, created exclusively and kept if the attempt fails; nothing an
     // earlier attempt left is reused. The result and WRITTEN are stored in one transaction.
+    let ledgerStageRecorded = false;
     const produced = await produceRepoFactoryResult({
       plan: executable,
       workDir,
       checkoutPath: attemptCheckoutPath(workDir, executable.repositoryRole, attempt),
       keepCheckoutOnFailure: true,
       // CEO decision (b): durably, before the attempt's first ledger write and so before any request.
-      beforeLedgerWrite: () => this.deps.applications.recordLedgerStage(runId, attempt),
+      // And every completed write keeps the attempt that first recorded it: a receipt an earlier
+      // attempt recorded is only referred to by this one, never recorded as its own.
+      beforeLedgerWrite: (state) => {
+        if (!ledgerStageRecorded) {
+          this.deps.applications.recordLedgerStage(runId, attempt);
+          ledgerStageRecorded = true;
+        }
+        const attributed = this.deps.applications.receiptAttribution(runId);
+        for (const written of state.receipts) {
+          if (!attributed.has(written.operationId)) {
+            this.deps.applications.recordReceiptAttribution(runId, attempt, written.operationId, digestOf(written));
+          }
+        }
+      },
       clock: this.deps.clock,
       github: { port: this.deps.githubPort, authority },
       // The reviewed files, and the tree the producer reports must be exactly these (#246 C2).
@@ -864,17 +939,49 @@ export class RepoFactoryBootstrapRunner {
   }
 
   /**
-   * #246 C3, CEO decision (c) — whether every earlier attempt of this application has ended with no
-   * writer left, asked before a new one starts. This CONFIRM holds the run's in-process slot
-   * (`produceAndActivate`), so no attempt of the run runs here; this process holding the control
-   * plane's single-writer lock means no other control-plane process runs, so an attempt a dead
-   * daemon started has ended; and no git lock file in any earlier attempt's checkout means no git
-   * process is still writing there. An earlier checkout that is not a plain directory of ours, or
-   * that cannot be read in full, cannot be shown to be still: unclear is IN_DOUBT, and nothing is
-   * attempted. Nothing here touches an earlier checkout.
+   * #246 C3 — the approval identity of an existing application's execution, when it can be proven:
+   * the receipt its reservation (or a later required approval) consumed, shown by the owner authority
+   * to have been consumed for this candidate — the presented receipt itself when it is that one, or
+   * else that receipt as an owner approval recorded on the run. Null when it cannot be proven: then
+   * only a new owner approval continues the execution.
+   */
+  private provenApprovalIdentity(
+    runId: string,
+    candidateSnapshotDigest: string,
+    presentedReceiptDigest: string,
+    presentedConsumedForCandidate: boolean,
+  ): string | null {
+    const identity = this.deps.applications.approvalIdentity(runId);
+    if (identity === null) return null;
+    if (identity === presentedReceiptDigest) return presentedConsumedForCandidate ? identity : null;
+    const receipt = this.deps.artifacts
+      .list<unknown>(runId, ArtifactKind.APPROVAL)
+      .map((artifact) => recordedApprovalSchema.safeParse(artifact.content))
+      .flatMap((recorded) => (recorded.success ? [ownerApprovalReceiptSchema.safeParse(recorded.data.receipt)] : []))
+      .flatMap((parsed) => (parsed.success ? [parsed.data] : []))
+      .find((candidate) => digestOf(candidate) === identity);
+    if (receipt === undefined) return null;
+    return this.deps.ownerAuthority.assertConsumedApproval(receipt, candidateSnapshotDigest).allowed ? identity : null;
+  }
+
+  /**
+   * #246 C3, CEO decision (c), tightened — whether every earlier attempt of this application, and the
+   * process that wrote for it, is proven to have ended, asked before a new attempt starts. Nothing is
+   * inferred: each earlier attempt's writer — the daemon process recorded with it, by pid and OS start
+   * token — must be this very process, in which the run's in-process slot this CONFIRM holds shows the
+   * attempt has returned, or a process proven gone: no process at that pid, or one with another start
+   * token. That needs this process to hold the single-writer lock and to know its own identity.
+   * Only the daemon writes an attempt's checkout: a provisioned BOOTSTRAP_CTO's turns run restricted
+   * and sandboxed, with the deployment's state root denied to them. Its git and gh subprocesses are not
+   * recorded, so one a killed daemon left running is seen only through the lock files it holds in an
+   * earlier checkout's .git; and the checkouts directory and every earlier checkout must be plain
+   * directories. An attempt with no recorded writer, a writer still running, or anything unreadable
+   * is IN_DOUBT, and nothing is attempted. Nothing here touches an earlier checkout.
    */
   private earlierAttemptsEnded(application: BootstrapApplication, workDir: string, repositoryRole: string): Decision<void> {
     const writerLockHeld = this.#writerLockHeld?.() === true;
+    const current = this.currentWriter();
+    const writers = this.deps.applications.attemptWriters(application.runId);
     // The directory every attempt's checkout is in: absent, or a real directory, never a symlink.
     const checkoutsDir = dirname(attemptCheckoutPath(workDir, repositoryRole, 1));
     let checkoutsDirKind: string;
@@ -884,7 +991,14 @@ export class RepoFactoryBootstrapRunner {
     } catch (error) {
       checkoutsDirKind = (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable";
     }
-    const earlier: Array<{ attempt: number; path: string; kind: string; gitLockFiles: string[] | null }> = [];
+    const earlier: Array<{
+      attempt: number;
+      path: string;
+      kind: string;
+      gitLockFiles: string[] | null;
+      writer: AttemptWriter | null;
+      writerEnded: "THIS_PROCESS" | "PROVEN_GONE" | "NOT_PROVEN_GONE" | "UNRECORDED";
+    }> = [];
     for (let attempt = 1; attempt <= application.attempts; attempt += 1) {
       const path = attemptCheckoutPath(workDir, repositoryRole, attempt);
       let kind: string;
@@ -895,19 +1009,35 @@ export class RepoFactoryBootstrapRunner {
         kind = (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable";
       }
       const locks = kind === "directory" ? gitLockFiles(path) : kind === "absent" ? [] : null;
-      earlier.push({ attempt, path, kind, gitLockFiles: locks });
+      const writer = writers.get(attempt) ?? null;
+      const writerEnded =
+        writer === null
+          ? "UNRECORDED"
+          : current !== null && current.startToken !== null && writer.pid === current.pid && writer.startToken === current.startToken
+            ? "THIS_PROCESS"
+            : holderProvenGone({ pid: writer.pid, startedAt: writer.startedAt, startToken: writer.startToken, path: "" })
+              ? "PROVEN_GONE"
+              : "NOT_PROVEN_GONE";
+      earlier.push({ attempt, path, kind, gitLockFiles: locks, writer, writerEnded });
     }
     if (
       writerLockHeld &&
+      current !== null &&
+      current.startToken !== null &&
       (checkoutsDirKind === "directory" || checkoutsDirKind === "absent") &&
-      earlier.every((entry) => entry.gitLockFiles !== null && entry.gitLockFiles.length === 0)
+      earlier.every(
+        (entry) =>
+          entry.gitLockFiles !== null &&
+          entry.gitLockFiles.length === 0 &&
+          (entry.writerEnded === "THIS_PROCESS" || entry.writerEnded === "PROVEN_GONE"),
+      )
     ) {
       return allow(ReasonCode.OK, undefined);
     }
     return deny(
       ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
-      "an earlier attempt of this bootstrap run cannot be shown to have ended with no writer left, so no new attempt starts; it stays in doubt",
-      { refusal: "EARLIER_ATTEMPT_IN_DOUBT", runId: application.runId, writerLockHeld, checkoutsDir, checkoutsDirKind, earlier },
+      "an earlier attempt of this bootstrap run, or the process that wrote for it, cannot be shown to have ended, so no new attempt starts; it stays in doubt",
+      { refusal: "EARLIER_ATTEMPT_IN_DOUBT", runId: application.runId, writerLockHeld, current, checkoutsDir, checkoutsDirKind, earlier },
     );
   }
 
@@ -1143,10 +1273,29 @@ export class RepoFactoryBootstrapRunner {
       if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(unanswered, "precondition"));
       return unanswered;
     }
-    if (observed === null) return allow(ReasonCode.OK, undefined);
     const createOperation = execution.operations.find((operation) => operation.resourceType === "repository");
     const receipt = createOperation === undefined ? undefined : ledger.value.receipts.get(createOperation.operationId);
     const pending = createOperation === undefined ? undefined : ledger.value.pending.get(createOperation.operationId);
+    // #246 C3 — a create this run sent whose answer never arrived cannot be confirmed: with nothing at
+    // the target now, it may still land; with something there, it cannot be told from someone
+    // else's. Neither is written again. Nothing at the target is IN_DOUBT; something there strands.
+    if (observed === null && existing !== null && pending !== undefined && pending.respondedNodeId === null && receipt === undefined) {
+      const unconfirmed = deny(
+        ReasonCode.BOOTSTRAP_APPLICATION_IN_PROGRESS,
+        "a create this run sent was never answered and cannot be confirmed; it is not sent again, and the application stays in doubt",
+        {
+          stage: "precondition",
+          refusal: "UNCONFIRMED_PENDING_REQUEST",
+          runId,
+          target: `${execution.target.owner}/${execution.target.name}`,
+          operationId: createOperation?.operationId ?? null,
+          ledgerPath,
+        },
+      );
+      this.deps.applications.recordRefusal(runId, refusalRecord(unconfirmed, "precondition"));
+      return unconfirmed;
+    }
+    if (observed === null) return allow(ReasonCode.OK, undefined);
     const recordedNodeId = receipt?.resourceType === "repository" ? receipt.observed.nodeId : pending?.respondedNodeId ?? null;
     if (recordedNodeId !== null && recordedNodeId === observed.nodeId) return allow(ReasonCode.OK, undefined);
     const evidence = {

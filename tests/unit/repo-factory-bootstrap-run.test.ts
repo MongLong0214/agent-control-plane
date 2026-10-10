@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
@@ -201,9 +202,11 @@ const prepare = async (
     projects: harness.cp.projects,
     repositories: harness.cp.repositories,
   });
-  // #246 C3 — no daemon runs here: the test process is the only control-plane writer, which a
-  // daemon's single-instance lock attests in production. A new attempt after an earlier one asks it.
-  runner.attachWriterLock(() => true);
+  // #246 C3 — no daemon runs here: the test process is the only control-plane writer, and every
+  // attempt runs in it, which a daemon's single-instance lock and its holder record attest in
+  // production. A new attempt after an earlier one asks both.
+  const thisProcess = { pid: process.pid, startToken: readProcessStartToken(process.pid), startedAt: new Date().toISOString() };
+  runner.attachWriterLock(() => true, () => thisProcess);
   // The CEO's admission, which the runner asks among its pre-write checks, needs a current
   // continuity evaluation, as the CONFIRM door has before it calls the runner.
   await harness.cp.continuity.evaluate("bootstrap confirmation");

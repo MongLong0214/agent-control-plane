@@ -86,6 +86,24 @@ export interface BootstrapApplication extends BootstrapApplicationReservation {
 }
 
 /**
+ * #246 C3 — the daemon process an application attempt ran in, as its single-instance lock holder
+ * record names it: the pid and the OS start token that tells a reused pid from it. Recorded with
+ * every attempt, so a later attempt can prove the earlier one's process has ended.
+ */
+export interface AttemptWriter {
+  pid: number;
+  startToken: string | null;
+  startedAt: string;
+}
+
+/** What else a reservation records beside its row: the approval it consumed and who made its first attempt. */
+export interface ReservationProvenance {
+  /** The digest of the owner receipt consumed with the reservation: the execution's approval identity. */
+  approvalReceiptDigest: string;
+  writer: AttemptWriter | null;
+}
+
+/**
  * Why a STRANDED application was stranded, and what a person does about it. Kept in the row's
  * `last_refusal_json` with the evidence, and repeated by the doctor's finding.
  */
@@ -231,7 +249,7 @@ export class BootstrapApplications {
    * all. A reservation another run holds is refused here by the UNIQUE constraints' guard, whatever a
    * caller checked before.
    */
-  reserve(reservation: BootstrapApplicationReservation): Decision<BootstrapApplication> {
+  reserve(reservation: BootstrapApplicationReservation, provenance: ReservationProvenance): Decision<BootstrapApplication> {
     return this.guarded(() => {
       this.db.run(
         `INSERT INTO bootstrap_applications (run_id, project_id, repository_identity, bootstrap_operation_id,
@@ -250,9 +268,9 @@ export class BootstrapApplications {
         kind: "BOOTSTRAP_APPLICATION_RESERVED",
         runId: reservation.runId,
         projectId: null,
-        evidence: { ...reservation },
+        evidence: { ...reservation, approvalReceiptDigest: provenance.approvalReceiptDigest },
       });
-      return this.recordAttempt(reservation.runId, 0);
+      return this.recordAttempt(reservation.runId, 0, provenance.writer);
     });
   }
 
@@ -261,7 +279,7 @@ export class BootstrapApplications {
    * a compare-and-set on the count the caller read. A concurrent attempt that read the same count
    * loses here and writes nothing.
    */
-  recordAttempt(runId: string, expectedAttempts: number): Decision<BootstrapApplication> {
+  recordAttempt(runId: string, expectedAttempts: number, writer: AttemptWriter | null = null): Decision<BootstrapApplication> {
     return this.guarded(() => {
       const updated = this.db.run(
         `UPDATE bootstrap_applications SET attempts = attempts + 1
@@ -279,7 +297,12 @@ export class BootstrapApplications {
       this.audit.record({
         kind: "BOOTSTRAP_APPLICATION_ATTEMPT",
         runId,
-        evidence: { attempt: application.attempts, candidateSnapshotDigest: application.candidateSnapshotDigest },
+        // The start token is kept as `processStart`: the audit log redacts any key that names a token.
+        evidence: {
+          attempt: application.attempts,
+          candidateSnapshotDigest: application.candidateSnapshotDigest,
+          writer: writer === null ? null : { pid: writer.pid, processStart: writer.startToken, startedAt: writer.startedAt },
+        },
       });
       return allow(ReasonCode.OK, application);
     });
@@ -349,6 +372,96 @@ export class BootstrapApplications {
       evidence: { attempt },
     });
     if (!recorded.allowed) throw acpError(recorded.reasonCode, recorded.message, recorded.evidence);
+  }
+
+  /**
+   * The approval identity of this application's execution: the digest of the owner receipt its
+   * reservation consumed, or of the new owner approval a later attempt was required to consume when
+   * that identity could not be proven. Null when neither is recorded: the identity is unproven.
+   */
+  approvalIdentity(runId: string): string | null {
+    const recorded = [
+      ...this.events("BOOTSTRAP_APPLICATION_RESERVED", runId).map((event) => event["approvalReceiptDigest"]),
+      ...this.events("BOOTSTRAP_APPLICATION_APPROVAL", runId).map((event) => event["approvalReceiptDigest"]),
+    ];
+    const last = recorded.at(-1);
+    return typeof last === "string" && last.length > 0 ? last : null;
+  }
+
+  /** A new owner approval consumed for this execution because its earlier identity was unproven. */
+  recordApprovalIdentity(runId: string, approvalReceiptDigest: string): void {
+    const recorded = this.audit.record({
+      kind: "BOOTSTRAP_APPLICATION_APPROVAL",
+      runId,
+      projectId: null,
+      evidence: { approvalReceiptDigest },
+    });
+    if (!recorded.allowed) throw acpError(recorded.reasonCode, recorded.message, recorded.evidence);
+  }
+
+  /** The writer each attempt of this run was recorded with; an attempt recorded without one maps to null. */
+  attemptWriters(runId: string): Map<number, AttemptWriter | null> {
+    const writers = new Map<number, AttemptWriter | null>();
+    for (const event of this.events("BOOTSTRAP_APPLICATION_ATTEMPT", runId)) {
+      const attempt = event["attempt"];
+      if (typeof attempt !== "number") continue;
+      const writer = event["writer"] as Record<string, unknown> | null | undefined;
+      const processStart = writer?.["processStart"];
+      // A start token the audit log could not keep is no record of it; nor is anything not shaped like one.
+      const validStart = processStart === null || (typeof processStart === "string" && processStart.length > 0 && !processStart.startsWith("[redacted"));
+      const valid =
+        writer !== null &&
+        writer !== undefined &&
+        typeof writer["pid"] === "number" &&
+        typeof writer["startedAt"] === "string" &&
+        validStart;
+      writers.set(attempt, valid ? { pid: writer["pid"] as number, startToken: processStart as string | null, startedAt: writer["startedAt"] as string } : null);
+    }
+    return writers;
+  }
+
+  /**
+   * #246 C3 — which attempt first recorded each completed write of this run in its ledger. A receipt
+   * keeps the attempt that first recorded it; a later attempt that finds it only refers to it.
+   */
+  receiptAttribution(runId: string): Map<string, number> {
+    const attribution = new Map<string, number>();
+    for (const event of this.events("BOOTSTRAP_APPLICATION_WRITE_RECEIPTED", runId)) {
+      const operationId = event["operationId"];
+      const attempt = event["attempt"];
+      if (typeof operationId === "string" && typeof attempt === "number" && !attribution.has(operationId)) {
+        attribution.set(operationId, attempt);
+      }
+    }
+    return attribution;
+  }
+
+  /** Attempt `attempt` recorded the receipt of `operationId` first. */
+  recordReceiptAttribution(runId: string, attempt: number, operationId: string, receiptDigest: string): void {
+    const recorded = this.audit.record({
+      kind: "BOOTSTRAP_APPLICATION_WRITE_RECEIPTED",
+      runId,
+      projectId: null,
+      evidence: { attempt, operationId, receiptDigest },
+    });
+    if (!recorded.allowed) throw acpError(recorded.reasonCode, recorded.message, recorded.evidence);
+  }
+
+  /** The evidence of every `kind` audit event of this run, in the order they were recorded. */
+  private events(kind: string, runId: string): Array<Record<string, unknown>> {
+    return this.db
+      .all<{ evidence_json: string }>(
+        `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
+        [kind, runId],
+      )
+      .flatMap((row) => {
+        try {
+          const parsed = JSON.parse(row.evidence_json) as unknown;
+          return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? [parsed as Record<string, unknown>] : [];
+        } catch {
+          return [];
+        }
+      });
   }
 
   /** The attempts of this run recorded as having reached their first GitHub ledger write. */

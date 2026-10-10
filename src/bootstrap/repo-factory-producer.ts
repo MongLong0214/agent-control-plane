@@ -28,8 +28,10 @@ import {
   writeGitHubLedger,
   type AppliedGitHubOperations,
   type GitHubExecutionPlan,
+  type GitHubOperationReceipt,
   type GitHubWriteAuthority,
   type LedgerState,
+  type PendingWrite,
 } from "./repo-factory-github.ts";
 import {
   REPO_FACTORY_RESULT_SCHEMA_ID,
@@ -226,11 +228,13 @@ export interface RepoFactoryProducerInput {
    */
   keepCheckoutOnFailure?: boolean;
   /**
-   * #246 C3, CEO decision (b) — called once, before the GitHub ledger is first written by this call
-   * and so before any GitHub request that writes. It must durably record that the attempt reached
-   * that stage; a throw stops the producer before the ledger is written or anything is sent.
+   * #246 C3 — called before every GitHub ledger write this call makes, with the state about to be
+   * written; the first call comes before any GitHub request that writes. CEO decision (b): it must
+   * durably record that the attempt reached that stage. It also sees each receipt the first time it
+   * is written, which is how the caller attributes a completed write to the attempt that recorded it.
+   * A throw stops the producer before that ledger write, and before anything it would have sent.
    */
-  beforeLedgerWrite?: () => void;
+  beforeLedgerWrite?: (state: { receipts: readonly GitHubOperationReceipt[]; pending: readonly PendingWrite[] }) => void;
 }
 
 /** The blob id git gives `content`, in the object format the repository's own ids use. */
@@ -958,7 +962,6 @@ export const produceRepoFactoryResult = async (
   let applied: AppliedGitHubOperations | null = null;
   if (github !== null) {
     const ledgerPath = github.ledgerPath;
-    let ledgerStageRecorded = false;
     let outcome: Decision<AppliedGitHubOperations>;
     try {
       outcome = await applyGitHubOperations({
@@ -968,10 +971,7 @@ export const produceRepoFactoryResult = async (
         defaultBranch: plan.defaultBranch,
         prior,
         record: (state) => {
-          if (!ledgerStageRecorded) {
-            input.beforeLedgerWrite?.();
-            ledgerStageRecorded = true;
-          }
+          input.beforeLedgerWrite?.(state);
           writeGitHubLedger(ledgerPath, {
             schema: GITHUB_LEDGER_SCHEMA_ID,
             ...ledgerOwner,

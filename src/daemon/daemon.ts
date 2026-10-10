@@ -1399,7 +1399,17 @@ export class Daemon {
     this.cp.doctor.setSupplementalFindings(this.#doctorSupplier);
     // #246 C3 — the same rule for the bootstrap runner's question "is this process the only
     // control-plane writer": answered by this daemon's lock, and only once the lock is this daemon's.
-    this.cp.bootstrapProducer.attachWriterLock(() => this.lock.held());
+    // Its identity is the lock's own holder record — this process's pid and OS start token — which
+    // the runner records with each application attempt so a later one can prove it ended.
+    this.cp.bootstrapProducer.attachWriterLock(
+      () => this.lock.held(),
+      () => {
+        if (!this.lock.held()) return null;
+        const holder = this.lock.read();
+        if (holder === null || holder.pid !== process.pid) return null;
+        return { pid: holder.pid, startToken: holder.startToken ?? null, startedAt: holder.startedAt };
+      },
+    );
 
     try {
       this.installContinuityCoordinator();
