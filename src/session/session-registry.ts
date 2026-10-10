@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
+import { digestOfSet } from "../core/digest.ts";
 import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
 import { newSessionId } from "../core/ids.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
@@ -118,11 +119,39 @@ export interface BuzzActorHolders {
   readonly blocking: string | null;
 }
 
-/** A key the CEO took past earlier CEO rows (CEO 1791632040): when, and which rows it was proven against. */
+/**
+ * A key the CEO took past earlier CEO rows (CEO 1791632040), as its record states it. The rows it
+ * was proven against are stated losslessly as their count and `digestOfSet` of their ids — the
+ * record's `recoveredFrom` list is for a reader, and the audit log keeps at most 200 of an array's
+ * elements, so it is never what membership is decided by (review ceobuzz-r1-02).
+ */
 export interface BuzzActorRecovery {
+  /** The recovery's audit time, by this daemon's clock. */
   readonly at: string;
-  readonly from: readonly string[];
+  /** The verified challenge answer's signed `created_at`, in seconds (`BuzzKeyPossession`). */
+  readonly answerSignedAt: number;
+  readonly count: number;
+  readonly digest: string;
 }
+
+/** A recovery record's evidence, read the one way the writer's readback and every reader read it. */
+const recoveryOf = (at: string, evidenceJson: string): BuzzActorRecovery | null => {
+  let evidence: unknown;
+  try {
+    evidence = JSON.parse(evidenceJson) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof evidence !== "object" || evidence === null) return null;
+  const fields = evidence as Record<string, unknown>;
+  const count = fields["recoveredCount"];
+  const digest = fields["recoveredDigest"];
+  const answerSignedAt = fields["answerSignedAt"];
+  if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 1) return null;
+  if (typeof digest !== "string" || digest.length === 0) return null;
+  if (typeof answerSignedAt !== "number" || !Number.isSafeInteger(answerSignedAt)) return null;
+  return { at, answerSignedAt, count, digest };
+};
 
 const CEO_ROLE_KEY = roleKeyFor(Role.CEO);
 
@@ -579,8 +608,10 @@ export class SessionRegistry {
    *     terminal earlier CEO rows, for a recovery;
    *   - and the UPDATE itself is conditional on the row still being that live, unbound incarnation.
    *
-   * Earlier rows are never written: their column is write-once and stays as the key's history, and a
-   * recovery's audit row names them (`recoveredFrom`), which is what #1038's peer rule reads.
+   * Earlier rows are never written: their column is write-once and stays as the key's history. A
+   * recovery's audit row states them as a count and a set digest (`BuzzActorRecovery`) together with
+   * the verified answer's signed time, which is what #1038's peer rule reads; the row is read back
+   * inside the transaction and anything but those exact values refuses and rolls the binding back.
    */
   #writePossessedBuzzActor(possession: BuzzKeyPossession, actorId: string): Decision<SessionRecord> {
     const sessionId = possession.runtime.sessionId;
@@ -626,14 +657,45 @@ export class SessionRegistry {
           sessionId,
         });
       }
-      this.audit.record({
+      if (holders.history.length === 0) {
+        this.audit.record({
+          kind: "SESSION_BUZZ_ACTOR_BOUND",
+          sessionId,
+          actor: `buzz:${actorId}`,
+          evidence: { channel: "buzz" },
+        });
+        return allow(ReasonCode.OK, this.require(sessionId));
+      }
+      const count = holders.history.length;
+      const digest = digestOfSet(holders.history);
+      const recorded = this.audit.record({
         kind: "SESSION_BUZZ_ACTOR_BOUND",
         sessionId,
         actor: `buzz:${actorId}`,
-        evidence: holders.history.length === 0
-          ? { channel: "buzz" }
-          : { channel: "buzz", recoveredFrom: [...holders.history], generation: possession.ceoBindingGeneration },
+        evidence: {
+          channel: "buzz",
+          recoveredFrom: [...holders.history],
+          recoveredCount: count,
+          recoveredDigest: digest,
+          answerSignedAt: possession.answerSignedAt,
+          generation: possession.ceoBindingGeneration,
+        },
       });
+      const persisted = recorded.allowed
+        ? this.db.get<{ at: string; evidence_json: string }>(
+          `SELECT at, evidence_json FROM audit_events WHERE event_id = ?`,
+          [recorded.value],
+        )
+        : undefined;
+      const readBack = persisted ? recoveryOf(persisted.at, persisted.evidence_json) : null;
+      if (
+        readBack === null ||
+        readBack.count !== count ||
+        readBack.digest !== digest ||
+        readBack.answerSignedAt !== possession.answerSignedAt
+      ) {
+        return deny(ReasonCode.CONFLICT, "the recovery's record did not persist as written", { sessionId });
+      }
       return allow(ReasonCode.OK, this.require(sessionId));
     });
   }
@@ -758,8 +820,8 @@ export class SessionRegistry {
 
   /**
    * The recovery this session's binding of this identity was, when it was one: the first
-   * `SESSION_BUZZ_ACTOR_BOUND` record for the pair, with the earlier rows it was proven against.
-   * Null for a first binding, or for a record whose evidence does not name them.
+   * `SESSION_BUZZ_ACTOR_BOUND` record for the pair. Null for a first binding, or for a record whose
+   * evidence does not state a recovery's count, digest and answer time.
    */
   buzzActorRecovery(sessionId: string, buzzActorId: string): BuzzActorRecovery | null {
     const row = this.db.get<{ at: string; evidence_json: string }>(
@@ -768,18 +830,16 @@ export class SessionRegistry {
         ORDER BY event_id LIMIT 1`,
       [sessionId, `buzz:${buzzActorId}`],
     );
-    if (!row) return null;
-    let evidence: unknown;
-    try {
-      evidence = JSON.parse(row.evidence_json) as unknown;
-    } catch {
-      return null;
-    }
-    if (typeof evidence !== "object" || evidence === null) return null;
-    const from = (evidence as Record<string, unknown>)["recoveredFrom"];
-    if (!Array.isArray(from) || from.length === 0) return null;
-    if (!from.every((id): id is string => typeof id === "string")) return null;
-    return { at: row.at, from };
+    return row ? recoveryOf(row.at, row.evidence_json) : null;
+  }
+
+  /**
+   * Whether a recovery was proven against exactly these history rows (`buzzActorHolders().history`,
+   * recomputed now): the same count and the same set digest. A row the record does not name, or a
+   * named row that is no longer history, makes the answer no.
+   */
+  buzzActorRecoveryNames(recovery: BuzzActorRecovery, history: readonly string[]): boolean {
+    return recovery.count === history.length && recovery.digest === digestOfSet(history);
   }
 
   setBuzzAddress(sessionId: string, address: string | null): void {

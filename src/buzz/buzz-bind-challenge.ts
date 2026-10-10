@@ -105,6 +105,13 @@ export interface BuzzKeyPossession {
    * because a re-adoption can commit between this store's own check and the write.
    */
   readonly ceoBindingGeneration: number;
+  /**
+   * The verified answer's signed `created_at`, in seconds: inside the challenge's window and no later
+   * than the daemon's clock plus `BUZZ_BIND_SIGNED_SKEW_SECONDS`. A recovery records it as part of the
+   * boundary its key's peer events are counted from, so it is bounded here: an answer dated far ahead
+   * would otherwise hold back the CEO's ordinary messages until that time.
+   */
+  readonly answerSignedAt: number;
 }
 
 const POSSESSIONS = new WeakSet<object>();
@@ -286,6 +293,13 @@ export class BuzzBindChallenges {
         "the binding event was not signed while the challenge was open",
       );
     }
+    if (event.created_at * 1000 > now + BUZZ_BIND_SIGNED_SKEW_SECONDS * 1000) {
+      return refuse(
+        ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED,
+        "signed-ahead-of-clock",
+        "the binding event is dated further ahead of this daemon's clock than the signing skew allows",
+      );
+    }
     if (!this.#isCurrentCeo(this.#ports.currentCeo(), challenge.runtime, challenge.ceoBindingGeneration)) {
       return refuse(
         ReasonCode.BINDING_GENERATION_STALE,
@@ -308,6 +322,7 @@ export class BuzzBindChallenges {
       runtime: challenge.runtime,
       buzzActorId: challenge.actor,
       ceoBindingGeneration: challenge.ceoBindingGeneration,
+      answerSignedAt: event.created_at,
     });
     POSSESSIONS.add(possession);
     const bound = this.#ports.bind(possession);

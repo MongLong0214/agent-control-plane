@@ -128,20 +128,29 @@ export interface BuzzPeerCurrentCeo {
    * binds one, and #1037 is what issues the credential that lets `bindActor` do it.
    */
   readonly channelIdentity: string | null;
-  /**
-   * When this generation's assignment was created — or, for an identity this runtime recovered past
-   * terminal earlier CEO rows by proving possession (CEO 1791632040), when it was recovered, if that
-   * is later: the earliest moment an event signed with the identity is this generation's.
-   */
+  /** When this generation's assignment was created. */
   readonly generationStartedAt: string;
+  /**
+   * For an identity this runtime recovered past terminal earlier CEO rows by proving possession
+   * (CEO 1791632040), the boundary its events count from: the latest of `generationStartedAt`, the
+   * recovery's audit time and the verified challenge answer's signed time (CEO 1791634542). Null for
+   * any other identity. An event must be dated in a whole second strictly after the boundary's
+   * second; the boundary's own second is refused, never floored (review ceobuzz-r1-01).
+   *
+   * This bounds what an event *claims*, not when it was signed: `created_at` is the signer's own
+   * value. An event the earlier generation signed before the recovery, dated after the boundary and
+   * held back, is admitted — the accepted Limit. Closing it needs a recovery-specific value inside
+   * the event, which this rule does not ask for.
+   */
+  readonly recoveryBoundary: string | null;
   /**
    * Whether that identity is anything but this generation's alone (#1044): another session row —
    * of any lifecycle — carries it, or this runtime carried it while serving an earlier CEO
    * generation. Either way an event signed with it may be an earlier holder's, and nothing in the
    * event can say which, so every event signed with it is refused. A fresh identity per CEO
    * generation is one remedy; the other is the possession-proven recovery (CEO 1791632040), after
-   * which terminal earlier CEO rows the recovery names are history, not reuse, and the window above
-   * starts at the recovery. A live second holder, or any other row, is still reuse.
+   * which terminal earlier CEO rows the recovery's record names exactly are history, not reuse, and
+   * `recoveryBoundary` applies. A live second holder, or any other row, is still reuse.
    *
    * It is the identity's history, not the runtime's: a runtime that served an earlier generation
    * with no identity and took this one only afterwards holds an identity no earlier generation used.
@@ -204,6 +213,18 @@ const signedSince = (signedAt: unknown, startedAt: string): number | null => {
     signedAt >= startedAtSeconds
     ? signedAt
     : null;
+};
+
+/**
+ * Whether a signed time is in a whole second strictly after a boundary's second, or there is no
+ * boundary. The boundary's own second is ambiguous — `created_at` cannot say which side of the
+ * boundary's fraction it was signed on — so it is refused rather than floored (review ceobuzz-r1-01).
+ * A boundary that does not parse refuses.
+ */
+const signedAfterBoundarySecond = (signedAt: number, boundary: string | null): boolean => {
+  if (boundary === null) return true;
+  const boundarySecond = Math.floor(Date.parse(boundary) / 1000);
+  return Number.isFinite(boundarySecond) && signedAt > boundarySecond;
 };
 
 const sameChannelIdentity = (a: string, b: string): boolean => {
@@ -710,11 +731,15 @@ export class BuzzMessageIngress {
       );
     }
     // In whole seconds (`signedSince`). Truncating admits the fraction of the start second before
-    // the start. For an identity no earlier generation held that reopens nothing for an earlier
-    // generation; for a recovered one the start is the recovery, which every earlier holder's row
-    // was already terminal at.
+    // the start, and only for an identity no earlier generation held — so it reopens nothing for an
+    // earlier generation. A recovered identity, which an earlier generation did hold, must instead
+    // be dated after its boundary's whole second (`recoveryBoundary`), which refuses that second.
     const signedAt = signedSince(input.createdAt, ceo.generationStartedAt);
-    if (signedAt === null || signedAt * 1000 > peers.nowMs() + BUZZ_PEER_FUTURE_SKEW_SECONDS * 1000) {
+    if (
+      signedAt === null ||
+      !signedAfterBoundarySecond(signedAt, ceo.recoveryBoundary) ||
+      signedAt * 1000 > peers.nowMs() + BUZZ_PEER_FUTURE_SKEW_SECONDS * 1000
+    ) {
       return deny(
         ReasonCode.BUZZ_PEER_EVENT_OUTSIDE_GENERATION,
         "the event was not signed inside the current CEO generation",

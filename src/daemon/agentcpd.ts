@@ -1216,19 +1216,29 @@ export const buzzPeerRegistry = (cp: ControlPlane): BuzzPeerRegistry => ({
     //
     // CEO 1791632040: one kind of other row is history rather than ambiguity — a terminal earlier
     // CEO row (`buzzActorHolders`) that this runtime's own binding recovered the key past by proving
-    // possession, as that recovery's record names it. Its events then count only from the recovery:
-    // anything signed before it is not this generation's for certain. Any other holder, or a terminal
-    // earlier row the key was rebound past without a possession proof, is still reuse.
+    // possession, when the recovery's record names exactly the history rows there are now (count and
+    // set digest, `buzzActorRecoveryNames`). Any other holder, a row the record does not name, or a
+    // terminal earlier row the key was rebound past without a possession proof is still reuse.
+    //
+    // A recovered key's events then count from a boundary this daemon fixes (CEO 1791634542): the
+    // latest of the generation's start, the recovery's audit time and the verified answer's signed
+    // time, with the boundary's own second refused. That refuses an event dated at or before the
+    // recovery. It does not say when an event was signed — `created_at` is the signer's own claim —
+    // so an event the earlier generation signed before the recovery, dated past the boundary and held
+    // back, is admitted: the accepted Limit.
     let reused = false;
-    let identitySince = ceo.createdAt;
+    let recoveryBoundary: string | null = null;
     if (channelIdentity !== null) {
       const holders = cp.sessions.buzzActorHolders(channelIdentity, ceo.sessionId);
       const recovery = holders.history.length === 0 ? null : cp.sessions.buzzActorRecovery(ceo.sessionId, channelIdentity);
-      const onlyHistory = holders.blocking === null &&
-        (holders.history.length === 0 || (recovery !== null && holders.history.every((id) => recovery.from.includes(id))));
-      if (recovery !== null && onlyHistory && Date.parse(recovery.at) > Date.parse(identitySince)) {
-        identitySince = recovery.at;
-      }
+      // An unreadable time cannot fix a boundary, so it fails closed as reuse.
+      const boundaryMs = recovery === null
+        ? Number.NaN
+        : Math.max(Date.parse(ceo.createdAt), Date.parse(recovery.at), recovery.answerSignedAt * 1000);
+      const recovered = recovery !== null && Number.isFinite(boundaryMs) &&
+        cp.sessions.buzzActorRecoveryNames(recovery, holders.history);
+      const onlyHistory = holders.blocking === null && (holders.history.length === 0 || recovered);
+      if (recovered && onlyHistory) recoveryBoundary = new Date(boundaryMs).toISOString();
       reused = !onlyHistory ||
         identityUsedInAnEarlierCeoGeneration(cp, ceo.sessionId, channelIdentity, ceo.bindingGeneration);
     }
@@ -1236,7 +1246,8 @@ export const buzzPeerRegistry = (cp: ControlPlane): BuzzPeerRegistry => ({
       bindingGeneration: ceo.bindingGeneration,
       sessionId: ceo.sessionId,
       channelIdentity,
-      generationStartedAt: identitySince,
+      generationStartedAt: ceo.createdAt,
+      recoveryBoundary,
       channelIdentityReused: reused,
     };
   },
