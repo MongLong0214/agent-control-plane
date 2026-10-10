@@ -13,6 +13,7 @@ import {
   repoFactoryGitHubWriteParameters,
   type ProduceAndActivateInput,
 } from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
+import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -134,9 +135,9 @@ export interface PreparedBootstrapRun {
  */
 export const prepareBootstrapRun = async (
   projectId: string,
-  options: { ops: Operation[]; manifest: ProjectManifest },
+  options: { ops: Operation[]; manifest: ProjectManifest; ownerIdentities?: readonly OwnerIdentity[] },
 ): Promise<PreparedBootstrapRun> => {
-  const harness = makeHarness();
+  const harness = makeHarness(options.ownerIdentities === undefined ? {} : { ownerIdentities: options.ownerIdentities });
   const created = harness.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: ExecutionMode.STANDARD, contract: CONTRACT });
   if (!created.allowed) throw new Error(created.message);
   const runId = created.value.runId;
