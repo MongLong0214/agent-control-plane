@@ -21,6 +21,7 @@ import { ContinuityMode, Role, type RoleBinding, RunState, SessionLifecycle, rol
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import { drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
+import { isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
@@ -1331,11 +1332,11 @@ export class ContinuityKernel {
   /**
    * #246 C4-R2 — retires the replacement session this failover provisioned and will not use, through
    * the provider's own stop, never by a row transition alone. It holds no role, by its row or as an
-   * actor's runtime — proven, and the session moved out of READY, in one transaction before the stop
-   * is awaited, so no bind or actor move can adopt it meanwhile and the concurrent holder is never the
-   * target. Only a stop that returned is recorded STOPPED; a failed stop leaves it ERROR, recorded
-   * `REMAINING_STOP_FAILED`, and one that could not be proven unused is left alone and recorded
-   * `REMAINING_OWNERSHIP_UNVERIFIED`.
+   * actor's runtime, and is no adopted canonical runtime — proven, and the session moved out of
+   * READY, in one transaction before the stop is awaited, so no bind or actor move can adopt it
+   * meanwhile and no other holder is ever the target. Only a stop that returned is recorded STOPPED;
+   * a failed stop leaves it ERROR, recorded `REMAINING_STOP_FAILED`, and one that could not be
+   * proven unused is left alone and recorded `REMAINING_OWNERSHIP_UNVERIFIED`.
    */
   async #retireUnusedReplacement(sessionId: string, role: Role, reason: string): Promise<void> {
     const session = this.sessions.get(sessionId);
@@ -1355,7 +1356,11 @@ export class ContinuityKernel {
           LIMIT 1`,
         [sessionId, sessionId],
       ) !== undefined;
-      if (!session || holds) return deny<void>(ReasonCode.CONFLICT, "the replacement holds a role", { sessionId });
+      // An adopted canonical runtime is never this attempt's to stop, whatever its assignments say: a
+      // canonical actor may still point at it with every assignment revoked.
+      if (!session || holds || isAdoptedCanonicalRuntime(this.db, sessionId)) {
+        return deny<void>(ReasonCode.CONFLICT, "the replacement holds a role or is a canonical runtime", { sessionId });
+      }
       const moved = this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: stopping`);
       return moved.allowed ? allow(ReasonCode.OK, undefined) : (moved as Decision<unknown> as Decision<void>);
     });
