@@ -1858,7 +1858,7 @@ export const startDaemonBuzzMentionSubscriber = (
         messageIngress.seam.ingress,
         {
           ...messageIngress.seam.port,
-          wakeRole: (roleKey) => wakeForMention(messageIngress.seam.roleConversation, roleKey, mention),
+          wakeRole: (roleKey) => wakeForMention(cp, messageIngress.seam.roleConversation, roleKey, mention),
         },
         buzzMentionInputFor(messageIngress.seam.ingress, secret, request),
       );
@@ -1918,10 +1918,13 @@ export const buzzMentionWakeGate = (
 
 /**
  * The wake for a mention the daemon's own subscriber delivered, carrying that mention's verified
- * context. A context this path cannot state, or no role port to give it to, refuses the wake; it
- * never falls through to an ordinary wake.
+ * context. It goes through `wakeRoleHolder` like every role wake, so a driven holder is woken
+ * through its runtime and a contradicted one is refused there; only the conversation port's wake
+ * is given the mention's context. A context this path cannot state, or no role port to give it
+ * to, refuses the wake; it never falls through to an ordinary wake.
  */
 const wakeForMention = (
+  cp: Pick<ControlPlane, "bindings" | "sessionRuntime">,
   roleConversation: Pick<RoleConversationPort, "wake"> | null,
   roleKey: string,
   mention: MentionWakeContext,
@@ -1929,7 +1932,7 @@ const wakeForMention = (
   if (roleConversation === null || mention.roleKey !== roleKey || [mention.actorId, mention.room, mention.eventId].some((value) => value.length === 0)) {
     return Promise.resolve(deny(ReasonCode.ROLE_PEER_STALE, "a mention's wake carried no usable mention context", { roleKey }));
   }
-  return roleConversation.wake(roleKey, mention);
+  return wakeRoleHolder(cp, { wake: (key) => roleConversation.wake(key, mention) }, roleKey, { kind: "owner message", ids: [] });
 };
 
 /**

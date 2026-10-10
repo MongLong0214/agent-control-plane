@@ -370,3 +370,42 @@ describe("a mention's wake is governed by the mention gate", () => {
     }
   });
 });
+
+describe("a mention's wake is routed like every role wake (#246 C4)", () => {
+  const publishMention = async (f: Awaited<ReturnType<typeof start>>): Promise<number> => {
+    const before = wakes.dialled.length;
+    f.h.clock.advance(1_000);
+    f.relay.publish(signedMention({
+      author: f.owner.secretKey, addressedTo: f.cto.pubkey, room: ROOM, createdAt: secondsOf(f.h.cp.clock.nowIso()), text: "mention",
+    }));
+    await f.relay.drain(f.subscriber);
+    return wakes.dialled.length - before;
+  };
+
+  it("wakes a driven holder through its runtime, not the conversation port", async () => {
+    const f = await start();
+    try {
+      vi.spyOn(f.h.cp.sessionRuntime, "drivesSession").mockReturnValue(true);
+      const driven = vi.spyOn(f.h.cp.sessionRuntime, "wake").mockReturnValue(allow(ReasonCode.OK, "STARTED"));
+      expect(await publishMention(f)).toBe(0);
+      expect(driven).toHaveBeenCalledTimes(1);
+      expect(driven.mock.calls[0]?.[0]).toBe(f.roleKey);
+    } finally {
+      vi.restoreAllMocks();
+      await f.close();
+    }
+  });
+
+  it("refuses a holder whose driven-spawn record contradicts its binding, before any socket contact", async () => {
+    const f = await start();
+    try {
+      vi.spyOn(f.h.cp.sessionRuntime, "drivenModeOf").mockReturnValue("CONTRADICTED");
+      const driven = vi.spyOn(f.h.cp.sessionRuntime, "wake");
+      expect(await publishMention(f)).toBe(0);
+      expect(driven).not.toHaveBeenCalled();
+    } finally {
+      vi.restoreAllMocks();
+      await f.close();
+    }
+  });
+});
