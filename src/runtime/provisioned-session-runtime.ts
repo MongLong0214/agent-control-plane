@@ -55,8 +55,28 @@ export interface SessionWakeTrigger {
   kind: string;
 }
 
-/** The roles whose sessions this runtime drives. Wired for BOOTSTRAP_CTO; never a canonical role. */
+/** The roles all of whose sessions this runtime drives: a run's BOOTSTRAP_CTO. Never a canonical role. */
 const DRIVEN_ROLES: ReadonlySet<Role> = new Set([Role.BOOTSTRAP_CTO]);
+
+/**
+ * #246 C4 — the audit kind that records a PRIMARY_CTO session spawned, for a bootstrap activation,
+ * to be driven by this runtime. Written by `CtoLifecycle.spawn` in the transaction that creates the
+ * session row, before its credential is adopted or anything can refuse it. `audit_events` is append
+ * only, so the fact can neither be added later nor taken back, and a session that does not carry it
+ * — every interactive PRIMARY_CTO, every adopted canonical CTO — is never driven here, whatever its
+ * role. The role alone never makes a PRIMARY_CTO driven.
+ *
+ * An append-only spawn record rather than a new column or the shape of the session's workdir: the
+ * schema is not changed for this, and a path is not a fact anybody recorded.
+ */
+export const DRIVEN_PRIMARY_CTO_SPAWN_RECORD = "PRIMARY_CTO_DRIVEN_SESSION_SPAWNED";
+
+/** SQL: whether the session `sessionExpr` names was spawned as a driven PRIMARY_CTO. */
+export const drivenPrimaryCtoSessionSql = (sessionExpr: string): string => `EXISTS (
+  SELECT 1 FROM audit_events driven_e
+   WHERE driven_e.kind = '${DRIVEN_PRIMARY_CTO_SPAWN_RECORD}'
+     AND driven_e.session_id = ${sessionExpr}
+)`;
 
 interface HeldCredential {
   role: Role;
@@ -126,9 +146,25 @@ export class ProvisionedSessionRuntime {
     private readonly options: ProvisionedSessionRuntimeOptions = {},
   ) {}
 
-  /** Whether sessions of this role are driven here. */
+  /**
+   * Whether every session of this role is driven here (a run's BOOTSTRAP_CTO). A PRIMARY_CTO is
+   * driven per session, never per role: ask `drivesSession`.
+   */
   static drives(role: Role): boolean {
     return DRIVEN_ROLES.has(role);
+  }
+
+  /**
+   * Whether this runtime drives `sessionId` holding `role`: every BOOTSTRAP_CTO, and a PRIMARY_CTO
+   * only when its own spawn recorded it driven (`DRIVEN_PRIMARY_CTO_SPAWN_RECORD`).
+   */
+  drivesSession(sessionId: string, role: Role): boolean {
+    if (DRIVEN_ROLES.has(role)) return true;
+    return role === Role.PRIMARY_CTO && this.#spawnedDriven(sessionId);
+  }
+
+  #spawnedDriven(sessionId: string): boolean {
+    return this.ports.audit.byKind(DRIVEN_PRIMARY_CTO_SPAWN_RECORD).some((row) => row.sessionId === sessionId);
   }
 
   /** The daemon's launch channel and socket paths. Until both are attached no turn can run. */
@@ -148,8 +184,8 @@ export class ProvisionedSessionRuntime {
    * rotation just replaced it with. Replaces any earlier one for the session.
    */
   adopt(sessionId: string, role: Role, sessionSecret: string, credentialEpoch: number): Decision<void> {
-    if (!ProvisionedSessionRuntime.drives(role)) {
-      return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "this runtime drives provisioned bootstrap CTO sessions only", {
+    if (!this.drivesSession(sessionId, role)) {
+      return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "this runtime drives provisioned sessions only: a bootstrap CTO, or a primary CTO spawned driven", {
         sessionId,
         role,
       });
@@ -210,7 +246,7 @@ export class ProvisionedSessionRuntime {
    */
   wake(roleKey: string, triggers: readonly SessionWakeTrigger[]): Decision<"STARTED" | "COALESCED"> {
     const binding = this.ports.bindings.active(roleKey);
-    if (!binding || !ProvisionedSessionRuntime.drives(binding.role)) {
+    if (!binding || !this.drivesSession(binding.sessionId, binding.role)) {
       return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "no provisioned session holds this role", { roleKey });
     }
     if (!this.holds(binding.sessionId)) {

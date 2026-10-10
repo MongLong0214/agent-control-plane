@@ -12,12 +12,14 @@ import { type SessionLiveness, probeSessionLiveness } from "../daemon/dead-bindi
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import { DRIVEN_PRIMARY_CTO_RUNTIME } from "../domain/fixed-role-runtime.ts";
+import { Role, type RoleBinding, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
+import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, drivenPrimaryCtoSessionSql } from "../runtime/provisioned-session-runtime.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -168,6 +170,11 @@ interface SpawnRequest {
   stopOnRefusal?: boolean;
   /** Record the session as spawned for this run, with the session row (`BOOTSTRAP_CTO_SPAWN_RECORD`). */
   spawnedForRun?: string;
+  /**
+   * #246 C4 — a PRIMARY_CTO for the project this bootstrap run activates, driven on the headless
+   * runtime: recorded so with the session row (`DRIVEN_PRIMARY_CTO_SPAWN_RECORD`), under this run.
+   */
+  drivenForActivation?: string;
 }
 
 export class CtoLifecycle {
@@ -215,10 +222,39 @@ export class CtoLifecycle {
    * fresh session → Buzz → doctor readiness → binding → project ACTIVE → dispatch.
    */
   async ensurePrimaryCto(projectId: string, runId: string): Promise<Decision<RoleBinding>> {
+    return this.#ensurePrimaryCto(projectId, runId, false);
+  }
+
+  /**
+   * #246 C4 — the PRIMARY_CTO a bootstrap activation provisions for the project it activates: the
+   * same lineage checks, spawn and binding as `ensurePrimaryCto`, but the spawn is a fresh session
+   * of its own, in its own workdir, on Claude Opus (`DRIVEN_PRIMARY_CTO_RUNTIME`), driven by the
+   * headless runtime and recorded so with its session row. Only a PROJECT_BOOTSTRAP run asks for
+   * one. An existing binding is answered exactly as `ensurePrimaryCto` answers it.
+   *
+   * A door of its own rather than the run's kind read inside `ensurePrimaryCto`: the caller states
+   * that it is an activation, and the activation switches to this door together with its fixtures.
+   */
+  async ensureDrivenPrimaryCto(projectId: string, bootstrapRunId: string): Promise<Decision<RoleBinding>> {
+    const run = this.runs.get(bootstrapRunId);
+    if (run?.kind !== RunKind.PROJECT_BOOTSTRAP) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "only a bootstrap activation provisions a driven primary CTO", {
+        projectId,
+        runId: bootstrapRunId,
+        kind: run?.kind ?? null,
+      });
+    }
+    return this.#ensurePrimaryCto(projectId, bootstrapRunId, true);
+  }
+
+  async #ensurePrimaryCto(projectId: string, runId: string, driven: boolean): Promise<Decision<RoleBinding>> {
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
     const existing = this.bindings.active(roleKey);
     if (existing) {
       const session = this.sessions.get(existing.sessionId);
+      // #246 C4 — a driven session is asked by an authenticated attestation turn that resumes its
+      // conversation, never by opening its id again, and is never replaced by another session.
+      if (this.#spawnedDriven(existing.sessionId)) return this.#reuseDrivenPrimaryCto(existing, session, runId);
       if (session?.lifecycle === SessionLifecycle.READY) {
         // READY is what the control plane last wrote about the session, not proof that the
         // provider still has one. Reusing a session on that alone is the false-ready path
@@ -255,12 +291,14 @@ export class CtoLifecycle {
     // A released canonical role is not given a spawned CTO either; its conversation re-claims it.
     const released = this.#releasedCanonicalHolder(projectId, roleKey);
     if (released) return this.#refuseAdoptedCanonical(released, null, null, runId);
+    const runtime: CtoPreference = driven ? { ...DRIVEN_PRIMARY_CTO_RUNTIME, effort: null } : this.preference;
     const created = await this.spawn({
       role: Role.PRIMARY_CTO,
       scope: projectId,
       purpose: "primary-cto",
-      runtime: this.preference,
+      runtime,
       canonicalGuard: { roleKey, runId },
+      ...(driven ? { drivenForActivation: runId } : {}),
     });
     if (!created.allowed) return created as Decision<RoleBinding>;
 
@@ -288,9 +326,50 @@ export class CtoLifecycle {
       runId,
       sessionId: created.value,
       roleKey,
-      evidence: { generation: bound.value.bindingGeneration, provider: this.preference.provider },
+      evidence: {
+        generation: bound.value.bindingGeneration,
+        provider: runtime.provider,
+        ...(driven ? { driven: true } : {}),
+      },
     });
     return bound;
+  }
+
+  /**
+   * #246 C4 — an existing binding held by a driven PRIMARY_CTO: reused when an attestation turn that
+   * resumes its own conversation proves the daemon still drives it with its current credential, and
+   * refused otherwise. Never `--session-id` (the provider refuses to open a conversation it already
+   * has), never marked ERROR and never taken over by another session: a driven session is recovered
+   * on itself.
+   */
+  async #reuseDrivenPrimaryCto(
+    existing: RoleBinding,
+    session: SessionRecord | null,
+    runId: string,
+  ): Promise<Decision<RoleBinding>> {
+    if (session?.lifecycle === SessionLifecycle.DRAINING) {
+      return deny(ReasonCode.RUN_DISPATCH_BLOCKED_CTO_DRAINING, "primary CTO is draining", {
+        projectId: existing.projectId,
+        sessionId: existing.sessionId,
+      });
+    }
+    const live = await this.probeRoleSession(existing.sessionId, Role.PRIMARY_CTO);
+    if (live.allowed) return allow(ReasonCode.OK, existing);
+    this.audit.record({
+      kind: "CTO_SESSION_PROBE_FAILED",
+      reasonCode: live.reasonCode,
+      projectId: existing.projectId,
+      runId,
+      sessionId: existing.sessionId,
+      roleKey: existing.roleKey,
+      evidence: { provider: session?.provider ?? null, driven: true, ...live.evidence },
+    });
+    return live as Decision<RoleBinding>;
+  }
+
+  /** Whether this session's own spawn recorded it as a driven PRIMARY_CTO (`DRIVEN_PRIMARY_CTO_SPAWN_RECORD`). */
+  #spawnedDriven(sessionId: string): boolean {
+    return this.db.get<{ driven: number }>(`SELECT ${drivenPrimaryCtoSessionSql("?")} AS driven`, [sessionId])?.driven === 1;
   }
 
   /** §10.1 — replacement requested: the outgoing CTO drains, new runs queue. */
@@ -991,7 +1070,8 @@ export class CtoLifecycle {
     // #246 C1b — a session on the headless runtime is asked by an authenticated attestation turn
     // that continues its conversation: opening its id again is refused by the provider, and an
     // unauthenticated answer would say nothing about the credential the daemon holds for it.
-    if (role === Role.BOOTSTRAP_CTO) {
+    // #246 C4 — and so is a PRIMARY_CTO whose spawn recorded it driven; never by its role alone.
+    if (role === Role.BOOTSTRAP_CTO || (role === Role.PRIMARY_CTO && this.#spawnedDriven(sessionId))) {
       if (!this.#sessionRuntime) return runtimeUnavailable(sessionId, role);
       return notProvenReady(sessionId, await this.#sessionRuntime.attest(sessionId, "resume"));
     }
@@ -1024,9 +1104,11 @@ export class CtoLifecycle {
   private async spawn(request: SpawnRequest): Promise<Decision<string>> {
     const { role, scope, purpose, runtime, canonicalGuard } = request;
     // #246 C1b — a BOOTSTRAP_CTO runs on the real headless runtime, and is refused before anything
-    // starts when there is none: readiness then has nothing that could authenticate it.
-    const headless = role === Role.BOOTSTRAP_CTO ? this.#sessionRuntime : null;
-    if (role === Role.BOOTSTRAP_CTO && !headless) return runtimeUnavailable(null, role);
+    // starts when there is none: readiness then has nothing that could authenticate it. #246 C4 — so
+    // does a PRIMARY_CTO a bootstrap activation asked for driven; any other PRIMARY_CTO does not.
+    const driven = role === Role.BOOTSTRAP_CTO || (role === Role.PRIMARY_CTO && request.drivenForActivation !== undefined);
+    const headless = driven ? this.#sessionRuntime : null;
+    if (driven && !headless) return runtimeUnavailable(null, role);
     const adapter = this.providers.hasRoleScoped(runtime.provider)
       ? this.providers.requireForRole(runtime.provider, role)
       : this.providers.get(runtime.provider);
@@ -1093,6 +1175,18 @@ export class CtoLifecycle {
           this.audit.record({
             kind: BOOTSTRAP_CTO_SPAWN_RECORD,
             runId: request.spawnedForRun,
+            sessionId: created.sessionId,
+            evidence: { role, provider: adapter.provider, model: runtime.model, purpose },
+          });
+        }
+        // #246 C4 — the one fact that makes a PRIMARY_CTO driven, written with its session row: the
+        // runtime adopts its credential, the outbox routes to it in band and its probes resume its
+        // conversation only because this row exists. Append-only, so it is never added later.
+        if (headless && role === Role.PRIMARY_CTO) {
+          this.audit.record({
+            kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+            runId: request.drivenForActivation ?? null,
+            projectId: scope,
             sessionId: created.sessionId,
             evidence: { role, provider: adapter.provider, model: runtime.model, purpose },
           });
