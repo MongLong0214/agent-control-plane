@@ -16,6 +16,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
+import { isTerminal } from "../domain/run-state.ts";
 import { ContinuityMode, Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
@@ -608,6 +609,9 @@ export class ContinuityKernel {
           };
     const switchAdmission = await this.capacity.refreshForProviderSwitch(switchTarget);
     if (!switchAdmission.allowed) return switchAdmission as Decision<{ provider: string; generation: number }>;
+    // #512 — a WORKER whose run ended while the admission was awaited is not staffed again.
+    const endedBeforeSpawn = this.#workerRunEnded(role, scope);
+    if (endedBeforeSpawn) return endedBeforeSpawn;
 
     const expected = this.bindings.active(roleKey);
     if (role === Role.PRIMARY_CTO && !sameHolder(fenced, expected)) {
@@ -635,6 +639,13 @@ export class ContinuityKernel {
     }
     const provisioned = await this.provisionRoutableSession(role, assignment.provider, `continuity:${role}`);
     if (!provisioned.allowed) return provisioned as Decision<{ provider: string; generation: number }>;
+    // #512 — nor one whose run ended while its session was provisioned; that session is never bound,
+    // and is stopped through its provider.
+    const endedAfterSpawn = this.#workerRunEnded(role, scope);
+    if (endedAfterSpawn) {
+      await this.#stopUnboundWorkerSession(provisioned.value.sessionId, role, "the worker's run ended");
+      return endedAfterSpawn;
+    }
 
     const current = this.bindings.active(roleKey);
     // #246 C4-R2 — first, a holder with a driven-spawn record is never replaced, however it came to hold.
@@ -683,7 +694,14 @@ export class ContinuityKernel {
       takeover: true,
     });
     if (!switched.allowed) {
-      await this.#retireUnusedReplacement(provisioned.value.sessionId, role, "failover rejected");
+      // #512 — the registry's own fence refused a WORKER whose run ended after the check above: the
+      // session this attempt provisioned is stopped through its provider, as for that check. Any
+      // other refused switch retires its replacement the same way (#246 C4-R2).
+      if (role === Role.WORKER && switched.reasonCode === ReasonCode.RUN_ALREADY_TERMINAL) {
+        await this.#stopUnboundWorkerSession(provisioned.value.sessionId, role, "failover rejected: the worker's run ended");
+      } else {
+        await this.#retireUnusedReplacement(provisioned.value.sessionId, role, "failover rejected");
+      }
       return switched as Decision<{ provider: string; generation: number }>;
     }
 
@@ -698,6 +716,65 @@ export class ContinuityKernel {
       provider: assignment.provider,
       generation: switched.value.bindingGeneration,
     });
+  }
+
+  /**
+   * #512 — the refusal for failing over a WORKER whose task's run has ended, or null. Asked after each
+   * of the failover's awaits; the registry's bind and switch refuse the same WORKER in their own
+   * transactions, which is what holds when the run ends between this check and the switch.
+   */
+  #workerRunEnded(
+    role: Role,
+    scope: { taskId?: string | null },
+  ): Decision<{ provider: string; generation: number }> | null {
+    if (role !== Role.WORKER || !scope.taskId) return null;
+    const run = this.db.get<{ run_id: string; state: RunState }>(
+      `SELECT r.run_id, r.state FROM tasks t JOIN runs r ON r.run_id = t.run_id WHERE t.task_id = ?`,
+      [scope.taskId],
+    );
+    if (!run || !isTerminal(run.state)) return null;
+    return deny(ReasonCode.RUN_ALREADY_TERMINAL, "the worker's run has ended; it is not failed over", {
+      taskId: scope.taskId,
+      runId: run.run_id,
+      state: run.state,
+    });
+  }
+
+  /**
+   * #512 — stops the one session this failover attempt provisioned for a WORKER and will not bind,
+   * through the adapter that constituted it, with the handle its row records. STOPPED is recorded
+   * only once the provider's stop has returned. A stop that throws leaves the session ERROR and is
+   * recorded as remaining, its process unverified. A session that holds any role is not touched.
+   */
+  async #stopUnboundWorkerSession(sessionId: string, role: Role, reason: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.lifecycle === SessionLifecycle.STOPPED) return;
+    if (this.bindings.bySession(sessionId).some((binding) => binding.status === "ACTIVE")) return;
+    try {
+      await this.providers.requireForRole(session.provider, role).stopSession({
+        externalSessionId: session.incarnation.split("#")[0] ?? session.sessionId,
+        provider: session.provider,
+        model: session.model,
+        effort: session.effort,
+        pid: session.osPid,
+        ...(session.workdir ? { workdir: session.workdir } : {}),
+      });
+    } catch (error) {
+      this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);
+      this.audit.record({
+        kind: "CONTINUITY_UNBOUND_SESSION_STOP_FAILED",
+        reasonCode: ReasonCode.SESSION_STOP_FAILED,
+        sessionId,
+        evidence: {
+          reason,
+          role,
+          status: "PROCESS_UNVERIFIED",
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+      return;
+    }
+    this.sessions.transition(sessionId, SessionLifecycle.STOPPED, reason);
   }
 
   /**
