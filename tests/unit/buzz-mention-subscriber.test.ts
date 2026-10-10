@@ -177,10 +177,19 @@ const configFor = (
   })),
 });
 
+/**
+ * Every answer carries the session's stored room, as the daemon's registry's does; `room` is the
+ * room it answers with when an entry names none. Admission requires one, so a fixture that admits
+ * has to state where its CTO answers.
+ */
 const registryHolding = (
-  bindings: Readonly<Record<string, { roleKey: string; buzzActorId: string }>>,
+  bindings: Readonly<Record<string, { roleKey: string; buzzActorId: string; room?: string | null }>>,
+  room: string = ROOM,
 ): BuzzMentionRegistry => ({
-  primaryCtoBindingFor: (pubkey) => bindings[pubkey] ?? null,
+  primaryCtoBindingFor: (pubkey) => {
+    const bound = bindings[pubkey];
+    return bound ? { room, ...bound } : null;
+  },
 });
 
 interface RecordingSink extends BuzzMentionSink {
@@ -2232,7 +2241,7 @@ describe("the buzz mention subscriber's relay protocol", () => {
     harness.cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [
       projectId, "subscriber revoked binding", harness.cp.clock.nowIso(),
     ]);
-    const session = harness.cp.sessions.create({ provider: "scripted", model: "subscriber-cto" });
+    const session = harness.cp.sessions.create({ provider: "scripted", model: "subscriber-cto", buzzAddress: ROOM });
     expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test").allowed).toBe(true);
     expect(harness.cp.sessions.bindBuzzActor({
       sessionId: session.sessionId, sessionSecret: session.sessionSecret!, buzzActorId: identity.pubkey,
@@ -2278,7 +2287,7 @@ describe("the buzz mention subscriber's relay protocol", () => {
       buzzActorId: identity.pubkey,
     };
     const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
-      registry: { primaryCtoBindingFor: () => held },
+      registry: { primaryCtoBindingFor: () => (held ? { room: ROOM, ...held } : null) },
       sink,
       openSocket: transport.factory,
       scheduler: clock.scheduler,
@@ -2327,6 +2336,7 @@ describe("the buzz mention subscriber's relay protocol", () => {
     identity: Identity;
     owner: Identity;
     reports: BuzzMentionRoleNotHeldReport[];
+    changes: BuzzMentionAdmissionChange[];
     clock: VirtualClock;
     sockets: ManualSocket[];
     sink: RecordingSink;
@@ -2341,22 +2351,25 @@ describe("the buzz mention subscriber's relay protocol", () => {
     const clock = virtualClock();
     const transport = manualTransport();
     const reports: BuzzMentionRoleNotHeldReport[] = [];
+    const changes: BuzzMentionAdmissionChange[] = [];
     let held: { roleKey: string; buzzActorId: string } | null = {
       roleKey: ROLE_KEY,
       buzzActorId: identity.pubkey,
     };
     const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
-      registry: { primaryCtoBindingFor: () => held },
+      registry: { primaryCtoBindingFor: () => (held ? { room: ROOM, ...held } : null) },
       sink,
       openSocket: transport.factory,
       scheduler: clock.scheduler,
       reportRoleNotHeld: (report) => reports.push(report),
+      reportAdmission: (change) => changes.push(change),
     });
     return {
       handle,
       identity,
       owner,
       reports,
+      changes,
       clock,
       sockets: transport.sockets,
       sink,
@@ -2367,79 +2380,67 @@ describe("the buzz mention subscriber's relay protocol", () => {
   };
 
   /**
-   * One mention, delivered on whatever connection is live, and the reconnect timer fired.
-   *
-   * The fire is what makes the next call a *consecutive* attempt rather than a second attempt on
-   * a socket the subscriber already dropped: a `role-not-held` rejection closes the connection,
-   * so without it every later delivery would arrive on a dead generation and be fenced out.
+   * 1080-N1-04. A binding found gone at delivery suspends the identity through the same path
+   * judgement uses. The socket goes and is not replaced while the binding stays gone: each tick of
+   * the judgement timer asks the registry and requests no mail. The exclusion is reported once, when
+   * the timer confirms it, not on the delivery that first saw it.
    */
-  const deliverMention = async (
-    context: ReturnType<typeof startOneWhoseBindingMoves>,
-    createdAt: number,
-  ): Promise<void> => {
-    const socket = live(context.sockets);
-    await authenticate(socket, context.handle);
-    const subId = (sentFrames(socket)[1] as string[])[1] ?? "";
-    socket.handlers.onFrame(
-      frame([
-        "EVENT",
-        subId,
-        mentionEvent({ author: context.owner.secretKey, addressedTo: context.identity.pubkey, createdAt }),
-      ]),
-    );
-    await context.handle.settled();
-    context.clock.fireAll();
-  };
-
-  it("reports a role-not-held run that has stopped being explicable as a race", async () => {
+  it("suspends an identity whose binding is gone at delivery, and asks for none of its mail while it stays gone", async () => {
     const context = startOneWhoseBindingMoves();
     try {
-      // The binding is gone and stays gone. Every rejection below takes the identical code path
-      // the single-event race takes, which is the whole difficulty: only the run tells them apart.
+      const first = live(context.sockets);
+      await authenticate(first, context.handle);
+      const subId = (sentFrames(first)[1] as string[])[1] ?? "";
       context.hold(null);
-      for (let attempt = 1; attempt <= ROLE_NOT_HELD_REPORT_AFTER; attempt += 1) {
-        expect(context.reports).toEqual([]);
-        await deliverMention(context, 1_800_002_000 + attempt);
-      }
-      expect(context.reports).toEqual([
-        {
-          identityPubkey: context.identity.pubkey,
-          roleKey: ROLE_KEY,
-          consecutive: ROLE_NOT_HELD_REPORT_AFTER,
-        },
-      ]);
-      expect(context.sink.admitted).toEqual([]);
+      first.handlers.onFrame(
+        frame(["EVENT", subId, mentionEvent({ author: context.owner.secretKey, addressedTo: context.identity.pubkey })]),
+      );
+      await context.handle.settled();
+      expect(first.closed).toBe(true);
+      expect(context.changes).toEqual([]);
 
-      // Once, for the whole run. A condition that repeats every thirty seconds and reports every
-      // time is a condition an operator filters out.
-      await deliverMention(context, 1_800_009_000);
-      expect(context.reports).toHaveLength(1);
+      for (let tick = 0; tick < ROLE_NOT_HELD_REPORT_AFTER; tick += 1) context.clock.fireAll();
+      expect(context.sockets).toHaveLength(1);
+      expect(context.sink.admitted).toEqual([]);
+      expect(context.changes.map((change) => [change.state, change.reason])).toEqual([
+        ["EXCLUDED", "NO_LIVE_PRIMARY_CTO_BINDING"],
+      ]);
+      expect(context.handle.admission().identities[0]).toMatchObject({ state: "EXCLUDED", reason: "NO_LIVE_PRIMARY_CTO_BINDING" });
     } finally {
       context.handle.close();
     }
   });
 
-  it("says nothing about a single role-not-held, which is the race the reconnect is for", async () => {
+  it("says nothing about a single role-not-held the next judgement answers, and reconnects from the same window", async () => {
     const context = startOneWhoseBindingMoves();
     try {
-      // Exactly the case the code comment describes: the registry is mid-settle, one event is
-      // rejected, and the next attempt finds the binding. Reporting here would train an operator
-      // to skip the line that matters.
+      // The registry is mid-settle: one event finds no binding, the next judgement finds it again.
+      const first = live(context.sockets);
+      await authenticate(first, context.handle);
+      first.handlers.onFrame(frame(["EOSE", (sentFrames(first)[1] as string[])[1] ?? ""]));
+      await context.handle.settled();
       context.hold(null);
-      await deliverMention(context, 1_800_002_001);
-      expect(context.reports).toEqual([]);
-
+      first.handlers.onFrame(
+        frame(["EVENT", (sentFrames(first)[1] as string[])[1] ?? "", mentionEvent({
+          author: context.owner.secretKey, addressedTo: context.identity.pubkey, createdAt: 1_800_002_001,
+        })]),
+      );
+      await context.handle.settled();
+      expect(first.closed).toBe(true);
       context.hold({ roleKey: ROLE_KEY, buzzActorId: context.identity.pubkey });
-      await deliverMention(context, 1_800_002_002);
-      expect(context.reports).toEqual([]);
-      expect(context.sink.admitted).toHaveLength(1);
+      context.clock.fireAll();
 
-      // And the run restarted, rather than resuming where the race left it: four more rejections
-      // after a binding that answered are still four, not five.
-      context.hold(null);
-      for (let attempt = 1; attempt < ROLE_NOT_HELD_REPORT_AFTER; attempt += 1) {
-        await deliverMention(context, 1_800_003_000 + attempt);
-      }
+      const second = live(context.sockets);
+      expect(second).not.toBe(first);
+      await authenticate(second, context.handle);
+      expect((sentFrames(second)[1] as [string, string, Record<string, unknown>])[2]["since"]).toBe(0);
+      const subId = (sentFrames(second)[1] as string[])[1] ?? "";
+      second.handlers.onFrame(
+        frame(["EVENT", subId, mentionEvent({ author: context.owner.secretKey, addressedTo: context.identity.pubkey, createdAt: 1_800_002_002 })]),
+      );
+      await context.handle.settled();
+      expect(context.sink.admitted).toHaveLength(1);
+      expect(context.changes).toEqual([]);
       expect(context.reports).toEqual([]);
     } finally {
       context.handle.close();
@@ -2457,7 +2458,7 @@ describe("the buzz mention subscriber's relay protocol", () => {
     let bound = { roleKey: ROLE_KEY, buzzActorId: identity.pubkey };
     const transport = manualTransport();
     const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
-      registry: { primaryCtoBindingFor: () => bound },
+      registry: { primaryCtoBindingFor: () => ({ room: ROOM, ...bound }) },
       sink,
       openSocket: transport.factory,
       scheduler: virtualClock().scheduler,
@@ -2751,7 +2752,7 @@ describe("a canonical CTO routed to its own room hears it only through its own i
     const sink = recordingSink();
     const transport = manualTransport();
     const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
-      registry: registryHolding({ [identity.pubkey]: { roleKey: ROLE_KEY, buzzActorId: identity.pubkey } }),
+      registry: registryHolding({ [identity.pubkey]: { roleKey: ROLE_KEY, buzzActorId: identity.pubkey } }, rooms[0]),
       sink,
       openSocket: transport.factory,
       scheduler: virtualClock().scheduler,

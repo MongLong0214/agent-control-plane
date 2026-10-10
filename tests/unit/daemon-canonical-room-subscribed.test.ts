@@ -120,7 +120,9 @@ const PROJECT = "room-project";
 const HOLDER = "11111111-1111-4111-8111-111111111111";
 const FRESH = "22222222-2222-4222-8222-222222222222";
 const FRESH_PROJECT = "fresh-room-project";
-const FRESH_ACTOR = "buzz:fresh-room-cto";
+/** A real channel identity, so a deployment can configure it as a subscriber identity (1080-N1-02). */
+const FRESH_SECRET = generateSecretKey();
+const FRESH_ACTOR = getPublicKey(FRESH_SECRET);
 const HOLDER_START = "darwin-tv:1790000100.000001";
 const RELAY = 545_454;
 const CLAIMANT = 100;
@@ -222,7 +224,7 @@ const canonicalEvidence = (buzzCalls: string[]): CanonicalEvidence => {
 
 interface DeploymentShape {
   /** The bound CTO's own key in `buzz-nostr-subscriber.json`, a key no session holds, or no file. */
-  subscriber?: "bound" | "unbound" | "absent";
+  subscriber?: "bound" | "unbound" | "absent" | "unclaimed-entry";
   /** Without a buzz owner no message ingress starts, and so no subscriber. */
   buzzOwner?: boolean;
   /**
@@ -240,6 +242,8 @@ interface DeploymentShape {
 }
 
 const TELEGRAM_OWNER = "4242";
+/** The conversation the single entry of a non-`canonical` deployment names. */
+const NON_CANONICAL_HOLDER = "99999999-9999-4999-8999-999999999999";
 
 /** A deployment whose canonical CTO holds its role live, with its subscriber listening in `rooms`. */
 const deployment = (rooms: readonly string[], shape: DeploymentShape = {}) => {
@@ -247,7 +251,10 @@ const deployment = (rooms: readonly string[], shape: DeploymentShape = {}) => {
   const secretKey = generateSecretKey();
   const pubkey = getPublicKey(secretKey);
   const keyFile = join(root, "subscriber.key");
-  const subscriberKey = shape.subscriber === "unbound" ? generateSecretKey() : secretKey;
+  // `unclaimed-entry` configures the key of the canonical entry nobody has claimed yet: a configured
+  // identity that is excluded at startup, unlike `unbound`, whose key no entry names.
+  const subscriberKey =
+    shape.subscriber === "unbound" ? generateSecretKey() : shape.subscriber === "unclaimed-entry" ? FRESH_SECRET : secretKey;
   writeFileSync(keyFile, Buffer.from(subscriberKey).toString("hex"), { mode: 0o600 });
   if (shape.subscriber !== "absent") {
     writeFileSync(join(root, BUZZ_SUBSCRIBER_CONFIG_FILENAME), JSON.stringify({
@@ -296,20 +303,21 @@ const deployment = (rooms: readonly string[], shape: DeploymentShape = {}) => {
     expect(seed.sessions.bindBuzzActor({
       sessionId: session.sessionId, sessionSecret: session.sessionSecret!, buzzActorId: pubkey,
     }, { isAllowedActor: () => true }).allowed).toBe(true);
-    const claimed = { executorKind: SELF_CLAIM_EXECUTOR_KIND, targetLocator: HOLDER, targetLocatorDigest: sha256(HOLDER) };
-    const bound = shape.canonical
-      ? seed.bindings.bind({
-        role: Role.PRIMARY_CTO,
-        sessionId: session.sessionId,
-        projectId: PROJECT,
-        authenticatedTarget: {
-          claimed,
-          protocolVersion: SELF_CLAIM_PROTOCOL,
-          attestationDigest: digestOf({ fixture: "room-subscribed", sessionId: session.sessionId }),
-          verify: () => claimed,
-        },
-      })
-      : seed.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: session.sessionId, projectId: PROJECT });
+    // Bound to the conversation its canonical entry names in both shapes: an entry's identity is
+    // admitted to the subscriber only on the canonical target its entry names (1080-N1-05).
+    const conversation = shape.canonical ? HOLDER : NON_CANONICAL_HOLDER;
+    const claimed = { executorKind: SELF_CLAIM_EXECUTOR_KIND, targetLocator: conversation, targetLocatorDigest: sha256(conversation) };
+    const bound = seed.bindings.bind({
+      role: Role.PRIMARY_CTO,
+      sessionId: session.sessionId,
+      projectId: PROJECT,
+      authenticatedTarget: {
+        claimed,
+        protocolVersion: SELF_CLAIM_PROTOCOL,
+        attestationDigest: digestOf({ fixture: "room-subscribed", sessionId: session.sessionId }),
+        verify: () => claimed,
+      },
+    });
     expect(bound.allowed, JSON.stringify(bound)).toBe(true);
   } finally {
     seed.close();
@@ -350,7 +358,7 @@ const deployment = (rooms: readonly string[], shape: DeploymentShape = {}) => {
       { sessionUuid: HOLDER, projectId: PROJECT, buzzActorId: pubkey, buzzAddress: ITS_ROOM },
       { sessionUuid: FRESH, projectId: FRESH_PROJECT, buzzActorId: FRESH_ACTOR, buzzAddress: ITS_ROOM },
     ]
-    : [{ sessionUuid: "99999999-9999-4999-8999-999999999999", projectId: PROJECT, buzzActorId: pubkey, buzzAddress: ITS_ROOM }];
+    : [{ sessionUuid: NON_CANONICAL_HOLDER, projectId: PROJECT, buzzActorId: pubkey, buzzAddress: ITS_ROOM }];
   for (const [key, value] of Object.entries({
     ACP_MCP_TOKEN: "startup-mcp-token",
     ACP_OPERATOR_TOKEN: "startup-operator-token",
@@ -497,6 +505,44 @@ describe("a claim or a correction that reaches the daemon before its rooms are c
         correctionAuditRows: 0,
         holderRoom: DEFAULT_ROOM,
       });
+    } finally {
+      after.close();
+    }
+  });
+
+  /**
+   * 1080-N1-02. The subscriber's key is the canonical entry nobody has claimed: configured, and
+   * excluded at startup for want of a binding. Its file says it listens only in DEFAULT_ROOM, and its
+   * entry routes it to ITS_ROOM. Excluding it must not remove that restriction: the startup check
+   * still refuses the configuration, and the claim that would write ITS_ROOM writes nothing.
+   */
+  it("keeps an excluded configured identity's room restriction: startup refuses and its claim writes no room", async () => {
+    const early: { claim?: Promise<Decision<unknown>> } = {};
+    const { config, pubkey, buzzCalls } = deployment([DEFAULT_ROOM], {
+      canonical: true,
+      subscriber: "unclaimed-entry",
+      onReattachOpened: () => {
+        early.claim = claimFresh();
+      },
+    });
+    let reachedShutdown = false;
+    const started = main({
+      config,
+      waitForShutdown: async (shutdown) => {
+        reachedShutdown = true;
+        await shutdown("STARTUP_TEST");
+      },
+    });
+    await expect(started).rejects.toThrow(
+      `the canonical CTO for project ${FRESH_PROJECT} is routed to Buzz room ${ITS_ROOM}, ` +
+        `but its mention subscriber identity listens only in ${DEFAULT_ROOM}`,
+    );
+    expect(reachedShutdown).toBe(false);
+    await expect(early.claim).resolves.toMatchObject({ allowed: false });
+    expect(buzzCalls).toEqual([]);
+    const after = new ControlPlane(config);
+    try {
+      expect(roomState(after, pubkey).freshSessionRooms).toEqual([]);
     } finally {
       after.close();
     }

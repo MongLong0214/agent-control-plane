@@ -259,7 +259,7 @@ describe("re-judgement through the binding registry's own switch events", () => 
 });
 
 describe("the registry's judgement of one identity", () => {
-  it("names each reason it excludes for, and requires a canonical identity's binding on its entry's project", async () => {
+  it("names each reason it excludes for, and requires a canonical identity's binding on its entry's project and conversation", async () => {
     const f = await start({ logicBound: true });
     try {
       const key = f.keys.repoFactory.pubkey;
@@ -267,7 +267,11 @@ describe("the registry's judgement of one identity", () => {
       const onItsProject = buzzMentionSubscriberRegistry(f.h.cp, { sessions: [{ ...entry, projectId: PROJECT.repoFactory }] });
       const onAnother = buzzMentionSubscriberRegistry(f.h.cp, { sessions: [{ ...entry, projectId: PROJECT.commitlore }] });
 
-      expect(onItsProject.judgeIdentity!(key)).toEqual({
+      // Bound with no canonical target: an entry names one conversation, and an ACTIVE assignment on
+      // a READY runtime without that conversation's target is not it (1080-N1-05).
+      expect(onItsProject.judgeIdentity!(key)).toEqual({ verdict: "EXCLUDED", reason: "CANONICAL_TARGET_UNVERIFIED" });
+      // Outside canonical activation the same binding is admitted, with the room it answers in.
+      expect(buzzMentionSubscriberRegistry(f.h.cp).judgeIdentity!(key)).toEqual({
         verdict: "ADMITTED",
         binding: {
           roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: PROJECT.repoFactory }),

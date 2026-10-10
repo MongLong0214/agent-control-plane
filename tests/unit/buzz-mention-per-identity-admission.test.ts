@@ -52,6 +52,7 @@ const bindingOf = (cto: Cto, key: ChannelKey, generation = 1, sessionId = `${cto
   buzzActorId: key.pubkey,
   bindingGeneration: generation,
   sessionId,
+  room: ROOMS[cto],
 });
 
 interface Deployment {
@@ -228,7 +229,11 @@ describe("re-judgement of the admitted set", () => {
       await d.relay.drain(d.handle);
       // Not a state a consistent registry reaches; the rule is that the holder keeps the role and
       // the later claimant is excluded, rather than two connections racing for one role's mail.
-      d.registry.hold(d.keys.commitlore.pubkey, { ...bindingOf("repoFactory", d.keys.commitlore), buzzActorId: d.keys.commitlore.pubkey });
+      d.registry.hold(d.keys.commitlore.pubkey, {
+        ...bindingOf("repoFactory", d.keys.commitlore),
+        buzzActorId: d.keys.commitlore.pubkey,
+        room: ROOMS.commitlore,
+      });
       d.handle.rejudge();
       await d.relay.drain(d.handle);
       expect(d.handle.admission().identities.map((one) => [one.identity, one.state, one.reason])).toEqual([
