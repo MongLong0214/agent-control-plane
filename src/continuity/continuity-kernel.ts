@@ -1278,6 +1278,8 @@ export class ContinuityKernel {
     }
     // Recorded with its native start pinned beside the lstart, read as one snapshot of one process
     // (ACP1045-R2-01, R3-01); see `SessionRegistry.createWithPinnedStart`.
+    // #246 C4-R2 — from here the provider has a session this attempt started; every refusal below
+    // stops it through the provider (`#retireUnusedReplacement`), not by marking its row alone.
     const session = this.sessions.createWithPinnedStart({
       provider: adapter.provider,
       model,
@@ -1295,7 +1297,7 @@ export class ContinuityKernel {
     });
     const connected = await buzz.connect(session.sessionId, purpose);
     if (!connected.allowed) {
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "buzz connect failed");
+      await this.#retireUnusedReplacement(session.sessionId, role, "buzz connect failed");
       return connected as Decision<{ sessionId: string }>;
     }
     this.sessions.setBuzzAddress(session.sessionId, connected.value);
@@ -1304,7 +1306,7 @@ export class ContinuityKernel {
       runtime = await adapter.probeSession(handle);
     } catch (err) {
       await this.capacity.refresh(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, [provider]);
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe threw");
+      await this.#retireUnusedReplacement(session.sessionId, role, "provider session probe threw");
       return deny(ReasonCode.SESSION_NOT_READY, "provider session probe did not complete", {
         provider,
         error: (err as Error).message,
@@ -1313,7 +1315,7 @@ export class ContinuityKernel {
     }
     if (runtime !== "HEALTHY") {
       await this.capacity.refresh(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, [provider]);
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe failed");
+      await this.#retireUnusedReplacement(session.sessionId, role, "provider session probe failed");
       return deny(ReasonCode.SESSION_NOT_READY, "provider cannot prove the constituted session is ready", {
         provider,
         runtime,
@@ -1323,20 +1325,21 @@ export class ContinuityKernel {
     this.sessions.transition(session.sessionId, SessionLifecycle.READY, "provider session and route verified");
     const checked = await readiness.checkSession(session.sessionId);
     if (!checked.allowed) {
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "readiness failed");
+      await this.#retireUnusedReplacement(session.sessionId, role, "readiness failed");
       return checked as Decision<{ sessionId: string }>;
     }
     return allow(ReasonCode.OK, { sessionId: session.sessionId });
   }
 
   /**
-   * #246 C4-R2 — retires the replacement session this failover provisioned and will not use, through
-   * the provider's own stop, never by a row transition alone. It holds no role, by its row or as an
-   * actor's runtime, and is no adopted canonical runtime — proven, and the session moved out of
-   * READY, in one transaction before the stop is awaited, so no bind or actor move can adopt it
-   * meanwhile and no other holder is ever the target. Only a stop that returned is recorded STOPPED;
-   * a failed stop leaves it ERROR, recorded `REMAINING_STOP_FAILED`, and one that could not be
-   * proven unused is left alone and recorded `REMAINING_OWNERSHIP_UNVERIFIED`.
+   * #246 C4-R2 — retires a session this continuity attempt started and will not use (a refused
+   * failover, or a provisioning that failed after the provider started it), through the provider's
+   * own stop, never by a row transition alone. It holds no role, by its row or as an actor's
+   * runtime, and is no adopted canonical runtime — proven, and the session moved out of READY, in one
+   * transaction before the stop is awaited, so no bind or actor move can adopt it meanwhile and no
+   * other holder is ever the target. Only a stop that returned is recorded STOPPED; a failed stop
+   * leaves it ERROR, recorded `REMAINING_STOP_FAILED`, and one that could not be proven unused is
+   * left alone and recorded `REMAINING_OWNERSHIP_UNVERIFIED`.
    */
   async #retireUnusedReplacement(sessionId: string, role: Role, reason: string): Promise<void> {
     const session = this.sessions.get(sessionId);

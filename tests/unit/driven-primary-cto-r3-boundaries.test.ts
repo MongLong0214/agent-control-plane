@@ -1,21 +1,22 @@
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 
-import { allow } from "../../src/core/errors.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { isAdoptedCanonicalRuntime } from "../../src/registry/canonical-self-claim.ts";
 import type { SessionHandle } from "../../src/runtime/provider.ts";
-import { withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { drivenPrimary } from "../helpers/driven-primary-cto.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { fixtureManifest, registerFixtureProject } from "../helpers/harness.ts";
 
 /**
- * #246 PR-C C4-R2 — review 3 of the recovery slice. A replacement a refused failover will not use is
- * stopped through its provider only when it is proven to be nobody's — no ACTIVE assignment and no
- * adopted canonical runtime — and recovery refuses a holder that moved once its attestation
- * completed. These are the review's witnesses with only their harness adapted (no review-tree
- * output files).
+ * #246 PR-C C4-R2 — review 3 of the recovery slice. A session a continuity attempt started and will
+ * not use is stopped through its provider only when it is proven to be nobody's — no ACTIVE
+ * assignment and no adopted canonical runtime — and that holds for a refused failover and for a
+ * provisioning refused after the provider started the session alike. The first five bodies are the
+ * review's witnesses with only their harness adapted (no review-tree output files); the provisioning
+ * siblings after them are this slice's own.
  */
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
@@ -172,5 +173,144 @@ it('replacement retirement remains ERROR with no STOPPED evidence until its prov
     expect((await pending).allowed).toBe(false);
     expect(cp.sessions.require(row.session_id).lifecycle).toBe(SessionLifecycle.STOPPED);
     expect(cp.audit.byKind('CONTINUITY_REPLACEMENT_CLEANUP')).toMatchObject([{sessionId:row.session_id,evidence:{outcome:'STOPPED'}}]);
+  });
+});
+
+it('ROUND1-ESCAPE-02: failover route refusal must stop the provider resource it already started',async()=>{
+  await withBootstrapRuntime(async f=>{
+    const cp=f.harness.cp;
+    const projectId='r3-refused-provider-route';
+    await registerFixtureProject(f.harness,projectId);
+    const initial=await cp.cto.ensurePrimaryCto(projectId,'fixture');
+    if(!initial.allowed) throw new Error(initial.message);
+    const start=f.gpt.startSession.bind(f.gpt);
+    let unused:SessionHandle|null=null;
+    vi.spyOn(f.gpt,'startSession').mockImplementationOnce(async spec=>{unused=await start(spec);return unused});
+    cp.continuity.attach({buzz:{connect:async()=>deny(ReasonCode.SESSION_NOT_READY,'fixture route refusal',{})}});
+    const stop=vi.spyOn(f.gpt,'stopSession');
+    f.loseClaude();
+    const refused=await cp.continuity.failover(initial.value.roleKey,Role.PRIMARY_CTO,{projectId},'route refusal');
+    expect(refused).toMatchObject({allowed:false,reasonCode:ReasonCode.SESSION_NOT_READY});
+    expect(unused).not.toBeNull();
+    const resource=unused! as SessionHandle;
+    const providerHealth=await f.gpt.probeSession(resource);
+    const current=cp.bindings.active(initial.value.roleKey);
+    expect(current?.assignmentId).toBe(initial.value.assignmentId);
+    expect.soft(stop).toHaveBeenCalledTimes(1);
+    expect.soft(providerHealth).toBe('UNAVAILABLE');
+  });
+});
+
+
+/** The row a provisioned session was recorded under, found by its provider conversation id. */
+const provisionedRow = (f: BootstrapRuntimeFixture, resource: SessionHandle) =>
+  f.harness.cp.db.get<{ session_id: string; lifecycle: string }>(
+    "SELECT session_id, lifecycle FROM sessions WHERE incarnation LIKE ?",
+    [`${resource.externalSessionId}#%`],
+  );
+
+/**
+ * A failover whose replacement the provider starts, then refused by `refuse` after the start. The
+ * started resource is captured, and the real provider probe is kept so its health is read honestly.
+ */
+const refusedProvisioning = async (
+  f: BootstrapRuntimeFixture,
+  projectId: string,
+  refuse: (
+    f: BootstrapRuntimeFixture,
+    started: () => SessionHandle | null,
+    stop: { mockRejectedValueOnce: (error: Error) => unknown },
+  ) => void,
+) => {
+  const cp = f.harness.cp;
+  await registerFixtureProject(f.harness, projectId);
+  const initial = await cp.cto.ensurePrimaryCto(projectId, "fixture");
+  if (!initial.allowed) throw new Error(initial.message);
+  const start = f.gpt.startSession.bind(f.gpt);
+  const probe = f.gpt.probeSession.bind(f.gpt);
+  let started: SessionHandle | null = null;
+  vi.spyOn(f.gpt, "startSession").mockImplementationOnce(async (spec) => {
+    started = await start(spec);
+    return started;
+  });
+  const stop = vi.spyOn(f.gpt, "stopSession");
+  refuse(f, () => started, stop);
+  f.loseClaude();
+  const refused = await cp.continuity.failover(initial.value.roleKey, Role.PRIMARY_CTO, { projectId }, "refused provisioning");
+  const resource = started as SessionHandle | null;
+  if (!resource) throw new Error("the provider never started a replacement");
+  return { cp, initial, refused, resource, stop, probe, row: provisionedRow(f, resource) };
+};
+
+it("a replacement whose provider probe is not HEALTHY is stopped through the provider", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const out = await refusedProvisioning(f, "r3-probe-degraded", (fx, started) => {
+      const real = fx.gpt.probeSession.bind(fx.gpt);
+      vi.spyOn(fx.gpt, "probeSession").mockImplementation(async (handle) =>
+        handle.externalSessionId === started()?.externalSessionId ? "DEGRADED" : real(handle));
+    });
+    expect(out.refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+    expect(out.stop).toHaveBeenCalledTimes(1);
+    expect(out.stop.mock.calls[0]?.[0]).toMatchObject({ externalSessionId: out.resource.externalSessionId });
+    expect(await out.probe(out.resource)).toBe("UNAVAILABLE");
+    expect(out.row?.lifecycle).toBe(SessionLifecycle.STOPPED);
+    expect(out.cp.audit.byKind("CONTINUITY_REPLACEMENT_CLEANUP")).toMatchObject([
+      { sessionId: out.row?.session_id, evidence: { outcome: "STOPPED", reason: "provider session probe failed" } },
+    ]);
+    expect(out.cp.bindings.active(out.initial.value.roleKey)?.assignmentId).toBe(out.initial.value.assignmentId);
+  });
+});
+
+it("a replacement whose provider probe throws is stopped through the provider", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const out = await refusedProvisioning(f, "r3-probe-threw", (fx, started) => {
+      const real = fx.gpt.probeSession.bind(fx.gpt);
+      vi.spyOn(fx.gpt, "probeSession").mockImplementation(async (handle) => {
+        if (handle.externalSessionId === started()?.externalSessionId) throw new Error("fixture probe failure");
+        return real(handle);
+      });
+    });
+    expect(out.refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+    expect(out.stop).toHaveBeenCalledTimes(1);
+    expect(await out.probe(out.resource)).toBe("UNAVAILABLE");
+    expect(out.row?.lifecycle).toBe(SessionLifecycle.STOPPED);
+    expect(out.cp.audit.byKind("CONTINUITY_REPLACEMENT_CLEANUP")).toMatchObject([
+      { sessionId: out.row?.session_id, evidence: { outcome: "STOPPED", reason: "provider session probe threw" } },
+    ]);
+  });
+});
+
+it("a replacement refused by the readiness probe is stopped through the provider", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const out = await refusedProvisioning(f, "r3-readiness-refused", (fx) => {
+      fx.harness.cp.continuity.attach({
+        readiness: { checkSession: async () => deny(ReasonCode.SESSION_NOT_READY, "fixture readiness refusal", {}) },
+      });
+    });
+    expect(out.refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+    expect(out.stop).toHaveBeenCalledTimes(1);
+    expect(await out.probe(out.resource)).toBe("UNAVAILABLE");
+    expect(out.row?.lifecycle).toBe(SessionLifecycle.STOPPED);
+    expect(out.cp.audit.byKind("CONTINUITY_REPLACEMENT_CLEANUP")).toMatchObject([
+      { sessionId: out.row?.session_id, evidence: { outcome: "STOPPED", reason: "readiness failed" } },
+    ]);
+  });
+});
+
+it("a refused replacement whose provider stop fails stays ERROR and is recorded as remaining", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const out = await refusedProvisioning(f, "r3-route-stop-fails", (fx, _started, stop) => {
+      fx.harness.cp.continuity.attach({
+        buzz: { connect: async () => deny(ReasonCode.SESSION_NOT_READY, "fixture route refusal", {}) },
+      });
+      stop.mockRejectedValueOnce(new Error("fixture stop failure"));
+    });
+    expect(out.refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+    expect(out.stop).toHaveBeenCalledTimes(1);
+    expect(await out.probe(out.resource)).toBe("HEALTHY");
+    expect(out.row?.lifecycle).toBe(SessionLifecycle.ERROR);
+    expect(out.cp.audit.byKind("CONTINUITY_REPLACEMENT_CLEANUP")).toMatchObject([
+      { sessionId: out.row?.session_id, evidence: { outcome: "REMAINING_STOP_FAILED", reason: "buzz connect failed" } },
+    ]);
   });
 });
