@@ -314,8 +314,7 @@ export interface CheckoutRecoveryPrecondition {
 export const RESERVATION_RELEASE_PRECONDITIONS = [
   "the run is a cancelled PROJECT_BOOTSTRAP run, so the approval its reservation consumed, which names that run, can never be presented again; and its application is RESERVED",
   "no application attempt of the run is in flight, and this process holds the control plane's single-writer lock",
-  "the attempt ledger, which records every GitHub request before it is sent, shows none was ever sent: it is absent, or this operation's own with no receipt and no pending request",
-  "the last attempt's own outcome is recorded: it ended in a production refusal that names this ledger and no request issued or completed",
+  "no request was ever sent: no attempt durably reached the stage that precedes the attempt ledger's first write and no ledger exists, or the ledger those attempts wrote holds no receipt and no pending request",
 ] as const;
 
 /** A reservation release, with the evidence that its application had no external effect. */
@@ -327,10 +326,10 @@ export interface ReservationRelease {
   attempts: number;
   approvalDigest: string;
   ledgerPath: string;
-  /** Whether the ledger file exists at all; when it does, it holds no receipt and no pending request. */
+  /** Whether the ledger file exists; when it does, it holds no receipt and no pending request. */
   ledgerPresent: boolean;
-  /** The last attempt's recorded outcome, as the application row keeps it. */
-  lastAttemptOutcome: { attempt: number; refusal: string | null; reasonCode: string | null };
+  /** The attempts durably recorded as having reached their first ledger write. */
+  ledgerStageAttempts: number[];
 }
 
 export interface ReservationReleaseInspection {
@@ -833,6 +832,8 @@ export class RepoFactoryBootstrapRunner {
       workDir,
       checkoutPath: attemptCheckoutPath(workDir, executable.repositoryRole, attempt),
       keepCheckoutOnFailure: true,
+      // CEO decision (b): durably, before the attempt's first ledger write and so before any request.
+      beforeLedgerWrite: () => this.deps.applications.recordLedgerStage(runId, attempt),
       clock: this.deps.clock,
       github: { port: this.deps.githubPort, authority },
       // The reviewed files, and the tree the producer reports must be exactly these (#246 C2).
@@ -1186,15 +1187,14 @@ export class RepoFactoryBootstrapRunner {
   }
 
   /**
-   * #246 C3, CEO decision (b) as corrected twice — whether a cancelled run's reservation can be
-   * released, asked without changing anything. Released only on positive proof that the application
-   * had no external effect: no attempt in flight here and this process the only control-plane
-   * writer; the attempt ledger — written and synced before every GitHub request is sent — showing
-   * that none was ever sent; and the last attempt's own recorded outcome agreeing. A pending request
-   * (sent, and its outcome never recorded), a ledger that cannot be read as this operation's, or an
-   * attempt whose outcome was never recorded — a daemon that died mid-attempt — cannot be proven to
-   * have had no effect: `inDoubt` says why, and nothing is released. GitHub is not read: that a
-   * repository is absent now does not prove a request sent earlier will not land.
+   * #246 C3, CEO decision (b) as corrected — whether a cancelled run's reservation can be released,
+   * asked without changing anything. Released only on positive proof that the application had no
+   * external effect: no attempt in flight here and this process the only control-plane writer; and
+   * either no attempt durably reached the stage that precedes the attempt ledger's first write (and
+   * no ledger exists), or the ledger those attempts wrote — synced before every GitHub request is
+   * sent — holds no receipt and no pending request. A missing ledger is not that proof: after an
+   * attempt reached it, a missing or unreadable ledger is a doubt, as is a pending request or a
+   * ledger nothing explains, and `inDoubt` says which; nothing is released. GitHub is not read.
    */
   inspectReservationRelease(runId: string | null): ReservationReleaseInspection {
     const preconditions: CheckoutRecoveryPrecondition[] = [];
@@ -1241,15 +1241,9 @@ export class RepoFactoryBootstrapRunner {
     return allow(ReasonCode.OK, proven.value);
   }
 
-  /**
-   * CEO decision (b): a release refused because no effect can be proven keeps the reservation, marked
-   * so. The last attempt's own outcome is kept inside the mark (`attemptOutcome`), so a doubt that
-   * later clears does not erase the record a later release needs.
-   */
+  /** CEO decision (b): a release refused because no effect can be proven keeps the reservation, marked so. */
   recordReleaseInDoubt(runId: string, inDoubt: Record<string, unknown>): void {
-    const last = this.deps.applications.get(runId)?.lastRefusal ?? null;
-    const attemptOutcome = last?.["stage"] === "release" ? (last["attemptOutcome"] ?? null) : last;
-    this.deps.applications.recordRefusal(runId, { stage: "release", refusal: "RELEASE_IN_DOUBT", ...inDoubt, attemptOutcome });
+    this.deps.applications.recordRefusal(runId, { stage: "release", refusal: "RELEASE_IN_DOUBT", ...inDoubt });
   }
 
   /** The release preconditions, appended to `preconditions` as they are checked. */
@@ -1288,52 +1282,34 @@ export class RepoFactoryBootstrapRunner {
     const workRoot = this.deps.workRoot;
     if (workRoot === null || !PATH_SAFE_RUN_ID.test(runId)) return inDoubt("WORK_ROOT_UNCONFIGURED", { workRoot });
     const ledgerPath = githubLedgerPath(join(workRoot, runId), outputs.value.target.repositoryRole);
-    const ledger = readGitHubLedger(
-      ledgerPath,
-      { bootstrapOperationId: outputs.value.bootstrapOperationId, requestDigest: outputs.value.requestDigest },
-      outputs.value.githubOperations,
-    );
-    if (!ledger.allowed) return inDoubt("LEDGER_UNREADABLE", { ledgerPath, ledger: refusalRecord(ledger, "precondition") });
-    const receipted = [...ledger.value.receipts.keys()].sort();
-    const pending = [...ledger.value.pending.keys()].sort();
-    // A pending request was sent and its outcome never recorded: whatever GitHub shows now, it may
-    // still land. That is a doubt, not a release.
-    if (pending.length > 0) return inDoubt("UNRESOLVED_REQUEST", { ledgerPath, pending, receipted });
-    // A receipt is a write that landed: an external effect, not a doubt. The reservation is kept.
-    if (!met(receipted.length === 0, { cause: receipted.length === 0 ? null : "WRITE_LANDED", ledgerPath, receipted })) {
-      return unmet({ cause: "WRITE_LANDED", receipted });
-    }
     const ledgerPresent = pathOccupied(ledgerPath);
-
-    // The last attempt's own outcome: recorded by the attempt itself when it returned. An attempt
-    // whose outcome was never recorded — its daemon died — proves nothing about what it sent.
-    const last = application.lastRefusal;
-    const outcome = (last?.["stage"] === "release" ? (last["attemptOutcome"] ?? null) : last) as Record<string, unknown> | null;
-    const evidence = (outcome?.["evidence"] ?? null) as Record<string, unknown> | null;
-    const listed = (key: string): unknown[] | null => {
-      const value = evidence?.[key];
-      return Array.isArray(value) ? value : null;
-    };
-    const recordedLedger = evidence?.["ledgerPath"];
-    const ended =
-      outcome !== null &&
-      outcome["stage"] === "production" &&
-      outcome["attempt"] === application.attempts &&
-      (recordedLedger === undefined || recordedLedger === ledgerPath) &&
-      (listed("pendingOperationIds") ?? []).length === 0 &&
-      (listed("completedOperationIds") ?? []).length === 0;
-    const lastAttemptOutcome = {
-      attempt: application.attempts,
-      refusal: typeof outcome?.["refusal"] === "string" ? outcome["refusal"] : typeof evidence?.["refusal"] === "string" ? evidence["refusal"] : null,
-      reasonCode: typeof outcome?.["reasonCode"] === "string" ? outcome["reasonCode"] : null,
-    };
-    if (!ended) {
-      return inDoubt("ATTEMPT_OUTCOME_UNRECORDED", {
-        attempts: application.attempts,
-        recorded: outcome === null ? null : { stage: outcome["stage"] ?? null, attempt: outcome["attempt"] ?? null },
-      });
+    // Every attempt records, durably, that it reached its first ledger write before it writes the
+    // ledger, and the ledger is written before every GitHub request. So an attempt with no such
+    // record never sent anything; one with it is judged by the ledger, which must then be there.
+    const ledgerStageAttempts = this.deps.applications.ledgerStageAttempts(runId);
+    if (ledgerStageAttempts.length === 0) {
+      // No attempt reached the ledger: nothing was sent. A ledger nothing explains is a doubt.
+      if (ledgerPresent) return inDoubt("LEDGER_UNEXPLAINED", { ledgerPath, ledgerStageAttempts });
+      met(true, { ledgerPath, ledgerPresent, ledgerStageAttempts });
+    } else {
+      // An attempt reached the ledger: a missing ledger proves nothing, it is a doubt.
+      if (!ledgerPresent) return inDoubt("LEDGER_MISSING", { ledgerPath, ledgerStageAttempts });
+      const ledger = readGitHubLedger(
+        ledgerPath,
+        { bootstrapOperationId: outputs.value.bootstrapOperationId, requestDigest: outputs.value.requestDigest },
+        outputs.value.githubOperations,
+      );
+      if (!ledger.allowed) return inDoubt("LEDGER_UNREADABLE", { ledgerPath, ledger: refusalRecord(ledger, "precondition") });
+      const receipted = [...ledger.value.receipts.keys()].sort();
+      const pending = [...ledger.value.pending.keys()].sort();
+      // A pending request was sent and its outcome never recorded: whatever GitHub shows now, it may
+      // still land. That is a doubt, not a release.
+      if (pending.length > 0) return inDoubt("UNRESOLVED_REQUEST", { ledgerPath, pending, receipted });
+      // A receipt is a write that landed: an external effect, not a doubt. The reservation is kept.
+      if (!met(receipted.length === 0, { cause: receipted.length === 0 ? null : "WRITE_LANDED", ledgerPath, receipted, ledgerStageAttempts })) {
+        return unmet({ cause: "WRITE_LANDED", receipted });
+      }
     }
-    met(true, { lastAttemptOutcome });
     return allow(ReasonCode.OK, {
       runId: application.runId,
       projectId: application.projectId,
@@ -1343,7 +1319,7 @@ export class RepoFactoryBootstrapRunner {
       approvalDigest: application.approvalDigest,
       ledgerPath,
       ledgerPresent,
-      lastAttemptOutcome,
+      ledgerStageAttempts,
     });
   }
 

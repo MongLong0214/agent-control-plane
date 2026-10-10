@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -1397,7 +1397,7 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
       expect(record).toMatchObject({ phase: "RELEASED", attempts: 1, projectId: "c3-b-release", repositoryIdentity: BOOTSTRAP_IDENTITY });
       expect(record?.lastRefusal).toMatchObject({
         cause: "RELEASED",
-        evidence: { attempts: 1, lastAttemptOutcome: { attempt: 1, refusal: "REMOTE_REFUSED" } },
+        evidence: { attempts: 1, ledgerPresent: false, ledgerStageAttempts: [] },
       });
       expect((await confirm(f, first))["ok"]).toBe(false);
 
@@ -1436,20 +1436,75 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
     });
   });
 
-  it("an attempt whose daemon died before recording its outcome stays IN_DOUBT, though its ledger shows nothing sent", async () => {
+  it("a daemon that died before its attempt reached the ledger provably sent nothing: the reservation is released", async () => {
     await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-dead"));
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-dead-early"));
       await approveWrites(f, run);
-      // The daemon dies after the attempt is recorded and before it records how the attempt ended.
+      // The daemon dies after the attempt is recorded and before it records how the attempt ended;
+      // it never reached the stage that precedes the ledger's first write.
       const recorded = vi.spyOn(f.harness.cp.bootstrapApplications, "recordRefusal").mockImplementation(() => undefined);
       await attemptEndsBeforeAnyRequest(f, run);
       recorded.mockRestore();
       expect(applicationOf(f, run.runId)?.lastRefusal).toBeNull();
+      expect(f.harness.cp.bootstrapApplications.ledgerStageAttempts(run.runId)).toEqual([]);
+      await cancelRun(f, run);
+      const released = await releaseReservation(f, run);
+      expect(released, JSON.stringify(released)).toMatchObject({ ok: true, value: { changes: 1 } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RELEASED", attempts: 1 });
+    });
+  });
+
+  it("a daemon that died after its attempt reached the ledger, with the ledger then missing, stays IN_DOUBT: a missing ledger proves nothing", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-dead-late"));
+      await approveWrites(f, run);
+      const recorded = vi.spyOn(f.harness.cp.bootstrapApplications, "recordRefusal").mockImplementation(() => undefined);
+      f.github.failNext = "createRepository";
+      expect((await confirm(f, run))["ok"]).toBe(false);
+      recorded.mockRestore();
+      expect(f.harness.cp.bootstrapApplications.ledgerStageAttempts(run.runId)).toEqual([1]);
+      // The ledger the attempt wrote is gone; GitHub holds nothing at the target either.
+      const ledger = join(f.workRoot, run.runId, "github-ledger", "primary.json");
+      expect(existsSync(ledger)).toBe(true);
+      unlinkSync(ledger);
+      expect(f.github.repository("acme", "fixture")).toBeUndefined();
       await cancelRun(f, run);
       const refused = await releaseReservation(f, run);
       expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
-      expect(preconditionOf(refused, 3)).toMatchObject({ satisfied: false, evidence: { cause: "ATTEMPT_OUTCOME_UNRECORDED" } });
-      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1, lastRefusal: { refusal: "RELEASE_IN_DOUBT" } });
+      expect(preconditionOf(refused, 2)).toMatchObject({ satisfied: false, evidence: { cause: "LEDGER_MISSING", ledgerStageAttempts: [1] } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1, lastRefusal: { refusal: "RELEASE_IN_DOUBT", cause: "LEDGER_MISSING" } });
+    });
+  });
+
+  it("an unreadable ledger after an attempt reached it stays IN_DOUBT", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-unreadable"));
+      await approveWrites(f, run);
+      f.github.failNext = "createRepository";
+      expect((await confirm(f, run))["ok"]).toBe(false);
+      writeFileSync(join(f.workRoot, run.runId, "github-ledger", "primary.json"), "{ not a ledger");
+      await cancelRun(f, run);
+      const refused = await releaseReservation(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(refused, 2)).toMatchObject({ satisfied: false, evidence: { cause: "LEDGER_UNREADABLE" } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", lastRefusal: { refusal: "RELEASE_IN_DOUBT" } });
+    });
+  });
+
+  it("a ledger no attempt of the run explains stays IN_DOUBT", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-unexplained"));
+      await approveWrites(f, run);
+      await attemptEndsBeforeAnyRequest(f, run);
+      expect(f.harness.cp.bootstrapApplications.ledgerStageAttempts(run.runId)).toEqual([]);
+      const ledgerDir = join(f.workRoot, run.runId, "github-ledger");
+      mkdirSync(ledgerDir, { recursive: true, mode: 0o700 });
+      writeFileSync(join(ledgerDir, "primary.json"), "{}\n", { mode: 0o600 });
+      await cancelRun(f, run);
+      const refused = await releaseReservation(f, run);
+      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET });
+      expect(preconditionOf(refused, 2)).toMatchObject({ satisfied: false, evidence: { cause: "LEDGER_UNEXPLAINED" } });
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", lastRefusal: { refusal: "RELEASE_IN_DOUBT" } });
     });
   });
 

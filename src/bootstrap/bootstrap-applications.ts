@@ -1,5 +1,5 @@
 import type { Clock } from "../core/clock.ts";
-import { type Decision, type Evidence, allow, deny, isAcpError } from "../core/errors.ts";
+import { type Decision, type Evidence, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -49,15 +49,16 @@ import type { Db } from "../db/database.ts";
  * - Recovery: the same CONFIRM again, never a new plan or a new scope.
  * - Cancel: the run is cancelled first, and then the repair `release_bootstrap_reservation` releases
  *   its reservation, only on positive proof of no external effect: no attempt is in flight, this
- *   process is the only control-plane writer, the attempt ledger (written and synced before every
- *   GitHub request is sent) shows that no request was ever sent, and the last attempt's own recorded
- *   outcome agrees. GitHub's present state is not that proof. The row becomes RELEASED and keeps
+ *   process is the only control-plane writer, and either no attempt durably reached the stage that
+ *   precedes the attempt ledger's first write (and no ledger exists), or the ledger those attempts
+ *   wrote — synced before every GitHub request is sent — holds no receipt and no pending request. A
+ *   missing ledger is not that proof, and neither is GitHub's present state. The row becomes RELEASED and keeps
  *   everything it recorded, with the release record beside it; it no longer holds the project id or
  *   repository identity, so a new run may reserve them under its own new approval. The old approval
- *   cannot serve that run: it names the cancelled run, which can never be confirmed again. A request
- *   sent whose outcome was never recorded, a ledger that cannot be read, or an attempt whose own
- *   outcome was never recorded keeps the reservation RESERVED with RELEASE_IN_DOUBT as its last
- *   refusal; a write that landed keeps it as it is.
+ *   cannot serve that run: it names the cancelled run, which can never be confirmed again. A pending
+ *   request, a ledger that is missing or unreadable after an attempt reached it, or a ledger nothing
+ *   explains keeps the reservation RESERVED with RELEASE_IN_DOUBT as its last refusal; a write that
+ *   landed keeps it as it is.
  * - STRANDED and COMPLETED are terminal: the reservation is never released or reused.
  */
 
@@ -332,6 +333,41 @@ export class BootstrapApplications {
     } catch (error) {
       if (!isAcpError(error)) throw error;
     }
+  }
+
+  /**
+   * #246 C3, CEO decision (b) — attempt `attempt` of this run is about to write its GitHub ledger for
+   * the first time, and so may send a GitHub request after it. Recorded, durably, before that write:
+   * an attempt with no such record never wrote the ledger and so never sent a request. A write that
+   * fails throws, which stops the producer before the ledger is written or anything is sent.
+   */
+  recordLedgerStage(runId: string, attempt: number): void {
+    const recorded = this.audit.record({
+      kind: "BOOTSTRAP_APPLICATION_LEDGER_STAGE",
+      runId,
+      projectId: null,
+      evidence: { attempt },
+    });
+    if (!recorded.allowed) throw acpError(recorded.reasonCode, recorded.message, recorded.evidence);
+  }
+
+  /** The attempts of this run recorded as having reached their first GitHub ledger write. */
+  ledgerStageAttempts(runId: string): number[] {
+    return this.db
+      .all<{ evidence_json: string }>(
+        `SELECT evidence_json FROM audit_events
+          WHERE kind = 'BOOTSTRAP_APPLICATION_LEDGER_STAGE' AND run_id = ?
+          ORDER BY event_id`,
+        [runId],
+      )
+      .map((row) => {
+        try {
+          const attempt = (JSON.parse(row.evidence_json) as { attempt?: unknown }).attempt;
+          return typeof attempt === "number" && Number.isInteger(attempt) ? attempt : -1;
+        } catch {
+          return -1;
+        }
+      });
   }
 
   private move(

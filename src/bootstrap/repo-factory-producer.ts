@@ -225,6 +225,12 @@ export interface RepoFactoryProducerInput {
    * the caller's next attempt creates a checkout of its own, so this one is preserved where it is.
    */
   keepCheckoutOnFailure?: boolean;
+  /**
+   * #246 C3, CEO decision (b) — called once, before the GitHub ledger is first written by this call
+   * and so before any GitHub request that writes. It must durably record that the attempt reached
+   * that stage; a throw stops the producer before the ledger is written or anything is sent.
+   */
+  beforeLedgerWrite?: () => void;
 }
 
 /** The blob id git gives `content`, in the object format the repository's own ids use. */
@@ -952,6 +958,7 @@ export const produceRepoFactoryResult = async (
   let applied: AppliedGitHubOperations | null = null;
   if (github !== null) {
     const ledgerPath = github.ledgerPath;
+    let ledgerStageRecorded = false;
     let outcome: Decision<AppliedGitHubOperations>;
     try {
       outcome = await applyGitHubOperations({
@@ -960,13 +967,18 @@ export const produceRepoFactoryResult = async (
         checkoutPath: localRepoPath,
         defaultBranch: plan.defaultBranch,
         prior,
-        record: (state) =>
+        record: (state) => {
+          if (!ledgerStageRecorded) {
+            input.beforeLedgerWrite?.();
+            ledgerStageRecorded = true;
+          }
           writeGitHubLedger(ledgerPath, {
             schema: GITHUB_LEDGER_SCHEMA_ID,
             ...ledgerOwner,
             receipts: state.receipts,
             pending: state.pending,
-          }),
+          });
+        },
         ledgerPath,
         clock,
         approvedTree,
