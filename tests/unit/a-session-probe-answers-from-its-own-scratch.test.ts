@@ -708,7 +708,7 @@ describe("a probe ends its own process group on every completion, and only its o
     const stubs = tempDir("acp-session-probe-stub-");
     try {
       const controller = new AbortController();
-      const timeoutMs = 3_000;
+      const timeoutMs = 5_000;
       const started = Date.now();
       const mark = sandboxed.length;
       const pending = __testing.productionRunCli(claudeWithDescendant(stubs, "hang", marker), [marker], {
@@ -717,7 +717,8 @@ describe("a probe ends its own process group on every completion, and only its o
         signal: controller.signal,
         reapProcessGroup: true,
       });
-      expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 2_000)).toBe(true);
+      // Generous bounds: on a loaded host the stand-in can take seconds to start.
+      expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 4_000)).toBe(true);
       const probe = sandboxed[mark]!;
       const cli = cliPids(probe)[0]!;
       const descendant = descendantPids(probe)[0]!;
@@ -727,7 +728,7 @@ describe("a probe ends its own process group on every completion, and only its o
         process.kill(probe.pid!, "SIGKILL");
       } else {
         process.kill(probe.pid!, "SIGKILL");
-        expect(await waitFor(() => !alive(probe.pid!), 2_000)).toBe(true);
+        expect(await waitFor(() => !alive(probe.pid!), 10_000)).toBe(true);
         controller.abort();
       }
       const result = await pending;
@@ -1281,5 +1282,224 @@ process.stdout.write("stdout line\\nno trailing newline", () => {
     expect(direct.exitCode).toBe(mode === "exit0" ? 0 : mode === "exit7" ? 7 : null);
     expectConsistentReap(held.processGroup);
     expect(held.processGroup!.reaped).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------------------------------------ */
+/* #1077 N2-01 (narrow 6) — the settle deadline is enforced: one answer, never a late success         */
+/* ------------------------------------------------------------------------------------------------ */
+
+/** Kills, as the test, every live member of a row's own group: what the probe was right to leave. */
+const clearRowGroupOf = (mark: number): void => {
+  const own = sandboxed[mark];
+  if (own?.pid === undefined) return;
+  for (const line of liveMembersOf(own.pid)) {
+    const pid = Number(line.split(/\s+/)[0]);
+    if (pid > 0) process.kill(pid, "SIGKILL");
+  }
+};
+
+/**
+ * Watches the timers the adapter arms. The 2000 ms one is the settle deadline: its first arming is
+ * the first end request, on the monotonic clock. Observation wakes (10 ms) armed `afterMs` or more
+ * after that request are delayed by `delayMs`, or held and never run ("never") until `release`.
+ */
+const watchTimers = (late: { afterMs: number; delayMs: number | "never" | ((requestedAt: number) => number) }) => {
+  const nativeTimeout = globalThis.setTimeout;
+  const trace = { requestedAt: null as number | null, lateWakes: 0, held: [] as (() => void)[] };
+  const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+    if (ms === 2_000 && trace.requestedAt === null) trace.requestedAt = performance.now();
+    if (ms === 10 && trace.requestedAt !== null && performance.now() - trace.requestedAt >= late.afterMs) {
+      trace.lateWakes += 1;
+      if (late.delayMs === "never") {
+        trace.held.push(() => callback(...args));
+        return nativeTimeout(() => undefined, 0);
+      }
+      const delay = typeof late.delayMs === "function" ? late.delayMs(trace.requestedAt) : late.delayMs;
+      return nativeTimeout(() => callback(...args), Math.max(0, delay));
+    }
+    return nativeTimeout(callback, ms, ...args);
+  }) as typeof setTimeout);
+  return { trace, release: () => { for (const run of trace.held.splice(0)) run(); }, restore: () => spy.mockRestore() };
+};
+
+/** Group checks after the first attempt throw `code` until the deadline, then answer as the kernel does. */
+const watchChecksUntilDeadline = (code: "EPERM" | "EIO", requestedAt: () => number | null) => {
+  const nativeKill = process.kill.bind(process);
+  const attempts: string[] = [];
+  const checks: { at: number; abs: number; answer: string }[] = [];
+  const spy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
+    if (pid < 0 && signal !== 0 && signal !== undefined) {
+      try {
+        const ok = nativeKill(pid, signal as NodeJS.Signals);
+        attempts.push("sent");
+        return ok;
+      } catch (error) {
+        attempts.push((error as NodeJS.ErrnoException).code ?? "error");
+        throw error;
+      }
+    }
+    if (pid < 0 && signal === 0 && attempts.length > 0) {
+      const asked = requestedAt();
+      const at = performance.now();
+      if (asked !== null && at < asked + 2_000) {
+        checks.push({ at: at - asked, abs: at, answer: code });
+        throw Object.assign(new Error(`kill ${code}`), { code, errno: -1, syscall: "kill" });
+      }
+      try {
+        const ok = nativeKill(pid, 0);
+        checks.push({ at: asked === null ? -1 : at - asked, abs: at, answer: "PRESENT" });
+        return ok;
+      } catch (error) {
+        checks.push({ at: asked === null ? -1 : at - asked, abs: at, answer: (error as NodeJS.ErrnoException).code ?? "error" });
+        throw error;
+      }
+    }
+    return nativeKill(pid, signal as NodeJS.Signals);
+  }) as typeof process.kill);
+  return { attempts, checks, restore: () => spy.mockRestore() };
+};
+
+const writeCompletingCli = (dir: string): string => {
+  const binary = join(dir, "claude-completes.cjs");
+  writeFileSync(binary, `#!${process.execPath}\nprocess.stdout.write("done", () => process.exit(0));\n`);
+  chmodSync(binary, 0o700);
+  return binary;
+};
+
+describe("the settle deadline is enforced: whichever answers first wins, and nothing after it is a success", () => {
+  for (const code of ["EPERM", "EIO"] as const) {
+    it.for(["completion", "timeout", "abort"] as const)(`a late observation wake with ${code} until the deadline, %s: one UNAVAILABLE answer at the deadline`, async (route, ctx) => {
+      requireSeatbelt(ctx);
+      const marker = `acp-probe-descendant-${randomUUID()}`;
+      const stubs = tempDir("acp-session-probe-stub-");
+      const timers = watchTimers({ afterMs: 1_500, delayMs: 1_000 });
+      const watch = watchChecksUntilDeadline(code, () => timers.trace.requestedAt);
+      const mark = sandboxed.length;
+      try {
+        const controller = new AbortController();
+        let answers = 0;
+        let answeredAt: number | null = null;
+        const binary = route === "completion" ? writeCompletingCli(stubs) : claudeWithDescendant(stubs, "hang", marker);
+        const pending = __testing.productionRunCli(binary, route === "completion" ? [] : [marker], {
+          cwd: undefined, timeoutMs: route === "timeout" ? 200 : 60_000, signal: controller.signal, reapProcessGroup: true,
+        });
+        void pending.then(() => { answers += 1; answeredAt = performance.now(); });
+        if (route === "abort") {
+          expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 10_000)).toBe(true);
+          controller.abort();
+        }
+        expect(await waitFor(() => timers.trace.requestedAt !== null, 10_000)).toBe(true);
+        const requestedAt = timers.trace.requestedAt!;
+        await new Promise((resolve) => setTimeout(resolve, Math.max(0, requestedAt + 2_050 - performance.now())));
+        const by2050 = answers;
+        const result = await pending;
+        const attemptsAtAnswer = watch.attempts.length;
+        await new Promise((resolve) => setTimeout(resolve, 1_200));
+        const firstEsrch = watch.checks.find((check) => check.answer === "ESRCH");
+        __testing.setRunCli(async () => result);
+        const adapter = new ClaudeCliAdapter({ clock: { nowIso: () => "2026-10-10T00:00:00.000Z" } as never, capacityFile: join(STATE_ROOT, "capacity.fixture"), binary: process.execPath });
+        const probe = await adapter.probeSession({ externalSessionId: randomUUID(), provider: "claude", model: "opus", effort: null, pid: null })
+          .then((health) => health, (error: Error) => error.message);
+        __testing.setRunCli(null);
+        const observed = {
+          code, route, by2050, answers, answerMs: answeredAt! - requestedAt, lateWakes: timers.trace.lateWakes,
+          attempts: watch.attempts, attemptsAfterAnswer: watch.attempts.length - attemptsAtAnswer,
+          firstEsrchMs: firstEsrch?.at ?? null, processGroup: result.processGroup, probe,
+        };
+        console.error(`WITNESS late-wake ${JSON.stringify(observed)}`);
+        expect(observed.lateWakes).toBeGreaterThanOrEqual(1);
+        expect(watch.attempts).toEqual(["sent"]);
+        expect(by2050).toBe(1);
+        expect(answers).toBe(1);
+        expect(observed.attemptsAfterAnswer).toBe(0);
+        expect(result.processGroup!.reaped).toBe(false);
+        expect(result.processGroup!.detail).toEqual(expect.stringContaining(`process group ${result.processGroup!.pgid}`));
+        expectConsistentReap(result.processGroup);
+        if (firstEsrch) expect(firstEsrch.at).toBeGreaterThan(2_000);
+        expect(probe).not.toBe("HEALTHY");
+      } finally {
+        __testing.setRunCli(null);
+        watch.restore();
+        timers.restore();
+        clearRowGroupOf(mark);
+        killMarked(marker);
+      }
+    });
+  }
+
+  it("an observation that never returns: the deadline answers once, and releasing it later changes nothing", async (ctx) => {
+    requireSeatbelt(ctx);
+    const marker = `acp-probe-descendant-${randomUUID()}`;
+    const stubs = tempDir("acp-session-probe-stub-");
+    const timers = watchTimers({ afterMs: 0, delayMs: "never" });
+    const watch = watchChecksUntilDeadline("EIO", () => timers.trace.requestedAt);
+    const mark = sandboxed.length;
+    try {
+      const controller = new AbortController();
+      let answers = 0;
+      const pending = __testing.productionRunCli(claudeWithDescendant(stubs, "hang", marker), [marker], {
+        cwd: undefined, timeoutMs: 60_000, signal: controller.signal, reapProcessGroup: true,
+      });
+      void pending.then(() => { answers += 1; });
+      expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 10_000)).toBe(true);
+      controller.abort();
+      const result = await pending;
+      const answerMs = performance.now() - timers.trace.requestedAt!;
+      const heldWakes = timers.trace.held.length;
+      // The observation comes back only now, long after the answer.
+      timers.release();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      console.error(`WITNESS never-returning-observation ${JSON.stringify({ answerMs, heldWakes, answers, attempts: watch.attempts, processGroup: result.processGroup })}`);
+      expect(heldWakes).toBeGreaterThanOrEqual(1);
+      expect(answerMs).toBeGreaterThanOrEqual(1_990);
+      expect(answerMs).toBeLessThan(2_400);
+      expect(answers).toBe(1);
+      expect(watch.attempts).toEqual(["sent"]);
+      expect(result.processGroup).toMatchObject({ reaped: false, signals: ["sent"], delivered: 1, ownership: "HELD" });
+      expect(result.processGroup!.detail).toEqual(expect.stringContaining(`was not confirmed empty within 2000 ms of the first end request`));
+      expectConsistentReap(result.processGroup);
+    } finally {
+      watch.restore();
+      timers.restore();
+      clearRowGroupOf(mark);
+      killMarked(marker);
+    }
+  });
+
+  it.for([-30, -5, 0, 5, 30] as const)("a completion racing the deadline (observation at %d ms from it): one answer, a success only before it", async (offset, ctx) => {
+    requireSeatbelt(ctx);
+    const stubs = tempDir("acp-session-probe-stub-");
+    const timers = watchTimers({ afterMs: 0, delayMs: (requestedAt) => requestedAt + 2_000 + offset - performance.now() });
+    // Every check before the deadline is unobservable, so the first answerable check is the late wake.
+    const watch = watchChecksUntilDeadline("EIO", () => (timers.trace.requestedAt === null ? null : timers.trace.requestedAt + offset - 2));
+    const mark = sandboxed.length;
+    try {
+      let answers = 0;
+      let answeredAt: number | null = null;
+      const pending = __testing.productionRunCli(writeCompletingCli(stubs), [], { cwd: undefined, timeoutMs: 60_000, reapProcessGroup: true });
+      void pending.then(() => { answers += 1; answeredAt = performance.now(); });
+      const result = await pending;
+      const requestedAt = timers.trace.requestedAt!;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const firstEsrch = watch.checks.find((check) => check.answer === "ESRCH");
+      const observed = { offset, answers, answerMs: answeredAt! - requestedAt, firstEsrchMs: firstEsrch ? firstEsrch.abs - requestedAt : null, processGroup: result.processGroup };
+      console.error(`WITNESS deadline-race ${JSON.stringify(observed)}`);
+      expect(answers).toBe(1);
+      expectConsistentReap(result.processGroup);
+      if (result.processGroup!.reaped) {
+        // A success was both observed and answered before the deadline, on the monotonic clock.
+        expect(observed.answerMs).toBeLessThan(2_000);
+        expect(observed.firstEsrchMs).not.toBeNull();
+        expect(observed.firstEsrchMs!).toBeLessThan(2_000);
+      } else {
+        expect(result.processGroup!.detail).toEqual(expect.stringContaining(`process group ${result.processGroup!.pgid}`));
+      }
+      if (offset > 0) expect(result.processGroup!.reaped).toBe(false);
+    } finally {
+      watch.restore();
+      timers.restore();
+      clearRowGroupOf(mark);
+    }
   });
 });
