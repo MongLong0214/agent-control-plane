@@ -291,7 +291,8 @@ const openWorld = (options: {
       identities: [{ privateKeyFile: cto.keyFile, encoding: "hex", rooms: options.rooms ?? [ROOM] }],
     },
     registry: {
-      primaryCtoBindingFor: (pubkey) => (pubkey === cto.pubkey ? { roleKey: ROLE_KEY, buzzActorId: cto.pubkey } : null),
+      primaryCtoBindingFor: (pubkey) =>
+        pubkey === cto.pubkey ? { roleKey: ROLE_KEY, buzzActorId: cto.pubkey, room: (options.rooms ?? [ROOM])[0]! } : null,
     },
     sink: { admit: () => Promise.resolve("REFUSED" as const) },
     openSocket: relay.factory,
@@ -1214,7 +1215,7 @@ describe("the daemon's owner-reply wiring", () => {
     const subscriber = startBuzzMentionSubscriber({
       config: { relayUrl: RELAY, identities: [{ privateKeyFile: cto.keyFile, encoding: "hex", rooms: [ROOM] }] },
       registry: {
-        primaryCtoBindingFor: (pubkey) => (pubkey === cto.pubkey ? { roleKey: ROLE_KEY, buzzActorId: cto.pubkey } : null),
+        primaryCtoBindingFor: (pubkey) => (pubkey === cto.pubkey ? { roleKey: ROLE_KEY, buzzActorId: cto.pubkey, room: ROOM } : null),
       },
       sink: { admit: () => Promise.resolve("REFUSED" as const) },
       openSocket: relay.factory,
