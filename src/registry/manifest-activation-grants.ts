@@ -84,25 +84,26 @@ export interface ManifestActivationTarget {
 }
 
 /**
- * What the finalizer established about one workflow the manifest points to, before the activation
- * transaction and outside it (CEO ruling 6). `READ`: the file's exact bytes at `revision` of the exact
- * repository hash to `approvedDigest`. `REUSED`: the base manifest declares this exact entry, so the
- * exact-byte approval the base already carries stands, and nothing is read again.
+ * What the finalizer read of one workflow the manifest points to, before the activation transaction and
+ * outside it (CEO ruling 6): the file's exact bytes at `revision` of the exact repository hash to
+ * `approvedDigest`. Every workflow is read, an unchanged declaration included: an equal entry in the
+ * base says nothing about the bytes at the revision being activated.
  */
 export interface ActivatedWorkflowEvidence {
   repositoryRole: string;
-  repositoryIdentity: string | null;
+  repositoryIdentity: string;
   path: string;
   checkName: string;
-  approvedDigest: string | null;
-  evidence: "READ" | "REUSED";
-  revision: string | null;
-  observedDigest: string | null;
+  approvedDigest: string;
+  evidence: "READ";
+  revision: string;
+  observedDigest: string;
 }
 
 /**
- * Whether `supplied` compares exactly the workflows `expected` names, one each: a changed or new
- * workflow was read and matched, an unchanged one was reused, and nothing is missing or extra.
+ * Whether `supplied` compares exactly the workflows `expected` names, one each, each read at an exact
+ * revision of the exact repository and matching an approved digest; nothing missing or extra, and no
+ * workflow without an approved digest.
  */
 export const sameWorkflowCoverage = (
   expected: readonly ContractChangeWorkflowEvidence[],
@@ -115,14 +116,13 @@ export const sameWorkflowCoverage = (
       entry.repositoryRole === workflow.repositoryRole &&
       entry.path === workflow.path &&
       entry.checkName === workflow.checkName &&
+      workflow.approvedDigest !== null &&
+      !workflow.unapprovedFirstActivation &&
       entry.approvedDigest === workflow.approvedDigest &&
-      (workflow.unchangedFromBase
-        ? entry.evidence === "REUSED"
-        : entry.evidence === "READ" &&
-          workflow.approvedDigest !== null &&
-          entry.observedDigest === workflow.approvedDigest &&
-          entry.repositoryIdentity === workflow.repositoryRemote &&
-          typeof entry.revision === "string" && entry.revision.length > 0));
+      entry.evidence === "READ" &&
+      entry.observedDigest === workflow.approvedDigest &&
+      entry.repositoryIdentity === workflow.repositoryRemote &&
+      typeof entry.revision === "string" && entry.revision.length > 0);
     if (index < 0) return false;
     remaining.splice(index, 1);
   }

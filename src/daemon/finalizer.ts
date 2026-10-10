@@ -562,10 +562,10 @@ export class ApprovedRunFinalizer {
    * CEO ruling 6 — before activation, every workflow the manifest points to is compared at the exact
    * repository its role names and the revision this finalization verified: the merge commit, for a
    * repository this run merged (its candidate head, when asked before the merge); otherwise the commit
-   * the manifest's default branch names now. An entry
-   * the base declares byte for byte reuses the base's exact-byte approval. One that cannot be read or
-   * does not hash to its approved digest refuses activation: a contract that cannot be verified is
-   * never activated.
+   * the manifest's default branch names now. Every entry is read, one the base declares byte for byte
+   * included: an equal declaration is not evidence of the bytes at this revision. One with no approved
+   * digest, one that cannot be read, or one that does not hash to its approved digest refuses
+   * activation: a contract that cannot be verified is never activated.
    */
   private async compareActivationWorkflows(
     runId: string,
@@ -585,13 +585,10 @@ export class ApprovedRunFinalizer {
         checkName: workflow.checkName,
         approvedDigest: workflow.approvedDigest,
       };
-      if (workflow.unchangedFromBase) {
-        compared.push({ ...entry, evidence: "REUSED", revision: null, observedDigest: null });
-        continue;
-      }
       const unverified = (message: string, detail: Record<string, unknown> = {}): Decision<ActivatedWorkflowEvidence[]> =>
         deny(ReasonCode.MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED, message, { runId, workflow: entry, ...detail });
-      if (workflow.approvedDigest === null || workflow.unapprovedFirstActivation) {
+      const approvedDigest = workflow.approvedDigest;
+      if (approvedDigest === null || workflow.unapprovedFirstActivation) {
         return unverified("the workflow names no approved digest to compare against");
       }
       const repository = repositories.find((candidate) => candidate.repositoryRole === workflow.repositoryRole);
@@ -616,13 +613,20 @@ export class ApprovedRunFinalizer {
           cause: { reasonCode: read.reasonCode, message: read.message, evidence: read.evidence },
         });
       }
-      if (read.value.workflowDigest !== workflow.approvedDigest) {
+      if (read.value.workflowDigest !== approvedDigest) {
         return unverified("the workflow's bytes at the exact revision are not the ones the manifest approves", {
           revision: read.value.revision,
           observedDigest: read.value.workflowDigest,
         });
       }
-      compared.push({ ...entry, evidence: "READ", revision: read.value.revision, observedDigest: read.value.workflowDigest });
+      compared.push({
+        ...entry,
+        repositoryIdentity: repository.identity,
+        approvedDigest,
+        evidence: "READ",
+        revision: read.value.revision,
+        observedDigest: read.value.workflowDigest,
+      });
     }
     return allow(ReasonCode.OK, compared);
   }
