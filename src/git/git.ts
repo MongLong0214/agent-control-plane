@@ -92,6 +92,53 @@ const authorizeGitMutation = async (
 const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 
 /**
+ * One time bound shared by several git invocations that answer one question together (#1082
+ * R3-01). `endsAt` is on the monotonic `performance.now()` clock, so a wall-clock step cannot
+ * lengthen or shorten it, and it is carried as an absolute instant to every check. The bound is a
+ * logical budget: each invocation is given what remains of it at its launch instant, none is
+ * started once it is spent, and an answer that settles at or after `endsAt` is a timeout. How
+ * promptly the operating system delivers the kill and the answer is not part of what it promises.
+ */
+interface GitDeadline {
+  readonly boundMs: number;
+  readonly endsAt: number;
+}
+
+/** A positive bound, refused at 0 or below for the reason `git()` gives. */
+const positiveBound = (cwd: string, args: readonly string[], timeoutMs: number): number => {
+  if (timeoutMs <= 0) {
+    fail(ReasonCode.INVALID_ARGUMENT, "a git time bound must be a positive number of milliseconds", {
+      cwd,
+      args,
+      timeoutMs,
+    });
+  }
+  return timeoutMs;
+};
+
+const deadlineAfter = (cwd: string, timeoutMs: number | undefined): GitDeadline => {
+  const boundMs = positiveBound(cwd, [], timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS);
+  return { boundMs, endsAt: performance.now() + boundMs };
+};
+
+/**
+ * What remains of `deadline` at `at`, in whole milliseconds because that is what Node's `timeout`
+ * takes. Under one millisecond is spent: Node reads `timeout: 0` as no bound at all, so the next
+ * process is refused rather than started.
+ */
+const remainingAt = (deadline: GitDeadline, at: number, cwd: string, args: readonly string[]): number => {
+  const remaining = Math.floor(deadline.endsAt - at);
+  if (remaining < 1) {
+    fail(
+      ReasonCode.GIT_TIMEOUT,
+      `git ${args.join(" ")} was not started: the ${deadline.boundMs}ms bound it shares was already spent`,
+      { cwd, args, timeoutMs: deadline.boundMs, started: false },
+    );
+  }
+  return remaining;
+};
+
+/**
  * argv-only git invocation. There is no shell in the path, so no interpolation,
  * pipes or redirection can be smuggled through a branch name or path
  * (Integration §12: "기본 `sh -c`, Pipe, Redirect, Command Substitution 금지").
@@ -99,29 +146,46 @@ const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 export const git = async (
   cwd: string,
   args: readonly string[],
-  options: { allowFailure?: boolean; timeoutMs?: number; isolatedConfig?: boolean } = {},
+  options: { allowFailure?: boolean; timeoutMs?: number; isolatedConfig?: boolean; deadline?: GitDeadline } = {},
 ): Promise<GitResult> => {
   // `?? ` would pass a caller's `0` straight through, and Node reads `timeout: 0` as *no*
   // timeout — so the one value that removes the bound would still census as bounded, because
   // `verify-subprocess-calls-are-bounded.mjs` reads the property's presence and never its value.
   // No caller passes 0 today; this refuses the affordance rather than waiting for one to.
   const requested = options.timeoutMs;
-  if (requested !== undefined && requested <= 0) {
-    fail(ReasonCode.INVALID_ARGUMENT, "a git time bound must be a positive number of milliseconds", {
-      cwd,
-      args,
-      timeoutMs: requested,
-    });
-  }
-  const timeout = requested ?? DEFAULT_GIT_TIMEOUT_MS;
+  if (requested !== undefined) positiveBound(cwd, args, requested);
+  const deadline = options.deadline;
+  // A shared deadline already spent starts nothing, before any other work is done for this call.
+  if (deadline) remainingAt(deadline, performance.now(), cwd, args);
+  // The launch instant, read with nothing awaited between it and the spawn. Under a shared deadline
+  // the process's own bound is recomputed from this one sample, not carried from the check above:
+  // a scheduling gap between the two would otherwise be budget the deadline never granted (#1082
+  // R3-01, round 4 -- measured, a status sampled at 500 of a 1000ms deadline, started at 750 and
+  // settled at 1001 read clean, its own elapsed 251 being under the 500 it was given).
+  const startedAt = performance.now();
+  const timeout = deadline ? remainingAt(deadline, startedAt, cwd, args) : requested ?? DEFAULT_GIT_TIMEOUT_MS;
+  // A settlement at or after the bound is not git answering (#1082 R3-01). Node's kill timer fires
+  // only once `timeout` has elapsed since the spawn, and it destroys the output pipes before it
+  // signals, so a child that outlives the signal -- one that ignores SIGTERM, or whose exit races
+  // the timer -- still settles, and Node reports whatever that settlement is. Measured with a git
+  // that ignored SIGTERM: one with nothing to write settled with its own exit code, 0 read as
+  // success and 1 handed back by `allowFailure` as git saying no; one still writing died of
+  // SIGPIPE on the destroyed pipe and read as an outside signal. `startedAt` is read before the
+  // spawn, so every settlement the timer could have touched reads as at least `timeout` here. A
+  // shared deadline is also compared absolutely, so whatever order the callbacks run in, nothing
+  // settling at or after `endsAt` is counted.
+  const late = (): boolean => {
+    const now = performance.now();
+    return now - startedAt >= timeout || (deadline !== undefined && now >= deadline.endsAt);
+  };
+  let settled: { stdout: string; stderr: string };
   try {
-    const { stdout, stderr } = await exec("git", ["-C", cwd, ...args], {
+    settled = await exec("git", ["-C", cwd, ...args], {
       maxBuffer: MAX_BUFFER,
       encoding: "utf8",
       timeout,
       env: { ...sanitizedGitEnv(), ...(options.isolatedConfig ? ISOLATED_CONFIG_ENV : {}) },
     });
-    return { stdout, stderr, exitCode: 0 };
   } catch (err) {
     const e = err as {
       stdout?: string;
@@ -136,7 +200,15 @@ export const git = async (
     // "ETIMEDOUT" as the synchronous family reports. So `e.code ?? 1` would have called it exit 1,
     // which is indistinguishable from git refusing, and `allowFailure` callers would have read
     // "the answer is no" where the truth is "the check could not run" (#859).
-    const timedOut = e.killed === true && e.signal === "SIGTERM" && (e.code ?? null) === null;
+    // The deadline first, for every settlement shape (#1082 R3-01, round 5): a settlement at or after
+    // the bound -- an exit code, a signal, a spawn failure or a maxBuffer refusal -- is the bound, not
+    // git answering. Measured: a real maxBuffer refusal delivered after a shared deadline's `endsAt`
+    // read INTERNAL_ERROR while string codes were exempt here. One clock sample decides it.
+    const settledLate = late();
+    const killedByBound = e.killed === true && e.signal === "SIGTERM" && (e.code ?? null) === null;
+    // A child that outlived the signal and then exited is no answer either: its output pipes were
+    // destroyed when the bound fired. Inside the bound, a string `code` keeps its own shape below.
+    const timedOut = settledLate || killedByBound;
     // Measured on this repository's runtime (Node 22), the three shapes that are *not* git
     // answering:
     //
@@ -158,7 +230,9 @@ export const git = async (
     const signalled = (e.code ?? null) === null;
     const didNotRun = timedOut || typeof e.code === "string" || signalled;
     const detail = timedOut
-      ? `git ${args.join(" ")} exceeded its ${timeout}ms bound and was killed`
+      ? killedByBound
+        ? `git ${args.join(" ")} exceeded its ${timeout}ms bound and was killed`
+        : `git ${args.join(" ")} settled after its ${timeout}ms bound, so its answer is not counted`
       : typeof e.code === "string"
         ? `git ${args.join(" ")} did not run: ${e.code}`
         : signalled
@@ -183,6 +257,14 @@ export const git = async (
             : { exitCode: e.code as number }),
     });
   }
+  if (late()) {
+    return fail(
+      ReasonCode.GIT_TIMEOUT,
+      `git ${args.join(" ")} settled after its ${timeout}ms bound, so its answer is not counted`,
+      { cwd, args, timeoutMs: timeout },
+    );
+  }
+  return { stdout: settled.stdout, stderr: settled.stderr, exitCode: 0 };
 };
 
 /** git needs a predictable environment; the caller's locale/pager must not leak in. */
@@ -238,42 +320,132 @@ export const remoteUrl = async (cwd: string, remote = "origin"): Promise<string 
   return out.exitCode === 0 ? out.stdout.trim() : null;
 };
 
+/** `withoutRepositoryPrograms`, optionally spending a deadline the caller shares. */
+const programFreeOptions = async (cwd: string, bound: { deadline?: GitDeadline }): Promise<string[]> => {
+  const listed = await git(cwd, ["config", "--name-only", "--get-regexp", "^filter\\."], {
+    allowFailure: true,
+    ...bound,
+  });
+  const drivers = new Set(
+    listed.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((key) => key.startsWith("filter.") && key.lastIndexOf(".") > "filter.".length)
+      .map((key) => key.slice("filter.".length, key.lastIndexOf("."))),
+  );
+  return [
+    "--no-replace-objects",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=/dev/null",
+    ...[...drivers].flatMap((driver) => [
+      "-c", `filter.${driver}.smudge=`,
+      "-c", `filter.${driver}.clean=`,
+      "-c", `filter.${driver}.process=`,
+      "-c", `filter.${driver}.required=false`,
+    ]),
+  ];
+};
+
+/**
+ * Options that keep one git invocation from running the programs listed below, and from reading
+ * replaced objects (#1082 R1-01). Every git read that prepares or judges a candidate for
+ * verification takes them. The claim is exactly this list, each item measured against a real
+ * program; it is not a claim that no other git setting can select a program.
+ *
+ * - `--no-replace-objects`: the objects the candidate commit actually names. A replace ref changes
+ *   what a local read returns and nothing else.
+ * - Every filter driver the configuration declares (the repository's, and the operator's global
+ *   one, which is where git-lfs installs itself), emptied: `smudge`, `clean` and `process`, and
+ *   `required=false` so a declared-required driver does not fail the command instead. A candidate's
+ *   `.gitattributes` selects a driver by name, and `git status` runs its clean or process program
+ *   as the control-plane user, outside any sandbox -- measured, a clean filter that kept the source
+ *   looking clean started a writer that rewrote the gate after it had been checked. An emptied
+ *   driver is no driver, so git compares and writes raw bytes. The cost: in a repository that
+ *   uses LFS, a file whose stat information is stale is compared raw against its pointer and
+ *   reads as modified.
+ * - `core.fsmonitor=false`: the fsmonitor hook is a program the configuration names.
+ * - `core.hooksPath=/dev/null`: `git status` writes the index and so runs `post-index-change`.
+ *
+ * These reach the repository git is run in and nothing nested in it. Status reads therefore also
+ * pass `--ignore-submodules=dirty`: otherwise git runs `git status` inside every populated
+ * submodule with that repository's own configuration, and that repository's fsmonitor and hooks
+ * run -- measured. Patch reads pass `PATCH_WITHOUT_PROGRAMS` for the same reason.
+ */
+export const withoutRepositoryPrograms = async (cwd: string): Promise<string[]> => programFreeOptions(cwd, {});
+
+/**
+ * Whether the checkout has no tracked change and no untracked, non-ignored file. Read under
+ * `withoutRepositoryPrograms`, so neither a candidate-selected filter nor a submodule's own
+ * configuration runs anything while it is asked: snapshot freshness asks it of a candidate's source.
+ * Dirt inside a populated submodule's own working tree is therefore not counted; a submodule whose
+ * checked-out commit differs from the recorded one still is.
+ *
+ * The answer takes two git processes, configuration discovery and then status, and `timeoutMs`
+ * bounds the pair, not each one (#1082 R3-01). The doctor hands this the remainder of its sweep
+ * budget; when discovery ran under git's own 120s default instead, a 20ms request with discovery
+ * delayed by 350ms answered after about 730ms. One deadline is taken before discovery, each process gets what is left of it,
+ * status is not started once it is spent, and a process that settles after it is a timeout. With
+ * no `timeoutMs`, the pair shares `git()`'s default bound.
+ */
 export const isClean = async (
   cwd: string,
   options: { timeoutMs?: number } = {},
-): Promise<boolean> =>
-  (await git(cwd, ["status", "--porcelain"], {
-    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-  })).stdout.trim().length === 0;
+): Promise<boolean> => {
+  const deadline = deadlineAfter(cwd, options.timeoutMs);
+  const programs = await programFreeOptions(cwd, { deadline });
+  const status = await git(cwd, [...programs, "status", "--porcelain", "--ignore-submodules=dirty"], { deadline });
+  return status.stdout.trim().length === 0;
+};
 
 export const mergeBase = async (cwd: string, a: string, b: string): Promise<string | null> => {
   const out = await git(cwd, ["merge-base", a, b], { allowFailure: true });
   return out.exitCode === 0 ? out.stdout.trim() : null;
 };
 
-/** Stable digest of the exact patch between two commits. */
-export const diffDigest = async (cwd: string, base: string, head: string): Promise<string> => {
-  const out = await git(cwd, [
-    "diff",
-    "--no-color",
-    "--no-ext-diff",
-    "--full-index",
-    "--binary",
-    `${base}..${head}`,
-  ]);
-  return sha256(out.stdout);
-};
+/**
+ * Options every diff of a candidate takes (#1082 R1-01), so the patch is the stored bytes and no
+ * program renders it.
+ *
+ * - `--no-ext-diff`: `diff.external`, or a `diff=<driver>` attribute's `command`, would run.
+ * - `--no-textconv`: a `diff=<driver>` attribute the candidate commits selects the textconv program
+ *   the repository's configuration names.
+ * - `--submodule=short`: a changed gitlink is one `Subproject commit` line. A repository's
+ *   `diff.submodule=diff` otherwise makes git diff the populated nested repository's two commits
+ *   in a child git that reads the nested repository's own configuration, and neither option above
+ *   reaches that child. Measured: the nested repository's textconv and `diff.external` programs
+ *   both ran through `diffDigest`, and neither runs with this option. `short` is git's default,
+ *   so a repository without that setting digests the same bytes as before.
+ */
+const PATCH_WITHOUT_PROGRAMS = ["--no-ext-diff", "--no-textconv", "--submodule=short"] as const;
 
-export const diffText = async (cwd: string, base: string, head: string): Promise<string> =>
-  (await git(cwd, ["diff", "--no-color", "--no-ext-diff", "--full-index", `${base}..${head}`]))
+/**
+ * The exact patch between two commits: the bytes the freeze digests and the blind reviewer reads,
+ * so what is reviewed is what was frozen.
+ */
+export const diffPatch = async (cwd: string, base: string, head: string): Promise<string> =>
+  (await git(cwd, ["diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", "--binary", `${base}..${head}`]))
     .stdout;
 
+/** Stable digest of the exact patch between two commits. */
+export const diffDigest = async (cwd: string, base: string, head: string): Promise<string> =>
+  sha256(await diffPatch(cwd, base, head));
+
+export const diffText = async (cwd: string, base: string, head: string): Promise<string> =>
+  (await git(cwd, ["diff", "--no-color", ...PATCH_WITHOUT_PROGRAMS, "--full-index", `${base}..${head}`]))
+    .stdout;
+
+/**
+ * The paths a candidate changes. `--name-only` renders no patch, so the options that keep a patch
+ * read from running programs have nothing to act on here -- measured, a nested repository's
+ * `diff.external` and textconv did not run through this read without them. They are passed anyway
+ * so the read does not depend on that.
+ */
 export const changedPaths = async (
   cwd: string,
   base: string,
   head: string,
 ): Promise<string[]> => {
-  const out = await git(cwd, ["diff", "--name-only", `${base}..${head}`]);
+  const out = await git(cwd, ["diff", "--name-only", ...PATCH_WITHOUT_PROGRAMS, `${base}..${head}`]);
   return out.stdout.split("\n").map((l) => l.trim()).filter(Boolean).sort();
 };
 
@@ -298,14 +470,15 @@ export const addWorktree = async (
   path: string,
   ref: string,
   authorization?: GuardedGitEffect,
-  options: { timeoutMs?: number } = {},
+  /** `gitOptions` go before the subcommand: `--no-replace-objects` and `-c` overrides. */
+  options: { timeoutMs?: number; gitOptions?: readonly string[] } = {},
 ): Promise<Decision<void>> => {
   return authorizeGitMutation(
     authorization,
     path,
     WorktreeAction.ADD,
     cwd,
-    () => git(cwd, ["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", path, ref], {
+    () => git(cwd, [...(options.gitOptions ?? []), "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", path, ref], {
       ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     }),
   );
