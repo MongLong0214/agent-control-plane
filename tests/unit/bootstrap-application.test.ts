@@ -16,7 +16,6 @@ import {
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
-import { readWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
 import { processGroupEmpty, readProcessGroup } from "../../src/bootstrap/attempt-writer-group.ts";
@@ -44,7 +43,10 @@ import { BOOTSTRAP_IDENTITY, bootstrapCoverageKeys, bootstrapPlan, cleanTreeMani
 import { callMcpToolOverSocket, claimLaunchedCredential } from "../helpers/mcp-socket.ts";
 
 afterAll(cleanupTempDirs);
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  fsFaults.openSync = null;
+});
 
 /**
  * Review 1076-R1-05 — every rename this process attempts, recorded as it is attempted. A final-state
@@ -52,8 +54,14 @@ afterEach(() => vi.restoreAllMocks());
  * than mocks, so restoring mocks between tests leaves them in place.
  */
 const renames = vi.hoisted(() => ({ attempted: [] as Array<{ from: string; to: string }> }));
+/** Review 1076-R3 — a fault a test injects into a file open, by path; none unless a test sets one. */
+const fsFaults = vi.hoisted(() => ({ openSync: null as ((path: string) => void) | null }));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof FsModule>();
+  const openSync = ((path: Parameters<typeof actual.openSync>[0], ...rest: unknown[]) => {
+    fsFaults.openSync?.(String(path));
+    return (actual.openSync as (...args: unknown[]) => number)(path, ...rest);
+  }) as typeof actual.openSync;
   const note = (from: unknown, to: unknown): void => {
     renames.attempted.push({ from: String(from), to: String(to) });
   };
@@ -72,7 +80,7 @@ vi.mock("node:fs", async (importOriginal) => {
       await actual.promises.rename(from, to);
     },
   };
-  const wrapped = { ...actual, renameSync, rename, promises };
+  const wrapped = { ...actual, openSync, renameSync, rename, promises };
   return { ...wrapped, default: wrapped };
 });
 
@@ -2003,6 +2011,25 @@ const resultReceiptsOf = (f: Fixture, run: ReviewedRun): Array<Record<string, un
     .content.externalWriteReceipts;
 
 /** The active CEO replaced by another session, as an operator's switch does. */
+/**
+ * Review 1076-R3 — the withheld-request records (or, with `kind`, the consumptions of their exemption)
+ * the runner wrote for one operation, read straight from the run's work directory, in generation order.
+ */
+const withheldRecordsOf = (
+  f: Fixture,
+  run: ReviewedRun,
+  operationId: string,
+  kind: "withheld-request" | "withheld-consumption" = "withheld-request",
+): Array<Record<string, unknown>> => {
+  const root = join(f.workRoot, run.runId, "withheld-requests");
+  if (!existsSync(root)) return [];
+  return (readdirSync(root, { recursive: true }) as string[])
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => JSON.parse(readFileSync(join(root, name), "utf8")) as Record<string, unknown>)
+    .filter((record) => String(record["schema"]).startsWith(`acp.bootstrap.${kind}.`) && record["operationId"] === operationId)
+    .sort((a, b) => Number(a["attempt"]) - Number(b["attempt"]));
+};
+
 const replaceCeo = (f: Fixture): string => {
   const replacement = f.harness.cp.sessions.create({ provider: "scripted", model: "replacement-ceo" });
   f.harness.cp.sessions.transition(replacement.sessionId, SessionLifecycle.READY, "replacement");
@@ -2626,10 +2653,9 @@ describe("#246 C3 review 1076-R2: authority is asked when a write request starts
         // The create's intent is in the ledger and was never sent: recorded as withheld.
         const [intent] = ledgerOf(f, run).pending;
         expect(intent).toMatchObject({ resourceType: "repository", respondedNodeId: null });
-        expect(readWithheldRequest(join(f.workRoot, run.runId), intent!["operationId"] as string, intent!["attemptedAt"] as string)).toMatchObject({
-          attempt: 1,
-          refusal: "CEO_ADMISSION_LOST",
-        });
+        expect(withheldRecordsOf(f, run, intent!["operationId"] as string)).toEqual([
+          expect.objectContaining({ attempt: 1, refusal: "CEO_ADMISSION_LOST", intentDigest: digestOf(intent) }),
+        ]);
 
         // The current CEO confirms: the withheld create is made, once.
         await f.harness.cp.continuity.evaluate("the replacement CEO confirms");
@@ -2642,6 +2668,10 @@ describe("#246 C3 review 1076-R2: authority is asked when a write request starts
         expect(port.posts).toHaveLength(1);
         expect(writesOf(f)).toEqual(WRITE_METHODS);
         expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+        // Review 1076-R3 — attempt 2 consumed the exemption, durably, before its POST could start.
+        expect(withheldRecordsOf(f, run, intent!["operationId"] as string, "withheld-consumption")).toEqual([
+          expect.objectContaining({ attempt: 2, intentDigest: digestOf(intent) }),
+        ]);
       });
     });
   }
@@ -2800,5 +2830,297 @@ describe("#246 C3 review 1076-R3: a live writer is attributed by the group it le
     expect(answer.withOrphan.others).toEqual([expect.objectContaining({ pid: answer.orphan })]);
     expect(answer.withOrphan.others[0]!.ppid).not.toBe(answer.leader);
     expect(answer.afterOrphan).toEqual({ others: [], includesThisProcess: true });
+  });
+});
+
+/**
+ * Review 1076-R3, R1-04 — the proof that a withheld request was never sent is bound to that exact
+ * intent and the generation that withheld it, and used once: the attempt that relies on it records,
+ * durably and before its request can start, that its generation consumed it. A request that then
+ * started and was never answered is in doubt for every later attempt and is not sent again; one whose
+ * consumption could not be recorded is not sent at all. The protection and the default-branch setting
+ * reuse the pending intent an earlier attempt began, so both are witnessed. Each request goes through
+ * the guarded production port; one that starts is counted as sent and its effect held back.
+ */
+describe("#246 C3 review 1076-R3: a withheld request is made at most once, its exemption consumed before it is sent", () => {
+  /**
+   * The production port's `method` over a client whose mutating request starts and, unless `answer`
+   * says otherwise, never answers: its effect is retained until released. `beforeCall` runs when the
+   * runner calls the port method, before the production port reads or writes anything.
+   */
+  const heldRequests = (
+    f: Fixture,
+    method: "protectBranch" | "setDefaultBranch" | "pushBranch",
+    beforeCall: (call: number) => void = () => {},
+    answer: (call: number) => boolean = () => false,
+  ) => {
+    const actual = (f.github[method] as (...args: unknown[]) => Promise<void>).bind(f.github);
+    const state = { calls: 0, sent: 0, effects: 0, retained: [] as Array<() => Promise<void>>, refused: [] as string[] };
+    let currentEffect: () => Promise<void> = async () => {};
+    const send = async (): Promise<void> => {
+      state.sent += 1;
+      const effect = currentEffect;
+      if (answer(state.calls)) {
+        state.effects += 1;
+        await effect();
+        return;
+      }
+      state.retained.push(async () => {
+        state.effects += 1;
+        await effect();
+      });
+      throw new Error("request started and response was lost before its retained effect landed");
+    };
+    const port = createBootstrapGitHubWritePort(
+      {
+        async request<T>(verb: string): Promise<T> {
+          expect(verb).toBe(method === "protectBranch" ? "PUT" : "PATCH");
+          await send();
+          return {} as T;
+        },
+      },
+      async (_cwd, args) => {
+        expect(args).toContain("push");
+        await send();
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    );
+    vi.spyOn(f.github, method).mockImplementation((async (...args: unknown[]) => {
+      state.calls += 1;
+      beforeCall(state.calls);
+      currentEffect = () => actual(...args);
+      return (port[method] as (...args: unknown[]) => Promise<void>)(...args);
+    }) as never);
+    return {
+      state,
+      /** Lets every retained request land, in order; one the server then refuses, as a second push, is noted. */
+      release: async () => {
+        for (const effect of state.retained.splice(0)) {
+          try {
+            await effect();
+          } catch (error) {
+            state.refused.push(error instanceof Error ? error.message.slice(0, 200) : String(error));
+          }
+        }
+      },
+    };
+  };
+
+  /**
+   * The run's CONFIRM again, under the CEO now bound, after the clock has moved on by `advance`, from a
+   * restarted daemon: the earlier attempt's writer is another process, proven gone with its group.
+   */
+  const resumeUnder = async (f: Fixture, run: ReviewedRun, ceoSessionId: string, advance = 1000) => {
+    await f.restartDaemon();
+    await f.harness.cp.continuity.evaluate("the current CEO resumes the withheld write");
+    f.harness.clock.advance(advance);
+    return f.harness.cp.bootstrapProducer.produceAndActivateApproved({ runId: run.runId, candidateSnapshotDigest: run.candidate, ceoSessionId });
+  };
+
+  const pendingIntentOf = (f: Fixture, run: ReviewedRun, resourceType: string) => {
+    const intent = ledgerOf(f, run).pending.find((pending) => pending["resourceType"] === resourceType);
+    expect(intent, JSON.stringify(ledgerOf(f, run))).toBeDefined();
+    return intent!;
+  };
+
+  for (const sibling of [
+    { method: "protectBranch", resourceType: "branch-protection", name: "R3 a withheld protection intent cannot excuse a later started unanswered PUT" },
+    { method: "setDefaultBranch", resourceType: "setting", name: "R3 a withheld default-branch setting cannot excuse a later started unanswered PATCH" },
+  ] as const) {
+    it(sibling.name, async () => {
+      await withFixture(async (f) => {
+        const run = await reviewedBootstrap(f, cleanTreeManifest(`r3-withheld-started-${sibling.resourceType}`));
+        await approveWrites(f, run);
+        // The default branch stays unset until the setting lands, so GitHub never shows it settled meanwhile.
+        f.github.pushSetsDefault = false;
+        let replacement: string | null = null;
+        const held = heldRequests(f, sibling.method, (call) => {
+          if (call === 1) replacement = replaceCeo(f);
+        });
+        const withheld = await confirm(f, run);
+        expect(withheld, JSON.stringify(withheld)).toMatchObject({ ok: false, evidence: { refusal: "CEO_ADMISSION_LOST" } });
+        const intent1 = pendingIntentOf(f, run, sibling.resourceType);
+        const record1 = withheldRecordsOf(f, run, intent1["operationId"] as string)[0];
+        expect(held.state.sent).toBe(0);
+        expect(record1).toMatchObject({ attempt: 1, refusal: "CEO_ADMISSION_LOST" });
+
+        const started = await resumeUnder(f, run, replacement!);
+        expect(started, JSON.stringify(started)).toMatchObject({ allowed: false });
+        expect(held.state.sent).toBe(1);
+
+        const replay = await resumeUnder(f, run, replacement!);
+        await held.release();
+        expect(held.state.sent, "A request that actually started must not inherit an old withheld exception").toBe(1);
+        expect(replay).toMatchObject({ allowed: false, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST" } });
+        expect(held.state.effects).toBe(1);
+        expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 2 });
+        // Attempt 2 consumed the exemption of exactly that intent before its request started, and withheld nothing.
+        expect(withheldRecordsOf(f, run, intent1["operationId"] as string, "withheld-consumption")).toEqual([
+          expect.objectContaining({ attempt: 2, intentDigest: digestOf(intent1) }),
+        ]);
+        expect(withheldRecordsOf(f, run, intent1["operationId"] as string).map((record) => record["attempt"])).toEqual([1]);
+      });
+    });
+  }
+
+  it("R3 a withheld push cannot excuse a later started unanswered push begun at the same time", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r3-withheld-started-push"));
+      await approveWrites(f, run);
+      let replacement: string | null = null;
+      const held = heldRequests(f, "pushBranch", (call) => {
+        if (call === 1) replacement = replaceCeo(f);
+      });
+      const withheld = await confirm(f, run);
+      expect(withheld, JSON.stringify(withheld)).toMatchObject({ ok: false, evidence: { refusal: "CEO_ADMISSION_LOST" } });
+      const intent1 = pendingIntentOf(f, run, "branch");
+      expect(held.state.sent).toBe(0);
+      expect(withheldRecordsOf(f, run, intent1["operationId"] as string)[0]).toMatchObject({ attempt: 1, refusal: "CEO_ADMISSION_LOST" });
+
+      // The push begins its intent again on every attempt; with the clock where it was, at the same
+      // time as the withheld one, so the operation and that time no longer tell the two apart.
+      const started = await resumeUnder(f, run, replacement!, 0);
+      expect(started, JSON.stringify(started)).toMatchObject({ allowed: false });
+      expect(held.state.sent).toBe(1);
+      expect(pendingIntentOf(f, run, "branch")["attemptedAt"]).toBe(intent1["attemptedAt"]);
+
+      const replay = await resumeUnder(f, run, replacement!, 0);
+      await held.release();
+      expect(held.state.sent, "A push that actually started must not inherit an old withheld exception").toBe(1);
+      expect(replay).toMatchObject({ allowed: false, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST" } });
+      expect(held.state.effects).toBe(1);
+    });
+  });
+
+  it("R3 a crash immediately before the exemption is consumed: nothing is sent, and the next attempt makes the request once", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r3-crash-before-consumption"));
+      await approveWrites(f, run);
+      let replacement: string | null = null;
+      const held = heldRequests(
+        f,
+        "protectBranch",
+        (call) => {
+          if (call === 1) replacement = replaceCeo(f);
+        },
+        () => true,
+      );
+      await confirm(f, run);
+      const intent = pendingIntentOf(f, run, "branch-protection");
+      expect(held.state.sent).toBe(0);
+
+      // Attempt 2's consumption cannot be recorded — its write fails where a crash would stop it.
+      fsFaults.openSync = (path) => {
+        if (/withheld-requests\/[0-9a-f]{64}\/consumed-2\.json$/.test(path)) {
+          throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+        }
+      };
+      const unconsumed = await resumeUnder(f, run, replacement!);
+      fsFaults.openSync = null;
+      expect(unconsumed, JSON.stringify(unconsumed)).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_EXEMPTION_UNCONSUMED", attempt: 2 } });
+      expect(held.state.calls).toBe(1);
+      expect(held.state.sent).toBe(0);
+      expect(withheldRecordsOf(f, run, intent["operationId"] as string, "withheld-consumption")).toEqual([]);
+
+      // Nothing was sent and nothing consumed the exemption: attempt 3 makes the request, once.
+      const made = await resumeUnder(f, run, replacement!);
+      expect(made, JSON.stringify(made)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(held.state.sent).toBe(1);
+      expect(held.state.effects).toBe(1);
+      expect(writesOf(f)).toEqual(WRITE_METHODS);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 3 });
+    });
+  });
+
+  it("R3 a crash immediately after the exemption is consumed: the request is in doubt and never sent", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r3-crash-after-consumption"));
+      await approveWrites(f, run);
+      let replacement: string | null = null;
+      const held = heldRequests(f, "protectBranch", (call) => {
+        if (call === 1) replacement = replaceCeo(f);
+        // Attempt 2 stops right after its consumption, before the port sends anything — as a daemon killed there.
+        if (call === 2) throw new Error("the daemon died right after consuming the exemption");
+      });
+      await confirm(f, run);
+      const intent = pendingIntentOf(f, run, "branch-protection");
+      const crashed = await resumeUnder(f, run, replacement!);
+      expect(crashed, JSON.stringify(crashed)).toMatchObject({ allowed: false });
+      expect(held.state.calls).toBe(2);
+
+      const replay = await resumeUnder(f, run, replacement!);
+      await held.release();
+      expect(replay).toMatchObject({ allowed: false, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST" } });
+      expect(held.state.calls).toBe(2);
+      expect(held.state.sent).toBe(0);
+      expect(held.state.effects).toBe(0);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 2 });
+      // What attempt 2 left: its consumption of that exact intent, and no withheld record of its own.
+      expect(withheldRecordsOf(f, run, intent["operationId"] as string, "withheld-consumption")).toEqual([
+        expect.objectContaining({ attempt: 2, intentDigest: digestOf(intent) }),
+      ]);
+      expect(withheldRecordsOf(f, run, intent["operationId"] as string).map((record) => record["attempt"])).toEqual([1]);
+    });
+  });
+
+  it("R3 an exemption consumed and then withheld again in the same generation still proves the request unsent: it is made once", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r3-consumed-then-withheld"));
+      await approveWrites(f, run);
+      let replacement: string | null = null;
+      const held = heldRequests(
+        f,
+        "protectBranch",
+        (call) => {
+          // Attempts 1 and 2 each lose their CEO inside the port: attempt 2 after it consumed the exemption.
+          if (call <= 2) replacement = replaceCeo(f);
+        },
+        () => true,
+      );
+      await confirm(f, run);
+      const intent = pendingIntentOf(f, run, "branch-protection");
+      const again = await resumeUnder(f, run, replacement!);
+      expect(again, JSON.stringify(again)).toMatchObject({ allowed: false, evidence: { refusal: "CEO_ADMISSION_LOST" } });
+      expect(held.state.sent).toBe(0);
+      expect(withheldRecordsOf(f, run, intent["operationId"] as string).map((record) => record["attempt"])).toEqual([1, 2]);
+      expect(withheldRecordsOf(f, run, intent["operationId"] as string, "withheld-consumption").map((record) => record["attempt"])).toEqual([2]);
+
+      const made = await resumeUnder(f, run, replacement!);
+      expect(made, JSON.stringify(made)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+      expect(held.state.sent).toBe(1);
+      expect(held.state.effects).toBe(1);
+      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 3 });
+    });
+  });
+
+  it("R3 a create started before CEO replacement is pending without a withheld record and never retried", async () => {
+    await withFixture(async (f) => {
+      const run = await reviewedBootstrap(f, cleanTreeManifest("r3-started-create"));
+      await approveWrites(f, run);
+      let sent = 0;
+      let replacement: string | null = null;
+      const port = createBootstrapGitHubWritePort({
+        async request<T>(method: string): Promise<T> {
+          if (method === "GET") return { type: "Organization" } as T;
+          sent += 1;
+          replacement = replaceCeo(f);
+          throw new Error("POST started, response not known");
+        },
+      });
+      vi.spyOn(f.github, "createRepository").mockImplementation(port.createRepository as never);
+      await confirm(f, run);
+      const intent = ledgerOf(f, run).pending[0]!;
+      expect(withheldRecordsOf(f, run, intent["operationId"] as string)).toEqual([]);
+      expect(sent).toBe(1);
+      await f.restartDaemon();
+      await f.harness.cp.continuity.evaluate("new CEO retry");
+      const second = await f.harness.cp.bootstrapProducer.produceAndActivateApproved({
+        runId: run.runId,
+        candidateSnapshotDigest: run.candidate,
+        ceoSessionId: replacement!,
+      });
+      expect(sent).toBe(1);
+      expect(second).toMatchObject({ allowed: false, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST" } });
+    });
   });
 });
