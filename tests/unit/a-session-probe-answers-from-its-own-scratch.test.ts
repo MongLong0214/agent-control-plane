@@ -504,10 +504,8 @@ const expectConsistentReap = (reap: ProcessGroupReap | undefined): void => {
   } else {
     expect(reap!.detail).toEqual(expect.stringContaining(`process group ${reap!.pgid}`));
   }
-  if (reap!.ownership !== "HELD") {
-    expect(reap!.reaped).toBe(false);
-    expect(reap!.signals).toEqual([]);
-  }
+  if (reap!.ownership !== "HELD") expect(reap!.reaped).toBe(false);
+  if (reap!.ownership === "HOLDER_LOST") expect(reap!.signals).toEqual([]);
 };
 
 /** Kills only processes carrying this test's own marker: a RED run must not leave its leak behind. */
@@ -857,13 +855,14 @@ describe("a probe ends its own process group on every completion, and only its o
 /* ------------------------------------------------------------------------------------------------ */
 
 /** Records every group signal ACP's code sends, and lets a row make the first one fail as EPERM. */
-const watchGroupSignals = (options: { failFirstWithEperm?: boolean } = {}) => {
+const watchGroupSignals = (options: { failFirstWithEperm?: boolean; afterFirstAttempt?: () => void } = {}) => {
   const nativeKill = process.kill.bind(process);
   const attempts: { pid: number; signal: string | number }[] = [];
   let failed = false;
   const spy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
     if (pid < 0 && signal !== 0 && signal !== undefined) {
       attempts.push({ pid, signal });
+      if (attempts.length === 1) options.afterFirstAttempt?.();
       if (options.failFirstWithEperm && !failed) {
         failed = true;
         throw Object.assign(new Error("kill EPERM"), { code: "EPERM", errno: -1, syscall: "kill" });
@@ -997,6 +996,73 @@ describe("ownership needs the holder's start token; a failed attempt is never a 
       killMarked(marker);
     }
   });
+
+  it.for(["completion", "timeout", "abort", "recorder-failure"] as const)(
+    "%s with the token lost between attempts: answers at once as UNAVAILABLE, keeping the failed attempt",
+    async (route, ctx) => {
+      requireSeatbelt(ctx);
+      const marker = `acp-probe-descendant-${randomUUID()}`;
+      const stubs = tempDir("acp-session-probe-stub-");
+      tokenRead.mode = "native";
+      tokenRead.spawned = false;
+      // A live holder and group; the first attempt fails, and the token stops reading after it.
+      const watch = watchGroupSignals({ failFirstWithEperm: true, afterFirstAttempt: () => { tokenRead.mode = "null"; } });
+      const mark = sandboxed.length;
+      try {
+        const controller = new AbortController();
+        const started = Date.now();
+        const pending = __testing.productionRunCli(claudeWithDescendant(stubs, route === "completion" ? "refuse" : "hang", marker), [marker], {
+          cwd: undefined,
+          timeoutMs: route === "timeout" ? 200 : 60_000,
+          signal: controller.signal,
+          reapProcessGroup: true,
+          ...(route === "recorder-failure" ? { onSpawn: () => { throw new Error("the spawn recorder refused"); } } : {}),
+        });
+        let requestedAt = started + (route === "timeout" ? 200 : 0);
+        if (route === "abort") {
+          expect(await waitFor(() => sandboxed.length > mark && descendantPids(sandboxed[mark]!).length === 1, 10_000)).toBe(true);
+          requestedAt = Date.now();
+          controller.abort();
+        }
+        const outcome = await Promise.race([
+          pending,
+          new Promise<"PENDING">((resolve) => setTimeout(() => resolve("PENDING"), (route === "completion" ? 5_000 : 2_000) + (requestedAt - started))),
+        ]);
+        const settledAt = Date.now();
+        const holder = sandboxed[mark]?.pid;
+        const observed = {
+          route,
+          outcome: outcome === "PENDING" ? "PENDING" : outcome.processGroup,
+          attempts: watch.attempts,
+          settleMs: settledAt - requestedAt,
+          holderAliveAtSettle: holder !== undefined && alive(holder),
+        };
+        console.error(`WITNESS token-between-attempts ${JSON.stringify(observed)}`);
+        expect(outcome).not.toBe("PENDING");
+        if (outcome === "PENDING") return;
+        if (route !== "completion") expect(observed.settleMs).toBeLessThan(1_000);
+        expect(outcome.processGroup).toEqual({
+          pgid: holder, reaped: false, signalled: true, signals: ["EPERM"], delivered: 0, ownership: "UNVERIFIABLE",
+          detail: expect.stringContaining(`process group ${holder} got 1 attempt(s), 0 delivered (EPERM), and no further signal`),
+        });
+        expectConsistentReap(outcome.processGroup);
+        expect(watch.attempts).toHaveLength(1);
+        // It did not wait on the holder: still live when the probe answered.
+        expect(observed.holderAliveAtSettle).toBe(true);
+      } finally {
+        watch.restore();
+        tokenRead.mode = "native";
+        const own = sandboxed[mark];
+        if (own?.pid !== undefined) {
+          for (const line of liveMembersOf(own.pid)) {
+            const pid = Number(line.split(/\s+/)[0]);
+            if (pid > 0) process.kill(pid, "SIGKILL");
+          }
+        }
+        killMarked(marker);
+      }
+    },
+  );
 
   it.for(["exit0", "exit7", "sigterm"] as const)("%s: stdout, stderr and status are what running the CLI directly answers", async (mode, ctx) => {
     requireSeatbelt(ctx);

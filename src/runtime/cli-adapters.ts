@@ -383,9 +383,10 @@ const killChildTree = (child: ReturnType<typeof spawn>): void => {
  * #1077 — what ACP could establish about the probe's process group when it was asked to end it.
  *
  * - `HELD`: the holder, which leads the group, was ACP's own unreaped child and still carried the
- *   start token read at spawn; every signal was sent under that check (see `endHeldGroup`).
+ *   start token read at spawn before every signal sent (see `endHeldGroup`).
  * - `UNVERIFIABLE`: the holder had no recorded exit, but its start token was missing, unreadable or
- *   different. Nothing was signalled and the probe returned without waiting for the group.
+ *   different — before the first attempt (nothing sent) or between attempts while a member was still
+ *   live (the attempts made are kept, none follows). The probe returned without waiting for the group.
  * - `HOLDER_LOST`: the holder exited before ACP could end the group. Nothing was signalled.
  */
 export type ProcessGroupOwnership = "HELD" | "UNVERIFIABLE" | "HOLDER_LOST";
@@ -433,6 +434,8 @@ export class ProbeProcessGroupUnconfirmed extends Error {
 const PROBE_GROUP_REAP_BOUND_MS = 2_000;
 /** How long, inside the one turn that holds ownership, signals are repeated while a member lives. */
 const PROBE_GROUP_SIGNAL_SPIN_MS = 50;
+/** How long, after the last signal and without sending another, members are given to die. */
+const PROBE_GROUP_SETTLE_SPIN_MS = 100;
 /** How long a probe's pipes may stay open after its holder exited before they are closed. */
 const PROBE_STDIO_DRAIN_MS = 1_000;
 
@@ -521,24 +524,39 @@ const endHeldGroup = (
   pgid: number,
   holderStartedAt: string | null,
   signals: string[],
-): ProcessGroupOwnership => {
-  if (child.exitCode !== null || child.signalCode !== null) return "HOLDER_LOST";
+): { ownership: ProcessGroupOwnership; settleNow: boolean } => {
+  if (child.exitCode !== null || child.signalCode !== null) return { ownership: "HOLDER_LOST", settleNow: false };
   const owned = (): boolean =>
     child.exitCode === null &&
     child.signalCode === null &&
     holderStartedAt !== null &&
     readProcessStartToken(pgid) === holderStartedAt;
-  if (!owned()) return "UNVERIFIABLE";
+  if (!owned()) return { ownership: "UNVERIFIABLE", settleNow: true };
   const deadline = Date.now() + PROBE_GROUP_SIGNAL_SPIN_MS;
-  do {
+  let verifiedThroughout = true;
+  for (;;) {
     try {
       process.kill(-pgid, "SIGKILL");
       signals.push("sent");
     } catch (error) {
       signals.push((error as NodeJS.ErrnoException).code ?? "error");
     }
-  } while (groupHasLiveMember(pgid) && Date.now() < deadline && owned());
-  return "HELD";
+    if (!groupHasLiveMember(pgid) || Date.now() >= deadline) break;
+    if (!owned()) {
+      verifiedThroughout = false;
+      break;
+    }
+  }
+  // No further signal from here. A member hit by a delivered SIGKILL becomes a zombie within moments,
+  // and the holder's token stops reading once it has; give that a short, bounded, signal-free wait.
+  const settleBy = Date.now() + PROBE_GROUP_SETTLE_SPIN_MS;
+  while (groupHasLiveMember(pgid) && Date.now() < settleBy) {
+    /* observe only */
+  }
+  // Nothing live is left: the holder is at most an unreaped zombie, its exit is due, and the group is
+  // judged on the observation after it. Something live is left: the probe does not wait on it.
+  if (!groupHasLiveMember(pgid)) return { ownership: "HELD", settleNow: false };
+  return { ownership: verifiedThroughout ? "HELD" : "UNVERIFIABLE", settleNow: true };
 };
 
 /** Observes, after the holder has exited, whether the group has emptied. Sends no signal. */
@@ -787,18 +805,27 @@ const productionRunCli = async (
         if (pgid === undefined || endRequested) return;
         endRequested = true;
         setImmediate(() => {
-          ownership = endHeldGroup(child, pgid, holderStartedAt, signals);
-          if (ownership === "UNVERIFIABLE") {
-            settleHolding(Promise.resolve({
-              pgid,
-              reaped: false,
-              signalled: false,
-              signals: [],
-              delivered: 0,
-              ownership: "UNVERIFIABLE",
-              detail: `the probe's holder (pid ${pgid}) has no recorded exit but its start token was ${holderStartedAt === null ? "not read at spawn" : "unreadable or different"}; process group ${pgid} was not signalled and may still hold the probe's processes`,
-            }));
-          }
+          const ended = endHeldGroup(child, pgid, holderStartedAt, signals);
+          ownership = ended.ownership;
+          if (!ended.settleNow) return;
+          // Ownership could not be confirmed, or the group still had a live member once ACP stopped
+          // signalling: answer now, with every attempt kept, rather than wait on what is left.
+          const sent = delivered();
+          const attempts = signals.length === 0
+            ? "was not signalled"
+            : `got ${signals.length} attempt(s), ${sent} delivered (${signals.join(", ")}), and no further signal`;
+          const why = ended.ownership === "UNVERIFIABLE"
+            ? `the probe's holder (pid ${pgid}) has no recorded exit but its start token was ${holderStartedAt === null ? "not read at spawn" : "unreadable or different"}`
+            : `process group ${pgid} still had a live member after the attempts`;
+          settleHolding(Promise.resolve({
+            pgid,
+            reaped: false,
+            signalled: signals.length > 0,
+            signals: [...signals],
+            delivered: sent,
+            ownership: ended.ownership,
+            detail: `${why}; process group ${pgid} ${attempts} and may still hold the probe's processes`,
+          }));
         });
       };
       if (holding && pgid !== undefined) {
