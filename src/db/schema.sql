@@ -1452,6 +1452,139 @@ BEGIN
 END;
 
 -- ---------------------------------------------------------------------------
+-- manifest_activation_grants  (schema v44, issue #246 B2-b)
+--   Lifecycle: one row per CONTRACT_CHANGE run, inserted by the CEO's CONFIRM in the transaction that
+--   moves the run to CEO_APPROVED, and consumed once by the daemon finalizer in the transaction that
+--   moves the project's active manifest from the run's pin to the manifest its PLAN carries and
+--   completes the run.
+--   Authority lives in code: ManifestActivationGrants.issue at CONFIRM and its verify before the first
+--   GitHub write and at activation re-derive every fact a row names from the run, its candidate, its
+--   PLAN, its packet and the live CEO binding; a row alone authorises nothing. These guards are the
+--   structural ones only: one grant per run, its identity fixed, consumed once and only forward, never
+--   deleted; the project's pointer moves only with a consumed grant naming that move; and a
+--   CONTRACT_CHANGE run completes only with its own grant consumed for its current candidate.
+--   WITHOUT ROWID, so no REPLACE through a hidden rowid deletes a row.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS manifest_activation_grants (
+  grant_id                  TEXT NOT NULL PRIMARY KEY,
+  run_id                    TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+  project_id                TEXT NOT NULL REFERENCES projects(project_id),
+  run_kind                  TEXT NOT NULL CHECK (run_kind = 'CONTRACT_CHANGE'),
+  -- What the CEO confirmed, by digest: the manifest the PLAN carries, the base it replaces (the
+  -- run's pin), the PLAN, the candidate and its production-ready packet.
+  manifest_digest           TEXT NOT NULL CHECK (manifest_digest LIKE 'sha256:%'),
+  from_manifest_digest      TEXT NOT NULL CHECK (from_manifest_digest LIKE 'sha256:%'),
+  plan_digest               TEXT NOT NULL,
+  candidate_snapshot_digest TEXT NOT NULL,
+  packet_digest             TEXT NOT NULL,
+  -- The CEO binding that confirmed, as it stood at CONFIRM.
+  ceo_assignment_id         TEXT NOT NULL REFERENCES assignments(assignment_id),
+  ceo_actor_id              TEXT NOT NULL,
+  ceo_session_id            TEXT NOT NULL,
+  ceo_session_incarnation   TEXT NOT NULL,
+  ceo_binding_generation    INTEGER NOT NULL CHECK (ceo_binding_generation > 0),
+  issued_at                 TEXT NOT NULL,
+  grant_digest              TEXT NOT NULL UNIQUE,
+  -- Set once, by the finalization attempt that activated the manifest.
+  consumed_at               TEXT,
+  consumed_attempt_id       TEXT,
+  CHECK ((consumed_at IS NULL) = (consumed_attempt_id IS NULL)),
+  CHECK (manifest_digest <> from_manifest_digest)
+) WITHOUT ROWID;
+
+-- CP-HI-02 — #246 B2-b: a grant is born unconsumed; consumption is an update the guard below admits.
+CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_born_unconsumed
+BEFORE INSERT ON manifest_activation_grants
+WHEN NEW.consumed_at IS NOT NULL OR NEW.consumed_attempt_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_IMMUTABLE');
+END;
+
+-- CP-HI-01 — #246 B2-b: one grant per run, ever; a second is refused, not merged, and a REPLACE cannot
+-- take an existing grant's place.
+CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_no_replace
+BEFORE INSERT ON manifest_activation_grants
+WHEN EXISTS (
+  SELECT 1 FROM manifest_activation_grants
+   WHERE grant_id = NEW.grant_id OR run_id = NEW.run_id OR grant_digest = NEW.grant_digest
+)
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_NO_REPLACE');
+END;
+
+-- CP-HI-03 — #246 B2-b: what a grant names is fixed once written.
+CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_immutable
+BEFORE UPDATE ON manifest_activation_grants
+WHEN NEW.grant_id IS NOT OLD.grant_id
+  OR NEW.run_id IS NOT OLD.run_id
+  OR NEW.project_id IS NOT OLD.project_id
+  OR NEW.run_kind IS NOT OLD.run_kind
+  OR NEW.manifest_digest IS NOT OLD.manifest_digest
+  OR NEW.from_manifest_digest IS NOT OLD.from_manifest_digest
+  OR NEW.plan_digest IS NOT OLD.plan_digest
+  OR NEW.candidate_snapshot_digest IS NOT OLD.candidate_snapshot_digest
+  OR NEW.packet_digest IS NOT OLD.packet_digest
+  OR NEW.ceo_assignment_id IS NOT OLD.ceo_assignment_id
+  OR NEW.ceo_actor_id IS NOT OLD.ceo_actor_id
+  OR NEW.ceo_session_id IS NOT OLD.ceo_session_id
+  OR NEW.ceo_session_incarnation IS NOT OLD.ceo_session_incarnation
+  OR NEW.ceo_binding_generation IS NOT OLD.ceo_binding_generation
+  OR NEW.issued_at IS NOT OLD.issued_at
+  OR NEW.grant_digest IS NOT OLD.grant_digest
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_IMMUTABLE');
+END;
+
+-- CP-HI-02 — #246 B2-b: a grant is consumed once, from unconsumed to consumed, and never back.
+CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_consumed_once
+BEFORE UPDATE ON manifest_activation_grants
+WHEN OLD.consumed_at IS NOT NULL OR NEW.consumed_at IS NULL OR NEW.consumed_attempt_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_CONSUMED');
+END;
+
+-- CP-HI-06 — #246 B2-b: never removed; a deleted grant would free its run for a second one.
+CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_no_delete
+BEFORE DELETE ON manifest_activation_grants
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_IMMUTABLE');
+END;
+
+-- CP-HI-03 — #246 B2-b: a project's active manifest moves only by a consumed grant that names exactly
+-- this move, which is what the activation transaction writes before it moves the pointer. Registering
+-- a project inserts its first manifest and is not an update.
+CREATE TRIGGER IF NOT EXISTS projects_active_manifest_moves_by_grant
+BEFORE UPDATE OF active_manifest_digest ON projects
+WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
+ AND NOT EXISTS (
+  SELECT 1 FROM manifest_activation_grants g
+   WHERE g.project_id = NEW.project_id
+     AND g.from_manifest_digest IS OLD.active_manifest_digest
+     AND g.manifest_digest IS NEW.active_manifest_digest
+     AND g.consumed_at IS NOT NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_ACTIVATION_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-02 — #246 B2-b: a CONTRACT_CHANGE run completes only once its own grant for its current
+-- candidate is consumed and the project's active manifest is the one that grant names.
+CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated
+BEFORE UPDATE OF state ON runs
+WHEN NEW.state = 'COMPLETED' AND OLD.state IS NOT 'COMPLETED' AND NEW.kind = 'CONTRACT_CHANGE'
+ AND NOT EXISTS (
+  SELECT 1 FROM manifest_activation_grants g
+    JOIN projects p ON p.project_id = g.project_id
+   WHERE g.run_id = NEW.run_id
+     AND g.candidate_snapshot_digest IS NEW.current_candidate_digest
+     AND g.consumed_at IS NOT NULL
+     AND p.active_manifest_digest IS g.manifest_digest
+)
+BEGIN
+  SELECT RAISE(ABORT, 'CONTRACT_CHANGE_NOT_ACTIVATED');
+END;
+
+-- ---------------------------------------------------------------------------
 -- verification_results  (PRD §17.6, §17.7)
 --   Lifecycle: one row per (snapshot, command, repository) execution.
 --   Integrity: the completeness gate counts these rows; a JSON blob cannot be

@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 43;
+export const SCHEMA_VERSION = 44;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -148,6 +148,9 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- CP-HI-02 — #246 C1b \(schema v42\): which hold continuity placed is daemon authority[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_continuity_hold_not_inserted[\s\S]*?\nEND;/,
   // v43 alone creates the bootstrap application record and its guards (#246 C3).
   /-- -{75}\n-- bootstrap_applications[\s\S]*?CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_delete[\s\S]*?\nEND;/,
+  // v44 alone creates the manifest activation grant, its guards, and the two guards over projects and
+  // runs that name it (#246 B2-b).
+  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -3159,6 +3162,65 @@ const v43: SchemaMigration = {
   checksum: () => migrationChecksum("v43-bootstrap-application-record", SCHEMA_VERSION),
 };
 
+/** v44's guards, read from schema.sql by name: the grant's own, then the two over projects and runs. */
+const V44_MANIFEST_ACTIVATION_TRIGGER_NAMES: readonly string[] = [
+  "manifest_activation_grants_born_unconsumed",
+  "manifest_activation_grants_no_replace",
+  "manifest_activation_grants_immutable",
+  "manifest_activation_grants_consumed_once",
+  "manifest_activation_grants_no_delete",
+  "projects_active_manifest_moves_by_grant",
+  "runs_contract_change_completes_activated",
+];
+
+/**
+ * #246 B2-b. A CONTRACT_CHANGE run's CEO CONFIRM issues one activation grant for the run, and the daemon
+ * finalizer consumes it in the transaction that moves the project's active manifest from the run's pin
+ * to the manifest the run's PLAN carries and completes the run. Before this, no path could move an
+ * existing project's active manifest: the one caller of `activateManifest` could never satisfy it, and
+ * the only APPROVAL row its reader accepted was one written with raw SQL.
+ *
+ * Additive: one new table and its five guards, and two guards over existing tables — `projects`, whose
+ * active manifest now moves only with a consumed grant naming the move, and `runs`, whose CONTRACT_CHANGE
+ * rows complete only with their own grant consumed. No existing row is touched and there is no backfill:
+ * a CONTRACT_CHANGE run confirmed before this has no grant, cannot complete, and is listed by doctor; its
+ * artifacts are kept. A chain test can build a v43 image out of a current database, which already has
+ * the table; it is accepted only with schema.sql's exact shape and no row, never repaired, as v43 does.
+ * The triggers are dropped and recreated, as v43 does for its own.
+ *
+ * A live database at v43 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v44: SchemaMigration = {
+  id: "v44-manifest-activation-grant",
+  fromVersion: 43,
+  toVersion: 44,
+  apply: (raw) => {
+    const tableDdl = schemaObject(
+      /CREATE TABLE IF NOT EXISTS manifest_activation_grants \([\s\S]*?\n\) WITHOUT ROWID;/,
+      "the manifest_activation_grants table",
+      SCHEMA_VERSION,
+    );
+    const existing = (raw.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'manifest_activation_grants'",
+    ).get() as { sql: string } | undefined)?.sql;
+    if (existing !== undefined) {
+      const normalise = (sql: string): string => sql
+        .replace(/^CREATE TABLE IF NOT EXISTS /i, "CREATE TABLE ")
+        .replace(/--[^\n]*/g, "").replace(/"/g, "").replace(/;\s*$/, "").replace(/\s+/g, " ").trim();
+      if (normalise(existing) !== normalise(tableDdl)
+          || raw.prepare("SELECT 1 FROM manifest_activation_grants LIMIT 1").get()) {
+        throw new Error("v44 pre-existing manifest_activation_grants table does not match the current schema or is populated");
+      }
+    } else {
+      raw.exec(tableDdl);
+    }
+    raw.exec(dropsFor(V44_MANIFEST_ACTIVATION_TRIGGER_NAMES));
+    raw.exec(triggerDdlFor(V44_MANIFEST_ACTIVATION_TRIGGER_NAMES, SCHEMA_VERSION));
+  },
+  checksum: () => migrationChecksum("v44-manifest-activation-grant", SCHEMA_VERSION),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -3192,6 +3254,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v41,
   v42,
   v43,
+  v44,
 ]);
 
 interface RequiredTrigger {
@@ -3364,6 +3427,16 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "bootstrap_applications_identity_immutable", sentinel: "BOOTSTRAP_APPLICATION_IMMUTABLE", introducedIn: 43 },
   { name: "bootstrap_applications_phase_forward", sentinel: "BOOTSTRAP_APPLICATION_PHASE_INVALID", introducedIn: 43 },
   { name: "bootstrap_applications_no_delete", sentinel: "BOOTSTRAP_APPLICATION_IMMUTABLE", introducedIn: 43 },
+  // #246 B2-b — the manifest activation grant: born unconsumed, one per run, its identity fixed, consumed
+  // once, never deleted; a project's pointer moves only by a consumed grant, and a CONTRACT_CHANGE run
+  // completes only with its own.
+  { name: "manifest_activation_grants_born_unconsumed", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 44 },
+  { name: "manifest_activation_grants_no_replace", sentinel: "MANIFEST_GRANT_NO_REPLACE", introducedIn: 44 },
+  { name: "manifest_activation_grants_immutable", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 44 },
+  { name: "manifest_activation_grants_consumed_once", sentinel: "MANIFEST_GRANT_CONSUMED", introducedIn: 44 },
+  { name: "manifest_activation_grants_no_delete", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 44 },
+  { name: "projects_active_manifest_moves_by_grant", sentinel: "MANIFEST_ACTIVATION_AUTHORITY_DENIED", introducedIn: 44 },
+  { name: "runs_contract_change_completes_activated", sentinel: "CONTRACT_CHANGE_NOT_ACTIVATED", introducedIn: 44 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
