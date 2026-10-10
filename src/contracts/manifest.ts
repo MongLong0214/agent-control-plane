@@ -113,16 +113,17 @@ export const projectManifestSchema = z
      * own copy.
      *
      * An entry is bound to the command that runs it, never to the project. An entry without
-     * `loadedBy` must be invoked directly: some verification command of its repository must name
-     * it as its first argument (`node gate/check.mjs`). A command that reaches a script through
-     * selection configuration the candidate owns -- `node --run verify`, `npm test`, a package
-     * script -- does not bind it, because the candidate can re-point that configuration without
-     * touching the script, so such a declaration is refused rather than accepted as protection.
-     * An entry with `loadedBy` is a helper that the named declared entry loads for its decision;
-     * it is checked wherever its root is. For a TRUSTED_CI command the argv is ACP's statement of
-     * what the approved workflow runs: ACP does not parse the workflow, so the approved workflow
-     * must itself run that argv, and a workflow `run:` that goes through a package script is
-     * selection configuration this binding does not reach.
+     * `loadedBy` must be run by a local verification command of its repository in the one admitted
+     * launch form, `node <entry>` (see `launchedEntry`). A command that reaches a script through
+     * selection configuration the candidate owns -- `node --run verify`, `pnpm <name>`, `npm test`
+     * -- does not bind it, because the candidate can re-point that configuration without touching
+     * the script, so such a declaration is refused rather than accepted as protection. An entry
+     * with `loadedBy` is a helper that the named declared entry loads for its decision; it is
+     * checked wherever its root is.
+     *
+     * The validator arm covers local execution only. A gate entry on a TRUSTED_CI command is
+     * refused: CI runs it after earlier steps of the approved job that ACP cannot see, so nothing
+     * ACP checks binds what CI executed. BOTH_REQUIRED is admitted because its local run is checked.
      *
      * `.optional()` with no default is load-bearing. `manifestDigest` digests the parsed object,
      * so a defaulted `[]` would change the digest of every manifest written before this field
@@ -136,9 +137,11 @@ export const projectManifestSchema = z
      * through imports, and project code, tests and dependencies stay the candidate's (§14.2).
      * A helper an entry imports for its decision is outside the guarantee until it is declared
      * too; an entry that loads any undeclared candidate file in-process can be short-circuited
-     * through that file, so a gate entry means something only when it is self-contained. A
-     * helper is trusted to be loaded by a path its root's pinned bytes name; a loader that
-     * resolves it through candidate configuration (a package.json `imports` map) is not bound.
+     * through that file, so a gate entry means something only when it is self-contained. The
+     * same holds for a program the entry runs by name: the sandbox PATH lists the worktree, so a
+     * name can resolve to a file the candidate commits. A helper is trusted to be loaded by a
+     * path its root's pinned bytes name; a loader that resolves it through candidate
+     * configuration (a package.json `imports` map) is not bound.
      */
     gateEntries: z
       .array(
@@ -233,7 +236,20 @@ export const projectManifestSchema = z
       } else if (!manifest.verificationCommands.some((command) => invokesDirectly(command, root))) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `gateEntry '${root.path}' is invoked directly by no verification command of repositoryRole '${root.repositoryRole}': a command must name it as its first argument`,
+          message: `gateEntry '${root.path}' is run by no local verification command of repositoryRole '${root.repositoryRole}' as 'node ${root.path}'`,
+          path: ["gateEntries"],
+        });
+      }
+    }
+    for (const command of manifest.verificationCommands) {
+      const launched = launchedEntry(command);
+      if (
+        command.evidenceMode === "TRUSTED_CI" &&
+        entries.some((entry) => entry.repositoryRole === command.repositoryRole && entry.path === launched)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `verificationCommand '${command.id}' runs gate entry '${launched}' only in trusted CI, where it cannot be checked before it runs; declare it LOCAL_COMMAND or BOTH_REQUIRED`,
           path: ["gateEntries"],
         });
       }
@@ -346,16 +362,43 @@ const gateEntryRoot = (entry: GateEntry, declared: ReadonlyMap<string, GateEntry
 };
 
 /**
- * RF-S22 — whether a command runs `entry` itself rather than through selection configuration:
- * its first argument, resolved against its cwd, is the entry's path. An option there
- * (`node --run verify`) or any other position names something the interpreter or a package
- * manager resolves, which the candidate controls.
+ * RF-S22 — the file a command's launch form executes as-is, or null when its launcher picks what
+ * runs from anything else (#1082 R1-02).
+ *
+ * This is an allowlist of launch semantics, not of spellings. The one admitted form is `node
+ * <entry> [args...]`: node executes the file its first operand names, resolved against the
+ * command's cwd, and reads everything after it as the script's own arguments. Any node option
+ * before the entry can change what is loaded (`--run`, `-e`, `-r`/`--require`, `--import`,
+ * `--loader`, `--env-file`), so a first operand that starts with "-" is never an entry.
+ *
+ * Nothing else launches a gate. Package managers and task runners (npm, pnpm, yarn, npx, bun,
+ * make, just) and tools that read their own configuration (vitest, eslint, tsc) choose what runs
+ * from candidate files: `pnpm gate/check.mjs` runs a package script of that name. git is not an
+ * interpreter. node is also the only interpreter the verification executable allowlist admits,
+ * and an entry run as argv[0] is not on it either. Python and Deno are left out on their own
+ * terms: CPython puts the script's directory first on its import path and runs an unchecked
+ * hash-based .pyc in place of a declared helper's source, and Deno resolves imports through a
+ * deno.json it discovers in the candidate tree.
  */
-const invokesDirectly = (command: VerificationCommandShape, entry: GateEntry): boolean => {
-  const first = command.argv[1];
-  if (command.repositoryRole !== entry.repositoryRole || first === undefined || first.startsWith("-")) return false;
-  return posix.normalize(posix.join(command.cwd, first)) === entry.path;
+const launchedEntry = (command: VerificationCommandShape): string | null => {
+  const [launcher, operand] = command.argv;
+  if (launcher !== "node" || operand === undefined || operand.startsWith("-")) return null;
+  return posix.normalize(posix.join(command.cwd, operand));
 };
+
+/**
+ * Whether `command` runs `entry` where ACP can check it first. A TRUSTED_CI command's run happens
+ * on CI, after whatever earlier step of the approved job ran -- a dependency install's lifecycle
+ * scripts, a local action -- any of which can rewrite the entry before it runs, and ACP sees only
+ * the result. Requiring the approved workflow to carry a `run:` line equal to the argv was
+ * rejected rather than adopted: it binds the line, not what ran before it in the same job. So the
+ * validator arm binds local execution only: LOCAL_COMMAND, and BOTH_REQUIRED, whose local run is
+ * checked.
+ */
+const invokesDirectly = (command: VerificationCommandShape, entry: GateEntry): boolean =>
+  command.repositoryRole === entry.repositoryRole &&
+  command.evidenceMode !== "TRUSTED_CI" &&
+  launchedEntry(command) === entry.path;
 
 /**
  * The gate entries a selected command must find unchanged before it runs: the ones it invokes

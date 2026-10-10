@@ -671,9 +671,41 @@ describe("portable project manifest (Integration §10.2)", () => {
       ["npm", "test"],
       ["node", "-e", "process.exit(0)", "scripts/gate.mjs"],
       ["node", "SCRIPTS/gate.mjs"],
+      // Launch semantics, not spelling (#1082 R1-02 round 2): every one of these names the entry
+      // as its first argument, and none of them executes it as-is.
+      ["pnpm", "scripts/gate.mjs"],
+      ["npm", "scripts/gate.mjs"],
+      ["npx", "scripts/gate.mjs"],
+      ["yarn", "scripts/gate.mjs"],
+      ["bun", "scripts/gate.mjs"],
+      ["vitest", "scripts/gate.mjs"],
+      ["eslint", "scripts/gate.mjs"],
+      ["tsc", "scripts/gate.mjs"],
+      ["git", "scripts/gate.mjs"],
+      ["python3", "scripts/gate.mjs"],
+      ["deno", "run", "scripts/gate.mjs"],
+      ["node", "--require", "./x.cjs", "scripts/gate.mjs"],
+      ["node", "-r", "./x.cjs", "scripts/gate.mjs"],
+      ["node", "--import", "./x.mjs", "scripts/gate.mjs"],
+      ["node", "--loader", "./x.mjs", "scripts/gate.mjs"],
+      ["node", "--env-file", ".env", "scripts/gate.mjs"],
+      ["scripts/gate.mjs"],
     ]) {
-      expect(refusedAt({ ...runsGate(argv), gateEntries: [gate] }), argv.join(" ")).toEqual(["gateEntries"]);
+      // Some of these are also outside the verification executable allowlist, a separate refusal.
+      expect(refusedAt({ ...runsGate(argv), gateEntries: [gate] }), argv.join(" ")).toContain("gateEntries");
     }
+    // A TRUSTED_CI command runs where ACP cannot check the entry first, so it cannot carry one;
+    // BOTH_REQUIRED can, because its local run is checked before it starts.
+    const inMode = (evidenceMode: string) => ({
+      ...runsGate(["node", "scripts/gate.mjs"]),
+      verificationCommands: [{ ...runsGate(["node", "scripts/gate.mjs"]).verificationCommands[0]!, evidenceMode }],
+      gateEntries: [gate],
+    });
+    expect(new Set(refusedAt(inMode("TRUSTED_CI")))).toEqual(new Set(["gateEntries"]));
+    expect(assertPortableManifest(inMode("BOTH_REQUIRED")).allowed).toBe(true);
+    expect(assertPortableManifest(inMode("LOCAL_COMMAND")).allowed).toBe(true);
+    // Arguments after the entry are the script's own, not node's.
+    expect(assertPortableManifest({ ...runsGate(["node", "scripts/gate.mjs", "--strict"]), gateEntries: [gate] }).allowed).toBe(true);
     // An interpreter reads a first argument that starts with "-" as its own option, not a script.
     expect(refusedAt({ ...runsGate(["node", "-gate.mjs"]), gateEntries: [{ ...gate, path: "-gate.mjs" }] })).toEqual(["gateEntries"]);
     for (const [argv, cwd] of [[["node", "scripts/gate.mjs"], "."], [["node", "./scripts/gate.mjs"], "."], [["node", "gate.mjs"], "scripts"]] as const) {

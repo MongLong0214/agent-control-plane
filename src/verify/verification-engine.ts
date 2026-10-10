@@ -263,13 +263,15 @@ export class VerificationEngine {
    * RF-S22 (PRD §14.2 "Candidate Gate Logic 변경은 이전 Trusted Contract로 판정", RF-019).
    *
    * What this guarantees, and where (#1082). Each selected command's gate entries
-   * (`gateEntriesFor`: the entry its argv runs directly and the helpers declared under it) are
-   * checked twice for a LOCAL_COMMAND: here, in git objects at the candidate head, before any
-   * worktree, sandbox or CI read; and again in `runLocal`, in that command's materialised
-   * worktree, immediately before it runs. For TRUSTED_CI only the first check exists: it binds the
-   * committed bytes at the exact head the evidence must report, and it runs before that evidence
-   * is accepted, not before CI ran. What CI's own checkout made of those bytes is not observed.
-   * Post-merge verification and its cached receipts do not repeat either check.
+   * (`gateEntriesFor`: the entry it runs as `node <entry>` and the helpers declared under it) are
+   * checked twice: here, in git objects at the candidate head, before any worktree, sandbox or CI
+   * read; and again in `runLocal`, in that command's materialised worktree, immediately before it
+   * runs. Only commands that run locally carry gate entries -- LOCAL_COMMAND, and BOTH_REQUIRED,
+   * whose CI evidence is collected in addition to a checked local run. The manifest refuses a gate
+   * entry on a TRUSTED_CI-only command, because CI runs it where neither check can reach. The
+   * source checkout itself is read under `withoutRepositoryPrograms`, so freshness runs nothing the
+   * repository or the candidate selects. Post-merge verification and its cached receipts do not
+   * repeat either check.
    *
    * Obligations follow the selected procedure and the run's participants, not the manifest as a
    * whole: a command that is not selected, or whose repository is not in the run, holds the run

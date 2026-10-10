@@ -2571,10 +2571,12 @@ describe("trusted CI evidence (CP-S29)", () => {
   });
 
   /**
-   * RF-S22 (PRD §14.2, RF-019) — the TRUSTED_CI arm. The approved workflow runs
-   * `node scripts/gate.mjs`, and the pinned manifest declares that script as a gate entry. CI
-   * evidence for the candidate is always `success` from the approved workflow digest, which is
-   * exactly what a workflow running a gate the candidate rewrote would report.
+   * RF-S22 (PRD §14.2, RF-019) — a gate that CI evidence is also collected for. The command is
+   * BOTH_REQUIRED: a gate entry is refused on a TRUSTED_CI-only command (#1082 R1-02b), because CI
+   * runs it where ACP cannot check it first. The approved workflow runs `node scripts/gate.mjs` and
+   * the pinned manifest declares that script as a gate entry. CI evidence for the candidate is
+   * always `success` from the approved workflow digest, which is exactly what a workflow running a
+   * gate the candidate rewrote would report.
    */
   const GATE_SCRIPT = [
     "import { createRequire } from 'node:module';",
@@ -2587,7 +2589,7 @@ describe("trusted CI evidence (CP-S29)", () => {
       id: "project-ci",
       argv: ["node", "scripts/gate.mjs"],
       repositoryRole: "primary",
-      evidenceMode: "TRUSTED_CI",
+      evidenceMode: "BOTH_REQUIRED",
       timeoutSeconds: 60,
     }),
   ];
@@ -2687,7 +2689,12 @@ describe("trusted CI evidence (CP-S29)", () => {
    * #1082 R1-03 — gate obligations follow the run's participants and its selected procedure. The
    * project has a primary and a secondary repository, each with a gate its own command runs.
    */
-  const SECONDARY_GATE = "process.exit(1);\n";
+  const SECONDARY_GATE = [
+    "import { createRequire } from 'node:module';",
+    "const app = createRequire(import.meta.url)('./src/app.js');",
+    "if (app() !== 2) process.exit(1);",
+    "",
+  ].join("\n");
   const participation = async (options: { selected: string[]; secondaryInRun: boolean }) => {
     const harness = makeHarness();
     writeFiles(harness.repoPath, { "scripts/gate.mjs": GATE_SCRIPT });
@@ -2705,7 +2712,7 @@ describe("trusted CI evidence (CP-S29)", () => {
           id: "secondary-ci",
           argv: ["node", "other-gate.mjs"],
           repositoryRole: "secondary",
-          evidenceMode: "TRUSTED_CI",
+          evidenceMode: "BOTH_REQUIRED",
           timeoutSeconds: 60,
         }),
       ],
@@ -2793,7 +2800,8 @@ describe("trusted CI evidence (CP-S29)", () => {
     expect(verified).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.VERIFICATION_GAP,
-      evidence: { report: { status: "INCOMPLETE", expectedInputs: 2, observedInputs: 1 } },
+      // Each BOTH_REQUIRED command expects a local and a CI input; only the primary's two arrive.
+      evidence: { report: { status: "INCOMPLETE", expectedInputs: 4, observedInputs: 2 } },
     });
   });
 
@@ -2802,6 +2810,44 @@ describe("trusted CI evidence (CP-S29)", () => {
     expect(verified.allowed, verified.allowed ? "" : `${verified.reasonCode}: ${verified.message}`).toBe(true);
     expect(verified.allowed && verified.value.status).toBe("PASS");
     expect([...fetched].sort()).toEqual(["github:acme/fixture", "github:acme/secondary"]);
+  });
+
+  /**
+   * #1082 R1-02 — the review's selector rows, kept. Each pins a gate the candidate could then
+   * replace without touching its bytes: pnpm runs a package script named like the file, and a
+   * TRUSTED_CI command is run by whatever its approved workflow says, here `node --run verify`.
+   * Neither can be declared, so neither can be registered as a project's contract.
+   */
+  it.each([
+    ["pnpm naming the entry, in trusted CI", ["pnpm", "gate/check.mjs"], "TRUSTED_CI", "pnpm gate/check.mjs"],
+    ["pnpm naming the entry, run locally", ["pnpm", "gate/check.mjs"], "LOCAL_COMMAND", "pnpm gate/check.mjs"],
+    ["a direct node argv whose approved workflow runs a package script", ["node", "gate/check.mjs"], "TRUSTED_CI", "node --run verify"],
+  ] as const)("RF-S22 arm:validator #1082 R1-02: %s cannot be declared a gate", (_, argv, evidenceMode, run) => {
+    const harness = makeHarness();
+    const workflow = `name: verify\non: [push]\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: ${run}\n`;
+    const manifest = fixtureManifest("selector-project", {
+      verificationProfiles: { simple: ["verify"], standard: ["verify"], guarded: ["verify"] },
+      verificationCommands: [parseVerificationCommand({ id: "verify", argv: [...argv], repositoryRole: "primary", evidenceMode })],
+      ciWorkflows: [{
+        path: ".github/workflows/ci.yml",
+        checkName: "verify",
+        repositoryRole: "primary",
+        approvedDigest: sha256(workflow),
+        unapprovedFirstActivation: false,
+      }],
+      gateEntries: [{ path: "gate/check.mjs", repositoryRole: "primary", digest: sha256("process.exit(1);\n") }],
+    });
+    const registered = harness.cp.projects.register({
+      projectId: manifest.projectId,
+      name: "selector",
+      manifest,
+      authorization: harness.cp.manifestAuthorizationForTests(manifest),
+    });
+    expect(registered).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.INVALID_ARGUMENT,
+      evidence: { issues: expect.arrayContaining([expect.objectContaining({ path: "gateEntries" })]) },
+    });
   });
 
   it("CP-S29: a CI result at the exact head from an approved workflow is accepted", async () => {
