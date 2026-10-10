@@ -35,6 +35,7 @@ import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from
 import { TaskGraph } from "../run/task-graph.ts";
 import { BootstrapCtoStaffing } from "../run/bootstrap-cto-staffing.ts";
 import { WORKER_TURN_PROVIDER, WorkerTurnRunner } from "../run/worker-turn.ts";
+import { WorkerRetirement } from "../run/worker-retirement.ts";
 import { WorkerStaffing } from "../run/worker-staffing.ts";
 import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter, type CliAdapterOptions } from "../runtime/cli-adapters.ts";
 import {
@@ -282,6 +283,8 @@ export class ControlPlane {
   readonly workerTurns: WorkerTurnRunner;
   /** #512 — the production path that mints a task's first WORKER binding. */
   readonly workers: WorkerStaffing;
+  /** #512 — revokes a run's WORKER bindings when it ends, and stops their sessions. */
+  readonly workerRetirement: WorkerRetirement;
   /** #246 — staffs a project-less bootstrap run's BOOTSTRAP_CTO at dispatch, and reclaims it. */
   readonly bootstrapCtos: BootstrapCtoStaffing;
   /** #246 C1b — the challenges a provisioned session answers over its authenticated connection. */
@@ -701,6 +704,12 @@ export class ControlPlane {
         },
       });
 
+      this.workerRetirement = new WorkerRetirement(this.db, this.audit, {
+        bindings: this.bindings,
+        sessions: this.sessions,
+        providers: this.providers,
+      });
+
       // Close the dependency cycles with narrow ports.
       this.runs.attach({
         cto: {
@@ -709,6 +718,7 @@ export class ControlPlane {
           plannedProvider: (projectId) => this.cto.plannedProvider(projectId),
         },
         bootstrapCto: this.bootstrapCtos,
+        workerRetirement: this.workerRetirement,
         // The target has to survive the port: dropping it here is what made every dispatch
         // ask "is any provider healthy?" instead of "is the one this run will use healthy?".
         capacity: { refreshForDispatch: (target) => this.capacity.refreshForDispatch(target) },
