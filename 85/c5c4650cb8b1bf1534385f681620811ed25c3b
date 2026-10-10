@@ -1,0 +1,55 @@
+Limit: the settle after a terminal transition runs once; a session it leaves live is asked again only by WorkerRetirement.reconcile
+Ruled-out: stopping a retired worker's session inside the run's terminal transaction | a provider stop is awaited and a transaction cannot span an await, so the binding is revoked in the transaction and the session is stopped after commit
+Warn: retirement only reads a worker turn's recorded process and never signals it; the runner that launched the process alone kills it or records it released, so a retired worker's session stays live and is recorded as remaining while that process runs
+Warn: a retired worker's session with a RUNNING receipt is left live as RECEIPT_OPEN rather than stopped
+Warn: keep retirement to WORKER rows of a run in a terminal state: a live run's WORKER, whatever its task's state, may still serve a retry or a revision
+Record-Id: r-workerretire
+Provenance: inherited 080f00e67f4b271ce5162fb172ebb8a3e9c4934c
+
+Limit: Daemon.reconcile() runs at daemon start and when a bootstrap park promotes, never on a timer, so a retired worker's session left live because its process remained stays live until the next start
+Warn: the retirement call sits after the restart has settled receipts and before the doctor runs; moving it before the receipt sweep would leave a session live as RECEIPT_OPEN for a receipt the restart is about to abandon
+Record-Id: r-workerretirereconcile
+Follows: r-workerretire
+Provenance: inherited b177c28172cf88060a8158f049e786badad05410
+
+Limit: a WORKER bound for a task id with no tasks row is not scope-checked, because there is nothing to derive its run from
+Ruled-out: resolving a WORKER's run as COALESCE(a.run_id, t.run_id) | the row's run_id was an unchecked label, so another run's end could revoke a live worker; the task's run is the authority instead
+Warn: a WORKER row whose run_id disagrees with its task's run is never revoked by retirement; it is deferred and recorded once as WORKER_SCOPE_CONFLICT, and its session is not stopped
+Record-Id: r-workerretirescope
+Follows: r-workerretirereconcile
+Provenance: inherited d3bbc9f25108d4fdd191d08621ebb1d0b06f987f
+
+Limit: a failover refused after its session was provisioned marks that session STOPPED directly, as the failover's other refusals do, without a provider stop
+Warn: the fence that keeps a terminal run's WORKER from coming back ACTIVE is the check inside BindingRegistry.bind and switchTo; the failover's own checks only save a spawn, and a new WORKER writer must go through the registry to be fenced
+Warn: the terminal-run fence is applied to WORKER only; CEO, CTO and every other role bind as before
+Record-Id: r-workerretirefence
+Follows: r-workerretirescope
+Provenance: inherited cdc8695a6e440480057f3a234aec09a99d866e55
+
+Limit: a retired worker's session whose PID-less receipt was abandoned stays live as PROCESS_UNVERIFIED indefinitely, since nothing can show its worker stopped; the binding is still revoked
+Warn: a receipt's status is not process evidence: ABANDONED and TIMEOUT receipts without a recorded pid leave the session live as PROCESS_UNVERIFIED; only a released or confirmed-gone pid, a SUCCEEDED or FAILED receipt, or a runtime-managed receipt whose launch was never admitted counts as ended
+Warn: the launch-admitted test duplicates WorkerTurnRunner.launchWasAuthorised; change both together
+Record-Id: r-workerretirepidless
+Follows: r-workerretirefence
+Provenance: inherited 98f9a6c767237de41bedf226e2d2fa5d4e37b92e
+
+Warn: the watchdog runs WorkerRetirement.reconcile alone, not Daemon.reconcile(); the restart reconciliation's other sweeps must not move onto a timer with it
+Warn: a reconcile asked for while one is queued or running returns that pass, so a tick can answer from state read before the latest change; the next tick sees it
+Warn: WORKER_RETIREMENT_RECONCILED is written only for a pass that revoked, stopped or failed to stop something; remaining and deferred work is recorded by its own deduplicated events
+Record-Id: r-workerretiretick
+Follows: r-workerretirepidless
+Provenance: inherited 1e0775dcd22abdd18870dfa4167d852765b53a27
+
+Limit: only the WORKER run-ended refusal stops its provisioned session through the provider; the failover's other refusal branches still mark their unused session STOPPED directly
+Warn: a WORKER failover refused after provisioning stops that one session through its adapter and records STOPPED only after the stop returns; a failed stop leaves it ERROR and recorded as remaining with its process unverified
+Warn: the fence that keeps a terminal run's WORKER from coming back ACTIVE is the check inside BindingRegistry.bind and switchTo; the failover's own checks only save a spawn, and a new WORKER writer must go through the registry to be fenced
+Warn: the terminal-run fence is applied to WORKER only; CEO, CTO and every other role bind as before
+Record-Id: r-workerretirefencestop
+Supersedes: r-workerretirefence
+Provenance: inherited 7fb124347f818a7b705f6f6bfb86d5a872982a34
+
+Limit: the stale-plan refusal (coverage plan superseded) still marks its unused session STOPPED without a provider stop; a run's end does not reach it, because no await separates it from the post-provision run check
+Warn: both WORKER run-ended refusals in failover, the post-provision check and the registry's RUN_ALREADY_TERMINAL refusal of switchTo, stop the provisioned session through #stopUnboundWorkerSession; any other switchTo refusal still marks it STOPPED directly
+Record-Id: r-workerretireswitchstop
+Follows: r-workerretirefencestop
+Provenance: inherited b4e54a632db8e380c866ba4793f16543411d2d6d
