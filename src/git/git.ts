@@ -200,10 +200,15 @@ export const git = async (
     // "ETIMEDOUT" as the synchronous family reports. So `e.code ?? 1` would have called it exit 1,
     // which is indistinguishable from git refusing, and `allowFailure` callers would have read
     // "the answer is no" where the truth is "the check could not run" (#859).
+    // The deadline first, for every settlement shape (#1082 R3-01, round 5): a settlement at or after
+    // the bound -- an exit code, a signal, a spawn failure or a maxBuffer refusal -- is the bound, not
+    // git answering. Measured: a real maxBuffer refusal delivered after a shared deadline's `endsAt`
+    // read INTERNAL_ERROR while string codes were exempt here. One clock sample decides it.
+    const settledLate = late();
     const killedByBound = e.killed === true && e.signal === "SIGTERM" && (e.code ?? null) === null;
     // A child that outlived the signal and then exited is no answer either: its output pipes were
-    // destroyed when the bound fired (#1082 R3-01). A string `code` keeps its own shape below.
-    const timedOut = killedByBound || (typeof e.code !== "string" && late());
+    // destroyed when the bound fired. Inside the bound, a string `code` keeps its own shape below.
+    const timedOut = settledLate || killedByBound;
     // Measured on this repository's runtime (Node 22), the three shapes that are *not* git
     // answering:
     //
