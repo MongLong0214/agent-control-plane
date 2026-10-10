@@ -604,6 +604,62 @@ describe("review round 1: a terminal run's WORKER never comes back ACTIVE (wr-r1
   });
 });
 
+const killChild = async (child: ChildProcess): Promise<void> => {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, "exit");
+  child.kill("SIGKILL");
+  await exited;
+};
+
+/** A worker's own process group, standing in for a worker the CTO launched; killed only by the test. */
+const liveWorkerProcess = (): ChildProcess =>
+  spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+
+const remainingFor = (harness: Harness, sessionId: string) =>
+  harness.cp.audit.byKind("WORKER_PROCESS_REMAINING").filter((entry) => entry.sessionId === sessionId);
+
+describe("review round 1: an ABANDONED receipt is not exit evidence (wr-r1-04)", () => {
+  it("a cancelled receipt without a PID leaves the session live as PROCESS_UNVERIFIED, while the binding is revoked", async () => {
+    const harness = gatedHarness();
+    const run = await activeRun(harness);
+    const workerSessionId = bindWorker(harness, run.taskIds[0]!);
+    const capacity = vi.spyOn(harness.cp.tasks, "admitWorkerFanout").mockResolvedValue(allow(ReasonCode.OK, undefined));
+    const worker = liveWorkerProcess();
+    try {
+      // task_receipt_submit's writer: a receipt that names no worker process.
+      const execution = await harness.cp.tasks.startWorkerExecution({
+        runId: run.runId,
+        taskId: run.taskIds[0]!,
+        ownerBindingGeneration: run.ownerBindingGeneration,
+        workerSessionId,
+        provider: "scripted",
+        model: "scripted-worker",
+        repositoryId: run.repositoryId,
+      });
+      if (!execution.allowed) throw new Error(execution.message);
+      expect(capacity).toHaveBeenCalledTimes(1);
+
+      expect(harness.cp.runs.cancel(run.runId, "cancel a worker whose process was not recorded").allowed).toBe(true);
+      await harness.cp.workerRetirement.settled();
+      await harness.cp.workerRetirement.reconcile();
+
+      expect(workerAssignment(harness, run.taskIds[0]!)?.status).toBe("REVOKED");
+      expect(harness.cp.tasks.execution(execution.value.executionId)).toMatchObject({ status: "ABANDONED", workerProcessId: null });
+      expect(lifecycleOf(harness, workerSessionId)).toBe(SessionLifecycle.READY);
+      const remaining = remainingFor(harness, workerSessionId);
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0]!.evidence).toMatchObject({
+        executions: [{ executionId: execution.value.executionId, pid: null, status: "PROCESS_UNVERIFIED" }],
+      });
+      expect(worker.exitCode).toBeNull();
+      expect(worker.signalCode).toBeNull();
+    } finally {
+      await killChild(worker);
+      capacity.mockRestore();
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // The ordinary finalization path, as tests/unit/ordinary-finalization-authority.test.ts drives it.
 

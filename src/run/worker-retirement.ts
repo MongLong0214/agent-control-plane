@@ -345,31 +345,48 @@ export class WorkerRetirement {
   }
 
   /**
-   * A receipt still open on the session, and every recorded worker process not confirmed gone — the
-   * same rule the worker runner applies before it records one released: no member of the group it led
-   * remains, and the pid is gone or now names a process with another start time.
+   * What the session's receipts leave running, or cannot show has ended. A receipt's status is the
+   * receipt's, not the process's: ABANDONED is written by a cancel or a restart without anything
+   * having seen the worker exit, and TIMEOUT says it did not finish. So:
+   *
+   * - a RUNNING receipt is open;
+   * - a recorded pid ends only when the runner recorded it released, or by the rule the runner
+   *   applies before it does — no member of the group it led remains, and the pid is gone or now
+   *   names a process with another start time; otherwise it is running or unverified;
+   * - with no recorded pid, only a SUCCEEDED or FAILED receipt, which reports the worker's end, or a
+   *   runtime-managed receipt whose launch the guard never admitted, which ran nothing, has ended.
+   *   Any other receipt without a pid is PROCESS_UNVERIFIED: nothing establishes that its worker,
+   *   whoever launched it, has stopped.
    */
   #remainingTurns(sessionId: string): RemainingWorkerProcess[] {
     const rows = this.db.all<{
       execution_id: string;
       status: string;
+      runtime_managed: number;
       worker_process_id: number | null;
       worker_process_started_at: string | null;
       worker_process_released_at: string | null;
     }>(
-      `SELECT execution_id, status, worker_process_id, worker_process_started_at, worker_process_released_at
+      `SELECT execution_id, status, runtime_managed, worker_process_id, worker_process_started_at,
+              worker_process_released_at
          FROM task_executions
         WHERE worker_session_id = ?
-          AND (status = 'RUNNING' OR (worker_process_id IS NOT NULL AND worker_process_released_at IS NULL))
         ORDER BY execution_id`,
       [sessionId],
     );
     const remaining: RemainingWorkerProcess[] = [];
     for (const row of rows) {
       const pid = row.worker_process_id;
-      const process = pid !== null && row.worker_process_released_at === null
-        ? this.#turnProcess(pid, row.worker_process_started_at)
-        : "GONE";
+      let process: "GONE" | RemainingStatus;
+      if (pid !== null) {
+        process = row.worker_process_released_at !== null ? "GONE" : this.#turnProcess(pid, row.worker_process_started_at);
+      } else if (row.status === "SUCCEEDED" || row.status === "FAILED") {
+        process = "GONE";
+      } else if (row.runtime_managed === 1 && !this.#launchWasAdmitted(row.execution_id)) {
+        process = "GONE";
+      } else {
+        process = "PROCESS_UNVERIFIED";
+      }
       if (process !== "GONE") {
         remaining.push({ sessionId, executionId: row.execution_id, pid, status: process });
       } else if (row.status === "RUNNING") {
@@ -377,6 +394,23 @@ export class WorkerRetirement {
       }
     }
     return remaining;
+  }
+
+  /**
+   * Whether the managed write guard admitted a provider launch for this runtime-managed receipt —
+   * the worker runner's own test for a launch that may have run with no pid recorded
+   * (`WorkerTurnRunner.launchWasAuthorised`), read here the same way.
+   */
+  #launchWasAdmitted(executionId: string): boolean {
+    return this.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM audit_events
+        WHERE kind = 'MANAGED_WRITE_GUARD'
+          AND json_extract(evidence_json, '$.taskReceiptId') = ?
+          AND json_extract(evidence_json, '$.operation') = 'FILE_MUTATION'
+          AND json_extract(evidence_json, '$.allowed') = 1
+        LIMIT 1`,
+      [executionId],
+    ) !== undefined;
   }
 
   #turnProcess(pid: number, startedAt: string | null): "GONE" | "PROCESS_RUNNING" | "PROCESS_UNVERIFIED" {
@@ -400,21 +434,33 @@ export class WorkerRetirement {
     };
   }
 
+  /**
+   * Reports what remains on every pass, and records it only when it differs from what this session's
+   * last record said, so repeated passes over an unchanged session write nothing.
+   */
   #recordRemaining(
     session: SessionRecord,
     remaining: RemainingWorkerProcess[],
     report: Omit<WorkerRetirementReport, "revoked" | "deferred">,
   ): void {
+    report.remaining.push(...remaining);
+    const executions = remaining.map(({ executionId, pid, status }) => ({ executionId, pid, status }));
+    const last = this.db.get<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = ? AND session_id = ? ORDER BY event_id DESC LIMIT 1`,
+      [WORKER_PROCESS_REMAINING, session.sessionId],
+    );
+    if (last && JSON.stringify((JSON.parse(last.evidence_json) as { executions?: unknown }).executions) === JSON.stringify(executions)) {
+      return;
+    }
     this.audit.record({
       kind: WORKER_PROCESS_REMAINING,
       sessionId: session.sessionId,
       evidence: {
         reason: "a retired worker's session is left live while what it ran remains",
         lifecycle: session.lifecycle,
-        executions: remaining.map(({ executionId, pid, status }) => ({ executionId, pid, status })),
+        executions,
       },
     });
-    report.remaining.push(...remaining);
   }
 
   /** A settle that threw after commit: recorded where possible, never thrown into the caller. */
