@@ -525,6 +525,27 @@ describe("Repo Factory scenarios count in the verdict", () => {
     }
   });
 
+  it("carries a scenario's own revision and CI run when its evidence moved, and refuses one without the other", () => {
+    const moved = "fedcba9876543210fedcba9876543210fedcba98";
+    const external = elsewhere([{ id: second, revision: moved, ciRun: "43", tests: ["tests/test_x.py::test_moved"] }]);
+
+    const result = traceFixture([whole(first, "passed")], external, { writeEvidence: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.row(second)?.external).toEqual([
+      expect.objectContaining({ revision: moved, ciRun: "43", repository: "example/other-repository" }),
+    ]);
+    expect(result.markdown).toContain("example/other-repository@fedcba987654 (CI run 43)");
+
+    for (const entry of [
+      { id: second, revision: moved, tests: ["tests/test_x.py::test_moved"] },
+      { id: second, revision: "fedcba9", ciRun: "43", tests: ["tests/test_x.py::test_moved"] },
+    ]) {
+      const refused = traceFixture([whole(first, "passed")], elsewhere([entry]));
+      expect(refused.report.summary.repoFactoryExternalEvidenceProblems, JSON.stringify(entry)).not.toEqual([]);
+      expect(refused.exitCode).toBe(1);
+    }
+  });
+
   it("no longer claims that CI recomputes the committed report", () => {
     const result = traceFixture([whole(first, "passed"), whole(second, "passed")], noExternal, { writeEvidence: true });
 

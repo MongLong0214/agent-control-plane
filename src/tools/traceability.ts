@@ -85,6 +85,10 @@ interface ScenarioRow {
 /** One Repo Factory scenario whose tests live in another repository. */
 export interface ExternalScenario {
   readonly id: string;
+  /** This scenario's own evidence commit, when it is not the evidence's default `revision`. */
+  readonly revision?: string;
+  /** The CI run that judged this scenario's own `revision`. Required whenever `revision` is given. */
+  readonly ciRun?: string;
   /** The other repository's own test ids (pytest node ids), as its CI runs them. */
   readonly tests: readonly string[];
   /** What the external evidence does not show, stated beside it rather than left out. */
@@ -93,14 +97,14 @@ export interface ExternalScenario {
 
 export interface ExternalScenarioEvidence {
   readonly repository: string;
-  /** The exact commit the listed tests are the evidence at. */
+  /** The exact commit the listed tests are the evidence at, unless a scenario names its own. */
   readonly revision: string;
   /** The CI run that judged that commit. */
   readonly ciRun: string;
   readonly scenarios: readonly ExternalScenario[];
 }
 
-/** An external entry as one report row carries it: where the evidence is, and what it covers. */
+/** An external entry as one report row carries it, with the revision and CI run that apply to it. */
 export interface ExternalScenarioReference extends ExternalScenario {
   readonly repository: string;
   readonly revision: string;
@@ -128,9 +132,13 @@ export interface ExternalScenarioReference extends ExternalScenario {
  * - a scenario that is listed and also covered here, by a whole label or a complete set of arms,
  *   or listed twice, is DUPLICATE and fails. Each scenario has exactly one judge.
  *
- * repo-factory's CI step (`pytest tests/ -q`) keeps no per-test result, only its summary line
- * (`852 passed, 3 skipped` for the run below). Each listed id was seen to pass in a junit run of
- * the same revision; the CI run shows that the suite as a whole passed there.
+ * Entries stay at the revision their ids were measured at. A scenario whose evidence moved names
+ * its own revision and CI run; the rest use the default, which is older than repo-factory's main.
+ *
+ * repo-factory's CI step (`pytest tests/ -q`) keeps no per-test result, only its summary line:
+ * `852 passed, 3 skipped` at 309e2e6b47, `880 passed, 3 skipped` at f1380fd2e4 and
+ * `889 passed, 3 skipped` at 41b61b0d1c. Each listed id was seen to pass in a junit run of its
+ * own revision; the CI run shows that the suite as a whole passed there.
  */
 export const REPO_FACTORY_EXTERNAL_EVIDENCE: ExternalScenarioEvidence = {
   repository: "MongLong0214/repo-factory",
@@ -143,14 +151,26 @@ export const REPO_FACTORY_EXTERNAL_EVIDENCE: ExternalScenarioEvidence = {
     },
     {
       id: "RF-S03",
+      revision: "f1380fd2e47c9c359c16ee8e1ce96a04d294d049",
+      ciRun: "38026327764",
       tests: [
         "tests/test_slice1_plan.py::test_standard_lean_revision_preserves_product_scope_and_required_artifacts",
+        "tests/test_slice1_plan.py::test_lean_accept_without_removals_preserves_the_plan",
         "tests/test_slice1_plan.py::test_lean_review_refuses_product_scope_and_required_artifact_removal",
         "tests/test_slice1_plan.py::test_lean_decision_refuses_planning",
+        "tests/test_slice1_plan.py::test_lean_review_refuses_unrequested_optional_and_contradictory_verdicts",
+        "tests/test_slice1_plan.py::test_lean_review_schema_requires_a_reason",
+        "tests/test_slice1_plan.py::test_lean_review_refuses_duplicate_removal_items",
+        "tests/test_slice1_plan.py::test_lean_review_cli_emits_applied_review_outside_strict_plan",
+        "tests/test_slice1_plan.py::test_a_verdict_that_does_not_account_for_every_requested_option_is_refused",
+        "tests/test_slice1_plan.py::test_the_plan_command_refuses_a_request_that_skipped_the_lean_review",
+        "tests/test_slice1_plan.py::test_simple_reaches_the_plan_without_a_lean_review",
+        "tests/test_slice1_plan.py::test_the_plan_command_refuses_a_verdict_that_blocks",
+        "tests/test_lean_review.py::test_the_generated_revision_cuts_what_nothing_consumes_and_keeps_scope",
+        "tests/test_lean_review.py::test_an_already_lean_spec_gets_a_pass_verdict_and_an_unchanged_plan",
+        "tests/test_lean_review.py::test_a_cut_into_scope_is_generated_as_a_ceo_decision_and_stops_the_plan",
+        "tests/test_lean_review.py::test_the_generator_refuses_a_verdict_the_plan_would_refuse",
       ],
-      limit:
-        "a lean verdict is applied when one is supplied; nothing requires or produces one, so an " +
-        "over-designed STANDARD request without a review compiles unchanged",
     },
     {
       id: "RF-S04",
@@ -158,12 +178,22 @@ export const REPO_FACTORY_EXTERNAL_EVIDENCE: ExternalScenarioEvidence = {
     },
     {
       id: "RF-S08",
-      tests: ["tests/test_slice2_stack_ci.py::test_node_workflow_installs_dependencies_on_both_declared_runtimes"],
+      revision: "41b61b0d1cab9c10fa92378bb5ff3b0904a7d897",
+      ciRun: "38027660325",
+      tests: [
+        "tests/test_node_install_witness.py::test_the_fixture_dependency_is_the_source_beside_it_and_the_lock_pins_its_bytes",
+        "tests/test_node_install_witness.py::test_the_rendered_steps_install_the_pinned_dependency_and_run_it",
+        "tests/test_node_install_witness.py::test_a_failed_install_is_not_followed_by_steps_that_count_as_success",
+        "tests/test_node_install_witness.py::test_a_configured_runtime_list_with_an_unusable_entry_fails_instead_of_skipping",
+        "tests/test_node_install_witness.py::test_a_usable_runtime_list_runs_every_execution_witness_on_every_runtime",
+        "tests/test_slice2_stack_ci.py::test_node_workflow_installs_dependencies_on_both_declared_runtimes",
+      ],
       limit:
-        "a static check of the rendered workflow, which installs nothing. The dated install record " +
-        "(Actions run 32256790243, 2026-08-19) survives only as residual JSON: the run answers 404, so " +
-        "it cannot be verified remotely. A local install witness is pending in repo-factory PR #56, " +
-        "not merged; its evidence is a local run, not a GitHub Actions pass",
+        "the install witness is a local, offline install from a file: tarball, not GitHub Actions " +
+        "setup-node. CI does not set RF_S08_NODE_BIN_DIRS, so it runs the witness on one runtime, " +
+        "Node 22 (the declared latest); the declared lower runtime, Node 20, is checked only in the " +
+        "rendered workflow. The 2026-08-19 run 32256790243 survives only as residual JSON: it " +
+        "answers 404 and cannot be verified remotely",
     },
     {
       id: "RF-S16",
@@ -556,6 +586,15 @@ const measuredCommit = (): string => {
 
 const NO_EXTERNAL_EVIDENCE: ExternalScenarioEvidence = { repository: "", revision: "", ciRun: "", scenarios: [] };
 
+/** The revision and CI run an entry's tests are evidence at: its own, or the evidence's default. */
+const evidenceAt = (
+  external: ExternalScenarioEvidence,
+  entry: ExternalScenario,
+): { revision: string; ciRun: string } => ({
+  revision: entry.revision ?? external.revision,
+  ciRun: entry.ciRun ?? external.ciRun,
+});
+
 /** What makes an external entry unusable. Each problem fails the report rather than being skipped. */
 const externalEvidenceProblems = (
   external: ExternalScenarioEvidence,
@@ -564,11 +603,16 @@ const externalEvidenceProblems = (
   if (external.scenarios.length === 0) return [];
   const problems: string[] = [];
   if (!external.repository) problems.push("the external evidence names no repository");
-  if (!/^[0-9a-f]{40}$/.test(external.revision)) {
-    problems.push(`the external evidence revision is not a full commit SHA: '${external.revision}'`);
-  }
-  if (!external.ciRun) problems.push("the external evidence names no CI run");
   for (const entry of external.scenarios) {
+    const { revision, ciRun } = evidenceAt(external, entry);
+    if (!/^[0-9a-f]{40}$/.test(revision)) {
+      problems.push(`${entry.id}: the external evidence revision is not a full commit SHA: '${revision}'`);
+    }
+    if (!ciRun) problems.push(`${entry.id}: the external evidence names no CI run`);
+    // A revision of its own with the default's CI run would credit one commit with another's run.
+    if (entry.revision !== undefined && entry.ciRun === undefined) {
+      problems.push(`${entry.id} names its own revision but not the CI run that judged it`);
+    }
     if (!repoFactoryScenarios.has(entry.id)) problems.push(`${entry.id} is not a Repo Factory scenario in the PRD`);
     if (entry.tests.length === 0 || entry.tests.some((test) => test.trim() === "")) {
       problems.push(`${entry.id} names no external test id`);
@@ -689,8 +733,7 @@ export const buildTraceabilityReport = (
       external: entries.map((entry) => ({
         ...entry,
         repository: external.repository,
-        revision: external.revision,
-        ciRun: external.ciRun,
+        ...evidenceAt(external, entry),
         acpUnattendedRun: "NOT_SUPPORTED" as const,
       })),
     };
