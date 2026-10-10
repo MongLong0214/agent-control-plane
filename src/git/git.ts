@@ -298,14 +298,15 @@ export const addWorktree = async (
   path: string,
   ref: string,
   authorization?: GuardedGitEffect,
-  options: { timeoutMs?: number } = {},
+  /** `gitOptions` go before the subcommand: `--no-replace-objects` and `-c` overrides. */
+  options: { timeoutMs?: number; gitOptions?: readonly string[] } = {},
 ): Promise<Decision<void>> => {
   return authorizeGitMutation(
     authorization,
     path,
     WorktreeAction.ADD,
     cwd,
-    () => git(cwd, ["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", path, ref], {
+    () => git(cwd, [...(options.gitOptions ?? []), "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", path, ref], {
       ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     }),
   );

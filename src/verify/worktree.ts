@@ -90,6 +90,44 @@ const lstatOrNull = (path: string): Stats | null => {
 const statusEntries = (stdout: string): string[] => stdout.split("\n").filter((line) => line.length > 0);
 
 /**
+ * What every git that prepares or judges a linked verification worktree runs with (#1082 R1-01).
+ *
+ * `--no-replace-objects`: the worktree holds the objects the candidate commit actually names. A
+ * replace ref changes what a local read returns and nothing else, so honouring it materialised a
+ * replacement tree -- with a different gate script -- under the candidate's own SHA. The tree is
+ * then compared with the one the source resolves the candidate to, which honours replacements as
+ * the snapshot does, so a replaced candidate is refused rather than reproduced, as the
+ * self-contained copy already refuses it.
+ *
+ * Every filter driver the repository's configuration declares, emptied. A `.gitattributes` the
+ * candidate commits selects a driver by name, and checkout then runs that driver's smudge or
+ * process program as the control-plane user, outside the sandbox -- measured, a smudge filter
+ * wrote different gate bytes into a worktree that `git status` called clean, and an LFS-shaped
+ * process filter ran the same way. An emptied driver is no driver: git writes the blob as stored,
+ * and `required=false` keeps a declared-required driver from failing the checkout instead. So LFS
+ * content is not fetched into a verification worktree; its pointer files are what a command sees.
+ */
+const preparationOptions = async (repositoryPath: string): Promise<string[]> => {
+  const listed = await git(repositoryPath, ["config", "--name-only", "--get-regexp", "^filter\\."], { allowFailure: true });
+  const drivers = new Set(
+    listed.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((key) => key.startsWith("filter.") && key.lastIndexOf(".") > "filter.".length)
+      .map((key) => key.slice("filter.".length, key.lastIndexOf("."))),
+  );
+  return [
+    "--no-replace-objects",
+    ...[...drivers].flatMap((driver) => [
+      "-c", `filter.${driver}.smudge=`,
+      "-c", `filter.${driver}.clean=`,
+      "-c", `filter.${driver}.process=`,
+      "-c", `filter.${driver}.required=false`,
+    ]),
+  ];
+};
+
+/**
  * The source checkout as a self-contained copy would have to match it: its HEAD, and every
  * tracked change or untracked, non-ignored file `git status` reports there. `--untracked-files=all`
  * because a repository's `status.showUntrackedFiles=no` would otherwise hide exactly the file a copy
@@ -175,18 +213,20 @@ export class WorktreeManager {
     // the disposable tree.
     const expectedHead = await revParse(repositoryPath, head);
     const expectedTree = await treeOf(repositoryPath, expectedHead);
+    const preparation = await preparationOptions(repositoryPath);
     try {
       // `worktree add` performs a checkout, which normally invokes a repository-local
       // post-checkout hook as the control-plane user. Candidate-controlled hooks therefore
       // must be disabled before Git has a chance to materialise any verification input.
-      requireAllowed(await addWorktree(repositoryPath, path, expectedHead, authorization.add));
+      requireAllowed(await addWorktree(repositoryPath, path, expectedHead, authorization.add, { gitOptions: preparation }));
 
       const [materializedHead, materializedTree, status] = await Promise.all([
         revParse(path, "HEAD"),
-        treeOf(path, "HEAD"),
+        git(path, [...preparation, "rev-parse", "HEAD^{tree}"]).then((result) => result.stdout.trim()),
         // Include untracked files explicitly: a hook that adds a replacement executable
-        // must not hide behind a repository's status.showUntrackedFiles preference.
-        git(path, ["status", "--porcelain", "--untracked-files=all"]),
+        // must not hide behind a repository's status.showUntrackedFiles preference. No
+        // fsmonitor either: it is a program the repository's configuration names.
+        git(path, [...preparation, "-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=all"]),
       ]);
       if (
         materializedHead !== expectedHead ||

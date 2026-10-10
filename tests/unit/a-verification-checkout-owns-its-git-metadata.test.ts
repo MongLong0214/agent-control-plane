@@ -1006,7 +1006,7 @@ describe("a self-contained checkout holds the tree the snapshot froze (#1072 RF-
       new ManualClock("2026-10-09T00:00:00.000Z"),
     );
 
-  it("refuses a copy whose tree is not the frozen one, where a linked worktree holds the frozen tree", async () => {
+  it("refuses a copy whose tree is not the frozen one, and a linked worktree refuses it too", async () => {
     const repository = makeRepo();
     const { candidate, ownTree, replacedTree } = replaced(repository);
     expect(replacedTree).not.toBe(ownTree);
@@ -1018,10 +1018,12 @@ describe("a self-contained checkout holds the tree the snapshot froze (#1072 RF-
     expect((await verifySnapshotFreshness(snapshot, [{ identity: frozen.identity, checkoutPath: repository }])).allowed).toBe(true);
 
     const manager = new WorktreeManager(tempDir("acp-own-checkout-"));
-    // The linked sibling reads the source's own object database, replacement included.
-    const linked = await manager.create(repository, frozen.candidateHead, "linked-replaced", authorizationFor(manager, repository, "linked-replaced"));
-    expect(gitSync(linked.path, ["rev-parse", "HEAD^{tree}"])).toBe(replacedTree);
-    await manager.destroy(repository, linked.path, authorizationFor(manager, repository, "linked-replaced"));
+    // #1082 R1-01: a linked worktree is materialised unreplaced as well, so it no longer reproduces
+    // the replacement under the candidate's SHA; it refuses the replaced candidate the same way.
+    const linked = await refusal(manager.create(repository, frozen.candidateHead, "linked-replaced", authorizationFor(manager, repository, "linked-replaced")));
+    expect(linked.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
+    expect(linked.evidence).toMatchObject({ expectedTree: `git-tree:${replacedTree}`, materializedTree: `git-tree:${ownTree}` });
+    expect(existsSync(manager.pathFor("linked-replaced"))).toBe(false);
 
     const refused = await refusal(manager.create(
       repository,
