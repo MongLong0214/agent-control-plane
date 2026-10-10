@@ -2,6 +2,7 @@ import { afterAll, afterEach, expect, it, vi } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
+import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD } from "../../src/runtime/provisioned-session-runtime.ts";
 import { withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { drivenPrimary, externalOf, holdNextAttestation } from "../helpers/driven-primary-cto.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -185,6 +186,85 @@ it("1084-R1-03 (record of another role): recovery does not start on a session wh
     expect(recovered).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
     expect(cp.sessions.require(other.sessionId).credentialEpoch).toBe(otherEpoch);
     expect(f.claude.turns.length).toBe(turns);
+  });
+});
+
+it("1084-R1-04: failover must not replace a driven holder acquired during admission", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const cp = f.harness.cp;
+    cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
+    await registerFixtureProject(f.harness, "review-failover-race");
+    const bootstrap = await f.dispatchBootstrap();
+    const initial = await cp.cto.ensurePrimaryCto("review-failover-race", "fixture");
+    if (!initial.allowed) throw new Error(initial.message);
+    let drivenSession = "";
+    const admission = cp.capacity.refreshForProviderSwitch.bind(cp.capacity);
+    vi.spyOn(cp.capacity, "refreshForProviderSwitch").mockImplementationOnce(async (target) => {
+      f.restoreClaude();
+      await cp.continuity.evaluate("fixture coverage recovered during admission");
+      expect(cp.bindings.revoke(initial.value.roleKey, "fixture replacing interactive holder").allowed).toBe(true);
+      const won = await cp.cto.ensureDrivenPrimaryCto("review-failover-race", bootstrap.runId);
+      if (!won.allowed) throw new Error(won.message);
+      drivenSession = won.value.sessionId;
+      return admission(target);
+    });
+    f.loseClaude();
+    const result = await cp.continuity.failover("PRIMARY_CTO:review-failover-race", Role.PRIMARY_CTO,
+      { projectId: "review-failover-race" }, "fixture concurrent activation");
+    expect(drivenSession).not.toBe("");
+    expect.soft(result.allowed).toBe(false);
+    expect.soft(cp.bindings.active("PRIMARY_CTO:review-failover-race")?.sessionId).toBe(drivenSession);
+  });
+});
+
+it("1084-R1-04 (fence): failover refuses when another holder replaced the fenced one during admission", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const cp = f.harness.cp;
+    await registerFixtureProject(f.harness, "review-failover-fence");
+    const initial = await cp.cto.ensurePrimaryCto("review-failover-fence", "fixture");
+    if (!initial.allowed) throw new Error(initial.message);
+    const other = cp.sessions.create({ provider: "scripted", model: "other-cto" });
+    cp.sessions.transition(other.sessionId, SessionLifecycle.READY, "fixture: another holder");
+    const admission = cp.capacity.refreshForProviderSwitch.bind(cp.capacity);
+    vi.spyOn(cp.capacity, "refreshForProviderSwitch").mockImplementationOnce(async (target) => {
+      expect(cp.bindings.revoke(initial.value.roleKey, "fixture replaced during admission").allowed).toBe(true);
+      const rebound = cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "review-failover-fence", sessionId: other.sessionId });
+      if (!rebound.allowed) throw new Error(rebound.message);
+      return admission(target);
+    });
+    f.loseClaude();
+    const sessions = cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM sessions`)!.n;
+    const result = await cp.continuity.failover(initial.value.roleKey, Role.PRIMARY_CTO,
+      { projectId: "review-failover-fence" }, "fixture holder replaced during admission");
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE });
+    expect(cp.bindings.active(initial.value.roleKey)?.sessionId).toBe(other.sessionId);
+    expect(cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM sessions`)!.n).toBe(sessions);
+  });
+});
+
+it("1084-R1-04 (switch boundary): failover refuses at the switch when the holder carries a driven-spawn record by then", async () => {
+  await withBootstrapRuntime(async (f) => {
+    const cp = f.harness.cp;
+    await registerFixtureProject(f.harness, "review-failover-switch");
+    const initial = await cp.cto.ensurePrimaryCto("review-failover-switch", "fixture");
+    if (!initial.allowed) throw new Error(initial.message);
+    // While failover constitutes its replacement session, the holder comes to carry a record.
+    const start = f.gpt.startSession.bind(f.gpt);
+    vi.spyOn(f.gpt, "startSession").mockImplementationOnce(async (spec) => {
+      cp.audit.record({
+        kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,
+        projectId: "review-failover-switch",
+        roleKey: initial.value.roleKey,
+        sessionId: initial.value.sessionId,
+        evidence: { creationGeneration: 1 },
+      });
+      return start(spec);
+    });
+    f.loseClaude();
+    const result = await cp.continuity.failover(initial.value.roleKey, Role.PRIMARY_CTO,
+      { projectId: "review-failover-switch" }, "fixture record during provisioning");
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED });
+    expect(cp.bindings.active(initial.value.roleKey)?.sessionId).toBe(initial.value.sessionId);
   });
 });
 

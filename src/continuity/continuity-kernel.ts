@@ -16,7 +16,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
-import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import { ContinuityMode, Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import { drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
@@ -566,14 +566,10 @@ export class ContinuityKernel {
     if (role === Role.BOOTSTRAP_CTO) return bootstrapCtoNotReplaceable(roleKey);
     // #246 C4-R2 — nor is a PRIMARY_CTO whose holder has a driven-spawn record: its conversation lives
     // in its own session, which is recovered on itself (`CtoLifecycle.recoverDrivenPrimaryCto`).
-    const holder = role === Role.PRIMARY_CTO ? this.bindings.active(roleKey) : null;
-    if (holder && drivenModeOf(this.db, holder.sessionId) !== "NONE") {
-      return deny(
-        ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
-        "a driven primary CTO is never failed over to another session; it is recovered on its own",
-        { roleKey, sessionId: holder.sessionId },
-      );
-    }
+    // The holder read here is the one this failover may replace: fenced before the first await, so
+    // a binding that arrives while evaluation or admission is awaited is refused, never replaced.
+    const fenced = role === Role.PRIMARY_CTO ? this.bindings.active(roleKey) : null;
+    if (fenced && drivenModeOf(this.db, fenced.sessionId) !== "NONE") return drivenPrimaryNotReplaceable(roleKey, fenced.sessionId);
     const plan = await this.evaluate(`failover:${roleKey}`);
     const assignment = plan.assignments.find((a) => a.roleKey === roleKey);
     const required = plan.requiredRoles.find((candidate) => candidate.roleKey === roleKey);
@@ -614,6 +610,13 @@ export class ContinuityKernel {
     if (!switchAdmission.allowed) return switchAdmission as Decision<{ provider: string; generation: number }>;
 
     const expected = this.bindings.active(roleKey);
+    if (role === Role.PRIMARY_CTO && !sameHolder(fenced, expected)) {
+      return deny(ReasonCode.BINDING_GENERATION_STALE, "the role's binding changed while the failover was admitted; it is not replaced", {
+        roleKey,
+        fencedGeneration: fenced?.bindingGeneration ?? null,
+        currentGeneration: expected?.bindingGeneration ?? null,
+      });
+    }
     // #954 — a role continuity revoked for want of coverage gets its binding back only from a claim
     // (see `restore()`). With no active binding `switchTo` has no current row to replace, reads the
     // unmatched attestation as a replacement, and inserts a fresh assignment, so this public method
@@ -647,6 +650,12 @@ export class ContinuityKernel {
         expectedGeneration: expected?.bindingGeneration ?? null,
         actualGeneration: current?.bindingGeneration ?? null,
       });
+    }
+
+    // #246 C4-R2 — at the switch itself, a holder with a driven-spawn record is still never replaced.
+    if (role === Role.PRIMARY_CTO && current && drivenModeOf(this.db, current.sessionId) !== "NONE") {
+      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "the holder is a driven primary CTO");
+      return drivenPrimaryNotReplaceable(roleKey, current.sessionId);
     }
 
     const switched = this.bindings.switchTo({
@@ -1248,6 +1257,24 @@ export class ContinuityKernel {
     return "PAUSE_NEW_WORK";
   }
 }
+
+/** #246 C4-R2 — continuity's answer for replacing a driven PRIMARY_CTO: it is recovered on its own session. */
+const drivenPrimaryNotReplaceable = <T>(roleKey: string, sessionId: string): Decision<T> =>
+  deny(
+    ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
+    "a driven primary CTO is never failed over to another session; it is recovered on its own",
+    { roleKey, sessionId },
+  );
+
+/** #246 C4-R2 — the same holder: no binding at all on both sides, or the same assignment on the same runtime. */
+const sameHolder = (fenced: RoleBinding | null, current: RoleBinding | null): boolean =>
+  fenced === null
+    ? current === null
+    : current !== null &&
+      current.assignmentId === fenced.assignmentId &&
+      current.bindingGeneration === fenced.bindingGeneration &&
+      current.sessionId === fenced.sessionId &&
+      current.sessionIncarnation === fenced.sessionIncarnation;
 
 /** #246 C1-02 — continuity's one answer for a bootstrap CTO replacement: none is constituted. */
 const bootstrapCtoNotReplaceable = <T>(roleKey: string | null): Decision<T> =>
