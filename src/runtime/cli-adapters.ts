@@ -1836,7 +1836,13 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     const result = await runCli(this.#binary, [
       "-p", "--output-format", "json", "--model", handle.model, "--session-id", handle.externalSessionId,
     ], {
-      cwd: handle.workdir ?? process.cwd(),
+      // This invocation's private scratch — the one directory its profile re-opens — not the
+      // session's workdir. A WORKER's workdir is the managed runtime root under the read-denied
+      // state root, so a probe spawned there ran a CLI that could not read its own cwd and exited 1
+      // at once; every worker provisioning then failed its probe. The profile is not widened to
+      // the workdir, and an answer from here proves the session answers, not that its turns can
+      // reach a checkout: a WORKER turn still runs in its claimed worktree.
+      cwd: undefined,
       timeoutMs: 30_000,
       stdin: "Reply with READY.",
       environmentAllowlist: this.#environmentAllowlist,
