@@ -90,6 +90,12 @@ export interface SessionWakeTrigger {
    * still holds is refused there. Absent on every other trigger, which the final check never asks.
    */
   stillAdmissible?: () => boolean;
+  /**
+   * For a mention's trigger: whether the work it stands for was taken up, read when its turn has
+   * ended, which for a mention is whether its message has left PENDING. Such a trigger is marked
+   * handled only when this answers true; otherwise it is released, as a refused turn's are.
+   */
+  served?: () => boolean;
 }
 
 /** The roles all of whose sessions this runtime drives: a run's BOOTSTRAP_CTO. Never a canonical role. */
@@ -527,7 +533,12 @@ export class ProvisionedSessionRuntime {
       for (const trigger of triggers) lane.claimed.delete(trigger.id);
       if (completed) {
         for (const trigger of triggers) {
-          if (!this.#isEnvelope(trigger.id) && !notAdmitted.has(trigger.id)) lane.handled.add(trigger.id);
+          if (this.#isEnvelope(trigger.id) || notAdmitted.has(trigger.id)) continue;
+          // A mention's trigger is handled by what actually happened in the turn, not by the gate's
+          // answer before the provider call: a claim refused mid-turn, or never made, leaves its
+          // message PENDING and the trigger released.
+          if (trigger.stillAdmissible !== undefined && trigger.served?.() !== true) continue;
+          lane.handled.add(trigger.id);
         }
       }
     }

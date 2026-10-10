@@ -343,7 +343,7 @@ export const wakeRoleHolder = async (
   cp: Pick<ControlPlane, "bindings" | "sessionRuntime">,
   conversation: Pick<RoleConversationPort, "wake">,
   roleKey: string,
-  cause: { kind: string; ids: readonly string[]; stillAdmissible?: () => boolean },
+  cause: { kind: string; ids: readonly string[]; stillAdmissible?: () => boolean; served?: () => boolean },
 ): Promise<Decision<void>> => {
   const holder = cp.bindings.active(roleKey);
   // #246 C4 — a PRIMARY_CTO whose driven-spawn record exists but does not make it DRIVEN is neither
@@ -366,6 +366,7 @@ export const wakeRoleHolder = async (
     kind: cause.kind,
     // A mention's gate rides with its trigger to the runtime's final check before the provider call.
     ...(cause.stillAdmissible === undefined ? {} : { stillAdmissible: cause.stillAdmissible }),
+    ...(cause.served === undefined ? {} : { served: cause.served }),
   })));
   return woke.allowed ? allow(ReasonCode.OK, undefined) : (woke as Decision<void>);
 };
@@ -1948,10 +1949,19 @@ const wakeForMention = (
   if (!stillAdmissible()) {
     return Promise.resolve(deny(ReasonCode.ROLE_PEER_STALE, "the mention's identity, role or room no longer stands behind this holder", { roleKey }));
   }
+  // Served once the mention's own message has left PENDING: claimed, or settled by a fence. Read
+  // when the driven turn ends, so a claim refused mid-turn leaves the trigger released.
+  const served = (): boolean =>
+    (cp.db.get<{ status: string }>(
+      `SELECT status FROM outbox WHERE kind = ? AND json_extract(payload_json, '$.sourceChannel') = 'buzz'
+          AND json_extract(payload_json, '$.sourceNonce') = ?`,
+      [MessageKind.OWNER_MESSAGE, buzzMessageNonce(mention.eventId)],
+    )?.status ?? "PENDING") !== "PENDING";
   return wakeRoleHolder(cp, { wake: (key) => roleConversation.wake(key, mention) }, roleKey, {
     kind: "owner message",
     ids: [],
     stillAdmissible,
+    served,
   });
 };
 
