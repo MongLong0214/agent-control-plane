@@ -38,7 +38,25 @@ export interface ACPBootstrapActivationResult {
   activity: "ACTIVE" | "INACTIVE";
   availability: "HEALTHY" | "DEGRADED" | "UNAVAILABLE";
   completedAt: string;
+  /** G0a (RF-018) — what this activation did not observe, said rather than passed over silently. */
+  warnings: ActivationWarning[];
 }
+
+/**
+ * G0a — the Repo Factory producer installs no CommitLore hook and reads no CommitLore record, so a
+ * manifest that asks for CommitLore activates with it named NOT_OBSERVED. `required` never gets this
+ * far: `bootstrapPlanPreflight` refuses it before any GitHub call. `off` asks for nothing.
+ */
+export interface ActivationWarning {
+  commitlore: "NOT_OBSERVED";
+  mode: "required" | "preferred";
+}
+
+const activationWarnings = (manifest: ProjectManifest | null): ActivationWarning[] => {
+  const mode = manifest?.commitlore.mode ?? null;
+  if (mode === "required" || mode === "preferred") return [{ commitlore: "NOT_OBSERVED", mode }];
+  return [];
+};
 
 export interface ActivationInput {
   runId: string;
@@ -318,6 +336,7 @@ export class BootstrapActivation {
       activity: project.activity,
       availability: project.availability,
       completedAt: this.clock.nowIso(),
+      warnings: activationWarnings(input.approvedManifest),
     };
 
     // §26.3 — the factory result and doctor observation are retained for retry. Neither
@@ -576,6 +595,8 @@ export class BootstrapActivation {
       activity: project?.activity ?? "INACTIVE",
       availability: project?.availability ?? "UNAVAILABLE",
       completedAt: input.confirmedAt,
+      // The manifest this bootstrap activated: the project's active one, which the bindings above match.
+      warnings: activationWarnings(this.projects.activeManifest(projectId)?.manifest ?? null),
     };
     const incomplete = this.incompleteness(activation, doctorArtifact.content.report);
     if (!activation.ceoConfirm) incomplete.push("ceoConfirm");

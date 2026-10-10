@@ -16,12 +16,15 @@ import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { git, tryRevParse, type GitResult } from "../git/git.ts";
+import { consumeWithheldExemption, readWithheldIntent, withheldUnsent } from "./bootstrap-approval-anchor.ts";
+import { withinBootstrapAttempt } from "./bootstrap-write-guard.ts";
 import type { GitHubWritePort } from "./github-write-port.ts";
 import {
   GITHUB_LEDGER_SCHEMA_ID,
   applyGitHubOperations,
   githubLedgerPath,
   githubOperationSchema,
+  isCreateOnlyPlan,
   preflightGitHubOperations,
   readGitHubLedger,
   toExternalWriteReceipt,
@@ -189,6 +192,12 @@ const plannedFilesSchema = z
   .array(plannedFileSchema)
   .min(1)
   .refine((files) => new Set(files.map((file) => file.path)).size === files.length, "a planned file is named twice");
+
+/**
+ * #246 C5 — a create-only plan commits nothing: its tree is the one GitHub's initialization made, so
+ * no planned file, the bootstrap content file included, is written, reviewed as a file, or reported.
+ */
+const createOnlyFilesSchema = z.array(plannedFileSchema).max(0, "a create-only plan commits no file; its tree is the one GitHub initialized");
 
 export interface RepoFactoryGitHubInput {
   port: GitHubWritePort;
@@ -726,7 +735,8 @@ export const trackedFilesOrDeny = (tracked: GitResult): Decision<string[]> => {
  * Builds one `repo-factory.result.v2` from a real local filesystem/git run — no GitHub
  * write, no hand-authored result. Every fact this returns is something the run actually
  * observed: `bootstrapVerification[].exactHead` is the commit this run checked and published (on a
- * resume, the head GitHub holds as the push step receipted it), and a real `git rev-parse HEAD`
+ * resume, the head GitHub holds as the push step receipted it; for a create-only plan, the commit
+ * GitHub's initialization made, read back and checked out — #246 C5), and a real `git rev-parse HEAD`
  * read back after the verification must equal it, and the `externalWriteReceipt` describes the local git repository this
  * call created, not a GitHub resource it never touched.
  *
@@ -760,7 +770,11 @@ export const produceRepoFactoryResult = async (
   }
   const plan = parsedPlan.data;
   const clock = input.clock ?? systemClock;
-  const parsedFiles = plannedFilesSchema.safeParse(input.approvedFiles ?? plannedBootstrapFiles(plan));
+  // #246 C5 — create-only: no local commit; the head is the one GitHub initialized, read back.
+  const createOnly = isCreateOnlyPlan(plan.githubOperations);
+  const parsedFiles = createOnly
+    ? createOnlyFilesSchema.safeParse(input.approvedFiles ?? [])
+    : plannedFilesSchema.safeParse(input.approvedFiles ?? plannedBootstrapFiles(plan));
   if (!parsedFiles.success) {
     return deny(ReasonCode.INVALID_ARGUMENT, "the approved files failed validation", {
       issues: parsedFiles.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
@@ -896,61 +910,66 @@ export const produceRepoFactoryResult = async (
   // against a produced repository and asserting its output is empty.
   writeFileSync(join(localRepoPath, ".git", "info", "exclude"), `${OPERATION_MARKER_NAME}\n`, { flag: "a" });
 
-  // The approved files and nothing else (#246 C2): the bytes the plan's review read.
-  for (const file of approvedFiles) writeFileSync(join(localRepoPath, file.path), file.content);
-
-  // Only the approved files are tracked — the ownership marker above is bookkeeping for this
-  // function's own retry/cleanup logic, not part of the repository's real content.
-  await gitOrCleanup(["add", "--", ...approvedFiles.map((file) => file.path)]);
-  const commit = await gitOrCleanup(
-    [
-      "-c", "user.email=repo-factory@local",
-      "-c", "user.name=Repo Factory",
-      "commit", "-m", "repo factory bootstrap",
-    ],
-    { allowFailure: true },
-  );
-  if (commit.exitCode !== 0) {
-    cleanup();
-    return deny(
-      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-      "local bootstrap commit failed; refusing to fabricate a result without a real commit",
-      { stderr: commit.stderr },
-    );
-  }
-
-  // #246 C2, review round 1 (RF-REVIEW-01) — the commit just made is compared with the approved
-  // files before anything reaches GitHub. Checked only after the GitHub operations, a tree a hook
-  // had changed was refused once the repository existed with those bytes pushed, its default branch
-  // set and its branch protected; a refusal undoes none of that. A head GitHub already holds is
-  // checked the same way once it is checked out (`approvedTree` below), and the head this run
-  // finally reports once more after.
-  //
-  // Review round 3 (RF-REVIEW-01) — what is checked is a commit id, and that id is what is published:
-  // the push sends `validatedHead` and the result reports the head the push step receipted. HEAD is
-  // read once, here, before any await on GitHub; read again later it could name a commit that moved
-  // in while GitHub was awaited, which nothing had checked.
   const approvedTree = (at: string): Promise<Decision<void>> => producedTreeDrift(localRepoPath, at, approvedFiles);
-  const checkedCommit = async (): Promise<Decision<string>> => {
-    const committed = await tryRevParse(localRepoPath, "HEAD");
-    if (!committed) {
-      return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "local repository has no exact HEAD after commit", { localRepoPath });
+  // #246 C5 — a create-only plan makes no commit and pushes none: the checkout stays unborn until the
+  // create's step fetches the commit GitHub's initialization made and resets onto it.
+  let validatedHead: string | null = null;
+  if (!createOnly) {
+    // The approved files and nothing else (#246 C2): the bytes the plan's review read.
+    for (const file of approvedFiles) writeFileSync(join(localRepoPath, file.path), file.content);
+
+    // Only the approved files are tracked — the ownership marker above is bookkeeping for this
+    // function's own retry/cleanup logic, not part of the repository's real content.
+    await gitOrCleanup(["add", "--", ...approvedFiles.map((file) => file.path)]);
+    const commit = await gitOrCleanup(
+      [
+        "-c", "user.email=repo-factory@local",
+        "-c", "user.name=Repo Factory",
+        "commit", "-m", "repo factory bootstrap",
+      ],
+      { allowFailure: true },
+    );
+    if (commit.exitCode !== 0) {
+      cleanup();
+      return deny(
+        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+        "local bootstrap commit failed; refusing to fabricate a result without a real commit",
+        { stderr: commit.stderr },
+      );
     }
-    const committedDrift = await approvedTree(committed);
-    return committedDrift.allowed ? allow(ReasonCode.OK, committed) : (committedDrift as Decision<string>);
-  };
-  let validated: Decision<string>;
-  try {
-    validated = await checkedCommit();
-  } catch (thrown) {
-    cleanup();
-    throw thrown;
+
+    // #246 C2, review round 1 (RF-REVIEW-01) — the commit just made is compared with the approved
+    // files before anything reaches GitHub. Checked only after the GitHub operations, a tree a hook
+    // had changed was refused once the repository existed with those bytes pushed, its default branch
+    // set and its branch protected; a refusal undoes none of that. A head GitHub already holds is
+    // checked the same way once it is checked out (`approvedTree` above), and the head this run
+    // finally reports once more after.
+    //
+    // Review round 3 (RF-REVIEW-01) — what is checked is a commit id, and that id is what is published:
+    // the push sends `validatedHead` and the result reports the head the push step receipted. HEAD is
+    // read once, here, before any await on GitHub; read again later it could name a commit that moved
+    // in while GitHub was awaited, which nothing had checked.
+    const checkedCommit = async (): Promise<Decision<string>> => {
+      const committed = await tryRevParse(localRepoPath, "HEAD");
+      if (!committed) {
+        return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "local repository has no exact HEAD after commit", { localRepoPath });
+      }
+      const committedDrift = await approvedTree(committed);
+      return committedDrift.allowed ? allow(ReasonCode.OK, committed) : (committedDrift as Decision<string>);
+    };
+    let validated: Decision<string>;
+    try {
+      validated = await checkedCommit();
+    } catch (thrown) {
+      cleanup();
+      throw thrown;
+    }
+    if (!validated.allowed) {
+      cleanup();
+      return validated as Decision<RepoFactoryResult>;
+    }
+    validatedHead = validated.value;
   }
-  if (!validated.allowed) {
-    cleanup();
-    return validated as Decision<RepoFactoryResult>;
-  }
-  const validatedHead = validated.value;
 
   // GitHub's half, between the commit and the verification: the verified head below must be
   // the head GitHub holds. On a resumed push the commit just made is not that head — its
@@ -962,6 +981,7 @@ export const produceRepoFactoryResult = async (
   let applied: AppliedGitHubOperations | null = null;
   if (github !== null) {
     const ledgerPath = github.ledgerPath;
+    const insideAttempt = withinBootstrapAttempt();
     let outcome: Decision<AppliedGitHubOperations>;
     try {
       outcome = await applyGitHubOperations({
@@ -981,6 +1001,30 @@ export const produceRepoFactoryResult = async (
         },
         ledgerPath,
         clock,
+        // Review C5I-R1-02 — the one proof that a pending request was never sent, for a standalone call
+        // and the runner's attempts alike: C3's withheld records of exactly that intent, keyed by the
+        // digest of the whole intent and judged by `withheldUnsent`, the predicate the runner uses to
+        // find an intent exempt. The runner consumes the exemption, durably, before the request starts.
+        provenUnsent: (intent) =>
+          withheldUnsent(readWithheldIntent(workDir, { operationId: intent.operationId, intentDigest: digestOf(intent) })),
+        // Inside a bootstrap attempt, the attempt records the consumption under its own generation before
+        // the request starts. Outside one, nothing would: this call records it under the next generation
+        // the intent's records name, so the exemption is used once whoever calls.
+        consumeExemption: insideAttempt
+          ? () => undefined
+          : (intent) => {
+              const key = { operationId: intent.operationId, intentDigest: digestOf(intent) };
+              const records = readWithheldIntent(workDir, key);
+              if (records === null) throw new Error("the withheld records of this intent cannot be read");
+              const generations = [...records.withheld, ...records.consumed].map((record) => record.attempt);
+              consumeWithheldExemption(workDir, {
+                runId: plan.runId,
+                ...key,
+                resourceType: intent.resourceType,
+                attempt: Math.max(0, ...generations) + 1,
+                consumedAt: clock.nowIso(),
+              });
+            },
         approvedTree,
         validatedHead,
       });
@@ -1000,12 +1044,21 @@ export const produceRepoFactoryResult = async (
   // awaits above (RF-REVIEW-01, round 3). The re-read after verification below refuses a checkout
   // that is not at it.
   const head = applied === null ? validatedHead : applied.publishedHead;
+  if (head === null) {
+    cleanup();
+    return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "this run made no commit and GitHub reported no head; there is nothing to verify", {
+      localRepoPath,
+    });
+  }
 
   // #246 C2 — the head this run reports, GitHub's own on a resumed push, must hold exactly the
-  // approved files. A drifted tree is refused before it is verified, receipted or activated.
+  // approved files. A drifted tree is refused before it is verified, receipted or activated. #246 C5 —
+  // except a create-only head: its tree is GitHub's initialization, which no planned file describes,
+  // and what was checked of it instead is that it is the parentless commit at the default branch of
+  // the repository this operation created (`applyGitHubOperations`).
   let drift: Decision<void>;
   try {
-    drift = await approvedTree(head);
+    drift = createOnly ? allow(ReasonCode.OK, undefined) : await approvedTree(head);
   } catch (thrown) {
     cleanup();
     throw thrown;
