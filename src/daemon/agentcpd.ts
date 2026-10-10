@@ -52,6 +52,7 @@ import {
   sendDaemonNoticeProbe,
 } from "../runtime/acp-daemon-notice.ts";
 import {
+  SELF_CLAIM_EXECUTOR_KIND,
   assertCanonicalSessionsValid,
   canonicalBuzzChannelFor,
   unsubscribedRoomRefusal,
@@ -64,11 +65,13 @@ import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import { BuzzBindChallenges, buzzBindContentOf } from "../buzz/buzz-bind-challenge.ts";
 import {
   BUZZ_MENTION_ADDRESSED_TO,
-  BuzzMentionBindingUnavailableError,
   nativeSubscriberScheduler,
   startBuzzMentionSubscriberFromStateDir,
   type BuzzMentionAdmission,
+  type BuzzMentionAdmissionReporter,
   type BuzzMentionAdmissionRequest,
+  type BuzzMentionDeliveryBinding,
+  type BuzzMentionIdentityJudgement,
   type BuzzMentionRegistry,
   type BuzzMentionSink,
   type BuzzMentionSubscriberHandle,
@@ -91,6 +94,7 @@ import {
   type IngressPolicy,
 } from "../ingress/ingress-guard.ts";
 import {
+  BUZZ_MESSAGE_NONCE_PREFIX,
   BuzzMessageIngress,
   buzzMessageNonce,
   buzzMessageSigningRequest,
@@ -132,8 +136,11 @@ import {
   RoleConversationPort,
   type OwnerMessageHandover,
   type OwnerMessageLedger,
+  type OwnerMessageProvenance,
+  type MentionWakeContext,
+  type MentionWakeGate,
 } from "../mcp/role-conversation.ts";
-import { digestOf, isDigest } from "../core/digest.ts";
+import { digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { HOLDER_CLAIMED_KINDS, MessageKind } from "../outbox/envelope.ts";
 import type { HolderIdentity } from "../outbox/outbox.ts";
 import { respond, type AuthenticatedMcpPeer, type McpPeerAuthenticator } from "../mcp/shared.ts";
@@ -336,7 +343,7 @@ export const wakeRoleHolder = async (
   cp: Pick<ControlPlane, "bindings" | "sessionRuntime">,
   conversation: Pick<RoleConversationPort, "wake">,
   roleKey: string,
-  cause: { kind: string; ids: readonly string[] },
+  cause: { kind: string; ids: readonly string[]; stillAdmissible?: () => boolean; served?: () => boolean },
 ): Promise<Decision<void>> => {
   const holder = cp.bindings.active(roleKey);
   // #246 C4 — a PRIMARY_CTO whose driven-spawn record exists but does not make it DRIVEN is neither
@@ -354,7 +361,13 @@ export const wakeRoleHolder = async (
   // #246 C4 — a PRIMARY_CTO is driven only when its own spawn recorded it so, never by its role.
   if (!holder || !cp.sessionRuntime.drivesSession(holder.sessionId, holder.role)) return conversation.wake(roleKey);
   const ids = cause.ids.length > 0 ? cause.ids : [`${cause.kind}:${randomUUID()}`];
-  const woke = cp.sessionRuntime.wake(roleKey, ids.map((id) => ({ id, kind: cause.kind })));
+  const woke = cp.sessionRuntime.wake(roleKey, ids.map((id) => ({
+    id,
+    kind: cause.kind,
+    // A mention's gate rides with its trigger to the runtime's final check before the provider call.
+    ...(cause.stillAdmissible === undefined ? {} : { stillAdmissible: cause.stillAdmissible }),
+    ...(cause.served === undefined ? {} : { served: cause.served }),
+  })));
   return woke.allowed ? allow(ReasonCode.OK, undefined) : (woke as Decision<void>);
 };
 
@@ -419,6 +432,8 @@ export interface LocalBuzzMessageIngress {
   readonly seam: {
     readonly ingress: BuzzMessageIngress;
     readonly port: BuzzMessageTurnPort;
+    /** The role port `port.wakeRole` wakes, so a mention's wake can carry its context to it. */
+    readonly roleConversation: RoleConversationPort | null;
   };
   close(): Promise<void>;
 }
@@ -623,8 +638,12 @@ export const startLocalMcpListeners = async (
     // and `cto.mcp.sock` are already in, two lines above. It is passed rather than derived inside
     // the port so the port never has to know what a deployment's layout is, and so a test that
     // wants a different directory gets one without moving the daemon's.
-    { endpointDir: stateDir, ownerMessages: ownerMessageLedger(cp) },
+    // The wake's final holder check and its frame handoff run in the daemon's write transaction.
+    { endpointDir: stateDir, ownerMessages: ownerMessageLedger(cp), serializeWake: (body) => cp.db.tx(body) },
   );
+  // A wake caused by a verified mention is gated on that mention's identity, role and room, judged by
+  // whichever mention subscriber runs over this control plane. No other wake meets this gate.
+  ctoConversation.useMentionWakeGate(buzzMentionWakeGate(cp, () => runningMentionSubscribers.get(cp) ?? null));
   const hermes = await startMcpSocket(
     hermesPath,
     token,
@@ -1408,7 +1427,7 @@ export const startBuzzMessageIngressListener = async (
 
   return {
     socketPath,
-    seam: { ingress, port },
+    seam: { ingress, port, roleConversation },
     close: async () => {
       await closeSocketServer(server);
       try {
@@ -1450,6 +1469,119 @@ export const startDaemonBuzzMessageIngress = (
     roleConversation: listeners.ctoConversation,
   });
 
+/** The canonical session entries, when canonical activation is configured: one per CTO identity. */
+export interface BuzzMentionCanonicalEntries {
+  readonly sessions: readonly CanonicalAdoptableSession[];
+}
+
+/**
+ * One identity's admission, with the line `primaryCtoBindingFor` prints when it refuses.
+ *
+ * Every condition is read here, in one place, because neither half is enough alone: an ACTIVE
+ * PRIMARY_CTO assignment whose live runtime is not this READY session, and a READY session holding
+ * no such assignment, are both refused. When canonical activation names this identity, the
+ * binding's project must also be the one its entry names. The session's room is reported, and the
+ * subscriber requires it to be one of the rooms its identity listens in.
+ */
+const judgeBuzzMentionIdentity = (
+  cp: ControlPlane,
+  canonical: BuzzMentionCanonicalEntries | null,
+  pubkey: string,
+): { judgement: BuzzMentionIdentityJudgement; said: string; detail: Record<string, unknown> } => {
+  const refuse = (reason: string, said: string, detail: Record<string, unknown> = {}) => ({
+    judgement: { verdict: "EXCLUDED", reason } as const,
+    said,
+    detail,
+  });
+  const channelIdentity = pubkey.trim();
+  if (channelIdentity.length === 0) return refuse("CHANNEL_IDENTITY_EMPTY", "the channel identity is empty");
+  const session = cp.db.get<{
+    session_id: string;
+    incarnation: string;
+    buzz_actor_id: string | null;
+    buzz_address: string | null;
+  }>(
+    `SELECT session_id, incarnation, buzz_actor_id, buzz_address FROM sessions
+      WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
+    [channelIdentity],
+  );
+  if (!session || session.buzz_actor_id === null) {
+    return refuse("NO_LIVE_SESSION", "no READY or DRAINING session carries this channel identity", {
+      sessionsWithThisActor: cp.db.all<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM sessions WHERE buzz_actor_id = ?`,
+        [channelIdentity],
+      )[0]?.n ?? 0,
+    });
+  }
+  const held = currentBindingsForRoles(cp, MENTIONABLE_ROLES).filter(
+    (binding) => binding.sessionId === session.session_id,
+  );
+  const only = held.length === 1 ? held[0] : undefined;
+  if (!only) {
+    return refuse("NO_SINGLE_MENTIONABLE_ROLE", "that session holds no single mentionable role", {
+      heldForSession: held.length,
+      roles: held.map((binding) => binding.role),
+      projects: cp.projects.list().length,
+    });
+  }
+  if (only.role !== Role.PRIMARY_CTO) {
+    return refuse("NOT_PRIMARY_CTO", "the one role that session holds is not PRIMARY_CTO", { role: only.role });
+  }
+  const entry = canonical?.sessions.find((one) => one.buzzActorId === channelIdentity);
+  if (entry && entry.projectId !== only.projectId) {
+    return refuse("PROJECT_MISMATCH", "the binding's project is not the one its canonical entry names");
+  }
+  // A canonical entry names one conversation. The binding must be that conversation's, by the same
+  // authority the reattach admits a holder with: the assignment's actor carries the claude-cli
+  // target for the entry's session UUID and digest, and that actor's live runtime is this exact
+  // session and incarnation. A READY runtime under an ACTIVE assignment without it is not the
+  // canonical session, and missing evidence is refused, never assumed.
+  if (entry && !canonicalTargetHolds(cp, only.assignmentId, entry.sessionUuid, session.session_id, session.incarnation)) {
+    return refuse("CANONICAL_TARGET_UNVERIFIED", "the binding is not the canonical session its entry names");
+  }
+  // The stored column travels back with the answer rather than being assumed equal to the lookup
+  // key. `WHERE buzz_actor_id = ?` is SQLite's comparison, and the subscriber re-runs it in
+  // constant time before it will speak for the role.
+  return {
+    judgement: {
+      verdict: "ADMITTED",
+      binding: {
+        roleKey: only.roleKey,
+        buzzActorId: session.buzz_actor_id,
+        bindingGeneration: only.bindingGeneration,
+        sessionId: only.sessionId,
+        ...(only.projectId === null ? {} : { projectId: only.projectId }),
+        room: session.buzz_address,
+      },
+    },
+    said: "",
+    detail: {},
+  };
+};
+
+/**
+ * Whether `assignmentId` is an ACTIVE PRIMARY_CTO assignment whose actor is bound to the canonical
+ * conversation `sessionUuid` (executor, locator and digest) and is served right now by exactly
+ * `sessionId` at `incarnation`. The join is the one canonical reattach admits a holder by.
+ */
+const canonicalTargetHolds = (
+  cp: ControlPlane,
+  assignmentId: string,
+  sessionUuid: string,
+  sessionId: string,
+  incarnation: string,
+): boolean =>
+  (cp.db.get<{ n: number }>(
+    `SELECT COUNT(*) AS n
+       FROM assignments a
+       JOIN conversational_actors c ON c.actor_id = a.actor_id AND c.retired_at IS NULL
+       JOIN actor_target_bindings tb ON tb.target_actor_id = a.actor_id
+      WHERE a.assignment_id = ? AND a.role = ? AND a.status = 'ACTIVE'
+        AND tb.executor_kind = ? AND tb.target_locator = ? AND tb.target_locator_digest = ?
+        AND c.current_session_id = ? AND c.current_session_incarnation = ?`,
+    [assignmentId, Role.PRIMARY_CTO, SELF_CLAIM_EXECUTOR_KIND, sessionUuid, sha256(sessionUuid), sessionId, incarnation],
+  )?.n ?? 0) === 1;
+
 /**
  * The registry answer the relay subscriber preflights against (#760 Part C).
  *
@@ -1461,9 +1593,13 @@ export const startDaemonBuzzMessageIngress = (
  * connection, and an identity with a second role has no single thing to assert.
  *
  * So: a live session, exactly one mentionable binding, and that binding a `PRIMARY_CTO`. Anything
- * else is `null`, and `null` at startup is a subscriber that does not open.
+ * else is `null` (or, asked through `judgeIdentity`, an exclusion with its reason), and it excludes
+ * that identity alone: the subscriber's other identities are judged on their own answers.
  */
-export const buzzMentionSubscriberRegistry = (cp: ControlPlane): BuzzMentionRegistry => ({
+export const buzzMentionSubscriberRegistry = (
+  cp: ControlPlane,
+  canonical: BuzzMentionCanonicalEntries | null = null,
+): BuzzMentionRegistry => ({
   // Four ways to answer `null`, and until 2026-09-16 they were one silent `null` between them.
   //
   // Measured that day: the subscriber refused at every start with "identities[0] does not currently
@@ -1480,46 +1616,14 @@ export const buzzMentionSubscriberRegistry = (cp: ControlPlane): BuzzMentionRegi
   // read from the request, and the numbers are counts — a pubkey is public but this stays a
   // diagnostic about the deployment's own shape rather than an echo of its input.
   primaryCtoBindingFor: (pubkey) => {
-    const channelIdentity = pubkey.trim();
-    const refuse = (reason: string, detail: Record<string, unknown> = {}): null => {
-      process.stderr.write(
-        `Buzz mention binding lookup refused: ${reason} ${JSON.stringify(detail)}\n`,
-      );
-      return null;
-    };
-    if (channelIdentity.length === 0) return refuse("the channel identity is empty");
-    const session = cp.db.get<{ session_id: string; buzz_actor_id: string | null }>(
-      `SELECT session_id, buzz_actor_id FROM sessions
-        WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
-      [channelIdentity],
-    );
-    if (!session || session.buzz_actor_id === null) {
-      return refuse("no READY or DRAINING session carries this channel identity", {
-        sessionsWithThisActor: cp.db.all<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM sessions WHERE buzz_actor_id = ?`,
-          [channelIdentity],
-        )[0]?.n ?? 0,
-      });
-    }
-    const held = currentBindingsForRoles(cp, MENTIONABLE_ROLES).filter(
-      (binding) => binding.sessionId === session.session_id,
-    );
-    const only = held.length === 1 ? held[0] : undefined;
-    if (!only) {
-      return refuse("that session holds no single mentionable role", {
-        heldForSession: held.length,
-        roles: held.map((binding) => binding.role),
-        projects: cp.projects.list().length,
-      });
-    }
-    if (only.role !== Role.PRIMARY_CTO) {
-      return refuse("the one role that session holds is not PRIMARY_CTO", { role: only.role });
-    }
-    // The stored column travels back with the answer rather than being assumed equal to the
-    // lookup key. `WHERE buzz_actor_id = ?` is SQLite's comparison, and the subscriber re-runs
-    // it in constant time before it will speak for the role.
-    return { roleKey: only.roleKey, buzzActorId: session.buzz_actor_id };
+    const judged = judgeBuzzMentionIdentity(cp, canonical, pubkey);
+    if (judged.judgement.verdict === "ADMITTED") return judged.judgement.binding;
+    process.stderr.write(`Buzz mention binding lookup refused: ${judged.said} ${JSON.stringify(judged.detail)}\n`);
+    return null;
   },
+  // The same judgement with its reason code and without the line above: the subscriber asks it at
+  // startup, on every re-judgement and before every delivery, and writes the reason into health.
+  judgeIdentity: (pubkey) => judgeBuzzMentionIdentity(cp, canonical, pubkey).judgement,
   // #1044. Read when a frame arrives, before it queues: the CEO binding and this role's binding as
   // they stand at that moment. The seam compares it with the registry when the frame is processed.
   peerReceiptFor: (roleKey) => {
@@ -1719,6 +1823,10 @@ export const startDaemonBuzzMentionSubscriber = (
     scheduler?: BuzzSubscriberScheduler;
     /** The adopted CEO's pending Buzz binding challenges, shared with its tool socket. */
     bindChallenges?: BuzzBindChallenges;
+    /** The canonical session entries, so an identity's binding must be on its entry's project. */
+    canonical?: BuzzMentionCanonicalEntries | null;
+    /** Where admission changes are reported; the subscriber's own stderr line when absent. */
+    reportAdmission?: BuzzMentionAdmissionReporter;
   } = {},
 ): BuzzMentionSubscriberHandle => {
   const secret = policy.secret?.trim() ?? "";
@@ -1736,19 +1844,142 @@ export const startDaemonBuzzMentionSubscriber = (
             deny(ReasonCode.INVALID_ARGUMENT, "this daemon serves no Buzz binding challenge"),
         );
       }
+      // The subscriber judged this delivery against the binding it names, immediately before
+      // calling here. Read once more before the seam's first write: a re-claim or a session change
+      // committed in between makes this a retry, never a delivery on the strength of a binding that
+      // has moved. The retry asks the relay again and is judged against the binding that holds then.
+      if (request.binding !== undefined && buzzMentionBindingMoved(cp, request.roleKey, request.binding)) {
+        return "RETRY";
+      }
+      // The seam's own port, with its wake replaced for this one delivery: the wake this admission
+      // causes is a mention's, and carries the context this path verified. Nothing a caller says
+      // decides that; only this path builds it.
+      const mention: MentionWakeContext = {
+        actorId: request.identityPubkey,
+        roleKey: request.roleKey,
+        room: request.conversation,
+        eventId: request.event.id,
+      };
       const delivered = await deliverBuzzMessage(
         messageIngress.seam.ingress,
-        messageIngress.seam.port,
+        {
+          ...messageIngress.seam.port,
+          wakeRole: (roleKey) => wakeForMention(cp, messageIngress.seam.roleConversation, roleKey, mention),
+        },
         buzzMentionInputFor(messageIngress.seam.ingress, secret, request),
       );
       return buzzMentionVerdictOf(delivered);
     },
   };
-  return startBuzzMentionSubscriberFromStateDir(stateDir, {
-    registry: buzzMentionSubscriberRegistry(cp),
+  const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+    registry: buzzMentionSubscriberRegistry(cp, options.canonical ?? null),
     sink,
     ...(options.openSocket ? { openSocket: options.openSocket } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
+    ...(options.reportAdmission ? { reportAdmission: options.reportAdmission } : {}),
+  });
+  runningMentionSubscribers.set(cp, handle);
+  return handle;
+};
+
+/**
+ * The mention subscriber started over each control plane, read by the CTO port's wake eligibility.
+ * The latest start wins; a closed subscriber answers no eligibility, so it gates nothing.
+ */
+const runningMentionSubscribers = new WeakMap<ControlPlane, BuzzMentionSubscriberHandle>();
+
+/**
+ * Whether `roleKey`'s live binding is no longer the generation and serving session a delivery names.
+ * Exported so the sink's last check is a row a test can write without racing the subscriber.
+ */
+export const buzzMentionBindingMoved = (
+  cp: ControlPlane,
+  roleKey: string,
+  binding: BuzzMentionDeliveryBinding,
+): boolean => {
+  const current = cp.bindings.active(roleKey);
+  if (!current) return true;
+  if (binding.bindingGeneration !== null && current.bindingGeneration !== binding.bindingGeneration) return true;
+  return binding.sessionId !== null && current.sessionId !== binding.sessionId;
+};
+
+/**
+ * The gate a mention's wake must pass: the holder's current session carries exactly the channel
+ * identity the mention named, for the role it was admitted for, and the mention subscriber judges
+ * that identity admitted, answering in the room the mention arrived in. The holder's own identity
+ * is read from its current session; no other subscription's role pin stands in for it.
+ */
+export const buzzMentionWakeGate = (
+  cp: ControlPlane,
+  running: () => Pick<BuzzMentionSubscriberHandle, "deliveryEligibility"> | null,
+): MentionWakeGate => (binding, mention) => {
+  const actorId =
+    cp.db.get<{ buzz_actor_id: string | null }>(`SELECT buzz_actor_id FROM sessions WHERE session_id = ?`, [
+      binding.sessionId,
+    ])?.buzz_actor_id ?? null;
+  if (actorId !== mention.actorId || binding.roleKey !== mention.roleKey) return false;
+  const eligibility = running()?.deliveryEligibility({ actorId, roleKey: binding.roleKey }) ?? null;
+  return eligibility !== null && eligibility.eligible && eligibility.room === mention.room;
+};
+
+/**
+ * The wake for a mention the daemon's own subscriber delivered, carrying that mention's verified
+ * context. It goes through `wakeRoleHolder` like every role wake, so a driven holder is woken
+ * through its runtime and a contradicted one is refused there; only the conversation port's wake
+ * is given the mention's context. A context this path cannot state, or no role port to give it
+ * to, refuses the wake; it never falls through to an ordinary wake.
+ */
+const wakeForMention = (
+  cp: ControlPlane,
+  roleConversation: Pick<RoleConversationPort, "wake"> | null,
+  roleKey: string,
+  mention: MentionWakeContext,
+): Promise<Decision<void>> => {
+  if (roleConversation === null || mention.roleKey !== roleKey || [mention.actorId, mention.room, mention.eventId].some((value) => value.length === 0)) {
+    return Promise.resolve(deny(ReasonCode.ROLE_PEER_STALE, "a mention's wake carried no usable mention context", { roleKey }));
+  }
+  // The same gate the conversation port applies, for the driven route: it rides with the runtime
+  // trigger and is asked again immediately before the provider call. Judged against the role's
+  // current holder each time it is asked.
+  const gate = buzzMentionWakeGate(cp, () => runningMentionSubscribers.get(cp) ?? null);
+  const stillAdmissible = (): boolean => {
+    const holder = cp.bindings.active(roleKey);
+    return holder !== null && gate(holder, mention);
+  };
+  if (!stillAdmissible()) {
+    return Promise.resolve(deny(ReasonCode.ROLE_PEER_STALE, "the mention's identity, role or room no longer stands behind this holder", { roleKey }));
+  }
+  // Served once this mention's own event is spent: a row pointing at it left PENDING (its claim, the
+  // holder's rejection or a fence), whatever its kind (an owner's mention is an OWNER_MESSAGE, the
+  // CEO's a PEER_MESSAGE), or its turn held a terminal fact. Keyed by the verified event and read
+  // from the append-only departure record the hand-over rule refuses on, rather than from a row's
+  // writable pointer or status. A claim refused mid-turn spends nothing, so the trigger is released.
+  const served = (): boolean => cp.outbox.sourceEventSpent("buzz", buzzMessageNonce(mention.eventId));
+  return wakeRoleHolder(cp, { wake: (key) => roleConversation.wake(key, mention) }, roleKey, {
+    kind: "owner message",
+    ids: [],
+    stillAdmissible,
+    served,
+  });
+};
+
+/**
+ * Re-judges the mention subscriber's identities after every committed binding switch: a bind, a
+ * re-claim, a session change and a revoke all publish one (`BindingRegistry.onSwitch`). Off the
+ * committing call stack, and against whichever subscriber is running when it fires, so a switch
+ * before the subscriber starts or after it closes does nothing.
+ *
+ * The subscriber's own judgement timer covers what no switch announces — a session taking its
+ * channel identity, or its room, after its binding — on the reconnect schedule.
+ */
+export const rejudgeBuzzMentionSubscriberOnBindingSwitch = (
+  cp: ControlPlane,
+  running: () => Pick<BuzzMentionSubscriberHandle, "rejudge"> | null,
+): void => {
+  cp.bindings.onSwitch(() => {
+    setImmediate(() => {
+      running()?.rejudge();
+    });
   });
 };
 
@@ -1799,24 +2030,6 @@ export const startDaemonOwnerReplyConsumer = (
       consumer.close();
     },
   };
-};
-
-/** Like Telegram's refusal path: a missing prerequisite disables only this ingress. */
-const startDaemonBuzzMentionSubscriberOrRefuse = (
-  ...args: Parameters<typeof startDaemonBuzzMentionSubscriber>
-): BuzzMentionSubscriberHandle | null => {
-  try {
-    return startDaemonBuzzMentionSubscriber(...args);
-  } catch (error) {
-    if (!(error instanceof BuzzMentionBindingUnavailableError)) throw error;
-    // Dead-binding recovery deliberately leaves the role unbound. Keep the claim door
-    // available, while preserving the subscriber's all-or-none preflight and delivery checks.
-    process.stderr.write(
-      `Buzz mention subscriber refused: ${error.message}; continuing without Buzz mention subscriber. ` +
-        "After a fresh role claim, restart the daemon to enable mentions.\n",
-    );
-    return null;
-  }
 };
 
 /**
@@ -3921,6 +4134,71 @@ export const deliverAsCeoTurn = async (
  * site that reports coverage it does not independently have: it would settle the two transitions
  * the outbox already settles, and none of the three it does not.
  */
+/**
+ * A claimed message's provenance, from its own stored source row: the digest-checked payload's
+ * room and the row's nonce, with the row's `actor` beside them labelled unverified because no digest
+ * covers it. Buzz fields are read on the Buzz channel only, and anything absent or unreadable is
+ * `null` rather than inferred.
+ */
+export const ownerMessageProvenanceOf = (
+  channel: string,
+  nonce: string,
+  actor: string,
+  payload: unknown,
+): OwnerMessageProvenance => {
+  const buzz = channel === "buzz";
+  const conversation =
+    typeof payload === "object" && payload !== null && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)["conversation"]
+      : undefined;
+  const eventId = nonce.startsWith(BUZZ_MESSAGE_NONCE_PREFIX) ? nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length) : "";
+  return {
+    channel,
+    room: buzz && typeof conversation === "string" && conversation.length > 0 ? conversation : null,
+    // The digest-covered payload carries no signer, so there is no verified sender to report.
+    senderKey: null,
+    storedActorUnverified: actor.length > 0 ? actor : null,
+    eventId: buzz && eventId.length > 0 ? eventId : null,
+    replyToEventId: null,
+  };
+};
+
+/**
+ * Whether an owner message may be handed to `holder` now, as far as the Buzz mention it came from
+ * is concerned. The mention is read from the message's own verified stored provenance: the source
+ * row's payload, checked against the digest the message was enqueued for, whose `mention` is the
+ * channel identity the event was addressed to and whose `conversation` is the room it arrived in.
+ * When a configured subscriber identity has that key, the holder's current session must carry it,
+ * for this role, and the subscriber must judge it admitted in that same room. Anything else (no
+ * mention, another channel, no configured identity of that key, no subscriber running, a source
+ * the claim itself will refuse) is not this gate's to withhold. The row's unverified `actor`
+ * column is never read.
+ */
+const buzzMentionClaimHolds = (cp: ControlPlane, holder: HolderIdentity, pointerPayload: unknown): boolean => {
+  const pointer = ownerMessagePointerOf(pointerPayload);
+  if (!pointer || pointer.sourceChannel !== "buzz") return true;
+  const source = cp.db.get<{ payload_json: string | null }>(
+    `SELECT payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+    [pointer.sourceChannel, pointer.sourceNonce],
+  );
+  let payload: unknown;
+  try {
+    payload = source?.payload_json ? (JSON.parse(source.payload_json) as unknown) : null;
+  } catch {
+    return true;
+  }
+  if (payload === null || digestOf(payload) !== pointer.sourcePayloadDigest) return true;
+  const { mention, conversation } = payload as { mention?: unknown; conversation?: unknown };
+  if (typeof mention !== "string" || mention.length === 0 || typeof conversation !== "string") return true;
+  const running = runningMentionSubscribers.get(cp) ?? null;
+  const eligibility = running?.deliveryEligibility({ actorId: mention, roleKey: holder.roleKey }) ?? null;
+  if (eligibility === null) return true;
+  const actorId = cp.db.get<{ buzz_actor_id: string | null }>(`SELECT buzz_actor_id FROM sessions WHERE session_id = ?`, [
+    holder.targetSessionId,
+  ])?.buzz_actor_id ?? null;
+  return actorId === mention && eligibility.eligible && eligibility.room === conversation;
+};
+
 export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
   /** The pointer on one owner-message row, or a denial naming what is wrong with it. */
   const pointerOn = (messageId: string) => {
@@ -3968,9 +4246,17 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         // handed over and not written to — and reported by id so the holder can reject it.
         const ceo = buzzPeerRegistry(cp).currentCeo();
         const ctoChannel = cp.sessions.get(holder.targetSessionId)?.buzzAddress ?? null;
+        // The owner messages withheld because the mention they came from no longer stands behind
+        // this holder, so the handover can name the reason.
+        const mentionGated = new Set<string>();
         const taken = cp.outbox.claimForHolder(
           holder,
           (candidate) => {
+            if (candidate.kind === MessageKind.OWNER_MESSAGE) {
+              if (buzzMentionClaimHolds(cp, holder, candidate.payload)) return true;
+              mentionGated.add(candidate.messageId);
+              return false;
+            }
             if (candidate.kind !== MessageKind.PEER_MESSAGE) return true;
             const source = admittedPeerSource(cp, candidate.payload);
             return peerProofIsCurrent(
@@ -3994,7 +4280,13 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         // Shown to the role's exact current holder only, whether or not it is the carry successor.
         // Present only when there is one, so a handover without any keeps its shape.
         const refusals = cp.outbox.peerMessageRefusalNoticesFor(holder).map(peerMessageRefusalNoticeOf);
-        const notices = refusals.length > 0 ? { refusedAtRestart: refusals } : {};
+        const gatedMentions = withheld
+          .filter((row) => mentionGated.has(row.messageId))
+          .map((row) => ({ messageId: row.messageId, reason: "MENTION_NOT_ELIGIBLE" as const }));
+        const notices = {
+          ...(refusals.length > 0 ? { refusedAtRestart: refusals } : {}),
+          ...(gatedMentions.length > 0 ? { mentionWithheld: gatedMentions } : {}),
+        };
         const message = taken.claimed[0];
         // Nothing new was handed over: either the queue is empty, or an unresolved hand-over is
         // blocking it. Both are reported with metadata only — `UnresolvedOwnerMessage` has no
@@ -4024,8 +4316,8 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
             "this owner message does not carry a readable source pointer",
           );
         }
-        const source = cp.db.get<{ payload_json: string | null }>(
-          `SELECT payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        const source = cp.db.get<{ payload_json: string | null; actor: string }>(
+          `SELECT payload_json, actor FROM inbound_messages WHERE channel = ? AND nonce = ?`,
           [pointer.sourceChannel, pointer.sourceNonce],
         );
         if (!source?.payload_json) {
@@ -4065,6 +4357,8 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
             createdAt: message.createdAt,
             // #1038. From the row's kind — the daemon's own fact — and never from the payload.
             principal: message.kind === MessageKind.PEER_MESSAGE ? "peer" : "owner",
+            // From this message's own source row, read in the same transaction as its text.
+            provenance: ownerMessageProvenanceOf(pointer.sourceChannel, pointer.sourceNonce, source.actor, payload),
           },
           unresolved,
           withheld,
@@ -4803,22 +5097,33 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         // beside the daemon's other state this opens nothing and reports zero sockets, which is
         // every deployment until an operator writes that file. A malformed one is a startup
         // error rather than a quiet zero, because an operator who wrote the file meant it.
-        // An unbound role instead warns and skips the subscriber until the next daemon start.
-        buzzMentionSubscriber = startDaemonBuzzMentionSubscriberOrRefuse(
-          cp,
-          stateDir,
-          buzzActorIngressPolicy,
-          buzzMessageIngress,
-          buzzBindChallenges === undefined ? {} : { bindChallenges: buzzBindChallenges },
-        );
+        //
+        // An identity without a live binding no longer refuses the subscriber: it is excluded,
+        // reported, and re-judged on every binding switch and on the subscriber's own schedule,
+        // while every other identity subscribes. One paused CTO used to silence all of them.
+        buzzMentionSubscriber = startDaemonBuzzMentionSubscriber(cp, stateDir, buzzActorIngressPolicy, buzzMessageIngress, {
+          ...(buzzBindChallenges === undefined ? {} : { bindChallenges: buzzBindChallenges }),
+          canonical: canonicalSessions === null ? null : { sessions: canonicalSessions },
+        });
+        rejudgeBuzzMentionSubscriberOnBindingSwitch(cp, () => buzzMentionSubscriber);
         process.stdout.write(
-          `Buzz mention subscriber configured identities: ${buzzMentionSubscriber?.socketCount ?? 0}\n`,
+          `Buzz mention subscriber configured identities: ${buzzMentionSubscriber.socketCount}\n`,
         );
+        // The configured count above is not continuity. This line is: how many of them are
+        // delivering, and the one word that says whether that is all of them.
+        if (buzzMentionSubscriber.socketCount > 0) {
+          const admission = buzzMentionSubscriber.admission();
+          process.stdout.write(
+            `Buzz mention subscriber admitted identities: ${admission.admittedIdentities} of ` +
+              `${admission.configuredIdentities} (${admission.continuity})\n`,
+          );
+        }
         // Hand `doctor` the counters, not this number. The line above is what the subscriber was
         // *configured* to be and is printed once; `doctor` needs what it has actually received,
         // and that is the only thing that can tell "connected and silent" from "receiving and
         // refusing" (#674, #841). Only when a subscriber exists: a deployment without one has
-        // nothing to be silent about.
+        // nothing to be silent about. The counters carry `admission` beside them, so health.json
+        // shows a PARTIAL subscriber and each excluded identity's reason, read when it is written.
         // Captured into a const: `buzzMentionSubscriber` is a `let` the startup path reassigns,
         // and a closure over it would read whatever it holds when `doctor` runs rather than the
         // subscriber this block is about — which is also why TypeScript refuses to narrow it here.
@@ -4947,7 +5252,14 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   if (options.waitForShutdown) {
     await options.waitForShutdown(shutdown, context);
   } else {
-    setInterval(() => daemon.writeHealth(null), 30_000).unref();
+    // The one existing internal tick, and the mention subscriber's periodic judgement rides it: a
+    // session that stops, or whose room is rewritten, publishes no binding switch, and an admitted
+    // identity would otherwise be judged again only when its next mention arrives. Judged first,
+    // so the health written on the same tick reports the result.
+    setInterval(() => {
+      buzzMentionSubscriber?.rejudge();
+      daemon.writeHealth(null);
+    }, 30_000).unref();
     await new Promise<void>(() => undefined);
   }
 };
