@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -1156,7 +1156,12 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     expect(verified).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
   });
 
-  it("RF-S22 arm:validator #1082: a replace ref planted before the freeze cannot put a replacement gate in the worktree", async () => {
+  it.each([
+    // Left as `git replace` leaves it, the checkout is clean read unreplaced; preparation refuses.
+    ["left as replaced", false],
+    // Reset onto the replacement, its index is not the commit's own; freshness refuses.
+    ["reset onto the replacement", true],
+  ])("RF-S22 arm:validator #1082: a replace ref planted before the freeze, %s, cannot put a replacement gate in the worktree", async (_, reset) => {
     const candidate = await frozenPinnedCandidate({
       manifest: ENTRY_ONLY,
       beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
@@ -1166,8 +1171,9 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
         writeFiles(repo, { "gate/check.js": UNCONDITIONAL_PASS });
         gitSync(repo, ["add", "gate/check.js"]);
         const replacement = gitSync(repo, ["commit-tree", gitSync(repo, ["write-tree"]), "-p", head, "-m", "replacement"]);
-        gitSync(repo, ["replace", head, replacement]);
         gitSync(repo, ["reset", "-q", "--hard", head]);
+        gitSync(repo, ["replace", head, replacement]);
+        if (reset) gitSync(repo, ["reset", "-q", "--hard", head]);
       },
     });
     // The raw candidate still carries the pinned gate; only a replacement-honouring read differs.
@@ -1175,7 +1181,8 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
     expect(gitSync(candidate.harness.repoPath, ["show", "HEAD:gate/check.js"])).toBe(UNCONDITIONAL_PASS.trimEnd());
 
     vi.mocked(runSandboxed).mockClear();
-    await expect(verifyPinned(candidate)).rejects.toMatchObject({ reasonCode: ReasonCode.SNAPSHOT_STALE });
+    const outcome = await verifyPinned(candidate).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ reasonCode: ReasonCode.SNAPSHOT_STALE });
     expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
   });
 
@@ -1202,6 +1209,86 @@ describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMM
 
     await expect(verifyPinned(candidate)).rejects.toMatchObject({ reasonCode: ReasonCode.SNAPSHOT_STALE });
     expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+  });
+
+  /**
+   * #1082 R1-01 round 2 — the source checkout is read too, by snapshot freshness, before and after
+   * the commands run. Its `git status` used to run a clean or process filter the candidate's
+   * `.gitattributes` selects, and the populated submodules' own configuration: measured, such a
+   * program kept freshness green and started a writer that rewrote the gate after it was checked.
+   * The program is configured after the freeze and the gate file is touched, so the source's
+   * status has to read its content during verification.
+   */
+  it.each([
+    ["a clean filter", false],
+    ["a required process filter", true],
+  ])("RF-S22 arm:validator #1082: %s the candidate selects in the source never runs during verification", async (_, processFilter) => {
+    const programs = tempDir("acp-source-filter-");
+    const ran = join(programs, "ran");
+    writeFileSync(join(programs, "filter.sh"), `touch '${ran}'\n${processFilter ? "exit 1" : "cat"}\n`);
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      candidateChange: (repo) => writeFiles(repo, { ".gitattributes": "gate/check.js filter=outside\n" }),
+    });
+    const repo = candidate.harness.repoPath;
+    gitSync(repo, ["config", `filter.outside.${processFilter ? "process" : "clean"}`, `sh '${join(programs, "filter.sh")}'`]);
+    if (processFilter) gitSync(repo, ["config", "filter.outside.required", "true"]);
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(repo, "gate", "check.js"), later, later);
+
+    const { verified, executed } = await verifyObservingGate(candidate);
+    expect(existsSync(ran), "a candidate-selected filter program ran while the source was read").toBe(false);
+    expect(executed).toEqual([GATE_ENTRY]);
+    expect(verified).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+  });
+
+  it("RF-S22 arm:validator #1082: a textconv program the candidate selects never runs while the candidate is frozen", async () => {
+    const programs = tempDir("acp-textconv-");
+    const ran = join(programs, "ran");
+    writeFileSync(join(programs, "textconv.sh"), `touch '${ran}'\ncat "$1"\n`);
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: (repo) => {
+        commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER })(repo);
+        gitSync(repo, ["config", "diff.outside.textconv", `sh '${join(programs, "textconv.sh")}'`]);
+      },
+      candidateChange: (repo) => writeFiles(repo, {
+        ".gitattributes": "src/app.js diff=outside\n",
+        "src/app.js": "module.exports = () => 1; // changed\n",
+      }),
+    });
+    // The freeze digested the patch between base and candidate, which touches the selected file.
+    expect(candidate.snapshot.repositories[0]!.touchedPaths).toContain("src/app.js");
+    const { executed } = await verifyObservingGate(candidate);
+    expect(existsSync(ran), "a candidate-selected textconv program ran while the candidate was read").toBe(false);
+    expect(executed).toEqual([GATE_ENTRY]);
+  });
+
+  it("RF-S22 arm:validator #1082: a populated submodule's own filter never runs while the source is read", async () => {
+    const programs = tempDir("acp-submodule-filter-");
+    const ran = join(programs, "ran");
+    writeFileSync(join(programs, "filter.sh"), `touch '${ran}'\ncat\n`);
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.js": GATE_ENTRY, "gate/decide.js": GATE_HELPER }),
+      // A nested repository the candidate commits as a gitlink, left populated in the source.
+      candidateChange: (repo) => {
+        gitSync(repo, ["init", "-q", "vendor/nested"]);
+        const nested = join(repo, "vendor", "nested");
+        writeFiles(nested, { "data.txt": "nested\n", ".gitattributes": "data.txt filter=inner\n" });
+        commitAll(nested, "nested");
+      },
+    });
+    const nested = join(candidate.harness.repoPath, "vendor", "nested");
+    gitSync(nested, ["config", "filter.inner.clean", `sh '${join(programs, "filter.sh")}'`]);
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(nested, "data.txt"), later, later);
+
+    const { verified, executed } = await verifyObservingGate(candidate);
+    expect(existsSync(ran), "a submodule's filter program ran while the source was read").toBe(false);
+    expect(executed).toEqual([GATE_ENTRY]);
+    expect(verified).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
   });
 
   it("RF-S22 arm:validator #1082: a gate that preparation writes differently from its pin is refused before it runs", async () => {

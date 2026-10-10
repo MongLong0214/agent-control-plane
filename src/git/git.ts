@@ -238,11 +238,62 @@ export const remoteUrl = async (cwd: string, remote = "origin"): Promise<string 
   return out.exitCode === 0 ? out.stdout.trim() : null;
 };
 
+/**
+ * Options that keep one git invocation from running a program the repository's configuration
+ * names, and from reading replaced objects (#1082 R1-01). Every git read that prepares or judges a
+ * candidate for verification takes them.
+ *
+ * - `--no-replace-objects`: the objects the candidate commit actually names. A replace ref changes
+ *   what a local read returns and nothing else.
+ * - Every filter driver the configuration declares (the repository's, and the operator's global
+ *   one, which is where git-lfs installs itself), emptied: `smudge`, `clean` and `process`, and
+ *   `required=false` so a declared-required driver does not fail the command instead. A candidate's
+ *   `.gitattributes` selects a driver by name, and `git status` runs its clean or process program
+ *   as the control-plane user, outside any sandbox -- measured, a clean filter that kept the source
+ *   looking clean started a writer that rewrote the gate after it had been checked. An emptied
+ *   driver is no driver, so git compares and writes raw bytes. The cost: in a repository that
+ *   uses LFS, a file whose stat information is stale is compared raw against its pointer and
+ *   reads as modified.
+ * - `core.fsmonitor=false`: the fsmonitor hook is a program the configuration names.
+ * - `core.hooksPath=/dev/null`: `git status` writes the index and so runs `post-index-change`.
+ *
+ * Status reads also pass `--ignore-submodules=dirty`: otherwise git runs `git status` inside every
+ * populated submodule with that repository's own configuration, which none of the above reaches.
+ */
+export const withoutRepositoryPrograms = async (cwd: string): Promise<string[]> => {
+  const listed = await git(cwd, ["config", "--name-only", "--get-regexp", "^filter\\."], { allowFailure: true });
+  const drivers = new Set(
+    listed.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((key) => key.startsWith("filter.") && key.lastIndexOf(".") > "filter.".length)
+      .map((key) => key.slice("filter.".length, key.lastIndexOf("."))),
+  );
+  return [
+    "--no-replace-objects",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=/dev/null",
+    ...[...drivers].flatMap((driver) => [
+      "-c", `filter.${driver}.smudge=`,
+      "-c", `filter.${driver}.clean=`,
+      "-c", `filter.${driver}.process=`,
+      "-c", `filter.${driver}.required=false`,
+    ]),
+  ];
+};
+
+/**
+ * Whether the checkout has no tracked change and no untracked, non-ignored file. Read under
+ * `withoutRepositoryPrograms`, so neither a candidate-selected filter nor a submodule's own
+ * configuration runs anything while it is asked: snapshot freshness asks it of a candidate's source.
+ * Dirt inside a populated submodule's own working tree is therefore not counted; a submodule whose
+ * checked-out commit differs from the recorded one still is.
+ */
 export const isClean = async (
   cwd: string,
   options: { timeoutMs?: number } = {},
 ): Promise<boolean> =>
-  (await git(cwd, ["status", "--porcelain"], {
+  (await git(cwd, [...(await withoutRepositoryPrograms(cwd)), "status", "--porcelain", "--ignore-submodules=dirty"], {
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   })).stdout.trim().length === 0;
 
@@ -257,6 +308,9 @@ export const diffDigest = async (cwd: string, base: string, head: string): Promi
     "diff",
     "--no-color",
     "--no-ext-diff",
+    // A `diff=<driver>` attribute the candidate commits selects a textconv program the
+    // repository's configuration names; the patch is the stored bytes, not a program's view.
+    "--no-textconv",
     "--full-index",
     "--binary",
     `${base}..${head}`,
@@ -265,7 +319,7 @@ export const diffDigest = async (cwd: string, base: string, head: string): Promi
 };
 
 export const diffText = async (cwd: string, base: string, head: string): Promise<string> =>
-  (await git(cwd, ["diff", "--no-color", "--no-ext-diff", "--full-index", `${base}..${head}`]))
+  (await git(cwd, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--full-index", `${base}..${head}`]))
     .stdout;
 
 export const changedPaths = async (
