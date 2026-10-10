@@ -3,12 +3,12 @@
     "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
     "docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md"
   ],
-  "measuredAt": "6c9fabdd1d003c46e239495378b9467e38bae468",
+  "measuredAt": "b0187e9d2d13cfebd40c056eb9c715dfa7316d04",
   "testRun": {
     "reporter": "vitest-json",
     "success": true,
-    "total": 4610,
-    "passed": 4598,
+    "total": 4611,
+    "passed": 4599,
     "failed": 0,
     "pending": 12
   },
@@ -1416,15 +1416,27 @@
       "external": [
         {
           "id": "RF-S03",
+          "revision": "f1380fd2e47c9c359c16ee8e1ce96a04d294d049",
+          "ciRun": "38026327764",
           "tests": [
             "tests/test_slice1_plan.py::test_standard_lean_revision_preserves_product_scope_and_required_artifacts",
+            "tests/test_slice1_plan.py::test_lean_accept_without_removals_preserves_the_plan",
             "tests/test_slice1_plan.py::test_lean_review_refuses_product_scope_and_required_artifact_removal",
-            "tests/test_slice1_plan.py::test_lean_decision_refuses_planning"
+            "tests/test_slice1_plan.py::test_lean_decision_refuses_planning",
+            "tests/test_slice1_plan.py::test_lean_review_refuses_unrequested_optional_and_contradictory_verdicts",
+            "tests/test_slice1_plan.py::test_lean_review_schema_requires_a_reason",
+            "tests/test_slice1_plan.py::test_lean_review_refuses_duplicate_removal_items",
+            "tests/test_slice1_plan.py::test_lean_review_cli_emits_applied_review_outside_strict_plan",
+            "tests/test_slice1_plan.py::test_a_verdict_that_does_not_account_for_every_requested_option_is_refused",
+            "tests/test_slice1_plan.py::test_the_plan_command_refuses_a_request_that_skipped_the_lean_review",
+            "tests/test_slice1_plan.py::test_simple_reaches_the_plan_without_a_lean_review",
+            "tests/test_slice1_plan.py::test_the_plan_command_refuses_a_verdict_that_blocks",
+            "tests/test_lean_review.py::test_the_generated_revision_cuts_what_nothing_consumes_and_keeps_scope",
+            "tests/test_lean_review.py::test_an_already_lean_spec_gets_a_pass_verdict_and_an_unchanged_plan",
+            "tests/test_lean_review.py::test_a_cut_into_scope_is_generated_as_a_ceo_decision_and_stops_the_plan",
+            "tests/test_lean_review.py::test_the_generator_refuses_a_verdict_the_plan_would_refuse"
           ],
-          "limit": "a lean verdict is applied when one is supplied; nothing requires or produces one, so an over-designed STANDARD request without a review compiles unchanged",
           "repository": "MongLong0214/repo-factory",
-          "revision": "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
-          "ciRun": "36937509727",
           "acpUnattendedRun": "NOT_SUPPORTED"
         }
       ]
@@ -1541,13 +1553,18 @@
       "external": [
         {
           "id": "RF-S08",
+          "revision": "41b61b0d1cab9c10fa92378bb5ff3b0904a7d897",
+          "ciRun": "38027660325",
           "tests": [
+            "tests/test_node_install_witness.py::test_the_fixture_dependency_is_the_source_beside_it_and_the_lock_pins_its_bytes",
+            "tests/test_node_install_witness.py::test_the_rendered_steps_install_the_pinned_dependency_and_run_it",
+            "tests/test_node_install_witness.py::test_a_failed_install_is_not_followed_by_steps_that_count_as_success",
+            "tests/test_node_install_witness.py::test_a_configured_runtime_list_with_an_unusable_entry_fails_instead_of_skipping",
+            "tests/test_node_install_witness.py::test_a_usable_runtime_list_runs_every_execution_witness_on_every_runtime",
             "tests/test_slice2_stack_ci.py::test_node_workflow_installs_dependencies_on_both_declared_runtimes"
           ],
-          "limit": "a static check of the rendered workflow, which installs nothing. The dated install record (Actions run 32256790243, 2026-08-19) survives only as residual JSON: the run answers 404, so it cannot be verified remotely. A local install witness is pending in repo-factory PR #56, not merged; its evidence is a local run, not a GitHub Actions pass",
+          "limit": "the install witness is a local, offline install from a file: tarball, not GitHub Actions setup-node. CI does not set RF_S08_NODE_BIN_DIRS, so it runs the witness on one runtime, Node 22 (the declared latest); the declared lower runtime, Node 20, is checked only in the rendered workflow. The 2026-08-19 run 32256790243 survives only as residual JSON: it answers 404 and cannot be verified remotely",
           "repository": "MongLong0214/repo-factory",
-          "revision": "309e2e6b47b0bc35db0147cb5fe5c132580653d7",
-          "ciRun": "36937509727",
           "acpUnattendedRun": "NOT_SUPPORTED"
         }
       ]
