@@ -2,8 +2,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { sha256 } from "../../src/core/digest.ts";
 import { manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
-import { Daemon } from "../../src/daemon/daemon.ts";
-import { Role, RunKind, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { RunKind, RunState } from "../../src/domain/types.ts";
 import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
 import type { ReviewPacket } from "../../src/review/blind-review.ts";
 import {
@@ -22,7 +21,7 @@ import {
   stricter,
   type DispatchedRun,
 } from "../helpers/contract-change.ts";
-import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import {
   applyPassingChange,
   bindWorker,
@@ -40,7 +39,7 @@ afterEach(() => vi.restoreAllMocks());
 /**
  * Issue #246 B2-a — a CONTRACT_CHANGE candidate and its blind review are bound to the manifest its
  * PLAN carries and to the base it changes, a PLAN replaced while it is judged leaves it stale, other
- * candidates are unchanged, and nothing here activates anything.
+ * candidates are unchanged. Activating the bound manifest is B2-b's (contract-change-activate.test.ts).
  *
  * PLANs go through the CTO MCP port's own `submitPlan` routing. The pipeline, the review gate and the
  * production gate are the production ones; the reviewer is the harness's scripted one. No PLAN,
@@ -420,46 +419,5 @@ describe("a CONTRACT_CHANGE candidate too large for one reviewer", () => {
     expect(review.content.coveredFiles).toContain(manifestKey(run.projectId, m1));
     expect(review.content.coveredFiles).toContain(`${registered.identity}:src/app.js`);
     expect(review.content.contractChange?.manifestDigest).toBe(manifestDigest(m1));
-  });
-});
-
-describe("standalone-deploy safety: nothing is activated, granted or completed differently", () => {
-  it("a reviewed, confirmed and finalized CONTRACT_CHANGE leaves the project's active manifest where it was", async () => {
-    const harness = makeHarness();
-    const { run, m1, registered } = await noRepositoryChange(harness, "cc-no-activation");
-    const projectBefore = harness.cp.projects.get(run.projectId)!.activeManifestDigest;
-    const outcome = await submit(harness, run);
-    expect(outcome.allowed && outcome.value.stage).toBe("COMPLETED_REVIEW");
-    const digest = harness.cp.runs.currentCandidate(run.runId)!;
-    await harness.cp.continuity.evaluate("confirm the contract change");
-    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
-    const confirmed = harness.cp.ceo.submitCeoDecision({
-      runId: run.runId,
-      decision: "CONFIRM",
-      candidateSnapshotDigest: digest,
-      ceoSessionId: ceo.sessionId,
-      rationale: "standalone-deploy safety witness",
-    });
-    expect(confirmed.allowed, JSON.stringify(confirmed)).toBe(true);
-    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-cc-no-activation-") });
-    expect((await daemon.start()).allowed).toBe(true);
-    await daemon.stop();
-    // The run completes exactly as a CONTRACT_CHANGE run completed before this slice ...
-    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.COMPLETED);
-    // ... and nothing moved: no activation, no grant, no stored proposed manifest, no drift.
-    expect(harness.cp.projects.get(run.projectId)!.activeManifestDigest).toBe(projectBefore);
-    expect(projectBefore).toBe(run.baseDigest);
-    expect(harness.cp.projects.manifest(manifestDigest(m1))).toBeNull();
-    // The only APPROVAL is the CTO's final approval of the packet; no activation grant exists.
-    const approvals = harness.cp.artifacts.list<Record<string, unknown>>(run.runId, "APPROVAL");
-    expect(approvals.map((approval) => approval.producedBy)).toEqual(["service"]);
-    expect(approvals.filter((approval) => approval.content["schema"] === "acp.manifest-activation-grant.v1")).toEqual([]);
-    expect(harness.cp.audit.byKind("PROJECT_MANIFEST_ACTIVATED")).toEqual([]);
-    expect(harness.cp.repositories.byId(registered.repositoryId)!.activeManifestDigest).toBe(run.baseDigest);
-    // A run dispatched after it still pins, and is verified against, the base.
-    const next = await dispatchRun(harness, run.projectId, RunKind.STANDARD_WORK, [
-      { repositoryId: registered.repositoryId, repositoryRole: "primary", baseBranch: "dev" },
-    ]);
-    expect(next.baseDigest).toBe(run.baseDigest);
   });
 });

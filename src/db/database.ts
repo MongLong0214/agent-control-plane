@@ -1475,6 +1475,14 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   BOOTSTRAP_APPLICATION_NO_REPLACE: ReasonCode.BOOTSTRAP_APPLICATION_RESERVED,
   BOOTSTRAP_APPLICATION_IMMUTABLE: ReasonCode.CONFLICT,
   BOOTSTRAP_APPLICATION_PHASE_INVALID: ReasonCode.CONFLICT,
+  // #246 B2-b — a manifest activation grant is one per run, fixed once written, consumed once; the
+  // project's pointer moves only with a consumed grant, and a CONTRACT_CHANGE completes only with its own.
+  MANIFEST_GRANT_NO_REPLACE: ReasonCode.CONFLICT,
+  PROJECT_NO_REPLACE: ReasonCode.CONFLICT,
+  MANIFEST_GRANT_IMMUTABLE: ReasonCode.CONFLICT,
+  MANIFEST_GRANT_CONSUMED: ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED,
+  MANIFEST_ACTIVATION_AUTHORITY_DENIED: ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_DENIED,
+  CONTRACT_CHANGE_NOT_ACTIVATED: ReasonCode.CONTRACT_CHANGE_NOT_ACTIVATED,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

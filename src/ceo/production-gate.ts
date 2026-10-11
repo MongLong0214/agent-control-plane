@@ -25,6 +25,7 @@ import type { ReviewPacket } from "../review/blind-review.ts";
 import type { RunEngine, CompletionAuthoritySet } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
+import type { CeoDecisionIngress, ManifestActivationGrants } from "../registry/manifest-activation-grants.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { ContinuityGate } from "../run/run-engine.ts";
@@ -152,7 +153,17 @@ export interface CeoDecisionInput {
   candidateSnapshotDigest: string;
   ceoSessionId: string;
   rationale: string;
+  /**
+   * #246 B2-b — the session the MCP door authenticated for this call and the key of the MCP mutation it
+   * runs under, passed through by the door and never taken from a tool argument. A CONTRACT_CHANGE
+   * CONFIRM requires it, in flight now and naming the live CEO session the decision names; an
+   * in-process caller has none and issues no grant.
+   */
+  ingress?: CeoDecisionIngress;
 }
+
+/** #246 B2-b — the grant authority a CONTRACT_CHANGE CONFIRM admits against and issues through. */
+export type ManifestGrantsPort = Pick<ManifestActivationGrants, "admitConfirm" | "issue" | "bindConsumer">;
 
 export class ProductionGate {
   #continuity: ContinuityGate | null = null;
@@ -161,6 +172,7 @@ export class ProductionGate {
   #bootstrapCompletionChain: BootstrapCompletionChainPort | null = null;
   #bootstrapActivation: BootstrapActivationFinalizer | null = null;
   #sourceReadLeases: SourceReadLeasePort | null = null;
+  #manifestGrants: ManifestGrantsPort | null = null;
 
   constructor(
     private readonly db: Db,
@@ -185,6 +197,7 @@ export class ProductionGate {
     bootstrapApplications?: BootstrapApplicationsPort;
     bootstrapCompletionChain?: BootstrapCompletionChainPort;
     sourceReadLeases?: SourceReadLeasePort;
+    manifestGrants?: ManifestGrantsPort;
   }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
@@ -192,6 +205,7 @@ export class ProductionGate {
     if (ports.bootstrapApplications) this.#bootstrapApplications = ports.bootstrapApplications;
     if (ports.bootstrapCompletionChain) this.#bootstrapCompletionChain = ports.bootstrapCompletionChain;
     if (ports.sourceReadLeases) this.#sourceReadLeases = ports.sourceReadLeases;
+    if (ports.manifestGrants) this.#manifestGrants = ports.manifestGrants;
   }
 
   /**
@@ -541,9 +555,12 @@ export class ProductionGate {
    * between packet and confirm, the confirm is void rather than approximately right.
    */
   submitCeoDecision(input: CeoDecisionInput): Decision<{ state: RunState }> {
+    const reentry = this.contractChangeConsumerReentry(input);
+    if (reentry) return reentry;
     const admitted = this.admitCeoDecision(input, "decide");
     if (!admitted.allowed) return admitted as Decision<{ state: RunState }>;
     const { isBootstrap } = admitted.value;
+    const isContractChange = this.runs.get(input.runId)?.kind === RunKind.CONTRACT_CHANGE;
 
     if (input.decision === "CONFIRM" && !isBootstrap) {
       const freshness = this.revalidateCandidateFreshness(input.runId, input.candidateSnapshotDigest);
@@ -613,6 +630,23 @@ export class ProductionGate {
         );
         if (!transition.allowed) return transition as Decision<{ state: RunState }>;
 
+        // #246 B2-b — a CONTRACT_CHANGE CONFIRM is where its one activation grant is issued, in this
+        // transaction and after CEO_APPROVED, so a refusal undoes the decision with it.
+        let grantDigest: string | null = null;
+        if (input.decision === "CONFIRM" && isContractChange) {
+          const grants = this.#manifestGrants;
+          const issued: Decision<{ grantDigest: string }> = grants
+            ? grants.issue({
+                runId: input.runId,
+                candidateSnapshotDigest: input.candidateSnapshotDigest,
+                ceoSessionId: input.ceoSessionId,
+                ...(input.ingress === undefined ? {} : { ingress: input.ingress }),
+              })
+            : deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "manifest activation grants are not configured", { runId: input.runId });
+          if (!issued.allowed) throw acpError(issued.reasonCode, issued.message, issued.evidence);
+          grantDigest = issued.value.grantDigest;
+        }
+
         // #246 C3 — the application that produced this activation is COMPLETED with the run, in
         // this transaction; a refusal here undoes the run's COMPLETED as well.
         if (input.decision === "CONFIRM" && isBootstrap) {
@@ -633,6 +667,8 @@ export class ProductionGate {
             decision: input.decision,
             candidateSnapshotDigest: input.candidateSnapshotDigest,
             rationale: input.rationale,
+            // Traceability only; the grant row is what activation reads, never this.
+            ...(grantDigest === null ? {} : { manifestActivationGrantDigest: grantDigest }),
           },
         });
         this.telemetry.record({
@@ -647,6 +683,54 @@ export class ProductionGate {
       if (isAcpError(error)) return deny(error.reasonCode, error.message, error.evidence);
       throw error;
     }
+  }
+
+  /**
+   * #246 B2-b, CEO ruling 2 — a CONFIRM of a CONTRACT_CHANGE already confirmed and finalizing does not
+   * decide again: it makes the calling live CEO session the consumer of the run's unconsumed grant, so
+   * a re-adopted CEO resumes consumption without a new approval. The same CEO-role checks a CONFIRM
+   * asks apply; null when the call is not such a re-entry.
+   */
+  private contractChangeConsumerReentry(input: CeoDecisionInput): Decision<{ state: RunState }> | null {
+    if (input.decision !== "CONFIRM") return null;
+    const run = this.runs.get(input.runId);
+    if (
+      run?.kind !== RunKind.CONTRACT_CHANGE ||
+      (run.state !== RunState.CEO_APPROVED && run.state !== RunState.MERGING && run.state !== RunState.POST_MERGE_VERIFYING)
+    ) {
+      return null;
+    }
+    const continuity = this.assertCompletionAllowed(input.runId);
+    if (!continuity.allowed) return continuity as Decision<{ state: RunState }>;
+    const holds = this.assertCurrentCeo(input.ceoSessionId);
+    if (!holds.allowed) return holds as Decision<{ state: RunState }>;
+    const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
+    if (!independence.allowed) return independence as Decision<{ state: RunState }>;
+    const grants = this.#manifestGrants;
+    if (!grants) {
+      return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "manifest activation grants are not configured", { runId: input.runId });
+    }
+    return this.db.txDecision(() => {
+      const bound = grants.bindConsumer({
+        runId: input.runId,
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+        ceoSessionId: input.ceoSessionId,
+        ...(input.ingress === undefined ? {} : { ingress: input.ingress }),
+      });
+      if (!bound.allowed) return bound as Decision<{ state: RunState }>;
+      this.audit.record({
+        kind: "MANIFEST_ACTIVATION_CONSUMER_BOUND",
+        runId: input.runId,
+        sessionId: input.ceoSessionId,
+        evidence: {
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+          grantId: bound.value.grantId,
+          consumer: bound.value.consumer,
+          rationale: input.rationale,
+        },
+      });
+      return allow(ReasonCode.OK, { state: run.state });
+    });
   }
 
   /**
@@ -739,6 +823,20 @@ export class ProductionGate {
     if (isBootstrap && input.decision === "FINAL_REVISE") {
       const frozen = this.#bootstrapApplications?.assertNotFrozen(input.runId, "FINAL_REVISE");
       if (frozen !== undefined && !frozen.allowed) return frozen as Decision<{ isBootstrap: boolean }>;
+    }
+
+    // #246 B2-b — a CONTRACT_CHANGE CONFIRM issues the run's activation grant, so it is admitted only
+    // while its base is still the active manifest (CEO ruling 1), no other CONTRACT_CHANGE of the
+    // project is confirmed and finalizing, and the candidate still binds its PLAN and its packet.
+    if (run.kind === RunKind.CONTRACT_CHANGE && input.decision === "CONFIRM") {
+      const grants = this.#manifestGrants;
+      const admissible = grants
+        ? grants.admitConfirm(input.runId, input.candidateSnapshotDigest, {
+            ceoSessionId: input.ceoSessionId,
+            ...(input.ingress === undefined ? {} : { ingress: input.ingress }),
+          })
+        : deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "manifest activation grants are not configured", { runId: input.runId });
+      if (!admissible.allowed) return admissible as Decision<{ isBootstrap: boolean }>;
     }
 
     // The packet records what the owner gate said when it was published, but a later

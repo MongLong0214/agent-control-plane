@@ -15,6 +15,7 @@ import { latestReceiptLookupError } from "../conversation/turn-coordinator.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { strandedBootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
+import { contractChangeRunsWithoutGrant } from "../registry/manifest-activation-grants.ts";
 import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
@@ -466,6 +467,7 @@ export class Doctor {
     if (scope === "system" || scope === "run") {
       findings.push(...this.checkRuns(target ?? null));
       findings.push(...this.checkStrandedBootstrapApplications(target ?? null));
+      findings.push(...this.checkContractChangeRunsWithoutGrant(target ?? null));
       findings.push(...this.checkWorkers());
     }
     if (scope === "system" || scope === "session") {
@@ -745,6 +747,25 @@ export class Doctor {
       recommendedAction: typeof application.lastRefusal?.["requiredRecovery"] === "string"
         ? (application.lastRefusal["requiredRecovery"] as string)
         : "a person establishes what the repository at the target is; the reservation is kept and never reused",
+    }));
+  }
+
+  /**
+   * #246 B2-b, CEO ruling 8 — a CONTRACT_CHANGE run the activation path cannot finish: confirmed before
+   * grants existed, or its PLAN carries no manifest. It is not moved onto the new path and nothing
+   * touches it; its run and artifacts are kept. Not blocking: only that run is stuck.
+   */
+  private checkContractChangeRunsWithoutGrant(runId: string | null): Finding[] {
+    return contractChangeRunsWithoutGrant(this.db, runId).map((run) => ({
+      code: "CONTRACT_CHANGE_RUN_WITHOUT_GRANT",
+      severity: "WARN",
+      scope: `run:${run.runId}`,
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: { projectId: run.projectId, state: run.state, cause: run.cause },
+      recommendedAction: run.cause === "CONFIRMED_WITHOUT_GRANT"
+        ? "this run was confirmed without an activation grant and cannot complete; the CTO cancels it and creates a new CONTRACT_CHANGE run whose PLAN carries the manifest, and its artifacts are kept"
+        : "this run's PLAN carries no manifest, so it can never be confirmed; the CTO submits a PLAN carrying the manifest or cancels and re-creates the run, and its artifacts are kept",
     }));
   }
 

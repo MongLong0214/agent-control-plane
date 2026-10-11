@@ -3110,6 +3110,48 @@ export class GitHubKernel {
    * present, then read the same immutable file from GitHub at the merge SHA rather than
    * mistaking an absent local object for a different workflow.
    */
+  /**
+   * #246 B2-b — the sha256 of one file's exact bytes at an exact revision of a registered repository:
+   * the merge commit a finalization verified, or, given a branch, the commit that branch names now,
+   * resolved first so the bytes and the revision are one answer. Read the way post-merge provenance
+   * reads a workflow (the local object if present, else GitHub at that SHA). Read-only; the caller
+   * decides what a mismatch means.
+   */
+  async workflowDigestAt(
+    repositoryIdentity: string,
+    at: { sha: string } | { branch: string },
+    path: string,
+  ): Promise<Decision<{ revision: string; workflowDigest: string }>> {
+    const slug = this.slug(repositoryIdentity);
+    if (!slug.allowed) return slug as Decision<{ revision: string; workflowDigest: string }>;
+    const { owner, repo } = slug.value;
+    let revision: string;
+    if ("sha" in at) {
+      revision = at.sha;
+    } else {
+      try {
+        const ref = await this.api().request<{ object?: { sha?: string } }>(
+          "GET",
+          `/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(at.branch)}`,
+        );
+        const sha = ref?.object?.sha;
+        if (typeof sha !== "string" || sha.trim() === "") {
+          return deny(ReasonCode.PROBE_FAILED, "GitHub returned no commit for the branch", { repositoryIdentity, branch: at.branch });
+        }
+        revision = sha;
+      } catch (error) {
+        return deny(ReasonCode.PROBE_FAILED, "could not resolve the branch to an exact commit", {
+          repositoryIdentity,
+          branch: at.branch,
+          ...transportOutcome(error),
+        });
+      }
+    }
+    const content = await this.workflowContentAtExactHead(repositoryIdentity, owner, repo, revision, path);
+    if (!content.allowed) return content as Decision<{ revision: string; workflowDigest: string }>;
+    return allow(ReasonCode.OK, { revision, workflowDigest: sha256(content.value) });
+  }
+
   private async workflowContentAtExactHead(
     repositoryIdentity: string,
     owner: string,
