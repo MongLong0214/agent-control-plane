@@ -495,7 +495,7 @@ const workerFailover = async (
   harness: Harness,
   run: ActiveRun,
   duringAdmission: () => Promise<void> = async () => undefined,
-  duringReadiness: () => Promise<void> = async () => undefined,
+  duringReadiness: (sessionId: string) => Promise<void> = async () => undefined,
 ) => {
   const roleKey = roleKeyFor(Role.WORKER, { taskId: run.taskIds[0]! });
   const plan = await harness.cp.continuity.evaluate("worker replacement planned while the turn ran");
@@ -510,8 +510,8 @@ const workerFailover = async (
   harness.cp.continuity.attach({
     buzz: { connect: async () => allow(ReasonCode.OK, "test-route") },
     readiness: {
-      checkSession: async () => {
-        await duringReadiness();
+      checkSession: async (sessionId: string) => {
+        await duringReadiness(sessionId);
         return allow(ReasonCode.OK, undefined);
       },
     },
@@ -770,13 +770,14 @@ describe("review round 1: retirement is retried by the watchdog (wr-r1-01)", () 
  * cancel commits after the failover's last read of the run and before the binding transaction, so it
  * is the registry's own fence that refuses.
  */
-const cancelAtTheSwitch = (harness: Harness, run: ActiveRun) => {
+const cancelAtTheSwitch = (harness: Harness, run: ActiveRun, alsoBefore: (sessionId: string) => void = () => undefined) => {
   const realSwitch = harness.cp.bindings.switchTo.bind(harness.cp.bindings);
   const reached = { count: 0 };
   const spy = vi.spyOn(harness.cp.bindings, "switchTo").mockImplementation((input) => {
     if (input.role === Role.WORKER) {
       reached.count += 1;
       expect(harness.cp.runs.cancel(run.runId, "cancel commits just before the binding transaction").allowed).toBe(true);
+      alsoBefore(input.sessionId);
     }
     return realSwitch(input);
   });
@@ -867,6 +868,146 @@ describe("review round 2: a registry refusal stops the failover's session throug
       await killChild(child);
     }
   });
+});
+
+type CleanupBoundary = "post-provision" | "terminal-switch" | "worker-retirement";
+
+/**
+ * A cleanup of a worker session at `boundary` — continuity's post-provision run check, the registry's
+ * refusal of the failover's switch, or worker retirement after a cancel — racing an ordinary
+ * `BindingRegistry.bind` of that same session to a task of another, live run, with that task's own
+ * scope. The provider stop is held behind a barrier.
+ *
+ * `bind-first` binds the session before the cleanup reaches it; `reservation-first` binds while the
+ * stop is held. `stopFails` makes the held stop throw once released.
+ */
+const cleanupRace = async (boundary: CleanupBoundary, order: "bind-first" | "reservation-first", stopFails = false) => {
+  const harness = gatedHarness();
+  let run: ActiveRun;
+  let claude: ClaudeWorkerDouble;
+  if (boundary === "worker-retirement") {
+    run = await activeRun(harness);
+    claude = new ClaudeWorkerDouble(harness.clock);
+    harness.cp.providers.registerForRole(claude, Role.WORKER);
+    const staffed = await staffing(harness, claude).provision(provisionRequest(run, run.taskIds[0]!));
+    if (!staffed.allowed) throw new Error(`${staffed.reasonCode}: ${staffed.message}`);
+  } else {
+    ({ run, claude } = await runningWorker(harness));
+  }
+  const live = await activeRun(harness, ["new-holder"], run);
+  const liveKey = roleKeyFor(Role.WORKER, { taskId: live.taskIds[0]! });
+  const adopt = (sessionId: string) => harness.cp.bindings.bind({
+    role: Role.WORKER,
+    sessionId,
+    taskId: live.taskIds[0]!,
+    runId: live.runId,
+    projectId: live.projectId,
+  });
+
+  const realStop = claude.stopSession.bind(claude);
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  let entered!: () => void;
+  const stopping = new Promise<void>((resolve) => { entered = resolve; });
+  const stop = vi.spyOn(claude, "stopSession").mockImplementation(async (handle) => {
+    entered();
+    await barrier;
+    if (stopFails) throw new Error("the provider would not stop the session");
+    return realStop(handle);
+  });
+
+  let target: string | null = null;
+  let early: ReturnType<typeof adopt> | null = null;
+  const adoptFirst = (sessionId: string): void => {
+    if (order !== "bind-first") return;
+    target = sessionId;
+    early = adopt(sessionId);
+  };
+  const boundaryHook = boundary === "terminal-switch" ? cancelAtTheSwitch(harness, run, adoptFirst) : null;
+  let pending: Promise<unknown>;
+  if (boundary === "worker-retirement") {
+    target = harness.cp.db.get<{ session_id: string }>(
+      `SELECT session_id FROM assignments WHERE role_key = ?`,
+      [roleKeyFor(Role.WORKER, { taskId: run.taskIds[0]! })],
+    )!.session_id;
+    expect(harness.cp.runs.cancel(run.runId, "retirement cleanup begins").allowed).toBe(true);
+    adoptFirst(target);
+    pending = harness.cp.workerRetirement.settled();
+  } else {
+    pending = workerFailover(harness, run, async () => undefined, async (sessionId) => {
+      if (boundary !== "post-provision") return;
+      expect(harness.cp.runs.cancel(run.runId, "cancelled during the replacement's readiness").allowed).toBe(true);
+      adoptFirst(sessionId);
+    });
+  }
+
+  let during: ReturnType<typeof adopt> | null = null;
+  let stopCalls = 0;
+  try {
+    if (order === "reservation-first") {
+      await stopping;
+      const held = claudeSessions(harness).filter((session) => session.lifecycle !== SessionLifecycle.STOPPED);
+      target = boundary === "worker-retirement" ? target : held.map((session) => session.session_id).at(-1) ?? null;
+      during = adopt(target!);
+    }
+    release();
+    await pending;
+    await harness.cp.workerRetirement.settled();
+  } finally {
+    release();
+    await pending;
+    stopCalls = stop.mock.calls.length;
+    boundaryHook?.restore();
+    stop.mockRestore();
+  }
+  return {
+    harness,
+    claude,
+    stopCalls,
+    early,
+    during,
+    session: harness.cp.sessions.require(target!),
+    holder: harness.cp.bindings.active(liveKey),
+  };
+};
+
+describe("cleanup reserves a worker session before it stops it (ROUND1-ESCAPE-03)", () => {
+  for (const boundary of ["post-provision", "terminal-switch", "worker-retirement"] as const) {
+    it(`${boundary}: reservation first — a bind while the stop is awaited is refused, and the session is STOPPED after the stop`, async () => {
+      const raced = await cleanupRace(boundary, "reservation-first");
+
+      expect(raced.during).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+      expect(raced.holder).toBeNull();
+      expect(raced.stopCalls).toBe(1);
+      expect(raced.session.lifecycle).toBe(SessionLifecycle.STOPPED);
+    });
+
+    it(`${boundary}: bind first — the cleanup backs off with no stop and leaves the new holder's session READY`, async () => {
+      const raced = await cleanupRace(boundary, "bind-first");
+
+      expect(raced.early).toMatchObject({ allowed: true });
+      expect(raced.stopCalls).toBe(0);
+      expect(raced.holder?.sessionId).toBe(raced.session.sessionId);
+      expect(raced.session.lifecycle).toBe(SessionLifecycle.READY);
+    });
+
+    it(`${boundary}: reservation first, the stop fails — the bind is refused and the session is neither READY nor STOPPED`, async () => {
+      const raced = await cleanupRace(boundary, "reservation-first", true);
+
+      expect(raced.during).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+      expect(raced.holder).toBeNull();
+      expect(raced.stopCalls).toBe(1);
+      expect(raced.session.lifecycle).toBe(SessionLifecycle.ERROR);
+      const failures = boundary === "worker-retirement"
+        ? raced.harness.cp.audit.byKind("WORKER_SESSION_STOP_FAILED")
+        : raced.harness.cp.audit.byKind("CONTINUITY_UNBOUND_SESSION_STOP_FAILED");
+      const failure = failures.filter((entry) => entry.sessionId === raced.session.sessionId);
+      expect(failure).toHaveLength(1);
+      if (boundary === "worker-retirement") {
+        expect(failure[0]!.evidence).toMatchObject({ status: "PROCESS_UNVERIFIED" });
+      }
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------------------------
