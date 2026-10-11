@@ -253,8 +253,45 @@ export const ReasonCode = {
   BUZZ_MENTION_NOT_RESOLVED: "BUZZ_MENTION_NOT_RESOLVED",
 
   // --- registries ----------------------------------------------------------
-  MANIFEST_ACTIVATION_EVIDENCE_MISSING: "MANIFEST_ACTIVATION_EVIDENCE_MISSING",
   MANIFEST_ACTIVATION_GRANT_CONSUMED: "MANIFEST_ACTIVATION_GRANT_CONSUMED",
+  /**
+   * #246 B2-b — a CONTRACT_CHANGE run has no activation grant: its CEO CONFIRM never issued one. A
+   * run that reached a finalization state any other way merges and completes nothing.
+   */
+  MANIFEST_ACTIVATION_GRANT_MISSING: "MANIFEST_ACTIVATION_GRANT_MISSING",
+  /**
+   * #246 B2-b — what a grant names no longer holds: the candidate, its PLAN, the manifest that PLAN
+   * carries, the published packet, or the base the activation compares-and-sets from.
+   */
+  MANIFEST_ACTIVATION_TARGET_STALE: "MANIFEST_ACTIVATION_TARGET_STALE",
+  /**
+   * #246 B2-b — the CEO authority a grant records is not the live CEO binding: the role is held by
+   * another actor, by nobody, or by a session that is not live, or the confirming call's
+   * authenticated session is not the one it names.
+   */
+  MANIFEST_ACTIVATION_AUTHORITY_STALE: "MANIFEST_ACTIVATION_AUTHORITY_STALE",
+  /** #246 B2-b — a project's active manifest moved by anything but a consumed grant (v44 guard). */
+  MANIFEST_ACTIVATION_AUTHORITY_DENIED: "MANIFEST_ACTIVATION_AUTHORITY_DENIED",
+  /**
+   * #246 B2-b — a workflow the manifest points to does not carry its approved bytes at the exact
+   * repository and revision activation reads, or cannot be read there. Nothing is activated.
+   */
+  MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED: "MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED",
+  /**
+   * #246 B2-b — activation was refused after a merge. The run ends BLOCKED_POST_MERGE naming this,
+   * the active manifest does not move, and the recovery is a new CONTRACT_CHANGE run with no
+   * repositories carrying the manifest.
+   */
+  MANIFEST_ACTIVATION_REFUSED: "MANIFEST_ACTIVATION_REFUSED",
+  /**
+   * #246 B2-b — a CONTRACT_CHANGE whose base (its dispatch pin) is no longer the project's active
+   * manifest: it would replace a contract it was not judged against.
+   */
+  MANIFEST_PIN_SUPERSEDED: "MANIFEST_PIN_SUPERSEDED",
+  /** #246 B2-b — another CONTRACT_CHANGE of the project is already confirmed and finalizing. */
+  CONTRACT_CHANGE_FINALIZATION_OVERLAP: "CONTRACT_CHANGE_FINALIZATION_OVERLAP",
+  /** #246 B2-b — a CONTRACT_CHANGE run completes only in the transaction that activates its grant. */
+  CONTRACT_CHANGE_NOT_ACTIVATED: "CONTRACT_CHANGE_NOT_ACTIVATED",
   REPOSITORY_CHECKOUT_ALREADY_REGISTERED: "REPOSITORY_CHECKOUT_ALREADY_REGISTERED",
   REPOSITORY_BINDING_CHANGE_REQUIRES_ACTIVATION:
     "REPOSITORY_BINDING_CHANGE_REQUIRES_ACTIVATION",
@@ -534,6 +571,36 @@ export const ReasonCode = {
    * again gives the same answer. Not a staleness code, because nothing re-derived would admit it.
    */
   BUZZ_MENTION_PRECEDES_BINDING: "BUZZ_MENTION_PRECEDES_BINDING",
+
+  // --- #246 owner approval of a bootstrap's GitHub writes by a Buzz reply ----
+  /**
+   * An envelope whose text carries the owner-approval marker, in any spelling, reached the message
+   * seam. Approval replies are judged only by their Nostr signature, on the subscriber's approval
+   * route; the seam's relay-attested envelopes can neither approve nor be delivered as work.
+   */
+  BUZZ_OWNER_APPROVAL_NOT_A_MESSAGE: "BUZZ_OWNER_APPROVAL_NOT_A_MESSAGE",
+  /** The approval event's verified signer is not a declared `buzz` owner key. Nothing is written. */
+  BUZZ_APPROVAL_NOT_OWNER: "BUZZ_APPROVAL_NOT_OWNER",
+  /** The event carries the approval marker but not exactly one well-formed token and nothing else like it. */
+  BUZZ_APPROVAL_MALFORMED: "BUZZ_APPROVAL_MALFORMED",
+  /** No single reply reference names a stored approval prompt. */
+  BUZZ_APPROVAL_PROMPT_UNRESOLVED: "BUZZ_APPROVAL_PROMPT_UNRESOLVED",
+  /** The reply's room, or the identity that received it, is not the prompt's. */
+  BUZZ_APPROVAL_PROMPT_WRONG_ROOM: "BUZZ_APPROVAL_PROMPT_WRONG_ROOM",
+  /** The token's code is not the code of the prompt the reply references. */
+  BUZZ_APPROVAL_PROMPT_CODE_MISMATCH: "BUZZ_APPROVAL_PROMPT_CODE_MISMATCH",
+  /** The prompt was cancelled: its run left review, its scope changed, or it was re-issued. */
+  BUZZ_APPROVAL_PROMPT_CANCELLED: "BUZZ_APPROVAL_PROMPT_CANCELLED",
+  /** The prompt already holds a different answer; a prompt is answered once. */
+  BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED: "BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED",
+  /** The prompt's server-stored expiry has passed, or the reply was signed before the prompt existed. */
+  BUZZ_APPROVAL_PROMPT_EXPIRED: "BUZZ_APPROVAL_PROMPT_EXPIRED",
+  /** The run's current approval scope is no longer the one the prompt binds; the evidence names the field. */
+  BUZZ_APPROVAL_PROMPT_STALE: "BUZZ_APPROVAL_PROMPT_STALE",
+  /** The run is not awaiting an owner decision on this scope, so nothing is minted. */
+  BUZZ_APPROVAL_RUN_NOT_AWAITING_APPROVAL: "BUZZ_APPROVAL_RUN_NOT_AWAITING_APPROVAL",
+  /** No prompt can be posted now: the approval identity is unset, not admitted, not held or not connected. */
+  BUZZ_APPROVAL_IDENTITY_UNAVAILABLE: "BUZZ_APPROVAL_IDENTITY_UNAVAILABLE",
 
   // --- canonical turns -----------------------------------------------------
   /**
@@ -942,6 +1009,7 @@ export const isReasonCode = (value: string): value is ReasonCode => ALL.has(valu
  */
 export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.BINDING_GENERATION_STALE,
+  ReasonCode.BUZZ_APPROVAL_PROMPT_STALE,
   ReasonCode.BUZZ_PEER_GENERATION_STALE,
   ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
   ReasonCode.CAPACITY_SENSOR_FILE_STALE,
@@ -950,6 +1018,11 @@ export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.DOCTOR_HEALTH_STALE,
   ReasonCode.EVIDENCE_STALE,
   ReasonCode.FINALIZATION_ATTEMPT_STALE,
+  // #246 B2-b — a CONTRACT_CHANGE grant compared with what is current now: its candidate, PLAN, review
+  // or packet was replaced, or the CEO binding or the grant's consumer moved on. Re-derived by a new
+  // CONFIRM or a current CEO's re-entry, never repaired.
+  ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_STALE,
+  ReasonCode.MANIFEST_ACTIVATION_TARGET_STALE,
   ReasonCode.MERGE_BASE_STALE,
   ReasonCode.MERGE_HEAD_STALE,
   ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
