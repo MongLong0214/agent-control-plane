@@ -1001,7 +1001,11 @@ describe("cleanup reserves a worker session before it stops it (ROUND1-ESCAPE-03
       const failures = boundary === "worker-retirement"
         ? raced.harness.cp.audit.byKind("WORKER_SESSION_STOP_FAILED")
         : raced.harness.cp.audit.byKind("CONTINUITY_UNBOUND_SESSION_STOP_FAILED");
-      expect(failures.filter((entry) => entry.sessionId === raced.session.sessionId)).toHaveLength(1);
+      const failure = failures.filter((entry) => entry.sessionId === raced.session.sessionId);
+      expect(failure).toHaveLength(1);
+      if (boundary === "worker-retirement") {
+        expect(failure[0]!.evidence).toMatchObject({ status: "PROCESS_UNVERIFIED" });
+      }
     });
   }
 });

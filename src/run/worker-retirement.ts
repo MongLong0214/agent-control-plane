@@ -327,7 +327,7 @@ export class WorkerRetirement {
         kind: WORKER_SESSION_STOP_FAILED,
         reasonCode: ReasonCode.SESSION_STOP_FAILED,
         sessionId,
-        evidence: { reason, error: error instanceof Error ? error.message : String(error) },
+        evidence: { reason, status: "PROCESS_UNVERIFIED", error: error instanceof Error ? error.message : String(error) },
       });
       report.stopFailed.push(sessionId);
       return;
