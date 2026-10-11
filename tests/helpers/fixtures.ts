@@ -133,6 +133,7 @@ export const makeRepo = (
   } catch (error) {
     throw named(`git init -b ${baseBranch} ${dir}`, error);
   }
+  gitSync(dir, ["config", "--local", "maintenance.auto", "false"]);
   writeFiles(dir, files);
   gitSync(dir, ["add", "-A"]);
   gitSync(dir, ["commit", "-q", "-m", "base"]);
