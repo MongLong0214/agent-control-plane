@@ -1,0 +1,29 @@
+Limit: the evidence lives in four inbound_messages pseudo-channels (issue, prompt, answer, refusal) with no schema change; their payload_json is write-once and only ACP's own connection can insert them
+Limit: a reply's window is the prompt's server-stored expiresAt (about 24 hours), asked at receipt, at issuance and at consumption; the owner's signed created_at only bounds it from below
+Ruled-out: keeping the signed outcome reply in the answer row's result_json | any writer of that column can rewrite it, so the event is signed before the transaction and kept in the write-once payload instead
+Warn: a buzz receipt is accepted only for repo_factory_github_write and only while verifyBuzzApprovalEvidence holds; owner_decision_submit, repair and OwnerAuthority keep their own channel rules
+Unverified: the CEO re-issue (O2) is reachable in-process only; no CEO tool calls BuzzOwnerApprovals.reissue yet
+Record-Id: r-oabuzzcore
+Provenance: inherited 4ebd4127a82fc0e1648a5909651042b67920af04
+
+Ruled-out: receiving an approval reply only through the mention subscription's #p filter | an owner's client need not tag the prompt's author, so replies are asked for by the open prompts' exact event ids instead (CEO 1791605708)
+Warn: the approval reply subscription moves no window and delivers nothing: the mention REQ, its cursor and its admission are untouched, and matching its filter authenticates nothing
+Warn: R1056-01 is widened to exactly two store-issued approval publications, a prompt and an outcome, whose tags and text the publisher derives from the publication's basis; a new message kind needs a new basis and its own review
+Record-Id: r-oabuzzreplies
+Follows: r-oabuzzcore
+Provenance: inherited 583eb6d65d4fd24e85e1661050eb2c517aa815b6
+
+Limit: a forged relay envelope carrying the marker is refused for its text, so no audit row records the forgery
+Ruled-out: refusing owner-approval marker text after IngressGuard.admit | the admission would spend the replay slot and keep a row holding the text; the refusal runs ahead of the guard instead, with nothing written, as the peer rule does
+Warn: the sink routes any marker-carrying event to the approval store first, ahead of the binding marker and the seam, whoever signed it; a store that is not wired refuses it outright
+Warn: the prompt and cancellation tick rides main()'s 30-second health tick and the subscriber's authentication callback; the health tick runs only when no waitForShutdown hook is given
+Record-Id: r-oabuzzdaemon
+Follows: r-oabuzzreplies
+Provenance: inherited 72b51721199017ff86eb19f289df6ec7e521a74c
+
+Warn: WITNESSES.md W6's row that a reply signed inside the window and delivered after it is minted is inverted by O3: it is refused BUZZ_APPROVAL_PROMPT_EXPIRED, judged on the stored expiry
+Unverified: no live relay, daemon, Keychain or GitHub was run; the witnesses drive the daemon's composition over a real control plane with the in-process storing relay, real nostr-tools keys and the bare-repository GitHub double
+Unverified: V1 (what the owner's client writes in a reply), V2 (the owner's membership of X's room) and V3 (X admitted on a deployed daemon) were not checked against the live relay or daemon
+Record-Id: r-oabuzzwitness
+Follows: r-oabuzzdaemon
+Provenance: inherited a545a590315978638b4c1693b3286c60e4ae9983
