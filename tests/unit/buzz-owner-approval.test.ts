@@ -895,6 +895,25 @@ describe("W8: duplicate approval", () => {
     }
   });
 
+  it("refuses a different duplicate event after the approved prompt's scope changes", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      await w.send(w.reply({ prompt }));
+      const changed = { ...w.prepared.manifest, repositories: [{ role: "primary" as const, remote: "github:acme/changed", manifestRoot: "." }] };
+      await replanBootstrap(
+        w.prepared.harness,
+        w.prepared.runId,
+        { planDigest: w.prepared.planDigest, snapshotDigest: w.prepared.snapshotDigest, ceoSessionId: w.prepared.ceoSessionId },
+        bootstrapPlan(changed, { operations: bootstrapOperations(APPROVED_PROTECTION, "github:acme/changed") as Operation[] }),
+      );
+      const duplicate = w.reply({ prompt, createdAt: secondsOf(w.prepared.harness.cp.clock.now().getTime()) + 1 });
+      expect(receiveDirect(w, duplicate)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BUZZ_APPROVAL_PROMPT_STALE });
+      expect(w.counts()).toMatchObject({ answers: 1, receipts: 1, artifacts: 1, consumptions: 0, githubCalls: 0 });
+    } finally {
+      await w.close();
+    }
+  });
+
   it("reuses the receipt during an anchored execution: no APPROVAL_SUPERSEDED, no new write", async () => {
     const { w } = await promptedWorld();
     try {
@@ -1182,6 +1201,19 @@ describe("W13: the prompt is public-safe", () => {
       await w.close();
     }
   });
+
+  it("omits a permitted free-text project ID from the public prompt", async () => {
+    const privateProjectId = "/private/tmp/t3-private-owner-material";
+    const { w, prompt } = await promptedWorld({ projectId: privateProjectId });
+    try {
+      expect(prompt.content).not.toContain(privateProjectId);
+      const scope = w.prepared.runner.approvalScopeOf(w.prepared.runId);
+      expect(scope.allowed).toBe(true);
+      if (scope.allowed) expect(scope.value.approvedManifest.projectId).toBe(privateProjectId);
+    } finally {
+      await w.close();
+    }
+  });
 });
 
 describe("O2: the current CEO may ask for a prompt to be re-issued, and nothing else", () => {
@@ -1235,6 +1267,17 @@ describe("O2: the current CEO may ask for a prompt to be re-issued, and nothing 
 });
 
 describe("O1 and O4: who posts, what is signed, and what health says", () => {
+  it("posts nothing when the configured signer is another admitted project's CTO", async () => {
+    const w = await startWorld({ withY: true, identity: (keys) => keys.y.pubkey });
+    try {
+      await w.tick();
+      expect(w.counts().prompts).toBe(0);
+      expect(w.approvals!.health().unavailable).toBe("REPO_FACTORY_AUTHORITY_MISMATCH");
+    } finally {
+      await w.close();
+    }
+  });
+
   it("posts nothing while X is not admitted, and health names why", async () => {
     const w = await startWorld();
     try {

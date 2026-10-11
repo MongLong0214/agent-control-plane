@@ -269,7 +269,6 @@ export const buzzOwnerApprovalPromptText = (binding: BuzzOwnerApprovalBinding, c
     `repository: ${binding.repositoryIdentity}`,
     `visibility: ${binding.visibility}`,
     `github owner: ${binding.owner}`,
-    `project: ${binding.projectName}`,
     `plan: ${binding.planDigest}`,
     `operations: ${binding.operationsDigest} (${binding.operations.length})`,
     ...binding.operations.map(operationLine),
@@ -723,6 +722,8 @@ export interface BuzzOwnerApprovalPorts {
   readonly ownerActors: readonly string[];
   /** The approval identity X's x-only key, or null when none is configured. */
   readonly identity: string | null;
+  /** The repo-factory CTO's current canonical signing identity and room, or why it is unavailable. */
+  readonly repoFactoryAuthority: () => { readonly signer: string; readonly room: string } | { readonly excluded: string };
   /** The approval identity was configured, and is not a usable key. */
   readonly identityInvalid?: boolean;
   /** The deployment's Buzz replay window, so the receipt's admission prunes nothing earlier than its own guard would. */
@@ -919,6 +920,28 @@ export class BuzzOwnerApprovals {
             channel: "buzz",
             promptEventId,
             expiresAt: prompt.expiresAt,
+          }));
+        }
+        const scope = this.#ports.runner.approvalScopeOf(prompt.binding.runId);
+        const stale = scope.allowed ? buzzOwnerApprovalStaleField(prompt.binding, scope.value) : "planDigest";
+        if (!scope.allowed || stale !== null) {
+          return this.#ownerRefusal(event, promptEventId, deny(ReasonCode.BUZZ_APPROVAL_PROMPT_STALE, "the run's current scope is not the one the prompt binds", {
+            channel: "buzz",
+            promptEventId,
+            field: stale,
+          }));
+        }
+        const need = this.#ports.runner.ownerApprovalNeed(prompt.binding.runId, scope.value);
+        const valid = verifyBuzzApprovalEvidence(db, answer.receipt, { nowMs: this.#ports.clock.now().getTime() });
+        if (
+          (need.need !== "SATISFIED" && need.need !== "EXECUTION_ANCHORED") ||
+          need.receipt === null ||
+          digestOf(need.receipt) !== digestOf(answer.receipt) ||
+          !valid.allowed
+        ) {
+          return this.#ownerRefusal(event, promptEventId, deny(ReasonCode.BUZZ_APPROVAL_PROMPT_STALE, "the recorded receipt is not valid for the run's current scope", {
+            channel: "buzz",
+            promptEventId,
           }));
         }
         this.#reused += 1;
@@ -1197,6 +1220,9 @@ export class BuzzOwnerApprovals {
     if (rooms === null) return unavailable("IDENTITY_NOT_HELD");
     const admitted = identityPort.admitted(signer);
     if ("excluded" in admitted) return unavailable(`IDENTITY_NOT_ADMITTED:${admitted.excluded}`);
+    const canonical = this.#ports.repoFactoryAuthority();
+    if ("excluded" in canonical) return unavailable(`REPO_FACTORY_AUTHORITY_UNAVAILABLE:${canonical.excluded}`);
+    if (canonical.signer !== signer || canonical.room !== admitted.room) return unavailable("REPO_FACTORY_AUTHORITY_MISMATCH");
     if (!rooms.includes(admitted.room)) return unavailable("ROOM_NOT_SUBSCRIBED");
     if (!publisher.ready(signer)) return unavailable("IDENTITY_NOT_CONNECTED");
     this.#unavailable = null;

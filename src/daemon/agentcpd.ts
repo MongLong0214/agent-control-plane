@@ -1954,6 +1954,15 @@ export const createDaemonBuzzOwnerApprovals = (
     runs: cp.runs,
     ownerActors: options.ownerActors,
     identity: identity === "INVALID" ? null : identity,
+    repoFactoryAuthority: () => {
+      const binding = cp.bindings.activePrimaryCto("repo-factory");
+      if (binding === null) return { excluded: "NO_ACTIVE_REPO_FACTORY_CTO" };
+      const session = cp.sessions.get(binding.sessionId);
+      if (session === null || session.buzzActorId === null || session.buzzAddress === null) {
+        return { excluded: "REPO_FACTORY_CTO_HAS_NO_BUZZ_IDENTITY" };
+      }
+      return { signer: session.buzzActorId, room: session.buzzAddress };
+    },
     identityInvalid: identity === "INVALID",
     ingressPolicy:
       options.policy === null
