@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -207,6 +207,26 @@ describe("a self-contained verification checkout (#246 C2v)", () => {
 
     await manager.destroy(repository, own.path, authorizationFor(manager, repository, "own"));
     await manager.destroy(repository, linked.path, authorizationFor(manager, repository, "linked"));
+  });
+
+  it("RF-S22 arm:validator #1082: reading the source for either checkout runs no filter program the candidate selects", async () => {
+    const programs = tempDir("acp-checkout-filter-");
+    const ran = join(programs, "ran");
+    writeFileSync(join(programs, "filter.sh"), `touch '${ran}'\ncat\n`);
+    const repository = makeRepo({ "README.md": "# fixture\n", ".gitattributes": "README.md filter=outside\n" });
+    gitSync(repository, ["config", "filter.outside.clean", `sh '${join(programs, "filter.sh")}'`]);
+    gitSync(repository, ["config", "filter.outside.smudge", `sh '${join(programs, "filter.sh")}'`]);
+    // Stale stat information, so a status read has to read the file's content.
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(repository, "README.md"), later, later);
+    const head = gitSync(repository, ["rev-parse", "HEAD"]);
+    const manager = new WorktreeManager(tempDir("acp-own-checkout-"));
+
+    const own = await manager.create(repository, head, "filtered-own", authorizationFor(manager, repository, "filtered-own"), { selfContained: true });
+    const linked = await manager.create(repository, head, "filtered-linked", authorizationFor(manager, repository, "filtered-linked"));
+    expect(existsSync(ran), "a candidate-selected filter program ran while a verification checkout was prepared").toBe(false);
+    await manager.destroy(repository, own.path, authorizationFor(manager, repository, "filtered-own"));
+    await manager.destroy(repository, linked.path, authorizationFor(manager, repository, "filtered-linked"));
   });
 
   it("keeps nothing of the original: no gitfile, alternates, hooks, config, remote, tags or FETCH_HEAD", async () => {
@@ -987,7 +1007,9 @@ describe("a self-contained checkout holds the tree the snapshot froze (#1072 RF-
     const replacement = commitAll(repository, "replacement");
     gitSync(repository, ["checkout", "-q", branch]);
     gitSync(repository, ["replace", candidate, replacement]);
-    gitSync(repository, ["reset", "-q", "--hard", "HEAD"]);
+    // #1082 R1-01: ACP reads a checkout's status unreplaced, so the index and files stay the
+    // commit's own, as `git replace` leaves them. Resetting onto the replacement would make them
+    // the replacement's, which an unreplaced status reports as uncommitted changes.
     return { candidate, ownTree, replacedTree: gitSync(repository, ["rev-parse", `${candidate}^{tree}`]) };
   };
 
@@ -1006,11 +1028,11 @@ describe("a self-contained checkout holds the tree the snapshot froze (#1072 RF-
       new ManualClock("2026-10-09T00:00:00.000Z"),
     );
 
-  it("refuses a copy whose tree is not the frozen one, where a linked worktree holds the frozen tree", async () => {
+  it("refuses a copy whose tree is not the frozen one, and a linked worktree refuses it too", async () => {
     const repository = makeRepo();
     const { candidate, ownTree, replacedTree } = replaced(repository);
     expect(replacedTree).not.toBe(ownTree);
-    expect(gitSync(repository, ["status", "--porcelain"])).toBe("");
+    expect(gitSync(repository, ["--no-replace-objects", "status", "--porcelain"])).toBe("");
 
     const snapshot = await freeze(repository);
     const frozen = snapshot.repositories[0]!;
@@ -1018,10 +1040,12 @@ describe("a self-contained checkout holds the tree the snapshot froze (#1072 RF-
     expect((await verifySnapshotFreshness(snapshot, [{ identity: frozen.identity, checkoutPath: repository }])).allowed).toBe(true);
 
     const manager = new WorktreeManager(tempDir("acp-own-checkout-"));
-    // The linked sibling reads the source's own object database, replacement included.
-    const linked = await manager.create(repository, frozen.candidateHead, "linked-replaced", authorizationFor(manager, repository, "linked-replaced"));
-    expect(gitSync(linked.path, ["rev-parse", "HEAD^{tree}"])).toBe(replacedTree);
-    await manager.destroy(repository, linked.path, authorizationFor(manager, repository, "linked-replaced"));
+    // #1082 R1-01: a linked worktree is materialised unreplaced as well, so it no longer reproduces
+    // the replacement under the candidate's SHA; it refuses the replaced candidate the same way.
+    const linked = await refusal(manager.create(repository, frozen.candidateHead, "linked-replaced", authorizationFor(manager, repository, "linked-replaced")));
+    expect(linked.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
+    expect(linked.evidence).toMatchObject({ expectedTree: `git-tree:${replacedTree}`, materializedTree: `git-tree:${ownTree}` });
+    expect(existsSync(manager.pathFor("linked-replaced"))).toBe(false);
 
     const refused = await refusal(manager.create(
       repository,
