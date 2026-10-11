@@ -8,6 +8,7 @@ import { digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, acpError, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type ProjectManifest, assertPortableManifest, manifestDigest } from "../contracts/manifest.ts";
+import { BUZZ_OWNER_APPROVAL_CHANNEL, verifyBuzzApprovalEvidence } from "../buzz/buzz-owner-approval.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { holderProvenGone } from "../daemon/single-instance.ts";
@@ -43,12 +44,13 @@ import type {
 import {
   approvedPlanSchema,
   bootstrapActivationHandoff,
+  currentBootstrapPlan,
   executablePlanOf,
   executableOperationsSchema,
   type PlannedBootstrapOutputs,
   plannedBootstrapOutputs,
 } from "./bootstrap-plan.ts";
-import type { GitHubWritePort, ObservedRepository } from "./github-write-port.ts";
+import { type GitHubWritePort, type ObservedRepository, parseGitHubIdentity } from "./github-write-port.ts";
 import {
   githubLedgerPath,
   preflightGitHubOperations,
@@ -204,6 +206,61 @@ export interface RepoFactoryApprovalBinding {
   approvedManifest: ProjectManifest;
 }
 
+/**
+ * #246 — everything an owner approval of this run's GitHub writes binds, computed from the run's own
+ * PLAN artifact alone (`approvalScopeOf`). The CLI names owner and visibility and is checked against
+ * the PLAN at execution; this scope takes them from the PLAN's first operation, the repository create,
+ * which is what that execution check compares them with. Nothing in it comes from a caller.
+ */
+export interface RepoFactoryApprovalScope {
+  runId: string;
+  operation: typeof REPO_FACTORY_GITHUB_WRITE_OPERATION;
+  planDigest: string;
+  /** The PLAN's operations as execution performs them, desired state included. */
+  githubOperations: GitHubOperation[];
+  operationsDigest: string;
+  /** `github:<owner>/<name>`, as the repository create names it. */
+  repositoryIdentity: string;
+  owner: string;
+  visibility: "public" | "private";
+  /** `repoFactoryGitHubWriteParameters` over the above: what a receipt's `parameterDigest` digests. */
+  parameters: Record<string, unknown>;
+  parameterDigest: string;
+  candidateSnapshotDigest: string | null;
+  approvedManifest: ProjectManifest;
+  projectName: string;
+}
+
+/**
+ * #246 — whether this run needs an owner decision on `scope` now, read-only (`ownerApprovalNeed`).
+ * "The newest decision" is the newest recorded Repo Factory approval, as C3's own readers take it.
+ *
+ *   - `NOT_APPLICABLE`: not a project-less bootstrap at CEO review with a passing review of its
+ *     current candidate, or an application frozen on another scope, or one with nothing to approve;
+ *   - `NONE`: no decision on this scope is recorded;
+ *   - `SATISFIED`: the newest decision approves this scope and is consumable now;
+ *   - `DECLINED`: the newest decision declines this scope;
+ *   - `NOT_CONSUMABLE`: the newest decision approves this scope and can no longer be consumed;
+ *   - `EXECUTION_ANCHORED`: an application runs on an anchored approval of this scope;
+ *   - `NEW_APPROVAL_REQUIRED`: an application of this scope cannot prove its approval and is not WRITTEN.
+ */
+export type RepoFactoryOwnerApprovalNeedState =
+  | "NOT_APPLICABLE"
+  | "NONE"
+  | "SATISFIED"
+  | "DECLINED"
+  | "NOT_CONSUMABLE"
+  | "EXECUTION_ANCHORED"
+  | "NEW_APPROVAL_REQUIRED";
+
+export interface RepoFactoryOwnerApprovalNeed {
+  need: RepoFactoryOwnerApprovalNeedState;
+  /** The receipt the need was judged on: the newest decision's, or the anchored execution's. */
+  receipt: OwnerApprovalReceipt | null;
+  /** Why, for `NOT_APPLICABLE` and `NOT_CONSUMABLE`: a fixed refusal name. */
+  reason: string | null;
+}
+
 /** A recorded approval as `recordOwnerApproval` writes it. The receipt in it is still only a claim. */
 const recordedApprovalSchema = z
   .object({
@@ -280,8 +337,11 @@ export interface RepoFactoryBootstrapRunnerDeps {
   /** Each run produces under `<workRoot>/<runId>`. Null means this deployment never configured one. */
   workRoot: string | null;
   clock: Clock;
-  /** #246 C3 — the transaction the approval's consumption, the reservation and its attempt share. */
-  db: Pick<Db, "txDecision">;
+  /**
+   * #246 C3 — the transaction the approval's consumption, the reservation and its attempt share.
+   * `get` reads a Buzz owner approval's stored evidence (`verifyBuzzApprovalEvidence`).
+   */
+  db: Pick<Db, "txDecision" | "get">;
   /** #246 C3 — the durable application record. */
   applications: BootstrapApplications;
   /** #246 C3 — the CEO admission every CONFIRM door asks, asked again here before anything is consumed. */
@@ -595,6 +655,116 @@ export class RepoFactoryBootstrapRunner {
   }
 
   /**
+   * #246 — the scope an owner approval of this run's GitHub writes binds, from the run's own PLAN
+   * artifact and nothing else: its digest, its operations as execution performs them, the repository
+   * the first one creates and that create's visibility, the parameters a receipt digests, the run's
+   * candidate, and the manifest the PLAN carries. Reads only. A prompt shows it and an answer is
+   * minted only while it is still exactly this.
+   */
+  approvalScopeOf(runId: string): Decision<RepoFactoryApprovalScope> {
+    const refuse = (reasonCode: ReasonCode, refusal: string, message: string, evidence: Evidence = {}): Decision<RepoFactoryApprovalScope> =>
+      deny(reasonCode, message, { refusal, runId, ...evidence });
+    const run = this.deps.runs.get(runId);
+    if (run === null) return refuse(ReasonCode.NOT_FOUND, "RUN_UNKNOWN", "unknown run");
+    if (run.kind !== RunKind.PROJECT_BOOTSTRAP) {
+      return refuse(ReasonCode.INVALID_ARGUMENT, "RUN_NOT_BOOTSTRAP", "a Repo Factory write needs a PROJECT_BOOTSTRAP run", {
+        kind: run.kind,
+      });
+    }
+    const planArtifact = this.deps.artifacts.latest<unknown>(runId, ArtifactKind.PLAN);
+    const current = currentBootstrapPlan(runId, planArtifact);
+    if (!current.allowed || planArtifact === null) return current as Decision<RepoFactoryApprovalScope>;
+    const { outputs, manifest } = current.value;
+    const repository = parseGitHubIdentity(outputs.target.repositoryIdentity);
+    if (repository === null || repository.ref !== null) {
+      return refuse(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "PLAN_NOT_EXECUTABLE", "the PLAN's repository is not github:<owner>/<name>", {
+        repositoryIdentity: outputs.target.repositoryIdentity,
+      });
+    }
+    const parameters = repoFactoryGitHubWriteParameters({
+      owner: repository.owner,
+      visibility: outputs.target.visibility,
+      planDigest: planArtifact.digest,
+      githubOperations: outputs.githubOperations,
+    });
+    return allow(ReasonCode.OK, {
+      runId,
+      operation: REPO_FACTORY_GITHUB_WRITE_OPERATION,
+      planDigest: planArtifact.digest,
+      githubOperations: outputs.githubOperations,
+      operationsDigest: digestOf(outputs.githubOperations),
+      repositoryIdentity: outputs.target.repositoryIdentity,
+      owner: repository.owner,
+      visibility: outputs.target.visibility,
+      parameters,
+      parameterDigest: digestOf(parameters),
+      candidateSnapshotDigest: this.deps.runs.currentCandidate(runId),
+      approvedManifest: manifest,
+      projectName: manifest.projectId,
+    });
+  }
+
+  /**
+   * #246 — whether the run needs an owner decision on `scope` now (`RepoFactoryOwnerApprovalNeed`).
+   * Reads only, and asks C3's own readers: the application and its anchored identity, the newest
+   * recorded decision, and the owner authority's consumability check. A Buzz receipt is consumable
+   * only while its prompt's stored expiry has not passed (`verifyBuzzApprovalEvidence`).
+   */
+  ownerApprovalNeed(runId: string, scope: RepoFactoryApprovalScope): RepoFactoryOwnerApprovalNeed {
+    const notApplicable = (reason: string): RepoFactoryOwnerApprovalNeed => ({ need: "NOT_APPLICABLE", receipt: null, reason });
+    const run = this.deps.runs.get(runId);
+    if (run === null || run.kind !== RunKind.PROJECT_BOOTSTRAP) return notApplicable("RUN_NOT_BOOTSTRAP");
+    if (run.projectId !== null) return notApplicable("RUN_NOT_PROJECTLESS");
+    if (run.state !== RunState.READY_FOR_CEO_REVIEW) return notApplicable("RUN_NOT_AT_CEO_REVIEW");
+    const candidate = this.deps.runs.currentCandidate(runId);
+    if (candidate === null || candidate !== scope.candidateSnapshotDigest) return notApplicable("CANDIDATE_NOT_CURRENT");
+    if (!this.deps.bootstrap.reviewForConfirmation(runId, candidate).allowed) return notApplicable("REVIEW_NOT_PASSED");
+
+    const application = this.deps.applications.get(runId);
+    if (application !== null) {
+      const workRoot = this.deps.workRoot;
+      if (workRoot === null) return notApplicable("WORK_ROOT_UNCONFIGURED");
+      if (application.phase !== "RESERVED" && application.phase !== "WRITTEN") return notApplicable("APPLICATION_NOT_RESUMABLE");
+      if (application.approvalDigest !== scope.parameterDigest) return notApplicable("APPLICATION_FROZEN_ON_ANOTHER_SCOPE");
+      const identity = this.anchoredIdentity(application, join(workRoot, runId));
+      if (identity.allowed) return { need: "EXECUTION_ANCHORED", receipt: identity.value.receipt, reason: null };
+      if (application.phase === "WRITTEN") return notApplicable("WRITTEN_APPROVAL_UNPROVEN");
+      if (identity.evidence["refusal"] === "APPROVAL_ANCHOR_UNSYNCED") return notApplicable("APPROVAL_ANCHOR_UNSYNCED");
+      return { need: "NEW_APPROVAL_REQUIRED", receipt: null, reason: null };
+    }
+
+    const newest = this.newestRecordedApproval(runId);
+    if (newest === null || newest.receipt === null || newest.receipt.parameterDigest !== scope.parameterDigest) {
+      return { need: "NONE", receipt: null, reason: null };
+    }
+    const receipt = newest.receipt;
+    if (!receipt.approved) return { need: "DECLINED", receipt, reason: null };
+    const consumable = this.deps.ownerAuthority.assertConsumable(receipt, candidate);
+    const open = consumable.allowed ? this.buzzApprovalOpen(receipt) : consumable;
+    if (!open.allowed) {
+      const refusal = open.evidence["refusal"];
+      return { need: "NOT_CONSUMABLE", receipt, reason: typeof refusal === "string" ? refusal : open.reasonCode };
+    }
+    return { need: "SATISFIED", receipt, reason: null };
+  }
+
+  /**
+   * #246 — a Buzz receipt may be consumed only while the prompt it answered is inside its stored
+   * window (CEO 1791605708, O3): asked where a receipt is consumed, never where an execution resumes
+   * on the approval its anchor names. Any other channel answers yes; its own rules apply.
+   */
+  private buzzApprovalOpen(receipt: OwnerApprovalReceipt): Decision<void> {
+    if (receipt.channel !== BUZZ_OWNER_APPROVAL_CHANNEL) return allow(ReasonCode.OK, undefined);
+    const verified = verifyBuzzApprovalEvidence(this.deps.db, receipt, { nowMs: this.deps.clock.now().getTime() });
+    if (verified.allowed) return verified;
+    return deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "the owner's Buzz approval can no longer be consumed: " + verified.message, {
+      refusal: verified.evidence["refusal"] === "PROMPT_EXPIRED" ? "APPROVAL_EXPIRED" : "APPROVAL_EVIDENCE_UNVERIFIED",
+      runId: receipt.runId,
+      evidence: verified.evidence,
+    });
+  }
+
+  /**
    * The CEO confirm's entry for a PROJECT_BOOTSTRAP run, which every CONFIRM door reaches:
    * `produceAndActivate` over the owner's newest recorded approval of this operation, so a later
    * decline supersedes an earlier approval; with none recorded it refuses as a missing approval,
@@ -854,6 +1024,9 @@ export class RepoFactoryBootstrapRunner {
      */
     const consumePresented = (): Decision<void> => {
       if (!consumesPresented) return allow(ReasonCode.OK, undefined);
+      // #246, O3 — a Buzz approval's stored window is asked again where it is consumed.
+      const open = this.buzzApprovalOpen(receipt.value);
+      if (!open.allowed) return open;
       const consumed = this.deps.ownerAuthority.consumeApproval(receipt.value, input.candidateSnapshotDigest);
       if (consumed.allowed && existing !== null) this.deps.applications.recordApprovalIdentity(runId, presentedReceiptDigest);
       return consumed;
@@ -925,7 +1098,8 @@ export class RepoFactoryBootstrapRunner {
     if (consumesPresented) {
       // Admitted from live ingress and not yet consumed: a receipt already consumed — for another
       // execution, or on the strength of a row nobody admitted — never starts or continues one.
-      const consumable = this.deps.ownerAuthority.assertConsumable(receipt.value, input.candidateSnapshotDigest);
+      const admissible = this.deps.ownerAuthority.assertConsumable(receipt.value, input.candidateSnapshotDigest);
+      const consumable = admissible.allowed ? this.buzzApprovalOpen(receipt.value) : admissible;
       if (!consumable.allowed) {
         if (existing === null) return atStage(consumable as Decision<ACPBootstrapActivationResult>, "approval");
         // The owner authority's own answer, named: the execution continues only under a new owner
@@ -2220,6 +2394,22 @@ export class RepoFactoryBootstrapRunner {
       );
     }
     if (!receipt.approved) return refuse("APPROVAL_DECLINED", "the owner declined this GitHub write");
+    // #246 — the channels that may carry this operation's approval, and for this operation only: the
+    // CLI as it always has, and a Buzz reply only when the evidence it was minted on still verifies —
+    // the owner's signed event, bound to the prompt and this scope. Every other channel is refused,
+    // whatever the owner authority would admit for another operation.
+    if (receipt.channel === BUZZ_OWNER_APPROVAL_CHANNEL) {
+      const evidence = verifyBuzzApprovalEvidence(this.deps.db, receipt);
+      if (!evidence.allowed) {
+        return refuse("APPROVAL_EVIDENCE_UNVERIFIED", `the owner's Buzz approval evidence does not verify: ${evidence.message}`, {
+          evidence: evidence.evidence,
+        });
+      }
+    } else if (receipt.channel !== "cli") {
+      return refuse("APPROVAL_CHANNEL_NOT_ACCEPTED", "a Repo Factory GitHub write is approved by the CLI or a verified Buzz reply only", {
+        channel: receipt.channel,
+      });
+    }
     return allow(ReasonCode.OK, receipt);
   }
 

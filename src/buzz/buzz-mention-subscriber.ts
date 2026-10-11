@@ -12,6 +12,11 @@ import {
   redeemOwnerReplyPublication,
 } from "../conversation/owner-reply-outbox.ts";
 import type { BuzzPeerBinding } from "../ingress/buzz-message.ts";
+import {
+  type BuzzApprovalPublication,
+  buzzApprovalPublicationShape,
+  redeemBuzzApprovalPublication,
+} from "./buzz-owner-approval.ts";
 
 /**
  * The daemon's own front door on the relay (#760, Part C).
@@ -551,6 +556,37 @@ export interface BuzzMentionVerdict {
 /** A reason code is a fixed catalogue string; anything else stays out of the health key space. */
 const REASON_CODE_SHAPE = /^[A-Z][A-Z0-9_]{0,63}$/;
 
+/**
+ * #246 — the replies an identity's owner-approval prompts may receive, asked for by the prompts'
+ * exact event ids rather than by a mention (CEO 1791605708): an owner's client need not tag the
+ * prompt's author for the reply to arrive. A second subscription on the identity's own connection;
+ * the mention subscription, its window and its admission are untouched.
+ */
+export interface BuzzApprovalReplyFilter {
+  /** The open prompts this identity signed. */
+  readonly eventIds: readonly string[];
+  /** The earliest `created_at` a reply to any of them may carry. */
+  readonly since: number;
+}
+
+/** One verified event the reply filter matched, on the identity's connection. */
+export interface BuzzApprovalReplyRequest {
+  readonly identityPubkey: string;
+  /** The event's single room. */
+  readonly conversation: string;
+  readonly event: BuzzMentionEvent;
+}
+
+/**
+ * Where reply-filter events go. Matching the filter authenticates nothing: the route judges each
+ * event by its own signature and the prompt it names, and never delivers one as a message. Its
+ * answer moves no window.
+ */
+export interface BuzzApprovalReplyRoute {
+  filterFor(pubkey: string): BuzzApprovalReplyFilter | null;
+  receive(request: BuzzApprovalReplyRequest): Promise<BuzzMentionAdmission | BuzzMentionVerdict>;
+}
+
 const excluded = (reason: string): BuzzMentionIdentityJudgement => ({ verdict: "EXCLUDED", reason });
 
 /**
@@ -1065,7 +1101,14 @@ type BuzzMentionRejection =
    * moves the window, and nothing is consumed on anyone's behalf.
    */
   | "event-room-not-bound"
-  | "role-not-held";
+  | "role-not-held"
+  /**
+   * #246 — an event the owner-approval reply filter matched, by what its route answered: recorded,
+   * already recorded, or refused. Never a delivery, so never `admitted`, and never a window move.
+   */
+  | "approval-reply-recorded"
+  | "approval-reply-already-recorded"
+  | "approval-reply-refused";
 
 /** A rejection as the tally keys it: one of the fixed reasons, or a refusal with its reason code. */
 type BuzzMentionRejectionKey = BuzzMentionRejection | `admission-refused:${string}`;
@@ -1188,6 +1231,8 @@ interface SubscriptionDeps {
   readonly authenticated: () => void;
   /** Re-judges one excluded identity against the registry and its siblings; the judgement timer's work. */
   readonly rejudge: (subscription: BuzzMentionSubscription) => void;
+  /** #246 — the owner-approval reply route, or null when none is configured. */
+  readonly approvalReplies: BuzzApprovalReplyRoute | null;
 }
 
 /** A publish waiting for the relay's `OK`, tied to the connection it was sent on. */
@@ -1272,6 +1317,9 @@ class BuzzMentionSubscription {
   readonly #tally = new FrameTally();
   /** Replies sent on this identity's connection and not yet answered, by event id (#1036). */
   readonly #publishes = new Map<string, PendingPublish>();
+  /** #246 — the owner-approval reply subscription on this connection, and the filter last sent on it. */
+  readonly #approvalSubscriptionId = randomUUID().replace(/-/gu, "");
+  #approvalFilter: string | null = null;
 
   constructor(
     deps: SubscriptionDeps,
@@ -1516,6 +1564,77 @@ class BuzzMentionSubscription {
     return verifyEvent({ ...event, tags: event.tags.map((tag) => [...tag]) });
   }
 
+  /**
+   * #246 — signs one of the two fixed owner-approval messages a publication describes (O4), as this
+   * identity. The tags and text are derived here from the publication's basis, never read from it.
+   */
+  signApproval(publication: BuzzApprovalPublication): BuzzSignedEvent | null {
+    if (publication.intent !== null || publication.signer !== this.#pubkey) return null;
+    if (!this.#rooms.includes(publication.basis.room)) return null;
+    const shape = buzzApprovalPublicationShape(publication.basis);
+    const signed = finalizeEvent(
+      { kind: BUZZ_MENTION_KIND, created_at: publication.createdAt, tags: shape.tags, content: shape.content },
+      this.#secretKey,
+    );
+    return {
+      id: signed.id,
+      pubkey: signed.pubkey,
+      created_at: signed.created_at,
+      kind: signed.kind,
+      tags: signed.tags.map((tag) => [...tag]),
+      content: signed.content,
+      sig: signed.sig,
+    };
+  }
+
+  /**
+   * #246 — sends a stored owner-approval message, once it is this identity's validly signed event of
+   * exactly the shape its basis derives, equal in id and bytes to what storage held when the
+   * publication was spent. Anything else is `UNAUTHORIZED` and is not sent.
+   */
+  publishApproval(publication: BuzzApprovalPublication, recorded: BuzzSignedEvent | null, timeoutMs: number): Promise<BuzzPublishAck> {
+    const event = publication.intent;
+    if (event === null || recorded === null) return Promise.resolve({ status: "UNAUTHORIZED" });
+    if (event.id !== recorded.id || eventFrame(event) !== eventFrame(recorded)) return Promise.resolve({ status: "UNAUTHORIZED" });
+    if (publication.signer !== this.#pubkey || event.pubkey !== this.#pubkey) return Promise.resolve({ status: "UNAUTHORIZED" });
+    if (!this.#rooms.includes(publication.basis.room) || event.kind !== BUZZ_MENTION_KIND) return Promise.resolve({ status: "UNAUTHORIZED" });
+    const shape = buzzApprovalPublicationShape(publication.basis);
+    if (event.content !== shape.content || JSON.stringify(event.tags) !== JSON.stringify(shape.tags)) {
+      return Promise.resolve({ status: "UNAUTHORIZED" });
+    }
+    if (!verifyEvent({ ...event, tags: event.tags.map((tag) => [...tag]) })) return Promise.resolve({ status: "UNAUTHORIZED" });
+    return this.#publish(recorded, timeoutMs);
+  }
+
+  /**
+   * #246 — sends this identity's owner-approval reply filter on its live connection when it changed:
+   * a `REQ` for the replies to its open prompts, in its own rooms, or a `CLOSE` once none is open.
+   */
+  refreshApprovalReplies(): void {
+    const route = this.#deps.approvalReplies;
+    if (route === null || !this.ready) return;
+    let filter: BuzzApprovalReplyFilter | null = null;
+    try {
+      filter = route.filterFor(this.#pubkey);
+    } catch {
+      filter = null;
+    }
+    const wanted =
+      filter === null || filter.eventIds.length === 0
+        ? null
+        : JSON.stringify({
+            kinds: [BUZZ_MENTION_KIND],
+            "#e": [...filter.eventIds],
+            "#h": this.#rooms,
+            since: Math.max(0, Math.floor(filter.since)),
+          });
+    if (wanted === this.#approvalFilter) return;
+    const generation = this.#generation;
+    if (wanted === null) this.#send(generation, JSON.stringify(["CLOSE", this.#approvalSubscriptionId]));
+    else this.#send(generation, `["REQ",${JSON.stringify(this.#approvalSubscriptionId)},${wanted}]`);
+    this.#approvalFilter = wanted;
+  }
+
   #publish(event: BuzzSignedEvent, timeoutMs: number): Promise<BuzzPublishAck> {
     if (!this.ready) return Promise.resolve({ status: "UNAVAILABLE" });
     const waiting = this.#publishes.get(event.id);
@@ -1642,6 +1761,7 @@ class BuzzMentionSubscription {
     this.#generation = 0;
     this.#subscribed = false;
     this.#authEventId = null;
+    this.#approvalFilter = null;
     this.#abandonPublishes();
     // The adapter's own retire path: listeners off, socket closed once, and deliberately no
     // notification back — this drop *is* the subscriber's decision, and being told about it would
@@ -1661,6 +1781,7 @@ class BuzzMentionSubscription {
     this.#generation = 0;
     this.#subscribed = false;
     this.#authEventId = null;
+    this.#approvalFilter = null;
     this.#abandonPublishes();
     if (this.#stopped || this.#timer !== null) return;
     const step = Math.min(this.#attempt, RELAY_RECONNECT_BACKOFF_MS.length - 1);
@@ -1847,6 +1968,9 @@ class BuzzMentionSubscription {
     };
     if (this.#since !== null) filter["since"] = this.#since;
     this.#send(generation, JSON.stringify(["REQ", this.#subscriptionId, filter]));
+    // #246 — the owner-approval replies, on their own subscription beside the mention one.
+    this.#approvalFilter = null;
+    this.refreshApprovalReplies();
     this.#deps.authenticated();
     return ACCEPTED;
   }
@@ -1863,6 +1987,8 @@ class BuzzMentionSubscription {
       this.#reconnect(generation);
       return rejected("frame-not-a-message");
     }
+    // #246 — the end of the approval replies' stored events says nothing about the mention window.
+    if (frame[1] === this.#approvalSubscriptionId && this.#approvalFilter !== null) return ACCEPTED;
     if (frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
     // The attempt reset says "a connection reached the end of stored events and therefore
     // worked". A stale EOSE says that about a connection that is gone, and would hand the live
@@ -1887,6 +2013,12 @@ class BuzzMentionSubscription {
     if (frame.length !== 3 || typeof frame[1] !== "string" || typeof frame[2] !== "string") {
       return rejected("frame-not-a-message");
     }
+    // #246 — the relay ending the approval replies' subscription ends only that one; the next
+    // refresh asks for it again, and the mention subscription carries on.
+    if (frame[1] === this.#approvalSubscriptionId) {
+      this.#approvalFilter = null;
+      return ACCEPTED;
+    }
     if (frame[1] !== this.#subscriptionId) return rejected("unknown-subscription");
     this.#reconnect(generation);
     return rejected("unknown-subscription");
@@ -1903,6 +2035,10 @@ class BuzzMentionSubscription {
     if (frame.length !== 3 || typeof frame[1] !== "string") {
       this.#reconnect(generation);
       return rejected("frame-not-a-message");
+    }
+    // #246 — an event the owner-approval reply filter matched goes to its route alone.
+    if (this.#subscribed && this.#approvalFilter !== null && frame[1] === this.#approvalSubscriptionId) {
+      return this.#onApprovalReply(frame[2], generation);
     }
     // The subscription id next, before a byte of the event is looked at. A relay that answers a
     // subscription this connection never opened is answering someone else's question.
@@ -2058,6 +2194,34 @@ class BuzzMentionSubscription {
     if (admission === "PRECEDES_BINDING") return { rejected: "admission-precedes-binding", admission };
     return { rejected: null, admission };
   }
+
+  /**
+   * #246 — one event on the owner-approval reply subscription. The same structural and signature
+   * checks as a mention, and exactly one room among this identity's; no `p` check, because this
+   * subscription asks by the prompt's id rather than by a mention, and no role judgement, because
+   * the route delivers nothing to a role. The route's answer is about this event only: the mention
+   * window is not moved and no reconnect follows.
+   */
+  async #onApprovalReply(raw: unknown, generation: number): Promise<BuzzMentionFrameOutcome> {
+    const route = this.#deps.approvalReplies;
+    if (route === null) return rejected("unknown-subscription");
+    const event = plainEventOf(raw);
+    if (event === null) return rejected("event-malformed");
+    if (!validateEvent(event)) return rejected("event-malformed");
+    if (!verifyEvent(event)) return rejected("event-signature-invalid");
+    if (event.kind !== BUZZ_MENTION_KIND) return rejected("event-wrong-kind");
+    const rooms = tagValues(event, "h");
+    const conversation = rooms.length === 1 ? rooms[0] : undefined;
+    if (conversation === undefined || conversation.trim().length === 0) return rejected("event-conversation-unusable");
+    if (!this.#rooms.includes(conversation)) return rejected("event-room-not-bound");
+    const frozen: BuzzMentionEvent = deepFreeze(event);
+    const answer = await route.receive({ identityPubkey: this.#pubkey, conversation, event: frozen });
+    if (!this.#isCurrent(generation)) return { rejected: null, admission: null };
+    const admission = typeof answer === "string" ? answer : answer.admission;
+    if (admission === "DURABLE") return rejected("approval-reply-recorded");
+    if (admission === "ALREADY_DURABLE") return rejected("approval-reply-already-recorded");
+    return rejected("approval-reply-refused");
+  }
 }
 
 /** A signed Nostr event, exactly as it goes on the wire. */
@@ -2148,6 +2312,17 @@ export interface BuzzReplyPublisher {
    * not sent.
    */
   publishOwnerReply(publication: OwnerReplyPublication, timeoutMs: number): Promise<BuzzPublishAck>;
+  /**
+   * #246 — signs one of the two fixed owner-approval messages (O4) an issued
+   * `BuzzApprovalPublication` with no recorded event describes; `null` for anything else.
+   */
+  signApprovalPublication(publication: BuzzApprovalPublication): BuzzSignedEvent | null;
+  /**
+   * #246 — sends an issued owner-approval publication's stored event on its signer's connection.
+   * Anything but that exact event, of the shape its basis derives, equal in id and bytes to what
+   * storage holds when it is sent, is `UNAUTHORIZED` and is not sent.
+   */
+  publishApprovalPublication(publication: BuzzApprovalPublication, timeoutMs: number): Promise<BuzzPublishAck>;
   /** Called after any identity's connection authenticates: at startup and after every reconnect. */
   onAuthenticated(listener: () => void): () => void;
 }
@@ -2158,6 +2333,8 @@ const NO_REPLY_PUBLISHER: BuzzReplyPublisher = Object.freeze({
   ready: () => false,
   signOwnerReply: () => null,
   publishOwnerReply: () => Promise.resolve({ status: "UNAVAILABLE" } as const),
+  signApprovalPublication: () => null,
+  publishApprovalPublication: () => Promise.resolve({ status: "UNAVAILABLE" } as const),
   onAuthenticated: () => () => undefined,
 });
 
@@ -2222,6 +2399,8 @@ export interface BuzzMentionSubscriberHandle {
   settled(): Promise<void>;
   /** Publishing as these identities, for the owner-reply consumer (#1036). */
   readonly replies: BuzzReplyPublisher;
+  /** #246 — asks every connected identity to send its owner-approval reply filter again. */
+  refreshApprovalReplies(): void;
   close(): void;
 }
 
@@ -2260,6 +2439,9 @@ const DISABLED: BuzzMentionSubscriberHandle = {
   rooms: [],
   identityRooms: [],
   replies: NO_REPLY_PUBLISHER,
+  refreshApprovalReplies: () => {
+    /* nothing is connected */
+  },
   settled: () => Promise.resolve(),
   close: () => {
     /* nothing was opened */
@@ -2276,6 +2458,8 @@ export interface BuzzMentionSubscriberOptions {
   readonly reportRoleNotHeld?: BuzzMentionRoleNotHeldReporter;
   /** Defaulted for the same reason: an excluded identity the operator is not told of is a silent one. */
   readonly reportAdmission?: BuzzMentionAdmissionReporter;
+  /** #246 — where replies to this daemon's owner-approval prompts go; absent, none is asked for. */
+  readonly approvalReplies?: BuzzApprovalReplyRoute;
 }
 
 /**
@@ -2359,6 +2543,7 @@ export const startBuzzMentionSubscriber = (
     rejudge: (subscription) => {
       if (!closed) apply(subscription, subscription.judge());
     },
+    approvalReplies: options.approvalReplies ?? null,
   };
 
   const seenPaths = new Set<string>();
@@ -2538,12 +2723,27 @@ export const startBuzzMentionSubscriber = (
           ? Promise.resolve({ status: "UNAUTHORIZED" })
           : subscription.publishOwnerReply(redeemed.publication, redeemed.recorded, timeoutMs);
       },
+      signApprovalPublication: (value) => {
+        const redeemed = redeemBuzzApprovalPublication(value);
+        return redeemed === null ? null : holding(redeemed.publication.signer)?.signApproval(redeemed.publication) ?? null;
+      },
+      publishApprovalPublication: (value, timeoutMs) => {
+        const redeemed = redeemBuzzApprovalPublication(value);
+        const subscription = redeemed === null ? null : holding(redeemed.publication.signer);
+        return redeemed === null || subscription === null
+          ? Promise.resolve({ status: "UNAUTHORIZED" })
+          : subscription.publishApproval(redeemed.publication, redeemed.recorded, timeoutMs);
+      },
       onAuthenticated: (listener) => {
         authenticatedListeners.add(listener);
         return () => {
           authenticatedListeners.delete(listener);
         };
       },
+    },
+    refreshApprovalReplies: () => {
+      if (closed) return;
+      for (const subscription of prepared) subscription.refreshApprovalReplies();
     },
     close: () => {
       closed = true;
