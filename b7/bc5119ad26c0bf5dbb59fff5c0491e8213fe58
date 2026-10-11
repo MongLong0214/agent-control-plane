@@ -1,0 +1,26 @@
+Limit: the possession-proven bind takes a key past another row only when every such row is terminal (STOPPED or ERROR), the bound runtime of a CEO assignment, and named by no ACTIVE assignment, bound or live; a CEO runtime reached only by a runtime move, with no assignment naming it, is not history and its key stays refused
+Limit: r-0b16dd6d3a79's Limit that the CEO's key cannot be rebound after a re-adoption onto a new session was true at 115916ce and is false after this commit for the possession-proven challenge path
+Warn: the possession write re-reads the CEO binding (session, incarnation, generation) and every other holder inside its own transaction; moving either check back out to the challenge store reopens the re-adoption race the binding-fresh witness measures
+Warn: the earlier row's buzz_actor_id is never written; the recovery's SESSION_BUZZ_ACTOR_BOUND row names the rows it was proven against as recoveredFrom, which is the record the peer rule is to read
+Unverified: no cross-process race was run: the two-answer witness queues both frames before either is handled in one process, and the re-adoption race is injected through the store's bind port
+Record-Id: r-ceobuzzrecover
+Follows: r-0b16dd6d3a79
+Provenance: inherited 028853d254963c3291e1fecb6989d8be362a0892
+
+Limit: r-1044peerfence's Limit that a CEO identity carried by another session row refuses every CEO mention was true at b6e164b7 and is false after this commit for a key the current CEO runtime recovered by possession past terminal earlier CEO rows its recovery record names; a key rebound past such a row without a possession proof is still reuse
+Limit: a recovered key's events count only from the recovery, in whole seconds: an event signed before it is refused as outside the generation, and one signed in the fraction of the recovery second before it is admitted
+Warn: the peer rule reads a recovered key's earlier rows as history only when the recovery record names every one of them; a row the record does not name, or any blocking holder, keeps every CEO mention refused BUZZ_PEER_ORIGIN_AMBIGUOUS
+Record-Id: r-ceobuzzpeerhist
+Follows: r-ceobuzzrecover
+Follows: r-1044peerfence
+Provenance: inherited d56c6f48fddd0c161456e6308e8396224cd87d47
+
+Limit: accepted by the CEO (1791634542): an event the earlier CEO generation signed with the same key before the recovery, dated past the recovery boundary and held back, is admitted; created_at is the signer's own claim, so the boundary bounds what an event claims, not when it was signed, and closing it needs a recovery-specific value inside the event
+Limit: r-ceobuzzpeerhist's Limit that an event signed in the fraction of the recovery second before it is admitted was true at d56c6f48 and is false after this commit: the boundary is the latest of the assignment's creation, the recovery's audit time and the verified answer's signed time, and its own second is refused
+Limit: a challenge answer dated more than 60 s ahead of the daemon's clock is refused signed-ahead-of-clock without spending the challenge, so an answer moves the boundary at most 60 s past the recovery
+Ruled-out: flooring the recovery boundary to its whole second | a mention signed in the recovery's own second before the recovery was admitted (review ceobuzz-r1-01)
+Warn: recovery membership is the record's recoveredCount and recoveredDigest (digestOfSet of the history rows) compared with buzzActorHolders recomputed now; recoveredFrom is for a reader and the audit log keeps at most 200 of its elements
+Warn: the writer reads its recovery row back inside the transaction and refuses CONFLICT, rolling the binding back, unless the count, digest and answer time persisted as written
+Record-Id: r-ceobuzzr1fix
+Follows: r-ceobuzzpeerhist
+Provenance: inherited 8cd82b52f0fc663a4c5e79ebdc27ec881b3d0c7b
