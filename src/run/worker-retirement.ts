@@ -306,6 +306,17 @@ export class WorkerRetirement {
     }
 
     const reason = "worker retired: its run ended";
+    // Reserved before the stop is awaited: in one transaction the session must still serve only ended
+    // runs' WORKERs and hold nothing, and it leaves READY for DRAINING, so no bind, switch or renewal
+    // can take it while the provider answers. DRAINING keeps it live, so a session whose own process
+    // outlives the stop is asked again on the next pass rather than abandoned.
+    const reserved = this.db.tx(() => {
+      const current = this.ports.sessions.get(sessionId);
+      if (!current || (current.lifecycle !== SessionLifecycle.READY && current.lifecycle !== SessionLifecycle.DRAINING)) return false;
+      if (!this.#retiredOnly(sessionId)) return false;
+      return this.ports.sessions.transition(sessionId, SessionLifecycle.DRAINING, `${reason}: stopping`).allowed;
+    });
+    if (!reserved) return;
     try {
       await this.ports.providers.requireForRole(session.provider, Role.WORKER).stopSession(handleFor(session));
     } catch (error) {
@@ -316,7 +327,7 @@ export class WorkerRetirement {
         kind: WORKER_SESSION_STOP_FAILED,
         reasonCode: ReasonCode.SESSION_STOP_FAILED,
         sessionId,
-        evidence: { reason, error: error instanceof Error ? error.message : String(error) },
+        evidence: { reason, status: "PROCESS_UNVERIFIED", error: error instanceof Error ? error.message : String(error) },
       });
       report.stopFailed.push(sessionId);
       return;
@@ -325,7 +336,7 @@ export class WorkerRetirement {
     // The session's own process, where it recorded one, must be gone before the row says so.
     const own = this.#sessionProcess(session);
     if (own !== null) {
-      this.#recordRemaining(session, [own], report);
+      this.#recordRemaining(this.ports.sessions.get(sessionId) ?? session, [own], report);
       return;
     }
     // Nothing it serves may have changed while the provider answered.
