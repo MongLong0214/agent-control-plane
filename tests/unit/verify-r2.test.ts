@@ -1,16 +1,24 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { dispatchBootstrapRun, fixtureManifest, makeHarness } from "../helpers/harness.ts";
 import { applyPassingChange } from "../helpers/harness.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { stableFixtureExecutable } from "../helpers/stable-fixture-executable.ts";
-import { assertPortableManifest, manifestDigest } from "../../src/contracts/manifest.ts";
+import { normalized, planCarrying } from "../helpers/contract-change.ts";
+import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
+import {
+  assertPortableManifest,
+  GATE_ENTRY_MODULE_FORMAT_UNPINNED,
+  manifestDigest,
+  type ProjectManifest,
+} from "../../src/contracts/manifest.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
+import { sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ExecutionMode, RunKind } from "../../src/domain/types.ts";
@@ -26,8 +34,19 @@ import {
   runSandboxed,
 } from "../../src/verify/sandbox.ts";
 import { WorktreeManager } from "../../src/verify/worktree.ts";
+import { GATE_RESOLUTION_REFUSED, gateResolutionPreload } from "../../src/verify/gate-resolution-hook.ts";
 import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
 import type { WorktreeAuthorization } from "../../src/verify/worktree.ts";
+import type * as SandboxModule from "../../src/verify/sandbox.ts";
+
+/**
+ * Every sandbox run is observed, so the RF-S22 cases can show a refusal came before any command
+ * ran. The wrapper calls the real implementation, so the other cases here behave unchanged.
+ */
+vi.mock("../../src/verify/sandbox.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof SandboxModule>();
+  return { ...actual, runSandboxed: vi.fn(actual.runSandboxed) };
+});
 
 afterEach(cleanupTempDirs);
 
@@ -110,6 +129,13 @@ const frozenPinnedCandidate = async (options: {
   baseBranch?: string;
   workBranch?: string;
   beforeRun?: (repositoryPath: string) => void;
+  /** Writes the candidate commit's files; the passing `src/app.js` change when omitted. */
+  candidateChange?: (repositoryPath: string) => void;
+  /** Runs after the candidate commit and before the freeze. */
+  beforeFreeze?: (repositoryPath: string) => void;
+  /** Runs after dispatch, with the run: where a CONTRACT_CHANGE run submits its PLAN (#246 B2-a). */
+  afterDispatch?: (harness: ReturnType<typeof makeHarness>, runId: string) => void;
+  kind?: RunKind;
 } = {}) => {
   const harness = makeHarness();
   options.beforeRun?.(harness.repoPath);
@@ -132,6 +158,7 @@ const frozenPinnedCandidate = async (options: {
   if (!repository.allowed) throw new Error(repository.message);
   const created = harness.cp.runs.create({
     projectId: manifest.projectId,
+    ...(options.kind ? { kind: options.kind } : {}),
     executionMode: ExecutionMode.STANDARD,
     contract,
     repositories: [{
@@ -143,7 +170,15 @@ const frozenPinnedCandidate = async (options: {
   if (!created.allowed) throw new Error(created.message);
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);
   if (!dispatched.allowed) throw new Error(dispatched.message);
-  applyPassingChange(harness.repoPath, options.workBranch ?? "task/verify-r2");
+  options.afterDispatch?.(harness, created.value.runId);
+  if (options.candidateChange) {
+    gitSync(harness.repoPath, ["checkout", "-q", "-b", options.workBranch ?? "task/verify-r2"]);
+    options.candidateChange(harness.repoPath);
+    commitAll(harness.repoPath, "candidate change");
+  } else {
+    applyPassingChange(harness.repoPath, options.workBranch ?? "task/verify-r2");
+  }
+  options.beforeFreeze?.(harness.repoPath);
   const snapshot = await harness.cp.pipeline.freeze(created.value.runId);
   if (!snapshot.allowed) throw new Error(snapshot.message);
   return { harness, manifest, repository: repository.value, run: dispatched.value, snapshot: snapshot.value };
@@ -800,5 +835,826 @@ exec /bin/ps "$@"
     await expect(
       buildCandidateSnapshot({ runId: "run_1", contractDigest: "sha256:contract", repositories: [] }, makeHarness().clock),
     ).rejects.toMatchObject({ reasonCode: ReasonCode.EVIDENCE_MISSING });
+  });
+});
+
+/**
+ * RF-S22 (PRD §14.2, RF-019): the candidate does not control the gate logic that judges it.
+ *
+ * The pinned command runs `gate/check.cjs`, which decides through `gate/decide.cjs`. Both are
+ * committed on the base branch before the run is dispatched, so the pinned digests name the
+ * bytes the trusted contract approved. The base `src/app.js` returns 1, which this gate refuses,
+ * so a candidate that leaves `src/app.js` alone can pass only by weakening the gate. The gate
+ * reads `src/app.js` as data: under ACP's loader a gate cannot load candidate code (round 5).
+ */
+describe("RF-S22 arm:validator: gate logic the pinned manifest binds (LOCAL_COMMAND)", () => {
+  const GATE_HELPER = "module.exports = (value) => value === 2;\n";
+  const GATE_ENTRY = [
+    "const decide = require('./decide.cjs');",
+    "const { readFileSync } = require('node:fs');",
+    "const { join } = require('node:path');",
+    "const returned = /=>\\s*(\\d+)/.exec(readFileSync(join(__dirname, '..', 'src', 'app.js'), 'utf8'));",
+    "if (!returned || !decide(Number(returned[1]))) { console.error('gate: app() must return 2'); process.exit(1); }",
+    "console.log('gate ok');",
+    "",
+  ].join("\n");
+  const UNCONDITIONAL_PASS = "process.exit(0);\n";
+
+  const entry = (path: string, content: string | Buffer, loadedBy?: string) => ({
+    path,
+    repositoryRole: "primary",
+    digest: sha256(content),
+    ...(loadedBy ? { loadedBy } : {}),
+  });
+  const gateManifest = (gateEntries: ProjectManifest["gateEntries"]): ProjectManifest => {
+    const base = fixtureManifest("verify-r2-project");
+    return {
+      ...base,
+      verificationCommands: [{ ...base.verificationCommands[0]!, argv: ["node", "gate/check.cjs"] }],
+      ...(gateEntries ? { gateEntries } : {}),
+    };
+  };
+  const commitGate = (files: Record<string, string>) => (repositoryPath: string): void => {
+    writeFiles(repositoryPath, files);
+    commitAll(repositoryPath, "add the gate the contract pins");
+  };
+  const ENTRY_ONLY = gateManifest([entry("gate/check.cjs", GATE_ENTRY)]);
+  const ENTRY_AND_HELPER = gateManifest([
+    entry("gate/check.cjs", GATE_ENTRY),
+    entry("gate/decide.cjs", GATE_HELPER, "gate/check.cjs"),
+  ]);
+
+  const verifyPinned = async (
+    candidate: Awaited<ReturnType<typeof frozenPinnedCandidate>>,
+    extra: { pinnedManifestDigest?: string } = {},
+  ) => {
+    vi.mocked(runSandboxed).mockClear();
+    return candidate.harness.cp.verification.verify({
+      runId: candidate.run.runId,
+      snapshot: candidate.snapshot,
+      commands: candidate.manifest.verificationCommands,
+      contractDigest: candidate.snapshot.contractDigest,
+      ...extra,
+    });
+  };
+  const verificationTrees = (candidate: Awaited<ReturnType<typeof frozenPinnedCandidate>>): number =>
+    candidate.harness.cp.db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM verification_worktrees WHERE run_id = ?",
+      [candidate.run.runId],
+    )!.n;
+
+  it("RF-S22 arm:validator W3: a candidate that rewrites a pinned gate entry to exit 0 is refused before anything runs", async () => {
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: (repo) => writeFiles(repo, { "gate/check.cjs": UNCONDITIONAL_PASS }),
+    });
+
+    const refused = await verifyPinned(candidate);
+    expect(refused).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+      evidence: {
+        path: "gate/check.cjs",
+        repositoryRole: "primary",
+        expected: sha256(GATE_ENTRY),
+        observed: sha256(UNCONDITIONAL_PASS),
+        observedState: "FILE",
+      },
+    });
+    // Before any sandbox, worktree or evidence: the weakened gate never ran.
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+    expect(verificationTrees(candidate)).toBe(0);
+    expect(candidate.harness.cp.verification.latestReport(
+      candidate.run.runId,
+      candidateSnapshotDigest(candidate.snapshot),
+    )).toBeNull();
+  });
+
+  it("RF-S22 arm:validator control: an untouched gate runs and judges the candidate, which may change its own code", async () => {
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_AND_HELPER,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: (repo) => writeFiles(repo, {
+        "src/app.js": "module.exports = () => 2;\n",
+        "tests/app.test.js": "require('node:assert').strictEqual(require('../src/app.js')(), 2);\n",
+      }),
+    });
+
+    const verified = await verifyPinned(candidate);
+    expect(verified.allowed, verified.allowed ? "" : `${verified.reasonCode}: ${verified.message}`).toBe(true);
+    if (!verified.allowed) return;
+    expect(verified.value).toMatchObject({ status: "PASS", results: [{ commandId: "verify", status: "PASS" }] });
+    expect(vi.mocked(runSandboxed)).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["deletes the entry from", (pinned: ProjectManifest): ProjectManifest => {
+      const own = structuredClone(pinned);
+      delete own.gateEntries;
+      return own;
+    }],
+    ["rewrites the entry's digest in", (pinned: ProjectManifest): ProjectManifest => ({
+      ...structuredClone(pinned),
+      gateEntries: [entry("gate/check.cjs", UNCONDITIONAL_PASS)],
+    })],
+  ])("RF-S22 arm:validator: a candidate that %s its own manifest copy is still judged by the active pin", async (_, ownCopy) => {
+    const own = assertPortableManifest(ownCopy(ENTRY_ONLY));
+    if (!own.allowed) throw new Error(own.message);
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: (repo) => writeFiles(repo, {
+        "gate/check.cjs": UNCONDITIONAL_PASS,
+        ".agent-control-plane/project.json": `${JSON.stringify(own.value, null, 2)}\n`,
+      }),
+    });
+    expect(manifestDigest(own.value)).not.toBe(candidate.run.pinnedManifestDigest);
+
+    expect(await verifyPinned(candidate)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+      evidence: { path: "gate/check.cjs", expected: sha256(GATE_ENTRY), observed: sha256(UNCONDITIONAL_PASS) },
+    });
+    // Naming its own manifest's digest does not select it either.
+    expect(await verifyPinned(candidate, { pinnedManifestDigest: manifestDigest(own.value) })).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CONTRACT_DIGEST_MISMATCH,
+    });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+  });
+
+  it("RF-S22 arm:validator: a CONTRACT_CHANGE run is judged by the current gate, not the gate it proposes", async () => {
+    const proposed = "const app = require('../src/app.js');\nprocess.exit(app() >= 1 ? 0 : 1);\n";
+    const proposedManifest = { ...ENTRY_ONLY, gateEntries: [entry("gate/check.cjs", proposed)] };
+    const candidate = await frozenPinnedCandidate({
+      kind: RunKind.CONTRACT_CHANGE,
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      // #246 B2-a: a CONTRACT_CHANGE run proposes its manifest in full on its PLAN, which the freeze
+      // binds; the proposal is the new gate, through the same door a CTO uses.
+      afterDispatch: (harness, runId) => {
+        const submitted = createCtoMcpPort(harness.cp).submitPlan(runId, planCarrying(proposedManifest));
+        if (!submitted.allowed) throw new Error(submitted.message);
+      },
+      candidateChange: (repo) => writeFiles(repo, {
+        "gate/check.cjs": proposed,
+        ".agent-control-plane/project.json": `${JSON.stringify(proposedManifest, null, 2)}\n`,
+      }),
+    });
+    expect(candidate.run.kind).toBe(RunKind.CONTRACT_CHANGE);
+    // The proposal is bound to the run, and the pin it would replace is still the one that judges.
+    expect(candidate.snapshot.contractChange).toMatchObject({ manifestDigest: manifestDigest(normalized(proposedManifest)) });
+
+    expect(await verifyPinned(candidate)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+      evidence: { path: "gate/check.cjs", expected: sha256(GATE_ENTRY), observed: sha256(proposed) },
+    });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+  });
+
+  it("RF-S22 arm:validator: a helper the entry decides through is bound only when it is declared", async () => {
+    const helperChange = (repo: string): void => writeFiles(repo, { "gate/decide.cjs": UNCONDITIONAL_PASS });
+
+    // Undeclared, the helper is not loaded at all (round 5): rewriting it to exit 0 used to
+    // short-circuit the gate, and now ACP's loader refuses it and the gate fails.
+    const undeclared = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: helperChange,
+    });
+    const refusedAtLoad = await verifyProbing(undeclared, "gate/check.cjs");
+    expect(refusedAtLoad.launched).toBe(1);
+    expect(refusedAtLoad.result).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+    expect(refusedAtLoad.outcome?.stderr).toContain(GATE_RESOLUTION_REFUSED);
+
+    const declared = await frozenPinnedCandidate({
+      manifest: ENTRY_AND_HELPER,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: helperChange,
+    });
+    expect(await verifyPinned(declared)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+      evidence: { path: "gate/decide.cjs", expected: sha256(GATE_HELPER), observed: sha256(UNCONDITIONAL_PASS) },
+    });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+  });
+
+  /**
+   * #1082 R1-02 (round 3) — what pinned bytes decide must not depend on how the candidate's package
+   * configuration classifies them. A merge-gate review's counterexample: this self-contained gate
+   * exits 1 as CommonJS, where a sloppy-mode function's `this` is the global object, and exits 0
+   * as an ES module, where it is undefined. Pinned as `.js`, the candidate changed only
+   * package.json and flipped the verdict of unchanged bytes.
+   */
+  const CLASSIFIED_GATE = "if ((function () { return this; })()) process.exit(1);\nconsole.log('PACKAGE_TYPE_BYPASS');\n";
+  /** `node <path>` in `cwd`, with the environment the sandbox builds for `command`. */
+  const nodeProbe = (cwd: string, path: string, command: ProjectManifest["verificationCommands"][number]) => {
+    const ran = boundedSpawnSync(process.execPath, [path], {
+      cwd,
+      encoding: "utf8",
+      timeout: 5_000,
+      env: buildSandboxEnvironment(command, tempDir("acp-node-env-"), undefined, cwd),
+    });
+    return { exit: ran.status, stdout: ran.stdout };
+  };
+
+  it("RF-S22 arm:validator #1082 R1-02: package type can change the verdict of an unchanged self-contained js gate", async () => {
+    // The review's declaration, `.js`, is refused where it is declared, before any run exists.
+    const asJs = gateManifest([entry("gate/check.js", CLASSIFIED_GATE)]);
+    asJs.verificationCommands = [{ ...asJs.verificationCommands[0]!, argv: ["node", "gate/check.js"] }];
+    const unpinned = { issues: expect.arrayContaining([expect.objectContaining({ path: "gateEntries", refusal: GATE_ENTRY_MODULE_FORMAT_UNPINNED })]) };
+    expect(assertPortableManifest(asJs)).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: unpinned });
+    vi.mocked(runSandboxed).mockClear();
+    const harness = makeHarness();
+    expect(harness.cp.projects.register({
+      projectId: asJs.projectId,
+      name: "package-type",
+      manifest: asJs,
+      authorization: harness.cp.manifestAuthorizationForTests(asJs),
+    })).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: unpinned });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+
+    // The same bytes declared as `.cjs`: the review's run and its assertions. The candidate's
+    // package.json type no longer reaches them.
+    const path = "gate/check.cjs";
+    const m = gateManifest([entry(path, CLASSIFIED_GATE)]);
+    m.verificationCommands = [{ ...m.verificationCommands[0]!, argv: ["node", path] }];
+    let old: ReturnType<typeof nodeProbe> | undefined;
+    const c = await frozenPinnedCandidate({
+      manifest: m,
+      beforeRun: (repo) => {
+        writeFiles(repo, { [path]: CLASSIFIED_GATE, "package.json": '{"type":"commonjs"}\n' });
+        commitAll(repo, "strict gate");
+        old = nodeProbe(repo, path, m.verificationCommands[0]!);
+      },
+      candidateChange: (repo) => writeFiles(repo, { "package.json": '{"type":"module"}\n' }),
+    });
+    let observed: { probe: ReturnType<typeof nodeProbe>; bytes: string } | undefined;
+    const real = vi.mocked(runSandboxed).getMockImplementation()!;
+    vi.mocked(runSandboxed).mockImplementation(async (input) => {
+      observed = { probe: nodeProbe(input.worktreePath, path, m.verificationCommands[0]!), bytes: readFileSync(join(input.worktreePath, path), "utf8") };
+      return real(input);
+    });
+    let result;
+    try {
+      result = await verifyPinned(c);
+    } finally {
+      vi.mocked(runSandboxed).mockImplementation(real);
+    }
+    expect(old!.exit).toBe(1);
+    expect(observed!.bytes).toBe(CLASSIFIED_GATE);
+    expect(observed!.probe.exit, "candidate package type must not change trusted gate execution").toBe(1);
+    expect(result).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+  });
+
+  /**
+   * Runs `verifyPinned`. If a command is launched, `probe` is raw node -- no ACP loader -- on the
+   * entry in its worktree, and `outcome` is what the sandboxed command, under the loader, did.
+   */
+  const verifyProbing = async (candidate: Awaited<ReturnType<typeof frozenPinnedCandidate>>, entryPath: string) => {
+    let probe: ReturnType<typeof nodeProbe> | undefined;
+    let outcome: Awaited<ReturnType<typeof runSandboxed>> | undefined;
+    vi.mocked(runSandboxed).mockClear();
+    const real = vi.mocked(runSandboxed).getMockImplementation()!;
+    vi.mocked(runSandboxed).mockImplementation(async (input) => {
+      probe = nodeProbe(input.worktreePath, entryPath, candidate.manifest.verificationCommands[0]!);
+      outcome = await real(input);
+      return outcome;
+    });
+    try {
+      return { result: await verifyPinned(candidate), probe, outcome, launched: vi.mocked(runSandboxed).mock.calls.length };
+    } finally {
+      vi.mocked(runSandboxed).mockImplementation(real);
+    }
+  };
+  const WEAK = "console.log('HELPER_BYPASS'); process.exit(0);\n";
+
+  it.each([
+    ["mjs", "import { passes } from './decide.mjs';\nif (!passes) process.exit(1);\n", "export const passes = false;\n"],
+    ["cjs", "const { passes } = require('./decide.cjs');\nif (!passes) process.exit(1);\n", "module.exports = { passes: false };\n"],
+  ] as const)("RF-S22 arm:validator #1082 R1-02: a declared .%s helper is loaded by its pinned path whatever the candidate's package configuration says", async (ext, gate, helper) => {
+    // The control the CEO asked to keep: with explicit extensions, neither the entry nor the helper
+    // it names by relative path is re-pointed by a package.json type flip, an imports or exports
+    // map, or a sibling with another extension -- the gate runs and decides with its pinned helper.
+    const entryPath = `gate/check.${ext}`, helperPath = `gate/decide.${ext}`;
+    const m = gateManifest([entry(entryPath, gate), entry(helperPath, helper, entryPath)]);
+    m.verificationCommands = [{ ...m.verificationCommands[0]!, argv: ["node", entryPath] }];
+    for (const maps of [false, true]) {
+      const candidate = await frozenPinnedCandidate({
+        manifest: m,
+        beforeRun: (repo) => {
+          writeFiles(repo, { [entryPath]: gate, [helperPath]: helper });
+          commitAll(repo, "gate and helper");
+        },
+        candidateChange: (repo) => writeFiles(repo, {
+          "package.json": JSON.stringify({
+            type: ext === "mjs" ? "commonjs" : "module",
+            ...(maps ? { imports: { "#decide": "./bypass.mjs" }, exports: "./bypass.mjs", main: "./bypass.mjs" } : {}),
+          }),
+          "bypass.mjs": WEAK,
+          "gate/decide.js": WEAK,
+          "gate/decide": WEAK,
+          [`gate/decide.${ext === "mjs" ? "cjs" : "mjs"}`]: WEAK,
+          [`${helperPath}.js`]: WEAK,
+        }),
+      });
+      const ran = await verifyProbing(candidate, entryPath);
+      expect(ran.launched, `maps: ${maps}`).toBe(1);
+      expect(ran.probe!.exit).toBe(1);
+      expect(ran.outcome!.stdout).not.toContain("HELPER_BYPASS");
+      expect(ran.outcome!.stderr, "the pinned helper loaded").not.toContain(GATE_RESOLUTION_REFUSED);
+      expect(ran.result).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+    }
+  });
+
+  it("RF-S22 arm:validator #1082 R1-02: every declared executable helper must use .mjs or .cjs, without a fallback loader", () => {
+    // A closure review's witness: a `.txt` helper that a denylist admitted, and that node's
+    // `require` runs as JavaScript. It is refused where it is declared, before any run exists.
+    const code = "module.exports = false;\n";
+    const gate = "if (!require('./decide.txt')) { console.log('DECLARED_TXT_HELPER_EXECUTED'); process.exit(1); }\n";
+    const manifest = gateManifest([entry("gate/check.cjs", gate), entry("gate/decide.txt", code, "gate/check.cjs")]);
+    const repo = makeRepo({ "gate/check.cjs": gate, "gate/decide.txt": code });
+    // What admitting it would mean: node runs the declared .txt helper as code.
+    expect(nodeProbe(repo, "gate/check.cjs", manifest.verificationCommands[0]!).stdout).toContain("DECLARED_TXT_HELPER_EXECUTED");
+    const unpinned = { issues: expect.arrayContaining([expect.objectContaining({ refusal: GATE_ENTRY_MODULE_FORMAT_UNPINNED })]) };
+    expect(assertPortableManifest(manifest)).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: unpinned });
+    const harness = makeHarness();
+    expect(harness.cp.projects.register({
+      projectId: manifest.projectId,
+      name: "helper-format",
+      manifest,
+      authorization: harness.cp.manifestAuthorizationForTests(manifest),
+    })).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT, evidence: unpinned });
+  });
+
+  /**
+   * #1082 R1-02 (rounds 4 and 5) — routes by which a candidate's package configuration, or its own
+   * files, chose what an unchanged gate loads. In each, the pinned gate and its pinned helper
+   * `policy/strict.cjs` are untouched, raw node follows the route the candidate changed and runs
+   * the candidate's bypass, and under ACP's loader the route itself is refused at load: the gate
+   * fails and the bypass never runs. The first two are a closure review's round-5 counterexamples,
+   * the third its round-4 imports-map swap.
+   */
+  const STRICT_HELPER = "module.exports = { passes: false };\n";
+  const routedGate = (specifier: string): string => `if (!require(${specifier}).passes) process.exit(1);\n`;
+  it.each([
+    [
+      "a bare specifier whose package main the candidate re-points",
+      routedGate("'decider'"),
+      { "node_modules/decider/package.json": '{"main":"../../policy/strict.cjs"}\n' },
+      { "node_modules/decider/package.json": '{"main":"./bypass.cjs"}\n', "node_modules/decider/bypass.cjs": "console.log('ROUTE_BYPASS'); process.exit(0);\n" },
+    ],
+    [
+      "a directory whose package.json main the candidate re-points, outside every declared file's scope",
+      routedGate("'../routing'"),
+      { "routing/package.json": '{"main":"../policy/strict.cjs"}\n' },
+      { "routing/package.json": '{"main":"./bypass.cjs"}\n', "routing/bypass.cjs": "console.log('ROUTE_BYPASS'); process.exit(0);\n" },
+    ],
+    [
+      "an imports map the candidate swaps",
+      routedGate("'#decide'"),
+      { "package.json": JSON.stringify({ type: "commonjs", imports: { "#decide": "./policy/strict.cjs" } }) },
+      { "package.json": JSON.stringify({ type: "commonjs", imports: { "#decide": "./bypass.cjs" } }), "bypass.cjs": "console.log('ROUTE_BYPASS'); process.exit(0);\n" },
+    ],
+    [
+      "a dynamic require of a file the manifest does not declare",
+      "const { join } = require('node:path');\nif (!require(join(__dirname, '..', 'policy', 'lenient.cjs')).passes) process.exit(1);\n",
+      { "policy/lenient.cjs": STRICT_HELPER },
+      { "policy/lenient.cjs": "console.log('ROUTE_BYPASS'); process.exit(0);\n" },
+    ],
+  ] as const)("RF-S22 arm:validator #1082 R1-02: a gate cannot load through %s", async (_, gate, baseFiles, swap) => {
+    const m = gateManifest([entry("gate/check.cjs", gate), entry("policy/strict.cjs", STRICT_HELPER, "gate/check.cjs")]);
+    let before: ReturnType<typeof nodeProbe> | undefined;
+    const candidate = await frozenPinnedCandidate({
+      manifest: m,
+      beforeRun: (repo) => {
+        writeFiles(repo, { "gate/check.cjs": gate, "policy/strict.cjs": STRICT_HELPER, ...baseFiles });
+        commitAll(repo, "a gate that reaches its decision through a route");
+        before = nodeProbe(repo, "gate/check.cjs", m.verificationCommands[0]!);
+      },
+      candidateChange: (repo) => writeFiles(repo, swap),
+    });
+    // Raw node: the same pinned bytes decide differently once only the candidate's files change.
+    const after = nodeProbe(candidate.harness.repoPath, "gate/check.cjs", m.verificationCommands[0]!);
+    expect(before!.exit).toBe(1);
+    expect(after.exit).toBe(0);
+    expect(after.stdout).toContain("ROUTE_BYPASS");
+
+    const { result, outcome, launched } = await verifyProbing(candidate, "gate/check.cjs");
+    expect(launched).toBe(1);
+    expect(outcome!.stdout, "the candidate's bypass ran inside the gate").not.toContain("ROUTE_BYPASS");
+    expect(outcome!.stderr).toContain(GATE_RESOLUTION_REFUSED);
+    expect(result).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+  });
+
+  it("RF-S22 arm:validator #1082 R1-02: the loader fails closed: no registerHooks, no gate; and no worker thread", () => {
+    const repo = makeRepo({
+      "gate/check.cjs": "console.log('GATE_STARTED');\n",
+      "gate/worker.cjs": "require('node:worker_threads');\nconsole.log('WORKER_LOADED');\n",
+    });
+    const loader = (...paths: string[]) => gateResolutionPreload(paths.map((path) => join(realpathSync(repo), path)));
+    const run = (argv: string[]) => boundedSpawnSync(process.execPath, argv, { cwd: repo, encoding: "utf8", timeout: 10_000 });
+    // The control: the declared entry starts under the loader.
+    expect(run([loader("gate/check.cjs"), "gate/check.cjs"])).toMatchObject({ status: 0, stdout: "GATE_STARTED\n" });
+    // A node whose module.registerHooks is missing: the preload throws before the entry starts.
+    const withoutHooks = `--import=data:text/javascript,${encodeURIComponent("import m from 'node:module'; m.registerHooks = undefined;")}`;
+    const unhooked = run([withoutHooks, loader("gate/check.cjs"), "gate/check.cjs"]);
+    expect(unhooked.status).not.toBe(0);
+    expect(unhooked.stdout).not.toContain("GATE_STARTED");
+    expect(unhooked.stderr).toContain("registerHooks");
+    // A worker would run its module graph without the loader, so the builtin is refused.
+    const worker = run([loader("gate/worker.cjs"), "gate/worker.cjs"]);
+    expect(worker.status).not.toBe(0);
+    expect(worker.stdout).not.toContain("WORKER_LOADED");
+    expect(worker.stderr).toContain(GATE_RESOLUTION_REFUSED);
+  });
+
+  it("RF-S22 arm:validator #1082 R1-02: a normal gate with only declared helpers passes while the project's own package.json changes", async () => {
+    // The control: under the loader, a gate that loads its declared helper by relative path, and
+    // reads the candidate's code as data, runs and passes on the candidate's change -- with the
+    // project's package.json changed, and with root maps and a main present, none of which it uses.
+    for (const packageJson of [
+      { name: "fixture", private: true, version: "2.0.0", dependencies: { "left-pad": "1.3.0" } },
+      { name: "fixture", main: "src/app.js", exports: { ".": "./src/app.js" }, imports: { "#x": "./bypass.cjs" } },
+    ]) {
+      const candidate = await frozenPinnedCandidate({
+        manifest: ENTRY_AND_HELPER,
+        beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER, "package.json": '{"name":"fixture","private":true}\n' }),
+        candidateChange: (repo) => writeFiles(repo, {
+          "src/app.js": "module.exports = () => 2;\n",
+          "package.json": `${JSON.stringify(packageJson)}\n`,
+        }),
+      });
+      const passed = await verifyProbing(candidate, "gate/check.cjs");
+      expect(passed.launched).toBe(1);
+      expect(passed.result.allowed && passed.result.value.status, JSON.stringify(passed.outcome?.stderr)).toBe("PASS");
+    }
+  });
+
+  it("RF-S22 arm:validator W5: a pinned gate entry absent at the candidate head is refused, not skipped", async () => {
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: (repo) => {
+        rmSync(join(repo, "gate", "check.cjs"));
+        writeFiles(repo, { "src/app.js": "module.exports = () => 2;\n" });
+      },
+    });
+    expect(await verifyPinned(candidate)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+      evidence: { path: "gate/check.cjs", expected: sha256(GATE_ENTRY), observed: null, observedState: "ABSENT" },
+    });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+  });
+
+  it("RF-S22 arm:validator: a symlink whose stored bytes equal the pinned digest is refused as not a regular file", async () => {
+    // A symlink's blob is its target text, so a link whose target spells the pinned bytes has
+    // the pinned digest. The target is a file the candidate controls, so following it would run
+    // the candidate's gate. This gate's text is a single path component so the link resolves.
+    const STRICT_GATE = "process.exit(1)";
+    const manifest = gateManifest([entry("gate/check.cjs", STRICT_GATE)]);
+    const candidate = await frozenPinnedCandidate({
+      manifest,
+      beforeRun: commitGate({ "gate/check.cjs": STRICT_GATE }),
+      candidateChange: (repo) => {
+        writeFiles(repo, { [`gate/${STRICT_GATE}`]: UNCONDITIONAL_PASS });
+        rmSync(join(repo, "gate", "check.cjs"));
+        symlinkSync(STRICT_GATE, join(repo, "gate", "check.cjs"));
+      },
+    });
+    expect(gitSync(candidate.harness.repoPath, ["ls-tree", "HEAD", "--", "gate/check.cjs"])).toMatch(/^120000 blob /);
+    expect(gitSync(candidate.harness.repoPath, ["cat-file", "blob", "HEAD:gate/check.cjs"])).toBe(STRICT_GATE);
+
+    expect(await verifyPinned(candidate)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+      evidence: { path: "gate/check.cjs", observed: null, observedState: "NOT_A_REGULAR_FILE", observedMode: "120000" },
+    });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+  });
+
+  it("RF-S22 arm:validator: an entry that cannot be compared is refused as unverified, not compared", async () => {
+    // git's output reaches the engine decoded as UTF-8, so an invalid byte and a literal U+FFFD
+    // decode alike. The engine re-derives the blob id to tell them apart.
+    const PINNED = "// � marks the pinned bytes\nprocess.exit(1);\n";
+    const candidate = await frozenPinnedCandidate({
+      manifest: gateManifest([entry("gate/check.cjs", PINNED)]),
+      beforeRun: commitGate({ "gate/check.cjs": PINNED }),
+      candidateChange: (repo) => writeFileSync(
+        join(repo, "gate", "check.cjs"),
+        Buffer.concat([Buffer.from("// "), Buffer.from([0xff]), Buffer.from(" marks the pinned bytes\nprocess.exit(1);\n")]),
+      ),
+    });
+    expect(await verifyPinned(candidate)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CONTRACT_UNVERIFIED,
+      evidence: { path: "gate/check.cjs", expected: sha256(PINNED) },
+    });
+
+    const verifyAltered = (alter: (repository: (typeof candidate.snapshot.repositories)[number]) => void) => {
+      const altered = structuredClone(candidate.snapshot);
+      alter(altered.repositories[0]!);
+      return candidate.harness.cp.verification.verify({
+        runId: candidate.run.runId,
+        snapshot: altered,
+        commands: candidate.manifest.verificationCommands,
+        contractDigest: altered.contractDigest,
+      });
+    };
+    // A head git cannot list is not an absent entry either.
+    expect(await verifyAltered((repository) => { repository.candidateHead = "f".repeat(40); }))
+      .toMatchObject({ allowed: false, reasonCode: ReasonCode.CONTRACT_UNVERIFIED });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+  });
+
+  /**
+   * #1082 R1-01 — what the command executes, not only what the candidate committed. These are the
+   * review's counterexamples, kept: each left the pinned blob unchanged while preparation wrote a
+   * different gate into the worktree the command ran in.
+   */
+  const verifyObservingGate = async (candidate: Awaited<ReturnType<typeof frozenPinnedCandidate>>) => {
+    vi.mocked(runSandboxed).mockClear();
+    const real = vi.mocked(runSandboxed).getMockImplementation()!;
+    const executed: string[] = [];
+    vi.mocked(runSandboxed).mockImplementation(async (input) => {
+      executed.push(readFileSync(join(input.worktreePath, "gate", "check.cjs"), "utf8"));
+      return real(input);
+    });
+    try {
+      const verified = await candidate.harness.cp.verification.verify({
+        runId: candidate.run.runId,
+        snapshot: candidate.snapshot,
+        commands: candidate.manifest.verificationCommands,
+        contractDigest: candidate.snapshot.contractDigest,
+      });
+      return { verified, executed };
+    } finally {
+      vi.mocked(runSandboxed).mockImplementation(real);
+    }
+  };
+
+  // An LFS pointer is what a repository commits for an LFS-tracked file, so a pin over one is a
+  // pin over the pointer. The driver is not named `lfs`, which a host's own git-lfs configuration
+  // would claim before this fixture's could.
+  const LFS_POINTER = `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 14\n`;
+
+  it.each([
+    ["a smudge filter", "witness", false, GATE_ENTRY],
+    ["an LFS-shaped required filter over a pinned pointer", "media", true, LFS_POINTER],
+  ])("RF-S22 arm:validator #1082: %s the candidate selects runs no program and changes no gate byte during preparation", async (_, driver, required, pinned) => {
+    const programs = tempDir("acp-gate-filter-");
+    const ran = join(programs, "ran");
+    // Run through sh rather than exec'd, so no fresh executable is minted per run.
+    writeFileSync(join(programs, "smudge.sh"), `touch '${ran}'\nprintf 'process.exit(0);\\n'\n`);
+    const candidate = await frozenPinnedCandidate({
+      manifest: gateManifest([entry("gate/check.cjs", pinned)]),
+      beforeRun: (repo) => {
+        commitGate({ "gate/check.cjs": pinned, "gate/decide.cjs": GATE_HELPER })(repo);
+        gitSync(repo, ["config", `filter.${driver}.smudge`, `sh '${join(programs, "smudge.sh")}'`]);
+        gitSync(repo, ["config", `filter.${driver}.clean`, "cat"]);
+        if (required) gitSync(repo, ["config", `filter.${driver}.required`, "true"]);
+      },
+      // The candidate only selects the driver; app() still returns 1, and a pointer is not a
+      // program, so the pinned gate refuses this candidate either way.
+      candidateChange: (repo) => writeFiles(repo, { ".gitattributes": `gate/check.cjs filter=${driver}\n` }),
+    });
+
+    const { verified, executed } = await verifyObservingGate(candidate);
+    expect(existsSync(ran), "a repository-selected filter program ran outside the sandbox").toBe(false);
+    expect(executed).toEqual([pinned]);
+    expect(verified).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+  });
+
+  it.each([
+    // Left as `git replace` leaves it, the checkout is clean read unreplaced; preparation refuses.
+    ["left as replaced", false],
+    // Reset onto the replacement, its index is not the commit's own; freshness refuses.
+    ["reset onto the replacement", true],
+  ])("RF-S22 arm:validator #1082: a replace ref planted before the freeze, %s, cannot put a replacement gate in the worktree", async (_, reset) => {
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: (repo) => writeFiles(repo, { "src/app.js": "module.exports = () => 1;\n// candidate\n" }),
+      beforeFreeze: (repo) => {
+        const head = gitSync(repo, ["rev-parse", "HEAD"]);
+        writeFiles(repo, { "gate/check.cjs": UNCONDITIONAL_PASS });
+        gitSync(repo, ["add", "gate/check.cjs"]);
+        const replacement = gitSync(repo, ["commit-tree", gitSync(repo, ["write-tree"]), "-p", head, "-m", "replacement"]);
+        gitSync(repo, ["reset", "-q", "--hard", head]);
+        gitSync(repo, ["replace", head, replacement]);
+        if (reset) gitSync(repo, ["reset", "-q", "--hard", head]);
+      },
+    });
+    // The raw candidate still carries the pinned gate; only a replacement-honouring read differs.
+    expect(gitSync(candidate.harness.repoPath, ["--no-replace-objects", "show", "HEAD:gate/check.cjs"])).toBe(GATE_ENTRY.trimEnd());
+    expect(gitSync(candidate.harness.repoPath, ["show", "HEAD:gate/check.cjs"])).toBe(UNCONDITIONAL_PASS.trimEnd());
+
+    vi.mocked(runSandboxed).mockClear();
+    const outcome = await verifyPinned(candidate).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ reasonCode: ReasonCode.SNAPSHOT_STALE });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+  });
+
+  it("RF-S22 arm:validator #1082: a replace ref planted and removed around preparation cannot either", async () => {
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+    });
+    const repo = candidate.harness.repoPath;
+    const head = gitSync(repo, ["rev-parse", "HEAD"]);
+    writeFiles(repo, { "gate/check.cjs": UNCONDITIONAL_PASS });
+    gitSync(repo, ["add", "gate/check.cjs"]);
+    const replacement = gitSync(repo, ["commit-tree", gitSync(repo, ["write-tree"]), "-p", head, "-m", "race replacement"]);
+    gitSync(repo, ["reset", "-q", "--hard", head]);
+    const create = candidate.harness.cp.worktrees.create.bind(candidate.harness.cp.worktrees);
+    vi.spyOn(candidate.harness.cp.worktrees, "create").mockImplementation(async (...args) => {
+      gitSync(repo, ["replace", head, replacement]);
+      try {
+        return await create(...args);
+      } finally {
+        gitSync(repo, ["replace", "-d", head]);
+      }
+    });
+
+    await expect(verifyPinned(candidate)).rejects.toMatchObject({ reasonCode: ReasonCode.SNAPSHOT_STALE });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+  });
+
+  /**
+   * #1082 R1-01 round 2 — the source checkout is read too, by snapshot freshness, before and after
+   * the commands run. Its `git status` used to run a clean or process filter the candidate's
+   * `.gitattributes` selects, and the populated submodules' own configuration: measured, such a
+   * program kept freshness green and started a writer that rewrote the gate after it was checked.
+   * The program is configured after the freeze and the gate file is touched, so the source's
+   * status has to read its content during verification.
+   */
+  it.each([
+    ["a clean filter", false],
+    ["a required process filter", true],
+  ])("RF-S22 arm:validator #1082: %s the candidate selects in the source never runs during verification", async (_, processFilter) => {
+    const programs = tempDir("acp-source-filter-");
+    const ran = join(programs, "ran");
+    writeFileSync(join(programs, "filter.sh"), `touch '${ran}'\n${processFilter ? "exit 1" : "cat"}\n`);
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: (repo) => writeFiles(repo, { ".gitattributes": "gate/check.cjs filter=outside\n" }),
+    });
+    const repo = candidate.harness.repoPath;
+    gitSync(repo, ["config", `filter.outside.${processFilter ? "process" : "clean"}`, `sh '${join(programs, "filter.sh")}'`]);
+    if (processFilter) gitSync(repo, ["config", "filter.outside.required", "true"]);
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(repo, "gate", "check.cjs"), later, later);
+
+    const { verified, executed } = await verifyObservingGate(candidate);
+    expect(existsSync(ran), "a candidate-selected filter program ran while the source was read").toBe(false);
+    expect(executed).toEqual([GATE_ENTRY]);
+    expect(verified).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+  });
+
+  it("RF-S22 arm:validator #1082: a textconv program the candidate selects never runs while the candidate is frozen", async () => {
+    const programs = tempDir("acp-textconv-");
+    const ran = join(programs, "ran");
+    writeFileSync(join(programs, "textconv.sh"), `touch '${ran}'\ncat "$1"\n`);
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: (repo) => {
+        commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER })(repo);
+        gitSync(repo, ["config", "diff.outside.textconv", `sh '${join(programs, "textconv.sh")}'`]);
+      },
+      candidateChange: (repo) => writeFiles(repo, {
+        ".gitattributes": "src/app.js diff=outside\n",
+        "src/app.js": "module.exports = () => 1; // changed\n",
+      }),
+    });
+    // The freeze digested the patch between base and candidate, which touches the selected file.
+    expect(candidate.snapshot.repositories[0]!.touchedPaths).toContain("src/app.js");
+    const { executed } = await verifyObservingGate(candidate);
+    expect(existsSync(ran), "a candidate-selected textconv program ran while the candidate was read").toBe(false);
+    expect(executed).toEqual([GATE_ENTRY]);
+  });
+
+  it("RF-S22 arm:validator #1082: a populated submodule's own filter never runs while the source is read", async () => {
+    const programs = tempDir("acp-submodule-filter-");
+    const ran = join(programs, "ran");
+    writeFileSync(join(programs, "filter.sh"), `touch '${ran}'\ncat\n`);
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      // A nested repository the candidate commits as a gitlink, left populated in the source.
+      candidateChange: (repo) => {
+        gitSync(repo, ["init", "-q", "vendor/nested"]);
+        const nested = join(repo, "vendor", "nested");
+        writeFiles(nested, { "data.txt": "nested\n", ".gitattributes": "data.txt filter=inner\n" });
+        commitAll(nested, "nested");
+      },
+    });
+    const nested = join(candidate.harness.repoPath, "vendor", "nested");
+    gitSync(nested, ["config", "filter.inner.clean", `sh '${join(programs, "filter.sh")}'`]);
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(join(nested, "data.txt"), later, later);
+
+    const { verified, executed } = await verifyObservingGate(candidate);
+    expect(existsSync(ran), "a submodule's filter program ran while the source was read").toBe(false);
+    expect(executed).toEqual([GATE_ENTRY]);
+    expect(verified).toMatchObject({ allowed: false, evidence: { report: { results: [{ commandId: "verify", status: "FAIL" }] } } });
+  });
+
+  it("RF-S22 arm:validator #1082 R1-01: a populated submodule's own textconv and external diff never run while the candidate is frozen or verified", async () => {
+    // The freeze digests the patch between base and candidate. With `diff.submodule=diff`, a moved
+    // gitlink is rendered by a child git reading the nested repository's own configuration, which
+    // `--no-textconv` and `--no-ext-diff` do not reach (round-3 review, 1082-R1-01).
+    const programs = tempDir("acp-submodule-diff-");
+    const counter = join(programs, "executions");
+    const program = join(programs, "program.sh");
+    writeFileSync(program, `echo "$*" >> '${counter}'\n[ -f "$2" ] && cat "$2" || cat\n`);
+    const nestedOf = (repo: string): string => join(repo, "vendor", "nested");
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: (repo) => {
+        commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER })(repo);
+        // A nested repository recorded as a gitlink on the base branch and left populated.
+        gitSync(repo, ["init", "-q", "vendor/nested"]);
+        writeFiles(nestedOf(repo), { "data.txt": "old\n", ".gitattributes": "data.txt diff=inner\n" });
+        commitAll(nestedOf(repo), "nested base");
+        commitAll(repo, "record the nested repository");
+      },
+      // The candidate moves the gitlink to a new nested commit.
+      candidateChange: (repo) => {
+        writeFiles(nestedOf(repo), { "data.txt": "new\n" });
+        commitAll(nestedOf(repo), "nested candidate");
+      },
+      beforeFreeze: (repo) => {
+        gitSync(nestedOf(repo), ["config", "diff.external", `sh '${program}' external`]);
+        gitSync(nestedOf(repo), ["config", "diff.inner.textconv", `sh '${program}' textconv`]);
+        gitSync(repo, ["config", "diff.submodule", "diff"]);
+      },
+    });
+    expect(candidate.snapshot.repositories[0]!.touchedPaths).toContain("vendor/nested");
+    const { executed } = await verifyObservingGate(candidate);
+    const ran = existsSync(counter) ? readFileSync(counter, "utf8").split("\n").filter(Boolean) : [];
+    expect(ran, "nested-configuration program executions").toEqual([]);
+    expect(executed).toEqual([GATE_ENTRY]);
+  });
+
+  it("RF-S22 arm:validator #1082: a gate that preparation writes differently from its pin is refused before it runs", async () => {
+    // The object check passes: the committed blob is the pinned one. The checkout then converts
+    // it, so the bytes the command would execute are not the pinned bytes.
+    const candidate = await frozenPinnedCandidate({
+      manifest: ENTRY_ONLY,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+      candidateChange: (repo) => writeFiles(repo, { ".gitattributes": "gate/check.cjs text eol=crlf\n" }),
+    });
+    expect(await verifyPinned(candidate)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+      evidence: {
+        commandId: "verify",
+        path: "gate/check.cjs",
+        checkedIn: "VERIFICATION_WORKTREE",
+        expected: sha256(GATE_ENTRY),
+        observed: sha256(GATE_ENTRY.replaceAll("\n", "\r\n")),
+      },
+    });
+    expect(vi.mocked(runSandboxed)).not.toHaveBeenCalled();
+    expect(verificationTrees(candidate)).toBe(1);
+  });
+
+  it("RF-S22 arm:validator #1082: each gate command is checked immediately before it runs, after every earlier command", async () => {
+    const base = gateManifest([entry("gate/check.cjs", GATE_ENTRY)]);
+    const manifest: ProjectManifest = {
+      ...base,
+      verificationProfiles: { simple: ["prepare", "verify"], standard: ["prepare", "verify"], guarded: ["prepare", "verify"] },
+      verificationCommands: [
+        { ...base.verificationCommands[0]!, id: "prepare", argv: ["node", "-e", "process.exit(0)"] },
+        base.verificationCommands[0]!,
+      ],
+    };
+    const candidate = await frozenPinnedCandidate({
+      manifest,
+      beforeRun: commitGate({ "gate/check.cjs": GATE_ENTRY, "gate/decide.cjs": GATE_HELPER }),
+    });
+    // Modelled, not executed: on a host where an earlier command is not write-confined, whatever
+    // it left running can reach the gate command's worktree once preparation has written it. The
+    // spy writes there at that moment, which is the last point before the gate command starts.
+    const create = candidate.harness.cp.worktrees.create.bind(candidate.harness.cp.worktrees);
+    vi.spyOn(candidate.harness.cp.worktrees, "create").mockImplementation(async (...args) => {
+      const worktree = await create(...args);
+      if (args[2].includes("-verify-")) writeFileSync(join(worktree.path, "gate", "check.cjs"), UNCONDITIONAL_PASS);
+      return worktree;
+    });
+
+    expect(await verifyPinned(candidate)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+      evidence: { commandId: "verify", checkedIn: "VERIFICATION_WORKTREE", observed: sha256(UNCONDITIONAL_PASS) },
+    });
+    // The earlier command ran; the gate command never did.
+    expect(vi.mocked(runSandboxed)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runSandboxed).mock.calls[0]![0].command.id).toBe("prepare");
   });
 });

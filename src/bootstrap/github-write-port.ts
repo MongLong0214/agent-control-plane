@@ -96,12 +96,15 @@ export interface GitHubWritePort {
   observeRepository(target: GitHubRepositoryTarget): Promise<ObservedRepository | null>;
   /**
    * Returns GitHub's response to the create. The producer still re-reads it separately.
-   * `description` carries the producer's create marker, recorded before the call.
+   * `description` carries the producer's create marker, recorded before the call. `autoInit` is the
+   * create's initialization option, sent as stated: `true` only for a create-only plan (#246 C5),
+   * whose default branch GitHub then initializes; absent, the request states `auto_init: false`.
    */
   createRepository(
     target: GitHubRepositoryTarget,
     visibility: GitHubVisibility,
     description: string,
+    autoInit?: boolean,
   ): Promise<ObservedRepository>;
   observeBranch(target: GitHubRepositoryTarget, branch: string): Promise<ObservedBranch | null>;
   pushBranch(target: GitHubRepositoryTarget, branch: string, checkoutPath: string, commitSha: string): Promise<void>;
@@ -172,14 +175,30 @@ interface RepositoryDocument {
   default_branch?: unknown;
 }
 
+/**
+ * #246 C5, review C5I-R1-03 — a provider identity this port reports: non-empty printable ASCII with no
+ * whitespace, as every GitHub node id is. An empty or malformed one is no identity at all, so it can
+ * neither attribute a repository nor be recorded as the one a create was answered with.
+ */
+export const isGitHubNodeId = (value: unknown): value is string =>
+  typeof value === "string" ? /^[\x21-\x7e]{1,256}$/.test(value) : false;
+
+/** A full commit id: 40 hex digits (SHA-1) or 64 (SHA-256). */
+const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
 const repositoryFrom = (document: RepositoryDocument, path: string): ObservedRepository => {
   const nodeId = document.node_id;
   const fullName = document.full_name;
-  if (typeof nodeId !== "string") {
-    throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's repository answer carries no node id", { path });
+  // Review C5I-R1-03 — checked here, before any caller can record or accept the answer: an answer
+  // with no valid identity throws, and the caller keeps the request it answered in doubt.
+  if (!isGitHubNodeId(nodeId)) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's repository answer carries no valid node id", { path });
   }
   if (typeof fullName !== "string") {
     throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's repository answer carries no full name", { path });
+  }
+  if (!/^[^/\s]+\/[^/\s]+$/.test(fullName)) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's repository answer carries no owner/name full name", { path });
   }
   // `visibility` is the field; `private` is the older one GitHub still sends. Neither is
   // invented when both are missing — an unknown visibility cannot match an approved one.
@@ -281,7 +300,7 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         repositoryFrom(await client.request<RepositoryDocument>("GET", repoPath(target)), repoPath(target)),
       ),
 
-    async createRepository(target, visibility, description) {
+    async createRepository(target, visibility, description, autoInit = false) {
       // The endpoint decides the owner, so it is chosen from what GitHub says the owner is —
       // never assumed. `POST user/repos` creates under whoever is authenticated, whatever the
       // plan named; that is the user/organization confusion this refuses rather than risks.
@@ -306,7 +325,7 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         description,
         private: visibility === "private",
         visibility,
-        auto_init: false,
+        auto_init: autoInit,
       });
       return repositoryFrom(created, path);
     },
@@ -320,6 +339,13 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         const sha = document.commit?.sha;
         if (typeof sha !== "string") {
           throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's branch answer carries no head", {
+            path: branchPath(target, branch),
+          });
+        }
+        // Review C5I-R1-03 — the head is an identity the producer records and compares; an empty or
+        // partial one is no head.
+        if (!COMMIT_ID.test(sha)) {
+          throw acpError(ReasonCode.INTERNAL_ERROR, "GitHub's branch answer carries no full commit id", {
             path: branchPath(target, branch),
           });
         }

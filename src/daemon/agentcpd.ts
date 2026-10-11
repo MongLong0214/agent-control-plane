@@ -1213,18 +1213,41 @@ export const buzzPeerRegistry = (cp: ControlPlane): BuzzPeerRegistry => ({
     // the column, which is what makes a key's earlier holder visible — or this runtime carried it
     // while serving an earlier CEO generation. A runtime that served an earlier generation with no
     // identity, and took this one only later, holds an identity no earlier generation used.
-    const reused =
-      channelIdentity !== null &&
-      (cp.db.get<{ carried: number }>(
-        `SELECT EXISTS (SELECT 1 FROM sessions WHERE buzz_actor_id = ? AND session_id <> ?) AS carried`,
-        [channelIdentity, ceo.sessionId],
-      )?.carried !== 0 ||
-        identityUsedInAnEarlierCeoGeneration(cp, ceo.sessionId, channelIdentity, ceo.bindingGeneration));
+    //
+    // CEO 1791632040: one kind of other row is history rather than ambiguity — a terminal earlier
+    // CEO row (`buzzActorHolders`) that this runtime's own binding recovered the key past by proving
+    // possession, when the recovery's record names exactly the history rows there are now (count and
+    // set digest, `buzzActorRecoveryNames`). Any other holder, a row the record does not name, or a
+    // terminal earlier row the key was rebound past without a possession proof is still reuse.
+    //
+    // A recovered key's events then count from a boundary this daemon fixes (CEO 1791634542): the
+    // latest of the generation's start, the recovery's audit time and the verified answer's signed
+    // time, with the boundary's own second refused. That refuses an event dated at or before the
+    // recovery. It does not say when an event was signed — `created_at` is the signer's own claim —
+    // so an event the earlier generation signed before the recovery, dated past the boundary and held
+    // back, is admitted: the accepted Limit.
+    let reused = false;
+    let recoveryBoundary: string | null = null;
+    if (channelIdentity !== null) {
+      const holders = cp.sessions.buzzActorHolders(channelIdentity, ceo.sessionId);
+      const recovery = holders.history.length === 0 ? null : cp.sessions.buzzActorRecovery(ceo.sessionId, channelIdentity);
+      // An unreadable time cannot fix a boundary, so it fails closed as reuse.
+      const boundaryMs = recovery === null
+        ? Number.NaN
+        : Math.max(Date.parse(ceo.createdAt), Date.parse(recovery.at), recovery.answerSignedAt * 1000);
+      const recovered = recovery !== null && Number.isFinite(boundaryMs) &&
+        cp.sessions.buzzActorRecoveryNames(recovery, holders.history);
+      const onlyHistory = holders.blocking === null && (holders.history.length === 0 || recovered);
+      if (recovered && onlyHistory) recoveryBoundary = new Date(boundaryMs).toISOString();
+      reused = !onlyHistory ||
+        identityUsedInAnEarlierCeoGeneration(cp, ceo.sessionId, channelIdentity, ceo.bindingGeneration);
+    }
     return {
       bindingGeneration: ceo.bindingGeneration,
       sessionId: ceo.sessionId,
       channelIdentity,
       generationStartedAt: ceo.createdAt,
+      recoveryBoundary,
       channelIdentityReused: reused,
     };
   },
@@ -1770,7 +1793,9 @@ export const createDaemonBuzzBindChallenges = (cp: ControlPlane, policy: Ingress
           sessionId,
         });
       }
-      if (cp.sessions.otherSessionCarrying(actor, sessionId) !== null) {
+      // A terminal earlier CEO row is history the possession-proven write may take the key past
+      // (CEO 1791632040); any other holder is refused here, before a challenge exists.
+      if (cp.sessions.buzzActorHolders(actor, sessionId).blocking !== null) {
         return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another session row already carries this identity", {
           sessionId,
         });

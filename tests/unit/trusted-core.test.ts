@@ -18,7 +18,13 @@ import {
   verifySnapshotFreshness,
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
-import { assertPortableManifest, PROJECT_MANIFEST_SCHEMA_ID } from "../../src/contracts/manifest.ts";
+import {
+  assertPortableManifest,
+  GATE_ENTRY_MODULE_FORMAT_UNPINNED,
+  gateEntriesFor,
+  manifestDigest,
+  PROJECT_MANIFEST_SCHEMA_ID,
+} from "../../src/contracts/manifest.ts";
 import {
   __testing as sandboxTesting,
   buildSandboxEnvironment,
@@ -658,6 +664,166 @@ describe("portable project manifest (Integration §10.2)", () => {
       assertPortableManifest(firstActivation).allowed,
       "a first activation has no digest to state and must still be able to say so",
     ).toBe(true);
+  });
+
+  it("RF-S22 arm:validator W4: a manifest without gate entries keeps the digest it had before the field existed", () => {
+    // Golden values measured at b4087696, before `gateEntries` was added. Every stored
+    // `pinned_manifest_digest` and `active_manifest_digest` is one of these digests, so a default
+    // that made an absent field present would break every one of them.
+    const parsed = assertPortableManifest(base);
+    if (!parsed.allowed) throw new Error(parsed.message);
+    expect("gateEntries" in parsed.value).toBe(false);
+    expect(manifestDigest(parsed.value)).toBe("sha256:65bd321ae60be501826cfd667cfbf39385997c9a1b488a79b78c55c87c947bfc");
+
+    // The same for a manifest that leaves every defaulted field to the schema.
+    const minimal = assertPortableManifest({
+      schema: PROJECT_MANIFEST_SCHEMA_ID,
+      projectId: "minimal",
+      repositories: [{ role: "primary", remote: "github:acme/minimal" }],
+      branchProfile: {},
+      verificationProfiles: {},
+    });
+    if (!minimal.allowed) throw new Error(minimal.message);
+    expect("gateEntries" in minimal.value).toBe(false);
+    expect(manifestDigest(minimal.value)).toBe("sha256:ca1dc49e1f7a4724d696210edeeb89cb586a0e9a887a97bdfec77e1d7e5c47a2");
+  });
+
+  /** `base` with its one command running a gate script directly. */
+  const runsGate = (argv: string[], cwd = ".") => ({
+    ...base,
+    verificationCommands: [{ ...base.verificationCommands[0]!, argv, cwd }],
+  });
+  const gate = { path: "scripts/gate.mjs", repositoryRole: "primary", digest: `sha256:${"a".repeat(64)}` };
+  const refusedAt = (manifest: unknown) => {
+    const decision = assertPortableManifest(manifest);
+    expect(decision).toMatchObject({ allowed: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+    return (decision.evidence.issues as Array<{ path: string; message: string }>).map((issue) => issue.path);
+  };
+
+  it("RF-S22 arm:validator W5: a gate entry names a repository-relative file of a known repository by its sha256", () => {
+    expect(assertPortableManifest({ ...runsGate(["node", "scripts/gate.mjs"]), gateEntries: [gate] }).allowed).toBe(true);
+
+    // A helper's path is in no argv, so its own portability check is the one that refuses it. Each
+    // names its module format, so that refusal is the only one (#1082 R1-02, round 3).
+    for (const path of ["/abs/x.mjs", "../x.mjs", "scripts/../x.mjs", "~/x.mjs", "C:\\x.mjs"]) {
+      const helper = { ...gate, path, loadedBy: "scripts/gate.mjs" };
+      expect(assertPortableManifest({ ...runsGate(["node", "scripts/gate.mjs"]), gateEntries: [gate, helper] }), path).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.MANIFEST_NOT_PORTABLE,
+      });
+    }
+    // An empty list would read as a declaration that binds nothing; absent is the only "none".
+    const gated = runsGate(["node", "scripts/gate.mjs"]);
+    expect(refusedAt({ ...gated, gateEntries: [] })).toEqual(["gateEntries"]);
+    expect(new Set(refusedAt({ ...gated, gateEntries: [{ ...gate, repositoryRole: "secondary" }] }))).toEqual(new Set(["gateEntries"]));
+    expect(refusedAt({ ...gated, gateEntries: [{ ...gate, digest: "a".repeat(64) }] })).toEqual(["gateEntries.0.digest"]);
+  });
+
+  it("RF-S22 arm:validator #1082 R1-02: a gate entry is bound to the command that runs it directly, never through selection configuration", () => {
+    // A package script, an npm script or an option in front of the path re-points without the
+    // entry's bytes changing, so the candidate would choose what runs. Such a pin is refused.
+    for (const argv of [
+      ["node", "--run", "verify"],
+      ["npm", "test"],
+      ["node", "-e", "process.exit(0)", "scripts/gate.mjs"],
+      ["node", "SCRIPTS/gate.mjs"],
+      // Launch semantics, not spelling (#1082 R1-02 round 2): every one of these names the entry
+      // as its first argument, and none of them executes it as-is.
+      ["pnpm", "scripts/gate.mjs"],
+      ["npm", "scripts/gate.mjs"],
+      ["npx", "scripts/gate.mjs"],
+      ["yarn", "scripts/gate.mjs"],
+      ["bun", "scripts/gate.mjs"],
+      ["vitest", "scripts/gate.mjs"],
+      ["eslint", "scripts/gate.mjs"],
+      ["tsc", "scripts/gate.mjs"],
+      ["git", "scripts/gate.mjs"],
+      ["python3", "scripts/gate.mjs"],
+      ["deno", "run", "scripts/gate.mjs"],
+      ["node", "--require", "./x.cjs", "scripts/gate.mjs"],
+      ["node", "-r", "./x.cjs", "scripts/gate.mjs"],
+      ["node", "--import", "./x.mjs", "scripts/gate.mjs"],
+      ["node", "--loader", "./x.mjs", "scripts/gate.mjs"],
+      ["node", "--env-file", ".env", "scripts/gate.mjs"],
+      ["scripts/gate.mjs"],
+    ]) {
+      // Some of these are also outside the verification executable allowlist, a separate refusal.
+      expect(refusedAt({ ...runsGate(argv), gateEntries: [gate] }), argv.join(" ")).toContain("gateEntries");
+    }
+    // A TRUSTED_CI command runs where ACP cannot check the entry first, so it cannot carry one;
+    // BOTH_REQUIRED can, because its local run is checked before it starts.
+    const inMode = (evidenceMode: string) => ({
+      ...runsGate(["node", "scripts/gate.mjs"]),
+      verificationCommands: [{ ...runsGate(["node", "scripts/gate.mjs"]).verificationCommands[0]!, evidenceMode }],
+      gateEntries: [gate],
+    });
+    expect(new Set(refusedAt(inMode("TRUSTED_CI")))).toEqual(new Set(["gateEntries"]));
+    expect(assertPortableManifest(inMode("BOTH_REQUIRED")).allowed).toBe(true);
+    expect(assertPortableManifest(inMode("LOCAL_COMMAND")).allowed).toBe(true);
+    // Arguments after the entry are the script's own, not node's.
+    expect(assertPortableManifest({ ...runsGate(["node", "scripts/gate.mjs", "--strict"]), gateEntries: [gate] }).allowed).toBe(true);
+    // An interpreter reads a first argument that starts with "-" as its own option, not a script.
+    expect(refusedAt({ ...runsGate(["node", "-gate.mjs"]), gateEntries: [{ ...gate, path: "-gate.mjs" }] })).toEqual(["gateEntries"]);
+    for (const [argv, cwd] of [[["node", "scripts/gate.mjs"], "."], [["node", "./scripts/gate.mjs"], "."], [["node", "gate.mjs"], "scripts"]] as const) {
+      expect(assertPortableManifest({ ...runsGate([...argv], cwd), gateEntries: [gate] }).allowed, argv.join(" ")).toBe(true);
+    }
+
+    // A helper is declared under the entry that loads it, and the chain must end at a direct one.
+    const helper = { ...gate, path: "scripts/decide.mjs", loadedBy: "scripts/gate.mjs" };
+    const gated = runsGate(["node", "scripts/gate.mjs"]);
+    expect(assertPortableManifest({ ...gated, gateEntries: [gate, helper] }).allowed).toBe(true);
+    expect(refusedAt({ ...gated, gateEntries: [gate, { ...helper, loadedBy: "scripts/nowhere.mjs" }] })).toEqual(["gateEntries"]);
+    expect(refusedAt({ ...gated, gateEntries: [gate, { ...helper, loadedBy: "scripts/decide.mjs" }] })).toEqual(["gateEntries"]);
+    expect(refusedAt({ ...gated, gateEntries: [gate, gate] })).toEqual(["gateEntries"]);
+
+    // What a run is held to is per selected command: the entry it runs and the helpers under it.
+    const parsed = assertPortableManifest({
+      ...gated,
+      verificationCommands: [
+        gated.verificationCommands[0]!,
+        { ...gated.verificationCommands[0]!, id: "lint", argv: ["npm", "run", "lint"] },
+      ],
+      gateEntries: [gate, helper],
+    });
+    if (!parsed.allowed) throw new Error(parsed.message);
+    const [test, lint] = parsed.value.verificationCommands;
+    expect(gateEntriesFor(parsed.value, test!).map((entry) => entry.path)).toEqual(["scripts/gate.mjs", "scripts/decide.mjs"]);
+    expect(gateEntriesFor(parsed.value, lint!)).toEqual([]);
+  });
+
+  it("RF-S22 arm:validator #1082 R1-02: a gate file names its module format in its extension, or is refused with its own code", () => {
+    // Every declared file, entry or helper, is exactly .mjs or .cjs: the only two extensions whose
+    // module format node takes from the extension alone (round 4: an allowlist, not a denylist).
+    const refusals = (manifest: unknown): string[] => {
+      const decision = assertPortableManifest(manifest);
+      if (decision.allowed) return [];
+      return (decision.evidence.issues as Array<{ refusal?: string }>).flatMap((issue) => (issue.refusal ? [issue.refusal] : []));
+    };
+    for (const path of ["scripts/gate.js", "scripts/gate.ts", "scripts/gate", "scripts/gate.MJS", "scripts/gate.json", "scripts/gate.txt"]) {
+      const manifest = { ...runsGate(["node", path]), gateEntries: [{ ...gate, path }] };
+      expect(refusals(manifest), path).toEqual([GATE_ENTRY_MODULE_FORMAT_UNPINNED]);
+      expect(refusedAt(manifest), path).toEqual(["gateEntries"]);
+    }
+    for (const path of ["scripts/gate.mjs", "scripts/gate.cjs"]) {
+      expect(assertPortableManifest({ ...runsGate(["node", path]), gateEntries: [{ ...gate, path }] }).allowed, path).toBe(true);
+    }
+
+    const gated = runsGate(["node", "scripts/gate.mjs"]);
+    const withHelper = (path: string) => ({ ...gated, gateEntries: [gate, { ...gate, path, loadedBy: "scripts/gate.mjs" }] });
+    // `.txt` and `.json` included: `require` runs an unknown extension as JavaScript, and that node
+    // can load a file is no reason to admit it.
+    for (const path of [
+      "scripts/decide.js", "scripts/decide.ts", "scripts/decide", "scripts/decide.JS",
+      "scripts/decide.txt", "scripts/thresholds.json", "scripts/decide.MJS", "scripts/decide.node",
+    ]) {
+      expect(refusals(withHelper(path)), path).toEqual([GATE_ENTRY_MODULE_FORMAT_UNPINNED]);
+      expect(refusedAt(withHelper(path)), path).toEqual(["gateEntries"]);
+    }
+    for (const path of ["scripts/decide.mjs", "scripts/decide.cjs"]) {
+      expect(assertPortableManifest(withHelper(path)).allowed, path).toBe(true);
+    }
+    // The code belongs to this refusal only: every other gateEntries refusal carries none.
+    expect(refusals({ ...gated, gateEntries: [gate, gate] })).toEqual([]);
   });
 });
 
