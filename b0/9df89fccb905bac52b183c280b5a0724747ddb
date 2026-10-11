@@ -1,0 +1,68 @@
+Limit: a raw INSERT into manifest_activation_grants is not refused by the schema, since no connection-local issue marker guards it; a raw writer can mint a row, and activation re-derives every fact it names from the run, its candidate, PLAN, review, packet and the live CEO binding
+Limit: a raw UPDATE that sets consumed_at on an unconsumed grant is admitted because it only moves forward, so a raw writer can pre-consume a grant and veto its activation; the run then cannot complete, which fails closed
+Limit: the projects guard accepts any consumed grant naming the exact move, so a raw writer that inserts and consumes a grant row can still move the pointer
+Ruled-out: connection-local marker functions for grant issue, consumption and pointer activation, with once-per-database capability claims | they stop only a writer that already holds the raw database handle, which the single-user, local threat model records as a Limit instead
+Warn: src/db/migrations.ts changes with v44: its bytes before this commit are the v43 pin 04bb01d5, and the frozen-authority pin needs a second party's independent digest of the new bytes, so the sealed-trace pin test fails until then
+Record-Id: r-b2bschema
+Follows: r-b2aassign
+Provenance: inherited 37ed4aa7686e354089e7414401a5b9853b17ddf5
+
+Limit: an in-process caller of ProductionGate.submitCeoDecision passes no ingress and is trusted as the live CEO session it names; only the MCP doors pass an authenticated session, and no normal path calls the gate in process
+Limit: consumption requires the live CEO binding to be the confirming actor, not retired and served by a READY session, at the confirming generation or a later one; a later generation of the same actor is taken as the official re-adoption the CEO ruled is no reason to re-approve
+Limit: a workflow the base declares byte for byte is not read again; activation reuses the base's exact-byte approval for it
+Ruled-out: the MANIFEST_CHANGE write guard on the run's CTO owner at activation | it admits only ACTIVE, READY_FOR_CEO_REVIEW and COMPLETED, never POST_MERGE_VERIFYING, and the CTO is not the CEO authority a grant records; the grant, the finalizer's completion capability and its running attempt bind activation instead
+Ruled-out: refusing an ordinary run's CONFIRM once its pin is superseded | the CEO ruled that runs already admitted keep running and verifying on their pin; only a CONTRACT_CHANGE whose base is no longer active is refused instead
+Warn: the grant reads the candidate's BLIND_REVIEW artifact rather than the packet's review summary, because a no-repository candidate's packet still records a not-applicable placeholder
+Warn: an in-flight candidate on a repository whose manifest digest moved is stale by snapshot freshness, as before; it re-freezes and is still verified against its own pin
+Warn: the existing-project branch of bootstrap activation was live for the same-manifest case, which returned before any grant check; only a move to another manifest could never succeed, and only that is refused
+Record-Id: r-b2bactivate
+Follows: r-b2bschema
+Provenance: inherited 32c70279935a77065a974374a50615612939b832
+
+Warn: a run listed as CONTRACT_CHANGE_RUN_WITHOUT_GRANT is not cancelled or recreated by anything here; the CTO does that, and its artifacts are kept
+Record-Id: r-b2bcleanup
+Follows: r-b2bactivate
+Provenance: inherited 309a39beab87b7b71181d07584499ba5ff2f9c33
+
+Limit: the end-to-end witness shows the next run pinning M1 and requiring unit-tests with BOTH_REQUIRED evidence and its CI workflow; it does not drive a failing node --test candidate through verification
+Limit: the race witness for the base compare-and-set stubs the CONFIRM overlap check to admit two grants on one base, which no normal path admits
+Record-Id: r-b2bwitness
+Follows: r-b2bcleanup
+Provenance: inherited 05c8c91bf8eb4263048f33bed2fafc292503b855
+
+Ruled-out: refusing a CEO CONFIRM while another CONTRACT_CHANGE of the project is confirmed | a run refused before its merge stays CEO_APPROVED, a state with no exit, and would block the project's contract changes for good; the finalizer serializes the finalizations instead
+Warn: a CONTRACT_CHANGE refused at PRE_MERGE stays CEO_APPROVED, which has no exit, and the watchdog's finalization sweep retries it and records the refusal on every tick, as it does for any CEO_APPROVED run that keeps refusing
+Record-Id: r-b2boverlap
+Follows: r-b2bwitness
+Provenance: inherited 7cd39cacb51214f0d8bcee80a069e7f1437370b6
+
+Ruled-out: listing projects in the census's NOT_APPEND_ONLY set | nothing legitimately replaces a project row, and leaving REPLACE open would move the active manifest with no grant, so the table is closed against it instead
+Record-Id: r-b2bprojectreplace
+Follows: r-b2boverlap
+Provenance: inherited 9f1ef270ac73dd7c156e0751339b3183067cdef0
+
+Limit: the FROZEN_BLOBS pin for src/db/migrations.ts (sha256 72487085, blob ca29c452) is the CTO's second-party digest of the bytes at 4356d8ab and matches this checkout's own computation; it is void if the file's bytes change
+Record-Id: r-b2bpin
+Follows: r-b2bprojectreplace
+Provenance: inherited 8ffbcd9286490cdc8714c7f1276fabfd4d75c6e8
+
+Limit: the grant's consumer columns are part of the v44 table in schema.sql and are not in its digest; the v44 migration reads the table and its trigger bodies from schema.sql by name, so src/db/migrations.ts is unchanged and its pin stands
+Limit: a raw UPDATE can re-bind an unconsumed grant's consumer, like the other raw-SQL Limits of the grant table; the consumed-once guard freezes every column once the grant is consumed
+Ruled-out: carrying the consumer on the finalization attempt row | finalization_attempts has no column for it and adding one needs a migration step in the pinned migrations.ts, so the consumer is durable on the grant instead and each attempt holds the one it started for
+Ruled-out: consuming on any live binding of the confirming actor | that authenticated the replacement binding rather than the consuming call, so an earlier session's call consumed after a re-adoption; the consumer is now the authenticated call's session instead
+Warn: after a re-adoption, every finalization attempt for an earlier consumer refuses with MANIFEST_ACTIVATION_AUTHORITY_STALE, and the watchdog retries it, until the live CEO re-enters with a CONFIRM of the same candidate
+Warn: an in-process caller can no longer confirm a CONTRACT_CHANGE at all; a recovery path that needs one must go through an authenticated door, and nothing internal does today
+Record-Id: r-b2br1authority
+Follows: r-b2bpin
+Provenance: inherited 9ae6284a2764ad0434be61b639303fbec1212683
+
+Limit: no exact-byte evidence is reused across revisions, so a CONTRACT_CHANGE always reads each workflow it names; a project whose base declares an unapproved workflow cannot activate a CONTRACT_CHANGE until that workflow is approved, and B2-a refuses changing a retained workflow's digest
+Ruled-out: deriving reusable evidence from an equal declaration in the base | an equal entry says nothing about the bytes at the revision being activated, so every workflow is read at that revision instead
+Record-Id: r-b2br1workflows
+Follows: r-b2br1authority
+Provenance: inherited 33ff2e789268f4ef919cb8871364f46a00c16531
+
+Warn: the staleness set is read by GitHub merge-proof handling to keep a proof pending; neither activation code reaches that path, so classifying them changes no decision today, and a future reader of the set should keep that in mind
+Record-Id: r-b2bstaleness
+Follows: r-b2br1workflows
+Provenance: inherited 18ab5feecf57e525ba814b022c53922264b6462f
