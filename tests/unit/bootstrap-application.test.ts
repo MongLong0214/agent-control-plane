@@ -1278,6 +1278,7 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
       const { first } = await interruptedAttempt(f, run);
       const before = footprint(first);
       const elsewhere = makeRepo({ "README.md": "# somewhere else\n" }, "main");
+      expect(gitSync(elsewhere, ["config", "--local", "--get", "maintenance.auto"])).toBe("false");
       const target = footprint(elsewhere);
       const second = attemptPath(f, run, 2);
       symlinkSync(elsewhere, second);
