@@ -26,6 +26,7 @@ import {
   revParse,
   treeOf,
   tryRevParse,
+  withoutRepositoryPrograms,
 } from "../git/git.ts";
 import { WorktreeAction, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
@@ -90,16 +91,33 @@ const lstatOrNull = (path: string): Stats | null => {
 const statusEntries = (stdout: string): string[] => stdout.split("\n").filter((line) => line.length > 0);
 
 /**
+ * What every git that prepares or judges a verification checkout runs with (#1082 R1-01): see
+ * `withoutRepositoryPrograms`. For a linked worktree, `--no-replace-objects` means the worktree
+ * holds the objects the candidate commit actually names; its tree is then compared with the one
+ * the source resolves the candidate to, which honours replacements as the snapshot does, so a
+ * replaced candidate is refused rather than reproduced, as the self-contained copy refuses it.
+ * Emptied filter drivers mean checkout writes the blob as stored: LFS content is not fetched into
+ * a verification worktree, and a command there sees the pointer files.
+ */
+const preparationOptions = withoutRepositoryPrograms;
+
+/**
  * The source checkout as a self-contained copy would have to match it: its HEAD, and every
  * tracked change or untracked, non-ignored file `git status` reports there. `--untracked-files=all`
  * because a repository's `status.showUntrackedFiles=no` would otherwise hide exactly the file a copy
  * of the commit drops. This reads the source the way `isClean` and the snapshot freshness check do,
- * except that it does not start the source's `core.fsmonitor` hook: measured, `git status` runs a
- * repository-configured fsmonitor program, and this read must not execute the original's config.
+ * under `withoutRepositoryPrograms`: measured, `git status` runs a repository-configured fsmonitor
+ * program and a candidate-selected clean or process filter, and this read must run none of them.
  */
 const sourceState = async (repositoryPath: string): Promise<{ head: string | null; status: string[] }> => {
   const head = await tryRevParse(repositoryPath, "HEAD");
-  const status = await git(repositoryPath, ["-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=all"]);
+  const status = await git(repositoryPath, [
+    ...(await preparationOptions(repositoryPath)),
+    "status",
+    "--porcelain",
+    "--untracked-files=all",
+    "--ignore-submodules=dirty",
+  ]);
   return { head, status: statusEntries(status.stdout) };
 };
 
@@ -175,18 +193,20 @@ export class WorktreeManager {
     // the disposable tree.
     const expectedHead = await revParse(repositoryPath, head);
     const expectedTree = await treeOf(repositoryPath, expectedHead);
+    const preparation = await preparationOptions(repositoryPath);
     try {
       // `worktree add` performs a checkout, which normally invokes a repository-local
       // post-checkout hook as the control-plane user. Candidate-controlled hooks therefore
       // must be disabled before Git has a chance to materialise any verification input.
-      requireAllowed(await addWorktree(repositoryPath, path, expectedHead, authorization.add));
+      requireAllowed(await addWorktree(repositoryPath, path, expectedHead, authorization.add, { gitOptions: preparation }));
 
       const [materializedHead, materializedTree, status] = await Promise.all([
         revParse(path, "HEAD"),
-        treeOf(path, "HEAD"),
+        git(path, [...preparation, "rev-parse", "HEAD^{tree}"]).then((result) => result.stdout.trim()),
         // Include untracked files explicitly: a hook that adds a replacement executable
-        // must not hide behind a repository's status.showUntrackedFiles preference.
-        git(path, ["status", "--porcelain", "--untracked-files=all"]),
+        // must not hide behind a repository's status.showUntrackedFiles preference. No
+        // fsmonitor either: it is a program the repository's configuration names.
+        git(path, [...preparation, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=dirty"]),
       ]);
       if (
         materializedHead !== expectedHead ||
