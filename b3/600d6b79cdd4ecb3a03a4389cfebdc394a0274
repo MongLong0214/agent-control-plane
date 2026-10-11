@@ -1,0 +1,6 @@
+Warn: a worker cleanup must reserve its session before awaiting the provider stop: the ownership check and the move out of READY happen in one transaction, because bind, switchTo and renewSameSession refuse only a session that is not READY; an ownership reread after the stop is too late to protect the resource
+Warn: continuity reserves an unbound worker session as ERROR, which can only go on to STOPPED; worker retirement reserves as DRAINING so a session whose own process outlives the stop stays live and is asked again on the next pass
+Warn: after a reservation, STOPPED is written only once the stop returned and the session's own recorded process is gone; otherwise the reserved state stays and the residual is recorded, and nothing moves the session back to READY
+Record-Id: r-workercleanupreserve
+Follows: r-workerretireswitchstop
+Provenance: inherited 99f4d8cf3b9bade8d6031618f5bb7686f92b2c41
