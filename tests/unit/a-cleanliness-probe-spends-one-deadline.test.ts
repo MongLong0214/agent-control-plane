@@ -1,0 +1,233 @@
+/**
+ * #1082 R3-01 — `isClean(cwd, { timeoutMs })` answers through two git processes, configuration
+ * discovery and then status, and the caller's bound covers both.
+ *
+ * The doctor hands `isClean` what is left of its sweep budget. A merge-gate review found the
+ * discovery read running under git's own 120s default instead: with discovery delayed 350ms, a
+ * 20ms request answered after about 734ms, while the prior status-only body answered in about
+ * 22ms. The first two cases are that witness and its control, with the review's assertion.
+ *
+ * The bounds here are logical budgets. A case asserts what the budget decides -- which process is
+ * started, which answer is counted, which reason is given -- and allows wall-clock slack for the
+ * operating system to deliver a kill and an answer; it does not claim 20ms of scheduling accuracy.
+ */
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { git, isClean } from "../../src/git/git.ts";
+import { cleanupTempDirs, gitSync, makeRepo } from "../helpers/fixtures.ts";
+import { stableFixtureBinDir } from "../helpers/stable-fixture-executable.ts";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  cleanupTempDirs();
+});
+
+/**
+ * A git that is slow to answer one kind of call, configuration discovery unless told otherwise.
+ * Its per-run settings live in the repository's `.git/acp-fixture-git`, never in this text, so the
+ * executable keeps one inode across runs. Every call it sees in such a repository is logged beside
+ * them.
+ */
+const SLOW_DISCOVERY_GIT = [
+  "#!/bin/sh",
+  'if [ "$1" = "-C" ] && [ -f "$2/.git/acp-fixture-git" ]; then',
+  '  . "$2/.git/acp-fixture-git"',
+  // Ignore SIGTERM before anything else, so a kill that lands early still finds it ignored.
+  "  case \"$*\" in *\"$DELAY_ON\"*) if [ -n \"$IGNORE_TERM\" ]; then trap '' TERM; fi;; esac",
+  "  printf '%s\\n' \"$*\" >> \"$2/.git/acp-fixture-git-calls\"",
+  '  case "$*" in *"$DELAY_ON"*) /bin/sleep "$DELAY";; esac',
+  "fi",
+  'exec "${REAL_GIT:-/usr/bin/git}" "$@"',
+  "",
+].join("\n");
+
+const realGit = execFileSync("/bin/sh", ["-c", "command -v git"], { encoding: "utf8", timeout: 5_000 }).trim();
+
+/** Runs `body` with the slow git first on PATH for a repository configured by `settings`. */
+const withSlowDiscovery = async <T>(
+  repo: string,
+  settings: { delaySeconds: number; ignoreTerm?: boolean; delayOn?: string },
+  body: () => Promise<T>,
+): Promise<{ result: T | { error: string; reasonCode: unknown }; elapsedMs: number; calls: string[] }> => {
+  writeFileSync(
+    join(repo, ".git", "acp-fixture-git"),
+    [
+      `DELAY=${settings.delaySeconds}`,
+      `DELAY_ON='${settings.delayOn ?? "config --name-only"}'`,
+      `REAL_GIT='${realGit}'`,
+      ...(settings.ignoreTerm ? ["IGNORE_TERM=1"] : []),
+      "",
+    ].join("\n"),
+  );
+  const bin = stableFixtureBinDir({ git: SLOW_DISCOVERY_GIT });
+  const prior = process.env.PATH;
+  process.env.PATH = `${bin}:${prior ?? ""}`;
+  const before = performance.now();
+  let result: T | { error: string; reasonCode: unknown };
+  try {
+    result = await body();
+  } catch (error) {
+    result = { error: String(error), reasonCode: (error as { reasonCode?: unknown }).reasonCode };
+  } finally {
+    // Assigning `undefined` would set the literal string "undefined" (every-git-call-has-a-time-bound).
+    if (prior === undefined) delete process.env.PATH;
+    else process.env.PATH = prior;
+  }
+  const elapsedMs = performance.now() - before;
+  const log = join(repo, ".git", "acp-fixture-git-calls");
+  const calls = existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [];
+  return { result, elapsedMs, calls };
+};
+
+const statusCalls = (calls: readonly string[]): string[] => calls.filter((call) => call.includes(" status "));
+
+/**
+ * The bound and delay of the cases that need the slow child to outlive its kill. The bound is
+ * logical; what it has to leave room for is the wrapper's own prologue -- `sh` starting, reading
+ * its settings and ignoring SIGTERM -- before the kill lands. Measured on a loaded host at 50ms, 8
+ * of 12 concurrent runs had `sh` killed before it got that far, so the case measured an ordinary
+ * kill, not a late settlement. 250ms leaves that room, and the delay is four times the bound.
+ */
+const LATE_BOUND_MS = 250;
+const LATE_DELAY_SECONDS = 1;
+
+describe("#1082 R3-01: one deadline bounds a cleanliness probe", () => {
+  it("RF-S22 arm:validator #1082 R3-01: isClean caller timeout also bounds its newly added config discovery", async () => {
+    const repo = makeRepo();
+    const { result, elapsedMs, calls } = await withSlowDiscovery(repo, { delaySeconds: 0.35 }, () =>
+      isClean(repo, { timeoutMs: 20 }),
+    );
+    // The review's assertion. 200ms is slack for the kill and the answer to be delivered, an order
+    // of magnitude under the 350ms discovery the bound has to cut short.
+    expect(elapsedMs, `config discovery ignored the caller time bound: ${JSON.stringify(result)}`).toBeLessThan(200);
+    expect(result).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
+    expect(statusCalls(calls), "status started after the shared bound was spent").toEqual([]);
+  });
+
+  it("RF-S22 arm:validator #1082 R3-01: control -- the slow fixture delays discovery only, so a status-only read stays inside the bound", async () => {
+    // The prior isClean body was this one status read. Under the same fixture it is back within
+    // the same slack whatever it answers, so the delay the first case cuts short is discovery's.
+    const repo = makeRepo();
+    const { elapsedMs, calls } = await withSlowDiscovery(repo, { delaySeconds: 0.35 }, () =>
+      git(repo, ["status", "--porcelain"], { timeoutMs: 20 }),
+    );
+    expect(elapsedMs).toBeLessThan(200);
+    expect(calls.some((call) => call.includes("config --name-only"))).toBe(false);
+  });
+
+  it("RF-S22 arm:validator #1082 R3-01: a discovery that settles after the deadline is not counted, and status is never started", async () => {
+    // The discovery ignores SIGTERM, so the bound's kill does not end it: it finishes its delay and
+    // exits, and Node settles that as an answer. The deadline is spent by then.
+    const repo = makeRepo();
+    const { result, calls } = await withSlowDiscovery(repo, { delaySeconds: LATE_DELAY_SECONDS, ignoreTerm: true }, () =>
+      isClean(repo, { timeoutMs: LATE_BOUND_MS }),
+    );
+    expect(result).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
+    expect(calls.filter((call) => call.includes("config --name-only"))).toHaveLength(1);
+    expect(statusCalls(calls), "a process was started after the shared bound was spent").toEqual([]);
+  });
+
+  // A child that outlives the bound's SIGTERM still settles, and Node hands back whatever that
+  // settlement is. Each row is a shape that was counted as something other than the bound.
+  it.each([
+    // Exits 0 with nothing to say: read as "clean".
+    ["exits 0 with no output, which read as git's answer", "status --porcelain", false, { exitCode: 0 }],
+    // Exits 1 with nothing to say: `allowFailure` read it as "no filter driver is configured".
+    ["exits 1 with no output, which allowFailure read as git saying no", "config --name-only", false, { exitCode: 1 }],
+    // Still writing when its pipe was destroyed: it died of SIGPIPE, read as a signal from elsewhere.
+    ["dies writing into the destroyed pipe, which read as an outside signal", "config --name-only", true, { reasonCode: ReasonCode.INTERNAL_ERROR }],
+  ] as const)("RF-S22 arm:validator #1082 R3-01: a git that settles after its bound is a timeout when it %s", async (_, delayOn, driver, before) => {
+    const repo = makeRepo();
+    // A configured filter driver gives discovery something to write.
+    if (driver) gitSync(repo, ["config", "filter.witness.clean", "cat"]);
+    const args = delayOn === "status --porcelain"
+      ? ["status", "--porcelain"]
+      : ["config", "--name-only", "--get-regexp", "^filter\\."];
+    const { result, calls } = await withSlowDiscovery(repo, { delaySeconds: LATE_DELAY_SECONDS, ignoreTerm: true, delayOn }, () =>
+      git(repo, args, { timeoutMs: LATE_BOUND_MS, allowFailure: true }),
+    );
+    // The child got far enough to ignore the kill, so this is the late settlement, not a plain kill.
+    expect(calls).toHaveLength(1);
+    // `before` is what the same settlement was reported as when a late settlement was counted.
+    expect(result, `previously ${JSON.stringify(before)}`).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
+  });
+
+  /**
+   * #1082 R3-01, round 4 — the shared deadline is an absolute instant on one monotonic clock, and a
+   * scheduling gap between computing what remains and launching the process grants nothing. These
+   * are a closure review's two witnesses, with its assertions: one models the clock exactly, one
+   * uses real monotonic time with a pause injected after the remaining-time sample. Both run real
+   * git. The sample positions are: the deadline, then per process its pre-check, its launch
+   * instant and its settlement.
+   */
+  const withClock = async (samples: readonly number[]) => {
+    const repo = makeRepo();
+    const observed: number[] = [];
+    vi.spyOn(performance, "now").mockImplementation(() => {
+      const next = samples[observed.length] ?? samples[samples.length - 1]!;
+      observed.push(next);
+      return next;
+    });
+    let result: unknown;
+    try {
+      result = { clean: await isClean(repo, { timeoutMs: 1000 }) };
+    } catch (error) {
+      const e = error as { reasonCode: unknown; evidence: unknown };
+      result = { reasonCode: e.reasonCode, evidence: e.evidence };
+    } finally {
+      vi.mocked(performance.now).mockRestore();
+    }
+    return { observed, result };
+  };
+
+  it("RF-S22 arm:validator #1082 R3-01: a status answer after the shared deadline cannot become success after a scheduling gap", async () => {
+    // Discovery: deadline 1000, checked at 1, launched at 1, settles at 2. Status: checked at 500,
+    // launched at 750, settles at 1001. Its own elapsed 251 is under the 500 the check saw.
+    const samples = [0, 1, 1, 2, 500, 750, 1001];
+    const { observed, result } = await withClock(samples);
+    expect(observed).toEqual(samples);
+    expect(result).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
+  });
+
+  it("RF-S22 arm:validator #1082 R3-01: a settlement exactly at the shared deadline is a timeout, and one just before it is an answer", async () => {
+    const at = await withClock([0, 1, 1, 2, 500, 750, 1000]);
+    expect(at.result).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
+    const before = await withClock([0, 1, 1, 2, 500, 750, 999]);
+    expect(before.result, "the control: the same sequence one millisecond earlier").toEqual({ clean: true });
+  });
+
+  it("RF-S22 arm:validator #1082 R3-01: a launch instant at or past the shared deadline starts nothing", async () => {
+    // The status check at 500 sees budget; the gap before its launch spends all of it.
+    const { result } = await withClock([0, 1, 1, 2, 500, 1000]);
+    expect(result).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT, evidence: { started: false } });
+  });
+
+  it("RF-S22 arm:validator #1082 R3-01: real monotonic time after a scheduling pause still cannot become clean", async () => {
+    const repo = makeRepo();
+    const realNow = performance.now.bind(performance);
+    const observed: number[] = [];
+    // A pause just after status samples its remaining budget. Every timestamp is real monotonic
+    // time; only the pause is injected, and it is longer than the whole budget.
+    vi.spyOn(performance, "now").mockImplementation(() => {
+      const sampled = realNow();
+      observed.push(sampled);
+      if (observed.length === 5) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      return sampled;
+    });
+    let result: unknown;
+    try {
+      result = { clean: await isClean(repo, { timeoutMs: 1000 }) };
+    } catch (error) {
+      const e = error as { reasonCode: unknown; evidence: unknown };
+      result = { reasonCode: e.reasonCode, evidence: e.evidence };
+    } finally {
+      vi.mocked(performance.now).mockRestore();
+    }
+    expect(result, JSON.stringify({ observed, result })).toMatchObject({ reasonCode: ReasonCode.GIT_TIMEOUT });
+  });
+});

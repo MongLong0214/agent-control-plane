@@ -8,7 +8,7 @@ import type { VerificationCommand } from "../contracts/verification-command.ts";
 import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
 import { RunKind } from "../domain/types.ts";
 import { parseGitHubIdentity } from "./github-write-port.ts";
-import { githubOperationSchema, preflightGitHubOperations, type GitHubOperation } from "./repo-factory-github.ts";
+import { githubOperationSchema, isCreateOnlyPlan, preflightGitHubOperations, type GitHubOperation } from "./repo-factory-github.ts";
 import {
   plannedBootstrapFiles,
   verificationKindRunning,
@@ -182,6 +182,14 @@ export const bootstrapPlanPreflight = (input: {
       ciWorkflows: manifest.ciWorkflows.map((workflow) => workflow.checkName),
     });
   }
+  // G0a (RF-018) — the same for CommitLore: this producer installs no CommitLore hook and observes no
+  // record, so a manifest that requires it would activate with the requirement silently unmet.
+  // `preferred` activates, with the activation result naming CommitLore as not observed.
+  if (manifest.commitlore.mode === "required") {
+    return unsupported("the manifest requires CommitLore, and this producer neither installs it nor observes any record", {
+      commitloreMode: manifest.commitlore.mode,
+    });
+  }
   const command = manifest.verificationCommands[0];
   if (manifest.verificationCommands.length !== 1) {
     return unsupported("this producer runs exactly one verification, and the manifest requires a different count", {
@@ -212,9 +220,12 @@ export const bootstrapPlanPreflight = (input: {
     });
   }
 
+  // #246 C5 — a create-only plan pushes nothing; its default branch is the one the manifest declares,
+  // and GitHub's initialized branch must be that one when it is read back. Otherwise it is the pushed
+  // ref, as before.
   const push = operations.find((operation) => operation.resourceType === "branch");
   const pushed = push === undefined ? null : parseGitHubIdentity(push.resourceIdentity);
-  const defaultBranch = pushed === null ? null : pushed.ref;
+  const defaultBranch = isCreateOnlyPlan(operations) ? manifest.branchProfile.defaultBranch : pushed === null ? null : pushed.ref;
   if (defaultBranch === null) {
     return refuse(
       ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
@@ -327,7 +338,8 @@ export const plannedBootstrapOutputs = (
       visibility: shape.value.visibility,
     },
     defaultBranch,
-    files: plannedBootstrapFiles(executable),
+    // #246 C5 — a create-only plan commits nothing: no file, the bootstrap content file included.
+    files: shape.value.createOnly ? [] : plannedBootstrapFiles(executable),
     githubOperations: shape.value.operations,
     verification: { commandId: command.id, argv: [...command.argv], cwd: command.cwd, kind: verificationKind },
     handoff: bootstrapActivationHandoff(manifest),
