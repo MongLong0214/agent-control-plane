@@ -1,0 +1,75 @@
+Limit: two attestation attempts for one session can overlap only after release() drops its lane; that is the race this scoping closes, and within one lane attempts stay serialized
+Warn: an attestation attempt's outcome is written for the incarnation and credential epoch it fixed before awaiting anything; a change that clears or sets the stored attestation from the session's current values instead lets a late failure of an earlier epoch take back a newer epoch's attestation
+Record-Id: r-b7d29c7e737a
+Provenance: inherited 71a626cf247b3c6bd7bd099d99069f71f2d23d67
+
+Limit: recovery runs only while the role's binding is ACTIVE and DRIVEN; a driven lineage whose binding was revoked by other means is not recovered here and is left for an operator
+Ruled-out: revoking the driven PRIMARY_CTO's binding on credential loss and renewing the same session at the next generation, as a run's BOOTSTRAP_CTO is, rather than keeping the binding ACTIVE | with no ACTIVE binding the next dispatch's ensurePrimaryCto spawns a new session for the role, and the handoff pinned to the original session could no longer be acknowledged
+Warn: the daemon's continuity pass skips revocation, coverage hold and failover for any PRIMARY_CTO whose holder has a driven-spawn record; a change that lets such a role reach the coverage path can replace its conversation with another session
+Record-Id: r-730001bd6b74
+Provenance: inherited e6b5326f4c1a5ef40fad7674b38ee1159951d77c
+
+Limit: the adopted-canonical part of the ownership proof has no witness: no fixture can make a freshly spawned session an adopted canonical runtime, so removing that check leaves every maintained witness green
+Limit: a session left REMAINING_STOP_FAILED or REMAINING_OWNERSHIP_UNVERIFIED is recorded but not retried by any sweep
+Warn: a driven spawn's cleanup stops a provider session only when ownership is proven (its one spawn record, no ACTIVE role held, not an adopted canonical runtime); anything else is recorded REMAINING and left running, and only a stop that returned is recorded STOPPED
+Record-Id: r-4f22331c9378
+Provenance: inherited e02d95e4d7574dd07ac935b631ea13ec6b13f634
+
+Limit: relinquish leaves the session's lane in place, so turns already queued for the newer credential still run in order
+Warn: a recovery that fails gives up custody only through relinquish(session, incarnation, epoch); calling release() there drops a newer epoch's credential, attestation and lane adopted since, and work is refused on a session that just proved itself
+Record-Id: r-d8f32c5ee39f
+Provenance: inherited 89d9c0e40cc1f2dc66f7fadc83b18ed0797838b4
+
+Limit: the re-checks before adoption and at completion have no witness of their own: adoption runs in the same turn of the event loop as the in-transaction comparison, and a binding that moves during the attestation already fails the attestation's own DRIVEN re-check, so removing either leaves every witness green
+Warn: a recovery's rotation, adoption and completion are each conditional on bindingMoved finding the role's current binding to be exactly the one it started from (assignment, generation, session, incarnation); re-reading a recoverable binding without comparing it lets another binding authorize rotating this session
+Warn: recovery starts only on a session whose one driven-spawn record names this role key and project; a SURVIVED move can put another role's driven session behind this role's binding
+Record-Id: r-918cd86f58de
+Provenance: inherited 7fba4a35edf14c60b32957841e3e82b68c037a84
+
+Limit: the review's R1-02 reproduction could not pass as written: its harness itself calls the provider stop after binding the cleanup target, so the maintained witness drives the same race and asserts the fix it asked for, a refused concurrent bind and no ACTIVE assignment on a stopped session
+Warn: a cleanup's ownership proof and the target's move out of READY are one transaction before the stop is awaited; every bind, same-session renewal and actor move admits only a READY session, so a new path that can make a non-READY session a holder reopens the race in which a cleanup stops a winner
+Record-Id: r-bed72ed50808
+Provenance: inherited 2d6be1ab7f0df46c6e6907f1b548162bfbbc4ba8
+
+Limit: the record carries no error text from the provider stop, so a stop failure's cause is not in the audit row; only its outcome and the resource are
+Warn: when a driven spawn's session row was never written, its cleanup is recorded under the run and project with the provider and conversation id; if that record cannot be written the spawn throws an error naming the untracked resource rather than the original failure alone
+Record-Id: r-611390860308
+Provenance: inherited 98a247c262c88dbe77fada3f428659124383358f
+
+Limit: the fence applies to PRIMARY_CTO failover only; other roles keep replacing the binding they read after admission, guarded by the existing generation check before the switch
+Warn: a PRIMARY_CTO failover replaces only the holder it fenced before its first await (same assignment, generation, session and incarnation after admission), and refuses again at the switch if the holder carries a driven-spawn record; reading the binding afresh after an await and replacing it lets a driven winner be swapped for a new session
+Record-Id: r-7c3a7158feab
+Provenance: inherited 1b3499476ccf275c12536f5105252f7a6ea89e25
+
+Limit: other roles keep the generation-only comparison, because a CEO whose runtime moves right before the switch is replaced as the attested-survival tests specify
+Warn: a PRIMARY_CTO failover is conditional on the exact holder it read (assignment, generation, runtime, incarnation), after provisioning and again inside switchTo through expectedCurrent; comparing only assignment and generation lets a surviving runtime move be replaced
+Record-Id: r-148c22f37e22
+Provenance: inherited 1d29e0da99f0306c9b050de9e7706df8459faab8
+
+Limit: restoration's own refusal of a provisioned session still only transitions its row; it is outside this failover path and not changed here
+Warn: a failover's unused replacement is retired only through #retireUnusedReplacement: reserve (no ACTIVE role, out of READY) in one transaction, then the provider's stop; a refusal path that only transitions the row to STOPPED leaves the provider session running and untracked
+Record-Id: r-3d0bf7f1dffb
+Provenance: inherited 5953e834accda346a4db39aa3fbc52320e7934e3
+
+Warn: recovery's driven-mode check is the only thing that refuses a session whose one spawn record names the role but whose creation actor no longer holds it before any capacity refresh or probe; without it the runtime still refuses the probe, but only after provider work starts
+Record-Id: r-c703df1ec888
+Provenance: inherited 208faf24dc1fb8401babe64b27e1045c15ef7ed4
+
+Limit: restoration's own refusal of a provisioned session still only transitions its row; it is outside the failover path and not changed here
+Warn: #retireUnusedReplacement proves a replacement nobody's in one transaction before it leaves READY: no ACTIVE assignment by its row, none as an actor's runtime, and not an adopted canonical runtime; a proof from ACTIVE assignments alone stops a canonical conversation whose assignment was revoked
+Record-Id: r-c4r2retirecanon
+Supersedes: r-3d0bf7f1dffb
+Provenance: inherited ceb3fadd9953b31dd8db20a8537a31ef56fced8d
+
+Limit: only refusals after the session row exists are retired: an exception while the row itself is written propagates without stopping the resource the provider already started
+Warn: every refusal in provisionRoutableSession after the provider started the session (route, provider probe, readiness) goes through #retireUnusedReplacement; a new refusal there that only transitions the row leaves the provider session running with nothing tracking it
+Record-Id: r-c4r2provisionstop
+Follows: r-c4r2retirecanon
+Provenance: inherited 3498b54bd9afab6bfadddef589589309fe0f450b
+
+Warn: a worker cleanup must reserve its session before awaiting the provider stop: the ownership check and the move out of READY happen in one transaction, because bind, switchTo and renewSameSession refuse only a session that is not READY; an ownership reread after the stop is too late to protect the resource
+Warn: continuity reserves an unbound worker session as ERROR, which can only go on to STOPPED; worker retirement reserves as DRAINING so a session whose own process outlives the stop stays live and is asked again on the next pass
+Warn: after a reservation, STOPPED is written only once the stop returned and the session's own recorded process is gone; otherwise the reserved state stays and the residual is recorded, and nothing moves the session back to READY
+Record-Id: r-workercleanupreserve
+Follows: r-workerretireswitchstop
+Provenance: inherited 99f4d8cf3b9bade8d6031618f5bb7686f92b2c41
