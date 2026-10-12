@@ -419,6 +419,13 @@ export class BindingRegistry {
       requireCurrentTargetAttestation?: boolean;
       takeover?: boolean;
       expectedCurrentGeneration?: number;
+      /**
+       * #246 C4-R2 — the exact binding the caller decided to replace: the switch is refused unless
+       * the role's current binding is still that assignment on that runtime and incarnation. A
+       * surviving move keeps the assignment and generation and changes only the runtime, so the
+       * generation alone does not say the holder is the same.
+       */
+      expectedCurrent?: { assignmentId: string; sessionId: string; sessionIncarnation: string };
     },
   ): Decision<RoleBinding> {
     // #664 — this body's writes (the runtime move, the revoke+mint+insert, the run
@@ -446,6 +453,18 @@ export class BindingRegistry {
             actualCurrentGeneration: current?.bindingGeneration ?? null,
           },
         );
+      }
+      if (
+        input.expectedCurrent !== undefined &&
+        (current?.assignmentId !== input.expectedCurrent.assignmentId ||
+          current.sessionId !== input.expectedCurrent.sessionId ||
+          current.sessionIncarnation !== input.expectedCurrent.sessionIncarnation)
+      ) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "the binding moved before the switch could be applied", {
+          roleKey,
+          expectedAssignmentId: input.expectedCurrent.assignmentId,
+          actualAssignmentId: current?.assignmentId ?? null,
+        });
       }
 
       // The kernel may have planned this switch while the actor still named an attested runtime.
