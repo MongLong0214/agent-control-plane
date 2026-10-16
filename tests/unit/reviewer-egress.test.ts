@@ -562,6 +562,25 @@ describe("gpt reviewer egress covers ChatGPT-authenticated Codex", () => {
     expect(record.jsonl).toContain('"host": "ab.chatgpt.com"');
   });
 
+  it("refuses to finalise direct-socket probes marked indeterminate even when they claim blocked", async () => {
+    const fixture = await makeFixture();
+    const lease = await acquireReviewerEgress(compiledPolicy(fixture.config), "gpt");
+    let probed = false;
+    try {
+      expect(await proxyStatus(lease.port, "api.openai.com")).toBe(200);
+      expect(await proxyStatus(lease.port, "api.anthropic.com")).toBe(403);
+      probed = true;
+    } finally {
+      if (!probed) await lease.abandon();
+    }
+    // Only `indeterminate` differs from the probe set the previous test finalises.
+    await expect(lease.finalise("reviewer-invocation", {
+      allowedEndpoint: { host: "api.openai.com", connected: true, statusCode: 200 },
+      deniedEndpoint: { host: "api.anthropic.com", denied: true, statusCode: 403 },
+      directSocket: blockedDirect("api.openai.com").map((probe) => ({ ...probe, indeterminate: true })),
+    })).rejects.toMatchObject({ failureCode: "REVIEWER_EGRESS_LOG_INVALID" });
+  });
+
   liveIt("still selects and proves a real deny probe outside the gpt allowlist", async () => {
     const fixture = await makeFixture();
     const lease = await acquireReviewerEgress(compiledPolicy(fixture.config), "gpt");

@@ -16,6 +16,7 @@ import { credentialBearingField } from "../db/audit.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import {
   REVIEWER_PROVIDER_ENDPOINTS,
+  reviewerEgressProbeIndeterminate,
   type ReviewerEgressConfig,
   type ReviewerEgressRecord,
 } from "./provider.ts";
@@ -350,7 +351,8 @@ class StartedReviewerEgressLease implements ReviewerEgressLease {
       !hasDeny ||
       !directModes.has("unset") ||
       !directModes.has("override") ||
-      probes.directSocket.some((probe) => probe.blocked !== true || probe.connected === true)
+      probes.directSocket.some((probe) => probe.blocked !== true || probe.connected === true) ||
+      [probes.allowedEndpoint, probes.deniedEndpoint, ...probes.directSocket].some(reviewerEgressProbeIndeterminate)
     ) {
       fail("REVIEWER_EGRESS_LOG_INVALID", "proxy JSONL does not corroborate all provider-only invocation probes and the generated allowlist binding");
     }

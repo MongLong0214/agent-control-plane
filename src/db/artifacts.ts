@@ -546,7 +546,7 @@ const reviewerEgressProbeSchema = z
     denied: z.boolean().optional(),
     blocked: z.boolean().optional(),
     // The live direct-socket probe always reports it, as `false` once the sandbox refused the
-    // socket. A `true` never reaches storage: the gate refuses a probe that is not `blocked`.
+    // socket. A `true` never reaches storage: finalise and the gate refuse any indeterminate probe.
     indeterminate: z.boolean().optional(),
     statusCode: z.number().int().nullable().optional(),
     errorCode: z.string().nullable().optional(),

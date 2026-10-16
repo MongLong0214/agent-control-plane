@@ -173,6 +173,14 @@ export interface ReviewerEgressProbe {
 }
 
 /**
+ * A probe that could not tell what happened proves nothing, whatever `blocked`, `connected`
+ * or `statusCode` claim beside it. Every check that accepts returned or stored probes refuses
+ * it; `indeterminate: false` and a legacy probe without the field are judged as before.
+ */
+export const reviewerEgressProbeIndeterminate = (probe: ReviewerEgressProbe): boolean =>
+  probe.indeterminate === true;
+
+/**
  * Verbatim proxy evidence for one confined provider process. `jsonl` is copied only after
  * the daemon has stopped its proxy, so the bytes in a BLIND_REVIEW artifact are immutable
  * evidence for that invocation rather than a pointer to a mutable host log.
