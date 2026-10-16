@@ -388,17 +388,33 @@ const createHermesServerFromPort = (
         `The run must be BLOCKED for a CEO decision. The resolution, non-blank and at most ${ESCALATION_RESOLUTION_MAX_LENGTH} characters, is delivered to the run's owner, and the run becomes ACTIVE.`,
       inputSchema: { ...mutation, runId: z.string(), escalationId: z.number().int().positive(), resolution: z.string() },
     },
-    async (args) => {
+    async (args) => guarded(async () => {
       // The idempotency key names one request. The CEO_DECISION that answers it commits the key's
       // digest beside the request's, and `resolveEscalation` reads that record first, before any
       // state: the same request is answered with its first result, and the same key carrying
-      // anything else is refused, never answered as if it were the first request. The response this
-      // layer stores is only a copy, so when its reservation has none to answer with — the store
-      // failed after the decision committed, or a resend arrived while it was reserved — the
-      // decision record answers instead.
+      // anything else is refused, never answered as if it were the first request.
+      //
+      // That record, not the response `write()` stores, is the answer to a replay. So every call is
+      // authenticated first — the current-CEO fence included — then answered from the committed
+      // decision when one exists, and only then handed to `write()` and its cache: a cached response
+      // (a CONFLICT a changed retry left behind, a missing store) can never shadow a committed
+      // success. The record is read again after `write()` for a decision that committed while this
+      // request's reservation was held.
       const requestDigest = escalationRequestDigestOf(args.runId, args.escalationId, args.resolution);
       const answer = <T>(decision: Decision<T>) =>
         respond({ ...decision, evidence: { ...decision.evidence, requestDigest } } as Decision<T>);
+      const committed = (): ToolResult | null => {
+        const peer = authenticateMcpPeer(authenticate);
+        if (!peer.allowed || !peer.value.sessionId) return null;
+        const recorded = port.replayEscalationResolution(
+          args.idempotencyKey,
+          { runId: args.runId, escalationId: args.escalationId, resolution: args.resolution },
+          peer.value.sessionId,
+        );
+        return recorded ? answer(recorded) : null;
+      };
+      const before = committed();
+      if (before) return before;
       let executed = false;
       const result = await write(args.idempotencyKey, () => {
         executed = true;
@@ -411,24 +427,14 @@ const createHermesServerFromPort = (
             : deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "Hermes MCP peer has no session"));
       });
       if (executed) return result;
-      const outcome = result.structuredContent as { reasonCode?: unknown; evidence?: { requestDigest?: unknown } } | undefined;
-      if (outcome?.reasonCode === ReasonCode.INGRESS_REPLAY_IGNORED) {
-        const peer = authenticateMcpPeer(authenticate);
-        const committed = peer.allowed && peer.value.sessionId
-          ? port.replayEscalationResolution(
-              args.idempotencyKey,
-              { runId: args.runId, escalationId: args.escalationId, resolution: args.resolution },
-              peer.value.sessionId,
-            )
-          : null;
-        return committed ? answer(committed) : result;
-      }
-      const stored = outcome?.evidence?.requestDigest;
+      const after = committed();
+      if (after) return after;
+      const stored = (result.structuredContent as { evidence?: { requestDigest?: unknown } } | undefined)?.evidence?.requestDigest;
       if (stored === requestDigest || (stored === undefined && result.isError === true)) return result;
       return respond(deny(ReasonCode.CONFLICT, "this idempotencyKey already names a different request", {
         idempotencyKey: args.idempotencyKey,
       }));
-    },
+    }),
   );
 
   server.registerTool(

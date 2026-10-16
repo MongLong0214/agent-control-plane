@@ -60,10 +60,11 @@ export type MessageKind = (typeof MessageKind)[keyof typeof MessageKind];
  * `ESCALATION_REPLY` is deliberately not here, and is the one narrow exception to that rule.
  * The CEO's resolution of an escalation concerns the run the role owns, not the session that
  * asked, so the run's new owner can act on it; but it is not role-level intent any holder may
- * inherit either, since it answers one escalation of one run. So `Outbox.retargetOrReject`
- * carries a PENDING, unclaimed reply once, on a takeover, and only to the takeover's new owner
- * of that same run while the run is live, in the same project, and the escalation it answers is
- * still the run's latest; a claimed or sent reply, and every other case, is rejected as before.
+ * inherit either, since it answers one escalation of one run. So a PENDING, unclaimed reply is
+ * carried once — by `Outbox.retargetOrReject` on a takeover, or held at continuity's revocation
+ * and carried by `Outbox.carryHeldEscalationReplies` at the same owner's renewal — and only to the
+ * run's new owner while the run is live, in the same project, and the escalation it answers is
+ * still the run's latest; a claimed or sent reply, and every other case, is rejected.
  */
 export const RETARGETABLE_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
   MessageKind.RUN_DISPATCH,

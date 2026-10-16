@@ -903,6 +903,15 @@ export class BindingRegistry {
        * carry record says an earlier restart already carried them.
        */
       holdPeerMessagesForSameActorSuccessor?: { readonly alreadyCarried: string[] };
+      /**
+       * Hold this generation's PENDING, unclaimed ESCALATION_REPLY rows instead of rejecting them
+       * (`Outbox.retargetOrReject`'s escalation-reply hold), for the same session's renewal of the
+       * run's owner at the next generation to carry once (`RunEngine.restoreRecoveredBootstrapOwner`).
+       * Only continuity's revocation of a BOOTSTRAP_CTO it will recover passes it: a recoverable
+       * generation replacement. Every other revoke — a run's end, an abandoned recovery, a release
+       * — rejects them as before.
+       */
+      holdEscalationRepliesForRenewal?: boolean;
     } = {},
   ): Decision<void> {
     return this.db.tx(() => {
@@ -930,14 +939,19 @@ export class BindingRegistry {
         current.bindingGeneration,
         current.bindingGeneration,
         current.sessionId,
-        options.holdPeerMessagesForSameActorSuccessor === undefined
-          ? {}
-          : {
-            holdPeerMessagesAddressedTo: {
-              sessionId: current.sessionId,
-              alreadyCarried: options.holdPeerMessagesForSameActorSuccessor.alreadyCarried,
-            },
-          },
+        {
+          ...(options.holdPeerMessagesForSameActorSuccessor === undefined
+            ? {}
+            : {
+              holdPeerMessagesAddressedTo: {
+                sessionId: current.sessionId,
+                alreadyCarried: options.holdPeerMessagesForSameActorSuccessor.alreadyCarried,
+              },
+            }),
+          ...(options.holdEscalationRepliesForRenewal === true && current.role === Role.BOOTSTRAP_CTO
+            ? { holdEscalationRepliesForRenewal: true }
+            : {}),
+        },
       );
       // Nothing to retarget onto — everything pending for a revoked role is stale.
       for (const id of fence.retargeted) {
