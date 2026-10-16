@@ -116,9 +116,13 @@ describe("escalation_resolve: the CEO's door to a CTO escalation", () => {
       expect(decisions).toHaveLength(1);
       expect(decisions[0]!.session_id).toBe(f.ceoSessionId);
       const evidence = JSON.parse(decisions[0]!.evidence_json) as Record<string, unknown>;
-      expect(Object.keys(evidence).sort()).toEqual(["escalation", "escalationId", "resolutionDigest", "resolutionLength"]);
-      expect(evidence).toMatchObject({ escalation: true, escalationId, resolutionLength: LONG_RESOLUTION.length });
-      expect(evidence["resolutionDigest"]).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(Object.keys(evidence).sort()).toEqual([
+        "escalation", "escalationId", "idempotencyKeyDigest", "messageId", "requestDigest", "resolutionDigest", "resolutionLength",
+      ]);
+      expect(evidence).toMatchObject({ escalation: true, escalationId, messageId: reply!.messageId, resolutionLength: LONG_RESOLUTION.length });
+      for (const digest of ["resolutionDigest", "idempotencyKeyDigest", "requestDigest"]) {
+        expect(evidence[digest]).toMatch(/^sha256:[0-9a-f]{64}$/);
+      }
       expect(decisions[0]!.evidence_json).not.toContain("acp-new");
 
       // The driven owner is woken for it, reads it in band and acknowledges it.
@@ -165,8 +169,9 @@ describe("escalation_resolve: the CEO's door to a CTO escalation", () => {
 
       const advisory = await escalate(f, runId, ownerSessionId, false);
       expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+      // A non-blocking escalation is never the run's open escalation: it did not block the run.
       const notBlocked = await resolve(f, { runId, escalationId: advisory, resolution: "use acp-new" });
-      expect(notBlocked).toMatchObject({ ok: false, reasonCode: ReasonCode.RUN_TRANSITION_ILLEGAL });
+      expect(notBlocked).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { currentEscalationId: null } });
       expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
       expect(ceoDecisions(f, runId)).toEqual([]);
       expect(replies(f, runId)).toEqual([]);

@@ -94,7 +94,16 @@ const hideHelperWrites = (
  * added to `src` but never added here would defeat the point of this test the same way
  * an EXEMPT entry nothing consults defeats the census itself.
  */
-const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = [
+/**
+ * A behavioural witness that a refusal inside the site's transaction rolls back every write before
+ * it, named by its test file and its exact title. Only sites converted with such a witness name one.
+ */
+interface RollbackWitness { file: string; title: string }
+
+const DOOR_TEST = "tests/unit/ceo-escalation-resolve-door.test.ts";
+const DOOR_R1_TEST = "tests/unit/ceo-escalation-resolve-door-r1.test.ts";
+
+const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witnesses?: RollbackWitness[] }> = [
   {
     // The opener is concise, so the anchor is the whole line: reverting it to `tx` leaves a body
     // that still writes an audit row and still refuses after it, which is the trap shape.
@@ -108,6 +117,35 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     label: "CtoBindingDelegation.authorizeRelease",
     file: "ceo/cto-binding-delegation.ts",
     anchor: "    return this.db.txDecision(() => this.#authorizeRelease(rawPrincipal, rawRequest));",
+  },
+  {
+    // A refused BLOCKED transition takes back the CTO_ESCALATION record and the CEO's notification.
+    label: "ProductionGate.openEscalation",
+    file: "ceo/production-gate.ts",
+    anchor: "  openEscalation(escalation: Escalation): Decision<{ state: RunState; escalationId: number | null }> {\n    return this.db.txDecision(() => {",
+    witnesses: [
+      {
+        file: DOOR_R1_TEST,
+        title: "a refused blocking open leaves no audit, no notification and the first escalation current and resolvable; a non-blocking one does not shadow it",
+      },
+    ],
+  },
+  {
+    // Each refusal leaves the run BLOCKED, no CEO_DECISION and no ESCALATION_REPLY: the stale target
+    // before any write, and no owner, a refused enqueue or a refused decision record after the
+    // BLOCKED -> ACTIVE transition (and the enqueue) this transaction then takes back.
+    label: "ProductionGate.resolveEscalation",
+    file: "ceo/production-gate.ts",
+    anchor: "  ): Decision<EscalationResolution> {\n    return this.db.txDecision(() => {",
+    witnesses: [
+      {
+        file: DOOR_TEST,
+        title: "refuses a delayed request naming an earlier escalation once a newer one is open, and never resolves the newer one",
+      },
+      { file: DOOR_TEST, title: "rolls back when the reply cannot be enqueued: the run stays BLOCKED and the escalation stays open" },
+      { file: DOOR_R1_TEST, title: "rolls back when the run has no current owner: the run stays BLOCKED, no decision, no reply" },
+      { file: DOOR_R1_TEST, title: "rolls back when the CEO_DECISION record is refused: the transition and the reply are taken back" },
+    ],
   },
   {
     label: "VerificationEngine.pinRunScopedCommands",
@@ -406,6 +444,15 @@ class CensusProbeUnresolvableOpener {
     expect(done.stdout).toContain("methodThatIsNeverDefinedAnywhereInThisFile");
     expect(done.stdout).toContain("Seen but not classified");
     expect(done.status).toBe(1);
+  });
+
+  it("every rollback witness a converted site names exists, under its exact title", () => {
+    const named = CONVERTED_SITES.flatMap((site) => (site.witnesses ?? []).map((witness) => ({ site: site.label, ...witness })));
+    expect(named.length).toBeGreaterThan(0);
+    for (const witness of named) {
+      const source = readFileSync(join(ROOT, witness.file), "utf8");
+      expect(source, `${witness.site}: ${witness.file} has no test titled "${witness.title}"`).toContain(`"${witness.title}"`);
+    }
   });
 
   describe("fails when a converted call site regresses back to plain tx() — every real site, not just one", () => {

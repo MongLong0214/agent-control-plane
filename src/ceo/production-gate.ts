@@ -99,6 +99,14 @@ export interface EscalationResolution {
   messageId: string | null;
 }
 
+/** The identity of one `escalation_resolve` request: the run, the escalation it names, the resolution. */
+export const escalationRequestDigestOf = (runId: string, escalationId: number, resolution: string): string =>
+  digestOf({ runId, escalationId, resolution: digestOf(resolution) });
+
+/** The digest an `escalation_resolve` idempotency key is recorded under; the key itself is never stored. */
+const escalationKeyDigestOf = (idempotencyKey: string): string =>
+  digestOf({ door: "escalation_resolve", idempotencyKey });
+
 /**
  * #246 C3 — the bootstrap application record, as the CEO decision reads and completes it: a CONFIRM
  * completes a bootstrap only on a WRITTEN application of that candidate, and a FINAL_REVISE is
@@ -1787,53 +1795,64 @@ export class ProductionGate {
    * §20 — a CTO escalation. Non-blocking escalations leave the run ACTIVE so other work
    * continues; only a blocked critical path moves the run to BLOCKED. The escalation's identity is
    * its CTO_ESCALATION audit event, which the CEO's notification names as `escalationId`.
+   *
+   * One transaction: the CTO_ESCALATION record, the CEO's notification and the BLOCKED transition
+   * commit together or not at all. A refused opening — a second blocking escalation while the run
+   * is already BLOCKED, or no CEO to notify — leaves no record and no notification behind, so it can
+   * never become the run's current escalation in place of the one that blocked it.
    */
   openEscalation(escalation: Escalation): Decision<{ state: RunState; escalationId: number | null }> {
-    const run = this.runs.get(escalation.runId);
-    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: escalation.runId });
+    return this.db.txDecision(() => {
+      const run = this.runs.get(escalation.runId);
+      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: escalation.runId });
 
-    const recorded = this.audit.record({
-      kind: "CTO_ESCALATION",
-      runId: escalation.runId,
-      sessionId: escalation.openedBySessionId,
-      evidence: {
+      const recorded = this.audit.record({
+        kind: "CTO_ESCALATION",
+        runId: escalation.runId,
+        sessionId: escalation.openedBySessionId,
+        evidence: {
+          question: escalation.question,
+          options: escalation.options,
+          recommendation: escalation.ctoRecommendation,
+          blocksCriticalPath: escalation.blocksCriticalPath,
+        },
+      });
+      const escalationId = recorded.allowed ? recorded.value : null;
+
+      const notified = this.notify(NotificationKind.TRUE_ESCALATION, escalation.runId, {
+        ...(escalationId === null ? {} : { escalationId }),
         question: escalation.question,
         options: escalation.options,
         recommendation: escalation.ctoRecommendation,
+        whyItMatters: escalation.whyItMatters,
         blocksCriticalPath: escalation.blocksCriticalPath,
-      },
+      });
+      if (!notified.allowed) return notified as Decision<{ state: RunState; escalationId: number | null }>;
+
+      if (!escalation.blocksCriticalPath) return allow(ReasonCode.OK, { state: run.state, escalationId });
+
+      const transition = this.runs.transition(
+        escalation.runId,
+        RunState.BLOCKED,
+        "CEO_DECISION_REQUIRED",
+        { question: escalation.question },
+      );
+      if (!transition.allowed) return transition as Decision<{ state: RunState; escalationId: number | null }>;
+      return allow(ReasonCode.OK, { state: RunState.BLOCKED, escalationId });
     });
-    const escalationId = recorded.allowed ? recorded.value : null;
-
-    const notified = this.notify(NotificationKind.TRUE_ESCALATION, escalation.runId, {
-      ...(escalationId === null ? {} : { escalationId }),
-      question: escalation.question,
-      options: escalation.options,
-      recommendation: escalation.ctoRecommendation,
-      whyItMatters: escalation.whyItMatters,
-      blocksCriticalPath: escalation.blocksCriticalPath,
-    });
-    if (!notified.allowed) return notified as Decision<{ state: RunState; escalationId: number | null }>;
-
-    if (!escalation.blocksCriticalPath) return allow(ReasonCode.OK, { state: run.state, escalationId });
-
-    const transition = this.runs.transition(
-      escalation.runId,
-      RunState.BLOCKED,
-      "CEO_DECISION_REQUIRED",
-      { question: escalation.question },
-    );
-    if (!transition.allowed) return transition as Decision<{ state: RunState; escalationId: number | null }>;
-    return allow(ReasonCode.OK, { state: RunState.BLOCKED, escalationId });
   }
 
   /**
-   * The run's current open escalation: its latest CTO_ESCALATION, unless a CEO escalation decision
-   * was recorded after it. `audit_events` is append only, so this is the whole escalation record.
+   * The run's current open escalation: its latest blocking CTO_ESCALATION, unless a CEO escalation
+   * decision was recorded after it. Only an escalation that blocked the critical path counts: a
+   * non-blocking one never moved the run, so it neither shadows the one that did nor is resolved
+   * through this door. Every CTO_ESCALATION row is an admitted opening (`openEscalation` rolls a
+   * refused one back), and `audit_events` is append only, so this is the whole escalation record.
    */
   openEscalationOf(runId: string): { escalationId: number } | null {
     const opened = this.db.get<{ event_id: number }>(
-      `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CTO_ESCALATION' ORDER BY event_id DESC LIMIT 1`,
+      `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CTO_ESCALATION'
+         AND json_extract(evidence_json, '$.blocksCriticalPath') = 1 ORDER BY event_id DESC LIMIT 1`,
       [runId],
     );
     if (!opened) return null;
@@ -1846,20 +1865,95 @@ export class ProductionGate {
   }
 
   /**
-   * The CEO's answer to a CTO escalation, in one transaction: the CEO_DECISION record, BLOCKED →
-   * ACTIVE and the owner's ESCALATION_REPLY commit together or not at all. The reply carries the
-   * resolution text, bounded; the audit row carries only its digest and length.
+   * The committed answer to an `escalation_resolve` request, read from the CEO_DECISION that recorded
+   * its idempotency key: the same request is answered with that decision's result, and the same key
+   * naming anything else is refused. `null` when no decision carries the key. Read only; the door
+   * consults it when its own mutation reservation has no stored result to answer with.
+   */
+  escalationResolutionReplay(
+    idempotencyKey: string,
+    request: { runId: string; escalationId: number; resolution: string },
+    byCeoSession: string,
+  ): Decision<EscalationResolution> | null {
+    if (!this.assertCurrentCeo(byCeoSession).allowed) return null;
+    return this.#replayEscalationResolution(
+      escalationKeyDigestOf(idempotencyKey),
+      escalationRequestDigestOf(request.runId, request.escalationId, request.resolution),
+    );
+  }
+
+  #replayEscalationResolution(keyDigest: string, requestDigest: string): Decision<EscalationResolution> | null {
+    const prior = this.db.get<{ run_id: string; evidence_json: string }>(
+      `SELECT run_id, evidence_json FROM audit_events WHERE kind = 'CEO_DECISION'
+         AND json_extract(evidence_json, '$.idempotencyKeyDigest') = ? ORDER BY event_id LIMIT 1`,
+      [keyDigest],
+    );
+    if (!prior) return null;
+    const recorded = JSON.parse(prior.evidence_json) as { requestDigest?: unknown; escalationId?: unknown; messageId?: unknown };
+    if (recorded.requestDigest !== requestDigest) {
+      return deny(ReasonCode.CONFLICT, "this idempotencyKey already names a different request", { requestDigest });
+    }
+    return allow(ReasonCode.OK, {
+      runId: prior.run_id,
+      state: RunState.ACTIVE,
+      escalationId: typeof recorded.escalationId === "number" ? recorded.escalationId : null,
+      messageId: typeof recorded.messageId === "string" ? recorded.messageId : null,
+    });
+  }
+
+  /** Why the door refuses to resolve `escalationId` on this run now, or `null` when it may. */
+  #escalationTargetRefusal(run: RunRow, escalationId: number): Decision<EscalationResolution> | null {
+    const resolved = this.db.get<{ event_id: number }>(
+      `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION'
+         AND json_extract(evidence_json, '$.escalation') = 1 AND json_extract(evidence_json, '$.escalationId') = ? LIMIT 1`,
+      [run.runId, escalationId],
+    );
+    if (resolved) {
+      return deny(ReasonCode.CONFLICT, `escalation ${escalationId} is already resolved`, {
+        runId: run.runId,
+        escalationId,
+        resolved: true,
+      });
+    }
+    const open = this.openEscalationOf(run.runId);
+    if (open?.escalationId !== escalationId) {
+      return deny(ReasonCode.CONFLICT, "the escalation named is not this run's current open escalation", {
+        runId: run.runId,
+        escalationId,
+        currentEscalationId: open?.escalationId ?? null,
+      });
+    }
+    if (run.state !== RunState.BLOCKED || run.stateReason !== "CEO_DECISION_REQUIRED") {
+      return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is ${run.state}`, {
+        runId: run.runId,
+        state: run.state,
+        reason: run.stateReason,
+      });
+    }
+    return null;
+  }
+
+  /**
+   * The CEO's answer to a CTO escalation, in one transaction: BLOCKED → ACTIVE, the owner's
+   * ESCALATION_REPLY and the CEO_DECISION record commit together or not at all. The reply carries the
+   * resolution text, bounded; the audit row carries only its digest and length, the reply's message
+   * id and the run's project.
    *
    * `target` is the CEO door's binding (`escalation_resolve`): it resolves only the escalation it
    * names, and only while that is the run's current open escalation and the run is BLOCKED with
    * CEO_DECISION_REQUIRED, and it refuses rather than resolve with no reply enqueued. Without a
    * target, an in-process caller resolves the run's escalation without naming it, as before.
+   *
+   * The door's `idempotencyKey` is committed with the decision, as a digest beside the request's
+   * digest, and is looked up first, before any state is read: the same request answers with the
+   * recorded result, with no transition and no enqueue, and the same key naming anything else is
+   * refused. So a replay never depends on the MCP layer having stored its response.
    */
   resolveEscalation(
     runId: string,
     resolution: string,
     byCeoSession: string,
-    target?: { escalationId: number },
+    target?: { escalationId: number; idempotencyKey?: string },
   ): Decision<EscalationResolution> {
     return this.db.txDecision(() => {
       const run = this.runs.get(runId);
@@ -1873,35 +1967,20 @@ export class ProductionGate {
           { runId, resolutionLength: resolution.length },
         );
       }
-      if (target) {
-        const open = this.openEscalationOf(runId);
-        if (open?.escalationId !== target.escalationId) {
-          return deny(ReasonCode.CONFLICT, "the escalation named is not this run's current open escalation", {
-            runId,
-            escalationId: target.escalationId,
-            currentEscalationId: open?.escalationId ?? null,
-          });
-        }
-        if (run.state !== RunState.BLOCKED || run.stateReason !== "CEO_DECISION_REQUIRED") {
-          return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is ${run.state}`, {
-            runId,
-            state: run.state,
-            reason: run.stateReason,
-          });
-        }
+      const request = target?.idempotencyKey === undefined
+        ? null
+        : {
+            idempotencyKeyDigest: escalationKeyDigestOf(target.idempotencyKey),
+            requestDigest: escalationRequestDigestOf(runId, target.escalationId, resolution),
+          };
+      if (request) {
+        const replayed = this.#replayEscalationResolution(request.idempotencyKeyDigest, request.requestDigest);
+        if (replayed) return replayed;
       }
-      const recorded = this.audit.record({
-        kind: "CEO_DECISION",
-        runId,
-        sessionId: byCeoSession,
-        evidence: {
-          escalation: true,
-          escalationId: target?.escalationId ?? null,
-          resolutionDigest: digestOf(resolution),
-          resolutionLength: resolution.length,
-        },
-      });
-      if (target && !recorded.allowed) return recorded as Decision<EscalationResolution>;
+      if (target) {
+        const refused = this.#escalationTargetRefusal(run, target.escalationId);
+        if (refused) return refused;
+      }
       let state = run.state;
       if (run.state === RunState.BLOCKED) {
         const transition = this.runs.transition(runId, RunState.ACTIVE, "escalation resolved");
@@ -1910,29 +1989,40 @@ export class ProductionGate {
       }
       const ownerRoleKey = this.runs.ownerRoleKeyFor(run);
       const binding = ownerRoleKey ? this.bindings.active(ownerRoleKey) : null;
-      if (!binding) {
-        return target
-          ? deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "the run has no current owner to receive the resolution", { runId })
-          : allow(ReasonCode.OK, { runId, state, escalationId: null, messageId: null });
+      if (!binding && target) {
+        return deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "the run has no current owner to receive the resolution", { runId });
       }
-      const enqueued = this.outbox.enqueue({
-        idempotencyKey: target
-          ? `escalation-reply:${runId}:e${target.escalationId}`
-          : `escalation-reply:${runId}:${digestOf(resolution)}`,
-        roleKey: binding.roleKey,
-        bindingGeneration: binding.bindingGeneration,
-        targetSessionId: binding.sessionId,
+      const enqueued = binding
+        ? this.outbox.enqueue({
+            idempotencyKey: target
+              ? `escalation-reply:${runId}:e${target.escalationId}`
+              : `escalation-reply:${runId}:${digestOf(resolution)}`,
+            roleKey: binding.roleKey,
+            bindingGeneration: binding.bindingGeneration,
+            targetSessionId: binding.sessionId,
+            runId,
+            kind: MessageKind.ESCALATION_REPLY,
+            payload: target ? { runId, escalationId: target.escalationId, resolution } : { runId, resolution },
+          })
+        : null;
+      if (target && enqueued && !enqueued.allowed) return enqueued as Decision<EscalationResolution>;
+      const messageId = enqueued?.allowed ? enqueued.value.messageId : null;
+      const recorded = this.audit.record({
+        kind: "CEO_DECISION",
         runId,
-        kind: MessageKind.ESCALATION_REPLY,
-        payload: target ? { runId, escalationId: target.escalationId, resolution } : { runId, resolution },
+        projectId: run.projectId,
+        sessionId: byCeoSession,
+        evidence: {
+          escalation: true,
+          escalationId: target?.escalationId ?? null,
+          resolutionDigest: digestOf(resolution),
+          resolutionLength: resolution.length,
+          messageId,
+          ...(request ?? {}),
+        },
       });
-      if (target && !enqueued.allowed) return enqueued as Decision<EscalationResolution>;
-      return allow(ReasonCode.OK, {
-        runId,
-        state,
-        escalationId: target?.escalationId ?? null,
-        messageId: enqueued.allowed ? enqueued.value.messageId : null,
-      });
+      if (target && !recorded.allowed) return recorded as Decision<EscalationResolution>;
+      return allow(ReasonCode.OK, { runId, state, escalationId: target?.escalationId ?? null, messageId });
     });
   }
 

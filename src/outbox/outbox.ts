@@ -9,7 +9,8 @@ import { newMessageId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { FailureClass as FailureClassCode, type FailureClass } from "../domain/types.ts";
+import { isTerminal } from "../domain/run-state.ts";
+import { FailureClass as FailureClassCode, type FailureClass, type RunState } from "../domain/types.ts";
 import { ownerMessagePointerOf } from "../ingress/buzz-message.ts";
 import { IngressGuard } from "../ingress/ingress-guard.ts";
 import {
@@ -131,6 +132,8 @@ export interface DeliveryFailure {
 }
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
+/** The append-only record that an ESCALATION_REPLY followed a takeover; at most one per reply. */
+const ESCALATION_REPLY_CARRIED = "ESCALATION_REPLY_CARRIED";
 const MAX_RETRY_DELAY_MS = 30 * 60 * 1000;
 const RETRYABLE_FAILURE_CLASSES: ReadonlySet<FailureClass> = new Set([
   "transient",
@@ -1555,6 +1558,7 @@ export class Outbox {
 
     for (const row of pending) {
       const holderClaimed = HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind);
+      const escalationReply = row.kind === MessageKind.ESCALATION_REPLY;
       // Whether the restart's carry, not this fence, records the CEO's notice for this row.
       let noticeOwedByCarry = false;
       // The hold (2026-10-03). Only `PENDING` — a `SENT` peer row's outcome is unknown and it is
@@ -1609,9 +1613,19 @@ export class Outbox {
           toGeneration !== fromGeneration &&
           !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) &&
           this.#handOverEligible(row.message_id)
-        : row.status === "PENDING" &&
-          RETARGETABLE_KINDS.has(row.kind as MessageKind) &&
-          row.expires_at > now;
+        : escalationReply
+          ? // An ESCALATION_REPLY is not role-level intent (see `RETARGETABLE_KINDS`): it follows a
+            // takeover once, only while it is unclaimed and still PENDING, and only when the
+            // successor is the run's own new owner and the resolution still answers that run
+            // (`#escalationReplyCarriable`). Anything else falls through to the reject below.
+            row.status === "PENDING" &&
+            (row.claim_token ?? null) === null &&
+            toGeneration !== fromGeneration &&
+            row.expires_at > now &&
+            this.#escalationReplyCarriable(row, toGeneration, toSessionId)
+          : row.status === "PENDING" &&
+            RETARGETABLE_KINDS.has(row.kind as MessageKind) &&
+            row.expires_at > now;
       // Compare-and-set rather than a bare write, and for a holder-claimed row the set it asserts
       // includes *this row has not been carried before*. `PENDING` cannot tell the two apart: a
       // row a previous takeover moved looks exactly like one that was never moved, so `G1 -> G2`
@@ -1624,14 +1638,19 @@ export class Outbox {
       // `PENDING` cannot tell a row nobody was handed from one handed over and put back by a
       // statement either (review finding 01), so the set it asserts also includes *this row never
       // left PENDING*; a row that did falls through to the same reject.
+      //
+      // An ESCALATION_REPLY asserts the same *not carried before*, and *still unclaimed*, in the
+      // write itself; its append-only carry record is the second half of "once".
       const carriedOnce = holderClaimed
         ? ` AND (reason_code IS NULL OR reason_code <> ?) AND ${handOverEligibleSql("outbox")}`
-        : "";
+        : escalationReply
+          ? ` AND claim_token IS NULL AND (reason_code IS NULL OR reason_code <> ?)`
+          : "";
       const moved = retargetable
         ? this.db.run(
             `UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
                WHERE message_id = ? AND status = 'PENDING'${carriedOnce}`,
-            holderClaimed
+            holderClaimed || escalationReply
               ? [
                   toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id,
                   ReasonCode.OUTBOX_RETARGETED,
@@ -1641,6 +1660,25 @@ export class Outbox {
         : 0;
       if (moved === 1) {
         retargeted.push(row.message_id);
+        if (escalationReply) {
+          // The carry record: the original target, the successor, and the reply's own id as the
+          // correlation id. The row keeps its message id, so the successor is handed this one row
+          // and no copy of it exists to be delivered twice.
+          this.audit.record({
+            kind: ESCALATION_REPLY_CARRIED,
+            runId: row.run_id,
+            roleKey,
+            sessionId: toSessionId,
+            evidence: {
+              messageId: row.message_id,
+              correlationId: row.message_id,
+              fromGeneration,
+              fromSession: row.target_session_id,
+              toGeneration,
+              toSessionId,
+            },
+          });
+        }
       } else {
         this.db.run(
           `UPDATE outbox SET status = 'REJECTED', reason_code = ?,
@@ -1845,6 +1883,65 @@ export class Outbox {
   }
 
   /** Whether a CARRIED record exists for this message: the once-only rule, and nothing else is. */
+  /**
+   * Whether a takeover may carry this PENDING, unclaimed ESCALATION_REPLY to `toGeneration`'s holder,
+   * read in the takeover's own transaction after it repointed the role's live runs. All of these:
+   *
+   *   - the successor is the run's official new owner: the run is owned by this row's role at exactly
+   *     `toGeneration` on exactly `toSessionId` — the takeover's own repoint, not any holder of the role;
+   *   - the run is live: not cancelled and not otherwise terminal;
+   *   - the reply is the one a CEO_DECISION enqueued, for the escalation its payload names, and that
+   *     escalation is still the run's latest blocking one: a newer escalation makes it stale;
+   *   - the project is the same: the run's is the one the decision was recorded under, and the
+   *     successor's assignment has the project scope of the generation the reply was addressed to;
+   *   - it was never carried before: no carry record names it.
+   */
+  #escalationReplyCarriable(row: RawOutbox, toGeneration: number, toSessionId: string): boolean {
+    if (row.run_id === null) return false;
+    const run = this.db.get<{
+      state: RunState; project_id: string | null; owner_role_key: string | null;
+      owner_binding_generation: number | null; owner_session_id: string | null;
+    }>(
+      `SELECT state, project_id, owner_role_key, owner_binding_generation, owner_session_id FROM runs WHERE run_id = ?`,
+      [row.run_id],
+    );
+    if (!run || isTerminal(run.state)) return false;
+    if (run.owner_role_key !== row.role_key || run.owner_binding_generation !== toGeneration || run.owner_session_id !== toSessionId) {
+      return false;
+    }
+    let escalationId: unknown;
+    try {
+      escalationId = (JSON.parse(row.payload_json) as { escalationId?: unknown }).escalationId;
+    } catch {
+      return false;
+    }
+    if (typeof escalationId !== "number") return false;
+    const decision = this.db.get<{ project_id: string | null; escalation_id: unknown }>(
+      `SELECT project_id, json_extract(evidence_json, '$.escalationId') AS escalation_id FROM audit_events
+        WHERE run_id = ? AND kind = 'CEO_DECISION' AND json_extract(evidence_json, '$.messageId') = ?
+        ORDER BY event_id DESC LIMIT 1`,
+      [row.run_id, row.message_id],
+    );
+    if (!decision || decision.escalation_id !== escalationId || decision.project_id !== run.project_id) return false;
+    const latest = this.db.get<{ event_id: number | null }>(
+      `SELECT MAX(event_id) AS event_id FROM audit_events WHERE run_id = ? AND kind = 'CTO_ESCALATION'
+          AND json_extract(evidence_json, '$.blocksCriticalPath') = 1`,
+      [row.run_id],
+    );
+    if (latest?.event_id !== escalationId) return false;
+    const scopes = this.db.all<{ binding_generation: number; project_id: string | null }>(
+      `SELECT binding_generation, project_id FROM assignments WHERE role_key = ? AND binding_generation IN (?, ?)`,
+      [row.role_key, row.binding_generation, toGeneration],
+    );
+    const from = scopes.find((scope) => scope.binding_generation === row.binding_generation);
+    const to = scopes.find((scope) => scope.binding_generation === toGeneration);
+    if (!from || !to || from.project_id !== to.project_id) return false;
+    return this.db.get<{ present: number }>(
+      `SELECT 1 AS present FROM audit_events WHERE kind = ? AND json_extract(evidence_json, '$.messageId') = ?`,
+      [ESCALATION_REPLY_CARRIED, row.message_id],
+    ) === undefined;
+  }
+
   #peerMessageCarried(messageId: string): boolean {
     return this.db.get<{ present: number }>(
       `SELECT 1 AS present FROM peer_message_carries WHERE message_id = ? AND outcome = 'CARRIED'`,

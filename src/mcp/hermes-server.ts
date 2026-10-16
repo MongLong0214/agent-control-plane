@@ -3,10 +3,14 @@ import { z } from "zod";
 
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import type { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
-import { type CeoDecisionInput, ESCALATION_RESOLUTION_MAX_LENGTH, type ProductionGate } from "../ceo/production-gate.ts";
+import {
+  type CeoDecisionInput,
+  ESCALATION_RESOLUTION_MAX_LENGTH,
+  escalationRequestDigestOf,
+  type ProductionGate,
+} from "../ceo/production-gate.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { Clock } from "../core/clock.ts";
-import { digestOf } from "../core/digest.ts";
 import { type Decision, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { CtoLifecycle } from "../cto/cto-lifecycle.ts";
@@ -160,8 +164,13 @@ export const createHermesMcpPort = (
       return decision;
     },
     executeRepair: (input: Parameters<RepairService["execute"]>[0]) => source.repair.execute(input),
-    resolveEscalation: (runId: string, escalationId: number, resolution: string, ceoSessionId: string) =>
-      source.ceo.resolveEscalation(runId, resolution, ceoSessionId, { escalationId }),
+    resolveEscalation: (runId: string, escalationId: number, resolution: string, ceoSessionId: string, idempotencyKey: string) =>
+      source.ceo.resolveEscalation(runId, resolution, ceoSessionId, { escalationId, idempotencyKey }),
+    replayEscalationResolution: (
+      idempotencyKey: string,
+      request: { runId: string; escalationId: number; resolution: string },
+      ceoSessionId: string,
+    ) => source.ceo.escalationResolutionReplay(idempotencyKey, request, ceoSessionId),
   });
   HERMES_MCP_PORTS.add(port);
   return port;
@@ -380,24 +389,42 @@ const createHermesServerFromPort = (
       inputSchema: { ...mutation, runId: z.string(), escalationId: z.number().int().positive(), resolution: z.string() },
     },
     async (args) => {
-      // The idempotency key names one request. A replay of it answers with its first result, before
-      // any state is read; the same key carrying anything else is refused, never answered as if it
-      // were the first request.
-      const requestDigest = digestOf({ runId: args.runId, escalationId: args.escalationId, resolution: digestOf(args.resolution) });
+      // The idempotency key names one request. The CEO_DECISION that answers it commits the key's
+      // digest beside the request's, and `resolveEscalation` reads that record first, before any
+      // state: the same request is answered with its first result, and the same key carrying
+      // anything else is refused, never answered as if it were the first request. The response this
+      // layer stores is only a copy, so when its reservation has none to answer with — the store
+      // failed after the decision committed, or a resend arrived while it was reserved — the
+      // decision record answers instead.
+      const requestDigest = escalationRequestDigestOf(args.runId, args.escalationId, args.resolution);
+      const answer = <T>(decision: Decision<T>) =>
+        respond({ ...decision, evidence: { ...decision.evidence, requestDigest } } as Decision<T>);
       let executed = false;
       const result = await write(args.idempotencyKey, () => {
         executed = true;
         // The deciding session is the door's authenticated CEO peer, never an argument.
         const peer = authenticateMcpPeer(authenticate);
-        const decision = !peer.allowed
+        return answer(!peer.allowed
           ? peer
           : peer.value.sessionId
-            ? port.resolveEscalation(args.runId, args.escalationId, args.resolution, peer.value.sessionId)
-            : deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "Hermes MCP peer has no session");
-        return respond({ ...decision, evidence: { ...decision.evidence, requestDigest } } as typeof decision);
+            ? port.resolveEscalation(args.runId, args.escalationId, args.resolution, peer.value.sessionId, args.idempotencyKey)
+            : deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "Hermes MCP peer has no session"));
       });
-      const stored = (result.structuredContent as { evidence?: { requestDigest?: unknown } } | undefined)?.evidence?.requestDigest;
-      if (executed || stored === requestDigest || (stored === undefined && result.isError === true)) return result;
+      if (executed) return result;
+      const outcome = result.structuredContent as { reasonCode?: unknown; evidence?: { requestDigest?: unknown } } | undefined;
+      if (outcome?.reasonCode === ReasonCode.INGRESS_REPLAY_IGNORED) {
+        const peer = authenticateMcpPeer(authenticate);
+        const committed = peer.allowed && peer.value.sessionId
+          ? port.replayEscalationResolution(
+              args.idempotencyKey,
+              { runId: args.runId, escalationId: args.escalationId, resolution: args.resolution },
+              peer.value.sessionId,
+            )
+          : null;
+        return committed ? answer(committed) : result;
+      }
+      const stored = outcome?.evidence?.requestDigest;
+      if (stored === requestDigest || (stored === undefined && result.isError === true)) return result;
       return respond(deny(ReasonCode.CONFLICT, "this idempotencyKey already names a different request", {
         idempotencyKey: args.idempotencyKey,
       }));
