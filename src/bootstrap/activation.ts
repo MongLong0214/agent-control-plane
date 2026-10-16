@@ -18,7 +18,13 @@ import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import { tryRevParse } from "../git/git.ts";
-import { type BootstrapPlanBinding, currentBootstrapPlan, sameBootstrapPlanBinding } from "./bootstrap-plan.ts";
+import {
+  type BootstrapPlanBinding,
+  bootstrapPlanIntentTasks,
+  bootstrapReviewIntentCurrent,
+  currentBootstrapPlan,
+  sameBootstrapPlanBinding,
+} from "./bootstrap-plan.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
 import { parseRepoFactoryResult } from "./repo-factory-result.ts";
 
@@ -449,13 +455,15 @@ export class BootstrapActivation {
           verdict?: string;
           candidateSnapshotDigest?: string;
           bootstrapPlan?: BootstrapPlanBinding;
+          bootstrapPlanIntentDigest?: string;
         }>(runId, ArtifactKind.BLIND_REVIEW, candidateSnapshotDigest);
     if (!review || review.content.verdict !== "PASS" || review.content.candidateSnapshotDigest !== candidateSnapshotDigest) {
       return refuse("activation requires a passing blind review of the bootstrap run", {
         verdict: review?.content.verdict ?? null,
       });
     }
-    const current = currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+    const planArtifact = this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN);
+    const current = currentBootstrapPlan(runId, planArtifact);
     if (!current.allowed) {
       return refuse("the run's current PLAN has no planned outputs, so no passing review is bound to it", {
         refusal: "BOOTSTRAP_REVIEW_NOT_BOUND",
@@ -471,6 +479,15 @@ export class BootstrapActivation {
         current: current.value.binding,
       });
     }
+    // Review of #1119, BPI-R1-01 — and of the PLAN's current intent, its one task's included, which no
+    // binding digest covers. A review with no intent digest predates the check and needs a fresh one.
+    const intent = bootstrapReviewIntentCurrent({
+      runId,
+      reviewedIntentDigest: review.content.bootstrapPlanIntentDigest,
+      planArtifact,
+      tasks: bootstrapPlanIntentTasks(this.db, runId),
+    });
+    if (!intent.allowed) return refuse(intent.message, intent.evidence);
     return allow(ReasonCode.OK, { digest: review.digest, verdict: "PASS", binding: current.value.binding });
   }
 

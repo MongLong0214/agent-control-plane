@@ -1,13 +1,19 @@
 import { randomUUID } from "node:crypto";
 
-import { currentBootstrapPlan, isProjectlessBootstrap, sameBootstrapPlanBinding } from "../bootstrap/bootstrap-plan.ts";
+import {
+  bootstrapPlanIntentTasks,
+  bootstrapReviewIntentCurrent,
+  currentBootstrapPlan,
+  isProjectlessBootstrap,
+  sameBootstrapPlanBinding,
+} from "../bootstrap/bootstrap-plan.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
-import type { ArtifactStore } from "../db/artifacts.ts";
+import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunRow, RunState } from "../domain/types.ts";
@@ -81,6 +87,58 @@ const unavailableReviewEvidence = (candidateSnapshotDigest: string, denial: Evid
   }
   evidence["candidateSnapshotDigest"] = candidateSnapshotDigest;
   return evidence as Evidence;
+};
+
+/**
+ * The REVISION_RETURNED_TO_CTO row, built field by field as the UNAVAILABLE row is. The revision
+ * delivered to the CTO carries the review packet or the verification report whole, and spread into
+ * the row the reviewer's findings text (and the packet's egress JSONL) made the audit refuse it: the
+ * row kept `{auditEvidenceRejected:true}`, its stage and candidate gone with the rest (live run_7717,
+ * both REVISE rounds). So the row keeps the stage, the candidate, counts, severities and digests, and
+ * names the stored BLIND_REVIEW artifact by digest; the findings themselves are read from that
+ * verified artifact, never from the audit. The delivery is unchanged.
+ */
+const FINDING_SEVERITIES = ["INFO", "MINOR", "MAJOR", "BLOCKER"] as const;
+const MAX_AUDITED_FINDING_DIGESTS = 50;
+
+const revisionAuditEvidence = (
+  delivered: Record<string, unknown>,
+  review: { digest: string; content: ReviewPacket } | null,
+): Evidence => {
+  const candidateSnapshotDigest = boundedScalar(delivered["candidateSnapshotDigest"]) ?? null;
+  if (delivered["stage"] === "verification") {
+    const report = (delivered["report"] ?? null) as Partial<VerificationReport> | null;
+    return {
+      stage: "verification",
+      candidateSnapshotDigest,
+      reportDigest: digestOf(report),
+      status: boundedScalar(report?.status) ?? null,
+      expectedInputs: boundedScalar(report?.expectedInputs) ?? null,
+      observedInputs: boundedScalar(report?.observedInputs) ?? null,
+      results: Array.isArray(report?.results) ? report.results.length : null,
+      gaps: Array.isArray(report?.gaps) ? report.gaps.length : null,
+    } as Evidence;
+  }
+  if (review === null) return { stage: "blind-review", candidateSnapshotDigest, reviewArtifactDigest: null } as Evidence;
+  const packet = review.content;
+  const findings = Array.isArray(packet.findings) ? packet.findings : [];
+  const planDigest = packet.bootstrapPlan?.planDigest ?? packet.contractChange?.planDigest;
+  return {
+    stage: "blind-review",
+    candidateSnapshotDigest,
+    reviewArtifactDigest: review.digest,
+    reviewKind: packet.bootstrapPlan ? "BOOTSTRAP_PLAN" : packet.contractChange ? "CONTRACT_CHANGE" : "CANDIDATE",
+    verdict: boundedScalar(packet.verdict) ?? null,
+    findings: findings.length,
+    findingsBySeverity: Object.fromEntries(
+      FINDING_SEVERITIES.map((severity) => [severity, findings.filter((finding) => finding.severity === severity).length]),
+    ),
+    findingDigests: findings.slice(0, MAX_AUDITED_FINDING_DIGESTS).map((finding) => digestOf(finding)),
+    coveredFiles: packet.coveredFiles.length,
+    omittedItems: packet.omittedItems.length,
+    ...(planDigest === undefined ? {} : { planDigest: boundedScalar(planDigest) ?? null }),
+    ...(packet.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: boundedScalar(packet.bootstrapPlanIntentDigest) ?? null }),
+  } as Evidence;
 };
 
 export interface SubmitResultInput {
@@ -345,8 +403,10 @@ export class CandidatePipeline {
         // is not the CTO's next instruction for P2. So the PLAN is checked after the last await before
         // each thing this path does — the revision request or unavailable-review record
         // (`unpassedReview`), and the packet (below) — never only once after the review.
-        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
-          this.bootstrapPlanStillCurrent(input.runId, snapshot),
+        // A verdict rests on the review the gate stored, whose intent must still be the run's too
+        // (BPI-R1-01): a task replaced during the await keeps the PLAN binding and changes only that.
+        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, (verdict) =>
+          this.bootstrapPlanStillCurrent(input.runId, snapshot, verdict ? snapshotDigest : null),
         );
         if (unpassed !== null) return unpassed;
         if (this.#continuity?.evaluate) await this.#continuity.evaluate("pre-completion");
@@ -593,9 +653,10 @@ export class CandidatePipeline {
     attemptId: string,
     /**
      * Whether the candidate is still the one to act on, asked after the last await and before
-     * anything is delivered or recorded. A repository candidate's verdict is delivered as before.
+     * anything is delivered or recorded, told whether the outcome is a reviewer verdict (one the gate
+     * stored a review for). A repository candidate's verdict is delivered as before.
      */
-    stillCurrent: () => Decision<void> = () => allow(ReasonCode.OK, undefined),
+    stillCurrent: (verdict: boolean) => Decision<void> = () => allow(ReasonCode.OK, undefined),
   ): Promise<Decision<PipelineOutcome> | null> {
     if (reviewed.allowed) return null;
     // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
@@ -604,10 +665,6 @@ export class CandidatePipeline {
     // #246 C2, review round 2 (RF-REVIEW-02) — the review and the evaluation above were awaited, and
     // a bootstrap PLAN replaced during either makes this outcome stale: no revision request and no
     // unavailable-review record is produced for it. Nothing below awaits before either is written.
-    const current = stillCurrent();
-    if (!current.allowed) {
-      return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: current.reasonCode, snapshotDigest });
-    }
     // §18.7 — only a reviewer *verdict* enters the CTO revision loop. A lost isolation
     // or a provider that never answered is an assurance failure the candidate cannot
     // repair, so the gate is neither lowered nor handed to the CTO to "fix".
@@ -615,6 +672,10 @@ export class CandidatePipeline {
       reviewed.reasonCode === ReasonCode.REVIEW_REVISE ||
       reviewed.reasonCode === ReasonCode.REVIEW_BLOCK ||
       reviewed.reasonCode === ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT;
+    const current = stillCurrent(isVerdict);
+    if (!current.allowed) {
+      return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: current.reasonCode, snapshotDigest });
+    }
 
     if (!isVerdict) {
       this.audit.record({
@@ -835,12 +896,14 @@ export class CandidatePipeline {
       if (!enqueued.allowed) return enqueued as Decision<void>;
     }
 
+    // The delivery above carries `evidence` whole; the row keeps a fixed field list (revisionAuditEvidence).
+    const review = evidence["stage"] === "blind-review" ? this.storedReview(runId, String(evidence["candidateSnapshotDigest"])) : null;
     this.audit.record({
       kind: "REVISION_RETURNED_TO_CTO",
       runId,
       roleKey: binding?.roleKey ?? null,
       reasonCode: reasonCode as never,
-      evidence,
+      evidence: revisionAuditEvidence(evidence, review),
     });
 
     // §31.3 — revision count is run-scope telemetry. The FSM keeps a blind-review
@@ -855,6 +918,12 @@ export class CandidatePipeline {
       dims: { stage: evidence["stage"] ?? null, mode: run.executionMode },
     });
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /** The review gate's own BLIND_REVIEW artifact for a candidate, or null when the gate stored none. */
+  private storedReview(runId: string, candidateSnapshotDigest: string): { digest: string; content: ReviewPacket } | null {
+    const stored = this.artifacts.latestForSnapshot<ReviewPacket>(runId, ArtifactKind.BLIND_REVIEW, candidateSnapshotDigest);
+    return stored !== null && stored.producedBy === EVIDENCE_PRODUCERS.BLIND_REVIEW ? stored : null;
   }
 
   /**
@@ -882,10 +951,13 @@ export class CandidatePipeline {
   /**
    * #246 C2, review round 1 (RF-REVIEW-02) — a project-less bootstrap candidate's freshness: the PLAN
    * binding it froze is still the one the run's current PLAN artifact implies. A current PLAN with no
-   * plannable outputs has no binding, and is not the candidate's either.
+   * plannable outputs has no binding, and is not the candidate's either. Given the snapshot of a
+   * stored review an outcome rests on, that review's intent must also be the run's current one
+   * (`bootstrapReviewIntentCurrent`, review of #1119 BPI-R1-01).
    */
-  private bootstrapPlanStillCurrent(runId: string, snapshot: CandidateSnapshot): Decision<void> {
-    const current = currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+  private bootstrapPlanStillCurrent(runId: string, snapshot: CandidateSnapshot, reviewedSnapshotDigest: string | null = null): Decision<void> {
+    const planArtifact = this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN);
+    const current = currentBootstrapPlan(runId, planArtifact);
     const currentBinding = current.allowed ? current.value.binding : null;
     if (!sameBootstrapPlanBinding(currentBinding, snapshot.bootstrapPlan)) {
       return deny(ReasonCode.EVIDENCE_STALE, "the PLAN this candidate names was replaced while it was being judged", {
@@ -894,7 +966,14 @@ export class CandidatePipeline {
         current: currentBinding,
       });
     }
-    return allow(ReasonCode.OK, undefined);
+    if (reviewedSnapshotDigest === null) return allow(ReasonCode.OK, undefined);
+    const intent = bootstrapReviewIntentCurrent({
+      runId,
+      reviewedIntentDigest: this.storedReview(runId, reviewedSnapshotDigest)?.content.bootstrapPlanIntentDigest,
+      planArtifact,
+      tasks: bootstrapPlanIntentTasks(this.db, runId),
+    });
+    return intent.allowed ? allow(ReasonCode.OK, undefined) : (intent as Decision<void>);
   }
 
   /**
