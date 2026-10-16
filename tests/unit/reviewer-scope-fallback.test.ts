@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { ManualClock } from "../../src/core/clock.ts";
+import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ArtifactKind, Role, RunState } from "../../src/domain/types.ts";
@@ -66,8 +67,19 @@ const codexAdapter = (options: { codexHome: string; reviewerCodexHome?: string }
     ...options,
   });
 
-/** The preferred GPT reviewer: the fixture's GPT provider, whose packet reviewer is `codex()`'s. */
-const preferCodex = (f: BootstrapRuntimeFixture, codex: () => CodexCliAdapter, before: () => Error | null = () => null) => {
+/**
+ * The preferred GPT reviewer: the fixture's GPT provider, whose packet reviewer is `codex()`'s, and
+ * whose packet scope the gate reads through the port production wires to the raw Codex adapter.
+ */
+const preferCodex = (
+  f: BootstrapRuntimeFixture,
+  codex: () => CodexCliAdapter,
+  before: () => Error | null = () => null,
+  scopeReported: () => boolean = () => true,
+) => {
+  f.harness.cp.review.attach({
+    packetReviewerScope: (provider) => provider === "gpt" && scopeReported() ? codex().packetReviewerScope() : null,
+  });
   const start = f.gpt.startSession.bind(f.gpt);
   const invoke = f.gpt.invoke.bind(f.gpt);
   const isolated: SessionSpec[] = [];
@@ -183,8 +195,8 @@ describe("the packet reviewer falls back to claude only when its scope is UNCONF
 
       expect(await submitResult(f, runId, ownerSessionId)).toBe("COMPLETED_REVIEW");
       expect(f.harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
-      // GPT was asked first and refused before anything was spawned; Claude then reviewed once.
-      expect(isolated).toHaveLength(1);
+      // GPT was passed over on its UNCONFIGURED scope before any session or spawn; Claude reviewed once.
+      expect(isolated).toEqual([]);
       expect(calls).toEqual([]);
       expect(claude.asked()).toBe(1);
 
@@ -281,6 +293,74 @@ describe("the packet reviewer falls back to claude only when its scope is UNCONF
   });
 });
 
+describe("a configured scope never reaches the fallback, whatever stops its reviewer (R1-01)", () => {
+  const noFallback = (f: BootstrapRuntimeFixture, runId: string, claude: { asked: () => number }) => {
+    expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+    expect(claude.asked()).toBe(0);
+    expect(auditOf(f, "BLIND_REVIEW_FALLBACK", runId)).toEqual([]);
+    expect(auditOf(f, "BLIND_REVIEW_COMPLETED", runId)).toEqual([]);
+  };
+
+  it("(a) a broken configured override with an unavailable runtime probe stays unavailable", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const adapter = codexAdapter({ codexHome: authenticatedHome(), reviewerCodexHome: "/invalid/configured/home" });
+      expect(adapter.packetReviewerScope().state).toBe("OVERRIDE");
+      const { isolated } = preferCodex(f, () => adapter);
+      const claude = claudeReviewer(f, "PASS");
+      const { runId, ownerSessionId } = await planned(f);
+      vi.spyOn(f.gpt, "probeRuntime").mockResolvedValue("UNAVAILABLE");
+
+      expect(await submitResult(f, runId, ownerSessionId)).toBe("REVIEW_UNAVAILABLE");
+      expect(isolated).toEqual([]);
+      noFallback(f, runId, claude);
+    }, harnessOptions);
+  });
+
+  it("(b) an authenticated default home whose capacity is denied stays unavailable", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const adapter = codexAdapter({ codexHome: authenticatedHome() });
+      expect(adapter.packetReviewerScope().state).toBe("DEFAULT");
+      const { isolated } = preferCodex(f, () => adapter);
+      const claude = claudeReviewer(f, "PASS");
+      const { runId, ownerSessionId } = await planned(f);
+      f.gpt.setCapacity({
+        provider: "gpt", sensorHealth: "HEALTHY", runtimeHealth: "HEALTHY", observedAt: f.harness.clock.nowIso(),
+        source: "r1-01-witness",
+        buckets: [{ id: "gpt-window", remainingPercent: 0, resetAt: null, capabilities: ["ceo", "cto", "blind-review", "worker"] }],
+      });
+
+      expect(await submitResult(f, runId, ownerSessionId)).toBe("REVIEW_UNAVAILABLE");
+      expect(isolated).toEqual([]);
+      noFallback(f, runId, claude);
+    }, harnessOptions);
+  });
+
+  it("(c) a preferred reviewer whose BLIND_REVIEWER binding is refused stays unavailable", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const adapter = codexAdapter({ codexHome: authenticatedHome() });
+      const { isolated } = preferCodex(f, () => adapter);
+      const calls = stubCodex({});
+      const claude = claudeReviewer(f, "PASS");
+      const { runId, ownerSessionId } = await planned(f);
+      const bindings = f.harness.cp.bindings;
+      const bind = bindings.bind.bind(bindings);
+      let refused = 0;
+      vi.spyOn(bindings, "bind").mockImplementation((input) => {
+        // Only the preferred GPT reviewer's binding is refused; a Claude fallback could still bind.
+        if (input.role !== Role.BLIND_REVIEWER || f.harness.cp.sessions.get(input.sessionId)?.provider !== "gpt") return bind(input);
+        refused += 1;
+        return deny(ReasonCode.CONFLICT, "witness: reviewer binding refused", {});
+      });
+
+      expect(await submitResult(f, runId, ownerSessionId)).toBe("REVIEW_UNAVAILABLE");
+      expect(isolated).toHaveLength(1);
+      expect(calls.map((call) => call.resume)).toEqual([false]);
+      expect(refused).toBe(1);
+      noFallback(f, runId, claude);
+    }, harnessOptions);
+  });
+});
+
 describe("a frozen result whose review was unavailable gets one official retry of the same candidate", () => {
   /**
    * The live shape: the owner submitted, the candidate froze, the review was unavailable as the
@@ -288,7 +368,8 @@ describe("a frozen result whose review was unavailable gets one official retry o
    */
   const liveShape = async (f: BootstrapRuntimeFixture, options: Partial<Pick<ScriptedBootstrapOwner, "onRetry">> = {}) => {
     let deployed = false;
-    preferCodex(f, () => codexAdapter({ codexHome: missingHome() }), () => deployed ? null : liveUnavailable());
+    // Before the deploy the gate had no scope to read, and the reviewer refused as it did live.
+    preferCodex(f, () => codexAdapter({ codexHome: missingHome() }), () => deployed ? null : liveUnavailable(), () => deployed);
     const run = await planned(f, { onResult: "follow-prompt", ...options });
     expect(run.owner.results).toEqual([{ runId: run.runId, ok: true, stage: "REVIEW_UNAVAILABLE" }]);
     const unavailable = auditOf(f, "BLIND_REVIEW_UNAVAILABLE", run.runId);

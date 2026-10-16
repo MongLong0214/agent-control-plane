@@ -588,8 +588,18 @@ export class ControlPlane {
         guard: this.guard,
         workerAdapter: () => this.providers.requireForRole(WORKER_TURN_PROVIDER, Role.WORKER),
       });
+      // The shared packet-reviewer predicate, read from the raw reviewer adapter (the registry hands
+      // out only wrapped ones): the gate may pass over its preferred reviewer only when this says
+      // UNCONFIGURED. Only the Codex adapter has such a scope.
+      const reviewerAdapters = registrations
+        .filter(({ roles }) => roles === undefined || roles.includes(Role.BLIND_REVIEWER))
+        .map(({ adapter }) => adapter);
       this.review.attach({
         capacity: { refreshForBlindReview: (target) => this.capacity.refreshForBlindReview(target) },
+        packetReviewerScope: (provider) => {
+          const adapter = reviewerAdapters.find((candidate) => candidate.provider === provider);
+          return adapter instanceof CodexCliAdapter ? adapter.packetReviewerScope() : null;
+        },
       });
       this.continuity = new ContinuityKernel(
         this.db, this.clock, this.audit, this.capacity, this.providers,

@@ -49,7 +49,7 @@ import {
   type ProviderRegistry,
   type ReviewerEgressRecord,
 } from "../runtime/provider.ts";
-import { PacketReviewerScopeUnconfigured } from "../runtime/reviewer-codex-home.ts";
+import type { PacketReviewerScope } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import {
@@ -310,9 +310,16 @@ const REVIEWER_SESSION_FAILURE_MESSAGES: Record<ProviderSessionProvisionError["r
  */
 export const REVIEWER_FALLBACK_SCOPE_UNCONFIGURED = "REVIEWER_FALLBACK_SCOPE_UNCONFIGURED";
 
+/**
+ * A provider's packet-reviewer scope by the shared predicate (`packetReviewerScope`), or null for a
+ * provider that has none. Read from the raw adapter, which the registry hands out only wrapped.
+ */
+export type PacketReviewerScopePort = (provider: string) => PacketReviewerScope | null;
+
 export class BlindReviewGate {
   readonly #pipelineCapability = Symbol("blind-review-control-plane");
   #capacity: BlindReviewCapacityGate | null = null;
+  #packetScope: PacketReviewerScopePort | null = null;
   constructor(
     private readonly clock: Clock,
     private readonly db: Db,
@@ -338,8 +345,9 @@ export class BlindReviewGate {
   ) {}
 
   /** Closed by the production composition root once the capacity monitor exists. */
-  attach(ports: { capacity?: BlindReviewCapacityGate }): void {
+  attach(ports: { capacity?: BlindReviewCapacityGate; packetReviewerScope?: PacketReviewerScopePort }): void {
     if (ports.capacity) this.#capacity = ports.capacity;
+    if (ports.packetReviewerScope) this.#packetScope = ports.packetReviewerScope;
   }
 
   /** §18.2 — CTO and Hermes do not invoke the review. */
@@ -694,10 +702,11 @@ export class BlindReviewGate {
    * independence is required even when the provider family is reused; if no isolated
    * reviewer can be constituted the gate is not lowered — the caller waits.
    *
-   * A preferred reviewer whose session setup fails falls back for exactly one reason: its
-   * packet-reviewer scope is UNCONFIGURED (`PacketReviewerScopeUnconfigured`, from the
-   * predicate the doctor reports). Any other setup failure — a configured override that is
-   * wrong or spent, an unusable home, an auth or isolation failure — still refuses.
+   * CEO 1792123922 (2026-10-16): the preferred reviewer is passed over for exactly one reason —
+   * its packet-reviewer scope is UNCONFIGURED by the predicate the doctor reports, decided before
+   * anything is probed or allocated for it. Every other preferred failure — runtime unavailable,
+   * capacity denied, binding refused, a wrong or spent override, an auth or isolation failure —
+   * ends the selection with no fallback. This replaces the earlier measured-outage fallback.
    */
   private async constituteReviewer(
     request: ReviewSubject,
@@ -724,6 +733,10 @@ export class BlindReviewGate {
       // Unknown registry scope is not an availability proof authorizing fallback.
       const scope = this.reviewerScope(preference.provider);
       if (!scope.allowed) return scope;
+      if (isPreferred && this.#packetScope?.(preference.provider)?.state === "UNCONFIGURED") {
+        attempts.push({ preference, reason: REVIEWER_FALLBACK_SCOPE_UNCONFIGURED });
+        continue;
+      }
       const adapter = scope.value
         ? this.providers.requireForRole(preference.provider, Role.BLIND_REVIEWER)
         : this.providers.get(preference.provider);
@@ -759,6 +772,8 @@ export class BlindReviewGate {
       if (!admissionScope.allowed) return admissionScope;
       if (health === "UNAVAILABLE") {
         attempts.push({ preference, reason: "runtime unavailable" });
+        // A configured preferred reviewer that is down is not UNCONFIGURED: no fallback.
+        if (isPreferred) break;
         continue;
       }
       // A runtime probe does not allocate a reviewer. Once a provider is healthy enough
@@ -768,6 +783,7 @@ export class BlindReviewGate {
       if (!capacity.allowed) {
         capacityFailure ??= capacity;
         attempts.push({ preference, reason: capacity.reasonCode });
+        if (isPreferred) break;
         continue;
       }
 
@@ -787,13 +803,6 @@ export class BlindReviewGate {
         });
       } catch (error) {
         rmSync(workdir, { recursive: true, force: true });
-        // Owner directive / CEO 1792123922 (2026-10-16): the one setup failure that is an
-        // absence rather than a fault. The fallback below is still a separate fresh reviewer
-        // session, bound BLIND_REVIEWER and independence-checked like the preferred one.
-        if (isPreferred && error instanceof PacketReviewerScopeUnconfigured) {
-          attempts.push({ preference, reason: REVIEWER_FALLBACK_SCOPE_UNCONFIGURED });
-          continue;
-        }
         const message = error instanceof Error ? error.message : "provider reviewer session setup failed";
         // A missing OS/profile/provider-identity proof is not a capacity outage. Falling
         // back to Claude here would hide a broken mandatory GPT gate behind a successful
@@ -871,6 +880,7 @@ export class BlindReviewGate {
         this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, "binding refused");
         rmSync(workdir, { recursive: true, force: true });
         attempts.push({ preference, reason: bound.reasonCode });
+        if (isPreferred) break;
         continue;
       }
 
