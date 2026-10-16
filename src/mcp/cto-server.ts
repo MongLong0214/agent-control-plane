@@ -166,6 +166,24 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, admitted.value).digest });
     },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
+    isProjectlessBootstrapRun: (runId: string) => isProjectlessBootstrap(source.runs.require(runId)),
+    // PR #1114 BOOT-02 — a project-less bootstrap's re-plan is all or nothing: the PLAN write, the
+    // supersession of the earlier PLAN's tasks, the one new task and its BOOTSTRAP_PLAN_TASKS binding
+    // commit in one transaction, and any refusal rolls every one of them back. BOOT-01 — the graph is
+    // one task with no dependency: the repository create that CEO CONFIRM settles from its receipt.
+    submitBootstrapPlan: (runId: string, plan: Record<string, unknown>, tasks: Parameters<TaskGraph["submit"]>[1]) =>
+      source.db.txDecision((): Decision<unknown> => {
+        const stored = port.submitPlan(runId, plan);
+        if (!stored.allowed) return stored;
+        if (tasks.length !== 1 || (tasks[0]!.dependsOn ?? []).length > 0) {
+          return deny(
+            ReasonCode.INVALID_ARGUMENT,
+            "a project-less bootstrap PLAN carries exactly one task, with no dependency: the repository create its CEO CONFIRM settles",
+            { runId, refusal: "BOOTSTRAP_PLAN_TASK_COUNT", tasks: tasks.length },
+          );
+        }
+        return port.submitTasks(runId, tasks);
+      }),
     ownerRoleKeyForRun: (runId: string) => source.runs.ownerRoleKeyFor(source.runs.require(runId)),
     acquireClaims: (input: Parameters<ClaimRegistry["acquire"]>[0]) => source.claims.acquire(input),
     advisoryOverlaps: (repositoryIdentity: string, runId: string, declaredPaths: readonly string[]) =>
@@ -423,6 +441,7 @@ const createCtoServerFromPort = (
     async (args) => write("plan_submit", args.idempotencyKey, (peer) => {
       const fenced = owner(peer, args.runId);
       if (!fenced.allowed) return respond(fenced);
+      if (port.isProjectlessBootstrapRun(args.runId)) return respond(port.submitBootstrapPlan(args.runId, args.plan, args.tasks));
       const stored = port.submitPlan(args.runId, args.plan);
       if (!stored.allowed) return respond(stored);
       return respond(port.submitTasks(args.runId, args.tasks));

@@ -298,7 +298,7 @@ export class CandidatePipeline {
         // is not the CTO's next instruction for P2. So the PLAN is checked after the last await before
         // each thing this path does — the revision request or unavailable-review record
         // (`unpassedReview`), and the packet (below) — never only once after the review.
-        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, () =>
+        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
           this.bootstrapPlanStillCurrent(input.runId, snapshot),
         );
         if (unpassed !== null) return unpassed;
@@ -317,7 +317,7 @@ export class CandidatePipeline {
           contract: contract.value,
           contractDigest: run.contractDigest,
         });
-        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, () =>
+        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
           this.contractChangePlanStillCurrent(input.runId, snapshot),
         );
         if (unpassed !== null) return unpassed;
@@ -398,11 +398,12 @@ export class CandidatePipeline {
 
       // §34.2 — a failed verification returns to CTO revision with the evidence still
       // bound to the candidate that failed.
-      this.returnToCto(input.runId, verified.reasonCode, {
+      const returned = this.returnToCto(input.runId, verified.reasonCode, {
         stage: "verification",
         candidateSnapshotDigest: snapshotDigest,
         report,
-      });
+      }, attemptId);
+      if (!returned.allowed) return returned as Decision<PipelineOutcome>;
       return allow(ReasonCode.OK, {
         stage: "VERIFICATION_FAILED",
         reasonCode: verified.reasonCode,
@@ -439,8 +440,8 @@ export class CandidatePipeline {
     // #246 B2-a — a CONTRACT_CHANGE candidate's verdict is for the PLAN it names; one replaced since
     // gets no revision request. Any other candidate's verdict is delivered as before.
     const unpassed = snapshot.contractChange === undefined
-      ? await this.unpassedReview(input.runId, snapshotDigest, reviewed)
-      : await this.unpassedReview(input.runId, snapshotDigest, reviewed, () =>
+      ? await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId)
+      : await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
           this.contractChangePlanStillCurrent(input.runId, snapshot),
         );
     if (unpassed !== null) return unpassed;
@@ -541,6 +542,8 @@ export class CandidatePipeline {
     runId: string,
     snapshotDigest: string,
     reviewed: Decision<ReviewPacket>,
+    /** The submission this review belongs to: its revision is delivered once per attempt. */
+    attemptId: string,
     /**
      * Whether the candidate is still the one to act on, asked after the last await and before
      * anything is delivered or recorded. A repository candidate's verdict is delivered as before.
@@ -581,11 +584,12 @@ export class CandidatePipeline {
       });
     }
 
-    this.returnToCto(runId, reviewed.reasonCode, {
+    const returned = this.returnToCto(runId, reviewed.reasonCode, {
       stage: "blind-review",
       candidateSnapshotDigest: snapshotDigest,
       ...reviewed.evidence,
-    });
+    }, attemptId);
+    if (!returned.allowed) return returned as Decision<PipelineOutcome>;
     const packet = this.review.latestPacket(runId, snapshotDigest);
     return allow(ReasonCode.OK, {
       stage: "REVISION_REQUIRED",
@@ -761,15 +765,19 @@ export class CandidatePipeline {
   /**
    * §18.6 — the revision loop is internal. The run returns to the CTO with the reason
    * and the evidence; Hermes is not notified.
+   *
+   * PR #1114 BOOT-03 — each submission's verdict is its own revision cycle, so the delivery is keyed
+   * by the attempt as well as the candidate: a second verdict on the same PLAN is a second message.
+   * A delivery the outbox refuses is answered as that refusal, with nothing recorded as returned.
    */
-  private returnToCto(runId: string, reasonCode: string, evidence: Record<string, unknown>): void {
+  private returnToCto(runId: string, reasonCode: string, evidence: Record<string, unknown>, attemptId: string): Decision<void> {
     const run = this.runs.require(runId);
     const roleKey = this.runs.ownerRoleKeyFor(run);
     const binding = roleKey ? this.bindings.active(roleKey) : null;
 
     if (binding) {
-      this.outbox.enqueue({
-        idempotencyKey: `revision:${runId}:${String(evidence["candidateSnapshotDigest"])}:${reasonCode}`,
+      const enqueued = this.outbox.enqueue({
+        idempotencyKey: `revision:${runId}:${String(evidence["candidateSnapshotDigest"])}:${reasonCode}:${attemptId}`,
         roleKey: binding.roleKey,
         bindingGeneration: binding.bindingGeneration,
         targetSessionId: binding.sessionId,
@@ -777,6 +785,7 @@ export class CandidatePipeline {
         kind: MessageKind.REVISION_REQUEST,
         payload: { runId, reasonCode, ...evidence },
       });
+      if (!enqueued.allowed) return enqueued as Decision<void>;
     }
 
     this.audit.record({
@@ -798,6 +807,7 @@ export class CandidatePipeline {
       text: reasonCode,
       dims: { stage: evidence["stage"] ?? null, mode: run.executionMode },
     });
+    return allow(ReasonCode.OK, undefined);
   }
 
   /**

@@ -39,8 +39,9 @@ const planned = async (f: BootstrapRuntimeFixture, onResult: ScriptedBootstrapOw
   // A revision is answered by its own directive and witness; these rows are about the result stage alone.
   const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onResult, onRevision: "ignore" });
   const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-  await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
-  await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
+  // The dispatch turn plans (and may submit a result, which runs a review): allow it time under load.
+  await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
+  await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false), { timeout: 10_000, interval: 25 });
   expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
   expect(owner.results).toEqual([]);
   expect(resultState(f, runId)).toEqual({ state: RunState.ACTIVE, candidate: null, attempts: [] });

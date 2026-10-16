@@ -107,7 +107,8 @@ describe("the ack-only stall: a driven bootstrap owner that acknowledges its RUN
       passBootstrapPlanReviews(f);
       const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onRecovery: "follow-prompt" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      // That turn now also submits the result, which runs the review: allow it time under load.
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
       // The RUN_DISPATCH's own turn carries the directive, and the ack rule is still there.
       const prompt = owner.prompts[0]!;
       expect(prompt).toContain(RUN_DISPATCH_DIRECTIVE);

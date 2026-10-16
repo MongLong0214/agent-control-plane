@@ -638,12 +638,13 @@ export class ProductionGate {
             ? this.completion.bootstrapActivation
             : undefined,
         );
-        if (!transition.allowed) {
-          // A bootstrap CONFIRM has settled its task and written its activation result above; a refused
-          // transition throws so neither is left behind without the run's COMPLETED.
-          if (isBootstrap && input.decision === "CONFIRM") throw acpError(transition.reasonCode, transition.message, transition.evidence);
-          return transition as Decision<{ state: RunState }>;
+        // A bootstrap CONFIRM settled its task and wrote its activation result above: a refused
+        // transition throws, so neither is left behind without the run's COMPLETED. Any other
+        // decision has written nothing yet, and its refusal returns as before.
+        if (!transition.allowed && isBootstrap && input.decision === "CONFIRM") {
+          throw acpError(transition.reasonCode, transition.message, transition.evidence);
         }
+        if (!transition.allowed) return transition as Decision<{ state: RunState }>;
 
         // CEO 1792120860 (5) — a project-less bootstrap's owner is a driven session, woken only by what
         // is addressed to it, and no other message carries the CEO's reason: the revision goes to it in
@@ -823,8 +824,11 @@ export class ProductionGate {
     if (!run || !isProjectlessBootstrap(run) || !run.ownerRoleKey) return allow(ReasonCode.OK, undefined);
     const binding = this.bindings.active(run.ownerRoleKey);
     if (!binding) return allow(ReasonCode.OK, undefined);
+    // PR #1114 BOOT-03 — one delivery per revision cycle: the FINAL_REVISE transition above counted this
+    // cycle (`revisionCount`, the cycle a redispatch keys its RUN_DISPATCH by), and a later FINAL_REVISE
+    // of the same candidate is a new cycle with its own rationale.
     return this.outbox.enqueue({
-      idempotencyKey: `ceo-final-revise:${input.runId}:${input.candidateSnapshotDigest}`,
+      idempotencyKey: `ceo-final-revise:${input.runId}:r${run.revisionCount}:${input.candidateSnapshotDigest}`,
       roleKey: binding.roleKey,
       bindingGeneration: binding.bindingGeneration,
       targetSessionId: binding.sessionId,

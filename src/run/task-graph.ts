@@ -1227,9 +1227,10 @@ export class TaskGraph {
 
   /**
    * CEO 1792120860 (3) — what a project-less bootstrap's new PLAN supersedes, in `submit`'s transaction
-   * before its tasks are inserted: each earlier task that is READY with no execution is CANCELLED,
-   * "superseded by PLAN <digest>". A task with an execution, or in any other state, is never simply
-   * cancelled: it is left as it is and named with why, and review entry then refuses the run for it.
+   * before its tasks are inserted: each earlier task that is PENDING or READY with no execution is
+   * CANCELLED, "superseded by PLAN <digest>" (PR #1114 BOOT-01: a PENDING one too, or it blocks the new
+   * PLAN for good). A task with an execution, or in any other state, is never simply cancelled: it is
+   * left as it is and named with why, and review entry then refuses the run for it.
    */
   #supersedeEarlierBootstrapTasks(runId: string, planDigest: string, now: string): void {
     const earlier = this.list(runId).filter((task) => task.state !== TaskState.CANCELLED);
@@ -1242,14 +1243,14 @@ export class TaskGraph {
     for (const task of earlier) {
       if (executed.has(task.taskId)) {
         left.push({ taskId: task.taskId, reason: "has an execution; never cancelled by a re-plan" });
-      } else if (task.state !== TaskState.READY) {
-        left.push({ taskId: task.taskId, reason: `${task.state}; a re-plan cancels only an unexecuted READY task` });
+      } else if (task.state !== TaskState.READY && task.state !== TaskState.PENDING) {
+        left.push({ taskId: task.taskId, reason: `${task.state}; a re-plan cancels only an unexecuted PENDING or READY task` });
       } else {
         cancelled.push(task.taskId);
       }
     }
     for (const taskId of cancelled) {
-      this.db.run(`UPDATE tasks SET state = 'CANCELLED', updated_at = ? WHERE task_id = ? AND state = 'READY'`, [now, taskId]);
+      this.db.run(`UPDATE tasks SET state = 'CANCELLED', updated_at = ? WHERE task_id = ? AND state IN ('PENDING', 'READY')`, [now, taskId]);
     }
     this.audit.record({
       kind: BOOTSTRAP_TASKS_SUPERSEDED,
