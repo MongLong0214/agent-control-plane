@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 
 import { deriveHumanGate } from "./human-gate.ts";
-import { currentBootstrapPlan, sameBootstrapPlanBinding } from "../bootstrap/bootstrap-plan.ts";
+import { currentBootstrapPlan, isProjectlessBootstrap, sameBootstrapPlanBinding } from "../bootstrap/bootstrap-plan.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
@@ -17,6 +17,7 @@ import {
   RunState,
   Role,
   RunKind,
+  type RunRow,
   roleKeyFor,
 } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
@@ -240,7 +241,7 @@ export class ProductionGate {
     );
     if (!ownerCheck.allowed) return ownerCheck as Decision<ProductionReadyPacket>;
 
-    const completeness = this.tasks.completeness(input.runId);
+    const completeness = this.reviewEntry(ownerCheck.value);
     if (!completeness.allowed) return completeness as Decision<ProductionReadyPacket>;
 
     // The candidate must be the one the run is actually on. Anything else is evidence for
@@ -587,7 +588,7 @@ export class ProductionGate {
         // A packet is immutable audit evidence of the graph at publication time, not a
         // completion token. Re-read completeness under the same write transaction as the
         // terminal transition so work admitted after publication cannot complete the run.
-        if (input.decision === "CONFIRM") {
+        if (input.decision === "CONFIRM" && !isBootstrap) {
           const completeness = this.tasks.completeness(input.runId);
           if (!completeness.allowed) return completeness as Decision<{ state: RunState }>;
         }
@@ -617,6 +618,15 @@ export class ProductionGate {
             confirmedAt: this.clock.nowIso(),
           });
           if (!finalized.allowed) return finalized as Decision<{ state: RunState }>;
+          // CEO 1792120507 / 1792120860 — the run's execution task is settled here, in this transaction,
+          // from the producer's stored create receipt and the activation result the finalizer just
+          // wrote; then completeness is read exactly as before. A refusal of either throws, so the
+          // activation result and everything else this transaction wrote roll back with it. The GitHub
+          // write is not undone: its receipt and WRITTEN application stay for the next CONFIRM.
+          const settled = this.settleBootstrapTask(input);
+          if (!settled.allowed) throw acpError(settled.reasonCode, settled.message, settled.evidence);
+          const completeness = this.tasks.completeness(input.runId);
+          if (!completeness.allowed) throw acpError(completeness.reasonCode, completeness.message, completeness.evidence);
         }
 
         const transition = this.runs.transition(
@@ -628,7 +638,20 @@ export class ProductionGate {
             ? this.completion.bootstrapActivation
             : undefined,
         );
-        if (!transition.allowed) return transition as Decision<{ state: RunState }>;
+        if (!transition.allowed) {
+          // A bootstrap CONFIRM has settled its task and written its activation result above; a refused
+          // transition throws so neither is left behind without the run's COMPLETED.
+          if (isBootstrap && input.decision === "CONFIRM") throw acpError(transition.reasonCode, transition.message, transition.evidence);
+          return transition as Decision<{ state: RunState }>;
+        }
+
+        // CEO 1792120860 (5) — a project-less bootstrap's owner is a driven session, woken only by what
+        // is addressed to it, and no other message carries the CEO's reason: the revision goes to it in
+        // band, in this transaction, so the decision and its delivery stand or fall together.
+        if (input.decision === "FINAL_REVISE") {
+          const returned = this.returnBootstrapForRevision(input);
+          if (!returned.allowed) throw acpError(returned.reasonCode, returned.message, returned.evidence);
+        }
 
         // #246 B2-b — a CONTRACT_CHANGE CONFIRM is where its one activation grant is issued, in this
         // transaction and after CEO_APPROVED, so a refusal undoes the decision with it.
@@ -751,6 +774,72 @@ export class ProductionGate {
    * writes before the decision), and again by the decision itself (`decide`), which completes the
    * run only on the WRITTEN application of the candidate it names (#246 C3).
    */
+  /**
+   * What review entry asks of the run's tasks (CEO 1792120507 / 1792120860), the same question
+   * `CandidatePipeline` asks: a project-less PROJECT_BOOTSTRAP run that joins no repository is asked
+   * `TaskGraph.bootstrapReviewEntry` against its current PLAN, validated by `currentBootstrapPlan`;
+   * every other run keeps `completeness` exactly.
+   */
+  private reviewEntry(run: RunRow): Decision<unknown> {
+    if (!isProjectlessBootstrap(run) || this.runs.repositoriesOf(run.runId).length > 0) return this.tasks.completeness(run.runId);
+    const current = currentBootstrapPlan(run.runId, this.artifacts.latest<unknown>(run.runId, ArtifactKind.PLAN));
+    if (!current.allowed) return current;
+    return this.tasks.bootstrapReviewEntry(run.runId, current.value.binding.planDigest);
+  }
+
+  /**
+   * The CONFIRM transaction's settlement of a project-less bootstrap's one task: the run's current
+   * PLAN and its repository-create operation, the task review entry answers for that PLAN, the
+   * confirmed candidate, and the stored producer result and activation result, all handed to
+   * `TaskGraph.settleBootstrapExecutionTask`, which checks every binding again. Any other run settles
+   * nothing here.
+   */
+  private settleBootstrapTask(input: CeoDecisionInput): Decision<unknown> {
+    const run = this.runs.get(input.runId);
+    if (!run || !isProjectlessBootstrap(run)) return allow(ReasonCode.OK, undefined);
+    const current = currentBootstrapPlan(input.runId, this.artifacts.latest<unknown>(input.runId, ArtifactKind.PLAN));
+    if (!current.allowed) return current;
+    const entry = this.tasks.bootstrapReviewEntry(input.runId, current.value.binding.planDigest);
+    if (!entry.allowed) return entry;
+    return this.tasks.settleBootstrapExecutionTask({
+      runId: input.runId,
+      taskId: entry.value.taskId,
+      planDigest: current.value.binding.planDigest,
+      operationId: current.value.outputs.githubOperations[0]?.operationId ?? "",
+      candidateSnapshotDigest: input.candidateSnapshotDigest,
+      repoFactoryResultDigest: this.artifacts.latest(input.runId, ArtifactKind.REPO_FACTORY_RESULT)?.digest ?? "",
+      activationResultDigest: this.artifacts.latest(input.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT)?.digest ?? "",
+    });
+  }
+
+  /**
+   * CEO 1792120860 (5) — a FINAL_REVISE of a project-less bootstrap sends the run's owner a
+   * REVISION_REQUEST carrying the CEO's rationale, as a review verdict's revision does
+   * (`CandidatePipeline.returnToCto`). The run stays REVISION_REQUIRED until the CEO dispatches it
+   * again; the owner plans anew from the reason meanwhile. Any other run is unchanged.
+   */
+  private returnBootstrapForRevision(input: CeoDecisionInput): Decision<unknown> {
+    const run = this.runs.get(input.runId);
+    if (!run || !isProjectlessBootstrap(run) || !run.ownerRoleKey) return allow(ReasonCode.OK, undefined);
+    const binding = this.bindings.active(run.ownerRoleKey);
+    if (!binding) return allow(ReasonCode.OK, undefined);
+    return this.outbox.enqueue({
+      idempotencyKey: `ceo-final-revise:${input.runId}:${input.candidateSnapshotDigest}`,
+      roleKey: binding.roleKey,
+      bindingGeneration: binding.bindingGeneration,
+      targetSessionId: binding.sessionId,
+      runId: input.runId,
+      kind: MessageKind.REVISION_REQUEST,
+      payload: {
+        runId: input.runId,
+        stage: "ceo-final-revise",
+        decision: "FINAL_REVISE",
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+        rationale: input.rationale,
+      },
+    });
+  }
+
   private admitCeoDecision(input: CeoDecisionInput, stage: "apply" | "decide"): Decision<{ isBootstrap: boolean }> {
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
@@ -817,6 +906,13 @@ export class ProductionGate {
             runId: input.runId,
           });
       if (!verified.allowed) return verified as Decision<{ isBootstrap: boolean }>;
+    }
+    // CEO 1792120860 — a project-less bootstrap CONFIRM settles the run's one task from the create
+    // receipt. Whether that task can be settled is asked here too, at both stages, so a run that
+    // could not complete is refused before the runner's GitHub write rather than after it.
+    if (isBootstrap && input.decision === "CONFIRM" && isProjectlessBootstrap(run)) {
+      const settleable = this.reviewEntry(run);
+      if (!settleable.allowed) return settleable as Decision<{ isBootstrap: boolean }>;
     }
     // #246 C3 — the contract freeze: once an external write of the application may have happened,
     // the run cannot be sent back for another plan.

@@ -129,8 +129,7 @@ vi.mock("node:fs", async (importOriginal) => {
  * CONFIRM, witnessed through the real doors.
  *
  * run_create, run_dispatch and ceo_decision_submit go over `hermes.mcp.sock` as the CEO; plan_submit,
- * task_worker_provision, task_receipt_submit, result_submit and the primary CTO's handoff_ack over
- * `cto.mcp.sock`, each with the credential its runtime took from the launch channel; the owner's
+ * result_submit and the primary CTO's handoff_ack over `cto.mcp.sock`, each with the credential its runtime took from the launch channel; the owner's
  * approval of the GitHub writes over the operator socket with agentctl and the owner token. GitHub is
  * the bare-repository double, which counts every write; the Claude runtime is a scripted double.
  * Continuity is evaluated before each CEO decision, as the daemon does on its own schedule. No run
@@ -176,9 +175,6 @@ const applicationFixture = async () => {
   harness.cp.cto.attach({ sessionLaunch: launch });
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
-  harness.cp.providers.registerForRole(claude, Role.WORKER);
-  claude.setCapacity(claudeReading(harness, 81, 3));
-  await harness.cp.capacity.refreshForRole("claude", Role.WORKER);
   claude.setCapacity(claudeReading(harness, 80));
 
   const ceo = harness.cp.sessions.create({ provider: "scripted", model: "c3-ceo" });
@@ -273,9 +269,9 @@ interface ReviewedRun {
 }
 
 /**
- * run_create (no project) and run_dispatch over the Hermes socket; plan_submit with the manifest,
- * the PLAN's task worked by its own Claude worker, and result_submit over the CTO socket, where the
- * BOOTSTRAP_PLAN review passes. The run is at CEO review on the candidate that review passed.
+ * run_create (no project) and run_dispatch over the Hermes socket; plan_submit with the manifest and
+ * result_submit over the CTO socket, where the BOOTSTRAP_PLAN review passes. The run is at CEO review
+ * on the candidate that review passed, its PLAN's task READY until the CONFIRM settles it.
  */
 const reviewedBootstrap = async (f: Fixture, manifest: ProjectManifest, taskKey = "bootstrap"): Promise<ReviewedRun> => {
   const created = await f.hermes("run_create", {
@@ -294,23 +290,7 @@ const reviewedBootstrap = async (f: Fixture, manifest: ProjectManifest, taskKey 
     tasks: [{ key: taskKey, title: taskKey, category: "implementation" }],
   });
   expect(planned, JSON.stringify(planned)).toMatchObject({ ok: true });
-  for (const task of f.harness.cp.tasks.ready(runId)) {
-    const provisioned = await f.cto(owner, "task_worker_provision", { runId, taskId: task.taskId, provider: "claude" });
-    expect(provisioned, JSON.stringify(provisioned)).toMatchObject({ ok: true });
-    const workerSessionId = (provisioned["value"] as { workerSessionId: string }).workerSessionId;
-    const startedTask = await f.cto(owner, "task_receipt_submit", { runId, taskId: task.taskId, phase: "started", workerSessionId });
-    expect(startedTask, JSON.stringify(startedTask)).toMatchObject({ ok: true });
-    const finished = await f.cto(owner, "task_receipt_submit", {
-      runId,
-      taskId: task.taskId,
-      phase: "finished",
-      executionId: (startedTask["value"] as { executionId: string }).executionId,
-      workerSessionId,
-      status: "SUCCEEDED",
-      resultDigest: digestOf({ task: task.taskId }),
-    });
-    expect(finished, JSON.stringify(finished)).toMatchObject({ ok: true });
-  }
+  // No worker and no receipt: the PLAN's task stays READY until the CONFIRM settles it (CEO 1792120507).
   await f.harness.cp.continuity.evaluate("before result_submit");
   f.harness.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.harness, runId)) });
   const submitted = await f.cto(owner, "result_submit", {

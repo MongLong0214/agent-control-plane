@@ -86,10 +86,11 @@ export interface SessionWakeTrigger {
   /**
    * A trigger caused by a verified Buzz mention carries the mention's gate: whether the mention's
    * identity, role and room still stand behind the role's current holder. A bootstrap PLAN recovery
-   * trigger carries its own: whether its run still needs a PLAN from that exact owner. It is asked
-   * again at the turn's final check, immediately before the provider call, and a turn none of whose
-   * triggers still holds is refused there. Absent on every other trigger, which the final check
-   * never asks.
+   * trigger carries its own: whether its run still needs a PLAN from that exact owner; a bootstrap
+   * result recovery trigger, whether its run still needs a result for that PLAN from that exact
+   * owner. It is asked again at the turn's final check, immediately before the provider call, and a
+   * turn none of whose triggers still holds is refused there. Absent on every other trigger, which
+   * the final check never asks.
    */
   stillAdmissible?: () => boolean;
   /**
@@ -257,8 +258,8 @@ interface TurnLane {
  *   own re-wake, at most once per row per `IN_BAND_REWAKE_MS` and never past the row's TTL, so
  *   unacknowledged work is retried at that pace and never in a loop here. Turns start only from
  *   the existing event paths (an in-band dispatch, an owner message, a wake) and from the control
- *   plane's own spawn and recovery, the daemon's once-per-dispatch bootstrap PLAN recovery wake
- *   included; there is no timer here.
+ *   plane's own spawn and recovery, the daemon's once-per-dispatch bootstrap PLAN recovery wake and
+ *   once-per-PLAN bootstrap result recovery wake included; there is no timer here.
  *
  * In memory only: a restarted daemon holds no credential, and a session it holds none for cannot
  * run a turn until its credential is rotated and delivered again.
@@ -899,6 +900,34 @@ export const planRecoveryTriggerKind = (runId: string): string => `${PLAN_RECOVE
 export const planRecoveryTriggerId = (runId: string, bindingGeneration: number, messageId: string): string =>
   `bootstrap-plan-recovery:${runId}:${bindingGeneration}:${messageId}`;
 
+/**
+ * What submitting a project-less bootstrap run's result means once its PLAN is accepted, in the words
+ * both the result directive and the result recovery line use. Review entry needs no task success: the
+ * PLAN's task is the external create, which the control plane settles at CEO CONFIRM from the
+ * producer's create receipt and the activation result (CEO 1792120507). The blind review runs inside
+ * `result_submit`; it needs nothing more.
+ */
+const RESULT_STEPS =
+  "submit the result of its current PLAN with mcp__acp-cto__result_submit, its resultSummary and recommendation taken from that PLAN and a new idempotencyKey; " +
+  "result_submit runs the blind review itself and answers when it is done. " +
+  "Do not provision a worker or submit a task receipt for that run: its task is settled by the control plane at CEO CONFIRM";
+
+/**
+ * The audit kind that records one bootstrap result recovery wake, for its run, the owner's binding
+ * generation and the PLAN it has no result for (`evidence.bindingGeneration`, `evidence.planDigest`).
+ * `audit_events` is append only, so a daemon that starts again reads the wake as already made.
+ */
+export const BOOTSTRAP_RESULT_RECOVERY_WAKE = "BOOTSTRAP_RESULT_RECOVERY_WAKE";
+
+const RESULT_RECOVERY_KIND_PREFIX = "result recovery: run ";
+
+/** The wake kind that tells a run's owner why it was woken: its run has a PLAN and no result for it. */
+export const resultRecoveryTriggerKind = (runId: string): string => `${RESULT_RECOVERY_KIND_PREFIX}${runId} has a PLAN and no result`;
+
+/** The trigger id of one result recovery wake: the runtime refuses a second wake for it as a duplicate. */
+export const resultRecoveryTriggerId = (runId: string, bindingGeneration: number, planDigest: string): string =>
+  `bootstrap-result-recovery:${runId}:${bindingGeneration}:${planDigest}`;
+
 const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[]): string =>
   [
     `You are the ${binding.role}${binding.runId ? ` of run ${binding.runId}` : ""} in the agent control plane, at binding generation ${binding.bindingGeneration}.`,
@@ -909,6 +938,13 @@ const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[
     ...(triggers.some((trigger) => trigger.kind.startsWith(PLAN_RECOVERY_KIND_PREFIX))
       ? [
           `A wake for "${PLAN_RECOVERY_KIND_PREFIX}<runId> has no PLAN" means that run's RUN_DISPATCH was already acknowledged and the run still has no PLAN: for that run, ${PLAN_STEPS}. No message is left to acknowledge for it.`,
+        ]
+      : []),
+    `For a run whose contract_get returned a bootstrapPlanGuide, once its PLAN is accepted and the run is ACTIVE, unless that PLAN's result was already submitted, and before you acknowledge its RUN_DISPATCH: ${RESULT_STEPS}.`,
+    `A REVISION_REQUEST for a run whose contract_get returned a bootstrapPlanGuide carries why its PLAN was sent back (the CEO's rationale, or the blind review's findings): for that run, ${PLAN_STEPS}, writing the new PLAN so that it addresses that reason; then acknowledge the REVISION_REQUEST with mcp__acp-cto__run_ack. If the run is ACTIVE, submit the new PLAN's result first, as above; a run the CEO sent back is ACTIVE again with its next RUN_DISPATCH.`,
+    ...(triggers.some((trigger) => trigger.kind.startsWith(RESULT_RECOVERY_KIND_PREFIX))
+      ? [
+          `A wake for "${RESULT_RECOVERY_KIND_PREFIX}<runId> has a PLAN and no result" means that run's current PLAN was accepted and no result was submitted for it: for that run, ${RESULT_STEPS}. No message is left to acknowledge for it.`,
         ]
       : []),
     "A HANDOFF_PACKAGE is accepted with mcp__acp-cto__handoff_ack for its handoffId before it is acknowledged.",

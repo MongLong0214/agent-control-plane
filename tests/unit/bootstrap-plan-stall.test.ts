@@ -3,6 +3,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { passBootstrapPlanReviews } from "../helpers/bootstrap-result.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { RUN_DISPATCH_DIRECTIVE, scriptBootstrapOwner } from "../helpers/scripted-bootstrap-owner.ts";
 
@@ -18,6 +19,10 @@ afterEach(() => vi.restoreAllMocks());
  * daemon with its watchdog; only the model is scripted (`scriptBootstrapOwner`), and it does only
  * what the turn's prompt tells it to. They import nothing the fix added, so they run unchanged
  * against the base and fail there on behaviour.
+ *
+ * Since the result stage (CEO 1792120507) the prompt also has an owner whose PLAN is accepted submit
+ * the run's result in the same turn, so the reviewer is scripted too, and the run that proceeds
+ * reaches CEO review with its task still READY.
  */
 
 const runDispatches = (f: BootstrapRuntimeFixture, runId: string) =>
@@ -48,6 +53,7 @@ const ticks = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 describe("the ack-only stall: a driven bootstrap owner that acknowledges its RUN_DISPATCH and plans nothing", () => {
   it("is left with no PLAN and no pending work; the daemon wakes it exactly once more, and the PLAN it then builds from contract_get's guide is accepted", async () => {
     await withBootstrapRuntime(async (f) => {
+      passBootstrapPlanReviews(f);
       const owner = scriptBootstrapOwner(f, { onDispatch: "ack-only", onRecovery: "follow-prompt" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
       // The attestation, then the RUN_DISPATCH's work turn, which only acknowledged.
@@ -89,14 +95,16 @@ describe("the ack-only stall: a driven bootstrap owner that acknowledges its RUN
       const plan = planOf(f, runId);
       expect(plan).not.toBeNull();
       expect((plan!.content as Record<string, unknown>)["projectManifestDigest"]).toBe(owner.submissions[0]!.supplied);
-      // The run proceeds: its PLAN's task is ready for a worker, and it is still the owner's ACTIVE run.
+      // The run proceeds: the same turn submitted its result, which the review passed to CEO review.
+      // The PLAN's task stays READY until CEO CONFIRM settles it from the create receipt.
       expect(f.harness.cp.tasks.ready(runId)).toHaveLength(1);
-      expect(f.harness.cp.runs.require(runId).state).toBe("ACTIVE");
+      expect(f.harness.cp.runs.require(runId).state).toBe("READY_FOR_CEO_REVIEW");
     });
   });
 
   it("an owner that follows the RUN_DISPATCH prompt plans in that very turn, and then nothing wakes it again", async () => {
     await withBootstrapRuntime(async (f) => {
+      passBootstrapPlanReviews(f);
       const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onRecovery: "follow-prompt" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
       await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));

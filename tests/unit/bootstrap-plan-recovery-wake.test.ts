@@ -24,6 +24,7 @@ import {
 } from "../../src/runtime/provisioned-session-runtime.ts";
 import { bootstrapPlan, callCtoToolAsOwner, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { passBootstrapPlanReviews } from "../helpers/bootstrap-result.ts";
 import { FakeGitHub as FakeGitHubClient } from "../helpers/fake-github.ts";
 import { FakeGitHub as FakeGitHubWritePort } from "../helpers/fake-github-write-port.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -60,8 +61,13 @@ const planOf = (f: BootstrapRuntimeFixture, runId: string) => f.harness.cp.artif
 const ticks = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** A run whose owner's RUN_DISPATCH turn acknowledged it and planned nothing, with its turn ended. */
-const stalled = async (f: BootstrapRuntimeFixture, onRecovery: ScriptedBootstrapOwner["onRecovery"]) => {
-  const owner = scriptBootstrapOwner(f, { onDispatch: "ack-only", onRecovery });
+const stalled = async (
+  f: BootstrapRuntimeFixture,
+  onRecovery: ScriptedBootstrapOwner["onRecovery"],
+  // These rows are about the PLAN stage; the result stage has its own (bootstrap-result-*.test.ts).
+  onResult: ScriptedBootstrapOwner["onResult"] = "ignore",
+) => {
+  const owner = scriptBootstrapOwner(f, { onDispatch: "ack-only", onRecovery, onResult });
   const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
   await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
   await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
@@ -111,7 +117,7 @@ describe("the recovery wake: once per (run, owner generation, acknowledged RUN_D
 
   it("a run that already has a PLAN is not woken", async () => {
     await withBootstrapRuntime(async (f) => {
-      const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt" });
+      const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onResult: "ignore" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
       await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
       expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
@@ -318,7 +324,9 @@ describe("R1-01: the recovery wake's eligibility is asked again immediately befo
 describe("restart: the renewed owner's run gets its one recovery wake and proceeds", () => {
   it("after a restart that loses the credential, the renewed generation's RUN_DISPATCH is acknowledged with no PLAN; the daemon wakes that owner once and the run proceeds", async () => {
     await withBootstrapRuntime(async (f) => {
-      const { owner, runId, ownerSessionId, roleKey } = await stalled(f, "follow-prompt");
+      // The owner that plans also submits its result, as the prompt now says; the review passes it.
+      passBootstrapPlanReviews(f);
+      const { owner, runId, ownerSessionId, roleKey } = await stalled(f, "follow-prompt", "follow-prompt");
       // The restart: the plaintext credential is gone. Continuity pauses the run and revokes the
       // binding; the next tick recovers the same session at the next generation and redispatches.
       f.harness.cp.sessionRuntime.release(ownerSessionId);
@@ -335,6 +343,10 @@ describe("restart: the renewed owner's run gets its one recovery wake and procee
       const daemon = await startDaemon(f, "restart");
       try {
         await vi.waitFor(() => expect(planOf(f, runId)).not.toBeNull(), { timeout: 10_000, interval: 25 });
+        await vi.waitFor(() => expect(f.harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW), {
+          timeout: 10_000,
+          interval: 25,
+        });
         await ticks(400);
       } finally {
         await daemon.stop();
@@ -347,7 +359,10 @@ describe("restart: the renewed owner's run gets its one recovery wake and procee
         triggerId: planRecoveryTriggerId(runId, 2, second.message_id),
       }]);
       expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
-      expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.ACTIVE, ownerBindingGeneration: 2 });
+      // The same turn submitted the result; the review passed it to CEO review. The task stays READY:
+      // it is settled only at CEO CONFIRM from the create receipt (CEO 1792120507).
+      expect(owner.results).toEqual([{ runId, ok: true, stage: "COMPLETED_REVIEW" }]);
+      expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.READY_FOR_CEO_REVIEW, ownerBindingGeneration: 2 });
       expect(f.harness.cp.tasks.ready(runId)).toHaveLength(1);
     });
   });

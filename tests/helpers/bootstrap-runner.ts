@@ -22,7 +22,7 @@ import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
 import { git } from "../../src/git/git.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
-import { bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan } from "./bootstrap-plan.ts";
+import { bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan, submitBootstrapPlan } from "./bootstrap-plan.ts";
 import { FakeGitHub, type Target } from "./fake-github-write-port.ts";
 import { tempDir } from "./fixtures.ts";
 import { TEST_OWNER, dispatchBootstrapRun, makeHarness, type Harness } from "./harness.ts";
@@ -135,7 +135,13 @@ export interface PreparedBootstrapRun {
  */
 export const prepareBootstrapRun = async (
   projectId: string,
-  options: { ops: Operation[]; manifest: ProjectManifest; ownerIdentities?: readonly OwnerIdentity[] },
+  options: {
+    ops: Operation[];
+    manifest: ProjectManifest;
+    ownerIdentities?: readonly OwnerIdentity[];
+    /** A PLAN the owner submits first and then replaces with the reviewed one, superseding its task. */
+    earlierPlan?: Record<string, unknown>;
+  },
 ): Promise<PreparedBootstrapRun> => {
   const harness = makeHarness(options.ownerIdentities === undefined ? {} : { ownerIdentities: options.ownerIdentities });
   const created = harness.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: ExecutionMode.STANDARD, contract: CONTRACT });
@@ -146,6 +152,7 @@ export const prepareBootstrapRun = async (
   const { manifest, ops } = options;
   const plan = bootstrapPlan(manifest, { operations: ops });
   const plannable = plannedBootstrapOutputs({ runId, planArtifact: { digest: "probe", content: plan } }, manifest).allowed;
+  if (options.earlierPlan !== undefined) await submitBootstrapPlan(harness, runId, options.earlierPlan);
   const reviewed = await reviewBootstrapPlan(harness, runId, plannable ? plan : bootstrapPlan(cleanTreeManifest(projectId)));
   const planArtifact = plannable ? { digest: reviewed.planDigest } : harness.cp.artifacts.put(runId, "PLAN", plan);
 

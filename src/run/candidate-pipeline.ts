@@ -10,7 +10,7 @@ import type { VerificationCommand } from "../contracts/verification-command.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { ArtifactKind, RunState } from "../domain/types.ts";
+import { ArtifactKind, type RunRow, RunState } from "../domain/types.ts";
 import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contract.ts";
 import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
@@ -264,7 +264,7 @@ export class CandidatePipeline {
       return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is ${run.state}`, { runId: input.runId });
     }
 
-    const completeness = this.tasks.completeness(input.runId);
+    const completeness = this.reviewEntry(run);
     if (!completeness.allowed) return completeness as Decision<PipelineOutcome>;
 
     const frozen = await this.freeze(input.runId);
@@ -498,6 +498,21 @@ export class CandidatePipeline {
     } finally {
       sourceReadLease.value.release();
     }
+  }
+
+  /**
+   * What review entry asks of the run's tasks (CEO 1792120507 / 1792120860). A project-less
+   * PROJECT_BOOTSTRAP run that joins no repository is asked `TaskGraph.bootstrapReviewEntry` against
+   * its current PLAN, whose preparation `currentBootstrapPlan` validates here and again at the
+   * freeze and the review: its one task is the external create, settled only at CEO CONFIRM from the
+   * producer's receipt, so no task success is required or fabricated before review. Every other run
+   * keeps `completeness` exactly. The owner was asserted by the caller just before.
+   */
+  private reviewEntry(run: RunRow): Decision<unknown> {
+    if (!isProjectlessBootstrap(run) || this.runs.repositoriesOf(run.runId).length > 0) return this.tasks.completeness(run.runId);
+    const current = currentBootstrapPlan(run.runId, this.artifacts.latest<unknown>(run.runId, ArtifactKind.PLAN));
+    if (!current.allowed) return current;
+    return this.tasks.bootstrapReviewEntry(run.runId, current.value.binding.planDigest);
   }
 
   /** The run's pinned task contract, read back by its digest. */
