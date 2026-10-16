@@ -1,0 +1,11 @@
+Limit: not enforced at CONFIRM: the project's active manifest against the PLAN's digest is checked at activation only, the ACK sender being the current PRIMARY_CTO is not checked, and the forged-ledger limit C5I-R1-01 remains
+Warn: the BOOTSTRAP_PLAN review packet now carries a bounded typed projection of the PLAN intent with its own intent digest checked by the review gate and production gate; an over-bound field fails before review rather than being truncated; the lifecycle statement lists only items tied by test to the code that enforces them
+Record-Id: r-bootstrapreviewpacketintent
+Follows: r-bootstrapreviewentry
+Provenance: inherited fb56c55cdacbf59f11e649edba526db9aa27d8a4
+
+Limit: a legacy singleton task without a BOOTSTRAP_PLAN_TASKS record is still admitted at review entry; the lifecycle statement lists its PLAN provenance as not verified instead of enforced
+Warn: every consumer of a BOOTSTRAP_PLAN review (the pipeline after the continuity await, activation readiness, the runner pre-write check, CONFIRM, the production gate and the blind-review gate) calls one shared check bootstrapReviewIntentCurrent; a review without an intent digest is refused as BOOTSTRAP_PLAN_INTENT_MISSING and needs a fresh review, never authorizing a create
+Record-Id: r-bootstrapreviewintentconsumers
+Follows: r-bootstrapreviewpacketintent
+Provenance: inherited 06a7cdc8099a9e306ead16e7aaa9e57fda5e0994
