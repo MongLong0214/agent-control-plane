@@ -175,6 +175,17 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       source.db.txDecision((): Decision<unknown> => {
         const stored = port.submitPlan(runId, plan);
         if (!stored.allowed) return stored;
+        // ROUND1-ESCAPE-01 — the artifact store hands back an identical earlier PLAN without making it
+        // current, so a re-plan to it would leave the newer PLAN current behind its tasks. It is refused
+        // with both digests, and nothing is changed; re-submitting the current PLAN is accepted as before.
+        const current = source.artifacts.latest(runId, ArtifactKind.PLAN)?.digest ?? null;
+        if (current !== stored.value.digest) {
+          return deny(
+            ReasonCode.CONFLICT,
+            "this PLAN is an earlier one the run already stored, not its current PLAN; change the PLAN and submit it again",
+            { runId, refusal: "BOOTSTRAP_PLAN_RESUBMITTED_NOT_CURRENT", currentPlanDigest: current, resubmittedPlanDigest: stored.value.digest },
+          );
+        }
         if (tasks.length !== 1 || (tasks[0]!.dependsOn ?? []).length > 0) {
           return deny(
             ReasonCode.INVALID_ARGUMENT,

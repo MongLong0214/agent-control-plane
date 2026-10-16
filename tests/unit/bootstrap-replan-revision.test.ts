@@ -106,6 +106,51 @@ describe("BOOT-02: a refused re-plan changes nothing", () => {
   });
 });
 
+describe("ROUND1-ESCAPE-01: re-submitting an earlier stored PLAN is refused, never silently kept behind the current one", () => {
+  it("P1, P2, then P1 again: the third plan_submit is refused with both digests; tasks, binding and the review stay on P2", async () => {
+    const { h, runId, call } = await fixture();
+    const task = [{ key: "create", title: "create repository", category: "implementation" }];
+    const first = bootstrapPlan(cleanTreeManifest("review-replayed"), { summary: "P1" });
+    expect((await call("plan_submit", { plan: first, tasks: task })).body).toMatchObject({ ok: true });
+    const firstDigest = h.cp.artifacts.latest(runId, "PLAN")!.digest;
+    const secondManifest = cleanTreeManifest("review-replayed");
+    secondManifest.verificationCommands = secondManifest.verificationCommands.map((c) => ({ ...c, timeoutSeconds: 1200, maxMemoryMb: 4096 }));
+    expect((await call("plan_submit", { plan: bootstrapPlan(secondManifest, { summary: "P2" }), tasks: task })).body).toMatchObject({ ok: true });
+    const secondDigest = h.cp.artifacts.latest(runId, "PLAN")!.digest;
+    expect(secondDigest).not.toBe(firstDigest);
+    const tasksBefore = h.cp.tasks.list(runId);
+    const bindingsBefore = h.cp.audit.byKind("BOOTSTRAP_PLAN_TASKS").filter((row) => row.runId === runId).map((row) => row.evidence);
+
+    const replayed = await call("plan_submit", { plan: first, tasks: task });
+    expect(replayed.body, replayed.text).toMatchObject({
+      ok: false,
+      evidence: { refusal: "BOOTSTRAP_PLAN_RESUBMITTED_NOT_CURRENT", currentPlanDigest: secondDigest, resubmittedPlanDigest: firstDigest },
+    });
+    expect(h.cp.artifacts.latest(runId, "PLAN")!.digest).toBe(secondDigest);
+    expect(h.cp.tasks.list(runId)).toEqual(tasksBefore);
+    expect(h.cp.audit.byKind("BOOTSTRAP_PLAN_TASKS").filter((row) => row.runId === runId).map((row) => row.evidence)).toEqual(bindingsBefore);
+    expect(bindingsBefore.at(-1)).toMatchObject({ planDigest: secondDigest });
+
+    // The current PLAN is still P2, and result_submit reviews exactly that.
+    h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(h, runId)) });
+    const result = await call("result_submit", { resultSummary: "prepared", recommendation: "create repository" });
+    expect(result.body, result.text).toMatchObject({ ok: true, value: { stage: "COMPLETED_REVIEW" } });
+    const candidate = h.cp.artifacts.latest<{ bootstrapPlan?: { planDigest?: string } }>(runId, "CANDIDATE_SNAPSHOT")!;
+    expect(candidate.content.bootstrapPlan?.planDigest).toBe(secondDigest);
+  });
+
+  it("re-submitting the current PLAN is still accepted", async () => {
+    const { h, runId, call } = await fixture();
+    const task = [{ key: "create", title: "create repository", category: "implementation" }];
+    const plan = bootstrapPlan(cleanTreeManifest("review-replayed-current"), { summary: "P1" });
+    expect((await call("plan_submit", { plan, tasks: task })).body).toMatchObject({ ok: true });
+    const digest = h.cp.artifacts.latest(runId, "PLAN")!.digest;
+    expect((await call("plan_submit", { plan, tasks: task })).body).toMatchObject({ ok: true });
+    expect(h.cp.artifacts.latest(runId, "PLAN")!.digest).toBe(digest);
+    expect(h.cp.tasks.list(runId).map((t) => t.state)).toEqual(["CANCELLED", "READY"]);
+  });
+});
+
 describe("BOOT-03: each revision cycle is its own delivery", () => {
   it.each(["Second revision reason", "First revision reason"])(
     "a second FINAL_REVISE of the same PLAN delivers the current CEO rationale: %s",
