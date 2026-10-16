@@ -1,0 +1,21 @@
+Limit: the FINAL_REVISE and CONFIRM admitted states are unchanged, so a BLOCKED run leaves only through this door or run_cancel; an in-process resolveEscalation without a target keeps resolving the run's escalation unnamed
+Warn: escalation_resolve names the escalation by its CTO_ESCALATION audit event id and resolves it only while it is the run's current open escalation and the run is BLOCKED CEO_DECISION_REQUIRED; the idempotency replay is answered before any state is read; the CEO_DECISION audit carries only the resolution's digest and length while the ESCALATION_REPLY payload carries the bounded text
+Record-Id: r-ceoescalationresolvedoor
+Provenance: inherited fc8786743e4bf5265b1b63aef61e1f7a3e847c0f
+
+Limit: a bootstrap owner is never taken over: a daemon restart revokes its generation, which rejects a PENDING ESCALATION_REPLY, and recovery renews the same session at the next generation; resolve only after that renewal and before the next restart; an ACK is only receipt, never proof of a replan or result
+Warn: the CEO_DECISION row of a targeted resolution is the replay source of truth: it stores the idempotency key digest, the request digest and the reply messageId in the decision transaction, and the key is checked before any state check; openEscalation is one transaction, so a refused blocking escalation leaves no audit, notification or current escalation; a PENDING unclaimed ESCALATION_REPLY is carried once on a takeover of the same run and roleKey with a carry record, while the kind stays out of RETARGETABLE_KINDS
+Record-Id: r-escalationresolveatomicreplay
+Follows: r-ceoescalationresolvedoor
+Provenance: inherited 7f56b83c0fb1bf8e9105ad1e357e5aab9c4a454c
+
+Limit: a held reply still expires after its 30-minute TTL; the old generation is shut out by credential rotation, the outbox ack does not itself check the generation; an ACK is only receipt, never proof of a replan or result
+Warn: the CEO_DECISION row of a targeted resolution stores the idempotency key digest, the request digest and the reply messageId in the decision transaction; escalation_resolve authenticates, checks the current CEO, then reads that record before the write() cache, so a recorded success or CONFLICT returns before write() and a cached CONFLICT cannot hide a committed success; openEscalation is one transaction and only blocking escalations count as current; a PENDING unclaimed ESCALATION_REPLY is carried once on a takeover of the same run and roleKey, and only the daemon's continuity revoke of a BOOTSTRAP_CTO holds one whose run is pinned to that generation and whose escalation is current, for the renewal transaction that re-pins the run to carry once or reject; cancel, terminal states and the sweep reject a held reply that can no longer be carried; release, reclaim, abandoned recovery and operator revokes still reject it
+Record-Id: r-escalationreplyrenewalcarry
+Supersedes: r-escalationresolveatomicreplay
+Provenance: inherited 1a45bbe2f14a004e7041681b014f834dcee37035
+
+Warn: a held ESCALATION_REPLY stays held only while its run is live and pinned to the revoked generation, its escalation is current, and renewalPossible holds, which reuses the recovery admission #recoverable; bind() and switchTo() reject older held replies of that roleKey in their own transaction even when the earlier binding was already revoked, and the sweep rejects any held reply whose renewal is no longer possible
+Record-Id: r-escalationreplyheldwhilerenewable
+Follows: r-escalationreplyrenewalcarry
+Provenance: inherited f2a1bc055b2a591cd307d62a46abc1f2e71a0680
