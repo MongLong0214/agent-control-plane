@@ -21,7 +21,12 @@ import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
 import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
-import { ProvisionedSessionRuntime } from "../runtime/provisioned-session-runtime.ts";
+import {
+  BOOTSTRAP_PLAN_RECOVERY_WAKE,
+  ProvisionedSessionRuntime,
+  planRecoveryTriggerId,
+  planRecoveryTriggerKind,
+} from "../runtime/provisioned-session-runtime.ts";
 import {
   resolveDoctorHealth,
   type DoctorHealthAttempt,
@@ -30,9 +35,10 @@ import {
   type DoctorScope,
   type Finding,
 } from "../doctor/doctor.ts";
+import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPO_FACTORY_GITHUB_WRITE_OPERATION } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
-import { Role, RunState, SessionLifecycle } from "../domain/types.ts";
+import { ArtifactKind, Role, RunState, SessionLifecycle } from "../domain/types.ts";
 import { buildAcceptanceReport } from "../export/acceptance-report.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
 import {
@@ -489,6 +495,11 @@ export interface ContinuityReconcileReport {
   unresolved: Array<{ roleKey: string; reasonCode: ReasonCode }>;
   restored: string[];
   restorationDeferred: Array<{ roleKey: string; reasonCode: string }>;
+}
+
+/** The owners one bootstrap PLAN recovery pass woke (`Daemon.wakeBootstrapPlanRecovery`). */
+export interface BootstrapPlanRecoveryReport {
+  woken: Array<{ runId: string; roleKey: string; bindingGeneration: number; messageId: string }>;
 }
 
 interface CrashLoopFile {
@@ -1454,6 +1465,12 @@ export class Daemon {
       // Issue #246 — a bootstrap run that ended while no daemon was running left its BOOTSTRAP_CTO
       // bound or its session running; the watchdog repeats this, through the same backoff.
       await this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
+      // A bootstrap owner that acknowledged its RUN_DISPATCH and submitted no PLAN is woken once, if
+      // this daemon can run its turn now. After a restart it holds no credential, so the pass that
+      // wakes such an owner is a watchdog tick after its recovery; the marker keeps it once either way.
+      await this.runPeriodic("bootstrap_plan_recovery", async () => {
+        this.wakeBootstrapPlanRecovery();
+      });
       // #639 contract 6, at the moment it matters most: right after a restart, before the first
       // periodic sweep would otherwise get to it. This genuinely runs and asks — it is not a
       // no-op by omission — but two independent facts limit it today, both stated in full in
@@ -2239,6 +2256,132 @@ export class Daemon {
     }
   }
 
+  /**
+   * The bootstrap PLAN recovery wake, run at startup and on every watchdog tick. A driven bootstrap
+   * CTO is woken only by what is addressed to it, so one whose turn acknowledged its RUN_DISPATCH and
+   * submitted no PLAN would otherwise never run again. Its owner is woken once more, and exactly once
+   * per (run, owner binding generation, acknowledged RUN_DISPATCH), when all of these hold:
+   *
+   * - the run is ACTIVE and a project-less PROJECT_BOOTSTRAP, and has no PLAN artifact;
+   * - the role's ACTIVE binding is the run's pinned owner — session, incarnation and generation —
+   *   and `assertOwner` still answers yes, so the tools the wake asks for would accept the session;
+   * - its session is READY, driven by this runtime, whose daemon holds its current credential and
+   *   is attached, and no turn of it is running or queued;
+   * - the newest RUN_DISPATCH addressed to that generation and session is ACKED. One still PENDING
+   *   is the outbox's own re-wake's to retry, never this sweep's.
+   *
+   * The once-marker is a `BOOTSTRAP_PLAN_RECOVERY_WAKE` audit event naming the tuple, read before the
+   * wake and written in the same synchronous section as the wake the runtime accepted, so neither a
+   * second tick nor a daemon that starts again wakes it twice; a wake the runtime refused writes
+   * nothing and ran nothing. The trigger's id is built from the tuple, so the runtime's own
+   * duplicate refusal applies as well, and its kind tells the session why it was woken. Nothing
+   * follows up on an owner that does not answer: a new tuple — a renewed generation, a new
+   * RUN_DISPATCH — is the only thing that can earn another wake.
+   */
+  wakeBootstrapPlanRecovery(): BootstrapPlanRecoveryReport {
+    const woken: BootstrapPlanRecoveryReport["woken"] = [];
+    const runtime = this.cp.sessionRuntime;
+    const candidates = this.cp.db.all<{ run_id: string }>(
+      `SELECT run_id FROM runs
+        WHERE state = 'ACTIVE' AND kind = 'PROJECT_BOOTSTRAP' AND project_id IS NULL
+        ORDER BY created_at, run_id`,
+    );
+    for (const { run_id: runId } of candidates) {
+      const run = this.cp.runs.get(runId);
+      if (!run?.ownerRoleKey || !run.ownerSessionId || !run.ownerSessionIncarnation || run.ownerBindingGeneration === null) continue;
+      const owner = {
+        roleKey: run.ownerRoleKey,
+        sessionId: run.ownerSessionId,
+        sessionIncarnation: run.ownerSessionIncarnation,
+        bindingGeneration: run.ownerBindingGeneration,
+      };
+      if (!this.#bootstrapPlanOwnerStands(runId, owner)) continue;
+      if (
+        !runtime.drivesSession(owner.sessionId, Role.BOOTSTRAP_CTO) ||
+        !runtime.holds(owner.sessionId) ||
+        !runtime.attachedToDaemon() ||
+        runtime.turnInProgress(owner.sessionId)
+      ) {
+        continue;
+      }
+      const dispatch = this.cp.db.get<{ message_id: string; status: string }>(
+        `SELECT message_id, status FROM outbox
+          WHERE run_id = ? AND kind = 'RUN_DISPATCH' AND binding_generation = ? AND target_session_id = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT 1`,
+        [runId, owner.bindingGeneration, owner.sessionId],
+      );
+      if (dispatch?.status !== "ACKED") continue;
+      const tuple = { runId, bindingGeneration: owner.bindingGeneration, messageId: dispatch.message_id };
+      const alreadyWoken = this.cp.db.get<{ n: number }>(
+        `SELECT 1 AS n FROM audit_events
+          WHERE kind = ? AND run_id = ?
+            AND json_extract(evidence_json, '$.bindingGeneration') = ?
+            AND json_extract(evidence_json, '$.messageId') = ?
+          LIMIT 1`,
+        [BOOTSTRAP_PLAN_RECOVERY_WAKE, runId, tuple.bindingGeneration, tuple.messageId],
+      );
+      if (alreadyWoken) continue;
+      const triggerId = planRecoveryTriggerId(runId, tuple.bindingGeneration, tuple.messageId);
+      // R1-01 — the turn starts behind awaits (credential preparation and delivery), so what made
+      // the owner eligible is asked again at the runtime's final check, immediately before the
+      // provider call. One that no longer holds drops the trigger there: no provider turn runs for
+      // it, and its marker stays spent.
+      const woke = runtime.wake(owner.roleKey, [{
+        id: triggerId,
+        kind: planRecoveryTriggerKind(runId),
+        stillAdmissible: () => this.#bootstrapPlanOwnerStands(runId, owner),
+      }]);
+      if (!woke.allowed) continue;
+      this.cp.audit.record({
+        kind: BOOTSTRAP_PLAN_RECOVERY_WAKE,
+        reasonCode: ReasonCode.OK,
+        runId,
+        sessionId: owner.sessionId,
+        roleKey: owner.roleKey,
+        evidence: { bindingGeneration: tuple.bindingGeneration, messageId: tuple.messageId, triggerId },
+      });
+      woken.push({ ...tuple, roleKey: owner.roleKey });
+    }
+    return { woken };
+  }
+
+  /**
+   * Whether `owner` is still the one a bootstrap PLAN recovery is for: the run is ACTIVE and a
+   * project-less PROJECT_BOOTSTRAP with no PLAN artifact, pinned to exactly that owner; the role's
+   * ACTIVE binding is exactly that owner (role key, session, incarnation, generation) and
+   * `assertOwner` still allows it; and its session is READY. The sweep asks it before it wakes, and
+   * the wake's trigger asks it again at the runtime's final check before the provider call.
+   */
+  #bootstrapPlanOwnerStands(
+    runId: string,
+    owner: { roleKey: string; sessionId: string; sessionIncarnation: string; bindingGeneration: number },
+  ): boolean {
+    const run = this.cp.runs.get(runId);
+    if (!run || run.state !== RunState.ACTIVE || !isProjectlessBootstrap(run)) return false;
+    if (this.cp.artifacts.latest(runId, ArtifactKind.PLAN) !== null) return false;
+    if (
+      run.ownerRoleKey !== owner.roleKey ||
+      run.ownerSessionId !== owner.sessionId ||
+      run.ownerSessionIncarnation !== owner.sessionIncarnation ||
+      run.ownerBindingGeneration !== owner.bindingGeneration
+    ) {
+      return false;
+    }
+    const binding = this.cp.bindings.active(owner.roleKey);
+    if (
+      !binding ||
+      binding.role !== Role.BOOTSTRAP_CTO ||
+      binding.sessionId !== owner.sessionId ||
+      binding.sessionIncarnation !== owner.sessionIncarnation ||
+      binding.bindingGeneration !== owner.bindingGeneration
+    ) {
+      return false;
+    }
+    if (!this.cp.runs.assertOwner(runId, owner.sessionId, owner.bindingGeneration).allowed) return false;
+    return this.cp.sessions.get(owner.sessionId)?.lifecycle === SessionLifecycle.READY;
+  }
+
   private startTimers(): void {
     const watchdogMs = this.options.watchdogIntervalMs ?? 60_000;
     const deliveryMs = this.options.deliveryIntervalMs ?? 5_000;
@@ -2267,6 +2410,10 @@ export class Daemon {
       });
       // A failing reclaim backs off on its own and does not cost the watchdog its tick.
       void this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
+      // A bootstrap owner that acknowledged its RUN_DISPATCH and planned nothing, woken once per dispatch.
+      void this.runPeriodic("bootstrap_plan_recovery", async () => {
+        this.wakeBootstrapPlanRecovery();
+      });
       // #512 — and a retired worker's session left live while its process ran is settled on a later tick.
       void this.runPeriodic("worker_retirement", async () => {
         await this.cp.workerRetirement.reconcile();

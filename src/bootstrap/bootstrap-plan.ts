@@ -3,13 +3,20 @@ import { z } from "zod";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { type ProjectManifest, assertPortableManifest, manifestDigest } from "../contracts/manifest.ts";
+import {
+  PROJECT_MANIFEST_SCHEMA_ID,
+  type ProjectManifest,
+  assertPortableManifest,
+  manifestDigest,
+  projectManifestSchema,
+} from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
 import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
 import { RunKind } from "../domain/types.ts";
 import { parseGitHubIdentity } from "./github-write-port.ts";
 import { githubOperationSchema, isCreateOnlyPlan, preflightGitHubOperations, type GitHubOperation } from "./repo-factory-github.ts";
 import {
+  VERIFICATION_KINDS,
   plannedBootstrapFiles,
   verificationKindRunning,
   type PlannedBootstrapFile,
@@ -466,4 +473,137 @@ export const planForSubmission = (
     });
   }
   return allow(ReasonCode.OK, { ...rest, projectManifest: manifest.value });
+};
+
+/** The schema id of the guide `contract_get` hands a project-less bootstrap run's owner. */
+export const BOOTSTRAP_PLAN_GUIDE_SCHEMA_ID = "agent-control-plane.bootstrap-plan-guide.v1";
+
+/** The placeholders the guide is written in. The owner replaces each with the value its contract names. */
+export const BOOTSTRAP_PLAN_GUIDE_PLACEHOLDERS = Object.freeze({
+  projectId: "<project-id>",
+  repositoryIdentity: "github:<owner>/<name>",
+  operationId: "<operation-id>",
+  visibility: "<public|private>",
+});
+
+/** The id the guide's example gives the one verification command this producer runs. */
+const CLEAN_TREE_COMMAND_ID = "clean-tree";
+
+/**
+ * The smallest manifest the Repo Factory producer executes for one repository, from the caller's
+ * values and nothing else: one repository with that remote, one long-lived default branch, and the
+ * one verification command this producer runs (`VERIFICATION_KINDS.CLEAN_TREE`), named by every
+ * profile. Every other field is the schema's default, so the manifest the schema parses from it is
+ * the one a PLAN stores and its digest is taken over (`planForSubmission`).
+ *
+ * Built from placeholders it is the guide's example; `assertPortableManifest` accepts it either way.
+ * `defaultBranch` defaults to `main`, the branch GitHub initializes for a create-only plan.
+ */
+export const minimalBootstrapManifest = (input: {
+  projectId: string;
+  repositoryIdentity: string;
+  defaultBranch?: string;
+}): z.input<typeof projectManifestSchema> => {
+  const defaultBranch = input.defaultBranch ?? "main";
+  return {
+    schema: PROJECT_MANIFEST_SCHEMA_ID,
+    projectId: input.projectId,
+    repositories: [{ role: "primary", remote: input.repositoryIdentity }],
+    branchProfile: { longLived: [defaultBranch], defaultBranch },
+    verificationProfiles: {
+      simple: [CLEAN_TREE_COMMAND_ID],
+      standard: [CLEAN_TREE_COMMAND_ID],
+      guarded: [CLEAN_TREE_COMMAND_ID],
+    },
+    verificationCommands: [{ id: CLEAN_TREE_COMMAND_ID, argv: ["git", ...VERIFICATION_KINDS.CLEAN_TREE.argv] }],
+  };
+};
+
+/** The manifest keys the schema has no default for: absent, the manifest fails it. */
+const requiredManifestKeys = (): string[] =>
+  Object.entries(projectManifestSchema.innerType().shape)
+    .filter(([, field]) => !field.isOptional())
+    .map(([key]) => key);
+
+/**
+ * What a project-less bootstrap run's owner needs to write a PLAN `plan_submit` accepts and the
+ * producer can execute, as data its session can read with `contract_get`: the owner has no tool that
+ * runs code, so nothing here asks it to compute anything. Generic: it names no run, project, owner
+ * or repository; the contract supplies those.
+ */
+export interface BootstrapPlanGuide {
+  schema: typeof BOOTSTRAP_PLAN_GUIDE_SCHEMA_ID;
+  submit: string[];
+  planFields: Array<{ field: string; carries: string }>;
+  repositoryCreateOperation: {
+    shape: { operationId: string; resourceType: "repository"; resourceIdentity: string; desiredState: { visibility: string; autoInit: true } };
+    rules: string[];
+  };
+  manifest: {
+    schema: typeof PROJECT_MANIFEST_SCHEMA_ID;
+    requiredKeys: string[];
+    producerAccepts: string[];
+    placeholders: string;
+    example: z.input<typeof projectManifestSchema>;
+  };
+  digestRule: string[];
+  afterAcceptance: string;
+}
+
+/** The guide `contract_get` carries for a project-less PROJECT_BOOTSTRAP run, and for no other run. */
+export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
+  const placeholders = BOOTSTRAP_PLAN_GUIDE_PLACEHOLDERS;
+  const cleanTreeArgv = JSON.stringify(["git", ...VERIFICATION_KINDS.CLEAN_TREE.argv]);
+  return {
+    schema: BOOTSTRAP_PLAN_GUIDE_SCHEMA_ID,
+    submit: [
+      "Call mcp__acp-cto__plan_submit with { idempotencyKey, runId, plan, tasks }.",
+      "Use a new idempotencyKey for every call: a key already used answers with its first result again.",
+      "tasks: at least one task { key, title, category }, for example one implementation task that creates the repository.",
+    ],
+    planFields: [
+      { field: "summary", carries: "what this bootstrap creates and why, from the contract" },
+      { field: "bootstrapOperationId", carries: "a non-empty id you choose for this bootstrap; keep it unchanged when you resubmit" },
+      { field: "requestDigest", carries: "the run's contractDigest, as contract_get's run.contractDigest states it" },
+      { field: "githubOperations", carries: "the GitHub operations in the order they run, each with its desiredState; the first is repositoryCreateOperation" },
+      { field: "projectManifest", carries: "the full project manifest (manifest); its one repository's remote is the repository the first operation creates" },
+      { field: "projectManifestDigest", carries: "the digest of projectManifest (digestRule)" },
+    ],
+    repositoryCreateOperation: {
+      shape: {
+        operationId: placeholders.operationId,
+        resourceType: "repository",
+        resourceIdentity: placeholders.repositoryIdentity,
+        desiredState: { visibility: placeholders.visibility, autoInit: true },
+      },
+      rules: [
+        "It is the first operation, and a plan creates exactly one repository; operation ids are unique.",
+        "resourceIdentity is github:<owner>/<name> with no #ref: the repository the contract asks for, and exactly the manifest's repository remote.",
+        "desiredState.visibility is the visibility the contract asks for: public or private.",
+        "desiredState.autoInit true makes the plan create-only: GitHub initializes the default branch and nothing is pushed, so this operation is the whole plan, and the manifest's branchProfile.defaultBranch must be the branch GitHub initializes (main).",
+        "Without autoInit true the plan must also push the bootstrap commit after the create (a branch operation on github:<owner>/<name>#<defaultBranch>).",
+      ],
+    },
+    manifest: {
+      schema: PROJECT_MANIFEST_SCHEMA_ID,
+      requiredKeys: requiredManifestKeys(),
+      producerAccepts: [
+        "exactly one repository { role, remote }, whose remote is the repository the first operation creates",
+        `exactly one verification command, argv ${cleanTreeArgv}, cwd ".", in that repository's role, evidenceMode LOCAL_COMMAND, named by every verification profile`,
+        "no ciWorkflows, and a commitlore.mode other than \"required\"",
+        "branchProfile.defaultBranch is one of branchProfile.longLived",
+        "portable: no absolute or home paths, and no secret, token or session identifier anywhere",
+      ],
+      placeholders: `Replace ${placeholders.projectId}, <owner> and <name> with the values the contract names; ${placeholders.projectId} is the new project's id.`,
+      example: minimalBootstrapManifest({ projectId: placeholders.projectId, repositoryIdentity: placeholders.repositoryIdentity }),
+    },
+    digestRule: [
+      "projectManifestDigest is \"sha256:\" and the lowercase hex SHA-256 of the manifest's canonical JSON (object keys sorted, no whitespace), taken after the manifest schema fills in its defaults; the PLAN stores that normalized manifest.",
+      "Without a way to compute it, submit the PLAN with any non-empty projectManifestDigest: plan_submit refuses it with refusal MANIFEST_MISMATCH, and the refusal's evidence.supplied is the digest of the manifest you sent.",
+      "Then submit the same PLAN again with projectManifestDigest set to evidence.supplied and a new idempotencyKey. Any change to the manifest changes its digest: read supplied again from the next refusal.",
+      "A manifest that fails the schema or is not portable is refused first, with refusal MANIFEST_NOT_PORTABLE and the issues or violations, before any digest is compared.",
+    ],
+    afterAcceptance:
+      "An accepted PLAN approves nothing and writes nothing to GitHub: its review, the owner's approval and the CEO's confirmation are separate steps that follow it.",
+  };
 };

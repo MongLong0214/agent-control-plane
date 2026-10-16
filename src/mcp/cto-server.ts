@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import type { BootstrapActivation } from "../bootstrap/activation.ts";
 import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
-import { planForSubmission } from "../bootstrap/bootstrap-plan.ts";
+import { bootstrapPlanGuide, isProjectlessBootstrap, planForSubmission } from "../bootstrap/bootstrap-plan.ts";
 import { githubOperationSchema } from "../bootstrap/repo-factory-github.ts";
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import type { ProductionGate } from "../ceo/production-gate.ts";
@@ -137,7 +137,7 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     contractForRun: (runId: string) => {
       const run = source.runs.require(runId);
       const manifest = run.pinnedManifestDigest ? source.projects.manifest(run.pinnedManifestDigest) : null;
-      return {
+      const contract = {
         run,
         contract: source.artifacts.latest(runId, ArtifactKind.TASK_CONTRACT)?.content ?? null,
         pinnedManifestDigest: run.pinnedManifestDigest,
@@ -145,6 +145,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
         branchProfile: manifest?.branchProfile ?? null,
         repositories: source.runs.repositoriesOf(runId),
       };
+      // A project-less bootstrap run's owner also reads what its PLAN must carry: it has no tool that
+      // runs code, and nothing else it can read says. Every other run's answer is exactly as before.
+      return isProjectlessBootstrap(run) ? { ...contract, bootstrapPlanGuide: bootstrapPlanGuide() } : contract;
     },
     // #246 C2 — a project-less bootstrap run's PLAN carries its manifest in full, checked portable
     // and against the digest the PLAN names before anything is stored. #246 B2-a — so does a
