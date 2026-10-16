@@ -1,0 +1,13 @@
+Limit: no projects row marks the repo-factory project (name is free text, every live active manifest is null), so the operator names its registered id on ACP_REPO_FACTORY_PROJECT_ID and the registry must hold it
+Limit: the identity-ambiguity count includes ACTIVE PRIMARY_CTO bindings whose runtime is not live, because a stopped runtime keeps its Buzz key
+Ruled-out: the literal project id repo-factory | the live repo-factory project is registered under a prj_ id, so the literal never resolves and the owner-approval prompt can never be posted
+Warn: a revoked or stopped X is refused by admission before this authority is asked (IDENTITY_NOT_ADMITTED:NO_LIVE_SESSION); the NO_ACTIVE and NOT_LIVE witnesses keep X as another project's CTO so they reach the authority
+Record-Id: r-t3rfconfiguredproject
+Provenance: inherited 62ce602eeb692906b89c90f335a0f2d2e6d370e2
+
+Limit: outcome replies (#publishOutcome) are still sent without asking the current authority; this correction covers prompt publication only
+Warn: a stored prompt is published only when the posting authority asked at that send still covers its signer and room; tick awaits between prompts, so an authority captured earlier in the tick must not decide a later send
+Warn: health's unavailable cause now reflects the latest authority check, including one made by a prompt retry
+Record-Id: r-t3retryauthority
+Follows: r-t3rfconfiguredproject
+Provenance: inherited 53c3b59bbee0909bedc7131380998260eb4cb31b
