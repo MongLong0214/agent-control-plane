@@ -21,6 +21,8 @@ import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
 import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
+import { BOOTSTRAP_PLAN_TASKS } from "../run/task-graph.ts";
+import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import {
   BOOTSTRAP_PLAN_RECOVERY_WAKE,
   BOOTSTRAP_RESULT_RECOVERY_WAKE,
@@ -516,9 +518,25 @@ export interface BootstrapResultRecoveryReport {
     bindingGeneration: number;
     planDigest: string;
     /** Present on a review retry wake: the frozen candidate and the unavailable review it retries. */
-    retry?: { candidateSnapshotDigest: string; unavailableEventId: number };
+    retry?: { candidateSnapshotDigest: string; unavailableEventId: number; candidateFrozenEventId?: number };
   }>;
 }
+
+/**
+ * What moves a bootstrap run's trail on after a candidate's freeze, so that a legacy UNAVAILABLE row
+ * after it can no longer be linked to that candidate (`Daemon.#legacyUnavailableFreeze`).
+ */
+const LEGACY_RETRY_TRAIL_KINDS: readonly string[] = Object.freeze([
+  "CANDIDATE_FROZEN",
+  "CANDIDATE_PROMOTED",
+  "CANDIDATE_INVALIDATED",
+  "BLIND_REVIEW_UNAVAILABLE",
+  "BLIND_REVIEW_COMPLETED",
+  "BLIND_REVIEW_REJECTED",
+  "REVISION_RETURNED_TO_CTO",
+  "TASK_GRAPH_SUBMITTED",
+  BOOTSTRAP_PLAN_TASKS,
+]);
 
 interface CrashLoopFile {
   failures: number;
@@ -2459,6 +2477,9 @@ export class Daemon {
             planDigest,
             candidateSnapshotDigest: retry.candidateSnapshotDigest,
             unavailableEventId: retry.unavailableEventId,
+            ...(retry.candidateFrozenEventId === undefined
+              ? {}
+              : { unavailableLinkedBy: "AUDIT_ORDER", candidateFrozenEventId: retry.candidateFrozenEventId }),
             triggerId,
           },
         });
@@ -2549,7 +2570,9 @@ export class Daemon {
    *   candidate pipeline attempt is RUNNING;
    * - its current candidate was frozen from that PLAN;
    * - the run's latest review outcome (`BLIND_REVIEW_UNAVAILABLE`, `BLIND_REVIEW_COMPLETED` or
-   *   `BLIND_REVIEW_REJECTED`, by event order) is `BLIND_REVIEW_UNAVAILABLE` for that candidate;
+   *   `BLIND_REVIEW_REJECTED`, by event order) is `BLIND_REVIEW_UNAVAILABLE` for that candidate, or
+   *   a legacy one with no candidate digest that audit order links to it (`#legacyUnavailableFreeze`,
+   *   whose freeze is then answered too);
    * - `owner` is exactly the run's owner (`#bootstrapOwnerExact`).
    *
    * The sweep also asks the once-marker; the wake's `stillAdmissible` asks only this.
@@ -2558,7 +2581,7 @@ export class Daemon {
     runId: string,
     owner: { roleKey: string; sessionId: string; sessionIncarnation: string; bindingGeneration: number },
     planDigest: string,
-  ): { candidateSnapshotDigest: string; unavailableEventId: number } | null {
+  ): { candidateSnapshotDigest: string; unavailableEventId: number; candidateFrozenEventId?: number } | null {
     const run = this.cp.runs.get(runId);
     if (!run || run.state !== RunState.ACTIVE || !isProjectlessBootstrap(run)) return null;
     if (this.cp.artifacts.latest(runId, ArtifactKind.PLAN)?.digest !== planDigest) return null;
@@ -2583,9 +2606,73 @@ export class Daemon {
         LIMIT 1`,
       [runId],
     );
-    if (!latest || latest.kind !== "BLIND_REVIEW_UNAVAILABLE" || latest.candidate !== candidate) return null;
+    if (!latest || latest.kind !== "BLIND_REVIEW_UNAVAILABLE") return null;
+    const linkedFreeze = latest.candidate === candidate ? null : this.#legacyUnavailableFreeze(runId, candidate, latest.event_id);
+    if (latest.candidate !== candidate && linkedFreeze === null) return null;
     if (!this.#bootstrapOwnerExact(run, owner)) return null;
-    return { candidateSnapshotDigest: candidate, unavailableEventId: latest.event_id };
+    return linkedFreeze === null
+      ? { candidateSnapshotDigest: candidate, unavailableEventId: latest.event_id }
+      : { candidateSnapshotDigest: candidate, unavailableEventId: latest.event_id, candidateFrozenEventId: linkedFreeze };
+  }
+
+  /**
+   * An UNAVAILABLE row written before #1117 had its evidence rejected by the audit log: it reads
+   * `{auditEvidenceRejected:true}` with no candidate digest, and only its trusted `run_id` column
+   * names the run. Such a row, and only such a row, is linked to the run's current candidate by audit
+   * order alone, when the freeze right before it (by event id) froze exactly that candidate and,
+   * after that freeze, nothing but this row moved the trail: no other freeze, promotion or
+   * invalidation, no other review outcome or revision, no new PLAN tasks, and no terminal transition.
+   * A stored review of the candidate vetoes the link unless the audit trail places it before that
+   * freeze (an unchanged PLAN re-freezes the same digest, so an earlier review of it is history, not
+   * an outcome of this freeze). Answers that freeze's event id, or null when anything is missing or
+   * ambiguous. A row that carries any digest is never re-linked here.
+   */
+  #legacyUnavailableFreeze(runId: string, candidate: string, unavailableEventId: number): number | null {
+    const legacy = this.cp.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM audit_events
+        WHERE event_id = ? AND run_id = ? AND kind = 'BLIND_REVIEW_UNAVAILABLE'
+          AND json_type(evidence_json, '$.candidateSnapshotDigest') IS NULL
+          AND json_extract(evidence_json, '$.auditEvidenceRejected') = 1`,
+      [unavailableEventId, runId],
+    );
+    if (!legacy) return null;
+    const freeze = this.cp.db.get<{ event_id: number; at: string; candidate: unknown }>(
+      `SELECT event_id, at, json_extract(evidence_json, '$.candidateSnapshotDigest') AS candidate
+         FROM audit_events
+        WHERE run_id = ? AND kind = 'CANDIDATE_FROZEN' AND event_id < ?
+        ORDER BY event_id DESC
+        LIMIT 1`,
+      [runId, unavailableEventId],
+    );
+    if (!freeze || freeze.candidate !== candidate) return null;
+    const movedOn = this.cp.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM audit_events
+        WHERE run_id = ? AND event_id > ? AND event_id <> ?
+          AND (kind IN (${LEGACY_RETRY_TRAIL_KINDS.map(() => "?").join(", ")})
+               OR (kind = 'RUN_TRANSITION'
+                   AND json_extract(evidence_json, '$.to') IN (${TERMINAL_RUN_STATES.map(() => "?").join(", ")})))
+        LIMIT 1`,
+      [runId, freeze.event_id, unavailableEventId, ...LEGACY_RETRY_TRAIL_KINDS, ...TERMINAL_RUN_STATES],
+    );
+    if (movedOn) return null;
+    // The gate writes a review artifact and its BLIND_REVIEW_COMPLETED row in one synchronous section,
+    // so audit order places a stored review: every one must be matched by a completed review of this
+    // candidate ahead of the freeze (one after it was refused above). One the trail cannot place, or
+    // whose own timestamp is after the freeze, is ambiguous and refuses.
+    const reviews = this.cp.db.get<{ stored: number; late: number }>(
+      `SELECT COUNT(*) AS stored, COALESCE(SUM(created_at > ?), 0) AS late FROM run_artifacts
+        WHERE run_id = ? AND kind = 'BLIND_REVIEW' AND candidate_snapshot_digest = ?`,
+      [freeze.at, runId, candidate],
+    );
+    if (!reviews || reviews.late > 0) return null;
+    if (reviews.stored === 0) return freeze.event_id;
+    const placed = this.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events
+        WHERE run_id = ? AND kind = 'BLIND_REVIEW_COMPLETED' AND event_id < ?
+          AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?`,
+      [runId, freeze.event_id, candidate],
+    );
+    return (placed?.n ?? 0) >= reviews.stored ? freeze.event_id : null;
   }
 
   /**
