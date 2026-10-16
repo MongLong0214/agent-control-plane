@@ -1495,5 +1495,84 @@ describe("T3: the posting authority is the configured repo-factory project's CTO
         await w.close();
       }
     });
+
+    /**
+     * ACP1091-01 — a prompt issued under the authority whose first send did not reach the relay is
+     * stored and retried by later ticks. The retry asks the authority again at the moment it sends,
+     * so a prompt the authority no longer covers stays unsent.
+     */
+    const pendingPrompt = async (w: World): Promise<string> => {
+      const firstSend = vi.spyOn(w.subscriber.replies, "publishApprovalPublication").mockResolvedValueOnce({ status: "UNAVAILABLE" });
+      const initial = await w.approvals!.tick();
+      await w.drain();
+      firstSend.mockRestore();
+      expect(initial.authority).toBeNull();
+      expect(initial.issued).toHaveLength(1);
+      expect(w.counts().prompts, "the first send did not reach the relay").toBe(0);
+      expect(w.approvals!.health()).toMatchObject({ openPrompts: 1, unpublishedPrompts: 1 });
+      return initial.issued[0]!;
+    };
+
+    it("does not send a pending prompt once the configured project's binding is revoked and X is another project's CTO", async () => {
+      const w = await startWorld();
+      try {
+        const { cp } = w.prepared.harness;
+        await pendingPrompt(w);
+        expect(cp.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId: REPO_FACTORY_PROJECT }), "test revoke").allowed).toBe(true);
+        cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [COMMITLORE_PROJECT, COMMITLORE_PROJECT, cp.clock.nowIso()]);
+        expect(cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: w.ctoSessions.x, projectId: COMMITLORE_PROJECT }).allowed).toBe(true);
+        w.subscriber.rejudge();
+        await w.drain();
+        expect(w.subscriber.admission().identities.find((one) => one.identityPubkey === w.keys.x.pubkey)?.state).toBe("ADMITTED");
+        const retry = await w.approvals!.tick();
+        await w.drain();
+        expect(retry.authority).toBe(unavailableFor("NO_ACTIVE_REPO_FACTORY_CTO"));
+        expect(retry.published).toEqual([]);
+        expect(w.counts().prompts).toBe(0);
+        expect(w.approvals!.health()).toMatchObject({ openPrompts: 1, unpublishedPrompts: 1 });
+      } finally {
+        await w.close();
+      }
+    });
+
+    it("does not send a pending prompt from a store recreated with ACP_REPO_FACTORY_PROJECT_ID unset", async () => {
+      const w = await startWorld();
+      let restarted: BuzzOwnerApprovals | null = null;
+      try {
+        await pendingPrompt(w);
+        w.approvals!.close();
+        restarted = composition.createDaemonBuzzOwnerApprovals!(w.prepared.harness.cp, {
+          environment: { ACP_OWNER_APPROVAL_BUZZ_IDENTITY: w.keys.x.pubkey },
+          ownerActors: [w.keys.owner.pubkey],
+          policy: { allowedActors: [w.keys.owner.pubkey, w.keys.ceo.pubkey], secret: SECRET },
+          runner: w.prepared.runner,
+        });
+        composition.attachDaemonBuzzOwnerApprovals!(restarted, w.subscriber);
+        const retry = await restarted.tick();
+        await w.drain();
+        expect(retry.authority).toBe(unavailableFor("REPO_FACTORY_PROJECT_NOT_CONFIGURED"));
+        expect(retry.published).toEqual([]);
+        expect(w.counts().prompts).toBe(0);
+        expect(restarted.health()).toMatchObject({ openPrompts: 1, unpublishedPrompts: 1 });
+      } finally {
+        restarted?.close();
+        await w.close();
+      }
+    });
+
+    it("control: sends the same pending prompt on the retry tick while the authority still holds", async () => {
+      const w = await startWorld();
+      try {
+        const promptEventId = await pendingPrompt(w);
+        const retry = await w.approvals!.tick();
+        await w.drain();
+        expect(retry.authority).toBeNull();
+        expect(retry.published).toEqual([promptEventId]);
+        expect(w.publishedPrompts().map((event) => event.id)).toEqual([promptEventId]);
+        expect(w.approvals!.health()).toMatchObject({ openPrompts: 1, unpublishedPrompts: 0, unavailable: null });
+      } finally {
+        await w.close();
+      }
+    });
   });
 });
