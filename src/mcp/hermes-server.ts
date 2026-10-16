@@ -3,9 +3,10 @@ import { z } from "zod";
 
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import type { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
-import type { CeoDecisionInput, ProductionGate } from "../ceo/production-gate.ts";
+import { type CeoDecisionInput, ESCALATION_RESOLUTION_MAX_LENGTH, type ProductionGate } from "../ceo/production-gate.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { Clock } from "../core/clock.ts";
+import { digestOf } from "../core/digest.ts";
 import { type Decision, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { CtoLifecycle } from "../cto/cto-lifecycle.ts";
@@ -98,6 +99,7 @@ export const createHermesMcpPort = (
             evidence: source.ceo.evidence(runId),
             claims: source.claims.heldByRun(runId),
             humanGate: source.ceo.humanGateStatus(runId),
+            openEscalation: source.ceo.openEscalationOf(runId),
           }
         : null;
     },
@@ -158,6 +160,8 @@ export const createHermesMcpPort = (
       return decision;
     },
     executeRepair: (input: Parameters<RepairService["execute"]>[0]) => source.repair.execute(input),
+    resolveEscalation: (runId: string, escalationId: number, resolution: string, ceoSessionId: string) =>
+      source.ceo.resolveEscalation(runId, resolution, ceoSessionId, { escalationId }),
   });
   HERMES_MCP_PORTS.add(port);
   return port;
@@ -365,6 +369,39 @@ const createHermesServerFromPort = (
       };
       return respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale, ingress }));
     }),
+  );
+
+  server.registerTool(
+    "escalation_resolve",
+    {
+      description:
+        "Resolve a run's current open CTO escalation, named by its escalationId (run_get openEscalation, or the escalation notification). " +
+        `The run must be BLOCKED for a CEO decision. The resolution, non-blank and at most ${ESCALATION_RESOLUTION_MAX_LENGTH} characters, is delivered to the run's owner, and the run becomes ACTIVE.`,
+      inputSchema: { ...mutation, runId: z.string(), escalationId: z.number().int().positive(), resolution: z.string() },
+    },
+    async (args) => {
+      // The idempotency key names one request. A replay of it answers with its first result, before
+      // any state is read; the same key carrying anything else is refused, never answered as if it
+      // were the first request.
+      const requestDigest = digestOf({ runId: args.runId, escalationId: args.escalationId, resolution: digestOf(args.resolution) });
+      let executed = false;
+      const result = await write(args.idempotencyKey, () => {
+        executed = true;
+        // The deciding session is the door's authenticated CEO peer, never an argument.
+        const peer = authenticateMcpPeer(authenticate);
+        const decision = !peer.allowed
+          ? peer
+          : peer.value.sessionId
+            ? port.resolveEscalation(args.runId, args.escalationId, args.resolution, peer.value.sessionId)
+            : deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "Hermes MCP peer has no session");
+        return respond({ ...decision, evidence: { ...decision.evidence, requestDigest } } as typeof decision);
+      });
+      const stored = (result.structuredContent as { evidence?: { requestDigest?: unknown } } | undefined)?.evidence?.requestDigest;
+      if (executed || stored === requestDigest || (stored === undefined && result.isError === true)) return result;
+      return respond(deny(ReasonCode.CONFLICT, "this idempotencyKey already names a different request", {
+        idempotencyKey: args.idempotencyKey,
+      }));
+    },
   );
 
   server.registerTool(

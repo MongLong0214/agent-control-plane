@@ -88,6 +88,17 @@ export interface Escalation {
   openedAt: string;
 }
 
+/** The longest resolution the CEO may send a run's owner in an ESCALATION_REPLY. */
+export const ESCALATION_RESOLUTION_MAX_LENGTH = 4000;
+
+/** What a resolution answered: the run, its state afterwards, the escalation and the reply. */
+export interface EscalationResolution {
+  runId: string;
+  state: RunState;
+  escalationId: number | null;
+  messageId: string | null;
+}
+
 /**
  * #246 C3 — the bootstrap application record, as the CEO decision reads and completes it: a CONFIRM
  * completes a bootstrap only on a WRITTEN application of that candidate, and a FINAL_REVISE is
@@ -1774,13 +1785,14 @@ export class ProductionGate {
 
   /**
    * §20 — a CTO escalation. Non-blocking escalations leave the run ACTIVE so other work
-   * continues; only a blocked critical path moves the run to BLOCKED.
+   * continues; only a blocked critical path moves the run to BLOCKED. The escalation's identity is
+   * its CTO_ESCALATION audit event, which the CEO's notification names as `escalationId`.
    */
-  openEscalation(escalation: Escalation): Decision<{ state: RunState }> {
+  openEscalation(escalation: Escalation): Decision<{ state: RunState; escalationId: number | null }> {
     const run = this.runs.get(escalation.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: escalation.runId });
 
-    this.audit.record({
+    const recorded = this.audit.record({
       kind: "CTO_ESCALATION",
       runId: escalation.runId,
       sessionId: escalation.openedBySessionId,
@@ -1791,17 +1803,19 @@ export class ProductionGate {
         blocksCriticalPath: escalation.blocksCriticalPath,
       },
     });
+    const escalationId = recorded.allowed ? recorded.value : null;
 
     const notified = this.notify(NotificationKind.TRUE_ESCALATION, escalation.runId, {
+      ...(escalationId === null ? {} : { escalationId }),
       question: escalation.question,
       options: escalation.options,
       recommendation: escalation.ctoRecommendation,
       whyItMatters: escalation.whyItMatters,
       blocksCriticalPath: escalation.blocksCriticalPath,
     });
-    if (!notified.allowed) return notified as Decision<{ state: RunState }>;
+    if (!notified.allowed) return notified as Decision<{ state: RunState; escalationId: number | null }>;
 
-    if (!escalation.blocksCriticalPath) return allow(ReasonCode.OK, { state: run.state });
+    if (!escalation.blocksCriticalPath) return allow(ReasonCode.OK, { state: run.state, escalationId });
 
     const transition = this.runs.transition(
       escalation.runId,
@@ -1809,39 +1823,117 @@ export class ProductionGate {
       "CEO_DECISION_REQUIRED",
       { question: escalation.question },
     );
-    if (!transition.allowed) return transition as Decision<{ state: RunState }>;
-    return allow(ReasonCode.OK, { state: RunState.BLOCKED });
+    if (!transition.allowed) return transition as Decision<{ state: RunState; escalationId: number | null }>;
+    return allow(ReasonCode.OK, { state: RunState.BLOCKED, escalationId });
   }
 
-  resolveEscalation(runId: string, resolution: string, byCeoSession: string): Decision<void> {
-    const run = this.runs.get(runId);
-    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
-    const holds = this.assertCurrentCeo(byCeoSession);
-    if (!holds.allowed) return holds as Decision<void>;
-    this.audit.record({
-      kind: "CEO_DECISION",
-      runId,
-      sessionId: byCeoSession,
-      evidence: { resolution, escalation: true },
-    });
-    if (run.state === RunState.BLOCKED) {
-      const transition = this.runs.transition(runId, RunState.ACTIVE, "escalation resolved");
-      if (!transition.allowed) return transition as Decision<void>;
-    }
-    const ownerRoleKey = this.runs.ownerRoleKeyFor(run);
-    const binding = ownerRoleKey ? this.bindings.active(ownerRoleKey) : null;
-    if (binding) {
-      this.outbox.enqueue({
-        idempotencyKey: `escalation-reply:${runId}:${digestOf(resolution)}`,
+  /**
+   * The run's current open escalation: its latest CTO_ESCALATION, unless a CEO escalation decision
+   * was recorded after it. `audit_events` is append only, so this is the whole escalation record.
+   */
+  openEscalationOf(runId: string): { escalationId: number } | null {
+    const opened = this.db.get<{ event_id: number }>(
+      `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CTO_ESCALATION' ORDER BY event_id DESC LIMIT 1`,
+      [runId],
+    );
+    if (!opened) return null;
+    const answered = this.db.get<{ event_id: number }>(
+      `SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION' AND event_id > ?
+         AND json_extract(evidence_json, '$.escalation') = 1 LIMIT 1`,
+      [runId, opened.event_id],
+    );
+    return answered ? null : { escalationId: opened.event_id };
+  }
+
+  /**
+   * The CEO's answer to a CTO escalation, in one transaction: the CEO_DECISION record, BLOCKED →
+   * ACTIVE and the owner's ESCALATION_REPLY commit together or not at all. The reply carries the
+   * resolution text, bounded; the audit row carries only its digest and length.
+   *
+   * `target` is the CEO door's binding (`escalation_resolve`): it resolves only the escalation it
+   * names, and only while that is the run's current open escalation and the run is BLOCKED with
+   * CEO_DECISION_REQUIRED, and it refuses rather than resolve with no reply enqueued. Without a
+   * target, an in-process caller resolves the run's escalation without naming it, as before.
+   */
+  resolveEscalation(
+    runId: string,
+    resolution: string,
+    byCeoSession: string,
+    target?: { escalationId: number },
+  ): Decision<EscalationResolution> {
+    return this.db.txDecision(() => {
+      const run = this.runs.get(runId);
+      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+      const holds = this.assertCurrentCeo(byCeoSession);
+      if (!holds.allowed) return holds as Decision<EscalationResolution>;
+      if (resolution.trim().length === 0 || resolution.length > ESCALATION_RESOLUTION_MAX_LENGTH) {
+        return deny(
+          ReasonCode.INVALID_ARGUMENT,
+          `an escalation resolution is non-blank text of at most ${ESCALATION_RESOLUTION_MAX_LENGTH} characters`,
+          { runId, resolutionLength: resolution.length },
+        );
+      }
+      if (target) {
+        const open = this.openEscalationOf(runId);
+        if (open?.escalationId !== target.escalationId) {
+          return deny(ReasonCode.CONFLICT, "the escalation named is not this run's current open escalation", {
+            runId,
+            escalationId: target.escalationId,
+            currentEscalationId: open?.escalationId ?? null,
+          });
+        }
+        if (run.state !== RunState.BLOCKED || run.stateReason !== "CEO_DECISION_REQUIRED") {
+          return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is ${run.state}`, {
+            runId,
+            state: run.state,
+            reason: run.stateReason,
+          });
+        }
+      }
+      const recorded = this.audit.record({
+        kind: "CEO_DECISION",
+        runId,
+        sessionId: byCeoSession,
+        evidence: {
+          escalation: true,
+          escalationId: target?.escalationId ?? null,
+          resolutionDigest: digestOf(resolution),
+          resolutionLength: resolution.length,
+        },
+      });
+      if (target && !recorded.allowed) return recorded as Decision<EscalationResolution>;
+      let state = run.state;
+      if (run.state === RunState.BLOCKED) {
+        const transition = this.runs.transition(runId, RunState.ACTIVE, "escalation resolved");
+        if (!transition.allowed) return transition as Decision<EscalationResolution>;
+        state = RunState.ACTIVE;
+      }
+      const ownerRoleKey = this.runs.ownerRoleKeyFor(run);
+      const binding = ownerRoleKey ? this.bindings.active(ownerRoleKey) : null;
+      if (!binding) {
+        return target
+          ? deny(ReasonCode.OUTBOX_TARGET_NOT_CURRENT, "the run has no current owner to receive the resolution", { runId })
+          : allow(ReasonCode.OK, { runId, state, escalationId: null, messageId: null });
+      }
+      const enqueued = this.outbox.enqueue({
+        idempotencyKey: target
+          ? `escalation-reply:${runId}:e${target.escalationId}`
+          : `escalation-reply:${runId}:${digestOf(resolution)}`,
         roleKey: binding.roleKey,
         bindingGeneration: binding.bindingGeneration,
         targetSessionId: binding.sessionId,
         runId,
         kind: MessageKind.ESCALATION_REPLY,
-        payload: { runId, resolution },
+        payload: target ? { runId, escalationId: target.escalationId, resolution } : { runId, resolution },
       });
-    }
-    return allow(ReasonCode.OK, undefined);
+      if (target && !enqueued.allowed) return enqueued as Decision<EscalationResolution>;
+      return allow(ReasonCode.OK, {
+        runId,
+        state,
+        escalationId: target?.escalationId ?? null,
+        messageId: enqueued.allowed ? enqueued.value.messageId : null,
+      });
+    });
   }
 
   /**
