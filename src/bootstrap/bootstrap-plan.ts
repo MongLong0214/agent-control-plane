@@ -12,6 +12,7 @@ import {
 } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
 import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
+import type { Db } from "../db/database.ts";
 import { RunKind } from "../domain/types.ts";
 import { parseGitHubIdentity } from "./github-write-port.ts";
 import { githubOperationSchema, isCreateOnlyPlan, preflightGitHubOperations, type GitHubOperation } from "./repo-factory-github.ts";
@@ -433,6 +434,176 @@ export const bootstrapPlanCoverageTargets = (
     path: `#operation/${operation.operationId}`,
   })),
 ];
+
+export const BOOTSTRAP_PLAN_INTENT_SCHEMA_ID = "agent-control-plane.bootstrap-plan-intent.v1";
+
+/**
+ * The bound on each field of the intent a BOOTSTRAP_PLAN reviewer is shown. A field over its bound
+ * refuses the review, naming the field, its length and the bound; it is never truncated, since a
+ * reviewer judging a cut field would be judging something the PLAN does not say.
+ */
+export const BOOTSTRAP_PLAN_INTENT_BOUNDS = Object.freeze({
+  summaryChars: 4_000,
+  listItems: 32,
+  itemChars: 1_000,
+  taskTitleChars: 500,
+});
+
+/**
+ * What a bootstrap PLAN says it intends, typed: its summary, repository and verification intent and
+ * risks as the PLAN artifact stores them, and the title and completion criteria (`spec.completionCriteria`,
+ * null when not stored) of the one live task created with it. The PLAN digest covers the first four;
+ * the task is not covered by any digest the candidate binds, so a review records this projection's
+ * own digest, and a projection that changed since is stale.
+ */
+export interface BootstrapPlanIntent {
+  schema: typeof BOOTSTRAP_PLAN_INTENT_SCHEMA_ID;
+  planDigest: string;
+  summary: string | null;
+  repositoryIntent: string[];
+  verificationIntent: string[];
+  risks: string[];
+  task: { taskId: string; title: string; completionCriteria: string[] | null };
+}
+
+/** The run's tasks as `bootstrapPlanIntent` reads them; a CANCELLED one is ignored. */
+export interface BootstrapPlanIntentTask {
+  taskId: string;
+  title: string;
+  state: string;
+  spec: unknown;
+}
+
+/** The intent projection of a bootstrap run's PLAN artifact and its one live task, with its digest. */
+export const bootstrapPlanIntent = (input: {
+  runId: string;
+  planArtifact: BootstrapPlanArtifact;
+  tasks: readonly BootstrapPlanIntentTask[];
+}): Decision<{ intent: BootstrapPlanIntent; digest: string }> => {
+  const { runId, planArtifact } = input;
+  const bounds = BOOTSTRAP_PLAN_INTENT_BOUNDS;
+  type Refusal = { ok: false; refusal: string; field: string; length?: number; bound?: number; unit?: "characters" | "items" };
+  type Read<T> = { ok: true; value: T } | Refusal;
+  const text = (field: string, value: unknown, bound: number, optional: boolean): Read<string | null> => {
+    if (value === undefined && optional) return { ok: true, value: null };
+    if (typeof value !== "string") return { ok: false, refusal: "PLAN_INTENT_FIELD_INVALID", field };
+    if (value.length > bound) {
+      return { ok: false, refusal: "PLAN_INTENT_FIELD_TOO_LONG", field, length: value.length, bound, unit: "characters" };
+    }
+    return { ok: true, value };
+  };
+  /** A list of strings; `absent` is what an absent list reads as. */
+  const list = (field: string, value: unknown, absent: string[] | null): Read<string[] | null> => {
+    if (value === undefined) return { ok: true, value: absent };
+    if (!Array.isArray(value)) return { ok: false, refusal: "PLAN_INTENT_FIELD_INVALID", field };
+    if (value.length > bounds.listItems) {
+      return { ok: false, refusal: "PLAN_INTENT_FIELD_TOO_LONG", field, length: value.length, bound: bounds.listItems, unit: "items" };
+    }
+    const items: string[] = [];
+    for (const [index, item] of value.entries()) {
+      const read = text(`${field}[${index}]`, item, bounds.itemChars, false);
+      if (!read.ok) return read;
+      items.push(read.value!);
+    }
+    return { ok: true, value: items };
+  };
+  const refuse = (read: Refusal): Decision<{ intent: BootstrapPlanIntent; digest: string }> =>
+    deny(
+      ReasonCode.INVALID_ARGUMENT,
+      read.refusal === "PLAN_INTENT_FIELD_TOO_LONG"
+        ? `the PLAN's ${read.field} has ${read.length} ${read.unit}, over the review's bound of ${read.bound}; it is never truncated, so shorten it and submit the PLAN again`
+        : `the PLAN's ${read.field} is not the type the review reads (a string, or a list of strings); submit the PLAN again with it corrected`,
+      {
+        stage: "precondition",
+        refusal: read.refusal,
+        runId,
+        planDigest: planArtifact.digest,
+        field: read.field,
+        ...(read.length === undefined ? {} : { length: read.length, bound: read.bound }),
+      },
+    );
+
+  const live = input.tasks.filter((task) => task.state !== "CANCELLED");
+  const task = live[0];
+  if (live.length !== 1 || task === undefined) {
+    return deny(ReasonCode.TASK_RESULT_COUNT_MISMATCH, "a bootstrap PLAN's intent is read with its one live task", {
+      stage: "precondition",
+      refusal: "BOOTSTRAP_PLAN_TASK_COUNT",
+      runId,
+      planDigest: planArtifact.digest,
+      tasks: live.map((candidate) => candidate.taskId),
+    });
+  }
+  const plan = isRecord(planArtifact.content) ? planArtifact.content : {};
+  const summary = text("summary", plan["summary"], bounds.summaryChars, true);
+  if (!summary.ok) return refuse(summary);
+  const repositoryIntent = list("repositoryIntent", plan["repositoryIntent"], []);
+  if (!repositoryIntent.ok) return refuse(repositoryIntent);
+  const verificationIntent = list("verificationIntent", plan["verificationIntent"], []);
+  if (!verificationIntent.ok) return refuse(verificationIntent);
+  const risks = list("risks", plan["risks"], []);
+  if (!risks.ok) return refuse(risks);
+  const title = text("task.title", task.title, bounds.taskTitleChars, false);
+  if (!title.ok) return refuse(title);
+  const completionCriteria = list("task.completionCriteria", isRecord(task.spec) ? task.spec["completionCriteria"] : undefined, null);
+  if (!completionCriteria.ok) return refuse(completionCriteria);
+
+  const intent: BootstrapPlanIntent = {
+    schema: BOOTSTRAP_PLAN_INTENT_SCHEMA_ID,
+    planDigest: planArtifact.digest,
+    summary: summary.value,
+    repositoryIntent: repositoryIntent.value!,
+    verificationIntent: verificationIntent.value!,
+    risks: risks.value!,
+    task: { taskId: task.taskId, title: title.value!, completionCriteria: completionCriteria.value },
+  };
+  return allow(ReasonCode.OK, { intent, digest: digestOf(intent) });
+};
+
+/** A run's tasks as `bootstrapPlanIntent` reads them, in creation order, from the tasks table itself. */
+export const bootstrapPlanIntentTasks = (db: Pick<Db, "all">, runId: string): BootstrapPlanIntentTask[] =>
+  db
+    .all<{ task_id: string; title: string; state: string; spec_json: string }>(
+      `SELECT task_id, title, state, spec_json FROM tasks WHERE run_id = ? ORDER BY created_at, rowid`,
+      [runId],
+    )
+    .map((row) => ({ taskId: row.task_id, title: row.title, state: row.state, spec: JSON.parse(row.spec_json) as unknown }));
+
+/**
+ * Review of #1119, round 1 (BPI-R1-01) — whether a BOOTSTRAP_PLAN review was shown the run's CURRENT
+ * intent: its `bootstrapPlanIntentDigest` is the digest of the projection recomputed now from the run's
+ * latest PLAN artifact and its one live task. No PLAN binding digest covers the task, so the same PLAN
+ * submitted again with another task, or a task changed since, leaves the binding and changes only this.
+ * A review with no such digest predates it (pre-#1119): it was never shown the intent and cannot be
+ * compared, so it authorizes nothing until the PLAN is reviewed again. Every consumer that trusts such
+ * a review asks this, after its last await and before it acts; none restates the comparison.
+ */
+export const bootstrapReviewIntentCurrent = (input: {
+  runId: string;
+  reviewedIntentDigest: unknown;
+  planArtifact: BootstrapPlanArtifact | null;
+  tasks: readonly BootstrapPlanIntentTask[];
+}): Decision<{ digest: string }> => {
+  const { runId } = input;
+  if (typeof input.reviewedIntentDigest !== "string") {
+    return deny(
+      ReasonCode.EVIDENCE_STALE,
+      "the bootstrap plan review carries no PLAN intent digest (it predates the intent check), so it was never shown the run's current PLAN intent; the PLAN must be reviewed again",
+      { runId, refusal: "BOOTSTRAP_PLAN_INTENT_MISSING", reviewed: null },
+    );
+  }
+  const current = input.planArtifact === null ? null : bootstrapPlanIntent({ runId, planArtifact: input.planArtifact, tasks: input.tasks });
+  const currentDigest = current?.allowed ? current.value.digest : null;
+  if (input.reviewedIntentDigest !== currentDigest) {
+    return deny(ReasonCode.EVIDENCE_STALE, "the bootstrap plan review was shown another PLAN intent than the run's current one", {
+      runId,
+      refusal: "BOOTSTRAP_PLAN_INTENT_STALE",
+      reviewed: input.reviewedIntentDigest,
+      current: currentDigest,
+    });
+  }
+  return allow(ReasonCode.OK, { digest: input.reviewedIntentDigest });
+};
 
 /** Whether a run is the project-less PROJECT_BOOTSTRAP run this slice binds to its PLAN. */
 export const isProjectlessBootstrap = (run: { kind: string; projectId: string | null }): boolean =>

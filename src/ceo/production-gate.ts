@@ -1,7 +1,13 @@
 import { execFileSync } from "node:child_process";
 
 import { deriveHumanGate } from "./human-gate.ts";
-import { currentBootstrapPlan, isProjectlessBootstrap, sameBootstrapPlanBinding } from "../bootstrap/bootstrap-plan.ts";
+import {
+  bootstrapPlanIntentTasks,
+  bootstrapReviewIntentCurrent,
+  currentBootstrapPlan,
+  isProjectlessBootstrap,
+  sameBootstrapPlanBinding,
+} from "../bootstrap/bootstrap-plan.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
@@ -1380,9 +1386,10 @@ export class ProductionGate {
     // Review round 1 (RF-REVIEW-02) — the candidate's PLAN must still be the run's. A review of the
     // PLAN the candidate names is not a review of a PLAN that replaced it; comparing the review with
     // the frozen candidate alone cannot tell, since both still name the replaced one.
-    const current = currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+    const planArtifact = this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN);
+    const current = currentBootstrapPlan(runId, planArtifact);
     const currentBinding = current.allowed ? current.value.binding : null;
-    if (!sameBootstrapPlanBinding(currentBinding, binding)) {
+    if (!sameBootstrapPlanBinding(currentBinding, binding) || planArtifact === null) {
       return deny(ReasonCode.EVIDENCE_STALE, "the candidate names a PLAN, manifest or planned outputs that are not the run's current ones", {
         runId,
         candidateSnapshotDigest,
@@ -1419,6 +1426,15 @@ export class ProductionGate {
         candidate: binding,
       });
     }
+    // The reviewer was shown the PLAN's intent, its one task's included, which no binding digest
+    // covers: the same PLAN submitted again with another task leaves the review stale.
+    const intent = bootstrapReviewIntentCurrent({
+      runId,
+      reviewedIntentDigest: review.bootstrapPlanIntentDigest,
+      planArtifact,
+      tasks: bootstrapPlanIntentTasks(this.db, runId),
+    });
+    if (!intent.allowed) return deny(intent.reasonCode, intent.message, { candidateSnapshotDigest, ...intent.evidence });
     if (review.verdict !== "PASS") {
       return deny(ReasonCode.REVIEW_REQUIRED, "blind review has not passed", { verdict: review.verdict });
     }
