@@ -1,0 +1,19 @@
+Limit: no capability token guards the settle write; it is guarded by its own checks (CONFIRM transaction, project-less bootstrap, current PLAN and candidate, stored producer result with a verified create receipt, activation result, one READY PLAN-bound task, one settlement per run)
+Limit: a run planned before BOOTSTRAP_PLAN_TASKS records existed (the live bootstrap run) is accepted by a legacy rule only when it has a sole unbound READY task
+Limit: a project-less bootstrap PLAN must carry exactly one task
+Ruled-out: settling a bootstrap task through an idle worker and a synthetic SUCCEEDED receipt before review | the CEO rejected it: a receipt from a worker that did no work, closing the repository-create task before anything exists, is not evidence of preparation
+Unverified: REVIEW_UNAVAILABLE still stalls the owner; a real headless owner following the result and revision directives, and a review longer than the 30-minute turn, were not exercised
+Record-Id: r-bootstrapreviewentry
+Follows: r-bootstrapownerplans
+Provenance: inherited c6cbbca234973bbafa02d84430d135f083651fe2
+
+Limit: only a project-less bootstrap plan_submit commits the PLAN, supersession, task and binding in one transaction; other run kinds still store the PLAN before their tasks
+Warn: revision deliveries are keyed by revision cycle (CEO) and review attempt (blind review) as well as candidate; a refused enqueue is returned as the result, not ignored
+Record-Id: r-bootstrapreplanatomic
+Follows: r-bootstrapreviewentry
+Provenance: inherited bedb3cd9b2af0812c6e5e90ecab4e8b0b2238f7d
+
+Limit: a project-less bootstrap plan_submit that deduplicates to an earlier stored PLAN which is not the run's current PLAN is refused (BOOTSTRAP_PLAN_RESUBMITTED_NOT_CURRENT) and rolls back; re-submitting the current PLAN, other run kinds and artifact deduplication are unchanged
+Record-Id: r-bootstrapplanresubmit
+Follows: r-bootstrapreplanatomic
+Provenance: inherited 20d94e84ef670434d492099ad39b29bf0aea4c8c
