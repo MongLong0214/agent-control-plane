@@ -1,0 +1,9 @@
+Limit: a review UNAVAILABLE row with no candidate digest is retried only when its evidence is exactly {auditEvidenceRejected:true}, its run_id column names the run, the freeze immediately before it in audit order froze the current candidate, and nothing moved on after it; the existing marker key bounds it, so no extra retry is earned per row or per deploy
+Record-Id: r-retrylegacyrow
+Follows: r-reviewerunavailablebounded
+Provenance: inherited 0056dadfc861d67f7736a42602c97605509f2166
+
+Limit: a stored review of the candidate vetoes the legacy retry unless a completed-review audit event for that candidate is ordered before the selected freeze; an unmatched stored review or one later than the freeze still blocks, and no witness covers a stored review with no matching completed-review event
+Record-Id: r-retrylegacyrowordered
+Follows: r-retrylegacyrow
+Provenance: inherited c5fef976b1bb3f272ddc04ed1038eaa82d13351d
