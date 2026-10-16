@@ -46,8 +46,8 @@ export class RecordingRuntimeDouble extends HeadlessRuntimeDouble {
  * bootstrap CTO's runtime reaches them, a headless Claude double for the role, a GPT provider
  * standing by, and a daemon to reconcile continuity. Only the model is scripted.
  */
-export const bootstrapRuntimeFixture = async () => {
-  const harness = makeHarness();
+export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof makeHarness>[0] = {}) => {
+  const harness = makeHarness(harnessOptions);
   const launch = await startSessionLaunchChannel(tempDir("acp-c1b-launch-"), { mcpToken: BOOTSTRAP_FIXTURE_TOKEN });
   const claude = new RecordingRuntimeDouble(harness.clock, "claude");
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
@@ -200,8 +200,11 @@ export const acknowledgeInBandOnWorkTurns = (f: BootstrapRuntimeFixture): Handle
   return handled;
 };
 
-export const withBootstrapRuntime = async (body: (f: BootstrapRuntimeFixture) => Promise<void>): Promise<void> => {
-  const f = await bootstrapRuntimeFixture();
+export const withBootstrapRuntime = async (
+  body: (f: BootstrapRuntimeFixture) => Promise<void>,
+  harnessOptions: Parameters<typeof makeHarness>[0] = {},
+): Promise<void> => {
+  const f = await bootstrapRuntimeFixture(harnessOptions);
   try {
     await body(f);
   } finally {

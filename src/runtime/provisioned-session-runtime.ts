@@ -255,7 +255,8 @@ interface TurnLane {
  *   own re-wake, at most once per row per `IN_BAND_REWAKE_MS` and never past the row's TTL, so
  *   unacknowledged work is retried at that pace and never in a loop here. Turns start only from
  *   the existing event paths (an in-band dispatch, an owner message, a wake) and from the control
- *   plane's own spawn and recovery; there is no timer here.
+ *   plane's own spawn and recovery, the daemon's once-per-dispatch bootstrap PLAN recovery wake
+ *   included; there is no timer here.
  *
  * In memory only: a restarted daemon holds no credential, and a session it holds none for cannot
  * run a turn until its credential is rotated and delivered again.
@@ -382,6 +383,20 @@ export class ProvisionedSessionRuntime {
   holds(sessionId: string): boolean {
     const held = this.#held.get(sessionId);
     return held !== undefined && held.credentialEpoch === this.ports.sessions.get(sessionId)?.credentialEpoch;
+  }
+
+  /** Whether the daemon's launch channel and socket paths are attached: without both no relayed turn runs. */
+  attachedToDaemon(): boolean {
+    return this.#delivery !== null && this.#route !== null;
+  }
+
+  /**
+   * Whether a turn of this session is running or queued here: any serialized operation (a work
+   * turn, an attestation, a probe) or a coalesced follow-up still to run.
+   */
+  turnInProgress(sessionId: string): boolean {
+    const lane = this.#lanes.get(sessionId);
+    return lane !== undefined && (lane.pending > 0 || lane.coalesced.length > 0);
   }
 
   /**
@@ -845,12 +860,47 @@ const attestationPrompt = (nonce: string): string =>
     "Do not call any other tool. After the tool answers, reply with the single word ATTESTED.",
   ].join("\n");
 
+/** How many `plan_submit` calls one turn makes for one run before it stops correcting its PLAN. */
+export const PLAN_SUBMISSIONS_PER_TURN = 4;
+
+/**
+ * What planning a run means, in the words both the RUN_DISPATCH line and the recovery line use: the
+ * contract is read through `contract_get`, which for a project-less bootstrap also carries the
+ * `bootstrapPlanGuide`, and a refused PLAN is corrected from the refusal's own evidence.
+ */
+const PLAN_STEPS =
+  "read mcp__acp-cto__contract_get for that run; write a PLAN that satisfies its contract, following the bootstrapPlanGuide it returns when there is one; " +
+  "submit the PLAN with mcp__acp-cto__plan_submit, using a new idempotencyKey for every call; " +
+  `if plan_submit refuses it, correct the PLAN from the refusal's evidence and submit it again, at most ${PLAN_SUBMISSIONS_PER_TURN} plan_submit calls for that run in this turn`;
+
+/**
+ * The audit kind that records one bootstrap PLAN recovery wake, for its run, the owner's binding
+ * generation and the acknowledged RUN_DISPATCH (`evidence.bindingGeneration`, `evidence.messageId`).
+ * `audit_events` is append only, so a daemon that starts again reads the wake as already made.
+ */
+export const BOOTSTRAP_PLAN_RECOVERY_WAKE = "BOOTSTRAP_PLAN_RECOVERY_WAKE";
+
+const PLAN_RECOVERY_KIND_PREFIX = "plan recovery: run ";
+
+/** The wake kind that tells a run's owner why it was woken: its run still has no PLAN. */
+export const planRecoveryTriggerKind = (runId: string): string => `${PLAN_RECOVERY_KIND_PREFIX}${runId} has no PLAN`;
+
+/** The trigger id of one recovery wake: the runtime refuses a second wake for it as a duplicate. */
+export const planRecoveryTriggerId = (runId: string, bindingGeneration: number, messageId: string): string =>
+  `bootstrap-plan-recovery:${runId}:${bindingGeneration}:${messageId}`;
+
 const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[]): string =>
   [
     `You are the ${binding.role}${binding.runId ? ` of run ${binding.runId}` : ""} in the agent control plane, at binding generation ${binding.bindingGeneration}.`,
     `The control plane woke you for: ${[...new Set(triggers.map((trigger) => trigger.kind))].join(", ")}.`,
     "Your only interface is the acp-cto tools. Call mcp__acp-cto__role_dispatch_pending to read the messages addressed to you.",
     "Act on each message as its kind requires, using the acp-cto tools, and acknowledge each one with mcp__acp-cto__run_ack (or mcp__acp-cto__role_dispatch_ack when it names no run).",
+    `A RUN_DISPATCH for a run you own and have not yet submitted a PLAN for means: ${PLAN_STEPS}; then acknowledge the RUN_DISPATCH with mcp__acp-cto__run_ack.`,
+    ...(triggers.some((trigger) => trigger.kind.startsWith(PLAN_RECOVERY_KIND_PREFIX))
+      ? [
+          `A wake for "${PLAN_RECOVERY_KIND_PREFIX}<runId> has no PLAN" means that run's RUN_DISPATCH was already acknowledged and the run still has no PLAN: for that run, ${PLAN_STEPS}. No message is left to acknowledge for it.`,
+        ]
+      : []),
     "A HANDOFF_PACKAGE is accepted with mcp__acp-cto__handoff_ack for its handoffId before it is acknowledged.",
     "When nothing addressed to you remains, reply with a one-line summary of what you did.",
   ].join("\n");
