@@ -9,7 +9,7 @@ import { newMessageId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { TERMINAL_RUN_STATES, isTerminal } from "../domain/run-state.ts";
+import { isTerminal } from "../domain/run-state.ts";
 import { FailureClass as FailureClassCode, type FailureClass, type RunState } from "../domain/types.ts";
 import { ownerMessagePointerOf } from "../ingress/buzz-message.ts";
 import { IngressGuard } from "../ingress/ingress-guard.ts";
@@ -140,24 +140,17 @@ const ESCALATION_REPLY_HELD = "ESCALATION_REPLY_HELD";
 const ESCALATION_REPLY_HOLD_REJECTED = "ESCALATION_REPLY_HOLD_REJECTED";
 
 /**
- * A held ESCALATION_REPLY the generic fence must leave alone: PENDING and unclaimed, held by its own
- * generation's revocation, never carried, and its run still live and still pinned to exactly the
- * generation and session it was addressed to — the state in which continuity's renewal of that same
- * owner is the only thing that can happen next. The moment any of that stops being true the row is
- * an ordinary undeliverable one again, and `fenceUndeliverable` rejects it.
+ * The rows a revocation held for an owner's renewal that nothing has carried or settled: PENDING,
+ * unclaimed, a hold record for their own generation, no carry record. Which of them stay held is
+ * decided in TypeScript by `Outbox.#stillHeld`, against continuity's own recovery admission.
  */
-const heldEscalationReplySql = (alias: string): string => `(
+const heldEscalationReplyCandidatesSql = (alias: string): string => `(
   ${alias}.kind = '${MessageKind.ESCALATION_REPLY}' AND ${alias}.status = 'PENDING' AND ${alias}.claim_token IS NULL
   AND EXISTS (SELECT 1 FROM audit_events held WHERE held.kind = '${ESCALATION_REPLY_HELD}'
                AND json_extract(held.evidence_json, '$.messageId') = ${alias}.message_id
                AND json_extract(held.evidence_json, '$.fromGeneration') = ${alias}.binding_generation)
   AND NOT EXISTS (SELECT 1 FROM audit_events carried WHERE carried.kind = '${ESCALATION_REPLY_CARRIED}'
-               AND json_extract(carried.evidence_json, '$.messageId') = ${alias}.message_id)
-  AND EXISTS (SELECT 1 FROM runs pinned WHERE pinned.run_id = ${alias}.run_id
-               AND pinned.owner_role_key = ${alias}.role_key
-               AND pinned.owner_binding_generation = ${alias}.binding_generation
-               AND pinned.owner_session_id = ${alias}.target_session_id
-               AND pinned.state NOT IN (${TERMINAL_RUN_STATES.map((state) => `'${state}'`).join(",")})))`;
+               AND json_extract(carried.evidence_json, '$.messageId') = ${alias}.message_id))`;
 const MAX_RETRY_DELAY_MS = 30 * 60 * 1000;
 const RETRYABLE_FAILURE_CLASSES: ReadonlySet<FailureClass> = new Set([
   "transient",
@@ -500,6 +493,12 @@ export class Outbox {
 
   /** The CTO role's wake port, once the daemon's listeners exist; null wakes nothing. */
   #inBandWake: InBandWake | null = null;
+  /**
+   * Continuity's answer to "can recovery still renew this role's `generation`?" —
+   * `BootstrapCtoStaffing.renewalPossible`, attached by the composition root. Until it is attached
+   * nothing is held: an ESCALATION_REPLY is held for a renewal only while recovery says one can come.
+   */
+  #renewalPossible: ((roleKey: string, generation: number) => boolean) | null = null;
   /**
    * When each pending in-band row was last woken for, by message id (clock milliseconds).
    *
@@ -1619,7 +1618,7 @@ export class Outbox {
         toGeneration === fromGeneration &&
         options.holdEscalationRepliesForRenewal === true &&
         this.#escalationReplyUnclaimed(row, now) &&
-        this.#escalationReplyCarriable(row, fromGeneration, row.target_session_id)
+        this.#stillHeld(row)
       ) {
         this.audit.record({
           kind: ESCALATION_REPLY_HELD,
@@ -1914,6 +1913,45 @@ export class Outbox {
   }
 
   /** Whether a CARRIED record exists for this message: the once-only rule, and nothing else is. */
+  /** Attaches continuity's renewal question; see `#renewalPossible`. */
+  attachRenewalCheck(renewalPossible: (roleKey: string, generation: number) => boolean): void {
+    this.#renewalPossible = renewalPossible;
+  }
+
+  /**
+   * Whether a held reply stays held: its renewal is still possible. The run is live, still pinned to
+   * exactly the generation and session the reply was addressed to, and the escalation it answers is
+   * still the one resolved (`#escalationReplyCarriable` at that generation); and continuity's own
+   * recovery admission still renews that generation (`#renewalPossible`). A row for which any of it
+   * fails can never be carried.
+   */
+  #stillHeld(row: RawOutbox): boolean {
+    return (
+      this.#escalationReplyCarriable(row, row.binding_generation, row.target_session_id) &&
+      this.#renewalPossible?.(row.role_key, row.binding_generation) === true
+    );
+  }
+
+  /**
+   * A new generation of `roleKey` was bound by a path that is not the renewal (a bind, a switch, a
+   * replacement or takeover, even after an earlier revoke): continuity's recovery now refuses the
+   * role (`BINDING_ALREADY_ACTIVE`, and a later generation on another actor or session ends the
+   * same-runtime chain for good), so no reply held for an earlier generation can ever be carried.
+   * Every one is rejected here, in the bind's own transaction.
+   */
+  rejectHeldEscalationRepliesForRole(roleKey: string, belowGeneration: number, reason: string): string[] {
+    const now = this.clock.nowIso();
+    return this.db.all<{ run_id: string | null }>(
+      `SELECT DISTINCT o.run_id FROM outbox o WHERE o.role_key = ? AND o.binding_generation < ? AND o.kind = ?`,
+      [roleKey, belowGeneration, MessageKind.ESCALATION_REPLY],
+    ).flatMap((run) => (run.run_id === null ? [] : this.#heldEscalationReplies(run.run_id)))
+      .filter((row) => row.role_key === roleKey && row.binding_generation < belowGeneration)
+      .map((row) => {
+        this.#rejectHeldEscalationReply(row, now, reason);
+        return row.message_id;
+      });
+  }
+
   /**
    * The renewal half of the escalation-reply hold, called by `RunEngine.restoreRecoveredBootstrapOwner`
    * in the transaction that pins `runId` to its owner's renewed generation, after the pin. Every reply
@@ -2678,6 +2716,20 @@ export class Outbox {
    */
   fenceUndeliverable(): number {
     return this.db.tx(() => {
+      // The backstop for a held ESCALATION_REPLY: it is spared only while its renewal is still
+      // possible (`#stillHeld`); one whose renewal can no longer come is rejected below like any
+      // other row whose target is gone.
+      const now = this.clock.nowIso();
+      const stillHeld: string[] = [];
+      let heldRejected = 0;
+      for (const row of this.db.all<RawOutbox>(`SELECT * FROM outbox WHERE ${heldEscalationReplyCandidatesSql("outbox")}`)) {
+        if (this.#stillHeld(row)) {
+          stillHeld.push(row.message_id);
+        } else {
+          this.#rejectHeldEscalationReply(row, now, "its renewal can no longer come");
+          heldRejected += 1;
+        }
+      }
       // Read the holder-claimed rows this call is about to burn *before* burning them: after the
       // UPDATE their status no longer says which ones moved, and each of them owns an ingress
       // claim that closes in this same transaction.
@@ -2697,11 +2749,11 @@ export class Outbox {
                   OR (status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL}))
                 )
             AND NOT ${liveDeliveryTarget("outbox")}
-            AND NOT ${heldEscalationReplySql("outbox")}`,
-        [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED],
+            AND message_id NOT IN (SELECT value FROM json_each(?))`,
+        [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, JSON.stringify(stillHeld)],
       ).changes;
       for (const messageId of stranded) this.settleHolderClaimOrThrow(messageId);
-      return changes;
+      return changes + heldRejected;
     });
   }
 

@@ -717,6 +717,8 @@ export class ControlPlane {
           runs: this.runs,
         },
       });
+      // An ESCALATION_REPLY is held for an owner's renewal only while this recovery can still renew it.
+      this.outbox.attachRenewalCheck((roleKey, generation) => this.bootstrapCtos.renewalPossible(roleKey, generation));
       this.continuity.attach({
         bootstrapRecovery: {
           recover: (roleKey) => this.bootstrapCtos.recover(roleKey),

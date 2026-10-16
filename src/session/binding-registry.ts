@@ -366,6 +366,9 @@ export class BindingRegistry {
           input.mode ?? "PREFERRED", this.clock.nowIso(),
         ],
       );
+      // A generation bound here is not the renewal, so a reply held for an earlier one is never
+      // carried now: rejected in this transaction (`Outbox.rejectHeldEscalationRepliesForRole`).
+      this.outbox.rejectHeldEscalationRepliesForRole(roleKey, generation, "the role was bound again, not renewed");
       if (input.authenticatedTarget && targetBinding.value) {
         const attested = this.recordTargetAttestation({
           targetBindingId: targetBinding.value,
@@ -646,6 +649,9 @@ export class BindingRegistry {
           input.mode ?? "PREFERRED", this.clock.nowIso(),
         ],
       );
+      // Not the renewal, whether or not the previous binding was still active: a reply held for an
+      // earlier generation can never be carried now, so it is rejected in this transaction.
+      this.outbox.rejectHeldEscalationRepliesForRole(roleKey, generation, "the role was replaced, not renewed");
 
       // A takeover repoints the live runs in the *same* transaction, so a crash cannot
       // leave a run pinned to a revoked generation.

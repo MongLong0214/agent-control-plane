@@ -4,7 +4,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import { Role, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import {
@@ -314,6 +314,90 @@ describe("ESC-03: the official restart renewal carries a held reply once", () =>
       expect(f.harness.cp.bindings.revoke(roleKey, "operator release", { allowBlockedRuns: true })).toMatchObject({ allowed: true });
       expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "REJECTED", bindingGeneration: 1 });
       expect(records(f, "ESCALATION_REPLY_HELD", reply.messageId)).toEqual([]);
+    });
+  });
+});
+
+/** A READY session that is not the run's owner: what a permanent replacement binds. */
+const strangerSession = (f: BootstrapRuntimeFixture): string => {
+  const next = f.harness.cp.sessions.create({ provider: "scripted", model: `permanent replacement ${++keys}` });
+  expect(f.harness.cp.sessions.transition(next.sessionId, SessionLifecycle.READY, "replacement ready")).toMatchObject({ allowed: true });
+  return next.sessionId;
+};
+
+/** The reply is never delivered: not to generation 1, not to the replacement, and never carried. */
+const expectRejectedUndelivered = (f: BootstrapRuntimeFixture, messageId: string, ownerSessionId: string, reason: string) => {
+  expect(f.harness.cp.outbox.get(messageId)).toMatchObject({ status: "REJECTED", bindingGeneration: 1, targetSessionId: ownerSessionId });
+  expect(records(f, "ESCALATION_REPLY_HOLD_REJECTED", messageId)).toMatchObject([{ reason }]);
+  expect(records(f, "ESCALATION_REPLY_CARRIED", messageId)).toEqual([]);
+};
+
+describe("ESC-03 round 3: a held reply stays held only while its renewal is still possible", () => {
+  it("a permanent replacement after the hold rejects the reply in the replacement's own transaction (the reviewer's sequence)", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, ownerSessionId, roleKey, reply } = await resolvedWithPendingReply(f);
+      await restart(f, ownerSessionId);
+      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "PENDING", bindingGeneration: 1 });
+      expect(records(f, "ESCALATION_REPLY_HELD", reply.messageId)).toHaveLength(1);
+
+      const next = strangerSession(f);
+      const replacement = f.harness.cp.bindings.switchTo({
+        role: Role.BOOTSTRAP_CTO, runId, sessionId: next, reason: "permanent replacement, previous owner no longer authorized",
+        conversation: "REPLACED", takeover: true,
+      });
+      expect(replacement).toMatchObject({ allowed: true, value: { bindingGeneration: 2 } });
+      expectRejectedUndelivered(f, reply.messageId, ownerSessionId, "the role was replaced, not renewed");
+      const incarnation = f.harness.cp.sessions.get(next)!.incarnation;
+      expect(f.harness.cp.outbox.pendingInBandFor(next, incarnation).map((m) => m.messageId)).not.toContain(reply.messageId);
+
+      expect(await f.harness.cp.bootstrapCtos.recover(roleKey)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_ALREADY_ACTIVE });
+      f.harness.cp.outbox.fenceUndeliverable();
+      expectRejectedUndelivered(f, reply.messageId, ownerSessionId, "the role was replaced, not renewed");
+    });
+  });
+
+  it("a fresh bind of the role after the hold rejects the reply in the bind's own transaction", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, ownerSessionId, reply } = await resolvedWithPendingReply(f);
+      await restart(f, ownerSessionId);
+      expect(f.harness.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId, sessionId: strangerSession(f) })).toMatchObject({ allowed: true });
+      expectRejectedUndelivered(f, reply.messageId, ownerSessionId, "the role was bound again, not renewed");
+    });
+  });
+
+  it("the sweep is the backstop: a holder written past the bind paths ends the renewal, and the sweep rejects the reply", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { ownerSessionId, roleKey, reply } = await resolvedWithPendingReply(f);
+      await restart(f, ownerSessionId);
+      // No bind path skips the transactional rejection; a raw write is the only way past it.
+      f.harness.cp.db.run(
+        `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, task_id, actor_id, session_id,
+                                  session_incarnation, binding_generation, mode, status, created_at)
+         SELECT 'asg_r3_raw', role_key, role, project_id, run_id, task_id, actor_id, session_id,
+                session_incarnation, binding_generation + 1, mode, 'ACTIVE', created_at
+           FROM assignments WHERE role_key = ? AND binding_generation = 1`,
+        [roleKey],
+      );
+      expect(f.harness.cp.outbox.get(reply.messageId)!.status).toBe("PENDING");
+      expect(f.harness.cp.outbox.fenceUndeliverable()).toBeGreaterThanOrEqual(1);
+      expectRejectedUndelivered(f, reply.messageId, ownerSessionId, "its renewal can no longer come");
+    });
+  });
+
+  it("a reversible withdrawal (DRAINING) keeps the hold, and the renewal still carries it once after READY", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { ownerSessionId, roleKey, reply } = await resolvedWithPendingReply(f);
+      await restart(f, ownerSessionId);
+      expect(f.harness.cp.sessions.transition(ownerSessionId, SessionLifecycle.DRAINING, "authority withdrawn for now")).toMatchObject({ allowed: true });
+      expect(await f.harness.cp.bootstrapCtos.recover(roleKey)).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
+      f.harness.cp.outbox.fenceUndeliverable();
+      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "PENDING", bindingGeneration: 1 });
+
+      expect(f.harness.cp.sessions.transition(ownerSessionId, SessionLifecycle.READY, "authority restored")).toMatchObject({ allowed: true });
+      f.harness.clock.advance(15 * 60_000 + 1);
+      await recover(f);
+      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "PENDING", bindingGeneration: 2, targetSessionId: ownerSessionId });
+      expect(records(f, "ESCALATION_REPLY_CARRIED", reply.messageId)).toHaveLength(1);
     });
   });
 });

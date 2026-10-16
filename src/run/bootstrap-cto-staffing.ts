@@ -580,6 +580,27 @@ export class BootstrapCtoStaffing {
     return allow(ReasonCode.OK, renewed);
   }
 
+  /**
+   * Whether continuity's recovery can still renew exactly `generation` of this role on its own
+   * session — the question an ESCALATION_REPLY held for that renewal is kept on (`Outbox`). It is
+   * `recover`'s own admission, `#recoverable`, not a restatement of it: yes while a recovery of the
+   * role is running, or while `#recoverable` admits the role with `generation` as its run's pin. One
+   * refusal does not end the possibility: a session that is only DRAINING can return to READY, and
+   * `#recoverable` refuses it on that alone, after every other check has passed. Reads only.
+   */
+  renewalPossible(roleKey: string, generation: number): boolean {
+    const recovery = this.#recovery;
+    if (!recovery) return false;
+    if (this.#recovering.has(roleKey)) return true;
+    const recoverable = this.#recoverable(recovery, roleKey);
+    if (recoverable.allowed) return recoverable.value.pinnedGeneration === generation;
+    if (recoverable.reasonCode !== ReasonCode.SESSION_NOT_READY || recoverable.evidence["lifecycle"] !== SessionLifecycle.DRAINING) {
+      return false;
+    }
+    const runId = this.ports.bindings.history(roleKey).at(-1)?.runId ?? null;
+    return runId !== null && this.ports.runs.get(runId)?.ownerBindingGeneration === generation;
+  }
+
   /** Step 1 of `recover`, asked again inside the rotation transaction. Reads only. */
   #recoverable(recovery: BootstrapCtoRecoveryPorts, roleKey: string): Decision<RecoverableBootstrapCto> {
     if (this.ports.bindings.active(roleKey)) {
