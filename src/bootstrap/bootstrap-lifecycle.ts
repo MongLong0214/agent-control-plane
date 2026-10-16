@@ -68,7 +68,7 @@ export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[]
     id: "plan-one-task",
     kind: BootstrapLifecycleKind.PLAN_REQUIREMENT,
     statement:
-      "The run reaches this review with exactly one live task, READY and created with the current PLAN; a run whose task has an execution or is already SUCCEEDED is not reviewed.",
+      "The run reaches this review with exactly one live task, and it is READY; a run whose task has an execution or is already SUCCEEDED is not reviewed, nor, once the run has a BOOTSTRAP_PLAN_TASKS record, one whose task no such record binds to the current PLAN.",
     sites: [
       {
         file: TASKS,
@@ -216,6 +216,14 @@ export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[]
         absent: ["primary.sessionId !==", "!== primary.sessionId", "primary?.sessionId !==", "!== primary?.sessionId"],
       },
     ],
+  },
+  {
+    // Review of #1119, BPI-R1-02 — the legacy exception `plan-one-task` leaves out, disclosed.
+    id: "plan-task-legacy-provenance",
+    kind: BootstrapLifecycleKind.NOT_VERIFIED,
+    statement:
+      "For a run with no BOOTSTRAP_PLAN_TASKS record (planned before plan_submit wrote one), that its one live task was created with the current PLAN is not checked: the task is accepted as the current PLAN's while it is the run's only live task.",
+    sites: [{ file: TASKS, symbol: "boundToBootstrapPlan", enforces: ["if (bindings.length === 0) return liveTasks === 1;"] }],
   },
   {
     id: "forged-ledger",

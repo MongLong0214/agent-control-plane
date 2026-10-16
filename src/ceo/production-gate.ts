@@ -1,7 +1,13 @@
 import { execFileSync } from "node:child_process";
 
 import { deriveHumanGate } from "./human-gate.ts";
-import { bootstrapPlanIntent, currentBootstrapPlan, isProjectlessBootstrap, sameBootstrapPlanBinding } from "../bootstrap/bootstrap-plan.ts";
+import {
+  bootstrapPlanIntentTasks,
+  bootstrapReviewIntentCurrent,
+  currentBootstrapPlan,
+  isProjectlessBootstrap,
+  sameBootstrapPlanBinding,
+} from "../bootstrap/bootstrap-plan.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
@@ -1403,17 +1409,13 @@ export class ProductionGate {
     }
     // The reviewer was shown the PLAN's intent, its one task's included, which no binding digest
     // covers: the same PLAN submitted again with another task leaves the review stale.
-    const intent = bootstrapPlanIntent({ runId, planArtifact, tasks: this.tasks.list(runId) });
-    const currentIntent = intent.allowed ? intent.value.digest : null;
-    if (review.bootstrapPlanIntentDigest === undefined || review.bootstrapPlanIntentDigest !== currentIntent) {
-      return deny(ReasonCode.EVIDENCE_STALE, "the bootstrap plan review was shown another PLAN intent than the run's current one", {
-        runId,
-        candidateSnapshotDigest,
-        refusal: "BOOTSTRAP_PLAN_INTENT_STALE",
-        reviewed: review.bootstrapPlanIntentDigest ?? null,
-        current: currentIntent,
-      });
-    }
+    const intent = bootstrapReviewIntentCurrent({
+      runId,
+      reviewedIntentDigest: review.bootstrapPlanIntentDigest,
+      planArtifact,
+      tasks: bootstrapPlanIntentTasks(this.db, runId),
+    });
+    if (!intent.allowed) return deny(intent.reasonCode, intent.message, { candidateSnapshotDigest, ...intent.evidence });
     if (review.verdict !== "PASS") {
       return deny(ReasonCode.REVIEW_REQUIRED, "blind review has not passed", { verdict: review.verdict });
     }

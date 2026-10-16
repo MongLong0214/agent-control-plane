@@ -10,6 +10,8 @@ import {
   type PlannedBootstrapOutputs,
   bootstrapPlanCoverageTargets,
   bootstrapPlanIntent,
+  bootstrapPlanIntentTasks,
+  bootstrapReviewIntentCurrent,
   currentBootstrapPlan,
   isProjectlessBootstrap,
   sameBootstrapPlanBinding,
@@ -529,14 +531,13 @@ export class BlindReviewGate {
       if (!stillCurrent.allowed) return stillCurrent as Decision<ReviewPacket>;
       // The same PLAN can be submitted again with another task, which no binding digest covers: a
       // verdict on an intent the run no longer has is stale too.
-      if (stillCurrent.value.intentDigest !== inputs.intentDigest) {
-        return deny(ReasonCode.EVIDENCE_STALE, "the PLAN's task was replaced while its review was in flight", {
-          runId: inputs.runId,
-          refusal: "BOOTSTRAP_PLAN_INTENT_STALE",
-          reviewed: inputs.intentDigest,
-          current: stillCurrent.value.intentDigest,
-        });
-      }
+      const intentCurrent = bootstrapReviewIntentCurrent({
+        runId: inputs.runId,
+        reviewedIntentDigest: inputs.intentDigest,
+        planArtifact: this.artifacts.latest<unknown>(inputs.runId, ArtifactKind.PLAN),
+        tasks: bootstrapPlanIntentTasks(this.db, inputs.runId),
+      });
+      if (!intentCurrent.allowed) return intentCurrent as Decision<ReviewPacket>;
       return this.settle({
         runId: inputs.runId,
         contractDigest: inputs.contractDigest,
@@ -1928,12 +1929,7 @@ export class BlindReviewGate {
     const intent = bootstrapPlanIntent({
       runId: request.runId,
       planArtifact,
-      tasks: this.db
-        .all<{ task_id: string; title: string; state: string; spec_json: string }>(
-          `SELECT task_id, title, state, spec_json FROM tasks WHERE run_id = ? ORDER BY created_at, rowid`,
-          [request.runId],
-        )
-        .map((row) => ({ taskId: row.task_id, title: row.title, state: row.state, spec: JSON.parse(row.spec_json) as unknown })),
+      tasks: bootstrapPlanIntentTasks(this.db, request.runId),
     });
     if (!intent.allowed) return intent as Decision<TrustedBootstrapPlanReview>;
     return allow(ReasonCode.OK, {

@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 
-import { currentBootstrapPlan, isProjectlessBootstrap, sameBootstrapPlanBinding } from "../bootstrap/bootstrap-plan.ts";
+import {
+  bootstrapPlanIntentTasks,
+  bootstrapReviewIntentCurrent,
+  currentBootstrapPlan,
+  isProjectlessBootstrap,
+  sameBootstrapPlanBinding,
+} from "../bootstrap/bootstrap-plan.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
@@ -397,8 +403,10 @@ export class CandidatePipeline {
         // is not the CTO's next instruction for P2. So the PLAN is checked after the last await before
         // each thing this path does — the revision request or unavailable-review record
         // (`unpassedReview`), and the packet (below) — never only once after the review.
-        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, () =>
-          this.bootstrapPlanStillCurrent(input.runId, snapshot),
+        // A verdict rests on the review the gate stored, whose intent must still be the run's too
+        // (BPI-R1-01): a task replaced during the await keeps the PLAN binding and changes only that.
+        const unpassed = await this.unpassedReview(input.runId, snapshotDigest, reviewed, attemptId, (verdict) =>
+          this.bootstrapPlanStillCurrent(input.runId, snapshot, verdict ? snapshotDigest : null),
         );
         if (unpassed !== null) return unpassed;
         if (this.#continuity?.evaluate) await this.#continuity.evaluate("pre-completion");
@@ -645,9 +653,10 @@ export class CandidatePipeline {
     attemptId: string,
     /**
      * Whether the candidate is still the one to act on, asked after the last await and before
-     * anything is delivered or recorded. A repository candidate's verdict is delivered as before.
+     * anything is delivered or recorded, told whether the outcome is a reviewer verdict (one the gate
+     * stored a review for). A repository candidate's verdict is delivered as before.
      */
-    stillCurrent: () => Decision<void> = () => allow(ReasonCode.OK, undefined),
+    stillCurrent: (verdict: boolean) => Decision<void> = () => allow(ReasonCode.OK, undefined),
   ): Promise<Decision<PipelineOutcome> | null> {
     if (reviewed.allowed) return null;
     // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
@@ -656,10 +665,6 @@ export class CandidatePipeline {
     // #246 C2, review round 2 (RF-REVIEW-02) — the review and the evaluation above were awaited, and
     // a bootstrap PLAN replaced during either makes this outcome stale: no revision request and no
     // unavailable-review record is produced for it. Nothing below awaits before either is written.
-    const current = stillCurrent();
-    if (!current.allowed) {
-      return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: current.reasonCode, snapshotDigest });
-    }
     // §18.7 — only a reviewer *verdict* enters the CTO revision loop. A lost isolation
     // or a provider that never answered is an assurance failure the candidate cannot
     // repair, so the gate is neither lowered nor handed to the CTO to "fix".
@@ -667,6 +672,10 @@ export class CandidatePipeline {
       reviewed.reasonCode === ReasonCode.REVIEW_REVISE ||
       reviewed.reasonCode === ReasonCode.REVIEW_BLOCK ||
       reviewed.reasonCode === ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT;
+    const current = stillCurrent(isVerdict);
+    if (!current.allowed) {
+      return allow(ReasonCode.OK, { stage: "CANDIDATE_STALE", reasonCode: current.reasonCode, snapshotDigest });
+    }
 
     if (!isVerdict) {
       this.audit.record({
@@ -942,10 +951,13 @@ export class CandidatePipeline {
   /**
    * #246 C2, review round 1 (RF-REVIEW-02) — a project-less bootstrap candidate's freshness: the PLAN
    * binding it froze is still the one the run's current PLAN artifact implies. A current PLAN with no
-   * plannable outputs has no binding, and is not the candidate's either.
+   * plannable outputs has no binding, and is not the candidate's either. Given the snapshot of a
+   * stored review an outcome rests on, that review's intent must also be the run's current one
+   * (`bootstrapReviewIntentCurrent`, review of #1119 BPI-R1-01).
    */
-  private bootstrapPlanStillCurrent(runId: string, snapshot: CandidateSnapshot): Decision<void> {
-    const current = currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+  private bootstrapPlanStillCurrent(runId: string, snapshot: CandidateSnapshot, reviewedSnapshotDigest: string | null = null): Decision<void> {
+    const planArtifact = this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN);
+    const current = currentBootstrapPlan(runId, planArtifact);
     const currentBinding = current.allowed ? current.value.binding : null;
     if (!sameBootstrapPlanBinding(currentBinding, snapshot.bootstrapPlan)) {
       return deny(ReasonCode.EVIDENCE_STALE, "the PLAN this candidate names was replaced while it was being judged", {
@@ -954,7 +966,14 @@ export class CandidatePipeline {
         current: currentBinding,
       });
     }
-    return allow(ReasonCode.OK, undefined);
+    if (reviewedSnapshotDigest === null) return allow(ReasonCode.OK, undefined);
+    const intent = bootstrapReviewIntentCurrent({
+      runId,
+      reviewedIntentDigest: this.storedReview(runId, reviewedSnapshotDigest)?.content.bootstrapPlanIntentDigest,
+      planArtifact,
+      tasks: bootstrapPlanIntentTasks(this.db, runId),
+    });
+    return intent.allowed ? allow(ReasonCode.OK, undefined) : (intent as Decision<void>);
   }
 
   /**

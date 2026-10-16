@@ -12,6 +12,7 @@ import {
 } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
 import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
+import type { Db } from "../db/database.ts";
 import { RunKind } from "../domain/types.ts";
 import { parseGitHubIdentity } from "./github-write-port.ts";
 import { githubOperationSchema, isCreateOnlyPlan, preflightGitHubOperations, type GitHubOperation } from "./repo-factory-github.ts";
@@ -557,6 +558,51 @@ export const bootstrapPlanIntent = (input: {
     task: { taskId: task.taskId, title: title.value!, completionCriteria: completionCriteria.value },
   };
   return allow(ReasonCode.OK, { intent, digest: digestOf(intent) });
+};
+
+/** A run's tasks as `bootstrapPlanIntent` reads them, in creation order, from the tasks table itself. */
+export const bootstrapPlanIntentTasks = (db: Pick<Db, "all">, runId: string): BootstrapPlanIntentTask[] =>
+  db
+    .all<{ task_id: string; title: string; state: string; spec_json: string }>(
+      `SELECT task_id, title, state, spec_json FROM tasks WHERE run_id = ? ORDER BY created_at, rowid`,
+      [runId],
+    )
+    .map((row) => ({ taskId: row.task_id, title: row.title, state: row.state, spec: JSON.parse(row.spec_json) as unknown }));
+
+/**
+ * Review of #1119, round 1 (BPI-R1-01) — whether a BOOTSTRAP_PLAN review was shown the run's CURRENT
+ * intent: its `bootstrapPlanIntentDigest` is the digest of the projection recomputed now from the run's
+ * latest PLAN artifact and its one live task. No PLAN binding digest covers the task, so the same PLAN
+ * submitted again with another task, or a task changed since, leaves the binding and changes only this.
+ * A review with no such digest predates it (pre-#1119): it was never shown the intent and cannot be
+ * compared, so it authorizes nothing until the PLAN is reviewed again. Every consumer that trusts such
+ * a review asks this, after its last await and before it acts; none restates the comparison.
+ */
+export const bootstrapReviewIntentCurrent = (input: {
+  runId: string;
+  reviewedIntentDigest: unknown;
+  planArtifact: BootstrapPlanArtifact | null;
+  tasks: readonly BootstrapPlanIntentTask[];
+}): Decision<{ digest: string }> => {
+  const { runId } = input;
+  if (typeof input.reviewedIntentDigest !== "string") {
+    return deny(
+      ReasonCode.EVIDENCE_STALE,
+      "the bootstrap plan review carries no PLAN intent digest (it predates the intent check), so it was never shown the run's current PLAN intent; the PLAN must be reviewed again",
+      { runId, refusal: "BOOTSTRAP_PLAN_INTENT_MISSING", reviewed: null },
+    );
+  }
+  const current = input.planArtifact === null ? null : bootstrapPlanIntent({ runId, planArtifact: input.planArtifact, tasks: input.tasks });
+  const currentDigest = current?.allowed ? current.value.digest : null;
+  if (input.reviewedIntentDigest !== currentDigest) {
+    return deny(ReasonCode.EVIDENCE_STALE, "the bootstrap plan review was shown another PLAN intent than the run's current one", {
+      runId,
+      refusal: "BOOTSTRAP_PLAN_INTENT_STALE",
+      reviewed: input.reviewedIntentDigest,
+      current: currentDigest,
+    });
+  }
+  return allow(ReasonCode.OK, { digest: input.reviewedIntentDigest });
 };
 
 /** Whether a run is the project-less PROJECT_BOOTSTRAP run this slice binds to its PLAN. */
