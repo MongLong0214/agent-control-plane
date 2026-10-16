@@ -1,0 +1,12 @@
+Limit: the packet reviewer scope is one predicate shared by doctor and the reviewer: override set → OVERRIDE (capsule rules), else ~/.codex with auth.json → DEFAULT (reused, never claimed), missing → UNCONFIGURED, anything else → UNUSABLE; only UNCONFIGURED falls back to the configured fallback reviewer
+Limit: the review-unavailable retry wake fires once per (run, generation, candidate), so a retry that fails again cannot loop every tick
+Ruled-out: a single-use private reviewer CODEX_HOME capsule as the only path | the owner rejected it: every review would consume a capsule that needs a fresh browser login; the existing authenticated Codex home is reused instead, and the capsule stays only as an explicit override
+Warn: the shared default home is not credential- or history-isolated; reviewer independence comes from its own session, the frozen candidate and role separation
+Unverified: that the live Codex CLI accepts the new reviewer model and refreshes its login under the relaxed reviewer profile is provable only after deployment
+Record-Id: r-reviewerdefaulthome
+Provenance: inherited d4e371ceae202c28f76f8ab2257aec074462a562
+
+Warn: every preferred-to-fallback reviewer transition (runtime unavailable, capacity denial, binding refusal, session setup) now requires the shared packet reviewer scope to be UNCONFIGURED; this intentionally removes the previous measured-outage fallback, so a configured but unavailable GPT reviewer ends REVIEW_UNAVAILABLE
+Record-Id: r-reviewerfallbackgate
+Follows: r-reviewerdefaulthome
+Provenance: inherited 93b10b02d9f075e606b60a75620e747a8b70851d
