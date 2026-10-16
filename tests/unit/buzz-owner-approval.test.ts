@@ -73,6 +73,14 @@ afterEach(() => vi.restoreAllMocks());
 
 const SECRET = "buzz-owner-approval-secret";
 const ROOM_X = "room-repo-factory";
+/**
+ * The repo-factory project as the operator names it on `ACP_REPO_FACTORY_PROJECT_ID`: a project id
+ * of the shape the live registry issues (`prj_` and 24 lowercase hex), never the word "repo-factory".
+ * The fixture used to register the project under the literal id `repo-factory`, which is the one id
+ * the daemon looked up and the one id no real deployment has.
+ */
+const REPO_FACTORY_PROJECT = "prj_5e1f0c2a9b7d4e3f8a6c1b2d";
+const COMMITLORE_PROJECT = "commitlore";
 const ROOM_Y = "room-commitlore";
 const ROOM_OTHER = "room-elsewhere";
 const PROMPT_HEADER = "ACP OWNER APPROVAL REQUEST";
@@ -182,6 +190,12 @@ const startWorld = async (
     projectId?: string;
     xRooms?: readonly string[];
     withY?: boolean;
+    /** The project X is PRIMARY_CTO of; the configured repo-factory project unless a case moves it. */
+    xProjectId?: string;
+    /** The project Y is PRIMARY_CTO of, when `withY`. */
+    yProjectId?: string;
+    /** `ACP_REPO_FACTORY_PROJECT_ID` as configured; `null` leaves it unset. */
+    repoFactoryProjectId?: string | null;
     runner?: (real: BuzzOwnerApprovalRunnerPort) => BuzzOwnerApprovalRunnerPort;
     identity?: (keys: Keys) => string | undefined;
   } = {},
@@ -204,8 +218,9 @@ const startWorld = async (
   const { cp } = prepared.harness;
   // The CEO speaks on Buzz as its own key, so its marker-carrying mention is a peer's, not the owner's.
   cp.db.run(`UPDATE sessions SET buzz_actor_id = ? WHERE session_id = ?`, [keys.ceo.pubkey, prepared.ceoSessionId]);
-  const xSession = bindPrimaryCto(prepared, "repo-factory", keys.x, ROOM_X);
-  const ySession = options.withY ? bindPrimaryCto(prepared, "commitlore", keys.y, ROOM_Y) : null;
+  const xSession = bindPrimaryCto(prepared, options.xProjectId ?? REPO_FACTORY_PROJECT, keys.x, ROOM_X);
+  const ySession = options.withY ? bindPrimaryCto(prepared, options.yProjectId ?? COMMITLORE_PROJECT, keys.y, ROOM_Y) : null;
+  const repoFactoryProjectId = options.repoFactoryProjectId === undefined ? REPO_FACTORY_PROJECT : options.repoFactoryProjectId;
   writeSubscriberConfig(dir, [
     { keyFile: keys.x.keyFile, rooms: options.xRooms ?? [ROOM_X] },
     ...(options.withY ? [{ keyFile: keys.y.keyFile, rooms: [ROOM_Y] }] : []),
@@ -220,7 +235,10 @@ const startWorld = async (
   const module = await loadApprovalModule();
   const approvals =
     composition.createDaemonBuzzOwnerApprovals?.(cp, {
-      environment: { ACP_OWNER_APPROVAL_BUZZ_IDENTITY: options.identity ? options.identity(keys) : keys.x.pubkey },
+      environment: {
+        ACP_OWNER_APPROVAL_BUZZ_IDENTITY: options.identity ? options.identity(keys) : keys.x.pubkey,
+        ...(repoFactoryProjectId === null ? {} : { ACP_REPO_FACTORY_PROJECT_ID: repoFactoryProjectId }),
+      },
       ownerActors: [keys.owner.pubkey],
       policy,
       runner: options.runner ? options.runner(prepared.runner) : prepared.runner,
@@ -815,7 +833,7 @@ describe("W7: replay", () => {
       for (let round = 0; round < 3; round += 1) await w.send(reply);
       const module = w.module!;
       const restarted = composition.createDaemonBuzzOwnerApprovals!(w.prepared.harness.cp, {
-        environment: { ACP_OWNER_APPROVAL_BUZZ_IDENTITY: w.keys.x.pubkey },
+        environment: { ACP_OWNER_APPROVAL_BUZZ_IDENTITY: w.keys.x.pubkey, ACP_REPO_FACTORY_PROJECT_ID: REPO_FACTORY_PROJECT },
         ownerActors: [w.keys.owner.pubkey],
         policy: { allowedActors: [w.keys.owner.pubkey], secret: SECRET },
         runner: w.prepared.runner,
@@ -1282,7 +1300,7 @@ describe("O1 and O4: who posts, what is signed, and what health says", () => {
     const w = await startWorld();
     try {
       const { cp } = w.prepared.harness;
-      expect(cp.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId: "repo-factory" }), "test revoke").allowed).toBe(true);
+      expect(cp.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId: REPO_FACTORY_PROJECT }), "test revoke").allowed).toBe(true);
       w.subscriber.rejudge();
       await w.tick();
       expect(w.counts().prompts).toBe(0);
@@ -1338,5 +1356,223 @@ describe("O1 and O4: who posts, what is signed, and what health says", () => {
     } finally {
       await w.close();
     }
+  });
+});
+
+/**
+ * T3 — the repo-factory project is the one the operator names on `ACP_REPO_FACTORY_PROJECT_ID`, a
+ * registered project id. Not a display name, not a literal, not an id pattern: the authority is
+ * every one of the configured id, its registration, its ACTIVE PRIMARY_CTO binding, that binding's
+ * live runtime carrying a Buzz identity and room, and that identity held by exactly one ACTIVE
+ * PRIMARY_CTO binding. Any one missing posts nothing and health names which.
+ */
+describe("T3: the posting authority is the configured repo-factory project's CTO", () => {
+  const unavailableFor = (cause: string): string => `REPO_FACTORY_AUTHORITY_UNAVAILABLE:${cause}`;
+  const registerProject = (w: World, projectId: string): void => {
+    const { cp } = w.prepared.harness;
+    cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [projectId, "repo-factory", cp.clock.nowIso()]);
+  };
+  const ticksToNothing = async (w: World): Promise<string | null> => {
+    w.subscriber.rejudge();
+    await w.tick();
+    expect(w.counts().prompts, "no owner-approval prompt is posted").toBe(0);
+    expect(w.relay.published.filter((event) => event.content.startsWith(PROMPT_HEADER))).toEqual([]);
+    return w.approvals!.health().unavailable;
+  };
+
+  describe("1: a real-format project id", () => {
+    it("posts the prompt when the configured prj_ project's live CTO is X, and health is available", async () => {
+      const w = await startWorld();
+      try {
+        expect(REPO_FACTORY_PROJECT).toMatch(/^prj_[0-9a-f]{24}$/);
+        await w.tick();
+        expect(w.approvals!.health()).toMatchObject({ configured: true, unavailable: null, openPrompts: 1 });
+        expect(w.counts().prompts).toBe(1);
+        expect(w.publishedPrompts()[0]!.pubkey).toBe(w.keys.x.pubkey);
+      } finally {
+        await w.close();
+      }
+    });
+  });
+
+  describe("2: only another project matches", () => {
+    it("posts nothing when X is another project's CTO and the configured project's CTO is a different key", async () => {
+      const w = await startWorld({ xProjectId: COMMITLORE_PROJECT, withY: true, yProjectId: REPO_FACTORY_PROJECT });
+      try {
+        expect(w.subscriber.admission().identities.find((one) => one.identityPubkey === w.keys.x.pubkey)?.state).toBe("ADMITTED");
+        expect(await ticksToNothing(w)).toBe("REPO_FACTORY_AUTHORITY_MISMATCH");
+      } finally {
+        await w.close();
+      }
+    });
+
+    it("posts nothing when X is another project's CTO and the configured project has no CTO", async () => {
+      const w = await startWorld({ xProjectId: COMMITLORE_PROJECT });
+      try {
+        registerProject(w, REPO_FACTORY_PROJECT);
+        expect(await ticksToNothing(w)).toBe(unavailableFor("NO_ACTIVE_REPO_FACTORY_CTO"));
+      } finally {
+        await w.close();
+      }
+    });
+  });
+
+  describe("3: zero or more than one", () => {
+    it("posts nothing when ACP_REPO_FACTORY_PROJECT_ID is unset or blank", async () => {
+      for (const configured of [null, "   "]) {
+        const w = await startWorld({ repoFactoryProjectId: configured });
+        try {
+          expect(await ticksToNothing(w), JSON.stringify(configured)).toBe(unavailableFor("REPO_FACTORY_PROJECT_NOT_CONFIGURED"));
+        } finally {
+          await w.close();
+        }
+      }
+    });
+
+    it("posts nothing when the configured id names no registered project", async () => {
+      const w = await startWorld({ repoFactoryProjectId: "prj_000000000000000000000000" });
+      try {
+        expect(await ticksToNothing(w)).toBe(unavailableFor("REPO_FACTORY_PROJECT_NOT_REGISTERED"));
+      } finally {
+        await w.close();
+      }
+    });
+
+    it("posts nothing when X's Buzz identity is held by two ACTIVE PRIMARY_CTO bindings", async () => {
+      const w = await startWorld();
+      try {
+        const { cp } = w.prepared.harness;
+        // A second ACTIVE PRIMARY_CTO binding whose runtime carries X's key. The schema keeps a key on
+        // one *live* session only, so the second holder is a stopped runtime its ACTIVE binding still
+        // resolves to — written by raw SQL, since no API sets a key on a session after it has stopped.
+        cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [COMMITLORE_PROJECT, COMMITLORE_PROJECT, cp.clock.nowIso()]);
+        const second = cp.sessions.create({ provider: "scripted", model: "cto", buzzAddress: ROOM_Y });
+        expect(cp.sessions.transition(second.sessionId, SessionLifecycle.READY, "test").reasonCode).toBe(ReasonCode.OK);
+        expect(cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: second.sessionId, projectId: COMMITLORE_PROJECT }).allowed).toBe(true);
+        cp.db.run(`UPDATE sessions SET lifecycle = 'STOPPED' WHERE session_id = ?`, [second.sessionId]);
+        cp.db.run(`UPDATE sessions SET buzz_actor_id = ? WHERE session_id = ?`, [w.keys.x.pubkey, second.sessionId]);
+        expect(cp.bindings.activePrimaryCto(COMMITLORE_PROJECT)?.sessionId).toBe(second.sessionId);
+        expect(cp.bindings.activePrimaryCto(REPO_FACTORY_PROJECT)?.sessionId).toBe(w.ctoSessions.x);
+        expect(await ticksToNothing(w)).toBe(unavailableFor("REPO_FACTORY_CTO_IDENTITY_AMBIGUOUS"));
+      } finally {
+        await w.close();
+      }
+    });
+  });
+
+  describe("4: a revoked or stale binding", () => {
+    it("posts nothing once the configured project's binding is revoked", async () => {
+      // X stays admitted as another project's CTO, so the refusal is the authority's own.
+      const w = await startWorld({ xProjectId: COMMITLORE_PROJECT, withY: true, yProjectId: REPO_FACTORY_PROJECT });
+      try {
+        const { cp } = w.prepared.harness;
+        expect(cp.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId: REPO_FACTORY_PROJECT }), "test revoke").allowed).toBe(true);
+        expect(await ticksToNothing(w)).toBe(unavailableFor("NO_ACTIVE_REPO_FACTORY_CTO"));
+      } finally {
+        await w.close();
+      }
+    });
+
+    it("posts nothing when the configured project's CTO runtime is no longer live", async () => {
+      const w = await startWorld({ xProjectId: COMMITLORE_PROJECT, withY: true, yProjectId: REPO_FACTORY_PROJECT });
+      try {
+        const { cp } = w.prepared.harness;
+        expect(cp.sessions.transition(w.ctoSessions.y!, SessionLifecycle.STOPPED, "test stop").reasonCode).toBe(ReasonCode.OK);
+        expect(cp.bindings.activePrimaryCto(REPO_FACTORY_PROJECT)?.sessionId).toBe(w.ctoSessions.y);
+        expect(await ticksToNothing(w)).toBe(unavailableFor("REPO_FACTORY_CTO_NOT_LIVE"));
+      } finally {
+        await w.close();
+      }
+    });
+
+    it("posts nothing when X itself is the configured CTO and its runtime stops: admission refuses first", async () => {
+      const w = await startWorld();
+      try {
+        const { cp } = w.prepared.harness;
+        expect(cp.sessions.transition(w.ctoSessions.x, SessionLifecycle.STOPPED, "test stop").reasonCode).toBe(ReasonCode.OK);
+        expect(await ticksToNothing(w)).toBe("IDENTITY_NOT_ADMITTED:NO_LIVE_SESSION");
+      } finally {
+        await w.close();
+      }
+    });
+
+    /**
+     * ACP1091-01 — a prompt issued under the authority whose first send did not reach the relay is
+     * stored and retried by later ticks. The retry asks the authority again at the moment it sends,
+     * so a prompt the authority no longer covers stays unsent.
+     */
+    const pendingPrompt = async (w: World): Promise<string> => {
+      const firstSend = vi.spyOn(w.subscriber.replies, "publishApprovalPublication").mockResolvedValueOnce({ status: "UNAVAILABLE" });
+      const initial = await w.approvals!.tick();
+      await w.drain();
+      firstSend.mockRestore();
+      expect(initial.authority).toBeNull();
+      expect(initial.issued).toHaveLength(1);
+      expect(w.counts().prompts, "the first send did not reach the relay").toBe(0);
+      expect(w.approvals!.health()).toMatchObject({ openPrompts: 1, unpublishedPrompts: 1 });
+      return initial.issued[0]!;
+    };
+
+    it("does not send a pending prompt once the configured project's binding is revoked and X is another project's CTO", async () => {
+      const w = await startWorld();
+      try {
+        const { cp } = w.prepared.harness;
+        await pendingPrompt(w);
+        expect(cp.bindings.revoke(roleKeyFor(Role.PRIMARY_CTO, { projectId: REPO_FACTORY_PROJECT }), "test revoke").allowed).toBe(true);
+        cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, [COMMITLORE_PROJECT, COMMITLORE_PROJECT, cp.clock.nowIso()]);
+        expect(cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: w.ctoSessions.x, projectId: COMMITLORE_PROJECT }).allowed).toBe(true);
+        w.subscriber.rejudge();
+        await w.drain();
+        expect(w.subscriber.admission().identities.find((one) => one.identityPubkey === w.keys.x.pubkey)?.state).toBe("ADMITTED");
+        const retry = await w.approvals!.tick();
+        await w.drain();
+        expect(retry.authority).toBe(unavailableFor("NO_ACTIVE_REPO_FACTORY_CTO"));
+        expect(retry.published).toEqual([]);
+        expect(w.counts().prompts).toBe(0);
+        expect(w.approvals!.health()).toMatchObject({ openPrompts: 1, unpublishedPrompts: 1 });
+      } finally {
+        await w.close();
+      }
+    });
+
+    it("does not send a pending prompt from a store recreated with ACP_REPO_FACTORY_PROJECT_ID unset", async () => {
+      const w = await startWorld();
+      let restarted: BuzzOwnerApprovals | null = null;
+      try {
+        await pendingPrompt(w);
+        w.approvals!.close();
+        restarted = composition.createDaemonBuzzOwnerApprovals!(w.prepared.harness.cp, {
+          environment: { ACP_OWNER_APPROVAL_BUZZ_IDENTITY: w.keys.x.pubkey },
+          ownerActors: [w.keys.owner.pubkey],
+          policy: { allowedActors: [w.keys.owner.pubkey, w.keys.ceo.pubkey], secret: SECRET },
+          runner: w.prepared.runner,
+        });
+        composition.attachDaemonBuzzOwnerApprovals!(restarted, w.subscriber);
+        const retry = await restarted.tick();
+        await w.drain();
+        expect(retry.authority).toBe(unavailableFor("REPO_FACTORY_PROJECT_NOT_CONFIGURED"));
+        expect(retry.published).toEqual([]);
+        expect(w.counts().prompts).toBe(0);
+        expect(restarted.health()).toMatchObject({ openPrompts: 1, unpublishedPrompts: 1 });
+      } finally {
+        restarted?.close();
+        await w.close();
+      }
+    });
+
+    it("control: sends the same pending prompt on the retry tick while the authority still holds", async () => {
+      const w = await startWorld();
+      try {
+        const promptEventId = await pendingPrompt(w);
+        const retry = await w.approvals!.tick();
+        await w.drain();
+        expect(retry.authority).toBeNull();
+        expect(retry.published).toEqual([promptEventId]);
+        expect(w.publishedPrompts().map((event) => event.id)).toEqual([promptEventId]);
+        expect(w.approvals!.health()).toMatchObject({ openPrompts: 1, unpublishedPrompts: 0, unavailable: null });
+      } finally {
+        await w.close();
+      }
+    });
   });
 });

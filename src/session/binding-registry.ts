@@ -1002,6 +1002,25 @@ export class BindingRegistry {
     return row ? hydrate(row) : null;
   }
 
+  /**
+   * Every ACTIVE PRIMARY_CTO binding, whatever its project, resolved through `activePrimaryCto`'s
+   * assignment/actor join. Reads only: a caller asking how many bindings hold one runtime's
+   * identity counts across all projects, not just the projects it can name.
+   */
+  activePrimaryCtos(): RoleBinding[] {
+    return this.db
+      .all<RawAssignment>(
+        `SELECT a.*,
+                c.current_session_id AS live_session_id,
+                c.current_session_incarnation AS live_session_incarnation
+           FROM assignments a
+           LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+          WHERE a.role = 'PRIMARY_CTO' AND a.status = 'ACTIVE'
+          ORDER BY a.assignment_id`,
+      )
+      .map(hydrate);
+  }
+
   byRun(runId: string): RoleBinding[] {
     return this.db
       .all<RawAssignment>(

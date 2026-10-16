@@ -1435,6 +1435,10 @@ export class BuzzOwnerApprovals {
     const prompt = readPrompt(db, promptEventId);
     if (prompt === null || readAnswer(db, promptEventId) !== null) return false;
     if (DELIVERED.has(prompt.deliveryStatus ?? "") || BLOCKED.has(prompt.deliveryStatus ?? "")) return false;
+    // ACP1091-01: a stored prompt is sent only while the authority that would issue it now still
+    // covers its signer and room. Asked here, at the send, because `tick` awaits between prompts.
+    const authority = this.#postingAuthority();
+    if (!authority.allowed || authority.value.signer !== prompt.signer || authority.value.room !== prompt.room) return false;
     return this.#send(`prompt:${promptEventId}`, prompt.signer, {
       basis: { kind: "PROMPT", binding: prompt.binding, code: prompt.code, expiresAt: prompt.expiresAt, room: prompt.room, ownerKeys: prompt.ownerKeys },
       signer: prompt.signer,
