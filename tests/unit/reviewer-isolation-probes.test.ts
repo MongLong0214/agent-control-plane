@@ -87,9 +87,9 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
       emptyEnvironment: true as const,
       network: "provider-only" as const, tools: "none" as const };
     try {
-      const handle = await adapter.startSession({ model: "gpt-5.6-sol", effort: "xhigh",
+      const handle = await adapter.startSession({ model: "gpt-6.1-sol", effort: "xhigh",
         workdir: packet, purpose: "blind-review", isolation });
-      const result = await adapter.invoke({ model: "gpt-5.6-sol", effort: "xhigh", workdir: packet,
+      const result = await adapter.invoke({ model: "gpt-6.1-sol", effort: "xhigh", workdir: packet,
         externalSessionId: handle.externalSessionId, prompt: "READY", timeoutMs: 10000,
         readOnly: true, correlationId: "private-lease", isolation });
       expect(result.ok, result.error ?? undefined).toBe(true);
@@ -156,7 +156,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
       rmSync(dirname(sibling), { recursive: true, force: true });
     }
   });
-  it("P0-07 fixes the Codex reviewer to GPT-5.6 Sol xhigh and uses only its provider thread id", () => {
+  it("P0-07 fixes the Codex reviewer to GPT-6.1 Sol xhigh and uses only its provider thread id", () => {
     const packetRoot = tempDir("acp-codex-reviewer-contract-");
     const adapter = new CodexCliAdapter({
       clock: new ManualClock("2026-08-13T00:00:00.000Z"),
@@ -167,7 +167,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
     expect(adapter.requiresReviewerProviderSessionProof).toBe(true);
     expect(adapter.supportsReviewerEffortAttestation).toBe(true);
 
-    const bootstrap = __testing.codexReviewerArgs("bootstrap", "gpt-5.6-sol", "xhigh");
+    const bootstrap = __testing.codexReviewerArgs("bootstrap", "gpt-6.1-sol", "xhigh");
     expect(bootstrap).toEqual([
       "exec",
       "--json",
@@ -176,7 +176,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
       "--ignore-rules",
       "--skip-git-repo-check",
       "-m",
-      "gpt-5.6-sol",
+      "gpt-6.1-sol",
       "-c",
       'sandbox_mode="read-only"',
       "-c",
@@ -189,7 +189,7 @@ console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',tex
 
     const resume = __testing.codexReviewerArgs(
       "resume",
-      "gpt-5.6-sol",
+      "gpt-6.1-sol",
       "xhigh",
       "provider-thread-7b1c",
     );

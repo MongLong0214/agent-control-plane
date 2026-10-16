@@ -193,6 +193,9 @@ case "$account" in
   # was never exercised — the fake was masking the property the test is named for.
   ACP_BUZZ_BINARY) [[ "\${ACP_FAKE_BUZZ_BINARY_ITEM:-0}" == "1" ]] || exit 44
                    printf 'keychain-provided-buzz\\n' ;;
+  # The packet reviewer's private Codex home override is optional: no item unless a row stores one.
+  ACP_REVIEWER_CODEX_HOME) [[ -n "\${ACP_FAKE_REVIEWER_CODEX_HOME:-}" ]] || exit 44
+                           printf '%s\\n' "$ACP_FAKE_REVIEWER_CODEX_HOME" ;;
   ACP_CANONICAL_*)
     case ",\${ACP_CANONICAL_KEYCHAIN_ACCOUNTS:-}," in
       *,"$account",*) ;;
@@ -286,7 +289,7 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # to carry had already gone stale twice: it said the canonical group ran 17-24 when it runs 17-22,
   # put lsof at 25-26 when it is 23-24, and gave Hermes an overlapping 26-33. A comment restating a
   # derived position is the second authority the derivation was introduced to remove.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \\
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \\
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \\
@@ -303,7 +306,8 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "$(command -v lsof || printf '<unresolvable>')" "$(lsof_scan)" \\
     "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \\
     "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \\
-    "\${ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY-}" "\${ACP_HERMES_GATEWAY_API_KEY-}" >> "$ACP_LAUNCHER_ENV_LOG"
+    "\${ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY-}" "\${ACP_HERMES_GATEWAY_API_KEY-}" \\
+    "\${ACP_REVIEWER_CODEX_HOME:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -499,6 +503,8 @@ const launcherObservations = (harness: InstallerHarness) => {
     hermes: Object.fromEntries(
       HERMES_ADOPTION_VARIABLES.map((name, index) => [name, f[HERMES_BASE_FIELD + index] ?? ""]),
     ) as Record<(typeof HERMES_ADOPTION_VARIABLES)[number], string>,
+    /** The packet reviewer's optional private Codex home override, appended after the Hermes group. */
+    reviewerCodexHome: f[HERMES_BASE_FIELD + HERMES_ADOPTION_VARIABLES.length],
   };
 };
 
@@ -1396,6 +1402,24 @@ exec /bin/cp "$@"
     for (const name of HERMES_ADOPTION_VARIABLES.slice(0, -1)) {
       expect(partial[name]).toBe(`keychain-${name}`);
     }
+  });
+
+  it("passes the packet reviewer's optional Codex home override from the Keychain, never from the inherited shell", () => {
+    const harness = makeHarness();
+    harness.env["ACP_REVIEWER_CODEX_HOME"] = "/inherited/shell/override";
+    expect(installWithPins(harness).status).toBe(0);
+
+    // No item: the daemon gets no override and its reviewer reuses the user's own Codex home.
+    let launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    expect(launcherObservations(harness).reviewerCodexHome).toBe("<unset>");
+    expect(readFileSync(harness.securityLog, "utf8")).toContain("find-generic-password -w -s test-service -a ACP_REVIEWER_CODEX_HOME");
+
+    harness.env["ACP_FAKE_REVIEWER_CODEX_HOME"] = "/keychain/reviewer-codex-homes/capsule/home";
+    rmSync(harness.launcherEnvLog);
+    launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    expect(launcherObservations(harness).reviewerCodexHome).toBe("/keychain/reviewer-codex-homes/capsule/home");
   });
 
   it("#423 takes BUZZ_PRIVATE_KEY from the desktop store when it has no item of its own", () => {

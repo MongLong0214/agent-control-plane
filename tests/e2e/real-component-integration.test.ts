@@ -258,7 +258,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         // requiresReviewerProviderSessionProof is true — a stricter reviewer contract, not a
         // looser one. The Claude path stays available and is not the default.
         reviewer: {
-          preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: null },
+          preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: null },
           // Production configures `[claude/opus]` here; this said `[]`, so the sentence above —
           // "the Claude path stays available" — was true of the deployment and false of the test
           // asserting it. A preferred reviewer that cannot constitute isolation had nothing to

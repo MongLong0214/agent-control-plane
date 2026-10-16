@@ -8,7 +8,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { artifactDigestMatches } from "../../src/db/artifacts.ts";
 import { ExecutionMode, Role, roleKeyFor } from "../../src/domain/types.ts";
-import { BlindReviewGate, __testing, type ReviewPacket } from "../../src/review/blind-review.ts";
+import { BlindReviewGate, REVIEWER_FALLBACK_SCOPE_UNCONFIGURED, __testing, type ReviewPacket } from "../../src/review/blind-review.ts";
 import { CandidatePipeline } from "../../src/run/candidate-pipeline.ts";
 import { canonical } from "../../src/guard/workspace-probe.ts";
 import { ClaudeCliAdapter, reviewerEnvironment } from "../../src/runtime/cli-adapters.ts";
@@ -308,7 +308,7 @@ const gateWithReviewerPreferences = (
   setup.harness.cp.repositories,
   setup.harness.cp.telemetry,
   {
-    preferred: { provider: preferred.provider, model: "gpt-5.6-sol", effort: "xhigh" },
+    preferred: { provider: preferred.provider, model: "gpt-6.1-sol", effort: "xhigh" },
     fallbacks: [{ provider: fallback.provider, model: "opus", effort: null }],
   },
 );
@@ -351,7 +351,7 @@ describe("review role caller selection", () => {
     }
   });
 
-  it("keeps scoped unavailability fallback on the reviewer identity", async () => {
+  it("refuses a configured preferred outage, and keeps an UNCONFIGURED-scope fallback on the reviewer identity", async () => {
     const setup = await prepareReviewedInputs();
     const { cp, clock } = setup.harness;
     let workdir: string | undefined;
@@ -365,13 +365,21 @@ describe("review role caller selection", () => {
       cp.providers.registerForRole(wrong, Role.PRIMARY_CTO);
       const start = vi.spyOn(fallback, "startSession");
       const wrongStart = vi.spyOn(wrong, "startSession");
-      const result = await gateWithReviewerPreferences(setup, preferred, fallback)["constituteReviewer"](roleReviewRequest(setup));
+      const gate = gateWithReviewerPreferences(setup, preferred, fallback);
+      // CEO 1792123922: a measured outage of a configured preferred reviewer is no fallback.
+      expect(await gate["constituteReviewer"](roleReviewRequest(setup))).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.ISOLATION_LOST,
+        evidence: { attempts: [expect.objectContaining({ reason: "runtime unavailable" })] },
+      });
+      expect(start).not.toHaveBeenCalled();
+      gate.attach({ packetReviewerScope: (provider) => provider === "gpt" ? { state: "UNCONFIGURED", root: "/fixture/no-codex-home" } : null });
+      const result = await gate["constituteReviewer"](roleReviewRequest(setup));
       if (result.allowed) workdir = result.value.workdir;
       expect(result.allowed && result.value.preference.provider).toBe("claude");
       expect(start).toHaveBeenCalledOnce();
       expect(wrongStart).not.toHaveBeenCalled();
       expect(cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toEqual([
-        expect.objectContaining({ evidence: expect.objectContaining({ reason: "runtime unavailable" }) }),
+        expect.objectContaining({ evidence: expect.objectContaining({ reason: REVIEWER_FALLBACK_SCOPE_UNCONFIGURED }) }),
       ]);
     } finally {
       if (workdir) rmSync(workdir, { recursive: true, force: true });
@@ -392,10 +400,16 @@ describe("review role caller selection", () => {
       });
       preferred.setRuntimeHealth("UNAVAILABLE");
       cp.providers.registerForRole(preferred, Role.BLIND_REVIEWER);
+      // A configured preferred outage ends the selection; the fallback is never looked up.
+      expect(await gate["constituteReviewer"](roleReviewRequest(setup))).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.ISOLATION_LOST,
+        evidence: { attempts: [expect.objectContaining({ reason: "runtime unavailable" })] },
+      });
+      gate.attach({ packetReviewerScope: (provider) => provider === "gpt" ? { state: "UNCONFIGURED", root: "/fixture/no-codex-home" } : null });
       expect(await gate["constituteReviewer"](roleReviewRequest(setup))).toMatchObject({
         allowed: false, reasonCode: ReasonCode.ISOLATION_LOST,
         evidence: { attempts: [
-          expect.objectContaining({ reason: "runtime unavailable" }),
+          expect.objectContaining({ reason: REVIEWER_FALLBACK_SCOPE_UNCONFIGURED }),
           expect.objectContaining({ reason: "no adapter registered" }),
         ] },
       });
@@ -823,7 +837,7 @@ describe("round-2 blind-review regressions", () => {
     // Claude review even though no GPT unavailability was ever measured.
   });
 
-  it("falls back to Claude only after GPT is actually unavailable and records why", async () => {
+  it("falls back to Claude only when GPT's packet scope is UNCONFIGURED, never on a measured outage, and records why", async () => {
     const setup = await prepareReviewedInputs();
     const preferred = new TestProductionAdapter(setup.harness.clock, "gpt");
     preferred.setRuntimeHealth("UNAVAILABLE");
@@ -834,8 +848,15 @@ describe("round-2 blind-review regressions", () => {
     });
     setup.harness.cp.providers.register(preferred);
     setup.harness.cp.providers.register(fallback);
+    const gate = gateWithReviewerPreferences(setup, preferred, fallback);
 
-    const result = await invokeGate(gateWithReviewerPreferences(setup, preferred, fallback), setup);
+    // CEO 1792123922 (2026-10-16): a configured GPT reviewer that is down leaves the review unavailable.
+    expect(await invokeGate(gate, setup)).toMatchObject({ allowed: false, reasonCode: ReasonCode.ISOLATION_LOST });
+    expect(fallback.invocations).toHaveLength(0);
+    expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
+
+    gate.attach({ packetReviewerScope: (provider) => provider === "gpt" ? { state: "UNCONFIGURED", root: "/fixture/no-codex-home" } : null });
+    const result = await invokeGate(gate, setup);
 
     expect(result.allowed).toBe(true);
     expect(result.allowed && result.value.provider).toBe("claude");
@@ -844,7 +865,7 @@ describe("round-2 blind-review regressions", () => {
     expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toEqual([
       expect.objectContaining({
         runId: setup.run.runId,
-        evidence: expect.objectContaining({ from: "gpt", provider: "claude", reason: "runtime unavailable" }),
+        evidence: expect.objectContaining({ from: "gpt", provider: "claude", reason: REVIEWER_FALLBACK_SCOPE_UNCONFIGURED }),
       }),
     ]);
   });

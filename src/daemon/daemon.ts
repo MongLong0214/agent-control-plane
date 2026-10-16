@@ -24,11 +24,14 @@ import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
 import {
   BOOTSTRAP_PLAN_RECOVERY_WAKE,
   BOOTSTRAP_RESULT_RECOVERY_WAKE,
+  BOOTSTRAP_REVIEW_RETRY_WAKE,
   ProvisionedSessionRuntime,
   planRecoveryTriggerId,
   planRecoveryTriggerKind,
   resultRecoveryTriggerId,
   resultRecoveryTriggerKind,
+  reviewRetryTriggerId,
+  reviewRetryTriggerKind,
 } from "../runtime/provisioned-session-runtime.ts";
 import {
   resolveDoctorHealth,
@@ -507,7 +510,14 @@ export interface BootstrapPlanRecoveryReport {
 
 /** The owners one bootstrap result recovery pass woke (`Daemon.wakeBootstrapResultRecovery`). */
 export interface BootstrapResultRecoveryReport {
-  woken: Array<{ runId: string; roleKey: string; bindingGeneration: number; planDigest: string }>;
+  woken: Array<{
+    runId: string;
+    roleKey: string;
+    bindingGeneration: number;
+    planDigest: string;
+    /** Present on a review retry wake: the frozen candidate and the unavailable review it retries. */
+    retry?: { candidateSnapshotDigest: string; unavailableEventId: number };
+  }>;
 }
 
 interface CrashLoopFile {
@@ -2378,6 +2388,11 @@ export class Daemon {
    * above about the run and the owner as `stillAdmissible`, asked again at the runtime's final check
    * before the provider call. Nothing follows up an owner that does not answer: only a renewed
    * generation or a new PLAN can earn another wake.
+   *
+   * The same pass also makes the review retry (`#bootstrapReviewRetry`): a result submitted for the
+   * current PLAN whose candidate's latest review ended unavailable wakes the owner once per (run,
+   * owner binding generation, candidate) to submit that result again, under the same runtime
+   * conditions, marked by a `BOOTSTRAP_REVIEW_RETRY_WAKE` audit event.
    */
   wakeBootstrapResultRecovery(): BootstrapResultRecoveryReport {
     const woken: BootstrapResultRecoveryReport["woken"] = [];
@@ -2399,13 +2414,55 @@ export class Daemon {
         sessionIncarnation: run.ownerSessionIncarnation,
         bindingGeneration: run.ownerBindingGeneration,
       };
-      if (!this.#bootstrapResultOwnerStands(runId, owner, planDigest)) continue;
+      const resultStage = this.#bootstrapResultOwnerStands(runId, owner, planDigest);
+      const retry = resultStage ? null : this.#bootstrapReviewRetry(runId, owner, planDigest);
+      if (!resultStage && retry === null) continue;
       if (
         !runtime.drivesSession(owner.sessionId, Role.BOOTSTRAP_CTO) ||
         !runtime.holds(owner.sessionId) ||
         !runtime.attachedToDaemon() ||
         runtime.turnInProgress(owner.sessionId)
       ) {
+        continue;
+      }
+      if (retry !== null) {
+        // One official retry per (run, owner generation, candidate): a retry whose own review is
+        // unavailable again records a new unavailable event, and keying on that alone would wake the
+        // owner on every tick for as long as the reviewer stays down.
+        const alreadyRetried = this.cp.db.get<{ n: number }>(
+          `SELECT 1 AS n FROM audit_events
+            WHERE kind = ? AND run_id = ?
+              AND json_extract(evidence_json, '$.bindingGeneration') = ?
+              AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?
+            LIMIT 1`,
+          [BOOTSTRAP_REVIEW_RETRY_WAKE, runId, owner.bindingGeneration, retry.candidateSnapshotDigest],
+        );
+        if (alreadyRetried) continue;
+        const triggerId = reviewRetryTriggerId(
+          runId, owner.bindingGeneration, retry.candidateSnapshotDigest, retry.unavailableEventId,
+        );
+        const woke = runtime.wake(owner.roleKey, [{
+          id: triggerId,
+          kind: reviewRetryTriggerKind(runId),
+          stillAdmissible: () =>
+            this.#bootstrapReviewRetry(runId, owner, planDigest)?.unavailableEventId === retry.unavailableEventId,
+        }]);
+        if (!woke.allowed) continue;
+        this.cp.audit.record({
+          kind: BOOTSTRAP_REVIEW_RETRY_WAKE,
+          reasonCode: ReasonCode.OK,
+          runId,
+          sessionId: owner.sessionId,
+          roleKey: owner.roleKey,
+          evidence: {
+            bindingGeneration: owner.bindingGeneration,
+            planDigest,
+            candidateSnapshotDigest: retry.candidateSnapshotDigest,
+            unavailableEventId: retry.unavailableEventId,
+            triggerId,
+          },
+        });
+        woken.push({ runId, roleKey: owner.roleKey, bindingGeneration: owner.bindingGeneration, planDigest, retry });
         continue;
       }
       const alreadyWoken = this.cp.db.get<{ n: number }>(
@@ -2479,6 +2536,56 @@ export class Daemon {
     );
     const frozenFrom = snapshot?.content.bootstrapPlan?.planDigest;
     return typeof frozenFrom !== "string" || frozenFrom === planDigest;
+  }
+
+  /**
+   * The review retry (CEO 1792123922): the result was submitted for the run's current PLAN, and
+   * the blind review of the candidate it froze ended unavailable. `result_submit` is the official
+   * retry — the same PLAN freezes the same candidate digest and its review runs again — so the
+   * owner is woken to call it, with no replan, worker or receipt. Answers the candidate and the
+   * unavailable review's audit event when all of these hold, and null otherwise:
+   *
+   * - the run is ACTIVE, a project-less PROJECT_BOOTSTRAP, its latest PLAN is `planDigest`, and no
+   *   candidate pipeline attempt is RUNNING;
+   * - its current candidate was frozen from that PLAN;
+   * - the run's latest review outcome (`BLIND_REVIEW_UNAVAILABLE`, `BLIND_REVIEW_COMPLETED` or
+   *   `BLIND_REVIEW_REJECTED`, by event order) is `BLIND_REVIEW_UNAVAILABLE` for that candidate;
+   * - `owner` is exactly the run's owner (`#bootstrapOwnerExact`).
+   *
+   * The sweep also asks the once-marker; the wake's `stillAdmissible` asks only this.
+   */
+  #bootstrapReviewRetry(
+    runId: string,
+    owner: { roleKey: string; sessionId: string; sessionIncarnation: string; bindingGeneration: number },
+    planDigest: string,
+  ): { candidateSnapshotDigest: string; unavailableEventId: number } | null {
+    const run = this.cp.runs.get(runId);
+    if (!run || run.state !== RunState.ACTIVE || !isProjectlessBootstrap(run)) return null;
+    if (this.cp.artifacts.latest(runId, ArtifactKind.PLAN)?.digest !== planDigest) return null;
+    const running = this.cp.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM candidate_pipeline_attempts WHERE run_id = ? AND state = 'RUNNING' LIMIT 1`,
+      [runId],
+    );
+    if (running) return null;
+    const candidate = this.cp.runs.currentCandidate(runId);
+    if (candidate === null) return null;
+    const snapshot = this.cp.artifacts.latestForSnapshot<{ bootstrapPlan?: { planDigest?: unknown } }>(
+      runId,
+      ArtifactKind.CANDIDATE_SNAPSHOT,
+      candidate,
+    );
+    if (snapshot?.content.bootstrapPlan?.planDigest !== planDigest) return null;
+    const latest = this.cp.db.get<{ event_id: number; kind: string; candidate: unknown }>(
+      `SELECT event_id, kind, json_extract(evidence_json, '$.candidateSnapshotDigest') AS candidate
+         FROM audit_events
+        WHERE run_id = ? AND kind IN ('BLIND_REVIEW_UNAVAILABLE', 'BLIND_REVIEW_COMPLETED', 'BLIND_REVIEW_REJECTED')
+        ORDER BY event_id DESC
+        LIMIT 1`,
+      [runId],
+    );
+    if (!latest || latest.kind !== "BLIND_REVIEW_UNAVAILABLE" || latest.candidate !== candidate) return null;
+    if (!this.#bootstrapOwnerExact(run, owner)) return null;
+    return { candidateSnapshotDigest: candidate, unavailableEventId: latest.event_id };
   }
 
   /**

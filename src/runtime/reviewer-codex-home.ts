@@ -1,9 +1,84 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
-/** Control metadata stays outside CODEX_HOME, where the reviewer cannot replace it. */
+import { ReasonCode } from "../core/reason-codes.ts";
+import { ProviderSessionProvisionError } from "./provider.ts";
+
+/**
+ * The daemon user's own Codex home: where `codex login` already put this account's credential.
+ *
+ * One notion, not a second one. It is the home the Codex adapter's capacity probe reads (the
+ * default `CodexUsageCollector` already used), the one a runtime Codex session reaches through
+ * `HOME`, and the one the packet reviewer reuses when no private capsule overrides it. `CODEX_HOME`
+ * from the daemon's environment is deliberately not consulted, for the reason the capacity probe
+ * gives: a second Codex home on a host is a second account.
+ */
+export const defaultCodexHome = (): string => join(homedir(), ".codex");
+
+/**
+ * Which Codex home the packet reviewer runs under. The one rule the doctor and the reviewer share
+ * (owner directive and CEO 1792123922, 2026-10-16); neither restates it.
+ *
+ * - `OVERRIDE` — `ACP_REVIEWER_CODEX_HOME` is set and not empty. The capsule rules below apply
+ *   unchanged: a wrong, unauthenticated or spent capsule refuses, and nothing falls back to the
+ *   default home or to another reviewer.
+ * - `DEFAULT` — no override, and the default home is a directory holding an `auth.json` file. It is
+ *   reused by every review and never claimed.
+ * - `UNCONFIGURED` — no override, and the default home is missing or holds no `auth.json`. The only
+ *   state in which the blind-review gate may constitute a fallback reviewer.
+ * - `UNUSABLE` — no override, and the default home is there but cannot be read as one: not a
+ *   directory, `auth.json` not a file, or a permission error. A fault, not an absence: no fallback.
+ *
+ * Metadata only. `auth.json` is stat'ed, never opened, so this cannot say whether the login is
+ * current: an expired credential reads `DEFAULT` and fails at run time, and that refuses.
+ */
+export type PacketReviewerScope = {
+  readonly state: "OVERRIDE" | "DEFAULT" | "UNCONFIGURED" | "UNUSABLE";
+  readonly root: string;
+};
+
+export const packetReviewerScope = (override: string | undefined, defaultHome: string): PacketReviewerScope => {
+  if (override !== undefined && override !== "") return { state: "OVERRIDE", root: override };
+  return { state: defaultHomeState(defaultHome), root: defaultHome };
+};
+
+const absent = (error: unknown): boolean => (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
+
+const defaultHomeState = (root: string): "DEFAULT" | "UNCONFIGURED" | "UNUSABLE" => {
+  try {
+    if (!statSync(root).isDirectory()) return "UNUSABLE";
+  } catch (error) {
+    return absent(error) ? "UNCONFIGURED" : "UNUSABLE";
+  }
+  try {
+    return statSync(join(root, "auth.json")).isFile() ? "DEFAULT" : "UNUSABLE";
+  } catch (error) {
+    return absent(error) ? "UNCONFIGURED" : "UNUSABLE";
+  }
+};
+
+/**
+ * What the Codex packet reviewer throws when `packetReviewerScope` answers `UNCONFIGURED`, and only
+ * then. The blind-review gate reads this class as the one admissible reason to constitute a fallback
+ * reviewer; every other refusal — any override fault, `UNUSABLE`, an auth failure at run time, an
+ * isolation or handshake failure — keeps the review unavailable.
+ */
+export class PacketReviewerScopeUnconfigured extends ProviderSessionProvisionError {
+  constructor() {
+    super(
+      ReasonCode.ISOLATION_LOST,
+      "Codex packet reviewer has no ACP_REVIEWER_CODEX_HOME override and no authenticated Codex home",
+    );
+    this.name = "PacketReviewerScopeUnconfigured";
+  }
+}
+
+/**
+ * The optional private override's capsule. Control metadata stays outside CODEX_HOME, where the
+ * reviewer cannot replace it.
+ */
 export interface ReviewerCodexHome {
   readonly root: string;
   readonly dev: number;

@@ -22,6 +22,9 @@ import { callMcpToolOverSocket } from "./mcp-socket.ts";
  *   accepted or in the turn of the run's next RUN_DISPATCH, and on a result-recovery wake when the
  *   prompt carries that wake's line. `"recovery-only"` skips the result outside a result-recovery
  *   wake, the stall observed live. `"ignore"` never submits a result.
+ * - `onRetry: "follow-prompt"` (the default) submits the latest accepted PLAN's result again on a review
+ *   retry wake when the prompt carries that wake's line, even though it was submitted before; `"ignore"`
+ *   answers such a wake with no tool call at all.
  * - `onRevision: "follow-prompt"` (the default) answers a REVISION_REQUEST the prompt's revision line
  *   covers by planning the run again from the reason the request carries, applying the verification
  *   limits it names; `"ignore"` acknowledges it and does nothing else.
@@ -31,6 +34,7 @@ export interface ScriptedBootstrapOwner {
   onRecovery: "follow-prompt" | "ignore";
   onResult: "follow-prompt" | "recovery-only" | "ignore";
   onRevision: "follow-prompt" | "ignore";
+  onRetry: "follow-prompt" | "ignore";
   /** Every work turn's prompt, in order. */
   readonly prompts: string[];
   /** Every `plan_submit` call: its run, whether it was accepted, and the refusal's name and `supplied`. */
@@ -60,6 +64,7 @@ export const RUN_DISPATCH_DIRECTIVE = "A RUN_DISPATCH for a run you own and have
 const RECOVERY_DIRECTIVE = "means that run's RUN_DISPATCH was already acknowledged and the run still has no PLAN";
 export const RESULT_DIRECTIVE = "For a run whose contract_get returned a bootstrapPlanGuide, once its PLAN is accepted and the run is ACTIVE";
 const RESULT_RECOVERY_DIRECTIVE = "means that run's current PLAN was accepted and no result was submitted for it";
+const REVIEW_RETRY_DIRECTIVE = "means the blind review of that run's submitted result could not be constituted and can now be retried";
 export const REVISION_DIRECTIVE = "A REVISION_REQUEST for a run whose contract_get returned a bootstrapPlanGuide carries why its PLAN was sent back";
 const WOKE_FOR = "The control plane woke you for:";
 
@@ -94,6 +99,7 @@ export const scriptBootstrapOwner = (
     onRecovery?: ScriptedBootstrapOwner["onRecovery"];
     onResult?: ScriptedBootstrapOwner["onResult"];
     onRevision?: ScriptedBootstrapOwner["onRevision"];
+    onRetry?: ScriptedBootstrapOwner["onRetry"];
   },
 ): ScriptedBootstrapOwner => {
   let gate: Promise<void> | null = null;
@@ -104,6 +110,7 @@ export const scriptBootstrapOwner = (
     onRecovery: options.onRecovery ?? "follow-prompt",
     onResult: options.onResult ?? "follow-prompt",
     onRevision: options.onRevision ?? "follow-prompt",
+    onRetry: options.onRetry ?? "follow-prompt",
     prompts: [],
     submissions: [],
     contracts: [],
@@ -203,6 +210,13 @@ export const scriptBootstrapOwner = (
     if (resultRecovered !== null) {
       if (owner.onResult === "ignore" || !prompt.includes(RESULT_RECOVERY_DIRECTIVE)) return;
       await submitResult(resultRecovered);
+    }
+    const retried = /review retry: run (\S+) has a result whose blind review was unavailable/.exec(wokeFor)?.[1] ?? null;
+    if (retried !== null) {
+      if (owner.onRetry === "ignore" || !prompt.includes(REVIEW_RETRY_DIRECTIVE)) return;
+      const mine = planned.get(retried);
+      if (mine !== undefined) mine.resulted = false;
+      await submitResult(retried);
     }
     const pending = await call("role_dispatch_pending", {});
     const messages = (pending["value"] as {

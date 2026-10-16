@@ -84,6 +84,8 @@ export const makeHarness = (
     root?: string;
     /** Issue #246 — the Repo Factory work root and GitHub double the composed runner uses. */
     repoFactory?: ControlPlaneConfig["repoFactory"];
+    /** The blind reviewer's preference and fallbacks; the scripted reviewer alone when omitted. */
+    reviewer?: ControlPlaneConfig["reviewer"];
   } = {},
 ): Harness => {
   const root = options.root ?? tempDir("acp-harness-");
@@ -124,7 +126,7 @@ console.log('verification ok');`,
     // A fixture writes evidence directly in a few places; the daemon never unlocks this.
     allowTestEvidenceWriters: options.allowTestEvidenceWriters ?? true,
     ctoPreference: { provider: "scripted", model: "scripted-cto", effort: null },
-    reviewer: {
+    reviewer: options.reviewer ?? {
       preferred: { provider: "scripted", model: "scripted-reviewer", effort: "xhigh" },
       fallbacks: [],
     },

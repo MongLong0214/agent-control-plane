@@ -122,7 +122,7 @@ const reviewWithFallback = async () => {
       fallbacks: [{ provider: "claude", model: "fallback-reviewer", effort: null }],
     });
   gate.attach({ capacity: cp.capacity });
-  return { ...setup, fallback, invoke: () => gate.controlPlaneInvoker()(request) };
+  return { ...setup, fallback, gate, invoke: () => gate.controlPlaneInvoker()(request) };
 };
 
 describe("reviewer scope fallback boundary", () => {
@@ -156,8 +156,24 @@ describe("reviewer scope fallback boundary", () => {
     expect(h.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
   });
 
-  it.each(["capacity", "outage"] as const)("preserves healthy fallback after preferred %s", async (failure) => {
+  // CEO 1792123922 (2026-10-16): a measured preferred outage or capacity denial no longer falls back.
+  it.each(["capacity", "outage"] as const)("refuses a configured preferred reviewer's %s with no fallback", async (failure) => {
     const { h, fallback, invoke } = await reviewWithFallback();
+    if (failure === "capacity") h.scripted.setCapacity(capacity(h, "blind-review", 0));
+    else h.scripted.setRuntimeHealth("UNAVAILABLE");
+    const preferredStart = vi.spyOn(h.scripted, "startSession");
+    const fallbackStart = vi.spyOn(fallback, "startSession");
+    expect(await invoke()).toMatchObject({ allowed: false });
+    expect(preferredStart).not.toHaveBeenCalled();
+    expect(h.scripted.invocations).toHaveLength(0);
+    expect(fallbackStart).not.toHaveBeenCalled();
+    expect(fallback.invocations).toHaveLength(0);
+    expect(h.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
+  });
+
+  it.each(["capacity", "outage"] as const)("still admits a healthy fallback past a preferred %s whose scope is UNCONFIGURED", async (failure) => {
+    const { h, fallback, gate, invoke } = await reviewWithFallback();
+    gate.attach({ packetReviewerScope: (provider) => provider === "scripted" ? { state: "UNCONFIGURED", root: "/fixture/no-codex-home" } : null });
     if (failure === "capacity") h.scripted.setCapacity(capacity(h, "blind-review", 0));
     else h.scripted.setRuntimeHealth("UNAVAILABLE");
     const preferredStart = vi.spyOn(h.scripted, "startSession");
