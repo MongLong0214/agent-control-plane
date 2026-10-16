@@ -10,6 +10,7 @@ import {
 } from "../../src/bootstrap/bootstrap-plan.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, assertPortableManifest, manifestDigest } from "../../src/contracts/manifest.ts";
 import { canonicalJson, sha256 } from "../../src/core/digest.ts";
+import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ArtifactKind, ExecutionMode, Role, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
@@ -17,10 +18,11 @@ import { MessageKind } from "../../src/outbox/envelope.ts";
 import {
   BOOTSTRAP_PLAN_RECOVERY_WAKE,
   PLAN_SUBMISSIONS_PER_TURN,
+  type SessionWakeTrigger,
   planRecoveryTriggerId,
   planRecoveryTriggerKind,
 } from "../../src/runtime/provisioned-session-runtime.ts";
-import { callCtoToolAsOwner } from "../helpers/bootstrap-plan.ts";
+import { bootstrapPlan, callCtoToolAsOwner, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { FakeGitHub as FakeGitHubClient } from "../helpers/fake-github.ts";
 import { FakeGitHub as FakeGitHubWritePort } from "../helpers/fake-github-write-port.ts";
@@ -202,6 +204,113 @@ describe("the recovery wake: once per (run, owner generation, acknowledged RUN_D
         id: planRecoveryTriggerId(runId, 1, messageId),
         kind: planRecoveryTriggerKind(runId),
       }])).toMatchObject({ allowed: true, value: "STARTED" });
+    });
+  });
+});
+
+/**
+ * Holds the next launch preparation — the first await of a relayed turn, between the wake that
+ * admitted it and its provider call — until `release`, so a row can change what made it eligible.
+ */
+const holdLaunchPreparation = (f: BootstrapRuntimeFixture) => {
+  let release!: () => void;
+  let entered = false;
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const prepare = f.launch.prepare.bind(f.launch);
+  vi.spyOn(f.launch, "prepare").mockImplementationOnce(async () => {
+    entered = true;
+    await barrier;
+    return prepare();
+  });
+  return { entered: () => entered, release: () => release() };
+};
+
+const turnsRefused = (f: BootstrapRuntimeFixture, sessionId: string): number =>
+  f.harness.cp.db.get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_TURN_REFUSED' AND session_id = ?`,
+    [sessionId],
+  )?.n ?? 0;
+
+const plannedElsewhere = (f: BootstrapRuntimeFixture, runId: string, ownerSessionId: string) =>
+  f.cto(ownerSessionId, "plan_submit", {
+    runId,
+    plan: bootstrapPlan(cleanTreeManifest("already-planned"), { requestDigest: f.harness.cp.runs.require(runId).contractDigest }),
+    tasks: [{ key: "bootstrap", title: "create the repository", category: "implementation" }],
+  });
+
+describe("R1-01: the recovery wake's eligibility is asked again immediately before the provider call", () => {
+  it("(a) an owner whose run was held and whose binding was revoked while launch preparation awaited is never contacted; the wake stays spent", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, ownerSessionId, roleKey } = await stalled(f, "follow-prompt");
+      const cp = f.harness.cp;
+      const providerTurns = f.claude.turns.length;
+      const held = holdLaunchPreparation(f);
+      expect(f.daemon.wakeBootstrapPlanRecovery().woken).toHaveLength(1);
+      await vi.waitFor(() => expect(held.entered()).toBe(true));
+      expect(cp.runs.transition(runId, RunState.BLOCKED, "test: held while the wake prepares").allowed).toBe(true);
+      expect(cp.bindings.revoke(roleKey, "test: revoked while the wake prepares", { allowBlockedRuns: true }).allowed).toBe(true);
+      held.release();
+      await vi.waitFor(() => expect(turnsRefused(f, ownerSessionId)).toBe(1));
+      await vi.waitFor(() => expect(cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
+      expect(f.claude.turns.length).toBe(providerTurns);
+      expect(markers(f, runId)).toHaveLength(1);
+    });
+  });
+
+  it("(b) a PLAN the current owner submitted while launch preparation awaited suppresses the recovery turn, and is not replaced", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, ownerSessionId } = await stalled(f, "follow-prompt");
+      const cp = f.harness.cp;
+      const providerTurns = f.claude.turns.length;
+      const held = holdLaunchPreparation(f);
+      expect(f.daemon.wakeBootstrapPlanRecovery().woken).toHaveLength(1);
+      await vi.waitFor(() => expect(held.entered()).toBe(true));
+      expect(await plannedElsewhere(f, runId, ownerSessionId)).toMatchObject({ ok: true });
+      const original = planOf(f, runId)!;
+      held.release();
+      await vi.waitFor(() => expect(turnsRefused(f, ownerSessionId)).toBe(1));
+      await vi.waitFor(() => expect(cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
+      expect(f.claude.turns.length).toBe(providerTurns);
+      expect(planOf(f, runId)!.digest).toBe(original.digest);
+      expect(markers(f, runId)).toHaveLength(1);
+      expect(f.daemon.wakeBootstrapPlanRecovery()).toEqual({ woken: [] });
+    });
+  });
+
+  it("(c) coalesced with another trigger, a recovery that no longer holds is dropped: the turn runs for the other, and its prompt names no recovery", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { owner, runId, ownerSessionId, roleKey } = await stalled(f, "follow-prompt");
+      const runtime = f.harness.cp.sessionRuntime;
+      // The trigger exactly as the daemon builds it, kept rather than run, so it can be coalesced.
+      let recovery: readonly SessionWakeTrigger[] = [];
+      const wake = vi.spyOn(runtime, "wake").mockImplementationOnce((_roleKey, triggers) => {
+        recovery = triggers;
+        return allow(ReasonCode.OK, "STARTED" as const);
+      });
+      expect(f.daemon.wakeBootstrapPlanRecovery().woken).toHaveLength(1);
+      wake.mockRestore();
+      expect(recovery).toEqual([expect.objectContaining({ kind: planRecoveryTriggerKind(runId) })]);
+      // A turn runs; the recovery and an ordinary trigger coalesce behind it into one follow-up.
+      const release = owner.hold();
+      expect(runtime.wake(roleKey, [{ id: "busy", kind: "test" }])).toMatchObject({ allowed: true, value: "STARTED" });
+      await vi.waitFor(() => expect(owner.prompts).toHaveLength(2));
+      expect(runtime.wake(roleKey, [...recovery])).toMatchObject({ allowed: true, value: "COALESCED" });
+      expect(runtime.wake(roleKey, [{ id: "other", kind: "ordinary work" }])).toMatchObject({ allowed: true, value: "COALESCED" });
+      // Meanwhile the owner plans the run itself, so the recovery no longer holds.
+      expect(await plannedElsewhere(f, runId, ownerSessionId)).toMatchObject({ ok: true });
+      const original = planOf(f, runId)!;
+      release();
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(4));
+      await vi.waitFor(() => expect(runtime.turnInProgress(ownerSessionId)).toBe(false));
+      expect(owner.prompts).toHaveLength(3);
+      const followUp = owner.prompts.at(-1)!;
+      expect(followUp).toContain("The control plane woke you for: ordinary work.");
+      expect(followUp).not.toContain("plan recovery");
+      expect(followUp).not.toContain('A wake for "');
+      expect(planOf(f, runId)!.digest).toBe(original.digest);
+      expect(turnsRefused(f, ownerSessionId)).toBe(0);
     });
   });
 });

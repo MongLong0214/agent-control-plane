@@ -2288,26 +2288,19 @@ export class Daemon {
     );
     for (const { run_id: runId } of candidates) {
       const run = this.cp.runs.get(runId);
-      if (!run || run.state !== RunState.ACTIVE || !isProjectlessBootstrap(run)) continue;
-      if (this.cp.artifacts.latest(runId, ArtifactKind.PLAN) !== null) continue;
-      if (!run.ownerRoleKey || !run.ownerSessionId || run.ownerBindingGeneration === null) continue;
-      const binding = this.cp.bindings.active(run.ownerRoleKey);
+      if (!run?.ownerRoleKey || !run.ownerSessionId || !run.ownerSessionIncarnation || run.ownerBindingGeneration === null) continue;
+      const owner = {
+        roleKey: run.ownerRoleKey,
+        sessionId: run.ownerSessionId,
+        sessionIncarnation: run.ownerSessionIncarnation,
+        bindingGeneration: run.ownerBindingGeneration,
+      };
+      if (!this.#bootstrapPlanOwnerStands(runId, owner)) continue;
       if (
-        !binding ||
-        binding.role !== Role.BOOTSTRAP_CTO ||
-        binding.bindingGeneration !== run.ownerBindingGeneration ||
-        binding.sessionId !== run.ownerSessionId ||
-        binding.sessionIncarnation !== run.ownerSessionIncarnation ||
-        !this.cp.runs.assertOwner(runId, binding.sessionId, binding.bindingGeneration).allowed
-      ) {
-        continue;
-      }
-      if (this.cp.sessions.get(binding.sessionId)?.lifecycle !== SessionLifecycle.READY) continue;
-      if (
-        !runtime.drivesSession(binding.sessionId, binding.role) ||
-        !runtime.holds(binding.sessionId) ||
+        !runtime.drivesSession(owner.sessionId, Role.BOOTSTRAP_CTO) ||
+        !runtime.holds(owner.sessionId) ||
         !runtime.attachedToDaemon() ||
-        runtime.turnInProgress(binding.sessionId)
+        runtime.turnInProgress(owner.sessionId)
       ) {
         continue;
       }
@@ -2316,10 +2309,10 @@ export class Daemon {
           WHERE run_id = ? AND kind = 'RUN_DISPATCH' AND binding_generation = ? AND target_session_id = ?
           ORDER BY created_at DESC, rowid DESC
           LIMIT 1`,
-        [runId, binding.bindingGeneration, binding.sessionId],
+        [runId, owner.bindingGeneration, owner.sessionId],
       );
       if (dispatch?.status !== "ACKED") continue;
-      const tuple = { runId, bindingGeneration: binding.bindingGeneration, messageId: dispatch.message_id };
+      const tuple = { runId, bindingGeneration: owner.bindingGeneration, messageId: dispatch.message_id };
       const alreadyWoken = this.cp.db.get<{ n: number }>(
         `SELECT 1 AS n FROM audit_events
           WHERE kind = ? AND run_id = ?
@@ -2330,19 +2323,63 @@ export class Daemon {
       );
       if (alreadyWoken) continue;
       const triggerId = planRecoveryTriggerId(runId, tuple.bindingGeneration, tuple.messageId);
-      const woke = runtime.wake(binding.roleKey, [{ id: triggerId, kind: planRecoveryTriggerKind(runId) }]);
+      // R1-01 — the turn starts behind awaits (credential preparation and delivery), so what made
+      // the owner eligible is asked again at the runtime's final check, immediately before the
+      // provider call. One that no longer holds drops the trigger there: no provider turn runs for
+      // it, and its marker stays spent.
+      const woke = runtime.wake(owner.roleKey, [{
+        id: triggerId,
+        kind: planRecoveryTriggerKind(runId),
+        stillAdmissible: () => this.#bootstrapPlanOwnerStands(runId, owner),
+      }]);
       if (!woke.allowed) continue;
       this.cp.audit.record({
         kind: BOOTSTRAP_PLAN_RECOVERY_WAKE,
         reasonCode: ReasonCode.OK,
         runId,
-        sessionId: binding.sessionId,
-        roleKey: binding.roleKey,
+        sessionId: owner.sessionId,
+        roleKey: owner.roleKey,
         evidence: { bindingGeneration: tuple.bindingGeneration, messageId: tuple.messageId, triggerId },
       });
-      woken.push({ ...tuple, roleKey: binding.roleKey });
+      woken.push({ ...tuple, roleKey: owner.roleKey });
     }
     return { woken };
+  }
+
+  /**
+   * Whether `owner` is still the one a bootstrap PLAN recovery is for: the run is ACTIVE and a
+   * project-less PROJECT_BOOTSTRAP with no PLAN artifact, pinned to exactly that owner; the role's
+   * ACTIVE binding is exactly that owner (role key, session, incarnation, generation) and
+   * `assertOwner` still allows it; and its session is READY. The sweep asks it before it wakes, and
+   * the wake's trigger asks it again at the runtime's final check before the provider call.
+   */
+  #bootstrapPlanOwnerStands(
+    runId: string,
+    owner: { roleKey: string; sessionId: string; sessionIncarnation: string; bindingGeneration: number },
+  ): boolean {
+    const run = this.cp.runs.get(runId);
+    if (!run || run.state !== RunState.ACTIVE || !isProjectlessBootstrap(run)) return false;
+    if (this.cp.artifacts.latest(runId, ArtifactKind.PLAN) !== null) return false;
+    if (
+      run.ownerRoleKey !== owner.roleKey ||
+      run.ownerSessionId !== owner.sessionId ||
+      run.ownerSessionIncarnation !== owner.sessionIncarnation ||
+      run.ownerBindingGeneration !== owner.bindingGeneration
+    ) {
+      return false;
+    }
+    const binding = this.cp.bindings.active(owner.roleKey);
+    if (
+      !binding ||
+      binding.role !== Role.BOOTSTRAP_CTO ||
+      binding.sessionId !== owner.sessionId ||
+      binding.sessionIncarnation !== owner.sessionIncarnation ||
+      binding.bindingGeneration !== owner.bindingGeneration
+    ) {
+      return false;
+    }
+    if (!this.cp.runs.assertOwner(runId, owner.sessionId, owner.bindingGeneration).allowed) return false;
+    return this.cp.sessions.get(owner.sessionId)?.lifecycle === SessionLifecycle.READY;
   }
 
   private startTimers(): void {

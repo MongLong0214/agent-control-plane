@@ -85,9 +85,11 @@ export interface SessionWakeTrigger {
   kind: string;
   /**
    * A trigger caused by a verified Buzz mention carries the mention's gate: whether the mention's
-   * identity, role and room still stand behind the role's current holder. It is asked again at the
-   * turn's final check, immediately before the provider call, and a turn none of whose triggers
-   * still holds is refused there. Absent on every other trigger, which the final check never asks.
+   * identity, role and room still stand behind the role's current holder. A bootstrap PLAN recovery
+   * trigger carries its own: whether its run still needs a PLAN from that exact owner. It is asked
+   * again at the turn's final check, immediately before the provider call, and a turn none of whose
+   * triggers still holds is refused there. Absent on every other trigger, which the final check
+   * never asks.
    */
   stillAdmissible?: () => boolean;
   /**
@@ -564,7 +566,12 @@ export class ProvisionedSessionRuntime {
     const servedBefore = new Set<string>();
     try {
       // A refused turn is not a completed one: its triggers are released, never marked handled.
-      const turn = await this.#turn(binding.sessionId, "resume", workPrompt(binding, triggers), {
+      // The prompt is written after the final check, so a gated trigger dropped there without a
+      // `served` answer (a plan recovery whose run moved on) is not named in it. A mention's trigger
+      // keeps its place in the prompt whatever its gate answered, as it always has.
+      const prompt = () =>
+        workPrompt(binding, triggers.filter((trigger) => trigger.served !== undefined || !notAdmitted.has(trigger.id)));
+      const turn = await this.#turn(binding.sessionId, "resume", prompt, {
         relay: true,
         timeoutMs: this.options.turnTimeoutMs ?? 30 * 60_000,
         purpose: "work",
@@ -601,8 +608,9 @@ export class ProvisionedSessionRuntime {
           if (this.#isEnvelope(trigger.id) || notAdmitted.has(trigger.id)) continue;
           // A mention's trigger is handled by what actually happened in the turn, not by the gate's
           // answer before the provider call: a claim refused mid-turn, or never made, leaves its
-          // message PENDING and the trigger released.
-          if (trigger.stillAdmissible !== undefined && trigger.served?.() !== true) continue;
+          // message PENDING and the trigger released. A gated trigger with no `served` (a plan
+          // recovery) that its turn ran for is handled like an ordinary one.
+          if (trigger.served !== undefined && trigger.served() !== true) continue;
           lane.handled.add(trigger.id);
         }
       }
@@ -676,7 +684,8 @@ export class ProvisionedSessionRuntime {
   async #turn(
     sessionId: string,
     conversation: ConversationStep,
-    prompt: string,
+    /** The prompt, or how to write it once the final check below has passed. */
+    prompt: string | (() => string),
     turn: {
       relay: boolean;
       timeoutMs: number;
@@ -768,12 +777,13 @@ export class ProvisionedSessionRuntime {
       if (delivered) this.#delivery!.withdraw(handle.externalSessionId);
       return refused(wanted);
     }
+    const text = typeof prompt === "string" ? prompt : prompt();
     let result: SessionTurnResult;
     try {
       result = await provider.runSessionTurn({
         handle,
         conversation,
-        prompt,
+        prompt: text,
         timeoutMs: turn.timeoutMs,
         correlationId: `turn_${randomUUID()}`,
         relay: turn.relay ? this.#route : null,
