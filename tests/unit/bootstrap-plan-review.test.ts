@@ -13,7 +13,6 @@ import { manifestDigest, type ProjectManifest } from "../../src/contracts/manife
 import { startLocalMcpListeners, startSessionLaunchChannel } from "../../src/daemon/agentcpd.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import type { CapacityReading } from "../../src/runtime/provider.ts";
 import {
   CANDIDATE_SNAPSHOT_SCHEMA_ID,
   buildNoRepositoryCandidateSnapshot,
@@ -21,7 +20,7 @@ import {
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { makeHarness, registerFixtureProject, reviewerPass, reviewerRevise, type Harness } from "../helpers/harness.ts";
+import { makeHarness, registerFixtureProject, reviewerPass, reviewerRevise } from "../helpers/harness.ts";
 import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
 import { callMcpToolOverSocket, claimLaunchedCredential } from "../helpers/mcp-socket.ts";
 import { HeadlessRuntimeDouble } from "../helpers/headless-runtime.ts";
@@ -33,8 +32,7 @@ afterEach(() => vi.restoreAllMocks());
  * Issue #246 PR-C slice C2 — the bootstrap blind review, witnessed.
  *
  * Every state change goes through a real door: run_create, run_dispatch and ceo_decision_submit over
- * `hermes.mcp.sock` as the CEO; plan_submit, task_worker_provision, task_receipt_submit and
- * result_submit over `cto.mcp.sock` as the run's bootstrap CTO, with the credential its launch
+ * `hermes.mcp.sock` as the CEO; plan_submit and result_submit over `cto.mcp.sock` as the run's bootstrap CTO, with the credential its launch
  * channel issued. The blind reviewer is the harness's scripted reviewer, constituted by the review
  * gate itself; the Claude runtime is a scripted double. Readiness and confirmation are read through
  * `BootstrapActivation`'s own checks, which change nothing. No review is written and no run state is
@@ -53,36 +51,14 @@ const CONTRACT: TaskContract = {
   references: [],
 };
 
-/** One Claude window as the usage collector reports it, `minutesAgo` old. */
-const claudeReading = (harness: Harness, remainingPercent: number, minutesAgo = 0): CapacityReading => {
-  const now = harness.clock.now().getTime();
-  return {
-    provider: "claude",
-    sensorHealth: "HEALTHY",
-    runtimeHealth: "HEALTHY",
-    observedAt: new Date(now - minutesAgo * 60_000).toISOString(),
-    source: "bootstrap-plan-review-fixture",
-    buckets: [{
-      id: "five_hour",
-      remainingPercent,
-      resetAt: new Date(now + 2 * 60 * 60_000).toISOString(),
-      capabilities: ["ceo", "cto", "blind-review", "worker"],
-    }],
-  };
-};
-
 const reviewFixture = async () => {
   const harness = makeHarness();
   const launch = await startSessionLaunchChannel(tempDir("acp-c2-launch-"), { mcpToken: TOKEN });
   harness.cp.cto.attach({ sessionLaunch: launch });
-  // Claude Opus staffs the bootstrap CTO and the workers; the reviewer is the harness's own.
+  // Claude Opus staffs the bootstrap CTO; the reviewer is the harness's own. No worker is staffed: the
+  // PLAN's task stays READY until CEO CONFIRM settles it (CEO 1792120507).
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
-  harness.cp.providers.registerForRole(claude, Role.WORKER);
-  // A Claude WORKER allocation needs one earlier reading through the role's own probe (#512).
-  claude.setCapacity(claudeReading(harness, 81, 3));
-  await harness.cp.capacity.refreshForRole("claude", Role.WORKER);
-  claude.setCapacity(claudeReading(harness, 80));
 
   const ceo = harness.cp.sessions.create({ provider: "scripted", model: "c2-ceo" });
   const ceoSecret = ceo.sessionSecret;
@@ -173,32 +149,6 @@ const submitPlan = (f: Fixture, run: BootstrapRun, plan: Record<string, unknown>
     tasks: [{ key: taskKey, title: taskKey, category: "implementation" }],
   });
 
-/** Every READY task staffed with its own Claude Opus worker and carried to SUCCEEDED, over the CTO socket. */
-const workReadyTasks = async (f: Fixture, run: BootstrapRun): Promise<void> => {
-  for (const task of f.harness.cp.tasks.ready(run.runId)) {
-    const provisioned = await f.cto(run.owner, "task_worker_provision", { runId: run.runId, taskId: task.taskId, provider: "claude" });
-    expect(provisioned, JSON.stringify(provisioned)).toMatchObject({ ok: true });
-    const workerSessionId = (provisioned["value"] as { workerSessionId: string }).workerSessionId;
-    const started = await f.cto(run.owner, "task_receipt_submit", {
-      runId: run.runId,
-      taskId: task.taskId,
-      phase: "started",
-      workerSessionId,
-    });
-    expect(started, JSON.stringify(started)).toMatchObject({ ok: true });
-    const finished = await f.cto(run.owner, "task_receipt_submit", {
-      runId: run.runId,
-      taskId: task.taskId,
-      phase: "finished",
-      executionId: (started["value"] as { executionId: string }).executionId,
-      workerSessionId,
-      status: "SUCCEEDED",
-      resultDigest: digestOf({ task: task.taskId }),
-    });
-    expect(finished, JSON.stringify(finished)).toMatchObject({ ok: true });
-  }
-};
-
 /**
  * The coverage a passing reviewer of the run's current PLAN names. A PLAN that carries no manifest
  * has no planned outputs (on c315463e, plan_submit dropped the manifest); no review can be asked
@@ -227,10 +177,9 @@ const submitResult = async (f: Fixture, run: BootstrapRun) => {
   });
 };
 
-/** plan_submit, its task done, result_submit: the candidate's digest once the review has passed. */
+/** plan_submit, then result_submit (the task stays READY): the candidate's digest once the review has passed. */
 const reviewedPlan = async (f: Fixture, run: BootstrapRun, manifest: ProjectManifest, taskKey: string): Promise<string> => {
   expect(await submitPlan(f, run, bootstrapPlan(manifest), taskKey)).toMatchObject({ ok: true });
-  await workReadyTasks(f, run);
   const submitted = await submitResult(f, run);
   expect(submitted, JSON.stringify(submitted)).toMatchObject({ ok: true, value: { stage: "COMPLETED_REVIEW" } });
   return (submitted["value"] as { snapshotDigest: string }).snapshotDigest;
@@ -281,7 +230,6 @@ describe("#246 C2 W5: a PASS for one plan never stands for another", () => {
       });
 
       // P2's own review is another candidate, and only that candidate is ready.
-      await workReadyTasks(f, run);
       const submitted = await submitResult(f, run);
       expect(submitted, JSON.stringify(submitted)).toMatchObject({ ok: true, value: { stage: "COMPLETED_REVIEW" } });
       const s2 = (submitted["value"] as { snapshotDigest: string }).snapshotDigest;
@@ -315,7 +263,6 @@ describe("#246 C2: a bootstrap plan reaches the CEO only on a PASS", () => {
     await withFixture(async (f) => {
       const run = await dispatchedBootstrap(f);
       expect(await submitPlan(f, run, bootstrapPlan(cleanTreeManifest("c2-revise")), "plan-1")).toMatchObject({ ok: true });
-      await workReadyTasks(f, run);
       await f.harness.cp.continuity.evaluate("before result_submit");
       f.harness.scripted.script({
         match: /Bootstrap plan review/,

@@ -1,3 +1,4 @@
+import { parseRepoFactoryResult } from "../bootstrap/repo-factory-result.ts";
 import type { Clock } from "../core/clock.ts";
 import type {
   DynamicReserveDemand,
@@ -12,6 +13,7 @@ import type { Db } from "../db/database.ts";
 import {
   type FailureClass,
   Role,
+  RunKind,
   RunState,
   type TaskCategory,
   type TaskClass,
@@ -138,6 +140,30 @@ export interface WorkerCapacityGate {
 }
 
 /**
+ * CEO 1792120507 / 1792120860 — what settles a project-less PROJECT_BOOTSTRAP run's execution task:
+ * the producer's stored REPO_FACTORY_RESULT and its create receipt, the activation result the CEO
+ * CONFIRM's transaction wrote, bound to the run, its current PLAN, the create operation, the run's
+ * current candidate and that one task (`TaskGraph.settleBootstrapExecutionTask`).
+ */
+export interface BootstrapTaskSettlement {
+  runId: string;
+  taskId: string;
+  planDigest: string;
+  /** The PLAN's repository-create operation, whose receipt settles the task. */
+  operationId: string;
+  candidateSnapshotDigest: string;
+  repoFactoryResultDigest: string;
+  activationResultDigest: string;
+}
+
+/** The audit kind binding a project-less bootstrap PLAN to the tasks its `plan_submit` created. */
+export const BOOTSTRAP_PLAN_TASKS = "BOOTSTRAP_PLAN_TASKS";
+/** The audit kind a re-plan writes when it cancels (or leaves) an earlier PLAN's tasks. */
+export const BOOTSTRAP_TASKS_SUPERSEDED = "BOOTSTRAP_TASKS_SUPERSEDED";
+/** The audit kind of the one settlement of a project-less bootstrap's execution task. */
+export const BOOTSTRAP_TASK_SETTLED = "BOOTSTRAP_TASK_SETTLED";
+
+/**
  * Deliberately narrow binding port. TaskGraph can verify the worker that a receipt names,
  * but it receives neither the binding registry nor authority to mutate bindings.
  */
@@ -241,6 +267,10 @@ export class TaskGraph {
 
     return this.db.tx(() => {
       const now = this.clock.nowIso();
+      // CEO 1792120860 (3) — a project-less bootstrap's re-plan supersedes the earlier PLAN's tasks in
+      // this same transaction: an unexecuted READY one is CANCELLED, anything else is left as it is.
+      const bootstrapPlan = this.#projectlessBootstrapPlanDigest(runId);
+      if (bootstrapPlan !== null) this.#supersedeEarlierBootstrapTasks(runId, bootstrapPlan, now);
       const idByKey = new Map<string, string>();
       for (const spec of specs) idByKey.set(spec.key, newTaskId());
 
@@ -292,6 +322,13 @@ export class TaskGraph {
           dependencyCount: created.reduce((n, t) => n + t.dependsOn.length, 0),
         },
       });
+      if (bootstrapPlan !== null) {
+        this.audit.record({
+          kind: BOOTSTRAP_PLAN_TASKS,
+          runId,
+          evidence: { planDigest: bootstrapPlan, taskIds: created.map((task) => task.taskId) },
+        });
+      }
       this.telemetry.record({ scope: "graph", name: "task_count", runId, value: created.length });
       this.telemetry.record({
         scope: "graph",
@@ -971,6 +1008,254 @@ export class TaskGraph {
     return allow(ReasonCode.OK, {
       tasks: tasks.length,
       succeeded: tasks.filter((t) => t.state === TaskState.SUCCEEDED).length,
+    });
+  }
+
+  /**
+   * CEO 1792120507 / 1792120860 — a project-less PROJECT_BOOTSTRAP run's review entry, which takes
+   * the place of `completeness` for that run kind only (the result pipeline and the packet ask it).
+   * Its task is the external create: nothing may execute or claim it before the owner's approval and
+   * the CEO's CONFIRM, which settles it from the producer's create receipt. So review entry needs no
+   * task success, and refuses, with the refusal named, what a fake completion leaves behind: any task
+   * execution, or a task already SUCCEEDED. Neither is deleted or corrected. The run must then hold
+   * exactly one live task, READY and bound to `planDigest`, the run's current PLAN: that is the task
+   * one create receipt settles. A CANCELLED task is ignored and is never completion evidence.
+   */
+  bootstrapReviewEntry(runId: string, planDigest: string): Decision<{ taskId: string }> {
+    const refuse = (reasonCode: ReasonCode, refusal: string, message: string, evidence: Record<string, unknown> = {}) =>
+      deny(reasonCode, message, { runId, refusal, planDigest, ...evidence }) as Decision<{ taskId: string }>;
+    const executed = this.db
+      .all<{ task_id: string }>(`SELECT DISTINCT task_id FROM task_executions WHERE run_id = ? ORDER BY task_id`, [runId])
+      .map((row) => row.task_id);
+    if (executed.length > 0) {
+      return refuse(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "BOOTSTRAP_TASK_HAS_EXECUTION",
+        "a project-less bootstrap's task is settled only from its create receipt at CEO CONFIRM; this run carries a task execution, which is left as found",
+        { taskIds: executed },
+      );
+    }
+    const tasks = this.list(runId);
+    const succeeded = tasks.filter((task) => task.state === TaskState.SUCCEEDED).map((task) => task.taskId);
+    if (succeeded.length > 0) {
+      return refuse(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "BOOTSTRAP_TASK_SUCCEEDED_BEFORE_CONFIRM",
+        "a project-less bootstrap's task is settled only from its create receipt at CEO CONFIRM; this run carries a task already SUCCEEDED, which is left as found",
+        { taskIds: succeeded },
+      );
+    }
+    const live = tasks.filter((task) => task.state !== TaskState.CANCELLED);
+    if (live.length !== 1 || live[0]!.state !== TaskState.READY) {
+      return refuse(
+        ReasonCode.TASK_RESULT_COUNT_MISMATCH,
+        "BOOTSTRAP_PLAN_TASK_COUNT",
+        "a project-less bootstrap reaches CEO review with exactly one READY task, the one its repository-create receipt settles at CONFIRM",
+        { tasks: live.map((task) => ({ taskId: task.taskId, state: task.state })) },
+      );
+    }
+    const task = live[0]!;
+    if (!this.#boundToBootstrapPlan(runId, task.taskId, planDigest, live.length)) {
+      return refuse(
+        ReasonCode.TASK_RESULT_COUNT_MISMATCH,
+        "BOOTSTRAP_TASK_NOT_OF_CURRENT_PLAN",
+        "the run's READY task was not created with its current PLAN; submit the PLAN again so its task is",
+        { taskId: task.taskId },
+      );
+    }
+    return allow(ReasonCode.OK, { taskId: task.taskId });
+  }
+
+  /**
+   * CEO 1792120507 / 1792120860 — the one write that settles a project-less PROJECT_BOOTSTRAP run's
+   * execution task. It needs no worker: it moves the task READY → SUCCEEDED on the evidence the
+   * CONFIRM transaction holds, and records both digests and every binding it checked. Refused unless
+   * all of these hold, each with its refusal named:
+   *
+   * - it runs inside a transaction, the run is a project-less PROJECT_BOOTSTRAP still at CEO review,
+   *   and both digests are named;
+   * - the run's stored BOOTSTRAP_ACTIVATION_RESULT is the one named, for this run and a CEO CONFIRM.
+   *   Only the finalizer inside the CONFIRM transaction writes it, and it commits only with the run's
+   *   COMPLETED, so this is the CONFIRM transaction's path;
+   * - `planDigest` is the run's current PLAN, `operationId` its first operation and a repository
+   *   create, and `candidateSnapshotDigest` the run's current candidate;
+   * - the run's stored REPO_FACTORY_RESULT is the one named, for this run and this PLAN, and carries a
+   *   verified create receipt for that operation and resource;
+   * - the task is this run's, READY, and the one `bootstrapReviewEntry` answers for this PLAN (no
+   *   execution anywhere in the run, nothing SUCCEEDED, exactly one live task, bound to this PLAN);
+   * - no task of the run was settled before: one create receipt settles one task.
+   */
+  settleBootstrapExecutionTask(input: BootstrapTaskSettlement): Decision<TaskRecord> {
+    const refuse = (reasonCode: ReasonCode, refusal: string, message: string, evidence: Record<string, unknown> = {}) =>
+      deny(reasonCode, message, { runId: input.runId, taskId: input.taskId, refusal, ...evidence }) as Decision<TaskRecord>;
+    if (!this.db.inTransaction) {
+      return refuse(ReasonCode.COMPLETION_AUTHORITY_DENIED, "OUTSIDE_CONFIRM_TRANSACTION", "a bootstrap task is settled only inside the CEO CONFIRM transaction");
+    }
+    const run = this.db.get<{ kind: string; project_id: string | null; state: string; current_candidate_digest: string | null }>(
+      `SELECT kind, project_id, state, current_candidate_digest FROM runs WHERE run_id = ?`,
+      [input.runId],
+    );
+    if (!run || run.kind !== RunKind.PROJECT_BOOTSTRAP || run.project_id !== null) {
+      return refuse(ReasonCode.COMPLETION_AUTHORITY_DENIED, "RUN_NOT_PROJECTLESS_BOOTSTRAP", "only a project-less PROJECT_BOOTSTRAP run's task is settled this way");
+    }
+    if (run.state !== RunState.READY_FOR_CEO_REVIEW) {
+      return refuse(ReasonCode.RUN_TRANSITION_ILLEGAL, "RUN_NOT_AT_CONFIRM", `run is ${run.state}; a bootstrap task is settled only by the CONFIRM of a run at CEO review`);
+    }
+    if (!input.repoFactoryResultDigest || !input.activationResultDigest) {
+      return refuse(ReasonCode.EVIDENCE_MISSING, "SETTLEMENT_EVIDENCE_MISSING", "settlement names both the producer's result and the activation result");
+    }
+    const activation = this.#latestArtifact(input.runId, "BOOTSTRAP_ACTIVATION_RESULT");
+    const activated = activation?.content as { runId?: unknown; ceoConfirm?: { decision?: unknown } } | undefined;
+    if (
+      activation === null ||
+      activation.digest !== input.activationResultDigest ||
+      activated?.runId !== input.runId ||
+      activated.ceoConfirm?.decision !== "CONFIRM"
+    ) {
+      return refuse(ReasonCode.EVIDENCE_STALE, "ACTIVATION_RESULT_NOT_BOUND", "the named activation result is not this run's CONFIRM activation", {
+        named: input.activationResultDigest,
+        stored: activation?.digest ?? null,
+      });
+    }
+    const plan = this.#latestArtifact(input.runId, "PLAN");
+    if (plan === null || plan.digest !== input.planDigest) {
+      return refuse(ReasonCode.EVIDENCE_STALE, "PLAN_NOT_CURRENT", "the named PLAN is not the run's current PLAN", {
+        named: input.planDigest,
+        current: plan?.digest ?? null,
+      });
+    }
+    if (run.current_candidate_digest !== input.candidateSnapshotDigest) {
+      return refuse(ReasonCode.EVIDENCE_STALE, "CANDIDATE_NOT_CURRENT", "the named candidate is not the run's current candidate", {
+        named: input.candidateSnapshotDigest,
+        current: run.current_candidate_digest,
+      });
+    }
+    const operations = (plan.content as { githubOperations?: unknown } | null)?.githubOperations;
+    const create = Array.isArray(operations) ? (operations[0] as { operationId?: unknown; resourceType?: unknown; resourceIdentity?: unknown } | undefined) : undefined;
+    const factory = this.#latestArtifact(input.runId, "REPO_FACTORY_RESULT");
+    const parsed = factory === null ? null : parseRepoFactoryResult(factory.content);
+    const receipt = parsed?.allowed
+      ? parsed.value.externalWriteReceipts.find((row) =>
+          row.operationId === input.operationId &&
+          row.resourceType === "repository" &&
+          row.resourceIdentity === create?.resourceIdentity &&
+          row.verified)
+      : undefined;
+    if (
+      create?.operationId !== input.operationId ||
+      create.resourceType !== "repository" ||
+      factory === null ||
+      factory.digest !== input.repoFactoryResultDigest ||
+      !parsed?.allowed ||
+      parsed.value.runId !== input.runId ||
+      parsed.value.planDigest !== input.planDigest ||
+      receipt === undefined
+    ) {
+      return refuse(ReasonCode.EVIDENCE_STALE, "CREATE_RECEIPT_NOT_BOUND", "the named producer result carries no verified create receipt of this run's PLAN for this operation", {
+        operationId: input.operationId,
+        named: input.repoFactoryResultDigest,
+        stored: factory?.digest ?? null,
+      });
+    }
+    const task = this.get(input.taskId);
+    if (task === null || task.runId !== input.runId || task.state !== TaskState.READY) {
+      return refuse(ReasonCode.CONFLICT, "TASK_NOT_READY", "only a READY task of this run is settled", { state: task?.state ?? null });
+    }
+    const entry = this.bootstrapReviewEntry(input.runId, input.planDigest);
+    if (!entry.allowed) return entry as Decision<TaskRecord>;
+    if (entry.value.taskId !== input.taskId) {
+      return refuse(ReasonCode.TASK_RESULT_COUNT_MISMATCH, "BOOTSTRAP_TASK_NOT_OF_CURRENT_PLAN", "the named task is not the current PLAN's task", {
+        currentTaskId: entry.value.taskId,
+      });
+    }
+    const earlier = this.db.get<{ n: number }>(`SELECT 1 AS n FROM audit_events WHERE kind = ? AND run_id = ? LIMIT 1`, [
+      BOOTSTRAP_TASK_SETTLED,
+      input.runId,
+    ]);
+    if (earlier) return refuse(ReasonCode.CONFLICT, "RECEIPT_ALREADY_SETTLED", "this run's create receipt already settled a task");
+    const updated = this.db.run(`UPDATE tasks SET state = 'SUCCEEDED', updated_at = ? WHERE task_id = ? AND state = 'READY'`, [
+      this.clock.nowIso(),
+      input.taskId,
+    ]);
+    if (updated.changes !== 1) return refuse(ReasonCode.CONFLICT, "TASK_NOT_READY", "the task moved while it was being settled");
+    this.audit.record({
+      kind: BOOTSTRAP_TASK_SETTLED,
+      runId: input.runId,
+      evidence: {
+        taskId: input.taskId,
+        planDigest: input.planDigest,
+        operationId: input.operationId,
+        repoFactoryResultDigest: input.repoFactoryResultDigest,
+        createReceiptDigest: digestOf(receipt),
+        activationResultDigest: input.activationResultDigest,
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+      },
+    });
+    return allow(ReasonCode.OK, this.require(input.taskId));
+  }
+
+  /** The run's current PLAN digest when it is a project-less PROJECT_BOOTSTRAP with a PLAN; else null. */
+  #projectlessBootstrapPlanDigest(runId: string): string | null {
+    const run = this.db.get<{ kind: string; project_id: string | null }>(`SELECT kind, project_id FROM runs WHERE run_id = ?`, [runId]);
+    if (!run || run.kind !== RunKind.PROJECT_BOOTSTRAP || run.project_id !== null) return null;
+    return this.#latestArtifact(runId, "PLAN")?.digest ?? null;
+  }
+
+  /** The run's latest current artifact of `kind`, read as `ArtifactStore.latest` reads it. */
+  #latestArtifact(runId: string, kind: string): { digest: string; content: unknown } | null {
+    const row = this.db.get<{ digest: string; content_json: string }>(
+      `SELECT digest, content_json FROM run_artifacts WHERE run_id = ? AND kind = ? AND superseded = 0
+        ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      [runId, kind],
+    );
+    return row ? { digest: row.digest, content: JSON.parse(row.content_json) as unknown } : null;
+  }
+
+  /**
+   * Whether `taskId` was created with `planDigest`, by the `BOOTSTRAP_PLAN_TASKS` record its
+   * `plan_submit` wrote. A run with no such record at all was planned before they were written; its
+   * task counts as its current PLAN's only while it is the run's one live task.
+   */
+  #boundToBootstrapPlan(runId: string, taskId: string, planDigest: string, liveTasks: number): boolean {
+    const bindings = this.db
+      .all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ?`, [BOOTSTRAP_PLAN_TASKS, runId])
+      .map((row) => JSON.parse(row.evidence_json) as { planDigest?: unknown; taskIds?: unknown });
+    if (bindings.length === 0) return liveTasks === 1;
+    return bindings.some((binding) =>
+      binding.planDigest === planDigest && Array.isArray(binding.taskIds) && binding.taskIds.includes(taskId));
+  }
+
+  /**
+   * CEO 1792120860 (3) — what a project-less bootstrap's new PLAN supersedes, in `submit`'s transaction
+   * before its tasks are inserted: each earlier task that is PENDING or READY with no execution is
+   * CANCELLED, "superseded by PLAN <digest>" (PR #1114 BOOT-01: a PENDING one too, or it blocks the new
+   * PLAN for good). A task with an execution, or in any other state, is never simply cancelled: it is
+   * left as it is and named with why, and review entry then refuses the run for it.
+   */
+  #supersedeEarlierBootstrapTasks(runId: string, planDigest: string, now: string): void {
+    const earlier = this.list(runId).filter((task) => task.state !== TaskState.CANCELLED);
+    if (earlier.length === 0) return;
+    const executed = new Set(
+      this.db.all<{ task_id: string }>(`SELECT DISTINCT task_id FROM task_executions WHERE run_id = ?`, [runId]).map((row) => row.task_id),
+    );
+    const cancelled: string[] = [];
+    const left: Array<{ taskId: string; reason: string }> = [];
+    for (const task of earlier) {
+      if (executed.has(task.taskId)) {
+        left.push({ taskId: task.taskId, reason: "has an execution; never cancelled by a re-plan" });
+      } else if (task.state !== TaskState.READY && task.state !== TaskState.PENDING) {
+        left.push({ taskId: task.taskId, reason: `${task.state}; a re-plan cancels only an unexecuted PENDING or READY task` });
+      } else {
+        cancelled.push(task.taskId);
+      }
+    }
+    for (const taskId of cancelled) {
+      this.db.run(`UPDATE tasks SET state = 'CANCELLED', updated_at = ? WHERE task_id = ? AND state IN ('PENDING', 'READY')`, [now, taskId]);
+    }
+    this.audit.record({
+      kind: BOOTSTRAP_TASKS_SUPERSEDED,
+      runId,
+      evidence: { planDigest, reason: `superseded by PLAN ${planDigest}`, cancelled, left },
     });
   }
 

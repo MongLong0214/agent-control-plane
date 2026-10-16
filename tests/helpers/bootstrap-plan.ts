@@ -8,17 +8,19 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { Role, roleKeyFor } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
-import { bindCeo, bindWorker, fixtureManifest, reviewerPass, reviewerRevise, type Harness } from "./harness.ts";
+import { bindCeo, fixtureManifest, reviewerPass, reviewerRevise, type Harness } from "./harness.ts";
 
 /**
  * Issue #246 PR-C slice C2 — fixtures for a project-less PROJECT_BOOTSTRAP run's plan and its
  * BOOTSTRAP_PLAN review, shared by the tests that need a bootstrap run at CEO review.
  *
  * `reviewBootstrapPlan` reaches READY_FOR_CEO_REVIEW the way production does: the run's bootstrap CTO
- * submits the PLAN (manifest included) through the `plan_submit` tool, the PLAN's tasks are carried
- * to SUCCEEDED by workers of their own, and `result_submit`'s pipeline freezes the candidate and runs
- * the blind review, answered here by the scripted reviewer. It writes no review and moves no state
- * itself. The witnesses of slice C2 drive the same path over the real sockets instead.
+ * submits the PLAN (manifest included) through the `plan_submit` tool, and `result_submit`'s pipeline
+ * freezes the candidate and runs the blind review, answered here by the scripted reviewer. The PLAN's
+ * task stays READY: a project-less bootstrap's review entry needs no task success, and the task is
+ * settled only at CEO CONFIRM from the producer's create receipt and the activation result (CEO
+ * 1792120507). Nothing here starts, finishes or fakes an execution. It writes no review and moves no
+ * state itself. The witnesses of slice C2 drive the same path over the real sockets instead.
  */
 
 export const BOOTSTRAP_IDENTITY = "github:acme/fixture";
@@ -142,28 +144,6 @@ export const submitBootstrapPlan = async (harness: Harness, runId: string, plan:
   return stored.digest;
 };
 
-/** Every READY task carried to SUCCEEDED by a worker session of its own, as the existing fixtures do. */
-export const completeReadyTasks = (harness: Harness, runId: string): void => {
-  const ownerBindingGeneration = harness.cp.runs.require(runId).ownerBindingGeneration;
-  if (ownerBindingGeneration === null) throw new Error("the bootstrap run has no owner generation");
-  for (const task of harness.cp.tasks.ready(runId)) {
-    const started = harness.cp.tasks.startExecution({
-      runId,
-      taskId: task.taskId,
-      ownerBindingGeneration,
-      workerSessionId: bindWorker(harness, task.taskId),
-      provider: "scripted",
-      model: "scripted-worker",
-    });
-    if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
-    const finished = harness.cp.tasks.finishExecution(started.value.executionId, {
-      status: "SUCCEEDED",
-      resultDigest: digestOf({ task: task.taskId }),
-    });
-    if (!finished.allowed) throw new Error(`${finished.reasonCode}: ${finished.message}`);
-  }
-};
-
 /** The coverage keys a passing reviewer of the run's current PLAN must name. */
 export const bootstrapCoverageKeys = (harness: Harness, runId: string): string[] => {
   const current = currentBootstrapPlan(runId, harness.cp.artifacts.latest(runId, "PLAN"));
@@ -178,9 +158,9 @@ export interface ReviewedBootstrapPlan {
 }
 
 /**
- * The PLAN submitted by the run's bootstrap CTO, its task done, and `result_submit`'s pipeline run:
- * the candidate frozen with its PLAN binding and its BOOTSTRAP_PLAN review answered PASS by the
- * scripted reviewer, so the run is at CEO review.
+ * The PLAN submitted by the run's bootstrap CTO and `result_submit`'s pipeline run: the candidate
+ * frozen with its PLAN binding and its BOOTSTRAP_PLAN review answered PASS by the scripted reviewer,
+ * so the run is at CEO review with the PLAN's task still READY.
  */
 export const reviewBootstrapPlan = async (
   harness: Harness,
@@ -190,7 +170,6 @@ export const reviewBootstrapPlan = async (
   const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
   const ceoSessionId = ceo?.sessionId ?? bindCeo(harness);
   const planDigest = await submitBootstrapPlan(harness, runId, plan);
-  completeReadyTasks(harness, runId);
   harness.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(harness, runId)) });
   const run = harness.cp.runs.require(runId);
   const outcome = await harness.cp.pipeline.submitResult({

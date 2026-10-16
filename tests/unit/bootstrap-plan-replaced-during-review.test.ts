@@ -1,13 +1,12 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { bootstrapActivationHandoff, currentBootstrapPlan } from "../../src/bootstrap/bootstrap-plan.ts";
-import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { startLocalMcpListeners, startSessionLaunchChannel } from "../../src/daemon/agentcpd.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import type { CapacityReading, InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
+import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
 import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
@@ -28,7 +27,7 @@ afterEach(() => vi.restoreAllMocks());
  * produced a packet and READY_FOR_CEO_REVIEW for a PLAN the run no longer has.
  *
  * Every state change goes through a real door: run_create, run_dispatch over `hermes.mcp.sock` as the
- * CEO; plan_submit, task_worker_provision, task_receipt_submit and result_submit over `cto.mcp.sock`
+ * CEO; plan_submit and result_submit over `cto.mcp.sock`
  * as the run's bootstrap CTO, with the credential its launch channel issued. The reviewer is the
  * harness's scripted one, constituted by the review gate itself; the test only decides *when* it
  * answers. No review is written and no run state is moved by the test.
@@ -46,33 +45,12 @@ const CONTRACT: TaskContract = {
   references: [],
 };
 
-const claudeReading = (harness: Harness, remainingPercent: number, minutesAgo = 0): CapacityReading => {
-  const now = harness.clock.now().getTime();
-  return {
-    provider: "claude",
-    sensorHealth: "HEALTHY",
-    runtimeHealth: "HEALTHY",
-    observedAt: new Date(now - minutesAgo * 60_000).toISOString(),
-    source: "bootstrap-plan-replaced-fixture",
-    buckets: [{
-      id: "five_hour",
-      remainingPercent,
-      resetAt: new Date(now + 2 * 60 * 60_000).toISOString(),
-      capabilities: ["ceo", "cto", "blind-review", "worker"],
-    }],
-  };
-};
-
 const fixture = async () => {
   const harness = makeHarness();
   const launch = await startSessionLaunchChannel(tempDir("acp-rf02-launch-"), { mcpToken: TOKEN });
   harness.cp.cto.attach({ sessionLaunch: launch });
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
-  harness.cp.providers.registerForRole(claude, Role.WORKER);
-  claude.setCapacity(claudeReading(harness, 81, 3));
-  await harness.cp.capacity.refreshForRole("claude", Role.WORKER);
-  claude.setCapacity(claudeReading(harness, 80));
 
   const ceo = harness.cp.sessions.create({ provider: "scripted", model: "rf02-ceo" });
   const ceoSecret = ceo.sessionSecret;
@@ -153,27 +131,6 @@ const submitPlan = async (f: Fixture, run: BootstrapRun, manifest: ProjectManife
   expect(submitted, JSON.stringify(submitted)).toMatchObject({ ok: true });
 };
 
-/** Every READY task staffed with its own Claude Opus worker and carried to SUCCEEDED, over the CTO socket. */
-const workReadyTasks = async (f: Fixture, run: BootstrapRun): Promise<void> => {
-  for (const task of f.harness.cp.tasks.ready(run.runId)) {
-    const provisioned = await f.cto(run.owner, "task_worker_provision", { runId: run.runId, taskId: task.taskId, provider: "claude" });
-    expect(provisioned, JSON.stringify(provisioned)).toMatchObject({ ok: true });
-    const workerSessionId = (provisioned["value"] as { workerSessionId: string }).workerSessionId;
-    const started = await f.cto(run.owner, "task_receipt_submit", { runId: run.runId, taskId: task.taskId, phase: "started", workerSessionId });
-    expect(started, JSON.stringify(started)).toMatchObject({ ok: true });
-    const finished = await f.cto(run.owner, "task_receipt_submit", {
-      runId: run.runId,
-      taskId: task.taskId,
-      phase: "finished",
-      executionId: (started["value"] as { executionId: string }).executionId,
-      workerSessionId,
-      status: "SUCCEEDED",
-      resultDigest: digestOf({ task: task.taskId }),
-    });
-    expect(finished, JSON.stringify(finished)).toMatchObject({ ok: true });
-  }
-};
-
 /** Scripts a PASS naming exactly the coverage of the run's PLAN as it is now. */
 const scriptPassForCurrentPlan = (f: Fixture, run: BootstrapRun): void => {
   f.harness.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.harness, run.runId)) });
@@ -237,7 +194,6 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
       const m1 = cleanTreeManifest("rf02-inflight-first");
       const m2 = cleanTreeManifest("rf02-inflight-second");
       await submitPlan(f, run, m1, "plan-1");
-      await workReadyTasks(f, run);
       // 1073-N1-01 — P1's PLAN binding, read before anything can replace it.
       const p1 = currentBootstrapPlan(run.runId, f.harness.cp.artifacts.latest(run.runId, "PLAN"));
       if (!p1.allowed) throw new Error(p1.message);
@@ -261,7 +217,6 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
 
       // While P1's reviewer works, the bootstrap CTO submits P2 through plan_submit and its task is done.
       await submitPlan(f, run, m2, "plan-2");
-      await workReadyTasks(f, run);
       const p2 = currentBootstrapPlan(run.runId, f.harness.cp.artifacts.latest(run.runId, "PLAN"));
       if (!p2.allowed) throw new Error(p2.message);
 
@@ -312,7 +267,6 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
       const m1 = cleanTreeManifest("rf02-publication-first");
       const m2 = cleanTreeManifest("rf02-publication-second");
       await submitPlan(f, run, m1, "plan-1");
-      await workReadyTasks(f, run);
       await f.harness.cp.continuity.evaluate("before result_submit");
       scriptPassForCurrentPlan(f, run);
 
@@ -324,7 +278,6 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
         if (reason === "pre-completion" && !replaced) {
           replaced = true;
           await submitPlan(f, run, m2, "plan-2");
-          await workReadyTasks(f, run);
         }
         return evaluate(reason);
       });
@@ -369,7 +322,6 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
     await withFixture(async (f) => {
       const run = await dispatchedBootstrap(f);
       await submitPlan(f, run, cleanTreeManifest("rf02-unavailable-first"), "plan-1");
-      await workReadyTasks(f, run);
       await f.harness.cp.continuity.evaluate("before result_submit");
       // The reviewer's runtime is down: the review gate returns no verdict, an assurance failure.
       f.harness.scripted.setRuntimeHealth("UNAVAILABLE");
@@ -381,7 +333,6 @@ describe("RF-REVIEW-02: a PLAN replaced while it is judged gets no ready packet"
           replaced = true;
           f.harness.scripted.setRuntimeHealth("HEALTHY");
           await submitPlan(f, run, cleanTreeManifest("rf02-unavailable-second"), "plan-2");
-          await workReadyTasks(f, run);
         }
         return evaluate(reason);
       });

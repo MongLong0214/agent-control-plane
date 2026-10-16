@@ -10,7 +10,7 @@ import type { CapacityReading, SessionHandle, SessionSpec } from "../../src/runt
 import { BindingRegistry } from "../../src/session/binding-registry.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask, fixtureManifest, makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
-import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest, completeReadyTasks } from "../helpers/bootstrap-plan.ts";
+import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 import { HeadlessRuntimeDouble } from "../helpers/headless-runtime.ts";
 import type { TestProductionAdapter } from "../helpers/production-adapter.ts";
@@ -201,7 +201,7 @@ const queuedBootstrapRun = (f: Fixture): string => {
  * A dispatched bootstrap run sent back for revision by the CEO's FINAL_REVISE over the Hermes
  * socket, so `run_dispatch` may dispatch it again. It reaches CEO review the way production does
  * (#246 C2): its bootstrap CTO's `plan_submit` and `result_submit` over `cto.mcp.sock`, the PLAN's
- * task done, and the BOOTSTRAP_PLAN review passed by the scripted reviewer.
+ * task left READY (CEO 1792120507), and the BOOTSTRAP_PLAN review passed by the scripted reviewer.
  */
 const revisedBootstrap = async (f: Fixture): Promise<{ runId: string; ownerSessionId: string }> => {
   const dispatched = await f.dispatchBootstrap();
@@ -211,7 +211,6 @@ const revisedBootstrap = async (f: Fixture): Promise<{ runId: string; ownerSessi
     tasks: [{ key: "bootstrap", title: "bootstrap the repository", category: "implementation" }],
   });
   expect(planned).toMatchObject({ ok: true });
-  completeReadyTasks(f.harness, dispatched.runId);
   f.harness.scripted.script({
     match: /Bootstrap plan review/,
     text: reviewerPass(bootstrapCoverageKeys(f.harness, dispatched.runId)),

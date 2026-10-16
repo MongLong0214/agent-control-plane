@@ -41,7 +41,6 @@ import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 import {
   bootstrapPlan,
   callCtoToolAsOwner,
-  completeReadyTasks,
   replanBootstrap,
   reviewBootstrapPlan,
   submitBootstrapPlan,
@@ -177,8 +176,8 @@ const prepareRun = async (
   const manifest = cleanTreeManifest(projectId);
   const plan = bootstrapPlan(manifest, { operations: options.operations ?? operations() });
   if (options.review === false) {
+    // Planned and never reviewed: its task stays READY, as a project-less bootstrap's does until CONFIRM.
     const planDigest = await submitBootstrapPlan(harness, runId, plan);
-    completeReadyTasks(harness, runId);
     return { runId, planDigest, snapshotDigest: "", manifest, bootstrapCtoSessionId };
   }
   const reviewed = await reviewBootstrapPlan(harness, runId, plan);

@@ -300,11 +300,13 @@ describe("ACP-C1B-04: a revision redispatch dispatches the revision", () => {
       await revise(f, runId);
       const redispatched = await f.hermes("run_dispatch", { runId });
       expect(redispatched).toMatchObject({ ok: true, value: { state: RunState.ACTIVE, ownerBindingGeneration: 1 } });
-      // The reuse attestation, then the revision's own work turn.
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(4));
-      await vi.waitFor(() => expect(handled).toHaveLength(2));
+      // CEO 1792120860 (5) — the FINAL_REVISE itself reaches the driven owner in band (a REVISION_REQUEST
+      // with the CEO's reason), then the redispatch's RUN_DISPATCH; work turns read and settle each.
+      await vi.waitFor(() => expect(handled).toHaveLength(3));
+      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
       expect(handled).toEqual([
         { kind: MessageKind.RUN_DISPATCH, generation: 1, acked: true },
+        { kind: MessageKind.REVISION_REQUEST, generation: 1, acked: true },
         { kind: MessageKind.RUN_DISPATCH, generation: 1, acked: true },
       ]);
       expect(dispatches(f, runId)).toEqual([
