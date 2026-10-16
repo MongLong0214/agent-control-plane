@@ -8,7 +8,7 @@ import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/b
 import { bootstrapCoverageKeys } from "../helpers/bootstrap-plan.ts";
 import { resultState } from "../helpers/bootstrap-result.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { reviewerPass } from "../helpers/harness.ts";
+import { reviewerPass, reviewerRevise } from "../helpers/harness.ts";
 import { scriptBootstrapOwner, type ScriptedBootstrapOwner } from "../helpers/scripted-bootstrap-owner.ts";
 
 /**
@@ -291,6 +291,73 @@ describe("a legacy row is not retried twice", () => {
       expect(sweep(f)).toEqual({ woken: [] });
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
       expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+    });
+  });
+});
+
+describe("a review the audit trail places before the selected freeze does not veto the retry", () => {
+  /**
+   * ACP-LEGACY-RETRY-01: the first review of the candidate returned REVISE; the owner submitted the
+   * unchanged PLAN again, which re-froze the same candidate digest, and that review was unavailable.
+   * The REVISE precedes the re-freeze by event id, so the legacy row is linked to the re-freeze exactly
+   * as its digest-bearing sibling is.
+   */
+  it.each(["legacy", "digest"] as const)("a REVISE before the re-freeze, then an unavailable %s row: one retry", async (shape) => {
+    await withBootstrapRuntime(async (f) => {
+      const scripted = f.harness.scripted;
+      const invoke = scripted.invoke.bind(scripted);
+      let firstReview = true;
+      vi.spyOn(scripted, "invoke").mockImplementation(async (request) => {
+        if (firstReview && /Bootstrap plan review/.test(request.prompt)) {
+          firstReview = false;
+          const reviewing = f.harness.cp.db.get<{ run_id: string }>(
+            `SELECT run_id FROM candidate_pipeline_attempts WHERE state = 'RUNNING' LIMIT 1`,
+          )!;
+          scripted.script({ match: /Bootstrap plan review/, text: reviewerRevise(bootstrapCoverageKeys(f.harness, reviewing.run_id), "revise the plan") });
+        }
+        return invoke(request);
+      });
+      const legacy = legacyRows(f);
+      legacy.on = false;
+      const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onRevision: "ignore", onResult: "follow-prompt", onRetry: "ignore" });
+      const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
+      await vi.waitFor(() => expect(owner.results).toHaveLength(1), { timeout: 10_000, interval: 25 });
+      expect(owner.results[0]).toMatchObject({ stage: "REVISION_REQUIRED" });
+      await vi.waitFor(() => expect(owner.revisions).toHaveLength(1), { timeout: 10_000, interval: 25 });
+      await idle(f, ownerSessionId);
+      const candidate = f.harness.cp.runs.currentCandidate(runId)!;
+      const revise = auditOf(f, "BLIND_REVIEW_COMPLETED", runId).at(-1)!;
+      expect(f.harness.cp.artifacts.list(runId, ArtifactKind.BLIND_REVIEW)).toHaveLength(1);
+
+      legacy.on = shape === "legacy";
+      const submitted = await f.cto(ownerSessionId, "result_submit", {
+        runId, resultSummary: "the planned bootstrap outputs", recommendation: "create the repository",
+      });
+      expect(submitted).toMatchObject({ ok: true, value: { stage: "REVIEW_UNAVAILABLE" } });
+      legacy.on = false;
+      await idle(f, ownerSessionId);
+      expect(f.harness.cp.runs.currentCandidate(runId)).toBe(candidate);
+      const freeze = auditOf(f, "CANDIDATE_FROZEN", runId).at(-1)!;
+      const unavailable = auditOf(f, "BLIND_REVIEW_UNAVAILABLE", runId).at(-1)!;
+      expect(revise.eventId).toBeLessThan(freeze.eventId);
+      expect(freeze.eventId).toBeLessThan(unavailable.eventId);
+      if (shape === "legacy") expectLegacyShape(f, runId, unavailable);
+      else expect(unavailable.evidence["candidateSnapshotDigest"]).toBe(candidate);
+      expect(resultState(f, runId)).toEqual({ state: RunState.ACTIVE, candidate, attempts: ["RELEASED"] });
+
+      const planDigest = f.harness.cp.artifacts.latest(runId, ArtifactKind.PLAN)!.digest;
+      expect(sweep(f)).toEqual({
+        woken: [{
+          runId, roleKey, bindingGeneration: 1, planDigest,
+          retry: {
+            candidateSnapshotDigest: candidate, unavailableEventId: unavailable.eventId,
+            ...(shape === "legacy" ? { candidateFrozenEventId: freeze.eventId } : {}),
+          },
+        }],
+      });
+      await idle(f, ownerSessionId);
+      expect(sweep(f)).toEqual({ woken: [] });
+      expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
     });
   });
 });

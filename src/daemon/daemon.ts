@@ -2621,9 +2621,11 @@ export class Daemon {
    * names the run. Such a row, and only such a row, is linked to the run's current candidate by audit
    * order alone, when the freeze right before it (by event id) froze exactly that candidate and,
    * after that freeze, nothing but this row moved the trail: no other freeze, promotion or
-   * invalidation, no other review outcome or revision, no new PLAN tasks, no terminal transition, and
-   * no stored review of the candidate. Answers that freeze's event id, or null when anything is
-   * missing or ambiguous. A row that carries any digest is never re-linked here.
+   * invalidation, no other review outcome or revision, no new PLAN tasks, and no terminal transition.
+   * A stored review of the candidate vetoes the link unless the audit trail places it before that
+   * freeze (an unchanged PLAN re-freezes the same digest, so an earlier review of it is history, not
+   * an outcome of this freeze). Answers that freeze's event id, or null when anything is missing or
+   * ambiguous. A row that carries any digest is never re-linked here.
    */
   #legacyUnavailableFreeze(runId: string, candidate: string, unavailableEventId: number): number | null {
     const legacy = this.cp.db.get<{ n: number }>(
@@ -2634,8 +2636,8 @@ export class Daemon {
       [unavailableEventId, runId],
     );
     if (!legacy) return null;
-    const freeze = this.cp.db.get<{ event_id: number; candidate: unknown }>(
-      `SELECT event_id, json_extract(evidence_json, '$.candidateSnapshotDigest') AS candidate
+    const freeze = this.cp.db.get<{ event_id: number; at: string; candidate: unknown }>(
+      `SELECT event_id, at, json_extract(evidence_json, '$.candidateSnapshotDigest') AS candidate
          FROM audit_events
         WHERE run_id = ? AND kind = 'CANDIDATE_FROZEN' AND event_id < ?
         ORDER BY event_id DESC
@@ -2653,11 +2655,24 @@ export class Daemon {
       [runId, freeze.event_id, unavailableEventId, ...LEGACY_RETRY_TRAIL_KINDS, ...TERMINAL_RUN_STATES],
     );
     if (movedOn) return null;
-    const reviewed = this.cp.db.get<{ n: number }>(
-      `SELECT 1 AS n FROM run_artifacts WHERE run_id = ? AND kind = 'BLIND_REVIEW' AND candidate_snapshot_digest = ? LIMIT 1`,
-      [runId, candidate],
+    // The gate writes a review artifact and its BLIND_REVIEW_COMPLETED row in one synchronous section,
+    // so audit order places a stored review: every one must be matched by a completed review of this
+    // candidate ahead of the freeze (one after it was refused above). One the trail cannot place, or
+    // whose own timestamp is after the freeze, is ambiguous and refuses.
+    const reviews = this.cp.db.get<{ stored: number; late: number }>(
+      `SELECT COUNT(*) AS stored, COALESCE(SUM(created_at > ?), 0) AS late FROM run_artifacts
+        WHERE run_id = ? AND kind = 'BLIND_REVIEW' AND candidate_snapshot_digest = ?`,
+      [freeze.at, runId, candidate],
     );
-    return reviewed ? null : freeze.event_id;
+    if (!reviews || reviews.late > 0) return null;
+    if (reviews.stored === 0) return freeze.event_id;
+    const placed = this.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events
+        WHERE run_id = ? AND kind = 'BLIND_REVIEW_COMPLETED' AND event_id < ?
+          AND json_extract(evidence_json, '$.candidateSnapshotDigest') = ?`,
+      [runId, freeze.event_id, candidate],
+    );
+    return (placed?.n ?? 0) >= reviews.stored ? freeze.event_id : null;
   }
 
   /**
