@@ -1956,9 +1956,25 @@ export const buzzOwnerApprovalVerdictOf = (decision: Decision<BuzzOwnerApprovalA
 export const OWNER_APPROVAL_BUZZ_IDENTITY_ENV = "ACP_OWNER_APPROVAL_BUZZ_IDENTITY";
 
 /**
+ * #246 T3 — the variable naming the repo-factory project: its registered project id, as the
+ * operator configures it (the `ACP_TELEGRAM_DEFAULT_PROJECT_ID` precedent). The trimmed value is the
+ * id and nothing else: not a display name, not a literal, and not checked against an id pattern,
+ * which would make this file a second authority for what a project id is (r-5586d6cc13d9). The
+ * registry is the authority; an id it does not hold refuses.
+ */
+export const REPO_FACTORY_PROJECT_ID_ENV = "ACP_REPO_FACTORY_PROJECT_ID";
+
+/**
  * #246 — the owner-approval store over this daemon's registries: the bootstrap runner's scope and
  * need, the run list for the prompt tick, the declared `buzz` owners, the deployment's Buzz replay
  * window for the receipt's admission, and the current CEO binding for a re-issue request (O2).
+ *
+ * T3 — the canonical signer is the CTO of the project `ACP_REPO_FACTORY_PROJECT_ID` names, and only
+ * when every link holds: the id is configured and registered, the project has an ACTIVE PRIMARY_CTO
+ * binding, that binding's runtime is live (READY or DRAINING, as `currentCeo` reads it) and carries
+ * a Buzz identity and room, and that identity is held by exactly one ACTIVE PRIMARY_CTO binding
+ * across all projects. The store then compares it with X and X's admitted room; that comparison is
+ * what refuses X being another project's CTO.
  */
 export const createDaemonBuzzOwnerApprovals = (
   cp: ControlPlane,
@@ -1970,7 +1986,9 @@ export const createDaemonBuzzOwnerApprovals = (
     publishTimeoutMs?: number;
   },
 ): BuzzOwnerApprovals => {
-  const identity = buzzOwnerApprovalIdentityOf((options.environment ?? process.env)[OWNER_APPROVAL_BUZZ_IDENTITY_ENV]);
+  const environment = options.environment ?? process.env;
+  const identity = buzzOwnerApprovalIdentityOf(environment[OWNER_APPROVAL_BUZZ_IDENTITY_ENV]);
+  const repoFactoryProjectId = environment[REPO_FACTORY_PROJECT_ID_ENV]?.trim() ?? "";
   return new BuzzOwnerApprovals({
     db: cp.db,
     clock: cp.clock,
@@ -1980,13 +1998,22 @@ export const createDaemonBuzzOwnerApprovals = (
     ownerActors: options.ownerActors,
     identity: identity === "INVALID" ? null : identity,
     repoFactoryAuthority: () => {
-      const binding = cp.bindings.activePrimaryCto("repo-factory");
+      if (repoFactoryProjectId.length === 0) return { excluded: "REPO_FACTORY_PROJECT_NOT_CONFIGURED" };
+      if (cp.projects.get(repoFactoryProjectId) === null) return { excluded: "REPO_FACTORY_PROJECT_NOT_REGISTERED" };
+      const binding = cp.bindings.activePrimaryCto(repoFactoryProjectId);
       if (binding === null) return { excluded: "NO_ACTIVE_REPO_FACTORY_CTO" };
       const session = cp.sessions.get(binding.sessionId);
-      if (session === null || session.buzzActorId === null || session.buzzAddress === null) {
-        return { excluded: "REPO_FACTORY_CTO_HAS_NO_BUZZ_IDENTITY" };
+      const lifecycle = session?.lifecycle;
+      if (session === null || (lifecycle !== SessionLifecycle.READY && lifecycle !== SessionLifecycle.DRAINING)) {
+        return { excluded: "REPO_FACTORY_CTO_NOT_LIVE" };
       }
-      return { signer: session.buzzActorId, room: session.buzzAddress };
+      const signer = session.buzzActorId;
+      if (signer === null || session.buzzAddress === null) return { excluded: "REPO_FACTORY_CTO_HAS_NO_BUZZ_IDENTITY" };
+      // Counted over every ACTIVE PRIMARY_CTO binding, live runtime or not: a stopped runtime keeps its
+      // key, so a second binding resolving to one carrying this key is a second holder, not history.
+      const holders = cp.bindings.activePrimaryCtos().filter((held) => cp.sessions.get(held.sessionId)?.buzzActorId === signer);
+      if (holders.length !== 1) return { excluded: "REPO_FACTORY_CTO_IDENTITY_AMBIGUOUS" };
+      return { signer, room: session.buzzAddress };
     },
     identityInvalid: identity === "INVALID",
     ingressPolicy:
