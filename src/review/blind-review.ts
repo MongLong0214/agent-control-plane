@@ -49,6 +49,7 @@ import {
   type ProviderRegistry,
   type ReviewerEgressRecord,
 } from "../runtime/provider.ts";
+import { PacketReviewerScopeUnconfigured } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import {
@@ -301,6 +302,13 @@ const REVIEWER_SESSION_FAILURE_MESSAGES: Record<ProviderSessionProvisionError["r
   [ReasonCode.REVIEWER_SESSION_UNREADABLE_ANSWER]:
     "preferred reviewer answered its identity handshake without a resumable session id",
 };
+
+/**
+ * Why a fallback reviewer was selected when the preferred reviewer's packet scope is UNCONFIGURED:
+ * the preferred attempt's reason, carried into the `BLIND_REVIEW_FALLBACK` audit beside the
+ * preferred and actual provider and model.
+ */
+export const REVIEWER_FALLBACK_SCOPE_UNCONFIGURED = "REVIEWER_FALLBACK_SCOPE_UNCONFIGURED";
 
 export class BlindReviewGate {
   readonly #pipelineCapability = Symbol("blind-review-control-plane");
@@ -681,10 +689,15 @@ export class BlindReviewGate {
   }
 
   /**
-   * §18.1 / §18.7 — prefer GPT-5.6 Sol at xhigh; fall back to a *separate* fresh
+   * §18.1 / §18.7 — prefer GPT-6.1 Sol at xhigh; fall back to a *separate* fresh
    * session when the preferred provider is unavailable. Session and context
    * independence is required even when the provider family is reused; if no isolated
    * reviewer can be constituted the gate is not lowered — the caller waits.
+   *
+   * A preferred reviewer whose session setup fails falls back for exactly one reason: its
+   * packet-reviewer scope is UNCONFIGURED (`PacketReviewerScopeUnconfigured`, from the
+   * predicate the doctor reports). Any other setup failure — a configured override that is
+   * wrong or spent, an unusable home, an auth or isolation failure — still refuses.
    */
   private async constituteReviewer(
     request: ReviewSubject,
@@ -774,6 +787,13 @@ export class BlindReviewGate {
         });
       } catch (error) {
         rmSync(workdir, { recursive: true, force: true });
+        // Owner directive / CEO 1792123922 (2026-10-16): the one setup failure that is an
+        // absence rather than a fault. The fallback below is still a separate fresh reviewer
+        // session, bound BLIND_REVIEWER and independence-checked like the preferred one.
+        if (isPreferred && error instanceof PacketReviewerScopeUnconfigured) {
+          attempts.push({ preference, reason: REVIEWER_FALLBACK_SCOPE_UNCONFIGURED });
+          continue;
+        }
         const message = error instanceof Error ? error.message : "provider reviewer session setup failed";
         // A missing OS/profile/provider-identity proof is not a capacity outage. Falling
         // back to Claude here would hide a broken mandatory GPT gate behind a successful
@@ -864,7 +884,9 @@ export class BlindReviewGate {
           reasonCode: ReasonCode.OK,
           evidence: {
             from: this.preferences.preferred.provider,
+            preferredModel: this.preferences.preferred.model,
             provider: preference.provider,
+            model: preference.model,
             reason: preferredAttempt?.reason ?? "preferred provider unavailable",
           },
         });

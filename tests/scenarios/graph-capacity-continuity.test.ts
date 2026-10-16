@@ -49,7 +49,7 @@ const makeMultiProviderHarness = ({ forwardDispatchTarget = true }: { forwardDis
     allowTestEvidenceWriters: true,
     ctoPreference: { provider: "claude", model: "opus", effort: null },
     reviewer: {
-      preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
+      preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
       fallbacks: [{ provider: "claude", model: "opus", effort: null }],
     },
   });

@@ -560,7 +560,7 @@ export class ControlPlane {
         this.clock, this.db, this.audit, this.artifacts, this.#evidenceWriters.BLIND_REVIEW,
         this.sessions, this.bindings, this.providers, this.repositories, this.telemetry,
         config.reviewer ?? {
-          preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
+          preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
           fallbacks: [{ provider: "claude", model: "opus", effort: null }],
         },
         config.reviewerEgress?.providerEndpoints ?? REVIEWER_PROVIDER_ENDPOINTS,
@@ -905,9 +905,8 @@ export class ControlPlane {
         environmentAllowlist: [],
         denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir, ...credentialDenyPaths],
         managedWriteBroker,
-        // A reviewer can only use this deployment-provisioned dedicated CODEX_HOME. The
-        // ordinary ~/.codex tree is intentionally never repurposed as a blind-review
-        // credential scope because it can contain producer conversations.
+        // Optional private override. Unset, the packet reviewer reuses this user's own
+        // authenticated Codex home (`packetReviewerScope`), so no review needs a login.
         reviewerCodexHome: process.env["ACP_REVIEWER_CODEX_HOME"],
         reviewerEgress: this.config.reviewerEgress,
         binary: process.env["ACP_CODEX_BINARY"],

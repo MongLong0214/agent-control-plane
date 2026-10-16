@@ -928,6 +928,27 @@ export const resultRecoveryTriggerKind = (runId: string): string => `${RESULT_RE
 export const resultRecoveryTriggerId = (runId: string, bindingGeneration: number, planDigest: string): string =>
   `bootstrap-result-recovery:${runId}:${bindingGeneration}:${planDigest}`;
 
+/**
+ * The audit kind that records one bootstrap review retry wake: the run's current candidate, frozen
+ * from its current PLAN, whose latest blind review ended unavailable (`evidence.bindingGeneration`,
+ * `evidence.candidateSnapshotDigest`, `evidence.unavailableEventId`). Append only, as above.
+ */
+export const BOOTSTRAP_REVIEW_RETRY_WAKE = "BOOTSTRAP_REVIEW_RETRY_WAKE";
+
+const REVIEW_RETRY_KIND_PREFIX = "review retry: run ";
+
+/** The wake kind that tells a run's owner its submitted result's blind review was unavailable. */
+export const reviewRetryTriggerKind = (runId: string): string =>
+  `${REVIEW_RETRY_KIND_PREFIX}${runId} has a result whose blind review was unavailable`;
+
+/** The trigger id of one review retry wake, built from the unavailable review it answers. */
+export const reviewRetryTriggerId = (
+  runId: string,
+  bindingGeneration: number,
+  candidateSnapshotDigest: string,
+  unavailableEventId: number,
+): string => `bootstrap-review-retry:${runId}:${bindingGeneration}:${candidateSnapshotDigest}:${unavailableEventId}`;
+
 const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[]): string =>
   [
     `You are the ${binding.role}${binding.runId ? ` of run ${binding.runId}` : ""} in the agent control plane, at binding generation ${binding.bindingGeneration}.`,
@@ -945,6 +966,11 @@ const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[
     ...(triggers.some((trigger) => trigger.kind.startsWith(RESULT_RECOVERY_KIND_PREFIX))
       ? [
           `A wake for "${RESULT_RECOVERY_KIND_PREFIX}<runId> has a PLAN and no result" means that run's current PLAN was accepted and no result was submitted for it: for that run, ${RESULT_STEPS}. No message is left to acknowledge for it.`,
+        ]
+      : []),
+    ...(triggers.some((trigger) => trigger.kind.startsWith(REVIEW_RETRY_KIND_PREFIX))
+      ? [
+          `A wake for "${REVIEW_RETRY_KIND_PREFIX}<runId> has a result whose blind review was unavailable" means the blind review of that run's submitted result could not be constituted and can now be retried: for that run, even though its result was already submitted, ${RESULT_STEPS}. Its PLAN is unchanged: do not submit a new PLAN, since submitting the same result again reviews the same frozen candidate. No message is left to acknowledge for it.`,
         ]
       : []),
     "A HANDOFF_PACKAGE is accepted with mcp__acp-cto__handoff_ack for its handoffId before it is acknowledged.",

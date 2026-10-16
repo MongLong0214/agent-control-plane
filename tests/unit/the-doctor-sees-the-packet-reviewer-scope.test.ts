@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -56,16 +56,29 @@ const capsule = (parts: { claimed?: boolean; auth?: boolean }): string => {
 
 describe("the doctor sees the packet reviewer's scope", () => {
   const original = process.env["ACP_REVIEWER_CODEX_HOME"];
+  const originalHome = process.env["HOME"];
+  // With no override the reviewer's default is the user's own `~/.codex`, so every row runs as a
+  // fixture user whose home holds no Codex login unless the row gives it one.
+  let user = "";
 
-  beforeEach(() => { delete process.env["ACP_REVIEWER_CODEX_HOME"]; });
+  beforeEach(() => {
+    delete process.env["ACP_REVIEWER_CODEX_HOME"];
+    // Canonical: a capsule refuses any symlinked ancestor, and macOS temp paths start with one.
+    user = realpathSync(mkdtempSync(join(tmpdir(), "acp-doctor-scope-user-")));
+    process.env["HOME"] = user;
+  });
   afterEach(() => {
     if (original === undefined) delete process.env["ACP_REVIEWER_CODEX_HOME"];
     else process.env["ACP_REVIEWER_CODEX_HOME"] = original;
+    if (originalHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = originalHome;
+    rmSync(user, { recursive: true, force: true });
   });
 
   it("reports the state this deployment was actually in: configured nowhere", async () => {
     // The exact shape of #512's first run. Nothing pointed at a capsule, and the only surface that
-    // said so was a review failing 154 seconds in.
+    // said so was a review failing 154 seconds in. Since 2026-10-16 that also means the user's own
+    // Codex home holds no login.
     const findings = await scopeFindings(makeHarness());
 
     expect(findings).toHaveLength(1);
@@ -73,6 +86,15 @@ describe("the doctor sees the packet reviewer's scope", () => {
       state: "UNCONFIGURED",
       variable: "ACP_REVIEWER_CODEX_HOME",
     });
+  });
+
+  it("reports READY — nothing — when no override is set and the user's own Codex home is logged in", async () => {
+    const home = join(user, ".codex");
+    mkdirSync(home, { mode: 0o700 });
+    expect(await scopeFindings(makeHarness())).toHaveLength(1);
+    writeFileSync(join(home, "auth.json"), "not json — the doctor never opens it", { mode: 0o600 });
+
+    expect(await scopeFindings(makeHarness())).toEqual([]);
   });
 
   it("distinguishes a spent capsule from an unauthenticated one", async () => {

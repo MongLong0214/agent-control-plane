@@ -72,7 +72,7 @@ const makePlane = () => {
     allowTestEvidenceWriters: true,
     ctoPreference: { provider: "claude", model: "opus", effort: null },
     reviewer: {
-      preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
+      preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" },
       fallbacks: [],
     },
   });
@@ -139,7 +139,7 @@ const authenticatedTarget = () => {
 };
 
 const bindCeoSessionWithTarget = (plane: ReturnType<typeof makePlane>, attest = true) => {
-  const session = plane.cp.sessions.create({ provider: "gpt", model: "gpt-5.6-sol" });
+  const session = plane.cp.sessions.create({ provider: "gpt", model: "gpt-6.1-sol" });
   plane.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test");
   const bound = plane.cp.bindings.bind({
     roleKey: roleKeyFor(Role.CEO),
@@ -665,7 +665,7 @@ describe("completion requires a current continuity mode (§15.6)", () => {
 
 describe("failover produces a routable session (§15.7)", () => {
   const bindCeoSession = (plane: ReturnType<typeof makePlane>) => {
-    const session = plane.cp.sessions.create({ provider: "gpt", model: "gpt-5.6-sol" });
+    const session = plane.cp.sessions.create({ provider: "gpt", model: "gpt-6.1-sol" });
     plane.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test");
     const bound = plane.cp.bindings.bind({
       roleKey: roleKeyFor(Role.CEO),

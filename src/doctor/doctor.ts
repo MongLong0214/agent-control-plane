@@ -26,7 +26,7 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
-import { inspectReviewerCodexHome } from "../runtime/reviewer-codex-home.ts";
+import { defaultCodexHome, inspectReviewerCodexHome, packetReviewerScope } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 
@@ -1042,7 +1042,9 @@ export class Doctor {
   }
 
   /**
-   * Whether the packet reviewer has a private credential scope it could actually use.
+   * Whether the packet reviewer has a Codex home it could actually use: the optional private
+   * override's capsule, or — with no override — this user's own authenticated Codex home. Read
+   * through `packetReviewerScope`, the predicate the reviewer itself runs under.
    *
    * The blind-review gate needs one the moment a candidate reaches review, and until then nothing
    * says whether it exists. Measured on #512: `ACP_REVIEWER_CODEX_HOME` was set in neither the
@@ -1065,23 +1067,29 @@ export class Doctor {
   private checkPacketReviewerScope(): Finding[] {
     const findings: Finding[] = [];
     const action =
-      "provision a private reviewer CODEX_HOME, authenticate it, and point " +
-      "ACP_REVIEWER_CODEX_HOME at its `home` directory";
-    const configured = process.env["ACP_REVIEWER_CODEX_HOME"];
+      "log this user's Codex home in once (`codex login`), or provision a private reviewer CODEX_HOME, " +
+      "authenticate it, and point ACP_REVIEWER_CODEX_HOME at its `home` directory";
+    // The same predicate the Codex packet reviewer runs under (owner directive, 2026-10-16): no
+    // override and an authenticated default home is READY, and says nothing here.
+    const scope = packetReviewerScope(process.env["ACP_REVIEWER_CODEX_HOME"], defaultCodexHome());
+    if (scope.state === "DEFAULT") return findings;
 
-    if (!configured) {
+    if (scope.state === "UNCONFIGURED" || scope.state === "UNUSABLE") {
       findings.push({
         code: ReasonCode.PACKET_REVIEWER_SCOPE_UNAVAILABLE,
         severity: "ERROR",
         scope: "reviewer:packet",
         blocking: false,
         confidence: "HIGH",
-        observedEvidence: { state: "UNCONFIGURED", variable: "ACP_REVIEWER_CODEX_HOME" },
+        observedEvidence: scope.state === "UNCONFIGURED"
+          ? { state: "UNCONFIGURED", variable: "ACP_REVIEWER_CODEX_HOME", root: scope.root }
+          : { state: "UNUSABLE_DEFAULT_HOME", root: scope.root },
         recommendedAction: action,
       });
       return findings;
     }
 
+    const configured = scope.root;
     const inspected = inspectReviewerCodexHome(configured);
     // READY is the claim's own answer, not this method's opinion of it, and the credential's
     // freshness is not part of either: nothing here opens `auth.json`.

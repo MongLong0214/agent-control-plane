@@ -18,7 +18,15 @@ import type { Clock } from "../core/clock.ts";
 import { disposableWorkspaceLocation } from "../core/disposable-workspace-root.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
-import { assertReviewerCodexHome, claimReviewerCodexHome, type ReviewerCodexHome } from "./reviewer-codex-home.ts";
+import {
+  PacketReviewerScopeUnconfigured,
+  assertReviewerCodexHome,
+  claimReviewerCodexHome,
+  defaultCodexHome,
+  packetReviewerScope,
+  type PacketReviewerScope,
+  type ReviewerCodexHome,
+} from "./reviewer-codex-home.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import {
   ClaudeUsageCollector,
@@ -80,8 +88,16 @@ export interface CliAdapterOptions {
    * "Not logged in", and dispatch then fails SESSION_NOT_READY).
    */
   providerCredentialDir?: string;
-  /** Explicit independently provisioned, single-session private Codex home; never a shared store. */
+  /**
+   * Optional explicit override: an independently provisioned, single-session private Codex home
+   * (`ACP_REVIEWER_CODEX_HOME`). When set, its capsule rules apply and any fault refuses.
+   */
   reviewerCodexHome?: string;
+  /**
+   * The Codex home this adapter's provider identity lives in: its capacity probe reads it, and with
+   * no `reviewerCodexHome` override its packet reviewer reuses it. Defaults to `defaultCodexHome()`.
+   */
+  codexHome?: string;
   /** Dependency-injection seam for a real /usage collector; production supplies one below. */
   usageCollector?: UsageCollector;
   /** Observations beyond this lead are not valid freshness evidence. */
@@ -609,6 +625,12 @@ const productionRunCli = async (
     reviewerCredentialPaths?: readonly string[];
     /** Branded, identity-checked single-session home; never a caller-supplied write path. */
     reviewerPrivateHome?: ReviewerCodexHome;
+    /**
+     * The daemon user's own Codex home, reused across reviews with no claim. The reviewer profile
+     * reopens reading and writing in this one directory for the provider CLI; every other deny holds.
+     * Exclusive with `reviewerPrivateHome`.
+     */
+    reviewerSharedHome?: string;
     /** Provider config root used while HOME points at the packet directory. */
     reviewerConfigDirectory?: string;
     /** A provider-specific reviewer environment, constructed rather than inherited. */
@@ -662,8 +684,11 @@ const productionRunCli = async (
   };
   try {
     const workdir = realpathSync(options.cwd ?? scratch);
+    if (options.reviewerPrivateHome && options.reviewerSharedHome !== undefined) {
+      throw new Error("a packet reviewer runs under exactly one Codex home");
+    }
     if (options.isolation) {
-      assertReviewerIsolation(workdir, options.isolation, options.reviewerCredentialPaths ?? []);
+      assertReviewerIsolation(workdir, options.isolation, options.reviewerCredentialPaths ?? [], options.reviewerSharedHome);
       if (options.reviewerPrivateHome) assertReviewerCodexHome(options.reviewerPrivateHome);
     }
     const isolated = options.isolation !== undefined;
@@ -702,6 +727,7 @@ const productionRunCli = async (
           options.reviewerExecutablePaths ?? [],
           egress?.port,
           options.reviewerPrivateHome,
+          options.reviewerSharedHome,
         )
       : runtimeProfile(
           workdir,
@@ -733,6 +759,7 @@ const productionRunCli = async (
         options.timeoutMs,
         egress!,
         composedProfilePath,
+        options.reviewerSharedHome,
       );
       if (!isolation.enforced) {
         await abandonEgress();
@@ -1173,9 +1200,12 @@ const probeDeniedTranscriptPaths = async (
   timeoutMs: number,
   egress?: ReviewerEgressLease,
   composedProfilePath?: string,
+  /** A shared reviewer Codex home the profile reopens on purpose; it is not probed as a denial. */
+  reopenedHome?: string,
 ): Promise<IsolationProbe> => {
+  const reopened = reopenedHome === undefined ? undefined : resolvePath(reopenedHome);
   const paths = [...new Set([...denyReadPaths, ...reviewerTranscriptRoots()].map(resolvePath))]
-    .filter((path) => path && path !== packetRoot && !path.startsWith(`${packetRoot}/`));
+    .filter((path) => path && path !== packetRoot && !path.startsWith(`${packetRoot}/`) && path !== reopened);
   const existing: Array<{ path: string; kind: "directory" | "file" }> = [];
   for (const path of paths) {
     try {
@@ -1473,6 +1503,7 @@ const proveReviewerIsolation = async (
   timeoutMs: number,
   egress: ReviewerEgressLease,
   composedProfilePath: string | undefined,
+  sharedHome?: string,
 ): Promise<IsolationProbe> => {
   if (!reviewerToolContractPresent(args)) {
     return { enforced: false, reason: "reviewer no-tools CLI contract is incomplete" };
@@ -1498,6 +1529,7 @@ const proveReviewerIsolation = async (
     timeoutMs,
     egress,
     composedProfilePath,
+    sharedHome,
   );
   if (!transcripts.enforced) return transcripts;
   const tools = await probeNoTools(profile, cwd, environment, cwd, timeoutMs, egress, composedProfilePath);
@@ -1509,6 +1541,7 @@ const assertReviewerIsolation = (
   workdir: string,
   isolation: NonNullable<InvocationRequest["isolation"]>,
   credentialPaths: readonly string[],
+  sharedHome?: string,
 ): void => {
   if (isolation.emptyEnvironment !== true || isolation.network !== "provider-only" || isolation.tools !== "none") {
     throw new Error("reviewer isolation contract is incomplete");
@@ -1519,8 +1552,15 @@ const assertReviewerIsolation = (
   // A provider credential scope inside a normal conversation store would make the profile
   // choose between provider login and producer-history isolation. That is not a trade-off
   // the adapter may silently make: require a dedicated scope or fail the review closed.
+  //
+  // The one deliberate exception is the daemon user's own Codex home, named by the adapter as
+  // `sharedHome` when no private override is configured (owner directive, 2026-10-16). That
+  // reviewer is not history-isolated: the provider CLI can read the home's earlier sessions.
+  // Its independence is a fresh review session, the frozen candidate and role separation.
   const transcriptRoots = reviewerTranscriptRoots().map(resolvePath);
+  const reopened = sharedHome === undefined ? undefined : resolvePath(sharedHome);
   for (const credentialPath of credentialPaths.map(resolvePath)) {
+    if (credentialPath === reopened) continue;
     if (transcriptRoots.some((root) => credentialPath === root || credentialPath.startsWith(`${root}/`))) {
       throw new Error("reviewer credential scope overlaps a host transcript store");
     }
@@ -1634,10 +1674,10 @@ const claudeCredentialPaths = (configDirectory?: string): string[] => {
 };
 
 /**
- * Codex keeps its authenticated session state under CODEX_HOME. A packet reviewer is
- * allowed to use it only when the deployment supplied a dedicated reviewer-only root;
- * pointing it at ~/.codex would make prior producer transcripts readable by the provider
- * CLI before the model even receives its packet.
+ * Codex keeps its authenticated session state under CODEX_HOME. A packet reviewer runs under
+ * either the deployment's optional private override capsule, or — with no override — the daemon
+ * user's own Codex home, reused across reviews (`packetReviewerScope`). The second is not
+ * history-isolated: earlier sessions in that home are readable by the provider CLI.
  */
 const codexCredentialPaths = (configDirectory?: string): string[] =>
   configDirectory ? [configDirectory] : [];
@@ -1762,7 +1802,9 @@ const reviewerProfile = (
   additionalExecutables: readonly string[] = [],
   egressPort?: number,
   privateHome?: ReviewerCodexHome,
+  sharedHome?: string,
 ): string => {
+  if (privateHome && sharedHome !== undefined) throw new Error("a packet reviewer runs under exactly one Codex home");
   if (privateHome) {
     assertReviewerCodexHome(privateHome);
     const capsule = dirname(privateHome.root);
@@ -1837,6 +1879,25 @@ const reviewerProfile = (
   // `/tmp`. Carve it back out after that allowance: ACP evidence may not become reviewer-writable
   // merely because the two system roots coincide on one platform.
   lines.push(`(deny file-write* (subpath ${quote(resolvePath(disposableWorkspaceRoot))}))`);
+  if (sharedHome !== undefined) {
+    // Owner directive 2026-10-16: with no private override, the reviewer uses the daemon user's
+    // existing, already-authenticated Codex home, so no review needs a login. Codex reads and
+    // writes its home (auth refresh, thread files, logs), so that one directory is reopened for
+    // both, after the transcript-root deny that covers it — SBPL takes the last matching rule.
+    // Nothing else moves: the packet stays the only other writable root, every other read deny,
+    // the exec allow-list and the egress lines above are unchanged, and ACP itself never deletes,
+    // resets or copies anything in this home.
+    const root = resolvePath(sharedHome);
+    if (packetRoot === root || packetRoot.startsWith(`${root}/`) || root.startsWith(`${packetRoot}/`)) {
+      throw new Error("shared reviewer home overlaps packet");
+    }
+    lines.push(`(allow file-read* file-write* (subpath ${quote(root)}))`);
+    for (const ancestor of ancestorsOf(root)) lines.push(`(allow file-read-metadata (literal ${quote(ancestor)}))`);
+    // An explicit withheld input inside the home keeps its deny over the reopening.
+    for (const path of denyReadPaths.map(resolvePath)) {
+      if (path.startsWith(`${root}/`)) lines.push(`(deny file-read* file-write* (subpath ${quote(path)}))`);
+    }
+  }
   if (privateHome) {
     // Deny owner home and every sibling/capsule, then reopen only the selected root,
     // packet and exact native executable/runtime files. No global temp write grant.
@@ -2528,7 +2589,15 @@ const codexReviewerArgs = (
 };
 
 /**
- * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-5.6 Sol at xhigh
+ * The Codex home a constituted packet reviewer runs under: the optional private override's claimed
+ * capsule, or the daemon user's own home, shared and never claimed.
+ */
+type CodexReviewerHome =
+  | { readonly kind: "PRIVATE"; readonly root: string; readonly binding: ReviewerCodexHome }
+  | { readonly kind: "SHARED"; readonly root: string };
+
+/**
+ * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-6.1 Sol at xhigh
  * effort, §18.1) and for mechanical worker tasks.
  */
 export class CodexCliAdapter implements ProviderAdapter {
@@ -2538,10 +2607,10 @@ export class CodexCliAdapter implements ProviderAdapter {
   readonly requiresReviewerProviderSessionProof = true;
   readonly supportsReviewerEffortAttestation = true;
   readonly defaultModels = {
-    reviewer: "gpt-5.6-sol",
-    ceo: "gpt-5.6-sol",
+    reviewer: "gpt-6.1-sol",
+    ceo: "gpt-6.1-sol",
     worker: "gpt-5.6-luna-max",
-    cto: "gpt-5.6-sol",
+    cto: "gpt-6.1-sol",
   } as const;
 
   readonly #binary: string;
@@ -2555,8 +2624,9 @@ export class CodexCliAdapter implements ProviderAdapter {
   readonly #reviewerEgress: ReviewerEgressConfig | undefined;
   readonly #managedWriteBroker: ManagedInvocationWriteBroker | undefined;
   readonly #reviewerCodexHome: string | undefined;
+  readonly #codexHome: string;
   readonly #reviewerSessions = new Map<string, {
-    home: ReviewerCodexHome;
+    home: CodexReviewerHome;
     busy: boolean;
     workdir: string;
     model: string;
@@ -2593,10 +2663,53 @@ export class CodexCliAdapter implements ProviderAdapter {
     // Session isolation is untouched: `runtimeEnvironment` and the seatbelt profile still
     // receive it, and no profile deny is relaxed.
     this.#reviewerCodexHome = options.reviewerCodexHome;
+    // One home for this account, handed to the capacity probe explicitly so the quota it reads and
+    // the identity a default-home reviewer runs under cannot drift apart.
+    this.#codexHome = options.codexHome ?? defaultCodexHome();
     this.#usageCollector = options.usageCollector ?? new CodexUsageCollector({
       clock: this.#clock,
       binary: this.#binary,
+      codexHome: this.#codexHome,
     });
+  }
+
+  /**
+   * The packet reviewer's Codex home as the shared predicate reads it — the same rule the doctor's
+   * `checkPacketReviewerScope` reports, evaluated for this adapter's override and default home.
+   */
+  packetReviewerScope(): PacketReviewerScope {
+    return packetReviewerScope(this.#reviewerCodexHome, this.#codexHome);
+  }
+
+  /**
+   * Selects the home a new packet reviewer runs under. An override follows the capsule rules and
+   * any fault refuses; it never falls back to the default home. Only `UNCONFIGURED` throws
+   * `PacketReviewerScopeUnconfigured`, the one refusal the blind-review gate may route around.
+   */
+  private reviewerHome(): CodexReviewerHome {
+    const scope = this.packetReviewerScope();
+    if (scope.state === "OVERRIDE") {
+      try {
+        const binding = claimReviewerCodexHome(scope.root);
+        return { kind: "PRIVATE", root: binding.root, binding };
+      } catch {
+        throw new ProviderSessionProvisionError(ReasonCode.ISOLATION_LOST, "invalid or already claimed private reviewer CODEX_HOME");
+      }
+    }
+    if (scope.state === "UNCONFIGURED") throw new PacketReviewerScopeUnconfigured();
+    if (scope.state === "UNUSABLE") {
+      throw new ProviderSessionProvisionError(ReasonCode.ISOLATION_LOST, "the Codex home is present but is not usable as a reviewer home");
+    }
+    return { kind: "SHARED", root: realpathSync(scope.root) };
+  }
+
+  /** The runCli options that put a reviewer process under its home. */
+  private reviewerHomeOptions(home: CodexReviewerHome, workdir: string) {
+    return {
+      reviewerCredentialPaths: codexCredentialPaths(home.root),
+      ...(home.kind === "PRIVATE" ? { reviewerPrivateHome: home.binding } : { reviewerSharedHome: home.root }),
+      reviewerEnvironment: codexReviewerEnvironment(workdir, home.root),
+    };
   }
 
   /**
@@ -2623,9 +2736,9 @@ export class CodexCliAdapter implements ProviderAdapter {
   }
 
   async stopSession(handle: SessionHandle): Promise<void> {
-    // The dedicated credential root is deployment-owned and may contain the provider's
-    // auth state. Only forget the one freshly constituted reviewer id; the review gate
-    // removes its packet root in its own finally block.
+    // Either home — the override's capsule or the user's own Codex home — holds the provider's
+    // auth state and is never removed or reset here. Only forget the one freshly constituted
+    // reviewer id; the review gate removes its packet root in its own finally block.
     this.#reviewerSessions.delete(handle.externalSessionId);
   }
 
@@ -2749,17 +2862,7 @@ export class CodexCliAdapter implements ProviderAdapter {
    * The answer turn then uses `exec resume <thread_id>` under the same profile.
    */
   private async startPacketReviewerSession(spec: SessionSpec): Promise<SessionHandle> {
-    if (!this.#reviewerCodexHome) {
-      throw new ProviderSessionProvisionError(
-        ReasonCode.ISOLATION_LOST,
-        "Codex packet reviewer requires a dedicated private CODEX_HOME credential scope",
-      );
-    }
-    let home: ReviewerCodexHome;
-    try { home = claimReviewerCodexHome(this.#reviewerCodexHome); } catch {
-      throw new ProviderSessionProvisionError(ReasonCode.ISOLATION_LOST, "invalid or already claimed private reviewer CODEX_HOME");
-    }
-    const credentialPaths = codexCredentialPaths(home.root);
+    const home = this.reviewerHome();
     const args = codexReviewerArgs("bootstrap", spec.model, spec.effort);
     const nativeBinary = codexReviewerExecutables(this.#binary).at(-1)!;
     const result = await runCli(nativeBinary, args, {
@@ -2767,9 +2870,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       timeoutMs: 60_000,
       stdin: "This is a packet-only reviewer session identity handshake. Reply exactly READY and do not use tools.",
       isolation: spec.isolation,
-      reviewerCredentialPaths: credentialPaths,
-      reviewerPrivateHome: home,
-      reviewerEnvironment: codexReviewerEnvironment(spec.workdir, home.root),
+      ...this.reviewerHomeOptions(home, spec.workdir),
       reviewerExecutablePaths: codexReviewerExecutables(this.#binary),
       reviewerEgress: this.#reviewerEgress,
       reviewerProvider: this.provider,
@@ -2841,8 +2942,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       constituted.busy ||
       constituted.workdir !== request.workdir ||
       constituted.model !== model ||
-      constituted.effort !== (request.effort ?? null) ||
-      !this.#reviewerCodexHome
+      constituted.effort !== (request.effort ?? null)
     ) {
       return refusedInvocation(
         request,
@@ -2853,8 +2953,10 @@ export class CodexCliAdapter implements ProviderAdapter {
       );
     }
 
-    try { assertReviewerCodexHome(constituted.home); } catch {
-      return refusedInvocation(request, this.provider, model, started, "private reviewer home identity changed");
+    if (constituted.home.kind === "PRIVATE") {
+      try { assertReviewerCodexHome(constituted.home.binding); } catch {
+        return refusedInvocation(request, this.provider, model, started, "private reviewer home identity changed");
+      }
     }
     constituted.busy = true;
     const args = codexReviewerArgs("resume", model, request.effort, expectedSessionId);
@@ -2864,9 +2966,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       timeoutMs: request.timeoutMs,
       stdin: request.systemPrompt ? `${request.systemPrompt}\n\n---\n\n${request.prompt}` : request.prompt,
       isolation: request.isolation,
-      reviewerCredentialPaths: codexCredentialPaths(constituted.home.root),
-      reviewerPrivateHome: constituted.home,
-      reviewerEnvironment: codexReviewerEnvironment(request.workdir, constituted.home.root),
+      ...this.reviewerHomeOptions(constituted.home, request.workdir),
       reviewerExecutablePaths: codexReviewerExecutables(this.#binary),
       reviewerEgress: this.#reviewerEgress,
       reviewerProvider: this.provider,
