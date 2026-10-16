@@ -8,8 +8,12 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import { ClaudeCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
-import type { ReviewerEgressConfig } from "../../src/runtime/provider.ts";
-import { acquireReviewerEgress } from "../../src/runtime/reviewer-egress.ts";
+import {
+  REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS,
+  REVIEWER_PROVIDER_ENDPOINTS,
+  type ReviewerEgressConfig,
+} from "../../src/runtime/provider.ts";
+import { acquireReviewerEgress, type EgressProbes } from "../../src/runtime/reviewer-egress.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { requireSeatbelt } from "../helpers/seatbelt.ts";
 
@@ -88,6 +92,7 @@ PERMIT_NONALLOWLISTED = __PERMIT_NONALLOWLISTED__
 DENY_INVALID = __DENY_INVALID__
 START_DIGEST_MODE = "__START_DIGEST_MODE__"
 EMIT_UNEXPECTED_ALLOW = __EMIT_UNEXPECTED_ALLOW__
+EMIT_ALLOW_HOSTS = __EMIT_ALLOW_HOSTS__
 
 def allowed_hosts():
     with open(ALLOW, encoding="utf-8") as source:
@@ -140,6 +145,8 @@ if START_DIGEST_MODE == "wrong":
 log({"t": time.time(), "verdict": "START", "port": PORT, "pid": os.getpid(), "allowlistDigest": allowlist_digest})
 if EMIT_UNEXPECTED_ALLOW:
     log({"t": time.time(), "verdict": "ALLOW", "host": "unexpected.example.com", "port": "443"})
+for emitted_host in EMIT_ALLOW_HOSTS:
+    log({"t": time.time(), "verdict": "ALLOW", "host": emitted_host, "port": "443"})
 while True:
     try:
         connection, _ = server.accept()
@@ -163,6 +170,7 @@ const makeFixture = async (
     denyInvalid = false,
     startDigestMode = "correct",
     emitUnexpectedAllow = false,
+    emitAllowHosts = [],
   }: {
     permitNonAllowlisted?: boolean;
     /** Models the reported open proxy: every real name is allowed, only .invalid is denied. */
@@ -171,6 +179,8 @@ const makeFixture = async (
     startDigestMode?: "correct" | "wrong";
     /** Ensures runtime evidence validation rejects a proxy's unrelated successful CONNECT. */
     emitUnexpectedAllow?: boolean;
+    /** ALLOW records the proxy logs at start, as a reviewer's own CONNECTs would leave them. */
+    emitAllowHosts?: readonly string[];
   } = {},
 ): Promise<EgressFixture> => {
   const root = tempDir("acp-reviewer-egress-");
@@ -190,7 +200,8 @@ const makeFixture = async (
     .replace("__PERMIT_NONALLOWLISTED__", permitNonAllowlisted ? "True" : "False")
     .replace("__DENY_INVALID__", denyInvalid ? "True" : "False")
     .replace("__START_DIGEST_MODE__", startDigestMode)
-    .replace("__EMIT_UNEXPECTED_ALLOW__", emitUnexpectedAllow ? "True" : "False"), { mode: 0o700 });
+    .replace("__EMIT_UNEXPECTED_ALLOW__", emitUnexpectedAllow ? "True" : "False")
+    .replace("__EMIT_ALLOW_HOSTS__", JSON.stringify(emitAllowHosts)), { mode: 0o700 });
   chmodSync(proxyPath, 0o700);
   writeFileSync(
     binary,
@@ -493,6 +504,100 @@ while True:
     })).rejects.toMatchObject({ failureCode: "REVIEWER_EGRESS_LOG_CREDENTIAL_BEARING" });
     // Removing the pre-persistence credential scan lets this raw token-shaped JSONL pass
     // into evidence, so this refusal is deliberately before record construction.
+  });
+});
+
+/**
+ * A ChatGPT-authenticated Codex reviewer never calls api.openai.com: through the shipped
+ * proxy it CONNECTs to chatgpt.com and ab.chatgpt.com, and refreshes its token at
+ * auth.openai.com. With only the API host compiled in, the model was unreachable and a
+ * live review failed BLIND_REVIEW_UNAVAILABLE. finalise accepts an ALLOW only for an exact
+ * generated endpoint, so every host has to be named; a subdomain does not inherit.
+ */
+describe("gpt reviewer egress covers ChatGPT-authenticated Codex", () => {
+  const GPT_ENDPOINTS = ["api.openai.com", "chatgpt.com", "ab.chatgpt.com", "auth.openai.com"];
+
+  /** The compiled endpoint policy, as production uses it: no deployment override. */
+  const compiledPolicy = ({ providerEndpoints: _override, ...config }: ReviewerEgressConfig): ReviewerEgressConfig =>
+    config;
+
+  const blockedDirect = (host: string): EgressProbes["directSocket"] => [
+    { host, proxyMode: "unset", connected: false, blocked: true, errorCode: "EPERM" },
+    { host, proxyMode: "override", connected: false, blocked: true, errorCode: "EPERM" },
+  ];
+
+  it("generates the gpt allowlist with exactly the API-key and ChatGPT hosts", async () => {
+    const fixture = await makeFixture();
+    const lease = await acquireReviewerEgress(compiledPolicy(fixture.config), "gpt");
+    try {
+      expect(lease.allowedEndpoints).toEqual(GPT_ENDPOINTS);
+      // The fake proxy reads the generated allowlist.txt, so these measure the file itself.
+      for (const host of GPT_ENDPOINTS) expect(await proxyStatus(lease.port, host), host).toBe(200);
+      expect(await proxyStatus(lease.port, "api.anthropic.com")).toBe(403);
+    } finally {
+      await lease.abandon();
+    }
+  });
+
+  it("finalises a proxy log that ALLOWs chatgpt.com and ab.chatgpt.com as valid gpt evidence", async () => {
+    const fixture = await makeFixture({ emitAllowHosts: ["chatgpt.com", "ab.chatgpt.com"] });
+    const lease = await acquireReviewerEgress(compiledPolicy(fixture.config), "gpt");
+    let probed = false;
+    try {
+      expect(await proxyStatus(lease.port, "api.openai.com")).toBe(200);
+      expect(await proxyStatus(lease.port, "api.anthropic.com")).toBe(403);
+      probed = true;
+    } finally {
+      if (!probed) await lease.abandon();
+    }
+    // Before the fix this rejects: "proxy JSONL records an ALLOW outside the generated allowlist".
+    const record = await lease.finalise("reviewer-invocation", {
+      allowedEndpoint: { host: "api.openai.com", connected: true, statusCode: 200 },
+      deniedEndpoint: { host: "api.anthropic.com", denied: true, statusCode: 403 },
+      directSocket: blockedDirect("api.openai.com"),
+    });
+    expect(record.allowedEndpoints).toEqual(GPT_ENDPOINTS);
+    expect(record.allowlistDigest).toBe(sha256(`${GPT_ENDPOINTS.join("\n")}\n`));
+    expect(record.jsonl).toContain('"host": "chatgpt.com"');
+    expect(record.jsonl).toContain('"host": "ab.chatgpt.com"');
+  });
+
+  liveIt("still selects and proves a real deny probe outside the gpt allowlist", async () => {
+    const fixture = await makeFixture();
+    const lease = await acquireReviewerEgress(compiledPolicy(fixture.config), "gpt");
+    let probes: EgressProbes | undefined;
+    try {
+      const composedProfilePath = join(fixture.packetRoot, "reviewer-composed.sb");
+      const inner = "(version 1)\n(allow default)";
+      writeFileSync(composedProfilePath, __testing.composeReviewerProfile(lease.profileText, inner), { mode: 0o600 });
+      const result = await __testing.probeProviderOnlyNetwork(inner, fixture.packetRoot, {}, 15_000, lease, composedProfilePath);
+      expect(result).toMatchObject({ enforced: true });
+      probes = result.enforced ? result.egressProbes : undefined;
+      expect(probes).toBeDefined();
+    } finally {
+      if (!probes) await lease.abandon();
+    }
+    if (!probes) throw new Error("the gpt provider-only probe returned no egress probes");
+    const deniedHost = probes.deniedEndpoint.host;
+    expect(GPT_ENDPOINTS).not.toContain(deniedHost);
+    expect(REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS).toContain(deniedHost);
+    expect(probes.deniedEndpoint).toMatchObject({ denied: true, statusCode: 403 });
+    const record = await lease.finalise("reviewer-invocation", probes);
+    expect(record.jsonl).toContain(`"verdict": "DENY", "host": "${deniedHost}"`);
+  }, 60_000);
+
+  it("leaves the claude and grok allowlists unchanged", async () => {
+    expect(REVIEWER_PROVIDER_ENDPOINTS["claude"]).toEqual(["api.anthropic.com"]);
+    expect(REVIEWER_PROVIDER_ENDPOINTS["grok"]).toEqual(["api.x.ai"]);
+    const fixture = await makeFixture();
+    for (const [provider, endpoints] of [["claude", ["api.anthropic.com"]], ["grok", ["api.x.ai"]]] as const) {
+      const lease = await acquireReviewerEgress(compiledPolicy(fixture.config), provider);
+      try {
+        expect(lease.allowedEndpoints, provider).toEqual(endpoints);
+      } finally {
+        await lease.abandon();
+      }
+    }
   });
 });
 

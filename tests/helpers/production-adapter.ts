@@ -63,14 +63,17 @@ export class TestProductionAdapter extends ScriptedAdapter {
  * adapters may never use this: they must populate the same shape from a live proxy lease.
  */
 export const testReviewerEgressEvidence = (provider: string): ReviewerEgressRecord[] => {
-  const allowedHost = REVIEWER_PROVIDER_ENDPOINTS[provider]?.[0] ??
+  const policy = REVIEWER_PROVIDER_ENDPOINTS[provider];
+  const allowedHost = policy?.[0] ??
     `${provider.replace(/[^a-z0-9-]/gi, "").toLowerCase() || "reviewer"}.provider.test`;
+  // The durable record must name the provider's whole compiled allowlist, not its first host.
+  const allowedEndpoints = policy && policy.length > 0 ? [...policy] : [allowedHost];
   const deniedHost = allowedHost === "api.openai.com" ? "api.anthropic.com" : "api.openai.com";
   const port = 18_443;
-  const allowlistDigest = sha256(`${allowedHost}\n`);
+  const allowlistDigest = sha256(`${allowedEndpoints.join("\n")}\n`);
   return [{
     provider,
-    allowedEndpoints: [allowedHost],
+    allowedEndpoints,
     allowlistDigest,
     proxyPort: port,
     phase: "reviewer-invocation",

@@ -9,9 +9,9 @@ measured egress lease is refused with `ISOLATION_LOST`.
 The daemon's endpoint policy lives in
 [`src/runtime/provider.ts`](../src/runtime/provider.ts) as `REVIEWER_PROVIDER_ENDPOINTS`:
 
-| Provider | Default reviewer endpoint |
+| Provider | Default reviewer endpoints |
 | --- | --- |
-| `gpt` | `api.openai.com` |
+| `gpt` | `api.openai.com`, `chatgpt.com`, `ab.chatgpt.com`, `auth.openai.com` |
 | `claude` | `api.anthropic.com` |
 | `grok` | `api.x.ai` |
 

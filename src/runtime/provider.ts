@@ -113,7 +113,10 @@ export type ProviderId = (typeof ProviderId)[keyof typeof ProviderId];
  * but an omitted provider never falls through to another provider's hosts.
  */
 export const REVIEWER_PROVIDER_ENDPOINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  gpt: Object.freeze(["api.openai.com"]),
+  // api.openai.com serves API-key Codex. A ChatGPT-authenticated Codex reaches the model only
+  // through chatgpt.com and ab.chatgpt.com and refreshes its token at auth.openai.com. An ALLOW
+  // is valid only for an exact generated endpoint, so the subdomain is named, not inherited.
+  gpt: Object.freeze(["api.openai.com", "chatgpt.com", "ab.chatgpt.com", "auth.openai.com"]),
   claude: Object.freeze(["api.anthropic.com"]),
   grok: Object.freeze(["api.x.ai"]),
 });
