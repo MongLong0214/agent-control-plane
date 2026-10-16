@@ -282,15 +282,20 @@ const VERDICT_SCHEMA_PROMPT: readonly string[] = [
 ];
 
 /**
- * What an answer the parser refused leaves in a deny's evidence: a fixed marker, its digest and its
- * length, never its text. That evidence reaches the BLIND_REVIEW_UNAVAILABLE audit row, where a
- * free-form string under an unlisted key makes the allowlist refuse the whole evidence, the
- * candidate digest the official retry matches on included.
+ * Free-form provider text (an answer, stderr, an adapter error) as review evidence: its digest and
+ * length under `<name>Digest` / `<name>Length`, never the text. A denial's evidence is returned to
+ * the run's owner and summarised into the BLIND_REVIEW_UNAVAILABLE audit row, and provider text is
+ * not evidence the control plane stores.
  */
-const unparsableAnswerEvidence = (text: string): { problem: string; answerDigest: string; answerLength: number } => ({
+const textDigestEvidence = (name: string, text: string | null | undefined): Record<string, string | number | null> => ({
+  [`${name}Digest`]: text == null ? null : sha256(text),
+  [`${name}Length`]: text?.length ?? 0,
+});
+
+/** An answer the parser refused: a fixed marker, the answer's digest and its length. */
+const unparsableAnswerEvidence = (text: string): Record<string, string | number | null> => ({
   problem: "VERDICT_UNPARSABLE",
-  answerDigest: sha256(text),
-  answerLength: text.length,
+  ...textDigestEvidence("answer", text),
 });
 
 /** Diff size above which a single reviewer context is not trusted to hold everything. */
@@ -1135,12 +1140,10 @@ export class BlindReviewGate {
       packetRoot: reviewer.workdir,
       isolationAttested: result.isolationAttested,
       isolationReasonCode: result.isolationReasonCode ?? null,
-      // Which probe refused, not merely that one did. proveReviewerIsolation names the failing
-      // probe and runCli puts that text in `error`; this deny recorded only the code, so every
-      // failure read identically as ISOLATION_LOST. A fail-closed path that cannot say why is
-      // expensive in exactly the way #419 has been — the boundary was working and the reason it
-      // refused was unreadable from the evidence it left behind.
-      isolationDetail: result.error ?? null,
+      // Which probe refused, not merely that one did (#419), as a digest: proveReviewerIsolation
+      // names the failing probe in `error`, but an adapter fills the same field from provider
+      // stderr, which is never stored. The digest still tells two refusals apart.
+      ...textDigestEvidence("isolationDetail", result.error),
     });
   }
 
@@ -1170,7 +1173,7 @@ export class BlindReviewGate {
         runId: request.runId,
         provider: reviewer.preference.provider,
         exitCode: result.exitCode,
-        error: result.error,
+        ...textDigestEvidence("error", result.error),
       });
     }
 
@@ -1281,11 +1284,27 @@ export class BlindReviewGate {
         generation: reviewer.generation,
         provider: reviewer.preference.provider,
       });
-      const parsed = result.ok ? parseVerdict(result.json ?? result.text) : null;
+      // A chunk that did not answer, or answered in no verdict shape, is missing evidence, as for a
+      // single or final reviewer. Folding it into omissions made the reducer return REVISE: a
+      // provider failure or a malformed answer became a verdict the run's owner was asked to fix.
+      // Omissions a valid chunk verdict reports are still omissions.
+      if (!result.ok) {
+        return deny(ReasonCode.EVIDENCE_MISSING, "chunk reviewer invocation did not complete", {
+          runId: request.runId,
+          provider: reviewer.preference.provider,
+          chunk: index + 1,
+          exitCode: result.exitCode,
+          ...textDigestEvidence("error", result.error),
+        });
+      }
+      const parsed = parseVerdict(result.json ?? result.text);
       if (!parsed) {
-        // A chunk that did not produce a usable verdict is an omission, not a pass.
-        omitted.push(...chunk.flatMap((c) => c.files.map((f) => `${c.identity}:${f}`)));
-        continue;
+        return deny(ReasonCode.EVIDENCE_MISSING, "chunk reviewer did not return a parsable verdict", {
+          runId: request.runId,
+          provider: reviewer.preference.provider,
+          chunk: index + 1,
+          ...unparsableAnswerEvidence(result.text),
+        });
       }
       const chunkCoverage = validateChunkCoverage(parsed.coveredFiles, chunk);
       if (!chunkCoverage.allowed) return chunkCoverage as Decision<ReviewOutcome>;
@@ -1350,7 +1369,7 @@ export class BlindReviewGate {
       return deny(ReasonCode.EVIDENCE_MISSING, "final chunked reviewer did not complete", {
         runId: request.runId,
         exitCode: finalResult.exitCode,
-        error: finalResult.error,
+        ...textDigestEvidence("error", finalResult.error),
       });
     }
     const finalVerdict = parseVerdict(finalResult.json ?? finalResult.text);

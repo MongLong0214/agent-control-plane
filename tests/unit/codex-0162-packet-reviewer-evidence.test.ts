@@ -15,7 +15,7 @@ import { BOOTSTRAP_REVIEW_RETRY_WAKE } from "../../src/runtime/provisioned-sessi
 import { provisionReviewerCodexHome } from "../../src/runtime/reviewer-codex-home.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { bootstrapCoverageKeys } from "../helpers/bootstrap-plan.ts";
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import {
   applyPassingChange,
   bindCeo,
@@ -79,31 +79,45 @@ const standardRevise = (coveredFiles: string[], repository: string, path: string
 /** The finding shape the packet reviewer is told to answer in: the gate's one verdict schema, rendered. */
 const renderedSchema = (): string => JSON.stringify(reviewTesting.VERDICT_SCHEMA, null, 2);
 
+/** Synthetic provider stderr, longer than the audit's 200-character bound for an unlisted field. */
+const STDERR_MARKER = `synthetic-provider-diagnostic ${"q".repeat(400)}`;
+
 /**
  * runCli at the spawn boundary. A handshake answers READY under a fresh thread id; each resume
- * answers the next queued answer (the last one repeats) under the thread it resumes.
+ * answers the next queued answer (the last one repeats; a function is asked with the prompt) under
+ * the thread it resumes, with the given exit, stderr and isolation result.
  */
-const stubProvider = (answers: Array<string | (() => string)>) => {
+const stubProvider = (
+  answers: Array<string | ((prompt: string) => string)>,
+  resumed: { exitCode?: number; stderr?: string; isolationEnforced?: boolean } = {},
+) => {
   const prompts: string[] = [];
   let threads = 0;
   __testing.setRunCli(async (_file, args, options) => {
     const resume = args.includes("resume");
-    if (resume) prompts.push(String(options.stdin ?? ""));
+    const prompt = String(options.stdin ?? "");
+    if (resume) prompts.push(prompt);
     const next = resume ? (answers.length > 1 ? answers.shift()! : answers[0]!) : "READY";
     return {
       stdout: resume
-        ? codexStdout(String(args.at(-2)), typeof next === "function" ? next() : next)
+        ? codexStdout(String(args.at(-2)), typeof next === "function" ? next(prompt) : next)
         // The reviewer session id is taken from the thread id's leading digits, so those differ.
         : codexStdout(`01a1448e-${String(++threads).padStart(4, "0")}-7000-8000-000000000000`, "READY"),
-      stderr: "",
-      exitCode: 0,
+      stderr: resume ? resumed.stderr ?? "" : "",
+      exitCode: resume ? resumed.exitCode ?? 0 : 0,
       timedOut: false,
-      isolationEnforced: true,
+      isolationEnforced: resume ? resumed.isolationEnforced ?? true : true,
       egressEvidence: testReviewerEgressEvidence("gpt"),
     };
   });
   return { prompts };
 };
+
+/** Every durable table whose rows contain `marker`. */
+const durableTablesContaining = (harness: Harness, marker: string): string[] =>
+  harness.cp.db.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table'`)
+    .map(({ name }) => name)
+    .filter((name) => harness.cp.db.all(`SELECT * FROM "${name}"`).some((row) => JSON.stringify(row).includes(marker)));
 
 /** A real CodexCliAdapter for the reviewer's session and invocation; the scripted base keeps capacity. */
 class CodexPacketReviewer extends TestProductionAdapter {
@@ -134,22 +148,31 @@ const CONTRACT: TaskContract = {
   references: [],
 };
 
-const setup = (): { harness: Harness; reviewer: CodexPacketReviewer } => {
+/** An authenticated default Codex home: shared by every reviewer session and never claimed, as live. */
+const sharedCodexHome = (): string => {
+  const home = join(tempDir("acp-codex-0162-user-"), ".codex");
+  mkdirSync(home, { mode: 0o700 });
+  writeFileSync(join(home, "auth.json"), '{"synthetic":"placeholder"}', { mode: 0o600 });
+  return home;
+};
+
+/** A private override home is claimed once; a chunked review needs a session per chunk, so it shares. */
+const setup = (options: { shared?: boolean } = {}): { harness: Harness; reviewer: CodexPacketReviewer } => {
   const harness = makeHarness({ reviewer: { preferred: { provider: "gpt", model: "gpt-6.1-sol", effort: "xhigh" }, fallbacks: [] } });
-  const root = provisionReviewerCodexHome();
-  homes.push(root);
+  const root = options.shared ? null : provisionReviewerCodexHome();
+  if (root) homes.push(root);
   const real = new CodexCliAdapter({
     clock: new ManualClock("2026-10-16T11:40:00.000Z"),
     capacityFile: join(tempDir("acp-codex-0162-"), "gpt.json"),
     binary: join(tempDir("acp-codex-0162-bin-"), "codex-stub"),
-    reviewerCodexHome: root,
+    ...(root ? { reviewerCodexHome: root } : { codexHome: sharedCodexHome() }),
   });
   const reviewer = new CodexPacketReviewer(harness.clock, real);
   harness.cp.providers.registerForRole(reviewer, Role.BLIND_REVIEWER);
   return { harness, reviewer };
 };
 
-const submit = async (harness: Harness) => {
+const submit = async (harness: Harness, options: { large?: boolean } = {}) => {
   const { projectId, repositoryId } = await registerFixtureProject(harness);
   bindCeo(harness);
   const created = harness.cp.runs.create({
@@ -176,7 +199,12 @@ const submit = async (harness: Harness) => {
     repositoryId,
   });
   if (!execution.allowed) throw new Error(execution.message);
-  const head = applyPassingChange(harness.repoPath);
+  let head = applyPassingChange(harness.repoPath);
+  if (options.large) {
+    // Over the single-context budget, so the gate reviews it in chunks.
+    writeFiles(harness.repoPath, { "src/app.js": `module.exports = () => 2;\n// ${"x".repeat(130_000)}\n` });
+    head = commitAll(harness.repoPath, "large reviewed change");
+  }
   harness.cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: `sha256:${head}` });
   const outcome = await harness.cp.pipeline.submitResult({
     runId,
@@ -254,6 +282,46 @@ describe("a codex-cli 0.162 packet review through the real candidate gate", () =
     }
   });
 
+  it("refuses an off-schema chunk answer as bounded EVIDENCE_MISSING, never as a REVISE from its omissions", async () => {
+    const { harness } = setup({ shared: true });
+    try {
+      const answer = offSchemaAnswer(["github:acme/fixture:src/app.js"]);
+      const { prompts } = stubProvider([(prompt) => (/# Final review/.test(prompt)
+        ? JSON.stringify({ verdict: "PASS", coveredFiles: [], omittedItems: [], findings: [] })
+        : answer)]);
+      const { runId, outcome } = await submit(harness, { large: true });
+      expect(prompts[0]).toMatch(/# Review chunk 1 of /);
+      expect(outcome).toMatchObject({ allowed: true, value: { stage: "REVIEW_UNAVAILABLE", reasonCode: ReasonCode.EVIDENCE_MISSING } });
+      const frozen = (outcome as { value: { snapshotDigest: string } }).value.snapshotDigest;
+      expect(harness.cp.artifacts.latest(runId, ArtifactKind.BLIND_REVIEW)).toBeNull();
+      expect(harness.cp.audit.byKind("REVISION_RETURNED_TO_CTO").filter((row) => row.runId === runId)).toEqual([]);
+      const rows = unavailableRows(harness, runId);
+      expect(rows).toHaveLength(1);
+      expectBoundedUnavailable(rows[0], frozen, answer);
+      expect(rows[0]!.evidence).toMatchObject({ problem: "VERDICT_UNPARSABLE", chunk: 1 });
+    } finally {
+      harness.cp.close();
+    }
+  });
+
+  it("stores no provider stderr when an attested reviewer exits nonzero", async () => {
+    const { harness } = setup();
+    try {
+      stubProvider([standardRevise(["github:acme/fixture:src/app.js"], "github:acme/fixture", "src/app.js")], { exitCode: 1, stderr: STDERR_MARKER });
+      const { runId, outcome } = await submit(harness);
+      expect(outcome).toMatchObject({ allowed: true, value: { stage: "REVIEW_UNAVAILABLE", reasonCode: ReasonCode.EVIDENCE_MISSING } });
+      const frozen = (outcome as { value: { snapshotDigest: string } }).value.snapshotDigest;
+      const rows = unavailableRows(harness, runId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.evidence).toMatchObject({ candidateSnapshotDigest: frozen, exitCode: 1, errorDigest: expect.stringMatching(/^sha256:/) });
+      expect(rows[0]!.evidence["errorLength"]).toBeGreaterThan(200);
+      expect(JSON.stringify(outcome)).not.toContain(STDERR_MARKER);
+      expect(durableTablesContaining(harness, STDERR_MARKER)).toEqual([]);
+    } finally {
+      harness.cp.close();
+    }
+  });
+
   it("still refuses a reviewer invocation whose effort differs from the constituted session", async () => {
     const root = provisionReviewerCodexHome();
     homes.push(root);
@@ -295,14 +363,11 @@ describe("an off-schema bootstrap PLAN review keeps its candidate, so the offici
   const harnessOptions = { reviewer: REVIEWER };
 
   const routeToCodex = (f: BootstrapRuntimeFixture) => {
-    const home = join(tempDir("acp-codex-0162-user-"), ".codex");
-    mkdirSync(home, { mode: 0o700 });
-    writeFileSync(join(home, "auth.json"), '{"synthetic":"placeholder"}', { mode: 0o600 });
     const codex = new CodexCliAdapter({
       clock: new ManualClock("2026-10-16T11:40:00.000Z"),
       capacityFile: join(tempDir("acp-codex-0162-capacity-"), "gpt.json"),
       binary: process.execPath,
-      codexHome: home,
+      codexHome: sharedCodexHome(),
     });
     f.harness.cp.review.attach({ packetReviewerScope: (provider) => provider === "gpt" ? codex.packetReviewerScope() : null });
     const start = f.gpt.startSession.bind(f.gpt);
@@ -385,6 +450,36 @@ describe("an off-schema bootstrap PLAN review keeps its candidate, so the offici
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
       expect(reviewer.reviews()).toBe(2);
       expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+    }, harnessOptions);
+  });
+
+  it("an isolation failure with long provider stderr keeps its candidate, is retried once, and stores no stderr", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const reviewer = routeToCodex(f);
+      stubProvider([offSchemaNow(f)], { exitCode: 1, stderr: STDERR_MARKER, isolationEnforced: false });
+      const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onRevision: "ignore", onResult: "follow-prompt", onRetry: "follow-prompt" });
+      const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
+      await vi.waitFor(() => expect(owner.results).toHaveLength(1), { timeout: 10_000, interval: 25 });
+      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false), { timeout: 10_000, interval: 25 });
+      expect(owner.results).toEqual([{ runId, ok: true, stage: "REVIEW_UNAVAILABLE" }]);
+      const candidate = f.harness.cp.runs.currentCandidate(runId)!;
+      const rows = auditOf(f, "BLIND_REVIEW_UNAVAILABLE", runId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
+      expect(rows[0]!.evidence).toMatchObject({ candidateSnapshotDigest: candidate, isolationDetailDigest: expect.stringMatching(/^sha256:/) });
+      expect(rows[0]!.evidence["isolationDetailLength"]).toBeGreaterThan(200);
+      expect(rows[0]!.evidence).not.toHaveProperty("auditEvidenceRejected");
+      const planDigest = f.harness.cp.artifacts.latest(runId, ArtifactKind.PLAN)!.digest;
+      expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({
+        woken: [{ runId, roleKey, bindingGeneration: 1, planDigest, retry: { candidateSnapshotDigest: candidate, unavailableEventId: rows[0]!.eventId } }],
+      });
+      await vi.waitFor(() => expect(owner.results).toHaveLength(2), { timeout: 10_000, interval: 25 });
+      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false), { timeout: 10_000, interval: 25 });
+      expect(owner.results.at(-1)).toMatchObject({ stage: "REVIEW_UNAVAILABLE" });
+      expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
+      expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
+      expect(reviewer.reviews()).toBe(2);
+      expect(durableTablesContaining(f.harness, STDERR_MARKER)).toEqual([]);
     }, harnessOptions);
   });
 

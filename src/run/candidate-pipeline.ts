@@ -36,6 +36,53 @@ import type { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 
 const ATTEMPT_LEASE_TTL_MS = 30 * 60 * 1000;
 
+/**
+ * The BLIND_REVIEW_UNAVAILABLE row, built field by field and never spread from the denial. A denial
+ * can carry provider text, and one free-form string over the audit's bound for an unlisted field
+ * makes the audit keep none of the row: not the reason, and not the candidate the official retry
+ * (daemon `#bootstrapReviewRetry`) matches on. So the row holds the candidate this attempt froze, the
+ * scalar fields named here when their values are numbers, booleans or bounded identifiers (digests
+ * and lengths stand in for provider text), and the reviewer attempts by preference and fixed reason.
+ * The denial's reason is the row's reason code.
+ */
+const UNAVAILABLE_REVIEW_FIELDS = [
+  "runId", "provider", "model", "effort", "problem", "chunk", "exitCode", "isolationAttested",
+  "isolationReasonCode", "answerDigest", "answerLength", "errorDigest", "errorLength",
+  "isolationDetailDigest", "isolationDetailLength",
+] as const;
+const BOUNDED_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/#+-]{0,199}$/;
+const ATTEMPT_REASON = /^[A-Za-z0-9][A-Za-z0-9 ._:-]{0,119}$/;
+const boundedScalar = (value: unknown, shape: RegExp = BOUNDED_IDENTIFIER): string | number | boolean | null | undefined => {
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  return typeof value === "string" && shape.test(value) ? value : undefined;
+};
+
+const unavailableReviewEvidence = (candidateSnapshotDigest: string, denial: Evidence | undefined): Evidence => {
+  const source: Record<string, unknown> = denial ?? {};
+  const evidence: Record<string, unknown> = {};
+  for (const field of UNAVAILABLE_REVIEW_FIELDS) {
+    const value = boundedScalar(source[field]);
+    if (value !== undefined) evidence[field] = value;
+  }
+  const attempts = source["attempts"];
+  if (Array.isArray(attempts)) {
+    evidence["attempts"] = attempts.slice(0, 20).map((attempt: unknown) => {
+      const record = (attempt ?? {}) as { preference?: Record<string, unknown>; reason?: unknown };
+      return {
+        preference: {
+          provider: boundedScalar(record.preference?.["provider"]) ?? null,
+          model: boundedScalar(record.preference?.["model"]) ?? null,
+          effort: boundedScalar(record.preference?.["effort"]) ?? null,
+        },
+        reason: boundedScalar(record.reason, ATTEMPT_REASON) ?? null,
+      };
+    });
+  }
+  evidence["candidateSnapshotDigest"] = candidateSnapshotDigest;
+  return evidence as Evidence;
+};
+
 export interface SubmitResultInput {
   runId: string;
   ownerSessionId: string;
@@ -574,9 +621,7 @@ export class CandidatePipeline {
         kind: "BLIND_REVIEW_UNAVAILABLE",
         runId,
         reasonCode: reviewed.reasonCode,
-        // The candidate is the one this attempt froze, written last so no review evidence can replace
-        // it: the official retry (daemon `#bootstrapReviewRetry`) matches the row on this digest alone.
-        evidence: { ...reviewed.evidence, candidateSnapshotDigest: snapshotDigest },
+        evidence: unavailableReviewEvidence(snapshotDigest, reviewed.evidence),
       });
       return allow(ReasonCode.OK, {
         stage: "REVIEW_UNAVAILABLE",
