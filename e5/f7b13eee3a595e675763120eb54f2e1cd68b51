@@ -1,0 +1,12 @@
+Limit: the recovery wake is spent once per (run, owner binding generation, acknowledged RUN_DISPATCH): if the woken turn is later refused or fails, or the owner ignores the directive, nothing wakes it again until a new generation or RUN_DISPATCH
+Limit: the guide's example manifest defaults the branch to main, the branch GitHub initializes for a create-only plan; an owner account with another default branch needs a different manifest
+Warn: the RUN_DISPATCH planning line is part of the generic driven work prompt, so it also reaches driven PRIMARY_CTO sessions, not only BOOTSTRAP_CTO
+Unverified: whether a real headless owner session follows the planning directive was not tested; acceptance is the live bootstrap run producing a PLAN
+Record-Id: r-bootstrapownerplans
+Provenance: inherited bf66d1f117c264b08f9fd211e5f048c81901b6a9
+
+Limit: a refused recovery-only turn is audited as ROLE_PEER_STALE with refusal wording written for mentions
+Warn: a plan recovery trigger carries stillAdmissible, re-asked at the runtime's final check after the credential-delivery awaits; the work prompt is now written after that check from the triggers that survived it, so a dropped recovery trigger is not named in the prompt
+Record-Id: r-bootstrapplanrecheck
+Follows: r-bootstrapownerplans
+Provenance: inherited bc7585262c6b1e8948f455c2e950d9a2bcd0d25c
