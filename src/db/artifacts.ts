@@ -625,6 +625,9 @@ const blindReviewEvidenceSchema = z
       })
       .strict()
       .optional(),
+    // A BOOTSTRAP_PLAN review names the digest of the PLAN intent its reviewer was shown. Every other
+    // review carries no such key.
+    bootstrapPlanIntentDigest: DIGEST_SCHEMA.optional(),
     // Issue #246 B2-a — a CONTRACT_CHANGE review names the PLAN, the manifest it carries and the base
     // it changes, as the gate reloaded them, and the CI workflows a later activation must verify.
     // Every other review carries no such key.

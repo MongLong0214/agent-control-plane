@@ -7,7 +7,7 @@ import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
-import type { ArtifactStore } from "../db/artifacts.ts";
+import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunRow, RunState } from "../domain/types.ts";
@@ -81,6 +81,58 @@ const unavailableReviewEvidence = (candidateSnapshotDigest: string, denial: Evid
   }
   evidence["candidateSnapshotDigest"] = candidateSnapshotDigest;
   return evidence as Evidence;
+};
+
+/**
+ * The REVISION_RETURNED_TO_CTO row, built field by field as the UNAVAILABLE row is. The revision
+ * delivered to the CTO carries the review packet or the verification report whole, and spread into
+ * the row the reviewer's findings text (and the packet's egress JSONL) made the audit refuse it: the
+ * row kept `{auditEvidenceRejected:true}`, its stage and candidate gone with the rest (live run_7717,
+ * both REVISE rounds). So the row keeps the stage, the candidate, counts, severities and digests, and
+ * names the stored BLIND_REVIEW artifact by digest; the findings themselves are read from that
+ * verified artifact, never from the audit. The delivery is unchanged.
+ */
+const FINDING_SEVERITIES = ["INFO", "MINOR", "MAJOR", "BLOCKER"] as const;
+const MAX_AUDITED_FINDING_DIGESTS = 50;
+
+const revisionAuditEvidence = (
+  delivered: Record<string, unknown>,
+  review: { digest: string; content: ReviewPacket } | null,
+): Evidence => {
+  const candidateSnapshotDigest = boundedScalar(delivered["candidateSnapshotDigest"]) ?? null;
+  if (delivered["stage"] === "verification") {
+    const report = (delivered["report"] ?? null) as Partial<VerificationReport> | null;
+    return {
+      stage: "verification",
+      candidateSnapshotDigest,
+      reportDigest: digestOf(report),
+      status: boundedScalar(report?.status) ?? null,
+      expectedInputs: boundedScalar(report?.expectedInputs) ?? null,
+      observedInputs: boundedScalar(report?.observedInputs) ?? null,
+      results: Array.isArray(report?.results) ? report.results.length : null,
+      gaps: Array.isArray(report?.gaps) ? report.gaps.length : null,
+    } as Evidence;
+  }
+  if (review === null) return { stage: "blind-review", candidateSnapshotDigest, reviewArtifactDigest: null } as Evidence;
+  const packet = review.content;
+  const findings = Array.isArray(packet.findings) ? packet.findings : [];
+  const planDigest = packet.bootstrapPlan?.planDigest ?? packet.contractChange?.planDigest;
+  return {
+    stage: "blind-review",
+    candidateSnapshotDigest,
+    reviewArtifactDigest: review.digest,
+    reviewKind: packet.bootstrapPlan ? "BOOTSTRAP_PLAN" : packet.contractChange ? "CONTRACT_CHANGE" : "CANDIDATE",
+    verdict: boundedScalar(packet.verdict) ?? null,
+    findings: findings.length,
+    findingsBySeverity: Object.fromEntries(
+      FINDING_SEVERITIES.map((severity) => [severity, findings.filter((finding) => finding.severity === severity).length]),
+    ),
+    findingDigests: findings.slice(0, MAX_AUDITED_FINDING_DIGESTS).map((finding) => digestOf(finding)),
+    coveredFiles: packet.coveredFiles.length,
+    omittedItems: packet.omittedItems.length,
+    ...(planDigest === undefined ? {} : { planDigest: boundedScalar(planDigest) ?? null }),
+    ...(packet.bootstrapPlanIntentDigest === undefined ? {} : { bootstrapPlanIntentDigest: boundedScalar(packet.bootstrapPlanIntentDigest) ?? null }),
+  } as Evidence;
 };
 
 export interface SubmitResultInput {
@@ -835,12 +887,14 @@ export class CandidatePipeline {
       if (!enqueued.allowed) return enqueued as Decision<void>;
     }
 
+    // The delivery above carries `evidence` whole; the row keeps a fixed field list (revisionAuditEvidence).
+    const review = evidence["stage"] === "blind-review" ? this.storedReview(runId, String(evidence["candidateSnapshotDigest"])) : null;
     this.audit.record({
       kind: "REVISION_RETURNED_TO_CTO",
       runId,
       roleKey: binding?.roleKey ?? null,
       reasonCode: reasonCode as never,
-      evidence,
+      evidence: revisionAuditEvidence(evidence, review),
     });
 
     // §31.3 — revision count is run-scope telemetry. The FSM keeps a blind-review
@@ -855,6 +909,12 @@ export class CandidatePipeline {
       dims: { stage: evidence["stage"] ?? null, mode: run.executionMode },
     });
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /** The review gate's own BLIND_REVIEW artifact for a candidate, or null when the gate stored none. */
+  private storedReview(runId: string, candidateSnapshotDigest: string): { digest: string; content: ReviewPacket } | null {
+    const stored = this.artifacts.latestForSnapshot<ReviewPacket>(runId, ArtifactKind.BLIND_REVIEW, candidateSnapshotDigest);
+    return stored !== null && stored.producedBy === EVIDENCE_PRODUCERS.BLIND_REVIEW ? stored : null;
   }
 
   /**
