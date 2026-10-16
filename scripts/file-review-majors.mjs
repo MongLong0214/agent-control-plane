@@ -89,7 +89,7 @@ const body = (f) =>
   [
     marker(f),
     ...(staleNote ? [`> **${staleNote}**`, ``] : []),
-    `Reported by the independent GPT-5.6 Sol production-readiness review (round \`${ROUND}\`,`,
+    `Reported by the independent production-readiness review (\`pnpm review:production\`, round \`${ROUND}\`,`,
     `read-only sandbox, reasoning effort \`xhigh\`) as a **${f.severity}** finding in the`,
     `\`${f.area}\` area. Filed verbatim so the reasoning survives a session reset; it has not`,
     `been re-verified by the implementer unless a comment on this issue says so.`,
