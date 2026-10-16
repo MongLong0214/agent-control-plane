@@ -522,8 +522,8 @@ describe("gpt reviewer egress covers ChatGPT-authenticated Codex", () => {
     config;
 
   const blockedDirect = (host: string): EgressProbes["directSocket"] => [
-    { host, proxyMode: "unset", connected: false, blocked: true, errorCode: "EPERM" },
-    { host, proxyMode: "override", connected: false, blocked: true, errorCode: "EPERM" },
+    { host, proxyMode: "unset", connected: false, blocked: true, indeterminate: false, errorCode: "EPERM" },
+    { host, proxyMode: "override", connected: false, blocked: true, indeterminate: false, errorCode: "EPERM" },
   ];
 
   it("generates the gpt allowlist with exactly the API-key and ChatGPT hosts", async () => {
