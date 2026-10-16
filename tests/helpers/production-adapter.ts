@@ -63,14 +63,17 @@ export class TestProductionAdapter extends ScriptedAdapter {
  * adapters may never use this: they must populate the same shape from a live proxy lease.
  */
 export const testReviewerEgressEvidence = (provider: string): ReviewerEgressRecord[] => {
-  const allowedHost = REVIEWER_PROVIDER_ENDPOINTS[provider]?.[0] ??
+  const policy = REVIEWER_PROVIDER_ENDPOINTS[provider];
+  const allowedHost = policy?.[0] ??
     `${provider.replace(/[^a-z0-9-]/gi, "").toLowerCase() || "reviewer"}.provider.test`;
+  // The durable record must name the provider's whole compiled allowlist, not its first host.
+  const allowedEndpoints = policy && policy.length > 0 ? [...policy] : [allowedHost];
   const deniedHost = allowedHost === "api.openai.com" ? "api.anthropic.com" : "api.openai.com";
   const port = 18_443;
-  const allowlistDigest = sha256(`${allowedHost}\n`);
+  const allowlistDigest = sha256(`${allowedEndpoints.join("\n")}\n`);
   return [{
     provider,
-    allowedEndpoints: [allowedHost],
+    allowedEndpoints,
     allowlistDigest,
     proxyPort: port,
     phase: "reviewer-invocation",
@@ -79,12 +82,14 @@ export const testReviewerEgressEvidence = (provider: string): ReviewerEgressReco
       JSON.stringify({ t: 2, verdict: "ALLOW", host: allowedHost, port: 443 }),
       JSON.stringify({ t: 3, verdict: "DENY", host: deniedHost, port: 443 }),
     ].join("\n") + "\n",
+    // The exact shape probeProviderOnlyNetwork returns, so a field the runtime emits and the
+    // persisted schema refuses fails here rather than only on a live reviewer.
     probes: {
-      allowedEndpoint: { host: allowedHost, connected: true, statusCode: 200 },
-      deniedEndpoint: { host: deniedHost, denied: true, statusCode: 403 },
+      allowedEndpoint: { host: allowedHost, connected: true, statusCode: 200, errorCode: null },
+      deniedEndpoint: { host: deniedHost, connected: false, statusCode: 403, errorCode: null, denied: true },
       directSocket: [
-        { host: allowedHost, proxyMode: "unset", connected: false, blocked: true, errorCode: "EPERM" },
-        { host: allowedHost, proxyMode: "override", connected: false, blocked: true, errorCode: "EPERM" },
+        { host: allowedHost, proxyMode: "unset", connected: false, blocked: true, indeterminate: false, errorCode: "EPERM" },
+        { host: allowedHost, proxyMode: "override", connected: false, blocked: true, indeterminate: false, errorCode: "EPERM" },
       ],
     },
   }];

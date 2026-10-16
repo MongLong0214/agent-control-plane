@@ -44,6 +44,7 @@ import {
   ProviderSessionProvisionError,
   REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS,
   REVIEWER_PROVIDER_ENDPOINTS,
+  reviewerEgressProbeIndeterminate,
   type InvocationRequest,
   type InvocationResult,
   type ProviderRegistry,
@@ -2269,6 +2270,7 @@ const reviewerEgressRecordProblem = (
     !isPlainRecord(denied) ||
     direct.some((probe) => !isPlainRecord(probe))
   ) return "probe-shape-missing";
+  if ([allowed, denied, ...direct].some(reviewerEgressProbeIndeterminate)) return "indeterminate-probe";
   if (allowed.connected !== true || allowed.statusCode !== 200 || !allowedList.includes(allowed.host)) return "allow-probe-missing";
   if (
     denied.denied !== true ||

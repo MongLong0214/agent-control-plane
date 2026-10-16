@@ -113,7 +113,10 @@ export type ProviderId = (typeof ProviderId)[keyof typeof ProviderId];
  * but an omitted provider never falls through to another provider's hosts.
  */
 export const REVIEWER_PROVIDER_ENDPOINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  gpt: Object.freeze(["api.openai.com"]),
+  // api.openai.com serves API-key Codex. A ChatGPT-authenticated Codex reaches the model only
+  // through chatgpt.com and ab.chatgpt.com and refreshes its token at auth.openai.com. An ALLOW
+  // is valid only for an exact generated endpoint, so the subdomain is named, not inherited.
+  gpt: Object.freeze(["api.openai.com", "chatgpt.com", "ab.chatgpt.com", "auth.openai.com"]),
   claude: Object.freeze(["api.anthropic.com"]),
   grok: Object.freeze(["api.x.ai"]),
 });
@@ -168,6 +171,14 @@ export interface ReviewerEgressProbe {
   statusCode?: number | null;
   errorCode?: string | null;
 }
+
+/**
+ * A probe that could not tell what happened proves nothing, whatever `blocked`, `connected`
+ * or `statusCode` claim beside it. Every check that accepts returned or stored probes refuses
+ * it; `indeterminate: false` and a legacy probe without the field are judged as before.
+ */
+export const reviewerEgressProbeIndeterminate = (probe: ReviewerEgressProbe): boolean =>
+  probe.indeterminate === true;
 
 /**
  * Verbatim proxy evidence for one confined provider process. `jsonl` is copied only after
