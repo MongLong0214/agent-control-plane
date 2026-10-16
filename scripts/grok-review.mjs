@@ -3,7 +3,7 @@
  * Independent production-readiness review by Grok (grok-4.6-build, reasoning effort `xhigh`,
  * which is the CLI's maximum — `max` is rejected).
  *
- * Same shape as `scripts/production-review.mjs` (GPT-5.6 Sol) on purpose: the areas are the
+ * Same shape as `scripts/production-review.mjs` (GPT-6.1 Sol) on purpose: the areas are the
  * ones the PRD gives distinct authority to, the reviewer reads the repository itself rather
  * than an excerpt someone chose, and the findings come back structured so they can be filed
  * without a human paraphrasing them.
