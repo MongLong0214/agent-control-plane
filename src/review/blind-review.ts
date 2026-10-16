@@ -231,6 +231,11 @@ const candidateCoverageTargets = (
   ...(change === null ? [] : [change.target]),
 ];
 
+/**
+ * The one verdict shape: the response schema a runtime may enforce, the schema every reviewer prompt
+ * states, and the keys and values `parseVerdict` accepts. Every finding key is required because the
+ * parser requires each of them, `path` included (null when the finding names no file).
+ */
 const VERDICT_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -244,7 +249,7 @@ const VERDICT_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["category", "severity", "repository", "summary", "detail"],
+        required: ["category", "severity", "repository", "path", "summary", "detail"],
         properties: {
           category: {
             type: "string",
@@ -263,6 +268,30 @@ const VERDICT_SCHEMA = {
     },
   },
 } as const;
+
+/**
+ * The schema as every reviewer prompt states it. The packet reviewer's CLI is given no response
+ * schema, and a PLAN prompt's example shows no finding, so without this a reviewer invents a
+ * finding shape the parser refuses (2026-10-16: `{issue, requiredChange, severity: HIGH, target}`).
+ */
+const VERDICT_SCHEMA_PROMPT: readonly string[] = [
+  "The object must validate against this JSON Schema; an answer in any other shape is not a verdict:",
+  "```json",
+  JSON.stringify(VERDICT_SCHEMA, null, 2),
+  "```",
+];
+
+/**
+ * What an answer the parser refused leaves in a deny's evidence: a fixed marker, its digest and its
+ * length, never its text. That evidence reaches the BLIND_REVIEW_UNAVAILABLE audit row, where a
+ * free-form string under an unlisted key makes the allowlist refuse the whole evidence, the
+ * candidate digest the official retry matches on included.
+ */
+const unparsableAnswerEvidence = (text: string): { problem: string; answerDigest: string; answerLength: number } => ({
+  problem: "VERDICT_UNPARSABLE",
+  answerDigest: sha256(text),
+  answerLength: text.length,
+});
 
 /** Diff size above which a single reviewer context is not trusted to hold everything. */
 const CHUNK_THRESHOLD_CHARS = 120_000;
@@ -1150,8 +1179,7 @@ export class BlindReviewGate {
       return deny(ReasonCode.EVIDENCE_MISSING, "reviewer did not return a parsable verdict", {
         runId: request.runId,
         provider: reviewer.preference.provider,
-        error: result.error,
-        raw: result.text.slice(0, 500),
+        ...unparsableAnswerEvidence(result.text),
       });
     }
     const attested = this.assertInvocationIdentity(request.runId, reviewer, result.providerSessionId);
@@ -1329,7 +1357,7 @@ export class BlindReviewGate {
     if (!finalVerdict) {
       return deny(ReasonCode.EVIDENCE_MISSING, "final chunked reviewer returned no usable verdict", {
         runId: request.runId,
-        raw: finalResult.text.slice(0, 500),
+        ...unparsableAnswerEvidence(finalResult.text),
       });
     }
 
@@ -1393,6 +1421,7 @@ export class BlindReviewGate {
       "",
       "## Required response",
       "Return a single JSON object matching the schema, and nothing else.",
+      ...VERDICT_SCHEMA_PROMPT,
       "You may not return PASS while omittedItems is non-empty.",
     ].join("\n");
   }
@@ -1463,6 +1492,7 @@ export class BlindReviewGate {
         2,
       ),
       "```",
+      ...VERDICT_SCHEMA_PROMPT,
       "`coveredFiles` must list every file you actually examined, formatted `<repository-identity>:<path>`.",
       "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
       "`findings` may be empty. Everything you need is above; you have no tools and are not expected to look anything up.",
@@ -1526,6 +1556,7 @@ export class BlindReviewGate {
         2,
       ),
       "```",
+      ...VERDICT_SCHEMA_PROMPT,
       "`coveredFiles` must list every required coverage item you actually examined, exactly as written above.",
       "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
       "`findings` may be empty. Everything you need is above; you have no tools and are not expected to look anything up.",
@@ -1574,6 +1605,7 @@ export class BlindReviewGate {
         2,
       ),
       "```",
+      ...VERDICT_SCHEMA_PROMPT,
       "`coveredFiles` must list every required coverage item you actually examined, exactly as written above.",
       "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
       "`findings` may be empty. Everything you need is above; you have no tools and are not expected to look anything up.",
@@ -2174,24 +2206,25 @@ const parseVerdict = (input: unknown): RawVerdict | null => {
           }
         })()
       : input;
-  if (!isPlainRecord(value) || !hasExactKeys(value, ["verdict", "coveredFiles", "omittedItems", "findings"])) return null;
+  if (!isPlainRecord(value) || !hasExactKeys(value, [...VERDICT_SCHEMA.required])) return null;
   const record = value as Record<string, unknown>;
   const verdict = record["verdict"];
-  if (verdict !== "PASS" && verdict !== "REVISE" && verdict !== "BLOCK") return null;
+  if (!REVIEW_VERDICTS.has(verdict as ReviewVerdict)) return null;
   if (!isStringArray(record["coveredFiles"]) || !isStringArray(record["omittedItems"])) return null;
   if (!Array.isArray(record["findings"]) || !record["findings"].every(isReviewFinding)) return null;
   return {
-    verdict,
+    verdict: verdict as ReviewVerdict,
     coveredFiles: record["coveredFiles"],
     omittedItems: record["omittedItems"],
     findings: record["findings"],
   };
 };
 
-const REVIEW_CATEGORIES = new Set<ReviewFindingCategory>([
-  "correctness", "regression", "security", "scope", "performance", "maintainability", "evidence", "freshness", "source",
-]);
-const REVIEW_SEVERITIES = new Set<ReviewFinding["severity"]>(["INFO", "MINOR", "MAJOR", "BLOCKER"]);
+/** The parser reads its keys and values from `VERDICT_SCHEMA`, the shape every reviewer prompt states. */
+const FINDING_SCHEMA = VERDICT_SCHEMA.properties.findings.items;
+const REVIEW_VERDICTS = new Set<ReviewVerdict>(VERDICT_SCHEMA.properties.verdict.enum);
+const REVIEW_CATEGORIES = new Set<ReviewFindingCategory>(FINDING_SCHEMA.properties.category.enum);
+const REVIEW_SEVERITIES = new Set<ReviewFinding["severity"]>(FINDING_SCHEMA.properties.severity.enum);
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
@@ -2311,7 +2344,7 @@ const isStringArray = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every((item): item is string => typeof item === "string");
 
 const isReviewFinding = (value: unknown): value is ReviewFinding => {
-  if (!isPlainRecord(value) || !hasExactKeys(value, ["category", "severity", "repository", "path", "summary", "detail"])) return false;
+  if (!isPlainRecord(value) || !hasExactKeys(value, [...FINDING_SCHEMA.required])) return false;
   return (
     typeof value["category"] === "string" && REVIEW_CATEGORIES.has(value["category"] as ReviewFindingCategory) &&
     typeof value["severity"] === "string" && REVIEW_SEVERITIES.has(value["severity"] as ReviewFinding["severity"]) &&
@@ -2535,4 +2568,4 @@ const splitOversizedSection = (
   return parts;
 };
 
-export const __testing = { splitDiffs, parseVerdict, worseVerdict, validateChunkCoverage };
+export const __testing = { splitDiffs, parseVerdict, worseVerdict, validateChunkCoverage, VERDICT_SCHEMA };

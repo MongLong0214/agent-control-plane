@@ -574,7 +574,9 @@ export class CandidatePipeline {
         kind: "BLIND_REVIEW_UNAVAILABLE",
         runId,
         reasonCode: reviewed.reasonCode,
-        evidence: { candidateSnapshotDigest: snapshotDigest, ...reviewed.evidence },
+        // The candidate is the one this attempt froze, written last so no review evidence can replace
+        // it: the official retry (daemon `#bootstrapReviewRetry`) matches the row on this digest alone.
+        evidence: { ...reviewed.evidence, candidateSnapshotDigest: snapshotDigest },
       });
       return allow(ReasonCode.OK, {
         stage: "REVIEW_UNAVAILABLE",
