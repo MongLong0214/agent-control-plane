@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Independent production-readiness review by GPT-5.6 Sol.
+ * Independent production-readiness review by GPT-6.1 Sol.
  *
  * Splits the implementation into the areas the PRD gives distinct authority to, and asks
  * for structured findings per area. The reviewer reads the repository itself under a
@@ -232,7 +232,7 @@ const run = (key, area) =>
       [
         "exec",
         "-m",
-        "gpt-5.6-sol",
+        "gpt-6.1-sol",
         "-c",
         'model_reasoning_effort="xhigh"',
         "-s",
