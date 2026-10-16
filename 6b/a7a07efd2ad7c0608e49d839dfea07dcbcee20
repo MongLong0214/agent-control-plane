@@ -1,0 +1,10 @@
+Ruled-out: normalizing provider usage and effort keys in reviewer evidence | rejected after tracing: no reasoning_* key reaches BLIND_REVIEW; the live refusal came from an off-schema verdict whose 500-character raw text was spread into the UNAVAILABLE audit evidence instead
+Warn: VERDICT_SCHEMA is the single source for both the reviewer prompts and the parser; a non-standard answer is refused as EVIDENCE_MISSING with only a fixed problem code, an answer digest and its length, and the UNAVAILABLE row's candidateSnapshotDigest is the attempt's frozen candidate, written last so review output cannot replace it
+Record-Id: r-reviewerschemaprompt
+Provenance: inherited 4bf1ebb86a8f009e365cebc03bb635b5b2ba1c1c
+
+Limit: the reviewer-session setup denial still carries a raw reason string that can include handshake stderr; it no longer reaches the UNAVAILABLE row but is returned to the caller, and no witness covers it
+Warn: the UNAVAILABLE audit row is built from a fixed field list (identifiers, numbers, booleans, a fixed attempt reason, the frozen candidate written last); provider text reaches durable state only as a digest and length; an unparsable chunk answer is EVIDENCE_MISSING, never folded into omissions
+Record-Id: r-reviewerunavailablebounded
+Follows: r-reviewerschemaprompt
+Provenance: inherited 07b7cc652b6e5dad120812f721592469bc832e0d
