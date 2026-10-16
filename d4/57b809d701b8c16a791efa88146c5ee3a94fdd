@@ -1,0 +1,3 @@
+Warn: the production review script pins gpt-6.1-sol by owner directive; gpt-5.6-sol is not to be used for reviews, and historical docs that name it are records, not configuration
+Record-Id: r-reviewscriptmodelpin
+Provenance: inherited 148b9226efabdfb4d762d9a54441268a94cce667
