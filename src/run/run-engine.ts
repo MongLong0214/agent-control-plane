@@ -886,6 +886,9 @@ export class RunEngine {
         // Issue #246 — a bootstrap run that ends (CONFIRM → COMPLETED, cancel, fail) gives back its
         // BOOTSTRAP_CTO in this same transaction; the daemon's reclaim sweep stops the session.
         if (run.kind === RunKind.PROJECT_BOOTSTRAP) this.#bootstrapCto?.release(runId, `run ${to}`);
+        // An escalation reply a revocation held for this run's owner's renewal is never carried now:
+        // an ended run's owner is not renewed. It is rejected here, in the transaction that ends it.
+        this.outbox.rejectHeldEscalationReplies(runId, `run ${to}`);
         // #512 — and every run's WORKER bindings end with it, in this same transaction; their
         // sessions are stopped after it commits, unless something they ran is still running.
         this.#workerRetirement?.retireRun(runId, to);
@@ -1451,6 +1454,13 @@ export class RunEngine {
       }
       // Work a previous generation started is fenced to it, as a takeover fences it.
       this.tasks.abandonStaleExecutions(runId, renewed.bindingGeneration, "bootstrap CTO recovered at a new generation");
+      // The CEO's resolution the outage's revocation held for this owner follows it here, once, now
+      // that the run is pinned to the renewed generation; one that can no longer be carried is
+      // rejected in this same transaction.
+      this.outbox.carryHeldEscalationReplies(runId, renewed.roleKey, fromGeneration, {
+        generation: renewed.bindingGeneration,
+        sessionId: renewed.sessionId,
+      });
       return allow(ReasonCode.OK, { run: this.require(runId), resumed: resumes });
     });
   }

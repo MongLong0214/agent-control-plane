@@ -167,6 +167,17 @@ const EXPECTED_CONVERTED_SITES = [
   // exactly the same reason the binding door can: the audit write is what makes the refusal
   // observable, so a `tx` here would keep a row describing an authorization that never happened.
   { file: "ceo/cto-binding-delegation.ts", symbol: "authorizeRelease", label: "CtoBindingDelegation.authorizeRelease", evidence: "direct" },
+  // The CTO's escalation opening writes CTO_ESCALATION and the CEO's notification, then can be refused
+  // by the BLOCKED transition (the run is already BLOCKED) or by the notification itself: a `tx` here
+  // kept the refused opening's record, and the record is what names the run's current escalation.
+  // Rollback witness (named in the census test's CONVERTED_SITES): "a refused blocking open leaves no
+  // audit, no notification and the first escalation current and resolvable; ...".
+  { file: "ceo/production-gate.ts", symbol: "openEscalation", label: "ProductionGate.openEscalation", evidence: "direct" },
+  // The CEO's resolution moves BLOCKED -> ACTIVE and enqueues the owner's ESCALATION_REPLY before the
+  // CEO_DECISION that commits the request identity, and refuses if the enqueue or that record is
+  // refused: none of the three may stand without the others. Rollback witnesses (named in the census
+  // test's CONVERTED_SITES): the stale target, a refused enqueue, no current owner, a refused record.
+  { file: "ceo/production-gate.ts", symbol: "resolveEscalation", label: "ProductionGate.resolveEscalation", evidence: "direct" },
   { file: "session/binding-registry.ts", symbol: "bind", label: "BindingRegistry.bind", evidence: "direct" },
   { file: "session/binding-registry.ts", symbol: "switchTo", label: "BindingRegistry.switchTo", evidence: "direct" },
   { file: "run/task-graph.ts", symbol: "finishExecution", label: "TaskGraph.finishExecution (post-preflight)", evidence: "direct" },

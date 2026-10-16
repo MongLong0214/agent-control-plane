@@ -2231,6 +2231,10 @@ export class Daemon {
     const revoked = this.cp.bindings.revoke(required.roleKey, reason, {
       allowBlockedRuns: true,
       ...(options.allowHeldRuns === true ? { allowHeldRuns: true } : {}),
+      // A run's BOOTSTRAP_CTO revoked here is the one continuity recovers on its own session at the
+      // next generation (`BootstrapCtoStaffing.recover` accepts exactly these continuity reasons), so
+      // a resolution still queued for it is held for that renewal rather than lost to the outage.
+      ...(required.role === Role.BOOTSTRAP_CTO ? { holdEscalationRepliesForRenewal: true } : {}),
     });
     if (!revoked.allowed) {
       this.cp.audit.record({

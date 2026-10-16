@@ -963,6 +963,10 @@ const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[
       : []),
     `For a run whose contract_get returned a bootstrapPlanGuide, once its PLAN is accepted and the run is ACTIVE, unless that PLAN's result was already submitted, and before you acknowledge its RUN_DISPATCH: ${RESULT_STEPS}.`,
     `A REVISION_REQUEST for a run whose contract_get returned a bootstrapPlanGuide carries why its PLAN was sent back (the CEO's rationale, or the blind review's findings): for that run, ${PLAN_STEPS}, writing the new PLAN so that it addresses that reason; then acknowledge the REVISION_REQUEST with mcp__acp-cto__run_ack. If the run is ACTIVE, submit the new PLAN's result first, as above; a run the CEO sent back is ACTIVE again with its next RUN_DISPATCH.`,
+    "An ESCALATION_REPLY is the CEO's resolution of the escalation it names (its escalationId) for a run you are the current owner of: act on it only when it is addressed to you as that run's current owner and names that run's escalation, and then only for that run. " +
+      "Carry out its resolution, for example by planning that run again or submitting its result again as the lines above direct, then acknowledge the ESCALATION_REPLY with mcp__acp-cto__run_ack. " +
+      "The resolution never bypasses T3, the blind review or the CEO's CONFIRM: a new PLAN still goes through mcp__acp-cto__plan_submit and a result through mcp__acp-cto__result_submit, each with its normal gates. " +
+      "If carrying out the resolution fails or is refused, do not acknowledge it: report the refusal or failure for that run with mcp__acp-cto__escalation_open instead.",
     ...(triggers.some((trigger) => trigger.kind.startsWith(RESULT_RECOVERY_KIND_PREFIX))
       ? [
           `A wake for "${RESULT_RECOVERY_KIND_PREFIX}<runId> has a PLAN and no result" means that run's current PLAN was accepted and no result was submitted for it: for that run, ${RESULT_STEPS}. No message is left to acknowledge for it.`,
