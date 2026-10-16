@@ -1,0 +1,15 @@
+Limit: a ChatGPT-authenticated CLI reaches chatgpt.com and ab.chatgpt.com (measured through the shipped proxy) and refreshes via auth.openai.com, never api.openai.com; the GPT reviewer allowlist lists all four hosts exactly, because finalise accepts only exact generated endpoints even though the proxy matches subdomains
+Record-Id: r-gptreviewerendpoints
+Follows: r-reviewerdefaulthome
+Provenance: inherited ef9896bf8d7f1ccfa88ae61390fba1df92d94f91
+
+Warn: the stored probe schema now accepts the runtime's indeterminate field; an indeterminate:true probe is still refused as ISOLATION_LOST before any artifact write, so acceptance of the field is not acceptance of an indeterminate result
+Record-Id: r-reviewerprobeindeterminate
+Follows: r-gptreviewerendpoints
+Provenance: inherited 5561bd513c025b2b59def647213e825ff44fa37a
+
+Warn: r-reviewerprobeindeterminate's Warn that an indeterminate:true probe is still refused was false at 5561bd51: the gate checked only blocked and connected, so a contradictory probe stored a PASS; one shared predicate now refuses indeterminate:true in the gate and in finalise, while indeterminate:false and legacy probes without the field remain accepted
+Record-Id: r-reviewerprobeindeterminatefix
+Follows: r-reviewerprobeindeterminate
+Supersedes: r-reviewerprobeindeterminate
+Provenance: inherited 1882cf96b06a44c20aebe6bbe9e12cec774645bd
