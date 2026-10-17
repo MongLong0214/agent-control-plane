@@ -1,4 +1,0 @@
-Warn: a legacy pause interrupted before its revocation could borrow a later reconcile's revoke or defer; release requires the pause's own pass to have finished, with exactly one revoke or defer for the owner role and the same loss reason, and a restoring binding on the same role, session and incarnation; generations are not compared for equality, and anything ambiguous keeps the wait
-Record-Id: r-continuityreviewholdepisode
-Follows: r-continuityreviewholdrelease
-Provenance: reconstructed
