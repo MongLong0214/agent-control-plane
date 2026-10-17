@@ -11,6 +11,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { defaultConfig } from "../../src/app/control-plane.ts";
 import { processGroupEmpty } from "../../src/bootstrap/attempt-writer-group.ts";
 import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
+import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../../src/ceo/owner-authority.ts";
 import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
 import { allow } from "../../src/core/errors.ts";
@@ -358,6 +359,34 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
     );
     expect(activation?.content.ceoConfirm).toMatchObject({ decision: "CONFIRM" });
     expect(activation?.content.localBindings).toEqual([expect.objectContaining({ identity: IDENTITY })]);
+
+    // RF-S17 arm:activation: on this real runner path, no RepoFactoryResult stored for the run (the
+    // runner's and activation's retained copy) states a CTO or Doctor fact, and the
+    // BOOTSTRAP_ACTIVATION_RESULT the CONFIRM wrote supplies both, from the PRIMARY_CTO binding that
+    // acknowledged the handoff and from activation's own doctor report.
+    const stored = wired.harness.cp.artifacts.list<Record<string, unknown>>(wired.runId, "REPO_FACTORY_RESULT");
+    expect(stored.length).toBeGreaterThan(0);
+    for (const result of stored) {
+      expect(parseRepoFactoryResult(result.content).allowed).toBe(true);
+      expect(Object.keys(result.content).filter((key) => /cto|doctor/i.test(key))).toEqual([]);
+    }
+    const doctorReport = wired.harness.cp.artifacts.latest<{ source: string; report: { status: string; findings: unknown[] } }>(
+      wired.runId,
+      "DOCTOR_REPORT",
+    );
+    if (!doctorReport) throw new Error("activation stored no DOCTOR_REPORT");
+    expect(doctorReport.content.source).toBe("bootstrap-activation");
+    expect(activation?.content).toMatchObject({
+      schema: "agent-control-plane.bootstrap-activation.v1",
+      primaryCtoBinding: {
+        roleKey: primary.roleKey,
+        sessionId: primary.sessionId,
+        bindingGeneration: primary.bindingGeneration,
+        promotedFromBootstrap: false,
+      },
+      handoffAck: { handoffId },
+      doctor: { status: doctorReport.content.report.status, findings: doctorReport.content.report.findings.length },
+    });
   });
 
   it("a CEO confirm with no owner approval is refused by the runner; no GitHub call, nothing consumed, not COMPLETED", async () => {
