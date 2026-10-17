@@ -1,0 +1,8 @@
+Warn: a declared verification command is launched by the absolute path the allowlist approved (verificationLaunchArgv), never found by name through the sandbox PATH, so a candidate cannot shadow a declared tool; a command that no longer resolves to an allowed tool at launch is refused
+Record-Id: r-verifyabsolutelaunch
+Provenance: inherited 28862a259676052f8ba53b7463648d726b986322
+
+Warn: a declared verification tool is launched by the approved absolute path itself, keeping symlink aliases so a dispatching shim keeps its argv0 personality; at launch its realpath must equal the allowlisted target or the command is refused, and the sandbox PATH is never consulted
+Record-Id: r-verifylaunchkeepsalias
+Follows: r-verifyabsolutelaunch
+Provenance: inherited ecbd1a4272e31bea219521ab047a3f55801dca98
