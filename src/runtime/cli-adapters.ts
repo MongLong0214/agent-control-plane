@@ -177,7 +177,7 @@ const DENIED_TOOLS = [
  * while one naming the link path is refused with EPERM — but that measurement is not a committed
  * case, so nothing in this repository would notice if it stopped holding.
  */
-const resolveExecutable = (binary: string): string => {
+export const resolveExecutable = (binary: string): string => {
   // An explicitly empty pin names no CLI. Joining it to a PATH entry turns absence into that
   // directory, which the doctor then misreports as a configured path that is not a regular file.
   if (binary === "") return binary;

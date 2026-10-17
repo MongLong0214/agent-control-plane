@@ -6,6 +6,7 @@ import { expect, vi } from "vitest";
 
 import { processGroupEmpty } from "../../src/bootstrap/attempt-writer-group.ts";
 import { writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
+import type { CommitLorePort } from "../../src/bootstrap/commitlore-observation.ts";
 import { plannedBootstrapOutputs } from "../../src/bootstrap/bootstrap-plan.ts";
 import {
   REPO_FACTORY_GITHUB_WRITE_OPERATION,
@@ -146,6 +147,8 @@ export const prepareBootstrapRun = async (
      * binds it, and the PLAN stored as an artifact rather than through `plan_submit`; then reviewed.
      */
     legacyTask?: boolean;
+    /** #246 B3 — the runner's CommitLore port; omitted, the runner has none. */
+    commitlore?: CommitLorePort | null;
   },
 ): Promise<PreparedBootstrapRun> => {
   const harness = makeHarness(options.ownerIdentities === undefined ? {} : { ownerIdentities: options.ownerIdentities });
@@ -179,6 +182,7 @@ export const prepareBootstrapRun = async (
     bindings: harness.cp.bindings,
     projects: harness.cp.projects,
     repositories: harness.cp.repositories,
+    commitlore: options.commitlore ?? null,
   });
   // As the runner's own witnesses do (#246 C3, review 1076-R3): every attempt is recorded with a writer
   // that has since exited — a real process that led its own group, its start token read while it ran,
