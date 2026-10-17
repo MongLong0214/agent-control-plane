@@ -44,4 +44,8 @@ service's access control, not on this repository.
 
 Those links are not part of this project's record. Decisions, evidence and review live in this
 repository, its issues and its pull requests, and nothing is to be read from or cited through such
-a link. New commit messages must not carry one (#1107).
+a link. New commit messages must not carry one, and a check refuses them: the `commit-msg` hook
+and the CI range check (`pnpm trailers`) both run `scripts/verify-trailers-are-parsable.mjs`, which
+rejects a session link, bare, labelled or embedded, and a session metadata line such as
+`Claude-Session:`. It reads only the message or range it is given, so the published commits keep
+their links (#1107).

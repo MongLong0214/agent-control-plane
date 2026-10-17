@@ -139,9 +139,21 @@ if [ -z "$NODE_BIN" ]; then
   exit 1
 fi
 
-if ! "$NODE_BIN" "$CHECK" --message-file "$MSG_FILE" >/dev/null 2>&1; then
-  "$NODE_BIN" "$CHECK" --message-file "$MSG_FILE" >&2
-  echo "" >&2
-  echo "commit-msg: this message writes a record git will not store." >&2
+# The check runs once and its report is kept, so the sentence below names the cause the check
+# reported. Since #1107 it refuses two things: a record git will not store, and a link to an external
+# work session. Only the check's own verdict starts a line with `RESULT:`; the message text it echoes
+# is always indented, so a message cannot choose the sentence.
+if ! REPORT=$("$NODE_BIN" "$CHECK" --message-file "$MSG_FILE" 2>&1); then
+  printf '%s\n\n' "$REPORT" >&2
+  RESULT=$(printf '%s\n' "$REPORT" | grep '^RESULT: ' | tail -n 1)
+  case "$RESULT" in
+    *"external work session"*)
+      echo "commit-msg: this message links an external work session, which is not part of this project's record (#1107)." >&2
+      case "$RESULT" in
+        *"git will not store"*) echo "commit-msg: this message writes a record git will not store." >&2 ;;
+      esac
+      ;;
+    *) echo "commit-msg: this message writes a record git will not store." >&2 ;;
+  esac
   exit 1
 fi

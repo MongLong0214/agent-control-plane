@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
-import { homedir, tmpdir, userInfo } from "node:os";
-import { basename, dirname, join, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { afterAll, beforeAll } from "vitest";
+
+import { isWithin, LIVE_STATE_ROOT, resolvesToLiveState } from "./live-state-root.ts";
 
 /**
  * #1093 — every test file runs with HOME at a private temporary directory, never the operator's.
@@ -18,32 +20,10 @@ import { afterAll, beforeAll } from "vitest";
  * The directory is deliberately not under `tmpdir()`. The reviewer profile makes the per-user temp
  * directory writable, and `scratch-root.test.ts` (#489) holds the scratch root outside it; a HOME
  * placed there would make the scratch reviewer-writable and turn that check red.
+ *
+ * Nothing here needs to read the live state root. Where a sandbox makes it unreadable, the guard
+ * compares below it lexically (`live-state-root.ts`), so isolation still holds and the run proceeds.
  */
-
-/** The operator's live state root, from the passwd entry — HOME is exactly what this file moves. */
-export const LIVE_STATE_ROOT = join(userInfo().homedir, ".agent-control-plane");
-
-/** `path` with its deepest existing ancestor resolved, so a symlinked spelling still compares equal. */
-const resolved = (path: string): string => {
-  const tail: string[] = [];
-  let head = path;
-  while (!existsSync(head)) {
-    const parent = dirname(head);
-    if (parent === head) return path;
-    tail.unshift(basename(head));
-    head = parent;
-  }
-  return join(realpathSync(head), ...tail);
-};
-
-const isWithin = (path: string, root: string): boolean => {
-  const candidate = resolved(path);
-  const base = resolved(root);
-  return candidate === base || candidate.startsWith(`${base}${sep}`);
-};
-
-/** True when `path` is, or is inside, the operator's live `~/.agent-control-plane`. */
-export const resolvesToLiveState = (path: string): boolean => isWithin(path, LIVE_STATE_ROOT);
 
 /**
  * A system temporary root outside the reviewer-writable `tmpdir()`. There is no fallback to
