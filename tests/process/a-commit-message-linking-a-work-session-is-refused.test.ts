@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
@@ -62,13 +62,11 @@ const CLEAN = [
   "subject\n\njust a body, nothing to record\n",
 ];
 
-/** What `git commit -v` hands the hook: the diff sits below git's scissors line and is discarded. */
-const VERBOSE_TAIL =
-  "# ------------------------ >8 ------------------------\n" +
-  "# Do not modify or remove the line above.\n" +
-  "# Everything below it will be ignored.\n" +
-  "diff --git a/t.ts b/t.ts\n" +
-  `+const SESSION_URL = "${LINK}";\n`;
+/** Git's scissors line. Whether git discards what follows depends on a cleanup mode the hook never sees. */
+const SCISSORS = "# ------------------------ >8 ------------------------\n# Do not modify or remove the line above.\n";
+
+/** What `git commit -v` hands the hook: the staged diff, below git's scissors line. */
+const VERBOSE_TAIL = `${SCISSORS}# Everything below it will be ignored.\ndiff --git a/t.ts b/t.ts\n+const SESSION_URL = "${LINK}";\n`;
 
 describe("a message that links an external work session is refused (#1107)", () => {
   for (const [form, message] of LINKED) {
@@ -101,11 +99,114 @@ describe("a message that links an external work session is refused (#1107)", () 
     }
   });
 
-  it("reads a verbose commit's message, not the diff git appends below the scissors line", () => {
-    const clean = `subject\n\nwhat changed.\n\n${VERBOSE_TAIL}`;
-    expect(viaHook(clean).status, viaHook(clean).out).toBe(0);
-    const linked = `subject\n\n${LINK}\n\n${VERBOSE_TAIL}`;
-    expect(viaHook(linked).status).toBe(1);
+  it("reads the whole file, below git's scissors line too (review r2, R1)", () => {
+    // `git commit -F` keeps text below the scissors line, and the hook cannot see the cleanup mode.
+    for (const message of [`subject\n\nwhat changed.\n\n${SCISSORS}${LINK}\n`, `subject\n\nwhat changed.\n\n${VERBOSE_TAIL}`]) {
+      const checked = viaChecker(message);
+      expect(checked.status, checked.out).toBe(1);
+      const hooked = viaHook(message);
+      expect(hooked.status, hooked.out).toBe(1);
+      expect(hooked.out).toContain("external work session");
+      expect(checked.out + hooked.out).not.toContain(SYNTHETIC_ID);
+    }
+  });
+});
+
+/**
+ * Review r2, R1: the same refusals through a real `git commit`, with this repository's hook and
+ * checker installed in a scratch repository. `-F` is the case the scissors cut let through: git
+ * stored the link below that line and the hook exited 0.
+ */
+describe("a real git commit through the hook is refused when it links a work session (#1107)", () => {
+  // LC_ALL=C: a localized git translates the scissors line's second line, and the r2 cut never fired.
+  const gitEnv = (dir: string): NodeJS.ProcessEnv => ({
+    ...env,
+    LC_ALL: "C",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: join(dir, "absent-gitconfig"),
+  });
+
+  const repository = (): { dir: string; git: (args: string[], extra?: NodeJS.ProcessEnv) => Run; head: () => string } => {
+    const dir = tempDir("acp-session-link-commit-");
+    for (const file of [".githooks/commit-msg", "scripts/verify-trailers-are-parsable.mjs", "scripts/lib/record-trailer-keys.mjs"]) {
+      mkdirSync(dirname(join(dir, file)), { recursive: true });
+      copyFileSync(join(ROOT, file), join(dir, file));
+    }
+    chmodSync(join(dir, ".githooks/commit-msg"), 0o755);
+    const git = (args: string[], extra: NodeJS.ProcessEnv = {}): Run => {
+      const done = boundedSpawnSync("git", args, { cwd: dir, encoding: "utf8", env: { ...gitEnv(dir), ...extra } });
+      return { status: done.status ?? -1, out: `${done.stdout ?? ""}${done.stderr ?? ""}` };
+    };
+    for (const args of [
+      ["init", "-q", "-b", "main", "."],
+      ["config", "user.email", "fixture@example.invalid"],
+      ["config", "user.name", "fixture"],
+      ["config", "core.hooksPath", join(dir, ".githooks")],
+      ["add", "."],
+      ["commit", "-q", "--no-verify", "-m", "fixture"],
+    ]) {
+      const done = git(args);
+      expect(done.status, `git ${args.join(" ")}: ${done.out}`).toBe(0);
+    }
+    const head = (): string => git(["rev-parse", "HEAD"]).out.trim();
+    return { dir, git, head };
+  };
+
+  const commitFile = (repo: ReturnType<typeof repository>, message: string): Run =>
+    repo.git(["commit", "--allow-empty", "-q", "-F", messageFile(message)]);
+
+  /** A verbose editor commit: git appends the staged diff below its scissors line, then runs this editor. */
+  const commitVerbose = (repo: ReturnType<typeof repository>, staged: string): Run => {
+    writeFileSync(join(repo.dir, "t.ts"), staged);
+    expect(repo.git(["add", "t.ts"]).status).toBe(0);
+    const editor = join(repo.dir, "..", "editor.sh");
+    writeFileSync(editor, `#!/bin/sh\n{ printf 'verbose subject\\n\\nwhat changed.\\n'; cat "$1"; } > "$1.next" && mv "$1.next" "$1"\n`);
+    chmodSync(editor, 0o755);
+    return repo.git(["commit", "-q", "-v"], { GIT_EDITOR: editor });
+  };
+
+  it("refuses `git commit -F` with a link below the scissors line, and stores nothing", () => {
+    const repo = repository();
+    const before = repo.head();
+    const done = commitFile(repo, `subject\n\nwhat changed.\n\n${SCISSORS}${LINK}\n`);
+    expect(done.status, done.out).not.toBe(0);
+    expect(done.out).toContain("external work session");
+    expect(done.out).not.toContain(SYNTHETIC_ID);
+    expect(repo.head()).toBe(before);
+  });
+
+  it("still refuses the bare, labelled and embedded forms through `git commit -F`, and stores a clean one", () => {
+    const repo = repository();
+    const before = repo.head();
+    for (const [form, message] of LINKED) {
+      const done = commitFile(repo, message);
+      expect(done.status, `${form}: ${done.out}`).not.toBe(0);
+      expect(done.out).not.toContain(SYNTHETIC_ID);
+    }
+    expect(repo.head()).toBe(before);
+    const clean = commitFile(repo, CLEAN[0]!);
+    expect(clean.status, clean.out).toBe(0);
+    expect(repo.head()).not.toBe(before);
+  });
+
+  it("passes a verbose editor commit whose staged diff links nothing, and stores only the message", () => {
+    const repo = repository();
+    const done = commitVerbose(repo, "export const answer = 42;\n");
+    expect(done.status, done.out).toBe(0);
+    expect(repo.git(["log", "-1", "--format=%B"]).out.trim()).toBe("verbose subject\n\nwhat changed.");
+  });
+
+  it("refuses a verbose editor commit whose staged diff carries a link: the documented, fail-closed cost", () => {
+    // The hook reads every line git hands it, and in a verbose editor commit that includes the diff.
+    // docs/SECURITY.md: commit such a change without `-v`, and the message is checked alone.
+    const repo = repository();
+    const before = repo.head();
+    const done = commitVerbose(repo, `export const SESSION_URL = "${LINK}";\n`);
+    expect(done.status, done.out).not.toBe(0);
+    expect(done.out).toContain("external work session");
+    expect(repo.head()).toBe(before);
+    const plain = repo.git(["commit", "-q", "-F", messageFile("subject\n\nwhat changed.\n")]);
+    expect(plain.status, plain.out).toBe(0);
   });
 });
 

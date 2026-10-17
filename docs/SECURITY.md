@@ -49,3 +49,9 @@ and the CI range check (`pnpm trailers`) both run `scripts/verify-trailers-are-p
 rejects a session link, bare, labelled or embedded, and a session metadata line such as
 `Claude-Session:`. It reads only the message or range it is given, so the published commits keep
 their links (#1107).
+
+The hook reads every line of the file git hands it, including anything below git's scissors line.
+The hook is not told whether git will discard that part: `git commit -F` keeps it, so skipping it
+let a link through. The accepted cost is that a verbose editor commit (`git commit -v`) whose
+staged diff contains such a link is refused as well. Commit that change without `-v`, and the
+message is checked on its own.

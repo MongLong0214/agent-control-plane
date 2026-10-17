@@ -145,17 +145,18 @@ const SESSION_LINKS = [
 ];
 
 /**
- * What `git commit --verbose` appends below the message: git's scissors line, then the diff, which
- * git discards. Cut only on git's exact two lines, so a message cannot hide a link below a look-alike.
+ * Each line of `message` that links an external work session, described without the link.
+ *
+ * Every line is read, git's scissors line and everything below it included. Whether git discards
+ * that part is a cleanup mode the hook is never told: `git commit -F` keeps it, `-v` or
+ * `--cleanup=scissors` drop it, and the line's wording follows git's locale. Skipping it on the
+ * hook's guess stored a link from a plain `-F` commit (review r2, R1). The cost, accepted and
+ * documented in docs/SECURITY.md: a verbose editor commit whose staged diff carries such a link is
+ * refused too; commit that change without `-v`.
  */
-const VERBOSE_SCISSORS = "# ------------------------ >8 ------------------------\n# Do not modify or remove the line above.\n";
-
-/** Each line of `message` that links an external work session, described without the link. */
-const sessionLinks = (message, { verbose = false } = {}) => {
-  const cut = verbose ? message.indexOf(VERBOSE_SCISSORS) : -1;
-  const lines = (cut === -1 ? message : message.slice(0, cut)).split("\n");
+const sessionLinks = (message) => {
   const found = [];
-  lines.forEach((line, index) => {
+  message.split("\n").forEach((line, index) => {
     const key = SESSION_METADATA_LINE.exec(line);
     if (key !== null) found.push(`line ${String(index + 1)}: a \`${key[1]}:\` line`);
     else if (SESSION_LINKS.some((pattern) => pattern.test(line))) found.push(`line ${String(index + 1)}: a link`);
@@ -209,7 +210,7 @@ if (messageFileAt !== -1) {
   }
   const message = bytes.toString("utf8");
   const lost = unparsed(message, [], path === "-" ? [] : ["--message-file", path]);
-  const linked = sessionLinks(message, { verbose: true });
+  const linked = sessionLinks(message);
   if (lost.length > 0 || linked.length > 0) {
     const reasons = [];
     if (lost.length > 0) {

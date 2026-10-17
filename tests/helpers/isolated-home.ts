@@ -22,7 +22,8 @@ import { isWithin, LIVE_STATE_ROOT, resolvesToLiveState } from "./live-state-roo
  * placed there would make the scratch reviewer-writable and turn that check red.
  *
  * Nothing here needs to read the live state root. Where a sandbox makes it unreadable, the guard
- * compares below it lexically (`live-state-root.ts`), so isolation still holds and the run proceeds.
+ * compares below it lexically and follows a link to it by reading the link itself; a HOME it cannot
+ * account for is refused (`live-state-root.ts`), so isolation still holds and the run proceeds.
  */
 
 /**
