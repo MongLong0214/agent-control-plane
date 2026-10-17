@@ -22,7 +22,7 @@ import {
 } from "../guard/managed-write-guard.ts";
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
 import type { TrustedCredentialStore } from "./credential-store.ts";
-import { type BranchCommitMessage, composeSquashCommitMessage, composeSquashCommitTitle } from "./merge-commit-message.ts";
+import { type BranchCommitMessage, squashCommitForMerge } from "./merge-commit-message.ts";
 
 /**
  * The gate's GitHub-side correlator: run, candidate, and the payload digest that binds the rest.
@@ -1717,12 +1717,13 @@ export class GitHubKernel {
       });
     }
 
-    // What the merge commit will say, decided here rather than left to GitHub. Read before the
-    // reservation so a branch whose commits cannot be listed fails with nothing reserved: the
-    // fallback for an unreadable branch is GitHub's own composition, which is the leak this
-    // states the message to avoid. Only for `squash` — see `outgoingSquashCommitMessage`.
-    const outgoingCommitMessage =
-      method === "squash" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber, preflight) : undefined;
+    // What the merge commit will say, decided here before the reservation: a branch whose commits
+    // cannot be listed fails with nothing reserved, as GitHub's own composition is the leak this avoids.
+    // Squash only (`outgoingSquashCommitMessage`). Its Merged-Head is the `sha` the PUT below sends.
+    const outgoing = method === "squash" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber,
+      preflight, input.exactHeadSha) : allow(ReasonCode.OK, undefined); // or a refusal: records it cannot keep
+    if (!outgoing.allowed) return outgoing as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    const outgoingCommitMessage = outgoing.value;
 
     const target = this.writeTarget(input.runId, input.repositoryIdentity, preflight.head.ref);
     if (!target.allowed) return target as Decision<{ mergeCommitSha: string; replayed: boolean }>;
@@ -1915,13 +1916,15 @@ export class GitHubKernel {
    * Every failure here is a throw rather than a composed-anyway, because the fallback for "the
    * branch could not be read" is GitHub's own composition — precisely what this exists to
    * replace. It runs before the receipt reservation, so a failure leaves nothing reserved.
+   * Its one refusal, records the squash would not keep, is `squashCommitForMerge`'s.
    */
   private async outgoingSquashCommitMessage(
     owner: string,
     repo: string,
     pullNumber: number,
     pull: PullRequest,
-  ): Promise<{ title: string; message: string }> {
+    mergedHead: string,
+  ): Promise<Decision<{ title: string; message: string }>> {
     const expectedCount = pull.commits;
     if (typeof expectedCount !== "number" || !Number.isSafeInteger(expectedCount) || expectedCount < 1) {
       throw new Error(`pull request ${pullNumber} has no usable exact commit total`);
@@ -1966,10 +1969,7 @@ export class GitHubKernel {
     if (commits.at(-1)!.sha !== pull.head.sha) {
       throw new Error(`pull request ${pullNumber} commit list does not end at its exact head`);
     }
-    return {
-      title: composeSquashCommitTitle(commits, pull.title, pullNumber),
-      message: composeSquashCommitMessage(commits),
-    };
+    return squashCommitForMerge(commits, pull.title, pullNumber, mergedHead);
   }
 
   /** Translate the pinned contract vocabulary to GitHub's REST API vocabulary. */

@@ -1335,8 +1335,21 @@ describe("round-2 review: post-merge coverage and receipts", () => {
 describe("the outgoing squash message is stated by the daemon, not composed by GitHub", () => {
   const SESSION_URL = "https://claude.ai/code/session_0000000000000000000000";
 
-  /** The branch's commit messages, in the two shapes that reach `main` today. */
+  /**
+   * The branch's commit messages, in the two shapes that reach `main` today.
+   *
+   * The record-carrying commit is the branch's last: a squash keeps as trailers only its last
+   * paragraph, so a record in an earlier commit is kept only by a notes mirror, which this daemon
+   * does not write, and it refuses that squash before merging (S9-R1). Carried this way the record
+   * sits in the squash's own trailer block, which is what the merge-records gate reads.
+   */
   const BRANCH_COMMITS = [
+    {
+      message:
+        "docs: the second change\n\n" +
+        "The capture flow could not run, so the context is in this prose.\n" +
+        `Claude-Session: ${SESSION_URL}\n`,
+    },
     {
       message:
         "feat: the first change\n\n" +
@@ -1344,12 +1357,6 @@ describe("the outgoing squash message is stated by the daemon, not composed by G
         "Limit: the first commit's record\n" +
         "Record-Id: r-111111111111\n" +
         `X-Claude-Session: ${SESSION_URL}\n`,
-    },
-    {
-      message:
-        "docs: the second change\n\n" +
-        "The capture flow could not run, so the context is in this prose.\n" +
-        `Claude-Session: ${SESSION_URL}\n`,
     },
   ];
 
