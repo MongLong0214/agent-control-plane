@@ -31,9 +31,12 @@ export default defineConfig({
         : (["default"] as const)),
       ...(rpcTrace ? [rpcTrace.reporter] : []),
     ],
-    setupFiles: rpcTrace
-      ? [fileURLToPath(new URL("./tests/helpers/vitest-rpc-trace-worker.ts", import.meta.url))]
-      : [],
+    // #1093: HOME is a private temporary directory before any test file loads, so no run allocates
+    // under the live daemon's scratch root. First, so every later setup file already sees it.
+    setupFiles: [
+      fileURLToPath(new URL("./tests/helpers/isolated-home.ts", import.meta.url)),
+      ...(rpcTrace ? [fileURLToPath(new URL("./tests/helpers/vitest-rpc-trace-worker.ts", import.meta.url))] : []),
+    ],
     outputFile: {
       junit: "evidence/junit.xml",
       json: "evidence/local/ci-vitest-results.json",
