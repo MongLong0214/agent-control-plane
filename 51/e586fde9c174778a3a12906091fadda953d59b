@@ -1,0 +1,4 @@
+Limit: ACP trusts the Gateway channel for the peer_grant the same way it trusts it for the owner principal; argument scope per run, project and key is enforced by the Hermes guard config, not by ACP
+Warn: admitHermesProvenance admits a peer principal only after every existing check (anchor, cron false, depth 0, session, lineage), and only with a digest-shaped peer_grant and a tool in HERMES_PEER_DELEGABLE_TOOLS (escalation_resolve, ceo_decision_submit, run_create, run_dispatch); a peer ceo_decision_submit is limited to FINAL_REVISE or CONFIRM from the parsed arguments the handler executes; the admitted principal and peer_grant are recorded on the mutation audit rows
+Record-Id: r-ceopeerdelegatedmutation
+Provenance: inherited 65437706d5adbf15d6d49a00e38a74134b7f2403
