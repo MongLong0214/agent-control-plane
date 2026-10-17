@@ -1,0 +1,20 @@
+Limit: ACP stores no provider account id, so the persisted reading is matched on registration generation plus window reset instead of an account identity
+Warn: after a restart a worker admission may use the newest persisted WORKER reading only if provider, role and registration generation match and it is within freshnessMs of its original observation; a restart never refreshes it, and expired, future-dated, mismatched or unparseable readings are refused; the critical-role stale grace keeps its fixed end and a provider switch is re-checked after its wait so it cannot extend the grace; capacity snapshots are ordered by parsed time, not observed_at text
+Record-Id: r-capacityrestartfreshness
+Provenance: inherited d3d4ae112ae437f504e54a09f258c36dd8b830a1
+
+Warn: a persisted WORKER reading is restored after a restart only when its account digest (sha256 of the Claude CLI's own orgId and email from auth status, read before and after usage; never stored raw) matches the fresh one, it is within freshnessMs of its original observation, and no CAPACITY_ROLE_INVALIDATED row for that provider and role is at or after it; providers that report no account identity (Codex, Grok) are refused and audited rather than guessed from reset time or registration order
+Warn: a capacity row with an unparseable observed_at stored after the newest valid one makes the reading SUSPENDED and the burn unknown, so legacy malformed evidence never lets an older healthy row win; a later valid row replaces it
+Record-Id: r-capacityrestoreaccountidentity
+Supersedes: r-capacityrestartfreshness
+Provenance: inherited 5664d20be6c8e502d082655ecdb5e62cbda333dd
+
+Warn: the Claude collection (identity, usage, identity) runs under one deadline, min(45 s, 20 s + 2 x 5 s) = 30 s, inside the collector and doctor bound; the usage read keeps its 20 s, an identity read that runs out of time yields no identity (the reading stays HEALTHY but is not restorable), and the second identity read is skipped when the first found none
+Record-Id: r-claudecollectiondeadline
+Follows: r-capacityrestoreaccountidentity
+Provenance: inherited be827f3fd8a65aa3ae46928ae44e8990deff7a43
+
+Warn: a persisted capacity reading is withdrawn if any CAPACITY_ROLE_INVALIDATED event for its provider and role is logged after it in durable audit order; wall-clock time no longer decides, so a backward clock step plus a second invalidation cannot restore a withdrawn reading, and an invalidation whose order cannot be read counts as applying
+Record-Id: r-capacityinvalidationorder
+Follows: r-capacityrestoreaccountidentity
+Provenance: inherited 9aeae0c77c11c030aac78b7165c57e1ec6c571bf
