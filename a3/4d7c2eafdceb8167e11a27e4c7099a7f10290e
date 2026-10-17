@@ -1,0 +1,14 @@
+Warn: worker and CTO turns run under a group holder and a group is signalled only while its leader is unreaped, the group existed at spawn and the start token matches, so shared groups, foreign processes and reused pids get no signal; an unidentified worker orphan is released only by the audited repair release_unidentified_worker_orphan, which refuses while ps shows the worker and signals nothing; ignored-path changes are named in the receipt; an unconfirmed probe reap names its group
+Record-Id: r-workerprocessownership
+Provenance: inherited 7a1a4570fa1c02f72d8dc8534d2602eb021f8b3f
+
+Warn: an unidentified worker orphan is released only by the operator's admitted, consumed, never-refused repair receipt bound to the orphan event; ignored nested repositories are walked by lstat and readdir so their changes are named; an unproved process group gets no signal and an explicit failure; a turn whose group cleanup is unconfirmed returns ok:false naming the group and is refused by the session runtime and worker turns
+Record-Id: r-workerprocessownershipfix
+Follows: r-workerprocessownership
+Provenance: inherited 759aec714d82f5716828c13c50b2ace526046ef0
+
+Limit: a raw SQL writer can still forge a release record; blocking that needs a schema change
+Warn: an unidentified worker orphan is freed only by the repair's own release record, written after the owner is checked live through the configured owner authority and bound by a digest to the execution, worker session, orphan event and receipt; the reader no longer consults the ingress replay cache, so a completed release survives pruning, and a refused repair does not bar the receipt from a later genuine release
+Record-Id: r-orphanreleaserepairauthority
+Follows: r-workerprocessownershipfix
+Provenance: inherited 82cb44c9ef8041562e3deb2698af0d69a89394df
