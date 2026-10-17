@@ -11,7 +11,8 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { git } from "../git/git.ts";
-import { resolveExecutable, runtimeEnvironment } from "../runtime/cli-adapters.ts";
+import { runtimeEnvironment } from "../runtime/cli-adapters.ts";
+import { COMMITLORE_BINARY_VARIABLE, commitlorePin, verifyCommitLorePin } from "./commitlore-pin.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
 import { frameRecord, unframeRecord, writeWholeSync } from "./whole-write.ts";
 
@@ -219,8 +220,8 @@ export const commitloreChildHome = (): string => {
 };
 
 /**
- * `commitlore` as a child: resolved on this process's PATH before the child's environment is built (that
- * environment's PATH does not carry it), argv only, no shell, bounded in time and output.
+ * One `commitlore` child at `executable`: argv only, no shell, bounded in time and output, in the child
+ * environment above (whose PATH does not carry it).
  *
  * Review S11-R1-02 — a deadline that expires and an output bound that is exceeded are failures fixed the
  * moment they happen: the answer is refused then, and nothing the child does afterwards, an exit 0 with a
@@ -230,12 +231,12 @@ export const commitloreChildHome = (): string => {
  * process id or a group. At most `maxOutputBytes` of each stream is kept, and the answer settles within
  * `timeoutMs`, or within `drainMs` of the child's exit when a descendant holds its pipes open.
  */
-export const commitloreRunner =
-  (limits: Readonly<CommitLoreLimits> = COMMITLORE_LIMITS): CommitLoreRunner =>
+const commitloreChild =
+  (executable: string, limits: Readonly<CommitLoreLimits>): CommitLoreRunner =>
   (argv, cwd) =>
     new Promise((resolvePromise, reject) => {
       const home = commitloreChildHome();
-      const child = spawn(resolveExecutable("commitlore"), [...argv], {
+      const child = spawn(executable, [...argv], {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         timeout: limits.timeoutMs,
@@ -321,7 +322,29 @@ export const commitloreRunner =
       });
     });
 
-/** The production port: the `commitlore` on this process's PATH, run with `COMMITLORE_OBSERVATION_ARGV`. */
+/**
+ * Slice S16 — `commitlore` as a child: the executable `ACP_COMMITLORE_BINARY` pins (`commitlore-pin.ts`), read
+ * when the runner is made, as the provider CLIs' pins are read when their adapters are made, and never
+ * looked up on any PATH. Every command is preceded by the pin's checks: the pin is a usable absolute path,
+ * and the CLI there answers a supported `--version` and has the `doctor --json` command, each asked through
+ * the same bounded child in the same constructed environment. A pin that fails any of them is refused as a
+ * command that could not be run, and nothing else is run with it.
+ */
+export const commitloreRunner =
+  (
+    limits: Readonly<CommitLoreLimits> = COMMITLORE_LIMITS,
+    pin: string | undefined = process.env[COMMITLORE_BINARY_VARIABLE],
+  ): CommitLoreRunner =>
+  async (argv, cwd) => {
+    const executable = commitlorePin(pin);
+    if (!executable.allowed) throw new Error(executable.message);
+    const run = commitloreChild(executable.value, limits);
+    const unsupported = await verifyCommitLorePin(executable.value, run, cwd);
+    if (unsupported !== null) throw new Error(unsupported);
+    return run(argv, cwd);
+  };
+
+/** The production port: the pinned `commitlore` (`commitloreRunner`), run with `COMMITLORE_OBSERVATION_ARGV`. */
 export const createCommitLoreCliPort = (run: CommitLoreRunner = commitloreRunner()): CommitLorePort => ({
   async observe(checkoutPath) {
     const [initArgv, doctorArgv] = COMMITLORE_OBSERVATION_ARGV as [readonly string[], readonly string[]];

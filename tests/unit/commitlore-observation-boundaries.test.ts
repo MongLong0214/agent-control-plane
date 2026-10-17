@@ -28,12 +28,21 @@ afterAll(() => {
 const root = tempDir("acp-s11-r1-boundaries-");
 const ok = JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] });
 
-/** A `commitlore` on PATH that is `body`, run by this Node, its directory first on this process's PATH. */
+// Slice S16: what the runner asks a pinned CLI before any other command, answered as a supported one does.
+const PIN_CHECKS = `if (process.argv[2] === '--version') process.stdout.write('1.7.3\\n');
+else if (process.argv[2] === 'doctor' && process.argv[3] === '--help') process.stdout.write('Usage: commitlore doctor [options]\\n  --json  emit the report as JSON\\n');
+else {`;
+
+/**
+ * A `commitlore` that is `body`, run by this Node, pinned by `ACP_COMMITLORE_BINARY` (slice S16) and
+ * answering the pin's checks first; its directory is also first on this process's PATH.
+ */
 const fake = (name: string, body: string): string => {
   const dir = tempDir(`acp-s11-r1-${name}-`);
   writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
-  writeFileSync(join(dir, "commitlore"), `#!${process.execPath}\n${body}\n`, { mode: 0o700 });
+  writeFileSync(join(dir, "commitlore"), `#!${process.execPath}\n${PIN_CHECKS}\n${body}\n}\n`, { mode: 0o700 });
   vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
+  vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
   return dir;
 };
 
@@ -98,7 +107,7 @@ it("R1-01: CommitLore children receive no daemon authority variables, a known na
     "GIT_ASKPASS",
   ]);
   expect(Object.keys(observed).filter((key) => !constructed.has(key) && key !== "__CF_USER_TEXT_ENCODING")).toEqual([]);
-  // The daemon's PATH is used to find `commitlore`, and is not handed to it.
+  // The daemon's PATH is not handed to it (and, since slice S16, is not used to find it either).
   expect(observed["PATH"]?.split(":")).not.toContain(bin);
 });
 
