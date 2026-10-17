@@ -4,6 +4,8 @@ import { join } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
+import { REPO_FACTORY_RESULT_SCHEMA_ID } from "../../src/bootstrap/repo-factory-result.ts";
+import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { type Decision, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
@@ -14,6 +16,7 @@ import { MessageKind } from "../../src/outbox/envelope.ts";
 import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD, type SpawnAttestation } from "../../src/runtime/provisioned-session-runtime.ts";
 import type { SessionHandle, SessionTurnRequest, SessionTurnResult } from "../../src/runtime/provider.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
+import { BOOTSTRAP_IDENTITY, BOOTSTRAP_REQUEST_DIGEST, bootstrapPlan, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest, registerFixtureProject } from "../helpers/harness.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
@@ -68,6 +71,44 @@ type OpenActivationHandoff = (
 const openActivationHandoff = (f: BootstrapRuntimeFixture): OpenActivationHandoff => {
   const bootstrap = f.harness.cp.bootstrap as unknown as { openActivationHandoff: OpenActivationHandoff };
   return bootstrap.openActivationHandoff.bind(bootstrap);
+};
+
+/**
+ * Review of run_7717 (F4) — a BOOTSTRAP handoff is acknowledged only while it carries the repository
+ * facts of its run's stored producer result. Activation stores that result, under the run's PLAN, before
+ * it opens a handoff; a witness that opens one directly stores the PLAN and result activation would
+ * have, and delivers their facts.
+ */
+const OBSERVED_HEAD = "a".repeat(40);
+const producedHandoff = (f: BootstrapRuntimeFixture, runId: string, projectId: string): HandoffPackage => {
+  const manifest = cleanTreeManifest(projectId);
+  const plan = f.harness.cp.artifacts.put(runId, "PLAN", bootstrapPlan(manifest));
+  const at = f.harness.clock.nowIso();
+  f.harness.cp.artifacts.put(runId, "REPO_FACTORY_RESULT", {
+    schema: REPO_FACTORY_RESULT_SCHEMA_ID,
+    runId,
+    bootstrapOperationId: "op-bootstrap",
+    planDigest: plan.digest,
+    projectManifestDigest: manifestDigest(manifest),
+    repositories: [{ role: "primary", identity: BOOTSTRAP_IDENTITY, proposedCheckoutPath: null, defaultBranch: "main", createdBranches: [] }],
+    externalWriteReceipts: [{
+      bootstrapOperationId: "op-bootstrap",
+      requestDigest: BOOTSTRAP_REQUEST_DIGEST,
+      operationId: "create-repository:fixture",
+      resourceType: "repository",
+      resourceIdentity: BOOTSTRAP_IDENTITY,
+      preexisting: false,
+      beforeStateDigest: null,
+      afterStateDigest: "sha256:created",
+      createdAt: at,
+      rereadAt: at,
+      verified: true,
+    }],
+    bootstrapVerification: [{ commandId: "clean-tree", repositoryIdentity: BOOTSTRAP_IDENTITY, exactHead: OBSERVED_HEAD, status: "PASS" }],
+    ciEvidence: [],
+    unresolvedGaps: [],
+  });
+  return { ...HANDOFF, repositoryFacts: [{ identity: BOOTSTRAP_IDENTITY, branch: "main", head: OBSERVED_HEAD }] };
 };
 
 /** A bootstrap run, dispatched, and a driven PRIMARY_CTO provisioned for the project it activates. */
@@ -314,7 +355,8 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       };
 
       const turnsBeforeHandoff = f.finishedTurns(binding.sessionId);
-      const opened = openActivationHandoff(f)("handoff-project", bootstrap.runId, binding.sessionId, HANDOFF);
+      const delivered = producedHandoff(f, bootstrap.runId, "handoff-project");
+      const opened = openActivationHandoff(f)("handoff-project", bootstrap.runId, binding.sessionId, delivered);
       if (!opened.allowed) throw new Error(opened.message);
       const handoffId = opened.value.handoffId;
       const row = cp.db.get<{ message_id: string }>(
@@ -341,7 +383,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         f.claude.turns.filter((turn) =>
           turn.handle.externalSessionId === external && turn.relay !== null && !/session_attest/.test(turn.prompt)).length;
       const turnsAfterFirst = workTurns();
-      expect(openActivationHandoff(f)("handoff-project", bootstrap.runId, binding.sessionId, HANDOFF)).toMatchObject({
+      expect(openActivationHandoff(f)("handoff-project", bootstrap.runId, binding.sessionId, delivered)).toMatchObject({
         allowed: true,
         value: { handoffId },
       });
@@ -352,7 +394,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         targetSessionId: binding.sessionId,
         runId: bootstrap.runId,
         kind: MessageKind.HANDOFF_PACKAGE,
-        payload: { handoffId, projectId: "handoff-project", handoff: HANDOFF },
+        payload: { handoffId, projectId: "handoff-project", handoff: delivered },
       });
       expect(again.reasonCode).toBe(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED);
       const conversation = { wake: async () => allow(ReasonCode.OK, undefined) };
@@ -515,7 +557,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(true);
 
       // The activation's handoff arrives: its wake is refused and no turn runs on the stale READY.
-      const opened = openActivationHandoff(f)("stale-project", bootstrap.runId, binding.sessionId, HANDOFF);
+      const opened = openActivationHandoff(f)("stale-project", bootstrap.runId, binding.sessionId, producedHandoff(f, bootstrap.runId, "stale-project"));
       if (!opened.allowed) throw new Error(opened.message);
       const messageId = cp.db.get<{ message_id: string }>(
         `SELECT message_id FROM outbox WHERE idempotency_key = ?`,

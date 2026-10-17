@@ -23,6 +23,7 @@ import {
   bootstrapPlanIntentTasks,
   bootstrapReviewIntentCurrent,
   currentBootstrapPlan,
+  deliveredBootstrapHandoff,
   sameBootstrapPlanBinding,
 } from "./bootstrap-plan.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
@@ -307,12 +308,13 @@ export class BootstrapActivation {
     const ctoSession = this.sessions.get(primaryCtoBinding.sessionId);
 
     // 8/9. Structured handoff must be persisted and acknowledged *by the incoming
-    // session* (§26.5). This call only records and delivers it; the ack is a separate act.
+    // session* (§26.5). This call only records and delivers it; the ack is a separate act. What is
+    // delivered carries the repository facts of the validated result, not the PLAN-time nulls (F4).
     const handoff = this.openActivationHandoff(
       projectId,
       input.runId,
       primaryCtoBinding.sessionId,
-      input.handoff,
+      deliveredBootstrapHandoff(input.handoff, result),
     );
     if (!handoff.allowed) return handoff as Decision<ACPBootstrapActivationResult>;
     const handoffAck = this.acknowledgedActivationHandoff(
@@ -563,6 +565,44 @@ export class BootstrapActivation {
     }
     const project = this.projects.get(projectId);
     const primary = this.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }));
+    // Review of run_7717 (F2) — activation compared the manifest before this transaction. The CONFIRM
+    // completes only while the project's active manifest is still the one the run's current PLAN names,
+    // and its repository bindings are the PLAN's planned target (checked with the bindings below).
+    const plan = currentBootstrapPlan(input.runId, this.artifacts.latest<unknown>(input.runId, ArtifactKind.PLAN));
+    if (!plan.allowed) return plan as Decision<ACPBootstrapActivationResult>;
+    const plannedManifestDigest = plan.value.binding.projectManifestDigest;
+    if (project?.activeManifestDigest !== plannedManifestDigest) {
+      return deny(
+        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        "the project's active manifest is not the one this run's PLAN names; the CONFIRM completes nothing on another manifest",
+        {
+          refusal: "ACTIVE_MANIFEST_NOT_PLANNED",
+          runId: input.runId,
+          projectId,
+          activeManifestDigest: project?.activeManifestDigest ?? null,
+          projectManifestDigest: plannedManifestDigest,
+        },
+      );
+    }
+    // Review of run_7717 (F3) — the handoff was opened to, and is acknowledged only by, one session. The
+    // CONFIRM completes only while that session is the project's PRIMARY_CTO: a replacement bound since
+    // has received and acknowledged nothing, and no path redelivers a bootstrap handoff to it.
+    if (primary !== null && primary.sessionId !== handoffArtifact.content.toSessionId) {
+      return deny(
+        ReasonCode.HANDOFF_ACK_REQUIRED,
+        "the bootstrap handoff's recipient is no longer the project's PRIMARY_CTO; the replacement has acknowledged nothing, so the CONFIRM completes nothing",
+        {
+          refusal: "ACK_RECIPIENT_NOT_PRIMARY_CTO",
+          runId: input.runId,
+          projectId,
+          handoffId: handoffArtifact.content.handoffId,
+          handoffRecipient: handoffArtifact.content.toSessionId,
+          primaryCto: primary.sessionId,
+          primaryCtoGeneration: primary.bindingGeneration,
+        },
+      );
+    }
+    const target = plan.value.outputs.target;
     const ctoSession = primary ? this.sessions.get(primary.sessionId) : null;
     const handoffAck = this.acknowledgedActivationHandoff(
       input.runId,
@@ -573,6 +613,8 @@ export class BootstrapActivation {
       const local = this.repositories.byIdentity(repository.identity);
       if (
         !local ||
+        repository.identity !== target.repositoryIdentity ||
+        repository.role !== target.repositoryRole ||
         local.projectId !== projectId ||
         local.repositoryRole !== repository.role ||
         local.activeManifestDigest !== project?.activeManifestDigest
@@ -748,8 +790,8 @@ export class BootstrapActivation {
 
   /** The ack, as recorded by the incoming session itself. */
   acknowledgeActivationHandoff(handoffId: string, ackBySessionId: string): Decision<void> {
-    const row = this.db.get<{ to_session_id: string; status: string; kind: string }>(
-      `SELECT to_session_id, status, kind FROM handoffs WHERE handoff_id = ?`,
+    const row = this.db.get<{ to_session_id: string; status: string; kind: string; package_json: string }>(
+      `SELECT to_session_id, status, kind, package_json FROM handoffs WHERE handoff_id = ?`,
       [handoffId],
     );
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId });
@@ -763,6 +805,8 @@ export class BootstrapActivation {
         got: ackBySessionId,
       });
     }
+    const observed = this.observedHandoffFacts(handoffId, JSON.parse(row.package_json) as Partial<HandoffPackage>);
+    if (!observed.allowed) return observed;
     if (row.status === "ACKED") return allow(ReasonCode.OK, undefined);
     this.db.run(
       `UPDATE handoffs SET status = 'ACKED', acked_at = ?, ack_by_session_id = ? WHERE handoff_id = ?`,
@@ -775,6 +819,62 @@ export class BootstrapActivation {
       evidence: { handoffId, source: "bootstrap-activation" },
     });
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * Review of run_7717 (F4) — the repository facts a BOOTSTRAP handoff must carry for its ACK to be
+   * accepted: for each repository its run's stored producer result names, exactly one fact, whose branch
+   * is the PLAN's default branch (for a create-only plan, the manifest's; the one the create's readback
+   * reported; for a run whose PLAN has no planned outputs, the manifest's) and whose head is the
+   * 40-hex exact head that result carries (for a create-only plan, the initialized commit its create
+   * receipt read back). A null, planned or other value is refused, and the handoff stays PENDING.
+   */
+  private observedHandoffFacts(handoffId: string, handoff: Partial<HandoffPackage>): Decision<void> {
+    const owner = this.db.get<{ run_id: string }>(
+      `SELECT run_id FROM run_artifacts WHERE kind = ? AND superseded = 0 AND json_extract(content_json, '$.handoffId') = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      [ArtifactKind.HANDOFF, handoffId],
+    );
+    const stored = owner ? this.artifacts.latest<unknown>(owner.run_id, ArtifactKind.REPO_FACTORY_RESULT) : null;
+    const parsed = stored ? parseRepoFactoryResult(stored.content) : null;
+    const result = parsed?.allowed ? parsed.value : null;
+    // The PLAN's default branch (for a create-only plan, the manifest's branchProfile.defaultBranch); for
+    // a run whose PLAN predates planned outputs, the manifest's the result was produced under.
+    const plan = owner ? currentBootstrapPlan(owner.run_id, this.artifacts.latest<unknown>(owner.run_id, ArtifactKind.PLAN)) : null;
+    const defaultBranch = plan?.allowed
+      ? plan.value.outputs.defaultBranch
+      : result
+        ? (this.projects.manifest(result.projectManifestDigest)?.branchProfile.defaultBranch ?? null)
+        : null;
+    const expected = result
+      ? result.repositories.map((repository) => ({
+          identity: repository.identity,
+          branch: repository.defaultBranch === defaultBranch ? defaultBranch : null,
+          head: result.bootstrapVerification.find((row) => row.repositoryIdentity === repository.identity)?.exactHead ?? null,
+        }))
+      : [];
+    const delivered = Array.isArray(handoff.repositoryFacts) ? handoff.repositoryFacts : [];
+    const observed =
+      expected.length > 0 &&
+      delivered.length === expected.length &&
+      expected.every((want) => {
+        const facts = delivered.filter((fact) => fact?.identity === want.identity);
+        return (
+          facts.length === 1 &&
+          want.branch !== null &&
+          want.head !== null &&
+          /^[0-9a-f]{40}$/.test(want.head) &&
+          facts[0]!.branch === want.branch &&
+          facts[0]!.head === want.head
+        );
+      });
+    return observed
+      ? allow(ReasonCode.OK, undefined)
+      : deny(
+          ReasonCode.HANDOFF_PACKAGE_INCOMPLETE,
+          "the handoff does not carry the observed default branch and exact head of every created repository, so it is not acknowledged",
+          { refusal: "HANDOFF_FACTS_NOT_OBSERVED", handoffId, runId: owner?.run_id ?? null, expected, delivered },
+        );
   }
 
   private acknowledgedActivationHandoff(

@@ -15,6 +15,7 @@ import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
 import type { Db } from "../db/database.ts";
 import { RunKind } from "../domain/types.ts";
 import { parseGitHubIdentity } from "./github-write-port.ts";
+import type { RepoFactoryResult } from "./repo-factory-result.ts";
 import { githubOperationSchema, isCreateOnlyPlan, preflightGitHubOperations, type GitHubOperation } from "./repo-factory-github.ts";
 import {
   VERIFICATION_KINDS,
@@ -105,6 +106,22 @@ export const bootstrapActivationHandoff = (manifest: ProjectManifest): HandoffPa
   })),
   knownRisks: [],
   recommendedNextAction: "acknowledge this handoff; the project's first work arrives as a run",
+});
+
+/**
+ * Review of run_7717 (F4) — the handoff activation delivers: `planned` (whose repository facts the PLAN
+ * cannot know before the create, so null) with each produced repository's facts taken from the stored
+ * producer result — the default branch the create's readback reported and the exact head it read back
+ * (for a create-only plan, the parentless commit GitHub initialized). Derived from that stored result
+ * alone, never from a fresh read, so a retried activation delivers the same package.
+ */
+export const deliveredBootstrapHandoff = (planned: HandoffPackage, result: RepoFactoryResult): HandoffPackage => ({
+  ...planned,
+  repositoryFacts: result.repositories.map((repository) => ({
+    identity: repository.identity,
+    branch: repository.defaultBranch,
+    head: result.bootstrapVerification.find((row) => row.repositoryIdentity === repository.identity)?.exactHead ?? null,
+  })),
 });
 
 export interface BootstrapPlanPreflight {

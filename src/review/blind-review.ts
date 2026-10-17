@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { bootstrapLifecycleSection } from "../bootstrap/bootstrap-lifecycle.ts";
+import { bootstrapLifecycleSection, type BootstrapPlanTaskProvenance } from "../bootstrap/bootstrap-lifecycle.ts";
 import {
   BOOTSTRAP_PLAN_INTENT_BOUNDS,
   type BootstrapPlanBinding,
@@ -67,6 +67,7 @@ import {
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { TaskContract } from "../run/run-engine.ts";
+import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
 
 export interface ReviewFinding {
   category: ReviewFindingCategory;
@@ -215,6 +216,8 @@ interface TrustedBootstrapPlanReview {
   /** What the PLAN and its one task say they intend, reloaded with the binding, and its digest. */
   intent: BootstrapPlanIntent;
   intentDigest: string;
+  /** Whether a BOOTSTRAP_PLAN_TASKS record binds the run's live task to this PLAN, read from the store. */
+  planTask: BootstrapPlanTaskProvenance;
 }
 
 /** A CONTRACT_CHANGE candidate's change once it has been reloaded from the PLAN it names. */
@@ -1598,7 +1601,7 @@ export class BlindReviewGate {
       JSON.stringify(inputs.outputs, null, 2),
       "```",
       "",
-      ...bootstrapLifecycleSection(),
+      ...bootstrapLifecycleSection(inputs.planTask),
       "## Required coverage",
       ...expected.map((target) => `- ${target.identity}:${target.path}`),
       "",
@@ -1926,12 +1929,14 @@ export class BlindReviewGate {
     }
     // What the PLAN says it intends, from the same PLAN artifact and the run's one live task. A field
     // over its bound refuses the review here, before any reviewer is constituted.
-    const intent = bootstrapPlanIntent({
-      runId: request.runId,
-      planArtifact,
-      tasks: bootstrapPlanIntentTasks(this.db, request.runId),
-    });
+    const tasks = bootstrapPlanIntentTasks(this.db, request.runId);
+    const intent = bootstrapPlanIntent({ runId: request.runId, planArtifact, tasks });
     if (!intent.allowed) return intent as Decision<TrustedBootstrapPlanReview>;
+    // Review of run_7717 (F6) — this run's own PLAN-task provenance, for the lifecycle the reviewer is shown.
+    const live = tasks.filter((task) => task.state !== "CANCELLED");
+    const taskId = live.length === 1 ? live[0]!.taskId : null;
+    const planDigest = current.value.binding.planDigest;
+    const planTask = { taskId, planDigest, recorded: taskId !== null && bootstrapPlanTaskRecorded(this.db, request.runId, taskId, planDigest) };
     return allow(ReasonCode.OK, {
       runId: request.runId,
       snapshot: request.snapshot,
@@ -1942,6 +1947,7 @@ export class BlindReviewGate {
       manifest: current.value.manifest,
       intent: intent.value.intent,
       intentDigest: intent.value.digest,
+      planTask,
     });
   }
 

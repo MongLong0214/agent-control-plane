@@ -70,12 +70,18 @@ describe("W2: every lifecycle statement is tied to the code that enforces it", (
       expect(item.sites.length, item.id).toBeGreaterThan(0);
       for (const site of item.sites) expect(site.enforces.length, `${item.id} ${site.symbol}`).toBeGreaterThan(0);
     }
-    // A NOT_VERIFIED item about a missing check names the check, so adding it fails here.
-    for (const id of ["confirm-manifest-recheck", "confirm-ack-recipient"]) {
+    // Review of run_7717 — the two checks once reported absent (F2, F3) are enforced now, and the
+    // application's terminal state (F5) and the delivered facts (F4) are stated with their code.
+    for (const id of ["confirm-manifest-recheck", "confirm-ack-recipient", "application-completed", "handoff-observed-facts"]) {
       const item = BOOTSTRAP_POST_CONFIRM_LIFECYCLE.find((candidate) => candidate.id === id)!;
-      expect(item.kind).toBe(BootstrapLifecycleKind.NOT_VERIFIED);
-      expect(item.sites.some((site) => (site.absent ?? []).length > 0), id).toBe(true);
+      expect(item.kind, id).toBe(BootstrapLifecycleKind.IMPLEMENTED_GUARANTEE);
     }
+    // F1 — the forged-ledger item states the trust boundary and keeps the checks it does not exempt.
+    const forged = BOOTSTRAP_POST_CONFIRM_LIFECYCLE.find((candidate) => candidate.id === "forged-ledger")!;
+    expect(forged.kind).toBe(BootstrapLifecycleKind.NOT_VERIFIED);
+    expect(forged.statement).toContain("single local owner account");
+    expect(forged.statement).toContain("not an exemption");
+    expect(forged.sites[0]!.enforces).toEqual(expect.arrayContaining(["WRONG_TARGET", "already exists and carries no receipt from this bootstrap operation"]));
   });
 
   it.each(BOOTSTRAP_POST_CONFIRM_LIFECYCLE.map((item) => [item.id, item] as const))("%s: its sites still enforce it", (_id, item) => {
@@ -90,14 +96,39 @@ describe("W2: every lifecycle statement is tied to the code that enforces it", (
       `src/bootstrap/activation.ts incompleteness: missing ${JSON.stringify('missing.push("handoffAck")')}`,
     ]);
     const recipient = BOOTSTRAP_POST_CONFIRM_LIFECYCLE.find((item) => item.id === "confirm-ack-recipient")!.sites[0]!;
-    const checked = activation.replace(
-      "const handoffAck = this.acknowledgedActivationHandoff(\n      input.runId,\n      handoffArtifact.content.handoffId,",
-      "if (primary && primary.sessionId !== handoffArtifact.content.toSessionId) return deny(ReasonCode.CONFLICT, \"x\", {});\n    const handoffAck = this.acknowledgedActivationHandoff(\n      input.runId,\n      handoffArtifact.content.handoffId,",
-    );
-    expect(checked).not.toBe(activation);
-    expect(violations(checked, recipient)).toEqual([
-      `src/bootstrap/activation.ts finalizeBootstrapActivationConfirm: now checks ${JSON.stringify("primary.sessionId !==")}`,
+    expect(violations(activation, recipient)).toEqual([]);
+    const unchecked = activation.replace("primary.sessionId !== handoffArtifact.content.toSessionId", "false");
+    expect(unchecked).not.toBe(activation);
+    expect(violations(unchecked, recipient)).toEqual([
+      `src/bootstrap/activation.ts finalizeBootstrapActivationConfirm: missing ${JSON.stringify("primary.sessionId !== handoffArtifact.content.toSessionId")}`,
     ]);
+    // F5 — the CONFIRM no longer moving the application to COMPLETED is reported.
+    const gate = source("src/ceo/production-gate.ts");
+    const completed = BOOTSTRAP_POST_CONFIRM_LIFECYCLE.find((item) => item.id === "application-completed")!.sites.find((site) => site.symbol === "submitCeoDecision")!;
+    expect(violations(gate, completed)).toEqual([]);
+    expect(violations(gate.replace("applications.markCompleted(input.runId, input.candidateSnapshotDigest)", "allow(ReasonCode.OK, null)"), completed)).toEqual([
+      `src/ceo/production-gate.ts submitCeoDecision: missing ${JSON.stringify("applications.markCompleted(input.runId, input.candidateSnapshotDigest)")}`,
+    ]);
+  });
+
+  it("F6: the run's own PLAN-task provenance is rendered as an enforced fact when recorded and as NOT_VERIFIED when not, and not at all unnamed", () => {
+    const at = (lines: string[], text: string) => lines.findIndex((line) => line.startsWith(text));
+    const headings = (lines: string[]) => ({
+      guarantees: lines.indexOf("Guarantees the control plane implements after CONFIRM:"),
+      notVerified: lines.indexOf("Conditions the control plane does not verify:"),
+    });
+    const bound = bootstrapLifecycleSection({ taskId: "task_bound", planDigest: "sha256:plan", recorded: true });
+    const line = at(bound, "- [plan-task-provenance-this-run]");
+    expect(line).toBeGreaterThan(headings(bound).guarantees);
+    expect(line).toBeLessThan(headings(bound).notVerified);
+    expect(bound[line]).toContain("task task_bound is bound to its current PLAN sha256:plan by a BOOTSTRAP_PLAN_TASKS record");
+    const legacy = bootstrapLifecycleSection({ taskId: "task_legacy", planDigest: "sha256:plan", recorded: false });
+    expect(at(legacy, "- [plan-task-provenance-this-run]")).toBeGreaterThan(headings(legacy).notVerified);
+    expect(legacy[at(legacy, "- [plan-task-provenance-this-run]")]).toContain("no BOOTSTRAP_PLAN_TASKS record");
+    expect(at(bootstrapLifecycleSection(), "- [plan-task-provenance-this-run]")).toBe(-1);
+    // The site it names is the store read the review prompt computes it with.
+    expect(source("src/run/task-graph.ts")).toContain("export const bootstrapPlanTaskRecorded = ");
+    expect(source("src/review/blind-review.ts")).toContain("bootstrapPlanTaskRecorded(this.db, request.runId, taskId, planDigest)");
   });
 
   it("the prompt section is rendered from the items alone, grouped by kind, and the result schema from its constant", () => {
