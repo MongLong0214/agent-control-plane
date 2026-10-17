@@ -46,7 +46,7 @@ import {
 import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPO_FACTORY_GITHUB_WRITE_OPERATION } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
-import { ArtifactKind, Role, type RunRow, RunState, SessionLifecycle } from "../domain/types.ts";
+import { ArtifactKind, Role, type RoleBinding, type RunRow, RunState, SessionLifecycle } from "../domain/types.ts";
 import { buildAcceptanceReport } from "../export/acceptance-report.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
 import {
@@ -1847,6 +1847,7 @@ export class Daemon {
         // until the explicit non-preemptive restore path can safely move it.
         if (currentStillCovered) {
           this.releaseCoverageHold(required.roleKey, current.bindingGeneration, "the incumbent's provider covers the role again");
+          this.releaseContinuityReviewHolds(current);
           continue;
         }
 
@@ -2085,9 +2086,14 @@ export class Daemon {
           paused.push({ runId: run.runId, roleKey: required.roleKey, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
         }
       } else if (run.state === RunState.READY_FOR_CEO_REVIEW) {
+        // v44 records no hold outside BLOCKED, and the audit log stores `roleKey` redacted, so the
+        // pause says which role it held the run for, and on which candidate, under fields it keeps:
+        // `RunEngine.#continuityReviewHold` hands the wait back only for that role and candidate.
         const waiting = this.cp.runs.transition(run.runId, RunState.AWAITING_HUMAN, reason, {
           roleKey: required.roleKey,
           continuityAction: "PAUSE_NEW_WORK",
+          continuityHold: required.roleKey,
+          candidateSnapshotDigest: this.cp.runs.currentCandidate(run.runId),
         });
         if (waiting.allowed) {
           paused.push({ runId: run.runId, roleKey: required.roleKey, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
@@ -2095,6 +2101,21 @@ export class Daemon {
       }
     }
     return paused;
+  }
+
+  /**
+   * The incumbent `binding` covers its role again. A run at CEO review that continuity paused for this
+   * role, and whose owner's revocation it then had to defer (a held run's owner is not revoked for
+   * coverage), would otherwise wait for a human that nobody asked: hand each such wait back. The run
+   * engine decides, per run, whether the wait is continuity's own and nothing has moved since, and
+   * answers `released: false` for every other one; a refusal here changes nothing and the next pass
+   * asks again.
+   */
+  private releaseContinuityReviewHolds(binding: RoleBinding): void {
+    for (const run of this.cp.runs.list({ state: RunState.AWAITING_HUMAN })) {
+      if (run.ownerRoleKey !== binding.roleKey) continue;
+      this.cp.runs.releaseContinuityReviewHold(run.runId, binding);
+    }
   }
 
   /**
