@@ -13,11 +13,11 @@ export const SCHEMA_VERSION = 44;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
-
+const v44SchemaPath = fileURLToPath(new URL("./schema-v44.sql", import.meta.url)); // released v38–v44 read only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
-  version <= 37 ? historicalSchemaSql() : schemaSql();
+  version <= 37 ? historicalSchemaSql() : version <= 44 ? readFileSync(v44SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -2595,7 +2595,7 @@ const v38: SchemaMigration = {
       const normalise = (sql: string): string => sql
         .replace(/^CREATE TABLE IF NOT EXISTS /i, "CREATE TABLE ")
         .replace(/"/g, "").replace(/;\s*$/, "").replace(/\s+/g, " ").trim();
-      if (!actual || normalise(actual) !== normalise(canonicalTurnsTableOnlyDdl(SCHEMA_VERSION))
+      if (!actual || normalise(actual) !== normalise(canonicalTurnsTableOnlyDdl(44))
           || (raw.prepare("SELECT 1 FROM canonical_turns WHERE override_incumbent_turn_request_id IS NOT NULL LIMIT 1").get())) {
         throw new Error("v38 pre-existing canonical_turns column does not match the current table/FK constraints or is populated");
       }
@@ -2644,9 +2644,9 @@ const v38: SchemaMigration = {
       "inbound_messages_delete_authority",
       "inbound_claim_authority_markers_insert_guard",
       "canonical_turns_no_replace",
-    ], SCHEMA_VERSION));
+    ], 44));
   },
-  checksum: () => migrationChecksum("v38-canonical-verified-target-override", SCHEMA_VERSION),
+  checksum: () => migrationChecksum("v38-canonical-verified-target-override", 44),
 };
 
 /**
@@ -2682,9 +2682,9 @@ const v39: SchemaMigration = {
   apply: (raw) => {
     const names = [...V38_RECEIPT_GATED_TRIGGER_NAMES, "inbound_messages_owner_reply_key_immutable"];
     raw.exec(dropsFor(names));
-    raw.exec(triggerDdlFor(names, SCHEMA_VERSION));
+    raw.exec(triggerDdlFor(names, 44));
   },
-  checksum: () => migrationChecksum("v39-owner-reply-intent-keeps-its-key", SCHEMA_VERSION),
+  checksum: () => migrationChecksum("v39-owner-reply-intent-keeps-its-key", 44),
 };
 
 /**
@@ -2799,10 +2799,10 @@ const v40: SchemaMigration = {
   toVersion: 40,
   apply: (raw) => {
     for (const record of V40_RECORD_TABLES) {
-      const tableDdl = schemaObject(record.table, `the ${record.name} table`, SCHEMA_VERSION);
+      const tableDdl = schemaObject(record.table, `the ${record.name} table`, 44);
       const indexDdl = record.index === undefined
         ? null
-        : schemaObject(record.index, `the ${record.name} index`, SCHEMA_VERSION);
+        : schemaObject(record.index, `the ${record.name} index`, 44);
       const existing = (raw.prepare(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
       ).get(record.name) as { sql: string } | undefined)?.sql;
@@ -2820,7 +2820,7 @@ const v40: SchemaMigration = {
       if (indexDdl !== null) raw.exec(indexDdl);
     }
     raw.exec(dropsFor(V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES));
-    raw.exec(triggerDdlFor(V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES, SCHEMA_VERSION));
+    raw.exec(triggerDdlFor(V40_PEER_MESSAGE_CARRY_TRIGGER_NAMES, 44));
     // Review finding 01: every row that has already left PENDING, of any kind, departed before the
     // trigger above existed. The table is empty here (checked above), so no guard refuses a row.
     raw.exec(`INSERT INTO holder_message_departures (message_id, from_status, to_status, departed_at, basis)
@@ -2850,7 +2850,7 @@ const v40: SchemaMigration = {
                      OR json_type(turn_claim_json, '$.settledAt') IS NOT NULL
                    ELSE 0 END) = 1`);
   },
-  checksum: () => migrationChecksum("v40-peer-message-carry-record", SCHEMA_VERSION),
+  checksum: () => migrationChecksum("v40-peer-message-carry-record", 44),
 };
 
 /**
@@ -2984,7 +2984,7 @@ const v41: SchemaMigration = {
       const definition = schemaObject(
         new RegExp(`^\\s*${column.name}\\s+${column.type}\\b[^\\n]*?(?=,\\n)`, "m"),
         `the task_executions.${column.name} column`,
-        SCHEMA_VERSION,
+        44,
       ).trim();
       raw.exec(`ALTER TABLE task_executions ADD COLUMN ${definition}`);
     }
@@ -2998,9 +2998,9 @@ const v41: SchemaMigration = {
     }
     const v41Triggers = [...V41_WORKER_INDEPENDENCE_TRIGGER_NAMES, ...V41_WORKER_PROCESS_TRIGGER_NAMES];
     raw.exec(dropsFor(v41Triggers));
-    raw.exec(triggerDdlFor(v41Triggers, SCHEMA_VERSION));
+    raw.exec(triggerDdlFor(v41Triggers, 44));
   },
-  checksum: () => migrationChecksum("v41-runtime-managed-worker-turns", SCHEMA_VERSION),
+  checksum: () => migrationChecksum("v41-runtime-managed-worker-turns", 44),
 };
 
 /**
@@ -3085,14 +3085,14 @@ const v42: SchemaMigration = {
       const definition = schemaObject(
         new RegExp(`^\\s*${column.name}\\s+${column.type}\\b[^\\n]*?(?=,\\n)`, "m"),
         `the ${column.table}.${column.name} column`,
-        SCHEMA_VERSION,
+        44,
       ).trim();
       raw.exec(`ALTER TABLE ${column.table} ADD COLUMN ${definition}`);
     }
     raw.exec(dropsFor(V42_TRIGGER_NAMES));
-    raw.exec(triggerDdlFor(V42_TRIGGER_NAMES, SCHEMA_VERSION));
+    raw.exec(triggerDdlFor(V42_TRIGGER_NAMES, 44));
   },
-  checksum: () => migrationChecksum("v42-session-credential-epoch", SCHEMA_VERSION),
+  checksum: () => migrationChecksum("v42-session-credential-epoch", 44),
 };
 
 /** v43's guards over the bootstrap application record, read from schema.sql by name. */
@@ -3133,7 +3133,7 @@ const v43: SchemaMigration = {
     const tableDdl = schemaObject(
       /CREATE TABLE IF NOT EXISTS bootstrap_applications \([\s\S]*?\n\) WITHOUT ROWID;/,
       "the bootstrap_applications table",
-      SCHEMA_VERSION,
+      44,
     );
     const existing = (raw.prepare(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bootstrap_applications'",
@@ -3154,12 +3154,12 @@ const v43: SchemaMigration = {
       [/CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_project_held[^;]*;/, "the bootstrap_applications project index"],
       [/CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_identity_held[^;]*;/, "the bootstrap_applications identity index"],
     ] as const) {
-      raw.exec(schemaObject(index, what, SCHEMA_VERSION));
+      raw.exec(schemaObject(index, what, 44));
     }
     raw.exec(dropsFor(V43_BOOTSTRAP_APPLICATION_TRIGGER_NAMES));
-    raw.exec(triggerDdlFor(V43_BOOTSTRAP_APPLICATION_TRIGGER_NAMES, SCHEMA_VERSION));
+    raw.exec(triggerDdlFor(V43_BOOTSTRAP_APPLICATION_TRIGGER_NAMES, 44));
   },
-  checksum: () => migrationChecksum("v43-bootstrap-application-record", SCHEMA_VERSION),
+  checksum: () => migrationChecksum("v43-bootstrap-application-record", 44),
 };
 
 /** v44's guards, read from schema.sql by name: the grant's own, then the two over projects and runs. */
@@ -3201,7 +3201,7 @@ const v44: SchemaMigration = {
     const tableDdl = schemaObject(
       /CREATE TABLE IF NOT EXISTS manifest_activation_grants \([\s\S]*?\n\) WITHOUT ROWID;/,
       "the manifest_activation_grants table",
-      SCHEMA_VERSION,
+      44,
     );
     const existing = (raw.prepare(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'manifest_activation_grants'",
@@ -3218,9 +3218,9 @@ const v44: SchemaMigration = {
       raw.exec(tableDdl);
     }
     raw.exec(dropsFor(V44_MANIFEST_ACTIVATION_TRIGGER_NAMES));
-    raw.exec(triggerDdlFor(V44_MANIFEST_ACTIVATION_TRIGGER_NAMES, SCHEMA_VERSION));
+    raw.exec(triggerDdlFor(V44_MANIFEST_ACTIVATION_TRIGGER_NAMES, 44));
   },
-  checksum: () => migrationChecksum("v44-manifest-activation-grant", SCHEMA_VERSION),
+  checksum: () => migrationChecksum("v44-manifest-activation-grant", 44),
 };
 
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
