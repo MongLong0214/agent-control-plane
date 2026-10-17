@@ -48,9 +48,14 @@
  * its composer governs the merges it performs once deployed.
  */
 
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { MERGE_RECORDS_GATE, type SquashRecordPreservation, squashRecordPreservation } from "../git/squash-records.ts";
+import {
+  MERGE_RECORDS_GATE,
+  PRESERVATION_TIMEOUT_MS,
+  type SquashRecordPreservation,
+  squashRecordPreservation,
+} from "../git/squash-records.ts";
 
 /** One branch commit, as GitHub's list-commits endpoint reports it. */
 export interface BranchCommitMessage {
@@ -243,17 +248,31 @@ export const composeSquashCommitTitle = (
  * `examineSquash`, run on these exact bytes, finds record lines the trailer block alone would not
  * keep. Keeping them needs the notes mirror, which this daemon does not write, so it does not merge.
  * Not a count of commits or records: a branch whose last trailer block carries them all proceeds.
+ *
+ * An examination that outlives its bound (`examinationTimeoutMs`, the whole examination's) is the
+ * other refusal, `GIT_TIMEOUT`, named as such: an unanswered question is never an allowed merge.
  */
 export const squashCommitForMerge = async (
   commits: readonly BranchCommitMessage[],
   pullTitle: string | undefined,
   pullNumber: number,
   mergedHead: string,
+  examinationTimeoutMs: number = PRESERVATION_TIMEOUT_MS,
 ): Promise<Decision<{ title: string; message: string }>> => {
   const title = composeSquashCommitTitle(commits, pullTitle, pullNumber);
   const message = composeSquashCommitMessage(commits, mergedHead);
   await assertSquashNamesMergedHead(title, message, mergedHead); // the gate reads the title too
-  const kept = await squashRecordPreservation(commits, title, message, mergedHead, pullNumber);
+  let kept: SquashRecordPreservation;
+  try {
+    kept = await squashRecordPreservation(commits, title, message, mergedHead, pullNumber, examinationTimeoutMs);
+  } catch (error) {
+    if (!isAcpError(error) || error.reasonCode !== ReasonCode.GIT_TIMEOUT) throw error;
+    return deny(
+      ReasonCode.GIT_TIMEOUT,
+      `pull request #${pullNumber} is not merged: ${error.message}, so whether its squash keeps the branch's records is unanswered.`,
+      { pullNumber, mergedHead, ...error.evidence },
+    );
+  }
   if (kept.unpreserved.length === 0) return allow(ReasonCode.OK, { title, message });
   return deny(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, notesMirrorRequiredMessage(pullNumber, kept), {
     pullNumber,

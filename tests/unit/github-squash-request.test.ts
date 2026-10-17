@@ -451,3 +451,23 @@ describe("the squash PUT names the head it fences on as the merge's Merged-Head"
     });
   });
 });
+
+/**
+ * S9 review r2, R1: the gate maps each lost line to one commit, the newest carrying it. Two records
+ * sharing a `Limit:` both lose it, and a later commit restating one of their ids without it does not
+ * keep it for that record. The refusal names every record that loses a line, not the gate's one.
+ */
+it("FOLLOWUP: names both records whose shared constraint is lost, including a partially restated duplicate ID", async () => {
+  const messages = [
+    "first\n\nLimit: the shared constraint\nRecord-Id: r-aaaaaa\n",
+    "second\n\nLimit: the shared constraint\nRecord-Id: r-bbbbbb\n",
+    "third\n\nWarn: the final warning\nRecord-Id: r-aaaaaa\n",
+  ];
+  const test = fixture(messages);
+  const refused = await test.execute();
+  expect(refused.allowed).toBe(false);
+  expect(test.reserve).not.toHaveBeenCalled();
+  expect(test.calls.filter((call) => call.method !== "GET")).toEqual([]);
+  if (refused.allowed) throw new Error("not refused");
+  expect(refused.evidence["unpreservedRecordIds"]).toEqual(["r-aaaaaa", "r-bbbbbb"]);
+});
