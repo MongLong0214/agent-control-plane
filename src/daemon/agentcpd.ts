@@ -146,6 +146,7 @@ import {
   CanonicalCtoRestoreCondition,
   type CanonicalCtoAttachChallenger,
   type CanonicalCtoAttachProof,
+  type CanonicalCtoRestoreSuccession,
   type CanonicalCtoRestoreTarget,
 } from "../continuity/continuity-kernel.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
@@ -646,6 +647,14 @@ export const CANONICAL_CTO_RESTORE_CHALLENGE_TIMEOUT_MS = 10_000;
  */
 export const CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX = "acp-restore-challenge:";
 
+/**
+ * Review S2B-R1-01 — the JSON-RPC notification a committed capacity restore writes on the connection
+ * it challenged, just before ending it. Its params are the `CanonicalCtoRestoreSuccession`. The relay
+ * takes it out of the stream and adopts the restored binding on it alone; it never reaches the
+ * client. Copied by hand into `src/cli/attach-relay.ts`, which imports nothing daemon-side.
+ */
+export const CANONICAL_CTO_RESTORE_SUCCESSION_METHOD = "notifications/acp/canonical-cto-restore-succession";
+
 const RESTORE_ANCESTRY_HOPS = 64;
 
 /** One reattach-door admission and the kernel peer it was admitted on. */
@@ -744,6 +753,11 @@ const restoreChallengeTransport = (raw: SocketTransport, connection: ReattachCon
  * `challengeTimeoutMs` by the daemon's clock, and only while that connection is open: an answer on
  * an earlier connection, an answer to a challenge whose connection closed for a reconnect, and a
  * replayed answer each settle nothing.
+ *
+ * Once the restore commits, the proof's `release` writes the succession on that same connection —
+ * the binding it was admitted under, the binding committed, the challenge's id — as one
+ * `CANONICAL_CTO_RESTORE_SUCCESSION_METHOD` notification, and then ends it. That line is the only
+ * thing the relay adopts a binding other than its own on (review S2B-R1-01).
  *
  * Exported for its witnesses; the reattach door composes it and attaches it to continuity.
  */
@@ -845,9 +859,37 @@ export const createCanonicalCtoAttachChallenger = (
       if (!after.allowed) return after as Decision<CanonicalCtoAttachProof>;
       return allow(ReasonCode.OK, {
         connectionId: connection.connectionId,
+        challengeId: id,
         stillAttached: () => stillAttached(connection),
-        release: () => {
-          connection.socket.destroy();
+        release: (restored) => {
+          // Review S2B-R1-01 — `from` is what this connection was admitted under, which its relay
+          // was told in the door's acknowledgement; `to` is what the restore committed. Ended only
+          // once the line is written, or once writing it failed: a relay that never reads it
+          // refuses the restored binding on reconnect, which is the safe side.
+          const held = connection.admitted;
+          const succession: CanonicalCtoRestoreSuccession = {
+            from: {
+              roleKey: held.roleKey,
+              assignmentId: held.assignmentId,
+              bindingGeneration: held.bindingGeneration,
+              sessionId: held.sessionId,
+              sessionIncarnation: held.sessionIncarnation,
+            },
+            to: {
+              roleKey: restored.roleKey,
+              assignmentId: restored.assignmentId,
+              bindingGeneration: restored.bindingGeneration,
+              sessionId: restored.sessionId,
+              sessionIncarnation: restored.sessionIncarnation,
+            },
+            challengeId: id,
+          };
+          const end = (): void => {
+            connection.socket.destroy();
+          };
+          connection
+            .send({ jsonrpc: "2.0", method: CANONICAL_CTO_RESTORE_SUCCESSION_METHOD, params: { ...succession } })
+            .then(end, end);
         },
       });
     },

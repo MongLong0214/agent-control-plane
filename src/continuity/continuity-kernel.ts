@@ -997,8 +997,9 @@ export class ContinuityKernel {
    *     same, the capacity snapshot must still admit, and the connection is proven attached once more
    *     as the last process read before the bind.
    *
-   * After the commit the challenged connection is ended, so the relay comes back through the reattach
-   * door under the restored binding. A refusal once the target holds is recorded as
+   * After the commit the challenged connection is told the one succession the restore committed and
+   * is ended, so the relay comes back through the reattach door under the restored binding and
+   * adopts it on that announcement alone (review S2B-R1-01). A refusal once the target holds is recorded as
    * `CANONICAL_CTO_RESTORE_REFUSED` with its condition, which the doctor names, and the next attempt
    * of the same revocation waits out `CANONICAL_CTO_RESTORE_BACKOFF_MS`. Answers `null` for a role
    * this path does not restore at all.
@@ -1142,9 +1143,12 @@ export class ContinuityKernel {
         projectId: target.projectId,
         sessionId: target.sessionId,
         evidence: {
+          fromAssignmentId: target.revokedAssignmentId,
           fromGeneration: target.revokedGeneration,
+          toAssignmentId: bound.value.assignmentId,
           toGeneration: bound.value.bindingGeneration,
           connectionId: proof.value.connectionId,
+          challengeId: proof.value.challengeId,
           credentialEpoch: rotated.value.session.credentialEpoch,
         },
       });
@@ -1152,9 +1156,11 @@ export class ContinuityKernel {
       return allow(ReasonCode.OK, bound.value);
     });
     if (!committed.allowed) return this.#refuseCanonicalRestore(target, committed);
-    // Ended only once committed: the relay comes back through the reattach door, which admits it
-    // under the restored binding by the same process-tree proof every reattach passes.
-    proof.value.release();
+    // Announced and ended only once committed (review S2B-R1-01): the challenged connection is told
+    // this one succession — the binding it was admitted under, the binding committed, the challenge
+    // it answered — and then ended, so the relay comes back through the reattach door and adopts
+    // the restored binding because this line named it, never because its generation is higher.
+    proof.value.release(committed.value);
     return committed;
   }
 
@@ -1982,13 +1988,40 @@ export const freshCanonicalCapacity = (
 export interface CanonicalCtoAttachProof {
   /** The reattach connection the challenge was answered on. */
   readonly connectionId: string;
+  /** The JSON-RPC id of the challenge that connection answered; the relay saw it pass both ways. */
+  readonly challengeId: string;
   /**
    * The connection is still open and its kernel peer still descends from the target session's live
    * claude, running the target conversation. Process reads only; asked inside the bind transaction.
    */
   stillAttached(): Decision<void>;
-  /** Ends the challenged connection, so the relay reattaches under the restored binding. */
-  release(): void;
+  /**
+   * Called once, after the restore committed `restored`. Writes the one succession the relay on the
+   * challenged connection may adopt (`CanonicalCtoRestoreSuccession`) on that connection, then ends
+   * it, so the relay reattaches under the restored binding (review S2B-R1-01).
+   */
+  release(restored: RoleBinding): void;
+}
+
+/** #1106 — one binding as a capacity restore's succession names it: the role, the row, the runtime. */
+export interface CanonicalCtoSuccessionBinding {
+  roleKey: string;
+  assignmentId: string;
+  bindingGeneration: number;
+  sessionId: string;
+  sessionIncarnation: string;
+}
+
+/**
+ * Review S2B-R1-01 — the committed capacity restore as the relay on the challenged connection is
+ * told of it, the only thing that relay adopts a binding other than its own on: `from` is the binding
+ * that connection was admitted under, `to` the binding the restore committed, and `challengeId` the
+ * liveness challenge it was proven by. Written once, on that connection, after the commit.
+ */
+export interface CanonicalCtoRestoreSuccession {
+  from: CanonicalCtoSuccessionBinding;
+  to: CanonicalCtoSuccessionBinding;
+  challengeId: string;
 }
 
 /**

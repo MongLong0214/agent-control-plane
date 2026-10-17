@@ -194,7 +194,8 @@ const DEFAULT_CLAIM_TIMEOUT_MS = 180_000;
  * session and its incarnation. The reattach door's acknowledgement carries it, and so does a claim
  * receipt's `binding`. A relay keeps the one its first admission named and refuses a reconnect that
  * names any other, so coming back after a restart can never adopt a binding or session that
- * replaced its own. Must have the members `CanonicalCtoAdmittedTuple` has in
+ * replaced its own — but for the one binding a committed capacity restore announced to it
+ * (`successionRefusal`, review S2B-R1-01). Must have the members `CanonicalCtoAdmittedTuple` has in
  * `src/daemon/canonical-self-claim-listener.ts`, which is not imported for the reason given above.
  */
 interface AdmittedTuple {
@@ -231,18 +232,100 @@ const sameTuple = (left: AdmittedTuple, right: AdmittedTuple): boolean => {
 };
 
 /**
- * #1106 — whether `next` is a later generation of the binding `held` named, on the very same runtime
- * row: the same session and the same incarnation, a higher generation, another assignment. That is
- * what the daemon's capacity restore of a canonical CTO binds — the same conversation on the same
- * session at the next generation, with no other runtime — and it then ends the relay's connection so
- * the relay comes back under it. A binding on another session or incarnation is still a binding that
- * replaced this relay's own, and is refused as before.
+ * Review S2B-R1-01 — the binding a relay holds: the tuple its admissions name, and the role it holds
+ * it as. The door's acknowledgement names no role, so a relay's first role is the one it was started
+ * for (`canonicalCtoRoleKey`), and a later one is only ever the role a committed capacity restore's
+ * succession named, which must be that same role.
  */
-const sameRuntimeSuccessor = (next: AdmittedTuple, held: AdmittedTuple): boolean => {
-  if (next.sessionId !== held.sessionId) return false;
-  if (next.sessionIncarnation !== held.sessionIncarnation) return false;
-  if (next.assignmentId === held.assignmentId) return false;
-  return next.bindingGeneration > held.bindingGeneration;
+interface HeldBinding extends AdmittedTuple {
+  roleKey: string;
+}
+
+/**
+ * The role key a relay started for `projectId` attaches as: `roleKeyFor(Role.PRIMARY_CTO, …)` in
+ * `src/domain/types.ts`, copied for the reason the method names above are.
+ */
+const canonicalCtoRoleKey = (projectId: string): string => `PRIMARY_CTO:${projectId}`;
+
+/**
+ * Review S2B-R1-01 — `CANONICAL_CTO_RESTORE_SUCCESSION_METHOD` and
+ * `CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX` in `src/daemon/agentcpd.ts`, copied for the reason the
+ * method names above are. Exported so a witness holds the two in step.
+ */
+export const RESTORE_SUCCESSION_METHOD = "notifications/acp/canonical-cto-restore-succession";
+export const RESTORE_CHALLENGE_PREFIX = "acp-restore-challenge:";
+
+/**
+ * Review S2B-R1-01 — one committed capacity restore, as the daemon announces it on the connection it
+ * challenged (`CanonicalCtoRestoreSuccession` in `src/continuity/continuity-kernel.ts`): the binding
+ * that connection was admitted under, the binding the restore committed, and the challenge it was
+ * proven by.
+ */
+interface RestoreSuccession {
+  from: HeldBinding;
+  to: HeldBinding;
+  challengeId: string;
+}
+
+const parseHeldBinding = (value: unknown): HeldBinding | null => {
+  const tuple = parseAdmittedTuple(value);
+  if (tuple === null) return null;
+  const roleKey = (value as { roleKey?: unknown }).roleKey;
+  if (!nonEmptyString(roleKey)) return null;
+  return { ...tuple, roleKey };
+};
+
+/** The succession `params` names, or null when it names none completely. */
+const parseRestoreSuccession = (params: unknown): RestoreSuccession | null => {
+  if (typeof params !== "object") return null;
+  if (params === null) return null;
+  const named = params as { from?: unknown; to?: unknown; challengeId?: unknown };
+  const from = parseHeldBinding(named.from);
+  if (from === null) return null;
+  const to = parseHeldBinding(named.to);
+  if (to === null) return null;
+  if (!nonEmptyString(named.challengeId)) return null;
+  return { from, to, challengeId: named.challengeId };
+};
+
+/**
+ * Review S2B-R1-01 — why a succession announced on a link is not one this relay adopts, or null when
+ * it is. `held` is the binding the relay holds, `answeredChallenge` the restore challenge that link
+ * carried to the client and the client answered with a result, and `waiting` whether a succession
+ * is already held for the next reconnect. Each refusal is its own statement.
+ *
+ * What it proves together: the restore was of exactly the role and the assignment, generation,
+ * session and incarnation this relay holds; it was proven over this very connection, by the challenge
+ * this relay passed to its client and passed the answer back; and what it committed is that same
+ * role on that same runtime row at the next generation. One, and only once.
+ */
+const successionRefusal = (
+  succession: RestoreSuccession,
+  held: HeldBinding,
+  answeredChallenge: string | null,
+  waiting: boolean,
+): string | null => {
+  if (waiting) return "a succession is already held";
+  if (succession.from.roleKey !== held.roleKey) return "it restores another role";
+  if (succession.to.roleKey !== held.roleKey) return "it changes the role";
+  if (!sameTuple(succession.from, held)) return "it restores another binding";
+  if (succession.challengeId !== answeredChallenge) return "this connection did not answer its challenge";
+  if (succession.to.sessionId !== held.sessionId) return "it moves the session";
+  if (succession.to.sessionIncarnation !== held.sessionIncarnation) return "it moves the incarnation";
+  if (succession.to.bindingGeneration !== held.bindingGeneration + 1) return "it skips a generation";
+  if (succession.to.assignmentId === held.assignmentId) return "it names the same assignment";
+  return null;
+};
+
+/**
+ * Review S2B-R1-01 — the binding a reconnect that named `named` adopts when `named` is not the one
+ * the relay holds: exactly the binding a succession it took announced, or null, which refuses the
+ * reconnect as PR1051-R1 does.
+ */
+const provenSuccessor = (named: AdmittedTuple, proven: HeldBinding | null): HeldBinding | null => {
+  if (proven === null) return null;
+  if (!sameTuple(named, proven)) return null;
+  return proven;
 };
 
 type ClaimOutcome =
@@ -729,6 +812,7 @@ export const runAttachRelayCommand = async (
   const messaging = sessionMessagingFromEnv();
   const reattached = await reattachFirst(
     options.reattachSocketPath,
+    canonicalCtoRoleKey(options.claim.projectId),
     DEFAULT_CLAIM_TIMEOUT_MS,
     options.reattach,
     messaging,
@@ -758,6 +842,7 @@ const CLAIM = "claim";
  */
 const reattachFirst = async (
   reattachSocketPath: string | undefined,
+  roleKey: string,
   timeoutMs: number,
   policy: Partial<ReattachPolicy> | undefined,
   messaging: SessionMessaging | undefined,
@@ -771,7 +856,7 @@ const reattachFirst = async (
       reattached.socket,
       NO_HANDSHAKE,
       true,
-      reattached.tuple,
+      { ...reattached.tuple, roleKey },
       reattachSocketPath,
       policy,
       messaging,
@@ -800,6 +885,7 @@ export const runAttachRelay = async (
   if (options.initialReattach !== false) {
     const reattached = await reattachFirst(
       options.reattachSocketPath,
+      canonicalCtoRoleKey(options.claim.projectId),
       options.claimTimeoutMs ?? DEFAULT_CLAIM_TIMEOUT_MS,
       options.reattach,
       options.messaging,
@@ -847,7 +933,8 @@ export const runAttachRelay = async (
   const door = options.reattachSocketPath;
   if (door === undefined) return pipeStdioToSocket(first, io, connection);
   if (claimed.tuple === null) return pipeStdioToSocket(first, io, connection);
-  return relayWithReattach(first, connection, false, claimed.tuple, door, options.reattach, options.messaging, io);
+  const held = { ...claimed.tuple, roleKey: canonicalCtoRoleKey(options.claim.projectId) };
+  return relayWithReattach(first, connection, false, held, door, options.reattach, options.messaging, io);
 };
 
 /**
@@ -1065,6 +1152,13 @@ interface Link {
   wakeRegistrations: Map<string, unknown>;
   /** Whether the relay has registered its wake proxy on this link of its own accord. */
   proxyOffered: boolean;
+  /**
+   * Review S2B-R1-01 — the id of the last capacity-restore challenge the daemon sent the client on
+   * this link, and the same id once the client answered it with a result while this link was
+   * current. One each, so nothing here grows; the daemon has one challenge open per connection.
+   */
+  challenge: string | null;
+  answeredChallenge: string | null;
 }
 
 const WAKE_REGISTER_TOOL = "role_wake_endpoint_register";
@@ -1102,11 +1196,15 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *     claims: a refusal — this process holds no binding, the binding was revoked, the ancestry does
  *     not match — ends the relay rather than falling back to a claim. An admission that names a
  *     binding or runtime other than `initial`, the one the first admission named, ends it too
- *     (review PR1051-R1): a reconnect never adopts a binding that replaced its own. The one
- *     exception is not a replacement: a later generation on the same session and incarnation
- *     (`sameRuntimeSuccessor`) — what the daemon's capacity restore binds (#1106) — names the same
- *     runtime the reattach door just proved this process is, and is adopted and compared against
- *     from then on.
+ *     (review PR1051-R1): a reconnect never adopts a binding that replaced its own. A higher
+ *     generation on the same session is not an exception (review S2B-R1-01): a release and rebind,
+ *     another holder in between, or another project's role all name one. The one binding a
+ *     reconnect adopts in place of its own is the one a committed capacity restore (#1106)
+ *     announced on the connection it challenged (`RESTORE_SUCCESSION_METHOD`), taken only when
+ *     `successionRefusal` finds nothing — this relay's exact role and binding restored, proven by
+ *     the challenge this link carried both ways, to the same role and runtime at the next
+ *     generation — and adopted only by the next admission, which must name exactly it. A
+ *     succession is held for that one admission and then gone, so it is never adopted twice.
  *   - **One wait at a time, one connection at a time** (PR1051-R2). Every socket is a `Link` that
  *     owns its waiters and its in-flight requests, and only the current link's lines reach anything.
  *     An attempt the relay gives up on is destroyed, so a late answer on it satisfies nothing; a
@@ -1161,24 +1259,31 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *     variables being present: a complete environment whose socket the proxy may not forward to
  *     opens no proxy, and renaming there would change the client's bytes with no proxy to protect.
  *
- * Seeing those messages, and renaming request ids once the proxy listens, is the only reason this
- * relay reads JSON-RPC at all. Once it listens, a client request leaves with its id renamed, but for
- * that one registration with nothing else changed, and an answer returns with the client's id
- * restored; every other line is forwarded exactly as it arrived.
+ * Seeing those messages, renaming request ids once the proxy listens, and the capacity restore's
+ * challenge and succession (review S2B-R1-01) are the only reasons this relay reads JSON-RPC at all.
+ * Once it listens, a client request leaves with its id renamed, but for that one registration with
+ * nothing else changed, and an answer returns with the client's id restored; a restore's challenge
+ * and its answer pass unchanged and are only noted, and its succession is taken out of the stream;
+ * every other line is forwarded exactly as it arrived.
  */
 const relayWithReattach = (
   first: Socket,
   connection: { handshake(socket: Socket): void },
   firstAdmitted: boolean,
-  initial: AdmittedTuple,
+  initial: HeldBinding,
   reattachSocketPath: string,
   policyOverrides: Partial<ReattachPolicy> | undefined,
   messaging: SessionMessaging | undefined,
   io: AttachRelayIo,
 ): Promise<number> =>
   new Promise<number>((resolveRelay) => {
-    /** The binding tuple a reconnect must name: the first admission's, or its same-runtime successor's. */
+    /** The binding a reconnect must name: the first admission's, or the one a restore's succession named. */
     let admittedUnder = initial;
+    /**
+     * Review S2B-R1-01 — the binding a committed capacity restore announced on the current link, held
+     * for the next admission alone. One at a time; any admission takes it away.
+     */
+    let succession: HeldBinding | null = null;
     const policy: ReattachPolicy = { ...DEFAULT_REATTACH_POLICY, ...policyOverrides };
     let phase: "connecting" | "live" | "reattaching" | "done" = "connecting";
     /** The one link the relay serves or is restoring. Every other socket it opened is destroyed. */
@@ -1296,6 +1401,52 @@ const relayWithReattach = (
       if (params?.name === WAKE_REGISTER_TOOL) link.wakeRegistrations.set(key, params.arguments);
     };
 
+    /**
+     * Review S2B-R1-01 — notes a capacity-restore challenge the daemon sent the client on `link`. Only
+     * observed: the line still passes to the client exactly as it arrived.
+     */
+    const noteChallenge = (link: Link, message: RelayedMessage): void => {
+      if (message.method !== "ping") return;
+      if (typeof message.id !== "string") return;
+      if (!message.id.startsWith(RESTORE_CHALLENGE_PREFIX)) return;
+      link.challenge = message.id;
+      link.answeredChallenge = null;
+    };
+
+    /**
+     * Review S2B-R1-01 — notes the client's answer to `link`'s challenge, when it is one with a
+     * result. Only observed: the line still leaves exactly as it arrived.
+     */
+    const noteChallengeAnswer = (link: Link, message: RelayedMessage | null): void => {
+      if (message === null) return;
+      if (message.method !== undefined) return;
+      if (link.challenge === null) return;
+      if (message.id !== link.challenge) return;
+      if (typeof message.result !== "object") return;
+      if (message.result === null) return;
+      link.answeredChallenge = link.challenge;
+    };
+
+    /**
+     * Review S2B-R1-01 — the daemon's announcement of a committed capacity restore on `link`. Taken
+     * out of the stream, never passed to the client, and held for the next admission only when
+     * `successionRefusal` finds nothing; otherwise held not at all, so that admission is compared
+     * with the binding the relay already holds, as at PR1051-R1.
+     */
+    const takeSuccession = (link: Link, message: RelayedMessage): void => {
+      const announced = message.id === undefined ? parseRestoreSuccession(message.params) : null;
+      if (announced === null) {
+        io.stderr.write("attach: restore succession refused: malformed\n");
+        return;
+      }
+      const refusal = successionRefusal(announced, admittedUnder, link.answeredChallenge, succession !== null);
+      if (refusal !== null) {
+        io.stderr.write(`attach: restore succession refused: ${refusal}\n`);
+        return;
+      }
+      succession = announced.to;
+    };
+
     /** Keeps a replayable request now that the daemon answered it, and only if it succeeded. */
     const settleReplayable = (link: Link, key: string, message: RelayedMessage): void => {
       const initialize = link.initializes.get(key);
@@ -1387,6 +1538,7 @@ const relayWithReattach = (
         if (id !== undefined) undelivered(id, "agent-control-plane is reattaching; this request was not sent");
         return;
       }
+      noteChallengeAnswer(link, message);
       if (proxy === null) {
         // No proxy, so no request of the relay's own on this link: the line leaves exactly as it
         // arrived, under the client's own id, as before the proxy existed (review PR1057-R3).
@@ -1445,6 +1597,10 @@ const relayWithReattach = (
         link.accepted = true;
       }
       const message = parseRelayed(line);
+      if (message !== null) {
+        if (message.method === RESTORE_SUCCESSION_METHOD) return takeSuccession(link, message);
+        noteChallenge(link, message);
+      }
       const id = message === null ? undefined : responseIdOf(message);
       if (id !== undefined) {
         const key = idKey(id);
@@ -1499,6 +1655,8 @@ const relayWithReattach = (
         initializes: new Map(),
         wakeRegistrations: new Map(),
         proxyOffered: false,
+        challenge: null,
+        answeredChallenge: null,
       };
       current = link;
       daemonBlocked = false;
@@ -1675,16 +1833,20 @@ const relayWithReattach = (
             outcome.socket.destroy();
             return protocolFailure("reattach reply");
           }
-          // #1106 — a later generation on this same runtime row is the binding this relay's own was
-          // restored to, and is adopted as the one every later reconnect is compared with.
-          if (sameRuntimeSuccessor(outcome.tuple, admittedUnder)) admittedUnder = outcome.tuple;
-          if (!sameTuple(outcome.tuple, admittedUnder)) {
+          // Review S2B-R1-01 — a succession is this admission's to use or lose: taken away here
+          // whatever the admission names, so it is never adopted by a later one.
+          const proven = succession;
+          succession = null;
+          const next = sameTuple(outcome.tuple, admittedUnder) ? admittedUnder : provenSuccessor(outcome.tuple, proven);
+          if (next === null) {
             outcome.socket.destroy();
             // The relay found the mismatch itself, so it writes its own stage message rather than a
             // daemon reason code it was not sent.
             io.stderr.write("attach: reattach admitted another binding\n");
             return end(ATTACH_EXIT.HANDSHAKE_REFUSED);
           }
+          // The restored binding, adopted as the one every later reconnect is compared with.
+          admittedUnder = next;
           const link = open(outcome.socket, true);
           if (await restore(link, deadlineAt, abort.signal)) {
             clearTimeout(wait.deadline);

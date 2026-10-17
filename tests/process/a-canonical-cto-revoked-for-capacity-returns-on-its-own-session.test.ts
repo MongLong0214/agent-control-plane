@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { PassThrough, type Readable, type Writable } from "node:stream";
 
@@ -8,8 +9,17 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
+import { CtoBindingDelegation } from "../../src/ceo/cto-binding-delegation.ts";
+import { CtoDelegatedBinding } from "../../src/daemon/cto-delegated-binding.ts";
+import { RoleAttachmentCredentials } from "../../src/session/role-attachment-credentials.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
-import { runAttachRelay, type ReattachPolicy } from "../../src/cli/attach-relay.ts";
+import {
+  ATTACH_EXIT,
+  RESTORE_CHALLENGE_PREFIX,
+  RESTORE_SUCCESSION_METHOD,
+  runAttachRelay,
+  type ReattachPolicy,
+} from "../../src/cli/attach-relay.ts";
 import {
   CANONICAL_CTO_CAPACITY_RESTORED,
   CANONICAL_CTO_RESTORE_BACKOFF_MS,
@@ -23,7 +33,12 @@ import {
 import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
-import { CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX, startLocalMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
+import {
+  CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX,
+  CANONICAL_CTO_RESTORE_SUCCESSION_METHOD,
+  startLocalMcpListeners,
+  type LocalMcpListeners,
+} from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { createCanonicalCtoReattach } from "../../src/registry/canonical-cto-reattach.ts";
@@ -327,6 +342,7 @@ const started = async () => {
     claude,
     daemon,
     sessionId: session.sessionId,
+    oldSecret: session.sessionSecret!,
     processes,
     transport,
     client,
@@ -662,5 +678,389 @@ describe("#1106: a canonical CTO revoked only for capacity returns on its own se
     await f.revokeForCapacity();
     const finding = (await f.cp.doctor.run("system")).findings.find((candidate) => candidate.code === "CANONICAL_CTO_RESTORE_PENDING");
     expect(finding).toMatchObject({ blocking: false, observedEvidence: { roleKey: CTO, condition: "AWAITING_RESTORE" } });
+  });
+});
+
+/**
+ * Review S2B-R1-01 — the reviewer's four reconnect counterexamples, changed only for paths: a
+ * same-session binding at a later generation that no capacity restore committed is a binding that
+ * replaced the relay's own, and the relay's reconnect refuses it as PR1051-R1 does. With them, the
+ * reviewer's credential control.
+ */
+describe("review S2B-R1-01: a reconnect adopts only the succession a committed capacity restore announced", () => {
+  const bindSameCanonical = (f: Awaited<ReturnType<typeof started>>, projectId = PROJECT) => {
+    const claimed = { executorKind: SELF_CLAIM_EXECUTOR_KIND, targetLocator: CONVERSATION, targetLocatorDigest: sha256(CONVERSATION) };
+    return f.cp.bindings.bind({role: Role.PRIMARY_CTO, projectId, sessionId: f.sessionId,
+      authenticatedTarget: {claimed, protocolVersion: SELF_CLAIM_PROTOCOL, attestationDigest: digestOf({review: 'manual-rebind'}), verify: () => claimed}});
+  };
+
+  it('R1: reconnect rejects a CEO delegated release and same-session rebind', async () => {
+    const f = await started();
+    const ceo = f.cp.sessions.create({provider:'hermes', model:'fixture'});
+    expect(f.cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+    expect(f.cp.bindings.bind({role:Role.CEO, sessionId:ceo.sessionId}).allowed).toBe(true);
+    const principal = {sessionId:ceo.sessionId, sessionSecret:ceo.sessionSecret!};
+    const claimed = {executorKind: SELF_CLAIM_EXECUTOR_KIND, targetLocator: CONVERSATION, targetLocatorDigest:sha256(CONVERSATION)};
+    const writer = new CtoDelegatedBinding({db:f.cp.db, sessions:f.cp.sessions, bindings:f.cp.bindings,
+      authority:new CtoBindingDelegation(f.cp.sessions, f.cp.bindings, f.cp.audit, f.cp.db),
+      target: () => ({claimed, protocolVersion:SELF_CLAIM_PROTOCOL, attestationDigest:digestOf({review:'delegated'}), verify:()=>claimed})});
+    const released = writer.release({method:'ctoBinding.release',principal,request:{requestId:'review-release',projectId:PROJECT,
+      role:'PRIMARY_CTO',action:'release',expectedBindingGeneration:1,reason:'CEO chooses a new assignment'}});
+    expect(released.allowed, JSON.stringify(released)).toBe(true);
+    const rebound = writer.execute({method:'ctoBinding.bind',principal,request:{requestId:'review-bind',projectId:PROJECT,
+      role:'PRIMARY_CTO',action:'bind-or-rebind',expectedBindingGeneration:2,targetSessionId:f.sessionId}});
+    expect(rebound.allowed, JSON.stringify(rebound)).toBe(true);
+    await f.restart();
+    const ended = await until(f.relayEnded,1000);
+    console.error('R1 delegated rebind', {ended, generation:f.cp.bindings.active(CTO)?.bindingGeneration,
+      toolServed:ended?false:await f.toolServed(), capacityRestoreEvents:f.cp.audit.byKind(CANONICAL_CTO_CAPACITY_RESTORED).length});
+    expect(ended).toBe(true);
+  });
+
+  it('R1: reconnect rejects an operator rebind on the same session without a capacity restore', async () => {
+    const f = await started();
+    expect(f.cp.bindings.revoke(CTO, 'operator release, not capacity').allowed).toBe(true);
+    expect(bindSameCanonical(f).allowed).toBe(true);
+    expect(f.cp.audit.byKind(CANONICAL_CTO_CAPACITY_RESTORED)).toHaveLength(0);
+    await f.restart();
+    const ended = await until(f.relayEnded, 1000);
+    console.error('R1 same-session rebind', {ended, generation: f.cp.bindings.active(CTO)?.bindingGeneration,
+      toolServed: ended ? false : await f.toolServed(), capacityRestoreEvents: f.cp.audit.byKind(CANONICAL_CTO_CAPACITY_RESTORED).length});
+    expect(ended).toBe(true);
+  });
+
+  it('R1: reconnect rejects a replacement history that returns to the original session at gen3', async () => {
+    const f = await started();
+    expect(f.cp.bindings.revoke(CTO, 'operator replacement').allowed).toBe(true);
+    const other = f.cp.sessions.create({provider: 'claude', model: 'opus'});
+    expect(f.cp.sessions.transition(other.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+    expect(f.cp.bindings.bind({role: Role.PRIMARY_CTO, projectId: PROJECT, sessionId: other.sessionId}).allowed).toBe(true);
+    expect(f.cp.bindings.revoke(CTO, 'operator releases replacement').allowed).toBe(true);
+    expect(bindSameCanonical(f).allowed).toBe(true);
+    await f.restart();
+    const ended = await until(f.relayEnded, 1000);
+    console.error('R1 replacement history', {ended, generation: f.cp.bindings.active(CTO)?.bindingGeneration,
+      toolServed: ended ? false : await f.toolServed(), capacityRestoreEvents: f.cp.audit.byKind(CANONICAL_CTO_CAPACITY_RESTORED).length});
+    expect(ended).toBe(true);
+  });
+
+  it('R1: reconnect rejects a different project on the same session', async () => {
+    const f = await started();
+    const projectId = 'other-project';
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, {projectId});
+    const manifest = fixtureManifest(projectId);
+    expect(f.cp.projects.register({projectId,name:'other',manifest,authorization:f.cp.manifestAuthorizationForTests(manifest)}).allowed).toBe(true);
+    const other = f.cp.sessions.create({provider:'claude',model:'fixture'});
+    expect(f.cp.sessions.transition(other.sessionId,SessionLifecycle.READY).allowed).toBe(true);
+    expect(f.cp.bindings.bind({role:Role.PRIMARY_CTO,projectId,sessionId:other.sessionId}).allowed).toBe(true);
+    expect(f.cp.bindings.revoke(roleKey,'end first generation').allowed).toBe(true);
+    expect(f.cp.bindings.revoke(CTO,'release project A').allowed).toBe(true);
+    expect(bindSameCanonical(f,projectId).allowed).toBe(true);
+    expect(f.cp.bindings.active(CTO)).toBeNull();
+    await f.restart();
+    const ended = await until(f.relayEnded,1000);
+    console.error('R1 other project', {ended, oldRole:CTO, adoptedRole:roleKey, generation:f.cp.bindings.active(roleKey)?.bindingGeneration,
+      toolServed:ended?false:await f.toolServed(), capacityRestoreEvents:f.cp.audit.byKind(CANONICAL_CTO_CAPACITY_RESTORED).length});
+    expect(ended).toBe(true);
+  });
+
+  it('credential control: restored generation rejects the old secret at registry and attachment issuance', async () => {
+    const f = await started();
+    expect(f.cp.sessions.verifySecret(f.sessionId, f.oldSecret).allowed).toBe(true);
+    await f.revokeForCapacity();
+    f.windowResets();
+    const result = await f.port().restore(CTO);
+    expect(result?.allowed).toBe(true);
+    expect(f.cp.sessions.verifySecret(f.sessionId, f.oldSecret).allowed).toBe(false);
+    expect(f.cp.bindings.authenticateBoundSession({roleKey:CTO, sessionId:f.sessionId, sessionSecret:f.oldSecret, bindingGeneration:2}).allowed).toBe(false);
+    const attachments = new RoleAttachmentCredentials(f.cp.sessions, f.cp.bindings, f.clock);
+    expect(attachments.issue({sessionId:f.sessionId, sessionSecret:f.oldSecret, roleKey:CTO}).allowed).toBe(false);
+    expect(await until(f.toolServed)).toBe(true);
+  });
+});
+
+describe("review S2B-R1-01: the succession a restore commits names one binding, adopted once", () => {
+  it("keeps the relay's copies of the succession method and the challenge prefix in step with the daemon's", () => {
+    expect(RESTORE_SUCCESSION_METHOD).toBe(CANONICAL_CTO_RESTORE_SUCCESSION_METHOD);
+    expect(RESTORE_CHALLENGE_PREFIX).toBe(CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX);
+  });
+
+  it("records the succession it announced, and refuses a rebind made before the relay returned to it", async () => {
+    const f = await started();
+    await f.revokeForCapacity();
+    f.windowResets();
+    const restored = await f.port().restore(CTO);
+    expect(restored?.allowed).toBe(true);
+    const [record] = f.cp.audit.byKind(CANONICAL_CTO_CAPACITY_RESTORED);
+    expect(record?.evidence).toMatchObject({
+      fromGeneration: 1,
+      toGeneration: 2,
+      toAssignmentId: f.cp.bindings.active(CTO)!.assignmentId,
+      challengeId: expect.stringMatching(new RegExp(`^${CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX}`)),
+    });
+    // Before the relay's connection has even closed: generation 2 is released and the same session
+    // is bound again at generation 3. The succession named generation 2, so the reconnect refuses.
+    expect(f.cp.bindings.revoke(CTO, "operator release after the restore").allowed).toBe(true);
+    const claimed = { executorKind: SELF_CLAIM_EXECUTOR_KIND, targetLocator: CONVERSATION, targetLocatorDigest: sha256(CONVERSATION) };
+    expect(f.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: PROJECT, sessionId: f.sessionId,
+      authenticatedTarget: { claimed, protocolVersion: SELF_CLAIM_PROTOCOL, attestationDigest: digestOf({ review: "rebind-after-restore" }), verify: () => claimed } }).allowed).toBe(true);
+    expect(f.cp.bindings.active(CTO)?.bindingGeneration).toBe(3);
+    expect(await until(f.relayEnded, 2_000)).toBe(true);
+  });
+});
+
+/**
+ * Review S2B-R1-01 — each check `successionRefusal` makes, one witness each, against a stand-in door
+ * that writes exactly the lines a test names: connection 0 admits `HELD`, sends a restore challenge,
+ * and once the client answered it announces the given successions and ends; connection 1 admits
+ * `readmits`. A real daemon cannot be made to announce a succession that names another role, another
+ * predecessor or another challenge, so these are the witnesses for refusing one.
+ */
+describe("review S2B-R1-01: a relay takes a succession only for its own role, binding and challenge", () => {
+  const HELD = { assignmentId: "assignment-1", bindingGeneration: 1, sessionId: "session-1", sessionIncarnation: "incarnation-1" };
+  const RESTORED = { assignmentId: "assignment-2", bindingGeneration: 2, sessionId: "session-1", sessionIncarnation: "incarnation-1" };
+  const CHALLENGE = `${CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX}stand-in`;
+  const OTHER_ROLE = roleKeyFor(Role.PRIMARY_CTO, { projectId: "other-project" });
+  type Tuple = typeof HELD;
+  type Message = Record<string, unknown>;
+  const line = (message: Message): string => `${JSON.stringify(message)}\n`;
+  const admittedAs = (tuple: Tuple): string => line({ ok: true, reasonCode: "OK", admitted: tuple });
+  const announcing = (params: Message): Message => ({ jsonrpc: "2.0", method: CANONICAL_CTO_RESTORE_SUCCESSION_METHOD, params });
+  const succession = (overrides: { from?: Partial<Tuple & { roleKey: string }>; to?: Partial<Tuple & { roleKey: string }>; challengeId?: string } = {}): Message => ({
+    from: { roleKey: CTO, ...HELD, ...overrides.from },
+    to: { roleKey: CTO, ...RESTORED, ...overrides.to },
+    challengeId: overrides.challengeId ?? CHALLENGE,
+  });
+
+  const standInDoor = async (
+    onConnect: (index: number, socket: Socket) => void,
+    onLine: (index: number, socket: Socket, message: Message) => void = () => undefined,
+  ) => {
+    const dir = mkdtempSync("/tmp/acpsr-");
+    roots.push(dir);
+    const path = join(dir, "door.sock");
+    const connections: Socket[] = [];
+    const lines: Message[][] = [];
+    const server = createServer((socket) => {
+      const index = connections.length;
+      connections.push(socket);
+      lines.push([]);
+      socket.on("error", () => undefined);
+      let held = "";
+      socket.on("data", (chunk: Buffer) => {
+        held += chunk.toString("utf8");
+        for (let at = held.indexOf("\n"); at !== -1; at = held.indexOf("\n")) {
+          const message = JSON.parse(held.slice(0, at)) as Message;
+          held = held.slice(at + 1);
+          lines[index]!.push(message);
+          onLine(index, socket, message);
+        }
+      });
+      onConnect(index, socket);
+    });
+    await new Promise<void>((resolve) => server.listen(path, resolve));
+    closers.push(async () => {
+      for (const socket of connections) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+    return { dir, path, connections, lines };
+  };
+
+  /** The real relay on that door, with a client on its stdio that answers each `ping` unless told not to. */
+  const relayOn = (door: { dir: string; path: string }, answers: boolean) => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let err = "";
+    stderr.on("data", (chunk: Buffer) => {
+      err += chunk.toString("utf8");
+    });
+    const received: Message[] = [];
+    let held = "";
+    stdout.on("data", (chunk: Buffer) => {
+      held += chunk.toString("utf8");
+      for (let at = held.indexOf("\n"); at !== -1; at = held.indexOf("\n")) {
+        const message = JSON.parse(held.slice(0, at)) as Message;
+        held = held.slice(at + 1);
+        received.push(message);
+        if (answers && message.method === "ping") stdin.write(line({ jsonrpc: "2.0", id: message.id, result: {} }));
+      }
+    });
+    let code: number | null = null;
+    const exit = runAttachRelay(
+      {
+        claimSocketPath: join(door.dir, "no-claim.sock"),
+        mcpSocketPath: join(door.dir, "no-mcp.sock"),
+        reattachSocketPath: door.path,
+        claim: { claimedSessionUuid: CONVERSATION, projectId: PROJECT, expectedBindingGeneration: 1 },
+        reattach: POLICY,
+        mcpToken: TOKEN,
+      },
+      { stdin, stdout, stderr },
+    ).then((exited) => {
+      code = exited;
+      return exited;
+    });
+    closers.push(async () => {
+      stdin.end();
+      await exit;
+    });
+    return { stdin, err: () => err, code: () => code, received };
+  };
+
+  /**
+   * Connection 0 admits `HELD` and challenges with `challenge`; once the client answered it (or at
+   * once, when the client does not answer) it announces `announce` and ends. Connection 1 admits
+   * `readmits`; `later` scripts any connection after it.
+   */
+  const restoreThroughStandIn = async (options: {
+    announce: Message[];
+    readmits: Tuple;
+    answers?: boolean;
+    challenge?: string;
+    later?: (index: number, socket: Socket) => void;
+  }) => {
+    const challenge = options.challenge ?? CHALLENGE;
+    const answers = options.answers ?? true;
+    const announceAndEnd = (socket: Socket): void => {
+      socket.write(options.announce.map(announcing).map(line).join(""), () => socket.destroy());
+    };
+    const door = await standInDoor(
+      (index, socket) => {
+        if (index === 0) {
+          socket.write(admittedAs(HELD));
+          setTimeout(() => {
+            socket.write(line({ jsonrpc: "2.0", id: challenge, method: "ping" }));
+            if (!answers) setTimeout(() => announceAndEnd(socket), 100);
+          }, 50);
+          return;
+        }
+        if (index === 1) {
+          socket.write(admittedAs(options.readmits));
+          return;
+        }
+        options.later?.(index, socket);
+      },
+      (index, socket, message) => {
+        if (index !== 0) return;
+        if (message.id !== challenge) return;
+        if (!("result" in message)) return;
+        announceAndEnd(socket);
+      },
+    );
+    const relay = relayOn(door, answers);
+    return { door, relay };
+  };
+
+  const refused = async (relay: ReturnType<typeof relayOn>): Promise<boolean> =>
+    until(() => relay.code() === ATTACH_EXIT.HANDSHAKE_REFUSED, 3_000);
+
+  /** Live on connection `index`: a client request written now reaches it. */
+  const liveOn = async (relay: ReturnType<typeof relayOn>, door: { lines: Message[][] }, index: number): Promise<boolean> => {
+    for (const started = Date.now(); Date.now() - started < 3_000;) {
+      relay.stdin.write(line({ jsonrpc: "2.0", id: `probe-${Date.now()}`, method: "tools/list" }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      if (door.lines[index]?.some((message) => message.method === "tools/list") === true) return true;
+    }
+    return false;
+  };
+
+  it("adopts the restored binding a valid succession named, and never passes the announcement to the client", async () => {
+    const { door, relay } = await restoreThroughStandIn({ announce: [succession()], readmits: RESTORED });
+    expect(await liveOn(relay, door, 1)).toBe(true);
+    expect(relay.code()).toBeNull();
+    expect(relay.err()).toBe("");
+    expect(relay.received.some((message) => message.method === CANONICAL_CTO_RESTORE_SUCCESSION_METHOD)).toBe(false);
+    expect(relay.received.some((message) => message.id === CHALLENGE)).toBe(true);
+  });
+
+  it("refuses a succession that restores another role (role)", async () => {
+    const { relay } = await restoreThroughStandIn({ announce: [succession({ from: { roleKey: OTHER_ROLE } })], readmits: RESTORED });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: restore succession refused: it restores another role\nattach: reattach admitted another binding\n");
+  });
+
+  it("refuses a succession that changes the role (role)", async () => {
+    const { relay } = await restoreThroughStandIn({ announce: [succession({ to: { roleKey: OTHER_ROLE } })], readmits: RESTORED });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: restore succession refused: it changes the role\nattach: reattach admitted another binding\n");
+  });
+
+  it("refuses a succession from another assignment than the one the relay holds (predecessor assignment)", async () => {
+    const { relay } = await restoreThroughStandIn({ announce: [succession({ from: { assignmentId: "assignment-0" } })], readmits: RESTORED });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: restore succession refused: it restores another binding\nattach: reattach admitted another binding\n");
+  });
+
+  it("refuses a succession whose challenge the client never answered on this connection (connection binding)", async () => {
+    const { relay } = await restoreThroughStandIn({ announce: [succession()], readmits: RESTORED, answers: false });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: restore succession refused: this connection did not answer its challenge\nattach: reattach admitted another binding\n");
+  });
+
+  it("refuses a succession naming a challenge other than the one this connection answered (connection binding)", async () => {
+    const { relay } = await restoreThroughStandIn({
+      announce: [succession({ challengeId: `${CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX}another` })],
+      readmits: RESTORED,
+    });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: restore succession refused: this connection did not answer its challenge\nattach: reattach admitted another binding\n");
+  });
+
+  it.each([
+    ["moves the session", { sessionId: "session-2" }],
+    ["moves the incarnation", { sessionIncarnation: "incarnation-2" }],
+    ["skips a generation", { bindingGeneration: 3 }],
+    ["names the same assignment", { assignmentId: HELD.assignmentId }],
+  ] as const)("refuses a succession that %s (new binding)", async (refusal, change) => {
+    const named = { ...RESTORED, ...change };
+    const { relay } = await restoreThroughStandIn({ announce: [succession({ to: named })], readmits: named });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe(`attach: restore succession refused: it ${refusal}\nattach: reattach admitted another binding\n`);
+  });
+
+  it("refuses a reconnect that names a binding other than the one the succession named (new binding)", async () => {
+    const { relay } = await restoreThroughStandIn({ announce: [succession()], readmits: { ...RESTORED, assignmentId: "assignment-3" } });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: reattach admitted another binding\n");
+  });
+
+  it("takes one succession: a second announced while one is held is refused, not taken in its place", async () => {
+    const second = { ...RESTORED, assignmentId: "assignment-2b" };
+    const { relay } = await restoreThroughStandIn({ announce: [succession(), succession({ to: second })], readmits: second });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: restore succession refused: a succession is already held\nattach: reattach admitted another binding\n");
+  });
+
+  it("holds a succession for the next admission alone: one that did not use it leaves nothing for a later one", async () => {
+    // Connection 1 names the binding the relay already holds, so it is admitted as it always was;
+    // when it ends, connection 2 names the binding the succession had named, and is refused.
+    const { door, relay } = await restoreThroughStandIn({
+      announce: [succession()],
+      readmits: HELD,
+      later: (index, socket) => {
+        if (index === 2) socket.write(admittedAs(RESTORED));
+      },
+    });
+    expect(await liveOn(relay, door, 1)).toBe(true);
+    door.connections[1]!.destroy();
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: reattach admitted another binding\n");
+  });
+
+  it("does not adopt on a replayed succession: after its one adoption, the same announcement moves nothing", async () => {
+    const third = { ...RESTORED, assignmentId: "assignment-3", bindingGeneration: 3 };
+    const { door, relay } = await restoreThroughStandIn({
+      announce: [succession()],
+      readmits: RESTORED,
+      later: (index, socket) => {
+        if (index === 2) socket.write(admittedAs(third));
+      },
+    });
+    expect(await liveOn(relay, door, 1)).toBe(true);
+    // The very announcement connection 0 carried, written again on connection 1, which then ends.
+    door.connections[1]!.write(line(announcing(succession())), () => door.connections[1]!.destroy());
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: restore succession refused: it restores another binding\nattach: reattach admitted another binding\n");
   });
 });

@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CanonicalCtoRestoreCondition, type CanonicalCtoRestoreTarget } from "../../src/continuity/continuity-kernel.ts";
 import {
   CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX,
+  CANONICAL_CTO_RESTORE_SUCCESSION_METHOD,
   createCanonicalCtoAttachChallenger,
   takeRestoreChallengeAnswer,
   type ReattachConnection,
@@ -15,6 +16,7 @@ import {
 import { hostSessionRegistryAbsent, type ProcessAncestryInspector, type ProcessSnapshot } from "../../src/registry/canonical-self-claim.ts";
 import type { CanonicalCtoAdmission } from "../../src/registry/canonical-cto-reattach.ts";
 import type { ProcessLineageReader } from "../../src/session/runtime-lineage.ts";
+import type { RoleBinding } from "../../src/domain/types.ts";
 import {
   canonicalCtoFixture,
   CONVERSATION,
@@ -245,5 +247,48 @@ describe("#1106: the capacity restore's liveness challenge", () => {
     expect(proof.value.stillAttached().allowed).toBe(true);
     x.record.socket.destroy();
     expect(proof.value.stillAttached().evidence).toMatchObject({ condition: CanonicalCtoRestoreCondition.ATTACH_TARGET_NOT_LIVE });
+  });
+
+  it("on release writes the one succession it proved on that connection and ends it (review S2B-R1-01)", async () => {
+    const s = await subject();
+    const x = await s.connection(s.admitted);
+    const proving = s.challenger.challenge(s.target);
+    expect(await until(() => x.sent.length === 1)).toBe(true);
+    takeRestoreChallengeAnswer(x.record, answerTo(x.sent[0]!));
+    const proof = await proving;
+    if (!proof.allowed) throw new Error(proof.message);
+    expect(proof.value.challengeId).toBe(idOf(x.sent[0]!));
+    const restored = {
+      ...s.f.h.cp.bindings.active(CTO),
+      roleKey: CTO,
+      assignmentId: "restored-assignment",
+      bindingGeneration: s.admitted.bindingGeneration + 1,
+      sessionId: s.admitted.sessionId,
+      sessionIncarnation: s.admitted.sessionIncarnation,
+    } as RoleBinding;
+    proof.value.release(restored);
+    expect(await until(() => x.record.socket.destroyed)).toBe(true);
+    expect(x.sent).toHaveLength(2);
+    expect(x.sent[1]).toEqual({
+      jsonrpc: "2.0",
+      method: CANONICAL_CTO_RESTORE_SUCCESSION_METHOD,
+      params: {
+        from: {
+          roleKey: CTO,
+          assignmentId: s.admitted.assignmentId,
+          bindingGeneration: s.admitted.bindingGeneration,
+          sessionId: s.admitted.sessionId,
+          sessionIncarnation: s.admitted.sessionIncarnation,
+        },
+        to: {
+          roleKey: CTO,
+          assignmentId: "restored-assignment",
+          bindingGeneration: s.admitted.bindingGeneration + 1,
+          sessionId: s.admitted.sessionId,
+          sessionIncarnation: s.admitted.sessionIncarnation,
+        },
+        challengeId: idOf(x.sent[0]!),
+      },
+    });
   });
 });
