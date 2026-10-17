@@ -74,7 +74,8 @@ const validResult = (harness: Harness, runId: string, projectId: string, planDig
     role: "primary",
     identity: BOOTSTRAP_IDENTITY,
     proposedCheckoutPath: harness.repoPath,
-    defaultBranch: "dev",
+    // The PLAN's default branch, the one it pushes and sets (and the handoff's ACK requires).
+    defaultBranch: "main",
     createdBranches: ["main", "dev"],
   }],
   externalWriteReceipts: bootstrapOperations().map((operation) => ({

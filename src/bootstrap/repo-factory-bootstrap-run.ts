@@ -47,6 +47,8 @@ import {
   currentBootstrapPlan,
   executablePlanOf,
   executableOperationsSchema,
+  handoffFactsAre,
+  observedRepositoryFacts,
   type PlannedBootstrapOutputs,
   plannedBootstrapOutputs,
 } from "./bootstrap-plan.ts";
@@ -1757,6 +1759,31 @@ export class RepoFactoryBootstrapRunner {
       return unattributed("the stored result's checkout is not this run's own, carrying this operation's marker", {
         checkoutPath,
         proposed: repositories.map((repository) => repository.proposedCheckoutPath),
+      });
+    }
+    // PR #1122 R1 (BCG-R1-02) — the repository facts the handoff delivers, selected from the stored result
+    // bound to the PLAN's target and required verification, must be this execution's own readback as its
+    // ledger receipted it: a create-only create's reported default branch and initialized parentless head,
+    // or a push's branch and published head. Conflicting verification rows are refused in the selection.
+    const facts = observedRepositoryFacts(result, {
+      repositoryIdentity: application.repositoryIdentity,
+      defaultBranch: plan.defaultBranch,
+      verificationCommandId: plan.verificationCommandId,
+    });
+    const created = receipts.find((receipt) => receipt!.resourceType === "repository");
+    const pushed = receipts.filter((receipt) => receipt!.resourceType === "branch").at(-1);
+    const readback = execution.createOnly
+      ? created?.resourceType === "repository"
+        ? { branch: created.observed.defaultBranch ?? null, head: created.observed.initializedHead ?? null }
+        : null
+      : pushed?.resourceType === "branch"
+        ? { branch: pushed.observed.name, head: pushed.observed.headSha }
+        : null;
+    if (!facts.allowed || readback === null || !handoffFactsAre({ repositoryFacts: facts.value }, [{ identity: application.repositoryIdentity, ...readback }])) {
+      return unattributed("the stored result's repository facts are not this execution's readback in the attempt ledger", {
+        ledgerPath,
+        facts: facts.allowed ? facts.value : facts.evidence,
+        readback,
       });
     }
     return allow(ReasonCode.OK, result);

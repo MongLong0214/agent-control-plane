@@ -829,7 +829,8 @@ describe("Repo Factory boundary (CP-S52)", () => {
         role: "primary",
         identity: "github:acme/fixture",
         proposedCheckoutPath: harness.repoPath,
-        defaultBranch: "dev",
+        // The bootstrap PLAN's default branch, the one its operations push and set (and the handoff's ACK requires).
+        defaultBranch: "main",
         createdBranches: ["main", "dev"],
       },
     ],

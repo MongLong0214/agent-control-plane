@@ -163,6 +163,21 @@ export const BOOTSTRAP_TASKS_SUPERSEDED = "BOOTSTRAP_TASKS_SUPERSEDED";
 /** The audit kind of the one settlement of a project-less bootstrap's execution task. */
 export const BOOTSTRAP_TASK_SETTLED = "BOOTSTRAP_TASK_SETTLED";
 
+/** The `BOOTSTRAP_PLAN_TASKS` records of a run, as its `plan_submit`s wrote them. */
+const bootstrapPlanTaskRecords = (db: Pick<Db, "all">, runId: string): Array<{ planDigest?: unknown; taskIds?: unknown }> =>
+  db
+    .all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ?`, [BOOTSTRAP_PLAN_TASKS, runId])
+    .map((row) => JSON.parse(row.evidence_json) as { planDigest?: unknown; taskIds?: unknown });
+
+/**
+ * Review of run_7717 (F6) — whether a `BOOTSTRAP_PLAN_TASKS` record binds `taskId` to `planDigest`: the
+ * task was created by that PLAN's `plan_submit`. Read from the store, with no legacy fallback; the review
+ * prompt states the answer for its run, and CONFIRM's settlement requires it.
+ */
+export const bootstrapPlanTaskRecorded = (db: Pick<Db, "all">, runId: string, taskId: string, planDigest: string): boolean =>
+  bootstrapPlanTaskRecords(db, runId).some((binding) =>
+    binding.planDigest === planDigest && Array.isArray(binding.taskIds) && binding.taskIds.includes(taskId));
+
 /**
  * Deliberately narrow binding port. TaskGraph can verify the worker that a receipt names,
  * but it receives neither the binding registry nor authority to mutate bindings.
@@ -1083,6 +1098,8 @@ export class TaskGraph {
    *   verified create receipt for that operation and resource;
    * - the task is this run's, READY, and the one `bootstrapReviewEntry` answers for this PLAN (no
    *   execution anywhere in the run, nothing SUCCEEDED, exactly one live task, bound to this PLAN);
+   * - a `BOOTSTRAP_PLAN_TASKS` record binds the task to this PLAN: unlike review entry, no legacy
+   *   singleton is settled;
    * - no task of the run was settled before: one create receipt settles one task.
    */
   settleBootstrapExecutionTask(input: BootstrapTaskSettlement): Decision<TaskRecord> {
@@ -1168,6 +1185,16 @@ export class TaskGraph {
         currentTaskId: entry.value.taskId,
       });
     }
+    // Review of run_7717 (F6) — review entry admits a legacy singleton with no record; settlement does
+    // not: a create receipt settles only a task the current PLAN's `plan_submit` is recorded to have created.
+    if (!bootstrapPlanTaskRecorded(this.db, input.runId, input.taskId, input.planDigest)) {
+      return refuse(
+        ReasonCode.TASK_RESULT_COUNT_MISMATCH,
+        "BOOTSTRAP_TASK_PLAN_UNRECORDED",
+        "no BOOTSTRAP_PLAN_TASKS record binds this task to the current PLAN; settlement admits no legacy task, so submit the PLAN again to create its task",
+        { planDigest: input.planDigest },
+      );
+    }
     const earlier = this.db.get<{ n: number }>(`SELECT 1 AS n FROM audit_events WHERE kind = ? AND run_id = ? LIMIT 1`, [
       BOOTSTRAP_TASK_SETTLED,
       input.runId,
@@ -1217,12 +1244,9 @@ export class TaskGraph {
    * task counts as its current PLAN's only while it is the run's one live task.
    */
   #boundToBootstrapPlan(runId: string, taskId: string, planDigest: string, liveTasks: number): boolean {
-    const bindings = this.db
-      .all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ?`, [BOOTSTRAP_PLAN_TASKS, runId])
-      .map((row) => JSON.parse(row.evidence_json) as { planDigest?: unknown; taskIds?: unknown });
+    const bindings = bootstrapPlanTaskRecords(this.db, runId);
     if (bindings.length === 0) return liveTasks === 1;
-    return bindings.some((binding) =>
-      binding.planDigest === planDigest && Array.isArray(binding.taskIds) && binding.taskIds.includes(taskId));
+    return bootstrapPlanTaskRecorded(this.db, runId, taskId, planDigest);
   }
 
   /**
