@@ -1,0 +1,20 @@
+Warn: released migrations v38 to v44 read the frozen src/db/schema-v44.sql snapshot (a byte copy of the pre-change v44 schema.sql, blob 157a8e4d) instead of the live schema.sql, so later schema edits cannot change what an old migration installs; schemaSqlAt routes versions up to 44 to that file
+Warn: the build copies schema-v44.sql into dist beside the migration module; without that copy a compiled upgrade fails with ENOENT
+Record-Id: r-v45a0frozenv44snapshot
+Provenance: inherited 9ff4431d8aa7e1f7cbe49c1ca2903cdbeef07216
+
+Limit: the general CONTRACT_CHANGE path still reads workflows at the default branch at run time; binding its revision is a separate slice
+Warn: migration v45 adds a dedicated first-activation grant table: an operator-registered project's active manifest moves NULL to an approved manifest only through a consumed first-activation grant, bound to the exact project, target manifest, review, CEO approval and registered repository identity and role set, consumed once while the pointer is still NULL; the v44 grant table and its NOT NULL from column are untouched, so the general CONTRACT_CHANGE path is unchanged
+Warn: first activation binds a non-empty set of workflows by repository, path, checkName, exact commit SHA and digest, and PRE_MERGE and ACTIVATION read that same commit through src/github/workflow-digest-at-commit.ts with replacement objects disabled and a commit-only remote path; tags are never dereferenced and the default branch head is never adopted
+Record-Id: r-v45firstmanifestactivation
+Provenance: inherited d06fe329005bee93b954d446af3fbfa31314927a
+
+Limit: the released v43 step has the same IF NOT EXISTS gap and is not changed here
+Warn: every name a v45 IF NOT EXISTS statement takes (the first-grant table, its unique index and the ten guards) is checked in any letter case before and after the step for its type, table and definition, and the table must then carry exactly its index and seven guards; a conflict refuses the step rather than dropping and re-creating the object, because IF NOT EXISTS is a no-op whenever anything holds the name
+Record-Id: r-b2698634768a
+Provenance: inherited 1908b40e4da30eac4d5712cbf48439a748dd7b1e
+
+Limit: the released v44 step's normaliser has the same literal-stripping flaw and is unchanged here
+Warn: v45 compares each stored definition with schema.sql token by token: single-quoted literals byte for byte, a double-quoted name equal to its bare word only when it is a plain non-keyword name, and whitespace and comments outside literals as one separator; anything it cannot classify (backticks, brackets, quoted keywords, unterminated regions) refuses the step rather than being stripped and accepted
+Record-Id: r-aeeb3e619708
+Provenance: inherited af1e44c5877976c979676056911753e56708e4df
