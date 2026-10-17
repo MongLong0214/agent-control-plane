@@ -1,0 +1,3 @@
+Warn: doctor warns CEO_BUZZ_IDENTITY_UNBOUND when the live CEO runtime has no buzz actor id; the subscriber-silent finding stays quiet when every identity is deliberately excluded; every role wake is audited as ROLE_WAKE_SENT with its cause, so an empty registration wake is explained rather than silent
+Record-Id: r-wakecausesubscriberdoctor
+Provenance: inherited e0eac324a1a85c0944eb2fd99f810800b9870215
