@@ -6,7 +6,7 @@ import type { Db } from "../db/database.ts";
 import type { Role } from "../domain/types.ts";
 import type { CapacityBucket, CapacityReading, ProviderRegistry, RoleCapacityBinding } from "../runtime/provider.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
-import { USAGE_PROVIDERS } from "./usage-collectors.ts";
+import { USAGE_PROVIDERS, accountDigestOfSource, isAccountDigest } from "./usage-collectors.ts";
 
 export type AllocationAdmission = "OPEN" | "CONSERVE" | "SUSPENDED";
 
@@ -158,6 +158,12 @@ const ROLE_HISTORY_LIMIT = 16;
 /** #1099 — the audit record that carries a WORKER binding's newest accepted observation across a restart. */
 const ROLE_OBSERVATION_AUDIT_KIND = "CAPACITY_ROLE_OBSERVATION";
 
+/** #1099 — a persisted observation the first worker after a restart did not count, and why. */
+const ROLE_OBSERVATION_NOT_RESTORED_AUDIT_KIND = "CAPACITY_ROLE_OBSERVATION_NOT_RESTORED";
+
+/** #1099 — an explicit capacity invalidation of a role binding, kept so that a restart honours it. */
+const ROLE_INVALIDATION_AUDIT_KIND = "CAPACITY_ROLE_INVALIDATED";
+
 /**
  * One accepted observation in a role binding's burn history.
  *
@@ -168,11 +174,16 @@ const ROLE_OBSERVATION_AUDIT_KIND = "CAPACITY_ROLE_OBSERVATION";
  * at which the monitor first accepted the observation; a re-read of it replaces this entry and
  * keeps that first instant, so a permitted clock lead that normalizes later on a re-read cannot
  * turn one observation into two.
+ *
+ * `account` is the digest of the account the collector established it measured
+ * (`accountDigestOfSource`), or null when it established none. Only readings of one account are ever
+ * combined into a burn (#1099).
  */
 interface RoleObservation {
   readonly identity: number;
   readonly acceptedAt: string;
   readonly buckets: CapacityReading["buckets"];
+  readonly account: string | null;
 }
 
 /** One window observation, in the shape `capacity_snapshots` stores it. */
@@ -188,6 +199,8 @@ interface BurnObservation {
  * offset, or two precisions) can order one way as text and the other as time. Readings are therefore
  * ordered by the instant they parse to. A spelling that does not parse has no place in that order and
  * goes behind every one that does; equal instants fall back to the text, so the order stays total.
+ * That placement is only an order: the readers of stored rows decide by storage order whether such
+ * a row is the newest (`newestObservedAt`), so it can never let an older row win.
  */
 const instantOf = (observedAt: string): number => {
   const at = Date.parse(observedAt);
@@ -481,6 +494,7 @@ export class CapacityMonitor {
         identity,
         acceptedAt: first?.acceptedAt ?? new Date(Date.parse(measured.observedAt)).toISOString(),
         buckets: structuredClone(reading.buckets),
+        account: accountDigestOfSource(reading.source),
       });
       this.#roleHistory.set(binding, history.slice(-ROLE_HISTORY_LIMIT));
     }
@@ -977,12 +991,14 @@ export class CapacityMonitor {
       // also counts the newest observation a worker admission persisted for this exact binding before
       // the restart, but only while it is inside `freshnessMs` of its original observation time and
       // its provider, account and target match (`restoredRoleObservation`); expired, future-dated,
-      // mismatched or unparseable records count for nothing. The probe above is still required, and
-      // still has to be HEALTHY, so a persisted reading can complete a burn measurement but never
-      // stand in for a failed one. This admission's own reading is persisted after the burn is read.
+      // mismatched or unparseable records count for nothing, and a record that is not counted is
+      // audited with the reason. The probe above is still required, and still has to be HEALTHY, so
+      // a persisted reading can complete a burn measurement but never stand in for a failed one, and
+      // it is that probe's account the record has to match. This admission's own reading is
+      // persisted after the burn is read.
       let demand = target.reserveDemand;
       if (roleBinding && demand.burnRatePercentPerHourByBucket) {
-        demand = withBurnRates(demand, this.roleBurnRateByBucket(roleBinding));
+        demand = withBurnRates(demand, this.roleBurnRateByBucket(roleBinding, true));
         this.persistRoleObservation(roleBinding);
       }
       const reserves = new Map(
@@ -1139,19 +1155,58 @@ export class CapacityMonitor {
 
   /**
    * #1101 — the newest instant at which `provider` has stored rows, by time (`newestObservedFirst`).
-   * Given `quotaBefore`, the newest instant strictly earlier than it whose rows are not an ERROR.
+   * Given `quotaBefore`, the newest parseable instant strictly earlier than it whose rows are not an
+   * ERROR; a row whose time does not parse is never earlier than anything.
+   *
+   * Review r1, rows the writer stored before #1101: it could store an `observed_at` that does not
+   * parse (an ERROR reading, under its collector's own text). Such a row has no place in time, and
+   * the one order known about it is the order it was stored in (`rowid`). A reading stored before it
+   * may be older than it, so none may win over it. The rule: when the most recently stored row with an
+   * unparseable time was stored after every row of the newest parseable instant, that row is the
+   * current reading — it reads as an ERROR, so SUSPENDED — and burn is unknown
+   * (`measuredBurnRateByBucket`). A reading stored after it supersedes it, and every new reading is,
+   * since the writer now dates an unparseable time at the moment it was read.
    */
   private newestObservedAt(provider: string, quotaBefore?: string): string | null {
-    const instants = this.db.all<{ observed_at: string }>(
-      quotaBefore === undefined
-        ? `SELECT DISTINCT observed_at FROM capacity_snapshots WHERE provider = ?`
-        : `SELECT DISTINCT observed_at FROM capacity_snapshots WHERE provider = ? AND sensor_health != 'ERROR'`,
+    if (quotaBefore !== undefined) {
+      return this.db.all<{ observed_at: string }>(
+        `SELECT DISTINCT observed_at FROM capacity_snapshots WHERE provider = ? AND sensor_health != 'ERROR'`,
+        [provider],
+      ).map((row) => row.observed_at)
+        .filter((observedAt) => Number.isFinite(Date.parse(observedAt)) && instantOf(observedAt) < instantOf(quotaBefore))
+        .sort(newestObservedFirst)[0] ?? null;
+    }
+    const { parseable, unparseable } = this.storedInstants(provider);
+    if (unparseable && (!parseable || unparseable.stored > parseable.stored)) return unparseable.observedAt;
+    return parseable?.observedAt ?? null;
+  }
+
+  /**
+   * The newest parseable instant `provider` has rows at, by time, and the most recently stored
+   * unparseable one, each with the `rowid` of its last stored row. `rowid` is SQLite's insertion order,
+   * not a column this schema states (v44 adds none). Without AUTOINCREMENT a new row takes one more
+   * than the largest that remains, so it still follows every stored row; a `VACUUM` or a restored
+   * `VACUUM INTO` copy may renumber rows, which SQLite does in their existing order but does not
+   * promise to. The only ACP code that vacuums is the backup, which writes a separate file.
+   */
+  private storedInstants(provider: string): {
+    parseable: { observedAt: string; stored: number } | null;
+    unparseable: { observedAt: string; stored: number } | null;
+  } {
+    let parseable: { observedAt: string; stored: number } | null = null;
+    let unparseable: { observedAt: string; stored: number } | null = null;
+    for (const row of this.db.all<{ observed_at: string; stored: number }>(
+      `SELECT observed_at, MAX(rowid) AS stored FROM capacity_snapshots WHERE provider = ? GROUP BY observed_at`,
       [provider],
-    ).map((row) => row.observed_at);
-    const candidates = quotaBefore === undefined
-      ? instants
-      : instants.filter((observedAt) => instantOf(observedAt) < instantOf(quotaBefore));
-    return candidates.sort(newestObservedFirst)[0] ?? null;
+    )) {
+      const instant = { observedAt: row.observed_at, stored: row.stored };
+      if (Number.isFinite(Date.parse(row.observed_at))) {
+        if (!parseable || newestObservedFirst(row.observed_at, parseable.observedAt) < 0) parseable = instant;
+      } else if (!unparseable || row.stored > unparseable.stored) {
+        unparseable = instant;
+      }
+    }
+    return { parseable, unparseable };
   }
 
   private rowsObservedAt(provider: string, observedAt: string): RawCapacity[] {
@@ -1351,6 +1406,10 @@ export class CapacityMonitor {
         WHERE provider = ? AND remaining_percent IS NOT NULL`,
       [provider],
     );
+    // Review r1: a row with an unparseable time stored after the newest parseable reading makes the
+    // current reading unknown (`newestObservedAt`), and its burn with it: no older row may measure it.
+    const { parseable, unparseable } = this.storedInstants(provider);
+    if (unparseable && (!parseable || unparseable.stored > parseable.stored)) return {};
     // Ordered here, by parsed time, rather than by the stored text (#1101).
     return burnRateByBucket(rows.sort(byWindowNewestFirst));
   }
@@ -1362,15 +1421,26 @@ export class CapacityMonitor {
    *
    * The history is the in-memory one plus, when it is still usable, the observation persisted for this
    * exact binding before a restart (#1099, `restoredRoleObservation`). An observation already in
-   * memory is counted once, at the instant it was first accepted.
+   * memory is counted once, at the instant it was first accepted. Only observations of the account the
+   * newest one measured are combined: a reading of one account never measures another's burn.
+   * `auditRefusal` records a persisted observation that was not counted, with the reason; the
+   * admission asks for that, the demand computed before its probe does not.
    */
-  private roleBurnRateByBucket(binding: RoleCapacityBinding): Record<string, number> {
+  private roleBurnRateByBucket(binding: RoleCapacityBinding, auditRefusal = false): Record<string, number> {
     const history = this.#roleHistory.get(binding) ?? [];
-    const restored = this.restoredRoleObservation(binding);
+    const account = history.at(-1)?.account ?? null;
+    const sameAccount = history.filter((entry) => entry.account === account);
+    const restoration = this.restoredRoleObservation(binding, history);
+    if (auditRefusal && restoration && "refused" in restoration) {
+      this.audit.record({
+        kind: ROLE_OBSERVATION_NOT_RESTORED_AUDIT_KIND,
+        evidence: { provider: binding.provider, role: binding.role, reason: restoration.refused },
+      });
+    }
     const rows: BurnObservation[] = [];
-    for (const observation of restored && !history.some((entry) => entry.identity === restored.identity)
-      ? [restored, ...history]
-      : history) {
+    for (const observation of restoration && "restored" in restoration
+      ? [restoration.restored, ...sameAccount]
+      : sameAccount) {
       for (const bucket of observation.buckets) {
         // `remaining_percent IS NOT NULL`: an unknown quota is not an observation of burn.
         if (typeof bucket.remainingPercent !== "number" || !Number.isFinite(bucket.remainingPercent)) continue;
@@ -1386,12 +1456,40 @@ export class CapacityMonitor {
   }
 
   /**
+   * #1099 — `ProviderRegistry.invalidateCapacityForRole` withdrew this provider's capacity for `role`.
+   * The registry's generation bump is process-local, so the invalidation is recorded here, at the
+   * monitor's clock, and `restoredRoleObservation` refuses every observation that does not postdate
+   * the latest one, whatever account it measured.
+   */
+  capacityInvalidated(provider: string, role: Role): void {
+    this.audit.record({
+      kind: ROLE_INVALIDATION_AUDIT_KIND,
+      reasonCode: ReasonCode.OK,
+      evidence: { provider, role },
+    });
+  }
+
+  /** When capacity for `provider` in `role` was last explicitly invalidated, or null if never. */
+  private latestRoleInvalidation(provider: string, role: Role): string | null {
+    return this.db.get<{ at: string }>(
+      `SELECT at FROM audit_events
+        WHERE kind = ?
+          AND json_extract(evidence_json, '$.provider') = ?
+          AND json_extract(evidence_json, '$.role') = ?
+        ORDER BY event_id DESC LIMIT 1`,
+      [ROLE_INVALIDATION_AUDIT_KIND, provider, role],
+    )?.at ?? null;
+  }
+
+  /**
    * #1099 — makes the WORKER binding's newest accepted observation durable, so that the first worker
    * after a restart can be measured against it (`restoredRoleObservation`). Called once the admission
    * has read its burn, so that what it restored is the reading from before the restart, not this one.
    *
    * What is recorded is the history entry itself, at the instant it was first accepted: a re-read of
-   * an older observation is recorded at that older instant, so recording never renews freshness.
+   * an older observation is recorded at that older instant, so recording never renews freshness. The
+   * account is recorded as the collector's digest (`accountDigest`, null when it established none);
+   * no raw account value reaches the monitor at all.
    */
   private persistRoleObservation(binding: RoleCapacityBinding): void {
     const newest = (this.#roleHistory.get(binding) ?? []).at(-1);
@@ -1405,6 +1503,7 @@ export class CapacityMonitor {
         generation: binding.generation,
         identity: newest.identity,
         observedAt: newest.acceptedAt,
+        accountDigest: newest.account,
         buckets: newest.buckets.map((bucket) => ({
           id: bucket.id,
           remainingPercent: bucket.remainingPercent,
@@ -1416,24 +1515,41 @@ export class CapacityMonitor {
   }
 
   /**
-   * #1099 — the newest observation persisted for this binding, or null unless every condition of the
-   * owner's ruling (2026-10-17) holds:
+   * #1099 — the newest observation persisted for this binding, restored only when every condition of
+   * the owner's ruling (2026-10-17) holds, and otherwise refused with the condition that failed:
    *
-   * - **provider and measurement target**: the record names this binding's provider and role;
-   * - **account**: it was taken through this same capacity registration (`generation`). The role
-   *   selects the credential scope (#512) and the generation is the registration's position in the
-   *   composition, so a recomposed or invalidated scope does not match. ACP has no account identity
-   *   beyond that: an account changed outside the composition between the record and the restart is
-   *   caught only because its windows reset at different instants, which `burnRateByBucket` refuses;
+   * - **provider and measurement target**: the record names this binding's provider and role, and was
+   *   taken through the registration at the same position in the composition (`generation`,
+   *   REGISTRATION_MISMATCH). The generation restarts with the process, so it says nothing about the
+   *   account; it only keeps a recomposed scope, or one invalidated in this process, from matching.
+   * - **account** (review r1): the record's `accountDigest` equals the digest of the account the
+   *   probe this admission just took measured. Both are established by the provider's collector from
+   *   what the provider CLI itself reports and are digests, never raw values; Claude's is the
+   *   organization id and signed-in address that `claude auth status` names (`claudeAccountDigest`).
+   *   The comparison is against a fresh read every time, so a changed account invalidates every record
+   *   of the old one durably (ACCOUNT_MISMATCH). Where either side has no account identity — the
+   *   Codex and Grok collectors read none, nor does a configured terminal or a failed identity read —
+   *   restoration is refused (NO_ACCOUNT_IDENTITY): the pre-#1099 behaviour, since a registration
+   *   order, a reset time or a bucket id cannot tell two accounts apart.
+   * - **not withdrawn** (review r1): its original observation time is later than the latest explicit
+   *   invalidation of this provider and role (`capacityInvalidated`, INVALIDATED). The invalidation
+   *   is recorded durably because the generation it bumps restarts with the process; it withdraws the
+   *   readings of every account, and an observation at the very instant of the invalidation, or an
+   *   invalidation whose time does not parse, counts as withdrawn.
    * - **freshness**: its original observation time parses, is not in the future, and is within
-   *   `freshnessMs` of now. That time is the one first accepted before the restart and is never
-   *   re-stamped, so a restart cannot renew it;
-   * - **shape**: identity and quota parse as a reading does (`parseObservationBuckets`).
+   *   `freshnessMs` of now (UNPARSEABLE_TIME, FUTURE_DATED, EXPIRED). That time is the one first
+   *   accepted before the restart and is never re-stamped, so a restart cannot renew it;
+   * - **shape**: the record, its identity and its quota parse as a reading does (UNREADABLE).
    *
-   * Only the newest record for the binding is considered, and anything unmet answers null: the
-   * window then has one reading and stays held, so a missing or failed measurement is never capacity.
+   * Only the newest record for the binding is considered. A record whose observation is already in
+   * memory is this process's own and is counted there, so it is neither restored nor refused (null).
+   * Refused, the window has one reading and stays held: a missing or failed measurement is never
+   * capacity.
    */
-  private restoredRoleObservation(binding: RoleCapacityBinding): RoleObservation | null {
+  private restoredRoleObservation(
+    binding: RoleCapacityBinding,
+    history: readonly RoleObservation[],
+  ): { restored: RoleObservation } | { refused: string } | null {
     const row = this.db.get<{ evidence_json: string }>(
       `SELECT evidence_json FROM audit_events
         WHERE kind = ?
@@ -1447,17 +1563,30 @@ export class CapacityMonitor {
     try {
       evidence = JSON.parse(row.evidence_json);
     } catch {
-      return null;
+      return { refused: "UNREADABLE" };
     }
-    if (!isPlainRecord(evidence) || evidence["generation"] !== binding.generation) return null;
+    if (!isPlainRecord(evidence)) return { refused: "UNREADABLE" };
     const identity = evidence["identity"];
+    if (typeof identity === "number" && history.some((entry) => entry.identity === identity)) return null;
+    if (evidence["generation"] !== binding.generation) return { refused: "REGISTRATION_MISMATCH" };
+    const recordedAccount = isAccountDigest(evidence["accountDigest"]) ? evidence["accountDigest"] : null;
+    const measuredAccount = history.at(-1)?.account ?? null;
+    if (recordedAccount === null || measuredAccount === null) return { refused: "NO_ACCOUNT_IDENTITY" };
+    if (recordedAccount !== measuredAccount) return { refused: "ACCOUNT_MISMATCH" };
     const observedAt = evidence["observedAt"];
-    if (typeof identity !== "number" || !Number.isFinite(identity) || typeof observedAt !== "string") return null;
+    if (typeof identity !== "number" || !Number.isFinite(identity) || typeof observedAt !== "string") {
+      return { refused: "UNREADABLE" };
+    }
     const at = Date.parse(observedAt);
     const now = Date.parse(this.clock.nowIso());
-    if (!Number.isFinite(at) || at > now || now - at > this.#options.freshnessMs) return null;
+    if (!Number.isFinite(at)) return { refused: "UNPARSEABLE_TIME" };
+    const invalidatedAt = this.latestRoleInvalidation(binding.provider, binding.role);
+    if (invalidatedAt !== null && !(at > Date.parse(invalidatedAt))) return { refused: "INVALIDATED" };
+    if (at > now) return { refused: "FUTURE_DATED" };
+    if (now - at > this.#options.freshnessMs) return { refused: "EXPIRED" };
     const buckets = parseObservationBuckets(evidence["buckets"]);
-    return buckets ? { identity, acceptedAt: new Date(at).toISOString(), buckets } : null;
+    if (!buckets) return { refused: "UNREADABLE" };
+    return { restored: { identity, acceptedAt: new Date(at).toISOString(), buckets, account: recordedAccount } };
   }
 
   private enrich(input: CapacityReading): ProviderCapacity {
