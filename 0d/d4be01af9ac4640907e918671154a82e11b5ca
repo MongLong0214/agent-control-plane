@@ -1,0 +1,25 @@
+Limit: on multi-commit squashes, records from earlier commits are not all in git's trailer block and still need the notes mirror
+Warn: the daemon's squash message opens with a Merged-Head paragraph naming the exact sha the kernel sends in the merge PUT, placed as scripts/merge-pr.mjs places it, so main's merge-records gate can verify a daemon-finalized merge; the composer refuses a short sha, a head that is not the branch's last commit, and a branch that already declares the key
+Record-Id: r-daemonsquashmergedhead
+Provenance: inherited efabbcbb136a4d65cace969183b799c88f535783
+
+Warn: before reserving the merge, the kernel runs the merge-records gate's own mergedHeadIn reader over the complete squash title and body and requires exactly the sha it will send in the PUT, so a commit or pull-request title beginning with Merged-Head cannot publish a second, conflicting line
+Record-Id: r-daemonsquashtitlecollision
+Follows: r-daemonsquashmergedhead
+Provenance: inherited de5ed7840b19ff728ca96cf1aa923368bcc4d75f
+
+Limit: the daemon writes no notes mirror, so a branch whose records need one cannot be finalized by the daemon until an official in-process mirror exists
+Warn: before reserving a merge, the kernel runs the merge-records gate's own examineSquash on the exact squash title and body in a private repository with no notes; if a branch record would not survive in the valid trailer block it refuses with MERGE_BRANCH_PROFILE_UNSATISFIED, names the unpreserved Record-Ids and says this daemon does not support the notes mirror, rather than merging and losing the record
+Record-Id: r-daemonsquashrecordsfailclosed
+Follows: r-daemonsquashmergedhead
+Provenance: inherited 095f732f6d00ab976b21a9d25fbd55b8281a832a
+
+Warn: the fail-closed refusal names every record that would lose a line, including records that share a deduplicated line, while the preservation verdict stays the gate's own examineSquash; the branch is read with one git log and one interpret-trailers call fed to that unchanged verdict, under a single 120 s bound that refuses with GIT_TIMEOUT rather than allowing the merge
+Record-Id: r-squashrecordsdiagnosticbatch
+Follows: r-daemonsquashrecordsfailclosed
+Provenance: inherited 2761710f363502521d1ee8567f0159960f7465dc
+
+Warn: every bounded examination process reads the deadline when its answer settles, succeeded or failed, and an answer that settles past the bound is GIT_TIMEOUT rather than an allowed merge, because a stalled event loop can deliver a child's answer after the bound without its timeout firing
+Record-Id: r-3effff3c0c31
+Follows: r-squashrecordsdiagnosticbatch
+Provenance: inherited dd7934f2ff0901cb47005f211cdb8d0954e22d18
