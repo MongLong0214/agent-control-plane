@@ -89,8 +89,10 @@ describe("the squash PUT publishes a sanitized title and a complete body", () =>
     "sanitizes the actual PUT title and body from the %s",
     async (source) => {
       const dirtyTitle = `fix: preserve the change ${SESSION_URL}`;
-      const first = `${source === "single commit subject" ? dirtyTitle : "First change"}\n\n${RECORD}\nX-Claude-Session: ${SESSION_URL}`;
-      const messages = source === "single commit subject" ? [first] : [first, `Second change\n\nClaude-Session: ${SESSION_URL}`];
+      // The record sits in the last commit's trailer block, the one block a squash keeps as trailers.
+      const messages = source === "single commit subject"
+        ? [`${dirtyTitle}\n\n${RECORD}\nX-Claude-Session: ${SESSION_URL}`]
+        : [`First change\n\nX-Claude-Session: ${SESSION_URL}`, `Second change\n\n${RECORD}\nClaude-Session: ${SESSION_URL}`];
       const body = await fixture(messages, source === "pull request title" ? dirtyTitle : "Other title").putBody();
       expect(body.commit_title).toBe("fix: preserve the change [session reference removed] (#100)");
       expect(body.commit_message).toContain(RECORD);
@@ -117,7 +119,7 @@ describe("the squash PUT publishes a sanitized title and a complete body", () =>
       const metadata = `X-Claude-Session: ${SESSION_URL}`;
       const messages = source === "single commit subject"
         ? [`${metadata}\n\n${RECORD}`]
-        : [`First change\n\n${RECORD}`, "Second change"];
+        : ["First change", `Second change\n\n${RECORD}`];
       const body = await fixture(messages, metadata).putBody();
       expect(body.commit_title).toBe("Squash pull request (#100)");
       expect(body.commit_message).toContain(RECORD);
@@ -156,11 +158,13 @@ describe("the squash PUT publishes a sanitized title and a complete body", () =>
     expect(test.reserve).not.toHaveBeenCalled();
   });
 
-  it.each([1, 100, 101, 200, 250])("publishes every record in order for a complete %s-commit pull", async (count) => {
-    const records = Array.from({ length: count }, (_, index) => `Limit: record ${index}`);
-    const test = fixture(records.map((record, index) => `Change ${index}\n\n${record}`));
+  // Bodies rather than records: a record in an earlier commit is refused (S9-R1, below), and what
+  // this pins is that every page of the branch reaches the PUT, in order.
+  it.each([1, 100, 101, 200, 250])("publishes every commit body in order for a complete %s-commit pull", async (count) => {
+    const bodies = Array.from({ length: count }, (_, index) => `body line ${index}.`);
+    const test = fixture(bodies.map((body, index) => `Change ${index}\n\n${body}`));
     const body = await test.putBody();
-    expect(body.commit_message!.split("\n").filter((line) => line.startsWith("Limit:"))).toEqual(records);
+    expect(body.commit_message!.split("\n").filter((line) => line.startsWith("body line "))).toEqual(bodies);
     expect(body.commit_title).toBe(`${count === 1 ? "Change 0" : "A reviewed change"} (#100)`);
     expect(test.calls.filter((call) => /\/commits\?/.test(call.path)).length).toBeLessThanOrEqual(3);
   });
@@ -180,14 +184,14 @@ describe("the squash PUT publishes a sanitized title and a complete body", () =>
  */
 describe("the squash PUT names the head it fences on as the merge's Merged-Head", () => {
   it("names exactly the PUT's sha, once, as the message's first paragraph", async () => {
-    const body = await fixture([`First change\n\n${RECORD}`, "Second change\n\nWarn: the second record"]).putBody();
+    const body = await fixture(["First change\n\nwhy the first change.", `Second change\n\n${RECORD}\nWarn: the second record`]).putBody();
     expect(body.sha).toBe(HEAD);
     expect(body.commit_message!.split("\n").filter((line) => /merged-head/iu.test(line))).toEqual([`Merged-Head: ${body.sha}`]);
     expect(body.commit_message!.startsWith(`Merged-Head: ${body.sha}\n\n`)).toBe(true);
   });
 
   it("refuses a head that moved after evaluation, before any message is composed, PUT or reservation", async () => {
-    const test = fixture([`First change\n\n${RECORD}`, "Second change"]);
+    const test = fixture(["First change", `Second change\n\n${RECORD}`]);
     test.pull.head.sha = "c".repeat(40);
     const refused = await test.execute();
     expect(refused.allowed).toBe(false);
@@ -239,17 +243,23 @@ describe("the squash PUT names the head it fences on as the merge's Merged-Head"
   };
 
   /**
-   * `title` and `message` committed as GitHub squashes `feature` onto `main`, with `note` as the
-   * merge's commitlore note when given, then the real gate on it.
+   * `title` and `message` committed as GitHub squashes `feature` onto `main`, then the real gate on
+   * it. `hypotheticalNote` exists for one labelled witness only: what the gate would accept if a
+   * notes mirror were written. This daemon writes none, so no other witness may pass one.
    */
-  const squashAndGate = (repository: ReturnType<typeof branchRepository>, title: string, message: string, note?: string) => {
+  const squashAndGate = (
+    repository: ReturnType<typeof branchRepository>,
+    title: string,
+    message: string,
+    hypotheticalNote?: string,
+  ) => {
     const { dir, work, base } = repository;
     git(work, "checkout", "--quiet", "main");
     git(work, "merge", "--quiet", "--squash", "feature");
     commitFile(work, join(dir, "msg"), `${title}\n\n${message}`);
     const merge = git(work, "rev-parse", "HEAD");
-    if (note !== undefined) {
-      writeFileSync(join(dir, "note"), `${note}\n`);
+    if (hypotheticalNote !== undefined) {
+      writeFileSync(join(dir, "note"), `${hypotheticalNote}\n`);
       git(work, "notes", "--ref=commitlore", "add", "-F", join(dir, "note"), merge);
     }
     git(work, "remote", "add", "origin", work);
@@ -260,20 +270,15 @@ describe("the squash PUT names the head it fences on as the merge's Merged-Head"
   };
 
   it.each([
-    { shape: "one commit", messages: [`feat: one change\n\nwhy.\n\n${LAST}\nX-Claude-Session: ${SESSION_URL}\n`], note: undefined },
-    {
-      shape: "two commits, the stranded record carried by its note",
-      messages: [`feat: first change\n\nwhy.\n\n${FIRST}\n`, `fix: second change\n\nwhy.\n\n${LAST}\n`],
-      note: FIRST,
-    },
-  ])("passes the real merge-records gate when committed as GitHub composes it ($shape)", async ({ messages, note }) => {
+    { shape: "one commit", messages: [`feat: one change\n\nwhy.\n\n${LAST}\nX-Claude-Session: ${SESSION_URL}\n`] },
+  ])("passes the real merge-records gate when committed as GitHub composes it ($shape)", async ({ messages }) => {
     const repository = branchRepository(messages);
     const { shas, stored } = repository;
 
     const body = await fixture(stored, "A reviewed change", stored.length, shas).putBody();
     expect(body.sha).toBe(shas.at(-1));
 
-    const { merge, gate } = squashAndGate(repository, body.commit_title!, body.commit_message!, note);
+    const { merge, gate } = squashAndGate(repository, body.commit_title!, body.commit_message!);
     expect(gate.status, gate.stdout).toBe(0);
     expect(gate.stdout).toContain(
       `#100  ${messages.length} record line(s) on the branch, all reachable from ${merge.slice(0, 8)} ` +
@@ -317,5 +322,132 @@ describe("the squash PUT names the head it fences on as the merge's Merged-Head"
     );
     expect(gate.status, gate.stdout).toBe(1);
     expect(gate.stdout).toContain("2 conflicting Merged-Head trailers");
+  });
+
+  /**
+   * S9 review r1, R1: a squash keeps as trailers only its last paragraph, so a record from an earlier
+   * commit survives only in a CommitLore notes mirror, which this daemon does not write. The daemon
+   * now asks the gate's own `examineSquash`, before the reservation, whether the trailer block alone
+   * keeps every record line the branch carries; it refuses when it does not, naming the records.
+   * Each witness also commits the same bytes and runs the real gate, which must agree.
+   */
+  describe("a squash proceeds only when its trailer block alone keeps every record the gate requires", () => {
+    const id = (letter: string): string => `r-${letter.repeat(12)}`;
+    /** Advice the refusal must never give: the records and the history stay as they are. */
+    const FORBIDDEN_ADVICE = /squash (?:the |its |these )?records|into one commit|delete|remove|rewrite|amend|rebase|force|renam|change (?:the |its )?(?:record-)?ids?/iu;
+
+    const refusedBeforeAnyWrite = async (test: ReturnType<typeof fixture>) => {
+      const decision = await test.execute();
+      if (decision.allowed) throw new Error("the squash was not refused");
+      expect(decision.reasonCode).toBe(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED);
+      expect(test.reserve).not.toHaveBeenCalled();
+      expect(test.calls.filter((call) => call.method !== "GET")).toEqual([]);
+      expect(decision.message).toContain("notes mirror, which this daemon does not support");
+      expect(decision.message).toContain("official preservation path");
+      expect(decision.message).not.toMatch(FORBIDDEN_ADVICE);
+      return decision;
+    };
+
+    it.each([
+      { shape: "no record on several commits", records: 0, messages: ["feat: first\n\nwhy.\n", "fix: second\n\nmore why.\n"] },
+      {
+        shape: "one record, in the last of several commits",
+        records: 2,
+        messages: ["feat: first\n\nwhy.\n", `fix: second\n\nwhy.\n\n${LAST}\nRecord-Id: ${id("a")}\n`],
+      },
+      {
+        shape: "a duplicate Record-Id the last commit restates whole",
+        records: 2,
+        messages: [
+          `feat: first\n\nLimit: the restated record\nRecord-Id: ${id("d")}\n`,
+          `fix: second\n\nLimit: the restated record\nRecord-Id: ${id("d")}\n`,
+        ],
+      },
+    ])("proceeds, and the real gate passes the bytes it sent ($shape)", async ({ messages, records }) => {
+      const repository = branchRepository(messages);
+      const { shas, stored } = repository;
+      const test = fixture(stored, "A reviewed change", stored.length, shas);
+      const body = await test.putBody();
+      expect(test.reserve).toHaveBeenCalledTimes(1);
+
+      const { merge, gate } = squashAndGate(repository, body.commit_title!, body.commit_message!);
+      expect(gate.status, gate.stdout).toBe(0);
+      expect(gate.stdout).toContain(`#100  ${records} record line(s) on the branch, all reachable from ${merge.slice(0, 8)}`);
+    });
+
+    it.each([
+      {
+        shape: "several commits and several records needing notes",
+        messages: [
+          `feat: first\n\nwhy.\n\nLimit: the first record\nRecord-Id: ${id("a")}\n`,
+          `fix: second\n\nWarn: the second record\nRecord-Id: ${id("b")}\n`,
+          `docs: third\n\nLimit: the third record\nRecord-Id: ${id("c")}\n`,
+        ],
+        ids: [id("a"), id("b")],
+        lines: 4,
+      },
+      {
+        shape: "a duplicate Record-Id whose earlier copy says more than the last",
+        messages: [
+          `feat: first\n\nLimit: what the first copy says\nRecord-Id: ${id("d")}\n`,
+          `fix: second\n\nLimit: what the second copy says\nRecord-Id: ${id("d")}\n`,
+        ],
+        ids: [id("d")],
+        lines: 1,
+      },
+      {
+        // Present as text, even in the last paragraph, which a prose line keeps from being a trailer
+        // block: a search of the message would call it carried (commitlore#1029); the gate does not.
+        shape: "a record in the body text but in no valid trailer block",
+        messages: [
+          `feat: first\n\nLimit: the text-only record\nRecord-Id: ${id("e")}\n`,
+          `fix: second\n\nLimit: the text-only record\nRecord-Id: ${id("e")}\nrestated above this prose line, so git reads no trailer block here\n`,
+        ],
+        ids: [id("e")],
+        lines: 2,
+      },
+    ])("refuses before the reservation with zero GitHub writes, naming the records ($shape)", async ({ messages, ids, lines }) => {
+      const repository = branchRepository(messages);
+      const { shas, stored } = repository;
+      const refused = await refusedBeforeAnyWrite(fixture(stored, "A reviewed change", stored.length, shas));
+      expect(refused.evidence["unpreservedRecordIds"]).toEqual(ids);
+      expect(refused.evidence["unpreservedRecordLines"]).toBe(lines);
+      expect(refused.evidence["commitsWithoutRecordId"]).toEqual([]);
+      for (const name of ids) expect(refused.message.split(name)).toHaveLength(2);
+
+      // The real gate, on the bytes the daemon declined to send, refuses the same lines.
+      const branch = stored.map((message, index) => ({ sha: shas[index]!, message }));
+      const message = composeSquashCommitMessage(branch, shas.at(-1)!);
+      for (const name of ids) expect(message).toContain(`Record-Id: ${name}`);
+      const { gate } = squashAndGate(repository, composeSquashCommitTitle(branch, "A reviewed change", 100), message);
+      expect(gate.status, gate.stdout).toBe(1);
+      expect(gate.stdout).toContain(`${lines} record line(s) the branch carried and this merge does not keep`);
+    });
+
+    it("names the commit when a lost record line has no Record-Id", async () => {
+      const repository = branchRepository(["feat: first\n\nLimit: a record line with no id\n", "fix: second\n\nwhy.\n"]);
+      const { shas, stored } = repository;
+      const refused = await refusedBeforeAnyWrite(fixture(stored, "A reviewed change", stored.length, shas));
+      expect(refused.evidence["unpreservedRecordIds"]).toEqual([]);
+      expect(refused.evidence["commitsWithoutRecordId"]).toEqual([shas[0]]);
+      expect(refused.message).toContain(shas[0]!);
+    });
+
+    /**
+     * HYPOTHETICAL, labelled as such: what the gate WOULD accept had a notes mirror carried the
+     * stranded record. This daemon writes no note; the witness shows only that the refusal above is
+     * about the mirror and nothing else.
+     */
+    it("HYPOTHETICAL: the gate would accept the refused bytes only with a notes mirror this daemon does not write", async () => {
+      const messages = [`feat: first\n\nwhy.\n\n${FIRST}\n`, `fix: second\n\nwhy.\n\n${LAST}\n`];
+      const repository = branchRepository(messages);
+      const { shas, stored } = repository;
+      await refusedBeforeAnyWrite(fixture(stored, "A reviewed change", stored.length, shas));
+
+      const branch = stored.map((message, index) => ({ sha: shas[index]!, message }));
+      const title = composeSquashCommitTitle(branch, "A reviewed change", 100);
+      const { gate } = squashAndGate(repository, title, composeSquashCommitMessage(branch, shas.at(-1)!), FIRST);
+      expect(gate.status, gate.stdout).toBe(0);
+    });
   });
 });
