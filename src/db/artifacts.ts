@@ -630,12 +630,31 @@ const blindReviewEvidenceSchema = z
     bootstrapPlanIntentDigest: DIGEST_SCHEMA.optional(),
     // Issue #246 B2-a — a CONTRACT_CHANGE review names the PLAN, the manifest it carries and the base
     // it changes, as the gate reloaded them, and the CI workflows a later activation must verify.
-    // Every other review carries no such key.
+    // Every other review carries no such key. #512 — a first activation's review names no base
+    // (`baseManifestDigest: null`), and only together with `firstActivation` and the exact workflow
+    // revisions it judged, by list and by digest.
     contractChange: z
       .object({
         planDigest: z.string().min(1),
         manifestDigest: z.string().min(1),
-        baseManifestDigest: z.string().min(1),
+        baseManifestDigest: z.string().min(1).nullable(),
+        firstActivation: z.literal(true).optional(),
+        workflowRevisionsDigest: DIGEST_SCHEMA.optional(),
+        workflowRevisions: z
+          .array(
+            z
+              .object({
+                repositoryRole: z.string().min(1),
+                repositoryIdentity: z.string().min(1),
+                path: z.string().min(1),
+                checkName: z.string().min(1),
+                commitSha: z.string().regex(/^[0-9a-f]{40}$/),
+                fileDigest: z.string().min(1),
+              })
+              .strict(),
+          )
+          .min(1)
+          .optional(),
         workflowEvidence: z.array(
           z
             .object({
@@ -651,6 +670,17 @@ const blindReviewEvidenceSchema = z
         ),
       })
       .strict()
+      .superRefine((change, ctx) => {
+        const first = change.firstActivation === true;
+        const complete = change.workflowRevisionsDigest !== undefined && change.workflowRevisions !== undefined;
+        if (first !== (change.baseManifestDigest === null) || (first ? !complete : change.workflowRevisionsDigest !== undefined || change.workflowRevisions !== undefined)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "a contract change review names no base only as a first activation, with its exact workflow revisions",
+            path: ["baseManifestDigest"],
+          });
+        }
+      })
       .optional(),
     createdAt: z.string().min(1),
   })

@@ -1083,6 +1083,7 @@ describe("baseline boundary contracts", () => {
       "v42-session-credential-epoch",
       "v43-bootstrap-application-record",
       "v44-manifest-activation-grant",
+      "v45-first-manifest-activation",
     ]);
   });
 

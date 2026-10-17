@@ -19,9 +19,15 @@ import { verifySnapshotFreshness } from "../snapshot/candidate-snapshot.ts";
 import type { CompletionAuthority } from "../run/run-engine.ts";
 import type {
   ActivatedWorkflowEvidence,
+  FirstActivationWorkflowEvidence,
   GrantConsumer,
   ManifestActivationTarget,
 } from "../registry/manifest-activation-grants.ts";
+import { GitHubAppClient } from "../github/github-kernel.ts";
+import { workflowDigestAtCommit } from "../github/workflow-digest-at-commit.ts";
+
+type ChangeTarget = Extract<ManifestActivationTarget, { kind: "CHANGE" }>;
+type FirstTarget = Extract<ManifestActivationTarget, { kind: "FIRST" }>;
 
 const FINALIZATION_LEASE_TTL_MS = 30 * 60_000;
 
@@ -467,8 +473,12 @@ export class ApprovedRunFinalizer {
     // #246 B2-b — the workflows the manifest names are compared at the candidate before anything is
     // merged, so a workflow that would refuse activation refuses here, with nothing written; activation
     // compares them again at the merge commit.
+    // #512 — a first activation reads every bound revision at its exact commit, the same read
+    // ACTIVATION makes again; no merge receipt or branch head is ever read in its place.
     if (granted?.allowed) {
-      const workflows = await this.compareActivationWorkflows(runId, granted.value, snapshotArtifact.content);
+      const workflows = granted.value.kind === "FIRST"
+        ? await this.compareFirstActivationWorkflows(runId, granted.value)
+        : await this.compareActivationWorkflows(runId, granted.value, snapshotArtifact.content);
       if (!workflows.allowed) return workflows as Decision<ConfirmedMergePlan[]>;
     }
 
@@ -537,7 +547,9 @@ export class ApprovedRunFinalizer {
       });
     const target = this.cp.manifestGrants.verify(runId, "ACTIVATION", consumer);
     if (!target.allowed) return refused(target);
-    const workflows = await this.compareActivationWorkflows(runId, target.value);
+    const workflows: Decision<readonly ActivatedWorkflowEvidence[]> = target.value.kind === "FIRST"
+      ? await this.compareFirstActivationWorkflows(runId, target.value)
+      : await this.compareActivationWorkflows(runId, target.value);
     if (!workflows.allowed) return refused(workflows);
     const done = this.cp.db.txDecision(() => {
       const activated = this.cp.projects.activateManifest(runId, {
@@ -569,7 +581,7 @@ export class ApprovedRunFinalizer {
    */
   private async compareActivationWorkflows(
     runId: string,
-    target: ManifestActivationTarget,
+    target: ChangeTarget,
     /** Before any merge: the candidate, whose head stands in for the merge commit of each repository it carries. */
     beforeMerge?: CandidateSnapshot,
   ): Promise<Decision<ActivatedWorkflowEvidence[]>> {
@@ -626,6 +638,83 @@ export class ApprovedRunFinalizer {
         evidence: "READ",
         revision: read.value.revision,
         observedDigest: read.value.workflowDigest,
+      });
+    }
+    return allow(ReasonCode.OK, compared);
+  }
+
+  /**
+   * #512 — a first activation's workflows, read at PRE_MERGE and again at ACTIVATION by the exact-commit
+   * reader: each bound revision of the grant, at exactly its bound commit object of exactly its bound
+   * repository, which must be the project's REGISTERED repository for its role. A wrong object type, an
+   * unreadable object, a path that is not a file, or bytes that do not hash to the bound digest refuse
+   * activation, and the pointer does not move. Whether the default branch head reaches the commit is
+   * recorded as evidence only; the head is never read in the commit's place.
+   */
+  private async compareFirstActivationWorkflows(
+    runId: string,
+    target: FirstTarget,
+  ): Promise<Decision<FirstActivationWorkflowEvidence[]>> {
+    const repositories = this.cp.repositories
+      .byProject(target.grant.projectId)
+      .filter((repository) => repository.registration === "REGISTERED");
+    const client = this.cp.config.githubClient ?? new GitHubAppClient(this.cp.credentials);
+    const compared: FirstActivationWorkflowEvidence[] = [];
+    for (const revision of target.grant.workflowRevisions) {
+      const entry = {
+        repositoryRole: revision.repositoryRole,
+        repositoryIdentity: revision.repositoryIdentity,
+        path: revision.path,
+        checkName: revision.checkName,
+        commitSha: revision.commitSha,
+        fileDigest: revision.fileDigest,
+      };
+      const unverified = (message: string, detail: Record<string, unknown> = {}): Decision<FirstActivationWorkflowEvidence[]> =>
+        deny(ReasonCode.MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED, message, { runId, activation: "FIRST", workflow: entry, ...detail });
+      const repository = repositories.find((candidate) => candidate.repositoryRole === revision.repositoryRole);
+      if (!repository || repository.identity !== revision.repositoryIdentity) {
+        return unverified("no registered repository of the project is the exact repository the revision binds", {
+          registeredIdentity: repository?.identity ?? null,
+        });
+      }
+      const read = await workflowDigestAtCommit(
+        { repositories: this.cp.repositories, client },
+        {
+          repositoryIdentity: revision.repositoryIdentity,
+          projectId: target.grant.projectId,
+          commitSha: revision.commitSha,
+          path: revision.path,
+          defaultBranch: target.manifest.branchProfile.defaultBranch,
+        },
+      );
+      if (!read.allowed) {
+        return unverified("the workflow could not be read at the bound commit", {
+          cause: { reasonCode: read.reasonCode, message: read.message, evidence: read.evidence },
+        });
+      }
+      if (read.value.commitSha !== revision.commitSha || read.value.observedDigest !== revision.fileDigest) {
+        return unverified("the workflow's bytes at the bound commit are not the ones the manifest approves", {
+          revision: read.value.commitSha,
+          blobSha: read.value.blobSha,
+          observedDigest: read.value.observedDigest,
+          readVia: read.value.readVia,
+        });
+      }
+      compared.push({
+        repositoryRole: revision.repositoryRole,
+        repositoryIdentity: revision.repositoryIdentity,
+        path: revision.path,
+        checkName: revision.checkName,
+        approvedDigest: revision.fileDigest,
+        evidence: "READ",
+        revision: read.value.commitSha,
+        observedDigest: read.value.observedDigest,
+        commitSha: read.value.commitSha,
+        objectType: read.value.objectType,
+        blobSha: read.value.blobSha,
+        readVia: read.value.readVia,
+        reachable: read.value.reachable,
+        defaultBranchHead: read.value.defaultBranchHead,
       });
     }
     return allow(ReasonCode.OK, compared);
