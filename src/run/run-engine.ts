@@ -468,6 +468,9 @@ export class RunEngine {
           projectId: run.projectId,
         });
       }
+      // #512 — asked before anything is provisioned, and again in the dispatch transaction.
+      const repin = this.nullPinRefusal(run);
+      if (!repin.allowed) return repin as Decision<RunRow>;
     }
 
     let binding: RoleBinding | null = null;
@@ -574,9 +577,15 @@ export class RunEngine {
 
       // A caller may pin a manifest while QUEUED. That immutable pin is the dispatch
       // contract; the current project manifest is used only when no pin exists yet.
+      // #512 (CEO 1edb842a) — and only for a run with no history under its NULL pin: one with history
+      // is refused here, in the transaction that would otherwise pin it, never pinned silently.
+      const repin = this.nullPinRefusal(fresh);
+      if (!repin.allowed) return repin as Decision<RunRow>;
       const effectiveManifest =
         fresh.pinnedManifestDigest ??
         (fresh.projectId ? (this.projects.get(fresh.projectId)?.activeManifestDigest ?? null) : null);
+      // The run's first pin, set by this dispatch in the same UPDATE that moves it to ACTIVE.
+      const firstPin = fresh.pinnedManifestDigest === null && effectiveManifest !== null;
 
       // §29/§30.3 — activation, its envelope and its audit record are one operation; the
       // database refuses the state write unless this raises the marker (#66).
@@ -595,6 +604,7 @@ export class RunEngine {
             evidence: {
               ownerBindingGeneration: binding?.bindingGeneration ?? null,
               pinnedManifestDigest: effectiveManifest,
+              ...(firstPin ? { manifestPin: { firstPin: true, from: null, to: effectiveManifest } } : {}),
               ...hermesTurnEvidence(hermesTurn),
             },
           });
@@ -637,6 +647,58 @@ export class RunEngine {
 
       return allow(ReasonCode.OK, this.require(runId));
     });
+  }
+
+  /**
+   * #512 (CEO 1edb842a, design E7) — a run whose pin is still NULL while its project's active manifest
+   * is not is pinned to that manifest at dispatch only if this is its first pin: it has no history that
+   * presumed a manifest. One that was dispatched before, or holds a PLAN, candidate, verification,
+   * review, packet or approval, ran a task, or met a CEO decision is refused with a named reason
+   * (`evidence.refusal`), its pin stays NULL and nothing earlier is reused: it continues only by an
+   * explicit re-plan, which is a cancel and a new run with a new PLAN and a new review. That covers the
+   * REVISION_REQUIRED re-dispatch, which the COALESCE below would otherwise pin to the new manifest.
+   */
+  private nullPinRefusal(run: RunRow): Decision<void> {
+    if (run.pinnedManifestDigest !== null || !run.projectId) return allow(ReasonCode.OK, undefined);
+    const active = this.projects.get(run.projectId)?.activeManifestDigest ?? null;
+    if (active === null) return allow(ReasonCode.OK, undefined);
+    const history = this.nullPinHistory(run);
+    if (history.length === 0) return allow(ReasonCode.OK, undefined);
+    return deny(
+      ReasonCode.MANIFEST_PIN_SUPERSEDED,
+      "this run has history under a NULL pin and its project now has an active manifest; it is not pinned to it silently and continues only by an explicit re-plan (cancel, then a new run)",
+      {
+        runId: run.runId,
+        kind: run.kind,
+        projectId: run.projectId,
+        refusal: run.kind === RunKind.CONTRACT_CHANGE ? "NULL_PIN_CONTRACT_CHANGE_SUPERSEDED" : "NULL_PIN_HAS_HISTORY",
+        pinnedManifestDigest: null,
+        active,
+        history,
+        recovery: "CANCEL_AND_REPLAN",
+      },
+    );
+  }
+
+  /** What a run did that presumed a manifest, by kind; empty for a run with none. */
+  private nullPinHistory(run: RunRow): string[] {
+    const history: string[] = [];
+    if (run.dispatchedAt !== null) history.push("DISPATCHED");
+    for (const row of this.db.all<{ kind: string }>(
+      `SELECT DISTINCT kind FROM run_artifacts
+        WHERE run_id = ? AND kind IN ('PLAN','CANDIDATE_SNAPSHOT','VERIFICATION','BLIND_REVIEW','PRODUCTION_READY_PACKET','APPROVAL')
+        ORDER BY kind`,
+      [run.runId],
+    )) {
+      history.push(row.kind);
+    }
+    if ((this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM task_executions WHERE run_id = ?`, [run.runId])?.n ?? 0) > 0) {
+      history.push("TASK_EXECUTION");
+    }
+    if ((this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM audit_events WHERE run_id = ? AND kind = 'CEO_DECISION'`, [run.runId])?.n ?? 0) > 0) {
+      history.push("CEO_DECISION");
+    }
+    return history;
   }
 
   /**
@@ -901,13 +963,19 @@ export class RunEngine {
         // #246 B2-b — a CONTRACT_CHANGE completes only in the transaction that consumed its grant for
         // its current candidate and moved the project's active manifest to the one the grant names. The
         // v44 trigger `runs_contract_change_completes_activated` refuses the same write.
+        // #512 — a first-activation run's own grant is in manifest_first_activation_grants, under the
+        // same predicates, which the v45 body of the same trigger also reads.
         if (run.kind === RunKind.CONTRACT_CHANGE) {
           const activated = this.db.get<{ n: number }>(
-            `SELECT COUNT(*) AS n FROM manifest_activation_grants g
-               JOIN projects p ON p.project_id = g.project_id
-              WHERE g.run_id = ? AND g.candidate_snapshot_digest IS ? AND g.consumed_at IS NOT NULL
-                AND p.active_manifest_digest IS g.manifest_digest`,
-            [runId, this.currentCandidate(runId)],
+            `SELECT (SELECT COUNT(*) FROM manifest_activation_grants g
+                       JOIN projects p ON p.project_id = g.project_id
+                      WHERE g.run_id = ? AND g.candidate_snapshot_digest IS ? AND g.consumed_at IS NOT NULL
+                        AND p.active_manifest_digest IS g.manifest_digest)
+                  + (SELECT COUNT(*) FROM manifest_first_activation_grants f
+                       JOIN projects p ON p.project_id = f.project_id
+                      WHERE f.run_id = ? AND f.candidate_snapshot_digest IS ? AND f.consumed_at IS NOT NULL
+                        AND p.active_manifest_digest IS f.manifest_digest) AS n`,
+            [runId, this.currentCandidate(runId), runId, this.currentCandidate(runId)],
           );
           if ((activated?.n ?? 0) !== 1) {
             return deny(

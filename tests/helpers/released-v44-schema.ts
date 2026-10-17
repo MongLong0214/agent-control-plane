@@ -123,13 +123,33 @@ const V44_TRIGGERS = [
 ];
 
 /**
+ * What v45 adds on top of v44 (#512): the first-activation grant table, its index and its seven
+ * guards, and the guard it puts on the v44 grant table. v45 also replaces two v44 bodies, which
+ * `V44_TRIGGERS` drops below in any case.
+ */
+export const V45_ADDED_TRIGGERS = [
+  "manifest_first_activation_grants_born_unconsumed",
+  "manifest_first_activation_grants_born_on_null",
+  "manifest_first_activation_grants_no_replace",
+  "manifest_first_activation_grants_immutable",
+  "manifest_first_activation_grants_consumed_once",
+  "manifest_first_activation_grants_consumed_while_null",
+  "manifest_first_activation_grants_no_delete",
+  "manifest_activation_grants_not_first",
+];
+
+/**
  * A v43 image, written at the current version and taken back by removing exactly what v44 adds —
- * the way the v40–v43 fixtures build theirs. Not approved.
+ * the way the v40–v43 fixtures build theirs — and, since the current version is v45, what v45 adds
+ * as well. Not approved.
  */
 export const v43Image = (path: string): string => {
   new Db(path).close();
   const legacy = new Database(path);
   try {
+    legacy.exec(V45_ADDED_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n"));
+    legacy.exec("DROP INDEX manifest_first_activation_grants_one_consumed_per_project");
+    legacy.exec("DROP TABLE manifest_first_activation_grants");
     legacy.exec(V44_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n"));
     legacy.exec("DROP TABLE manifest_activation_grants");
     legacy.exec(`

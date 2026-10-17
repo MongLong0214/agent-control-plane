@@ -192,7 +192,10 @@ export interface CeoDecisionInput {
 }
 
 /** #246 B2-b — the grant authority a CONTRACT_CHANGE CONFIRM admits against and issues through. */
-export type ManifestGrantsPort = Pick<ManifestActivationGrants, "admitConfirm" | "issue" | "bindConsumer">;
+export type ManifestGrantsPort = Pick<
+  ManifestActivationGrants,
+  "admitConfirm" | "issue" | "bindConsumer" | "issueFirst" | "isFirstActivation"
+>;
 
 export class ProductionGate {
   #continuity: ContinuityGate | null = null;
@@ -683,17 +686,23 @@ export class ProductionGate {
         }
 
         // #246 B2-b — a CONTRACT_CHANGE CONFIRM is where its one activation grant is issued, in this
-        // transaction and after CEO_APPROVED, so a refusal undoes the decision with it.
+        // transaction and after CEO_APPROVED, so a refusal undoes the decision with it. #512 — a
+        // NULL-pinned CONTRACT_CHANGE is a first activation, and its grant is the first-activation one.
         let grantDigest: string | null = null;
+        let firstActivation = false;
         if (input.decision === "CONFIRM" && isContractChange) {
           const grants = this.#manifestGrants;
+          firstActivation = grants?.isFirstActivation(input.runId) ?? false;
+          const request = {
+            runId: input.runId,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+            ceoSessionId: input.ceoSessionId,
+            ...(input.ingress === undefined ? {} : { ingress: input.ingress }),
+          };
           const issued: Decision<{ grantDigest: string }> = grants
-            ? grants.issue({
-                runId: input.runId,
-                candidateSnapshotDigest: input.candidateSnapshotDigest,
-                ceoSessionId: input.ceoSessionId,
-                ...(input.ingress === undefined ? {} : { ingress: input.ingress }),
-              })
+            ? firstActivation
+              ? grants.issueFirst(request)
+              : grants.issue(request)
             : deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "manifest activation grants are not configured", { runId: input.runId });
           if (!issued.allowed) throw acpError(issued.reasonCode, issued.message, issued.evidence);
           grantDigest = issued.value.grantDigest;
@@ -721,6 +730,7 @@ export class ProductionGate {
             rationale: input.rationale,
             // Traceability only; the grant row is what activation reads, never this.
             ...(grantDigest === null ? {} : { manifestActivationGrantDigest: grantDigest }),
+            ...(firstActivation ? { manifestActivation: "FIRST" } : {}),
             ...hermesTurnEvidence(input.hermesTurn),
           },
         });

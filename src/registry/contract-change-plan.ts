@@ -1,4 +1,4 @@
-import { canonicalJson } from "../core/digest.ts";
+import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { assertPortableManifest, manifestDigest, projectManifestSchema, type ProjectManifest } from "../contracts/manifest.ts";
@@ -49,6 +49,29 @@ export const ContractChangeRefusal = {
   WORKFLOW_DIGEST_CHANGED: "CONTRACT_CHANGE_WORKFLOW_DIGEST_CHANGED",
   /** The run has no pinned manifest, or the pinned manifest cannot be read back by its digest. */
   BASE_UNAVAILABLE: "CONTRACT_CHANGE_BASE_UNAVAILABLE",
+  /**
+   * #512 E1 — a first-activation PLAN is for a CONTRACT_CHANGE run of a project with a NULL pin;
+   * this run has a base, so it is a contract change, not a first activation.
+   */
+  FIRST_ACTIVATION_RUN_HAS_BASE: "CONTRACT_CHANGE_FIRST_ACTIVATION_RUN_HAS_BASE",
+  /** #512 E2 — the project's active manifest is no longer NULL. */
+  FIRST_ACTIVATION_PROJECT_NOT_NULL: "CONTRACT_CHANGE_FIRST_ACTIVATION_PROJECT_NOT_NULL",
+  /**
+   * #512 E3 — the project is not operator-registered: its PROJECT_REGISTERED row did not record a
+   * JSON-null manifest, there is not exactly one such row, or a bootstrap application names it.
+   */
+  FIRST_ACTIVATION_NOT_OPERATOR_REGISTERED: "CONTRACT_CHANGE_FIRST_ACTIVATION_NOT_OPERATOR_REGISTERED",
+  /** #512 E4 — the manifest's (role, remote) set is not the project's REGISTERED (role, identity) set. */
+  FIRST_ACTIVATION_REPOSITORIES_MISMATCH: "CONTRACT_CHANGE_FIRST_ACTIVATION_REPOSITORIES_MISMATCH",
+  /** #512 E5 — the run participates with a repository; a first activation changes no source. */
+  FIRST_ACTIVATION_RUN_HAS_REPOSITORIES: "CONTRACT_CHANGE_FIRST_ACTIVATION_RUN_HAS_REPOSITORIES",
+  /** #512 E6 — the manifest names no CI workflow, or one without an approved digest. */
+  FIRST_ACTIVATION_WORKFLOWS_REQUIRED: "CONTRACT_CHANGE_FIRST_ACTIVATION_WORKFLOWS_REQUIRED",
+  /**
+   * #512 E6 — `workflowRevisions` is not an exact bijection with the manifest's workflows: an entry
+   * missing, extra or repeated, a field that does not match, or a commit that is not 40 lowercase hex.
+   */
+  FIRST_ACTIVATION_REVISIONS_MISMATCH: "CONTRACT_CHANGE_FIRST_ACTIVATION_REVISIONS_MISMATCH",
 } as const;
 export type ContractChangeRefusal = (typeof ContractChangeRefusal)[keyof typeof ContractChangeRefusal];
 
@@ -58,6 +81,79 @@ export interface ContractChangeBinding {
   manifestDigest: string;
   /** The run's dispatch pin. A later activation compares the active manifest against it. */
   baseManifestDigest: string;
+}
+
+/**
+ * #512 — what a first-activation CONTRACT_CHANGE candidate is, by digest: its PLAN, the manifest it
+ * carries, no base (the project's active manifest is NULL), and the exact workflow revisions the PLAN
+ * binds. `baseManifestDigest` is null only together with `firstActivation`.
+ */
+export interface FirstActivationBinding {
+  planDigest: string;
+  manifestDigest: string;
+  baseManifestDigest: null;
+  firstActivation: true;
+  workflowRevisionsDigest: string;
+}
+
+export type AnyContractChangeBinding = ContractChangeBinding | FirstActivationBinding;
+
+/**
+ * #512 E6 — one exact workflow revision a first-activation PLAN binds: the workflow file at `path`
+ * of the repository `repositoryIdentity` (the manifest's remote for `repositoryRole`), checked as
+ * `checkName`, read at the commit object `commitSha` (40 lowercase hex, never a ref), whose bytes
+ * hash to `fileDigest` (the manifest's `approvedDigest` for it).
+ */
+export interface WorkflowRevision {
+  repositoryRole: string;
+  repositoryIdentity: string;
+  path: string;
+  checkName: string;
+  commitSha: string;
+  fileDigest: string;
+}
+
+const WORKFLOW_REVISION_FIELDS = ["repositoryRole", "repositoryIdentity", "path", "checkName", "commitSha", "fileDigest"] as const;
+
+/** A full commit object id: 40 lowercase hex. An abbreviated, uppercase or ref-shaped name is not one. */
+export const COMMIT_SHA = /^[0-9a-f]{40}$/;
+
+const WORKFLOW_REVISIONS_SCHEMA = "acp.workflow-revisions.v1";
+
+const revisionKey = (revision: Pick<WorkflowRevision, "repositoryRole" | "repositoryIdentity" | "path" | "checkName">): string =>
+  canonicalJson([revision.repositoryRole, revision.repositoryIdentity, revision.path, revision.checkName]);
+
+/** The digest a set of bound revisions is carried under; independent of the order the PLAN lists them in. */
+export const workflowRevisionsDigest = (revisions: readonly WorkflowRevision[]): string =>
+  digestOf({
+    schema: WORKFLOW_REVISIONS_SCHEMA,
+    revisions: [...revisions]
+      .map((revision) => ({
+        repositoryRole: revision.repositoryRole,
+        repositoryIdentity: revision.repositoryIdentity,
+        path: revision.path,
+        checkName: revision.checkName,
+        commitSha: revision.commitSha,
+        fileDigest: revision.fileDigest,
+      }))
+      .sort((left, right) => (revisionKey(left) < revisionKey(right) ? -1 : revisionKey(left) > revisionKey(right) ? 1 : 0)),
+  });
+
+/**
+ * #512 — the facts about a project and run that only the database holds, read where it is at hand
+ * (CONFIRM admission, issue, PRE_MERGE and ACTIVATION). `plan_submit` checks without them.
+ */
+export interface FirstActivationFacts {
+  /** E2: the project's active manifest now. */
+  activeManifestDigest: string | null;
+  /** E3: the project's one PROJECT_REGISTERED row that recorded a JSON-null manifest, else null. */
+  registrationEventId: number | null;
+  /** E3: bootstrap application rows naming the project id. */
+  bootstrapApplications: number;
+  /** E4: the project's REGISTERED repositories. */
+  registeredRepositories: ReadonlyArray<{ role: string | null; identity: string }>;
+  /** E5: repositories the run participates with. */
+  runRepositories: number;
 }
 
 /** The facts about a run this module reads. */
@@ -489,10 +585,328 @@ export const contractChangePlanForSubmission = (
   run: ContractChangeRun,
   plan: Record<string, unknown>,
   lookup: ManifestLookup,
+  /** #512 — the first-activation facts, where the caller holds the database; E2–E5 are then checked too. */
+  facts: FirstActivationFacts | null = null,
 ): Decision<Record<string, unknown>> => {
+  // #512 — a PLAN that says it is a first activation is judged only as one, never as a change of a base.
+  if (isFirstActivationPlan(plan)) return firstActivationPlanForSubmission(run, plan, facts);
   const validated = validateContractChangePlan(run, plan, lookup);
   if (!validated.allowed) return validated as Decision<Record<string, unknown>>;
   return allow(ReasonCode.OK, { ...plan, projectManifest: validated.value.manifest });
+};
+
+/** #512 — a PLAN that names itself a first activation (`firstActivation: true`). */
+export const isFirstActivationPlan = (plan: unknown): boolean => isRecord(plan) && plan["firstActivation"] === true;
+
+/** #512 — a CONTRACT_CHANGE run that can only be a first activation: its project is set and its pin is NULL. */
+export const isFirstActivationRun = (run: ContractChangeRun): boolean =>
+  run.kind === RunKind.CONTRACT_CHANGE && run.projectId !== null && run.pinnedManifestDigest === null;
+
+interface ValidatedFirstActivation {
+  manifest: ProjectManifest;
+  manifestDigest: string;
+  workflowRevisions: WorkflowRevision[];
+  workflowRevisionsDigest: string;
+}
+
+/**
+ * #512 E6 — the exact workflow binding a first activation needs, and only a first activation: the
+ * manifest names at least one CI workflow, every one with an approved digest, and `supplied` is a
+ * bijection with them keyed on (repositoryRole, repositoryIdentity, path, checkName) — no entry
+ * missing, extra or repeated, so equal counts alone never pass — where each identity is the
+ * manifest's remote for the role (and, given `registered`, the REGISTERED identity), each file
+ * digest is that workflow's approved digest, and each commit is 40 lowercase hex.
+ */
+export const firstActivationRevisions = (
+  manifest: ProjectManifest,
+  supplied: unknown,
+  registered: FirstActivationFacts["registeredRepositories"] | null,
+): Decision<WorkflowRevision[]> => {
+  if (manifest.ciWorkflows.length === 0) {
+    return refuse(ReasonCode.INVALID_ARGUMENT, ContractChangeRefusal.FIRST_ACTIVATION_WORKFLOWS_REQUIRED, "a first activation binds at least one CI workflow; the manifest names none", {
+      ciWorkflows: 0,
+    });
+  }
+  const unapproved = manifest.ciWorkflows.filter((workflow) => workflow.approvedDigest === null || workflow.unapprovedFirstActivation);
+  if (unapproved.length > 0) {
+    return refuse(ReasonCode.INVALID_ARGUMENT, ContractChangeRefusal.FIRST_ACTIVATION_WORKFLOWS_REQUIRED, "every CI workflow a first activation binds names its approved digest", {
+      unapproved: unapproved.map((workflow) => `${workflow.repositoryRole}:${workflow.path}`),
+    });
+  }
+  const mismatch = (message: string, evidence: Evidence = {}): Decision<WorkflowRevision[]> =>
+    refuse(ReasonCode.INVALID_ARGUMENT, ContractChangeRefusal.FIRST_ACTIVATION_REVISIONS_MISMATCH, message, evidence);
+  if (!Array.isArray(supplied) || supplied.length === 0) {
+    return mismatch("a first activation binds an exact revision of every CI workflow it names", {
+      workflowRevisions: Array.isArray(supplied) ? 0 : null,
+    });
+  }
+  const revisions: WorkflowRevision[] = [];
+  for (const [index, entry] of supplied.entries()) {
+    if (
+      !isRecord(entry) ||
+      Object.keys(entry).length !== WORKFLOW_REVISION_FIELDS.length ||
+      !WORKFLOW_REVISION_FIELDS.every((field) => typeof entry[field] === "string" && (entry[field] as string).length > 0)
+    ) {
+      return mismatch("each workflow revision has exactly the fields repositoryRole, repositoryIdentity, path, checkName, commitSha and fileDigest", { index });
+    }
+    const revision = Object.fromEntries(WORKFLOW_REVISION_FIELDS.map((field) => [field, entry[field] as string])) as unknown as WorkflowRevision;
+    if (!COMMIT_SHA.test(revision.commitSha)) {
+      return mismatch("a workflow revision names a full commit object id: 40 lowercase hex", { index, commitSha: revision.commitSha });
+    }
+    revisions.push(revision);
+  }
+  const remoteFor = (role: string): string | null =>
+    manifest.repositories.find((repository) => repository.role === role)?.remote ?? null;
+  const expected = new Map<string, ProjectManifest["ciWorkflows"][number]>();
+  for (const workflow of manifest.ciWorkflows) {
+    const remote = remoteFor(workflow.repositoryRole);
+    if (remote === null) {
+      return mismatch("a CI workflow names a repository role the manifest does not declare", { repositoryRole: workflow.repositoryRole, path: workflow.path });
+    }
+    const key = revisionKey({ repositoryRole: workflow.repositoryRole, repositoryIdentity: remote, path: workflow.path, checkName: workflow.checkName });
+    if (expected.has(key)) {
+      return mismatch("the manifest names one CI workflow twice", { repositoryRole: workflow.repositoryRole, path: workflow.path, checkName: workflow.checkName });
+    }
+    expected.set(key, workflow);
+  }
+  const seen = new Set<string>();
+  for (const revision of revisions) {
+    const key = revisionKey(revision);
+    if (seen.has(key)) {
+      return mismatch("a workflow revision is listed twice", { repositoryRole: revision.repositoryRole, path: revision.path, checkName: revision.checkName });
+    }
+    seen.add(key);
+    const workflow = expected.get(key);
+    if (!workflow) {
+      return mismatch("a workflow revision names no CI workflow of the manifest at that role, repository, path and check name", {
+        repositoryRole: revision.repositoryRole,
+        repositoryIdentity: revision.repositoryIdentity,
+        path: revision.path,
+        checkName: revision.checkName,
+      });
+    }
+    if (revision.fileDigest !== workflow.approvedDigest) {
+      return mismatch("a workflow revision's file digest is not the approved digest of its workflow", {
+        repositoryRole: revision.repositoryRole,
+        path: revision.path,
+        fileDigest: revision.fileDigest,
+        approvedDigest: workflow.approvedDigest,
+      });
+    }
+    if (registered !== null) {
+      const identity = registered.find((repository) => repository.role === revision.repositoryRole)?.identity ?? null;
+      if (identity !== revision.repositoryIdentity) {
+        return mismatch("a workflow revision's repository is not the project's REGISTERED repository for its role", {
+          repositoryRole: revision.repositoryRole,
+          repositoryIdentity: revision.repositoryIdentity,
+          registeredIdentity: identity,
+        });
+      }
+    }
+  }
+  const missing = [...expected.keys()].filter((key) => !seen.has(key));
+  if (missing.length > 0 || revisions.length !== expected.size) {
+    return mismatch("a CI workflow of the manifest has no bound revision", {
+      missing: missing.map((key) => {
+        const workflow = expected.get(key)!;
+        return `${workflow.repositoryRole}:${workflow.path}:${workflow.checkName}`;
+      }),
+    });
+  }
+  return allow(ReasonCode.OK, revisions);
+};
+
+/**
+ * #512 E2–E5 — the eligibility facts only the database holds: the project is NULL now (E2), it was
+ * registered by the operator with a JSON-null manifest and no bootstrap application names it (E3),
+ * the manifest's (role, remote) set is exactly the project's REGISTERED (role, identity) set (E4),
+ * and the run participates with no repository (E5).
+ */
+export const firstActivationEligibility = (
+  run: ContractChangeRun,
+  manifest: ProjectManifest,
+  facts: FirstActivationFacts,
+): Decision<{ registrationEventId: number }> => {
+  const evidence = { projectId: run.projectId };
+  if (facts.activeManifestDigest !== null) {
+    return refuse(ReasonCode.MANIFEST_PIN_SUPERSEDED, ContractChangeRefusal.FIRST_ACTIVATION_PROJECT_NOT_NULL, "the project's active manifest is no longer NULL; a first activation activates only a NULL project", {
+      ...evidence,
+      active: facts.activeManifestDigest,
+    });
+  }
+  if (facts.registrationEventId === null || facts.bootstrapApplications > 0) {
+    return refuse(ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_DENIED, ContractChangeRefusal.FIRST_ACTIVATION_NOT_OPERATOR_REGISTERED, "only a project the operator registered without a manifest is first-activated", {
+      ...evidence,
+      registrationEventId: facts.registrationEventId,
+      bootstrapApplications: facts.bootstrapApplications,
+    });
+  }
+  const pairs = (entries: ReadonlyArray<{ role: string | null; identity: string }>): string[] =>
+    entries.map((entry) => canonicalJson([entry.role, entry.identity])).sort();
+  const declared = pairs(manifest.repositories.map((repository) => ({ role: repository.role, identity: repository.remote })));
+  const registered = pairs(facts.registeredRepositories);
+  if (canonicalJson(declared) !== canonicalJson(registered) || new Set(declared).size !== declared.length) {
+    return refuse(ReasonCode.REPOSITORY_IDENTITY_MISMATCH, ContractChangeRefusal.FIRST_ACTIVATION_REPOSITORIES_MISMATCH, "the manifest's repositories are not exactly the project's registered repositories and roles", {
+      ...evidence,
+      declared: manifest.repositories.map((repository) => `${repository.role}:${repository.remote}`),
+      registered: facts.registeredRepositories.map((repository) => `${repository.role ?? "null"}:${repository.identity}`),
+    });
+  }
+  if (facts.runRepositories > 0) {
+    return refuse(ReasonCode.INVALID_ARGUMENT, ContractChangeRefusal.FIRST_ACTIVATION_RUN_HAS_REPOSITORIES, "a first activation changes no repository source: its run participates with none", {
+      ...evidence,
+      runRepositories: facts.runRepositories,
+    });
+  }
+  return allow(ReasonCode.OK, { registrationEventId: facts.registrationEventId });
+};
+
+/**
+ * #512 — every check a first-activation PLAN passes that needs no database (E1, E4's manifest checks
+ * and E6), then, given `facts`, the ones that do (E2–E5 and E6 against the REGISTERED identities).
+ */
+const validateFirstActivationPlan = (
+  run: ContractChangeRun,
+  plan: Record<string, unknown>,
+  facts: FirstActivationFacts | null,
+): Decision<ValidatedFirstActivation> => {
+  if (!run.projectId) {
+    return refuse(ReasonCode.INVALID_ARGUMENT, ContractChangeRefusal.PROJECT_MISSING, "a CONTRACT_CHANGE run names the project whose contract it changes");
+  }
+  if (!isFirstActivationRun(run)) {
+    return refuse(ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN, ContractChangeRefusal.FIRST_ACTIVATION_RUN_HAS_BASE, "a first activation is a CONTRACT_CHANGE run whose pin is NULL", {
+      kind: run.kind,
+      pinnedManifestDigest: run.pinnedManifestDigest,
+    });
+  }
+  const carried = plan["projectManifest"];
+  const named = plan["projectManifestDigest"];
+  if (carried === undefined) {
+    return refuse(ReasonCode.INVALID_ARGUMENT, ContractChangeRefusal.MANIFEST_MISSING, "a first-activation PLAN carries the full manifest it activates", {
+      projectManifestDigest: typeof named === "string" ? named : null,
+    });
+  }
+  const manifest = assertPortableManifest(carried);
+  if (!manifest.allowed) {
+    return refuse(manifest.reasonCode, ContractChangeRefusal.MANIFEST_NOT_PORTABLE, manifest.message, manifest.evidence);
+  }
+  const supplied = manifestDigest(manifest.value);
+  if (supplied !== named) {
+    return refuse(ReasonCode.CONTRACT_DIGEST_MISMATCH, ContractChangeRefusal.MANIFEST_DIGEST_MISMATCH, "the manifest the PLAN carries is not the one its projectManifestDigest names", {
+      supplied,
+      named: typeof named === "string" ? named : null,
+    });
+  }
+  if (manifest.value.projectId !== run.projectId) {
+    return refuse(ReasonCode.INVALID_ARGUMENT, ContractChangeRefusal.PROJECT_MISMATCH, "the carried manifest names another project", {
+      runProjectId: run.projectId,
+      manifestProjectId: manifest.value.projectId,
+    });
+  }
+  let revisions = firstActivationRevisions(manifest.value, plan["workflowRevisions"], null);
+  if (!revisions.allowed) return revisions as Decision<ValidatedFirstActivation>;
+  if (facts !== null) {
+    const eligible = firstActivationEligibility(run, manifest.value, facts);
+    if (!eligible.allowed) return eligible as Decision<ValidatedFirstActivation>;
+    // E6 against the REGISTERED identities as well; with E4 passed it agrees, and it is asked anyway.
+    revisions = firstActivationRevisions(manifest.value, plan["workflowRevisions"], facts.registeredRepositories);
+    if (!revisions.allowed) return revisions as Decision<ValidatedFirstActivation>;
+  }
+  return allow(ReasonCode.OK, {
+    manifest: manifest.value,
+    manifestDigest: supplied,
+    workflowRevisions: revisions.value,
+    workflowRevisionsDigest: workflowRevisionsDigest(revisions.value),
+  });
+};
+
+/**
+ * #512 — `plan_submit` for a first-activation CONTRACT_CHANGE. What is stored is the PLAN with the
+ * normalized manifest and the normalized revisions, so the PLAN digest covers both. No network call.
+ */
+export const firstActivationPlanForSubmission = (
+  run: ContractChangeRun,
+  plan: Record<string, unknown>,
+  facts: FirstActivationFacts | null,
+): Decision<Record<string, unknown>> => {
+  const validated = validateFirstActivationPlan(run, plan, facts);
+  if (!validated.allowed) return validated as Decision<Record<string, unknown>>;
+  return allow(ReasonCode.OK, {
+    ...plan,
+    firstActivation: true,
+    projectManifest: validated.value.manifest,
+    workflowRevisions: validated.value.workflowRevisions,
+  });
+};
+
+/** #512 — a first-activation PLAN as validated: no base, and the exact revisions it binds. */
+export interface CurrentFirstActivationPlan {
+  binding: FirstActivationBinding;
+  manifest: ProjectManifest;
+  baseManifest: null;
+  workflowEvidence: ContractChangeWorkflowEvidence[];
+  workflowRevisions: WorkflowRevision[];
+}
+
+/**
+ * #512 — the first-activation candidate the run's latest PLAN implies, re-validated from the stored
+ * PLAN (and, given `facts`, against the project as it stands): the binding a snapshot freezes, the
+ * manifest it carries and the revisions it binds. A PLAN that is not a first activation has none.
+ */
+export const currentFirstActivationPlan = (
+  run: ContractChangeRun,
+  planArtifact: { digest: string; content: unknown } | null,
+  facts: FirstActivationFacts | null,
+): Decision<CurrentFirstActivationPlan> => {
+  if (planArtifact === null || !isRecord(planArtifact.content) || !isFirstActivationPlan(planArtifact.content)) {
+    return refuse(ReasonCode.INVALID_ARGUMENT, ContractChangeRefusal.MANIFEST_MISSING, "the run has no first-activation PLAN carrying a manifest", {
+      planDigest: planArtifact?.digest ?? null,
+    });
+  }
+  const validated = validateFirstActivationPlan(run, planArtifact.content, facts);
+  if (!validated.allowed) {
+    return deny(validated.reasonCode, validated.message, { planDigest: planArtifact.digest, ...validated.evidence }) as Decision<CurrentFirstActivationPlan>;
+  }
+  return allow(ReasonCode.OK, {
+    binding: {
+      planDigest: planArtifact.digest,
+      manifestDigest: validated.value.manifestDigest,
+      baseManifestDigest: null,
+      firstActivation: true,
+      workflowRevisionsDigest: validated.value.workflowRevisionsDigest,
+    },
+    manifest: validated.value.manifest,
+    baseManifest: null,
+    workflowEvidence: validated.value.manifest.ciWorkflows.map((workflow) => ({
+      repositoryRole: workflow.repositoryRole,
+      repositoryRemote: validated.value.manifest.repositories.find((repository) => repository.role === workflow.repositoryRole)?.remote ?? null,
+      path: workflow.path,
+      checkName: workflow.checkName,
+      approvedDigest: workflow.approvedDigest,
+      unapprovedFirstActivation: workflow.unapprovedFirstActivation,
+      unchangedFromBase: false,
+    })),
+    workflowRevisions: validated.value.workflowRevisions,
+  });
+};
+
+/**
+ * #512 — the candidate a CONTRACT_CHANGE run's latest PLAN implies, whichever kind it is: a change of
+ * the run's pinned base, or, for a PLAN that names itself one, a first activation. For a reader that
+ * freezes or reviews either kind; `currentContractChangePlan` stays the general path alone.
+ */
+export const currentContractChangeTarget = (
+  run: ContractChangeRun,
+  planArtifact: { digest: string; content: unknown } | null,
+  lookup: ManifestLookup,
+  /** #512 — as for `contractChangePlanForSubmission`: given, a first activation is judged against them. */
+  facts: FirstActivationFacts | null = null,
+): Decision<(CurrentContractChangePlan & { firstActivation?: undefined }) | (CurrentFirstActivationPlan & { firstActivation: true })> => {
+  if (planArtifact !== null && isFirstActivationPlan(planArtifact.content)) {
+    const first = currentFirstActivationPlan(run, planArtifact, facts);
+    return first.allowed ? allow(ReasonCode.OK, { ...first.value, firstActivation: true as const }) : (first as Decision<never>);
+  }
+  return currentContractChangePlan(run, planArtifact, lookup);
 };
 
 /**
@@ -526,9 +940,13 @@ export const currentContractChangePlan = (
   });
 };
 
+/**
+ * Equal bindings: the same PLAN, manifest and base, and, for a first activation (#512), the same
+ * exact workflow revisions. A general binding never equals a first-activation one.
+ */
 export const sameContractChangeBinding = (
-  left: ContractChangeBinding | null | undefined,
-  right: ContractChangeBinding | null | undefined,
+  left: AnyContractChangeBinding | null | undefined,
+  right: AnyContractChangeBinding | null | undefined,
 ): boolean =>
   left !== null &&
   left !== undefined &&
@@ -536,7 +954,15 @@ export const sameContractChangeBinding = (
   right !== undefined &&
   left.planDigest === right.planDigest &&
   left.manifestDigest === right.manifestDigest &&
-  left.baseManifestDigest === right.baseManifestDigest;
+  left.baseManifestDigest === right.baseManifestDigest &&
+  isFirstActivationBinding(left) === isFirstActivationBinding(right) &&
+  workflowRevisionsDigestOf(left) === workflowRevisionsDigestOf(right);
+
+const isFirstActivationBinding = (binding: AnyContractChangeBinding): binding is FirstActivationBinding =>
+  "firstActivation" in binding && binding.firstActivation === true;
+
+const workflowRevisionsDigestOf = (binding: AnyContractChangeBinding): string | null =>
+  isFirstActivationBinding(binding) ? binding.workflowRevisionsDigest : null;
 
 /**
  * The blind-review coverage item for the carried manifest, keyed like candidate coverage:

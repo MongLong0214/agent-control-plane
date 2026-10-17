@@ -22,7 +22,8 @@ import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ProductionGate, ProductionReadyPacket } from "../ceo/production-gate.ts";
-import { currentContractChangePlan, isContractChangeRun, sameContractChangeBinding } from "../registry/contract-change-plan.ts";
+import { currentContractChangeTarget, isContractChangeRun, sameContractChangeBinding } from "../registry/contract-change-plan.ts";
+import { firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
@@ -282,10 +283,12 @@ export class CandidatePipeline {
     // run is verified against stays its dispatch pin, rather than a contract the candidate proposes.
     let contractChange: Parameters<typeof buildNoRepositoryCandidateSnapshot>[0]["contractChange"];
     if (isContractChangeRun(run)) {
-      const current = currentContractChangePlan(
+      // #512 (v45) — or a first activation, judged against the project as it stands now (E2–E6).
+      const current = currentContractChangeTarget(
         run,
         this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN),
         (digest) => this.projects.manifest(digest),
+        firstActivationFactsOf(this.db, run),
       );
       if (!current.allowed) return current as Decision<CandidateSnapshot>;
       contractChange = current.value.binding;
@@ -984,7 +987,12 @@ export class CandidatePipeline {
   private contractChangePlanStillCurrent(runId: string, snapshot: CandidateSnapshot): Decision<void> {
     const run = this.runs.get(runId);
     const current = run
-      ? currentContractChangePlan(run, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN), (digest) => this.projects.manifest(digest))
+      ? currentContractChangeTarget(
+          run,
+          this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN),
+          (digest) => this.projects.manifest(digest),
+          firstActivationFactsOf(this.db, run),
+        )
       : null;
     const currentBinding = current?.allowed ? current.value.binding : null;
     if (!sameContractChangeBinding(currentBinding, snapshot.contractChange)) {

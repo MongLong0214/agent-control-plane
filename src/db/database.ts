@@ -1483,6 +1483,9 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   MANIFEST_GRANT_CONSUMED: ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED,
   MANIFEST_ACTIVATION_AUTHORITY_DENIED: ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_DENIED,
   CONTRACT_CHANGE_NOT_ACTIVATED: ReasonCode.CONTRACT_CHANGE_NOT_ACTIVATED,
+  // #512 (schema v45) — a first-activation grant is born only on a NULL project for its NULL-pinned
+  // CONTRACT_CHANGE run and own registration, and is consumed only while the project is still NULL.
+  MANIFEST_FIRST_ACTIVATION_DENIED: ReasonCode.MANIFEST_ACTIVATION_AUTHORITY_DENIED,
   // The canonical-turn ledger, which had no entries here at all: every one of its denials came
   // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
   // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the

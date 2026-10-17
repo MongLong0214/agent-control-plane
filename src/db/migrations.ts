@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 44;
+export const SCHEMA_VERSION = 45;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -149,8 +149,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   // v43 alone creates the bootstrap application record and its guards (#246 C3).
   /-- -{75}\n-- bootstrap_applications[\s\S]*?CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_delete[\s\S]*?\nEND;/,
   // v44 alone creates the manifest activation grant, its guards, and the two guards over projects and
-  // runs that name it (#246 B2-b).
-  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/,
+  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512).
+  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -3223,6 +3223,183 @@ const v44: SchemaMigration = {
   checksum: () => migrationChecksum("v44-manifest-activation-grant", 44),
 };
 
+/**
+ * v45's guards, read from schema.sql by name: the first-activation grant's seven, the one on the v44
+ * grant table that names it, and the two v44 guards over projects and runs whose bodies v45 replaces.
+ */
+const V45_FIRST_ACTIVATION_TRIGGER_NAMES: readonly string[] = [
+  "manifest_first_activation_grants_born_unconsumed",
+  "manifest_first_activation_grants_born_on_null",
+  "manifest_first_activation_grants_no_replace",
+  "manifest_first_activation_grants_immutable",
+  "manifest_first_activation_grants_consumed_once",
+  "manifest_first_activation_grants_consumed_while_null",
+  "manifest_first_activation_grants_no_delete",
+  "manifest_activation_grants_not_first",
+  "projects_active_manifest_moves_by_grant",
+  "runs_contract_change_completes_activated",
+];
+
+/** One object a v45 `IF NOT EXISTS` statement creates, and what may hold its name. */
+interface V45Object {
+  readonly type: "table" | "index" | "trigger";
+  readonly name: string;
+  /** The table it is on; a table's is its own name. */
+  readonly table: string;
+  /** schema.sql's definition at v45, the only one the name may hold after the step. */
+  readonly ddl: string;
+  /** For a guard v44 defined and v45 replaces, v44's definition, which the name may still hold before the step. */
+  readonly v44Ddl?: string;
+}
+
+/** A stored or schema.sql definition without `IF NOT EXISTS`, comments, double quotes or spacing. */
+const normaliseV45Sql = (sql: string): string => sql
+  .replace(/^CREATE (TABLE|UNIQUE INDEX|TRIGGER) IF NOT EXISTS /i, "CREATE $1 ")
+  .replace(/--[^\n]*/g, "").replace(/"/g, "").replace(/;\s*$/, "").replace(/\s+/g, " ").trim();
+
+/** The table a schema.sql definition is on, read from the definition itself. */
+const v45OwnerOf = (ddl: string, pattern: RegExp): string => {
+  const owner = pattern.exec(ddl)?.[1];
+  if (owner === undefined) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "a v45 object in schema.sql names no table", { ddl: ddl.slice(0, 120) });
+  }
+  return owner;
+};
+
+/** The first-grant table, its index and the ten guards, each read from schema.sql by name. */
+const v45Objects = (): readonly V45Object[] => {
+  const table = schemaObject(
+    /CREATE TABLE IF NOT EXISTS manifest_first_activation_grants \([\s\S]*?\n\) WITHOUT ROWID;/,
+    "the manifest_first_activation_grants table",
+    45,
+  );
+  const index = schemaObject(
+    /CREATE UNIQUE INDEX IF NOT EXISTS manifest_first_activation_grants_one_consumed_per_project[^;]*;/,
+    "the manifest_first_activation_grants index",
+    45,
+  );
+  return [
+    { type: "table", name: "manifest_first_activation_grants", table: "manifest_first_activation_grants", ddl: table },
+    {
+      type: "index",
+      name: "manifest_first_activation_grants_one_consumed_per_project",
+      table: v45OwnerOf(index, /\bON (\w+)\s*\(/),
+      ddl: index,
+    },
+    ...V45_FIRST_ACTIVATION_TRIGGER_NAMES.map((name): V45Object => {
+      const ddl = triggerDdlFor([name], 45);
+      return {
+        type: "trigger",
+        name,
+        table: v45OwnerOf(ddl, /^(?:BEFORE|AFTER|INSTEAD OF)\b[^\n]*?\bON (\w+)\s*$/m),
+        ddl,
+        ...(V44_MANIFEST_ACTIVATION_TRIGGER_NAMES.includes(name) ? { v44Ddl: triggerDdlFor([name], 44) } : {}),
+      };
+    }),
+  ];
+};
+
+/**
+ * V45-R1-01. Whatever holds each v45 name — of any type, on any table, in any letter case, since SQLite
+ * compares names case-insensitively — must be the object schema.sql defines under it: its type, its
+ * table and its definition. `IF NOT EXISTS` is a no-op when anything holds the name, and `DROP TRIGGER IF
+ * EXISTS` removes whatever trigger does, so neither statement shows that the object it names was
+ * installed. Measured at dce20a42: an index of the unique index's name on `projects` let the step commit
+ * with no partial unique index on the grant table, and two first grants were then consumed for one NULL
+ * project. Before the step a name may be free, and a guard v45 replaces may still hold v44's body; after
+ * it every name is held, by v45's definition alone.
+ */
+const assertV45Names = (raw: Database.Database, objects: readonly V45Object[], when: "before" | "after"): void => {
+  for (const object of objects) {
+    const holders = raw
+      .prepare("SELECT type, name, tbl_name AS tbl, sql FROM sqlite_master WHERE name = ? COLLATE NOCASE")
+      .all(object.name) as Array<{ type: string; name: string; tbl: string; sql: string | null }>;
+    if (when === "after" && holders.length === 0) {
+      throw new Error(`v45 refuses: ${object.name} is not held by the ${object.type} schema.sql defines on ${object.table} after the step`);
+    }
+    const accepted = [object.ddl, ...(when === "before" && object.v44Ddl !== undefined ? [object.v44Ddl] : [])]
+      .map(normaliseV45Sql);
+    for (const holder of holders) {
+      if (holder.type !== object.type || holder.name !== object.name || holder.tbl !== object.table
+          || holder.sql === null || !accepted.includes(normaliseV45Sql(holder.sql))) {
+        throw new Error(
+          `v45 refuses: ${object.name} is held by the ${holder.type} ${holder.name} on ${holder.tbl}, which is not the ${object.type} schema.sql defines on ${object.table}`,
+        );
+      }
+    }
+  }
+};
+
+/**
+ * After the step the first-grant table carries exactly what schema.sql puts on it — its index and its
+ * seven guards, beside the automatic indexes of its own constraints — so a pre-existing table of the
+ * exact shape cannot bring an index or a guard of its own into v45.
+ */
+const assertV45TableCarries = (raw: Database.Database, objects: readonly V45Object[]): void => {
+  const table = objects.find((object) => object.type === "table")!.name;
+  const carried = (raw
+    .prepare("SELECT type, name FROM sqlite_master WHERE tbl_name = ? COLLATE NOCASE AND type <> 'table' AND NOT (type = 'index' AND sql IS NULL)")
+    .all(table) as Array<{ type: string; name: string }>).map((row) => `${row.type} ${row.name}`);
+  const defined = objects
+    .filter((object) => object.type !== "table" && object.table === table)
+    .map((object) => `${object.type} ${object.name}`);
+  const extra = carried.filter((entry) => !defined.includes(entry));
+  const missing = defined.filter((entry) => !carried.includes(entry));
+  if (extra.length > 0 || missing.length > 0) {
+    throw new Error(
+      `v45 refuses: ${table} carries ${extra.join(", ") || "nothing"} beyond what schema.sql defines on it and lacks ${missing.join(", ") || "nothing"}`,
+    );
+  }
+};
+
+/**
+ * #512. An operator-registered project starts with a NULL active manifest, and no path could give it
+ * one: a CONTRACT_CHANGE needs a base, the v44 grant's `from_manifest_digest` is NOT NULL, and the
+ * pointer guard admits only a v44 grant whose `from` is the old value. A first-activation
+ * CONTRACT_CHANGE's CEO CONFIRM now issues a grant in its own table, bound to the exact project, its
+ * NULL registration, the manifest, the review and the exact workflow revisions, and the daemon
+ * finalizer consumes it, once and only while the project is still NULL, in the transaction that moves
+ * the pointer NULL → M1 and completes the run.
+ *
+ * Additive, apart from two replaced bodies: one new table, its partial unique index (one consumed first
+ * grant per project) and its seven guards, one new guard on the v44 grant table (a run holds one grant
+ * across both tables), and the v44 pointer and completion guards, each gaining the first-activation
+ * alternative. For any non-NULL old pointer value both replaced bodies decide exactly as v44's did. The
+ * v44 table, its five guards and its NOT NULL `from` column are untouched. No existing row is touched
+ * and there is no backfill. A chain test can build a v44 image out of a current database, which already
+ * has the table; it is accepted only with schema.sql's exact shape (index included) and no row, never
+ * repaired, as v44 does. The triggers are dropped and recreated, once every name has been checked.
+ *
+ * V45-R1-01: every name the step's `IF NOT EXISTS` statements take is checked before the step, whether
+ * or not the table exists, and again after it (`assertV45Names`), and the table must then carry exactly
+ * the objects schema.sql puts on it. A conflict refuses the step; nothing is dropped to make room.
+ *
+ * A live database at v44 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v45: SchemaMigration = {
+  id: "v45-first-manifest-activation",
+  fromVersion: 44,
+  toVersion: 45,
+  apply: (raw) => {
+    const objects = v45Objects();
+    const table = objects.find((object) => object.type === "table")!;
+    const index = objects.find((object) => object.type === "index")!;
+    assertV45Names(raw, objects, "before");
+    const tableExists = raw.prepare("SELECT 1 FROM sqlite_master WHERE name = ? COLLATE NOCASE").get(table.name) !== undefined;
+    if (tableExists && raw.prepare("SELECT 1 FROM manifest_first_activation_grants LIMIT 1").get()) {
+      throw new Error("v45 pre-existing manifest_first_activation_grants table is populated");
+    }
+    if (!tableExists) raw.exec(table.ddl);
+    raw.exec(index.ddl);
+    raw.exec(dropsFor(V45_FIRST_ACTIVATION_TRIGGER_NAMES));
+    raw.exec(triggerDdlFor(V45_FIRST_ACTIVATION_TRIGGER_NAMES, 45));
+    assertV45Names(raw, objects, "after");
+    assertV45TableCarries(raw, objects);
+  },
+  checksum: () => migrationChecksum("v45-first-manifest-activation", 45),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -3257,6 +3434,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v42,
   v43,
   v44,
+  v45,
 ]);
 
 interface RequiredTrigger {
@@ -3440,6 +3618,14 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "projects_no_replace", sentinel: "PROJECT_NO_REPLACE", introducedIn: 44 },
   { name: "projects_active_manifest_moves_by_grant", sentinel: "MANIFEST_ACTIVATION_AUTHORITY_DENIED", introducedIn: 44 },
   { name: "runs_contract_change_completes_activated", sentinel: "CONTRACT_CHANGE_NOT_ACTIVATED", introducedIn: 44 },
+  { name: "manifest_first_activation_grants_born_unconsumed", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_born_on_null", sentinel: "MANIFEST_FIRST_ACTIVATION_DENIED", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_no_replace", sentinel: "MANIFEST_GRANT_NO_REPLACE", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_immutable", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_consumed_once", sentinel: "MANIFEST_GRANT_CONSUMED", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_consumed_while_null", sentinel: "MANIFEST_FIRST_ACTIVATION_DENIED", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_no_delete", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
+  { name: "manifest_activation_grants_not_first", sentinel: "MANIFEST_GRANT_NO_REPLACE", introducedIn: 45 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
