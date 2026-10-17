@@ -1,10 +1,12 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { lstatSync, mkdirSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
+import { lstatSync, mkdirSync, readlinkSync, realpathSync, renameSync, symlinkSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import {
   canonical,
+  type Created,
+  createPrivateDirectory,
   isWithin,
   type Links,
   LIVE_STATE_ROOT,
@@ -88,7 +90,11 @@ describe("the live-root guard needs no read of live state (#1093, R2)", () => {
       },
     };
     expect(resolvesToLiveState(join(LIVE_STATE_ROOT, "scratch"), realpath, links)).toBe(true);
-    expect(resolvesToLiveState(tempDir("acp-live-root-private-"), realpath, links)).toBe(false);
+    // A root that cannot be inspected vouches only for a directory this process created (review r3, R3).
+    const created: Created = new Map();
+    const home = createPrivateDirectory(join(realpathSync(tempDir("acp-live-root-private-")), "home"), created);
+    expect(resolvesToLiveState(join(home, ".agent-control-plane", "scratch"), realpath, links, created)).toBe(false);
+    expect(resolvesToLiveState(tempDir("acp-live-root-private-"), realpath, links, created)).toBe(true);
     expect(denied.length, "the live root was never asked about, so nothing was measured").toBeGreaterThan(0);
   });
 
@@ -188,19 +194,126 @@ describe("a direct alias to a protected root is still the root (#1093, review r2
       expect(isWithin(paths.rootAlias, live, realpath, links)).toBe(true);
       expect(isWithin(join(elsewhere, ".agent-control-plane", "scratch"), live, realpath, links)).toBe(true);
     }
-    // The same link, readable, is followed to where it points and passes.
-    expect(isWithin(join(elsewhere, ".agent-control-plane", "scratch"), live, realpath, uninspectable(live))).toBe(false);
+    // The same link, readable, is followed to where it points and passes, where the root can be inspected.
+    expect(isWithin(join(elsewhere, ".agent-control-plane", "scratch"), live, realpath)).toBe(false);
+    // Where the root cannot, nothing but a directory this process created vouches for it (review r3, R3).
+    expect(isWithin(join(elsewhere, ".agent-control-plane", "scratch"), live, realpath, uninspectable(live))).toBe(true);
   });
 
   it("still passes a private HOME under the same protection", () => {
     const { dir, live } = aliasFixture();
     const realpath = protectedRealpath(live);
-    const links = uninspectable(live);
     const absent = join(dir, "private-home", ".agent-control-plane", "scratch");
-    expect(isWithin(absent, live, realpath, links)).toBe(false);
     const present = join(dir, "present-home", ".agent-control-plane", "scratch");
     mkdirSync(present, { recursive: true });
-    expect(isWithin(present, live, realpath, links)).toBe(false);
-    expect(isWithin(live, live, realpath, links)).toBe(true);
+    // A root that resolves, or is at least inspected, is compared as before: any private HOME passes.
+    expect(isWithin(absent, live, realpath)).toBe(false);
+    expect(isWithin(present, live, realpath)).toBe(false);
+    // A root that cannot even be inspected passes the HOME this process created, and only that.
+    const links = uninspectable(live);
+    const created: Created = new Map();
+    const home = createPrivateDirectory(join(dir, "created-home"), created);
+    expect(isWithin(join(home, ".agent-control-plane", "scratch"), live, realpath, links, created)).toBe(false);
+    mkdirSync(join(home, ".agent-control-plane", "scratch"), { recursive: true });
+    expect(isWithin(join(home, ".agent-control-plane", "scratch"), live, realpath, links, created)).toBe(false);
+    expect(isWithin(absent, live, realpath, links, created)).toBe(true);
+    expect(isWithin(present, live, realpath, links, created)).toBe(true);
+    expect(isWithin(live, live, realpath, links, created)).toBe(true);
+  });
+});
+
+/**
+ * Review r3, R3 — the live root is itself a link, and the host refuses to resolve, inspect or read
+ * anything at or below it (the reviewer's injected EPERM, on a synthetic root). The root's identity
+ * is then unknown, and round 3 compared against its own spelling anyway: an alias to the link's
+ * physical target read as outside live state, and setup allocated into it. Unknown must mean refused,
+ * except inside a directory this process created and can still prove is the one it created.
+ */
+describe("a live root that is itself an uninspectable link (#1093, review r3 R3)", () => {
+  const fixture = () => {
+    const dir = realpathSync(tempDir("acp-live-root-symlink-"));
+    const account = join(dir, "home");
+    const physical = join(dir, "physical-state");
+    const live = join(account, ".agent-control-plane");
+    mkdirSync(account);
+    mkdirSync(join(physical, "scratch"), { recursive: true });
+    symlinkSync(physical, live);
+    const aliasHome = join(dir, "alias-home");
+    mkdirSync(aliasHome);
+    symlinkSync(physical, join(aliasHome, ".agent-control-plane"));
+    // The reviewer's preload: realpath, lstat and readlink refused at or below the live root's spelling.
+    const deny = (path: string): void => {
+      if (under(resolve(path), live)) throw eperm(path);
+    };
+    const realpath: Realpath = (path) => {
+      deny(path);
+      return realpathSync(path);
+    };
+    const links: Links = {
+      lstat: (path) => {
+        deny(path);
+        return lstatSync(path);
+      },
+      readlink: (path) => {
+        deny(path);
+        return readlinkSync(path);
+      },
+    };
+    return { dir, live, physical, aliasHome, realpath, links };
+  };
+
+  it("refuses an alias to the link's physical target, and its scratch", () => {
+    const { live, physical, aliasHome, realpath, links } = fixture();
+    expect(() => links.lstat(live), "the protection under test is not in place").toThrow(/EPERM/);
+    const created: Created = new Map();
+    for (const path of [
+      join(aliasHome, ".agent-control-plane", "scratch"),
+      join(aliasHome, ".agent-control-plane"),
+      join(physical, "scratch"),
+      physical,
+      join(live, "scratch"),
+    ]) {
+      expect({ path, within: isWithin(path, live, realpath, links, created) }).toEqual({ path, within: true });
+    }
+  });
+
+  it("passes the private HOME this process created, and nothing it cannot prove is that directory", () => {
+    const { dir, live, physical, realpath, links } = fixture();
+    const created: Created = new Map();
+    const home = createPrivateDirectory(join(dir, "private-home"), created);
+    const scratch = join(home, ".agent-control-plane", "scratch");
+    expect(isWithin(scratch, live, realpath, links, created)).toBe(false);
+    expect(isWithin(home, live, realpath, links, created)).toBe(false);
+
+    // Spelled through `..` past a link, or through a link below it, it is no longer provably inside:
+    // `home/link/..` reads as `home` but is the link target's parent, here the live state itself.
+    symlinkSync(join(physical, "scratch"), join(home, "link"));
+    expect(isWithin(`${home}${sep}link${sep}..`, live, realpath, links, created)).toBe(true);
+    symlinkSync(physical, join(home, ".agent-control-plane"));
+    expect(isWithin(scratch, live, realpath, links, created)).toBe(true);
+
+    // Gone, it vouches for nothing below it that exists; replaced, the new directory is not the one created.
+    const gone = createPrivateDirectory(join(dir, "gone-home"), created);
+    renameSync(gone, join(dir, "moved-home"));
+    expect(isWithin(join(gone, ".agent-control-plane", "scratch"), live, realpath, links, created)).toBe(false);
+    mkdirSync(gone);
+    expect(isWithin(join(gone, ".agent-control-plane", "scratch"), live, realpath, links, created)).toBe(true);
+
+    // Reached through a link, a created directory is not recorded at all.
+    const linkedParent = join(dir, "linked-parent");
+    symlinkSync(realpathSync(tempDir("acp-live-root-linked-")), linkedParent);
+    const viaLink = createPrivateDirectory(join(linkedParent, "home"), created);
+    expect(created.has(viaLink)).toBe(false);
+    expect(isWithin(join(viaLink, ".agent-control-plane", "scratch"), live, realpath, links, created)).toBe(true);
+
+    // Exclusive: an existing directory is never adopted as created.
+    expect(() => createPrivateDirectory(home, created)).toThrow(/EEXIST/);
+  });
+
+  it("keeps the current answer where the root resolves", () => {
+    const { live, physical, aliasHome } = fixture();
+    expect(isWithin(join(aliasHome, ".agent-control-plane", "scratch"), live)).toBe(true);
+    expect(isWithin(join(physical, "scratch"), live)).toBe(true);
+    expect(isWithin(tempDir("acp-live-root-elsewhere-"), live)).toBe(false);
   });
 });

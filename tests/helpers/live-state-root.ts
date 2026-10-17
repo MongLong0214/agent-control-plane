@@ -1,4 +1,4 @@
-import { lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { lstatSync, mkdirSync, readlinkSync, realpathSync } from "node:fs";
 import { userInfo } from "node:os";
 import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 
@@ -16,9 +16,12 @@ export type Realpath = (path: string) => string;
 
 /** How a single path component is inspected: neither call reads what a link points at. */
 export type Links = {
-  lstat: (path: string) => { isSymbolicLink: () => boolean };
+  lstat: (path: string) => { isSymbolicLink: () => boolean; dev: number; ino: number };
   readlink: (path: string) => string;
 };
+
+/** Directories this process created itself, by spelling, with the device and inode each had then. */
+export type Created = Map<string, { dev: number; ino: number }>;
 
 const NODE_LINKS: Links = {
   lstat: (path) => lstatSync(path),
@@ -114,21 +117,95 @@ const resolution = (path: string, realpath: Realpath, links: Links): Resolution 
 export const canonical = (path: string, realpath: Realpath = realpathSync, links: Links = NODE_LINKS): string =>
   resolution(path, realpath, links).path;
 
+/** True when every component of the absolute `path` can be inspected and none is a link. */
+const linkFree = (path: string, links: Links): boolean => {
+  let current = parse(path).root;
+  for (const name of path.split(sep).filter(Boolean)) {
+    current = join(current, name);
+    try {
+      if (links.lstat(current).isSymbolicLink()) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+};
+
+/** The directories this process created with `createPrivateDirectory`. */
+const CREATED: Created = new Map();
+
+/**
+ * Creates `path` as a new private directory and records it as created by this process — the one kind
+ * of path the guard can still vouch for when the live root cannot be inspected (review r3, R3).
+ *
+ * Not recursive, so it fails with EEXIST unless this call made the directory: a directory that did
+ * not exist a moment ago is not the live root, which existed before. It is recorded only when spelled
+ * absolutely with no link on the way, so the spelling and the directory are the same thing.
+ */
+export const createPrivateDirectory = (path: string, created: Created = CREATED, links: Links = NODE_LINKS): string => {
+  mkdirSync(path, { mode: 0o700 });
+  if (path === resolve(path) && linkFree(path, links)) {
+    const { dev, ino } = links.lstat(path);
+    created.set(path, { dev, ino });
+  }
+  return path;
+};
+
+/**
+ * True only when `path` provably stays inside a directory this process created: at or below an entry
+ * of `created`, spelled without `..`, with no link anywhere on the way, and the entry still the very
+ * directory created there (same device and inode). A part of the path that no longer exists ends the
+ * walk — nothing below it exists to lead anywhere. A component that cannot be inspected proves nothing.
+ */
+const insideCreated = (path: string, links: Links, created: Created): boolean => {
+  if (!isAbsolute(path) || path.split(sep).includes("..")) return false;
+  const absolute = resolve(path);
+  for (const [dir, identity] of created) {
+    if (absolute !== dir && !absolute.startsWith(`${dir}${sep}`)) continue;
+    let current = parse(absolute).root;
+    let proven = true;
+    for (const name of absolute.split(sep).filter(Boolean)) {
+      current = join(current, name);
+      let stats: ReturnType<Links["lstat"]>;
+      try {
+        stats = links.lstat(current);
+      } catch (error) {
+        proven = ABSENT.has(unresolvable(error));
+        break;
+      }
+      if (stats.isSymbolicLink() || (current === dir && (stats.dev !== identity.dev || stats.ino !== identity.ino))) {
+        proven = false;
+        break;
+      }
+    }
+    if (proven) return true;
+  }
+  return false;
+};
+
 /**
  * True when `path` is `root` or inside it. A candidate whose identity could not be established is
  * treated as inside: this answers "may a test allocate here?", and the answer for an unknown is no.
- * The root has no such alternative, and is compared by its best spelling.
+ *
+ * The same holds for the root (review r3, R3). The root used to be compared by its best spelling even
+ * when that spelling was not its identity: a live root that is itself a link, on a host that refuses
+ * to inspect it, kept its own spelling, and an alias to the link's physical target read as outside.
+ * Where the root cannot be established, the only candidates let through are those inside a directory
+ * this process created (`createPrivateDirectory`) — the private HOME the setup makes. Every other
+ * candidate is refused. Where the root resolves, the comparison is as before.
  */
 export const isWithin = (
   path: string,
   root: string,
   realpath: Realpath = realpathSync,
   links: Links = NODE_LINKS,
+  created: Created = CREATED,
 ): boolean => {
   const candidate = resolution(path, realpath, links);
   if (!candidate.established) return true;
-  const base = canonical(root, realpath, links);
-  return candidate.path === base || candidate.path.startsWith(`${base}${sep}`);
+  const base = resolution(root, realpath, links);
+  if (!base.established) return !insideCreated(path, links, created);
+  return candidate.path === base.path || candidate.path.startsWith(`${base.path}${sep}`);
 };
 
 /** True when `path` is, or is inside, the operator's live `~/.agent-control-plane`. */
@@ -136,4 +213,5 @@ export const resolvesToLiveState = (
   path: string,
   realpath: Realpath = realpathSync,
   links: Links = NODE_LINKS,
-): boolean => isWithin(path, LIVE_STATE_ROOT, realpath, links);
+  created: Created = CREATED,
+): boolean => isWithin(path, LIVE_STATE_ROOT, realpath, links, created);

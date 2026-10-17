@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll } from "vitest";
 
-import { isWithin, LIVE_STATE_ROOT, resolvesToLiveState } from "./live-state-root.ts";
+import { createPrivateDirectory, isWithin, LIVE_STATE_ROOT, resolvesToLiveState } from "./live-state-root.ts";
 
 /**
  * #1093 — every test file runs with HOME at a private temporary directory, never the operator's.
@@ -24,6 +24,8 @@ import { isWithin, LIVE_STATE_ROOT, resolvesToLiveState } from "./live-state-roo
  * Nothing here needs to read the live state root. Where a sandbox makes it unreadable, the guard
  * compares below it lexically and follows a link to it by reading the link itself; a HOME it cannot
  * account for is refused (`live-state-root.ts`), so isolation still holds and the run proceeds.
+ * Where the live root cannot even be inspected, only the private HOME made here passes: the guard
+ * vouches for a directory this process created, and for nothing else (review r3, R3).
  */
 
 /**
@@ -76,9 +78,11 @@ const liveRootError = (what: string): Error =>
  * is compared too, which also catches a root fixed before HOME was moved.
  */
 beforeAll(() => {
+  // Present before the first test, as an operator's home is, and created here first: a directory
+  // this process just made is one the guard can tell from the live root without inspecting that
+  // root. Left alone when the file chose its own.
+  if (homedir() === privateHome) createPrivateDirectory(privateHome);
   if (resolvesToLiveState(join(homedir(), ".agent-control-plane", "scratch"))) throw liveRootError(`HOME (${homedir()})`);
-  // Present before the first test, as an operator's home is. Left alone when the file chose its own.
-  if (homedir() === privateHome) mkdirSync(privateHome, { recursive: true, mode: 0o700 });
 });
 
 afterAll(async () => {

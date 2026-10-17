@@ -237,3 +237,112 @@ describe("test isolation refuses a HOME that links straight to a protected live 
     expect(readdirSync(join(state, "scratch"))).toEqual([]);
   }, 120_000);
 });
+
+/**
+ * Review r3, R3 — the reviewer's root-symlink process replay, unchanged but for its paths and its
+ * isolation. The surrogate live root is itself a link to a physical state directory, and the preload
+ * refuses realpath, lstat and readlink at or below the root's spelling, so its identity cannot be
+ * established. The test file points HOME at a directory whose `.agent-control-plane` links to the same
+ * physical directory. Round 3 compared that alias against the root's own spelling, passed setup and
+ * allocated a marker into the surrogate's physical scratch. Setup must refuse it before the first test,
+ * and the private HOME setup makes must still pass under the same refusal.
+ */
+const ROOT_SYMLINK_PRELOAD = `
+import fs from 'node:fs';import os from 'node:os';import {syncBuiltinESMExports} from 'node:module';import {join,resolve,sep} from 'node:path';
+const live=join(process.env.ACP_REVIEW_ACCOUNT_HOME,'.agent-control-plane');
+const userInfo=os.userInfo;os.userInfo=(...args)=>({...userInfo(...args),homedir:process.env.ACP_REVIEW_ACCOUNT_HOME});
+const deny=p=>{const at=resolve(String(p));if(at===live||at.startsWith(live+sep)){fs.appendFileSync(process.env.ACP_REVIEW_DENIAL_LOG,'denied\\n');throw Object.assign(Error('synthetic EPERM'),{code:'EPERM'});}};
+for(const key of ['realpathSync','lstatSync','readlinkSync']){const original=fs[key];const patched=(p,...args)=>{deny(p);return original(p,...args)};if(key==='realpathSync')patched.native=patched;fs[key]=patched;}
+syncBuiltinESMExports();
+`;
+
+describe("test isolation refuses an alias when the live root is itself an uninspectable link (#1093, review r3 R3)", () => {
+  it("fails setup before allocating into the link's physical target, and still runs a private HOME", () => {
+    const fixture = realpathSync(tempDir("acp-protected-root-symlink-"));
+    const account = join(fixture, "home");
+    const physical = join(fixture, "physical-state");
+    const live = join(account, ".agent-control-plane");
+    mkdirSync(account, { recursive: true });
+    mkdirSync(join(physical, "scratch"), { recursive: true });
+    symlinkSync(physical, live);
+    const aliasHome = join(fixture, "alias-home");
+    mkdirSync(aliasHome);
+    symlinkSync(physical, join(aliasHome, ".agent-control-plane"));
+
+    symlinkSync(join(ROOT, "node_modules"), join(fixture, "node_modules"));
+    const preload = join(fixture, "protect.mjs");
+    writeFileSync(preload, ROOT_SYMLINK_PRELOAD);
+    writeFileSync(join(fixture, "alias.test.ts"), aliasTest(join(ROOT, "src", "core", "scratch-root.ts")));
+    const config = join(fixture, "alias.config.ts");
+    writeFileSync(
+      config,
+      `import {defineConfig} from 'vitest/config'; export default defineConfig({cacheDir:${JSON.stringify(join(fixture, ".vite"))},test:{include:['alias.test.ts'],setupFiles:[${JSON.stringify(join(ROOT, "tests", "helpers", "isolated-home.ts"))}],pool:'forks'}});`,
+    );
+
+    const run = (label: string, args: string[], cwd: string) => {
+      const report = join(fixture, `${label}.json`);
+      const allocation = join(fixture, `${label}-allocation.log`);
+      const denial = join(fixture, `${label}-denial.log`);
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        CI: "",
+        HOME: account,
+        ACP_REVIEW_ACCOUNT_HOME: account,
+        ACP_REVIEW_DENIAL_LOG: denial,
+        ACP_REVIEW_ALIAS_HOME: aliasHome,
+        ACP_REVIEW_ALLOCATION_LOG: allocation,
+        NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+      };
+      delete env["ACP_VITEST_GATE"];
+      delete env[VITEST_RPC_TRACE_ENV];
+      delete env["ACP_VITEST_RPC_TRACE_FILE"];
+      delete env["ACP_VITEST_RPC_TRACE_RUN"];
+      const done = spawnSync(process.execPath, [VITEST, "run", ...args, "--reporter=json", `--outputFile.json=${report}`], {
+        cwd,
+        encoding: "utf8",
+        timeout: 50_000,
+        env,
+      });
+      const output = `${done.stdout}${done.stderr}`.slice(-4000);
+      expect(existsSync(report), output).toBe(true);
+      const r = JSON.parse(readFileSync(report, "utf8")) as {
+        numPassedTests: number;
+        numFailedTests: number;
+        numPendingTests: number;
+        testResults: { message?: string }[];
+      };
+      const allocated = existsSync(allocation) ? readFileSync(allocation, "utf8") : null;
+      const real = allocated === null ? null : realpathSync(allocated);
+      return {
+        status: done.status,
+        pass: r.numPassedTests,
+        fail: r.numFailedTests,
+        skip: r.numPendingTests,
+        denials: existsSync(denial) ? readFileSync(denial, "utf8").trim().split("\n").length : 0,
+        allocation: allocated,
+        wroteSurrogateLiveState: real?.startsWith(`${physical}/`) === true,
+        why: r.testResults.map((file) => file.message ?? "").join("\n"),
+        output,
+      };
+    };
+
+    const aliased = run("head", ["--config", config], fixture);
+    expect(aliased.denials, `the protected surrogate was never reached\n${aliased.output}`).toBeGreaterThan(0);
+    expect(
+      { allocation: aliased.allocation, wroteSurrogateLiveState: aliased.wroteSurrogateLiveState, pass: aliased.pass },
+      `${aliased.why}\n${aliased.output}`,
+    ).toEqual({ allocation: null, wroteSurrogateLiveState: false, pass: 0 });
+    expect(readdirSync(join(physical, "scratch"))).toEqual([]);
+    expect(aliased.why).toContain("#1093");
+    expect(aliased.status).not.toBe(0);
+
+    // The ordinary file, with the private HOME setup makes, under the same refusals.
+    const isolated = run("private", [GUARD], ROOT);
+    expect(isolated.denials, `the protected surrogate was never reached\n${isolated.output}`).toBeGreaterThan(0);
+    expect(
+      { status: isolated.status, pass: isolated.pass, fail: isolated.fail, skip: isolated.skip },
+      `${isolated.why}\n${isolated.output}`,
+    ).toEqual({ status: 0, pass: 3, fail: 0, skip: 0 });
+    expect(readdirSync(join(physical, "scratch"))).toEqual([]);
+  }, 120_000);
+});
