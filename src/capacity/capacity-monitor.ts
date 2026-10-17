@@ -1457,9 +1457,9 @@ export class CapacityMonitor {
 
   /**
    * #1099 — `ProviderRegistry.invalidateCapacityForRole` withdrew this provider's capacity for `role`.
-   * The registry's generation bump is process-local, so the invalidation is recorded here, at the
-   * monitor's clock, and `restoredRoleObservation` refuses every observation that does not postdate
-   * the latest one, whatever account it measured.
+   * The registry's generation bump is process-local, so the invalidation is recorded here, durably,
+   * and `restoredRoleObservation` refuses every observation persisted before it in the audit log,
+   * whatever account it measured. No account is recorded: it withdraws them all.
    */
   capacityInvalidated(provider: string, role: Role): void {
     this.audit.record({
@@ -1469,16 +1469,33 @@ export class CapacityMonitor {
     });
   }
 
-  /** When capacity for `provider` in `role` was last explicitly invalidated, or null if never. */
-  private latestRoleInvalidation(provider: string, role: Role): string | null {
-    return this.db.get<{ at: string }>(
-      `SELECT at FROM audit_events
-        WHERE kind = ?
-          AND json_extract(evidence_json, '$.provider') = ?
-          AND json_extract(evidence_json, '$.role') = ?
-        ORDER BY event_id DESC LIMIT 1`,
-      [ROLE_INVALIDATION_AUDIT_KIND, provider, role],
-    )?.at ?? null;
+  /**
+   * Review r3 — whether capacity for `provider` in `role` was explicitly invalidated after the audit
+   * event `eventId`. Decided by the order of the append-only, AUTOINCREMENT audit log, never by the
+   * `at` either event carries: a clock stepped back, two equal instants, a later invalidation stamped
+   * earlier, or a restart cannot move a withdrawal before what it withdrew. Every invalidation after
+   * the record counts, not only the newest. An order that cannot be read, or an invalidation whose
+   * provider and role cannot be read, counts as one that applies (fail closed).
+   */
+  private invalidatedAfter(provider: string, role: Role, eventId: unknown): boolean {
+    if (typeof eventId !== "number" || !Number.isSafeInteger(eventId)) return true;
+    const rows = this.db.all<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = ? AND event_id > ? ORDER BY event_id`,
+      [ROLE_INVALIDATION_AUDIT_KIND, eventId],
+    );
+    return rows.some((row) => {
+      let evidence: unknown;
+      try {
+        evidence = JSON.parse(row.evidence_json);
+      } catch {
+        return true;
+      }
+      if (!isPlainRecord(evidence)) return true;
+      const recordedProvider = evidence["provider"];
+      const recordedRole = evidence["role"];
+      if (typeof recordedProvider !== "string" || typeof recordedRole !== "string") return true;
+      return recordedProvider === provider && recordedRole === role;
+    });
   }
 
   /**
@@ -1531,11 +1548,13 @@ export class CapacityMonitor {
    *   Codex and Grok collectors read none, nor does a configured terminal or a failed identity read —
    *   restoration is refused (NO_ACCOUNT_IDENTITY): the pre-#1099 behaviour, since a registration
    *   order, a reset time or a bucket id cannot tell two accounts apart.
-   * - **not withdrawn** (review r1): its original observation time is later than the latest explicit
-   *   invalidation of this provider and role (`capacityInvalidated`, INVALIDATED). The invalidation
-   *   is recorded durably because the generation it bumps restarts with the process; it withdraws the
-   *   readings of every account, and an observation at the very instant of the invalidation, or an
-   *   invalidation whose time does not parse, counts as withdrawn.
+   * - **not withdrawn** (review r1, r3): no explicit invalidation of this provider and role
+   *   (`capacityInvalidated`, INVALIDATED) follows the record in the audit log (`invalidatedAfter`).
+   *   The invalidation is recorded durably because the generation it bumps restarts with the process;
+   *   it withdraws the readings of every account. The record is written while its binding is current
+   *   and that binding's history holds only what it accepted, so in one process an invalidation
+   *   ordered after the record is one the observation predates. Wall-clock time takes no part: equal
+   *   instants or a clock stepped back cannot reorder the log.
    * - **freshness**: its original observation time parses, is not in the future, and is within
    *   `freshnessMs` of now (UNPARSEABLE_TIME, FUTURE_DATED, EXPIRED). That time is the one first
    *   accepted before the restart and is never re-stamped, so a restart cannot renew it;
@@ -1550,8 +1569,8 @@ export class CapacityMonitor {
     binding: RoleCapacityBinding,
     history: readonly RoleObservation[],
   ): { restored: RoleObservation } | { refused: string } | null {
-    const row = this.db.get<{ evidence_json: string }>(
-      `SELECT evidence_json FROM audit_events
+    const row = this.db.get<{ event_id: unknown; evidence_json: string }>(
+      `SELECT event_id, evidence_json FROM audit_events
         WHERE kind = ?
           AND json_extract(evidence_json, '$.provider') = ?
           AND json_extract(evidence_json, '$.role') = ?
@@ -1580,8 +1599,7 @@ export class CapacityMonitor {
     const at = Date.parse(observedAt);
     const now = Date.parse(this.clock.nowIso());
     if (!Number.isFinite(at)) return { refused: "UNPARSEABLE_TIME" };
-    const invalidatedAt = this.latestRoleInvalidation(binding.provider, binding.role);
-    if (invalidatedAt !== null && !(at > Date.parse(invalidatedAt))) return { refused: "INVALIDATED" };
+    if (this.invalidatedAfter(binding.provider, binding.role, row.event_id)) return { refused: "INVALIDATED" };
     if (at > now) return { refused: "FUTURE_DATED" };
     if (now - at > this.#options.freshnessMs) return { refused: "EXPIRED" };
     const buckets = parseObservationBuckets(evidence["buckets"]);

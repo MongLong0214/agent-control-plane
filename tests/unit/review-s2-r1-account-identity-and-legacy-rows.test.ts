@@ -195,8 +195,9 @@ describe("ACP-S2-R1-02: legacy rows with an unparseable observed_at, after an up
 /**
  * ACP-S2-R1-01, durable invalidation: an explicit `invalidateCapacityForRole` withdraws every reading
  * taken before it, and a restart must not bring one back, even for the same account. The
- * invalidation is recorded (CAPACITY_ROLE_INVALIDATED) and restoration refuses any observation that
- * does not postdate the latest one for the provider and role.
+ * invalidation is recorded (CAPACITY_ROLE_INVALIDATED) and restoration refuses any observation whose
+ * record any invalidation for the provider and role follows in the audit log (review r3: by order,
+ * not by time).
  */
 describe("ACP-S2-R1-01: an explicit invalidation survives a restart", () => {
   const ACCOUNT = sha256("fixture account A");
@@ -251,6 +252,120 @@ describe("ACP-S2-R1-01: an explicit invalidation survives a restart", () => {
     try {
       expect((await third.cp.tasks.admitWorkerFanout("claude", "opus")).reasonCode).toBe(ReasonCode.OK);
       // The one refusal on record is the second process's, of the reading taken before the invalidation.
+      expect(notRestored(third.cp)).toEqual(["INVALIDATED"]);
+    } finally {
+      third.cp.close();
+    }
+  });
+
+  // Review r3 (`review-s2-r3-invalidation-clock.test.ts` is the reviewer's own): the barrier is the
+  // durable order of the audit log, never the wall clock, so equal or backward timestamps decide nothing.
+  const atOf = (cp: ControlPlane, kind: string) => cp.audit.byKind(kind).map((row) => row.at);
+
+  it("identical timestamp: an invalidation at the reading's own instant withdraws it", async () => {
+    const clock = new ManualClock(START);
+    const first = boot(clock);
+    first.claude.setCapacity(sameAccount(clock, 81));
+    expect((await first.cp.tasks.admitWorkerFanout("claude", "opus")).reasonCode)
+      .toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    first.cp.providers.invalidateCapacityForRole("claude", Role.WORKER);
+    expect(atOf(first.cp, "CAPACITY_ROLE_INVALIDATED")).toEqual(atOf(first.cp, "CAPACITY_ROLE_OBSERVATION"));
+    first.cp.close();
+    clock.advance(120000);
+    const again = boot(clock, first.root);
+    again.claude.setCapacity(sameAccount(clock, 80));
+    try {
+      expect((await again.cp.tasks.admitWorkerFanout("claude", "opus")).reasonCode)
+        .toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+      expect(notRestored(again.cp)).toEqual(["INVALIDATED"]);
+    } finally {
+      again.cp.close();
+    }
+  });
+
+  it("identical timestamp: a reading persisted after the invalidation, at the same instant, is restored", async () => {
+    const clock = new ManualClock(START);
+    const first = boot(clock);
+    first.claude.setCapacity(sameAccount(clock, 82));
+    await first.cp.tasks.admitWorkerFanout("claude", "opus");
+    first.cp.providers.invalidateCapacityForRole("claude", Role.WORKER);
+    first.cp.close();
+    // The next process reads at the invalidation's own instant; the log orders its record after it.
+    const second = boot(clock, first.root);
+    second.claude.setCapacity(sameAccount(clock, 81));
+    try {
+      expect((await second.cp.tasks.admitWorkerFanout("claude", "opus")).reasonCode)
+        .toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+      expect(atOf(second.cp, "CAPACITY_ROLE_INVALIDATED")).toEqual([START]);
+      expect(atOf(second.cp, "CAPACITY_ROLE_OBSERVATION")).toEqual([START, START]);
+    } finally {
+      second.cp.close();
+    }
+    clock.advance(60000);
+    const third = boot(clock, first.root);
+    third.claude.setCapacity(sameAccount(clock, 80));
+    try {
+      expect((await third.cp.tasks.admitWorkerFanout("claude", "opus")).reasonCode).toBe(ReasonCode.OK);
+    } finally {
+      third.cp.close();
+    }
+  });
+
+  it("repeated invalidation: later invalidations, stamped before the reading after a restart, keep it withdrawn", async () => {
+    const clock = new ManualClock(START);
+    const first = boot(clock);
+    first.claude.setCapacity(sameAccount(clock, 81));
+    expect((await first.cp.tasks.admitWorkerFanout("claude", "opus")).reasonCode)
+      .toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    clock.advance(60000);
+    first.cp.providers.invalidateCapacityForRole("claude", Role.WORKER);
+    first.cp.close();
+    // A second process, its clock stepped back before the reading, invalidates twice at one instant.
+    clock.advance(-120000);
+    const second = boot(clock, first.root);
+    second.cp.providers.invalidateCapacityForRole("claude", Role.WORKER);
+    second.cp.providers.invalidateCapacityForRole("claude", Role.WORKER);
+    second.cp.close();
+    clock.advance(180000);
+    const third = boot(clock, first.root);
+    third.claude.setCapacity(sameAccount(clock, 80));
+    try {
+      expect(atOf(third.cp, "CAPACITY_ROLE_INVALIDATED"))
+        .toEqual(["2026-08-12T00:01:00.000Z", "2026-08-11T23:59:00.000Z", "2026-08-11T23:59:00.000Z"]);
+      expect((await third.cp.tasks.admitWorkerFanout("claude", "opus")).reasonCode)
+        .toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+      expect(notRestored(third.cp)).toEqual(["INVALIDATED"]);
+    } finally {
+      third.cp.close();
+    }
+  });
+
+  it("fail closed: another role's invalidation does not withdraw it; one that names no provider and role does", async () => {
+    const clock = new ManualClock(START);
+    const first = boot(clock);
+    first.claude.setCapacity(sameAccount(clock, 81));
+    await first.cp.tasks.admitWorkerFanout("claude", "opus");
+    first.cp.providers.invalidateCapacityForRole("claude", Role.CEO);
+    first.cp.close();
+    clock.advance(120000);
+    const second = boot(clock, first.root);
+    second.claude.setCapacity(sameAccount(clock, 80));
+    try {
+      expect((await second.cp.tasks.admitWorkerFanout("claude", "opus")).reasonCode).toBe(ReasonCode.OK);
+      second.cp.db.run(
+        `INSERT INTO audit_events (at, kind, reason_code, actor, evidence_json)
+         VALUES (?, 'CAPACITY_ROLE_INVALIDATED', 'OK', 'test', 'not json')`,
+        [clock.nowIso()],
+      );
+    } finally {
+      second.cp.close();
+    }
+    clock.advance(120000);
+    const third = boot(clock, first.root);
+    third.claude.setCapacity(sameAccount(clock, 79));
+    try {
+      expect((await third.cp.tasks.admitWorkerFanout("claude", "opus")).reasonCode)
+        .toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
       expect(notRestored(third.cp)).toEqual(["INVALIDATED"]);
     } finally {
       third.cp.close();
