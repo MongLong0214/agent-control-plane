@@ -199,9 +199,15 @@ export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[]
     id: "primary-cto-handoff",
     kind: BootstrapLifecycleKind.IMPLEMENTED_GUARANTEE,
     statement:
-      "Activation binds the project's PRIMARY_CTO (an active binding of that role is reused) and opens a BOOTSTRAP handoff to that session; only the session it was opened to can acknowledge it.",
+      "Activation binds the project's PRIMARY_CTO through the driven door, a fresh session driven on the headless runtime whose handoff is delivered in band (an active binding of that role is reused), and opens a BOOTSTRAP handoff to that session; only the session it was opened to can acknowledge it. An interactive holder with no Buzz identity, whose PENDING handoff was REJECTED undeliverable, is replaced on the activation retry by a driven one in one switch that records its reason, and the handoff is reissued to it as a new PENDING package for a new ACK.",
     sites: [
-      { file: ACTIVATION, symbol: "activate", enforces: ["this.cto.ensurePrimaryCto(projectId, input.runId)", "this.openActivationHandoff("] },
+      { file: ACTIVATION, symbol: "activate", enforces: ["this.cto.ensureDrivenPrimaryCto(projectId, input.runId, undeliverable ?? undefined)", "this.openActivationHandoff("] },
+      {
+        file: ACTIVATION,
+        symbol: "undeliverableHandoff",
+        enforces: ['drivenModeOf(this.db, binding.sessionId) !== "NONE"', "session.buzzActorId", 'message.status !== "REJECTED"', 'row?.status !== "PENDING"'],
+      },
+      { file: ACTIVATION, symbol: "reissuedToReplacement", enforces: ["PRIMARY_CTO_UNDELIVERABLE_REPLACED", 'row?.status !== "PENDING"'] },
       { file: ACTIVATION, symbol: "acknowledgeActivationHandoff", enforces: ["row.to_session_id !== ackBySessionId", "ack must come from the incoming session"] },
     ],
   },
@@ -267,7 +273,7 @@ export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[]
     id: "confirm-ack-recipient",
     kind: BootstrapLifecycleKind.IMPLEMENTED_GUARANTEE,
     statement:
-      "The CONFIRM transaction completes the run only while the session the BOOTSTRAP handoff was opened to, the only one that can acknowledge it, is the project's active PRIMARY_CTO binding; after a reassignment it is refused, since the replacement has acknowledged nothing and no path redelivers a bootstrap handoff to it.",
+      "The CONFIRM transaction completes the run only while the session the BOOTSTRAP handoff was opened to, the only one that can acknowledge it, is the project's active PRIMARY_CTO binding; after a reassignment it is refused, since the replacement has acknowledged nothing. Only the activation retry's own replacement of an undeliverable recipient redelivers a bootstrap handoff, as a new package to the replacement, whose ACK is then the one required.",
     sites: [
       {
         file: ACTIVATION,
