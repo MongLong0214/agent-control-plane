@@ -748,6 +748,33 @@ describe("only the owner the pause took the run from gets the wait back: same ro
     });
   });
 
+  // Review r2 (RH-R2-01): the replacement above differs in session and incarnation both, so it could not
+  // tell a dropped session comparison apart. Here only the session differs.
+  it.each([
+    ["a new-shape pause", restart],
+    ["a legacy pause", legacyRestart],
+  ] as const)("%s: a holder on another session carrying the owner's incarnation value does not release it", async (_shape, pause) => {
+    await withBootstrapRuntime(async (f) => {
+      const ready = await reviewReady(f);
+      await pause(f, ready);
+      expect(f.harness.cp.bindings.active(ready.roleKey)).toBeNull();
+      const count = transitions(f, ready.runId).length;
+      const other = f.harness.cp.sessions.create({
+        provider: "claude",
+        model: "replacement",
+        incarnation: f.harness.cp.sessions.require(ready.ownerSessionId).incarnation,
+      });
+      f.harness.cp.sessions.transition(other.sessionId, SessionLifecycle.READY, "a replacement bootstrap CTO");
+      const bound = f.harness.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId: ready.runId, sessionId: other.sessionId });
+      if (!bound.allowed) throw new Error(bound.message);
+      expect(f.harness.cp.runs.reassignOwner(ready.runId, bound.value, "a replacement took the role").allowed).toBe(true);
+      expect(f.harness.cp.runs.releaseContinuityReviewHold(ready.runId, bound.value))
+        .toMatchObject({ allowed: true, value: { released: false } });
+      expect(f.harness.cp.runs.require(ready.runId).state).toBe(RunState.AWAITING_HUMAN);
+      expect(transitions(f, ready.runId)).toHaveLength(count);
+    });
+  });
+
   it("a new-shape pause that recorded another incarnation of the owner's session is kept", async () => {
     await withBootstrapRuntime(async (f) => {
       const ready = await reviewReady(f);
