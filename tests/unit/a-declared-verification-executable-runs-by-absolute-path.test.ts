@@ -1,9 +1,10 @@
 import { chmodSync, existsSync, realpathSync, rmSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { parseVerificationCommand, resolveVerificationExecutable } from "../../src/contracts/verification-command.ts";
+import type * as VerificationCommandModule from "../../src/contracts/verification-command.ts";
 import { runSandboxed, verificationLaunchArgv, type SandboxOutcome } from "../../src/verify/sandbox.ts";
 import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
 import { stableFixtureBinDir, stableFixtureLink } from "../helpers/stable-fixture-executable.ts";
@@ -19,7 +20,28 @@ const isolatedHome = vi.hoisted(() => {
   return home;
 });
 
-afterEach(cleanupTempDirs);
+/**
+ * One resolver answer a test substitutes, consumed by the next call. Every other call reaches the
+ * real resolver, so the rest of this file runs against it unchanged.
+ */
+type Resolution = ReturnType<typeof VerificationCommandModule.resolveVerificationExecutable>;
+const resolverOverride = vi.hoisted(() => ({ next: undefined as Resolution | undefined }));
+vi.mock("../../src/contracts/verification-command.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof VerificationCommandModule>();
+  return {
+    ...actual,
+    resolveVerificationExecutable: (...args: Parameters<typeof actual.resolveVerificationExecutable>): Resolution => {
+      const next = resolverOverride.next;
+      resolverOverride.next = undefined;
+      return next ?? actual.resolveVerificationExecutable(...args);
+    },
+  };
+});
+
+afterEach(() => {
+  resolverOverride.next = undefined;
+  cleanupTempDirs();
+});
 afterAll(() => {
   rmSync(isolatedHome, { recursive: true, force: true });
 });
@@ -84,7 +106,7 @@ describe("a declared verification executable runs by the absolute path the allow
     expect(outcome.stdout.trim(), described(outcome)).toBe("trusted-tool");
   });
 
-  it("launches every declared executable by an absolute path, the one the allowlist resolved", async () => {
+  it("launches every declared executable by the absolute path the allowlist approved, symlinks left in place", async () => {
     const repository = makeRepo();
     // Resolved and stat'ed, never executed: no fresh inode reaches exec.
     writeFiles(repository, { "tools/vitest": "#!/bin/sh\nexit 0\n" });
@@ -95,11 +117,32 @@ describe("a declared verification executable runs by the absolute path the allow
     expect(node.allowed).toBe(true);
     const nodeArgv = node.allowed ? node.value : [];
     expect(isAbsolute(nodeArgv[0] ?? "")).toBe(true);
-    expect(nodeArgv).toEqual([resolveVerificationExecutable("node", context).resolvedPath, "-e", "process.exit(0)"]);
-    expect(nodeArgv[0]).toBe(realpathSync(join(dirname(process.execPath), "node")));
+    expect(nodeArgv).toEqual([resolve(dirname(process.execPath), "node"), "-e", "process.exit(0)"]);
+    expect(realpathSync(nodeArgv[0] ?? "")).toBe(resolveVerificationExecutable("node", context).resolvedPath);
 
-    const relative = await verificationLaunchArgv(["./tools/vitest", "run"], context);
-    expect(relative).toMatchObject({ allowed: true, value: [realpathSync(join(repository, "tools", "vitest")), "run"] });
+    const relativeTool = await verificationLaunchArgv(["./tools/vitest", "run"], context);
+    expect(relativeTool).toMatchObject({ allowed: true, value: [join(repository, "tools", "vitest"), "run"] });
+  });
+
+  it("makes a tool found through a relative entry on the daemon's PATH absolute, never a path for the sandbox to resolve", async () => {
+    const name = declaredName();
+    const trusted = stableFixtureBinDir({ [name]: "#!/bin/sh\necho trusted-tool\n" });
+    const repository = makeRepo();
+    const context = { cwd: repository, additionalRoots: [repository] };
+    const launched = await withDaemonPath(relative(process.cwd(), trusted), () => verificationLaunchArgv([name], context));
+    expect(launched).toMatchObject({ allowed: true, value: [join(trusted, name)] });
+  });
+
+  it("refuses a declared executable that no longer leads to the tool the allowlist approved", async () => {
+    const repository = makeRepo();
+    const context = { cwd: repository, additionalRoots: [repository] };
+    const approved = resolveVerificationExecutable("node", context);
+    expect(approved.allowed).toBe(true);
+    // The allowlist approved one tool; by launch, `node` leads somewhere else.
+    resolverOverride.next = { ...approved, resolvedPath: join(repository, "the-approved-tool") };
+    const launched = await verificationLaunchArgv(["node", "-e", "process.exit(0)"], context);
+    expect(launched.allowed).toBe(false);
+    expect(launched.allowed ? "" : launched.message).toContain("no longer leads to the tool the allowlist approved");
   });
 
   it("refuses an executable the allowlist does not approve, rather than leaving it to the sandbox's PATH", async () => {
