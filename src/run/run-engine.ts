@@ -1,4 +1,5 @@
 import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
+import { isContinuityRevocationReason } from "../continuity/continuity-kernel.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
@@ -191,6 +192,74 @@ export interface ContinuityGate {
 /** §15.6's freshness window, the same one `assertCompletionAllowed` applies by default. */
 export const CONTINUITY_MODE_MAX_AGE_MS = 5 * 60 * 1000;
 
+/**
+ * What CEO review asks of a run continuity would hand back to it: whether its human gate is satisfied.
+ * The production gate answers; with no port attached nothing is handed back.
+ */
+export interface CeoReviewGate {
+  humanGateStatus(runId: string): { satisfied: boolean };
+}
+
+/** The state reason a run carries after continuity hands its own CEO-review wait back. */
+export const CONTINUITY_REVIEW_RELEASE_REASON = "continuity restored the role its pause named; back to CEO review";
+
+/** Continuity's own wait at CEO review, as `RunEngine.#continuityReviewHold` found it. */
+interface ContinuityReviewHold {
+  pauseEventId: number;
+  candidateSnapshotDigest: string;
+}
+
+/**
+ * An owner by identity: the role, the session it is bound to and that session's incarnation, and the
+ * binding generation. The binding a release would hand the run back to, or the one a pause took it from.
+ */
+interface ContinuityOwner {
+  roleKey: string;
+  sessionId: string;
+  incarnation: string;
+  generation: number;
+}
+
+/**
+ * The revocation (or deferred revocation) continuity wrote for the loss its pause answered, in the
+ * pause's own reconcile pass: the session and generation it took the role from.
+ */
+interface ContinuityLossEpisode {
+  sessionId: string;
+  generation: number;
+}
+
+/**
+ * The fields a pause at CEO review records, since this change, of the owner it paused the run under —
+ * the run's pin at that moment. `RunEngine.#continuityReviewHold` hands the wait back only to the same
+ * role, session and incarnation.
+ */
+export const CONTINUITY_PAUSE_OWNER_FIELDS = {
+  sessionId: "ownerSessionId",
+  incarnation: "ownerSessionIncarnation",
+  generation: "ownerBindingGeneration",
+} as const;
+
+/** The owner a pause recorded under `CONTINUITY_PAUSE_OWNER_FIELDS`; null when any part is missing. */
+const recordedPauseOwner = (evidence: Record<string, unknown>): Omit<ContinuityOwner, "roleKey"> | null => {
+  const sessionId = evidence[CONTINUITY_PAUSE_OWNER_FIELDS.sessionId];
+  const incarnation = evidence[CONTINUITY_PAUSE_OWNER_FIELDS.incarnation];
+  const generation = evidence[CONTINUITY_PAUSE_OWNER_FIELDS.generation];
+  if (typeof sessionId !== "string" || typeof incarnation !== "string") return null;
+  if (typeof generation !== "number" || !Number.isInteger(generation)) return null;
+  return { sessionId, incarnation, generation };
+};
+
+/** An audit row's evidence as a plain object, or null when it is not one. */
+const auditEvidence = (json: string): Record<string, unknown> | null => {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+};
+
 export class RunEngine {
   /**
    * §29 authority. The database refuses `UPDATE runs SET state` unless this operation raised
@@ -205,6 +274,7 @@ export class RunEngine {
   #workerRetirement: WorkerRetirementPort | null = null;
   #capacity: CapacityGate | null = null;
   #continuity: ContinuityGate | null = null;
+  #ceoReview: CeoReviewGate | null = null;
   readonly #baseline: BaselineRecorder;
 
   constructor(
@@ -233,12 +303,14 @@ export class RunEngine {
     workerRetirement?: WorkerRetirementPort;
     capacity?: CapacityGate;
     continuity?: ContinuityGate;
+    ceoReview?: CeoReviewGate;
   }): void {
     if (ports.cto) this.#cto = ports.cto;
     if (ports.bootstrapCto) this.#bootstrapCto = ports.bootstrapCto;
     if (ports.workerRetirement) this.#workerRetirement = ports.workerRetirement;
     if (ports.capacity) this.#capacity = ports.capacity;
     if (ports.continuity) this.#continuity = ports.continuity;
+    if (ports.ceoReview) this.#ceoReview = ports.ceoReview;
   }
 
   create(input: CreateRunInput): Decision<RunRow> {
@@ -1257,7 +1329,8 @@ export class RunEngine {
       params.push(filter.projectId);
     }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-    return this.db.all<RawRun>(`SELECT * FROM runs ${where} ORDER BY created_at`, params).map(hydrate);
+    // `rowid` makes the order total: runs created in one millisecond come back in insertion order.
+    return this.db.all<RawRun>(`SELECT * FROM runs ${where} ORDER BY created_at, rowid`, params).map(hydrate);
   }
 
   activeRunsOwnedBy(sessionId: string): RunRow[] {
@@ -1333,10 +1406,13 @@ export class RunEngine {
    *   for the new generation in this dispatch cycle. The pause was continuity's answer to lost
    *   coverage, and a recovery runs only from its restore pass once the fixed runtime covers the
    *   role again; the renewed CTO decides what any other role it lost needs (a fresh worker, say).
-   * - BLOCKED for anything else (a CEO decision), REVISION_REQUIRED or AWAITING_HUMAN: only the
-   *   owner's authority comes back. The run keeps its state and its reason, nothing is dispatched,
-   *   and whoever releases that hold — the CEO's resolution, a redispatch — reaches the renewed
-   *   generation.
+   * - AWAITING_HUMAN under continuity's own wait at CEO review for this role, with nothing moved
+   *   since (`#continuityReviewHold`): the wait is handed back — AWAITING_HUMAN → ACTIVE →
+   *   READY_FOR_CEO_REVIEW on the renewed pin, the same candidate and packet, nothing dispatched.
+   * - BLOCKED for anything else (a CEO decision), REVISION_REQUIRED or any other AWAITING_HUMAN: only
+   *   the owner's authority comes back. The run keeps its state and its reason, nothing is
+   *   dispatched, and whoever releases that hold — the CEO's resolution, a redispatch — reaches the
+   *   renewed generation.
    *
    * Refused, with nothing written, unless the run is the project-less bootstrap pinned to exactly
    * `fromGeneration` of the same session and `renewed` is still its role's active binding. A
@@ -1387,6 +1463,15 @@ export class RunEngine {
         renewed.boundSessionId, renewed.bindingGeneration, renewed.boundSessionIncarnation, renewed.roleKey,
       ];
       const resumes = run.state === RunState.BLOCKED && (run.continuityHoldRoleKey ?? null) !== null;
+      // Continuity's own wait at CEO review, for the role this recovery renews on the session and
+      // incarnation the pause took it from, with nothing moved since: the run goes back to CEO review
+      // on the renewed pin, and nothing is dispatched.
+      const reviewHold = resumes ? null : this.#continuityReviewHold(run, {
+        roleKey: renewed.roleKey,
+        sessionId: renewed.boundSessionId,
+        incarnation: renewed.boundSessionIncarnation,
+        generation: renewed.bindingGeneration,
+      });
       if (resumes) {
         const transition = canTransition(run.state, RunState.ACTIVE, run.kind);
         if (!transition.allowed) return transition as Decision<{ run: RunRow; resumed: boolean }>;
@@ -1438,6 +1523,13 @@ export class RunEngine {
               ["bootstrap CTO recovered", ...pin, runId],
             ),
         });
+      } else if (reviewHold) {
+        this.#releaseContinuityReviewHold(run, reviewHold, {
+          roleKey: renewed.roleKey,
+          sessionId: renewed.boundSessionId,
+          incarnation: renewed.boundSessionIncarnation,
+          generation: renewed.bindingGeneration,
+        }, { fromGeneration, toGeneration: renewed.bindingGeneration });
       } else {
         // The run's own hold stands; only who holds the run's authority changes.
         this.db.run(
@@ -1470,6 +1562,317 @@ export class RunEngine {
       });
       return allow(ReasonCode.OK, { run: this.require(runId), resumed: resumes });
     });
+  }
+
+  /**
+   * The other place continuity gives back the role its pause named: the daemon's reconcile, when the
+   * incumbent whose revocation the pause could not complete (a run at CEO review is a held run, so a
+   * coverage revocation of its owner is deferred) covers the role again. `binding` must be the role's
+   * active binding and exactly the run's pinned owner — role, session, incarnation and generation —
+   * and the run is released by the same rule and in the same shape as `restoreRecoveredBootstrapOwner`
+   * releases it. Being the pinned owner is not enough: a holder on another session or incarnation
+   * (a replacement, a switch, a failover) that is pinned to the run now is not the owner the pause took
+   * it from, and is answered `released: false` like any other wait that is not continuity's own.
+   */
+  releaseContinuityReviewHold(runId: string, binding: RoleBinding): Decision<{ run: RunRow; released: boolean }> {
+    return this.db.txDecision(() => {
+      const run = this.get(runId);
+      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+      if (
+        run.ownerRoleKey !== binding.roleKey ||
+        run.ownerSessionId !== binding.boundSessionId ||
+        run.ownerSessionIncarnation !== binding.boundSessionIncarnation ||
+        run.ownerBindingGeneration !== binding.bindingGeneration
+      ) {
+        return deny(ReasonCode.RUN_OWNER_REVOKED, "the run is not pinned to this binding", {
+          runId,
+          pinnedGeneration: run.ownerBindingGeneration,
+          generation: binding.bindingGeneration,
+        });
+      }
+      const current = this.db.get<{ assignment_id: string; binding_generation: number }>(
+        `SELECT assignment_id, binding_generation FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+        [binding.roleKey],
+      );
+      if (current?.assignment_id !== binding.assignmentId || current.binding_generation !== binding.bindingGeneration) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "the binding is no longer the role's active one", {
+          runId,
+          generation: binding.bindingGeneration,
+          currentGeneration: current?.binding_generation ?? null,
+        });
+      }
+      const hold = this.#continuityReviewHold(run, {
+        roleKey: binding.roleKey,
+        sessionId: binding.boundSessionId,
+        incarnation: binding.boundSessionIncarnation,
+        generation: binding.bindingGeneration,
+      });
+      if (!hold) return allow(ReasonCode.OK, { run, released: false });
+      this.#releaseContinuityReviewHold(run, hold, {
+        roleKey: binding.roleKey,
+        sessionId: binding.boundSessionId,
+        incarnation: binding.boundSessionIncarnation,
+        generation: binding.bindingGeneration,
+      }, { generation: binding.bindingGeneration });
+      return allow(ReasonCode.OK, { run: this.require(runId), released: true });
+    });
+  }
+
+  /**
+   * Continuity's own wait at CEO review: the pause `run` is in, when continuity alone placed it there
+   * for `owner`'s role, on `owner`'s session and incarnation, and nothing has moved since; null for
+   * every other wait. Reads only, and is asked inside the transaction that would release it.
+   *
+   * v44 has no column for this wait (`continuity_hold_role_key` exists only while BLOCKED), so the
+   * durable fact is the audit ledger, each row written in the transaction of the change it records:
+   *
+   *   - the run's latest RUN_TRANSITION is READY_FOR_CEO_REVIEW → AWAITING_HUMAN with continuityAction
+   *     PAUSE_NEW_WORK, and the one before it entered READY_FOR_CEO_REVIEW with the current candidate;
+   *   - the pause belongs to one loss episode (`#lossEpisode`): its own reconcile pass finished and
+   *     named the run, and in that pass exactly one revocation or deferral, of the owner's role, was
+   *     written for the loss the pause names. A pause whose pass never finished — the old daemon
+   *     committed the pause before it revoked anything — has no episode, so a later pass's revocation
+   *     cannot be borrowed for it;
+   *   - the owner the pause took the run from is `owner`'s role, session and incarnation. Since this
+   *     change the pause records it (`continuityHold`, its candidate and `CONTINUITY_PAUSE_OWNER_FIELDS`).
+   *     A row written before carries only a `roleKey`, which the audit log stores redacted, so it is
+   *     the episode's revocation that names the session and generation, checked against the run's pin
+   *     at the pause and the assignment of that generation (`#legacyPausedOwner`). The generation
+   *     moves on for the same session's renewal and is never compared for equality; an unrelated
+   *     holder on another session or incarnation never releases the wait, even when it is now pinned;
+   *   - no candidate was promoted or invalidated since the run entered review, no CEO or owner decision
+   *     was recorded since the pause, the candidate's PRODUCTION_READY_PACKET is current, and the human
+   *     gate is satisfied (`CeoReviewGate`).
+   *
+   * Anything missing, unparsable or ambiguous keeps the wait.
+   *
+   * Trust limit: every fact above is read from `audit_events`, which the daemon writes but v44 does not
+   * guard against a raw SQLite writer. A same-uid process that writes the database directly could forge
+   * a pause chain and have a wait handed back; the transition itself still needs daemon authority, and
+   * no schema-v44 column can carry this hold in its place.
+   */
+  #continuityReviewHold(run: RunRow, owner: ContinuityOwner): ContinuityReviewHold | null {
+    if (run.state !== RunState.AWAITING_HUMAN) return null;
+    const [pause, entered] = this.db.all<{ event_id: number; evidence_json: string }>(
+      `SELECT event_id, evidence_json FROM audit_events
+        WHERE kind = 'RUN_TRANSITION' AND run_id = ?
+        ORDER BY event_id DESC LIMIT 2`,
+      [run.runId],
+    );
+    if (!pause || !entered) return null;
+    const paused = auditEvidence(pause.evidence_json);
+    const review = auditEvidence(entered.evidence_json);
+    if (!paused || !review) return null;
+    if (paused["from"] !== RunState.READY_FOR_CEO_REVIEW || paused["to"] !== RunState.AWAITING_HUMAN) return null;
+    if (paused["continuityAction"] !== "PAUSE_NEW_WORK") return null;
+    if (review["to"] !== RunState.READY_FOR_CEO_REVIEW) return null;
+    const candidate = this.currentCandidate(run.runId);
+    if (candidate === null || review["candidateSnapshotDigest"] !== candidate) return null;
+    const recorded = "continuityHold" in paused;
+    if (recorded && (paused["continuityHold"] !== owner.roleKey || paused["candidateSnapshotDigest"] !== candidate)) {
+      return null;
+    }
+    const episode = this.#lossEpisode(run, pause.event_id, paused["reason"], owner.roleKey);
+    if (!episode) return null;
+    const pausedOwner = recorded ? recordedPauseOwner(paused) : this.#legacyPausedOwner(run, pause.event_id, episode);
+    if (!pausedOwner) return null;
+    // The episode's revocation took the role from the owner the pause names, and no other.
+    if (episode.sessionId !== pausedOwner.sessionId || episode.generation !== pausedOwner.generation) return null;
+    if (!this.#sameOwner(pausedOwner, owner)) return null;
+    const moved = this.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events
+        WHERE run_id = ?
+          AND ((kind IN ('CANDIDATE_PROMOTED', 'CANDIDATE_INVALIDATED') AND event_id > ?)
+            OR (kind IN ('CEO_DECISION', 'OWNER_DECISION') AND event_id > ?))`,
+      [run.runId, entered.event_id, pause.event_id],
+    );
+    if ((moved?.n ?? 1) !== 0) return null;
+    const packet = this.artifacts.latestForSnapshot<{ runId?: unknown; candidateSnapshotDigest?: unknown }>(
+      run.runId,
+      ArtifactKind.PRODUCTION_READY_PACKET,
+      candidate,
+    );
+    if (packet?.content.runId !== run.runId || packet.content.candidateSnapshotDigest !== candidate) return null;
+    if (this.#ceoReview?.humanGateStatus(run.runId).satisfied !== true) return null;
+    return { pauseEventId: pause.event_id, candidateSnapshotDigest: candidate };
+  }
+
+  /**
+   * The loss a pause answered, read from its own reconcile pass: the rows after the pause up to the
+   * first CONTINUITY_RECONCILED after it, the record the pass writes when it finishes.
+   *
+   *   (a) that CONTINUITY_RECONCILED exists, and (b) its `pausedRuns` names the run exactly once — a
+   *       pass that never finished, or a later one that paused nothing of this run, is no episode;
+   *   (c) the revocation's (BINDING_REVOKED) or deferral's (CONTINUITY_REVOKE_DEFERRED) reason is the
+   *       pause's own loss reason, and one of continuity's;
+   *   (d) it is the only such row in the window for any role whose loss pauses this run (the CEO, a
+   *       role of the run, of its project or of one of its tasks), and the only row of any reason for
+   *       `roleKey`: two candidates leave the pause's role ambiguous;
+   *   (e) it names the session and the generation it took the role from (`session_id`,
+   *       `evidence.generation`) — the caller checks those against the pause's owner.
+   */
+  #lossEpisode(run: RunRow, pauseEventId: number, lossReason: unknown, roleKey: string): ContinuityLossEpisode | null {
+    if (typeof lossReason !== "string" || !isContinuityRevocationReason(lossReason)) return null;
+    const closed = this.db.get<{ event_id: number; evidence_json: string }>(
+      `SELECT event_id, evidence_json FROM audit_events
+        WHERE kind = 'CONTINUITY_RECONCILED' AND event_id > ?
+        ORDER BY event_id LIMIT 1`,
+      [pauseEventId],
+    );
+    if (!closed) return null;
+    const pausedRuns = auditEvidence(closed.evidence_json)?.["pausedRuns"];
+    if (!Array.isArray(pausedRuns)) return null;
+    const named = pausedRuns.filter((entry: unknown) =>
+      typeof entry === "object" && entry !== null && (entry as Record<string, unknown>)["runId"] === run.runId,
+    );
+    if (named.length !== 1) return null;
+    const window = this.db.all<{ role_key: string | null; session_id: string | null; evidence_json: string }>(
+      `SELECT role_key, session_id, evidence_json FROM audit_events
+        WHERE event_id > ? AND event_id < ?
+          AND kind IN ('BINDING_REVOKED', 'CONTINUITY_REVOKE_DEFERRED')
+        ORDER BY event_id`,
+      [pauseEventId, closed.event_id],
+    );
+    const sameLoss = window.filter((row) =>
+      row.role_key !== null &&
+      this.#lossPauses(run, row.role_key) &&
+      auditEvidence(row.evidence_json)?.["reason"] === lossReason,
+    );
+    if (sameLoss.length !== 1) return null;
+    const [revocation] = sameLoss;
+    if (revocation?.role_key !== roleKey) return null;
+    if (window.filter((row) => row.role_key === roleKey).length !== 1) return null;
+    const generation = auditEvidence(revocation.evidence_json)?.["generation"];
+    if (revocation.session_id === null || typeof generation !== "number" || !Number.isInteger(generation)) return null;
+    return { sessionId: revocation.session_id, generation };
+  }
+
+  /** Whether the loss of `roleKey` pauses `run`, as the daemon's `pauseAffectedRuns` scopes it. */
+  #lossPauses(run: RunRow, roleKey: string): boolean {
+    if (roleKey === roleKeyFor(Role.CEO) || roleKey === run.ownerRoleKey) return true;
+    if (roleKey.endsWith(`:${run.runId}`)) return true;
+    if (run.projectId !== null && roleKey.endsWith(`:${run.projectId}`)) return true;
+    if (!roleKey.startsWith(`${Role.WORKER}:`)) return false;
+    const task = this.db.get<{ run_id: string }>(`SELECT run_id FROM tasks WHERE task_id = ?`, [
+      roleKey.slice(Role.WORKER.length + 1),
+    ]);
+    return task?.run_id === run.runId;
+  }
+
+  /**
+   * A legacy pause's owner, which its row does not record: the session and generation its episode's
+   * revocation took the role from, when that was the run's pin at the pause — the run's own session,
+   * and the generation the first owner renewal after the pause renewed from (or the current pin, with
+   * none) — and the incarnation the assignment of that generation was bound to. A takeover after the
+   * pause, or a renewal chain that does not end at the current pin, leaves the owner unknown.
+   */
+  #legacyPausedOwner(run: RunRow, pauseEventId: number, episode: ContinuityLossEpisode): Omit<ContinuityOwner, "roleKey"> | null {
+    if (run.ownerSessionId !== episode.sessionId || run.ownerRoleKey === null || run.ownerBindingGeneration === null) {
+      return null;
+    }
+    const repins = this.db.all<{ kind: string; evidence_json: string }>(
+      `SELECT kind, evidence_json FROM audit_events
+        WHERE run_id = ? AND event_id > ? AND kind IN ('RUN_OWNER_RENEWED', 'RECOVERY_TAKEOVER')
+        ORDER BY event_id`,
+      [run.runId, pauseEventId],
+    );
+    let pinned: number | null = null;
+    let next: number | null = null;
+    for (const repin of repins) {
+      if (repin.kind !== "RUN_OWNER_RENEWED") return null;
+      const renewal = auditEvidence(repin.evidence_json);
+      const from = renewal?.["fromGeneration"];
+      const to = renewal?.["toGeneration"];
+      if (typeof from !== "number" || typeof to !== "number") return null;
+      if (next !== null && from !== next) return null;
+      pinned ??= from;
+      next = to;
+    }
+    if (next !== null && next !== run.ownerBindingGeneration) return null;
+    const generation = pinned ?? run.ownerBindingGeneration;
+    const assignment = this.db.get<{ session_id: string; session_incarnation: string }>(
+      `SELECT session_id, session_incarnation FROM assignments WHERE role_key = ? AND binding_generation = ?`,
+      [run.ownerRoleKey, generation],
+    );
+    if (assignment?.session_id !== episode.sessionId) return null;
+    return { sessionId: assignment.session_id, incarnation: assignment.session_incarnation, generation };
+  }
+
+  /**
+   * The same owner across generations: the role is fixed by the caller, so the same session and the
+   * same incarnation — still that session's incarnation now — at the paused generation or a later one.
+   */
+  #sameOwner(paused: Omit<ContinuityOwner, "roleKey">, owner: ContinuityOwner): boolean {
+    if (owner.sessionId !== paused.sessionId || owner.incarnation !== paused.incarnation) return false;
+    if (owner.generation < paused.generation) return false;
+    const session = this.db.get<{ incarnation: string }>(`SELECT incarnation FROM sessions WHERE session_id = ?`, [
+      paused.sessionId,
+    ]);
+    return session?.incarnation === paused.incarnation;
+  }
+
+  /**
+   * Hands continuity's own wait back: AWAITING_HUMAN → ACTIVE → READY_FOR_CEO_REVIEW inside the caller's
+   * transaction, each edge under the run engine's transition authority with its own RUN_TRANSITION row,
+   * the owner pinned to `owner`. No envelope: nothing is dispatched, no candidate or packet is made, and
+   * the CEO is not notified again — the READY_FOR_CEO_REVIEW notification already sent names this same
+   * candidate and human gate, which is all its idempotency key is made of. Both edges are in §29's
+   * table, so a refusal is a broken invariant: it throws, and the caller's transaction rolls back.
+   */
+  #releaseContinuityReviewHold(
+    run: RunRow,
+    hold: ContinuityReviewHold,
+    owner: { roleKey: string; sessionId: string; incarnation: string; generation: number },
+    evidence: Record<string, unknown>,
+  ): void {
+    const release = {
+      reason: CONTINUITY_REVIEW_RELEASE_REASON,
+      continuityRelease: owner.roleKey,
+      pauseEventId: hold.pauseEventId,
+      candidateSnapshotDigest: hold.candidateSnapshotDigest,
+      ...evidence,
+    };
+    const edges: ReadonlyArray<{ from: RunState; to: RunState; sql: string; params: unknown[] }> = [
+      {
+        from: RunState.AWAITING_HUMAN,
+        to: RunState.ACTIVE,
+        sql: `UPDATE runs SET state = ?, state_reason = ?, continuity_hold_role_key = NULL,
+                              owner_session_id = ?, owner_binding_generation = ?,
+                              owner_session_incarnation = ?, owner_role_key = ?
+               WHERE run_id = ?`,
+        params: [
+          RunState.ACTIVE, CONTINUITY_REVIEW_RELEASE_REASON,
+          owner.sessionId, owner.generation, owner.incarnation, owner.roleKey, run.runId,
+        ],
+      },
+      {
+        from: RunState.ACTIVE,
+        to: RunState.READY_FOR_CEO_REVIEW,
+        sql: `UPDATE runs SET state = ?, state_reason = ? WHERE run_id = ?`,
+        params: [RunState.READY_FOR_CEO_REVIEW, CONTINUITY_REVIEW_RELEASE_REASON, run.runId],
+      },
+    ];
+    for (const edge of edges) {
+      const legal = canTransition(edge.from, edge.to, run.kind);
+      if (!legal.allowed) fail(legal.reasonCode, legal.message, legal.evidence);
+      this.db.applyRunStateTransition(this.#stateTransitions, {
+        runId: run.runId,
+        toState: edge.to,
+        recordTransitionEvidence: () => {
+          this.audit.record({
+            kind: "RUN_TRANSITION",
+            runId: run.runId,
+            projectId: run.projectId,
+            sessionId: owner.sessionId,
+            roleKey: owner.roleKey,
+            evidence: { from: edge.from, to: edge.to, ...release },
+          });
+          return allow(ReasonCode.OK, undefined);
+        },
+        enqueueTransitionEnvelope: () => allow(ReasonCode.OK, undefined),
+        updateState: () => this.db.run(edge.sql, edge.params),
+      });
+    }
   }
 }
 
