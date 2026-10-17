@@ -45,7 +45,7 @@ it("preserves the declared tool personality when an approved executable is a sym
 
 it("selects the approved daemon tool instead of the same-name candidate executable", async () => {
   const repository = temp();
-  const trusted = stableFixtureBinDir({ pnpm: "#!/bin/sh\necho trusted-tool\n" });
+  const trusted = realpathSync(stableFixtureBinDir({ pnpm: "#!/bin/sh\necho trusted-tool\n" }));
   stableFixtureLink(join(repository, "pnpm"), "#!/bin/sh\necho candidate-tool\n");
   const git = (args: string[]) => execFileSync("/usr/bin/git", ["-C", repository, ...args], {
     encoding: "utf8", timeout: 10000,
