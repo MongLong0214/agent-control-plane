@@ -37,6 +37,7 @@ import {
   observedRepositoryFacts,
   sameBootstrapPlanBinding,
 } from "./bootstrap-plan.ts";
+import { commitloreActivationGate } from "./commitlore-observation.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
 import { parseRepoFactoryResult } from "./repo-factory-result.ts";
 
@@ -61,17 +62,19 @@ export interface ACPBootstrapActivationResult {
 }
 
 /**
- * G0a — the Repo Factory producer installs no CommitLore hook and reads no CommitLore record, so a
- * manifest that asks for CommitLore activates with it named NOT_OBSERVED. `required` never gets this
- * far: `bootstrapPlanPreflight` refuses it before any GitHub call. `off` asks for nothing.
+ * G0a, #246 B3 — a manifest that asks for CommitLore and a producer result that carries no passing
+ * CommitLore verification at the published head activates with CommitLore named NOT_OBSERVED. Only
+ * `preferred` gets this far unobserved: `required` is refused by `commitloreActivationGate` before
+ * anything is written. `off` asks for nothing.
  */
 export interface ActivationWarning {
   commitlore: "NOT_OBSERVED";
   mode: "required" | "preferred";
 }
 
-const activationWarnings = (manifest: ProjectManifest | null): ActivationWarning[] => {
+const activationWarnings = (manifest: ProjectManifest | null, observed: boolean): ActivationWarning[] => {
   const mode = manifest?.commitlore.mode ?? null;
+  if (observed) return [];
   if (mode === "required" || mode === "preferred") return [{ commitlore: "NOT_OBSERVED", mode }];
   return [];
 };
@@ -229,6 +232,9 @@ export class BootstrapActivation {
     if (!current.allowed) return current as Decision<ACPBootstrapActivationResult>;
     const facts = observedRepositoryFacts(result, factsTargetOf(current.value.outputs));
     if (!facts.allowed) return facts as Decision<ACPBootstrapActivationResult>;
+    // #246 B3 — the approved manifest's CommitLore mode, enforced on this result at those facts' heads.
+    const commitlore = commitloreActivationGate(input.approvedManifest.commitlore.mode, result, facts.value);
+    if (!commitlore.allowed) return commitlore as Decision<ACPBootstrapActivationResult>;
 
     // Everything that can be refused is refused *before* the first mutation. Registering a
     // project, binding a primary CTO and then denying would leave a half-activated
@@ -374,7 +380,7 @@ export class BootstrapActivation {
       activity: project.activity,
       availability: project.availability,
       completedAt: this.clock.nowIso(),
-      warnings: activationWarnings(input.approvedManifest),
+      warnings: activationWarnings(input.approvedManifest, commitlore.value.observed),
     };
 
     // §26.3 — the factory result and doctor observation are retained for retry. Neither
@@ -634,6 +640,13 @@ export class BootstrapActivation {
     ]);
     const deliveredFacts = this.observedHandoffFacts(handoffArtifact.content.handoffId, delivered ? JSON.parse(delivered.package_json) : {});
     if (!deliveredFacts.allowed) return deliveredFacts as Decision<ACPBootstrapActivationResult>;
+    // #246 B3 — asked again of the stored result at the CONFIRM, under the manifest the project activated:
+    // a required CommitLore with no passing verification at the published head completes nothing.
+    const activeManifest = this.projects.activeManifest(projectId)?.manifest ?? null;
+    const resultFacts = observedRepositoryFacts(factory.content, factsTargetOf(plan.value.outputs));
+    if (!resultFacts.allowed) return resultFacts as Decision<ACPBootstrapActivationResult>;
+    const commitlore = commitloreActivationGate(activeManifest?.commitlore.mode ?? plan.value.manifest.commitlore.mode, factory.content, resultFacts.value);
+    if (!commitlore.allowed) return commitlore as Decision<ACPBootstrapActivationResult>;
     const target = plan.value.outputs.target;
     const ctoSession = primary ? this.sessions.get(primary.sessionId) : null;
     const handoffAck = this.acknowledgedActivationHandoff(
@@ -694,7 +707,7 @@ export class BootstrapActivation {
       availability: project?.availability ?? "UNAVAILABLE",
       completedAt: input.confirmedAt,
       // The manifest this bootstrap activated: the project's active one, which the bindings above match.
-      warnings: activationWarnings(this.projects.activeManifest(projectId)?.manifest ?? null),
+      warnings: activationWarnings(activeManifest, commitlore.value.observed),
     };
     const incomplete = this.incompleteness(activation, doctorArtifact.content.report);
     if (!activation.ceoConfirm) incomplete.push("ceoConfirm");

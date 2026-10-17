@@ -24,6 +24,7 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { ACPBootstrapActivationResult, BootstrapActivation } from "./activation.ts";
 import { type GroupMember, processGroupEmpty, processGroupMembership } from "./attempt-writer-group.ts";
 import { type BootstrapWriteRequest, runUnderWriteGuard } from "./bootstrap-write-guard.ts";
+import { type CommitLorePort, commitloreRequired, probeCommitLore } from "./commitlore-observation.ts";
 import {
   type OwnerApprovalAnchor,
   acceptApprovalAnchor,
@@ -351,6 +352,12 @@ export interface RepoFactoryBootstrapRunnerDeps {
   bindings: Pick<BindingRegistry, "active">;
   projects: Pick<ProjectRegistry, "get">;
   repositories: Pick<RepositoryRegistry, "byIdentity">;
+  /**
+   * #246 B3 — what observes CommitLore for a manifest that requires it. The production composition passes
+   * `createCommitLoreCliPort()`; tests pass a double. Absent, a manifest that requires CommitLore is
+   * refused before anything is consumed or written, and one that prefers it or turns it off is unaffected.
+   */
+  commitlore?: CommitLorePort | null;
 }
 
 type Stage = "precondition" | "approval" | "production" | "activation";
@@ -920,6 +927,8 @@ export class RepoFactoryBootstrapRunner {
     const outputs = planned.value;
     const operations = outputs.githubOperations;
     const executable = executablePlanOf(outputs, planArtifact.digest);
+    // #246 B3 — the approved manifest's CommitLore mode, as the PLAN carries it, and what observes it.
+    const commitlore = { mode: input.approvedManifest.commitlore.mode, port: this.deps.commitlore ?? null };
 
     // Readiness is asked about the candidate the CEO confirms: a passing review of that candidate,
     // bound to the run's current PLAN, manifest and planned outputs (#246 C2).
@@ -1142,6 +1151,17 @@ export class RepoFactoryBootstrapRunner {
     let pendingAtStart: ReadonlyMap<string, PendingWrite> = new Map();
     let exemptAtStart: ReadonlyMap<string, PendingWrite> = new Map();
     if (existing?.phase !== "WRITTEN") {
+      // #246 B3 — a manifest that requires CommitLore needs CommitLore observable on this host before the
+      // owner's approval is consumed or GitHub is read or written: no observer, or a probe that does not
+      // pass, refuses here, and a new run reserves nothing. The PLAN stays as approved; nothing lowers its
+      // mode. The observation the result reports is made again in the checkout, at the published head.
+      if (commitloreRequired(commitlore.mode)) {
+        const probed = await probeCommitLore(commitlore.port);
+        if (!probed.allowed) {
+          if (existing !== null) this.deps.applications.recordRefusal(runId, refusalRecord(probed, "precondition"));
+          return atStage(probed as Decision<ACPBootstrapActivationResult>, "precondition");
+        }
+      }
       if (existing !== null) {
         const ended = this.earlierAttemptsEnded(existing, workDir, executable.repositoryRole);
         if (!ended.allowed) {
@@ -1338,6 +1358,7 @@ export class RepoFactoryBootstrapRunner {
       github: { port: githubPort, authority },
       // The reviewed files, and the tree the producer reports must be exactly these (#246 C2).
       approvedFiles: outputs.files,
+      commitlore,
       persist: (result) => {
         const written = this.deps.db.txDecision(() => {
           this.deps.artifacts.put(runId, ArtifactKind.REPO_FACTORY_RESULT, result);

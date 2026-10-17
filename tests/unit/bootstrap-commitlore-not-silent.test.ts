@@ -8,9 +8,10 @@ import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
 /**
  * Issue #246 G0a (RF-018, RF-S20/RF-S21 on the ACP producer path) — the manifest's `commitlore.mode` is
- * never a silent PASS. This producer installs no CommitLore hook and observes no CommitLore record, so a
- * manifest that requires CommitLore is refused as unsupported before any GitHub call, one that prefers
- * it activates with the activation result naming it NOT_OBSERVED, and `off` activates as before.
+ * never a silent PASS. A manifest that requires CommitLore is planned as approved and, with nothing to
+ * observe CommitLore with, refused before any GitHub call (#246 B3 enforces it where it can be observed:
+ * `bootstrap-commitlore-mode.test.ts`); one that prefers it activates with the activation result naming
+ * it NOT_OBSERVED, and `off` activates as before.
  *
  * The plans are the push-mode bootstrap the producer already performs, so these witnesses isolate
  * CommitLore from every other change.
@@ -22,23 +23,19 @@ afterEach(() => vi.restoreAllMocks());
 const pushOperations = (): Operation[] => bootstrapOperations() as Operation[];
 
 describe("#246 G0a: CommitLore is never a silent PASS on the ACP producer path", () => {
-  it("G0a-1: a PLAN whose manifest requires CommitLore is refused as unsupported before any GitHub call, with zero writes", async () => {
+  it("G0a-1: a PLAN whose manifest requires CommitLore is planned as approved, and with no CommitLore observer refused before any GitHub call, with zero writes", async () => {
     const manifest = cleanTreeManifest("g0a-required", { commitlore: { mode: "required" } });
     const planned = plannedBootstrapOutputs(
       { runId: "run_g0a", planArtifact: { digest: "probe", content: bootstrapPlan(manifest, { operations: pushOperations() }) } },
       manifest,
     );
-    expect(planned, JSON.stringify(planned)).toMatchObject({
-      allowed: false,
-      reasonCode: ReasonCode.VERIFICATION_GAP,
-      evidence: { refusal: "UNSUPPORTED_VERIFICATION", commitloreMode: "required" },
-    });
+    expect(planned.allowed, JSON.stringify(planned)).toBe(true);
     const prepared = await prepareBootstrapRun("g0a-required", { manifest, ops: pushOperations() });
     const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: ownerApprovalFor(prepared) });
     expect(refused, JSON.stringify(refused)).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.VERIFICATION_GAP,
-      evidence: { stage: "precondition", refusal: "UNSUPPORTED_VERIFICATION", commitloreMode: "required" },
+      evidence: { stage: "precondition", refusal: "COMMITLORE_REQUIRED_UNOBSERVABLE", commitloreMode: "required" },
     });
     noGitHubCall(prepared);
   });

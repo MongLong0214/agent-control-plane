@@ -266,14 +266,11 @@ export const bootstrapPlanPreflight = (input: {
       ciWorkflows: manifest.ciWorkflows.map((workflow) => workflow.checkName),
     });
   }
-  // G0a (RF-018) — the same for CommitLore: this producer installs no CommitLore hook and observes no
-  // record, so a manifest that requires it would activate with the requirement silently unmet.
-  // `preferred` activates, with the activation result naming CommitLore as not observed.
-  if (manifest.commitlore.mode === "required") {
-    return unsupported("the manifest requires CommitLore, and this producer neither installs it nor observes any record", {
-      commitloreMode: manifest.commitlore.mode,
-    });
-  }
+  // #246 B3 (G0a, RF-018) — CommitLore is not refused here. A manifest that requires it is planned as
+  // approved and enforced where it can be observed: the runner refuses before anything is consumed or
+  // written when CommitLore cannot be observed on this host, the producer verifies it in the checkout at
+  // the published head, and activation refuses a result that does not carry that verification
+  // (`commitlore-observation.ts`). `preferred` activates named NOT_OBSERVED; `off` asks for nothing.
   const command = manifest.verificationCommands[0];
   if (manifest.verificationCommands.length !== 1) {
     return unsupported("this producer runs exactly one verification, and the manifest requires a different count", {
@@ -837,7 +834,8 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
       producerAccepts: [
         "exactly one repository { role, remote }, whose remote is the repository the first operation creates",
         `exactly one verification command, argv ${cleanTreeArgv}, cwd ".", in that repository's role, evidenceMode LOCAL_COMMAND, named by every verification profile`,
-        "no ciWorkflows, and a commitlore.mode other than \"required\"",
+        "no ciWorkflows",
+        "commitlore.mode \"required\" only where this deployment can run CommitLore: the producer runs commitlore init and commitlore doctor --json in the checkout at the head it publishes, and refuses without a passing report; \"preferred\" is not observed and activates named NOT_OBSERVED; \"off\" asks for nothing",
         "branchProfile.defaultBranch is one of branchProfile.longLived",
         "portable: no absolute or home paths, and no secret, token or session identifier anywhere",
       ],

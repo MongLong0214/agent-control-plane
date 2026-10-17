@@ -68,6 +68,7 @@ import { RepairService } from "../doctor/repair.ts";
 import { BootstrapActivation } from "../bootstrap/activation.ts";
 import type { GitHubWritePort } from "../bootstrap/github-write-port.ts";
 import { createBootstrapGitHubWritePort } from "../bootstrap/bootstrap-write-guard.ts";
+import { type CommitLorePort, createCommitLoreCliPort } from "../bootstrap/commitlore-observation.ts";
 import { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { Daemon, type DaemonOptions } from "../daemon/daemon.ts";
@@ -162,9 +163,10 @@ export interface ControlPlaneConfig {
    * Issue #246 — where a PROJECT_BOOTSTRAP run's Repo Factory producer may write its local
    * checkout and GitHub receipt ledger (`<workRoot>/<runId>`). `defaultConfig()` supplies one
    * under the state root; a value given here wins. Absent, the producer refuses every run before
-   * any GitHub call. `githubPort` replaces the production `gh` port in tests.
+   * any GitHub call. `githubPort` replaces the production `gh` port in tests; `commitlore` replaces
+   * the production `commitlore` CLI port that observes a manifest's required CommitLore (#246 B3).
    */
-  repoFactory?: { workRoot: string; githubPort?: GitHubWritePort };
+  repoFactory?: { workRoot: string; githubPort?: GitHubWritePort; commitlore?: CommitLorePort };
 }
 
 export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): ControlPlaneConfig => ({
@@ -770,6 +772,8 @@ export class ControlPlane {
         bindings: this.bindings,
         projects: this.projects,
         repositories: this.repositories,
+        // #246 B3 — runs only for a manifest whose CommitLore mode is required.
+        commitlore: config.repoFactory?.commitlore ?? createCommitLoreCliPort(),
       });
       // The GitHub kernel binds the production gate's single human-gate predicate to its
       // payload. It never reinterprets APPROVAL artifacts or ingress receipts itself.

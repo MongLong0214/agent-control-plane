@@ -17,6 +17,13 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { git, tryRevParse, type GitResult } from "../git/git.ts";
 import { consumeWithheldExemption, readWithheldIntent, withheldUnsent } from "./bootstrap-approval-anchor.ts";
+import {
+  COMMITLORE_VERIFICATION_ID,
+  type CommitLoreMode,
+  type CommitLorePort,
+  commitloreRequired,
+  requiredCommitLoreObservation,
+} from "./commitlore-observation.ts";
 import { withinBootstrapAttempt } from "./bootstrap-write-guard.ts";
 import type { GitHubWritePort } from "./github-write-port.ts";
 import {
@@ -244,6 +251,16 @@ export interface RepoFactoryProducerInput {
    * A throw stops the producer before that ledger write, and before anything it would have sent.
    */
   beforeLedgerWrite?: (state: { receipts: readonly GitHubOperationReceipt[]; pending: readonly PendingWrite[] }) => void;
+  /**
+   * #246 B3 — the approved manifest's CommitLore mode, and the port that observes it. A `required` mode
+   * (or any value the manifest contract does not define) is verified in the checkout at the head this
+   * call publishes — `commitlore init` and `commitlore doctor --json`, after every GitHub write, so no
+   * hook it installs runs in the push — and reported as a `commitlore:doctor` verification row; without
+   * a port, or without a passing observation, nothing is reported. `preferred` and `off` are not
+   * observed. Omitted, the mode is not observed either, and activation refuses a required manifest
+   * whose result carries no row.
+   */
+  commitlore?: { mode: CommitLoreMode; port: CommitLorePort | null };
 }
 
 /** The blob id git gives `content`, in the object format the repository's own ids use. */
@@ -782,6 +799,13 @@ export const produceRepoFactoryResult = async (
   }
   const approvedFiles = parsedFiles.data;
 
+  // #246 B3 — a required CommitLore with nothing to observe it is refused before any local or GitHub write.
+  const commitloreObservedHere = input.commitlore !== undefined && commitloreRequired(input.commitlore.mode);
+  if (commitloreObservedHere && input.commitlore?.port === null) {
+    const unobservable = await requiredCommitLoreObservation(null, "", { at: "precondition" });
+    return unobservable as Decision<RepoFactoryResult>;
+  }
+
   if (plan.githubOperations.length > 0 && input.github === undefined) {
     return deny(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
@@ -1068,6 +1092,26 @@ export const produceRepoFactoryResult = async (
     return drift as Decision<RepoFactoryResult>;
   }
 
+  // #246 B3 — a required CommitLore is observed here, in this checkout at the head this run reports, and
+  // only after every GitHub write: `init` installs hooks, and a pre-push hook must not run inside the
+  // approved push. The bootstrap commit carries no decision record and is not given one: its diff is the
+  // reviewed PLAN's files (CommitLore's own policy: most commits carry none). Not passing refuses here.
+  let commitloreRow: RepoFactoryResult["bootstrapVerification"][number] | null = null;
+  if (commitloreObservedHere) {
+    let observed: Decision<unknown>;
+    try {
+      observed = await requiredCommitLoreObservation(input.commitlore?.port ?? null, localRepoPath, { at: "head", head });
+    } catch (thrown) {
+      cleanup();
+      throw thrown;
+    }
+    if (!observed.allowed) {
+      cleanup();
+      return observed as Decision<RepoFactoryResult>;
+    }
+    commitloreRow = { commandId: COMMITLORE_VERIFICATION_ID, repositoryIdentity: "", exactHead: head, status: "PASS" };
+  }
+
   // The real verification kind this run promises `bootstrapVerification` about. A judge
   // that denies is a genuine observation, not a fabricated one, and it must refuse rather
   // than record PASS regardless.
@@ -1148,6 +1192,7 @@ export const produceRepoFactoryResult = async (
         exactHead: head,
         status: "PASS",
       },
+      ...(commitloreRow === null ? [] : [{ ...commitloreRow, repositoryIdentity: identity }]),
     ],
     ciEvidence: [],
     unresolvedGaps: [],
