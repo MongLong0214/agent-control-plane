@@ -139,6 +139,26 @@ export const containedWorkdir = (reported: string | null | undefined, managedRoo
  */
 export const BOOTSTRAP_CTO_SPAWN_RECORD = "BOOTSTRAP_CTO_SESSION_SPAWNED";
 
+/** The audit kind a bootstrap activation's replacement of an undeliverable PRIMARY_CTO writes with its switch. */
+export const PRIMARY_CTO_UNDELIVERABLE_REPLACED = "PRIMARY_CTO_UNDELIVERABLE_REPLACED";
+
+/**
+ * #246 C4 — an interactive PRIMARY_CTO that a bootstrap activation's handoff could not reach, which the
+ * activation's retry replaces with a driven one (`ensureDrivenPrimaryCto`). The activation decides that
+ * it is undeliverable; the replacement asks that again, synchronously, inside the transaction that
+ * revokes it and binds the driven session, after every await of the spawn.
+ */
+export interface UndeliverablePrimaryCto {
+  /** The binding read when the replacement was decided: refused if the role has moved since. */
+  readonly binding: RoleBinding;
+  /** Recorded as the revoked assignment's reason and with the replacement's audit. */
+  readonly reason: string;
+  /** Whether the binding is still undeliverable, asked inside the replacing transaction. */
+  readonly stillUndeliverable: () => boolean;
+  /** What the decision rested on, recorded with the replacement. */
+  readonly evidence: Readonly<Record<string, unknown>>;
+}
+
 /** #246 C1-R1 — one project's switchover a canonical CTO was left in, withdrawn. */
 export interface CanonicalSwitchoverWithdrawal {
   projectId: string;
@@ -234,8 +254,18 @@ export class CtoLifecycle {
    *
    * A door of its own rather than the run's kind read inside `ensurePrimaryCto`: the caller states
    * that it is an activation, and the activation switches to this door together with its fixtures.
+   *
+   * With `replacing`, the existing binding is not answered: it is an interactive PRIMARY_CTO the
+   * activation's handoff could not reach, and a driven session takes the role from it. The spawn is
+   * the same; the bind is a switch that revokes that exact binding, with its reason, and binds the
+   * driven session in one transaction, only while it is still undeliverable. Anything else is refused
+   * before anything is spawned: a driven, contradicted or canonical holder, or a binding that moved.
    */
-  async ensureDrivenPrimaryCto(projectId: string, bootstrapRunId: string): Promise<Decision<RoleBinding>> {
+  async ensureDrivenPrimaryCto(
+    projectId: string,
+    bootstrapRunId: string,
+    replacing?: UndeliverablePrimaryCto,
+  ): Promise<Decision<RoleBinding>> {
     const run = this.runs.get(bootstrapRunId);
     if (run?.kind !== RunKind.PROJECT_BOOTSTRAP) {
       return deny(ReasonCode.INVALID_ARGUMENT, "only a bootstrap activation provisions a driven primary CTO", {
@@ -244,13 +274,59 @@ export class CtoLifecycle {
         kind: run?.kind ?? null,
       });
     }
-    return this.#ensurePrimaryCto(projectId, bootstrapRunId, true);
+    return this.#ensurePrimaryCto(projectId, bootstrapRunId, true, replacing);
   }
 
-  async #ensurePrimaryCto(projectId: string, runId: string, driven: boolean): Promise<Decision<RoleBinding>> {
+  /**
+   * #246 C4 — why `replacing` may not be replaced now, or null when it may: it is still the role's
+   * active binding (same assignment, session, incarnation and generation), held interactively by
+   * no canonical CTO, and its caller still finds it undeliverable. Asked before the spawn and again
+   * inside the transaction that switches the role.
+   */
+  #replacementRefusal(projectId: string, roleKey: string, replacing: UndeliverablePrimaryCto): Decision<RoleBinding> | null {
+    const current = this.bindings.active(roleKey);
+    const expected = replacing.binding;
+    const refuse = (message: string, evidence: Record<string, unknown>): Decision<RoleBinding> =>
+      deny(ReasonCode.CONFLICT, message, {
+        refusal: "UNDELIVERABLE_REPLACEMENT_REFUSED",
+        projectId,
+        expectedSession: expected.sessionId,
+        expectedGeneration: expected.bindingGeneration,
+        ...evidence,
+      });
+    if (
+      !current ||
+      current.assignmentId !== expected.assignmentId ||
+      current.sessionId !== expected.sessionId ||
+      current.sessionIncarnation !== expected.sessionIncarnation ||
+      current.bindingGeneration !== expected.bindingGeneration
+    ) {
+      return refuse("the PRIMARY_CTO binding moved since it was found undeliverable", {
+        currentSession: current?.sessionId ?? null,
+        currentGeneration: current?.bindingGeneration ?? null,
+      });
+    }
+    const mode = this.#drivenMode(current.sessionId);
+    if (mode !== "NONE") return refuse("only an interactive PRIMARY_CTO is replaced as undeliverable", { drivenMode: mode });
+    if (this.#canonicalHolderOf(projectId, roleKey, current)) {
+      return refuse("a canonical PRIMARY_CTO is never replaced as undeliverable", { canonical: true });
+    }
+    if (!replacing.stillUndeliverable()) return refuse("the PRIMARY_CTO is no longer undeliverable", {});
+    return null;
+  }
+
+  async #ensurePrimaryCto(
+    projectId: string,
+    runId: string,
+    driven: boolean,
+    replacing?: UndeliverablePrimaryCto,
+  ): Promise<Decision<RoleBinding>> {
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
     const existing = this.bindings.active(roleKey);
-    if (existing) {
+    if (replacing) {
+      const refused = this.#replacementRefusal(projectId, roleKey, replacing);
+      if (refused) return refused;
+    } else if (existing) {
       const session = this.sessions.get(existing.sessionId);
       // #246 C4 — a driven session is asked by an authenticated attestation turn that resumes its
       // conversation, never by opening its id again, and is never replaced by another session. A
@@ -311,17 +387,20 @@ export class CtoLifecycle {
       if (this.#releasedCanonicalHolder(projectId, roleKey)) {
         return deny<RoleBinding>(ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM, "the role became canonical during provisioning", { projectId });
       }
-      const binding = this.bindings.bind({ roleKey, role: Role.PRIMARY_CTO, sessionId: created.value, projectId, mode: "PREFERRED" });
-      // #246 C4 — the binding just granted must be the creation its spawn record names (project, role
-      // key, session, generation); otherwise the whole bind rolls back and the session is not used.
-      if (binding.allowed && driven && this.#drivenMode(created.value) !== "DRIVEN") {
-        return deny<RoleBinding>(ReasonCode.CONFLICT, "the driven primary CTO's spawn record does not name the binding granted to it", {
-          projectId,
-          sessionId: created.value,
-          bindingGeneration: binding.value.bindingGeneration,
-        });
+      if (!replacing) {
+        const binding = this.bindings.bind({ roleKey, role: Role.PRIMARY_CTO, sessionId: created.value, projectId, mode: "PREFERRED" });
+        // #246 C4 — the binding just granted must be the creation its spawn record names (project, role
+        // key, session, generation); otherwise the whole bind rolls back and the session is not used.
+        if (binding.allowed && driven && this.#drivenMode(created.value) !== "DRIVEN") {
+          return deny<RoleBinding>(ReasonCode.CONFLICT, "the driven primary CTO's spawn record does not name the binding granted to it", {
+            projectId,
+            sessionId: created.value,
+            bindingGeneration: binding.value.bindingGeneration,
+          });
+        }
+        return binding;
       }
-      return binding;
+      return this.#switchFromUndeliverable(projectId, roleKey, runId, created.value, replacing);
     });
     if (!bound.allowed && bound.reasonCode === ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM) {
       const claimed = this.#releasedCanonicalHolder(projectId, roleKey);
@@ -346,7 +425,61 @@ export class CtoLifecycle {
         ...(driven ? { driven: true } : {}),
       },
     });
+    // The replaced session holds nothing now; the provider is asked to stop it, as an unused one is.
+    if (replacing) await this.stopUnusedSession(replacing.binding.sessionId, replacing.reason);
     return bound;
+  }
+
+  /**
+   * #246 C4 — inside the bind transaction: the undeliverable binding is asked again, then revoked with
+   * its reason and the driven session bound in its place by one switch, which is refused unless the
+   * role's current binding is still that exact assignment. As for a bind, the switch must have granted
+   * the creation the spawn record names, or the whole switch rolls back. The replacement is recorded
+   * with it, last, so nothing after that record refuses.
+   */
+  #switchFromUndeliverable(
+    projectId: string,
+    roleKey: string,
+    runId: string,
+    sessionId: string,
+    replacing: UndeliverablePrimaryCto,
+  ): Decision<RoleBinding> {
+    const refused = this.#replacementRefusal(projectId, roleKey, replacing);
+    if (refused) return refused;
+    const from = replacing.binding;
+    const switched = this.bindings.switchTo({
+      roleKey,
+      role: Role.PRIMARY_CTO,
+      sessionId,
+      projectId,
+      mode: "PREFERRED",
+      reason: replacing.reason,
+      conversation: "REPLACED",
+      expectedCurrent: { assignmentId: from.assignmentId, sessionId: from.sessionId, sessionIncarnation: from.sessionIncarnation },
+    });
+    if (!switched.allowed) return switched;
+    if (this.#drivenMode(sessionId) !== "DRIVEN") {
+      return deny<RoleBinding>(ReasonCode.CONFLICT, "the driven primary CTO's spawn record does not name the binding granted to it", {
+        projectId,
+        sessionId,
+        bindingGeneration: switched.value.bindingGeneration,
+      });
+    }
+    this.audit.record({
+      kind: PRIMARY_CTO_UNDELIVERABLE_REPLACED,
+      projectId,
+      runId,
+      sessionId,
+      roleKey,
+      evidence: {
+        ...replacing.evidence,
+        reason: replacing.reason,
+        fromSession: from.sessionId,
+        fromGeneration: from.bindingGeneration,
+        toGeneration: switched.value.bindingGeneration,
+      },
+    });
+    return switched;
   }
 
   /**

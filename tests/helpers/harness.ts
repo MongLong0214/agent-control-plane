@@ -306,9 +306,10 @@ export const makeStartedOperator = async (options: {
 const BOOTSTRAP_CTO_DOUBLES = new WeakMap<ControlPlane, HeadlessRuntimeDouble>();
 
 /**
- * Issue #246 — the Claude double a run's BOOTSTRAP_CTO is staffed on, registered for that role
- * alone: the bootstrap CTO's provider is fixed to Claude (Opus), so a fixture supplies a Claude
- * adapter rather than pointing staffing at the scripted one. Registered once per control plane.
+ * Issue #246 — the Claude double a run's BOOTSTRAP_CTO is staffed on, registered for that role and,
+ * since C4, for the PRIMARY_CTO its activation provisions driven on the same runtime: both are fixed
+ * to Claude (Opus), so a fixture supplies a Claude adapter rather than pointing staffing at the
+ * scripted one. An interactive PRIMARY_CTO keeps the CTO preference. Registered once per control plane.
  *
  * C1b: a bootstrap CTO runs on the headless runtime, whose readiness is an authenticated
  * attestation. A fixture with no sockets gets the in-process form of that runtime's two transports
@@ -324,6 +325,7 @@ export const bootstrapCtoProvider = (cp: ControlPlane, clock: Clock): HeadlessRu
     attest: (peer, nonce) => cp.sessionAttestations.attest(peer, nonce),
   });
   cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
+  cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
   cp.sessionRuntime.attach({
     delivery: launch,
     route: { launchSocketPath: "in-process:launch", mcpSocketPath: "in-process:cto" },
