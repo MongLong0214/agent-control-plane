@@ -1717,12 +1717,11 @@ export class GitHubKernel {
       });
     }
 
-    // What the merge commit will say, decided here rather than left to GitHub. Read before the
-    // reservation so a branch whose commits cannot be listed fails with nothing reserved: the
-    // fallback for an unreadable branch is GitHub's own composition, which is the leak this
-    // states the message to avoid. Only for `squash` — see `outgoingSquashCommitMessage`.
-    const outgoingCommitMessage =
-      method === "squash" ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber, preflight) : undefined;
+    // What the merge commit will say, decided here before the reservation: a branch whose commits
+    // cannot be listed fails with nothing reserved, as GitHub's own composition is the leak this avoids.
+    // Squash only (`outgoingSquashCommitMessage`). Its Merged-Head is the `sha` the PUT below sends.
+    const outgoingCommitMessage = method === "squash"
+      ? await this.outgoingSquashCommitMessage(owner, repo, input.pullNumber, preflight, input.exactHeadSha) : undefined;
 
     const target = this.writeTarget(input.runId, input.repositoryIdentity, preflight.head.ref);
     if (!target.allowed) return target as Decision<{ mergeCommitSha: string; replayed: boolean }>;
@@ -1921,6 +1920,7 @@ export class GitHubKernel {
     repo: string,
     pullNumber: number,
     pull: PullRequest,
+    mergedHead: string,
   ): Promise<{ title: string; message: string }> {
     const expectedCount = pull.commits;
     if (typeof expectedCount !== "number" || !Number.isSafeInteger(expectedCount) || expectedCount < 1) {
@@ -1968,7 +1968,7 @@ export class GitHubKernel {
     }
     return {
       title: composeSquashCommitTitle(commits, pull.title, pullNumber),
-      message: composeSquashCommitMessage(commits),
+      message: composeSquashCommitMessage(commits, mergedHead),
     };
   }
 

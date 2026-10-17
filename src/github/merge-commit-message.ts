@@ -150,14 +150,39 @@ export const withoutSessionMetadata = (message: string): string => {
     .replace(/\s+$/, "");
 };
 
+/** A full commit sha, the only `Merged-Head` value `verify-merge-preserved-records.mjs` accepts. */
+const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+
+/** Any line declaring the key, in any case or spacing: the gate counts each against "exactly one". */
+const DECLARES_MERGED_HEAD = /^\s*merged-head\s*:/iu;
+
 /**
  * The message the daemon puts on the wire for a squash.
  *
  * Composed rather than delegated so that what reaches `main` is a statement this process made and
  * can be tested, instead of whatever GitHub assembles from a branch nobody re-read.
+ *
+ * It opens with `Merged-Head: <mergedHead>` as its own paragraph, the placement `scripts/merge-pr.mjs`
+ * uses: `main`'s push CI (`pnpm merge-records`) reads a squash's branch up to that one line and
+ * refuses a squash without it as unverifiable. First rather than last, because git parses only the
+ * last paragraph as the trailer block, so the records stored there are the branch's, as before.
+ *
+ * `mergedHead` is the sha the merge PUT fences on. It must be the head the squashed commits end at,
+ * and no branch message may already declare the key — either would publish a head the gate cannot
+ * verify, so both throw before anything is reserved or sent.
  */
-export const composeSquashCommitMessage = (commits: readonly BranchCommitMessage[]): string =>
-  withoutSessionMetadata(githubSquashCommitMessage(commits));
+export const composeSquashCommitMessage = (commits: readonly BranchCommitMessage[], mergedHead: string): string => {
+  if (!FULL_SHA.test(mergedHead)) throw new Error("the Merged-Head to record is not one full commit sha");
+  if (commits.at(-1)?.sha !== mergedHead) {
+    throw new Error("the squashed commits do not end at the head this merge would record as its Merged-Head");
+  }
+  const body = withoutSessionMetadata(githubSquashCommitMessage(commits));
+  if (body.split("\n").some((line) => DECLARES_MERGED_HEAD.test(line))) {
+    throw new Error("a branch commit message already declares a Merged-Head, so the squash would name more than one");
+  }
+  const line = `Merged-Head: ${mergedHead}`;
+  return body === "" ? line : `${line}\n\n${body}`;
+};
 
 /** COMMIT_OR_PR_TITLE, including GitHub's PR suffix, sanitized before it reaches the PUT. */
 export const composeSquashCommitTitle = (

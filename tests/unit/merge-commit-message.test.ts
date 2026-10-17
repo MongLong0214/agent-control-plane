@@ -1,3 +1,6 @@
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -92,13 +95,16 @@ describe("the composed message reproduces what GitHub would have written", () =>
     );
   });
 
-  it("leaves a branch that carries no metadata byte-identical to GitHub's own composition", () => {
-    // The composition only earns its risk if it is inert when there is nothing to remove.
+  it("leaves a branch that carries no metadata byte-identical to GitHub's own composition, after its Merged-Head", () => {
+    // The composition only earns its risk if it is inert when there is nothing to remove. The one
+    // paragraph it adds is the head it was merged from, ahead of everything GitHub would have written.
     const commits = [
       { sha: "4".repeat(40), message: "feat: a thing\n\nwhy the thing.\n\nLimit: a stated limit\n" },
       { sha: "5".repeat(40), message: "test: cover the thing\n\nRecord-Id: r-aaaabbbbcccc\n" },
     ];
-    expect(composeSquashCommitMessage(commits)).toBe(githubSquashCommitMessage(commits));
+    expect(composeSquashCommitMessage(commits, "5".repeat(40))).toBe(
+      `Merged-Head: ${"5".repeat(40)}\n\n${githubSquashCommitMessage(commits)}`,
+    );
   });
 });
 
@@ -201,7 +207,7 @@ describe("every record line GitHub would have carried survives the composition",
     // list, and preservation stated in its terms can only be as complete as the list is. A line
     // GitHub would have carried is either present or it is session metadata — nothing else.
     const baseline = githubSquashCommitMessage(branch);
-    const composed = composeSquashCommitMessage(branch);
+    const composed = composeSquashCommitMessage(branch, branch.at(-1)!.sha);
     const survivors = new Set(composed.split("\n").map((line) => line.trim()));
 
     const lost = baseline
@@ -213,7 +219,7 @@ describe("every record line GitHub would have carried survives the composition",
   });
 
   it("carries every record line of a multi-commit branch, named rather than counted", () => {
-    const composed = composeSquashCommitMessage(branch);
+    const composed = composeSquashCommitMessage(branch, branch.at(-1)!.sha);
     expect(recordLines(composed)).toEqual(recordLines(githubSquashCommitMessage(branch)));
     expect(recordLines(composed)).toEqual([
       "Limit: the first commit's record",
@@ -309,7 +315,7 @@ describe("one message, both halves, with the record lines in the order the branc
   const recordSequence = (message: string): string[] =>
     message.split("\n").filter((line) => /^(Warn|Limit|Ruled-out|Record-Id|Provenance):/.test(line));
 
-  const composed = composeSquashCommitMessage(branch);
+  const composed = composeSquashCommitMessage(branch, branch.at(-1)!.sha);
   const baseline = githubSquashCommitMessage(branch);
 
   it("has a fixture that can actually catch a sort and a de-duplication", () => {
@@ -408,16 +414,87 @@ describe("the record blocks the SPEC recognises survive the composition", () => 
 
   it("recognises the same record blocks, by the same identities, before and after", () => {
     const baseline = githubSquashCommitMessage(branch);
-    const composed = composeSquashCommitMessage(branch);
+    const composed = composeSquashCommitMessage(branch, branch.at(-1)!.sha);
     // The fixture is only meaningful if the baseline had blocks to lose.
     expect(recordBlockIds(baseline)).toEqual(["Record-Id: r-444444444444", "Record-Id: r-555555555555"]);
     expect(recordBlockIds(composed)).toEqual(recordBlockIds(baseline));
   });
 
   it("keeps the separator SPEC §3.1 marks REQUIRED inside a Ruled-out value", () => {
-    const composed = composeSquashCommitMessage(branch);
+    const composed = composeSquashCommitMessage(branch, branch.at(-1)!.sha);
     const ruledOut = composed.split("\n").filter((line) => line.startsWith("Ruled-out: "));
     expect(ruledOut).toEqual(["Ruled-out: the other approach | it hides the exit status"]);
     expect(ruledOut[0]!.slice("Ruled-out: ".length).includes(" | ")).toBe(true);
+  });
+});
+
+/**
+ * The squash names the head it was merged from (S9, blocks #512).
+ *
+ * `main`'s push CI runs `pnpm merge-records HEAD~1..HEAD`, which reads a squash's branch up to the
+ * one `Merged-Head: <full sha>` line its message carries and refuses a squash without it as
+ * unverifiable. `scripts/merge-pr.mjs` already writes that line, as its own paragraph straight after
+ * the subject; the daemon's composer wrote none, so the first squash it finalized would turn `main`
+ * red. These read the composed message with the gate's own reader, `mergedHeadIn`, rather than with
+ * a restatement of it.
+ */
+describe("the composed message names the head it was merged from, once", () => {
+  const HEAD = "f".repeat(40);
+  const branch = [
+    {
+      sha: "e".repeat(40),
+      message: "feat: the first change\n\nwhy.\n\nLimit: the first commit's record\nRecord-Id: r-666666666666\n",
+    },
+    {
+      sha: HEAD,
+      message: `fix: the second change\n\nwhy.\n\nWarn: the second commit's record\nRecord-Id: r-777777777777\nX-Claude-Session: ${SESSION_URL}\n`,
+    },
+  ];
+
+  type GateReader = { mergedHeadIn: (message: string, what: string) => string };
+  const gate = async (): Promise<GateReader> =>
+    (await import(pathToFileURL(join(process.cwd(), "scripts", "verify-merge-preserved-records.mjs")).href)) as GateReader;
+
+  /** Trailers git stores for the squash as committed: the title, a blank line, then this body. */
+  const storedTrailers = (body: string): string[] => parsedTrailers(`title (#100)\n\n${body}\n`);
+
+  it("opens with one Merged-Head paragraph the gate reads back as the merged head, leaving the parsed trailer block as it was", async () => {
+    const composed = composeSquashCommitMessage(branch, HEAD);
+    expect(composed.split("\n").filter((line) => /merged-head/iu.test(line))).toEqual([`Merged-Head: ${HEAD}`]);
+    expect(composed.startsWith(`Merged-Head: ${HEAD}\n\n`)).toBe(true);
+    expect((await gate()).mergedHeadIn(composed, "the composed message")).toBe(HEAD);
+
+    // git parses only the last paragraph; the line sits first, so the block git stores is the one
+    // the composition without it stores, and the records it carries are the branch's.
+    const withoutLine = withoutSessionMetadata(githubSquashCommitMessage(branch));
+    expect(storedTrailers(composed)).toEqual(storedTrailers(withoutLine));
+    expect(storedTrailers(composed)).toEqual(["Warn: the second commit's record", "Record-Id: r-777777777777"]);
+    expect(recordLines(composed)).toEqual(recordLines(githubSquashCommitMessage(branch)));
+  });
+
+  it("is the Merged-Head line alone when the only commit has no body", async () => {
+    const composed = composeSquashCommitMessage([{ sha: HEAD, message: "chore: a subject and nothing else\n" }], HEAD);
+    expect(composed).toBe(`Merged-Head: ${HEAD}`);
+    expect((await gate()).mergedHeadIn(composed, "the composed message")).toBe(HEAD);
+  });
+
+  it.each([
+    ["a head the squashed commits do not end at", "e".repeat(40)],
+    ["an abbreviated head", HEAD.slice(0, 12)],
+    ["an upper-case head", HEAD.toUpperCase()],
+  ])("refuses to name %s, so no message naming a stale head exists", (_, head) => {
+    expect(() => composeSquashCommitMessage(branch, head)).toThrow(/Merged-Head/);
+  });
+
+  it.each([
+    ["the key as merge-pr writes it", `Merged-Head: ${"1".repeat(40)}`],
+    ["the key in another case and spacing", `  merged-head :${HEAD}`],
+  ])("refuses a branch whose messages already declare a Merged-Head (%s), which the gate would read as two", async (_, line) => {
+    const carrying = [branch[0]!, { sha: HEAD, message: `fix: quotes a squash\n\n${line}\n` }];
+    expect(() => composeSquashCommitMessage(carrying, HEAD)).toThrow(/Merged-Head/);
+    // Why it refuses: prefixed anyway, the gate's own reader refuses the result for good.
+    const prefixed = `Merged-Head: ${HEAD}\n\n${githubSquashCommitMessage(carrying)}`;
+    const { mergedHeadIn } = await gate();
+    expect(() => mergedHeadIn(prefixed, "x")).toThrow(/Merged-Head trailers/);
   });
 });
