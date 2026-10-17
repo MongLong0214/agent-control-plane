@@ -1,0 +1,13 @@
+Limit: on this host commitlore init writes .claude/, so a required-mode bootstrap refuses here
+Warn: the bootstrap producer enforces the approved manifest's CommitLore mode: required refuses the gate without a passing commitlore init plus doctor --json observation at the published head, preferred is named NOT_OBSERVED and never blocks, and an unsupported value is held to required rather than downgraded; no decision record is demanded on the bootstrap commit, because that would demand a fabricated record
+Record-Id: r-a150042a9a87
+Provenance: inherited a853f1e8877af9cd5b06a4ecf18c130f0b62d649
+
+Limit: commitlore is resolved on the daemon's PATH, which by launcher policy holds no user directory, so in production a required-mode bootstrap refuses until an absolute commitlore pin exists; the per-attempt record stops a database-only writer but not one that also forges files in the work directory
+Warn: the CommitLore children get only the CP-HI-05 runtime environment plus an allowlist (PATH, HOME, USER, TMPDIR, locale, git no-system-config and no-prompt), so no daemon credential or unknown secret reaches them; timeout, overflow and a signalled exit are final failures that a later exit 0 never turns into PASS, and only this invocation's own child is escalated to SIGKILL; a passing observation is a per-attempt record bound to run, attempt, repository identity, published head and report digest and is checked at activation, a WRITTEN retry and CONFIRM, rather than trusting a stored PASS row
+Record-Id: r-df0fb0b8518e
+Provenance: inherited f6ae2cadf77b9f46f8a88c12bf012a18ca59db0a
+
+Warn: each CommitLore child gets a fresh 0700 HOME removed on exit, an empty GIT_CONFIG_GLOBAL, GIT_CONFIG_NOSYSTEM, every injected GIT_CONFIG_* stripped except a command-scope credential.helper= reset, an empty GIT_ASKPASS and GIT_TERMINAL_PROMPT=0, so no global, system, environment-injected or repo-local credential helper or askpass can run inside it; a required observation that needs remote credentials refuses rather than authenticating
+Record-Id: r-cae8121d8dcc
+Provenance: inherited 483698daadddbe8b36369fcfd7974f336b56367a
