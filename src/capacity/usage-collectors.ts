@@ -47,6 +47,12 @@ export interface UsageCollectorOptions {
   providerCredentialDir?: string;
   /** Injected in tests. Production runs the provider CLI's own non-interactive usage command. */
   nonInteractive?: NonInteractiveUsageProbe;
+  /**
+   * Injected in tests; null states that no account identity is read. Production asks the Claude CLI
+   * which account it is signed in as (`CLAUDE_ACCOUNT_IDENTITY_ARGS`). A test that injects
+   * `nonInteractive` and not this gets none, never the host's real account.
+   */
+  accountIdentity?: NonInteractiveUsageProbe | null;
   /** Injected in tests. Production asks the Codex app-server for the account's rate limits. */
   codexRateLimits?: CodexRateLimitProbe;
   /** Pinned, never inherited: a different CODEX_HOME is a different account's quota. */
@@ -107,6 +113,116 @@ export const CLAUDE_NON_INTERACTIVE_ARGS = [
   "1",
   "/usage",
 ] as const;
+
+/**
+ * #1099 — `claude auth status --json`, the CLI's own statement of the account it is signed in as.
+ * Measured 2026-10-17 on the deployment host: answered locally in 0.13 s. It names the organization
+ * (`orgId`, a UUID) and the signed-in address. Run with the environment `/usage` runs with, it reads
+ * the same credential store, so it names the account whose windows `/usage` reports. Neither value
+ * is kept or logged: only their digest (`claudeAccountDigest`).
+ */
+export const CLAUDE_ACCOUNT_IDENTITY_ARGS = ["auth", "status", "--json"] as const;
+
+/**
+ * #1099 review r2 — the most one account-identity read may take. Measured at 0.13 s (above); 5 s is
+ * headroom for a slow host, not a measurement.
+ */
+export const CLAUDE_ACCOUNT_IDENTITY_TIMEOUT_MS = 5_000;
+
+/**
+ * #1099 review r2 — the one deadline a whole Claude collection runs under: identity, then `/usage`,
+ * then identity. Each identity read used to get the usage read's own 20 s, so two slow identity reads
+ * around a healthy 10 s usage read took 50 s, past the 45 s collector bound and the doctor's 45 s
+ * capacity deadline, and the reading arrived after the report that needed it.
+ *
+ * The usage read keeps its whole timeout; the identity reads get only what is left beside it. An
+ * identity read that runs out costs the reading its account (it is then never restored after a
+ * restart) and never costs the reading itself. Capped at `COLLECTOR_TIMEOUT_MS`, the bound the
+ * callers derive their deadlines from.
+ */
+export const claudeCollectionBudgetMs = (usageTimeoutMs: number): number =>
+  Math.min(COLLECTOR_TIMEOUT_MS, usageTimeoutMs + 2 * CLAUDE_ACCOUNT_IDENTITY_TIMEOUT_MS);
+
+/**
+ * One deadline for a whole collection, on the monotonic clock so a wall-clock step cannot move it.
+ * `within` does not rely on a probe honouring the timeout it was handed: past `withinMs`, the answer
+ * is `expired`, whatever the probe is still doing.
+ */
+class CollectionDeadline {
+  private readonly endsAt: number;
+
+  constructor(budgetMs: number) {
+    this.endsAt = performance.now() + budgetMs;
+  }
+
+  remainingMs(): number {
+    return Math.max(0, Math.floor(this.endsAt - performance.now()));
+  }
+
+  async within<T>(withinMs: number, work: () => Promise<T>, expired: T): Promise<T> {
+    const running = work();
+    let timer: NodeJS.Timeout | undefined;
+    // Armed after the work starts, so a probe whose own timer is due at the same moment answers first.
+    const spent = new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(expired), withinMs);
+    });
+    try {
+      return await Promise.race([running, spent]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/** What a read the deadline stopped answers: it did not finish, so it established nothing. */
+const DEADLINE_SPENT = { stdout: "", stderr: "", code: null, timedOut: true } as const;
+
+/**
+ * The digest of the account a `claude auth status --json` run names, or null when the run failed,
+ * is not signed in, or names no organization or address. The address is lower-cased because the
+ * provider treats it case-insensitively. Raw values never leave this function.
+ */
+export const claudeAccountDigest = (outcome: {
+  stdout: string;
+  code: number | null;
+  timedOut?: boolean;
+  spawnError?: { code?: string; message: string };
+}): string | null => {
+  if (outcome.spawnError || outcome.timedOut === true || outcome.code !== 0) return null;
+  let status: unknown;
+  try {
+    status = JSON.parse(outcome.stdout);
+  } catch {
+    return null;
+  }
+  if (!status || typeof status !== "object" || Array.isArray(status)) return null;
+  const { loggedIn, orgId, email } = status as Record<string, unknown>;
+  if (loggedIn !== true || typeof orgId !== "string" || typeof email !== "string") return null;
+  const organization = orgId.trim();
+  const address = email.trim().toLowerCase();
+  if (organization.length === 0 || address.length === 0) return null;
+  return sha256(`claude-account\u0000${organization}\u0000${address}`);
+};
+
+/**
+ * A reading's `source` is its provenance (`<collector>:<provider>;raw-output-digest:<digest>`), and
+ * the account a collector measured is provenance too, so it travels there as one more field:
+ * `;account-digest:sha256:<hex>`. Only a collector that established the account adds it.
+ */
+export const withAccountDigest = (source: string, accountDigest: string | null): string =>
+  accountDigest === null ? source : `${source};account-digest:${accountDigest}`;
+
+/** Whether `value` has the shape of an account digest: `sha256:` and 64 lower-case hex digits. */
+export const isAccountDigest = (value: unknown): value is string =>
+  typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
+
+/** The account digest `source` states, or null when it states none, states two, or states a malformed one. */
+export const accountDigestOfSource = (source: string): string | null => {
+  const stated = [...source.matchAll(/(?:^|;)account-digest:([^;]*)/gu)];
+  if (stated.length !== 1) return null;
+  const digest = stated[0]![1];
+  return isAccountDigest(digest) ? digest : null;
+};
 
 /**
  * What a quota read needs and nothing else. The daemon's environment is not a safe default for
@@ -902,11 +1018,39 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
 
   private readonly probe: NonInteractiveUsageProbe;
   private readonly probeTimeoutMs: number;
+  private readonly identity: NonInteractiveUsageProbe | null;
 
   constructor(private readonly claudeOptions: UsageCollectorOptions) {
     super(claudeOptions);
     this.probe = claudeOptions.nonInteractive ?? new SpawnNonInteractiveUsageProbe(CLAUDE_NON_INTERACTIVE_ARGS);
     this.probeTimeoutMs = claudeOptions.timeoutMs ?? NON_INTERACTIVE_TIMEOUT_MS;
+    this.identity = claudeOptions.accountIdentity !== undefined
+      ? claudeOptions.accountIdentity
+      : claudeOptions.nonInteractive
+        ? null
+        : new SpawnNonInteractiveUsageProbe(CLAUDE_ACCOUNT_IDENTITY_ARGS);
+  }
+
+  /**
+   * The digest of the account the CLI is signed in as, or null; a failed read is no identity, and so
+   * is one with no time left once `reserveMs` is kept for what follows it under `deadline`.
+   */
+  private async accountDigest(deadline: CollectionDeadline, reserveMs: number): Promise<string | null> {
+    const identity = this.identity;
+    if (!identity) return null;
+    const timeoutMs = Math.min(CLAUDE_ACCOUNT_IDENTITY_TIMEOUT_MS, deadline.remainingMs() - reserveMs);
+    if (timeoutMs <= 0) return null;
+    try {
+      return claudeAccountDigest(
+        await deadline.within(
+          timeoutMs,
+          () => identity.run({ binary: this.claudeOptions.binary, timeoutMs }),
+          DEADLINE_SPENT,
+        ),
+      );
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -935,8 +1079,19 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
       timedOut?: boolean;
       spawnError?: { code?: string; message: string };
     };
+    // #1099 — the account is read on both sides of the usage read, and only an account named the same
+    // by both is the one measured: a sign-in that changed in between leaves the reading unbound.
+    // Review r2: all three reads share one deadline, and the usage read's time is kept for it first.
+    const usageTimeoutMs = Math.min(this.probeTimeoutMs, COLLECTOR_TIMEOUT_MS);
+    const deadline = new CollectionDeadline(claudeCollectionBudgetMs(usageTimeoutMs));
+    const accountBefore = await this.accountDigest(deadline, usageTimeoutMs);
     try {
-      outcome = await this.probe.run({ binary: this.claudeOptions.binary, timeoutMs: this.probeTimeoutMs });
+      const timeoutMs = Math.min(usageTimeoutMs, deadline.remainingMs());
+      outcome = await deadline.within(
+        timeoutMs,
+        () => this.probe.run({ binary: this.claudeOptions.binary, timeoutMs }),
+        DEADLINE_SPENT,
+      );
     } catch (error) {
       // `spawn` does not always reach the `error` event. It throws synchronously when an argument
       // is rejected before any syscall — an empty binary gives ERR_INVALID_ARG_VALUE — and when
@@ -1028,17 +1183,18 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
     }
 
     const parsed = parseNonInteractiveUsage(this.provider, envelope.result, observedAt);
-    return parsed.ok
-      ? {
-          provider: this.provider,
-          sensorHealth: "HEALTHY",
-          runtimeHealth: "UNKNOWN",
-          observedAt,
-          buckets: parsed.buckets,
-          source,
-          rawOutputDigest: digest,
-        }
-      : failedReading(this.provider, observedAt, source, digest, parsed.error);
+    if (!parsed.ok) return failedReading(this.provider, observedAt, source, digest, parsed.error);
+    // No account before means none can match after, so the second read would spend time for nothing.
+    const accountAfter = accountBefore === null ? null : await this.accountDigest(deadline, 0);
+    return {
+      provider: this.provider,
+      sensorHealth: "HEALTHY",
+      runtimeHealth: "UNKNOWN",
+      observedAt,
+      buckets: parsed.buckets,
+      source: withAccountDigest(source, accountBefore !== null && accountBefore === accountAfter ? accountBefore : null),
+      rawOutputDigest: digest,
+    };
   }
 }
 

@@ -538,6 +538,11 @@ export type RuntimeRefreshTrigger = "PROVIDER_SWITCH_OR_FAILURE";
 
 export interface RuntimeCapacityObserver {
   refresh(trigger: RuntimeRefreshTrigger, providerIds?: readonly string[]): Promise<unknown>;
+  /**
+   * #1099 — told of every explicit `invalidateCapacityForRole`, so the invalidation outlives this
+   * process: the generation it bumps is process-local and restarts at the same number.
+   */
+  capacityInvalidated?(provider: string, role: Role): void;
 }
 
 /**
@@ -728,6 +733,9 @@ export class ProviderRegistry {
    * Explicit scope-change notification. This generation is process-local registration
    * evidence, NOT automatic detection of a credential/account change. The owner must
    * invalidate before changing scope; a fresh probe is required before reusing capacity.
+   *
+   * #1099 — the generation restarts with the process, so the attached capacity observer is told as
+   * well and records the invalidation durably; a restart then cannot restore a reading taken before it.
    */
   invalidateCapacityForRole(provider: string, role: Role): void {
     const binding = this.capacityBindingForRole(provider, role);
@@ -735,6 +743,7 @@ export class ProviderRegistry {
     this.#capacityBindings.set(roleScopedKey(provider, role), Object.freeze({
       ...binding, generation: ++this.#capacityGeneration,
     }));
+    this.#capacity?.capacityInvalidated?.(provider, role);
   }
 
   /** Capacity never falls back to a default or another role's adapter. */
