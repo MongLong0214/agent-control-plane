@@ -839,6 +839,8 @@ export class ControlPlane {
       this.pipeline.attach({
         continuity: { evaluate: (reason) => this.continuity.evaluate(reason) },
       });
+      // A run continuity paused at CEO review goes back to it only with its human gate satisfied.
+      this.runs.attach({ ceoReview: { humanGateStatus: (runId) => this.ceo.humanGateStatus(runId) } });
       this.cto.attach({ readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) } });
       this.continuity.attach({ readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) } });
       this.workers = new WorkerStaffing(this.db, this.clock, this.audit, {

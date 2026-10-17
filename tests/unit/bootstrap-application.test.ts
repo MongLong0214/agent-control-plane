@@ -175,6 +175,8 @@ const applicationFixture = async () => {
   harness.cp.cto.attach({ sessionLaunch: launch });
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
+  // #246 C4 — the PRIMARY_CTO activation provisions is driven on the same Claude runtime.
+  harness.cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
   claude.setCapacity(claudeReading(harness, 80));
 
   const ceo = harness.cp.sessions.create({ provider: "scripted", model: "c3-ceo" });
@@ -230,6 +232,7 @@ const applicationFixture = async () => {
     harness,
     github,
     workRoot,
+    claude,
     ceoSessionId: ceo.sessionId,
     hermes,
     cto,
@@ -401,8 +404,8 @@ describe("#246 C3 W2: a failure after the repository was created", () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w2-provider"));
       await approveWrites(f, run);
-      // The primary CTO activation provisions answers its readiness probe UNAVAILABLE.
-      f.harness.scripted.setNextSessionHealth("UNAVAILABLE");
+      // The driven primary CTO activation provisions cannot run its attestation turn: its provider is down.
+      f.claude.setNextSessionHealth("UNAVAILABLE");
       const first = await confirm(f, run);
       expect(first, JSON.stringify(first)).toMatchObject({ ok: false, evidence: { stage: "activation" } });
       expect(writesOf(f)).toEqual(WRITE_METHODS);
@@ -2295,7 +2298,7 @@ describe("#246 C3 review 1076-R1-02: a database row stands in for neither the ap
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-before-activation"));
       await approveWrites(f, run);
       // The primary CTO's provider is down: WRITTEN, and nothing activated yet.
-      f.harness.scripted.setNextSessionHealth("UNAVAILABLE");
+      f.claude.setNextSessionHealth("UNAVAILABLE");
       const first = await confirm(f, run);
       expect(first, JSON.stringify(first)).toMatchObject({ ok: false, evidence: { stage: "activation" } });
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
