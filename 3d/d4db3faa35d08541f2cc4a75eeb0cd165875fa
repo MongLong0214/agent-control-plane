@@ -1,0 +1,10 @@
+Limit: the F4 head is checked against the stored result, not re-tied to the on-disk ledger; F3 compares only the session because the handoff record stores no generation; a run planned before BOOTSTRAP_PLAN_TASKS existed must re-submit its PLAN before CONFIRM
+Warn: a project-less bootstrap CONFIRM now refuses when the active manifest or repository binding is not the PLAN's (ACTIVE_MANIFEST_NOT_PLANNED) and when the handoff ACK recipient is not the current PRIMARY_CTO (ACK_RECIPIENT_NOT_PRIMARY_CTO), which closes the CONFIRM gaps the r-bootstrapreviewpacketintent Limit named; settlement refuses a task without a BOOTSTRAP_PLAN_TASKS record for the current PLAN (BOOTSTRAP_TASK_PLAN_UNRECORDED); the delivered activation handoff carries the observed branch and initial head from the stored producer result, and the ACK refuses null or mismatched facts (HANDOFF_FACTS_NOT_OBSERVED)
+Record-Id: r-bootstrapcompletiongates
+Provenance: inherited 0e9b6ab7115d848f9886d1f182bf1ddabeb1aa27
+
+Limit: the CONFIRM comparison to the readback goes through the stored result in two steps within one transaction, not one direct comparison; the test stand-in completeBootstrapRunUntilC3 skips writtenChain
+Warn: at CONFIRM the run's current handoff package is checked whether ACKed or not by the same function as the ACK; handoff facts come from the PLAN's target repository and required verification row, conflicting heads are refused at activation, and writtenChain requires the facts to equal that execution's readback in the attempt ledger; an activation retry reissues an invalid handoff as a new PENDING package to the current PRIMARY_CTO, which needs a new ACK, and keeps the old records
+Record-Id: r-bootstraphandofffactsbound
+Follows: r-bootstrapcompletiongates
+Provenance: inherited 213dcaada2327ea960c1cf037e10fd16cc173b4a
