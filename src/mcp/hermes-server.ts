@@ -27,8 +27,10 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import {
   admitHermesProvenance,
-  HERMES_READ_ONLY_TOOLS,
+  type HermesAdmittedTurn,
   type HermesProvenanceAnchor,
+  HERMES_READ_ONLY_TOOLS,
+  type HermesToolCall,
 } from "./hermes-provenance.ts";
 import {
   authenticateMcpPeer,
@@ -92,7 +94,8 @@ export const createHermesMcpPort = (
   const port = Object.freeze({
     mutation: createMcpMutationPort(source),
     createRun: (input: Parameters<RunEngine["create"]>[0]) => source.runs.create(input),
-    dispatchRun: (runId: string) => source.runs.dispatch(runId),
+    dispatchRun: (runId: string, hermesTurn?: HermesAdmittedTurn) =>
+      source.runs.dispatch(runId, hermesTurn === undefined ? {} : { hermesTurn }),
     runView: (runId: string) => {
       const run = source.runs.get(runId);
       return run
@@ -164,8 +167,13 @@ export const createHermesMcpPort = (
       return decision;
     },
     executeRepair: (input: Parameters<RepairService["execute"]>[0]) => source.repair.execute(input),
-    resolveEscalation: (runId: string, escalationId: number, resolution: string, ceoSessionId: string, idempotencyKey: string) =>
-      source.ceo.resolveEscalation(runId, resolution, ceoSessionId, { escalationId, idempotencyKey }),
+    resolveEscalation: (
+      runId: string, escalationId: number, resolution: string, ceoSessionId: string, idempotencyKey: string,
+      hermesTurn?: HermesAdmittedTurn,
+    ) =>
+      source.ceo.resolveEscalation(runId, resolution, ceoSessionId, {
+        escalationId, idempotencyKey, ...(hermesTurn === undefined ? {} : { hermesTurn }),
+      }),
     replayEscalationResolution: (
       idempotencyKey: string,
       request: { runId: string; escalationId: number; resolution: string },
@@ -190,8 +198,9 @@ export interface HermesServerOptions {
    * The adopted CEO's tool channel (#1037): the bound Hermes session and lineage its admission
    * read. Every tool outside `HERMES_READ_ONLY_TOOLS` — including any the caller registers on the
    * returned server afterwards — is admitted only when the call's `params._meta` provenance names
-   * the owner's own top-level, non-scheduled turn in that session and lineage. A refusal happens
-   * before the idempotency reservation, so it writes nothing.
+   * a top-level, non-scheduled turn in that session and lineage: the owner's, or a peer's carrying a
+   * peer grant for one of `HERMES_PEER_DELEGABLE_TOOLS`. A refusal happens before the idempotency
+   * reservation, so it writes nothing. The admitted turn reaches the delegable tools' audit evidence.
    */
   provenance?: HermesProvenanceAnchor;
 }
@@ -210,7 +219,7 @@ type ToolCallbackArgs = readonly unknown[];
  */
 const requireToolProvenance = (
   server: McpServer,
-  admit: (extra: unknown) => ReturnType<typeof admitHermesProvenance>,
+  admit: (call: HermesToolCall, extra: unknown) => ReturnType<typeof admitHermesProvenance>,
 ): void => {
   const register = server.registerTool.bind(server) as (
     name: string,
@@ -228,8 +237,13 @@ const requireToolProvenance = (
       HERMES_READ_ONLY_TOOLS.has(name)
         ? callback
         : (...callArgs: ToolCallbackArgs) => {
-            const admitted = admit(callArgs[callArgs.length - 1]);
-            return admitted.allowed ? callback(...callArgs) : respond(admitted);
+            const extra = callArgs[callArgs.length - 1];
+            // The parsed arguments are the very object the callback receives, so a peer's
+            // `ceo_decision_submit` is admitted on the decision it then executes.
+            const admitted = admit({ tool: name, arguments: callArgs.length > 1 ? callArgs[0] : undefined }, extra);
+            if (!admitted.allowed) return respond(admitted);
+            rememberAdmittedTurn(extra, admitted.value);
+            return callback(...callArgs);
           },
     );
   server.registerTool = guardedRegister as McpServer["registerTool"];
@@ -237,6 +251,20 @@ const requireToolProvenance = (
 
 const requestMeta = (extra: unknown): unknown =>
   typeof extra === "object" && extra !== null ? (extra as { _meta?: unknown })._meta : undefined;
+
+/**
+ * The turn each admitted call was made by, keyed by that call's own request context, so a handler
+ * can put it in its mutation's audit evidence without reading `_meta` a second time. A call on a
+ * server with no provenance anchor has no entry, and its audit evidence is as it was.
+ */
+const admittedTurns = new WeakMap<object, HermesAdmittedTurn>();
+
+const rememberAdmittedTurn = (extra: unknown, turn: HermesAdmittedTurn): void => {
+  if (typeof extra === "object" && extra !== null) admittedTurns.set(extra, turn);
+};
+
+const admittedTurnOf = (extra: unknown): HermesAdmittedTurn | undefined =>
+  typeof extra === "object" && extra !== null ? admittedTurns.get(extra) : undefined;
 
 /**
  * This scope deliberately receives only the port. Every registered handler closes over this
@@ -250,12 +278,12 @@ const createHermesServerFromPort = (
   const server = new McpServer({ name: "agent-control-plane-hermes", version: "1.3.0" });
   const anchor = options.provenance;
   if (anchor !== undefined) {
-    requireToolProvenance(server, (extra) => {
+    requireToolProvenance(server, (call, extra) => {
       // The connection's authority first, so a channel whose binding moved is refused as stale
       // rather than as a provenance mismatch; then the one call-level question.
       const peer = authenticateMcpPeer(authenticate);
       if (!peer.allowed) return peer as ReturnType<typeof admitHermesProvenance>;
-      return admitHermesProvenance(requestMeta(extra), anchor);
+      return admitHermesProvenance(requestMeta(extra), anchor, call);
     });
   }
   const read = (execute: () => Promise<ToolResult> | ToolResult) =>
@@ -285,19 +313,20 @@ const createHermesServerFromPort = (
         })).default([]),
       },
     },
-    async (args) => write(args.idempotencyKey, () => respond(port.createRun({
+    async (args, extra) => write(args.idempotencyKey, () => respond(port.createRun({
       projectId: args.projectId ?? null,
       kind: (args.kind as RunKind | undefined) ?? RunKind.STANDARD_WORK,
       executionMode: args.executionMode as ExecutionMode,
       contract: args.contract,
       repositories: args.repositories,
+      hermesTurn: admittedTurnOf(extra),
     }))),
   );
 
   server.registerTool(
     "run_dispatch",
     { description: "Admit a queued run.", inputSchema: { ...mutation, runId: z.string() } },
-    async (args) => write(args.idempotencyKey, async () => respond(await port.dispatchRun(args.runId))),
+    async (args, extra) => write(args.idempotencyKey, async () => respond(await port.dispatchRun(args.runId, admittedTurnOf(extra)))),
   );
 
   server.registerTool(
@@ -365,7 +394,7 @@ const createHermesServerFromPort = (
   server.registerTool(
     "ceo_decision_submit",
     { description: "Submit the CEO's final decision.", inputSchema: { ...mutation, runId: z.string(), decision: z.enum(["CONFIRM", "FINAL_REVISE", "OWNER_DECISION_REQUIRED"]), candidateSnapshotDigest: z.string(), ceoSessionId: z.string(), rationale: z.string() } },
-    async (args) => write(args.idempotencyKey, async () => {
+    async (args, extra) => write(args.idempotencyKey, async () => {
       // #246 B2-b — the door's authenticated session travels with the decision, never an argument, so a
       // CONTRACT_CHANGE grant is issued, or its consumer re-bound, only when it is the CEO session the call
       // names and this mutation is in flight.
@@ -376,7 +405,7 @@ const createHermesServerFromPort = (
         sessionIncarnation: peer.allowed ? peer.value.sessionIncarnation ?? null : null,
         idempotencyKey: args.idempotencyKey,
       };
-      return respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale, ingress }));
+      return respond(await port.submitCeoDecision({ runId: args.runId, decision: args.decision, candidateSnapshotDigest: args.candidateSnapshotDigest, ceoSessionId: args.ceoSessionId, rationale: args.rationale, ingress, hermesTurn: admittedTurnOf(extra) }));
     }),
   );
 
@@ -388,7 +417,7 @@ const createHermesServerFromPort = (
         `The run must be BLOCKED for a CEO decision. The resolution, non-blank and at most ${ESCALATION_RESOLUTION_MAX_LENGTH} characters, is delivered to the run's owner, and the run becomes ACTIVE.`,
       inputSchema: { ...mutation, runId: z.string(), escalationId: z.number().int().positive(), resolution: z.string() },
     },
-    async (args) => guarded(async () => {
+    async (args, extra) => guarded(async () => {
       // The idempotency key names one request. The CEO_DECISION that answers it commits the key's
       // digest beside the request's, and `resolveEscalation` reads that record first, before any
       // state: the same request is answered with its first result, and the same key carrying
@@ -423,7 +452,7 @@ const createHermesServerFromPort = (
         return answer(!peer.allowed
           ? peer
           : peer.value.sessionId
-            ? port.resolveEscalation(args.runId, args.escalationId, args.resolution, peer.value.sessionId, args.idempotencyKey)
+            ? port.resolveEscalation(args.runId, args.escalationId, args.resolution, peer.value.sessionId, args.idempotencyKey, admittedTurnOf(extra))
             : deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "Hermes MCP peer has no session"));
       });
       if (executed) return result;
