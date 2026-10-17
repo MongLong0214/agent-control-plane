@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
@@ -54,9 +54,15 @@ import {
 import {
   SELF_CLAIM_EXECUTOR_KIND,
   assertCanonicalSessionsValid,
+  assertClaudeIdentityStillLive,
   canonicalBuzzChannelFor,
+  defaultProcessAncestryInspector,
+  deriveClaimantIdentity,
+  makeDefaultHostSessionRegistryReader,
   unsubscribedRoomRefusal,
   type CanonicalAdoptableSession,
+  type HostSessionRegistryReader,
+  type ProcessAncestryInspector,
   type SubscribedBuzzRooms,
 } from "../registry/canonical-self-claim.ts";
 import { readProcessStartToken } from "../core/process-argv.ts";
@@ -136,6 +142,13 @@ import {
 import type { TelegramDirectAnswer } from "../ingress/telegram-router.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
+import {
+  CanonicalCtoRestoreCondition,
+  type CanonicalCtoAttachChallenger,
+  type CanonicalCtoAttachProof,
+  type CanonicalCtoRestoreSuccession,
+  type CanonicalCtoRestoreTarget,
+} from "../continuity/continuity-kernel.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
 import { CeoConversationPort, type CeoTurnOutcome } from "../mcp/ceo-conversation.ts";
@@ -158,10 +171,20 @@ import {
   startAdoptedCeoToolListener,
   startCanonicalCtoToolListener,
   startCanonicalSelfClaimListener,
+  type AuthenticatedClaimPeer,
   type CanonicalSelfClaimListener,
 } from "./canonical-self-claim-listener.ts";
-import { createCanonicalCtoReattach, type CanonicalCtoReattach } from "../registry/canonical-cto-reattach.ts";
-import { recordedStartIsLive } from "../session/runtime-lineage.ts";
+import {
+  createCanonicalCtoReattach,
+  type CanonicalCtoAdmission,
+  type CanonicalCtoReattach,
+} from "../registry/canonical-cto-reattach.ts";
+import {
+  admitRuntimeLineage,
+  defaultProcessLineageReader,
+  recordedStartIsLive,
+  type ProcessLineageReader,
+} from "../session/runtime-lineage.ts";
 import { readOneJsonLineRequest } from "./local-socket-framing.ts";
 import { daemonCtoBindingRuntime, type CtoBindingRuntime } from "./cto-binding-runtime.ts";
 
@@ -302,7 +325,11 @@ export interface LocalMcpListeners {
    * for a connection the process tree admits instead of a session secret. Closed by `close()`.
    * Resolves to the socket's path.
    */
-  openCanonicalCtoReattach(reattach: CanonicalCtoReattach, daemon: { lock: { held(): boolean } }): Promise<string>;
+  openCanonicalCtoReattach(
+    reattach: CanonicalCtoReattach,
+    daemon: { lock: { held(): boolean } },
+    restore?: CanonicalCtoRestoreOptions,
+  ): Promise<string>;
 }
 
 /**
@@ -594,6 +621,278 @@ export const startSessionLaunchChannel = async (
         if (active) await closeSocketServer(active);
       })();
       return closing;
+    },
+  };
+};
+
+/**
+ * #1106 — what the capacity restore's liveness challenge reads. Absent, the production readers: the
+ * same ones the reattach door's own admission uses when it is given none.
+ */
+export interface CanonicalCtoRestoreOptions {
+  processes?: ProcessLineageReader;
+  inspector?: ProcessAncestryInspector;
+  registryReader?: HostSessionRegistryReader;
+  maxAncestryHops?: number;
+  /** How long a liveness challenge waits for its answer before it is refused. */
+  challengeTimeoutMs?: number;
+}
+
+/** #1106 — the default wait for a liveness challenge's answer; a live client answers a ping at once. */
+export const CANONICAL_CTO_RESTORE_CHALLENGE_TIMEOUT_MS = 10_000;
+
+/**
+ * #1106 — the prefix of a liveness challenge's JSON-RPC id. The rest is a digest of what the
+ * challenge is bound to, so the answer, which echoes the id, names that binding.
+ */
+export const CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX = "acp-restore-challenge:";
+
+/**
+ * Review S2B-R1-01 — the JSON-RPC notification a committed capacity restore writes on the connection
+ * it challenged, just before ending it. Its params are the `CanonicalCtoRestoreSuccession`. The relay
+ * takes it out of the stream and adopts the restored binding on it alone; it never reaches the
+ * client. Copied by hand into `src/cli/attach-relay.ts`, which imports nothing daemon-side.
+ */
+export const CANONICAL_CTO_RESTORE_SUCCESSION_METHOD = "notifications/acp/canonical-cto-restore-succession";
+
+const RESTORE_ANCESTRY_HOPS = 64;
+
+/** One reattach-door admission and the kernel peer it was admitted on. */
+type AdmittedReattach = CanonicalCtoAdmission & { peer: AuthenticatedClaimPeer };
+
+type RestoreChallengeOutcome =
+  | { kind: "answered"; message: JSONRPCMessage }
+  | { kind: "closed" }
+  | { kind: "timeout" };
+
+/** What a liveness challenge is bound to; its id is a digest of this and a fresh salt. */
+interface RestoreChallengeBinding {
+  roleKey: string;
+  sessionId: string;
+  sessionIncarnation: string;
+  revokedGeneration: number;
+  connectionId: string;
+}
+
+interface PendingRestoreChallenge {
+  settle(outcome: RestoreChallengeOutcome): void;
+}
+
+/** One open connection the canonical CTO reattach door admitted. Exported for its witnesses. */
+export interface ReattachConnection {
+  /** Minted by the daemon at admission; nothing the peer sends names it. */
+  readonly connectionId: string;
+  readonly peer: AuthenticatedClaimPeer;
+  readonly admitted: CanonicalCtoAdmission;
+  readonly socket: Socket;
+  closed: boolean;
+  /** Open challenges on this connection, by id. An answer is taken once, here and nowhere else. */
+  readonly challenges: Map<string, PendingRestoreChallenge>;
+  send(message: JSONRPCMessage): Promise<void>;
+}
+
+const restoreChallengeId = (binding: RestoreChallengeBinding, salt: string): string =>
+  `${CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX}${digestOf({ domain: "acp.canonical-cto-restore-challenge", ...binding, salt })}`;
+
+/**
+ * Takes the answer to one of this connection's open liveness challenges out of the MCP stream, or
+ * answers false for every other message. An answer carrying the prefix that matches no open
+ * challenge on this connection — a replay, a late answer, one meant for another connection — is
+ * dropped here and settles nothing. Exported for its witnesses.
+ */
+export const takeRestoreChallengeAnswer = (connection: ReattachConnection, message: JSONRPCMessage): boolean => {
+  if ("method" in message) return false;
+  if (!("id" in message)) return false;
+  const id: unknown = message.id;
+  if (typeof id !== "string") return false;
+  if (!id.startsWith(CANONICAL_CTO_RESTORE_CHALLENGE_PREFIX)) return false;
+  const pending = connection.challenges.get(id);
+  if (pending === undefined) {
+    process.stderr.write("canonical CTO restore challenge answer matched no open challenge\n");
+    return true;
+  }
+  connection.challenges.delete(id);
+  pending.settle({ kind: "answered", message });
+  return true;
+};
+
+/** The reattach door's transport, with its challenge answers taken out before the MCP server reads. */
+const restoreChallengeTransport = (raw: SocketTransport, connection: ReattachConnection): Transport => {
+  const wrapped: Transport = {
+    start: () => {
+      raw.onmessage = (message) => {
+        if (takeRestoreChallengeAnswer(connection, message)) return;
+        wrapped.onmessage?.(message);
+      };
+      raw.onclose = () => wrapped.onclose?.();
+      raw.onerror = (error) => wrapped.onerror?.(error);
+      return raw.start();
+    },
+    send: (message, options) => raw.send(message, options),
+    close: () => raw.close(),
+  };
+  return wrapped;
+};
+
+/**
+ * #1106 — the liveness challenge a capacity restore is attested by, over the canonical session's own
+ * reattach connection.
+ *
+ * The connection is the one this door admitted under exactly the revoked binding — role, assignment,
+ * generation, session, incarnation and conversation — and still open. Its proof is the door's own
+ * evidence read again, never a credential: the kernel peer it was admitted on still descends from the
+ * session's recorded claude, that claude still runs the same conversation with the same start, and
+ * the session row is still that incarnation and READY. It is read before the challenge, after the
+ * answer, and once more inside the bind (`stillAttached`).
+ *
+ * The challenge is a JSON-RPC `ping` the daemon writes on that connection. The relay passes a
+ * daemon request to its client byte for byte, and the client — Claude Code's MCP client — answers
+ * `ping` with the same id; a relay never answers one itself. The id is a digest of the role, the
+ * session, its incarnation, the revoked generation, the connection and a fresh salt, so the answer
+ * names what it answers. It is taken once, only from the connection it was written on, only before
+ * `challengeTimeoutMs` by the daemon's clock, and only while that connection is open: an answer on
+ * an earlier connection, an answer to a challenge whose connection closed for a reconnect, and a
+ * replayed answer each settle nothing.
+ *
+ * Once the restore commits, the proof's `release` writes the succession on that same connection —
+ * the binding it was admitted under, the binding committed, the challenge's id — as one
+ * `CANONICAL_CTO_RESTORE_SUCCESSION_METHOD` notification, and then ends it. That line is the only
+ * thing the relay adopts a binding other than its own on (review S2B-R1-01).
+ *
+ * Exported for its witnesses; the reattach door composes it and attaches it to continuity.
+ */
+export const createCanonicalCtoAttachChallenger = (
+  cp: ControlPlane,
+  connections: ReadonlySet<ReattachConnection>,
+  options: CanonicalCtoRestoreOptions,
+): CanonicalCtoAttachChallenger => {
+  const processes = options.processes ?? defaultProcessLineageReader;
+  const inspector = options.inspector ?? defaultProcessAncestryInspector;
+  const registryReader = options.registryReader ?? makeDefaultHostSessionRegistryReader();
+  const maxAncestryHops = options.maxAncestryHops ?? RESTORE_ANCESTRY_HOPS;
+  const timeoutMs = options.challengeTimeoutMs ?? CANONICAL_CTO_RESTORE_CHALLENGE_TIMEOUT_MS;
+
+  const admittedUnder = (connection: ReattachConnection, target: CanonicalCtoRestoreTarget): boolean => {
+    const held = connection.admitted;
+    if (held.roleKey !== target.roleKey) return false;
+    if (held.assignmentId !== target.revokedAssignmentId) return false;
+    if (held.bindingGeneration !== target.revokedGeneration) return false;
+    if (held.sessionId !== target.sessionId) return false;
+    if (held.sessionIncarnation !== target.sessionIncarnation) return false;
+    return held.conversation === target.conversation;
+  };
+  const openFor = (target: CanonicalCtoRestoreTarget): ReattachConnection[] =>
+    [...connections].filter((connection) => !connection.closed && admittedUnder(connection, target));
+
+  const notLive = (message: string): Decision<void> =>
+    deny(ReasonCode.ROLE_PEER_STALE, message, { condition: CanonicalCtoRestoreCondition.ATTACH_TARGET_NOT_LIVE });
+  const failed = <T>(message: string): Decision<T> =>
+    deny(ReasonCode.ROLE_PEER_FAILED, message, { condition: CanonicalCtoRestoreCondition.LIVENESS_CHALLENGE_FAILED });
+
+  const stillAttached = (connection: ReattachConnection): Decision<void> => {
+    if (connection.closed || connection.socket.destroyed) return notLive("the challenged reattach connection closed");
+    const session = cp.sessions.get(connection.admitted.sessionId);
+    if (session === null) return notLive("the canonical session's row is gone");
+    if (session.incarnation !== connection.admitted.sessionIncarnation) return notLive("the canonical session was respawned");
+    if (session.lifecycle !== SessionLifecycle.READY) return notLive("the canonical session is not READY");
+    const identity = deriveClaimantIdentity(connection.peer.peerPid, inspector, maxAncestryHops, registryReader);
+    if (!identity.allowed) return notLive("the connection's peer no longer descends from a claude process");
+    if (identity.value.sessionUuid !== connection.admitted.conversation) {
+      return notLive("the connection's claude no longer runs the canonical conversation");
+    }
+    const lineage = admitRuntimeLineage(connection.peer.peerPid, session, processes, cp.sessions);
+    if (!lineage.allowed) return notLive("the connection's peer no longer descends from the session's recorded claude");
+    if (lineage.value.startToken !== identity.value.startedAt) {
+      return notLive("the session's recorded claude is not the claude this connection runs under");
+    }
+    const live = assertClaudeIdentityStillLive(identity.value, inspector, registryReader);
+    if (!live.allowed) return notLive("the connection's claude changed while it was read");
+    return allow(ReasonCode.OK, undefined);
+  };
+
+  const ask = (connection: ReattachConnection, id: string): Promise<RestoreChallengeOutcome> =>
+    new Promise<RestoreChallengeOutcome>((resolveOutcome) => {
+      let settled = false;
+      const settle = (outcome: RestoreChallengeOutcome): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        connection.challenges.delete(id);
+        resolveOutcome(outcome);
+      };
+      const timer = setTimeout(() => settle({ kind: "timeout" }), timeoutMs);
+      timer.unref();
+      connection.challenges.set(id, { settle });
+      connection.send({ jsonrpc: "2.0", id, method: "ping" }).catch(() => settle({ kind: "closed" }));
+    });
+
+  return {
+    connected: (target) => openFor(target).length > 0,
+    challenge: async (target) => {
+      const open = openFor(target);
+      if (open.length === 0) {
+        return deny(ReasonCode.ROLE_PEER_ABSENT, "no open reattach connection was admitted under the revoked binding", {
+          condition: CanonicalCtoRestoreCondition.NO_REATTACH_CONNECTION,
+        });
+      }
+      if (open.length > 1) return failed("more than one open reattach connection names the revoked binding");
+      const connection = open[0]!;
+      const before = stillAttached(connection);
+      if (!before.allowed) return before as Decision<CanonicalCtoAttachProof>;
+      const binding: RestoreChallengeBinding = {
+        roleKey: target.roleKey,
+        sessionId: target.sessionId,
+        sessionIncarnation: target.sessionIncarnation,
+        revokedGeneration: target.revokedGeneration,
+        connectionId: connection.connectionId,
+      };
+      const id = restoreChallengeId(binding, randomBytes(24).toString("base64url"));
+      const expiresAtMs = Date.parse(cp.clock.nowIso()) + timeoutMs;
+      const outcome = await ask(connection, id);
+      if (outcome.kind === "timeout") return failed("the liveness challenge went unanswered");
+      if (outcome.kind === "closed") return failed("the challenged reattach connection closed before it answered");
+      // An error answer carries no result, so this one check refuses it too.
+      const answer = outcome.message as { result?: unknown };
+      if (typeof answer.result !== "object" || answer.result === null) return failed("the liveness challenge was not answered with a result");
+      if (Date.parse(cp.clock.nowIso()) > expiresAtMs) return failed("the liveness challenge's answer arrived after it expired");
+      const after = stillAttached(connection);
+      if (!after.allowed) return after as Decision<CanonicalCtoAttachProof>;
+      return allow(ReasonCode.OK, {
+        connectionId: connection.connectionId,
+        challengeId: id,
+        stillAttached: () => stillAttached(connection),
+        release: (restored) => {
+          // Review S2B-R1-01 — `from` is what this connection was admitted under, role included,
+          // which its relay was told in the door's acknowledgement (review S2B-R2-01) and is the
+          // only predecessor it accepts on this connection; `to` is what the restore committed.
+          // Ended only once the line is written, or once writing it failed: a relay that never reads
+          // it refuses the restored binding on reconnect, which is the safe side.
+          const held = connection.admitted;
+          const succession: CanonicalCtoRestoreSuccession = {
+            from: {
+              roleKey: held.roleKey,
+              assignmentId: held.assignmentId,
+              bindingGeneration: held.bindingGeneration,
+              sessionId: held.sessionId,
+              sessionIncarnation: held.sessionIncarnation,
+            },
+            to: {
+              roleKey: restored.roleKey,
+              assignmentId: restored.assignmentId,
+              bindingGeneration: restored.bindingGeneration,
+              sessionId: restored.sessionId,
+              sessionIncarnation: restored.sessionIncarnation,
+            },
+            challengeId: id,
+          };
+          const end = (): void => {
+            connection.socket.destroy();
+          };
+          connection
+            .send({ jsonrpc: "2.0", method: CANONICAL_CTO_RESTORE_SUCCESSION_METHOD, params: { ...succession } })
+            .then(end, end);
+        },
+      });
     },
   };
 };
@@ -917,15 +1216,19 @@ export const startLocalMcpListeners = async (
   // the same server as above, admitted by `CanonicalCtoReattach` rather than by a secret; a
   // connection it does not admit is refused before MCP begins and its relay claims instead.
   let reattach: CanonicalSelfClaimListener | null = null;
+  // #1106 — every connection this door admitted that is still open, with the kernel peer it was
+  // admitted on. The capacity restore's liveness challenge goes over exactly one of these.
+  const reattachConnections = new Set<ReattachConnection>();
   const openCanonicalCtoReattach = async (
     admission: CanonicalCtoReattach,
     daemon: { lock: { held(): boolean } },
+    restore: CanonicalCtoRestoreOptions = {},
   ): Promise<string> => {
     if (reattach !== null) throw new Error("the canonical CTO reattach socket is already open");
-    reattach = await startCanonicalCtoToolListener(
+    reattach = await startCanonicalCtoToolListener<AdmittedReattach>(
       daemon,
       stateDir,
-      async (peer) => {
+      async (peer): Promise<Decision<AdmittedReattach>> => {
         const admitted = admission.admit(peer);
         // After admission and never part of it: the correction opens the room through the Buzz
         // CLI, and a reattach must not wait on, or fail with, the relay. It admits the peer again
@@ -944,7 +1247,10 @@ export const startLocalMcpListeners = async (
             },
           );
         }
-        return admitted;
+        if (!admitted.allowed) return admitted as Decision<AdmittedReattach>;
+        // The kernel's peer travels with the admission so a later liveness challenge re-proves the
+        // same process tree; the acknowledgement line names only the role and the binding tuple.
+        return allow(admitted.reasonCode, { ...admitted.value, peer });
       },
       (admitted, socket) => {
         const binding = cp.bindings.active(admitted.roleKey);
@@ -952,6 +1258,25 @@ export const startLocalMcpListeners = async (
           socket.destroy();
           return;
         }
+        const transport = new SocketTransport(socket, Buffer.alloc(0));
+        const connection: ReattachConnection = {
+          connectionId: randomUUID(),
+          peer: admitted.peer,
+          admitted,
+          socket,
+          closed: false,
+          challenges: new Map(),
+          send: (message) => transport.send(message),
+        };
+        reattachConnections.add(connection);
+        socket.once("close", () => {
+          connection.closed = true;
+          reattachConnections.delete(connection);
+          for (const [id, pending] of connection.challenges) {
+            connection.challenges.delete(id);
+            pending.settle({ kind: "closed" });
+          }
+        });
         const server = ctoServer(
           () => admission.authenticate(admitted),
           {
@@ -963,11 +1288,15 @@ export const startLocalMcpListeners = async (
           () => () => admission.connection(admitted),
           "canonical-reattach",
         );
-        void server.connect(new SocketTransport(socket, Buffer.alloc(0))).catch((err: unknown) => {
+        void server.connect(restoreChallengeTransport(transport, connection)).catch((err: unknown) => {
           socket.destroy(err instanceof Error ? err : new Error(String(err)));
         });
       },
     );
+    // #1106 — a canonical CTO continuity revoked only for capacity is restored on its own session
+    // once its window resets, proven live over one of this door's own connections. Attached here
+    // because the door is what holds those connections; the last door opened is the one asked.
+    cp.continuity.attach({ canonicalCtoAttach: createCanonicalCtoAttachChallenger(cp, reattachConnections, restore) });
     return reattach.socketPath;
   };
   const servers = [hermes, cto];

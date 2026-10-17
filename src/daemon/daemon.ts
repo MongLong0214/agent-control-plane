@@ -7,12 +7,12 @@ import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger, type ProviderCapa
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
 import { RECONCILE_SWEEP_BUDGET_MS } from "../conversation/turn-coordinator.ts";
 import {
-  CONTINUITY_COVERAGE_REVOCATION_REASON,
   CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX,
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
   CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
   type RequiredRole,
   type RoleCoveragePlan,
+  coverageRevocationReason,
 } from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
 import { DARWIN_START_TOKEN, readProcessStartToken } from "../core/process-argv.ts";
@@ -1891,11 +1891,19 @@ export class Daemon {
             reasonCode: plan.outcome === "NO_VALID_COVERAGE" ? ReasonCode.COVERAGE_NONE : ReasonCode.COVERAGE_PARTIAL,
           });
           if (this.holdsThroughCoverageGap(required.roleKey, current.bindingGeneration, session, currentCapacity)) continue;
-          pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_COVERAGE_REVOCATION_REASON));
           // The reason is the continuity kernel's, not a literal this site owns: `requiredRoles`
           // reads it back off the revoked row to tell a revocation it performed from an operator
           // release, which is what decides whether the role is still owed a binding (#954).
-          this.revokePausedBinding(required, CONTINUITY_COVERAGE_REVOCATION_REASON);
+          // #1106 — and it says what was measured: an exhausted window on a HEALTHY reading, a
+          // runtime that is gone (UNAVAILABLE, or a session no longer READY), both, or neither.
+          // Only the first is ever restored without a claim, so nothing here guesses capacity.
+          const coverageReason = coverageRevocationReason({
+            runtimeLost: session?.lifecycle !== SessionLifecycle.READY || currentCapacity?.runtimeHealth === "UNAVAILABLE",
+            quotaExhausted: currentCapacity?.sensorHealth === "HEALTHY" &&
+              this.cp.capacity.hasExhaustedQuotaFor(currentCapacity, required.capability),
+          });
+          pausedRuns.push(...this.pauseAffectedRuns(required, coverageReason));
+          this.revokePausedBinding(required, coverageReason);
           continue;
         }
         this.releaseCoverageHold(required.roleKey, current.bindingGeneration, "the coverage plan can staff the role again");
