@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
 import { accessSync, constants as fsConstants, existsSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 import { sha256 } from "../core/digest.ts";
@@ -13,6 +13,7 @@ import {
   isVerificationCommandRefused,
   resolveVerificationExecutable,
   verificationExecutableRefusalMessage,
+  verificationExecutableSearchPath,
   type VerificationCommand,
 } from "../contracts/verification-command.ts";
 import { isWithin } from "../guard/workspace-probe.ts";
@@ -308,7 +309,8 @@ export const memoryLimitForPlatform = (
  * Resolving outside also fixes which `git` runs. Inside, the sandbox PATH lists the worktree before
  * `/usr/bin`, so a candidate that commits an executable named `git` at its root was run in place of
  * git -- measured: `git status --porcelain` printed the candidate's output and exited 0 -- while the
- * allowlist outside had approved `/usr/bin/git`.
+ * allowlist outside had approved `/usr/bin/git`. Every other declared executable had the same
+ * exposure until `verificationLaunchArgv` (#1102) launched each one by its approved absolute path.
  */
 const XCRUN_STUBS: ReadonlySet<string> = new Set(["/usr/bin/git"]);
 const XCRUN = "/usr/bin/xcrun";
@@ -347,8 +349,8 @@ const executableFileAt = (path: string): boolean => {
 };
 
 /**
- * The argv the sandbox execs: the command's own, except that an xcrun stub at argv[0] is replaced by
- * the absolute path of the tool it stands for. A tool that cannot be located, or a location that is
+ * The xcrun-stub step of the argv the sandbox execs (`verificationLaunchArgv`): the argv it is given,
+ * except that an xcrun stub at argv[0] is replaced by the absolute path of the tool it stands for. A tool that cannot be located, or a location that is
  * not an executable of the same name, is a refusal -- falling back to the stub would only move the
  * failure inside the sandbox, where it cannot say why.
  */
@@ -383,6 +385,70 @@ export const sandboxLaunchArgv = async (
     });
   }
   return allow(ReasonCode.OK, [target, ...argv.slice(1)]);
+};
+
+/**
+ * The absolute path argv[0] names, with its symlinks left in place: a path as declared (a relative
+ * one against the command's cwd), or a bare name looked up in the daemon-built search path in the
+ * resolver's order. It is the alias the allowlist approved. The sandbox's PATH is never consulted,
+ * and a relative entry on the daemon's PATH is made absolute here, against the daemon's cwd where
+ * the resolver found it -- left relative, the sandbox would resolve it against the worktree.
+ */
+const approvedLaunchPath = (
+  argv0: string,
+  context: { cwd: string; additionalRoots: readonly string[] },
+): string | null => {
+  const raw = argv0.replaceAll("\\", sep);
+  if (raw.includes(sep)) return isAbsolute(raw) ? raw : resolve(context.cwd, raw);
+  for (const root of verificationExecutableSearchPath(context.additionalRoots)) {
+    const candidate = resolve(root, raw);
+    if (executableFileAt(candidate)) return candidate;
+  }
+  return null;
+};
+
+const realPathOf = (path: string): string | null => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * The argv the sandbox execs (#1102): argv[0] is an absolute path the executable allowlist approved
+ * outside the sandbox, never a name for the sandbox's PATH to look up. That PATH lists the worktree
+ * ahead of `/usr/local/bin` and `/usr/bin`, and the daemon's PATH, where the allowlist also finds
+ * tools, is not on it at all -- so a candidate that committed an executable named after a declared
+ * command at its root ran in place of the approved tool. Measured: a declared `pnpm`, approved from
+ * a directory on the daemon's PATH, printed the candidate's output and passed.
+ *
+ * The approved path itself runs, not its realpath: a tool that dispatches on argv[0] (a multiplexer
+ * behind a `pnpm` symlink) must see the name it was declared by. Measured: launching the realpath ran
+ * the multiplexer's help, which exited 0 where the declared `pnpm test` exited 17. At launch the
+ * path must still lead to the tool the allowlist approved, or the command is refused. An xcrun stub
+ * is then replaced by the tool it stands for, as `sandboxLaunchArgv` says.
+ */
+export const verificationLaunchArgv = async (
+  argv: readonly string[],
+  context: { cwd: string; additionalRoots: readonly string[] },
+): Promise<Decision<readonly string[]>> => {
+  const resolution = resolveVerificationExecutable(argv[0] ?? "", context);
+  if (!resolution.allowed || resolution.resolvedPath === null) {
+    return deny(ReasonCode.INVALID_ARGUMENT, verificationExecutableRefusalMessage(argv, context), {
+      resolvedPath: resolution.resolvedPath,
+    });
+  }
+  const launchPath = approvedLaunchPath(argv[0] ?? "", context);
+  const target = launchPath === null ? null : realPathOf(launchPath);
+  if (launchPath === null || target !== resolution.resolvedPath || !executableFileAt(launchPath)) {
+    return deny(
+      ReasonCode.INVALID_ARGUMENT,
+      `verification executable '${resolution.name}' no longer leads to the tool the allowlist approved`,
+      { approved: resolution.resolvedPath, launchPath, target },
+    );
+  }
+  return sandboxLaunchArgv([launchPath, ...argv.slice(1)], context);
 };
 
 /** Test-only scope for the independent descendant-fencing regression. */
@@ -514,7 +580,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     rmSync(scratch, { recursive: true, force: true });
     return refused(command, startedMs, startedAt, mechanism, targets.reasonCode, targets.reason);
   }
-  const launch = await sandboxLaunchArgv(command.argv, executableContext);
+  const launch = await verificationLaunchArgv(command.argv, executableContext);
   if (!launch.allowed) {
     rmSync(scratch, { recursive: true, force: true });
     return refused(
@@ -921,6 +987,8 @@ export const buildSandboxEnvironment = (
     // declared executable is allowlisted; the child must not *inherit* it, or a
     // user-writable directory on the daemon's PATH becomes a directory the candidate can
     // resolve binaries out of. This lane widened it while claiming tighter confinement.
+    // It never selects the declared executable: that is exec'd by absolute path
+    // (`verificationLaunchArgv`, #1102). It serves only what the command itself looks up.
     PATH: [
       dirname(process.execPath),
       ...(worktreePath ? [worktreePath] : []),
