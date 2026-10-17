@@ -88,7 +88,7 @@ export const WorkerTurnEvent = {
   /**
    * #1096 — an operator's repair (`release_unidentified_worker_orphan`) recorded an unidentified orphan
    * with no recorded pid as resolved, after confirming nothing of it runs. The orphan row stays, and the
-   * row counts only as `orphanResolutionVerified` follows it to the operator's admitted receipt.
+   * row counts only as `orphanResolutionVerified` verifies it as that repair's own release record.
    */
   ORPHAN_RESOLVED: ORPHAN_RESOLVED_EVENT,
   SHUTDOWN_DRAINED: "TASK_WORKER_TURNS_DRAINED",
@@ -1799,8 +1799,8 @@ export class WorkerTurnRunner {
   /**
    * An earlier turn of this task that may have launched a process never recorded: no pid to confirm gone.
    * #1096 — one the operator's repair has since released no longer blocks, and only as far as
-   * `orphanResolutionVerified` traces that release to the operator's admitted receipt for exactly this
-   * orphan event; a resolution row alone is never enough. The orphan row itself is never removed.
+   * `orphanResolutionVerified` verifies that repair's own durable release record for exactly this orphan
+   * event; a resolution row the audit API wrote is never enough. The orphan row itself is never removed.
    */
   private blockedOrphan(taskId: string): { executionId: string; eventId: number } | null {
     const [first] = unresolvedUnidentifiedOrphans(this.ports.db, { taskId });

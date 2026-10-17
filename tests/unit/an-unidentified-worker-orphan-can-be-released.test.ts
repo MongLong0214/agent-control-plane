@@ -8,6 +8,12 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION, RepairService } from "../../src/doctor/repair.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
+import {
+  ORPHAN_RELEASE_AUTHORIZATION_KEY,
+  orphanExecutionOf,
+  orphanReleaseAuthorization,
+  orphanReleaseParameterDigest,
+} from "../../src/run/worker-orphan-release.ts";
 import { WorkerTurnEvent, WorkerTurnRunner, type WorkerTurnOptions } from "../../src/run/worker-turn.ts";
 import { cleanupTempDirs, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { FakeWorkerAdapter, seedWorkerWorld, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
@@ -18,8 +24,9 @@ import { FakeWorkerAdapter, seedWorkerWorld, type WorkerWorld } from "../helpers
  * for good. The operator's way out is an audited, allowlisted repair: once nothing of the orphan runs,
  * `release_unidentified_worker_orphan` records that one orphan event resolved, and the task is admitted
  * again. It is owner-authorised: the operator's receipt is admitted through ingress for exactly this
- * orphan event, and the task's reader traces the resolution to that admission, so a resolution row the
- * repair did not write — or wrote under a receipt for something else — releases nothing.
+ * orphan event, the repair proves the owner live when it writes, and the task's reader accepts only the
+ * repair's own release record, so a resolution row the audit API wrote — even one in the repair's exact
+ * shape — or one under a receipt for something else releases nothing.
  *
  * The repair reads the process table and signals nothing. Its "nothing runs" check is real: the fake
  * provider's child carries `--session-id <the worker session>` as the provider CLI does, and only the
@@ -168,7 +175,7 @@ describe("#1096 an operator can release a task held by an unidentified worker or
     adapter.killAll();
     await runner.settled(executionId);
     // A resolution row the repair never wrote releases nothing, even naming the exact orphan event and a
-    // receipt the operator really had admitted for it: that one a repair refused, and never consumed.
+    // receipt the operator really had admitted for it: the audit API wrote it, not the release repair.
     appendResolution(world, executionId, orphanEventId, whileRunningReceipt);
     expect((await retry()).allowed).toBe(false);
 
@@ -208,5 +215,84 @@ describe("#1096 an operator can release a task held by an unidentified worker or
 
     // Released once; a second release has nothing to resolve.
     expect((await release(exact)).reasonCode).toBe(ReasonCode.REPAIR_PRECONDITION_UNMET);
+  });
+
+  it("the audit API cannot write a release even in the repair's exact shape and digest, and a non-owner receipt releases nothing", async () => {
+    const world = seedWorkerWorld(makeCore());
+    const adapter = new UnrecordedSpawnAdapter(world.broker);
+    adapters.push(adapter);
+    adapter.script = { hold: true, ignoreAbort: true };
+    const runner = makeRunner(world, adapter);
+    const request = {
+      runId: world.runId, taskId: world.taskId, claimId: world.claimId,
+      ownerSessionId: world.cto.sessionId, ownerBindingGeneration: world.cto.generation,
+    };
+    const started = await runner.start(request);
+    if (!started.allowed) throw new Error(started.message);
+    const executionId = started.value.executionId;
+    await waitFor(() => adapter.launches === 1, "the provider launch");
+    const restarted = makeRunner(world, adapter);
+    await restarted.reconcileAfterRestart();
+    adapter.killAll();
+    await runner.settled(executionId);
+    const orphanRow = world.audit.byKind(WorkerTurnEvent.ORPHAN_UNIDENTIFIED)[0]!;
+    const orphan = { eventId: orphanRow.eventId, executionId, taskId: world.taskId, runId: orphanRow.runId };
+    const exact = { executionId, orphanEventId: String(orphan.eventId), confirm: "nothing-running" };
+
+    // A non-owner's receipt, admitted by an ingress that allowlists it, is refused by the configured owner
+    // authority before anything is checked or written.
+    const nonOwnerIngress = new IngressGuard(world.db, world.clock, world.audit, { cli: { allowedActors: ["not-the-owner"] } });
+    const approval = {
+      runId: null, candidateSnapshotDigest: null, operation: REPAIR_OWNER_APPROVAL_OPERATION,
+      parameters: { operationId: "release_unidentified_worker_orphan", parameters: exact, dryRun: false },
+      idempotencyKey: "non-owner-release", approved: true,
+    };
+    const nonOwner = nonOwnerIngress.admitOwnerApproval(
+      { channel: "cli", actor: "not-the-owner", nonce: "non-owner-release", payload: ownerApprovalPayload(approval) },
+      approval,
+    );
+    if (!nonOwner.allowed) throw new Error(nonOwner.message);
+    const repairs = repairsFor(world);
+    const refused = await repairs.execute({
+      operationId: "release_unidentified_worker_orphan", parameters: exact, authorizedBy: "OWNER", dryRun: false, ownerApproval: nonOwner.value,
+    });
+    expect(refused.reasonCode).toBe(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED);
+
+    // The operator's real receipt, really consumed by the owner authority, and a resolution row in the
+    // repair's exact shape with the exact digest the reader recomputes — written through the audit API.
+    const receipt = operatorReceipt(world, exact, false);
+    expect(new OwnerAuthority(world.db, [OPERATOR], world.clock).consumeApproval(receipt, null).allowed).toBe(true);
+    const ownerApproval = {
+      channel: receipt.channel, actor: receipt.actor, nonce: receipt.inboundNonce,
+      receiptDigest: digestOf(receipt), parameterDigest: orphanReleaseParameterDigest(executionId, orphan.eventId),
+    };
+    const authorization = orphanReleaseAuthorization(orphan, orphanExecutionOf(world.db, executionId)!, ownerApproval);
+    const forged = world.audit.record({
+      kind: WorkerTurnEvent.ORPHAN_RESOLVED,
+      runId: orphan.runId,
+      actor: `${receipt.channel}:${receipt.actor}`,
+      evidence: {
+        executionId, taskId: world.taskId, orphanEventId: orphan.eventId, operationId: "release_unidentified_worker_orphan",
+        ownerApproval, [ORPHAN_RELEASE_AUTHORIZATION_KEY]: authorization,
+      },
+    });
+    expect(forged.allowed).toBe(true);
+    const stored = world.audit.byKind(WorkerTurnEvent.ORPHAN_RESOLVED).at(-1)!.evidence[ORPHAN_RELEASE_AUTHORIZATION_KEY];
+    adapter.script = { neverRuns: true };
+    const afterForgery = await restarted.start(request);
+    console.error(`WITNESS orphan-release-audit-api ${JSON.stringify({ refused: refused.reasonCode, stored, afterForgery: afterForgery.reasonCode })}`);
+    expect(stored).toBe("[redacted]");
+    expect(afterForgery.allowed).toBe(false);
+    expect(world.audit.byKind(WorkerTurnEvent.ORPHAN_RESOLVED)).toHaveLength(1);
+
+    // The repair itself, under a fresh owner receipt, releases it.
+    const released = await repairs.execute({
+      operationId: "release_unidentified_worker_orphan", parameters: exact, authorizedBy: "OWNER", dryRun: false,
+      ownerApproval: operatorReceipt(world, exact, false),
+    });
+    expect(released.allowed).toBe(true);
+    const admitted = await restarted.start(request);
+    expect(admitted.allowed, admitted.allowed ? "" : `${admitted.reasonCode} ${admitted.message}`).toBe(true);
+    if (admitted.allowed) await restarted.settled(admitted.value.executionId);
   });
 });
