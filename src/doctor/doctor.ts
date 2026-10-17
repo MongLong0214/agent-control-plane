@@ -9,6 +9,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import { RefreshTrigger } from "../capacity/capacity-monitor.ts";
+import { BUZZ_BIND_CHALLENGE_TTL_MS } from "../buzz/buzz-bind-challenge.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import { latestReceiptLookupError } from "../conversation/turn-coordinator.ts";
@@ -171,6 +172,19 @@ const inspectPin = (path: string): { condition: PinCondition; error?: string } |
     };
   }
 };
+
+/**
+ * The official recovery for CEO_BUZZ_IDENTITY_UNBOUND (the `buzz_actor_bind` possession handshake).
+ * Doctor only names it: it never mints a challenge, and a minted challenge is not the recovery.
+ */
+const CEO_BUZZ_IDENTITY_RECOVERY = {
+  tool: "buzz_actor_bind",
+  caller: "CEO",
+  argument: "actor: the CEO's own Buzz actor",
+  challengeValidForMs: BUZZ_BIND_CHALLENGE_TTL_MS,
+  answer: "a Buzz mention of the CTO carrying the challenge, signed with that actor's key",
+  completion: "the signed answer accepted and a readback of the current canonical CEO binding's runtime showing its buzz_actor_id; a challenge alone is not completion",
+} as const;
 
 export interface Finding {
   code: string;
@@ -695,10 +709,15 @@ export class Doctor {
             bindingGeneration: ceo.bindingGeneration,
             lifecycle: runtime.lifecycle,
             buzzActorId: null,
+            recovery: CEO_BUZZ_IDENTITY_RECOVERY,
           },
           recommendedAction:
-            "bind the CEO runtime's Buzz identity (the possession-proven key rebind); until then " +
-            "every CEO->CTO peer mention is refused",
+            `the CEO runs ${CEO_BUZZ_IDENTITY_RECOVERY.tool} with its own Buzz actor to get a one-time ` +
+            `challenge (valid ${BUZZ_BIND_CHALLENGE_TTL_MS / 60_000} minutes), then posts it in a Buzz ` +
+            "mention of the CTO signed with that actor's key; done only when that signed answer is " +
+            "accepted and a readback of the current canonical CEO binding's runtime shows its " +
+            "buzz_actor_id, since issuing a challenge alone binds nothing. Until then every CEO->CTO " +
+            "peer mention is refused",
         });
       }
     }
