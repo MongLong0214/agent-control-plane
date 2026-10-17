@@ -37,6 +37,31 @@ describe("a CEO session with no Buzz identity bound is named by doctor (#1112)",
     expect(await findingsOf(harness, "cto")).toContainEqual(expect.objectContaining({ code: CODE }));
   });
 
+  it("names the official recovery: buzz_actor_bind, the signed answer, and the readback that completes it", async () => {
+    const harness = makeHarness();
+    const sessionId = bindCeo(harness);
+
+    const finding = (await findingsOf(harness)).find((f) => f.code === CODE);
+    expect(finding).toBeDefined();
+    // Severity and blocking state are unchanged by naming the action.
+    expect(finding).toMatchObject({ severity: "WARN", blocking: false });
+    expect(finding?.observedEvidence["recovery"]).toEqual({
+      tool: "buzz_actor_bind",
+      caller: "CEO",
+      argument: "actor: the CEO's own Buzz actor",
+      challengeValidForMs: 10 * 60 * 1000,
+      answer: "a Buzz mention of the CTO carrying the challenge, signed with that actor's key",
+      completion: "the signed answer accepted and a readback of the current canonical CEO binding's runtime showing its buzz_actor_id; a challenge alone is not completion",
+    });
+    const text = finding?.recommendedAction ?? "";
+    expect(text).toMatch(/^the CEO runs buzz_actor_bind with its own Buzz actor to get a one-time challenge \(valid 10 minutes\)/);
+    expect(text).toContain("posts it in a Buzz mention of the CTO signed with that actor's key");
+    expect(text).toContain("a readback of the current canonical CEO binding's runtime shows its buzz_actor_id");
+    expect(text).toContain("issuing a challenge alone binds nothing");
+    // Doctor names the action and performs none of it: the runtime is still unbound.
+    expect(harness.cp.sessions.get(sessionId)?.buzzActorId).toBeNull();
+  });
+
   it("stays quiet once the CEO's runtime carries a Buzz identity", async () => {
     const harness = makeHarness();
     const sessionId = bindCeo(harness);
