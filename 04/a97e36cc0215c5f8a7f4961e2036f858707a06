@@ -1,0 +1,14 @@
+Limit: no restore once the daemon has restarted since the revocation or when the relay is on cto.mcp.sock, because no open reattach connection remains to prove the session live; doctor names that condition
+Warn: a canonical PRIMARY_CTO revoked only for capacity is restored on the same session at the next generation only after a fresh HEALTHY admission, a challenge answered over the session's still-open reattach connection, and an in-transaction recheck of the revoke reason, owner hold, replacement and other holders; the revoked credential is rotated and its plaintext discarded rather than revived, and runtime-unavailable or compound revocations are never restored automatically
+Record-Id: r-440b60cd8494
+Provenance: inherited 107ce76592855778a7d45a3d2edbd1520da03da4
+
+Limit: the reattach acknowledgement carries no role field, so the relay takes its own role from its --project argument
+Warn: the attach relay adopts a different binding on reconnect only through the one committed capacity-restore succession the daemon announces on the connection it challenged, naming the relay's own role and binding as from and the same role, session and incarnation at generation plus one as to; the next reconnect must name exactly that binding and the succession is consumed, so a rebind, a replacement, another holder or another project's role is refused rather than adopted as a higher generation
+Record-Id: r-302364efc78f
+Provenance: inherited 3813a75eec9bad511e52017a383a2ca9a97bc2f0
+
+Warn: the attach relay adopts a different binding on reconnect only through the one committed capacity-restore succession announced on the challenged connection, and the predecessor role it checks is the roleKey the daemon's reattach acknowledgement names for that admission (bound to its assignment, generation, session and incarnation), never a role derived from the relay's own --project argument; a missing or tampered roleKey, another role or holder, a reused tuple and a replay are refused, while a stale claim selector with a same-role restore succeeds
+Record-Id: r-e92364acd64d
+Supersedes: r-302364efc78f
+Provenance: inherited 88dab900cc1fc06de271d674dad3e95901f804ab
