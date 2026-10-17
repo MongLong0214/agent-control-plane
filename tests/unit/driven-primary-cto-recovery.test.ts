@@ -6,13 +6,13 @@ import { IN_BAND_REWAKE_MS } from "../../src/outbox/outbox.ts";
 import { DRIVEN_PRIMARY_CTO_SPAWN_RECORD } from "../../src/runtime/provisioned-session-runtime.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import {
-  DRIVEN_HANDOFF,
   actOnWorkTurns,
   countAudit,
   drivenPrimary,
   externalOf,
   holdNextAttestation,
   openActivationHandoff,
+  producedHandoff,
   routeInBandWakes,
   workTurnsOf,
 } from "../helpers/driven-primary-cto.ts";
@@ -85,7 +85,7 @@ describe("#246 C4-R2 — a driven PRIMARY_CTO is recovered on its own session, a
       // The handoff is queued, and the daemon goes down before any turn acknowledged it: what it held
       // in memory for the session — the credential and its attestation — is gone.
       cp.outbox.attachInBandWake(async () => ({ allowed: true, reasonCode: ReasonCode.OK, value: undefined, evidence: {} }));
-      const opened = openActivationHandoff(f)("recover-crash", bootstrap.runId, binding.sessionId, DRIVEN_HANDOFF);
+      const opened = openActivationHandoff(f)("recover-crash", bootstrap.runId, binding.sessionId, producedHandoff(f, bootstrap.runId, "recover-crash"));
       if (!opened.allowed) throw new Error(opened.message);
       const messageId = cp.outbox.byIdempotencyKey(`bootstrap-handoff:${opened.value.handoffId}`)!.messageId;
       cp.sessionRuntime.release(binding.sessionId);

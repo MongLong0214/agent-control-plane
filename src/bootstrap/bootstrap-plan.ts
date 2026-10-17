@@ -15,6 +15,7 @@ import type { HandoffPackage } from "../cto/cto-lifecycle.ts";
 import type { Db } from "../db/database.ts";
 import { RunKind } from "../domain/types.ts";
 import { parseGitHubIdentity } from "./github-write-port.ts";
+import type { RepoFactoryResult } from "./repo-factory-result.ts";
 import { githubOperationSchema, isCreateOnlyPlan, preflightGitHubOperations, type GitHubOperation } from "./repo-factory-github.ts";
 import {
   VERIFICATION_KINDS,
@@ -106,6 +107,81 @@ export const bootstrapActivationHandoff = (manifest: ProjectManifest): HandoffPa
   knownRisks: [],
   recommendedNextAction: "acknowledge this handoff; the project's first work arrives as a run",
 });
+
+/** What a bootstrap's facts are bound to: the PLAN's target repository, default branch and required verification. */
+export interface BootstrapFactsTarget {
+  repositoryIdentity: string;
+  defaultBranch: string;
+  verificationCommandId: string;
+}
+
+/**
+ * Review of run_7717 (F4) and of PR #1122 R1 (BCG-R1-02) — the repository facts a stored producer result
+ * establishes, the one selection delivery, the ACK and the CONFIRM all make. The result must name exactly
+ * the PLAN's target repository, on the PLAN's default branch, and every verification row it carries for
+ * that repository must name one head, which the PLAN's required verification row names: never the first
+ * PASS row of any command. Conflicting rows, a missing required row, or a head that is not a full SHA are
+ * refused. That this head and branch are the create's own readback is checked where the readback is held,
+ * the attempt ledger (`RepoFactoryBootstrapRunner.writtenChain`).
+ */
+export const observedRepositoryFacts = (
+  result: RepoFactoryResult,
+  target: BootstrapFactsTarget,
+): Decision<HandoffPackage["repositoryFacts"]> => {
+  const refuse = (message: string, evidence: Evidence = {}) =>
+    deny(ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, message, { refusal: "RESULT_FACTS_UNBOUND", ...target, ...evidence }) as Decision<
+      HandoffPackage["repositoryFacts"]
+    >;
+  const [repository, ...others] = result.repositories;
+  if (repository === undefined || others.length > 0 || repository.identity !== target.repositoryIdentity) {
+    return refuse("the producer result does not name exactly the PLAN's target repository", {
+      repositories: result.repositories.map((row) => row.identity),
+    });
+  }
+  if (repository.defaultBranch !== target.defaultBranch) {
+    return refuse("the producer result's default branch is not the PLAN's", { reported: repository.defaultBranch });
+  }
+  const rows = result.bootstrapVerification.filter((row) => row.repositoryIdentity === repository.identity);
+  const heads = [...new Set(rows.map((row) => row.exactHead))];
+  const required = rows.find((row) => row.commandId === target.verificationCommandId && row.status === "PASS");
+  if (heads.length !== 1 || required === undefined || !/^[0-9a-f]{40}$/.test(required.exactHead)) {
+    return refuse("the producer result's verification rows do not name one head under the PLAN's required verification", {
+      heads,
+      commands: rows.map((row) => row.commandId),
+    });
+  }
+  return allow(ReasonCode.OK, [{ identity: repository.identity, branch: repository.defaultBranch, head: required.exactHead }]);
+};
+
+/**
+ * The handoff activation delivers: `planned` (whose repository facts the PLAN cannot know before the
+ * create, so null) with the facts `observedRepositoryFacts` selected from the stored producer result,
+ * so a retried activation delivers the same package.
+ */
+export const deliveredBootstrapHandoff = (planned: HandoffPackage, facts: HandoffPackage["repositoryFacts"]): HandoffPackage => ({
+  ...planned,
+  repositoryFacts: facts,
+});
+
+/** The facts target of a PLAN's planned outputs. */
+export const factsTargetOf = (outputs: PlannedBootstrapOutputs): BootstrapFactsTarget => ({
+  repositoryIdentity: outputs.target.repositoryIdentity,
+  defaultBranch: outputs.defaultBranch,
+  verificationCommandId: outputs.verification.commandId,
+});
+
+/** Whether a delivered handoff's repository facts are exactly `observed`, one fact per repository. */
+export const handoffFactsAre = (handoff: Partial<HandoffPackage>, observed: HandoffPackage["repositoryFacts"]): boolean => {
+  const delivered = Array.isArray(handoff.repositoryFacts) ? handoff.repositoryFacts : [];
+  return (
+    observed.length > 0 &&
+    delivered.length === observed.length &&
+    observed.every((want) => {
+      const facts = delivered.filter((fact) => fact?.identity === want.identity);
+      return facts.length === 1 && want.branch !== null && want.head !== null && facts[0]!.branch === want.branch && facts[0]!.head === want.head;
+    })
+  );
+};
 
 export interface BootstrapPlanPreflight {
   plan: ApprovedBootstrapPlan;

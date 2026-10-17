@@ -19,13 +19,13 @@ import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
-import { ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunKind, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { git } from "../../src/git/git.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
-import { bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan, submitBootstrapPlan } from "./bootstrap-plan.ts";
+import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest, reviewBootstrapPlan, submitBootstrapPlan } from "./bootstrap-plan.ts";
 import { FakeGitHub, type Target } from "./fake-github-write-port.ts";
 import { tempDir } from "./fixtures.ts";
-import { TEST_OWNER, dispatchBootstrapRun, makeHarness, type Harness } from "./harness.ts";
+import { TEST_OWNER, bindCeo, dispatchBootstrapRun, makeHarness, reviewerPass, type Harness } from "./harness.ts";
 
 /**
  * Issue #246 — a PROJECT_BOOTSTRAP run at CEO review and the Repo Factory runner wired to the
@@ -141,6 +141,11 @@ export const prepareBootstrapRun = async (
     ownerIdentities?: readonly OwnerIdentity[];
     /** A PLAN the owner submits first and then replaces with the reviewed one, superseding its task. */
     earlierPlan?: Record<string, unknown>;
+    /**
+     * The pre-#1114 shape: the run's one task stored before any PLAN, so no BOOTSTRAP_PLAN_TASKS record
+     * binds it, and the PLAN stored as an artifact rather than through `plan_submit`; then reviewed.
+     */
+    legacyTask?: boolean;
   },
 ): Promise<PreparedBootstrapRun> => {
   const harness = makeHarness(options.ownerIdentities === undefined ? {} : { ownerIdentities: options.ownerIdentities });
@@ -153,7 +158,9 @@ export const prepareBootstrapRun = async (
   const plan = bootstrapPlan(manifest, { operations: ops });
   const plannable = plannedBootstrapOutputs({ runId, planArtifact: { digest: "probe", content: plan } }, manifest).allowed;
   if (options.earlierPlan !== undefined) await submitBootstrapPlan(harness, runId, options.earlierPlan);
-  const reviewed = await reviewBootstrapPlan(harness, runId, plannable ? plan : bootstrapPlan(cleanTreeManifest(projectId)));
+  const reviewed = options.legacyTask === true
+    ? await reviewLegacyBootstrapPlan(harness, runId, plan)
+    : await reviewBootstrapPlan(harness, runId, plannable ? plan : bootstrapPlan(cleanTreeManifest(projectId)));
   const planArtifact = plannable ? { digest: reviewed.planDigest } : harness.cp.artifacts.put(runId, "PLAN", plan);
 
   const workRoot = tempDir("acp-246-runner-");
@@ -213,6 +220,27 @@ export const prepareBootstrapRun = async (
       handoff: HANDOFF,
     },
   };
+};
+
+/** `legacyTask`'s review: one task stored before any PLAN, the PLAN stored as an artifact, then reviewed to CEO review. */
+const reviewLegacyBootstrapPlan = async (harness: Harness, runId: string, plan: Record<string, unknown>) => {
+  const ceoSessionId = harness.cp.bindings.active(roleKeyFor(Role.CEO))?.sessionId ?? bindCeo(harness);
+  const submitted = harness.cp.tasks.submit(runId, [{ key: "legacy", title: "a task stored before any PLAN", category: "implementation" }]);
+  if (!submitted.allowed) throw new Error(submitted.message);
+  const planArtifact = harness.cp.artifacts.put(runId, "PLAN", plan);
+  harness.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(harness, runId)) });
+  const run = harness.cp.runs.require(runId);
+  const outcome = await harness.cp.pipeline.submitResult({
+    runId,
+    ownerSessionId: run.ownerSessionId!,
+    ownerBindingGeneration: run.ownerBindingGeneration!,
+    resultSummary: "the planned bootstrap outputs",
+    recommendation: "create the repository",
+  });
+  if (!outcome.allowed || outcome.value.stage !== "COMPLETED_REVIEW") {
+    throw new Error(`the legacy bootstrap plan was not reviewed to CEO review: ${JSON.stringify(outcome)}`);
+  }
+  return { planDigest: planArtifact.digest, snapshotDigest: outcome.value.snapshotDigest, ceoSessionId };
 };
 
 /**

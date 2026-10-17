@@ -23,6 +23,10 @@ import {
   bootstrapPlanIntentTasks,
   bootstrapReviewIntentCurrent,
   currentBootstrapPlan,
+  deliveredBootstrapHandoff,
+  factsTargetOf,
+  handoffFactsAre,
+  observedRepositoryFacts,
   sameBootstrapPlanBinding,
 } from "./bootstrap-plan.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
@@ -210,6 +214,14 @@ export class BootstrapActivation {
     const provenance = await this.validateFactoryProvenance(input, result, approvedDigest);
     if (!provenance.allowed) return provenance as Decision<ACPBootstrapActivationResult>;
 
+    // PR #1122 R1 (BCG-R1-02) — the repository facts the handoff will carry, selected from this result
+    // bound to the PLAN's target and required verification, refused here (conflicting verification rows
+    // included) before anything is written or delivered.
+    const current = currentBootstrapPlan(input.runId, this.artifacts.latest<unknown>(input.runId, ArtifactKind.PLAN));
+    if (!current.allowed) return current as Decision<ACPBootstrapActivationResult>;
+    const facts = observedRepositoryFacts(result, factsTargetOf(current.value.outputs));
+    if (!facts.allowed) return facts as Decision<ACPBootstrapActivationResult>;
+
     // Everything that can be refused is refused *before* the first mutation. Registering a
     // project, binding a primary CTO and then denying would leave a half-activated
     // project behind and make a retry conflict with itself (Integration §7 Phase J).
@@ -307,12 +319,13 @@ export class BootstrapActivation {
     const ctoSession = this.sessions.get(primaryCtoBinding.sessionId);
 
     // 8/9. Structured handoff must be persisted and acknowledged *by the incoming
-    // session* (§26.5). This call only records and delivers it; the ack is a separate act.
+    // session* (§26.5). This call only records and delivers it; the ack is a separate act. What is
+    // delivered carries the repository facts of the validated result, not the PLAN-time nulls (F4).
     const handoff = this.openActivationHandoff(
       projectId,
       input.runId,
       primaryCtoBinding.sessionId,
-      input.handoff,
+      deliveredBootstrapHandoff(input.handoff, facts.value),
     );
     if (!handoff.allowed) return handoff as Decision<ACPBootstrapActivationResult>;
     const handoffAck = this.acknowledgedActivationHandoff(
@@ -563,6 +576,52 @@ export class BootstrapActivation {
     }
     const project = this.projects.get(projectId);
     const primary = this.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }));
+    // Review of run_7717 (F2) — activation compared the manifest before this transaction. The CONFIRM
+    // completes only while the project's active manifest is still the one the run's current PLAN names,
+    // and its repository bindings are the PLAN's planned target (checked with the bindings below).
+    const plan = currentBootstrapPlan(input.runId, this.artifacts.latest<unknown>(input.runId, ArtifactKind.PLAN));
+    if (!plan.allowed) return plan as Decision<ACPBootstrapActivationResult>;
+    const plannedManifestDigest = plan.value.binding.projectManifestDigest;
+    if (project?.activeManifestDigest !== plannedManifestDigest) {
+      return deny(
+        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        "the project's active manifest is not the one this run's PLAN names; the CONFIRM completes nothing on another manifest",
+        {
+          refusal: "ACTIVE_MANIFEST_NOT_PLANNED",
+          runId: input.runId,
+          projectId,
+          activeManifestDigest: project?.activeManifestDigest ?? null,
+          projectManifestDigest: plannedManifestDigest,
+        },
+      );
+    }
+    // Review of run_7717 (F3) — the handoff was opened to, and is acknowledged only by, one session. The
+    // CONFIRM completes only while that session is the project's PRIMARY_CTO: a replacement bound since
+    // has received and acknowledged nothing, and no path redelivers a bootstrap handoff to it.
+    if (primary !== null && primary.sessionId !== handoffArtifact.content.toSessionId) {
+      return deny(
+        ReasonCode.HANDOFF_ACK_REQUIRED,
+        "the bootstrap handoff's recipient is no longer the project's PRIMARY_CTO; the replacement has acknowledged nothing, so the CONFIRM completes nothing",
+        {
+          refusal: "ACK_RECIPIENT_NOT_PRIMARY_CTO",
+          runId: input.runId,
+          projectId,
+          handoffId: handoffArtifact.content.handoffId,
+          handoffRecipient: handoffArtifact.content.toSessionId,
+          primaryCto: primary.sessionId,
+          primaryCtoGeneration: primary.bindingGeneration,
+        },
+      );
+    }
+    // PR #1122 R1 (BCG-R1-01) — the package the run's handoff delivered, ACKed or not, must carry the
+    // observed facts, by the check its ACK makes; the completion chain asked above has bound those facts
+    // to this create execution's readback in the attempt ledger. An ACK of an earlier package proves nothing.
+    const delivered = this.db.get<{ package_json: string }>(`SELECT package_json FROM handoffs WHERE handoff_id = ? AND kind = 'BOOTSTRAP'`, [
+      handoffArtifact.content.handoffId,
+    ]);
+    const deliveredFacts = this.observedHandoffFacts(handoffArtifact.content.handoffId, delivered ? JSON.parse(delivered.package_json) : {});
+    if (!deliveredFacts.allowed) return deliveredFacts as Decision<ACPBootstrapActivationResult>;
+    const target = plan.value.outputs.target;
     const ctoSession = primary ? this.sessions.get(primary.sessionId) : null;
     const handoffAck = this.acknowledgedActivationHandoff(
       input.runId,
@@ -573,6 +632,8 @@ export class BootstrapActivation {
       const local = this.repositories.byIdentity(repository.identity);
       if (
         !local ||
+        repository.identity !== target.repositoryIdentity ||
+        repository.role !== target.repositoryRole ||
         local.projectId !== projectId ||
         local.repositoryRole !== repository.role ||
         local.activeManifestDigest !== project?.activeManifestDigest
@@ -673,7 +734,12 @@ export class BootstrapActivation {
       toSessionId: string;
       handoff: HandoffPackage;
     }>(runId, ArtifactKind.HANDOFF);
-    if (recorded) {
+    // PR #1122 R1 (BCG-R1-01) — a recorded handoff whose delivered package lacks the observed facts (one
+    // persisted before they were delivered) is reissued: a fresh PENDING handoff, to the current
+    // PRIMARY_CTO, of the same package with the observed facts, for a new ACK. Only that differs; the
+    // earlier handoff row and artifact are kept as they are, and its ACK, if any, is evidence of nothing.
+    const reissues = recorded !== null && this.reissuable(projectId, recorded.content, handoff);
+    if (recorded && !reissues) {
       const recordedDigest = digestOf(recorded.content.handoff);
       if (
         recorded.content.projectId !== projectId ||
@@ -741,15 +807,37 @@ export class BootstrapActivation {
       projectId,
       runId,
       sessionId: toSessionId,
-      evidence: { handoffId, source: "bootstrap-activation" },
+      evidence: { handoffId, source: "bootstrap-activation", ...(reissues ? { reissuedFrom: recorded.content.handoffId } : {}) },
     });
     return allow(ReasonCode.OK, { handoffId });
   }
 
+  /**
+   * Whether a recorded BOOTSTRAP handoff is replaced by `handoff`: the recorded one's delivered package
+   * does not carry the observed facts, `handoff` does, and the two packages differ in nothing else.
+   */
+  private reissuable(
+    projectId: string,
+    recorded: { handoffId: string; projectId: string; handoff: HandoffPackage },
+    handoff: HandoffPackage,
+  ): boolean {
+    const row = this.db.get<{ package_json: string }>(`SELECT package_json FROM handoffs WHERE handoff_id = ? AND kind = 'BOOTSTRAP'`, [
+      recorded.handoffId,
+    ]);
+    const factless = (pkg: Partial<HandoffPackage>) => digestOf({ ...pkg, repositoryFacts: [] });
+    return (
+      row !== undefined &&
+      recorded.projectId === projectId &&
+      !this.observedHandoffFacts(recorded.handoffId, JSON.parse(row.package_json) as Partial<HandoffPackage>).allowed &&
+      this.observedHandoffFacts(recorded.handoffId, handoff).allowed &&
+      factless(recorded.handoff) === factless(handoff)
+    );
+  }
+
   /** The ack, as recorded by the incoming session itself. */
   acknowledgeActivationHandoff(handoffId: string, ackBySessionId: string): Decision<void> {
-    const row = this.db.get<{ to_session_id: string; status: string; kind: string }>(
-      `SELECT to_session_id, status, kind FROM handoffs WHERE handoff_id = ?`,
+    const row = this.db.get<{ to_session_id: string; status: string; kind: string; package_json: string }>(
+      `SELECT to_session_id, status, kind, package_json FROM handoffs WHERE handoff_id = ?`,
       [handoffId],
     );
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId });
@@ -763,6 +851,8 @@ export class BootstrapActivation {
         got: ackBySessionId,
       });
     }
+    const observed = this.observedHandoffFacts(handoffId, JSON.parse(row.package_json) as Partial<HandoffPackage>);
+    if (!observed.allowed) return observed;
     if (row.status === "ACKED") return allow(ReasonCode.OK, undefined);
     this.db.run(
       `UPDATE handoffs SET status = 'ACKED', acked_at = ?, ack_by_session_id = ? WHERE handoff_id = ?`,
@@ -777,18 +867,57 @@ export class BootstrapActivation {
     return allow(ReasonCode.OK, undefined);
   }
 
+  /**
+   * Review of run_7717 (F4), PR #1122 R1 — the repository facts a BOOTSTRAP handoff must carry, checked
+   * when its ACK is accepted, when an ACK is relied on, and at CONFIRM: exactly the facts
+   * `observedRepositoryFacts` selects from its run's stored producer result, bound to the run's current
+   * PLAN. A null, planned or other value is refused.
+   */
+  private observedHandoffFacts(handoffId: string, handoff: Partial<HandoffPackage>): Decision<void> {
+    const owner = this.db.get<{ run_id: string }>(
+      `SELECT run_id FROM run_artifacts WHERE kind = ? AND superseded = 0 AND json_extract(content_json, '$.handoffId') = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      [ArtifactKind.HANDOFF, handoffId],
+    );
+    return this.handoffFactsObserved(owner?.run_id ?? null, handoffId, handoff);
+  }
+
+  private handoffFactsObserved(runId: string | null, handoffId: string, handoff: Partial<HandoffPackage>): Decision<void> {
+    const stored = runId === null ? null : this.artifacts.latest<unknown>(runId, ArtifactKind.REPO_FACTORY_RESULT);
+    const parsed = stored ? parseRepoFactoryResult(stored.content) : null;
+    const plan = runId === null ? null : currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+    const observed = parsed?.allowed && plan?.allowed ? observedRepositoryFacts(parsed.value, factsTargetOf(plan.value.outputs)) : null;
+    const expected = observed?.allowed ? observed.value : [];
+    return handoffFactsAre(handoff, expected)
+      ? allow(ReasonCode.OK, undefined)
+      : deny(
+          ReasonCode.HANDOFF_PACKAGE_INCOMPLETE,
+          "the handoff does not carry the observed default branch and exact head of every created repository, so it is not acknowledged",
+          {
+            refusal: "HANDOFF_FACTS_NOT_OBSERVED",
+            handoffId,
+            runId,
+            expected,
+            delivered: Array.isArray(handoff.repositoryFacts) ? handoff.repositoryFacts : [],
+            ...(observed && !observed.allowed ? { result: observed.evidence } : {}),
+          },
+        );
+  }
+
   private acknowledgedActivationHandoff(
     runId: string,
     handoffId: string,
     toSessionId: string,
   ): { handoffId: string; ackedAt: string } | null {
-    const row = this.db.get<{ handoff_id: string; acked_at: string | null }>(
-      `SELECT handoff_id, acked_at FROM handoffs
+    const row = this.db.get<{ handoff_id: string; acked_at: string | null; package_json: string }>(
+      `SELECT handoff_id, acked_at, package_json FROM handoffs
         WHERE handoff_id = ? AND kind = 'BOOTSTRAP' AND to_session_id = ? AND status = 'ACKED'`,
       [handoffId, toSessionId],
     );
     const artifact = this.artifacts.latest<{ handoffId: string }>(runId, ArtifactKind.HANDOFF);
     if (artifact?.content.handoffId !== handoffId) return null;
+    // PR #1122 R1 (BCG-R1-01) — an ACK of a package without the observed facts acknowledges nothing.
+    if (row && !this.observedHandoffFacts(handoffId, JSON.parse(row.package_json) as Partial<HandoffPackage>).allowed) return null;
     return row?.acked_at ? { handoffId: row.handoff_id, ackedAt: row.acked_at } : null;
   }
 
