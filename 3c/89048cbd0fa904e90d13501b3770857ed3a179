@@ -1,0 +1,3 @@
+Warn: after a daemon restart the endpoint registry can already name the relay before the relay has its replayed registration answered, and the relay serves requests only once that answer arrives; a test must wait for the relay to serve again (a bounded ping that repeats only on the exact -32001 not-sent error), not for endpointFor to be non-null
+Record-Id: r-relayreattachreadysignal
+Provenance: inherited fac10682e60e0e1bdd9a0fd13be63300d5f7033f
