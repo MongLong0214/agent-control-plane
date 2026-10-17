@@ -1,0 +1,11 @@
+Limit: the hold is read from audit_events, so a same-uid raw SQLite writer could forge a pause chain; schema v44 has no protected column for it
+Warn: continuity's own pause of a run at CEO review (READY_FOR_CEO_REVIEW to AWAITING_HUMAN) is handed back to CEO review when the role it named is covered again (bootstrap CTO recovery or the incumbent covering again): AWAITING_HUMAN to ACTIVE to READY_FOR_CEO_REVIEW in one transaction, only for the exact pinned owner binding, the same candidate with its packet, a satisfied human gate and no later transition, candidate change, CEO or owner decision; v44 allows no hold column outside BLOCKED, so new pauses name the role and candidate in their RUN_TRANSITION evidence and legacy pauses are named by the continuity revocation their own reconcile pass wrote next
+Warn: a CEO CONFIRM re-evaluates continuity (the pipeline's pre-completion evaluation) in the async MCP door before the synchronous gate, because a daemon restart leaves no evaluation until its first sweep; SURVIVAL and a failed evaluation still refuse
+Record-Id: r-continuityreviewholdrelease
+Provenance: inherited d5186361d4d316e81bf789eda90acb83205e22e4
+
+Limit: every fact the release reads comes from audit_events, which v44 does not guard against a raw SQLite writer, so a same-uid process writing the database directly could forge a pause chain
+Warn: continuity hands its own CEO-review wait back only within the pause's own loss episode: the pause's reconcile pass finished and named the run once, that pass holds exactly one revoke or defer for the owner role with the pause's loss reason, and the restoring binding is the same role, session and incarnation; generations are never compared for equality, and an interrupted pass keeps the wait rather than borrowing a later reconcile's revocation
+Record-Id: r-continuityreviewholdlossepisode
+Follows: r-continuityreviewholdrelease
+Provenance: inherited 423c456db8803dc12d11af7a2004085eb823e8ed
