@@ -20,11 +20,18 @@ import {
   v11Image,
   v43Image,
 } from "../helpers/released-v44-schema.ts";
+import {
+  toV44Image,
+  V45_BASE_CHECKSUM,
+  V45_SCHEMA_DIGEST_FROM_V11,
+  V45_SCHEMA_DIGEST_FROM_V44,
+} from "../helpers/released-v45-schema.ts";
 
 afterAll(cleanupTempDirs);
 
 /**
- * V45-A0, witnesses D3-a and D3-b: the *built* chain finds the v44 snapshot.
+ * V45-A0, witnesses D3-a and D3-b: the *built* chain finds the v44 snapshot — and, since the v45
+ * freeze, the v45 snapshot, which the released v45 step reads in the same way.
  *
  * `migrations.ts` resolves each schema file beside its own module, and the build input is
  * TypeScript only, so a schema file reaches `dist/db/` only if the `build` script copies it. A
@@ -87,8 +94,8 @@ const scratchBuild = (): string => {
 
 /**
  * The compiled half, as a child: it imports only `dist/`, approves (unless told the parent did),
- * opens, and reports the schema at v44 and at the end. Rows rather than a digest, so both sides
- * digest with the same function.
+ * opens, and reports the schema at v44, at v45 and at the end. Rows rather than a digest, so both
+ * sides digest with the same function.
  */
 const CHILD = `
 import Database from "better-sqlite3";
@@ -103,8 +110,11 @@ try {
   const { openDb } = await import(pathToFileURL(distRoot + "/db/database.js").href);
   const { approveMigration } = await import(pathToFileURL(distRoot + "/db/migration-approval.js").href);
   if (approval === "approve") approveMigration(dbPath, "V45-A0 compiled witness");
-  const out = { atV44: null };
-  openDb(dbPath, { afterMigration: (m) => { if (m.toVersion === 44) out.atV44 = rowsOf(); } }).close();
+  const out = { atV44: null, atV45: null };
+  openDb(dbPath, { afterMigration: (m) => {
+    if (m.toVersion === 44) out.atV44 = rowsOf();
+    if (m.toVersion === 45) out.atV45 = rowsOf();
+  } }).close();
   const raw = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
     out.final = raw.prepare(SQL).all();
@@ -119,6 +129,7 @@ try {
 
 interface CompiledRun {
   atV44: SchemaRow[] | null;
+  atV45: SchemaRow[] | null;
   final: SchemaRow[];
   receipts: Array<{ migration_id: string; checksum: string }>;
 }
@@ -143,6 +154,17 @@ const sourceFinal = (path: string): string => {
   return digestOfSchemaRows(schemaRowsOf(path));
 };
 
+/** The v45 step's own receipt checksum, if the run wrote one. */
+const v45Receipt = (run: CompiledRun): string | undefined =>
+  run.receipts.find((row) => row.migration_id === "v45-first-manifest-activation")?.checksum;
+
+/** A v44 image of a database this checkout writes; see `toV44Image`. Not approved. */
+const v44Image = (prefix: string): string => {
+  const path = privateStatePath(prefix);
+  new Db(path).close();
+  return toV44Image(path);
+};
+
 const releasedReceipts = (run: CompiledRun): Record<string, string> =>
   Object.fromEntries(
     run.receipts
@@ -158,7 +180,7 @@ describe("V45-A0: the built chain reads the v44 snapshot from dist", () => {
 
   it("D3-a: pnpm build puts every schema file schemaSqlAt can return into dist/db", () => {
     const wanted = schemaFilesBesideMigrations();
-    expect(wanted).toEqual(expect.arrayContaining(["schema.sql", "schema-v37.sql", "schema-v44.sql"]));
+    expect(wanted).toEqual(expect.arrayContaining(["schema.sql", "schema-v37.sql", "schema-v44.sql", "schema-v45.sql"]));
     const built = readdirSync(join(build, "dist", "db"));
     for (const file of wanted) {
       expect(built, `dist/db/${file}`).toContain(file);
@@ -193,6 +215,39 @@ describe("V45-A0: the built chain reads the v44 snapshot from dist", () => {
     const twin = privateStatePath("acp-a0-src-fresh-");
     new Db(twin).close();
     expect(digestOfSchemaRows(compiled(path, "fresh").final)).toBe(digestOfSchemaRows(schemaRowsOf(twin)));
+  });
+
+  it("v45 freeze: a compiled upgrade of an approved v44 image reaches the v45 build's schema, with v45's shipped receipt", () => {
+    const path = v44Image("acp-v45f-dist-v44-");
+    const twin = v44Image("acp-v45f-src-v44-");
+    const run = compiled(path, "approve");
+    expect(run.atV45).not.toBeNull();
+    expect(digestOfSchemaRows(run.atV45!)).toBe(V45_SCHEMA_DIGEST_FROM_V44);
+    expect(v45Receipt(run)).toBe(V45_BASE_CHECKSUM);
+    expect(digestOfSchemaRows(run.final)).toBe(sourceFinal(twin));
+  });
+
+  it("v45 freeze: a compiled upgrade from v11 reaches the v45 build's schema at v45, with v45's shipped receipt", () => {
+    const run = compiled(v11Image(privateStatePath("acp-v45f-dist-v11-")), "approve");
+    expect(run.atV45).not.toBeNull();
+    expect(digestOfSchemaRows(run.atV45!)).toBe(V45_SCHEMA_DIGEST_FROM_V11);
+    expect(v45Receipt(run)).toBe(V45_BASE_CHECKSUM);
+  });
+
+  // Second to last: it removes the v45 snapshot from this file's build. The v44 RED below fails at
+  // v44, before any step reads the v45 snapshot, so it is unaffected.
+  it("v45 freeze RED: without dist/db/schema-v45.sql the chain fails on ENOENT and the v44 image is unchanged", () => {
+    rmSync(join(build, "dist", "db", "schema-v45.sql"));
+    expect(existsSync(join(build, "dist", "db", "schema-v45.sql"))).toBe(false);
+    const path = v44Image("acp-v45f-dist-missing-");
+    approveMigration(path, "v45 freeze compiled witness, snapshot removed");
+    const before = digestOfSchemaRows(schemaRowsOf(path));
+    const run = runCompiled(path, "approved-by-parent");
+    expect(run.status).not.toBe(0);
+    expect(run.stderr).toMatch(/ENOENT/);
+    expect(run.stderr).toMatch(/schema-v45\.sql/);
+    expect(userVersionOf(path)).toBe(44);
+    expect(digestOfSchemaRows(schemaRowsOf(path))).toBe(before);
   });
 
   // Last: it removes the snapshot from this file's build.

@@ -14,10 +14,13 @@ export const SCHEMA_VERSION = 45;
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
 const v44SchemaPath = fileURLToPath(new URL("./schema-v44.sql", import.meta.url)); // released v38–v44 read only this
+const v45SchemaPath = fileURLToPath(new URL("./schema-v45.sql", import.meta.url)); // released v45 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
-  version <= 37 ? historicalSchemaSql() : version <= 44 ? readFileSync(v44SchemaPath, "utf8") : schemaSql();
+  version <= 37 ? historicalSchemaSql()
+    : version <= 44 ? readFileSync(v44SchemaPath, "utf8")
+      : version <= 45 ? readFileSync(v45SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
