@@ -360,9 +360,16 @@ interface PeerAdmittedDoor<T> {
  * What the canonical CTO door's acknowledgement names: the binding and the runtime this connection
  * was admitted under (review PR1051-R1). A relay that comes back after a restart compares it with
  * what its first admission named and refuses any other, so a reconnect can never adopt a binding or
- * session that replaced its own while it was away. None of the four is a credential.
+ * session that replaced its own while it was away. None of the five is a credential.
+ *
+ * `roleKey` is the role of that binding, as the admission read it from the binding row the process
+ * tree proved — never from anything the peer sent (review S2B-R2-01). The relay holds it with this
+ * connection's tuple and takes a capacity restore's succession on this connection only when it
+ * names exactly that role and tuple as its predecessor; the relay's own claim selectors can name
+ * another project than the one this door admitted it for.
  */
 export interface CanonicalCtoAdmittedTuple {
+  roleKey: string;
   assignmentId: string;
   bindingGeneration: number;
   sessionId: string;
@@ -374,6 +381,7 @@ const admittedLine = (admitted: CanonicalCtoAdmittedTuple): string =>
     ok: true,
     reasonCode: ReasonCode.OK,
     admitted: {
+      roleKey: admitted.roleKey,
       assignmentId: admitted.assignmentId,
       bindingGeneration: admitted.bindingGeneration,
       sessionId: admitted.sessionId,
@@ -453,7 +461,7 @@ export const startAdoptedCeoToolListener = <T>(
 /**
  * Starts the canonical CTO's reattach socket (#1037): the same door, answering an admitted peer
  * with one `{ok:true,admitted}` line before MCP begins, so the relay knows not to claim and knows
- * which binding and runtime it was admitted under.
+ * which role, binding and runtime it was admitted under.
  */
 export const startCanonicalCtoToolListener = <T extends CanonicalCtoAdmittedTuple>(
   daemon: { lock: { held(): boolean } },

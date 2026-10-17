@@ -566,7 +566,7 @@ const answeredWithin = <T>(answer: Promise<T>, budgetMs: number): Promise<T | "u
 const pauseFor = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("review PR1051-R1: a reconnect comes back only to the binding and runtime it left", () => {
-  it("names the admitted binding and runtime in the door's acknowledgement", async () => {
+  it("names the admitted role, binding and runtime in the door's acknowledgement", async () => {
     const { subject, paths } = await started();
     const binding = subject.h.cp.bindings.active(CTO)!;
     const socket = createConnection(paths.reattachPath);
@@ -584,6 +584,8 @@ describe("review PR1051-R1: a reconnect comes back only to the binding and runti
       ok: true,
       reasonCode: ReasonCode.OK,
       admitted: {
+        // Review S2B-R2-01 — the role the door admitted this connection as, read from the binding.
+        roleKey: binding.roleKey,
         assignmentId: binding.assignmentId,
         bindingGeneration: binding.bindingGeneration,
         sessionId: binding.sessionId,
@@ -835,10 +837,14 @@ describe("review PR1051-R4: nothing on the gap path is held without bound", () =
 });
 
 /**
- * A claim socket that answers with a receipt naming `tuple`, and a `cto.mcp.sock` that takes the
+ * A claim socket that answers with a receipt naming `binding`, and a `cto.mcp.sock` that takes the
  * handshake line and then hands each client line to `onLine`. Both count what reaches them.
  */
-const claimedStandIns = async (dir: string, onLine: (socket: Socket, line: Line) => void) => {
+const claimedStandIns = async (
+  dir: string,
+  onLine: (socket: Socket, line: Line) => void,
+  binding: Record<string, unknown> = STAND_IN_TUPLE,
+) => {
   const seen = { claims: [] as string[], handshakes: [] as string[], mcp: [] as Socket[], mcpLines: [] as Line[] };
   const servers: Server[] = [];
   const claimServer = createServer((socket) => {
@@ -848,7 +854,7 @@ const claimedStandIns = async (dir: string, onLine: (socket: Socket, line: Line)
       socket.end(`${JSON.stringify({
         allowed: true,
         reasonCode: ReasonCode.OK,
-        value: { sessionId: STAND_IN_TUPLE.sessionId, sessionSecret: "stand-in-secret-canary", binding: STAND_IN_TUPLE },
+        value: { sessionId: STAND_IN_TUPLE.sessionId, sessionSecret: "stand-in-secret-canary", binding },
       })}\n`);
     });
   });
@@ -920,6 +926,28 @@ describe("review PR1051-R5: a claimed relay comes back after a restart too", () 
       });
     });
   }
+
+  it("review S2B-R2-01: comes back through a door that names its role, whatever role its claim receipt named", async () => {
+    // The claim's connection is admitted under no role: only the door's acknowledgement names one,
+    // so the first door admission of the claimed binding is taken under the role it names.
+    const { dir } = standInPaths();
+    const { seen, paths } = await claimedStandIns(dir, (socket, line) => {
+      if (line.method === "initialize") socket.write(initializeResult(line.id));
+    }, { ...STAND_IN_TUPLE, roleKey: "PRIMARY_CTO:receipt-role" });
+    const door = await standInDoor(paths.reattachPath, (socket, _index, line) => {
+      if (line.method === "initialize") socket.write(initializeResult(line.id));
+    }, false);
+    door.tuple = { ...STAND_IN_TUPLE, roleKey: "PRIMARY_CTO:door-role" };
+    const r = relay(paths, FAST);
+    expect((await initializeWith(r)).error).toBeUndefined();
+    await door.listen();
+    seen.mcp[0]!.destroy();
+    expect(await until(() => door.lines[0]?.some((line) => line.method === "initialize") === true)).toBe(true);
+    expect(r.exited()).toBeNull();
+    expect(r.err()).toBe("");
+    r.stdin.end();
+    expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
+  });
 
   it("reattaches when the claimed connection closes before its first answer, with no refusal", async () => {
     const { dir } = standInPaths();

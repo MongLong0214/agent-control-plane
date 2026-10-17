@@ -862,10 +862,11 @@ export const createCanonicalCtoAttachChallenger = (
         challengeId: id,
         stillAttached: () => stillAttached(connection),
         release: (restored) => {
-          // Review S2B-R1-01 — `from` is what this connection was admitted under, which its relay
-          // was told in the door's acknowledgement; `to` is what the restore committed. Ended only
-          // once the line is written, or once writing it failed: a relay that never reads it
-          // refuses the restored binding on reconnect, which is the safe side.
+          // Review S2B-R1-01 — `from` is what this connection was admitted under, role included,
+          // which its relay was told in the door's acknowledgement (review S2B-R2-01) and is the
+          // only predecessor it accepts on this connection; `to` is what the restore committed.
+          // Ended only once the line is written, or once writing it failed: a relay that never reads
+          // it refuses the restored binding on reconnect, which is the safe side.
           const held = connection.admitted;
           const succession: CanonicalCtoRestoreSuccession = {
             from: {
@@ -1248,7 +1249,7 @@ export const startLocalMcpListeners = async (
         }
         if (!admitted.allowed) return admitted as Decision<AdmittedReattach>;
         // The kernel's peer travels with the admission so a later liveness challenge re-proves the
-        // same process tree; the acknowledgement line still names only the binding tuple.
+        // same process tree; the acknowledgement line names only the role and the binding tuple.
         return allow(admitted.reasonCode, { ...admitted.value, peer });
       },
       (admitted, socket) => {

@@ -188,8 +188,12 @@ const healthy = (clock: ManualClock, observedAt = clock.nowIso()): CapacityReadi
   buckets: [{ id: "weekly-all-models", remainingPercent: 90, resetAt: null, capabilities: ["cto", "ceo"] }],
 });
 
-/** A canonical CTO bound the way the canonical claim binds one, its daemon, its relay and its client. */
-const started = async () => {
+/**
+ * A canonical CTO bound the way the canonical claim binds one, its daemon, its relay and its client.
+ * `relayProject` is the project the relay's own claim selectors name; the door admits on the process
+ * tree whatever they say.
+ */
+const started = async (relayProject = PROJECT) => {
   const root = tempDir("acp-capacity-restore-");
   const clock = new ManualClock("2026-10-10T13:00:00.000Z");
   const claude = new TestProductionAdapter(clock, "claude");
@@ -279,14 +283,17 @@ const started = async () => {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
-  stderr.resume();
+  let stderrText = "";
+  stderr.on("data", (chunk: Buffer) => {
+    stderrText += chunk.toString("utf8");
+  });
   let relayEnded = false;
   const exit = runAttachRelay(
     {
       claimSocketPath: join(dir, "no-claim.sock"),
       mcpSocketPath: join(dir, "cto.mcp.sock"),
       reattachSocketPath: join(dir, "agentcpd.canonical-cto-tools.sock"),
-      claim: { claimedSessionUuid: CONVERSATION, projectId: PROJECT, expectedBindingGeneration: 2 },
+      claim: { claimedSessionUuid: CONVERSATION, projectId: relayProject, expectedBindingGeneration: 2 },
       reattach: POLICY,
       mcpToken: TOKEN,
     },
@@ -354,6 +361,7 @@ const started = async () => {
     sessionCount,
     refusals,
     relayEnded: () => relayEnded,
+    relayStderr: () => stderrText,
     restart: async () => {
       await stop();
       await open();
@@ -779,6 +787,69 @@ describe("review S2B-R1-01: a reconnect adopts only the succession a committed c
   });
 });
 
+/**
+ * Review S2B-R2-01 — the reattach door admits on the process tree, so a relay whose own claim
+ * selectors name another project is still admitted as, and serves, the binding the tree proves. The
+ * predecessor role a succession must name is the one the door's acknowledgement named for the
+ * challenged connection, never one derived from those selectors. The first test is the reviewer's
+ * witness, changed only for paths: at 3813a75e the relay refused the restore of its own binding as
+ * "another role" and the session was left disconnected at generation 2.
+ */
+describe("review S2B-R2-01: the predecessor role is the one the reattach door admitted the connection as", () => {
+  it('R2: a reattach admitted under its actual role survives a capacity restore with stale project selectors', async () => {
+    const f = await started('stale-project-selector');
+    // Reattach proves and serves PROJECT without consulting claim selectors.
+    expect(await f.toolServed()).toBe(true);
+    await f.revokeForCapacity();
+    f.windowResets();
+    const restored = await f.port().restore(CTO);
+    expect(restored?.allowed).toBe(true);
+    expect(f.cp.bindings.active(CTO)).toMatchObject({sessionId:f.sessionId,bindingGeneration:2});
+    const ended = await until(f.relayEnded, 1500);
+    const live = ended ? false : await f.toolServed();
+    console.error({restored:restored?.allowed, live, relayEnded:f.relayEnded(), stderr:f.relayStderr()});
+    expect(live).toBe(true);
+  });
+
+  it("with stale selectors, the restored binding is the one adopted, and nothing is refused on the way", async () => {
+    const f = await started("stale-project-selector");
+    await f.revokeForCapacity();
+    f.windowResets();
+    expect((await f.port().restore(CTO))?.allowed).toBe(true);
+    expect(await until(f.toolServed)).toBe(true);
+    expect(f.relayEnded()).toBe(false);
+    expect(f.relayStderr()).toBe("");
+    expect(f.cp.audit.byKind(CANONICAL_CTO_CAPACITY_RESTORED)).toHaveLength(1);
+    expect(f.sessionCount()).toBe(1);
+  });
+
+  it("with stale selectors, a same-session rebind without a capacity restore is still refused", async () => {
+    const f = await started("stale-project-selector");
+    expect(f.cp.bindings.revoke(CTO, "operator release, not capacity").allowed).toBe(true);
+    const claimed = { executorKind: SELF_CLAIM_EXECUTOR_KIND, targetLocator: CONVERSATION, targetLocatorDigest: sha256(CONVERSATION) };
+    expect(f.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: PROJECT, sessionId: f.sessionId,
+      authenticatedTarget: { claimed, protocolVersion: SELF_CLAIM_PROTOCOL, attestationDigest: digestOf({ review: "stale-rebind" }), verify: () => claimed } }).allowed).toBe(true);
+    await f.restart();
+    expect(await until(f.relayEnded, 2_000)).toBe(true);
+    expect(f.relayStderr()).toBe("attach: reattach admitted another binding\n");
+    expect(f.cp.audit.byKind(CANONICAL_CTO_CAPACITY_RESTORED)).toHaveLength(0);
+  });
+
+  it("with stale selectors, a rebind made after the restore and before the relay returned is refused", async () => {
+    const f = await started("stale-project-selector");
+    await f.revokeForCapacity();
+    f.windowResets();
+    expect((await f.port().restore(CTO))?.allowed).toBe(true);
+    expect(f.cp.bindings.revoke(CTO, "operator release after the restore").allowed).toBe(true);
+    const claimed = { executorKind: SELF_CLAIM_EXECUTOR_KIND, targetLocator: CONVERSATION, targetLocatorDigest: sha256(CONVERSATION) };
+    expect(f.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: PROJECT, sessionId: f.sessionId,
+      authenticatedTarget: { claimed, protocolVersion: SELF_CLAIM_PROTOCOL, attestationDigest: digestOf({ review: "stale-rebind-after-restore" }), verify: () => claimed } }).allowed).toBe(true);
+    expect(f.cp.bindings.active(CTO)?.bindingGeneration).toBe(3);
+    expect(await until(f.relayEnded, 2_000)).toBe(true);
+    expect(f.relayStderr()).toBe("attach: reattach admitted another binding\n");
+  });
+});
+
 describe("review S2B-R1-01: the succession a restore commits names one binding, adopted once", () => {
   it("keeps the relay's copies of the succession method and the challenge prefix in step with the daemon's", () => {
     expect(RESTORE_SUCCESSION_METHOD).toBe(CANONICAL_CTO_RESTORE_SUCCESSION_METHOD);
@@ -824,7 +895,9 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
   type Tuple = typeof HELD;
   type Message = Record<string, unknown>;
   const line = (message: Message): string => `${JSON.stringify(message)}\n`;
-  const admittedAs = (tuple: Tuple): string => line({ ok: true, reasonCode: "OK", admitted: tuple });
+  /** The door's acknowledgement: `tuple`, and the role named by `role` — `{}` names none. */
+  const admittedAs = (tuple: Tuple, role: { roleKey?: unknown } = { roleKey: CTO }): string =>
+    line({ ok: true, reasonCode: "OK", admitted: { ...role, ...tuple } });
   const announcing = (params: Message): Message => ({ jsonrpc: "2.0", method: CANONICAL_CTO_RESTORE_SUCCESSION_METHOD, params });
   const succession = (overrides: { from?: Partial<Tuple & { roleKey: string }>; to?: Partial<Tuple & { roleKey: string }>; challengeId?: string } = {}): Message => ({
     from: { roleKey: CTO, ...HELD, ...overrides.from },
@@ -866,8 +939,11 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
     return { dir, path, connections, lines };
   };
 
-  /** The real relay on that door, with a client on its stdio that answers each `ping` unless told not to. */
-  const relayOn = (door: { dir: string; path: string }, answers: boolean) => {
+  /**
+   * The real relay on that door, with a client on its stdio that answers each `ping` unless told not
+   * to. `projectId` is the project its own claim selectors name.
+   */
+  const relayOn = (door: { dir: string; path: string }, answers: boolean, projectId = PROJECT) => {
     const stdin = new PassThrough();
     const stdout = new PassThrough();
     const stderr = new PassThrough();
@@ -892,7 +968,7 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
         claimSocketPath: join(door.dir, "no-claim.sock"),
         mcpSocketPath: join(door.dir, "no-mcp.sock"),
         reattachSocketPath: door.path,
-        claim: { claimedSessionUuid: CONVERSATION, projectId: PROJECT, expectedBindingGeneration: 1 },
+        claim: { claimedSessionUuid: CONVERSATION, projectId, expectedBindingGeneration: 1 },
         reattach: POLICY,
         mcpToken: TOKEN,
       },
@@ -909,9 +985,10 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
   };
 
   /**
-   * Connection 0 admits `HELD` and challenges with `challenge`; once the client answered it (or at
-   * once, when the client does not answer) it announces `announce` and ends. Connection 1 admits
-   * `readmits`; `later` scripts any connection after it.
+   * Connection 0 admits `HELD` under `role` and challenges with `challenge`; once the client answered
+   * it (or at once, when the client does not answer) it announces `announce` and ends. Connection 1
+   * admits `readmits` under `readmitRole`; `later` scripts any connection after it. Both roles are
+   * `CTO` unless named; the relay's own claim selectors name `relayProject`.
    */
   const restoreThroughStandIn = async (options: {
     announce: Message[];
@@ -919,6 +996,9 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
     answers?: boolean;
     challenge?: string;
     later?: (index: number, socket: Socket) => void;
+    role?: { roleKey?: unknown };
+    readmitRole?: { roleKey?: unknown };
+    relayProject?: string;
   }) => {
     const challenge = options.challenge ?? CHALLENGE;
     const answers = options.answers ?? true;
@@ -928,7 +1008,7 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
     const door = await standInDoor(
       (index, socket) => {
         if (index === 0) {
-          socket.write(admittedAs(HELD));
+          socket.write(admittedAs(HELD, options.role));
           setTimeout(() => {
             socket.write(line({ jsonrpc: "2.0", id: challenge, method: "ping" }));
             if (!answers) setTimeout(() => announceAndEnd(socket), 100);
@@ -936,7 +1016,7 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
           return;
         }
         if (index === 1) {
-          socket.write(admittedAs(options.readmits));
+          socket.write(admittedAs(options.readmits, options.readmitRole));
           return;
         }
         options.later?.(index, socket);
@@ -948,7 +1028,7 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
         announceAndEnd(socket);
       },
     );
-    const relay = relayOn(door, answers);
+    const relay = relayOn(door, answers, options.relayProject);
     return { door, relay };
   };
 
@@ -1062,5 +1142,63 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
     door.connections[1]!.write(line(announcing(succession())), () => door.connections[1]!.destroy());
     expect(await refused(relay)).toBe(true);
     expect(relay.err()).toBe("attach: restore succession refused: it restores another binding\nattach: reattach admitted another binding\n");
+  });
+
+  it.each([
+    ["the relay's selectors name another project than the role the door admitted", "stale-project-selector", CTO],
+    ["the door admitted another project's role than the relay's selectors name", PROJECT, OTHER_ROLE],
+  ] as const)("adopts the restored binding under the role the door admitted, when %s (S2B-R2-01)", async (_case, relayProject, roleKey) => {
+    const { door, relay } = await restoreThroughStandIn({
+      announce: [succession({ from: { roleKey }, to: { roleKey } })],
+      readmits: RESTORED,
+      role: { roleKey },
+      readmitRole: { roleKey },
+      relayProject,
+    });
+    expect(await liveOn(relay, door, 1)).toBe(true);
+    expect(relay.code()).toBeNull();
+    expect(relay.err()).toBe("");
+  });
+
+  it.each([
+    ["names none", {}],
+    ["names an empty one", { roleKey: "" }],
+    ["names one that is not a string", { roleKey: 7 }],
+    ["names null", { roleKey: null }],
+  ] as const)("refuses a succession on a connection whose admission %s (S2B-R2-01, missing role)", async (_case, role) => {
+    const { relay } = await restoreThroughStandIn({ announce: [succession()], readmits: RESTORED, role });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: restore succession refused: this connection was admitted under no role\nattach: reattach admitted another binding\n");
+  });
+
+  it("refuses a succession naming the relay's own selector role when the door admitted another (S2B-R2-01, tampered role)", async () => {
+    const { relay } = await restoreThroughStandIn({ announce: [succession()], readmits: RESTORED, role: { roleKey: OTHER_ROLE } });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: restore succession refused: it restores another role\nattach: reattach admitted another binding\n");
+  });
+
+  it.each([
+    ["another role", { roleKey: OTHER_ROLE }],
+    ["no role", {}],
+  ] as const)("refuses a reconnect that names the restored binding under %s (S2B-R2-01, successor role)", async (_case, readmitRole) => {
+    const { relay } = await restoreThroughStandIn({ announce: [succession()], readmits: RESTORED, readmitRole });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: reattach admitted another binding\n");
+  });
+
+  it.each([
+    ["another role", { roleKey: OTHER_ROLE }],
+    ["no role", {}],
+  ] as const)("refuses a reconnect that names the binding it holds under %s (S2B-R2-01, held role)", async (_case, readmitRole) => {
+    const { relay } = await restoreThroughStandIn({ announce: [], readmits: HELD, readmitRole });
+    expect(await refused(relay)).toBe(true);
+    expect(relay.err()).toBe("attach: reattach admitted another binding\n");
+  });
+
+  it("re-admits the binding it holds under the role its admission named (S2B-R2-01, held role control)", async () => {
+    const { door, relay } = await restoreThroughStandIn({ announce: [], readmits: HELD });
+    expect(await liveOn(relay, door, 1)).toBe(true);
+    expect(relay.code()).toBeNull();
+    expect(relay.err()).toBe("");
   });
 });
