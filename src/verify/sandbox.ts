@@ -308,7 +308,8 @@ export const memoryLimitForPlatform = (
  * Resolving outside also fixes which `git` runs. Inside, the sandbox PATH lists the worktree before
  * `/usr/bin`, so a candidate that commits an executable named `git` at its root was run in place of
  * git -- measured: `git status --porcelain` printed the candidate's output and exited 0 -- while the
- * allowlist outside had approved `/usr/bin/git`.
+ * allowlist outside had approved `/usr/bin/git`. Every other declared executable had the same
+ * exposure until `verificationLaunchArgv` (#1102) launched each one by its resolved absolute path.
  */
 const XCRUN_STUBS: ReadonlySet<string> = new Set(["/usr/bin/git"]);
 const XCRUN = "/usr/bin/xcrun";
@@ -347,8 +348,8 @@ const executableFileAt = (path: string): boolean => {
 };
 
 /**
- * The argv the sandbox execs: the command's own, except that an xcrun stub at argv[0] is replaced by
- * the absolute path of the tool it stands for. A tool that cannot be located, or a location that is
+ * The xcrun-stub step of the argv the sandbox execs (`verificationLaunchArgv`): the argv it is given,
+ * except that an xcrun stub at argv[0] is replaced by the absolute path of the tool it stands for. A tool that cannot be located, or a location that is
  * not an executable of the same name, is a refusal -- falling back to the stub would only move the
  * failure inside the sandbox, where it cannot say why.
  */
@@ -383,6 +384,31 @@ export const sandboxLaunchArgv = async (
     });
   }
   return allow(ReasonCode.OK, [target, ...argv.slice(1)]);
+};
+
+/**
+ * The argv the sandbox execs (#1102): argv[0] is the absolute path the executable allowlist resolved
+ * and judged, outside the sandbox, never a name for the sandbox's PATH to look up. That PATH lists
+ * the worktree ahead of `/usr/local/bin` and `/usr/bin`, and the daemon's PATH, where the allowlist
+ * also finds tools, is not on it at all -- so a candidate that committed an executable named after a
+ * declared command at its root ran in place of the approved tool. Measured: a declared `pnpm`,
+ * approved from a directory on the daemon's PATH, printed the candidate's output and passed.
+ *
+ * The real path is what runs, because it is what the allowlist decided on. A tool that tells its
+ * personalities apart by argv[0] through a symlink therefore sees its real name. An xcrun stub is
+ * then replaced by the tool it stands for, as `sandboxLaunchArgv` says.
+ */
+export const verificationLaunchArgv = async (
+  argv: readonly string[],
+  context: { cwd: string; additionalRoots: readonly string[] },
+): Promise<Decision<readonly string[]>> => {
+  const resolution = resolveVerificationExecutable(argv[0] ?? "", context);
+  if (!resolution.allowed || resolution.resolvedPath === null) {
+    return deny(ReasonCode.INVALID_ARGUMENT, verificationExecutableRefusalMessage(argv, context), {
+      resolvedPath: resolution.resolvedPath,
+    });
+  }
+  return sandboxLaunchArgv([resolution.resolvedPath, ...argv.slice(1)], context);
 };
 
 /** Test-only scope for the independent descendant-fencing regression. */
@@ -514,7 +540,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     rmSync(scratch, { recursive: true, force: true });
     return refused(command, startedMs, startedAt, mechanism, targets.reasonCode, targets.reason);
   }
-  const launch = await sandboxLaunchArgv(command.argv, executableContext);
+  const launch = await verificationLaunchArgv(command.argv, executableContext);
   if (!launch.allowed) {
     rmSync(scratch, { recursive: true, force: true });
     return refused(
@@ -921,6 +947,8 @@ export const buildSandboxEnvironment = (
     // declared executable is allowlisted; the child must not *inherit* it, or a
     // user-writable directory on the daemon's PATH becomes a directory the candidate can
     // resolve binaries out of. This lane widened it while claiming tighter confinement.
+    // It never selects the declared executable: that is exec'd by absolute path
+    // (`verificationLaunchArgv`, #1102). It serves only what the command itself looks up.
     PATH: [
       dirname(process.execPath),
       ...(worktreePath ? [worktreePath] : []),
