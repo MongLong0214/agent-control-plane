@@ -1,0 +1,21 @@
+Warn: a vitest setup file points HOME at a private directory before any test file loads and guards before and after each file, so a test run never resolves the live ~/.agent-control-plane scratch root; SECURITY.md records the same-uid UDF and trigger residual and the residual session-link exposure without reproducing any link; WORKER turns keep no transcript, pinned by a test
+Record-Id: r-testhomeisolation
+Provenance: inherited b8d206d0db9aa55a8c785b829925bf61a9d6bc02
+
+Warn: commit messages that link an external work session (the session URL host and path, or a *-Session: line, bare, labelled or embedded) are refused by both the commit-msg hook and the range check in verify-trailers-are-parsable.mjs; the check is forward-only, history is not rewritten, and older commits on main still carry such links
+Warn: the test isolation guard resolves the live state root only as far as it can be read and compares lexically below an ancestor that fails with EPERM, EACCES or ENOENT, so a host that protects ~/.agent-control-plane still runs every test file while resolvable aliases of the live root stay rejected
+Record-Id: r-sessionlinkcommitcheck
+Follows: r-testhomeisolation
+Provenance: inherited 3415391194f3563551116f60eb33a6b9ea29fd0c
+
+Warn: the session-link check reads the whole commit message file, including text below the scissors line, rather than assuming git's cleanup mode, because a plain git commit -F stores everything; the cost is that git commit -v is refused when the staged diff itself contains such a link (documented in SECURITY.md)
+Warn: the test isolation guard walks each path component with lstat and readlink, so an alias to the protected live root or its scratch directory is caught without reading the protected target; a component it cannot inspect is refused rather than compared lexically
+Record-Id: r-sessionlinkwholemessage
+Supersedes: r-sessionlinkcommitcheck
+Provenance: inherited 1e033a64eeec826299d31ad13ea055c5646c6447
+
+Limit: on a host where the live root cannot be inspected, test files that set their own HOME outside a directory the setup created are refused rather than run
+Warn: when the live state root's own identity cannot be established (for example the root is a symlink whose inspection fails with EPERM), the test isolation guard accepts only paths inside a directory this process just created, still the same directory and reached without symlinks, and refuses everything else; a root that resolves behaves as before
+Record-Id: r-liverootunknownfailclosed
+Follows: r-sessionlinkwholemessage
+Provenance: inherited 1ad3dc58a5fe0dbf1fa54a3c31d1f830e33f5e35
