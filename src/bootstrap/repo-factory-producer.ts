@@ -20,9 +20,11 @@ import { consumeWithheldExemption, readWithheldIntent, withheldUnsent } from "./
 import {
   COMMITLORE_VERIFICATION_ID,
   type CommitLoreMode,
+  type CommitLoreObservation,
   type CommitLorePort,
   commitloreRequired,
   requiredCommitLoreObservation,
+  writeCommitLoreObservationRecord,
 } from "./commitlore-observation.ts";
 import { withinBootstrapAttempt } from "./bootstrap-write-guard.ts";
 import type { GitHubWritePort } from "./github-write-port.ts";
@@ -1096,9 +1098,9 @@ export const produceRepoFactoryResult = async (
   // only after every GitHub write: `init` installs hooks, and a pre-push hook must not run inside the
   // approved push. The bootstrap commit carries no decision record and is not given one: its diff is the
   // reviewed PLAN's files (CommitLore's own policy: most commits carry none). Not passing refuses here.
-  let commitloreRow: RepoFactoryResult["bootstrapVerification"][number] | null = null;
+  let commitlorePass: Extract<CommitLoreObservation, { outcome: "PASS" }> | null = null;
   if (commitloreObservedHere) {
-    let observed: Decision<unknown>;
+    let observed: Decision<CommitLoreObservation>;
     try {
       observed = await requiredCommitLoreObservation(input.commitlore?.port ?? null, localRepoPath, { at: "head", head });
     } catch (thrown) {
@@ -1109,7 +1111,7 @@ export const produceRepoFactoryResult = async (
       cleanup();
       return observed as Decision<RepoFactoryResult>;
     }
-    commitloreRow = { commandId: COMMITLORE_VERIFICATION_ID, repositoryIdentity: "", exactHead: head, status: "PASS" };
+    if (observed.value.outcome === "PASS") commitlorePass = observed.value;
   }
 
   // The real verification kind this run promises `bootstrapVerification` about. A judge
@@ -1166,6 +1168,22 @@ export const produceRepoFactoryResult = async (
         ]
       : applied.receipts.map((receipt) => toExternalWriteReceipt(receipt, ledgerOwner));
 
+  // Review S11-R1-03 — the passing observation is recorded beside this attempt, outside the database, before
+  // the result that reports it is stored: run, operation, this attempt's checkout, the repository, the head
+  // and the doctor's report with its digest. Activation, a WRITTEN retry and every CONFIRM require a stored
+  // CommitLore row to be bound to it (`verifyCommitLoreBinding`). Not recorded, no result is reported.
+  if (commitlorePass !== null) {
+    const recorded = writeCommitLoreObservationRecord(
+      workDir,
+      { runId: plan.runId, bootstrapOperationId: plan.bootstrapOperationId, checkoutPath: localRepoPath, repositoryIdentity: identity, head },
+      commitlorePass,
+    );
+    if (!recorded.allowed) {
+      cleanup();
+      return recorded as Decision<RepoFactoryResult>;
+    }
+  }
+
   const result: RepoFactoryResult = {
     schema: REPO_FACTORY_RESULT_SCHEMA_ID,
     runId: plan.runId,
@@ -1192,7 +1210,7 @@ export const produceRepoFactoryResult = async (
         exactHead: head,
         status: "PASS",
       },
-      ...(commitloreRow === null ? [] : [{ ...commitloreRow, repositoryIdentity: identity }]),
+      ...(commitlorePass === null ? [] : [{ commandId: COMMITLORE_VERIFICATION_ID, repositoryIdentity: identity, exactHead: head, status: "PASS" as const }]),
     ],
     ciEvidence: [],
     unresolvedGaps: [],

@@ -37,7 +37,13 @@ afterEach(() => vi.restoreAllMocks());
 
 const pushOperations = (): Operation[] => bootstrapOperations() as Operation[];
 
-const PASS: CommitLoreObservation = { outcome: "PASS", reportStatus: "ok", warnings: [], detail: "commitlore doctor passed" };
+const PASS: CommitLoreObservation = {
+  outcome: "PASS",
+  reportStatus: "ok",
+  warnings: [],
+  detail: "commitlore doctor passed",
+  report: JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] }),
+};
 const FAIL: CommitLoreObservation = {
   outcome: "FAIL",
   reportStatus: null,
