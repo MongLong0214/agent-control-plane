@@ -570,6 +570,38 @@ export const scanAgainst = async (
   };
 };
 
+/**
+ * #1097 — what `lstat` reports of every path git ignores in the worktree (kind, size, mode, inode, mtime
+ * and ctime), keyed by path, over a private index read from `treeIsh`. Git lists no ignored path to
+ * `scanAgainst`, so a turn's change under one is neither committed nor seen there; two readings, before
+ * the turn and after it, name every ignored path the turn created, changed or removed. Nothing listed
+ * here is ever committed.
+ */
+export const ignoredPathState = async (repo: PinnedRepository, treeIsh: string, label: string): Promise<Map<string, string>> => {
+  const index = join(repo.scratch, `${label}.ignored.index`);
+  await must(repo, ["read-tree", treeIsh], { index });
+  const listed = (await must(repo, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"], { index }))
+    .split("\0")
+    .filter(Boolean);
+  const state = new Map<string, string>();
+  for (const path of listed) {
+    const stat = lstatOrNull(join(repo.workTree, path.replace(/\/$/, "")));
+    state.set(
+      path,
+      stat === null
+        ? "missing"
+        : [stat.isDirectory() ? "d" : stat.isSymbolicLink() ? "l" : stat.isFile() ? "f" : "o", stat.size, stat.mode, stat.ino, stat.mtimeMs, stat.ctimeMs].join(":"),
+    );
+  }
+  return state;
+};
+
+/** #1097 — the ignored paths whose state differs between two `ignoredPathState` readings, sorted. */
+export const ignoredPathsChanged = (before: ReadonlyMap<string, string>, after: ReadonlyMap<string, string>): string[] =>
+  [...new Set([...before.keys(), ...after.keys()])]
+    .filter((path) => before.get(path) !== after.get(path))
+    .sort();
+
 /** A gitlink's path is absent, or an empty directory reached without a symlink: nothing checked out. */
 const gitlinkIsEmpty = (workTree: string, path: string): boolean => {
   let cursor = workTree;

@@ -387,14 +387,6 @@ const composeReviewerProfile = (ownerProfileText: string, packetProfile: string)
   return `${ownerProfile}\n${packetRules.join("\n")}\n`;
 };
 
-const killChildTree = (child: ReturnType<typeof spawn>): void => {
-  try {
-    process.kill(-(child.pid ?? 0), "SIGKILL");
-  } catch {
-    child.kill("SIGKILL");
-  }
-};
-
 /**
  * #1077 — what ACP could establish about the probe's process group when it was asked to end it.
  *
@@ -469,15 +461,30 @@ const PROBE_STDIO_DRAIN_MS = 1_000;
  * same profile and environment, so it adds no authority. It moves its own stderr to /dev/null and
  * keeps the original on fd 5 for the CLI alone, so nothing the holder says — a job-status line for a
  * CLI killed by a signal, for one — reaches the CLI's stderr. It runs the CLI as its child, in its
- * own group, with stdin, stdout and that stderr, and with fds 3, 4 and 5 closed for it; reports the
- * CLI's status on fd 3; and then blocks reading fd 4, which ACP never writes, so it holds the
- * group's id until ACP has signalled the group.
+ * own group, with stdin, stdout and that stderr, and with fds 3, 4 and 5 closed for it; closes its own
+ * copies of the CLI's stdout and stderr once the CLI has exited, so only what the CLI left behind can
+ * keep them open (#1104); reports the CLI's status on fd 3; and then blocks reading fd 4, which ACP
+ * never writes, so it holds the group's id until ACP has signalled the group, or has closed fd 4.
  *
  * ksh93 reports a CLI ended by a signal as 256 + the signal number, which no exit code can be, so
  * the status is exact: `holderStatus` turns it back into what running the CLI directly answers.
  */
 const PROBE_HOLDER_SCRIPT =
-  'exec 5>&2 2>/dev/null; "$@" 2>&5 5>&- 3>&- 4<&-; s=$?; printf \'exit %s\\n\' "$s" >&3; read -r _ <&4';
+  'exec 5>&2 2>/dev/null; "$@" 2>&5 5>&- 3>&- 4<&-; s=$?; exec 1>&- 5>&-; printf \'exit %s\\n\' "$s" >&3; read -r _ <&4';
+
+/**
+ * #1104 — what ksh adds to the environment of a command it runs: `_`, `PWD`, `SHLVL`, and `A__z` for
+ * SHLVL's integer attribute (measured, ksh93u+ 2012-08-01). A turn's environment is constructed, so the
+ * holder runs the CLI through `env`, which takes each back out — or sets it back to the constructed
+ * value, for a name the construction carries — and the CLI receives exactly that environment.
+ * Limit: as with the egress wrapper, a CLI path containing `=` would be read by `env` as a variable.
+ */
+const HOLDER_ADDED_ENVIRONMENT = ["_", "A__z", "PWD", "SHLVL"] as const;
+const holderRestoredEnvironment = (environment: NodeJS.ProcessEnv): string[] => [
+  "/usr/bin/env",
+  ...HOLDER_ADDED_ENVIRONMENT.flatMap((name) => (environment[name] === undefined ? ["-u", name] : [])),
+  ...HOLDER_ADDED_ENVIRONMENT.flatMap((name) => (environment[name] === undefined ? [] : [`${name}=${environment[name]}`])),
+];
 
 /** The holder's report as the direct-execution exit code: a number, or null for a signal. */
 const holderStatus = (reported: number | null): number | null =>
@@ -510,12 +517,78 @@ const groupIsEmpty = (pgid: number): boolean => {
 };
 
 /**
+ * #1104 — the process group an invocation's spawn created for it alone, as read at the spawn.
+ *
+ * Every CLI is spawned `detached`, so its leader calls `setsid` and leads a new session and a new group
+ * whose id is its own pid. `createdAtSpawn` checks that rather than assuming it: in the same synchronous
+ * turn as the spawn, while the leader is certainly unreaped, a group with the leader's id is present. Only
+ * the leader can have created a group with its own id (XNU hands out no pid that names a group), and a
+ * group made by `setsid` admits only processes of its own new session: the leader's descendants. A child
+ * left in a group it shares — the daemon's, say — has no group with its own id, and nothing of its group
+ * is ever signalled.
+ */
+interface LedGroup {
+  /** The leader's pid, which is also the group's id. */
+  pid: number;
+  /** A group with the leader's id was present at spawn (`kill(-pid, 0)` answered), so the spawn created it. */
+  createdAtSpawn: boolean;
+  /** The leader's start token read at spawn; null when it could not be read. */
+  startedAt: string | null;
+}
+
+const ledGroupAtSpawn = (child: ReturnType<typeof spawn>): LedGroup | null => {
+  const pid = child.pid;
+  if (pid === undefined) return null;
+  return { pid, startedAt: readProcessStartToken(pid), createdAtSpawn: groupLiveness(pid) === "PRESENT" };
+};
+
+/**
+ * #1104 — the ownership proof every group signal needs, asked only from a `setImmediate` callback (see
+ * `endHeldGroup` for why there): the leader is still ACP's own unreaped child, so no other process can
+ * hold its pid or a group with its id; the group is the one its spawn created; and the start token reads
+ * back as it did at spawn, so this is the same incarnation. A pid or group id that matches proves nothing
+ * on its own, and holding the leader's pid without the token match proves nothing either.
+ */
+const ownsLedGroup = (child: ReturnType<typeof spawn>, group: LedGroup | null): boolean =>
+  group !== null &&
+  child.exitCode === null &&
+  child.signalCode === null &&
+  group.createdAtSpawn &&
+  group.startedAt !== null &&
+  readProcessStartToken(group.pid) === group.startedAt;
+
+/**
+ * #1104 — ends an invocation that runs without a holder (a reviewer, a profile probe): its own group
+ * while that is proven, else its leader alone through its own handle while it is unreaped. Once the
+ * leader has exited, nothing is signalled at all, since its id no longer proves whose group it names: the
+ * pipes are closed instead, so a process that kept them cannot hold the answer back.
+ */
+const endLedGroup = (child: ReturnType<typeof spawn>, group: LedGroup | null): void => {
+  setImmediate(() => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      for (const stream of child.stdio) stream?.destroy();
+      return;
+    }
+    if (ownsLedGroup(child, group)) {
+      try {
+        process.kill(-group!.pid, "SIGKILL");
+        return;
+      } catch {
+        // Not delivered: the leader alone, below.
+      }
+    }
+    child.kill("SIGKILL");
+  });
+};
+
+/**
  * #1077 — signals the holder's group, only while ownership is provable, and answers what it could
  * establish. Call it only from a `setImmediate` callback.
  *
- * Before every attempt, in the same synchronous turn: the holder has no recorded exit, its start
- * token was read at spawn, and it reads back the same now. A null, unreadable or different token
- * means no attempt (`UNVERIFIABLE`). The first delivered SIGKILL ends the attempts; an undelivered one
+ * Before every attempt, in the same synchronous turn, `ownsLedGroup`: the holder has no recorded exit,
+ * the group with its id was present at spawn (#1104), its start token was read at spawn, and it reads
+ * back the same now. A group not created at spawn, or a null, unreadable or different token, means no
+ * attempt (`UNVERIFIABLE`). The first delivered SIGKILL ends the attempts; an undelivered one
  * is repeated only while a signallable member is observed (`groupLiveness` PRESENT) and the token
  * still verifies. With nothing delivered the probe answers at once; with a delivery it answers once
  * the group is observed gone, and in every case by the settle deadline fixed at the first request.
@@ -550,16 +623,12 @@ const groupIsEmpty = (pgid: number): boolean => {
  */
 const endHeldGroup = (
   child: ReturnType<typeof spawn>,
-  pgid: number,
-  holderStartedAt: string | null,
+  group: LedGroup,
   signals: string[],
 ): { ownership: ProcessGroupOwnership; settleNow: boolean } => {
   if (child.exitCode !== null || child.signalCode !== null) return { ownership: "HOLDER_LOST", settleNow: false };
-  const owned = (): boolean =>
-    child.exitCode === null &&
-    child.signalCode === null &&
-    holderStartedAt !== null &&
-    readProcessStartToken(pgid) === holderStartedAt;
+  const pgid = group.pid;
+  const owned = (): boolean => ownsLedGroup(child, group);
   if (!owned()) return { ownership: "UNVERIFIABLE", settleNow: true };
   // One delivered SIGKILL is the end: the group is then judged on the observation after the holder's
   // exit. An undelivered attempt is repeated only while a signallable member is observed and the
@@ -651,7 +720,9 @@ const productionRunCli = async (
      * #1077 — the invocation intends no process to outlive it. It runs under `PROBE_HOLDER_SCRIPT`,
      * and once the CLI has exited, timed out or been aborted, its group is signalled only while the
      * holder provably still holds it (`endHeldGroup`); otherwise nothing is signalled and the result
-     * says so. Set only by a session probe; turns and every other invocation are unchanged.
+     * says so. Set by a session probe and, #1104, by every worker and CTO turn: whatever such a turn's
+     * CLI starts in its group is the turn's own, and no intended long-lived child is known. A process
+     * that leaves the group (`setsid`) is outside it and is left alone.
      */
     reapProcessGroup?: boolean;
   },
@@ -807,7 +878,7 @@ const productionRunCli = async (
         child = spawn("/usr/bin/sandbox-exec", reviewerSandboxArgs(
           profile,
           holding ? "/bin/ksh" : file,
-          holding ? ["-c", PROBE_HOLDER_SCRIPT, "acp-probe-holder", file, ...args] : args,
+          holding ? ["-c", PROBE_HOLDER_SCRIPT, "acp-group-holder", ...holderRestoredEnvironment(environment), file, ...args] : args,
           egress ?? undefined,
           composedProfilePath,
         ), {
@@ -825,9 +896,11 @@ const productionRunCli = async (
       let timedOut = false;
       let egressLost = false;
       let answered = false;
+      // #1104 — the group this spawn created and the leader's identity, read before anything else can
+      // happen to it; required before every signal, whether or not a holder leads the group.
+      const led = ledGroupAtSpawn(child);
       const pgid = holding ? child.pid : undefined;
-      // The holder's identity, read before anything else can happen to it; required before every signal.
-      const holderStartedAt = pgid === undefined ? null : readProcessStartToken(pgid);
+      const holderStartedAt = holding ? (led?.startedAt ?? null) : null;
       // The CLI's own exit status, as the holder reported it; null until it has.
       let reported: number | null = null;
       let endRequested = false;
@@ -852,6 +925,17 @@ const productionRunCli = async (
         options.signal?.removeEventListener("abort", abort);
         // The CLI's status is the holder's report; the holder's own exit is ACP's signal.
         resolve({ stdout, stderr, exitCode: holderStatus(reported), timedOut, egressLost, processGroup });
+        // #1104 — a holder still alive is released, not signalled: once its CLI has exited, it reads
+        // EOF on fd 4 and ends on its own. Later than the drain, so the answer never waits on it.
+        setTimeout(() => child.stdio[4]?.destroy(), PROBE_STDIO_DRAIN_MS).unref();
+      };
+      // #1104 — an answer that is not a cleanup, given after the CLI reported its exit, waits for the
+      // CLI's output to be read to its end, within the deadline: a turn's answer is never cut short.
+      let outputOpen = 2;
+      let pendingAnswer: ProcessGroupReap | null = null;
+      const answerOutputRead = (processGroup: ProcessGroupReap): void => {
+        if (reported === null || outputOpen === 0) answerOnce(processGroup);
+        else pendingAnswer = processGroup;
       };
       // A probe answer that is not a cleanup: every attempt and the delivered count kept, the group
       // named as possibly still holding the probe's processes, and no further signal.
@@ -869,6 +953,14 @@ const productionRunCli = async (
           ownership: ownership ?? "UNVERIFIABLE",
           detail: `${why}; process group ${pgid ?? "unknown"} ${attempts} and may still hold the probe's processes`,
         };
+      };
+      // #1105 — which of the two came late, never as a negative duration: the observation itself (an
+      // ESRCH first seen at or after the deadline), or only the completion after an ESRCH seen in time.
+      const lateness = (seenAt: number, now: number): string => {
+        const deadline = deadlineAt ?? seenAt;
+        return seenAt >= deadline
+          ? `process group ${pgid} was first observed empty ${Math.round(seenAt - deadline)} ms after the deadline`
+          : `process group ${pgid} was observed empty (ESRCH) ${Math.round(deadline - seenAt)} ms before the deadline, but the probe's answer completed ${Math.round(now - deadline)} ms after it`;
       };
       // The answer from the holder's exit: a cleanup only with HELD ownership, a delivered signal and
       // an ESRCH seen strictly before the deadline, on the same monotonic clock.
@@ -891,9 +983,9 @@ const productionRunCli = async (
               ? `the probe's holder (pid ${pgid}) exited before ACP could end its group`
               : sent === 0
                 ? `no signal to process group ${pgid} was delivered`
-                : seen.empty
-                  ? `process group ${pgid} was first observed empty ${Math.round(seen.at - (deadlineAt ?? seen.at))} ms after the deadline`
-                  : `process group ${pgid} was not observed empty (ESRCH) before the deadline`,
+                : !seen.empty
+                  ? `process group ${pgid} was not observed empty (ESRCH) before the deadline`
+                  : lateness(seen.at, now),
           ),
           ownership: held ? "HELD" : "HOLDER_LOST",
         });
@@ -904,11 +996,11 @@ const productionRunCli = async (
       // naming the group it is leaving behind rather than waiting on it.
       const requestEnd = (): void => {
         if (!holding) {
-          killChildTree(child);
+          endLedGroup(child, led);
           return;
         }
         // No holder pid means nothing was spawned: there is no group of ours to signal.
-        if (pgid === undefined || endRequested) return;
+        if (pgid === undefined || led === null || endRequested) return;
         endRequested = true;
         // A logical deadline, armed once at the first request on the monotonic clock and cleared only
         // when the answer is committed: a later request, the close, an observation starting or failing
@@ -916,19 +1008,21 @@ const productionRunCli = async (
         // stalls; it is the point after which no answer can be a cleanup or a HEALTHY probe.
         deadlineAt = performance.now() + PROBE_END_SETTLE_BOUND_MS;
         deadlineTimer = setTimeout(() => {
-          answerOnce(unconfirmed(
+          answerOnce(pendingAnswer ?? unconfirmed(
             `process group ${pgid} was not confirmed empty within ${PROBE_END_SETTLE_BOUND_MS} ms of the first end request`,
           ));
         }, PROBE_END_SETTLE_BOUND_MS);
         setImmediate(() => {
           // Nothing is ever signalled after the probe has answered.
           if (answered) return;
-          const ended = endHeldGroup(child, pgid, holderStartedAt, signals);
+          const ended = endHeldGroup(child, led, signals);
           ownership = ended.ownership;
           if (!ended.settleNow) return;
-          answerOnce(unconfirmed(
+          answerOutputRead(unconfirmed(
             ended.ownership === "UNVERIFIABLE"
-              ? `the probe's holder (pid ${pgid}) has no recorded exit but its start token was ${holderStartedAt === null ? "not read at spawn" : "unreadable or different"}`
+              ? led?.createdAtSpawn === false
+                ? `the probe's holder (pid ${pgid}) has no recorded exit but no group of its own was present at spawn`
+                : `the probe's holder (pid ${pgid}) has no recorded exit but its start token was ${holderStartedAt === null ? "not read at spawn" : "unreadable or different"}`
               : `no signal to process group ${pgid} was delivered`,
           ));
         });
@@ -945,6 +1039,12 @@ const productionRunCli = async (
         });
         child.stdio[3]?.on("error", () => undefined);
         child.stdio[4]?.on("error", () => undefined);
+        for (const stream of [child.stdout, child.stderr]) {
+          stream?.once("close", () => {
+            outputOpen -= 1;
+            if (outputOpen === 0 && pendingAnswer !== null) answerOnce(pendingAnswer);
+          });
+        }
         child.once("exit", () => {
           // Nothing is signalled from here on; the group is only observed — until the deadline when
           // an end was asked for, else for the reap bound — and a lost holder is never a cleanup.
@@ -987,7 +1087,7 @@ const productionRunCli = async (
       // read from the process itself; null where the platform cannot report one.
       if (child.pid !== undefined && options.onSpawn) {
         try {
-          options.onSpawn(child.pid, readProcessStartToken(child.pid));
+          options.onSpawn(child.pid, led?.startedAt ?? null);
         } catch {
           // A recorder that throws must not leave the provider running unaccounted for.
           requestEnd();
@@ -1099,6 +1199,8 @@ const runProfileCommand = async (
       resolve({ stdout: "", stderr: (err as Error).message, exitCode: null, timedOut: false });
       return;
     }
+    // #1104 — what this spawn created, read before anything else can happen to it.
+    const led = ledGroupAtSpawn(child);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -1111,11 +1213,7 @@ const runProfileCommand = async (
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        process.kill(-(child.pid ?? 0), "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
+      endLedGroup(child, led);
     }, Math.min(Math.max(timeoutMs, 1), 5_000));
     child.stdout?.on("data", (b: Buffer) => (stdout += b.toString("utf8")));
     child.stderr?.on("data", (b: Buffer) => (stderr += b.toString("utf8")));
@@ -2178,6 +2276,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       reviewerEgressPhase: request.isolation ? "reviewer-invocation" : undefined,
       onSpawn: request.onSpawn,
       signal: request.signal,
+      // #1104 — a worker or CTO turn owns what its CLI leaves in its group, and ends it on every
+      // completion under the holder's ownership proof. A packet reviewer's profile admits no holder.
+      reapProcessGroup: request.isolation === undefined,
     });
 
     let result: Awaited<ReturnType<typeof runCli>>;
@@ -2392,6 +2493,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
         subtrees: [workdir],
         files: request.relay ? [relayScript, process.execPath] : [],
       },
+      // #1104 — the turn owns what its CLI leaves in its group, the relay included; see `invoke`.
+      reapProcessGroup: true,
     });
     const envelope = safeParse(result.stdout);
     const text = typeof envelope?.["result"] === "string" ? (envelope["result"] as string) : "";

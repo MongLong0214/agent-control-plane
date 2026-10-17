@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -11,6 +13,7 @@ import { ArtifactKind } from "../domain/types.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { isClean, tryRevParse } from "../git/git.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
+import { WorkerTurnEvent } from "../run/worker-turn.ts";
 import {
   type RepairWorktreeAuthority,
   type ManagedWriteGuard,
@@ -33,6 +36,10 @@ const VERIFICATION_WORKTREE_OWNER_RELEASE_STATES = TERMINAL_RUN_STATES;
 
 /** The exact admitted ingress operation used for owner-authorised repair. */
 export const REPAIR_OWNER_APPROVAL_OPERATION = "repair_execute";
+
+/** #1096 — the parameter, and its one accepted value, by which an operator attests nothing of an orphan runs. */
+const ORPHAN_RELEASE_CONFIRMATION_PARAMETER = "confirm";
+const ORPHAN_RELEASE_CONFIRMATION = "nothing-running";
 
 /** PRD §25.7 — the operation contract every repair must satisfy. */
 export interface RepairOperation {
@@ -164,6 +171,25 @@ export class RepairService {
         "the application becomes RELEASED and keeps its record; a new run may reserve the same project id and repository identity under its own owner approval; when no external effect can be proven nothing is released and the reservation is kept, RELEASE_IN_DOUBT",
       undo: "none needed: nothing outside the database changed, and the released run cannot be confirmed again",
       preconditions: [...RESERVATION_RELEASE_PRECONDITIONS],
+    },
+    // #1096 — a worker launch the guard admitted whose pid was never recorded leaves its task blocked
+    // for good: no pid can ever be confirmed gone. After the operator has checked that nothing of it
+    // runs, this records the orphan resolved. It reads the process table and signals nothing.
+    release_unidentified_worker_orphan: {
+      id: "release_unidentified_worker_orphan",
+      risk: "MEDIUM",
+      authorization: "HERMES",
+      description:
+        "Record a worker orphan that was never identified (a launch with no recorded pid) as resolved, so its task may run again",
+      expectedEffect:
+        "the task's next worker turn is admitted again; the orphan record stays, and a resolution naming this repair is recorded beside it",
+      undo: "none needed: nothing is signalled, deleted or rewritten, and a later unidentified orphan of the task blocks it again",
+      preconditions: [
+        "the execution has an unidentified-orphan record with no recorded pid that no resolution follows",
+        "the execution is not RUNNING and records no worker process",
+        `the operator confirmed that nothing of the orphan is running (${ORPHAN_RELEASE_CONFIRMATION_PARAMETER}=${ORPHAN_RELEASE_CONFIRMATION})`,
+        "no live process carries the worker session's id on its command line",
+      ],
     },
   };
 
@@ -501,6 +527,60 @@ export class RepairService {
           },
         };
       }
+      case "release_unidentified_worker_orphan": {
+        const executionId = request.parameters["executionId"] ?? "";
+        const orphan = this.db.get<{ event_id: number; run_id: string | null; evidence_json: string }>(
+          `SELECT orphan.event_id, orphan.run_id, orphan.evidence_json FROM audit_events orphan
+            WHERE orphan.kind = ? AND json_extract(orphan.evidence_json, '$.executionId') = ?
+              AND json_extract(orphan.evidence_json, '$.pid') IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM audit_events resolved
+                 WHERE resolved.kind = ? AND resolved.event_id > orphan.event_id
+                   AND json_extract(resolved.evidence_json, '$.executionId') = ?)
+            ORDER BY orphan.event_id DESC LIMIT 1`,
+          [WorkerTurnEvent.ORPHAN_UNIDENTIFIED, executionId, WorkerTurnEvent.ORPHAN_RESOLVED, executionId],
+        );
+        const execution = this.db.get<{ task_id: string; status: string; worker_process_id: number | null; worker_session_id: string }>(
+          `SELECT task_id, status, worker_process_id, worker_session_id FROM task_executions WHERE execution_id = ?`,
+          [executionId],
+        );
+        const incarnation = execution
+          ? this.db.get<{ incarnation: string }>(`SELECT incarnation FROM sessions WHERE session_id = ?`, [execution.worker_session_id])?.incarnation
+          : undefined;
+        // The provider CLI of every worker turn carries its session as `--session-id <id>`.
+        const workerSessionId = incarnation?.split("#", 1)[0] ?? "";
+        const scan = workerSessionId === "" ? { carriers: [], error: "the worker session's id is unknown" } : processesCarrying(workerSessionId);
+        const confirmation = request.parameters[ORPHAN_RELEASE_CONFIRMATION_PARAMETER] ?? null;
+        const evidence = {
+          executionId,
+          taskId: execution?.task_id ?? null,
+          orphanEventId: orphan?.event_id ?? null,
+          executionStatus: execution?.status ?? null,
+          workerProcessId: execution?.worker_process_id ?? null,
+          workerSessionId: execution?.worker_session_id ?? null,
+          confirmation,
+          liveProcessScan: scan,
+        };
+        return {
+          preconditions: [
+            checked(operation.preconditions[0]!, orphan !== undefined, evidence),
+            checked(operation.preconditions[1]!, execution !== undefined && execution.status !== "RUNNING" && execution.worker_process_id === null, evidence),
+            checked(operation.preconditions[2]!, confirmation === ORPHAN_RELEASE_CONFIRMATION, evidence),
+            checked(operation.preconditions[3]!, scan.error === null && scan.carriers.length === 0, evidence),
+          ],
+          perform: async (dryRun) => {
+            if (dryRun) return { changes: 1, evidence };
+            const recorded = this.audit.record({
+              kind: WorkerTurnEvent.ORPHAN_RESOLVED,
+              runId: orphan?.run_id ?? null,
+              actor: request.authorizedBy,
+              evidence: { ...evidence, operationId: operation.id },
+            });
+            if (!recorded.allowed) return { changes: 0, evidence, refusal: recorded as Decision<never> };
+            return { changes: 1, evidence };
+          },
+        };
+      }
       default:
         throw new Error(`missing repair plan for ${operation.id}`);
     }
@@ -597,6 +677,29 @@ const alive = (pid: number): boolean => {
   } catch {
     return false;
   }
+};
+
+/**
+ * #1096 — live processes whose command line carries `token` as one whole argument, read from `ps`. It
+ * observes and signals nothing; any failure to read the table is an error, never an empty answer.
+ */
+const processesCarrying = (token: string): { carriers: number[]; error: string | null } => {
+  let listing: string;
+  try {
+    listing = execFileSync("/bin/ps", ["-axww", "-o", "pid=,command="], {
+      encoding: "utf8",
+      timeout: 5_000,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (err) {
+    return { carriers: [], error: safeErrorMessage(err) };
+  }
+  const carriers: number[] = [];
+  for (const line of listing.split("\n")) {
+    const [pid, ...command] = line.trim().split(/\s+/);
+    if (command.includes(token) && Number(pid) !== process.pid) carriers.push(Number(pid));
+  }
+  return { carriers, error: null };
 };
 
 const safeErrorMessage = (err: unknown): string => {
