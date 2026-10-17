@@ -1,5 +1,5 @@
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -29,11 +29,12 @@ afterAll(cleanupTempDirs);
  * `migrations.ts` resolves each schema file beside its own module, and the build input is
  * TypeScript only, so a schema file reaches `dist/db/` only if the `build` script copies it. A
  * source-level test cannot see a missing copy: the file is always beside the source. Deploys run
- * `pnpm build`, so that is what runs here, in a scratch copy of this working tree's build inputs —
+ * `pnpm build`, so its `build` script is what runs here, in a scratch copy of this working tree's build inputs —
  * never the checkout's own `dist/`, which can hold a copy an earlier build left behind.
  */
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
-const BUILD_BUDGET_MS = 300_000;
+// A cold build measured 262 s on a loaded host; the budget leaves room so load does not read as a failure.
+const BUILD_BUDGET_MS = 600_000;
 const NATIVE_EXTENSION = join(
   "native",
   "fd-vfs",
@@ -49,7 +50,17 @@ const schemaFilesBesideMigrations = (): string[] =>
     .map((match) => match[1]!)
     .sort();
 
-/** What `pnpm build` reads, copied from the working tree, and built there. Returns the copy's root. */
+/**
+ * What `pnpm build` reads, copied from the working tree, and built there. Returns the copy's root.
+ *
+ * It runs the copy's own `scripts.build` command line the way `pnpm run build` runs it — `sh -c`,
+ * with the package's `node_modules/.bin` first on PATH — but not through pnpm. pnpm 11 checks
+ * dependencies before a run by running `pnpm install` (`verify-deps-before-run`), and that install
+ * refuses this copy's `node_modules`, a symlink resolving outside the copy
+ * (ERR_PNPM_UNSAFE_MODULES_DIR); older pnpm does not, so going through pnpm makes this witness's
+ * verdict depend on the host's pnpm. Reading the command line from `package.json` keeps it the
+ * deploy's build: an edit to the script is an edit to what runs here.
+ */
 const scratchBuild = (): string => {
   const root = join(tempDir("acp-a0-build-"), "repo");
   for (const file of ["package.json", "tsconfig.json", "tsconfig.build.json", "scripts/copy-native-fd-vfs-into-dist.mjs", NATIVE_EXTENSION]) {
@@ -58,9 +69,18 @@ const scratchBuild = (): string => {
   }
   cpSync(join(ROOT, "src"), join(root, "src"), { recursive: true });
   symlinkSync(join(ROOT, "node_modules"), join(root, "node_modules"));
-  const built = boundedSpawnSync("pnpm", ["run", "build"], { cwd: root, encoding: "utf8", timeout: BUILD_BUDGET_MS });
+  const { scripts } = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { scripts: { build: string } };
+  const built = boundedSpawnSync("sh", ["-c", scripts.build], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: BUILD_BUDGET_MS,
+    env: {
+      ...process.env,
+      PATH: [join(root, "node_modules", ".bin"), dirname(process.execPath), process.env.PATH ?? ""].join(delimiter),
+    },
+  });
   if (built.status !== 0) {
-    throw new Error(`pnpm build failed in the scratch copy (${built.status}):\n${built.stdout}\n${built.stderr}`);
+    throw new Error(`the build script failed in the scratch copy (${built.status}):\n${built.stdout}\n${built.stderr}`);
   }
   return root;
 };
