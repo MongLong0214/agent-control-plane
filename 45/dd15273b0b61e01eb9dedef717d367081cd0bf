@@ -1,0 +1,4 @@
+Warn: released migrations v38 to v44 read the frozen src/db/schema-v44.sql snapshot (a byte copy of the pre-change v44 schema.sql, blob 157a8e4d) instead of the live schema.sql, so later schema edits cannot change what an old migration installs; schemaSqlAt routes versions up to 44 to that file
+Warn: the build copies schema-v44.sql into dist beside the migration module; without that copy a compiled upgrade fails with ENOENT
+Record-Id: r-v45a0frozenv44snapshot
+Provenance: inherited 9ff4431d8aa7e1f7cbe49c1ca2903cdbeef07216
