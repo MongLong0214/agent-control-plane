@@ -124,6 +124,60 @@ export const CLAUDE_NON_INTERACTIVE_ARGS = [
 export const CLAUDE_ACCOUNT_IDENTITY_ARGS = ["auth", "status", "--json"] as const;
 
 /**
+ * #1099 review r2 — the most one account-identity read may take. Measured at 0.13 s (above); 5 s is
+ * headroom for a slow host, not a measurement.
+ */
+export const CLAUDE_ACCOUNT_IDENTITY_TIMEOUT_MS = 5_000;
+
+/**
+ * #1099 review r2 — the one deadline a whole Claude collection runs under: identity, then `/usage`,
+ * then identity. Each identity read used to get the usage read's own 20 s, so two slow identity reads
+ * around a healthy 10 s usage read took 50 s, past the 45 s collector bound and the doctor's 45 s
+ * capacity deadline, and the reading arrived after the report that needed it.
+ *
+ * The usage read keeps its whole timeout; the identity reads get only what is left beside it. An
+ * identity read that runs out costs the reading its account (it is then never restored after a
+ * restart) and never costs the reading itself. Capped at `COLLECTOR_TIMEOUT_MS`, the bound the
+ * callers derive their deadlines from.
+ */
+export const claudeCollectionBudgetMs = (usageTimeoutMs: number): number =>
+  Math.min(COLLECTOR_TIMEOUT_MS, usageTimeoutMs + 2 * CLAUDE_ACCOUNT_IDENTITY_TIMEOUT_MS);
+
+/**
+ * One deadline for a whole collection, on the monotonic clock so a wall-clock step cannot move it.
+ * `within` does not rely on a probe honouring the timeout it was handed: past `withinMs`, the answer
+ * is `expired`, whatever the probe is still doing.
+ */
+class CollectionDeadline {
+  private readonly endsAt: number;
+
+  constructor(budgetMs: number) {
+    this.endsAt = performance.now() + budgetMs;
+  }
+
+  remainingMs(): number {
+    return Math.max(0, Math.floor(this.endsAt - performance.now()));
+  }
+
+  async within<T>(withinMs: number, work: () => Promise<T>, expired: T): Promise<T> {
+    const running = work();
+    let timer: NodeJS.Timeout | undefined;
+    // Armed after the work starts, so a probe whose own timer is due at the same moment answers first.
+    const spent = new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(expired), withinMs);
+    });
+    try {
+      return await Promise.race([running, spent]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/** What a read the deadline stopped answers: it did not finish, so it established nothing. */
+const DEADLINE_SPENT = { stdout: "", stderr: "", code: null, timedOut: true } as const;
+
+/**
  * The digest of the account a `claude auth status --json` run names, or null when the run failed,
  * is not signed in, or names no organization or address. The address is lower-cased because the
  * provider treats it case-insensitively. Raw values never leave this function.
@@ -977,11 +1031,23 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
         : new SpawnNonInteractiveUsageProbe(CLAUDE_ACCOUNT_IDENTITY_ARGS);
   }
 
-  /** The digest of the account the CLI is signed in as, or null; a failed read is no identity. */
-  private async accountDigest(): Promise<string | null> {
-    if (!this.identity) return null;
+  /**
+   * The digest of the account the CLI is signed in as, or null; a failed read is no identity, and so
+   * is one with no time left once `reserveMs` is kept for what follows it under `deadline`.
+   */
+  private async accountDigest(deadline: CollectionDeadline, reserveMs: number): Promise<string | null> {
+    const identity = this.identity;
+    if (!identity) return null;
+    const timeoutMs = Math.min(CLAUDE_ACCOUNT_IDENTITY_TIMEOUT_MS, deadline.remainingMs() - reserveMs);
+    if (timeoutMs <= 0) return null;
     try {
-      return claudeAccountDigest(await this.identity.run({ binary: this.claudeOptions.binary, timeoutMs: this.probeTimeoutMs }));
+      return claudeAccountDigest(
+        await deadline.within(
+          timeoutMs,
+          () => identity.run({ binary: this.claudeOptions.binary, timeoutMs }),
+          DEADLINE_SPENT,
+        ),
+      );
     } catch {
       return null;
     }
@@ -1015,9 +1081,17 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
     };
     // #1099 — the account is read on both sides of the usage read, and only an account named the same
     // by both is the one measured: a sign-in that changed in between leaves the reading unbound.
-    const accountBefore = await this.accountDigest();
+    // Review r2: all three reads share one deadline, and the usage read's time is kept for it first.
+    const usageTimeoutMs = Math.min(this.probeTimeoutMs, COLLECTOR_TIMEOUT_MS);
+    const deadline = new CollectionDeadline(claudeCollectionBudgetMs(usageTimeoutMs));
+    const accountBefore = await this.accountDigest(deadline, usageTimeoutMs);
     try {
-      outcome = await this.probe.run({ binary: this.claudeOptions.binary, timeoutMs: this.probeTimeoutMs });
+      const timeoutMs = Math.min(usageTimeoutMs, deadline.remainingMs());
+      outcome = await deadline.within(
+        timeoutMs,
+        () => this.probe.run({ binary: this.claudeOptions.binary, timeoutMs }),
+        DEADLINE_SPENT,
+      );
     } catch (error) {
       // `spawn` does not always reach the `error` event. It throws synchronously when an argument
       // is rejected before any syscall — an empty binary gives ERR_INVALID_ARG_VALUE — and when
@@ -1110,7 +1184,8 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
 
     const parsed = parseNonInteractiveUsage(this.provider, envelope.result, observedAt);
     if (!parsed.ok) return failedReading(this.provider, observedAt, source, digest, parsed.error);
-    const accountAfter = await this.accountDigest();
+    // No account before means none can match after, so the second read would spend time for nothing.
+    const accountAfter = accountBefore === null ? null : await this.accountDigest(deadline, 0);
     return {
       provider: this.provider,
       sensorHealth: "HEALTHY",
