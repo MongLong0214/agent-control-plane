@@ -133,6 +133,24 @@ export const createHermesMcpPort = (
       capacity: source.capacity.all(),
     }),
     submitCeoDecision: async (input: CeoDecisionInput): Promise<Decision<{ state: RunState }>> => {
+      // §15.6 — a CONFIRM is a completion, and the gate admits one only on an evaluation under five
+      // minutes old. The gate is synchronous, so this async door refreshes it first, the same
+      // `pre-completion` evaluation the candidate pipeline makes before its packet: a daemon restart
+      // leaves no evaluation until its first sweep minutes later, and a CONFIRM in that gap was
+      // refused on a stale NORMAL. The gate still decides: SURVIVAL refuses, and so does an
+      // evaluation that fails, rather than a CONFIRM going ahead on the reading it could not renew.
+      if (input.decision === "CONFIRM") {
+        try {
+          await source.continuity.evaluate("pre-completion");
+        } catch {
+          // The thrown text is not echoed: this answer is stored as the mutation's durable response.
+          return deny(
+            ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
+            "continuity could not be re-evaluated before the CONFIRM; completion requires a current evaluation",
+            { runId: input.runId },
+          );
+        }
+      }
       // Issue #246 — a PROJECT_BOOTSTRAP CONFIRM completes only on a result Repo Factory produced
       // under the owner's approval. The runner runs here, ahead of the decision and outside its
       // transaction, rather than inside submitCeoDecision: the runner awaits GitHub and git, and the

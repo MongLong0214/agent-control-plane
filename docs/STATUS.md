@@ -63,6 +63,15 @@ are not an approval to ignore their residual risk. They explain why a constraine
 made and what would cause it to be revisited. The open P0 queue and the independent review
 remain the governing evidence for release readiness.
 
+- **A WORKER turn keeps no transcript, so it cannot be resumed.** It runs under the runtime
+  seatbelt profile, which denies every write except the invocation's scratch and the paths the
+  write broker granted, so the coding CLI's transcript directory is never written. Each turn opens
+  its own conversation with `--session-id` and never passes `--resume`. That is the design, one
+  turn per task, not a defect. A multi-turn WORKER would need two changes: a writable transcript
+  directory, as the driven-session turn path already grants (`runSessionTurn`), and `--resume` for
+  every turn after the first. `tests/unit/a-worker-turn-keeps-no-transcript.test.ts` pins the limit
+  (#1098).
+
 ## Paths this repository does not verify
 
 Named here because a green suite otherwise reads as coverage of them.

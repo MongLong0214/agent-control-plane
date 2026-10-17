@@ -13,7 +13,7 @@ import {
   repoFactoryGitHubWriteParameters,
   type ProduceAndActivateInput,
 } from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
-import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
+import type { OwnerApprovalReceipt, OwnerIdentity } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -246,12 +246,13 @@ const reviewLegacyBootstrapPlan = async (harness: Harness, runId: string, plan: 
 /**
  * The owner's approval as production carries it, admitted through the real ingress guard, over the
  * parameters named (by default the plan's). It is presented as the plan's own visibility; the receipt
- * is what binds the one the owner approved.
+ * is what binds the one the owner approved, typed as the admitted receipt it is, so a witness can also
+ * record it (`recordOwnerApproval`).
  */
 export const ownerApprovalFor = (
   prepared: PreparedBootstrapRun,
   overrides: { visibility?: "public" | "private"; operations?: Operation[] } = {},
-): NonNullable<ProduceAndActivateInput["ownerApproval"]> => {
+): NonNullable<ProduceAndActivateInput["ownerApproval"]> & { receipt: OwnerApprovalReceipt } => {
   const { harness, runId } = prepared;
   const parameters = repoFactoryGitHubWriteParameters({
     owner: "acme",

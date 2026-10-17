@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Fails when a message carries a CommitLore trailer git will not parse as one.
+ * Fails when a message carries a CommitLore trailer git will not parse as one, or links an external
+ * work session (#1107, `sessionLinks` below).
  *
  * `git interpret-trailers` reads the final paragraph, one trailer per line. Wrap a `Limit:` across
  * two lines and the continuation is an ordinary line, which ends the block — so every trailer after
@@ -121,6 +122,52 @@ const unparsed = (message, carried = [], source = []) => {
   return missing.filter((line) => !elsewhere.includes(line.trim()));
 };
 
+/**
+ * #1107 — a link to an external work session is not part of this project's record, and no new
+ * commit may carry one. 123 commits on `main` dated 2026-08-12 to 2026-10-04 do, on a labelled
+ * session line or bare at the end of a squash body copied from a pull-request description, because
+ * nothing refused them. Those stay: history is not rewritten, and this reads only the message or
+ * range it is given (docs/SECURITY.md, "Stated residuals").
+ *
+ * Two shapes, both by line, so the bare, labelled and embedded forms are one rule:
+ *   - a session metadata key, the set `src/github/merge-commit-message.ts` strips from the daemon's
+ *     own squash messages, whatever its value;
+ *   - a session URL: that service's host and `/code/session_` path, with or without a scheme, and
+ *     the daemon's wider definition of any URL to a `session_` page with a long opaque id.
+ *
+ * A refusal names the line and never repeats the link, because a CI log is as readable as the
+ * commit would have been.
+ */
+const SESSION_METADATA_LINE = /^\s*((?:X-)?(?:Claude|Codex|Grok|Agent)-Session)\s*:/i;
+const SESSION_LINKS = [
+  /(?:^|[^A-Za-z0-9.-])(?:[A-Za-z0-9-]+\.)*claude\.ai\/code\/session_[A-Za-z0-9_-]/i,
+  /https?:\/\/[^\s<>()[\]]*\/session_[A-Za-z0-9_-]{16,}/i,
+];
+
+/**
+ * Each line of `message` that links an external work session, described without the link.
+ *
+ * Every line is read, git's scissors line and everything below it included. Whether git discards
+ * that part is a cleanup mode the hook is never told: `git commit -F` keeps it, `-v` or
+ * `--cleanup=scissors` drop it, and the line's wording follows git's locale. Skipping it on the
+ * hook's guess stored a link from a plain `-F` commit (review r2, R1). The cost, accepted and
+ * documented in docs/SECURITY.md: a verbose editor commit whose staged diff carries such a link is
+ * refused too; commit that change without `-v`.
+ */
+const sessionLinks = (message) => {
+  const found = [];
+  message.split("\n").forEach((line, index) => {
+    const key = SESSION_METADATA_LINE.exec(line);
+    if (key !== null) found.push(`line ${String(index + 1)}: a \`${key[1]}:\` line`);
+    else if (SESSION_LINKS.some((pattern) => pattern.test(line))) found.push(`line ${String(index + 1)}: a link`);
+  });
+  return found;
+};
+
+const LINK_EXPLANATION =
+  "\nA link to an external work session is not part of this project's record (#1107). Remove it from\n" +
+  "the message. Commits already on main keep theirs: published history is not rewritten.\n";
+
 /** Whether this checkout has the notes ref at all — absent is "not fetched", never "empty". */
 const notesRefPresent = () => {
   try {
@@ -163,12 +210,25 @@ if (messageFileAt !== -1) {
   }
   const message = bytes.toString("utf8");
   const lost = unparsed(message, [], path === "-" ? [] : ["--message-file", path]);
-  if (lost.length > 0) {
-    report(lost, "the message");
-    process.stdout.write(`${EXPLANATION}RESULT: FAIL — ${lost.length} trailer line(s) git will not store.\n`);
+  const linked = sessionLinks(message);
+  if (lost.length > 0 || linked.length > 0) {
+    const reasons = [];
+    if (lost.length > 0) {
+      report(lost, "the message");
+      process.stdout.write(EXPLANATION);
+      reasons.push(`${lost.length} trailer line(s) git will not store`);
+    }
+    if (linked.length > 0) {
+      for (const line of linked) process.stdout.write(`  the message, ${line}\n`);
+      process.stdout.write(LINK_EXPLANATION);
+      reasons.push(`${linked.length} line(s) linking an external work session`);
+    }
+    process.stdout.write(`RESULT: FAIL — ${reasons.join("; ")}.\n`);
     process.exit(1);
   }
-  process.stdout.write("RESULT: PASS — every trailer in the message survives `git interpret-trailers --parse`.\n");
+  process.stdout.write(
+    "RESULT: PASS — every trailer in the message survives `git interpret-trailers --parse`, and no line links an external work session.\n",
+  );
   process.exit(0);
 }
 
@@ -187,13 +247,21 @@ try {
 const notesFetched = notesRefPresent();
 
 let broken = 0;
+let linkedCommits = 0;
 for (const sha of shas) {
-  const lost = unparsed(git(["log", "-1", "--format=%B", sha]), notesFetched ? noteLines(sha) : [], ["--commit", sha]);
+  const message = git(["log", "-1", "--format=%B", sha]);
+  const linked = sessionLinks(message);
+  if (linked.length > 0) {
+    linkedCommits += 1;
+    for (const line of linked) process.stdout.write(`  ${sha.slice(0, 7)}, ${line}\n`);
+  }
+  const lost = unparsed(message, notesFetched ? noteLines(sha) : [], ["--commit", sha]);
   if (lost.length === 0) continue;
   broken += 1;
   report(lost, sha.slice(0, 7));
 }
 
+const reasons = [];
 if (broken > 0) {
   process.stdout.write(EXPLANATION);
   if (!notesFetched) {
@@ -206,10 +274,17 @@ if (broken > 0) {
         "  git fetch --no-tags origin '+refs/notes/commitlore:refs/notes/commitlore'\n",
     );
   }
-  process.stdout.write(`RESULT: FAIL — ${broken} commit(s) in ${range} carry a trailer git will not store.\n`);
+  reasons.push(`${broken} commit(s) in ${range} carry a trailer git will not store`);
+}
+if (linkedCommits > 0) {
+  process.stdout.write(LINK_EXPLANATION);
+  reasons.push(`${linkedCommits} commit(s) in ${range} carry a link to an external work session`);
+}
+if (reasons.length > 0) {
+  process.stdout.write(`RESULT: FAIL — ${reasons.join("; ")}.\n`);
   process.exit(1);
 }
 
 process.stdout.write(
-  `RESULT: PASS — ${shas.length} commit(s) in ${range}, every trailer survives \`git interpret-trailers --parse\`.\n`,
+  `RESULT: PASS — ${shas.length} commit(s) in ${range}, every trailer survives \`git interpret-trailers --parse\`, and none links an external work session.\n`,
 );
