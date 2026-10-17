@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   SESSION_METADATA_KEYS,
+  assertSquashNamesMergedHead,
   composeSquashCommitMessage,
   githubSquashCommitMessage,
   withoutSessionMetadata,
@@ -476,6 +477,16 @@ describe("the composed message names the head it was merged from, once", () => {
     const composed = composeSquashCommitMessage([{ sha: HEAD, message: "chore: a subject and nothing else\n" }], HEAD);
     expect(composed).toBe(`Merged-Head: ${HEAD}`);
     expect((await gate()).mergedHeadIn(composed, "the composed message")).toBe(HEAD);
+  });
+
+  it("reads the whole squash, title included, with the gate's reader, and requires it to name the merged head", async () => {
+    const composed = composeSquashCommitMessage(branch, HEAD);
+    await expect(assertSquashNamesMergedHead("fix: the second change (#100)", composed, HEAD)).resolves.toBeUndefined();
+    // The body-only refusal above cannot see a title; the gate reads it, so this does.
+    await expect(assertSquashNamesMergedHead("Merged-Head: update documentation (#100)", composed, HEAD))
+      .rejects.toThrow(/2 conflicting Merged-Head trailers/);
+    await expect(assertSquashNamesMergedHead("title (#100)", composed, "e".repeat(40)))
+      .rejects.toThrow(/not the head this merge fences on/);
   });
 
   it.each([

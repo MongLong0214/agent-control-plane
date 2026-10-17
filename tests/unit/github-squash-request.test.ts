@@ -6,6 +6,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { GitHubKernel, type GitHubClient, type MergeInput } from "../../src/github/github-kernel.ts";
+import { composeSquashCommitMessage, composeSquashCommitTitle } from "../../src/github/merge-commit-message.ts";
 import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { fakeGitHub } from "../helpers/fake-github-pulls.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -216,14 +217,8 @@ describe("the squash PUT names the head it fences on as the merge's Merged-Head"
   const FIRST = "Limit: the first commit's record, which the squash strands mid-message";
   const LAST = "Warn: the last commit's record, in the paragraph git parses";
 
-  it.each([
-    { shape: "one commit", messages: [`feat: one change\n\nwhy.\n\n${LAST}\nX-Claude-Session: ${SESSION_URL}\n`], note: undefined },
-    {
-      shape: "two commits, the stranded record carried by its note",
-      messages: [`feat: first change\n\nwhy.\n\n${FIRST}\n`, `fix: second change\n\nwhy.\n\n${LAST}\n`],
-      note: FIRST,
-    },
-  ])("passes the real merge-records gate when committed as GitHub composes it ($shape)", async ({ messages, note }) => {
+  /** A real repository: a base commit on `main`, then `messages` as the commits of `feature`. */
+  const branchRepository = (messages: readonly string[]) => {
     const dir = tempDir("acp-daemon-squash-");
     const work = join(dir, "work");
     mkdirSync(work);
@@ -240,28 +235,87 @@ describe("the squash PUT names the head it fences on as the merge's Merged-Head"
       return git(work, "rev-parse", "HEAD");
     });
     const stored = shas.map((sha) => git(work, "log", "-1", "--format=%B", sha));
+    return { dir, work, base, shas, stored };
+  };
 
-    const body = await fixture(stored, "A reviewed change", stored.length, shas).putBody();
-    expect(body.sha).toBe(shas.at(-1));
-
+  /**
+   * `title` and `message` committed as GitHub squashes `feature` onto `main`, with `note` as the
+   * merge's commitlore note when given, then the real gate on it.
+   */
+  const squashAndGate = (repository: ReturnType<typeof branchRepository>, title: string, message: string, note?: string) => {
+    const { dir, work, base } = repository;
     git(work, "checkout", "--quiet", "main");
     git(work, "merge", "--quiet", "--squash", "feature");
-    commitFile(work, join(dir, "msg"), `${body.commit_title}\n\n${body.commit_message}`);
+    commitFile(work, join(dir, "msg"), `${title}\n\n${message}`);
     const merge = git(work, "rev-parse", "HEAD");
     if (note !== undefined) {
       writeFileSync(join(dir, "note"), `${note}\n`);
       git(work, "notes", "--ref=commitlore", "add", "-F", join(dir, "note"), merge);
     }
     git(work, "remote", "add", "origin", work);
-
     const env = { ...fakeGitHub(dir, { 100: { merged: true, mergeCommit: merge } }), GIT_DIR: undefined, GIT_WORK_TREE: undefined };
     const gate = boundedSpawnSync(process.execPath, [join(process.cwd(), "scripts", "verify-merge-preserved-records.mjs"), `${base}..${merge}`],
       { cwd: work, env, encoding: "utf8" });
+    return { merge, gate };
+  };
+
+  it.each([
+    { shape: "one commit", messages: [`feat: one change\n\nwhy.\n\n${LAST}\nX-Claude-Session: ${SESSION_URL}\n`], note: undefined },
+    {
+      shape: "two commits, the stranded record carried by its note",
+      messages: [`feat: first change\n\nwhy.\n\n${FIRST}\n`, `fix: second change\n\nwhy.\n\n${LAST}\n`],
+      note: FIRST,
+    },
+  ])("passes the real merge-records gate when committed as GitHub composes it ($shape)", async ({ messages, note }) => {
+    const repository = branchRepository(messages);
+    const { shas, stored } = repository;
+
+    const body = await fixture(stored, "A reviewed change", stored.length, shas).putBody();
+    expect(body.sha).toBe(shas.at(-1));
+
+    const { merge, gate } = squashAndGate(repository, body.commit_title!, body.commit_message!, note);
     expect(gate.status, gate.stdout).toBe(0);
     expect(gate.stdout).toContain(
       `#100  ${messages.length} record line(s) on the branch, all reachable from ${merge.slice(0, 8)} ` +
         `(the branch read up to its merge-time head ${shas.at(-1)!.slice(0, 8)})`,
     );
     expect(gate.stdout).toContain("RESULT: PASS");
+  });
+
+  /**
+   * S9 review r1, R2: the gate reads the title too. A title opening `Merged-Head:` — a single
+   * commit's subject, or a multi-commit pull request's title — reached the PUT, and the real gate
+   * then refused the committed squash as naming two. The squash is now read with the gate's own
+   * `mergedHeadIn`, title included, before anything is reserved or sent.
+   */
+  it.each([
+    {
+      source: "a single commit's subject",
+      messages: [`Merged-Head: update documentation\n\nwhy.\n\n${LAST}\n`],
+      title: "A reviewed change",
+    },
+    {
+      source: "a multi-commit pull request's title",
+      messages: [`feat: first change\n\nwhy.\n\n${FIRST}\n`, `fix: second change\n\nwhy.\n\n${LAST}\n`],
+      title: "Merged-Head: update documentation",
+    },
+  ])("refuses a title declaring a Merged-Head ($source) before reservation or PUT, as the real gate would", async ({ messages, title }) => {
+    const repository = branchRepository(messages);
+    const { shas, stored } = repository;
+
+    const test = fixture(stored, title, stored.length, shas);
+    await expect(test.execute()).rejects.toThrow(/conflicting Merged-Head trailers/);
+    expect(test.puts()).toHaveLength(0);
+    expect(test.reserve).not.toHaveBeenCalled();
+
+    // Why: the same bytes, had they been sent, are a squash the real gate refuses for good.
+    const branch = stored.map((message, index) => ({ sha: shas[index]!, message }));
+    const { gate } = squashAndGate(
+      repository,
+      composeSquashCommitTitle(branch, title, 100),
+      composeSquashCommitMessage(branch, shas.at(-1)!),
+    );
+    expect(gate.status, gate.stdout).toBe(1);
+    expect(gate.stdout).toContain("2 conflicting Merged-Head trailers");
   });
 });

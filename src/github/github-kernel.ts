@@ -22,7 +22,7 @@ import {
 } from "../guard/managed-write-guard.ts";
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
 import type { TrustedCredentialStore } from "./credential-store.ts";
-import { type BranchCommitMessage, composeSquashCommitMessage, composeSquashCommitTitle } from "./merge-commit-message.ts";
+import { type BranchCommitMessage, assertSquashNamesMergedHead, composeSquashCommitMessage, composeSquashCommitTitle } from "./merge-commit-message.ts";
 
 /**
  * The gate's GitHub-side correlator: run, candidate, and the payload digest that binds the rest.
@@ -1966,10 +1966,10 @@ export class GitHubKernel {
     if (commits.at(-1)!.sha !== pull.head.sha) {
       throw new Error(`pull request ${pullNumber} commit list does not end at its exact head`);
     }
-    return {
-      title: composeSquashCommitTitle(commits, pull.title, pullNumber),
-      message: composeSquashCommitMessage(commits, mergedHead),
-    };
+    const title = composeSquashCommitTitle(commits, pull.title, pullNumber);
+    const message = composeSquashCommitMessage(commits, mergedHead);
+    await assertSquashNamesMergedHead(title, message, mergedHead); // the gate reads the title too
+    return { title, message };
   }
 
   /** Translate the pinned contract vocabulary to GitHub's REST API vocabulary. */

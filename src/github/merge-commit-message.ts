@@ -184,6 +184,29 @@ export const composeSquashCommitMessage = (commits: readonly BranchCommitMessage
   return body === "" ? line : `${line}\n\n${body}`;
 };
 
+/**
+ * The gate's own reader, `mergedHeadIn`. `src/github` and the built `dist/github` both sit two levels
+ * under the root whose `scripts/` the deployed generation ships, so this one address serves both.
+ */
+const GATE_READER = new URL("../../scripts/verify-merge-preserved-records.mjs", import.meta.url);
+
+/**
+ * The squash as GitHub commits it — the title, a blank line, the message — read back with the
+ * merge-records gate's `mergedHeadIn`, which must answer exactly `mergedHead`.
+ *
+ * The title is checked because the gate reads it: a single commit's subject or a pull request's
+ * title can open with `Merged-Head:`, which the body-only refusal in `composeSquashCommitMessage`
+ * cannot see, and the gate then refuses the squash as naming two. A refusal throws, before
+ * anything is reserved or sent.
+ */
+export const assertSquashNamesMergedHead = async (title: string, message: string, mergedHead: string): Promise<void> => {
+  const { mergedHeadIn } = (await import(GATE_READER.href)) as { mergedHeadIn: (message: string, what: string) => string };
+  const named = mergedHeadIn(`${title}\n\n${message}`, "the squash message");
+  if (named !== mergedHead) {
+    throw new Error(`the squash message names ${named} as its Merged-Head, not the head this merge fences on`);
+  }
+};
+
 /** COMMIT_OR_PR_TITLE, including GitHub's PR suffix, sanitized before it reaches the PUT. */
 export const composeSquashCommitTitle = (
   commits: readonly BranchCommitMessage[],
