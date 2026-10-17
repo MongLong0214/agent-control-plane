@@ -206,20 +206,28 @@ export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[]
     ],
   },
   {
-    // Review of run_7717 (F4).
+    // Review of run_7717 (F4), PR #1122 R1 (BCG-R1-01, BCG-R1-02).
     id: "handoff-observed-facts",
     kind: BootstrapLifecycleKind.IMPLEMENTED_GUARANTEE,
     statement:
-      "The handoff activation delivers carries, for each produced repository, the default branch and exact head of the stored producer result: the branch the create's readback reported and the head it read back (for a create-only plan, the parentless commit GitHub initialized). The planned outputs' handoff above shows them null because the PLAN precedes the create. An ACK is accepted only when every created repository has exactly one fact, its branch the PLAN's default branch (for a create-only plan, the manifest's branchProfile.defaultBranch) and its head that 40-hex head.",
+      "The handoff activation delivers carries the repository facts selected from the stored producer result bound to the PLAN's target repository, default branch and required verification; every verification row for that repository must name the one head the required row names, and a result with conflicting rows is refused at activation, before any handoff. The planned outputs' handoff above shows the facts null because the PLAN precedes the create. An ACK is accepted, an ACK is relied on, and a CONFIRM completes only while the delivered package, ACKed or not, carries exactly those facts; the CONFIRM's completion chain requires them to be the create execution's own readback in the attempt ledger (for a create-only plan, the default branch GitHub reported and the parentless head it initialized). An activation retry reissues a persisted handoff without them as a fresh PENDING package for a new ACK from the current PRIMARY_CTO; the earlier handoff is kept and proves nothing.",
     sites: [
-      { file: PLAN, symbol: "deliveredBootstrapHandoff", enforces: ["branch: repository.defaultBranch", "?.exactHead ?? null"] },
-      { file: ACTIVATION, symbol: "activate", enforces: ["deliveredBootstrapHandoff(input.handoff, result)"] },
+      {
+        file: PLAN,
+        symbol: "observedRepositoryFacts",
+        enforces: ["repository.identity !== target.repositoryIdentity", "heads.length !== 1", "row.commandId === target.verificationCommandId", "RESULT_FACTS_UNBOUND"],
+      },
+      { file: ACTIVATION, symbol: "activate", enforces: ["observedRepositoryFacts(result, factsTargetOf(current.value.outputs))", "deliveredBootstrapHandoff(input.handoff, facts.value)"] },
       { file: ACTIVATION, symbol: "acknowledgeActivationHandoff", enforces: ["this.observedHandoffFacts("] },
+      { file: ACTIVATION, symbol: "acknowledgedActivationHandoff", enforces: ["this.observedHandoffFacts(handoffId"] },
+      { file: ACTIVATION, symbol: "finalizeBootstrapActivationConfirm", enforces: ["this.observedHandoffFacts(handoffArtifact.content.handoffId"] },
       {
         file: ACTIVATION,
-        symbol: "observedHandoffFacts",
-        enforces: ["HANDOFF_FACTS_NOT_OBSERVED", "/^[0-9a-f]{40}$/.test(want.head)", "plan.value.outputs.defaultBranch", "delivered.length === expected.length"],
+        symbol: "handoffFactsObserved",
+        enforces: ["HANDOFF_FACTS_NOT_OBSERVED", "observedRepositoryFacts(parsed.value, factsTargetOf(plan.value.outputs))", "handoffFactsAre(handoff, expected)"],
       },
+      { file: ACTIVATION, symbol: "reissuable", enforces: ["!this.observedHandoffFacts(recorded.handoffId", "factless(recorded.handoff) === factless(handoff)"] },
+      { file: RUNNER, symbol: "writtenChain", enforces: ["created.observed.initializedHead", "this execution's readback in the attempt ledger"] },
     ],
   },
   {

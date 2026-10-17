@@ -24,6 +24,9 @@ import {
   bootstrapReviewIntentCurrent,
   currentBootstrapPlan,
   deliveredBootstrapHandoff,
+  factsTargetOf,
+  handoffFactsAre,
+  observedRepositoryFacts,
   sameBootstrapPlanBinding,
 } from "./bootstrap-plan.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
@@ -211,6 +214,14 @@ export class BootstrapActivation {
     const provenance = await this.validateFactoryProvenance(input, result, approvedDigest);
     if (!provenance.allowed) return provenance as Decision<ACPBootstrapActivationResult>;
 
+    // PR #1122 R1 (BCG-R1-02) — the repository facts the handoff will carry, selected from this result
+    // bound to the PLAN's target and required verification, refused here (conflicting verification rows
+    // included) before anything is written or delivered.
+    const current = currentBootstrapPlan(input.runId, this.artifacts.latest<unknown>(input.runId, ArtifactKind.PLAN));
+    if (!current.allowed) return current as Decision<ACPBootstrapActivationResult>;
+    const facts = observedRepositoryFacts(result, factsTargetOf(current.value.outputs));
+    if (!facts.allowed) return facts as Decision<ACPBootstrapActivationResult>;
+
     // Everything that can be refused is refused *before* the first mutation. Registering a
     // project, binding a primary CTO and then denying would leave a half-activated
     // project behind and make a retry conflict with itself (Integration §7 Phase J).
@@ -314,7 +325,7 @@ export class BootstrapActivation {
       projectId,
       input.runId,
       primaryCtoBinding.sessionId,
-      deliveredBootstrapHandoff(input.handoff, result),
+      deliveredBootstrapHandoff(input.handoff, facts.value),
     );
     if (!handoff.allowed) return handoff as Decision<ACPBootstrapActivationResult>;
     const handoffAck = this.acknowledgedActivationHandoff(
@@ -602,6 +613,14 @@ export class BootstrapActivation {
         },
       );
     }
+    // PR #1122 R1 (BCG-R1-01) — the package the run's handoff delivered, ACKed or not, must carry the
+    // observed facts, by the check its ACK makes; the completion chain asked above has bound those facts
+    // to this create execution's readback in the attempt ledger. An ACK of an earlier package proves nothing.
+    const delivered = this.db.get<{ package_json: string }>(`SELECT package_json FROM handoffs WHERE handoff_id = ? AND kind = 'BOOTSTRAP'`, [
+      handoffArtifact.content.handoffId,
+    ]);
+    const deliveredFacts = this.observedHandoffFacts(handoffArtifact.content.handoffId, delivered ? JSON.parse(delivered.package_json) : {});
+    if (!deliveredFacts.allowed) return deliveredFacts as Decision<ACPBootstrapActivationResult>;
     const target = plan.value.outputs.target;
     const ctoSession = primary ? this.sessions.get(primary.sessionId) : null;
     const handoffAck = this.acknowledgedActivationHandoff(
@@ -715,7 +734,12 @@ export class BootstrapActivation {
       toSessionId: string;
       handoff: HandoffPackage;
     }>(runId, ArtifactKind.HANDOFF);
-    if (recorded) {
+    // PR #1122 R1 (BCG-R1-01) — a recorded handoff whose delivered package lacks the observed facts (one
+    // persisted before they were delivered) is reissued: a fresh PENDING handoff, to the current
+    // PRIMARY_CTO, of the same package with the observed facts, for a new ACK. Only that differs; the
+    // earlier handoff row and artifact are kept as they are, and its ACK, if any, is evidence of nothing.
+    const reissues = recorded !== null && this.reissuable(projectId, recorded.content, handoff);
+    if (recorded && !reissues) {
       const recordedDigest = digestOf(recorded.content.handoff);
       if (
         recorded.content.projectId !== projectId ||
@@ -783,9 +807,31 @@ export class BootstrapActivation {
       projectId,
       runId,
       sessionId: toSessionId,
-      evidence: { handoffId, source: "bootstrap-activation" },
+      evidence: { handoffId, source: "bootstrap-activation", ...(reissues ? { reissuedFrom: recorded.content.handoffId } : {}) },
     });
     return allow(ReasonCode.OK, { handoffId });
+  }
+
+  /**
+   * Whether a recorded BOOTSTRAP handoff is replaced by `handoff`: the recorded one's delivered package
+   * does not carry the observed facts, `handoff` does, and the two packages differ in nothing else.
+   */
+  private reissuable(
+    projectId: string,
+    recorded: { handoffId: string; projectId: string; handoff: HandoffPackage },
+    handoff: HandoffPackage,
+  ): boolean {
+    const row = this.db.get<{ package_json: string }>(`SELECT package_json FROM handoffs WHERE handoff_id = ? AND kind = 'BOOTSTRAP'`, [
+      recorded.handoffId,
+    ]);
+    const factless = (pkg: Partial<HandoffPackage>) => digestOf({ ...pkg, repositoryFacts: [] });
+    return (
+      row !== undefined &&
+      recorded.projectId === projectId &&
+      !this.observedHandoffFacts(recorded.handoffId, JSON.parse(row.package_json) as Partial<HandoffPackage>).allowed &&
+      this.observedHandoffFacts(recorded.handoffId, handoff).allowed &&
+      factless(recorded.handoff) === factless(handoff)
+    );
   }
 
   /** The ack, as recorded by the incoming session itself. */
@@ -822,12 +868,10 @@ export class BootstrapActivation {
   }
 
   /**
-   * Review of run_7717 (F4) — the repository facts a BOOTSTRAP handoff must carry for its ACK to be
-   * accepted: for each repository its run's stored producer result names, exactly one fact, whose branch
-   * is the PLAN's default branch (for a create-only plan, the manifest's; the one the create's readback
-   * reported; for a run whose PLAN has no planned outputs, the manifest's) and whose head is the
-   * 40-hex exact head that result carries (for a create-only plan, the initialized commit its create
-   * receipt read back). A null, planned or other value is refused, and the handoff stays PENDING.
+   * Review of run_7717 (F4), PR #1122 R1 — the repository facts a BOOTSTRAP handoff must carry, checked
+   * when its ACK is accepted, when an ACK is relied on, and at CONFIRM: exactly the facts
+   * `observedRepositoryFacts` selects from its run's stored producer result, bound to the run's current
+   * PLAN. A null, planned or other value is refused.
    */
   private observedHandoffFacts(handoffId: string, handoff: Partial<HandoffPackage>): Decision<void> {
     const owner = this.db.get<{ run_id: string }>(
@@ -835,45 +879,28 @@ export class BootstrapActivation {
         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
       [ArtifactKind.HANDOFF, handoffId],
     );
-    const stored = owner ? this.artifacts.latest<unknown>(owner.run_id, ArtifactKind.REPO_FACTORY_RESULT) : null;
+    return this.handoffFactsObserved(owner?.run_id ?? null, handoffId, handoff);
+  }
+
+  private handoffFactsObserved(runId: string | null, handoffId: string, handoff: Partial<HandoffPackage>): Decision<void> {
+    const stored = runId === null ? null : this.artifacts.latest<unknown>(runId, ArtifactKind.REPO_FACTORY_RESULT);
     const parsed = stored ? parseRepoFactoryResult(stored.content) : null;
-    const result = parsed?.allowed ? parsed.value : null;
-    // The PLAN's default branch (for a create-only plan, the manifest's branchProfile.defaultBranch); for
-    // a run whose PLAN predates planned outputs, the manifest's the result was produced under.
-    const plan = owner ? currentBootstrapPlan(owner.run_id, this.artifacts.latest<unknown>(owner.run_id, ArtifactKind.PLAN)) : null;
-    const defaultBranch = plan?.allowed
-      ? plan.value.outputs.defaultBranch
-      : result
-        ? (this.projects.manifest(result.projectManifestDigest)?.branchProfile.defaultBranch ?? null)
-        : null;
-    const expected = result
-      ? result.repositories.map((repository) => ({
-          identity: repository.identity,
-          branch: repository.defaultBranch === defaultBranch ? defaultBranch : null,
-          head: result.bootstrapVerification.find((row) => row.repositoryIdentity === repository.identity)?.exactHead ?? null,
-        }))
-      : [];
-    const delivered = Array.isArray(handoff.repositoryFacts) ? handoff.repositoryFacts : [];
-    const observed =
-      expected.length > 0 &&
-      delivered.length === expected.length &&
-      expected.every((want) => {
-        const facts = delivered.filter((fact) => fact?.identity === want.identity);
-        return (
-          facts.length === 1 &&
-          want.branch !== null &&
-          want.head !== null &&
-          /^[0-9a-f]{40}$/.test(want.head) &&
-          facts[0]!.branch === want.branch &&
-          facts[0]!.head === want.head
-        );
-      });
-    return observed
+    const plan = runId === null ? null : currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+    const observed = parsed?.allowed && plan?.allowed ? observedRepositoryFacts(parsed.value, factsTargetOf(plan.value.outputs)) : null;
+    const expected = observed?.allowed ? observed.value : [];
+    return handoffFactsAre(handoff, expected)
       ? allow(ReasonCode.OK, undefined)
       : deny(
           ReasonCode.HANDOFF_PACKAGE_INCOMPLETE,
           "the handoff does not carry the observed default branch and exact head of every created repository, so it is not acknowledged",
-          { refusal: "HANDOFF_FACTS_NOT_OBSERVED", handoffId, runId: owner?.run_id ?? null, expected, delivered },
+          {
+            refusal: "HANDOFF_FACTS_NOT_OBSERVED",
+            handoffId,
+            runId,
+            expected,
+            delivered: Array.isArray(handoff.repositoryFacts) ? handoff.repositoryFacts : [],
+            ...(observed && !observed.allowed ? { result: observed.evidence } : {}),
+          },
         );
   }
 
@@ -882,13 +909,15 @@ export class BootstrapActivation {
     handoffId: string,
     toSessionId: string,
   ): { handoffId: string; ackedAt: string } | null {
-    const row = this.db.get<{ handoff_id: string; acked_at: string | null }>(
-      `SELECT handoff_id, acked_at FROM handoffs
+    const row = this.db.get<{ handoff_id: string; acked_at: string | null; package_json: string }>(
+      `SELECT handoff_id, acked_at, package_json FROM handoffs
         WHERE handoff_id = ? AND kind = 'BOOTSTRAP' AND to_session_id = ? AND status = 'ACKED'`,
       [handoffId, toSessionId],
     );
     const artifact = this.artifacts.latest<{ handoffId: string }>(runId, ArtifactKind.HANDOFF);
     if (artifact?.content.handoffId !== handoffId) return null;
+    // PR #1122 R1 (BCG-R1-01) — an ACK of a package without the observed facts acknowledges nothing.
+    if (row && !this.observedHandoffFacts(handoffId, JSON.parse(row.package_json) as Partial<HandoffPackage>).allowed) return null;
     return row?.acked_at ? { handoffId: row.handoff_id, ackedAt: row.acked_at } : null;
   }
 

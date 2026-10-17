@@ -3,9 +3,12 @@ import { join } from "node:path";
 
 import Database from "better-sqlite3";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
+import * as planModule from "../../src/bootstrap/bootstrap-plan.ts";
 import { bootstrapActivationHandoff } from "../../src/bootstrap/bootstrap-plan.ts";
+import type { RepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
+import { allow } from "../../src/core/errors.ts";
 import { manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -16,6 +19,7 @@ import { ownerApprovalFor, type PreparedBootstrapRun, prepareBootstrapRun } from
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
+afterEach(() => vi.restoreAllMocks());
 
 /**
  * Review of run_7717 (BLOCK, F2–F6) — what the CEO's CONFIRM completion transaction of a project-less
@@ -250,6 +254,139 @@ describe("F6: settlement requires the task's BOOTSTRAP_PLAN_TASKS binding to the
     const refused = confirm(prepared);
     expect(refused).toMatchObject({ allowed: false, evidence: { refusal: "BOOTSTRAP_TASK_PLAN_UNRECORDED" } });
     expect(harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+    nothingCompleted(prepared);
+  });
+});
+
+/**
+ * PR #1122 R1 (BCG-R1-01) — a handoff persisted before activation delivered observed facts. Its package is
+ * checked at CONFIRM, ACKed or not, and an activation retry reissues it with the observed facts for a new
+ * ACK from the current PRIMARY_CTO; the earlier handoff and its ACK are kept and prove nothing.
+ */
+describe("BCG-R1-01: a persisted handoff without the observed facts", () => {
+  /** What the implementation before F4 persisted: the PLAN-time package delivered, and its ACK accepted. */
+  const asBeforeF4 = (prepared: PreparedBootstrapRun, options: { ack: boolean }) => {
+    vi.spyOn(planModule, "deliveredBootstrapHandoff").mockImplementation((planned) => planned);
+    if (options.ack) {
+      vi.spyOn(prepared.harness.cp.bootstrap as unknown as { observedHandoffFacts: () => unknown }, "observedHandoffFacts").mockReturnValue(
+        allow(ReasonCode.OK, undefined),
+      );
+    }
+  };
+
+  it("an ACKed package with null branch and head: CONFIRM is refused HANDOFF_FACTS_NOT_OBSERVED and nothing completes", async () => {
+    const prepared = await prepare("bcg-r1-acked");
+    asBeforeF4(prepared, { ack: true });
+    const handoffId = await produce(prepared);
+    await ackAndActivate(prepared, handoffId);
+    vi.restoreAllMocks();
+    expect(deliveredHandoff(prepared, handoffId).repositoryFacts).toEqual([{ identity: IDENTITY, branch: null, head: null }]);
+    expect(prepared.harness.cp.db.get<{ status: string }>(`SELECT status FROM handoffs WHERE handoff_id = ?`, [handoffId])?.status).toBe("ACKED");
+    expect(confirm(prepared)).toMatchObject({ allowed: false, reasonCode: ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, evidence: { refusal: "HANDOFF_FACTS_NOT_OBSERVED" } });
+    nothingCompleted(prepared);
+  });
+
+  it("a PENDING package with null facts: refused at ACK and at CONFIRM, reissued by the activation retry, ACKed anew by the current PRIMARY_CTO, then completed", async () => {
+    const prepared = await prepare("bcg-r1-pending");
+    asBeforeF4(prepared, { ack: false });
+    const stale = await produce(prepared);
+    vi.restoreAllMocks();
+    const { harness } = prepared;
+    const primary = primaryOf(prepared).sessionId;
+    expect(harness.cp.bootstrap.acknowledgeActivationHandoff(stale, primary)).toMatchObject({ allowed: false, evidence: { refusal: "HANDOFF_FACTS_NOT_OBSERVED" } });
+
+    const retried = await prepared.runner.produceAndActivate(prepared.input);
+    expect(retried, JSON.stringify(retried)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    const reissued = retried.evidence["pendingHandoffId"] as string;
+    expect(reissued).not.toBe(stale);
+    const readback = createReadback(prepared);
+    expect(deliveredHandoff(prepared, reissued).repositoryFacts).toEqual([{ identity: IDENTITY, branch: "main", head: readback.initializedHead }]);
+    // The earlier handoff is kept as it was, and neither it nor a CONFIRM before the new ACK completes anything.
+    const rows = harness.cp.db.all<{ handoff_id: string; status: string; to_session_id: string }>(
+      `SELECT handoff_id, status, to_session_id FROM handoffs WHERE project_id = ? ORDER BY created_at, rowid`,
+      [prepared.manifest.projectId],
+    );
+    expect(rows).toEqual([
+      { handoff_id: stale, status: "PENDING", to_session_id: primary },
+      { handoff_id: reissued, status: "PENDING", to_session_id: primary },
+    ]);
+    expect(harness.cp.audit.byKind("HANDOFF_SUBMITTED").filter((row) => row.evidence["handoffId"] === reissued).map((row) => row.evidence["reissuedFrom"])).toEqual([stale]);
+    expect(harness.cp.bootstrap.acknowledgeActivationHandoff(stale, primary).allowed).toBe(false);
+    expect(confirm(prepared)).toMatchObject({ allowed: false });
+    nothingCompleted(prepared);
+
+    await ackAndActivate(prepared, reissued);
+    expect(confirm(prepared)).toMatchObject({ allowed: true, value: { state: RunState.COMPLETED } });
+    expect(harness.cp.bootstrapApplications.get(prepared.runId)?.phase).toBe("COMPLETED");
+    expect(harness.cp.tasks.list(prepared.runId).map((task) => task.state)).toEqual(["SUCCEEDED"]);
+    expect(harness.cp.artifacts.latest<{ handoffAck: { handoffId: string } }>(prepared.runId, "BOOTSTRAP_ACTIVATION_RESULT")?.content.handoffAck.handoffId).toBe(reissued);
+    expect(prepared.github.createRequests).toHaveLength(1);
+  });
+});
+
+/**
+ * PR #1122 R1 (BCG-R1-02) — the handoff's head is the one the run's required verification names for the
+ * PLAN's target, one head across every verification row, and the create's readback at completion.
+ */
+describe("BCG-R1-02: the delivered head is bound to the required verification and the create's readback", () => {
+  /** A factory result altered at activation's input boundary, the receipts and ledger left as they are. */
+  const alterAtActivation = (prepared: PreparedBootstrapRun, alter: (result: RepoFactoryResult, checkoutPath: string) => Promise<RepoFactoryResult>) => {
+    const bootstrap = prepared.harness.cp.bootstrap;
+    const activate = bootstrap.activate.bind(bootstrap);
+    vi.spyOn(bootstrap, "activate").mockImplementation(async (input) =>
+      activate({ ...input, factoryResult: await alter(input.factoryResult as RepoFactoryResult, input.localBindings[0]!.checkoutPath) }),
+    );
+  };
+
+  const noHandoff = (prepared: PreparedBootstrapRun) => {
+    expect(prepared.harness.cp.artifacts.latest(prepared.runId, "HANDOFF")).toBeNull();
+    expect(prepared.harness.cp.db.all(`SELECT handoff_id FROM handoffs WHERE project_id = ?`, [prepared.manifest.projectId])).toEqual([]);
+  };
+
+  for (const [name, row] of [
+    ["an all-zero head under another command, prepended", (head: string) => [{ commandId: "unrelated-command", head: "0".repeat(40) }, { commandId: "clean-tree", head }]],
+    ["a second well-formed head under the required command", (head: string) => [{ commandId: "clean-tree", head }, { commandId: "clean-tree", head: "0123456789abcdef0123456789abcdef01234567" }]],
+  ] as const) {
+    it(`conflicting verification rows (${name}) are refused at activation: no handoff is delivered and CONFIRM completes nothing`, async () => {
+      const prepared = await prepare(`bcg-r1-rows-${name.split(" ")[1]}`);
+      alterAtActivation(prepared, async (result) => ({
+        ...result,
+        bootstrapVerification: row(result.bootstrapVerification[0]!.exactHead).map(({ commandId, head }) => ({
+          commandId,
+          repositoryIdentity: IDENTITY,
+          exactHead: head,
+          status: "PASS" as const,
+        })),
+      }));
+      const refused = await prepared.runner.produceAndActivate(prepared.input);
+      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, evidence: { refusal: "RESULT_FACTS_UNBOUND" } });
+      noHandoff(prepared);
+      expect(confirm(prepared)).toMatchObject({ allowed: false });
+      nothingCompleted(prepared);
+    });
+  }
+
+  it("a well-formed head that is not the create's readback (the checkout moved to it, one coherent row): ACKed, then refused at completion with nothing completed", async () => {
+    const prepared = await prepare("bcg-r1-not-readback");
+    let moved = "";
+    alterAtActivation(prepared, async (result, checkoutPath) => {
+      if (moved === "") {
+        await git(checkoutPath, ["-c", "user.email=other@example.com", "-c", "user.name=other", "commit", "-q", "--allow-empty", "-m", "a later commit"]);
+        moved = (await git(checkoutPath, ["rev-parse", "HEAD"])).stdout.trim();
+      }
+      return { ...result, bootstrapVerification: result.bootstrapVerification.map((row) => ({ ...row, exactHead: moved })) };
+    });
+    const handoffId = await produce(prepared);
+    vi.restoreAllMocks();
+    const readback = createReadback(prepared);
+    expect(moved).toMatch(/^[0-9a-f]{40}$/);
+    expect(moved).not.toBe(readback.initializedHead);
+    expect(deliveredHandoff(prepared, handoffId).repositoryFacts).toEqual([{ identity: IDENTITY, branch: "main", head: moved }]);
+    expect(prepared.harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primaryOf(prepared).sessionId)).toMatchObject({ allowed: true });
+    const resumed = await prepared.runner.produceAndActivate(prepared.input);
+    expect(resumed).toMatchObject({ allowed: false, evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" } });
+    const refused = confirm(prepared);
+    expect(refused).toMatchObject({ allowed: false, evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED", readback: { head: readback.initializedHead } } });
     nothingCompleted(prepared);
   });
 });
