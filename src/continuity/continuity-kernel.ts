@@ -2,6 +2,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
+import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { isWithin } from "../guard/workspace-probe.ts";
@@ -22,7 +23,7 @@ import { ContinuityMode, Role, type RoleBinding, RunState, SessionLifecycle, rol
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import { drivenModeOf } from "../runtime/provisioned-session-runtime.ts";
-import { isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
+import { SELF_CLAIM_EXECUTOR_KIND, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -106,6 +107,36 @@ const OPTIONAL_PROVIDERS: ReadonlySet<string> = new Set(["grok"]);
  */
 export const CONTINUITY_COVERAGE_REVOCATION_REASON = "coverage plan cannot staff the bound role";
 
+/**
+ * #1106 — the same revocation, split by what the daemon measured when it wrote it. Before the split
+ * every coverage revocation carried the one literal above, so a role revoked because its quota
+ * window ran out and one revoked because its runtime stopped answering read the same, and nothing
+ * could restore the first without also restoring the second. Only the capacity-only reason is ever
+ * restored automatically (`ContinuityKernel.restoreCapacityRevokedCanonicalCto`). The literal above
+ * stays the reason for a revocation the daemon cannot classify, and every row written before the
+ * split keeps it, so an old revocation is never read as capacity.
+ */
+export const CONTINUITY_CAPACITY_EXHAUSTED_REVOCATION_REASON = `${CONTINUITY_COVERAGE_REVOCATION_REASON}: capacity exhausted`;
+
+/** #1106 — the runtime itself was measured UNAVAILABLE (or its session is no longer READY). */
+export const CONTINUITY_RUNTIME_UNAVAILABLE_REVOCATION_REASON = `${CONTINUITY_COVERAGE_REVOCATION_REASON}: runtime unavailable`;
+
+/** #1106 — both at once. A compound reason is never restored automatically. */
+export const CONTINUITY_CAPACITY_AND_RUNTIME_REVOCATION_REASON =
+  `${CONTINUITY_COVERAGE_REVOCATION_REASON}: capacity exhausted and runtime unavailable`;
+
+/**
+ * #1106 — which coverage reason the daemon writes for what it measured at the revocation. Capacity
+ * counts only as an exhausted window on a reading whose sensor was HEALTHY; a revocation that is
+ * neither capacity nor a lost runtime keeps the unclassified literal.
+ */
+export const coverageRevocationReason = (measured: { runtimeLost: boolean; quotaExhausted: boolean }): string => {
+  if (measured.runtimeLost && measured.quotaExhausted) return CONTINUITY_CAPACITY_AND_RUNTIME_REVOCATION_REASON;
+  if (measured.runtimeLost) return CONTINUITY_RUNTIME_UNAVAILABLE_REVOCATION_REASON;
+  if (measured.quotaExhausted) return CONTINUITY_CAPACITY_EXHAUSTED_REVOCATION_REASON;
+  return CONTINUITY_COVERAGE_REVOCATION_REASON;
+};
+
 /** A planned failover that returned without leaving the ready binding it promised. */
 export const CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON =
   "continuity failover did not leave a ready planned binding";
@@ -131,6 +162,9 @@ export const CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON = "the provisioned runtim
 /** The exact reasons above, for the reader that has a `revoked_reason` and needs its origin. */
 export const CONTINUITY_REVOCATION_REASONS: readonly string[] = [
   CONTINUITY_COVERAGE_REVOCATION_REASON,
+  CONTINUITY_CAPACITY_EXHAUSTED_REVOCATION_REASON,
+  CONTINUITY_RUNTIME_UNAVAILABLE_REVOCATION_REASON,
+  CONTINUITY_CAPACITY_AND_RUNTIME_REVOCATION_REASON,
   CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON,
   CONTINUITY_RUNTIME_CREDENTIAL_LOST_REASON,
 ];
@@ -174,6 +208,8 @@ export class ContinuityKernel {
   #readiness: { checkSession(sessionId: string): Promise<Decision<void>> } | null = null;
   #buzz: { connect(sessionId: string, purpose: string): Promise<Decision<string>> } | null = null;
   #bootstrapRecovery: BootstrapCtoRecoveryPort | null = null;
+  #canonicalCtoAttach: CanonicalCtoAttachChallenger | null = null;
+  readonly #restoringCanonical = new Set<string>();
 
   /**
    * §15.7 requires the new session to be READY *before* the switch. Without a readiness
@@ -184,10 +220,12 @@ export class ContinuityKernel {
     readiness?: { checkSession(sessionId: string): Promise<Decision<void>> };
     buzz?: { connect(sessionId: string, purpose: string): Promise<Decision<string>> };
     bootstrapRecovery?: BootstrapCtoRecoveryPort;
+    canonicalCtoAttach?: CanonicalCtoAttachChallenger;
   }): void {
     if (ports.readiness) this.#readiness = ports.readiness;
     if (ports.buzz) this.#buzz = ports.buzz;
     if (ports.bootstrapRecovery) this.#bootstrapRecovery = ports.bootstrapRecovery;
+    if (ports.canonicalCtoAttach) this.#canonicalCtoAttach = ports.canonicalCtoAttach;
   }
 
   constructor(
@@ -900,6 +938,22 @@ export class ContinuityKernel {
         else deferred.push({ roleKey: assignment.roleKey, reasonCode: recovered.reasonCode });
         continue;
       }
+      // #1106 — a canonical CTO revoked only for capacity comes back on its own session at the next
+      // generation (`restoreCapacityRevokedCanonicalCto`). A refusal leaves everything as it was and
+      // still records the claim the role is owed, which stays the way back if the restore cannot be
+      // proven; `null` is a role that path does not restore at all.
+      if (assignment.role === Role.PRIMARY_CTO) {
+        const restoredCanonical = await this.restoreCapacityRevokedCanonicalCto(assignment.roleKey);
+        if (restoredCanonical?.allowed === true) {
+          restored.push(assignment.roleKey);
+          continue;
+        }
+        if (restoredCanonical !== null) {
+          deferred.push({ roleKey: assignment.roleKey, reasonCode: restoredCanonical.reasonCode });
+          if (!this.recordRestorationAwaitsClaim(assignment.roleKey, assignment.provider)) alreadyRecorded += 1;
+          continue;
+        }
+      }
       deferred.push({ roleKey: assignment.roleKey, reasonCode: ReasonCode.BINDING_REVOKED });
       if (!this.recordRestorationAwaitsClaim(assignment.roleKey, assignment.provider)) alreadyRecorded += 1;
     }
@@ -922,6 +976,213 @@ export class ContinuityKernel {
   }
 
   /**
+   * #1106 — restores a canonical PRIMARY_CTO that continuity revoked only for capacity, on the same
+   * session at the next generation, once its window has reset. No session, process or conversation
+   * is created, and the session's revoked credential is not revived: it is rotated in the restoring
+   * transaction and its plaintext is discarded, so the restored authority is reachable only through
+   * the reattach door, which admits on the process tree and holds no credential.
+   *
+   * In order, each a refusal of its own that leaves everything as it was:
+   *
+   *   - the role's newest assignment is a canonical binding revoked with the capacity-only reason, and
+   *     since that revocation there was no owner suspend, no replacement and no other holder
+   *     (`readCanonicalCtoRestoreTarget`, which the doctor asks too);
+   *   - an open reattach connection was admitted under exactly the revoked binding;
+   *   - a measurement taken now is HEALTHY, newer than the revocation, no longer exhausted for `cto`,
+   *     and admitted (`refreshForDispatch`, then the snapshot it wrote: `freshCanonicalCapacity`);
+   *   - that connection answers a liveness challenge bound to the role, the session, its incarnation,
+   *     the revoked generation and the connection, and is proven still attached to the live claude of
+   *     that session (`CanonicalCtoAttachChallenger`);
+   *   - inside the binding transaction, after the challenge, the target is read again and must be the
+   *     same, the capacity snapshot must still admit, and the connection is proven attached once more
+   *     as the last process read before the bind.
+   *
+   * After the commit the challenged connection is ended, so the relay comes back through the reattach
+   * door under the restored binding. A refusal once the target holds is recorded as
+   * `CANONICAL_CTO_RESTORE_REFUSED` with its condition, which the doctor names, and the next attempt
+   * of the same revocation waits out `CANONICAL_CTO_RESTORE_BACKOFF_MS`. Answers `null` for a role
+   * this path does not restore at all.
+   */
+  async restoreCapacityRevokedCanonicalCto(roleKey: string): Promise<Decision<RoleBinding> | null> {
+    const reading = readCanonicalCtoRestoreTarget(this.db, roleKey);
+    if (reading.kind === "NOT_APPLICABLE") return null;
+    if (reading.kind === "UNMET") {
+      return deny(reading.reasonCode, reading.message, { roleKey, condition: reading.condition });
+    }
+    const target = reading.target;
+    if (this.#restoringCanonical.has(roleKey)) {
+      return deny(ReasonCode.CONFLICT, "a restore of this canonical CTO is already running", {
+        roleKey,
+        condition: CanonicalCtoRestoreCondition.RESTORE_IN_PROGRESS,
+      });
+    }
+    if (this.#canonicalRestoreBackingOff(roleKey, target.revokeEventId)) {
+      return deny(ReasonCode.DAEMON_BACKOFF_ACTIVE, "a recent restore of this canonical CTO was refused; waiting out its backoff", {
+        roleKey,
+        condition: CanonicalCtoRestoreCondition.RESTORE_BACKING_OFF,
+        backoffMs: CANONICAL_CTO_RESTORE_BACKOFF_MS,
+      });
+    }
+    this.#restoringCanonical.add(roleKey);
+    try {
+      return await this.#restoreCanonical(target);
+    } finally {
+      this.#restoringCanonical.delete(roleKey);
+    }
+  }
+
+  /** Whether `restoreCapacityRevokedCanonicalCto` would try this role now. */
+  #canonicalCtoRestoreDue(roleKey: string): boolean {
+    const attach = this.#canonicalCtoAttach;
+    if (attach === null) return false;
+    const reading = readCanonicalCtoRestoreTarget(this.db, roleKey);
+    if (reading.kind !== "TARGET") return false;
+    if (!attach.connected(reading.target)) return false;
+    return !this.#canonicalRestoreBackingOff(roleKey, reading.target.revokeEventId);
+  }
+
+  async #restoreCanonical(target: CanonicalCtoRestoreTarget): Promise<Decision<RoleBinding>> {
+    const attach = this.#canonicalCtoAttach;
+    // Checked before anything is measured: without the connection nothing can be proven, and a
+    // probe spent on a role that cannot be attested is a probe for nothing.
+    if (attach === null || !attach.connected(target)) {
+      return this.#refuseCanonicalRestore(target, deny(ReasonCode.ROLE_PEER_ABSENT,
+        "no open reattach connection was admitted under the revoked binding", {
+          condition: CanonicalCtoRestoreCondition.NO_REATTACH_CONNECTION,
+        }));
+    }
+    // A measurement taken now. The refresh is the admission; the snapshot it leaves is what says
+    // whether it is new, healthy and past the window, each a different refusal.
+    const admitted = await this.capacity.refreshForDispatch({
+      provider: target.provider,
+      capabilities: ["cto"],
+      priority: "critical",
+      ...(this.providers.hasRoleScoped(target.provider) ? { role: Role.PRIMARY_CTO } : {}),
+    });
+    const measured = freshCanonicalCapacity(target, this.capacity);
+    if (!measured.allowed) return this.#refuseCanonicalRestore(target, measured);
+    if (!admitted.allowed) {
+      return this.#refuseCanonicalRestore(target, deny(admitted.reasonCode, admitted.message, {
+        condition: CanonicalCtoRestoreCondition.CAPACITY_ADMISSION_REFUSED,
+      }));
+    }
+
+    const proof = await attach.challenge(target);
+    if (!proof.allowed) return this.#refuseCanonicalRestore(target, proof);
+
+    const committed = this.db.txDecision<RoleBinding>(() => {
+      const again = readCanonicalCtoRestoreTarget(this.db, target.roleKey);
+      if (again.kind === "NOT_APPLICABLE") {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "the role is no longer a canonical CTO revoked for capacity", {
+          condition: CanonicalCtoRestoreCondition.REPLACED,
+        });
+      }
+      if (again.kind === "UNMET") return deny(again.reasonCode, again.message, { condition: again.condition });
+      const moved = restoreTargetMoved<RoleBinding>(target, again.target);
+      if (moved) return moved;
+      const capacityNow = freshCanonicalCapacity(target, this.capacity);
+      if (!capacityNow.allowed) return capacityNow as Decision<RoleBinding>;
+      const session = this.sessions.get(target.sessionId);
+      if (!session) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "the canonical session's row is gone", {
+          condition: CanonicalCtoRestoreCondition.RUNTIME_MOVED,
+        });
+      }
+      // The last process read this transaction makes; nothing after it leaves this process.
+      const attached = proof.value.stillAttached();
+      if (!attached.allowed) {
+        return deny(attached.reasonCode, attached.message, { condition: CanonicalCtoRestoreCondition.ATTACH_TARGET_NOT_LIVE });
+      }
+      const claimed = {
+        executorKind: SELF_CLAIM_EXECUTOR_KIND,
+        targetLocator: target.conversation,
+        targetLocatorDigest: sha256(target.conversation),
+      };
+      const bound = this.bindings.bind({
+        role: Role.PRIMARY_CTO,
+        projectId: target.projectId,
+        sessionId: target.sessionId,
+        mode: "PREFERRED",
+        authenticatedTarget: {
+          claimed,
+          protocolVersion: CANONICAL_CTO_CAPACITY_RESTORE_PROTOCOL,
+          attestationDigest: digestOf({
+            domain: CANONICAL_CTO_CAPACITY_RESTORE_PROTOCOL,
+            roleKey: target.roleKey,
+            sessionId: target.sessionId,
+            sessionIncarnation: target.sessionIncarnation,
+            revokedGeneration: target.revokedGeneration,
+            revokedAssignmentId: target.revokedAssignmentId,
+            connectionId: proof.value.connectionId,
+          }),
+          verify: () => claimed,
+        },
+      });
+      if (!bound.allowed) return bound;
+      const actor = this.db.get<{ actor_id: string }>(`SELECT actor_id FROM assignments WHERE assignment_id = ?`, [
+        bound.value.assignmentId,
+      ]);
+      if (
+        bound.value.sessionId !== target.sessionId ||
+        bound.value.sessionIncarnation !== target.sessionIncarnation ||
+        bound.value.bindingGeneration !== target.revokedGeneration + 1 ||
+        actor?.actor_id !== target.actorId
+      ) {
+        return deny(ReasonCode.CONFLICT, "the restored binding is not the same actor and session at the next generation", {
+          condition: CanonicalCtoRestoreCondition.RUNTIME_MOVED,
+        });
+      }
+      // Not revived: the revoked generation's credential stops verifying here, and the new one is
+      // dropped unread, so no socket that authenticates by session secret admits this binding.
+      const rotated = this.sessions.rotateSecret(target.sessionId, session.credentialEpoch);
+      if (!rotated.allowed) return rotated as Decision<RoleBinding>;
+      const recorded = this.audit.record({
+        kind: CANONICAL_CTO_CAPACITY_RESTORED,
+        roleKey: target.roleKey,
+        projectId: target.projectId,
+        sessionId: target.sessionId,
+        evidence: {
+          fromGeneration: target.revokedGeneration,
+          toGeneration: bound.value.bindingGeneration,
+          connectionId: proof.value.connectionId,
+          credentialEpoch: rotated.value.session.credentialEpoch,
+        },
+      });
+      if (!recorded.allowed) return recorded as Decision<RoleBinding>;
+      return allow(ReasonCode.OK, bound.value);
+    });
+    if (!committed.allowed) return this.#refuseCanonicalRestore(target, committed);
+    // Ended only once committed: the relay comes back through the reattach door, which admits it
+    // under the restored binding by the same process-tree proof every reattach passes.
+    proof.value.release();
+    return committed;
+  }
+
+  /** Records one refused attempt with its condition, and answers the refusal. */
+  #refuseCanonicalRestore<T>(target: CanonicalCtoRestoreTarget, refusal: Decision<unknown>): Decision<T> {
+    const condition = conditionOf(refusal) ?? CanonicalCtoRestoreCondition.LIVENESS_CHALLENGE_FAILED;
+    this.audit.record({
+      kind: CANONICAL_CTO_RESTORE_REFUSED,
+      reasonCode: refusal.reasonCode,
+      roleKey: target.roleKey,
+      projectId: target.projectId,
+      sessionId: target.sessionId,
+      evidence: { condition, generation: target.revokedGeneration, backoffMs: CANONICAL_CTO_RESTORE_BACKOFF_MS },
+    });
+    return deny(refusal.reasonCode, refusal.allowed ? "canonical CTO restore refused" : refusal.message, {
+      roleKey: target.roleKey,
+      condition,
+    });
+  }
+
+  /** Whether this revocation's latest refused restore is younger than the backoff. */
+  #canonicalRestoreBackingOff(roleKey: string, revokeEventId: number): boolean {
+    const refused = latestCanonicalRestoreRefusal(this.db, roleKey, revokeEventId);
+    if (!refused) return false;
+    return Date.parse(this.clock.nowIso()) - Date.parse(refused.at) < CANONICAL_CTO_RESTORE_BACKOFF_MS;
+  }
+
+  /**
    * Whether this role's pending need is already on the ledger for the revocation it is waiting on.
    *
    * Keyed on `event_id >` the role's newest `BINDING_REVOKED`, which is what makes the answer
@@ -939,6 +1200,9 @@ export class ContinuityKernel {
     // #246 C1b — a bootstrap CTO's need is its recovery, and a recovery that just failed has
     // nothing to gain from another pass before its backoff ends.
     if (this.#bootstrapRecovery?.backingOff(roleKey) === true) return true;
+    // #1106 — a capacity-only canonical CTO whose restore can be tried now is owed a pass even
+    // after its claim need was recorded; the restore's own backoff paces the attempts.
+    if (this.#canonicalCtoRestoreDue(roleKey)) return false;
     return this.db.get<{ one: number }>(
       `SELECT 1 AS one FROM audit_events
         WHERE kind = 'CONTINUITY_RESTORE_AWAITS_CLAIM' AND role_key = ?
@@ -1452,3 +1716,288 @@ const bootstrapCtoNotReplaceable = <T>(roleKey: string | null): Decision<T> =>
     "a run's bootstrap CTO is never replaced; its authority is revoked and its own session recovered",
     { roleKey },
   );
+
+/**
+ * #1106 — the attestation domain of a binding `ContinuityKernel.restoreCapacityRevokedCanonicalCto`
+ * restored, recorded as the target attestation's protocol so a reader can tell it from a claim's.
+ */
+export const CANONICAL_CTO_CAPACITY_RESTORE_PROTOCOL = "acp.canonical-cto-capacity-restore/v1";
+
+/** #1106 — the audit kind of one committed capacity restore. */
+export const CANONICAL_CTO_CAPACITY_RESTORED = "CANONICAL_CTO_CAPACITY_RESTORED";
+
+/** #1106 — the audit kind of one refused capacity restore, carrying its condition. */
+export const CANONICAL_CTO_RESTORE_REFUSED = "CANONICAL_CTO_RESTORE_REFUSED";
+
+/** #1106 — how long a refused capacity restore waits before the next attempt of the same revocation. */
+export const CANONICAL_CTO_RESTORE_BACKOFF_MS = 5 * 60_000;
+
+/**
+ * #1106 — every condition a capacity restore can find unmet, by name. Each is its own refusal, its
+ * own `CANONICAL_CTO_RESTORE_REFUSED` evidence and its own doctor sentence; none is folded into
+ * another, because each is a different repair.
+ */
+export const CanonicalCtoRestoreCondition = {
+  /** The newest revocation was for a lost runtime, both causes at once, or anything but capacity. */
+  REVOKE_NOT_CAPACITY_ONLY: "REVOKE_NOT_CAPACITY_ONLY",
+  /** The coverage literal written before the split, which cannot tell capacity from a lost runtime. */
+  REVOKE_REASON_UNDISTINGUISHED: "REVOKE_REASON_UNDISTINGUISHED",
+  ANOTHER_HOLDER_ACTIVE: "ANOTHER_HOLDER_ACTIVE",
+  OWNER_SUSPENDED: "OWNER_SUSPENDED",
+  /** A replacement was requested since the revocation, or the role's newest row is no longer it. */
+  REPLACED: "REPLACED",
+  /** The revoked runtime row is gone, not READY, respawned, or its actor moved or retired. */
+  RUNTIME_MOVED: "RUNTIME_MOVED",
+  /** No reading, a reading that is not HEALTHY, unknown quota, or one measured before the revocation. */
+  CAPACITY_NOT_FRESH: "CAPACITY_NOT_FRESH",
+  CAPACITY_WINDOW_NOT_RESET: "CAPACITY_WINDOW_NOT_RESET",
+  CAPACITY_ADMISSION_REFUSED: "CAPACITY_ADMISSION_REFUSED",
+  /** No open reattach connection was admitted under exactly the revoked binding. */
+  NO_REATTACH_CONNECTION: "NO_REATTACH_CONNECTION",
+  /** The connection's peer is no longer proven to descend from the session's live claude. */
+  ATTACH_TARGET_NOT_LIVE: "ATTACH_TARGET_NOT_LIVE",
+  /** The challenge went unanswered, expired, was answered with an error, or its connection closed. */
+  LIVENESS_CHALLENGE_FAILED: "LIVENESS_CHALLENGE_FAILED",
+  RESTORE_IN_PROGRESS: "RESTORE_IN_PROGRESS",
+  RESTORE_BACKING_OFF: "RESTORE_BACKING_OFF",
+} as const;
+export type CanonicalCtoRestoreCondition = (typeof CanonicalCtoRestoreCondition)[keyof typeof CanonicalCtoRestoreCondition];
+
+const RESTORE_CONDITIONS: ReadonlySet<string> = new Set(Object.values(CanonicalCtoRestoreCondition));
+
+const conditionOf = (decision: Decision<unknown>): CanonicalCtoRestoreCondition | null => {
+  const named = (decision.evidence as { condition?: unknown } | undefined)?.condition;
+  return typeof named === "string" && RESTORE_CONDITIONS.has(named) ? (named as CanonicalCtoRestoreCondition) : null;
+};
+
+/** #1106 — the revoked canonical binding a capacity restore would put back, as the ledger has it. */
+export interface CanonicalCtoRestoreTarget {
+  roleKey: string;
+  projectId: string;
+  revokedAssignmentId: string;
+  revokedGeneration: number;
+  revokedAt: string;
+  /** The newest `BINDING_REVOKED` of the role, which is this generation's. */
+  revokeEventId: number;
+  actorId: string;
+  sessionId: string;
+  sessionIncarnation: string;
+  /** The claude conversation the actor's self-claim target names. */
+  conversation: string;
+  provider: string;
+}
+
+export type CanonicalCtoRestoreTargetReading =
+  | { kind: "NOT_APPLICABLE" }
+  | { kind: "UNMET"; condition: CanonicalCtoRestoreCondition; reasonCode: ReasonCode; message: string }
+  | { kind: "TARGET"; target: CanonicalCtoRestoreTarget };
+
+const unmet = (
+  condition: CanonicalCtoRestoreCondition,
+  reasonCode: ReasonCode,
+  message: string,
+): CanonicalCtoRestoreTargetReading => ({ kind: "UNMET", condition, reasonCode, message });
+
+/**
+ * #1106 — whether a role is a canonical PRIMARY_CTO continuity revoked only for capacity, with
+ * nothing since, and which binding it would get back. Reads the ledger only, so the doctor asks the
+ * same question the restore does.
+ *
+ * `NOT_APPLICABLE` is any role this path has nothing to say about: never bound, not a PRIMARY_CTO,
+ * not a canonical (self-claim) actor, or released by something other than continuity. `UNMET` is a
+ * canonical CTO continuity revoked whose restore is refused, and why; its reason code is the one the
+ * restoration pass already reported for such a role (BINDING_REVOKED: it waits on a claim), except
+ * for a role that is held.
+ */
+export const readCanonicalCtoRestoreTarget = (db: Db, roleKey: string): CanonicalCtoRestoreTargetReading => {
+  const latest = db.get<{
+    assignment_id: string;
+    role: Role;
+    project_id: string | null;
+    actor_id: string;
+    session_id: string;
+    session_incarnation: string;
+    binding_generation: number;
+    status: string;
+    revoked_reason: string | null;
+    revoked_at: string | null;
+  }>(
+    `SELECT assignment_id, role, project_id, actor_id, session_id, session_incarnation, binding_generation,
+            status, revoked_reason, revoked_at
+       FROM assignments WHERE role_key = ? ORDER BY binding_generation DESC LIMIT 1`,
+    [roleKey],
+  );
+  if (!latest) return { kind: "NOT_APPLICABLE" };
+  if (latest.role !== Role.PRIMARY_CTO) return { kind: "NOT_APPLICABLE" };
+  if (latest.status === "ACTIVE") {
+    return unmet(CanonicalCtoRestoreCondition.ANOTHER_HOLDER_ACTIVE, ReasonCode.BINDING_ALREADY_ACTIVE,
+      "the role has an active holder; it is never overwritten");
+  }
+  const canonical = db.get<{ target_locator: string; target_locator_digest: string }>(
+    `SELECT target_locator, target_locator_digest FROM actor_target_bindings
+      WHERE target_actor_id = ? AND executor_kind = ?`,
+    [latest.actor_id, SELF_CLAIM_EXECUTOR_KIND],
+  );
+  if (!canonical) return { kind: "NOT_APPLICABLE" };
+  if (canonical.target_locator_digest !== sha256(canonical.target_locator)) return { kind: "NOT_APPLICABLE" };
+  if (!isContinuityRevocationReason(latest.revoked_reason)) return { kind: "NOT_APPLICABLE" };
+  if (latest.revoked_reason === CONTINUITY_COVERAGE_REVOCATION_REASON) {
+    return unmet(CanonicalCtoRestoreCondition.REVOKE_REASON_UNDISTINGUISHED, ReasonCode.BINDING_REVOKED,
+      "the revocation predates the capacity/runtime split and is never read as capacity");
+  }
+  if (latest.revoked_reason !== CONTINUITY_CAPACITY_EXHAUSTED_REVOCATION_REASON) {
+    return unmet(CanonicalCtoRestoreCondition.REVOKE_NOT_CAPACITY_ONLY, ReasonCode.BINDING_REVOKED,
+      "the newest revocation was not for capacity alone");
+  }
+  if (latest.project_id === null || latest.revoked_at === null) return { kind: "NOT_APPLICABLE" };
+  const revoked = db.get<{ event_id: number; generation: number | null }>(
+    `SELECT event_id, json_extract(evidence_json, '$.generation') AS generation FROM audit_events
+      WHERE kind = 'BINDING_REVOKED' AND role_key = ? ORDER BY event_id DESC LIMIT 1`,
+    [roleKey],
+  );
+  if (!revoked || revoked.generation !== latest.binding_generation) {
+    return unmet(CanonicalCtoRestoreCondition.REPLACED, ReasonCode.BINDING_REVOKED,
+      "the role's newest revocation is not the capacity one");
+  }
+  const project = db.get<{ suspended: number }>(`SELECT suspended FROM projects WHERE project_id = ?`, [latest.project_id]);
+  if (!project) return { kind: "NOT_APPLICABLE" };
+  const suspendedSince = db.get<{ one: number }>(
+    `SELECT 1 AS one FROM audit_events WHERE kind = 'PROJECT_SUSPENDED' AND project_id = ? AND event_id > ? LIMIT 1`,
+    [latest.project_id, revoked.event_id],
+  );
+  if (project.suspended === 1 || suspendedSince) {
+    return unmet(CanonicalCtoRestoreCondition.OWNER_SUSPENDED, ReasonCode.BINDING_REVOKED,
+      "the owner suspended the project since the revocation");
+  }
+  const replacementSince = db.get<{ one: number }>(
+    `SELECT 1 AS one FROM audit_events WHERE kind = 'CTO_REPLACEMENT_REQUESTED' AND project_id = ? AND event_id > ? LIMIT 1`,
+    [latest.project_id, revoked.event_id],
+  );
+  if (replacementSince) {
+    return unmet(CanonicalCtoRestoreCondition.REPLACED, ReasonCode.BINDING_REVOKED,
+      "a replacement was requested since the revocation");
+  }
+  const runtime = db.get<{ lifecycle: string; incarnation: string; provider: string }>(
+    `SELECT lifecycle, incarnation, provider FROM sessions WHERE session_id = ?`,
+    [latest.session_id],
+  );
+  const actor = db.get<{ current_session_id: string | null; current_session_incarnation: string | null; retired_at: string | null }>(
+    `SELECT current_session_id, current_session_incarnation, retired_at FROM conversational_actors WHERE actor_id = ?`,
+    [latest.actor_id],
+  );
+  const runtimeIsTheRevokedOne =
+    runtime?.lifecycle === SessionLifecycle.READY &&
+    runtime.incarnation === latest.session_incarnation &&
+    actor?.retired_at === null &&
+    actor.current_session_id === latest.session_id &&
+    actor.current_session_incarnation === latest.session_incarnation;
+  if (!runtimeIsTheRevokedOne) {
+    return unmet(CanonicalCtoRestoreCondition.RUNTIME_MOVED, ReasonCode.BINDING_REVOKED,
+      "the revoked runtime is gone, not READY, respawned, or its actor moved");
+  }
+  return {
+    kind: "TARGET",
+    target: {
+      roleKey,
+      projectId: latest.project_id,
+      revokedAssignmentId: latest.assignment_id,
+      revokedGeneration: latest.binding_generation,
+      revokedAt: latest.revoked_at,
+      revokeEventId: revoked.event_id,
+      actorId: latest.actor_id,
+      sessionId: latest.session_id,
+      sessionIncarnation: latest.session_incarnation,
+      conversation: canonical.target_locator,
+      provider: runtime.provider,
+    },
+  };
+};
+
+/** The newest refused restore of this role's current revocation, if any. */
+export const latestCanonicalRestoreRefusal = (
+  db: Db,
+  roleKey: string,
+  revokeEventId: number,
+): { at: string; condition: string | null; reasonCode: string | null } | null =>
+  db.get<{ at: string; condition: string | null; reasonCode: string | null }>(
+    `SELECT at, json_extract(evidence_json, '$.condition') AS condition, reason_code AS reasonCode FROM audit_events
+      WHERE kind = ? AND role_key = ? AND event_id > ?
+      ORDER BY event_id DESC LIMIT 1`,
+    [CANONICAL_CTO_RESTORE_REFUSED, roleKey, revokeEventId],
+  ) ?? null;
+
+/** A change between the target the challenge was asked under and the one read inside the bind. */
+const restoreTargetMoved = <T>(started: CanonicalCtoRestoreTarget, now: CanonicalCtoRestoreTarget): Decision<T> | null => {
+  if (now.revokedAssignmentId !== started.revokedAssignmentId) return movedDuringRestore(CanonicalCtoRestoreCondition.REPLACED);
+  if (now.revokedGeneration !== started.revokedGeneration) return movedDuringRestore(CanonicalCtoRestoreCondition.REPLACED);
+  if (now.revokeEventId !== started.revokeEventId) return movedDuringRestore(CanonicalCtoRestoreCondition.REPLACED);
+  if (now.sessionId !== started.sessionId) return movedDuringRestore(CanonicalCtoRestoreCondition.RUNTIME_MOVED);
+  if (now.sessionIncarnation !== started.sessionIncarnation) return movedDuringRestore(CanonicalCtoRestoreCondition.RUNTIME_MOVED);
+  if (now.actorId !== started.actorId) return movedDuringRestore(CanonicalCtoRestoreCondition.RUNTIME_MOVED);
+  if (now.conversation !== started.conversation) return movedDuringRestore(CanonicalCtoRestoreCondition.RUNTIME_MOVED);
+  return null;
+};
+
+const movedDuringRestore = <T>(condition: CanonicalCtoRestoreCondition): Decision<T> =>
+  deny(ReasonCode.BINDING_GENERATION_STALE, "the revoked binding changed while its restore was attested", { condition });
+
+/**
+ * #1106 — the capacity question, answered from the snapshot the restore's own refresh wrote: a
+ * collector measurement (never an operator observation), HEALTHY in both sensor and runtime, taken
+ * after the revocation, with known quota for `cto`, no longer exhausted, and routable. Synchronous,
+ * so the bind transaction asks it again.
+ */
+export const freshCanonicalCapacity = (
+  target: Pick<CanonicalCtoRestoreTarget, "provider" | "revokedAt">,
+  capacity: Pick<
+    CapacityMonitor,
+    "currentForRole" | "current" | "hasExhaustedQuotaFor" | "hasUnknownQuotaFor" | "isRoutableFor"
+  >,
+): Decision<void> => {
+  const reading = capacity.currentForRole(target.provider, Role.PRIMARY_CTO) ?? capacity.current(target.provider);
+  const notFresh = (message: string): Decision<void> =>
+    deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, message, { condition: CanonicalCtoRestoreCondition.CAPACITY_NOT_FRESH });
+  if (reading === null) return notFresh("no capacity reading for the canonical CTO's provider");
+  if (reading.operatorObservation !== undefined) return notFresh("an operator observation is not a measurement");
+  if (reading.sensorHealth !== "HEALTHY") return notFresh("the capacity reading's sensor is not HEALTHY");
+  if (reading.runtimeHealth !== "HEALTHY") return notFresh("the capacity reading's runtime is not HEALTHY");
+  if (!(Date.parse(reading.observedAt) > Date.parse(target.revokedAt))) {
+    return notFresh("the capacity reading was taken before the revocation");
+  }
+  if (capacity.hasUnknownQuotaFor(reading, "cto")) return notFresh("the capacity reading has unknown quota for the role");
+  if (capacity.hasExhaustedQuotaFor(reading, "cto")) {
+    return deny(ReasonCode.CAPACITY_ADMISSION_SUSPENDED, "the exhausted window has not reset", {
+      condition: CanonicalCtoRestoreCondition.CAPACITY_WINDOW_NOT_RESET,
+    });
+  }
+  if (!capacity.isRoutableFor(reading, "cto")) {
+    return deny(ReasonCode.CAPACITY_ADMISSION_CONSERVE, "the role is not admitted on the fresh reading", {
+      condition: CanonicalCtoRestoreCondition.CAPACITY_ADMISSION_REFUSED,
+    });
+  }
+  return allow(ReasonCode.OK, undefined);
+};
+
+/** #1106 — what the restore's liveness challenge proved, held for the bind and released after it. */
+export interface CanonicalCtoAttachProof {
+  /** The reattach connection the challenge was answered on. */
+  readonly connectionId: string;
+  /**
+   * The connection is still open and its kernel peer still descends from the target session's live
+   * claude, running the target conversation. Process reads only; asked inside the bind transaction.
+   */
+  stillAttached(): Decision<void>;
+  /** Ends the challenged connection, so the relay reattaches under the restored binding. */
+  release(): void;
+}
+
+/**
+ * #1106 — the daemon side of the liveness challenge: the canonical CTO reattach door's own open
+ * connections. A refusal names its `condition` in its evidence.
+ */
+export interface CanonicalCtoAttachChallenger {
+  /** Whether an open reattach connection was admitted under exactly this revoked binding. No I/O. */
+  connected(target: CanonicalCtoRestoreTarget): boolean;
+  challenge(target: CanonicalCtoRestoreTarget): Promise<Decision<CanonicalCtoAttachProof>>;
+}
+

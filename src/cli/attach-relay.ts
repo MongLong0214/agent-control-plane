@@ -230,6 +230,21 @@ const sameTuple = (left: AdmittedTuple, right: AdmittedTuple): boolean => {
   return left.sessionIncarnation === right.sessionIncarnation;
 };
 
+/**
+ * #1106 — whether `next` is a later generation of the binding `held` named, on the very same runtime
+ * row: the same session and the same incarnation, a higher generation, another assignment. That is
+ * what the daemon's capacity restore of a canonical CTO binds — the same conversation on the same
+ * session at the next generation, with no other runtime — and it then ends the relay's connection so
+ * the relay comes back under it. A binding on another session or incarnation is still a binding that
+ * replaced this relay's own, and is refused as before.
+ */
+const sameRuntimeSuccessor = (next: AdmittedTuple, held: AdmittedTuple): boolean => {
+  if (next.sessionId !== held.sessionId) return false;
+  if (next.sessionIncarnation !== held.sessionIncarnation) return false;
+  if (next.assignmentId === held.assignmentId) return false;
+  return next.bindingGeneration > held.bindingGeneration;
+};
+
 type ClaimOutcome =
   | { kind: "receipt"; sessionId: string; sessionSecret: string; tuple: AdmittedTuple | null }
   | { kind: "unavailable" }
@@ -1087,7 +1102,11 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *     claims: a refusal — this process holds no binding, the binding was revoked, the ancestry does
  *     not match — ends the relay rather than falling back to a claim. An admission that names a
  *     binding or runtime other than `initial`, the one the first admission named, ends it too
- *     (review PR1051-R1): a reconnect never adopts a binding that replaced its own.
+ *     (review PR1051-R1): a reconnect never adopts a binding that replaced its own. The one
+ *     exception is not a replacement: a later generation on the same session and incarnation
+ *     (`sameRuntimeSuccessor`) — what the daemon's capacity restore binds (#1106) — names the same
+ *     runtime the reattach door just proved this process is, and is adopted and compared against
+ *     from then on.
  *   - **One wait at a time, one connection at a time** (PR1051-R2). Every socket is a `Link` that
  *     owns its waiters and its in-flight requests, and only the current link's lines reach anything.
  *     An attempt the relay gives up on is destroyed, so a late answer on it satisfies nothing; a
@@ -1158,6 +1177,8 @@ const relayWithReattach = (
   io: AttachRelayIo,
 ): Promise<number> =>
   new Promise<number>((resolveRelay) => {
+    /** The binding tuple a reconnect must name: the first admission's, or its same-runtime successor's. */
+    let admittedUnder = initial;
     const policy: ReattachPolicy = { ...DEFAULT_REATTACH_POLICY, ...policyOverrides };
     let phase: "connecting" | "live" | "reattaching" | "done" = "connecting";
     /** The one link the relay serves or is restoring. Every other socket it opened is destroyed. */
@@ -1654,7 +1675,10 @@ const relayWithReattach = (
             outcome.socket.destroy();
             return protocolFailure("reattach reply");
           }
-          if (!sameTuple(outcome.tuple, initial)) {
+          // #1106 — a later generation on this same runtime row is the binding this relay's own was
+          // restored to, and is adopted as the one every later reconnect is compared with.
+          if (sameRuntimeSuccessor(outcome.tuple, admittedUnder)) admittedUnder = outcome.tuple;
+          if (!sameTuple(outcome.tuple, admittedUnder)) {
             outcome.socket.destroy();
             // The relay found the mismatch itself, so it writes its own stage message rather than a
             // daemon reason code it was not sent.

@@ -140,12 +140,21 @@ const rewritingPass = async <T>(
  * `roleKey` (which the audit log stores redacted) and `continuityAction` — no `continuityHold`, no
  * candidate, no owner — and a deferred revocation carried only its reason, no generation.
  */
+/**
+ * The coverage reason as the code before #1106 wrote it: one literal, whatever was measured. The
+ * split reasons all begin with it.
+ */
+const legacyCoverageReason = (reason: string): string =>
+  reason.startsWith(`${CONTINUITY_COVERAGE_REVOCATION_REASON}: `) ? CONTINUITY_COVERAGE_REVOCATION_REASON : reason;
+
 const OLD_CODE = {
   pause: ({ reason, evidence }: PauseCall): PauseCall => ({
-    reason,
+    reason: legacyCoverageReason(reason),
     evidence: { roleKey: evidence["roleKey"], continuityAction: evidence["continuityAction"] },
   }),
-  deferral: ({ reason }: Record<string, unknown>) => ({ reason }),
+  deferral: ({ reason }: Record<string, unknown>) => ({
+    reason: typeof reason === "string" ? legacyCoverageReason(reason) : reason,
+  }),
 };
 
 /** The restart's first sweep, as the code before this change ran it: a legacy pause, then the revocation. */

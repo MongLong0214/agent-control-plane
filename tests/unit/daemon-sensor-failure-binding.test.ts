@@ -7,7 +7,11 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { allow } from "../../src/core/errors.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { CONTINUITY_COVERAGE_REVOCATION_REASON } from "../../src/continuity/continuity-kernel.ts";
+import {
+  CONTINUITY_CAPACITY_EXHAUSTED_REVOCATION_REASON,
+  CONTINUITY_COVERAGE_REVOCATION_REASON,
+  CONTINUITY_RUNTIME_UNAVAILABLE_REVOCATION_REASON,
+} from "../../src/continuity/continuity-kernel.ts";
 import {
   COVERAGE_REVOCATION_GRACE_MS,
   Daemon,
@@ -601,7 +605,7 @@ describe("#954: a role continuity revoked is a role continuity owes", () => {
         `SELECT revoked_reason FROM assignments WHERE role_key = ? ORDER BY binding_generation DESC`,
         [fixture.roleKey],
       )[0],
-    ).toEqual({ revoked_reason: CONTINUITY_COVERAGE_REVOCATION_REASON });
+    ).toEqual({ revoked_reason: CONTINUITY_RUNTIME_UNAVAILABLE_REVOCATION_REASON });
     return report;
   };
 
@@ -1089,7 +1093,7 @@ describe("#954: a live incumbent keeps its binding through a momentary coverage 
         `SELECT revoked_reason FROM assignments WHERE role_key = ? ORDER BY binding_generation DESC`,
         [fixture.roleKey],
       )[0],
-    ).toEqual({ revoked_reason: CONTINUITY_COVERAGE_REVOCATION_REASON });
+    ).toEqual({ revoked_reason: CONTINUITY_CAPACITY_EXHAUSTED_REVOCATION_REASON });
   });
 
   it("holds a session recorded the ordinary way, by ps lstart text", async () => {
