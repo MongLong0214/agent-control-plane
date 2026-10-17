@@ -383,6 +383,8 @@ export class CtoLifecycle {
 
     // A canonical claim that landed after `spawn`'s pre-launch check is refused in the transaction
     // that would bind; the launched session is stopped rather than left a live orphan.
+    // DA-R1-01 — the session a replacement reserved for its provider stop, set inside the transaction.
+    const retiring: { sessionId: string | null } = { sessionId: null };
     const bound = this.db.txDecision(() => {
       if (this.#releasedCanonicalHolder(projectId, roleKey)) {
         return deny<RoleBinding>(ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM, "the role became canonical during provisioning", { projectId });
@@ -400,7 +402,7 @@ export class CtoLifecycle {
         }
         return binding;
       }
-      return this.#switchFromUndeliverable(projectId, roleKey, runId, created.value, replacing);
+      return this.#switchFromUndeliverable(projectId, roleKey, runId, created.value, replacing, retiring);
     });
     if (!bound.allowed && bound.reasonCode === ReasonCode.CANONICAL_CTO_AWAITING_RECLAIM) {
       const claimed = this.#releasedCanonicalHolder(projectId, roleKey);
@@ -425,8 +427,10 @@ export class CtoLifecycle {
         ...(driven ? { driven: true } : {}),
       },
     });
-    // The replaced session holds nothing now; the provider is asked to stop it, as an unused one is.
-    if (replacing) await this.stopUnusedSession(replacing.binding.sessionId, replacing.reason);
+    // DA-R1-01 — only a session the switch's own transaction reserved (out of READY, holding nothing) is
+    // stopped, as `#stopWithdrawnReplacements` stops a withdrawn replacement; one that still holds a role
+    // was never reserved and is left as it is.
+    if (retiring.sessionId) await this.#stopWithdrawnReplacements([retiring.sessionId], replacing?.reason ?? "replaced");
     return bound;
   }
 
@@ -436,6 +440,13 @@ export class CtoLifecycle {
    * role's current binding is still that exact assignment. As for a bind, the switch must have granted
    * the creation the spawn record names, or the whole switch rolls back. The replacement is recorded
    * with it, last, so nothing after that record refuses.
+   *
+   * DA-R1-01 — the outgoing session is not unused merely because this role left it. In the same
+   * transaction, after the switch, it is retired only if it holds no other ACTIVE role, by its
+   * recorded session or an actor's runtime pointer (`#holdsAnyRole`), and is no canonical runtime:
+   * then it leaves READY for ERROR here, as `#withdrawCanonicalSwitchover` reserves a withdrawn
+   * replacement, so no bind, switch or actor move can take it while its provider stop is awaited.
+   * A session that still holds a role is preserved and never stopped.
    */
   #switchFromUndeliverable(
     projectId: string,
@@ -443,6 +454,7 @@ export class CtoLifecycle {
     runId: string,
     sessionId: string,
     replacing: UndeliverablePrimaryCto,
+    retiring: { sessionId: string | null },
   ): Decision<RoleBinding> {
     const refused = this.#replacementRefusal(projectId, roleKey, replacing);
     if (refused) return refused;
@@ -465,6 +477,15 @@ export class CtoLifecycle {
         bindingGeneration: switched.value.bindingGeneration,
       });
     }
+    const outgoing = this.sessions.get(from.sessionId);
+    const retires = outgoing !== null &&
+      outgoing.lifecycle !== SessionLifecycle.STOPPED &&
+      !this.#holdsAnyRole(from.sessionId) &&
+      !isAdoptedCanonicalRuntime(this.db, from.sessionId);
+    if (retires) {
+      const reserved = this.sessions.transition(from.sessionId, SessionLifecycle.ERROR, `${replacing.reason}: replaced, provider stop pending`);
+      if (!reserved.allowed) return reserved as Decision<unknown> as Decision<RoleBinding>;
+    }
     this.audit.record({
       kind: PRIMARY_CTO_UNDELIVERABLE_REPLACED,
       projectId,
@@ -477,8 +498,10 @@ export class CtoLifecycle {
         fromSession: from.sessionId,
         fromGeneration: from.bindingGeneration,
         toGeneration: switched.value.bindingGeneration,
+        fromSessionRetired: retires,
       },
     });
+    retiring.sessionId = retires ? from.sessionId : null;
     return switched;
   }
 
