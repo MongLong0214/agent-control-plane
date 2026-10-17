@@ -14,7 +14,7 @@
   },
   "scripts": {
     "postinstall": "node scripts/build-native-peercred.mjs && node scripts/build-native-fd-vfs.mjs",
-    "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql && cp src/db/schema-v37.sql dist/db/schema-v37.sql && node scripts/copy-native-fd-vfs-into-dist.mjs",
+    "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql && cp src/db/schema-v37.sql dist/db/schema-v37.sql && cp src/db/schema-v44.sql dist/db/schema-v44.sql && node scripts/copy-native-fd-vfs-into-dist.mjs",
     "typecheck": "tsc --noEmit",
     "ci:preflight": "node scripts/verify-ci-preflight.mjs",
     "gates": "node scripts/run-prepush-gates.mjs",

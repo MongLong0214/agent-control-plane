@@ -1,6 +1,8 @@
 {
-  "schemaVersion": 26,
+  "schemaVersion": 44,
   "live": {
+    "v12-migration-ledger-and-invariant-replay": "sha256:ec8955aed2d499e13d313e3fed473e0cb4e2ecb1c45af2e7fc95f2537ec91261",
+    "v13-finalization-state-machine": "sha256:1d8ff28d8f21296e0380b76b76637813e825b7f9c91029dc03ac52d877af3936",
     "v14-baseline-evidence-ledger": "sha256:1a7afb51ccbd4fa85c8e0f7ddc61672bddae0154ec8ee4df295673f1f5d7105a",
     "v15-durable-verification-worktree-ownership": "sha256:bb05fa728b0091f27586baab53e753974ae7fde8962a31b6ef28972a5bc66a4e",
     "v16-session-workdir-immutability": "sha256:505d78c99da918cdd3664192d38641cbeecce573a141355a91858355263f50ef",
@@ -11,6 +13,26 @@
     "v21-canonical-turns": "sha256:474d28d76a85e62e1df1697f2bcf96a168061d799ee2b8a5d52c8d927158feb7",
     "v22-canonical-turn-ledger": "sha256:0431ddace84b2c2785fa2eca5107a4e9bd6a2a7d87e6070d6550c00dc0d6b5e7",
     "v23-turn-claimed-at": "sha256:a066442ba8603e17c6b2c969884edc99b6f2e5ca9fb219ea6d663b6da085ab27",
-    "v24-observation-ledger": "sha256:09b7d8c4f027fc3293832ff7266f4a50836c7998473e0dc2d61eb4802296d1d6"
+    "v24-observation-ledger": "sha256:09b7d8c4f027fc3293832ff7266f4a50836c7998473e0dc2d61eb4802296d1d6",
+    "v25-ledger-guards": "sha256:9da23abaa5ed1e91c49d8f4e2c24622a1557e71b685a49ea7825701454abd244",
+    "v26-ledger-trigger-bodies": "sha256:70fb63fd4dd5c6011fd562b36b776c3b4be8c9cdf65585435c8169745bf5fcae",
+    "v27-an-observation-carries-its-evidence": "sha256:1eab16ff90666afd380e16c17db42bc51f10c882265ade81dde9254d2ed9e602",
+    "v28-an-operator-can-settle-a-turn-nobody-observed": "sha256:e008f5508319644f16de212c1ac764eefbe46a88761e2f53c8b50694cc0a6748",
+    "v29-a-dispatch-is-a-fact": "sha256:aae9b4a9cf67e37f92ed20467eb6c05c18ca2691a6c68e4f664ba9ae4ade7ee9",
+    "v30-a-turn-and-a-reply-are-two-lifecycles": "sha256:3473661960732a698b241634528806c72ba7a0274ac15940abfbbfd2a221ed2c",
+    "v31-a-generation-means-nothing-without-its-role-key": "sha256:c68de5415fb9dcd5dc6e1e01d4f406c160f73b5ec83da35e58c54ff29c67ecd3",
+    "v32-a-source-can-only-cite-its-turns-own-claim-event": "sha256:42080e95b70112a54cc72d6f4cfd26f474d631446daff58ea3adb7610d640a3c",
+    "v33-back-up-before-telegram-settlement-state": "sha256:14697b4c6fdadcd0d2dc1824341f9eae11b3b19dae376aa04f035c6e70fc834d",
+    "v34-persist-hermes-target-bind-receipt-evidence": "sha256:86398556e24ea50497847777e27951f0607062e208fe8514959a0797edc714ca",
+    "v35-keep-the-admitted-payload-with-its-inbound-row": "sha256:04936167efc8234d47e11973d98228370abaa3eef796a7f280de9ef78134ed88",
+    "v36-backfill-ingress-receipt-identities-before-freezing-claims": "sha256:4903bd01042e1df8bccfed5202d88848c7c23d0053852227ce298c9331bb7291",
+    "v37-seed-claude-cli-executor-kind": "sha256:cd864e067cefb4d011b9448971b821d36e8304e28071c312b0392ceed597d66e",
+    "v38-canonical-verified-target-override": "sha256:5cd405d8160332876dd46a5b91923793d90026df4d94bc41646bf4f6035af910",
+    "v39-owner-reply-intent-keeps-its-key": "sha256:a39afb71e5c3a6403beddc204cf69c99da33a786580bb6dce6443f715f79bdfb",
+    "v40-peer-message-carry-record": "sha256:9d4c804d29fd12b8bb44d10f003599cd651d1c55d3a4326a17cf8cf0eab15e86",
+    "v41-runtime-managed-worker-turns": "sha256:07224d2df964676d25a0c8a35dec7f8d239eca7aacebd69795b5662fedeaafd3",
+    "v42-session-credential-epoch": "sha256:a5be3e069535b259d3f70a8140bb44e243cec7c91046bb7caa32946bfd4c353c",
+    "v43-bootstrap-application-record": "sha256:7ffb8367eb3fea440422e1f14f9aef48feb1f8ddea826d2888da48353dfac0f1",
+    "v44-manifest-activation-grant": "sha256:06a2f0a829718e98c9b9b606c9e53d7cee40ab69f1beda36ee6716158117b380"
   }
 }
