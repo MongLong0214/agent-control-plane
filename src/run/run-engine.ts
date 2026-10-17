@@ -1645,6 +1645,11 @@ export class RunEngine {
    *     gate is satisfied (`CeoReviewGate`).
    *
    * Anything missing, unparsable or ambiguous keeps the wait.
+   *
+   * Trust limit: every fact above is read from `audit_events`, which the daemon writes but v44 does not
+   * guard against a raw SQLite writer. A same-uid process that writes the database directly could forge
+   * a pause chain and have a wait handed back; the transition itself still needs daemon authority, and
+   * no schema-v44 column can carry this hold in its place.
    */
   #continuityReviewHold(run: RunRow, owner: ContinuityOwner): ContinuityReviewHold | null {
     if (run.state !== RunState.AWAITING_HUMAN) return null;
