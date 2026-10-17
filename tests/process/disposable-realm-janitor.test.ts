@@ -81,16 +81,17 @@ describe("the disposable realm crash janitor", () => {
 
     try {
       const before = readdirSync(inheritedRoot).sort();
-      const result = spawnSync("pnpm", ["acceptance:disposable-realm"], {
+      // The package's own `acceptance:disposable-realm` command line, run by Node's script runner:
+      // `sh -c` with `node_modules/.bin` on PATH, nothing before it. Not through pnpm: pnpm 11
+      // (`verify-deps-before-run`, default `install`) runs `pnpm install` before the script, so the
+      // launch would write outside the realm before its workspace exists, and the verdict would
+      // depend on the host's pnpm — that install refuses a `node_modules` symlinked from outside
+      // the checkout (ERR_PNPM_UNSAFE_MODULES_DIR); pnpm 10 skips it. An edit to the script is
+      // still an edit to what runs here.
+      const result = spawnSync(process.execPath, ["--run", "acceptance:disposable-realm"], {
         cwd: repositoryRoot,
         encoding: "utf8",
-        // pnpm enables Node's own compile cache before it reads package.json. Disable that
-        // launcher-owned cache so this assertion isolates writes caused by the configured driver.
-        env: {
-          ...process.env,
-          NODE_DISABLE_COMPILE_CACHE: "1",
-          TMPDIR: inheritedRoot,
-        },
+        env: { ...process.env, TMPDIR: inheritedRoot },
         timeout: 30_000,
       });
 
