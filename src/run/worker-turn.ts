@@ -13,6 +13,7 @@ import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
+import { ORPHAN_RESOLVED_EVENT, ORPHAN_UNIDENTIFIED_EVENT, unresolvedUnidentifiedOrphans } from "./worker-orphan-release.ts";
 import {
   type PinnedRepository,
   type WorkerCommitPort,
@@ -83,12 +84,13 @@ export const WorkerTurnEvent = {
   LATE_RESULT_REFUSED: "TASK_WORKER_TURN_LATE_RESULT_REFUSED",
   ORPHAN_KILLED: "TASK_WORKER_ORPHAN_KILLED",
   ORPHAN_GONE: "TASK_WORKER_ORPHAN_GONE",
-  ORPHAN_UNIDENTIFIED: "TASK_WORKER_ORPHAN_UNIDENTIFIED",
+  ORPHAN_UNIDENTIFIED: ORPHAN_UNIDENTIFIED_EVENT,
   /**
    * #1096 — an operator's repair (`release_unidentified_worker_orphan`) recorded an unidentified orphan
-   * with no recorded pid as resolved, after confirming nothing of it runs. The orphan row stays.
+   * with no recorded pid as resolved, after confirming nothing of it runs. The orphan row stays, and the
+   * row counts only as `orphanResolutionVerified` follows it to the operator's admitted receipt.
    */
-  ORPHAN_RESOLVED: "TASK_WORKER_ORPHAN_RESOLVED",
+  ORPHAN_RESOLVED: ORPHAN_RESOLVED_EVENT,
   SHUTDOWN_DRAINED: "TASK_WORKER_TURNS_DRAINED",
   /** A stopping daemon stopped a turn's git and recorded what the repository shows (ACP-WORKER-03). */
   GIT_STOPPED: "TASK_WORKER_TURN_GIT_STOPPED",
@@ -822,7 +824,9 @@ export class WorkerTurnRunner {
     if (blocked) {
       return deny(ReasonCode.CONFLICT, "an earlier turn of this task may have launched a process that was never recorded; it is not executed again", {
         taskId: request.taskId,
-        executionId: blocked,
+        executionId: blocked.executionId,
+        // #1096 — the record the operator's release names (`release_unidentified_worker_orphan`).
+        orphanEventId: blocked.eventId,
       });
     }
 
@@ -1254,6 +1258,16 @@ export class WorkerTurnRunner {
     }
     if (!turn.spawned) {
       this.fail(facts, executionId, "FAILED", "infrastructure", { ...evidence, reason: "NEVER_RAN", reasonCode: ReasonCode.INTERNAL_ERROR });
+      return;
+    }
+    // #1104 — the turn's own process group was not confirmed ended: not a completion, and the group is named.
+    if (result.processGroup !== undefined) {
+      this.fail(facts, executionId, "FAILED", "infrastructure", {
+        ...evidence,
+        reason: "PROCESS_GROUP_UNCONFIRMED",
+        reasonCode: ReasonCode.INTERNAL_ERROR,
+        processGroup: result.processGroup,
+      });
       return;
     }
     if (!result.ok) {
@@ -1784,26 +1798,13 @@ export class WorkerTurnRunner {
 
   /**
    * An earlier turn of this task that may have launched a process never recorded: no pid to confirm gone.
-   * #1096 — one an operator's repair has since recorded resolved, later than the orphan row, no longer
-   * blocks; the orphan row itself is never removed.
+   * #1096 — one the operator's repair has since released no longer blocks, and only as far as
+   * `orphanResolutionVerified` traces that release to the operator's admitted receipt for exactly this
+   * orphan event; a resolution row alone is never enough. The orphan row itself is never removed.
    */
-  private blockedOrphan(taskId: string): string | null {
-    const rows = this.ports.db.all<{ evidence_json: string }>(
-      `SELECT orphan.evidence_json FROM audit_events orphan
-        WHERE orphan.kind = ? AND json_extract(orphan.evidence_json, '$.taskId') = ?
-          AND NOT EXISTS (
-            SELECT 1 FROM audit_events resolved
-             WHERE resolved.kind = ? AND resolved.event_id > orphan.event_id
-               AND json_extract(resolved.evidence_json, '$.taskId') = ?
-               AND json_extract(resolved.evidence_json, '$.executionId') = json_extract(orphan.evidence_json, '$.executionId'))
-        ORDER BY orphan.event_id`,
-      [WorkerTurnEvent.ORPHAN_UNIDENTIFIED, taskId, WorkerTurnEvent.ORPHAN_RESOLVED, taskId],
-    );
-    for (const row of rows) {
-      const evidence = JSON.parse(row.evidence_json) as { executionId?: unknown; pid?: unknown };
-      if (evidence.pid === null || evidence.pid === undefined) return String(evidence.executionId ?? "");
-    }
-    return null;
+  private blockedOrphan(taskId: string): { executionId: string; eventId: number } | null {
+    const [first] = unresolvedUnidentifiedOrphans(this.ports.db, { taskId });
+    return first === undefined ? null : { executionId: first.executionId, eventId: first.eventId };
   }
 
   /** Whether the guard admitted a provider launch for this receipt; a launch with no recorded pid is then unidentifiable. */

@@ -13,6 +13,14 @@ import { ArtifactKind } from "../domain/types.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { isClean, tryRevParse } from "../git/git.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
+import {
+  ORPHAN_RELEASE_APPROVAL_OPERATION,
+  ORPHAN_RELEASE_CONFIRMATION,
+  ORPHAN_RELEASE_REPAIR_ID,
+  type OrphanReleaseApproval,
+  orphanReleaseParameters,
+  unresolvedUnidentifiedOrphans,
+} from "../run/worker-orphan-release.ts";
 import { WorkerTurnEvent } from "../run/worker-turn.ts";
 import {
   type RepairWorktreeAuthority,
@@ -37,9 +45,8 @@ const VERIFICATION_WORKTREE_OWNER_RELEASE_STATES = TERMINAL_RUN_STATES;
 /** The exact admitted ingress operation used for owner-authorised repair. */
 export const REPAIR_OWNER_APPROVAL_OPERATION = "repair_execute";
 
-/** #1096 — the parameter, and its one accepted value, by which an operator attests nothing of an orphan runs. */
-const ORPHAN_RELEASE_CONFIRMATION_PARAMETER = "confirm";
-const ORPHAN_RELEASE_CONFIRMATION = "nothing-running";
+/** #1096 — the orphan release's receipt names this operation; this fails to compile if the two differ. */
+const _orphanReleaseApprovalOperation: typeof REPAIR_OWNER_APPROVAL_OPERATION = ORPHAN_RELEASE_APPROVAL_OPERATION;
 
 /** PRD §25.7 — the operation contract every repair must satisfy. */
 export interface RepairOperation {
@@ -174,20 +181,23 @@ export class RepairService {
     },
     // #1096 — a worker launch the guard admitted whose pid was never recorded leaves its task blocked
     // for good: no pid can ever be confirmed gone. After the operator has checked that nothing of it
-    // runs, this records the orphan resolved. It reads the process table and signals nothing.
-    release_unidentified_worker_orphan: {
-      id: "release_unidentified_worker_orphan",
+    // runs, this records that one orphan event resolved. It reads the process table and signals nothing.
+    // Owner-authorised: the resolution counts only as far as its reader traces it to the operator's
+    // admitted ingress receipt for exactly this orphan event (`orphanResolutionVerified`), so neither an
+    // audit append nor a raw write can release a task.
+    [ORPHAN_RELEASE_REPAIR_ID]: {
+      id: ORPHAN_RELEASE_REPAIR_ID,
       risk: "MEDIUM",
-      authorization: "HERMES",
+      authorization: "OWNER",
       description:
-        "Record a worker orphan that was never identified (a launch with no recorded pid) as resolved, so its task may run again",
+        "Record one worker orphan event that was never identified (a launch with no recorded pid) as resolved, so its task may run again",
       expectedEffect:
-        "the task's next worker turn is admitted again; the orphan record stays, and a resolution naming this repair is recorded beside it",
+        "the task's next worker turn is admitted again; the orphan record stays, and a resolution naming this repair and the operator's admitted receipt is recorded beside it",
       undo: "none needed: nothing is signalled, deleted or rewritten, and a later unidentified orphan of the task blocks it again",
       preconditions: [
-        "the execution has an unidentified-orphan record with no recorded pid that no resolution follows",
+        "orphanEventId names an unidentified-orphan record of this execution, with no recorded pid, that no verified resolution follows",
         "the execution is not RUNNING and records no worker process",
-        `the operator confirmed that nothing of the orphan is running (${ORPHAN_RELEASE_CONFIRMATION_PARAMETER}=${ORPHAN_RELEASE_CONFIRMATION})`,
+        `the parameters are exactly executionId, orphanEventId and the operator's confirmation that nothing of the orphan is running (confirm=${ORPHAN_RELEASE_CONFIRMATION})`,
         "no live process carries the worker session's id on its command line",
       ],
     },
@@ -256,6 +266,9 @@ export class RepairService {
       ownerReceipt = request.ownerApproval;
     }
 
+    // #1096 — a refusal names the owner receipt it refused, so nothing can later present that receipt
+    // as one a repair acted on.
+    const refusedReceipt = ownerReceipt ? { ownerReceiptDigest: digestOf(ownerReceipt) } : {};
     const plan = await this.plan(operation, request);
     if (plan.preconditions.some((precondition) => !precondition.satisfied)) {
       this.audit.record({
@@ -263,7 +276,7 @@ export class RepairService {
         reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET,
         runId: request.runId ?? null,
         actor: request.authorizedBy,
-        evidence: { operationId: operation.id, preconditions: plan.preconditions },
+        evidence: { operationId: operation.id, preconditions: plan.preconditions, ...refusedReceipt },
       });
       return deny(ReasonCode.REPAIR_PRECONDITION_UNMET, "repair preconditions are not satisfied", {
         operationId: operation.id,
@@ -284,7 +297,7 @@ export class RepairService {
         reasonCode: outcome.refusal.reasonCode,
         runId: request.runId ?? null,
         actor: request.authorizedBy,
-        evidence: { operationId: operation.id, refusal: outcome.refusal.evidence },
+        evidence: { operationId: operation.id, refusal: outcome.refusal.evidence, ...refusedReceipt },
       });
       return outcome.refusal;
     }
@@ -527,19 +540,14 @@ export class RepairService {
           },
         };
       }
-      case "release_unidentified_worker_orphan": {
+      case ORPHAN_RELEASE_REPAIR_ID: {
         const executionId = request.parameters["executionId"] ?? "";
-        const orphan = this.db.get<{ event_id: number; run_id: string | null; evidence_json: string }>(
-          `SELECT orphan.event_id, orphan.run_id, orphan.evidence_json FROM audit_events orphan
-            WHERE orphan.kind = ? AND json_extract(orphan.evidence_json, '$.executionId') = ?
-              AND json_extract(orphan.evidence_json, '$.pid') IS NULL
-              AND NOT EXISTS (
-                SELECT 1 FROM audit_events resolved
-                 WHERE resolved.kind = ? AND resolved.event_id > orphan.event_id
-                   AND json_extract(resolved.evidence_json, '$.executionId') = ?)
-            ORDER BY orphan.event_id DESC LIMIT 1`,
-          [WorkerTurnEvent.ORPHAN_UNIDENTIFIED, executionId, WorkerTurnEvent.ORPHAN_RESOLVED, executionId],
-        );
+        // Only an orphan event no verified resolution follows; a resolution row nothing admitted is ignored.
+        const unresolved = executionId === "" ? [] : unresolvedUnidentifiedOrphans(this.db, { executionId });
+        const orphan = unresolved.find((candidate) => String(candidate.eventId) === request.parameters["orphanEventId"]);
+        // The receipt binds the parameters; only these exact ones are what the reader will verify.
+        const exactParameters =
+          orphan !== undefined && digestOf(request.parameters) === digestOf(orphanReleaseParameters(executionId, orphan.eventId));
         const execution = this.db.get<{ task_id: string; status: string; worker_process_id: number | null; worker_session_id: string }>(
           `SELECT task_id, status, worker_process_id, worker_session_id FROM task_executions WHERE execution_id = ?`,
           [executionId],
@@ -550,11 +558,13 @@ export class RepairService {
         // The provider CLI of every worker turn carries its session as `--session-id <id>`.
         const workerSessionId = incarnation?.split("#", 1)[0] ?? "";
         const scan = workerSessionId === "" ? { carriers: [], error: "the worker session's id is unknown" } : processesCarrying(workerSessionId);
-        const confirmation = request.parameters[ORPHAN_RELEASE_CONFIRMATION_PARAMETER] ?? null;
+        const confirmation = request.parameters["confirm"] ?? null;
         const evidence = {
           executionId,
           taskId: execution?.task_id ?? null,
-          orphanEventId: orphan?.event_id ?? null,
+          orphanEventId: orphan?.eventId ?? null,
+          // Every orphan event of this execution still blocking its task: what `orphanEventId` may name.
+          unresolvedOrphanEventIds: unresolved.map((candidate) => candidate.eventId),
           executionStatus: execution?.status ?? null,
           workerProcessId: execution?.worker_process_id ?? null,
           workerSessionId: execution?.worker_session_id ?? null,
@@ -565,16 +575,26 @@ export class RepairService {
           preconditions: [
             checked(operation.preconditions[0]!, orphan !== undefined, evidence),
             checked(operation.preconditions[1]!, execution !== undefined && execution.status !== "RUNNING" && execution.worker_process_id === null, evidence),
-            checked(operation.preconditions[2]!, confirmation === ORPHAN_RELEASE_CONFIRMATION, evidence),
+            checked(operation.preconditions[2]!, exactParameters && confirmation === ORPHAN_RELEASE_CONFIRMATION, evidence),
             checked(operation.preconditions[3]!, scan.error === null && scan.carriers.length === 0, evidence),
           ],
           perform: async (dryRun) => {
             if (dryRun) return { changes: 1, evidence };
+            // `execute` admitted this receipt and consumed it before acting; the resolution names where it
+            // was admitted, so its reader can check that admission itself rather than trust this row.
+            const receipt = request.ownerApproval;
+            if (!receipt) throw new Error("an owner-authorised repair acted without its receipt");
+            const ownerApproval: OrphanReleaseApproval = {
+              channel: receipt.channel,
+              actor: receipt.actor,
+              nonce: receipt.inboundNonce,
+              receiptDigest: digestOf(receipt),
+            };
             const recorded = this.audit.record({
               kind: WorkerTurnEvent.ORPHAN_RESOLVED,
-              runId: orphan?.run_id ?? null,
-              actor: request.authorizedBy,
-              evidence: { ...evidence, operationId: operation.id },
+              runId: orphan?.runId ?? null,
+              actor: `${receipt.channel}:${receipt.actor}`,
+              evidence: { ...evidence, operationId: operation.id, ownerApproval: { ...ownerApproval } },
             });
             if (!recorded.allowed) return { changes: 0, evidence, refusal: recorded as Decision<never> };
             return { changes: 1, evidence };

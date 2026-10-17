@@ -52,6 +52,7 @@ import {
   type SessionSpec,
   type SessionTurnRequest,
   type SessionTurnResult,
+  type UnendedProcessGroup,
   extractJson,
 } from "./provider.ts";
 import {
@@ -558,28 +559,73 @@ const ownsLedGroup = (child: ReturnType<typeof spawn>, group: LedGroup | null): 
   readProcessStartToken(group.pid) === group.startedAt;
 
 /**
- * #1104 — ends an invocation that runs without a holder (a reviewer, a profile probe): its own group
- * while that is proven, else its leader alone through its own handle while it is unreaped. Once the
- * leader has exited, nothing is signalled at all, since its id no longer proves whose group it names: the
- * pipes are closed instead, so a process that kept them cannot hold the answer back.
+ * #1104 — ends an invocation that runs without a holder (a reviewer, a profile probe): its own group,
+ * and only while `ownsLedGroup` proves it. Nothing else is ever signalled — not the leader alone, not a
+ * group whose proof failed or whose signal was not delivered. Every such case is told to `refused`,
+ * once, with what is left named, and the caller answers within its own bound with that cleanup failure
+ * instead of waiting on a process it may not signal. Once the leader has exited, its id no longer proves
+ * whose group it names: the pipes are closed, so a process that kept them cannot hold the answer back,
+ * and that too is reported as a group left unended.
  */
-const endLedGroup = (child: ReturnType<typeof spawn>, group: LedGroup | null): void => {
+const endLedGroup = (
+  child: ReturnType<typeof spawn>,
+  group: LedGroup | null,
+  refused: (left: ProcessGroupReap) => void,
+): void => {
   setImmediate(() => {
+    const pgid = group?.pid ?? child.pid ?? -1;
+    const left = `process group ${pgid} was not signalled and may still hold the invocation's processes`;
     if (child.exitCode !== null || child.signalCode !== null) {
       for (const stream of child.stdio) stream?.destroy();
+      refused(ledGroupLeft(pgid, "HOLDER_LOST", [], `the leader (pid ${pgid}) exited before its group could be ended; ${left}`));
       return;
     }
-    if (ownsLedGroup(child, group)) {
-      try {
-        process.kill(-group!.pid, "SIGKILL");
-        return;
-      } catch {
-        // Not delivered: the leader alone, below.
-      }
+    if (!ownsLedGroup(child, group)) {
+      refused(ledGroupLeft(pgid, "UNVERIFIABLE", [], `${ledGroupUnproved(group, pgid)}; ${left}`));
+      return;
     }
-    child.kill("SIGKILL");
+    try {
+      process.kill(-pgid, "SIGKILL");
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+      refused(ledGroupLeft(pgid, "HELD", [code], `SIGKILL to process group ${pgid} was not delivered (${code}); nothing else was signalled and the group may still hold the invocation's processes`));
+    }
   });
 };
+
+/** #1104 — which part of the ownership proof failed, for a group that was therefore not signalled. */
+const ledGroupUnproved = (group: LedGroup | null, pgid: number): string =>
+  group === null
+    ? `no spawn identity was read for pid ${pgid}`
+    : !group.createdAtSpawn
+      ? `the leader (pid ${pgid}) had no group of its own present at spawn`
+      : group.startedAt === null
+        ? `the leader's (pid ${pgid}) start token was not read at spawn`
+        : `the leader's (pid ${pgid}) start token is unreadable or different from the one read at spawn`;
+
+/**
+ * #1104 — the group a turn's cleanup left unended, or undefined when it was confirmed ended or nothing
+ * asked for it. A turn's result is never a completion while this is defined: its `ok` is false and its
+ * error names the group, and nothing more is signalled to it.
+ */
+const unendedGroupOf = (reap: ProcessGroupReap | undefined): UnendedProcessGroup | undefined =>
+  reap === undefined || reap.reaped ? undefined : { pgid: reap.pgid, ownership: reap.ownership, detail: reap.detail };
+
+const unendedGroupError = (group: UnendedProcessGroup): string =>
+  `PROCESS_GROUP_UNCONFIRMED: the turn's own process group ${group.pgid} was not confirmed ended (${group.ownership})${
+    group.detail === null ? "" : `: ${group.detail}`
+  }`.slice(0, 2000);
+
+/** #1104 — a bounded answer for a group `endLedGroup` could not end: named, never counted as cleaned. */
+const ledGroupLeft = (pgid: number, ownership: ProcessGroupOwnership, signals: string[], detail: string): ProcessGroupReap => ({
+  pgid,
+  reaped: false,
+  signalled: signals.length > 0,
+  signals,
+  delivered: 0,
+  ownership,
+  detail,
+});
 
 /**
  * #1077 — signals the holder's group, only while ownership is provable, and answers what it could
@@ -733,7 +779,11 @@ const productionRunCli = async (
   timedOut: boolean;
   isolationEnforced: boolean;
   egressEvidence?: ReviewerEgressRecord[];
-  /** Present when `reapProcessGroup` was asked for and the child was spawned and exited. */
+  /**
+   * Present when `reapProcessGroup` was asked for and the child was spawned and exited; and, #1104, for
+   * an invocation without a holder whose end was asked for but could not be carried out under the
+   * ownership proof (`endLedGroup`), always unreaped.
+   */
   processGroup?: ProcessGroupReap;
 }> => {
   const scratch = acpScratchDir("acp-runtime-");
@@ -994,9 +1044,21 @@ const productionRunCli = async (
       // failure — asks for the same thing: the held group ended in the check phase, the only place
       // ownership is proven. When it cannot be proven, nothing is sent and the probe answers now,
       // naming the group it is leaving behind rather than waiting on it.
+      // #1104 — without a holder: the group `endLedGroup` could not end under its proof, named in the
+      // answer, which waits for the CLI's close no longer than the settle bound and never on a process
+      // ACP may not signal.
+      let ledLeft: ProcessGroupReap | null = null;
+      let ledLeftTimer: ReturnType<typeof setTimeout> | undefined;
       const requestEnd = (): void => {
         if (!holding) {
-          endLedGroup(child, led);
+          endLedGroup(child, led, (left) => {
+            if (answered || ledLeft !== null) return;
+            ledLeft = left;
+            ledLeftTimer = setTimeout(() => {
+              for (const stream of child.stdio) stream?.destroy();
+              finish(null);
+            }, PROBE_END_SETTLE_BOUND_MS);
+          });
           return;
         }
         // No holder pid means nothing was spawned: there is no group of ours to signal.
@@ -1078,9 +1140,10 @@ const productionRunCli = async (
         if (answered) return;
         answered = true;
         clearTimeout(timer);
+        clearTimeout(ledLeftTimer);
         stopWatchingEgress?.();
         options.signal?.removeEventListener("abort", abort);
-        resolve({ stdout, stderr, exitCode, timedOut, egressLost });
+        resolve({ stdout, stderr, exitCode, timedOut, egressLost, ...(ledLeft === null ? {} : { processGroup: ledLeft }) });
       };
       // #512 — reported before anything else can happen to the child, so a runtime that owns this
       // invocation has recorded the process before it could outlive the daemon. The start time is
@@ -1095,6 +1158,9 @@ const productionRunCli = async (
       }
       child.stdout?.on("data", (buffer: Buffer) => (stdout += buffer.toString("utf8")));
       child.stderr?.on("data", (buffer: Buffer) => (stderr += buffer.toString("utf8")));
+      // A CLI that exits without reading its prompt closes the pipe: EPIPE is its answer, judged by its
+      // exit status, and not an uncaught error of the daemon.
+      child.stdin?.on("error", () => undefined);
       if (options.stdin !== undefined) child.stdin?.write(options.stdin);
       child.stdin?.end();
       child.on("error", (error) => {
@@ -1205,15 +1271,26 @@ const runProfileCommand = async (
     let stderr = "";
     let timedOut = false;
     let settled = false;
+    // #1104 — a group `endLedGroup` could not end is named in stderr, and the answer waits for the
+    // close no longer than the settle bound.
+    let leftTimer: ReturnType<typeof setTimeout> | undefined;
     const finish = (exitCode: number | null): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(leftTimer);
       resolve({ stdout, stderr, exitCode, timedOut });
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      endLedGroup(child, led);
+      endLedGroup(child, led, (left) => {
+        if (settled || leftTimer !== undefined) return;
+        stderr += `${stderr === "" || stderr.endsWith("\n") ? "" : "\n"}PROCESS_GROUP_UNCONFIRMED: ${left.detail ?? ""}`;
+        leftTimer = setTimeout(() => {
+          for (const stream of child.stdio) stream?.destroy();
+          finish(null);
+        }, PROBE_END_SETTLE_BOUND_MS);
+      });
     }, Math.min(Math.max(timeoutMs, 1), 5_000));
     child.stdout?.on("data", (b: Buffer) => (stdout += b.toString("utf8")));
     child.stderr?.on("data", (b: Buffer) => (stderr += b.toString("utf8")));
@@ -2318,12 +2395,14 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     const text =
       typeof envelope?.["result"] === "string" ? (envelope["result"] as string) : result.stdout;
     const isolationSucceeded = request.isolation === undefined || result.isolationEnforced;
+    // #1104 — a turn whose own group was not confirmed ended did not complete, whatever its CLI said.
+    const unended = unendedGroupOf(result.processGroup);
 
     return {
       // A provider answer produced after a failed packet boundary is not a successful
       // invocation. Keeping `ok` false matches the attestation result and prevents a
       // caller that forgets the separate field from treating it as usable evidence.
-      ok: result.exitCode === 0 && !result.timedOut && isolationSucceeded,
+      ok: result.exitCode === 0 && !result.timedOut && isolationSucceeded && unended === undefined,
       text,
       json: extractJson(text),
       provider: this.provider,
@@ -2332,9 +2411,12 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       exitCode: result.exitCode,
       error: result.timedOut
         ? "timeout"
-        : result.exitCode === 0 && isolationSucceeded
-          ? null
-          : result.stderr.slice(0, 2000),
+        : unended !== undefined
+          ? unendedGroupError(unended)
+          : result.exitCode === 0 && isolationSucceeded
+            ? null
+            : result.stderr.slice(0, 2000),
+      ...(unended === undefined ? {} : { processGroup: unended }),
       providerSessionId:
         typeof envelope?.["session_id"] === "string" ? (envelope["session_id"] as string) : null,
       stdout: result.stdout,
@@ -2501,7 +2583,10 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     const providerSessionId =
       typeof envelope?.["session_id"] === "string" ? (envelope["session_id"] as string) : null;
     const answeredAsThisConversation = providerSessionId === handle.externalSessionId;
-    const ok = result.exitCode === 0 && !result.timedOut && envelope?.["is_error"] !== true && answeredAsThisConversation;
+    // #1104 — a turn whose own group was not confirmed ended did not complete, whatever its CLI said.
+    const unended = unendedGroupOf(result.processGroup);
+    const ok = result.exitCode === 0 && !result.timedOut && envelope?.["is_error"] !== true && answeredAsThisConversation &&
+      unended === undefined;
     return {
       ok,
       text,
@@ -2510,11 +2595,14 @@ export class ClaudeCliAdapter implements ProviderAdapter {
         ? null
         : result.timedOut
           ? "timeout"
-          : result.exitCode === 0 && !answeredAsThisConversation
-            ? "SESSION_TURN_CONVERSATION_MISMATCH: the provider answered as a different conversation"
-            : result.stderr.slice(0, 2000) || (envelope?.["is_error"] === true ? text.slice(0, 2000) : "turn failed"),
+          : unended !== undefined
+            ? unendedGroupError(unended)
+            : result.exitCode === 0 && !answeredAsThisConversation
+              ? "SESSION_TURN_CONVERSATION_MISMATCH: the provider answered as a different conversation"
+              : result.stderr.slice(0, 2000) || (envelope?.["is_error"] === true ? text.slice(0, 2000) : "turn failed"),
       providerSessionId,
       durationMs: Date.now() - started,
+      ...(unended === undefined ? {} : { processGroup: unended }),
     };
   }
 }

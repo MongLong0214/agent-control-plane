@@ -305,6 +305,19 @@ export interface InvocationResult {
    * invocation setting. Used only by adapters that can make this a measured fact.
    */
   effortAttested?: boolean;
+  /** #1104 — present when the invocation's own process group was not confirmed ended; `ok` is then false. */
+  processGroup?: UnendedProcessGroup;
+}
+
+/**
+ * #1104 — an invocation's own process group that its cleanup could not confirm ended. Nothing more is
+ * signalled to it; it is named so that the caller refuses the completion and says what may be left.
+ */
+export interface UnendedProcessGroup {
+  pgid: number;
+  /** What the cleanup could establish about owning the group: `HELD`, `UNVERIFIABLE` or `HOLDER_LOST`. */
+  ownership: string;
+  detail: string | null;
 }
 
 /**
@@ -349,6 +362,8 @@ export interface SessionTurnResult {
   /** The conversation id the provider reported, when it reported one. */
   providerSessionId: string | null;
   durationMs: number;
+  /** #1104 — present when the turn's own process group was not confirmed ended; `ok` is then false. */
+  processGroup?: UnendedProcessGroup;
 }
 
 export interface SessionSpec {

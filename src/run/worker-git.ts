@@ -570,12 +570,21 @@ export const scanAgainst = async (
   };
 };
 
+/** #1097 — how many entries beneath ignored directories one reading walks before it reports a failure. */
+const IGNORED_WALK_LIMIT = 200_000;
+
 /**
  * #1097 — what `lstat` reports of every path git ignores in the worktree (kind, size, mode, inode, mtime
  * and ctime), keyed by path, over a private index read from `treeIsh`. Git lists no ignored path to
  * `scanAgainst`, so a turn's change under one is neither committed nor seen there; two readings, before
  * the turn and after it, name every ignored path the turn created, changed or removed. Nothing listed
  * here is ever committed.
+ *
+ * Git lists an ignored nested repository as one directory (`build/cache/`) and does not descend into it,
+ * so every entry beneath such a directory is read here as well — by `lstat` and `readdir` alone: a
+ * symlink is recorded as itself and never followed, and nothing of the nested repository is run. A
+ * directory is recorded by kind, mode and inode only; what changes inside it is named by its entries.
+ * A walk past `IGNORED_WALK_LIMIT` entries, or a directory that cannot be read, fails the reading.
  */
 export const ignoredPathState = async (repo: PinnedRepository, treeIsh: string, label: string): Promise<Map<string, string>> => {
   const index = join(repo.scratch, `${label}.ignored.index`);
@@ -584,15 +593,26 @@ export const ignoredPathState = async (repo: PinnedRepository, treeIsh: string, 
     .split("\0")
     .filter(Boolean);
   const state = new Map<string, string>();
-  for (const path of listed) {
+  let walked = 0;
+  const record = (path: string): void => {
     const stat = lstatOrNull(join(repo.workTree, path.replace(/\/$/, "")));
-    state.set(
-      path,
-      stat === null
-        ? "missing"
-        : [stat.isDirectory() ? "d" : stat.isSymbolicLink() ? "l" : stat.isFile() ? "f" : "o", stat.size, stat.mode, stat.ino, stat.mtimeMs, stat.ctimeMs].join(":"),
-    );
-  }
+    if (stat === null) {
+      state.set(path, "missing");
+      return;
+    }
+    if (!stat.isDirectory()) {
+      state.set(path, [stat.isSymbolicLink() ? "l" : stat.isFile() ? "f" : "o", stat.size, stat.mode, stat.ino, stat.mtimeMs, stat.ctimeMs].join(":"));
+      return;
+    }
+    state.set(path, ["d", stat.mode, stat.ino].join(":"));
+    const directory = path.endsWith("/") ? path : `${path}/`;
+    for (const entry of readdirSync(join(repo.workTree, directory), { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+      walked += 1;
+      if (walked > IGNORED_WALK_LIMIT) throw new Error(`more than ${IGNORED_WALK_LIMIT} entries beneath ignored directories`);
+      record(entry.isDirectory() ? `${directory}${entry.name}/` : `${directory}${entry.name}`);
+    }
+  };
+  for (const path of listed) record(path);
   return state;
 };
 
