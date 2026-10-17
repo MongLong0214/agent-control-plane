@@ -173,12 +173,50 @@ export const COMMITLORE_LIMITS: Readonly<CommitLoreLimits> = Object.freeze({
 /**
  * Review S11-R1-01 (CP-HI-05) — what a `commitlore` child is given: the environment ACP constructs for a
  * child it must not hand its authority to (`runtimeEnvironment`, the agent CLIs' own), with nothing
- * allowlisted on top. PATH, HOME, USER, TMPDIR, the locale and git's no-system-config and no-prompt
- * switches, and nothing else: no ACP, GitHub, Buzz or provider variable, and no `GIT_*` that would point
- * CommitLore's own git calls away from the checkout it runs in. HOME is the daemon's own: CommitLore
- * reads the user's agent-host configuration from it, and that is the configuration the doctor reports on.
+ * allowlisted on top. PATH, USER, TMPDIR, the locale and the git controls below, and nothing else: no
+ * ACP, GitHub, Buzz or provider variable, and no `GIT_*` that would point CommitLore's own git calls away
+ * from the checkout it runs in.
+ *
+ * Review S11-R3 (CEO cb5501eb) — nor any credential git would find on its own, for the child's git calls
+ * and for every hook they run, which inherit this environment:
+ * - HOME is `home`, this child's own (`commitloreChildHome`), not the daemon's: its git config routes
+ *   GitHub to `gh`, and its `.netrc` is read by git's HTTP transport whatever the config says;
+ * - the global config is the empty file in that home, and the system config is not read;
+ * - no config is injected through the environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and its
+ *   `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`) except one command-scope `credential.helper=`, which git
+ *   reads after every config file and which empties the helper list a repository's own config built;
+ * - no askpass program (an empty `GIT_ASKPASS` stops git consulting `core.askPass` and `SSH_ASKPASS`) and
+ *   no terminal prompt.
+ * So a git call that needs a credential fails rather than finding one.
  */
-export const commitloreChildEnvironment = (): NodeJS.ProcessEnv => runtimeEnvironment([], tmpdir());
+const INJECTED_GIT_CONFIG = /^GIT_CONFIG_(?:PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)$/;
+
+export const commitloreChildEnvironment = (home: string): NodeJS.ProcessEnv => {
+  const environment = runtimeEnvironment([], tmpdir());
+  for (const name of Object.keys(environment)) if (INJECTED_GIT_CONFIG.test(name)) delete environment[name];
+  return {
+    ...environment,
+    HOME: home,
+    GIT_CONFIG_GLOBAL: join(home, ".gitconfig"),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "credential.helper",
+    GIT_CONFIG_VALUE_0: "",
+    GIT_ASKPASS: "",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+};
+
+/**
+ * A `commitlore` child's home: made for that one child under the system temporary directory, owner-only
+ * (0700), holding nothing but the empty file its global git config is, and removed once the child has
+ * exited or failed to start (`commitloreRunner`).
+ */
+export const commitloreChildHome = (): string => {
+  const home = mkdtempSync(join(tmpdir(), "acp-commitlore-home-"));
+  closeSync(openSync(join(home, ".gitconfig"), "wx", 0o600));
+  return home;
+};
 
 /**
  * `commitlore` as a child: resolved on this process's PATH before the child's environment is built (that
@@ -196,12 +234,22 @@ export const commitloreRunner =
   (limits: Readonly<CommitLoreLimits> = COMMITLORE_LIMITS): CommitLoreRunner =>
   (argv, cwd) =>
     new Promise((resolvePromise, reject) => {
+      const home = commitloreChildHome();
       const child = spawn(resolveExecutable("commitlore"), [...argv], {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         timeout: limits.timeoutMs,
-        env: commitloreChildEnvironment(),
+        env: commitloreChildEnvironment(home),
       });
+      const removeHome = (): void => {
+        try {
+          rmSync(home, { recursive: true, force: true });
+        } catch {
+          // What the child left there and made unremovable stays, in its owner-only directory: never a
+          // reason to throw from this listener.
+        }
+      };
+      child.once("exit", removeHome).once("error", removeHome);
       const kept: Record<"stdout" | "stderr", Buffer[]> = { stdout: [], stderr: [] };
       const size: Record<"stdout" | "stderr", number> = { stdout: 0, stderr: 0 };
       let failure: string | null = null;

@@ -81,7 +81,22 @@ it("R1-01: CommitLore children receive no daemon authority variables, a known na
   for (const key of sentinels) expect(serialized).not.toContain(`review-only-${key}`);
   // Constructed, not filtered: only what the CP-HI-05 child environment names (and what macOS's own
   // CoreFoundation sets inside a process that lacks it) is there at all.
-  const constructed = new Set(["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT"]);
+  // S11-R3 added git's credential controls, every value of which ACP sets itself.
+  const constructed = new Set([
+    "PATH",
+    "HOME",
+    "USER",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_TERMINAL_PROMPT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_ASKPASS",
+  ]);
   expect(Object.keys(observed).filter((key) => !constructed.has(key) && key !== "__CF_USER_TEXT_ENCODING")).toEqual([]);
   // The daemon's PATH is used to find `commitlore`, and is not handed to it.
   expect(observed["PATH"]?.split(":")).not.toContain(bin);

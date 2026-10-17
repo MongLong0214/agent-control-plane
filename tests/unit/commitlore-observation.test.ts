@@ -158,10 +158,24 @@ describe("#246 B3: the activation gate per mode", () => {
 });
 
 describe("review S11-R1-01: the CommitLore child environment is the CP-HI-05 constructed one", () => {
-  it("names only PATH, HOME, USER, TMPDIR, the locale and git's two switches, whatever the daemon carries", () => {
-    const environment = commitloreChildEnvironment();
+  it("names only PATH, HOME, USER, TMPDIR, the locale and git's controls (S11-R3), whatever the daemon carries", () => {
+    const environment = commitloreChildEnvironment("/acp-s11-r3/home");
     expect(Object.keys(environment).sort()).toEqual(
-      ["GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT", "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", ...(process.env["USER"] ? ["USER"] : [])].sort(),
+      [
+        "GIT_ASKPASS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_TERMINAL_PROMPT",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "TMPDIR",
+        ...(process.env["USER"] ? ["USER"] : []),
+      ].sort(),
     );
     expect(environment["PATH"]).not.toBe(process.env["PATH"]);
   });
