@@ -1,0 +1,8 @@
+Warn: bootstrap activation provisions the project's PRIMARY_CTO through ensureDrivenPrimaryCto (driven spawn record, in-band HANDOFF_PACKAGE); a retry replaces an existing binding only when it is interactive (DrivenMode NONE), not canonical, has no buzz actor id, the run's handoff names it and is still PENDING, and its HANDOFF_PACKAGE was REJECTED as a non-retryable contract failure at that generation; the driven session is spawned first, one transaction re-checks the guards, revokes through switchTo, binds the driven session and records PRIMARY_CTO_UNDELIVERABLE_REPLACED, and the handoff is reissued once as a new in-band PENDING package with 0 GitHub calls
+Record-Id: r-activationdrivenprimarycto
+Provenance: inherited 702641a729734847240ade8d9d74216ca51eaf3a
+
+Warn: in the undeliverable-PRIMARY_CTO recovery the old session is stopped only if it holds no other active role (assignments and actor runtime pointers) and is not canonical, and it moves to ERROR inside the switch transaction before any provider stop, so it cannot be rebound during cleanup
+Record-Id: r-activationrecoveryreservation
+Follows: r-activationdrivenprimarycto
+Provenance: inherited 51aa124c47dced0eecf4786747de5b144505911d
