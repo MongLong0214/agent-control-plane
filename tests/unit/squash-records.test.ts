@@ -1,9 +1,12 @@
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { ACP_SCRATCH_ROOT } from "../../src/core/scratch-root.ts";
 import { gateReads, squashRecordPreservation } from "../../src/git/squash-records.ts";
 import { composeSquashCommitMessage, composeSquashCommitTitle, squashCommitForMerge } from "../../src/github/merge-commit-message.ts";
 import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
@@ -110,5 +113,75 @@ describe("the merge-records examination of a squash", () => {
     expect(decision.reasonCode).toBe(ReasonCode.GIT_TIMEOUT);
     expect(decision.message).toContain("did not finish within its 300ms bound");
     expect(decision.evidence).toMatchObject({ pullNumber: 100, mergedHead: commits.at(-1)!.sha, timeoutMs: 300 });
+  });
+
+  /**
+   * S9 review r3: an answer that settles after the bound was returned as an answer, so a 5 s
+   * examination allowed the merge after 8.6 s. This is the reviewer's witness, changed only in its
+   * imports and in its scratch root, which is this file's private HOME (`tests/helpers/isolated-home.ts`):
+   * once the examination writes its gate reads, the parent's event loop stalls for 7 s while the last
+   * child runs, so that child's successful answer settles past the deadline.
+   */
+  it("refuses a merge whose examination answers only after its bound, even when the answer succeeded", async () => {
+    mkdirSync(ACP_SCRATCH_ROOT, { recursive: true, mode: 0o700 });
+    const marker = `late-probe-${randomBytes(12).toString("hex")}`;
+    let blocked = false;
+    let blockedAtMs: number | undefined;
+    const started = performance.now();
+    const observer = setInterval(() => {
+      const ready = readdirSync(ACP_SCRATCH_ROOT, { recursive: true }).some((name) => {
+        if (!String(name).endsWith("reads.json")) return false;
+        try {
+          return readFileSync(join(ACP_SCRATCH_ROOT, String(name)), "utf8").includes(marker);
+        } catch {
+          return false;
+        }
+      });
+      if (!blocked && ready) {
+        blocked = true;
+        blockedAtMs = Math.round(performance.now() - started);
+        const until = performance.now() + 7000;
+        while (performance.now() < until) {
+          // The parent is stalled; the examination's last child finishes meanwhile.
+        }
+      }
+    }, 2);
+    const commits = [{ sha: "1".repeat(40), message: `${marker}\n\nwhy.\n` }];
+    try {
+      const result = await squashCommitForMerge(commits, "test", 100, commits[0]!.sha, 5000);
+      const elapsedMs = Math.round(performance.now() - started);
+      if (!blocked) throw new Error("the delayed settlement was not exercised");
+      if (result.allowed || result.reasonCode !== ReasonCode.GIT_TIMEOUT) {
+        throw new Error(`a 5000ms examination answered after ${elapsedMs}ms (stalled at ${blockedAtMs}ms): ${JSON.stringify(result)}`);
+      }
+      expect(result.evidence).toMatchObject({ pullNumber: 100, mergedHead: commits[0]!.sha, timeoutMs: 5000, started: true });
+    } finally {
+      clearInterval(observer);
+    }
+  });
+
+  /** The same stall, where the late child failed: past the deadline the refusal is the timeout, not the failure. */
+  it("refuses a merge whose examination fails only after its bound as a timeout, whatever the child returned", async () => {
+    const marker = join(tempDir("acp-squash-records-late-failure-"), "started");
+    let blocked = false;
+    const observer = setInterval(() => {
+      if (blocked || !existsSync(marker)) return;
+      blocked = true;
+      const until = performance.now() + 3000;
+      while (performance.now() < until) {
+        // The parent is stalled; the child fails meanwhile.
+      }
+    }, 2);
+    const commits = branchOf(["feat: first\n\nwhy.\n"]);
+    try {
+      const decision = await withGit(() => `: > '${marker}'\nsleep 0.5\nexit 1`,
+        () => squashCommitForMerge(commits, "A reviewed change", 100, commits.at(-1)!.sha, 1500));
+      if (!blocked) throw new Error("the delayed settlement was not exercised");
+      if (decision.allowed) throw new Error("a merge whose examination timed out was allowed");
+      expect(decision.reasonCode).toBe(ReasonCode.GIT_TIMEOUT);
+      expect(decision.evidence).toMatchObject({ timeoutMs: 1500, started: true });
+    } finally {
+      clearInterval(observer);
+    }
   });
 });

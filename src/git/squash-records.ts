@@ -84,7 +84,10 @@ const EXAMINE_SQUASH = [
   "process.stdout.write(JSON.stringify({ carried: carried.size, missing }));",
 ].join("\n");
 
-/** A bounded `run` in `cwd`: every process gets what remains of one deadline, and none starts once it is spent. */
+/**
+ * A bounded `run` in `cwd`: every process gets what remains of one deadline, none starts once it is
+ * spent, and none is answered once it is spent — whatever the process returned.
+ */
 type Run = (file: string, args: readonly string[], input?: string) => Promise<string>;
 
 const examinationTimedOut = (timeoutMs: number, started: boolean) =>
@@ -99,17 +102,25 @@ const boundedRun = (cwd: string, env: NodeJS.ProcessEnv, timeoutMs: number): Run
   return async (file, args, input) => {
     const remaining = Math.floor(endsAt - performance.now());
     if (remaining < 1) throw examinationTimedOut(timeoutMs, false);
+    let stdout: string;
     try {
       const pending = execFileAsync(file, args, { cwd, env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: remaining });
       pending.child.stdin?.end(input ?? "");
-      return (await pending).stdout;
+      stdout = (await pending).stdout;
     } catch (error) {
+      // S9-R3: the deadline is read when the answer settles, failed or not. A stalled event loop
+      // can deliver a child's answer after the bound without its `timeout` ever firing.
+      if (performance.now() >= endsAt) throw examinationTimedOut(timeoutMs, true);
       // Node reports a child its `timeout` killed as `killed`, SIGTERM and no string code; an
       // overflowing `maxBuffer` is killed too, and carries its own code.
       const { killed, signal, code } = error as { killed?: unknown; signal?: unknown; code?: unknown };
       if (killed === true && signal === "SIGTERM" && typeof code !== "string") throw examinationTimedOut(timeoutMs, true);
       throw error;
     }
+    // A successful answer that settles past the deadline is still an examination that outlived its
+    // bound: GIT_TIMEOUT, never an answer (S9 review r3, a 5 s bound allowed after 8.6 s).
+    if (performance.now() >= endsAt) throw examinationTimedOut(timeoutMs, true);
+    return stdout;
   };
 };
 
