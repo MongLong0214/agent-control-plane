@@ -3252,10 +3252,112 @@ interface V45Object {
   readonly v44Ddl?: string;
 }
 
-/** A stored or schema.sql definition without `IF NOT EXISTS`, comments, double quotes or spacing. */
-const normaliseV45Sql = (sql: string): string => sql
-  .replace(/^CREATE (TABLE|UNIQUE INDEX|TRIGGER) IF NOT EXISTS /i, "CREATE $1 ")
-  .replace(/--[^\n]*/g, "").replace(/"/g, "").replace(/;\s*$/, "").replace(/\s+/g, " ").trim();
+/**
+ * SQLite's keywords, with TRUE and FALSE. A double-quoted region holding one of these is not the bare
+ * word: `TEXT "UNIQUE"` declares a column type and no UNIQUE constraint.
+ */
+const SQLITE_KEYWORDS: ReadonlySet<string> = new Set([
+  "ABORT", "ACTION", "ADD", "AFTER", "ALL", "ALTER", "ALWAYS", "ANALYZE", "AND", "AS", "ASC", "ATTACH",
+  "AUTOINCREMENT", "BEFORE", "BEGIN", "BETWEEN", "BY", "CASCADE", "CASE", "CAST", "CHECK", "COLLATE",
+  "COLUMN", "COMMIT", "CONFLICT", "CONSTRAINT", "CREATE", "CROSS", "CURRENT", "CURRENT_DATE", "CURRENT_TIME",
+  "CURRENT_TIMESTAMP", "DATABASE", "DEFAULT", "DEFERRABLE", "DEFERRED", "DELETE", "DESC", "DETACH", "DISTINCT",
+  "DO", "DROP", "EACH", "ELSE", "END", "ESCAPE", "EXCEPT", "EXCLUDE", "EXCLUSIVE", "EXISTS", "EXPLAIN", "FAIL",
+  "FILTER", "FIRST", "FOLLOWING", "FOR", "FOREIGN", "FROM", "FULL", "GENERATED", "GLOB", "GROUP", "GROUPS",
+  "HAVING", "IF", "IGNORE", "IMMEDIATE", "IN", "INDEX", "INDEXED", "INITIALLY", "INNER", "INSERT", "INSTEAD",
+  "INTERSECT", "INTO", "IS", "ISNULL", "JOIN", "KEY", "LAST", "LEFT", "LIKE", "LIMIT", "MATCH", "MATERIALIZED",
+  "NATURAL", "NO", "NOT", "NOTHING", "NOTNULL", "NULL", "NULLS", "OF", "OFFSET", "ON", "OR", "ORDER", "OTHERS",
+  "OUTER", "OVER", "PARTITION", "PLAN", "PRAGMA", "PRECEDING", "PRIMARY", "QUERY", "RAISE", "RANGE", "RECURSIVE",
+  "REFERENCES", "REGEXP", "REINDEX", "RELEASE", "RENAME", "REPLACE", "RESTRICT", "RETURNING", "RIGHT",
+  "ROLLBACK", "ROW", "ROWS", "SAVEPOINT", "SELECT", "SET", "TABLE", "TEMP", "TEMPORARY", "THEN", "TIES", "TO",
+  "TRANSACTION", "TRIGGER", "UNBOUNDED", "UNION", "UNIQUE", "UPDATE", "USING", "VACUUM", "VALUES", "VIEW",
+  "VIRTUAL", "WHEN", "WHERE", "WINDOW", "WITH", "WITHOUT", "TRUE", "FALSE",
+]);
+
+/** Where the quoted region opening at `from` ends, past its closing quote; a doubled quote is inside it. */
+const quotedRegionEnd = (sql: string, from: number, quote: string): number | undefined => {
+  for (let at = from + 1; at < sql.length; at += 1) {
+    if (sql[at] !== quote) continue;
+    if (sql[at + 1] !== quote) return at + 1;
+    at += 1;
+  }
+  return undefined;
+};
+
+/**
+ * ROUND1-ESCAPE-01. A stored or schema.sql definition as a list of tokens, or undefined when it holds
+ * anything this cannot classify, which the caller refuses. Quoted regions are separated first, so
+ * nothing below reaches inside one:
+ * - a single-quoted literal (`''` inside it included) is one token, byte for byte;
+ * - a double-quoted identifier is the bare word it holds when that is a plain ASCII name and not a
+ *   keyword (SQLite's rename writes `"projects"`); any other double-quoted region cannot be classified;
+ * - a backticked or bracketed identifier cannot be classified: nothing legitimate writes one here.
+ * Between those, a run of whitespace and `--` or block comments is one separator token; a separator's
+ * presence counts, its contents do not. `IF NOT EXISTS` after the CREATE keywords, which SQLite does not
+ * store, and a final `;` are dropped. An unterminated literal, identifier or block comment, or a
+ * character SQLite does not lex, cannot be classified. Measured at 1908b40e: removing every double
+ * quote and collapsing whitespace across the whole definition, literals included, accepted a grant
+ * table whose CHECK read `LIKE 'sha"256:%'` and a guard whose error literal had changed, and the
+ * second was then dropped and recreated.
+ */
+const normaliseV45Sql = (sql: string): string | undefined => {
+  const tokens: string[] = [];
+  const separate = (): void => {
+    if (tokens.length > 0 && tokens[tokens.length - 1] !== " ") tokens.push(" ");
+  };
+  const word = /[\w$\u0080-\u{10ffff}]+/uy;
+  let at = 0;
+  while (at < sql.length) {
+    const char = sql[at]!;
+    if (" \t\n\f\r".includes(char)) {
+      separate();
+      at += 1;
+    } else if (sql.startsWith("--", at)) {
+      separate();
+      const end = sql.indexOf("\n", at);
+      at = end === -1 ? sql.length : end;
+    } else if (sql.startsWith("/*", at)) {
+      separate();
+      const end = sql.indexOf("*/", at + 2);
+      if (end === -1) return undefined;
+      at = end + 2;
+    } else if (char === "'" || char === "\"") {
+      const end = quotedRegionEnd(sql, at, char);
+      if (end === undefined) return undefined;
+      const region = sql.slice(at, end);
+      const name = region.slice(1, -1);
+      if (char === "'") {
+        tokens.push(region);
+      } else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && !SQLITE_KEYWORDS.has(name.toUpperCase())) {
+        tokens.push(name);
+      } else {
+        return undefined;
+      }
+      at = end;
+    } else if ("(),;.+-*/%<>=!|&~".includes(char)) {
+      tokens.push(char);
+      at += 1;
+    } else {
+      word.lastIndex = at;
+      const match = word.exec(sql);
+      if (match === null) return undefined;
+      tokens.push(match[0]);
+      at = word.lastIndex;
+    }
+  }
+  const kind = tokens[2] === "UNIQUE" && tokens[4] === "INDEX" ? 6 : 4;
+  if (tokens[0] === "CREATE" && ["IF", " ", "NOT", " ", "EXISTS", " "].every((token, i) => tokens[kind + i] === token)) {
+    tokens.splice(kind, 6);
+  }
+  if (tokens[tokens.length - 1] === " ") tokens.pop();
+  if (tokens[tokens.length - 1] === ";") tokens.pop();
+  if (tokens[tokens.length - 1] === " ") tokens.pop();
+  return JSON.stringify(tokens);
+};
+
+/** A schema.sql definition `normaliseV45Sql` cannot classify: schema.sql has drifted from what v45 reads. */
+const v45SchemaUnreadable = (ddl: string): never => {
+  throw acpError(ReasonCode.INTERNAL_ERROR, "a v45 object in schema.sql cannot be classified", { ddl: ddl.slice(0, 120) });
+};
 
 /** The table a schema.sql definition is on, read from the definition itself. */
 const v45OwnerOf = (ddl: string, pattern: RegExp): string => {
@@ -3318,10 +3420,11 @@ const assertV45Names = (raw: Database.Database, objects: readonly V45Object[], w
       throw new Error(`v45 refuses: ${object.name} is not held by the ${object.type} schema.sql defines on ${object.table} after the step`);
     }
     const accepted = [object.ddl, ...(when === "before" && object.v44Ddl !== undefined ? [object.v44Ddl] : [])]
-      .map(normaliseV45Sql);
+      .map((ddl) => normaliseV45Sql(ddl) ?? v45SchemaUnreadable(ddl));
     for (const holder of holders) {
+      const held = holder.sql === null ? undefined : normaliseV45Sql(holder.sql);
       if (holder.type !== object.type || holder.name !== object.name || holder.tbl !== object.table
-          || holder.sql === null || !accepted.includes(normaliseV45Sql(holder.sql))) {
+          || held === undefined || !accepted.includes(held)) {
         throw new Error(
           `v45 refuses: ${object.name} is held by the ${holder.type} ${holder.name} on ${holder.tbl}, which is not the ${object.type} schema.sql defines on ${object.table}`,
         );
@@ -3373,6 +3476,8 @@ const assertV45TableCarries = (raw: Database.Database, objects: readonly V45Obje
  * V45-R1-01: every name the step's `IF NOT EXISTS` statements take is checked before the step, whether
  * or not the table exists, and again after it (`assertV45Names`), and the table must then carry exactly
  * the objects schema.sql puts on it. A conflict refuses the step; nothing is dropped to make room.
+ * ROUND1-ESCAPE-01: definitions compare token by token with every literal byte for byte
+ * (`normaliseV45Sql`), and one that cannot be classified is a conflict.
  *
  * A live database at v44 reaches this step only through an approved migration
  * (`assertMigrationApproved`), as it does every step.
