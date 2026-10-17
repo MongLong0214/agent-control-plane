@@ -367,7 +367,9 @@ export const wakeRoleHolder = async (
     }
   }
   // #246 C4 — a PRIMARY_CTO is driven only when its own spawn recorded it so, never by its role.
-  if (!holder || !cp.sessionRuntime.drivesSession(holder.sessionId, holder.role)) return conversation.wake(roleKey);
+  if (!holder || !cp.sessionRuntime.drivesSession(holder.sessionId, holder.role)) {
+    return conversation.wake(roleKey, undefined, cause.kind);
+  }
   const ids = cause.ids.length > 0 ? cause.ids : [`${cause.kind}:${randomUUID()}`];
   const woke = cp.sessionRuntime.wake(roleKey, ids.map((id) => ({
     id,
@@ -647,7 +649,15 @@ export const startLocalMcpListeners = async (
     // the port so the port never has to know what a deployment's layout is, and so a test that
     // wants a different directory gets one without moving the daemon's.
     // The wake's final holder check and its frame handoff run in the daemon's write transaction.
-    { endpointDir: stateDir, ownerMessages: ownerMessageLedger(cp), serializeWake: (body) => cp.db.tx(body) },
+    {
+      endpointDir: stateDir,
+      ownerMessages: ownerMessageLedger(cp),
+      serializeWake: (body) => cp.db.tx(body),
+      // #1103 — every wake frame handed to a CTO, with its cause, so a wake that finds empty queues
+      // can be attributed (a registration's, at a daemon start or a re-registration).
+      onWakeWritten: ({ roleKey, cause }) =>
+        cp.audit.record({ kind: "ROLE_WAKE_SENT", reasonCode: ReasonCode.OK, roleKey, evidence: { cause } }),
+    },
   );
   // A wake caused by a verified mention is gated on that mention's identity, role and room, judged by
   // whichever mention subscriber runs over this control plane. No other wake meets this gate.

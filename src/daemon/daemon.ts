@@ -3170,6 +3170,12 @@ export class Daemon {
       }];
     }
     if (counters.framesHandled > 0) return [];
+    // #1108 — admission is judged per identity, and an identity that is excluded opens no socket,
+    // so with none admitted no frame can arrive and silence is the expected state, not a relay
+    // fault. Health already carries that state as admission NONE with each identity's reason. A
+    // receipt with no admission keeps the old reading.
+    const admission = counters.admission;
+    if (admission !== undefined && admission.admittedIdentities === 0) return [];
     if (Date.now() - receipt.startedAtMs < BUZZ_MENTION_SILENCE_GRACE_MS) return [];
     return [{
       code: "BUZZ_MENTION_SUBSCRIBER_SILENT",
@@ -3178,9 +3184,11 @@ export class Daemon {
       blocking: false,
       confidence: "HIGH",
       // The numbers side by side, because their disagreement is the whole diagnosis: identities
-      // configured says the subscriber was set up, frames handled says nothing has arrived.
+      // configured says the subscriber was set up, frames handled says nothing has arrived, and
+      // identities admitted says how many of them could have received one.
       observedEvidence: {
         configuredIdentities: receipt.configuredIdentities,
+        ...(admission === undefined ? {} : { admittedIdentities: admission.admittedIdentities }),
         framesHandled: 0,
         admitted: 0,
         upForMs: Date.now() - receipt.startedAtMs,

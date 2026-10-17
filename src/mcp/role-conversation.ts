@@ -261,6 +261,24 @@ export const DEFAULT_ROLE_WAKE_TIMEOUT_MS = 2_000;
 export const ROLE_WAKE_TOKEN = "ACP-ROLE-WAKE";
 
 /**
+ * #1103 — why a wake was sent, recorded by the daemon and never put in the frame (see
+ * `ROLE_WAKE_TOKEN`). `registration` is the unconditional wake a registration sends whatever is
+ * queued, `mention` a verified mention's, and a caller that knows its trigger passes it (the daemon's
+ * `wakeRoleHolder` passes its cause's kind: `in-band dispatch`, `owner message`).
+ */
+export const ROLE_WAKE_CAUSE = {
+  REGISTRATION: "registration",
+  MENTION: "mention",
+  UNSPECIFIED: "unspecified",
+} as const;
+
+/** One wake frame handed to an endpoint, and why it was sent. */
+export interface WrittenRoleWake {
+  readonly roleKey: string;
+  readonly cause: string;
+}
+
+/**
  * The exact bytes of a wake: one newline-delimited JSON frame carrying the token as its content.
  *
  * The frame shape is **part of the version-pinned contract**, not an implementation detail this
@@ -505,6 +523,13 @@ export class RoleConversationPort {
    * current-holder check alone. Absent, a mention wake is refused rather than sent ungated.
    */
   #mentionWakeGate: MentionWakeGate | null = null;
+  /**
+   * #1103 — told once per wake frame handed to an endpoint, with why it was sent. The frame itself
+   * carries nothing (`ROLE_WAKE_TOKEN`), so this record is the only place a wake that finds empty
+   * queues can be attributed: the daemon writes it as a `ROLE_WAKE_SENT` audit row. Absent, wakes
+   * are sent as before and recorded nowhere.
+   */
+  readonly #onWakeWritten: ((wake: WrittenRoleWake) => void) | null;
 
   constructor(
     role: Role,
@@ -514,11 +539,13 @@ export class RoleConversationPort {
       wakeTimeoutMs?: number;
       ownerMessages?: OwnerMessageLedger;
       serializeWake?: <T>(body: () => T) => T;
+      onWakeWritten?: (wake: WrittenRoleWake) => void;
     } = {},
   ) {
     this.#role = role;
     this.#bindings = bindings;
     this.#serializeWake = options.serializeWake ?? null;
+    this.#onWakeWritten = options.onWakeWritten ?? null;
     this.#ownerMessages = options.ownerMessages ?? null;
     this.#endpointDir = options.endpointDir === undefined ? null : resolvePath(options.endpointDir);
     this.#wakeTimeoutMs = options.wakeTimeoutMs ?? DEFAULT_ROLE_WAKE_TIMEOUT_MS;
@@ -966,7 +993,12 @@ export class RoleConversationPort {
     // The outcome is deliberately discarded. Registration succeeded on the strength of the checks
     // above; a wake that does not land says nothing about whether the endpoint is registered, and
     // folding it into this decision would make a correct registration look refused.
-    for (const roleKey of registered) await this.wake(roleKey);
+    //
+    // #1103 — this is the wake a CTO sees at a daemon start (its relay reattaches and registers
+    // again) and after any registration, with both queues empty when nothing was waiting. It is
+    // kept, and recorded with the cause `registration` (`onWakeWritten`), so such a wake is
+    // attributable rather than unexplained.
+    for (const roleKey of registered) await this.wake(roleKey, undefined, ROLE_WAKE_CAUSE.REGISTRATION);
     return allow(ReasonCode.OK, registered);
   }
 
@@ -1089,7 +1121,7 @@ export class RoleConversationPort {
    * `connect`, and no filesystem check available here can prevent it — and it is not asked to:
    * the constant token is what makes winning the race worth nothing.
    */
-  async wake(roleKey: string, mention?: MentionWakeContext): Promise<Decision<void>> {
+  async wake(roleKey: string, mention?: MentionWakeContext, cause?: string): Promise<Decision<void>> {
     const peer = this.#live.get(roleKey);
     if (!peer) {
       return deny(ReasonCode.ROLE_PEER_ABSENT, "no session is currently attached for this role", {
@@ -1237,6 +1269,24 @@ export class RoleConversationPort {
     // the holder registered again used to clear unconditionally, which erased the newer
     // registration's own refusal and reported a holder nothing can wake as wakeable.
     if (peer.registration === registration) peer.wakeFailure = null;
+    // #1103 — recorded only for a frame that was handed off, and on the next turn of the event
+    // loop rather than here: a registration's answer waits on this wake, and a relay reattaching
+    // after a restart is refusing its client's requests until that answer arrives, so the record
+    // must not lengthen it. A recorder that throws is not a failed wake; the frame has landed.
+    const recorder = this.#onWakeWritten;
+    if (recorder !== null) {
+      const written: WrittenRoleWake = {
+        roleKey,
+        cause: mention !== undefined ? ROLE_WAKE_CAUSE.MENTION : (cause ?? ROLE_WAKE_CAUSE.UNSPECIFIED),
+      };
+      setImmediate(() => {
+        try {
+          recorder(written);
+        } catch {
+          // Only the record is lost.
+        }
+      });
+    }
     return allow(ReasonCode.OK, undefined);
   }
 
