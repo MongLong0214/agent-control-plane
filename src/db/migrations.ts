@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 44;
+export const SCHEMA_VERSION = 45;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -149,8 +149,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   // v43 alone creates the bootstrap application record and its guards (#246 C3).
   /-- -{75}\n-- bootstrap_applications[\s\S]*?CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_delete[\s\S]*?\nEND;/,
   // v44 alone creates the manifest activation grant, its guards, and the two guards over projects and
-  // runs that name it (#246 B2-b).
-  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/,
+  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512).
+  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -3223,6 +3223,83 @@ const v44: SchemaMigration = {
   checksum: () => migrationChecksum("v44-manifest-activation-grant", 44),
 };
 
+/**
+ * v45's guards, read from schema.sql by name: the first-activation grant's seven, the one on the v44
+ * grant table that names it, and the two v44 guards over projects and runs whose bodies v45 replaces.
+ */
+const V45_FIRST_ACTIVATION_TRIGGER_NAMES: readonly string[] = [
+  "manifest_first_activation_grants_born_unconsumed",
+  "manifest_first_activation_grants_born_on_null",
+  "manifest_first_activation_grants_no_replace",
+  "manifest_first_activation_grants_immutable",
+  "manifest_first_activation_grants_consumed_once",
+  "manifest_first_activation_grants_consumed_while_null",
+  "manifest_first_activation_grants_no_delete",
+  "manifest_activation_grants_not_first",
+  "projects_active_manifest_moves_by_grant",
+  "runs_contract_change_completes_activated",
+];
+
+/**
+ * #512. An operator-registered project starts with a NULL active manifest, and no path could give it
+ * one: a CONTRACT_CHANGE needs a base, the v44 grant's `from_manifest_digest` is NOT NULL, and the
+ * pointer guard admits only a v44 grant whose `from` is the old value. A first-activation
+ * CONTRACT_CHANGE's CEO CONFIRM now issues a grant in its own table, bound to the exact project, its
+ * NULL registration, the manifest, the review and the exact workflow revisions, and the daemon
+ * finalizer consumes it, once and only while the project is still NULL, in the transaction that moves
+ * the pointer NULL → M1 and completes the run.
+ *
+ * Additive, apart from two replaced bodies: one new table, its partial unique index (one consumed first
+ * grant per project) and its seven guards, one new guard on the v44 grant table (a run holds one grant
+ * across both tables), and the v44 pointer and completion guards, each gaining the first-activation
+ * alternative. For any non-NULL old pointer value both replaced bodies decide exactly as v44's did. The
+ * v44 table, its five guards and its NOT NULL `from` column are untouched. No existing row is touched
+ * and there is no backfill. A chain test can build a v44 image out of a current database, which already
+ * has the table; it is accepted only with schema.sql's exact shape (index included) and no row, never
+ * repaired, as v44 does. The triggers are dropped and recreated.
+ *
+ * A live database at v44 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v45: SchemaMigration = {
+  id: "v45-first-manifest-activation",
+  fromVersion: 44,
+  toVersion: 45,
+  apply: (raw) => {
+    const tableDdl = schemaObject(
+      /CREATE TABLE IF NOT EXISTS manifest_first_activation_grants \([\s\S]*?\n\) WITHOUT ROWID;/,
+      "the manifest_first_activation_grants table",
+      45,
+    );
+    const indexDdl = schemaObject(
+      /CREATE UNIQUE INDEX IF NOT EXISTS manifest_first_activation_grants_one_consumed_per_project[^;]*;/,
+      "the manifest_first_activation_grants index",
+      45,
+    );
+    const normalise = (sql: string): string => sql
+      .replace(/^CREATE (TABLE|UNIQUE INDEX) IF NOT EXISTS /i, "CREATE $1 ")
+      .replace(/--[^\n]*/g, "").replace(/"/g, "").replace(/;\s*$/, "").replace(/\s+/g, " ").trim();
+    const existingSql = (type: "table" | "index", name: string): string | undefined =>
+      (raw.prepare("SELECT sql FROM sqlite_master WHERE type = ? AND name = ?").get(type, name) as
+        { sql: string } | undefined)?.sql;
+    const existingTable = existingSql("table", "manifest_first_activation_grants");
+    const existingIndex = existingSql("index", "manifest_first_activation_grants_one_consumed_per_project");
+    if (existingTable !== undefined) {
+      if (normalise(existingTable) !== normalise(tableDdl)
+          || (existingIndex !== undefined && normalise(existingIndex) !== normalise(indexDdl))
+          || raw.prepare("SELECT 1 FROM manifest_first_activation_grants LIMIT 1").get()) {
+        throw new Error("v45 pre-existing manifest_first_activation_grants table does not match the current schema or is populated");
+      }
+    } else {
+      raw.exec(tableDdl);
+    }
+    raw.exec(indexDdl);
+    raw.exec(dropsFor(V45_FIRST_ACTIVATION_TRIGGER_NAMES));
+    raw.exec(triggerDdlFor(V45_FIRST_ACTIVATION_TRIGGER_NAMES, 45));
+  },
+  checksum: () => migrationChecksum("v45-first-manifest-activation", 45),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -3257,6 +3334,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v42,
   v43,
   v44,
+  v45,
 ]);
 
 interface RequiredTrigger {
@@ -3440,6 +3518,14 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "projects_no_replace", sentinel: "PROJECT_NO_REPLACE", introducedIn: 44 },
   { name: "projects_active_manifest_moves_by_grant", sentinel: "MANIFEST_ACTIVATION_AUTHORITY_DENIED", introducedIn: 44 },
   { name: "runs_contract_change_completes_activated", sentinel: "CONTRACT_CHANGE_NOT_ACTIVATED", introducedIn: 44 },
+  { name: "manifest_first_activation_grants_born_unconsumed", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_born_on_null", sentinel: "MANIFEST_FIRST_ACTIVATION_DENIED", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_no_replace", sentinel: "MANIFEST_GRANT_NO_REPLACE", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_immutable", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_consumed_once", sentinel: "MANIFEST_GRANT_CONSUMED", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_consumed_while_null", sentinel: "MANIFEST_FIRST_ACTIVATION_DENIED", introducedIn: 45 },
+  { name: "manifest_first_activation_grants_no_delete", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
+  { name: "manifest_activation_grants_not_first", sentinel: "MANIFEST_GRANT_NO_REPLACE", introducedIn: 45 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [

@@ -14,8 +14,10 @@ import { type Activity, type Availability, Role } from "../domain/types.ts";
 import { type CompletionAuthority, isDaemonFinalizerCompletion } from "../run/run-engine.ts";
 import {
   type ActivatedWorkflowEvidence,
+  type FirstActivationWorkflowEvidence,
   type GrantConsumer,
   type ManifestActivationGrants,
+  sameFirstActivationCoverage,
   sameWorkflowCoverage,
 } from "./manifest-activation-grants.ts";
 import {
@@ -159,6 +161,11 @@ export class ProjectRegistry {
    * points to (CEO ruling 6); it must cover each one exactly. `consumer` is the authenticated CEO
    * session the finalization attempt started for; it must still be the grant's consumer and the live
    * CEO binding when this transaction commits (CEO ruling 2).
+   *
+   * #512 — a first-activation grant moves the pointer from NULL instead: `workflows` must then be an
+   * exact, non-empty bijection with the grant's bound revisions, each read at its bound commit, and the
+   * audit records `from: null` and `activation: "FIRST"`. The grant is consumed before the pointer
+   * moves, which is the order the schema's consumed-while-NULL guard relies on.
    */
   activateManifest(
     runId: string,
@@ -168,7 +175,7 @@ export class ProjectRegistry {
       workflows: readonly ActivatedWorkflowEvidence[];
       consumer: GrantConsumer | null;
     },
-  ): Decision<{ from: string; to: string; grantId: string }> {
+  ): Decision<{ from: string | null; to: string; grantId: string }> {
     if (!isDaemonFinalizerCompletion(input.completion)) {
       return deny(ReasonCode.COMPLETION_AUTHORITY_DENIED, "only the daemon finalizer activates a CONTRACT_CHANGE manifest", { runId });
     }
@@ -176,20 +183,30 @@ export class ProjectRegistry {
     if (!grants) {
       return deny(ReasonCode.MANIFEST_ACTIVATION_GRANT_MISSING, "manifest activation grants are not configured", { runId });
     }
-    return this.db.txDecision(() => {
+    type Activated = Decision<{ from: string | null; to: string; grantId: string }>;
+    return this.db.txDecision((): Activated => {
       const target = grants.verify(runId, "ACTIVATION", input.consumer);
-      if (!target.allowed) return target as Decision<{ from: string; to: string; grantId: string }>;
+      if (!target.allowed) return target as Activated;
       const { grant, manifest } = target.value;
-      const covered = sameWorkflowCoverage(target.value.workflowEvidence, input.workflows);
+      const first = target.value.kind === "FIRST";
+      const covered = target.value.kind === "FIRST"
+        ? sameFirstActivationCoverage(
+            target.value.workflowRevisions,
+            target.value.workflowEvidence,
+            input.workflows as readonly FirstActivationWorkflowEvidence[],
+          )
+        : sameWorkflowCoverage(target.value.workflowEvidence, input.workflows);
       if (!covered) {
         return deny(ReasonCode.MANIFEST_ACTIVATION_WORKFLOW_UNVERIFIED, "activation must carry a comparison for every workflow the manifest names", {
           runId,
+          ...(first ? { activation: "FIRST" } : {}),
           expected: target.value.workflowEvidence.map((workflow) => `${workflow.repositoryRole}:${workflow.path}`),
           supplied: input.workflows.map((workflow) => `${workflow.repositoryRole}:${workflow.path}`),
         });
       }
       const consumed = grants.consume(runId, input.attemptId);
-      if (!consumed.allowed) return consumed as Decision<{ from: string; to: string; grantId: string }>;
+      if (!consumed.allowed) return consumed as Activated;
+      const from = target.value.kind === "FIRST" ? null : target.value.grant.fromManifestDigest;
 
       // Content-addressed and immutable: the PLAN's manifest was checked portable and to hash to the
       // grant's digest when the PLAN was stored, and again by `verify` just above.
@@ -217,9 +234,17 @@ export class ProjectRegistry {
         projectId: grant.projectId,
         runId,
         evidence: {
-          from: grant.fromManifestDigest,
+          from,
           to: grant.manifestDigest,
           viaRunKind: "CONTRACT_CHANGE",
+          ...(target.value.kind === "FIRST"
+            ? {
+                activation: "FIRST",
+                registrationEventId: target.value.grant.registrationEventId,
+                reviewDigest: target.value.grant.reviewDigest,
+                workflowRevisionsDigest: target.value.grant.workflowRevisionsDigest,
+              }
+            : {}),
           grantId: grant.grantId,
           grantDigest: grant.grantDigest,
           attemptId: input.attemptId,
@@ -228,7 +253,7 @@ export class ProjectRegistry {
           workflows: input.workflows.map((workflow) => ({ ...workflow })),
         },
       });
-      return allow(ReasonCode.OK, { from: grant.fromManifestDigest, to: grant.manifestDigest, grantId: grant.grantId });
+      return allow(ReasonCode.OK, { from, to: grant.manifestDigest, grantId: grant.grantId });
     });
   }
 

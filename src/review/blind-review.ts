@@ -37,14 +37,16 @@ import {
 import { diffPatch } from "../git/git.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import {
-  type ContractChangeBinding,
+  type AnyContractChangeBinding,
   type ContractChangeWorkflowEvidence,
+  type WorkflowRevision,
   contractChangeCoverageTarget,
-  currentContractChangePlan,
+  currentContractChangeTarget,
   isContractChangeRun,
   sameContractChangeBinding,
   storedManifest,
 } from "../registry/contract-change-plan.ts";
+import { firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
   ProviderSessionProvisionError,
@@ -132,10 +134,14 @@ export interface ReviewPacket {
   createdAt: string;
 }
 
-/** What a CONTRACT_CHANGE review records it judged (#246 B2-a). */
-export interface ContractChangeReviewBinding extends ContractChangeBinding {
+/**
+ * What a CONTRACT_CHANGE review records it judged (#246 B2-a); for a first activation (#512) also the
+ * exact workflow revisions it was shown.
+ */
+export type ContractChangeReviewBinding = AnyContractChangeBinding & {
   workflowEvidence: ContractChangeWorkflowEvidence[];
-}
+  workflowRevisions?: WorkflowRevision[];
+};
 
 export interface ReviewerPreference {
   provider: string;
@@ -223,10 +229,13 @@ interface TrustedBootstrapPlanReview {
 /** A CONTRACT_CHANGE candidate's change once it has been reloaded from the PLAN it names. */
 interface TrustedContractChange {
   projectId: string;
-  binding: ContractChangeBinding;
+  binding: AnyContractChangeBinding;
   manifest: ProjectManifest;
-  baseManifest: ProjectManifest;
+  /** Null for a first activation (#512): there is no base. */
+  baseManifest: ProjectManifest | null;
   workflowEvidence: ContractChangeWorkflowEvidence[];
+  /** #512 — a first activation's exact workflow revisions. */
+  workflowRevisions?: WorkflowRevision[];
   /** `<projectId>:#manifest/<manifestDigest>`, the coverage item the reviewer must account for. */
   target: { identity: string; path: string };
 }
@@ -492,7 +501,7 @@ export class BlindReviewGate {
         expected,
         binaryArtifacts,
         bootstrapPlan: null,
-        contractChange: change === null ? null : { ...change.binding, workflowEvidence: change.workflowEvidence },
+        contractChange: change === null ? null : reviewBindingOf(change),
         planReview: false,
       });
     } finally {
@@ -596,7 +605,7 @@ export class BlindReviewGate {
         expected,
         binaryArtifacts: [],
         bootstrapPlan: null,
-        contractChange: { ...inputs.change.binding, workflowEvidence: inputs.change.workflowEvidence },
+        contractChange: reviewBindingOf(inputs.change),
         planReview: true,
       });
     } finally {
@@ -1958,8 +1967,8 @@ export class BlindReviewGate {
    * by digest, never from a request.
    */
   private contractChangeForCandidate(runId: string, snapshot: CandidateSnapshot): Decision<TrustedContractChange | null> {
-    const run = this.db.get<{ kind: string; project_id: string | null; pinned_manifest_digest: string | null }>(
-      `SELECT kind, project_id, pinned_manifest_digest FROM runs WHERE run_id = ?`,
+    const run = this.db.get<{ run_id: string; kind: string; project_id: string | null; pinned_manifest_digest: string | null }>(
+      `SELECT run_id, kind, project_id, pinned_manifest_digest FROM runs WHERE run_id = ?`,
       [runId],
     );
     if (!run || !isContractChangeRun(run)) {
@@ -1976,10 +1985,13 @@ export class BlindReviewGate {
         contractChange: named ?? null,
       });
     }
-    const current = currentContractChangePlan(
-      { kind: run.kind, projectId: run.project_id, pinnedManifestDigest: run.pinned_manifest_digest },
+    // #512 (v45) — or a first activation, judged against the project as it stands now.
+    const facts = { runId: run.run_id, kind: run.kind, projectId: run.project_id, pinnedManifestDigest: run.pinned_manifest_digest };
+    const current = currentContractChangeTarget(
+      facts,
       this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN),
       (digest) => storedManifest(this.db, digest),
+      firstActivationFactsOf(this.db, facts),
     );
     if (!current.allowed) return current as Decision<TrustedContractChange | null>;
     if (!sameContractChangeBinding(current.value.binding, named)) {
@@ -1995,6 +2007,7 @@ export class BlindReviewGate {
       manifest: current.value.manifest,
       baseManifest: current.value.baseManifest,
       workflowEvidence: current.value.workflowEvidence,
+      ...(current.value.firstActivation ? { workflowRevisions: current.value.workflowRevisions } : {}),
       target: contractChangeCoverageTarget(run.project_id, current.value.binding),
     });
   }
@@ -2250,11 +2263,19 @@ const CONTRACT_CHANGE_REVIEWER_SYSTEM_PROMPT = [
  */
 const contractChangeSection = (change: TrustedContractChange): string[] => [
   "## Contract change",
-  "This run proposes a new project manifest. It replaces the base manifest only if it is approved and",
-  "later activated; until then every run, this one included, is verified against the base.",
+  ...(change.baseManifest === null
+    ? [
+        "This run proposes the first manifest of an operator-registered project, which has none. It becomes",
+        "the project's manifest only if it is approved and later activated, and only while the project still",
+        "has none; each CI workflow is then read at exactly the commit bound below, never at a branch head.",
+      ]
+    : [
+        "This run proposes a new project manifest. It replaces the base manifest only if it is approved and",
+        "later activated; until then every run, this one included, is verified against the base.",
+      ]),
   `Plan digest: ${change.binding.planDigest}`,
   `Proposed manifest digest: ${change.binding.manifestDigest}`,
-  `Base manifest digest: ${change.binding.baseManifestDigest}`,
+  `Base manifest digest: ${change.binding.baseManifestDigest ?? "none (first activation)"}`,
   `Coverage item for the proposed manifest: ${change.target.identity}:${change.target.path}`,
   "",
   "### Proposed manifest",
@@ -2262,17 +2283,31 @@ const contractChangeSection = (change: TrustedContractChange): string[] => [
   JSON.stringify(change.manifest, null, 2),
   "```",
   "",
-  "### Base manifest",
-  "```json",
-  JSON.stringify(change.baseManifest, null, 2),
-  "```",
-  "",
+  ...(change.baseManifest === null
+    ? []
+    : ["### Base manifest", "```json", JSON.stringify(change.baseManifest, null, 2), "```", ""]),
   "### CI workflows a later activation must verify",
   "```json",
   JSON.stringify(change.workflowEvidence, null, 2),
   "```",
   "",
+  ...("workflowRevisionsDigest" in change.binding
+    ? [
+        `### Exact workflow revisions (digest ${change.binding.workflowRevisionsDigest})`,
+        "```json",
+        JSON.stringify(change.workflowRevisions ?? [], null, 2),
+        "```",
+        "",
+      ]
+    : []),
 ];
+
+/** What a CONTRACT_CHANGE review records it judged: the binding, the workflows, and a first activation's revisions. */
+const reviewBindingOf = (change: TrustedContractChange): ContractChangeReviewBinding => ({
+  ...change.binding,
+  workflowEvidence: change.workflowEvidence,
+  ...(change.workflowRevisions === undefined ? {} : { workflowRevisions: change.workflowRevisions }),
+});
 
 const parseVerdict = (input: unknown): RawVerdict | null => {
   const value =

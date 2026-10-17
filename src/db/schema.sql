@@ -1570,6 +1570,8 @@ END;
 -- CP-HI-03 — #246 B2-b: a project's active manifest moves only by a consumed grant that names exactly
 -- this move, which is what the activation transaction writes before it moves the pointer. Registering
 -- a project inserts its first manifest and is not an update.
+-- v45 (#512): or, from NULL only, by the project's consumed first-activation grant naming the new
+-- manifest. For any non-NULL old value the body decides exactly as v44's did.
 CREATE TRIGGER IF NOT EXISTS projects_active_manifest_moves_by_grant
 BEFORE UPDATE OF active_manifest_digest ON projects
 WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
@@ -1580,12 +1582,20 @@ WHEN NEW.active_manifest_digest IS NOT OLD.active_manifest_digest
      AND g.manifest_digest IS NEW.active_manifest_digest
      AND g.consumed_at IS NOT NULL
 )
+ AND NOT (OLD.active_manifest_digest IS NULL AND EXISTS (
+  SELECT 1 FROM manifest_first_activation_grants f
+   WHERE f.project_id = NEW.project_id
+     AND f.manifest_digest IS NEW.active_manifest_digest
+     AND f.consumed_at IS NOT NULL
+))
 BEGIN
   SELECT RAISE(ABORT, 'MANIFEST_ACTIVATION_AUTHORITY_DENIED');
 END;
 
 -- CP-HI-02 — #246 B2-b: a CONTRACT_CHANGE run completes only once its own grant for its current
 -- candidate is consumed and the project's active manifest is the one that grant names.
+-- v45 (#512): a first-activation run's own grant is in manifest_first_activation_grants, under the
+-- same run, current-candidate, consumed and pointer predicates.
 CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated
 BEFORE UPDATE OF state ON runs
 WHEN NEW.state = 'COMPLETED' AND OLD.state IS NOT 'COMPLETED' AND NEW.kind = 'CONTRACT_CHANGE'
@@ -1597,8 +1607,190 @@ WHEN NEW.state = 'COMPLETED' AND OLD.state IS NOT 'COMPLETED' AND NEW.kind = 'CO
      AND g.consumed_at IS NOT NULL
      AND p.active_manifest_digest IS g.manifest_digest
 )
+ AND NOT EXISTS (
+  SELECT 1 FROM manifest_first_activation_grants f
+    JOIN projects p ON p.project_id = f.project_id
+   WHERE f.run_id = NEW.run_id
+     AND f.candidate_snapshot_digest IS NEW.current_candidate_digest
+     AND f.consumed_at IS NOT NULL
+     AND p.active_manifest_digest IS f.manifest_digest
+)
 BEGIN
   SELECT RAISE(ABORT, 'CONTRACT_CHANGE_NOT_ACTIVATED');
+END;
+
+-- ---------------------------------------------------------------------------
+-- manifest_first_activation_grants  (schema v45, #512)
+--   Lifecycle: one row per first-activation CONTRACT_CHANGE run of an operator-registered project
+--   whose active manifest is NULL, inserted by the CEO's CONFIRM in the transaction that moves the run
+--   to CEO_APPROVED, and consumed once by the daemon finalizer in the transaction that moves the
+--   project's pointer from NULL to the manifest the run's PLAN carries and completes the run.
+--   Authority lives in code: ManifestActivationGrants issues and verifies a first grant by re-deriving
+--   every fact it names (the run, its candidate, PLAN, review, packet, the exact workflow revisions,
+--   the project's registration and repository set, and the live CEO binding). These guards are the
+--   structural ones only: born unconsumed, born only for a NULL project's NULL-pinned CONTRACT_CHANGE
+--   run and that project's own NULL registration, one grant per run across both grant tables, fixed
+--   once written, consumed once and only forward while the project is still NULL, never deleted, and
+--   one consumed first grant per project, ever. The v44 table, its guards and its NOT NULL base are
+--   unchanged. WITHOUT ROWID, so no REPLACE through a hidden rowid deletes a row.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS manifest_first_activation_grants (
+  grant_id                  TEXT NOT NULL PRIMARY KEY,
+  run_id                    TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+  project_id                TEXT NOT NULL REFERENCES projects(project_id),
+  run_kind                  TEXT NOT NULL CHECK (run_kind = 'CONTRACT_CHANGE'),
+  -- The project's PROJECT_REGISTERED audit row, which recorded a NULL active manifest.
+  registration_event_id     INTEGER NOT NULL,
+  -- What the CEO confirmed, by digest: the manifest the PLAN carries, the PLAN, the candidate, its
+  -- production-ready packet and the PASS review of this exact binding.
+  manifest_digest           TEXT NOT NULL CHECK (manifest_digest LIKE 'sha256:%'),
+  plan_digest               TEXT NOT NULL,
+  candidate_snapshot_digest TEXT NOT NULL,
+  packet_digest             TEXT NOT NULL,
+  review_digest             TEXT NOT NULL,
+  -- The exact workflow revisions the PLAN bound: a non-empty array of
+  -- {repositoryRole, repositoryIdentity, path, checkName, commitSha, fileDigest}.
+  workflow_revisions_json   TEXT NOT NULL CHECK (json_valid(workflow_revisions_json)
+    AND json_type(workflow_revisions_json) = 'array'
+    AND json_array_length(workflow_revisions_json) > 0),
+  workflow_revisions_digest TEXT NOT NULL CHECK (workflow_revisions_digest LIKE 'sha256:%'),
+  -- The CEO binding that confirmed, as it stood at CONFIRM.
+  ceo_assignment_id         TEXT NOT NULL REFERENCES assignments(assignment_id),
+  ceo_actor_id              TEXT NOT NULL,
+  ceo_session_id            TEXT NOT NULL,
+  ceo_session_incarnation   TEXT NOT NULL,
+  ceo_binding_generation    INTEGER NOT NULL CHECK (ceo_binding_generation > 0),
+  issued_at                 TEXT NOT NULL,
+  grant_digest              TEXT NOT NULL UNIQUE,
+  -- The authenticated CEO session whose call drives consumption, as on the v44 table.
+  consumer_session_id          TEXT NOT NULL,
+  consumer_session_incarnation TEXT NOT NULL,
+  consumer_bound_at            TEXT NOT NULL,
+  -- Set once, by the finalization attempt that activated the manifest.
+  consumed_at               TEXT,
+  consumed_attempt_id       TEXT,
+  CHECK ((consumed_at IS NULL) = (consumed_attempt_id IS NULL))
+) WITHOUT ROWID;
+
+-- #512: a project leaves NULL once. One consumed first grant per project, ever.
+CREATE UNIQUE INDEX IF NOT EXISTS manifest_first_activation_grants_one_consumed_per_project
+  ON manifest_first_activation_grants(project_id) WHERE consumed_at IS NOT NULL;
+
+-- CP-HI-02 — #512 (schema v45): a first grant is born unconsumed; consumption is an update the
+-- guards below admit.
+CREATE TRIGGER IF NOT EXISTS manifest_first_activation_grants_born_unconsumed
+BEFORE INSERT ON manifest_first_activation_grants
+WHEN NEW.consumed_at IS NOT NULL OR NEW.consumed_attempt_id IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_IMMUTABLE');
+END;
+
+-- CP-HI-03 — #512 (schema v45): a first grant is born only for a project whose active manifest is
+-- NULL now, for that project's CONTRACT_CHANGE run with a NULL pin, naming that project's own
+-- PROJECT_REGISTERED row, which recorded a JSON-null active manifest.
+CREATE TRIGGER IF NOT EXISTS manifest_first_activation_grants_born_on_null
+BEFORE INSERT ON manifest_first_activation_grants
+WHEN NOT EXISTS (
+  SELECT 1 FROM projects p
+   WHERE p.project_id = NEW.project_id AND p.active_manifest_digest IS NULL
+)
+ OR NOT EXISTS (
+  SELECT 1 FROM runs r
+   WHERE r.run_id = NEW.run_id AND r.project_id = NEW.project_id
+     AND r.kind = 'CONTRACT_CHANGE' AND r.pinned_manifest_digest IS NULL
+)
+ OR NOT EXISTS (
+  SELECT 1 FROM audit_events e
+   WHERE e.event_id = NEW.registration_event_id
+     AND e.kind = 'PROJECT_REGISTERED'
+     AND e.project_id = NEW.project_id
+     AND json_valid(e.evidence_json)
+     AND json_type(e.evidence_json, '$.activeManifestDigest') = 'null'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_FIRST_ACTIVATION_DENIED');
+END;
+
+-- CP-HI-01 — #512 (schema v45): one grant per run, ever, across both grant tables; a second is
+-- refused, not merged, and a REPLACE cannot take an existing grant's place. A project that already
+-- consumed its first grant is given no other.
+CREATE TRIGGER IF NOT EXISTS manifest_first_activation_grants_no_replace
+BEFORE INSERT ON manifest_first_activation_grants
+WHEN EXISTS (
+  SELECT 1 FROM manifest_first_activation_grants
+   WHERE grant_id = NEW.grant_id OR run_id = NEW.run_id OR grant_digest = NEW.grant_digest
+      OR (project_id = NEW.project_id AND consumed_at IS NOT NULL)
+)
+ OR EXISTS (SELECT 1 FROM manifest_activation_grants g WHERE g.run_id = NEW.run_id)
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_NO_REPLACE');
+END;
+
+-- CP-HI-03 — #512 (schema v45): what a first grant names is fixed once written.
+CREATE TRIGGER IF NOT EXISTS manifest_first_activation_grants_immutable
+BEFORE UPDATE ON manifest_first_activation_grants
+WHEN NEW.grant_id IS NOT OLD.grant_id
+  OR NEW.run_id IS NOT OLD.run_id
+  OR NEW.project_id IS NOT OLD.project_id
+  OR NEW.run_kind IS NOT OLD.run_kind
+  OR NEW.registration_event_id IS NOT OLD.registration_event_id
+  OR NEW.manifest_digest IS NOT OLD.manifest_digest
+  OR NEW.plan_digest IS NOT OLD.plan_digest
+  OR NEW.candidate_snapshot_digest IS NOT OLD.candidate_snapshot_digest
+  OR NEW.packet_digest IS NOT OLD.packet_digest
+  OR NEW.review_digest IS NOT OLD.review_digest
+  OR NEW.workflow_revisions_json IS NOT OLD.workflow_revisions_json
+  OR NEW.workflow_revisions_digest IS NOT OLD.workflow_revisions_digest
+  OR NEW.ceo_assignment_id IS NOT OLD.ceo_assignment_id
+  OR NEW.ceo_actor_id IS NOT OLD.ceo_actor_id
+  OR NEW.ceo_session_id IS NOT OLD.ceo_session_id
+  OR NEW.ceo_session_incarnation IS NOT OLD.ceo_session_incarnation
+  OR NEW.ceo_binding_generation IS NOT OLD.ceo_binding_generation
+  OR NEW.issued_at IS NOT OLD.issued_at
+  OR NEW.grant_digest IS NOT OLD.grant_digest
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_IMMUTABLE');
+END;
+
+-- CP-HI-02 — #512 (schema v45): a first grant is consumed once, from unconsumed to consumed, and never
+-- back; once consumed nothing in it changes, its consumer included.
+CREATE TRIGGER IF NOT EXISTS manifest_first_activation_grants_consumed_once
+BEFORE UPDATE ON manifest_first_activation_grants
+WHEN OLD.consumed_at IS NOT NULL
+  OR (NEW.consumed_at IS NULL) <> (NEW.consumed_attempt_id IS NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_CONSUMED');
+END;
+
+-- CP-HI-03 — #512 (schema v45): a first grant is consumed only while its project's active manifest is
+-- still NULL. Activation consumes before it moves the pointer, so the one that moves it passes and
+-- every later one is refused.
+CREATE TRIGGER IF NOT EXISTS manifest_first_activation_grants_consumed_while_null
+BEFORE UPDATE ON manifest_first_activation_grants
+WHEN OLD.consumed_at IS NULL AND NEW.consumed_at IS NOT NULL
+ AND NOT EXISTS (
+  SELECT 1 FROM projects p
+   WHERE p.project_id = NEW.project_id AND p.active_manifest_digest IS NULL
+)
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_FIRST_ACTIVATION_DENIED');
+END;
+
+-- CP-HI-06 — #512 (schema v45): never removed; a deleted first grant would free its run and its
+-- project for a second one.
+CREATE TRIGGER IF NOT EXISTS manifest_first_activation_grants_no_delete
+BEFORE DELETE ON manifest_first_activation_grants
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_IMMUTABLE');
+END;
+
+-- CP-HI-01 — #512 (schema v45): the other direction of one grant per run: a run that already holds a
+-- first-activation grant is never given a v44 grant.
+CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first
+BEFORE INSERT ON manifest_activation_grants
+WHEN EXISTS (SELECT 1 FROM manifest_first_activation_grants f WHERE f.run_id = NEW.run_id)
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_GRANT_NO_REPLACE');
 END;
 
 -- ---------------------------------------------------------------------------

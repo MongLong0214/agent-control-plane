@@ -65,13 +65,26 @@ export type SnapshotBootstrapPlan = z.infer<typeof snapshotBootstrapPlanSchema>;
  * carries and the base it changes (the run's pinned manifest), each by digest. Present only on a
  * CONTRACT_CHANGE candidate, with or without repositories.
  */
-export const snapshotContractChangeSchema = z
-  .object({
-    planDigest: z.string().min(1),
-    manifestDigest: z.string().min(1),
-    baseManifestDigest: z.string().min(1),
-  })
-  .strict();
+export const snapshotContractChangeSchema = z.union([
+  z
+    .object({
+      planDigest: z.string().min(1),
+      manifestDigest: z.string().min(1),
+      baseManifestDigest: z.string().min(1),
+    })
+    .strict(),
+  // #512 (v45) — a first activation of an operator-registered NULL project changes no base: the base
+  // is null only together with `firstActivation` and the digest of the exact workflow revisions.
+  z
+    .object({
+      planDigest: z.string().min(1),
+      manifestDigest: z.string().min(1),
+      baseManifestDigest: z.null(),
+      firstActivation: z.literal(true),
+      workflowRevisionsDigest: z.string().min(1),
+    })
+    .strict(),
+]);
 
 export type SnapshotContractChange = z.infer<typeof snapshotContractChangeSchema>;
 

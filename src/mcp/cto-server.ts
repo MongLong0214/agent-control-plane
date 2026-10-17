@@ -19,6 +19,7 @@ import type { Doctor } from "../doctor/doctor.ts";
 import { ArtifactKind } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import { contractChangePlanForSubmission, isContractChangeRun } from "../registry/contract-change-plan.ts";
+import { firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { BlindReviewGate } from "../review/blind-review.ts";
 import type { CandidatePipeline } from "../run/candidate-pipeline.ts";
@@ -160,7 +161,7 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       if (!frozen.allowed) return frozen as Decision<{ digest: string }>;
       const run = source.runs.require(runId);
       const admitted = isContractChangeRun(run)
-        ? contractChangePlanForSubmission(run, plan, (digest) => source.projects.manifest(digest))
+        ? contractChangePlanForSubmission(run, plan, (digest) => source.projects.manifest(digest), firstActivationFactsOf(source.db, run))
         : planForSubmission(run, plan);
       if (!admitted.allowed) return admitted as Decision<{ digest: string }>;
       return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, admitted.value).digest });
