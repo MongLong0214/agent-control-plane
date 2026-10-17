@@ -1,16 +1,31 @@
+import { execFileSync } from "node:child_process";
+
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
-import type { AuditLog } from "../db/audit.ts";
+import { type AuditLog, redact } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind } from "../domain/types.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { isClean, tryRevParse } from "../git/git.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
+import {
+  ORPHAN_RELEASE_APPROVAL_OPERATION,
+  ORPHAN_RELEASE_AUTHORIZATION_KEY,
+  ORPHAN_RELEASE_CONFIRMATION,
+  ORPHAN_RELEASE_REPAIR_ID,
+  type OrphanReleaseApproval,
+  orphanExecutionOf,
+  orphanReleaseAuthorization,
+  orphanReleaseParameterDigest,
+  orphanReleaseParameters,
+  unresolvedUnidentifiedOrphans,
+} from "../run/worker-orphan-release.ts";
+import { WorkerTurnEvent } from "../run/worker-turn.ts";
 import {
   type RepairWorktreeAuthority,
   type ManagedWriteGuard,
@@ -33,6 +48,9 @@ const VERIFICATION_WORKTREE_OWNER_RELEASE_STATES = TERMINAL_RUN_STATES;
 
 /** The exact admitted ingress operation used for owner-authorised repair. */
 export const REPAIR_OWNER_APPROVAL_OPERATION = "repair_execute";
+
+/** #1096 — the orphan release's receipt names this operation; this fails to compile if the two differ. */
+const _orphanReleaseApprovalOperation: typeof REPAIR_OWNER_APPROVAL_OPERATION = ORPHAN_RELEASE_APPROVAL_OPERATION;
 
 /** PRD §25.7 — the operation contract every repair must satisfy. */
 export interface RepairOperation {
@@ -164,6 +182,29 @@ export class RepairService {
         "the application becomes RELEASED and keeps its record; a new run may reserve the same project id and repository identity under its own owner approval; when no external effect can be proven nothing is released and the reservation is kept, RELEASE_IN_DOUBT",
       undo: "none needed: nothing outside the database changed, and the released run cannot be confirmed again",
       preconditions: [...RESERVATION_RELEASE_PRECONDITIONS],
+    },
+    // #1096 — a worker launch the guard admitted whose pid was never recorded leaves its task blocked
+    // for good: no pid can ever be confirmed gone. After the operator has checked that nothing of it
+    // runs, this records that one orphan event resolved. It reads the process table and signals nothing.
+    // Owner-authorised: at the moment it writes, it proves the owner live through the configured owner
+    // authority, and its release record carries an authorization digest bound to this orphan and that
+    // receipt, which the audit API cannot write (`orphanResolutionVerified`). The record is durable; a
+    // raw SQL writer is the Limit `worker-orphan-release.ts` names.
+    [ORPHAN_RELEASE_REPAIR_ID]: {
+      id: ORPHAN_RELEASE_REPAIR_ID,
+      risk: "MEDIUM",
+      authorization: "OWNER",
+      description:
+        "Record one worker orphan event that was never identified (a launch with no recorded pid) as resolved, so its task may run again",
+      expectedEffect:
+        "the task's next worker turn is admitted again; the orphan record stays, and a resolution naming this repair and the operator's admitted receipt is recorded beside it",
+      undo: "none needed: nothing is signalled, deleted or rewritten, and a later unidentified orphan of the task blocks it again",
+      preconditions: [
+        "orphanEventId names an unidentified-orphan record of this execution, with no recorded pid, that no verified resolution follows",
+        "the execution is not RUNNING and records no worker process",
+        `the parameters are exactly executionId, orphanEventId and the operator's confirmation that nothing of the orphan is running (confirm=${ORPHAN_RELEASE_CONFIRMATION})`,
+        "no live process carries the worker session's id on its command line",
+      ],
     },
   };
 
@@ -501,9 +542,123 @@ export class RepairService {
           },
         };
       }
+      case ORPHAN_RELEASE_REPAIR_ID: {
+        const executionId = request.parameters["executionId"] ?? "";
+        // Only an orphan event no verified release follows; a resolution row this repair did not write is ignored.
+        const unresolved = executionId === "" ? [] : unresolvedUnidentifiedOrphans(this.db, { executionId });
+        const orphan = unresolved.find((candidate) => String(candidate.eventId) === request.parameters["orphanEventId"]);
+        // The receipt binds the parameters; only these exact ones are what the reader will verify.
+        const exactParameters =
+          orphan !== undefined && digestOf(request.parameters) === digestOf(orphanReleaseParameters(executionId, orphan.eventId));
+        const execution = this.db.get<{ task_id: string; status: string; worker_process_id: number | null; worker_session_id: string }>(
+          `SELECT task_id, status, worker_process_id, worker_session_id FROM task_executions WHERE execution_id = ?`,
+          [executionId],
+        );
+        const incarnation = execution
+          ? this.db.get<{ incarnation: string }>(`SELECT incarnation FROM sessions WHERE session_id = ?`, [execution.worker_session_id])?.incarnation
+          : undefined;
+        // The provider CLI of every worker turn carries its session as `--session-id <id>`.
+        const workerSessionId = incarnation?.split("#", 1)[0] ?? "";
+        const scan = workerSessionId === "" ? { carriers: [], error: "the worker session's id is unknown" } : processesCarrying(workerSessionId);
+        const confirmation = request.parameters["confirm"] ?? null;
+        const evidence = {
+          executionId,
+          taskId: execution?.task_id ?? null,
+          orphanEventId: orphan?.eventId ?? null,
+          // Every orphan event of this execution still blocking its task: what `orphanEventId` may name.
+          unresolvedOrphanEventIds: unresolved.map((candidate) => candidate.eventId),
+          executionStatus: execution?.status ?? null,
+          workerProcessId: execution?.worker_process_id ?? null,
+          workerSessionId: execution?.worker_session_id ?? null,
+          confirmation,
+          liveProcessScan: scan,
+        };
+        return {
+          preconditions: [
+            checked(operation.preconditions[0]!, orphan !== undefined, evidence),
+            checked(operation.preconditions[1]!, execution !== undefined && execution.status !== "RUNNING" && execution.worker_process_id === null, evidence),
+            checked(operation.preconditions[2]!, exactParameters && confirmation === ORPHAN_RELEASE_CONFIRMATION, evidence),
+            checked(operation.preconditions[3]!, scan.error === null && scan.carriers.length === 0, evidence),
+          ],
+          perform: async (dryRun) => {
+            if (dryRun) return { changes: 1, evidence };
+            const recorded = this.db.txDecision(() => this.recordOrphanRelease(request, evidence));
+            if (!recorded.allowed) return { changes: 0, evidence, refusal: recorded as Decision<never> };
+            return { changes: 1, evidence };
+          },
+        };
+      }
       default:
         throw new Error(`missing repair plan for ${operation.id}`);
     }
+  }
+
+  /**
+   * #1096 — the release record of `release_unidentified_worker_orphan`, the only thing that releases an
+   * unidentified orphan (`orphanResolutionVerified`). Owner identity is proven live, at the moment of use,
+   * through the configured owner authority: the receipt names an allowlisted owner and its admission still
+   * stands (`assertApproval`), and `execute` has just consumed it for no candidate (`assertConsumedApproval`).
+   * The orphan is read again here, so it is still unresolved, its execution still records no process, and
+   * the receipt approves exactly its release. The record is written by this insert, not `AuditLog.record`:
+   * its authorization digest sits under a key the audit API redacts; the rest is redacted as the audit API
+   * would. Its reader never asks the ingress replay cache again, so the release stays durable.
+   */
+  private recordOrphanRelease(request: RepairRequest, evidence: Record<string, unknown>): Decision<void> {
+    const receipt = request.ownerApproval;
+    const owner = this.#ownerAuthority;
+    if (!receipt || !owner) {
+      return deny(
+        ReasonCode.REPAIR_REQUIRES_OWNER,
+        "an orphan release is recorded only under an owner receipt the configured owner authority admits",
+        { operationId: ORPHAN_RELEASE_REPAIR_ID },
+      );
+    }
+    const live = owner.assertApproval(receipt);
+    if (!live.allowed) return live;
+    const consumed = owner.assertConsumedApproval(receipt, null);
+    if (!consumed.allowed) return consumed;
+    const executionId = request.parameters["executionId"] ?? "";
+    const orphanEventId = request.parameters["orphanEventId"] ?? null;
+    const orphan = unresolvedUnidentifiedOrphans(this.db, { executionId }).find(
+      (candidate) => String(candidate.eventId) === orphanEventId,
+    );
+    const execution = orphanExecutionOf(this.db, executionId);
+    if (
+      orphan === undefined ||
+      execution === null ||
+      execution.taskId !== orphan.taskId ||
+      execution.workerProcessId !== null ||
+      receipt.parameterDigest !== orphanReleaseParameterDigest(executionId, orphan.eventId)
+    ) {
+      return deny(
+        ReasonCode.REPAIR_PRECONDITION_UNMET,
+        "the receipt no longer names an unresolved unidentified orphan of this execution",
+        { executionId, orphanEventId },
+      );
+    }
+    const approval: OrphanReleaseApproval = {
+      channel: receipt.channel,
+      actor: receipt.actor,
+      nonce: receipt.inboundNonce,
+      receiptDigest: digestOf(receipt),
+      parameterDigest: receipt.parameterDigest,
+    };
+    const recorded = redact({ ...evidence, operationId: ORPHAN_RELEASE_REPAIR_ID, ownerApproval: approval }) as Record<string, unknown>;
+    this.db.run(
+      `INSERT INTO audit_events (at, kind, reason_code, run_id, actor, evidence_json)
+       VALUES (?, ?, NULL, ?, ?, ?)`,
+      [
+        this.clock.nowIso(),
+        WorkerTurnEvent.ORPHAN_RESOLVED,
+        orphan.runId,
+        `${receipt.channel}:${receipt.actor}`,
+        JSON.stringify({
+          ...recorded,
+          [ORPHAN_RELEASE_AUTHORIZATION_KEY]: orphanReleaseAuthorization(orphan, execution, approval),
+        }),
+      ],
+    );
+    return allow(ReasonCode.OK, undefined);
   }
 
   private repairWorktreeAuthorization(
@@ -597,6 +752,29 @@ const alive = (pid: number): boolean => {
   } catch {
     return false;
   }
+};
+
+/**
+ * #1096 — live processes whose command line carries `token` as one whole argument, read from `ps`. It
+ * observes and signals nothing; any failure to read the table is an error, never an empty answer.
+ */
+const processesCarrying = (token: string): { carriers: number[]; error: string | null } => {
+  let listing: string;
+  try {
+    listing = execFileSync("/bin/ps", ["-axww", "-o", "pid=,command="], {
+      encoding: "utf8",
+      timeout: 5_000,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (err) {
+    return { carriers: [], error: safeErrorMessage(err) };
+  }
+  const carriers: number[] = [];
+  for (const line of listing.split("\n")) {
+    const [pid, ...command] = line.trim().split(/\s+/);
+    if (command.includes(token) && Number(pid) !== process.pid) carriers.push(Number(pid));
+  }
+  return { carriers, error: null };
 };
 
 const safeErrorMessage = (err: unknown): string => {

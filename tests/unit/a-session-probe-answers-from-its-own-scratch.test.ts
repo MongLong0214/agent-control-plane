@@ -849,6 +849,40 @@ describe("a probe ends its own process group on every completion, and only its o
       world.close();
     }
   });
+
+  it("#1109 RED/GREEN: a provision refused for an unconfirmed reap keeps the named group in its stored refusal evidence", async () => {
+    const unconfirmed = {
+      pgid: 434343, reaped: false, signalled: false, signals: [], delivered: 0, ownership: "HOLDER_LOST" as const,
+      detail: "the probe's holder (pid 434343) exited before ACP could end its group; process group 434343 was not signalled and may still hold the probe's processes",
+    };
+    __testing.setRunCli(async () => ({
+      stdout: JSON.stringify({ type: "result", session_id: "x", result: "READY" }),
+      stderr: "", exitCode: 0, timedOut: false, isolationEnforced: false, processGroup: unconfirmed,
+    }));
+    const world = await provisioningWorld((_root, stubs) => refusingClaude(stubs));
+    try {
+      const refused = await world.provision();
+      expect(refused.allowed).toBe(false);
+      const sessionId = claudeSessions(world.harness)[0]?.session_id ?? "";
+      // Read back from the database once the refusal response is gone: what an operator can find.
+      const stopped = world.harness.cp.audit.byKind("SESSION_LIFECYCLE")
+        .filter((row) => row.sessionId === sessionId && row.evidence["to"] === SessionLifecycle.STOPPED)
+        .map((row) => row.evidence["reason"]);
+      const named = world.harness.cp.audit.byKind("WORKER_PROBE_GROUP_UNCONFIRMED").map((row) => ({
+        sessionId: row.sessionId, runId: row.runId, evidence: row.evidence,
+      }));
+      console.error(`WITNESS stored-unconfirmed-group ${JSON.stringify({ stopped, named })}`);
+      expect(stopped).toEqual([expect.stringContaining("process group 434343")]);
+      expect(named).toEqual([{
+        sessionId,
+        runId: world.runId,
+        evidence: expect.objectContaining({ taskId: world.taskId, processGroup: unconfirmed }),
+      }]);
+    } finally {
+      __testing.setRunCli(null);
+      world.close();
+    }
+  });
 });
 
 /* ------------------------------------------------------------------------------------------------ */

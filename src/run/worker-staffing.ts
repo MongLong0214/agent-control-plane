@@ -1,11 +1,12 @@
 import type { Clock } from "../core/clock.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { containedWorkdir, probeSessionHealth } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
 import { Role, type RoleBinding, RunState, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
+import type { ProcessGroupReap } from "../runtime/cli-adapters.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
@@ -159,7 +160,26 @@ export class WorkerStaffing {
       // handle may turn it READY.
       const live = await probeSessionHealth(adapter, handle);
       if (!live.allowed) {
-        await this.#discard(adapter, handle, sessionId, "provider worker session probe failed");
+        // #1109 — a probe that could not confirm its own group empty named that group; the refusal
+        // keeps it, so the group can still be inspected once the caller's response is gone.
+        const group = unconfirmedProbeGroup(live.evidence);
+        if (group) {
+          this.audit.record({
+            kind: "WORKER_PROBE_GROUP_UNCONFIRMED",
+            reasonCode: live.reasonCode,
+            runId: request.runId,
+            sessionId,
+            evidence: { taskId: request.taskId, provider: adapter.provider, processGroup: group, probeError: live.evidence["probeError"] ?? null },
+          });
+        }
+        await this.#discard(
+          adapter,
+          handle,
+          sessionId,
+          group
+            ? `provider worker session probe failed: process group ${group.pgid} was not confirmed empty (${group.ownership})`
+            : "provider worker session probe failed",
+        );
         return live as Decision<WorkerProvisioned>;
       }
       const ready = this.ports.sessions.transition(sessionId, SessionLifecycle.READY, "provider worker session verified");
@@ -273,6 +293,13 @@ export class WorkerStaffing {
     this.ports.sessions.transition(sessionId, SessionLifecycle.STOPPED, reason);
   }
 }
+
+/** #1109 — the process group a refused session probe could not confirm empty, from its denial; else null. */
+const unconfirmedProbeGroup = (evidence: Evidence): ProcessGroupReap | null => {
+  const group = evidence["processGroup"];
+  if (typeof group !== "object" || group === null) return null;
+  return typeof (group as { pgid?: unknown }).pgid === "number" ? (group as ProcessGroupReap) : null;
+};
 
 /** The worker model for a provider: the fixed one, or a refusal. Never a substitute. */
 const resolveWorkerModel = (provider: string, requested: string | undefined): Decision<string> => {

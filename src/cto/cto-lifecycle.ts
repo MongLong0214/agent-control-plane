@@ -2259,6 +2259,9 @@ export const probeSessionHealth = async (
     return deny(ReasonCode.SESSION_NOT_READY, "provider session probe did not complete", {
       provider: adapter.provider,
       probeError: error instanceof Error ? error.message : String(error),
+      // #1109 — the group a session probe could not confirm empty (`ProbeProcessGroupUnconfirmed`, by
+      // name: this module does not load the adapters), kept as data, not only as text.
+      ...(error instanceof Error && error.name === "ProbeProcessGroupUnconfirmed" && "reap" in error ? { processGroup: error.reap } : {}),
     });
   }
   if (health !== "HEALTHY") {

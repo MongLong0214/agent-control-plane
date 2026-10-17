@@ -811,9 +811,12 @@ export class ProvisionedSessionRuntime {
         }
       }
     }
+    // #1104 — a turn that left its own process group unconfirmed is not a completed turn, whatever it
+    // answered: it is refused below with the group named, and nothing more is signalled to it.
+    const completed = result.ok && result.processGroup === undefined;
     this.ports.audit.record({
       kind: "SESSION_TURN",
-      reasonCode: result.ok ? ReasonCode.OK : ReasonCode.SESSION_TURN_FAILED,
+      reasonCode: completed ? ReasonCode.OK : ReasonCode.SESSION_TURN_FAILED,
       sessionId,
       // `step` and `sameConversationId`, not "conversation": the audit stores no field named for
       // a conversation's content, and a key ending in it is redacted as one.
@@ -824,16 +827,25 @@ export class ProvisionedSessionRuntime {
         exitCode: result.exitCode,
         durationMs: result.durationMs,
         sameConversationId: result.providerSessionId === handle.externalSessionId,
+        // #1104 — the turn's own process group, when its cleanup could not confirm it ended.
+        ...(result.processGroup === undefined ? {} : { processGroup: result.processGroup }),
       },
     });
-    if (!result.ok) {
-      return deny(ReasonCode.SESSION_TURN_FAILED, "the session's turn did not complete as its own conversation", {
-        sessionId,
-        purpose: turn.purpose,
-        step: conversation,
-        exitCode: result.exitCode,
-        sameConversationId: result.providerSessionId === handle.externalSessionId,
-      });
+    if (!completed) {
+      return deny(
+        ReasonCode.SESSION_TURN_FAILED,
+        result.processGroup === undefined
+          ? "the session's turn did not complete as its own conversation"
+          : `the session's turn did not confirm its own process group ${result.processGroup.pgid} ended`,
+        {
+          sessionId,
+          purpose: turn.purpose,
+          step: conversation,
+          exitCode: result.exitCode,
+          sameConversationId: result.providerSessionId === handle.externalSessionId,
+          ...(result.processGroup === undefined ? {} : { processGroup: result.processGroup }),
+        },
+      );
     }
     return allow(ReasonCode.OK, result);
   }

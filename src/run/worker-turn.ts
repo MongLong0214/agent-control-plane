@@ -13,6 +13,7 @@ import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
+import { ORPHAN_RESOLVED_EVENT, ORPHAN_UNIDENTIFIED_EVENT, unresolvedUnidentifiedOrphans } from "./worker-orphan-release.ts";
 import {
   type PinnedRepository,
   type WorkerCommitPort,
@@ -22,6 +23,8 @@ import {
   effectiveConfig,
   gitDirFingerprint,
   headOf,
+  ignoredPathState,
+  ignoredPathsChanged,
   objectFormatOf,
   parentOf,
   pinRepository,
@@ -81,7 +84,13 @@ export const WorkerTurnEvent = {
   LATE_RESULT_REFUSED: "TASK_WORKER_TURN_LATE_RESULT_REFUSED",
   ORPHAN_KILLED: "TASK_WORKER_ORPHAN_KILLED",
   ORPHAN_GONE: "TASK_WORKER_ORPHAN_GONE",
-  ORPHAN_UNIDENTIFIED: "TASK_WORKER_ORPHAN_UNIDENTIFIED",
+  ORPHAN_UNIDENTIFIED: ORPHAN_UNIDENTIFIED_EVENT,
+  /**
+   * #1096 — an operator's repair (`release_unidentified_worker_orphan`) recorded an unidentified orphan
+   * with no recorded pid as resolved, after confirming nothing of it runs. The orphan row stays, and the
+   * row counts only as `orphanResolutionVerified` verifies it as that repair's own release record.
+   */
+  ORPHAN_RESOLVED: ORPHAN_RESOLVED_EVENT,
   SHUTDOWN_DRAINED: "TASK_WORKER_TURNS_DRAINED",
   /** A stopping daemon stopped a turn's git and recorded what the repository shows (ACP-WORKER-03). */
   GIT_STOPPED: "TASK_WORKER_TURN_GIT_STOPPED",
@@ -223,7 +232,15 @@ interface TurnFacts extends DurableFacts {
   gitDirFingerprint: string;
   /** What the real index staged before the turn (`stagedContent`): its entries, never its stat cache. */
   stagedBaseline: string;
+  /** #1097 — every ignored path's state before the turn (`ignoredPathState`), or why it could not be read. */
+  ignoredBaseline: IgnoredReading;
 }
+
+/** #1097 — a reading of the worktree's ignored paths; a failed one is kept as its error, never as empty. */
+type IgnoredReading = { state: ReadonlyMap<string, string>; error: null } | { state: null; error: string };
+
+/** How many changed ignored paths a receipt names; the total is always given. */
+const IGNORED_CHANGES_NAMED = 200;
 
 interface InFlightTurn {
   promise: Promise<void>;
@@ -807,7 +824,9 @@ export class WorkerTurnRunner {
     if (blocked) {
       return deny(ReasonCode.CONFLICT, "an earlier turn of this task may have launched a process that was never recorded; it is not executed again", {
         taskId: request.taskId,
-        executionId: blocked,
+        executionId: blocked.executionId,
+        // #1096 — the record the operator's release names (`release_unidentified_worker_orphan`).
+        orphanEventId: blocked.eventId,
       });
     }
 
@@ -1072,6 +1091,7 @@ export class WorkerTurnRunner {
       }
       const config = await effectiveConfig(repo);
       const stagedBaseline = await stagedContent(repo, snapshot);
+      const ignoredBaseline = await readIgnored(repo, head, "prepare");
       return allow(ReasonCode.OK, {
         ...facts,
         repo,
@@ -1079,6 +1099,7 @@ export class WorkerTurnRunner {
         objectFormat,
         config,
         stagedBaseline,
+        ignoredBaseline,
         gitDirFingerprint: gitDirFingerprint(repo),
       });
     } catch (error) {
@@ -1202,7 +1223,14 @@ export class WorkerTurnRunner {
     // turn left behind. A writer that may still be running is not read at all.
     const observed = turn.spawned && turn.processGone ? await this.observe(facts) : null;
     const diffDigest = observed?.diffDigest ?? null;
-    const evidence = { ...base, diffDigest, paths: observed?.entries.map((entry) => entry.path) ?? [] };
+    // #1097 — a change under an ignored path is never committed; it is named here, whatever the outcome.
+    const ignoredChanges = observed ? await ignoredChangesOf(facts) : null;
+    const evidence = {
+      ...base,
+      diffDigest,
+      paths: observed?.entries.map((entry) => entry.path) ?? [],
+      ...(ignoredChanges ? { ignoredChanges } : {}),
+    };
 
     if (!this.isRunning(executionId)) {
       this.refuseLate(facts, executionId, { ...evidence, reason: "EXECUTION_NO_LONGER_RUNNING" });
@@ -1230,6 +1258,16 @@ export class WorkerTurnRunner {
     }
     if (!turn.spawned) {
       this.fail(facts, executionId, "FAILED", "infrastructure", { ...evidence, reason: "NEVER_RAN", reasonCode: ReasonCode.INTERNAL_ERROR });
+      return;
+    }
+    // #1104 — the turn's own process group was not confirmed ended: not a completion, and the group is named.
+    if (result.processGroup !== undefined) {
+      this.fail(facts, executionId, "FAILED", "infrastructure", {
+        ...evidence,
+        reason: "PROCESS_GROUP_UNCONFIRMED",
+        reasonCode: ReasonCode.INTERNAL_ERROR,
+        processGroup: result.processGroup,
+      });
       return;
     }
     if (!result.ok) {
@@ -1340,6 +1378,8 @@ export class WorkerTurnRunner {
             taskId: facts.taskId,
             head: facts.baseHead,
             paths: observed.entries.map((entry) => entry.path),
+            // #1097 — a finding, not an input of the digest: what the turn changed that was not committed.
+            ...(ignoredChanges ? { ignoredChanges } : {}),
           },
         });
         if (!recorded.allowed) {
@@ -1756,19 +1796,15 @@ export class WorkerTurnRunner {
     return null;
   }
 
-  /** An earlier turn of this task that may have launched a process never recorded: no pid to confirm gone. */
-  private blockedOrphan(taskId: string): string | null {
-    const rows = this.ports.db.all<{ evidence_json: string }>(
-      `SELECT evidence_json FROM audit_events
-        WHERE kind = ? AND json_extract(evidence_json, '$.taskId') = ?
-        ORDER BY event_id`,
-      [WorkerTurnEvent.ORPHAN_UNIDENTIFIED, taskId],
-    );
-    for (const row of rows) {
-      const evidence = JSON.parse(row.evidence_json) as { executionId?: unknown; pid?: unknown };
-      if (evidence.pid === null || evidence.pid === undefined) return String(evidence.executionId ?? "");
-    }
-    return null;
+  /**
+   * An earlier turn of this task that may have launched a process never recorded: no pid to confirm gone.
+   * #1096 — one the operator's repair has since released no longer blocks, and only as far as
+   * `orphanResolutionVerified` verifies that repair's own durable release record for exactly this orphan
+   * event; a resolution row the audit API wrote is never enough. The orphan row itself is never removed.
+   */
+  private blockedOrphan(taskId: string): { executionId: string; eventId: number } | null {
+    const [first] = unresolvedUnidentifiedOrphans(this.ports.db, { taskId });
+    return first === undefined ? null : { executionId: first.executionId, eventId: first.eventId };
   }
 
   /** Whether the guard admitted a provider launch for this receipt; a launch with no recorded pid is then unidentifiable. */
@@ -1784,6 +1820,28 @@ export class WorkerTurnRunner {
     ));
   }
 }
+
+/** #1097 — `ignoredPathState`, with a failure kept as its error. */
+const readIgnored = async (repo: PinnedRepository, treeIsh: string, label: string): Promise<IgnoredReading> => {
+  try {
+    return { state: await ignoredPathState(repo, treeIsh, label), error: null };
+  } catch (error) {
+    return { state: null, error: errorText(error).slice(0, 300) };
+  }
+};
+
+/**
+ * #1097 — the ignored paths the turn created, changed or removed: the receipt's finding for work git
+ * would otherwise drop without a word. A reading that failed, before or after, is reported as such.
+ */
+const ignoredChangesOf = async (facts: TurnFacts): Promise<{ paths: string[]; total: number; error: string | null }> => {
+  const after = await readIgnored(facts.repo, facts.baseHead, "observe");
+  if (facts.ignoredBaseline.state === null || after.state === null) {
+    return { paths: [], total: 0, error: facts.ignoredBaseline.error ?? after.error };
+  }
+  const changed = ignoredPathsChanged(facts.ignoredBaseline.state, after.state);
+  return { paths: changed.slice(0, IGNORED_CHANGES_NAMED), total: changed.length, error: null };
+};
 
 const workerPrompt = (facts: TurnFacts): string =>
   [
