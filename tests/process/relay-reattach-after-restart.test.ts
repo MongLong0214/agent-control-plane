@@ -210,10 +210,126 @@ const relay = (paths: { claimPath: string; ctoPath: string; reattachPath: string
   };
 };
 
+/** The answer the relay gives a request it did not send because it is reattaching. */
+const NOT_SENT = { code: RELAY_REATTACHING_ERROR, message: "agent-control-plane is reattaching; this request was not sent" };
+
+/**
+ * Waits until the relay carries requests again, and returns the last thing it answered.
+ *
+ * The relay serves again once its restore is done, and only a request it carries says so. The
+ * daemon's wake endpoint is not that signal: the daemon records it before it answers the replayed
+ * registration, and the relay is reattaching until that answer arrives (`gatedDoor` holds the two
+ * apart). So this sends a `ping` and asks again only while the answer is exactly the "not sent"
+ * refusal, which by the relay's contract left nothing behind. Any other answer ends the wait, and
+ * so does the deadline; either way the last answer is returned, so a refusal at the deadline fails
+ * the caller's assertion rather than passing it.
+ */
+const servedAgain = async (r: ReturnType<typeof relay>, budgetMs = 5_000): Promise<Wire> => {
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    const answer = await r.request("ping", {});
+    if (answer.error?.code !== NOT_SENT.code || answer.error.message !== NOT_SENT.message) return answer;
+    if (Date.now() >= deadline) return answer;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+};
+
+/** The id of a JSON-RPC line, or undefined when it has none or is not JSON. */
+const idOf = (line: string): unknown => {
+  try {
+    return (JSON.parse(line) as { id?: unknown }).id;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * A pipe in front of the real reattach door that can hold back the daemon's answer to a wake
+ * registration, and every line after it on that connection, until released.
+ *
+ * It opens the interval the restart cases used to cross blind: a returning relay replays its wake
+ * registration, the daemon records the endpoint and then answers, and the relay serves again only
+ * once that answer arrives. While it is held, the daemon has the endpoint and the relay is still
+ * reattaching. Everything else passes as it arrived. A connection the door does not take is closed
+ * before any line, which the relay reads as a daemon not back yet.
+ */
+const gatedDoor = async (door: string) => {
+  const path = join(door, "..", "gate.sock");
+  let arming: ((held: { release: () => void }) => void) | null = null;
+  const sockets: Socket[] = [];
+  const eachLine = (socket: Socket, onLine: (line: string) => void): void => {
+    let text = "";
+    socket.on("data", (chunk: Buffer) => {
+      text += chunk.toString("utf8");
+      for (let newline = text.indexOf("\n"); newline >= 0; newline = text.indexOf("\n")) {
+        const line = text.slice(0, newline);
+        text = text.slice(newline + 1);
+        onLine(line);
+      }
+    });
+  };
+  const server = createServer((relaySide) => {
+    const daemonSide = createConnection(door);
+    sockets.push(relaySide, daemonSide);
+    relaySide.on("error", () => undefined);
+    daemonSide.on("error", () => undefined);
+    relaySide.once("close", () => daemonSide.destroy());
+    daemonSide.once("close", () => relaySide.destroy());
+    const registrations = new Set<unknown>();
+    let held: string[] | null = null;
+    eachLine(relaySide, (line) => {
+      const message = JSON.parse(line) as { id?: unknown; method?: string; params?: { name?: string } };
+      if (message.method === "tools/call" && message.params?.name === "role_wake_endpoint_register") registrations.add(message.id);
+      daemonSide.write(`${line}\n`);
+    });
+    eachLine(daemonSide, (line) => {
+      if (held !== null) {
+        held.push(line);
+        return;
+      }
+      const take = arming;
+      if (take === null || !registrations.has(idOf(line))) {
+        relaySide.write(`${line}\n`);
+        return;
+      }
+      arming = null;
+      const queue = [line];
+      held = queue;
+      take({
+        release: () => {
+          held = null;
+          for (const each of queue) relaySide.write(`${each}\n`);
+        },
+      });
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(path, resolve));
+  closers.push(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  return {
+    path,
+    /** Holds the next answer to a wake registration; settles once one is held, or fails at the budget. */
+    holdNextRegistrationAnswer: (budgetMs = 5_000) =>
+      new Promise<{ release: () => void }>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          arming = null;
+          reject(new Error("no answer to a wake registration reached the gate"));
+        }, budgetMs);
+        arming = (held) => {
+          clearTimeout(timer);
+          resolve(held);
+        };
+      }),
+  };
+};
+
 /** Attached, initialized and registered for wake, the state a live canonical CTO is in. */
-const attachedAndRegistered = async () => {
+const attachedAndRegistered = async (gated = false) => {
   const fixture = await started();
-  const r = relay(fixture.paths);
+  const gate = gated ? await gatedDoor(fixture.paths.reattachPath) : null;
+  const r = relay(gate === null ? fixture.paths : { ...fixture.paths, reattachPath: gate.path });
   const init = await r.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: qualified });
   expect(init.error).toBeUndefined();
   r.notify("notifications/initialized");
@@ -223,7 +339,7 @@ const attachedAndRegistered = async () => {
   });
   expect(registered.result?.structuredContent).toMatchObject({ ok: true });
   expect(fixture.daemon.current()?.ctoConversation.endpointFor(CTO)).toBe(fixture.endpoint);
-  return { ...fixture, r };
+  return { ...fixture, r, gate };
 };
 
 const generation = (subject: CanonicalCtoFixture) =>
@@ -238,6 +354,9 @@ describe("a canonical CTO relay across a daemon restart", () => {
     // The restarted daemon learns the wake endpoint from the relay, with no client involvement.
     expect(await until(() => daemon.current()?.ctoConversation.endpointFor(CTO) === endpoint)).toBe(true);
     expect(r.exited()).toBeNull();
+    // The daemon records the endpoint before the relay is serving again (the next case holds the two
+    // apart), so the request below waits for the relay rather than for the endpoint.
+    expect((await servedAgain(r)).error).toBeUndefined();
     const listed = await r.request("tools/list", {});
     expect(listed.result?.tools?.map((tool) => tool.name)).toContain("role_owner_message_claim");
     expect(generation(subject)).toEqual(before);
@@ -248,15 +367,26 @@ describe("a canonical CTO relay across a daemon restart", () => {
   });
 
   it("answers a request sent while it is reattaching with the defined error, and serves the next one", async () => {
-    const { daemon, r } = await attachedAndRegistered();
+    const { daemon, endpoint, gate, r } = await attachedAndRegistered(true);
     await daemon.stop();
     const refused = await r.request("tools/list", {});
     expect(refused.error).toMatchObject({ code: RELAY_REATTACHING_ERROR });
     expect(refused.result).toBeUndefined();
+    const holding = gate!.holdNextRegistrationAnswer();
     await daemon.open();
-    expect(await until(() => daemon.current()?.ctoConversation.endpointFor(CTO) !== null)).toBe(true);
+    const held = await holding;
+    // Held between the daemon recording the replayed endpoint and the relay reading its answer: the
+    // endpoint is back and the relay is still reattaching, so the endpoint is not the relay's
+    // readiness and a request sent now is the defined refusal, never sent.
+    expect(daemon.current()?.ctoConversation.endpointFor(CTO)).toBe(endpoint);
+    const early = await r.request("tools/list", {});
+    expect(early.error).toEqual(NOT_SENT);
+    expect(early.result).toBeUndefined();
+    held.release();
+    expect((await servedAgain(r)).error).toBeUndefined();
     const listed = await r.request("tools/list", {});
     expect(listed.error).toBeUndefined();
+    expect(listed.result?.tools?.map((tool) => tool.name)).toContain("role_owner_message_claim");
     r.stdin.end();
     expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
   });
