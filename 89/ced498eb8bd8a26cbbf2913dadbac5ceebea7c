@@ -1,0 +1,4 @@
+Limit: traceability is 24 of 25 after this change: RF-S25's owner-authority arm still has no label
+Warn: RF-S17's activation arm is traced by the repo-factory wiring test that drives owner approval through COMPLETED and asserts the split: no stored REPO_FACTORY_RESULT carries a cto or doctor key, and BOOTSTRAP_ACTIVATION_RESULT takes primaryCtoBinding from the PRIMARY_CTO that acknowledged the handoff and doctor from its DOCTOR_REPORT; the label rides on those assertions, not on its own
+Record-Id: r-rfs17activationarm
+Provenance: inherited 6adf0d6a6d473223df4556a2e211cc1fc0cc2931
