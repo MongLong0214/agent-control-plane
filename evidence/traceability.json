@@ -3,13 +3,13 @@
     "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
     "docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md"
   ],
-  "measuredAt": "b0187e9d2d13cfebd40c056eb9c715dfa7316d04",
+  "measuredAt": "a34d7c2eafdceb8167e11a27e4c7099a7f10290e (working tree modified)",
   "testRun": {
     "reporter": "vitest-json",
-    "success": true,
-    "total": 4611,
-    "passed": 4599,
-    "failed": 0,
+    "success": false,
+    "total": 5570,
+    "passed": 5461,
+    "failed": 97,
     "pending": 12
   },
   "summary": {
@@ -20,10 +20,8 @@
     "scenariosWithPassedDeclarations": 59,
     "scenariosMissing": [],
     "repoFactoryScenarios": 25,
-    "repoFactoryScenariosWithPassedDeclarations": 14,
+    "repoFactoryScenariosWithPassedDeclarations": 16,
     "repoFactoryScenariosMissing": [
-      "RF-S17",
-      "RF-S22",
       "RF-S25"
     ],
     "repoFactoryScenariosExternal": [
@@ -860,6 +858,26 @@
         {
           "file": "tests/scenarios/github-kernel.test.ts",
           "title": "a CI result belonging to another repository is not evidence for this one"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "RF-S22 arm:validator W1: a candidate that rewrites the gate script a pinned workflow runs is refused before CI is read"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "RF-S22 arm:validator W2: nothing but the declared entry is frozen — project code, tests and dependencies may change"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "RF-S22 arm:validator #1082 R1-03: a primary-only run is not held to a secondary gate its procedure does not run"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "RF-S22 arm:validator #1082 R1-03: a procedure that runs the secondary gate still requires the secondary repository"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "RF-S22 arm:validator #1082 R1-03: a run with both repositories checks and passes both gates"
         },
         {
           "file": "tests/scenarios/github-kernel.test.ts",
@@ -1806,12 +1824,19 @@
               "title": "is rejected by the real overclaim check when a forbidden activation claim is added to genuine producer output"
             }
           ]
+        },
+        {
+          "arm": "activation",
+          "tests": [
+            {
+              "file": "tests/unit/repo-factory-run-wiring.test.ts",
+              "title": "owner approval → CEO confirm → GitHub writes (double) → activation → COMPLETED"
+            }
+          ]
         }
       ],
-      "missingArms": [
-        "activation"
-      ],
-      "status": "DECLARATION_MISSING",
+      "missingArms": [],
+      "status": "DECLARATION_COVERED",
       "external": []
     },
     {
@@ -1910,12 +1935,171 @@
               "title": "CP-HI-03 / RF-S22: a command list that does not match the pinned manifest is refused"
             }
           ]
+        },
+        {
+          "arm": "validator",
+          "tests": [
+            {
+              "file": "tests/scenarios/github-kernel.test.ts",
+              "title": "RF-S22 arm:validator W1: a candidate that rewrites the gate script a pinned workflow runs is refused before CI is read"
+            },
+            {
+              "file": "tests/scenarios/github-kernel.test.ts",
+              "title": "RF-S22 arm:validator W2: nothing but the declared entry is frozen — project code, tests and dependencies may change"
+            },
+            {
+              "file": "tests/scenarios/github-kernel.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-03: a primary-only run is not held to a secondary gate its procedure does not run"
+            },
+            {
+              "file": "tests/scenarios/github-kernel.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-03: a procedure that runs the secondary gate still requires the secondary repository"
+            },
+            {
+              "file": "tests/scenarios/github-kernel.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-03: a run with both repositories checks and passes both gates"
+            },
+            {
+              "file": "tests/unit/a-cleanliness-probe-spends-one-deadline.test.ts",
+              "title": "RF-S22 arm:validator #1082 R3-01: isClean caller timeout also bounds its newly added config discovery"
+            },
+            {
+              "file": "tests/unit/a-cleanliness-probe-spends-one-deadline.test.ts",
+              "title": "RF-S22 arm:validator #1082 R3-01: control -- the slow fixture delays discovery only, so a status-only read stays inside the bound"
+            },
+            {
+              "file": "tests/unit/a-cleanliness-probe-spends-one-deadline.test.ts",
+              "title": "RF-S22 arm:validator #1082 R3-01: a discovery that settles after the deadline is not counted, and status is never started"
+            },
+            {
+              "file": "tests/unit/a-cleanliness-probe-spends-one-deadline.test.ts",
+              "title": "RF-S22 arm:validator #1082 R3-01: a status answer after the shared deadline cannot become success after a scheduling gap"
+            },
+            {
+              "file": "tests/unit/a-cleanliness-probe-spends-one-deadline.test.ts",
+              "title": "RF-S22 arm:validator #1082 R3-01: a settlement exactly at the shared deadline is a timeout, and one just before it is an answer"
+            },
+            {
+              "file": "tests/unit/a-cleanliness-probe-spends-one-deadline.test.ts",
+              "title": "RF-S22 arm:validator #1082 R3-01: a launch instant at or past the shared deadline starts nothing"
+            },
+            {
+              "file": "tests/unit/a-cleanliness-probe-spends-one-deadline.test.ts",
+              "title": "RF-S22 arm:validator #1082 R3-01: real monotonic time after a scheduling pause still cannot become clean"
+            },
+            {
+              "file": "tests/unit/a-patch-read-runs-no-nested-repository-program.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-01: freeze diff must not run a nested repo textconv or clean filter"
+            },
+            {
+              "file": "tests/unit/a-patch-read-runs-no-nested-repository-program.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-01: nested diff external override and policy control"
+            },
+            {
+              "file": "tests/unit/a-patch-read-runs-no-nested-repository-program.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-01: every snapshot, verification, freshness, doctor and blind-review read runs zero nested-configuration programs"
+            },
+            {
+              "file": "tests/unit/a-verification-checkout-owns-its-git-metadata.test.ts",
+              "title": "RF-S22 arm:validator #1082: reading the source for either checkout runs no filter program the candidate selects"
+            },
+            {
+              "file": "tests/unit/every-git-settlement-meets-the-absolute-deadline.test.ts",
+              "title": "RF-S22 arm:validator #1082 R3-01: no process is launched when the gap before launch spends the deadline"
+            },
+            {
+              "file": "tests/unit/every-git-settlement-meets-the-absolute-deadline.test.ts",
+              "title": "RF-S22 arm:validator #1082 R3-01: an actual maxBuffer error delivered beyond endsAt must be GIT_TIMEOUT"
+            },
+            {
+              "file": "tests/unit/trusted-core.test.ts",
+              "title": "RF-S22 arm:validator W4: a manifest without gate entries keeps the digest it had before the field existed"
+            },
+            {
+              "file": "tests/unit/trusted-core.test.ts",
+              "title": "RF-S22 arm:validator W5: a gate entry names a repository-relative file of a known repository by its sha256"
+            },
+            {
+              "file": "tests/unit/trusted-core.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-02: a gate entry is bound to the command that runs it directly, never through selection configuration"
+            },
+            {
+              "file": "tests/unit/trusted-core.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-02: a gate file names its module format in its extension, or is refused with its own code"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator W3: a candidate that rewrites a pinned gate entry to exit 0 is refused before anything runs"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator control: an untouched gate runs and judges the candidate, which may change its own code"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator: a CONTRACT_CHANGE run is judged by the current gate, not the gate it proposes"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator: a helper the entry decides through is bound only when it is declared"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-02: package type can change the verdict of an unchanged self-contained js gate"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-02: every declared executable helper must use .mjs or .cjs, without a fallback loader"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-02: the loader fails closed: no registerHooks, no gate; and no worker thread"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-02: a normal gate with only declared helpers passes while the project's own package.json changes"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator W5: a pinned gate entry absent at the candidate head is refused, not skipped"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator: a symlink whose stored bytes equal the pinned digest is refused as not a regular file"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator: an entry that cannot be compared is refused as unverified, not compared"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator #1082: a replace ref planted and removed around preparation cannot either"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator #1082: a textconv program the candidate selects never runs while the candidate is frozen"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator #1082: a populated submodule's own filter never runs while the source is read"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator #1082 R1-01: a populated submodule's own textconv and external diff never run while the candidate is frozen or verified"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator #1082: a gate that preparation writes differently from its pin is refused before it runs"
+            },
+            {
+              "file": "tests/unit/verify-r2.test.ts",
+              "title": "RF-S22 arm:validator #1082: each gate command is checked immediately before it runs, after every earlier command"
+            }
+          ]
         }
       ],
-      "missingArms": [
-        "validator"
-      ],
-      "status": "DECLARATION_MISSING",
+      "missingArms": [],
+      "status": "DECLARATION_COVERED",
       "external": []
     },
     {
