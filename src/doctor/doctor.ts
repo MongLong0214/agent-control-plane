@@ -664,7 +664,8 @@ export class Doctor {
     }
 
     // The CEO role has no project scope but must exist for notifications to land.
-    if (!this.bindings.active(roleKeyFor(Role.CEO))) {
+    const ceo = this.bindings.active(roleKeyFor(Role.CEO));
+    if (!ceo) {
       findings.push({
         code: "CEO_ROLE_UNBOUND",
         severity: "WARN",
@@ -674,6 +675,32 @@ export class Doctor {
         observedEvidence: {},
         recommendedAction: "bind the CEO role so production-ready notifications are deliverable",
       });
+    } else {
+      // #1112 — the Buzz peer rule reads the CEO's identity off the binding's live runtime
+      // (`buzzPeerRegistry.currentCeo`), so a READY/DRAINING CEO runtime with no `buzz_actor_id`
+      // has every CEO->CTO peer mention refused, and only the subscriber's rejection counters said
+      // so. Same session and lifecycle the peer rule reads; a runtime that is not live is a dead
+      // CEO, a different repair, and is left to the session checks.
+      const runtime = this.sessions.get(ceo.sessionId);
+      const live = runtime?.lifecycle === SessionLifecycle.READY || runtime?.lifecycle === SessionLifecycle.DRAINING;
+      if (runtime && live && runtime.buzzActorId === null) {
+        findings.push({
+          code: "CEO_BUZZ_IDENTITY_UNBOUND",
+          severity: "WARN",
+          scope: "global",
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: {
+            sessionId: ceo.sessionId,
+            bindingGeneration: ceo.bindingGeneration,
+            lifecycle: runtime.lifecycle,
+            buzzActorId: null,
+          },
+          recommendedAction:
+            "bind the CEO runtime's Buzz identity (the possession-proven key rebind); until then " +
+            "every CEO->CTO peer mention is refused",
+        });
+      }
     }
     return findings;
   }
