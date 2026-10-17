@@ -31,10 +31,14 @@ import { ReasonCode } from "../core/reason-codes.ts";
  *                        (`actor_target_bindings.target_locator_digest`, written from the Gateway
  *                        readback or the target-bind receipt), so the two are the same function's
  *                        output by construction, not by a second implementation agreeing.
- *   principal            "owner" | "peer"; only "owner" may mutate (an unknown value is refused)
+ *   principal            "owner" | "peer"; any other value is refused. A peer may mutate only as
+ *                        `admitPeerTurn` below allows (CEO ad57675b)
  *   cron                 boolean; only `false` may mutate
  *   delegation_depth     integer; 0 is a top-level turn, > 0 a subagent; only 0 may mutate, and a
  *                        missing value is refused rather than read as 0
+ *   peer_grant           `sha256:<64 hex>`, a peer turn only: the digest of the Hermes peer policy
+ *                        applied to this call. Checked for shape and recorded, never compared:
+ *                        what it names is Hermes's half of the delegation
  *   session_key, platform, chat_id, parent_chat_id
  *                        carried, not compared. `parent_chat_id` in particular is not a subagent
  *                        signal: a delegate worker inherits its parent's context unchanged, so its
@@ -66,8 +70,45 @@ export const HERMES_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "continuity_status",
 ]);
 
-const refuse = (message: string): Decision<void> =>
-  deny(ReasonCode.MCP_TOOL_PROVENANCE_REFUSED, message, {});
+/**
+ * The tools a peer turn of the CEO binding may call (CEO ad57675b): a fixed set, so a tool added
+ * later, and every tool not named here — run_cancel, run_priority_set, cto_*, repair_execute,
+ * doctor_run, owner_decision_submit — stays the owner's alone. Hermes narrows this further by its own
+ * configured allowlist; neither side's permission alone executes anything.
+ */
+export const HERMES_PEER_DELEGABLE_TOOLS: ReadonlySet<string> = new Set([
+  "escalation_resolve",
+  "ceo_decision_submit",
+  "run_create",
+  "run_dispatch",
+]);
+
+/** The decisions a peer turn may submit; OWNER_DECISION_REQUIRED and anything else are the owner's. */
+export const HERMES_PEER_CEO_DECISIONS: ReadonlySet<string> = new Set(["FINAL_REVISE", "CONFIRM"]);
+
+/** The call being admitted: the tool's name and the arguments the SDK parsed for its handler. */
+export interface HermesToolCall {
+  tool: string;
+  arguments: unknown;
+}
+
+/** Which turn an admitted call was made by, recorded with the mutation's own audit evidence. */
+export interface HermesAdmittedTurn {
+  principal: "owner" | "peer";
+  /** The peer grant the call carried; `null` for the owner, whose turn needs none. */
+  peerGrant: string | null;
+}
+
+/** The bounded audit fields for an admitted turn: two values, never the provenance object itself. */
+export const hermesTurnEvidence = (
+  turn: HermesAdmittedTurn | undefined,
+): { hermesPrincipal?: HermesAdmittedTurn["principal"]; hermesPeerGrant?: string | null } =>
+  turn === undefined ? {} : { hermesPrincipal: turn.principal, hermesPeerGrant: turn.peerGrant };
+
+const PRINCIPALS: ReadonlySet<unknown> = new Set(["owner", "peer"]);
+
+const refuse = (message: string): Decision<never> =>
+  deny<never>(ReasonCode.MCP_TOOL_PROVENANCE_REFUSED, message, {});
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   if (typeof value !== "object") return false;
@@ -76,21 +117,49 @@ const isRecord = (value: unknown): value is Record<string, unknown> => {
 };
 
 /**
- * Admits one mutation call, or refuses it with nothing written.
+ * A peer turn's own conditions, asked only after every condition an owner's turn meets has passed.
+ *
+ * The one argument read anywhere in admission is `ceo_decision_submit`'s `decision`, and only here:
+ * it is what the call asks to do, not who is asking, and it can only refuse. `call.arguments` is the
+ * object the SDK parsed for the handler, so the decision checked is the decision executed.
+ */
+const admitPeerTurn = (
+  provenance: Record<string, unknown>,
+  call: HermesToolCall | undefined,
+): Decision<HermesAdmittedTurn> => {
+  const peerGrant = provenance["peer_grant"];
+  if (!isDigest(peerGrant)) return refuse("a peer's turn carries no well-formed peer_grant digest");
+  if (call === undefined) return refuse("a peer's turn may call only a delegable tool, and this call names none");
+  if (!HERMES_PEER_DELEGABLE_TOOLS.has(call.tool)) return refuse("this tool is not delegable to a peer's turn");
+  if (call.tool === "ceo_decision_submit") {
+    const decision = isRecord(call.arguments) ? call.arguments["decision"] : undefined;
+    if (typeof decision !== "string") return refuse("a peer's ceo_decision_submit names no decision");
+    if (!HERMES_PEER_CEO_DECISIONS.has(decision)) {
+      return refuse("a peer's turn may submit only FINAL_REVISE or CONFIRM");
+    }
+  }
+  return allow<HermesAdmittedTurn>(ReasonCode.OK, { principal: "peer", peerGrant });
+};
+
+/**
+ * Admits one mutation call, or refuses it with nothing written, and answers with the turn admitted.
  *
  * `meta` is the request's `params._meta` exactly as the SDK delivered it; `anchor` is what the
- * connection's admission read from the binding, `null` when there is nothing to compare against.
+ * connection's admission read from the binding, `null` when there is nothing to compare against;
+ * `call` is the tool and its parsed arguments. An owner's turn never needs `call`; a peer's turn
+ * without it is refused.
  */
 export const admitHermesProvenance = (
   meta: unknown,
   anchor: HermesProvenanceAnchor | null,
-): Decision<void> => {
+  call?: HermesToolCall,
+): Decision<HermesAdmittedTurn> => {
   if (anchor === null) return refuse("this channel's runtime does not hold the live CEO binding");
   if (!isRecord(meta)) return refuse("the call carries no provenance");
   if (!Object.hasOwn(meta, HERMES_PROVENANCE_META_KEY)) return refuse("the call carries no provenance");
   const provenance = meta[HERMES_PROVENANCE_META_KEY];
   if (!isRecord(provenance)) return refuse("the call's provenance is not an object");
-  if (provenance["principal"] !== "owner") return refuse("only the owner's turn may mutate");
+  if (!PRINCIPALS.has(provenance["principal"])) return refuse("only the owner's or a delegated peer's turn may mutate");
   if (provenance["cron"] !== false) return refuse("a scheduled turn may not mutate");
   if (provenance["delegation_depth"] !== 0) return refuse("only a top-level turn may mutate");
   if (typeof provenance["session_id"] !== "string") return refuse("the call names no Hermes session");
@@ -101,5 +170,6 @@ export const admitHermesProvenance = (
   if (provenance["lineage_root_digest"] !== anchor.lineageRootDigest) {
     return refuse("the call's lineage root is not the bound lineage");
   }
-  return allow(ReasonCode.OK, undefined);
+  if (provenance["principal"] === "peer") return admitPeerTurn(provenance, call);
+  return allow<HermesAdmittedTurn>(ReasonCode.OK, { principal: "owner", peerGrant: null });
 };

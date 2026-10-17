@@ -33,6 +33,7 @@ import type { RunEngine, CompletionAuthoritySet } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { CeoDecisionIngress, ManifestActivationGrants } from "../registry/manifest-activation-grants.ts";
+import { type HermesAdmittedTurn, hermesTurnEvidence } from "../mcp/hermes-provenance.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { ContinuityGate } from "../run/run-engine.ts";
@@ -186,6 +187,8 @@ export interface CeoDecisionInput {
    * in-process caller has none and issues no grant.
    */
   ingress?: CeoDecisionIngress;
+  /** The Hermes turn the CEO door admitted this call for, recorded in the decision's audit row. */
+  hermesTurn?: HermesAdmittedTurn;
 }
 
 /** #246 B2-b — the grant authority a CONTRACT_CHANGE CONFIRM admits against and issues through. */
@@ -718,6 +721,7 @@ export class ProductionGate {
             rationale: input.rationale,
             // Traceability only; the grant row is what activation reads, never this.
             ...(grantDigest === null ? {} : { manifestActivationGrantDigest: grantDigest }),
+            ...hermesTurnEvidence(input.hermesTurn),
           },
         });
         this.telemetry.record({
@@ -776,6 +780,7 @@ export class ProductionGate {
           grantId: bound.value.grantId,
           consumer: bound.value.consumer,
           rationale: input.rationale,
+          ...hermesTurnEvidence(input.hermesTurn),
         },
       });
       return allow(ReasonCode.OK, { state: run.state });
@@ -1969,7 +1974,7 @@ export class ProductionGate {
     runId: string,
     resolution: string,
     byCeoSession: string,
-    target?: { escalationId: number; idempotencyKey?: string },
+    target?: { escalationId: number; idempotencyKey?: string; hermesTurn?: HermesAdmittedTurn },
   ): Decision<EscalationResolution> {
     return this.db.txDecision(() => {
       const run = this.runs.get(runId);
@@ -2035,6 +2040,7 @@ export class ProductionGate {
           resolutionLength: resolution.length,
           messageId,
           ...(request ?? {}),
+          ...hermesTurnEvidence(target?.hermesTurn),
         },
       });
       if (target && !recorded.allowed) return recorded as Decision<EscalationResolution>;

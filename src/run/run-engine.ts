@@ -36,6 +36,7 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { TaskGraph } from "./task-graph.ts";
+import { type HermesAdmittedTurn, hermesTurnEvidence } from "../mcp/hermes-provenance.ts";
 
 /** PRD §13.1 — the authoritative specification Hermes writes. */
 export interface TaskContract {
@@ -114,6 +115,8 @@ export interface CreateRunInput {
     baseBranch: string;
     mergeOrder?: number;
   }>;
+  /** The Hermes turn the CEO door admitted this call for, recorded in RUN_CREATED; absent in process. */
+  hermesTurn?: HermesAdmittedTurn;
 }
 
 /** Provisioning a primary CTO belongs to the CTO lifecycle; the run engine only asks. */
@@ -339,6 +342,7 @@ export class RunEngine {
           contractDigest,
           humanGate: humanGate.items,
           humanGateRequired: humanGate.required,
+          ...hermesTurnEvidence(input.hermesTurn),
         },
       });
 
@@ -353,7 +357,8 @@ export class RunEngine {
    * claims, merges, receipts — is authorised against that pin, so the checks here are
    * the ones that keep a run from ever being owned by a stale or absent binding.
    */
-  async dispatch(runId: string): Promise<Decision<RunRow>> {
+  /** `hermesTurn` is the Hermes turn the CEO door admitted, recorded in this call's audit evidence. */
+  async dispatch(runId: string, options: { hermesTurn?: HermesAdmittedTurn } = {}): Promise<Decision<RunRow>> {
     const run = this.get(runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
     if (run.state !== RunState.QUEUED && run.state !== RunState.REVISION_REQUIRED) {
@@ -412,7 +417,7 @@ export class RunEngine {
           runId,
           projectId: run.projectId,
           reasonCode: ReasonCode.RUN_DISPATCH_BLOCKED_CTO_DRAINING,
-          evidence: {},
+          evidence: { ...hermesTurnEvidence(options.hermesTurn) },
         });
         return deny(
           ReasonCode.RUN_DISPATCH_BLOCKED_CTO_DRAINING,
@@ -462,7 +467,7 @@ export class RunEngine {
 
     let activated: Decision<RunRow>;
     try {
-      activated = this.activateDispatched(runId, binding, staffed);
+      activated = this.activateDispatched(runId, binding, staffed, options.hermesTurn);
     } catch (error) {
       if (staffed) await this.#bootstrapCto!.discard(staffed, "bootstrap dispatch failed");
       throw error;
@@ -481,6 +486,7 @@ export class RunEngine {
     runId: string,
     provisioned: RoleBinding | null,
     staffed: BootstrapCtoStaffedSession | null,
+    hermesTurn: HermesAdmittedTurn | undefined,
   ): Decision<RunRow> {
     return this.db.txDecision(() => {
       const fresh = this.require(runId);
@@ -517,6 +523,7 @@ export class RunEngine {
             evidence: {
               ownerBindingGeneration: binding?.bindingGeneration ?? null,
               pinnedManifestDigest: effectiveManifest,
+              ...hermesTurnEvidence(hermesTurn),
             },
           });
           return allow(ReasonCode.OK, undefined);
