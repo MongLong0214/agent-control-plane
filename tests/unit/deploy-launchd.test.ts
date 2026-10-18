@@ -196,6 +196,12 @@ case "$account" in
   # The packet reviewer's private Codex home override is optional: no item unless a row stores one.
   ACP_REVIEWER_CODEX_HOME) [[ -n "\${ACP_FAKE_REVIEWER_CODEX_HOME:-}" ]] || exit 44
                            printf '%s\\n' "$ACP_FAKE_REVIEWER_CODEX_HOME" ;;
+  # CommitLore's pin (#246 B3) is optional: no item unless a row stores one, so the catch-all cannot
+  # answer for it, and a row can make the lookup itself fail with a status other than 44.
+  ACP_COMMITLORE_BINARY)
+    [[ -z "\${ACP_FAKE_COMMITLORE_LOOKUP_STATUS:-}" ]] || exit "$ACP_FAKE_COMMITLORE_LOOKUP_STATUS"
+    [[ -n "\${ACP_FAKE_COMMITLORE_BINARY_ITEM:-}" ]] || exit 44
+    printf '%s\\n' "$ACP_FAKE_COMMITLORE_BINARY_ITEM" ;;
   ACP_CANONICAL_*)
     case ",\${ACP_CANONICAL_KEYCHAIN_ACCOUNTS:-}," in
       *,"$account",*) ;;
@@ -2155,23 +2161,177 @@ exec /bin/cp "$@"
     expect(seen.started, "a pinned provider CLI did not start").toBe("started,started,started");
   });
 
-  it("B3-PIN hands the daemon an operator-supplied ACP_COMMITLORE_BINARY unchanged, over the baked pin", () => {
-    const harness = makeHarness();
+  /**
+   * The operator's persistent ACP_COMMITLORE_BINARY is the Keychain item: the plist carries no such
+   * variable, so a value in an installing shell never reaches a daemon launchd starts. These rows run
+   * the rendered launcher twice against the same Keychain stub and report what the daemon was handed
+   * each time — that the value is kept across re-execution of the launcher. It is not a launchd
+   * restart test: no launchd is involved.
+   *
+   * What the daemon was handed is reported as a label, never as the value, so neither a pass nor a
+   * failure prints what the Keychain held; `keychainValue` is checked against the launcher's stderr the
+   * same way.
+   */
+  const commitloreAcrossReexecution = (
+    harness: InstallerHarness,
+    candidates: Record<string, string>,
+    keychainValue?: string,
+  ) => {
+    rmSync(harness.securityLog, { force: true });
+    const runs = [1, 2].map(() => {
+      rmSync(harness.launcherEnvLog, { force: true });
+      const launched = runGeneratedLauncher(harness);
+      const handed = launched.status === 0 ? launcherObservations(harness).commitlore : undefined;
+      return {
+        status: launched.status,
+        handed:
+          handed === undefined
+            ? "nothing: the launcher did not reach the daemon"
+            : handed === "<unset>"
+              ? "unset"
+              : (Object.entries(candidates).find(([, value]) => value === handed)?.[0] ?? "something else"),
+        stderrNamesTheKeychainValue: keychainValue !== undefined && launched.stderr.includes(keychainValue),
+        reportsAFailedLookup: launched.stderr.includes("the Keychain lookup for ACP_COMMITLORE_BINARY failed"),
+      };
+    });
+    // The launcher's lookups only: the log was cleared after the install, which asks for other accounts.
+    const lookups = existsSync(harness.securityLog)
+      ? readFileSync(harness.securityLog, "utf8")
+          .split("\n")
+          .filter((line) => line.endsWith(" -a ACP_COMMITLORE_BINARY")).length
+      : 0;
+    return { runs, lookups };
+  };
+
+  /** Installs with `commitlore` resolvable, so that a baked pin exists for an operator value to win over. */
+  const installWithCommitlorePin = (harness: InstallerHarness): string => {
     const cli = cliDirectories(harness, "commitlore");
     expect(installWithPins(harness).status).toBe(0);
-    // Precedence is only measured if there is something to take precedence over.
     expect(readFileSync(launcherPath(harness), "utf8").split("\n")).toContain(
       `ACP_RESOLVED_COMMITLORE_BINARY=${cli["commitlore"]}`,
     );
+    return cli["commitlore"] as string;
+  };
 
-    // Wrong values on purpose. The launcher neither vets an operator's value nor replaces it with the
-    // path it resolved or with a PATH search; the daemon's own pin checks are what refuse it.
-    for (const operatorValue of [join(harness.home, "operator-named", "commitlore"), "commitlore"]) {
-      rmSync(harness.launcherEnvLog, { force: true });
-      harness.env["ACP_COMMITLORE_BINARY"] = operatorValue;
-      const launched = runGeneratedLauncher(harness);
-      expect(launched.status, launched.stderr).toBe(0);
-      expect(launcherObservations(harness).commitlore, "the operator's value was replaced").toBe(operatorValue);
+  it("B3-PIN-R1 keeps a Keychain ACP_COMMITLORE_BINARY that names a CommitLore across re-execution, over the baked pin", () => {
+    const harness = makeHarness();
+    const resolved = installWithCommitlorePin(harness);
+    const operatorDirectory = join(harness.home, "operator-cli");
+    mkdirSync(operatorDirectory, { recursive: true });
+    const operator = writeProviderCli(join(operatorDirectory, "commitlore"), SELF_CONTAINED_CLI);
+    harness.env["ACP_FAKE_COMMITLORE_BINARY_ITEM"] = operator;
+
+    const kept = commitloreAcrossReexecution(harness, { "the Keychain value": operator, "the baked pin": resolved }, operator);
+    const expected = {
+      status: 0,
+      handed: "the Keychain value",
+      stderrNamesTheKeychainValue: false,
+      reportsAFailedLookup: false,
+    };
+    expect(kept.runs).toEqual([expected, expected]);
+    expect(kept.lookups, "the launcher did not ask the Keychain on every launch").toBe(2);
+  });
+
+  it("B3-PIN-R1 keeps a wrong Keychain ACP_COMMITLORE_BINARY unchanged across re-execution and never replaces it with the baked pin", () => {
+    const harness = makeHarness();
+    const resolved = installWithCommitlorePin(harness);
+    const notExecutable = join(harness.home, "operator-not-executable", "commitlore");
+    mkdirSync(dirname(notExecutable), { recursive: true });
+    writeFileSync(notExecutable, SELF_CONTAINED_CLI, { mode: 0o600 });
+
+    // Missing, relative (a bare name) and not executable. The launcher examines none of them; the
+    // daemon's own pin checks are what refuse each one.
+    const wrong = {
+      "a missing absolute path": join(harness.home, "operator-named-nothing", "commitlore"),
+      "a bare name": "commitlore",
+      "a non-executable file": notExecutable,
+    };
+    for (const [kind, value] of Object.entries(wrong)) {
+      harness.env["ACP_FAKE_COMMITLORE_BINARY_ITEM"] = value;
+      const kept = commitloreAcrossReexecution(harness, { "the Keychain value": value, "the baked pin": resolved }, value);
+      const expected = {
+        status: 0,
+        handed: "the Keychain value",
+        stderrNamesTheKeychainValue: false,
+        reportsAFailedLookup: false,
+      };
+      expect(kept.runs, kind).toEqual([expected, expected]);
+      expect(kept.lookups, kind).toBe(2);
+    }
+  });
+
+  it("B3-PIN-R1 hands the daemon the baked pin across re-execution when the Keychain has no ACP_COMMITLORE_BINARY", () => {
+    const harness = makeHarness();
+    const resolved = installWithCommitlorePin(harness);
+
+    const kept = commitloreAcrossReexecution(harness, { "the baked pin": resolved });
+    const expected = { status: 0, handed: "the baked pin", stderrNamesTheKeychainValue: false, reportsAFailedLookup: false };
+    expect(kept.runs).toEqual([expected, expected]);
+    // The pin applied because the Keychain was asked and had no item, not because it was never asked.
+    expect(kept.lookups, "the launcher did not ask the Keychain on every launch").toBe(2);
+  });
+
+  /**
+   * ACP1152-R1: ACP_RESOLVED_COMMITLORE_BINARY is the launcher's own internal name, and a value of it
+   * inherited from launchd (`launchctl setenv`) is not an install's answer. Both sides start from a fake
+   * one in the parent environment, naming a real absolute executable, with no operator value in the
+   * parent environment or the Keychain.
+   */
+  const injectInheritedResolvedPin = (harness: InstallerHarness): string => {
+    const injectedDirectory = join(harness.home, "injected-cli");
+    mkdirSync(injectedDirectory, { recursive: true });
+    const injected = writeProviderCli(join(injectedDirectory, "commitlore"), SELF_CONTAINED_CLI);
+    harness.env["ACP_RESOLVED_COMMITLORE_BINARY"] = injected;
+    return injected;
+  };
+
+  it("ACP1152-R1 replaces an inherited ACP_RESOLVED_COMMITLORE_BINARY with the pin this install resolved, across re-execution", () => {
+    const harness = makeHarness();
+    const resolved = cliDirectories(harness, "commitlore")["commitlore"] as string;
+    const injected = injectInheritedResolvedPin(harness);
+
+    expect(installWithPins(harness).status).toBe(0);
+    expect(readFileSync(launcherPath(harness), "utf8").split("\n")).toContain(
+      `ACP_RESOLVED_COMMITLORE_BINARY=${resolved}`,
+    );
+
+    const kept = commitloreAcrossReexecution(harness, { "the baked pin": resolved, "the inherited internal value": injected });
+    const expected = { status: 0, handed: "the baked pin", stderrNamesTheKeychainValue: false, reportsAFailedLookup: false };
+    expect(kept.runs, "the daemon was not handed the pin this install resolved").toEqual([expected, expected]);
+    expect(kept.lookups, "the launcher did not ask the Keychain on every launch").toBe(2);
+  });
+
+  it("ACP1152-R1 gives the daemon no CommitLore pin from an inherited ACP_RESOLVED_COMMITLORE_BINARY when commitlore did not resolve", () => {
+    const harness = makeHarness();
+    // The reproduced case: no commitlore on the installer's PATH, so no baked line to overwrite the
+    // inherited value.
+    cliDirectories(harness);
+    assertProviderUnresolvable(harness, "commitlore");
+    const injected = injectInheritedResolvedPin(harness);
+
+    expect(installWithPins(harness).status).toBe(0);
+    expect(readFileSync(launcherPath(harness), "utf8"), "the precondition is a launcher with no baked pin").not.toMatch(
+      /^ACP_RESOLVED_COMMITLORE_BINARY=/m,
+    );
+
+    const kept = commitloreAcrossReexecution(harness, { "the inherited internal value": injected });
+    const expected = { status: 0, handed: "unset", stderrNamesTheKeychainValue: false, reportsAFailedLookup: false };
+    expect(kept.runs, "an inherited internal variable reached the daemon as its CommitLore pin").toEqual([expected, expected]);
+    expect(kept.lookups, "the launcher did not ask the Keychain on every launch").toBe(2);
+  });
+
+  it("B3-PIN-R1 withholds the baked pin across re-execution when the Keychain lookup fails, and says so", () => {
+    const harness = makeHarness();
+    const resolved = installWithCommitlorePin(harness);
+
+    // 44 is the stub's (and `security`'s) "no such item". Anything else is a lookup that did not
+    // answer, which may be hiding a value the operator chose, so the resolved pin must not stand in.
+    for (const status of ["36", "1"]) {
+      harness.env["ACP_FAKE_COMMITLORE_LOOKUP_STATUS"] = status;
+      const kept = commitloreAcrossReexecution(harness, { "the baked pin": resolved });
+      const expected = { status: 0, handed: "unset", stderrNamesTheKeychainValue: false, reportsAFailedLookup: true };
+      expect(kept.runs, `security exit ${status}`).toEqual([expected, expected]);
+      expect(kept.lookups, `security exit ${status}`).toBe(2);
     }
   });
 

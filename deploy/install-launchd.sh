@@ -377,7 +377,9 @@ write_launcher() {
   # (src/bootstrap/commitlore-pin.ts), so a launcher that never sets it refuses every bootstrap
   # CommitLore observation. It is not a provider: it has no quota, and its notice says what an absent
   # pin does instead. Pinning it delivers the path and nothing more — the daemon still vets the pin
-  # with its own checks, and a bootstrap can still refuse for reasons a pin does not touch.
+  # with its own checks, and a bootstrap can still refuse for reasons a pin does not touch. This pin is
+  # the fallback, not the operator's channel: an operator's persistent value is the Keychain item
+  # ACP_COMMITLORE_BINARY, which the launcher reads on every launch and which wins over it.
   local spec cli pin_variable resolved_cli
   local cli_pins=()
   for spec in claude:ACP_RESOLVED_CLAUDE_BINARY codex:ACP_RESOLVED_CODEX_BINARY grok:ACP_RESOLVED_GROK_BINARY \
@@ -410,6 +412,12 @@ write_launcher() {
     if [[ -n "$resolved_buzz" ]]; then
       printf 'ACP_RESOLVED_BUZZ_BINARY=%q\n' "$resolved_buzz"
     fi
+    # ACP_RESOLVED_COMMITLORE_BINARY is this install's answer and nothing else's. Without this line a
+    # launcher written where `commitlore` did not resolve carries no assignment for it, and the
+    # promotion below would consume a value of that name inherited from launchd (`launchctl setenv`)
+    # — a pin no operator stored and no install resolved. Cleared before the baked line, so the
+    # resolved pin is exactly what this install wrote, or nothing.
+    printf 'unset ACP_RESOLVED_COMMITLORE_BINARY\n'
     local pin
     if [[ ${#cli_pins[@]} -gt 0 ]]; then
       for pin in "${cli_pins[@]}"; do
@@ -451,10 +459,19 @@ required_keychain_value() {
   printf '%s' "$value"
 }
 
+# Every failed lookup leaves the account unset, whatever the failure — no item and a `security` that
+# could not answer alike — and nothing is reported. optional_keychain_status keeps the exit status of
+# the last lookup (0 when it answered) so that a caller with a fallback can tell the two apart; it
+# changes nothing for an account whose caller does not read it.
+optional_keychain_status=0
 optional_keychain_value() {
   local account="$1" value=""
   unset "$account"
-  value="$(security find-generic-password -w -s "$ACP_KEYCHAIN_SERVICE" -a "$account" 2>/dev/null)" || return 0
+  optional_keychain_status=0
+  value="$(security find-generic-password -w -s "$ACP_KEYCHAIN_SERVICE" -a "$account" 2>/dev/null)" || {
+    optional_keychain_status=$?
+    return 0
+  }
   [[ -n "$value" ]] || return 0
   printf -v "$account" '%s' "$value"
   export "$account"
@@ -529,6 +546,10 @@ for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_
   ACP_REVIEWER_CODEX_HOME; do
   optional_keychain_value "$optional"
 done
+# ACP_COMMITLORE_BINARY is an optional account like the others and goes through the same loader, but on
+# its own line, so that the status the CommitLore block below reads is this lookup's and no other's.
+optional_keychain_value ACP_COMMITLORE_BINARY
+commitlore_keychain_status="$optional_keychain_status"
 buzz_key_from_desktop_secrets
 
 # Reviewer credential scopes are paths, not secrets, so they are derived rather than fetched
@@ -569,12 +590,24 @@ fi
 if [[ -z "${ACP_GROK_BINARY:-}" && -n "${ACP_RESOLVED_GROK_BINARY:-}" ]]; then
   export ACP_GROK_BINARY="$ACP_RESOLVED_GROK_BINARY"
 fi
-# The CommitLore CLI resolved at install time, by the same rule (#246 B3). ACP_COMMITLORE_BINARY is
-# the only input the daemon reads for it, and the daemon searches no PATH for it. An operator-supplied
-# value wins and is passed through unexamined: a wrong one is refused by the daemon's own pin checks,
-# never replaced here. This delivers the pin; it does not make a bootstrap succeed.
-if [[ -z "${ACP_COMMITLORE_BINARY:-}" && -n "${ACP_RESOLVED_COMMITLORE_BINARY:-}" ]]; then
-  export ACP_COMMITLORE_BINARY="$ACP_RESOLVED_COMMITLORE_BINARY"
+# The CommitLore CLI (#246 B3). ACP_COMMITLORE_BINARY is the only input the daemon reads for it, and the
+# daemon searches no PATH for it. The operator's persistent value is the Keychain item of that name: it
+# is read on every launch, as ACP_BUZZ_BINARY is, and exported unchanged. A wrong one is refused by the
+# daemon's own pin checks and is never replaced here. Only when there is no item does the path resolved
+# at install time apply.
+#
+# A lookup that failed is not "no item". 44 is what `security` exits with when the item is not there;
+# any other failure leaves the variable unset, as the loader leaves every optional account, and the
+# resolved pin is withheld too, because a Keychain that could not answer may hold a value the operator
+# chose. The daemon then refuses each bootstrap CommitLore observation, and this line says why without
+# naming any value. This delivers the pin; it does not make a bootstrap succeed.
+if [[ -z "${ACP_COMMITLORE_BINARY:-}" ]]; then
+  if [[ "$commitlore_keychain_status" != 0 && "$commitlore_keychain_status" != 44 ]]; then
+    printf 'agentcpd launcher: the Keychain lookup for ACP_COMMITLORE_BINARY failed (security exit %s); the resolved pin is withheld and bootstrap CommitLore observations will refuse\n' \
+      "$commitlore_keychain_status" >&2
+  elif [[ -n "${ACP_RESOLVED_COMMITLORE_BINARY:-}" ]]; then
+    export ACP_COMMITLORE_BINARY="$ACP_RESOLVED_COMMITLORE_BINARY"
+  fi
 fi
 
 exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"
