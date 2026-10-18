@@ -1,0 +1,53 @@
+Limit: OWNER_DECISION approvals recorded before this change carry the old service label and no longer count; once their ingress row is pruned they are indistinguishable from the forgery, so a pending run needs a new owner decision
+Limit: a writer holding ACP's own raw database handle can still write the canonical label, the same boundary inbound_messages has; closing it needs a trigger and therefore a migration
+Warn: an owner decision counts only as the canonical OWNER_DECISION artifact the production gate writes through its own capability (produced_by production-gate:owner-decision) in the transaction that admits and consumes the receipt; OWNER_APPROVAL_CONSUMED and OWNER_DECISION audit rows neither satisfy an item nor remove a recorded decision, because a connection ACP did not open can insert them
+Record-Id: r-6a55371c74d4
+Provenance: inherited 7dab783a725c769e3199702481659e2aeda222cd
+
+Limit: until the v47 authority guard lands, an in-process Db.run insert can still forge the canonical label; the two ODV47-KNOWN-FAIL tests record that and are not a security pass
+Warn: a refusal can only withhold, so an OWNER_DECISION refusal exactly bound to the current item, run, operation, gate and candidate counts whatever its producer label, and a legacy refusal is never discarded; a refusal bound to anything else is not read, and an approval counts only as the canonical record, a legacy one being reported back as decideAgain
+Record-Id: r-e8136bf6b229
+Provenance: inherited 933c545f33e2a6bf48ed6127b910486479d0c67b
+
+Limit: tests/process/the-schema-probe-puts-the-file-back.test.ts clones the committed HEAD, so it can only confirm this freeze after the commit; it is run after committing
+Warn: released v46 now reads only src/db/schema-v46.sql, a byte-for-byte copy of schema.sql at 2ef0d0cf; its checksum stays the full sha256:aa2aa099fe49482d7c9ae5e32ffc6a587287e5cdd9e97b44e268a22a3883e04a, so the next migration may change schema.sql without changing what v46 installs
+Record-Id: r-07dcf9c8265f
+Provenance: inherited 772459ca68ef271d2d8a3a5860fc4030f93a6003
+
+Limit: a connection that defines acp_evidence_write_authorized itself is outside this guard, and an ordinary Db.run can still set superseded = 1 on an owner refusal so an earlier approval decides again; the second gap needs a supersede-path design decision
+Warn: v47 guards run_artifacts inserts of an APPROVAL carrying the canonical owner-decision label, or any top-level content kind member equal to OWNER_DECISION (read through json_each so a duplicate key cannot hide it), with the connection-local authority marker; only exactly 1 passes, so NULL, a missing function or an error refuses; rows written before v47 are untouched
+Record-Id: r-e2aae5190f09
+Provenance: inherited faa829ec3fecaa5d5aca6cd41160d2f464c4a24f
+
+Limit: the schema-probe process test clones the committed HEAD, so this freeze can only be confirmed by it after the commit; it is run after committing
+Warn: released v47 now reads only src/db/schema-v47.sql, a byte-for-byte copy of schema.sql at faa829ec; its checksum stays the full sha256:f9b2370034620dc56f825fd9119fedd22ba76a46261c64684446992a48958b49, so v48 may change schema.sql without changing what v47 installs
+Record-Id: r-a465576b41e2
+Provenance: inherited 05b46d767130398ff6f852e4d7f9732258ab93e1
+
+Limit: a connection that defines the marker as 1 can still withdraw a refusal and the gate then reads satisfied; that foreign-connection boundary stays a stated Limit
+Warn: v48 makes the one-way superseded mark on an OWNER_DECISION APPROVAL (canonical label or OWNER_DECISION content, so legacy service refusals too) need the connection-local marker, exactly 1 and fail-closed; only the run engine's candidate staleness marks hold it, for their one statement, because the mark removes a decision's effect as surely as a delete
+Warn: on a connection with recursive_triggers off (SQLite's default) an insert naming a decision's rowid or UPDATE OR REPLACE … SET rowid deleted it with every other guard silent, so v48 also adds no-rowid-replace, rowid-immutable and rowid-positive guards on run_artifacts
+Record-Id: r-981a4f6094a6
+Provenance: inherited ccc4865f6037dc390f5dd4e45b3d677628a76496
+
+Warn: v47 refuses to install its guard while any APPROVAL row already carries the canonical owner-decision label (OWNER_DECISION_LABEL_PREDATES_GUARD), writing no guard and no receipt; only the 46→47 step checks, never v48 or startup, and a database that already holds a v47 receipt is neither re-examined nor cleaned, its receipt not vouching for its rows
+Warn: this corrects r-a465576b41e2: the v47 checksum is no longer sha256:f9b23700…; it now covers the v47 snapshot and the refusal predicate (sha256:6030b25b…), so a receipt written by the candidate step without this check is told apart from the corrected one
+Record-Id: r-38ccd1c52b35
+Provenance: inherited cbb4bfaffe8050b8c246eb56e51f6ea420411232
+
+Limit: only the v47 receipt is compared by value; v12 to v46 receipts keep the format check, because released values of v12 and v38 differ from today's and v24 was edited in place, so comparing them would refuse released databases
+Limit: a refused database exits 78 on its first start and 0 on the launchd restart that finds the same refusal on record, because launchd restarts any non-zero exit; the exit-code scheme awaits the CEO's ruling
+Warn: a database is refused read-only, under the migration lock and before any backup or write, when its v47 receipt value differs from this build's step (MIGRATION_RECEIPT_MISMATCH, never rewritten) or when a pre-guard row claims an owner decision; the lock excludes ACP's migrations and daemon but not an older build or a raw writer, and the in-transaction v47 check stays as the second line, which keeps rows and receipts but not bytes
+Warn: a pre-guard row is refused when its label normalizes to the canonical label or its content is OWNER_DECISION-shaped under any label other than exactly service, using one shared definition with the reader and the guards; this corrects r-38ccd1c52b35 and r-a465576b41e2: the v47 checksum is now sha256:c2677069…, databases with a v47 receipt are re-examined by value, and the image is no longer restored from a backup on this refusal
+Record-Id: r-ad207fc055d4
+Provenance: inherited 91b9292696fdfd04ffe9768be1ca5ead501e52af
+
+Limit: a new build running under an older plist that lacks ACP_DAEMON_SUPERVISOR exits 78 on this refusal and launchd restarts it every ThrottleInterval; install and upgrade re-render the plist before starting the job, so this happens only when a build lands some other way
+Warn: a SEC database refusal decides its exit from the refusal this run confirmed and nothing else: a direct run exits 78 every time, and under this job's launchd plist (ACP_DAEMON_SUPERVISOR=launchd, set only by the rendered plist) it uses the #738 protocol, writing migration-refusal.json, showing in agentctl daemon status and exiting 0 as a stop signal rather than a successful start; this corrects r-ad207fc055d4's 78-then-0 Limit
+Record-Id: r-96544bcb9474
+Provenance: inherited 8e634c2962ae4ac37bc328a4a0bc921564e83e0f
+
+Limit: other APPROVAL readers (repo-factory-bootstrap-run and the generic artifact list) still throw on a non-JSON row, and write-time rejection of invalid APPROVAL content (a future v49 guard) remains a separate candidate
+Warn: the owner gate reads as owner decisions only APPROVAL rows with the canonical label or content SQLite itself judges OWNER_DECISION-shaped by the guards' own clause, filtered in SQL before any parse; a non-canonical row SQLite cannot read (not JSON, or nested past json1's depth limit) gains no decision authority and cannot break the reader. This makes r-e8136bf6b229's 'a legacy refusal is never discarded' false for such unreadable rows; genuine flat legacy rows are still read
+Record-Id: r-693564e68aaf
+Provenance: inherited fc48ac445126fb6cb916a701abbd7689b17aad07
