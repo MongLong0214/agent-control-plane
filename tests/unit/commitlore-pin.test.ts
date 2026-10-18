@@ -30,9 +30,12 @@ import {
   probeCommitLore,
 } from "../../src/bootstrap/commitlore-observation.ts";
 import {
+  assertCommitLorePinUnchanged,
+  bindCommitLorePin,
   COMMITLORE_INIT_OPTIONS,
   COMMITLORE_PIN_MAX_BYTES,
   commitlorePinIdentity,
+  CommitLorePinIdentityError,
   judgeCommitLoreVersion,
 } from "../../src/bootstrap/commitlore-pin.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -737,6 +740,28 @@ describe("S16-R2-01: reading the pin's identity is bounded, has its own deadline
     const workers = Number(process.env["UV_THREADPOOL_SIZE"] ?? 4);
     return Promise.all(Array.from({ length: workers }, () => new Promise((settled) => pbkdf2("s16", "r2", 4_000_000, 32, "sha256", settled))));
   };
+  /**
+   * CEO 470b8551 — two layers. The observation keeps only a refusal's first 300 characters
+   * (`createCommitLoreCliPort`), so how far a long tmp path pushes the rest past that cut is no part of
+   * its contract: an observation's detail is judged only as exactly that prefix (`observedAs`). The code,
+   * the realpath and the size are judged on what the identity reader itself rejects with for the same
+   * fixture, uncut (`rejection`).
+   */
+  const observedAs = (refusal: string): string => `commitlore could not be run: ${refusal.slice(0, 300)}`;
+  const rejection = async (pending: Promise<unknown>): Promise<Error> => {
+    try {
+      await pending;
+    } catch (error) {
+      return error as Error;
+    }
+    throw new Error("the identity reader accepted a fixture it must refuse");
+  };
+  /** The identity reader's own refusal, uncut: its condition and its whole message. */
+  const readerRefusal = (error: Error) => ({
+    reader: error instanceof CommitLorePinIdentityError,
+    condition: (error as Partial<CommitLorePinIdentityError>).condition,
+    message: error.message,
+  });
 
   /**
    * The reviewer's harness (s16-r2-evidence/hash-budget-*.ts|mjs), its paths aside: a Node child observes
@@ -828,10 +853,19 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     try {
       const run = await observeInChild(pin, 100, 2_500);
       const answer = judgedInChild(run);
-      expect(answer.result).toMatchObject({
-        outcome: "FAIL",
-        detail: expect.stringMatching(new RegExp(`^commitlore could not be run: ${VARIABLE} TOO_LARGE: .* is ${TIB} bytes, more than the ${CAP} bytes`)),
+      // The identity reader, on this same 1-TiB file: TOO_LARGE, uncut, naming the file it opened (the pin's
+      // realpath: a runner's /var/folders tmp dir is /private/var/folders) and its size; and the binding the
+      // runner makes first refuses with that reason whole.
+      const target = realpathSync(pin);
+      expect(readerRefusal(await rejection(commitlorePinIdentity(pin)))).toEqual({
+        reader: true,
+        condition: "TOO_LARGE",
+        message: `${target} is ${TIB} bytes, more than the ${CAP} bytes a supported entrypoint is`,
       });
+      const refusal = await rejection(bindCommitLorePin(pin));
+      expect(refusal.message).toBe(`${VARIABLE} TOO_LARGE: ${pin} is no supported entrypoint (${target} is ${TIB} bytes, more than the ${CAP} bytes a supported entrypoint is)`);
+      // The observation: the runner refused, its detail exactly that refusal's first 300 characters.
+      expect(answer.result).toMatchObject({ outcome: "FAIL", detail: observedAs(refusal.message) });
       expect(answer.elapsed).toBeLessThan(1_000);
       expect(existsSync(ran)).toBe(false);
       witnessed(`S16-R2-01 sparse asserted answerMs=${Math.round(answer.elapsed ?? Number.NaN)} turns=${answer.turns}`);
@@ -846,18 +880,28 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     // Bounded preparation before the watchdog starts (`prepareFixture`): the new file's cold first exec.
     prepareFixture(pinned.bin, ["--version"], pinned.log);
     try {
+      // The identity the observation's checks bind, read from this same file before it grows.
+      const bound = await bindCommitLorePin(pinned.bin);
       const run = await observeInChild(pinned.bin, 5_000, 5_000);
       const answer = judgedInChild(run);
-      // The re-check reads the pin's realpath, the path the refusal names inside its parentheses: a runner's
-      // /var/folders tmp dir is /private/var/folders. The observation keeps a refusal's first 300 characters
-      // (commitlore-observation.ts); under that longer tmp path the cap's wording falls past them, the code,
-      // both paths and the size do not.
+      // The identity reader, on this same file now that it grew: TOO_LARGE, uncut, naming the file it opened
+      // (the pin's realpath: a runner's /var/folders tmp dir is /private/var/folders) and its size; and the
+      // re-check made before init --help refuses REPLACED with that reason whole.
       const target = realpathSync(pinned.bin);
-      const refusal = `${VARIABLE} REPLACED: ${pinned.bin} can no longer be read as the file its checks ran (${target} is ${TIB} bytes, more than the ${CAP} bytes a supported entrypoint is)`;
-      expect(answer.result).toMatchObject({ outcome: "FAIL", detail: `commitlore could not be run: ${refusal.slice(0, 300)}` });
-      expect(answer.result?.detail).toContain(`(${target} is ${TIB} bytes`);
+      expect(bound.target).toBe(target);
+      expect(readerRefusal(await rejection(commitlorePinIdentity(pinned.bin)))).toEqual({
+        reader: true,
+        condition: "TOO_LARGE",
+        message: `${target} is ${TIB} bytes, more than the ${CAP} bytes a supported entrypoint is`,
+      });
+      const refusal = await rejection(assertCommitLorePinUnchanged(pinned.bin, bound));
+      expect(refusal.message).toBe(
+        `${VARIABLE} REPLACED: ${pinned.bin} can no longer be read as the file its checks ran (${target} is ${TIB} bytes, more than the ${CAP} bytes a supported entrypoint is)`,
+      );
       expect(statSync(pinned.bin).size).toBe(TIB);
-      // It grew during doctor --help, and nothing spawned after that check.
+      // The observation: the runner refused, its detail exactly that refusal's first 300 characters, and it
+      // grew during doctor --help with nothing spawned after that check: no init, no doctor.
+      expect(answer.result).toMatchObject({ outcome: "FAIL", detail: observedAs(refusal.message) });
       expect(argvs(pinned.log)).toEqual(["--version", "doctor --help"]);
       witnessed(`S16-R2-01 grow-during-check asserted answerMs=${Math.round(answer.elapsed ?? Number.NaN)} turns=${answer.turns}`);
     } finally {
@@ -921,9 +965,11 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
       tempDir("acp-s16-r2-deadline-checkout-"),
     );
     await busy;
+    // Its detail is judged only as the observation's 300-character prefix of that refusal (`observedAs`); the
+    // deadline it names is judged above, on the reader's own uncut error for this same file.
     expect(observed).toMatchObject({
       outcome: "FAIL",
-      detail: `commitlore could not be run: ${VARIABLE} UNREADABLE: ${pinned.bin} could not be read as a file to check (${pinned.bin} could not be read within 100 ms)`,
+      detail: observedAs(`${VARIABLE} UNREADABLE: ${pinned.bin} could not be read as a file to check (${pinned.bin} could not be read within 100 ms)`),
     });
     expect(argvs(pinned.log)).toEqual([]);
     witnessed(`S16-R2-01 identity-deadline asserted beats=${read.beats} ms=${read.elapsed.toFixed(1)}`);
