@@ -19,9 +19,10 @@ import type { CommitLoreRun, CommitLoreRunner } from "./commitlore-observation.t
  * comes first, because a relative pin would be read against this process's working directory and spawned
  * against the checkout's.
  *
- * A path that is executable is not yet a CommitLore that works. Before any command is run with it, the
- * pinned CLI is asked its version and its `doctor` command's usage, under the same bounded child and the
- * same constructed child environment as the observation itself (`commitloreRunner`).
+ * A path that is executable is not yet a CommitLore that works. Before an observation runs any command
+ * with it, the pinned CLI is asked its version and its `doctor` command's usage, once for that observation,
+ * under the same bounded child and the same constructed child environment as the observation's commands
+ * (`commitloreRunner`'s `ready`).
  */
 export const COMMITLORE_BINARY_VARIABLE = "ACP_COMMITLORE_BINARY";
 
@@ -36,7 +37,7 @@ export type CommitLorePinCondition =
   | "UNSUPPORTED_VERSION"
   | "NO_DOCTOR_COMMAND";
 
-/** The argv the pin is checked with, in this order, before any other `commitlore` command is run. */
+/** The argv the pin is checked with, in this order, before an observation's first `commitlore` command. */
 export const COMMITLORE_PIN_CHECK_ARGV: ReadonlyArray<readonly string[]> = Object.freeze([
   Object.freeze(["--version"]),
   Object.freeze(["doctor", "--help"]),

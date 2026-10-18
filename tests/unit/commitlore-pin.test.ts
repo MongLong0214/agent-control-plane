@@ -23,7 +23,22 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
  */
 
 afterEach(() => vi.unstubAllEnvs());
-afterAll(cleanupTempDirs);
+// A check abandoned at a test's timeout never reaches that test's `finally`, which ends the child it left: a
+// PID file still here names a child that was never ended, and only that exact PID is.
+const hangingPidFiles: string[] = [];
+const endExact = (pidFile: string): void => {
+  if (!existsSync(pidFile)) return;
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  try {
+    if (Number.isSafeInteger(pid) && pid > 1) process.kill(pid, "SIGKILL");
+  } catch {
+    // already gone
+  }
+};
+afterAll(() => {
+  for (const pidFile of hangingPidFiles) endExact(pidFile);
+  cleanupTempDirs();
+});
 
 const VARIABLE = "ACP_COMMITLORE_BINARY";
 const OK_REPORT = JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCode: 0, checks: [] });
@@ -54,6 +69,10 @@ const ROOT_USAGE = [
 interface FakeOptions {
   version?: string;
   versionExit?: number;
+  /** `--version` never answers, and writes its PID to `hanging.pid` (it ends at SIGTERM, which it does not handle). */
+  versionHangs?: boolean;
+  /** `--version` answers only after this many milliseconds. */
+  versionDelayMs?: number;
   doctorHelp?: string;
   doctorReport?: string;
   doctorExit?: number;
@@ -65,7 +84,7 @@ const fake = (name: string, options: FakeOptions = {}): { dir: string; bin: stri
   const dir = tempDir(`acp-s16-${name}-`);
   const bin = join(dir, "commitlore");
   const log = join(dir, "invocations.jsonl");
-  const { version = "1.7.3\n", versionExit = 0, doctorHelp = DOCTOR_USAGE, doctorReport = OK_REPORT, doctorExit = 0 } = options;
+  const { version = "1.7.3\n", versionExit = 0, versionHangs = false, versionDelayMs = 0, doctorHelp = DOCTOR_USAGE, doctorReport = OK_REPORT, doctorExit = 0 } = options;
   writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
   writeFileSync(
     bin,
@@ -74,7 +93,7 @@ const fs = require('node:fs');
 const [command, flag] = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), env: process.env }) + '\\n');
 const answer = (text, code) => process.stdout.write(text, () => process.exit(code));
-if (command === '--version') answer(${JSON.stringify(version)}, ${versionExit});
+if (command === '--version') ${versionHangs ? `(fs.writeFileSync(${JSON.stringify(join(dir, "hanging.pid"))}, String(process.pid)), setInterval(() => {}, 1000))` : `setTimeout(() => answer(${JSON.stringify(version)}, ${versionExit}), ${versionDelayMs})`};
 else if (command === 'doctor' && flag === '--help') answer(${JSON.stringify(doctorHelp)}, 0);
 else if (command === 'doctor') answer(${JSON.stringify(`${doctorReport}\n`)}, ${doctorExit});
 `,
@@ -203,13 +222,74 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     vi.stubEnv(VARIABLE, pinned.bin);
     expect(await probeCommitLore(createCommitLoreCliPort())).toMatchObject({ allowed: true, value: { outcome: "PASS" } });
     expect(invocations(onPath.log)).toEqual([]);
-    // Each observation command is preceded by the pin's own checks.
+    // The pin's own checks precede the observation's first command, once.
     expect(invocations(pinned.log).map(({ argv }) => argv.join(" "))).toEqual([
       "--version",
       "doctor --help",
       "init --mcp-scope none --no-unattended",
+      "doctor --json",
+    ]);
+  });
+
+  it("every observation checks the pin again, before its own first command: once per observation, not once per port", async () => {
+    workingOnPath();
+    const pinned = fake("each-observation");
+    vi.stubEnv(VARIABLE, pinned.bin);
+    const port = createCommitLoreCliPort();
+    const root = tempDir("acp-s16-each-observation-");
+    expect(await port.observe(root)).toMatchObject({ outcome: "PASS" });
+    expect(await port.observe(root)).toMatchObject({ outcome: "PASS" });
+    const observation = ["--version", "doctor --help", "init --mcp-scope none --no-unattended", "doctor --json"];
+    expect(invocations(pinned.log).map(({ argv }) => argv.join(" "))).toEqual([...observation, ...observation]);
+  });
+
+  it("a command's call is its spawn: the runner starts it at once, with no check inside it, and still only from an absolute pin", async () => {
+    workingOnPath();
+    const pinned = fake("command-only");
+    const root = tempDir("acp-s16-command-only-");
+    // What the S11 deadline and SIGKILL witnesses time from the call is the command alone.
+    expect(await commitloreRunner(COMMITLORE_LIMITS, pinned.bin)(["doctor", "--json"], root)).toMatchObject({ exitCode: 0 });
+    expect(invocations(pinned.log).map(({ argv }) => argv.join(" "))).toEqual(["doctor --json"]);
+    for (const pin of [undefined, "", "commitlore", relative(process.cwd(), pinned.bin)]) {
+      await expect(commitloreRunner(COMMITLORE_LIMITS, pin)(["doctor", "--json"], root)).rejects.toThrow(
+        new RegExp(`${VARIABLE} (NOT_CONFIGURED|NOT_ABSOLUTE)`),
+      );
+    }
+    expect(invocations(pinned.log)).toHaveLength(1);
+  });
+
+  it("the checks are bounded like any command: one that never answers is refused at its own bound, and nothing else runs", async () => {
+    workingOnPath();
+    const pinned = fake("hanging-check", { versionHangs: true });
+    const pidFile = join(pinned.dir, "hanging.pid");
+    hangingPidFiles.push(pidFile);
+    // The first exec of a newly written executable is slow on macOS and under parallel load can outlast the
+    // 800 ms bound before the fake's first statement; a second exec is not. So it is executed once, with an
+    // argv that answers, before the bound starts, and that invocation is cleared from its log.
+    execFileSync(pinned.bin, ["doctor", "--help"], { stdio: "ignore", timeout: 30_000 });
+    writeFileSync(pinned.log, "");
+    const limits = { ...COMMITLORE_LIMITS, checkTimeoutMs: 800, killGraceMs: 300 };
+    try {
+      const observed = await createCommitLoreCliPort(commitloreRunner(limits, pinned.bin)).observe(tempDir("acp-s16-hanging-check-"));
+      expect(observed).toMatchObject({ outcome: "FAIL", detail: expect.stringMatching(/commitlore --version did not answer within 800 ms/) });
+      expect(invocations(pinned.log).map(({ argv }) => argv)).toEqual([["--version"]]);
+    } finally {
+      endExact(pidFile);
+    }
+  });
+
+  it("the checks' time is their own: a check slower than a command's bound leaves that command its whole bound", async () => {
+    workingOnPath();
+    // The check outlasts a command's bound, and that bound is what a command that must pass gets: wide
+    // enough that a command which takes tens of milliseconds still passes when the host stalls under load.
+    const pinned = fake("slow-check", { versionDelayMs: 3_500 });
+    const limits = { ...COMMITLORE_LIMITS, timeoutMs: 3_000, killGraceMs: 300 };
+    const observed = await createCommitLoreCliPort(commitloreRunner(limits, pinned.bin)).observe(tempDir("acp-s16-slow-check-"));
+    expect(observed).toMatchObject({ outcome: "PASS" });
+    expect(invocations(pinned.log).map(({ argv }) => argv.join(" "))).toEqual([
       "--version",
       "doctor --help",
+      "init --mcp-scope none --no-unattended",
       "doctor --json",
     ]);
   });
@@ -286,17 +366,19 @@ describe("S16: the real pinned CLI, in the constructed environment and a fresh H
   it.skipIf(REAL === null)("passes the pin's checks, writes nothing to HOME and leaves the checkout clean", async () => {
     const home = tempDir("acp-s16-real-home-");
     const repo = tempDir("acp-s16-real-repo-");
-    execFileSync("git", ["init", "-q"], { cwd: repo });
+    execFileSync("git", ["init", "-q"], { cwd: repo, timeout: 20_000 });
     vi.stubEnv("HOME", home);
     vi.stubEnv(VARIABLE, undefined);
     for (const key of ["ACP_MCP_TOKEN", "ACP_OPERATOR_TOKEN", "GH_TOKEN"]) vi.stubEnv(key, `s16-only-${key}`);
-    // The pin is passed, not found: a run through it is preceded by `--version` and `doctor --help`.
+    // The pin is passed, not found: its checks, `--version` and `doctor --help`, pass, and so does a run.
     const run = commitloreRunner(COMMITLORE_LIMITS, REAL as string);
+    await expect(run.ready(repo)).resolves.toBeUndefined();
     const answered = await run(["--version"], repo);
     expect(answered.exitCode).toBe(0);
     expect(answered.stdout.trim()).toMatch(/^1\.\d+\.\d+$/);
     expect(readdirSync(home)).toEqual([]);
-    expect(execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: repo, encoding: "utf8" })).toBe("");
+    const status = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: repo, encoding: "utf8", timeout: 20_000 });
+    expect(status).toBe("");
     // The same CLI through a relative pin is refused before it runs.
     await expect(commitloreRunner(COMMITLORE_LIMITS, relative(process.cwd(), REAL as string))(["--version"], repo)).rejects.toThrow(
       new RegExp(`${VARIABLE} NOT_ABSOLUTE`),

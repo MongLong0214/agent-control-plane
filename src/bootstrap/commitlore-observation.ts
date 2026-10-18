@@ -150,15 +150,27 @@ export const judgeCommitLoreRuns = (init: CommitLoreRun | null, doctor: CommitLo
   return { outcome: "PASS", reportStatus: status as "ok" | "degraded", warnings, detail: "commitlore doctor passed", report: doctor.stdout };
 };
 
-export type CommitLoreRunner = (argv: readonly string[], cwd: string) => Promise<CommitLoreRun>;
+/**
+ * Runs one `commitlore` command in `cwd`. A runner whose CLI must be checked before it is used carries
+ * `ready`: the CLI port awaits it once per observation, before the observation's first command, and runs
+ * no command if it throws (slice S16, `commitloreRunner`).
+ */
+export interface CommitLoreRunner {
+  (argv: readonly string[], cwd: string): Promise<CommitLoreRun>;
+  readonly ready?: (cwd: string) => Promise<void>;
+}
 
 /**
  * The bounds one `commitlore` child runs under. `timeoutMs` is its whole answer; `maxOutputBytes` is what
  * is kept of each stream; `killGraceMs` is how long a child sent SIGTERM has before SIGKILL; `drainMs` is
  * how long its pipes may stay open after it exited.
+ *
+ * Slice S16 — `checkTimeoutMs` is `timeoutMs` for each of the pin's checks (`--version`, `doctor --help`,
+ * `commitloreRunner`'s `ready`), a bound of their own: their time is never taken from a command's.
  */
 export interface CommitLoreLimits {
   timeoutMs: number;
+  checkTimeoutMs: number;
   maxOutputBytes: number;
   killGraceMs: number;
   drainMs: number;
@@ -166,6 +178,7 @@ export interface CommitLoreLimits {
 
 export const COMMITLORE_LIMITS: Readonly<CommitLoreLimits> = Object.freeze({
   timeoutMs: 180_000,
+  checkTimeoutMs: 180_000,
   maxOutputBytes: 4 * 1024 * 1024,
   killGraceMs: 2_000,
   drainMs: 2_000,
@@ -325,29 +338,51 @@ const commitloreChild =
 /**
  * Slice S16 — `commitlore` as a child: the executable `ACP_COMMITLORE_BINARY` pins (`commitlore-pin.ts`), read
  * when the runner is made, as the provider CLIs' pins are read when their adapters are made, and never
- * looked up on any PATH. Every command is preceded by the pin's checks: the pin is a usable absolute path,
- * and the CLI there answers a supported `--version` and has the `doctor --json` command, each asked through
- * the same bounded child in the same constructed environment. A pin that fails any of them is refused as a
- * command that could not be run, and nothing else is run with it.
+ * looked up on any PATH. Every command, and every check, is refused before it spawns unless the pin is a
+ * usable absolute path.
+ *
+ * `ready` is the rest of the pin's checks: the CLI there answers a supported `--version` and has the
+ * `doctor --json` command, each asked through the same bounded child in the same constructed environment.
+ * A pin that fails any of them is refused, and the CLI port runs nothing else with it. They run once per
+ * observation, before its first command (`createCommitLoreCliPort`), not inside each command: a command's
+ * call is its spawn, so its own `timeoutMs` and its SIGTERM-then-SIGKILL escalation are measured from the
+ * moment it starts, never shortened by the checks' time. Each check is bounded by `checkTimeoutMs` from its
+ * own spawn, with the same output, grace and drain bounds, so an observation still ends within the sum of
+ * its four children's bounds: two checks, then `init` and `doctor`, one at a time.
  */
-export const commitloreRunner =
-  (
-    limits: Readonly<CommitLoreLimits> = COMMITLORE_LIMITS,
-    pin: string | undefined = process.env[COMMITLORE_BINARY_VARIABLE],
-  ): CommitLoreRunner =>
-  async (argv, cwd) => {
+export const commitloreRunner = (
+  limits: Readonly<CommitLoreLimits> = COMMITLORE_LIMITS,
+  pin: string | undefined = process.env[COMMITLORE_BINARY_VARIABLE],
+): CommitLoreRunner & { readonly ready: (cwd: string) => Promise<void> } => {
+  const pinned = (): string => {
     const executable = commitlorePin(pin);
     if (!executable.allowed) throw new Error(executable.message);
-    const run = commitloreChild(executable.value, limits);
-    const unsupported = await verifyCommitLorePin(executable.value, run, cwd);
-    if (unsupported !== null) throw new Error(unsupported);
-    return run(argv, cwd);
+    return executable.value;
   };
+  const run = async (argv: readonly string[], cwd: string): Promise<CommitLoreRun> => commitloreChild(pinned(), limits)(argv, cwd);
+  const ready = async (cwd: string): Promise<void> => {
+    const executable = pinned();
+    const check = commitloreChild(executable, { ...limits, timeoutMs: limits.checkTimeoutMs });
+    const unsupported = await verifyCommitLorePin(executable, check, cwd);
+    if (unsupported !== null) throw new Error(unsupported);
+  };
+  return Object.assign(run, { ready });
+};
 
-/** The production port: the pinned `commitlore` (`commitloreRunner`), run with `COMMITLORE_OBSERVATION_ARGV`. */
+/**
+ * The production port: the pinned `commitlore` (`commitloreRunner`), run with `COMMITLORE_OBSERVATION_ARGV`.
+ * A runner's `ready` is awaited once, before `init`, and nothing runs if it refuses.
+ */
 export const createCommitLoreCliPort = (run: CommitLoreRunner = commitloreRunner()): CommitLorePort => ({
   async observe(checkoutPath) {
     const [initArgv, doctorArgv] = COMMITLORE_OBSERVATION_ARGV as [readonly string[], readonly string[]];
+    if (run.ready !== undefined) {
+      try {
+        await run.ready(checkoutPath);
+      } catch (error) {
+        return fail(`commitlore could not be run: ${(error as Error).message.slice(0, 300)}`);
+      }
+    }
     let init: CommitLoreRun;
     try {
       init = await run(initArgv, checkoutPath);
