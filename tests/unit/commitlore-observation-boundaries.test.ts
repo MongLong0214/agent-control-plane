@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { ChildProcess, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -276,20 +276,155 @@ it("R1-02: the owned child that ignores SIGTERM is SIGKILLed after the grace, an
   }
 });
 
+/**
+ * The S11 exit-0 witness's record of one observation, in the order this client saw it: each deadline the
+ * runner armed for a command (`timeoutMs`) and fired, each signal this client sent a child (through the
+ * `ChildProcess` it spawned: the runner's own termination, or `spawn`'s `timeout`), that child's exit as this
+ * client saw it, and the moment the answer settled. Nothing here changes what the runner does, except that a
+ * run may hold the runner's command deadline back by `holdMs`, so the other order of the race — the exit of
+ * a child this client signalled at its bound, seen before the runner's own deadline fires — is certain.
+ */
+type Exit0Event =
+  | { readonly kind: "deadline-armed" | "deadline-fired" | "settled"; readonly at: number }
+  | { readonly kind: "signal"; readonly at: number; readonly pid: number; readonly command: string; readonly armed: boolean }
+  | { readonly kind: "exit"; readonly at: number; readonly pid: number; readonly code: number | null; readonly signal: NodeJS.Signals | null };
+
+const observeExit0 = async (
+  bin: string,
+  limits: { readonly timeoutMs: number; readonly killGraceMs: number },
+  files: { readonly armed: string; readonly signalled: string },
+  holdMs: number,
+): Promise<{ observed: Awaited<ReturnType<ReturnType<typeof createCommitLoreCliPort>["observe"]>> | null; events: Exit0Event[] }> => {
+  const events: Exit0Event[] = [];
+  const now = (): number => performance.now();
+  const armedPids = (): string[] => (existsSync(files.armed) ? readFileSync(files.armed, "utf8").split("\n") : []);
+  const realSetTimeout = globalThis.setTimeout;
+  const realKill = ChildProcess.prototype.kill;
+  const seen = new WeakSet<ChildProcess>();
+  globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+    // The runner's own deadline: armed for a command's bound by a frame of the runner itself, not by `spawn`.
+    const caller = (new Error().stack ?? "").split("\n")[2] ?? "";
+    if (delay !== limits.timeoutMs || !caller.includes("commitlore-observation.ts")) return realSetTimeout(callback, delay, ...args);
+    events.push({ kind: "deadline-armed", at: now() });
+    return realSetTimeout(
+      () => {
+        events.push({ kind: "deadline-fired", at: now() });
+        callback(...args);
+      },
+      delay + holdMs,
+    );
+  }) as unknown as typeof setTimeout;
+  ChildProcess.prototype.kill = function (this: ChildProcess, signal?: NodeJS.Signals | number): boolean {
+    if (this.pid !== undefined && this.exitCode === null && this.signalCode === null) {
+      const pid = this.pid;
+      events.push({ kind: "signal", at: now(), pid, command: this.spawnargs[1] ?? "", armed: armedPids().includes(String(pid)) });
+      if (!seen.has(this)) {
+        seen.add(this);
+        this.once("exit", (code, exitSignal) => events.push({ kind: "exit", at: now(), pid, code, signal: exitSignal }));
+      }
+    }
+    return realKill.call(this, signal);
+  };
+  try {
+    const run = commitloreRunner({ ...COMMITLORE_LIMITS, ...limits }, bin);
+    const settledWithin = limits.timeoutMs + holdMs + limits.killGraceMs + 3_000;
+    const observed = await Promise.race([
+      createCommitLoreCliPort(run).observe(root),
+      new Promise<null>((resolve) => realSetTimeout(() => resolve(null), settledWithin)),
+    ]);
+    if (observed !== null) events.push({ kind: "settled", at: now() });
+    return { observed, events };
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    ChildProcess.prototype.kill = realKill;
+  }
+};
+
+/**
+ * CEO e91a0d63 (가), 37d29a30 — the refusal is judged against the termination cause this client actually
+ * observed before the answer settled, never against either of two reasons:
+ * - the runner's deadline fired first: the reason is that deadline, `did not answer within <timeoutMs> ms`;
+ * - else this client signalled the `init` child and saw it exit: the reason is that signal, `was signalled
+ *   before it answered (it then exited <its exit code or signal, as seen>)`.
+ * A PASS, a reason that is not the one its observed cause gives, and an answer with no observed cause at all
+ * each fail. A fixture whose child was signalled before it was armed is a FIXTURE-READY FAILURE.
+ */
+const judgeExit0 = (run: Awaited<ReturnType<typeof observeExit0>>, timeoutMs: number): "deadline" | "signal" => {
+  if (run.observed === null) throw new Error(`the observation never settled: no deadline and no signal of this client ended it (${JSON.stringify(run.events)})`);
+  expect(run.observed.outcome).toBe("FAIL");
+  const reason = /^commitlore init could not be run: commitlore init (.*)$/.exec(run.observed.detail)?.[1];
+  if (reason === undefined) throw new Error(`the refusal is not init's: ${JSON.stringify(run.observed.detail)}`);
+  const before = run.events.slice(0, run.events.findIndex(({ kind }) => kind === "settled"));
+  const signal = before.find((event) => event.kind === "signal" && event.command === "init");
+  if (signal?.kind === "signal" && !signal.armed) throw new Error(`FIXTURE-READY FAILURE: init child ${signal.pid} was signalled before it handled SIGTERM; the exit-0 witness was not judged`);
+  const armed = before.find(({ kind }) => kind === "deadline-armed");
+  const fired = before.find(({ kind }) => kind === "deadline-fired");
+  if (fired !== undefined && armed !== undefined) {
+    // The deadline that fired is the command's own, at its bound from the spawn (and never earlier).
+    expect(fired.at - armed.at).toBeGreaterThanOrEqual(timeoutMs - 1);
+    expect(reason).toBe(`did not answer within ${timeoutMs} ms`);
+    return "deadline";
+  }
+  const exit = signal?.kind === "signal" ? before.find((event) => event.kind === "exit" && event.pid === signal.pid) : undefined;
+  if (signal?.kind === "signal" && exit?.kind === "exit" && armed !== undefined) {
+    // This client signals a child only at its bound (`spawn`'s `timeout`) or after refusing it: never earlier.
+    expect(signal.at - armed.at).toBeGreaterThanOrEqual(timeoutMs - 2);
+    expect(reason).toBe(`was signalled before it answered (it then exited ${exit.code ?? exit.signal})`);
+    return "signal";
+  }
+  throw new Error(`no termination cause this client observed explains the refusal ${JSON.stringify(reason)} (${JSON.stringify(before)})`);
+};
+
 it("R1-02: a child that exits 0 after this client signalled it is refused, never PASS", async () => {
-  fake(
+  const dir = tempDir("acp-s11-r1-exit0-");
+  const files = { armed: join(dir, "armed.pids"), signalled: join(dir, "signalled.jsonl") };
+  const bin = fake(
     "exit0-bin",
     `
+    const fs = require('node:fs');
     process.on('SIGTERM', () => {
+      fs.appendFileSync(${JSON.stringify(files.signalled)}, JSON.stringify({ pid: process.pid, command: process.argv[2] }) + '\\n');
       if (process.argv[2] === 'doctor') console.log(${JSON.stringify(ok)});
       process.exit(0);
     });
+    fs.appendFileSync(${JSON.stringify(files.armed)}, process.pid + '\\n');
     setInterval(() => {}, 1000);
   `,
   );
-  const run = commitloreRunner({ ...COMMITLORE_LIMITS, timeoutMs: 800, killGraceMs: 500 });
-  const observed = await createCommitLoreCliPort(run).observe(root);
-  expect(observed).toMatchObject({ outcome: "FAIL", detail: expect.stringMatching(/init could not be run: .*did not answer within 800 ms/) });
+  const limits = { timeoutMs: 800, killGraceMs: 500 };
+  const exited = new Set<number>();
+  try {
+    // As the race falls (the runner's deadline and spawn's own timeout are both at 800 ms), then with the
+    // runner's deadline held back 1 s so the signalled child's exit is certainly seen first.
+    const causes: string[] = [];
+    for (const holdMs of [0, 1_000]) {
+      const run = await observeExit0(join(bin, "commitlore"), limits, files, holdMs);
+      const record = (): void => run.events.forEach((event) => event.kind === "exit" && exited.add(event.pid));
+      record();
+      const cause = judgeExit0(run, limits.timeoutMs);
+      if (holdMs > 0 && cause !== "signal") throw new Error(`FIXTURE-ORDER FAILURE: with the deadline held back the cause seen was ${cause}; the signal path was not exercised`);
+      // The premise: the init child really was signalled by this client and exited 0 after it.
+      const signal = run.events.find((event) => event.kind === "signal" && event.command === "init");
+      if (signal?.kind !== "signal") throw new Error("this client never signalled the init child");
+      await vi.waitFor(() => expect(run.events.some((event) => event.kind === "exit" && event.pid === signal.pid)).toBe(true), {
+        timeout: limits.killGraceMs + 2_000,
+        interval: 20,
+      });
+      record();
+      expect(run.events.find((event) => event.kind === "exit" && event.pid === signal.pid)).toMatchObject({ code: 0, signal: null });
+      expect(readFileSync(files.signalled, "utf8")).toContain(JSON.stringify({ pid: signal.pid, command: "init" }));
+      causes.push(cause);
+    }
+    // Counts, for a repeated run, that this assertion ran: a file outside the checkout, named by that run.
+    const executed = process.env["ACP_TEST_WITNESS_LOG"];
+    if (executed !== undefined) appendFileSync(executed, `R1-02 exit0 asserted causes=${causes.join(",")}\n`);
+  } finally {
+    // A child no deadline and no signal ended (a mutant without them) is ended by its exact PID; one whose
+    // exit this client saw is never signalled again, its PID possibly another process's by now.
+    for (const pid of existsSync(files.armed) ? readFileSync(files.armed, "utf8").split("\n").filter(Boolean).map(Number) : []) {
+      if (!exited.has(pid) && alive(pid)) process.kill(pid, "SIGKILL");
+    }
+  }
 });
 
 it("lead-3: a successful init that creates a checkout file is refused by the probe", async () => {
