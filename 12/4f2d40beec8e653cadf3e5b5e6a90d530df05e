@@ -1,0 +1,8 @@
+Warn: a request body gh did not take is refused with no HTTP status and requestOutcome unknown, even when gh exits 0, and nothing retries: gh api --input - streams the body while gh may already be acting, so a stdin error is not evidence that GitHub saw no request, and the missing status keeps the producer's pending intent in doubt
+Record-Id: r-8bddf6350344
+Provenance: inherited b16d59ee9d3f0a051bf5e3d140f88c30a3018784
+
+Limit: a gh failure with no HTTP status and no requestOutcome, such as a non-zero exit or a timeout kill, still maps to REMOTE_REFUSED with resumable true; the pending ledger still stops it being re-sent
+Warn: a GitHub write whose body gh did not take keeps status null and requestOutcome unknown as structured values through the producer and its durable refusal, as REQUEST_OUTCOME_UNKNOWN with indeterminate true and resumable false; the pending entry stays, so later calls meet the existing pending-ledger check and no second POST is sent
+Record-Id: r-09de5d5593ac
+Provenance: inherited 52048f6188ecade71d59cfa9746d9ebd7cb3abe1
