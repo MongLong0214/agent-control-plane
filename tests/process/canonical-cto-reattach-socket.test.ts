@@ -22,6 +22,7 @@ import {
   type CanonicalCtoFixture,
 } from "../helpers/canonical-cto-reattach.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { clearSessionMessagingEnv } from "../helpers/session-messaging-env.ts";
 
 /**
  * The canonical CTO's reattach end to end (#1037): the real kernel-peer listener, the real
@@ -35,16 +36,11 @@ import { cleanupTempDirs } from "../helpers/fixtures.ts";
  * The relay's CLI entry reads the session's messaging socket and token from the environment, and a
  * run from inside a Claude Code session inherits that session's real ones: the relay would open its
  * wake proxy beside the live session's socket, outside this file's scratch roots. Every
- * CLAUDE_CODE_MESSAGING_* variable is cleared before any relay runs, so the only socket directories
- * a run uses are the mkdtemp roots below.
+ * CLAUDE_CODE_MESSAGING_* variable is cleared before any relay runs (`clearSessionMessagingEnv`), so
+ * the only socket directories a run uses are the mkdtemp roots below.
  */
-const clearSessionMessagingEnv = (): void => {
-  for (const name of Object.keys(process.env)) {
-    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
-  }
-};
 clearSessionMessagingEnv();
-beforeEach(clearSessionMessagingEnv);
+beforeEach(() => clearSessionMessagingEnv());
 
 const TOKEN = "fixture-mcp-token";
 const roots: string[] = [];

@@ -37,6 +37,7 @@ import {
   type CanonicalCtoFixture,
 } from "../helpers/canonical-cto-reattach.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { clearSessionMessagingEnv, inheritedSessionMessagingNames, SESSION_MESSAGING_PREFIX } from "../helpers/session-messaging-env.ts";
 
 /**
  * The canonical CTO relay as the session's wake proxy.
@@ -68,11 +69,20 @@ const AUTHENTICATED_WAKE = `${JSON.stringify({ type: "auth", token: MESSAGING_TO
  * The relay reads the session's messaging socket and token from its environment, and a test run
  * from inside a Claude Code session inherits that session's real ones. No relay here may see them:
  * a proxy would open beside the real session's socket and a wake would reach the real session.
+ * Every CLAUDE_CODE_MESSAGING_* variable is cleared, not only the two named here (R1154-01); these
+ * two are the ones this suite sets itself.
  */
-const MESSAGING_ENV = ["CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"] as const;
-const clearMessagingEnv = (): void => {
-  for (const name of MESSAGING_ENV) delete process.env[name];
-};
+type MessagingEnvName = "CLAUDE_CODE_MESSAGING_SOCKET" | "CLAUDE_CODE_MESSAGING_TOKEN";
+const clearMessagingEnv = (): void => clearSessionMessagingEnv();
+/**
+ * R1154-01 — a variable the parent environment hands in under a suffix no list names. Set before this
+ * file's own module code runs, as an inherited one would be; the clear below has to remove it.
+ */
+const inheritedUnknown = vi.hoisted(() => {
+  const name = `CLAUDE_CODE_MESSAGING_R1154_PROXY_${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+  process.env[name] = "inherited-from-the-parent";
+  return name;
+});
 clearMessagingEnv();
 beforeEach(clearMessagingEnv);
 
@@ -577,7 +587,7 @@ describe("the canonical CTO relay wakes its session as the session's own child",
 
   it("opens the proxy only when the environment names both the session's socket and its token", async () => {
     const f = await started();
-    const cases: Array<{ env: Partial<Record<(typeof MESSAGING_ENV)[number], string>>; proxied: boolean }> = [
+    const cases: Array<{ env: Partial<Record<MessagingEnvName, string>>; proxied: boolean }> = [
       { env: {}, proxied: false },
       { env: { CLAUDE_CODE_MESSAGING_SOCKET: f.session.path }, proxied: false },
       { env: { CLAUDE_CODE_MESSAGING_TOKEN: MESSAGING_TOKEN }, proxied: false },
@@ -944,7 +954,7 @@ const recordingDoor = async (dir: string) => {
 
 const lines = (...frames: string[]): string => frames.map((frame) => `${frame}\n`).join("");
 
-type MessagingVariable = (typeof MESSAGING_ENV)[number];
+type MessagingVariable = MessagingEnvName;
 
 /** How a case leaves the relay without a proxy: what it hands the relay, or what the environment holds. */
 interface Unproxied {
@@ -1092,4 +1102,10 @@ describe("with no wake proxy the relay changes no byte in either direction (revi
     expect(r.err()).toBe("");
     await r.finish();
   });
+});
+
+it("R1154-01: no relay here inherits a CLAUDE_CODE_MESSAGING_* variable, whatever its suffix", () => {
+  expect(inheritedUnknown.startsWith(SESSION_MESSAGING_PREFIX)).toBe(true);
+  // Neither this process's environment, which an in-process relay reads, nor a child that inherits it.
+  expect(inheritedSessionMessagingNames()).toEqual({ here: [], child: [] });
 });
