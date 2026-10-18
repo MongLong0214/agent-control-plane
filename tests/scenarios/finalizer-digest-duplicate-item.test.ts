@@ -7,10 +7,12 @@ import { FakeGitHub } from "../helpers/fake-github.ts";
 import { driveToReviewedCandidate, makeHarness, ownerDecisionReceipt } from "../helpers/harness.ts";
 
 /**
- * FIX-FINALIZER-DIGEST — every required item is bound once, by its stable id. `deriveHumanGate` already
- * removes duplicates, so a definition naming an item twice cannot arise from a task contract; this
- * witness supplies one through the definition itself, to show that the resolver refuses it rather
- * than binding one decision twice.
+ * FIX-FINALIZER-DIGEST — every required item is bound once, by its stable id. This witness supplies a
+ * duplicate through the derived definition itself, to show that the resolver refuses it rather than
+ * binding one decision twice. It is not coverage of a task contract that declares a question twice:
+ * `deriveHumanGate` drops that repeat from the items, which is why review r1 found it accepted
+ * (FD-R1-DUP). That case is witnessed through the durable contract in
+ * finalizer-digest-duplicate-declaration.test.ts.
  */
 const duplicate = vi.hoisted(() => ({ on: false }));
 
