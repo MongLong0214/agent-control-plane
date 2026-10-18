@@ -1109,6 +1109,7 @@ describe("baseline boundary contracts", () => {
       "v45-first-manifest-activation",
       "v46-rowid-no-replace",
       "v47-owner-decision-authority-guard",
+      "v48-owner-decision-supersede-guard",
     ]);
   });
 

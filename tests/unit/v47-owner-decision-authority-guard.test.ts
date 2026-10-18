@@ -14,6 +14,7 @@ import { digestOfSchemaRows, privateStatePath, schemaRowsOf } from "../helpers/r
 import { V45_BASE_CHECKSUM, contentDigests } from "../helpers/released-v45-schema.ts";
 import { V46_BASE_CHECKSUM, V46_SCHEMA_DIGEST_FROM_V11 } from "../helpers/released-v46-schema.ts";
 import { V47_ADDED_TRIGGERS } from "../helpers/released-v47-schema.ts";
+import { V48_ADDED_TRIGGERS } from "../helpers/released-v48-schema.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -343,12 +344,12 @@ const seedAsV46 = (path: string): { legacy: Row[]; preV47Forgery: Row } => {
 };
 
 describe("S1: the v46 → v47 step on the released v46 image", () => {
-  it("is the last step of the chain, from 46", () => {
-    expect(SCHEMA_VERSION).toBe(47);
-    expect(MIGRATIONS.at(-1)).toMatchObject({ id: "v47-owner-decision-authority-guard", fromVersion: 46, toVersion: 47 });
+  it("is the step from 46 to 47; the chain runs on past it when the current version is later (v48, SEC-OD1)", () => {
+    expect(MIGRATIONS.find((step) => step.id === "v47-owner-decision-authority-guard")).toMatchObject({ fromVersion: 46, toVersion: 47 });
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(47);
   });
 
-  it("keeps every row, the legacy \"service\" OWNER_DECISION rows included, and the v45 and v46 receipts byte for byte; adds only the guard and its receipt; then refuses the same forgery", () => {
+  it("keeps every row, the legacy \"service\" OWNER_DECISION rows included, and the v45 and v46 receipts byte for byte; adds only the guard and its receipt (and v48's, which follows); then refuses the same forgery", () => {
     const path = releasedV46("acp-v47-s1-");
     const { legacy, preV47Forgery } = seedAsV46(path);
     const before = contentDigests(path);
@@ -368,19 +369,20 @@ describe("S1: the v46 → v47 step on the released v46 image", () => {
     new Db(path).close();
 
     const after = contentDigests(path);
-    expect(after.userVersion).toBe(47);
+    expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsDigestBefore, ...restBefore } = before.tables;
     const { schema_migrations: receiptsDigestAfter, ...restAfter } = after.tables;
     expect(restAfter).toEqual(restBefore);
     expect(receiptsDigestAfter).not.toBe(receiptsDigestBefore);
     expect(receiptsThrough46(path)).toEqual(receiptsBefore);
-    expect(triggersOf(path)).toEqual([...triggersBefore, GUARD].sort());
+    // v48 (SEC-OD1) follows on the same approved chain and adds its four triggers, no row.
+    expect(triggersOf(path)).toEqual([...triggersBefore, GUARD, ...V48_ADDED_TRIGGERS].sort());
     const raw = new Database(path, { readonly: true });
     try {
       expect(raw.prepare("SELECT version, migration_id, checksum FROM schema_migrations WHERE version = 47").get()).toEqual({
         version: 47,
         migration_id: "v47-owner-decision-authority-guard",
-        checksum: MIGRATIONS.at(-1)!.checksum(),
+        checksum: MIGRATIONS.find((step) => step.toVersion === 47)!.checksum(),
       });
       for (const r of [...legacy, preV47Forgery]) {
         expect(raw.prepare("SELECT produced_by, content_json FROM run_artifacts WHERE artifact_id = ?").get(r.id))
@@ -401,7 +403,7 @@ describe("S1: the v46 → v47 step on the released v46 image", () => {
     }
   });
 
-  it("the released v46 image migrated to v47 differs from it by exactly the guard, whose stored definition is a fresh v47 install's", () => {
+  it("the released v46 image migrated to v47 differs from it by exactly the guard (and v48's four, which follow), whose stored definition is a fresh install's", () => {
     const fresh = privateStatePath("acp-v47-fresh-");
     new Db(fresh).close();
     const freshGuard = schemaRowsOf(fresh).filter((r) => r.name === GUARD);
@@ -411,7 +413,7 @@ describe("S1: the v46 → v47 step on the released v46 image", () => {
     approveMigration(path, "v47 M3 witness");
     new Db(path).close();
     const after = schemaRowsOf(path);
-    expect(after.filter((r) => r.name !== GUARD)).toEqual(before);
+    expect(after.filter((r) => r.name !== GUARD && !V48_ADDED_TRIGGERS.includes(r.name))).toEqual(before);
     expect(after.filter((r) => r.name === GUARD)).toEqual(freshGuard);
   });
 });
@@ -504,7 +506,7 @@ describe("S3: rollback through the restore drill", () => {
     expect(triggersOf(path)).not.toContain(GUARD);
     approveMigration(path, "v47 fault witness, again");
     new Db(path).close();
-    expect(contentDigests(path).userVersion).toBe(47);
+    expect(contentDigests(path).userVersion).toBe(SCHEMA_VERSION);
     expect(existsSync(migrationApprovalPath(path))).toBe(false);
   });
 

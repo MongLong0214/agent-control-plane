@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -1052,5 +1052,305 @@ describe("SEC-OD1 v47: an exactly bound owner refusal blocks CONFIRM and the ker
     expect((await w.harness.cp.github.gatePublish(w.payload, w.identity)).reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
     expect({ writes: githubWrites(w), checks: w.github.checkRuns.length, merges: w.github.mergeCount })
       .toEqual({ writes: 0, checks: 0, merges: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------
+// SEC-OD1 v48 (CEO 072dbccb)
+
+/**
+ * The review's residual after v47 (followup-fix/v47-guard-evidence/residual-superseded-probe.log): the
+ * owner refuses an item they had approved, an ordinary `Db.run` sets the one-way superseded mark on that
+ * refusal (`run_artifacts_content_immutable` lets exactly that flag change), the earlier approval decides
+ * the item again, and the kernel merges. v48's `run_artifacts_owner_decision_supersede_guard` refuses the
+ * mark on an owner decision unless the connection-local marker is exactly 1, which only the run engine's
+ * staleness marks hold, for their one statement. Every ODV48 counterexample here is RED at 05b46d76 (v47):
+ * the withdrawal is admitted and the gate, the publish, CONFIRM or the merge is allowed.
+ */
+const V48_REFUSAL = { reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, evidence: { sqlite: "OWNER_DECISION_SUPERSEDE_AUTHORITY_DENIED" } };
+
+/** `sql` as an ordinary `Db.run` on ACP's own connection; what it threw, or undefined if admitted. */
+const viaDb = (w: World, sql: string, params: unknown[] = []): unknown => {
+  try {
+    w.harness.cp.db.run(sql, params);
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+};
+
+/** The record of the owner's latest refusal of `item`: what the counterexample withdraws. */
+const refusalOf = (w: World, item: string) =>
+  w.harness.cp.artifacts.list<{ kind?: string; item?: string; approved?: boolean }>(w.runId, "APPROVAL")
+    .filter((artifact) => artifact.content.kind === "OWNER_DECISION" && artifact.content.item === item && artifact.content.approved === false)
+    .at(-1)!;
+
+/** The reviewer's write: the one-way mark on that refusal, by an ordinary `Db.run`. */
+const withdraw = (w: World, artifactId: string): unknown =>
+  viaDb(w, "UPDATE run_artifacts SET superseded = 1 WHERE artifact_id = ?", [artifactId]);
+
+/** Every artifact of the run as [id, superseded], so a withdrawal that slipped through is visible. */
+const supersededFlags = (w: World): Array<[string, boolean]> =>
+  w.harness.cp.artifacts.list(w.runId).map((artifact) => [artifact.artifactId, artifact.superseded]);
+
+const writesToGitHub = (w: World): number => w.github.calls.filter((call) => call.method !== "GET").length;
+
+const ceoConfirm = (w: World) => {
+  const ceo = w.harness.cp.bindings.active(roleKeyFor(Role.CEO));
+  if (!ceo) throw new Error("fixture CEO binding missing");
+  return w.harness.cp.ceo.submitCeoDecision({
+    runId: w.runId,
+    decision: "CONFIRM",
+    candidateSnapshotDigest: w.candidate,
+    ceoSessionId: ceo.sessionId,
+    rationale: "confirm at CEO review",
+  });
+};
+
+describe("SEC-OD1 v48: the owner's refusal cannot be withdrawn by an ordinary write (the review's counterexample)", () => {
+  it("ODV48 at the kernel merge: approve, publish, refuse; a Db.run withdrawal of the refusal is refused, the approval does not revive, the merge is refused with 0 GitHub writes", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+    const pullNumber = await openPull(w);
+    decide(w, ITEM_B, false, "owner refused after publish");
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+    const flags = supersededFlags(w);
+    const writes = writesToGitHub(w);
+    const attempt = withdraw(w, refusalOf(w, ITEM_B).artifactId);
+    const merged = await merge(w, pullNumber);
+    const observed = { updateError: attempt === undefined ? null : String(attempt), gate: gateAccepts(w), merged: outcome(merged), merges: w.github.mergeCount };
+    expect(attempt, JSON.stringify(observed)).toMatchObject(V48_REFUSAL);
+    expect(supersededFlags(w)).toEqual(flags);
+    expect(observed.gate).toEqual({ satisfied: false, digest: false });
+    expect(merged.reasonCode, JSON.stringify(observed)).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect({ writes: writesToGitHub(w) - writes, merges: w.github.mergeCount }).toEqual({ writes: 0, merges: 0 });
+  });
+
+  it("ODV48 at the gate and the kernel publish: refused after approval, the withdrawal is refused and gatePublish refuses with 0 GitHub writes", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    decide(w, ITEM_B, false, "owner refused before publish");
+    const writes = writesToGitHub(w);
+    const attempt = withdraw(w, refusalOf(w, ITEM_B).artifactId);
+    const published = await w.harness.cp.github.gatePublish(w.payload, w.identity);
+    const observed = { gate: gateAccepts(w), published: outcome(published), checks: w.github.checkRuns.length };
+    expect(attempt, JSON.stringify(observed)).toMatchObject(V48_REFUSAL);
+    expect(observed.gate).toEqual({ satisfied: false, digest: false });
+    expect(published.reasonCode, JSON.stringify(observed)).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect({ writes: writesToGitHub(w) - writes, checks: w.github.checkRuns.length, merges: w.github.mergeCount })
+      .toEqual({ writes: 0, checks: 0, merges: 0 });
+  });
+
+  it("ODV48 at CEO CONFIRM: approve, then refuse; the withdrawal is refused, and CONFIRM and gatePublish refuse with 0 GitHub writes", async () => {
+    const w = await world([ITEM_A], { packetOnly: true });
+    decide(w, ITEM_B, true, "approved first");
+    decide(w, ITEM_B, false, "then refused");
+    const attempt = withdraw(w, refusalOf(w, ITEM_B).artifactId);
+    const confirmed = ceoConfirm(w);
+    const observed = { gate: gateAccepts(w), confirmed: outcome(confirmed) };
+    expect(attempt, JSON.stringify(observed)).toMatchObject(V48_REFUSAL);
+    expect(confirmed, JSON.stringify(observed)).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
+    expect((await w.harness.cp.github.gatePublish(w.payload, w.identity)).reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect({ writes: writesToGitHub(w), checks: w.github.checkRuns.length, merges: w.github.mergeCount })
+      .toEqual({ writes: 0, checks: 0, merges: 0 });
+  });
+
+  it("ODV48 a refusal recorded before SEC-OD1 (labelled \"service\") cannot be withdrawn either: the merge is refused with 0 GitHub writes", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+    const pullNumber = await openPull(w);
+    asBeforeSecOd1(w, () => decide(w, ITEM_B, false, "refused before SEC-OD1"));
+    const legacy = refusalOf(w, ITEM_B);
+    expect(legacy.producedBy).toBe("service");
+    const writes = writesToGitHub(w);
+    const attempt = withdraw(w, legacy.artifactId);
+    const merged = await merge(w, pullNumber);
+    const observed = { gate: gateAccepts(w), merged: outcome(merged), merges: w.github.mergeCount };
+    expect(attempt, JSON.stringify(observed)).toMatchObject(V48_REFUSAL);
+    expect(merged.reasonCode, JSON.stringify(observed)).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect({ writes: writesToGitHub(w) - writes, merges: w.github.mergeCount }).toEqual({ writes: 0, merges: 0 });
+  });
+
+  it("ODV48 the same withdrawal in every other write form on ACP's connection is refused, and the refusal still decides", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    decide(w, ITEM_B, false, "owner refused");
+    const refusal = refusalOf(w, ITEM_B);
+    const other = w.harness.cp.artifacts.list(w.runId).find((artifact) => artifact.kind !== "APPROVAL" && !artifact.superseded)!;
+    expect(other).toBeDefined();
+    const rowid = w.harness.cp.db.get<{ r: number }>("SELECT rowid AS r FROM run_artifacts WHERE artifact_id = ?", [refusal.artifactId])!.r;
+    const flags = supersededFlags(w);
+    const now = w.harness.clock.nowIso();
+    const forms: Array<[string, string, unknown[]]> = [
+      ["UPDATE OR IGNORE", "UPDATE OR IGNORE run_artifacts SET superseded = 1 WHERE artifact_id = ?", [refusal.artifactId]],
+      ["UPDATE OR REPLACE", "UPDATE OR REPLACE run_artifacts SET superseded = 1 WHERE artifact_id = ?", [refusal.artifactId]],
+      ["the text '1'", "UPDATE run_artifacts SET superseded = '1' WHERE artifact_id = ?", [refusal.artifactId]],
+      ["a CTE", "WITH target(id) AS (SELECT ?) UPDATE run_artifacts SET superseded = 1 WHERE artifact_id IN (SELECT id FROM target)", [refusal.artifactId]],
+      ["every APPROVAL of the run", "UPDATE run_artifacts SET superseded = 1 WHERE run_id = ? AND kind = 'APPROVAL'", [w.runId]],
+      ["DELETE", "DELETE FROM run_artifacts WHERE artifact_id = ?", [refusal.artifactId]],
+      ["DELETE of the run (cascade)", "DELETE FROM runs WHERE run_id = ?", [w.runId]],
+      ["INSERT OR REPLACE on its id", `INSERT OR REPLACE INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+        VALUES (?, ?, 'PLAN', ?, NULL, '{}', 'service', ?)`, [refusal.artifactId, w.runId, digestOf("replaced by id"), now]],
+      ["INSERT OR REPLACE on its rowid", `INSERT OR REPLACE INTO run_artifacts (rowid, artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+        VALUES (?, 'art_v48_by_rowid', ?, 'PLAN', ?, NULL, '{}', 'service', ?)`, [rowid, w.runId, digestOf("replaced by rowid"), now]],
+      ["UPDATE OR REPLACE … SET rowid onto it", "UPDATE OR REPLACE run_artifacts SET superseded = 1, rowid = ? WHERE artifact_id = ?", [rowid, other.artifactId]],
+    ];
+    const outcomes = forms.map(([name, sql, params]) => [name, viaDb(w, sql, params) === undefined ? "ADMITTED" : "refused"]);
+    expect(outcomes).toEqual(forms.map(([name]) => [name, "refused"]));
+    for (const [name, sql, params] of forms.slice(0, 5)) expect(viaDb(w, sql, params), name).toMatchObject(V48_REFUSAL);
+    let reinserted: unknown;
+    try {
+      w.harness.cp.db.tx(() => {
+        w.harness.cp.db.run("DELETE FROM run_artifacts WHERE artifact_id = ?", [refusal.artifactId]);
+        w.harness.cp.db.run(
+          `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+           VALUES (?, ?, 'PLAN', ?, NULL, '{}', 'service', ?)`,
+          [refusal.artifactId, w.runId, digestOf("reinserted"), now],
+        );
+      });
+    } catch (error) {
+      reinserted = error;
+    }
+    expect(reinserted).toMatchObject({ evidence: { sqlite: "ARTIFACT_IMMUTABLE" } });
+    expect(supersededFlags(w)).toEqual(flags);
+    expect(refusalOf(w, ITEM_B)).toEqual(refusal);
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+  });
+
+  it("ODV48-LIMIT (CEO 52c3b1e6 (b)): a connection that defines the marker itself, to return 1, withdraws the refusal and the earlier approval decides again", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    decide(w, ITEM_B, false, "owner refused");
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+    const side = new Database(w.harness.cp.config.databasePath);
+    try {
+      side.function("acp_evidence_write_authorized", () => 0);
+      expect(() => side.prepare("UPDATE run_artifacts SET superseded = 1 WHERE artifact_id = ?").run(refusalOf(w, ITEM_B).artifactId))
+        .toThrowError(/OWNER_DECISION_SUPERSEDE_AUTHORITY_DENIED/);
+    } finally {
+      side.close();
+    }
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+    const limit = new Database(w.harness.cp.config.databasePath);
+    try {
+      limit.function("acp_evidence_write_authorized", () => 1);
+      limit.prepare("UPDATE run_artifacts SET superseded = 1 WHERE artifact_id = ?").run(refusalOf(w, ITEM_B).artifactId);
+    } finally {
+      limit.close();
+    }
+    // Stated, not closed: the guard is a boundary against ACP's own Db.run, not against a writer that supplies the marker.
+    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+  });
+});
+
+describe("SEC-OD1 v48 controls: the legitimate paths that change an owner decision's effect still work", () => {
+  it("ODV48-CONTROL the owner's own re-decision through the formal path (approve, refuse, approve) decides each time, never needs the mark, and the last approval publishes and merges", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+    decide(w, ITEM_B, false, "not now");
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+    decide(w, ITEM_B, true, "now yes");
+    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+    expect(decisionLabels(w).filter(([item]) => item === ITEM_B)).toEqual([
+      [ITEM_B, true, OWNER_DECISION_LABEL],
+      [ITEM_B, false, OWNER_DECISION_LABEL],
+      [ITEM_B, true, OWNER_DECISION_LABEL],
+    ]);
+    expect(w.harness.cp.artifacts.list(w.runId, "APPROVAL").filter((artifact) => artifact.superseded)).toEqual([]);
+    expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+    expect(outcome(await merge(w, await openPull(w)))).toBe("ALLOWED");
+    expect(w.github.mergeCount).toBe(1);
+  });
+
+  it("ODV48-CONTROL promoting a new candidate supersedes every owner decision of the old one, canonical and \"service\", and leaves no marker", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    putRefusal(w, { item: ITEM_A });
+    const decisions = () => w.harness.cp.artifacts.list<{ kind?: string }>(w.runId, "APPROVAL").filter((artifact) => artifact.content.kind === "OWNER_DECISION");
+    expect(decisions().map((artifact) => [artifact.producedBy, artifact.superseded])).toEqual([
+      [OWNER_DECISION_LABEL, false],
+      [OWNER_DECISION_LABEL, false],
+      ["service", false],
+    ]);
+    w.harness.cp.runs.promoteCandidate(w.runId, digestOf({ revisedFrom: w.candidate, revision: 1 }));
+    expect(decisions().map((artifact) => artifact.superseded)).toEqual([true, true, true]);
+    expect(markerNow(w)).toBe(0);
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+  });
+
+  it("ODV48-CONTROL invalidating the candidate supersedes every owner decision bound to it and leaves no marker", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    decide(w, ITEM_B, false, "owner refused");
+    const invalidated = w.harness.cp.runs.invalidateCandidate(w.runId, "v48 control: source changed");
+    expect(outcome(invalidated)).toBe("ALLOWED");
+    expect(w.harness.cp.artifacts.list<{ kind?: string }>(w.runId, "APPROVAL")
+      .filter((artifact) => artifact.content.kind === "OWNER_DECISION")
+      .map((artifact) => artifact.superseded)).toEqual([true, true, true]);
+    expect(markerNow(w)).toBe(0);
+  });
+});
+
+describe("SEC-OD1 v48 capability scope: the run engine holds the marker for its one staleness statement", () => {
+  it("ODV48-SCOPE a staleness mark inside a transaction that then fails keeps nothing and leaves no marker; the next Db.run withdrawal is refused", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    decide(w, ITEM_B, false, "owner refused");
+    const flags = supersededFlags(w);
+    let inside: unknown = "not reached";
+    let threw: unknown;
+    try {
+      w.harness.cp.db.tx(() => {
+        w.harness.cp.runs.promoteCandidate(w.runId, digestOf({ revisedFrom: w.candidate, revision: 2 }));
+        inside = markerNow(w);
+        throw new Error("the transaction fails after the staleness mark");
+      });
+    } catch (error) {
+      threw = error;
+    }
+    expect(String(threw)).toMatch(/the transaction fails after the staleness mark/);
+    expect(inside).toBe(0);
+    expect(supersededFlags(w)).toEqual(flags);
+    expect(markerNow(w)).toBe(0);
+    expect(withdraw(w, refusalOf(w, ITEM_B).artifactId)).toMatchObject(V48_REFUSAL);
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+  });
+
+  it("ODV48-SCOPE a staleness statement that throws while the marker is held releases it; nothing is kept", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    decide(w, ITEM_B, false, "owner refused");
+    const flags = supersededFlags(w);
+    const db = w.harness.cp.db;
+    const run = db.run.bind(db);
+    let during: unknown;
+    const spy = vi.spyOn(db, "run").mockImplementation((sql: string, params?: unknown[]) => {
+      if (/UPDATE run_artifacts SET superseded = 1/.test(sql)) {
+        during = markerNow(w);
+        throw new Error("the staleness statement fails");
+      }
+      return run(sql, params);
+    });
+    try {
+      expect(() => w.harness.cp.runs.promoteCandidate(w.runId, digestOf({ revisedFrom: w.candidate, revision: 3 })))
+        .toThrowError(/the staleness statement fails/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(during).toBe(1);
+    expect(markerNow(w)).toBe(0);
+    expect(supersededFlags(w)).toEqual(flags);
+    expect(withdraw(w, refusalOf(w, ITEM_B).artifactId)).toMatchObject(V48_REFUSAL);
+  });
+
+  it("ODV48-SCOPE only the run engine's own capability marks superseded through the Db: none, a forged one, or the production gate's writer is refused", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    decide(w, ITEM_B, false, "owner refused");
+    const flags = supersededFlags(w);
+    const db = w.harness.cp.db as unknown as { supersedeRunArtifacts?: (authority: unknown, runId: string, current: string | null) => unknown };
+    for (const authority of [undefined, {}, w.harness.cp.evidenceWritersForTests().PRODUCTION_READY_PACKET]) {
+      let refusal: unknown;
+      try {
+        db.supersedeRunArtifacts!(authority, w.runId, null);
+      } catch (error) {
+        refusal = error;
+      }
+      expect(refusal).toMatchObject({ reasonCode: ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED });
+    }
+    expect(supersededFlags(w)).toEqual(flags);
+    expect(markerNow(w)).toBe(0);
   });
 });

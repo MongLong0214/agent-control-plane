@@ -1247,16 +1247,9 @@ export class RunEngine {
         candidateSnapshotDigest,
         runId,
       ]);
-      this.db.run(
-        `UPDATE run_artifacts SET superseded = 1
-          WHERE run_id = ?
-            AND (
-              (candidate_snapshot_digest IS NOT NULL AND candidate_snapshot_digest <> ?)
-              OR (kind = 'APPROVAL' AND candidate_snapshot_digest IS NULL)
-            )
-            AND superseded = 0`,
-        [runId, candidateSnapshotDigest],
-      );
+      // SEC-OD1 (v48) — an owner decision bound to the earlier candidate is among these, and its
+      // superseded mark needs the authority this engine holds, for this one statement.
+      this.db.supersedeRunArtifacts(this.#stateTransitions, runId, candidateSnapshotDigest);
       this.audit.record({
         kind: "CANDIDATE_PROMOTED",
         runId,
@@ -1325,11 +1318,8 @@ export class RunEngine {
   ): void {
     const current = this.currentCandidate(runId);
     this.db.run(`UPDATE runs SET current_candidate_digest = NULL WHERE run_id = ?`, [runId]);
-    this.db.run(
-      `UPDATE run_artifacts SET superseded = 1
-        WHERE run_id = ? AND candidate_snapshot_digest IS NOT NULL AND superseded = 0`,
-      [runId],
-    );
+    // SEC-OD1 (v48) — under this engine's authority, as `promoteCandidate`: owner decisions are candidate-bound.
+    this.db.supersedeRunArtifacts(this.#stateTransitions, runId, null);
     this.audit.record({
       kind: "CANDIDATE_INVALIDATED",
       runId,

@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 47;
+export const SCHEMA_VERSION = 48;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -156,8 +156,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   // v43 alone creates the bootstrap application record and its guards (#246 C3).
   /-- -{75}\n-- bootstrap_applications[\s\S]*?CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_delete[\s\S]*?\nEND;/,
   // v44 alone creates the manifest activation grant, its guards, and the two guards over projects and
-  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512); v46 alone, the rowid guards (#1094); v47 alone, the owner-decision guard (SEC-OD1).
-  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/, /-- -{75}\n-- rowid no-replace guards[\s\S]*?CREATE TRIGGER IF NOT EXISTS canonical_turns_rowid_positive[\s\S]*?\nEND;/, /-- CP-HI-06 — SEC-OD1 \(v47\): an owner decision[\s\S]*?CREATE TRIGGER IF NOT EXISTS run_artifacts_owner_decision_authority_guard[\s\S]*?\nEND;/,
+  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512); v46 alone, the rowid guards (#1094); v47 alone, the owner-decision guard (SEC-OD1); v48 alone, its supersede and rowid guards.
+  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/, /-- -{75}\n-- rowid no-replace guards[\s\S]*?CREATE TRIGGER IF NOT EXISTS canonical_turns_rowid_positive[\s\S]*?\nEND;/, /-- CP-HI-06 — SEC-OD1 \(v47\): an owner decision[\s\S]*?CREATE TRIGGER IF NOT EXISTS run_artifacts_owner_decision_authority_guard[\s\S]*?\nEND;/, /-- -{75}\n-- owner-decision supersede guards[\s\S]*?CREATE TRIGGER IF NOT EXISTS run_artifacts_rowid_positive[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -3632,6 +3632,66 @@ const v47: SchemaMigration = {
   checksum: () => migrationChecksum("v47-owner-decision-authority-guard", 47),
 };
 
+/** v48's guards, read from schema.sql by name (SEC-OD1): the supersede guard, then insert by rowid, rowid change, non-positive rowid. */
+export const V48_OWNER_DECISION_SUPERSEDE_TRIGGER_NAMES: readonly string[] = [
+  "run_artifacts_owner_decision_supersede_guard",
+  "run_artifacts_no_rowid_replace",
+  "run_artifacts_rowid_immutable",
+  "run_artifacts_rowid_positive",
+];
+
+/**
+ * SEC-OD1 (CEO 072dbccb). An owner decision stops counting once its one-way superseded mark is set, and
+ * `run_artifacts_content_immutable` lets exactly that flag change. Measured at v47: an ordinary in-process
+ * `Db.run` set it on the owner's exactly bound refusal, the earlier approval decided the item again, and
+ * the kernel merged. v48 adds a BEFORE UPDATE trigger that refuses any change of the flag on an
+ * OWNER_DECISION APPROVAL — the canonical label, or a top-level content kind member of OWNER_DECISION as
+ * v47 reads it, so legacy "service" refusals as well — unless the connection-local evidence marker returns
+ * exactly 1. Only `Db.supersedeRunArtifacts`, which the run engine's capability enters for its one
+ * staleness statement, sets it for an UPDATE.
+ *
+ * The same removal through the hidden rowid: with recursive_triggers off (SQLite's default on a connection
+ * ACP did not open), an insert naming the decision's rowid, or `UPDATE OR REPLACE … SET rowid` onto it,
+ * deleted the decision with every run_artifacts guard silent. v48 adds v46's three rowid guards for
+ * `run_artifacts`, raising its existing RUN_ARTIFACT_NO_REPLACE sentinel. As at v46, the insert guard is
+ * sound only while every rowid is positive, so the step first counts non-positive rowids and refuses if any
+ * exist; it never deletes or renumbers a row, and the outer migration backup restores the original image.
+ *
+ * Additive only: four triggers, no existing body changed, no row touched; rows written before v48 keep
+ * their flags. Each name is checked as v45–v47 check theirs (`assertStepNames`): before the step,
+ * whatever holds it, in any letter case, must be absent or the trigger schema.sql defines, of that type,
+ * on `run_artifacts`, token for token; anything else refuses the step and nothing is dropped or replaced.
+ * `CREATE TRIGGER IF NOT EXISTS` then adds each only where the name is free, so a repeated application
+ * changes nothing. The names are checked again after.
+ *
+ * Limit: a connection that defines `acp_evidence_write_authorized` itself, to return 1, passes the
+ * supersede guard (CEO 52c3b1e6 (b)), and a writer that drops a trigger passes all four; they are a
+ * boundary against ACP's own `Db.run`, not against every raw writer.
+ *
+ * A live database at v47 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v48: SchemaMigration = {
+  id: "v48-owner-decision-supersede-guard",
+  fromVersion: 47,
+  toVersion: 48,
+  apply: (raw) => {
+    const objects = stepTriggerObjects(48, V48_OWNER_DECISION_SUPERSEDE_TRIGGER_NAMES);
+    assertStepNames(raw, 48, objects, "before");
+    const nonPositive = (raw.prepare("SELECT COUNT(*) AS n FROM run_artifacts WHERE rowid <= 0").get() as { n: number }).n;
+    if (nonPositive > 0) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `v48 refuses to guard rowids: run_artifacts holds ${nonPositive} row(s) with rowid <= 0; no row was deleted or renumbered`,
+        { nonPositive: [{ table: "run_artifacts", count: nonPositive }] },
+      );
+    }
+    raw.exec(triggerDdlFor(V48_OWNER_DECISION_SUPERSEDE_TRIGGER_NAMES, 48));
+    assertStepNames(raw, 48, objects, "after");
+  },
+  checksum: () => migrationChecksum("v48-owner-decision-supersede-guard", 48),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -3669,6 +3729,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v45,
   v46,
   v47,
+  v48,
 ]);
 
 interface RequiredTrigger {
@@ -3870,6 +3931,10 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "canonical_turns_rowid_immutable", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
   { name: "canonical_turns_rowid_positive", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
   { name: "run_artifacts_owner_decision_authority_guard", sentinel: "OWNER_DECISION_WRITE_AUTHORITY_DENIED", introducedIn: 47 },
+  { name: "run_artifacts_owner_decision_supersede_guard", sentinel: "OWNER_DECISION_SUPERSEDE_AUTHORITY_DENIED", introducedIn: 48 },
+  { name: "run_artifacts_no_rowid_replace", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 48 },
+  { name: "run_artifacts_rowid_immutable", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 48 },
+  { name: "run_artifacts_rowid_positive", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 48 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [

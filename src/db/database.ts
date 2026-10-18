@@ -1263,6 +1263,56 @@ export class Db {
     }
   }
 
+  /**
+   * SEC-OD1 (v48) — the run engine's one-way staleness mark over a run's artifacts.
+   *
+   * `run_artifacts_owner_decision_supersede_guard` refuses that mark on an owner decision unless the
+   * connection-local evidence marker returns exactly 1. The run engine's capability enters the marker for
+   * this one statement and leaves it in `finally`, as `insertEvidenceArtifact` does for one insert, so a
+   * statement or transaction that fails leaves no marker behind and an ordinary `Db.run` never runs under
+   * it. The statement is fixed here rather than supplied: the capability sets the superseded flag and
+   * nothing else, and `run_artifacts_content_immutable` still holds every other column.
+   *
+   * With a `currentCandidate`, what promoting it supersedes: every artifact bound to another candidate,
+   * and every APPROVAL bound to none. With `null`, what invalidating the candidate supersedes: every
+   * candidate-bound artifact.
+   */
+  supersedeRunArtifacts(
+    authority: RunStateTransitionAuthority,
+    runId: string,
+    currentCandidate: string | null,
+  ): Database.RunResult {
+    if (!RunStateTransitionAuthorityToken.belongsTo(authority, this)) {
+      fail(
+        ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED,
+        "a run's artifacts are marked superseded only with the authority held by the run engine",
+        { runId },
+      );
+    }
+    const [sql, params]: [string, unknown[]] = currentCandidate === null
+      ? [
+        `UPDATE run_artifacts SET superseded = 1
+          WHERE run_id = ? AND candidate_snapshot_digest IS NOT NULL AND superseded = 0`,
+        [runId],
+      ]
+      : [
+        `UPDATE run_artifacts SET superseded = 1
+          WHERE run_id = ?
+            AND (
+              (candidate_snapshot_digest IS NOT NULL AND candidate_snapshot_digest <> ?)
+              OR (kind = 'APPROVAL' AND candidate_snapshot_digest IS NULL)
+            )
+            AND superseded = 0`,
+        [runId, currentCandidate],
+      ];
+    this.#evidenceWriteMarkerDepth += 1;
+    try {
+      return this.run(sql, params);
+    } finally {
+      this.#evidenceWriteMarkerDepth -= 1;
+    }
+  }
+
   all<T>(sql: string, params: unknown[] = []): T[] {
     this.assertUsable();
     assertReadQuery(sql);
@@ -1428,6 +1478,9 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   // SEC-OD1 (v47) — an owner decision written without the production gate's capability; the same
   // code `putOwnerDecision` refuses with, so the two refusals of one condition read alike.
   OWNER_DECISION_WRITE_AUTHORITY_DENIED: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+  // SEC-OD1 (v48) — an owner decision's superseded mark set without that capability withdraws the
+  // decision as surely as a forged one adds it, so it reads as the same refusal.
+  OWNER_DECISION_SUPERSEDE_AUTHORITY_DENIED: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
   ARTIFACT_IMMUTABLE: ReasonCode.CONFLICT,
   GITHUB_RECEIPT_IMMUTABLE: ReasonCode.CONFLICT,
   GITHUB_RECEIPT_PROTOCOL_VIOLATION: ReasonCode.GITHUB_RECEIPT_PROTOCOL_VIOLATION,

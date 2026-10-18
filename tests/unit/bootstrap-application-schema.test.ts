@@ -133,9 +133,9 @@ describe("v43: the bootstrap application record (#246 C3)", () => {
     approveMigration(path, "v42 to v43 fixture");
     const migrated = openDb(path);
     try {
-      // #246 B2-b adds v44, #512 v45, #1094 v46 and SEC-OD1 v47 on top; this row is about v43, which the chain still runs in order.
-      expect(SCHEMA_VERSION).toBe(47);
-      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(47);
+      // #246 B2-b adds v44, #512 v45, #1094 v46 and SEC-OD1 v47 and v48 on top; this row is about v43, which the chain still runs in order.
+      expect(SCHEMA_VERSION).toBe(48);
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(48);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 42 ORDER BY version`,
       )).toEqual([
@@ -145,6 +145,7 @@ describe("v43: the bootstrap application record (#246 C3)", () => {
         { version: 45, migration_id: "v45-first-manifest-activation" },
         { version: 46, migration_id: "v46-rowid-no-replace" },
         { version: 47, migration_id: "v47-owner-decision-authority-guard" },
+        { version: 48, migration_id: "v48-owner-decision-supersede-guard" },
       ]);
       const objects = (type: string) =>
         migrated.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = ?`, [type]).map((row) => row.name);
