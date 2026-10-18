@@ -156,6 +156,20 @@ const statusOf = (error: unknown): number | null => {
   return typeof status === "number" ? status : null;
 };
 
+/** FIX-1147-R1 — the value `requestOutcome` carries on a request that may have run with no answer heard. */
+export const REQUEST_OUTCOME_UNKNOWN = "unknown";
+
+/**
+ * FIX-1147-R1 — whether a port failure is the port's mark of a request that may have run and was
+ * never answered (`spawnGh` refusing a body `gh` did not take). Read from the failure's structured
+ * evidence only: a message is cut short by whoever reports it and can lose the very word.
+ */
+export const requestOutcomeUnknown = (error: unknown): boolean => {
+  if (!isAcpError(error)) return false;
+  const outcome = (error.evidence as { requestOutcome?: unknown } | undefined)?.requestOutcome;
+  return outcome === REQUEST_OUTCOME_UNKNOWN;
+};
+
 /** A 404 is "absent". Every other failure — including an unreadable one — propagates. */
 const absentOn404 = async <T>(read: () => Promise<T>): Promise<T | null> => {
   try {
@@ -450,8 +464,9 @@ const GH_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
  * answered and never retried. `gh api --input -` streams stdin as the request body, so `gh` can be
  * acting while the body is still being written, and nothing here sees when it does: a stdin error is
  * not evidence that GitHub saw no request, and an exit 0 beside one is not an answer about this body.
- * The missing status is the port's existing mark of an unheard request (`transportOutcome`), which
- * keeps the producer's pending intent for it in doubt.
+ * The missing status is the port's existing mark of an unheard request (`transportOutcome`), and
+ * `requestOutcome` says it may have run; the producer keeps both as structured evidence in its
+ * refusal (`requestOutcomeUnknown`, FIX-1147-R1), and its pending intent for the request in doubt.
  */
 const spawnGh: GhRunner = (args, stdin) =>
   new Promise((resolvePromise, reject) => {
@@ -504,7 +519,7 @@ const spawnGh: GhRunner = (args, stdin) =>
             `gh ${args.join(" ")} did not take its ${inputBytes}-byte body (${how}), so whether GitHub acted on the request is unknown: ${stderr.trim().slice(0, 300)}`,
             {
               status: null,
-              requestOutcome: "unknown",
+              requestOutcome: REQUEST_OUTCOME_UNKNOWN,
               inputBytes,
               stdinError: stdinError === undefined ? null : (stdinError.code ?? stdinError.message),
               stdinFinished,

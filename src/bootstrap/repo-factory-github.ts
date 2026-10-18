@@ -20,6 +20,8 @@ import { git, tryRevParse } from "../git/git.ts";
 import {
   isGitHubNodeId,
   parseGitHubIdentity,
+  REQUEST_OUTCOME_UNKNOWN,
+  requestOutcomeUnknown,
   sameGitHubName,
   type BranchProtectionState,
   type GitHubRepositoryTarget,
@@ -742,10 +744,19 @@ const normalizedProtection = (state: ComparableProtection): ObservedBranchProtec
 const sameProtection = (observed: ObservedBranchProtection, desired: BranchProtectionState): boolean =>
   canonicalJson(normalizedProtection(observed)) === canonicalJson(normalizedProtection(desired));
 
+/**
+ * What a refusal keeps of a failure: its message, cut short, and the structure that classifies it.
+ * FIX-1147-R1 — a request the port marks as possibly run with no answer heard keeps that mark,
+ * `status: null` and `requestOutcome: "unknown"`, as values; nothing reads it back out of the message,
+ * which the cut can shorten past the very word.
+ */
 const describeFailure = (error: unknown): Evidence => {
   const message = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
   if (!isAcpError(error)) return { message };
   const status = (error.evidence as { status?: unknown }).status;
+  if (requestOutcomeUnknown(error)) {
+    return { message, status: typeof status === "number" ? status : null, requestOutcome: REQUEST_OUTCOME_UNKNOWN };
+  }
   return typeof status === "number" ? { message, status } : { message };
 };
 
@@ -777,7 +788,8 @@ export const applyGitHubOperations = async (
   /**
    * Every failure stops here, carrying exactly what this attempt completed. `resumable` says
    * whether retrying the same operation can make progress without a person: a remote that
-   * refused or did not answer can be retried; a wrong target or a drifted resource cannot.
+   * refused or did not answer can be retried; a wrong target or a drifted resource cannot, and
+   * neither can a request that may have run with its outcome unknown (FIX-1147-R1).
    */
   const stop = <T>(
     reasonCode: ReasonCode,
@@ -803,6 +815,20 @@ export const applyGitHubOperations = async (
     try {
       return allow(ReasonCode.OK, await call());
     } catch (error) {
+      // FIX-1147-R1 — a request the port says may have run, unanswered (a create, setting or
+      // protection body `gh` did not take), is no refusal and no retry: it is kept in doubt, as an
+      // unidentified create answer is. Its pending intent stays in the ledger, and only the reconciliation
+      // every later attempt makes first (`unresolvedPending`, the runner's pending check) decides it.
+      if (requestOutcomeUnknown(error)) {
+        return stop(
+          ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+          "REQUEST_OUTCOME_UNKNOWN",
+          `${operationId ?? "the final readback"}'s request may have reached GitHub, and no answer to it was heard; it is not retried, and any intent it left pending stays in the ledger, reconciled against GitHub before anything is sent again`,
+          operationId,
+          { indeterminate: true, remote: describeFailure(error) },
+          false,
+        );
+      }
       return stop(
         ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
         "REMOTE_REFUSED",
