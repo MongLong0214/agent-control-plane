@@ -3846,6 +3846,95 @@ BEGIN
   SELECT RAISE(ABORT, 'ACTOR_TARGET_BINDING_IMMUTABLE');
 END;
 
+-- ---------------------------------------------------------------------------
+-- rowid no-replace guards (#1094, schema v46)
+--   `outbox`, `inbound_messages` and `canonical_turns` are rowid tables, and their `_no_replace`
+--   triggers compare declared keys only. Measured: an `INSERT OR REPLACE` naming an existing rowid
+--   with a new key replaced that row, and `UPDATE OR REPLACE … SET rowid = <existing>` deleted the
+--   other row, with every declared-key guard silent. Per table, the three guards below refuse both
+--   and an explicit non-positive rowid, raising the table's existing `*_NO_REPLACE` sentinel.
+--   They close REPLACE through the hidden rowid on ACP's connection and on one it did not open. They
+--   are not a boundary against a raw writer, which can drop a trigger.
+--
+--   The positive-rowid guard is what keeps the insert guard sound. In a BEFORE INSERT trigger
+--   `NEW.rowid` is -1 when the statement names no rowid, so one row at rowid -1 would make the insert
+--   guard refuse every ordinary insert; and an automatic rowid is the largest plus one, which stays
+--   non-positive while the largest is. No code writes an explicit rowid to these tables. v46 counts
+--   non-positive rowids first and refuses to install these over a table holding one; it never
+--   deletes or renumbers a row.
+-- ---------------------------------------------------------------------------
+-- CP-HI-06 — a REPLACE naming an existing rowid deletes that message without colliding on its key.
+CREATE TRIGGER IF NOT EXISTS outbox_no_rowid_replace
+BEFORE INSERT ON outbox
+WHEN EXISTS (SELECT 1 FROM outbox WHERE rowid = NEW.rowid)
+BEGIN
+  SELECT RAISE(ABORT, 'OUTBOX_NO_REPLACE');
+END;
+
+-- CP-HI-06 — `UPDATE OR REPLACE … SET rowid` onto another row deletes that row; a row's rowid is fixed.
+CREATE TRIGGER IF NOT EXISTS outbox_rowid_immutable
+BEFORE UPDATE ON outbox
+WHEN NEW.rowid IS NOT OLD.rowid
+BEGIN
+  SELECT RAISE(ABORT, 'OUTBOX_NO_REPLACE');
+END;
+
+-- CP-HI-06 — a non-positive rowid is what would turn the insert guard against ordinary inserts.
+CREATE TRIGGER IF NOT EXISTS outbox_rowid_positive
+AFTER INSERT ON outbox
+WHEN NEW.rowid <= 0
+BEGIN
+  SELECT RAISE(ABORT, 'OUTBOX_NO_REPLACE');
+END;
+
+-- CP-HI-06 — a REPLACE naming an existing rowid deletes an admitted nonce without colliding on its key.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_no_rowid_replace
+BEFORE INSERT ON inbound_messages
+WHEN EXISTS (SELECT 1 FROM inbound_messages WHERE rowid = NEW.rowid)
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_MESSAGE_NO_REPLACE');
+END;
+
+-- CP-HI-06 — `UPDATE OR REPLACE … SET rowid` onto another row deletes that row; a row's rowid is fixed.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_rowid_immutable
+BEFORE UPDATE ON inbound_messages
+WHEN NEW.rowid IS NOT OLD.rowid
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_MESSAGE_NO_REPLACE');
+END;
+
+-- CP-HI-06 — a non-positive rowid is what would turn the insert guard against ordinary inserts.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_rowid_positive
+AFTER INSERT ON inbound_messages
+WHEN NEW.rowid <= 0
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_MESSAGE_NO_REPLACE');
+END;
+
+-- CP-HI-06 — a REPLACE naming an existing rowid deletes a turn without colliding on its key.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_no_rowid_replace
+BEFORE INSERT ON canonical_turns
+WHEN EXISTS (SELECT 1 FROM canonical_turns WHERE rowid = NEW.rowid)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_NO_REPLACE');
+END;
+
+-- CP-HI-06 — `UPDATE OR REPLACE … SET rowid` onto another row deletes that row; a row's rowid is fixed.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_rowid_immutable
+BEFORE UPDATE ON canonical_turns
+WHEN NEW.rowid IS NOT OLD.rowid
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_NO_REPLACE');
+END;
+
+-- CP-HI-06 — a non-positive rowid is what would turn the insert guard against ordinary inserts.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_rowid_positive
+AFTER INSERT ON canonical_turns
+WHEN NEW.rowid <= 0
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_NO_REPLACE');
+END;
+
 
 INSERT OR IGNORE INTO continuity_state (id, mode, changed_at)
 VALUES (1, 'NORMAL', '1970-01-01T00:00:00.000Z');

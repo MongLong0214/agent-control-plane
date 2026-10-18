@@ -1291,7 +1291,17 @@ describe("a rollback preserves every write made since its pair was sealed (SSOT 
     let declaredBefore: unknown;
     writeTo(fixture.databasePath, (raw) => {
       declaredBefore = raw.prepare(declared).all();
-      expect(raw.prepare("UPDATE inbound_messages SET rowid = 100 WHERE nonce = 'm1'").run().changes).toBe(1);
+      // Since v46 (#1094) an UPDATE of the rowid is refused, so the row is moved the other way a
+      // writer still has: deleted under the ingress delete authority, which this raw connection
+      // defines for itself, and inserted again, every declared value as it was, at rowid 100.
+      expect(() => raw.prepare("UPDATE inbound_messages SET rowid = 100 WHERE nonce = 'm1'").run())
+        .toThrow(/INBOUND_MESSAGE_NO_REPLACE/);
+      raw.function("acp_ingress_delete_authorized", { varargs: true }, () => 1);
+      const [row] = declaredBefore as Array<Record<string, unknown>>;
+      const columns = Object.keys(row!);
+      expect(raw.prepare("DELETE FROM inbound_messages WHERE nonce = 'm1'").run().changes).toBe(1);
+      raw.prepare(`INSERT INTO inbound_messages (rowid, ${columns.join(", ")}) VALUES (100, ${columns.map(() => "?").join(", ")})`)
+        .run(...columns.map((column) => row![column] as never));
       // Only the hidden identity moved. Every declared value is what it was, and the moved value is
       // one `pendingOwnerMessages` hands out as `arrivalSequence`.
       expect(raw.prepare(declared).all()).toEqual(declaredBefore);

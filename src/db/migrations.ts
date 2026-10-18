@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 45;
+export const SCHEMA_VERSION = 46;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -152,8 +152,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   // v43 alone creates the bootstrap application record and its guards (#246 C3).
   /-- -{75}\n-- bootstrap_applications[\s\S]*?CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_delete[\s\S]*?\nEND;/,
   // v44 alone creates the manifest activation grant, its guards, and the two guards over projects and
-  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512).
-  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/,
+  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512); v46 alone, the rowid guards (#1094).
+  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/, /-- -{75}\n-- rowid no-replace guards[\s\S]*?CREATE TRIGGER IF NOT EXISTS canonical_turns_rowid_positive[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -3508,6 +3508,61 @@ const v45: SchemaMigration = {
   checksum: () => migrationChecksum("v45-first-manifest-activation", 45),
 };
 
+/** The three rowid tables #1094 names, each guarded by the three v46 triggers below. */
+const V46_ROWID_TABLES = ["outbox", "inbound_messages", "canonical_turns"] as const;
+
+/** v46's guards, read from schema.sql by name: per table, insert by rowid, rowid change, non-positive rowid. */
+export const V46_ROWID_TRIGGER_NAMES: readonly string[] = [
+  "outbox_no_rowid_replace",
+  "outbox_rowid_immutable",
+  "outbox_rowid_positive",
+  "inbound_messages_no_rowid_replace",
+  "inbound_messages_rowid_immutable",
+  "inbound_messages_rowid_positive",
+  "canonical_turns_no_rowid_replace",
+  "canonical_turns_rowid_immutable",
+  "canonical_turns_rowid_positive",
+];
+
+/**
+ * #1094. `outbox`, `inbound_messages` and `canonical_turns` are rowid tables whose `_no_replace`
+ * triggers compare declared keys only, so a REPLACE that names an existing rowid with a new key, or an
+ * `UPDATE OR REPLACE` that moves a row onto another row's rowid, deleted that row. v46 adds three
+ * triggers per table, each raising the table's existing `*_NO_REPLACE` sentinel. They close REPLACE
+ * through the hidden rowid on any connection; they are not a boundary against a raw writer.
+ *
+ * Additive only: nine triggers, no existing body changed, no row touched, no backfill. The insert guard
+ * is sound only while every rowid is positive (`NEW.rowid` is -1 in a BEFORE INSERT trigger when no
+ * rowid is named), so the step first counts non-positive rowids in each table and refuses, naming each
+ * table and its count, if any exist. It never deletes or renumbers a row; the outer migration backup
+ * restores the original image. The triggers are dropped and recreated, so an image that already holds
+ * them is accepted with schema.sql's bodies.
+ *
+ * A live database at v45 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v46: SchemaMigration = {
+  id: "v46-rowid-no-replace",
+  fromVersion: 45,
+  toVersion: 46,
+  apply: (raw) => {
+    const nonPositive = V46_ROWID_TABLES.flatMap((table) => {
+      const count = (raw.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE rowid <= 0`).get() as { n: number }).n;
+      return count > 0 ? [{ table, count }] : [];
+    });
+    if (nonPositive.length > 0) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `v46 refuses to guard rowids: ${nonPositive.map(({ table, count }) => `${table} holds ${count} row(s) with rowid <= 0`).join("; ")}; no row was deleted or renumbered`,
+        { nonPositive },
+      );
+    }
+    raw.exec(dropsFor(V46_ROWID_TRIGGER_NAMES));
+    raw.exec(triggerDdlFor(V46_ROWID_TRIGGER_NAMES, 46));
+  },
+  checksum: () => migrationChecksum("v46-rowid-no-replace", 46),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -3543,6 +3598,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v43,
   v44,
   v45,
+  v46,
 ]);
 
 interface RequiredTrigger {
@@ -3734,6 +3790,15 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "manifest_first_activation_grants_consumed_while_null", sentinel: "MANIFEST_FIRST_ACTIVATION_DENIED", introducedIn: 45 },
   { name: "manifest_first_activation_grants_no_delete", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
   { name: "manifest_activation_grants_not_first", sentinel: "MANIFEST_GRANT_NO_REPLACE", introducedIn: 45 },
+  { name: "outbox_no_rowid_replace", sentinel: "OUTBOX_NO_REPLACE", introducedIn: 46 },
+  { name: "outbox_rowid_immutable", sentinel: "OUTBOX_NO_REPLACE", introducedIn: 46 },
+  { name: "outbox_rowid_positive", sentinel: "OUTBOX_NO_REPLACE", introducedIn: 46 },
+  { name: "inbound_messages_no_rowid_replace", sentinel: "INBOUND_MESSAGE_NO_REPLACE", introducedIn: 46 },
+  { name: "inbound_messages_rowid_immutable", sentinel: "INBOUND_MESSAGE_NO_REPLACE", introducedIn: 46 },
+  { name: "inbound_messages_rowid_positive", sentinel: "INBOUND_MESSAGE_NO_REPLACE", introducedIn: 46 },
+  { name: "canonical_turns_no_rowid_replace", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
+  { name: "canonical_turns_rowid_immutable", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
+  { name: "canonical_turns_rowid_positive", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [

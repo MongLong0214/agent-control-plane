@@ -1244,7 +1244,8 @@ describe("versioned SQLite migration", () => {
         [42, "v42-session-credential-epoch"],
         [43, "v43-bootstrap-application-record"],
         [44, "v44-manifest-activation-grant"],
-        [SCHEMA_VERSION, "v45-first-manifest-activation"],
+        [45, "v45-first-manifest-activation"],
+        [SCHEMA_VERSION, "v46-rowid-no-replace"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

@@ -8,6 +8,7 @@ import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
 import { installMigrationLedger } from "../../src/db/migrations.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { dropV46Triggers } from "../helpers/released-v46-schema.ts";
 import { fileCore, seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 /**
@@ -92,6 +93,8 @@ const v42Image = (seed?: (raw: Database.Database) => void): { path: string; befo
   world.db.close();
   const legacy = new Database(path);
   try {
+    // Nothing of v46's (#1094) stays in an image of an earlier version.
+    dropV46Triggers(legacy);
     legacy.exec(V43_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n"));
     legacy.exec(`DROP TABLE bootstrap_applications`);
     seed?.(legacy);
@@ -125,9 +128,9 @@ describe("v43: the bootstrap application record (#246 C3)", () => {
     approveMigration(path, "v42 to v43 fixture");
     const migrated = openDb(path);
     try {
-      // #246 B2-b adds v44 and #512 v45 on top; this row is about v43, which the chain still runs in order.
-      expect(SCHEMA_VERSION).toBe(45);
-      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(45);
+      // #246 B2-b adds v44, #512 v45 and #1094 v46 on top; this row is about v43, which the chain still runs in order.
+      expect(SCHEMA_VERSION).toBe(46);
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(46);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 42 ORDER BY version`,
       )).toEqual([
@@ -135,6 +138,7 @@ describe("v43: the bootstrap application record (#246 C3)", () => {
         { version: 43, migration_id: "v43-bootstrap-application-record" },
         { version: 44, migration_id: "v44-manifest-activation-grant" },
         { version: 45, migration_id: "v45-first-manifest-activation" },
+        { version: 46, migration_id: "v46-rowid-no-replace" },
       ]);
       const objects = (type: string) =>
         migrated.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = ?`, [type]).map((row) => row.name);

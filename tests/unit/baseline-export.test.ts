@@ -1084,6 +1084,7 @@ describe("baseline boundary contracts", () => {
       "v43-bootstrap-application-record",
       "v44-manifest-activation-grant",
       "v45-first-manifest-activation",
+      "v46-rowid-no-replace",
     ]);
   });
 

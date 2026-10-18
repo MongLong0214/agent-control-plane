@@ -9,6 +9,7 @@ import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
 import { installMigrationLedger } from "../../src/db/migrations.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { dropV46Triggers } from "../helpers/released-v46-schema.ts";
 import { fileCore, seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 /**
@@ -129,6 +130,8 @@ const v39Image = (seed?: (raw: Database.Database) => void): { path: string; befo
 
   const legacy = new Database(path);
   try {
+    // Nothing of v46's (#1094) stays in an image of an earlier version.
+    dropV46Triggers(legacy);
     legacy.exec([...V41_TRIGGERS, ...V40_TRIGGERS].map((name) => `DROP TRIGGER ${name};`).join("\n"));
     for (const column of V41_COLUMNS) legacy.exec(`ALTER TABLE task_executions DROP COLUMN ${column}`);
     legacy.exec(`DROP INDEX peer_message_carries_by_successor; DROP INDEX peer_message_refusal_notices_by_role;`);
@@ -172,8 +175,8 @@ describe("integration of v40 (#1068) and v41 (#512 PR-B) from a v39 database", (
     approveMigration(path, "v39 to v41 integration fixture");
     const migrated = openDb(path);
     try {
-      // #246 C1b adds v42, C3 v43, B2-b v44 and #512 v45 on top; this row is about v40 and v41, which the chain still runs in order.
-      expect(SCHEMA_VERSION).toBe(45);
+      // #246 C1b adds v42, C3 v43, B2-b v44, #512 v45 and #1094 v46 on top; this row is about v40 and v41, which the chain still runs in order.
+      expect(SCHEMA_VERSION).toBe(46);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 39 ORDER BY version`,
@@ -185,6 +188,7 @@ describe("integration of v40 (#1068) and v41 (#512 PR-B) from a v39 database", (
         { version: 43, migration_id: "v43-bootstrap-application-record" },
         { version: 44, migration_id: "v44-manifest-activation-grant" },
         { version: 45, migration_id: "v45-first-manifest-activation" },
+        { version: 46, migration_id: "v46-rowid-no-replace" },
       ]);
       const triggers = migrated.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'trigger'`).map((row) => row.name);
       for (const name of [...V40_TRIGGERS, ...V41_TRIGGERS]) expect(triggers, name).toContain(name);

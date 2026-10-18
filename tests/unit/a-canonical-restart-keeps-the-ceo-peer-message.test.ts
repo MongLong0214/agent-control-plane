@@ -44,6 +44,7 @@ import {
 } from "../../src/registry/canonical-self-claim.ts";
 import { cleanupTempDirs, makeCore, makeRepo, seedRun, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { dropV46Triggers } from "../helpers/released-v46-schema.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -1587,6 +1588,8 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     );
     db.close();
     const legacy = new Database(path);
+    // Nothing of v46's (#1094) stays in an image of an earlier version.
+    dropV46Triggers(legacy);
     legacy.exec(CARRY_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n"));
     // Finding 01's departure records, their outbox and ingress triggers and the id guard: v40's too.
     legacy.exec(`${DEPARTURE_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n")}
@@ -1636,8 +1639,8 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     approveMigration(path, "ACP-PEER-SUCCESSION-01 v38 fixture");
     const migrated = openDb(path);
     try {
-      // v41 (#512), v42 (#246 C1b), v43 (#246 C3), v44 (#246 B2-b) and v45 (#512) follow on the same approved chain.
-      expect(SCHEMA_VERSION).toBe(45);
+      // v41 (#512), v42 (#246 C1b), v43 (#246 C3), v44 (#246 B2-b), v45 (#512) and v46 (#1094) follow on the same approved chain.
+      expect(SCHEMA_VERSION).toBe(46);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 38 ORDER BY version`,
@@ -1650,6 +1653,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
         { version: 43, migration_id: "v43-bootstrap-application-record" },
         { version: 44, migration_id: "v44-manifest-activation-grant" },
         { version: 45, migration_id: "v45-first-manifest-activation" },
+        { version: 46, migration_id: "v46-rowid-no-replace" },
       ]);
       expect(migrated.all<{ name: string }>(
         `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'peer_message_carries' ORDER BY name`,
@@ -1943,7 +1947,7 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
     }
   });
 
-  it("W3 the departure refuses raw UPDATE, DELETE and REPLACE, and survives the outbox row being deleted and re-inserted", async () => {
+  it("W3 the departure refuses raw UPDATE, DELETE and REPLACE, and survives its outbox row put back, which can no longer be deleted or replaced by rowid", async () => {
     const fixture = await startFixture();
     const external = new Database(join(fixture.harness.root, "state.sqlite"));
     try {
@@ -1987,9 +1991,10 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
       }
       expect(departures()).toEqual([departure]);
 
-      // The outbox row deleted and re-inserted under the same id, as a message nobody was handed. A
-      // plain DELETE of a row that left PENDING is refused; a REPLACE through its hidden rowid, on this
-      // connection with recursive triggers off, still removes it, and the departure stands regardless.
+      // The outbox row taken out and brought back under the same id, as a message nobody was handed. A
+      // plain DELETE of a row that left PENDING is refused, and since v46 (#1094) so is the REPLACE through
+      // its hidden rowid that used to remove it on this connection: the row stays as it was. What is left
+      // is the same row put back to PENDING in place, and the departure stands regardless.
       const row = external.prepare(`SELECT * FROM outbox WHERE message_id = ?`).get(id) as Record<string, unknown>;
       expect(() => external.prepare(`DELETE FROM outbox WHERE message_id = ?`).run(id))
         .toThrow(/OUTBOX_DEPARTED_ROW_NO_DELETE/);
@@ -1999,14 +2004,11 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
         status: "REJECTED", payload_json: "{}",
       };
       const decoyColumns = Object.keys(decoy);
-      external.prepare(
+      expect(() => external.prepare(
         `REPLACE INTO outbox (rowid, ${decoyColumns.join(", ")}) VALUES (?, ${decoyColumns.map(() => "?").join(", ")})`,
-      ).run(target.r, ...decoyColumns.map((column) => decoy[column] as never));
-      expect(rowOf(fixture, id)).toBeUndefined();
-      const reborn: Record<string, unknown> = { ...row, status: "PENDING", attempts: 0, sent_at: null, claim_token: null, claimed_at: null };
-      const columns = Object.keys(reborn);
-      external.prepare(`INSERT INTO outbox (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`)
-        .run(...columns.map((column) => reborn[column] as never));
+      ).run(target.r, ...decoyColumns.map((column) => decoy[column] as never))).toThrow(/OUTBOX_NO_REPLACE/);
+      expect(rowOf(fixture, id)).toEqual(row);
+      putBack(fixture, id);
       expect(rowOf(fixture, id)).toMatchObject({ status: "PENDING", attempts: 0, sent_at: null });
       expect(departures()).toEqual([departure]);
 
@@ -2294,7 +2296,11 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
       ledger.claim(holder);
       const original = external.prepare(`SELECT * FROM outbox WHERE message_id = ?`).get(first!.message_id) as
         Record<string, unknown>;
-      // The plain DELETE, as the review ran it; where it is refused, the hidden rowid is the way round.
+      // The plain DELETE, as the review ran it; where it is refused, the hidden rowid was the way round
+      // until v46 (#1094) refused that as well, so the original row stays. Put back to PENDING, as W5's
+      // writer does, it is withheld by its own departure and leaves the holder nothing in flight, as the
+      // deleted row did. The re-created row is inserted under a new id all the same: the row this
+      // witness is about.
       let plainDelete: unknown = null;
       try {
         external.prepare(`DELETE FROM outbox WHERE message_id = ?`).run(first!.message_id);
@@ -2309,10 +2315,11 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
           status: "REJECTED", payload_json: "{}",
         };
         const columns = Object.keys(decoy);
-        external.prepare(`REPLACE INTO outbox (rowid, ${columns.join(", ")}) VALUES (?, ${columns.map(() => "?").join(", ")})`)
-          .run(target.r, ...columns.map((column) => decoy[column] as never));
+        expect(() => external.prepare(`REPLACE INTO outbox (rowid, ${columns.join(", ")}) VALUES (?, ${columns.map(() => "?").join(", ")})`)
+          .run(target.r, ...columns.map((column) => decoy[column] as never))).toThrow(/OUTBOX_NO_REPLACE/);
       }
-      expect(rowOf(fixture, first!.message_id)).toBeUndefined();
+      expect(rowOf(fixture, first!.message_id)).toEqual(original);
+      putBack(fixture, first!.message_id);
       copyAs(original, `${first!.message_id}_again`);
 
       await fixture.ceoSays("그 뒤에 온 진짜 지시");
@@ -2348,8 +2355,10 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
   it("W11 01(c): a turn the ingress completed is never carried, however its terminal fact is erased afterwards", async () => {
     const fixture = await startFixture();
     const external = new Database(join(fixture.harness.root, "state.sqlite"));
-    // An outside writer defines the ingress claim authority on its own connection to re-insert a claim.
+    // An outside writer defines the ingress claim authority on its own connection to re-insert a claim,
+    // and the ingress delete authority to remove the admitted row first.
     external.function("acp_ingress_claim_authorized", { varargs: true }, () => 1);
+    external.function("acp_ingress_delete_authorized", { varargs: true }, () => 1);
     try {
       const { harness } = fixture;
       const guard = new IngressGuard(harness.cp.db, harness.clock, harness.cp.audit, {});
@@ -2366,11 +2375,16 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
           WHERE channel = 'buzz' AND nonce = ?`,
         [buzzMessageNonce(erased.id)],
       );
-      // The admitted row deleted through its hidden rowid and inserted again without the fact.
+      // The admitted row deleted and inserted again without the fact. Through its hidden rowid that is
+      // refused since v46 (#1094), and the row stays; the outside writer deletes it outright instead.
       const row = external.prepare(`SELECT rowid AS r, * FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`)
         .get(buzzMessageNonce(recreated.id)) as Record<string, unknown>;
-      external.prepare(`REPLACE INTO inbound_messages (rowid, channel, nonce, actor, received_at) VALUES (?, 'buzz', ?, ?, ?)`)
-        .run(row["r"] as never, "buzz-message:decoy", "decoy", harness.clock.nowIso());
+      expect(() => external.prepare(`REPLACE INTO inbound_messages (rowid, channel, nonce, actor, received_at) VALUES (?, 'buzz', ?, ?, ?)`)
+        .run(row["r"] as never, "buzz-message:decoy", "decoy", harness.clock.nowIso())).toThrow(/INBOUND_MESSAGE_NO_REPLACE/);
+      expect(external.prepare(`SELECT rowid AS r, * FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`)
+        .get(buzzMessageNonce(recreated.id))).toEqual(row);
+      expect(external.prepare(`DELETE FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`)
+        .run(buzzMessageNonce(recreated.id)).changes).toBe(1);
       const { r: _rowid, ...kept } = row;
       const claim = JSON.parse(String(kept["turn_claim_json"])) as Record<string, unknown>;
       delete claim["noReplyAt"];
