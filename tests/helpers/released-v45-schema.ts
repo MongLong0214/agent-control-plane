@@ -103,3 +103,48 @@ export const contentDigests = (path: string): { userVersion: number; schema: str
     raw.close();
   }
 };
+
+/**
+ * The v45 freeze: like v38–v44 (V45-A0), the released v45 step reads its own frozen snapshot,
+ * `src/db/schema-v45.sql`, a byte copy of `schema.sql` at the commit below, so a later schema change
+ * cannot change what a database receives at its v45 step. Every value here was measured with the
+ * pre-change code at that commit and is transcribed, not recomputed: a value a run derives from the
+ * file it is checking agrees with whatever file it is handed.
+ */
+export const V45_FREEZE_BASE_COMMIT = "04a97e36cc0215c5f8a7f4961e2036f858707a06";
+
+export const V45_SNAPSHOT_PATH = "src/db/schema-v45.sql";
+/** `git rev-parse 04a97e36:src/db/schema.sql`, the v45 canonical source. */
+export const V45_SNAPSHOT_GIT_BLOB = "aee08ad7b91d7e7c7ada0000f6ea7cea8d830489";
+export const V45_SNAPSHOT_SHA256 = "70821ad69e99dc006a21751558b2f4eaec1001146e7b65f1e4b052453622a7bf";
+
+/** v45's receipt checksum as the pre-change build computed it. */
+export const V45_BASE_CHECKSUM = "sha256:4263f0011ebdd53fb8e645f55b4e391e8247755debd8961fe74c312c983ad1ee";
+
+/**
+ * `digestOfSchemaRows` of the database the pre-change build left at v45: from a v44 image (`toV44Image`
+ * of a database that build wrote, which is also its fresh v45 create), and from the v11 fixture, which
+ * runs every step v12–v45.
+ */
+export const V45_SCHEMA_DIGEST_FROM_V44 =
+  "sha256:992a12b35a87f555b30aac31767a2a04eedf0881c49bc45b31510fe1bad68d60";
+export const V45_SCHEMA_DIGEST_FROM_V11 =
+  "sha256:62b015f331f512a58fa22bcfca251ab5d12902b4ef9a31be6366821d897711ba";
+
+/**
+ * A fresh v45 create, made from the snapshot rather than from whatever `schema.sql` holds now. The
+ * bootstrap path applies the schema's DDL and then the migration ledger; nothing else it does
+ * reaches `sqlite_schema`.
+ */
+export const freshV45CreateFromSnapshot = (path: string): string => {
+  const ddl = readFileSync(new URL(`../../${V45_SNAPSHOT_PATH}`, import.meta.url), "utf8")
+    .replace(/^\s*PRAGMA\s+(?:journal_mode|foreign_keys|synchronous)\s*=\s*[^;]+;\s*$/gim, "");
+  const raw = new Database(path);
+  try {
+    raw.exec(ddl);
+    installMigrationLedger(raw);
+  } finally {
+    raw.close();
+  }
+  return path;
+};

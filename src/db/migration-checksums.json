@@ -33,6 +33,7 @@
     "v41-runtime-managed-worker-turns": "sha256:07224d2df964676d25a0c8a35dec7f8d239eca7aacebd69795b5662fedeaafd3",
     "v42-session-credential-epoch": "sha256:a5be3e069535b259d3f70a8140bb44e243cec7c91046bb7caa32946bfd4c353c",
     "v43-bootstrap-application-record": "sha256:7ffb8367eb3fea440422e1f14f9aef48feb1f8ddea826d2888da48353dfac0f1",
-    "v44-manifest-activation-grant": "sha256:06a2f0a829718e98c9b9b606c9e53d7cee40ab69f1beda36ee6716158117b380"
+    "v44-manifest-activation-grant": "sha256:06a2f0a829718e98c9b9b606c9e53d7cee40ab69f1beda36ee6716158117b380",
+    "v45-first-manifest-activation": "sha256:4263f0011ebdd53fb8e645f55b4e391e8247755debd8961fe74c312c983ad1ee"
   }
 }
