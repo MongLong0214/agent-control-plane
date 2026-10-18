@@ -1,0 +1,15 @@
+Limit: a human-gate item is linked to the owner's T3 approval only when the task contract names owner-approval:repo_factory_github_write exactly; free-text items that describe the same approval, such as run_7717's, still need their own OWNER_DECISION
+Warn: an item's own OWNER_DECISION still decides it, so an explicit owner refusal is never overridden by a later T3 approval
+Record-Id: r-3a484ce84c5b
+Provenance: inherited 4ad6755a9944dcdfbcc4dc9f67b7dd3f948a7c9f
+
+Limit: owner-authored events in an open prompt's room now reach the approval matcher through a second subscription filter (authors = owner keys); owner chat there is refused and raises the approval-reply-refused health counter, and the mention subscription, its cursor and admission are unchanged
+Warn: the production gate's T3 link and C3 read one predicate, ownerApprovalHolds: a recorded receipt or a consumption audit row never holds on its own; the anchored execution or a live admitted ingress inside the window decides
+Warn: an approval answer is the token standing alone after trim, checked where it is issued and again where it is consumed, for the threaded reply and the code link alike; a sentence that quotes the token is conversation
+Record-Id: r-65dc6586605b
+Provenance: inherited eed3923508323e0909d0cff927dbb163d86f869d
+
+Limit: ownerApprovalNeed still answers EXECUTION_ANCHORED without comparing the anchor's candidate with the current one; the gate does not read it, so it is outside S10-R2-01
+Warn: an approval anchor admits exactly the candidate it was consumed for: the candidate asked about is compared with the anchor's own candidate, never with the run's current database value, and another candidate is refused APPROVAL_NOT_THIS_CANDIDATE so the linked gate item never holds for it; a same-candidate anchor still holds after its ingress admission is pruned
+Record-Id: r-90bf8c831667
+Provenance: inherited 788cf9fefe88a8f81a88ba9c836ba2056e7302e0
