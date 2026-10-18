@@ -444,6 +444,15 @@ export const ReasonCode = {
    * from "the check did not run", which is the collapse #859 exists to remove.
    */
   GIT_TIMEOUT: "GIT_TIMEOUT",
+  /**
+   * A child given input on its stdin did not take it: the write failed (EPIPE, when the child
+   * exited without reading) or the stream closed before the input was handed over.
+   *
+   * A refusal even when the child exited 0. Its answer was computed without the input it was
+   * asked about, so an exit status reads as a verdict on something nobody gave it (FIX-EPIPE,
+   * where `git fast-import` exiting 0 early would have answered for a branch it never read).
+   */
+  GIT_INPUT_NOT_DELIVERED: "GIT_INPUT_NOT_DELIVERED",
   /** Ordinary conversation arrived while no CEO peer held an authenticated socket. */
   CEO_CONVERSATION_UNAVAILABLE: "CEO_CONVERSATION_UNAVAILABLE",
   /** The connected CEO peer did not declare the `sampling` capability at handshake. */
