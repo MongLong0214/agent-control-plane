@@ -830,8 +830,8 @@ export class ControlPlane {
         bootstrapApplications: this.bootstrapApplications,
         // #246 C3, review 1076-R1-02 — the chain the CEO decision completes on; its finalizer asks too.
         bootstrapCompletionChain: this.bootstrapProducer,
-        // S10 (#246 b) — the scope a human-gate item linked to the owner's T3 approval is judged on.
-        repoFactoryApprovalScopes: this.bootstrapProducer,
+        // S10 (#246 b), S10-R1-01 — the predicate a human-gate item linked to the owner's T3 approval is judged on.
+        repoFactoryApprovals: this.bootstrapProducer,
         sourceReadLeases: this.guard,
         // #246 B2-b — a CONTRACT_CHANGE CONFIRM admits against and issues its activation grant here.
         manifestGrants: this.manifestGrants,

@@ -203,7 +203,9 @@ export const prepareBootstrapRun = async (
   await vi.waitFor(() => expect(processGroupEmpty(writer.processGroup)).toBe(true), { timeout: 10_000, interval: 20 });
   expect(writer.startToken).not.toBeNull();
   runner.attachWriterLock(() => true, () => writer);
-  harness.cp.ceo.attach({ bootstrapCompletionChain: runner });
+  // As production wires one runner for both (S10-R1-01): the gate's T3-linked item reads the predicate
+  // of the runner whose CONFIRM consumes the approval.
+  harness.cp.ceo.attach({ bootstrapCompletionChain: runner, repoFactoryApprovals: runner });
   harness.cp.bootstrap.attachCompletionChain(runner);
   await harness.cp.continuity.evaluate("bootstrap confirmation");
   return {

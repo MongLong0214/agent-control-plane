@@ -567,6 +567,15 @@ export interface BuzzApprovalReplyFilter {
   readonly eventIds: readonly string[];
   /** The earliest `created_at` a reply to any of them may carry. */
   readonly since: number;
+  /**
+   * S10-R1-03 — the configured owner keys whose events in `rooms` are asked for too, on the same
+   * subscription, so an owner's answer under another message reaches the route without a mention or a
+   * reference to the prompt. Delivery only: the route judges each event, and the mention REQ, its
+   * window and its admission are untouched.
+   */
+  readonly ownerAuthors?: readonly string[];
+  /** The open prompts' rooms; the owner keys are asked for in those of this identity's rooms only. */
+  readonly rooms?: readonly string[];
 }
 
 /** One verified event the reply filter matched, on the identity's connection. */
@@ -1608,7 +1617,8 @@ class BuzzMentionSubscription {
 
   /**
    * #246 — sends this identity's owner-approval reply filter on its live connection when it changed:
-   * a `REQ` for the replies to its open prompts, in its own rooms, or a `CLOSE` once none is open.
+   * a `REQ` for the replies to its open prompts, in its own rooms — and, S10-R1-03, for the configured
+   * owner keys' events in those prompts' rooms — or a `CLOSE` once none is open.
    */
   refreshApprovalReplies(): void {
     const route = this.#deps.approvalReplies;
@@ -1619,15 +1629,19 @@ class BuzzMentionSubscription {
     } catch {
       filter = null;
     }
-    const wanted =
-      filter === null || filter.eventIds.length === 0
-        ? null
-        : JSON.stringify({
-            kinds: [BUZZ_MENTION_KIND],
-            "#e": [...filter.eventIds],
-            "#h": this.#rooms,
-            since: Math.max(0, Math.floor(filter.since)),
-          });
+    let wanted: string | null = null;
+    if (filter !== null && filter.eventIds.length > 0) {
+      const since = Math.max(0, Math.floor(filter.since));
+      const filters: Record<string, unknown>[] = [{ kinds: [BUZZ_MENTION_KIND], "#e": [...filter.eventIds], "#h": this.#rooms, since }];
+      // S10-R1-03 — the owner keys' events in the open prompts' rooms, as a second filter of the same REQ.
+      const promptRooms = filter.rooms ?? [];
+      const ownerRooms = this.#rooms.filter((room) => promptRooms.includes(room));
+      const owners = filter.ownerAuthors ?? [];
+      if (owners.length > 0 && ownerRooms.length > 0) {
+        filters.push({ kinds: [BUZZ_MENTION_KIND], authors: [...owners], "#h": ownerRooms, since });
+      }
+      wanted = filters.map((one) => JSON.stringify(one)).join(",");
+    }
     if (wanted === this.#approvalFilter) return;
     const generation = this.#generation;
     if (wanted === null) this.#send(generation, JSON.stringify(["CLOSE", this.#approvalSubscriptionId]));
@@ -2198,7 +2212,7 @@ class BuzzMentionSubscription {
   /**
    * #246 — one event on the owner-approval reply subscription. The same structural and signature
    * checks as a mention, and exactly one room among this identity's; no `p` check, because this
-   * subscription asks by the prompt's id rather than by a mention, and no role judgement, because
+   * subscription asks by the prompt's id, or by the owner key (S10-R1-03), rather than by a mention, and no role judgement, because
    * the route delivers nothing to a role. The route's answer is about this event only: the mention
    * window is not moved and no reconnect follows.
    */

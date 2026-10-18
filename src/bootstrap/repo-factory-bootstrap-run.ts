@@ -9,7 +9,7 @@ import { type Decision, type Evidence, acpError, allow, deny, isAcpError } from 
 import { ReasonCode } from "../core/reason-codes.ts";
 import { type ProjectManifest, assertPortableManifest, manifestDigest } from "../contracts/manifest.ts";
 import { BUZZ_OWNER_APPROVAL_CHANNEL, verifyBuzzApprovalEvidence } from "../buzz/buzz-owner-approval.ts";
-import type { ArtifactStore } from "../db/artifacts.ts";
+import type { ArtifactStore, StoredArtifact } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { holderProvenGone } from "../daemon/single-instance.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
@@ -786,15 +786,7 @@ export class RepoFactoryBootstrapRunner {
     const { runId } = confirmation;
     const missing = (message: string): Decision<ACPBootstrapActivationResult> =>
       deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, message, { stage: "approval", refusal: "APPROVAL_MISSING", runId });
-    const approvals = this.deps.artifacts
-      .list<unknown>(runId, ArtifactKind.APPROVAL)
-      .filter(
-        (artifact) =>
-          !artifact.superseded &&
-          isRecord(artifact.content) &&
-          artifact.content["kind"] === REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND,
-      );
-    const newest = this.executionsOwnApproval(runId, approvals) ?? approvals.at(-1);
+    const newest = this.presentedApproval(runId);
     if (newest === undefined) {
       return missing("a Repo Factory GitHub write needs the owner's approval, and none is recorded for this run");
     }
@@ -811,6 +803,121 @@ export class RepoFactoryBootstrapRunner {
       projectName: recorded.data.projectName,
       handoff: bootstrapActivationHandoff(manifest.value),
     });
+  }
+
+  /**
+   * The recorded Repo Factory decision a CONFIRM presents: the anchored execution's own approval while
+   * the newest decision duplicates it (`executionsOwnApproval`), else the newest. One selection, read
+   * by `produceAndActivateApproved` and by `ownerApprovalHolds`.
+   */
+  private presentedApproval(runId: string): StoredArtifact<unknown> | undefined {
+    const approvals = this.deps.artifacts
+      .list<unknown>(runId, ArtifactKind.APPROVAL)
+      .filter(
+        (artifact) =>
+          !artifact.superseded &&
+          isRecord(artifact.content) &&
+          artifact.content["kind"] === REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND,
+      );
+    return this.executionsOwnApproval(runId, approvals) ?? approvals.at(-1);
+  }
+
+  /**
+   * S10-R1-01 — whether the owner's Repo Factory approval holds now for this run and candidate:
+   * C3's own judgement, read-only, and the one predicate the production gate's linked human-gate
+   * item reads (`REPO_FACTORY_GITHUB_WRITE_GATE_ITEM`). The decision judged is the one a CONFIRM
+   * presents (`presentedApproval`), checked as `apply` checks it: bound to the run's current PLAN
+   * scope and approving it (`approvalReceipt`), then admitted by `approvalAdmission` — named by the
+   * execution's durable approval anchor, or, with no proven anchor and nothing WRITTEN, admitted by
+   * live ingress, unconsumed for this candidate and, for Buzz, inside its prompt's stored window.
+   * A recorded receipt, or a consumption audit row, never holds on its own. Consumes nothing,
+   * writes nothing and syncs nothing.
+   */
+  ownerApprovalHolds(runId: string, candidateSnapshotDigest: string): Decision<OwnerApprovalReceipt> {
+    const refuse = (refusal: string, message: string): Decision<OwnerApprovalReceipt> =>
+      deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, message, { stage: "approval", refusal, runId });
+    const run = this.deps.runs.get(runId);
+    // As `apply` refuses RUN_NOT_PROJECTLESS before any approval is asked.
+    if (run === null || run.kind !== RunKind.PROJECT_BOOTSTRAP || run.projectId !== null) {
+      return refuse("RUN_NOT_PROJECTLESS", "only a project-less PROJECT_BOOTSTRAP run's Repo Factory approval is judged here");
+    }
+    // As `apply` refuses every CONFIRM WORK_ROOT_UNCONFIGURED: without a work root no approval is admitted.
+    const workRoot = this.deps.workRoot;
+    if (workRoot === null) return refuse("WORK_ROOT_UNCONFIGURED", "this deployment has no Repo Factory work root");
+    const scope = this.approvalScopeOf(runId);
+    if (!scope.allowed) return scope as Decision<unknown> as Decision<OwnerApprovalReceipt>;
+    const presented = this.presentedApproval(runId);
+    const recorded = presented === undefined ? null : recordedApprovalSchema.safeParse(presented.content);
+    if (recorded === null || !recorded.success) return refuse("APPROVAL_MISSING", "no well-formed owner approval is recorded for this run");
+    const receipt = this.approvalReceipt(runId, recorded.data.receipt, {
+      owner: scope.value.owner,
+      visibility: scope.value.visibility,
+      planDigest: scope.value.planDigest,
+      githubOperations: scope.value.githubOperations,
+    });
+    if (!receipt.allowed) return receipt;
+    const admitted = this.approvalAdmission(
+      runId,
+      this.deps.applications.get(runId),
+      join(workRoot, runId),
+      receipt.value,
+      candidateSnapshotDigest,
+      false,
+    );
+    return admitted.allowed ? allow(ReasonCode.OK, receipt.value) : (admitted as Decision<unknown> as Decision<OwnerApprovalReceipt>);
+  }
+
+  /**
+   * #246 C3, the CEO's ruling on inheritance and review 1076-R1-02; S10-R1-01 — whether the approval a
+   * CONFIRM presents admits it, and whether that CONFIRM consumes it. `apply` acts on this answer
+   * (`accepted`: the anchor is synced now) and `ownerApprovalHolds` reads it (never syncs).
+   *
+   *   - an existing application whose approval anchor proves its identity resumes on exactly the
+   *     receipt the anchor names, never consumed again (APPROVAL_NOT_THIS_EXECUTION otherwise);
+   *   - an anchor that could not be synced refuses (APPROVAL_ANCHOR_UNSYNCED), and a WRITTEN
+   *     application whose identity is unproven refuses with the anchor's own answer;
+   *   - otherwise — a new execution, or a RESERVED one whose identity cannot be proven — the presented
+   *     receipt must be admitted from live ingress, unconsumed for this candidate and, for Buzz, inside
+   *     its prompt's stored window; it is then the receipt this CONFIRM consumes.
+   */
+  private approvalAdmission(
+    runId: string,
+    application: BootstrapApplication | null,
+    workDir: string,
+    receipt: OwnerApprovalReceipt,
+    candidateSnapshotDigest: string,
+    accepted: boolean,
+  ): Decision<{ consumes: boolean }> {
+    const presentedReceiptDigest = digestOf(receipt);
+    if (application !== null) {
+      const identity = this.anchoredIdentity(application, workDir, accepted);
+      if (!identity.allowed && identity.evidence["refusal"] === "APPROVAL_ANCHOR_UNSYNCED") return identity as Decision<unknown> as Decision<{ consumes: boolean }>;
+      if (identity.allowed) {
+        if (presentedReceiptDigest !== identity.value.receiptDigest) {
+          return deny(
+            ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+            "this bootstrap application resumes on the owner approval its reservation consumed; another approval is not admitted for the same execution",
+            { stage: "approval", refusal: "APPROVAL_NOT_THIS_EXECUTION", runId, approvalIdentity: identity.value.receiptDigest, presented: presentedReceiptDigest },
+          );
+        }
+        return allow(ReasonCode.OK, { consumes: false });
+      }
+      if (application.phase === "WRITTEN") return identity as Decision<unknown> as Decision<{ consumes: boolean }>;
+    }
+    // Admitted from live ingress and not yet consumed: a receipt already consumed — for another
+    // execution, or on the strength of a row nobody admitted — never starts or continues one.
+    const admissible = this.deps.ownerAuthority.assertConsumable(receipt, candidateSnapshotDigest);
+    const consumable = admissible.allowed ? this.buzzApprovalOpen(receipt) : admissible;
+    if (!consumable.allowed) {
+      if (application === null) return consumable as Decision<unknown> as Decision<{ consumes: boolean }>;
+      // The owner authority's own answer, named: the execution continues only under a new owner
+      // approval admitted from live ingress, and an approval already consumed is not taken for it.
+      return {
+        ...consumable,
+        evidence: { stage: "approval", refusal: "NEW_OWNER_APPROVAL_REQUIRED", runId, presented: presentedReceiptDigest, ...consumable.evidence },
+      } as Decision<unknown> as Decision<{ consumes: boolean }>;
+    }
+    return allow(ReasonCode.OK, { consumes: true });
   }
 
   /**
@@ -1082,46 +1189,18 @@ export class RepoFactoryBootstrapRunner {
     // nothing left to approve; its identity must be proven. A new run, and any change of target, owner,
     // visibility, PLAN, manifest or write scope, needs a new owner approval too: those are refused
     // above, by the receipt's run and parameters and by the freeze.
-    if (existing !== null) {
-      // Accepted, not only read (review 1076-R5): the anchor and its directory synced now, before
-      // anything is written on it. A sync that fails refuses with nothing sent; it is not taken for an
-      // anchor that is missing, so no other approval is consumed in its place.
-      const identity = this.anchoredIdentity(existing, join(workRoot, runId), true);
-      if (!identity.allowed && identity.evidence["refusal"] === "APPROVAL_ANCHOR_UNSYNCED") {
-        this.deps.applications.recordRefusal(runId, refusalRecord(identity, "approval"));
-        return atStage(identity as Decision<ACPBootstrapActivationResult>, "approval");
+    // S10-R1-01 — the judgement itself is `approvalAdmission`, which `ownerApprovalHolds` reads too.
+    // Accepted, not only read (review 1076-R5): the anchor and its directory synced now, before
+    // anything is written on it. A sync that fails refuses with nothing sent; it is not taken for an
+    // anchor that is missing, so no other approval is consumed in its place.
+    const admission = this.approvalAdmission(runId, existing, join(workRoot, runId), receipt.value, input.candidateSnapshotDigest, true);
+    if (!admission.allowed) {
+      if (existing !== null && admission.evidence["refusal"] === "APPROVAL_ANCHOR_UNSYNCED") {
+        this.deps.applications.recordRefusal(runId, refusalRecord(admission, "approval"));
       }
-      if (identity.allowed) {
-        if (presentedReceiptDigest !== identity.value.receiptDigest) {
-          return refuse(
-            ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-            "APPROVAL_NOT_THIS_EXECUTION",
-            "this bootstrap application resumes on the owner approval its reservation consumed; another approval is not admitted for the same execution",
-            { approvalIdentity: identity.value.receiptDigest, presented: presentedReceiptDigest },
-            "approval",
-          );
-        }
-      } else if (existing.phase === "WRITTEN") {
-        return atStage(identity as Decision<ACPBootstrapActivationResult>, "approval");
-      } else {
-        consumesPresented = true;
-      }
+      return atStage(admission as Decision<ACPBootstrapActivationResult>, "approval");
     }
-    if (consumesPresented) {
-      // Admitted from live ingress and not yet consumed: a receipt already consumed — for another
-      // execution, or on the strength of a row nobody admitted — never starts or continues one.
-      const admissible = this.deps.ownerAuthority.assertConsumable(receipt.value, input.candidateSnapshotDigest);
-      const consumable = admissible.allowed ? this.buzzApprovalOpen(receipt.value) : admissible;
-      if (!consumable.allowed) {
-        if (existing === null) return atStage(consumable as Decision<ACPBootstrapActivationResult>, "approval");
-        // The owner authority's own answer, named: the execution continues only under a new owner
-        // approval admitted from live ingress, and an approval already consumed is not taken for it.
-        return {
-          ...consumable,
-          evidence: { stage: "approval", refusal: "NEW_OWNER_APPROVAL_REQUIRED", runId, presented: presentedReceiptDigest, ...consumable.evidence },
-        } as Decision<ACPBootstrapActivationResult>;
-      }
-    }
+    consumesPresented = admission.value.consumes;
     const held = this.reservationConflicts(reservation, existing);
     if (!held.allowed) return held as Decision<ACPBootstrapActivationResult>;
 

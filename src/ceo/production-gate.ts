@@ -8,12 +8,7 @@ import {
   isProjectlessBootstrap,
   sameBootstrapPlanBinding,
 } from "../bootstrap/bootstrap-plan.ts";
-import {
-  REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND,
-  REPO_FACTORY_GITHUB_WRITE_OPERATION,
-  type RepoFactoryBootstrapRunner,
-} from "../bootstrap/repo-factory-bootstrap-run.ts";
-import { BUZZ_OWNER_APPROVAL_CHANNEL, verifyBuzzApprovalEvidence } from "../buzz/buzz-owner-approval.ts";
+import { REPO_FACTORY_GITHUB_WRITE_OPERATION, type RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
@@ -185,10 +180,10 @@ export const OWNER_DECISION_OPERATION = "owner_decision_submit";
 export const REPO_FACTORY_GITHUB_WRITE_GATE_ITEM = `owner-approval:${REPO_FACTORY_GITHUB_WRITE_OPERATION}`;
 
 /**
- * S10 — the run's Repo Factory write scope as the bootstrap runner computes it from the run's own
- * PLAN, so the item linked to the T3 approval is judged on exactly the scope a T3 receipt binds.
+ * S10-R1-01 — the bootstrap runner's own read-only approval predicate (`ownerApprovalHolds`): the item
+ * linked to the T3 approval is decided by exactly the judgement C3 acts on, never by a second reader.
  */
-export type RepoFactoryApprovalScopePort = Pick<RepoFactoryBootstrapRunner, "approvalScopeOf">;
+export type RepoFactoryApprovalPort = Pick<RepoFactoryBootstrapRunner, "ownerApprovalHolds">;
 
 /** PRD §21 — the owner-only gate list. */
 export { HUMAN_GATE_TRIGGERS } from "./human-gate.ts";
@@ -225,7 +220,7 @@ export class ProductionGate {
   #bootstrapActivation: BootstrapActivationFinalizer | null = null;
   #sourceReadLeases: SourceReadLeasePort | null = null;
   #manifestGrants: ManifestGrantsPort | null = null;
-  #repoFactoryApprovalScopes: RepoFactoryApprovalScopePort | null = null;
+  #repoFactoryApprovals: RepoFactoryApprovalPort | null = null;
 
   constructor(
     private readonly db: Db,
@@ -251,8 +246,8 @@ export class ProductionGate {
     bootstrapCompletionChain?: BootstrapCompletionChainPort;
     sourceReadLeases?: SourceReadLeasePort;
     manifestGrants?: ManifestGrantsPort;
-    /** S10 — the scope the T3-linked human-gate item is judged on; without it that item reads unsatisfied. */
-    repoFactoryApprovalScopes?: RepoFactoryApprovalScopePort;
+    /** S10 — the predicate the T3-linked human-gate item is judged on; without it that item reads unsatisfied. */
+    repoFactoryApprovals?: RepoFactoryApprovalPort;
   }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
@@ -261,7 +256,7 @@ export class ProductionGate {
     if (ports.bootstrapCompletionChain) this.#bootstrapCompletionChain = ports.bootstrapCompletionChain;
     if (ports.sourceReadLeases) this.#sourceReadLeases = ports.sourceReadLeases;
     if (ports.manifestGrants) this.#manifestGrants = ports.manifestGrants;
-    if (ports.repoFactoryApprovalScopes) this.#repoFactoryApprovalScopes = ports.repoFactoryApprovalScopes;
+    if (ports.repoFactoryApprovals) this.#repoFactoryApprovals = ports.repoFactoryApprovals;
   }
 
   /**
@@ -1389,7 +1384,7 @@ export class ProductionGate {
         });
   }
 
-  private humanGateDefinition(runId: string): { required: boolean; items: string[]; digest: string } {
+  private humanGateDefinition(runId: string): { required: boolean; items: string[]; digest: string; linksT3: boolean } {
     const run = this.runs.get(runId);
     const contract = this.artifacts.latest<{ humanGate?: unknown; scope?: unknown }>(
       runId,
@@ -1409,7 +1404,13 @@ export class ProductionGate {
           declaredItems,
         })
       : { required: declaredItems.length > 0, items: declaredItems };
-    return { ...definition, digest: digestOf(definition.items) };
+    // S10-R1-04 — the link is judged on the declared values as stored, before `deriveHumanGate` trims
+    // them: no declared value is a noncanonical spelling of the item, so the item `humanGateStatus`
+    // finds after the trim was declared exactly. The digest is unchanged.
+    const linksT3 = declaredItems.every(
+      (item) => item === REPO_FACTORY_GITHUB_WRITE_GATE_ITEM || item.trim() !== REPO_FACTORY_GITHUB_WRITE_GATE_ITEM,
+    );
+    return { ...definition, digest: digestOf(definition.items), linksT3 };
   }
 
   /**
@@ -1772,57 +1773,16 @@ export class ProductionGate {
     }
 
     // S10 — an item's own OWNER_DECISION, approval or refusal, decides it as before, so an explicit
-    // refusal is never overridden. Only the item that declares the T3 link, with no decision of its
-    // own, is decided by the owner's T3 approval; every other item still needs its OWNER_DECISION.
+    // refusal is never overridden. Only the item the contract declares, exactly, as the T3 link
+    // (S10-R1-04: its raw value), with no decision of its own, is decided by the owner's T3 approval,
+    // and that by the bootstrap runner's own predicate (S10-R1-01); every other item still needs its
+    // OWNER_DECISION.
     const decided = (item: string): boolean =>
       latestDecision.get(item) ??
-      (item === REPO_FACTORY_GITHUB_WRITE_GATE_ITEM && this.#repoFactoryWriteApproved(runId, currentCandidate));
+      (item === REPO_FACTORY_GITHUB_WRITE_GATE_ITEM &&
+        gate.linksT3 &&
+        this.#repoFactoryApprovals?.ownerApprovalHolds(runId, currentCandidate).allowed === true);
     return { required: true, items, satisfied: items.every(decided) };
-  }
-
-  /**
-   * S10 (#246 defect b) — whether the owner's T3 approval holds for this run and candidate: the newest
-   * Repo Factory decision recorded on the run (a later decline supersedes an earlier approval, as C3
-   * reads it) approves the run's current PLAN scope, recomputed now, for exactly this candidate, and
-   * is still owner authority — consumable now (its ingress admission by an allowlisted owner, its
-   * candidate, unconsumed, and a Buzz receipt's evidence inside its prompt's stored window) or already
-   * consumed for this candidate by the CONFIRM it authorised. Reads only; consumes nothing.
-   */
-  #repoFactoryWriteApproved(runId: string, candidateSnapshotDigest: string): boolean {
-    const scopes = this.#repoFactoryApprovalScopes;
-    const authority = this.#ownerAuthority;
-    const run = this.runs.get(runId);
-    if (!scopes || !authority || !run || !isProjectlessBootstrap(run)) return false;
-    const scope = scopes.approvalScopeOf(runId);
-    if (!scope.allowed) return false;
-    const newest = this.artifacts
-      .list<unknown>(runId, ArtifactKind.APPROVAL)
-      .filter(
-        (artifact) =>
-          !artifact.superseded && isRecord(artifact.content) && artifact.content["kind"] === REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND,
-      )
-      .at(-1);
-    const receipt: unknown = newest !== undefined && isRecord(newest.content) ? newest.content["receipt"] : undefined;
-    if (newest?.candidateSnapshotDigest !== candidateSnapshotDigest || !isOwnerApprovalReceipt(receipt)) return false;
-    if (
-      Object.keys(receipt).length !== 9 ||
-      receipt.approved !== true ||
-      receipt.runId !== runId ||
-      receipt.operation !== REPO_FACTORY_GITHUB_WRITE_OPERATION ||
-      receipt.operation !== scope.value.operation ||
-      receipt.parameterDigest !== scope.value.parameterDigest ||
-      receipt.candidateSnapshotDigest !== candidateSnapshotDigest
-    ) {
-      return false;
-    }
-    if (authority.assertConsumedApproval(receipt, candidateSnapshotDigest).allowed) {
-      return receipt.channel !== BUZZ_OWNER_APPROVAL_CHANNEL || verifyBuzzApprovalEvidence(this.db, receipt).allowed;
-    }
-    if (!authority.assertConsumable(receipt, candidateSnapshotDigest).allowed) return false;
-    return (
-      receipt.channel !== BUZZ_OWNER_APPROVAL_CHANNEL ||
-      verifyBuzzApprovalEvidence(this.db, receipt, { nowMs: this.clock.now().getTime() }).allowed
-    );
   }
 
   /**

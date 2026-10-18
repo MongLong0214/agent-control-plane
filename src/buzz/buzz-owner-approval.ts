@@ -36,7 +36,8 @@ import type { BuzzMentionEvent, BuzzPublishAck, BuzzSignedEvent } from "./buzz-m
  *      or posts that bare token under another message of the prompt's room, and the code finds the
  *      prompt (S10, CEO c07863f8: a different thread alone is no reason to refuse);
  *   3. the reply reaches this module from X's own connection, by the stored prompt's exact `e`
- *      reference — not by a mention — or through the mention sink, which routes any event carrying
+ *      reference — not by a mention — or by its author, a configured owner key, in an open prompt's
+ *      room (S10-R1-03), or through the mention sink, which routes any event carrying
  *      the marker here first, before the binding marker and before the message seam;
  *   4. `receive` verifies it (signature, owner key, grammar, prompt, room, code, answer slot, the
  *      server-stored expiry, the scope recomputed now, the need) and, in one transaction, writes the
@@ -94,10 +95,19 @@ const APPROVAL_MARKER = /acp[\s\p{Pd}_]*(?:approve|decline)[\s\p{Pd}_]*write/giu
 /** The one form that decides: the exact token a prompt shows, standing alone. */
 const WELL_FORMED_TOKEN = /(?<![0-9A-Za-z])acp-(approve|decline)-write:([0-9a-f]{16})(?![0-9A-Za-z])/g;
 /**
- * S10 (#246 defect a) — the whole content of an answer found by its code rather than its thread:
- * the token and nothing else, so a sentence that quotes a token is conversation, never an answer.
+ * S10 (#246 defect a), S10-R1-02 — the whole content of an answer, however it finds its prompt: the
+ * token and nothing else, so a sentence that quotes a token — a negation, a quotation, an
+ * explanation — is conversation, never an answer, in the prompt's thread or under another message.
  */
 const BARE_TOKEN = /^acp-(?:approve|decline)-write:[0-9a-f]{16}$/u;
+
+/**
+ * S10-R1-02 — whether an event's content is one approval token standing alone: `BARE_TOKEN` over the
+ * content after `String.prototype.trim` (leading and trailing Unicode white space and line terminators,
+ * nothing else). Asked where an answer is issued (`buzzOwnerApprovalPromptLink`, for the reply and the
+ * code link alike) and again where it is consumed (`verifyBuzzApprovalEvidence`).
+ */
+const buzzOwnerApprovalStandsAlone = (content: string): boolean => BARE_TOKEN.test(content.trim());
 
 /**
  * What an event's content says about owner approval, in three answers:
@@ -158,9 +168,12 @@ const tagValues = (event: { readonly tags: readonly (readonly string[])[] }, nam
  *   - `REPLY`: the event's reply reference is a stored prompt. That prompt is the one answered, and
  *     its code must be the token's (a reply to prompt A carrying B's code is refused, as before);
  *   - `CODE`: the reference names no stored prompt — none, an ambiguous one, or another event, as
- *     when the owner answers under a CTO's message rather than the prompt — and the content is the
- *     bare token and nothing else, and exactly one stored prompt carries the token's code. The code
- *     is derived from the prompt's run, scope, candidate and issue, so it names that prompt itself.
+ *     when the owner answers under a CTO's message rather than the prompt — and exactly one stored
+ *     prompt carries the token's code. The code is derived from the prompt's run, scope, candidate
+ *     and issue, so it names that prompt itself.
+ *
+ * Either link needs the content to be the bare token and nothing else (`buzzOwnerApprovalStandsAlone`,
+ * S10-R1-02): a reply to the prompt that quotes its token in a sentence links to nothing.
  *
  * Finding the prompt decides nothing else: the receiver still asks the owner key, the room and
  * receiving identity, the answer slot, the stored window, the scope recomputed now and the need,
@@ -171,9 +184,10 @@ export const buzzOwnerApprovalPromptLink = (
   event: Pick<BuzzSignedEvent, "tags" | "content">,
   code: string,
 ): { readonly promptEventId: string; readonly link: "REPLY" | "CODE" } | null => {
+  // S10-R1-02 — neither link holds for anything but the token alone.
+  if (!buzzOwnerApprovalStandsAlone(event.content)) return null;
   const reference = buzzReplyReferenceOf(event);
   if (reference !== null && readPrompt(db, reference) !== null) return { promptEventId: reference, link: "REPLY" };
-  if (!BARE_TOKEN.test(event.content.trim())) return null;
   // Exactly one stored prompt row carries the code; two, even one that no longer reads back, name none.
   const carrying = db.get<{ n: number; nonce: string | null }>(
     `SELECT COUNT(*) AS n, MIN(nonce) AS nonce FROM inbound_messages
@@ -690,6 +704,10 @@ export const verifyBuzzApprovalEvidence = (
   if (buzzReplyReferenceOf(event) !== promptEventId && !byCode()) {
     return refuse("EVENT_NOT_A_REPLY", "the owner's stored event neither replies to the prompt nor carries its code alone", { promptEventId });
   }
+  // S10-R1-02 — asked again at consumption, for the reply link too: the stored event is the token alone.
+  if (!buzzOwnerApprovalStandsAlone(event.content)) {
+    return refuse("EVENT_NOT_STANDALONE", "the owner's stored event is not an approval token standing alone", { promptEventId });
+  }
   const prompt = readPrompt(db, promptEventId);
   if (prompt === null) return refuse("PROMPT_UNVERIFIED", "the prompt this receipt answers does not read back", { promptEventId });
   if (token.kind !== "TOKEN" || token.approved !== receipt.approved || token.code !== prompt.code) {
@@ -919,7 +937,7 @@ export class BuzzOwnerApprovals {
     const linked = buzzOwnerApprovalPromptLink(db, event, content.code);
     const prompt = linked === null ? null : readPrompt(db, linked.promptEventId);
     if (linked === null || prompt === null) {
-      return this.#ownerRefusal(event, null, deny(ReasonCode.BUZZ_APPROVAL_PROMPT_UNRESOLVED, "the event neither replies to a stored approval prompt nor carries exactly one prompt's code alone", {
+      return this.#ownerRefusal(event, null, deny(ReasonCode.BUZZ_APPROVAL_PROMPT_UNRESOLVED, "the event is not a token alone that replies to a stored approval prompt or carries exactly one prompt's code", {
         channel: "buzz",
       }));
     }
@@ -1209,14 +1227,26 @@ export class BuzzOwnerApprovals {
    * The reply filter for one subscribed identity (CEO 1791605708): the prompts it signed that are
    * still open — unanswered, uncancelled, inside their stored window — by their exact event ids, and
    * the earliest time a reply to any of them may carry. Null for none.
+   *
+   * S10-R1-03 — and, while any is open, the configured owner keys and those prompts' rooms: an owner's
+   * bare code under another author's message neither references the prompt nor mentions this identity,
+   * so it is asked for by its author in the room. Matching authenticates nothing: `receive` still asks
+   * the signature, the owner key, the room and receiving identity, and the code's one prompt.
    */
-  replyFilter(pubkey: string): { readonly eventIds: readonly string[]; readonly since: number } | null {
+  replyFilter(pubkey: string): {
+    readonly eventIds: readonly string[];
+    readonly since: number;
+    readonly ownerAuthors: readonly string[];
+    readonly rooms: readonly string[];
+  } | null {
     const now = this.#ports.clock.now().getTime();
     const open = this.#openPrompts().filter((prompt) => prompt.signer === pubkey && now <= prompt.expiresAtMs);
     if (open.length === 0) return null;
     return {
       eventIds: open.map((prompt) => prompt.promptEventId),
       since: Math.min(...open.map((prompt) => prompt.createdAt)) - BUZZ_OWNER_APPROVAL_SIGNED_SKEW_SECONDS,
+      ownerAuthors: [...this.#owners.keys()],
+      rooms: [...new Set(open.map((prompt) => prompt.room))],
     };
   }
 
