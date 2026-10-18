@@ -332,6 +332,15 @@ export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
           timedOut: outcome.timedOut,
           ...(outcome.spawnError ? { spawnError: outcome.spawnError } : {}),
         };
+        // FIX-1148-R3 — settled is the end of reading, on every path: exit, spawn failure, the end of
+        // the work and the deadline. Nothing written afterwards is buffered, and the pipes are let go
+        // now: a descendant outside the killed group that inherited stdout or stderr kept this handle,
+        // and the caller's process with it, alive after a HEALTHY return. The `error` listeners stay on;
+        // a destroyed stream emits no error of its own.
+        child.stdout.off("data", onStdout);
+        child.stderr.off("data", onStderr);
+        child.stdout.destroy();
+        child.stderr.destroy();
         if (exited || ownedPid === null) returnDecided();
       };
       // Settle on the timer itself rather than waiting for a close that may never come.
@@ -354,8 +363,19 @@ export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
           ),
         });
       }, input.timeoutMs);
-      child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-      child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+      const onStdout = (chunk: Buffer): void => {
+        stdout += chunk.toString();
+      };
+      const onStderr = (chunk: Buffer): void => {
+        stderr += chunk.toString();
+      };
+      child.stdout.on("data", onStdout);
+      child.stderr.on("data", onStderr);
+      // A read error on an owned pipe, before or after settling, ends only that stream; the outcome is
+      // still the CLI's exit or the timeout. Unheard, it would be an uncaught exception, and `src` has
+      // no handler for one.
+      child.stdout.on("error", ignoreOwnedStreamError);
+      child.stderr.on("error", ignoreOwnedStreamError);
       child.once("error", (error: NodeJS.ErrnoException) =>
         finish({
           code: null,
@@ -386,6 +406,9 @@ const cleanupReserveMs = (timeoutMs: number): number =>
 /** A pid this probe can signal as its own process group: never `kill(0)` (its own group) or `kill(-1)` (everything). */
 const ownedProcessGroup = (pid: number | undefined): number | null =>
   pid === undefined || !Number.isSafeInteger(pid) || pid <= 1 ? null : pid;
+
+/** Heard so it is not uncaught, and nothing else: a pipe that failed has said all it will. */
+const ignoreOwnedStreamError = (): void => undefined;
 
 /**
  * What a probe returns when the deadline came and the operating system had not confirmed its owned

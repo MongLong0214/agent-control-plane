@@ -182,6 +182,9 @@ const atReturn = (pid: number | undefined): { pidPresent: boolean } => {
   }
 };
 
+/** Whether `pid` names a process right now: read before any cleanup, so a check is never passed by killing first. */
+const alive = (pid: number): boolean => atReturn(pid).pidPresent;
+
 /** The most of a timeout `usage-collectors.ts` keeps for cleanup (CLEANUP_RESERVE_CAP_MS). */
 const cleanupReserveCap = 500;
 
@@ -732,7 +735,7 @@ describe("FIX-1148-R2: a probe returns only once its owned child is exited and r
     }
   });
 
-  it("non-interactive control: a CLI that answers and exits while a descendant in another group holds its stdout is read HEALTHY at its exit, not held to a timeout", async () => {
+  it("non-interactive control: a CLI that answers and exits while a descendant in another group holds its stdout is read HEALTHY at its exit, not held to a timeout, its pipes let go while the holder lives", async () => {
     const holderPidPath = join(home, "ni-holder.pid");
     const cli = join(home, "claude-ni-held.mjs");
     writeFileSync(
@@ -755,15 +758,93 @@ process.exit(0);
     try {
       const reading = await new ClaudeUsageCollector({ clock: clock(), binary: cli, timeoutMs, accountIdentity: null }).collect();
       const returnedAfterMs = performance.now() - startedAt;
+      // FIX-1148-R3 — read at the return, before anything is awaited or the holder is touched.
+      const owned = watch.child!;
+      const released = {
+        stdoutDestroyed: owned.stdout!.destroyed,
+        stderrDestroyed: owned.stderr!.destroyed,
+        stdoutDataListeners: owned.stdout!.listenerCount("data"),
+        stderrDataListeners: owned.stderr!.listenerCount("data"),
+      };
+      const holderPid = Number(readFileSync(holderPidPath, "utf8").trim());
       expect(watch.exited).toBe(true);
       expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+      expect(reading.buckets).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: "current-session", remainingPercent: 88 })]),
+      );
       // Returned at the CLI's exit: the held pipe's `close` is not waited for, and the work's end is far off.
       expect(returnedAfterMs).toBeLessThan(timeoutMs - cleanupReserveCap);
+      // The pipes were let go by the probe, not by the holder going: the holder is still there.
+      expect(alive(holderPid), `holder ${holderPid} was gone before the check, so it proves nothing`).toBe(true);
+      expect(released).toEqual({ stdoutDestroyed: true, stderrDestroyed: true, stdoutDataListeners: 0, stderrDataListeners: 0 });
     } finally {
       spawnSeam.next = null;
       exactPidCleanup([existsSync(holderPidPath) ? Number(readFileSync(holderPidPath, "utf8").trim()) : undefined]);
     }
   });
+
+  /**
+   * FIX-1148-R3, R1148-04: `SpawnNonInteractiveUsageProbe` returned HEALTHY at its CLI's exit but kept
+   * its pipes and their `data` handlers. A detached descendant that inherited one kept the caller's
+   * process alive long after its 1 s timeout; killing the holder is what let it end. Here the holder
+   * outlives every bound and is checked alive when the caller ends: the caller ends by itself or not at all.
+   */
+  it.each([{ held: "stdout" }, { held: "stderr" }])(
+    "FIX-1148-R3 R1148-04: the CLI answered and exited while a detached descendant still holds its $held: the caller's process ends by itself, the holder still alive",
+    async ({ held }) => {
+      const holderPidPath = join(home, `ni-natural-${held}.pid`);
+      const cli = join(home, `claude-ni-natural-${held}.mjs`);
+      const holderStdio = JSON.stringify(["ignore", held === "stdout" ? "inherit" : "ignore", held === "stderr" ? "inherit" : "ignore"]);
+      writeFileSync(
+        cli,
+        `#!${NODE}
+import { spawn } from "node:child_process";
+import { writeFileSync, writeSync } from "node:fs";
+// Its own process group, so the probe's kill of the CLI's group does not reach it. It outlives every bound here.
+const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"], { detached: true, stdio: ${holderStdio} });
+holder.unref();
+writeFileSync(${JSON.stringify(holderPidPath)}, String(holder.pid));
+writeSync(1, ${JSON.stringify(NI_ENVELOPE)});
+process.exit(0);
+`,
+      );
+      chmodSync(cli, 0o755);
+      // No `process.exit`: the caller ends only when nothing it owns is left open.
+      const caller = join(home, "ni-natural-caller.mjs");
+      writeFileSync(
+        caller,
+        String.raw`
+const [collectorsUrl, clockUrl, binary] = process.argv.slice(2);
+const { ClaudeUsageCollector } = await import(collectorsUrl);
+const { ManualClock } = await import(clockUrl);
+const reading = await new ClaudeUsageCollector({ clock: new ManualClock("2026-08-13T00:00:00.000Z"), binary, timeoutMs: 1_000, accountIdentity: null }).collect();
+process.stdout.write(JSON.stringify({ sensorHealth: reading.sensorHealth, buckets: reading.buckets, error: reading.error ?? null }));
+`,
+      );
+      const startedAt = performance.now();
+      try {
+        // The holder lives 20 s. A caller its pipe holds meets this 6 s bound, which throws.
+        const ran = await runBoundedChild(
+          NODE,
+          ["--experimental-transform-types", "--no-warnings", caller, USAGE_COLLECTORS, CLOCK, cli],
+          { budgetMs: 6_000 },
+        );
+        const elapsedMs = performance.now() - startedAt;
+        // Read the moment the caller has ended, before any cleanup: the holder had not gone.
+        const holderPid = Number(readFileSync(holderPidPath, "utf8").trim());
+        expect(alive(holderPid), `holder ${holderPid} was gone when the caller ended, so it proves nothing`).toBe(true);
+        expect(ran.status, ran.stderr.slice(-1200)).toBe(0);
+        const reading = JSON.parse(ran.stdout) as { sensorHealth: string; buckets: unknown[]; error: string | null };
+        expect(reading).toMatchObject({ sensorHealth: "HEALTHY", error: null });
+        expect(reading.buckets).toEqual(
+          expect.arrayContaining([expect.objectContaining({ id: "current-session", remainingPercent: 88 })]),
+        );
+        expect(elapsedMs).toBeLessThan(4_000);
+      } finally {
+        exactPidCleanup([existsSync(holderPidPath) ? Number(readFileSync(holderPidPath, "utf8").trim()) : undefined]);
+      }
+    },
+  );
 
   it("non-interactive, short timeouts with no owned pid: the work and cleanup budgets stay valid, the call returns timed out, and nothing is signalled", async () => {
     for (const timeoutMs of [1, 3, 4, 10]) {
