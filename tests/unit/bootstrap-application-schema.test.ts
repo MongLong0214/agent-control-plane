@@ -6,16 +6,16 @@ import { afterAll, describe, expect, it } from "vitest";
 import { isAcpError } from "../../src/core/errors.ts";
 import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
-import { installMigrationLedger } from "../../src/db/migrations.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { dropV46Triggers } from "../helpers/released-v46-schema.ts";
+import { carryRows, laterObjectsIn, releasedChainImage } from "../helpers/released-chain-image.ts";
 import { fileCore, seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 /**
  * Issue #246 PR-C slice C3, schema v43 — the bootstrap application record, as the database states
  * it. Every row writes raw SQL, the way a writer that bypassed `BootstrapApplications` would; the
- * migration rows build a v42 image the way the v40–v42 fixtures build theirs: written at the current
- * version with real rows, then taken back by removing exactly what v43 adds.
+ * migration rows use the released chain's own v42 (V46-R1-02): the v11 fixture run through v12..v42
+ * and stopped there, holding real rows written by this build and carried into the v42 tables and
+ * columns. Taking a current database back left both manifest-grant tables in it.
  */
 
 afterAll(cleanupTempDirs);
@@ -41,11 +41,21 @@ const names = (raw: Database.Database, type: "table" | "trigger"): string[] =>
   (raw.prepare(`SELECT name FROM sqlite_master WHERE type = ? ORDER BY name`).all(type) as { name: string }[])
     .map((row) => row.name);
 
-const dump = (raw: Database.Database, except: readonly string[]): Record<string, string[]> =>
+/** Each table's columns, in order. */
+type Shape = Record<string, string[]>;
+const shapeOf = (raw: Database.Database): Shape =>
+  Object.fromEntries(names(raw, "table").filter((name) => !name.startsWith("sqlite_"))
+    .map((name) => [name, raw.prepare(`SELECT name FROM pragma_table_info(?)`).pluck().all(name) as string[]]));
+
+/** Every row of every table as a sorted set. Given the v42 image's shape, only its tables and columns. */
+const dump = (raw: Database.Database, except: readonly string[], shape?: Shape): Record<string, string[]> =>
   Object.fromEntries(
     names(raw, "table")
-      .filter((name) => !except.includes(name) && !name.startsWith("sqlite_"))
-      .map((name) => [name, (raw.prepare(`SELECT * FROM "${name}"`).all() as unknown[]).map((row) => JSON.stringify(row)).sort()]),
+      .filter((name) => !except.includes(name) && !name.startsWith("sqlite_") && (shape === undefined || name in shape))
+      .map((name) => {
+        const columns = shape?.[name]?.map((column) => `"${column}"`).join(", ") ?? "*";
+        return [name, (raw.prepare(`SELECT ${columns} FROM "${name}"`).all() as unknown[]).map((row) => JSON.stringify(row)).sort()];
+      }),
   );
 
 const COLUMNS = `run_id, project_id, repository_identity, bootstrap_operation_id, plan_digest, manifest_digest,
@@ -83,32 +93,27 @@ const currentDatabase = () => {
   return { path, world };
 };
 
-/** Written at the current version with real rows, then taken back to v42. */
-const v42Image = (seed?: (raw: Database.Database) => void): { path: string; before: Record<string, string[]> } => {
-  const { path, world } = currentDatabase();
+/**
+ * The released chain's v42, holding rows this build wrote at the current version. A `seed` that plants a
+ * `bootstrap_applications` table plants a v43 object on purpose; the image is checked before it runs.
+ */
+const v42Image = (seed?: (raw: Database.Database) => void): { path: string; before: Record<string, string[]>; shape: Shape } => {
+  const { path: source, world } = currentDatabase();
   world.db.run(
     `INSERT INTO audit_events (at, kind, reason_code, actor, evidence_json) VALUES (?, 'WRITTEN_BEFORE_V43', 'OK', 'test', '{}')`,
     [NOW],
   );
   world.db.close();
+  const path = releasedChainImage(statePath(), 42);
+  carryRows(source, path);
+  // The historical schema first: nothing of v43 or any later version is in the image.
+  expect(laterObjectsIn(path, 42)).toEqual([]);
   const legacy = new Database(path);
   try {
-    // Nothing of v46's (#1094) stays in an image of an earlier version.
-    dropV46Triggers(legacy);
-    legacy.exec(V43_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n"));
-    legacy.exec(`DROP TABLE bootstrap_applications`);
-    seed?.(legacy);
-    legacy.exec(`
-      DROP TRIGGER schema_migrations_no_delete;
-      DROP TRIGGER schema_migrations_insert_authority;
-      DELETE FROM schema_migrations WHERE version > 42;
-      INSERT INTO schema_migrations (version, migration_id, checksum, applied_at)
-        VALUES (42, 'bootstrap-v42', 'sha256:${"0".repeat(64)}', '${NOW}');
-      PRAGMA user_version = 42;
-    `);
-    installMigrationLedger(legacy);
     expect(names(legacy, "trigger").filter((name) => V43_TRIGGERS.includes(name))).toEqual([]);
-    return { path, before: dump(legacy, ["schema_migrations", "bootstrap_applications"]) };
+    const shape = shapeOf(legacy);
+    seed?.(legacy);
+    return { path, before: dump(legacy, ["schema_migrations", "bootstrap_applications"]), shape };
   } finally {
     legacy.close();
   }
@@ -124,7 +129,7 @@ describe("v43: the bootstrap application record (#246 C3)", () => {
   });
 
   it("v42 → v43 installs the table and its triggers, keeps every row, and the guards bite from the first write", () => {
-    const { path, before } = v42Image();
+    const { path, before, shape } = v42Image();
     approveMigration(path, "v42 to v43 fixture");
     const migrated = openDb(path);
     try {
@@ -134,7 +139,7 @@ describe("v43: the bootstrap application record (#246 C3)", () => {
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 42 ORDER BY version`,
       )).toEqual([
-        { version: 42, migration_id: "bootstrap-v42" },
+        { version: 42, migration_id: "v42-session-credential-epoch" },
         { version: 43, migration_id: "v43-bootstrap-application-record" },
         { version: 44, migration_id: "v44-manifest-activation-grant" },
         { version: 45, migration_id: "v45-first-manifest-activation" },
@@ -152,10 +157,10 @@ describe("v43: the bootstrap application record (#246 C3)", () => {
     }
     const after = new Database(path, { readonly: true });
     try {
-      expect(dump(after, ["schema_migrations", "bootstrap_applications", "audit_events"])).toEqual(
+      expect(dump(after, ["schema_migrations", "bootstrap_applications", "audit_events"], shape)).toEqual(
         Object.fromEntries(Object.entries(before).filter(([name]) => name !== "audit_events")),
       );
-      expect(dump(after, ["schema_migrations"])["audit_events"]).toEqual(expect.arrayContaining(before["audit_events"]!));
+      expect(dump(after, ["schema_migrations"], shape)["audit_events"]).toEqual(expect.arrayContaining(before["audit_events"]!));
     } finally {
       after.close();
     }

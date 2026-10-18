@@ -41,6 +41,9 @@ import {
   TEST_OPERATOR_TOKEN,
 } from "../helpers/harness.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { laterObjectsIn, releasedChainImage } from "../helpers/released-chain-image.ts";
+import { privateStatePath } from "../helpers/released-v44-schema.ts";
+import { contentDigests } from "../helpers/released-v45-schema.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -1089,35 +1092,10 @@ describe("baseline boundary contracts", () => {
   });
 
   it("opens a v13 database through production construction and applies the rest of the chain", () => {
-    const harness = makeHarness();
-    const databasePath = harness.cp.config.databasePath;
-    harness.cp.close();
-    const raw = new Database(databasePath);
-    try {
-      raw.exec("DROP TRIGGER baseline_records_immutable; DROP TRIGGER baseline_records_no_delete; DROP TABLE baseline_records;");
-      raw.exec("DROP TRIGGER telegram_owner_prompts_immutable; DROP TRIGGER telegram_owner_prompts_no_delete; DROP TABLE telegram_owner_prompts;");
-      raw.exec("DROP TRIGGER conversational_actor_registration_generation_monotonic; DROP TRIGGER conversational_actor_registration_retirement_terminal; DROP TABLE conversational_actor_registrations; DROP TABLE conversational_actor_registry_state;");
-      raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
-      raw.prepare("DELETE FROM schema_migrations WHERE version >= ?").run(14);
-      const v13 = migrationChainFrom(12).find((migration) => migration.toVersion === 13)!;
-      raw.function("acp_schema_migration_authorized", () => 1);
-      raw.prepare(
-        `INSERT INTO schema_migrations
-           (version, migration_id, checksum, backup_file, backup_checksum, applied_at)
-         VALUES (?, ?, ?, NULL, NULL, ?)`,
-      ).run(13, v13.id, v13.checksum(), "2026-08-14T00:00:00.000Z");
-      raw.exec(`
-        CREATE TRIGGER schema_migrations_immutable
-        BEFORE UPDATE ON schema_migrations
-        BEGIN SELECT RAISE(ABORT, 'SCHEMA_MIGRATION_RECEIPT_IMMUTABLE'); END;
-        CREATE TRIGGER schema_migrations_no_delete
-        BEFORE DELETE ON schema_migrations
-        BEGIN SELECT RAISE(ABORT, 'SCHEMA_MIGRATION_RECEIPT_IMMUTABLE'); END;
-      `);
-      raw.pragma("user_version = 13");
-    } finally {
-      raw.close();
-    }
+    // V46-R1-02: the released chain's own v13 (the v11 fixture through v12 and v13), not a current
+    // database relabelled 13, which held every later object but three tables, all nine v46 guards included.
+    const databasePath = releasedChainImage(privateStatePath("acp-baseline-v13-"), 13);
+    expect(laterObjectsIn(databasePath, 13)).toEqual([]);
     // #738 — a database at an older version no longer migrates itself. This fixture is a
     // deployment that stopped at v13, so it takes the approval its owner would have taken.
     approveMigration(databasePath, "baseline-export fixture");
@@ -1125,9 +1103,9 @@ describe("baseline boundary contracts", () => {
     const reopened = new Database(databasePath);
     try {
       expect(Number(reopened.pragma("user_version", { simple: true }))).toBe(13);
-      expect(
-        reopened.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'baseline_records'").get(),
-      ).toEqual({ n: 0 });
+      // The released v12 step replays the frozen schema-v37.sql, which already holds baseline_records, and
+      // v14 creates it IF NOT EXISTS; what v14 has not yet added is its receipt.
+      expect(reopened.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version >= 14").get()).toEqual({ n: 0 });
     } finally {
       reopened.close();
     }
@@ -1217,38 +1195,14 @@ describe("baseline boundary contracts", () => {
   });
 
   it("restores the original v13 file when v14 fails after its commit", () => {
-    const harness = makeHarness();
-    const databasePath = harness.cp.config.databasePath;
-    harness.cp.close();
-    const raw = new Database(databasePath);
-    try {
-      raw.exec("DROP TRIGGER baseline_records_immutable; DROP TRIGGER baseline_records_no_delete; DROP TABLE baseline_records;");
-      raw.exec("DROP TRIGGER telegram_owner_prompts_immutable; DROP TRIGGER telegram_owner_prompts_no_delete; DROP TABLE telegram_owner_prompts;");
-      raw.exec("DROP TRIGGER conversational_actor_registration_generation_monotonic; DROP TRIGGER conversational_actor_registration_retirement_terminal; DROP TABLE conversational_actor_registrations; DROP TABLE conversational_actor_registry_state;");
-      raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
-      raw.prepare("DELETE FROM schema_migrations WHERE version >= ?").run(14);
-      const v13 = migrationChainFrom(12).find((migration) => migration.toVersion === 13)!;
-      raw.function("acp_schema_migration_authorized", () => 1);
-      raw.prepare(
-        `INSERT INTO schema_migrations
-           (version, migration_id, checksum, backup_file, backup_checksum, applied_at)
-         VALUES (?, ?, ?, NULL, NULL, ?)`,
-      ).run(13, v13.id, v13.checksum(), "2026-08-14T00:00:00.000Z");
-      raw.exec(`
-        CREATE TRIGGER schema_migrations_immutable
-        BEFORE UPDATE ON schema_migrations
-        BEGIN SELECT RAISE(ABORT, 'SCHEMA_MIGRATION_RECEIPT_IMMUTABLE'); END;
-        CREATE TRIGGER schema_migrations_no_delete
-        BEFORE DELETE ON schema_migrations
-        BEGIN SELECT RAISE(ABORT, 'SCHEMA_MIGRATION_RECEIPT_IMMUTABLE'); END;
-      `);
-      raw.pragma("user_version = 13");
-    } finally {
-      raw.close();
-    }
+    // V46-R1-02: the released chain's own v13 (the v11 fixture through v12 and v13), not a current
+    // database relabelled 13, which held every later object but three tables, all nine v46 guards included.
+    const databasePath = releasedChainImage(privateStatePath("acp-baseline-v13-"), 13);
+    expect(laterObjectsIn(databasePath, 13)).toEqual([]);
     // #738 — a database at an older version no longer migrates itself. This fixture is a
     // deployment that stopped at v13, so it takes the approval its owner would have taken.
     approveMigration(databasePath, "baseline-export fixture");
+    const image = contentDigests(databasePath);
 
     expect(() => new Db(databasePath, {
       afterMigration: (migration) => {
@@ -1259,8 +1213,6 @@ describe("baseline boundary contracts", () => {
     const restored = new Database(databasePath, { readonly: true, fileMustExist: true });
     try {
       expect(Number(restored.pragma("user_version", { simple: true }))).toBe(13);
-      expect(restored.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'baseline_records'").get())
-        .toEqual({ n: 0 });
       expect(restored.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 14").get())
         .toEqual({ n: 0 });
       expect(restored.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 15").get())
@@ -1270,6 +1222,8 @@ describe("baseline boundary contracts", () => {
     } finally {
       restored.close();
     }
+    // The whole v13 image is back, byte for byte in every table and schema row.
+    expect(contentDigests(databasePath)).toEqual(image);
 
     // #747 — the rollback linked a staged image into place, so the restored database is a new
     // inode that the failed attempt's approval no longer names. Retrying takes a fresh decision.

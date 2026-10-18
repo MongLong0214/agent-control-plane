@@ -506,21 +506,88 @@ describe("the v45 → v46 step", () => {
     expect(existsSync(migrationApprovalPath(path))).toBe(false);
   });
 
-  it("an image that already holds the v46 triggers is accepted with schema.sql's bodies", () => {
-    const fresh = privateStatePath("acp-v46-preexisting-fresh-");
-    new Db(fresh).close();
-    const path = privateStatePath("acp-v46-preexisting-");
+  it("an image that already holds all nine v46 triggers exactly as schema.sql defines them is accepted, and a repeated application changes nothing", () => {
+    const path = privateStatePath("acp-v46-exact-");
     new Db(path).close();
+    const definitions = schemaRowsOf(path).filter((row) => V46_ADDED_TRIGGERS.includes(row.name));
+    expect(definitions).toHaveLength(9);
     toV45Image(path);
     const raw = new Database(path);
     try {
-      // One guard present with a weakened body, as a chain test or an interrupted copy could leave it.
-      raw.exec("CREATE TRIGGER outbox_rowid_positive AFTER INSERT ON outbox WHEN 0 BEGIN SELECT 1; END;");
+      for (const definition of definitions) raw.exec(definition.sql!);
     } finally {
       raw.close();
     }
-    approveMigration(path, "V46 pre-existing witness");
+    approveMigration(path, "V46-R1-01 exact pre-existing definitions");
     new Db(path).close();
-    expect(digestOfSchemaRows(schemaRowsOf(path))).toBe(digestOfSchemaRows(schemaRowsOf(fresh)));
+    const before = contentDigests(path);
+    const repeat = new Database(path);
+    try {
+      MIGRATIONS.find((migration) => migration.toVersion === 46)!.apply(repeat);
+    } finally {
+      repeat.close();
+    }
+    expect(contentDigests(path)).toEqual(before);
   });
+});
+
+/**
+ * V46-R1-01. Whatever already holds a v46 name must be the trigger schema.sql defines: its type, its
+ * table, its exact name and its definition, token for token. Anything else refuses the step, and the
+ * contaminated v45 image is restored byte for byte, with no v46 receipt. The review's witnesses, changed
+ * only for paths and isolation, plus two siblings: a view, and an upper-case name with the exact body.
+ *
+ * RED at 404422d5: v46 dropped and recreated its triggers, so `DROP TRIGGER IF EXISTS` replaced a
+ * weakened body, a trigger on another table and an upper-case name, and an index or a view of the name
+ * stayed beside the new guard; every open succeeded.
+ */
+const V46_TABLE_OF = (name: string): { table: string; sentinel: string } =>
+  name.startsWith("outbox_") ? { table: "outbox", sentinel: "OUTBOX_NO_REPLACE" }
+    : name.startsWith("inbound_messages_") ? { table: "inbound_messages", sentinel: "INBOUND_MESSAGE_NO_REPLACE" }
+      : { table: "canonical_turns", sentinel: "CANONICAL_TURN_NO_REPLACE" };
+
+describe.each(V46_ADDED_TRIGGERS)("V46-R1-01: a contaminated %s", (name) => {
+  it.each(["weakened body", "wrong table", "index", "view", "upper-case name", "upper-case name with the exact body"])(
+    "refuses a %s and restores the contaminated v45 image, with no v46 receipt",
+    (variant) => {
+      const fresh = privateStatePath("acp-v46-contaminated-fresh-");
+      new Db(fresh).close();
+      const exact = schemaRowsOf(fresh).find((row) => row.name === name)!.sql!;
+      const path = privateStatePath("acp-v46-contaminated-");
+      new Db(path).close();
+      toV45Image(path);
+      const { table, sentinel } = V46_TABLE_OF(name);
+      const weakened = (on: string, as: string): string =>
+        `CREATE TRIGGER ${as} AFTER INSERT ON ${on} WHEN 0 BEGIN SELECT RAISE(ABORT, '${sentinel}'); END;`;
+      const raw = new Database(path);
+      try {
+        if (variant === "weakened body") raw.exec(weakened(table, name));
+        else if (variant === "wrong table") raw.exec(weakened("projects", name));
+        else if (variant === "index") raw.exec(`CREATE INDEX ${name} ON outbox(message_id)`);
+        else if (variant === "view") raw.exec(`CREATE VIEW ${name} AS SELECT 1`);
+        else if (variant === "upper-case name") raw.exec(weakened(table, name.toUpperCase()));
+        else raw.exec(exact.replace(name, name.toUpperCase()));
+      } finally {
+        raw.close();
+      }
+      const contaminated = contentDigests(path);
+      approveMigration(path, "V46-R1-01 contamination witness");
+      let refusal: unknown;
+      try {
+        new Db(path).close();
+      } catch (error) {
+        refusal = error;
+      }
+      expect(String(refusal)).toMatch(/original database was restored/);
+      expect(String((refusal as { evidence?: { migrationError?: unknown } } | undefined)?.evidence?.migrationError))
+        .toMatch(new RegExp(`^v46 refuses: ${name} is held by the`));
+      expect(contentDigests(path)).toEqual(contaminated);
+      const probe = new Database(path, { readonly: true });
+      try {
+        expect(probe.prepare("SELECT COUNT(*) FROM schema_migrations WHERE version = 46").pluck().get()).toBe(0);
+      } finally {
+        probe.close();
+      }
+    },
+  );
 });
