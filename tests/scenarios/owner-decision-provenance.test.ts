@@ -1615,7 +1615,7 @@ describe("FIX-SEC-R3 review r3's originals: a candidate receipt, a decision-shap
     expect(fileBytes(path)).toBe(bytes);
   });
 
-  it("RV3-REFUSAL the file, its receipts and its version are unchanged byte for byte; the start exits non-zero under the refusal's code, and the restart it earns stays down", async () => {
+  it("RV3-REFUSAL the file, its receipts and its version are unchanged byte for byte; every start exits non-zero under the refusal's code, and exits 0 only under the launchd plist", async () => {
     const w = await v46History();
     const path = asReleasedV46(w);
     forgeAtV46(w, path, "art_rv3_refusal", ITEM_B);
@@ -1624,12 +1624,13 @@ describe("FIX-SEC-R3 review r3's originals: a candidate receipt, a decision-shap
 
     const refusal = upgrade(w, "FIX-SEC-R3 startup refusal");
     expect({ bytes: fileBytes(path), receipts: receiptsOf(path), logical: contentDigests(path) }).toEqual(before);
-    const first = dispositionForStartupError(refusal, path);
-    expect(first).toMatchObject({ exitCode: 78, body: { reasonCode: "OWNER_DECISION_LABEL_PREDATES_GUARD", standing: false } });
+    const first = dispositionForStartupError(refusal, path, {});
+    expect(first).toMatchObject({ exitCode: 78, body: { reasonCode: "OWNER_DECISION_LABEL_PREDATES_GUARD", supervisor: null, exitCode: 78 } });
+    expect(first.body).not.toHaveProperty("standing");
     expect(first.reportPath).not.toBeNull();
     expect(JSON.parse(readFileSync(first.reportPath!, "utf8"))).toMatchObject({ reasonCode: "OWNER_DECISION_LABEL_PREDATES_GUARD" });
 
-    // The restart launchd gives a non-zero exit: the same refusal, read-only again, already on record.
+    // A second start: the same refusal, read-only again, its own record on file. The record decides nothing.
     let retry: unknown;
     try {
       makeHarness({ root: w.harness.root, repoPath: w.harness.repoPath, githubClient: w.github, clock: w.harness.clock }).cp.close();
@@ -1637,7 +1638,9 @@ describe("FIX-SEC-R3 review r3's originals: a candidate receipt, a decision-shap
       retry = error;
     }
     expect(retry).toMatchObject({ reasonCode: "OWNER_DECISION_LABEL_PREDATES_GUARD" });
-    expect(dispositionForStartupError(retry, path)).toMatchObject({ exitCode: 0, body: { standing: true } });
+    expect(dispositionForStartupError(retry, path, {})).toMatchObject({ exitCode: 78 });
+    expect(dispositionForStartupError(retry, path, { ACP_DAEMON_SUPERVISOR: "launchd" }))
+      .toMatchObject({ exitCode: 0, body: { reasonCode: "OWNER_DECISION_LABEL_PREDATES_GUARD", supervisor: "launchd", exitCode: 0 } });
     expect({ bytes: fileBytes(path), receipts: receiptsOf(path), logical: contentDigests(path) }).toEqual(before);
     expect(external(w)).toEqual({ writes: 0, merges: 0, checks: 0 });
   });
