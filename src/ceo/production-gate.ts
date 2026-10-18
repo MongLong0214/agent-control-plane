@@ -16,7 +16,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "./owner-authority.ts";
 import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import type { AuditLog } from "../db/audit.ts";
-import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
+import { type ArtifactStore, type EvidenceWriter, OWNER_DECISION_PRODUCER, type StoredArtifact } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import {
   ArtifactKind,
@@ -1649,7 +1649,10 @@ export class ProductionGate {
 
         const actor = `${receipt.channel}:${receipt.actor}`;
         const gate = this.humanGateDefinition(input.runId);
-        this.artifacts.put(input.runId, ArtifactKind.APPROVAL, {
+        // SEC-OD1 — the canonical owner decision: written only here, through this gate's capability, in
+        // the transaction that admitted the receipt from live ingress and consumed it. The readers count
+        // no other APPROVAL artifact as an owner decision.
+        this.artifacts.putOwnerDecision(this.packetWriter, input.runId, {
           kind: "OWNER_DECISION",
           item: input.item,
           approved: input.approved,
@@ -1715,6 +1718,57 @@ export class ProductionGate {
     }
   }
 
+  /**
+   * SEC-OD1 — the owner decision an APPROVAL artifact canonically records for this run's current gate
+   * and candidate, or null. `humanGateStatus` and `currentHumanGateDecisionDigest` judge every artifact
+   * here, so neither can count a record the other refuses.
+   *
+   * The source of truth is the record `recordOwnerDecision` writes through `putOwnerDecision`, in the
+   * one transaction that admits the receipt from live ingress (an allowlisted owner, and the write-once
+   * `inbound_messages` row whose actor and admitted payload are the receipt's) and consumes it for the
+   * candidate. Its label is the authority the actor held at that time. It outlives the 24h ingress
+   * replay cache, so a legitimate past approval is never asked for a live admission again. The rest of
+   * the record is then checked against this run: the receipt binds the exact item, decision and note,
+   * this run and the owner-decision operation, and the gate definition and the current candidate.
+   *
+   * OWNER_APPROVAL_CONSUMED and OWNER_DECISION audit rows are ordinary rows a connection ACP did not
+   * open can insert, so here they neither satisfy an item nor take a recorded decision away.
+   */
+  private canonicalOwnerDecision(
+    runId: string,
+    artifact: StoredArtifact<OwnerDecisionRecord>,
+    gateDigest: string,
+    currentCandidate: string,
+  ): { item: string; approved: boolean } | null {
+    const decision = artifact.content;
+    if (
+      artifact.superseded ||
+      artifact.producedBy !== OWNER_DECISION_PRODUCER ||
+      decision.kind !== "OWNER_DECISION" ||
+      typeof decision.item !== "string" ||
+      decision.item.length === 0 ||
+      typeof decision.approved !== "boolean" ||
+      typeof decision.note !== "string" ||
+      decision.humanGateDigest !== gateDigest ||
+      artifact.candidateSnapshotDigest !== currentCandidate ||
+      decision.candidateSnapshotDigest !== currentCandidate
+    ) {
+      return null;
+    }
+    const receipt = this.assertOwnerDecisionReceipt({
+      runId,
+      item: decision.item,
+      approved: decision.approved,
+      note: decision.note,
+      receipt: decision.receipt,
+      // Admission was proven when the canonical record was written; a pruned cache is not asked again.
+      requireLiveAdmission: false,
+    });
+    // The receipt was minted for the candidate it was consumed for, and that is the current one.
+    if (!receipt.allowed || receipt.value.candidateSnapshotDigest !== currentCandidate) return null;
+    return { item: decision.item, approved: decision.approved };
+  }
+
   humanGateStatus(runId: string): { required: boolean; items: string[]; satisfied: boolean } {
     const gate = this.humanGateDefinition(runId);
     const { items } = gate;
@@ -1723,53 +1777,15 @@ export class ProductionGate {
 
     const currentCandidate = this.runs.currentCandidate(runId);
     if (!currentCandidate) return { required: true, items, satisfied: false };
-    // An approval row is only evidence of owner authority while its retained ingress receipt
-    // can still be admitted. In particular, never let a direct ArtifactStore write turn an
-    // APPROVAL-shaped object into an owner decision (CP-HI-07).
+    // Only a canonical owner decision decides an item (SEC-OD1): never a direct ArtifactStore
+    // write of an APPROVAL-shaped object (CP-HI-07), and never an audit row.
     if (!this.#ownerAuthority) return { required: true, items, satisfied: false };
     const latestDecision = new Map<string, boolean>();
-    for (const artifact of this.artifacts.list<{
-      kind?: string;
-      item?: string;
-      approved?: boolean;
-      note?: unknown;
-      humanGateDigest?: string;
-      candidateSnapshotDigest?: string | null;
-      receipt?: unknown;
-    }>(runId, ArtifactKind.APPROVAL)) {
-      const decision = artifact.content;
-      if (
-        artifact.superseded ||
-        decision.kind !== "OWNER_DECISION" ||
-        typeof decision.item !== "string" ||
-        decision.item.length === 0 ||
-        typeof decision.approved !== "boolean" ||
-        typeof decision.note !== "string" ||
-        decision.humanGateDigest !== gate.digest ||
-        artifact.candidateSnapshotDigest !== currentCandidate ||
-        decision.candidateSnapshotDigest !== currentCandidate
-      ) {
-        continue;
-      }
-      const retainedReceipt = this.assertOwnerDecisionReceipt({
-        runId,
-        item: decision.item,
-        approved: decision.approved,
-        note: decision.note,
-        receipt: decision.receipt,
-        // Retained read: authority comes from the consumption record below, not from a
-        // replay cache that has since been pruned.
-        requireLiveAdmission: false,
-      });
-      if (!retainedReceipt.allowed) continue;
-      const candidateBinding = this.#ownerAuthority.assertConsumedApproval(
-        retainedReceipt.value,
-        currentCandidate,
-      );
-      if (!candidateBinding.allowed) continue;
+    for (const artifact of this.artifacts.list<OwnerDecisionRecord>(runId, ArtifactKind.APPROVAL)) {
+      const decision = this.canonicalOwnerDecision(runId, artifact, gate.digest, currentCandidate);
       // ArtifactStore.list is durable creation order (then rowid), so assignment makes
       // a later explicit rejection revoke an earlier approval for the same gate item.
-      latestDecision.set(decision.item, decision.approved);
+      if (decision) latestDecision.set(decision.item, decision.approved);
     }
 
     // S10 — an item's own OWNER_DECISION, approval or refusal, decides it as before, so an explicit
@@ -1807,43 +1823,10 @@ export class ProductionGate {
     }
 
     const latest = new Map<string, { approved: boolean; digest: string }>();
-    for (const artifact of this.artifacts.list<{
-      kind?: string;
-      item?: string;
-      approved?: boolean;
-      note?: unknown;
-      humanGateDigest?: string;
-      candidateSnapshotDigest?: string | null;
-      receipt?: unknown;
-    }>(runId, ArtifactKind.APPROVAL)) {
-      const decision = artifact.content;
-      if (
-        artifact.superseded ||
-        decision.kind !== "OWNER_DECISION" ||
-        typeof decision.item !== "string" ||
-        !gate.items.includes(decision.item) ||
-        typeof decision.approved !== "boolean" ||
-        typeof decision.note !== "string" ||
-        decision.humanGateDigest !== gate.digest ||
-        artifact.candidateSnapshotDigest !== candidateSnapshotDigest ||
-        decision.candidateSnapshotDigest !== candidateSnapshotDigest
-      ) {
-        continue;
-      }
-      const retainedReceipt = this.assertOwnerDecisionReceipt({
-        runId,
-        item: decision.item,
-        approved: decision.approved,
-        note: decision.note,
-        receipt: decision.receipt,
-        // Retained read: authority comes from the consumption record below, not from a
-        // replay cache that has since been pruned.
-        requireLiveAdmission: false,
-      });
-      if (retainedReceipt.allowed && this.#ownerAuthority.assertConsumedApproval(
-        retainedReceipt.value,
-        candidateSnapshotDigest,
-      ).allowed) {
+    for (const artifact of this.artifacts.list<OwnerDecisionRecord>(runId, ArtifactKind.APPROVAL)) {
+      // The same canonical verifier as humanGateStatus (SEC-OD1); only the item rule differs here.
+      const decision = this.canonicalOwnerDecision(runId, artifact, gate.digest, candidateSnapshotDigest);
+      if (decision && gate.items.includes(decision.item)) {
         latest.set(decision.item, { approved: decision.approved, digest: artifact.digest });
       }
     }
@@ -2155,6 +2138,17 @@ export class ProductionGate {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** An APPROVAL artifact's content as the owner-decision readers load it: untrusted until verified. */
+interface OwnerDecisionRecord {
+  kind?: string;
+  item?: string;
+  approved?: boolean;
+  note?: unknown;
+  humanGateDigest?: string;
+  candidateSnapshotDigest?: string | null;
+  receipt?: unknown;
+}
 
 /** Content loaded from an artifact is untrusted JSON until it has this complete receipt shape. */
 const isOwnerApprovalReceipt = (value: unknown): value is OwnerApprovalReceipt =>

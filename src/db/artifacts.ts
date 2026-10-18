@@ -49,6 +49,14 @@ export const isEvidenceKind = (kind: string): kind is EvidenceKind =>
   Object.hasOwn(EVIDENCE_PRODUCERS, kind);
 
 /**
+ * SEC-OD1 — the `produced_by` of a canonical owner decision: the OWNER_DECISION APPROVAL artifact
+ * `ProductionGate.recordOwnerDecision` writes in the one transaction that admits the owner's receipt
+ * from live ingress and consumes it. Only `putOwnerDecision` writes it, and only for the holder of the
+ * production gate's capability; `put` labels every row "service" whatever its content says.
+ */
+export const OWNER_DECISION_PRODUCER = "production-gate:owner-decision";
+
+/**
  * The only secret in this module. It is never exported and never stored on a token, so the
  * sole route to a constructed capability is `ArtifactStore.issueEvidenceWriters`. Symbol
  * identity — not the description — is what the constructor compares, so re-creating
@@ -212,6 +220,35 @@ export class ArtifactStore {
   }
 
   /**
+   * SEC-OD1 — the one write that makes an APPROVAL artifact a canonical owner decision.
+   *
+   * Authority is the production gate's capability, never the content: an OWNER_DECISION-shaped
+   * object written through `put` carries "service" and is not an owner decision. The row cannot be
+   * inserted by a connection ACP did not open (the table's insert triggers name a function only ACP's
+   * own connection defines) and is immutable once written, label included, so the label outlives the
+   * ingress replay cache the receipt was admitted from. A writer that holds ACP's own raw database
+   * handle can still write the label; that is the single-user local threat model's Limit.
+   */
+  putOwnerDecision<T>(
+    writer: EvidenceWriter<"PRODUCTION_READY_PACKET">,
+    runId: string,
+    content: T,
+    candidateSnapshotDigest: string,
+  ): StoredArtifact<T> {
+    const writePort = EvidenceWriterToken.kindOf(writer) === "PRODUCTION_READY_PACKET"
+      ? EVIDENCE_WRITE_PORTS.get(writer)
+      : undefined;
+    if (!writePort) {
+      fail(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "an owner decision is recorded only through the production gate's writer capability",
+        { runId },
+      );
+    }
+    return this.write(runId, "APPROVAL", content, candidateSnapshotDigest, OWNER_DECISION_PRODUCER, writePort);
+  }
+
+  /**
    * Writes an evidence artifact. Authority is the capability the caller holds, never a
    * name it supplies: the recorded producer is derived from the capability's kind, so a
    * caller that knows "verification-engine" but holds nothing is refused, and a caller
@@ -305,7 +342,18 @@ export class ArtifactStore {
         WHERE run_id = ? AND kind = ? AND digest = ? AND candidate_snapshot_digest IS ?`,
       [runId, kind, digest, candidateSnapshotDigest],
     );
-    if (existing) return hydrate<T>(existing);
+    if (existing) {
+      // SEC-OD1 — an identical row another writer stored first is not this owner decision. Returning
+      // it would report the decision recorded while no canonical record exists.
+      if (producedBy === OWNER_DECISION_PRODUCER && existing.produced_by !== producedBy) {
+        fail(
+          ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+          "an identical owner-decision-shaped artifact was already written by another writer",
+          { runId, kind, digest, producedBy: existing.produced_by },
+        );
+      }
+      return hydrate<T>(existing);
+    }
 
     const artifact: StoredArtifact<T> = {
       artifactId: newArtifactId(),
@@ -319,7 +367,7 @@ export class ArtifactStore {
       superseded: false,
     };
     const contentJson = canonicalJson(durableContent);
-    if (isEvidenceKind(kind)) {
+    if (isEvidenceKind(kind) || evidenceWritePort) {
       const writePort = evidenceWritePort ?? fail(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
         `${kind} requires an evidence writer capability`,
