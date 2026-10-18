@@ -12,7 +12,7 @@ import {
 } from "../snapshot/candidate-snapshot.ts";
 import { credentialBearingField, prohibitedDurableField } from "./audit.ts";
 import type { Db, EvidenceWritePort } from "./database.ts";
-import { OWNER_DECISION_LABEL } from "./migrations.ts";
+import { OWNER_DECISION_LABEL, ownerDecisionShapeSql } from "./migrations.ts";
 
 export interface StoredArtifact<T = unknown> {
   artifactId: string;
@@ -536,6 +536,29 @@ export class ArtifactStore {
           [runId],
         );
     return rows.map((row) => hydrate<T>(row));
+  }
+
+  /**
+   * SEC-OD1 (FIX-SEC-NEST, CEO 4170f7c5) — the APPROVAL rows the owner gate reads as owner decisions, in
+   * `list`'s order: the canonical label, or content SQLite itself judges OWNER_DECISION-shaped by the
+   * guards' own clause (`ownerDecisionShapeSql`). That is the set the v47 guard refuses to an ordinary
+   * write. A row with another label whose content SQLite cannot read as an owner decision (not JSON, or
+   * nested past json1's depth limit, which `JSON.parse` still reads) is outside what the guard vetted
+   * and is not one, so it is left out here, in this query, and never hydrated: it can neither count nor
+   * fail the read. Nothing is caught. A canonical row is returned whatever its content and judged by
+   * the gate as before. The clause is a `CASE WHEN` condition, as the guards' WHEN evaluates it, so
+   * `json_each` never reads a row `json_valid` refused.
+   */
+  listOwnerDecisions<T>(runId: string): StoredArtifact<T>[] {
+    return this.db
+      .all<RawArtifact>(
+        `SELECT * FROM run_artifacts
+          WHERE run_id = ? AND kind = 'APPROVAL'
+            AND (produced_by = ? OR (CASE WHEN ${ownerDecisionShapeSql("content_json")} THEN 1 ELSE 0 END) = 1)
+          ORDER BY created_at, rowid`,
+        [runId, OWNER_DECISION_LABEL],
+      )
+      .map((row) => hydrate<T>(row));
   }
 
   byDigest<T>(digest: string): StoredArtifact<T> | null {

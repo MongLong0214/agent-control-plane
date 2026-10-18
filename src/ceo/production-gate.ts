@@ -1800,6 +1800,12 @@ export class ProductionGate {
    * cannot then satisfy its item. A refusal bound to anything else is not read at all. An approval
    * counts only as the canonical record (CEO 52c3b1e6 (a)); a non-canonical one is reported back as
    * `decideAgain` so the refusal can say why, and never decides the item.
+   *
+   * FIX-SEC-NEST (CEO 4170f7c5). A non-canonical record is read at all only when SQLite itself judges its
+   * content OWNER_DECISION-shaped, by the guards' clause (`ArtifactStore.listOwnerDecisions`): a row the
+   * v47 guard admitted because SQLite cannot read it (nested past json1's depth limit, or not JSON) is
+   * left out in the query, so it neither counts as a refusal, whatever its `created_at`, nor fails this
+   * read. Only rows so identified are left out; no error is caught here.
    */
   private ownerDecisionsOf(
     runId: string,
@@ -1808,10 +1814,10 @@ export class ProductionGate {
   ): { latest: Map<string, { approved: boolean; digest: string }>; decideAgain: Set<string> } {
     const latest = new Map<string, { approved: boolean; digest: string }>();
     const decideAgain = new Set<string>();
-    for (const artifact of this.artifacts.list<OwnerDecisionRecord>(runId, ArtifactKind.APPROVAL)) {
+    for (const artifact of this.artifacts.listOwnerDecisions<OwnerDecisionRecord>(runId)) {
       const decision = this.boundOwnerDecision(runId, artifact, gateDigest, currentCandidate);
       if (!decision) continue;
-      // ArtifactStore.list is durable creation order (then rowid), so assignment makes
+      // listOwnerDecisions is durable creation order (then rowid), so assignment makes
       // a later explicit rejection revoke an earlier approval for the same gate item.
       if (decision.canonical || !decision.approved) {
         latest.set(decision.item, { approved: decision.approved, digest: artifact.digest });
