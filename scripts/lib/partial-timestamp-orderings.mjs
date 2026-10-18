@@ -41,8 +41,8 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   // so the ordering was given `handoff_id` instead — the remedy this file's header prescribes — and
   // the entry is gone rather than relocated. The query refuses unless `rows.length === 1`, so the
   // tiebreaker changes no decision; what it removes is this file's claim on an unrelated edit.
-  ["src/github/github-kernel.ts:3472", "ORDER BY created_at DESC"],
-  ["src/github/github-kernel.ts:3898", "ORDER BY created_at"],
+  ["src/github/github-kernel.ts:3593", "ORDER BY created_at DESC"],
+  ["src/github/github-kernel.ts:4019", "ORDER BY created_at"],
   // `RunEngine.list` was here at run-engine.ts:1260. Its ordering was given `rowid` rather than
   // re-keyed when an edit above it moved it: insertion order is what ties already returned.
 ]);

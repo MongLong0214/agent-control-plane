@@ -53,6 +53,7 @@ import {
   writeSubscriberConfig,
 } from "../helpers/buzz-mention-relay.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { humanGateBindingOf } from "../helpers/human-gate-binding.ts";
 import { TEST_OWNER, dispatchBootstrapRun, ownerDecisionReceipt } from "../helpers/harness.ts";
 import { OWNER_DECISION_WRITE_DENIED, writeOutsideTheGuard } from "../helpers/released-v47-schema.ts";
 
@@ -2105,12 +2106,14 @@ describe("RV1142 concrete review witnesses", () => {
     } finally { await w.close(); }
   });
 
-  it("RV1142-W4 the merge-finalizer reader retains its distinct decision rule", async () => {
+  // FIX-FINALIZER-DIGEST (CEO 4b4317b0) reverses this witness: the merge-finalizer reader no longer keeps
+  // a distinct rule. It answers from the one resolver humanGateStatus answers from, T3 link included.
+  it("RV1142-W4 the merge-finalizer reader reads the same decision rule as the gate (FIX-FINALIZER-DIGEST)", async () => {
     const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
     try {
       await w.send(w.reply({ prompt }));
       expect(gateOf(w).satisfied).toBe(true);
-      expect(w.prepared.harness.cp.ceo.currentHumanGateDecisionDigest(w.prepared.runId).allowed).toBe(false);
+      expect(w.prepared.harness.cp.ceo.currentHumanGateDecisionDigest(w.prepared.runId).allowed).toBe(true);
     } finally { await w.close(); }
   });
 });
@@ -2552,6 +2555,120 @@ describe("SEC-OD1-R1-02: owner decisions recorded before canonical provenance", 
       expect(gateOf(w)).toEqual({ required: true, items: [T3_GATE_ITEM, PROSE_ITEM], satisfied: true });
     } finally {
       await w.close();
+    }
+  });
+});
+
+/**
+ * CEO ef7fa698, point 1: two things are verified here and recorded apart.
+ * - T3 COMPLETED is verified on the CONFIRM path. A project-less PROJECT_BOOTSTRAP completes at the CEO's
+ *   CONFIRM and never reaches the daemon finalizer, so these witnesses do not show a T3 run completing
+ *   through the daemon finalizer, and nothing here should be read that way.
+ * - The binding agreement, separately: the finalizer's reader (`currentHumanGateDecisionDigest`), the
+ *   kernel's port (`humanGateBinding`) and the binding of the receipt `ownerApprovalHolds` admits. All
+ *   three agree before consumption; the reader names the same binding after consumption; the reader and
+ *   the port name it after the receipt's ingress admission is pruned.
+ */
+describe("FINALIZER-DIGEST T3: the decision digest the daemon finalizer names reads the S10 T3 link", () => {
+  /** The binding the T3 link gives: the receipt `ownerApprovalHolds` admits, bound by the item's id. */
+  const t3Binding = (w: World): string => {
+    const { runId, runner, harness } = w.prepared;
+    const candidate = harness.cp.runs.currentCandidate(runId)!;
+    const held = runner.ownerApprovalHolds(runId, candidate);
+    if (!held.allowed) throw new Error(`${held.reasonCode}: ${held.message}`);
+    return humanGateBindingOf({
+      items: [T3_GATE_ITEM],
+      candidateSnapshotDigest: candidate,
+      decisions: [{ item: T3_GATE_ITEM, source: "T3_APPROVAL", decision: digestOf(held.value) }],
+    });
+  };
+  const named = (w: World) => w.prepared.harness.cp.ceo.currentHumanGateDecisionDigest(w.prepared.runId);
+
+  it("FINALIZER-DIGEST-T3 a T3-linked item approved through the daemon's Buzz sink is named by currentHumanGateDecisionDigest as humanGateStatus counts it", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(underMessage(w, ctoMessage(w), `acp-approve-write:${w.promptCode(prompt)}`));
+      expect(gateOf(w)).toEqual({ required: true, items: [T3_GATE_ITEM], satisfied: true });
+      const first = named(w);
+      expect({ allowed: first.allowed, reasonCode: first.reasonCode }, JSON.stringify(first)).toEqual({ allowed: true, reasonCode: ReasonCode.OK });
+      // The finalizer's value and the kernel's port are one binding, of the T3 receipt the existing judge admits.
+      const binding = t3Binding(w);
+      expect(first).toMatchObject({ value: binding });
+      expect(cp.ceo.humanGateBinding(w.prepared.runId)).toEqual({ required: true, items: [T3_GATE_ITEM], satisfied: true, humanGateDigest: binding });
+
+      // C3 consumes the approval and anchors it: the same decision, so the same binding.
+      const applied = await w.confirm();
+      expect(applied.reasonCode, JSON.stringify(applied)).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+      expect(named(w)).toMatchObject({ allowed: true, value: binding });
+      const primary = cp.bindings.activePrimaryCto(w.prepared.manifest.projectId);
+      expect(cp.bootstrap.acknowledgeActivationHandoff(applied.evidence["pendingHandoffId"] as string, primary!.sessionId).allowed).toBe(true);
+      const activated = await w.confirm();
+      expect(activated.allowed, JSON.stringify(activated)).toBe(true);
+      // T3 COMPLETED, verified on the CONFIRM path: the bootstrap completes at this CONFIRM, not through
+      // the daemon finalizer. Recorded apart from the binding agreement checked above.
+      const confirmed = cp.ceo.submitCeoDecision({
+        runId: w.prepared.runId,
+        decision: "CONFIRM",
+        candidateSnapshotDigest: w.prepared.snapshotDigest,
+        ceoSessionId: w.prepared.ceoSessionId,
+        rationale: "apply the bootstrap",
+      });
+      expect(confirmed.allowed, JSON.stringify(confirmed)).toBe(true);
+      expect(cp.runs.require(w.prepared.runId).state).toBe(RunState.COMPLETED);
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("FINALIZER-DIGEST-T3 the binding of an anchored T3 approval is unchanged once its ingress admission is pruned", async () => {
+    const { w } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      // A CLI approval, so the receipt's own ingress admission is in the channel the prune below reaches.
+      const approval = ownerApprovalFor(w.prepared);
+      expect(w.prepared.runner.recordOwnerApproval(w.prepared.runId, {
+        owner: "acme", visibility: "public", planDigest: w.prepared.planDigest,
+        approvedManifest: w.prepared.manifest, projectName: w.prepared.manifest.projectId,
+        receipt: approval.receipt,
+      }).allowed).toBe(true);
+      const before = named(w);
+      if (!before.allowed) throw new Error(`${before.reasonCode}: ${before.message}`);
+      expect(before.value).toBe(t3Binding(w));
+      expect((await w.confirm()).reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(named(w)).toMatchObject({ allowed: true, value: before.value });
+      w.prepared.harness.clock.advance(25 * 60 * 60 * 1000);
+      const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { cli: { allowedActors: [TEST_OWNER.actor] } });
+      expect(guard.admit({ channel: "cli", actor: TEST_OWNER.actor, nonce: "after-retention", payload: null }).allowed).toBe(true);
+      expect(cp.ownerAuthority.assertApproval(approval.receipt as never).allowed).toBe(false);
+      expect(named(w)).toMatchObject({ allowed: true, value: before.value });
+      expect(cp.ceo.humanGateBinding(w.prepared.runId).humanGateDigest).toBe(before.value);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("FINALIZER-DIGEST-T3 an explicit refusal of the linked item, or a T3 approval that no longer holds, leaves no binding to name", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(named(w).allowed).toBe(true);
+      w.prepared.harness.clock.advance(25 * 60 * 60 * 1000);
+      // Past the prompt's stored window, the existing judge refuses the unanchored Buzz approval.
+      expect(named(w)).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
+      expect(w.prepared.harness.cp.ceo.humanGateBinding(w.prepared.runId)).toMatchObject({ satisfied: false, humanGateDigest: null });
+    } finally {
+      await w.close();
+    }
+    const refused = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      await refused.w.send(refused.w.reply({ prompt: refused.prompt }));
+      expect(ownerDecision(refused.w, T3_GATE_ITEM, false).allowed).toBe(true);
+      expect(named(refused.w)).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
+    } finally {
+      await refused.w.close();
     }
   });
 });

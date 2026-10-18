@@ -21,7 +21,7 @@ import {
   type ManagedWriteGuard,
 } from "../guard/managed-write-guard.ts";
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
-import type { TrustedCredentialStore } from "./credential-store.ts";
+import type { BeforeDispatch, TrustedCredentialStore } from "./credential-store.ts";
 import { type BranchCommitMessage, squashCommitForMerge } from "./merge-commit-message.ts";
 
 /**
@@ -69,11 +69,21 @@ export const transportOutcome = (error: unknown): { outcome: TransportOutcome; s
   return typeof status === "number" ? { outcome: "answered", status } : { outcome: "unheard" };
 };
 
+/**
+ * FD-R2 — `beforeDispatch` is a synchronous check that a client awaiting something before it sends
+ * (`GitHubAppClient`: the installation token) runs after that await and immediately before the
+ * request leaves. If the check refuses or throws, the client sends nothing and rejects.
+ */
+export interface GitHubRequestOptions {
+  beforeDispatch?: BeforeDispatch;
+}
+
 export interface GitHubClient {
   request<T>(
     method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
     path: string,
     body?: unknown,
+    options?: GitHubRequestOptions,
   ): Promise<T>;
 }
 
@@ -105,11 +115,13 @@ export class GitHubAppClient implements GitHubClient {
     method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
     path: string,
     body?: unknown,
+    options?: GitHubRequestOptions,
   ): Promise<T> {
     const result = await this.credentials.githubApi({
       method,
       path,
       ...(body !== undefined ? { input: JSON.stringify(body) } : {}),
+      ...(options?.beforeDispatch ? { beforeDispatch: options.beforeDispatch } : {}),
     });
     // Throw the denial structurally rather than flattening it to a string (#533): the evidence
     // carries `status` when a response arrived, and that is the only thing distinguishing an
@@ -177,17 +189,23 @@ interface GitHubCaller {
 }
 
 /**
- * The GitHub boundary deliberately reads the owner-gate predicate through this narrow port.
- * `ProductionGate.humanGateStatus` is the sole place that interprets approval artifacts and
- * their ingress receipts; the kernel only binds its result to a gate payload.
+ * The GitHub boundary deliberately reads the owner gate through this narrow port.
+ * `ProductionGate.resolveHumanGate` is the sole place that interprets owner decisions, T3 approvals
+ * and their ingress receipts; the port answers `ProductionGate.humanGateBinding`, and the kernel only
+ * compares its binding with the gate payload's, each time it publishes and each time it merges.
  */
 export interface HumanGateStatusPort {
   humanGateStatus(runId: string): {
     required: boolean;
     items: readonly string[];
     satisfied: boolean;
-    /** Digest of the current ProductionGate definition, supplied with the status. */
-    humanGateDigest: string;
+    /**
+     * FIX-FINALIZER-DIGEST — the current human-gate binding: the digest of the gate definition digest,
+     * the current candidate and each required item's authenticated decision, the same value the daemon
+     * finalizer names as the payload's `humanGateDigest`. Null while the gate is unsatisfied, so no
+     * payload can name it; never the definition digest alone.
+     */
+    humanGateDigest: string | null;
     /**
      * SEC-OD1-R1-02 — the undecided items whose latest owner approval is not a canonical owner decision
      * (recorded before SEC-OD1), named so the refusal says the owner must decide again.
@@ -266,7 +284,7 @@ export class GitHubKernel {
    * because GitHub has already accepted it but the first caller has not reread it yet.
    */
   private readonly inFlightReservations = new Set<string>();
-  /** `ProductionGate.humanGateStatus` is the sole human-gate predicate. */
+  /** `ProductionGate.resolveHumanGate`, through `humanGateBinding`, is the sole human-gate predicate. */
   private humanGateStatusPort: HumanGateStatusPort | null = null;
   private readonly client: GitHubClient | undefined;
   private readonly postMergePollAttempts: number;
@@ -788,7 +806,14 @@ export class GitHubKernel {
         this.releaseReservation(idempotencyKey, payloadDigest);
         return this.gatePublish(payload, repositoryIdentity, daemonFinalizerAuthority);
       }
-      const replay = await this.verifyGate(repositoryIdentity, payload.exactHead, payload.runId);
+      // FD-GATE — the replay is of this publication: its payload was found current above, and the gate
+      // selected is the trusted one that carries exactly it, wherever GitHub lists it.
+      const replay = await this.verifyGate(repositoryIdentity, payload.exactHead, payload.runId, (published) =>
+        digestOf(published) === payloadDigest
+          ? allow(ReasonCode.OK, undefined)
+          : deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "a trusted gate on this head carries another payload", {
+            idempotencyKey,
+          }));
       if (!replay.allowed || digestOf(replay.value) !== payloadDigest) {
         return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "cached gate no longer matches its recorded payload", {
           idempotencyKey,
@@ -822,6 +847,9 @@ export class GitHubKernel {
     });
     if (!reserved.allowed) return reserved as Decision<{ checkRunId: number }>;
 
+    // FD-R2 (ROUND1-ESCAPE-PUBLISH) — the transport awaits its installation token after the check above,
+    // so it checks the payload again once it holds the token, immediately before the POST.
+    const dispatch = this.payloadBackedAtDispatch(payload, repositoryIdentity);
     const created = await this.mediate(
       WriteOperation.GITHUB_CHECK_RUN,
       payload.runId,
@@ -848,9 +876,15 @@ export class GitHubKernel {
           summary: `payloadDigest=${payloadDigest}`,
           text: JSON.stringify(payload, null, 2),
         },
-      }),
+      }, { beforeDispatch: dispatch.beforeDispatch }),
     );
     if (!created.allowed) {
+      const refusedAtDispatch = dispatch.refused();
+      if (refusedAtDispatch) {
+        // Nothing was sent: the reservation goes, as the check above would have left none.
+        this.releaseReservation(idempotencyKey, payloadDigest);
+        return refusedAtDispatch as Decision<{ checkRunId: number }>;
+      }
       if (created.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, payloadDigest);
       return created as Decision<{ checkRunId: number }>;
     }
@@ -931,6 +965,34 @@ export class GitHubKernel {
       },
     });
     return allow(ReasonCode.OK, { checkRunId });
+  }
+
+  /**
+   * FD-R2 — the check the transport runs immediately before it sends a write that `payload` authorises
+   * (the gate POST, the merge PUT): `assertGatePayloadBacked` again, because the installation token is
+   * awaited after the kernel's own last check. `refused` reports whether that check refused, and
+   * therefore that nothing was sent, so the write is not mistaken for one whose outcome is unknown.
+   */
+  private payloadBackedAtDispatch(
+    payload: GatePayload,
+    repositoryIdentity: string,
+  ): { beforeDispatch: BeforeDispatch; refused: () => Decision<void> | null } {
+    let refused: Decision<void> | null = null;
+    return {
+      beforeDispatch: () => {
+        let verified: Decision<void>;
+        try {
+          verified = this.assertGatePayloadBacked(payload, repositoryIdentity);
+        } catch {
+          verified = deny(ReasonCode.INTERNAL_ERROR, "gate payload could not be re-verified before dispatch", {
+            runId: payload.runId,
+          });
+        }
+        refused = verified.allowed ? null : verified;
+        return verified;
+      },
+      refused: () => refused,
+    };
   }
 
   /**
@@ -1068,6 +1130,14 @@ export class GitHubKernel {
 
   /** PRD §24.5 — every predicate, evaluated against live GitHub state. */
   async mergeEvaluate(input: MergeInput): Promise<Decision<{ predicates: Record<string, boolean> }>> {
+    const evaluated = await this.evaluateMerge(input);
+    return evaluated.allowed ? allow(evaluated.reasonCode, { predicates: evaluated.value.predicates }) : evaluated;
+  }
+
+  /** `mergeEvaluate`, also naming the gate payload it selected, which `mergeExecute` re-verifies before it writes. */
+  private async evaluateMerge(
+    input: MergeInput,
+  ): Promise<Decision<{ predicates: Record<string, boolean>; gate?: GatePayload }>> {
     const authority = this.assertAuthority(input.runId, input.repositoryIdentity, input);
     if (!authority.allowed) return authority as Decision<{ predicates: Record<string, boolean> }>;
 
@@ -1173,7 +1243,10 @@ export class GitHubKernel {
     if (!contract.allowed) {
       return deny(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, contract.message, contract.evidence);
     }
-    const gate = await this.verifyGate(input.repositoryIdentity, pull.head.sha, input.runId);
+    // FD-GATE — the gate selected is the trusted one whose payload is backed by the current state, its
+    // human-gate binding included, so a stale gate listed ahead of it cannot mask it.
+    const gate = await this.verifyGate(input.repositoryIdentity, pull.head.sha, input.runId, (payload) =>
+      this.assertGatePayloadBacked(payload, input.repositoryIdentity));
     if (!gate.allowed) return gate as Decision<{ predicates: Record<string, boolean> }>;
 
     // The gate payload was checked against local evidence when it was published; at merge
@@ -1182,6 +1255,7 @@ export class GitHubKernel {
     if (!stillBacked.allowed) return stillBacked as Decision<{ predicates: Record<string, boolean> }>;
 
     return allow(ReasonCode.OK, {
+      gate: gate.value,
       predicates: {
         exactHead: true,
         expectedBase: true,
@@ -1296,11 +1370,21 @@ export class GitHubKernel {
    * CP-S35 — a gate is trusted only if the daemon published it. Name alone proves
    * nothing: the creator identity and the payload digest must both match the local
    * publication record, and the payload's head must be the head being merged.
+   *
+   * FD-GATE (CEO ef7fa698) — of the trusted gates, only one whose payload `selects` accepts is
+   * returned: the payload the caller requires, judged against the current state. A head can carry a
+   * trusted gate for a binding that no longer holds (the owner decided again after it was published)
+   * beside the gate for the binding that holds now, and GitHub's listing order says nothing about which
+   * is which, so the first trusted gate is not the answer, and neither is the newest. Gates that pass
+   * `selects` each name the required state exactly (a retry's gate differs only in its timestamp), so
+   * which of them is returned decides nothing. With no gate selected the refusal is the first trusted
+   * gate's own `selects` refusal, never that gate.
    */
   private async verifyGate(
     repositoryIdentity: string,
     head: string,
     runId: string,
+    selects: (payload: GatePayload) => Decision<void>,
   ): Promise<Decision<GatePayload>> {
     const checks = await this.listCheckRuns(repositoryIdentity, head, GATE_CHECK_NAME);
     if (!checks.allowed) return checks as Decision<GatePayload>;
@@ -1327,6 +1411,7 @@ export class GitHubKernel {
       );
     }
 
+    let unselected: Decision<void> | null = null;
     for (const check of candidates) {
       const summary = check.output?.summary ?? "";
       const digest = /payloadDigest=(sha256:[0-9a-f]{64})/.exec(summary)?.[1] ?? null;
@@ -1449,9 +1534,17 @@ export class GitHubKernel {
         });
         continue;
       }
+      // Trusted, and still only a candidate: a gate for a binding that no longer holds is the daemon's
+      // own and not forged, so it is passed over without a GATE_REJECTED record.
+      const selected = selects(payload);
+      if (!selected.allowed) {
+        unselected ??= selected;
+        continue;
+      }
       return allow(ReasonCode.OK, payload);
     }
 
+    if (unselected) return unselected as Decision<GatePayload>;
     return deny(
       ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID,
       "no production gate on this head was published by the trusted credential",
@@ -1681,8 +1774,15 @@ export class GitHubKernel {
     );
     if (!finalization.allowed) return finalization as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
-    const evaluation = await this.mergeEvaluate(input);
+    const evaluation = await this.evaluateMerge(input);
     if (!evaluation.allowed) return evaluation as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    const selectedGate = evaluation.value.gate;
+    if (!selectedGate) {
+      return deny(ReasonCode.INTERNAL_ERROR, "merge evaluation named no gate payload to re-verify", {
+        runId: input.runId,
+        repositoryIdentity: input.repositoryIdentity,
+      });
+    }
 
     const slug = this.slug(input.repositoryIdentity);
     if (!slug.allowed) return slug as Decision<{ mergeCommitSha: string; replayed: boolean }>;
@@ -1733,6 +1833,18 @@ export class GitHubKernel {
     const target = this.writeTarget(input.runId, input.repositoryIdentity, preflight.head.ref);
     if (!target.allowed) return target as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
+    // FD-R1-RACE — the evaluation above was followed by awaited reads (the preflight, and for a squash the
+    // commits its message is composed from), and an owner decision or a new candidate can land during
+    // any of them. So the selected gate's payload is verified again here, after the last await: its
+    // evidence still backs the current candidate and its human-gate binding is the one the owner's
+    // current decisions resolve to. Nothing is awaited between this check and the client's request
+    // call (the reservation and the guard's authorisation are synchronous up to the effect). The
+    // production transport then awaits its installation token, so it runs the same check again
+    // after that await, immediately before the PUT (FD-R2, below). The check and GitHub's merge are
+    // still two steps, not one atomic one.
+    const stillCurrent = this.assertGatePayloadBacked(selectedGate, input.repositoryIdentity);
+    if (!stillCurrent.allowed) return stillCurrent as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+
     const reserved = this.reserveReceipt({
       idempotencyKey,
       operation: "merge_execute",
@@ -1748,6 +1860,7 @@ export class GitHubKernel {
     // GitHub fences the irreversible write on the exact head. Its REST API has no base
     // predicate, so the late base reread and first-parent proof below make that residual
     // race explicit rather than treating the preflight as an atomic guarantee.
+    const dispatch = this.payloadBackedAtDispatch(selectedGate, input.repositoryIdentity);
     const merged = await this.mediate(
       WriteOperation.PROGRAMMATIC_MERGE,
       input.runId,
@@ -1765,9 +1878,16 @@ export class GitHubKernel {
             commit_message: outgoingCommitMessage.message,
           } : {}),
         },
+        { beforeDispatch: dispatch.beforeDispatch },
       ),
     );
     if (!merged.allowed) {
+      const refusedAtDispatch = dispatch.refused();
+      if (refusedAtDispatch) {
+        // Nothing was sent: the reservation goes, as the check above would have left none.
+        this.releaseReservation(idempotencyKey, requestDigest);
+        return refusedAtDispatch as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+      }
       if (merged.evidence["effectInvoked"] !== true) {
         this.releaseReservation(idempotencyKey, requestDigest);
       } else {
@@ -3410,8 +3530,9 @@ export class GitHubKernel {
 
   /**
    * CP-HI-07 at the GitHub boundary. The kernel owns payload binding, not owner-decision
-   * interpretation: `ProductionGate.humanGateStatus` is re-read for both publication and
-   * merge, then its current definition digest is bound to the payload.
+   * interpretation: the production gate resolves the human gate again for both publication and
+   * merge (FIX-FINALIZER-DIGEST), and the payload must name its current binding exactly. A payload
+   * named before a decision or the candidate changed names a binding that no longer exists.
    */
   private assertGatePayloadHumanGateStatus(payload: GatePayload): Decision<void> {
     const port = this.humanGateStatusPort;
