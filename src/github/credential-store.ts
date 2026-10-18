@@ -95,6 +95,14 @@ export interface TrustedCredential {
   creatorIdentity: string;
 }
 
+/**
+ * FD-R2 — a check the caller needs to hold when its request leaves. `githubApi` runs it synchronously
+ * once it holds the installation token, its last await, and sends only if it allows. A refusal or a
+ * throw sends nothing. This narrows the window to the dispatch itself; GitHub still applies the
+ * request later, so the check and the write are not one atomic step.
+ */
+export type BeforeDispatch = () => Decision<void>;
+
 export interface GitHubAppCredentialOptions {
   /** Absolute path to the owner-provisioned GitHub App environment file. */
   appEnvFile?: string;
@@ -370,9 +378,26 @@ export class TrustedCredentialStore {
     method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
     path: string;
     input?: string;
+    beforeDispatch?: BeforeDispatch;
   }): Promise<Decision<GitHubApiResult>> {
     const token = await this.#installationToken();
     if (!token.allowed) return token as Decision<GitHubApiResult>;
+
+    // FD-R2 — the token, cached or refreshed, is the last await before the send, and a decision can land
+    // during it. The caller's check runs after it, and `#request` calls fetch before its own first await,
+    // so nothing is awaited between the check and the dispatch. Each call dispatches once: nothing here
+    // retries or re-authenticates and sends again.
+    if (options.beforeDispatch) {
+      let verified: Decision<void>;
+      try {
+        verified = options.beforeDispatch();
+      } catch {
+        verified = deny(ReasonCode.INTERNAL_ERROR, "pre-dispatch verification failed; the request was not sent", {
+          operation: options.method,
+        });
+      }
+      if (!verified.allowed) return verified as Decision<GitHubApiResult>;
+    }
 
     return this.#request({
       method: options.method,

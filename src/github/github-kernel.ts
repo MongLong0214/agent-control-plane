@@ -21,7 +21,7 @@ import {
   type ManagedWriteGuard,
 } from "../guard/managed-write-guard.ts";
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
-import type { TrustedCredentialStore } from "./credential-store.ts";
+import type { BeforeDispatch, TrustedCredentialStore } from "./credential-store.ts";
 import { type BranchCommitMessage, squashCommitForMerge } from "./merge-commit-message.ts";
 
 /**
@@ -69,11 +69,21 @@ export const transportOutcome = (error: unknown): { outcome: TransportOutcome; s
   return typeof status === "number" ? { outcome: "answered", status } : { outcome: "unheard" };
 };
 
+/**
+ * FD-R2 — `beforeDispatch` is a synchronous check that a client awaiting something before it sends
+ * (`GitHubAppClient`: the installation token) runs after that await and immediately before the
+ * request leaves. If the check refuses or throws, the client sends nothing and rejects.
+ */
+export interface GitHubRequestOptions {
+  beforeDispatch?: BeforeDispatch;
+}
+
 export interface GitHubClient {
   request<T>(
     method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
     path: string,
     body?: unknown,
+    options?: GitHubRequestOptions,
   ): Promise<T>;
 }
 
@@ -105,11 +115,13 @@ export class GitHubAppClient implements GitHubClient {
     method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
     path: string,
     body?: unknown,
+    options?: GitHubRequestOptions,
   ): Promise<T> {
     const result = await this.credentials.githubApi({
       method,
       path,
       ...(body !== undefined ? { input: JSON.stringify(body) } : {}),
+      ...(options?.beforeDispatch ? { beforeDispatch: options.beforeDispatch } : {}),
     });
     // Throw the denial structurally rather than flattening it to a string (#533): the evidence
     // carries `status` when a response arrived, and that is the only thing distinguishing an
@@ -835,6 +847,9 @@ export class GitHubKernel {
     });
     if (!reserved.allowed) return reserved as Decision<{ checkRunId: number }>;
 
+    // FD-R2 (ROUND1-ESCAPE-PUBLISH) — the transport awaits its installation token after the check above,
+    // so it checks the payload again once it holds the token, immediately before the POST.
+    const dispatch = this.payloadBackedAtDispatch(payload, repositoryIdentity);
     const created = await this.mediate(
       WriteOperation.GITHUB_CHECK_RUN,
       payload.runId,
@@ -861,9 +876,15 @@ export class GitHubKernel {
           summary: `payloadDigest=${payloadDigest}`,
           text: JSON.stringify(payload, null, 2),
         },
-      }),
+      }, { beforeDispatch: dispatch.beforeDispatch }),
     );
     if (!created.allowed) {
+      const refusedAtDispatch = dispatch.refused();
+      if (refusedAtDispatch) {
+        // Nothing was sent: the reservation goes, as the check above would have left none.
+        this.releaseReservation(idempotencyKey, payloadDigest);
+        return refusedAtDispatch as Decision<{ checkRunId: number }>;
+      }
       if (created.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, payloadDigest);
       return created as Decision<{ checkRunId: number }>;
     }
@@ -944,6 +965,34 @@ export class GitHubKernel {
       },
     });
     return allow(ReasonCode.OK, { checkRunId });
+  }
+
+  /**
+   * FD-R2 — the check the transport runs immediately before it sends a write that `payload` authorises
+   * (the gate POST, the merge PUT): `assertGatePayloadBacked` again, because the installation token is
+   * awaited after the kernel's own last check. `refused` reports whether that check refused, and
+   * therefore that nothing was sent, so the write is not mistaken for one whose outcome is unknown.
+   */
+  private payloadBackedAtDispatch(
+    payload: GatePayload,
+    repositoryIdentity: string,
+  ): { beforeDispatch: BeforeDispatch; refused: () => Decision<void> | null } {
+    let refused: Decision<void> | null = null;
+    return {
+      beforeDispatch: () => {
+        let verified: Decision<void>;
+        try {
+          verified = this.assertGatePayloadBacked(payload, repositoryIdentity);
+        } catch {
+          verified = deny(ReasonCode.INTERNAL_ERROR, "gate payload could not be re-verified before dispatch", {
+            runId: payload.runId,
+          });
+        }
+        refused = verified.allowed ? null : verified;
+        return verified;
+      },
+      refused: () => refused,
+    };
   }
 
   /**
@@ -1788,9 +1837,11 @@ export class GitHubKernel {
     // commits its message is composed from), and an owner decision or a new candidate can land during
     // any of them. So the selected gate's payload is verified again here, after the last await: its
     // evidence still backs the current candidate and its human-gate binding is the one the owner's
-    // current decisions resolve to. Nothing is awaited between this check and the PUT request (the
-    // reservation and the guard's authorisation are synchronous up to the effect), but the check and
-    // GitHub's merge are still two steps, not one atomic one.
+    // current decisions resolve to. Nothing is awaited between this check and the client's request
+    // call (the reservation and the guard's authorisation are synchronous up to the effect). The
+    // production transport then awaits its installation token, so it runs the same check again
+    // after that await, immediately before the PUT (FD-R2, below). The check and GitHub's merge are
+    // still two steps, not one atomic one.
     const stillCurrent = this.assertGatePayloadBacked(selectedGate, input.repositoryIdentity);
     if (!stillCurrent.allowed) return stillCurrent as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
@@ -1809,6 +1860,7 @@ export class GitHubKernel {
     // GitHub fences the irreversible write on the exact head. Its REST API has no base
     // predicate, so the late base reread and first-parent proof below make that residual
     // race explicit rather than treating the preflight as an atomic guarantee.
+    const dispatch = this.payloadBackedAtDispatch(selectedGate, input.repositoryIdentity);
     const merged = await this.mediate(
       WriteOperation.PROGRAMMATIC_MERGE,
       input.runId,
@@ -1826,9 +1878,16 @@ export class GitHubKernel {
             commit_message: outgoingCommitMessage.message,
           } : {}),
         },
+        { beforeDispatch: dispatch.beforeDispatch },
       ),
     );
     if (!merged.allowed) {
+      const refusedAtDispatch = dispatch.refused();
+      if (refusedAtDispatch) {
+        // Nothing was sent: the reservation goes, as the check above would have left none.
+        this.releaseReservation(idempotencyKey, requestDigest);
+        return refusedAtDispatch as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+      }
       if (merged.evidence["effectInvoked"] !== true) {
         this.releaseReservation(idempotencyKey, requestDigest);
       } else {
