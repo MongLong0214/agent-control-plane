@@ -1,0 +1,34 @@
+Limit: after the owner re-decides on a published head, verifyGate takes the first trusted gate on that head, which is the stale one, so the head cannot merge; gate selection was left unchanged here and needs its own decision
+Warn: the daemon finalizer and the GitHub kernel now name one human-gate binding from ProductionGate.resolveHumanGate: the digest of the gate definition digest, the current candidate and each item's decision identity; each reader re-verifies every decision, a digest is never accepted on its own and the definition digest is never accepted in place of the binding
+Record-Id: r-714ce50a5a33
+Provenance: inherited 9aebe9970570f7d882b2ac6ba1b119517a7db7ab
+
+Limit: run creation still stores a contract that declares a question twice; such a run is refused at the gate and at CONFIRM, not when it is created
+Warn: verifyGate returns only a trusted gate whose payload matches the state the caller requires, judged against the current binding, because a head can carry a trusted stale gate beside the current one and GitHub's listing order says nothing about which is which; this resolves the gate-selection Limit recorded in r-714ce50a5a33
+Warn: mergeExecute re-verifies the selected gate's payload after its last awaited read and awaits nothing between that check and the PUT, but the check and GitHub's merge are still two steps, not one atomic one
+Record-Id: r-f943e4d0c4c5
+Provenance: inherited d80ca8941e82a22643c90426bfa93c7268896a50
+
+Warn: the gate POST and the merge PUT are checked again inside the transport: githubApi runs the caller's beforeDispatch after its installation-token await, its last await, and calls fetch with nothing awaited in between; a refusal or a throw sends nothing, but the check and GitHub's application of the write are still two steps, not one atomic one
+Warn: this corrects r-f943e4d0c4c5, whose Warn said nothing is awaited between mergeExecute's check and the PUT; that held for the kernel's call but not for the production transport, which awaited its installation token in between
+Warn: the transport dispatches each call once, with no retry and no re-authentication after a 401; the kernel's crash-recovery re-sends go back through the same pre-dispatch check, so any new resend path must pass beforeDispatch too
+Record-Id: r-d765d95d579c
+Provenance: inherited 6c6b26cb6044f9e7a1b29b0fad392a755462032d
+
+Warn: under the FD binding a re-decision changes the human-gate binding, so the v48 re-decision control expects the payload built before it to be refused with 0 GitHub writes and a new attempt that re-resolves the current decisions to publish and merge once; a test that reuses one payload across a re-decision is asserting the pre-FD contract
+Warn: the test World's payload getter reads the world's current harness, because SEC-R2's upgrade() closes the harness the world was built with and installs a new one
+Record-Id: r-3527ddbf27ff
+Provenance: inherited 88e97905ffd59ca25eb015c52ba7548de090a882
+
+Limit: a renamed or transferred repository answers its old path with 301 or 307, so every call for it now fails closed until ACP's repository identity names the new owner/repo, and a redirected reconcile or postflight read is recorded FAILED rather than PENDING
+Warn: the GitHub transport sends with redirect: manual and refuses every 3xx without following Location, because fetch's default follow re-sent a gate POST or merge PUT to the new location without passing beforeDispatch; any future redirect handling must be a new request that passes the check again
+Record-Id: r-9400ce1cc9f7
+Provenance: inherited c8d2724fcc762df5026dfb347fa41a74241494ae
+
+Warn: a gate POST that took effect at GitHub and was then answered with a 307 is recovered by reusing that gate, which names the current binding, with no second gate POST; any change to the PENDING recovery must keep reusing an existing matching gate rather than re-POSTing because a 307 came back
+Record-Id: r-a59b841cd8ef
+Provenance: inherited 10a8c82c87fc171e1f17bcd57dfe9cfba08357c4
+
+Warn: in the SEC-NEST witnesses a world whose gate is satisfied when built keeps the binding fixed before any row is inserted, and other worlds read the current binding through the normal resolver; the definition-digest fallback is only for refusal cases, and a probe that replaced it with a sentinel left all 11 passing, so no success control relies on it
+Record-Id: r-5c3f16d78255
+Provenance: inherited d8b7b2a6fea2c5334e155d6f47bfdf957ad5e577
