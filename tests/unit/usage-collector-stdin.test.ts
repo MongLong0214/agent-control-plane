@@ -1,18 +1,28 @@
 import type * as ChildProcess from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
-import { ExpectUsageTerminal, type UsageTerminalResult } from "../../src/capacity/usage-collectors.ts";
+import {
+  ClaudeUsageCollector,
+  CodexUsageCollector,
+  ExpectUsageTerminal,
+  type UsageTerminal,
+  type UsageTerminalResult,
+} from "../../src/capacity/usage-collectors.ts";
+import { ManualClock } from "../../src/core/clock.ts";
 import { runBoundedChild } from "../helpers/bounded-child.ts";
 import { CHILD_BUDGET_MS } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
-/** When set, the next spawn returns this stand-in child; every other spawn, the stand-in daemons' included, is real. */
-const spawnSeam = vi.hoisted(() => ({ next: null as null | (() => unknown) }));
+/**
+ * When set, the next spawn returns what this gives back: a stand-in child, or the real child it was
+ * handed to start, watched. Every other spawn, the stand-in daemons' included, is real.
+ */
+const spawnSeam = vi.hoisted(() => ({ next: null as null | ((real: () => ChildProcess.ChildProcess) => unknown) }));
 vi.mock("node:child_process", async (original) => {
   const actual = await original<typeof ChildProcess>();
   return {
@@ -20,7 +30,7 @@ vi.mock("node:child_process", async (original) => {
     spawn(command: string, args: readonly string[], options: ChildProcess.SpawnOptions) {
       const next = spawnSeam.next;
       spawnSeam.next = null;
-      return next === null ? actual.spawn(command, args, options) : next();
+      return next === null ? actual.spawn(command, args, options) : next(() => actual.spawn(command, args, options));
     },
   };
 });
@@ -315,5 +325,252 @@ describe("Unit 2 kill(0): ExpectUsageTerminal signals only a process group it ow
     expect(kills).toEqual([[-expectPid!, "SIGKILL"]]);
     expect(await ends(expectPid!), `expect ${expectPid} was not ended and reaped`).toBe(true);
     expect(await ends(cliPid!), `the CLI ${cliPid} under expect is still running`).toBe(true);
+  });
+});
+
+/** SIGKILL to exactly these pids, any still there; never a process group. */
+const exactPidCleanup = (pids: ReadonlyArray<number | undefined>): void => {
+  for (const pid of pids) {
+    if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 1) continue;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+};
+
+/**
+ * FIX-1148-R1, R1148-01: `SpawnCodexRateLimitProbe` settled on a stdin failure but kept parsing what the
+ * server said afterwards, and kept its pipes. A `null` line then threw out of the stdout handler and
+ * ended the caller's process; a descendant outside the killed group that held stdout kept the caller's
+ * process alive past the probe's timeout.
+ */
+describe("FIX-1148-R1 R1148-01: the Codex probe reads nothing after it settles and lets its pipes go", () => {
+  /** Takes `initialize`, shuts its stdin, answers the handshake, then writes forty thousand `null` lines. */
+  const codexLateNulls = script(
+    "codex-late-nulls",
+    `IFS= read -r line\nexec 0<&-\nprintf '{"id":0,"result":{}}\\n'\nyes null | head -n 40000\nsleep 5`,
+  );
+  /** Takes every line, says things that parse but are no message, then answers the read with `null`. */
+  const codexNullAnswer = script(
+    "codex-null-answer",
+    `IFS= read -r line\nprintf '{"id":0,"result":{}}\\n'\nIFS= read -r line\nIFS= read -r line\nprintf 'null\\n[]\\n42\\n"x"\\n{"id":1,"result":null}\\n'\nsleep 5`,
+  );
+
+  it("late `null` lines after the stdin failure settled it: the daemon stands and the reading stays the failure", async () => {
+    const error = failedReading(await standIn("codex", codexLateNulls));
+    expect(error).toMatch(/did not take/);
+  });
+
+  it("`null`, an array, a number, a string and a `null` result: the daemon stands and none of it is HEALTHY", async () => {
+    const error = failedReading(await standIn("codex", codexNullAnswer));
+    expect(error).toMatch(/returned no object/);
+  });
+
+  it("a descendant outside the killed group holds the server's stdout: the caller's process still ends with its reading", async () => {
+    const holderPidPath = join(home, "holder.pid");
+    const server = join(home, "codex-held-pipe.mjs");
+    writeFileSync(
+      server,
+      `#!${NODE}
+import { closeSync, readSync, writeFileSync, writeSync } from "node:fs";
+import { spawn } from "node:child_process";
+// Its own process group, so the probe's kill of the server's group does not reach it. It holds stdout.
+const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], { detached: true, stdio: ["ignore", "inherit", "ignore"] });
+holder.unref();
+writeFileSync(${JSON.stringify(holderPidPath)}, String(holder.pid));
+readSync(0, Buffer.alloc(4096));
+closeSync(0);
+writeSync(1, '{"id":0,"result":{}}\\n');
+setTimeout(() => {}, 10000);
+`,
+    );
+    chmodSync(server, 0o755);
+    // No `process.exit`: the caller ends only when nothing it owns is left open.
+    const caller = join(home, "held-caller.mjs");
+    writeFileSync(
+      caller,
+      String.raw`
+const [collectorsUrl, clockUrl, binary, codexHome] = process.argv.slice(2);
+const { CodexUsageCollector } = await import(collectorsUrl);
+const { ManualClock } = await import(clockUrl);
+const reading = await new CodexUsageCollector({ clock: new ManualClock("2026-08-13T00:00:00.000Z"), binary, timeoutMs: 1_500, codexHome }).collect();
+process.stdout.write(JSON.stringify({ sensorHealth: reading.sensorHealth, buckets: reading.buckets, error: reading.error ?? null }));
+`,
+    );
+    const started = performance.now();
+    let ran: Awaited<ReturnType<typeof runBoundedChild>>;
+    try {
+      // The holder lives 10 s. A caller its pipe holds meets this 6 s bound, which throws.
+      ran = await runBoundedChild(
+        NODE,
+        ["--experimental-transform-types", "--no-warnings", caller, USAGE_COLLECTORS, CLOCK, server, codexHome],
+        { budgetMs: 6_000 },
+      );
+    } finally {
+      exactPidCleanup([existsSync(holderPidPath) ? Number(readFileSync(holderPidPath, "utf8").trim()) : undefined]);
+    }
+    const elapsedMs = performance.now() - started;
+    expect(ran.status, ran.stderr.slice(-1200)).toBe(0);
+    const reading = JSON.parse(ran.stdout) as { sensorHealth: string; buckets: unknown[]; error: string | null };
+    expect(reading).toMatchObject({ sensorHealth: "ERROR", buckets: [] });
+    expect(reading.error).toMatch(/did not take/);
+    expect(elapsedMs).toBeLessThan(4_000);
+  });
+});
+
+/**
+ * FIX-1148-R1, R1148-02: `ExpectUsageTerminal` resolved the moment it decided, and cleared its deadline
+ * there. An `expect` that did not end on the trust prompt's SIGTERM — here one stopped just before it —
+ * was never signalled again and outlived the call. Deciding and cleaning up are now two steps: the
+ * call returns once the owned `expect` is confirmed gone, or at the existing deadline after SIGKILL.
+ */
+describe("FIX-1148-R1 R1148-02: the pseudo-terminal's cleanup confirms the owned expect is gone, within the existing deadline", () => {
+  const trustThenSleep = (name: string, pidsPath: string): string =>
+    script(name, `echo $PPID $$ > '${pidsPath}'\nprintf 'Do you trust the files in this folder?\\n'\nexec sleep 10`);
+
+  /** The real terminal on the real `expect`, watched from before the terminal's own listeners. */
+  const runWatched = async (binary: string, timeoutMs: number, stopOnTrust: boolean) => {
+    const realKill = process.kill.bind(process);
+    let child: ChildProcess.ChildProcess | undefined;
+    let exited = false;
+    let seen = "";
+    let stopped = false;
+    spawnSeam.next = (real) => {
+      const started = real();
+      child = started;
+      started.once("exit", () => {
+        exited = true;
+      });
+      started.stdout?.on("data", (chunk: Buffer) => {
+        seen += chunk.toString("utf8");
+        const pid = started.pid;
+        if (stopOnTrust && !stopped && seen.includes("Do you trust") && pid !== undefined && pid > 1) {
+          stopped = true;
+          realKill(pid, "SIGSTOP");
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        }
+      });
+      return started;
+    };
+    const kill = vi.spyOn(process, "kill");
+    const startedAt = performance.now();
+    try {
+      const result = await new ExpectUsageTerminal().run({ binary, args: [], steps: [], timeoutMs, environment: { PATH: "/usr/bin:/bin" } });
+      return {
+        result,
+        returnedAfterMs: performance.now() - startedAt,
+        exitedAtReturn: exited,
+        stopped,
+        pid: child?.pid,
+        groupSignals: kill.mock.calls.map((call) => [...call]).filter(([pid]) => typeof pid === "number" && pid < 0),
+      };
+    } finally {
+      kill.mockRestore();
+      spawnSeam.next = null;
+    }
+  };
+
+  const pidsOf = (path: string): [number | undefined, number | undefined] => {
+    if (!existsSync(path)) return [undefined, undefined];
+    const [expectPid, cliPid] = readFileSync(path, "utf8").trim().split(" ").map(Number);
+    return [expectPid, cliPid];
+  };
+
+  it("an expect stopped before the trust prompt's SIGTERM is SIGKILLed at the existing deadline, ends, and the call is back by then", async () => {
+    const pidsPath = join(home, "stopped-trust.pids");
+    const timeoutMs = 1_100;
+    try {
+      const watched = await runWatched(trustThenSleep("claude-trust-stopped", pidsPath), timeoutMs, true);
+      expect(watched.stopped).toBe(true);
+      expect(watched.result).toMatchObject({ exitCode: null, timedOut: false });
+      expect(watched.result.error).toMatch(/refuses to approve/);
+      // The trust prompt's own SIGTERM is kept; the deadline adds the SIGKILL a stopped expect needs.
+      expect(watched.groupSignals).toEqual([
+        [-watched.pid!, "SIGTERM"],
+        [-watched.pid!, "SIGKILL"],
+      ]);
+      // Bounded by the existing deadline, not added to it.
+      expect(watched.returnedAfterMs).toBeLessThan(timeoutMs + 750);
+      const [expectPid, cliPid] = pidsOf(pidsPath);
+      expect(expectPid).toBe(watched.pid);
+      expect(await ends(expectPid!), `expect ${expectPid} is still running`).toBe(true);
+      expect(await ends(cliPid!), `the CLI ${cliPid} under expect is still running`).toBe(true);
+    } finally {
+      exactPidCleanup(pidsOf(pidsPath));
+    }
+  });
+
+  it("an expect that takes the trust prompt's SIGTERM is confirmed gone before the call returns, with no further signal", async () => {
+    const pidsPath = join(home, "live-trust.pids");
+    try {
+      const watched = await runWatched(trustThenSleep("claude-trust-live", pidsPath), 5_000, false);
+      expect(watched.result.error).toMatch(/refuses to approve/);
+      expect(watched.groupSignals).toEqual([[-watched.pid!, "SIGTERM"]]);
+      expect(watched.exitedAtReturn).toBe(true);
+      const [, cliPid] = pidsOf(pidsPath);
+      expect(await ends(cliPid!), `the CLI ${cliPid} under expect is still running`).toBe(true);
+    } finally {
+      exactPidCleanup(pidsOf(pidsPath));
+    }
+  });
+});
+
+/**
+ * FIX-1148-R1, R1148-03: the collector's own small program. A CLI that printed a plausible quota line
+ * and exited before its banner made `expect` exit 125 (eof in a step's wait); `finish` on stdin had
+ * marked the program taken and the reader ignored `exitCode`, so the reading was HEALTHY at 77%.
+ */
+describe("FIX-1148-R1 R1148-03: a terminal that did not finish its program is never read as quota", () => {
+  const clock = () => new ManualClock("2026-08-13T00:00:00.000Z");
+  /** No pid recording here: the 10-round witness above counts its own `expect`s from its own file. */
+  const quotaThenExit = script("cli-quota-then-exit", `printf '5-hour limit: 77%% remaining - resets in 2h\\n'\nexit 0`);
+  const QUOTA_LINE = "5-hour limit: 77% remaining - resets in 2h\n";
+
+  it.each([
+    { name: "Claude", Collector: ClaudeUsageCollector },
+    { name: "Codex (configured terminal)", Collector: CodexUsageCollector },
+  ])("$name, with the collector's unchanged program: expect exits 125 and the reading is a failure, not 77 percent", async ({ Collector }) => {
+    const real = new ExpectUsageTerminal();
+    const seen: UsageTerminalResult[] = [];
+    const terminal: UsageTerminal = {
+      async run(input) {
+        const result = await real.run(input);
+        seen.push(result);
+        return result;
+      },
+    };
+    const reading = await new Collector({ clock: clock(), binary: quotaThenExit, timeoutMs: 3_000, terminal }).collect();
+    expect(reading).toMatchObject({ sensorHealth: "ERROR", buckets: [] });
+    expect(reading.error).toMatch(/exited 125/);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ exitCode: 125, timedOut: false });
+    expect(seen[0]!.stdout).toContain("77% remaining");
+    expect(seen[0]!.error).toMatch(/exited 125/);
+  });
+
+  it("the reader refuses any terminal's non-zero or missing exit before parsing, whatever it printed", async () => {
+    for (const exitCode of [125, 1, null]) {
+      const terminal: UsageTerminal = {
+        async run() {
+          return { stdout: QUOTA_LINE, stderr: "", exitCode, timedOut: false, error: null };
+        },
+      };
+      const reading = await new ClaudeUsageCollector({ clock: clock(), binary: "claude", terminal }).collect();
+      expect(reading, `exit ${exitCode}`).toMatchObject({ sensorHealth: "ERROR", buckets: [] });
+      expect(reading.error).toMatch(/not read as quota/);
+    }
+  });
+
+  it("control: the same output from a terminal that ended 0 is still read", async () => {
+    const terminal: UsageTerminal = {
+      async run() {
+        return { stdout: QUOTA_LINE, stderr: "", exitCode: 0, timedOut: false, error: null };
+      },
+    };
+    const reading = await new ClaudeUsageCollector({ clock: clock(), binary: "claude", terminal }).collect();
+    expect(reading).toMatchObject({ sensorHealth: "HEALTHY" });
+    expect(reading.buckets.map((bucket) => bucket.remainingPercent)).toEqual([77]);
   });
 });
