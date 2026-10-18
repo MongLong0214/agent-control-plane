@@ -407,17 +407,17 @@ write_launcher() {
     printf 'ACP_BUZZ_KEYCHAIN_SERVICE=%q\n' "$buzz_keychain_service"
     printf 'ACP_BUZZ_KEYCHAIN_ACCOUNT=%q\n' "$buzz_keychain_account"
     printf 'ACP_BUZZ_KEYCHAIN_IDENTITY=%q\n' "$buzz_keychain_identity"
+    # Each ACP_RESOLVED_*_BINARY is this install's answer and nothing else's. Without this line a
+    # launcher written where a CLI did not resolve carries no assignment for it, and the promotion
+    # below would consume a value of that name inherited from launchd (`launchctl setenv`) — a pin no
+    # operator stored and no install resolved. Cleared before the baked lines, so each resolved pin is
+    # exactly what this install wrote, or nothing. (CommitLore since #1152; the others since its sibling.)
+    printf 'unset ACP_RESOLVED_BUZZ_BINARY ACP_RESOLVED_CLAUDE_BINARY ACP_RESOLVED_CODEX_BINARY ACP_RESOLVED_GROK_BINARY ACP_RESOLVED_COMMITLORE_BINARY\n'
     local resolved_buzz=""
     resolved_buzz="$(resolve_buzz_binary)"
     if [[ -n "$resolved_buzz" ]]; then
       printf 'ACP_RESOLVED_BUZZ_BINARY=%q\n' "$resolved_buzz"
     fi
-    # ACP_RESOLVED_COMMITLORE_BINARY is this install's answer and nothing else's. Without this line a
-    # launcher written where `commitlore` did not resolve carries no assignment for it, and the
-    # promotion below would consume a value of that name inherited from launchd (`launchctl setenv`)
-    # — a pin no operator stored and no install resolved. Cleared before the baked line, so the
-    # resolved pin is exactly what this install wrote, or nothing.
-    printf 'unset ACP_RESOLVED_COMMITLORE_BINARY\n'
     local pin
     if [[ ${#cli_pins[@]} -gt 0 ]]; then
       for pin in "${cli_pins[@]}"; do
