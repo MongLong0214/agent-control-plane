@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -99,7 +99,7 @@ import type { OwnerIdentity } from "../ceo/owner-authority.ts";
 import { canonicalTurnTarget } from "../conversation/canonical-turn-target.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { recordMigrationRefusal } from "../db/migration-approval.ts";
+import { migrationRefusalPath, recordMigrationRefusal } from "../db/migration-approval.ts";
 import {
   BuzzActorIngress,
   IngressGuard,
@@ -5846,11 +5846,54 @@ export interface StartupDisposition {
  *
  * Nothing else changes: a crash, a doctor block, a bad token still exit 1 and are still
  * retried.
+ *
+ * SEC-OD1 (FIX-SEC-R3, R3-01, CEO 80492af7) — a database this build refuses as it stands: a migration
+ * receipt another step wrote (MIGRATION_RECEIPT_MISMATCH), or an owner decision claimed before the v47
+ * guard (OWNER_DECISION_LABEL_PREDATES_GUARD). Both are refused read-only, so the file is unchanged and
+ * the next start would refuse the same way. The refusal is reported under its own code and the report
+ * written, and the process exits non-zero (`DATABASE_REFUSED_EXIT_CODE`) so the start reads as failed.
+ * `KeepAlive { SuccessfulExit = false }` restarts that once; the restart finds this same refusal (code
+ * and evidence) already on record and exits 0, so launchd stops there and the loop the exit-1 comment
+ * above describes does not form. A refusal whose report cannot be written exits 0 at once for the same
+ * reason. A different refusal, or a changed database, is reported as new.
  */
+export const DATABASE_REFUSED_EXIT_CODE = 78;
+
+const STANDING_DATABASE_REFUSALS: ReadonlySet<string> = new Set([
+  ReasonCode.MIGRATION_RECEIPT_MISMATCH,
+  ReasonCode.OWNER_DECISION_LABEL_PREDATES_GUARD,
+]);
+
+/** The refusal already on record, or null when there is none or it cannot be read. */
+const recordedRefusal = (databasePath: string): { reasonCode?: unknown; evidence?: unknown } | null => {
+  try {
+    return JSON.parse(readFileSync(migrationRefusalPath(databasePath), "utf8")) as { reasonCode?: unknown; evidence?: unknown };
+  } catch {
+    return null;
+  }
+};
+
 export const dispositionForStartupError = (err: unknown, databasePath: string): StartupDisposition => {
   const body = isAcpError(err)
     ? { reasonCode: err.reasonCode, message: err.message, evidence: err.evidence }
     : { message: (err as Error).message, stack: (err as Error).stack };
+  if (isAcpError(err) && STANDING_DATABASE_REFUSALS.has(err.reasonCode)) {
+    const previous = recordedRefusal(databasePath);
+    const standing =
+      previous !== null &&
+      previous.reasonCode === err.reasonCode &&
+      JSON.stringify(previous.evidence) === JSON.stringify(err.evidence);
+    const report = { refusedAt: new Date().toISOString(), pid: process.pid, ...body, standing };
+    let reportPath: string | null = null;
+    try {
+      reportPath = recordMigrationRefusal(databasePath, report);
+    } catch (writeError) {
+      process.stderr.write(
+        `${JSON.stringify({ migrationRefusalReportUnwritable: String(writeError) }, null, 2)}\n`,
+      );
+    }
+    return { exitCode: standing || reportPath === null ? 0 : DATABASE_REFUSED_EXIT_CODE, body: report, reportPath };
+  }
   if (!isAcpError(err) || err.reasonCode !== ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED) {
     return { exitCode: 1, body, reportPath: null };
   }
@@ -5892,7 +5935,16 @@ if (isMainModule()) {
   void main().catch((err: unknown) => {
     const disposition = dispositionForStartupError(err, defaultConfig().databasePath);
     process.stderr.write(`${JSON.stringify(disposition.body, null, 2)}\n`);
-    if (disposition.exitCode === 0) {
+    if (isAcpError(err) && STANDING_DATABASE_REFUSALS.has(err.reasonCode)) {
+      process.stderr.write(
+        `agentcpd refused to open the database as it stands (${err.reasonCode}). Nothing in it was changed ` +
+          "and no receipt is rewritten; it is not a released database to repair automatically. " +
+          (disposition.exitCode === 0
+            ? "This refusal was already on record, so the daemon stays stopped until it is started again.\n"
+            : "launchd restarts this once; that start finds the refusal on record and stays stopped.\n") +
+          (disposition.reportPath === null ? "" : `Refusal report: ${disposition.reportPath}\n`),
+      );
+    } else if (disposition.exitCode === 0) {
       process.stderr.write(
         "agentcpd refused to start: this build would migrate the live database and no approval " +
           "names that migration. The daemon is stopped and will not be restarted by launchd " +

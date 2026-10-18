@@ -84,18 +84,53 @@ export const V47_SNAPSHOT_GIT_BLOB = "9ca4cad97b1dbf5cbd759d7f11d11b3c7bb9c543";
 export const V47_SNAPSHOT_SHA256 = "8c4de11d7ae4d687120196ad9ae73e5b370f6abcc47b9a8b31dc5e69608de487";
 
 /**
- * v47's receipt checksum, in full, since the step refuses canonical labels written before its guard
- * (FIX-SEC-R2, CEO 85eac6ef option B): the snapshot and that refusal's predicate. Transcribed from the
- * build that added the refusal, where `sha256("v47-owner-decision-authority-guard\n" + snapshot +
- * "\nrefused-before-install: " + predicate)` computed outside the code agreed with the step's own value.
+ * v47's receipt checksum, in full, since the step refuses owner decisions claimed before its guard
+ * (FIX-SEC-R3, CEO 80492af7: the canonical label once normalized, or OWNER_DECISION content under a label
+ * other than exactly "service"): the snapshot and that refusal's predicate. Only the predicate component
+ * changed from FIX-SEC-R2's; the snapshot did not. Transcribed from the build that widened the refusal,
+ * where `sha256("v47-owner-decision-authority-guard\n" + snapshot + "\nrefused-before-install: " +
+ * predicate)` computed in a shell, outside the code, agreed with the step's own value.
  */
-export const V47_BASE_CHECKSUM = "sha256:6030b25bbb1ece91d3195a27e8ee703a335863fbd4ab8660c2548dde21eb905b";
+export const V47_BASE_CHECKSUM = "sha256:c267706968989846716794ae98529b6f33a027b0d085c08e80f169769b58b586";
 
 /**
  * The receipt checksum of the unreleased candidate v47 (faa829ec to ccc4865f), which installed the guard
  * without that refusal. A database holding it was migrated by the candidate; it is never a released one.
  */
 export const V47_CANDIDATE_CHECKSUM = "sha256:f9b2370034620dc56f825fd9119fedd22ba76a46261c64684446992a48958b49";
+
+/**
+ * The receipt checksum of the second unreleased candidate v47 (cbb4bfaf, FIX-SEC-R2), whose refusal read
+ * only the exact canonical label. Never released either; a database holding it is refused the same way.
+ */
+export const V47_R2_CANDIDATE_CHECKSUM = "sha256:6030b25bbb1ece91d3195a27e8ee703a335863fbd4ab8660c2548dde21eb905b";
+
+/**
+ * FIX-SEC-R3 (R1-01) — a v46 image taken to v47 the way an unreleased candidate step did it: the guard
+ * from the snapshot (the candidates installed the same trigger), the candidate's receipt `checksum` and
+ * user_version 47, in one transaction, with no pre-install refusal at all. This is the review's
+ * reproduction (candidate step from ccc4865f, its genuine receipt) without importing that build's code.
+ */
+export const asCandidateV47 = (path: string, checksum: string, appliedAt: string): string => {
+  const snapshot = readFileSync(new URL(`../../${V47_SNAPSHOT_PATH}`, import.meta.url), "utf8");
+  const guard = /CREATE TRIGGER IF NOT EXISTS run_artifacts_owner_decision_authority_guard\n[\s\S]*?\nEND;/.exec(snapshot)?.[0];
+  if (guard === undefined) throw new Error("the v47 snapshot has no owner-decision guard");
+  const raw = new Database(path);
+  try {
+    if (raw.pragma("user_version", { simple: true }) !== 46) throw new Error("a candidate v47 step starts from v46");
+    raw.function("acp_evidence_write_authorized", () => 0);
+    raw.function("acp_schema_migration_authorized", () => 1);
+    raw.exec("BEGIN IMMEDIATE");
+    raw.exec(guard);
+    raw.prepare("INSERT INTO schema_migrations (version, migration_id, checksum, applied_at) VALUES (47, ?, ?, ?)")
+      .run("v47-owner-decision-authority-guard", checksum, appliedAt);
+    raw.pragma("user_version = 47");
+    raw.exec("COMMIT");
+  } finally {
+    raw.close();
+  }
+  return path;
+};
 
 /**
  * `digestOfSchemaRows` of the database the pre-change build left at v47 from the released chain: from the

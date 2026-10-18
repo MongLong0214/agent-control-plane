@@ -1,10 +1,12 @@
 import Database from "better-sqlite3";
-import { copyFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { copyFileSync, readFileSync } from "node:fs";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { dispositionForStartupError } from "../../src/daemon/agentcpd.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
 import { OWNER_DECIDE_AGAIN_MESSAGE } from "../../src/db/artifacts.ts";
 import { Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
@@ -17,7 +19,13 @@ import { FakeGitHub } from "../helpers/fake-github.ts";
 import { carryRows, laterObjectsIn, releasedChainImage } from "../helpers/released-chain-image.ts";
 import { privateStatePath } from "../helpers/released-v44-schema.ts";
 import { contentDigests } from "../helpers/released-v45-schema.ts";
-import { V47_BASE_CHECKSUM, writeOutsideTheGuard } from "../helpers/released-v47-schema.ts";
+import {
+  V47_BASE_CHECKSUM,
+  V47_CANDIDATE_CHECKSUM,
+  V47_R2_CANDIDATE_CHECKSUM,
+  asCandidateV47,
+  writeOutsideTheGuard,
+} from "../helpers/released-v47-schema.ts";
 import {
   approveReviewedCandidateForFinalization,
   type Harness,
@@ -1460,14 +1468,11 @@ describe("FIX-SEC-R2 a canonical label written before the guard refuses the upgr
       driven = JSON.stringify({ gate: gateAccepts(w), published: outcome(published), merged: outcome(merged) });
     }
     expect({ driven, ...external(w) }).toEqual({ driven: "NOT_OPENED", writes: 0, merges: 0, checks: 0 });
-    expect(refusal).toMatchObject({
-      reasonCode: ReasonCode.INTERNAL_ERROR,
-      message: "migration failed; the original database was restored from its automatic backup",
-      evidence: { fromVersion: 46 },
-    });
-    const migrationError = String((refusal as { evidence: { migrationError: unknown } }).evidence.migrationError);
-    expect(migrationError).toMatch(/^v47 refuses: OWNER_DECISION_LABEL_PREDATES_GUARD — run_artifacts holds 2 APPROVAL row\(s\) labelled "production-gate:owner-decision"/);
-    expect(migrationError).toContain('"art_secr2_forged_a", "art_secr2_forged_b";');
+    // FIX-SEC-R3: refused by the migrator's read-only preflight, under its own code, before any backup.
+    expect(refusal).toMatchObject({ reasonCode: "OWNER_DECISION_LABEL_PREDATES_GUARD" });
+    const message = (refusal as Error).message;
+    expect(message).toMatch(/^v47 refuses: OWNER_DECISION_LABEL_PREDATES_GUARD — run_artifacts holds 2 APPROVAL row\(s\) that claim an owner decision/);
+    expect(message).toContain('"art_secr2_forged_a", "art_secr2_forged_b";');
     expect(contentDigests(path)).toEqual(before);
   });
 
@@ -1528,5 +1533,112 @@ describe("FIX-SEC-R2 a canonical label written before the guard refuses the upgr
     expect(outcome(await merge(w, await openPull(w)))).toBe("ALLOWED");
     expect(external(w)).toMatchObject({ merges: 1, checks: 1 });
     expect(receiptAt47(w)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });
+  });
+});
+
+/**
+ * FIX-SEC-R3 (CEO 80492af7) — review r3's originals (rv3-final.log :84 and :96, startup-retry.log), rebuilt
+ * on this file's harness. Each measures the security outcome first (refused or not; when not, what the
+ * database then published and merged), so the file also loads at cbb4bfaf and shows the defect there.
+ *
+ *   RV3-CANDIDATE  a released v46 image with never-admitted approvals, taken to v47 by a candidate step
+ *                  with its genuine receipt: the upgrade went through, and publication and merge each
+ *                  happened once. Now the receipt's value refuses it.
+ *   RV3-SHAPE      OWNER_DECISION content under an upper-case label, written at v46: it upgraded and its
+ *                  bound refusal was then counted. Now the shape refuses it.
+ *   RV3-REFUSAL    the refusal went through the generic backup and restore, which rewrote the file
+ *                  (872,448 → 860,160 bytes) and reported INTERNAL_ERROR. Now nothing touches the file, the
+ *                  start reports the refusal's own code and exits non-zero, and the restart that exit
+ *                  earns finds the same refusal on record and exits 0, so it is not retried again.
+ */
+const fileBytes = (path: string): string => createHash("sha256").update(readFileSync(path)).digest("hex");
+
+const receiptsOf = (path: string): unknown[] => {
+  const raw = new Database(path, { readonly: true, fileMustExist: true });
+  try {
+    return raw.prepare("SELECT * FROM schema_migrations ORDER BY version").all();
+  } finally {
+    raw.close();
+  }
+};
+
+/** What the database did once it opened: the gate, then publication and merge, driven as far as they go. */
+const drive = async (w: World): Promise<unknown> => {
+  const published = await w.harness.cp.github.gatePublish(w.payload, w.identity);
+  const merged = published.allowed ? await merge(w, await openPull(w)) : published;
+  return { gate: gateAccepts(w), published: outcome(published), merged: outcome(merged) };
+};
+
+describe("FIX-SEC-R3 review r3's originals: a candidate receipt, a decision-shaped label and the refusal's image", () => {
+  it.each([
+    { name: "faa829ec–ccc4865f (the review's)", checksum: V47_CANDIDATE_CHECKSUM },
+    { name: "cbb4bfaf", checksum: V47_R2_CANDIDATE_CHECKSUM },
+  ])("RV3-CANDIDATE a database the candidate v47 of $name migrated is refused: 0 publications, 0 merges, the image untouched", async ({ checksum }) => {
+    const w = await v46History();
+    const path = asReleasedV46(w);
+    forgeAtV46(w, path, "art_rv3_candidate_a", ITEM_A);
+    forgeAtV46(w, path, "art_rv3_candidate_b", ITEM_B);
+    asCandidateV47(path, checksum, w.harness.clock.nowIso());
+    const bytes = fileBytes(path);
+    const receipts = receiptsOf(path);
+    const refusal = upgrade(w, "FIX-SEC-R3 candidate v47 receipt");
+    const driven = refusal === undefined ? await drive(w) : "NOT_OPENED";
+    expect({ driven, ...external(w) }).toEqual({ driven: "NOT_OPENED", writes: 0, merges: 0, checks: 0 });
+    expect(refusal).toMatchObject({
+      reasonCode: "MIGRATION_RECEIPT_MISMATCH",
+      evidence: { mismatches: [{ version: 47, migrationId: "v47-owner-decision-authority-guard", stored: checksum, expected: V47_BASE_CHECKSUM }] },
+    });
+    expect(fileBytes(path)).toBe(bytes);
+    expect(receiptsOf(path)).toEqual(receipts);
+  });
+
+  it("RV3-SHAPE OWNER_DECISION content under an upper-case label written at v46 refuses the upgrade; its refusal is never read", async () => {
+    const w = await world([...ITEMS], { before: true });
+    const path = asReleasedV46(w);
+    const content = decisionContent(w, false, "pre-guard shape under label variant", {});
+    const raw = new Database(path);
+    try {
+      raw.function("acp_evidence_write_authorized", () => 0);
+      raw.prepare(
+        `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+         VALUES ('art_rv3_shape', ?, 'APPROVAL', ?, ?, ?, ?, ?)`,
+      ).run(w.runId, digestOf(content), w.candidate, JSON.stringify(content), OWNER_DECISION_LABEL.toUpperCase(), w.harness.clock.nowIso());
+    } finally {
+      raw.close();
+    }
+    const bytes = fileBytes(path);
+    const refusal = upgrade(w, "FIX-SEC-R3 pre-guard shape");
+    const accepted = refusal === undefined ? w.harness.cp.ceo.humanGateStatus(w.runId) : null;
+    expect({ accepted, refusal: (refusal as { reasonCode?: unknown } | undefined)?.reasonCode })
+      .toEqual({ accepted: null, refusal: "OWNER_DECISION_LABEL_PREDATES_GUARD" });
+    expect((refusal as Error).message).toContain('"art_rv3_shape"');
+    expect(fileBytes(path)).toBe(bytes);
+  });
+
+  it("RV3-REFUSAL the file, its receipts and its version are unchanged byte for byte; the start exits non-zero under the refusal's code, and the restart it earns stays down", async () => {
+    const w = await v46History();
+    const path = asReleasedV46(w);
+    forgeAtV46(w, path, "art_rv3_refusal", ITEM_B);
+    const before = { bytes: fileBytes(path), receipts: receiptsOf(path), logical: contentDigests(path) };
+    expect(before.logical.userVersion).toBe(46);
+
+    const refusal = upgrade(w, "FIX-SEC-R3 startup refusal");
+    expect({ bytes: fileBytes(path), receipts: receiptsOf(path), logical: contentDigests(path) }).toEqual(before);
+    const first = dispositionForStartupError(refusal, path);
+    expect(first).toMatchObject({ exitCode: 78, body: { reasonCode: "OWNER_DECISION_LABEL_PREDATES_GUARD", standing: false } });
+    expect(first.reportPath).not.toBeNull();
+    expect(JSON.parse(readFileSync(first.reportPath!, "utf8"))).toMatchObject({ reasonCode: "OWNER_DECISION_LABEL_PREDATES_GUARD" });
+
+    // The restart launchd gives a non-zero exit: the same refusal, read-only again, already on record.
+    let retry: unknown;
+    try {
+      makeHarness({ root: w.harness.root, repoPath: w.harness.repoPath, githubClient: w.github, clock: w.harness.clock }).cp.close();
+    } catch (error) {
+      retry = error;
+    }
+    expect(retry).toMatchObject({ reasonCode: "OWNER_DECISION_LABEL_PREDATES_GUARD" });
+    expect(dispositionForStartupError(retry, path)).toMatchObject({ exitCode: 0, body: { standing: true } });
+    expect({ bytes: fileBytes(path), receipts: receiptsOf(path), logical: contentDigests(path) }).toEqual(before);
+    expect(external(w)).toEqual({ writes: 0, merges: 0, checks: 0 });
   });
 });

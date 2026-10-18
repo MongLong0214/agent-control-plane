@@ -971,6 +971,18 @@ export const ReasonCode = {
    * the process entry point has to recognise this one to decide its exit code (#738).
    */
   SCHEMA_MIGRATION_NOT_APPROVED: "SCHEMA_MIGRATION_NOT_APPROVED",
+  /**
+   * SEC-OD1 (FIX-SEC-R3, R1-01). A stored migration receipt from v47 on names a step whose checksum is
+   * not the one this build's step computes, such as the unreleased candidate v47's. Refused, read-only,
+   * before any backup or write, at an upgrade and at an open; the receipt is never rewritten.
+   */
+  MIGRATION_RECEIPT_MISMATCH: "MIGRATION_RECEIPT_MISMATCH",
+  /**
+   * SEC-OD1 (FIX-SEC-R3, R3-02). The database holds an APPROVAL row that claims an owner decision from
+   * before the v47 guard existed: the canonical label once normalized, or OWNER_DECISION content under a
+   * label other than exactly "service". v47 refuses to install its guard over it; nothing is changed.
+   */
+  OWNER_DECISION_LABEL_PREDATES_GUARD: "OWNER_DECISION_LABEL_PREDATES_GUARD",
   FINALIZATION_ATTEMPT_STALE: "FINALIZATION_ATTEMPT_STALE",
   FINALIZATION_COMPENSATION_REQUIRED: "FINALIZATION_COMPENSATION_REQUIRED",
   /**

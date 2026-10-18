@@ -15,6 +15,7 @@ import {
   freshV47CreateFromSnapshot,
   V47_BASE_CHECKSUM,
   V47_CANDIDATE_CHECKSUM,
+  V47_R2_CANDIDATE_CHECKSUM,
   V47_FRESH_SCHEMA_DIGEST,
   V47_SCHEMA_DIGEST_FROM_RELEASED_CHAIN,
   V47_SNAPSHOT_GIT_BLOB,
@@ -85,8 +86,10 @@ describe("the v47 freeze: the released v47 step installs the v47 snapshot", () =
   it("v46 and v45 keep the full receipt checksums they shipped with, and v47 has the corrected one, in the step and in the checksum map", () => {
     expect(V47).toMatchObject({ fromVersion: 46, toVersion: 47 });
     expect(V47.checksum()).toBe(V47_BASE_CHECKSUM);
-    // FIX-SEC-R2 (CEO 85eac6ef option B): the unreleased candidate's receipt is told apart from this step's.
+    // FIX-SEC-R2 (CEO 85eac6ef option B) and FIX-SEC-R3 (CEO 80492af7): both unreleased candidates'
+    // receipts are told apart from this step's.
     expect(V47_BASE_CHECKSUM).not.toBe(V47_CANDIDATE_CHECKSUM);
+    expect(V47_BASE_CHECKSUM).not.toBe(V47_R2_CANDIDATE_CHECKSUM);
     expect(V46.checksum()).toBe(V46_BASE_CHECKSUM);
     expect(V45.checksum()).toBe(V45_BASE_CHECKSUM);
     const manifest = JSON.parse(readFileSync(new URL("../../src/db/migration-checksums.json", import.meta.url), "utf8")) as {

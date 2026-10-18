@@ -1,19 +1,33 @@
 import Database from "better-sqlite3";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import { restoreDatabase } from "../../src/db/backup.ts";
 import { Db } from "../../src/db/database.ts";
 import { approveMigration, migrationApprovalPath } from "../../src/db/migration-approval.ts";
-import { MIGRATIONS, SCHEMA_VERSION } from "../../src/db/migrations.ts";
+import {
+  MIGRATIONS,
+  SCHEMA_VERSION,
+  claimsUnvettedOwnerDecision,
+  isOwnerDecisionContent,
+  normalizedProducerLabel,
+  ownerDecisionShapeSql,
+} from "../../src/db/migrations.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { laterObjectsIn, releasedChainImage } from "../helpers/released-chain-image.ts";
 import { digestOfSchemaRows, privateStatePath, schemaRowsOf } from "../helpers/released-v44-schema.ts";
 import { V45_BASE_CHECKSUM, contentDigests } from "../helpers/released-v45-schema.ts";
 import { V46_BASE_CHECKSUM, V46_SCHEMA_DIGEST_FROM_V11 } from "../helpers/released-v46-schema.ts";
-import { V47_ADDED_TRIGGERS, V47_BASE_CHECKSUM } from "../helpers/released-v47-schema.ts";
+import {
+  V47_ADDED_TRIGGERS,
+  V47_BASE_CHECKSUM,
+  V47_CANDIDATE_CHECKSUM,
+  V47_R2_CANDIDATE_CHECKSUM,
+  asCandidateV47,
+} from "../helpers/released-v47-schema.ts";
 import { V48_ADDED_TRIGGERS } from "../helpers/released-v48-schema.ts";
 
 afterAll(cleanupTempDirs);
@@ -546,22 +560,33 @@ describe("S3: rollback through the restore drill", () => {
 });
 
 /**
- * FIX-SEC-R2 (CEO 85eac6ef, option B). The review's counterexample: a never-admitted approval written
- * with the canonical label by an ordinary v46 write survived the upgrade and overrode the owner's
- * refusal. The guard cannot authenticate a label already stored, so its first install refuses while any
- * APPROVAL carries one. Literal strings only, so this file loads at the build before the refusal too.
+ * FIX-SEC-R2 (CEO 85eac6ef, option B), widened by FIX-SEC-R3 (CEO 80492af7). The review's counterexample: a
+ * never-admitted approval written with the canonical label by an ordinary v46 write survived the upgrade and
+ * overrode the owner's refusal; at cbb4bfaf, OWNER_DECISION content under an upper-case label upgraded too.
+ * The guard cannot authenticate a row already stored, so its first install refuses while any APPROVAL claims
+ * an owner decision: the canonical label once normalized, or OWNER_DECISION content under a label other than
+ * exactly "service". The migrator's read-only preflight refuses before it backs anything up, so the file is
+ * byte for byte what it was (R3-01). Literal strings only, so this file loads at the build before the fix.
  */
-const PRE_GUARD_REFUSAL = /^v47 refuses: OWNER_DECISION_LABEL_PREDATES_GUARD — run_artifacts holds (\d+) APPROVAL row\(s\) labelled "production-gate:owner-decision" from before the owner-decision guard existed: /;
+const PRE_GUARD_REFUSAL = /^v47 refuses: OWNER_DECISION_LABEL_PREDATES_GUARD — run_artifacts holds (\d+) APPROVAL row\(s\) that claim an owner decision from before the owner-decision guard existed \(/;
 
-/** Approves and opens `path`; returns the migrator's own error text, or undefined when it migrated. */
-const upgradeRefusal = (path: string, why: string): string | undefined => {
+const bytesOf = (path: string): string => createHash("sha256").update(readFileSync(path)).digest("hex");
+
+/**
+ * Approves and opens `path`; returns the refusal's message, or undefined when it migrated. A refusal must
+ * be the preflight's: typed with its own code, and every byte of the file, taken before the approval, the
+ * same after it.
+ */
+const upgradeRefusal = (path: string, why: string, code = "OWNER_DECISION_LABEL_PREDATES_GUARD"): string | undefined => {
+  const bytes = bytesOf(path);
   approveMigration(path, why);
   try {
     new Db(path).close();
     return undefined;
   } catch (error) {
-    expect(String(error)).toMatch(/original database was restored/);
-    return String((error as { evidence?: { migrationError?: unknown } }).evidence?.migrationError);
+    expect(error).toMatchObject({ reasonCode: code });
+    expect(bytesOf(path)).toBe(bytes);
+    return (error as Error).message;
   }
 };
 
@@ -583,8 +608,8 @@ const storedAs = (path: string, rows: readonly Row[]): unknown[] => {
   }
 };
 
-describe("S4: a canonical label already stored when the guard is first installed refuses v47 (FIX-SEC-R2, option B)", () => {
-  it("SECR2 the review's counterexample, an ordinary v46 write of the label, refuses the step: the cause and the row are named, no guard, no receipt, the v46 image unchanged", () => {
+describe("S4: an owner decision already claimed when the guard is first installed refuses v47, before anything is written (FIX-SEC-R2 option B, FIX-SEC-R3)", () => {
+  it("SECR2 the review's counterexample, an ordinary v46 write of the label, refuses the step: the cause and the row are named, no guard, no receipt, the v46 image unchanged byte for byte", () => {
     const path = releasedV46("acp-v47-s4-forged-");
     const { legacy } = seedAsV46(path);
     const forged = writeAtV46(path, row("APPROVAL", { ...decision("item b", true), receipt: { actor: "not-the-owner", inboundNonce: "never-admitted" } }, LABEL));
@@ -614,14 +639,31 @@ describe("S4: a canonical label already stored when the guard is first installed
     { name: "under the marker (a candidate build's capability write)", write: (path) => writeAtV46(path, row("APPROVAL", decision("item a", true), LABEL), () => 1) },
     { name: "on content that is not a decision", write: (path) => writeAtV46(path, row("APPROVAL", { kind: "NOT_A_DECISION" }, LABEL)) },
     { name: "as a refusal", write: (path) => writeAtV46(path, row("APPROVAL", decision("item a", false), LABEL)) },
+    // FIX-SEC-R3 (R3-02): the review's shape forgery, and the label in other forms.
+    { name: "in upper case on a decision (the review's shape forgery)", write: (path) => writeAtV46(path, row("APPROVAL", decision("item a", false), LABEL.toUpperCase())) },
+    { name: "in upper case on content that is not a decision", write: (path) => writeAtV46(path, row("APPROVAL", { kind: "NOT_A_DECISION" }, LABEL.toUpperCase())) },
+    { name: "with a trailing space", write: (path) => writeAtV46(path, row("APPROVAL", { kind: "NOT_A_DECISION" }, `${LABEL} `)) },
+    { name: "in full width", write: (path) => writeAtV46(path, row("APPROVAL", { kind: "NOT_A_DECISION" }, "ｐｒｏｄｕｃｔｉｏｎ－ｇａｔｅ：ｏｗｎｅｒ－ｄｅｃｉｓｉｏｎ")) },
+    { name: "as OWNER_DECISION content under \"Service\"", write: (path) => writeAtV46(path, row("APPROVAL", decision("item a", false), "Service")) },
+    { name: "as OWNER_DECISION content under \"service \"", write: (path) => writeAtV46(path, row("APPROVAL", decision("item a", true), "service ")) },
+    { name: "as OWNER_DECISION content under another component's label", write: (path) => writeAtV46(path, row("APPROVAL", decision("item a", false), "ceo")) },
+    { name: "as OWNER_DECISION content under an empty label", write: (path) => writeAtV46(path, row("APPROVAL", decision("item a", true), "")) },
+    {
+      name: "as a duplicate key the reader's JSON.parse does not read but the guards do",
+      write: (path) => writeAtV46(path, row("APPROVAL", `{"kind":"OWNER_DECISION","kind":"NOT_A_DECISION","item":"item a","approved":false}`, "ceo")),
+    },
+    {
+      name: "as OWNER_DECISION content nested deeper than SQLite's JSON reads, which only the reader's JSON.parse sees",
+      write: (path) => writeAtV46(path, row("APPROVAL", `{"kind":"OWNER_DECISION","item":"item a","approved":false,"deep":${"[".repeat(1100)}${"]".repeat(1100)}}`, "ceo")),
+    },
   ];
 
-  it.each(WRITTEN)("SECR2 the label written $name refuses the step as well, and the image is unchanged", ({ write }) => {
+  it.each(WRITTEN)("SECR2/R3 the claim written $name refuses the step as well, and the image is unchanged byte for byte", ({ write }) => {
     const path = releasedV46("acp-v47-s4-written-");
     seedAsV46(path);
     const labelled = write(path);
     const before = contentDigests(path);
-    const refusal = upgradeRefusal(path, "v47 S4 label variants");
+    const refusal = upgradeRefusal(path, "v47 S4 claim variants");
     expect(refusal).toMatch(PRE_GUARD_REFUSAL);
     expect(refusal).toContain(`holds 1 APPROVAL row(s)`);
     expect(refusal).toContain(JSON.stringify(labelled.id));
@@ -667,16 +709,17 @@ describe("S4: a canonical label already stored when the guard is first installed
     expect(receiptAt(path, 47)).toBeUndefined();
   });
 
-  it("SECR2 rows the guard's label clause does not read never refuse: OWNER_DECISION content labelled \"service\", the label on a HANDOFF, and a label differing by case or a trailing space", () => {
-    const path = releasedV46("acp-v47-s4-unread-");
+  it("R3 legacy history never refuses: OWNER_DECISION approvals and refusals labelled exactly \"service\", the label on a HANDOFF, and an APPROVAL that is not JSON; no row is excepted by id", () => {
+    const path = releasedV46("acp-v47-s4-legacy-");
     const { legacy } = seedAsV46(path);
     const unread = [
       writeAtV46(path, row("HANDOFF", decision("item a", true), LABEL)),
-      writeAtV46(path, row("APPROVAL", decision("item a", true), LABEL.toUpperCase())),
-      writeAtV46(path, row("APPROVAL", decision("item a", true), `${LABEL} `)),
+      writeAtV46(path, row("APPROVAL", decision("item c", true), "service")),
+      writeAtV46(path, row("APPROVAL", "not json", "ceo")),
+      writeAtV46(path, row("APPROVAL", { kind: "CTO_APPROVAL", inner: { kind: "OWNER_DECISION" } }, "ceo")),
     ];
     const before = contentDigests(path);
-    expect(upgradeRefusal(path, "v47 S4 rows the label clause does not read")).toBeUndefined();
+    expect(upgradeRefusal(path, "v47 S4 legacy history")).toBeUndefined();
     const after = contentDigests(path);
     expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: _receiptsBefore, ...restBefore } = before.tables;
@@ -689,7 +732,7 @@ describe("S4: a canonical label already stored when the guard is first installed
     })));
   });
 
-  it("SECR2 a label stored at v45 refuses at v47, and the migrator restores the v45 image: no v46 or v47 receipt", () => {
+  it("SECR2 a label stored at v45 refuses before v46 runs: the v45 image unchanged byte for byte, no v46 or v47 receipt", () => {
     const path = releasedChainImage(privateStatePath("acp-v47-s4-v45-"), 45);
     expect(laterObjectsIn(path, 45)).toEqual([]);
     seedAsV46(path);
@@ -730,5 +773,156 @@ describe("S4: a canonical label already stored when the guard is first installed
     expect(storedAs(path, canonical)).toEqual(canonical.map((r) => ({
       kind: r.kind, produced_by: r.producedBy, content_json: r.content, superseded: 0,
     })));
+  });
+
+  it("R3 the second line: inside v47's own transaction the step refuses the same claim, so a row written after the preflight is still refused (no guard, no receipt)", () => {
+    const path = releasedV46("acp-v47-s4-second-");
+    seedAsV46(path);
+    const forged = writeAtV46(path, row("APPROVAL", decision("item a", true), LABEL.toUpperCase()));
+    const raw = foreign(path, () => 0);
+    raw.function("acp_schema_migration_authorized", () => 1);
+    let refusal: unknown;
+    try {
+      raw.exec("BEGIN IMMEDIATE");
+      try {
+        MIGRATIONS.find((step) => step.toVersion === 47)!.apply(raw);
+      } catch (error) {
+        refusal = error;
+      }
+      raw.exec("ROLLBACK");
+    } finally {
+      raw.close();
+    }
+    expect(refusal).toMatchObject({ reasonCode: "OWNER_DECISION_LABEL_PREDATES_GUARD" });
+    expect(String((refusal as Error).message)).toContain(JSON.stringify(forged.id));
+    expect(triggersOf(path)).not.toContain(GUARD);
+    expect(receiptAt(path, 47)).toBeUndefined();
+  });
+});
+
+/**
+ * FIX-SEC-R3 (R1-01). The review took a released v46 image to v47 with the candidate step from ccc4865f and
+ * its genuine receipt (sha256:f9b23700…), then upgraded: the receipt passed the format check, and the
+ * never-admitted approvals it carried published and merged once. A stored receipt from v47 on is now
+ * compared with this build's step by value, read-only, before anything is written; v45 and v46 receipts
+ * are not compared, so they behave as before.
+ */
+describe("S5: a v47 receipt another step wrote is refused at an upgrade and at an open, before anything is written (FIX-SEC-R3)", () => {
+  const CANDIDATES = [
+    { name: "the candidate v47 (faa829ec–ccc4865f, no pre-install check)", checksum: V47_CANDIDATE_CHECKSUM, by: /faa829ec–ccc4865f/ },
+    { name: "the candidate v47 (cbb4bfaf, the exact label only)", checksum: V47_R2_CANDIDATE_CHECKSUM, by: /cbb4bfaf/ },
+    { name: "a value no build wrote", checksum: `sha256:${"0".repeat(64)}`, by: null },
+  ];
+
+  it.each(CANDIDATES)("an upgrade of a database $name took to v47 refuses, the forgery in it never read: the image, its receipts and its version unchanged", ({ checksum, by }) => {
+    const path = releasedV46("acp-v47-s5-upgrade-");
+    seedAsV46(path);
+    writeAtV46(path, row("APPROVAL", { ...decision("item b", true), receipt: { actor: "not-the-owner", inboundNonce: "never-admitted" } }, LABEL));
+    asCandidateV47(path, checksum, NOW);
+    const before = contentDigests(path);
+    expect(before.userVersion).toBe(47);
+    const refusal = upgradeRefusal(path, "v47 S5 candidate receipt", "MIGRATION_RECEIPT_MISMATCH");
+    expect(refusal).toMatch(/^this build refuses a database whose migration receipt another step wrote: v47 "v47-owner-decision-authority-guard" holds /);
+    if (by !== null) expect(refusal).toMatch(by);
+    expect(refusal).toMatch(/nothing was changed and the receipt is not rewritten$/);
+    expect(contentDigests(path)).toEqual(before);
+    expect(receiptAt(path, 47)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum });
+    expect(receiptAt(path, 48)).toBeUndefined();
+  });
+
+  it("a database a candidate took to v47 and then to v48 is refused at an open, read-only", () => {
+    const path = releasedV46("acp-v47-s5-open-");
+    seedAsV46(path);
+    asCandidateV47(path, V47_CANDIDATE_CHECKSUM, NOW);
+    const v48 = MIGRATIONS.find((step) => step.toVersion === 48)!;
+    const raw = foreign(path, () => 0);
+    try {
+      raw.function("acp_schema_migration_authorized", () => 1);
+      raw.exec("BEGIN IMMEDIATE");
+      v48.apply(raw);
+      raw.prepare("INSERT INTO schema_migrations (version, migration_id, checksum, applied_at) VALUES (48, ?, ?, ?)").run(v48.id, v48.checksum(), NOW);
+      raw.pragma("user_version = 48");
+      raw.exec("COMMIT");
+    } finally {
+      raw.close();
+    }
+    const bytes = bytesOf(path);
+    let refusal: unknown;
+    try {
+      new Db(path).close();
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toMatchObject({
+      reasonCode: "MIGRATION_RECEIPT_MISMATCH",
+      evidence: { mismatches: [{ version: 47, migrationId: "v47-owner-decision-authority-guard", stored: V47_CANDIDATE_CHECKSUM, expected: V47_BASE_CHECKSUM }] },
+    });
+    expect(bytesOf(path)).toBe(bytes);
+  });
+
+  it("this build's own v47 receipt upgrades and reopens; released v45 and v46 receipts are not compared by value, so any well-formed one behaves exactly as before", () => {
+    const path = releasedV46("acp-v47-s5-released-");
+    seedAsV46(path);
+    expect(receiptsThrough46(path).map((r) => (r as { version: number; checksum: string })).filter((r) => r.version >= 45).map((r) => r.checksum))
+      .toEqual([V45_BASE_CHECKSUM, V46_BASE_CHECKSUM]);
+    // A different well-formed v46 value: the format check is the only one before v47, as at cbb4bfaf.
+    const other = releasedV46("acp-v47-s5-other46-");
+    seedAsV46(other);
+    const raw = new Database(other);
+    try {
+      raw.function("acp_schema_migration_authorized", () => 1);
+      const triggers = raw.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'schema_migrations'").all() as Array<{ name: string; sql: string }>;
+      raw.exec("BEGIN IMMEDIATE");
+      for (const trigger of triggers) raw.exec(`DROP TRIGGER "${trigger.name}"`);
+      raw.prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 46").run(`sha256:${"4".repeat(64)}`);
+      for (const trigger of triggers) raw.exec(trigger.sql);
+      raw.exec("COMMIT");
+    } finally {
+      raw.close();
+    }
+    for (const image of [path, other]) {
+      const receipts = receiptsThrough46(image);
+      expect(upgradeRefusal(image, "v47 S5 released receipts")).toBeUndefined();
+      expect(receiptsThrough46(image)).toEqual(receipts);
+      expect(receiptAt(image, 47)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });
+      const upgraded = contentDigests(image);
+      new Db(image).close();
+      expect(contentDigests(image)).toEqual(upgraded);
+    }
+  });
+});
+
+/**
+ * FIX-SEC-R3 (CEO 80492af7): one standard. The refusal reuses the reader's shape test and the guards' shape
+ * clause rather than a third copy. The guards are SQL in frozen snapshots and cannot call a function, so
+ * their clause is compared here with the shared one, token for token.
+ */
+describe("S6: the refusal, the reader and the guards test an owner decision the same way (FIX-SEC-R3)", () => {
+  const squash = (sql: string): string => sql.replace(/\s+/g, " ").replace(/\( /g, "(").replace(/ \)/g, ")").trim();
+
+  it("the v47 insert guard and the v48 supersede guard carry the shared shape clause over NEW and OLD", () => {
+    const fresh = privateStatePath("acp-v47-s6-");
+    new Db(fresh).close();
+    const bodies = Object.fromEntries(schemaRowsOf(fresh).filter((r) => r.type === "trigger").map((r) => [r.name, squash(r.sql ?? "")]));
+    expect(bodies[GUARD]).toContain(squash(ownerDecisionShapeSql("NEW.content_json")));
+    expect(bodies["run_artifacts_owner_decision_supersede_guard"]).toContain(squash(ownerDecisionShapeSql("OLD.content_json")));
+    const snapshot = squash(readFileSync(new URL("../../src/db/schema-v47.sql", import.meta.url), "utf8"));
+    expect(snapshot).toContain(squash(ownerDecisionShapeSql("NEW.content_json")));
+  });
+
+  it("a claim is the label once normalized, or either shape test under any label but exactly \"service\"", () => {
+    const shaped = JSON.stringify(decision("item a", false));
+    const claims = (producedBy: unknown, contentJson: unknown, guardShaped: unknown = 0): boolean =>
+      claimsUnvettedOwnerDecision({ producedBy, contentJson, guardShaped });
+    expect(isOwnerDecisionContent(JSON.parse(shaped))).toBe(true);
+    for (const content of [null, [], "OWNER_DECISION", { kind: "CTO_APPROVAL" }]) expect(isOwnerDecisionContent(content)).toBe(false);
+    expect(normalizedProducerLabel(" ＰＲＯＤＵＣＴＩＯＮ-gate:Owner-Decision\t")).toBe(LABEL);
+    expect(claims(LABEL, "{}")).toBe(true);
+    expect(claims(LABEL.toUpperCase(), "not json")).toBe(true);
+    expect(claims("service", shaped, 1)).toBe(false);
+    expect(claims("Service", shaped)).toBe(true);
+    expect(claims("ceo", "{}", 1)).toBe(true);
+    expect(claims("ceo", "{}", 0)).toBe(false);
+    expect(claims(Buffer.from("service"), shaped)).toBe(true);
   });
 });

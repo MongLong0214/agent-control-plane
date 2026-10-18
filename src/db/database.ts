@@ -46,6 +46,8 @@ import {
   SCHEMA_VERSION as CURRENT_SCHEMA_VERSION,
   assertLoadBearingInvariants,
   assertMigrationLedgerAt,
+  assertMigrationPreflight,
+  assertReceiptsAreThisBuilds,
   bootstrapChecksum,
   installMigrationLedger,
   migrationChainFrom,
@@ -583,6 +585,9 @@ export class Db {
         includeTelegramOwnerPrompts: true,
       });
       assertMigrationLedgerAt(this.#raw, version);
+      // SEC-OD1 (FIX-SEC-R3, R1-01) — a receipt another step wrote, such as the candidate v47's, is
+      // refused at an open as well as at an upgrade, read-only and before anything is written.
+      this.refuseUnchanged(() => assertReceiptsAreThisBuilds(this.#raw));
       // #747, the repair half of the retirement contract. This branch is also the proof that a
       // spent approval is inert: it returns without ever consulting one, so an approval left on
       // disk by a failed rename authorises nothing. Filing it away here is what keeps the state
@@ -684,6 +689,13 @@ export class Db {
           { expected: version, found: current, file: this.file },
         );
       }
+      // SEC-OD1 (FIX-SEC-R3, R3-01) — the read-only preflight, under the lock and before `migrate`
+      // backs anything up: a receipt another step wrote, or an owner decision claimed before the v47
+      // guard, refuses here with nothing written, so the image stays byte for byte what it was and the
+      // approval stays unspent. The lock does not exclude an older build's or a raw writer between this
+      // read and the step's transaction; v47 repeats the predicate inside that transaction, and a
+      // refusal from there takes `migrate`'s generic restore (rows and receipts kept, not the bytes).
+      this.refuseUnchanged(() => assertMigrationPreflight(this.#raw, version));
       this.migrate(filename, version);
     });
     this.appliedMigrationApproval = approval;
@@ -692,6 +704,19 @@ export class Db {
       approval.fromVersion,
       approval.toVersion,
     );
+  }
+
+  /**
+   * Runs a read-only refusal check; on a refusal, closes this handle (it wrote nothing) and rethrows,
+   * so no connection outlives a constructor that did not return.
+   */
+  private refuseUnchanged(check: () => void): void {
+    try {
+      check();
+    } catch (error) {
+      if (this.#raw.open) this.#raw.close();
+      throw error;
+    }
   }
 
   /**

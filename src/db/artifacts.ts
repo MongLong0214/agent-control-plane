@@ -12,6 +12,7 @@ import {
 } from "../snapshot/candidate-snapshot.ts";
 import { credentialBearingField, prohibitedDurableField } from "./audit.ts";
 import type { Db, EvidenceWritePort } from "./database.ts";
+import { OWNER_DECISION_LABEL } from "./migrations.ts";
 
 export interface StoredArtifact<T = unknown> {
   artifactId: string;
@@ -52,9 +53,10 @@ export const isEvidenceKind = (kind: string): kind is EvidenceKind =>
  * SEC-OD1 — the `produced_by` of a canonical owner decision: the OWNER_DECISION APPROVAL artifact
  * `ProductionGate.recordOwnerDecision` writes in the one transaction that admits the owner's receipt
  * from live ingress and consumes it. Only `putOwnerDecision` writes it, and only for the holder of the
- * production gate's capability; `put` labels every row "service" whatever its content says.
+ * production gate's capability; `put` labels every row "service" whatever its content says. Defined
+ * once, beside v47's refusal of owner decisions written before its guard (`OWNER_DECISION_LABEL`).
  */
-export const OWNER_DECISION_PRODUCER = "production-gate:owner-decision";
+export const OWNER_DECISION_PRODUCER = OWNER_DECISION_LABEL;
 
 /**
  * SEC-OD1-R1-02 — why an owner gate refuses when an item's latest exactly bound approval does not

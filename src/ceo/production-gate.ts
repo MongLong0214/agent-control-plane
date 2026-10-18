@@ -25,6 +25,7 @@ import {
   type StoredArtifact,
 } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
+import { isOwnerDecisionContent } from "../db/migrations.ts";
 import {
   ArtifactKind,
   type CeoDecision,
@@ -1759,7 +1760,8 @@ export class ProductionGate {
     const decision = artifact.content;
     if (
       artifact.superseded ||
-      decision.kind !== "OWNER_DECISION" ||
+      // The one shape test, shared with v47's refusal of decisions written before its guard.
+      !isOwnerDecisionContent(decision) ||
       typeof decision.item !== "string" ||
       decision.item.length === 0 ||
       typeof decision.approved !== "boolean" ||
