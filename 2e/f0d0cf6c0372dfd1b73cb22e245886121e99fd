@@ -1,0 +1,14 @@
+Ruled-out: stripping later objects from a newer database to build a historical test image | images taken back from a newer database kept later objects such as bootstrap_applications and both grant tables, so they are now built by running the released chain up to that version
+Warn: v46 refuses, instead of dropping, any object that already holds one of its nine trigger names; each name is checked for type, owning table, exact definition and letter case before any change and again after, because drop-and-recreate silently replaced weakened or misplaced guards and left a same-named index beside one
+Warn: the released chain's own v13 already holds baseline_records and telegram_owner_prompts, so an image helper must not treat them as later objects
+Warn: this verified record restates the v46 decision itself, nine triggers refusing an insert by rowid, a rowid change and a non-positive rowid on outbox, inbound_messages and canonical_turns; that decision's earlier record on 404422d5 is hand-authored (Provenance: authored) and is left unchanged
+Record-Id: r-d11b3a00fc82
+Provenance: inherited ffdb8b82724916b5bdfa5345fae92253fe627dcc
+
+Limit: the v13 image is the fresh-install v13 of 842830c5; a v11 database upgraded by v13's own steps differs from it in the runs definition text and two receipts
+Warn: correction to r-d11b3a00fc82: its warning that the released chain's own v13 already holds baseline_records and telegram_owner_prompts is true only of today's chain replay, not of the released v13 (842830c5); the v13 test image is now built from that release's own schema, frozen as tests/fixtures/schema-v13.sql with its git blob and SHA-256 pinned
+Record-Id: r-984762113478
+Provenance: inherited 70b6eebeeab9dfd6e48dd18b1412728385b37f36
+
+Warn: v46 refuses an insert naming an existing rowid, a rowid change and a non-positive rowid on outbox, inbound_messages and canonical_turns; prepare test data with explicit INSERT, UPDATE or DELETE rather than REPLACE, and never weaken these triggers to make a fixture pass
+Provenance: inherited 404422d557ace7e64a1312fd087a0cd53bbc1873
