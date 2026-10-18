@@ -1,0 +1,22 @@
+Limit: an expect stopped on an input-delivery failure is killed with SIGKILL, because a SIGTERM landing while expect is exiting deadlocks it in Tcl_FinalizeNotifier and it then ignores SIGTERM; the trust-prompt path still sends SIGTERM
+Warn: a stdin failure in the expect usage terminal or the Codex rate-limit probe yields an ERROR reading with no buckets, never a parsed or zero-remaining reading, and nothing waits for the child's stdin to close
+Record-Id: r-3de370c91048
+Provenance: inherited 8b9e9d9faf1a8aa645b4e422a8b94b6a593dee56
+
+Warn: stop() signals only a process group this probe owns: with no pid, a non-integer pid or pid 1 it sends nothing, because -(pid ?? 0) made a failed spawn signal the daemon's own process group and kill(-1) signals every process
+Record-Id: r-688d7a4f4107
+Provenance: inherited 61983b4a1a6a2836c8035d9d427aa9625ef6a68e
+
+Limit: a run that actually times out sends SIGKILL and returns at the deadline without waiting for the exit event, which lands milliseconds later; waiting would have extended the deadline
+Warn: usage collection decides its result before cleanup and nothing said or exited afterwards replaces it: the Codex probe drops its stdout handler and releases its pipes on settlement, a failed terminal exit is an ERROR before any quota is parsed, and expect cleanup returns at confirmed exit or the existing deadline, which is not extended
+Record-Id: r-d906a42e8f63
+Provenance: inherited 267b46c600c1b3084b6e436bd67aef1bc36aa245
+
+Warn: every usage probe splits its unchanged deadline into work and a cleanup reserve and returns only after its owned direct child's exit, or at the deadline with an explicit cleanup-failed ERROR; this corrects r-d906a42e8f63's Limit that a timed-out run returns before the exit event, and exit proves only the direct child ended and was reaped, not its descendants
+Record-Id: r-cc6d12f6e82b
+Provenance: inherited 823a265a62f6daace058ce62bd231c59c680bcb5
+
+Limit: the probe still takes its result at the child's exit event, when Node's stdio streams may still be open, so output not yet read at that moment is not in the result; main bb99f88e settles on exit too, and releasing the pipes does not change what is returned
+Warn: the non-interactive usage probe stops reading when it settles, on every path, and destroys its stdout and stderr pipes, so a descendant outside the killed group that inherited either pipe no longer keeps the caller's process alive after a HEALTHY return; output written after settling is discarded, and an error listener stays on each pipe so a late stream error is never uncaught
+Record-Id: r-a29499ce4fb4
+Provenance: inherited d2008c63940dd5cdba7367a1958d79d88df290e3
