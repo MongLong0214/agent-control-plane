@@ -1,8 +1,10 @@
 import Database from "better-sqlite3";
+import { readFileSync } from "node:fs";
 
 import { canonicalJson } from "../../src/core/digest.ts";
 import { newArtifactId } from "../../src/core/ids.ts";
 import { digestArtifactContent, type StoredArtifact } from "../../src/db/artifacts.ts";
+import { installMigrationLedger } from "../../src/db/migrations.ts";
 
 /**
  * SEC-OD1 (v47) — fixtures for the v46 → v47 step and for rows the v47 guard leaves standing.
@@ -63,4 +65,52 @@ export const writeOutsideTheGuard = <T>(
     side.close();
   }
   return artifact;
+};
+
+/**
+ * The v47 freeze: like v45 (#1140) and v46, the released v47 step reads its own frozen snapshot,
+ * `src/db/schema-v47.sql`, a byte copy of `schema.sql` at the v47 commit, so a later schema change
+ * (v48 onward) cannot change what a database receives at its v47 step. Every value here was measured
+ * with the pre-change code, whose `migrations.ts` and `schema.sql` are those of that commit, and is
+ * transcribed, not recomputed: a value a run derives from the file it is checking agrees with whatever
+ * file it is handed.
+ */
+export const V47_FREEZE_BASE_COMMIT = "faa829ec3fecaa5d5aca6cd41160d2f464c4a24f";
+
+export const V47_SNAPSHOT_PATH = "src/db/schema-v47.sql";
+/** `git rev-parse faa829ec:src/db/schema.sql`, the v47 canonical source. */
+export const V47_SNAPSHOT_GIT_BLOB = "9ca4cad97b1dbf5cbd759d7f11d11b3c7bb9c543";
+export const V47_SNAPSHOT_SHA256 = "8c4de11d7ae4d687120196ad9ae73e5b370f6abcc47b9a8b31dc5e69608de487";
+
+/** v47's receipt checksum as the pre-change build computed it, in full. */
+export const V47_BASE_CHECKSUM = "sha256:f9b2370034620dc56f825fd9119fedd22ba76a46261c64684446992a48958b49";
+
+/**
+ * `digestOfSchemaRows` of the database the pre-change build left at v47 from the released chain: from the
+ * released v46 image (`releasedChainImage(path, 46)`), from the released v45 image, and from the v11
+ * fixture, which runs every step v12–v47. All three reach the same schema, so one value serves them.
+ */
+export const V47_SCHEMA_DIGEST_FROM_RELEASED_CHAIN =
+  "sha256:13b1778f67db771feefdee355247c729b79f7d6283d48641fdcd8f50c969da31";
+
+/** `digestOfSchemaRows` of a fresh database the pre-change build created at v47 (`new Db(path)`). */
+export const V47_FRESH_SCHEMA_DIGEST =
+  "sha256:5a4dcc90b8c913a1c1e21c1a1150581c8aaa5b93ab9d3a8510fccfd9a0f45c48";
+
+/**
+ * A fresh v47 create, made from the snapshot rather than from whatever `schema.sql` holds now. The
+ * bootstrap path applies the schema's DDL and then the migration ledger; nothing else it does
+ * reaches `sqlite_schema`.
+ */
+export const freshV47CreateFromSnapshot = (path: string): string => {
+  const ddl = readFileSync(new URL(`../../${V47_SNAPSHOT_PATH}`, import.meta.url), "utf8")
+    .replace(/^\s*PRAGMA\s+(?:journal_mode|foreign_keys|synchronous)\s*=\s*[^;]+;\s*$/gim, "");
+  const raw = new Database(path);
+  try {
+    raw.exec(ddl);
+    installMigrationLedger(raw);
+  } finally {
+    raw.close();
+  }
+  return path;
 };
