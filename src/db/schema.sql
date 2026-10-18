@@ -1276,6 +1276,31 @@ BEGIN
   SELECT RAISE(ABORT, 'EVIDENCE_WRITE_AUTHORITY_DENIED');
 END;
 
+-- CP-HI-06 — SEC-OD1 (v47): an owner decision is written only under the production gate's capability.
+-- The canonical label, or a top-level content kind of OWNER_DECISION (any member of that name, so
+-- duplicate keys cannot hide it from SQLite while JSON.parse reads it), needs the same
+-- connection-local marker evidence needs. Fail-closed: only exactly 1 passes, so NULL, a missing
+-- function or a function that throws refuses. Rows written before v47 are untouched. A connection
+-- that defines the marker function itself is outside this guard (CEO 52c3b1e6 (b)).
+CREATE TRIGGER IF NOT EXISTS run_artifacts_owner_decision_authority_guard
+BEFORE INSERT ON run_artifacts
+WHEN NEW.kind = 'APPROVAL'
+ AND (
+   NEW.produced_by = 'production-gate:owner-decision'
+   OR (
+     json_valid(NEW.content_json) = 1
+     AND EXISTS (
+       SELECT 1 FROM json_each(NEW.content_json) member
+        WHERE member.key = 'kind'
+          AND member.value = 'OWNER_DECISION'
+     )
+   )
+ )
+ AND acp_evidence_write_authorized() IS NOT 1
+BEGIN
+  SELECT RAISE(ABORT, 'OWNER_DECISION_WRITE_AUTHORITY_DENIED');
+END;
+
 -- CP-HI-06 — content-addressed evidence is append-only but for the one-way staleness mark.
 -- Evidence is append-only except for one one-way staleness mark. Every metadata field,
 -- including row identity and timestamp, participates in authority and must stay fixed.

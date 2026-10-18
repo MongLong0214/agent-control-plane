@@ -6,12 +6,13 @@ import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
 import { OWNER_DECIDE_AGAIN_MESSAGE } from "../../src/db/artifacts.ts";
-import { RunState } from "../../src/domain/types.ts";
+import { Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import type { GatePayload } from "../../src/github/github-kernel.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { createHermesMcpPort } from "../../src/mcp/hermes-server.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
+import { writeOutsideTheGuard } from "../helpers/released-v47-schema.ts";
 import {
   approveReviewedCandidateForFinalization,
   type Harness,
@@ -88,20 +89,51 @@ const decide = (w: Pick<World, "harness" | "runId">, item: string, approved: boo
 };
 
 /**
+ * v47 — what `put` (the "service" label) does with an OWNER_DECISION-shaped record now: refuses it at
+ * the database, typed as the capability refusal, and stores nothing. Then the same record is written
+ * as it stands in a database upgraded from before v47, by a connection outside the guard
+ * (`writeOutsideTheGuard`, v47's stated Limit), so the readers' own checks still face it.
+ */
+const putIsRefusedThenWrittenOutsideTheGuard = <T>(w: Pick<World, "harness">, runId: string, content: T, candidate: string) => {
+  const before = w.harness.cp.artifacts.list(runId, "APPROVAL").length;
+  let refusal: unknown;
+  try {
+    w.harness.cp.artifacts.put(runId, "APPROVAL", content, candidate);
+  } catch (error) {
+    refusal = error;
+  }
+  expect(refusal).toMatchObject({
+    reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+    evidence: { sqlite: "OWNER_DECISION_WRITE_AUTHORITY_DENIED" },
+  });
+  expect(w.harness.cp.artifacts.list(runId, "APPROVAL")).toHaveLength(before);
+  return writeOutsideTheGuard(w.harness.cp.config.databasePath, runId, content, candidate, w.harness.clock.nowIso());
+};
+
+/**
  * SEC-OD1-R1-02 — `record` as the code before SEC-OD1 recorded an owner decision: the same admission,
- * consumption and transaction, written through `put`, so with the "service" label every decision of
- * that era carries. Restored afterwards, so nothing else is written this way.
+ * consumption and transaction, with the "service" label every decision of that era carries. Since v47
+ * `put` refuses that row, so the record is captured in the transaction and written once it commits,
+ * as it stands in a database upgraded from before v47 (`putIsRefusedThenWrittenOutsideTheGuard`).
+ * Restored afterwards, so nothing else is written this way.
  */
 const asBeforeSecOd1 = <T>(w: Pick<World, "harness">, record: () => T): T => {
   const store = w.harness.cp.artifacts;
   const canonical = store.putOwnerDecision;
-  store.putOwnerDecision = ((_writer, runId, content, candidate) =>
-    store.put(runId, "APPROVAL", content, candidate)) as typeof store.putOwnerDecision;
+  const captured: Array<{ runId: string; content: unknown; candidate: string }> = [];
+  store.putOwnerDecision = ((_writer: unknown, runId: string, content: unknown, candidate: string) => {
+    captured.push({ runId, content, candidate });
+    // What the caller is handed is never read: recordOwnerDecision ignores the stored artifact.
+    return undefined;
+  }) as unknown as typeof store.putOwnerDecision;
+  let recorded: T;
   try {
-    return record();
+    recorded = record();
   } finally {
     store.putOwnerDecision = canonical;
   }
+  for (const { runId, content, candidate } of captured) putIsRefusedThenWrittenOutsideTheGuard(w, runId, content, candidate);
+  return recorded;
 };
 
 /**
@@ -110,7 +142,7 @@ const asBeforeSecOd1 = <T>(w: Pick<World, "harness">, record: () => T): T => {
  * confirms for real, otherwise the fixture stages CEO_APPROVED so the kernel's own re-check is what is
  * exercised.
  */
-const world = async (approve: readonly string[] = [], options: { before?: boolean } = {}): Promise<World> => {
+const world = async (approve: readonly string[] = [], options: { before?: boolean; packetOnly?: boolean } = {}): Promise<World> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
   const harness = makeHarness({ githubClient: github });
@@ -139,9 +171,29 @@ const world = async (approve: readonly string[] = [], options: { before?: boolea
     if (options.before) asBeforeSecOd1({ harness }, record);
     else record();
   }
-  await approveReviewedCandidateForFinalization(harness, driven, {
-    bypassCeoConfirmation: options.before === true || !ITEMS.every((item) => approve.includes(item)),
-  });
+  if (options.packetOnly) {
+    // The CTO packet is built and the run waits at CEO review: CONFIRM is left to the test.
+    await harness.cp.continuity.evaluate("test finalization packet");
+    const packet = harness.cp.ceo.buildPacket({
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      approval: {
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        resultSummary: "candidate verified",
+        recommendation: "merge",
+        residualRisk: [],
+        approvedBySessionId: driven.ownerSessionId,
+        approvedByGeneration: driven.ownerBindingGeneration,
+        approvedAt: harness.clock.nowIso(),
+      },
+    });
+    if (!packet.allowed) throw new Error(`${packet.reasonCode}: ${packet.message}`);
+  } else {
+    await approveReviewedCandidateForFinalization(harness, driven, {
+      bypassCeoConfirmation: options.before === true || !ITEMS.every((item) => approve.includes(item)),
+    });
+  }
   installDaemonFinalizerGitHubFixture(harness);
   return {
     harness,
@@ -223,9 +275,12 @@ const admittedFor = (w: World, item: string, note: string, candidate: string): O
   return admitted.value;
 };
 
-/** The hand-written half of the probe: an OWNER_DECISION-shaped APPROVAL artifact put straight into the store. */
+/**
+ * The hand-written half of the probe: an OWNER_DECISION-shaped APPROVAL artifact put straight into the
+ * store. Since v47 `put` refuses it; it is then written outside the guard, so the gate still faces it.
+ */
 const handWrite = (w: World, item: string, note: string, receipt: OwnerApprovalReceipt, candidate = w.candidate) =>
-  w.harness.cp.artifacts.put(w.runId, "APPROVAL", {
+  putIsRefusedThenWrittenOutsideTheGuard(w, w.runId, {
     kind: "OWNER_DECISION",
     item,
     approved: true,
@@ -458,7 +513,7 @@ describe("SEC-OD1 the canonical record and its writer", () => {
     expect(outcome(published)).toBe("ALLOWED");
   });
 
-  it("ODWRITER recordOwnerDecision writes the canonical label; put of the same shape does not", async () => {
+  it("ODWRITER recordOwnerDecision writes the canonical label; put of the same shape is refused (v47), and written outside the guard it carries \"service\"", async () => {
     const w = await world([ITEM_A]);
     const approvals = w.harness.cp.artifacts.list<{ kind?: string; item?: string }>(w.runId, "APPROVAL")
       .filter((artifact) => artifact.content.kind === "OWNER_DECISION");
@@ -505,8 +560,9 @@ describe("SEC-OD1 the canonical record and its writer", () => {
     const w = await world();
     const note = "pre-empted";
     const receipt = ownerDecisionReceipt(w.harness, w.runId, ITEM_A, true, note);
-    // Exactly what recordOwnerDecision would write in this transaction, written first by `put`.
-    w.harness.cp.artifacts.put(w.runId, "APPROVAL", {
+    // Exactly what recordOwnerDecision would write in this transaction, written first by another
+    // writer: `put` is refused since v47, so outside the guard.
+    putIsRefusedThenWrittenOutsideTheGuard(w, w.runId, {
       kind: "OWNER_DECISION",
       item: ITEM_A,
       approved: true,
@@ -578,9 +634,12 @@ const decisionContent = (w: World, approved: boolean, note: string, binding: Bin
   };
 };
 
-/** A refusal written with `put`, so labelled "service" like every decision recorded before SEC-OD1. */
+/**
+ * A refusal labelled "service" like every decision recorded before SEC-OD1. `put` refuses it since
+ * v47, so it is written outside the guard, as it stands in a database upgraded from before v47.
+ */
 const putRefusal = (w: World, binding: Binding = {}) =>
-  w.harness.cp.artifacts.put(w.runId, "APPROVAL", decisionContent(w, false, "refused", binding), binding.artifactCandidate ?? w.candidate);
+  putIsRefusedThenWrittenOutsideTheGuard(w, w.runId, decisionContent(w, false, "refused", binding), binding.artifactCandidate ?? w.candidate);
 
 /**
  * An approval written through the production gate's own capability, so with the canonical label, but
@@ -780,48 +839,218 @@ describe("SEC-OD1-R1-02 approvals recorded before SEC-OD1 do not count, and the 
 
 /**
  * SEC-OD1-R1-01 — the review's counterexample: the canonical label written by an ordinary in-process
- * `Db.run`, with no capability, no admitted receipt and no allowlisted actor. Code alone cannot refuse
- * it; the v47 authority guard (a migration) does. Until then these are expected failures: vitest
- * reports them passed only while they fail, and that is never a security PASS. v47 turns each into `it`.
+ * `Db.run`, with no capability, no admitted receipt and no allowlisted actor. Code alone could not refuse
+ * it. Before v47 these two were expected failures (`it.fails`, never a security PASS); the v47 authority
+ * guard (`run_artifacts_owner_decision_authority_guard`) refuses the insert itself, so each is now an
+ * ordinary test: the write is refused, nothing is stored, and the gate, the kernel publish and the
+ * kernel merge refuse with no GitHub write.
  */
-const canonicalViaDbRun = (w: World, item: string, note: string): void => {
-  const content = {
-    kind: "OWNER_DECISION",
-    item,
-    approved: true,
-    note,
-    receipt: typedReceipt(w, item, note, { actor: "not-the-owner" }),
-    humanGateDigest: digestOf(ITEMS),
-    candidateSnapshotDigest: w.candidate,
-  };
-  w.harness.cp.db.run(
-    `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
-     VALUES (?, ?, 'APPROVAL', ?, ?, ?, ?, ?)`,
-    [`art_v47_${digestOf({ item, note }).slice(7, 31)}`, w.runId, digestOf(content), w.candidate, JSON.stringify(content), OWNER_DECISION_LABEL, w.harness.clock.nowIso()],
-  );
+const forgedDecision = (w: World, item: string, note: string) => ({
+  kind: "OWNER_DECISION",
+  item,
+  approved: true,
+  note,
+  receipt: typedReceipt(w, item, note, { actor: "not-the-owner" }),
+  humanGateDigest: digestOf(ITEMS),
+  candidateSnapshotDigest: w.candidate,
+});
+
+/** The forgery as an ordinary `Db.run` on ACP's own connection; returns what it threw (nothing, if admitted). */
+const viaDbRun = (w: World, content: Record<string, unknown>, label: string, verb = "INSERT"): unknown => {
+  try {
+    w.harness.cp.db.run(
+      `${verb} INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+       VALUES (?, ?, 'APPROVAL', ?, ?, ?, ?, ?)`,
+      [`art_v47_${digestOf({ content, label, verb }).slice(7, 31)}`, w.runId, digestOf(content), w.candidate, JSON.stringify(content), label, w.harness.clock.nowIso()],
+    );
+    return undefined;
+  } catch (error) {
+    return error;
+  }
 };
 
-describe("SEC-OD1-R1-01 known failures until the v47 authority guard (expected to fail; not a security PASS)", () => {
-  it.fails("ODV47-KNOWN-FAIL until v47: a Db.run of the canonical label, never admitted, must not publish", async () => {
+/** The v47 refusal, typed as the capability refusal and naming the trigger's sentinel. */
+const V47_REFUSAL = { reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, evidence: { sqlite: "OWNER_DECISION_WRITE_AUTHORITY_DENIED" } };
+
+/** Every APPROVAL row of the run as [producedBy, content kind], so a stored forgery is visible. */
+const approvalRows = (w: World): Array<[string, unknown]> =>
+  w.harness.cp.artifacts.list<{ kind?: unknown }>(w.runId, "APPROVAL").map((artifact) => [artifact.producedBy, artifact.content.kind]);
+
+/** The connection-local marker as ACP's own connection reads it outside any capability write. */
+const markerNow = (w: World): unknown =>
+  w.harness.cp.db.get<{ v: unknown }>("SELECT acp_evidence_write_authorized() AS v")?.v;
+
+describe("SEC-OD1-R1-01 the v47 authority guard refuses an ordinary Db.run forgery (formerly ODV47-KNOWN-FAIL)", () => {
+  it("ODV47 a Db.run of the canonical label, never admitted, is refused at write and does not publish", async () => {
     const w = await world([ITEM_A]);
     expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
-    canonicalViaDbRun(w, ITEM_B, "not admitted; ordinary Db.run");
+    const rows = approvalRows(w);
+    expect(viaDbRun(w, forgedDecision(w, ITEM_B, "not admitted; ordinary Db.run"), OWNER_DECISION_LABEL)).toMatchObject(V47_REFUSAL);
+    expect(approvalRows(w)).toEqual(rows);
     const published = await w.harness.cp.github.gatePublish(w.payload, w.identity);
     const observed = { gate: gateAccepts(w), published: outcome(published), checks: w.github.checkRuns.length };
     expect(published.reasonCode, JSON.stringify(observed)).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
     expect(w.github.checkRuns).toHaveLength(0);
   });
 
-  it.fails("ODV47-KNOWN-FAIL until v47: a Db.run of the canonical label must not override the owner's refusal at merge", async () => {
+  it("ODV47 a Db.run of the canonical label is refused at write and does not override the owner's refusal at merge", async () => {
     const w = await world([ITEM_A, ITEM_B]);
     expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
     const pullNumber = await openPull(w);
     decide(w, ITEM_B, false, "owner refused");
     expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
-    canonicalViaDbRun(w, ITEM_B, "overriding the refusal; ordinary Db.run");
+    const rows = approvalRows(w);
+    expect(viaDbRun(w, forgedDecision(w, ITEM_B, "overriding the refusal; ordinary Db.run"), OWNER_DECISION_LABEL)).toMatchObject(V47_REFUSAL);
+    expect(approvalRows(w)).toEqual(rows);
     const merged = await merge(w, pullNumber);
     const observed = { gate: gateAccepts(w), merged: outcome(merged), merges: w.github.mergeCount };
     expect(merged.reasonCode, JSON.stringify(observed)).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
     expect(w.github.mergeCount).toBe(0);
+  });
+
+  it("ODV47 OWNER_DECISION content under the \"service\" label, the canonical label on other content, and INSERT OR REPLACE are each refused", async () => {
+    const w = await world([ITEM_A]);
+    const rows = approvalRows(w);
+    const content = forgedDecision(w, ITEM_B, "legacy-looking");
+    // A new legacy-looking approval or refusal can no longer be created by `Db.run`.
+    expect(viaDbRun(w, content, "service")).toMatchObject(V47_REFUSAL);
+    expect(viaDbRun(w, { ...content, approved: false }, "service")).toMatchObject(V47_REFUSAL);
+    // The label alone is enough, whatever the content says.
+    expect(viaDbRun(w, { kind: "NOT_A_DECISION", item: ITEM_B }, OWNER_DECISION_LABEL)).toMatchObject(V47_REFUSAL);
+    // A duplicate key hides the kind from SQLite's `$.kind` and not from JSON.parse; the guard reads every member.
+    const duplicated = (w2: World) => `{"kind":"NOT_A_DECISION","kind":"OWNER_DECISION","item":${JSON.stringify(ITEM_B)},"approved":true,"candidateSnapshotDigest":${JSON.stringify(w2.candidate)}}`;
+    expect(JSON.parse(duplicated(w)).kind).toBe("OWNER_DECISION");
+    let duplicateRefusal: unknown;
+    try {
+      w.harness.cp.db.run(
+        `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+         VALUES ('art_v47_duplicate_key', ?, 'APPROVAL', ?, ?, ?, 'service', ?)`,
+        [w.runId, digestOf(duplicated(w)), w.candidate, duplicated(w), w.harness.clock.nowIso()],
+      );
+    } catch (error) {
+      duplicateRefusal = error;
+    }
+    expect(duplicateRefusal).toMatchObject(V47_REFUSAL);
+    for (const verb of ["INSERT OR REPLACE", "REPLACE", "INSERT OR IGNORE"]) {
+      expect(viaDbRun(w, content, OWNER_DECISION_LABEL, verb)).toMatchObject(V47_REFUSAL);
+    }
+    expect(approvalRows(w)).toEqual(rows);
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+  });
+
+  it("ODV47 an UPDATE into the canonical shape, or of a written decision's content or bindings, stays refused by run_artifacts_content_immutable", async () => {
+    const w = await world([ITEM_A]);
+    const ordinary = w.harness.cp.artifacts.list<{ kind?: unknown }>(w.runId, "APPROVAL").find((artifact) => artifact.producedBy === "service");
+    const decision = w.harness.cp.artifacts.list<{ kind?: unknown }>(w.runId, "APPROVAL").find((artifact) => artifact.producedBy === OWNER_DECISION_LABEL);
+    expect(ordinary).toBeDefined();
+    expect(decision).toBeDefined();
+    const before = approvalRows(w);
+    const refusedWith = (sql: string, params: unknown[]): unknown => {
+      try {
+        w.harness.cp.db.run(sql, params);
+        return undefined;
+      } catch (error) {
+        return error;
+      }
+    };
+    const immutable = { reasonCode: ReasonCode.CONFLICT, evidence: { sqlite: "ARTIFACT_IMMUTABLE" } };
+    const forged = JSON.stringify(forgedDecision(w, ITEM_B, "updated into shape"));
+    for (const [sql, params] of [
+      ["UPDATE run_artifacts SET produced_by = ? WHERE artifact_id = ?", [OWNER_DECISION_LABEL, ordinary!.artifactId]],
+      ["UPDATE run_artifacts SET content_json = ? WHERE artifact_id = ?", [forged, ordinary!.artifactId]],
+      ["UPDATE run_artifacts SET content_json = ?, produced_by = ? WHERE artifact_id = ?", [forged, OWNER_DECISION_LABEL, ordinary!.artifactId]],
+      ["UPDATE OR REPLACE run_artifacts SET produced_by = ? WHERE artifact_id = ?", [OWNER_DECISION_LABEL, ordinary!.artifactId]],
+      ["UPDATE run_artifacts SET content_json = ? WHERE artifact_id = ?", [JSON.stringify({ ...decision!.content as object, item: ITEM_B }), decision!.artifactId]],
+      ["UPDATE run_artifacts SET candidate_snapshot_digest = ? WHERE artifact_id = ?", [OTHER_CANDIDATE, decision!.artifactId]],
+      ["UPDATE run_artifacts SET run_id = run_id, digest = ? WHERE artifact_id = ?", [digestOf("other"), decision!.artifactId]],
+      ["UPDATE run_artifacts SET produced_by = 'service' WHERE artifact_id = ?", [decision!.artifactId]],
+    ] as Array<[string, unknown[]]>) {
+      expect(refusedWith(sql, params), sql).toMatchObject(immutable);
+    }
+    // REPLACE onto the written decision's own row id is refused before it can delete it.
+    expect(refusedWith(
+      `INSERT OR REPLACE INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+       VALUES (?, ?, 'APPROVAL', ?, ?, '{}', 'service', ?)`,
+      [decision!.artifactId, w.runId, digestOf("replaced"), w.candidate, w.harness.clock.nowIso()],
+    )).toMatchObject({ reasonCode: ReasonCode.CONFLICT, evidence: { sqlite: "RUN_ARTIFACT_NO_REPLACE" } });
+    expect(approvalRows(w)).toEqual(before);
+    expect(w.harness.cp.artifacts.list(w.runId, "APPROVAL").find((artifact) => artifact.artifactId === decision!.artifactId))
+      .toEqual(decision);
+  });
+});
+
+describe("SEC-OD1 v47 capability scope: the marker is held for one statement of the formal path and never reused", () => {
+  it("ODSCOPE the formal path writes the canonical record; ordinary Db.run before, after and inside the same transaction is refused", async () => {
+    const w = await world([ITEM_A]);
+    expect(markerNow(w)).toBe(0);
+    const rows = approvalRows(w);
+    const writer = w.harness.cp.evidenceWritersForTests().PRODUCTION_READY_PACKET;
+    let inside: unknown = "not reached";
+    let threw: unknown;
+    try {
+      w.harness.cp.db.tx(() => {
+        w.harness.cp.artifacts.putOwnerDecision(writer, w.runId, decisionContent(w, true, "inside a transaction", { item: ITEM_B }), w.candidate);
+        inside = viaDbRun(w, forgedDecision(w, ITEM_B, "same transaction, after the capability write"), OWNER_DECISION_LABEL);
+        throw new Error("the transaction fails after the capability write");
+      });
+    } catch (error) {
+      threw = error;
+    }
+    expect(inside).toMatchObject(V47_REFUSAL);
+    expect(String(threw)).toMatch(/the transaction fails after the capability write/);
+    // The failed transaction kept nothing, and left no marker behind.
+    expect(approvalRows(w)).toEqual(rows);
+    expect(markerNow(w)).toBe(0);
+    expect(viaDbRun(w, forgedDecision(w, ITEM_B, "after a failed transaction"), OWNER_DECISION_LABEL)).toMatchObject(V47_REFUSAL);
+    // The formal path itself still writes, and leaves no marker behind either.
+    expect(w.harness.cp.artifacts.putOwnerDecision(writer, w.runId, decisionContent(w, true, "formal", { item: ITEM_B }), w.candidate).producedBy)
+      .toBe(OWNER_DECISION_LABEL);
+    expect(markerNow(w)).toBe(0);
+    expect(viaDbRun(w, forgedDecision(w, ITEM_B, "after a capability write"), OWNER_DECISION_LABEL)).toMatchObject(V47_REFUSAL);
+  });
+
+  it("ODSCOPE a capability write that throws inside its own statement leaves no marker; the next Db.run is refused", async () => {
+    const w = await world([ITEM_A]);
+    const writer = w.harness.cp.evidenceWritersForTests().PRODUCTION_READY_PACKET;
+    // The insert itself fails (no such run: a foreign-key refusal) while the marker is held.
+    expect(() => w.harness.cp.artifacts.putOwnerDecision(writer, "run_that_does_not_exist", decisionContent(w, true, "no run", { item: ITEM_B }), w.candidate))
+      .toThrowError();
+    expect(markerNow(w)).toBe(0);
+    const rows = approvalRows(w);
+    expect(viaDbRun(w, forgedDecision(w, ITEM_B, "after a failed capability write"), OWNER_DECISION_LABEL)).toMatchObject(V47_REFUSAL);
+    expect(approvalRows(w)).toEqual(rows);
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+  });
+});
+
+describe("SEC-OD1 v47: an exactly bound owner refusal blocks CONFIRM and the kernel publish with no GitHub write", () => {
+  const confirm = (w: World) => {
+    const ceo = w.harness.cp.bindings.active(roleKeyFor(Role.CEO));
+    if (!ceo) throw new Error("fixture CEO binding missing");
+    return w.harness.cp.ceo.submitCeoDecision({
+      runId: w.runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: w.candidate,
+      ceoSessionId: ceo.sessionId,
+      rationale: "confirm at CEO review",
+    });
+  };
+  const githubWrites = (w: World): number => w.github.calls.filter((call) => call.method !== "GET").length;
+
+  it("ODV47-REFUSAL control: with both items approved through the formal path, CONFIRM is allowed", async () => {
+    const w = await world([ITEM_A], { packetOnly: true });
+    decide(w, ITEM_B, true, "approved");
+    expect(outcome(confirm(w))).toBe("ALLOWED");
+  });
+
+  it("ODV47-REFUSAL the owner refuses an item and a Db.run forgery of its approval is refused: CONFIRM and gatePublish refuse, 0 GitHub writes", async () => {
+    const w = await world([ITEM_A], { packetOnly: true });
+    decide(w, ITEM_B, false, "refused, exactly bound");
+    expect(viaDbRun(w, forgedDecision(w, ITEM_B, "override attempt"), OWNER_DECISION_LABEL)).toMatchObject(V47_REFUSAL);
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+    expect(confirm(w)).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
+    expect((await w.harness.cp.github.gatePublish(w.payload, w.identity)).reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect({ writes: githubWrites(w), checks: w.github.checkRuns.length, merges: w.github.mergeCount })
+      .toEqual({ writes: 0, checks: 0, merges: 0 });
   });
 });

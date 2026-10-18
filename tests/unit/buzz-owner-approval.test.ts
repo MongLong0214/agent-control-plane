@@ -54,6 +54,7 @@ import {
 } from "../helpers/buzz-mention-relay.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { TEST_OWNER, dispatchBootstrapRun, ownerDecisionReceipt } from "../helpers/harness.ts";
+import { OWNER_DECISION_WRITE_DENIED, writeOutsideTheGuard } from "../helpers/released-v47-schema.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
@@ -2471,19 +2472,33 @@ describe("S10-R2-01: an anchored execution's approval admits only the candidate 
 
 /**
  * SEC-OD1-R1-02 — the owner's decisions as the code before SEC-OD1 recorded them: the same admission,
- * consumption and transaction, written through `put`, so with the "service" label every decision of
- * that era carries. Restored after `record`, so nothing else in the world is written this way.
+ * consumption and transaction, with the "service" label every decision of that era carries. Since v47
+ * `put` refuses that row at the database, so the record is captured in the transaction and, once it
+ * commits, written as it stands in a database upgraded from before v47: by a connection outside the
+ * guard (`writeOutsideTheGuard`, v47's stated Limit). Restored after `record`, so nothing else in the
+ * world is written this way.
  */
 const asBeforeSecOd1 = <T>(w: World, record: () => T): T => {
-  const store = w.prepared.harness.cp.artifacts;
+  const { harness } = w.prepared;
+  const store = harness.cp.artifacts;
   const canonical = store.putOwnerDecision;
-  store.putOwnerDecision = ((_writer, runId, content, candidate) =>
-    store.put(runId, "APPROVAL", content, candidate)) as typeof store.putOwnerDecision;
+  const captured: Array<{ runId: string; content: unknown; candidate: string }> = [];
+  store.putOwnerDecision = ((_writer: unknown, runId: string, content: unknown, candidate: string) => {
+    captured.push({ runId, content, candidate });
+    // What the caller is handed is never read: recordOwnerDecision ignores the stored artifact.
+    return undefined;
+  }) as unknown as typeof store.putOwnerDecision;
+  let recorded: T;
   try {
-    return record();
+    recorded = record();
   } finally {
     store.putOwnerDecision = canonical;
   }
+  for (const { runId, content, candidate } of captured) {
+    expect(() => store.put(runId, "APPROVAL", content, candidate)).toThrowError(OWNER_DECISION_WRITE_DENIED);
+    writeOutsideTheGuard(harness.cp.config.databasePath, runId, content, candidate, harness.clock.nowIso());
+  }
+  return recorded;
 };
 
 const ownerDecisionLabels = (w: World): Array<[unknown, unknown, string]> =>

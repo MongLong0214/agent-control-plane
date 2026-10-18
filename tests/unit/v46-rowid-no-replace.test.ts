@@ -374,9 +374,9 @@ describe("mutation checks: each v46 guard is load-bearing", () => {
 });
 
 describe("the v45 → v46 step", () => {
-  it("is the last step of the chain, from 45, and nothing else changed version", () => {
-    expect(SCHEMA_VERSION).toBe(46);
-    expect(MIGRATIONS.at(-1)).toMatchObject({ id: "v46-rowid-no-replace", fromVersion: 45, toVersion: 46 });
+  it("is the step from 45 to 46; the chain runs on past it when the current version is later (v47, SEC-OD1)", () => {
+    expect(MIGRATIONS.find((step) => step.id === "v46-rowid-no-replace")).toMatchObject({ fromVersion: 45, toVersion: 46 });
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(46);
   });
 
   it("M3: the v45 image is the v45 build's, and a fresh v46 install equals it migrated to v46, apart from receipts", () => {
@@ -415,7 +415,7 @@ describe("the v45 → v46 step", () => {
     approveMigration(path, "V46 B4 preservation witness");
     new Db(path).close();
     const after = contentDigests(path);
-    expect(after.userVersion).toBe(46);
+    expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsBefore, ...restBefore } = before.tables;
     const { schema_migrations: receiptsAfter, ...restAfter } = after.tables;
     expect(restAfter).toEqual(restBefore);
@@ -424,9 +424,11 @@ describe("the v45 → v46 step", () => {
     const raw = new Database(path, { readonly: true });
     try {
       const receipts = raw.prepare("SELECT version, migration_id FROM schema_migrations ORDER BY version").all();
+      // v47 (SEC-OD1) follows on the same approved chain and adds one trigger, no row.
       expect(receipts).toEqual([
         { version: 45, migration_id: "bootstrap-v45" },
         { version: 46, migration_id: "v46-rowid-no-replace" },
+        { version: 47, migration_id: "v47-owner-decision-authority-guard" },
       ]);
     } finally {
       raw.close();
@@ -469,7 +471,11 @@ describe("the v45 → v46 step", () => {
     expect(digestOfSchemaRows(schemaRowsOf(path))).toBe(V44_SCHEMA_DIGEST_FROM_V43);
     const inode = statSync(path).ino;
     const approved = approveMigration(path, "V46 D5-b witness");
-    expect(approved).toMatchObject({ fromVersion: 44, toVersion: 46, migrations: ["v45-first-manifest-activation", "v46-rowid-no-replace"] });
+    expect(approved).toMatchObject({
+      fromVersion: 44,
+      toVersion: SCHEMA_VERSION,
+      migrations: ["v45-first-manifest-activation", "v46-rowid-no-replace", "v47-owner-decision-authority-guard"],
+    });
     const databaseModule = new URL("../../src/db/database.ts", import.meta.url).href;
     const child = boundedSpawnSync(
       process.execPath,
@@ -500,9 +506,13 @@ describe("the v45 → v46 step", () => {
     expect(statSync(path).ino).toBe(inode);
     expect(contentDigests(path).userVersion).toBe(45);
 
-    expect(approveMigration(path, "V46 D5-b re-approval")).toMatchObject({ fromVersion: 45, toVersion: 46, migrations: ["v46-rowid-no-replace"] });
+    expect(approveMigration(path, "V46 D5-b re-approval")).toMatchObject({
+      fromVersion: 45,
+      toVersion: SCHEMA_VERSION,
+      migrations: ["v46-rowid-no-replace", "v47-owner-decision-authority-guard"],
+    });
     new Db(path).close();
-    expect(contentDigests(path).userVersion).toBe(46);
+    expect(contentDigests(path).userVersion).toBe(SCHEMA_VERSION);
     expect(existsSync(migrationApprovalPath(path))).toBe(false);
   });
 

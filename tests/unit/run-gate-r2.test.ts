@@ -21,6 +21,7 @@ import type { VerificationReport } from "../../src/verify/verification-engine.ts
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
 import {
+  type Harness,
   TEST_OWNER,
   bindCeo,
   bindWorker,
@@ -29,6 +30,7 @@ import {
   registerFixtureProject,
 } from "../helpers/harness.ts";
 import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
+import { OWNER_DECISION_WRITE_DENIED, writeOutsideTheGuard } from "../helpers/released-v47-schema.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -206,6 +208,16 @@ const ownerDecisionReceipt = (
   }, approval);
   if (!receipt.allowed) throw new Error(receipt.message);
   return receipt.value;
+};
+
+/**
+ * v47 (SEC-OD1): `put` refuses an OWNER_DECISION-shaped APPROVAL at the database. Each such row below
+ * is then written outside the guard (`writeOutsideTheGuard`, v47's stated Limit, as every row recorded
+ * before v47 stands), so the gate's own checks still face it.
+ */
+const putOutsideTheGuard = (harness: Harness, runId: string, content: Record<string, unknown>, candidate: string | null) => {
+  expect(() => harness.cp.artifacts.put(runId, ArtifactKind.APPROVAL, content, candidate)).toThrowError(OWNER_DECISION_WRITE_DENIED);
+  return writeOutsideTheGuard(harness.cp.config.databasePath, runId, content, candidate, harness.clock.nowIso());
 };
 
 describe("round-2 run and production-gate regressions", () => {
@@ -428,7 +440,7 @@ describe("round-2 run and production-gate regressions", () => {
     expect(fixture.harness.cp.artifacts.list(fixture.runId, ArtifactKind.APPROVAL)).toHaveLength(0);
 
     // A row from before this hardening must not remain usable once a candidate is promoted.
-    const legacy = fixture.harness.cp.artifacts.put(fixture.runId, ArtifactKind.APPROVAL, {
+    const legacy = putOutsideTheGuard(fixture.harness, fixture.runId, {
       kind: "OWNER_DECISION",
       item: "public release",
       approved: true,
@@ -436,13 +448,13 @@ describe("round-2 run and production-gate regressions", () => {
       at: fixture.harness.clock.nowIso(),
       humanGateDigest: digestOf(["public release"]),
       candidateSnapshotDigest: null,
-    });
+    }, null);
     const frozen = await fixture.harness.cp.pipeline.freeze(fixture.runId);
     if (!frozen.allowed) throw new Error(frozen.message);
 
     expect(fixture.harness.cp.artifacts.list(fixture.runId, ArtifactKind.APPROVAL)
       .find((artifact) => artifact.artifactId === legacy.artifactId)?.superseded).toBe(true);
-    const lateLegacy = fixture.harness.cp.artifacts.put(fixture.runId, ArtifactKind.APPROVAL, {
+    const lateLegacy = putOutsideTheGuard(fixture.harness, fixture.runId, {
       kind: "OWNER_DECISION",
       item: "public release",
       approved: true,
@@ -450,7 +462,7 @@ describe("round-2 run and production-gate regressions", () => {
       at: fixture.harness.clock.nowIso(),
       humanGateDigest: digestOf(["public release"]),
       candidateSnapshotDigest: null,
-    });
+    }, null);
     expect(lateLegacy.superseded).toBe(false);
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({
       required: true,
@@ -574,7 +586,7 @@ describe("round-2 run and production-gate regressions", () => {
 
   it("#381 ignores owner-decision-shaped rows without an admitted, parameter-bound receipt", async () => {
     const absent = await evidenceReadyRun(["public release"]);
-    absent.harness.cp.artifacts.put(absent.runId, ArtifactKind.APPROVAL, {
+    putOutsideTheGuard(absent.harness, absent.runId, {
       kind: "OWNER_DECISION",
       item: "public release",
       approved: true,
@@ -593,7 +605,7 @@ describe("round-2 run and production-gate regressions", () => {
       true,
       "the real decision",
     );
-    notAdmitted.harness.cp.artifacts.put(notAdmitted.runId, ArtifactKind.APPROVAL, {
+    putOutsideTheGuard(notAdmitted.harness, notAdmitted.runId, {
       kind: "OWNER_DECISION",
       item: "public release",
       approved: true,
@@ -613,7 +625,7 @@ describe("round-2 run and production-gate regressions", () => {
       true,
       "the actual approved note",
     );
-    mismatched.harness.cp.artifacts.put(mismatched.runId, ArtifactKind.APPROVAL, {
+    putOutsideTheGuard(mismatched.harness, mismatched.runId, {
       kind: "OWNER_DECISION",
       item: "public release",
       approved: true,
@@ -633,7 +645,7 @@ describe("round-2 run and production-gate regressions", () => {
 
     // This is an exact receipt from admitted ingress, but it bypasses recordOwnerDecision(),
     // so no authorising write has consumed it for the candidate.
-    fixture.harness.cp.artifacts.put(fixture.runId, ArtifactKind.APPROVAL, {
+    putOutsideTheGuard(fixture.harness, fixture.runId, {
       kind: "OWNER_DECISION",
       item: "public release",
       approved: true,

@@ -1108,6 +1108,7 @@ describe("baseline boundary contracts", () => {
       "v44-manifest-activation-grant",
       "v45-first-manifest-activation",
       "v46-rowid-no-replace",
+      "v47-owner-decision-authority-guard",
     ]);
   });
 

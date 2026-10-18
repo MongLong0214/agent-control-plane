@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { chmodSync, readFileSync } from "node:fs";
 
 import { installMigrationLedger } from "../../src/db/migrations.ts";
+import { dropV47Triggers } from "./released-v47-schema.ts";
 
 /**
  * #1094 (v46) — fixtures for the v45 → v46 step.
@@ -39,10 +40,14 @@ export const dropV46Triggers = (raw: Database.Database): void => {
   raw.exec(V46_ADDED_TRIGGERS.map((name) => `DROP TRIGGER IF EXISTS ${name};`).join("\n"));
 };
 
-/** Turns the database at `path`, written at v46, into a v45 image in place. Not approved. */
+/**
+ * Turns the database at `path`, written at v46 or later, into a v45 image in place: what v47 adds
+ * (SEC-OD1) is taken back as well. Not approved.
+ */
 export const toV45Image = (path: string): string => {
   const legacy = new Database(path);
   try {
+    dropV47Triggers(legacy);
     dropV46Triggers(legacy);
     legacy.exec(`
       DROP TRIGGER schema_migrations_no_delete;

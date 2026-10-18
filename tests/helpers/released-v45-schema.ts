@@ -5,6 +5,7 @@ import { chmodSync, readFileSync } from "node:fs";
 import { installMigrationLedger } from "../../src/db/migrations.ts";
 import { V45_ADDED_TRIGGERS } from "./released-v44-schema.ts";
 import { dropV46Triggers } from "./released-v46-schema.ts";
+import { dropV47Triggers } from "./released-v47-schema.ts";
 
 /**
  * #512 (v45) — fixtures for the v44 → v45 step.
@@ -28,11 +29,13 @@ export const v44TriggerBody = (name: string): string => {
 
 /**
  * Turns the database at `path`, written at v45 or later, into a v44 image in place: what v46 adds
- * (#1094) is taken back first, so the image carries nothing a later version installs. Not approved.
+ * (#1094) and v47 adds (SEC-OD1) is taken back first, so the image carries nothing a later version
+ * installs. Not approved.
  */
 export const toV44Image = (path: string): string => {
   const legacy = new Database(path);
   try {
+    dropV47Triggers(legacy);
     dropV46Triggers(legacy);
     legacy.exec(V45_ADDED_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n"));
     legacy.exec("DROP INDEX manifest_first_activation_grants_one_consumed_per_project");

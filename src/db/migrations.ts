@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 46;
+export const SCHEMA_VERSION = 47;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -154,8 +154,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   // v43 alone creates the bootstrap application record and its guards (#246 C3).
   /-- -{75}\n-- bootstrap_applications[\s\S]*?CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_delete[\s\S]*?\nEND;/,
   // v44 alone creates the manifest activation grant, its guards, and the two guards over projects and
-  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512); v46 alone, the rowid guards (#1094).
-  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/, /-- -{75}\n-- rowid no-replace guards[\s\S]*?CREATE TRIGGER IF NOT EXISTS canonical_turns_rowid_positive[\s\S]*?\nEND;/,
+  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512); v46 alone, the rowid guards (#1094); v47 alone, the owner-decision guard (SEC-OD1).
+  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/, /-- -{75}\n-- rowid no-replace guards[\s\S]*?CREATE TRIGGER IF NOT EXISTS canonical_turns_rowid_positive[\s\S]*?\nEND;/, /-- CP-HI-06 — SEC-OD1 \(v47\): an owner decision[\s\S]*?CREATE TRIGGER IF NOT EXISTS run_artifacts_owner_decision_authority_guard[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -3587,6 +3587,49 @@ const v46: SchemaMigration = {
   checksum: () => migrationChecksum("v46-rowid-no-replace", 46),
 };
 
+/** v47's guard, read from schema.sql by name (SEC-OD1). */
+export const V47_OWNER_DECISION_TRIGGER_NAMES: readonly string[] = [
+  "run_artifacts_owner_decision_authority_guard",
+];
+
+/**
+ * SEC-OD1 (CEO 1b1f1b7f, aa6ac374). An APPROVAL carrying the canonical owner-decision label, or
+ * OWNER_DECISION content, could be inserted by an ordinary in-process `Db.run`: the label was the
+ * only thing the gate readers trusted, and nothing in the database refused it. v47 adds one BEFORE
+ * INSERT trigger on `run_artifacts` that refuses such a row unless the connection-local evidence
+ * marker returns exactly 1, which only `Db.insertEvidenceArtifact` (through `putOwnerDecision`'s
+ * capability) sets, for one statement. `INSERT OR REPLACE` fires it as well; an UPDATE into that shape,
+ * or of a written decision's content or bindings, stays refused by `run_artifacts_content_immutable`.
+ *
+ * Additive only: one trigger, no existing body changed, no row touched. Rows written before v47,
+ * including OWNER_DECISION rows labelled "service", stay exactly as they are; the readers decide what
+ * they count.
+ *
+ * Its name is checked as v45 and v46 check theirs (`assertStepNames`): before the step, whatever holds
+ * it, in any letter case, must be absent or the trigger schema.sql defines, of that type, on
+ * `run_artifacts`, token for token; anything else refuses the step and nothing is dropped or replaced.
+ * `CREATE TRIGGER IF NOT EXISTS` then adds it only where the name is free, so a repeated application
+ * changes nothing. The name is checked again after.
+ *
+ * Limit: a connection that defines `acp_evidence_write_authorized` itself, to return 1, passes this
+ * guard (CEO 52c3b1e6 (b)); it is a boundary against ACP's own `Db.run`, not against every raw writer.
+ *
+ * A live database at v46 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v47: SchemaMigration = {
+  id: "v47-owner-decision-authority-guard",
+  fromVersion: 46,
+  toVersion: 47,
+  apply: (raw) => {
+    const objects = stepTriggerObjects(47, V47_OWNER_DECISION_TRIGGER_NAMES);
+    assertStepNames(raw, 47, objects, "before");
+    raw.exec(triggerDdlFor(V47_OWNER_DECISION_TRIGGER_NAMES, 47));
+    assertStepNames(raw, 47, objects, "after");
+  },
+  checksum: () => migrationChecksum("v47-owner-decision-authority-guard", 47),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -3623,6 +3666,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v44,
   v45,
   v46,
+  v47,
 ]);
 
 interface RequiredTrigger {
@@ -3823,6 +3867,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "canonical_turns_no_rowid_replace", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
   { name: "canonical_turns_rowid_immutable", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
   { name: "canonical_turns_rowid_positive", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
+  { name: "run_artifacts_owner_decision_authority_guard", sentinel: "OWNER_DECISION_WRITE_AUTHORITY_DENIED", introducedIn: 47 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
