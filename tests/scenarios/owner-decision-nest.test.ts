@@ -106,14 +106,24 @@ const world = async (approve: readonly string[], packetOnly = false): Promise<Wo
     await approveReviewedCandidateForFinalization(harness, driven, { bypassCeoConfirmation: !ITEMS.every((item) => approve.includes(item)) });
   }
   installDaemonFinalizerGitHubFixture(harness);
+  // FIX-FINALIZER-DIGEST: the payload names the human-gate binding, as the daemon finalizer does. A world
+  // satisfied when built names that binding, fixed then; any other world names, when read, the binding the
+  // gate gives then, or the old definition digest while the gate has none.
+  const built = harness.cp.ceo.currentHumanGateDecisionDigest(driven.runId);
+  const named = (): string => {
+    const now = built.allowed ? built : harness.cp.ceo.currentHumanGateDecisionDigest(driven.runId);
+    return now.allowed ? now.value : digestOf(ITEMS);
+  };
   return {
     harness, github, runId: driven.runId, identity: driven.identity,
     caller: { ownerSessionId: driven.ownerSessionId, ownerBindingGeneration: driven.ownerBindingGeneration },
     head: driven.candidateHead, base: driven.baseHead, workBranch: driven.workBranch, candidate: driven.candidateSnapshotDigest,
-    payload: {
-      runId: driven.runId, candidateSnapshotDigest: driven.candidateSnapshotDigest, contractDigest: driven.contractDigest,
-      verificationDigest: driven.verificationDigest, blindReviewDigest: driven.blindReviewDigest, humanGateDigest: digestOf(ITEMS),
-      bindingGeneration: driven.ownerBindingGeneration, exactHead: driven.candidateHead, timestamp: "2026-08-12T00:00:00.000Z",
+    get payload(): GatePayload {
+      return {
+        runId: driven.runId, candidateSnapshotDigest: driven.candidateSnapshotDigest, contractDigest: driven.contractDigest,
+        verificationDigest: driven.verificationDigest, blindReviewDigest: driven.blindReviewDigest, humanGateDigest: named(),
+        bindingGeneration: driven.ownerBindingGeneration, exactHead: driven.candidateHead, timestamp: "2026-08-12T00:00:00.000Z",
+      };
     },
   };
 };
