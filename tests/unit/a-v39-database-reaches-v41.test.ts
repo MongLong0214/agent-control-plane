@@ -7,8 +7,8 @@ import { afterAll, describe, expect, it } from "vitest";
 import { isAcpError } from "../../src/core/errors.ts";
 import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
-import { installMigrationLedger } from "../../src/db/migrations.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { carryRows, laterObjectsIn, releasedChainImage } from "../helpers/released-chain-image.ts";
 import { fileCore, seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 /**
@@ -16,9 +16,10 @@ import { fileCore, seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
  * through both steps in order, keeping every row; and a v41 step that fails closed restores the whole
  * v39 file, v40's work included.
  *
- * The image is built the way #1068's and PR-B's own fixtures build theirs: written at the current
- * version with real rows, then taken back by removing exactly what v40 and v41 add. v40's record
- * tables are WITHOUT ROWID, so rows are compared as sorted sets, never by rowid.
+ * The image is the released chain's own v39 (V46-R1-02): the v11 fixture run through v12..v39 and
+ * stopped there, holding real rows written by this build and carried into the v39 tables and columns.
+ * Taking a current database back left v42–v45's tables in it. v40's record tables are WITHOUT ROWID,
+ * so rows are compared as sorted sets, never by rowid.
  */
 
 afterAll(cleanupTempDirs);
@@ -91,26 +92,31 @@ const names = (raw: Database.Database, type: "table" | "trigger"): string[] =>
   (raw.prepare(`SELECT name FROM sqlite_master WHERE type = ? ORDER BY name`).all(type) as { name: string }[])
     .map((row) => row.name);
 
-/** Every row of every table as a sorted set; task_executions without v41's columns. */
-const dump = (raw: Database.Database, except: readonly string[]): Record<string, string[]> =>
+/** Each table's columns, in order. */
+type Shape = Record<string, string[]>;
+const shapeOf = (raw: Database.Database): Shape =>
+  Object.fromEntries(names(raw, "table").filter((name) => !name.startsWith("sqlite_"))
+    .map((name) => [name, raw.prepare(`SELECT name FROM pragma_table_info(?)`).pluck().all(name) as string[]]));
+
+/**
+ * Every row of every table as a sorted set. Given the v39 image's shape, only its tables and columns:
+ * what v40 and every later step add (tables, and columns such as v41's and v42's) is not compared.
+ */
+const dump = (raw: Database.Database, except: readonly string[], shape?: Shape): Record<string, string[]> =>
   Object.fromEntries(
     names(raw, "table")
-      .filter((name) => !except.includes(name) && !name.startsWith("sqlite_"))
+      .filter((name) => !except.includes(name) && !name.startsWith("sqlite_") && (shape === undefined || name in shape))
       .map((name) => {
-        const rows = raw.prepare(`SELECT * FROM "${name}"`).all() as Record<string, unknown>[];
-        return [name, rows.map((row) => {
-          const kept = name === "task_executions"
-            ? Object.fromEntries(Object.entries(row).filter(([column]) => !V41_COLUMNS.includes(column)))
-            : row;
-          return JSON.stringify(kept);
-        }).sort()];
+        const columns = shape?.[name]?.map((column) => `"${column}"`).join(", ") ?? "*";
+        const rows = raw.prepare(`SELECT ${columns} FROM "${name}"`).all() as Record<string, unknown>[];
+        return [name, rows.map((row) => JSON.stringify(row)).sort()];
       }),
   );
 
-/** Written at the current version with real rows, then taken back to v39. */
-const v39Image = (seed?: (raw: Database.Database) => void): { path: string; before: Record<string, string[]>; execution: string } => {
-  const path = statePath();
-  const world = seedWorkerWorld(fileCore(path));
+/** The released chain's v39, holding rows this build wrote at the current version. */
+const v39Image = (seed?: (raw: Database.Database) => void): { path: string; before: Record<string, string[]>; shape: Shape; execution: string } => {
+  const source = statePath();
+  const world = seedWorkerWorld(fileCore(source));
   // A CTO-receipted execution, so task_executions holds a row v41's columns must be added beside.
   const started = world.tasks.startExecution({
     runId: world.runId, taskId: world.taskId, ownerBindingGeneration: world.cto.generation,
@@ -127,29 +133,19 @@ const v39Image = (seed?: (raw: Database.Database) => void): { path: string; befo
   );
   world.db.close();
 
+  const path = releasedChainImage(statePath(), 39);
+  carryRows(source, path);
+  // The historical schema first: nothing of v40 or any later version is in the image.
+  expect(laterObjectsIn(path, 39)).toEqual([]);
   const legacy = new Database(path);
   try {
-    legacy.exec([...V41_TRIGGERS, ...V40_TRIGGERS].map((name) => `DROP TRIGGER ${name};`).join("\n"));
-    for (const column of V41_COLUMNS) legacy.exec(`ALTER TABLE task_executions DROP COLUMN ${column}`);
-    legacy.exec(`DROP INDEX peer_message_carries_by_successor; DROP INDEX peer_message_refusal_notices_by_role;`);
-    for (const table of V40_TABLES) legacy.exec(`DROP TABLE ${table}`);
     seed?.(legacy);
-    legacy.exec(`
-      DROP TRIGGER schema_migrations_no_delete;
-      DROP TRIGGER schema_migrations_insert_authority;
-      DELETE FROM schema_migrations WHERE version > 39;
-      INSERT INTO schema_migrations (version, migration_id, checksum, applied_at)
-        VALUES (39, 'bootstrap-v39', 'sha256:${"0".repeat(64)}', '${NOW}');
-      PRAGMA user_version = 39;
-    `);
-    installMigrationLedger(legacy);
-    // Nothing of v40's or v41's is left in the image.
     expect(names(legacy, "trigger").filter((name) => [...V40_TRIGGERS, ...V41_TRIGGERS].includes(name))).toEqual([]);
     expect(names(legacy, "table").filter((name) => V40_TABLES.includes(name))).toEqual([]);
     const columns = (legacy.prepare(`SELECT name FROM pragma_table_info('task_executions')`).all() as { name: string }[])
       .map((row) => row.name);
     expect(columns.filter((name) => V41_COLUMNS.includes(name))).toEqual([]);
-    return { path, before: dump(legacy, ["schema_migrations"]), execution: started.value.executionId };
+    return { path, before: dump(legacy, ["schema_migrations"]), shape: shapeOf(legacy), execution: started.value.executionId };
   } finally {
     legacy.close();
   }
@@ -157,7 +153,7 @@ const v39Image = (seed?: (raw: Database.Database) => void): { path: string; befo
 
 describe("integration of v40 (#1068) and v41 (#512 PR-B) from a v39 database", () => {
   it("names every trigger the registry records for v40 and v41", () => {
-    // The lists above are what the image removes; a guard added to either version later must be here too.
+    // The lists above are what the image must not hold; a guard added to either version later must be here too.
     const source = readFileSync(fileURLToPath(new URL("../../src/db/migrations.ts", import.meta.url)), "utf8");
     const introducedIn = (version: number): string[] =>
       [...source.matchAll(new RegExp(`\\{ name: "([a-z_]+)", sentinel: [^}]*introducedIn: ${version} \\}`, "g"))]
@@ -168,23 +164,24 @@ describe("integration of v40 (#1068) and v41 (#512 PR-B) from a v39 database", (
   });
 
   it("migrates v39 through v40 to v41, keeping every row, with both steps' objects installed and guarding", () => {
-    const { path, before, execution } = v39Image();
+    const { path, before, shape, execution } = v39Image();
     approveMigration(path, "v39 to v41 integration fixture");
     const migrated = openDb(path);
     try {
-      // #246 C1b adds v42, C3 v43, B2-b v44 and #512 v45 on top; this row is about v40 and v41, which the chain still runs in order.
-      expect(SCHEMA_VERSION).toBe(45);
+      // #246 C1b adds v42, C3 v43, B2-b v44, #512 v45 and #1094 v46 on top; this row is about v40 and v41, which the chain still runs in order.
+      expect(SCHEMA_VERSION).toBe(46);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 39 ORDER BY version`,
       )).toEqual([
-        { version: 39, migration_id: "bootstrap-v39" },
+        { version: 39, migration_id: "v39-owner-reply-intent-keeps-its-key" },
         { version: 40, migration_id: "v40-peer-message-carry-record" },
         { version: 41, migration_id: "v41-runtime-managed-worker-turns" },
         { version: 42, migration_id: "v42-session-credential-epoch" },
         { version: 43, migration_id: "v43-bootstrap-application-record" },
         { version: 44, migration_id: "v44-manifest-activation-grant" },
         { version: 45, migration_id: "v45-first-manifest-activation" },
+        { version: 46, migration_id: "v46-rowid-no-replace" },
       ]);
       const triggers = migrated.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'trigger'`).map((row) => row.name);
       for (const name of [...V40_TRIGGERS, ...V41_TRIGGERS]) expect(triggers, name).toContain(name);
@@ -207,7 +204,7 @@ describe("integration of v40 (#1068) and v41 (#512 PR-B) from a v39 database", (
     }
     const after = new Database(path, { readonly: true });
     try {
-      expect(dump(after, ["schema_migrations", ...V40_TABLES])).toEqual(before);
+      expect(dump(after, ["schema_migrations"], shape)).toEqual(before);
     } finally {
       after.close();
     }

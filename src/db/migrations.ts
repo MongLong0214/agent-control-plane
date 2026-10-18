@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 45;
+export const SCHEMA_VERSION = 46;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -152,8 +152,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   // v43 alone creates the bootstrap application record and its guards (#246 C3).
   /-- -{75}\n-- bootstrap_applications[\s\S]*?CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_delete[\s\S]*?\nEND;/,
   // v44 alone creates the manifest activation grant, its guards, and the two guards over projects and
-  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512).
-  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/,
+  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512); v46 alone, the rowid guards (#1094).
+  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/, /-- -{75}\n-- rowid no-replace guards[\s\S]*?CREATE TRIGGER IF NOT EXISTS canonical_turns_rowid_positive[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -3243,16 +3243,16 @@ const V45_FIRST_ACTIVATION_TRIGGER_NAMES: readonly string[] = [
   "runs_contract_change_completes_activated",
 ];
 
-/** One object a v45 `IF NOT EXISTS` statement creates, and what may hold its name. */
-interface V45Object {
+/** One object a step's `IF NOT EXISTS` statements create (v45, v46), and what may hold its name. */
+interface StepObject {
   readonly type: "table" | "index" | "trigger";
   readonly name: string;
   /** The table it is on; a table's is its own name. */
   readonly table: string;
-  /** schema.sql's definition at v45, the only one the name may hold after the step. */
+  /** schema.sql's definition at the step's version, the only one the name may hold after the step. */
   readonly ddl: string;
-  /** For a guard v44 defined and v45 replaces, v44's definition, which the name may still hold before the step. */
-  readonly v44Ddl?: string;
+  /** For a guard an earlier version defined and the step replaces (v44's, at v45), that definition, which the name may still hold before the step. */
+  readonly priorDdl?: string;
 }
 
 /**
@@ -3302,7 +3302,7 @@ const quotedRegionEnd = (sql: string, from: number, quote: string): number | und
  * table whose CHECK read `LIKE 'sha"256:%'` and a guard whose error literal had changed, and the
  * second was then dropped and recreated.
  */
-const normaliseV45Sql = (sql: string): string | undefined => {
+const normaliseStepSql = (sql: string): string | undefined => {
   const tokens: string[] = [];
   const separate = (): void => {
     if (tokens.length > 0 && tokens[tokens.length - 1] !== " ") tokens.push(" ");
@@ -3357,22 +3357,43 @@ const normaliseV45Sql = (sql: string): string | undefined => {
   return JSON.stringify(tokens);
 };
 
-/** A schema.sql definition `normaliseV45Sql` cannot classify: schema.sql has drifted from what v45 reads. */
-const v45SchemaUnreadable = (ddl: string): never => {
-  throw acpError(ReasonCode.INTERNAL_ERROR, "a v45 object in schema.sql cannot be classified", { ddl: ddl.slice(0, 120) });
+/** A schema.sql definition `normaliseStepSql` cannot classify: schema.sql has drifted from what the step reads. */
+const stepSchemaUnreadable = (version: number, ddl: string): never => {
+  throw acpError(ReasonCode.INTERNAL_ERROR, `a v${version} object in schema.sql cannot be classified`, { ddl: ddl.slice(0, 120) });
 };
 
 /** The table a schema.sql definition is on, read from the definition itself. */
-const v45OwnerOf = (ddl: string, pattern: RegExp): string => {
+const stepOwnerOf = (version: number, ddl: string, pattern: RegExp): string => {
   const owner = pattern.exec(ddl)?.[1];
   if (owner === undefined) {
-    throw acpError(ReasonCode.INTERNAL_ERROR, "a v45 object in schema.sql names no table", { ddl: ddl.slice(0, 120) });
+    throw acpError(ReasonCode.INTERNAL_ERROR, `a v${version} object in schema.sql names no table`, { ddl: ddl.slice(0, 120) });
   }
   return owner;
 };
 
+/**
+ * Each named guard as schema.sql defines it at `version`, on the table its definition names; a guard
+ * in `prior.names`, which an earlier version defined and the step replaces, also carries its definition
+ * at `prior.version`.
+ */
+const stepTriggerObjects = (
+  version: number,
+  names: readonly string[],
+  prior?: { readonly version: number; readonly names: readonly string[] },
+): StepObject[] =>
+  names.map((name): StepObject => {
+    const ddl = triggerDdlFor([name], version);
+    return {
+      type: "trigger",
+      name,
+      table: stepOwnerOf(version, ddl, /^(?:BEFORE|AFTER|INSTEAD OF)\b[^\n]*?\bON (\w+)\s*$/m),
+      ddl,
+      ...(prior !== undefined && prior.names.includes(name) ? { priorDdl: triggerDdlFor([name], prior.version) } : {}),
+    };
+  });
+
 /** The first-grant table, its index and the ten guards, each read from schema.sql by name. */
-const v45Objects = (): readonly V45Object[] => {
+const v45Objects = (): readonly StepObject[] => {
   const table = schemaObject(
     /CREATE TABLE IF NOT EXISTS manifest_first_activation_grants \([\s\S]*?\n\) WITHOUT ROWID;/,
     "the manifest_first_activation_grants table",
@@ -3388,48 +3409,39 @@ const v45Objects = (): readonly V45Object[] => {
     {
       type: "index",
       name: "manifest_first_activation_grants_one_consumed_per_project",
-      table: v45OwnerOf(index, /\bON (\w+)\s*\(/),
+      table: stepOwnerOf(45, index, /\bON (\w+)\s*\(/),
       ddl: index,
     },
-    ...V45_FIRST_ACTIVATION_TRIGGER_NAMES.map((name): V45Object => {
-      const ddl = triggerDdlFor([name], 45);
-      return {
-        type: "trigger",
-        name,
-        table: v45OwnerOf(ddl, /^(?:BEFORE|AFTER|INSTEAD OF)\b[^\n]*?\bON (\w+)\s*$/m),
-        ddl,
-        ...(V44_MANIFEST_ACTIVATION_TRIGGER_NAMES.includes(name) ? { v44Ddl: triggerDdlFor([name], 44) } : {}),
-      };
-    }),
+    ...stepTriggerObjects(45, V45_FIRST_ACTIVATION_TRIGGER_NAMES, { version: 44, names: V44_MANIFEST_ACTIVATION_TRIGGER_NAMES }),
   ];
 };
 
 /**
- * V45-R1-01. Whatever holds each v45 name — of any type, on any table, in any letter case, since SQLite
- * compares names case-insensitively — must be the object schema.sql defines under it: its type, its
- * table and its definition. `IF NOT EXISTS` is a no-op when anything holds the name, and `DROP TRIGGER IF
- * EXISTS` removes whatever trigger does, so neither statement shows that the object it names was
- * installed. Measured at dce20a42: an index of the unique index's name on `projects` let the step commit
+ * V45-R1-01, V46-R1-01. Whatever holds each name a step takes (v45, v46) — of any type, on any table, in
+ * any letter case, since SQLite compares names case-insensitively — must be the object schema.sql
+ * defines under it: its type, its table and its definition. `IF NOT EXISTS` is a no-op when anything
+ * holds the name, and `DROP TRIGGER IF EXISTS` removes whatever trigger does, so neither statement shows
+ * that the object it names was installed. Measured at dce20a42: an index of the unique index's name on `projects` let the step commit
  * with no partial unique index on the grant table, and two first grants were then consumed for one NULL
- * project. Before the step a name may be free, and a guard v45 replaces may still hold v44's body; after
- * it every name is held, by v45's definition alone.
+ * project. Before the step a name may be free, and a guard the step replaces may still hold its earlier
+ * body (v44's, at v45); after it every name is held, by the step's definition alone.
  */
-const assertV45Names = (raw: Database.Database, objects: readonly V45Object[], when: "before" | "after"): void => {
+const assertStepNames = (raw: Database.Database, version: number, objects: readonly StepObject[], when: "before" | "after"): void => {
   for (const object of objects) {
     const holders = raw
       .prepare("SELECT type, name, tbl_name AS tbl, sql FROM sqlite_master WHERE name = ? COLLATE NOCASE")
       .all(object.name) as Array<{ type: string; name: string; tbl: string; sql: string | null }>;
     if (when === "after" && holders.length === 0) {
-      throw new Error(`v45 refuses: ${object.name} is not held by the ${object.type} schema.sql defines on ${object.table} after the step`);
+      throw new Error(`v${version} refuses: ${object.name} is not held by the ${object.type} schema.sql defines on ${object.table} after the step`);
     }
-    const accepted = [object.ddl, ...(when === "before" && object.v44Ddl !== undefined ? [object.v44Ddl] : [])]
-      .map((ddl) => normaliseV45Sql(ddl) ?? v45SchemaUnreadable(ddl));
+    const accepted = [object.ddl, ...(when === "before" && object.priorDdl !== undefined ? [object.priorDdl] : [])]
+      .map((ddl) => normaliseStepSql(ddl) ?? stepSchemaUnreadable(version, ddl));
     for (const holder of holders) {
-      const held = holder.sql === null ? undefined : normaliseV45Sql(holder.sql);
+      const held = holder.sql === null ? undefined : normaliseStepSql(holder.sql);
       if (holder.type !== object.type || holder.name !== object.name || holder.tbl !== object.table
           || held === undefined || !accepted.includes(held)) {
         throw new Error(
-          `v45 refuses: ${object.name} is held by the ${holder.type} ${holder.name} on ${holder.tbl}, which is not the ${object.type} schema.sql defines on ${object.table}`,
+          `v${version} refuses: ${object.name} is held by the ${holder.type} ${holder.name} on ${holder.tbl}, which is not the ${object.type} schema.sql defines on ${object.table}`,
         );
       }
     }
@@ -3441,7 +3453,7 @@ const assertV45Names = (raw: Database.Database, objects: readonly V45Object[], w
  * seven guards, beside the automatic indexes of its own constraints — so a pre-existing table of the
  * exact shape cannot bring an index or a guard of its own into v45.
  */
-const assertV45TableCarries = (raw: Database.Database, objects: readonly V45Object[]): void => {
+const assertV45TableCarries = (raw: Database.Database, objects: readonly StepObject[]): void => {
   const table = objects.find((object) => object.type === "table")!.name;
   const carried = (raw
     .prepare("SELECT type, name FROM sqlite_master WHERE tbl_name = ? COLLATE NOCASE AND type <> 'table' AND NOT (type = 'index' AND sql IS NULL)")
@@ -3477,10 +3489,10 @@ const assertV45TableCarries = (raw: Database.Database, objects: readonly V45Obje
  * repaired, as v44 does. The triggers are dropped and recreated, once every name has been checked.
  *
  * V45-R1-01: every name the step's `IF NOT EXISTS` statements take is checked before the step, whether
- * or not the table exists, and again after it (`assertV45Names`), and the table must then carry exactly
+ * or not the table exists, and again after it (`assertStepNames`), and the table must then carry exactly
  * the objects schema.sql puts on it. A conflict refuses the step; nothing is dropped to make room.
  * ROUND1-ESCAPE-01: definitions compare token by token with every literal byte for byte
- * (`normaliseV45Sql`), and one that cannot be classified is a conflict.
+ * (`normaliseStepSql`), and one that cannot be classified is a conflict.
  *
  * A live database at v44 reaches this step only through an approved migration
  * (`assertMigrationApproved`), as it does every step.
@@ -3493,7 +3505,7 @@ const v45: SchemaMigration = {
     const objects = v45Objects();
     const table = objects.find((object) => object.type === "table")!;
     const index = objects.find((object) => object.type === "index")!;
-    assertV45Names(raw, objects, "before");
+    assertStepNames(raw, 45, objects, "before");
     const tableExists = raw.prepare("SELECT 1 FROM sqlite_master WHERE name = ? COLLATE NOCASE").get(table.name) !== undefined;
     if (tableExists && raw.prepare("SELECT 1 FROM manifest_first_activation_grants LIMIT 1").get()) {
       throw new Error("v45 pre-existing manifest_first_activation_grants table is populated");
@@ -3502,10 +3514,75 @@ const v45: SchemaMigration = {
     raw.exec(index.ddl);
     raw.exec(dropsFor(V45_FIRST_ACTIVATION_TRIGGER_NAMES));
     raw.exec(triggerDdlFor(V45_FIRST_ACTIVATION_TRIGGER_NAMES, 45));
-    assertV45Names(raw, objects, "after");
+    assertStepNames(raw, 45, objects, "after");
     assertV45TableCarries(raw, objects);
   },
   checksum: () => migrationChecksum("v45-first-manifest-activation", 45),
+};
+
+/** The three rowid tables #1094 names, each guarded by the three v46 triggers below. */
+const V46_ROWID_TABLES = ["outbox", "inbound_messages", "canonical_turns"] as const;
+
+/** v46's guards, read from schema.sql by name: per table, insert by rowid, rowid change, non-positive rowid. */
+export const V46_ROWID_TRIGGER_NAMES: readonly string[] = [
+  "outbox_no_rowid_replace",
+  "outbox_rowid_immutable",
+  "outbox_rowid_positive",
+  "inbound_messages_no_rowid_replace",
+  "inbound_messages_rowid_immutable",
+  "inbound_messages_rowid_positive",
+  "canonical_turns_no_rowid_replace",
+  "canonical_turns_rowid_immutable",
+  "canonical_turns_rowid_positive",
+];
+
+/**
+ * #1094. `outbox`, `inbound_messages` and `canonical_turns` are rowid tables whose `_no_replace`
+ * triggers compare declared keys only, so a REPLACE that names an existing rowid with a new key, or an
+ * `UPDATE OR REPLACE` that moves a row onto another row's rowid, deleted that row. v46 adds three
+ * triggers per table, each raising the table's existing `*_NO_REPLACE` sentinel. They close REPLACE
+ * through the hidden rowid on any connection; they are not a boundary against a raw writer.
+ *
+ * Additive only: nine triggers, no existing body changed, no row touched, no backfill. The insert guard
+ * is sound only while every rowid is positive (`NEW.rowid` is -1 in a BEFORE INSERT trigger when no
+ * rowid is named), so the step first counts non-positive rowids in each table and refuses, naming each
+ * table and its count, if any exist. It never deletes or renumbers a row; the outer migration backup
+ * restores the original image.
+ *
+ * V46-R1-01: before anything else, every one of the nine names is checked as v45 checks its own
+ * (`assertStepNames`): whatever holds it, in any letter case, must be the trigger schema.sql defines,
+ * on its table, token for token. A free name or schema.sql's exact definition is accepted, so a repeated
+ * application is too; anything else refuses the step, and nothing is dropped to make room. Measured at
+ * 404422d5: `DROP TRIGGER IF EXISTS` then `CREATE TRIGGER IF NOT EXISTS` silently replaced a weakened
+ * body, a trigger on another table and an upper-case name, and committed with an index of the name left
+ * beside the guard. The names are checked again after the step.
+ *
+ * A live database at v45 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v46: SchemaMigration = {
+  id: "v46-rowid-no-replace",
+  fromVersion: 45,
+  toVersion: 46,
+  apply: (raw) => {
+    const objects = stepTriggerObjects(46, V46_ROWID_TRIGGER_NAMES);
+    assertStepNames(raw, 46, objects, "before");
+    const nonPositive = V46_ROWID_TABLES.flatMap((table) => {
+      const count = (raw.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE rowid <= 0`).get() as { n: number }).n;
+      return count > 0 ? [{ table, count }] : [];
+    });
+    if (nonPositive.length > 0) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `v46 refuses to guard rowids: ${nonPositive.map(({ table, count }) => `${table} holds ${count} row(s) with rowid <= 0`).join("; ")}; no row was deleted or renumbered`,
+        { nonPositive },
+      );
+    }
+    raw.exec(dropsFor(V46_ROWID_TRIGGER_NAMES));
+    raw.exec(triggerDdlFor(V46_ROWID_TRIGGER_NAMES, 46));
+    assertStepNames(raw, 46, objects, "after");
+  },
+  checksum: () => migrationChecksum("v46-rowid-no-replace", 46),
 };
 
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
@@ -3543,6 +3620,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v43,
   v44,
   v45,
+  v46,
 ]);
 
 interface RequiredTrigger {
@@ -3734,6 +3812,15 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "manifest_first_activation_grants_consumed_while_null", sentinel: "MANIFEST_FIRST_ACTIVATION_DENIED", introducedIn: 45 },
   { name: "manifest_first_activation_grants_no_delete", sentinel: "MANIFEST_GRANT_IMMUTABLE", introducedIn: 45 },
   { name: "manifest_activation_grants_not_first", sentinel: "MANIFEST_GRANT_NO_REPLACE", introducedIn: 45 },
+  { name: "outbox_no_rowid_replace", sentinel: "OUTBOX_NO_REPLACE", introducedIn: 46 },
+  { name: "outbox_rowid_immutable", sentinel: "OUTBOX_NO_REPLACE", introducedIn: 46 },
+  { name: "outbox_rowid_positive", sentinel: "OUTBOX_NO_REPLACE", introducedIn: 46 },
+  { name: "inbound_messages_no_rowid_replace", sentinel: "INBOUND_MESSAGE_NO_REPLACE", introducedIn: 46 },
+  { name: "inbound_messages_rowid_immutable", sentinel: "INBOUND_MESSAGE_NO_REPLACE", introducedIn: 46 },
+  { name: "inbound_messages_rowid_positive", sentinel: "INBOUND_MESSAGE_NO_REPLACE", introducedIn: 46 },
+  { name: "canonical_turns_no_rowid_replace", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
+  { name: "canonical_turns_rowid_immutable", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
+  { name: "canonical_turns_rowid_positive", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [

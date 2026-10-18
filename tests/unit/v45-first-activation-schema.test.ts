@@ -28,7 +28,13 @@ import {
   schemaRowsOf,
   v43Image,
 } from "../helpers/released-v44-schema.ts";
-import { V45_REPLACED_TRIGGERS, contentDigests, toV44Image, v44TriggerBody } from "../helpers/released-v45-schema.ts";
+import {
+  V45_REPLACED_TRIGGERS,
+  contentDigests,
+  freshV45CreateFromSnapshot,
+  toV44Image,
+  v44TriggerBody,
+} from "../helpers/released-v45-schema.ts";
 import { stricter, dispatchRun } from "../helpers/contract-change.ts";
 import { carryContractChange, decideThroughHermes } from "../helpers/harness.ts";
 
@@ -430,22 +436,35 @@ describe("mutation checks: each predicate the guards rest on is load-bearing", (
 
 describe("the v44 → v45 step", () => {
   it("M3: a fresh v45 install equals a v44 image (and a v43 image) migrated to v45, apart from receipts; the v44 image is the v44 build's", () => {
-    const fresh = privateStatePath("acp-v45-fresh-");
+    // The fresh v45 install from the frozen v45 snapshot, and each image's schema as v45 left it: the
+    // chain runs on past v45 when the current version is later. At the chain's end, each equals a fresh
+    // install at the current version.
+    const freshV45 = digestOfSchemaRows(schemaRowsOf(freshV45CreateFromSnapshot(privateStatePath("acp-v45-fresh-"))));
+    const fresh = privateStatePath("acp-v45-fresh-current-");
     new Db(fresh).close();
+    const migrateRecordingV45 = (path: string, why: string): string => {
+      approveMigration(path, why);
+      const atV45: string[] = [];
+      new Db(path, {
+        afterMigration: (migration) => {
+          if (migration.toVersion === 45) atV45.push(digestOfSchemaRows(schemaRowsOf(path)));
+        },
+      }).close();
+      expect(atV45).toHaveLength(1);
+      return atV45[0]!;
+    };
     const path = privateStatePath("acp-v45-m3-");
     new Db(path).close();
     toV44Image(path);
     expect(digestOfSchemaRows(schemaRowsOf(path))).toBe(V44_SCHEMA_DIGEST_FROM_V43);
-    approveMigration(path, "V45 M3 witness");
-    new Db(path).close();
+    expect(migrateRecordingV45(path, "V45 M3 witness")).toBe(freshV45);
     expect(digestOfSchemaRows(schemaRowsOf(path))).toBe(digestOfSchemaRows(schemaRowsOf(fresh)));
 
     const fromV43 = v43Image(privateStatePath("acp-v45-m3-v43-"));
-    approveMigration(fromV43, "V45 M3 witness from v43");
-    new Db(fromV43).close();
+    expect(migrateRecordingV45(fromV43, "V45 M3 witness from v43")).toBe(freshV45);
     expect(digestOfSchemaRows(schemaRowsOf(fromV43))).toBe(digestOfSchemaRows(schemaRowsOf(fresh)));
-    expect(SCHEMA_VERSION).toBe(45);
-    expect(MIGRATIONS.at(-1)).toMatchObject({ id: "v45-first-manifest-activation", fromVersion: 44, toVersion: 45 });
+    expect(MIGRATIONS.find((step) => step.id === "v45-first-manifest-activation"))
+      .toMatchObject({ fromVersion: 44, toVersion: 45 });
   });
 
   it("the replaced bodies decide exactly as v44's for every non-NULL old value (A8 pointer outcomes)", async () => {
@@ -552,7 +571,7 @@ describe("the v44 → v45 step", () => {
     approveMigration(path, "V45 M1 witness");
     new Db(path).close();
     const after = contentDigests(path);
-    expect(after.userVersion).toBe(45);
+    expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsBefore, ...restBefore } = before.tables;
     const { schema_migrations: receiptsAfter, manifest_first_activation_grants: added, ...restAfter } = after.tables;
     expect(restAfter).toEqual(restBefore);
@@ -561,7 +580,7 @@ describe("the v44 → v45 step", () => {
     const raw = new Database(path, { readonly: true });
     try {
       const receipts = raw.prepare("SELECT version, migration_id FROM schema_migrations ORDER BY version").all() as Array<{ version: number; migration_id: string }>;
-      expect(receipts.at(-1)).toEqual({ version: 45, migration_id: "v45-first-manifest-activation" });
+      expect(receipts.find((row) => row.version === 45)).toEqual({ version: 45, migration_id: "v45-first-manifest-activation" });
       expect(receipts.filter((row) => row.version <= 44)).toEqual([{ version: 44, migration_id: "bootstrap-v44" }]);
     } finally {
       raw.close();
@@ -627,7 +646,7 @@ describe("the v44 → v45 step", () => {
     expect(() => new Db(path)).toThrowError(/for a different database than the one being opened/);
     approveMigration(path, "V45 D4-b fresh approval");
     new Db(path).close();
-    expect(contentDigests(path).userVersion).toBe(45);
+    expect(contentDigests(path).userVersion).toBe(SCHEMA_VERSION);
   });
 
   it("D5-a: a process killed after v45 commits leaves v45 with its receipt, the same inode, no restore; reopening retires the approval", () => {
@@ -658,6 +677,13 @@ describe("the v44 → v45 step", () => {
     const { schema_migrations: _r2, manifest_first_activation_grants: _added, ...restKilled } = killed.tables;
     expect(restKilled).toEqual(restBefore);
     expect(existsSync(migrationApprovalPath(path))).toBe(true);
+    if (SCHEMA_VERSION > 45) {
+      // A build with steps after v45 starts a migration here, not a same-version open: the approval
+      // that named the chain from 44 does not name the one from 45, and a fresh approval does.
+      expect(() => new Db(path)).toThrowError(/does not name the migration this start would perform/);
+      expect(statSync(path).ino).toBe(inode);
+      approveMigration(path, "V45 D5-a re-approval");
+    }
     new Db(path).close();
     expect(statSync(path).ino).toBe(inode);
     expect(existsSync(migrationApprovalPath(path))).toBe(false);

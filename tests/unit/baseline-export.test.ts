@@ -41,8 +41,31 @@ import {
   TEST_OPERATOR_TOKEN,
 } from "../helpers/harness.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { laterObjectsIn } from "../helpers/released-chain-image.ts";
+import { releasedV13Image } from "../helpers/released-v13-schema.ts";
+import { privateStatePath } from "../helpers/released-v44-schema.ts";
+import { contentDigests } from "../helpers/released-v45-schema.ts";
 
 afterAll(cleanupTempDirs);
+
+/**
+ * The objects on `baseline_records` in the committed file, read on a second connection the way a
+ * migration step's `afterMigration` sees it. This is v14's ledger, and v13 has none of it.
+ */
+const baselineLedgerObjects = (path: string): string[] => {
+  const reader = new Database(path, { readonly: true, fileMustExist: true });
+  try {
+    return reader
+      .prepare(
+        `SELECT type || ' ' || name FROM sqlite_schema
+          WHERE tbl_name = 'baseline_records' AND substr(name, 1, 7) <> 'sqlite_' ORDER BY type, name`,
+      )
+      .pluck()
+      .all() as string[];
+  } finally {
+    reader.close();
+  }
+};
 
 const contract = {
   goal: "record a small baseline run",
@@ -1084,39 +1107,17 @@ describe("baseline boundary contracts", () => {
       "v43-bootstrap-application-record",
       "v44-manifest-activation-grant",
       "v45-first-manifest-activation",
+      "v46-rowid-no-replace",
     ]);
   });
 
   it("opens a v13 database through production construction and applies the rest of the chain", () => {
-    const harness = makeHarness();
-    const databasePath = harness.cp.config.databasePath;
-    harness.cp.close();
-    const raw = new Database(databasePath);
-    try {
-      raw.exec("DROP TRIGGER baseline_records_immutable; DROP TRIGGER baseline_records_no_delete; DROP TABLE baseline_records;");
-      raw.exec("DROP TRIGGER telegram_owner_prompts_immutable; DROP TRIGGER telegram_owner_prompts_no_delete; DROP TABLE telegram_owner_prompts;");
-      raw.exec("DROP TRIGGER conversational_actor_registration_generation_monotonic; DROP TRIGGER conversational_actor_registration_retirement_terminal; DROP TABLE conversational_actor_registrations; DROP TABLE conversational_actor_registry_state;");
-      raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
-      raw.prepare("DELETE FROM schema_migrations WHERE version >= ?").run(14);
-      const v13 = migrationChainFrom(12).find((migration) => migration.toVersion === 13)!;
-      raw.function("acp_schema_migration_authorized", () => 1);
-      raw.prepare(
-        `INSERT INTO schema_migrations
-           (version, migration_id, checksum, backup_file, backup_checksum, applied_at)
-         VALUES (?, ?, ?, NULL, NULL, ?)`,
-      ).run(13, v13.id, v13.checksum(), "2026-08-14T00:00:00.000Z");
-      raw.exec(`
-        CREATE TRIGGER schema_migrations_immutable
-        BEFORE UPDATE ON schema_migrations
-        BEGIN SELECT RAISE(ABORT, 'SCHEMA_MIGRATION_RECEIPT_IMMUTABLE'); END;
-        CREATE TRIGGER schema_migrations_no_delete
-        BEFORE DELETE ON schema_migrations
-        BEGIN SELECT RAISE(ABORT, 'SCHEMA_MIGRATION_RECEIPT_IMMUTABLE'); END;
-      `);
-      raw.pragma("user_version = 13");
-    } finally {
-      raw.close();
-    }
+    // V46-R1-02: the released v13, written from 842830c5's own schema.sql the way that release set up
+    // a database, and compared with it object by object. It is neither a current database relabelled
+    // 13 nor this chain's v13, which replays schema-v37.sql and already held baseline_records, so a v14
+    // stubbed out to nothing still passed.
+    const databasePath = releasedV13Image(privateStatePath("acp-baseline-v13-"));
+    expect(laterObjectsIn(databasePath, 13)).toEqual([]);
     // #738 — a database at an older version no longer migrates itself. This fixture is a
     // deployment that stopped at v13, so it takes the approval its owner would have taken.
     approveMigration(databasePath, "baseline-export fixture");
@@ -1127,12 +1128,25 @@ describe("baseline boundary contracts", () => {
       expect(
         reopened.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'baseline_records'").get(),
       ).toEqual({ n: 0 });
+      expect(reopened.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version >= 14").get()).toEqual({ n: 0 });
     } finally {
       reopened.close();
     }
 
-    const migrated = new Db(databasePath);
+    // The v14 step itself, read right after it commits, before any later step runs.
+    let atV14: string[] = [];
+    const migrated = new Db(databasePath, {
+      afterMigration: (migration) => {
+        if (migration.id === "v14-baseline-evidence-ledger") atV14 = baselineLedgerObjects(databasePath);
+      },
+    });
     try {
+      expect(atV14).toEqual([
+        "index baseline_records_run_kind",
+        "table baseline_records",
+        "trigger baseline_records_immutable",
+        "trigger baseline_records_no_delete",
+      ]);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.get<{ migration_id: string; checksum: string }>(
         "SELECT migration_id, checksum FROM schema_migrations WHERE version = 15",
@@ -1216,44 +1230,30 @@ describe("baseline boundary contracts", () => {
   });
 
   it("restores the original v13 file when v14 fails after its commit", () => {
-    const harness = makeHarness();
-    const databasePath = harness.cp.config.databasePath;
-    harness.cp.close();
-    const raw = new Database(databasePath);
-    try {
-      raw.exec("DROP TRIGGER baseline_records_immutable; DROP TRIGGER baseline_records_no_delete; DROP TABLE baseline_records;");
-      raw.exec("DROP TRIGGER telegram_owner_prompts_immutable; DROP TRIGGER telegram_owner_prompts_no_delete; DROP TABLE telegram_owner_prompts;");
-      raw.exec("DROP TRIGGER conversational_actor_registration_generation_monotonic; DROP TRIGGER conversational_actor_registration_retirement_terminal; DROP TABLE conversational_actor_registrations; DROP TABLE conversational_actor_registry_state;");
-      raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
-      raw.prepare("DELETE FROM schema_migrations WHERE version >= ?").run(14);
-      const v13 = migrationChainFrom(12).find((migration) => migration.toVersion === 13)!;
-      raw.function("acp_schema_migration_authorized", () => 1);
-      raw.prepare(
-        `INSERT INTO schema_migrations
-           (version, migration_id, checksum, backup_file, backup_checksum, applied_at)
-         VALUES (?, ?, ?, NULL, NULL, ?)`,
-      ).run(13, v13.id, v13.checksum(), "2026-08-14T00:00:00.000Z");
-      raw.exec(`
-        CREATE TRIGGER schema_migrations_immutable
-        BEFORE UPDATE ON schema_migrations
-        BEGIN SELECT RAISE(ABORT, 'SCHEMA_MIGRATION_RECEIPT_IMMUTABLE'); END;
-        CREATE TRIGGER schema_migrations_no_delete
-        BEFORE DELETE ON schema_migrations
-        BEGIN SELECT RAISE(ABORT, 'SCHEMA_MIGRATION_RECEIPT_IMMUTABLE'); END;
-      `);
-      raw.pragma("user_version = 13");
-    } finally {
-      raw.close();
-    }
+    // V46-R1-02: the released v13 from 842830c5's own schema.sql (see the test above), which has no
+    // baseline_records, so the rollback below undoes a table v14 really created.
+    const databasePath = releasedV13Image(privateStatePath("acp-baseline-v13-"));
+    expect(laterObjectsIn(databasePath, 13)).toEqual([]);
     // #738 — a database at an older version no longer migrates itself. This fixture is a
     // deployment that stopped at v13, so it takes the approval its owner would have taken.
     approveMigration(databasePath, "baseline-export fixture");
+    const image = contentDigests(databasePath);
 
+    let committedV14: string[] = [];
     expect(() => new Db(databasePath, {
       afterMigration: (migration) => {
-        if (migration.id === "v14-baseline-evidence-ledger") throw new Error("injected v14 post-commit failure");
+        if (migration.id !== "v14-baseline-evidence-ledger") return;
+        committedV14 = baselineLedgerObjects(databasePath);
+        throw new Error("injected v14 post-commit failure");
       },
     })).toThrowError(/original database was restored/);
+    // The failure came after v14 had committed its ledger, so there was something to roll back.
+    expect(committedV14).toEqual([
+      "index baseline_records_run_kind",
+      "table baseline_records",
+      "trigger baseline_records_immutable",
+      "trigger baseline_records_no_delete",
+    ]);
 
     const restored = new Database(databasePath, { readonly: true, fileMustExist: true });
     try {
@@ -1269,6 +1269,8 @@ describe("baseline boundary contracts", () => {
     } finally {
       restored.close();
     }
+    // The whole v13 image is back, byte for byte in every table and schema row.
+    expect(contentDigests(databasePath)).toEqual(image);
 
     // #747 — the rollback linked a staged image into place, so the restored database is a new
     // inode that the failed attempt's approval no longer names. Retrying takes a fresh decision.

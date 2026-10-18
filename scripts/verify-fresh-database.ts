@@ -113,7 +113,7 @@ let cp: ControlPlane | null = null;
 let fresh: Db | null = null;
 let inspection: Database.Database | null = null;
 
-const finish = (): never => {
+const finish = async (): Promise<never> => {
   try {
     cp?.close();
   } catch {
@@ -131,6 +131,11 @@ const finish = (): never => {
   }
   report();
   rmSync(root, { recursive: true, force: true });
+  // `process.exit` does not wait for stdout. Where stdout is a pipe it is asynchronous (macOS), and
+  // exiting at once dropped whatever the pipe had not yet taken: a --json report past 64 KiB reached
+  // its reader cut at exactly 65536 bytes while the verdict itself was complete. Exit only once
+  // everything report() wrote has been handed to the stream.
+  await new Promise<void>((resolve) => process.stdout.write("", () => resolve()));
   process.exit(problems.length === 0 ? 0 : 1);
 };
 
@@ -138,7 +143,7 @@ try {
   cp = new ControlPlane(config);
 } catch (err) {
   problems.push(`the composition root could not initialise a fresh database: ${describe(err)}`);
-  finish();
+  await finish();
 }
 
 // Db intentionally exposes only a schema-version diagnostic surface. This verifier needs
@@ -586,7 +591,7 @@ for (const [label, outcome] of [
   }
 }
 
-finish();
+await finish();
 
 // --------------------------------------------------------------------------
 

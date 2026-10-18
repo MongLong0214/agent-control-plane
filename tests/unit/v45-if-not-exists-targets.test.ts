@@ -6,12 +6,13 @@ import { afterAll, describe, expect, it } from "vitest";
 import { isAcpError } from "../../src/core/errors.ts";
 import { Db } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
+import { SCHEMA_VERSION } from "../../src/db/migrations.ts";
 import { Role, RunKind, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { createRun, operatorRegisteredProject } from "../helpers/first-activation.ts";
 import { makeHarness } from "../helpers/harness.ts";
 import { V45_ADDED_TRIGGERS, digestOfSchemaRows, privateStatePath, schemaRowsOf } from "../helpers/released-v44-schema.ts";
-import { V45_REPLACED_TRIGGERS, contentDigests, toV44Image } from "../helpers/released-v45-schema.ts";
+import { V45_REPLACED_TRIGGERS, contentDigests, freshV45CreateFromSnapshot, toV44Image } from "../helpers/released-v45-schema.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -43,8 +44,8 @@ const freshV45 = (() => {
   let cached: { path: string; sql: Map<string, string> } | undefined;
   return () => {
     if (cached) return cached;
-    const path = privateStatePath("acp-v45-r1-fresh-");
-    new Db(path).close();
+    // From the frozen v45 snapshot, so it stays a v45 database however far the current version moves on.
+    const path = freshV45CreateFromSnapshot(privateStatePath("acp-v45-r1-fresh-"));
     const raw = new Database(path, { readonly: true });
     try {
       const rows = raw
@@ -103,11 +104,17 @@ const expectRefusedAndPreserved = (path: string, contaminated: ReturnType<typeof
 
 /** Opening takes the step; the schema is a fresh v45 install's, row for row. */
 const expectAccepted = (path: string): void => {
-  new Db(path).close();
-  expect(digestOfSchemaRows(schemaRowsOf(path))).toBe(digestOfSchemaRows(schemaRowsOf(freshV45().path)));
+  // The schema as v45 left it, before any later step: the chain runs on to the current version.
+  const atV45: string[] = [];
+  new Db(path, {
+    afterMigration: (migration) => {
+      if (migration.toVersion === 45) atV45.push(digestOfSchemaRows(schemaRowsOf(path)));
+    },
+  }).close();
+  expect(atV45).toEqual([digestOfSchemaRows(schemaRowsOf(freshV45().path))]);
   const raw = new Database(path, { readonly: true });
   try {
-    expect(raw.pragma("user_version", { simple: true })).toBe(45);
+    expect(raw.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
     expect(raw.prepare("SELECT migration_id FROM schema_migrations WHERE version = 45").pluck().get()).toBe("v45-first-manifest-activation");
   } finally {
     raw.close();

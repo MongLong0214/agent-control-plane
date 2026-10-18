@@ -6,12 +6,13 @@ import { afterAll, describe, expect, it } from "vitest";
 import { isAcpError } from "../../src/core/errors.ts";
 import { Db } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
+import { SCHEMA_VERSION } from "../../src/db/migrations.ts";
 import { Role, RunKind, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { createRun, operatorRegisteredProject } from "../helpers/first-activation.ts";
 import { makeHarness } from "../helpers/harness.ts";
 import { privateStatePath } from "../helpers/released-v44-schema.ts";
-import { contentDigests, toV44Image } from "../helpers/released-v45-schema.ts";
+import { contentDigests, freshV45CreateFromSnapshot, toV44Image } from "../helpers/released-v45-schema.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -40,13 +41,15 @@ const TABLE = "manifest_first_activation_grants";
 const INDEX = "manifest_first_activation_grants_one_consumed_per_project";
 const NO_DELETE = "manifest_first_activation_grants_no_delete";
 
-/** The stored definitions of a fresh v45 database, by name. */
+/**
+ * The stored definitions of a fresh v45 database, by name: created from the frozen v45 snapshot, so it
+ * stays a v45 database however far the current version moves on.
+ */
 const freshV45Sql = (() => {
   let cached: Map<string, string> | undefined;
   return (name: string): string => {
     if (cached === undefined) {
-      const path = privateStatePath("acp-v45-literal-fresh-");
-      new Db(path).close();
+      const path = freshV45CreateFromSnapshot(privateStatePath("acp-v45-literal-fresh-"));
       const raw = new Database(path, { readonly: true });
       try {
         cached = new Map((raw.prepare("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL").all() as Array<{ name: string; sql: string }>)
@@ -119,12 +122,15 @@ const expectRefusedAndPreserved = (path: string, contaminated: ReturnType<typeof
   expectNoV45Receipt(path);
 };
 
-/** Opening takes the step and keeps the accepted table as it stood; its partial unique index is v45's. */
+/**
+ * Opening takes the step and keeps the accepted table as it stood; its partial unique index is v45's.
+ * The chain then runs on to the current version, which changes none of v45's objects.
+ */
 const expectAcceptedKeeping = (path: string, tableSql: string): void => {
   new Db(path).close();
   const raw = new Database(path, { readonly: true });
   try {
-    expect(raw.pragma("user_version", { simple: true })).toBe(45);
+    expect(raw.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
     expect(raw.prepare("SELECT migration_id FROM schema_migrations WHERE version = 45").pluck().get()).toBe("v45-first-manifest-activation");
     expect(raw.prepare("SELECT sql FROM sqlite_master WHERE name = ?").pluck().get(TABLE)).toBe(tableSql);
     expect(raw.prepare("SELECT tbl_name, sql FROM sqlite_master WHERE name = ?").get(INDEX)).toEqual({ tbl_name: TABLE, sql: freshV45Sql(INDEX) });

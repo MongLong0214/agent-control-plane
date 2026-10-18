@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 45,
+  "schemaVersion": 46,
   "live": {
     "v12-migration-ledger-and-invariant-replay": "sha256:ec8955aed2d499e13d313e3fed473e0cb4e2ecb1c45af2e7fc95f2537ec91261",
     "v13-finalization-state-machine": "sha256:1d8ff28d8f21296e0380b76b76637813e825b7f9c91029dc03ac52d877af3936",

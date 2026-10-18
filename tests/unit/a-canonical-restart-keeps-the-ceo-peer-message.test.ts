@@ -20,7 +20,6 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
 import { AuditLog } from "../../src/db/audit.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
-import { installMigrationLedger } from "../../src/db/migrations.ts";
 import {
   ownerMessageLedger,
   startBuzzMessageIngressListener,
@@ -44,6 +43,7 @@ import {
 } from "../../src/registry/canonical-self-claim.ts";
 import { cleanupTempDirs, makeCore, makeRepo, seedRun, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { carryRows, laterObjectsIn, releasedChainImage } from "../helpers/released-chain-image.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -1559,19 +1559,31 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     "outbox_holder_message_source_departs",
     "outbox_message_id_immutable",
   ];
-  /** Every row of every table, by table, so a migration that touched any of them shows. */
-  const dump = (raw: Database.Database, except: readonly string[]): Record<string, unknown[]> =>
+  /** Each table's columns, in order. */
+  type Shape = Record<string, string[]>;
+  const shapeOf = (raw: Database.Database): Shape =>
+    Object.fromEntries((raw.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`).pluck().all() as string[])
+      .map((name) => [name, raw.prepare(`SELECT name FROM pragma_table_info(?)`).pluck().all(name) as string[]]));
+  /**
+   * Every row of every table, by table, so a migration that touched any of them shows. Given the image's
+   * shape, only its tables and columns: what v40 and every later step add is not compared.
+   */
+  const dump = (raw: Database.Database, except: readonly string[], shape?: Shape): Record<string, unknown[]> =>
     Object.fromEntries(
       (raw.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`).all() as { name: string }[])
-        .filter(({ name }) => !except.includes(name))
+        .filter(({ name }) => !except.includes(name) && (shape === undefined || name in shape))
         // Sorted here, not by rowid: v40's record tables are WITHOUT ROWID.
-        .map(({ name }) => [name, (raw.prepare(`SELECT * FROM "${name}"`).all() as unknown[])
+        .map(({ name }) => [name, (raw.prepare(`SELECT ${shape?.[name]?.map((column) => `"${column}"`).join(", ") ?? "*"} FROM "${name}"`).all() as unknown[])
           .map((row) => JSON.stringify(row)).sort()]),
     );
-  /** A database written at the current version, with rows in it, taken back to `version`'s image. */
-  const legacyImage = (version: 38 | 39, populateCarries = false): { path: string; before: Record<string, unknown[]> } => {
-    const path = statePath();
-    const db = openDb(path);
+  /**
+   * The released chain's image at `version` (V46-R1-02): the v11 fixture run through v12..`version` and
+   * stopped there, holding rows this build wrote at the current version, carried into its tables and
+   * columns. Taking a current database back left `bootstrap_applications` and both grant tables in it.
+   */
+  const legacyImage = (version: 38 | 39, populateCarries = false): { path: string; before: Record<string, unknown[]>; shape: Shape } => {
+    const source = statePath();
+    const db = openDb(source);
     db.run(
       `INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json, result_json)
        VALUES ('owner-reply-intent', 'turn:written-before-v40', 'cto', ?, ?, '{"status":"RECORDED"}')`,
@@ -1586,63 +1598,59 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
       [NOW],
     );
     db.close();
+    const path = releasedChainImage(statePath(), version);
+    carryRows(source, path);
+    // The historical schema first: nothing of a later version, v39's key guard included at v38.
+    expect(laterObjectsIn(path, version)).toEqual([]);
     const legacy = new Database(path);
-    legacy.exec(CARRY_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n"));
-    // Finding 01's departure records, their outbox and ingress triggers and the id guard: v40's too.
-    legacy.exec(`${DEPARTURE_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n")}
-      DROP TABLE holder_message_departures; DROP TABLE holder_message_source_departures;`);
-    // And finding 04's delivery record, which v39 did not have either.
-    legacy.exec(`${DELIVERY_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n")}
-      DROP TABLE peer_message_notice_deliveries;`);
-    legacy.exec(`${NOTICE_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n")}
-      DROP INDEX peer_message_refusal_notices_by_role; DROP TABLE peer_message_refusal_notices;
-      DROP TRIGGER inbound_messages_buzz_source_key_immutable;`);
-    if (populateCarries) {
-      legacy.exec(`INSERT INTO peer_message_carries VALUES (
-        'msg_unvouched', 'CARRIED', NULL, 'buzz', 'buzz-message:x', 'sha256:x', 'PRIMARY_CTO:p', 's1', 'i1', 1, 'a1',
-        's2', 'i2', 2, 'a2', 'actor', 'uuid', 'buzz', 1, '${NOW}')`);
-    } else {
-      legacy.exec(`DROP INDEX peer_message_carries_by_successor; DROP TABLE peer_message_carries;`);
-    }
-    if (version === 38) {
-      // v38 as it wrote its claim guards (live only beside a receipt at exactly 38), and no v39 key guard.
-      const gated = legacy.prepare(
-        `SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%WHERE version >= 38)%' ORDER BY name`,
-      ).all() as { name: string; sql: string }[];
-      expect(gated).toHaveLength(3);
-      for (const trigger of gated) {
-        legacy.exec(`DROP TRIGGER ${trigger.name}; ${trigger.sql.replace("WHERE version >= 38)", "WHERE version = 38)")};`);
+    try {
+      if (version === 38) {
+        // The chain's v38 step now reads the frozen v44 snapshot, whose claim guards test for a receipt at
+        // 38 or later; the v38 build wrote them testing for exactly 38. The image keeps the v38 build's.
+        const gated = legacy.prepare(
+          `SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%WHERE version >= 38)%' ORDER BY name`,
+        ).all() as { name: string; sql: string }[];
+        expect(gated).toHaveLength(3);
+        for (const trigger of gated) {
+          legacy.exec(`DROP TRIGGER ${trigger.name}; ${trigger.sql.replace("WHERE version >= 38)", "WHERE version = 38)")};`);
+        }
       }
-      legacy.exec(`DROP TRIGGER inbound_messages_owner_reply_key_immutable;`);
+      const shape = shapeOf(legacy);
+      if (populateCarries) {
+        // A deliberate plant, not part of a v39 image: v40's carry table and its index as this build
+        // defines them, without their guards, holding a record nothing vouched for.
+        const reader = new Database(source, { readonly: true });
+        try {
+          for (const name of ["peer_message_carries", "peer_message_carries_by_successor"]) {
+            legacy.exec(reader.prepare(`SELECT sql FROM sqlite_master WHERE name = ?`).pluck().get(name) as string);
+          }
+        } finally {
+          reader.close();
+        }
+        legacy.exec(`INSERT INTO peer_message_carries VALUES (
+          'msg_unvouched', 'CARRIED', NULL, 'buzz', 'buzz-message:x', 'sha256:x', 'PRIMARY_CTO:p', 's1', 'i1', 1, 'a1',
+          's2', 'i2', 2, 'a2', 'actor', 'uuid', 'buzz', 1, '${NOW}')`);
+      }
+      return { path, before: dump(legacy, ["schema_migrations"]), shape };
+    } finally {
+      legacy.close();
     }
-    legacy.exec(`
-      DROP TRIGGER schema_migrations_no_delete;
-      DROP TRIGGER schema_migrations_insert_authority;
-      DELETE FROM schema_migrations WHERE version > ${version};
-      INSERT INTO schema_migrations (version, migration_id, checksum, applied_at)
-        VALUES (${version}, 'bootstrap-v${version}', 'sha256:${"0".repeat(64)}', '${NOW}');
-      PRAGMA user_version = ${version};
-    `);
-    installMigrationLedger(legacy);
-    const before = dump(legacy, ["schema_migrations"]);
-    legacy.close();
-    return { path, before };
   };
 
   it("migrates a v38 database through v39 to v40, keeping every row, and the new record is guarded from the first", () => {
-    const { path, before } = legacyImage(38);
+    const { path, before, shape } = legacyImage(38);
     expect(Object.keys(before)).not.toContain("peer_message_carries");
     expect(Object.keys(before)).not.toContain("peer_message_refusal_notices");
     approveMigration(path, "ACP-PEER-SUCCESSION-01 v38 fixture");
     const migrated = openDb(path);
     try {
-      // v41 (#512), v42 (#246 C1b), v43 (#246 C3), v44 (#246 B2-b) and v45 (#512) follow on the same approved chain.
-      expect(SCHEMA_VERSION).toBe(45);
+      // v41 (#512), v42 (#246 C1b), v43 (#246 C3), v44 (#246 B2-b), v45 (#512) and v46 (#1094) follow on the same approved chain.
+      expect(SCHEMA_VERSION).toBe(46);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 38 ORDER BY version`,
       )).toEqual([
-        { version: 38, migration_id: "bootstrap-v38" },
+        { version: 38, migration_id: "v38-canonical-verified-target-override" },
         { version: 39, migration_id: "v39-owner-reply-intent-keeps-its-key" },
         { version: 40, migration_id: "v40-peer-message-carry-record" },
         { version: 41, migration_id: "v41-runtime-managed-worker-turns" },
@@ -1650,6 +1658,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
         { version: 43, migration_id: "v43-bootstrap-application-record" },
         { version: 44, migration_id: "v44-manifest-activation-grant" },
         { version: 45, migration_id: "v45-first-manifest-activation" },
+        { version: 46, migration_id: "v46-rowid-no-replace" },
       ]);
       expect(migrated.all<{ name: string }>(
         `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'peer_message_carries' ORDER BY name`,
@@ -1682,9 +1691,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     }
     const after = new Database(path, { readonly: true });
     try {
-      expect(dump(after, ["schema_migrations", "peer_message_carries", "peer_message_refusal_notices",
-        "holder_message_departures", "holder_message_source_departures", "peer_message_notice_deliveries"]))
-        .toEqual(before);
+      expect(dump(after, ["schema_migrations"], shape)).toEqual(before);
     } finally {
       after.close();
     }
@@ -1693,7 +1700,16 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
   it("refuses a v39 image whose carry table already holds a record nothing vouched for, and restores it", () => {
     const { path, before } = legacyImage(39, true);
     approveMigration(path, "ACP-PEER-SUCCESSION-01 populated fixture");
-    expect(() => openDb(path)).toThrow(/migration failed; the original database was restored/);
+    let refusal: unknown;
+    try {
+      openDb(path).close();
+    } catch (error) {
+      refusal = error;
+    }
+    expect(String(refusal)).toMatch(/migration failed; the original database was restored/);
+    // Refused for the planted record, not for anything else about the image.
+    expect(String((refusal as { evidence?: { migrationError?: unknown } } | undefined)?.evidence?.migrationError))
+      .toMatch(/v40 pre-existing peer_message_carries table does not match the current schema or is populated/);
     const restored = new Database(path, { readonly: true });
     try {
       expect(Number(restored.pragma("user_version", { simple: true }))).toBe(39);
@@ -1704,11 +1720,11 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
   });
 
   it("W4 finding 01: a v39 database's rows outside PENDING get a BACKFILL departure, exactly those, of every kind", () => {
-    const { path } = legacyImage(39);
+    const { path, shape } = legacyImage(39);
     const legacy = new Database(path);
     // The v38 claim guard names this function; SQLite resolves it whenever an inbound row is inserted.
     legacy.function("acp_ingress_claim_authorized", { varargs: true }, () => 0);
-    // `legacyImage` already took away the departure objects v39 did not have.
+    // The released chain's v39 has none of the departure objects (`legacyImage` checked).
     const row = legacy.prepare(
       `INSERT INTO outbox (message_id, idempotency_key, role_key, binding_generation, target_session_id, kind,
                            payload_json, payload_digest, request_fingerprint, expires_at, created_at, status)
@@ -1771,8 +1787,7 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     // Every v39 row is kept as it was; only the new table has rows.
     const after = new Database(path, { readonly: true });
     try {
-      expect(dump(after, ["schema_migrations", "holder_message_departures", "holder_message_source_departures",
-        "peer_message_carries", "peer_message_refusal_notices", "peer_message_notice_deliveries"])).toEqual(before);
+      expect(dump(after, ["schema_migrations"], shape)).toEqual(before);
     } finally {
       after.close();
     }
@@ -1943,7 +1958,7 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
     }
   });
 
-  it("W3 the departure refuses raw UPDATE, DELETE and REPLACE, and survives the outbox row being deleted and re-inserted", async () => {
+  it("W3 the departure refuses raw UPDATE, DELETE and REPLACE, and survives its outbox row put back, which can no longer be deleted or replaced by rowid", async () => {
     const fixture = await startFixture();
     const external = new Database(join(fixture.harness.root, "state.sqlite"));
     try {
@@ -1987,9 +2002,10 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
       }
       expect(departures()).toEqual([departure]);
 
-      // The outbox row deleted and re-inserted under the same id, as a message nobody was handed. A
-      // plain DELETE of a row that left PENDING is refused; a REPLACE through its hidden rowid, on this
-      // connection with recursive triggers off, still removes it, and the departure stands regardless.
+      // The outbox row taken out and brought back under the same id, as a message nobody was handed. A
+      // plain DELETE of a row that left PENDING is refused, and since v46 (#1094) so is the REPLACE through
+      // its hidden rowid that used to remove it on this connection: the row stays as it was. What is left
+      // is the same row put back to PENDING in place, and the departure stands regardless.
       const row = external.prepare(`SELECT * FROM outbox WHERE message_id = ?`).get(id) as Record<string, unknown>;
       expect(() => external.prepare(`DELETE FROM outbox WHERE message_id = ?`).run(id))
         .toThrow(/OUTBOX_DEPARTED_ROW_NO_DELETE/);
@@ -1999,14 +2015,11 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
         status: "REJECTED", payload_json: "{}",
       };
       const decoyColumns = Object.keys(decoy);
-      external.prepare(
+      expect(() => external.prepare(
         `REPLACE INTO outbox (rowid, ${decoyColumns.join(", ")}) VALUES (?, ${decoyColumns.map(() => "?").join(", ")})`,
-      ).run(target.r, ...decoyColumns.map((column) => decoy[column] as never));
-      expect(rowOf(fixture, id)).toBeUndefined();
-      const reborn: Record<string, unknown> = { ...row, status: "PENDING", attempts: 0, sent_at: null, claim_token: null, claimed_at: null };
-      const columns = Object.keys(reborn);
-      external.prepare(`INSERT INTO outbox (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`)
-        .run(...columns.map((column) => reborn[column] as never));
+      ).run(target.r, ...decoyColumns.map((column) => decoy[column] as never))).toThrow(/OUTBOX_NO_REPLACE/);
+      expect(rowOf(fixture, id)).toEqual(row);
+      putBack(fixture, id);
       expect(rowOf(fixture, id)).toMatchObject({ status: "PENDING", attempts: 0, sent_at: null });
       expect(departures()).toEqual([departure]);
 
@@ -2294,7 +2307,11 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
       ledger.claim(holder);
       const original = external.prepare(`SELECT * FROM outbox WHERE message_id = ?`).get(first!.message_id) as
         Record<string, unknown>;
-      // The plain DELETE, as the review ran it; where it is refused, the hidden rowid is the way round.
+      // The plain DELETE, as the review ran it; where it is refused, the hidden rowid was the way round
+      // until v46 (#1094) refused that as well, so the original row stays. Put back to PENDING, as W5's
+      // writer does, it is withheld by its own departure and leaves the holder nothing in flight, as the
+      // deleted row did. The re-created row is inserted under a new id all the same: the row this
+      // witness is about.
       let plainDelete: unknown = null;
       try {
         external.prepare(`DELETE FROM outbox WHERE message_id = ?`).run(first!.message_id);
@@ -2309,10 +2326,11 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
           status: "REJECTED", payload_json: "{}",
         };
         const columns = Object.keys(decoy);
-        external.prepare(`REPLACE INTO outbox (rowid, ${columns.join(", ")}) VALUES (?, ${columns.map(() => "?").join(", ")})`)
-          .run(target.r, ...columns.map((column) => decoy[column] as never));
+        expect(() => external.prepare(`REPLACE INTO outbox (rowid, ${columns.join(", ")}) VALUES (?, ${columns.map(() => "?").join(", ")})`)
+          .run(target.r, ...columns.map((column) => decoy[column] as never))).toThrow(/OUTBOX_NO_REPLACE/);
       }
-      expect(rowOf(fixture, first!.message_id)).toBeUndefined();
+      expect(rowOf(fixture, first!.message_id)).toEqual(original);
+      putBack(fixture, first!.message_id);
       copyAs(original, `${first!.message_id}_again`);
 
       await fixture.ceoSays("그 뒤에 온 진짜 지시");
@@ -2348,8 +2366,10 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
   it("W11 01(c): a turn the ingress completed is never carried, however its terminal fact is erased afterwards", async () => {
     const fixture = await startFixture();
     const external = new Database(join(fixture.harness.root, "state.sqlite"));
-    // An outside writer defines the ingress claim authority on its own connection to re-insert a claim.
+    // An outside writer defines the ingress claim authority on its own connection to re-insert a claim,
+    // and the ingress delete authority to remove the admitted row first.
     external.function("acp_ingress_claim_authorized", { varargs: true }, () => 1);
+    external.function("acp_ingress_delete_authorized", { varargs: true }, () => 1);
     try {
       const { harness } = fixture;
       const guard = new IngressGuard(harness.cp.db, harness.clock, harness.cp.audit, {});
@@ -2366,11 +2386,16 @@ describe("finding 01: a holder-claimed message that ever left PENDING is never h
           WHERE channel = 'buzz' AND nonce = ?`,
         [buzzMessageNonce(erased.id)],
       );
-      // The admitted row deleted through its hidden rowid and inserted again without the fact.
+      // The admitted row deleted and inserted again without the fact. Through its hidden rowid that is
+      // refused since v46 (#1094), and the row stays; the outside writer deletes it outright instead.
       const row = external.prepare(`SELECT rowid AS r, * FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`)
         .get(buzzMessageNonce(recreated.id)) as Record<string, unknown>;
-      external.prepare(`REPLACE INTO inbound_messages (rowid, channel, nonce, actor, received_at) VALUES (?, 'buzz', ?, ?, ?)`)
-        .run(row["r"] as never, "buzz-message:decoy", "decoy", harness.clock.nowIso());
+      expect(() => external.prepare(`REPLACE INTO inbound_messages (rowid, channel, nonce, actor, received_at) VALUES (?, 'buzz', ?, ?, ?)`)
+        .run(row["r"] as never, "buzz-message:decoy", "decoy", harness.clock.nowIso())).toThrow(/INBOUND_MESSAGE_NO_REPLACE/);
+      expect(external.prepare(`SELECT rowid AS r, * FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`)
+        .get(buzzMessageNonce(recreated.id))).toEqual(row);
+      expect(external.prepare(`DELETE FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`)
+        .run(buzzMessageNonce(recreated.id)).changes).toBe(1);
       const { r: _rowid, ...kept } = row;
       const claim = JSON.parse(String(kept["turn_claim_json"])) as Record<string, unknown>;
       delete claim["noReplyAt"];
