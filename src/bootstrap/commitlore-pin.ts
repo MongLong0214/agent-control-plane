@@ -37,6 +37,7 @@ export const COMMITLORE_BINARY_VARIABLE = "ACP_COMMITLORE_BINARY";
 
 /**
  * Why a pin is refused. The stat conditions are the provider pins' own (`doctor.ts` `PinCondition`).
+ * `NO_DOCTOR_COMMAND`: `doctor --help` gives no `doctor` usage that declares `--json` (`judgeCommitLoreDoctorCommand`).
  * `NO_INIT_COMMAND`: `init --help` gives no `init` usage at all (it fails, or answers something else).
  * `NO_INIT_OPTION`: it gives one, and that usage does not offer an option the observation passes.
  */
@@ -158,25 +159,58 @@ export const judgeCommitLoreVersion = (pin: string, run: CommitLoreRun): string 
 };
 
 /**
+ * Review B3-R1-01 — one option declaration in a usage's `Options:` section, as the CLI's argument parser
+ * (commander) prints it: exactly two spaces of indent, then `--name` or `-x, --name`, then whitespace, `<`,
+ * `[`, `=` or the end of the line. The name is taken whole, so a longer option (`--no-agent-hooks-x`) or a
+ * shorter prefix (`--no-agent`) is another option, and a short alias alone (`-n`) declares no long option.
+ */
+const OPTION_DECLARATION = /^ {2}(?:-[A-Za-z0-9], )?(--[A-Za-z0-9][A-Za-z0-9-]*)(?=[\s<[=]|$)/;
+
+/**
+ * Review B3-R1-01 — the long options a usage declares: only the declarations (`OPTION_DECLARATION`) inside
+ * its `Options:` section, which runs from the first line that is `Options:` to the first blank line or the
+ * first line not indented by a space. A description's wrapped continuation (indented deeper), the command's
+ * description and the prose after the section (at column 0) declare nothing, whatever word they start with.
+ * A layout this does not recognise declares nothing, so every required option is missing (fail closed): no
+ * `Options:` section, option lines at another indent, or a tab in place of the two spaces.
+ */
+const declaredCommitLoreOptions = (usage: string): ReadonlySet<string> => {
+  const lines = usage.split("\n");
+  const start = lines.findIndex((line) => /^Options:\s*$/.test(line));
+  const declared = new Set<string>();
+  if (start === -1) return declared;
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() === "" || !line.startsWith(" ")) break;
+    const declaration = OPTION_DECLARATION.exec(line);
+    if (declaration !== null) declared.add(declaration[1] as string);
+  }
+  return declared;
+};
+
+/**
  * Whether the pinned CLI has the `doctor` command the observation runs, with its `--json` report: its own
- * usage for `doctor --help`, exit 0. A CLI without the command answers with its root usage instead, and
- * exits 0 doing it, so the exit code alone says nothing. Null when it has it; otherwise the reason.
+ * usage for `doctor --help`, exit 0, declaring `--json` in its `Options:` section (`declaredCommitLoreOptions`,
+ * the one declaration rule `init`'s options are read by too; review B3-R1-01: `--json` named in prose, in a
+ * description or in a wrapped continuation is no declaration). A CLI without the command answers with its
+ * root usage instead, and exits 0 doing it, so the exit code alone says nothing. Null when it has it;
+ * otherwise the reason, `NO_DOCTOR_COMMAND` either way: the observation needs the one `doctor --json`.
  */
 export const judgeCommitLoreDoctorCommand = (pin: string, run: CommitLoreRun): string | null => {
   const usage = run.stdout.trimStart().split("\n", 1)[0] ?? "";
-  if (run.exitCode === 0 && /^Usage: commitlore doctor(\s|$)/.test(usage) && /(^|\s)--json(\s|$)/m.test(run.stdout)) return null;
+  if (run.exitCode === 0 && /^Usage: commitlore doctor(\s|$)/.test(usage) && declaredCommitLoreOptions(run.stdout).has("--json")) return null;
   return (
     `${COMMITLORE_BINARY_VARIABLE} NO_DOCTOR_COMMAND: ${pin} doctor --help exited ${run.exitCode} ` +
-    `without a doctor --json usage (${JSON.stringify(tail(usage) || tail(run.stderr))})`
+    `without a doctor usage declaring --json (${JSON.stringify(tail(usage) || tail(run.stderr))})`
   );
 };
 
 /**
  * Review S16-R1-03 — whether the pinned CLI has the `init` command the observation runs, taking the options
- * it passes: its own usage for `init --help`, exit 0, listing each of `COMMITLORE_INIT_OPTIONS` as an option
- * (a line that starts with it). As for `doctor`, a CLI without the command answers with its root usage and
- * exits 0. Null when it has it; otherwise the reason: `NO_INIT_COMMAND` when there is no `init` usage at
- * all, `NO_INIT_OPTION` naming each option that usage does not offer and what the observation needs it for.
+ * it passes: its own usage for `init --help`, exit 0, declaring each of `COMMITLORE_INIT_OPTIONS` in its
+ * `Options:` section (`declaredCommitLoreOptions`; a mention anywhere else is no declaration). As for
+ * `doctor`, a CLI without the command answers with its root usage and exits 0. Null when it has it;
+ * otherwise the reason: `NO_INIT_COMMAND` when there is no `init` usage at all, `NO_INIT_OPTION` naming each
+ * option that usage does not declare and what the observation needs it for.
  *
  * This reads a usage and runs no `init`: it shows the CLI declares the command and those options, and it is
  * no evidence that `init` succeeds in a checkout or of what it changes there.
@@ -189,9 +223,8 @@ export const judgeCommitLoreInitCommand = (pin: string, run: CommitLoreRun): str
       `(${JSON.stringify(tail(usage) || tail(run.stderr))})`
     );
   }
-  // The first word of each line, a short alias (`-m, `) aside: an option the usage lists starts its line.
-  const listed = new Set(run.stdout.split("\n").map((line) => line.trim().replace(/^-\w, /, "").split(/\s/, 1)[0]));
-  const missing = COMMITLORE_INIT_OPTIONS.filter((option) => !listed.has(option));
+  const declared = declaredCommitLoreOptions(run.stdout);
+  const missing = COMMITLORE_INIT_OPTIONS.filter((option) => !declared.has(option));
   if (missing.length === 0) return null;
   return (
     `${COMMITLORE_BINARY_VARIABLE} NO_INIT_OPTION: ${pin} init does not offer ` +

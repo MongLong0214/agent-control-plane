@@ -84,14 +84,17 @@ interface FakeOptions {
   offersNoAgentHooks: boolean;
   /** An observer that writes into the working tree although it was asked not to. */
   writesIntoTreeAnyway?: boolean;
+  /** What `init --help` prints instead of `initUsage(offersNoAgentHooks)`. */
+  initHelp?: string;
 }
 
 /**
- * A fake `commitlore` in a directory of its own, logging every argv. Its `init`, with the argv it takes, installs
- * a commit-msg hook under `.git`; the argv without `--no-agent-hooks` (1.7.4's) also writes the injection hook
- * into the tree, as 1.7.4 does.
+ * A fake `commitlore` in a directory of its own, logging every argv. Any `init` but `init --help` first leaves
+ * the marker `.git/INIT_RAN` (review B3-R1-01: it ran, whatever it then answers). Its `init`, with the argv it
+ * takes, installs a commit-msg hook under `.git`; the argv without `--no-agent-hooks` (1.7.4's) also writes the
+ * injection hook into the tree, as 1.7.4 does.
  */
-const fake = (name: string, { offersNoAgentHooks, writesIntoTreeAnyway = false }: FakeOptions): { bin: string; log: string } => {
+const fake = (name: string, { offersNoAgentHooks, writesIntoTreeAnyway = false, initHelp }: FakeOptions): { bin: string; log: string } => {
   const dir = tempDir(`acp-r2-${name}-`);
   const bin = join(dir, "commitlore");
   const log = join(dir, "argv.log");
@@ -106,9 +109,10 @@ const answer = (text, code) => process.stdout.write(text, () => process.exit(cod
 const refuse = () => process.stderr.write("error: unknown option '" + argv + "'\\n", () => process.exit(2));
 const gitHook = () => { fs.mkdirSync('.git/hooks', { recursive: true }); fs.writeFileSync('.git/hooks/commit-msg', '#!/bin/sh\\n', { mode: 0o755 }); };
 const agentHook = () => { fs.mkdirSync('.claude', { recursive: true }); fs.writeFileSync('.claude/settings.json', '{"hooks":{}}\\n'); };
+if (argv.startsWith('init ') && argv !== 'init --help') fs.writeFileSync('.git/INIT_RAN', argv + '\\n');
 if (argv === '--version') answer('1.7.4\\n', 0);
-else if (argv === 'doctor --help') answer('Usage: commitlore doctor [options]\\n  --json             emit the report as JSON\\n', 0);
-else if (argv === 'init --help') answer(${JSON.stringify(initUsage(offersNoAgentHooks))}, 0);
+else if (argv === 'doctor --help') answer('Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json             emit the report as JSON\\n', 0);
+else if (argv === 'init --help') answer(${JSON.stringify(initHelp ?? initUsage(offersNoAgentHooks))}, 0);
 else if (argv === ${JSON.stringify(OLD_INIT)}) { gitHook(); agentHook(); answer('', 0); }
 else if (argv === ${JSON.stringify(INIT)} && ${offersNoAgentHooks}) { gitHook(); if (${writesIntoTreeAnyway}) agentHook(); answer('', 0); }
 else if (argv === 'doctor --json') answer(${JSON.stringify(`${DEGRADED_REPORT}\n`)}, 0);
@@ -159,6 +163,7 @@ describe("R2: the observation's init carries --no-agent-hooks, and a CommitLore 
     // Only the checks ran: neither init with the option nor the argv without it, whose 1.7.4 answer would pass.
     expect(argvs(cli.log)).toEqual(CHECKS);
     expect(existsSync(join(checkout, ".claude"))).toBe(false);
+    expect(existsSync(join(checkout, ".git", "INIT_RAN"))).toBe(false);
     expect(existsSync(join(checkout, ".git", "hooks", "commit-msg"))).toBe(false);
     expect(hooks(checkout)).toEqual(hooksBefore);
     expect(status(checkout)).toBe("");
@@ -170,6 +175,36 @@ describe("R2: the observation's init carries --no-agent-hooks, and a CommitLore 
       evidence: { refusal: "COMMITLORE_REQUIRED_NOT_OBSERVED", at: "probe", observation: { detail: expect.stringContaining("NO_INIT_OPTION") } },
     });
     expect(argvs(cli.log)).toEqual(CHECKS);
+  });
+
+  // Review B3-R1-01 (RED at c3835591: init ran, left its marker, then exited 2 on the unknown option). The usage
+  // declares the other two options and names --no-agent-hooks only as the first word of a line that is no
+  // option declaration.
+  it.each([
+    ["an epilogue line at column 0", `${initUsage(false)}--no-agent-hooks is unavailable in this release.\n`],
+    [
+      "a wrapped description's continuation line",
+      initUsage(false).replace("                       foreign hook\n", "                       --no-agent-hooks is not offered by this build\n"),
+    ],
+  ])("B3-R1-01: --no-agent-hooks named only in %s is refused NO_INIT_OPTION after exactly the three checks, and init never runs", async (_where, help) => {
+    expect(help.split("\n").some((line) => line.trimStart().startsWith("--no-agent-hooks is "))).toBe(true);
+    const cli = fake("named-not-declared", { offersNoAgentHooks: false, initHelp: help });
+    const checkout = makeRepo();
+    const hooksBefore = hooks(checkout);
+    const observed = await requiredCommitLoreObservation(portAt(cli.bin), checkout, { at: "checkout" });
+    expect(observed).toMatchObject({
+      allowed: false,
+      evidence: {
+        refusal: "COMMITLORE_REQUIRED_NOT_OBSERVED",
+        at: "checkout",
+        observation: { outcome: "FAIL", detail: expect.stringContaining("ACP_COMMITLORE_BINARY NO_INIT_OPTION: ") },
+      },
+    });
+    expect(argvs(cli.log)).toEqual(CHECKS);
+    expect(existsSync(join(checkout, ".git", "INIT_RAN"))).toBe(false);
+    expect(existsSync(join(checkout, ".claude"))).toBe(false);
+    expect(hooks(checkout)).toEqual(hooksBefore);
+    expect(status(checkout)).toBe("");
   });
 
   it("an init usage with the option: init runs with --no-agent-hooks after the checks, the doctor is judged as before, and the observation passes with the status empty", async () => {

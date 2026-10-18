@@ -25,6 +25,8 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMMITLORE_LIMITS,
   COMMITLORE_OBSERVATION_ARGV,
+  commitloreChildEnvironment,
+  commitloreChildHome,
   commitloreRunner,
   createCommitLoreCliPort,
   probeCommitLore,
@@ -36,6 +38,7 @@ import {
   COMMITLORE_PIN_MAX_BYTES,
   commitlorePinIdentity,
   CommitLorePinIdentityError,
+  judgeCommitLoreDoctorCommand,
   judgeCommitLoreInitCommand,
   judgeCommitLoreVersion,
 } from "../../src/bootstrap/commitlore-pin.ts";
@@ -111,6 +114,14 @@ const DOCTOR_USAGE = [
   "  -h, --help         display help for command",
   "",
 ].join("\n");
+// Review B3-R1-01, its doctor sibling: `--json` undeclared, and named only as the first word of a line that is
+// no declaration: after the options at column 0, or as another option's wrapped description.
+const DOCTOR_WITHOUT_JSON = DOCTOR_USAGE.replace("  --json             emit the report as JSON\n", "");
+const DOCTOR_JSON_IN_EPILOGUE_ONLY = `${DOCTOR_WITHOUT_JSON}\n--json is not offered by this doctor.\n`;
+const DOCTOR_JSON_IN_CONTINUATION_ONLY = DOCTOR_WITHOUT_JSON.replace(
+  "  --fix              apply the reversible local config fixes\n",
+  "  --fix              apply the reversible local config fixes;\n                     --json is not offered by this doctor\n",
+);
 // What the real CLI 1.7.3 prints for `init --help`, its options in the order it lists them, with the
 // `--no-agent-hooks` option that commitlore main (4501ef68, not yet released) lists before `-h, --help`.
 const INIT_USAGE = [
@@ -175,6 +186,21 @@ const ROOT_USAGE = [
 ].join("\n");
 const INIT = "init --mcp-scope none --no-unattended --no-agent-hooks";
 const OBSERVATION = ["--version", "doctor --help", "init --help", INIT, "doctor --json"];
+
+/** `usage` without its declaration of `option`: the option's line and every wrapped continuation of it. */
+const undeclared = (usage: string, option: string): string => {
+  const without = usage.replace(new RegExp(`^ {2}${option}[ <][^\\n]*\\n(?: {3,}[^\\n]*\\n)*`, "m"), "");
+  if (without === usage) throw new Error(`FIXTURE FAILURE: ${option} is not declared in the usage it is removed from`);
+  return without;
+};
+/** Review B3-R1-01: `option` undeclared, and named only as the first word of a column-0 line after the options. */
+const inEpilogueOnly = (option: string): string => `${undeclared(INIT_USAGE, option)}\n${option} is unavailable in this release.\n`;
+/** Review B3-R1-01: `option` undeclared, and named only as the first word of another option's wrapped description. */
+const inContinuationOnly = (option: string): string => {
+  const usage = undeclared(INIT_USAGE, option).replace("                       foreign hook\n", `                       ${option} is not offered by this build\n`);
+  if (!usage.includes(`                       ${option} is not offered`)) throw new Error("FIXTURE FAILURE: no continuation line to rewrite");
+  return usage;
+};
 
 interface FakeOptions {
   version?: string;
@@ -359,12 +385,35 @@ describe("S16: the pinned CLI must answer a supported version and have doctor --
     ["a doctor without --json", { doctorHelp: DOCTOR_USAGE.replace(/ {2}--json[^\n]*\n/, "") }],
     ["a root usage that has a --json of its own", { doctorHelp: `${ROOT_USAGE}  --json          emit JSON\n` }],
     ["no usage at all", { doctorHelp: "" }],
+    // Review B3-R1-01, its doctor sibling (RED at c3835591): --json named, never declared.
+    ["a doctor that names --json only in an epilogue line, as its first word", { doctorHelp: DOCTOR_JSON_IN_EPILOGUE_ONLY }],
+    ["a doctor that names --json only as the first word of a wrapped description", { doctorHelp: DOCTOR_JSON_IN_CONTINUATION_ONLY }],
   ])("%s refuses NO_DOCTOR_COMMAND, though its doctor --json would answer ok", async (_name, options) => {
     workingOnPath();
     const pinned = fake("doctor", options);
     vi.stubEnv(VARIABLE, pinned.bin);
     await refusedWith("NO_DOCTOR_COMMAND");
     expect(argvs(pinned.log)).toEqual(["--version", "doctor --help"]);
+  });
+
+  // Review B3-R1-01, its doctor sibling: `--json` is read by the one declaration rule init's options are.
+  it("B3-R1-01 doctor controls: an exact declaration passes; a longer option, a shorter prefix, a short alias alone and an unrecognised layout do not declare --json", () => {
+    const judged = (doctorHelp: string): string | null => judgeCommitLoreDoctorCommand("/pinned/commitlore", { exitCode: 0, stdout: doctorHelp, stderr: "" });
+    const refused = /^ACP_COMMITLORE_BINARY NO_DOCTOR_COMMAND: \/pinned\/commitlore doctor --help exited 0 without a doctor usage declaring --json /;
+    expect(judged(DOCTOR_USAGE)).toBeNull();
+    expect(judged(DOCTOR_USAGE.replace("  --json             emit", "  -j, --json         emit"))).toBeNull();
+    for (const declaration of ["  --json-x           emit", "  --js               emit", "  -j                 emit"]) {
+      expect(judged(DOCTOR_USAGE.replace("  --json             emit", declaration)), declaration).toMatch(refused);
+    }
+    for (const [layout, usage] of [
+      ["no Options: section", DOCTOR_USAGE.replace("Options:\n", "")],
+      ["four spaces", DOCTOR_USAGE.replace(/^ {2}(?=-)/gm, "    ")],
+      ["a tab", DOCTOR_USAGE.replace(/^ {2}(?=-)/gm, "\t")],
+    ] as const) {
+      expect(judged(usage), layout).toMatch(refused);
+    }
+    expect(judged(DOCTOR_JSON_IN_EPILOGUE_ONLY)).toMatch(refused);
+    expect(judged(DOCTOR_JSON_IN_CONTINUATION_ONLY)).toMatch(refused);
   });
 
   it.each(["1.4.2\n", "1.5.1\n", "1.7.3\n", "1.10.0\n", "1.4.10\n"])("version %j within major 1 from 1.4.2 is supported", async (version) => {
@@ -547,6 +596,19 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
       { initHelp: "Usage: commitlore init [options]\n\nPass --mcp-scope none, --no-unattended and --no-agent-hooks from scripts.\n" },
       ["--mcp-scope", "--no-unattended", "--no-agent-hooks"],
     ],
+    // Review B3-R1-01: the same prose with each option the first word of its line, and no Options: section.
+    [
+      "an init usage that names the options only in prose, each the first word of its line",
+      { initHelp: "Usage: commitlore init [options]\n\n--mcp-scope none keeps the MCP registration out.\n--no-unattended keeps capture off.\n--no-agent-hooks keeps the checkout clean.\n" },
+      ["--mcp-scope", "--no-unattended", "--no-agent-hooks"],
+    ],
+    // Review B3-R1-01 regressions (RED at c3835591, where init ran): --no-agent-hooks named, not declared.
+    ["an init that names --no-agent-hooks only in an epilogue line, as its first word", { initHelp: inEpilogueOnly("--no-agent-hooks") }, ["--no-agent-hooks"]],
+    [
+      "an init that names --no-agent-hooks only as the first word of a wrapped description",
+      { initHelp: inContinuationOnly("--no-agent-hooks") },
+      ["--no-agent-hooks"],
+    ],
   ])("%s refuses NO_INIT_OPTION, and init never runs", async (_name, options, missing) => {
     workingOnPath();
     const pinned = fake("init-option", options);
@@ -557,6 +619,53 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
     const refusal = judgeCommitLoreInitCommand("/pinned/commitlore", { exitCode: 0, stdout: options.initHelp, stderr: "" });
     expect(refusal).toMatch(/^ACP_COMMITLORE_BINARY NO_INIT_OPTION: \/pinned\/commitlore init does not offer --/);
     for (const option of COMMITLORE_INIT_OPTIONS) expect(refusal?.includes(`${option}, which the observation needs `), option).toBe(missing.includes(option));
+  });
+
+  // Review B3-R1-01 (CEO e96196aa): one parser for all three options. Each is judged declared only on an
+  // option line of the Options: section; named anywhere else it is missing.
+  const judged = (usage: string): string | null => judgeCommitLoreInitCommand("/pinned/commitlore", { exitCode: 0, stdout: usage, stderr: "" });
+  const missingIn = (usage: string): string[] => {
+    const refusal = judged(usage);
+    if (refusal === null) return [];
+    expect(refusal).toMatch(/^ACP_COMMITLORE_BINARY NO_INIT_OPTION: \/pinned\/commitlore init does not offer --/);
+    return COMMITLORE_INIT_OPTIONS.filter((option) => refusal.includes(`${option}, which the observation needs `));
+  };
+
+  it.each(
+    COMMITLORE_INIT_OPTIONS.flatMap((option) => [
+      [`${option} named only in an epilogue line, as its first word`, inEpilogueOnly(option), option, `${option} is unavailable in this release.`],
+      [
+        `${option} named only as the first word of a wrapped description`,
+        inContinuationOnly(option),
+        option,
+        `                       ${option} is not offered by this build`,
+      ],
+    ]),
+  )("B3-R1-01: %s is missing (NO_INIT_OPTION)", (_name, usage, option, line) => {
+    // The fixture really names the option first on that line, and nowhere declares it.
+    expect(usage.split("\n")).toContain(line);
+    expect(missingIn(usage)).toEqual([option]);
+  });
+
+  it.each([
+    ["no Options: section", INIT_USAGE.replace("Options:\n", "")],
+    ["option lines indented by four spaces", INIT_USAGE.replace(/^ {2}(?=-)/gm, "    ")],
+    ["option lines indented by one space", INIT_USAGE.replace(/^ {2}(?=-)/gm, " ")],
+    ["option lines indented by a tab", INIT_USAGE.replace(/^ {2}(?=-)/gm, "\t")],
+    ["option lines after a blank line inside the section", INIT_USAGE.replace("Options:\n", "Options:\n\n")],
+    ["a description line that starts with each option, above an Options: section that declares none", "Usage: commitlore init [options]\n\n--mcp-scope\n--no-unattended\n--no-agent-hooks\n\nOptions:\n  -h, --help           display help for command\n"],
+  ])("B3-R1-01: a layout it does not recognise declares nothing, and every option is missing (fail closed): %s", (_name, usage) => {
+    expect(missingIn(usage)).toEqual([...COMMITLORE_INIT_OPTIONS]);
+  });
+
+  it("B3-R1-01 controls: an exact declaration passes; a longer option, a shorter prefix and a short alias alone do not declare it", () => {
+    expect(judged(INIT_USAGE)).toBeNull();
+    expect(judged(INIT_USAGE.replace("  --no-agent-hooks     write", "  -n, --no-agent-hooks write"))).toBeNull();
+    expect(missingIn(INIT_USAGE.replace("  --no-agent-hooks     write", "  --no-agent-hooks-x   write"))).toEqual(["--no-agent-hooks"]);
+    expect(missingIn(INIT_USAGE.replace("  --no-agent-hooks     write", "  --no-agent           write"))).toEqual(["--no-agent-hooks"]);
+    expect(missingIn(INIT_USAGE.replace("  --no-agent-hooks     write", "  -n                   write"))).toEqual(["--no-agent-hooks"]);
+    // The real 1.7.4 usage, every line of it, declares the other two and not --no-agent-hooks.
+    expect(missingIn(INIT_USAGE_1_7_4)).toEqual(["--no-agent-hooks"]);
   });
 
   it("the refusal for a missing --no-agent-hooks names the capability: the observation needs it so that it writes nothing into the checkout", () => {
@@ -702,14 +811,63 @@ const shellFake = (name: string, { versionDelay = "0" }: { versionDelay?: string
 const shellArgvs = (log: string): string[] => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
 
 /**
- * The host's real CLI, for this test only, and only when it is given explicitly: an absolute path in
- * `ACP_TEST_REAL_COMMITLORE`. It is never found on PATH (nor does the producer search PATH), so a CLI that
- * happens to be installed where this suite runs, CI included, never decides it.
+ * The real CLI this test judges: `ACP_TEST_REAL_COMMITLORE` when it is set, otherwise the first `commitlore` on
+ * this process's PATH (absolute entries, executable), as project CI provides one (`ci:commitlore` appends its
+ * directory to GITHUB_PATH); null when there is neither, and the test is skipped.
+ *
+ * This discovery is the test's own, and separate from the daemon's contract: the daemon never searches PATH,
+ * and runs only the explicit absolute pin `ACP_COMMITLORE_BINARY` names (`commitlorePin`), as this test does
+ * once it has found one.
  */
-const REAL = process.env["ACP_TEST_REAL_COMMITLORE"] || null;
+const realCommitLore = (): string | null => {
+  const explicit = process.env["ACP_TEST_REAL_COMMITLORE"];
+  if (explicit !== undefined && explicit !== "") return explicit;
+  for (const directory of (process.env["PATH"] ?? "").split(":").filter((entry) => entry.startsWith("/"))) {
+    try {
+      accessSync(join(directory, "commitlore"), constants.X_OK);
+      return join(directory, "commitlore");
+    } catch {
+      // not here
+    }
+  }
+  return null;
+};
+const REAL = realCommitLore();
 
-describe("S16: the real pinned CLI, given explicitly, in the constructed environment and a fresh HOME", () => {
-  it.skipIf(REAL === null)("answers the pin's checks as its init usage declares, writes nothing to HOME and leaves the checkout clean", async () => {
+/** Whether a usage declares `--no-agent-hooks` as an option line: this test's own reading, not the producer's. */
+const offersNoAgentHooks = (usage: string): boolean => /^ {2}(?:-\w, )?--no-agent-hooks(?=[\s<[=]|$)/m.test(usage);
+const branchFor = (usage: string): string =>
+  offersNoAgentHooks(usage) ? "pass branch: init offers --no-agent-hooks" : "refusal branch: init lacks --no-agent-hooks";
+
+/**
+ * CEO e96196aa — which capability branch the real CLI is judged on, named in the test's own title so that the
+ * run's output says it ran and which branch it judged (the junit and json reports always carry the title; the
+ * default reporter prints it for a file run alone, a slow test or a failure). Read once here, at collection,
+ * from the CLI's own `init --help` under a fresh HOME and the child environment the runner gives a check; the
+ * test reads the usage again through the runner and requires the same branch.
+ */
+const REAL_BRANCH = ((): string => {
+  if (REAL === null) return "no real CLI";
+  const home = commitloreChildHome();
+  try {
+    const usage = execFileSync(REAL, ["init", "--help"], {
+      cwd: home,
+      env: commitloreChildEnvironment(home),
+      encoding: "utf8",
+      timeout: 30_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return branchFor(usage);
+  } catch (error) {
+    return `unjudged: its init --help could not be read (${(error as Error).message.split("\n", 1)[0]})`;
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+})();
+
+describe("S16: the real CLI (ACP_TEST_REAL_COMMITLORE, else the first on PATH) in the constructed environment and a fresh HOME", () => {
+  it.skipIf(REAL === null)(`the real pinned CLI, ${REAL_BRANCH}: answers the pin's checks as its init usage declares, writes nothing to HOME and leaves the checkout clean`, async () => {
+    expect(REAL_BRANCH).toMatch(/^(pass|refusal) branch: /);
     const home = tempDir("acp-s16-real-home-");
     const repo = tempDir("acp-s16-real-repo-");
     execFileSync("git", ["init", "-q"], { cwd: repo, timeout: 20_000 });
@@ -719,10 +877,11 @@ describe("S16: the real pinned CLI, given explicitly, in the constructed environ
     vi.stubEnv(VARIABLE, undefined);
     for (const key of ["ACP_MCP_TOKEN", "ACP_OPERATOR_TOKEN", "GH_TOKEN"]) vi.stubEnv(key, `s16-only-${key}`);
     const run = commitloreRunner(COMMITLORE_LIMITS, REAL as string);
-    // What this CLI's own init usage declares, read here by a pattern of this test's, not the producer's.
+    // The usage again, through the runner: the branch the title names is the one judged here.
     const usage = await run(["init", "--help"], repo);
     expect(usage.exitCode).toBe(0);
-    if (/^ {2}--no-agent-hooks\s/m.test(usage.stdout)) {
+    expect(branchFor(usage.stdout)).toBe(REAL_BRANCH);
+    if (offersNoAgentHooks(usage.stdout)) {
       // The pin is passed, not found: its checks, `--version`, `doctor --help` and `init --help`, pass, and so
       // does a run through the runner they bound.
       const checked = await run.ready(repo);
@@ -916,7 +1075,7 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     // The reviewer's script (hash-budget-parent.mjs), logging each argv that reaches it, then made 1 TiB.
     writeFileSync(
       pin,
-      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${ran}'\ncase "$*" in\n"--version") echo 1.7.3; exit 0;;\n"doctor --help") printf "Usage: commitlore doctor [options]\\n  --json\\n"; exit 0;;\n"init --help") printf "Usage: commitlore init [options]\\n  --mcp-scope <scope>\\n  --no-unattended\\n  --no-agent-hooks\\n"; exit 0;;\n"${INIT}") exit 0;;\n"doctor --json") echo '${OK_REPORT}'; exit 0;;\nesac\nexit 2\n`,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${ran}'\ncase "$*" in\n"--version") echo 1.7.3; exit 0;;\n"doctor --help") printf "Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json\\n"; exit 0;;\n"init --help") printf "Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>\\n  --no-unattended\\n  --no-agent-hooks\\n"; exit 0;;\n"${INIT}") exit 0;;\n"doctor --json") echo '${OK_REPORT}'; exit 0;;\nesac\nexit 2\n`,
       { mode: 0o700 },
     );
     sparse(pin, TIB);
