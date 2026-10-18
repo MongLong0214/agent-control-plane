@@ -3,7 +3,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ATTACH_EXIT, runAttachRelay, runAttachRelayCommand } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -30,6 +30,21 @@ import { cleanupTempDirs } from "../helpers/fixtures.ts";
  * reaches it. The only stated facts are the process tree above this test process — which the
  * kernel reports as the peer, since the relay runs in-process.
  */
+
+/**
+ * The relay's CLI entry reads the session's messaging socket and token from the environment, and a
+ * run from inside a Claude Code session inherits that session's real ones: the relay would open its
+ * wake proxy beside the live session's socket, outside this file's scratch roots. Every
+ * CLAUDE_CODE_MESSAGING_* variable is cleared before any relay runs, so the only socket directories
+ * a run uses are the mkdtemp roots below.
+ */
+const clearSessionMessagingEnv = (): void => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
+  }
+};
+clearSessionMessagingEnv();
+beforeEach(clearSessionMessagingEnv);
 
 const TOKEN = "fixture-mcp-token";
 const roots: string[] = [];

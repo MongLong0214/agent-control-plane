@@ -1444,6 +1444,31 @@ export class Outbox {
   }
 
   /**
+   * Whether this exact holder has anything a wake would send it to read: a row `pendingInBandFor`
+   * lists, an owner or peer message `claimForHolder` would hand over, report unresolved or report
+   * withheld, or a refusal notice it is owed. Only reads.
+   *
+   * The registration wake asks this (FIX-ROLE-WAKE): a registration wake with no confirmed work is
+   * skipped, and a relay registers again on every daemon start. It errs toward true: a withheld row
+   * counts, because the claim still shows it to the holder.
+   */
+  hasWorkForHolder(holder: HolderIdentity): boolean {
+    if (this.pendingInBandFor(holder.targetSessionId, holder.sessionIncarnation).length > 0) return true;
+    const queued = this.db.get<{ queued: number }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM outbox o
+          WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
+            AND o.status IN ('PENDING','SENT')
+            AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
+            AND ${exactHolderTarget("o")}
+       ) AS queued`,
+      [holder.roleKey, holder.bindingGeneration, holder.targetSessionId, holder.sessionIncarnation],
+    );
+    if (queued?.queued === 1) return true;
+    return this.peerMessageRefusalNoticesFor(holder).length > 0;
+  }
+
+  /**
    * Installs the CTO role's wake port. Rows enqueued before this are not woken by it; the next
    * `wakeInBandPending` finds them, which is why the composition root runs one right after.
    */

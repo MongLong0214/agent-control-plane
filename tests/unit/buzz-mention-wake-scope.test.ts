@@ -21,6 +21,7 @@ import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { deliverBuzzMessage } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import { ROLE_WAKE_FRAME, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { MessageKind } from "../../src/outbox/envelope.ts";
 import { IN_BAND_KINDS } from "../../src/outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../../src/registry/canonical-self-claim.ts";
 import { channelKey, signedMention, steppedClock, storingRelay, writeSubscriberConfig } from "../helpers/buzz-mention-relay.ts";
@@ -287,6 +288,17 @@ describe("wakes the mention gate does not govern keep the current-holder check a
     try {
       f.excludeIdentity();
       const holder = f.h.cp.bindings.active(f.roleKey)!;
+      // Something for the registration to drain: a registration wake with no confirmed work is
+      // skipped (FIX-ROLE-WAKE). An owner message queued here sends no wake of its own.
+      expect(f.h.cp.outbox.enqueue({
+        idempotencyKey: "owner-message:registration-drain",
+        roleKey: f.roleKey,
+        bindingGeneration: holder.bindingGeneration,
+        targetSessionId: holder.sessionId,
+        runId: null,
+        kind: MessageKind.OWNER_MESSAGE,
+        payload: { sourceChannel: "buzz", sourceNonce: "registration-drain", sourcePayloadDigest: "x" },
+      }).allowed).toBe(true);
       const again = await f.attach(holder.sessionId, holder.sessionIncarnation, "wake-2.sock");
       expect(again.registration.allowed).toBe(true);
       expect(again.dials).toBe(1);
@@ -316,7 +328,8 @@ describe("wakes the mention gate does not govern keep the current-holder check a
       expect(f.subscriber.admission().identities[0]).toMatchObject({ state: "EXCLUDED", roleKey: f.roleKey });
       const attached = await f.attach(next.sessionId, f.h.cp.sessions.require(next.sessionId).incarnation, "next.sock");
       expect(attached.registration.allowed).toBe(true);
-      expect(attached.frame).toBe(ROLE_WAKE_FRAME);
+      // No work is confirmed for the new holder, so its registration wake is skipped (FIX-ROLE-WAKE).
+      expect(attached.dials).toBe(0);
       const before = wakes.dialled.length;
       const woken = f.conversation.wake(f.roleKey);
       const dials = await completeDials(before);

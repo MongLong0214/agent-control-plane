@@ -27,6 +27,7 @@ import {
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startLocalMcpListeners, type LocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { ROLE_WAKE_FRAME, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
+import { MessageKind } from "../../src/outbox/envelope.ts";
 import {
   canonicalCtoFixture,
   CLAUDE,
@@ -199,6 +200,18 @@ const started = async () => {
   fixtures.push(subject);
   // The kernel will report this process as the peer: it runs under the stated claude.
   subject.processes.set(process.pid, { ppid: CLAUDE, startedAt: "darwin-tv:1790000500.000005", argv: ["node"] });
+  // A registration wake with no confirmed work is skipped (FIX-ROLE-WAKE).
+  // One owner message stays queued, so each registration is one wake through the proxy, as counted below.
+  const holder = subject.h.cp.bindings.active(CTO)!;
+  expect(subject.h.cp.outbox.enqueue({
+    idempotencyKey: "owner-message:relay-wake-proxy",
+    roleKey: CTO,
+    bindingGeneration: holder.bindingGeneration,
+    targetSessionId: holder.sessionId,
+    runId: null,
+    kind: MessageKind.OWNER_MESSAGE,
+    payload: { sourceChannel: "buzz", sourceNonce: "relay-wake-proxy", sourcePayloadDigest: "x" },
+  }).allowed).toBe(true);
   const dir = mkdtempSync("/tmp/acpwp-");
   roots.push(dir);
   const daemon = await daemonOn(subject, dir);
