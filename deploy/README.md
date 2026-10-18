@@ -136,6 +136,11 @@ and the daemon passes it to the matching adapter. An absolute pin is the only ch
 CLI outside the launcher's `PATH` is reachable; a configured adapter override takes precedence
 over the environment.
 
+`commitlore` is pinned the same way, as `ACP_RESOLVED_COMMITLORE_BINARY` promoted to
+`ACP_COMMITLORE_BINARY` unless that is already set; it is the daemon's only input for a bootstrap's
+CommitLore (no `PATH` search), and a delivered pin is still vetted by the daemon's own checks, so it
+does not by itself make a bootstrap succeed.
+
 Only an absolute, executable path is pinned. A CLI the installer cannot resolve is named on
 stderr and left unpinned rather than refused, so a host without an optional CLI can still deploy.
 An unpinned provider is searched for on the launcher's `PATH` as any bare name would be, and if it

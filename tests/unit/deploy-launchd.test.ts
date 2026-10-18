@@ -281,15 +281,16 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # its own PATH can find, whether the handed path runs, which interpreter its PATH resolves,
   # whether an unrelated executable sitting beside a provider CLI is reachable, then the atomic
   # canonical activation group, then where the bare name lsof resolves and what a real scan through
-  # it reports, then the optional Hermes adoption group. These are separate observations and a
-  # launcher can satisfy any of them without the others.
+  # it reports, then the optional Hermes adoption group, then the reviewer's Codex home override,
+  # then the CommitLore pin the daemon was handed. These are separate observations and a launcher
+  # can satisfy any of them without the others.
   #
   # The positions of the last three are deliberately NOT written here. They are derived in
   # launcherObservations from the activation groups own lengths, and the numbers this comment used
   # to carry had already gone stale twice: it said the canonical group ran 17-24 when it runs 17-22,
   # put lsof at 25-26 when it is 23-24, and gave Hermes an overlapping 26-33. A comment restating a
   # derived position is the second authority the derivation was introduced to remove.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \\
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \\
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \\
@@ -307,7 +308,8 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \\
     "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \\
     "\${ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY-}" "\${ACP_HERMES_GATEWAY_API_KEY-}" \\
-    "\${ACP_REVIEWER_CODEX_HOME:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
+    "\${ACP_REVIEWER_CODEX_HOME:-<unset>}" \\
+    "\${ACP_COMMITLORE_BINARY:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -505,6 +507,8 @@ const launcherObservations = (harness: InstallerHarness) => {
     ) as Record<(typeof HERMES_ADOPTION_VARIABLES)[number], string>,
     /** The packet reviewer's optional private Codex home override, appended after the Hermes group. */
     reviewerCodexHome: f[HERMES_BASE_FIELD + HERMES_ADOPTION_VARIABLES.length],
+    /** The `ACP_COMMITLORE_BINARY` the daemon was handed (#246 B3), appended after the reviewer override. */
+    commitlore: f[HERMES_BASE_FIELD + HERMES_ADOPTION_VARIABLES.length + 1],
   };
 };
 
@@ -2088,6 +2092,120 @@ exec /bin/cp "$@"
     for (const name of ["claude", "codex", "grok"]) expect(seen.handed[name]).toBe("<unset>");
   });
 
+  /**
+   * #246 B3 runs a bootstrap's CommitLore only from `ACP_COMMITLORE_BINARY`, an explicit absolute path
+   * (src/bootstrap/commitlore-pin.ts): no PATH search, no alias, no fallback. A launcher that never sets
+   * it makes every bootstrap CommitLore observation refuse, so the installer resolves `commitlore` the
+   * way it resolves the provider CLIs. These rows measure the pin's delivery only; whether a bootstrap
+   * then succeeds is the daemon's to decide, and nothing here says it does.
+   */
+  const PINNED_CLIS = [
+    ["claude", "ACP_RESOLVED_CLAUDE_BINARY"],
+    ["codex", "ACP_RESOLVED_CODEX_BINARY"],
+    ["grok", "ACP_RESOLVED_GROK_BINARY"],
+    ["commitlore", "ACP_RESOLVED_COMMITLORE_BINARY"],
+  ] as const;
+
+  /** Each named CLI in a directory of its own, and a PATH that holds those directories and nothing else. */
+  const cliDirectories = (harness: InstallerHarness, ...names: string[]): Record<string, string> => {
+    // An inherited value would be the operator's and would win; these rows measure the installer's.
+    delete harness.env["ACP_COMMITLORE_BINARY"];
+    const cli: Record<string, string> = {};
+    const directories = names.map((name) => {
+      const directory = join(harness.home, `acp-cli-${name}`);
+      mkdirSync(directory, { recursive: true });
+      cli[name] = writeProviderCli(join(directory, name), SELF_CONTAINED_CLI);
+      return directory;
+    });
+    harness.env["PATH"] = isolatedInstallerPath(harness, ...directories);
+    return cli;
+  };
+
+  it("B3-PIN pins the commitlore CLI absolutely beside the provider pins, and the daemon is handed it", () => {
+    const harness = makeHarness();
+    const cli = cliDirectories(harness, "claude", "codex", "grok", "commitlore");
+
+    const installed = installWithPins(harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    expect(installed.stderr, "a CLI that resolved was reported as unresolved").not.toContain("could not resolve");
+
+    // The rendered artifact that carries every one of these pins is the launcher: the plist runs it and
+    // carries none of them. Whole lines, so a pin cannot be satisfied by a comment that mentions the path.
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    const lines = launcher.split("\n");
+    expect(cli["commitlore"]?.startsWith("/"), "the fixture is not an absolute path").toBe(true);
+    for (const [name, variable] of PINNED_CLIS) {
+      expect(lines, `${variable} does not carry the ${name} CLI the installer resolved`).toContain(
+        `${variable}=${cli[name]}`,
+      );
+    }
+    // The pin is the channel; the CLI's directory is not added to the daemon's PATH to reach it.
+    expect(launcher).toContain(EXPECTED_LAUNCHER_PATH_LINE);
+    expect(launcher, "the commitlore directory reached the daemon's PATH").not.toContain(
+      `${dirname(cli["commitlore"] as string)}:`,
+    );
+
+    // The file holding a path is not the daemon receiving it: run the launcher and read what it handed.
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+    expect(seen.commitlore, "the launcher never exported the resolved commitlore CLI").toBe(cli["commitlore"]);
+    // The provider pins are what they were.
+    for (const name of ["claude", "codex", "grok"]) expect(seen.handed[name]).toBe(cli[name]);
+    expect(seen.started, "a pinned provider CLI did not start").toBe("started,started,started");
+  });
+
+  it("B3-PIN hands the daemon an operator-supplied ACP_COMMITLORE_BINARY unchanged, over the baked pin", () => {
+    const harness = makeHarness();
+    const cli = cliDirectories(harness, "commitlore");
+    expect(installWithPins(harness).status).toBe(0);
+    // Precedence is only measured if there is something to take precedence over.
+    expect(readFileSync(launcherPath(harness), "utf8").split("\n")).toContain(
+      `ACP_RESOLVED_COMMITLORE_BINARY=${cli["commitlore"]}`,
+    );
+
+    // Wrong values on purpose. The launcher neither vets an operator's value nor replaces it with the
+    // path it resolved or with a PATH search; the daemon's own pin checks are what refuse it.
+    for (const operatorValue of [join(harness.home, "operator-named", "commitlore"), "commitlore"]) {
+      rmSync(harness.launcherEnvLog, { force: true });
+      harness.env["ACP_COMMITLORE_BINARY"] = operatorValue;
+      const launched = runGeneratedLauncher(harness);
+      expect(launched.status, launched.stderr).toBe(0);
+      expect(launcherObservations(harness).commitlore, "the operator's value was replaced").toBe(operatorValue);
+    }
+  });
+
+  it("B3-PIN names an unresolvable commitlore CLI on stderr, pins nothing for it and installs anyway", () => {
+    const harness = makeHarness();
+    // The providers resolve, so the row also shows commitlore's absence costs them nothing.
+    const cli = cliDirectories(harness, "claude", "codex", "grok");
+    assertProviderUnresolvable(harness, "commitlore");
+
+    const installed = installWithPins(harness);
+    expect(installed.status, installed.stderr).toBe(0);
+    const notice = installed.stderr.split("\n").filter((line) => line.includes("could not resolve"));
+    expect(notice, "the installer said nothing, or something else, about commitlore").toHaveLength(1);
+    expect(notice[0]).toContain("could not resolve the commitlore CLI");
+    // It names the variable an operator sets, and does not borrow the providers' consequence: CommitLore
+    // has no quota, and an absent pin refuses rather than reporting one.
+    expect(notice[0]).toContain("ACP_COMMITLORE_BINARY");
+    expect(notice[0]).not.toContain("quota");
+
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    expect(launcher, "a pin was baked for a CLI that was never found").not.toMatch(/^ACP_RESOLVED_COMMITLORE_BINARY=/m);
+    const lines = launcher.split("\n");
+    for (const [name, variable] of PINNED_CLIS.slice(0, 3)) {
+      expect(lines, `the ${name} pin changed`).toContain(`${variable}=${cli[name]}`);
+    }
+
+    // The daemon still starts, with no value: its own pin rule then refuses each bootstrap observation.
+    const launched = runGeneratedLauncher(harness);
+    expect(launched.status, launched.stderr).toBe(0);
+    const seen = launcherObservations(harness);
+    expect(seen.commitlore).toBe("<unset>");
+    for (const name of ["claude", "codex", "grok"]) expect(seen.handed[name]).toBe(cli[name]);
+  });
+
   it("#423 leaves BUZZ_PRIVATE_KEY unset rather than guessing when neither source has it", () => {
     const harness = makeHarness();
     harness.env["ACP_FAKE_BUZZ_ITEM_MISSING"] = "1";
@@ -2847,12 +2965,13 @@ exit 0
 describe("the suite's executable fixture writers", () => {
   const writeEveryExecutableFixture = (): string => {
     const home = tempDir("acp-launchd-writers-");
-    // The names the rows use: provider CLIs (#785, #954), the Buzz CLI (#423), an updater's
-    // versions (#954), and the link target the leak row reads its sentinel from.
+    // The names the rows use: provider CLIs (#785, #954), the CommitLore CLI (#246 B3), the Buzz CLI
+    // (#423), an updater's versions (#954), and the link target the leak row reads its sentinel from.
     for (const name of [
       "claude",
       "codex",
       "grok",
+      "commitlore",
       "acp-sibling-probe",
       "claude-1.0",
       "buzz",
@@ -2888,7 +3007,7 @@ describe("the suite's executable fixture writers", () => {
     const warm = new Set(executables(writeEveryExecutableFixture()).map(({ inode }) => inode));
     const repeated = executables(writeEveryExecutableFixture());
 
-    expect(repeated.length, "the writers left no executables, so this measured nothing").toBe(11);
+    expect(repeated.length, "the writers left no executables, so this measured nothing").toBe(12);
     expect(
       repeated.filter(({ inode }) => !warm.has(inode)).map(({ path }) => path),
       "a repeated run wrote these as new executable inodes",

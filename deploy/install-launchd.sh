@@ -371,15 +371,27 @@ write_launcher() {
   # without it must still be able to deploy. It is named on stderr instead, because a provider
   # whose CLI is absent reports no quota rather than an error, which is indistinguishable from a
   # provider that is simply out of quota unless the install says so.
+  #
+  # `commitlore` is resolved by the same rule (#246 B3). The daemon runs a bootstrap's CommitLore only
+  # from ACP_COMMITLORE_BINARY, an explicit absolute path, and searches no PATH for it
+  # (src/bootstrap/commitlore-pin.ts), so a launcher that never sets it refuses every bootstrap
+  # CommitLore observation. It is not a provider: it has no quota, and its notice says what an absent
+  # pin does instead. Pinning it delivers the path and nothing more — the daemon still vets the pin
+  # with its own checks, and a bootstrap can still refuse for reasons a pin does not touch.
   local spec cli pin_variable resolved_cli
   local cli_pins=()
-  for spec in claude:ACP_RESOLVED_CLAUDE_BINARY codex:ACP_RESOLVED_CODEX_BINARY grok:ACP_RESOLVED_GROK_BINARY; do
+  for spec in claude:ACP_RESOLVED_CLAUDE_BINARY codex:ACP_RESOLVED_CODEX_BINARY grok:ACP_RESOLVED_GROK_BINARY \
+    commitlore:ACP_RESOLVED_COMMITLORE_BINARY; do
     cli="${spec%%:*}"
     pin_variable="${spec##*:}"
     resolved_cli="$(resolve_cli_binary "$cli")"
     if [[ -z "$resolved_cli" ]]; then
-      printf 'agentcpd installer: could not resolve the %s CLI from this PATH. Nothing is pinned for it, and the %s capacity probe will report no quota rather than an error.\n' \
-        "$cli" "$cli" >&2
+      if [[ "$cli" == commitlore ]]; then
+        printf 'agentcpd installer: could not resolve the commitlore CLI from this PATH. Nothing is pinned for it, and every bootstrap CommitLore observation will refuse until ACP_COMMITLORE_BINARY names one.\n' >&2
+      else
+        printf 'agentcpd installer: could not resolve the %s CLI from this PATH. Nothing is pinned for it, and the %s capacity probe will report no quota rather than an error.\n' \
+          "$cli" "$cli" >&2
+      fi
       continue
     fi
     cli_pins[${#cli_pins[@]}]="$pin_variable=$resolved_cli"
@@ -556,6 +568,13 @@ if [[ -z "${ACP_CODEX_BINARY:-}" && -n "${ACP_RESOLVED_CODEX_BINARY:-}" ]]; then
 fi
 if [[ -z "${ACP_GROK_BINARY:-}" && -n "${ACP_RESOLVED_GROK_BINARY:-}" ]]; then
   export ACP_GROK_BINARY="$ACP_RESOLVED_GROK_BINARY"
+fi
+# The CommitLore CLI resolved at install time, by the same rule (#246 B3). ACP_COMMITLORE_BINARY is
+# the only input the daemon reads for it, and the daemon searches no PATH for it. An operator-supplied
+# value wins and is passed through unexamined: a wrong one is refused by the daemon's own pin checks,
+# never replaced here. This delivers the pin; it does not make a bootstrap succeed.
+if [[ -z "${ACP_COMMITLORE_BINARY:-}" && -n "${ACP_RESOLVED_COMMITLORE_BINARY:-}" ]]; then
+  export ACP_COMMITLORE_BINARY="$ACP_RESOLVED_COMMITLORE_BINARY"
 fi
 
 exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"
