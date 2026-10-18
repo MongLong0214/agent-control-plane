@@ -16,6 +16,7 @@ import { createHermesMcpPort } from "../../src/mcp/hermes-server.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
+import { bindingAsIfCounted } from "../helpers/human-gate-binding.ts";
 import { carryRows, laterObjectsIn, releasedChainImage } from "../helpers/released-chain-image.ts";
 import { privateStatePath } from "../helpers/released-v44-schema.ts";
 import { contentDigests } from "../helpers/released-v45-schema.ts";
@@ -68,7 +69,15 @@ interface World {
   base: string;
   workBranch: string;
   candidate: string;
-  payload: GatePayload;
+  /**
+   * FIX-FINALIZER-DIGEST — the gate payload, naming the human-gate binding. A world whose gate is
+   * satisfied when it is built names that binding, fixed then, so a later decision makes it stale. Any
+   * other world names, when read, the binding its latest OWNER_DECISION records would give if they
+   * counted (`bindingAsIfCounted`): a refusal is then the gate's judgement of those records.
+   */
+  readonly payload: GatePayload;
+  /** The same payload naming `humanGateDigest`. */
+  payloadWith(humanGateDigest: string): GatePayload;
 }
 
 /** GitHub's merged-PR snapshot plus its separately reread target ref (as github-hardening models it). */
@@ -208,6 +217,18 @@ const world = async (approve: readonly string[] = [], options: { before?: boolea
     });
   }
   installDaemonFinalizerGitHubFixture(harness);
+  const built = harness.cp.ceo.currentHumanGateDecisionDigest(driven.runId);
+  const payloadWith = (humanGateDigest: string): GatePayload => ({
+    runId: driven.runId,
+    candidateSnapshotDigest: driven.candidateSnapshotDigest,
+    contractDigest: driven.contractDigest,
+    verificationDigest: driven.verificationDigest,
+    blindReviewDigest: driven.blindReviewDigest,
+    humanGateDigest,
+    bindingGeneration: driven.ownerBindingGeneration,
+    exactHead: driven.candidateHead,
+    timestamp: "2026-08-12T00:00:00.000Z",
+  });
   return {
     harness,
     github,
@@ -218,17 +239,10 @@ const world = async (approve: readonly string[] = [], options: { before?: boolea
     base: driven.baseHead,
     workBranch: driven.workBranch,
     candidate: driven.candidateSnapshotDigest,
-    payload: {
-      runId: driven.runId,
-      candidateSnapshotDigest: driven.candidateSnapshotDigest,
-      contractDigest: driven.contractDigest,
-      verificationDigest: driven.verificationDigest,
-      blindReviewDigest: driven.blindReviewDigest,
-      humanGateDigest: digestOf(ITEMS),
-      bindingGeneration: driven.ownerBindingGeneration,
-      exactHead: driven.candidateHead,
-      timestamp: "2026-08-12T00:00:00.000Z",
+    get payload(): GatePayload {
+      return payloadWith(built.allowed ? built.value : bindingAsIfCounted(harness, driven.runId, ITEMS));
     },
+    payloadWith,
   };
 };
 
@@ -788,9 +802,13 @@ describe("SEC-OD1-R1-02 approvals recorded before SEC-OD1 do not count, and the 
         allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, message: OWNER_DECIDE_AGAIN_MESSAGE, evidence: decideAgain,
       });
       expect(w.github.checkRuns).toHaveLength(0);
-      // The owner decides again through the canonical path, and the same payload publishes.
+      // The owner decides again through the canonical path, and a payload naming the new decisions
+      // publishes (FIX-FINALIZER-DIGEST: the binding names each decision, so the legacy one is gone).
+      const legacy = w.payload.humanGateDigest;
       for (const item of ITEMS) decide(w, item, true, `decided again: ${item}`);
       expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: true });
+      expect(w.payload.humanGateDigest).not.toBe(legacy);
+      expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId)).toMatchObject({ allowed: true, value: w.payload.humanGateDigest });
       expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
     });
   }
@@ -814,13 +832,15 @@ describe("SEC-OD1-R1-02 approvals recorded before SEC-OD1 do not count, and the 
     const w = await world([...ITEMS], { before: true });
     // How such a run completed: the reader before SEC-OD1 counted these rows (the review's base run of
     // this fixture: satisfied, publish ALLOWED). That verdict is stood in for this drive only.
+    // FIX-FINALIZER-DIGEST: the kernel reads the gate through `humanGateBinding`, so that is what stands in.
     const ceo = w.harness.cp.ceo;
-    ceo.humanGateStatus = () => ({ required: true, items: [...ITEMS], satisfied: true });
+    const named = w.payload.humanGateDigest;
+    ceo.humanGateBinding = () => ({ required: true, items: [...ITEMS], satisfied: true, humanGateDigest: named });
     try {
       expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
       expect(outcome(await merge(w, await openPull(w)))).toBe("ALLOWED");
     } finally {
-      Reflect.deleteProperty(ceo, "humanGateStatus");
+      Reflect.deleteProperty(ceo, "humanGateBinding");
     }
     const completion = w.harness.cp.completionAuthoritiesForTests().daemonFinalizer;
     expect(w.harness.cp.runs.transition(w.runId, RunState.MERGING, "completed before SEC-OD1").allowed).toBe(true);
@@ -898,9 +918,12 @@ describe("SEC-OD1-R1-01 the v47 authority guard refuses an ordinary Db.run forge
     const w = await world([ITEM_A]);
     expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
     const rows = approvalRows(w);
-    expect(viaDbRun(w, forgedDecision(w, ITEM_B, "not admitted; ordinary Db.run"), OWNER_DECISION_LABEL)).toMatchObject(V47_REFUSAL);
+    const forged = forgedDecision(w, ITEM_B, "not admitted; ordinary Db.run");
+    expect(viaDbRun(w, forged, OWNER_DECISION_LABEL)).toMatchObject(V47_REFUSAL);
     expect(approvalRows(w)).toEqual(rows);
-    const published = await w.harness.cp.github.gatePublish(w.payload, w.identity);
+    // The payload names the binding the refused row would have given had it been stored and counted.
+    const payload = w.payloadWith(bindingAsIfCounted(w.harness, w.runId, ITEMS, { [ITEM_B]: digestOf(forged) }));
+    const published = await w.harness.cp.github.gatePublish(payload, w.identity);
     const observed = { gate: gateAccepts(w), published: outcome(published), checks: w.github.checkRuns.length };
     expect(published.reasonCode, JSON.stringify(observed)).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
     expect(w.github.checkRuns).toHaveLength(0);

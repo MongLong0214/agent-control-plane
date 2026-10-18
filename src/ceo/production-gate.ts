@@ -193,6 +193,32 @@ export const REPO_FACTORY_GITHUB_WRITE_GATE_ITEM = `owner-approval:${REPO_FACTOR
  */
 export type RepoFactoryApprovalPort = Pick<RepoFactoryBootstrapRunner, "ownerApprovalHolds">;
 
+/**
+ * FIX-FINALIZER-DIGEST — the binding of a run that needs no owner decision: the GitHub kernel's
+ * `NO_HUMAN_GATE_DIGEST`, the only value its payload may carry for such a run.
+ */
+const NO_HUMAN_GATE_BINDING = digestOf({ humanGate: "NOT_REQUIRED" });
+
+/** FIX-FINALIZER-DIGEST — one required item's authenticated decision, as the human-gate binding names it. */
+interface HumanGateItemDecision {
+  /** The item's stable id: the item text an owner decision binds. */
+  item: string;
+  source: "OWNER_DECISION" | "T3_APPROVAL";
+  /** The canonical record's artifact digest, or the digest of the T3 receipt `ownerApprovalHolds` admitted. */
+  decision: string;
+}
+
+/** FIX-FINALIZER-DIGEST — what `ProductionGate.resolveHumanGate` found: the binding, or why there is none. */
+type HumanGateResolution =
+  | { required: boolean; items: string[]; binding: string; refusal?: undefined; decideAgain?: undefined }
+  | {
+      required: true;
+      items: string[];
+      binding: null;
+      refusal: { message: string; evidence: Record<string, unknown> };
+      decideAgain?: string[];
+    };
+
 /** PRD §21 — the owner-only gate list. */
 export { HUMAN_GATE_TRIGGERS } from "./human-gate.ts";
 
@@ -1734,8 +1760,9 @@ export class ProductionGate {
 
   /**
    * SEC-OD1 — the owner decision an APPROVAL artifact records, exactly bound to this run's current gate
-   * and candidate, or null. `humanGateStatus` and `currentHumanGateDecisionDigest` judge every artifact
-   * here (through `ownerDecisionsOf`), so neither can count a record the other refuses.
+   * and candidate, or null. `resolveHumanGate`, which `humanGateStatus`, `humanGateBinding` and
+   * `currentHumanGateDecisionDigest` all answer from, judges every artifact here (through
+   * `ownerDecisionsOf`), so none of them can count a record another refuses.
    *
    * The source of truth is the record `recordOwnerDecision` writes through `putOwnerDecision`, in the
    * one transaction that admits the receipt from live ingress (an allowlisted owner, and the write-once
@@ -1829,80 +1856,106 @@ export class ProductionGate {
     return { latest, decideAgain };
   }
 
-  humanGateStatus(runId: string): { required: boolean; items: string[]; satisfied: boolean; decideAgain?: string[] } {
+  /**
+   * FIX-FINALIZER-DIGEST — the one reading of this run's human gate. `humanGateStatus`,
+   * `currentHumanGateDecisionDigest` (the value the daemon finalizer puts in the gate payload) and
+   * `humanGateBinding` (the GitHub kernel's port, re-read when it publishes and again when it merges)
+   * all answer from it, so no two of them can judge the gate differently.
+   *
+   * Every required item is bound by its stable id, the item text `recordOwnerDecision` binds, to its
+   * own authenticated decision: the latest owner decision exactly bound to this gate and candidate
+   * (`ownerDecisionsOf`, SEC-OD1), or, for the item the contract declares as the S10 T3 link and only
+   * while it has no decision of its own, the owner's T3 approval as `ownerApprovalHolds` judges it
+   * (actor, scope, candidate and anchor; S10-R1-01). A missing or refused item, a decision for another
+   * candidate (never read) or an item named twice leaves the gate unsatisfied, and an unsatisfied gate
+   * has no binding at all.
+   *
+   * The binding is the digest of the gate definition digest, the current candidate and each item's
+   * decision identity: the canonical record's artifact digest, or the T3 receipt's digest (the identity
+   * its anchor names). Neither depends on the 24h ingress replay cache, so pruning leaves the binding
+   * unchanged, while any new decision, refusal or candidate changes it: a payload named before that
+   * change is neither published nor merged after it. Each reader runs this resolution again, which
+   * re-verifies every decision; a digest is never accepted on its own, and the definition digest is
+   * never accepted in place of the binding.
+   */
+  private resolveHumanGate(runId: string): HumanGateResolution {
     const gate = this.humanGateDefinition(runId);
     const { items } = gate;
-    if (!gate.required) return { required: false, items: [], satisfied: true };
-    if (items.length === 0) return { required: true, items: [], satisfied: false };
-
+    if (!gate.required) return { required: false, items: [], binding: NO_HUMAN_GATE_BINDING };
+    const refused = (message: string, evidence: Record<string, unknown>, decideAgain?: string[]): HumanGateResolution =>
+      ({ required: true, items, binding: null, refusal: { message, evidence }, ...(decideAgain ? { decideAgain } : {}) });
+    if (items.length === 0) return refused("run requires a human gate with no durable gate items", { runId });
+    if (new Set(items).size !== items.length) {
+      return refused("the human-gate definition names an item more than once", { runId, items });
+    }
     const currentCandidate = this.runs.currentCandidate(runId);
-    if (!currentCandidate) return { required: true, items, satisfied: false };
     // Only a canonical owner decision approves an item (SEC-OD1): never a direct ArtifactStore
     // write of an APPROVAL-shaped object (CP-HI-07), and never an audit row.
-    if (!this.#ownerAuthority) return { required: true, items, satisfied: false };
+    if (!currentCandidate || !this.#ownerAuthority) return refused("no current authenticated owner decision exists", { runId });
     const { latest, decideAgain } = this.ownerDecisionsOf(runId, gate.digest, currentCandidate);
 
-    // S10 — an item's own OWNER_DECISION, approval or refusal, decides it as before, so an explicit
-    // refusal is never overridden. Only the item the contract declares, exactly, as the T3 link
-    // (S10-R1-04: its raw value), with no decision of its own, is decided by the owner's T3 approval,
-    // and that by the bootstrap runner's own predicate (S10-R1-01); every other item still needs its
-    // OWNER_DECISION.
-    const decided = (item: string): boolean =>
-      latest.get(item)?.approved ??
-      (item === REPO_FACTORY_GITHUB_WRITE_GATE_ITEM &&
-        gate.linksT3 &&
-        this.#repoFactoryApprovals?.ownerApprovalHolds(runId, currentCandidate).allowed === true);
-    const satisfied = items.every(decided);
+    // S10 — an item's own OWNER_DECISION, approval or refusal, decides it, so an explicit refusal is
+    // never overridden. Only the item the contract declares, exactly, as the T3 link (S10-R1-04: its raw
+    // value), with no decision of its own, is decided by the owner's T3 approval, and that by the
+    // bootstrap runner's own predicate (S10-R1-01); every other item still needs its OWNER_DECISION.
+    const decisionOf = (item: string): HumanGateItemDecision | null => {
+      const own = latest.get(item);
+      if (own) return own.approved ? { item, source: "OWNER_DECISION", decision: own.digest } : null;
+      if (item !== REPO_FACTORY_GITHUB_WRITE_GATE_ITEM || !gate.linksT3) return null;
+      const t3 = this.#repoFactoryApprovals?.ownerApprovalHolds(runId, currentCandidate);
+      return t3?.allowed === true ? { item, source: "T3_APPROVAL", decision: digestOf(t3.value) } : null;
+    };
+    const decisions = items.map(decisionOf);
+    if (decisions.every((decision): decision is HumanGateItemDecision => decision !== null)) {
+      return {
+        required: true,
+        items,
+        binding: digestOf({ humanGateDefinition: gate.digest, candidateSnapshotDigest: currentCandidate, decisions }),
+      };
+    }
     // SEC-OD1-R1-02 — named only for an item still undecided, and only when there is one, so every
     // other status (and every packet that carries it) is unchanged.
-    const redecide = satisfied || decideAgain.size === 0
-      ? []
-      : items.filter((item) => decideAgain.has(item) && !decided(item));
+    const redecide = items.filter((item, index) => decisions[index] === null && decideAgain.has(item));
     return redecide.length > 0
-      ? { required: true, items, satisfied, decideAgain: redecide }
-      : { required: true, items, satisfied };
+      ? refused(OWNER_DECIDE_AGAIN_MESSAGE, { runId, items, ...ownerDecideAgainEvidence(redecide) }, redecide)
+      : refused("every current owner-gate item needs approval", { runId, items });
+  }
+
+  humanGateStatus(runId: string): { required: boolean; items: string[]; satisfied: boolean; decideAgain?: string[] } {
+    const resolved = this.resolveHumanGate(runId);
+    if (!resolved.required) return { required: false, items: [], satisfied: true };
+    const status = { required: true, items: resolved.items, satisfied: resolved.binding !== null };
+    return resolved.decideAgain ? { ...status, decideAgain: resolved.decideAgain } : status;
   }
 
   /**
-   * The GitHub gate names an actual authenticated owner-decision artifact, not merely the
-   * human-gate definition. Keep the selection beside `humanGateStatus` so the daemon never
-   * turns a free-form digest into owner authority; the kernel independently re-validates it
-   * when it publishes and again when it merges.
+   * The GitHub kernel's `HumanGateStatusPort`: the status and the binding from one resolution, so the
+   * kernel compares a payload with exactly what the daemon finalizer was given to name. Null when the
+   * gate is unsatisfied: there is nothing a payload could name.
+   */
+  humanGateBinding(runId: string): {
+    required: boolean;
+    items: string[];
+    satisfied: boolean;
+    decideAgain?: string[];
+    humanGateDigest: string | null;
+  } {
+    const resolved = this.resolveHumanGate(runId);
+    if (!resolved.required) return { required: false, items: [], satisfied: true, humanGateDigest: resolved.binding };
+    const status = { required: true, items: resolved.items, satisfied: resolved.binding !== null, humanGateDigest: resolved.binding };
+    return resolved.decideAgain ? { ...status, decideAgain: resolved.decideAgain } : status;
+  }
+
+  /**
+   * The value the daemon finalizer names as the gate payload's `humanGateDigest`: the binding
+   * `resolveHumanGate` derives, never a free-form digest. The kernel independently resolves the gate
+   * again when it publishes and again when it merges, and refuses a payload that no longer names it.
    */
   currentHumanGateDecisionDigest(runId: string): Decision<string> {
-    const gate = this.humanGateDefinition(runId);
-    if (!gate.required) return allow(ReasonCode.OK, digestOf({ humanGate: "NOT_REQUIRED" }));
-    if (gate.items.length === 0) {
-      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "run requires a human gate with no durable gate items", {
-        runId,
-      });
-    }
-    const candidateSnapshotDigest = this.runs.currentCandidate(runId);
-    if (!candidateSnapshotDigest || !this.#ownerAuthority) {
-      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "no current authenticated owner decision exists", {
-        runId,
-      });
-    }
-
-    // The same reading as humanGateStatus (SEC-OD1); only the item rule differs here: every item needs
-    // its own approval, and the T3 link decides none.
-    const { latest, decideAgain } = this.ownerDecisionsOf(runId, gate.digest, candidateSnapshotDigest);
-    const unapproved = gate.items.filter((item) => latest.get(item)?.approved !== true);
-    if (unapproved.length > 0) {
-      const redecide = unapproved.filter((item) => decideAgain.has(item));
-      return redecide.length > 0
-        ? deny(ReasonCode.HUMAN_GATE_UNSATISFIED, OWNER_DECIDE_AGAIN_MESSAGE, {
-          runId,
-          items: gate.items,
-          ...ownerDecideAgainEvidence(redecide),
-        })
-        : deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "every current owner-gate item needs approval", {
-          runId,
-          items: gate.items,
-        });
-    }
-    const named = gate.items.map((item) => latest.get(item)!.digest).sort()[0]!;
-    return allow(ReasonCode.OK, named);
+    const resolved = this.resolveHumanGate(runId);
+    return resolved.binding === null
+      ? deny(ReasonCode.HUMAN_GATE_UNSATISFIED, resolved.refusal.message, resolved.refusal.evidence)
+      : allow(ReasonCode.OK, resolved.binding);
   }
 
   /**

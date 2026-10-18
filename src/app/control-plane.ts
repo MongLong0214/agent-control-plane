@@ -3,7 +3,6 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 
 import { type Clock, systemClock } from "../core/clock.ts";
-import { digestOf } from "../core/digest.ts";
 import { manifestDigest, type ProjectManifest } from "../contracts/manifest.ts";
 import { CapacityMonitor, type CapacityOptions } from "../capacity/capacity-monitor.ts";
 import { ClaimRegistry } from "../claims/claim-registry.ts";
@@ -775,15 +774,11 @@ export class ControlPlane {
         // #246 B3 — runs only for a manifest whose CommitLore mode is required.
         commitlore: config.repoFactory?.commitlore ?? createCommitLoreCliPort(),
       });
-      // The GitHub kernel binds the production gate's single human-gate predicate to its
-      // payload. It never reinterprets APPROVAL artifacts or ingress receipts itself.
+      // FIX-FINALIZER-DIGEST — the GitHub kernel compares its payload with the production gate's one
+      // human-gate resolution: the status and the binding the daemon finalizer names, resolved again at
+      // publish and at merge. It never reinterprets APPROVAL artifacts or ingress receipts itself.
       this.github.attach({
-        humanGateStatus: {
-          humanGateStatus: (runId) => {
-            const status = this.ceo.humanGateStatus(runId);
-            return { ...status, humanGateDigest: digestOf(status.items) };
-          },
-        },
+        humanGateStatus: { humanGateStatus: (runId) => this.ceo.humanGateBinding(runId) },
       });
       this.cto.attach({
         ownerAuthority: this.ownerAuthority,
