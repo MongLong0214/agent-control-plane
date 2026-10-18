@@ -200,6 +200,9 @@ case "$account" in
   # answer for it, and a row can make the lookup itself fail with a status other than 44.
   ACP_COMMITLORE_BINARY)
     [[ -z "\${ACP_FAKE_COMMITLORE_LOOKUP_STATUS:-}" ]] || exit "$ACP_FAKE_COMMITLORE_LOOKUP_STATUS"
+    # An item that exists and holds nothing: the lookup succeeds and answers an empty line, which is
+    # not the "no item" of exit 44.
+    [[ "\${ACP_FAKE_COMMITLORE_EMPTY_ITEM:-0}" != "1" ]] || { printf '\\n'; exit 0; }
     [[ -n "\${ACP_FAKE_COMMITLORE_BINARY_ITEM:-}" ]] || exit 44
     printf '%s\\n' "$ACP_FAKE_COMMITLORE_BINARY_ITEM" ;;
   ACP_CANONICAL_*)
@@ -2192,6 +2195,7 @@ exec /bin/cp "$@"
               : (Object.entries(candidates).find(([, value]) => value === handed)?.[0] ?? "something else"),
         stderrNamesTheKeychainValue: keychainValue !== undefined && launched.stderr.includes(keychainValue),
         reportsAFailedLookup: launched.stderr.includes("the Keychain lookup for ACP_COMMITLORE_BINARY failed"),
+        reportsAnEmptyItem: launched.stderr.includes("the Keychain item ACP_COMMITLORE_BINARY is present but empty"),
       };
     });
     // The launcher's lookups only: the log was cleared after the install, which asks for other accounts.
@@ -2227,6 +2231,7 @@ exec /bin/cp "$@"
       handed: "the Keychain value",
       stderrNamesTheKeychainValue: false,
       reportsAFailedLookup: false,
+      reportsAnEmptyItem: false,
     };
     expect(kept.runs).toEqual([expected, expected]);
     expect(kept.lookups, "the launcher did not ask the Keychain on every launch").toBe(2);
@@ -2254,6 +2259,7 @@ exec /bin/cp "$@"
         handed: "the Keychain value",
         stderrNamesTheKeychainValue: false,
         reportsAFailedLookup: false,
+        reportsAnEmptyItem: false,
       };
       expect(kept.runs, kind).toEqual([expected, expected]);
       expect(kept.lookups, kind).toBe(2);
@@ -2265,7 +2271,7 @@ exec /bin/cp "$@"
     const resolved = installWithCommitlorePin(harness);
 
     const kept = commitloreAcrossReexecution(harness, { "the baked pin": resolved });
-    const expected = { status: 0, handed: "the baked pin", stderrNamesTheKeychainValue: false, reportsAFailedLookup: false };
+    const expected = { status: 0, handed: "the baked pin", stderrNamesTheKeychainValue: false, reportsAFailedLookup: false, reportsAnEmptyItem: false };
     expect(kept.runs).toEqual([expected, expected]);
     // The pin applied because the Keychain was asked and had no item, not because it was never asked.
     expect(kept.lookups, "the launcher did not ask the Keychain on every launch").toBe(2);
@@ -2296,7 +2302,7 @@ exec /bin/cp "$@"
     );
 
     const kept = commitloreAcrossReexecution(harness, { "the baked pin": resolved, "the inherited internal value": injected });
-    const expected = { status: 0, handed: "the baked pin", stderrNamesTheKeychainValue: false, reportsAFailedLookup: false };
+    const expected = { status: 0, handed: "the baked pin", stderrNamesTheKeychainValue: false, reportsAFailedLookup: false, reportsAnEmptyItem: false };
     expect(kept.runs, "the daemon was not handed the pin this install resolved").toEqual([expected, expected]);
     expect(kept.lookups, "the launcher did not ask the Keychain on every launch").toBe(2);
   });
@@ -2315,8 +2321,27 @@ exec /bin/cp "$@"
     );
 
     const kept = commitloreAcrossReexecution(harness, { "the inherited internal value": injected });
-    const expected = { status: 0, handed: "unset", stderrNamesTheKeychainValue: false, reportsAFailedLookup: false };
+    const expected = { status: 0, handed: "unset", stderrNamesTheKeychainValue: false, reportsAFailedLookup: false, reportsAnEmptyItem: false };
     expect(kept.runs, "an inherited internal variable reached the daemon as its CommitLore pin").toEqual([expected, expected]);
+    expect(kept.lookups, "the launcher did not ask the Keychain on every launch").toBe(2);
+  });
+
+  it("ACP1152-R2 withholds the baked pin across re-execution when the Keychain item is present but empty, and says so", () => {
+    const harness = makeHarness();
+    const resolved = installWithCommitlorePin(harness);
+
+    // The lookup succeeds (exit 0) and answers nothing. Only exit 44, no item, may fall back; an empty
+    // item is one the operator stored, so the baked pin must not stand in for it.
+    harness.env["ACP_FAKE_COMMITLORE_EMPTY_ITEM"] = "1";
+    const kept = commitloreAcrossReexecution(harness, { "the baked pin": resolved });
+    const expected = {
+      status: 0,
+      handed: "unset",
+      stderrNamesTheKeychainValue: false,
+      reportsAFailedLookup: false,
+      reportsAnEmptyItem: true,
+    };
+    expect(kept.runs, "a present but empty item fell back to the baked pin").toEqual([expected, expected]);
     expect(kept.lookups, "the launcher did not ask the Keychain on every launch").toBe(2);
   });
 
@@ -2329,7 +2354,7 @@ exec /bin/cp "$@"
     for (const status of ["36", "1"]) {
       harness.env["ACP_FAKE_COMMITLORE_LOOKUP_STATUS"] = status;
       const kept = commitloreAcrossReexecution(harness, { "the baked pin": resolved });
-      const expected = { status: 0, handed: "unset", stderrNamesTheKeychainValue: false, reportsAFailedLookup: true };
+      const expected = { status: 0, handed: "unset", stderrNamesTheKeychainValue: false, reportsAFailedLookup: true, reportsAnEmptyItem: false };
       expect(kept.runs, `security exit ${status}`).toEqual([expected, expected]);
       expect(kept.lookups, `security exit ${status}`).toBe(2);
     }

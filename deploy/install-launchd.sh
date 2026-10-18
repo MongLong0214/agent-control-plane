@@ -596,18 +596,29 @@ fi
 # daemon's own pin checks and is never replaced here. Only when there is no item does the path resolved
 # at install time apply.
 #
-# A lookup that failed is not "no item". 44 is what `security` exits with when the item is not there;
-# any other failure leaves the variable unset, as the loader leaves every optional account, and the
-# resolved pin is withheld too, because a Keychain that could not answer may hold a value the operator
-# chose. The daemon then refuses each bootstrap CommitLore observation, and this line says why without
-# naming any value. This delivers the pin; it does not make a bootstrap succeed.
+# Only "no item" falls back, and 44 is what `security` exits with when the item is not there. Every
+# other outcome that leaves the variable empty withholds the resolved pin as well:
+#   - a lookup that failed leaves it unset, as the loader leaves every optional account, and a Keychain
+#     that could not answer may hold a value the operator chose;
+#   - a lookup that succeeded with an empty value is an item the operator stored, and the loader
+#     discards an empty answer, so substituting the pin here would deliver one the operator did not.
+# The daemon then refuses each bootstrap CommitLore observation, and one line says why without naming
+# any value. This delivers the pin; it does not make a bootstrap succeed.
 if [[ -z "${ACP_COMMITLORE_BINARY:-}" ]]; then
-  if [[ "$commitlore_keychain_status" != 0 && "$commitlore_keychain_status" != 44 ]]; then
-    printf 'agentcpd launcher: the Keychain lookup for ACP_COMMITLORE_BINARY failed (security exit %s); the resolved pin is withheld and bootstrap CommitLore observations will refuse\n' \
-      "$commitlore_keychain_status" >&2
-  elif [[ -n "${ACP_RESOLVED_COMMITLORE_BINARY:-}" ]]; then
-    export ACP_COMMITLORE_BINARY="$ACP_RESOLVED_COMMITLORE_BINARY"
-  fi
+  case "$commitlore_keychain_status" in
+    44)
+      if [[ -n "${ACP_RESOLVED_COMMITLORE_BINARY:-}" ]]; then
+        export ACP_COMMITLORE_BINARY="$ACP_RESOLVED_COMMITLORE_BINARY"
+      fi
+      ;;
+    0)
+      printf 'agentcpd launcher: the Keychain item ACP_COMMITLORE_BINARY is present but empty; the resolved pin is withheld and bootstrap CommitLore observations will refuse\n' >&2
+      ;;
+    *)
+      printf 'agentcpd launcher: the Keychain lookup for ACP_COMMITLORE_BINARY failed (security exit %s); the resolved pin is withheld and bootstrap CommitLore observations will refuse\n' \
+        "$commitlore_keychain_status" >&2
+      ;;
+  esac
 fi
 
 exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"
