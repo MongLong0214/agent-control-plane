@@ -81,6 +81,11 @@ export interface NonInteractiveUsageProbe {
      * nor the path that was tried.
      */
     spawnError?: { code?: string; message: string };
+    /**
+     * FIX-1148-R2 — set only when the deadline came and the operating system had not confirmed the
+     * owned child's exit. `code` is then null: whatever was read is not an answer.
+     */
+    cleanupError?: string;
   }>;
 }
 
@@ -262,6 +267,7 @@ export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
     // member is assignable whether or not the class restates it — so a caller holding the class
     // type rather than the interface was told the field does not exist (TS2339).
     spawnError?: { code?: string; message: string };
+    cleanupError?: string;
   }> {
     return new Promise((resolve) => {
       // Detached, so the whole process group can be killed. A grandchild that inherits the pipe
@@ -279,6 +285,30 @@ export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
       let stdout = "";
       let stderr = "";
       let settled = false;
+      // FIX-1148-R2 — settling decides the outcome; the call returns it once the CLI this probe owns,
+      // and SIGKILLs on settling, has emitted `exit`. That is Node's word that the DIRECT child ended
+      // and was reaped, not that every descendant did; one holding a pipe still does not hold the
+      // return, which never waits for `close`. The existing timeout is split, not extended: the work
+      // ends `cleanupReserveMs` before it, and an exit the OS has not confirmed by the timeout is
+      // returned there as `cleanupError` with a null code, never as the outcome.
+      type Decided = {
+        stdout: string;
+        stderr: string;
+        code: number | null;
+        timedOut: boolean;
+        spawnError?: { code?: string; message: string };
+      };
+      let decided: Decided | null = null;
+      let exited = false;
+      let returned = false;
+      const ownedPid = ownedProcessGroup(child.pid);
+      const returnDecided = (): void => {
+        if (returned || decided === null) return;
+        returned = true;
+        clearTimeout(timer);
+        clearTimeout(deadline);
+        resolve(decided);
+      };
       const finish = (outcome: {
         code: number | null;
         timedOut: boolean;
@@ -288,25 +318,64 @@ export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
         settled = true;
         clearTimeout(timer);
         try {
-          if (child.pid) process.kill(-child.pid, "SIGKILL");
+          if (ownedPid !== null) process.kill(-ownedPid, "SIGKILL");
         } catch {
           /* the group is already gone */
         }
         // `stderr` carries what the child wrote, and nothing else. A spawn failure travels in its
         // own field: folded in here, "the child complained" and "there was never a child" become
         // one string, and no caller can tell which one it is holding.
-        resolve({
+        decided = {
           stdout,
           stderr,
           code: outcome.code,
           timedOut: outcome.timedOut,
           ...(outcome.spawnError ? { spawnError: outcome.spawnError } : {}),
-        });
+        };
+        // FIX-1148-R3 — settled is the end of reading, on every path: exit, spawn failure, the end of
+        // the work and the deadline. Nothing written afterwards is buffered, and the pipes are let go
+        // now: a descendant outside the killed group that inherited stdout or stderr kept this handle,
+        // and the caller's process with it, alive after a HEALTHY return. The `error` listeners stay on;
+        // a destroyed stream emits no error of its own.
+        child.stdout.off("data", onStdout);
+        child.stderr.off("data", onStderr);
+        child.stdout.destroy();
+        child.stderr.destroy();
+        if (exited || ownedPid === null) returnDecided();
       };
-      // Resolve on the timer itself rather than waiting for a close that may never come.
-      const timer = setTimeout(() => finish({ code: null, timedOut: true }), input.timeoutMs);
-      child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-      child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+      // Settle on the timer itself rather than waiting for a close that may never come.
+      const reserveMs = cleanupReserveMs(input.timeoutMs);
+      const timer = setTimeout(() => finish({ code: null, timedOut: true }), input.timeoutMs - reserveMs);
+      // The end of the work, armed first and due no later, has settled the probe by now, so `finish`
+      // here does nothing; a probe not yet returned has an owned CLI whose exit is unconfirmed.
+      const deadline = setTimeout(() => {
+        finish({ code: null, timedOut: true });
+        if (returned || ownedPid === null || decided === null) return;
+        returned = true;
+        clearTimeout(timer);
+        resolve({
+          ...decided,
+          code: null,
+          cleanupError: cleanupUnconfirmed(
+            "the owned non-interactive /usage CLI",
+            ownedPid,
+            decided.timedOut ? "it did not finish in time" : "its outcome had been decided",
+          ),
+        });
+      }, input.timeoutMs);
+      const onStdout = (chunk: Buffer): void => {
+        stdout += chunk.toString();
+      };
+      const onStderr = (chunk: Buffer): void => {
+        stderr += chunk.toString();
+      };
+      child.stdout.on("data", onStdout);
+      child.stderr.on("data", onStderr);
+      // A read error on an owned pipe, before or after settling, ends only that stream; the outcome is
+      // still the CLI's exit or the timeout. Unheard, it would be an uncaught exception, and `src` has
+      // no handler for one.
+      child.stdout.on("error", ignoreOwnedStreamError);
+      child.stderr.on("error", ignoreOwnedStreamError);
       child.once("error", (error: NodeJS.ErrnoException) =>
         finish({
           code: null,
@@ -315,10 +384,39 @@ export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
         }),
       );
       // `exit` fires when the process goes, whether or not a descendant still holds the pipe.
-      child.once("exit", (code) => finish({ code, timedOut: false }));
+      child.once("exit", (code) => {
+        exited = true;
+        finish({ code, timedOut: false });
+        returnDecided();
+      });
     });
   }
 }
+
+/**
+ * FIX-1148-R2 — the part of a probe's existing timeout kept for cleanup alone. The work stops this
+ * much before the deadline, so a probe that has to SIGKILL its owned child still has time to see it
+ * exit and reaped before the deadline; the deadline itself does not move. Measured: SIGKILL to `exit`
+ * took 0.5 to 2.6 ms, so a quarter of the timeout, at most 500 ms, is wide room and not the work's.
+ */
+const CLEANUP_RESERVE_CAP_MS = 500;
+const cleanupReserveMs = (timeoutMs: number): number =>
+  Math.max(0, Math.min(CLEANUP_RESERVE_CAP_MS, Math.floor(timeoutMs / 4)));
+
+/** A pid this probe can signal as its own process group: never `kill(0)` (its own group) or `kill(-1)` (everything). */
+const ownedProcessGroup = (pid: number | undefined): number | null =>
+  pid === undefined || !Number.isSafeInteger(pid) || pid <= 1 ? null : pid;
+
+/** Heard so it is not uncaught, and nothing else: a pipe that failed has said all it will. */
+const ignoreOwnedStreamError = (): void => undefined;
+
+/**
+ * What a probe returns when the deadline came and the operating system had not confirmed its owned
+ * child's exit: a failure that says so, never the result as though the cleanup had completed.
+ */
+const cleanupUnconfirmed = (what: string, pid: number, decided: string): string =>
+  `cleanup failed: ${what} (pid ${pid}) was sent SIGKILL, but its exit was not confirmed by the deadline, ` +
+  `so it may still be running; ${decided}`;
 
 /**
  * macOS ships `expect(1)`, which creates a real pseudo-terminal without introducing a
@@ -365,19 +463,56 @@ export class ExpectUsageTerminal implements UsageTerminal {
       let stdout = "";
       let stderr = "";
       let timedOut = false;
-      let settled = false;
+      // FIX-1148-R1 — deciding the result and finishing the cleanup are two steps. `outcome` is the
+      // first decision, and nothing said or exited afterwards replaces it. Resolving at the decision
+      // and clearing the deadline there left an `expect` that ignored, or was stopped before, the
+      // trust prompt's SIGTERM running for good.
+      // FIX-1148-R2 — the call returns only once the owned `expect` is confirmed exited: `exit` is
+      // Node's word that this direct child ended and was reaped, not that its descendants did, and the
+      // pipes are let go at the decision so none of them holds the return. The existing deadline is
+      // split, not extended: the work stops
+      // `cleanupReserveMs` before it and the group is SIGKILLed there, and the reserve is for seeing
+      // that exit. An `expect` whose exit the OS has not confirmed by the deadline is a cleanup
+      // failure the result states; returning at the deadline as though it were gone was the bug.
+      let outcome: UsageTerminalResult | null = null;
+      let exited = false;
+      let returned = false;
+      // Only a group this probe owns. A child with no pid is a spawn that failed: there is nothing to
+      // signal, and its `error` event reports the failure. `-(pid ?? 0)` made that `kill(0)`, which
+      // signals the daemon's own process group; pid 1 is excluded because `kill(-1)` signals everything.
+      const ownedPid = (): number | null => ownedProcessGroup(child.pid);
       const stop = (signal: NodeJS.Signals = "SIGTERM"): void => {
+        const pid = ownedPid();
+        if (pid === null) return;
         try {
-          process.kill(-(child.pid ?? 0), signal);
+          process.kill(-pid, signal);
         } catch {
           child.kill(signal);
         }
       };
+      const returnOutcome = (): void => {
+        if (returned || outcome === null) return;
+        returned = true;
+        clearTimeout(workDeadline);
+        clearTimeout(deadline);
+        resolve(outcome);
+      };
+      // A child with no pid has nothing to confirm; an owned `expect` still running is cleanup not yet
+      // finished, and its `exit` returns the outcome instead, or the deadline returns a cleanup failure.
+      const settle = (): void => {
+        if (!exited && ownedPid() !== null) return;
+        returnOutcome();
+      };
       const finish = (result: UsageTerminalResult): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        resolve(result);
+        if (outcome !== null) return;
+        outcome = result;
+        // Nothing said after the decision is read, and the pipes are let go here rather than when the
+        // child's ends close: a descendant holding one would otherwise hold them open. The stdin
+        // `error` listener below stays on; a destroyed stream emits no error of its own.
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.stdin?.destroy();
+        settle();
       };
       const advanceFromOutput = (): void => {
         const clean = stripTerminal(stdout);
@@ -393,17 +528,44 @@ export class ExpectUsageTerminal implements UsageTerminal {
           return;
         }
       };
-      const timeout = setTimeout(() => {
-        timedOut = true;
+      // The existing deadline bounds both steps and is not extended. At the end of the work, undecided,
+      // the run has timed out; decided or not, an `expect` still there is SIGKILLed with its group, and
+      // the call waits for its `exit` in the reserve. At the deadline, an `expect` whose exit the OS has
+      // not confirmed is returned as a cleanup failure, never as an outcome whose cleanup completed.
+      const reserveMs = cleanupReserveMs(input.timeoutMs);
+      const workDeadline = setTimeout(() => {
         stop("SIGKILL");
-        finish({ stdout, stderr, exitCode: null, timedOut, error: "interactive /usage timed out" });
+        if (outcome === null) {
+          timedOut = true;
+          finish({ stdout, stderr, exitCode: null, timedOut, error: "interactive /usage timed out" });
+        }
+        settle();
+      }, input.timeoutMs - reserveMs);
+      // The end of the work, armed first and due no later, has always decided the outcome by now.
+      const deadline = setTimeout(() => {
+        if (returned) return;
+        returned = true;
+        clearTimeout(workDeadline);
+        const decided = outcome ?? { stdout, stderr, exitCode: null, timedOut: true, error: "interactive /usage timed out" };
+        const pid = ownedPid();
+        resolve(
+          exited || pid === null
+            ? decided
+            : { ...decided, error: cleanupUnconfirmed("the owned expect", pid, decided.error ?? "the run had ended") },
+        );
       }, input.timeoutMs);
+      child.once("exit", () => {
+        exited = true;
+        settle();
+      });
 
       child.stdout?.on("data", (data: Buffer) => {
+        if (outcome !== null) return;
         stdout += data.toString("utf8");
         advanceFromOutput();
       });
       child.stderr?.on("data", (data: Buffer) => {
+        if (outcome !== null) return;
         stderr += data.toString("utf8");
         advanceFromOutput();
       });
@@ -411,7 +573,51 @@ export class ExpectUsageTerminal implements UsageTerminal {
         stderr += error.message;
         finish({ stdout, stderr, exitCode: null, timedOut, error: error.message });
       });
-      child.on("close", (exitCode) => finish({ stdout, stderr, exitCode, timedOut, error: null }));
+
+      // FIX-STDIN-SIBLINGS — `expect -f -` runs its program as it reads it, so an `expect` that exits
+      // partway leaves the rest unread and the write fails with EPIPE. An `error` event nobody hears
+      // is an uncaught exception, and `src` has no handler for one. So the listener goes on before
+      // the write and stays for the stream's life. A program not handed over in full is a failed
+      // query whatever the terminal printed: that output answers a program nobody finished giving.
+      // Nothing here waits for stdin to close: `close` of the child and the outer timer still settle.
+      //
+      // SIGKILL, not `stop()`'s SIGTERM: the error comes as `expect` closes its stdin on the way out,
+      // and its default `trap exit {SIGINT SIGTERM}` runs from the signal handler. Measured: a SIGTERM
+      // landing inside `exit` deadlocks it in Tcl_FinalizeNotifier (bottomhalf → Tcl_AsyncMark waits on
+      // a mutex the exiting thread holds), and that `expect` then ignores SIGTERM forever — 20 of 50
+      // collections left one behind.
+      let programTaken = false;
+      const programNotTaken = (how: string): string =>
+        `expect did not take its program (${how}), so its output is not an answer to /usage`;
+      child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+        stop("SIGKILL");
+        finish({ stdout, stderr, exitCode: null, timedOut, error: programNotTaken(error.code ?? error.message) });
+      });
+      child.stdin?.once("finish", () => {
+        programTaken = true;
+      });
+      // FIX-1148-R1 — a program handed over is not a program run. `finish` on stdin says only that the
+      // bytes left this side; an `expect` that ends non-zero, or on a signal, did not reach the program's
+      // own `exit 0`, so what the terminal printed before then is not an answer to /usage. Measured: a
+      // CLI that printed a quota line and exited before its banner made `expect` exit 125 (eof in a
+      // step's wait), and the collector read that line as HEALTHY 77%.
+      const programFailed = (exitCode: number | null, signal: NodeJS.Signals | null): string =>
+        `expect ${exitCode === null ? `was ended by ${signal ?? "a signal"}` : `exited ${exitCode}`}` +
+        `${exitCode === 124 ? " (a step's wait timed out)" : exitCode === 125 ? " (the CLI ended during a step's wait)" : ""}` +
+        " before its program finished, so its output is not an answer to /usage";
+      child.on("close", (exitCode, signal) =>
+        finish({
+          stdout,
+          stderr,
+          exitCode,
+          timedOut,
+          error: !programTaken
+            ? programNotTaken("its stdin closed before the program was handed over")
+            : exitCode !== 0
+              ? programFailed(exitCode, signal)
+              : null,
+        }),
+      );
 
       child.stdin?.end(expectProgram(input.steps, input.timeoutMs));
     });
@@ -574,6 +780,17 @@ abstract class BaseUsageCollector implements UsageCollector {
     if (result.error || result.timedOut) {
       return failedReading(this.provider, observedAt, source, rawOutputDigest, result.error ?? "interactive /usage timed out");
     }
+    // FIX-1148-R1 — checked before any quota is parsed. A terminal that did not end cleanly did not
+    // finish the program, whatever it printed first; that output is not read as quota, not even as 0.
+    if (result.exitCode !== 0) {
+      return failedReading(
+        this.provider,
+        observedAt,
+        source,
+        rawOutputDigest,
+        `interactive /usage terminal ended ${result.exitCode === null ? "with no exit code" : `with exit code ${result.exitCode}`}, so its output is not read as quota`,
+      );
+    }
     const parsed = parseUsageOutput(this.provider, raw, observedAt, rawOutputDigest);
     return parsed.ok
       ? {
@@ -595,8 +812,9 @@ abstract class BaseUsageCollector implements UsageCollector {
  * The app-server is a *server*, and that is the whole hazard. Measured on 0.146.0: the correct
  * handshake answers in 1.6–2.2s and the process then never exits, so awaiting `exit` or `close`
  * is an unbounded wait on a startup path. Sending the read without `initialize` first is a
- * 56ms `-32600`, not a hang — the handshake was never the problem. This resolves on the
- * response and kills the group; it never waits for the process to end.
+ * 56ms `-32600`, not a hang — the handshake was never the problem. This decides on the
+ * response and kills the group; it waits for the process to end only once killed, and only
+ * within its own timeout.
  *
  * `account/usage/read` is a different method: lifetime token activity, the chart the TUI draws.
  * It cannot answer whether work may be dispatched and must not be mistaken for this one.
@@ -642,36 +860,90 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
       let buffer = "";
       let settled = false;
       let asked = false;
+      // FIX-1148-R2 — settling decides the answer; the call returns it only once the server, which
+      // this probe owns and SIGKILLs on settling, is confirmed exited: `exit` is Node's word that this
+      // direct child ended and was reaped, not that its descendants did. Returning at the decision left the server running past the return. The existing
+      // timeout is split, not extended: the work ends `cleanupReserveMs` before it, and a server whose
+      // exit the OS has not confirmed by the timeout is a cleanup failure, never the answer.
+      let decided: { value?: unknown; error?: string } | null = null;
+      let exited = false;
+      let returned = false;
+      const ownedPid = ownedProcessGroup(child.pid);
+      const returnDecided = (): void => {
+        if (returned || decided === null) return;
+        returned = true;
+        clearTimeout(timer);
+        clearTimeout(deadline);
+        if (decided.error) reject(new Error(decided.error));
+        else resolve(decided.value);
+      };
       const finish = (outcome: { value?: unknown; error?: string }): void => {
         if (settled) return;
         settled = true;
+        decided = outcome;
         clearTimeout(timer);
         try {
-          if (child.pid) process.kill(-child.pid, "SIGKILL");
+          if (ownedPid !== null) process.kill(-ownedPid, "SIGKILL");
         } catch {
           /* the group is already gone */
         }
-        if (outcome.error) reject(new Error(outcome.error));
-        else resolve(outcome.value);
+        // FIX-1148-R1 — settled is the end of reading. Nothing the server says afterwards is parsed, and
+        // the pipes are let go now: a late line once crashed the caller after a stdin failure had
+        // already settled it, and a descendant outside the killed group that inherited stdout kept
+        // this handle, and the caller's process with it, alive past the timeout. The stdin `error`
+        // listener stays on; a destroyed stream emits no error of its own.
+        childStdout.off("data", onData);
+        childStdout.destroy();
+        child.stderr?.destroy();
+        childStdin.destroy();
+        if (exited || ownedPid === null) returnDecided();
       };
-      const timer = setTimeout(() => finish({ error: "codex app-server did not answer in time" }), input.timeoutMs);
+      const reserveMs = cleanupReserveMs(input.timeoutMs);
+      const timer = setTimeout(
+        () => finish({ error: "codex app-server did not answer in time" }),
+        input.timeoutMs - reserveMs,
+      );
+      // The end of the work, armed first and due no later, has settled the probe by now, so `finish`
+      // here does nothing; a probe not yet returned has an owned server whose exit is unconfirmed.
+      const deadline = setTimeout(() => {
+        finish({ error: "codex app-server did not answer in time" });
+        if (returned || ownedPid === null) return;
+        returned = true;
+        clearTimeout(timer);
+        reject(new Error(cleanupUnconfirmed("the owned codex app-server", ownedPid, decided?.error ?? "an answer was read")));
+      }, input.timeoutMs);
       const send = (message: unknown): void => void childStdin.write(`${JSON.stringify(message)}\n`);
+      // FIX-STDIN-SIBLINGS — before the first `send`, and for as long as the stream lives. A server
+      // that is gone, or has shut its stdin, when a request is written fails the write with EPIPE; an
+      // `error` event nobody hears is an uncaught exception, and `src` has no handler for one. A
+      // request the server did not take has no answer, so this is the probe's failure, and anything
+      // the server says afterwards is not read as one. Nothing waits for stdin to close.
+      childStdin.on("error", (error: NodeJS.ErrnoException) =>
+        finish({
+          error: `codex app-server did not take its request (${error.code ?? error.message}), so no rate-limit answer is read`,
+        }),
+      );
 
-      childStdout.on("data", (chunk: Buffer) => {
+      const onData = (chunk: Buffer): void => {
+        if (settled) return;
         buffer += chunk.toString();
         let newline: number;
-        while ((newline = buffer.indexOf("\n")) >= 0) {
+        while (!settled && (newline = buffer.indexOf("\n")) >= 0) {
           const line = buffer.slice(0, newline);
           buffer = buffer.slice(newline + 1);
           if (!line.trim()) continue;
-          let message: { id?: unknown; result?: unknown; error?: unknown };
+          let parsed: unknown;
           try {
             // A leading BOM makes the whole line unparseable, which reads as a server that
             // never answered — a full timeout rather than a refusal.
-            message = JSON.parse(line.replace(/^\uFEFF/, "")) as { id?: unknown; result?: unknown; error?: unknown };
+            parsed = JSON.parse(line.replace(/^\uFEFF/, ""));
           } catch {
             continue;
           }
+          // FIX-1148-R1 — `null`, a number, a string or an array parses but is no JSON-RPC message,
+          // and reading `.id` off `null` threw out of this handler and ended the caller's process.
+          if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+          const message = parsed as { id?: unknown; result?: unknown; error?: unknown };
           // JSON-RPC ids may be strings. Comparing with === to a number meant a stack that
           // echoed "0" never got the read sent, and one that echoed "1" was never answered:
           // both spent the entire timeout looking like an unresponsive server.
@@ -693,10 +965,16 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
             else finish({ value: message.result });
           }
         }
-      });
+      };
+      childStdout.on("data", onData);
       child.once("error", (error) => finish({ error: neverStarted(error).message }));
-      // Only to notice a process that died before answering. The answer never arrives this way.
-      child.once("exit", () => finish({ error: "codex app-server exited before answering" }));
+      // To notice a process that died before answering, and to confirm a settled probe's server is
+      // gone before the call returns. The answer never arrives this way.
+      child.once("exit", () => {
+        exited = true;
+        finish({ error: "codex app-server exited before answering" });
+        returnDecided();
+      });
       send({ method: "initialize", id: 0, params: { clientInfo: { name: "agent-control-plane", version: "1.0.0" } } });
     });
   }
@@ -1078,6 +1356,7 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
       code: number | null;
       timedOut?: boolean;
       spawnError?: { code?: string; message: string };
+      cleanupError?: string;
     };
     // #1099 — the account is read on both sides of the usage read, and only an account named the same
     // by both is the one measured: a sign-in that changed in between leaves the reading unbound.
@@ -1142,6 +1421,11 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
         `non-interactive /usage never started: the operating system could not spawn the configured CLI at ` +
           `${this.claudeOptions.binary} (${outcome.spawnError.code ?? "no errno"}: ${outcome.spawnError.message})`,
       );
+    }
+    // FIX-1148-R2 — the CLI's exit was never confirmed: what it wrote is not an answer, and the
+    // failure says so rather than reading as a plain timeout.
+    if (outcome.cleanupError !== undefined) {
+      return failedReading(this.provider, observedAt, source, digest, `non-interactive /usage ${outcome.cleanupError}`);
     }
     // A read that was killed or exited badly is not a reading, whatever landed in the buffer.
     // A complete envelope can already be buffered when the timer fires, and filing that as
