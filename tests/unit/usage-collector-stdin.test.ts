@@ -1,11 +1,29 @@
+import type * as ChildProcess from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { PassThrough, Writable } from "node:stream";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
+import { ExpectUsageTerminal, type UsageTerminalResult } from "../../src/capacity/usage-collectors.ts";
 import { runBoundedChild } from "../helpers/bounded-child.ts";
 import { CHILD_BUDGET_MS } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+
+/** When set, the next spawn returns this stand-in child; every other spawn, the stand-in daemons' included, is real. */
+const spawnSeam = vi.hoisted(() => ({ next: null as null | (() => unknown) }));
+vi.mock("node:child_process", async (original) => {
+  const actual = await original<typeof ChildProcess>();
+  return {
+    ...actual,
+    spawn(command: string, args: readonly string[], options: ChildProcess.SpawnOptions) {
+      const next = spawnSeam.next;
+      spawnSeam.next = null;
+      return next === null ? actual.spawn(command, args, options) : next();
+    },
+  };
+});
 
 afterAll(cleanupTempDirs);
 
@@ -208,5 +226,94 @@ describe("FIX-STDIN-SIBLINGS: the pseudo-terminal collector when expect does not
     const settled = await standIn("claude-pty", claudeNormal);
     expect(settled).toMatchObject({ survived: true, settled: "resolved", sensorHealth: "HEALTHY", error: null });
     expect(settled.buckets?.map((bucket) => bucket.remainingPercent)).toEqual([77]);
+  });
+});
+
+/**
+ * Unit 2 kill(0), usage-collectors.ts `stop()`: it signalled `-(child.pid ?? 0)`. A child with no pid —
+ * a spawn that failed — made that `kill(0)`, which signals every process in the daemon's OWN group.
+ * The witnesses below replace `process.kill` with a spy that sends nothing, so a regression is seen,
+ * never suffered.
+ */
+describe("Unit 2 kill(0): ExpectUsageTerminal signals only a process group it owns", () => {
+  /** A child as Node hands one back from a failed spawn: no pid, and stdio that leads nowhere. */
+  const pidlessChild = (how: { spawnError?: boolean; stdinRefuses?: boolean; prints?: string }) => {
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined,
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      stdin: new Writable({
+        write(_chunk, _encoding, callback) {
+          callback(how.stdinRefuses ? Object.assign(new Error("write EPIPE"), { code: "EPIPE" }) : null);
+        },
+      }),
+      kill: vi.fn(() => false),
+    });
+    if (how.spawnError) {
+      process.nextTick(() =>
+        child.emit("error", Object.assign(new Error("spawn /usr/bin/expect ENOENT"), { code: "ENOENT" })),
+      );
+    }
+    if (how.prints !== undefined) setImmediate(() => child.stdout.write(how.prints));
+    return child;
+  };
+
+  const runWithoutPid = async (
+    child: ReturnType<typeof pidlessChild>,
+    timeoutMs: number,
+  ): Promise<{ result: UsageTerminalResult; kills: unknown[][]; childKills: number }> => {
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    spawnSeam.next = () => child;
+    try {
+      const result = await new ExpectUsageTerminal().run({ binary: "claude", args: [], steps: [], timeoutMs, environment: {} });
+      // Room for a stdin error that lands after the result settled.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { result, kills: kill.mock.calls.map((call) => [...call]), childKills: child.kill.mock.calls.length };
+    } finally {
+      kill.mockRestore();
+      spawnSeam.next = null;
+    }
+  };
+
+  it("spawn failure, then a stdin that refuses the program: sends no signal at all and returns the spawn failure", async () => {
+    const { result, kills, childKills } = await runWithoutPid(pidlessChild({ spawnError: true, stdinRefuses: true }), 5_000);
+    expect(kills).toEqual([]);
+    expect(childKills).toBe(0);
+    expect(result).toMatchObject({ exitCode: null, timedOut: false, error: "spawn /usr/bin/expect ENOENT" });
+  });
+
+  it("no pid and the timer fires: sends no signal and keeps the timeout classification", async () => {
+    const { result, kills, childKills } = await runWithoutPid(pidlessChild({}), 100);
+    expect(kills).toEqual([]);
+    expect(childKills).toBe(0);
+    expect(result).toMatchObject({ exitCode: null, timedOut: true, error: "interactive /usage timed out" });
+  });
+
+  it("no pid and a trust prompt on screen: sends no signal and still refuses the prompt", async () => {
+    const { result, kills, childKills } = await runWithoutPid(pidlessChild({ prints: "Do you trust the files in this folder?" }), 5_000);
+    expect(kills).toEqual([]);
+    expect(childKills).toBe(0);
+    expect(result.error).toMatch(/refuses to approve/);
+  });
+
+  it("control: an owned expect group that never answers is SIGKILLed at its own group and reaped under the timeout", async () => {
+    const pidsPath = join(home, "hung.pids");
+    const hung = script("claude-hangs", `echo $PPID $$ > '${pidsPath}'\nexec sleep 30`);
+    const kill = vi.spyOn(process, "kill");
+    let result: UsageTerminalResult;
+    let kills: unknown[][];
+    try {
+      // expect's own wait is ceil(1.1 s) = 2 s, so the outer timer is what ends this run.
+      result = await new ExpectUsageTerminal().run({ binary: hung, args: [], steps: [], timeoutMs: 1_100, environment: process.env });
+      kills = kill.mock.calls.map((call) => [...call]);
+    } finally {
+      kill.mockRestore();
+    }
+    expect(result).toMatchObject({ exitCode: null, timedOut: true, error: "interactive /usage timed out" });
+    const [expectPid, cliPid] = readFileSync(pidsPath, "utf8").trim().split(" ").map(Number);
+    expect(Number.isSafeInteger(expectPid) && expectPid! > 1).toBe(true);
+    expect(kills).toEqual([[-expectPid!, "SIGKILL"]]);
+    expect(await ends(expectPid!), `expect ${expectPid} was not ended and reaped`).toBe(true);
+    expect(await ends(cliPid!), `the CLI ${cliPid} under expect is still running`).toBe(true);
   });
 });

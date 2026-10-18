@@ -366,9 +366,14 @@ export class ExpectUsageTerminal implements UsageTerminal {
       let stderr = "";
       let timedOut = false;
       let settled = false;
+      // Only a group this probe owns. A child with no pid is a spawn that failed: there is nothing to
+      // signal, and its `error` event reports the failure. `-(pid ?? 0)` made that `kill(0)`, which
+      // signals the daemon's own process group; pid 1 is excluded because `kill(-1)` signals everything.
       const stop = (signal: NodeJS.Signals = "SIGTERM"): void => {
+        const pid = child.pid;
+        if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 1) return;
         try {
-          process.kill(-(child.pid ?? 0), signal);
+          process.kill(-pid, signal);
         } catch {
           child.kill(signal);
         }
