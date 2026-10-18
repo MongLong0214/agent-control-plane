@@ -1,0 +1,3 @@
+Warn: the C1B-03 renewal test waits for the revision-request turn to finish before release(), because release() does not end that turn as a restart would and its launch-channel take or withdraw could take the rotated credential the recovery provisions; the test covers renewal after a completed revision request, not a restart that leaves a turn in progress
+Record-Id: r-166ee0d94aca
+Provenance: inherited 5c7f40539e0011cc32c5fa853ef50a933f87ae57
