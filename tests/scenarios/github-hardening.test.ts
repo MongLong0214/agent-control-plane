@@ -13,6 +13,7 @@ import {
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
+import { bindingAsIfCounted } from "../helpers/human-gate-binding.ts";
 import { OWNER_DECISION_WRITE_DENIED, writeOutsideTheGuard } from "../helpers/released-v47-schema.ts";
 import {
   approveReviewedCandidateForFinalization,
@@ -143,10 +144,11 @@ const setup = async (options: {
     bypassCeoConfirmation: options.allowUnsatisfiedHumanGate,
   });
   installDaemonFinalizerGitHubFixture(harness);
-  const humanGateStatus = harness.cp.ceo.humanGateStatus(driven.runId);
-  const humanGateDigest = humanGateStatus.required
-    ? digestOf(humanGateStatus.items)
-    : NO_HUMAN_GATE_DIGEST;
+  // FIX-FINALIZER-DIGEST — the payload names the production gate's current human-gate binding, as the
+  // daemon finalizer does. A gate left unsatisfied has none, so each such test names what it claims.
+  const named = harness.cp.ceo.currentHumanGateDecisionDigest(driven.runId);
+  if (!named.allowed && !options.allowUnsatisfiedHumanGate) throw new Error(`${named.reasonCode}: ${named.message}`);
+  const humanGateDigest = named.allowed ? named.value : "";
 
   return {
     harness,
@@ -411,6 +413,21 @@ const recordOwnerDecision = (
   if (!recorded.allowed) throw new Error(`${recorded.reasonCode}: ${recorded.message}`);
 };
 
+/**
+ * FIX-FINALIZER-DIGEST — the binding a payload claims: every item's latest OWNER_DECISION record as if it
+ * counted, and `claimed` for an item with no record at all. The kernel refusing it is then its own
+ * judgement of those records, never a mismatch of digest forms.
+ */
+const claimedBinding = (fixture: Fixture, items: readonly string[], claimed: Readonly<Record<string, string>> = {}): string =>
+  bindingAsIfCounted(fixture.harness, fixture.runId, items, claimed);
+
+/** The binding the production gate names now; the run's gate must be satisfied. */
+const currentBinding = (fixture: Fixture): string => {
+  const named = fixture.harness.cp.ceo.currentHumanGateDecisionDigest(fixture.runId);
+  if (!named.allowed) throw new Error(`${named.reasonCode}: ${named.message}`);
+  return named.value;
+};
+
 /** A live, unrelated identity makes an ownership denial prove the owner check actually ran. */
 const unrelatedCaller = (fixture: Pick<OwnerAuthorityFixture, "harness" | "caller">) => {
   const session = fixture.harness.cp.sessions.create({ provider: "scripted", model: "unrelated-github-caller" });
@@ -503,8 +520,9 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
       approved: true,
       note: "approve production action",
     });
+    // The payload claims a decision of the second item that does not exist.
     const refused = await fixture.harness.cp.github.gatePublish(
-      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      { ...fixture.payload, humanGateDigest: claimedBinding(fixture, items, { [items[1]]: digestOf({ claimed: items[1] }) }) },
       fixture.identity,
     );
     expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
@@ -525,7 +543,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
       note: "approve release",
     });
     const published = await fixture.harness.cp.github.gatePublish(
-      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      { ...fixture.payload, humanGateDigest: currentBinding(fixture) },
       fixture.identity,
     );
     if (!published.allowed) throw new Error(`${published.reasonCode}: ${published.message}`);
@@ -554,7 +572,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
     });
 
     const refused = await fixture.harness.cp.github.gatePublish(
-      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      { ...fixture.payload, humanGateDigest: claimedBinding(fixture, items) },
       fixture.identity,
     );
     expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
@@ -572,7 +590,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
     });
 
     const refused = await fixture.harness.cp.github.gatePublish(
-      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      { ...fixture.payload, humanGateDigest: claimedBinding(fixture, items) },
       fixture.identity,
     );
     expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
@@ -604,7 +622,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
     );
 
     const refused = await fixture.harness.cp.github.gatePublish(
-      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      { ...fixture.payload, humanGateDigest: claimedBinding(fixture, items) },
       fixture.identity,
     );
     expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
@@ -615,19 +633,21 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
     const items = ["undelegated public release"] as const;
     const fixture = await setup({ humanGate: items });
     recordOwnerDecision(fixture, { item: items[0], approved: true, note: "approved" });
+    // The port answers unsatisfied with the very binding the payload names: only the port decides.
+    const binding = currentBinding(fixture);
     fixture.harness.cp.github.attach({
       humanGateStatus: {
         humanGateStatus: () => ({
           required: true,
           items,
           satisfied: false,
-          humanGateDigest: digestOf(items),
+          humanGateDigest: binding,
         }),
       },
     });
 
     const refused = await fixture.harness.cp.github.gatePublish(
-      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      { ...fixture.payload, humanGateDigest: binding },
       fixture.identity,
     );
     expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
@@ -638,8 +658,9 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
     const items = ["undelegated public release"] as const;
     const fixture = await setup({ humanGate: items });
     recordOwnerDecision(fixture, { item: items[0], approved: true, note: "approved" });
+    const binding = currentBinding(fixture);
     const published = await fixture.harness.cp.github.gatePublish(
-      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      { ...fixture.payload, humanGateDigest: binding },
       fixture.identity,
     );
     if (!published.allowed) throw new Error(`${published.reasonCode}: ${published.message}`);
@@ -650,7 +671,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
           required: true,
           items,
           satisfied: false,
-          humanGateDigest: digestOf(items),
+          humanGateDigest: binding,
         }),
       },
     });

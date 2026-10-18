@@ -177,17 +177,23 @@ interface GitHubCaller {
 }
 
 /**
- * The GitHub boundary deliberately reads the owner-gate predicate through this narrow port.
- * `ProductionGate.humanGateStatus` is the sole place that interprets approval artifacts and
- * their ingress receipts; the kernel only binds its result to a gate payload.
+ * The GitHub boundary deliberately reads the owner gate through this narrow port.
+ * `ProductionGate.resolveHumanGate` is the sole place that interprets owner decisions, T3 approvals
+ * and their ingress receipts; the port answers `ProductionGate.humanGateBinding`, and the kernel only
+ * compares its binding with the gate payload's, each time it publishes and each time it merges.
  */
 export interface HumanGateStatusPort {
   humanGateStatus(runId: string): {
     required: boolean;
     items: readonly string[];
     satisfied: boolean;
-    /** Digest of the current ProductionGate definition, supplied with the status. */
-    humanGateDigest: string;
+    /**
+     * FIX-FINALIZER-DIGEST — the current human-gate binding: the digest of the gate definition digest,
+     * the current candidate and each required item's authenticated decision, the same value the daemon
+     * finalizer names as the payload's `humanGateDigest`. Null while the gate is unsatisfied, so no
+     * payload can name it; never the definition digest alone.
+     */
+    humanGateDigest: string | null;
     /**
      * SEC-OD1-R1-02 — the undecided items whose latest owner approval is not a canonical owner decision
      * (recorded before SEC-OD1), named so the refusal says the owner must decide again.
@@ -266,7 +272,7 @@ export class GitHubKernel {
    * because GitHub has already accepted it but the first caller has not reread it yet.
    */
   private readonly inFlightReservations = new Set<string>();
-  /** `ProductionGate.humanGateStatus` is the sole human-gate predicate. */
+  /** `ProductionGate.resolveHumanGate`, through `humanGateBinding`, is the sole human-gate predicate. */
   private humanGateStatusPort: HumanGateStatusPort | null = null;
   private readonly client: GitHubClient | undefined;
   private readonly postMergePollAttempts: number;
@@ -3410,8 +3416,9 @@ export class GitHubKernel {
 
   /**
    * CP-HI-07 at the GitHub boundary. The kernel owns payload binding, not owner-decision
-   * interpretation: `ProductionGate.humanGateStatus` is re-read for both publication and
-   * merge, then its current definition digest is bound to the payload.
+   * interpretation: the production gate resolves the human gate again for both publication and
+   * merge (FIX-FINALIZER-DIGEST), and the payload must name its current binding exactly. A payload
+   * named before a decision or the candidate changed names a binding that no longer exists.
    */
   private assertGatePayloadHumanGateStatus(payload: GatePayload): Decision<void> {
     const port = this.humanGateStatusPort;
