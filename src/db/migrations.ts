@@ -9,18 +9,22 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 46;
+export const SCHEMA_VERSION = 48;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
 const v44SchemaPath = fileURLToPath(new URL("./schema-v44.sql", import.meta.url)); // released v38–v44 read only this
 const v45SchemaPath = fileURLToPath(new URL("./schema-v45.sql", import.meta.url)); // released v45 reads only this
+const v46SchemaPath = fileURLToPath(new URL("./schema-v46.sql", import.meta.url)); // released v46 reads only this
+const v47SchemaPath = fileURLToPath(new URL("./schema-v47.sql", import.meta.url)); // released v47 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
   version <= 37 ? historicalSchemaSql()
     : version <= 44 ? readFileSync(v44SchemaPath, "utf8")
-      : version <= 45 ? readFileSync(v45SchemaPath, "utf8") : schemaSql();
+      : version <= 45 ? readFileSync(v45SchemaPath, "utf8")
+        : version <= 46 ? readFileSync(v46SchemaPath, "utf8")
+          : version <= LATEST_FROZEN_VERSION ? readFileSync(v47SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -152,8 +156,8 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   // v43 alone creates the bootstrap application record and its guards (#246 C3).
   /-- -{75}\n-- bootstrap_applications[\s\S]*?CREATE TRIGGER IF NOT EXISTS bootstrap_applications_no_delete[\s\S]*?\nEND;/,
   // v44 alone creates the manifest activation grant, its guards, and the two guards over projects and
-  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512); v46 alone, the rowid guards (#1094).
-  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/, /-- -{75}\n-- rowid no-replace guards[\s\S]*?CREATE TRIGGER IF NOT EXISTS canonical_turns_rowid_positive[\s\S]*?\nEND;/,
+  // runs that name it (#246 B2-b); v45 alone, the first-activation grant and its guards (#512); v46 alone, the rowid guards (#1094); v47 alone, the owner-decision guard (SEC-OD1); v48 alone, its supersede and rowid guards.
+  /-- -{75}\n-- manifest_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS runs_contract_change_completes_activated[\s\S]*?\nEND;/, /-- -{75}\n-- manifest_first_activation_grants[\s\S]*?CREATE TRIGGER IF NOT EXISTS manifest_activation_grants_not_first[\s\S]*?\nEND;/, /-- -{75}\n-- rowid no-replace guards[\s\S]*?CREATE TRIGGER IF NOT EXISTS canonical_turns_rowid_positive[\s\S]*?\nEND;/, /-- CP-HI-06 — SEC-OD1 \(v47\): an owner decision[\s\S]*?CREATE TRIGGER IF NOT EXISTS run_artifacts_owner_decision_authority_guard[\s\S]*?\nEND;/, /-- -{75}\n-- owner-decision supersede guards[\s\S]*?CREATE TRIGGER IF NOT EXISTS run_artifacts_rowid_positive[\s\S]*?\nEND;/,
 ];
 
 /**
@@ -3585,6 +3589,256 @@ const v46: SchemaMigration = {
   checksum: () => migrationChecksum("v46-rowid-no-replace", 46),
 };
 
+/** v47's guard, read from schema.sql by name (SEC-OD1). */
+export const V47_OWNER_DECISION_TRIGGER_NAMES: readonly string[] = [
+  "run_artifacts_owner_decision_authority_guard",
+];
+
+/**
+ * SEC-OD1 (CEO 1b1f1b7f, aa6ac374). An APPROVAL carrying the canonical owner-decision label, or
+ * OWNER_DECISION content, could be inserted by an ordinary in-process `Db.run`: the label was the
+ * only thing the gate readers trusted, and nothing in the database refused it. v47 adds one BEFORE
+ * INSERT trigger on `run_artifacts` that refuses such a row unless the connection-local evidence
+ * marker returns exactly 1, which only `Db.insertEvidenceArtifact` (through `putOwnerDecision`'s
+ * capability) sets, for one statement. `INSERT OR REPLACE` fires it as well; an UPDATE into that shape,
+ * or of a written decision's content or bindings, stays refused by `run_artifacts_content_immutable`.
+ *
+ * Additive only: one trigger, no existing body changed, no row touched. Rows written before v47,
+ * including OWNER_DECISION rows labelled "service", stay exactly as they are; the readers decide what
+ * they count.
+ *
+ * Its name is checked as v45 and v46 check theirs (`assertStepNames`): before the step, whatever holds
+ * it, in any letter case, must be absent or the trigger schema.sql defines, of that type, on
+ * `run_artifacts`, token for token; anything else refuses the step and nothing is dropped or replaced.
+ * `CREATE TRIGGER IF NOT EXISTS` then adds it only where the name is free, so a repeated application
+ * changes nothing. The name is checked again after.
+ *
+ * Owner decisions written before the guard (CEO 85eac6ef option B; widened by CEO 80492af7). The guard
+ * refuses new writes; it cannot authenticate a row already stored. Before v47 any ordinary `Db.run` could
+ * write the canonical label (measured: a never-admitted `not-the-owner` approval written that way at v46
+ * overrode the owner's refusal after the upgrade, and publication and merge each went through once), or
+ * OWNER_DECISION content under a label in another letter case (measured at cbb4bfaf: it upgraded, and its
+ * bound refusal was then counted), and no released build before v47 wrote either. So this step refuses
+ * if any APPROVAL row claims an owner decision the guard could not have vetted
+ * (`claimsUnvettedOwnerDecision`): its label is the canonical one once normalized, or its content is
+ * OWNER_DECISION-shaped by the reader's test or the guards' and its label is not exactly "service". The
+ * refusal is `v47 refuses: OWNER_DECISION_LABEL_PREDATES_GUARD`, the count and the first artifact ids,
+ * each cut short. The step never deletes, relabels or promotes a row. An exact "service" row is the
+ * history every decision before SEC-OD1 has and stays legacy: its approval is never canonical and asks
+ * the owner to decide again, and its exactly bound refusal still counts. No live row is excepted by id.
+ *
+ * Two lines, the same predicate. The first is the migrator's read-only preflight
+ * (`assertMigrationPreflight`), under the migration lock and before any backup, so a refusal leaves the
+ * image byte for byte as it was. The preflight alone does not remove the window between that read and
+ * this step: the lock excludes ACP's migrations and daemon, not an older build's process or a raw
+ * connection. The second line runs here, inside the step's own write transaction and before the guard is
+ * installed, so a row written in that window is still refused; a refusal from here goes through the
+ * migrator's generic restore, which keeps the rows and receipts, not the bytes.
+ *
+ * The check runs only when a database goes from v46 to v47; it does not depend on whether the trigger
+ * is already there, since an ordinary `Db.run` at v46 could create it too. v48 and every later open
+ * never repeat it, so a canonical decision written under the guard is never refused for its label. A
+ * database that already holds a v47 receipt is told apart by that receipt's value instead
+ * (`receiptMismatches`): the receipt says only that some v47 step committed, and the unreleased
+ * candidates' steps (sha256:f9b23700…, with no check; sha256:6030b25b…, with the exact label only) wrote
+ * other values than this one's. Such a database is refused before anything is written, its receipt is
+ * never rewritten, and nothing cleans it or takes it as released history.
+ *
+ * Limit: a connection that defines `acp_evidence_write_authorized` itself, to return 1, passes this
+ * guard (CEO 52c3b1e6 (b)); it is a boundary against ACP's own `Db.run`, not against every raw writer.
+ *
+ * A live database at v46 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+/**
+ * SEC-OD1 — what an owner decision is, defined once (FIX-SEC-R3, CEO 80492af7). The gate reader
+ * (`ProductionGate.boundOwnerDecision`), the decision's writer (`ArtifactStore.putOwnerDecision`) and v47's
+ * pre-install refusal use these and keep no copy. The guards are SQL in the frozen schema snapshots and
+ * cannot call them; their shape clause is `ownerDecisionShapeSql` over `NEW.`/`OLD.content_json`, token for
+ * token, which a test compares with both trigger bodies (v47's insert guard and v48's supersede guard).
+ */
+/** The canonical label. Only `putOwnerDecision`, under the production gate's capability, writes it. */
+export const OWNER_DECISION_LABEL = "production-gate:owner-decision";
+/** The label `ArtifactStore.put` writes on any row; every owner decision recorded before SEC-OD1 carries it. */
+export const LEGACY_OWNER_DECISION_LABEL = "service";
+export const OWNER_DECISION_KIND = "OWNER_DECISION";
+
+/** The reader's shape test on a parsed record: its own top-level `kind` is OWNER_DECISION. */
+export const isOwnerDecisionContent = (content: unknown): boolean =>
+  typeof content === "object" && content !== null && !Array.isArray(content) &&
+  (content as { kind?: unknown }).kind === OWNER_DECISION_KIND;
+
+/** The guards' shape test over a content column: valid JSON with any top-level member `kind` = OWNER_DECISION. */
+export const ownerDecisionShapeSql = (column: string): string =>
+  `json_valid(${column}) = 1 AND EXISTS ( SELECT 1 FROM json_each(${column}) member WHERE member.key = 'kind' ` +
+  `AND member.value = '${OWNER_DECISION_KIND}' )`;
+
+/**
+ * A label as a claim to the canonical one is compared: Unicode NFKC, surrounding white space removed,
+ * lower case. The readers and the guards still compare the label exactly, so only the exact canonical
+ * label is canonical; this only widens what a refusal treats as claiming it.
+ */
+export const normalizedProducerLabel = (label: string): string => label.normalize("NFKC").trim().toLowerCase();
+
+/**
+ * Whether a stored APPROVAL row claims an owner decision the v47 guard could not have vetted: its label is
+ * the canonical one once normalized, or its content is OWNER_DECISION-shaped (by the reader's test or the
+ * guards') and its label is not exactly "service". An exact "service" row is legacy history and is not.
+ */
+export const claimsUnvettedOwnerDecision = (row: {
+  producedBy: unknown;
+  contentJson: unknown;
+  guardShaped: unknown;
+}): boolean => {
+  if (typeof row.producedBy === "string" && normalizedProducerLabel(row.producedBy) === OWNER_DECISION_LABEL) return true;
+  if (row.producedBy === LEGACY_OWNER_DECISION_LABEL) return false;
+  if (row.guardShaped === 1) return true;
+  if (typeof row.contentJson !== "string") return false;
+  try {
+    return isOwnerDecisionContent(JSON.parse(row.contentJson));
+  } catch {
+    return false;
+  }
+};
+
+/** At most this many artifact ids, each cut to this many characters, are named in the refusal. */
+const V47_PRE_GUARD_IDS_SHOWN = 5;
+const V47_PRE_GUARD_ID_CHARS = 64;
+
+/**
+ * Every APPROVAL row, with the guards' shape verdict beside it, in rowid order. The clause is evaluated
+ * as a condition (`CASE WHEN`), as a trigger's WHEN evaluates it: as a plain result column SQLite computes
+ * both sides of its AND, and `json_each` then fails the whole read on the first row that is not JSON.
+ */
+const V47_PRE_GUARD_ROWS =
+  `SELECT substr(CAST(artifact_id AS TEXT), 1, ${V47_PRE_GUARD_ID_CHARS + 1}) AS id, produced_by, content_json, ` +
+  `(CASE WHEN ${ownerDecisionShapeSql("content_json")} THEN 1 ELSE 0 END) AS guard_shaped ` +
+  "FROM run_artifacts WHERE kind = 'APPROVAL' ORDER BY rowid";
+
+/** What v47 refuses before it installs its guard, as its receipt checksum records it. */
+const V47_PRE_GUARD_REFUSAL =
+  `kind = 'APPROVAL' AND (nfkc_trim_lower(produced_by) = '${OWNER_DECISION_LABEL}' OR ` +
+  `(produced_by IS NOT '${LEGACY_OWNER_DECISION_LABEL}' AND ((${ownerDecisionShapeSql("content_json")}) ` +
+  `OR json_parse(content_json).kind = '${OWNER_DECISION_KIND}')))`;
+
+/**
+ * Refuses, writing nothing, while any APPROVAL row claims an owner decision from before the v47 guard.
+ * Run by the migrator's read-only preflight and again inside v47's transaction (see v47).
+ */
+export const refuseOwnerDecisionsBeforeTheGuard = (raw: Database.Database): void => {
+  const table = raw
+    .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'run_artifacts'")
+    .get() as { n: number };
+  if (table.n === 0) return;
+  let count = 0;
+  const shown: string[] = [];
+  for (const row of raw.prepare(V47_PRE_GUARD_ROWS).iterate() as Iterable<{
+    id: string | null;
+    produced_by: unknown;
+    content_json: unknown;
+    guard_shaped: unknown;
+  }>) {
+    if (!claimsUnvettedOwnerDecision({ producedBy: row.produced_by, contentJson: row.content_json, guardShaped: row.guard_shaped })) continue;
+    count += 1;
+    if (shown.length < V47_PRE_GUARD_IDS_SHOWN) {
+      const id = row.id;
+      shown.push(id === null ? "NULL" : JSON.stringify(id.length > V47_PRE_GUARD_ID_CHARS ? `${id.slice(0, V47_PRE_GUARD_ID_CHARS)}…` : id));
+    }
+  }
+  if (count === 0) return;
+  const more = count > shown.length ? ` (+${count - shown.length} more)` : "";
+  throw acpError(
+    ReasonCode.OWNER_DECISION_LABEL_PREDATES_GUARD,
+    `v47 refuses: OWNER_DECISION_LABEL_PREDATES_GUARD — run_artifacts holds ${count} APPROVAL row(s) that claim ` +
+      `an owner decision from before the owner-decision guard existed (the label "production-gate:owner-decision" ` +
+      `in any letter case, width or surrounding space, or OWNER_DECISION content under a label other than "service"): ` +
+      `${shown.join(", ")}${more}; a claim written before the guard cannot show the owner decided, so the guard is ` +
+      "not installed over it; no row was deleted, relabelled or promoted",
+    { refusal: "OWNER_DECISION_LABEL_PREDATES_GUARD", count, artifactIds: shown, unlisted: count - shown.length },
+  );
+};
+
+const v47: SchemaMigration = {
+  id: "v47-owner-decision-authority-guard",
+  fromVersion: 46,
+  toVersion: 47,
+  apply: (raw) => {
+    const objects = stepTriggerObjects(47, V47_OWNER_DECISION_TRIGGER_NAMES);
+    assertStepNames(raw, 47, objects, "before");
+    // The second line: the preflight ran before the backup, outside this transaction.
+    refuseOwnerDecisionsBeforeTheGuard(raw);
+    raw.exec(triggerDdlFor(V47_OWNER_DECISION_TRIGGER_NAMES, 47));
+    assertStepNames(raw, 47, objects, "after");
+  },
+  // The snapshot and the refusal predicate: a receipt written by a candidate step, whose refusal was
+  // absent or narrower, cannot be mistaken for this one's.
+  checksum: () =>
+    sha256(`v47-owner-decision-authority-guard\n${schemaSqlAt(47)}\nrefused-before-install: ${V47_PRE_GUARD_REFUSAL}`),
+};
+
+/** v48's guards, read from schema.sql by name (SEC-OD1): the supersede guard, then insert by rowid, rowid change, non-positive rowid. */
+export const V48_OWNER_DECISION_SUPERSEDE_TRIGGER_NAMES: readonly string[] = [
+  "run_artifacts_owner_decision_supersede_guard",
+  "run_artifacts_no_rowid_replace",
+  "run_artifacts_rowid_immutable",
+  "run_artifacts_rowid_positive",
+];
+
+/**
+ * SEC-OD1 (CEO 072dbccb). An owner decision stops counting once its one-way superseded mark is set, and
+ * `run_artifacts_content_immutable` lets exactly that flag change. Measured at v47: an ordinary in-process
+ * `Db.run` set it on the owner's exactly bound refusal, the earlier approval decided the item again, and
+ * the kernel merged. v48 adds a BEFORE UPDATE trigger that refuses any change of the flag on an
+ * OWNER_DECISION APPROVAL — the canonical label, or a top-level content kind member of OWNER_DECISION as
+ * v47 reads it, so legacy "service" refusals as well — unless the connection-local evidence marker returns
+ * exactly 1. Only `Db.supersedeRunArtifacts`, which the run engine's capability enters for its one
+ * staleness statement, sets it for an UPDATE.
+ *
+ * The same removal through the hidden rowid: with recursive_triggers off (SQLite's default on a connection
+ * ACP did not open), an insert naming the decision's rowid, or `UPDATE OR REPLACE … SET rowid` onto it,
+ * deleted the decision with every run_artifacts guard silent. v48 adds v46's three rowid guards for
+ * `run_artifacts`, raising its existing RUN_ARTIFACT_NO_REPLACE sentinel. As at v46, the insert guard is
+ * sound only while every rowid is positive, so the step first counts non-positive rowids and refuses if any
+ * exist; it never deletes or renumbers a row, and the outer migration backup restores the original image.
+ *
+ * Additive only: four triggers, no existing body changed, no row touched; rows written before v48 keep
+ * their flags. Each name is checked as v45–v47 check theirs (`assertStepNames`): before the step,
+ * whatever holds it, in any letter case, must be absent or the trigger schema.sql defines, of that type,
+ * on `run_artifacts`, token for token; anything else refuses the step and nothing is dropped or replaced.
+ * `CREATE TRIGGER IF NOT EXISTS` then adds each only where the name is free, so a repeated application
+ * changes nothing. The names are checked again after.
+ *
+ * Limit: a connection that defines `acp_evidence_write_authorized` itself, to return 1, passes the
+ * supersede guard (CEO 52c3b1e6 (b)), and a writer that drops a trigger passes all four; they are a
+ * boundary against ACP's own `Db.run`, not against every raw writer.
+ *
+ * v48 does not repeat v47's check for canonical labels written before the guard (CEO 85eac6ef): at v47
+ * the guard already decides who writes the label, and a decision written under it must never be refused.
+ *
+ * A live database at v47 reaches this step only through an approved migration
+ * (`assertMigrationApproved`), as it does every step.
+ */
+const v48: SchemaMigration = {
+  id: "v48-owner-decision-supersede-guard",
+  fromVersion: 47,
+  toVersion: 48,
+  apply: (raw) => {
+    const objects = stepTriggerObjects(48, V48_OWNER_DECISION_SUPERSEDE_TRIGGER_NAMES);
+    assertStepNames(raw, 48, objects, "before");
+    const nonPositive = (raw.prepare("SELECT COUNT(*) AS n FROM run_artifacts WHERE rowid <= 0").get() as { n: number }).n;
+    if (nonPositive > 0) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `v48 refuses to guard rowids: run_artifacts holds ${nonPositive} row(s) with rowid <= 0; no row was deleted or renumbered`,
+        { nonPositive: [{ table: "run_artifacts", count: nonPositive }] },
+      );
+    }
+    raw.exec(triggerDdlFor(V48_OWNER_DECISION_SUPERSEDE_TRIGGER_NAMES, 48));
+    assertStepNames(raw, 48, objects, "after");
+  },
+  checksum: () => migrationChecksum("v48-owner-decision-supersede-guard", 48),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -3621,6 +3875,8 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v44,
   v45,
   v46,
+  v47,
+  v48,
 ]);
 
 interface RequiredTrigger {
@@ -3821,6 +4077,11 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "canonical_turns_no_rowid_replace", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
   { name: "canonical_turns_rowid_immutable", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
   { name: "canonical_turns_rowid_positive", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 46 },
+  { name: "run_artifacts_owner_decision_authority_guard", sentinel: "OWNER_DECISION_WRITE_AUTHORITY_DENIED", introducedIn: 47 },
+  { name: "run_artifacts_owner_decision_supersede_guard", sentinel: "OWNER_DECISION_SUPERSEDE_AUTHORITY_DENIED", introducedIn: 48 },
+  { name: "run_artifacts_no_rowid_replace", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 48 },
+  { name: "run_artifacts_rowid_immutable", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 48 },
+  { name: "run_artifacts_rowid_positive", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 48 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
@@ -3934,6 +4195,113 @@ export const assertMigrationLedgerAt = (raw: Database.Database, version: number)
       version,
       receipt: receipt ?? null,
     });
+  }
+};
+
+/**
+ * SEC-OD1 (FIX-SEC-R3, R1-01). The first version whose stored receipt is compared by VALUE with the
+ * checksum this build's step computes; `assertMigrationLedgerAt` checks only the format. A database
+ * that holds the unreleased candidate v47's receipt (sha256:f9b23700…) was migrated by a step without
+ * the pre-install refusal, so a never-admitted approval written before the guard could stand in it; the
+ * format check passed it, and it upgraded, published and merged once (review r3).
+ *
+ * Why not earlier. Measured: the released v12 and v38 steps wrote other values than today's steps
+ * compute (v12's step then read the schema of its day, not schema-v37.sql; v38's read the schema of its
+ * day, not schema-v44.sql), and v24 was edited in place; comparing those would refuse released
+ * databases, the live one at v44 likely among them. v45's and v46's values are unchanged from their
+ * release commits to now (4263f001…, aa2aa099…), but they are not compared either, so a database
+ * carrying them opens and migrates exactly as before. Receipts v12–v46 keep the format check only.
+ *
+ * Why not later than the frozen steps. A step that still reads the live schema.sql (v48 until the next
+ * freeze) changes its checksum with any schema edit, so it joins when it is frozen
+ * (`LATEST_FROZEN_VERSION`). A bootstrap receipt (`bootstrap-v<n>`) is not compared: a database created at
+ * v47 or later had the guard from its first transaction.
+ */
+export const RECEIPT_VALUE_CHECKED_FROM = 47;
+
+/**
+ * The newest step that reads a frozen snapshot (`schemaSqlAt`'s last snapshot branch); every later step
+ * reads the live schema.sql, so its checksum still moves with any schema edit until the next freeze.
+ * Declared here, below the anchors other gates hold into this file, and read only inside functions.
+ */
+const LATEST_FROZEN_VERSION = 47;
+
+/** The receipt checksums the unreleased v47 candidates wrote, named in a refusal; never accepted. */
+const SUPERSEDED_V47_CHECKSUMS: Readonly<Record<string, string>> = {
+  "sha256:f9b2370034620dc56f825fd9119fedd22ba76a46261c64684446992a48958b49":
+    "the unreleased candidate v47 (faa829ec–ccc4865f), which had no pre-install refusal",
+  "sha256:6030b25bbb1ece91d3195a27e8ee703a335863fbd4ab8660c2548dde21eb905b":
+    "the unreleased candidate v47 (cbb4bfaf), which refused the exact canonical label only",
+};
+
+export interface ReceiptMismatch {
+  version: number;
+  migrationId: string;
+  stored: string;
+  expected: string;
+  /** Which unreleased candidate wrote it, when it is one this repository knows. */
+  supersededCandidate: string | null;
+}
+
+/** Every stored receipt, from `RECEIPT_VALUE_CHECKED_FROM` to the latest frozen step, that is not this build's. */
+export const receiptMismatches = (raw: Database.Database): ReceiptMismatch[] => {
+  const ledger = raw
+    .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+    .get() as { n: number };
+  if (ledger.n === 0) return [];
+  const mismatches: ReceiptMismatch[] = [];
+  for (const migration of MIGRATIONS) {
+    if (migration.toVersion < RECEIPT_VALUE_CHECKED_FROM || migration.toVersion > LATEST_FROZEN_VERSION) continue;
+    const stored = raw
+      .prepare("SELECT migration_id, checksum FROM schema_migrations WHERE version = ?")
+      .get(migration.toVersion) as { migration_id: string; checksum: string } | undefined;
+    if (stored === undefined || stored.migration_id === `bootstrap-v${migration.toVersion}`) continue;
+    const expected = migration.checksum();
+    if (stored.migration_id === migration.id && stored.checksum === expected) continue;
+    mismatches.push({
+      version: migration.toVersion,
+      migrationId: String(stored.migration_id),
+      stored: String(stored.checksum),
+      expected,
+      supersededCandidate: SUPERSEDED_V47_CHECKSUMS[String(stored.checksum)] ?? null,
+    });
+  }
+  return mismatches;
+};
+
+/** Refuses, writing nothing, a database holding a receipt `receiptMismatches` reports. Never rewrites one. */
+export const assertReceiptsAreThisBuilds = (raw: Database.Database): void => {
+  const mismatches = receiptMismatches(raw);
+  if (mismatches.length === 0) return;
+  throw acpError(
+    ReasonCode.MIGRATION_RECEIPT_MISMATCH,
+    "this build refuses a database whose migration receipt another step wrote: " +
+      mismatches
+        .map((m) =>
+          `v${m.version} ${JSON.stringify(m.migrationId)} holds ${m.stored.slice(0, 15)}…, this build's step writes ` +
+          `${m.expected.slice(0, 15)}…${m.supersededCandidate === null ? "" : ` (written by ${m.supersededCandidate})`}`)
+        .join("; ") +
+      "; such a receipt does not show this build's checks ran on the rows it migrated, so nothing was changed " +
+      "and the receipt is not rewritten",
+    { mismatches },
+  );
+};
+
+/**
+ * SEC-OD1 (FIX-SEC-R3, R3-01). What the migrator checks, read-only, after it holds the migration lock
+ * and before it backs anything up or writes: every receipt `receiptMismatches` reads, and, when the
+ * chain includes the v46 → v47 step, `refuseOwnerDecisionsBeforeTheGuard`. A refusal here leaves the
+ * image, its receipts and its version byte for byte as they were, because nothing has touched the file.
+ *
+ * Not the whole defence. The lock excludes ACP's own migrations and daemon, not an older build's process
+ * or a raw connection writing between this read and the step's transaction; v47 runs the same predicate
+ * again inside that transaction, and a refusal from there is restored by the migrator's generic path
+ * (rows and receipts kept, bytes not).
+ */
+export const assertMigrationPreflight = (raw: Database.Database, fromVersion: number): void => {
+  assertReceiptsAreThisBuilds(raw);
+  if (migrationChainFrom(fromVersion).some((migration) => migration.toVersion === 47)) {
+    refuseOwnerDecisionsBeforeTheGuard(raw);
   }
 };
 

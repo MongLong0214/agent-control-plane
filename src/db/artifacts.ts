@@ -12,6 +12,7 @@ import {
 } from "../snapshot/candidate-snapshot.ts";
 import { credentialBearingField, prohibitedDurableField } from "./audit.ts";
 import type { Db, EvidenceWritePort } from "./database.ts";
+import { OWNER_DECISION_LABEL, ownerDecisionShapeSql } from "./migrations.ts";
 
 export interface StoredArtifact<T = unknown> {
   artifactId: string;
@@ -47,6 +48,31 @@ export const EVIDENCE_PRODUCERS: Readonly<Record<EvidenceKind, string>> = {
 /** Own-property check, not `in`: `"toString" in EVIDENCE_PRODUCERS` is true. */
 export const isEvidenceKind = (kind: string): kind is EvidenceKind =>
   Object.hasOwn(EVIDENCE_PRODUCERS, kind);
+
+/**
+ * SEC-OD1 — the `produced_by` of a canonical owner decision: the OWNER_DECISION APPROVAL artifact
+ * `ProductionGate.recordOwnerDecision` writes in the one transaction that admits the owner's receipt
+ * from live ingress and consumes it. Only `putOwnerDecision` writes it, and only for the holder of the
+ * production gate's capability; `put` labels every row "service" whatever its content says. Defined
+ * once, beside v47's refusal of owner decisions written before its guard (`OWNER_DECISION_LABEL`).
+ */
+export const OWNER_DECISION_PRODUCER = OWNER_DECISION_LABEL;
+
+/**
+ * SEC-OD1-R1-02 — why an owner gate refuses when an item's latest exactly bound approval does not
+ * carry `OWNER_DECISION_PRODUCER`. Every decision recorded before SEC-OD1 was labelled "service", and
+ * once its ingress row is pruned it cannot be told from a hand-written one, so it is not counted
+ * (CEO 52c3b1e6 (a)); the refusal says so rather than reporting a missing approval. The production
+ * gate (CONFIRM, the decision digest) and the GitHub kernel's publish/merge gate say it the same way.
+ */
+export const OWNER_DECIDE_AGAIN_MESSAGE =
+  "an owner approval recorded without canonical owner-decision provenance (as every approval recorded before SEC-OD1 was) is not counted; the owner must decide again";
+
+/** The evidence that names the items to decide again beside `OWNER_DECIDE_AGAIN_MESSAGE`. */
+export const ownerDecideAgainEvidence = (items: readonly string[]): { decideAgain: string[]; remedy: "NEW_OWNER_DECISION" } => ({
+  decideAgain: [...items],
+  remedy: "NEW_OWNER_DECISION",
+});
 
 /**
  * The only secret in this module. It is never exported and never stored on a token, so the
@@ -212,6 +238,35 @@ export class ArtifactStore {
   }
 
   /**
+   * SEC-OD1 — the one write that makes an APPROVAL artifact a canonical owner decision.
+   *
+   * Authority is the production gate's capability, never the content: an OWNER_DECISION-shaped
+   * object written through `put` carries "service" and is not an owner decision. The row cannot be
+   * inserted by a connection ACP did not open (the table's insert triggers name a function only ACP's
+   * own connection defines) and is immutable once written, label included, so the label outlives the
+   * ingress replay cache the receipt was admitted from. A writer that holds ACP's own raw database
+   * handle can still write the label; that is the single-user local threat model's Limit.
+   */
+  putOwnerDecision<T>(
+    writer: EvidenceWriter<"PRODUCTION_READY_PACKET">,
+    runId: string,
+    content: T,
+    candidateSnapshotDigest: string,
+  ): StoredArtifact<T> {
+    const writePort = EvidenceWriterToken.kindOf(writer) === "PRODUCTION_READY_PACKET"
+      ? EVIDENCE_WRITE_PORTS.get(writer)
+      : undefined;
+    if (!writePort) {
+      fail(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "an owner decision is recorded only through the production gate's writer capability",
+        { runId },
+      );
+    }
+    return this.write(runId, "APPROVAL", content, candidateSnapshotDigest, OWNER_DECISION_PRODUCER, writePort);
+  }
+
+  /**
    * Writes an evidence artifact. Authority is the capability the caller holds, never a
    * name it supplies: the recorded producer is derived from the capability's kind, so a
    * caller that knows "verification-engine" but holds nothing is refused, and a caller
@@ -305,7 +360,18 @@ export class ArtifactStore {
         WHERE run_id = ? AND kind = ? AND digest = ? AND candidate_snapshot_digest IS ?`,
       [runId, kind, digest, candidateSnapshotDigest],
     );
-    if (existing) return hydrate<T>(existing);
+    if (existing) {
+      // SEC-OD1 — an identical row another writer stored first is not this owner decision. Returning
+      // it would report the decision recorded while no canonical record exists.
+      if (producedBy === OWNER_DECISION_PRODUCER && existing.produced_by !== producedBy) {
+        fail(
+          ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+          "an identical owner-decision-shaped artifact was already written by another writer",
+          { runId, kind, digest, producedBy: existing.produced_by },
+        );
+      }
+      return hydrate<T>(existing);
+    }
 
     const artifact: StoredArtifact<T> = {
       artifactId: newArtifactId(),
@@ -319,7 +385,7 @@ export class ArtifactStore {
       superseded: false,
     };
     const contentJson = canonicalJson(durableContent);
-    if (isEvidenceKind(kind)) {
+    if (isEvidenceKind(kind) || evidenceWritePort) {
       const writePort = evidenceWritePort ?? fail(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
         `${kind} requires an evidence writer capability`,
@@ -470,6 +536,29 @@ export class ArtifactStore {
           [runId],
         );
     return rows.map((row) => hydrate<T>(row));
+  }
+
+  /**
+   * SEC-OD1 (FIX-SEC-NEST, CEO 4170f7c5) — the APPROVAL rows the owner gate reads as owner decisions, in
+   * `list`'s order: the canonical label, or content SQLite itself judges OWNER_DECISION-shaped by the
+   * guards' own clause (`ownerDecisionShapeSql`). That is the set the v47 guard refuses to an ordinary
+   * write. A row with another label whose content SQLite cannot read as an owner decision (not JSON, or
+   * nested past json1's depth limit, which `JSON.parse` still reads) is outside what the guard vetted
+   * and is not one, so it is left out here, in this query, and never hydrated: it can neither count nor
+   * fail the read. Nothing is caught. A canonical row is returned whatever its content and judged by
+   * the gate as before. The clause is a `CASE WHEN` condition, as the guards' WHEN evaluates it, so
+   * `json_each` never reads a row `json_valid` refused.
+   */
+  listOwnerDecisions<T>(runId: string): StoredArtifact<T>[] {
+    return this.db
+      .all<RawArtifact>(
+        `SELECT * FROM run_artifacts
+          WHERE run_id = ? AND kind = 'APPROVAL'
+            AND (produced_by = ? OR (CASE WHEN ${ownerDecisionShapeSql("content_json")} THEN 1 ELSE 0 END) = 1)
+          ORDER BY created_at, rowid`,
+        [runId, OWNER_DECISION_LABEL],
+      )
+      .map((row) => hydrate<T>(row));
   }
 
   byDigest<T>(digest: string): StoredArtifact<T> | null {

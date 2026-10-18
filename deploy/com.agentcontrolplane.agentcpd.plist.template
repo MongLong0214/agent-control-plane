@@ -42,6 +42,9 @@
     <string>__ACP_HOME__</string>
     <key>PATH</key>
     <string>__ACP_PATH__</string>
+    <!-- Only this plist sets it: a database refusal then exits 0, the #738 stop signal to KeepAlive. -->
+    <key>ACP_DAEMON_SUPERVISOR</key>
+    <string>launchd</string>
   </dict>
 
   <key>SoftResourceLimits</key>

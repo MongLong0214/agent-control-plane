@@ -7,6 +7,8 @@ import { Db } from "../../src/db/database.ts";
 import { installMigrationLedger } from "../../src/db/migrations.ts";
 import { tempDir } from "./fixtures.ts";
 import { dropV46Triggers } from "./released-v46-schema.ts";
+import { dropV47Triggers } from "./released-v47-schema.ts";
+import { dropV48Triggers } from "./released-v48-schema.ts";
 
 /**
  * V45-A0: the released steps v38–v44 install what they installed when they shipped.
@@ -142,12 +144,14 @@ export const V45_ADDED_TRIGGERS = [
 /**
  * A v43 image, written at the current version and taken back by removing exactly what v44 adds —
  * the way the v40–v43 fixtures build theirs — and, since the current version is past v44, what v45
- * and v46 (#1094) add as well. Not approved.
+ * and v46 (#1094) add as well, and v47 and v48 (SEC-OD1). Not approved.
  */
 export const v43Image = (path: string): string => {
   new Db(path).close();
   const legacy = new Database(path);
   try {
+    dropV48Triggers(legacy);
+    dropV47Triggers(legacy);
     dropV46Triggers(legacy);
     legacy.exec(V45_ADDED_TRIGGERS.map((name) => `DROP TRIGGER ${name};`).join("\n"));
     legacy.exec("DROP INDEX manifest_first_activation_grants_one_consumed_per_project");

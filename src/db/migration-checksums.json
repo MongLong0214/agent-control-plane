@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 46,
+  "schemaVersion": 48,
   "live": {
     "v12-migration-ledger-and-invariant-replay": "sha256:ec8955aed2d499e13d313e3fed473e0cb4e2ecb1c45af2e7fc95f2537ec91261",
     "v13-finalization-state-machine": "sha256:1d8ff28d8f21296e0380b76b76637813e825b7f9c91029dc03ac52d877af3936",
@@ -34,6 +34,8 @@
     "v42-session-credential-epoch": "sha256:a5be3e069535b259d3f70a8140bb44e243cec7c91046bb7caa32946bfd4c353c",
     "v43-bootstrap-application-record": "sha256:7ffb8367eb3fea440422e1f14f9aef48feb1f8ddea826d2888da48353dfac0f1",
     "v44-manifest-activation-grant": "sha256:06a2f0a829718e98c9b9b606c9e53d7cee40ab69f1beda36ee6716158117b380",
-    "v45-first-manifest-activation": "sha256:4263f0011ebdd53fb8e645f55b4e391e8247755debd8961fe74c312c983ad1ee"
+    "v45-first-manifest-activation": "sha256:4263f0011ebdd53fb8e645f55b4e391e8247755debd8961fe74c312c983ad1ee",
+    "v46-rowid-no-replace": "sha256:aa2aa099fe49482d7c9ae5e32ffc6a587287e5cdd9e97b44e268a22a3883e04a",
+    "v47-owner-decision-authority-guard": "sha256:c267706968989846716794ae98529b6f33a027b0d085c08e80f169769b58b586"
   }
 }

@@ -1276,6 +1276,31 @@ BEGIN
   SELECT RAISE(ABORT, 'EVIDENCE_WRITE_AUTHORITY_DENIED');
 END;
 
+-- CP-HI-06 — SEC-OD1 (v47): an owner decision is written only under the production gate's capability.
+-- The canonical label, or a top-level content kind of OWNER_DECISION (any member of that name, so
+-- duplicate keys cannot hide it from SQLite while JSON.parse reads it), needs the same
+-- connection-local marker evidence needs. Fail-closed: only exactly 1 passes, so NULL, a missing
+-- function or a function that throws refuses. Rows written before v47 are untouched. A connection
+-- that defines the marker function itself is outside this guard (CEO 52c3b1e6 (b)).
+CREATE TRIGGER IF NOT EXISTS run_artifacts_owner_decision_authority_guard
+BEFORE INSERT ON run_artifacts
+WHEN NEW.kind = 'APPROVAL'
+ AND (
+   NEW.produced_by = 'production-gate:owner-decision'
+   OR (
+     json_valid(NEW.content_json) = 1
+     AND EXISTS (
+       SELECT 1 FROM json_each(NEW.content_json) member
+        WHERE member.key = 'kind'
+          AND member.value = 'OWNER_DECISION'
+     )
+   )
+ )
+ AND acp_evidence_write_authorized() IS NOT 1
+BEGIN
+  SELECT RAISE(ABORT, 'OWNER_DECISION_WRITE_AUTHORITY_DENIED');
+END;
+
 -- CP-HI-06 — content-addressed evidence is append-only but for the one-way staleness mark.
 -- Evidence is append-only except for one one-way staleness mark. Every metadata field,
 -- including row identity and timestamp, participates in authority and must stay fixed.
@@ -1301,6 +1326,67 @@ CREATE TRIGGER IF NOT EXISTS run_artifacts_no_delete
 BEFORE DELETE ON run_artifacts
 BEGIN
   SELECT RAISE(ABORT, 'ARTIFACT_IMMUTABLE');
+END;
+
+-- ---------------------------------------------------------------------------
+-- owner-decision supersede guards (SEC-OD1, schema v48)
+--   An owner decision stops counting once its one-way superseded mark is set, so the mark removes the
+--   decision's effect as surely as a delete would. Measured at v47: an ordinary `Db.run` set it on the
+--   owner's exactly bound refusal, the earlier approval decided the item again, and the merge was
+--   allowed. On an OWNER_DECISION APPROVAL — the canonical label, or any top-level content kind member
+--   of OWNER_DECISION as v47 reads it, so legacy "service" refusals too — the mark now needs the
+--   connection-local marker the decision's insert needs, exactly 1 (fail-closed). Only the run
+--   engine's candidate staleness marks hold it, for their one statement.
+--   The same removal through the hidden rowid: on a connection with recursive_triggers off (SQLite's
+--   default), an insert naming the decision's rowid, or `UPDATE OR REPLACE … SET rowid` onto it,
+--   deleted it with every guard above silent. The three rowid guards refuse both and a non-positive
+--   rowid, as v46's do for outbox, inbound_messages and canonical_turns; v48 refuses to install them
+--   over a table holding a non-positive rowid and never deletes or renumbers a row.
+--   A connection that defines the marker function itself, or drops a trigger, is outside these guards.
+-- ---------------------------------------------------------------------------
+-- CP-HI-06 — the superseded mark withdraws an owner decision, so it needs the decision's own authority.
+CREATE TRIGGER IF NOT EXISTS run_artifacts_owner_decision_supersede_guard
+BEFORE UPDATE ON run_artifacts
+WHEN NEW.superseded IS NOT OLD.superseded
+ AND OLD.kind = 'APPROVAL'
+ AND (
+   OLD.produced_by = 'production-gate:owner-decision'
+   OR (
+     json_valid(OLD.content_json) = 1
+     AND EXISTS (
+       SELECT 1 FROM json_each(OLD.content_json) member
+        WHERE member.key = 'kind'
+          AND member.value = 'OWNER_DECISION'
+     )
+   )
+ )
+ AND acp_evidence_write_authorized() IS NOT 1
+BEGIN
+  SELECT RAISE(ABORT, 'OWNER_DECISION_SUPERSEDE_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — a REPLACE naming an existing rowid deletes that artifact without colliding on its key.
+CREATE TRIGGER IF NOT EXISTS run_artifacts_no_rowid_replace
+BEFORE INSERT ON run_artifacts
+WHEN EXISTS (SELECT 1 FROM run_artifacts WHERE rowid = NEW.rowid)
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_ARTIFACT_NO_REPLACE');
+END;
+
+-- CP-HI-06 — `UPDATE OR REPLACE … SET rowid` onto another artifact deletes it; a row's rowid is fixed.
+CREATE TRIGGER IF NOT EXISTS run_artifacts_rowid_immutable
+BEFORE UPDATE ON run_artifacts
+WHEN NEW.rowid IS NOT OLD.rowid
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_ARTIFACT_NO_REPLACE');
+END;
+
+-- CP-HI-06 — a non-positive rowid is what would turn the insert guard against ordinary inserts.
+CREATE TRIGGER IF NOT EXISTS run_artifacts_rowid_positive
+AFTER INSERT ON run_artifacts
+WHEN NEW.rowid <= 0
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_ARTIFACT_NO_REPLACE');
 END;
 
 CREATE INDEX IF NOT EXISTS run_artifacts_run_kind ON run_artifacts(run_id, kind, created_at);

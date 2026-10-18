@@ -268,7 +268,11 @@ git checkout and a `pnpm build` run in it for any reason changes which `SCHEMA_V
 restart declares. The refusal exits 0, so `KeepAlive { SuccessfulExit = false }` leaves the job
 stopped rather than retrying every `ThrottleInterval`; it leaves `migration-refusal.json` in the
 state directory and `agentctl daemon status` reports it with no daemon running. The installer
-therefore reports a failed start even though launchd retains the job. `migration-plan`
+therefore reports a failed start even though launchd retains the job. A database this build refuses
+as it stands (`MIGRATION_RECEIPT_MISMATCH`, `OWNER_DECISION_LABEL_PREDATES_GUARD`) uses the same record
+and status, and exits 0 only under the rendered plist, which sets `ACP_DAEMON_SUPERVISOR=launchd`; that 0
+is the stop signal, not a successful start. Run any other way, the same refusal exits 78 every time.
+Nothing reads an earlier record to choose the exit. `migration-plan`
 reads the database read-only and prints what a start would do; `approve-migration` refuses a live
 lock, takes a validated recovery point, and writes an approval naming that exact chain and the
 database it is for, which is spent when the chain runs. An approval is a capability over one

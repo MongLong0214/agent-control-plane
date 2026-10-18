@@ -1644,8 +1644,8 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
     approveMigration(path, "ACP-PEER-SUCCESSION-01 v38 fixture");
     const migrated = openDb(path);
     try {
-      // v41 (#512), v42 (#246 C1b), v43 (#246 C3), v44 (#246 B2-b), v45 (#512) and v46 (#1094) follow on the same approved chain.
-      expect(SCHEMA_VERSION).toBe(46);
+      // v41 (#512), v42 (#246 C1b), v43 (#246 C3), v44 (#246 B2-b), v45 (#512), v46 (#1094), v47 and v48 (SEC-OD1) follow on the same approved chain.
+      expect(SCHEMA_VERSION).toBe(48);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 38 ORDER BY version`,
@@ -1659,6 +1659,8 @@ describe("schema v40: the carry record arrives by an additive migration", () => 
         { version: 44, migration_id: "v44-manifest-activation-grant" },
         { version: 45, migration_id: "v45-first-manifest-activation" },
         { version: 46, migration_id: "v46-rowid-no-replace" },
+        { version: 47, migration_id: "v47-owner-decision-authority-guard" },
+        { version: 48, migration_id: "v48-owner-decision-supersede-guard" },
       ]);
       expect(migrated.all<{ name: string }>(
         `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'peer_message_carries' ORDER BY name`,

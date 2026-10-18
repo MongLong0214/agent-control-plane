@@ -13,6 +13,7 @@ import {
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
+import { OWNER_DECISION_WRITE_DENIED, writeOutsideTheGuard } from "../helpers/released-v47-schema.ts";
 import {
   approveReviewedCandidateForFinalization,
   type Harness,
@@ -353,7 +354,16 @@ const mergeInput = (
  * Model the durable artifact that the owner-decision writer persists after ingress
  * admitted an exact decision. The kernel must reject an identical-looking row if its
  * candidate binding or receipt is missing, because APPROVAL is not an evidence kind.
+ *
+ * Since v47 (SEC-OD1) `put` of such a row is refused at the database. It is then written outside
+ * the guard (`writeOutsideTheGuard`, v47's stated Limit, as every pre-v47 row stands), so the
+ * kernel's own check still faces it.
  */
+const putOutsideTheGuard = (fixture: Fixture, content: Record<string, unknown>, candidate: string): string => {
+  expect(() => fixture.harness.cp.artifacts.put(fixture.runId, "APPROVAL", content, candidate)).toThrowError(OWNER_DECISION_WRITE_DENIED);
+  return writeOutsideTheGuard(fixture.harness.cp.config.databasePath, fixture.runId, content, candidate, fixture.harness.clock.nowIso()).digest;
+};
+
 const putOwnerDecision = (
   fixture: Fixture,
   items: readonly string[],
@@ -366,9 +376,8 @@ const putOwnerDecision = (
     input.approved,
     input.note,
   );
-  return fixture.harness.cp.artifacts.put(
-    fixture.runId,
-    "APPROVAL",
+  return putOutsideTheGuard(
+    fixture,
     {
       kind: "OWNER_DECISION",
       item: input.item,
@@ -379,7 +388,7 @@ const putOwnerDecision = (
       ...(input.receipt === false ? {} : { receipt }),
     },
     input.candidateSnapshotDigest ?? fixture.payload.candidateSnapshotDigest,
-  ).digest;
+  );
 };
 
 /** Go through the only owner-decision ingress that ProductionGate is allowed to count. */
@@ -580,9 +589,8 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
       true,
       "the receipt's note",
     );
-    fixture.harness.cp.artifacts.put(
-      fixture.runId,
-      "APPROVAL",
+    putOutsideTheGuard(
+      fixture,
       {
         kind: "OWNER_DECISION",
         item: items[0],

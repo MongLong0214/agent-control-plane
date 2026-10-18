@@ -163,6 +163,14 @@ const LATER_OBJECTS: ReadonlyArray<{ version: number; objects?: readonly string[
       "canonical_turns_no_rowid_replace", "canonical_turns_rowid_immutable", "canonical_turns_rowid_positive",
     ],
   },
+  { version: 47, objects: ["run_artifacts_owner_decision_authority_guard"] },
+  {
+    version: 48,
+    objects: [
+      "run_artifacts_owner_decision_supersede_guard", "run_artifacts_no_rowid_replace", "run_artifacts_rowid_immutable",
+      "run_artifacts_rowid_positive",
+    ],
+  },
 ];
 
 /**

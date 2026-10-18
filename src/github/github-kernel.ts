@@ -14,7 +14,7 @@ import type { RunEngine } from "../run/run-engine.ts";
 import type { CiCheck, CiEvidenceSource, VerificationReport } from "../verify/verification-engine.ts";
 import type { ReviewPacket } from "../review/blind-review.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
-import { EVIDENCE_PRODUCERS } from "../db/artifacts.ts";
+import { EVIDENCE_PRODUCERS, OWNER_DECIDE_AGAIN_MESSAGE, ownerDecideAgainEvidence } from "../db/artifacts.ts";
 import {
   WriteOperation,
   type DaemonFinalizerAuthority,
@@ -188,6 +188,11 @@ export interface HumanGateStatusPort {
     satisfied: boolean;
     /** Digest of the current ProductionGate definition, supplied with the status. */
     humanGateDigest: string;
+    /**
+     * SEC-OD1-R1-02 — the undecided items whose latest owner approval is not a canonical owner decision
+     * (recorded before SEC-OD1), named so the refusal says the owner must decide again.
+     */
+    decideAgain?: readonly string[];
   };
 }
 
@@ -3426,14 +3431,20 @@ export class GitHubKernel {
           );
     }
     if (!status.satisfied || payload.humanGateDigest !== status.humanGateDigest) {
-      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "current human-gate status does not satisfy this payload", {
+      const evidence = {
         runId: payload.runId,
         required: status.required,
         items: status.items,
         satisfied: status.satisfied,
         expectedDigest: status.humanGateDigest,
         suppliedDigest: payload.humanGateDigest,
-      });
+      };
+      return !status.satisfied && status.decideAgain && status.decideAgain.length > 0
+        ? deny(ReasonCode.HUMAN_GATE_UNSATISFIED, OWNER_DECIDE_AGAIN_MESSAGE, {
+          ...evidence,
+          ...ownerDecideAgainEvidence(status.decideAgain),
+        })
+        : deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "current human-gate status does not satisfy this payload", evidence);
     }
     return allow(ReasonCode.OK, undefined);
   }
