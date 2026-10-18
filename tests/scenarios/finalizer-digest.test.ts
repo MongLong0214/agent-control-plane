@@ -1120,7 +1120,8 @@ describe("FD-R2: the transport checks the gate payload again once it holds its i
  * runtime's own fetch, so what happens to a redirect is fetch's behaviour, not a double's. The server
  * answers the App's authentication itself and forwards every other request to FakeGitHub. When
  * `redirect` names a write, the server answers its first send with a same-origin 307, after running
- * `beforeRedirect`; a request that then arrives at the redirect target is forwarded too, and counted.
+ * `beforeRedirect` with that write (so a case can apply it at GitHub before the 307); a request that
+ * then arrives at the redirect target is forwarded too, and counted.
  *
  * `sends` lists every gate POST and merge PUT that reached the server, `redirected` the ones that
  * reached the redirect target, and `refusals` every denial the store returned with `redirect: true`.
@@ -1129,7 +1130,10 @@ const REDIRECTED = "/redirected";
 
 const nativeTransport = async (
   fixture: Fixture,
-  options: { redirect?: "gate POST" | "merge PUT"; beforeRedirect?: () => void } = {},
+  options: {
+    redirect?: "gate POST" | "merge PUT";
+    beforeRedirect?: (method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", target: string, body: unknown) => Promise<void> | void;
+  } = {},
 ) => {
   const root = tempDir("acp-fd-redirect-");
   const credentialDir = join(root, "credentials");
@@ -1170,7 +1174,7 @@ const nativeTransport = async (
       if (write) (followed ? redirected : sends).push(write);
       if (write && write === options.redirect && !followed && !answeredWithRedirect) {
         answeredWithRedirect = true;
-        options.beforeRedirect?.();
+        await options.beforeRedirect?.(method, target, body);
         res.writeHead(307, { Location: `${REDIRECTED}${path}` });
         res.end("{}");
         return;
@@ -1285,6 +1289,59 @@ describe("FIX-FD-REDIRECT: the transport sends each gate POST and merge PUT once
       }
     },
   );
+
+  it("FIX-FD-REDIRECT effect before the 307: GitHub applied the gate POST and then answered it with a 307; the next process reuses that gate, which names the current binding, sends no second gate POST, and merges once", async () => {
+    const fixture = await approvedHumanGatedRun();
+    const first = await nativeTransport(fixture, {
+      redirect: "gate POST",
+      // GitHub creates the gate, then answers the POST that created it with the redirect.
+      beforeRedirect: async (method, target, body) => {
+        await fixture.github.request(method, target, body);
+      },
+    });
+    try {
+      await finalizeAttempts(fixture, 0);
+      expect(first.sends).toEqual(["gate POST"]);
+      expect(first.redirected).toEqual([]);
+      expect(first.refusals[0]).toEqual({
+        reasonCode: ReasonCode.PROBE_FAILED,
+        evidence: { operation: "POST", status: 307, redirect: true },
+      });
+    } finally {
+      await first.close();
+    }
+    expect(writes(fixture.github)).toEqual({ gates: 1, merges: 0 });
+    const published = gatesOnHead(fixture).map((check) => check.id);
+    expect(published).toHaveLength(1);
+    expect(fixture.harness.cp.runs.require(fixture.driven.runId).state).not.toBe(RunState.COMPLETED);
+
+    // The same database opened by a new process: GitHub already holds the gate the refused POST created.
+    fixture.harness.cp.db.close();
+    const harness = makeHarness({
+      root: fixture.harness.root,
+      githubClient: fixture.github,
+      clock: fixture.harness.clock,
+      repoPath: fixture.harness.repoPath,
+    });
+    const restarted: Fixture = { ...fixture, harness };
+    const next = await nativeTransport(restarted);
+    try {
+      await finalizeAttempts(restarted, 0);
+      expect(next.sends).toEqual(["merge PUT"]);
+      expect(next.redirected).toEqual([]);
+      expect(next.refusals).toEqual([]);
+      // The merge stood on the gate the first process's POST created: still the only gate on the head,
+      // naming the binding that holds now.
+      expect(gatesOnHead(restarted).map((check) => check.id)).toEqual(published);
+      expect(harness.cp.ceo.humanGateBinding(fixture.driven.runId)).toMatchObject({ satisfied: true, humanGateDigest: fixture.binding });
+      expect(expectedBinding(restarted)).toBe(fixture.binding);
+      expect(writeLog(restarted)).toEqual([`gate ${fixture.binding}`, `merge ${fixture.driven.candidateHead}`]);
+      expect(writes(fixture.github)).toEqual({ gates: 1, merges: 1 });
+      expect(harness.cp.runs.require(fixture.driven.runId).state).toBe(RunState.COMPLETED);
+    } finally {
+      await next.close();
+    }
+  });
 
   it("FIX-FD-REDIRECT recovery: a gate POST answered with a 307 stays PENDING, and the next process publishes it as a new send and merges once", async () => {
     const fixture = await approvedHumanGatedRun();
