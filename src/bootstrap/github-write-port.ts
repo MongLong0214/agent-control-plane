@@ -156,6 +156,20 @@ const statusOf = (error: unknown): number | null => {
   return typeof status === "number" ? status : null;
 };
 
+/** FIX-1147-R1 — the value `requestOutcome` carries on a request that may have run with no answer heard. */
+export const REQUEST_OUTCOME_UNKNOWN = "unknown";
+
+/**
+ * FIX-1147-R1 — whether a port failure is the port's mark of a request that may have run and was
+ * never answered (`spawnGh` refusing a body `gh` did not take). Read from the failure's structured
+ * evidence only: a message is cut short by whoever reports it and can lose the very word.
+ */
+export const requestOutcomeUnknown = (error: unknown): boolean => {
+  if (!isAcpError(error)) return false;
+  const outcome = (error.evidence as { requestOutcome?: unknown } | undefined)?.requestOutcome;
+  return outcome === REQUEST_OUTCOME_UNKNOWN;
+};
+
 /** A 404 is "absent". Every other failure — including an unreadable one — propagates. */
 const absentOn404 = async <T>(read: () => Promise<T>): Promise<T | null> => {
   try {
@@ -438,6 +452,21 @@ const GH_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
  * nothing in it is ever parsed as a flag. The environment is inherited — less `GH_HOST`, see
  * `ghChildEnv` — because `gh` reads its own authentication from it; nothing here reads, logs or
  * forwards a credential.
+ *
+ * FIX-STDIN-SIBLINGS — the body's delivery is part of the answer. A `gh` that exits, or shuts its
+ * stdin, before reading the body closes the pipe under the write, which fails with EPIPE; an `error`
+ * event nobody hears is an uncaught exception, and `src` has no handler for one, so the daemon
+ * (`control-plane.ts` → `createBootstrapGitHubWritePort`) would end. So the stdin listeners go on
+ * before anything is written, and the call settles only once both the child and its stdin have
+ * closed (Node destroys a child's stdin when the child exits, so the second follows the first).
+ *
+ * A body `gh` did not take is refused with no HTTP status and `requestOutcome: "unknown"`, never
+ * answered and never retried. `gh api --input -` streams stdin as the request body, so `gh` can be
+ * acting while the body is still being written, and nothing here sees when it does: a stdin error is
+ * not evidence that GitHub saw no request, and an exit 0 beside one is not an answer about this body.
+ * The missing status is the port's existing mark of an unheard request (`transportOutcome`), and
+ * `requestOutcome` says it may have run; the producer keeps both as structured evidence in its
+ * refusal (`requestOutcomeUnknown`, FIX-1147-R1), and its pending intent for the request in doubt.
  */
 const spawnGh: GhRunner = (args, stdin) =>
   new Promise((resolvePromise, reject) => {
@@ -449,6 +478,10 @@ const spawnGh: GhRunner = (args, stdin) =>
     let stdout = "";
     let stderr = "";
     let overflow = false;
+    let stdinError: NodeJS.ErrnoException | undefined;
+    let stdinFinished = false;
+    let stdinClosed = false;
+    let ended: { readonly code: number | null; readonly signal: NodeJS.Signals | null } | undefined;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -461,8 +494,9 @@ const spawnGh: GhRunner = (args, stdin) =>
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
     });
-    child.once("error", reject);
-    child.once("close", (code, signal) => {
+    const settle = (): void => {
+      if (ended === undefined || !stdinClosed) return;
+      const { code, signal } = ended;
       if (overflow) {
         reject(acpError(ReasonCode.INTERNAL_ERROR, "gh produced more output than this client reads", { args }));
         return;
@@ -472,9 +506,51 @@ const spawnGh: GhRunner = (args, stdin) =>
         reject(acpError(ReasonCode.INTERNAL_ERROR, `gh ${args.join(" ")} did not answer`, { signal }));
         return;
       }
+      // A body not handed over in full is refused even beside exit 0; any stdin error is, body or not.
+      if (stdinError !== undefined || (stdin !== null && !stdinFinished)) {
+        const inputBytes = stdin === null ? 0 : Buffer.byteLength(stdin, "utf8");
+        const how =
+          stdinError === undefined
+            ? "its stdin closed before the body was handed over"
+            : `writing its stdin failed with ${stdinError.code ?? stdinError.message}`;
+        reject(
+          acpError(
+            ReasonCode.INTERNAL_ERROR,
+            `gh ${args.join(" ")} did not take its ${inputBytes}-byte body (${how}), so whether GitHub acted on the request is unknown: ${stderr.trim().slice(0, 300)}`,
+            {
+              status: null,
+              requestOutcome: REQUEST_OUTCOME_UNKNOWN,
+              inputBytes,
+              stdinError: stdinError === undefined ? null : (stdinError.code ?? stdinError.message),
+              stdinFinished,
+              exitCode: code,
+              signal,
+            },
+          ),
+        );
+        return;
+      }
       resolvePromise({ exitCode: code, stdout, stderr });
+    };
+    // Before any write: a stdin error nobody hears would end the process.
+    child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+      stdinError ??= error;
     });
-    child.stdin.end(stdin ?? "");
+    child.stdin.once("finish", () => {
+      stdinFinished = true;
+    });
+    child.stdin.once("close", () => {
+      stdinClosed = true;
+      settle();
+    });
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      ended = { code, signal };
+      settle();
+    });
+    // No body, no chunk: an empty write can never be what fails.
+    if (stdin === null) child.stdin.end();
+    else child.stdin.end(stdin);
   });
 
 /** `gh: Not Found (HTTP 404)` — the status `gh api` prints on a refused request. */
