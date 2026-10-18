@@ -36,6 +36,7 @@ import {
   COMMITLORE_PIN_MAX_BYTES,
   commitlorePinIdentity,
   CommitLorePinIdentityError,
+  judgeCommitLoreInitCommand,
   judgeCommitLoreVersion,
 } from "../../src/bootstrap/commitlore-pin.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -110,7 +111,8 @@ const DOCTOR_USAGE = [
   "  -h, --help         display help for command",
   "",
 ].join("\n");
-// What the real CLI 1.7.3 prints for `init --help`, its options in the order it lists them.
+// What the real CLI 1.7.3 prints for `init --help`, its options in the order it lists them, with the
+// `--no-agent-hooks` option that commitlore main (4501ef68, not yet released) lists before `-h, --help`.
 const INIT_USAGE = [
   "Usage: commitlore init [options]",
   "",
@@ -127,6 +129,36 @@ const INIT_USAGE = [
   "                       file yet (skips the prompt; for scripts)",
   "  --no-unattended      leave unattended capture off if the repository has no",
   "                       policy file yet (skips the prompt; for scripts)",
+  "  --no-agent-hooks     write nothing inside the working tree: skip the",
+  "                       PreToolUse injection hook at .claude/settings.json (for a",
+  "                       caller that must keep the checkout clean)",
+  "  -h, --help           display help for command",
+  "",
+].join("\n");
+// What the released CLI 1.7.4 prints for `init --help` (its options and their order; the prose after them is
+// left out): every option the observation passes but `--no-agent-hooks`.
+const INIT_USAGE_1_7_4 = [
+  "Usage: commitlore init [options]",
+  "",
+  "one-command onboarding: hooks install, directive author string, index --rebuild,",
+  "agent integration, MCP registration, capture policy, doctor --fix",
+  "",
+  "Options:",
+  "  --mcp-scope <scope>  where to register the capture server: user, project,",
+  "                       local, none (skips the prompt; default user)",
+  "  --force              forward to hooks install — replace an already-preserved",
+  "                       foreign hook",
+  "  --verbose            show step-by-step detail output instead of the result",
+  "                       summary",
+  "  --json               emit the report as JSON",
+  "  --upgrade            upgrade to the newest release before wiring this",
+  "                       repository",
+  "  --unattended         enable unattended capture if the repository has no policy",
+  "                       file yet (skips the prompt; for scripts)",
+  "  --no-unattended      leave unattended capture off if the repository has no",
+  "                       policy file yet (skips the prompt; for scripts)",
+  "  --agents-md          also write the capture procedure into AGENTS.md (off by",
+  "                       default; the MCP server already carries it)",
   "  -h, --help           display help for command",
   "",
 ].join("\n");
@@ -141,7 +173,8 @@ const ROOT_USAGE = [
   "  -h, --help      display help for command",
   "",
 ].join("\n");
-const OBSERVATION = ["--version", "doctor --help", "init --help", "init --mcp-scope none --no-unattended", "doctor --json"];
+const INIT = "init --mcp-scope none --no-unattended --no-agent-hooks";
+const OBSERVATION = ["--version", "doctor --help", "init --help", INIT, "doctor --json"];
 
 interface FakeOptions {
   version?: string;
@@ -201,7 +234,7 @@ if (command === '--version' && argv.length === 1) ${versionHangs ? `(fs.writeFil
 else if (command === 'doctor' && flag === '--help' && argv.length === 2) answer(${JSON.stringify(doctorHelp)}, 0);
 else if (command === 'doctor' && flag === '--json' && argv.length === 2) answer(${JSON.stringify(`${doctorReport}\n`)}, ${doctorExit});
 else if (command === 'init' && flag === '--help' && argv.length === 2) ${hasInit ? `answer(${JSON.stringify(initHelp)}, ${initHelpExit})` : `answer(${JSON.stringify(ROOT_USAGE)}, 0)`};
-else if (${hasInit} && argv.join(' ') === 'init --mcp-scope none --no-unattended') answer('', ${initExit});
+else if (${hasInit} && argv.join(' ') === ${JSON.stringify(INIT)}) answer('', ${initExit});
 else ${unknownAnswer};
 `,
     { mode: options.mode ?? 0o700 },
@@ -492,9 +525,6 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
   it.each([
     ["no init command (its root usage for init --help, and init itself unknown)", { hasInit: false }],
     ["no init command, and every unknown command answered with its root usage and exit 0", { hasInit: false, unknown: "root-usage" as const }],
-    ["an init without --mcp-scope", { initHelp: INIT_USAGE.replace(/ {2}--mcp-scope[^\n]*\n[^\n]*\n/, "") }],
-    ["an init without --no-unattended", { initHelp: INIT_USAGE.replace(/ {2}--no-unattended[^\n]*\n[^\n]*\n/, "") }],
-    ["an init usage that names the options only in prose", { initHelp: "Usage: commitlore init [options]\n\nPass --mcp-scope none and --no-unattended from scripts.\n" }],
     ["no usage at all", { initHelp: "" }],
     ["a failing init --help", { initHelpExit: 1 }],
   ])("%s refuses NO_INIT_COMMAND, and init never runs", async (_name, options) => {
@@ -505,15 +535,49 @@ describe("S16-R1-03: the pinned CLI must have the init command, with the options
     expect(argvs(pinned.log)).toEqual(["--version", "doctor --help", "init --help"]);
   });
 
+  // CEO c3c052bf: an init usage that does not offer an option the observation passes is its own condition,
+  // NO_INIT_OPTION, naming the option and what the observation needs it for; NO_INIT_COMMAND stays for no
+  // init usage at all.
+  it.each([
+    ["an init without --mcp-scope", { initHelp: INIT_USAGE.replace(/ {2}--mcp-scope[^\n]*\n[^\n]*\n/, "") }, ["--mcp-scope"]],
+    ["an init without --no-unattended", { initHelp: INIT_USAGE.replace(/ {2}--no-unattended[^\n]*\n[^\n]*\n/, "") }, ["--no-unattended"]],
+    ["an init without --no-agent-hooks (the released 1.7.4's usage)", { initHelp: INIT_USAGE_1_7_4 }, ["--no-agent-hooks"]],
+    [
+      "an init usage that names the options only in prose",
+      { initHelp: "Usage: commitlore init [options]\n\nPass --mcp-scope none, --no-unattended and --no-agent-hooks from scripts.\n" },
+      ["--mcp-scope", "--no-unattended", "--no-agent-hooks"],
+    ],
+  ])("%s refuses NO_INIT_OPTION, and init never runs", async (_name, options, missing) => {
+    workingOnPath();
+    const pinned = fake("init-option", options);
+    vi.stubEnv(VARIABLE, pinned.bin);
+    await refusedWith("NO_INIT_OPTION");
+    expect(argvs(pinned.log)).toEqual(["--version", "doctor --help", "init --help"]);
+    // The refusal itself, uncut: each missing option, and only those, with what the observation needs it for.
+    const refusal = judgeCommitLoreInitCommand("/pinned/commitlore", { exitCode: 0, stdout: options.initHelp, stderr: "" });
+    expect(refusal).toMatch(/^ACP_COMMITLORE_BINARY NO_INIT_OPTION: \/pinned\/commitlore init does not offer --/);
+    for (const option of COMMITLORE_INIT_OPTIONS) expect(refusal?.includes(`${option}, which the observation needs `), option).toBe(missing.includes(option));
+  });
+
+  it("the refusal for a missing --no-agent-hooks names the capability: the observation needs it so that it writes nothing into the checkout", () => {
+    expect(judgeCommitLoreInitCommand("/pinned/commitlore", { exitCode: 0, stdout: INIT_USAGE_1_7_4, stderr: "" })).toBe(
+      "ACP_COMMITLORE_BINARY NO_INIT_OPTION: /pinned/commitlore init does not offer --no-agent-hooks, which the observation needs so that it writes nothing into the checkout",
+    );
+    expect(judgeCommitLoreInitCommand("/pinned/commitlore", { exitCode: 0, stdout: INIT_USAGE, stderr: "" })).toBeNull();
+    // No init usage at all is still NO_INIT_COMMAND, whatever options the text names.
+    expect(judgeCommitLoreInitCommand("/pinned/commitlore", { exitCode: 0, stdout: ROOT_USAGE, stderr: "" })).toMatch(/^ACP_COMMITLORE_BINARY NO_INIT_COMMAND: /);
+    expect(judgeCommitLoreInitCommand("/pinned/commitlore", { exitCode: 1, stdout: INIT_USAGE, stderr: "" })).toMatch(/^ACP_COMMITLORE_BINARY NO_INIT_COMMAND: /);
+  });
+
   it("the reviewer's witness: a CLI with version and doctor support that answers root usage, exit 0, for a missing init is refused", async () => {
     workingOnPath();
     // Every argv but `--version`, `doctor --help` and `doctor --json` gets its root usage with exit 0.
     const pinned = fake("no-init-root-usage", { hasInit: false, unknown: "root-usage" });
-    expect(execFileSync(pinned.bin, ["init", "--mcp-scope", "none", "--no-unattended"], { encoding: "utf8", timeout: 30_000 })).toBe(ROOT_USAGE);
+    expect(execFileSync(pinned.bin, INIT.split(" "), { encoding: "utf8", timeout: 30_000 })).toBe(ROOT_USAGE);
     writeFileSync(pinned.log, "");
     const probed = await refusedWith("NO_INIT_COMMAND", createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pinned.bin)));
     expect(probed.allowed).toBe(false);
-    expect(argvs(pinned.log)).not.toContain("init --mcp-scope none --no-unattended");
+    expect(argvs(pinned.log)).not.toContain(INIT);
   });
 
   it("the help check runs no init and vouches for none: an init that lists its options and then fails still fails the observation", async () => {
@@ -588,7 +652,7 @@ describe("S16-R1-02: every spawn after the checks is preceded by a re-check that
     workingOnPath();
     const bad = uncheckedTarget();
     const pin = join(tempDir("acp-s16-during-init-"), "commitlore");
-    const good = fake("during-init", { during: { argv: "init --mcp-scope none --no-unattended", code: swapLink(pin, bad.bin) } });
+    const good = fake("during-init", { during: { argv: INIT, code: swapLink(pin, bad.bin) } });
     symlinkSync(good.bin, pin);
     const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin)).observe(tempDir("acp-s16-during-init-checkout-"));
     expect(observed).toMatchObject({ outcome: "FAIL", detail: expect.stringMatching(new RegExp(`^commitlore doctor could not be run: ${VARIABLE} REPLACED`)) });
@@ -625,7 +689,7 @@ const shellFake = (name: string, { versionDelay = "0" }: { versionDelay?: string
       `  "--version") sleep ${versionDelay}; printf '1.7.3\\n' ;;`,
       `  "doctor --help") printf '%s' ${quoted(DOCTOR_USAGE)} ;;`,
       `  "init --help") printf '%s' ${quoted(INIT_USAGE)} ;;`,
-      `  "init --mcp-scope none --no-unattended") : ;;`,
+      `  "${INIT}") : ;;`,
       `  "doctor --json") printf '%s\\n' ${quoted(OK_REPORT)} ;;`,
       `  *) printf "error: unknown command or option '%s'\\n" "$*" >&2; exit 2 ;;`,
       "esac",
@@ -637,38 +701,44 @@ const shellFake = (name: string, { versionDelay = "0" }: { versionDelay?: string
 };
 const shellArgvs = (log: string): string[] => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
 
-/** The host's real CLI, located for this test only (the producer never searches PATH), or null. */
-const realCommitLore = (): string | null => {
-  for (const directory of (process.env["PATH"] ?? "").split(":").filter((entry) => entry.startsWith("/"))) {
-    try {
-      accessSync(join(directory, "commitlore"), constants.X_OK);
-      return join(directory, "commitlore");
-    } catch {
-      // not here
-    }
-  }
-  return null;
-};
-const REAL = realCommitLore();
+/**
+ * The host's real CLI, for this test only, and only when it is given explicitly: an absolute path in
+ * `ACP_TEST_REAL_COMMITLORE`. It is never found on PATH (nor does the producer search PATH), so a CLI that
+ * happens to be installed where this suite runs, CI included, never decides it.
+ */
+const REAL = process.env["ACP_TEST_REAL_COMMITLORE"] || null;
 
-describe("S16: the real pinned CLI, in the constructed environment and a fresh HOME", () => {
-  it.skipIf(REAL === null)("passes the pin's checks, writes nothing to HOME and leaves the checkout clean", async () => {
+describe("S16: the real pinned CLI, given explicitly, in the constructed environment and a fresh HOME", () => {
+  it.skipIf(REAL === null)("answers the pin's checks as its init usage declares, writes nothing to HOME and leaves the checkout clean", async () => {
     const home = tempDir("acp-s16-real-home-");
     const repo = tempDir("acp-s16-real-repo-");
     execFileSync("git", ["init", "-q"], { cwd: repo, timeout: 20_000 });
+    const hooks = (): string[] => readdirSync(join(repo, ".git", "hooks")).sort();
+    const hooksBefore = hooks();
     vi.stubEnv("HOME", home);
     vi.stubEnv(VARIABLE, undefined);
     for (const key of ["ACP_MCP_TOKEN", "ACP_OPERATOR_TOKEN", "GH_TOKEN"]) vi.stubEnv(key, `s16-only-${key}`);
-    // The pin is passed, not found: its checks, `--version`, `doctor --help` and `init --help`, pass, and so
-    // does a run through the runner they bound.
     const run = commitloreRunner(COMMITLORE_LIMITS, REAL as string);
-    const checked = await run.ready(repo);
-    const answered = await checked(["--version"], repo);
-    expect(answered.exitCode).toBe(0);
-    expect(answered.stdout.trim()).toMatch(/^1\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+    // What this CLI's own init usage declares, read here by a pattern of this test's, not the producer's.
+    const usage = await run(["init", "--help"], repo);
+    expect(usage.exitCode).toBe(0);
+    if (/^ {2}--no-agent-hooks\s/m.test(usage.stdout)) {
+      // The pin is passed, not found: its checks, `--version`, `doctor --help` and `init --help`, pass, and so
+      // does a run through the runner they bound.
+      const checked = await run.ready(repo);
+      const answered = await checked(["--version"], repo);
+      expect(answered.exitCode).toBe(0);
+      expect(answered.stdout.trim()).toMatch(/^1\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+    } else {
+      // A release whose init does not offer --no-agent-hooks (1.7.4) is refused at its checks, before any init.
+      await expect(run.ready(repo)).rejects.toThrow(new RegExp(`^${VARIABLE} NO_INIT_OPTION: .* init does not offer --no-agent-hooks, `));
+    }
     expect(readdirSync(home)).toEqual([]);
     const status = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: repo, encoding: "utf8", timeout: 20_000 });
     expect(status).toBe("");
+    // The checks ran no init: no hook was installed and nothing was written beside the repository.
+    expect(hooks()).toEqual(hooksBefore);
+    expect(existsSync(join(repo, ".claude"))).toBe(false);
     // The same CLI through a relative pin is refused before it runs.
     await expect(commitloreRunner(COMMITLORE_LIMITS, relative(process.cwd(), REAL as string))(["--version"], repo)).rejects.toThrow(
       new RegExp(`${VARIABLE} NOT_ABSOLUTE`),
@@ -846,7 +916,7 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     // The reviewer's script (hash-budget-parent.mjs), logging each argv that reaches it, then made 1 TiB.
     writeFileSync(
       pin,
-      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${ran}'\ncase "$*" in\n"--version") echo 1.7.3; exit 0;;\n"doctor --help") printf "Usage: commitlore doctor [options]\\n  --json\\n"; exit 0;;\n"init --help") printf "Usage: commitlore init [options]\\n  --mcp-scope <scope>\\n  --no-unattended\\n"; exit 0;;\n"init --mcp-scope none --no-unattended") exit 0;;\n"doctor --json") echo '${OK_REPORT}'; exit 0;;\nesac\nexit 2\n`,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${ran}'\ncase "$*" in\n"--version") echo 1.7.3; exit 0;;\n"doctor --help") printf "Usage: commitlore doctor [options]\\n  --json\\n"; exit 0;;\n"init --help") printf "Usage: commitlore init [options]\\n  --mcp-scope <scope>\\n  --no-unattended\\n  --no-agent-hooks\\n"; exit 0;;\n"${INIT}") exit 0;;\n"doctor --json") echo '${OK_REPORT}'; exit 0;;\nesac\nexit 2\n`,
       { mode: 0o700 },
     );
     sparse(pin, TIB);

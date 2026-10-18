@@ -47,7 +47,7 @@ it("R1-02: timeout is refused even if the signalled child exits zero with valid 
     // Slice S16: the pin's checks are answered at once, as a supported CLI answers them.
     if (process.argv[2] === '--version') { process.stdout.write('1.7.3\\n'); return; }
     if (process.argv[2] === 'doctor' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore doctor [options]\\n  --json\\n'); return; }
-    if (process.argv[2] === 'init' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore init [options]\\n  --mcp-scope <scope>\\n  --no-unattended\\n'); return; }
+    if (process.argv[2] === 'init' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore init [options]\\n  --mcp-scope <scope>\\n  --no-unattended\\n  --no-agent-hooks\\n'); return; }
     const fs = require('node:fs');
     fs.appendFileSync(${JSON.stringify(events)}, process.argv[2] + ':ready\\n');
     process.on('SIGTERM', () => {

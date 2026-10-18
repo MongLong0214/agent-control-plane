@@ -27,10 +27,19 @@ import type { CommitLoreRun, CommitLoreRunner } from "./commitlore-observation.t
  * usage, once for that observation, under the same bounded child and the same constructed child
  * environment as the observation's commands (`commitloreRunner`'s `ready`). The file those checks ran is
  * the file every later spawn of that observation must still be (`commitlorePinIdentity`).
+ *
+ * The `init` usage must offer every option the observation passes (`COMMITLORE_INIT_OPTIONS`), among them
+ * `--no-agent-hooks`, without which `init` writes its Claude Code injection hook into the checkout. A CLI
+ * whose `init` lacks one is refused `NO_INIT_OPTION` before any `init` runs; nothing falls back to an argv
+ * without it.
  */
 export const COMMITLORE_BINARY_VARIABLE = "ACP_COMMITLORE_BINARY";
 
-/** Why a pin is refused. The stat conditions are the provider pins' own (`doctor.ts` `PinCondition`). */
+/**
+ * Why a pin is refused. The stat conditions are the provider pins' own (`doctor.ts` `PinCondition`).
+ * `NO_INIT_COMMAND`: `init --help` gives no `init` usage at all (it fails, or answers something else).
+ * `NO_INIT_OPTION`: it gives one, and that usage does not offer an option the observation passes.
+ */
 export type CommitLorePinCondition =
   | "NOT_CONFIGURED"
   | "NOT_ABSOLUTE"
@@ -41,6 +50,7 @@ export type CommitLorePinCondition =
   | "UNSUPPORTED_VERSION"
   | "NO_DOCTOR_COMMAND"
   | "NO_INIT_COMMAND"
+  | "NO_INIT_OPTION"
   | "TOO_LARGE"
   | "REPLACED";
 
@@ -52,12 +62,28 @@ export const COMMITLORE_PIN_CHECK_ARGV: ReadonlyArray<readonly string[]> = Objec
 ]);
 
 /** The options of `init` the observation passes (`COMMITLORE_OBSERVATION_ARGV`); its usage must list each. */
-export const COMMITLORE_INIT_OPTIONS: readonly string[] = Object.freeze(["--mcp-scope", "--no-unattended"]);
+export const COMMITLORE_INIT_OPTIONS = Object.freeze(["--mcp-scope", "--no-unattended", "--no-agent-hooks"] as const);
+
+/**
+ * What the observation needs each of `COMMITLORE_INIT_OPTIONS` for, as a `NO_INIT_OPTION` refusal names it.
+ * `--no-agent-hooks` skips only `init`'s Claude Code injection hook (`.claude/settings.json`, its one write
+ * into the working tree); the git hooks, the git config, the record index, the trusted-author handling and
+ * `init`'s own readiness verdict all stay, so it is not a skip of agent integration as a whole.
+ */
+const INIT_OPTION_NEEDS: Readonly<Record<(typeof COMMITLORE_INIT_OPTIONS)[number], string>> = Object.freeze({
+  "--mcp-scope": "to register no MCP server (`--mcp-scope none`) without a prompt",
+  "--no-unattended": "to leave unattended capture off without a prompt",
+  "--no-agent-hooks": "so that it writes nothing into the checkout",
+});
 
 /**
  * The versions this producer runs: major 1, from 1.4.2. 1.4.2 is the first release whose `init` takes the
  * `--mcp-scope` the observation passes (`COMMITLORE_OBSERVATION_ARGV`); every 1.x since emits the
  * `commitlore_doctor.v2` report the observation judges. Another major is refused until it is measured.
+ *
+ * The version does not show that `init` offers `--no-agent-hooks`: a build without it and a build with it
+ * answer the same one (the 1.7.4 release, and the unreleased source after it, both say 1.7.4), so that
+ * capability is read from `init --help` (`judgeCommitLoreInitCommand`) and the range is not raised for it.
  */
 export const COMMITLORE_SUPPORTED_VERSION = Object.freeze({ major: 1, minimum: Object.freeze([1, 4, 2] as const) });
 
@@ -149,20 +175,27 @@ export const judgeCommitLoreDoctorCommand = (pin: string, run: CommitLoreRun): s
  * Review S16-R1-03 — whether the pinned CLI has the `init` command the observation runs, taking the options
  * it passes: its own usage for `init --help`, exit 0, listing each of `COMMITLORE_INIT_OPTIONS` as an option
  * (a line that starts with it). As for `doctor`, a CLI without the command answers with its root usage and
- * exits 0. Null when it has it; otherwise the reason.
+ * exits 0. Null when it has it; otherwise the reason: `NO_INIT_COMMAND` when there is no `init` usage at
+ * all, `NO_INIT_OPTION` naming each option that usage does not offer and what the observation needs it for.
  *
  * This reads a usage and runs no `init`: it shows the CLI declares the command and those options, and it is
  * no evidence that `init` succeeds in a checkout or of what it changes there.
  */
 export const judgeCommitLoreInitCommand = (pin: string, run: CommitLoreRun): string | null => {
   const usage = run.stdout.trimStart().split("\n", 1)[0] ?? "";
+  if (run.exitCode !== 0 || !/^Usage: commitlore init(\s|$)/.test(usage)) {
+    return (
+      `${COMMITLORE_BINARY_VARIABLE} NO_INIT_COMMAND: ${pin} init --help exited ${run.exitCode} without an init usage ` +
+      `(${JSON.stringify(tail(usage) || tail(run.stderr))})`
+    );
+  }
   // The first word of each line, a short alias (`-m, `) aside: an option the usage lists starts its line.
   const listed = new Set(run.stdout.split("\n").map((line) => line.trim().replace(/^-\w, /, "").split(/\s/, 1)[0]));
   const missing = COMMITLORE_INIT_OPTIONS.filter((option) => !listed.has(option));
-  if (run.exitCode === 0 && /^Usage: commitlore init(\s|$)/.test(usage) && missing.length === 0) return null;
+  if (missing.length === 0) return null;
   return (
-    `${COMMITLORE_BINARY_VARIABLE} NO_INIT_COMMAND: ${pin} init --help exited ${run.exitCode} without an init usage ` +
-    `listing ${COMMITLORE_INIT_OPTIONS.join(" and ")} (${JSON.stringify(tail(usage) || tail(run.stderr))})`
+    `${COMMITLORE_BINARY_VARIABLE} NO_INIT_OPTION: ${pin} init does not offer ` +
+    missing.map((option) => `${option}, which the observation needs ${INIT_OPTION_NEEDS[option]}`).join("; nor ")
   );
 };
 

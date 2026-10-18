@@ -104,10 +104,10 @@ describe("#246 B3: the CommitLore verdict", () => {
     });
     expect(await passing.observe("/checkout")).toMatchObject({ outcome: "PASS" });
     expect(calls).toEqual([
-      { argv: ["init", "--mcp-scope", "none", "--no-unattended"], cwd: "/checkout" },
+      { argv: ["init", "--mcp-scope", "none", "--no-unattended", "--no-agent-hooks"], cwd: "/checkout" },
       { argv: ["doctor", "--json"], cwd: "/checkout" },
     ]);
-    expect(COMMITLORE_OBSERVATION_ARGV.map((argv) => argv.join(" "))).toEqual(["init --mcp-scope none --no-unattended", "doctor --json"]);
+    expect(COMMITLORE_OBSERVATION_ARGV.map((argv) => argv.join(" "))).toEqual(["init --mcp-scope none --no-unattended --no-agent-hooks", "doctor --json"]);
 
     const missing = createCommitLoreCliPort(async () => {
       throw Object.assign(new Error("spawn commitlore ENOENT"), { code: "ENOENT" });
@@ -216,7 +216,7 @@ describe("review S11-R1-03: a CommitLore row is bound to the record its attempt 
     expect(genuine).toEqual({
       schema: "acp.bootstrap.commitlore-observation.v1",
       ...binding,
-      argv: [["init", "--mcp-scope", "none", "--no-unattended"], ["doctor", "--json"]],
+      argv: [["init", "--mcp-scope", "none", "--no-unattended", "--no-agent-hooks"], ["doctor", "--json"]],
       reportStatus: "ok",
       reportDigest: sha256(report),
       report,

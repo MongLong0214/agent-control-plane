@@ -121,7 +121,7 @@ const fake = (name: string, body: string): void => {
   const prelude = `
     if (process.argv[2] === '--version') { process.stdout.write('1.7.3\\n'); return; }
     if (process.argv[2] === 'doctor' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore doctor [options]\\n  --json  emit the report as JSON\\n'); return; }
-    if (process.argv[2] === 'init' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore init [options]\\n  --mcp-scope <scope>  where to register\\n  --no-unattended      leave unattended capture off\\n'); return; }
+    if (process.argv[2] === 'init' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore init [options]\\n  --mcp-scope <scope>  where to register\\n  --no-unattended      leave unattended capture off\\n  --no-agent-hooks     write nothing inside the working tree\\n'); return; }
     const fs = require('node:fs');
     const { spawnSync } = require('node:child_process');
     const step = process.argv[2];
