@@ -134,20 +134,27 @@ const failResultStore = (f: BootstrapRuntimeFixture, key: string) => {
 };
 
 describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", () => {
-  it("while the RUN_DISPATCH turn is held past vi.waitFor's default 1000 ms quietOwner stays pending; once it is released, quietOwner resolves with two finished turns", async ({ signal }) => {
-    await withBootstrapRuntime(async (f) => {
+  it("while the RUN_DISPATCH turn is held past vi.waitFor's default 1000 ms quietOwner stays pending; once it is released, quietOwner resolves with two finished turns", async ({ signal, onTestFinished }) => {
+    // This test's own end, which the runner awaits before the next test on every cooperative exit (a pass,
+    // an assertion failure, a rejection, its timeout), bounded by hookTimeout: release the held turn, then
+    // collect the body, fixture close included. The body never waits on this hook. Its failure is already
+    // the test's, so it is neither reported again here nor replaced.
+    let releaseHeldTurn = (): void => undefined;
+    let body: Promise<void> = Promise.resolve();
+    onTestFinished(async () => {
+      try {
+        releaseHeldTurn();
+      } catch {
+        // The body's cleanup releases it too, and reports that error beside the test's failure.
+      }
+      await body.then(
+        () => undefined,
+        () => undefined,
+      );
+    });
+    body = withBootstrapRuntime(async (f) => {
       const latch = latchFirstWorkTurn(f);
-      // A runner timeout aborts the test's signal: the held turn is released then too, and the wait below
-      // stops waiting for a turn that may never be held.
-      const aborted = new Promise<never>((_resolve, reject) => {
-        const abort = () => {
-          latch.release();
-          reject(signal.reason);
-        };
-        if (signal.aborted) abort();
-        else signal.addEventListener("abort", abort, { once: true });
-      });
-      aborted.catch(() => undefined);
+      releaseHeldTurn = () => latch.release();
       // quietOwner past run_dispatch's reply: from there only its wait for the turn can keep it pending.
       const dispatchBootstrap = f.dispatchBootstrap;
       let answer = (_run: Awaited<ReturnType<typeof dispatchBootstrap>>): void => undefined;
@@ -174,23 +181,42 @@ describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", 
       );
       let run: Awaited<ReturnType<typeof dispatchBootstrap>> | null = null;
       let failure: { error: unknown } | null = null;
+      // A runner timeout aborts the test's signal: the held turn is released, and every observation wait
+      // below is interrupted, so the body reaches its cleanup at once. The listener is removed on every exit.
+      let abort = (): void => undefined;
+      const aborted = new Promise<never>((_resolve, reject) => {
+        abort = () => {
+          latch.release();
+          reject(signal.reason);
+        };
+      });
+      aborted.catch(() => undefined);
+      const untilAborted = <T>(wait: Promise<T>): Promise<T> => Promise.race([wait, aborted]);
+      let observation: ReturnType<typeof setTimeout> | undefined;
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
       try {
-        run = await Promise.race([
-          Promise.all([latch.entered, answered]).then(([, dispatched]) => dispatched),
-          // quietOwner settled before its turn was held: nothing is left to observe pending.
-          settled.then(() => null),
-          aborted,
-        ]);
+        run = await untilAborted(
+          Promise.race([
+            Promise.all([latch.entered, answered]).then(([, dispatched]) => dispatched),
+            // quietOwner settled before its turn was held: nothing is left to observe pending.
+            settled.then(() => null),
+          ]),
+        );
         expect(run, `quietOwner settled (${state}) before its RUN_DISPATCH turn was held`).not.toBeNull();
         const { ownerSessionId } = run!;
         // A macrotask boundary: whatever quietOwner could finish without the turn has finished.
-        await new Promise((resolve) => setImmediate(resolve));
+        await untilAborted(new Promise((resolve) => setImmediate(resolve)));
         // The only timed step in this test, and one is necessary: no latch can tell a wait that gives up at
         // 1000 ms (vi.waitFor's default, the wait #1156 replaced) from one that never gives up, unless 1000 ms
         // pass while the turn is held. It is deterministic: that old wait started its 1000 ms timer before the
         // boundary above, so it is registered ahead of this 1100 ms one (its 1000 ms plus two 50 ms polls) and
         // always fires first. Timer order decides, not how fast the turn runs.
-        await new Promise((resolve) => setTimeout(resolve, 1_100));
+        await untilAborted(
+          new Promise((resolve) => {
+            observation = setTimeout(resolve, 1_100);
+          }),
+        );
         expect(state).toBe("pending");
         expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(true);
         expect(f.finishedTurns(ownerSessionId)).toBe(1);
@@ -198,6 +224,8 @@ describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", 
         failure = { error };
         throw error;
       } finally {
+        signal.removeEventListener("abort", abort);
+        clearTimeout(observation);
         // On every cooperative exit path (assertion failure, rejection, runner timeout) the held turn is
         // released, quietOwner settles, and the released turn returns before the fixture closes (a wait
         // that already gave up no longer waits for it), each step tried even if another throws. A cleanup
@@ -230,6 +258,7 @@ describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", 
       expect(f.finishedTurns(ownerSessionId)).toBe(2);
       expect(f.harness.cp.outbox.listByRun(runId).filter((m) => m.kind === MessageKind.RUN_DISPATCH)).toMatchObject([{ status: "ACKED" }]);
     });
+    await body;
   });
 
   it("a RUN_DISPATCH turn that never runs fails at once, naming the turns finished and the state reached", async () => {
