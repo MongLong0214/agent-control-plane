@@ -149,10 +149,13 @@ export const prepareBootstrapRun = async (
     legacyTask?: boolean;
     /** #246 B3 — the runner's CommitLore port; omitted, the runner has none. */
     commitlore?: CommitLorePort | null;
+    /** S10 — the human-gate items the run's contract declares; omitted, it declares none. */
+    humanGate?: readonly string[];
   },
 ): Promise<PreparedBootstrapRun> => {
   const harness = makeHarness(options.ownerIdentities === undefined ? {} : { ownerIdentities: options.ownerIdentities });
-  const created = harness.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: ExecutionMode.STANDARD, contract: CONTRACT });
+  const contract = options.humanGate === undefined ? CONTRACT : { ...CONTRACT, humanGate: [...options.humanGate] };
+  const created = harness.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: ExecutionMode.STANDARD, contract });
   if (!created.allowed) throw new Error(created.message);
   const runId = created.value.runId;
   await dispatchBootstrapRun(harness.cp, harness.clock, runId);
@@ -200,7 +203,9 @@ export const prepareBootstrapRun = async (
   await vi.waitFor(() => expect(processGroupEmpty(writer.processGroup)).toBe(true), { timeout: 10_000, interval: 20 });
   expect(writer.startToken).not.toBeNull();
   runner.attachWriterLock(() => true, () => writer);
-  harness.cp.ceo.attach({ bootstrapCompletionChain: runner });
+  // As production wires one runner for both (S10-R1-01): the gate's T3-linked item reads the predicate
+  // of the runner whose CONFIRM consumes the approval.
+  harness.cp.ceo.attach({ bootstrapCompletionChain: runner, repoFactoryApprovals: runner });
   harness.cp.bootstrap.attachCompletionChain(runner);
   await harness.cp.continuity.evaluate("bootstrap confirmation");
   return {

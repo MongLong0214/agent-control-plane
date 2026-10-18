@@ -1,4 +1,4 @@
-import { chmodSync, readFileSync } from "node:fs";
+import { chmodSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import Database from "better-sqlite3";
@@ -10,7 +10,7 @@ import {
   repoFactoryGitHubWriteParameters,
 } from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
 import type { ProjectManifest } from "../../src/contracts/manifest.ts";
-import { sha256Hex } from "../../src/core/digest.ts";
+import { digestOf, sha256Hex } from "../../src/core/digest.ts";
 import { buzzMessageSigningRequest, deliverBuzzMessage } from "../../src/ingress/buzz-message.ts";
 import { IngressGuard, ingressSignature, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { admitRuntimeLineage } from "../../src/session/runtime-lineage.ts";
@@ -22,6 +22,7 @@ import type {
 } from "../../src/buzz/buzz-owner-approval.ts";
 import type { BuzzMentionEvent } from "../../src/buzz/buzz-mention-subscriber.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import * as productionGate from "../../src/ceo/production-gate.ts";
 import * as daemonComposition from "../../src/daemon/agentcpd.ts";
 import { startBuzzMessageIngressListener, startDaemonBuzzMentionSubscriber } from "../../src/daemon/agentcpd.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
@@ -51,7 +52,7 @@ import {
   writeSubscriberConfig,
 } from "../helpers/buzz-mention-relay.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { TEST_OWNER, dispatchBootstrapRun } from "../helpers/harness.ts";
+import { TEST_OWNER, dispatchBootstrapRun, ownerDecisionReceipt } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
@@ -198,6 +199,8 @@ const startWorld = async (
     repoFactoryProjectId?: string | null;
     runner?: (real: BuzzOwnerApprovalRunnerPort) => BuzzOwnerApprovalRunnerPort;
     identity?: (keys: Keys) => string | undefined;
+    /** S10 — the human-gate items the run's contract declares. */
+    humanGate?: readonly string[];
   } = {},
 ): Promise<World> => {
   const dir = tempDir("acp-oa-");
@@ -214,6 +217,7 @@ const startWorld = async (
     ops: bootstrapOperations() as Operation[],
     manifest: cleanTreeManifest(projectId),
     ownerIdentities: [TEST_OWNER, { channel: "buzz", actor: keys.owner.pubkey }],
+    ...(options.humanGate === undefined ? {} : { humanGate: options.humanGate }),
   });
   const { cp } = prepared.harness;
   // The CEO speaks on Buzz as its own key, so its marker-carrying mention is a peer's, not the owner's.
@@ -641,15 +645,18 @@ describe("W4: wrong prompt", () => {
     }
   });
 
-  it("refuses a token with no reply reference, or one naming an event that is not a prompt", async () => {
+  // S10 (CEO c07863f8): a different thread alone is no reason to refuse, so a bare code under no
+  // stored prompt is matched by its code (see the S10 witnesses). What stays refused is a token that
+  // neither replies to a stored prompt nor stands alone as the code of exactly one.
+  it("refuses a token with no reply reference, or one naming an event that is not a prompt, unless it is a bare code of one prompt", async () => {
     const { w, prompt } = await promptedWorld();
     try {
       const code = w.promptCode(prompt);
-      const noReference = w.reply({ prompt: null, content: `acp-approve-write:${code}` });
-      const notAPrompt = w.reply({ tags: [["h", ROOM_X], ["e", "f".repeat(64), "", "reply"], ["p", w.keys.x.pubkey]], content: `acp-approve-write:${code}` });
+      const noReference = w.reply({ prompt: null, content: `approve: acp-approve-write:${code}` });
+      const notAPrompt = w.reply({ tags: [["h", ROOM_X], ["e", "f".repeat(64), "", "reply"], ["p", w.keys.x.pubkey]], content: `acp-approve-write:${"0".repeat(16)}` });
       const rootAndReply = w.reply({
         tags: [["h", ROOM_X], ["e", prompt.id, "", "root"], ["e", "e".repeat(64), "", "reply"], ["p", w.keys.x.pubkey]],
-        content: `acp-approve-write:${code}`,
+        content: `acp-approve-write:${code} thanks`,
       });
       for (const event of [noReference, notAPrompt, rootAndReply]) {
         await w.send(event);
@@ -1574,5 +1581,889 @@ describe("T3: the posting authority is the configured repo-factory project's CTO
         await w.close();
       }
     });
+  });
+});
+
+/* ------------------------------------------------------------------------------------------- S10 */
+
+/** S10 — the repo-factory CTO's own message in X's room: the one the owner answered under in run_7717. */
+const ctoMessage = (w: World, content = "repo-factory: the plan is reviewed and waits for your approval"): BuzzMentionEvent =>
+  finalizeEvent(
+    { kind: 9, created_at: secondsOf(w.prepared.harness.cp.clock.now().getTime()), tags: [["h", ROOM_X]], content },
+    w.keys.x.secretKey,
+  ) as BuzzMentionEvent;
+
+/** S10 — an answer posted under `parent` instead of the prompt, tagged as a client tags a reply to it. */
+const underMessage = (
+  w: World,
+  parent: BuzzMentionEvent,
+  content: string,
+  options: { author?: ChannelKey; createdAt?: number; room?: string } = {},
+): BuzzMentionEvent =>
+  w.reply({
+    prompt: null,
+    content,
+    tags: [["h", options.room ?? ROOM_X], ["e", parent.id, "", "reply"], ["p", parent.pubkey]],
+    ...(options.author === undefined ? {} : { author: options.author }),
+    ...(options.createdAt === undefined ? {} : { createdAt: options.createdAt }),
+  });
+
+const answerPayload = (w: World, promptEventId: string): Record<string, unknown> | null => {
+  const row = w.prepared.harness.cp.db.get<{ payload_json: string }>(
+    `SELECT payload_json FROM inbound_messages WHERE channel = 'buzz-owner-approval-answer' AND nonce = ?`,
+    [promptEventId],
+  );
+  return row === undefined ? null : (JSON.parse(row.payload_json) as Record<string, unknown>);
+};
+
+describe("S10 (#246 a): an owner-signed code answered under another message (CEO c07863f8)", () => {
+  it("accepts the bare code under the CTO's message exactly once through the daemon's sink, and C3 consumes it once", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      const { cp } = w.prepared.harness;
+      const scope = w.prepared.runner.approvalScopeOf(w.prepared.runId);
+      if (!scope.allowed) throw new Error(scope.message);
+      const answer = underMessage(w, ctoMessage(w), `acp-approve-write:${w.promptCode(prompt)}`);
+      const receive = vi.spyOn(w.approvals!, "receive");
+      await w.send(answer);
+      expect(receive).toHaveBeenCalled();
+      expect(w.counts()).toMatchObject({ answers: 1, receipts: 1, artifacts: 1, consumptions: 0, githubCalls: 0, deliveries: 0, admittedMessages: 0, refusalRows: 0 });
+      const receipt = cp.artifacts.list<Record<string, unknown>>(w.prepared.runId, "APPROVAL").at(-1)!.content["receipt"];
+      expect(receipt).toEqual({
+        channel: "buzz",
+        actor: w.keys.owner.pubkey,
+        inboundNonce: `buzz-approval:${answer.id}`,
+        runId: w.prepared.runId,
+        candidateSnapshotDigest: w.prepared.snapshotDigest,
+        operation: "repo_factory_github_write",
+        parameterDigest: scope.value.parameterDigest,
+        idempotencyKey: `buzz:repo-factory-github-write:${prompt.id}`,
+        approved: true,
+      });
+      expect(answerPayload(w, prompt.id)).toMatchObject({ state: "ANSWERED", link: "CODE", approved: true });
+
+      // Single consumption: the relay again is a replay, and a second event carrying the code is refused.
+      await w.send(answer);
+      expect(receiveDirect(w, answer).reasonCode).toBe(ReasonCode.INGRESS_REPLAY_IGNORED);
+      const again = underMessage(w, ctoMessage(w, "status?"), `acp-approve-write:${w.promptCode(prompt)}`, { createdAt: answer.created_at + 1 });
+      expect(receiveDirect(w, again).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED);
+      expect(w.counts()).toMatchObject({ answers: 1, receipts: 1, artifacts: 1, refusalRows: 1 });
+
+      // The outcome answers the owner's event where it was posted; C3 consumes the receipt once.
+      await w.tick();
+      expect(w.publishedOutcomes()).toHaveLength(1);
+      expect(w.publishedOutcomes()[0]!.tags).toEqual([["h", ROOM_X], ["e", answer.id, "", "reply"]]);
+      expect(w.module!.verifyBuzzApprovalEvidence(cp.db, receipt as never, { nowMs: cp.clock.now().getTime() }).allowed).toBe(true);
+      const first = await w.confirm();
+      expect(first.reasonCode, JSON.stringify(first)).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(w.counts()).toMatchObject({ answers: 1, receipts: 1, consumptions: 1, githubCalls: 4 });
+      const resumed = await w.confirm();
+      expect(resumed.reasonCode, JSON.stringify(resumed)).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("refuses a stranger, the CEO, plain chat, a quoted token, an unknown code and another room; the bare code then mints once", async () => {
+    const { w, prompt } = await promptedWorld({ xRooms: [ROOM_X, ROOM_OTHER] });
+    try {
+      const code = w.promptCode(prompt);
+      const parent = ctoMessage(w);
+      let at = prompt.created_at;
+      const next = (content: string, options: { author?: ChannelKey; room?: string } = {}) =>
+        underMessage(w, parent, content, { ...options, createdAt: (at += 1) });
+      const stranger = next(`acp-approve-write:${code}`, { author: w.keys.stranger });
+      const ceo = next(`acp-approve-write:${code}`, { author: w.keys.ceo });
+      for (const event of [stranger, ceo]) {
+        await w.send(event);
+        expect(receiveDirect(w, event).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_NOT_OWNER);
+      }
+      expect(w.counts()).toMatchObject({ ...NOTHING_MINTED, refusalRows: 0 });
+      // The owner's ordinary conversation under the CTO's message carries no token: never an answer.
+      expect(receiveDirect(w, next("looks good to me, go ahead"))).toMatchObject({ allowed: false, reasonCode: ReasonCode.BUZZ_APPROVAL_MALFORMED });
+      // A sentence that quotes the token is conversation too, and a bare code of no prompt names nothing.
+      for (const content of [`ok, acp-approve-write:${code} once CI is green`, `acp-approve-write:${"0".repeat(16)}`]) {
+        expect(receiveDirect(w, next(content)).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_UNRESOLVED);
+      }
+      const elsewhere = next(`acp-approve-write:${code}`, { room: ROOM_OTHER });
+      expect(receiveDirect(w, elsewhere, w.keys.x.pubkey, ROOM_OTHER).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_WRONG_ROOM);
+      expect(w.counts()).toMatchObject({ ...NOTHING_MINTED, refusalRows: 3 });
+
+      const bare = next(`acp-approve-write:${code}`);
+      expect(receiveDirect(w, bare)).toMatchObject({ allowed: true, value: { result: "MINTED", promptEventId: prompt.id } });
+      expect(w.counts()).toMatchObject({ answers: 1, receipts: 1, artifacts: 1, deliveries: 0, admittedMessages: 0 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("wrong scope: the code of a prompt whose scope moved is PROMPT_STALE, then PROMPT_CANCELLED; the new prompt's code binds the new scope", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      const { harness } = w.prepared;
+      await replanBootstrap(
+        harness,
+        w.prepared.runId,
+        { planDigest: w.prepared.planDigest, snapshotDigest: w.prepared.snapshotDigest, ceoSessionId: w.prepared.ceoSessionId },
+        bootstrapPlan(w.prepared.manifest, { operations: bootstrapOperations() as Operation[], summary: "a revised plan" }),
+      );
+      const parent = ctoMessage(w);
+      const stale = underMessage(w, parent, `acp-approve-write:${w.promptCode(prompt)}`);
+      expect(receiveDirect(w, stale)).toMatchObject({ allowed: false, reasonCode: ReasonCode.BUZZ_APPROVAL_PROMPT_STALE, evidence: { field: "planDigest" } });
+      await w.tick();
+      expect(w.counts().prompts).toBe(2);
+      const cancelled = underMessage(w, parent, `acp-approve-write:${w.promptCode(prompt)}`, { createdAt: stale.created_at + 1 });
+      expect(receiveDirect(w, cancelled).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_CANCELLED);
+      expect(w.counts()).toMatchObject({ ...NOTHING_MINTED, refusalRows: 2 });
+
+      const renewed = w.publishedPrompts().at(-1)!;
+      const scope = w.prepared.runner.approvalScopeOf(w.prepared.runId);
+      if (!scope.allowed) throw new Error(scope.message);
+      const minted = receiveDirect(w, underMessage(w, parent, `acp-approve-write:${w.promptCode(renewed)}`, { createdAt: stale.created_at + 2 }));
+      expect(minted).toMatchObject({ allowed: true, value: { promptEventId: renewed.id, receipt: { parameterDigest: scope.value.parameterDigest } } });
+      expect(scope.value.planDigest).not.toBe(w.prepared.planDigest);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("expired: the code delivered after its prompt's stored window is PROMPT_EXPIRED, however it is dated", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      const parent = ctoMessage(w);
+      const inside = underMessage(w, parent, `acp-approve-write:${w.promptCode(prompt)}`);
+      w.prepared.harness.clock.advance(25 * 60 * 60 * 1000);
+      expect(receiveDirect(w, inside).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_EXPIRED);
+      const late = underMessage(w, parent, `acp-approve-write:${w.promptCode(prompt)}`, { createdAt: secondsOf(w.prepared.harness.cp.clock.now().getTime()) });
+      expect(receiveDirect(w, late).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_EXPIRED);
+      expect(w.counts()).toMatchObject({ ...NOTHING_MINTED, refusalRows: 2 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("an explicit refusal is never overridden: a decline by code stands against a later approval by code or by reply, and C3 refuses", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      const code = w.promptCode(prompt);
+      const parent = ctoMessage(w);
+      const decline = underMessage(w, parent, `acp-decline-write:${code}`);
+      expect(receiveDirect(w, decline)).toMatchObject({ allowed: true, value: { result: "MINTED", receipt: { approved: false } } });
+      const approveByCode = underMessage(w, parent, `acp-approve-write:${code}`, { createdAt: decline.created_at + 1 });
+      expect(receiveDirect(w, approveByCode).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED);
+      const approveByReply = w.reply({ prompt, createdAt: decline.created_at + 2 });
+      expect(receiveDirect(w, approveByReply).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED);
+      // A refused event's refusal is its answer from then on.
+      expect(receiveDirect(w, approveByCode).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED);
+      expect(w.counts()).toMatchObject({ answers: 1, receipts: 1, artifacts: 1 });
+      expect(await w.confirm()).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_DECLINED" } });
+      expect(w.counts()).toMatchObject({ consumptions: 0, githubCalls: 0 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("consumption asks the link again: a stored answer whose event quotes the code under another message is EVENT_NOT_A_REPLY", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      const { cp } = w.prepared.harness;
+      const scope = w.prepared.runner.approvalScopeOf(w.prepared.runId);
+      if (!scope.allowed) throw new Error(scope.message);
+      // An answer row as #mint writes one, in ACP's own connection, for an event that quotes the token.
+      const quoted = underMessage(w, ctoMessage(w), `ok, acp-approve-write:${w.promptCode(prompt)} once CI is green`);
+      const idempotencyKey = `buzz:repo-factory-github-write:${prompt.id}`;
+      const receipt = {
+        channel: "buzz",
+        actor: w.keys.owner.pubkey,
+        inboundNonce: `buzz-approval:${quoted.id}`,
+        runId: w.prepared.runId,
+        candidateSnapshotDigest: scope.value.candidateSnapshotDigest,
+        operation: scope.value.operation,
+        parameterDigest: scope.value.parameterDigest,
+        idempotencyKey,
+        approved: true,
+      };
+      const envelope = ownerApprovalPayload({
+        runId: w.prepared.runId,
+        candidateSnapshotDigest: scope.value.candidateSnapshotDigest,
+        operation: scope.value.operation,
+        parameters: scope.value.parameters,
+        idempotencyKey,
+        approved: true,
+      });
+      cp.db.run(`INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json) VALUES (?, ?, ?, ?, ?)`, [
+        "buzz-owner-approval-answer",
+        prompt.id,
+        quoted.pubkey,
+        cp.clock.nowIso(),
+        JSON.stringify({
+          schema: "acp.buzz-owner-approval.answer.v1",
+          state: "ANSWERED",
+          promptEventId: prompt.id,
+          approvalEvent: quoted,
+          approved: true,
+          envelope,
+          receipt,
+          receiptDigest: digestOf(receipt),
+          inboundNonce: receipt.inboundNonce,
+          answeredAt: cp.clock.nowIso(),
+          outcomeEvent: null,
+          link: "CODE",
+        }),
+      ]);
+      const verdict = w.module!.verifyBuzzApprovalEvidence(cp.db, receipt, { nowMs: cp.clock.now().getTime() });
+      expect(verdict).toMatchObject({ allowed: false, evidence: { refusal: "EVENT_NOT_A_REPLY" } });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("a code answered by reply first is a replayed code when it comes again under another message", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(answerPayload(w, prompt.id)).toMatchObject({ state: "ANSWERED", link: "REPLY" });
+      const again = underMessage(w, ctoMessage(w), `acp-approve-write:${w.promptCode(prompt)}`);
+      expect(receiveDirect(w, again).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED);
+      expect(w.counts()).toMatchObject({ answers: 1, receipts: 1, artifacts: 1 });
+    } finally {
+      await w.close();
+    }
+  });
+});
+
+/** S10 — the item a contract names to declare that the T3 approval is its owner decision. */
+const T3_GATE_ITEM = "owner-approval:repo_factory_github_write";
+/** The run_7717 item: the same approval described in prose, which declares no link. */
+const PROSE_ITEM = "실제 create 전 run·PLAN·operations scope의 T3 owner 서명 승인";
+
+const gateOf = (w: World) => w.prepared.harness.cp.ceo.humanGateStatus(w.prepared.runId);
+const ownerDecision = (w: World, item: string, approved: boolean) =>
+  w.prepared.harness.cp.ceo.recordOwnerDecision({
+    runId: w.prepared.runId,
+    item,
+    approved,
+    note: approved ? "approved" : "refused",
+    receipt: ownerDecisionReceipt(w.prepared.harness, w.prepared.runId, item, approved, approved ? "approved" : "refused"),
+  });
+
+describe("S10 (#246 b): the T3 approval decides the human-gate item that declares the link, and only that item", () => {
+  it("the linked item is satisfied by the owner's Buzz T3 approval, before and after C3 consumes it, and the CONFIRM completes", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      expect((productionGate as unknown as Record<string, unknown>)["REPO_FACTORY_GITHUB_WRITE_GATE_ITEM"]).toBe(T3_GATE_ITEM);
+      expect(gateOf(w)).toEqual({ required: true, items: [T3_GATE_ITEM], satisfied: false });
+      await w.send(underMessage(w, ctoMessage(w), `acp-approve-write:${w.promptCode(prompt)}`));
+      expect(gateOf(w)).toEqual({ required: true, items: [T3_GATE_ITEM], satisfied: true });
+
+      const first = await w.confirm();
+      expect(first.reasonCode, JSON.stringify(first)).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+      expect(gateOf(w).satisfied).toBe(true);
+      const primary = cp.bindings.activePrimaryCto(w.prepared.manifest.projectId);
+      expect(cp.bootstrap.acknowledgeActivationHandoff(first.evidence["pendingHandoffId"] as string, primary!.sessionId).allowed).toBe(true);
+      const activated = await w.confirm();
+      expect(activated.allowed, JSON.stringify(activated)).toBe(true);
+      const confirmed = cp.ceo.submitCeoDecision({
+        runId: w.prepared.runId,
+        decision: "CONFIRM",
+        candidateSnapshotDigest: w.prepared.snapshotDigest,
+        ceoSessionId: w.prepared.ceoSessionId,
+        rationale: "apply the bootstrap",
+      });
+      expect(confirmed.allowed, JSON.stringify(confirmed)).toBe(true);
+      expect(cp.runs.require(w.prepared.runId).state).toBe(RunState.COMPLETED);
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+      const decisions = cp.artifacts.list<Record<string, unknown>>(w.prepared.runId, "APPROVAL").filter((a) => a.content["kind"] === "OWNER_DECISION");
+      expect(decisions).toEqual([]);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("an unrelated item, and the same approval described in prose, stay unsatisfied until their own OWNER_DECISION", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM, PROSE_ITEM] });
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w)).toEqual({ required: true, items: [T3_GATE_ITEM, PROSE_ITEM], satisfied: false });
+      const refused = await w.confirm();
+      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
+      expect(w.counts()).toMatchObject({ consumptions: 0, githubCalls: 0 });
+      expect(ownerDecision(w, PROSE_ITEM, true).allowed).toBe(true);
+      expect(gateOf(w).satisfied).toBe(true);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("an explicit OWNER_DECISION refusal of the linked item is never overridden by a T3 approval, earlier or later", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w).satisfied).toBe(true);
+      expect(ownerDecision(w, T3_GATE_ITEM, false).allowed).toBe(true);
+      expect(gateOf(w).satisfied).toBe(false);
+      // A newer T3 approval, recorded through the CLI path, does not override the refusal either.
+      const approval = ownerApprovalFor(w.prepared);
+      expect(w.prepared.runner.recordOwnerApproval(w.prepared.runId, {
+        owner: "acme",
+        visibility: "public",
+        planDigest: w.prepared.planDigest,
+        approvedManifest: w.prepared.manifest,
+        projectName: w.prepared.manifest.projectId,
+        receipt: approval.receipt as never,
+      }).allowed).toBe(true);
+      expect(gateOf(w).satisfied).toBe(false);
+      expect(await w.confirm()).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
+      // The one consumption is the refusal's own owner_decision_submit receipt; no T3 receipt was consumed.
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 0 });
+      expect(w.prepared.harness.cp.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'OWNER_APPROVAL_CONSUMED' AND run_id = ?
+          AND json_extract(evidence_json, '$.operation') = 'repo_factory_github_write'`,
+        [w.prepared.runId],
+      )?.n).toBe(0);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("the owner's T3 decline, newer than an approval, is an explicit refusal: the linked item reads unsatisfied", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const approval = ownerApprovalFor(w.prepared);
+      expect(w.prepared.runner.recordOwnerApproval(w.prepared.runId, {
+        owner: "acme",
+        visibility: "public",
+        planDigest: w.prepared.planDigest,
+        approvedManifest: w.prepared.manifest,
+        projectName: w.prepared.manifest.projectId,
+        receipt: approval.receipt as never,
+      }).allowed).toBe(true);
+      expect(gateOf(w).satisfied).toBe(true);
+      const declined = receiveDirect(w, w.reply({ prompt, content: `acp-decline-write:${w.promptCode(prompt)}` }));
+      expect(declined).toMatchObject({ allowed: true, value: { result: "MINTED", receipt: { approved: false } } });
+      expect(gateOf(w).satisfied).toBe(false);
+      expect(await w.confirm()).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
+      expect(w.counts()).toMatchObject({ consumptions: 0, githubCalls: 0 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("a Buzz T3 approval past its prompt's stored window does not satisfy the linked item", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w).satisfied).toBe(true);
+      w.prepared.harness.clock.advance(25 * 60 * 60 * 1000);
+      expect(gateOf(w).satisfied).toBe(false);
+      expect(await w.confirm()).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
+      expect(w.counts()).toMatchObject({ consumptions: 0, githubCalls: 0 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("a newer T3 record whose receipt names a key no owner ingress admitted does not satisfy the linked item", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w).satisfied).toBe(true);
+      const real = cp.artifacts.list<Record<string, unknown>>(w.prepared.runId, "APPROVAL").at(-1)!;
+      const receipt = real.content["receipt"] as Record<string, unknown>;
+      // A Buzz receipt naming a stranger's key, and a CLI receipt naming an actor no owner ingress admitted.
+      for (const forged of [
+        { ...receipt, actor: w.keys.stranger.pubkey },
+        { ...receipt, channel: "cli", actor: "not-the-owner", inboundNonce: "cli-forged" },
+      ]) {
+        cp.artifacts.put(w.prepared.runId, "APPROVAL", { ...real.content, receipt: forged }, w.prepared.snapshotDigest);
+        expect(gateOf(w).satisfied).toBe(false);
+      }
+      expect(await w.confirm()).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
+      expect(w.counts()).toMatchObject({ consumptions: 0, githubCalls: 0 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("a consumed Buzz T3 approval still satisfies the linked item only while its stored evidence verifies", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      const first = await w.confirm();
+      expect(first.reasonCode, JSON.stringify(first)).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(w.counts()).toMatchObject({ consumptions: 1 });
+      expect(gateOf(w).satisfied).toBe(true);
+      const payload = answerPayload(w, prompt.id)!;
+      const side = new Database(cp.config.databasePath);
+      try {
+        side.exec("DROP TRIGGER IF EXISTS inbound_messages_payload_immutable");
+        side.prepare(`UPDATE inbound_messages SET payload_json = ? WHERE channel = 'buzz-owner-approval-answer' AND nonce = ?`).run(
+          JSON.stringify({ ...payload, approvalEvent: { ...(payload["approvalEvent"] as Record<string, unknown>), sig: "0".repeat(128) } }),
+          prompt.id,
+        );
+      } finally {
+        side.close();
+      }
+      expect(gateOf(w).satisfied).toBe(false);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("a T3 approval of a scope that has since moved does not satisfy the linked item", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w).satisfied).toBe(true);
+      await replanBootstrap(
+        w.prepared.harness,
+        w.prepared.runId,
+        { planDigest: w.prepared.planDigest, snapshotDigest: w.prepared.snapshotDigest, ceoSessionId: w.prepared.ceoSessionId },
+        bootstrapPlan(w.prepared.manifest, { operations: bootstrapOperations() as Operation[], summary: "a revised plan" }),
+      );
+      expect(w.prepared.harness.cp.runs.require(w.prepared.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+      expect(gateOf(w).satisfied).toBe(false);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("a PLAN stored after the T3 approval, with the candidate unmoved, is another scope: the linked item reads unsatisfied", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w).satisfied).toBe(true);
+      cp.artifacts.put(w.prepared.runId, "PLAN", bootstrapPlan(w.prepared.manifest, { operations: bootstrapOperations() as Operation[], summary: "a plan stored afterwards" }));
+      const scope = w.prepared.runner.approvalScopeOf(w.prepared.runId);
+      expect(scope.allowed && scope.value.candidateSnapshotDigest === w.prepared.snapshotDigest && scope.value.planDigest !== w.prepared.planDigest).toBe(true);
+      expect(gateOf(w).satisfied).toBe(false);
+    } finally {
+      await w.close();
+    }
+  });
+});
+
+
+/* eslint-disable no-console -- S10-R1: the review witnesses RV1142 W1–W8 are kept as written, observation logs included. */
+describe("RV1142 concrete review witnesses", () => {
+  it("RV1142-W1 only the exact declared item may use the T3 link", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [` ${T3_GATE_ITEM}\t`] });
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w).satisfied, JSON.stringify(gateOf(w))).toBe(false);
+    } finally { await w.close(); }
+  });
+
+  it("RV1142-W2 a forged consumption audit row cannot authenticate a T3 owner decision", async () => {
+    const { w } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      const scope = w.prepared.runner.approvalScopeOf(w.prepared.runId);
+      if (!scope.allowed) throw new Error(scope.message);
+      const receipt = {
+        channel: "cli", actor: "not-the-owner", inboundNonce: "never-admitted",
+        runId: w.prepared.runId, candidateSnapshotDigest: w.prepared.snapshotDigest,
+        operation: scope.value.operation, parameterDigest: scope.value.parameterDigest,
+        idempotencyKey: "forged-consumed-approval", approved: true,
+      };
+      const row = cp.artifacts.put(w.prepared.runId, "APPROVAL", {
+        kind: "REPO_FACTORY_GITHUB_WRITE", owner: "acme", visibility: "public",
+        planDigest: w.prepared.planDigest, approvedManifest: w.prepared.manifest,
+        projectName: w.prepared.manifest.projectId, receipt,
+      }, w.prepared.snapshotDigest);
+      expect(gateOf(w).satisfied).toBe(false);
+      const side = new Database(cp.config.databasePath);
+      try {
+        side.prepare(`INSERT INTO audit_events (at,kind,run_id,actor,evidence_json) VALUES (?, ?, ?, ?, ?)`)
+          .run(cp.clock.nowIso(), "OWNER_APPROVAL_CONSUMED", w.prepared.runId, "cli:not-the-owner",
+          JSON.stringify({receiptDigest: digestOf(receipt), candidateSnapshotDigest: w.prepared.snapshotDigest}));
+      } finally { side.close(); }
+      expect(cp.ownerAuthority.assertApproval(receipt).allowed).toBe(false);
+      expect(cp.ownerAuthority.assertConsumedApproval(receipt, w.prepared.snapshotDigest).allowed).toBe(true);
+      console.log("RV1142-W2 observed", JSON.stringify({ gate: gateOf(w), counts: w.counts(), artifact: row.digest, confirm: await w.confirm() }));
+      expect(gateOf(w).satisfied).toBe(false);
+    } finally { await w.close(); }
+  });
+
+  it("RV1142-W3 a quoted token cannot satisfy the linked gate or authorize writes", async () => {
+    const { w, prompt } = await promptedWorld({humanGate: [T3_GATE_ITEM]});
+    try {
+      const event = w.reply({ prompt, content: `do not use acp-approve-write:${w.promptCode(prompt)} until CI passes` });
+      const observed = receiveDirect(w, event);
+      const confirm = await w.confirm();
+      console.log("RV1142-W3 observed", JSON.stringify({ observed, gate: gateOf(w), confirm, counts: w.counts() }));
+      expect(gateOf(w).satisfied).toBe(false);
+      expect(w.counts().githubCalls).toBe(0);
+    } finally { await w.close(); }
+  });
+
+  it("RV1142-W4 the merge-finalizer reader retains its distinct decision rule", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w).satisfied).toBe(true);
+      expect(w.prepared.harness.cp.ceo.currentHumanGateDecisionDigest(w.prepared.runId).allowed).toBe(false);
+    } finally { await w.close(); }
+  });
+});
+
+
+describe("RV1142 anchored approval siblings", () => {
+  it("RV1142-W5 a duplicate approval does not strand an already anchored execution after ingress pruning", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({prompt}));
+      const first = await w.confirm();
+      expect(first.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(gateOf(w).satisfied).toBe(true);
+      const duplicate = ownerApprovalFor(w.prepared);
+      expect(w.prepared.runner.recordOwnerApproval(w.prepared.runId, {
+        owner: "acme", visibility: "public", planDigest: w.prepared.planDigest,
+        approvedManifest: w.prepared.manifest, projectName: w.prepared.manifest.projectId,
+        receipt: duplicate.receipt,
+      }).allowed).toBe(true);
+      expect(gateOf(w).satisfied).toBe(true);
+      w.prepared.harness.clock.advance(25 * 60 * 60 * 1000);
+      const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { cli: {allowedActors: [TEST_OWNER.actor]} });
+      expect(guard.admit({channel: "cli", actor: TEST_OWNER.actor, nonce: "after-retention", payload: null}).allowed).toBe(true);
+      const scope = w.prepared.runner.approvalScopeOf(w.prepared.runId);
+      if (!scope.allowed) throw new Error(scope.message);
+      const need = w.prepared.runner.ownerApprovalNeed(w.prepared.runId, scope.value);
+      const resumed = await w.confirm();
+      console.log("RV1142-W5 observed", JSON.stringify({gate: gateOf(w), need, resumed, counts: w.counts()}));
+      expect(need.need).toBe("EXECUTION_ANCHORED");
+      expect(gateOf(w).satisfied).toBe(true);
+    } finally { await w.close(); }
+  });
+});
+
+describe("RV1142 delivery and item siblings", () => {
+  it("RV1142-W6 a valid code under another author's message reaches the daemon without mentioning X", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      const parent = finalizeEvent({ kind: 9, created_at: prompt.created_at, tags: [["h", ROOM_X]], content: "CEO: please answer here" }, w.keys.ceo.secretKey) as BuzzMentionEvent;
+      const event = underMessage(w, parent, `acp-approve-write:${w.promptCode(prompt)}`);
+      const receive = vi.spyOn(w.approvals!, "receive");
+      await w.send(event);
+      const received = receive.mock.calls.length;
+      const counts = w.counts();
+      const filters = w.relay.requested.map(x => x.filter);
+      const direct = receiveDirect(w, event);
+      console.log("RV1142-W6 observed", JSON.stringify({ received, counts, filters, direct }));
+      expect(received).toBeGreaterThan(0);
+      expect(counts.answers).toBe(1);
+    } finally { await w.close(); }
+  });
+
+  it.each([
+    T3_GATE_ITEM.toUpperCase(),
+    `${T3_GATE_ITEM}:extra`,
+    `other:${T3_GATE_ITEM}`,
+    'owner-approval:repo_factory_github_ write',
+    PROSE_ITEM,
+  ])("RV1142-W7 nonlinked declared item %s remains unsatisfied", async (item) => {
+    const { w, prompt } = await promptedWorld({humanGate: [item]});
+    try {
+      await w.send(w.reply({prompt}));
+      expect(gateOf(w).satisfied).toBe(false);
+    } finally { await w.close(); }
+  });
+
+  it("RV1142-W8 two bare code events delivered together commit only one answer", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      const parent = ctoMessage(w);
+      const a = underMessage(w, parent, `acp-approve-write:${w.promptCode(prompt)}`);
+      const b = underMessage(w, parent, `acp-decline-write:${w.promptCode(prompt)}`, {createdAt: a.created_at + 1});
+      w.relay.publish(a);
+      w.relay.publish(b);
+      await w.drain();
+      expect(w.counts()).toMatchObject({ answers: 1, receipts: 1, artifacts: 1 });
+      expect(receiveDirect(w, b).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED);
+    } finally { await w.close(); }
+  });
+});
+/* eslint-enable no-console */
+
+describe("S10-R1: the fixes' own guards", () => {
+  it("S10-R1-01 a PROJECT_BOOTSTRAP row bound to a project is not decided by the T3 approval; C3 refuses it RUN_NOT_PROJECTLESS", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w).satisfied).toBe(true);
+      // RunEngine.create refuses a project for PROJECT_BOOTSTRAP (BOOTSTRAP_PROJECT_SUPPLIED) and nothing sets one
+      // later, so only a row written before that rule, or by a database writer, is bound to a project.
+      cp.db.run(`INSERT INTO projects (project_id, name, created_at) VALUES (?, ?, ?)`, ["legacy-bound", "legacy", cp.clock.nowIso()]);
+      cp.db.run(`UPDATE runs SET project_id = ? WHERE run_id = ?`, ["legacy-bound", w.prepared.runId]);
+      expect(w.prepared.runner.ownerApprovalHolds(w.prepared.runId, w.prepared.snapshotDigest)).toMatchObject({
+        allowed: false,
+        evidence: { refusal: "RUN_NOT_PROJECTLESS" },
+      });
+      expect(gateOf(w).satisfied).toBe(false);
+      expect(await w.confirm()).toMatchObject({ allowed: false, evidence: { refusal: "RUN_NOT_PROJECTLESS" } });
+      expect(w.counts()).toMatchObject({ consumptions: 0, githubCalls: 0 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("S10-R1-01 the gate reads the predicate of the runner it is given: one with no work root admits no approval, as its CONFIRM would not", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w).satisfied).toBe(true);
+      expect(cp.bootstrapProducer.ownerApprovalHolds(w.prepared.runId, w.prepared.snapshotDigest)).toMatchObject({
+        allowed: false,
+        evidence: { refusal: "WORK_ROOT_UNCONFIGURED" },
+      });
+      cp.ceo.attach({ repoFactoryApprovals: cp.bootstrapProducer });
+      expect(gateOf(w).satisfied).toBe(false);
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("S10-R1-01 an anchored execution holds only while the newest decision is its own or a duplicate: a different newer decision is APPROVAL_NOT_THIS_EXECUTION, as C3 refuses it", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      expect((await w.confirm()).reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(gateOf(w).satisfied).toBe(true);
+      // A newer record of the same scope that is not the same decision: it names no candidate.
+      const anchored = cp.artifacts.list<Record<string, unknown>>(w.prepared.runId, "APPROVAL").at(-1)!;
+      const receipt = { ...(anchored.content["receipt"] as Record<string, unknown>), channel: "cli", actor: TEST_OWNER.actor, inboundNonce: "cli-other-decision", candidateSnapshotDigest: null };
+      cp.artifacts.put(w.prepared.runId, "APPROVAL", { ...anchored.content, receipt }, w.prepared.snapshotDigest);
+      expect(w.prepared.runner.ownerApprovalHolds(w.prepared.runId, w.prepared.snapshotDigest)).toMatchObject({
+        allowed: false,
+        evidence: { refusal: "APPROVAL_NOT_THIS_EXECUTION" },
+      });
+      expect(gateOf(w).satisfied).toBe(false);
+      expect(await w.confirm()).toMatchObject({ allowed: false });
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("S10-R1-01 a WRITTEN execution whose approval anchor is gone is not held by a newer consumable duplicate, as C3 does not resume it", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      expect((await w.confirm()).reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(cp.bootstrapApplications.get(w.prepared.runId)?.phase).toBe("WRITTEN");
+      rmSync(join(w.prepared.workRoot, w.prepared.runId, "owner-approval"), { recursive: true, force: true });
+      const duplicate = ownerApprovalFor(w.prepared);
+      expect(w.prepared.runner.recordOwnerApproval(w.prepared.runId, {
+        owner: "acme",
+        visibility: "public",
+        planDigest: w.prepared.planDigest,
+        approvedManifest: w.prepared.manifest,
+        projectName: w.prepared.manifest.projectId,
+        receipt: duplicate.receipt,
+      }).allowed).toBe(true);
+      expect(w.prepared.runner.ownerApprovalHolds(w.prepared.runId, w.prepared.snapshotDigest).allowed).toBe(false);
+      expect(gateOf(w).satisfied).toBe(false);
+      expect(await w.confirm()).toMatchObject({ allowed: false });
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("S10-R1-02 consumption asks the standalone rule again for the reply link: a stored threaded sentence is EVENT_NOT_STANDALONE", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      const { cp } = w.prepared.harness;
+      const scope = w.prepared.runner.approvalScopeOf(w.prepared.runId);
+      if (!scope.allowed) throw new Error(scope.message);
+      // An answer row as #mint wrote one before this rule, for a reply to the prompt that quotes its token.
+      const sentence = w.reply({ prompt, content: `do not use acp-approve-write:${w.promptCode(prompt)} until CI passes` });
+      const idempotencyKey = `buzz:repo-factory-github-write:${prompt.id}`;
+      const receipt = {
+        channel: "buzz",
+        actor: w.keys.owner.pubkey,
+        inboundNonce: `buzz-approval:${sentence.id}`,
+        runId: w.prepared.runId,
+        candidateSnapshotDigest: scope.value.candidateSnapshotDigest,
+        operation: scope.value.operation,
+        parameterDigest: scope.value.parameterDigest,
+        idempotencyKey,
+        approved: true,
+      };
+      const envelope = ownerApprovalPayload({
+        runId: w.prepared.runId,
+        candidateSnapshotDigest: scope.value.candidateSnapshotDigest,
+        operation: scope.value.operation,
+        parameters: scope.value.parameters,
+        idempotencyKey,
+        approved: true,
+      });
+      cp.db.run(`INSERT INTO inbound_messages (channel, nonce, actor, received_at, payload_json) VALUES (?, ?, ?, ?, ?)`, [
+        "buzz-owner-approval-answer",
+        prompt.id,
+        sentence.pubkey,
+        cp.clock.nowIso(),
+        JSON.stringify({
+          schema: "acp.buzz-owner-approval.answer.v1",
+          state: "ANSWERED",
+          promptEventId: prompt.id,
+          approvalEvent: sentence,
+          approved: true,
+          envelope,
+          receipt,
+          receiptDigest: digestOf(receipt),
+          inboundNonce: receipt.inboundNonce,
+          answeredAt: cp.clock.nowIso(),
+          outcomeEvent: null,
+          link: "REPLY",
+        }),
+      ]);
+      const verdict = w.module!.verifyBuzzApprovalEvidence(cp.db, receipt, { nowMs: cp.clock.now().getTime() });
+      expect(verdict).toMatchObject({ allowed: false, evidence: { refusal: "EVENT_NOT_STANDALONE" } });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("S10-R1-02 the bare token in the prompt's thread, padded only by white space, still mints once", async () => {
+    const { w, prompt } = await promptedWorld();
+    try {
+      await w.send(w.reply({ prompt, content: `\n acp-approve-write:${w.promptCode(prompt)}\t\n` }));
+      expect(w.counts()).toMatchObject({ answers: 1, receipts: 1, artifacts: 1 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("S10-R1-03 the owner route asks only for the owner key's events in the prompt's room, and delivers none as a message", async () => {
+    const { w, prompt } = await promptedWorld({ xRooms: [ROOM_X, ROOM_OTHER] });
+    try {
+      const filters = w.relay.requested.map((request) => request.filter);
+      expect(filters.filter((filter) => Array.isArray(filter["authors"])).at(-1)).toEqual({
+        kinds: [9],
+        authors: [w.keys.owner.pubkey],
+        "#h": [ROOM_X],
+        since: expect.any(Number),
+      });
+      // The mention REQ is the one it was: X's `#p`, no author.
+      expect(filters.filter((filter) => Array.isArray(filter["#p"])).every((filter) => !("authors" in filter))).toBe(true);
+      const receive = vi.spyOn(w.approvals!, "receive");
+      const parent = finalizeEvent({ kind: 9, created_at: prompt.created_at, tags: [["h", ROOM_X]], content: "CEO: status?" }, w.keys.ceo.secretKey) as BuzzMentionEvent;
+      await w.send(underMessage(w, parent, "looks good to me", { createdAt: prompt.created_at + 1 }));
+      await w.send(underMessage(w, parent, `acp-approve-write:${w.promptCode(prompt)}`, { author: w.keys.stranger, createdAt: prompt.created_at + 2 }));
+      expect(receive.mock.calls.map(([request]) => request.event.pubkey)).toEqual([w.keys.owner.pubkey]);
+      expect(w.counts()).toMatchObject({ ...NOTHING_MINTED, refusalRows: 0 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("S10-R1-04 an exact declaration beside a padded spelling of it links nothing: the noncanonical spelling is refused", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM, `${T3_GATE_ITEM} `] });
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w)).toEqual({ required: true, items: [T3_GATE_ITEM], satisfied: false });
+    } finally {
+      await w.close();
+    }
+  });
+});
+
+/* eslint-disable no-console -- S10-R2: the review witness RV2-CANDIDATE is kept as written, observation log included. */
+describe("RV2 bounded remediation checks", () => {
+  it("RV2-CANDIDATE an anchored receipt cannot satisfy a different current candidate", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      expect((await w.confirm()).reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(gateOf(w).satisfied).toBe(true);
+      const candidate = `sha256:${"9".repeat(64)}`;
+      cp.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [candidate, w.prepared.runId]);
+      const confirm = await w.prepared.runner.produceAndActivateApproved({
+        runId: w.prepared.runId, candidateSnapshotDigest: candidate, ceoSessionId: w.prepared.ceoSessionId,
+      });
+      console.log("RV2-CANDIDATE", JSON.stringify({ gate: gateOf(w), confirm, counts: w.counts() }));
+      expect(confirm.allowed).toBe(false);
+      expect(gateOf(w).satisfied).toBe(false);
+    } finally { await w.close(); }
+  });
+});
+/* eslint-enable no-console */
+
+describe("S10-R2-01: an anchored execution's approval admits only the candidate its anchor names", () => {
+  it("S10-R2-01 control: the same candidate, anchored and its ingress admission pruned, still holds for the predicate and the gate", async () => {
+    const { w } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      // A CLI approval, so the anchored receipt's own ingress admission is in the channel pruned below.
+      const approval = ownerApprovalFor(w.prepared);
+      expect(w.prepared.runner.recordOwnerApproval(w.prepared.runId, {
+        owner: "acme", visibility: "public", planDigest: w.prepared.planDigest,
+        approvedManifest: w.prepared.manifest, projectName: w.prepared.manifest.projectId,
+        receipt: approval.receipt,
+      }).allowed).toBe(true);
+      expect((await w.confirm()).reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      const scope = w.prepared.runner.approvalScopeOf(w.prepared.runId);
+      if (!scope.allowed) throw new Error(scope.message);
+      const anchored = w.prepared.runner.ownerApprovalNeed(w.prepared.runId, scope.value);
+      expect(anchored).toMatchObject({ need: "EXECUTION_ANCHORED", receipt: { channel: "cli", candidateSnapshotDigest: w.prepared.snapshotDigest } });
+      const receipt = anchored.receipt!;
+      expect(digestOf(receipt)).toBe(digestOf(approval.receipt));
+      expect(cp.ownerAuthority.assertApproval(receipt).allowed).toBe(true);
+      expect(gateOf(w).satisfied).toBe(true);
+      // Past the retention window, the next admission prunes the receipt's ingress admission.
+      w.prepared.harness.clock.advance(25 * 60 * 60 * 1000);
+      const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { cli: { allowedActors: [TEST_OWNER.actor] } });
+      expect(guard.admit({ channel: "cli", actor: TEST_OWNER.actor, nonce: "after-retention", payload: null }).allowed).toBe(true);
+      expect(cp.ownerAuthority.assertApproval(receipt).allowed).toBe(false);
+      expect(cp.runs.currentCandidate(w.prepared.runId)).toBe(w.prepared.snapshotDigest);
+      expect(w.prepared.runner.ownerApprovalHolds(w.prepared.runId, w.prepared.snapshotDigest)).toMatchObject({ allowed: true });
+      expect(gateOf(w).satisfied).toBe(true);
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("S10-R2-01 control: another candidate is refused by the predicate, the gate and CONFIRM; the anchor's own candidate holds again", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      expect((await w.confirm()).reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(gateOf(w).satisfied).toBe(true);
+      const other = `sha256:${"9".repeat(64)}`;
+      const refused = {
+        allowed: false,
+        evidence: { stage: "approval", refusal: "APPROVAL_NOT_THIS_CANDIDATE", anchoredCandidate: w.prepared.snapshotDigest, candidateSnapshotDigest: other },
+      };
+      // Asked about another candidate while the run's own is unmoved: the anchor's candidate decides, not the run's.
+      expect(w.prepared.runner.ownerApprovalHolds(w.prepared.runId, other)).toMatchObject(refused);
+      // The run's candidate moved by a raw edit, its PLAN kept: the gate reads unsatisfied and CONFIRM refuses.
+      cp.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [other, w.prepared.runId]);
+      expect(w.prepared.runner.ownerApprovalHolds(w.prepared.runId, other)).toMatchObject(refused);
+      expect(gateOf(w).satisfied).toBe(false);
+      expect(
+        await w.prepared.runner.produceAndActivateApproved({ runId: w.prepared.runId, candidateSnapshotDigest: other, ceoSessionId: w.prepared.ceoSessionId }),
+      ).toMatchObject({ allowed: false });
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+      // The anchor's own candidate restored: the same anchor holds again, so the candidate alone was refused.
+      cp.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [w.prepared.snapshotDigest, w.prepared.runId]);
+      expect(gateOf(w).satisfied).toBe(true);
+    } finally {
+      await w.close();
+    }
   });
 });

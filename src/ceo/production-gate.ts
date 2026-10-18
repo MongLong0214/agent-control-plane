@@ -8,6 +8,7 @@ import {
   isProjectlessBootstrap,
   sameBootstrapPlanBinding,
 } from "../bootstrap/bootstrap-plan.ts";
+import { REPO_FACTORY_GITHUB_WRITE_OPERATION, type RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
@@ -170,6 +171,20 @@ export type NotificationKind = (typeof NotificationKind)[keyof typeof Notificati
  */
 export const OWNER_DECISION_OPERATION = "owner_decision_submit";
 
+/**
+ * S10 (#246 defect b; CEO c07863f8) — the human-gate item that declares, by name, that the owner's T3
+ * approval of this run's Repo Factory GitHub writes is this item's owner decision. A task contract
+ * names it exactly. Any other item text, however it describes the same approval, keeps the
+ * OWNER_DECISION rule: a description is not a declaration, and text matching is not a link.
+ */
+export const REPO_FACTORY_GITHUB_WRITE_GATE_ITEM = `owner-approval:${REPO_FACTORY_GITHUB_WRITE_OPERATION}`;
+
+/**
+ * S10-R1-01 — the bootstrap runner's own read-only approval predicate (`ownerApprovalHolds`): the item
+ * linked to the T3 approval is decided by exactly the judgement C3 acts on, never by a second reader.
+ */
+export type RepoFactoryApprovalPort = Pick<RepoFactoryBootstrapRunner, "ownerApprovalHolds">;
+
 /** PRD §21 — the owner-only gate list. */
 export { HUMAN_GATE_TRIGGERS } from "./human-gate.ts";
 
@@ -205,6 +220,7 @@ export class ProductionGate {
   #bootstrapActivation: BootstrapActivationFinalizer | null = null;
   #sourceReadLeases: SourceReadLeasePort | null = null;
   #manifestGrants: ManifestGrantsPort | null = null;
+  #repoFactoryApprovals: RepoFactoryApprovalPort | null = null;
 
   constructor(
     private readonly db: Db,
@@ -230,6 +246,8 @@ export class ProductionGate {
     bootstrapCompletionChain?: BootstrapCompletionChainPort;
     sourceReadLeases?: SourceReadLeasePort;
     manifestGrants?: ManifestGrantsPort;
+    /** S10 — the predicate the T3-linked human-gate item is judged on; without it that item reads unsatisfied. */
+    repoFactoryApprovals?: RepoFactoryApprovalPort;
   }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
@@ -238,6 +256,7 @@ export class ProductionGate {
     if (ports.bootstrapCompletionChain) this.#bootstrapCompletionChain = ports.bootstrapCompletionChain;
     if (ports.sourceReadLeases) this.#sourceReadLeases = ports.sourceReadLeases;
     if (ports.manifestGrants) this.#manifestGrants = ports.manifestGrants;
+    if (ports.repoFactoryApprovals) this.#repoFactoryApprovals = ports.repoFactoryApprovals;
   }
 
   /**
@@ -1365,7 +1384,7 @@ export class ProductionGate {
         });
   }
 
-  private humanGateDefinition(runId: string): { required: boolean; items: string[]; digest: string } {
+  private humanGateDefinition(runId: string): { required: boolean; items: string[]; digest: string; linksT3: boolean } {
     const run = this.runs.get(runId);
     const contract = this.artifacts.latest<{ humanGate?: unknown; scope?: unknown }>(
       runId,
@@ -1385,7 +1404,13 @@ export class ProductionGate {
           declaredItems,
         })
       : { required: declaredItems.length > 0, items: declaredItems };
-    return { ...definition, digest: digestOf(definition.items) };
+    // S10-R1-04 — the link is judged on the declared values as stored, before `deriveHumanGate` trims
+    // them: no declared value is a noncanonical spelling of the item, so the item `humanGateStatus`
+    // finds after the trim was declared exactly. The digest is unchanged.
+    const linksT3 = declaredItems.every(
+      (item) => item === REPO_FACTORY_GITHUB_WRITE_GATE_ITEM || item.trim() !== REPO_FACTORY_GITHUB_WRITE_GATE_ITEM,
+    );
+    return { ...definition, digest: digestOf(definition.items), linksT3 };
   }
 
   /**
@@ -1747,7 +1772,17 @@ export class ProductionGate {
       latestDecision.set(decision.item, decision.approved);
     }
 
-    return { required: true, items, satisfied: items.every((item) => latestDecision.get(item) === true) };
+    // S10 — an item's own OWNER_DECISION, approval or refusal, decides it as before, so an explicit
+    // refusal is never overridden. Only the item the contract declares, exactly, as the T3 link
+    // (S10-R1-04: its raw value), with no decision of its own, is decided by the owner's T3 approval,
+    // and that by the bootstrap runner's own predicate (S10-R1-01); every other item still needs its
+    // OWNER_DECISION.
+    const decided = (item: string): boolean =>
+      latestDecision.get(item) ??
+      (item === REPO_FACTORY_GITHUB_WRITE_GATE_ITEM &&
+        gate.linksT3 &&
+        this.#repoFactoryApprovals?.ownerApprovalHolds(runId, currentCandidate).allowed === true);
+    return { required: true, items, satisfied: items.every(decided) };
   }
 
   /**

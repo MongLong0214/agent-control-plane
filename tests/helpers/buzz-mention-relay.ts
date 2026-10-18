@@ -55,7 +55,10 @@ export interface RelayConnection {
   authenticatedAs: string | null;
   closed: boolean;
   readonly handlers: BuzzRelaySocketHandlers;
+  /** Each open subscription's first filter, as the witnesses read it. */
   readonly subscriptions: Map<string, Record<string, unknown>>;
+  /** NIP-01: a `REQ` may carry several filters, and an event matching any of them is sent once. */
+  readonly filterSets: Map<string, readonly Record<string, unknown>[]>;
 }
 
 const tagValues = (event: BuzzMentionEvent, name: string): string[] =>
@@ -64,6 +67,9 @@ const tagValues = (event: BuzzMentionEvent, name: string): string[] =>
 const matches = (filter: Record<string, unknown>, event: BuzzMentionEvent): boolean => {
   const kinds = filter["kinds"] as readonly number[] | undefined;
   if (kinds && !kinds.includes(event.kind)) return false;
+  // NIP-01 `authors`, as the owner-approval route asks for the owner keys' events (S10-R1-03).
+  const authors = filter["authors"] as readonly string[] | undefined;
+  if (authors && !authors.includes(event.pubkey)) return false;
   for (const name of ["p", "h", "e"]) {
     const wanted = filter[`#${name}`] as readonly string[] | undefined;
     if (wanted && !tagValues(event, name).some((value) => wanted.includes(value))) return false;
@@ -86,7 +92,7 @@ export const storingRelay = (options: StoringRelayOptions = {}): StoringRelay =>
   };
 
   const factory: BuzzRelaySocketFactory = (_url, handlers) => {
-    const connection: RelayConnection = { authenticatedAs: null, closed: false, handlers, subscriptions: new Map() };
+    const connection: RelayConnection = { authenticatedAs: null, closed: false, handlers, subscriptions: new Map(), filterSets: new Map() };
     connections.push(connection);
     queueMicrotask(() => say(connection, ["AUTH", `challenge-${connections.length}`]));
     return {
@@ -100,6 +106,7 @@ export const storingRelay = (options: StoringRelayOptions = {}): StoringRelay =>
           queueMicrotask(() => say(connection, ["OK", auth.id, true, ""]));
         } else if (frame[0] === "CLOSE") {
           connection.subscriptions.delete(frame[1] as string);
+          connection.filterSets.delete(frame[1] as string);
         } else if (frame[0] === "EVENT" && options.acceptPublishes === true) {
           const event = frame[1] as BuzzMentionEvent;
           published.push(event);
@@ -108,10 +115,11 @@ export const storingRelay = (options: StoringRelayOptions = {}): StoringRelay =>
           if (!duplicate) relayPublish(event);
         } else if (frame[0] === "REQ") {
           const id = frame[1] as string;
-          const filter = frame[2] as Record<string, unknown>;
-          requested.push({ pubkey: ((filter["#p"] as string[]) ?? [])[0] ?? "", filter });
-          connection.subscriptions.set(id, filter);
-          const backlog = stored.filter((event) => matches(filter, event));
+          const filters = frame.slice(2) as Record<string, unknown>[];
+          for (const filter of filters) requested.push({ pubkey: ((filter["#p"] as string[]) ?? [])[0] ?? "", filter });
+          connection.subscriptions.set(id, filters[0] ?? {});
+          connection.filterSets.set(id, filters);
+          const backlog = stored.filter((event) => filters.some((filter) => matches(filter, event)));
           queueMicrotask(() => {
             for (const event of backlog) say(connection, ["EVENT", id, event]);
             say(connection, ["EOSE", id]);
@@ -121,6 +129,7 @@ export const storingRelay = (options: StoringRelayOptions = {}): StoringRelay =>
       close: () => {
         connection.closed = true;
         connection.subscriptions.clear();
+        connection.filterSets.clear();
       },
     };
   };
@@ -128,8 +137,8 @@ export const storingRelay = (options: StoringRelayOptions = {}): StoringRelay =>
   function relayPublish(event: BuzzMentionEvent): void {
     stored.push(event);
     for (const connection of connections) {
-      for (const [id, filter] of connection.subscriptions) {
-        if (matches(filter, event)) say(connection, ["EVENT", id, event]);
+      for (const [id, filters] of connection.filterSets) {
+        if (filters.some((filter) => matches(filter, event))) say(connection, ["EVENT", id, event]);
       }
     }
   }
