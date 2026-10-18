@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ATTACH_EXIT, runAdoptedCeoAttachRelay } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -38,6 +38,7 @@ import {
   type AdoptedCeoFixture,
 } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { clearSessionMessagingEnv, inheritedSessionMessagingNames, SESSION_MESSAGING_PREFIX } from "../helpers/session-messaging-env.ts";
 
 /**
  * The adopted CEO tool socket end to end (#1037): the real kernel-peer listener, the real
@@ -75,6 +76,27 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 afterAll(cleanupTempDirs);
+
+/**
+ * R1154-01 — a variable the parent environment hands in under a suffix no list names. Planted in the
+ * first hoisted call, as an inherited one would be, so the hoisted clear after it has to remove it.
+ */
+const inheritedUnknown = vi.hoisted(() => {
+  const name = `CLAUDE_CODE_MESSAGING_R1154_ADOPTEDCEO_${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+  process.env[name] = "inherited-from-the-parent";
+  return name;
+});
+/**
+ * R1154-01 — every CLAUDE_CODE_MESSAGING_* variable is removed before this file's imports evaluate:
+ * vi.hoisted runs ahead of them, where a module-level call would run after. Inlined because a hoisted
+ * body cannot use an import; `clearSessionMessagingEnv` repeats it before each case.
+ */
+vi.hoisted(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
+  }
+});
+beforeEach(() => clearSessionMessagingEnv());
 
 /** `/tmp` directly: a per-user TMPDIR leaves too little of Darwin's 104-byte `sun_path`. */
 const stateDir = (): string => {
@@ -358,4 +380,10 @@ describe("the adopted CEO tool socket, through the relay", () => {
     expect(r.out()).toBe("");
     expect(snapshot(fixture.h)).toEqual(before);
   });
+});
+
+it("R1154-01: no relay here inherits a CLAUDE_CODE_MESSAGING_* variable, whatever its suffix", () => {
+  expect(inheritedUnknown.startsWith(SESSION_MESSAGING_PREFIX)).toBe(true);
+  // Neither this process's environment, which an in-process relay reads, nor a child that inherits it.
+  expect(inheritedSessionMessagingNames()).toEqual({ here: [], child: [] });
 });

@@ -262,9 +262,10 @@ export const ROLE_WAKE_TOKEN = "ACP-ROLE-WAKE";
 
 /**
  * #1103 — why a wake was sent, recorded by the daemon and never put in the frame (see
- * `ROLE_WAKE_TOKEN`). `registration` is the unconditional wake a registration sends whatever is
- * queued, `mention` a verified mention's, and a caller that knows its trigger passes it (the daemon's
- * `wakeRoleHolder` passes its cause's kind: `in-band dispatch`, `owner message`).
+ * `ROLE_WAKE_TOKEN`). `registration` is the wake a registration sends (where `holderHasWork` is
+ * configured, a registration wake with no confirmed work is skipped), `mention` a verified mention's,
+ * and a caller that knows its trigger passes it (the daemon's `wakeRoleHolder` passes its cause's
+ * kind: `in-band dispatch`, `owner message`).
  */
 export const ROLE_WAKE_CAUSE = {
   REGISTRATION: "registration",
@@ -530,6 +531,13 @@ export class RoleConversationPort {
    * are sent as before and recorded nowhere.
    */
   readonly #onWakeWritten: ((wake: WrittenRoleWake) => void) | null;
+  /**
+   * FIX-ROLE-WAKE — whether the holder has anything its wake would send it to read. Asked only by
+   * a registration's wake: a registration wake with no confirmed work (an answer of exactly
+   * `false`) is skipped, and one whose lookup throws is sent. Absent, a registration wakes
+   * unconditionally, as before.
+   */
+  readonly #holderHasWork: ((holder: HolderIdentity) => boolean) | null;
 
   constructor(
     role: Role,
@@ -540,12 +548,14 @@ export class RoleConversationPort {
       ownerMessages?: OwnerMessageLedger;
       serializeWake?: <T>(body: () => T) => T;
       onWakeWritten?: (wake: WrittenRoleWake) => void;
+      holderHasWork?: (holder: HolderIdentity) => boolean;
     } = {},
   ) {
     this.#role = role;
     this.#bindings = bindings;
     this.#serializeWake = options.serializeWake ?? null;
     this.#onWakeWritten = options.onWakeWritten ?? null;
+    this.#holderHasWork = options.holderHasWork ?? null;
     this.#ownerMessages = options.ownerMessages ?? null;
     this.#endpointDir = options.endpointDir === undefined ? null : resolvePath(options.endpointDir);
     this.#wakeTimeoutMs = options.wakeTimeoutMs ?? DEFAULT_ROLE_WAKE_TIMEOUT_MS;
@@ -983,23 +993,51 @@ export class RoleConversationPort {
     }
     const registered = owned.map(([roleKey]) => roleKey);
 
-    // §3 — one constant wake per registered slot, unconditionally, and this is what makes the
-    // whole path pollerless. A message admitted while nobody was attached is durable and PENDING,
-    // and the wake that would have nudged its holder was refused for want of an endpoint; without
-    // this line the only thing that would ever move it is another owner message. Sending it
-    // unconditionally — rather than only when something is known to be queued — means this port
-    // never has to ask the ledger a question, and an empty queue costs one refused connect.
+    // §3 — one constant wake per registered slot, and this is what makes the whole path
+    // pollerless. A message admitted while nobody was attached is durable and PENDING, and the
+    // wake that would have nudged its holder was refused for want of an endpoint; without this
+    // line the only thing that would ever move it is another owner message. A port built without
+    // `holderHasWork` sends it unconditionally and never asks the ledger a question; the daemon's
+    // port asks (FIX-ROLE-WAKE, below).
     //
     // The outcome is deliberately discarded. Registration succeeded on the strength of the checks
     // above; a wake that does not land says nothing about whether the endpoint is registered, and
     // folding it into this decision would make a correct registration look refused.
     //
     // #1103 — this is the wake a CTO sees at a daemon start (its relay reattaches and registers
-    // again) and after any registration, with both queues empty when nothing was waiting. It is
-    // kept, and recorded with the cause `registration` (`onWakeWritten`), so such a wake is
-    // attributable rather than unexplained.
-    for (const roleKey of registered) await this.wake(roleKey, undefined, ROLE_WAKE_CAUSE.REGISTRATION);
+    // again) and after any registration, recorded with the cause `registration` (`onWakeWritten`).
+    //
+    // FIX-ROLE-WAKE — with `holderHasWork` configured, a registration wake with no confirmed work is
+    // skipped: only an answer of exactly `false` skips it, and a lookup that throws, or a holder
+    // this port cannot derive, wakes as before. The rule is the same for a new registration and for
+    // a relay's replay after a daemon restart, which both arrive here. Dispatch and owner-message
+    // wakes do not pass through this check. The check runs after the endpoint is set above, so a
+    // message admitted after it is woken for by its own path; one admitted before it is seen here.
+    //
+    // Limit (non-blocking): this wake was also the first knock on a newly registered endpoint, so a
+    // registration whose endpoint refuses connections and that has no confirmed work is not reported
+    // as `registered-endpoint-refused-the-wake` at registration; that finding waits for the first
+    // real wake to the endpoint to fail.
+    for (const roleKey of registered) {
+      if (!this.#registrationFindsWork(server, roleKey)) continue;
+      await this.wake(roleKey, undefined, ROLE_WAKE_CAUSE.REGISTRATION);
+    }
     return allow(ReasonCode.OK, registered);
+  }
+
+  /** Whether a registration's wake for `roleKey` has anything to point at; see `#holderHasWork`. */
+  #registrationFindsWork(server: McpServer, roleKey: string): boolean {
+    const hasWork = this.#holderHasWork;
+    if (hasWork === null) return true;
+    // A holder this port can no longer derive is left to `wake`, which refuses it as before.
+    const holder = this.#holderFor(server, roleKey);
+    if (!holder.allowed) return true;
+    try {
+      // Skipped only on a confirmed `false`.
+      return hasWork(holder.value) !== false;
+    } catch {
+      return true;
+    }
   }
 
   /**

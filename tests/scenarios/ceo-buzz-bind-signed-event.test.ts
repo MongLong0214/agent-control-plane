@@ -4,7 +4,7 @@ import { PassThrough } from "node:stream";
 
 import { npubEncode } from "nostr-tools/nip19";
 import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey } from "nostr-tools/pure";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   BUZZ_SUBSCRIBER_CONFIG_FILENAME,
@@ -39,6 +39,7 @@ import { MessageKind } from "../../src/outbox/envelope.ts";
 import { adoptedFixture, CEO, DIGEST, GATEWAY, LIVE, type AdoptedCeoFixture } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest, registerFixtureProject, type Harness } from "../helpers/harness.ts";
+import { clearSessionMessagingEnv, inheritedSessionMessagingNames, SESSION_MESSAGING_PREFIX } from "../helpers/session-messaging-env.ts";
 
 /**
  * The adopted Hermes CEO binds its Buzz channel identity by proving it holds that identity's key.
@@ -94,6 +95,27 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 afterAll(cleanupTempDirs);
+
+/**
+ * R1154-01 — a variable the parent environment hands in under a suffix no list names. Planted in the
+ * first hoisted call, as an inherited one would be, so the hoisted clear after it has to remove it.
+ */
+const inheritedUnknown = vi.hoisted(() => {
+  const name = `CLAUDE_CODE_MESSAGING_R1154_BUZZBIND_${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+  process.env[name] = "inherited-from-the-parent";
+  return name;
+});
+/**
+ * R1154-01 — every CLAUDE_CODE_MESSAGING_* variable is removed before this file's imports evaluate:
+ * vi.hoisted runs ahead of them, where a module-level call would run after. Inlined because a hoisted
+ * body cannot use an import; `clearSessionMessagingEnv` repeats it before each case.
+ */
+vi.hoisted(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
+  }
+});
+beforeEach(() => clearSessionMessagingEnv());
 
 const settles = async (exit: Promise<number>, budgetMs = 10_000): Promise<number | "did-not-settle"> => {
   let timer: NodeJS.Timeout | undefined;
@@ -1163,4 +1185,10 @@ describe("review ceobuzz-r1: the recovery boundary and the recovery record", () 
     expect(f.boundRows()).toBe(0);
     expect(f.refusalRows()).toEqual([expect.objectContaining({ cause: "write-refused" })]);
   });
+});
+
+it("R1154-01: no relay here inherits a CLAUDE_CODE_MESSAGING_* variable, whatever its suffix", () => {
+  expect(inheritedUnknown.startsWith(SESSION_MESSAGING_PREFIX)).toBe(true);
+  // Neither this process's environment, which an in-process relay reads, nor a child that inherits it.
+  expect(inheritedSessionMessagingNames()).toEqual({ here: [], child: [] });
 });

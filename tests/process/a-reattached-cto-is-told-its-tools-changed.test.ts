@@ -31,6 +31,7 @@ import {
   type RecordedWire,
   type RecordingMcpClient,
 } from "../helpers/recording-mcp-client.ts";
+import { clearSessionMessagingEnv, inheritedSessionMessagingNames, SESSION_MESSAGING_PREFIX } from "../helpers/session-messaging-env.ts";
 
 /**
  * A canonical CTO's relay carries its client across a daemon restart by replaying `initialize`,
@@ -57,11 +58,27 @@ const POLICY: Partial<ReattachPolicy> = { maxWaitMs: 8_000, initialDelayMs: 20, 
 const qualified = WAKE_TRANSPORT_QUALIFIED_CLIENTS[0]!;
 const RELAY_REATTACHING_ERROR_CODE = -32001;
 
-const MESSAGING_ENV = ["CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"] as const;
-const clearMessagingEnv = (): void => {
-  for (const name of MESSAGING_ENV) delete process.env[name];
-};
-clearMessagingEnv();
+/** Every CLAUDE_CODE_MESSAGING_* variable, not only the socket and token the relay reads (R1154-01). */
+const clearMessagingEnv = (): void => clearSessionMessagingEnv();
+/**
+ * R1154-01 — a variable the parent environment hands in under a suffix no list names. Set before this
+ * file's own module code runs, as an inherited one would be; the clear below has to remove it.
+ */
+const inheritedUnknown = vi.hoisted(() => {
+  const name = `CLAUDE_CODE_MESSAGING_R1154_REATTACH_${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+  process.env[name] = "inherited-from-the-parent";
+  return name;
+});
+/**
+ * R1154-01 — every CLAUDE_CODE_MESSAGING_* variable is removed before this file's imports evaluate:
+ * vi.hoisted runs ahead of them, where a module-level call would run after. Inlined because a hoisted
+ * body cannot use an import; `clearSessionMessagingEnv` repeats it before each case.
+ */
+vi.hoisted(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
+  }
+});
 beforeEach(clearMessagingEnv);
 
 const until = async (condition: () => boolean, budgetMs = 10_000): Promise<boolean> => {
@@ -713,4 +730,10 @@ describe("withheld registration answers", () => {
       await r.finish();
     }, 60_000);
   }
+});
+
+it("R1154-01: no relay here inherits a CLAUDE_CODE_MESSAGING_* variable, whatever its suffix", () => {
+  expect(inheritedUnknown.startsWith(SESSION_MESSAGING_PREFIX)).toBe(true);
+  // Neither this process's environment, which an in-process relay reads, nor a child that inherits it.
+  expect(inheritedSessionMessagingNames()).toEqual({ here: [], child: [] });
 });

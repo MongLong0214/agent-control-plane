@@ -956,6 +956,8 @@ export const startLocalMcpListeners = async (
       // can be attributed (a registration's, at a daemon start or a re-registration).
       onWakeWritten: ({ roleKey, cause }) =>
         cp.audit.record({ kind: "ROLE_WAKE_SENT", reasonCode: ReasonCode.OK, roleKey, evidence: { cause } }),
+      // FIX-ROLE-WAKE — a registration wake with no confirmed work is skipped; a failed lookup wakes.
+      holderHasWork: (holder) => cp.outbox.hasWorkForHolder(holder),
     },
   );
   // A wake caused by a verified mention is gated on that mention's identity, role and room, judged by

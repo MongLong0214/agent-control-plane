@@ -1266,8 +1266,9 @@ const wakeRefusalReason = (message: RelayedMessage): string => {
  *     and the proxy's forward target is the environment's socket whatever is registered. Once per admission —
  *     after the client's `notifications/initialized`, and in each restore — the relay registers
  *     the proxy itself unless the client registered another endpoint, so a wake reaches a session
- *     whose model never called the tool. The daemon wakes on every registration it accepts, so
- *     that registration is also the first wake through the proxy.
+ *     whose model never called the tool. The daemon wakes on a registration it accepts unless the
+ *     wake has no confirmed work (a registration wake with no confirmed work is skipped), so that
+ *     registration is otherwise the first wake through the proxy.
  *   - **Once its proxy listens, the client's requests leave under ids of the relay's** (review
  *     PR1057-R2). The relay's own requests — the restore's replays and the proxy's registration,
  *     which goes out on a live link alongside the client's traffic — share the connection with the

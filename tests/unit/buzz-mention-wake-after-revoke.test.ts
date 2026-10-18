@@ -159,9 +159,14 @@ const start = async (options: { production?: boolean; serializeWake?: <T>(body: 
   const endpoint = await socketAt(join(dir, "wake.sock"));
   const dialledBefore = wakes.dialled.length;
   const registration = conversation.registerEndpoint(server, join(dir, "wake.sock"));
-  await dialled(dialledBefore + 1);
-  wakes.dialled.at(-1)!.succeed();
+  // On the daemon-built port a registration wake with no confirmed work is skipped (FIX-ROLE-WAKE),
+  // and nothing is queued yet; a port this fixture builds itself wakes as before.
+  if (listeners === null) {
+    await dialled(dialledBefore + 1);
+    wakes.dialled.at(-1)!.succeed();
+  }
   expect((await registration).allowed).toBe(true);
+  expect(wakes.dialled).toHaveLength(dialledBefore + (listeners === null ? 1 : 0));
 
   return {
     h,

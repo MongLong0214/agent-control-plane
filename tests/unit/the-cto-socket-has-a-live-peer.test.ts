@@ -990,19 +990,15 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       const registered = await peer.callTool("role_wake_endpoint_register", { endpoint: endpoint.path });
       expect(registered.ok).toBe(true);
 
-      // §3's drain: a successful registration sends **one constant wake unconditionally**, before
-      // anything asks whether something is queued. That is what empties a queue that filled while
-      // nobody was attached, and it is why this path needs no poller and no retry timer. Waited on
-      // rather than asserted immediately, because it is sent inside the tool call's own turn.
-      await until(
-        () => endpoint.received.length === 1,
-        "the unconditional wake a successful registration sends",
-      );
+      // §3's drain, narrowed by FIX-ROLE-WAKE: on the daemon-built port a registration wake with no
+      // confirmed work is skipped; one with work is what empties a queue that filled while nobody
+      // was attached. Nothing is queued here, so this registration wake is skipped.
+      expect(endpoint.received).toEqual([]);
 
       const woken = await listeners.ctoConversation.wake(roleKey);
       expect(woken.reasonCode).toBe(ReasonCode.OK);
       expect(woken.allowed).toBe(true);
-      await until(() => endpoint.received.length === 2, "the wake to land on the peer's endpoint");
+      await until(() => endpoint.received.length === 1, "the wake to land on the peer's endpoint");
       // **The byte shape itself**, not merely that something was written. This transport is a
       // version-pinned local runtime contract and the frame is part of that contract: the runtime
       // accepts this envelope because it is the shape it parses, so a row that accepted any bytes
@@ -1011,7 +1007,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
         type: "user",
         message: { role: "user", content: "ACP-ROLE-WAKE" },
       })}\n`;
-      expect(endpoint.received).toEqual([wakeFrame, wakeFrame]);
+      expect(endpoint.received).toEqual([wakeFrame]);
       expect(endpoint.received[0]).toBe(ROLE_WAKE_FRAME);
       // And the whole of what it says. Anything else in here — a nonce, a sender, an event id, a
       // count — would make the endpoint a disclosure channel defended only by a file mode, and
@@ -1033,7 +1029,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       const afterClose = await listeners.ctoConversation.wake(roleKey);
       expect(afterClose.allowed).toBe(false);
       expect(afterClose.reasonCode).toBe(ReasonCode.ROLE_PEER_ABSENT);
-      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME, ROLE_WAKE_FRAME]);
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
 
       // The half a durable endpoint would get wrong, and the reason a table was refused for this.
       // A successor connection for the same role, from the same session, is the current holder by
@@ -1048,7 +1044,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       const inherited = await listeners.ctoConversation.wake(roleKey);
       expect(inherited.allowed).toBe(false);
       expect(inherited.reasonCode).toBe(ReasonCode.ROLE_PEER_UNSUPPORTED);
-      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME, ROLE_WAKE_FRAME]);
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
     } finally {
       await peer.close();
       if (successor) await successor.close();

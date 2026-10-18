@@ -11,6 +11,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startDaemonMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../../src/domain/types.ts";
+import { MessageKind } from "../../src/outbox/envelope.ts";
 import {
   ROLE_WAKE_FRAME,
   RoleConversationPort,
@@ -367,8 +368,20 @@ describe("the daemon reports a binding that cannot receive wakes", () => {
     const endpointPath = join(stateDir, `cto-${label}.wake.sock`);
     // "abandoned" is a socket file whose listener is gone: every check the daemon makes before it
     // connects passes, and the connect is refused. Registration succeeds either way -- it is
-    // decided by those checks -- and what differs is whether the wake it sends lands.
-    if (register === "abandoned") await abandonSocket(endpointPath);
+    // decided by those checks -- and what differs is whether the wake it sends lands. A registration
+    // wake with no confirmed work is skipped (FIX-ROLE-WAKE), so an owner message waits.
+    if (register === "abandoned") {
+      await abandonSocket(endpointPath);
+      valueOf(harness.cp.outbox.enqueue({
+        idempotencyKey: `owner-message:wake-set-${label}`,
+        roleKey,
+        bindingGeneration: harness.cp.bindings.active(roleKey)!.bindingGeneration,
+        targetSessionId: session.sessionId,
+        runId: null,
+        kind: MessageKind.OWNER_MESSAGE,
+        payload: { sourceChannel: "buzz", sourceNonce: `wake-set-${label}`, sourcePayloadDigest: "x" },
+      }));
+    }
     const endpoint = register === true ? await listeningSocket(endpointPath) : null;
     if (register !== false) {
       const registered = await callTool(socket, "role_wake_endpoint_register", { endpoint: endpointPath });

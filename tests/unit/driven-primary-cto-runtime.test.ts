@@ -1306,8 +1306,10 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
           await vi.waitFor(() => expect(listeners.ctoConversation.connected(binding.roleKey)).toBe(true));
           const registered = await peer.callTool("role_wake_endpoint_register", { endpoint: endpoint.path });
           expect(registered["ok"]).toBe(true);
-          await vi.waitFor(() => expect(endpoint.connections()).toBeGreaterThan(0));
+          // No work is confirmed for the holder, so the registration wake is skipped
+          // (FIX-ROLE-WAKE); the control below is what shows the endpoint is live.
           const settled = endpoint.connections();
+          expect(settled).toBe(0);
 
           cp.audit.record({
             kind: DRIVEN_PRIMARY_CTO_SPAWN_RECORD,

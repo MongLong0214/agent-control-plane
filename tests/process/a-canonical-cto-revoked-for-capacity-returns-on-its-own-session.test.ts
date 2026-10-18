@@ -7,7 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ReadBuffer, serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CtoBindingDelegation } from "../../src/ceo/cto-binding-delegation.ts";
 import { CtoDelegatedBinding } from "../../src/daemon/cto-delegated-binding.ts";
@@ -54,6 +54,7 @@ import type { ProcessLineageReader } from "../../src/session/runtime-lineage.ts"
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
+import { clearSessionMessagingEnv, inheritedSessionMessagingNames, SESSION_MESSAGING_PREFIX } from "../helpers/session-messaging-env.ts";
 
 /**
  * #1106 — a canonical PRIMARY_CTO that continuity revoked only for capacity comes back by itself
@@ -169,6 +170,27 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 afterAll(cleanupTempDirs);
+
+/**
+ * R1154-01 — a variable the parent environment hands in under a suffix no list names. Planted in the
+ * first hoisted call, as an inherited one would be, so the hoisted clear after it has to remove it.
+ */
+const inheritedUnknown = vi.hoisted(() => {
+  const name = `CLAUDE_CODE_MESSAGING_R1154_CAPACITY_${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+  process.env[name] = "inherited-from-the-parent";
+  return name;
+});
+/**
+ * R1154-01 — every CLAUDE_CODE_MESSAGING_* variable is removed before this file's imports evaluate:
+ * vi.hoisted runs ahead of them, where a module-level call would run after. Inlined because a hoisted
+ * body cannot use an import; `clearSessionMessagingEnv` repeats it before each case.
+ */
+vi.hoisted(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
+  }
+});
+beforeEach(() => clearSessionMessagingEnv());
 
 const exhausted = (clock: ManualClock): CapacityReading => ({
   provider: "claude",
@@ -1201,4 +1223,10 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
     expect(relay.code()).toBeNull();
     expect(relay.err()).toBe("");
   });
+});
+
+it("R1154-01: no relay here inherits a CLAUDE_CODE_MESSAGING_* variable, whatever its suffix", () => {
+  expect(inheritedUnknown.startsWith(SESSION_MESSAGING_PREFIX)).toBe(true);
+  // Neither this process's environment, which an in-process relay reads, nor a child that inherits it.
+  expect(inheritedSessionMessagingNames()).toEqual({ here: [], child: [] });
 });

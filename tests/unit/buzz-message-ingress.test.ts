@@ -1558,9 +1558,9 @@ describe("the daemon's Buzz message ingress", () => {
         endpoint: endpoint.path,
       });
       expect(registered.ok, registered.message).toBe(true);
-      // Registration's own unconditional drain, before the message exists. Counted here so the
-      // wake this row is about is the *next* one rather than this one.
-      await until(() => endpoint.received.length === 1, "the registration's unconditional wake");
+      // A registration wake with no confirmed work is skipped (FIX-ROLE-WAKE), and the message does
+      // not exist yet, so the wake this row is about is the first one.
+      expect(endpoint.received).toEqual([]);
 
       const event = finalizeEvent(
         {
@@ -1614,8 +1614,8 @@ describe("the daemon's Buzz message ingress", () => {
 
       // The exact wake, and nothing else on the endpoint. The frame is a version-pinned local
       // contract; a row that accepted any bytes would pass against a wake no real client reads.
-      await until(() => endpoint.received.length === 2, "the wake this message's admission sends");
-      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME, ROLE_WAKE_FRAME]);
+      await until(() => endpoint.received.length === 1, "the wake this message's admission sends");
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
 
       // The holder takes it, once, over its own authenticated connection.
       const claimed = await peer.callTool("role_owner_message_claim", { roleKey });
@@ -1653,7 +1653,7 @@ describe("the daemon's Buzz message ingress", () => {
         row.message_id,
       ]);
       expect(harness.cp.outbox.get(row.message_id)?.status).toBe("ACKED");
-      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME, ROLE_WAKE_FRAME]);
+      expect(endpoint.received).toEqual([ROLE_WAKE_FRAME]);
     } finally {
       subscriber.close();
       await ingress.close();

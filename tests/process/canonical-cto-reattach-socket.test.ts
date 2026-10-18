@@ -3,7 +3,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ATTACH_EXIT, runAttachRelay, runAttachRelayCommand } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -22,6 +22,7 @@ import {
   type CanonicalCtoFixture,
 } from "../helpers/canonical-cto-reattach.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { clearSessionMessagingEnv } from "../helpers/session-messaging-env.ts";
 
 /**
  * The canonical CTO's reattach end to end (#1037): the real kernel-peer listener, the real
@@ -30,6 +31,25 @@ import { cleanupTempDirs } from "../helpers/fixtures.ts";
  * reaches it. The only stated facts are the process tree above this test process — which the
  * kernel reports as the peer, since the relay runs in-process.
  */
+
+/**
+ * The relay's CLI entry reads the session's messaging socket and token from the environment, and a
+ * run from inside a Claude Code session inherits that session's real ones: the relay would open its
+ * wake proxy beside the live session's socket, outside this file's scratch roots. Every
+ * CLAUDE_CODE_MESSAGING_* variable is cleared before any relay runs (`clearSessionMessagingEnv`), so
+ * the only socket directories a run uses are the mkdtemp roots below.
+ */
+/**
+ * R1154-01 — every CLAUDE_CODE_MESSAGING_* variable is removed before this file's imports evaluate:
+ * vi.hoisted runs ahead of them, where a module-level call would run after. Inlined because a hoisted
+ * body cannot use an import; `clearSessionMessagingEnv` repeats it before each case.
+ */
+vi.hoisted(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
+  }
+});
+beforeEach(() => clearSessionMessagingEnv());
 
 const TOKEN = "fixture-mcp-token";
 const roots: string[] = [];
