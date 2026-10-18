@@ -5,17 +5,24 @@ import { isAcpError } from "../../src/core/errors.ts";
 import { Db } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
 import { privateStatePath, v11Image } from "./released-v44-schema.ts";
+import { releasedV13Differences, releasedV13Image } from "./released-v13-schema.ts";
 
 /**
- * V46-R1-02. A database at an earlier version as the released chain leaves it, never one taken back
- * from a newer database.
+ * V46-R1-02. A database at an earlier version as the release left it, never one taken back from a
+ * newer database.
  *
  * Taking a newer database back keeps whatever the builder forgets to remove: measured at 404422d5, the
  * v38/v39 images kept `bootstrap_applications` and both manifest-grant tables, the v42 image both grant
- * tables, and the v13 image all nine v46 guards. Here the checked-in v11 fixture (prior-release SQL,
- * never this build's schema) runs the released steps v12..`version` through this build's migrator,
+ * tables, and the v13 image all nine v46 guards. From v38 on, the checked-in v11 fixture (prior-release
+ * SQL, never this build's schema) runs the released steps v12..`version` through this build's migrator,
  * which stops there. The image holds only what those steps install, and its ledger holds the receipts
  * of the steps it took rather than a relabelled bootstrap row.
+ *
+ * V46-R1-02, review r2. Below v38 this chain is not known to be the release. Its v12 step replays the frozen
+ * schema-v37.sql, and at v13 that left 16 tables, 7 indexes and 58 triggers v13 never had (compared with
+ * 842830c5). Review r2 compared the v38, v39 and v42 images with their releases and found them equal.
+ * v13 is built from the v13 release's own schema (`released-v13-schema.ts`) and compared with that
+ * release exactly. No other version below v38 has a released image here.
  */
 
 const STOP = (version: number): string => `the released chain image stops at v${version}`;
@@ -52,11 +59,23 @@ const chainBytes = (version: number): Buffer => {
   return bytes;
 };
 
-/** Writes the released chain's image at `version` to `path`. Not approved. */
-export const releasedChainImage = (path: string, version: number): string => {
+/**
+ * This build's chain from the v11 fixture, stopped at `version`. It is the released image at v38, v39
+ * and v42, as compared by review r2. At v13 it is not, and it is exported only for the check that refuses it.
+ */
+export const todaysChainImage = (path: string, version: number): string => {
   writeFileSync(path, chainBytes(version), { mode: 0o600 });
   chmodSync(path, 0o600);
   return path;
+};
+
+/** Writes the released image at `version` to `path`. Not approved. */
+export const releasedChainImage = (path: string, version: number): string => {
+  if (version === 13) return releasedV13Image(path);
+  if (version < 38) {
+    throw new Error(`no released v${version} image: below v38 this chain replays schema-v37.sql and is not compared with v${version}`);
+  }
+  return todaysChainImage(path, version);
 };
 
 /**
@@ -111,9 +130,10 @@ export const carryRows = (source: string, target: string): void => {
  * Objects the released chain installs after a version, named here rather than read from the code under
  * test. An image of `version` holds none of the objects of a later version, nor a later version's columns.
  *
- * Not listed: `baseline_records` (v14) and `telegram_owner_prompts` (v17). The released v12 step replays
- * the frozen schema-v37.sql, which holds both, and v14 and v17 create them `IF NOT EXISTS`, so the
- * chain's own v13 holds them. Measured on this chain, not assumed.
+ * This list serves the chain images from v38 on. v13 is not checked against it: `laterObjectsIn` compares
+ * a v13 image with the v13 release object by object. The r1 claim was that "the chain's own v13 holds
+ * `baseline_records` and `telegram_owner_prompts`". That is true of this chain and false of the release,
+ * which has neither table.
  */
 const LATER_OBJECTS: ReadonlyArray<{ version: number; objects?: readonly string[]; columns?: readonly string[] }> = [
   { version: 20, objects: ["conversational_actor_registrations", "conversational_actor_registry_state"] },
@@ -149,8 +169,13 @@ const LATER_OBJECTS: ReadonlyArray<{ version: number; objects?: readonly string[
  * What a historical image must be before a test uses it: at `version`, its top receipt the released
  * step's own, and holding no object or column a later version introduces. Returns the later objects
  * and columns found, which must be empty, so a caller's `expect` names them.
+ *
+ * At v13 the check is exact: every schema object, definition and receipt must be the v13 release's
+ * own (`releasedV13Differences`). The receipt is `bootstrap-v13` with that release's checksum, the
+ * receipt v13 itself wrote, and a relabelled row fails it.
  */
 export const laterObjectsIn = (path: string, version: number): string[] => {
+  if (version === 13) return releasedV13Differences(path);
   const raw = new Database(path, { readonly: true, fileMustExist: true });
   try {
     const found: string[] = [];

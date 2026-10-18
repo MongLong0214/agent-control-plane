@@ -38,8 +38,13 @@ export const RECEIPT_BYTES_SHA256 =
  * the file being read. These digests are not recomputed from the files they describe: a pin a run
  * derives from its own input agrees with whatever it is handed, which is exactly the defect these
  * pins exist to close.
+ *
+ * `tests/fixtures/schema-v13.sql` is a copy of a released file, `git show 842830c5:src/db/schema.sql`
+ * (V46-R1-02, CEO 414404c6). It also carries that file's git blob id (`git rev-parse
+ * 842830c5:src/db/schema.sql`). Git's blob hash is computed from the bytes, so the copy is checked
+ * against the release without needing that commit in the checkout.
  */
-export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string }> = [
+export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
   {
     path: "src/db/migrations.ts",
     sha256: "d3eca52f99ecee9d621ab7e398552fab482003041f62839f8662ba69264fc744",
@@ -55,6 +60,11 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string }> = [
   {
     path: "src/db/schema-v45.sql",
     sha256: "70821ad69e99dc006a21751558b2f4eaec1001146e7b65f1e4b052453622a7bf",
+  },
+  {
+    path: "tests/fixtures/schema-v13.sql",
+    sha256: "0c401e7d9cbc385819d8733c26dd6f60d269594d0a5a7b87d5bb0b041b487586",
+    gitBlob: "5724ce5155ab5c6c0b2a11d0fba2d121585fddc4",
   },
   {
     path: "tests/fixtures/schema-v25-lineage.sql",
@@ -75,11 +85,20 @@ const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 export const digestOfFile = (relativePath: string): string =>
   createHash("sha256").update(readFileSync(`${repoRoot}/${relativePath}`)).digest("hex");
 
+/** Git's blob id for a file's bytes, the value `git hash-object` prints. */
+export const gitBlobOfFile = (relativePath: string): string => {
+  const bytes = readFileSync(`${repoRoot}/${relativePath}`);
+  return createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+};
+
 /** `path: actual` for every pinned blob whose bytes no longer match. */
 export const driftedBlobs = (): string[] =>
   FROZEN_BLOBS.flatMap((blob) => {
     const actual = digestOfFile(blob.path);
-    return actual === blob.sha256 ? [] : [`${blob.path}: ${actual} (pinned ${blob.sha256})`];
+    const drifted = actual === blob.sha256 ? [] : [`${blob.path}: ${actual} (pinned ${blob.sha256})`];
+    if (blob.gitBlob === undefined) return drifted;
+    const blobId = gitBlobOfFile(blob.path);
+    return blobId === blob.gitBlob ? drifted : [...drifted, `${blob.path}: git blob ${blobId} (pinned ${blob.gitBlob})`];
   });
 
 /** What a closed schema has to state, so that "closed" is a property and not a hope. */

@@ -41,11 +41,31 @@ import {
   TEST_OPERATOR_TOKEN,
 } from "../helpers/harness.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { laterObjectsIn, releasedChainImage } from "../helpers/released-chain-image.ts";
+import { laterObjectsIn } from "../helpers/released-chain-image.ts";
+import { releasedV13Image } from "../helpers/released-v13-schema.ts";
 import { privateStatePath } from "../helpers/released-v44-schema.ts";
 import { contentDigests } from "../helpers/released-v45-schema.ts";
 
 afterAll(cleanupTempDirs);
+
+/**
+ * The objects on `baseline_records` in the committed file, read on a second connection the way a
+ * migration step's `afterMigration` sees it. This is v14's ledger, and v13 has none of it.
+ */
+const baselineLedgerObjects = (path: string): string[] => {
+  const reader = new Database(path, { readonly: true, fileMustExist: true });
+  try {
+    return reader
+      .prepare(
+        `SELECT type || ' ' || name FROM sqlite_schema
+          WHERE tbl_name = 'baseline_records' AND substr(name, 1, 7) <> 'sqlite_' ORDER BY type, name`,
+      )
+      .pluck()
+      .all() as string[];
+  } finally {
+    reader.close();
+  }
+};
 
 const contract = {
   goal: "record a small baseline run",
@@ -1092,9 +1112,11 @@ describe("baseline boundary contracts", () => {
   });
 
   it("opens a v13 database through production construction and applies the rest of the chain", () => {
-    // V46-R1-02: the released chain's own v13 (the v11 fixture through v12 and v13), not a current
-    // database relabelled 13, which held every later object but three tables, all nine v46 guards included.
-    const databasePath = releasedChainImage(privateStatePath("acp-baseline-v13-"), 13);
+    // V46-R1-02: the released v13, written from 842830c5's own schema.sql the way that release set up
+    // a database, and compared with it object by object. It is neither a current database relabelled
+    // 13 nor this chain's v13, which replays schema-v37.sql and already held baseline_records, so a v14
+    // stubbed out to nothing still passed.
+    const databasePath = releasedV13Image(privateStatePath("acp-baseline-v13-"));
     expect(laterObjectsIn(databasePath, 13)).toEqual([]);
     // #738 — a database at an older version no longer migrates itself. This fixture is a
     // deployment that stopped at v13, so it takes the approval its owner would have taken.
@@ -1103,15 +1125,28 @@ describe("baseline boundary contracts", () => {
     const reopened = new Database(databasePath);
     try {
       expect(Number(reopened.pragma("user_version", { simple: true }))).toBe(13);
-      // The released v12 step replays the frozen schema-v37.sql, which already holds baseline_records, and
-      // v14 creates it IF NOT EXISTS; what v14 has not yet added is its receipt.
+      expect(
+        reopened.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'baseline_records'").get(),
+      ).toEqual({ n: 0 });
       expect(reopened.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version >= 14").get()).toEqual({ n: 0 });
     } finally {
       reopened.close();
     }
 
-    const migrated = new Db(databasePath);
+    // The v14 step itself, read right after it commits, before any later step runs.
+    let atV14: string[] = [];
+    const migrated = new Db(databasePath, {
+      afterMigration: (migration) => {
+        if (migration.id === "v14-baseline-evidence-ledger") atV14 = baselineLedgerObjects(databasePath);
+      },
+    });
     try {
+      expect(atV14).toEqual([
+        "index baseline_records_run_kind",
+        "table baseline_records",
+        "trigger baseline_records_immutable",
+        "trigger baseline_records_no_delete",
+      ]);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.get<{ migration_id: string; checksum: string }>(
         "SELECT migration_id, checksum FROM schema_migrations WHERE version = 15",
@@ -1195,24 +1230,36 @@ describe("baseline boundary contracts", () => {
   });
 
   it("restores the original v13 file when v14 fails after its commit", () => {
-    // V46-R1-02: the released chain's own v13 (the v11 fixture through v12 and v13), not a current
-    // database relabelled 13, which held every later object but three tables, all nine v46 guards included.
-    const databasePath = releasedChainImage(privateStatePath("acp-baseline-v13-"), 13);
+    // V46-R1-02: the released v13 from 842830c5's own schema.sql (see the test above), which has no
+    // baseline_records, so the rollback below undoes a table v14 really created.
+    const databasePath = releasedV13Image(privateStatePath("acp-baseline-v13-"));
     expect(laterObjectsIn(databasePath, 13)).toEqual([]);
     // #738 — a database at an older version no longer migrates itself. This fixture is a
     // deployment that stopped at v13, so it takes the approval its owner would have taken.
     approveMigration(databasePath, "baseline-export fixture");
     const image = contentDigests(databasePath);
 
+    let committedV14: string[] = [];
     expect(() => new Db(databasePath, {
       afterMigration: (migration) => {
-        if (migration.id === "v14-baseline-evidence-ledger") throw new Error("injected v14 post-commit failure");
+        if (migration.id !== "v14-baseline-evidence-ledger") return;
+        committedV14 = baselineLedgerObjects(databasePath);
+        throw new Error("injected v14 post-commit failure");
       },
     })).toThrowError(/original database was restored/);
+    // The failure came after v14 had committed its ledger, so there was something to roll back.
+    expect(committedV14).toEqual([
+      "index baseline_records_run_kind",
+      "table baseline_records",
+      "trigger baseline_records_immutable",
+      "trigger baseline_records_no_delete",
+    ]);
 
     const restored = new Database(databasePath, { readonly: true, fileMustExist: true });
     try {
       expect(Number(restored.pragma("user_version", { simple: true }))).toBe(13);
+      expect(restored.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'baseline_records'").get())
+        .toEqual({ n: 0 });
       expect(restored.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 14").get())
         .toEqual({ n: 0 });
       expect(restored.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 15").get())
