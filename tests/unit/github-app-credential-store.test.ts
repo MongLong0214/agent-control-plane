@@ -1,5 +1,6 @@
 import { generateKeyPairSync, verify } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,7 +9,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { type Decision, allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { GITHUB_API_RESPONSE_LIMIT_BYTES, TrustedCredentialStore } from "../../src/github/credential-store.ts";
-import { GitHubAppClient } from "../../src/github/github-kernel.ts";
+import { GitHubAppClient, transportOutcome } from "../../src/github/github-kernel.ts";
 import { runtimeEnvironment } from "../../src/runtime/cli-adapters.ts";
 
 /** This file owns its temporary directories so its cleanup cannot race another suite's fixtures. */
@@ -507,5 +508,141 @@ describe("FD-R2 GitHub App transport: the check before dispatch", () => {
     const result = await store.githubApi({ ...PUT, beforeDispatch: check(allowed) });
     expect(result).toMatchObject({ allowed: false, evidence: { status: 401 } });
     expect(log).toEqual(["GET /app", "POST /app/installations/153553922/access_tokens", "check", `PUT ${PUT.path}`]);
+  });
+});
+
+/**
+ * FIX-FD-REDIRECT — the store's own fetch against a real HTTP server, so redirect handling is the
+ * runtime's, not a double's. A redirect answer is returned as a refusal naming the redirect; the
+ * request was sent once and nothing is sent to the redirect target. `log` records every request that
+ * reached the server and every run of the caller's check, in order.
+ */
+describe("FIX-FD-REDIRECT GitHub App transport: one send, no redirect followed", () => {
+  const REDIRECTED = "/redirected";
+
+  const nativeServer = async (answer: { path: string; status: number }) => {
+    const files = makeAppFiles();
+    const log: string[] = [];
+    const server = createServer((req, res) => {
+      // The request body is drained and not read: these answers depend only on the path.
+      req.resume();
+      req.on("end", () => {
+        const path = req.url!;
+        log.push(`${req.method} ${path}`);
+        res.setHeader("Content-Type", "application/json");
+        if (path === answer.path && answer.status >= 300 && answer.status < 400) {
+          res.writeHead(answer.status, { Location: `${REDIRECTED}${path}` });
+          res.end("{}");
+        } else if (path === "/app" || path === `${REDIRECTED}/app`) {
+          res.end(JSON.stringify({ slug: "acp-production-gate", permissions: appPermissions }));
+        } else if (path.endsWith("/access_tokens")) {
+          res.statusCode = 201;
+          res.end(JSON.stringify({ token: "installation-token-fd-redirect", expires_at: "2026-08-15T00:00:00.000Z" }));
+        } else {
+          res.statusCode = path === answer.path ? answer.status : 200;
+          res.end(JSON.stringify({ merged: true, sha: "b".repeat(40) }));
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const store = new TrustedCredentialStore(join(files.root, "secrets"), {
+      appEnvFile: files.envFile,
+      apiBaseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+      now: () => Date.parse("2026-08-14T00:00:00.000Z"),
+    });
+    return {
+      store,
+      log,
+      check: (): Decision<void> => {
+        log.push("check");
+        return allow(ReasonCode.OK, undefined);
+      },
+      close: async (): Promise<void> => {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      },
+    };
+  };
+
+  const requests = [
+    ["gate POST", "POST", "/repos/o/r/check-runs"],
+    ["merge PUT", "PUT", "/repos/o/r/pulls/7/merge"],
+    ["read", "GET", "/repos/o/r/pulls/7"],
+  ] as const;
+
+  it("FIX-FD-REDIRECT control: a 2xx answer is returned after one check and one send", async () => {
+    const { store, log, check, close } = await nativeServer({ path: "/repos/o/r/pulls/7/merge", status: 200 });
+    try {
+      expect((await store.authenticate()).allowed).toBe(true);
+      log.length = 0;
+      const result = await store.githubApi({ method: "PUT", path: "/repos/o/r/pulls/7/merge", input: "{}", beforeDispatch: check });
+      expect(result).toMatchObject({ allowed: true, value: { status: 200 } });
+      expect(log).toEqual(["check", "PUT /repos/o/r/pulls/7/merge"]);
+    } finally {
+      await close();
+    }
+  });
+
+  it.each(requests)("FIX-FD-REDIRECT %s: a 307 answer is a refusal naming the redirect; sent once, nothing sent to the target", async (_name, method, path) => {
+    const { store, log, check, close } = await nativeServer({ path, status: 307 });
+    try {
+      expect((await store.authenticate()).allowed).toBe(true);
+      log.length = 0;
+      const result = await store.githubApi({ method, path, ...(method === "GET" ? {} : { input: "{}" }), beforeDispatch: check });
+      expect(result).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.PROBE_FAILED,
+        evidence: { operation: method, status: 307, redirect: true },
+      });
+      expect(result.allowed ? "" : result.message).toMatch(/redirect, which is not followed/);
+      expect(log).toEqual(["check", `${method} ${path}`]);
+    } finally {
+      await close();
+    }
+  });
+
+  it.each([301, 302, 303, 308])("FIX-FD-REDIRECT merge PUT: a %i answer is refused the same way and not followed", async (status) => {
+    const path = "/repos/o/r/pulls/7/merge";
+    const { store, log, check, close } = await nativeServer({ path, status });
+    try {
+      expect((await store.authenticate()).allowed).toBe(true);
+      log.length = 0;
+      const result = await store.githubApi({ method: "PUT", path, input: "{}", beforeDispatch: check });
+      expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.PROBE_FAILED, evidence: { status, redirect: true } });
+      expect(log).toEqual(["check", `PUT ${path}`]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("FIX-FD-REDIRECT GitHubAppClient: the redirect refusal rejects as an answered failure, not as silence", async () => {
+    const path = "/repos/o/r/pulls/7/merge";
+    const { store, log, close } = await nativeServer({ path, status: 307 });
+    try {
+      const client = new GitHubAppClient(store);
+      const rejected = await client.request("PUT", path, { sha: "a".repeat(40) }).then(() => null, (error: unknown) => error);
+      expect(rejected).toMatchObject({ reasonCode: ReasonCode.PROBE_FAILED, evidence: { status: 307, redirect: true } });
+      expect(transportOutcome(rejected)).toEqual({ outcome: "answered", status: 307 });
+      expect(log.filter((entry) => entry.endsWith(path))).toEqual([`PUT ${path}`]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("FIX-FD-REDIRECT authentication: a redirect on GET /app refuses authentication and is not followed", async () => {
+    const { store, log, close } = await nativeServer({ path: "/app", status: 302 });
+    try {
+      expect(await store.authenticate()).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.GITHUB_APP_IDENTITY_UNVERIFIED,
+        evidence: { status: 302, redirect: true },
+      });
+      expect(log).toEqual(["GET /app"]);
+    } finally {
+      await close();
+    }
   });
 });

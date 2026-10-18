@@ -1,5 +1,6 @@
 import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -1111,5 +1112,218 @@ describe("FD-R2: the transport checks the gate payload again once it holds its i
     expect(transport.events).toEqual(["verified", "gate POST", `refused ${ReasonCode.INTERNAL_ERROR}`, "verified", "merge PUT"]);
     expect(mergePuts(fixture)).toEqual([{ pull: github.pulls[0]!.number, sha: driven.candidateHead }]);
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+  });
+});
+
+/**
+ * FIX-FD-REDIRECT (review r3 of #1145) — the production transport over a real HTTP server and the
+ * runtime's own fetch, so what happens to a redirect is fetch's behaviour, not a double's. The server
+ * answers the App's authentication itself and forwards every other request to FakeGitHub. When
+ * `redirect` names a write, the server answers its first send with a same-origin 307, after running
+ * `beforeRedirect`; a request that then arrives at the redirect target is forwarded too, and counted.
+ *
+ * `sends` lists every gate POST and merge PUT that reached the server, `redirected` the ones that
+ * reached the redirect target, and `refusals` every denial the store returned with `redirect: true`.
+ */
+const REDIRECTED = "/redirected";
+
+const nativeTransport = async (
+  fixture: Fixture,
+  options: { redirect?: "gate POST" | "merge PUT"; beforeRedirect?: () => void } = {},
+) => {
+  const root = tempDir("acp-fd-redirect-");
+  const credentialDir = join(root, "credentials");
+  mkdirSync(credentialDir, { mode: 0o700 });
+  const keyPath = join(credentialDir, "github-app.private-key.pem");
+  writeFileSync(keyPath, generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs1", format: "pem" }), { mode: 0o600 });
+  const envFile = join(credentialDir, "github-app.env");
+  writeFileSync(envFile, `GITHUB_APP_ID=4586878\nGITHUB_APP_INSTALLATION_ID=153553922\nGITHUB_APP_PRIVATE_KEY_PATH=${keyPath}\n`, { mode: 0o600 });
+  const sends: string[] = [];
+  const redirected: string[] = [];
+  const refusals: Array<{ reasonCode: string; evidence: Record<string, unknown> }> = [];
+  let answeredWithRedirect = false;
+  const server = createServer((req, res) => {
+    void (async () => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const text = Buffer.concat(chunks).toString();
+      const body = text ? JSON.parse(text) as unknown : undefined;
+      const method = req.method as "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
+      const path = req.url!;
+      res.setHeader("Content-Type", "application/json");
+      if (path === "/app") {
+        res.end(JSON.stringify({ slug: "acp-trusted-app", permissions: {
+          checks: "write", contents: "write", issues: "write", metadata: "read", pull_requests: "write",
+        } }));
+        return;
+      }
+      if (path.endsWith("/access_tokens")) {
+        res.statusCode = 201;
+        res.end(JSON.stringify({ token: "fd-redirect-installation-token", expires_at: "2026-08-15T00:00:00.000Z" }));
+        return;
+      }
+      const followed = path.startsWith(REDIRECTED);
+      const target = followed ? path.slice(REDIRECTED.length) : path;
+      const write = method === "PUT" && /\/pulls\/\d+\/merge$/.test(target) ? "merge PUT"
+        : method === "POST" && /\/check-runs$/.test(target) && (body as { name?: unknown }).name === GATE_CHECK_NAME ? "gate POST"
+          : null;
+      if (write) (followed ? redirected : sends).push(write);
+      if (write && write === options.redirect && !followed && !answeredWithRedirect) {
+        answeredWithRedirect = true;
+        options.beforeRedirect?.();
+        res.writeHead(307, { Location: `${REDIRECTED}${path}` });
+        res.end("{}");
+        return;
+      }
+      try {
+        const response = await fixture.github.request(method, target, body);
+        res.statusCode = method === "POST" ? 201 : 200;
+        res.end(JSON.stringify(response));
+      } catch {
+        res.statusCode = 500;
+        res.end("{}");
+      }
+    })();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const store = new TrustedCredentialStore(join(root, "secrets"), {
+    appEnvFile: envFile,
+    apiBaseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+    now: () => Date.parse("2026-08-14T00:00:00.000Z"),
+  });
+  expect((await store.authenticate()).allowed).toBe(true);
+  const githubApi = store.githubApi.bind(store);
+  store.githubApi = async (options) => {
+    const result = await githubApi(options);
+    if (!result.allowed && result.evidence["redirect"] === true) {
+      refusals.push({ reasonCode: result.reasonCode, evidence: result.evidence });
+    }
+    return result;
+  };
+  Object.assign(fixture.harness.cp.github, { credentials: store, client: new GitHubAppClient(store) });
+  return {
+    sends,
+    redirected,
+    refusals,
+    close: async (): Promise<void> => {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+};
+
+describe("FIX-FD-REDIRECT: the transport sends each gate POST and merge PUT once and follows no redirect", () => {
+  const sites = [
+    ["gate POST", "gate POST", false],
+    ["merge commit PUT", "merge PUT", false],
+    ["squash PUT", "merge PUT", true],
+  ] as const;
+
+  it("FIX-FD-REDIRECT control: GitHub answers 2xx over the native transport; each write is sent once and the run merges once", async () => {
+    const fixture = await approvedHumanGatedRun();
+    const transport = await nativeTransport(fixture);
+    try {
+      expect(await outcomeOf(fixture)).toEqual(COMPLETED_ONCE);
+      expect(transport.sends).toEqual(["gate POST", "merge PUT"]);
+      expect(transport.redirected).toEqual([]);
+      expect(transport.refusals).toEqual([]);
+    } finally {
+      await transport.close();
+    }
+  });
+
+  it.each(sites)(
+    "FIX-FD-REDIRECT %s: an authenticated owner refusal, then a same-origin 307 answer: the write was sent once, nothing is sent to the redirect target, and the run does not complete",
+    async (_site, write, squash) => {
+      const fixture = await approvedHumanGatedRun({ squash });
+      const { harness, driven, github } = fixture;
+      let changed = false;
+      const transport = await nativeTransport(fixture, {
+        redirect: write,
+        beforeRedirect: () => {
+          recordOwnerDecision(harness, driven.runId, fixture.items[0]!, false, "refused before the redirect answer");
+          changed = true;
+        },
+      });
+      try {
+        await finalizeAttempts(fixture, 1);
+        expect(changed).toBe(true);
+        // The first send left once and was answered with the redirect; it is not sent again anywhere.
+        expect(transport.sends.filter((sent) => sent === write)).toEqual([write]);
+        expect(transport.redirected).toEqual([]);
+        expect(transport.refusals[0]).toEqual({
+          reasonCode: ReasonCode.PROBE_FAILED,
+          evidence: { operation: write === "gate POST" ? "POST" : "PUT", status: 307, redirect: true },
+        });
+        expect(github.mergeCount).toBe(0);
+        if (write === "gate POST") expect(writes(github).gates).toBe(0);
+        expect(harness.cp.runs.require(driven.runId).state).not.toBe(RunState.COMPLETED);
+      } finally {
+        await transport.close();
+      }
+    },
+  );
+
+  it.each(sites)(
+    "FIX-FD-REDIRECT %s with nothing changed: a 307 answer is still not followed, and the run fails closed instead of completing",
+    async (_site, write, squash) => {
+      const fixture = await approvedHumanGatedRun({ squash });
+      const { harness, driven, github } = fixture;
+      const transport = await nativeTransport(fixture, { redirect: write });
+      try {
+        await finalizeAttempts(fixture, 1);
+        expect(transport.sends.filter((sent) => sent === write)).toEqual([write]);
+        expect(transport.redirected).toEqual([]);
+        expect(transport.refusals.length).toBeGreaterThan(0);
+        expect(github.mergeCount).toBe(0);
+        expect(harness.cp.runs.require(driven.runId).state).not.toBe(RunState.COMPLETED);
+      } finally {
+        await transport.close();
+      }
+    },
+  );
+
+  it("FIX-FD-REDIRECT recovery: a gate POST answered with a 307 stays PENDING, and the next process publishes it as a new send and merges once", async () => {
+    const fixture = await approvedHumanGatedRun();
+    const first = await nativeTransport(fixture, { redirect: "gate POST" });
+    try {
+      await finalizeAttempts(fixture, 0);
+      expect(first.sends).toEqual(["gate POST"]);
+      expect(first.redirected).toEqual([]);
+    } finally {
+      await first.close();
+    }
+    const pending = (harness: Harness) =>
+      harness.cp.db.all<{ status: string }>(
+        "SELECT status FROM github_receipts WHERE operation = 'gate_publish' AND run_id = ? ORDER BY rowid",
+        [fixture.driven.runId],
+      );
+    expect(pending(fixture.harness)).toEqual([{ status: "PENDING" }]);
+    expect(writes(fixture.github)).toEqual({ gates: 0, merges: 0 });
+
+    // The same database opened by a new process: GitHub shows no gate, so the reservation is released
+    // and the gate is published again from its call site, through the transport's check.
+    fixture.harness.cp.db.close();
+    const harness = makeHarness({
+      root: fixture.harness.root,
+      githubClient: fixture.github,
+      clock: fixture.harness.clock,
+      repoPath: fixture.harness.repoPath,
+    });
+    const restarted: Fixture = { ...fixture, harness };
+    const next = await nativeTransport(restarted);
+    try {
+      await finalizeAttempts(restarted, 0);
+      expect(next.sends).toEqual(["gate POST", "merge PUT"]);
+      expect(next.redirected).toEqual([]);
+      expect(pending(harness)).toEqual([{ status: "APPLIED" }]);
+      expect(writes(fixture.github)).toEqual({ gates: 1, merges: 1 });
+      expect(harness.cp.runs.require(fixture.driven.runId).state).toBe(RunState.COMPLETED);
+    } finally {
+      await next.close();
+    }
   });
 });
