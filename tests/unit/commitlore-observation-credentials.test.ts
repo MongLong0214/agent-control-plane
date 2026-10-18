@@ -110,11 +110,18 @@ const injectDaemonEnvironment = (): void => {
   for (const [name, value] of Object.entries(DAEMON_INJECTION())) vi.stubEnv(name, value);
 };
 
-/** A `commitlore` on PATH that is `body`, run by this Node, with the fixture paths it needs baked in. */
+/**
+ * A `commitlore` that is `body`, run by this Node, with the fixture paths it needs baked in, pinned by
+ * `ACP_COMMITLORE_BINARY` (slice S16) and answering the pin's checks before anything else; its directory is
+ * also first on this process's PATH.
+ */
 const fake = (name: string, body: string): void => {
   const dir = tempDir(`acp-s11-r3-${name}-`);
   writeFileSync(join(dir, "package.json"), '{"type":"commonjs"}');
   const prelude = `
+    if (process.argv[2] === '--version') { process.stdout.write('1.7.3\\n'); return; }
+    if (process.argv[2] === 'doctor' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore doctor [options]\\n  --json  emit the report as JSON\\n'); return; }
+    if (process.argv[2] === 'init' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore init [options]\\n  --mcp-scope <scope>  where to register\\n  --no-unattended      leave unattended capture off\\n'); return; }
     const fs = require('node:fs');
     const { spawnSync } = require('node:child_process');
     const step = process.argv[2];
@@ -131,6 +138,7 @@ const fake = (name: string, body: string): void => {
   `;
   writeFileSync(join(dir, "commitlore"), `#!${process.execPath}\n${prelude}\n${body}\n`, { mode: 0o700 });
   vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
+  vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
 };
 
 const readLog = (name: string): Array<Record<string, unknown>> =>

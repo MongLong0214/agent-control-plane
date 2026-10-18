@@ -122,7 +122,7 @@ const PROVIDER_PIN_VARIABLE: Readonly<Record<string, string>> = {
  * that is not "not there" — folding those into `ABSENT` would send an operator to reinstall a
  * binary sitting exactly where they put it.
  */
-type PinCondition =
+export type PinCondition =
   | "ABSENT"
   | "NOT_A_FILE"
   | "NOT_EXECUTABLE"
@@ -130,7 +130,7 @@ type PinCondition =
   | "NOT_ON_PATH"
   | "NOT_CONFIGURED";
 
-const PIN_CONDITION_PHRASE: Readonly<
+export const PIN_CONDITION_PHRASE: Readonly<
   Record<Exclude<PinCondition, "NOT_ON_PATH" | "NOT_CONFIGURED">, string>
 > = {
   ABSENT: "not there",
@@ -151,8 +151,11 @@ const PIN_CONDITION_PHRASE: Readonly<
  *
  * `statSync`, and deliberately neither `lstatSync` nor `realpathSync`: see
  * `checkProviderExecutables`, which is where that choice is argued.
+ *
+ * The CommitLore pin (`bootstrap/commitlore-pin.ts`) is read by this same rule, after its own
+ * absolute-path rule has refused every pin this function would read relative to the working directory.
  */
-const inspectPin = (path: string): { condition: PinCondition; error?: string } | null => {
+export const inspectPin = (path: string): { condition: PinCondition; error?: string } | null => {
   if (path === "") return { condition: "NOT_CONFIGURED" };
   if (!path.includes("/")) return { condition: "NOT_ON_PATH" };
   try {
