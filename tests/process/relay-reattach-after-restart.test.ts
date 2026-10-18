@@ -3,7 +3,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ATTACH_EXIT,
@@ -80,7 +80,16 @@ const until = async (condition: () => boolean, budgetMs = 5_000): Promise<boolea
  * CLAUDE_CODE_MESSAGING_* variable is cleared before any relay runs (`clearSessionMessagingEnv`), so
  * the only socket directories a run uses are the mkdtemp roots below.
  */
-clearSessionMessagingEnv();
+/**
+ * R1154-01 — every CLAUDE_CODE_MESSAGING_* variable is removed before this file's imports evaluate:
+ * vi.hoisted runs ahead of them, where a module-level call would run after. Inlined because a hoisted
+ * body cannot use an import; `clearSessionMessagingEnv` repeats it before each case.
+ */
+vi.hoisted(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
+  }
+});
 beforeEach(() => clearSessionMessagingEnv());
 
 const roots: string[] = [];

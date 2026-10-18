@@ -3,7 +3,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ATTACH_EXIT, runAttachRelay, runAttachRelayCommand } from "../../src/cli/attach-relay.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -39,7 +39,16 @@ import { clearSessionMessagingEnv } from "../helpers/session-messaging-env.ts";
  * CLAUDE_CODE_MESSAGING_* variable is cleared before any relay runs (`clearSessionMessagingEnv`), so
  * the only socket directories a run uses are the mkdtemp roots below.
  */
-clearSessionMessagingEnv();
+/**
+ * R1154-01 — every CLAUDE_CODE_MESSAGING_* variable is removed before this file's imports evaluate:
+ * vi.hoisted runs ahead of them, where a module-level call would run after. Inlined because a hoisted
+ * body cannot use an import; `clearSessionMessagingEnv` repeats it before each case.
+ */
+vi.hoisted(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
+  }
+});
 beforeEach(() => clearSessionMessagingEnv());
 
 const TOKEN = "fixture-mcp-token";

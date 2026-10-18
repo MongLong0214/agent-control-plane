@@ -69,7 +69,16 @@ const inheritedUnknown = vi.hoisted(() => {
   process.env[name] = "inherited-from-the-parent";
   return name;
 });
-clearMessagingEnv();
+/**
+ * R1154-01 — every CLAUDE_CODE_MESSAGING_* variable is removed before this file's imports evaluate:
+ * vi.hoisted runs ahead of them, where a module-level call would run after. Inlined because a hoisted
+ * body cannot use an import; `clearSessionMessagingEnv` repeats it before each case.
+ */
+vi.hoisted(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
+  }
+});
 beforeEach(clearMessagingEnv);
 
 const until = async (condition: () => boolean, budgetMs = 10_000): Promise<boolean> => {

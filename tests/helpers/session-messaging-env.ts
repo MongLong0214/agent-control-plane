@@ -23,6 +23,18 @@ export const clearSessionMessagingEnv = (): void => {
 };
 
 /**
+ * A copy of `env` without any variable whose name starts with `SESSION_MESSAGING_PREFIX`: the env to
+ * hand a spawned CLI, so the child never inherits one, whatever its suffix (R1154-01).
+ */
+export const withoutSessionMessagingEnv = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
+  const copy: NodeJS.ProcessEnv = { ...env };
+  for (const name of Object.keys(copy)) {
+    if (name.startsWith(SESSION_MESSAGING_PREFIX)) delete copy[name];
+  }
+  return copy;
+};
+
+/**
  * The prefixed names a relay started now would see: in this process's environment, which an
  * in-process relay reads, and in the environment of a child that inherits it, as a spawned relay
  * does when it is given no environment of its own.

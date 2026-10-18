@@ -1,12 +1,39 @@
 import { existsSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import {
+  clearSessionMessagingEnv,
+  inheritedSessionMessagingNames,
+  SESSION_MESSAGING_PREFIX,
+  withoutSessionMessagingEnv,
+} from "../helpers/session-messaging-env.ts";
 
 afterAll(cleanupTempDirs);
+
+/**
+ * R1154-01 — a variable the parent environment hands in under a suffix no list names. Planted in the
+ * first hoisted call, as an inherited one would be, so the hoisted clear after it has to remove it.
+ */
+const inheritedUnknown = vi.hoisted(() => {
+  const name = `CLAUDE_CODE_MESSAGING_R1154_SYMLINKCLI_${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+  process.env[name] = "inherited-from-the-parent";
+  return name;
+});
+/**
+ * R1154-01 — every CLAUDE_CODE_MESSAGING_* variable is removed before this file's imports evaluate:
+ * vi.hoisted runs ahead of them, where a module-level call would run after. Inlined because a hoisted
+ * body cannot use an import; `clearSessionMessagingEnv` repeats it before each case.
+ */
+vi.hoisted(() => {
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("CLAUDE_CODE_MESSAGING_")) delete process.env[name];
+  }
+});
+beforeEach(() => clearSessionMessagingEnv());
 
 /**
  * #1052's `deploy/install-launchd.sh` publishes `<state root>/current` as a symlink to
@@ -70,16 +97,22 @@ const ROLLBACK_PAIR = join(REPO_ROOT, ROLLBACK_PAIR_REL);
 const runThroughCurrentSymlink = (
   scriptRelativeToRoot: string,
   argv: readonly string[],
-  env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = withoutSessionMessagingEnv(process.env),
 ) => {
   const linkParent = tempDir("acp-current-symlink-");
   const currentLink = join(linkParent, "current");
   symlinkSync(REPO_ROOT, currentLink);
+  // R1154-01: the child is handed no CLAUDE_CODE_MESSAGING_* variable, whatever the caller passed.
+  const childEnv = withoutSessionMessagingEnv(env);
+  handedEnvs.push(childEnv);
   return boundedSpawnSync(process.execPath, [join(currentLink, scriptRelativeToRoot), ...argv], {
     encoding: "utf8",
-    env,
+    env: childEnv,
   });
 };
+
+/** Every env `runThroughCurrentSymlink` handed a child, newest last, for the R1154-01 witness. */
+const handedEnvs: NodeJS.ProcessEnv[] = [];
 
 /**
  * Scrubbed of the four variables `hermes-ceo`'s `main()` requires before it does anything else,
@@ -87,7 +120,7 @@ const runThroughCurrentSymlink = (
  * own ambient environment happens to carry.
  */
 const withoutHermesBootstrapEnv = (): NodeJS.ProcessEnv => {
-  const env = { ...process.env };
+  const env = withoutSessionMessagingEnv(process.env);
   delete env["ACP_HERMES_BOOTSTRAP_SOCKET"];
   delete env["ACP_HERMES_BOOTSTRAP_TOKEN"];
   delete env["ACP_HERMES_MCP_SOCKET"];
@@ -100,7 +133,10 @@ describe("a CLI run through the `current` symlink is not silent", () => {
     expect(existsSync(AGENTCTL), `${AGENTCTL} is missing — run pnpm build first`).toBe(true);
 
     const argv = ["attach", "canonical-cto", "--bogus"];
-    const direct = boundedSpawnSync(process.execPath, [AGENTCTL, ...argv], { encoding: "utf8" });
+    const direct = boundedSpawnSync(process.execPath, [AGENTCTL, ...argv], {
+      encoding: "utf8",
+      env: withoutSessionMessagingEnv(process.env),
+    });
     const viaSymlink = runThroughCurrentSymlink(AGENTCTL_REL, argv);
 
     // Pinned first, independently of the comparison below: if the selector check itself ever
@@ -121,7 +157,10 @@ describe("a CLI run through the `current` symlink is not silent", () => {
     expect(existsSync(STATE_ADMIN), `${STATE_ADMIN} is missing — run pnpm build first`).toBe(true);
 
     const argv = ["--bogus"];
-    const direct = boundedSpawnSync(process.execPath, [STATE_ADMIN, ...argv], { encoding: "utf8" });
+    const direct = boundedSpawnSync(process.execPath, [STATE_ADMIN, ...argv], {
+      encoding: "utf8",
+      env: withoutSessionMessagingEnv(process.env),
+    });
     const viaSymlink = runThroughCurrentSymlink(STATE_ADMIN_REL, argv);
 
     expect(direct.status, direct.stderr || direct.stdout).not.toBe(0);
@@ -143,6 +182,7 @@ describe("a CLI run through the `current` symlink is not silent", () => {
     const argv: string[] = [];
     const direct = boundedSpawnSync(process.execPath, [HERMES_TOOL_BRIDGE, ...argv], {
       encoding: "utf8",
+      env: withoutSessionMessagingEnv(process.env),
     });
     const viaSymlink = runThroughCurrentSymlink(HERMES_TOOL_BRIDGE_REL, argv);
 
@@ -188,6 +228,7 @@ describe("a CLI run through the `current` symlink is not silent", () => {
     const argv = ["--help"];
     const direct = boundedSpawnSync(process.execPath, [ROLLBACK_PAIR, ...argv], {
       encoding: "utf8",
+      env: withoutSessionMessagingEnv(process.env),
     });
     const viaSymlink = runThroughCurrentSymlink(ROLLBACK_PAIR_REL, argv);
 
@@ -203,4 +244,15 @@ describe("a CLI run through the `current` symlink is not silent", () => {
     expect(viaSymlink.stdout).toBe(direct.stdout);
     expect(viaSymlink.stderr).toBe(direct.stderr);
   });
+});
+
+it("R1154-01: no CLI child here inherits a CLAUDE_CODE_MESSAGING_* variable, whatever its suffix", () => {
+  expect(inheritedUnknown.startsWith(SESSION_MESSAGING_PREFIX)).toBe(true);
+  expect(inheritedSessionMessagingNames()).toEqual({ here: [], child: [] });
+  // A caller that still hands one in: the env actually given to the child carries none.
+  const handed = `${SESSION_MESSAGING_PREFIX}R1154_HANDED_${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+  runThroughCurrentSymlink(join("tests", "r1154-no-such-script.js"), [], { PATH: process.env["PATH"], [handed]: "from-the-caller" });
+  const given = handedEnvs.at(-1) ?? {};
+  expect(Object.keys(given).filter((name) => name.startsWith(SESSION_MESSAGING_PREFIX))).toEqual([]);
+  expect(given["PATH"]).toBe(process.env["PATH"]);
 });
