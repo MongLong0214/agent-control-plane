@@ -82,7 +82,7 @@ describe("a peer turn of the CEO binding, under a Hermes peer grant", () => {
         const dispatched = await peer.call("run_dispatch", { runId });
         expect(dispatched, JSON.stringify(dispatched)).toMatchObject({ ok: true });
         const ownerSessionId = f.harness.cp.runs.require(runId).ownerSessionId!;
-        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+        await f.awaitFinishedTurns(ownerSessionId, 2);
         expect(auditEvidence(f, "DISPATCHED", runId)).toEqual([
           expect.objectContaining({ hermesPrincipal: "peer", hermesPeerGrant: PEER_GRANT }),
         ]);

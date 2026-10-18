@@ -27,12 +27,31 @@ afterEach(() => vi.restoreAllMocks());
 
 let keys = 0;
 
+/**
+ * A dispatched run whose owner has finished its two turns: the attestation `run_dispatch` awaits, and
+ * the RUN_DISPATCH work turn its commit wakes and that runs behind its reply (#1156: waited for, not
+ * timed). Later work turns of the owner do nothing.
+ */
 const quietOwner = async (f: BootstrapRuntimeFixture) => {
   acknowledgeInBandOnWorkTurns(f);
   const run = await f.dispatchBootstrap();
-  await vi.waitFor(() => expect(f.finishedTurns(run.ownerSessionId)).toBe(2));
+  await f.awaitFinishedTurns(run.ownerSessionId, 2);
   f.claude.onWorkTurn = async () => {};
   return run;
+};
+
+/** Holds the owner's first work turn at the provider for `ms`, as a slow runner makes it take that long. */
+const holdFirstWorkTurn = (f: BootstrapRuntimeFixture, ms: number): (() => number) => {
+  const runTurn = f.claude.runSessionTurn.bind(f.claude);
+  let held = 0;
+  f.claude.runSessionTurn = async (request) => {
+    if (held === 0 && request.relay !== null && request.conversation === "resume") {
+      held += 1;
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    }
+    return runTurn(request);
+  };
+  return () => held;
 };
 
 const open = async (f: BootstrapRuntimeFixture, runId: string, ownerSessionId: string) => {
@@ -78,6 +97,28 @@ const failResultStore = (f: BootstrapRuntimeFixture, key: string) => {
   });
   return () => injected;
 };
+
+describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", () => {
+  it("a RUN_DISPATCH turn slower than vi.waitFor's default 1000 ms is waited for, and is the owner's second finished turn", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const held = holdFirstWorkTurn(f, 1_500);
+      const { runId, ownerSessionId } = await quietOwner(f);
+      expect(held()).toBe(1);
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.harness.cp.outbox.listByRun(runId).filter((m) => m.kind === MessageKind.RUN_DISPATCH)).toMatchObject([{ status: "ACKED" }]);
+    });
+  });
+
+  it("a RUN_DISPATCH turn that never runs fails at once, naming the turns finished and the state reached", async () => {
+    await withBootstrapRuntime(async (f) => {
+      // The commit's wake reaches nothing, so no turn follows the attestation.
+      f.harness.cp.outbox.attachInBandWake(async () => allow(ReasonCode.OK, undefined));
+      await expect(quietOwner(f)).rejects.toThrow(
+        /expected 2 finished turns of \S+; reached 1 finished, no turn running or queued; turns \[SESSION_TURN\(attestation, OK\)\]; in-band rows \[RUN_DISPATCH:PENDING\]$/,
+      );
+    });
+  });
+});
 
 describe("ESC-01: the committed decision answers before the response cache", () => {
   it("a changed retry after cache loss cannot poison the original committed replay", async () => {

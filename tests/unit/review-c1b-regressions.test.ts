@@ -41,7 +41,7 @@ const countKind = (f: BootstrapRuntimeFixture, kind: string, roleKey?: string): 
 const dispatchedAndAcked = async (f: BootstrapRuntimeFixture) => {
   const handled = acknowledgeInBandOnWorkTurns(f);
   const dispatched = await f.dispatchBootstrap();
-  await vi.waitFor(() => expect(f.finishedTurns(dispatched.ownerSessionId)).toBe(2));
+  await f.awaitFinishedTurns(dispatched.ownerSessionId, 2);
   expect(handled).toEqual([{ kind: MessageKind.RUN_DISPATCH, generation: 1, acked: true }]);
   return { ...dispatched, handled };
 };
@@ -86,7 +86,7 @@ describe("ACP-C1B-01: a failed work turn does not suppress its retry", () => {
       const handled = acknowledgeInBandOnWorkTurns(f);
       f.claude.failNextWorkTurns = 1;
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       expect(handled).toEqual([]);
       expect(dispatches(f, runId)).toEqual([expect.objectContaining({ generation: 1, status: "PENDING" })]);
 
@@ -151,7 +151,7 @@ describe("ROUND1-ESCAPE-01: an envelope is settled by the outbox, not by a turn'
     await withBootstrapRuntime(async (f) => {
       // No acknowledgement handler: the work turn exits 0 having made no tool call.
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       expect(dispatchOf(f, runId).status).toBe("PENDING");
       await f.harness.cp.outbox.wakeInBandPending();
       f.harness.clock.advance(IN_BAND_REWAKE_MS - 1);
@@ -187,7 +187,7 @@ describe("ROUND1-ESCAPE-01: an envelope is settled by the outbox, not by a turn'
   it("a wake naming an envelope that expired unacknowledged is refused and runs no turn", async () => {
     await withBootstrapRuntime(async (f) => {
       const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       const pending = dispatchOf(f, runId);
       expect(pending.status).toBe("PENDING");
       f.harness.clock.advance(Date.parse(pending.expiresAt) - Date.parse(f.harness.clock.nowIso()));

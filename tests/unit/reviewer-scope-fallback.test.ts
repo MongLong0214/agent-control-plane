@@ -140,7 +140,7 @@ const claudeReviewer = (f: BootstrapRuntimeFixture, verdict: "PASS" | "NO_ANSWER
 const planned = async (f: BootstrapRuntimeFixture, options: Partial<Pick<ScriptedBootstrapOwner, "onResult" | "onRetry">> = {}) => {
   const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onRevision: "ignore", onResult: "ignore", ...options });
   const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-  await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
+  await f.awaitFinishedTurns(ownerSessionId, 2);
   await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false), { timeout: 10_000, interval: 25 });
   expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
   return { owner, runId, ownerSessionId, roleKey, planDigest: f.harness.cp.artifacts.latest(runId, ArtifactKind.PLAN)!.digest };

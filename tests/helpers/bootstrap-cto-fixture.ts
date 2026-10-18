@@ -140,6 +140,43 @@ export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof 
       `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_TURN' AND session_id = ?`,
       [sessionId],
     )?.n ?? 0;
+  /**
+   * What a session's turns reached, for a failure message: how many finished, whether one is still
+   * running or queued, each finished or refused turn's purpose and reason, the in-band rows addressed
+   * to the session, and every failed wake of their role.
+   */
+  const turnState = (sessionId: string): string => {
+    const audited = harness.cp.db.all<{ kind: string; reason_code: string | null; evidence_json: string }>(
+      `SELECT kind, reason_code, evidence_json FROM audit_events
+        WHERE (session_id = ? AND kind IN ('SESSION_TURN', 'SESSION_TURN_REFUSED'))
+           OR (kind = 'OUTBOX_IN_BAND_WAKE_FAILED' AND role_key IN (SELECT role_key FROM outbox WHERE target_session_id = ?))
+        ORDER BY event_id`,
+      [sessionId, sessionId],
+    ).map((row) => `${row.kind}(${(JSON.parse(row.evidence_json) as { purpose?: string }).purpose ?? "-"}, ${row.reason_code ?? "-"})`);
+    const inBand = harness.cp.db.all<{ kind: string; status: string }>(
+      `SELECT kind, status FROM outbox WHERE target_session_id = ? ORDER BY created_at, rowid`,
+      [sessionId],
+    ).map((row) => `${row.kind}:${row.status}`);
+    const lane = harness.cp.sessionRuntime.turnInProgress(sessionId) ? "a turn still running or queued" : "no turn running or queued";
+    return `${finishedTurns(sessionId)} finished, ${lane}; turns [${audited.join(", ")}]; in-band rows [${inBand.join(", ")}]`;
+  };
+  /**
+   * #1156 — waits until the session's turn `expected` has finished, or until the session has no turn
+   * running or queued short of it, and then requires exactly `expected` finished. A woken turn runs
+   * behind the reply of the call that woke it (`run_dispatch` admits its RUN_DISPATCH turn when its
+   * transaction commits, before it answers), and how long that turn's socket round trips take is the
+   * runner's; so nothing here is bounded by a wall clock. A slow turn is waited for, and only the
+   * test's own timeout bounds one that never ends; a turn that never ran fails at once, naming what
+   * was reached.
+   */
+  const awaitFinishedTurns = async (sessionId: string, expected: number): Promise<void> => {
+    while (finishedTurns(sessionId) < expected && harness.cp.sessionRuntime.turnInProgress(sessionId)) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (finishedTurns(sessionId) !== expected) {
+      throw new Error(`expected ${expected} finished turns of ${sessionId}; reached ${turnState(sessionId)}`);
+    }
+  };
   return {
     harness,
     claude,
@@ -155,6 +192,7 @@ export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof 
     loseClaude,
     restoreClaude,
     finishedTurns,
+    awaitFinishedTurns,
     close: async () => {
       await listeners.close();
       await launch.close();

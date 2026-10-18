@@ -69,7 +69,7 @@ const stalled = async (
 ) => {
   const owner = scriptBootstrapOwner(f, { onDispatch: "ack-only", onRecovery, onResult });
   const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-  await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+  await f.awaitFinishedTurns(ownerSessionId, 2);
   await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
   const [dispatch] = runDispatches(f, runId);
   expect(dispatch).toMatchObject({ binding_generation: 1, status: "ACKED" });
@@ -119,7 +119,7 @@ describe("the recovery wake: once per (run, owner generation, acknowledged RUN_D
     await withBootstrapRuntime(async (f) => {
       const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onResult: "ignore" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
       expect(runDispatches(f, runId)).toEqual([expect.objectContaining({ status: "ACKED" })]);
       expect(f.daemon.wakeBootstrapPlanRecovery()).toEqual({ woken: [] });

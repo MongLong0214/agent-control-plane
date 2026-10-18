@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { sessionRelayScript } from "../../src/runtime/cli-adapters.ts";
@@ -78,7 +78,7 @@ const offer = async (f: BootstrapRuntimeFixture, ownerSessionId: string, secret?
 const dispatchedSession = async (f: BootstrapRuntimeFixture) => {
   const { ownerSessionId } = await f.dispatchBootstrap();
   // The attestation and the RUN_DISPATCH turn, both finished: nothing is left on offer.
-  await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+  await f.awaitFinishedTurns(ownerSessionId, 2);
   return ownerSessionId;
 };
 

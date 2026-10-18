@@ -24,7 +24,7 @@ describe("ROUND1-ESCAPE-01: a successful CLI return does not settle an unacknowl
         });
       }
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       const pending = () => f.harness.cp.outbox.listByRun(runId).filter((m) => m.kind === MessageKind.RUN_DISPATCH);
       expect(pending().map((m) => m.status)).toEqual(["PENDING"]);
       const handled = acknowledgeInBandOnWorkTurns(f);
@@ -71,7 +71,7 @@ describe("repair recovery siblings", () => {
     await withBootstrapRuntime(async (f) => {
       acknowledgeInBandOnWorkTurns(f);
       const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       expect(f.harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "review fixture").allowed).toBe(true);
       expect(f.harness.cp.runs.transition(runId, state, "semantic hold fixture").allowed).toBe(true);
       f.harness.cp.sessionRuntime.release(ownerSessionId);
@@ -94,7 +94,7 @@ describe("repair recovery siblings", () => {
     await withBootstrapRuntime(async (f) => {
       const handled = acknowledgeInBandOnWorkTurns(f);
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       for (let revision = 1; revision <= 2; revision++) {
         expect(f.harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "review fixture").allowed).toBe(true);
         expect(f.harness.cp.runs.transition(runId, RunState.REVISION_REQUIRED, "revision fixture").allowed).toBe(true);
