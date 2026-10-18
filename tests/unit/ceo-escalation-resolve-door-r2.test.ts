@@ -27,12 +27,66 @@ afterEach(() => vi.restoreAllMocks());
 
 let keys = 0;
 
+/**
+ * A dispatched run whose owner has finished its two turns: the attestation `run_dispatch` awaits, and
+ * the RUN_DISPATCH work turn its commit wakes and that runs behind its reply (#1156: waited for, not
+ * timed). Later work turns of the owner do nothing.
+ */
 const quietOwner = async (f: BootstrapRuntimeFixture) => {
   acknowledgeInBandOnWorkTurns(f);
   const run = await f.dispatchBootstrap();
-  await vi.waitFor(() => expect(f.finishedTurns(run.ownerSessionId)).toBe(2));
+  await f.awaitFinishedTurns(run.ownerSessionId, 2);
   f.claude.onWorkTurn = async () => {};
   return run;
+};
+
+/**
+ * Blocks the owner's first work turn at the provider until the test calls `release`, as a slow runner
+ * keeps it there. `entered` settles once the turn is blocked, so the session already shows it running;
+ * `returned` settles once that turn's provider call has returned after its release. `release` is
+ * idempotent: a second call does nothing.
+ */
+const latchFirstWorkTurn = (f: BootstrapRuntimeFixture) => {
+  const runTurn = f.claude.runSessionTurn.bind(f.claude);
+  let enter = (): void => undefined;
+  let release = (): void => undefined;
+  let markReturned = (): void => undefined;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const returned = new Promise<void>((resolve) => {
+    markReturned = resolve;
+  });
+  let held = 0;
+  f.claude.runSessionTurn = async (request) => {
+    if (held === 0 && request.relay !== null && request.conversation === "resume") {
+      held += 1;
+      enter();
+      await released;
+      try {
+        return await runTurn(request);
+      } finally {
+        markReturned();
+      }
+    }
+    return runTurn(request);
+  };
+  return { entered, returned, release: () => release(), held: () => held };
+};
+
+/**
+ * Keeps `failure` the error the test reports when the cleanup after it fails too: the cleanup error is
+ * recorded on it (`cleanupErrors`) and printed beside it, never thrown in its place.
+ */
+const keepFailureOverCleanupError = (failure: unknown, cleanupError: unknown): void => {
+  if (typeof failure === "object" && failure !== null) {
+    const carrier = failure as { cleanupErrors?: unknown[] };
+    (carrier.cleanupErrors ??= []).push(cleanupError);
+  }
+  console.error("the cleanup after this test's failure also failed:", cleanupError);
 };
 
 const open = async (f: BootstrapRuntimeFixture, runId: string, ownerSessionId: string) => {
@@ -78,6 +132,145 @@ const failResultStore = (f: BootstrapRuntimeFixture, key: string) => {
   });
   return () => injected;
 };
+
+describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", () => {
+  it("while the RUN_DISPATCH turn is held past vi.waitFor's default 1000 ms quietOwner stays pending; once it is released, quietOwner resolves with two finished turns", async ({ signal, onTestFinished }) => {
+    // This test's own end, which the runner awaits before the next test on every cooperative exit (a pass,
+    // an assertion failure, a rejection, its timeout), bounded by hookTimeout: release the held turn, then
+    // collect the body, fixture close included. The body never waits on this hook. Its failure is already
+    // the test's, so it is neither reported again here nor replaced.
+    let releaseHeldTurn = (): void => undefined;
+    let body: Promise<void> = Promise.resolve();
+    onTestFinished(async () => {
+      try {
+        releaseHeldTurn();
+      } catch {
+        // The body's cleanup releases it too, and reports that error beside the test's failure.
+      }
+      await body.then(
+        () => undefined,
+        () => undefined,
+      );
+    });
+    body = withBootstrapRuntime(async (f) => {
+      const latch = latchFirstWorkTurn(f);
+      releaseHeldTurn = () => latch.release();
+      // quietOwner past run_dispatch's reply: from there only its wait for the turn can keep it pending.
+      const dispatchBootstrap = f.dispatchBootstrap;
+      let answer = (_run: Awaited<ReturnType<typeof dispatchBootstrap>>): void => undefined;
+      const answered = new Promise<Awaited<ReturnType<typeof dispatchBootstrap>>>((resolve) => {
+        answer = resolve;
+      });
+      f.dispatchBootstrap = async () => {
+        const run = await dispatchBootstrap();
+        answer(run);
+        return run;
+      };
+      // quietOwner's settlement is observed from the moment it exists, so a rejection is captured here and
+      // never left unhandled; it is rethrown after the release.
+      let state: "pending" | "resolved" | "rejected" = "pending";
+      const settled = quietOwner(f).then(
+        (run) => {
+          state = "resolved";
+          return { ok: true as const, run };
+        },
+        (error: unknown) => {
+          state = "rejected";
+          return { ok: false as const, error };
+        },
+      );
+      let run: Awaited<ReturnType<typeof dispatchBootstrap>> | null = null;
+      let failure: { error: unknown } | null = null;
+      // A runner timeout aborts the test's signal: the held turn is released, and every observation wait
+      // below is interrupted, so the body reaches its cleanup at once. The listener is removed on every exit.
+      let abort = (): void => undefined;
+      const aborted = new Promise<never>((_resolve, reject) => {
+        abort = () => {
+          latch.release();
+          reject(signal.reason);
+        };
+      });
+      aborted.catch(() => undefined);
+      const untilAborted = <T>(wait: Promise<T>): Promise<T> => Promise.race([wait, aborted]);
+      let observation: ReturnType<typeof setTimeout> | undefined;
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      try {
+        run = await untilAborted(
+          Promise.race([
+            Promise.all([latch.entered, answered]).then(([, dispatched]) => dispatched),
+            // quietOwner settled before its turn was held: nothing is left to observe pending.
+            settled.then(() => null),
+          ]),
+        );
+        expect(run, `quietOwner settled (${state}) before its RUN_DISPATCH turn was held`).not.toBeNull();
+        const { ownerSessionId } = run!;
+        // A macrotask boundary: whatever quietOwner could finish without the turn has finished.
+        await untilAborted(new Promise((resolve) => setImmediate(resolve)));
+        // The only timed step in this test, and one is necessary: no latch can tell a wait that gives up at
+        // 1000 ms (vi.waitFor's default, the wait #1156 replaced) from one that never gives up, unless 1000 ms
+        // pass while the turn is held. It is deterministic: that old wait started its 1000 ms timer before the
+        // boundary above, so it is registered ahead of this 1100 ms one (its 1000 ms plus two 50 ms polls) and
+        // always fires first. Timer order decides, not how fast the turn runs.
+        await untilAborted(
+          new Promise((resolve) => {
+            observation = setTimeout(resolve, 1_100);
+          }),
+        );
+        expect(state).toBe("pending");
+        expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(true);
+        expect(f.finishedTurns(ownerSessionId)).toBe(1);
+      } catch (error) {
+        failure = { error };
+        throw error;
+      } finally {
+        signal.removeEventListener("abort", abort);
+        clearTimeout(observation);
+        // On every cooperative exit path (assertion failure, rejection, runner timeout) the held turn is
+        // released, quietOwner settles, and the released turn returns before the fixture closes (a wait
+        // that already gave up no longer waits for it), each step tried even if another throws. A cleanup
+        // error never replaces the failure that brought us here.
+        const cleanupErrors: unknown[] = [];
+        const turnReturned = async (): Promise<void> => {
+          if (latch.held() === 0) return;
+          await latch.returned;
+          // The runtime records the returned turn and frees the session's lane before the next macrotask.
+          await new Promise((resolve) => setImmediate(resolve));
+        };
+        for (const step of [() => latch.release(), () => settled, turnReturned]) {
+          try {
+            await step();
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
+        }
+        if (cleanupErrors.length > 0) {
+          if (failure === null) throw cleanupErrors[0];
+          for (const cleanupError of cleanupErrors) keepFailureOverCleanupError(failure.error, cleanupError);
+        }
+      }
+
+      const outcome = await settled;
+      if (!outcome.ok) throw outcome.error;
+      const { runId, ownerSessionId } = run!;
+      expect(outcome.run).toMatchObject({ runId, ownerSessionId });
+      expect(latch.held()).toBe(1);
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.harness.cp.outbox.listByRun(runId).filter((m) => m.kind === MessageKind.RUN_DISPATCH)).toMatchObject([{ status: "ACKED" }]);
+    });
+    await body;
+  });
+
+  it("a RUN_DISPATCH turn that never runs fails at once, naming the turns finished and the state reached", async () => {
+    await withBootstrapRuntime(async (f) => {
+      // The commit's wake reaches nothing, so no turn follows the attestation.
+      f.harness.cp.outbox.attachInBandWake(async () => allow(ReasonCode.OK, undefined));
+      await expect(quietOwner(f)).rejects.toThrow(
+        /expected 2 finished turns of \S+; reached 1 finished, no turn running or queued; turns \[SESSION_TURN\(attestation, OK\)\]; in-band rows \[RUN_DISPATCH:PENDING\]$/,
+      );
+    });
+  });
+});
 
 describe("ESC-01: the committed decision answers before the response cache", () => {
   it("a changed retry after cache loss cannot poison the original committed replay", async () => {

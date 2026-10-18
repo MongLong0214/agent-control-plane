@@ -57,7 +57,7 @@ describe("the ack-only stall: a driven bootstrap owner that acknowledges its RUN
       const owner = scriptBootstrapOwner(f, { onDispatch: "ack-only", onRecovery: "follow-prompt" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
       // The attestation, then the RUN_DISPATCH's work turn, which only acknowledged.
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       expect(owner.acknowledged).toEqual([expect.objectContaining({ kind: MessageKind.RUN_DISPATCH, ok: true })]);
       expect(runDispatches(f, runId)).toEqual([{ generation: 1, status: "ACKED" }]);
       expect(planOf(f, runId)).toBeNull();
@@ -107,8 +107,8 @@ describe("the ack-only stall: a driven bootstrap owner that acknowledges its RUN
       passBootstrapPlanReviews(f);
       const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onRecovery: "follow-prompt" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      // That turn now also submits the result, which runs the review: allow it time under load.
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
+      // That turn now also submits the result, which runs the review: waited for, however long it takes under load.
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       // The RUN_DISPATCH's own turn carries the directive, and the ack rule is still there.
       const prompt = owner.prompts[0]!;
       expect(prompt).toContain(RUN_DISPATCH_DIRECTIVE);

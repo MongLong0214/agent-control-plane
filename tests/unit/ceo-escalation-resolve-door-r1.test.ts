@@ -27,7 +27,7 @@ let keys = 0;
 const quietOwner = async (f: BootstrapRuntimeFixture) => {
   acknowledgeInBandOnWorkTurns(f);
   const run = await f.dispatchBootstrap();
-  await vi.waitFor(() => expect(f.finishedTurns(run.ownerSessionId)).toBe(2));
+  await f.awaitFinishedTurns(run.ownerSessionId, 2);
   f.claude.onWorkTurn = async () => {};
   return run;
 };

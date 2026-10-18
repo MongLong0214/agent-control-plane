@@ -44,7 +44,7 @@ const history = (f: BootstrapRuntimeFixture, roleKey: string) =>
 const outage = async (f: BootstrapRuntimeFixture) => {
   const dispatched = await f.dispatchBootstrap();
   // The RUN_DISPATCH wake starts a turn of the conversation; let it finish first.
-  await vi.waitFor(() => expect(f.finishedTurns(dispatched.ownerSessionId)).toBe(2));
+  await f.awaitFinishedTurns(dispatched.ownerSessionId, 2);
   f.loseClaude();
   await f.daemon.reconcileContinuity("claude coverage lost");
   expect(f.harness.cp.bindings.active(dispatched.roleKey)).toBeNull();
@@ -341,7 +341,7 @@ describe("C1b: a restarted daemon holds no credential, and recovers the same ses
   it("the next reconcile revokes and pauses the bootstrap CTO whose credential is gone, and restore recovers it on the same session", async () => {
     await withBootstrapRuntime(async (f) => {
       const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       // What a restart leaves: the row, the binding and the run, and no plaintext in memory.
       f.harness.cp.sessionRuntime.release(ownerSessionId);
       expect(f.harness.cp.sessionRuntime.wake(roleKey, [{ id: "after-restart", kind: "test" }])).toMatchObject({

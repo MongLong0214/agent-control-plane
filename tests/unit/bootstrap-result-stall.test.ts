@@ -95,7 +95,7 @@ describe("the result stall: a driven bootstrap owner whose PLAN was accepted, wh
       const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onResult: "recovery-only" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
       // The attestation, then the RUN_DISPATCH's work turn: a PLAN accepted, the dispatch acknowledged, no result.
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
       expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
       expect(runDispatches(f, runId)).toEqual([{ generation: 1, status: "ACKED" }]);
@@ -138,7 +138,7 @@ describe("the result stall: a driven bootstrap owner whose PLAN was accepted, wh
       // Generation 1 acknowledged its RUN_DISPATCH and planned nothing, as before #1113.
       const owner = scriptBootstrapOwner(f, { onDispatch: "ack-only", onResult: "recovery-only" });
       const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
       // The restart loses the credential; continuity recovers the same session at generation 2 and
       // dispatches again. That turn plans (#1113's directive), acknowledges, and submits no result.
@@ -183,7 +183,7 @@ describe("the result stall: a driven bootstrap owner whose PLAN was accepted, wh
       const reviews = passBootstrapPlanReviews(f);
       const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onResult: "follow-prompt" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
+      await f.awaitFinishedTurns(ownerSessionId, 2);
       expect(f.harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
       expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
       expect(owner.results).toEqual([{ runId, ok: true, stage: "COMPLETED_REVIEW" }]);

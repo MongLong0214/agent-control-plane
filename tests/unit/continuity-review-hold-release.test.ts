@@ -54,7 +54,7 @@ const reviewReady = async (f: BootstrapRuntimeFixture, contract: Partial<TaskCon
   const dispatched = await f.hermes("run_dispatch", { runId });
   expect(dispatched, JSON.stringify(dispatched)).toMatchObject({ ok: true });
   const ownerSessionId = f.harness.cp.runs.require(runId).ownerSessionId!;
-  await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
+  await f.awaitFinishedTurns(ownerSessionId, 2);
   const planned = await f.cto(ownerSessionId, "plan_submit", {
     runId,
     plan: bootstrapPlan(cleanTreeManifest("review-hold")),
