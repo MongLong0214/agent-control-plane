@@ -1,0 +1,14 @@
+Limit: the registration wake was also the first knock on a newly registered endpoint, so an endpoint that refuses connections and has no confirmed work is now reported only when its first real wake fails
+Warn: a role registration sends its ACP-ROLE-WAKE only when the holder has confirmed work (Outbox.hasWorkForHolder: a pending in-band row, a pending or unresolved owner or peer message, or an owed refusal notice); a lookup that fails or a holder the port cannot derive still wakes, so the contract is that a registration wake with no confirmed work is skipped, not that no empty wake is ever sent; dispatch and owner-message wakes are unchanged
+Warn: the relay-reattach and canonical-cto-reattach process tests clear every inherited CLAUDE_CODE_MESSAGING_* variable before any relay runs, so their sockets live only in their own temp directories and never under a live ~/.agent-control-plane
+Record-Id: r-17d5a553f769
+Provenance: inherited 66abbc6f31e04162234406c7fcf3d613cd148d6f
+
+Warn: every relay process test clears inherited session-messaging variables by the CLAUDE_CODE_MESSAGING_ prefix through tests/helpers/session-messaging-env.ts, never by a list of the names known today; a list leaks any variable a later client adds under the prefix into relays started by the suite (R1154-01), so keep new relay suites on the shared helper
+Record-Id: r-649aa75204d6
+Provenance: inherited 571c7c7c1585f505c48fcaf537a88abab3820fbb
+
+Limit: tests/unit/relay-tests-clear-session-messaging-env.test.ts is a text match over the relay's known entry points (runAttachRelay, runAttachRelayCommand, runAdoptedCeoAttachRelay, and the CLI spawned with attach) and the files that call them; it is not a general analyzer, so a new entry point, or a relay started through a helper under another name, is outside it until the sweep is extended
+Warn: a test that runs the relay in process clears every CLAUDE_CODE_MESSAGING_* variable inside vi.hoisted, which runs before the file's imports evaluate; a module-level clear placed after the imports runs too late, because the imported src modules have already evaluated with the inherited values (shown with a temporary probe module before this commit)
+Record-Id: r-2d38b51452d8
+Provenance: inherited 03c8fb9850d641ac37c3adf2648e436faa4242e4
