@@ -51,9 +51,18 @@ export type CommitLoreMode = ProjectManifest["commitlore"]["mode"];
  */
 export const COMMITLORE_VERIFICATION_ID = "commitlore:doctor";
 
-/** The fixed argv this producer runs, in this order. Nothing in a plan or manifest reaches it. */
+/**
+ * The fixed argv this producer runs, in this order. Nothing in a plan or manifest reaches it.
+ *
+ * `--no-agent-hooks` (CEO c3c052bf): without it `init` writes its Claude Code injection hook, a PreToolUse
+ * hook in `.claude/settings.json`, into the working tree, and the checkout it is verifying is no longer the
+ * approved one (`COMMITLORE_CHANGED_CHECKOUT`). It skips only that hook: `init` still installs its git hooks,
+ * writes its git config, builds the record index, handles the directive author string and gives its own
+ * readiness verdict, and `doctor --json` is judged as before. The pin's checks refuse a CLI whose `init`
+ * does not offer the option (`NO_INIT_OPTION`) before `init` runs; there is no fallback to an argv without it.
+ */
 export const COMMITLORE_OBSERVATION_ARGV: ReadonlyArray<readonly string[]> = Object.freeze([
-  Object.freeze(["init", "--mcp-scope", "none", "--no-unattended"]),
+  Object.freeze(["init", "--mcp-scope", "none", "--no-unattended", "--no-agent-hooks"]),
   Object.freeze(["doctor", "--json"]),
 ]);
 
@@ -67,7 +76,7 @@ export type CommitLoreObservation =
 
 /** Runs CommitLore in a checkout. Production uses `createCommitLoreCliPort()`; tests pass a double. */
 export interface CommitLorePort {
-  /** `commitlore init --mcp-scope none --no-unattended`, then `commitlore doctor --json`, in `checkoutPath`. */
+  /** `commitlore init --mcp-scope none --no-unattended --no-agent-hooks`, then `commitlore doctor --json`, in `checkoutPath`. */
   observe(checkoutPath: string): Promise<CommitLoreObservation>;
 }
 
@@ -459,6 +468,8 @@ const refuse = (refusal: string, message: string, evidence: Record<string, unkno
  * A required CommitLore observation in `checkoutPath`: the port's PASS, and the checkout's status unchanged
  * by it — `init` may place hooks under `.git`, but a file it leaves in the working tree is not the approved
  * tree and is refused rather than published, ignored or removed. A port that throws has observed nothing.
+ * `--no-agent-hooks` asks `init` to write nothing there; this check does not rely on it, and still refuses
+ * any change in the working tree after the observation, a user's change made before it included.
  */
 export const requiredCommitLoreObservation = async (
   port: CommitLorePort | null,

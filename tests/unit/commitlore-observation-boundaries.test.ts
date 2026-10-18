@@ -31,8 +31,8 @@ const ok = JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCo
 
 // Slice S16: what the runner asks a pinned CLI before any other command, answered as a supported one does.
 const PIN_CHECKS = `if (process.argv[2] === '--version') process.stdout.write('1.7.3\\n');
-else if (process.argv[2] === 'doctor' && process.argv[3] === '--help') process.stdout.write('Usage: commitlore doctor [options]\\n  --json  emit the report as JSON\\n');
-else if (process.argv[2] === 'init' && process.argv[3] === '--help') process.stdout.write('Usage: commitlore init [options]\\n  --mcp-scope <scope>  where to register\\n  --no-unattended      leave unattended capture off\\n');
+else if (process.argv[2] === 'doctor' && process.argv[3] === '--help') process.stdout.write('Usage: commitlore doctor [options]\\n\\nOptions:\\n  --json  emit the report as JSON\\n');
+else if (process.argv[2] === 'init' && process.argv[3] === '--help') process.stdout.write('Usage: commitlore init [options]\\n\\nOptions:\\n  --mcp-scope <scope>  where to register\\n  --no-unattended      leave unattended capture off\\n  --no-agent-hooks     write nothing inside the working tree\\n');
 else {`;
 
 /**
