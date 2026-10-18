@@ -1,0 +1,9 @@
+Limit: the version cannot show this capability: the commitlore 1.7.4 release and the unreleased source after it both report 1.7.4, so it is read from init --help; until an official release that offers --no-agent-hooks is installed at the pinned path, every required observation refuses NO_INIT_OPTION (it refused COMMITLORE_CHANGED_CHECKOUT before), so #246 B3 is not complete until then
+Warn: the required CommitLore observation runs init with --no-agent-hooks, and a pinned CLI whose init --help does not offer that option is refused NO_INIT_OPTION before init runs; there is no fallback to the old argv, because plain init writes its Claude Code injection hook (.claude/settings.json) into the checkout it is verifying
+Record-Id: r-5af8790d183b
+Provenance: inherited c3835591950866cd4d50271901fcd0b5f1a7addf
+
+Limit: a commitlore whose help leaves commander's layout (no Options: section, another indent, tabs) declares nothing and is refused before init runs, fail-closed, until this rule is updated for the new layout
+Warn: the pin's init and doctor capability checks count an option only when it is declared in the usage's Options: section with commander's layout (exactly two spaces of indent, the whole option name, then whitespace, <, [, = or end of line); an epilogue sentence or a wrapped description line that starts with the option name declares nothing (B3-R1-01: such prose let init run on the production path), and both checks share this one rule
+Record-Id: r-c0341c4ad9cf
+Provenance: inherited 1170e07df2ce920d3f43210838070885bc769ecf
