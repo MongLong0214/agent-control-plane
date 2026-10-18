@@ -411,7 +411,38 @@ export class ExpectUsageTerminal implements UsageTerminal {
         stderr += error.message;
         finish({ stdout, stderr, exitCode: null, timedOut, error: error.message });
       });
-      child.on("close", (exitCode) => finish({ stdout, stderr, exitCode, timedOut, error: null }));
+
+      // FIX-STDIN-SIBLINGS — `expect -f -` runs its program as it reads it, so an `expect` that exits
+      // partway leaves the rest unread and the write fails with EPIPE. An `error` event nobody hears
+      // is an uncaught exception, and `src` has no handler for one. So the listener goes on before
+      // the write and stays for the stream's life. A program not handed over in full is a failed
+      // query whatever the terminal printed: that output answers a program nobody finished giving.
+      // Nothing here waits for stdin to close: `close` of the child and the outer timer still settle.
+      //
+      // SIGKILL, not `stop()`'s SIGTERM: the error comes as `expect` closes its stdin on the way out,
+      // and its default `trap exit {SIGINT SIGTERM}` runs from the signal handler. Measured: a SIGTERM
+      // landing inside `exit` deadlocks it in Tcl_FinalizeNotifier (bottomhalf → Tcl_AsyncMark waits on
+      // a mutex the exiting thread holds), and that `expect` then ignores SIGTERM forever — 20 of 50
+      // collections left one behind.
+      let programTaken = false;
+      const programNotTaken = (how: string): string =>
+        `expect did not take its program (${how}), so its output is not an answer to /usage`;
+      child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+        stop("SIGKILL");
+        finish({ stdout, stderr, exitCode: null, timedOut, error: programNotTaken(error.code ?? error.message) });
+      });
+      child.stdin?.once("finish", () => {
+        programTaken = true;
+      });
+      child.on("close", (exitCode) =>
+        finish({
+          stdout,
+          stderr,
+          exitCode,
+          timedOut,
+          error: programTaken ? null : programNotTaken("its stdin closed before the program was handed over"),
+        }),
+      );
 
       child.stdin?.end(expectProgram(input.steps, input.timeoutMs));
     });
@@ -656,6 +687,16 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
       };
       const timer = setTimeout(() => finish({ error: "codex app-server did not answer in time" }), input.timeoutMs);
       const send = (message: unknown): void => void childStdin.write(`${JSON.stringify(message)}\n`);
+      // FIX-STDIN-SIBLINGS — before the first `send`, and for as long as the stream lives. A server
+      // that is gone, or has shut its stdin, when a request is written fails the write with EPIPE; an
+      // `error` event nobody hears is an uncaught exception, and `src` has no handler for one. A
+      // request the server did not take has no answer, so this is the probe's failure, and anything
+      // the server says afterwards is not read as one. Nothing waits for stdin or the server to close.
+      childStdin.on("error", (error: NodeJS.ErrnoException) =>
+        finish({
+          error: `codex app-server did not take its request (${error.code ?? error.message}), so no rate-limit answer is read`,
+        }),
+      );
 
       childStdout.on("data", (chunk: Buffer) => {
         buffer += chunk.toString();
