@@ -134,7 +134,8 @@ The installer resolves the provider CLIs `claude`, `codex` and `grok` from the i
 `ACP_CLAUDE_BINARY`, `ACP_CODEX_BINARY` or `ACP_GROK_BINARY` unless that variable is already set,
 and the daemon passes it to the matching adapter. An absolute pin is the only channel by which a
 CLI outside the launcher's `PATH` is reachable; a configured adapter override takes precedence
-over the environment.
+over the environment. The launcher clears every inherited `ACP_RESOLVED_*_BINARY` (Buzz and
+CommitLore included) before its own, so each is only what the install resolved, or nothing.
 
 `commitlore` is resolved the same way, into `ACP_RESOLVED_COMMITLORE_BINARY`, but the operator's
 persistent value is the `ACP_COMMITLORE_BINARY` account under the same Keychain service: the launcher

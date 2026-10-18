@@ -538,6 +538,8 @@ const launcherObservations = (harness: InstallerHarness) => {
     ) as Record<(typeof HERMES_ADOPTION_VARIABLES)[number], string>,
     /** The packet reviewer's optional private Codex home override, appended after the Hermes group. */
     reviewerCodexHome: f[HERMES_BASE_FIELD + HERMES_ADOPTION_VARIABLES.length],
+    /** The `ACP_BUZZ_BINARY` the daemon was handed (field 7). */
+    buzz: f[7],
     /**
      * The `ACP_COMMITLORE_BINARY` the daemon was handed (#246 B3), exactly as handed: read raw, never
      * trimmed, and `undefined` when the variable was not exported.
@@ -2354,6 +2356,75 @@ exec /bin/cp "$@"
     expect(kept.runs, "an inherited internal variable reached the daemon as its CommitLore pin").toEqual([expected, expected]);
     expect(kept.lookups, "the launcher did not ask the Keychain on every launch").toBe(2);
   });
+
+  /**
+   * PIN-SIBLINGS: ACP1152-R1's closure, for the provider and Buzz pins. ACP_RESOLVED_<P>_BINARY is the
+   * launcher's own internal name for what this install resolved, and a value of it inherited from launchd
+   * (`launchctl setenv`) is never an input. Each row starts from a fake one in the parent environment,
+   * naming a real absolute executable, with no ACP_<P>_BINARY in the parent environment or the Keychain.
+   * How an inherited ACP_<P>_BINARY itself is treated is a separate question these rows do not touch.
+   */
+  const SIBLING_PINS = ["claude", "codex", "grok", "buzz"] as const;
+  type SiblingPin = (typeof SIBLING_PINS)[number];
+
+  /** What the daemon was handed for `name` on each of two launches, as a label. */
+  const siblingAcrossReexecution = (
+    harness: InstallerHarness,
+    name: SiblingPin,
+    candidates: Record<string, string>,
+  ): string[] =>
+    [1, 2].map(() => {
+      rmSync(harness.launcherEnvLog, { force: true });
+      const launched = runGeneratedLauncher(harness);
+      if (launched.status !== 0) return `nothing: the launcher exited ${launched.status}`;
+      const seen = launcherObservations(harness);
+      const handed = name === "buzz" ? seen.buzz : seen.handed[name];
+      if (handed === "<unset>") return "unset";
+      return Object.entries(candidates).find(([, value]) => value === handed)?.[0] ?? "something else";
+    });
+
+  /** A fake ACP_RESOLVED_<P>_BINARY in the parent environment, and no ACP_<P>_BINARY there. */
+  const inheritSiblingInternal = (harness: InstallerHarness, name: SiblingPin): string => {
+    delete harness.env[`ACP_${name.toUpperCase()}_BINARY`];
+    const directory = join(harness.home, "inherited-cli");
+    mkdirSync(directory, { recursive: true });
+    const fake = writeProviderCli(join(directory, name), SELF_CONTAINED_CLI);
+    harness.env[`ACP_RESOLVED_${name.toUpperCase()}_BINARY`] = fake;
+    return fake;
+  };
+
+  for (const name of SIBLING_PINS) {
+    const internal = `ACP_RESOLVED_${name.toUpperCase()}_BINARY`;
+
+    it(`PIN-SIBLINGS replaces an inherited ${internal} with the ${name} pin this install resolved, across re-execution`, () => {
+      const harness = makeHarness();
+      const generated = cliDirectories(harness, name)[name] as string;
+      const fake = inheritSiblingInternal(harness, name);
+
+      expect(installWithPins(harness).status).toBe(0);
+      expect(readFileSync(launcherPath(harness), "utf8").split("\n")).toContain(`${internal}=${generated}`);
+      expect(
+        siblingAcrossReexecution(harness, name, { "the generated pin": generated, "the inherited fake": fake }),
+        `the daemon was not handed the ${name} pin this install resolved`,
+      ).toEqual(["the generated pin", "the generated pin"]);
+    });
+
+    it(`PIN-SIBLINGS gives the daemon no ${name} pin from an inherited ${internal} when ${name} did not resolve`, () => {
+      const harness = makeHarness();
+      cliDirectories(harness);
+      assertProviderUnresolvable(harness, name);
+      const fake = inheritSiblingInternal(harness, name);
+
+      expect(installWithPins(harness).status).toBe(0);
+      expect(readFileSync(launcherPath(harness), "utf8"), "the precondition is a launcher with no baked pin").not.toMatch(
+        new RegExp(`^${internal}=`, "m"),
+      );
+      expect(
+        siblingAcrossReexecution(harness, name, { "the inherited fake": fake }),
+        `an inherited ${internal} reached the daemon as its ${name} pin`,
+      ).toEqual(["unset", "unset"]);
+    });
+  }
 
   it("ACP1152-R2 withholds the baked pin across re-execution when the Keychain item is present but empty, and says so", () => {
     const harness = makeHarness();
