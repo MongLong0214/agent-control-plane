@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { copyFileSync } from "node:fs";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
@@ -10,9 +11,13 @@ import { Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import type { GatePayload } from "../../src/github/github-kernel.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { createHermesMcpPort } from "../../src/mcp/hermes-server.ts";
+import { approveMigration } from "../../src/db/migration-approval.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
-import { writeOutsideTheGuard } from "../helpers/released-v47-schema.ts";
+import { carryRows, laterObjectsIn, releasedChainImage } from "../helpers/released-chain-image.ts";
+import { privateStatePath } from "../helpers/released-v44-schema.ts";
+import { contentDigests } from "../helpers/released-v45-schema.ts";
+import { V47_BASE_CHECKSUM, writeOutsideTheGuard } from "../helpers/released-v47-schema.ts";
 import {
   approveReviewedCandidateForFinalization,
   type Harness,
@@ -1352,5 +1357,176 @@ describe("SEC-OD1 v48 capability scope: the run engine holds the marker for its 
     }
     expect(supersededFlags(w)).toEqual(flags);
     expect(markerNow(w)).toBe(0);
+  });
+});
+
+/**
+ * FIX-SEC-R2 (CEO 85eac6ef, option B) — the review's upgrade counterexample (sec-r2 upgrade-siblings :1366):
+ * an approval nobody admitted, written with the canonical label by an ordinary write at v46 (ACP's v46
+ * connection, whose marker returns 0), survived the upgrade and overrode the owner's refusal; publication
+ * and merge each went through once. v47 now refuses its first install while any APPROVAL carries the label.
+ *
+ * Each world is taken back to the released v46 image the review's way: the run's rows carried into the
+ * released chain's v46 schema (`carryRows`), with every decision as a database of that era holds it, the
+ * "service" label. Pre-v47 writes are measured on that image, and everything after on what the upgrade
+ * produced. Nothing here imports the refusal from the code, so this file loads at the build before it.
+ */
+const asReleasedV46 = (w: World): string => {
+  const source = w.harness.cp.config.databasePath;
+  const path = releasedChainImage(privateStatePath("acp-secr2-v46-"), 46);
+  w.harness.cp.close();
+  const image = new Database(path);
+  try {
+    image.pragma("foreign_keys = OFF");
+    const triggers = image.prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY rowid").all() as Array<{ name: string; sql: string }>;
+    const tables = image.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_migrations'").pluck().all() as string[];
+    image.exec("BEGIN IMMEDIATE");
+    for (const trigger of triggers) image.exec(`DROP TRIGGER "${trigger.name}"`);
+    for (const table of tables) image.exec(`DELETE FROM "${table}"`);
+    for (const trigger of triggers) image.exec(trigger.sql);
+    image.exec("COMMIT");
+  } finally {
+    image.close();
+  }
+  carryRows(source, path);
+  expect(laterObjectsIn(path, 46)).toEqual([]);
+  copyFileSync(path, source);
+  return source;
+};
+
+/** An ordinary write at v46, on a connection whose marker returns 0 as ACP's v46 connection's did. */
+const forgeAtV46 = (w: World, path: string, artifactId: string, item: string): void => {
+  const content = forgedDecision(w, item, `pre-v47 forgery of ${item}`);
+  const raw = new Database(path);
+  try {
+    expect(raw.pragma("user_version", { simple: true })).toBe(46);
+    raw.function("acp_evidence_write_authorized", () => 0);
+    raw.prepare(
+      `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+       VALUES (?, ?, 'APPROVAL', ?, ?, ?, ?, ?)`,
+    ).run(artifactId, w.runId, digestOf(content), w.candidate, JSON.stringify(content), OWNER_DECISION_LABEL, w.harness.clock.nowIso());
+  } finally {
+    raw.close();
+  }
+  expect(content.receipt.actor).toBe("not-the-owner");
+  sideConsumption(w, content.receipt, w.candidate);
+};
+
+/** The approved upgrade, as the daemon opens the database; the harness, or what the opening threw. */
+const upgrade = (w: World, why: string): unknown => {
+  approveMigration(w.harness.cp.config.databasePath, why);
+  try {
+    w.harness = makeHarness({ root: w.harness.root, repoPath: w.harness.repoPath, githubClient: w.github, clock: w.harness.clock });
+  } catch (error) {
+    return error;
+  }
+  installDaemonFinalizerGitHubFixture(w.harness);
+  w.harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+  return undefined;
+};
+
+const receiptAt47 = (w: World): unknown =>
+  w.harness.cp.db.get("SELECT migration_id, checksum FROM schema_migrations WHERE version = 47");
+
+const external = (w: World) => ({
+  writes: w.github.calls.filter((call) => call.method !== "GET").length,
+  merges: w.github.mergeCount,
+  checks: w.github.checkRuns.length,
+});
+
+/** The owner's history as a v46 database holds it: both items approved, then the refusal of ITEM_B, all "service". */
+const v46History = async (): Promise<World> => {
+  const w = await world([...ITEMS], { before: true });
+  asBeforeSecOd1(w, () => decide(w, ITEM_B, false, "the owner refused, before SEC-OD1"));
+  expect(decisionLabels(w)).toEqual([[ITEM_A, true, "service"], [ITEM_B, true, "service"], [ITEM_B, false, "service"]]);
+  return w;
+};
+
+describe("FIX-SEC-R2 a canonical label written before the guard refuses the upgrade (option B)", () => {
+  it("SECR2-UPGRADE never-admitted canonical approvals written by an ordinary v46 write refuse v47: no upgrade, 0 publications and 0 merges, the v46 database unchanged", async () => {
+    const w = await v46History();
+    const path = asReleasedV46(w);
+    forgeAtV46(w, path, "art_secr2_forged_a", ITEM_A);
+    forgeAtV46(w, path, "art_secr2_forged_b", ITEM_B);
+    const before = contentDigests(path);
+    expect(before.userVersion).toBe(46);
+
+    const refusal = upgrade(w, "FIX-SEC-R2 forged label at v46");
+    // Before option B the upgrade went through; what the forged rows then did is driven to the merge.
+    let driven = "NOT_OPENED";
+    if (refusal === undefined) {
+      const published = await w.harness.cp.github.gatePublish(w.payload, w.identity);
+      const merged = published.allowed ? await merge(w, await openPull(w)) : published;
+      driven = JSON.stringify({ gate: gateAccepts(w), published: outcome(published), merged: outcome(merged) });
+    }
+    expect({ driven, ...external(w) }).toEqual({ driven: "NOT_OPENED", writes: 0, merges: 0, checks: 0 });
+    expect(refusal).toMatchObject({
+      reasonCode: ReasonCode.INTERNAL_ERROR,
+      message: "migration failed; the original database was restored from its automatic backup",
+      evidence: { fromVersion: 46 },
+    });
+    const migrationError = String((refusal as { evidence: { migrationError: unknown } }).evidence.migrationError);
+    expect(migrationError).toMatch(/^v47 refuses: OWNER_DECISION_LABEL_PREDATES_GUARD — run_artifacts holds 2 APPROVAL row\(s\) labelled "production-gate:owner-decision"/);
+    expect(migrationError).toContain('"art_secr2_forged_a", "art_secr2_forged_b";');
+    expect(contentDigests(path)).toEqual(before);
+  });
+
+  it("SECR2-CLEAN the same v46 history without the forgery upgrades: the corrected v47 receipt, the refusal recorded before SEC-OD1 still blocks, and the owner's new canonical approvals publish and merge", async () => {
+    const w = await v46History();
+    asReleasedV46(w);
+    expect(upgrade(w, "FIX-SEC-R2 clean v46")).toBeUndefined();
+    expect(w.harness.cp.db.raw.pragma("user_version", { simple: true })).toBeGreaterThanOrEqual(48);
+    expect(receiptAt47(w)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });
+    expect(decisionLabels(w)).toEqual([[ITEM_A, true, "service"], [ITEM_B, true, "service"], [ITEM_B, false, "service"]]);
+
+    expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false, decideAgain: [ITEM_A] });
+    expect(await w.harness.cp.github.gatePublish(w.payload, w.identity)).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
+    expect(external(w)).toEqual({ writes: 0, merges: 0, checks: 0 });
+
+    for (const item of ITEMS) decide(w, item, true, `decided again after the upgrade: ${item}`);
+    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+    expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+    expect(outcome(await merge(w, await openPull(w)))).toBe("ALLOWED");
+    expect(external(w)).toMatchObject({ merges: 1, checks: 1 });
+  });
+
+  it("SECR2-AFTER-GUARD canonical decisions written under the guard never refuse the v48 upgrade or a reopen: the gate reads them, and the merge goes through once", async () => {
+    const w = await world([...ITEMS]);
+    expect(decisionLabels(w)).toEqual([[ITEM_A, true, OWNER_DECISION_LABEL], [ITEM_B, true, OWNER_DECISION_LABEL]]);
+    const source = w.harness.cp.config.databasePath;
+    const path = releasedChainImage(privateStatePath("acp-secr2-v47-"), 47);
+    w.harness.cp.close();
+    const image = new Database(path);
+    try {
+      image.pragma("foreign_keys = OFF");
+      const triggers = image.prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY rowid").all() as Array<{ name: string; sql: string }>;
+      const tables = image.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_migrations'").pluck().all() as string[];
+      image.exec("BEGIN IMMEDIATE");
+      for (const trigger of triggers) image.exec(`DROP TRIGGER "${trigger.name}"`);
+      for (const table of tables) image.exec(`DELETE FROM "${table}"`);
+      for (const trigger of triggers) image.exec(trigger.sql);
+      image.exec("COMMIT");
+      expect(image.prepare("SELECT migration_id, checksum FROM schema_migrations WHERE version = 47").get())
+        .toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });
+    } finally {
+      image.close();
+    }
+    carryRows(source, path);
+    expect(laterObjectsIn(path, 47)).toEqual([]);
+    copyFileSync(path, source);
+
+    expect(upgrade(w, "FIX-SEC-R2 v47 to v48 after the guard")).toBeUndefined();
+    expect(decisionLabels(w)).toEqual([[ITEM_A, true, OWNER_DECISION_LABEL], [ITEM_B, true, OWNER_DECISION_LABEL]]);
+    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+    // A plain reopen at the current version runs no step and reads the same decisions.
+    w.harness.cp.close();
+    w.harness = makeHarness({ root: w.harness.root, repoPath: w.harness.repoPath, githubClient: w.github, clock: w.harness.clock });
+    installDaemonFinalizerGitHubFixture(w.harness);
+    w.harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+    expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+    expect(outcome(await merge(w, await openPull(w)))).toBe("ALLOWED");
+    expect(external(w)).toMatchObject({ merges: 1, checks: 1 });
+    expect(receiptAt47(w)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });
   });
 });

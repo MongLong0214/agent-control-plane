@@ -13,7 +13,7 @@ import { laterObjectsIn, releasedChainImage } from "../helpers/released-chain-im
 import { digestOfSchemaRows, privateStatePath, schemaRowsOf } from "../helpers/released-v44-schema.ts";
 import { V45_BASE_CHECKSUM, contentDigests } from "../helpers/released-v45-schema.ts";
 import { V46_BASE_CHECKSUM, V46_SCHEMA_DIGEST_FROM_V11 } from "../helpers/released-v46-schema.ts";
-import { V47_ADDED_TRIGGERS } from "../helpers/released-v47-schema.ts";
+import { V47_ADDED_TRIGGERS, V47_BASE_CHECKSUM } from "../helpers/released-v47-schema.ts";
 import { V48_ADDED_TRIGGERS } from "../helpers/released-v48-schema.ts";
 
 afterAll(cleanupTempDirs);
@@ -35,6 +35,11 @@ afterAll(cleanupTempDirs);
  *       An exact pre-existing definition is accepted, and a repeated application changes nothing.
  *   S3  Rollback: a fault after v47 commits restores the v46 image, and the pre-migration backup
  *       restores through the operator restore drill.
+ *   S4  FIX-SEC-R2 (CEO 85eac6ef, option B): an APPROVAL that already carries the canonical label when
+ *       the guard is first installed refuses the step, whoever wrote it, with OWNER_DECISION_LABEL_PREDATES_GUARD
+ *       and the first artifact ids, cut short; nothing is installed, no receipt is written, the image is
+ *       restored and no row is deleted, relabelled or promoted. Only the label clause is read, never
+ *       "service" history. Once the guard is installed, canonical decisions never refuse v48 or a reopen.
  *
  * Pre-v47 and post-v47 are never mixed: what the released v46 image admits is measured on that image
  * before it is migrated, and every refusal is measured on the image v47 produced.
@@ -312,17 +317,15 @@ const triggersOf = (path: string): string[] => {
 };
 
 /**
- * Rows as the v46 build left them: ACP's capability writes (marker 1) and its ordinary writes
- * (marker 0, the "service" label), OWNER_DECISION refusals and approvals of that era among them.
- * On the released v46 image an ordinary write of the canonical label is admitted: the pre-v47
- * counterexample, measured on the v46 image before it is migrated.
+ * Rows as the released v46 build left them: ACP's capability writes (marker 1, evidence) and its
+ * ordinary writes (marker 0, the "service" label), OWNER_DECISION refusals and approvals of that era
+ * among them. No released build before v47 wrote the canonical label, so none carries it.
  */
-const seedAsV46 = (path: string): { legacy: Row[]; preV47Forgery: Row } => {
+const seedAsV46 = (path: string): { legacy: Row[] } => {
   const capability = foreign(path, () => 1);
   try {
     seedRun(capability);
     capability.prepare(INSERT).run(...params(row("VERIFICATION", { candidateSnapshotDigest: CANDIDATE, passed: true }, "verification-engine")));
-    capability.prepare(INSERT).run(...params(row("APPROVAL", decision("item a", true), LABEL)));
   } finally {
     capability.close();
   }
@@ -335,12 +338,24 @@ const seedAsV46 = (path: string): { legacy: Row[]; preV47Forgery: Row } => {
       row("APPROVAL", { kind: "REPO_FACTORY_GITHUB_WRITE_APPROVAL", owner: "o" }, "service"),
     ];
     for (const r of legacy) expect(tryInsert(ordinary, r)).toBe("ADMITTED");
-    const preV47Forgery = row("APPROVAL", decision("item c", true), LABEL);
-    expect(tryInsert(ordinary, preV47Forgery)).toBe("ADMITTED");
-    return { legacy, preV47Forgery };
+    return { legacy };
   } finally {
     ordinary.close();
   }
+};
+
+/**
+ * The pre-v47 counterexample, measured on the v46 image before it is migrated: an ordinary write
+ * (marker 0) of the canonical label is admitted there, or a write under the marker if `marker` says so.
+ */
+const writeAtV46 = (path: string, r: Row, marker: () => unknown = () => 0): Row => {
+  const raw = foreign(path, marker);
+  try {
+    expect(tryInsert(raw, r)).toBe("ADMITTED");
+  } finally {
+    raw.close();
+  }
+  return r;
 };
 
 describe("S1: the v46 → v47 step on the released v46 image", () => {
@@ -351,7 +366,7 @@ describe("S1: the v46 → v47 step on the released v46 image", () => {
 
   it("keeps every row, the legacy \"service\" OWNER_DECISION rows included, and the v45 and v46 receipts byte for byte; adds only the guard and its receipt (and v48's, which follows); then refuses the same forgery", () => {
     const path = releasedV46("acp-v47-s1-");
-    const { legacy, preV47Forgery } = seedAsV46(path);
+    const { legacy } = seedAsV46(path);
     const before = contentDigests(path);
     const receiptsBefore = receiptsThrough46(path);
     const triggersBefore = triggersOf(path);
@@ -384,7 +399,7 @@ describe("S1: the v46 → v47 step on the released v46 image", () => {
         migration_id: "v47-owner-decision-authority-guard",
         checksum: MIGRATIONS.find((step) => step.toVersion === 47)!.checksum(),
       });
-      for (const r of [...legacy, preV47Forgery]) {
+      for (const r of legacy) {
         expect(raw.prepare("SELECT produced_by, content_json FROM run_artifacts WHERE artifact_id = ?").get(r.id))
           .toEqual({ produced_by: r.producedBy, content_json: r.content });
       }
@@ -527,5 +542,193 @@ describe("S3: rollback through the restore drill", () => {
     restoreDatabase(path, backupFile);
     expect(contentDigests(path)).toEqual(before);
     expect(triggersOf(path)).not.toContain(GUARD);
+  });
+});
+
+/**
+ * FIX-SEC-R2 (CEO 85eac6ef, option B). The review's counterexample: a never-admitted approval written
+ * with the canonical label by an ordinary v46 write survived the upgrade and overrode the owner's
+ * refusal. The guard cannot authenticate a label already stored, so its first install refuses while any
+ * APPROVAL carries one. Literal strings only, so this file loads at the build before the refusal too.
+ */
+const PRE_GUARD_REFUSAL = /^v47 refuses: OWNER_DECISION_LABEL_PREDATES_GUARD — run_artifacts holds (\d+) APPROVAL row\(s\) labelled "production-gate:owner-decision" from before the owner-decision guard existed: /;
+
+/** Approves and opens `path`; returns the migrator's own error text, or undefined when it migrated. */
+const upgradeRefusal = (path: string, why: string): string | undefined => {
+  approveMigration(path, why);
+  try {
+    new Db(path).close();
+    return undefined;
+  } catch (error) {
+    expect(String(error)).toMatch(/original database was restored/);
+    return String((error as { evidence?: { migrationError?: unknown } }).evidence?.migrationError);
+  }
+};
+
+const receiptAt = (path: string, version: number): unknown => {
+  const raw = new Database(path, { readonly: true });
+  try {
+    return raw.prepare("SELECT migration_id, checksum FROM schema_migrations WHERE version = ?").get(version);
+  } finally {
+    raw.close();
+  }
+};
+
+const storedAs = (path: string, rows: readonly Row[]): unknown[] => {
+  const raw = new Database(path, { readonly: true });
+  try {
+    return rows.map((r) => raw.prepare("SELECT kind, produced_by, content_json, superseded FROM run_artifacts WHERE artifact_id = ?").get(r.id));
+  } finally {
+    raw.close();
+  }
+};
+
+describe("S4: a canonical label already stored when the guard is first installed refuses v47 (FIX-SEC-R2, option B)", () => {
+  it("SECR2 the review's counterexample, an ordinary v46 write of the label, refuses the step: the cause and the row are named, no guard, no receipt, the v46 image unchanged", () => {
+    const path = releasedV46("acp-v47-s4-forged-");
+    const { legacy } = seedAsV46(path);
+    const forged = writeAtV46(path, row("APPROVAL", { ...decision("item b", true), receipt: { actor: "not-the-owner", inboundNonce: "never-admitted" } }, LABEL));
+    const before = contentDigests(path);
+    const receipts = receiptsThrough46(path);
+    const triggers = triggersOf(path);
+
+    const refusal = upgradeRefusal(path, "v47 S4 forged label");
+    expect(refusal).toMatch(PRE_GUARD_REFUSAL);
+    expect(refusal).toContain(`holds 1 APPROVAL row(s)`);
+    expect(refusal).toContain(JSON.stringify(forged.id));
+    for (const r of legacy) expect(refusal).not.toContain(r.id);
+    expect(refusal).toMatch(/no row was deleted, relabelled or promoted$/);
+
+    expect(contentDigests(path)).toEqual(before);
+    expect(before.userVersion).toBe(46);
+    expect(receiptsThrough46(path)).toEqual(receipts);
+    expect(receiptAt(path, 47)).toBeUndefined();
+    expect(triggersOf(path)).toEqual(triggers);
+    expect(triggersOf(path)).not.toContain(GUARD);
+    expect(storedAs(path, [forged, ...legacy])).toEqual([forged, ...legacy].map((r) => ({
+      kind: r.kind, produced_by: r.producedBy, content_json: r.content, superseded: 0,
+    })));
+  });
+
+  const WRITTEN: ReadonlyArray<{ name: string; write: (path: string) => Row }> = [
+    { name: "under the marker (a candidate build's capability write)", write: (path) => writeAtV46(path, row("APPROVAL", decision("item a", true), LABEL), () => 1) },
+    { name: "on content that is not a decision", write: (path) => writeAtV46(path, row("APPROVAL", { kind: "NOT_A_DECISION" }, LABEL)) },
+    { name: "as a refusal", write: (path) => writeAtV46(path, row("APPROVAL", decision("item a", false), LABEL)) },
+  ];
+
+  it.each(WRITTEN)("SECR2 the label written $name refuses the step as well, and the image is unchanged", ({ write }) => {
+    const path = releasedV46("acp-v47-s4-written-");
+    seedAsV46(path);
+    const labelled = write(path);
+    const before = contentDigests(path);
+    const refusal = upgradeRefusal(path, "v47 S4 label variants");
+    expect(refusal).toMatch(PRE_GUARD_REFUSAL);
+    expect(refusal).toContain(`holds 1 APPROVAL row(s)`);
+    expect(refusal).toContain(JSON.stringify(labelled.id));
+    expect(contentDigests(path)).toEqual(before);
+    expect(receiptAt(path, 47)).toBeUndefined();
+  });
+
+  it("SECR2 the check does not depend on the trigger: a v46 image that already holds the exact guard and a stored label refuses all the same", () => {
+    const fresh = privateStatePath("acp-v47-s4-exact-def-");
+    new Db(fresh).close();
+    const exact = schemaRowsOf(fresh).find((r) => r.name === GUARD)!.sql!;
+    const path = releasedV46("acp-v47-s4-exact-");
+    seedAsV46(path);
+    const forged = writeAtV46(path, row("APPROVAL", decision("item a", true), LABEL));
+    const raw = new Database(path);
+    try {
+      raw.exec(exact);
+    } finally {
+      raw.close();
+    }
+    const before = contentDigests(path);
+    const refusal = upgradeRefusal(path, "v47 S4 guard already present");
+    expect(refusal).toMatch(PRE_GUARD_REFUSAL);
+    expect(refusal).toContain(JSON.stringify(forged.id));
+    expect(contentDigests(path)).toEqual(before);
+    expect(receiptAt(path, 47)).toBeUndefined();
+  });
+
+  it("SECR2 the refusal names at most five rows in rowid order, each id cut to 64 characters and escaped, and counts the rest", () => {
+    const path = releasedV46("acp-v47-s4-many-");
+    seedAsV46(path);
+    const long = `art_${"x".repeat(196)}`;
+    const spoof = 'art_"spoof\nRESULT: PASS';
+    const ids = [long, spoof, "art_s4_3", "art_s4_4", "art_s4_5", "art_s4_6", "art_s4_7"];
+    for (const id of ids) writeAtV46(path, { ...row("APPROVAL", decision(`item ${id.slice(0, 12)}`, true), LABEL), id });
+    const refusal = upgradeRefusal(path, "v47 S4 many labels")!;
+    expect(refusal).toMatch(PRE_GUARD_REFUSAL);
+    expect(refusal).toContain(`holds 7 APPROVAL row(s)`);
+    expect(refusal).toContain(`: ${JSON.stringify(`${long.slice(0, 64)}…`)}, ${JSON.stringify(spoof)}, "art_s4_3", "art_s4_4", "art_s4_5" (+2 more);`);
+    expect(refusal).not.toContain(long);
+    expect(refusal).not.toContain("art_s4_6");
+    expect(refusal.includes("\n")).toBe(false);
+    expect(receiptAt(path, 47)).toBeUndefined();
+  });
+
+  it("SECR2 rows the guard's label clause does not read never refuse: OWNER_DECISION content labelled \"service\", the label on a HANDOFF, and a label differing by case or a trailing space", () => {
+    const path = releasedV46("acp-v47-s4-unread-");
+    const { legacy } = seedAsV46(path);
+    const unread = [
+      writeAtV46(path, row("HANDOFF", decision("item a", true), LABEL)),
+      writeAtV46(path, row("APPROVAL", decision("item a", true), LABEL.toUpperCase())),
+      writeAtV46(path, row("APPROVAL", decision("item a", true), `${LABEL} `)),
+    ];
+    const before = contentDigests(path);
+    expect(upgradeRefusal(path, "v47 S4 rows the label clause does not read")).toBeUndefined();
+    const after = contentDigests(path);
+    expect(after.userVersion).toBe(SCHEMA_VERSION);
+    const { schema_migrations: _receiptsBefore, ...restBefore } = before.tables;
+    const { schema_migrations: _receiptsAfter, ...restAfter } = after.tables;
+    expect(restAfter).toEqual(restBefore);
+    expect(triggersOf(path)).toContain(GUARD);
+    expect(receiptAt(path, 47)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });
+    expect(storedAs(path, [...legacy, ...unread])).toEqual([...legacy, ...unread].map((r) => ({
+      kind: r.kind, produced_by: r.producedBy, content_json: r.content, superseded: 0,
+    })));
+  });
+
+  it("SECR2 a label stored at v45 refuses at v47, and the migrator restores the v45 image: no v46 or v47 receipt", () => {
+    const path = releasedChainImage(privateStatePath("acp-v47-s4-v45-"), 45);
+    expect(laterObjectsIn(path, 45)).toEqual([]);
+    seedAsV46(path);
+    const forged = writeAtV46(path, row("APPROVAL", decision("item a", true), LABEL));
+    const before = contentDigests(path);
+    expect(before.userVersion).toBe(45);
+    const refusal = upgradeRefusal(path, "v47 S4 from v45");
+    expect(refusal).toMatch(PRE_GUARD_REFUSAL);
+    expect(refusal).toContain(JSON.stringify(forged.id));
+    expect(contentDigests(path)).toEqual(before);
+    expect(receiptAt(path, 46)).toBeUndefined();
+    expect(receiptAt(path, 47)).toBeUndefined();
+  });
+
+  it("SECR2 once the guard is installed the check is never repeated: canonical decisions written under it upgrade to v48 and reopen, every row unchanged", () => {
+    const path = releasedChainImage(privateStatePath("acp-v47-s4-after-"), 47);
+    expect(laterObjectsIn(path, 47)).toEqual([]);
+    expect(receiptAt(path, 47)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });
+    const capability = foreign(path, () => 1);
+    let canonical: Row[];
+    try {
+      seedRun(capability);
+      canonical = [row("APPROVAL", decision("item a", true), LABEL), row("APPROVAL", decision("item b", false), LABEL)];
+      for (const r of canonical) expect(tryInsert(capability, r)).toBe("ADMITTED");
+    } finally {
+      capability.close();
+    }
+    const before = contentDigests(path);
+    expect(upgradeRefusal(path, "v47 S4 v48 after the guard")).toBeUndefined();
+    const upgraded = contentDigests(path);
+    expect(upgraded.userVersion).toBe(SCHEMA_VERSION);
+    const { schema_migrations: _receiptsBefore, ...restBefore } = before.tables;
+    const { schema_migrations: _receiptsAfter, ...restAfter } = upgraded.tables;
+    expect(restAfter).toEqual(restBefore);
+    new Db(path).close();
+    expect(contentDigests(path)).toEqual(upgraded);
+    expect(receiptAt(path, 47)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });
+    expect(storedAs(path, canonical)).toEqual(canonical.map((r) => ({
+      kind: r.kind, produced_by: r.producedBy, content_json: r.content, superseded: 0,
+    })));
   });
 });

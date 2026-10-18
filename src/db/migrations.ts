@@ -3613,12 +3613,61 @@ export const V47_OWNER_DECISION_TRIGGER_NAMES: readonly string[] = [
  * `CREATE TRIGGER IF NOT EXISTS` then adds it only where the name is free, so a repeated application
  * changes nothing. The name is checked again after.
  *
+ * Labels written before the guard (CEO 85eac6ef, option B). The guard refuses new writes; it cannot
+ * authenticate a label already stored. Before v47 any ordinary `Db.run` could write the canonical label
+ * (measured: a never-admitted `not-the-owner` approval written that way at v46 overrode the owner's
+ * refusal after the upgrade, and publication and merge each went through once), and no released build
+ * before v47 wrote it at all. So this step, in its own migration transaction and before it installs the
+ * guard, counts the APPROVAL rows that carry the canonical label as the guard's label clause reads it
+ * (`V47_PRE_GUARD_LABEL_PREDICATE`), and refuses if there is any: `v47 refuses:
+ * OWNER_DECISION_LABEL_PREDATES_GUARD`, the count and the first artifact ids, each cut short. Nothing is
+ * installed and no receipt is written; the migrator then restores the image it backed up. The step never
+ * deletes, relabels or promotes a row. Content alone is not refused: OWNER_DECISION
+ * rows labelled "service" are the history every decision before SEC-OD1 has, and the readers already
+ * count only their exactly bound refusals.
+ *
+ * The check runs at this step only, the one time a database goes from v46 to v47; it does not depend on
+ * whether the trigger is already there, since an ordinary `Db.run` at v46 could create it too. v48 and
+ * every later open never repeat it, so a canonical decision written under the guard is never refused for
+ * its label. A database that already holds a v47 receipt is not re-examined: that receipt says only that
+ * a v47 step committed, not that the rows it found were legitimate. v47 was never released, so such a
+ * database is a candidate or diagnostic one; the candidate's receipt checksum
+ * (sha256:f9b23700…, written before this check existed) differs from this step's, which covers the
+ * predicate. Nothing cleans such a database, and nothing should be taken from it as released history.
+ *
  * Limit: a connection that defines `acp_evidence_write_authorized` itself, to return 1, passes this
  * guard (CEO 52c3b1e6 (b)); it is a boundary against ACP's own `Db.run`, not against every raw writer.
  *
  * A live database at v46 reaches this step only through an approved migration
  * (`assertMigrationApproved`), as it does every step.
  */
+const V47_PRE_GUARD_LABEL_PREDICATE = "kind = 'APPROVAL' AND produced_by = 'production-gate:owner-decision'";
+
+/** At most this many artifact ids, each cut to this many characters, are named in the refusal. */
+const V47_PRE_GUARD_IDS_SHOWN = 5;
+const V47_PRE_GUARD_ID_CHARS = 64;
+
+const refuseLabelsBeforeTheGuard = (raw: Database.Database): void => {
+  const count = (raw.prepare(`SELECT COUNT(*) AS n FROM run_artifacts WHERE ${V47_PRE_GUARD_LABEL_PREDICATE}`).get() as { n: number }).n;
+  if (count === 0) return;
+  const shown = (raw
+    .prepare(
+      `SELECT substr(CAST(artifact_id AS TEXT), 1, ${V47_PRE_GUARD_ID_CHARS + 1}) AS id FROM run_artifacts
+        WHERE ${V47_PRE_GUARD_LABEL_PREDICATE} ORDER BY rowid LIMIT ${V47_PRE_GUARD_IDS_SHOWN}`,
+    )
+    .all() as Array<{ id: string | null }>)
+    .map(({ id }) => id === null ? "NULL" : JSON.stringify(id.length > V47_PRE_GUARD_ID_CHARS ? `${id.slice(0, V47_PRE_GUARD_ID_CHARS)}…` : id));
+  const more = count > shown.length ? ` (+${count - shown.length} more)` : "";
+  throw acpError(
+    ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+    `v47 refuses: OWNER_DECISION_LABEL_PREDATES_GUARD — run_artifacts holds ${count} APPROVAL row(s) labelled ` +
+      `"production-gate:owner-decision" from before the owner-decision guard existed: ${shown.join(", ")}${more}; ` +
+      "a label written before the guard cannot show the owner decided, so the guard is not installed over it; " +
+      "no row was deleted, relabelled or promoted",
+    { refusal: "OWNER_DECISION_LABEL_PREDATES_GUARD", count, artifactIds: shown, unlisted: count - shown.length },
+  );
+};
+
 const v47: SchemaMigration = {
   id: "v47-owner-decision-authority-guard",
   fromVersion: 46,
@@ -3626,10 +3675,14 @@ const v47: SchemaMigration = {
   apply: (raw) => {
     const objects = stepTriggerObjects(47, V47_OWNER_DECISION_TRIGGER_NAMES);
     assertStepNames(raw, 47, objects, "before");
+    refuseLabelsBeforeTheGuard(raw);
     raw.exec(triggerDdlFor(V47_OWNER_DECISION_TRIGGER_NAMES, 47));
     assertStepNames(raw, 47, objects, "after");
   },
-  checksum: () => migrationChecksum("v47-owner-decision-authority-guard", 47),
+  // The snapshot and the refusal predicate: a receipt written by the candidate step, which had no
+  // refusal, cannot be mistaken for this one's.
+  checksum: () =>
+    sha256(`v47-owner-decision-authority-guard\n${schemaSqlAt(47)}\nrefused-before-install: ${V47_PRE_GUARD_LABEL_PREDICATE}`),
 };
 
 /** v48's guards, read from schema.sql by name (SEC-OD1): the supersede guard, then insert by rowid, rowid change, non-positive rowid. */
@@ -3667,6 +3720,9 @@ export const V48_OWNER_DECISION_SUPERSEDE_TRIGGER_NAMES: readonly string[] = [
  * Limit: a connection that defines `acp_evidence_write_authorized` itself, to return 1, passes the
  * supersede guard (CEO 52c3b1e6 (b)), and a writer that drops a trigger passes all four; they are a
  * boundary against ACP's own `Db.run`, not against every raw writer.
+ *
+ * v48 does not repeat v47's check for canonical labels written before the guard (CEO 85eac6ef): at v47
+ * the guard already decides who writes the label, and a decision written under it must never be refused.
  *
  * A live database at v47 reaches this step only through an approved migration
  * (`assertMigrationApproved`), as it does every step.

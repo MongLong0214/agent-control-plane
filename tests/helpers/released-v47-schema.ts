@@ -73,7 +73,8 @@ export const writeOutsideTheGuard = <T>(
  * (v48 onward) cannot change what a database receives at its v47 step. Every value here was measured
  * with the pre-change code, whose `migrations.ts` and `schema.sql` are those of that commit, and is
  * transcribed, not recomputed: a value a run derives from the file it is checking agrees with whatever
- * file it is handed.
+ * file it is handed. The one exception is the receipt checksum, which FIX-SEC-R2 changed on purpose (the
+ * snapshot did not change); it is transcribed the same way, from that build.
  */
 export const V47_FREEZE_BASE_COMMIT = "faa829ec3fecaa5d5aca6cd41160d2f464c4a24f";
 
@@ -82,8 +83,19 @@ export const V47_SNAPSHOT_PATH = "src/db/schema-v47.sql";
 export const V47_SNAPSHOT_GIT_BLOB = "9ca4cad97b1dbf5cbd759d7f11d11b3c7bb9c543";
 export const V47_SNAPSHOT_SHA256 = "8c4de11d7ae4d687120196ad9ae73e5b370f6abcc47b9a8b31dc5e69608de487";
 
-/** v47's receipt checksum as the pre-change build computed it, in full. */
-export const V47_BASE_CHECKSUM = "sha256:f9b2370034620dc56f825fd9119fedd22ba76a46261c64684446992a48958b49";
+/**
+ * v47's receipt checksum, in full, since the step refuses canonical labels written before its guard
+ * (FIX-SEC-R2, CEO 85eac6ef option B): the snapshot and that refusal's predicate. Transcribed from the
+ * build that added the refusal, where `sha256("v47-owner-decision-authority-guard\n" + snapshot +
+ * "\nrefused-before-install: " + predicate)` computed outside the code agreed with the step's own value.
+ */
+export const V47_BASE_CHECKSUM = "sha256:6030b25bbb1ece91d3195a27e8ee703a335863fbd4ab8660c2548dde21eb905b";
+
+/**
+ * The receipt checksum of the unreleased candidate v47 (faa829ec to ccc4865f), which installed the guard
+ * without that refusal. A database holding it was migrated by the candidate; it is never a released one.
+ */
+export const V47_CANDIDATE_CHECKSUM = "sha256:f9b2370034620dc56f825fd9119fedd22ba76a46261c64684446992a48958b49";
 
 /**
  * `digestOfSchemaRows` of the database the pre-change build left at v47 from the released chain: from the

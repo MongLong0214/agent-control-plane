@@ -36,6 +36,6 @@
     "v44-manifest-activation-grant": "sha256:06a2f0a829718e98c9b9b606c9e53d7cee40ab69f1beda36ee6716158117b380",
     "v45-first-manifest-activation": "sha256:4263f0011ebdd53fb8e645f55b4e391e8247755debd8961fe74c312c983ad1ee",
     "v46-rowid-no-replace": "sha256:aa2aa099fe49482d7c9ae5e32ffc6a587287e5cdd9e97b44e268a22a3883e04a",
-    "v47-owner-decision-authority-guard": "sha256:f9b2370034620dc56f825fd9119fedd22ba76a46261c64684446992a48958b49"
+    "v47-owner-decision-authority-guard": "sha256:6030b25bbb1ece91d3195a27e8ee703a335863fbd4ab8660c2548dde21eb905b"
   }
 }

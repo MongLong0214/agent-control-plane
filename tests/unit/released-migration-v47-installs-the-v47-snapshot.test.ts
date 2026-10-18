@@ -14,6 +14,7 @@ import { V46_BASE_CHECKSUM, V46_SCHEMA_DIGEST_FROM_V11 } from "../helpers/releas
 import {
   freshV47CreateFromSnapshot,
   V47_BASE_CHECKSUM,
+  V47_CANDIDATE_CHECKSUM,
   V47_FRESH_SCHEMA_DIGEST,
   V47_SCHEMA_DIGEST_FROM_RELEASED_CHAIN,
   V47_SNAPSHOT_GIT_BLOB,
@@ -26,8 +27,9 @@ afterAll(cleanupTempDirs);
 /**
  * The v47 freeze (source level), as #1140 froze v45 and the v46 freeze followed: v47 reads
  * `schema-v47.sql`, not the live schema, and still produces exactly what the v47 build produced — the
- * same receipt checksum and the same `sqlite_schema`. The expected values were measured with the
- * pre-change code and are transcribed in the helper; nothing here derives them from the snapshot it is
+ * same `sqlite_schema`. Its receipt checksum is the corrected one (FIX-SEC-R2: the step now refuses
+ * canonical labels written before its guard, and its checksum covers that), never the candidate's. The
+ * expected values are transcribed in the helper; nothing here derives them from the snapshot it is
  * checking. Historical images come from the released chain (`releasedChainImage`), never from taking a
  * newer database back.
  */
@@ -80,9 +82,11 @@ describe("the v47 freeze: the released v47 step installs the v47 snapshot", () =
     expect(createHash("sha256").update(bytes).digest("hex")).toBe(V47_SNAPSHOT_SHA256);
   });
 
-  it("v47, v46 and v45 keep the full receipt checksums they shipped with, in the step and in the checksum map", () => {
+  it("v46 and v45 keep the full receipt checksums they shipped with, and v47 has the corrected one, in the step and in the checksum map", () => {
     expect(V47).toMatchObject({ fromVersion: 46, toVersion: 47 });
     expect(V47.checksum()).toBe(V47_BASE_CHECKSUM);
+    // FIX-SEC-R2 (CEO 85eac6ef option B): the unreleased candidate's receipt is told apart from this step's.
+    expect(V47_BASE_CHECKSUM).not.toBe(V47_CANDIDATE_CHECKSUM);
     expect(V46.checksum()).toBe(V46_BASE_CHECKSUM);
     expect(V45.checksum()).toBe(V45_BASE_CHECKSUM);
     const manifest = JSON.parse(readFileSync(new URL("../../src/db/migration-checksums.json", import.meta.url), "utf8")) as {
