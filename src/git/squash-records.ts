@@ -6,10 +6,11 @@
  * so no child there can carry the App token. The children here get a minimal environment built
  * below, never the daemon's own, exactly as `git.ts` does for every other git call.
  */
-import { execFile } from "node:child_process";
+import { type ChildProcess, execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import type { Writable } from "node:stream";
 import { promisify } from "node:util";
 
 import { acpError } from "../core/errors.ts";
@@ -97,30 +98,102 @@ const examinationTimedOut = (timeoutMs: number, started: boolean) =>
     { timeoutMs, started },
   );
 
-const boundedRun = (cwd: string, env: NodeJS.ProcessEnv, timeoutMs: number): Run => {
+/** How a child's stdin ended: whether `end` completed, and the first error the stream raised. */
+interface StdinEnd {
+  readonly finished: boolean;
+  readonly error: NodeJS.ErrnoException | undefined;
+}
+
+/**
+ * Hands `input` to a child's stdin and closes it, settling once the stream has closed.
+ *
+ * The error listener goes on before anything is written. A child that exits without reading its
+ * input closes the pipe under the write, which fails with EPIPE, and an `error` event nobody hears
+ * is an uncaught exception: `src` has no handler for one, so in the daemon it ended the process
+ * while it composed a merge message (FIX-EPIPE). With no input nothing is written at all: `end()`
+ * closes stdin without a chunk, so an empty write can never be what fails.
+ *
+ * The stream always closes: after `finish`, after an error, or when Node destroys it as the child
+ * exits. `finished` is true only when `finish` came first, that is when every byte was handed over
+ * and stdin was shut.
+ */
+const endStdin = (stdin: Writable | null, input: string | undefined): Promise<StdinEnd> => {
+  if (stdin === null) return Promise.resolve({ finished: false, error: undefined });
+  let error: NodeJS.ErrnoException | undefined;
+  const closed = new Promise<StdinEnd>((resolve) => {
+    stdin.on("error", (cause: NodeJS.ErrnoException) => {
+      error ??= cause;
+    });
+    stdin.once("close", () => resolve({ finished: stdin.writableFinished, error }));
+  });
+  if (input === undefined) stdin.end();
+  else stdin.end(input);
+  return closed;
+};
+
+const inputNotDelivered = (
+  file: string,
+  args: readonly string[],
+  input: string | undefined,
+  stdin: StdinEnd,
+  child: { readonly exitCode: number | null; readonly signalCode: NodeJS.Signals | null },
+) => {
+  const command = [basename(file), ...args.slice(0, 1)].join(" ");
+  const inputBytes = Buffer.byteLength(input ?? "", "utf8");
+  const how = stdin.error === undefined ? "its stdin closed before the input was handed over" : `writing its stdin failed with ${stdin.error.code ?? stdin.error.message}`;
+  return acpError(
+    ReasonCode.GIT_INPUT_NOT_DELIVERED,
+    `the merge-records examination's \`${command}\` did not take its ${inputBytes}-byte input (${how}), so its answer is not one about that input`,
+    {
+      command,
+      inputBytes,
+      stdinError: stdin.error === undefined ? null : (stdin.error.code ?? stdin.error.message),
+      stdinFinished: stdin.finished,
+      exitCode: child.exitCode,
+      signal: child.signalCode,
+    },
+  );
+};
+
+/**
+ * A `Run` bounded by `timeoutMs` from now. Exported only for `tests/unit/squash-records-stdin.test.ts`,
+ * which calls it from a process standing in for the daemon.
+ */
+export const boundedRun = (cwd: string, env: NodeJS.ProcessEnv, timeoutMs: number): Run => {
   const endsAt = performance.now() + timeoutMs;
   return async (file, args, input) => {
     const remaining = Math.floor(endsAt - performance.now());
     if (remaining < 1) throw examinationTimedOut(timeoutMs, false);
-    let stdout: string;
+    let answer: { readonly stdout: string } | { readonly failure: unknown };
+    let delivered: { readonly stdin: StdinEnd; readonly child: ChildProcess } | undefined;
     try {
       const pending = execFileAsync(file, args, { cwd, env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: remaining });
-      pending.child.stdin?.end(input ?? "");
-      stdout = (await pending).stdout;
-    } catch (error) {
-      // S9-R3: the deadline is read when the answer settles, failed or not. A stalled event loop
-      // can deliver a child's answer after the bound without its `timeout` ever firing.
-      if (performance.now() >= endsAt) throw examinationTimedOut(timeoutMs, true);
-      // Node reports a child its `timeout` killed as `killed`, SIGTERM and no string code; an
-      // overflowing `maxBuffer` is killed too, and carries its own code.
-      const { killed, signal, code } = error as { killed?: unknown; signal?: unknown; code?: unknown };
-      if (killed === true && signal === "SIGTERM" && typeof code !== "string") throw examinationTimedOut(timeoutMs, true);
-      throw error;
+      const stdinEnded = endStdin(pending.child.stdin, input);
+      answer = await pending.then(({ stdout }) => ({ stdout }), (failure: unknown) => ({ failure }));
+      // The child has exited by now, and Node destroys its stdin when it does, so this settles.
+      delivered = { stdin: await stdinEnded, child: pending.child };
+    } catch (failure) {
+      answer = { failure };
     }
-    // A successful answer that settles past the deadline is still an examination that outlived its
-    // bound: GIT_TIMEOUT, never an answer (S9 review r3, a 5 s bound allowed after 8.6 s).
+    // S9-R3: the deadline is read when the answer settles, failed or not. A stalled event loop can
+    // deliver a child's answer after the bound without its `timeout` ever firing, and a successful
+    // answer past the deadline is still an examination that outlived its bound: GIT_TIMEOUT, never
+    // an answer (S9 review r3, a 5 s bound allowed after 8.6 s).
     if (performance.now() >= endsAt) throw examinationTimedOut(timeoutMs, true);
-    return stdout;
+    if ("failure" in answer) {
+      // Node reports a child its `timeout` killed as `killed`, SIGTERM and no string code; an
+      // overflowing `maxBuffer` is killed too, and carries its own code, as does a spawn that
+      // failed. Each stays its own failure, whatever became of the input.
+      const { killed, signal, code } = answer.failure as { killed?: unknown; signal?: unknown; code?: unknown };
+      if (killed === true && signal === "SIGTERM" && typeof code !== "string") throw examinationTimedOut(timeoutMs, true);
+      if (typeof code === "string") throw answer.failure;
+    }
+    // Input given and not taken is a refusal even beside exit 0. Any stdin error is one, input or not.
+    if (delivered !== undefined && (delivered.stdin.error !== undefined || (input !== undefined && !delivered.stdin.finished))) {
+      throw inputNotDelivered(file, args, input, delivered.stdin, delivered.child);
+    }
+    if ("failure" in answer) throw answer.failure;
+    return answer.stdout;
   };
 };
 
