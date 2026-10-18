@@ -828,7 +828,8 @@ export class RepoFactoryBootstrapRunner {
    * item reads (`REPO_FACTORY_GITHUB_WRITE_GATE_ITEM`). The decision judged is the one a CONFIRM
    * presents (`presentedApproval`), checked as `apply` checks it: bound to the run's current PLAN
    * scope and approving it (`approvalReceipt`), then admitted by `approvalAdmission` — named by the
-   * execution's durable approval anchor, or, with no proven anchor and nothing WRITTEN, admitted by
+   * execution's durable approval anchor for exactly the candidate that anchor names (S10-R2-01), or,
+   * with no proven anchor and nothing WRITTEN, admitted by
    * live ingress, unconsumed for this candidate and, for Buzz, inside its prompt's stored window.
    * A recorded receipt, or a consumption audit row, never holds on its own. Consumes nothing,
    * writes nothing and syncs nothing.
@@ -873,7 +874,8 @@ export class RepoFactoryBootstrapRunner {
    * (`accepted`: the anchor is synced now) and `ownerApprovalHolds` reads it (never syncs).
    *
    *   - an existing application whose approval anchor proves its identity resumes on exactly the
-   *     receipt the anchor names, never consumed again (APPROVAL_NOT_THIS_EXECUTION otherwise);
+   *     receipt the anchor names, for exactly the candidate it names, never consumed again
+   *     (APPROVAL_NOT_THIS_CANDIDATE, APPROVAL_NOT_THIS_EXECUTION otherwise);
    *   - an anchor that could not be synced refuses (APPROVAL_ANCHOR_UNSYNCED), and a WRITTEN
    *     application whose identity is unproven refuses with the anchor's own answer;
    *   - otherwise — a new execution, or a RESERVED one whose identity cannot be proven — the presented
@@ -893,6 +895,23 @@ export class RepoFactoryBootstrapRunner {
       const identity = this.anchoredIdentity(application, workDir, accepted);
       if (!identity.allowed && identity.evidence["refusal"] === "APPROVAL_ANCHOR_UNSYNCED") return identity as Decision<unknown> as Decision<{ consumes: boolean }>;
       if (identity.allowed) {
+        // S10-R2-01 — the anchor admits exactly the candidate it was consumed for: the candidate asked
+        // about is compared with the anchor's own, never with the run's current one. Another candidate
+        // is refused here as C3 refuses its CONFIRM, so the linked gate item never holds for it.
+        if (candidateSnapshotDigest !== identity.value.candidateSnapshotDigest) {
+          return deny(
+            ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+            "this bootstrap application's owner approval was consumed for another candidate; it admits only the candidate its anchor names",
+            {
+              stage: "approval",
+              refusal: "APPROVAL_NOT_THIS_CANDIDATE",
+              runId,
+              approvalIdentity: identity.value.receiptDigest,
+              anchoredCandidate: identity.value.candidateSnapshotDigest,
+              candidateSnapshotDigest,
+            },
+          );
+        }
         if (presentedReceiptDigest !== identity.value.receiptDigest) {
           return deny(
             ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,

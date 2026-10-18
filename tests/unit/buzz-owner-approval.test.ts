@@ -2379,3 +2379,91 @@ describe("S10-R1: the fixes' own guards", () => {
     }
   });
 });
+
+/* eslint-disable no-console -- S10-R2: the review witness RV2-CANDIDATE is kept as written, observation log included. */
+describe("RV2 bounded remediation checks", () => {
+  it("RV2-CANDIDATE an anchored receipt cannot satisfy a different current candidate", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      expect((await w.confirm()).reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(gateOf(w).satisfied).toBe(true);
+      const candidate = `sha256:${"9".repeat(64)}`;
+      cp.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [candidate, w.prepared.runId]);
+      const confirm = await w.prepared.runner.produceAndActivateApproved({
+        runId: w.prepared.runId, candidateSnapshotDigest: candidate, ceoSessionId: w.prepared.ceoSessionId,
+      });
+      console.log("RV2-CANDIDATE", JSON.stringify({ gate: gateOf(w), confirm, counts: w.counts() }));
+      expect(confirm.allowed).toBe(false);
+      expect(gateOf(w).satisfied).toBe(false);
+    } finally { await w.close(); }
+  });
+});
+/* eslint-enable no-console */
+
+describe("S10-R2-01: an anchored execution's approval admits only the candidate its anchor names", () => {
+  it("S10-R2-01 control: the same candidate, anchored and its ingress admission pruned, still holds for the predicate and the gate", async () => {
+    const { w } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      // A CLI approval, so the anchored receipt's own ingress admission is in the channel pruned below.
+      const approval = ownerApprovalFor(w.prepared);
+      expect(w.prepared.runner.recordOwnerApproval(w.prepared.runId, {
+        owner: "acme", visibility: "public", planDigest: w.prepared.planDigest,
+        approvedManifest: w.prepared.manifest, projectName: w.prepared.manifest.projectId,
+        receipt: approval.receipt,
+      }).allowed).toBe(true);
+      expect((await w.confirm()).reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      const scope = w.prepared.runner.approvalScopeOf(w.prepared.runId);
+      if (!scope.allowed) throw new Error(scope.message);
+      const anchored = w.prepared.runner.ownerApprovalNeed(w.prepared.runId, scope.value);
+      expect(anchored).toMatchObject({ need: "EXECUTION_ANCHORED", receipt: { channel: "cli", candidateSnapshotDigest: w.prepared.snapshotDigest } });
+      const receipt = anchored.receipt!;
+      expect(digestOf(receipt)).toBe(digestOf(approval.receipt));
+      expect(cp.ownerAuthority.assertApproval(receipt).allowed).toBe(true);
+      expect(gateOf(w).satisfied).toBe(true);
+      // Past the retention window, the next admission prunes the receipt's ingress admission.
+      w.prepared.harness.clock.advance(25 * 60 * 60 * 1000);
+      const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { cli: { allowedActors: [TEST_OWNER.actor] } });
+      expect(guard.admit({ channel: "cli", actor: TEST_OWNER.actor, nonce: "after-retention", payload: null }).allowed).toBe(true);
+      expect(cp.ownerAuthority.assertApproval(receipt).allowed).toBe(false);
+      expect(cp.runs.currentCandidate(w.prepared.runId)).toBe(w.prepared.snapshotDigest);
+      expect(w.prepared.runner.ownerApprovalHolds(w.prepared.runId, w.prepared.snapshotDigest)).toMatchObject({ allowed: true });
+      expect(gateOf(w).satisfied).toBe(true);
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("S10-R2-01 control: another candidate is refused by the predicate, the gate and CONFIRM; the anchor's own candidate holds again", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      const { cp } = w.prepared.harness;
+      await w.send(w.reply({ prompt }));
+      expect((await w.confirm()).reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+      expect(gateOf(w).satisfied).toBe(true);
+      const other = `sha256:${"9".repeat(64)}`;
+      const refused = {
+        allowed: false,
+        evidence: { stage: "approval", refusal: "APPROVAL_NOT_THIS_CANDIDATE", anchoredCandidate: w.prepared.snapshotDigest, candidateSnapshotDigest: other },
+      };
+      // Asked about another candidate while the run's own is unmoved: the anchor's candidate decides, not the run's.
+      expect(w.prepared.runner.ownerApprovalHolds(w.prepared.runId, other)).toMatchObject(refused);
+      // The run's candidate moved by a raw edit, its PLAN kept: the gate reads unsatisfied and CONFIRM refuses.
+      cp.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [other, w.prepared.runId]);
+      expect(w.prepared.runner.ownerApprovalHolds(w.prepared.runId, other)).toMatchObject(refused);
+      expect(gateOf(w).satisfied).toBe(false);
+      expect(
+        await w.prepared.runner.produceAndActivateApproved({ runId: w.prepared.runId, candidateSnapshotDigest: other, ceoSessionId: w.prepared.ceoSessionId }),
+      ).toMatchObject({ allowed: false });
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 4 });
+      // The anchor's own candidate restored: the same anchor holds again, so the candidate alone was refused.
+      cp.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [w.prepared.snapshotDigest, w.prepared.runId]);
+      expect(gateOf(w).satisfied).toBe(true);
+    } finally {
+      await w.close();
+    }
+  });
+});
