@@ -1,0 +1,16 @@
+Limit: a woken turn that never ends is bounded only by the test's own timeout, and that timeout's failure names no turn state; a turn that never ran fails at once, naming the turns finished, the lane state and the session's in-band rows
+Warn: awaitFinishedTurns waits on the session's own state (turns finished, a turn running or queued), not a wall clock; it is sound only when the wake was admitted before the wait starts, as run_dispatch admits its RUN_DISPATCH turn when its transaction commits, before it answers; the later-turn finishedTurns waits whose wake can arrive after the wait starts were not converted (listed in the #1156 evidence) and still carry vi.waitFor's wall-clock limit
+Record-Id: r-346e424950a5
+Provenance: inherited caefb3d8b9595890d3e63025888deccac1523a8f
+
+Warn: the #1156 regression holds the RUN_DISPATCH turn on a latch and takes exactly one real-time step (1100 ms) before checking that quietOwner is still pending; that step is necessary because no latch can tell a wait that gives up at 1000 ms from one that never gives up unless 1000 ms pass while the turn is held, and it is deterministic because the old wait's 1000 ms timer is registered first, so removing it makes the regression unable to fail against the old wait
+Record-Id: r-f127b7fbee52
+Provenance: inherited 92ee75e2eeee62e63b122a7000f7730c1f705f40
+
+Warn: the latch regression releases the held turn, settles quietOwner and waits for the released turn on every cooperative exit path (assertion failure, rejection, runner timeout through the test's abort signal), each step tried even if another throws, and a cleanup error is attached to the original failure rather than replacing it (R2-01: with the release only after the assertions, a failing assertion abandoned the held turn); a forced process kill is not covered
+Record-Id: r-3333af79861f
+Provenance: inherited a2f27674100b7093da05fa3dae0312da81ddb3f7
+
+Warn: the latch test's cleanup on a runner timeout lives in onTestFinished, which vitest awaits before the next test and file teardown (bounded by hookTimeout): it releases the held turn, then awaits the test body including fixture close; the body never awaits the hook, so there is no cycle, and every observation wait (including the one 1100 ms step) is raced against the abort; a finally-only cleanup inside the body was not awaited by the runner after a timeout (R2-01, review r3: the next test saw the turn still held)
+Record-Id: r-ef3611874b99
+Provenance: inherited 7c7a5e074a75a855b58149e3051457a3f9641598
