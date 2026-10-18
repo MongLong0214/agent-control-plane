@@ -7,9 +7,11 @@ import { PassThrough, Writable } from "node:stream";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import {
+  CLAUDE_NON_INTERACTIVE_ARGS,
   ClaudeUsageCollector,
   CodexUsageCollector,
   ExpectUsageTerminal,
+  SpawnNonInteractiveUsageProbe,
   type UsageTerminal,
   type UsageTerminalResult,
 } from "../../src/capacity/usage-collectors.ts";
@@ -151,6 +153,38 @@ const ends = async (pid: number): Promise<boolean> => {
   }
   return false;
 };
+/** The next spawn, real, with its `exit` watched from before the probe's own listeners. */
+const watchNextSpawn = (): { child: ChildProcess.ChildProcess | undefined; exited: boolean } => {
+  const watch: { child: ChildProcess.ChildProcess | undefined; exited: boolean } = { child: undefined, exited: false };
+  spawnSeam.next = (real) => {
+    const started = real();
+    watch.child = started;
+    started.once("exit", () => {
+      watch.exited = true;
+    });
+    return started;
+  };
+  return watch;
+};
+
+/**
+ * FIX-1148-R2 — read at the moment the call returns, with nothing awaited in between: whether the owned
+ * child's `exit` had been seen (Node emits it after reaping), and whether its pid still names any process,
+ * a zombie included. Never a poll after the return: that would pass a call that returned first.
+ */
+const atReturn = (pid: number | undefined): { pidPresent: boolean } => {
+  if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 1) throw new Error(`no owned pid to check: ${pid}`);
+  try {
+    process.kill(pid, 0);
+    return { pidPresent: true };
+  } catch (error) {
+    return { pidPresent: (error as NodeJS.ErrnoException).code !== "ESRCH" };
+  }
+};
+
+/** The most of a timeout `usage-collectors.ts` keeps for cleanup (CLEANUP_RESERVE_CAP_MS). */
+const cleanupReserveCap = 500;
+
 /** Exits at once, saying nothing. */
 const claudeSilent = script("claude-silent", "exit 0");
 /** The banner after a moment, then the usage screen once /usage arrives. */
@@ -306,25 +340,42 @@ describe("Unit 2 kill(0): ExpectUsageTerminal signals only a process group it ow
     expect(result.error).toMatch(/refuses to approve/);
   });
 
-  it("control: an owned expect group that never answers is SIGKILLed at its own group and reaped under the timeout", async () => {
+  it("control: an owned expect group that never answers is SIGKILLed at its own group and reaped before the call returns, within the timeout", async () => {
     const pidsPath = join(home, "hung.pids");
     const hung = script("claude-hangs", `echo $PPID $$ > '${pidsPath}'\nexec sleep 30`);
+    const timeoutMs = 1_100;
+    const watch = watchNextSpawn();
     const kill = vi.spyOn(process, "kill");
     let result: UsageTerminalResult;
     let kills: unknown[][];
+    let exitedAtReturn: boolean;
+    let returnedAfterMs: number;
+    const startedAt = performance.now();
     try {
       // expect's own wait is ceil(1.1 s) = 2 s, so the outer timer is what ends this run.
-      result = await new ExpectUsageTerminal().run({ binary: hung, args: [], steps: [], timeoutMs: 1_100, environment: process.env });
+      result = await new ExpectUsageTerminal().run({ binary: hung, args: [], steps: [], timeoutMs, environment: process.env });
+      returnedAfterMs = performance.now() - startedAt;
+      exitedAtReturn = watch.exited;
       kills = kill.mock.calls.map((call) => [...call]);
     } finally {
       kill.mockRestore();
+      spawnSeam.next = null;
     }
-    expect(result).toMatchObject({ exitCode: null, timedOut: true, error: "interactive /usage timed out" });
-    const [expectPid, cliPid] = readFileSync(pidsPath, "utf8").trim().split(" ").map(Number);
-    expect(Number.isSafeInteger(expectPid) && expectPid! > 1).toBe(true);
-    expect(kills).toEqual([[-expectPid!, "SIGKILL"]]);
-    expect(await ends(expectPid!), `expect ${expectPid} was not ended and reaped`).toBe(true);
-    expect(await ends(cliPid!), `the CLI ${cliPid} under expect is still running`).toBe(true);
+    const { pidPresent } = atReturn(watch.child?.pid);
+    try {
+      expect(result).toMatchObject({ exitCode: null, timedOut: true, error: "interactive /usage timed out" });
+      const [expectPid, cliPid] = readFileSync(pidsPath, "utf8").trim().split(" ").map(Number);
+      expect(expectPid).toBe(watch.child?.pid);
+      expect(kills).toEqual([[-expectPid!, "SIGKILL"]]);
+      // FIX-1148-R2: confirmed at the return, not polled for after it, and inside the unchanged timeout.
+      expect(exitedAtReturn, `expect ${expectPid} had not exited when the call returned`).toBe(true);
+      expect(pidPresent, `expect ${expectPid} was not reaped when the call returned`).toBe(false);
+      expect(returnedAfterMs).toBeLessThan(timeoutMs);
+      // The CLI is expect's child, not this probe's: it is not reaped here, only seen to end.
+      expect(await ends(cliPid!), `the CLI ${cliPid} under expect is still running`).toBe(true);
+    } finally {
+      exactPidCleanup(existsSync(pidsPath) ? readFileSync(pidsPath, "utf8").trim().split(" ").map(Number) : []);
+    }
   });
 });
 
@@ -424,7 +475,8 @@ process.stdout.write(JSON.stringify({ sensorHealth: reading.sensorHealth, bucket
  * FIX-1148-R1, R1148-02: `ExpectUsageTerminal` resolved the moment it decided, and cleared its deadline
  * there. An `expect` that did not end on the trust prompt's SIGTERM — here one stopped just before it —
  * was never signalled again and outlived the call. Deciding and cleaning up are now two steps: the
- * call returns once the owned `expect` is confirmed gone, or at the existing deadline after SIGKILL.
+ * call returns once the owned `expect` is confirmed exited and reaped, SIGKILLed if need be at the end
+ * of the work, inside the existing deadline (FIX-1148-R2).
  */
 describe("FIX-1148-R1 R1148-02: the pseudo-terminal's cleanup confirms the owned expect is gone, within the existing deadline", () => {
   const trustThenSleep = (name: string, pidsPath: string): string =>
@@ -458,14 +510,13 @@ describe("FIX-1148-R1 R1148-02: the pseudo-terminal's cleanup confirms the owned
     const startedAt = performance.now();
     try {
       const result = await new ExpectUsageTerminal().run({ binary, args: [], steps: [], timeoutMs, environment: { PATH: "/usr/bin:/bin" } });
-      return {
-        result,
-        returnedAfterMs: performance.now() - startedAt,
-        exitedAtReturn: exited,
-        stopped,
-        pid: child?.pid,
-        groupSignals: kill.mock.calls.map((call) => [...call]).filter(([pid]) => typeof pid === "number" && pid < 0),
-      };
+      const returnedAfterMs = performance.now() - startedAt;
+      const exitedAtReturn = exited;
+      const groupSignals = kill.mock.calls.map((call) => [...call]).filter(([pid]) => typeof pid === "number" && pid < 0);
+      kill.mockRestore();
+      // FIX-1148-R2: read before anything is awaited, never polled for after the return.
+      const { pidPresent } = atReturn(child?.pid);
+      return { result, returnedAfterMs, exitedAtReturn, pidPresentAtReturn: pidPresent, stopped, pid: child?.pid, groupSignals };
     } finally {
       kill.mockRestore();
       spawnSeam.next = null;
@@ -478,7 +529,7 @@ describe("FIX-1148-R1 R1148-02: the pseudo-terminal's cleanup confirms the owned
     return [expectPid, cliPid];
   };
 
-  it("an expect stopped before the trust prompt's SIGTERM is SIGKILLed at the existing deadline, ends, and the call is back by then", async () => {
+  it("an expect stopped before the trust prompt's SIGTERM is SIGKILLed inside the existing deadline, and exited and reaped when the call returns", async () => {
     const pidsPath = join(home, "stopped-trust.pids");
     const timeoutMs = 1_100;
     try {
@@ -486,16 +537,18 @@ describe("FIX-1148-R1 R1148-02: the pseudo-terminal's cleanup confirms the owned
       expect(watched.stopped).toBe(true);
       expect(watched.result).toMatchObject({ exitCode: null, timedOut: false });
       expect(watched.result.error).toMatch(/refuses to approve/);
-      // The trust prompt's own SIGTERM is kept; the deadline adds the SIGKILL a stopped expect needs.
+      // The trust prompt's own SIGTERM is kept; the end of the work adds the SIGKILL a stopped expect needs.
       expect(watched.groupSignals).toEqual([
         [-watched.pid!, "SIGTERM"],
         [-watched.pid!, "SIGKILL"],
       ]);
-      // Bounded by the existing deadline, not added to it.
-      expect(watched.returnedAfterMs).toBeLessThan(timeoutMs + 750);
       const [expectPid, cliPid] = pidsOf(pidsPath);
       expect(expectPid).toBe(watched.pid);
-      expect(await ends(expectPid!), `expect ${expectPid} is still running`).toBe(true);
+      // FIX-1148-R2: the owned expect is exited and reaped at the return, inside the unchanged deadline.
+      expect(watched.exitedAtReturn, `expect ${expectPid} had not exited when the call returned`).toBe(true);
+      expect(watched.pidPresentAtReturn, `expect ${expectPid} was not reaped when the call returned`).toBe(false);
+      expect(watched.returnedAfterMs).toBeLessThan(timeoutMs);
+      // The CLI is expect's child, not this probe's: it is not reaped here, only seen to end.
       expect(await ends(cliPid!), `the CLI ${cliPid} under expect is still running`).toBe(true);
     } finally {
       exactPidCleanup(pidsOf(pidsPath));
@@ -509,11 +562,242 @@ describe("FIX-1148-R1 R1148-02: the pseudo-terminal's cleanup confirms the owned
       expect(watched.result.error).toMatch(/refuses to approve/);
       expect(watched.groupSignals).toEqual([[-watched.pid!, "SIGTERM"]]);
       expect(watched.exitedAtReturn).toBe(true);
+      expect(watched.pidPresentAtReturn).toBe(false);
       const [, cliPid] = pidsOf(pidsPath);
       expect(await ends(cliPid!), `the CLI ${cliPid} under expect is still running`).toBe(true);
     } finally {
       exactPidCleanup(pidsOf(pidsPath));
     }
+  });
+});
+
+/**
+ * FIX-1148-R2, R1148-02 and its Codex sibling: both probes returned at their decision, or at the
+ * deadline's SIGKILL, with the owned child still there; it exited 0.5 to 2.6 ms after the return. The
+ * existing timeout is now split, not extended: the work ends a reserve before it, and the call returns
+ * once the owned child is exited and reaped, or at the deadline with a cleanup failure that says so.
+ */
+describe("FIX-1148-R2: a probe returns only once its owned child is exited and reaped, inside the unchanged timeout", () => {
+  const clock = () => new ManualClock("2026-08-13T00:00:00.000Z");
+  /** Takes nothing and answers nothing, until its group is killed. */
+  const codexHangs = script("codex-hangs", "exec sleep 10");
+
+  const collectWatched = async (binary: string, timeoutMs: number) => {
+    const watch = watchNextSpawn();
+    const startedAt = performance.now();
+    try {
+      const reading = await new CodexUsageCollector({ clock: clock(), binary, timeoutMs, codexHome }).collect();
+      const returnedAfterMs = performance.now() - startedAt;
+      const exitedAtReturn = watch.exited;
+      const { pidPresent } = atReturn(watch.child?.pid);
+      return { reading, returnedAfterMs, exitedAtReturn, pidPresentAtReturn: pidPresent, pid: watch.child?.pid };
+    } finally {
+      spawnSeam.next = null;
+    }
+  };
+
+  it.each([
+    { name: "answers the read", binary: () => codexNormal, health: "HEALTHY", error: null },
+    { name: "shuts its stdin before the read", binary: () => codexShutsStdin, health: "ERROR", error: /did not take/ },
+    { name: "never answers", binary: () => codexHangs, health: "ERROR", error: /did not answer in time/ },
+  ])("Codex probe, a server that $name: its server is exited and reaped when the call returns", async ({ binary, health, error }) => {
+    const timeoutMs = 2_000;
+    let watched: Awaited<ReturnType<typeof collectWatched>> | undefined;
+    try {
+      watched = await collectWatched(binary(), timeoutMs);
+      expect(watched.reading.sensorHealth).toBe(health);
+      if (error === null) expect(watched.reading.error ?? null).toBeNull();
+      else expect(watched.reading.error).toMatch(error);
+      expect(watched.exitedAtReturn, `codex app-server ${watched.pid} had not exited when the call returned`).toBe(true);
+      expect(watched.pidPresentAtReturn, `codex app-server ${watched.pid} was not reaped when the call returned`).toBe(false);
+      expect(watched.returnedAfterMs).toBeLessThan(timeoutMs);
+    } finally {
+      exactPidCleanup([watched?.pid]);
+    }
+  });
+
+  /** Above any pid this kernel hands out. `process.kill` is stubbed throughout, so it is never signalled. */
+  const FAKE_PID = 2 ** 30;
+  /** A child the OS never reports gone: a pid, pipes, and no `exit`, ever. */
+  const neverExitingChild = (onLine?: (line: string, stdout: PassThrough) => void) => {
+    const stdout = new PassThrough();
+    return Object.assign(new EventEmitter(), {
+      pid: FAKE_PID,
+      stdout,
+      stderr: new PassThrough(),
+      stdin: new Writable({
+        write(chunk: Buffer, _encoding, callback) {
+          for (const line of chunk.toString("utf8").split("\n")) if (line.trim() !== "") onLine?.(line, stdout);
+          callback(null);
+        },
+      }),
+      kill: vi.fn(() => true),
+    });
+  };
+
+  const withoutConfirmation = async <T>(child: ReturnType<typeof neverExitingChild>, run: () => Promise<T>) => {
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    spawnSeam.next = () => child;
+    const startedAt = performance.now();
+    try {
+      const value = await run();
+      const returnedAfterMs = performance.now() - startedAt;
+      return { value, returnedAfterMs, kills: kill.mock.calls.map((call) => [...call]) };
+    } finally {
+      kill.mockRestore();
+      spawnSeam.next = null;
+    }
+  };
+
+  const CLEANUP_FAILED = new RegExp(`^cleanup failed: the owned (expect|codex app-server) \\(pid ${FAKE_PID}\\) was sent SIGKILL, but its exit was not confirmed by the deadline`);
+
+  it("expect: a decided trust refusal whose expect the OS never confirms gone returns at the deadline as a cleanup failure, not as the refusal alone", async () => {
+    const timeoutMs = 400;
+    const child = neverExitingChild();
+    setImmediate(() => child.stdout.write("Do you trust the files in this folder?\n"));
+    const { value: result, returnedAfterMs, kills } = await withoutConfirmation(child, () =>
+      new ExpectUsageTerminal().run({ binary: "claude", args: [], steps: [], timeoutMs, environment: {} }),
+    );
+    expect(result.error).toMatch(CLEANUP_FAILED);
+    expect(result.error).toMatch(/refuses to approve/);
+    expect(kills).toEqual([
+      [-FAKE_PID, "SIGTERM"],
+      [-FAKE_PID, "SIGKILL"],
+    ]);
+    // It waited through the reserve for the exit, and no further than the unchanged deadline.
+    expect(returnedAfterMs).toBeGreaterThanOrEqual(timeoutMs - 5);
+    expect(returnedAfterMs).toBeLessThan(timeoutMs + 100);
+  });
+
+  it("expect, through the collector: a run that timed out and whose expect is never confirmed gone is an ERROR reading naming the cleanup failure", async () => {
+    const timeoutMs = 400;
+    const child = neverExitingChild();
+    const { value: reading, returnedAfterMs } = await withoutConfirmation(child, () =>
+      new ClaudeUsageCollector({ clock: clock(), binary: "claude", timeoutMs, terminal: new ExpectUsageTerminal() }).collect(),
+    );
+    expect(reading).toMatchObject({ sensorHealth: "ERROR", buckets: [] });
+    expect(reading.error).toMatch(CLEANUP_FAILED);
+    expect(reading.error).toMatch(/timed out/);
+    expect(returnedAfterMs).toBeLessThan(timeoutMs + 100);
+  });
+
+  it("Codex: an answer read from a server the OS never confirms gone is an ERROR reading naming the cleanup failure, never HEALTHY", async () => {
+    const timeoutMs = 400;
+    const child = neverExitingChild((line, stdout) => {
+      const { id } = JSON.parse(line) as { id?: number };
+      if (id === 0) setImmediate(() => stdout.write('{"id":0,"result":{}}\n'));
+      if (id === 1) setImmediate(() => stdout.write(`${READ_ANSWER.replace("%s", "23")}\n`));
+    });
+    const { value: reading, returnedAfterMs, kills } = await withoutConfirmation(child, () =>
+      new CodexUsageCollector({ clock: clock(), binary: "codex", timeoutMs, codexHome }).collect(),
+    );
+    expect(reading).toMatchObject({ sensorHealth: "ERROR", buckets: [] });
+    expect(reading.error).toMatch(CLEANUP_FAILED);
+    expect(reading.error).toMatch(/an answer was read/);
+    expect(kills).toEqual([[-FAKE_PID, "SIGKILL"]]);
+    expect(returnedAfterMs).toBeGreaterThanOrEqual(timeoutMs - 5);
+    expect(returnedAfterMs).toBeLessThan(timeoutMs + 100);
+  });
+
+  /**
+   * The same rule on `SpawnNonInteractiveUsageProbe`, the daemon's Claude path: on its timeout it sent
+   * SIGKILL and returned at once, before the CLI's exit. `exit` is taken as proof that the DIRECT child
+   * ended and was reaped, never that its descendants did.
+   */
+  const NI_RESULT = [
+    "Current session: 12% used · resets Aug 18 at 7:49pm (Asia/Seoul)",
+    "Current week (all models): 64% used · resets Aug 21 at 4:59am (Asia/Seoul)",
+  ].join("\n");
+  const NI_ENVELOPE = JSON.stringify({ is_error: false, num_turns: 0, total_cost_usd: 0, result: NI_RESULT });
+
+  it("non-interactive Claude probe, a CLI that never answers: the CLI is exited and reaped when the call returns, inside the timeout", async () => {
+    const pidPath = join(home, "ni-hung.pid");
+    const hung = script("claude-ni-hangs", `echo $ > '${pidPath}'\nexec sleep 30`);
+    const timeoutMs = 1_000;
+    const watch = watchNextSpawn();
+    const startedAt = performance.now();
+    try {
+      const reading = await new ClaudeUsageCollector({ clock: clock(), binary: hung, timeoutMs, accountIdentity: null }).collect();
+      const returnedAfterMs = performance.now() - startedAt;
+      const exitedAtReturn = watch.exited;
+      const { pidPresent } = atReturn(watch.child?.pid);
+      expect(reading).toMatchObject({ sensorHealth: "ERROR", buckets: [] });
+      expect(reading.error).toBe("non-interactive /usage did not finish in time");
+      expect(exitedAtReturn, `the CLI ${watch.child?.pid} had not exited when the call returned`).toBe(true);
+      expect(pidPresent, `the CLI ${watch.child?.pid} was not reaped when the call returned`).toBe(false);
+      expect(returnedAfterMs).toBeLessThan(timeoutMs);
+    } finally {
+      spawnSeam.next = null;
+      exactPidCleanup([watch.child?.pid, existsSync(pidPath) ? Number(readFileSync(pidPath, "utf8").trim()) : undefined]);
+    }
+  });
+
+  it("non-interactive control: a CLI that answers and exits while a descendant in another group holds its stdout is read HEALTHY at its exit, not held to a timeout", async () => {
+    const holderPidPath = join(home, "ni-holder.pid");
+    const cli = join(home, "claude-ni-held.mjs");
+    writeFileSync(
+      cli,
+      `#!${NODE}
+import { spawn } from "node:child_process";
+import { writeFileSync, writeSync } from "node:fs";
+// Its own process group, so the probe's kill of the CLI's group does not reach it. It holds stdout.
+const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], { detached: true, stdio: ["ignore", "inherit", "ignore"] });
+holder.unref();
+writeFileSync(${JSON.stringify(holderPidPath)}, String(holder.pid));
+writeSync(1, ${JSON.stringify(NI_ENVELOPE)});
+process.exit(0);
+`,
+    );
+    chmodSync(cli, 0o755);
+    const timeoutMs = 4_000;
+    const watch = watchNextSpawn();
+    const startedAt = performance.now();
+    try {
+      const reading = await new ClaudeUsageCollector({ clock: clock(), binary: cli, timeoutMs, accountIdentity: null }).collect();
+      const returnedAfterMs = performance.now() - startedAt;
+      expect(watch.exited).toBe(true);
+      expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+      // Returned at the CLI's exit: the held pipe's `close` is not waited for, and the work's end is far off.
+      expect(returnedAfterMs).toBeLessThan(timeoutMs - cleanupReserveCap);
+    } finally {
+      spawnSeam.next = null;
+      exactPidCleanup([existsSync(holderPidPath) ? Number(readFileSync(holderPidPath, "utf8").trim()) : undefined]);
+    }
+  });
+
+  it("non-interactive, short timeouts with no owned pid: the work and cleanup budgets stay valid, the call returns timed out, and nothing is signalled", async () => {
+    for (const timeoutMs of [1, 3, 4, 10]) {
+      // A child as Node hands one back from a failed spawn: no pid, so there is no group to signal.
+      const child = neverExitingChild();
+      Reflect.set(child, "pid", undefined);
+      const { value: outcome, returnedAfterMs, kills } = await withoutConfirmation(child, () =>
+        new SpawnNonInteractiveUsageProbe(CLAUDE_NON_INTERACTIVE_ARGS).run({ binary: "claude", timeoutMs }),
+      );
+      expect(outcome, `timeout ${timeoutMs}`).toMatchObject({ code: null, timedOut: true });
+      expect(outcome.cleanupError).toBeUndefined();
+      expect(kills).toEqual([]);
+      expect(child.kill).not.toHaveBeenCalled();
+      expect(returnedAfterMs).toBeLessThan(timeoutMs + 100);
+    }
+  });
+
+  it("non-interactive: a full answer from a CLI the OS never confirms gone is an ERROR reading naming the cleanup failure at the deadline, never HEALTHY", async () => {
+    const timeoutMs = 400;
+    const child = neverExitingChild();
+    setImmediate(() => child.stdout.write(NI_ENVELOPE));
+    const { value: reading, returnedAfterMs, kills } = await withoutConfirmation(child, () =>
+      new ClaudeUsageCollector({ clock: clock(), binary: "claude", timeoutMs, accountIdentity: null }).collect(),
+    );
+    expect(reading).toMatchObject({ sensorHealth: "ERROR", buckets: [] });
+    expect(reading.error).toMatch(
+      new RegExp(
+        `^non-interactive /usage cleanup failed: the owned non-interactive /usage CLI \\(pid ${FAKE_PID}\\) was sent SIGKILL, but its exit was not confirmed by the deadline`,
+      ),
+    );
+    expect(kills).toEqual([[-FAKE_PID, "SIGKILL"]]);
+    // It did not wait for an exit that never came: it returned at the unchanged deadline.
+    expect(returnedAfterMs).toBeGreaterThanOrEqual(timeoutMs - 5);
+    expect(returnedAfterMs).toBeLessThan(timeoutMs + 100);
   });
 });
 
