@@ -1,0 +1,18 @@
+Limit: delivering the pin does not make a bootstrap's CommitLore observation succeed: the daemon's own pin checks still vet it, and other refusals such as COMMITLORE_CHANGED_CHECKOUT are untouched, so #246 B3 is not complete
+Warn: the installer resolves commitlore at install and upgrade time like the provider CLIs, writes ACP_RESOLVED_COMMITLORE_BINARY into the launcher, and exports ACP_COMMITLORE_BINARY from it only when that is unset; an operator-supplied value is passed through unchanged, and the daemon still reads only ACP_COMMITLORE_BINARY and searches no PATH
+Record-Id: r-9f5cde437e00
+Provenance: inherited d6dfed1b4a810f2303683f8cd7000704c1d3e4c5
+
+Limit: the provider and Buzz pins keep the old pattern: a CLI unresolvable at install plus a matching ACP_RESOLVED_*_BINARY inherited from launchd still reaches the daemon, and a provider's ACP_<P>_BINARY inherited from launchd is never cleared; left for a separate correction
+Warn: the launcher reads ACP_COMMITLORE_BINARY from the Keychain through the same loader as ACP_BUZZ_BINARY and passes a stored value through unchanged, wrong ones included; only a missing item (security exit 44) falls back to the install-time pin, any other lookup failure withholds the pin and prints only the exit status; the launcher unsets an inherited ACP_RESOLVED_COMMITLORE_BINARY before its own baked line, so the resolved pin is exactly what this install wrote or nothing
+Record-Id: r-c9a33fabb463
+Provenance: inherited e0db3a5724070ff84e4b592693a0c416025ca37c
+
+Warn: the launcher promotes the install-time CommitLore pin only when the Keychain lookup exits exactly 44 (no item); a present but empty item (exit 0) and any other failure withhold the pin and print one line without the value, so the daemon refuses bootstrap CommitLore fail-closed; the shared Keychain loader and the Buzz variables are unchanged
+Record-Id: r-62fe84ac42c2
+Provenance: inherited f694eb4d27c6326f1375b1469d1902ef11b26531
+
+Limit: only the observed newline rule is emulated; how security prints other non-printable characters was not measured and is not reproduced, and the round-3 newline counterexample came from the old stub, not from the real binary
+Warn: the deploy tests' Keychain stub reproduces only the security -w output rule the CTO observed on the real binary: a stored value containing a newline prints as its lowercase hex, any other value as itself, each followed by the one newline security appends; the fake daemon records ACP_COMMITLORE_BINARY byte for byte, so a newline-bearing operator value is shown reaching the daemon as hex and refused by the real pin check, never as the bare path
+Record-Id: r-bd86e78b3b3d
+Provenance: inherited 8be18563469bf774a5f209557c6cc7b1bcd81bf7
