@@ -40,18 +40,30 @@ const quietOwner = async (f: BootstrapRuntimeFixture) => {
   return run;
 };
 
-/** Holds the owner's first work turn at the provider for `ms`, as a slow runner makes it take that long. */
-const holdFirstWorkTurn = (f: BootstrapRuntimeFixture, ms: number): (() => number) => {
+/**
+ * Blocks the owner's first work turn at the provider until the test calls `release`, as a slow runner
+ * keeps it there. `entered` settles once the turn is blocked, so the session already shows it running.
+ */
+const latchFirstWorkTurn = (f: BootstrapRuntimeFixture) => {
   const runTurn = f.claude.runSessionTurn.bind(f.claude);
+  let enter = (): void => undefined;
+  let release = (): void => undefined;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   let held = 0;
   f.claude.runSessionTurn = async (request) => {
     if (held === 0 && request.relay !== null && request.conversation === "resume") {
       held += 1;
-      await new Promise((resolve) => setTimeout(resolve, ms));
+      enter();
+      await released;
     }
     return runTurn(request);
   };
-  return () => held;
+  return { entered, release: () => release(), held: () => held };
 };
 
 const open = async (f: BootstrapRuntimeFixture, runId: string, ownerSessionId: string) => {
@@ -99,11 +111,47 @@ const failResultStore = (f: BootstrapRuntimeFixture, key: string) => {
 };
 
 describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", () => {
-  it("a RUN_DISPATCH turn slower than vi.waitFor's default 1000 ms is waited for, and is the owner's second finished turn", async () => {
+  it("while the RUN_DISPATCH turn is held past vi.waitFor's default 1000 ms quietOwner stays pending; once it is released, quietOwner resolves with two finished turns", async () => {
     await withBootstrapRuntime(async (f) => {
-      const held = holdFirstWorkTurn(f, 1_500);
-      const { runId, ownerSessionId } = await quietOwner(f);
-      expect(held()).toBe(1);
+      const latch = latchFirstWorkTurn(f);
+      // quietOwner past run_dispatch's reply: from there only its wait for the turn can keep it pending.
+      const dispatchBootstrap = f.dispatchBootstrap;
+      let answer = (_run: Awaited<ReturnType<typeof dispatchBootstrap>>): void => undefined;
+      const answered = new Promise<Awaited<ReturnType<typeof dispatchBootstrap>>>((resolve) => {
+        answer = resolve;
+      });
+      f.dispatchBootstrap = async () => {
+        const run = await dispatchBootstrap();
+        answer(run);
+        return run;
+      };
+      let state: "pending" | "resolved" | "rejected" = "pending";
+      const owner = quietOwner(f).then(
+        (run) => {
+          state = "resolved";
+          return run;
+        },
+        (error: unknown) => {
+          state = "rejected";
+          throw error;
+        },
+      );
+      const [, { runId, ownerSessionId }] = await Promise.all([latch.entered, answered]);
+      // A macrotask boundary: whatever quietOwner could finish without the turn has finished.
+      await new Promise((resolve) => setImmediate(resolve));
+      // The only timed step in this test, and one is necessary: no latch can tell a wait that gives up at
+      // 1000 ms (vi.waitFor's default, the wait #1156 replaced) from one that never gives up, unless 1000 ms
+      // pass while the turn is held. It is deterministic: that old wait started its 1000 ms timer before the
+      // boundary above, so it is registered ahead of this 1100 ms one (its 1000 ms plus two 50 ms polls) and
+      // always fires first. Timer order decides, not how fast the turn runs.
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      expect(state).toBe("pending");
+      expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(true);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
+
+      latch.release();
+      expect(await owner).toMatchObject({ runId, ownerSessionId });
+      expect(latch.held()).toBe(1);
       expect(f.finishedTurns(ownerSessionId)).toBe(2);
       expect(f.harness.cp.outbox.listByRun(runId).filter((m) => m.kind === MessageKind.RUN_DISPATCH)).toMatchObject([{ status: "ACKED" }]);
     });
