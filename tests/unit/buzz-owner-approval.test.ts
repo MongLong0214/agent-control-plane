@@ -22,6 +22,7 @@ import type {
 } from "../../src/buzz/buzz-owner-approval.ts";
 import type { BuzzMentionEvent } from "../../src/buzz/buzz-mention-subscriber.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { OWNER_DECIDE_AGAIN_MESSAGE } from "../../src/db/artifacts.ts";
 import * as productionGate from "../../src/ceo/production-gate.ts";
 import * as daemonComposition from "../../src/daemon/agentcpd.ts";
 import { startBuzzMessageIngressListener, startDaemonBuzzMentionSubscriber } from "../../src/daemon/agentcpd.ts";
@@ -2462,6 +2463,78 @@ describe("S10-R2-01: an anchored execution's approval admits only the candidate 
       // The anchor's own candidate restored: the same anchor holds again, so the candidate alone was refused.
       cp.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [w.prepared.snapshotDigest, w.prepared.runId]);
       expect(gateOf(w).satisfied).toBe(true);
+    } finally {
+      await w.close();
+    }
+  });
+});
+
+/**
+ * SEC-OD1-R1-02 — the owner's decisions as the code before SEC-OD1 recorded them: the same admission,
+ * consumption and transaction, written through `put`, so with the "service" label every decision of
+ * that era carries. Restored after `record`, so nothing else in the world is written this way.
+ */
+const asBeforeSecOd1 = <T>(w: World, record: () => T): T => {
+  const store = w.prepared.harness.cp.artifacts;
+  const canonical = store.putOwnerDecision;
+  store.putOwnerDecision = ((_writer, runId, content, candidate) =>
+    store.put(runId, "APPROVAL", content, candidate)) as typeof store.putOwnerDecision;
+  try {
+    return record();
+  } finally {
+    store.putOwnerDecision = canonical;
+  }
+};
+
+const ownerDecisionLabels = (w: World): Array<[unknown, unknown, string]> =>
+  w.prepared.harness.cp.artifacts.list<Record<string, unknown>>(w.prepared.runId, "APPROVAL")
+    .filter((artifact) => artifact.content["kind"] === "OWNER_DECISION")
+    .map((artifact) => [artifact.content["item"], artifact.content["approved"], artifact.producedBy]);
+
+describe("SEC-OD1-R1-02: owner decisions recorded before canonical provenance", () => {
+  it("ODLEGACY-REFUSAL an exactly bound refusal recorded before SEC-OD1 still prevents the T3 CONFIRM, with no GitHub write", async () => {
+    // The review's reproduction: refused with 0 GitHub calls before SEC-OD1, 4 FakeGitHub writes at 7dab783a.
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM] });
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(gateOf(w).satisfied).toBe(true);
+      expect(asBeforeSecOd1(w, () => ownerDecision(w, T3_GATE_ITEM, false)).allowed).toBe(true);
+      expect(ownerDecisionLabels(w)).toEqual([[T3_GATE_ITEM, false, "service"]]);
+      const confirmed = await w.confirm();
+      const { consumptions, githubCalls } = w.counts();
+      // The one consumption is the refusal's own owner_decision_submit receipt; nothing reached GitHub.
+      expect({ gate: gateOf(w), confirmed: confirmed.reasonCode, consumptions, githubCalls }).toEqual({
+        gate: { required: true, items: [T3_GATE_ITEM], satisfied: false },
+        confirmed: ReasonCode.HUMAN_GATE_UNSATISFIED,
+        consumptions: 1,
+        githubCalls: 0,
+      });
+    } finally {
+      await w.close();
+    }
+  });
+
+  it("ODLEGACY-CONFIRM an approval recorded before SEC-OD1 does not count, and CONFIRM says the owner must decide again", async () => {
+    const { w, prompt } = await promptedWorld({ humanGate: [T3_GATE_ITEM, PROSE_ITEM] });
+    try {
+      await w.send(w.reply({ prompt }));
+      expect(asBeforeSecOd1(w, () => ownerDecision(w, PROSE_ITEM, true)).allowed).toBe(true);
+      expect(ownerDecisionLabels(w)).toEqual([[PROSE_ITEM, true, "service"]]);
+      expect(gateOf(w)).toEqual({ required: true, items: [T3_GATE_ITEM, PROSE_ITEM], satisfied: false, decideAgain: [PROSE_ITEM] });
+      expect(await w.confirm()).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED,
+        message: OWNER_DECIDE_AGAIN_MESSAGE,
+        evidence: { stage: "precondition", decideAgain: [PROSE_ITEM], remedy: "NEW_OWNER_DECISION" },
+      });
+      expect(w.counts()).toMatchObject({ consumptions: 1, githubCalls: 0 });
+      // The owner decides again through the canonical path, and the item is decided.
+      const { harness, runId } = w.prepared;
+      const note = "decided again";
+      expect(harness.cp.ceo.recordOwnerDecision({
+        runId, item: PROSE_ITEM, approved: true, note, receipt: ownerDecisionReceipt(harness, runId, PROSE_ITEM, true, note),
+      }).allowed).toBe(true);
+      expect(gateOf(w)).toEqual({ required: true, items: [T3_GATE_ITEM, PROSE_ITEM], satisfied: true });
     } finally {
       await w.close();
     }

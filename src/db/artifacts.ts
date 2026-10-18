@@ -57,6 +57,22 @@ export const isEvidenceKind = (kind: string): kind is EvidenceKind =>
 export const OWNER_DECISION_PRODUCER = "production-gate:owner-decision";
 
 /**
+ * SEC-OD1-R1-02 — why an owner gate refuses when an item's latest exactly bound approval does not
+ * carry `OWNER_DECISION_PRODUCER`. Every decision recorded before SEC-OD1 was labelled "service", and
+ * once its ingress row is pruned it cannot be told from a hand-written one, so it is not counted
+ * (CEO 52c3b1e6 (a)); the refusal says so rather than reporting a missing approval. The production
+ * gate (CONFIRM, the decision digest) and the GitHub kernel's publish/merge gate say it the same way.
+ */
+export const OWNER_DECIDE_AGAIN_MESSAGE =
+  "an owner approval recorded without canonical owner-decision provenance (as every approval recorded before SEC-OD1 was) is not counted; the owner must decide again";
+
+/** The evidence that names the items to decide again beside `OWNER_DECIDE_AGAIN_MESSAGE`. */
+export const ownerDecideAgainEvidence = (items: readonly string[]): { decideAgain: string[]; remedy: "NEW_OWNER_DECISION" } => ({
+  decideAgain: [...items],
+  remedy: "NEW_OWNER_DECISION",
+});
+
+/**
  * The only secret in this module. It is never exported and never stored on a token, so the
  * sole route to a constructed capability is `ArtifactStore.issueEvidenceWriters`. Symbol
  * identity — not the description — is what the constructor compares, so re-creating

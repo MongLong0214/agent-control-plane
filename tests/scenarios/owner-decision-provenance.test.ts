@@ -4,8 +4,12 @@ import { afterAll, describe, expect, it } from "vitest";
 import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
+import { OWNER_DECIDE_AGAIN_MESSAGE } from "../../src/db/artifacts.ts";
+import { RunState } from "../../src/domain/types.ts";
 import type { GatePayload } from "../../src/github/github-kernel.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
+import { createHermesMcpPort } from "../../src/mcp/hermes-server.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import {
@@ -84,11 +88,29 @@ const decide = (w: Pick<World, "harness" | "runId">, item: string, approved: boo
 };
 
 /**
- * A run driven to a reviewed candidate with the two-item gate. `approve` items are decided by the owner
- * first; when they cover the gate the CEO confirms for real, otherwise the fixture stages CEO_APPROVED
- * so the kernel's own re-check is what is exercised.
+ * SEC-OD1-R1-02 — `record` as the code before SEC-OD1 recorded an owner decision: the same admission,
+ * consumption and transaction, written through `put`, so with the "service" label every decision of
+ * that era carries. Restored afterwards, so nothing else is written this way.
  */
-const world = async (approve: readonly string[] = []): Promise<World> => {
+const asBeforeSecOd1 = <T>(w: Pick<World, "harness">, record: () => T): T => {
+  const store = w.harness.cp.artifacts;
+  const canonical = store.putOwnerDecision;
+  store.putOwnerDecision = ((_writer, runId, content, candidate) =>
+    store.put(runId, "APPROVAL", content, candidate)) as typeof store.putOwnerDecision;
+  try {
+    return record();
+  } finally {
+    store.putOwnerDecision = canonical;
+  }
+};
+
+/**
+ * A run driven to a reviewed candidate with the two-item gate. `approve` items are decided by the owner
+ * first (`before`: as the code before SEC-OD1 recorded them); when they count for the gate the CEO
+ * confirms for real, otherwise the fixture stages CEO_APPROVED so the kernel's own re-check is what is
+ * exercised.
+ */
+const world = async (approve: readonly string[] = [], options: { before?: boolean } = {}): Promise<World> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
   const harness = makeHarness({ githubClient: github });
@@ -112,9 +134,13 @@ const world = async (approve: readonly string[] = []): Promise<World> => {
     ttlMs: 7 * 24 * 60 * 60 * 1000,
   });
   if (!claimed.allowed) throw new Error(claimed.message);
-  for (const item of approve) decide({ harness, runId: driven.runId }, item, true, `approve ${item}`);
+  for (const item of approve) {
+    const record = () => decide({ harness, runId: driven.runId }, item, true, `approve ${item}`);
+    if (options.before) asBeforeSecOd1({ harness }, record);
+    else record();
+  }
   await approveReviewedCandidateForFinalization(harness, driven, {
-    bypassCeoConfirmation: !ITEMS.every((item) => approve.includes(item)),
+    bypassCeoConfirmation: options.before === true || !ITEMS.every((item) => approve.includes(item)),
   });
   installDaemonFinalizerGitHubFixture(harness);
   return {
@@ -507,5 +533,295 @@ describe("SEC-OD1 the canonical record and its writer", () => {
     } finally {
       side.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------
+// FIX-SEC-R1 (review r1 of PR #1144)
+
+/** Every OWNER_DECISION APPROVAL of the run as [item, approved, producedBy], in durable order. */
+const decisionLabels = (w: World): Array<[unknown, unknown, string]> =>
+  w.harness.cp.artifacts.list<{ kind?: string; item?: unknown; approved?: unknown }>(w.runId, "APPROVAL")
+    .filter((artifact) => artifact.content.kind === "OWNER_DECISION")
+    .map((artifact) => [artifact.content.item, artifact.content.approved, artifact.producedBy]);
+
+const OTHER_CANDIDATE = `sha256:${"e".repeat(64)}`;
+
+/** One binding of a decision record changed from the current one; everything else is exact. */
+interface Binding {
+  item?: string;
+  humanGateDigest?: string;
+  artifactCandidate?: string;
+  contentCandidate?: string;
+  /** Overrides on the record's receipt; null writes no receipt at all. */
+  receipt?: Partial<OwnerApprovalReceipt> | null;
+}
+
+/** The content of an OWNER_DECISION on `item` bound exactly to `w`, except for `binding`. */
+const decisionContent = (w: World, approved: boolean, note: string, binding: Binding) => {
+  const item = binding.item ?? ITEM_B;
+  return {
+    kind: "OWNER_DECISION",
+    item,
+    approved,
+    note,
+    at: w.harness.clock.nowIso(),
+    humanGateDigest: binding.humanGateDigest ?? digestOf(ITEMS),
+    candidateSnapshotDigest: binding.contentCandidate ?? w.candidate,
+    ...(binding.receipt === null ? {} : {
+      receipt: typedReceipt(w, item, note, {
+        approved,
+        parameterDigest: digestOf({ item, approved, note }),
+        ...binding.receipt,
+      }),
+    }),
+  };
+};
+
+/** A refusal written with `put`, so labelled "service" like every decision recorded before SEC-OD1. */
+const putRefusal = (w: World, binding: Binding = {}) =>
+  w.harness.cp.artifacts.put(w.runId, "APPROVAL", decisionContent(w, false, "refused", binding), binding.artifactCandidate ?? w.candidate);
+
+/**
+ * An approval written through the production gate's own capability, so with the canonical label, but
+ * with no admission behind it: what only the retained-receipt and binding checks can still refuse.
+ */
+const putCanonicalApproval = (w: World, binding: Binding = {}) =>
+  w.harness.cp.artifacts.putOwnerDecision(
+    w.harness.cp.evidenceWritersForTests().PRODUCTION_READY_PACKET,
+    w.runId,
+    decisionContent(w, true, "approved", binding),
+    binding.artifactCandidate ?? w.candidate,
+  );
+
+/**
+ * Each changes exactly one binding of a record deciding `approved`, so removing the check for that
+ * binding is what each one catches.
+ */
+const UNBOUND: ReadonlyArray<{ name: string; binding: (approved: boolean) => Binding }> = [
+  { name: "whose receipt binds other parameters", binding: (approved) => ({ receipt: { parameterDigest: digestOf({ item: ITEM_B, approved, note: "another note" }) } }) },
+  { name: "whose receipt binds another run", binding: () => ({ receipt: { runId: "run_another" } }) },
+  { name: "whose receipt binds another operation", binding: () => ({ receipt: { operation: "repo_factory_github_write" } }) },
+  { name: "whose receipt binds the other decision", binding: (approved) => ({ receipt: { approved: !approved } }) },
+  { name: "whose receipt binds another candidate", binding: () => ({ receipt: { candidateSnapshotDigest: OTHER_CANDIDATE } }) },
+  { name: "for another gate definition", binding: () => ({ humanGateDigest: digestOf([ITEM_B]) }) },
+  { name: "stored for another candidate", binding: () => ({ artifactCandidate: OTHER_CANDIDATE }) },
+  { name: "naming another candidate", binding: () => ({ contentCandidate: OTHER_CANDIDATE }) },
+];
+
+describe("SEC-OD1-R1-02 refusals: an exactly bound refusal counts whatever its label; any other never blocks", () => {
+  it("ODREFUSAL an exactly bound refusal recorded before SEC-OD1 blocks the gate and the kernel publish, with no check run", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    asBeforeSecOd1(w, () => decide(w, ITEM_B, false, "refused before SEC-OD1"));
+    expect(decisionLabels(w)).toEqual([
+      [ITEM_A, true, OWNER_DECISION_LABEL],
+      [ITEM_B, true, OWNER_DECISION_LABEL],
+      [ITEM_B, false, "service"],
+    ]);
+    const published = await w.harness.cp.github.gatePublish(w.payload, w.identity);
+    expect({ gate: gateAccepts(w), published: published.reasonCode, checks: w.github.checkRuns.length }).toEqual({
+      gate: { satisfied: false, digest: false },
+      published: ReasonCode.HUMAN_GATE_UNSATISFIED,
+      checks: 0,
+    });
+    expect(w.harness.cp.ceo.humanGateStatus(w.runId).decideAgain).toBeUndefined();
+  });
+
+  it("ODREFUSAL an exactly bound refusal recorded before SEC-OD1 blocks the kernel merge of a published candidate, with no merge", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+    const pullNumber = await openPull(w);
+    asBeforeSecOd1(w, () => decide(w, ITEM_B, false, "withdrawn before SEC-OD1"));
+    const merged = await merge(w, pullNumber);
+    expect({ gate: gateAccepts(w), merged: merged.reasonCode, merges: w.github.mergeCount }).toEqual({
+      gate: { satisfied: false, digest: false },
+      merged: ReasonCode.HUMAN_GATE_UNSATISFIED,
+      merges: 0,
+    });
+  });
+
+  it("ODREFUSAL an exactly bound refusal written by hand blocks too: a refusal can only withhold", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    expect(putRefusal(w).producedBy).toBe("service");
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+  });
+
+  it("ODREFUSAL the owner's canonical approval after a refusal recorded before SEC-OD1 decides the item again", async () => {
+    const w = await world([ITEM_A]);
+    asBeforeSecOd1(w, () => decide(w, ITEM_B, false, "not yet, before SEC-OD1"));
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+    decide(w, ITEM_B, true, "now yes");
+    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+  });
+
+  it("ODREFUSAL a refusal of an item outside this gate never blocks", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    expect(putRefusal(w, { item: "an item outside this gate" }).producedBy).toBe("service");
+    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+  });
+
+  for (const { name, binding } of UNBOUND) {
+    it(`ODREFUSAL a refusal ${name} never blocks`, async () => {
+      const w = await world([ITEM_A, ITEM_B]);
+      expect(putRefusal(w, binding(false)).producedBy).toBe("service");
+      expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+      expect(w.harness.cp.ceo.humanGateStatus(w.runId).decideAgain).toBeUndefined();
+    });
+  }
+
+  it("ODREFUSAL none of those refusals, written together, stops the kernel publish or merge", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    putRefusal(w, { item: "an item outside this gate" });
+    for (const { binding } of UNBOUND) putRefusal(w, binding(false));
+    expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+    expect(outcome(await merge(w, await openPull(w)))).toBe("ALLOWED");
+    expect(w.github.mergeCount).toBe(1);
+  });
+});
+
+describe("SEC-OD1 retained receipt: a canonical record whose receipt or bindings are not this decision's decides nothing", () => {
+  it("ODRECEIPT control: the same capability write, exactly bound, decides the item (so each refusal below is its binding's)", async () => {
+    const w = await world([ITEM_A]);
+    expect(putCanonicalApproval(w).producedBy).toBe(OWNER_DECISION_LABEL);
+    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+  });
+
+  it("ODRECEIPT a canonical record with no retained receipt decides nothing", async () => {
+    const w = await world([ITEM_A]);
+    expect(putCanonicalApproval(w, { receipt: null }).producedBy).toBe(OWNER_DECISION_LABEL);
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+  });
+
+  for (const { name, binding } of UNBOUND) {
+    it(`ODRECEIPT a canonical record ${name} decides nothing`, async () => {
+      const w = await world([ITEM_A]);
+      expect(putCanonicalApproval(w, binding(true)).producedBy).toBe(OWNER_DECISION_LABEL);
+      expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+    });
+  }
+});
+
+describe("SEC-OD1-R1-02 approvals recorded before SEC-OD1 do not count, and the refusal says to decide again", () => {
+  for (const prune of [false, true]) {
+    it(`ODLEGACY approvals recorded before SEC-OD1${prune ? ", their ingress pruned," : ""} are refused at the gate, the decision digest and the kernel publish, naming the items to decide again`, async () => {
+      const w = await world([...ITEMS], { before: true });
+      expect(decisionLabels(w)).toEqual([[ITEM_A, true, "service"], [ITEM_B, true, "service"]]);
+      if (prune) pruneIngress(w, ITEMS.map((item) => recordedReceipt(w, item)));
+      const decideAgain = { decideAgain: [...ITEMS], remedy: "NEW_OWNER_DECISION" };
+      expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false, decideAgain: [...ITEMS] });
+      expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, message: OWNER_DECIDE_AGAIN_MESSAGE, evidence: decideAgain,
+      });
+      expect(await w.harness.cp.github.gatePublish(w.payload, w.identity)).toMatchObject({
+        allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, message: OWNER_DECIDE_AGAIN_MESSAGE, evidence: decideAgain,
+      });
+      expect(w.github.checkRuns).toHaveLength(0);
+      // The owner decides again through the canonical path, and the same payload publishes.
+      for (const item of ITEMS) decide(w, item, true, `decided again: ${item}`);
+      expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: true });
+      expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+    });
+  }
+
+  it("ODLEGACY only an undecided item whose latest bound approval is not canonical is named, and a later canonical decision clears it", async () => {
+    const w = await world([ITEM_A]);
+    // ITEM_A keeps its canonical approval; a later approval without the label changes nothing for it.
+    asBeforeSecOd1(w, () => decide(w, ITEM_A, true, "again, without the canonical label"));
+    asBeforeSecOd1(w, () => decide(w, ITEM_B, true, "approved before SEC-OD1"));
+    expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false, decideAgain: [ITEM_B] });
+    expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId).evidence).toMatchObject({ decideAgain: [ITEM_B] });
+    // The owner's canonical refusal then decides ITEM_B: nothing is left to decide again.
+    decide(w, ITEM_B, false, "refused");
+    expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false });
+    expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId)).toMatchObject({
+      allowed: false, message: "every current owner-gate item needs approval",
+    });
+  });
+
+  it("ODCOMPLETED a run completed on approvals recorded before SEC-OD1 stays COMPLETED: its status and result read, and nothing is written again", async () => {
+    const w = await world([...ITEMS], { before: true });
+    // How such a run completed: the reader before SEC-OD1 counted these rows (the review's base run of
+    // this fixture: satisfied, publish ALLOWED). That verdict is stood in for this drive only.
+    const ceo = w.harness.cp.ceo;
+    ceo.humanGateStatus = () => ({ required: true, items: [...ITEMS], satisfied: true });
+    try {
+      expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+      expect(outcome(await merge(w, await openPull(w)))).toBe("ALLOWED");
+    } finally {
+      Reflect.deleteProperty(ceo, "humanGateStatus");
+    }
+    const completion = w.harness.cp.completionAuthoritiesForTests().daemonFinalizer;
+    expect(w.harness.cp.runs.transition(w.runId, RunState.MERGING, "completed before SEC-OD1").allowed).toBe(true);
+    expect(w.harness.cp.runs.transition(w.runId, RunState.POST_MERGE_VERIFYING, "completed before SEC-OD1").allowed).toBe(true);
+    expect(w.harness.cp.runs.transition(w.runId, RunState.COMPLETED, "completed before SEC-OD1", {}, completion).allowed).toBe(true);
+    const external = () => ({
+      writes: w.github.calls.filter((call) => call.method !== "GET").length,
+      merges: w.github.mergeCount,
+      checks: w.github.checkRuns.length,
+    });
+    const completed = external();
+    expect(completed).toMatchObject({ merges: 1, checks: 1 });
+
+    // Status (run_get, as RUN_SHOW): it reads, and says the approvals must be decided again.
+    const view = createHermesMcpPort(w.harness.cp).runView(w.runId);
+    expect(view?.run.state).toBe(RunState.COMPLETED);
+    expect(view?.humanGate).toEqual({ required: true, items: [...ITEMS], satisfied: false, decideAgain: [...ITEMS] });
+    // Result: the finalizer answers from its durable receipts and reopens nothing.
+    const result = await new ApprovedRunFinalizer(w.harness.cp, "sec-od1-completed").finalizeApprovedRun(w.runId);
+    expect(result).toMatchObject({
+      allowed: true,
+      reasonCode: ReasonCode.MERGE_IDEMPOTENT_REPLAY,
+      value: { state: RunState.COMPLETED, repositories: [{ repositoryIdentity: w.identity }] },
+    });
+    expect(w.harness.cp.runs.require(w.runId).state).toBe(RunState.COMPLETED);
+    expect(external()).toEqual(completed);
+  });
+});
+
+/**
+ * SEC-OD1-R1-01 — the review's counterexample: the canonical label written by an ordinary in-process
+ * `Db.run`, with no capability, no admitted receipt and no allowlisted actor. Code alone cannot refuse
+ * it; the v47 authority guard (a migration) does. Until then these are expected failures: vitest
+ * reports them passed only while they fail, and that is never a security PASS. v47 turns each into `it`.
+ */
+const canonicalViaDbRun = (w: World, item: string, note: string): void => {
+  const content = {
+    kind: "OWNER_DECISION",
+    item,
+    approved: true,
+    note,
+    receipt: typedReceipt(w, item, note, { actor: "not-the-owner" }),
+    humanGateDigest: digestOf(ITEMS),
+    candidateSnapshotDigest: w.candidate,
+  };
+  w.harness.cp.db.run(
+    `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest, content_json, produced_by, created_at)
+     VALUES (?, ?, 'APPROVAL', ?, ?, ?, ?, ?)`,
+    [`art_v47_${digestOf({ item, note }).slice(7, 31)}`, w.runId, digestOf(content), w.candidate, JSON.stringify(content), OWNER_DECISION_LABEL, w.harness.clock.nowIso()],
+  );
+};
+
+describe("SEC-OD1-R1-01 known failures until the v47 authority guard (expected to fail; not a security PASS)", () => {
+  it.fails("ODV47-KNOWN-FAIL until v47: a Db.run of the canonical label, never admitted, must not publish", async () => {
+    const w = await world([ITEM_A]);
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+    canonicalViaDbRun(w, ITEM_B, "not admitted; ordinary Db.run");
+    const published = await w.harness.cp.github.gatePublish(w.payload, w.identity);
+    const observed = { gate: gateAccepts(w), published: outcome(published), checks: w.github.checkRuns.length };
+    expect(published.reasonCode, JSON.stringify(observed)).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect(w.github.checkRuns).toHaveLength(0);
+  });
+
+  it.fails("ODV47-KNOWN-FAIL until v47: a Db.run of the canonical label must not override the owner's refusal at merge", async () => {
+    const w = await world([ITEM_A, ITEM_B]);
+    expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+    const pullNumber = await openPull(w);
+    decide(w, ITEM_B, false, "owner refused");
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+    canonicalViaDbRun(w, ITEM_B, "overriding the refusal; ordinary Db.run");
+    const merged = await merge(w, pullNumber);
+    const observed = { gate: gateAccepts(w), merged: outcome(merged), merges: w.github.mergeCount };
+    expect(merged.reasonCode, JSON.stringify(observed)).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect(w.github.mergeCount).toBe(0);
   });
 });
