@@ -162,6 +162,8 @@ interface GitHubApiResult {
 const GITHUB_API_BASE_URL = "https://api.github.com";
 const DEFAULT_REFRESH_BEFORE_EXPIRY_MS = 5 * 60 * 1_000;
 const REQUEST_TIMEOUT_MS = 120_000;
+/** The statuses fetch treats as redirects (Fetch standard, "redirect status"). */
+const REDIRECT_STATUSES: ReadonlySet<number> = new Set([301, 302, 303, 307, 308]);
 
 /**
  * The owner-approved App permission grants. Authentication succeeds only when the
@@ -386,7 +388,7 @@ export class TrustedCredentialStore {
     // FD-R2 — the token, cached or refreshed, is the last await before the send, and a decision can land
     // during it. The caller's check runs after it, and `#request` calls fetch before its own first await,
     // so nothing is awaited between the check and the dispatch. Each call dispatches once: nothing here
-    // retries or re-authenticates and sends again.
+    // retries or re-authenticates and sends again, and fetch does not follow a redirect (`#request`).
     if (options.beforeDispatch) {
       let verified: Decision<void>;
       try {
@@ -594,10 +596,30 @@ export class TrustedCredentialStore {
           ...(input.input === undefined ? {} : { "Content-Type": "application/json" }),
         },
         ...(input.input === undefined ? {} : { body: input.input }),
+        // FIX-FD-REDIRECT — fetch's default, "follow", answers a redirect by sending the request again
+        // to the new location inside fetch, so the second send never passes the caller's
+        // beforeDispatch: a gate POST or a merge PUT the owner refused in between still went out.
+        // Each call sends once. A redirect is an answer that names another location, returned below
+        // as a refusal; nothing here follows it.
+        redirect: "manual",
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch {
       return deny(input.failureCode, input.failureMessage, { operation: input.method });
+    }
+    if (response.type === "opaqueredirect" || REDIRECT_STATUSES.has(response.status)) {
+      // Not followed and not read: the Location header names a destination this transport does not
+      // send to, and the body is dropped as every refused body is. `status` marks it as answered.
+      try {
+        await response.body?.cancel();
+      } catch {
+        // The refusal below stands whether or not the unread body could be released.
+      }
+      return deny(input.failureCode, `${input.failureMessage}: GitHub answered with a redirect, which is not followed`, {
+        operation: input.method,
+        status: response.status,
+        redirect: true,
+      });
     }
 
     // `response.text()` would buffer whatever the endpoint sends. The bound is kept here,
