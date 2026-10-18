@@ -251,6 +251,16 @@ describe("ACP-C1B-03: a restart that loses the credential does not strand a run 
     await withBootstrapRuntime(async (f) => {
       const { runId, ownerSessionId, roleKey } = await dispatchedAndAcked(f);
       await revise(f, runId);
+      // The FINAL_REVISE's REVISION_REQUEST wakes a work turn in band. A restart ends it with the daemon;
+      // `release` does not, so it is let finish first: carried across, its launch-channel take or withdraw
+      // could take the rotated credential the recovery provisions for its attestation.
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
+      // A session runs one turn at a time and writes its SESSION_TURN row after the provider call and the
+      // withdraw return, so the third is the REVISION_REQUEST's turn: its in-band ack comes first, and the
+      // request is ACKED at generation 1 before the release. This covers renewal after a COMPLETED revision
+      // request; a restart that leaves a turn in progress is not covered here.
+      expect(f.harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST)
+        .map((message) => [message.bindingGeneration, message.status])).toEqual([[1, "ACKED"]]);
       f.harness.cp.sessionRuntime.release(ownerSessionId);
 
       await f.daemon.reconcileContinuity("first tick after a restart");
