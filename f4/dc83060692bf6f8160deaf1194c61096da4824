@@ -1,0 +1,4 @@
+Limit: an operator's ACP_CLAUDE_BINARY, ACP_CODEX_BINARY or ACP_GROK_BINARY inherited from launchd still reaches the daemon unchanged: the README and doctor name it as the override, but no documented route sets it; changing that channel needs its own decision
+Warn: the launcher unsets every internal ACP_RESOLVED_*_BINARY (buzz, claude, codex, grok, commitlore) before this install's baked lines, so each resolved pin is exactly what this install wrote, or nothing; an inherited value of those names never reaches the daemon
+Record-Id: r-81e97d402807
+Provenance: inherited dd1f3db2f8fa3c42f147aaae7e0dfb7675bac98a
