@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { GitHubKernel, type GitHubClient, type MergeInput } from "../../src/github/github-kernel.ts";
+import { type GatePayload, GitHubKernel, type GitHubClient, type MergeInput } from "../../src/github/github-kernel.ts";
 import { composeSquashCommitMessage, composeSquashCommitTitle } from "../../src/github/merge-commit-message.ts";
 import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
 import { fakeGitHub } from "../helpers/fake-github-pulls.ts";
@@ -67,7 +67,10 @@ const fixture = (
     mergeRepositoryId: () => allow(ReasonCode.OK, "test-repository"),
     receipt: () => undefined,
     assertFreshDaemonFinalization: () => allow(ReasonCode.OK, undefined),
-    mergeEvaluate: async () => allow(ReasonCode.OK, undefined),
+    // The evaluation names the gate payload it selected; mergeExecute verifies that payload again after its
+    // last awaited read and before the PUT (FD-R1-RACE). Authorization is satisfied here, so both allow.
+    evaluateMerge: async () => allow(ReasonCode.OK, { predicates: {}, gate: {} as GatePayload }),
+    assertGatePayloadBacked: () => allow(ReasonCode.OK, undefined),
     preparedPrIntent: () => allow(ReasonCode.OK, { head: "feature", base: "main" }),
     api: () => client,
     writeTarget: () => allow(ReasonCode.OK, {}),

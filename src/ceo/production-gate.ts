@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 
-import { deriveHumanGate } from "./human-gate.ts";
+import { deriveHumanGate, repeatedHumanGateDeclarations } from "./human-gate.ts";
 import {
   bootstrapPlanIntentTasks,
   bootstrapReviewIntentCurrent,
@@ -1424,7 +1424,13 @@ export class ProductionGate {
         });
   }
 
-  private humanGateDefinition(runId: string): { required: boolean; items: string[]; digest: string; linksT3: boolean } {
+  private humanGateDefinition(runId: string): {
+    required: boolean;
+    items: string[];
+    duplicateDeclarations: string[];
+    digest: string;
+    linksT3: boolean;
+  } {
     const run = this.runs.get(runId);
     const contract = this.artifacts.latest<{ humanGate?: unknown; scope?: unknown }>(
       runId,
@@ -1443,7 +1449,7 @@ export class ProductionGate {
           scope,
           declaredItems,
         })
-      : { required: declaredItems.length > 0, items: declaredItems };
+      : { required: declaredItems.length > 0, items: declaredItems, duplicateDeclarations: repeatedHumanGateDeclarations(declaredItems) };
     // S10-R1-04 — the link is judged on the declared values as stored, before `deriveHumanGate` trims
     // them: no declared value is a noncanonical spelling of the item, so the item `humanGateStatus`
     // finds after the trim was declared exactly. The digest is unchanged.
@@ -1885,8 +1891,15 @@ export class ProductionGate {
     const refused = (message: string, evidence: Record<string, unknown>, decideAgain?: string[]): HumanGateResolution =>
       ({ required: true, items, binding: null, refusal: { message, evidence }, ...(decideAgain ? { decideAgain } : {}) });
     if (items.length === 0) return refused("run requires a human gate with no durable gate items", { runId });
-    if (new Set(items).size !== items.length) {
-      return refused("the human-gate definition names an item more than once", { runId, items });
+    // FD-R1-DUP — the declarations as the durable contract stores them, before the derivation drops a
+    // repeat: a question declared twice, even in two spellings that normalise to one, is refused here
+    // rather than bound once. The items themselves are also checked, for a definition built otherwise.
+    if (gate.duplicateDeclarations.length > 0 || new Set(items).size !== items.length) {
+      return refused("the human-gate definition names an item more than once", {
+        runId,
+        items,
+        ...(gate.duplicateDeclarations.length > 0 ? { duplicateDeclarations: gate.duplicateDeclarations } : {}),
+      });
     }
     const currentCandidate = this.runs.currentCandidate(runId);
     // Only a canonical owner decision approves an item (SEC-OD1): never a direct ArtifactStore

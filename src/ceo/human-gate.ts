@@ -26,6 +26,13 @@ export interface HumanGateInput {
 export interface HumanGateDefinition {
   required: boolean;
   items: string[];
+  /**
+   * FD-R1-DUP — every declared owner question that repeats an earlier declaration once both are
+   * normalised (surrounding space, case and inner whitespace). Read from the declarations as stored,
+   * before `items` drops the repeats, so a durable contract that names one question twice is seen as
+   * doing so; the gate refuses such a definition rather than binding the question once.
+   */
+  duplicateDeclarations: string[];
 }
 
 /**
@@ -55,6 +62,18 @@ const uniqueNonEmpty = (items: readonly string[]): string[] =>
 const matches = (trigger: HumanGateTrigger, text: string): boolean =>
   text.includes(normalise(trigger)) || TRIGGER_PHRASES[trigger].some((phrase) => text.includes(phrase));
 
+/** The declared questions, as declared, that normalise to a question declared earlier. A blank declaration names none. */
+export const repeatedHumanGateDeclarations = (declared: readonly string[]): string[] => {
+  const seen = new Set<string>();
+  return declared.filter((item) => {
+    const key = normalise(item);
+    if (!key) return false;
+    if (seen.has(key)) return true;
+    seen.add(key);
+    return false;
+  });
+};
+
 /**
  * Computes the gate from durable run properties. A GUARDED run with no owner item remains
  * required but intentionally has an empty item list; callers must fail it closed rather than
@@ -70,5 +89,6 @@ export const deriveHumanGate = (input: HumanGateInput): HumanGateDefinition => {
     required:
       input.executionMode === ExecutionMode.GUARDED || triggeredItems.length > 0 || declaredItems.length > 0,
     items,
+    duplicateDeclarations: repeatedHumanGateDeclarations(input.declaredItems),
   };
 };

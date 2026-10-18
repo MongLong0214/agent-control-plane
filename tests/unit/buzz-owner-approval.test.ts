@@ -2559,6 +2559,16 @@ describe("SEC-OD1-R1-02: owner decisions recorded before canonical provenance", 
   });
 });
 
+/**
+ * CEO ef7fa698, point 1: two things are verified here and recorded apart.
+ * - T3 COMPLETED is verified on the CONFIRM path. A project-less PROJECT_BOOTSTRAP completes at the CEO's
+ *   CONFIRM and never reaches the daemon finalizer, so these witnesses do not show a T3 run completing
+ *   through the daemon finalizer, and nothing here should be read that way.
+ * - The binding agreement, separately: the finalizer's reader (`currentHumanGateDecisionDigest`), the
+ *   kernel's port (`humanGateBinding`) and the binding of the receipt `ownerApprovalHolds` admits. All
+ *   three agree before consumption; the reader names the same binding after consumption; the reader and
+ *   the port name it after the receipt's ingress admission is pruned.
+ */
 describe("FINALIZER-DIGEST T3: the decision digest the daemon finalizer names reads the S10 T3 link", () => {
   /** The binding the T3 link gives: the receipt `ownerApprovalHolds` admits, bound by the item's id. */
   const t3Binding = (w: World): string => {
@@ -2596,7 +2606,8 @@ describe("FINALIZER-DIGEST T3: the decision digest the daemon finalizer names re
       expect(cp.bootstrap.acknowledgeActivationHandoff(applied.evidence["pendingHandoffId"] as string, primary!.sessionId).allowed).toBe(true);
       const activated = await w.confirm();
       expect(activated.allowed, JSON.stringify(activated)).toBe(true);
-      // The T3-linked run completes on the same resolution.
+      // T3 COMPLETED, verified on the CONFIRM path: the bootstrap completes at this CONFIRM, not through
+      // the daemon finalizer. Recorded apart from the binding agreement checked above.
       const confirmed = cp.ceo.submitCeoDecision({
         runId: w.prepared.runId,
         decision: "CONFIRM",
