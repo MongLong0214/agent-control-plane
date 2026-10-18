@@ -1,3 +1,7 @@
+import { generateKeyPairSync } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
@@ -5,7 +9,8 @@ import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ArtifactKind, RunState } from "../../src/domain/types.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { GATE_CHECK_NAME, type GatePayload, gateExternalId, NO_HUMAN_GATE_DIGEST } from "../../src/github/github-kernel.ts";
+import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
+import { GATE_CHECK_NAME, GitHubAppClient, type GatePayload, gateExternalId, NO_HUMAN_GATE_DIGEST } from "../../src/github/github-kernel.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub, type FakePull } from "../helpers/fake-github.ts";
@@ -457,33 +462,37 @@ describe("FINALIZER-DIGEST: the daemon finalizer and the kernel bind the same hu
     expect(writes(github)).toEqual({ gates: 0, merges: 0 });
   });
 
-  it.each([
-    ["the owner approves an item again", approveAgain, (fixture: Fixture): string | null => expectedBinding(fixture)],
-    ["the owner refuses an item", (fixture: Fixture) =>
-      recordOwnerDecision(fixture.harness, fixture.driven.runId, fixture.items[1]!, false, "refused after publish"), () => null],
-  ])("FINALIZER-DIGEST (d) FD-GATE: a published binding is stale once %s; the merge evaluated with only that stale gate on the head is refused", async (_label, change, current) => {
-    const fixture = await approvedHumanGatedRun();
-    afterFirstGatePublished(fixture.github, () => change(fixture));
-    let gatesWhenEvaluated: number | null = null;
-    atMergeAfterGate(fixture.github, 1, () => {
-      gatesWhenEvaluated = gatesOnHead(fixture).length;
-    });
+  // The (d) case keeps its round-1 name as the describe, so the selector `FINALIZER-DIGEST \(d\):` still
+  // collects these witnesses, and `FINALIZER-DIGEST \(d\) FD-GATE` (their FD-GATE name) does too.
+  describe("FINALIZER-DIGEST (d): a published binding is stale once the owner decides again", () => {
+    it.each([
+      ["the owner approves an item again", approveAgain, (fixture: Fixture): string | null => expectedBinding(fixture)],
+      ["the owner refuses an item", (fixture: Fixture) =>
+        recordOwnerDecision(fixture.harness, fixture.driven.runId, fixture.items[1]!, false, "refused after publish"), () => null],
+    ])("FINALIZER-DIGEST (d) FD-GATE: a published binding is stale once %s; the merge evaluated with only that stale gate on the head is refused", async (_label, change, current) => {
+      const fixture = await approvedHumanGatedRun();
+      afterFirstGatePublished(fixture.github, () => change(fixture));
+      let gatesWhenEvaluated: number | null = null;
+      atMergeAfterGate(fixture.github, 1, () => {
+        gatesWhenEvaluated = gatesOnHead(fixture).length;
+      });
 
-    // Daemon.start's sweep: the attempt in which the change happened, then the MERGING run's next attempt.
-    await finalizeAttempts(fixture, 0);
-    const now = current(fixture);
-    expect(fixture.harness.cp.ceo.humanGateBinding(fixture.driven.runId).humanGateDigest).toBe(now);
-    expect(now).not.toBe(fixture.binding);
-    // The gate published before the change named the binding that then held, and it was the only gate on
-    // the head when the merge that followed was evaluated; that merge was refused for naming it, against
-    // the binding now (none after a refusal), and no merge was sent before another gate was published.
-    expect(publishedPayloads(fixture)[0]?.humanGateDigest).toBe(fixture.binding);
-    expect(gatesWhenEvaluated).toBe(1);
-    expect(failedAttempts(fixture)[0]).toEqual(
-      { reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, suppliedDigest: fixture.binding, expectedDigest: now },
-    );
-    expect(writeLog(fixture).slice(0, 2).filter((entry) => entry.startsWith("merge"))).toEqual([]);
-    expect(fixture.github.pulls).toHaveLength(1);
+      // Daemon.start's sweep: the attempt in which the change happened, then the MERGING run's next attempt.
+      await finalizeAttempts(fixture, 0);
+      const now = current(fixture);
+      expect(fixture.harness.cp.ceo.humanGateBinding(fixture.driven.runId).humanGateDigest).toBe(now);
+      expect(now).not.toBe(fixture.binding);
+      // The gate published before the change named the binding that then held, and it was the only gate on
+      // the head when the merge that followed was evaluated; that merge was refused for naming it, against
+      // the binding now (none after a refusal), and no merge was sent before another gate was published.
+      expect(publishedPayloads(fixture)[0]?.humanGateDigest).toBe(fixture.binding);
+      expect(gatesWhenEvaluated).toBe(1);
+      expect(failedAttempts(fixture)[0]).toEqual(
+        { reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, suppliedDigest: fixture.binding, expectedDigest: now },
+      );
+      expect(writeLog(fixture).slice(0, 2).filter((entry) => entry.startsWith("merge"))).toEqual([]);
+      expect(fixture.github.pulls).toHaveLength(1);
+    });
   });
 
   it("FINALIZER-DIGEST (e): after an attempt that opened the PR and failed at the gate, the resumed finalization reuses that PR and completes", async () => {
@@ -721,4 +730,386 @@ describe("FD-R1-RACE: a change while the kernel awaits its last read before the 
       expect(github.mergeCount).toBe(change === "approval again" ? 1 : 0);
     },
   );
+});
+
+/**
+ * FD-R2 (FD-R1-RACE, ROUND1-ESCAPE-PUBLISH) — the production transport between the kernel and GitHub:
+ * the real TrustedCredentialStore and GitHubAppClient, wired into the kernel in place of the test
+ * client, with GitHub answering behind a fake fetch, the HTTP boundary (FakeGitHub supplies the
+ * answers). The store awaits its installation token after the kernel's own last check, so a decision
+ * or a candidate can land during that await.
+ *
+ * `events` records, in order: each token refresh, each answer of the check the transport runs before
+ * a dispatch ("verified" or "refused <reason>"), and each gate POST and merge PUT dispatched.
+ * `staleWrites` records each of those writes whose payload no longer names the current binding and
+ * candidate when it is dispatched.
+ */
+const realTransport = async (fixture: Fixture) => {
+  const { harness, driven, github } = fixture;
+  const root = tempDir("acp-fd-r2-transport-");
+  const credentialDir = join(root, "credentials");
+  mkdirSync(credentialDir, { mode: 0o700 });
+  const keyPath = join(credentialDir, "github-app.private-key.pem");
+  writeFileSync(keyPath, generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs1", format: "pem" }), { mode: 0o600 });
+  const envFile = join(credentialDir, "github-app.env");
+  writeFileSync(envFile, `GITHUB_APP_ID=4586878\nGITHUB_APP_INSTALLATION_ID=153553922\nGITHUB_APP_PRIVATE_KEY_PATH=${keyPath}\n`, { mode: 0o600 });
+  let now = Date.parse("2026-08-14T00:00:00.000Z");
+  let duringRefresh: (() => void | Promise<void>) | null = null;
+  const atRequest: Array<{ method: string; path: RegExp; run: () => void }> = [];
+  const unanswered = new Set<string>();
+  const events: string[] = [];
+  const staleWrites: Array<Record<string, unknown>> = [];
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    if (url.pathname === "/app") {
+      const change = duringRefresh;
+      duringRefresh = null;
+      if (change) {
+        events.push("token refresh");
+        await Promise.resolve();
+        await change();
+      }
+      return new Response(JSON.stringify({ slug: "acp-trusted-app", permissions: {
+        checks: "write", contents: "write", issues: "write", metadata: "read", pull_requests: "write",
+      } }), { status: 200 });
+    }
+    if (url.pathname.endsWith("/access_tokens")) {
+      return new Response(JSON.stringify({ token: "fd-r2-installation-token", expires_at: new Date(now + 3_600_000).toISOString() }), { status: 201 });
+    }
+    const method = (init?.method ?? "GET") as "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
+    const body = init?.body ? JSON.parse(String(init.body)) as unknown : undefined;
+    const write = method === "PUT" && /\/pulls\/\d+\/merge$/.test(url.pathname) ? "merge PUT"
+      : method === "POST" && /\/check-runs$/.test(url.pathname) && (body as { name?: unknown }).name === GATE_CHECK_NAME ? "gate POST"
+        : null;
+    if (write) {
+      events.push(write);
+      // What the write rests on: the payload it publishes, or, for the merge, the last one published.
+      const payload = write === "gate POST"
+        ? JSON.parse((body as { output: { text: string } }).output.text) as GatePayload
+        : publishedPayloads(fixture).at(-1)!;
+      const current = {
+        binding: harness.cp.ceo.humanGateBinding(driven.runId).humanGateDigest,
+        candidate: harness.cp.runs.currentCandidate(driven.runId),
+      };
+      if (payload.humanGateDigest !== current.binding || payload.candidateSnapshotDigest !== current.candidate) {
+        staleWrites.push({ write, payloadBinding: payload.humanGateDigest, payloadCandidate: payload.candidateSnapshotDigest, ...current });
+      }
+      if (unanswered.delete(write)) throw new TypeError("fetch failed: the connection closed before GitHub answered");
+    }
+    const response = await github.request(method, url.pathname + url.search, body);
+    return new Response(JSON.stringify(response), { status: method === "POST" ? 201 : 200 });
+  };
+  const store = new TrustedCredentialStore(join(root, "secrets"), { appEnvFile: envFile, fetch, now: () => now });
+  expect((await store.authenticate()).allowed).toBe(true);
+  const githubApi = store.githubApi.bind(store);
+  store.githubApi = (options) => {
+    const armed = atRequest.findIndex((entry) => entry.method === options.method && entry.path.test(options.path));
+    if (armed >= 0) atRequest.splice(armed, 1)[0]!.run();
+    return githubApi(options.beforeDispatch === undefined ? options : {
+    ...options,
+    beforeDispatch: () => {
+      const verified = options.beforeDispatch!();
+      events.push(verified.allowed ? "verified" : `refused ${verified.reasonCode}`);
+      return verified;
+    },
+    });
+  };
+  Object.assign(harness.cp.github, { credentials: store, client: new GitHubAppClient(store) });
+  return {
+    events,
+    staleWrites,
+    /** The token expires now; `change` lands while the store mints the next one, after the kernel's last check. */
+    expireTokenThen: (change: () => void | Promise<void>): void => {
+      now += 2 * 3_600_000;
+      duringRefresh = change;
+    },
+    /** `run` runs once, when the kernel hands the transport its next request with this method and path. */
+    atNextRequest: (method: "POST" | "PUT", path: RegExp, run: () => void): void => {
+      atRequest.push({ method, path, run });
+    },
+    /** The next dispatched write of this kind reaches nothing and is not answered, as a dropped connection. */
+    dropNext: (write: "gate POST" | "merge PUT"): void => {
+      unanswered.add(write);
+    },
+  };
+};
+
+/** The events other than the transport's checks: what the first process did before it stopped. */
+const withoutChecks = (events: readonly string[]): string[] =>
+  events.filter((event) => event !== "verified" && !event.startsWith("refused "));
+
+/** Each gate POST and merge PUT dispatched, named with the event right before it. */
+const dispatchedAfter = (events: readonly string[]): string[] =>
+  events.flatMap((event, index) => (event === "gate POST" || event === "merge PUT" ? [`${events[index - 1]} -> ${event}`] : []));
+
+/** Runs `change` once, right after the kernel's first payload check returns: the gate publication's own. */
+const afterPublicationCheck = (fixture: Fixture, change: () => void): void => {
+  const kernel = fixture.harness.cp.github as unknown as { assertGatePayloadBacked: (...args: unknown[]) => unknown };
+  const check = kernel.assertGatePayloadBacked.bind(kernel);
+  let fired = false;
+  kernel.assertGatePayloadBacked = (...args: unknown[]) => {
+    const result = check(...args);
+    if (!fired) {
+      fired = true;
+      change();
+    }
+    return result;
+  };
+};
+
+describe("FD-R2: the transport checks the gate payload again once it holds its installation token, immediately before it sends", () => {
+  const changes = {
+    refusal: (fixture: Fixture) =>
+      recordOwnerDecision(fixture.harness, fixture.driven.runId, fixture.items[1]!, false, "refused during the token refresh"),
+    "approval again": (fixture: Fixture) =>
+      recordOwnerDecision(fixture.harness, fixture.driven.runId, fixture.items[0]!, true, "approved again during the token refresh"),
+    "candidate replacement": (fixture: Fixture) =>
+      fixture.harness.cp.runs.promoteCandidate(fixture.driven.runId, digestOf({ replacedDuringTokenRefresh: true })),
+  } as const;
+  const refusedFor = {
+    refusal: ReasonCode.HUMAN_GATE_UNSATISFIED,
+    "approval again": ReasonCode.HUMAN_GATE_UNSATISFIED,
+    "candidate replacement": ReasonCode.SNAPSHOT_STALE,
+  } as const;
+  const strategies = [
+    ["merge commit", false, "preflight"],
+    ["squash", true, "squash commits"],
+  ] as const;
+
+  it.each(strategies)(
+    "FD-R2 control %s: the token expires during the merge's last awaited read and nothing changes; the run merges once",
+    async (_strategy, squash, read) => {
+      const fixture = await approvedHumanGatedRun({ squash });
+      const transport = await realTransport(fixture);
+      duringMergePreparation(fixture, read, () => transport.expireTokenThen(() => undefined));
+
+      expect(await outcomeOf(fixture)).toEqual(COMPLETED_ONCE);
+      expect(transport.events).toContain("token refresh");
+      expect(transport.staleWrites).toEqual([]);
+    },
+  );
+
+  it.each(strategies)(
+    "FD-R2 every send %s: each gate POST and merge PUT leaves right after the transport's check of its payload, the refreshed token's PUT included",
+    async (_strategy, squash, read) => {
+      const fixture = await approvedHumanGatedRun({ squash });
+      const transport = await realTransport(fixture);
+      duringMergePreparation(fixture, read, () => transport.expireTokenThen(() => undefined));
+
+      expect(await outcomeOf(fixture)).toEqual(COMPLETED_ONCE);
+      expect(dispatchedAfter(transport.events)).toEqual(["verified -> gate POST", "verified -> merge PUT"]);
+      expect(transport.events.slice(-3)).toEqual(["token refresh", "verified", "merge PUT"]);
+    },
+  );
+
+  it.each(strategies.flatMap(([strategy, squash, read]) =>
+    (Object.keys(changes) as Array<keyof typeof changes>).map((change) => [strategy, change, squash, read] as const)))(
+    "FD-R2 %s: a %s while the transport refreshes its token after the kernel's last check sends no PUT for the evaluated binding",
+    async (_strategy, change, squash, read) => {
+      const fixture = await approvedHumanGatedRun({ squash });
+      const { harness, driven, github } = fixture;
+      const transport = await realTransport(fixture);
+      let changed = false;
+      duringMergePreparation(fixture, read, () => transport.expireTokenThen(() => {
+        changes[change](fixture);
+        changed = true;
+      }));
+
+      // Daemon.start's sweep: the attempt whose PUT waited on the token, then the MERGING run's next attempt.
+      await finalizeAttempts(fixture, 0);
+      expect(changed).toBe(true);
+      expect(transport.staleWrites).toEqual([]);
+      // The change landed during the refresh; the check the transport ran once it held the token refused,
+      // and that attempt sent nothing.
+      const refresh = transport.events.indexOf("token refresh");
+      expect(transport.events.slice(refresh, refresh + 2)).toEqual(["token refresh", `refused ${refusedFor[change]}`]);
+      const failed = failedAttempts(fixture)[0];
+      if (change === "approval again") {
+        // The legitimate next attempt publishes the new binding and merges on it, each write checked as it leaves.
+        const rebound = expectedBinding(fixture);
+        expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`, `gate ${rebound}`, `merge ${driven.candidateHead}`]);
+        expect(dispatchedAfter(transport.events)).toEqual(["verified -> gate POST", "verified -> gate POST", "verified -> merge PUT"]);
+        expect(failed).toEqual(stale(fixture, rebound));
+        expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+      } else {
+        expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`]);
+        if (change === "refusal") expect(failed).toEqual(stale(fixture, null));
+        else expect(failed?.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
+        expect(harness.cp.runs.require(driven.runId).state).not.toBe(RunState.COMPLETED);
+      }
+      expect(github.mergeCount).toBe(change === "approval again" ? 1 : 0);
+    },
+  );
+
+  const publicationWindows = [
+    // The review's witness: the store answers from its cached token, and that await is the window.
+    ["while the store awaits its cached token", (_transport: Awaited<ReturnType<typeof realTransport>>, change: () => void) => queueMicrotask(change)],
+    ["while the store refreshes its token", (transport: Awaited<ReturnType<typeof realTransport>>, change: () => void) => transport.expireTokenThen(change)],
+  ] as const;
+
+  it.each(publicationWindows)(
+    "FD-R2 publication control: nothing changes %s after the kernel's publication check; the gate is published and the run merges once",
+    async (_window, arrange) => {
+      const fixture = await approvedHumanGatedRun();
+      const transport = await realTransport(fixture);
+      let ran = false;
+      afterPublicationCheck(fixture, () => arrange(transport, () => {
+        ran = true;
+      }));
+
+      expect(await outcomeOf(fixture)).toEqual(COMPLETED_ONCE);
+      expect(ran).toBe(true);
+      expect(transport.staleWrites).toEqual([]);
+    },
+  );
+
+  it.each(publicationWindows)(
+    "FD-R2 publication: an owner refusal %s after the kernel's publication check sends no gate POST",
+    async (_window, arrange) => {
+      const fixture = await approvedHumanGatedRun();
+      const { harness, driven, github } = fixture;
+      const transport = await realTransport(fixture);
+      let changed = false;
+      afterPublicationCheck(fixture, () => arrange(transport, () => {
+        recordOwnerDecision(harness, driven.runId, fixture.items[0]!, false, "refused after the publication check");
+        changed = true;
+      }));
+
+      await finalizeAttempts(fixture, 0);
+      expect(changed).toBe(true);
+      expect(transport.staleWrites).toEqual([]);
+      expect(transport.events).toContain(`refused ${ReasonCode.HUMAN_GATE_UNSATISFIED}`);
+      expect(writes(github)).toEqual({ gates: 0, merges: 0 });
+      expect(harness.cp.runs.require(driven.runId).state).not.toBe(RunState.COMPLETED);
+    },
+  );
+
+  /** This run's receipts of one GitHub operation, in order. */
+  const receiptsOf = (fixture: Fixture, operation: "gate_publish" | "merge_execute") =>
+    fixture.harness.cp.db.all<{ status: string; request_digest: string }>(
+      "SELECT status, request_digest FROM github_receipts WHERE operation = ? AND run_id = ? ORDER BY rowid",
+      [operation, fixture.driven.runId],
+    );
+
+  /**
+   * The same database opened by a new process, with the real transport: a write the first process left
+   * PENDING is reconciled there and, when GitHub shows it never arrived, sent again from the same call
+   * site. `leaseExpired` moves the clock past the finalization lease of an attempt that never returned.
+   */
+  const restart = async (fixture: Fixture, leaseExpired: boolean) => {
+    fixture.harness.cp.db.close();
+    // FINALIZATION_LEASE_TTL_MS is 30 minutes.
+    if (leaseExpired) fixture.harness.clock.advance(31 * 60_000);
+    const harness = makeHarness({
+      root: fixture.harness.root,
+      githubClient: fixture.github,
+      clock: fixture.harness.clock,
+      repoPath: fixture.harness.repoPath,
+    });
+    const restarted: Fixture = { ...fixture, harness };
+    return { restarted, transport: await realTransport(restarted) };
+  };
+
+  it.each(["nothing changes", "the owner refuses during its token refresh"] as const)(
+    "FD-R2 re-send gate POST: a gate POST that GitHub never answered is sent again by the next process only through the transport's check (%s)",
+    async (change) => {
+      const fixture = await approvedHumanGatedRun();
+      const first = await realTransport(fixture);
+      first.dropNext("gate POST");
+      await finalizeAttempts(fixture, 0);
+      expect(withoutChecks(first.events)).toEqual(["gate POST"]);
+      const dropped = receiptsOf(fixture, "gate_publish");
+      expect(dropped).toMatchObject([{ status: "PENDING" }]);
+      expect(writes(fixture.github)).toEqual({ gates: 0, merges: 0 });
+
+      const { restarted, transport } = await restart(fixture, false);
+      const { harness, driven } = restarted;
+      if (change === "the owner refuses during its token refresh") {
+        transport.atNextRequest("POST", /\/check-runs$/, () => transport.expireTokenThen(() =>
+          recordOwnerDecision(harness, driven.runId, fixture.items[0]!, false, "refused while the re-sent gate POST waited")));
+      }
+      await finalizeAttempts(restarted, 0);
+      expect(transport.staleWrites).toEqual([]);
+      if (change === "the owner refuses during its token refresh") {
+        expect(transport.events).toEqual(["token refresh", `refused ${ReasonCode.HUMAN_GATE_UNSATISFIED}`]);
+        expect(writes(fixture.github)).toEqual({ gates: 0, merges: 0 });
+        // Nothing was sent, so the reservation the re-send made is released, not left PENDING.
+        expect(receiptsOf(restarted, "gate_publish")).toEqual([]);
+        expect(harness.cp.runs.require(driven.runId).state).not.toBe(RunState.COMPLETED);
+      } else {
+        // The dropped request itself, sent again: the same payload digest, now published and recorded.
+        expect(receiptsOf(restarted, "gate_publish")).toEqual([{ status: "APPLIED", request_digest: dropped[0]!.request_digest }]);
+        expect(dispatchedAfter(transport.events)).toEqual(["verified -> gate POST", "verified -> merge PUT"]);
+        expect(writes(fixture.github)).toEqual({ gates: 1, merges: 1 });
+        expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+      }
+    },
+  );
+
+  it.each(["nothing changes", "the owner refuses during its token refresh"] as const)(
+    "FD-R2 re-send merge PUT: a PUT whose process stopped while the transport awaited its token is sent again by the next process only through the transport's check (%s)",
+    async (change) => {
+      const fixture = await approvedHumanGatedRun();
+      const first = await realTransport(fixture);
+      let stopped!: () => void;
+      const stop = new Promise<void>((resolve) => {
+        stopped = resolve;
+      });
+      // The first process stops while its PUT waits for a token: that attempt never resumes.
+      first.atNextRequest("PUT", /\/merge$/, () => first.expireTokenThen(() => {
+        stopped();
+        return new Promise<void>(() => undefined);
+      }));
+      void new Daemon(fixture.harness.cp, { stateDir: tempDir("acp-finalizer-digest-") }).start();
+      await stop;
+      expect(withoutChecks(first.events)).toEqual(["gate POST", "token refresh"]);
+      expect(receiptsOf(fixture, "merge_execute")).toMatchObject([{ status: "PENDING" }]);
+
+      const { restarted, transport } = await restart(fixture, true);
+      const { harness, driven } = restarted;
+      if (change === "the owner refuses during its token refresh") {
+        transport.atNextRequest("PUT", /\/merge$/, () => transport.expireTokenThen(() =>
+          recordOwnerDecision(harness, driven.runId, fixture.items[0]!, false, "refused while the re-sent PUT waited")));
+      }
+      await finalizeAttempts(restarted, 0);
+      expect(transport.staleWrites).toEqual([]);
+      if (change === "the owner refuses during its token refresh") {
+        expect(transport.events.slice(-2)).toEqual(["token refresh", `refused ${ReasonCode.HUMAN_GATE_UNSATISFIED}`]);
+        expect(fixture.github.mergeCount).toBe(0);
+        expect(receiptsOf(restarted, "merge_execute")).toEqual([]);
+        expect(harness.cp.runs.require(driven.runId).state).not.toBe(RunState.COMPLETED);
+      } else {
+        expect(dispatchedAfter(transport.events).at(-1)).toBe("verified -> merge PUT");
+        expect(receiptsOf(restarted, "merge_execute")).toMatchObject([{ status: "APPLIED" }]);
+        expect(fixture.github.mergeCount).toBe(1);
+        expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+      }
+    },
+  );
+
+  it("FD-R2 throw: a payload check that throws as the PUT leaves sends nothing, releases the reservation, and the next attempt merges", async () => {
+    const fixture = await approvedHumanGatedRun();
+    const { harness, driven, github } = fixture;
+    const transport = await realTransport(fixture);
+    const kernel = harness.cp.github as unknown as { assertGatePayloadBacked: (...args: unknown[]) => unknown };
+    const check = kernel.assertGatePayloadBacked.bind(kernel);
+    let throwNext = false;
+    kernel.assertGatePayloadBacked = (...args: unknown[]) => {
+      if (throwNext) {
+        throwNext = false;
+        throw new Error("the payload check failed");
+      }
+      return check(...args);
+    };
+    transport.atNextRequest("PUT", /\/merge$/, () => {
+      throwNext = true;
+    });
+
+    // Daemon.start's sweep: the attempt whose check threw, then the MERGING run's next attempt.
+    await finalizeAttempts(fixture, 0);
+    expect(failedAttempts(fixture)[0]?.reasonCode).toBe(ReasonCode.INTERNAL_ERROR);
+    expect(transport.events).toEqual(["verified", "gate POST", `refused ${ReasonCode.INTERNAL_ERROR}`, "verified", "merge PUT"]);
+    expect(mergePuts(fixture)).toEqual([{ pull: github.pulls[0]!.number, sha: driven.candidateHead }]);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+  });
 });
