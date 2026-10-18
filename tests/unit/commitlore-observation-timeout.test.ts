@@ -1,4 +1,5 @@
 import type * as ChildProcess from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
@@ -46,6 +47,7 @@ it("R1-02: timeout is refused even if the signalled child exits zero with valid 
     // Slice S16: the pin's checks are answered at once, as a supported CLI answers them.
     if (process.argv[2] === '--version') { process.stdout.write('1.7.3\\n'); return; }
     if (process.argv[2] === 'doctor' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore doctor [options]\\n  --json\\n'); return; }
+    if (process.argv[2] === 'init' && process.argv[3] === '--help') { process.stdout.write('Usage: commitlore init [options]\\n  --mcp-scope <scope>\\n  --no-unattended\\n'); return; }
     const fs = require('node:fs');
     fs.appendFileSync(${JSON.stringify(events)}, process.argv[2] + ':ready\\n');
     process.on('SIGTERM', () => {
@@ -59,10 +61,20 @@ it("R1-02: timeout is refused even if the signalled child exits zero with valid 
   );
   vi.stubEnv("PATH", `${dir}:/usr/bin:/bin`);
   vi.stubEnv("ACP_COMMITLORE_BINARY", join(dir, "commitlore"));
+  // CEO 19aabbda (C-2): fixture preparation, bounded and before the observation. Every spawn here runs under
+  // the shortened 1.5 s, and since slice S16 the first is the `--version` check: the newly written fake is
+  // executed once first, so the cold first exec of a new file (0.13-5.1 s on this host, s16-r1-fix-evidence) is
+  // not inside that bound. A preparation that does not complete is a FIXTURE-PREPARATION FAILURE, never a
+  // pass; this witness is no evidence about a cold first spawn.
+  try {
+    execFileSync(join(dir, "commitlore"), ["--version"], { stdio: "ignore", timeout: 30_000 });
+  } catch (error) {
+    throw new Error(`FIXTURE-PREPARATION FAILURE: the fake's --version did not complete within 30000 ms (${(error as Error).message.split("\n", 1)[0]}); the witness was not judged`);
+  }
   const result = await createCommitLoreCliPort().observe(root);
   // The review asserted both commands asked for 180 s; at the fix `init` is refused, so only it asks, after
-  // the pin's two checks (slice S16), which run under the same bound.
-  expect(timing.requested).toEqual([180000, 180000, 180000]);
+  // the pin's three checks (slice S16: `--version`, `doctor --help`, `init --help`), under the same bound.
+  expect(timing.requested).toEqual([180000, 180000, 180000, 180000]);
   expect(result.outcome).toBe("FAIL");
   // `init` was signalled at the shortened bound and exited 0: refused there, so `doctor` never ran.
   expect(readFileSync(events, "utf8")).toBe("init:ready\ninit:SIGTERM\n");

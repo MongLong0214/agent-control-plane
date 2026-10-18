@@ -32,6 +32,7 @@ const ok = JSON.stringify({ schema: "commitlore_doctor.v2", status: "ok", exitCo
 // Slice S16: what the runner asks a pinned CLI before any other command, answered as a supported one does.
 const PIN_CHECKS = `if (process.argv[2] === '--version') process.stdout.write('1.7.3\\n');
 else if (process.argv[2] === 'doctor' && process.argv[3] === '--help') process.stdout.write('Usage: commitlore doctor [options]\\n  --json  emit the report as JSON\\n');
+else if (process.argv[2] === 'init' && process.argv[3] === '--help') process.stdout.write('Usage: commitlore init [options]\\n  --mcp-scope <scope>  where to register\\n  --no-unattended      leave unattended capture off\\n');
 else {`;
 
 /**
@@ -62,6 +63,23 @@ function killExact(pidFile: string): void {
   if (Number.isSafeInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, "SIGKILL");
 }
 
+/**
+ * CEO 19aabbda (C-2) — fixture preparation, done before any clock of a witness starts and bounded: the fake
+ * is executed once with an argv it answers at once, so the first exec of a newly written file, measured at
+ * 0.13-5.1 s on this host (s16-r1-fix-evidence), is not inside a bound the witness measures or waits within.
+ * A preparation that does not complete is a FIXTURE-PREPARATION FAILURE, never a pass. A witness prepared
+ * this way shows the behaviour of a child whose file was already executed once; it is no evidence about a
+ * cold first spawn (`commitlore-pin.test.ts` has that one).
+ */
+const PREPARATION_TIMEOUT_MS = 30_000;
+const prepareFixture = (bin: string, argv: readonly string[]): void => {
+  try {
+    execFileSync(bin, [...argv], { stdio: "ignore", timeout: PREPARATION_TIMEOUT_MS });
+  } catch (error) {
+    throw new Error(`FIXTURE-PREPARATION FAILURE: ${bin} ${argv.join(" ")} did not complete within ${PREPARATION_TIMEOUT_MS} ms (${(error as Error).message.split("\n", 1)[0]}); the witness was not judged`);
+  }
+};
+
 type Readiness = { readonly child: number; readonly descendant: number } | { readonly failure: string };
 
 /**
@@ -82,16 +100,31 @@ const awaitReadiness = (readyFile: string, pidFile: string, boundMs: number): Pr
     poll();
   });
 
+/**
+ * How long the readiness probe's `ps` may take. The probe is synchronous (`readiness`), so while it runs the
+ * runner's deadline cannot fire: bounded at 800 ms, a probe started before the 1 s deadline delays it to at
+ * most 1.8 s, inside the witness's own "refused at the deadline" bound of 2 s, so a `ps` that never answers
+ * is reported as the FIXTURE-READY FAILURE it is and not as a late deadline. `ps` measured p99 7.6 ms, max
+ * 29.5 ms under parallel load (s16-r1-fix-evidence/ps-latency-during-proof.txt).
+ */
+const PS_PROBE_TIMEOUT_MS = 800;
+
 function readiness(readyFile: string, pidFile: string): Readiness {
   const child = Number(readFileSync(pidFile, "utf8"));
   const named = JSON.parse(readFileSync(readyFile, "utf8")) as { child?: unknown; descendant?: unknown };
   const descendant = Number(named.descendant);
   if (named.child !== child || !Number.isSafeInteger(descendant) || descendant <= 1) return { failure: `the ready marker ${JSON.stringify(named)} does not name child ${child} and a descendant` };
-  let parent = "";
+  // CEO 19aabbda (C-1): the probe is bounded, and every way it can end without an answer is a fixture that
+  // was not shown ready — never a pass, and never read as "no such process".
+  let parent: string;
   try {
-    parent = execFileSync("ps", ["-o", "ppid=,stat=", "-p", String(descendant)], { encoding: "utf8" }).trim();
-  } catch {
-    // No such process: the descendant is not there to be judged.
+    parent = execFileSync("ps", ["-o", "ppid=,stat=", "-p", String(descendant)], { encoding: "utf8", timeout: PS_PROBE_TIMEOUT_MS }).trim();
+  } catch (error) {
+    const { code, status, signal } = error as NodeJS.ErrnoException & { status?: number | null; signal?: NodeJS.Signals | null };
+    // `ps -p` exits 1, printing nothing, when there is no such process: the descendant is not there.
+    if (code === undefined && signal == null && status === 1) return { failure: `descendant ${descendant} is not there (ps found no such process)` };
+    // Its own bound (ETIMEDOUT, SIGTERM), another signal, or a ps that could not run at all (EPERM, ENOENT).
+    return { failure: `ps could not answer for descendant ${descendant} within ${PS_PROBE_TIMEOUT_MS} ms (${code ?? (signal != null ? `signal ${signal}` : `exit ${String(status)}`)})` };
   }
   const [ppid, stat] = parent.split(/\s+/);
   if (Number(ppid) !== child || stat === undefined || stat.startsWith("Z")) return { failure: `descendant ${descendant} is not a live child of ${child} (ps: "${parent}")` };
@@ -154,7 +187,7 @@ it("R1-02: an output-overflowing child cannot keep the observation pending by ig
   pidFiles.push(pidFile);
   rmSync(pidFile, { force: true });
   rmSync(signalFile, { force: true });
-  fake(
+  const bin = fake(
     "overflow-bin",
     `
     const fs = require('node:fs');
@@ -164,6 +197,10 @@ it("R1-02: an output-overflowing child cannot keep the observation pending by ig
     setInterval(() => {}, 1000);
   `,
   );
+  // Fixture preparation (`prepareFixture`): the 5 s wait below starts with the observation, whose first spawn
+  // (since slice S16 the pin's `--version` check) would otherwise be this new file's cold first exec, measured
+  // at 5.0-5.1 s under parallel load (s16-r1-fix-evidence/superseded/round-before-overflow-prep).
+  prepareFixture(join(bin, "commitlore"), ["--version"]);
   let settled = false;
   const pending = createCommitLoreCliPort()
     .observe(root)
@@ -210,10 +247,9 @@ it("R1-02: the owned child that ignores SIGTERM is SIGKILLed after the grace, an
     setInterval(() => {}, 1000);
   `,
   );
-  // The first exec of a newly written executable is slow on macOS, and under parallel load can take longer
-  // than the runner's whole 1 s budget; a second exec of the same file is not. So the fake is executed once,
-  // answering the pin's `--version`, before the runner's clock starts.
-  execFileSync(join(bin, "commitlore"), ["--version"], { stdio: "ignore", timeout: 30_000 });
+  // Fixture preparation, before the runner's clock starts (`prepareFixture`): the first exec of the newly
+  // written fake is not inside the 1 s budget this witness measures.
+  prepareFixture(join(bin, "commitlore"), ["--version"]);
   const limits = { ...COMMITLORE_LIMITS, timeoutMs: 1_000, killGraceMs: 500 };
   const started = Date.now();
   const answer = commitloreRunner(limits)(["init"], root);
