@@ -229,7 +229,7 @@ const world = async (approve: readonly string[] = [], options: { before?: boolea
     exactHead: driven.candidateHead,
     timestamp: "2026-08-12T00:00:00.000Z",
   });
-  return {
+  const made: World = {
     harness,
     github,
     runId: driven.runId,
@@ -240,10 +240,12 @@ const world = async (approve: readonly string[] = [], options: { before?: boolea
     workBranch: driven.workBranch,
     candidate: driven.candidateSnapshotDigest,
     get payload(): GatePayload {
-      return payloadWith(built.allowed ? built.value : bindingAsIfCounted(harness, driven.runId, ITEMS));
+      // The world's current harness: an upgrade or reopen (FIX-SEC-R2) replaces it and closes this one.
+      return payloadWith(built.allowed ? built.value : bindingAsIfCounted(made.harness, driven.runId, ITEMS));
     },
     payloadWith,
   };
+  return made;
 };
 
 /** The receipt the owner's recorded decision on `item` carries (its first canonical record). */
@@ -1280,6 +1282,9 @@ describe("SEC-OD1 v48 controls: the legitimate paths that change an owner decisi
   it("ODV48-CONTROL the owner's own re-decision through the formal path (approve, refuse, approve) decides each time, never needs the mark, and the last approval publishes and merges", async () => {
     const w = await world([ITEM_A, ITEM_B]);
     expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+    // FIX-FINALIZER-DIGEST: the binding names each item's decision. This payload is built before the re-decision.
+    const before = w.payload;
+    expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId)).toMatchObject({ allowed: true, value: before.humanGateDigest });
     decide(w, ITEM_B, false, "not now");
     expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
     decide(w, ITEM_B, true, "now yes");
@@ -1290,8 +1295,19 @@ describe("SEC-OD1 v48 controls: the legitimate paths that change an owner decisi
       [ITEM_B, true, OWNER_DECISION_LABEL],
     ]);
     expect(w.harness.cp.artifacts.list(w.runId, "APPROVAL").filter((artifact) => artifact.superseded)).toEqual([]);
-    expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
+    // The payload built before the re-decision is refused, with 0 GitHub writes: no gate and no merge PUT.
+    const writes = writesToGitHub(w);
+    expect(outcome(await w.harness.cp.github.gatePublish(before, w.identity)))
+      .toBe("HUMAN_GATE_UNSATISFIED: current human-gate status does not satisfy this payload");
+    expect({ writes: writesToGitHub(w) - writes, checks: w.github.checkRuns.length, merges: w.github.mergeCount })
+      .toEqual({ writes: 0, checks: 0, merges: 0 });
+    // A new attempt re-resolves the current decisions, as the daemon finalizer does, and publishes and merges once.
+    const current = w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId);
+    if (!current.allowed) throw new Error(outcome(current));
+    expect(current.value).not.toBe(before.humanGateDigest);
+    expect(outcome(await w.harness.cp.github.gatePublish(w.payloadWith(current.value), w.identity))).toBe("ALLOWED");
     expect(outcome(await merge(w, await openPull(w)))).toBe("ALLOWED");
+    expect({ checks: w.github.checkRuns.length, merges: w.github.mergeCount }).toEqual({ checks: 1, merges: 1 });
     expect(w.github.mergeCount).toBe(1);
   });
 
