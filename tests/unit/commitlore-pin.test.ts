@@ -12,6 +12,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -847,10 +848,14 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     try {
       const run = await observeInChild(pinned.bin, 5_000, 5_000);
       const answer = judgedInChild(run);
-      expect(answer.result).toMatchObject({
-        outcome: "FAIL",
-        detail: expect.stringMatching(new RegExp(`^commitlore could not be run: ${VARIABLE} REPLACED: .* is ${TIB} bytes, more than the ${CAP} bytes`)),
-      });
+      // The re-check reads the pin's realpath, the path the refusal names inside its parentheses: a runner's
+      // /var/folders tmp dir is /private/var/folders. The observation keeps a refusal's first 300 characters
+      // (commitlore-observation.ts); under that longer tmp path the cap's wording falls past them, the code,
+      // both paths and the size do not.
+      const target = realpathSync(pinned.bin);
+      const refusal = `${VARIABLE} REPLACED: ${pinned.bin} can no longer be read as the file its checks ran (${target} is ${TIB} bytes, more than the ${CAP} bytes a supported entrypoint is)`;
+      expect(answer.result).toMatchObject({ outcome: "FAIL", detail: `commitlore could not be run: ${refusal.slice(0, 300)}` });
+      expect(answer.result?.detail).toContain(`(${target} is ${TIB} bytes`);
       expect(statSync(pinned.bin).size).toBe(TIB);
       // It grew during doctor --help, and nothing spawned after that check.
       expect(argvs(pinned.log)).toEqual(["--version", "doctor --help"]);
@@ -892,7 +897,8 @@ setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: per
     expect(read.turns).toBeGreaterThanOrEqual(64);
     expect(read.value).toMatchObject({ size: String(CAP), sha256: createHash("sha256").update(readFileSync(atCap)).digest("hex") });
     const over = await duringCheck(() => commitlorePinIdentity(overCap));
-    expect(over.error).toBe(`${overCap} is ${CAP + 1} bytes, more than the ${CAP} bytes a supported entrypoint is`);
+    // The refusal names the file it opened, the pin's realpath: a runner's /var/folders tmp dir is /private/var/folders.
+    expect(over.error).toBe(`${realpathSync(overCap)} is ${CAP + 1} bytes, more than the ${CAP} bytes a supported entrypoint is`);
     expect(COMMITLORE_PIN_MAX_BYTES).toBe(CAP);
     witnessed(`S16-R2-01 cap asserted turns=${read.turns} beats=${read.beats} ms=${read.elapsed.toFixed(1)}`);
   });
