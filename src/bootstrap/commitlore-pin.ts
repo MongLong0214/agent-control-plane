@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { type BigIntStats, closeSync, constants, fstatSync, openSync, readSync, realpathSync, statSync } from "node:fs";
+import { type BigIntStats, constants } from "node:fs";
+import { type FileHandle, open, realpath, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -40,6 +41,7 @@ export type CommitLorePinCondition =
   | "UNSUPPORTED_VERSION"
   | "NO_DOCTOR_COMMAND"
   | "NO_INIT_COMMAND"
+  | "TOO_LARGE"
   | "REPLACED";
 
 /** The argv the pin is checked with, in this order, before an observation's first `commitlore` command. */
@@ -205,29 +207,91 @@ export interface CommitLorePinIdentity {
   readonly sha256: string;
 }
 
+/**
+ * Review S16-R2-01 — the largest file read as a pin, in bytes: 8 MiB, set from the entrypoints this producer
+ * supports, not from any one of them.
+ * - The installer's wrapper (`# commitlore:wrapper:v1`, written by CommitLore's `install.sh`): a `/bin/sh`
+ *   script whose only variable parts are two absolute paths, 238 bytes on this host at 1.7.4, and under
+ *   4 KiB even with both paths at macOS's 1,024-byte PATH_MAX.
+ * - The release bundle itself, `dist/commitlore.mjs`, an executable `#!/usr/bin/env node` script, pinned
+ *   directly: 1,510,851 bytes at 1.4.2, the first supported version, to 1,571,351 bytes at 1.7.4 (+4% over
+ *   that range).
+ * 8 MiB is over five times the largest of those, room for the rest of the supported 1.x line. A larger
+ * file — a native or single-executable build (tens of MiB), or a sparse file of any apparent size — is no
+ * supported entrypoint, and it is refused on the descriptor's own size before a byte of it is read.
+ */
+export const COMMITLORE_PIN_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Review S16-R2-01 — how long one reading of a pin's identity may take, from its start: 10 s. Its own bound,
+ * never part of a check's or a command's: each child's `timeoutMs` starts at its spawn, after this read.
+ * Reading a pin at the cap took milliseconds on this host; the bound is there for a file system that does
+ * not answer, so that an observation still ends — within its children's bounds plus one of these for each
+ * of its seven readings (the binding, before each of five spawns, and after the last check).
+ */
+export const COMMITLORE_PIN_IDENTITY_TIMEOUT_MS = 10_000;
+
+/** Why a pin could not be read as one file: `TOO_LARGE` over the cap; `UNREADABLE` for every other way. */
+export class CommitLorePinIdentityError extends Error {
+  constructor(
+    readonly condition: "TOO_LARGE" | "UNREADABLE",
+    message: string,
+  ) {
+    super(message);
+    this.name = "CommitLorePinIdentityError";
+  }
+}
+
 const IDENTITY_FIELDS = ["target", "dev", "ino", "size", "mtimeNs", "ctimeNs", "sha256"] as const;
+
+/** The bytes asked of one read: the descriptor is read in chunks of this, each its own turn of the event loop. */
+const IDENTITY_CHUNK_BYTES = 64 * 1024;
 
 const sameFile = (a: BigIntStats, b: BigIntStats): boolean =>
   a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
 
-/** The identity of the file `pin` names now (`CommitLorePinIdentity`). Throws when it cannot be read as one. */
-export const commitlorePinIdentity = (pin: string): CommitLorePinIdentity => {
-  const target = realpathSync(pin);
-  const descriptor = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+/**
+ * The reading itself. On the descriptor, before any byte: a regular file, of at most the cap. Then exactly
+ * its size, chunk by chunk at explicit offsets, and one byte past it: at most size + 1 <= cap + 1 bytes are
+ * read, however the file changes. A file that ends early, has a byte past its size, or whose descriptor or
+ * path state differs afterwards changed while it was read. Every await is a turn of the event loop, and
+ * `expired` is asked after each, so a reading past its deadline stops at its next step. The descriptor is
+ * closed on every path, an expired one included; a FileHandle's close waits for a read still in flight, so
+ * the descriptor number is never released under one.
+ */
+const readPinIdentity = async (pin: string, expired: () => boolean): Promise<CommitLorePinIdentity> => {
+  const step = <T>(value: T): T => {
+    if (expired()) throw new CommitLorePinIdentityError("UNREADABLE", `${pin} was still being read at its deadline`);
+    return value;
+  };
+  const target = step(await realpath(pin));
+  let handle: FileHandle | null = null;
   try {
-    const opened = fstatSync(descriptor, { bigint: true });
-    if (!opened.isFile()) throw new Error(`${target} is not a regular file`);
+    handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    step(handle);
+    const opened = step(await handle.stat({ bigint: true }));
+    if (!opened.isFile()) throw new CommitLorePinIdentityError("UNREADABLE", `${target} is not a regular file`);
+    if (opened.size > BigInt(COMMITLORE_PIN_MAX_BYTES)) {
+      throw new CommitLorePinIdentityError(
+        "TOO_LARGE",
+        `${target} is ${opened.size} bytes, more than the ${COMMITLORE_PIN_MAX_BYTES} bytes a supported entrypoint is`,
+      );
+    }
+    const size = Number(opened.size);
     const hash = createHash("sha256");
-    const chunk = Buffer.allocUnsafe(64 * 1024);
-    let length = 0n;
-    for (let read = readSync(descriptor, chunk, 0, chunk.length, null); read > 0; read = readSync(descriptor, chunk, 0, chunk.length, null)) {
-      hash.update(chunk.subarray(0, read));
-      length += BigInt(read);
+    const chunk = Buffer.allocUnsafe(Math.max(1, Math.min(IDENTITY_CHUNK_BYTES, size + 1)));
+    let position = 0;
+    while (position < size) {
+      const { bytesRead } = step(await handle.read(chunk, 0, Math.min(chunk.length, size - position), position));
+      if (bytesRead === 0) throw new CommitLorePinIdentityError("UNREADABLE", `${target} changed while it was read (it ended at ${position} of ${size} bytes)`);
+      hash.update(chunk.subarray(0, bytesRead));
+      position += bytesRead;
     }
-    const after = fstatSync(descriptor, { bigint: true });
-    if (length !== opened.size || !sameFile(opened, after) || !sameFile(after, statSync(target, { bigint: true }))) {
-      throw new Error(`${target} changed while it was read`);
-    }
+    const { bytesRead: beyond } = step(await handle.read(chunk, 0, 1, size));
+    if (beyond !== 0) throw new CommitLorePinIdentityError("UNREADABLE", `${target} changed while it was read (it grew past ${size} bytes)`);
+    const after = step(await handle.stat({ bigint: true }));
+    const named = step(await stat(target, { bigint: true }));
+    if (!sameFile(opened, after) || !sameFile(after, named)) throw new CommitLorePinIdentityError("UNREADABLE", `${target} changed while it was read`);
     return {
       target,
       dev: String(after.dev),
@@ -238,24 +302,48 @@ export const commitlorePinIdentity = (pin: string): CommitLorePinIdentity => {
       sha256: hash.digest("hex"),
     };
   } finally {
-    closeSync(descriptor);
+    await handle?.close();
   }
 };
 
+/**
+ * The identity of the file `pin` names now (`CommitLorePinIdentity`), read without blocking the event loop
+ * and within `timeoutMs` (review S16-R2-01). Rejects with a `CommitLorePinIdentityError` when it cannot be
+ * read as one file within its bounds: too large, not a regular file, changed or grown while it was read,
+ * not there, or not read by its deadline. Whatever it rejects with, it never resolves after that.
+ */
+export const commitlorePinIdentity = (pin: string, timeoutMs: number = COMMITLORE_PIN_IDENTITY_TIMEOUT_MS): Promise<CommitLorePinIdentity> => {
+  let expired = false;
+  let deadline: NodeJS.Timeout | undefined;
+  const late = new Promise<never>((_, reject) => {
+    deadline = setTimeout(() => {
+      expired = true;
+      reject(new CommitLorePinIdentityError("UNREADABLE", `${pin} could not be read within ${timeoutMs} ms`));
+    }, timeoutMs);
+  });
+  const reading = readPinIdentity(pin, () => expired).catch((error: unknown) => {
+    throw error instanceof CommitLorePinIdentityError ? error : new CommitLorePinIdentityError("UNREADABLE", (error as Error).message);
+  });
+  return Promise.race([reading, late]).finally(() => clearTimeout(deadline));
+};
+
 /** The identity a pin's checks are about to run, or the refusal when the pin cannot be read as one. */
-export const bindCommitLorePin = (pin: string): CommitLorePinIdentity => {
+export const bindCommitLorePin = async (pin: string, timeoutMs?: number): Promise<CommitLorePinIdentity> => {
   try {
-    return commitlorePinIdentity(pin);
+    return await commitlorePinIdentity(pin, timeoutMs);
   } catch (error) {
+    if (error instanceof CommitLorePinIdentityError && error.condition === "TOO_LARGE") {
+      throw new Error(`${COMMITLORE_BINARY_VARIABLE} TOO_LARGE: ${pin} is no supported entrypoint (${error.message})`);
+    }
     throw new Error(`${COMMITLORE_BINARY_VARIABLE} UNREADABLE: ${pin} could not be read as a file to check (${(error as Error).message})`);
   }
 };
 
-/** Throws `REPLACED` unless `pin` still names exactly the file `bound` is; nothing is run either way. */
-export const assertCommitLorePinUnchanged = (pin: string, bound: CommitLorePinIdentity): void => {
+/** Rejects `REPLACED` unless `pin` still names exactly the file `bound` is; nothing is run either way. */
+export const assertCommitLorePinUnchanged = async (pin: string, bound: CommitLorePinIdentity, timeoutMs?: number): Promise<void> => {
   let now: CommitLorePinIdentity;
   try {
-    now = commitlorePinIdentity(pin);
+    now = await commitlorePinIdentity(pin, timeoutMs);
   } catch (error) {
     throw new Error(`${COMMITLORE_BINARY_VARIABLE} REPLACED: ${pin} can no longer be read as the file its checks ran (${(error as Error).message})`);
   }

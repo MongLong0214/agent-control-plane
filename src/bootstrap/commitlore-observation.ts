@@ -12,7 +12,14 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { git } from "../git/git.ts";
 import { runtimeEnvironment } from "../runtime/cli-adapters.ts";
-import { COMMITLORE_BINARY_VARIABLE, assertCommitLorePinUnchanged, bindCommitLorePin, commitlorePin, verifyCommitLorePin } from "./commitlore-pin.ts";
+import {
+  COMMITLORE_BINARY_VARIABLE,
+  COMMITLORE_PIN_IDENTITY_TIMEOUT_MS,
+  assertCommitLorePinUnchanged,
+  bindCommitLorePin,
+  commitlorePin,
+  verifyCommitLorePin,
+} from "./commitlore-pin.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
 import { frameRecord, unframeRecord, writeWholeSync } from "./whole-write.ts";
 
@@ -169,10 +176,14 @@ export interface CommitLoreRunner {
  * Slice S16 — `checkTimeoutMs` is `timeoutMs` for each of the pin's checks (`--version`, `doctor --help`,
  * `init --help`: `commitloreRunner`'s `ready`), a bound of their own: their time is never taken from a
  * command's.
+ *
+ * Review S16-R2-01 — `identityTimeoutMs` bounds each reading of the pin's identity (`commitlorePinIdentity`),
+ * the binding and every re-check before a spawn: a bound of its own too, taken from no check's or command's.
  */
 export interface CommitLoreLimits {
   timeoutMs: number;
   checkTimeoutMs: number;
+  identityTimeoutMs: number;
   maxOutputBytes: number;
   killGraceMs: number;
   drainMs: number;
@@ -181,6 +192,7 @@ export interface CommitLoreLimits {
 export const COMMITLORE_LIMITS: Readonly<CommitLoreLimits> = Object.freeze({
   timeoutMs: 180_000,
   checkTimeoutMs: 180_000,
+  identityTimeoutMs: COMMITLORE_PIN_IDENTITY_TIMEOUT_MS,
   maxOutputBytes: 4 * 1024 * 1024,
   killGraceMs: 2_000,
   drainMs: 2_000,
@@ -247,30 +259,33 @@ export const commitloreChildHome = (): string => {
  * `timeoutMs`, or within `drainMs` of the child's exit when a descendant holds its pipes open.
  *
  * Review S16-R1-02 — `beforeSpawn` is the last thing done before the spawn, after the child's home and
- * environment are made: if it throws, the answer is that refusal and nothing is spawned. Its time is not
+ * environment are made: if it rejects, the answer is that refusal and nothing is spawned. Its time is not
  * the command's: the deadline starts at the spawn.
+ *
+ * Review S16-R2-01 — `beforeSpawn` is awaited, so the event loop keeps turning while it runs (the pin's
+ * identity is read asynchronously, under its own deadline). The spawn follows its settling with no turn of
+ * the event loop between them, only the promise's own continuation.
  */
 const commitloreChild =
-  (executable: string, limits: Readonly<CommitLoreLimits>, beforeSpawn: () => void = () => {}): CommitLoreRunner =>
-  (argv, cwd) =>
-    new Promise((resolvePromise, reject) => {
-      const home = commitloreChildHome();
-      const removeHome = (): void => {
-        try {
-          rmSync(home, { recursive: true, force: true });
-        } catch {
-          // What the child left there and made unremovable stays, in its owner-only directory: never a
-          // reason to throw from this listener.
-        }
-      };
-      const env = commitloreChildEnvironment(home);
+  (executable: string, limits: Readonly<CommitLoreLimits>, beforeSpawn: () => Promise<void> = async () => {}): CommitLoreRunner =>
+  async (argv, cwd) => {
+    const home = commitloreChildHome();
+    const removeHome = (): void => {
       try {
-        beforeSpawn();
-      } catch (error) {
-        removeHome();
-        reject(error as Error);
-        return;
+        rmSync(home, { recursive: true, force: true });
+      } catch {
+        // What the child left there and made unremovable stays, in its owner-only directory: never a
+        // reason to throw from this listener.
       }
+    };
+    const env = commitloreChildEnvironment(home);
+    try {
+      await beforeSpawn();
+    } catch (error) {
+      removeHome();
+      throw error as Error;
+    }
+    return new Promise((resolvePromise, reject) => {
       const child = spawn(executable, [...argv], {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
@@ -348,6 +363,7 @@ const commitloreChild =
         );
       });
     });
+  };
 
 /**
  * Slice S16 — `commitlore` as a child: the executable `ACP_COMMITLORE_BINARY` pins (`commitlore-pin.ts`), read
@@ -372,6 +388,11 @@ const commitloreChild =
  * REPLACED and nothing further is spawned. That is a re-check before each spawn, not an exec bound to the
  * checked bytes: the window from the re-check to the kernel's own resolution of the path at exec remains,
  * as `CommitLorePinIdentity` states.
+ *
+ * Review S16-R2-01 — each of those readings is asynchronous and bounded on its own: a file over
+ * `COMMITLORE_PIN_MAX_BYTES` is refused on its descriptor's size before a byte is read, no reading takes
+ * more than that cap plus one byte, and none outlasts `identityTimeoutMs`. Its time is no check's and no
+ * command's: each child's bound starts at its own spawn.
  */
 export const commitloreRunner = (
   limits: Readonly<CommitLoreLimits> = COMMITLORE_LIMITS,
@@ -385,13 +406,13 @@ export const commitloreRunner = (
   const run = async (argv: readonly string[], cwd: string): Promise<CommitLoreRun> => commitloreChild(pinned(), limits)(argv, cwd);
   const ready = async (cwd: string): Promise<CommitLoreRunner> => {
     const executable = pinned();
-    const bound = bindCommitLorePin(executable);
-    const unchanged = (): void => assertCommitLorePinUnchanged(pinned(), bound);
+    const bound = await bindCommitLorePin(executable, limits.identityTimeoutMs);
+    const unchanged = (): Promise<void> => assertCommitLorePinUnchanged(pinned(), bound, limits.identityTimeoutMs);
     const check = commitloreChild(executable, { ...limits, timeoutMs: limits.checkTimeoutMs }, unchanged);
     const unsupported = await verifyCommitLorePin(executable, check, cwd);
     if (unsupported !== null) throw new Error(unsupported);
     // A change made while the last check ran refuses here, before any command is asked for.
-    unchanged();
+    await unchanged();
     const command = commitloreChild(executable, limits, unchanged);
     return async (argv, commandCwd) => command(argv, commandCwd);
   };

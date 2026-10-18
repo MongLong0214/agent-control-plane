@@ -1,5 +1,22 @@
-import { execFileSync } from "node:child_process";
-import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { createHash, pbkdf2 } from "node:crypto";
+import {
+  accessSync,
+  appendFileSync,
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  ftruncateSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join, relative } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +28,12 @@ import {
   createCommitLoreCliPort,
   probeCommitLore,
 } from "../../src/bootstrap/commitlore-observation.ts";
-import { COMMITLORE_INIT_OPTIONS, judgeCommitLoreVersion } from "../../src/bootstrap/commitlore-pin.ts";
+import {
+  COMMITLORE_INIT_OPTIONS,
+  COMMITLORE_PIN_MAX_BYTES,
+  commitlorePinIdentity,
+  judgeCommitLoreVersion,
+} from "../../src/bootstrap/commitlore-pin.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 /**
@@ -647,5 +669,286 @@ describe("S16: the real pinned CLI, in the constructed environment and a fresh H
     await expect(commitloreRunner(COMMITLORE_LIMITS, relative(process.cwd(), REAL as string))(["--version"], repo)).rejects.toThrow(
       new RegExp(`${VARIABLE} NOT_ABSOLUTE`),
     );
+  });
+});
+
+/**
+ * Review S16-R2-01 (CEO 37d29a30) — reading which file a pin is is bounded and never stalls the event loop:
+ * on the descriptor opened without following a link, a regular file of at most `COMMITLORE_PIN_MAX_BYTES`
+ * before any byte is read; at most its size plus one byte read; its own deadline; growth or change refused;
+ * the descriptor closed on every path. Every file here that is large in its apparent size is sparse: no
+ * test allocates its size. A witness whose child had to be killed by its watchdog has failed.
+ */
+describe("S16-R2-01: reading the pin's identity is bounded, has its own deadline and lets the event loop turn", () => {
+  const CAP = 8 * 1024 * 1024;
+  const TIB = 2 ** 40;
+  /** `path` extended to `bytes` without writing them: the file system allocates nothing for the hole. */
+  const sparse = (path: string, bytes: number): void => {
+    const descriptor = openSync(path, "r+");
+    try {
+      ftruncateSync(descriptor, bytes);
+    } finally {
+      closeSync(descriptor);
+    }
+  };
+  /**
+   * What happened while `work` ran: how many turns the event loop made (an immediate re-armed each turn), how
+   * often a 1 ms timer heartbeat fired, and how it settled. A reading that blocks the loop makes no turn.
+   */
+  const duringCheck = async <T>(work: () => T | Promise<T>) => {
+    let turns = 0;
+    let beats = 0;
+    let running = true;
+    const turn = (): void => {
+      if (!running) return;
+      turns += 1;
+      setImmediate(turn);
+    };
+    setImmediate(turn);
+    const heartbeat = setInterval(() => (beats += 1), 1);
+    const started = performance.now();
+    try {
+      const value = await Promise.resolve().then(work);
+      return { value, error: null, turns, beats, elapsed: performance.now() - started };
+    } catch (error) {
+      return { value: null, error: (error as Error).message, turns, beats, elapsed: performance.now() - started };
+    } finally {
+      running = false;
+      clearInterval(heartbeat);
+    }
+  };
+  /** The descriptors of this process that refer to `path`'s file, found through /dev/fd. */
+  const descriptorsOn = (path: string): number[] => {
+    const { dev, ino } = statSync(path);
+    return readdirSync("/dev/fd")
+      .map(Number)
+      .filter((fd) => {
+        try {
+          const opened = fstatSync(fd);
+          return opened.dev === dev && opened.ino === ino;
+        } catch {
+          return false;
+        }
+      });
+  };
+  /** Every worker of libuv's pool kept busy for longer than any deadline below, by key derivations. */
+  const occupyPool = (): Promise<unknown[]> => {
+    const workers = Number(process.env["UV_THREADPOOL_SIZE"] ?? 4);
+    return Promise.all(Array.from({ length: workers }, () => new Promise((settled) => pbkdf2("s16", "r2", 4_000_000, 32, "sha256", settled))));
+  };
+
+  /**
+   * The reviewer's harness (s16-r2-evidence/hash-budget-*.ts|mjs), its paths aside: a Node child observes
+   * through the production port with `timeoutMs` 100 and the given `checkTimeoutMs`, logging a 25 ms
+   * heartbeat, the moment the call returned its promise and the answer; added here, the turns the event loop
+   * made before the answer. The parent kills it by its own handle at `watchdogMs`, and that is a failure.
+   */
+  const OBSERVATION_MODULE = new URL("../../src/bootstrap/commitlore-observation.ts", import.meta.url).href;
+  const HARNESS = `import { appendFileSync } from "node:fs";
+const [moduleUrl, pin, log, checkTimeoutMs, checkout] = process.argv.slice(2);
+const write = (event) => appendFileSync(log, JSON.stringify(event) + "\\n");
+const { COMMITLORE_LIMITS, commitloreRunner, createCommitLoreCliPort } = await import(moduleUrl);
+write({ event: "loaded" });
+const start = performance.now();
+const heartbeat = setInterval(() => write({ event: "heartbeat", elapsed: performance.now() - start }), 25);
+let turns = 0;
+let observing = true;
+const turn = () => { if (!observing) return; turns += 1; setImmediate(turn); };
+const limits = { ...COMMITLORE_LIMITS, checkTimeoutMs: Number(checkTimeoutMs), timeoutMs: 100 };
+write({ event: "observe-call", checkTimeoutMs: limits.checkTimeoutMs, timeoutMs: limits.timeoutMs });
+setImmediate(turn);
+const pending = createCommitLoreCliPort(commitloreRunner(limits, pin)).observe(checkout);
+write({ event: "observe-returned-promise", elapsed: performance.now() - start });
+const result = await pending;
+observing = false;
+write({ event: "answer", elapsed: performance.now() - start, turns, result });
+setTimeout(() => { clearInterval(heartbeat); write({ event: "done", elapsed: performance.now() - start }); }, 80);
+`;
+  interface HarnessEvent {
+    event: string;
+    elapsed?: number;
+    turns?: number;
+    result?: { outcome: string; detail: string };
+  }
+  const observeInChild = (pin: string, checkTimeoutMs: number, watchdogMs: number) =>
+    new Promise<{ watchdog: boolean; code: number | null; signal: string | null; stderr: string; events: HarnessEvent[] }>((resolve) => {
+      const dir = tempDir("acp-s16-r2-harness-");
+      const script = join(dir, "harness.mjs");
+      const log = join(dir, "events.jsonl");
+      writeFileSync(script, HARNESS);
+      writeFileSync(log, "");
+      const child = spawn(
+        process.execPath,
+        ["--experimental-transform-types", "--no-warnings", script, OBSERVATION_MODULE, pin, log, String(checkTimeoutMs), tempDir("acp-s16-r2-checkout-")],
+        { cwd: dir, env: { ...process.env, HOME: tempDir("acp-s16-r2-home-") }, stdio: ["ignore", "ignore", "pipe"] },
+      );
+      let stderr = "";
+      child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+      let watchdog = false;
+      const timer = setTimeout(() => {
+        watchdog = true;
+        child.kill("SIGKILL");
+      }, watchdogMs);
+      const done = (code: number | null, signal: string | null): void => {
+        clearTimeout(timer);
+        const events = readFileSync(log, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as HarnessEvent);
+        resolve({ watchdog, code, signal, stderr: stderr.slice(-2000), events });
+      };
+      child.once("error", (error) => done(null, `spawn error: ${error.message}`));
+      child.once("close", done);
+    });
+  const judgedInChild = (run: Awaited<ReturnType<typeof observeInChild>>) => {
+    expect({ watchdog: run.watchdog, code: run.code, signal: run.signal, stderr: run.stderr }).toEqual({ watchdog: false, code: 0, signal: null, stderr: "" });
+    const names = run.events.map(({ event }) => event);
+    // The call returned its promise before anything was answered: nothing ran to completion inside it.
+    expect(names.indexOf("observe-returned-promise")).toBeGreaterThan(-1);
+    expect(names.indexOf("observe-returned-promise")).toBeLessThan(names.indexOf("answer"));
+    const answer = run.events.find(({ event }) => event === "answer") as HarnessEvent;
+    // The event loop turned while the observation was pending, and the heartbeat kept firing.
+    expect(answer.turns).toBeGreaterThan(0);
+    expect(names.filter((name) => name === "heartbeat").length).toBeGreaterThan(0);
+    return answer;
+  };
+
+  it("the reviewer's sparse-file witness: a 1-TiB executable pin under 100 ms bounds is refused TOO_LARGE at once, runs nothing, and the heartbeat fires", async () => {
+    const dir = tempDir("acp-s16-r2-sparse-");
+    const pin = join(dir, "commitlore");
+    const ran = join(dir, "ran.txt");
+    // The reviewer's script (hash-budget-parent.mjs), logging each argv that reaches it, then made 1 TiB.
+    writeFileSync(
+      pin,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${ran}'\ncase "$*" in\n"--version") echo 1.7.3; exit 0;;\n"doctor --help") printf "Usage: commitlore doctor [options]\\n  --json\\n"; exit 0;;\n"init --help") printf "Usage: commitlore init [options]\\n  --mcp-scope <scope>\\n  --no-unattended\\n"; exit 0;;\n"init --mcp-scope none --no-unattended") exit 0;;\n"doctor --json") echo '${OK_REPORT}'; exit 0;;\nesac\nexit 2\n`,
+      { mode: 0o700 },
+    );
+    sparse(pin, TIB);
+    try {
+      const run = await observeInChild(pin, 100, 2_500);
+      const answer = judgedInChild(run);
+      expect(answer.result).toMatchObject({
+        outcome: "FAIL",
+        detail: expect.stringMatching(new RegExp(`^commitlore could not be run: ${VARIABLE} TOO_LARGE: .* is ${TIB} bytes, more than the ${CAP} bytes`)),
+      });
+      expect(answer.elapsed).toBeLessThan(1_000);
+      expect(existsSync(ran)).toBe(false);
+      witnessed(`S16-R2-01 sparse asserted answerMs=${Math.round(answer.elapsed ?? Number.NaN)} turns=${answer.turns}`);
+    } finally {
+      rmSync(pin, { force: true });
+    }
+  });
+
+  it("growth during the check: a pin that makes itself 1 TiB (sparse) during doctor --help is refused before init --help spawns, at once, while the heartbeat fires", async () => {
+    // The reviewer's growth case, its paths aside: the CLI the pin is grows its own file during a check.
+    const pinned = fake("grow-during-check", { during: { argv: "doctor --help", code: `fs.truncateSync(process.argv[1], ${TIB});` } });
+    // Bounded preparation before the watchdog starts (`prepareFixture`): the new file's cold first exec.
+    prepareFixture(pinned.bin, ["--version"], pinned.log);
+    try {
+      const run = await observeInChild(pinned.bin, 5_000, 5_000);
+      const answer = judgedInChild(run);
+      expect(answer.result).toMatchObject({
+        outcome: "FAIL",
+        detail: expect.stringMatching(new RegExp(`^commitlore could not be run: ${VARIABLE} REPLACED: .* is ${TIB} bytes, more than the ${CAP} bytes`)),
+      });
+      expect(statSync(pinned.bin).size).toBe(TIB);
+      // It grew during doctor --help, and nothing spawned after that check.
+      expect(argvs(pinned.log)).toEqual(["--version", "doctor --help"]);
+      witnessed(`S16-R2-01 grow-during-check asserted answerMs=${Math.round(answer.elapsed ?? Number.NaN)} turns=${answer.turns}`);
+    } finally {
+      rmSync(pinned.bin, { force: true });
+    }
+  });
+
+  it("growth while the identity is read: a pin that grows at every turn of the event loop during the read is refused, never bound", async () => {
+    const pin = join(tempDir("acp-s16-r2-growing-"), "commitlore");
+    writeFileSync(pin, "#!/bin/sh\n", { mode: 0o700 });
+    sparse(pin, 4 * 1024 * 1024);
+    let growing = true;
+    let grew = 0;
+    const grow = (): void => {
+      if (!growing) return;
+      appendFileSync(pin, "#");
+      grew += 1;
+      setImmediate(grow);
+    };
+    setImmediate(grow);
+    const read = await duringCheck(() => commitlorePinIdentity(pin));
+    growing = false;
+    expect(read).toMatchObject({ value: null, error: expect.stringMatching(/changed while it was read/) });
+    expect(grew).toBeGreaterThan(0);
+    witnessed(`S16-R2-01 grow-while-read asserted grew=${grew} turns=${read.turns}`);
+  });
+
+  it("the cap is checked on the descriptor before a byte is read: a sparse pin of exactly the cap is read whole while the loop turns, one byte more is refused TOO_LARGE", async () => {
+    const dir = tempDir("acp-s16-r2-cap-");
+    const atCap = join(dir, "at-cap");
+    const overCap = join(dir, "over-cap");
+    for (const path of [atCap, overCap]) writeFileSync(path, "#!/bin/sh\n", { mode: 0o700 });
+    sparse(atCap, CAP);
+    sparse(overCap, CAP + 1);
+    const read = await duringCheck(() => commitlorePinIdentity(atCap));
+    // Read in 64 KiB chunks, one turn of the event loop each: 128 of them for the cap.
+    expect(read.turns).toBeGreaterThanOrEqual(64);
+    expect(read.value).toMatchObject({ size: String(CAP), sha256: createHash("sha256").update(readFileSync(atCap)).digest("hex") });
+    const over = await duringCheck(() => commitlorePinIdentity(overCap));
+    expect(over.error).toBe(`${overCap} is ${CAP + 1} bytes, more than the ${CAP} bytes a supported entrypoint is`);
+    expect(COMMITLORE_PIN_MAX_BYTES).toBe(CAP);
+    witnessed(`S16-R2-01 cap asserted turns=${read.turns} beats=${read.beats} ms=${read.elapsed.toFixed(1)}`);
+  });
+
+  it("the identity check has its own deadline: with the file system's workers busy, it is refused at that deadline while the heartbeat fires, its descriptor is closed, and the observation runs nothing", async () => {
+    const pinned = fake("identity-deadline");
+    const pool = occupyPool();
+    const read = await duringCheck(() => commitlorePinIdentity(pinned.bin, 100));
+    await pool;
+    expect(read.error).toBe(`${pinned.bin} could not be read within 100 ms`);
+    expect(read.elapsed).toBeGreaterThanOrEqual(99);
+    expect(read.elapsed).toBeLessThan(1_000);
+    // A 1 ms heartbeat kept firing for the whole wait.
+    expect(read.beats).toBeGreaterThanOrEqual(20);
+    // Whatever the abandoned reading opened once the pool freed up, it closed.
+    await vi.waitFor(() => expect(descriptorsOn(pinned.bin)).toEqual([]), { timeout: 2_000, interval: 20 });
+    // Through the runner: `identityTimeoutMs` is that deadline, and the refusal comes before any spawn.
+    const busy = occupyPool();
+    const observed = await createCommitLoreCliPort(commitloreRunner({ ...COMMITLORE_LIMITS, identityTimeoutMs: 100 }, pinned.bin)).observe(
+      tempDir("acp-s16-r2-deadline-checkout-"),
+    );
+    await busy;
+    expect(observed).toMatchObject({
+      outcome: "FAIL",
+      detail: `commitlore could not be run: ${VARIABLE} UNREADABLE: ${pinned.bin} could not be read as a file to check (${pinned.bin} could not be read within 100 ms)`,
+    });
+    expect(argvs(pinned.log)).toEqual([]);
+    witnessed(`S16-R2-01 identity-deadline asserted beats=${read.beats} ms=${read.elapsed.toFixed(1)}`);
+  });
+
+  it("normal-entrypoint control: the installer's wrapper and a bundle-sized script pinned directly are read while the loop turns, and pass under the production bounds", async () => {
+    // The installer's wrapper (`commitlore:wrapper:v1`), exec'ing Node on a bundle, as install.sh writes it.
+    const bundle = fake("control-bundle");
+    const wrapper = join(tempDir("acp-s16-r2-wrapper-"), "commitlore");
+    writeFileSync(
+      wrapper,
+      `#!/bin/sh\n# commitlore:wrapper:v1\n# Installed by install.sh. Edits are lost on reinstall.\nNODE="${process.execPath}"\n[ -x "$NODE" ] || NODE=node\nexec "$NODE" "${bundle.bin}" "$@"\n`,
+      { mode: 0o700 },
+    );
+    // The release bundle pinned directly, at the size of the 1.7.4 bundle (written out: 1.5 MB is no large file).
+    const bundled = fake("control-bundle-sized");
+    appendFileSync(bundled.bin, `/*${" ".repeat(1_571_351 - statSync(bundled.bin).size - 5)}*/\n`);
+    for (const [pin, ran, minimumTurns] of [
+      [wrapper, bundle.log, 1],
+      [bundled.bin, bundled.log, 16],
+    ] as const) {
+      const read = await duringCheck(() => commitlorePinIdentity(pin));
+      expect(read.turns).toBeGreaterThanOrEqual(minimumTurns);
+      expect(read.value).toMatchObject({ size: String(statSync(pin).size), sha256: createHash("sha256").update(readFileSync(pin)).digest("hex") });
+      expect(statSync(pin).size).toBeLessThanOrEqual(CAP);
+      const observed = await createCommitLoreCliPort(commitloreRunner(COMMITLORE_LIMITS, pin)).observe(tempDir("acp-s16-r2-control-checkout-"));
+      expect(observed).toMatchObject({ outcome: "PASS" });
+      expect(argvs(ran)).toEqual(OBSERVATION);
+    }
+    expect(statSync(wrapper).size).toBeLessThan(4_096);
+    expect(statSync(bundled.bin).size).toBe(1_571_351);
+    witnessed("S16-R2-01 normal-entrypoint control asserted");
   });
 });
