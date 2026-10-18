@@ -1,0 +1,8 @@
+Limit: waiting for stdin to close before classifying is not witnessed: removing the wait turns no witness red, so it is kept as a robustness measure rather than as a tested guarantee
+Warn: boundedRun registers the child's stdin error and close listeners before any write and refuses with GIT_INPUT_NOT_DELIVERED when supplied input was not handed over, even if the child exits 0; an unheard stdin error is an uncaught exception that ended the daemon while it composed a merge message, and src has no global handler to catch it
+Record-Id: r-c54f8b6523a8
+Provenance: inherited db1efb3d5c4538ff041faa053c41cf9fe9b1ad8d
+
+Warn: GIT_INPUT_NOT_DELIVERED is in the reason-code gate's PUBLISHED list, so deleting its catalogue entry now fails the gate; a new reason code that is not added to PUBLISHED is unprotected even though the catalogue and usage gates pass
+Record-Id: r-e794945e2566
+Provenance: inherited 416a3d307a4ffc892e5567c28fbbc548f9647e8e
