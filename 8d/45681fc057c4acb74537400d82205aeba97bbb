@@ -1,0 +1,37 @@
+Limit: the launcher change that sets the pin (install-launchd.sh) is not applied; until it is, the production required path keeps refusing
+Warn: the CommitLore binary is taken only from ACP_COMMITLORE_BINARY, an explicit absolute pin validated by the provider-pin inspectPin, rather than a PATH search; an unset, relative, missing, non-file or non-executable pin, a version outside 1.x from 1.4.2, or a doctor without --json refuses before any command runs, so required mode refuses rather than running an unidentified binary
+Record-Id: r-389fa7c70e4f
+Provenance: inherited 9afad8676c85bd1c85965494508d12ae04c84c4a
+
+Limit: the pin's checks (--version, doctor --help) run once per observation before its first command, each under its own checkTimeoutMs, so an observation ends within the sum of four children's bounds: two checks, then init and doctor
+Warn: a command's timeoutMs and its SIGTERM-then-SIGKILL escalation are measured from its own spawn; putting the checks back inside each command would shorten that bound by the checks' time
+Record-Id: r-a0d94933a00f
+Provenance: inherited 1928ac7e515bf3ed3b28ee18e65a58eb4951de6f
+
+Limit: production code is unchanged; besides the start order and readiness check, the fake binary is run once with --version before the runner's clock starts, because a newly written executable's first run under parallel load measured up to 1.4 s
+Warn: the S11 owned-child witness is judged only on a ready fixture: the child ignores SIGTERM and records its own pid before starting its descendant, then writes a ready marker naming both; a fixture that was not ready throws FIXTURE-READY FAILURE and never counts as a pass
+Record-Id: r-0370483f5d0b
+Provenance: inherited f5f9361cc40d33cec306589e783741902b4175ee
+
+Limit: the earlier run-33 failure was fixture start-up under load, not a product timeout defect: the original 1 s bound and 1.5 s check are kept and the fake answers from /bin/sh with its answers fixed before the clock starts
+Warn: the pin's identity (realpath target, dev, ino, size, mtime, ctime, sha256) is re-read immediately before every spawn after the checks and once after the last check, and any change refuses with nothing further spawned; this is a re-check before each spawn, not an exec bound to the checked bytes, so the window from the re-check to the kernel's own path resolution at exec remains
+Warn: the only --version answer accepted is exit 0 and exactly MAJOR.MINOR.PATCH of canonical decimal numerals (no sign, leading zero, prefix or suffix), compared as integers within 1.4.2 <= v < 2.0.0
+Record-Id: r-dde6673b70b8
+Provenance: inherited 06629ffed8a166df54e2c0332fea774e7bdd15e3
+
+Limit: a read the kernel never returns still holds one Node file-system worker thread and its descriptor until it returns; the deadline refuses on time but cannot reclaim that thread, and inspectPin's single synchronous stat is unchanged
+Warn: the pin is read as one file within bounds: on the no-follow descriptor it must first be a regular file of at most 8 MiB (over five times the largest supported entrypoint), then at most size + 1 bytes are read in async chunks under identityTimeoutMs, and growth, change, absence or a missed deadline refuses with the descriptor closed on every path
+Record-Id: r-b6644b7fb332
+Provenance: inherited 524f9584fb7459693e038ce4b779105cf3dbc42a
+
+Warn: the S11 exit-0 witness judges the refusal against the termination cause this client actually observed: if the runner's deadline fired first the reason must be that deadline, otherwise the signal it sent; a PASS, a reason that does not match its observed cause, or an answer with no observed cause all fail, and the race is also run with the deadline held back so the signal order is certain
+Record-Id: r-3f191f2580dd
+Provenance: inherited 9b356fa57bb731db4fb999c354b11aae1abe5fe4
+
+Warn: the S16-R2-01 witnesses build expected paths from the pin's realpath, because a runner's /var/folders tmp dir resolves to /private/var/folders and the refusal names the file it opened; the observation also keeps only a refusal's first 300 characters, so under that longer path the cap wording falls past the cut and the growth witness compares the detail cut at 300 while asserting the code, both paths and the size
+Record-Id: r-bf5da6a9476c
+Provenance: inherited 4e250bfebb2cf16ebe3fd840e50de8641716cecb
+
+Warn: the pin witnesses check the refusal code, realpath and size on the identity reader's uncut error from the same fixture, and judge the runner's detail only as the first 300 characters of that refusal; a new witness that asserts detail text past the cut passes on short tmp paths and fails under a long alias
+Record-Id: r-5c5e8bc6317b
+Provenance: inherited c0181e4a5a614633b182c8996f3e3eddc5828d23
