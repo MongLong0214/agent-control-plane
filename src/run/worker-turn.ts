@@ -13,6 +13,7 @@ import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
+import { type TaskWriteTarget, recordedWriteTarget, sameWriteTarget } from "./task-write-target.ts";
 import { ORPHAN_RESOLVED_EVENT, ORPHAN_UNIDENTIFIED_EVENT, unresolvedUnidentifiedOrphans } from "./worker-orphan-release.ts";
 import {
   type PinnedRepository,
@@ -209,6 +210,8 @@ interface ClaimFacts {
   worktree: string;
   branch: string;
   ownedPaths: string[];
+  /** The run's base branch for the claim's repository (`run_repositories.base_branch`). */
+  baseBranch: string;
 }
 
 interface DurableFacts {
@@ -218,8 +221,15 @@ interface DurableFacts {
   taskSpec: unknown;
   ownerSessionId: string;
   ownerBindingGeneration: number;
+  /** The run owner's pinned incarnation, named in the guard request for the task's branch. */
+  ownerSessionIncarnation: string | null;
   worker: WorkerIdentity;
   claim: ClaimFacts;
+  /**
+   * #512 S-TB — the write target the control plane recorded for the task (`task-write-target.ts`),
+   * which the claim matched; null for a task with no record, which runs exactly as before.
+   */
+  writeTarget: TaskWriteTarget | null;
 }
 
 interface TurnFacts extends DurableFacts {
@@ -439,6 +449,13 @@ export class WorkerTurnRunner {
     let preparedRepo: PinnedRepository | null = null;
     try {
       scratch = this.#scratchDir("acp-worker-git-");
+      // #512 S-TB — a task with a recorded write target gets its branch made, or re-entered, here,
+      // before the worktree it starts from is read; a task without one runs exactly as before.
+      if (facts.writeTarget) {
+        const branched = await this.prepareTaskBranch(facts, facts.writeTarget, scratch);
+        if (this.#stopping) return this.stoppingRefusal(request.taskId);
+        if (!branched.allowed) return branched as Decision<{ executionId: string }>;
+      }
       const prepared = await this.prepareWorktree(facts, scratch);
       if (this.#stopping) return this.stoppingRefusal(request.taskId);
       if (!prepared.allowed) return prepared as Decision<{ executionId: string }>;
@@ -776,7 +793,11 @@ export class WorkerTurnRunner {
       state: string;
       owner_session_id: string | null;
       owner_binding_generation: number | null;
-    }>(`SELECT state, owner_session_id, owner_binding_generation FROM runs WHERE run_id = ?`, [request.runId]);
+      owner_session_incarnation: string | null;
+    }>(
+      `SELECT state, owner_session_id, owner_binding_generation, owner_session_incarnation FROM runs WHERE run_id = ?`,
+      [request.runId],
+    );
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: request.runId });
     if (run.owner_session_id !== request.ownerSessionId || run.owner_binding_generation !== request.ownerBindingGeneration) {
       return deny(ReasonCode.BINDING_GENERATION_STALE, "the run's owner is no longer the caller", { runId: request.runId });
@@ -842,6 +863,11 @@ export class WorkerTurnRunner {
     } catch {
       spec = {};
     }
+    const writeTarget = recordedWriteTarget(db, request.runId, request.taskId);
+    if (writeTarget) {
+      const matched = this.matchesWriteTarget(request, spec, claim.value, writeTarget);
+      if (!matched.allowed) return matched as Decision<never>;
+    }
     return allow(ReasonCode.OK, {
       runId: request.runId,
       taskId: request.taskId,
@@ -849,9 +875,45 @@ export class WorkerTurnRunner {
       taskSpec: spec,
       ownerSessionId: request.ownerSessionId,
       ownerBindingGeneration: request.ownerBindingGeneration,
+      ownerSessionIncarnation: run.owner_session_incarnation,
       worker: worker.value,
       claim: claim.value,
+      writeTarget,
     });
+  }
+
+  /**
+   * #512 S-TB — the claim a turn runs under names exactly the task's recorded write target: its
+   * repository, its branch and its paths, no more and no fewer; and the task's spec still names that
+   * record, so what the CTO read, what it claimed and what is verified here are one value.
+   */
+  private matchesWriteTarget(
+    request: WorkerTurnRequest,
+    spec: unknown,
+    claim: ClaimFacts,
+    target: TaskWriteTarget,
+  ): Decision<void> {
+    const named = typeof spec === "object" && spec !== null ? (spec as Record<string, unknown>)["writeTarget"] : undefined;
+    if (!sameWriteTarget(named, target)) {
+      return deny(ReasonCode.CONFLICT, "the task's spec no longer names the write target the control plane recorded for it", {
+        taskId: request.taskId,
+      });
+    }
+    const paths = [...new Set(target.paths)].sort();
+    if (
+      claim.repositoryIdentity !== target.repositoryIdentity ||
+      claim.branch !== target.branch ||
+      claim.ownedPaths.length !== paths.length ||
+      claim.ownedPaths.some((path, index) => path !== paths[index])
+    ) {
+      return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "the claim does not name the task's recorded write target", {
+        taskId: request.taskId,
+        claimId: request.claimId,
+        claimed: { repositoryIdentity: claim.repositoryIdentity, branch: claim.branch, paths: claim.ownedPaths },
+        recorded: { repositoryIdentity: target.repositoryIdentity, branch: target.branch, paths },
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /** The ACTIVE `WORKER:<taskId>` binding of this run and the READY Claude/Opus session its actor serves now. */
@@ -986,8 +1048,8 @@ export class WorkerTurnRunner {
         claimId: request.claimId,
       });
     }
-    const repository = db.get<{ repository_id: string; checkout_path: string }>(
-      `SELECT r.repository_id, r.checkout_path
+    const repository = db.get<{ repository_id: string; checkout_path: string; base_branch: string }>(
+      `SELECT r.repository_id, r.checkout_path, rr.base_branch
          FROM run_repositories rr JOIN repositories r ON r.repository_id = rr.repository_id
         WHERE rr.run_id = ? AND r.identity = ?`,
       [request.runId, claim.repository_identity],
@@ -1012,6 +1074,7 @@ export class WorkerTurnRunner {
       worktree,
       branch: branches[0]!,
       ownedPaths,
+      baseBranch: repository.base_branch,
     });
   }
 
@@ -1108,6 +1171,168 @@ export class WorkerTurnRunner {
         error: errorText(error).slice(0, 500),
       });
     }
+  }
+
+  /**
+   * #512 S-TB (CEO 0a16329c) — before a task's first execution, the control plane makes the task's
+   * work branch, or re-enters it, so the turn starts on the recorded target and nowhere else:
+   *
+   * - The registered checkout already on the task's branch is a re-entry, taken as it is.
+   * - On the run's base branch, and clean, the task's branch is created at the run's pinned base
+   *   commit (create-only: a ref that exists is never overwritten) and checked out, as one GIT_BRANCH
+   *   write the Managed Write Guard approves for the run's owner and the claim it holds. The base
+   *   branch's ref is never written, whatever it names now.
+   * - A branch of that name that exists is used only when it descends from the pinned base and every
+   *   commit past it is one this task's turns made; anything else is refused and left as it is.
+   * - A checkout with changes is refused and its changes are left where they are; a checkout on any
+   *   other branch is refused and not moved. Nothing is reset, cleaned, pushed or forced.
+   *
+   * The checkout is moved with plumbing (`update-ref`, `read-tree -m -u`, `symbolic-ref`) under the
+   * hardened pinned git: no hook runs, and a repository that configures a filter driver is refused
+   * rather than have one run to move its files.
+   */
+  private async prepareTaskBranch(facts: DurableFacts, target: TaskWriteTarget, scratch: string): Promise<Decision<void>> {
+    let opened: GitChildren | null = null;
+    try {
+      const pinned = pinRepository(facts.claim.worktree, scratch);
+      if (!pinned.allowed) return pinned as Decision<never>;
+      opened = pinned.value.children;
+      this.#gitRegistries.add(opened);
+      return await this.prepareTaskBranchOn(pinned.value, facts, target);
+    } catch (error) {
+      return deny(ReasonCode.PROBE_FAILED, "the claimed worktree could not be prepared on the task's branch", {
+        worktreeId: facts.claim.worktree,
+        error: errorText(error).slice(0, 500),
+      });
+    } finally {
+      (opened as GitChildren | null)?.retire();
+      this.pruneGitRegistries();
+    }
+  }
+
+  private async prepareTaskBranchOn(repo: PinnedRepository, facts: DurableFacts, target: TaskWriteTarget): Promise<Decision<void>> {
+    const worktree = facts.claim.worktree;
+    const format = await objectFormatOf(repo);
+    const { head, branch } = await headOf(repo);
+    if (!head) return deny(ReasonCode.PROBE_FAILED, "the claimed worktree has no HEAD commit", { worktreeId: worktree });
+    if ((await commitOf(repo, target.baseSha)) !== target.baseSha) {
+      return deny(ReasonCode.CONFLICT, "the run's pinned base commit is not in the registered checkout", {
+        worktreeId: worktree,
+        baseSha: target.baseSha,
+      });
+    }
+    const tip = await commitOf(repo, `refs/heads/${target.branch}`);
+    if (tip !== null) {
+      const lineage = await this.taskBranchLineage(repo, facts, target, tip);
+      if (!lineage.allowed) return lineage;
+    }
+    // Re-entry: the checkout is on the task's branch already; the preparation that follows reads it.
+    if (branch === target.branch) return allow(ReasonCode.OK, undefined);
+    if (branch !== facts.claim.baseBranch) {
+      return deny(
+        ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH,
+        "the registered checkout is on neither the task's branch nor the run's base branch; the control plane does not move it",
+        { worktreeId: worktree, branch: target.branch, baseBranch: facts.claim.baseBranch, observed: branch },
+      );
+    }
+    const unclean = await uncleanPaths(repo, head, format, "branch");
+    if (unclean.length > 0) {
+      return deny(
+        ReasonCode.CONFLICT,
+        "the registered checkout holds uncommitted changes; the task's branch is made only from a clean checkout, and the control plane never resets or cleans one",
+        { worktreeId: worktree, paths: unclean.slice(0, 50) },
+      );
+    }
+    const to = tip ?? target.baseSha;
+    const needsCheckout = (await commitOf(repo, `${head}^{tree}`)) !== (await commitOf(repo, `${to}^{tree}`));
+    if (needsCheckout) {
+      const filters = await runPinnedGit(repo, ["config", "--get-regexp", "^filter\\."]);
+      if (filters.exitCode !== 1) {
+        return deny(
+          ReasonCode.CONFLICT,
+          "the registered checkout configures a filter driver; the control plane does not run one to check out the task's branch",
+          { worktreeId: worktree, exitCode: filters.exitCode },
+        );
+      }
+    }
+    const effect: { outcome: Decision<void> } = {
+      outcome: deny(ReasonCode.INTERNAL_ERROR, "the task branch effect did not run", { worktreeId: worktree }),
+    };
+    const authorised = await this.ports.guard.authorize(
+      {
+        operation: WriteOperation.GIT_BRANCH,
+        targetPath: worktree,
+        repositoryIdentity: facts.claim.repositoryIdentity,
+        targetBranch: target.branch,
+        targetWorktreeId: worktree,
+        taskId: facts.taskId,
+        runId: facts.runId,
+        sessionId: facts.ownerSessionId,
+        sessionIncarnation: facts.ownerSessionIncarnation,
+        bindingGeneration: facts.ownerBindingGeneration,
+        actor: "task-branch",
+      },
+      async () => {
+        effect.outcome = await switchToTaskBranch(repo, { head, branch: branch!, tip, to, target, format, needsCheckout });
+      },
+    );
+    if (!authorised.allowed) return authorised as Decision<never>;
+    if (!effect.outcome.allowed) return effect.outcome;
+    this.ports.audit.record({
+      kind: TASK_BRANCH_PREPARED,
+      runId: facts.runId,
+      sessionId: facts.ownerSessionId,
+      evidence: {
+        taskId: facts.taskId,
+        claimId: facts.claim.claimId,
+        worktreeId: worktree,
+        branch: target.branch,
+        baseSha: target.baseSha,
+        head: to,
+        from: head,
+        fromBranch: branch,
+        created: tip === null,
+        checkedOut: needsCheckout,
+      },
+    });
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /** An existing branch of the task's name descends from the pinned base, and past it holds only this task's commits. */
+  private async taskBranchLineage(repo: PinnedRepository, facts: DurableFacts, target: TaskWriteTarget, tip: string): Promise<Decision<void>> {
+    if (tip === target.baseSha) return allow(ReasonCode.OK, undefined);
+    const ancestor = await runPinnedGit(repo, ["merge-base", "--is-ancestor", target.baseSha, tip]);
+    if (ancestor.exitCode === 1) {
+      return deny(ReasonCode.CONFLICT, "a branch with the task's name does not descend from the run's pinned base; it is left as it is", {
+        branch: target.branch,
+        tip,
+        baseSha: target.baseSha,
+      });
+    }
+    const listed = ancestor.exitCode === 0 ? await runPinnedGit(repo, ["rev-list", `${target.baseSha}..${tip}`]) : null;
+    if (!listed || listed.exitCode !== 0) {
+      return deny(ReasonCode.PROBE_FAILED, "the task branch's history could not be read", { branch: target.branch, tip });
+    }
+    const ours = new Set(
+      this.ports.db
+        .all<{ head: string | null }>(
+          `SELECT json_extract(evidence_json, '$.commitHead') AS head FROM audit_events
+            WHERE run_id = ? AND kind IN (${Object.values(WorkerTurnEvent).map(() => "?").join(", ")})
+              AND json_extract(evidence_json, '$.taskId') = ?`,
+          [facts.runId, ...Object.values(WorkerTurnEvent), facts.taskId],
+        )
+        .map((row) => row.head)
+        .filter((head): head is string => typeof head === "string"),
+    );
+    const foreign = listed.stdout.split("\n").filter((commit) => commit.length > 0 && !ours.has(commit));
+    if (foreign.length > 0) {
+      return deny(ReasonCode.CONFLICT, "a branch with the task's name carries commits this task's turns did not make; it is left as it is", {
+        branch: target.branch,
+        tip,
+        foreign: foreign.slice(0, 20),
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   private async execute(
@@ -1822,6 +2047,87 @@ export class WorkerTurnRunner {
 }
 
 /** #1097 — `ignoredPathState`, with a failure kept as its error. */
+/** #512 S-TB — the audit kind for a task branch the control plane created or checked out. */
+export const TASK_BRANCH_PREPARED = "TASK_BRANCH_PREPARED";
+
+const ZERO_OID = { sha1: "0".repeat(40), sha256: "0".repeat(64) } as const;
+
+/** The commit (or tree) an expression names in the pinned repository, or null when it names none. */
+const commitOf = async (repo: PinnedRepository, expression: string): Promise<string | null> => {
+  const read = await runPinnedGit(repo, ["rev-parse", "--verify", "-q", expression.endsWith("^{tree}") ? expression : `${expression}^{commit}`]);
+  const value = read.stdout.trim();
+  return read.exitCode === 0 && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value) ? value : null;
+};
+
+/** What a checkout holds that its HEAD does not: staged entries, changed or untracked paths, and what cannot be vouched for. */
+const uncleanPaths = async (repo: PinnedRepository, head: string, format: "sha1" | "sha256", label: string): Promise<string[]> => {
+  const snapshot = indexSnapshot(repo, label);
+  const staged = await stagedAgainst(repo, head, snapshot);
+  const scan = await scanAgainst(repo, head, format, label);
+  return [...new Set([
+    ...staged,
+    ...scan.entries.map((entry) => entry.path),
+    ...scan.unsafe,
+    ...scan.populatedGitlinks,
+    ...scan.untrackedAgentConfiguration,
+  ])];
+};
+
+/**
+ * The GIT_BRANCH effect, run inside the guard's grant: the checkout must not have moved since it was
+ * read; the task's branch is created at the pinned base only where no ref of that name exists, or
+ * must still be where it was read; the files move from HEAD to the branch's commit by a two-tree
+ * `read-tree`, which refuses rather than overwrite anything; then HEAD names the branch.
+ */
+const switchToTaskBranch = async (
+  repo: PinnedRepository,
+  input: {
+    head: string;
+    branch: string;
+    tip: string | null;
+    to: string;
+    target: TaskWriteTarget;
+    format: "sha1" | "sha256";
+    needsCheckout: boolean;
+  },
+): Promise<Decision<void>> => {
+  const now = await headOf(repo);
+  if (now.head !== input.head || now.branch !== input.branch) {
+    return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the checkout moved before the task's branch was made", { branch: input.target.branch });
+  }
+  const ref = `refs/heads/${input.target.branch}`;
+  if (input.tip === null) {
+    const created = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch", ref, input.target.baseSha, ZERO_OID[input.format]]);
+    if (created.exitCode !== 0) {
+      return deny(ReasonCode.CONFLICT, "the task's branch could not be created; a ref that exists is never overwritten", {
+        branch: input.target.branch,
+        error: created.stderr.slice(0, 300),
+      });
+    }
+  } else if ((await commitOf(repo, ref)) !== input.tip) {
+    return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the task's branch moved before it was checked out", { branch: input.target.branch });
+  }
+  if (input.needsCheckout) {
+    const moved = await runPinnedGit(repo, ["read-tree", "-m", "-u", input.head, input.to]);
+    if (moved.exitCode !== 0) {
+      return deny(ReasonCode.CONFLICT, "the checkout's files could not be moved to the task's branch; they are left as they were", {
+        branch: input.target.branch,
+        error: moved.stderr.slice(0, 300),
+      });
+    }
+  }
+  const pointed = await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch", "HEAD", ref]);
+  const after = await headOf(repo);
+  if (pointed.exitCode !== 0 || after.head !== input.to || after.branch !== input.target.branch) {
+    return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the checkout is not on the task's branch after it was made", {
+      branch: input.target.branch,
+      observed: after.branch,
+      head: after.head,
+    });
+  }
+  return allow(ReasonCode.OK, undefined);
+};
+
 const readIgnored = async (repo: PinnedRepository, treeIsh: string, label: string): Promise<IgnoredReading> => {
   try {
     return { state: await ignoredPathState(repo, treeIsh, label), error: null };
