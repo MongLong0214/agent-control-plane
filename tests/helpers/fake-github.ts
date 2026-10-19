@@ -202,7 +202,8 @@ export class FakeGitHub implements GitHubClient {
       const ref = decodeURIComponent(/\/git\/ref\/heads\/(.+)$/.exec(path)![1]!);
       const sha = this.#heads.get(ref);
       if (!sha) throw new Error(`404 branch not found: ${ref}`);
-      return { object: { sha } } as unknown as T;
+      // GitHub names the exact ref and the object type; a branch publication checks both (#1161 BP-02).
+      return { ref: `refs/heads/${ref}`, object: { sha, type: "commit" } } as unknown as T;
     }
     if (method === "POST" && /\/git\/refs$/.test(path)) {
       const input = body as { ref: string; sha: string };

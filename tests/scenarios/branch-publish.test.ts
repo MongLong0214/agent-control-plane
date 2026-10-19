@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -61,6 +62,10 @@ const setup = async (options: {
   /** Commits made on the work branch before the passing change, so they belong to the candidate. */
   extraCandidateFiles?: Record<string, string>;
   trustedCi?: boolean;
+  /** Runs on the work branch before the passing change, after the base workflow commit (#1161 r1). */
+  beforeCandidate?: (harness: Harness) => Promise<void> | void;
+  /** Candidate paths the scripted reviewer attests to beyond src/app.js and `extraCandidateFiles`. */
+  reviewedPaths?: readonly string[];
 } = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
   const log: Fixture["log"] = [];
@@ -104,9 +109,13 @@ const setup = async (options: {
     writeFiles(harness.repoPath, options.extraCandidateFiles);
     commitAll(harness.repoPath, "an extra candidate change");
   }
+  if (options.beforeCandidate) {
+    startWorkBranch(harness.repoPath, WORK_BRANCH);
+    await options.beforeCandidate(harness);
+  }
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: WORK_BRANCH,
-    reviewedPaths: ["src/app.js", ...Object.keys(options.extraCandidateFiles ?? {})],
+    reviewedPaths: ["src/app.js", ...Object.keys(options.extraCandidateFiles ?? {}), ...(options.reviewedPaths ?? [])],
     manifestOverrides: {
       ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW), unapprovedFirstActivation: false, repositoryRole: "primary" }],
       ...options.manifestOverrides,
@@ -292,7 +301,7 @@ describe("S-PUSH: publishBranch", () => {
   });
 
   it("refuses a candidate past a cap before the first upload", async () => {
-    const fixture = await setup({ limits: { maxBlobBytes: 4 } });
+    const fixture = await setup({ limits: { maxObjectBytes: 4 } });
     const refused = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
     expect(refused.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
     expect(fixture.gitData.calls).toEqual([]);
@@ -483,5 +492,322 @@ describe("S-PUSH: gates before anything is sent", () => {
     expect(JSON.stringify(refused.evidence)).toContain(".github/workflows/extra.yml");
     expect(fixture.gitData.objectUploads()).toEqual([]);
     expect(receiptsOf(fixture)).toEqual([]);
+  });
+});
+
+/** A commit on the work branch with exactly these files, message and identity, before the passing change. */
+const candidateCommit = (repo: string, files: Record<string, string | Buffer>, message: string, env: Record<string, string> = {}): void => {
+  for (const [file, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(repo, file)), { recursive: true });
+    writeFileSync(join(repo, file), content);
+  }
+  execFileSync("git", ["-C", repo, "add", "-A"], { stdio: "ignore", timeout: 30_000 });
+  execFileSync("git", ["-C", repo, "commit", "-q", "--no-verify", "-m", message], {
+    stdio: "ignore",
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "ACP Test",
+      GIT_AUTHOR_EMAIL: "test@example.invalid",
+      GIT_COMMITTER_NAME: "ACP Test",
+      GIT_COMMITTER_EMAIL: "test@example.invalid",
+      GIT_CONFIG_NOSYSTEM: "1",
+      ...env,
+    },
+  });
+};
+
+/** A second registered checkout under a Unicode path, so that path is one the scan must keep local. */
+const registerUnicodeCheckout = async (harness: Harness): Promise<string> => {
+  const dir = join(tempDir("acp-bp-uni-"), "팀", "checkouts", "other");
+  mkdirSync(dir, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "dev", dir], { stdio: "ignore", timeout: 30_000 });
+  candidateCommit(dir, { "README.md": "other\n" }, "other base");
+  const registered = await harness.cp.repositories.register({ checkoutPath: dir, identity: "github:acme/other" });
+  if (!registered.allowed) throw new Error(`${registered.reasonCode}: ${registered.message}`);
+  expect(registered.value.checkoutPath).toContain("팀");
+  return registered.value.checkoutPath;
+};
+
+/** Refused before the first upload: no object, no ref, no receipt. */
+const expectNothingSent = (fixture: Fixture): void => {
+  expect(fixture.gitData.objectUploads()).toEqual([]);
+  expect(fixture.gitData.posts("refs")).toEqual([]);
+  expect(fixture.gitData.head(WORK_BRANCH)).toBeNull();
+  expect(receiptsOf(fixture)).toEqual([]);
+};
+
+const CHATGPT = "https://chatgpt.com/c/12345678-1234-5678-1234-123456789012";
+
+describe("#1161 r1 BP-01: the scan refuses on every surface before the first upload", () => {
+  it("pins the Unicode registered path in a candidate blob", async () => {
+    let unicode = "";
+    const fixture = await setup({
+      reviewedPaths: ["notes.md"],
+      beforeCandidate: async (harness) => {
+        unicode = await registerUnicodeCheckout(harness);
+        candidateCommit(harness.repoPath, { "notes.md": `copied from ${unicode}/private.txt\n` }, "notes");
+      },
+    });
+    const refused = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(refused.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+    expect(JSON.stringify(refused.evidence)).not.toContain(unicode);
+    expectNothingSent(fixture);
+  });
+
+  it("pins the Unicode registered path in a commit message, and refuses it in the author field", async () => {
+    for (const [message, env] of [
+      [`work in ${"__PATH__"}`, {}],
+      ["clean", { GIT_AUTHOR_NAME: "dev __PATH__" }],
+    ] as const) {
+      let unicode = "";
+      const fixture = await setup({
+        reviewedPaths: ["notes.md"],
+        beforeCandidate: async (harness) => {
+          unicode = await registerUnicodeCheckout(harness);
+          const fill = (text: string): string => text.replace("__PATH__", unicode);
+          candidateCommit(harness.repoPath, { "notes.md": "clean\n" }, fill(message), Object.fromEntries(Object.entries(env).map(([k, v]) => [k, fill(v)])));
+        },
+      });
+      const refused = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+      expect(refused.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+      expectNothingSent(fixture);
+    }
+  });
+
+  it("refuses a chatgpt.com/c session URL in the committer field and in a binary blob", async () => {
+    const committer = await setup({
+      reviewedPaths: ["notes.md"],
+      beforeCandidate: (harness) => candidateCommit(harness.repoPath, { "notes.md": "clean\n" }, "clean", { GIT_COMMITTER_NAME: "chatgpt.com/c/12345678-1234" }),
+    });
+    expect((await committer.harness.cp.github.publishBranch(committer.plan().publish)).reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+    expectNothingSent(committer);
+    const binary = await setup({
+      reviewedPaths: ["asset.bin"],
+      beforeCandidate: (harness) => candidateCommit(harness.repoPath, {
+        "asset.bin": Buffer.concat([Buffer.from([0xff, 0x00, 0xc3]), Buffer.from(CHATGPT, "utf8"), Buffer.from([0x80])]),
+      }, "asset"),
+    });
+    expect((await binary.harness.cp.github.publishBranch(binary.plan().publish)).reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+    expectNothingSent(binary);
+  });
+
+  it("pins the full tree path ~/.hermes/state", async () => {
+    const fixture = await setup({ extraCandidateFiles: { "~/.hermes/state": "clean\n" } });
+    const refused = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(refused.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+    expect((refused.evidence["findings"] as Array<{ rule: string }>).map((finding) => finding.rule)).toContain("home state path");
+    expectNothingSent(fixture);
+  });
+
+  it("pins chatgpt.com/c/<uuid> in the PR body: no upload, no ref, no receipt, and no PR (the finalizer stops at PUBLISH_BRANCH)", async () => {
+    const fixture = await setup();
+    const plan = fixture.plan();
+    const refused = await fixture.harness.cp.github.publishBranch({ ...plan.publish, pullRequest: { ...plan.publish.pullRequest, body: CHATGPT } });
+    expect(refused.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+    expect(fixture.gitData.calls).toEqual([]);
+    expectNothingSent(fixture);
+    const title = await fixture.harness.cp.github.publishBranch({ ...plan.publish, pullRequest: { ...plan.publish.pullRequest, title: "see https://claude.ai/share/0123abcd" } });
+    expect(title.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+    expect(fixture.github.pulls).toEqual([]);
+    expectNothingSent(fixture);
+  });
+});
+
+describe("#1161 r1 BP-02: only the exact intended ref, a commit, at the candidate, may count", () => {
+  it("pins a create answer naming another SHA: refused, nothing APPLIED; the next attempt settles it by the exact-target reconciliation read", async () => {
+    const fixture = await setup();
+    let contradict = true;
+    fixture.gitData.intercepts.push((call) => {
+      if (!contradict || call.method !== "POST" || !call.path.endsWith("/git/refs")) return undefined;
+      fixture.gitData.setHead(WORK_BRANCH, fixture.driven.candidateHead);
+      return { answer: { ref: `refs/heads/${WORK_BRANCH}`, object: { sha: "f".repeat(40), type: "commit" } } };
+    });
+    const refused = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(refused.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_OBJECT_MISMATCH);
+    expect(receiptsOf(fixture)).toEqual([expect.objectContaining({ status: "PENDING", verified: 0 })]);
+    contradict = false;
+    const posts = fixture.gitData.calls.filter((call) => call.method === "POST").length;
+    const settled = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(settled.reasonCode).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+    expect(fixture.gitData.calls.filter((call) => call.method === "POST").length).toBe(posts);
+    expect(receiptsOf(fixture)).toEqual([expect.objectContaining({ status: "APPLIED", verified: 1, preexisting: 0 })]);
+    expectCreateOnly(fixture);
+  });
+
+  for (const [label, answer] of [
+    ["another ref name at the candidate", (head: string) => ({ ref: "refs/heads/some-other-branch", object: { sha: head, type: "commit" } })],
+    ["a tag object at the candidate", (head: string) => ({ ref: `refs/heads/${WORK_BRANCH}`, object: { sha: head, type: "tag" } })],
+    ["no body at all", () => null],
+  ] as const) {
+    it(`refuses a create answer with ${label}, recording nothing applied`, async () => {
+      const fixture = await setup();
+      fixture.gitData.intercepts.push((call) => {
+        if (call.method !== "POST" || !call.path.endsWith("/git/refs")) return undefined;
+        fixture.gitData.setHead(WORK_BRANCH, fixture.driven.candidateHead);
+        return { answer: answer(fixture.driven.candidateHead) };
+      });
+      const refused = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+      expect(refused.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_OBJECT_MISMATCH);
+      expect(receiptsOf(fixture).some((row) => row.status === "APPLIED")).toBe(false);
+      expectCreateOnly(fixture);
+    });
+  }
+
+  it("pins a read answering another branch's name at the candidate SHA: refused before anything is sent, no receipt, the intended branch absent", async () => {
+    const fixture = await setup();
+    fixture.gitData.intercepts.push((call) => call.method === "GET" && call.path.endsWith(`/git/ref/heads/${WORK_BRANCH}`)
+      ? { answer: { ref: "refs/heads/some-other-branch", object: { sha: fixture.driven.candidateHead, type: "commit" } } }
+      : undefined);
+    const refused = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(refused.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_OBJECT_MISMATCH);
+    expectNothingSent(fixture);
+  });
+
+  it("refuses a base read answering another ref name, before anything is sent", async () => {
+    const fixture = await setup();
+    fixture.gitData.intercepts.push((call) => call.method === "GET" && call.path.endsWith("/git/ref/heads/dev")
+      ? { answer: { ref: "refs/heads/main", object: { sha: fixture.driven.baseHead, type: "commit" } } }
+      : undefined);
+    const refused = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(refused.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_OBJECT_MISMATCH);
+    expectNothingSent(fixture);
+  });
+
+  it("refuses a post-create readback naming another ref, and a reconciliation readback naming another ref; the receipt stays PENDING", async () => {
+    const fixture = await setup();
+    let afterCreate = false;
+    fixture.gitData.intercepts.push((call) => {
+      if (call.method === "POST" && call.path.endsWith("/git/refs")) afterCreate = true;
+      return afterCreate && call.method === "GET" && call.path.endsWith(`/git/ref/heads/${WORK_BRANCH}`)
+        ? { answer: { ref: "refs/heads/some-other-branch", object: { sha: fixture.driven.candidateHead, type: "commit" } } }
+        : undefined;
+    });
+    const first = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(first.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_OBJECT_MISMATCH);
+    expect(receiptsOf(fixture)).toEqual([expect.objectContaining({ status: "PENDING", verified: 0 })]);
+    const posts = fixture.gitData.calls.filter((call) => call.method === "POST").length;
+    const again = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(again.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_OBJECT_MISMATCH);
+    expect(fixture.gitData.calls.filter((call) => call.method === "POST").length).toBe(posts);
+    expect(receiptsOf(fixture)).toEqual([expect.objectContaining({ status: "PENDING", verified: 0 })]);
+    expectCreateOnly(fixture);
+  });
+});
+
+describe("#1161 r1 BP-03: the publication's caps and its receipt describe every commit, tree and blob byte", () => {
+  const candidateBytes = (fixture: Fixture): { count: number; bytes: number } => {
+    const ids = execFileSync("git", ["-C", fixture.harness.repoPath, "rev-list", "--objects", "--no-object-names", fixture.driven.candidateHead, `^${fixture.driven.baseHead}`], { encoding: "utf8", timeout: 30_000 });
+    const sizes = execFileSync("git", ["-C", fixture.harness.repoPath, "cat-file", "--batch-check=%(objectsize)"], { input: ids, encoding: "utf8", timeout: 30_000 })
+      .split("\n").filter(Boolean).map(Number);
+    return { count: sizes.length, bytes: sizes.reduce((sum, size) => sum + size, 0) };
+  };
+
+  it("refuses one byte over the total before any request, and the receipt of a publication at the bound counts every byte", async () => {
+    const probe = await setup();
+    const { bytes } = candidateBytes(probe);
+    const over = await setup({ limits: { maxTotalBytes: bytes - 1 } });
+    expect(candidateBytes(over).bytes).toBe(bytes);
+    const refused = await over.harness.cp.github.publishBranch(over.plan().publish);
+    expect(refused.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+    expect(over.gitData.calls).toEqual([]);
+    expectNothingSent(over);
+    const at = await setup({ limits: { maxTotalBytes: bytes } });
+    const published = await at.harness.cp.github.publishBranch(at.plan().publish);
+    expect(published.allowed, JSON.stringify(published)).toBe(true);
+    const response = JSON.parse(receiptsOf(at)[0]!.response_json) as { counts: { bytes: number; commits: number; trees: number; blobs: number } };
+    expect(response.counts.bytes).toBe(bytes);
+    expect(response.counts.commits + response.counts.trees + response.counts.blobs).toBe(candidateBytes(at).count);
+  });
+});
+
+/**
+ * #1161 r1 — the reviewer's scenario probes (pr1161-reviewer-probes-round1/scenario-probes.test.ts), ported:
+ * the same cases and assertions, with only the logging dropped and without the reviewer's sandbox stub, because
+ * the sandbox runs on this host. The unmodified file is replayed separately (evidence r3/replay-*).
+ */
+describe("#1161 r1 reviewer scenario probes, ported", () => {
+  it("review: rejects a mismatched ref-create response instead of APPLIED", async () => {
+    const fixture = await setup();
+    fixture.gitData.intercepts.push(call => {
+      if (call.method !== "POST" || !call.path.endsWith("/git/refs")) return undefined;
+      fixture.gitData.setHead(WORK_BRANCH, fixture.driven.candidateHead);
+      return { answer: { ref: `refs/heads/${WORK_BRANCH}`, object: { sha: "f".repeat(40), type: "commit" } } };
+    });
+    const result = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(result.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_OBJECT_MISMATCH);
+    expect(receiptsOf(fixture).some(row => row.status === "APPLIED")).toBe(false);
+  });
+
+  it("review: a readback naming another ref cannot prove the candidate ref exists", async () => {
+    const fixture = await setup();
+    fixture.gitData.intercepts.push(call => call.method === "GET" && call.path.endsWith(`/git/ref/heads/${WORK_BRANCH}`)
+      ? { answer: {ref: "refs/heads/some-other-branch", object: {sha: fixture.driven.candidateHead, type: "commit"}} }
+      : undefined);
+    const result = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(result.allowed).toBe(false);
+    expect(receiptsOf(fixture)).toEqual([]);
+  });
+  it("review: refuses a ChatGPT session URL before publication sends objects", async () => {
+    const fixture = await setup();
+    const plan = fixture.plan();
+    const result = await fixture.harness.cp.github.publishBranch({...plan.publish, pullRequest: {...plan.publish.pullRequest, body: "https://chatgpt.com/c/12345678-1234-5678-1234-123456789012"}});
+    const prepared = await fixture.harness.cp.github.prPrepare({...plan.prepare, body: "https://chatgpt.com/c/12345678-1234-5678-1234-123456789012"});
+    void prepared; // the original probe logged it
+    expect(result.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+    expect(fixture.gitData.objectUploads()).toEqual([]);
+  });
+
+  for (const endpoint of ["blobs", "trees", "commits"]) {
+    it(`review control: lost ${endpoint} answer stays pending and retry is create-only with one receipt`, async () => {
+      const fixture = await setup();
+      let lose = true;
+      fixture.gitData.intercepts.push(call => lose && call.method === "POST" && call.path.endsWith(`/git/${endpoint}`) ? {applyThenSilence: true} : undefined);
+      const first = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+      expect(first.allowed).toBe(false);
+      expect(fixture.gitData.posts("refs")).toHaveLength(0);
+      expect(receiptsOf(fixture)).toEqual([expect.objectContaining({status: "PENDING", verified: 0})]);
+      lose = false;
+      const retry = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+      expect(retry.allowed, JSON.stringify(retry)).toBe(true);
+      expect(receiptsOf(fixture)).toEqual([expect.objectContaining({status: "APPLIED", verified: 1})]);
+      expectCreateOnly(fixture);
+    });
+  }
+  it("review control: lost ref readback reconciles without another POST", async () => {
+    const fixture = await setup();
+    let lose = true;
+    fixture.gitData.intercepts.push(call => lose && fixture.gitData.posts("refs").length > 0 && call.method === "GET" && call.path.endsWith(`/git/ref/heads/${WORK_BRANCH}`) ? {silence: true} : undefined);
+    expect((await fixture.harness.cp.github.publishBranch(fixture.plan().publish)).allowed).toBe(false);
+    expect(receiptsOf(fixture)).toEqual([expect.objectContaining({status: "PENDING", verified: 0})]);
+    const posts = fixture.gitData.calls.filter(c=>c.method === "POST").length;
+    lose = false;
+    expect((await fixture.harness.cp.github.publishBranch(fixture.plan().publish)).allowed).toBe(true);
+    expect(fixture.gitData.calls.filter(c=>c.method === "POST")).toHaveLength(posts);
+    expect(receiptsOf(fixture)).toEqual([expect.objectContaining({status: "APPLIED", verified: 1})]);
+  });
+  it("review control: ref moved between create and readback stays collision and pending", async () => {
+    const fixture = await setup();
+    let other = "";
+    fixture.gitData.intercepts.push(call => {
+      if(call.method !== "POST" || !call.path.endsWith("/git/refs")) return undefined;
+      other = remoteCommitOn(fixture, fixture.driven.candidateHead);
+      fixture.gitData.setHead(WORK_BRANCH, other);
+      return {answer: {ref: `refs/heads/${WORK_BRANCH}`, object: {sha: fixture.driven.candidateHead, type: "commit"}}};
+    });
+    const result = await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(result.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+    expect(fixture.gitData.head(WORK_BRANCH)).toBe(other);
+    expect(receiptsOf(fixture)).toEqual([expect.objectContaining({status: "PENDING", verified: 0})]);
+    expectCreateOnly(fixture);
+  });
+  it("review control: moving local work and source tips still publishes only the frozen candidate", async () => {
+    const fixture = await setup();
+    const tip=execFileSync("git", ["-C", fixture.harness.repoPath, "commit-tree", `${fixture.driven.candidateHead}^{tree}`, "-p", fixture.driven.candidateHead, "-m", "tip moved"], {encoding: "utf8", timeout: 30_000, env: {...process.env, GIT_AUTHOR_NAME: "x", GIT_AUTHOR_EMAIL: "x@example.invalid", GIT_COMMITTER_NAME: "x", GIT_COMMITTER_EMAIL: "x@example.invalid"}}).trim();
+    for(const branch of [WORK_BRANCH, "dev"]) execFileSync("git", ["-C", fixture.harness.repoPath, "update-ref", `refs/heads/${branch}`, tip], {timeout: 30_000});
+    const result=await fixture.harness.cp.github.publishBranch(fixture.plan().publish);
+    expect(result.allowed, JSON.stringify(result)).toBe(true);
+    expect(fixture.gitData.head(WORK_BRANCH)).toBe(fixture.driven.candidateHead);
+    expect(fixture.gitData.objectUploads().some(c=>(c.body as {message?: string}).message === "tip moved\n")).toBe(false);
   });
 });

@@ -232,7 +232,7 @@ describe("the refusing public-safety scan", () => {
     const limits = (overrides: Partial<typeof DEFAULT_BRANCH_PUBLISH_LIMITS>) => ({ ...DEFAULT_BRANCH_PUBLISH_LIMITS, ...overrides });
     expect((await collectBranchObjects(path, base, two, limits({ maxCommits: 1 }))).reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
     expect((await collectBranchObjects(path, base, two, limits({ maxObjects: 3 }))).reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
-    expect((await collectBranchObjects(path, base, two, limits({ maxBlobBytes: 1024 }))).reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+    expect((await collectBranchObjects(path, base, two, limits({ maxObjectBytes: 1024 }))).reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
     expect((await collectBranchObjects(path, base, two, limits({ maxTotalBytes: 1024 }))).reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
     const collected = await collectBranchObjects(path, base, two, DEFAULT_BRANCH_PUBLISH_LIMITS);
     if (!collected.allowed) throw new Error(collected.message);
@@ -244,5 +244,292 @@ describe("the refusing public-safety scan", () => {
       ".github/workflows/ci.yml",
       ".GitHub/Workflows/x.yml",
     ]);
+  });
+});
+
+/**
+ * #1161 r1 (BP-01, BP-03; CEO 4729a06b, 37f3fcb3) — the reviewer's counterexamples, pinned. The scan is a
+ * pure function over the collected objects, so a refusal here is a refusal before any upload; the
+ * scenario suite asserts the same surfaces end to end with zero uploads.
+ */
+describe("#1161 r1 BP-01: one public-safety standard on every surface", () => {
+  const UNICODE_PATH = "/private/팀/checkouts";
+  const CHATGPT = "https://chatgpt.com/c/12345678-1234-5678-1234-123456789012";
+  const DATES = { author: "2026-10-19T12:00:00+09:00", committer: "2026-10-19T12:00:00+09:00" };
+  const scanWith = (objects: BranchObjects, overrides: Partial<Parameters<typeof scanPublication>[0]> = {}) =>
+    scanPublication({
+      objects,
+      branch: "feature/F1-test",
+      pullRequestTitle: "t",
+      pullRequestBody: "b",
+      forbiddenPaths: [UNICODE_PATH],
+      limits: DEFAULT_BRANCH_PUBLISH_LIMITS,
+      ...overrides,
+    });
+  const collect = async (files: Record<string, string | Buffer>, message = "clean", env: Record<string, string> = {}): Promise<BranchObjects> => {
+    const { path, base } = repository();
+    git(path, ["checkout", "-q", "--detach", base]);
+    for (const [file, content] of Object.entries(files)) {
+      execFileSync("mkdir", ["-p", join(path, file, "..")], { timeout: 30_000 });
+      execFileSync("sh", ["-c", 'cat > "$1"', "sh", join(path, file)], { input: content, timeout: 30_000 });
+    }
+    git(path, ["add", "-A"]);
+    const tree = git(path, ["write-tree"]);
+    const head = git(path, ["commit-tree", tree, "-p", base, "--no-gpg-sign", "-m", message], {
+      GIT_AUTHOR_DATE: DATES.author,
+      GIT_COMMITTER_DATE: DATES.committer,
+      ...env,
+    });
+    const collected = await collectBranchObjects(path, base, head, DEFAULT_BRANCH_PUBLISH_LIMITS);
+    if (!collected.allowed) throw new Error(`${collected.reasonCode}: ${collected.message}`);
+    return collected.value;
+  };
+  const expectRefused = (result: ReturnType<typeof scanPublication>, rule: string): void => {
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+    expect((result.evidence["findings"] as Array<{ rule: string }>).map((finding) => finding.rule)).toContain(rule);
+    expect(JSON.stringify(result.evidence)).not.toContain("팀");
+    expect(JSON.stringify(result.evidence)).not.toContain("12345678-1234");
+  };
+
+  it("pins the reported Unicode registered path in a blob", async () => {
+    expectRefused(scanWith(await collect({ "a.txt": `${UNICODE_PATH}/private.txt` })), "local absolute path");
+  });
+
+  it("pins the reported Unicode registered path in a commit message", async () => {
+    expectRefused(scanWith(await collect({ "a.txt": "clean" }, `work at ${UNICODE_PATH}`)), "local absolute path");
+  });
+
+  it("refuses the Unicode path in the author and in the committer field", async () => {
+    expectRefused(scanWith(await collect({ "a.txt": "clean" }, "clean", { GIT_AUTHOR_NAME: `dev ${UNICODE_PATH}` })), "local absolute path");
+    expectRefused(scanWith(await collect({ "a.txt": "clean" }, "clean", { GIT_COMMITTER_EMAIL: `x${UNICODE_PATH}@example.invalid` })), "local absolute path");
+  });
+
+  it("refuses the path written decomposed (NFD) or in another letter case", async () => {
+    expectRefused(scanWith(await collect({ "a.txt": `${UNICODE_PATH.normalize("NFD")}/x` })), "local absolute path");
+    expectRefused(scanWith(await collect({ "a.txt": `${UNICODE_PATH.toUpperCase()}/x` })), "local absolute path");
+  });
+
+  it("binary policy: a blob that is not UTF-8 is scanned as raw bytes for each rule and for each path's UTF-8 bytes", async () => {
+    const binary = (text: string): Buffer => Buffer.concat([Buffer.from([0xff, 0x00, 0xc3]), Buffer.from(text, "utf8"), Buffer.from([0x80, 0xfe])]);
+    const pathBlob = await collect({ "image.bin": binary(`${UNICODE_PATH}/x`) });
+    expect(pathBlob.blobs.some((blob) => new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }) && (() => {
+      try { new TextDecoder("utf-8", { fatal: true }).decode(blob.content); return false; } catch { return true; }
+    })())).toBe(true);
+    expectRefused(scanWith(pathBlob), "local absolute path");
+    expectRefused(scanWith(await collect({ "image.bin": binary(CHATGPT) })), "session url");
+    expectRefused(scanWith(await collect({ "image.bin": binary(`ghp_${"Ab1Cd2Ef3G".repeat(4)}`) })), "github token");
+  });
+
+  it("a UTF-16 blob with a byte-order mark is decoded and scanned as text", async () => {
+    const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(`see ${CHATGPT}`, "utf16le")]);
+    expectRefused(scanWith(await collect({ "notes.txt": utf16 })), "session url");
+  });
+
+  it("pins the reported full tree path ~/.hermes/state, scanned joined rather than per component", async () => {
+    const objects = await collect({ "~/.hermes/state": "clean" });
+    expect(objects.trees.flatMap((tree) => tree.entries.map((entry) => entry.path))).not.toContain("~/.hermes/state");
+    expectRefused(scanWith(objects), "home state path");
+  });
+
+  it("the joined path is scanned from the sent trees themselves, whatever the changed-path list says", () => {
+    const id = (n: number): string => n.toString(16).padStart(40, "0");
+    const commit = { sha: id(9), raw: Buffer.from("clean"), fields: { message: "clean", tree: id(1), parents: [], author: { name: "a", email: "a@example.invalid", date: "2026-10-19T12:00:00+09:00" }, committer: { name: "a", email: "a@example.invalid", date: "2026-10-19T12:00:00+09:00" } } };
+    const objects: BranchObjects = {
+      commits: [commit],
+      trees: [
+        { sha: id(3), entries: [{ path: "state", mode: "100644", type: "blob", sha: id(4) }] },
+        { sha: id(2), entries: [{ path: ".hermes", mode: "040000", type: "tree", sha: id(3) }] },
+        { sha: id(1), entries: [{ path: "~", mode: "040000", type: "tree", sha: id(2) }] },
+      ],
+      blobs: [],
+      changedPaths: [],
+      candidateTree: id(1),
+      bytes: 0,
+    };
+    expectRefused(scanWith(objects), "home state path");
+  });
+
+  it("a session URL laid out as directories is caught on the joined path", async () => {
+    expectRefused(scanWith(await collect({ "chatgpt.com/c/12345678-1234-5678-1234-123456789012/readme.md": "clean" })), "session url");
+  });
+
+  it("pins chatgpt.com/c/<uuid> in the PR body, and covers every session URL form on every surface", async () => {
+    const empty: BranchObjects = { commits: [], trees: [], blobs: [], changedPaths: [], candidateTree: "", bytes: 0 };
+    expectRefused(scanWith(empty, { pullRequestBody: CHATGPT }), "session url");
+    const forms = [
+      CHATGPT,
+      "https://chatgpt.com/share/6712-abcd-ef01",
+      "https://chat.openai.com/c/12345678-1234-5678-1234-123456789012",
+      "https://chatgpt.com/g/g-abc123/c/12345678-1234-5678-1234-123456789012",
+      "https://chatgpt.com/codex/tasks/task_e_0123456789",
+      "https://claude.ai/chat/0123abcd-0000-0000-0000-000000000000",
+      "https://claude.ai/share/0123abcd-0000-0000-0000-000000000000",
+      "https://claude.ai/code/session_0123456789abcdef",
+      "https://gemini.google.com/app/0123456789abcdef",
+      "https://g.co/gemini/share/0123456789ab",
+      "https://grok.com/share/abcdef0123",
+      "https://example.invalid/sessions/0123456789abcdef",
+    ];
+    for (const form of forms) {
+      expectRefused(scanWith(empty, { pullRequestTitle: `see ${form}` }), "session url");
+      expectRefused(scanWith(empty, { branch: `feature/${form.replace(/^https:\/\//, "")}` }), "session url");
+    }
+    expectRefused(scanWith(await collect({ "a.txt": `see ${CHATGPT}` })), "session url");
+    expectRefused(scanWith(await collect({ "a.txt": "clean" }, `see ${CHATGPT}`)), "session url");
+    expectRefused(scanWith(await collect({ "a.txt": "clean" }, "clean", { GIT_AUTHOR_NAME: "chatgpt.com/c/12345678-1234" })), "session url");
+  });
+
+  it("control: clean UTF-8 text with other Unicode passes", async () => {
+    const objects = await collect({ "docs/팀.md": "팀 문서 — 깨끗함\n" }, "팀 변경");
+    expect(scanWith(objects).allowed).toBe(true);
+  });
+});
+
+describe("#1161 r1 BP-03: the caps count every object and every byte, from metadata, before any payload is read", () => {
+  const DATES = { author: "2026-10-19T12:00:00+09:00", committer: "2026-10-19T12:00:00+09:00" };
+  const limits = (overrides: Partial<typeof DEFAULT_BRANCH_PUBLISH_LIMITS>) => ({ ...DEFAULT_BRANCH_PUBLISH_LIMITS, ...overrides });
+  /** The sizes git states for every object `base..head` sends, read independently of the collector. */
+  const stated = (path: string, base: string, head: string): Array<{ type: string; size: number }> => {
+    const ids = git(path, ["rev-list", "--objects", "--no-object-names", head, `^${base}`]);
+    return git(path, ["cat-file", "--batch-check"], {}, `${ids}\n`).split("\n").map((line) => {
+      const [, type, size] = line.split(" ");
+      return { type: type!, size: Number(size) };
+    });
+  };
+
+  it("pins the reported 26 MiB commit: refused under the default caps, and by the total alone when the per-object cap allows it", async () => {
+    const { path, base } = repository();
+    const tree = git(path, ["rev-parse", `${base}^{tree}`]);
+    const raw = `tree ${tree}\nparent ${base}\nauthor x <x@example.invalid> 1792378367 +0000\ncommitter x <x@example.invalid> 1792378367 +0000\n\n${"x".repeat(26 * 1024 * 1024)}\n`;
+    const head = git(path, ["hash-object", "-t", "commit", "-w", "--stdin"], {}, raw);
+    const byDefault = await collectBranchObjects(path, base, head, DEFAULT_BRANCH_PUBLISH_LIMITS);
+    expect(byDefault.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+    expect(byDefault.evidence).toMatchObject({ type: "commit" });
+    const byTotal = await collectBranchObjects(path, base, head, limits({ maxObjectBytes: 64 * 1024 * 1024 }));
+    expect(byTotal.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+    expect(byTotal.evidence).toMatchObject({ limit: DEFAULT_BRANCH_PUBLISH_LIMITS.maxTotalBytes });
+  });
+
+  it("pins the reported tree and commit-message bytes against a 1,024-byte total", async () => {
+    const { path, base } = repository();
+    const files = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`${i}-${"a".repeat(80)}`, "clean"]));
+    const treeHeavy = workerCommit(path, base, files, "clean", DATES);
+    expect(stated(path, base, treeHeavy).filter((object) => object.type === "tree").reduce((n, object) => n + object.size, 0)).toBeGreaterThan(1024);
+    expect((await collectBranchObjects(path, base, treeHeavy, limits({ maxTotalBytes: 1024 }))).reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+    const messageHeavy = workerCommit(path, base, { "b.txt": "clean" }, "x".repeat(2048), DATES);
+    expect((await collectBranchObjects(path, base, messageHeavy, limits({ maxTotalBytes: 1024 }))).reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+  });
+
+  it("every bound is exact: at the bound passes, one past it refuses (count, commits, largest object as commit and as tree, total, text)", async () => {
+    const { path, base } = repository();
+    const one = workerCommit(path, base, { "a.txt": "1\n" }, "one", DATES);
+    const head = workerCommit(path, one, { "dir/b.txt": "2\n" }, `two ${"m".repeat(600)}`, DATES);
+    const objects = stated(path, base, head);
+    const total = objects.reduce((n, object) => n + object.size, 0);
+    const largest = Math.max(...objects.map((object) => object.size));
+    expect(objects.find((object) => object.size === largest)?.type).toBe("commit");
+    const at = async (overrides: Partial<typeof DEFAULT_BRANCH_PUBLISH_LIMITS>) => collectBranchObjects(path, base, head, limits(overrides));
+    for (const [bound, value] of [["maxTotalBytes", total], ["maxObjectBytes", largest], ["maxObjects", objects.length], ["maxCommits", 2]] as const) {
+      const pass = await at({ [bound]: value });
+      expect(pass.allowed, `${bound} = ${value}`).toBe(true);
+      const refuse = await at({ [bound]: value - 1 });
+      expect(refuse.reasonCode, `${bound} = ${value - 1}`).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+    }
+    const full = await at({});
+    if (!full.allowed) throw new Error(full.message);
+    expect(full.value.bytes).toBe(total);
+    const scanned = scanPublication({ objects: full.value, branch: "feature/F1-x", pullRequestTitle: "title", pullRequestBody: "body", forbiddenPaths: [], limits: limits({ maxTextBytes: 5 }) });
+    expect(scanned.allowed && scanned.value.counts).toEqual({ commits: 2, trees: objects.filter((o) => o.type === "tree").length, blobs: objects.filter((o) => o.type === "blob").length, bytes: total });
+    const overText = scanPublication({ objects: full.value, branch: "feature/F1-x", pullRequestTitle: "title", pullRequestBody: "body", forbiddenPaths: [], limits: limits({ maxTextBytes: 4 }) });
+    expect(overText.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+
+    const { path: treePath, base: treeBase } = repository();
+    const wide = workerCommit(treePath, treeBase, Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`${i}-${"t".repeat(60)}`, "x"])), "w", DATES);
+    const wideObjects = stated(treePath, treeBase, wide);
+    const widest = Math.max(...wideObjects.map((object) => object.size));
+    expect(wideObjects.find((object) => object.size === widest)?.type).toBe("tree");
+    expect((await collectBranchObjects(treePath, treeBase, wide, limits({ maxObjectBytes: widest }))).allowed).toBe(true);
+    const tooWide = await collectBranchObjects(treePath, treeBase, wide, limits({ maxObjectBytes: widest - 1 }));
+    expect(tooWide.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+    expect(tooWide.evidence).toMatchObject({ type: "tree" });
+  });
+});
+
+/**
+ * #1161 r1 — the reviewer's object probes (pr1161-reviewer-probes-round1/object-probes.test.ts), ported: the
+ * same cases and assertions, with only the logging dropped and names prefixed. The unmodified file is replayed
+ * separately (evidence r3/replay-*).
+ */
+describe("#1161 r1 reviewer object probes, ported", () => {
+  const reviewForbidden = "/private/팀/checkouts";
+  const reviewInspect = (objects: BranchObjects) => scanPublication({objects, branch: "feature/F1-test", pullRequestTitle: "t", pullRequestBody: "b", forbiddenPaths: [reviewForbidden], limits: DEFAULT_BRANCH_PUBLISH_LIMITS});
+  for (const site of ["blob", "message"]) {
+    it(`review: refuses a literal registered Unicode path in ${site}`, async () => {
+      const {path, base} = repository();
+      const head = workerCommit(path, base, {"a.txt": site === "blob" ? `${reviewForbidden}/private.txt` : "clean"}, site === "message" ? `work at ${reviewForbidden}` : "clean", {author: "2026-10-19T12:00:00+09:00", committer: "2026-10-19T12:00:00+09:00"});
+      const collected = await collectBranchObjects(path, base, head, DEFAULT_BRANCH_PUBLISH_LIMITS);
+      if (!collected.allowed) throw new Error(collected.message);
+      const result = reviewInspect(collected.value);
+      expect(result.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+    });
+  }
+  it("review: refuses a home-state path composed of tree path components", async () => {
+    const {path, base} = repository();
+    const head = workerCommit(path, base, {"~/.hermes/state": "clean"}, "clean", {author: "2026-10-19T12:00:00+09:00", committer: "2026-10-19T12:00:00+09:00"});
+    const collected = await collectBranchObjects(path, base, head, DEFAULT_BRANCH_PUBLISH_LIMITS);
+    if (!collected.allowed) throw new Error(collected.message);
+    const result = reviewInspect(collected.value);
+    expect(result.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+  });
+  it("review: refuses a ChatGPT session URL in the PR body", () => {
+    const result = scanPublication({objects: {commits: [], trees: [], blobs: [], changedPaths: [], candidateTree: "", bytes: 0}, branch: "feature/F1-test", pullRequestTitle: "t", pullRequestBody: "https://chatgpt.com/c/12345678-1234-5678-1234-123456789012", forbiddenPaths: [], limits: DEFAULT_BRANCH_PUBLISH_LIMITS});
+    expect(result.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_CONTENT_REFUSED);
+  });
+
+  it("review: total upload cap includes commit message bytes", async () => {
+    const {path, base} = repository();
+    const head = workerCommit(path, base, {"a.txt": "clean"}, "x".repeat(2048), {author: "2026-10-19T12:00:00+09:00", committer: "2026-10-19T12:00:00+09:00"});
+    const result = await collectBranchObjects(path, base, head, {...DEFAULT_BRANCH_PUBLISH_LIMITS, maxTotalBytes: 1024});
+    expect(result.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+  });
+
+  it("review: default total cap also refuses a 26 MiB commit object", async () => {
+    const {path, base} = repository();
+    const tree = git(path, ["rev-parse", `${base}^{tree}`]);
+    const raw = `tree ${tree}\nparent ${base}\nauthor x <x@example.invalid> 1792378367 +0000\ncommitter x <x@example.invalid> 1792378367 +0000\n\n${"x".repeat(26*1024*1024)}\n`;
+    const head = git(path, ["hash-object", "-t", "commit", "-w", "--stdin"], {}, raw);
+    const result = await collectBranchObjects(path, base, head, DEFAULT_BRANCH_PUBLISH_LIMITS);
+    expect(result.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+  });
+  it("review: total upload cap includes tree bytes", async () => {
+    const {path, base} = repository();
+    const files = Object.fromEntries(Array.from({length: 20}, (_,i)=>[`${i}-${"a".repeat(80)}`, "clean"]));
+    const head = workerCommit(path, base, files, "clean", {author: "2026-10-19T12:00:00+09:00", committer: "2026-10-19T12:00:00+09:00"});
+    const result = await collectBranchObjects(path, base, head, {...DEFAULT_BRANCH_PUBLISH_LIMITS, maxTotalBytes: 1024});
+    const bytes = result.allowed ? result.value.trees.reduce((n,t)=>n+execFileSync("git", ["-C", path, "cat-file", "tree", t.sha], {timeout: 30_000}).length, 0) : null;
+    void bytes; // the original probe logged it
+    expect(result.reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED);
+  });
+  it("review control: rejects unrepresentable encoding, mergetag and extra commit headers", () => {
+    for (const extra of ["encoding ISO-8859-1", "mergetag object "+"a".repeat(40), "x-private unknown"]) {
+      const raw = Buffer.from(`tree ${"a".repeat(40)}\nauthor x <x@example.invalid> 1792378367 +0000\ncommitter x <x@example.invalid> 1792378367 +0000\n${extra}\n\nclean\n`);
+      expect(parseCommitObject("b".repeat(40), raw).reasonCode).toBe(ReasonCode.BRANCH_PUBLISH_UNSUPPORTED);
+    }
+  });
+  it("review control: a two-parent merge reproduces all local object IDs", async () => {
+    const {path, base} = repository();
+    const dates={author: "2026-10-19T12:00:00+09:00", committer: "2026-10-19T03:00:00+00:00"};
+    const one=workerCommit(path, base, {"one": "one"}, "one", dates);
+    const two=workerCommit(path, base, {"two": "two"}, "two", dates);
+    const tree=git(path, ["rev-parse", `${two}^{tree}`]);
+    const head=git(path, ["commit-tree", tree, "-p", one, "-p", two, "-m", "merge"], {GIT_AUTHOR_DATE: dates.author, GIT_COMMITTER_DATE: dates.committer});
+    const result=await collectBranchObjects(path, base, head, DEFAULT_BRANCH_PUBLISH_LIMITS);
+    if(!result.allowed) throw new Error(result.message);
+    expect(result.value.commits.at(-1)!.fields.parents).toEqual([one,two]);
+    const remote=new GitDataGitHub(bareRemoteAt(join(tempDir("acp-review-merge-"), "remote.git"), path, "dev", base));
+    const answers=await sendThrough(remote,result.value);
+    expect(answers.length).toBeGreaterThan(0);
+    for(const answer of answers) expect(answer.answered).toBe(answer.local);
   });
 });

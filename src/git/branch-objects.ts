@@ -20,21 +20,27 @@ import { ReasonCode } from "../core/reason-codes.ts";
  * Everything here is local and read-only. Nothing in this file sends a request.
  */
 
-/** Bounds on one publication. A candidate past any of them is refused, never truncated. */
+/**
+ * Bounds on one publication. A candidate past any of them is refused, never truncated. Every bound is
+ * inclusive (a value equal to it passes, one past it refuses) and is checked from `git cat-file
+ * --batch-check` metadata, before any object payload is read or uploaded.
+ */
 export interface BranchPublishLimits {
   maxCommits: number;
-  /** Commits, trees and blobs together. */
+  /** Every object sent, commits, trees and blobs together. */
   maxObjects: number;
-  maxBlobBytes: number;
+  /** The largest single object sent, of any type: a commit, a tree or a blob. */
+  maxObjectBytes: number;
+  /** The bytes of every object sent, commits, trees and blobs together. */
   maxTotalBytes: number;
-  /** The pull request title and body that follow the publication. */
+  /** The pull request title and body that follow the publication, each. */
   maxTextBytes: number;
 }
 
 export const DEFAULT_BRANCH_PUBLISH_LIMITS: BranchPublishLimits = Object.freeze({
   maxCommits: 100,
   maxObjects: 2_000,
-  maxBlobBytes: 5 * 1024 * 1024,
+  maxObjectBytes: 5 * 1024 * 1024,
   maxTotalBytes: 25 * 1024 * 1024,
   maxTextBytes: 64 * 1024,
 });
@@ -91,6 +97,8 @@ export interface BranchObjects {
   /** Every path any sent commit changes against any of its parents (`--root` for a root commit). */
   changedPaths: string[];
   candidateTree: string;
+  /** The bytes of every object sent (commits, trees and blobs), as the bounded metadata stated them. */
+  bytes: number;
 }
 
 
@@ -322,8 +330,15 @@ export const parseTreeObject = (sha: string, raw: Buffer): Decision<TreeApiEntry
   return allow(ReasonCode.OK, entries);
 };
 
-/** `git cat-file --batch` over `ids`: each object's type and bytes. */
-const readObjects = async (cwd: string, ids: readonly string[]): Promise<Map<string, { type: string; content: Buffer }>> => {
+/**
+ * `git cat-file --batch` over `ids`: each object's type and bytes. Each object must be the type and size the
+ * bounded metadata stated, so what was capped is what is read.
+ */
+const readObjects = async (
+  cwd: string,
+  ids: readonly string[],
+  stated: ReadonlyMap<string, { type: string; size: number }>,
+): Promise<Map<string, { type: string; content: Buffer }>> => {
   const out = new Map<string, { type: string; content: Buffer }>();
   if (ids.length === 0) return out;
   const { stdout } = await gitBytes(cwd, ["cat-file", "--batch"], { input: Buffer.from(`${ids.join("\n")}\n`, "latin1") });
@@ -336,6 +351,10 @@ const readObjects = async (cwd: string, ids: readonly string[]): Promise<Map<str
     const size = Number(header[2]);
     const content = stdout.subarray(lineEnd + 1, lineEnd + 1 + size);
     if (content.length !== size) throw new Error("cat-file --batch answer ended inside an object");
+    const expected = stated.get(header[0]!);
+    if (expected === undefined || expected.type !== header[1] || expected.size !== size) {
+      throw new Error(`object ${header[0]!} is not the type and size its metadata stated`);
+    }
     out.set(header[0]!, { type: header[1]!, content });
     at = lineEnd + 1 + size + 1;
   }
@@ -374,38 +393,45 @@ export const collectBranchObjects = async (
   const checked = lines((await gitBytes(checkoutPath, ["cat-file", "--batch-check"], {
     input: Buffer.from(`${allIds.join("\n")}\n`, "latin1"),
   })).stdout).map((line) => line.split(" "));
+  // #1161 BP-03 — every object counts, commits and trees as well as blobs: each against the per-object
+  // bound and all of them against the total, from this metadata alone, before any payload is read.
   const blobIds: string[] = [];
   const treeIds: string[] = [];
+  const stated = new Map<string, { type: string; size: number }>();
   let totalBytes = 0;
   for (const [id, type, size] of checked) {
-    if (type === "blob") {
-      const bytes = Number(size);
-      if (bytes > limits.maxBlobBytes) {
-        return deny(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED, "a blob is larger than one publication may send", {
-          blob: id,
-          bytes,
-          limit: limits.maxBlobBytes,
-        });
-      }
-      totalBytes += bytes;
-      blobIds.push(id!);
-    } else if (type === "tree") {
-      treeIds.push(id!);
-    } else if (type !== "commit") {
+    if (type !== "blob" && type !== "tree" && type !== "commit") {
       return deny(ReasonCode.BRANCH_PUBLISH_UNSUPPORTED, "candidate reaches an object the publication cannot send", {
         object: id ?? null,
         type: type ?? null,
       });
     }
+    const bytes = Number(size);
+    if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error(`object ${id ?? "?"} has no readable size`);
+    if (bytes > limits.maxObjectBytes) {
+      return deny(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED, `a ${type} is larger than one publication may send`, {
+        object: id,
+        type,
+        bytes,
+        limit: limits.maxObjectBytes,
+      });
+    }
+    totalBytes += bytes;
+    if (totalBytes > limits.maxTotalBytes) {
+      return deny(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED, "candidate objects exceed the bytes one publication may send", {
+        bytesAtLeast: totalBytes,
+        limit: limits.maxTotalBytes,
+      });
+    }
+    stated.set(id!, { type, size: bytes });
+    if (type === "blob") blobIds.push(id!);
+    else if (type === "tree") treeIds.push(id!);
   }
-  if (totalBytes > limits.maxTotalBytes) {
-    return deny(ReasonCode.BRANCH_PUBLISH_LIMIT_EXCEEDED, "candidate blobs exceed what one publication may send", {
-      bytes: totalBytes,
-      limit: limits.maxTotalBytes,
-    });
+  if (stated.size !== allIds.length || commitIds.some((id) => stated.get(id)?.type !== "commit")) {
+    throw new Error("the object metadata does not describe exactly the objects the publication sends");
   }
 
-  const objects = await readObjects(checkoutPath, [...commitIds, ...treeIds, ...blobIds]);
+  const objects = await readObjects(checkoutPath, [...commitIds, ...treeIds, ...blobIds], stated);
   const sent = new Set(commitIds);
   const commits: LocalCommit[] = [];
   for (const id of commitIds) {
@@ -474,5 +500,5 @@ export const collectBranchObjects = async (
       candidateHead,
     });
   }
-  return allow(ReasonCode.OK, { commits, trees, blobs, changedPaths: [...changed].sort(), candidateTree });
+  return allow(ReasonCode.OK, { commits, trees, blobs, changedPaths: [...changed].sort(), candidateTree, bytes: totalBytes });
 };

@@ -237,6 +237,8 @@ export interface BranchPublishResult {
 type BranchRefObservation =
   | { kind: "at"; sha: string }
   | { kind: "missing" }
+  /** #1161 BP-02 — an answer that is not exactly the ref asked for: another name, another type, no commit id. */
+  | { kind: "contradicts"; observed: { ref: unknown; type: unknown; sha: unknown } }
   | { kind: "unknown"; outcome: TransportOutcome; status?: number };
 
 /** One publication attempt's local facts, shared by the fresh and the reconciling path. */
@@ -960,7 +962,7 @@ export class GitHubKernel {
       if (this.inFlightReservations.has(delivery.idempotencyKey)) {
         return deny(ReasonCode.RESOURCE_COLLISION, "branch publication is in flight", { idempotencyKey: delivery.idempotencyKey });
       }
-      const observed = await this.readBranchRef(delivery.refPath);
+      const observed = await this.readBranchRef(delivery.refPath, delivery.ref);
       if (observed.kind === "unknown") {
         return deny(ReasonCode.PROBE_FAILED, "the branch ref could not be read to reconcile its publication", {
           idempotencyKey: delivery.idempotencyKey,
@@ -968,6 +970,7 @@ export class GitHubKernel {
           ...(observed.status === undefined ? {} : { status: observed.status }),
         });
       }
+      if (observed.kind === "contradicts") return this.refContradiction(delivery, "reconciliation readback", observed);
       if (observed.kind === "at" && observed.sha === delivery.candidateHead) {
         if (existing.verified !== 1) {
           // The ref is the candidate: an answer was lost, or the same commit was pushed by anyone. No resend.
@@ -1004,7 +1007,8 @@ export class GitHubKernel {
     if (!finalizationAgain.allowed) return finalizationAgain as Published;
     const base = await this.assertRemoteBase(delivery);
     if (!base.allowed) return base as Published;
-    const head = await this.readBranchRef(delivery.refPath);
+    const head = await this.readBranchRef(delivery.refPath, delivery.ref);
+    if (head.kind === "contradicts") return this.refContradiction(delivery, "branch read before publication", head);
     if (head.kind === "unknown") {
       return deny(ReasonCode.PROBE_FAILED, "the branch ref could not be read before publication", {
         repositoryIdentity: input.repositoryIdentity,
@@ -1135,23 +1139,39 @@ export class GitHubKernel {
         caller,
         async () => {
           try {
-            await this.api().request<unknown>(
+            const answer = await this.api().request<unknown>(
               "POST",
               `/repos/${owner}/${repo}/git/refs`,
               { ref: delivery.ref, sha: delivery.candidateHead },
               { beforeDispatch: dispatch.beforeDispatch },
             );
-            return { refused: null, outcome: null as ReturnType<typeof transportOutcome> | null };
+            return { refused: null, outcome: null as ReturnType<typeof transportOutcome> | null, answer };
           } catch (error) {
-            return { refused: dispatch.refused(), outcome: transportOutcome(error) };
+            return { refused: dispatch.refused(), outcome: transportOutcome(error), answer: undefined as unknown };
           }
         },
       );
       if (!created.allowed) return created as Published;
       if (created.value.refused) return created.value.refused as Published;
+      if (created.value.outcome === null) {
+        // #1161 BP-02 — the create answered: it must name exactly this ref, a commit, at the candidate. Any other
+        // answer leaves the remote uncertain, so nothing is recorded APPLIED here and the receipt stays PENDING;
+        // the reconciliation path settles it later by reading only the exact target ref.
+        const answered = this.refAnswer(created.value.answer, delivery.ref);
+        if (answered.kind !== "at" || answered.sha !== delivery.candidateHead) {
+          return this.refContradiction(
+            delivery,
+            "ref create answer",
+            answered.kind === "contradicts"
+              ? answered
+              : { kind: "contradicts", observed: { ref: delivery.ref, type: "commit", sha: answered.sha } },
+          );
+        }
+      }
 
       // A created ref, a 422 "Reference already exists", an answered failure and silence: one readback decides.
-      const observed = await this.readBranchRef(delivery.refPath);
+      const observed = await this.readBranchRef(delivery.refPath, delivery.ref);
+      if (observed.kind === "contradicts") return this.refContradiction(delivery, "readback after the create", observed);
       if (observed.kind === "at" && observed.sha === delivery.candidateHead) {
         const finalized = this.finalizeReservedReceipt({
           idempotencyKey,
@@ -1292,8 +1312,9 @@ export class GitHubKernel {
 
   /** The remote base ref must stand at the frozen base SHA; a moved or unread base sends nothing. */
   private async assertRemoteBase(delivery: BranchDelivery): Promise<Decision<void>> {
-    const base = await this.readBranchRef(delivery.baseRefPath);
+    const base = await this.readBranchRef(delivery.baseRefPath, `refs/heads/${delivery.input.baseBranch}`);
     if (base.kind === "at" && base.sha === delivery.baseHead) return allow(ReasonCode.OK, undefined);
+    if (base.kind === "contradicts") return this.refContradiction(delivery, "base ref read", base);
     if (base.kind === "unknown") {
       return deny(ReasonCode.PROBE_FAILED, "the remote base ref could not be read before publication", {
         baseBranch: delivery.input.baseBranch,
@@ -1309,8 +1330,51 @@ export class GitHubKernel {
     });
   }
 
-  /** GitHub's exact-ref read: the commit it names, an answered 404, or nothing a decision may rest on. */
-  private async readBranchRef(path: string): Promise<BranchRefObservation> {
+  /**
+   * #1161 BP-02 — a ref answer that is not exactly the ref asked for refuses. Nothing is recorded APPLIED
+   * and no ref is written; a PENDING receipt stays for the reconciliation path, which reads only the exact
+   * target. Another branch at the same commit never stands in for the intended one.
+   */
+  private refContradiction(
+    delivery: BranchDelivery,
+    where: string,
+    observation: { kind: "contradicts"; observed: { ref: unknown; type: unknown; sha: unknown } },
+  ): Decision<never> {
+    const text = (value: unknown): string | null => typeof value === "string" ? value.slice(0, 200) : null;
+    return deny(ReasonCode.BRANCH_PUBLISH_OBJECT_MISMATCH, `GitHub's ${where} is not exactly the ref asked for; nothing is recorded applied`, {
+      idempotencyKey: delivery.idempotencyKey,
+      expected: { ref: delivery.ref, type: "commit", sha: delivery.candidateHead },
+      observed: {
+        ref: text(observation.observed.ref),
+        type: text(observation.observed.type),
+        sha: text(observation.observed.sha),
+      },
+    });
+  }
+
+  /** An answer that names a ref: exactly `expectedRef`, an object of type commit, a full commit id. */
+  private refAnswer(answer: unknown, expectedRef: string): { kind: "at"; sha: string } | { kind: "contradicts"; observed: { ref: unknown; type: unknown; sha: unknown } } {
+    const body = answer !== null && typeof answer === "object" && !Array.isArray(answer)
+      ? answer as { ref?: unknown; object?: { sha?: unknown; type?: unknown } | null }
+      : null;
+    const observed = { ref: body?.ref, type: body?.object?.type, sha: body?.object?.sha };
+    if (
+      body === null ||
+      observed.ref !== expectedRef ||
+      observed.type !== "commit" ||
+      typeof observed.sha !== "string" ||
+      !/^[0-9a-f]{40}$/.test(observed.sha)
+    ) {
+      return { kind: "contradicts", observed };
+    }
+    return { kind: "at", sha: observed.sha };
+  }
+
+  /**
+   * GitHub's exact-ref read: the commit it names, an answered 404, an answer that is not exactly `expectedRef`
+   * (#1161 BP-02: another name, another type or no commit id contradicts it), or nothing a decision may rest on.
+   */
+  private async readBranchRef(path: string, expectedRef: string): Promise<BranchRefObservation> {
     let answer: unknown;
     try {
       answer = await this.api().request<unknown>("GET", path);
@@ -1319,12 +1383,7 @@ export class GitHubKernel {
       if (outcome.outcome === "answered" && outcome.status === 404) return { kind: "missing" };
       return { kind: "unknown", ...outcome };
     }
-    const object = (answer as { object?: { sha?: unknown; type?: unknown } } | null)?.object;
-    if (Array.isArray(answer) || typeof object?.sha !== "string" || !/^[0-9a-f]{40}$/.test(object.sha)) {
-      return { kind: "unknown", outcome: "answered" };
-    }
-    if (object.type !== undefined && object.type !== "commit") return { kind: "unknown", outcome: "answered" };
-    return { kind: "at", sha: object.sha };
+    return this.refAnswer(answer, expectedRef);
   }
 
   /** A branch name as a ref path: each component escaped, the separators kept. */
