@@ -1,0 +1,24 @@
+Limit: only STANDARD_WORK runs are released, so a bootstrap run held for the CEO stays BLOCKED; hold facts are read from audit_events, which a same-uid raw SQLite writer could forge; a run whose owner or worker binding changed after the pause stays held
+Warn: S-HOLD: a STANDARD_WORK run BLOCKED under continuity's own hold is released (BLOCKED->ACTIVE, one RUN_TRANSITION, hold cleared) only when its latest transition is that very pause, the held role has an ACTIVE READY binding again, the owner pin is still the project PRIMARY_CTO's ACTIVE READY binding, and nothing moved under the hold; ownership never moves to the CEO, and the release adds nothing to the outbox, so the existing STANDARD_WORK continuation wake advances it
+Record-Id: r-34948fc8e72c
+Provenance: inherited 729f92b88b6a04047aff5e332d0bc884501b23b1
+
+Limit: a task or artifact write in the same millisecond as the pause keeps the run held (fail-closed); an appender who forges both a return to ACTIVE and a new pause looks like a new real pause, because no schema link ties a pause audit row to the state write; task_worker_run records a write target before refusing a non-ACTIVE run (worker-turn.ts ensureWriteTarget before the state check), which this slice does not change
+Warn: #1162 r1: the hold's episode is the EARLIEST continuity pause after the run last entered ACTIVE, chosen by event id, so a pause copy appended later through AuditLog.record cannot replace it; any audit record of the run after that pause, and any task, execution, artifact or candidate attempt written at or after the pause's time (>=, fail-closed) or still RUNNING, keeps the hold
+Record-Id: r-d8fca0990bf0
+Provenance: inherited 2c0e0c3e9819fccdc91978400ad492fa2b4ea0aa
+
+Limit: a legacy pause with no digest (run_ab77268b, paused before this code) falls back to the timestamp rule: no row written at or after the pause time; forging a return to ACTIVE plus a pause copy with the digest stripped through the in-process AuditLog.record still releases a changed run, accepted as a Limit (CEO 3b9d8289) because no MCP path writes continuity_hold_role_key, RUN_TRANSITION or PAUSE_NEW_WORK
+Warn: #1162 r2: movement under a continuity hold is an allowlisted run-mutating audit kind after the pause (by event id) or a mismatch of holdSnapshotDigest, which pauseForContinuity records in the pause evidence over the candidate, tasks (id, state, attempts, spec digest, updated_at), executions, artifacts and candidate attempts; refusals and diagnostics such as OUTBOX_ACK_REJECTED never keep the hold, and an unchanged run is released even when every write shares the pause's millisecond
+Record-Id: r-9bb93bf0be36
+Provenance: inherited e3c29afe54346b31a307237cfc4436797aa322fb
+
+Limit: kinds not individually read stay classified as movement by default, which keeps a hold rather than releasing it; a branch-creation attempt that never resolves keeps its run held until an operator clears it
+Warn: #1162 r3: run-mutating audit kinds are classified by their recorded effect per emission site; kinds that only record a refusal, deferral or ignored input are not movement, MANAGED_WRITE_GUARD and PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP count only when applied, an unreadable outcome counts as movement, and every S-TB branch record (TASK_BRANCH_CREATING, TASK_BRANCH_CREATED, TASK_BRANCH_CREATION_UNDONE) is movement; the release also refuses while a branch-creation intent has neither a completion nor a verified undo
+Record-Id: r-7dd3145469d4
+Provenance: inherited daec824118523ea7f26ddba0f1a4363e105fda04
+
+Limit: a run with an unresolved branch-creation attempt stays held, and there is no operator tool to clear that attempt yet; it is never to be cleared by editing the database by hand
+Warn: the continuity-hold release runs from its movement and unresolved-intent checks through the conditional BLOCKED->ACTIVE UPDATE inside one BEGIN IMMEDIATE transaction that guardSync keeps synchronous; every refusal names its cause (the audit kind and event id after the pause, or the unresolved branch attempt id and its intent event)
+Record-Id: r-b0760ba1e730
+Provenance: inherited f5220852828e05eb324136428447b7037f7437fa
