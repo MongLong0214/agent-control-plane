@@ -43,6 +43,9 @@ afterEach(() => vi.restoreAllMocks());
  *   owner, a holder this runtime does not drive or hold, a run under review, CEO wait, hold, or
  *   cancelled, is never woken.
  *
+ * The canonical live target is #512: run_ab77268bab3d4ff482f7348e, left after its PLAN at task_e959ee8b
+ * READY with no worker.
+ *
  * Over the real sockets, launch channel and in-band wake; only the model is scripted, and its work
  * turn does what its prompt says. Where a row needs a worker to run, the control plane's worker
  * runtime is stood in for by real task records (a WORKER binding, an execution and its receipt).
@@ -322,6 +325,38 @@ const startDaemon = async (f: BootstrapRuntimeFixture, name: string): Promise<Da
 
 const nothing = { woken: [], stalled: [] };
 
+/**
+ * The owner's binding generation moves from 1 to `generation` on the same driven session, with the
+ * run's pin and its acknowledged RUN_DISPATCH at the new generation, as a takeover repoint or a
+ * renewal followed by a RUN_DISPATCH the owner acknowledged would leave them. A driven PRIMARY_CTO
+ * has no same-session renewal a test can drive, so the reads the continuation makes are moved
+ * instead, and only those: the run's pin, the role's ACTIVE binding, the owner fence, and the
+ * RUN_DISPATCH it looks up for the pinned generation. Everything else (the session, its driven
+ * record, the runtime's custody and lane, the tasks and the audit trail) is the real one.
+ */
+const moveOwnerGeneration = (f: BootstrapRuntimeFixture, runId: string, roleKey: string, generation: number): void => {
+  const cp = f.harness.cp;
+  const realRun = cp.runs.get.bind(cp.runs);
+  vi.spyOn(cp.runs, "get").mockImplementation((id) => {
+    const run = realRun(id);
+    return run && id === runId ? { ...run, ownerBindingGeneration: generation } : run;
+  });
+  const realActive = cp.bindings.active.bind(cp.bindings);
+  vi.spyOn(cp.bindings, "active").mockImplementation((key) => {
+    const binding = realActive(key);
+    return binding && key === roleKey ? { ...binding, bindingGeneration: generation } : binding;
+  });
+  const realAssertOwner = cp.runs.assertOwner.bind(cp.runs);
+  vi.spyOn(cp.runs, "assertOwner").mockImplementation((id, sessionId, bindingGeneration) =>
+    id === runId && bindingGeneration === generation ? allow(ReasonCode.OK, realRun(id)!) : realAssertOwner(id, sessionId, bindingGeneration));
+  const realGet = cp.db.get.bind(cp.db);
+  vi.spyOn(cp.db, "get").mockImplementation(((sql: string, params: unknown[] = []) =>
+    realGet(
+      sql,
+      /kind = 'RUN_DISPATCH'/.test(sql) && params[0] === runId && params[1] === generation ? [runId, 1, ...params.slice(2)] : params,
+    )) as typeof cp.db.get);
+};
+
 describe("witness 1 — the driven work prompt carries a STANDARD_WORK run past its PLAN", () => {
   it("a STANDARD_WORK RUN_DISPATCH's turn staffs, claims, runs and reads its READY task, then submits the result, before run_ack", async () => {
     await withBootstrapRuntime(async (f) => {
@@ -405,7 +440,7 @@ describe("witness 2 — a run stopped after its PLAN is woken once for the same 
       expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
       await ticks(50);
       expect(f.finishedTurns(sessionId)).toBe(turns + 1);
-      const triggerId = standardWorkContinuationTriggerId(runId, 1, taskId, TaskState.READY);
+      const triggerId = standardWorkContinuationTriggerId(runId, taskId, TaskState.READY);
       expect(markers(f, STANDARD_WORK_CONTINUATION_WAKE, runId)).toEqual([
         { bindingGeneration: 1, taskId, taskState: TaskState.READY, messageId: dispatch.messageId, triggerId },
       ]);
@@ -470,6 +505,85 @@ describe("witness 2 — a run stopped after its PLAN is woken once for the same 
       expect(markers(f, STANDARD_WORK_CONTINUATION_STALLED, runId)).toEqual([]);
       expect(standIn.provision).toHaveBeenCalledTimes(1);
       expect(f.finishedTurns(sessionId)).toBe(turns + 1);
+    });
+  });
+});
+
+describe("CEO 0d55e1de — a change of the owner's binding generation is not progress", () => {
+  it("the same READY state after a generation change: no second wake, and its one blocker is recorded instead", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, sessionId, roleKey, taskId } = await stalledAfterPlan(f, "std-gen-wake", "ignore");
+      const turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation().woken).toEqual([expect.objectContaining({ bindingGeneration: 1, taskId })]);
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(sessionId)).toBe(false), { timeout: 10_000, interval: 25 });
+      moveOwnerGeneration(f, runId, roleKey, 2);
+      // The control: the owner at generation 2 is a valid continuation target in every other respect.
+      expect(f.harness.cp.runs.require(runId).ownerBindingGeneration).toBe(2);
+      expect(f.harness.cp.sessionRuntime.drivesSession(sessionId, Role.PRIMARY_CTO)).toBe(true);
+      const report = f.daemon.wakeStandardWorkContinuation();
+      expect(report.woken).toEqual([]);
+      expect(report.stalled).toEqual([{ runId, roleKey, bindingGeneration: 2, taskId, taskState: TaskState.READY }]);
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
+      await ticks(50);
+      expect(f.finishedTurns(sessionId)).toBe(turns + 1);
+      expect(markers(f, STANDARD_WORK_CONTINUATION_WAKE, runId)).toEqual([expect.objectContaining({ bindingGeneration: 1, taskId })]);
+      expect(markers(f, STANDARD_WORK_CONTINUATION_STALLED, runId)).toEqual([expect.objectContaining({ bindingGeneration: 2, taskId })]);
+    });
+  });
+
+  it("after the blocker, a later generation change: no wake and no second blocker, at generation 2 or 3", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, sessionId, roleKey, taskId } = await stalledAfterPlan(f, "std-gen-stalled", "ignore");
+      const turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation().woken).toHaveLength(1);
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(sessionId)).toBe(false), { timeout: 10_000, interval: 25 });
+      expect(f.daemon.wakeStandardWorkContinuation().stalled).toHaveLength(1);
+      for (const generation of [2, 3]) {
+        vi.restoreAllMocks();
+        moveOwnerGeneration(f, runId, roleKey, generation);
+        expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
+        expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
+      }
+      await ticks(50);
+      expect(f.finishedTurns(sessionId)).toBe(turns + 1);
+      expect(markers(f, STANDARD_WORK_CONTINUATION_WAKE, runId)).toEqual([expect.objectContaining({ bindingGeneration: 1, taskId })]);
+      expect(markers(f, STANDARD_WORK_CONTINUATION_STALLED, runId)).toEqual([expect.objectContaining({ bindingGeneration: 1, taskId })]);
+    });
+  });
+
+  it("real progress still earns exactly one wake for the new state, and a generation change after it earns none", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const { runId, sessionId, roleKey, taskId } = await stalledAfterPlan(f, "std-gen-progress", "ignore");
+      // A second task of the run, READY behind the first.
+      const second = cp.tasks.submit(runId, [{ key: "notes", title: "update the release notes", category: "docs" }]);
+      if (!second.allowed) throw new Error(second.message);
+      const nextTaskId = second.value[0]!.taskId;
+      let turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation().woken).toEqual([expect.objectContaining({ taskId })]);
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await vi.waitFor(() => expect(cp.sessionRuntime.turnInProgress(sessionId)).toBe(false), { timeout: 10_000, interval: 25 });
+      expect(f.daemon.wakeStandardWorkContinuation().stalled).toEqual([expect.objectContaining({ taskId })]);
+      // Progress: the first task is staffed and executed, so the second is the run's state now.
+      const workerSessionId = bindWorkerForTask(cp, taskId, { provider: "claude", model: "opus" });
+      const opened = cp.tasks.startExecution({ runId, taskId, ownerBindingGeneration: 1, workerSessionId, provider: "claude", model: "opus" });
+      if (!opened.allowed) throw new Error(opened.message);
+      const closed = cp.tasks.finishExecution(opened.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:first" }, runId);
+      if (!closed.allowed) throw new Error(closed.message);
+      turns = f.finishedTurns(sessionId);
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual({
+        woken: [{ runId, roleKey, bindingGeneration: 1, taskId: nextTaskId, taskState: TaskState.READY }],
+        stalled: [],
+      });
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await vi.waitFor(() => expect(cp.sessionRuntime.turnInProgress(sessionId)).toBe(false), { timeout: 10_000, interval: 25 });
+      moveOwnerGeneration(f, runId, roleKey, 2);
+      expect(f.daemon.wakeStandardWorkContinuation().woken).toEqual([]);
+      expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
+      expect(f.finishedTurns(sessionId)).toBe(turns + 1);
+      expect(markers(f, STANDARD_WORK_CONTINUATION_WAKE, runId).map((evidence) => evidence["taskId"])).toEqual([taskId, nextTaskId]);
     });
   });
 });

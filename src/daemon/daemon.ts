@@ -2777,8 +2777,8 @@ export class Daemon {
    * the bootstrap recovery wakes, and built as they are. A driven PRIMARY_CTO is woken only by what is
    * addressed to it, so one whose turn got its STANDARD_WORK run's PLAN accepted, acknowledged the
    * RUN_DISPATCH and started nothing would never run again: its task stays READY with no worker. Its
-   * owner is woken once more, and exactly once per (run, owner binding generation, task, task state),
-   * when all of these hold:
+   * owner is woken once more, and exactly once per (run, task, task state) whatever the owner's binding
+   * generation, when all of these hold:
    *
    * - the run's state is the one `#standardWorkContinuation` describes: ACTIVE, STANDARD_WORK, with a
    *   PLAN, no hold, nothing running, its first READY task unstarted, its exact pinned driven owner
@@ -2794,8 +2794,10 @@ export class Daemon {
    * runtime's final check before the provider call. A tuple already woken is not woken again: once
    * no turn of its owner is running or queued and the run is still in that same state, the woken turn
    * made no progress, and the pass records one `STANDARD_WORK_CONTINUATION_STALLED` blocker for the
-   * tuple and nothing more. Only progress (the task staffed or run) or a renewed owner generation
-   * names a new tuple.
+   * tuple and nothing more. Only progress names a new tuple: another task READY and unstarted once
+   * this one moved on. A change of the owner's binding generation is not progress (CEO 0d55e1de): the
+   * marker, the blocker and the trigger id leave it out, and both audit events carry it as evidence
+   * only.
    */
   wakeStandardWorkContinuation(): StandardWorkContinuationReport {
     const report: StandardWorkContinuationReport = { woken: [], stalled: [] };
@@ -2818,15 +2820,15 @@ export class Daemon {
       // A turn of the owner running or queued may be the one making progress: nothing is decided now.
       if (state === null || runtime.turnInProgress(owner.sessionId)) continue;
       const tuple = { runId, roleKey: owner.roleKey, bindingGeneration: owner.bindingGeneration, ...state };
+      // Keyed on (run, task, task state) alone: a renewed owner generation finds the same marker.
       const marked = (kind: string): boolean =>
         Boolean(this.cp.db.get<{ n: number }>(
           `SELECT 1 AS n FROM audit_events
             WHERE kind = ? AND run_id = ?
-              AND json_extract(evidence_json, '$.bindingGeneration') = ?
               AND json_extract(evidence_json, '$.taskId') = ?
               AND json_extract(evidence_json, '$.taskState') = ?
             LIMIT 1`,
-          [kind, runId, tuple.bindingGeneration, tuple.taskId, tuple.taskState],
+          [kind, runId, tuple.taskId, tuple.taskState],
         ));
       if (marked(STANDARD_WORK_CONTINUATION_WAKE)) {
         // The one wake this state earned has run, or was dropped, and the state is unchanged: the
@@ -2859,7 +2861,7 @@ export class Daemon {
       ) {
         continue;
       }
-      const triggerId = standardWorkContinuationTriggerId(runId, tuple.bindingGeneration, tuple.taskId, tuple.taskState);
+      const triggerId = standardWorkContinuationTriggerId(runId, tuple.taskId, tuple.taskState);
       // As for the bootstrap stages (R1-01): the turn starts behind awaits, so a task staffed, a run
       // moved or a binding changed meanwhile drops the trigger at the runtime's final check, and its
       // marker stays spent.

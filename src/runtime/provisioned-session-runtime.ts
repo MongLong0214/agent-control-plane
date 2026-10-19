@@ -983,16 +983,17 @@ const STANDARD_WORK_STEPS =
 /**
  * The audit kind that records one standard work continuation wake: an ACTIVE STANDARD_WORK run whose
  * PLAN was accepted and whose RUN_DISPATCH its driven owner acknowledged, left with a READY task no
- * worker or execution was started for (`evidence.bindingGeneration`, `evidence.taskId`,
- * `evidence.taskState`). Append only, as above.
+ * worker or execution was started for. Keyed by its run, `evidence.taskId` and `evidence.taskState`;
+ * `evidence.bindingGeneration` is recorded but is not part of the key, so a renewed owner generation
+ * does not earn the same state another wake. Append only, as above.
  */
 export const STANDARD_WORK_CONTINUATION_WAKE = "STANDARD_WORK_CONTINUATION_WAKE";
 
 /**
  * The audit kind that records the explicit blocker a continuation leaves when the one turn it woke
- * made no progress: the same run, owner generation, task and task state, still READY with no worker
- * or execution, and no turn of the owner running or queued. Written once per that tuple; nothing
- * wakes the owner for it again.
+ * made no progress: the same run, task and task state, still READY with no worker or execution, and
+ * no turn of the owner running or queued. Written once per that tuple, whatever the owner's
+ * generation; nothing wakes the owner for it again.
  */
 export const STANDARD_WORK_CONTINUATION_STALLED = "STANDARD_WORK_CONTINUATION_STALLED";
 
@@ -1002,13 +1003,12 @@ const STANDARD_CONTINUATION_KIND_PREFIX = "standard work continuation: run ";
 export const standardWorkContinuationTriggerKind = (runId: string, taskId: string): string =>
   `${STANDARD_CONTINUATION_KIND_PREFIX}${runId} has READY task ${taskId} with no worker`;
 
-/** The trigger id of one continuation wake: the runtime refuses a second wake for it as a duplicate. */
-export const standardWorkContinuationTriggerId = (
-  runId: string,
-  bindingGeneration: number,
-  taskId: string,
-  taskState: string,
-): string => `standard-work-continuation:${runId}:${bindingGeneration}:${taskId}:${taskState}`;
+/**
+ * The trigger id of one continuation wake: the runtime refuses a second wake for it as a duplicate.
+ * Like the once-marker, it names no binding generation.
+ */
+export const standardWorkContinuationTriggerId = (runId: string, taskId: string, taskState: string): string =>
+  `standard-work-continuation:${runId}:${taskId}:${taskState}`;
 
 const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[]): string =>
   [
