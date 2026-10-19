@@ -1,6 +1,7 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { deny } from "../../src/core/errors.ts";
+import { WriteOperation } from "../../src/guard/managed-write-guard.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import {
@@ -739,6 +740,112 @@ describe("#1162 r2 — refusals are not movement, and rows are compared by diges
       await reconcile(f, "the CEO is bound again after a forged episode");
       // What a closed R1-01 would hold; today the forge releases the run, so this assertion fails.
       expectHeld(f, runId);
+    });
+  });
+});
+
+/**
+ * #1162 r3 — movement is classified by what a record says happened, not by its kind's name: a refusal or
+ * an ignored input recorded for the run under the hold is not movement, though it shares a kind with an
+ * applied change. The S-TB branch records are movement (their port is in continuity-hold-branch-movement).
+ */
+describe("#1162 r3 — a refused or ignored input recorded under the hold is not movement", () => {
+  it("R2-01 port (late result): an old-generation execution result an authenticated owner submits over MCP is ignored, and the unchanged run is released", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "late-execution");
+      const subject = await stalledRun(f, project);
+      const control = await stalledRun(f, project);
+      const task = cp.tasks.list(subject)[0]!;
+      const worker = bindWorkerForTask(cp, task.taskId, { provider: "claude", model: "opus" });
+      const execution = cp.tasks.startExecution({
+        runId: subject, taskId: task.taskId, ownerBindingGeneration: cp.runs.require(subject).ownerBindingGeneration!,
+        workerSessionId: worker, provider: "claude", model: "opus",
+      });
+      if (!execution.allowed) throw new Error(execution.message);
+      const takeover = cp.bindings.switchTo({
+        role: Role.PRIMARY_CTO, projectId: project.projectId, sessionId: project.sessionId,
+        reason: "replacement before pause", conversation: "REPLACED", takeover: true,
+      });
+      expect(takeover, JSON.stringify(takeover)).toMatchObject({ allowed: true, value: { bindingGeneration: 2 } });
+      expect(cp.tasks.execution(execution.value.executionId)?.status).toBe("ABANDONED");
+      await loseCeo(f);
+      const facts = () => ({
+        run: cp.runs.require(subject), tasks: cp.tasks.list(subject), executions: cp.tasks.executions(subject),
+        artifacts: cp.db.all(`SELECT * FROM run_artifacts WHERE run_id = ?`, [subject]),
+        attempts: cp.db.all(`SELECT * FROM candidate_pipeline_attempts WHERE run_id = ?`, [subject]),
+        outbox: cp.outbox.listByRun(subject),
+      });
+      const before = facts();
+      const refused = await f.cto(project.sessionId, "task_receipt_submit", {
+        runId: subject, taskId: task.taskId, phase: "finished", executionId: execution.value.executionId,
+        workerSessionId: worker, status: "FAILED",
+      });
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE });
+      expect(cp.audit.forRun(subject).at(-1)!.kind).toBe("TASK_EXECUTION_LATE_RESULT_IGNORED");
+      expect(facts()).toEqual(before);
+      readoptCeo(f);
+      const report = await reconcile(f, "an ignored execution result is no movement");
+      expectReleased(f, control);
+      expectReleased(f, subject);
+      expect(report.continuityHolds.released).toEqual(expect.arrayContaining([subject, control]));
+    });
+  });
+
+  it("R2-01 port (guard): a managed write evaluation refused WRITE_RUN_NOT_ACTIVE is not movement; an allowed one would be", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "guard-refusal");
+      const subject = await stalledRun(f, project);
+      const control = await stalledRun(f, project);
+      await loseCeo(f);
+      const facts = () => ({
+        run: cp.runs.require(subject), tasks: cp.tasks.list(subject), executions: cp.tasks.executions(subject),
+        artifacts: cp.db.all(`SELECT * FROM run_artifacts WHERE run_id = ?`, [subject]), outbox: cp.outbox.listByRun(subject),
+      });
+      const before = facts();
+      const owner = cp.runs.require(subject);
+      const repo = cp.runs.repositoriesOf(subject)[0]!;
+      const refused = cp.guard.evaluate({
+        operation: WriteOperation.FILE_MUTATION, targetPath: `${repo.checkoutPath}/README.md`,
+        repositoryIdentity: repo.identity, runId: subject, sessionId: owner.ownerSessionId!,
+        sessionIncarnation: owner.ownerSessionIncarnation!, bindingGeneration: owner.ownerBindingGeneration!,
+      });
+      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.WRITE_RUN_NOT_ACTIVE });
+      const event = cp.audit.forRun(subject).at(-1)!;
+      expect(event.kind).toBe("MANAGED_WRITE_GUARD");
+      expect(event.evidence["allowed"]).toBe(false);
+      expect(facts()).toEqual(before);
+      readoptCeo(f);
+      const report = await reconcile(f, "a denied write guard is no movement");
+      expectReleased(f, control);
+      expectReleased(f, subject);
+      expect(report.continuityHolds.released).toEqual(expect.arrayContaining([subject, control]));
+    });
+  });
+
+  it("a kind recorded with both outcomes is movement only when applied, or when its outcome cannot be read", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "outcome-classified");
+      const [stopFailed, stopped, guardAllowed, guardUnreadable] = [
+        await stalledRun(f, project), await stalledRun(f, project), await stalledRun(f, project), await stalledRun(f, project),
+      ];
+      await loseCeo(f);
+      // The records as their own writers word them, here written directly: the classification is the subject.
+      cp.audit.record({ kind: "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP", runId: stopFailed, reasonCode: ReasonCode.SESSION_STOP_FAILED, evidence: {} });
+      cp.audit.record({ kind: "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP", runId: stopped, reasonCode: ReasonCode.OK, evidence: {} });
+      cp.audit.record({ kind: "MANAGED_WRITE_GUARD", runId: guardAllowed, reasonCode: ReasonCode.WRITE_ALLOWED, evidence: { allowed: true } });
+      cp.audit.record({ kind: "MANAGED_WRITE_GUARD", runId: guardUnreadable, evidence: {} });
+      readoptCeo(f);
+      const report = await reconcile(f, "the CEO is bound again");
+      expectReleased(f, stopFailed);
+      for (const runId of [stopped, guardAllowed, guardUnreadable]) expectHeld(f, runId);
+      expect(report.continuityHolds.kept).toEqual(expect.arrayContaining([
+        { runId: stopped, why: "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP was recorded for the run after continuity's pause" },
+        { runId: guardAllowed, why: "MANAGED_WRITE_GUARD was recorded for the run after continuity's pause" },
+        { runId: guardUnreadable, why: "MANAGED_WRITE_GUARD was recorded for the run after continuity's pause" },
+      ]));
     });
   });
 });

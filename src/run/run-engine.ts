@@ -37,6 +37,12 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { TaskGraph } from "./task-graph.ts";
+import {
+  TASK_BRANCH_CREATED,
+  TASK_BRANCH_CREATING,
+  TASK_BRANCH_CREATION_UNDONE,
+  unresolvedCreationAttempt,
+} from "./task-write-target.ts";
 import { type HermesAdmittedTurn, hermesTurnEvidence } from "../mcp/hermes-provenance.ts";
 
 /** PRD §13.1 — the authoritative specification Hermes writes. */
@@ -275,30 +281,35 @@ const isContinuityPause = (evidence: Record<string, unknown> | null, stateReason
  * S-HOLD (#1162 R2-01) — the audit kinds recorded for a run that say the run itself moved: its state,
  * owner, tasks, write targets, executions and worker turns, candidates and reviews, decisions, escalations
  * and their replies, claims, leases, guards, bindings it scopes, wakes and finalization. One of these
- * after continuity's pause keeps the hold. A kind not listed here is a refusal or a diagnostic that
- * changes nothing (OUTBOX_ACK_REJECTED, GATE_REJECTED, MERGE_REFUSED, REPAIR_REFUSED, REPAIR_DRY_RUN,
+ * after continuity's pause keeps the hold. Classified by what each emission site records, not by name
+ * (#1162 r3): a kind every site of which records only a refusal, a deferral or an ignored input is not
+ * listed (OUTBOX_ACK_REJECTED, GATE_REJECTED, MERGE_REFUSED, REPAIR_REFUSED, REPAIR_DRY_RUN,
  * CTO_DISPATCH_REFUSED_CANONICAL, CTO_SESSION_PROBE_FAILED, WORKER_PROBE_GROUP_UNCONFIRMED,
- * CEO_NOTIFICATION_BLOCKED, BLIND_REVIEW_MANUAL_DENIED, TASK_WORKER_TURN_LATE_RESULT_REFUSED,
- * WORKER_SESSION_STOP_FAILED, STANDARD_WORK_CONTINUATION_STALLED) and never keeps it. A writer that leaves
+ * CEO_NOTIFICATION_BLOCKED, BLIND_REVIEW_MANUAL_DENIED, BLIND_REVIEW_REJECTED, RUN_DISPATCH_DEFERRED,
+ * TASK_EXECUTION_LATE_RESULT_IGNORED, TASK_WORKER_TURN_LATE_RESULT_REFUSED, WORKER_RETIREMENT_DEFERRED,
+ * BOOTSTRAP_CTO_RECLAIM_DEFERRED, WORKER_SESSION_STOP_FAILED, STANDARD_WORK_CONTINUATION_STALLED) and never
+ * keeps it; a kind whose sites record both outcomes is movement only for the applied one
+ * (`isRecordedMovement`). The S-TB branch records are movement too. A writer that leaves
  * no record, or a record of a kind added later, is still caught by the row snapshot (`#holdSnapshot`) or,
  * for a pause that predates it, by the row times. A kind whose effect was unclear is listed: listing keeps
  * the hold, the safe side.
  */
 const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
-  "RUN_CREATED", "DISPATCHED", "RUN_DISPATCH_DEFERRED", "RUN_TRANSITION", "RUN_PRIORITY_SET", "RUN_OWNER_RENEWED",
+  "RUN_CREATED", "DISPATCHED", "RUN_TRANSITION", "RUN_PRIORITY_SET", "RUN_OWNER_RENEWED",
   "RECOVERY_TAKEOVER", "PRIMARY_CTO_ACTIVATED", "PRIMARY_CTO_UNDELIVERABLE_REPLACED",
   "PRIMARY_CTO_DRIVEN_SESSION_SPAWNED", "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP",
   "BINDING_CREATED", "BINDING_RENEWED", "BINDING_RUNTIME_MOVED", "BINDING_SWITCHED",
   "TASK_GRAPH_SUBMITTED", "TASK_GRAPH_CANCELLED", "TASK_WRITE_TARGET_RECORDED", "TASK_BRANCH_PREPARED",
-  "TASK_EXECUTION_STARTED", "TASK_EXECUTION_FINISHED", "TASK_EXECUTION_LATE_RESULT_IGNORED",
+  TASK_BRANCH_CREATING, TASK_BRANCH_CREATED, TASK_BRANCH_CREATION_UNDONE,
+  "TASK_EXECUTION_STARTED", "TASK_EXECUTION_FINISHED",
   "TASK_EXECUTIONS_ABANDONED_FOR_TAKEOVER", "TASK_WORKER_TURN_STARTED", "TASK_WORKER_TURN_SUCCEEDED",
   "TASK_WORKER_TURN_FAILED", "TASK_WORKER_TURN_GIT_STOPPED", "TASK_WORKER_TURNS_DRAINED",
   "TASK_WORKER_ORPHAN_KILLED", "TASK_WORKER_ORPHAN_GONE", "TASK_WORKER_ORPHAN_UNIDENTIFIED",
-  "TASK_WORKER_ORPHAN_RESOLVED", "WORKER_RETIRED", "WORKER_RETIREMENT_DEFERRED",
+  "TASK_WORKER_ORPHAN_RESOLVED", "WORKER_RETIRED",
   "CANDIDATE_FROZEN", "CANDIDATE_PROMOTED", "CANDIDATE_INVALIDATED", "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED",
-  "BLIND_REVIEW_COMPLETED", "BLIND_REVIEW_FALLBACK", "BLIND_REVIEW_REJECTED", "BLIND_REVIEW_UNAVAILABLE",
+  "BLIND_REVIEW_COMPLETED", "BLIND_REVIEW_FALLBACK", "BLIND_REVIEW_UNAVAILABLE",
   "REVISION_RETURNED_TO_CTO", "VERIFICATION_COMPLETED",
-  "CEO_DECISION", "OWNER_DECISION", "OWNER_APPROVAL_INGRESS", "CTO_ESCALATION", "CEO_NOTIFICATION",
+  "CEO_DECISION", "OWNER_DECISION", "OWNER_APPROVAL_INGRESS", "OWNER_APPROVAL_CONSUMED", "CTO_ESCALATION", "CEO_NOTIFICATION",
   "BUZZ_OWNER_APPROVAL_PROMPTED", "ESCALATION_REPLY_HELD", "ESCALATION_REPLY_CARRIED",
   "ESCALATION_REPLY_HOLD_REJECTED", "OUTBOX_ACKED_IN_BAND",
   "CLAIM_ACQUIRED", "CLAIM_RELEASED", "SOURCE_READ_LEASE_ACQUIRED", "SOURCE_READ_LEASE_RELEASED",
@@ -306,8 +317,7 @@ const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
   "REPOSITORY_TEMPORARY_BINDING", "MANIFEST_ACTIVATION_CONSUMER_BOUND", "PROJECT_MANIFEST_ACTIVATED",
   "STANDARD_WORK_CONTINUATION_WAKE", "BOOTSTRAP_PLAN_RECOVERY_WAKE", "BOOTSTRAP_RESULT_RECOVERY_WAKE",
   "BOOTSTRAP_REVIEW_RETRY_WAKE", "BOOTSTRAP_PLAN_TASKS", "BOOTSTRAP_TASKS_SUPERSEDED", "BOOTSTRAP_TASK_SETTLED",
-  "BOOTSTRAP_CTO_SESSION_SPAWNED", "BOOTSTRAP_CTO_PROVISIONED", "BOOTSTRAP_CTO_RECOVERED",
-  "BOOTSTRAP_CTO_RECLAIM_DEFERRED", "BOOTSTRAP_ACTIVATED", "BOOTSTRAP_ACTIVATION_INCOMPLETE",
+  "BOOTSTRAP_CTO_SESSION_SPAWNED", "BOOTSTRAP_CTO_PROVISIONED", "BOOTSTRAP_CTO_RECOVERED", "BOOTSTRAP_ACTIVATED", "BOOTSTRAP_ACTIVATION_INCOMPLETE",
   "BOOTSTRAP_ACTIVATION_READY_FOR_CONFIRM", "BOOTSTRAP_APPLICATION_APPROVAL", "BOOTSTRAP_APPLICATION_ATTEMPT",
   "BOOTSTRAP_APPLICATION_LEDGER_STAGE", "BOOTSTRAP_APPLICATION_RESERVED", "BOOTSTRAP_APPLICATION_WRITE_RECEIPTED",
   "HANDOFF_SUBMITTED", "HANDOFF_ACK",
@@ -319,6 +329,18 @@ const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
   "BASELINE_INVOCATION_STARTED", "BASELINE_INVOCATION_FINISHED", "BASELINE_USAGE_RECORDED",
   "BASELINE_GRAPH_SNAPSHOT", "BASELINE_TASK_CLASSIFICATION", "BASELINE_QUALITY_OBSERVATION", "BASELINE_RUN_OUTCOME",
 ];
+
+/**
+ * #1162 r3 — whether a listed record is movement by its recorded outcome. The two listed kinds whose sites
+ * record both outcomes count only the applied one: a MANAGED_WRITE_GUARD evaluation whose evidence says
+ * `allowed: false` granted nothing, and a PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP that could not stop its session
+ * (SESSION_STOP_FAILED) changed nothing. An outcome that cannot be read counts as movement.
+ */
+const isRecordedMovement = (row: { kind: string; reason_code: string | null; evidence_json: string }): boolean => {
+  if (row.kind === "MANAGED_WRITE_GUARD") return auditEvidence(row.evidence_json)?.["allowed"] !== false;
+  if (row.kind === "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP") return row.reason_code !== ReasonCode.SESSION_STOP_FAILED;
+  return true;
+};
 
 /** The pause evidence field that carries `#holdSnapshot` at the pause (S-HOLD, CEO 3b9d8289). */
 const HOLD_SNAPSHOT_FIELD = "holdSnapshotDigest";
@@ -1862,14 +1884,18 @@ export class RunEngine {
         return kept("the run's owner pin is not its PRIMARY_CTO's active binding");
       }
       if (!owner.ready) return kept("the run's owner session is not READY");
-      const recorded = this.db.get<{ kind: string }>(
-        `SELECT kind FROM audit_events
+      const recorded = this.db.all<{ kind: string; reason_code: string | null; evidence_json: string }>(
+        `SELECT kind, reason_code, evidence_json FROM audit_events
           WHERE run_id = ? AND event_id > ?
             AND kind IN (${CONTINUITY_HOLD_MUTATING_KINDS.map(() => "?").join(", ")})
-          ORDER BY event_id LIMIT 1`,
+          ORDER BY event_id`,
         [runId, pause.event_id, ...CONTINUITY_HOLD_MUTATING_KINDS],
-      );
+      ).find(isRecordedMovement);
       if (recorded) return kept(`${recorded.kind} was recorded for the run after continuity's pause`);
+      // #1162 r3 — a task branch whose creation was started and has neither its completion nor a verified
+      // undo is an effect in flight on the checkout, which no row of this database shows: never released
+      // across it, whenever its intent was written.
+      if (this.#branchCreationInFlight(runId)) return kept("a task branch creation of the run is in flight or unresolved");
       // A pause written since S-HOLD carries the rows' digest: unmoved means equal, whatever the clock read.
       const atPause = auditEvidence(pause.evidence_json)?.[HOLD_SNAPSHOT_FIELD];
       if (typeof atPause === "string") {
@@ -1932,6 +1958,25 @@ export class RunEngine {
         return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "the run moved between the hold's check and its release", { runId });
       }
       return allow(ReasonCode.OK, { run: this.require(runId), released: true, kept: null });
+    });
+  }
+
+  /** #1162 r3 — whether any TASK_BRANCH_CREATING of the run is unresolved (`unresolvedCreationAttempt`). */
+  #branchCreationInFlight(runId: string): boolean {
+    const intents = this.db.all<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
+      [TASK_BRANCH_CREATING, runId],
+    );
+    return intents.some((row) => {
+      const intent = auditEvidence(row.evidence_json);
+      const [taskId, repositoryIdentity, branch, baseSha] = ["taskId", "repositoryIdentity", "branch", "baseSha"]
+        .map((field) => intent?.[field]);
+      // An intent whose scope cannot be read cannot be shown resolved: in flight.
+      if (typeof taskId !== "string" || typeof repositoryIdentity !== "string" || typeof branch !== "string" ||
+        typeof baseSha !== "string") {
+        return true;
+      }
+      return unresolvedCreationAttempt(this.db, { runId, taskId, repositoryIdentity, branch, baseSha });
     });
   }
 
