@@ -1,0 +1,24 @@
+Limit: a legacy task that already has a worker gets no recorded target and escalates at the claim; a task whose paths cannot be derived (no PLAN paths and not exactly one declared contract file) is still staffed but answers writeTargetRefused; nothing here pushes the branch to GitHub (S-PUSH is separate)
+Warn: a STANDARD_WORK task's write target (repository, branch, paths, declared parent, base commit) is one canonical record written at its first task_worker_provision, with a TASK_WRITE_TARGET_RECORDED audit in the same transaction, and contract_get, the claim check and task_worker_run all read it; one policy point picks the branch class from the repository's branchProfile (dev-bearing: task/<taskId>-<slug>; main-only: hotfix/<taskId>-<slug> to main, CEO f5879479), and task_worker_run creates that branch as one guard-approved GIT_BRANCH write at the run's pinned base commit, reusing an existing branch only when it descends from that commit and holds only this task's commits
+Record-Id: r-50fcae994b43
+Provenance: inherited 421263fbae57447800c1e5374544425ee4d39eb7
+
+Limit: candidate freeze still reads only the checkout's current branch, so a multi-task run freezes just its last task's branch; crash mid branch preparation, linked worktrees and SHA-256 repositories are untested
+Warn: S-TB's task branch carries its recorded origin end to end: candidate freeze takes the declared parent and the pinned base commit from the task's write-target record instead of reconstructing them from moving branch tips (S-TB-06, so a base that advanced after provision no longer loses lineage before PR verification); a branch is reused or left only with a control-plane creation record (S-TB-02/03), cleanliness is re-checked inside the branch effect before any write (S-TB-07), the run's base pin is settled inside the recording transaction (S-TB-04), a dev-bearing parent is dev only (S-TB-05), the single-file fallback needs a regular file at the pinned base (S-TB-08), and execution without a recorded target is refused (S-TB-01)
+Record-Id: r-7870e008b911
+Provenance: inherited a6e7b1e64878bff2a91114ac9f49888e6a5e06f6
+
+Limit: a crash between the create-only ref update and TASK_BRANCH_CREATED leaves a ref every later attempt refuses by name and never adopts, so an operator must clear it; a user edit landing during the switch on a path the two commits differ in leaves the checkout on the task branch, recorded created, and the refusal says leftOnBranch (not witnessed)
+Warn: TASK_BRANCH_CREATING is only an intent and is never read as ownership; re-entry and the hand-off read TASK_BRANCH_CREATED, written only after the create-only ref update succeeded, read back at the pinned base, and the checkout stood clean on it. A refusal after the ref exists undoes only this attempt: HEAD and files back, and the ref deleted only if this attempt created it and it still points at the pinned base
+Record-Id: r-a3afa12fa368
+Provenance: inherited de3721f099acb0ce64c0794e80b1d33ac458ec5d
+
+Limit: an attempt whose own records failed, or that left anything behind, has no TASK_BRANCH_CREATED or TASK_BRANCH_CREATION_UNDONE and stays unresolved, so later attempts at that run, task, branch and base are refused by name and there is no operator tool yet to clear it; a user write landing between the ownership check and the put-back of a partially moved file would be overwritten
+Warn: the S-TB undo checks each step before taking it: HEAD goes back only while it still names the task branch this attempt set, files are measured against where they started after any failed read-tree, and the task ref is deleted only if this attempt created it, nothing stands on it and it still points at the pinned base; every skipped or failed step is a named blocker in the refusal, and a refusal never reports a rollback that did not happen
+Record-Id: r-3352ad3222e1
+Provenance: inherited f38602712feca7af0c20ab6d8f46b50448c07925
+
+Limit: git's own read-tree verifies each entry and then writes it, so a user write landing between those two steps inside git can still be overwritten; git offers no worktree lock to close it, and the forward checkout has the same window. A recovery-incomplete attempt stays unresolved and is refused by name until an operator clears it, with no clearing tool yet
+Warn: after a refused read-tree, forward or reverse, the control plane only measures and never writes a file back: a put-back cannot exclude a concurrent user write, so files, index, HEAD and the ref stay exactly as they stand and the refusal ends with a 'recovery incomplete' blocker carrying, per path, the original, measured and destination blobs; user bytes take precedence over an automatic rollback (CEO 363fae88)
+Record-Id: r-a294b3fee2bf
+Provenance: inherited 95ee2d9f0fe3c3cec06fb9be239a20ccb66fac62
