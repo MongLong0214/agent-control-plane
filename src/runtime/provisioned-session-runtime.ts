@@ -5,7 +5,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
+import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { Role, type RoleBinding, RunKind, SessionLifecycle } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -982,6 +982,9 @@ export const reviewRetryTriggerId = (
   unavailableEventId: number,
 ): string => `bootstrap-review-retry:${runId}:${bindingGeneration}:${candidateSnapshotDigest}:${unavailableEventId}`;
 
+/** The provider this prompt tells the caller to name. Staffing still refuses any name the worker table does not list. */
+const STANDARD_WORK_WORKER_PROVIDER = fixedRuntimes(Role.WORKER).find((runtime) => runtime.provider === "claude")!.provider;
+
 /**
  * #512 — what carrying a STANDARD_WORK run past its accepted PLAN means, in the words both its
  * directive and the continuation wake's line use. The run's record, as `contract_get` answers it
@@ -1002,7 +1005,7 @@ const STANDARD_WORK_STEPS =
   "First, if the task has executions, read its newest execution with mcp__acp-cto__task_execution_get by that executionId; while that execution is RUNNING, read it again until it is not; " +
   "an execution that SUCCEEDED leaves its task done; an execution that did not succeed, or one you cannot read, is reported for that run with mcp__acp-cto__escalation_open, its task is never run again, and no result is submitted. " +
   "Only a READY task with no execution gets a first execution: reuse its worker if it has one and never provision another (a worker whose state is not ACTIVE is reported with mcp__acp-cto__escalation_open); " +
-  `otherwise staff it with mcp__acp-cto__task_worker_provision, using a new idempotencyKey and provider "${FIXED_ROLE_RUNTIME[Role.WORKER]!.provider}" with no model (the control plane fixes it); ` +
+  `otherwise staff it with mcp__acp-cto__task_worker_provision, using a new idempotencyKey and provider "${STANDARD_WORK_WORKER_PROVIDER}" with no model (the control plane fixes it); ` +
   "then claim its write target with mcp__acp-cto__resource_claim exactly as its spec's writeTarget names it: repositoryIdentity, branch and paths as declaredPaths, with that repository's checkoutPath from contract_get's repositories as the worktreeId (the control plane records a task's writeTarget when it provisions the task's worker and answers task_worker_provision with it, so after provisioning take it from that answer or read contract_get again); " +
   "task_worker_run then creates that branch at the run's pinned base and checks it out, or continues on it, and refuses a checkout that is not clean, so never choose, derive, create or change a branch yourself; when the spec names no writeTarget, report it with mcp__acp-cto__escalation_open (task_worker_provision answers writeTargetRefused when the control plane cannot record one); " +
   "start that first execution with mcp__acp-cto__task_worker_run, naming the task and the claimId resource_claim returned for that worktree, and read the execution it returns as above. " +

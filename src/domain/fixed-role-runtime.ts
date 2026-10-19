@@ -7,20 +7,28 @@ export interface FixedRoleRuntime {
 }
 
 /**
- * Roles whose runtime is fixed: a run's BOOTSTRAP_CTO (#246, RF PRD:156) and a task's WORKER
- * (#512) run on Claude Opus. Implementation and bootstrap work run on Claude Opus; GPT does no code
- * work, and Claude's own default worker model (Sonnet) is not Opus.
+ * Roles whose runtime is fixed. A run's BOOTSTRAP_CTO (#246, RF PRD:156) runs on Claude Opus.
+ * A task's WORKER (#512) runs on Claude Opus, or on GPT 6.1 Sol (CEO decision 129edfa1; owner
+ * instruction of 2026-10-19). The caller names the provider. Nothing is substituted or defaulted.
+ * Claude's own default worker model (Sonnet) is not Opus, and GPT's default worker model (Luna)
+ * is not 6.1 Sol.
  *
  * Every writer that constitutes a session for one of these roles reads this table — staffing at
- * provisioning, continuity at a WORKER's failover and restoration — and none substitutes another
- * provider or model for it. A role that its fixed provider cannot cover is uncovered, not moved
- * elsewhere. Continuity constitutes no session for a BOOTSTRAP_CTO at all: it is recovered on its
- * own session (#246 C1b).
+ * provisioning, continuity at a WORKER's failover and restoration — and none substitutes a
+ * provider or model from outside it. A provider the table does not list for the role is uncovered,
+ * not moved onto one it does, and one listed provider is not swapped for the other. Continuity
+ * constitutes no session for a BOOTSTRAP_CTO at all: it is recovered on its own session (#246 C1b).
  */
-export const FIXED_ROLE_RUNTIME: Readonly<Partial<Record<Role, FixedRoleRuntime>>> = Object.freeze({
-  [Role.BOOTSTRAP_CTO]: Object.freeze({ provider: "claude", model: "opus" }),
-  [Role.WORKER]: Object.freeze({ provider: "claude", model: "opus" }),
+export const FIXED_ROLE_RUNTIME: Readonly<Partial<Record<Role, readonly FixedRoleRuntime[]>>> = Object.freeze({
+  [Role.BOOTSTRAP_CTO]: Object.freeze([Object.freeze({ provider: "claude", model: "opus" })]),
+  [Role.WORKER]: Object.freeze([
+    Object.freeze({ provider: "claude", model: "opus" }),
+    Object.freeze({ provider: "gpt", model: "gpt-6.1-sol" }),
+  ]),
 });
+
+/** The fixed provider/model pairs for a role. Empty when the role is not fixed. */
+export const fixedRuntimes = (role: Role): readonly FixedRoleRuntime[] => FIXED_ROLE_RUNTIME[role] ?? [];
 
 /**
  * #246 C4 — the runtime of a PRIMARY_CTO a bootstrap activation provisions on the headless runtime:

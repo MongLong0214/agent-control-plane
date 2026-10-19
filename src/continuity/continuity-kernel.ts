@@ -16,7 +16,7 @@ import {
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
+import { type FixedRoleRuntime, fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { isTerminal } from "../domain/run-state.ts";
 import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { ContinuityMode, Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
@@ -335,6 +335,23 @@ export class ContinuityKernel {
     return taken;
   }
 
+  /**
+   * Providers from a fixed-runtime table that this role may be planned onto.
+   *
+   * One entry is that provider. Several stay on the provider the running execution already
+   * names, so one listed provider is not swapped for another when coverage is lost. No such
+   * execution, or a provider outside the table, yields no candidate.
+   */
+  private fixedCandidates(role: RequiredRole, fixed: readonly FixedRoleRuntime[]): readonly string[] {
+    if (fixed.length === 1) return [fixed[0]!.provider];
+    if (!role.taskId) return [];
+    const incumbent = this.db.get<{ provider: string }>(
+      `SELECT provider FROM task_executions WHERE task_id = ? AND status = 'RUNNING' ORDER BY started_at DESC LIMIT 1`,
+      [role.taskId],
+    )?.provider;
+    return incumbent !== undefined && fixed.some((runtime) => runtime.provider === incumbent) ? [incumbent] : [];
+  }
+
   /** §15.3 — computed before any failover, never after. */
   computeCoveragePlan(): RoleCoveragePlan {
     const requiredRoles = this.requiredRoles();
@@ -397,13 +414,15 @@ export class ContinuityKernel {
     // Preserve the capability needed by already-running work before reserving a fresh
     // session for a role that is merely expected to become active later.
     for (const role of [...requiredRoles].sort((left, right) => Number(right.inFlight) - Number(left.inFlight))) {
-      // #246 — a role with a fixed runtime (a BOOTSTRAP_CTO, a WORKER: Claude Opus) has one
-      // candidate, its own provider. When that provider cannot cover it the role is uncovered and
-      // the daemon pauses its run; it is never planned onto another provider.
-      const fixed = FIXED_ROLE_RUNTIME[role.role];
-      const preferred = fixed
-        ? [fixed.provider].filter((p) => byProvider.has(p) || registered.includes(p))
-        : candidatesFor(role.capability);
+      // #246 — a role with a fixed runtime is planned only onto a provider in that table.
+      // BOOTSTRAP_CTO has Claude Opus. WORKER has Claude Opus or GPT 6.1 Sol (CEO decision
+      // 129edfa1; owner instruction of 2026-10-19) and stays on the provider its running execution
+      // already names. A provider outside the table is never a candidate, and one listed provider
+      // is not swapped for the other. When the pinned provider cannot cover the role, it is uncovered.
+      const fixed = fixedRuntimes(role.role);
+      const preferred = fixed.length === 0
+        ? candidatesFor(role.capability)
+        : this.fixedCandidates(role, fixed).filter((p) => byProvider.has(p) || registered.includes(p));
       const taken = usedByGroup.get(role.isolationGroup) ?? new Set<string>();
 
       const routable = (provider: string): boolean => {
@@ -631,7 +650,7 @@ export class ContinuityKernel {
     // #246 — a role with a fixed runtime is admitted against its own role-scoped reading, the one it
     // was staffed under, so a Claude-to-Claude failover can be admitted at all; every other role
     // keeps the provider-level admission it had.
-    const fixedRole = FIXED_ROLE_RUNTIME[role] && this.providers.hasRoleScoped(assignment.provider) ? role : undefined;
+    const fixedRole = fixedRuntimes(role).length > 0 && this.providers.hasRoleScoped(assignment.provider) ? role : undefined;
     const switchTarget: DispatchCapacityTarget =
       required.capability === "worker"
         ? {
@@ -889,7 +908,10 @@ export class ContinuityKernel {
         });
         continue;
       }
-      const provisioned = await this.provisionRoutableSession(current.role, assignment.provider, "continuity:restore");
+      // A WORKER restore uses the purpose staffing's failover already uses, so the Codex adapter
+      // records the session and can probe it. Every other role keeps the restore purpose.
+      const purpose = current.role === Role.WORKER ? `continuity:${Role.WORKER}` : "continuity:restore";
+      const provisioned = await this.provisionRoutableSession(current.role, assignment.provider, purpose);
       if (!provisioned.allowed) {
         deferred.push({ roleKey: assignment.roleKey, reasonCode: provisioned.reasonCode });
         continue;
@@ -1526,16 +1548,21 @@ export class ContinuityKernel {
     provider: string,
     purpose: string,
   ): Promise<Decision<{ sessionId: string }>> {
-    // #246 — a role with a fixed runtime is constituted on exactly that provider and model, at
-    // failover and at restoration alike. The plan never names another provider for it; this
+    // #246 — a role with a fixed runtime is constituted on a provider and model from that table,
+    // at failover and at restoration alike. The plan never names a provider outside it; this
     // refuses one that reached here anyway, before anything is started.
     if (role === Role.BOOTSTRAP_CTO) return bootstrapCtoNotReplaceable(null);
-    const fixed = FIXED_ROLE_RUNTIME[role];
-    if (fixed && provider !== fixed.provider) {
+    const fixed = fixedRuntimes(role);
+    const matched = fixed.find((runtime) => runtime.provider === provider);
+    if (fixed.length > 0 && !matched) {
       return deny(
         ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED,
         "this role runs on a fixed provider and model; continuity does not move it to another",
-        { role, provider, fixedProvider: fixed.provider, fixedModel: fixed.model },
+        {
+          role,
+          provider,
+          allowed: fixed.map((runtime) => ({ provider: runtime.provider, model: runtime.model })),
+        },
       );
     }
     const adapter = this.providers.requireForRole(provider, role);
@@ -1554,8 +1581,8 @@ export class ContinuityKernel {
       );
     }
     // A fixed role's model is its own, never the adapter's default: Claude's default worker model
-    // is Sonnet, and a Claude-to-Claude WORKER failover would otherwise come back on it.
-    const model = fixed?.model ?? adapter.defaultModels[
+    // is Sonnet, GPT's is Luna, and a failover would otherwise come back on one of those.
+    const model = matched?.model ?? adapter.defaultModels[
       role === Role.BLIND_REVIEWER ? "reviewer" : role === Role.CEO ? "ceo" : role === Role.WORKER ? "worker" : "cto"
     ] ?? "default";
     let handle;
