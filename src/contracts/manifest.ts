@@ -291,7 +291,7 @@ export type ProjectManifest = z.infer<typeof projectManifestSchema>;
  * authority identifiers are content-wide concerns; filesystem paths are checked on the
  * fields that actually carry paths below, never inferred from serialized JSON.
  */
-const NON_PORTABLE_PATTERNS: Array<[RegExp, string]> = [
+export const NON_PORTABLE_PATTERNS: Array<[RegExp, string]> = [
   [/\b(ses|sess|session)_[A-Za-z0-9]{8,}/, "session identifier"],
   [/\bnsec1[a-z0-9]{20,}/, "buzz/nostr private key"],
   [/\b(gh[pousr]_[A-Za-z0-9]{20,})/, "github token"],

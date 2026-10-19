@@ -424,12 +424,14 @@ describe("the v45 → v46 step", () => {
     const raw = new Database(path, { readonly: true });
     try {
       const receipts = raw.prepare("SELECT version, migration_id FROM schema_migrations ORDER BY version").all();
-      // v47 and v48 (SEC-OD1) follow on the same approved chain and add triggers, no row.
+      // v47 and v48 (SEC-OD1) follow on the same approved chain and add triggers, no row; v49 (#512 S-PUSH)
+      // rebuilds github_receipts with every row and rowid kept, which the table digests above compare.
       expect(receipts).toEqual([
         { version: 45, migration_id: "bootstrap-v45" },
         { version: 46, migration_id: "v46-rowid-no-replace" },
         { version: 47, migration_id: "v47-owner-decision-authority-guard" },
         { version: 48, migration_id: "v48-owner-decision-supersede-guard" },
+        { version: 49, migration_id: "v49-branch-publish-receipts" },
       ]);
     } finally {
       raw.close();
@@ -475,7 +477,7 @@ describe("the v45 → v46 step", () => {
     expect(approved).toMatchObject({
       fromVersion: 44,
       toVersion: SCHEMA_VERSION,
-      migrations: ["v45-first-manifest-activation", "v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard"],
+      migrations: ["v45-first-manifest-activation", "v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts"],
     });
     const databaseModule = new URL("../../src/db/database.ts", import.meta.url).href;
     const child = boundedSpawnSync(
@@ -510,7 +512,7 @@ describe("the v45 → v46 step", () => {
     expect(approveMigration(path, "V46 D5-b re-approval")).toMatchObject({
       fromVersion: 45,
       toVersion: SCHEMA_VERSION,
-      migrations: ["v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard"],
+      migrations: ["v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts"],
     });
     new Db(path).close();
     expect(contentDigests(path).userVersion).toBe(SCHEMA_VERSION);

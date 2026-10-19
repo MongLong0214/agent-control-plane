@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 48;
+export const SCHEMA_VERSION = 49;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -17,6 +17,7 @@ const v44SchemaPath = fileURLToPath(new URL("./schema-v44.sql", import.meta.url)
 const v45SchemaPath = fileURLToPath(new URL("./schema-v45.sql", import.meta.url)); // released v45 reads only this
 const v46SchemaPath = fileURLToPath(new URL("./schema-v46.sql", import.meta.url)); // released v46 reads only this
 const v47SchemaPath = fileURLToPath(new URL("./schema-v47.sql", import.meta.url)); // released v47 reads only this
+const v48SchemaPath = fileURLToPath(new URL("./schema-v48.sql", import.meta.url)); // released v48 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -24,7 +25,8 @@ const schemaSqlAt = (version: number): string =>
     : version <= 44 ? readFileSync(v44SchemaPath, "utf8")
       : version <= 45 ? readFileSync(v45SchemaPath, "utf8")
         : version <= 46 ? readFileSync(v46SchemaPath, "utf8")
-          : version <= LATEST_FROZEN_VERSION ? readFileSync(v47SchemaPath, "utf8") : schemaSql();
+          : version <= 47 ? readFileSync(v47SchemaPath, "utf8")
+            : version <= LATEST_FROZEN_VERSION ? readFileSync(v48SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -3839,6 +3841,137 @@ const v48: SchemaMigration = {
   checksum: () => migrationChecksum("v48-owner-decision-supersede-guard", 48),
 };
 
+/** The guards v49 re-installs on `github_receipts`, read from schema.sql by name (#512 S-PUSH). */
+export const V49_GITHUB_RECEIPT_TRIGGER_NAMES: readonly string[] = [
+  "github_receipts_immutable",
+  "github_receipts_no_replace",
+  "github_receipts_applied_requires_reservation",
+  "github_receipts_pending_completion",
+  "github_receipts_no_delete",
+];
+
+/** The name the v48 table is moved to while its rows are copied; it never survives the step. */
+const V49_PRIOR_TABLE = "github_receipts_v48_rebuild";
+
+const GITHUB_RECEIPTS_TABLE_PATTERN = /CREATE TABLE IF NOT EXISTS github_receipts \([\s\S]*?\n\);/;
+const GITHUB_RECEIPTS_INDEX_PATTERN = /CREATE INDEX IF NOT EXISTS github_receipts_run [^;]*;/;
+
+/** `github_receipts`, its index and its five guards, each as schema.sql defines it at v49 and at v48. */
+const v49Objects = (): readonly StepObject[] => [
+  {
+    type: "table",
+    name: "github_receipts",
+    table: "github_receipts",
+    ddl: schemaObject(GITHUB_RECEIPTS_TABLE_PATTERN, "the github_receipts table", 49),
+    priorDdl: schemaObject(GITHUB_RECEIPTS_TABLE_PATTERN, "the v48 github_receipts table", 48),
+  },
+  {
+    type: "index",
+    name: "github_receipts_run",
+    table: "github_receipts",
+    ddl: schemaObject(GITHUB_RECEIPTS_INDEX_PATTERN, "the github_receipts index", 49),
+    priorDdl: schemaObject(GITHUB_RECEIPTS_INDEX_PATTERN, "the v48 github_receipts index", 48),
+  },
+  ...stepTriggerObjects(49, V49_GITHUB_RECEIPT_TRIGGER_NAMES, { version: 48, names: V49_GITHUB_RECEIPT_TRIGGER_NAMES }),
+];
+
+/**
+ * Every row of `table`, rowid first, each value with its storage class, in rowid order: what the rebuild
+ * must carry unchanged, compared as one string so a lost, added, retyped or renumbered row is a mismatch.
+ */
+const receiptRowsImage = (raw: Database.Database, table: string, columns: readonly string[]): string => {
+  const list = columns.map((column) => `"${column}"`).join(", ");
+  const typed = columns.map((column) => `typeof("${column}")`).join(", ");
+  return JSON.stringify(raw.prepare(`SELECT rowid, ${list}, ${typed} FROM "${table}" ORDER BY rowid`).raw().all());
+};
+
+/**
+ * Before and after the step `github_receipts` carries exactly the index and the five guards schema.sql puts
+ * on it, beside the automatic indexes of its own constraints. Before, because the rebuild drops whatever
+ * the old table carries; an object nobody declared is refused rather than dropped with it.
+ */
+const assertV49TableCarries = (raw: Database.Database, objects: readonly StepObject[], when: "before" | "after"): void => {
+  const carried = (raw
+    .prepare("SELECT type, name FROM sqlite_master WHERE tbl_name = 'github_receipts' COLLATE NOCASE AND type <> 'table' AND NOT (type = 'index' AND sql IS NULL)")
+    .all() as Array<{ type: string; name: string }>).map((row) => `${row.type} ${row.name}`);
+  const defined = objects.filter((object) => object.type !== "table").map((object) => `${object.type} ${object.name}`);
+  const extra = carried.filter((entry) => !defined.includes(entry));
+  const missing = defined.filter((entry) => !carried.includes(entry));
+  if (extra.length > 0 || missing.length > 0) {
+    throw new Error(
+      `v49 refuses: ${when} the step github_receipts carries ${extra.join(", ") || "nothing"} beyond what schema.sql defines on it and lacks ${missing.join(", ") || "nothing"}`,
+    );
+  }
+};
+
+/**
+ * #512 S-PUSH (CEO f5879479, 3d0daed0). The GitHub kernel publishes a STANDARD_WORK candidate's branch
+ * through the Git Data API and records it as a `branch_publish` receipt, under the reservation protocol the
+ * other kernel writes use. `github_receipts.operation` is a CHECK, which SQLite cannot alter in place, so
+ * v49 rebuilds the table. It adds exactly one operation to the CHECK and one to the reservation guard, as
+ * `pr_prepare` is there: a branch the kernel creates is reserved PENDING before its first upload, and a
+ * branch already at the exact candidate is an observation (preexisting = 1). Nothing else changes.
+ *
+ * Every row is carried with its rowid and every value with its storage class, compared before the old
+ * table is dropped; the index and the five guards are dropped with the old table and created again from
+ * schema.sql. The old table is renamed and the new one created under the real name, so the stored
+ * definition is schema.sql's text, as a fresh database's is. No other object may reference the table, and
+ * the table may carry nothing beyond its index and guards; either refuses the step before anything moves.
+ * Each name is checked as v45–v48 check theirs (`assertStepNames`), accepting v48's or v49's definition
+ * before the step and only v49's after. A table already at v49's definition is not rebuilt.
+ *
+ * The step runs in the migrator's one transaction, so a failure anywhere in it rolls back to the v48
+ * table, rows, index and guards as they were; the migrator then restores the pre-migration backup.
+ *
+ * A live database at v48 reaches this step only through an approved migration (`assertMigrationApproved`),
+ * as it does every step.
+ */
+const v49: SchemaMigration = {
+  id: "v49-branch-publish-receipts",
+  fromVersion: 48,
+  toVersion: 49,
+  apply: (raw) => {
+    const objects = v49Objects();
+    const table = objects.find((object) => object.type === "table")!;
+    const index = objects.find((object) => object.type === "index")!;
+    assertStepNames(raw, 49, objects, "before");
+    const stored = (raw
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'github_receipts'")
+      .get() as { sql?: string | null } | undefined)?.sql;
+    if (stored === undefined || stored === null) throw new Error("v49 refuses: github_receipts does not exist");
+    assertV49TableCarries(raw, objects, "before");
+    if (raw.prepare("SELECT 1 FROM sqlite_master WHERE name = ? COLLATE NOCASE").get(V49_PRIOR_TABLE) !== undefined) {
+      throw new Error(`v49 refuses: ${V49_PRIOR_TABLE} is already held`);
+    }
+    const foreign = raw
+      .prepare("SELECT type, name FROM sqlite_master WHERE tbl_name <> 'github_receipts' COLLATE NOCASE AND sql LIKE '%github_receipts%'")
+      .all() as Array<{ type: string; name: string }>;
+    if (foreign.length > 0) {
+      throw new Error(`v49 refuses: ${foreign.map((object) => `${object.type} ${object.name}`).join(", ")} references github_receipts`);
+    }
+    if (normaliseStepSql(stored) !== normaliseStepSql(table.ddl)) {
+      raw.exec(`ALTER TABLE github_receipts RENAME TO ${V49_PRIOR_TABLE}`);
+      raw.exec(dropsFor(V49_GITHUB_RECEIPT_TRIGGER_NAMES));
+      raw.exec("DROP INDEX github_receipts_run");
+      raw.exec(table.ddl);
+      const columns = sharedColumns(raw, V49_PRIOR_TABLE, "github_receipts");
+      const before = receiptRowsImage(raw, V49_PRIOR_TABLE, columns);
+      const list = columns.map((column) => `"${column}"`).join(", ");
+      raw.exec(`INSERT INTO github_receipts (rowid, ${list}) SELECT rowid, ${list} FROM ${V49_PRIOR_TABLE} ORDER BY rowid`);
+      if (receiptRowsImage(raw, "github_receipts", columns) !== before) {
+        throw new Error("v49 refuses: the rebuilt github_receipts does not hold exactly the rows of the v48 table");
+      }
+      raw.exec(`DROP TABLE ${V49_PRIOR_TABLE}`);
+    }
+    raw.exec(index.ddl);
+    raw.exec(dropsFor(V49_GITHUB_RECEIPT_TRIGGER_NAMES));
+    raw.exec(triggerDdlFor(V49_GITHUB_RECEIPT_TRIGGER_NAMES, 49));
+    assertStepNames(raw, 49, objects, "after");
+    assertV49TableCarries(raw, objects, "after");
+  },
+  checksum: () => migrationChecksum("v49-branch-publish-receipts", 49),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -3877,6 +4010,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v46,
   v47,
   v48,
+  v49,
 ]);
 
 interface RequiredTrigger {
@@ -4212,10 +4346,10 @@ export const assertMigrationLedgerAt = (raw: Database.Database, version: number)
  * release commits to now (4263f001…, aa2aa099…), but they are not compared either, so a database
  * carrying them opens and migrates exactly as before. Receipts v12–v46 keep the format check only.
  *
- * Why not later than the frozen steps. A step that still reads the live schema.sql (v48 until the next
- * freeze) changes its checksum with any schema edit, so it joins when it is frozen
- * (`LATEST_FROZEN_VERSION`). A bootstrap receipt (`bootstrap-v<n>`) is not compared: a database created at
- * v47 or later had the guard from its first transaction.
+ * Why not later than the frozen steps. A step that still reads the live schema.sql (v49 until the next
+ * freeze) changes its checksum with any schema edit. v48 is frozen (`LATEST_FROZEN_VERSION`) but its
+ * receipt is still not compared (`RECEIPT_VALUE_CHECKED_THROUGH`). A bootstrap receipt (`bootstrap-v<n>`)
+ * is not compared: a database created at v47 or later had the guard from its first transaction.
  */
 export const RECEIPT_VALUE_CHECKED_FROM = 47;
 
@@ -4223,8 +4357,21 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * The newest step that reads a frozen snapshot (`schemaSqlAt`'s last snapshot branch); every later step
  * reads the live schema.sql, so its checksum still moves with any schema edit until the next freeze.
  * Declared here, below the anchors other gates hold into this file, and read only inside functions.
+ *
+ * #512 S-PUSH (CEO 3d0daed0): v48 is frozen as v49's prerequisite. It reads `schema-v48.sql`, a byte copy
+ * of schema.sql at c65e73b2 (blob 29f2a057, unchanged since v48's merge ab136549), so v49's receipts table
+ * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
+ * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 47;
+const LATEST_FROZEN_VERSION = 48;
+
+/**
+ * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when
+ * v48 is frozen: CEO 3d0daed0 forbids re-interpreting an existing v48 receipt, and a value check would
+ * refuse a database whose v48 receipt an earlier build wrote, which the pre-freeze build opened. v48's
+ * and later receipts keep the format check only, as before the freeze.
+ */
+const RECEIPT_VALUE_CHECKED_THROUGH = 47;
 
 /** The receipt checksums the unreleased v47 candidates wrote, named in a refusal; never accepted. */
 const SUPERSEDED_V47_CHECKSUMS: Readonly<Record<string, string>> = {
@@ -4243,7 +4390,7 @@ export interface ReceiptMismatch {
   supersededCandidate: string | null;
 }
 
-/** Every stored receipt, from `RECEIPT_VALUE_CHECKED_FROM` to the latest frozen step, that is not this build's. */
+/** Every stored receipt, from `RECEIPT_VALUE_CHECKED_FROM` through `RECEIPT_VALUE_CHECKED_THROUGH`, that is not this build's. */
 export const receiptMismatches = (raw: Database.Database): ReceiptMismatch[] => {
   const ledger = raw
     .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
@@ -4251,7 +4398,7 @@ export const receiptMismatches = (raw: Database.Database): ReceiptMismatch[] => 
   if (ledger.n === 0) return [];
   const mismatches: ReceiptMismatch[] = [];
   for (const migration of MIGRATIONS) {
-    if (migration.toVersion < RECEIPT_VALUE_CHECKED_FROM || migration.toVersion > LATEST_FROZEN_VERSION) continue;
+    if (migration.toVersion < RECEIPT_VALUE_CHECKED_FROM || migration.toVersion > RECEIPT_VALUE_CHECKED_THROUGH) continue;
     const stored = raw
       .prepare("SELECT migration_id, checksum FROM schema_migrations WHERE version = ?")
       .get(migration.toVersion) as { migration_id: string; checksum: string } | undefined;

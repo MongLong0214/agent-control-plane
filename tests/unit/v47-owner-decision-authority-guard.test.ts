@@ -29,6 +29,7 @@ import {
   asCandidateV47,
 } from "../helpers/released-v47-schema.ts";
 import { V48_ADDED_TRIGGERS } from "../helpers/released-v48-schema.ts";
+import { V49_CHANGED_OBJECTS } from "../helpers/released-v49-schema.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -432,7 +433,7 @@ describe("S1: the v46 → v47 step on the released v46 image", () => {
     }
   });
 
-  it("the released v46 image migrated to v47 differs from it by exactly the guard (and v48's four, which follow), whose stored definition is a fresh install's", () => {
+  it("the released v46 image migrated to v47 differs from it by exactly the guard (and v48's four, which follow, and v49's receipts table), whose stored definition is a fresh install's", () => {
     const fresh = privateStatePath("acp-v47-fresh-");
     new Db(fresh).close();
     const freshGuard = schemaRowsOf(fresh).filter((r) => r.name === GUARD);
@@ -442,7 +443,8 @@ describe("S1: the v46 → v47 step on the released v46 image", () => {
     approveMigration(path, "v47 M3 witness");
     new Db(path).close();
     const after = schemaRowsOf(path);
-    expect(after.filter((r) => r.name !== GUARD && !V48_ADDED_TRIGGERS.includes(r.name))).toEqual(before);
+    expect(after.filter((r) => r.name !== GUARD && !V48_ADDED_TRIGGERS.includes(r.name) && !V49_CHANGED_OBJECTS.includes(r.name)))
+      .toEqual(before.filter((r) => !V49_CHANGED_OBJECTS.includes(r.name)));
     expect(after.filter((r) => r.name === GUARD)).toEqual(freshGuard);
   });
 });
@@ -834,14 +836,18 @@ describe("S5: a v47 receipt another step wrote is refused at an upgrade and at a
     const path = releasedV46("acp-v47-s5-open-");
     seedAsV46(path);
     asCandidateV47(path, V47_CANDIDATE_CHECKSUM, NOW);
-    const v48 = MIGRATIONS.find((step) => step.toVersion === 48)!;
+    // Every later step, v48 and #512 S-PUSH's v49, so the database is at this build's version and the
+    // open takes the same-version path that checks receipts.
+    const later = MIGRATIONS.filter((step) => step.toVersion > 47);
     const raw = foreign(path, () => 0);
     try {
       raw.function("acp_schema_migration_authorized", () => 1);
       raw.exec("BEGIN IMMEDIATE");
-      v48.apply(raw);
-      raw.prepare("INSERT INTO schema_migrations (version, migration_id, checksum, applied_at) VALUES (48, ?, ?, ?)").run(v48.id, v48.checksum(), NOW);
-      raw.pragma("user_version = 48");
+      for (const step of later) {
+        step.apply(raw);
+        raw.prepare("INSERT INTO schema_migrations (version, migration_id, checksum, applied_at) VALUES (?, ?, ?, ?)").run(step.toVersion, step.id, step.checksum(), NOW);
+        raw.pragma(`user_version = ${step.toVersion}`);
+      }
       raw.exec("COMMIT");
     } finally {
       raw.close();

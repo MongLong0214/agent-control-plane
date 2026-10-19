@@ -10,6 +10,7 @@ import {
   deriveConfirmedMergePlan,
   executePreparedConfirmedMerge,
   prepareConfirmedMerge,
+  publishConfirmedBranch,
   publishConfirmedMergeGate,
   type ConfirmedMergePlan,
   type ConfirmedMergePorts,
@@ -246,6 +247,11 @@ export class ApprovedRunFinalizer {
 
       const prepared: PlannedRepository[] = [];
       for (const plan of plans.value) {
+        // #512 S-PUSH — the candidate branch reaches GitHub before its PR is prepared. Create-only: a
+        // branch already at the exact candidate is reconciled, any other commit refuses (D4).
+        this.touchAttempt(runId, attemptId, `PUBLISH_BRANCH:${plan.repositoryIdentity}`);
+        const published = await publishConfirmedBranch(this.#ports, plan);
+        if (!published.allowed) return this.handleFailure(runId, attemptId, published as Decision<unknown>);
         this.touchAttempt(runId, attemptId, `PREPARE_PR:${plan.repositoryIdentity}`);
         const pr = await prepareConfirmedMerge(this.#ports, plan);
         if (!pr.allowed) return this.handleFailure(runId, attemptId, pr as Decision<unknown>);

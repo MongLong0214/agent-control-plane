@@ -29,6 +29,11 @@ export const WriteOperation = {
   GITHUB_RULESET: "GITHUB_RULESET",
   /** Check-run write. The production gate is published this way (§24.4). */
   GITHUB_CHECK_RUN: "GITHUB_CHECK_RUN",
+  /**
+   * #512 S-PUSH — a candidate's branch delivered through the Git Data API: blob, tree and commit uploads,
+   * then one create-only ref. The uploads are external sends even when no ref is written.
+   */
+  GITHUB_BRANCH_PUBLISH: "GITHUB_BRANCH_PUBLISH",
   MANIFEST_CHANGE: "MANIFEST_CHANGE",
   VERIFICATION_CONTRACT_CHANGE: "VERIFICATION_CONTRACT_CHANGE",
   PROGRAMMATIC_MERGE: "PROGRAMMATIC_MERGE",
@@ -77,6 +82,7 @@ const OPERATION_CLASS: Readonly<Record<WriteOperation, OperationClass>> = {
   [WriteOperation.GITHUB_RELEASE]: "REMOTE",
   [WriteOperation.GITHUB_RULESET]: "REMOTE",
   [WriteOperation.GITHUB_CHECK_RUN]: "REMOTE",
+  [WriteOperation.GITHUB_BRANCH_PUBLISH]: "REMOTE",
   [WriteOperation.PROGRAMMATIC_MERGE]: "REMOTE",
 };
 
@@ -402,6 +408,7 @@ const DAEMON_FINALIZATION_STATES: ReadonlySet<string> = new Set<string>([
 const DAEMON_FINALIZATION_OPERATIONS: ReadonlySet<WriteOperation> = new Set<WriteOperation>([
   WriteOperation.GITHUB_PR,
   WriteOperation.GITHUB_CHECK_RUN,
+  WriteOperation.GITHUB_BRANCH_PUBLISH,
   WriteOperation.PROGRAMMATIC_MERGE,
   WriteOperation.GITHUB_RELEASE,
   WriteOperation.GITHUB_ISSUE,

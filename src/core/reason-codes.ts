@@ -966,6 +966,14 @@ export const ReasonCode = {
   HERMES_BOOTSTRAP_RUNTIME_FAILED: "HERMES_BOOTSTRAP_RUNTIME_FAILED",
   RESOURCE_COLLISION: "RESOURCE_COLLISION",
   MANIFEST_NOT_PORTABLE: "MANIFEST_NOT_PORTABLE",
+  /** #512 S-PUSH — the public-safety scan found a forbidden pattern in something a branch publication would send. Nothing was sent. */
+  BRANCH_PUBLISH_CONTENT_REFUSED: "BRANCH_PUBLISH_CONTENT_REFUSED",
+  /** #512 S-PUSH — a branch publication would exceed its commit, object, byte or text bounds. Nothing was sent. */
+  BRANCH_PUBLISH_LIMIT_EXCEEDED: "BRANCH_PUBLISH_LIMIT_EXCEEDED",
+  /** #512 S-PUSH (D1) — an object id GitHub answered, or the fields rendered locally, is not the local object's. No ref is written. */
+  BRANCH_PUBLISH_OBJECT_MISMATCH: "BRANCH_PUBLISH_OBJECT_MISMATCH",
+  /** #512 S-PUSH (D3, D5) — the candidate or its contract is outside what v1 publishes. Nothing was sent. */
+  BRANCH_PUBLISH_UNSUPPORTED: "BRANCH_PUBLISH_UNSUPPORTED",
 
   // --- daemon --------------------------------------------------------------
   DAEMON_ALREADY_RUNNING: "DAEMON_ALREADY_RUNNING",
