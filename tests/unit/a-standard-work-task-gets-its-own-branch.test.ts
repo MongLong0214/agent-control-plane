@@ -45,6 +45,7 @@ const RECORDED = "TASK_WRITE_TARGET_RECORDED";
 const PREPARED = "TASK_BRANCH_PREPARED";
 const CREATING = "TASK_BRANCH_CREATING";
 const CREATED = "TASK_BRANCH_CREATED";
+const UNDONE = "TASK_BRANCH_CREATION_UNDONE";
 const POLICY = "WORK_BRANCH_POLICY";
 const IDENTITY = "github:acme/fixture";
 
@@ -423,9 +424,11 @@ describe("re-entry: the same run and task, or nothing", () => {
       expect(first).toMatchObject({ ok: true });
       await settle(f, first);
       // The intent before the create-only update, and its completion once the checkout stood clean on it.
-      const creation = { taskId, repositoryIdentity: IDENTITY, branch: target.branch, baseSha: target.baseSha, worktreeId: expect.any(String) };
+      const creation = { taskId, repositoryIdentity: IDENTITY, branch: target.branch, baseSha: target.baseSha, worktreeId: expect.any(String), attemptId: expect.any(String) };
       expect(events(f, CREATING, s.runId)).toEqual([creation]);
       expect(events(f, CREATED, s.runId)).toEqual([creation]);
+      // One attempt: the intent and its completion carry the same attempt id.
+      expect(events(f, CREATED, s.runId)[0]!["attemptId"]).toBe(events(f, CREATING, s.runId)[0]!["attemptId"]);
       // A commit on it that this task's turn made, as its record names it; the checkout went back to dev.
       writeFiles(s.repo, { "README.md": "# by this task\n" });
       const ours = commitAll(s.repo, "this task's turn");
@@ -838,6 +841,219 @@ describe("every later failure of branch preparation leaves refs, HEAD and user b
       expect(events(f, CREATED, s.runId)).toEqual([]);
       expect(events(f, PREPARED, s.runId)).toEqual([]);
       expect(cp.tasks.executions(s.runId)).toEqual([]);
+    });
+  });
+});
+
+/**
+ * A git first on PATH whose behaviour per call is a shell `case` body: `script(real)` receives the real
+ * git's path and returns the case arms; anything unmatched runs the real git.
+ */
+const gitScripted = (arms: (real: string) => string): { restore: () => void } => {
+  const bin = tempDir("acp-stb-git-script-");
+  const real = realGit();
+  writeFileSync(join(bin, "git"), ["#!/bin/sh", 'case "$*" in', arms(real), "esac", `exec '${real}' "$@"`, ""].join("\n"));
+  chmodSync(join(bin, "git"), 0o755);
+  const path = process.env["PATH"];
+  process.env["PATH"] = `${bin}${delimiter}${path ?? ""}`;
+  return { restore: () => { process.env["PATH"] = path; } };
+};
+
+describe("the undo verifies each step before it takes it, and names every step it could not take (review r3, S-TB-07)", () => {
+  const oneTask = async (f: BootstrapRuntimeFixture, label: string, advance: boolean) => {
+    const s = await standardRun(f, label, {
+      tasks: [{ key: "readme", title: "update README.md", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } }],
+    });
+    const taskId = s.taskIds[0]!;
+    const claimed = await staffAndClaim(f, s, taskId);
+    if (advance) {
+      writeFiles(s.repo, { "README.md": "# the base moved on\n", "src/app.js": "module.exports = () => 9;\n" });
+      commitAll(s.repo, "the base moves on");
+    }
+    return { ...s, taskId, ...claimed };
+  };
+  const blockersOf = (answer: Record<string, unknown>) => ((answer["evidence"] as { blockers?: Array<{ step: string; error: string; state: string; paths?: string[] }> }).blockers ?? []);
+
+  it("(a) HEAD another writer selected during the switch is never moved, with the files moved too; the ref and files it stands beside are kept, and the step is named", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await oneTask(f, "stb-r3-head-elsewhere", true);
+      gitSync(s.repo, ["branch", "user-selected", s.target.baseSha]);
+      const git = gitScripted((real) => `  *"task branch HEAD"*) '${real}' "$@"; code=$?; '${real}' symbolic-ref HEAD refs/heads/user-selected; exit "$code";;`);
+      let refused: Record<string, unknown>;
+      try {
+        refused = await runTask(f, s, s.taskId, s.claimId);
+      } finally {
+        git.restore();
+      }
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { rolledBack: false, headMoved: true, filesMoved: true, refRemoved: false } });
+      expect(blockersOf(refused)).toEqual([expect.objectContaining({ step: "head-back", error: expect.stringContaining("refs/heads/user-selected") })]);
+      expect(branchOf(s.repo)).toBe("user-selected");
+      expect(refOf(s.repo, `refs/heads/${s.target.branch}`)).toBe(s.target.baseSha);
+      expect(events(f, CREATED, s.runId)).toEqual([]);
+    });
+  });
+
+  it("(b) a refused forward read-tree that moved files it then cannot put back keeps the ref and HEAD as they stand and names the exact paths", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await oneTask(f, "stb-r3-stuck", true);
+      const head = refOf(s.repo, "HEAD");
+      const git = gitScripted(() => [
+        `  *"read-tree -m -u"*) chmod 555 '${join(s.repo, "src")}';;`,
+        "  *\"checkout-index\"*) echo 'injected: cannot put back' >&2; exit 1;;",
+      ].join("\n"));
+      let refused: Record<string, unknown>;
+      try {
+        refused = await runTask(f, s, s.taskId, s.claimId);
+      } finally {
+        git.restore();
+        chmodSync(join(s.repo, "src"), 0o755);
+      }
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { rolledBack: false, refRemoved: false, filesMoved: true, created: true } });
+      expect(String(refused["message"])).toContain("could not be put back; everything is left as it stands");
+      expect(blockersOf(refused)).toEqual([expect.objectContaining({ step: "files-forward", paths: ["README.md"], error: expect.stringContaining("injected: cannot put back") })]);
+      // Nothing claimed and nothing more moved: HEAD where it was, the ref kept at the pin, README as git left it.
+      expect(branchOf(s.repo)).toBe("dev");
+      expect(refOf(s.repo, "HEAD")).toBe(head);
+      expect(refOf(s.repo, `refs/heads/${s.target.branch}`)).toBe(s.target.baseSha);
+      expect(readFileSync(join(s.repo, "src/app.js"), "utf8")).toBe("module.exports = () => 9;\n");
+      expect(events(f, CREATED, s.runId)).toEqual([]);
+      expect(events(f, UNDONE, s.runId)).toEqual([]);
+    });
+  });
+
+  it("(c) a throw from the intent record leaves nothing, and a throw from the completion record goes through the undo; neither escapes as INTERNAL_ERROR", async () => {
+    for (const kind of [CREATING, CREATED]) {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const s = await oneTask(f, `stb-r3-throw-${kind === CREATED ? "completion" : "intent"}`, true);
+        const refsBefore = refsOf(s.repo);
+        const head = refOf(s.repo, "HEAD");
+        const record = cp.audit.record.bind(cp.audit);
+        const spy = vi.spyOn(cp.audit, "record").mockImplementation((entry) => {
+          if (entry.kind === kind) throw new Error(`injected: the store refused ${kind}`);
+          return record(entry);
+        });
+        const refused = await runTask(f, s, s.taskId, s.claimId);
+        spy.mockRestore();
+        expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+        expect(JSON.stringify(refused)).toContain(`injected: the store refused ${kind}`);
+        expect(refsOf(s.repo)).toBe(refsBefore);
+        expect(refOf(s.repo, "HEAD")).toBe(head);
+        expect(branchOf(s.repo)).toBe("dev");
+        expect(readFileSync(join(s.repo, "README.md"), "utf8")).toBe("# the base moved on\n");
+        expect(gitSync(s.repo, ["status", "--porcelain"])).toBe("");
+        // No intent was written: a retry starts afresh. A completion that failed leaves its attempt unresolved:
+        // a retry is refused by name, never re-attempted on its own.
+        const retry = await runTask(f, s, s.taskId, s.claimId);
+        if (kind === CREATING) {
+          expect(retry).toMatchObject({ ok: true });
+          await settle(f, retry);
+        } else {
+          expect(retry).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { creationAttempted: true } });
+        }
+      });
+    }
+  });
+
+  it("(c) a throw from a git read after the switch (not a record) goes through the same undo: nothing is left", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await oneTask(f, "stb-r3-throw-git", true);
+      const refsBefore = refsOf(s.repo);
+      const head = refOf(s.repo, "HEAD");
+      // The post-switch clean scan reads the task tree first; that read fails once, so the scan throws.
+      const git = gitScripted(() => `  *"ls-tree -r -z --full-tree ${s.target.baseSha}"*) echo 'injected: ls-tree' >&2; exit 1;;`);
+      let refused: Record<string, unknown>;
+      try {
+        refused = await runTask(f, s, s.taskId, s.claimId);
+      } finally {
+        git.restore();
+      }
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { rolledBack: true, refRemoved: true, headMoved: false, filesMoved: false, blockers: [] } });
+      expect(String(refused["message"])).toContain("an unexpected failure while the task's branch was made");
+      expect(JSON.stringify(refused)).toContain("injected: ls-tree");
+      expect(refsOf(s.repo)).toBe(refsBefore);
+      expect(refOf(s.repo, "HEAD")).toBe(head);
+      expect(readFileSync(join(s.repo, "README.md"), "utf8")).toBe("# the base moved on\n");
+      expect(gitSync(s.repo, ["status", "--porcelain"])).toBe("");
+      // A throw is not a verified, git-only failure: the attempt stays unresolved and is not tried again on its own.
+      expect(events(f, UNDONE, s.runId)).toEqual([]);
+    });
+  });
+
+  it("(d) every undo step that fails is a named blocker with git's words and the state it leaves; the refusal never claims a rollback", async () => {
+    const cases = [
+      {
+        name: "files-back refused: HEAD follows the files onto the task branch",
+        arms: (repo: string) => (real: string) => `  *"task branch HEAD"*) '${real}' "$@"; code=$?; printf '# user edit\\n' > '${join(repo, "README.md")}'; exit "$code";;`,
+        steps: ["files-back"],
+        evidence: { leftOnBranch: true, headMoved: true, filesMoved: true },
+        on: "task",
+      },
+      {
+        name: "head-back fails",
+        arms: (repo: string) => (real: string) => [
+          `  *"task branch undone HEAD"*) echo 'injected: head-back' >&2; exit 1;;`,
+          `  *"task branch HEAD"*) '${real}' "$@"; code=$?; printf 'notes\\n' > '${join(repo, "notes.txt")}'; exit "$code";;`,
+        ].join("\n"),
+        steps: ["head-back"],
+        evidence: { headMoved: true },
+        on: "task",
+      },
+      {
+        name: "ref-delete fails",
+        arms: (repo: string) => (real: string) => [
+          `  *"task branch undone -d"*) echo 'injected: ref-delete' >&2; exit 1;;`,
+          `  *"task branch HEAD"*) '${real}' "$@"; code=$?; printf 'notes\\n' > '${join(repo, "notes.txt")}'; exit "$code";;`,
+        ].join("\n"),
+        steps: ["ref-delete"],
+        evidence: { headMoved: false, filesMoved: false, refRemoved: false },
+        on: "dev",
+      },
+    ];
+    for (const c of cases) {
+      await withBootstrapRuntime(async (f) => {
+        const s = await oneTask(f, `stb-r3-d-${cases.indexOf(c)}`, true);
+        const git = gitScripted(c.arms(s.repo));
+        let refused: Record<string, unknown>;
+        try {
+          refused = await runTask(f, s, s.taskId, s.claimId);
+        } finally {
+          git.restore();
+        }
+        expect(refused, c.name).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { rolledBack: false, undoRecorded: false, ...c.evidence } });
+        const blockers = blockersOf(refused);
+        expect(blockers.map((blocker) => blocker.step), c.name).toEqual(c.steps);
+        for (const blocker of blockers) {
+          expect(blocker.error.length, c.name).toBeGreaterThan(0);
+          expect(blocker.state.length, c.name).toBeGreaterThan(0);
+        }
+        if (c.name === "head-back fails") expect(blockers[0]!.error).toContain("injected: head-back");
+        if (c.name === "ref-delete fails") expect(blockers[0]!.error).toContain("injected: ref-delete");
+        expect(branchOf(s.repo), c.name).toBe(c.on === "task" ? s.target.branch : "dev");
+        // The ref this attempt made is kept: something stands on it, or its removal failed.
+        expect(refOf(s.repo, `refs/heads/${s.target.branch}`), c.name).toBe(s.target.baseSha);
+        expect(events(f, UNDONE, s.runId), c.name).toEqual([]);
+      });
+    }
+  });
+
+  it("an attempt undone and verified is recorded resolved, so the task's next attempt creates its branch afresh", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await oneTask(f, "stb-r3-resolved", true);
+      const git = gitScripted(() => `  *"task branch HEAD"*) exit 1;;`);
+      let refused: Record<string, unknown>;
+      try {
+        refused = await runTask(f, s, s.taskId, s.claimId);
+      } finally {
+        git.restore();
+      }
+      expect(refused).toMatchObject({ ok: false, evidence: { rolledBack: true, undoRecorded: true, refRemoved: true, blockers: [] } });
+      expect(events(f, UNDONE, s.runId)).toEqual([expect.objectContaining({ attemptId: events(f, CREATING, s.runId)[0]!["attemptId"] })]);
+      const retry = await runTask(f, s, s.taskId, s.claimId);
+      expect(retry).toMatchObject({ ok: true });
+      await settle(f, retry);
+      expect(branchOf(s.repo)).toBe(s.target.branch);
+      expect(events(f, CREATED, s.runId)).toHaveLength(1);
     });
   });
 });

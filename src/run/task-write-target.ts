@@ -163,6 +163,15 @@ export const TASK_BRANCH_CREATING = "TASK_BRANCH_CREATING";
  */
 export const TASK_BRANCH_CREATED = "TASK_BRANCH_CREATED";
 
+/**
+ * #512 S-TB (review r3, S-TB-07) — an attempt that created nothing it kept: its ref never made, or made
+ * and removed, with HEAD and every file as they were, all verified. It resolves that attempt's intent,
+ * so a later attempt may create the branch afresh. It is never written when the attempt's own records
+ * failed or when anything could not be put back: such an attempt stays unresolved, and the task's
+ * branch is not attempted again on the control plane's own.
+ */
+export const TASK_BRANCH_CREATION_UNDONE = "TASK_BRANCH_CREATION_UNDONE";
+
 /** Every completed creation of a repository's branch, oldest first (`TASK_BRANCH_CREATED` only). */
 export const branchCreations = (
   db: Db,
@@ -182,6 +191,27 @@ export const branchCreations = (
       return { runId: row.run_id ?? "", taskId: String(evidence.taskId ?? ""), baseSha: String(evidence.baseSha ?? "") };
     })
     .filter((creation) => creation.runId.length > 0 && creation.taskId.length > 0 && creation.baseSha.length > 0);
+
+/**
+ * Whether an attempt to create this run and task's branch at this base was started and never resolved:
+ * an intent whose attempt has neither a completion nor a verified undo (an intent written before
+ * attempts carried an id is resolved only by a completion of the same scope).
+ */
+export const unresolvedCreationAttempt = (
+  db: Db,
+  scope: { runId: string; taskId: string; repositoryIdentity: string; branch: string; baseSha: string },
+): boolean => {
+  const rows = db.all<{ kind: string; attempt: string | null }>(
+    `SELECT kind, json_extract(evidence_json, '$.attemptId') AS attempt FROM audit_events
+      WHERE kind IN (?, ?, ?) AND run_id = ? AND json_extract(evidence_json, '$.taskId') = ?
+        AND json_extract(evidence_json, '$.repositoryIdentity') = ? AND json_extract(evidence_json, '$.branch') = ?
+        AND json_extract(evidence_json, '$.baseSha') = ?`,
+    [TASK_BRANCH_CREATING, TASK_BRANCH_CREATED, TASK_BRANCH_CREATION_UNDONE, scope.runId, scope.taskId, scope.repositoryIdentity, scope.branch, scope.baseSha],
+  );
+  const resolved = new Set(rows.filter((row) => row.kind !== TASK_BRANCH_CREATING && row.attempt).map((row) => row.attempt));
+  const completed = rows.some((row) => row.kind === TASK_BRANCH_CREATED);
+  return rows.some((row) => row.kind === TASK_BRANCH_CREATING && (row.attempt ? !resolved.has(row.attempt) : !completed));
+};
 
 /** Whether an attempt to create this run and task's branch at this base was started (an intent, never ownership). */
 export const branchCreationAttempted = (

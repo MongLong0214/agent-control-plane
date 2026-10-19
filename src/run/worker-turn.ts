@@ -10,16 +10,19 @@ import { type FailureClass, Role, RunKind, SessionLifecycle, TaskState, roleKeyF
 import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import type { InvocationResult, ProviderAdapter } from "../runtime/provider.ts";
+import { randomUUID } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { ExecutionRecord, TaskGraph } from "./task-graph.ts";
 import {
   TASK_BRANCH_CREATED,
   TASK_BRANCH_CREATING,
+  TASK_BRANCH_CREATION_UNDONE,
   type TaskWriteTarget,
   TaskWriteTargets,
   branchCreationAttempted,
   branchCreations,
+  unresolvedCreationAttempt,
   recordedWriteTarget,
   sameWriteTarget,
 } from "./task-write-target.ts";
@@ -41,6 +44,7 @@ import {
   plumbingWorkerCommit,
   type GitChildren,
   type GitChildrenClosed,
+  type GitRun,
   type GitProcessGroup,
   indexSnapshot,
   runPinnedGit,
@@ -1306,6 +1310,18 @@ export class WorkerTurnRunner {
       const lineage = await this.taskBranchLineage(repo, facts, target, tip);
       if (!lineage.allowed) return lineage;
     }
+    // Review r3 (S-TB-07) — an earlier attempt that never resolved (its own records failed, or something
+    // of it could not be put back) is not attempted again on the control plane's own: it is refused by name.
+    if (tip === null) {
+      const scope = { runId: facts.runId, taskId: facts.taskId, repositoryIdentity: facts.claim.repositoryIdentity, branch: target.branch, baseSha: target.baseSha };
+      if (unresolvedCreationAttempt(this.ports.db, scope)) {
+        return deny(
+          ReasonCode.CONFLICT,
+          "an earlier attempt to create the task's branch never resolved; the control plane does not attempt it again on its own",
+          { worktreeId: worktree, branch: target.branch, baseSha: target.baseSha, creationAttempted: true },
+        );
+      }
+    }
     // Re-entry: the checkout is on the task's branch already; the preparation that follows reads it.
     if (branch === target.branch) return allow(ReasonCode.OK, undefined);
     let handoff: { runId: string; taskId: string; branch: string } | null = null;
@@ -1345,6 +1361,8 @@ export class WorkerTurnRunner {
     const effect: { outcome: Decision<void> } = {
       outcome: deny(ReasonCode.INTERNAL_ERROR, "the task branch effect did not run", { worktreeId: worktree }),
     };
+    // One attempt's records (intent, completion or verified undo) carry the same id.
+    const attemptId = randomUUID();
     const authorised = await this.ports.guard.authorize(
       {
         operation: WriteOperation.GIT_BRANCH,
@@ -1371,7 +1389,7 @@ export class WorkerTurnRunner {
           indexBaseline,
           // The intent, written immediately before the create-only ref update, and the completion,
           // written only once the branch exists at the pin and the checkout stands clean on it.
-          recordCreation: (kind: typeof TASK_BRANCH_CREATING | typeof TASK_BRANCH_CREATED) => this.ports.audit.record({
+          recordCreation: (kind: CreationRecordKind) => this.ports.audit.record({
             kind,
             runId: facts.runId,
             sessionId: facts.ownerSessionId,
@@ -1381,6 +1399,7 @@ export class WorkerTurnRunner {
               branch: target.branch,
               baseSha: target.baseSha,
               worktreeId: worktree,
+              attemptId,
             },
           }),
         });
@@ -1388,25 +1407,30 @@ export class WorkerTurnRunner {
     );
     if (!authorised.allowed) return authorised as Decision<never>;
     if (!effect.outcome.allowed) return effect.outcome;
-    this.ports.audit.record({
-      kind: TASK_BRANCH_PREPARED,
-      runId: facts.runId,
-      sessionId: facts.ownerSessionId,
-      evidence: {
-        taskId: facts.taskId,
-        claimId: facts.claim.claimId,
-        repositoryIdentity: facts.claim.repositoryIdentity,
-        worktreeId: worktree,
-        branch: target.branch,
-        baseSha: target.baseSha,
-        head: to,
-        from: head,
-        fromBranch: branch,
-        created: tip === null,
-        checkedOut: needsCheckout,
-        handoffFrom: handoff,
-      },
-    });
+    // Evidence only, never read as ownership: a failure to write it does not refuse a branch made and recorded.
+    try {
+      this.ports.audit.record({
+        kind: TASK_BRANCH_PREPARED,
+        runId: facts.runId,
+        sessionId: facts.ownerSessionId,
+        evidence: {
+          taskId: facts.taskId,
+          claimId: facts.claim.claimId,
+          repositoryIdentity: facts.claim.repositoryIdentity,
+          worktreeId: worktree,
+          branch: target.branch,
+          baseSha: target.baseSha,
+          head: to,
+          from: head,
+          fromBranch: branch,
+          created: tip === null,
+          checkedOut: needsCheckout,
+          handoffFrom: handoff,
+        },
+      });
+    } catch {
+      /* the completion record stands; PREPARED is a report */
+    }
     return allow(ReasonCode.OK, undefined);
   }
 
@@ -2211,22 +2235,113 @@ const uncleanPaths = async (repo: PinnedRepository, head: string, format: "sha1"
   ])];
 };
 
+type CreationRecordKind = typeof TASK_BRANCH_CREATING | typeof TASK_BRANCH_CREATED | typeof TASK_BRANCH_CREATION_UNDONE;
+
+/** One undo step that did not do what it was for: the step, git's (or the store's) own words, and where that leaves the checkout. */
+interface UndoBlocker {
+  step: "head-back" | "files-back" | "head-forward" | "ref-delete" | "files-forward" | "completion" | "undo";
+  error: string;
+  state: string;
+  paths?: string[];
+}
+
+const gitWords = (run: GitRun): string => `exit ${run.exitCode ?? "none"}: ${(run.stderr || run.stdout).trim().slice(0, 300)}`;
+
+/** The ref HEAD names, or null when HEAD is detached or cannot be read. */
+const headRefOf = async (repo: PinnedRepository): Promise<string | null> => {
+  const read = await runPinnedGit(repo, ["symbolic-ref", "-q", "HEAD"]);
+  return read.exitCode === 0 ? read.stdout.trim() : null;
+};
+
+/** Each path's mode and object id in `tree`, for the paths asked; a path the tree lacks is absent. */
+const treeEntriesOf = async (repo: PinnedRepository, tree: string, paths: readonly string[]): Promise<Map<string, { mode: string; oid: string }>> => {
+  const entries = new Map<string, { mode: string; oid: string }>();
+  if (paths.length === 0) return entries;
+  const listed = await runPinnedGit(repo, ["ls-tree", "-z", "--full-tree", tree, "--", ...paths]);
+  if (listed.exitCode !== 0) throw new Error(`git ls-tree ${tree} ${gitWords(listed)}`);
+  for (const record of listed.stdout.split("\0")) {
+    if (!record) continue;
+    const tab = record.indexOf("\t");
+    const [mode, , oid] = record.slice(0, tab).split(" ");
+    entries.set(record.slice(tab + 1), { mode: mode!, oid: oid! });
+  }
+  return entries;
+};
+
 /**
- * The GIT_BRANCH effect, run inside the guard's grant (review r2, S-TB-03 and S-TB-07). Every check that
- * can refuse comes before the first write, and a refusal after it undoes exactly what this attempt did:
+ * Review r3 (S-TB-07 b) — after a two-tree `read-tree -m -u` from `from` to `dest` failed. Git can have
+ * written some files before it stopped (it never writes the index then), so nothing is assumed: what now
+ * differs from `from` is measured. A path whose bytes and mode are exactly `dest`'s (or that `dest` lacks
+ * and is gone) was written by that read-tree, and is put back from the index, which still holds `from`;
+ * a path `dest` added is removed only while it holds exactly `dest`'s bytes. Anything else is not ours and
+ * is never touched. Returns what was moved, what could not be put back, and what is not ours.
+ */
+const putBackPartialMove = async (
+  repo: PinnedRepository,
+  from: string,
+  dest: string,
+  format: "sha1" | "sha256",
+  label: string,
+): Promise<{ moved: string[]; stuck: string[]; foreign: string[]; error: string | null }> => {
+  try {
+    const staged = await stagedAgainst(repo, from, indexSnapshot(repo, `${label}-index`));
+    if (staged.length > 0) {
+      return { moved: [], stuck: staged.slice(0, 50), foreign: [], error: "the index no longer holds the tree the files were moved from; nothing is put back" };
+    }
+    const scan = await scanAgainst(repo, from, format, label);
+    const wanted = await treeEntriesOf(repo, dest, scan.entries.map((entry) => entry.path));
+    const moved: string[] = [];
+    const foreign: string[] = [...scan.unsafe];
+    for (const entry of scan.entries) {
+      const target = wanted.get(entry.path);
+      const ours = target === undefined ? entry.mode === null : entry.blob === target.oid && entry.mode === target.mode;
+      (ours ? moved : foreign).push(entry.path);
+    }
+    if (moved.length === 0) return { moved, stuck: [], foreign, error: null };
+    const original = await treeEntriesOf(repo, from, moved);
+    const restore = moved.filter((path) => original.has(path));
+    let error: string | null = null;
+    if (restore.length > 0) {
+      const out = await runPinnedGit(repo, ["checkout-index", "-f", "-q", "--", ...restore]);
+      if (out.exitCode !== 0) error = `git checkout-index ${gitWords(out)}`;
+    }
+    for (const path of moved.filter((candidate) => !original.has(candidate))) {
+      try {
+        rmSync(join(repo.workTree, path), { force: true });
+      } catch (failure) {
+        error = `${path} could not be removed: ${errorText(failure).slice(0, 200)}`;
+      }
+    }
+    const again = new Set((await scanAgainst(repo, from, format, `${label}-again`)).entries.map((entry) => entry.path));
+    const stuck = moved.filter((path) => again.has(path));
+    return { moved, stuck, foreign, error: stuck.length > 0 ? (error ?? "the paths did not read back as they were") : null };
+  } catch (failure) {
+    return { moved: [], stuck: ["(unmeasured)"], foreign: [], error: `the checkout could not be measured: ${errorText(failure).slice(0, 300)}` };
+  }
+};
+
+/**
+ * The GIT_BRANCH effect, run inside the guard's grant (review r2 S-TB-03 and S-TB-07; review r3 S-TB-07,
+ * CEO bb10228a 07). Every check that can refuse comes before the first write:
  *
  * 1. HEAD, the worktree and the index are as they were read: clean, nothing staged anew.
  * 2. Where files must move, the index's stat cache is refreshed; a file changed since step 1 refuses here.
- * 3. A missing branch is created create-only at the pinned base (its intent recorded first) and read back.
- * 4. Files move by a two-tree `read-tree -m -u`, which writes nothing when it refuses; then HEAD names the
- *    branch, and the checkout must stand on it at the expected commit, clean.
+ * 3. A missing branch's intent is recorded, it is created create-only at the pinned base and read back.
+ * 4. Files move by a two-tree `read-tree -m -u`; then HEAD names the branch, and the checkout must stand
+ *    on it at the expected commit, clean.
  * 5. Only then is the creation recorded complete (`TASK_BRANCH_CREATED`).
  *
- * A refusal after step 3 moves HEAD and files back (`read-tree -m -u` the other way, which also refuses
- * rather than overwrite) and deletes only the ref this attempt created, and only while it still points at
- * the pinned base. No other branch is touched and no user byte is written; if the files cannot be moved
- * back without overwriting a change, the checkout is left on the task's branch, which is then recorded as
- * created, and the refusal says so.
+ * A refusal or a throw after the first write goes through one undo, step by step, each step only when its
+ * own precondition is verified first: HEAD is moved back only while it still names the task branch this
+ * attempt set (someone else's choice is left alone); files are moved back only once HEAD is back, by the
+ * reverse `read-tree`, whose own partial failure is measured and put back; the ref is deleted only if this
+ * attempt created it, nothing stands on it and it still points at the pinned base (`update-ref -d` with
+ * that old value). A step that fails, or is not taken because its precondition does not hold, is a named
+ * blocker in the refusal with git's words and the state it leaves; nothing claims a rollback that did not
+ * happen. Where files cannot go back without overwriting a change, HEAD follows them onto the task branch,
+ * so the checkout stays consistent, and the branch is recorded created. A fully verified undo is recorded
+ * (`TASK_BRANCH_CREATION_UNDONE`) so a later attempt may start afresh; an attempt whose own records
+ * failed, or that left anything behind, stays unresolved and is not attempted again on its own.
  */
 const switchToTaskBranch = async (
   repo: PinnedRepository,
@@ -2240,12 +2355,20 @@ const switchToTaskBranch = async (
     needsCheckout: boolean;
     /** `stagedContent` of the real index when the checkout was read clean. */
     indexBaseline: string;
-    recordCreation: (kind: typeof TASK_BRANCH_CREATING | typeof TASK_BRANCH_CREATED) => Decision<number>;
+    recordCreation: (kind: CreationRecordKind) => Decision<number>;
   },
 ): Promise<Decision<void>> => {
   const branchRef = `refs/heads/${input.target.branch}`;
   const refused = (message: string, evidence: Record<string, unknown> = {}): Decision<never> =>
     deny(ReasonCode.CONFLICT, message, { branch: input.target.branch, ...evidence });
+  /** A record write, its throw turned into a refusal: the store failing is one more failure to undo. */
+  const record = (kind: CreationRecordKind): Decision<number> => {
+    try {
+      return input.recordCreation(kind);
+    } catch (error) {
+      return deny(ReasonCode.AUDIT_WRITE_FAILED, `the ${kind} record could not be written: ${errorText(error).slice(0, 300)}`, {});
+    }
+  };
   const now = await headOf(repo);
   if (now.head !== input.head || now.branch !== input.branch) {
     return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the checkout moved before the task's branch was made", { branch: input.target.branch });
@@ -2263,9 +2386,8 @@ const switchToTaskBranch = async (
     // The index's stat cache can be stale where the control plane's own commit updated entries without
     // one (`plumbingWorkerCommit`); `read-tree -m` refuses an entry it cannot see is up to date. The
     // refresh rewrites only that cache: the content was found clean above, and no filter driver is
-    // configured, so nothing the repository chose runs while files are compared. A file changed since
-    // then fails it, before anything is created.
-    // Without `-q`: a file whose content changed makes the refresh fail ("needs update"), not pass.
+    // configured, so nothing the repository chose runs while files are compared. Without `-q`, a file
+    // whose content changed since then fails it ("needs update"), before anything is created.
     const refreshed = await runPinnedGit(repo, ["update-index", "--refresh"]);
     if (refreshed.exitCode !== 0) {
       return refused("the checkout's files changed before its task branch was made; nothing was created or moved", {
@@ -2274,79 +2396,200 @@ const switchToTaskBranch = async (
     }
   }
 
-  // From here on, what this attempt did is undone on any refusal.
+  // From here on, what this attempt did is undone on any refusal or throw.
   let createdHere = false;
   let filesMoved = false;
   let headMoved = false;
-  const undo = async (message: string, evidence: Record<string, unknown>): Promise<Decision<never>> => {
-    if (headMoved) {
-      const back = await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch undone", "HEAD", `refs/heads/${input.branch}`]);
-      if (back.exitCode === 0) headMoved = false;
-    }
-    if (filesMoved && !headMoved) {
-      const restored = await runPinnedGit(repo, ["read-tree", "-m", "-u", input.to, input.head]);
-      if (restored.exitCode === 0) {
-        filesMoved = false;
-      } else {
-        // The files cannot go back without overwriting a change: HEAD follows them, so the checkout is
-        // consistent, on the task's branch, which is then this task's own and recorded as such.
-        const forward = await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch", "HEAD", branchRef]);
-        if (forward.exitCode === 0) headMoved = true;
+  const blockers: UndoBlocker[] = [];
+  const undo = async (message: string, evidence: Record<string, unknown>, cause: "git" | "records"): Promise<Decision<never>> => {
+    try {
+      // 1. HEAD back, only while it still names the task branch this attempt set.
+      let headElsewhere: string | null = null;
+      if (headMoved) {
+        const current = await headRefOf(repo);
+        if (current !== branchRef) {
+          headElsewhere = current ?? "a detached HEAD";
+          blockers.push({
+            step: "head-back",
+            error: `HEAD names ${headElsewhere}, not the task branch this attempt set; it is not moved`,
+            state: `HEAD is left on ${headElsewhere}; the files are ${filesMoved ? `at the task tree ${input.to}` : "as they were"}`,
+          });
+        } else {
+          const back = await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch undone", "HEAD", `refs/heads/${input.branch}`]);
+          if (back.exitCode === 0) {
+            headMoved = false;
+          } else {
+            blockers.push({
+              step: "head-back",
+              error: gitWords(back),
+              state: `HEAD still names the task branch at ${input.to}; the files are ${filesMoved ? "at the task tree" : "as they were"}`,
+            });
+          }
+        }
       }
+      // 2. Files back, only once HEAD is back on the branch it left.
+      let reverseRefused: string | null = null;
+      if (filesMoved && !headMoved && headElsewhere === null) {
+        const reverse = await runPinnedGit(repo, ["read-tree", "-m", "-u", input.to, input.head]);
+        if (reverse.exitCode === 0) {
+          filesMoved = false;
+        } else {
+          reverseRefused = gitWords(reverse);
+          const put = await putBackPartialMove(repo, input.to, input.head, input.format, "undo-reverse");
+          if (put.stuck.length > 0 || put.error !== null) {
+            blockers.push({
+              step: "files-back",
+              error: `${reverseRefused}; ${put.error ?? ""}`,
+              state: `HEAD names ${input.branch} at ${input.head}, while these paths are at neither tree: ${put.stuck.join(", ")}`,
+              paths: put.stuck,
+            });
+          } else {
+            blockers.push({
+              step: "files-back",
+              error: reverseRefused,
+              state: `the files stay at the task tree ${input.to}, with the change that stopped them; HEAD is put back on the task branch to match them`,
+            });
+            // Every file is still at the task tree: HEAD follows them, so the checkout is consistent there.
+            const forward = await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch", "HEAD", branchRef]);
+            if (forward.exitCode === 0) {
+              headMoved = true;
+            } else {
+              blockers.push({
+                step: "head-forward",
+                error: gitWords(forward),
+                state: `HEAD names ${input.branch} at ${input.head} while the index and files are at the task tree ${input.to}`,
+              });
+            }
+          }
+        }
+      }
+      // 3. The ref this attempt created: removed only while nothing stands on it and it still points at the pin.
+      let refRemoved = false;
+      let refNowElsewhere: string | null = null;
+      if (createdHere) {
+        const current = await commitOf(repo, branchRef);
+        const standsOnIt = filesMoved || (await headRefOf(repo)) === branchRef;
+        if (current !== input.target.baseSha) {
+          refNowElsewhere = current ?? "deleted";
+        } else if (!standsOnIt && blockers.length === 0) {
+          const removed = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch undone", "-d", branchRef, input.target.baseSha]);
+          if (removed.exitCode === 0) {
+            refRemoved = true;
+          } else {
+            blockers.push({
+              step: "ref-delete",
+              error: gitWords(removed),
+              state: `${branchRef} is left where it is (${(await commitOf(repo, branchRef)) ?? "deleted"})`,
+            });
+          }
+        }
+      }
+      const leftOnBranch = createdHere && !refRemoved && refNowElsewhere === null && headMoved && (await headRefOf(repo)) === branchRef;
+      if (leftOnBranch) {
+        const done = record(TASK_BRANCH_CREATED);
+        if (!done.allowed) {
+          blockers.push({ step: "completion", error: done.message, state: "the checkout is on the task branch, which has no completion record and is not adopted" });
+        }
+      }
+      const nothingKept = !createdHere || refRemoved || refNowElsewhere !== null;
+      const rolledBack = blockers.length === 0 && !headMoved && !filesMoved && nothingKept;
+      let undoRecorded = false;
+      if (rolledBack && cause === "git") undoRecorded = record(TASK_BRANCH_CREATION_UNDONE).allowed;
+      return refused(message, {
+        ...evidence,
+        created: createdHere,
+        refRemoved,
+        leftOnBranch,
+        headMoved,
+        filesMoved,
+        rolledBack,
+        undoRecorded,
+        ...(refNowElsewhere === null ? {} : { refNowElsewhere }),
+        ...(reverseRefused === null ? {} : { reverseRefused }),
+        blockers,
+      });
+    } catch (failure) {
+      blockers.push({ step: "undo", error: errorText(failure).slice(0, 300), state: "the undo stopped where it was; the checkout was not measured after it" });
+      return refused(message, { ...evidence, created: createdHere, headMoved, filesMoved, rolledBack: false, blockers });
     }
-    let refRemoved = false;
-    if (createdHere && !filesMoved && !headMoved && (await commitOf(repo, branchRef)) === input.target.baseSha) {
-      const removed = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch undone", "-d", branchRef, input.target.baseSha]);
-      refRemoved = removed.exitCode === 0;
-    }
-    const leftOnBranch = createdHere && !refRemoved;
-    if (leftOnBranch && headMoved) input.recordCreation(TASK_BRANCH_CREATED);
-    return refused(message, { ...evidence, created: createdHere, refRemoved, leftOnBranch, headMoved, filesMoved });
   };
 
-  if (input.tip === null) {
-    const intent = input.recordCreation(TASK_BRANCH_CREATING);
-    if (!intent.allowed) return intent as Decision<never>;
-    const created = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch", branchRef, input.target.baseSha, ZERO_OID[input.format]]);
-    if (created.exitCode !== 0) {
-      return refused("the task's branch could not be created; a ref that exists is never overwritten, nor adopted", {
-        error: created.stderr.slice(0, 300),
-      });
+  try {
+    if (input.tip === null) {
+      const intent = record(TASK_BRANCH_CREATING);
+      if (!intent.allowed) return refused(`the task branch's creation could not be recorded before it was made; nothing was created: ${intent.message}`);
+      const created = await runPinnedGit(repo, ["update-ref", "-m", "agent-control-plane: task branch", branchRef, input.target.baseSha, ZERO_OID[input.format]]);
+      if (created.exitCode !== 0) {
+        // Nothing of this attempt exists: the attempt is resolved, the ref there is someone else's.
+        const resolved = record(TASK_BRANCH_CREATION_UNDONE).allowed;
+        return refused("the task's branch could not be created; a ref that exists is never overwritten, nor adopted", {
+          error: created.stderr.slice(0, 300),
+          undoRecorded: resolved,
+        });
+      }
+      createdHere = true;
+      if ((await commitOf(repo, branchRef)) !== input.target.baseSha) {
+        return await undo("the task's branch does not read back at the pinned base after its creation", {}, "git");
+      }
+    } else if ((await commitOf(repo, branchRef)) !== input.tip) {
+      return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the task's branch moved before it was checked out", { branch: input.target.branch });
     }
-    createdHere = true;
-    if ((await commitOf(repo, branchRef)) !== input.target.baseSha) {
-      return undo("the task's branch does not read back at the pinned base after its creation", {});
+    if (input.needsCheckout) {
+      const moved = await runPinnedGit(repo, ["read-tree", "-m", "-u", input.head, input.to]);
+      if (moved.exitCode !== 0) {
+        // Review r3 (S-TB-07 b): never assume a refused read-tree moved nothing. Measure, put back what it
+        // wrote, and keep everything as it stands if that cannot be done.
+        const put = await putBackPartialMove(repo, input.head, input.to, input.format, "forward-refused");
+        if (put.stuck.length > 0 || put.error !== null) {
+          blockers.push({
+            step: "files-forward",
+            error: `${gitWords(moved)}; ${put.error ?? ""}`,
+            state: `HEAD names ${input.branch} at ${input.head}; ${createdHere ? `${branchRef} is kept at the pinned base; ` : ""}these paths are at neither tree: ${put.stuck.join(", ")}`,
+            paths: put.stuck,
+          });
+          return refused("the checkout's files could not be moved to the task's branch, and what moved could not be put back; everything is left as it stands", {
+            error: moved.stderr.slice(0, 300),
+            created: createdHere,
+            refRemoved: false,
+            leftOnBranch: false,
+            headMoved: false,
+            filesMoved: true,
+            rolledBack: false,
+            blockers,
+          });
+        }
+        return await undo("the checkout's files could not be moved to the task's branch; they are left as they were", {
+          error: moved.stderr.slice(0, 300),
+          ...(put.moved.length > 0 ? { putBack: put.moved } : {}),
+          ...(put.foreign.length > 0 ? { notOurs: put.foreign.slice(0, 50) } : {}),
+        }, "git");
+      }
+      filesMoved = true;
     }
-  } else if ((await commitOf(repo, branchRef)) !== input.tip) {
-    return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "the task's branch moved before it was checked out", { branch: input.target.branch });
-  }
-  if (input.needsCheckout) {
-    const moved = await runPinnedGit(repo, ["read-tree", "-m", "-u", input.head, input.to]);
-    if (moved.exitCode !== 0) {
-      return undo("the checkout's files could not be moved to the task's branch; they are left as they were", {
-        error: moved.stderr.slice(0, 300),
-      });
+    const pointed = await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch", "HEAD", branchRef]);
+    if (pointed.exitCode !== 0) {
+      return await undo("the checkout could not be put on the task's branch", { error: pointed.stderr.slice(0, 300) }, "git");
     }
-    filesMoved = true;
+    headMoved = true;
+    const after = await headOf(repo);
+    if (after.head !== input.to || after.branch !== input.target.branch) {
+      return await undo("the checkout is not on the task's branch after it was made", { observed: after.branch, head: after.head }, "git");
+    }
+    const left = await uncleanPaths(repo, input.to, input.format, "branch-after");
+    if (left.length > 0) {
+      return await undo("the checkout changed while it was moved to the task's branch; the change is left where it is", { paths: left.slice(0, 50) }, "git");
+    }
+    if (createdHere) {
+      const completed = record(TASK_BRANCH_CREATED);
+      if (!completed.allowed) {
+        return await undo("the task branch's creation could not be recorded complete", { reasonCode: completed.reasonCode, error: completed.message }, "records");
+      }
+    }
+    return allow(ReasonCode.OK, undefined);
+  } catch (failure) {
+    // Review r3 (S-TB-07 c): a throw after the first write goes through the same undo.
+    return await undo("an unexpected failure while the task's branch was made", { error: errorText(failure).slice(0, 300) }, "records");
   }
-  const pointed = await runPinnedGit(repo, ["symbolic-ref", "-m", "agent-control-plane: task branch", "HEAD", branchRef]);
-  if (pointed.exitCode !== 0) {
-    return undo("the checkout could not be put on the task's branch", { error: pointed.stderr.slice(0, 300) });
-  }
-  headMoved = true;
-  const after = await headOf(repo);
-  if (after.head !== input.to || after.branch !== input.target.branch) {
-    return undo("the checkout is not on the task's branch after it was made", { observed: after.branch, head: after.head });
-  }
-  const left = await uncleanPaths(repo, input.to, input.format, "branch-after");
-  if (left.length > 0) {
-    return undo("the checkout changed while it was moved to the task's branch; the change is left where it is", { paths: left.slice(0, 50) });
-  }
-  if (createdHere) {
-    const completed = input.recordCreation(TASK_BRANCH_CREATED);
-    if (!completed.allowed) return undo("the task branch's creation could not be recorded complete", { reasonCode: completed.reasonCode });
-  }
-  return allow(ReasonCode.OK, undefined);
 };
 
 const readIgnored = async (repo: PinnedRepository, treeIsh: string, label: string): Promise<IgnoredReading> => {
