@@ -34,6 +34,10 @@ import {
   resultRecoveryTriggerKind,
   reviewRetryTriggerId,
   reviewRetryTriggerKind,
+  STANDARD_WORK_CONTINUATION_STALLED,
+  STANDARD_WORK_CONTINUATION_WAKE,
+  standardWorkContinuationTriggerId,
+  standardWorkContinuationTriggerKind,
 } from "../runtime/provisioned-session-runtime.ts";
 import {
   resolveDoctorHealth,
@@ -46,7 +50,18 @@ import {
 import { isProjectlessBootstrap } from "../bootstrap/bootstrap-plan.ts";
 import { REPO_FACTORY_GITHUB_WRITE_OPERATION } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
-import { ArtifactKind, Role, type RoleBinding, type RunRow, RunState, SessionLifecycle } from "../domain/types.ts";
+import {
+  ArtifactKind,
+  ContinuityMode,
+  Role,
+  type RoleBinding,
+  RunKind,
+  type RunRow,
+  RunState,
+  SessionLifecycle,
+  TaskState,
+  roleKeyFor,
+} from "../domain/types.ts";
 import { buildAcceptanceReport } from "../export/acceptance-report.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
 import {
@@ -520,6 +535,15 @@ export interface BootstrapResultRecoveryReport {
     /** Present on a review retry wake: the frozen candidate and the unavailable review it retries. */
     retry?: { candidateSnapshotDigest: string; unavailableEventId: number; candidateFrozenEventId?: number };
   }>;
+}
+
+/**
+ * #512 — what one standard work continuation pass did (`Daemon.wakeStandardWorkContinuation`): the
+ * owners it woke, and the blockers it recorded for a woken state that made no progress.
+ */
+export interface StandardWorkContinuationReport {
+  woken: Array<{ runId: string; roleKey: string; bindingGeneration: number; taskId: string; taskState: string }>;
+  stalled: Array<{ runId: string; roleKey: string; bindingGeneration: number; taskId: string; taskState: string }>;
 }
 
 /**
@@ -1508,6 +1532,11 @@ export class Daemon {
       await this.runPeriodic("bootstrap_plan_recovery", async () => {
         this.wakeBootstrapPlanRecovery();
         this.wakeBootstrapResultRecovery();
+      });
+      // #512 — a driven PRIMARY_CTO whose STANDARD_WORK run stopped after its PLAN, with a READY task
+      // nothing was started for, is woken once per (run, owner generation, task, task state).
+      await this.runPeriodic("standard_work_continuation", async () => {
+        this.wakeStandardWorkContinuation();
       });
       // #639 contract 6, at the moment it matters most: right after a restart, before the first
       // periodic sweep would otherwise get to it. This genuinely runs and asks — it is not a
@@ -2740,6 +2769,202 @@ export class Daemon {
     run: RunRow,
     owner: { roleKey: string; sessionId: string; sessionIncarnation: string; bindingGeneration: number },
   ): boolean {
+    return this.#pinnedOwnerExact(run, owner, Role.BOOTSTRAP_CTO);
+  }
+
+  /**
+   * #512 — the standard work continuation wake, run at startup and on every watchdog tick right after
+   * the bootstrap recovery wakes, and built as they are. A driven PRIMARY_CTO is woken only by what is
+   * addressed to it, so one whose turn got its STANDARD_WORK run's PLAN accepted, acknowledged the
+   * RUN_DISPATCH and started nothing would never run again: its task stays READY with no worker. Its
+   * owner is woken once more, and exactly once per (run, owner binding generation, task, task state),
+   * when all of these hold:
+   *
+   * - the run's state is the one `#standardWorkContinuation` describes: ACTIVE, STANDARD_WORK, with a
+   *   PLAN, no hold, nothing running, its first READY task unstarted, its exact pinned driven owner
+   *   READY with the newest RUN_DISPATCH to it ACKED;
+   * - its session is driven by this runtime as a PRIMARY_CTO, whose daemon holds its current
+   *   credential and is attached, and no turn of it is running or queued.
+   *
+   * The once-marker is a `STANDARD_WORK_CONTINUATION_WAKE` audit event naming the tuple, read before
+   * the wake and written in the same synchronous section as the wake the runtime accepted, so neither
+   * a second tick nor a daemon that starts again wakes it twice; a wake the runtime refused writes
+   * nothing and ran nothing. The trigger's id is built from the tuple, so the runtime's own duplicate
+   * refusal applies as well, and its `stillAdmissible` asks `#standardWorkContinuation` again at the
+   * runtime's final check before the provider call. A tuple already woken is not woken again: once
+   * no turn of its owner is running or queued and the run is still in that same state, the woken turn
+   * made no progress, and the pass records one `STANDARD_WORK_CONTINUATION_STALLED` blocker for the
+   * tuple and nothing more. Only progress (the task staffed or run) or a renewed owner generation
+   * names a new tuple.
+   */
+  wakeStandardWorkContinuation(): StandardWorkContinuationReport {
+    const report: StandardWorkContinuationReport = { woken: [], stalled: [] };
+    const runtime = this.cp.sessionRuntime;
+    const candidates = this.cp.db.all<{ run_id: string }>(
+      `SELECT run_id FROM runs
+        WHERE state = 'ACTIVE' AND kind = 'STANDARD_WORK'
+        ORDER BY created_at, run_id`,
+    );
+    for (const { run_id: runId } of candidates) {
+      const run = this.cp.runs.get(runId);
+      if (!run?.ownerRoleKey || !run.ownerSessionId || !run.ownerSessionIncarnation || run.ownerBindingGeneration === null) continue;
+      const owner = {
+        roleKey: run.ownerRoleKey,
+        sessionId: run.ownerSessionId,
+        sessionIncarnation: run.ownerSessionIncarnation,
+        bindingGeneration: run.ownerBindingGeneration,
+      };
+      const state = this.#standardWorkContinuation(runId, owner);
+      // A turn of the owner running or queued may be the one making progress: nothing is decided now.
+      if (state === null || runtime.turnInProgress(owner.sessionId)) continue;
+      const tuple = { runId, roleKey: owner.roleKey, bindingGeneration: owner.bindingGeneration, ...state };
+      const marked = (kind: string): boolean =>
+        Boolean(this.cp.db.get<{ n: number }>(
+          `SELECT 1 AS n FROM audit_events
+            WHERE kind = ? AND run_id = ?
+              AND json_extract(evidence_json, '$.bindingGeneration') = ?
+              AND json_extract(evidence_json, '$.taskId') = ?
+              AND json_extract(evidence_json, '$.taskState') = ?
+            LIMIT 1`,
+          [kind, runId, tuple.bindingGeneration, tuple.taskId, tuple.taskState],
+        ));
+      if (marked(STANDARD_WORK_CONTINUATION_WAKE)) {
+        // The one wake this state earned has run, or was dropped, and the state is unchanged: the
+        // owner made no progress on it. That is left as an explicit blocker, once, and never re-woken.
+        if (marked(STANDARD_WORK_CONTINUATION_STALLED)) continue;
+        this.cp.audit.record({
+          kind: STANDARD_WORK_CONTINUATION_STALLED,
+          reasonCode: ReasonCode.WORKER_BINDING_REQUIRED,
+          runId,
+          projectId: run.projectId,
+          sessionId: owner.sessionId,
+          roleKey: owner.roleKey,
+          evidence: {
+            bindingGeneration: tuple.bindingGeneration,
+            taskId: tuple.taskId,
+            taskState: tuple.taskState,
+            messageId: tuple.messageId,
+            reason: "the continuation wake for this task ran and the task is still READY with no worker or execution; it is not woken again",
+          },
+        });
+        report.stalled.push({
+          runId, roleKey: owner.roleKey, bindingGeneration: tuple.bindingGeneration, taskId: tuple.taskId, taskState: tuple.taskState,
+        });
+        continue;
+      }
+      if (
+        !runtime.drivesSession(owner.sessionId, Role.PRIMARY_CTO) ||
+        !runtime.holds(owner.sessionId) ||
+        !runtime.attachedToDaemon()
+      ) {
+        continue;
+      }
+      const triggerId = standardWorkContinuationTriggerId(runId, tuple.bindingGeneration, tuple.taskId, tuple.taskState);
+      // As for the bootstrap stages (R1-01): the turn starts behind awaits, so a task staffed, a run
+      // moved or a binding changed meanwhile drops the trigger at the runtime's final check, and its
+      // marker stays spent.
+      const woke = runtime.wake(owner.roleKey, [{
+        id: triggerId,
+        kind: standardWorkContinuationTriggerKind(runId, tuple.taskId),
+        stillAdmissible: () => {
+          const still = this.#standardWorkContinuation(runId, owner);
+          return still !== null && still.taskId === tuple.taskId && still.messageId === tuple.messageId;
+        },
+      }]);
+      if (!woke.allowed) continue;
+      this.cp.audit.record({
+        kind: STANDARD_WORK_CONTINUATION_WAKE,
+        reasonCode: ReasonCode.OK,
+        runId,
+        projectId: run.projectId,
+        sessionId: owner.sessionId,
+        roleKey: owner.roleKey,
+        evidence: {
+          bindingGeneration: tuple.bindingGeneration,
+          taskId: tuple.taskId,
+          taskState: tuple.taskState,
+          messageId: tuple.messageId,
+          triggerId,
+        },
+      });
+      report.woken.push({
+        runId, roleKey: owner.roleKey, bindingGeneration: tuple.bindingGeneration, taskId: tuple.taskId, taskState: tuple.taskState,
+      });
+    }
+    return report;
+  }
+
+  /**
+   * #512 — the state a standard work continuation is for, read from durable records only, or null.
+   * Answers the run's first READY task (by creation order) and the acknowledged RUN_DISPATCH when all
+   * of these hold:
+   *
+   * - the run is ACTIVE and a STANDARD_WORK run of a project, with a PLAN artifact; no continuity
+   *   hold names it, its project is not suspended, and continuity is not in SURVIVAL;
+   * - no candidate pipeline attempt of it is RUNNING (a result submission and its blind review), and
+   *   it has no current candidate, so no result was submitted;
+   * - none of its tasks is RUNNING and none of its executions is RUNNING; it has a READY task, and no
+   *   READY task of it has an execution or a WORKER role that was ever held, so nothing was started,
+   *   queued or tried for any of them;
+   * - `owner` is exactly its owner as a PRIMARY_CTO (`#pinnedOwnerExact`), so its session is READY,
+   *   which also rules out a draining CTO;
+   * - the newest RUN_DISPATCH addressed to that owner generation and session is ACKED. One still
+   *   PENDING is the outbox's own re-wake's to retry, never this sweep's.
+   */
+  #standardWorkContinuation(
+    runId: string,
+    owner: { roleKey: string; sessionId: string; sessionIncarnation: string; bindingGeneration: number },
+  ): { taskId: string; taskState: string; messageId: string } | null {
+    const run = this.cp.runs.get(runId);
+    if (!run || run.state !== RunState.ACTIVE || run.kind !== RunKind.STANDARD_WORK || !run.projectId) return null;
+    if (run.continuityHoldRoleKey) return null;
+    if (this.cp.projects.get(run.projectId)?.suspended !== false) return null;
+    if (this.cp.continuity.mode() === ContinuityMode.SURVIVAL) return null;
+    if (this.cp.artifacts.latest(runId, ArtifactKind.PLAN) === null) return null;
+    const running = this.cp.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM candidate_pipeline_attempts WHERE run_id = ? AND state = 'RUNNING' LIMIT 1`,
+      [runId],
+    );
+    if (running || this.cp.runs.currentCandidate(runId) !== null) return null;
+    const tasks = this.cp.tasks.list(runId);
+    if (tasks.some((task) => task.state === TaskState.RUNNING)) return null;
+    const executing = this.cp.db.get<{ n: number }>(
+      `SELECT 1 AS n FROM task_executions WHERE run_id = ? AND status = 'RUNNING' LIMIT 1`,
+      [runId],
+    );
+    if (executing) return null;
+    const ready = tasks.filter((task) => task.state === TaskState.READY);
+    if (ready.length === 0) return null;
+    for (const task of ready) {
+      const executed = this.cp.db.get<{ n: number }>(
+        `SELECT 1 AS n FROM task_executions WHERE task_id = ? LIMIT 1`,
+        [task.taskId],
+      );
+      if (executed || task.attemptCount > 0) return null;
+      if (this.cp.bindings.history(roleKeyFor(Role.WORKER, { taskId: task.taskId })).length > 0) return null;
+    }
+    if (!this.#pinnedOwnerExact(run, owner, Role.PRIMARY_CTO)) return null;
+    const dispatch = this.cp.db.get<{ message_id: string; status: string }>(
+      `SELECT message_id, status FROM outbox
+        WHERE run_id = ? AND kind = 'RUN_DISPATCH' AND binding_generation = ? AND target_session_id = ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1`,
+      [runId, owner.bindingGeneration, owner.sessionId],
+    );
+    if (dispatch?.status !== "ACKED") return null;
+    return { taskId: ready[0]!.taskId, taskState: TaskState.READY, messageId: dispatch.message_id };
+  }
+
+  /**
+   * Whether `owner` is exactly the run's owner holding `role`: the run is pinned to it, the role's
+   * ACTIVE binding is it (role key, session, incarnation, generation), `assertOwner` still allows
+   * it, and its session is READY.
+   */
+  #pinnedOwnerExact(
+    run: RunRow,
+    owner: { roleKey: string; sessionId: string; sessionIncarnation: string; bindingGeneration: number },
+    role: Role,
+  ): boolean {
     const runId = run.runId;
     if (
       run.ownerRoleKey !== owner.roleKey ||
@@ -2752,7 +2977,7 @@ export class Daemon {
     const binding = this.cp.bindings.active(owner.roleKey);
     if (
       !binding ||
-      binding.role !== Role.BOOTSTRAP_CTO ||
+      binding.role !== role ||
       binding.sessionId !== owner.sessionId ||
       binding.sessionIncarnation !== owner.sessionIncarnation ||
       binding.bindingGeneration !== owner.bindingGeneration
@@ -2796,6 +3021,10 @@ export class Daemon {
       void this.runPeriodic("bootstrap_plan_recovery", async () => {
         this.wakeBootstrapPlanRecovery();
         this.wakeBootstrapResultRecovery();
+      });
+      // #512 — and a driven PRIMARY_CTO whose STANDARD_WORK run stopped after its PLAN, woken once per state.
+      void this.runPeriodic("standard_work_continuation", async () => {
+        this.wakeStandardWorkContinuation();
       });
       // #512 — and a retired worker's session left live while its process ran is settled on a later tick.
       void this.runPeriodic("worker_retirement", async () => {
