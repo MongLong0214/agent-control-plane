@@ -1,0 +1,9 @@
+Limit: v49 rebuilds github_receipts to admit op branch_publish and freezes v48 as schema-v48.sql; v48 receipts stay not value-checked, so existing receipts are not re-read. TRUSTED_CI contracts (D3) and changes under .github/workflows (D5) are refused in v1. Live github_receipts is empty, so row preservation across v49 is shown on seeded copies only
+Warn: S-PUSH: the finalizer publishes the candidate branch (PUBLISH_BRANCH, guard op GITHUB_BRANCH_PUBLISH) before PREPARE_PR, through the Git Data API from local objects only: every SHA comes from the frozen candidate snapshot, the lower bound is the frozen base SHA and never a branch tip read now, every id GitHub returns is checked against the local one, non-portable or secret content is refused before the first upload, and a retry reconciles by branch_publish:<repo>:<branch>:<candidateHead> through a ref readback instead of sending again; no force and no default or base branch write
+Record-Id: r-9f1b540b9d5f
+Provenance: inherited 1bd10097ca67be9426caa546ee2b8875e4011e15
+
+Limit: a forbidden path written in a text encoding other than UTF-8, or UTF-16 with a byte-order mark, is not detected
+Warn: #1161 r1: every ref answer (create, fresh read, base read, reconciliation, post-create read) must name exactly refs/heads/<branch>, type commit, at the expected SHA, or the publish refuses with BRANCH_PUBLISH_OBJECT_MISMATCH and records nothing APPLIED; the public-safety scan reads text as strict UTF-8 on every surface (PR title/body, full tree paths, commit message, author, committer) with a raw-byte policy for non-UTF-8 blobs, and the caps count commits, trees and blobs from git size metadata before any payload is read
+Record-Id: r-b6f93706aa50
+Provenance: inherited defcdba5249b3a734cdb7660a21aed053e198b3f
