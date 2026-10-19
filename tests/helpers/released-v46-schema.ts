@@ -4,6 +4,7 @@ import { chmodSync, readFileSync } from "node:fs";
 import { installMigrationLedger } from "../../src/db/migrations.ts";
 import { dropV47Triggers } from "./released-v47-schema.ts";
 import { dropV48Triggers } from "./released-v48-schema.ts";
+import { takeBackV49 } from "./released-v49-schema.ts";
 
 /**
  * #1094 (v46) — fixtures for the v45 → v46 step.
@@ -48,6 +49,7 @@ export const dropV46Triggers = (raw: Database.Database): void => {
 export const toV45Image = (path: string): string => {
   const legacy = new Database(path);
   try {
+    takeBackV49(legacy);
     dropV48Triggers(legacy);
     dropV47Triggers(legacy);
     dropV46Triggers(legacy);

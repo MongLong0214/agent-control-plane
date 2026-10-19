@@ -168,8 +168,8 @@ describe("integration of v40 (#1068) and v41 (#512 PR-B) from a v39 database", (
     approveMigration(path, "v39 to v41 integration fixture");
     const migrated = openDb(path);
     try {
-      // #246 C1b adds v42, C3 v43, B2-b v44, #512 v45, #1094 v46 and SEC-OD1 v47 and v48 on top; this row is about v40 and v41, which the chain still runs in order.
-      expect(SCHEMA_VERSION).toBe(48);
+      // #246 C1b adds v42, C3 v43, B2-b v44, #512 v45, #1094 v46 and SEC-OD1 v47 and v48 and #512 S-PUSH v49 on top; this row is about v40 and v41, which the chain still runs in order.
+      expect(SCHEMA_VERSION).toBe(49);
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.all<{ version: number; migration_id: string }>(
         `SELECT version, migration_id FROM schema_migrations WHERE version >= 39 ORDER BY version`,
@@ -184,6 +184,7 @@ describe("integration of v40 (#1068) and v41 (#512 PR-B) from a v39 database", (
         { version: 46, migration_id: "v46-rowid-no-replace" },
         { version: 47, migration_id: "v47-owner-decision-authority-guard" },
         { version: 48, migration_id: "v48-owner-decision-supersede-guard" },
+        { version: 49, migration_id: "v49-branch-publish-receipts" },
       ]);
       const triggers = migrated.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'trigger'`).map((row) => row.name);
       for (const name of [...V40_TRIGGERS, ...V41_TRIGGERS]) expect(triggers, name).toContain(name);

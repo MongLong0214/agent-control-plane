@@ -15,6 +15,7 @@ import { V45_BASE_CHECKSUM, contentDigests } from "../helpers/released-v45-schem
 import { V46_BASE_CHECKSUM } from "../helpers/released-v46-schema.ts";
 import { V47_BASE_CHECKSUM, V47_SCHEMA_DIGEST_FROM_RELEASED_CHAIN } from "../helpers/released-v47-schema.ts";
 import { OWNER_DECISION_SUPERSEDE_DENIED, V48_ADDED_TRIGGERS } from "../helpers/released-v48-schema.ts";
+import { V49_CHANGED_OBJECTS } from "../helpers/released-v49-schema.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -558,9 +559,10 @@ const seedAsV47 = (path: string): { kept: Row[]; withdrawnPreV48: Row; removedPr
 };
 
 describe("S1: the v47 → v48 step on the released v47 image", () => {
-  it("is the last step of the chain, from 47, and v47 keeps the full checksum it shipped with", () => {
-    expect(SCHEMA_VERSION).toBe(48);
-    expect(MIGRATIONS.at(-1)).toMatchObject({ id: "v48-owner-decision-supersede-guard", fromVersion: 47, toVersion: 48 });
+  it("is the step from 47, followed only by #512 S-PUSH's v49, and v47 keeps the full checksum it shipped with", () => {
+    expect(SCHEMA_VERSION).toBe(49);
+    expect(MIGRATIONS.find((step) => step.fromVersion === 47)).toMatchObject({ id: "v48-owner-decision-supersede-guard", fromVersion: 47, toVersion: 48 });
+    expect(MIGRATIONS.at(-1)).toMatchObject({ id: "v49-branch-publish-receipts", fromVersion: 48, toVersion: 49 });
     expect(MIGRATIONS.find((step) => step.toVersion === 47)!.checksum()).toBe(V47_BASE_CHECKSUM);
   });
 
@@ -586,7 +588,8 @@ describe("S1: the v47 → v48 step on the released v47 image", () => {
     new Db(path).close();
 
     const after = contentDigests(path);
-    expect(after.userVersion).toBe(48);
+    // #512 S-PUSH: the approved chain runs on to v49, which rebuilds github_receipts with every row kept.
+    expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsDigestBefore, ...restBefore } = before.tables;
     const { schema_migrations: receiptsDigestAfter, ...restAfter } = after.tables;
     expect(restAfter).toEqual(restBefore);
@@ -599,7 +602,7 @@ describe("S1: the v47 → v48 step on the released v47 image", () => {
       expect(raw.prepare("SELECT version, migration_id, checksum FROM schema_migrations WHERE version = 48").get()).toEqual({
         version: 48,
         migration_id: "v48-owner-decision-supersede-guard",
-        checksum: MIGRATIONS.at(-1)!.checksum(),
+        checksum: MIGRATIONS.find((step) => step.toVersion === 48)!.checksum(),
       });
     } finally {
       raw.close();
@@ -632,7 +635,9 @@ describe("S1: the v47 → v48 step on the released v47 image", () => {
     approveMigration(path, "v48 M3 witness");
     new Db(path).close();
     const after = schemaRowsOf(path);
-    expect(after.filter((r) => !V48_ADDED_TRIGGERS.includes(r.name))).toEqual(before);
+    // #512 S-PUSH: v49 follows on the same chain and changes only github_receipts' table and one of its guards.
+    expect(after.filter((r) => !V48_ADDED_TRIGGERS.includes(r.name) && !V49_CHANGED_OBJECTS.includes(r.name)))
+      .toEqual(before.filter((r) => !V49_CHANGED_OBJECTS.includes(r.name)));
     expect(after.filter((r) => V48_ADDED_TRIGGERS.includes(r.name))).toEqual(freshGuards);
   });
 });
@@ -750,7 +755,7 @@ describe("S3: rollback through the restore drill", () => {
     for (const name of V48_ADDED_TRIGGERS) expect(triggersOf(path)).not.toContain(name);
     approveMigration(path, "v48 fault witness, again");
     new Db(path).close();
-    expect(contentDigests(path).userVersion).toBe(48);
+    expect(contentDigests(path).userVersion).toBe(SCHEMA_VERSION);
     expect(existsSync(migrationApprovalPath(path))).toBe(false);
   });
 

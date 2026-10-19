@@ -2862,7 +2862,7 @@ CREATE TABLE IF NOT EXISTS github_receipts (
   operation           TEXT NOT NULL
                         CHECK (operation IN ('pr_prepare','gate_publish','merge_execute',
                                              'post_merge_verify','release_tag','rollback_prepare',
-                                             'issue_project')),
+                                             'issue_project','branch_publish')),
   -- Receipts outlive their run. Keeping the opaque historical run id avoids a mutable
   -- ON DELETE SET NULL update on an otherwise append-only receipt.
   run_id              TEXT,
@@ -2934,12 +2934,15 @@ END;
 -- marker only afterwards. Writes that this kernel originates must first reserve PENDING.
 -- `pr_prepare` may record a pre-existing pull request, which is an observation rather
 -- than a write and therefore remains eligible for direct APPLIED recording.
+-- v49 (#512 S-PUSH): `branch_publish` follows the same rule. A branch the kernel creates is
+-- reserved PENDING before the first object upload; a branch already at the exact candidate
+-- before anything is sent is an observation (preexisting = 1).
 CREATE TRIGGER IF NOT EXISTS github_receipts_applied_requires_reservation
 BEFORE INSERT ON github_receipts
 WHEN NEW.status = 'APPLIED'
  AND (
    NEW.operation IN ('gate_publish','merge_execute','release_tag','issue_project')
-   OR (NEW.operation = 'pr_prepare' AND NEW.preexisting = 0)
+   OR (NEW.operation IN ('pr_prepare','branch_publish') AND NEW.preexisting = 0)
  )
 BEGIN
   SELECT RAISE(ABORT, 'GITHUB_RECEIPT_PROTOCOL_VIOLATION');

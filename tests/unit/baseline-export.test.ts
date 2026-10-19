@@ -1110,6 +1110,7 @@ describe("baseline boundary contracts", () => {
       "v46-rowid-no-replace",
       "v47-owner-decision-authority-guard",
       "v48-owner-decision-supersede-guard",
+      "v49-branch-publish-receipts",
     ]);
   });
 

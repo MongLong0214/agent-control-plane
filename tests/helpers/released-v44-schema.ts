@@ -9,6 +9,7 @@ import { tempDir } from "./fixtures.ts";
 import { dropV46Triggers } from "./released-v46-schema.ts";
 import { dropV47Triggers } from "./released-v47-schema.ts";
 import { dropV48Triggers } from "./released-v48-schema.ts";
+import { takeBackV49 } from "./released-v49-schema.ts";
 
 /**
  * V45-A0: the released steps v38–v44 install what they installed when they shipped.
@@ -150,6 +151,7 @@ export const v43Image = (path: string): string => {
   new Db(path).close();
   const legacy = new Database(path);
   try {
+    takeBackV49(legacy);
     dropV48Triggers(legacy);
     dropV47Triggers(legacy);
     dropV46Triggers(legacy);

@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { dirname, isAbsolute } from "node:path";
+
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny, fromErrorPayload, isAcpError } from "../core/errors.ts";
@@ -23,6 +26,13 @@ import {
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
 import type { BeforeDispatch, TrustedCredentialStore } from "./credential-store.ts";
 import { type BranchCommitMessage, squashCommitForMerge } from "./merge-commit-message.ts";
+import {
+  type BranchObjects,
+  type BranchPublishLimits,
+  DEFAULT_BRANCH_PUBLISH_LIMITS,
+  collectBranchObjects,
+} from "../git/branch-objects.ts";
+import { scanPublication, workflowChanges } from "./branch-publish.ts";
 
 /**
  * The gate's GitHub-side correlator: run, candidate, and the payload digest that binds the rest.
@@ -98,6 +108,8 @@ export interface GitHubKernelOptions {
   postMergePollIntervalMs?: number;
   /** Test seam for the bounded wait. */
   sleep?: (milliseconds: number) => Promise<void>;
+  /** #512 S-PUSH — bounds on one branch publication; a candidate past any of them is refused. */
+  branchPublishLimits?: Partial<BranchPublishLimits>;
 }
 
 /**
@@ -186,6 +198,63 @@ interface GitHubCaller {
   ownerSessionId: string;
   ownerBindingGeneration: number;
   daemonFinalizerAuthority?: DaemonFinalizerAuthority;
+}
+
+/**
+ * #512 S-PUSH — one repository's branch publication, derived by the daemon finalizer from durable run
+ * state (`deriveConfirmedMergePlan`), never accepted from an MCP caller. Every SHA here is checked against
+ * the frozen candidate snapshot, which is the only source the kernel reads them from.
+ */
+export interface BranchPublishInput {
+  runId: string;
+  repositoryIdentity: string;
+  /** The branch created on GitHub, create-only. Never a long-lived, default or base branch. */
+  branch: string;
+  baseBranch: string;
+  exactHeadSha: string;
+  expectedBaseSha: string;
+  candidateSnapshotDigest: string;
+  /** The plan's human-gate binding: the value its gate payload carries, re-read before every send. */
+  humanGateDigest: string;
+  declaredParent?: string | null;
+  /** The pull request text that follows the publication, scanned with everything sent. */
+  pullRequest: { title: string; body: string; linkedIssues?: readonly number[]; requireLinkage?: boolean };
+  ownerSessionId: string;
+  ownerBindingGeneration: number;
+  /** Opaque capability supplied only by the daemon finalizer after CEO approval. */
+  daemonFinalizerAuthority?: DaemonFinalizerAuthority;
+}
+
+export interface BranchPublishResult {
+  ref: string;
+  sha: string;
+  scanDigest: string;
+  /** Whether this call sent anything. False when the branch already stood at the exact candidate. */
+  sent: boolean;
+}
+
+/** What GitHub's ref read answered: the exact commit, an answered 404, or nothing usable. */
+type BranchRefObservation =
+  | { kind: "at"; sha: string }
+  | { kind: "missing" }
+  | { kind: "unknown"; outcome: TransportOutcome; status?: number };
+
+/** One publication attempt's local facts, shared by the fresh and the reconciling path. */
+interface BranchDelivery {
+  input: BranchPublishInput;
+  owner: string;
+  repo: string;
+  ref: string;
+  refPath: string;
+  baseRefPath: string;
+  candidateHead: string;
+  baseHead: string;
+  objects: BranchObjects;
+  scanDigest: string;
+  counts: { commits: number; trees: number; blobs: number; bytes: number };
+  idempotencyKey: string;
+  requestDigest: string;
+  request: Record<string, unknown>;
 }
 
 /**
@@ -290,6 +359,7 @@ export class GitHubKernel {
   private readonly postMergePollAttempts: number;
   private readonly postMergePollIntervalMs: number;
   private readonly sleep: (milliseconds: number) => Promise<void>;
+  private readonly branchPublishLimits: BranchPublishLimits;
 
   constructor(
     private readonly db: Db,
@@ -308,6 +378,7 @@ export class GitHubKernel {
     this.postMergePollAttempts = Math.max(1, Math.floor(options.postMergePollAttempts ?? 1));
     this.postMergePollIntervalMs = Math.max(0, Math.floor(options.postMergePollIntervalMs ?? 0));
     this.sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+    this.branchPublishLimits = { ...DEFAULT_BRANCH_PUBLISH_LIMITS, ...options.branchPublishLimits };
   }
 
   attach(ports: { humanGateStatus?: HumanGateStatusPort }): void {
@@ -722,6 +793,564 @@ export class GitHubKernel {
       });
     }
     return allow(ReasonCode.OK, value);
+  }
+
+  // -------------------------------------------------------------------------
+  // branch_publish (#512 S-PUSH)
+  // -------------------------------------------------------------------------
+
+  /**
+   * #512 S-PUSH (CEO f5879479, 3d0daed0) — delivers a STANDARD_WORK candidate's branch to GitHub through
+   * the Git Data API with the App token, in process, before the pull request is prepared.
+   *
+   * Before any network call: the pinned owner, the branch claim, the frozen candidate, CEO-approved
+   * finalization with the daemon capability, the existing human-gate binding (D2), a branch that is no
+   * long-lived, default or base branch, the frozen source lineage, and the refusing public-safety scan over
+   * every object the publication would send and the pull request text that follows (a finding refuses;
+   * nothing is redacted, because redaction changes the ids). Then, by GitHub reads: the branch contract and
+   * the remote base ref, which must stand at the frozen base SHA (MERGE_BASE_STALE otherwise).
+   *
+   * Reconciliation is by `branch_publish:<repoIdentity>:<branch>:<candidateHead>`, the request digest binds
+   * {runId, candidateSnapshotDigest, baseHead, scanDigest}, and GitHub's ref is the truth: at the candidate
+   * the publication is APPLIED, whoever wrote it (an answer lost, or the same commit pushed by anyone);
+   * missing, it is sent again; at any other commit it is RESOURCE_COLLISION, never forced (D4). A branch
+   * already at the candidate before anything is sent is recorded as an observation (preexisting).
+   *
+   * Sending (D1, no fallback): a PENDING receipt is reserved first; blobs, trees and commits are uploaded,
+   * each built from the local object, and each id GitHub answers must be the local one, the commit's tree
+   * included, or nothing more is sent and no ref is written. The ref is then created once, under the guard,
+   * and the human gate is re-read immediately before every send. APPLIED is recorded only after the ref is
+   * read back at the exact candidate; a 422, an answered failure and silence all take that same read. A
+   * TRUSTED_CI or BOTH_REQUIRED contract (D3) and any change under `.github/workflows/` (D5) are refused
+   * before the reservation. The uploads are external sends even when no ref is written.
+   */
+  async publishBranch(input: BranchPublishInput): Promise<Decision<BranchPublishResult>> {
+    type Published = Decision<BranchPublishResult>;
+    const authority = this.assertAuthority(input.runId, input.repositoryIdentity, input);
+    if (!authority.allowed) return authority as Published;
+    const claimed = this.assertClaim(input.runId, input.repositoryIdentity, input.branch);
+    if (!claimed.allowed) return claimed as Published;
+    const candidate = this.candidateRepository(input.runId, input.repositoryIdentity);
+    if (!candidate.allowed) return candidate as Published;
+    const frozen = candidate.value;
+    if (
+      this.runs.currentCandidate(input.runId) !== input.candidateSnapshotDigest ||
+      input.exactHeadSha !== frozen.candidateHead ||
+      input.expectedBaseSha !== frozen.baseHead ||
+      input.baseBranch !== frozen.baseBranch
+    ) {
+      return deny(ReasonCode.SNAPSHOT_STALE, "branch publication does not name the run's frozen candidate", {
+        runId: input.runId,
+        repositoryIdentity: input.repositoryIdentity,
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+        currentCandidateSnapshotDigest: this.runs.currentCandidate(input.runId),
+      });
+    }
+    const finalization = this.assertFreshDaemonFinalization(input.runId, input.daemonFinalizerAuthority, "branch_publish");
+    if (!finalization.allowed) return finalization as Published;
+    const humanGate = this.assertGatePayloadHumanGateStatus(input);
+    if (!humanGate.allowed) return humanGate as Published;
+    const profile = this.branchProfile(input.runId);
+    if (!profile.allowed) return profile as Published;
+    if (
+      input.branch === input.baseBranch ||
+      input.branch === profile.value.defaultBranch ||
+      profile.value.longLived.includes(input.branch)
+    ) {
+      return deny(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION, "a branch publication never writes a long-lived, default or base branch", {
+        runId: input.runId,
+        branch: input.branch,
+      });
+    }
+    const lineage = await this.assertFrozenSourceLineage(
+      input.repositoryIdentity,
+      input.branch,
+      profile.value,
+      input.declaredParent ?? null,
+      frozen,
+    );
+    if (!lineage.allowed) return lineage as Published;
+    const repository = this.repositories.byIdentity(input.repositoryIdentity);
+    if (!repository) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "branch publication has no registered checkout", {
+        repositoryIdentity: input.repositoryIdentity,
+      });
+    }
+    // The lower bound is the frozen base SHA, never a branch tip read now.
+    const objects = await collectBranchObjects(repository.checkoutPath, frozen.baseHead, frozen.candidateHead, this.branchPublishLimits);
+    if (!objects.allowed) return objects as Published;
+    if (`git-tree:${objects.value.candidateTree}` !== frozen.treeDigest) {
+      return deny(ReasonCode.SNAPSHOT_STALE, "the local candidate tree is not the frozen tree", {
+        runId: input.runId,
+        candidateHead: frozen.candidateHead,
+      });
+    }
+    const linkedIssues = [...new Set(input.pullRequest.linkedIssues ?? [])].sort((a, b) => a - b);
+    const scan = scanPublication({
+      objects: objects.value,
+      branch: input.branch,
+      pullRequestTitle: input.pullRequest.title,
+      pullRequestBody: this.prBody(input.pullRequest.body, input.runId, linkedIssues, Boolean(input.pullRequest.requireLinkage)),
+      forbiddenPaths: this.publicationForbiddenPaths(),
+      limits: this.branchPublishLimits,
+    });
+    if (!scan.allowed) {
+      this.audit.record({
+        kind: "BRANCH_PUBLISH_REFUSED",
+        runId: input.runId,
+        reasonCode: scan.reasonCode,
+        evidence: { repositoryIdentity: input.repositoryIdentity, branch: input.branch, ...scan.evidence },
+      });
+      return scan as Published;
+    }
+
+    const slug = this.slug(input.repositoryIdentity);
+    if (!slug.allowed) return slug as Published;
+    const { owner, repo } = slug.value;
+    const releases = await this.activeReleases(input.repositoryIdentity);
+    if (!releases.allowed) return releases as Published;
+    const contract = validateBranchContract({
+      head: input.branch,
+      base: input.baseBranch,
+      profile: profile.value,
+      declaredParent: input.declaredParent ?? null,
+      activeReleases: releases.value,
+      sourceBranch: lineage.value.sourceBranch,
+    });
+    if (!contract.allowed) return contract as Published;
+
+    const request = {
+      runId: input.runId,
+      candidateSnapshotDigest: input.candidateSnapshotDigest,
+      baseHead: frozen.baseHead,
+      scanDigest: scan.value.scanDigest,
+    };
+    const delivery: BranchDelivery = {
+      input,
+      owner,
+      repo,
+      ref: `refs/heads/${input.branch}`,
+      refPath: `/repos/${owner}/${repo}/git/ref/heads/${this.refPathOf(input.branch)}`,
+      baseRefPath: `/repos/${owner}/${repo}/git/ref/heads/${this.refPathOf(input.baseBranch)}`,
+      candidateHead: frozen.candidateHead,
+      baseHead: frozen.baseHead,
+      objects: objects.value,
+      scanDigest: scan.value.scanDigest,
+      counts: scan.value.counts,
+      idempotencyKey: `branch_publish:${input.repositoryIdentity}:${input.branch}:${frozen.candidateHead}`,
+      requestDigest: digestOf(request),
+      request,
+    };
+    const result = (sent: boolean): BranchPublishResult => ({
+      ref: delivery.ref,
+      sha: delivery.candidateHead,
+      scanDigest: delivery.scanDigest,
+      sent,
+    });
+
+    const existing = this.receipt(delivery.idempotencyKey);
+    if (existing) {
+      if (existing.request_digest !== delivery.requestDigest) {
+        return deny(ReasonCode.RESOURCE_COLLISION, "branch publication is already bound to different operation intent", {
+          idempotencyKey: delivery.idempotencyKey,
+          existingRequestDigest: existing.request_digest,
+          requestDigest: delivery.requestDigest,
+        });
+      }
+      if (this.inFlightReservations.has(delivery.idempotencyKey)) {
+        return deny(ReasonCode.RESOURCE_COLLISION, "branch publication is in flight", { idempotencyKey: delivery.idempotencyKey });
+      }
+      const observed = await this.readBranchRef(delivery.refPath);
+      if (observed.kind === "unknown") {
+        return deny(ReasonCode.PROBE_FAILED, "the branch ref could not be read to reconcile its publication", {
+          idempotencyKey: delivery.idempotencyKey,
+          outcome: observed.outcome,
+          ...(observed.status === undefined ? {} : { status: observed.status }),
+        });
+      }
+      if (observed.kind === "at" && observed.sha === delivery.candidateHead) {
+        if (existing.verified !== 1) {
+          // The ref is the candidate: an answer was lost, or the same commit was pushed by anyone. No resend.
+          const finalized = this.finalizeReservedReceipt({
+            idempotencyKey: delivery.idempotencyKey,
+            requestDigest: delivery.requestDigest,
+            preexisting: false,
+            afterStateDigest: digestOf({ ref: delivery.ref, sha: observed.sha }),
+            response: { ...result(false), reconciled: true, request: delivery.request, counts: delivery.counts },
+            reread: true,
+          });
+          if (!finalized.allowed) return finalized as Published;
+          this.recordBranchPublished(delivery, "RECONCILED");
+        }
+        return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, result(false), { replayed: true });
+      }
+      if (observed.kind === "at") {
+        return deny(ReasonCode.RESOURCE_COLLISION, "the branch stands at another commit; a publication never moves or forces it", {
+          idempotencyKey: delivery.idempotencyKey,
+          expected: delivery.candidateHead,
+          observed: observed.sha,
+        });
+      }
+      if (existing.verified === 1) {
+        return deny(ReasonCode.RESOURCE_COLLISION, "the published branch no longer exists; an applied publication is never recreated", {
+          idempotencyKey: delivery.idempotencyKey,
+        });
+      }
+      // PENDING and the ref is missing: send again under the same reservation, whose record stays.
+      return this.deliverBranch(delivery, false);
+    }
+
+    const finalizationAgain = this.assertFreshDaemonFinalization(input.runId, input.daemonFinalizerAuthority, "branch_publish");
+    if (!finalizationAgain.allowed) return finalizationAgain as Published;
+    const base = await this.assertRemoteBase(delivery);
+    if (!base.allowed) return base as Published;
+    const head = await this.readBranchRef(delivery.refPath);
+    if (head.kind === "unknown") {
+      return deny(ReasonCode.PROBE_FAILED, "the branch ref could not be read before publication", {
+        repositoryIdentity: input.repositoryIdentity,
+        branch: input.branch,
+        outcome: head.outcome,
+        ...(head.status === undefined ? {} : { status: head.status }),
+      });
+    }
+    if (head.kind === "at" && head.sha !== delivery.candidateHead) {
+      return deny(ReasonCode.RESOURCE_COLLISION, "the branch already stands at another commit; a publication never moves or forces it", {
+        repositoryIdentity: input.repositoryIdentity,
+        branch: input.branch,
+        expected: delivery.candidateHead,
+        observed: head.sha,
+      });
+    }
+    if (head.kind === "at") {
+      // Already at the exact candidate before anything is sent: an observation, recorded as one.
+      this.writeReceipt({
+        idempotencyKey: delivery.idempotencyKey,
+        operation: "branch_publish",
+        runId: input.runId,
+        repositoryIdentity: input.repositoryIdentity,
+        resourceType: "git_ref",
+        resourceIdentity: `${owner}/${repo}@${delivery.ref}`,
+        preexisting: true,
+        beforeStateDigest: null,
+        afterStateDigest: digestOf({ ref: delivery.ref, sha: head.sha }),
+        requestDigest: delivery.requestDigest,
+        response: { ...result(false), request: delivery.request, counts: delivery.counts },
+        reread: true,
+      });
+      this.recordBranchPublished(delivery, "OBSERVED");
+      return allow(ReasonCode.OK, result(false));
+    }
+    return this.deliverBranch(delivery, true);
+  }
+
+  /**
+   * The sending half of `publishBranch`: D3 and D5, then (for a fresh publication) the reservation, the
+   * object uploads with each answered id checked, the one create-only ref, and the readback that alone may
+   * record APPLIED. `reserve` is false when a PENDING reservation for the same intent is being sent again.
+   */
+  private async deliverBranch(delivery: BranchDelivery, reserve: boolean): Promise<Decision<BranchPublishResult>> {
+    type Published = Decision<BranchPublishResult>;
+    const { input, owner, repo, idempotencyKey, requestDigest } = delivery;
+    if (!reserve) {
+      const base = await this.assertRemoteBase(delivery);
+      if (!base.allowed) return base as Published;
+    }
+    const manifest = this.pinnedManifest(input.runId);
+    if (!manifest.allowed) return manifest as Published;
+    const ciEvidence = manifest.value.verificationCommands.filter((command) => command.evidenceMode !== "LOCAL_COMMAND");
+    if (ciEvidence.length > 0) {
+      return deny(ReasonCode.BRANCH_PUBLISH_UNSUPPORTED, "v1 does not publish for a contract whose evidence needs CI before CEO approval (D3); nothing was sent", {
+        runId: input.runId,
+        commands: ciEvidence.map((command) => ({ id: command.id, evidenceMode: command.evidenceMode })),
+      });
+    }
+    const workflows = workflowChanges(delivery.objects.changedPaths);
+    if (workflows.length > 0) {
+      return deny(ReasonCode.BRANCH_PUBLISH_UNSUPPORTED, "a branch publication never changes a workflow under .github/workflows (D5); nothing was sent", {
+        runId: input.runId,
+        paths: workflows.slice(0, 20),
+      });
+    }
+    const target = this.writeTarget(input.runId, input.repositoryIdentity, input.branch);
+    if (!target.allowed) return target as Published;
+    if (reserve) {
+      const reserved = this.reserveReceipt({
+        idempotencyKey,
+        operation: "branch_publish",
+        runId: input.runId,
+        repositoryIdentity: input.repositoryIdentity,
+        resourceType: "git_ref",
+        resourceIdentity: `${owner}/${repo}@${delivery.ref}`,
+        beforeStateDigest: null,
+        requestDigest,
+      });
+      if (!reserved.allowed) return reserved as Published;
+    } else {
+      this.inFlightReservations.add(idempotencyKey);
+    }
+    try {
+      const caller: GitHubCaller = {
+        ownerSessionId: input.ownerSessionId,
+        ownerBindingGeneration: input.ownerBindingGeneration,
+        daemonFinalizerAuthority: input.daemonFinalizerAuthority,
+      };
+      const uploaded = await this.mediate(
+        WriteOperation.GITHUB_BRANCH_PUBLISH,
+        input.runId,
+        input.repositoryIdentity,
+        target.value,
+        caller,
+        () => this.uploadBranchObjects(delivery),
+      );
+      if (!uploaded.allowed) {
+        if (reserve && uploaded.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, requestDigest);
+        return uploaded as Published;
+      }
+      const progress = uploaded.value;
+      if (progress.refused) {
+        if (reserve && progress.sent === 0) this.releaseReservation(idempotencyKey, requestDigest);
+        return progress.refused as Published;
+      }
+      if (progress.mismatch) {
+        return deny(ReasonCode.BRANCH_PUBLISH_OBJECT_MISMATCH, "GitHub answered an object id that is not the local one; no ref was written", {
+          idempotencyKey,
+          ...progress.mismatch,
+          objectsSent: progress.sent,
+        });
+      }
+      if (progress.failure) {
+        return deny(ReasonCode.PROBE_FAILED, "an object upload did not complete; no ref was written and the publication stays pending", {
+          idempotencyKey,
+          ...progress.failure,
+          objectsSent: progress.sent,
+        });
+      }
+
+      const dispatch = this.branchPublishAtDispatch(input);
+      const created = await this.mediate(
+        WriteOperation.GITHUB_BRANCH_PUBLISH,
+        input.runId,
+        input.repositoryIdentity,
+        target.value,
+        caller,
+        async () => {
+          try {
+            await this.api().request<unknown>(
+              "POST",
+              `/repos/${owner}/${repo}/git/refs`,
+              { ref: delivery.ref, sha: delivery.candidateHead },
+              { beforeDispatch: dispatch.beforeDispatch },
+            );
+            return { refused: null, outcome: null as ReturnType<typeof transportOutcome> | null };
+          } catch (error) {
+            return { refused: dispatch.refused(), outcome: transportOutcome(error) };
+          }
+        },
+      );
+      if (!created.allowed) return created as Published;
+      if (created.value.refused) return created.value.refused as Published;
+
+      // A created ref, a 422 "Reference already exists", an answered failure and silence: one readback decides.
+      const observed = await this.readBranchRef(delivery.refPath);
+      if (observed.kind === "at" && observed.sha === delivery.candidateHead) {
+        const finalized = this.finalizeReservedReceipt({
+          idempotencyKey,
+          requestDigest,
+          preexisting: false,
+          afterStateDigest: digestOf({ ref: delivery.ref, sha: observed.sha }),
+          response: {
+            ref: delivery.ref,
+            sha: observed.sha,
+            scanDigest: delivery.scanDigest,
+            sent: true,
+            request: delivery.request,
+            counts: delivery.counts,
+            objectsSent: progress.sent,
+            createOutcome: created.value.outcome,
+          },
+          reread: true,
+        });
+        if (!finalized.allowed) return finalized as Published;
+        this.recordBranchPublished(delivery, "CREATED");
+        return allow(ReasonCode.OK, {
+          ref: delivery.ref,
+          sha: observed.sha,
+          scanDigest: delivery.scanDigest,
+          sent: true,
+        });
+      }
+      if (observed.kind === "at") {
+        return deny(ReasonCode.RESOURCE_COLLISION, "the branch stands at another commit; a publication never moves or forces it", {
+          idempotencyKey,
+          expected: delivery.candidateHead,
+          observed: observed.sha,
+          createOutcome: created.value.outcome,
+        });
+      }
+      return deny(ReasonCode.PROBE_FAILED, "the created ref was not read back at the candidate; the publication stays pending", {
+        idempotencyKey,
+        readback: observed.kind,
+        createOutcome: created.value.outcome,
+      });
+    } finally {
+      this.inFlightReservations.delete(idempotencyKey);
+    }
+  }
+
+  /** Blobs, then trees, then commits, each id GitHub answers checked before the next send. Never throws. */
+  private async uploadBranchObjects(delivery: BranchDelivery): Promise<{
+    sent: number;
+    refused: Decision<void> | null;
+    mismatch: { object: string; type: string; expected: string; observed: unknown } | null;
+    failure: { object: string; type: string; outcome: TransportOutcome; status?: number } | null;
+  }> {
+    const progress = {
+      sent: 0,
+      refused: null as Decision<void> | null,
+      mismatch: null as { object: string; type: string; expected: string; observed: unknown } | null,
+      failure: null as { object: string; type: string; outcome: TransportOutcome; status?: number } | null,
+    };
+    const prefix = `/repos/${delivery.owner}/${delivery.repo}/git`;
+    const send = async (
+      type: "blob" | "tree" | "commit",
+      object: string,
+      body: unknown,
+      expected: (answer: { sha?: unknown; tree?: { sha?: unknown } } | null) => boolean,
+    ): Promise<boolean> => {
+      const dispatch = this.branchPublishAtDispatch(delivery.input);
+      let answer: { sha?: unknown; tree?: { sha?: unknown } } | null;
+      try {
+        answer = await this.api().request<{ sha?: unknown; tree?: { sha?: unknown } } | null>(
+          "POST",
+          `${prefix}/${type}s`,
+          body,
+          { beforeDispatch: dispatch.beforeDispatch },
+        );
+      } catch (error) {
+        const refused = dispatch.refused();
+        if (refused) {
+          progress.refused = refused;
+          return false;
+        }
+        progress.sent += 1;
+        progress.failure = { object, type, ...transportOutcome(error) };
+        return false;
+      }
+      progress.sent += 1;
+      if (!expected(answer)) {
+        progress.mismatch = {
+          object,
+          type,
+          expected: object,
+          observed: { sha: answer?.sha ?? null, ...(type === "commit" ? { tree: answer?.tree?.sha ?? null } : {}) },
+        };
+        return false;
+      }
+      return true;
+    };
+    for (const blob of delivery.objects.blobs) {
+      const ok = await send("blob", blob.sha, { content: blob.content.toString("base64"), encoding: "base64" }, (answer) => answer?.sha === blob.sha);
+      if (!ok) return progress;
+    }
+    for (const tree of delivery.objects.trees) {
+      const ok = await send("tree", tree.sha, { tree: tree.entries }, (answer) => answer?.sha === tree.sha);
+      if (!ok) return progress;
+    }
+    for (const commit of delivery.objects.commits) {
+      const ok = await send("commit", commit.sha, commit.fields, (answer) =>
+        answer?.sha === commit.sha && answer.tree?.sha === commit.fields.tree);
+      if (!ok) return progress;
+    }
+    return progress;
+  }
+
+  /**
+   * The check run immediately before each publication send, after the transport's last await: the plan's
+   * human-gate binding is still the current one (D2), and the candidate is still the run's. A refusal sends
+   * nothing and is reported as a refusal, not as silence.
+   */
+  private branchPublishAtDispatch(input: BranchPublishInput): { beforeDispatch: BeforeDispatch; refused: () => Decision<void> | null } {
+    let refused: Decision<void> | null = null;
+    return {
+      beforeDispatch: () => {
+        let verified: Decision<void>;
+        try {
+          verified = this.runs.currentCandidate(input.runId) !== input.candidateSnapshotDigest
+            ? deny(ReasonCode.SNAPSHOT_STALE, "the candidate changed before a branch publication send", { runId: input.runId })
+            : this.assertGatePayloadHumanGateStatus(input);
+        } catch {
+          verified = deny(ReasonCode.INTERNAL_ERROR, "branch publication could not be re-verified before dispatch", {
+            runId: input.runId,
+          });
+        }
+        refused = verified.allowed ? null : verified;
+        return verified;
+      },
+      refused: () => refused,
+    };
+  }
+
+  /** The remote base ref must stand at the frozen base SHA; a moved or unread base sends nothing. */
+  private async assertRemoteBase(delivery: BranchDelivery): Promise<Decision<void>> {
+    const base = await this.readBranchRef(delivery.baseRefPath);
+    if (base.kind === "at" && base.sha === delivery.baseHead) return allow(ReasonCode.OK, undefined);
+    if (base.kind === "unknown") {
+      return deny(ReasonCode.PROBE_FAILED, "the remote base ref could not be read before publication", {
+        baseBranch: delivery.input.baseBranch,
+        outcome: base.outcome,
+        ...(base.status === undefined ? {} : { status: base.status }),
+      });
+    }
+    return deny(ReasonCode.MERGE_BASE_STALE, "the remote base ref is not the frozen base SHA; nothing was sent", {
+      runId: delivery.input.runId,
+      baseBranch: delivery.input.baseBranch,
+      expected: delivery.baseHead,
+      observed: base.kind === "at" ? base.sha : null,
+    });
+  }
+
+  /** GitHub's exact-ref read: the commit it names, an answered 404, or nothing a decision may rest on. */
+  private async readBranchRef(path: string): Promise<BranchRefObservation> {
+    let answer: unknown;
+    try {
+      answer = await this.api().request<unknown>("GET", path);
+    } catch (error) {
+      const outcome = transportOutcome(error);
+      if (outcome.outcome === "answered" && outcome.status === 404) return { kind: "missing" };
+      return { kind: "unknown", ...outcome };
+    }
+    const object = (answer as { object?: { sha?: unknown; type?: unknown } } | null)?.object;
+    if (Array.isArray(answer) || typeof object?.sha !== "string" || !/^[0-9a-f]{40}$/.test(object.sha)) {
+      return { kind: "unknown", outcome: "answered" };
+    }
+    if (object.type !== undefined && object.type !== "commit") return { kind: "unknown", outcome: "answered" };
+    return { kind: "at", sha: object.sha };
+  }
+
+  /** A branch name as a ref path: each component escaped, the separators kept. */
+  private refPathOf(branch: string): string {
+    return branch.split("/").map((component) => encodeURIComponent(component)).join("/");
+  }
+
+  /** Absolute paths no publication may carry: the home directory, the ACP state root, every registered checkout. */
+  private publicationForbiddenPaths(): string[] {
+    const paths = [homedir(), ...this.repositories.list().map((repository) => repository.checkoutPath)];
+    if (isAbsolute(this.db.file)) paths.push(dirname(this.db.file));
+    return paths;
+  }
+
+  private recordBranchPublished(delivery: BranchDelivery, how: "CREATED" | "OBSERVED" | "RECONCILED"): void {
+    this.audit.record({
+      kind: "BRANCH_PUBLISHED",
+      runId: delivery.input.runId,
+      evidence: {
+        repositoryIdentity: delivery.input.repositoryIdentity,
+        ref: delivery.ref,
+        sha: delivery.candidateHead,
+        scanDigest: delivery.scanDigest,
+        how,
+      },
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -3534,7 +4163,7 @@ export class GitHubKernel {
    * merge (FIX-FINALIZER-DIGEST), and the payload must name its current binding exactly. A payload
    * named before a decision or the candidate changed names a binding that no longer exists.
    */
-  private assertGatePayloadHumanGateStatus(payload: GatePayload): Decision<void> {
+  private assertGatePayloadHumanGateStatus(payload: Pick<GatePayload, "runId" | "humanGateDigest">): Decision<void> {
     const port = this.humanGateStatusPort;
     if (!port) {
       return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "GitHub kernel has no human-gate status port", {

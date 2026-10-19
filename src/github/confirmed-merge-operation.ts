@@ -11,6 +11,8 @@ import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import {
   NO_HUMAN_GATE_DIGEST,
+  type BranchPublishInput,
+  type BranchPublishResult,
   type GatePayload,
   type GitHubKernel,
   type MergeInput,
@@ -39,6 +41,8 @@ export interface ConfirmedMergePlan {
   exactHeadSha: string;
   expectedBaseSha: string;
   payload: GatePayload;
+  /** #512 S-PUSH — the candidate branch's delivery to GitHub, made before the PR is prepared. */
+  publish: BranchPublishInput;
   prepare: PrepareInput;
   merge: Omit<MergeInput, "pullNumber">;
 }
@@ -48,7 +52,7 @@ export interface ConfirmedMergePlan {
  * assembled by `agentctl`, Hermes, or a CTO has no way to call the external-write steps.
  */
 export interface ConfirmedMergePorts {
-  github: Pick<GitHubKernel, "gatePublish" | "prPrepare" | "mergeExecute">;
+  github: Pick<GitHubKernel, "publishBranch" | "gatePublish" | "prPrepare" | "mergeExecute">;
   runs: Pick<RunEngine, "get" | "currentCandidate">;
   artifacts: Pick<ArtifactStore, "latestForSnapshot">;
   projects: Pick<ProjectRegistry, "manifest">;
@@ -191,6 +195,24 @@ export const deriveConfirmedMergePlan = (
     exactHeadSha: repository.candidateHead,
     expectedBaseSha: repository.baseHead,
     payload,
+    publish: {
+      runId: input.runId,
+      repositoryIdentity: input.repositoryIdentity,
+      branch: input.head,
+      baseBranch: repository.baseBranch,
+      exactHeadSha: repository.candidateHead,
+      expectedBaseSha: repository.baseHead,
+      candidateSnapshotDigest: candidateDigest,
+      humanGateDigest,
+      declaredParent: input.declaredParent ?? null,
+      pullRequest: {
+        title: input.title,
+        body: input.body ?? "",
+        ...(input.linkedIssues === undefined ? {} : { linkedIssues: input.linkedIssues }),
+        ...(input.requireLinkage === undefined ? {} : { requireLinkage: input.requireLinkage }),
+      },
+      ...owner,
+    },
     prepare: {
       runId: input.runId,
       repositoryIdentity: input.repositoryIdentity,
@@ -214,6 +236,16 @@ export const deriveConfirmedMergePlan = (
     },
   });
 };
+
+/**
+ * #512 S-PUSH — deliver the candidate branch to GitHub through the kernel's Git Data API path, before its
+ * pull request is prepared. Create-only: a branch already at the exact candidate is reconciled, any other
+ * commit refuses.
+ */
+export const publishConfirmedBranch = async (
+  ports: ConfirmedMergePorts,
+  plan: ConfirmedMergePlan,
+): Promise<Decision<BranchPublishResult>> => ports.github.publishBranch(plan.publish);
 
 /** Prepare every PR before a gate or merge is released. */
 export const prepareConfirmedMerge = async (

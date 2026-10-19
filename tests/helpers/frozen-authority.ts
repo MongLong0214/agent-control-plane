@@ -32,7 +32,7 @@ export const RECEIPT_BYTES_SHA256 =
   "aa90c6af77754fce9861cb4f57501879c24f66f5616cf46225c5375adfd2a19d";
 
 /**
- * `src/db/migrations.ts`, its historical schema snapshots (v37, v44, v45, v46 and v47), and
+ * `src/db/migrations.ts`, its historical schema snapshots (v37, v44, v45, v46, v47 and v48), and
  * `tests/fixtures/schema-v25-lineage.sql` are append-only, frozen inputs: pinning their exact
  * bytes here means a coordinated edit changes the value a reader compares against, not merely
  * the file being read. These digests are not recomputed from the files they describe: a pin a run
@@ -49,11 +49,14 @@ export const RECEIPT_BYTES_SHA256 =
  *
  * `src/db/schema-v47.sql` is likewise `git show faa829ec:src/db/schema.sql` (the v47 commit, #246
  * SEC-OD1), and carries that file's git blob id.
+ *
+ * `src/db/schema-v48.sql` is likewise `git show c65e73b2:src/db/schema.sql`, byte-identical to v48's squash
+ * merge ab136549 and to 206d8bfe (#512 S-PUSH, CEO 3d0daed0), and carries that file's git blob id.
  */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
   {
     path: "src/db/migrations.ts",
-    sha256: "88a19026e29a670ba17ac7ba660f76542a3767df0dc1b1e042787988742f7e4a",
+    sha256: "343465d5f6bf50116a60c3b13a96c1ad1f9bd2ad775382429d31387a57e36595",
   },
   {
     path: "src/db/schema-v37.sql",
@@ -76,6 +79,11 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     path: "src/db/schema-v47.sql",
     sha256: "8c4de11d7ae4d687120196ad9ae73e5b370f6abcc47b9a8b31dc5e69608de487",
     gitBlob: "9ca4cad97b1dbf5cbd759d7f11d11b3c7bb9c543",
+  },
+  {
+    path: "src/db/schema-v48.sql",
+    sha256: "eb0b3b5b7b50e665a3ae2518af470a80bc2d6b8116133f5e248dd9fa9606a753",
+    gitBlob: "29f2a057a7892cb60292880a26bce747a5e32826",
   },
   {
     path: "tests/fixtures/schema-v13.sql",
