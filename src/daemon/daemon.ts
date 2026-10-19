@@ -34,6 +34,7 @@ import {
   resultRecoveryTriggerKind,
   reviewRetryTriggerId,
   reviewRetryTriggerKind,
+  STANDARD_CONTINUATION_STATE,
   STANDARD_WORK_CONTINUATION_STALLED,
   STANDARD_WORK_CONTINUATION_WAKE,
   standardWorkContinuationTriggerId,
@@ -2776,13 +2777,15 @@ export class Daemon {
    * #512 — the standard work continuation wake, run at startup and on every watchdog tick right after
    * the bootstrap recovery wakes, and built as they are. A driven PRIMARY_CTO is woken only by what is
    * addressed to it, so one whose turn got its STANDARD_WORK run's PLAN accepted, acknowledged the
-   * RUN_DISPATCH and started nothing would never run again: its task stays READY with no worker. Its
-   * owner is woken once more, and exactly once per (run, task, task state) whatever the owner's binding
-   * generation, when all of these hold:
+   * RUN_DISPATCH and started nothing would never run again: its task stays READY with no worker. Nor
+   * would one whose turn provisioned the task's worker and ended before its first execution. Its owner
+   * is woken once more, and exactly once per (run, task, continuation state) whatever the owner's
+   * binding generation, when all of these hold:
    *
    * - the run's state is the one `#standardWorkContinuation` describes: ACTIVE, STANDARD_WORK, with a
-   *   PLAN, no hold, nothing running, its first READY task unstarted, its exact pinned driven owner
-   *   READY with the newest RUN_DISPATCH to it ACKED;
+   *   PLAN, no hold, nothing running, its first READY task never executed (with no worker, or with an
+   *   ACTIVE one that never ran), its exact pinned driven owner READY with the newest RUN_DISPATCH to
+   *   it ACKED;
    * - its session is driven by this runtime as a PRIMARY_CTO, whose daemon holds its current
    *   credential and is attached, and no turn of it is running or queued.
    *
@@ -2846,7 +2849,7 @@ export class Daemon {
             taskId: tuple.taskId,
             taskState: tuple.taskState,
             messageId: tuple.messageId,
-            reason: "the continuation wake for this task ran and the task is still READY with no worker or execution; it is not woken again",
+            reason: "the continuation wake for this task ran and the task is still in that state, READY with no execution; it is not woken again",
           },
         });
         report.stalled.push({
@@ -2867,7 +2870,7 @@ export class Daemon {
       // marker stays spent.
       const woke = runtime.wake(owner.roleKey, [{
         id: triggerId,
-        kind: standardWorkContinuationTriggerKind(runId, tuple.taskId),
+        kind: standardWorkContinuationTriggerKind(runId, tuple.taskId, tuple.taskState),
         stillAdmissible: () => {
           const still = this.#standardWorkContinuation(runId, owner);
           return still !== null && still.taskId === tuple.taskId && still.messageId === tuple.messageId;
@@ -2898,16 +2901,19 @@ export class Daemon {
 
   /**
    * #512 — the state a standard work continuation is for, read from durable records only, or null.
-   * Answers the run's first READY task (by creation order) and the acknowledged RUN_DISPATCH when all
-   * of these hold:
+   * Answers the run's first READY task (by creation order), its continuation state
+   * (`STANDARD_CONTINUATION_STATE`) and the acknowledged RUN_DISPATCH when all of these hold:
    *
    * - the run is ACTIVE and a STANDARD_WORK run of a project, with a PLAN artifact; no continuity
    *   hold names it, its project is not suspended, and continuity is not in SURVIVAL;
    * - no candidate pipeline attempt of it is RUNNING (a result submission and its blind review), and
    *   it has no current candidate, so no result was submitted;
    * - none of its tasks is RUNNING and none of its executions is RUNNING; it has a READY task, and no
-   *   READY task of it has an execution or a WORKER role that was ever held, so nothing was started,
-   *   queued or tried for any of them;
+   *   READY task of it has an execution or an attempt, so no execution was started, queued or tried
+   *   for any of them, settled or not;
+   * - each READY task either never had a WORKER (UNSTAFFED) or holds an ACTIVE one that never ran
+   *   (STAFFED: provisioned, then interrupted before its first execution, CEO e64aa10b). A worker
+   *   that was revoked and not replaced is continuity's to answer, never a continuation's;
    * - `owner` is exactly its owner as a PRIMARY_CTO (`#pinnedOwnerExact`), so its session is READY,
    *   which also rules out a draining CTO;
    * - the newest RUN_DISPATCH addressed to that owner generation and session is ACKED. One still
@@ -2937,13 +2943,16 @@ export class Daemon {
     if (executing) return null;
     const ready = tasks.filter((task) => task.state === TaskState.READY);
     if (ready.length === 0) return null;
+    const states: string[] = [];
     for (const task of ready) {
       const executed = this.cp.db.get<{ n: number }>(
         `SELECT 1 AS n FROM task_executions WHERE task_id = ? LIMIT 1`,
         [task.taskId],
       );
       if (executed || task.attemptCount > 0) return null;
-      if (this.cp.bindings.history(roleKeyFor(Role.WORKER, { taskId: task.taskId })).length > 0) return null;
+      const worker = this.cp.bindings.history(roleKeyFor(Role.WORKER, { taskId: task.taskId })).at(-1);
+      if (worker !== undefined && worker.status !== "ACTIVE") return null;
+      states.push(worker === undefined ? STANDARD_CONTINUATION_STATE.UNSTAFFED : STANDARD_CONTINUATION_STATE.STAFFED);
     }
     if (!this.#pinnedOwnerExact(run, owner, Role.PRIMARY_CTO)) return null;
     const dispatch = this.cp.db.get<{ message_id: string; status: string }>(
@@ -2954,7 +2963,7 @@ export class Daemon {
       [runId, owner.bindingGeneration, owner.sessionId],
     );
     if (dispatch?.status !== "ACKED") return null;
-    return { taskId: ready[0]!.taskId, taskState: TaskState.READY, messageId: dispatch.message_id };
+    return { taskId: ready[0]!.taskId, taskState: states[0]!, messageId: dispatch.message_id };
   }
 
   /**

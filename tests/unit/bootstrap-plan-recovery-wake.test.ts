@@ -524,7 +524,7 @@ describe("the bootstrapPlanGuide contract_get carries", () => {
     });
   });
 
-  it("contract_get for a STANDARD_WORK run is byte-identical to the answer before the guide existed", async () => {
+  it("contract_get for a STANDARD_WORK run is byte-identical to the answer before the guide existed, plus its tasks (#512)", async () => {
     const harness = makeHarness();
     const { projectId, repositoryId } = await registerFixtureProject(harness, "standard-project");
     bindCeo(harness);
@@ -554,7 +554,9 @@ describe("the bootstrapPlanGuide contract_get carries", () => {
       branchProfile: manifest?.branchProfile ?? null,
       repositories: harness.cp.runs.repositoriesOf(runId),
     };
-    expect(answer.text).toBe(JSON.stringify({ ok: true, value: before }, null, 2));
+    // #512 (CEO e64aa10b) — a STANDARD_WORK run's owner also reads the run's tasks, appended after
+    // everything above, which stays byte for byte as it was; this run has no PLAN yet, so no task.
+    expect(answer.text).toBe(JSON.stringify({ ok: true, value: { ...before, tasks: [] } }, null, 2));
     expect(answer.body["value"]).not.toHaveProperty("bootstrapPlanGuide");
   });
 });
