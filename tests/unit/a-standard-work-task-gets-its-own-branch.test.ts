@@ -5,11 +5,14 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import type { BranchProfile } from "../../src/contracts/manifest.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ExecutionMode, Role, RunKind } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunKind, SessionLifecycle } from "../../src/domain/types.ts";
 import { classifyBranch, validateBranchContract } from "../../src/github/branch-contract.ts";
+import { GuardedInvocationWriteBroker } from "../../src/runtime/provider.ts";
+import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { cleanupTempDirs, commitAll, gitSync, writeFiles } from "../helpers/fixtures.ts";
 import { fixtureManifest, registerFixtureProject } from "../helpers/harness.ts";
+import { FakeWorkerAdapter, type FakeTurnScript } from "../helpers/worker-turn-fixture.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
@@ -40,6 +43,7 @@ afterEach(() => vi.restoreAllMocks());
 
 const RECORDED = "TASK_WRITE_TARGET_RECORDED";
 const PREPARED = "TASK_BRANCH_PREPARED";
+const CREATING = "TASK_BRANCH_CREATING";
 const POLICY = "WORK_BRANCH_POLICY";
 const IDENTITY = "github:acme/fixture";
 
@@ -168,6 +172,23 @@ const events = (f: BootstrapRuntimeFixture, kind: string, runId: string) =>
 const contractTasks = async (f: BootstrapRuntimeFixture, s: StandardRun) =>
   ((await f.cto(s.sessionId, "contract_get", { runId: s.runId }))["value"] as { tasks: Array<{ taskId: string; spec: Record<string, unknown> }> }).tasks;
 
+/** The WORKER provider stood in by a fake that writes what its script says, through the real guard broker. */
+const workerDoing = (f: BootstrapRuntimeFixture, script: FakeTurnScript): FakeWorkerAdapter => {
+  const fake = new FakeWorkerAdapter(new GuardedInvocationWriteBroker(f.harness.cp.guard));
+  fake.script = script;
+  vi.spyOn(f.claude, "invoke").mockImplementation((request) => fake.invoke(request));
+  return fake;
+};
+
+/** A WORKER bound the way staffing binds one, with no write target recorded: a task staffed before S-TB. */
+const bindWorker = (f: BootstrapRuntimeFixture, runId: string, taskId: string): void => {
+  const cp = f.harness.cp;
+  const session = cp.sessions.create({ provider: "claude", model: "opus" });
+  expect(cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test worker").allowed).toBe(true);
+  const bound = cp.bindings.bind({ role: Role.WORKER, sessionId: session.sessionId, runId, taskId, projectId: cp.runs.require(runId).projectId });
+  if (!bound.allowed) throw new Error(bound.message);
+};
+
 /** Provisions the task's worker and claims the write target the control plane recorded for it. */
 const staffAndClaim = async (f: BootstrapRuntimeFixture, s: StandardRun, taskId: string) => {
   const provisioned = await provision(f, s, taskId);
@@ -198,9 +219,14 @@ describe("the one branch policy point (CEO f5879479)", () => {
       .toMatchObject({ allowed: false, reasonCode: ReasonCode.PR_BRANCH_CONTRACT_VIOLATION });
 
     // Any other profile or base: refused, naming the policy point.
+    // c98ea8a3 (S-TB-05): in a dev-bearing profile the parent is dev only; a feature or release base is
+    // refused here, although the branch contract would accept either as a task branch's parent.
+    expect(validateBranchContract({ head: "task/x-y", base: "release/1.2.3", profile: DEV_BEARING, declaredParent: "release/1.2.3" }).allowed).toBe(true);
     for (const [profile, base] of [
       [{ ...DEV_BEARING, defaultBranch: "main" }, "main"],
       [DEV_BEARING, "main"],
+      [DEV_BEARING, "feature/123-parent"],
+      [DEV_BEARING, "release/1.2.3"],
       [MAIN_ONLY, "dev"],
       [{ ...MAIN_ONLY, longLived: ["main", "trunk"] }, "main"],
     ] as Array<[BranchProfile, string]>) {
@@ -383,7 +409,7 @@ describe("the pinned base, not the base branch's name", () => {
 });
 
 describe("re-entry: the same run and task, or nothing", () => {
-  it("an existing branch at the pinned base is re-entered, from the base branch or already checked out; one carrying a commit this task's turn made is re-entered too", async () => {
+  it("a branch the control plane created for this run and task is re-entered, from the base branch or already checked out, with a commit this task's turn made on it", async () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const s = await standardRun(f, "stb-reentry", {
@@ -391,10 +417,12 @@ describe("re-entry: the same run and task, or nothing", () => {
       });
       const taskId = s.taskIds[0]!;
       const { target, claimId } = await staffAndClaim(f, s, taskId);
-      // An earlier admission made the branch and stopped before an execution; the checkout went back to dev.
-      gitSync(s.repo, ["branch", target.branch, target.baseSha]);
-      // A commit on it that this task's turn made, as its record names it.
-      gitSync(s.repo, ["checkout", "-q", target.branch]);
+      // The first admission creates the branch, with its creation record, and starts an execution.
+      const first = await runTask(f, s, taskId, claimId);
+      expect(first).toMatchObject({ ok: true });
+      await settle(f, first);
+      expect(events(f, CREATING, s.runId)).toEqual([{ taskId, repositoryIdentity: IDENTITY, branch: target.branch, baseSha: target.baseSha, worktreeId: expect.any(String) }]);
+      // A commit on it that this task's turn made, as its record names it; the checkout went back to dev.
       writeFiles(s.repo, { "README.md": "# by this task\n" });
       const ours = commitAll(s.repo, "this task's turn");
       gitSync(s.repo, ["checkout", "-q", "dev"]);
@@ -405,41 +433,255 @@ describe("re-entry: the same run and task, or nothing", () => {
       await settle(f, ran);
       expect(branchOf(s.repo)).toBe(target.branch);
       expect(refOf(s.repo, `refs/heads/${target.branch}`)).toBe(ours);
-      expect(events(f, PREPARED, s.runId)).toEqual([expect.objectContaining({ created: false, checkedOut: true, head: ours })]);
+      expect(events(f, PREPARED, s.runId).slice(1)).toEqual([expect.objectContaining({ created: false, checkedOut: true, head: ours })]);
 
       // Already on it: re-entered with no branch write at all.
       const again = await runTask(f, s, taskId, claimId);
       expect(again).toMatchObject({ ok: true });
       await settle(f, again);
-      expect(events(f, PREPARED, s.runId)).toHaveLength(1);
-      expect(cp.tasks.executions(s.runId)).toHaveLength(2);
+      expect(events(f, PREPARED, s.runId)).toHaveLength(2);
+      expect(events(f, CREATING, s.runId)).toHaveLength(1);
+      expect(cp.tasks.executions(s.runId)).toHaveLength(3);
     });
   });
 
-  it("a branch with the task's name that carries a foreign commit, or does not descend from the pinned base, is refused and left exactly as it is", async () => {
-    for (const shape of ["foreign", "diverged"] as const) {
+  it("a branch with the task's name made by anyone else at the pinned base, or the control plane's own carrying a foreign commit or another history, is refused and left exactly as it is", async () => {
+    for (const shape of ["unrecorded", "foreign", "diverged"] as const) {
       await withBootstrapRuntime(async (f) => {
         const s = await standardRun(f, `stb-${shape}`, {
           tasks: [{ key: "readme", title: "update README.md", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } }],
         });
         const taskId = s.taskIds[0]!;
         const { target, claimId } = await staffAndClaim(f, s, taskId);
-        if (shape === "foreign") {
-          gitSync(s.repo, ["checkout", "-q", "-b", target.branch]);
-          writeFiles(s.repo, { "README.md": "# someone else\n" });
-          commitAll(s.repo, "someone else's work");
-          gitSync(s.repo, ["checkout", "-q", "dev"]);
+        if (shape === "unrecorded") {
+          // c98ea8a3 (S-TB-03): its name and its SHA are right, and that is not ownership.
+          gitSync(s.repo, ["branch", target.branch, target.baseSha]);
         } else {
-          const orphan = gitSync(s.repo, ["commit-tree", `${target.baseSha}^{tree}`, "-m", "unrelated history"]);
-          gitSync(s.repo, ["branch", target.branch, orphan]);
+          // The control plane's own branch first, through a real admission; then someone moves it.
+          const first = await runTask(f, s, taskId, claimId);
+          expect(first).toMatchObject({ ok: true });
+          await settle(f, first);
+          if (shape === "foreign") {
+            writeFiles(s.repo, { "README.md": "# someone else\n" });
+            commitAll(s.repo, "someone else's work");
+            gitSync(s.repo, ["checkout", "-q", "dev"]);
+          } else {
+            gitSync(s.repo, ["checkout", "-q", "dev"]);
+            const orphan = gitSync(s.repo, ["commit-tree", `${target.baseSha}^{tree}`, "-m", "unrelated history"]);
+            gitSync(s.repo, ["update-ref", `refs/heads/${target.branch}`, orphan]);
+          }
         }
+        const executions = f.harness.cp.tasks.executions(s.runId).length;
+        const prepared = events(f, PREPARED, s.runId).length;
         const refsBefore = refsOf(s.repo);
         const refused = await runTask(f, s, taskId, claimId);
         expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
         expect(refsOf(s.repo)).toBe(refsBefore);
         expect(branchOf(s.repo)).toBe("dev");
-        expect(f.harness.cp.tasks.executions(s.runId)).toEqual([]);
-        expect(events(f, PREPARED, s.runId)).toEqual([]);
+        expect(f.harness.cp.tasks.executions(s.runId)).toHaveLength(executions);
+        expect(events(f, PREPARED, s.runId)).toHaveLength(prepared);
+      });
+    }
+  });
+});
+
+describe("the hand-off between task branches (c98ea8a3, S-TB-02)", () => {
+  it("two successive successful tasks in one checkout: the second leaves the first's finished branch for its own, at the pinned base, and the first's ref and commit stay exactly where they are", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "stb-handoff", {
+        tasks: [
+          { key: "one", title: "update readme", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } },
+          { key: "two", title: "update app", category: "implementation", spec: { writeTarget: { paths: ["src/app.js"] } } },
+        ],
+      });
+      const [one, two] = s.taskIds as [string, string];
+      const worker = workerDoing(f, { writes: { "README.md": "# task one\n" } });
+      try {
+        const first = await staffAndClaim(f, s, one);
+        const ran = await runTask(f, s, one, first.claimId);
+        expect(ran).toMatchObject({ ok: true });
+        expect(cp.tasks.execution(await settle(f, ran))?.status).toBe("SUCCEEDED");
+        const oneTip = refOf(s.repo, `refs/heads/${first.target.branch}`)!;
+        expect(oneTip).not.toBe(first.target.baseSha);
+        expect(await f.cto(s.sessionId, "resource_release", { runId: s.runId })).toMatchObject({ ok: true });
+
+        worker.script = { writes: { "src/app.js": "module.exports = () => 2;\n" } };
+        const second = await staffAndClaim(f, s, two);
+        expect(second.target.baseSha).toBe(first.target.baseSha);
+        const next = await runTask(f, s, two, second.claimId);
+        expect(next).toMatchObject({ ok: true });
+        expect(cp.tasks.execution(await settle(f, next))?.status).toBe("SUCCEEDED");
+        expect(branchOf(s.repo)).toBe(second.target.branch);
+        // The second task's commit sits on the pinned base, not on the first task's work.
+        expect(refOf(s.repo, `refs/heads/${second.target.branch}^`)).toBe(second.target.baseSha);
+        expect(refOf(s.repo, `refs/heads/${first.target.branch}`)).toBe(oneTip);
+        expect(readFileSync(join(s.repo, "README.md"), "utf8")).toBe("# fixture project\n");
+        expect(events(f, PREPARED, s.runId).at(-1)).toMatchObject({
+          taskId: two,
+          created: true,
+          checkedOut: true,
+          from: oneTip,
+          fromBranch: first.target.branch,
+          handoffFrom: { runId: s.runId, taskId: one, branch: first.target.branch },
+        });
+      } finally {
+        worker.killAll();
+      }
+    });
+  });
+
+  it("a branch the control plane made for a task whose execution has not ended is not left; nothing is created or moved", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "stb-handoff-running", {
+        tasks: [
+          { key: "one", title: "update readme", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } },
+          { key: "two", title: "update app", category: "implementation", spec: { writeTarget: { paths: ["src/app.js"] } } },
+        ],
+      });
+      const [one, two] = s.taskIds as [string, string];
+      const first = await staffAndClaim(f, s, one);
+      const ran = await runTask(f, s, one, first.claimId);
+      expect(ran).toMatchObject({ ok: true });
+      await settle(f, ran);
+      // The first task runs again, by a receipt the CTO opened for it: its execution has not ended.
+      const workerSession = cp.bindings.active(`WORKER:${one}`)!.sessionId;
+      const open = cp.tasks.startExecution({ runId: s.runId, taskId: one, ownerBindingGeneration: 1, workerSessionId: workerSession, provider: "claude", model: "opus" });
+      expect(open.allowed).toBe(true);
+      expect(await f.cto(s.sessionId, "resource_release", { runId: s.runId })).toMatchObject({ ok: true });
+      const second = await staffAndClaim(f, s, two);
+      const refsBefore = refsOf(s.repo);
+      const refused = await runTask(f, s, two, second.claimId);
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+      expect(branchOf(s.repo)).toBe(first.target.branch);
+      expect(refsOf(s.repo)).toBe(refsBefore);
+      expect(refOf(s.repo, `refs/heads/${second.target.branch}`)).toBeNull();
+    });
+  });
+});
+
+describe("an already-staffed task with no recorded target (c98ea8a3, S-TB-01)", () => {
+  it("the daemon records a legacy task's derivable target before its continuation, and the claim and run go by it; a staffed task whose target cannot be derived is refused at the runner, whatever it claims", async () => {
+    await withBootstrapRuntime(async (f) => {
+      gitSync(f.harness.repoPath, ["checkout", "-q", "-b", "main"]);
+      const s = await standardRun(f, "stb-staffed", {
+        profile: MAIN_ONLY,
+        base: "main",
+        tasks: [
+          { key: "readme", title: "update README.md", category: "docs" },
+          { key: "impl", title: "implement", category: "implementation" },
+        ],
+      });
+      const [legacy, underivable] = s.taskIds as [string, string];
+      // Staffed before targets were recorded: bound the way staffing binds, with no recording.
+      for (const taskId of s.taskIds) bindWorker(f, s.runId, taskId);
+      expect(events(f, RECORDED, s.runId)).toEqual([]);
+      const outcomes = await f.daemon.recordStandardWorkTargets();
+      expect(outcomes).toHaveLength(2);
+      expect(outcomes).toEqual(expect.arrayContaining([
+        { runId: s.runId, taskId: legacy, recorded: true, reasonCode: ReasonCode.OK },
+        { runId: s.runId, taskId: underivable, recorded: false, reasonCode: ReasonCode.INVALID_ARGUMENT },
+      ]));
+      // Recorded once; a refusal on the same inputs is not derived again.
+      expect(await f.daemon.recordStandardWorkTargets()).toEqual([]);
+      const main = refOf(s.repo, "refs/heads/main")!;
+      const target = (await contractTasks(f, s)).find((task) => task.taskId === legacy)!.spec["writeTarget"] as WriteTarget;
+      expect(target).toEqual({ repositoryIdentity: IDENTITY, branch: `hotfix/${idOf(legacy)}-update-readme-md`, paths: ["README.md"], declaredParent: "main", baseSha: main });
+      const claimId = await claimTarget(f, s, target);
+      const ran = await runTask(f, s, legacy, claimId);
+      expect(ran).toMatchObject({ ok: true });
+      await settle(f, ran);
+      expect(branchOf(s.repo)).toBe(target.branch);
+      gitSync(s.repo, ["checkout", "-q", "main"]);
+      // The underivable one claims something arbitrary and is refused before anything is read or written.
+      expect(await f.cto(s.sessionId, "resource_release", { runId: s.runId })).toMatchObject({ ok: true });
+      const arbitrary = await claimTarget(f, s, { repositoryIdentity: IDENTITY, branch: "task/arbitrary", paths: ["README.md"] });
+      const refsBefore = refsOf(s.repo);
+      expect(await runTask(f, s, underivable, arbitrary)).toMatchObject({ ok: false, reasonCode: ReasonCode.INVALID_ARGUMENT });
+      expect(refsOf(s.repo)).toBe(refsBefore);
+      expect(f.harness.cp.tasks.executions(s.runId).filter((execution) => execution.taskId === underivable)).toEqual([]);
+    });
+  });
+
+  it("the runner records a staffed task's target from its PLAN before its first execution, and refuses a claim that is not that target", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "stb-staffed-runner", {
+        tasks: [{ key: "readme", title: "update README.md", category: "docs", spec: { writeTarget: { repositoryIdentity: IDENTITY, paths: ["README.md"] } } }],
+      });
+      const taskId = s.taskIds[0]!;
+      bindWorker(f, s.runId, taskId);
+      const branch = `task/${idOf(taskId)}-update-readme-md`;
+      const wrong = await claimTarget(f, s, { repositoryIdentity: IDENTITY, branch, paths: ["README.md", "src/app.js"] });
+      expect(await runTask(f, s, taskId, wrong)).toMatchObject({ ok: false, reasonCode: ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH });
+      // The refusal still recorded the target, through the same derivation provisioning uses.
+      expect(events(f, RECORDED, s.runId)).toEqual([expect.objectContaining({ taskId, writeTarget: expect.objectContaining({ branch, paths: ["README.md"] }) })]);
+      expect(await f.cto(s.sessionId, "resource_release", { runId: s.runId })).toMatchObject({ ok: true });
+      const right = await claimTarget(f, s, { repositoryIdentity: IDENTITY, branch, paths: ["README.md"] });
+      const ran = await runTask(f, s, taskId, right);
+      expect(ran).toMatchObject({ ok: true });
+      await settle(f, ran);
+      expect(branchOf(s.repo)).toBe(branch);
+    });
+  });
+});
+
+describe("the recorded lineage reaches the PR checks (c98ea8a3, S-TB-06)", () => {
+  it.each([
+    { profile: "dev-bearing", base: "dev", parent: "dev" },
+    { profile: "main-only", base: "main", parent: "main" },
+  ])("$profile: the base branch advances after the pin, the task commits atop the pin, and freeze, the finalizer's contract and the kernel's lineage check all carry the recorded parent and pinned commit", async ({ profile, base, parent }) => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      if (base === "main") gitSync(f.harness.repoPath, ["checkout", "-q", "-b", "main"]);
+      const branchProfile = profile === "main-only" ? MAIN_ONLY : DEV_BEARING;
+      const s = await standardRun(f, `stb-lineage-${base}`, {
+        profile: branchProfile,
+        base,
+        tasks: [{ key: "readme", title: "update README.md", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } }],
+      });
+      const taskId = s.taskIds[0]!;
+      const { target, claimId } = await staffAndClaim(f, s, taskId);
+      expect(target.declaredParent).toBe(parent);
+      writeFiles(s.repo, { "README.md": `# ${base} moves on\n` });
+      const advanced = commitAll(s.repo, `${base} moves on`);
+      const worker = workerDoing(f, { writes: { "README.md": "# the task's change, on the pin\n" } });
+      try {
+        const ran = await runTask(f, s, taskId, claimId);
+        expect(ran).toMatchObject({ ok: true });
+        expect(cp.tasks.execution(await settle(f, ran))?.status).toBe("SUCCEEDED");
+      } finally {
+        worker.killAll();
+      }
+      expect(refOf(s.repo, `refs/heads/${target.branch}^`)).toBe(target.baseSha);
+      expect(refOf(s.repo, `refs/heads/${base}`)).toBe(advanced);
+      const frozen = await cp.pipeline.freeze(s.runId);
+      if (!frozen.allowed) throw new Error(`${frozen.reasonCode}: ${frozen.message}`);
+      const repo = frozen.value.repositories[0]!;
+      // Never the moving tip: the recorded parent and the pinned commit.
+      expect({ sourceBranch: repo.sourceBranch, sourceHead: repo.sourceHead }).toEqual({ sourceBranch: parent, sourceHead: target.baseSha });
+      // The finalizer passes the frozen origin as the declared parent (finalizer.ts).
+      expect(validateBranchContract({ head: target.branch, base: repo.baseBranch, profile: branchProfile, declaredParent: repo.sourceBranch ?? null, sourceBranch: repo.sourceBranch ?? null }).allowed).toBe(true);
+      // The GitHub kernel's frozen-lineage check, as PR preparation calls it.
+      const kernel = cp.github as unknown as {
+        assertFrozenSourceLineage(identity: string, head: string, profile: BranchProfile, declaredParent: string | null, candidate: CandidateSnapshot["repositories"][number]): Promise<unknown>;
+      };
+      expect(await kernel.assertFrozenSourceLineage(IDENTITY, target.branch, branchProfile, parent, repo))
+        .toMatchObject({ allowed: true, value: { sourceBranch: parent, sourceHead: target.baseSha } });
+    });
+  });
+});
+
+describe("single-file evidence (c98ea8a3, S-TB-08)", () => {
+  it("a docs task with no paths takes its contract's one scope entry only when the pinned base holds a regular file there: a directory or a missing path is refused, nothing recorded", async () => {
+    for (const scope of [["src"], ["NOTES.md"]]) {
+      await withBootstrapRuntime(async (f) => {
+        const s = await standardRun(f, `stb-scope-${scope[0]!.replace(/\W/g, "")}`, { scope, tasks: [{ key: "docs", title: "document", category: "docs" }] });
+        expect(await provision(f, s, s.taskIds[0]!)).toMatchObject({
+          ok: true,
+          value: { writeTarget: null, writeTargetRefused: { reasonCode: ReasonCode.INVALID_ARGUMENT } },
+        });
+        expect(events(f, RECORDED, s.runId)).toEqual([]);
       });
     }
   });
@@ -466,6 +708,39 @@ describe("a checkout that is not clean or not the writer's", () => {
       expect(branchOf(s.repo)).toBe("dev");
       expect(f.harness.cp.tasks.executions(s.runId)).toEqual([]);
     });
+  });
+
+  it("cleanliness and the index are asserted again at the branch effect: a user edit or an index-only change landing just before the guard's authorization refuses with nothing created or moved", async () => {
+    for (const change of ["edit", "index"] as const) {
+      await withBootstrapRuntime(async (f) => {
+        const cp = f.harness.cp;
+        const s = await standardRun(f, `stb-fence-${change}`, {
+          tasks: [{ key: "readme", title: "update README.md", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } }],
+        });
+        const taskId = s.taskIds[0]!;
+        const { target, claimId } = await staffAndClaim(f, s, taskId);
+        const authorize = cp.guard.authorize.bind(cp.guard);
+        let landed = false;
+        vi.spyOn(cp.guard, "authorize").mockImplementation(async (request, effect) => {
+          if (request.operation === "GIT_BRANCH") {
+            landed = true;
+            if (change === "edit") writeFileSync(join(s.repo, "README.md"), "# a user's edit, just in time\n");
+            else gitSync(s.repo, ["update-index", "--assume-unchanged", "README.md"]);
+          }
+          return authorize(request, effect);
+        });
+        const refsBefore = refsOf(s.repo);
+        const refused = await runTask(f, s, taskId, claimId);
+        expect(landed).toBe(true);
+        expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+        expect(refsOf(s.repo)).toBe(refsBefore);
+        expect(refOf(s.repo, `refs/heads/${target.branch}`)).toBeNull();
+        expect(branchOf(s.repo)).toBe("dev");
+        if (change === "edit") expect(readFileSync(join(s.repo, "README.md"), "utf8")).toBe("# a user's edit, just in time\n");
+        expect(events(f, CREATING, s.runId)).toEqual([]);
+        expect(cp.tasks.executions(s.runId)).toEqual([]);
+      });
+    }
   });
 
   it("not owned: a checkout on another branch is not moved, a released claim and a caller that does not own the run are refused, and nothing is created", async () => {

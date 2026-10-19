@@ -4,7 +4,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { WorkerTurnRunner } from "../../src/run/worker-turn.ts";
 import { cleanupTempDirs, gitSync, makeCore, tempDir } from "../helpers/fixtures.ts";
-import { FakeWorkerAdapter, seedWorkerWorld, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
+import { FakeWorkerAdapter, recordSeededTarget, seedWorkerWorld, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 /**
  * #1097 — the worker's diff scan lists untracked paths with `--exclude-standard`, so a change under an
@@ -25,6 +25,8 @@ const ignoringWorld = (): WorkerWorld => {
   writeFileSync(join(world.repoPath, ".gitignore"), "build/\n");
   gitSync(world.repoPath, ["add", ".gitignore"]);
   gitSync(world.repoPath, ["commit", "-q", "-m", "ignore build output"]);
+  // #512 S-TB: the commit is the task branch's base, as the control plane would have recorded it.
+  recordSeededTarget(world);
   mkdirSync(join(world.repoPath, "build"), { recursive: true });
   writeFileSync(join(world.repoPath, "build", "untouched.txt"), "from before the turn\n");
   writeFileSync(join(world.repoPath, "build", "rewritten.txt"), "from before the turn\n");

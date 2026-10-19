@@ -8,10 +8,9 @@ import { acpScratchDir } from "../core/scratch-root.ts";
 import type { BranchProfile, ProjectManifest } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { ArtifactKind, RunKind, type RunRow, TaskState } from "../domain/types.ts";
+import { RunKind, TaskState } from "../domain/types.ts";
 import { classifyBranch, validateBranchContract } from "../github/branch-contract.ts";
-import type { RunEngine } from "./run-engine.ts";
-import { pinRepository, runPinnedGit } from "./worker-git.ts";
+import { type PinnedRepository, pinRepository, runPinnedGit } from "./worker-git.ts";
 
 /**
  * #512 S-TB (CEO 0a16329c, f5879479) — a STANDARD_WORK task's write target, recorded once by the
@@ -50,11 +49,12 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 /**
- * The single policy point that picks the class of a task's work branch (CEO f5879479). A
- * dev-bearing profile (its default branch is not `main`) cuts `task/*` from the run's base, which
- * the branch contract accepts when that base is dev, a feature or a release branch. A main-only
- * profile (`main` is its default and its only long-lived branch) cuts `hotfix/*` from `main`, the
- * one class the contract lets target `main`. Any other profile or base is refused here, by name.
+ * The single policy point that picks the class of a task's work branch (CEO f5879479, c98ea8a3). A
+ * dev-bearing profile (its default branch is not `main`) cuts `task/*` from dev and from nothing
+ * else: a feature or release base is refused here, though the branch contract itself would accept
+ * one. A main-only profile (`main` is its default and its only long-lived branch) cuts `hotfix/*`
+ * from `main`, the one class the contract lets target `main`. Any other profile or base is refused
+ * here, by name.
  */
 export const workBranchClassFor = (
   base: string,
@@ -64,7 +64,7 @@ export const workBranchClassFor = (
   const mainOnly = profile.defaultBranch === "main" && profile.longLived.every((name) => name === "main");
   const devBearing = classifyBranch(profile.defaultBranch, profile).class === "dev";
   if (mainOnly && baseClass === "main") return allow(ReasonCode.OK, { branchClass: "hotfix", declaredParent: base });
-  if (devBearing && (baseClass === "dev" || baseClass === "feature" || baseClass === "release")) {
+  if (devBearing && baseClass === "dev") {
     return allow(ReasonCode.OK, { branchClass: "task", declaredParent: base });
   }
   return deny(
@@ -139,8 +139,72 @@ const isNormalRelativePath = (path: string): boolean =>
   !path.startsWith("/") &&
   path.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
 
-/** A contract scope entry that names one file and nothing else (`README.md`), never free text. */
+/**
+ * A contract scope entry that could name one file (`README.md`), never free text. Syntax alone is not
+ * evidence: the entry is used only when the run's pinned base holds a regular file at exactly that
+ * path (`fileAtBase`), never a directory, a symlink or nothing.
+ */
 const isSingleFileScope = (entry: string): boolean => isNormalRelativePath(entry) && /^[A-Za-z0-9._/-]+$/.test(entry);
+
+/**
+ * #512 S-TB (c98ea8a3) — the audit kind the control plane writes immediately before it creates a
+ * task's work branch, inside the guard's grant: the run (the event's `run_id`), the task, the
+ * repository, the branch and the base commit it is created at. It is the one record that makes an
+ * existing branch of that name the control plane's own: re-entry and the hand-off from a finished
+ * task's branch both require it, and a branch with no such record is never used.
+ */
+export const TASK_BRANCH_CREATING = "TASK_BRANCH_CREATING";
+
+/** Every creation record for a repository's branch, oldest first. */
+export const branchCreations = (
+  db: Db,
+  repositoryIdentity: string,
+  branch: string,
+): Array<{ runId: string; taskId: string; baseSha: string }> =>
+  db
+    .all<{ run_id: string | null; evidence_json: string }>(
+      `SELECT run_id, evidence_json FROM audit_events
+        WHERE kind = ? AND json_extract(evidence_json, '$.repositoryIdentity') = ?
+          AND json_extract(evidence_json, '$.branch') = ?
+        ORDER BY event_id`,
+      [TASK_BRANCH_CREATING, repositoryIdentity, branch],
+    )
+    .map((row) => {
+      const evidence = JSON.parse(row.evidence_json) as { taskId?: unknown; baseSha?: unknown };
+      return { runId: row.run_id ?? "", taskId: String(evidence.taskId ?? ""), baseSha: String(evidence.baseSha ?? "") };
+    })
+    .filter((creation) => creation.runId.length > 0 && creation.taskId.length > 0 && creation.baseSha.length > 0);
+
+/** The recorded write target of a run whose branch, in that repository, is `branch`; the newest. */
+export const recordedTargetForBranch = (
+  db: Db,
+  runId: string,
+  repositoryIdentity: string,
+  branch: string,
+): (TaskWriteTarget & { taskId: string }) | null => {
+  const row = db.get<{ evidence_json: string }>(
+    `SELECT evidence_json FROM audit_events
+      WHERE kind = ? AND run_id = ?
+        AND json_extract(evidence_json, '$.writeTarget.repositoryIdentity') = ?
+        AND json_extract(evidence_json, '$.writeTarget.branch') = ?
+      ORDER BY event_id DESC LIMIT 1`,
+    [TASK_WRITE_TARGET_RECORDED, runId, repositoryIdentity, branch],
+  );
+  if (!row) return null;
+  const evidence = JSON.parse(row.evidence_json) as { taskId?: unknown; writeTarget?: unknown };
+  return isRecord(evidence.writeTarget) && typeof evidence.taskId === "string"
+    ? { ...(evidence.writeTarget as unknown as TaskWriteTarget), taskId: evidence.taskId }
+    : null;
+};
+
+/** The run's base commit for a repository as its first recorded target pinned it; null before any. */
+const runBasePin = (db: Db, runId: string, repositoryIdentity: string): string | null =>
+  db.get<{ base: string | null }>(
+    `SELECT json_extract(evidence_json, '$.writeTarget.baseSha') AS base FROM audit_events
+      WHERE kind = ? AND run_id = ? AND json_extract(evidence_json, '$.writeTarget.repositoryIdentity') = ?
+      ORDER BY event_id LIMIT 1`,
+    [TASK_WRITE_TARGET_RECORDED, runId, repositoryIdentity],
+  )?.base ?? null;
 
 /** The latest write target the control plane recorded for a task, read from its audit record. */
 export const recordedWriteTarget = (db: Db, runId: string, taskId: string): TaskWriteTarget | null => {
@@ -162,16 +226,31 @@ export interface TaskWriteTargetPorts {
   readonly db: Db;
   readonly clock: Clock;
   readonly audit: AuditLog;
-  readonly runs: Pick<RunEngine, "get" | "repositoriesOf">;
-  readonly projects: { manifest(digest: string): ProjectManifest | null };
-  readonly artifacts: { latest<T>(runId: string, kind: ArtifactKind): { content: T } | null };
-  /** Private scratch for the one pinned git read; defaults to the control plane's scratch root. */
+  /** Private scratch for the pinned git reads; defaults to the control plane's scratch root. */
   readonly scratchDir?: (prefix: string) => string;
+}
+
+interface RepositoryFacts {
+  identity: string;
+  checkoutPath: string;
+  baseBranch: string;
+}
+
+interface Derived {
+  target: Omit<TaskWriteTarget, "baseSha">;
+  repository: RepositoryFacts;
+  declared: Record<string, unknown> | null;
+  derivedFields: string[];
+  branchClass: WorkBranchClass;
+  /** The one path came from the contract's scope, so it stands only as a file at the pinned base. */
+  pathFromScope: boolean;
 }
 
 /**
  * Records a STANDARD_WORK task's write target, or says exactly why it cannot. Idempotent: a task
- * with a record gets that record back unchanged.
+ * with a record gets that record back unchanged. Everything is read from the database itself (the
+ * run, its repositories, its pinned manifest and contract), so every official door — provisioning,
+ * the runner before a first execution, the daemon before a continuation — records the same value.
  */
 export class TaskWriteTargets {
   constructor(private readonly ports: TaskWriteTargetPorts) {}
@@ -185,17 +264,23 @@ export class TaskWriteTargets {
     taskId: string,
     fence: () => Decision<unknown>,
   ): Promise<Decision<TaskWriteTarget | null>> {
-    const run = this.ports.runs.get(runId);
+    const run = this.ports.db.get<{ kind: string; pinned_manifest_digest: string | null }>(
+      `SELECT kind, pinned_manifest_digest FROM runs WHERE run_id = ?`,
+      [runId],
+    );
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
     if (run.kind !== RunKind.STANDARD_WORK) return allow(ReasonCode.OK, null);
     const existing = recordedWriteTarget(this.ports.db, runId, taskId);
     if (existing) return allow(ReasonCode.OK, existing);
 
-    const derived = this.derive(run, taskId);
+    const derived = this.derive(runId, run.pinned_manifest_digest, taskId);
     if (!derived.allowed) return derived as Decision<never>;
     const base = await this.pinnedBase(runId, derived.value.repository);
     if (!base.allowed) return base as Decision<never>;
-    const target: TaskWriteTarget = { ...derived.value.target, baseSha: base.value };
+    if (derived.value.pathFromScope) {
+      const file = await this.fileAtBase(derived.value.repository, base.value, derived.value.target.paths[0]!);
+      if (!file.allowed) return file as Decision<never>;
+    }
     // Every refusal comes before the first write; a failed audit write throws and takes the spec
     // update back with it, so a spec never names a target its record does not.
     return this.ports.db.tx((): Decision<TaskWriteTarget | null> => {
@@ -203,6 +288,18 @@ export class TaskWriteTargets {
       if (!fenced.allowed) return fenced as Decision<never>;
       const raced = recordedWriteTarget(this.ports.db, runId, taskId);
       if (raced) return allow(ReasonCode.OK, raced);
+      // c98ea8a3 (S-TB-04) — one base per run and repository, decided here, in the transaction that
+      // writes: a concurrent recording that committed first pinned it, and this one takes that pin.
+      // A path that stood only as a file at the base this one read is not carried to another base.
+      const pinned = runBasePin(this.ports.db, runId, derived.value.repository.identity);
+      if (pinned !== null && pinned !== base.value && derived.value.pathFromScope) {
+        return deny(ReasonCode.CONFLICT, "the run's base was pinned at another commit while this target was derived; it is derived again from that pin", {
+          taskId,
+          pinnedBase: pinned,
+          readBase: base.value,
+        });
+      }
+      const target: TaskWriteTarget = { ...derived.value.target, baseSha: pinned ?? base.value };
       const task = this.ports.db.get<{ spec_json: string }>(
         `SELECT spec_json FROM tasks WHERE task_id = ? AND run_id = ?`,
         [taskId, runId],
@@ -237,19 +334,13 @@ export class TaskWriteTargets {
   }
 
   /** Everything but the base commit, from the task, its spec, the run's contract, base and profile. */
-  private derive(run: RunRow, taskId: string): Decision<{
-    target: Omit<TaskWriteTarget, "baseSha">;
-    repository: { identity: string; checkoutPath: string; baseBranch: string };
-    declared: Record<string, unknown> | null;
-    derivedFields: string[];
-    branchClass: WorkBranchClass;
-  }> {
+  private derive(runId: string, pinnedManifestDigest: string | null, taskId: string): Decision<Derived> {
     const { db } = this.ports;
     const task = db.get<{ title: string; category: string; state: string; spec_json: string }>(
       `SELECT title, category, state, spec_json FROM tasks WHERE task_id = ? AND run_id = ?`,
-      [taskId, run.runId],
+      [taskId, runId],
     );
-    if (!task) return deny(ReasonCode.NOT_FOUND, "unknown task", { runId: run.runId, taskId });
+    if (!task) return deny(ReasonCode.NOT_FOUND, "unknown task", { runId, taskId });
     if (task.state === TaskState.SUCCEEDED || task.state === TaskState.FAILED || task.state === TaskState.CANCELLED) {
       return deny(ReasonCode.CONFLICT, `the task is ${task.state}; no write target is recorded for it`, { taskId, state: task.state });
     }
@@ -266,7 +357,12 @@ export class TaskWriteTargets {
     const derivedFields: string[] = ["declaredParent", "baseSha"];
 
     // The repository: the one the PLAN named, or the run's only one.
-    const repositories = this.ports.runs.repositoriesOf(run.runId);
+    const repositories = db.all<{ identity: string; checkoutPath: string; baseBranch: string }>(
+      `SELECT r.identity, r.checkout_path AS checkoutPath, rr.base_branch AS baseBranch
+         FROM run_repositories rr JOIN repositories r ON r.repository_id = rr.repository_id
+        WHERE rr.run_id = ? ORDER BY rr.merge_order, r.identity`,
+      [runId],
+    );
     const named = declared?.["repositoryIdentity"];
     if (named !== undefined && typeof named !== "string") {
       return deny(ReasonCode.INVALID_ARGUMENT, "the task's writeTarget.repositoryIdentity is not a string", { taskId });
@@ -293,6 +389,7 @@ export class TaskWriteTargets {
     // The paths: the task's own, or, for a docs task with none, the one file its contract declares.
     let paths: string[];
     const declaredPaths = declared?.["paths"];
+    const pathFromScope = declaredPaths === undefined;
     if (declaredPaths !== undefined) {
       if (
         !Array.isArray(declaredPaths) ||
@@ -303,7 +400,12 @@ export class TaskWriteTargets {
       }
       paths = [...new Set(declaredPaths)].sort();
     } else {
-      const scope = this.ports.artifacts.latest<{ scope?: unknown }>(run.runId, ArtifactKind.TASK_CONTRACT)?.content?.scope;
+      const contract = db.get<{ content_json: string }>(
+        `SELECT content_json FROM run_artifacts WHERE run_id = ? AND kind = 'TASK_CONTRACT' AND superseded = 0
+          ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+        [runId],
+      );
+      const scope = contract ? (JSON.parse(contract.content_json) as { scope?: unknown }).scope : undefined;
       const single = Array.isArray(scope) && scope.length === 1 && typeof scope[0] === "string" && isSingleFileScope(scope[0])
         ? scope[0]
         : null;
@@ -319,11 +421,14 @@ export class TaskWriteTargets {
     }
 
     // The branch and its declared parent, from the one policy point and the branch contract.
-    const manifest = run.pinnedManifestDigest ? this.ports.projects.manifest(run.pinnedManifestDigest) : null;
-    if (!manifest?.branchProfile) {
+    const manifest = pinnedManifestDigest
+      ? db.get<{ content_json: string }>(`SELECT content_json FROM manifests WHERE digest = ?`, [pinnedManifestDigest])
+      : undefined;
+    const profile = manifest ? (JSON.parse(manifest.content_json) as Partial<ProjectManifest>).branchProfile : undefined;
+    if (!profile) {
       return deny(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION, "the run pins no manifest with a branch profile; no work branch can be derived", {
         policy: WORK_BRANCH_POLICY,
-        runId: run.runId,
+        runId,
       });
     }
     const declaredBranch = declared?.["branch"];
@@ -334,7 +439,7 @@ export class TaskWriteTargets {
       taskId,
       title: task.title,
       base: chosen.baseBranch,
-      profile: manifest.branchProfile,
+      profile,
       declared: typeof declaredBranch === "string" ? declaredBranch : null,
     });
     if (!branch.allowed) return branch as Decision<never>;
@@ -346,39 +451,60 @@ export class TaskWriteTargets {
       declared,
       derivedFields: derivedFields.sort(),
       branchClass: branch.value.branchClass,
+      pathFromScope,
     });
   }
 
   /**
    * The run's base commit for a repository, pinned once: an earlier task's record of the same run
    * and repository, or else the commit its base branch names in the registered checkout right now.
-   * Every later task of the run reads the pin, never the branch name again.
+   * Every later task of the run reads the pin, never the branch name again; `ensure` settles a
+   * concurrent first pin inside its transaction.
    */
-  private async pinnedBase(
-    runId: string,
-    repository: { identity: string; checkoutPath: string; baseBranch: string },
-  ): Promise<Decision<string>> {
-    const earlier = this.ports.db.get<{ base: string | null }>(
-      `SELECT json_extract(evidence_json, '$.writeTarget.baseSha') AS base FROM audit_events
-        WHERE kind = ? AND run_id = ? AND json_extract(evidence_json, '$.writeTarget.repositoryIdentity') = ?
-        ORDER BY event_id LIMIT 1`,
-      [TASK_WRITE_TARGET_RECORDED, runId, repository.identity],
-    );
-    if (earlier?.base) return allow(ReasonCode.OK, earlier.base);
+  private async pinnedBase(runId: string, repository: RepositoryFacts): Promise<Decision<string>> {
+    const earlier = runBasePin(this.ports.db, runId, repository.identity);
+    if (earlier) return allow(ReasonCode.OK, earlier);
+    return this.withRepository(repository, async (repo) => {
+      const read = await runPinnedGit(repo, ["rev-parse", "--verify", "-q", `refs/heads/${repository.baseBranch}^{commit}`]);
+      const sha = read.stdout.trim();
+      if (read.exitCode !== 0 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) {
+        return deny(ReasonCode.NOT_FOUND, "the run's base branch names no commit in the registered checkout", {
+          repositoryIdentity: repository.identity,
+          baseBranch: repository.baseBranch,
+        });
+      }
+      return allow(ReasonCode.OK, sha);
+    });
+  }
+
+  /**
+   * c98ea8a3 (S-TB-08) — the contract's one scope entry stands as the task's path only when the
+   * pinned base holds exactly one regular file at exactly that path: a directory, a symlink, a
+   * submodule or nothing there is not file evidence, and is refused rather than widened.
+   */
+  private async fileAtBase(repository: RepositoryFacts, baseSha: string, path: string): Promise<Decision<void>> {
+    return this.withRepository(repository, async (repo) => {
+      const listed = await runPinnedGit(repo, ["ls-tree", "-z", "--full-tree", baseSha, "--", path]);
+      const entries = listed.stdout.split("\0").filter((entry) => entry.length > 0);
+      const entry = entries.length === 1 ? /^(\d{6}) (\w+) [0-9a-f]+\t(.*)$/s.exec(entries[0]!) : null;
+      if (listed.exitCode !== 0 || !entry || entry[2] !== "blob" || (entry[1] !== "100644" && entry[1] !== "100755") || entry[3] !== path) {
+        return deny(
+          ReasonCode.INVALID_ARGUMENT,
+          "the contract's one scope entry is not a single regular file at the run's pinned base; the control plane does not widen it to a directory or guess one",
+          { repositoryIdentity: repository.identity, path, baseSha, found: entries.map((line) => line.split("\t", 1)[0]).slice(0, 5) },
+        );
+      }
+      return allow(ReasonCode.OK, undefined);
+    });
+  }
+
+  private async withRepository<T>(repository: RepositoryFacts, read: (repo: PinnedRepository) => Promise<Decision<T>>): Promise<Decision<T>> {
     const scratch = (this.ports.scratchDir ?? acpScratchDir)("acp-task-base-");
     try {
       const pinned = pinRepository(repository.checkoutPath, scratch);
       if (!pinned.allowed) return pinned as Decision<never>;
       try {
-        const read = await runPinnedGit(pinned.value, ["rev-parse", "--verify", "-q", `refs/heads/${repository.baseBranch}^{commit}`]);
-        const sha = read.stdout.trim();
-        if (read.exitCode !== 0 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) {
-          return deny(ReasonCode.NOT_FOUND, "the run's base branch names no commit in the registered checkout", {
-            repositoryIdentity: repository.identity,
-            baseBranch: repository.baseBranch,
-          });
-        }
-        return allow(ReasonCode.OK, sha);
+        return await read(pinned.value);
       } finally {
         pinned.value.children.retire();
       }

@@ -22,6 +22,7 @@ import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-c
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
 import { CONTINUITY_MODE_MAX_AGE_MS, CONTINUITY_PAUSE_OWNER_FIELDS } from "../run/run-engine.ts";
 import { BOOTSTRAP_PLAN_TASKS } from "../run/task-graph.ts";
+import { TASK_WRITE_TARGET_RECORDED, TaskWriteTargets } from "../run/task-write-target.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import {
   BOOTSTRAP_PLAN_RECOVERY_WAKE,
@@ -679,6 +680,12 @@ export class Daemon {
   readonly #operatorResults = new Map<string, { fingerprint: string; result: Decision<unknown> }>();
   readonly #finalizer: ApprovedRunFinalizer;
   readonly #evidenceExporter: RunEvidenceExporter;
+  /**
+   * #512 S-TB — a task whose target derivation was refused for a reason only a change to its spec or
+   * run could lift, keyed by the task and the spec it was refused for, so a tick does not derive it
+   * again. Process memory only: a restarted daemon tries once more.
+   */
+  readonly #refusedTargets = new Set<string>();
 
   constructor(
     private readonly cp: ControlPlane,
@@ -1537,6 +1544,7 @@ export class Daemon {
       // #512 — a driven PRIMARY_CTO whose STANDARD_WORK run stopped after its PLAN, with a READY task
       // nothing was started for, is woken once per (run, owner generation, task, task state).
       await this.runPeriodic("standard_work_continuation", async () => {
+        await this.recordStandardWorkTargets();
         this.wakeStandardWorkContinuation();
       });
       // #639 contract 6, at the moment it matters most: right after a restart, before the first
@@ -2774,6 +2782,58 @@ export class Daemon {
   }
 
   /**
+   * #512 S-TB (c98ea8a3, S-TB-01) — the official backfill for an already-staffed task: an ACTIVE
+   * STANDARD_WORK run's READY task with an ACTIVE worker, no execution and no recorded write target
+   * (staffed before targets were recorded, or whose recording failed) gets its target derived and
+   * recorded here, through the same `TaskWriteTargets` provisioning uses, under the run's current
+   * owner, right before the continuation wake reads the run. What cannot be derived is left
+   * unrecorded: the runner refuses such a task and its owner's prompt escalates it.
+   */
+  async recordStandardWorkTargets(): Promise<Array<{ runId: string; taskId: string; recorded: boolean; reasonCode: string }>> {
+    const { db } = this.cp;
+    const rows = db.all<{ run_id: string; task_id: string; spec_json: string }>(
+      `SELECT t.run_id, t.task_id, t.spec_json FROM tasks t JOIN runs r ON r.run_id = t.run_id
+        WHERE r.state = 'ACTIVE' AND r.kind = 'STANDARD_WORK' AND t.state = 'READY'
+          AND EXISTS (SELECT 1 FROM assignments a WHERE a.role = 'WORKER' AND a.task_id = t.task_id AND a.status = 'ACTIVE')
+          AND NOT EXISTS (SELECT 1 FROM task_executions e WHERE e.task_id = t.task_id)
+          AND NOT EXISTS (SELECT 1 FROM audit_events v WHERE v.kind = ? AND v.run_id = t.run_id
+                           AND json_extract(v.evidence_json, '$.taskId') = t.task_id)
+        ORDER BY t.created_at, t.task_id`,
+      [TASK_WRITE_TARGET_RECORDED],
+    );
+    const outcomes: Array<{ runId: string; taskId: string; recorded: boolean; reasonCode: string }> = [];
+    if (rows.length === 0) return outcomes;
+    const targets = new TaskWriteTargets({ db, clock: this.cp.clock, audit: this.cp.audit });
+    for (const row of rows) {
+      const key = `${row.task_id}\u0000${row.spec_json}`;
+      if (this.#refusedTargets.has(key)) continue;
+      const fence = (): Decision<void> => {
+        const run = this.cp.runs.get(row.run_id);
+        const binding = run?.ownerRoleKey ? this.cp.bindings.active(run.ownerRoleKey) : null;
+        return run && binding && binding.sessionId === run.ownerSessionId && binding.bindingGeneration === run.ownerBindingGeneration
+          ? allow(ReasonCode.OK, undefined)
+          : deny(ReasonCode.RUN_OWNER_REVOKED, "the run's pinned owner is not its current one", { runId: row.run_id });
+      };
+      let ensured: Decision<unknown>;
+      try {
+        ensured = await targets.ensure(row.run_id, row.task_id, fence);
+      } catch (error) {
+        ensured = deny(ReasonCode.INTERNAL_ERROR, "the task's write target could not be recorded", {
+          error: error instanceof Error ? error.message.slice(0, 300) : String(error),
+        });
+      }
+      // A derivation refused on its inputs is not tried again for the same spec; a conflict, a moved
+      // owner or a failure is.
+      if (!ensured.allowed && (ensured.reasonCode === ReasonCode.INVALID_ARGUMENT || ensured.reasonCode === ReasonCode.PR_BRANCH_CONTRACT_VIOLATION ||
+          ensured.reasonCode === ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE)) {
+        this.#refusedTargets.add(key);
+      }
+      outcomes.push({ runId: row.run_id, taskId: row.task_id, recorded: ensured.allowed, reasonCode: ensured.reasonCode });
+    }
+    return outcomes;
+  }
+
+  /**
    * #512 — the standard work continuation wake, run at startup and on every watchdog tick right after
    * the bootstrap recovery wakes, and built as they are. A driven PRIMARY_CTO is woken only by what is
    * addressed to it, so one whose turn got its STANDARD_WORK run's PLAN accepted, acknowledged the
@@ -3035,6 +3095,7 @@ export class Daemon {
       });
       // #512 — and a driven PRIMARY_CTO whose STANDARD_WORK run stopped after its PLAN, woken once per state.
       void this.runPeriodic("standard_work_continuation", async () => {
+        await this.recordStandardWorkTargets();
         this.wakeStandardWorkContinuation();
       });
       // #512 — and a retired worker's session left live while its process ran is settled on a later tick.

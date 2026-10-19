@@ -39,6 +39,7 @@ import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationEngine, VerificationReport } from "../verify/verification-engine.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
+import { recordedTargetForBranch } from "./task-write-target.ts";
 import type { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 
 const ATTEMPT_LEASE_TTL_MS = 30 * 60 * 1000;
@@ -253,6 +254,7 @@ export class CandidatePipeline {
           repo.workBranch,
           repo.baseBranch,
           profile,
+          { runId, identity: repo.identity },
         );
         return {
           identity: repo.identity,
@@ -1028,11 +1030,25 @@ export class CandidatePipeline {
     workBranch: string | null,
     targetBranch: string,
     profile: BranchProfile | null,
+    scope: { runId: string; identity: string },
   ): Promise<{ sourceBranch: string | null; sourceHead: string | null }> {
     if (!profile) return { sourceBranch: null, sourceHead: null };
     const observedBranch = await currentBranch(checkoutPath);
     const candidateBranch = observedBranch === "HEAD" ? workBranch : observedBranch;
     if (!candidateBranch) return { sourceBranch: null, sourceHead: null };
+
+    // #512 S-TB (c98ea8a3, S-TB-06) — a branch the control plane made for one of this run's tasks has
+    // its origin on record: the declared parent and the pinned base commit it was created at. That is
+    // the lineage frozen, whatever the parent's tip names now; it is never re-derived from a moving tip.
+    // The candidate must still descend from that commit, or no origin is carried (fail closed).
+    const recorded = recordedTargetForBranch(this.db, scope.runId, scope.identity, candidateBranch);
+    if (recorded) {
+      const candidateHead = await revParse(checkoutPath, "HEAD");
+      const ancestor = await mergeBase(checkoutPath, recorded.baseSha, candidateHead);
+      return ancestor === recorded.baseSha
+        ? { sourceBranch: recorded.declaredParent, sourceHead: recorded.baseSha }
+        : { sourceBranch: null, sourceHead: null };
+    }
 
     const requiredSource = requiredBaseFor(candidateBranch, profile, targetBranch);
     if (!requiredSource) return { sourceBranch: null, sourceHead: null };
