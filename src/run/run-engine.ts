@@ -264,17 +264,12 @@ const isContinuityPauseReason = (reason: unknown): reason is string =>
     reason.startsWith(CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX) ||
     reason === CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON);
 
-/**
- * S-HOLD — what, written for a run after continuity paused it, means something moved under the hold: a
- * candidate, a decision or escalation, an owner repin, or its tasks and their executions.
- */
-const CONTINUITY_HOLD_MOVED_KINDS = [
-  "CANDIDATE_FROZEN", "CANDIDATE_PROMOTED", "CANDIDATE_INVALIDATED",
-  "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED", "CEO_DECISION", "OWNER_DECISION", "CTO_ESCALATION",
-  "RUN_OWNER_RENEWED", "RECOVERY_TAKEOVER", "TASK_GRAPH_SUBMITTED", "TASK_GRAPH_CANCELLED",
-  "TASK_EXECUTION_STARTED", "TASK_EXECUTION_FINISHED", "TASK_EXECUTIONS_ABANDONED_FOR_TAKEOVER",
-  "TASK_EXECUTION_LATE_RESULT_IGNORED",
-] as const;
+/** S-HOLD — a RUN_TRANSITION's evidence is continuity's own pause of an ACTIVE run, for `stateReason`. */
+const isContinuityPause = (evidence: Record<string, unknown> | null, stateReason: string | null): boolean =>
+  evidence !== null &&
+  evidence["from"] === RunState.ACTIVE && evidence["to"] === RunState.BLOCKED &&
+  evidence["continuityAction"] === "PAUSE_NEW_WORK" &&
+  evidence["reason"] === stateReason && isContinuityPauseReason(evidence["reason"]);
 
 /** S-HOLD — a binding change of a role whose loss pauses the run, other than the held role's own. */
 const CONTINUITY_HOLD_BINDING_KINDS = [
@@ -1719,17 +1714,23 @@ export class RunEngine {
    *
    * - the run is a STANDARD_WORK run, BLOCKED, with `continuity_hold_role_key` = `held.roleKey`, which
    *   only `pauseForContinuity` writes and every other edge clears;
-   * - its latest RUN_TRANSITION is that pause: ACTIVE → BLOCKED, continuityAction PAUSE_NEW_WORK, its
-   *   reason the run's state reason and one continuity pauses with. A run BLOCKED for anything else (a
-   *   CEO decision, a human gate) has neither, and is never released here;
+   * - the hold's episode is the EARLIEST continuity pause (ACTIVE → BLOCKED, continuityAction
+   *   PAUSE_NEW_WORK, its reason the run's state reason and one continuity pauses with) recorded after the
+   *   run last entered ACTIVE (its DISPATCHED, or a RUN_TRANSITION into ACTIVE). Event ids only grow, so
+   *   a row appended later, a copy of that pause included, can never take its place: it is a record after
+   *   the pause, and keeps the hold. A run BLOCKED for anything else (a CEO decision, a human gate) has no
+   *   such pause, and is never released here;
    * - `held` is still its role's ACTIVE binding (assignment and generation) and its runtime is READY on
    *   its current incarnation; the old session the pause lost is never asked for;
    * - the run's owner pin is its project's PRIMARY_CTO's ACTIVE binding, exactly (session, incarnation,
    *   generation), on a READY session. The pin is only read: ownership never moves, least of all to the
    *   role that was held;
-   * - nothing moved under the hold since the pause: no candidate, decision, escalation, owner repin, task
-   *   or execution record of the run, no task row updated after it, and no binding change of any other
-   *   role whose loss pauses the run.
+   * - nothing moved under the hold since the pause, measured from its event id: no audit record of the
+   *   run at all after it (deny by default: a decision, an escalation, a repin, a task, target, execution
+   *   or candidate record, another transition), no binding change after it of any other role whose loss
+   *   pauses the run; and, for writers that leave no audit record, no task row, execution, artifact or
+   *   candidate attempt of the run written at or after the pause's time (`>=`: one written in the same
+   *   millisecond keeps the hold, which is the safe side), and none of them RUNNING.
    *
    * The release is BLOCKED → ACTIVE under the transition authority, one RUN_TRANSITION, the hold cleared,
    * and the update conditional on the state, hold, reason and pin it read. Nothing is dispatched: the run is
@@ -1749,21 +1750,19 @@ export class RunEngine {
       if (run.continuityHoldRoleKey === null || run.continuityHoldRoleKey !== held.roleKey) {
         return kept("the run is not under continuity's hold for this role");
       }
-      const pause = this.db.get<{ event_id: number; at: string; evidence_json: string }>(
-        `SELECT event_id, at, evidence_json FROM audit_events
-          WHERE kind = 'RUN_TRANSITION' AND run_id = ?
-          ORDER BY event_id DESC LIMIT 1`,
+      const history = this.db.all<{ event_id: number; kind: string; at: string; evidence_json: string }>(
+        `SELECT event_id, kind, at, evidence_json FROM audit_events
+          WHERE run_id = ? AND kind IN ('DISPATCHED', 'RUN_TRANSITION')
+          ORDER BY event_id`,
         [runId],
       );
-      const paused = pause ? auditEvidence(pause.evidence_json) : null;
-      if (
-        !pause || !paused ||
-        paused["from"] !== RunState.ACTIVE || paused["to"] !== RunState.BLOCKED ||
-        paused["continuityAction"] !== "PAUSE_NEW_WORK" ||
-        paused["reason"] !== run.stateReason || !isContinuityPauseReason(paused["reason"])
-      ) {
-        return kept("the run's latest transition is not continuity's own pause");
-      }
+      let entered = -1;
+      history.forEach((row, index) => {
+        if (row.kind === "DISPATCHED" || auditEvidence(row.evidence_json)?.["to"] === RunState.ACTIVE) entered = index;
+      });
+      const pause = history.slice(entered + 1).find((row) =>
+        row.kind === "RUN_TRANSITION" && isContinuityPause(auditEvidence(row.evidence_json), run.stateReason));
+      if (!pause) return kept("no continuity pause is recorded since the run last entered ACTIVE");
       const covering = this.#activeBindingNow(held.roleKey);
       if (covering?.assignmentId !== held.assignmentId || covering.generation !== held.bindingGeneration) {
         return kept("the held role's binding is no longer its active one");
@@ -1780,17 +1779,27 @@ export class RunEngine {
         return kept("the run's owner pin is not its PRIMARY_CTO's active binding");
       }
       if (!owner.ready) return kept("the run's owner session is not READY");
-      const moved = this.db.get<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM audit_events
-          WHERE run_id = ? AND event_id > ?
-            AND kind IN (${CONTINUITY_HOLD_MOVED_KINDS.map(() => "?").join(", ")})`,
-        [runId, pause.event_id, ...CONTINUITY_HOLD_MOVED_KINDS],
+      const recorded = this.db.get<{ kind: string }>(
+        `SELECT kind FROM audit_events WHERE run_id = ? AND event_id > ? ORDER BY event_id LIMIT 1`,
+        [runId, pause.event_id],
       );
-      const tasksMoved = this.db.get<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM tasks WHERE run_id = ? AND updated_at > ?`,
-        [runId, pause.at],
+      if (recorded) return kept(`${recorded.kind} was recorded for the run after continuity's pause`);
+      const at = pause.at;
+      const touched = this.db.get<{ what: string }>(
+        `SELECT 'a task' AS what FROM tasks WHERE run_id = ? AND updated_at >= ?
+         UNION ALL
+         SELECT 'a task execution' FROM task_executions
+          WHERE run_id = ? AND (status = 'RUNNING' OR started_at >= ? OR ended_at >= ? OR last_activity_at >= ?
+                                OR worker_process_released_at >= ?)
+         UNION ALL
+         SELECT 'an artifact' FROM run_artifacts WHERE run_id = ? AND created_at >= ?
+         UNION ALL
+         SELECT 'a candidate pipeline attempt' FROM candidate_pipeline_attempts
+          WHERE run_id = ? AND (state = 'RUNNING' OR started_at >= ? OR released_at >= ?)
+         LIMIT 1`,
+        [runId, at, runId, at, at, at, at, runId, at, runId, at, at],
       );
-      if ((moved?.n ?? 1) !== 0 || (tasksMoved?.n ?? 1) !== 0) return kept("the run's candidate, decisions or tasks moved under the hold");
+      if (touched) return kept(`${touched.what} of the run was written at or after continuity's pause`);
       const rebound = this.db.all<{ role_key: string | null }>(
         `SELECT role_key FROM audit_events
           WHERE event_id > ? AND role_key IS NOT NULL AND role_key <> ?

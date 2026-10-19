@@ -4,6 +4,7 @@ import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import {
+  ArtifactKind,
   ExecutionMode,
   Role,
   type RoleBinding,
@@ -130,9 +131,14 @@ const stalledRun = async (f: BootstrapRuntimeFixture, project: Project): Promise
   return runId;
 };
 
-/** The CEO's Hermes session restarts: not READY, and the failover continuity tries is refused, as live. */
+/**
+ * The CEO's Hermes session restarts: not READY, and the failover continuity tries is refused, as live.
+ * Time has passed since the run's last write, as it had live (task 01:24Z, pause 04:09:28Z): the release
+ * keeps the hold for anything of the run written in the pause's own millisecond.
+ */
 const loseCeo = async (f: BootstrapRuntimeFixture) => {
   const cp = f.harness.cp;
+  f.harness.clock.advance(1_000);
   const ceo = cp.bindings.active(CEO)!;
   expect(cp.sessions.transition(ceo.sessionId, SessionLifecycle.ERROR, "the CEO's Hermes session restarted").allowed).toBe(true);
   const failover = vi.spyOn(cp.continuity, "failover")
@@ -357,7 +363,7 @@ describe("S-HOLD witness 2 — not released while anything the hold depends on i
       const pass = await reconcile(f, "the CEO is bound again");
       expectReleased(f, controlRun);
       expect(pass.continuityHolds.released).toEqual([controlRun]);
-      expect(pass.continuityHolds.kept).toContainEqual({ runId: subjectRun, why: "the run's candidate, decisions or tasks moved under the hold" });
+      expect(pass.continuityHolds.kept).toContainEqual({ runId: subjectRun, why: "TASK_GRAPH_SUBMITTED was recorded for the run after continuity's pause" });
       expectHeld(f, subjectRun);
     });
   });
@@ -383,7 +389,7 @@ describe("S-HOLD witness 3 — a BLOCKED run that is not continuity's own hold i
       const pass = await reconcile(f, "the CEO is bound again");
       expectReleased(f, controlRun);
       expect(pass.continuityHolds.released).toEqual([controlRun]);
-      expect(pass.continuityHolds.kept).toContainEqual({ runId: foreign, why: "the run's latest transition is not continuity's own pause" });
+      expect(pass.continuityHolds.kept).toContainEqual({ runId: foreign, why: "no continuity pause is recorded since the run last entered ACTIVE" });
       expect(cp.runs.require(decision)).toMatchObject({ state: RunState.BLOCKED, stateReason: "CEO_DECISION_REQUIRED", continuityHoldRoleKey: null });
       expect(cp.runs.require(foreign)).toMatchObject({ state: RunState.BLOCKED, stateReason: "CEO_DECISION_REQUIRED", continuityHoldRoleKey: CEO });
       expect(transitions(f, decision).length).toBe(decisionAt);
@@ -448,6 +454,133 @@ describe("S-HOLD witness 4 — the release re-checks inside its own transaction"
       expect(pass.continuityHolds.released).toEqual([controlRun]);
       expect(pass.continuityHolds.kept).toContainEqual({ runId: subjectRun, why: "the run is not under continuity's hold for this role" });
       expect(cp.runs.require(subjectRun)).toMatchObject({ state: RunState.BLOCKED, stateReason: "CEO_DECISION_REQUIRED", continuityHoldRoleKey: null });
+    });
+  });
+});
+
+/**
+ * #1162 r1 — the reviewer's two blockers, ported (their unmodified probe file is replayed separately), and
+ * a witness for each guard that closes them:
+ *
+ * - R1-01: the hold's episode is the EARLIEST continuity pause after the run last entered ACTIVE, and any
+ *   audit record of the run after it keeps the hold; a copy of the pause appended through the ordinary
+ *   AuditLog API can neither replace it nor hide what moved before it;
+ * - R1-02: a write the audit log does not order (or orders only by an equal timestamp) keeps the hold
+ *   when it lands at or after the pause's millisecond: the task write target `task_worker_run` prepares
+ *   while the run is BLOCKED, a task row, an artifact.
+ */
+describe("#1162 r1 — the hold's baseline is the authentic pause, and every write after it keeps the hold", () => {
+  it("R1-01 port: a copy of the pause appended after the run's tasks moved does not reset the baseline", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "port-forged-baseline");
+      const runId = await stalledRun(f, project);
+      await loseCeo(f);
+      expectHeld(f, runId);
+      const original = cp.audit.forRun(runId).filter((entry) => entry.kind === "RUN_TRANSITION").at(-1)!;
+      f.harness.clock.advance(10);
+      expect(cp.tasks.submit(runId, [{ key: "extra", title: "extra work", category: "docs" }]).allowed).toBe(true);
+      readoptCeo(f);
+      expect(ask(f, runId, cp.bindings.active(CEO)!)).toMatchObject({ released: false });
+      f.harness.clock.advance(10);
+      expect(cp.audit.record({ kind: "RUN_TRANSITION", runId, evidence: original.evidence }).allowed).toBe(true);
+      const pass = await reconcile(f, "probe: restored CEO after counterfeit pause");
+      expectHeld(f, runId);
+      expect(pass.continuityHolds.released).toEqual([]);
+      expect(pass.continuityHolds.kept).toContainEqual({ runId, why: "TASK_GRAPH_SUBMITTED was recorded for the run after continuity's pause" });
+    });
+  });
+
+  it("R1-02 port: the write target task_worker_run prepares while the run is BLOCKED, in the pause's millisecond, keeps the hold", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "port-target-moved");
+      const runId = await stalledRun(f, project);
+      await loseCeo(f);
+      const task = cp.tasks.list(runId)[0]!;
+      expect(task.spec).not.toHaveProperty("writeTarget");
+      const tried = await f.cto(project.sessionId, "task_worker_run", {
+        runId, taskId: task.taskId, claimId: "claim-does-not-matter-while-blocked",
+      });
+      expect(tried["ok"]).toBe(false);
+      expect(tried["reasonCode"]).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);
+      const pause = cp.audit.forRun(runId).filter((entry) => entry.kind === "RUN_TRANSITION").at(-1)!;
+      expect(cp.tasks.require(task.taskId).updatedAt).toBe(pause.at);
+      expect(cp.audit.forRun(runId).some((entry) => entry.kind === "TASK_WRITE_TARGET_RECORDED" && entry.eventId > pause.eventId)).toBe(true);
+      expect(cp.tasks.require(task.taskId).spec).toHaveProperty("writeTarget");
+      readoptCeo(f);
+      const pass = await reconcile(f, "probe: task spec changed at same time");
+      expectHeld(f, runId);
+      expect(pass.continuityHolds.released).toEqual([]);
+    });
+  });
+
+  it("a copy of the pause appended with nothing else moved still keeps the hold; the run beside it is released", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "forged-only");
+      const subjectRun = await stalledRun(f, project);
+      const controlRun = await stalledRun(f, project);
+      await loseCeo(f);
+      const original = cp.audit.forRun(subjectRun).filter((entry) => entry.kind === "RUN_TRANSITION").at(-1)!;
+      f.harness.clock.advance(10);
+      expect(cp.audit.record({ kind: "RUN_TRANSITION", runId: subjectRun, evidence: original.evidence }).allowed).toBe(true);
+      readoptCeo(f);
+      const pass = await reconcile(f, "the CEO is bound again");
+      expectReleased(f, controlRun);
+      expectHeld(f, subjectRun);
+      expect(pass.continuityHolds.released).toEqual([controlRun]);
+      expect(pass.continuityHolds.kept).toContainEqual({ runId: subjectRun, why: "RUN_TRANSITION was recorded for the run after continuity's pause" });
+    });
+  });
+
+  it("writes no audit record orders, in the pause's millisecond — a task row, an artifact — keep the hold; the run beside them is released", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "unaudited-writes");
+      const taskRun = await stalledRun(f, project);
+      const artifactRun = await stalledRun(f, project);
+      const controlRun = await stalledRun(f, project);
+      await loseCeo(f);
+      const pausedAt = f.harness.clock.nowIso();
+      const task = cp.tasks.list(taskRun)[0]!;
+      cp.db.run(`UPDATE tasks SET spec_json = ?, updated_at = ? WHERE task_id = ?`, [
+        JSON.stringify({ note: "changed under the hold" }), pausedAt, task.taskId,
+      ]);
+      cp.artifacts.put(artifactRun, ArtifactKind.PLAN, { summary: "a PLAN stored under the hold" });
+      expect(cp.audit.forRun(taskRun).at(-1)!.kind).toBe("RUN_TRANSITION");
+      expect(cp.audit.forRun(artifactRun).at(-1)!.kind).toBe("RUN_TRANSITION");
+      readoptCeo(f);
+      const pass = await reconcile(f, "the CEO is bound again");
+      expectReleased(f, controlRun);
+      expectHeld(f, taskRun);
+      expectHeld(f, artifactRun);
+      expect(pass.continuityHolds.released).toEqual([controlRun]);
+      expect(pass.continuityHolds.kept).toEqual(expect.arrayContaining([
+        { runId: taskRun, why: "a task of the run was written at or after continuity's pause" },
+        { runId: artifactRun, why: "an artifact of the run was written at or after continuity's pause" },
+      ]));
+    });
+  });
+
+  it("a second episode: released, paused again by a second CEO loss, and released again from its own pause", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const project = await ownedProject(f, scriptOwners(f), "second-episode");
+      const runId = await stalledRun(f, project);
+      const before = pin(f, runId);
+      await loseCeo(f);
+      readoptCeo(f);
+      expect((await reconcile(f, "the CEO is bound again")).continuityHolds.released).toEqual([runId]);
+      expectReleased(f, runId);
+      const lost = await loseCeo(f);
+      expect(lost.pausedRuns).toContainEqual({ runId, roleKey: CEO, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
+      expectHeld(f, runId);
+      readoptCeo(f);
+      const again = await reconcile(f, "the CEO is bound once more");
+      expectReleased(f, runId);
+      expect(again.continuityHolds.released).toEqual([runId]);
+      expect(pin(f, runId)).toEqual(before);
+      expect(transitions(f, runId).filter((entry) => entry["reason"] === RELEASE_REASON)).toHaveLength(2);
     });
   });
 });

@@ -283,6 +283,12 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witn
     file: "run/worker-turn.ts",
     anchor: "        const decision = this.ports.db.txDecision(() => {",
   },
+  {
+    // S-HOLD (#1162): a release whose conditional UPDATE matched no row is refused after its RUN_TRANSITION.
+    label: "RunEngine.releaseContinuityHold",
+    file: "run/run-engine.ts",
+    anchor: "  ): Decision<{ run: RunRow; released: boolean; kept: string | null }> {\n    return this.db.txDecision(() => {",
+  },
 ];
 
 /** Every EXEMPT and DEFERRED entry, so a marker drifting out of its body is caught for all of them, not just one. */
