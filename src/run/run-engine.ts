@@ -37,6 +37,12 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { TaskGraph } from "./task-graph.ts";
+import {
+  TASK_BRANCH_CREATED,
+  TASK_BRANCH_CREATING,
+  TASK_BRANCH_CREATION_UNDONE,
+  unresolvedCreationAttempt,
+} from "./task-write-target.ts";
 import { type HermesAdmittedTurn, hermesTurnEvidence } from "../mcp/hermes-provenance.ts";
 
 /** PRD §13.1 — the authoritative specification Hermes writes. */
@@ -249,6 +255,101 @@ const recordedPauseOwner = (evidence: Record<string, unknown>): Omit<ContinuityO
   if (typeof generation !== "number" || !Number.isInteger(generation)) return null;
   return { sessionId, incarnation, generation };
 };
+
+/**
+ * S-HOLD — the reasons `Daemon.pauseAffectedRuns` pauses an ACTIVE run with that are not themselves a
+ * continuity revocation reason: a refused failover (`failover refused: <reasonCode>`) and a failover
+ * that left no ready planned binding. Every other pause reason is one of continuity's revocation reasons.
+ */
+export const CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX = "failover refused: ";
+export const CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON = "failover did not leave a ready planned binding";
+
+const isContinuityPauseReason = (reason: unknown): reason is string =>
+  typeof reason === "string" &&
+  (isContinuityRevocationReason(reason) ||
+    reason.startsWith(CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX) ||
+    reason === CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON);
+
+/** S-HOLD — a RUN_TRANSITION's evidence is continuity's own pause of an ACTIVE run, for `stateReason`. */
+const isContinuityPause = (evidence: Record<string, unknown> | null, stateReason: string | null): boolean =>
+  evidence !== null &&
+  evidence["from"] === RunState.ACTIVE && evidence["to"] === RunState.BLOCKED &&
+  evidence["continuityAction"] === "PAUSE_NEW_WORK" &&
+  evidence["reason"] === stateReason && isContinuityPauseReason(evidence["reason"]);
+
+/**
+ * S-HOLD (#1162 R2-01) — the audit kinds recorded for a run that say the run itself moved: its state,
+ * owner, tasks, write targets, executions and worker turns, candidates and reviews, decisions, escalations
+ * and their replies, claims, leases, guards, bindings it scopes, wakes and finalization. One of these
+ * after continuity's pause keeps the hold. Classified by what each emission site records, not by name
+ * (#1162 r3): a kind every site of which records only a refusal, a deferral or an ignored input is not
+ * listed (OUTBOX_ACK_REJECTED, GATE_REJECTED, MERGE_REFUSED, REPAIR_REFUSED, REPAIR_DRY_RUN,
+ * CTO_DISPATCH_REFUSED_CANONICAL, CTO_SESSION_PROBE_FAILED, WORKER_PROBE_GROUP_UNCONFIRMED,
+ * CEO_NOTIFICATION_BLOCKED, BLIND_REVIEW_MANUAL_DENIED, BLIND_REVIEW_REJECTED, RUN_DISPATCH_DEFERRED,
+ * TASK_EXECUTION_LATE_RESULT_IGNORED, TASK_WORKER_TURN_LATE_RESULT_REFUSED, WORKER_RETIREMENT_DEFERRED,
+ * BOOTSTRAP_CTO_RECLAIM_DEFERRED, WORKER_SESSION_STOP_FAILED, STANDARD_WORK_CONTINUATION_STALLED) and never
+ * keeps it; a kind whose sites record both outcomes is movement only for the applied one
+ * (`isRecordedMovement`). The S-TB branch records are movement too. A writer that leaves
+ * no record, or a record of a kind added later, is still caught by the row snapshot (`#holdSnapshot`) or,
+ * for a pause that predates it, by the row times. A kind whose effect was unclear is listed: listing keeps
+ * the hold, the safe side.
+ */
+const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
+  "RUN_CREATED", "DISPATCHED", "RUN_TRANSITION", "RUN_PRIORITY_SET", "RUN_OWNER_RENEWED",
+  "RECOVERY_TAKEOVER", "PRIMARY_CTO_ACTIVATED", "PRIMARY_CTO_UNDELIVERABLE_REPLACED",
+  "PRIMARY_CTO_DRIVEN_SESSION_SPAWNED", "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP",
+  "BINDING_CREATED", "BINDING_RENEWED", "BINDING_RUNTIME_MOVED", "BINDING_SWITCHED",
+  "TASK_GRAPH_SUBMITTED", "TASK_GRAPH_CANCELLED", "TASK_WRITE_TARGET_RECORDED", "TASK_BRANCH_PREPARED",
+  TASK_BRANCH_CREATING, TASK_BRANCH_CREATED, TASK_BRANCH_CREATION_UNDONE,
+  "TASK_EXECUTION_STARTED", "TASK_EXECUTION_FINISHED",
+  "TASK_EXECUTIONS_ABANDONED_FOR_TAKEOVER", "TASK_WORKER_TURN_STARTED", "TASK_WORKER_TURN_SUCCEEDED",
+  "TASK_WORKER_TURN_FAILED", "TASK_WORKER_TURN_GIT_STOPPED", "TASK_WORKER_TURNS_DRAINED",
+  "TASK_WORKER_ORPHAN_KILLED", "TASK_WORKER_ORPHAN_GONE", "TASK_WORKER_ORPHAN_UNIDENTIFIED",
+  "TASK_WORKER_ORPHAN_RESOLVED", "WORKER_RETIRED",
+  "CANDIDATE_FROZEN", "CANDIDATE_PROMOTED", "CANDIDATE_INVALIDATED", "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED",
+  "BLIND_REVIEW_COMPLETED", "BLIND_REVIEW_FALLBACK", "BLIND_REVIEW_UNAVAILABLE",
+  "REVISION_RETURNED_TO_CTO", "VERIFICATION_COMPLETED",
+  "CEO_DECISION", "OWNER_DECISION", "OWNER_APPROVAL_INGRESS", "OWNER_APPROVAL_CONSUMED", "CTO_ESCALATION", "CEO_NOTIFICATION",
+  "BUZZ_OWNER_APPROVAL_PROMPTED", "ESCALATION_REPLY_HELD", "ESCALATION_REPLY_CARRIED",
+  "ESCALATION_REPLY_HOLD_REJECTED", "OUTBOX_ACKED_IN_BAND",
+  "CLAIM_ACQUIRED", "CLAIM_RELEASED", "SOURCE_READ_LEASE_ACQUIRED", "SOURCE_READ_LEASE_RELEASED",
+  "MANAGED_WRITE_GUARD", "MANAGED_WRITE_GUARD_CONSUMED", "MANAGED_WRITE_GUARD_REVOKED",
+  "REPOSITORY_TEMPORARY_BINDING", "MANIFEST_ACTIVATION_CONSUMER_BOUND", "PROJECT_MANIFEST_ACTIVATED",
+  "STANDARD_WORK_CONTINUATION_WAKE", "BOOTSTRAP_PLAN_RECOVERY_WAKE", "BOOTSTRAP_RESULT_RECOVERY_WAKE",
+  "BOOTSTRAP_REVIEW_RETRY_WAKE", "BOOTSTRAP_PLAN_TASKS", "BOOTSTRAP_TASKS_SUPERSEDED", "BOOTSTRAP_TASK_SETTLED",
+  "BOOTSTRAP_CTO_SESSION_SPAWNED", "BOOTSTRAP_CTO_PROVISIONED", "BOOTSTRAP_CTO_RECOVERED", "BOOTSTRAP_ACTIVATED", "BOOTSTRAP_ACTIVATION_INCOMPLETE",
+  "BOOTSTRAP_ACTIVATION_READY_FOR_CONFIRM", "BOOTSTRAP_APPLICATION_APPROVAL", "BOOTSTRAP_APPLICATION_ATTEMPT",
+  "BOOTSTRAP_APPLICATION_LEDGER_STAGE", "BOOTSTRAP_APPLICATION_RESERVED", "BOOTSTRAP_APPLICATION_WRITE_RECEIPTED",
+  "HANDOFF_SUBMITTED", "HANDOFF_ACK",
+  "FINALIZATION_ATTEMPT_ACQUIRED", "FINALIZATION_ATTEMPT_FAILED", "FINALIZATION_ATTEMPT_RECLAIMED",
+  "FINALIZATION_BLOCKED_POST_MERGE", "FINALIZATION_COMPLETED", "FINALIZATION_COMPLETION_RECONCILED",
+  "PRODUCTION_GATE_PUBLISHED", "MERGE_EXECUTED", "MERGE_REPLAY", "MERGE_BASE_DRIFT", "POST_MERGE_FAILED",
+  "HOTFIX_PROPAGATION", "REPAIR_EXECUTED",
+  "BASELINE_HARNESS_PINNED", "BASELINE_HARNESS_DISPATCH_CONTEXT", "BASELINE_ROLE_SESSION",
+  "BASELINE_INVOCATION_STARTED", "BASELINE_INVOCATION_FINISHED", "BASELINE_USAGE_RECORDED",
+  "BASELINE_GRAPH_SNAPSHOT", "BASELINE_TASK_CLASSIFICATION", "BASELINE_QUALITY_OBSERVATION", "BASELINE_RUN_OUTCOME",
+];
+
+/**
+ * #1162 r3 — whether a listed record is movement by its recorded outcome. The two listed kinds whose sites
+ * record both outcomes count only the applied one: a MANAGED_WRITE_GUARD evaluation whose evidence says
+ * `allowed: false` granted nothing, and a PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP that could not stop its session
+ * (SESSION_STOP_FAILED) changed nothing. An outcome that cannot be read counts as movement.
+ */
+const isRecordedMovement = (row: { kind: string; reason_code: string | null; evidence_json: string }): boolean => {
+  if (row.kind === "MANAGED_WRITE_GUARD") return auditEvidence(row.evidence_json)?.["allowed"] !== false;
+  if (row.kind === "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP") return row.reason_code !== ReasonCode.SESSION_STOP_FAILED;
+  return true;
+};
+
+/** The pause evidence field that carries `#holdSnapshot` at the pause (S-HOLD, CEO 3b9d8289). */
+const HOLD_SNAPSHOT_FIELD = "holdSnapshotDigest";
+
+/** S-HOLD — a binding change of a role whose loss pauses the run, other than the held role's own. */
+const CONTINUITY_HOLD_BINDING_KINDS = [
+  "BINDING_CREATED", "BINDING_RENEWED", "BINDING_REVOKED", "BINDING_SWITCHED", "BINDING_RUNTIME_MOVED",
+  "CONTINUITY_REVOKE_DEFERRED", "RECOVERY_TAKEOVER",
+] as const;
 
 /** An audit row's evidence as a plain object, or null when it is not one. */
 const auditEvidence = (json: string): Record<string, unknown> | null => {
@@ -915,7 +1016,39 @@ export class RunEngine {
     reason: string,
     evidence: Record<string, unknown> = {},
   ): Decision<RunRow> {
-    return this.#transition(runId, RunState.BLOCKED, reason, evidence, undefined, roleKey);
+    // S-HOLD (CEO 3b9d8289) — the pause records the digest of everything a release requires unmoved, so
+    // the release compares rows, not clocks. Read synchronously right before the transition: no await, and
+    // so no other writer of this process, lies between them.
+    const snapshot = { ...evidence, [HOLD_SNAPSHOT_FIELD]: this.#holdSnapshot(runId) };
+    return this.#transition(runId, RunState.BLOCKED, reason, snapshot, undefined, roleKey);
+  }
+
+  /**
+   * S-HOLD — the digest of what continuity's hold requires unmoved: the run's current candidate, its tasks
+   * (id, state, attempts, spec digest, updated_at), executions, artifacts (by digest) and candidate pipeline
+   * attempts, every row in full and in a fixed order. Equal digests at the pause and at the release mean
+   * none of them was written in between, whatever the clock read.
+   */
+  #holdSnapshot(runId: string): string {
+    const run = this.db.get<{ current_candidate_digest: string | null }>(
+      `SELECT current_candidate_digest FROM runs WHERE run_id = ?`,
+      [runId],
+    );
+    const tasks = this.db.all<{ spec_json: string }>(
+      `SELECT task_id, state, attempt_count, spec_json, updated_at FROM tasks WHERE run_id = ? ORDER BY task_id`,
+      [runId],
+    ).map(({ spec_json: spec, ...task }) => ({ ...task, spec: digestOf(spec) }));
+    return digestOf({
+      candidate: run?.current_candidate_digest ?? null,
+      tasks,
+      executions: this.db.all(`SELECT * FROM task_executions WHERE run_id = ? ORDER BY execution_id`, [runId]),
+      artifacts: this.db.all(
+        `SELECT artifact_id, kind, digest, candidate_snapshot_digest, produced_by, created_at, superseded
+           FROM run_artifacts WHERE run_id = ? ORDER BY artifact_id`,
+        [runId],
+      ),
+      attempts: this.db.all(`SELECT * FROM candidate_pipeline_attempts WHERE run_id = ? ORDER BY attempt_id`, [runId]),
+    });
   }
 
   #transition(
@@ -1674,6 +1807,259 @@ export class RunEngine {
       }, { generation: binding.bindingGeneration });
       return allow(ReasonCode.OK, { run: this.require(runId), released: true });
     });
+  }
+
+  /**
+   * S-HOLD — continuity's own BLOCKED hold on a STANDARD_WORK run, handed back once the role it held the
+   * run for is covered again by `held`. Before this, the only doors out of that hold were a bootstrap
+   * CTO's recovery and the review-wait release, so one CEO session restart left every ACTIVE STANDARD_WORK
+   * run BLOCKED for good (#512, run_ab77268b).
+   *
+   * Read and decided inside this one transaction, and released only when every one of these holds;
+   * otherwise nothing is written and `kept` says why:
+   *
+   * - the run is a STANDARD_WORK run, BLOCKED, with `continuity_hold_role_key` = `held.roleKey`, which
+   *   only `pauseForContinuity` writes and every other edge clears;
+   * - the hold's episode is the EARLIEST continuity pause (ACTIVE → BLOCKED, continuityAction
+   *   PAUSE_NEW_WORK, its reason the run's state reason and one continuity pauses with) recorded after the
+   *   run last entered ACTIVE (its DISPATCHED, or a RUN_TRANSITION into ACTIVE). Event ids only grow, so
+   *   a row appended later, a copy of that pause included, can never take its place: it is a record after
+   *   the pause, and keeps the hold. A run BLOCKED for anything else (a CEO decision, a human gate) has no
+   *   such pause, and is never released here;
+   * - `held` is still its role's ACTIVE binding (assignment and generation) and its runtime is READY on
+   *   its current incarnation; the old session the pause lost is never asked for;
+   * - the run's owner pin is its project's PRIMARY_CTO's ACTIVE binding, exactly (session, incarnation,
+   *   generation), on a READY session. The pin is only read: ownership never moves, least of all to the
+   *   role that was held;
+   * - nothing moved under the hold since the pause: no run-mutating audit record of the run after it by
+   *   event id (`CONTINUITY_HOLD_MUTATING_KINDS`; a refusal or a diagnostic such as OUTBOX_ACK_REJECTED is
+   *   not movement), no binding change after it of any other role whose loss pauses the run, and the
+   *   run's rows unmoved: equal to the digest the pause recorded (`#holdSnapshot`) or, for a legacy pause
+   *   written before the digest existed, none written at or after the pause's time (`#writtenSince`).
+   *
+   * The release is BLOCKED → ACTIVE under the transition authority, one RUN_TRANSITION, the hold cleared,
+   * and the update conditional on the state, hold, reason and pin it read. Nothing is dispatched: the run is
+   * left runnable and the daemon's existing STANDARD_WORK continuation wake (#1158) decides whether its
+   * owner is woken, once per (run, task, task state) by its own marker.
+   */
+  releaseContinuityHold(
+    runId: string,
+    held: RoleBinding,
+  ): Decision<{ run: RunRow; released: boolean; kept: string | null }> {
+    return this.db.txDecision(() => {
+      const run = this.get(runId);
+      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+      const kept = (why: string) => allow(ReasonCode.OK, { run, released: false, kept: why });
+      if (run.kind !== RunKind.STANDARD_WORK) return kept("only a STANDARD_WORK run's continuity hold is released here");
+      if (run.state !== RunState.BLOCKED) return kept(`the run is ${run.state}, not BLOCKED`);
+      if (run.continuityHoldRoleKey === null || run.continuityHoldRoleKey !== held.roleKey) {
+        return kept("the run is not under continuity's hold for this role");
+      }
+      const history = this.db.all<{ event_id: number; kind: string; at: string; evidence_json: string }>(
+        `SELECT event_id, kind, at, evidence_json FROM audit_events
+          WHERE run_id = ? AND kind IN ('DISPATCHED', 'RUN_TRANSITION')
+          ORDER BY event_id`,
+        [runId],
+      );
+      let entered = -1;
+      history.forEach((row, index) => {
+        if (row.kind === "DISPATCHED" || auditEvidence(row.evidence_json)?.["to"] === RunState.ACTIVE) entered = index;
+      });
+      const pause = history.slice(entered + 1).find((row) =>
+        row.kind === "RUN_TRANSITION" && isContinuityPause(auditEvidence(row.evidence_json), run.stateReason));
+      if (!pause) return kept("no continuity pause is recorded since the run last entered ACTIVE");
+      const covering = this.#activeBindingNow(held.roleKey);
+      if (covering?.assignmentId !== held.assignmentId || covering.generation !== held.bindingGeneration) {
+        return kept("the held role's binding is no longer its active one");
+      }
+      if (!covering.ready) return kept("the held role's session is not READY");
+      const ownerRoleKey = run.projectId === null ? null : roleKeyFor(Role.PRIMARY_CTO, { projectId: run.projectId });
+      const owner = ownerRoleKey === null ? null : this.#activeBindingNow(ownerRoleKey);
+      if (
+        ownerRoleKey === null || run.ownerRoleKey !== ownerRoleKey || !owner ||
+        owner.boundSessionId !== run.ownerSessionId ||
+        owner.boundIncarnation !== run.ownerSessionIncarnation ||
+        owner.generation !== run.ownerBindingGeneration
+      ) {
+        return kept("the run's owner pin is not its PRIMARY_CTO's active binding");
+      }
+      if (!owner.ready) return kept("the run's owner session is not READY");
+      const recorded = this.db.all<{ event_id: number; kind: string; reason_code: string | null; evidence_json: string }>(
+        `SELECT event_id, kind, reason_code, evidence_json FROM audit_events
+          WHERE run_id = ? AND event_id > ?
+            AND kind IN (${CONTINUITY_HOLD_MUTATING_KINDS.map(() => "?").join(", ")})
+          ORDER BY event_id`,
+        [runId, pause.event_id, ...CONTINUITY_HOLD_MUTATING_KINDS],
+      ).find(isRecordedMovement);
+      if (recorded) {
+        return kept(`${recorded.kind} (event ${recorded.event_id}) was recorded for the run after continuity's pause (event ${pause.event_id})`);
+      }
+      // #1162 r3 — a task branch whose creation was started and has neither its completion nor a verified
+      // undo is an effect in flight on the checkout, which no row of this database shows: never released
+      // across it, whenever its intent was written.
+      const unresolved = this.#unresolvedBranchCreation(runId);
+      if (unresolved) return kept(`a task branch creation of the run is in flight or unresolved: ${unresolved}`);
+      // A pause written since S-HOLD carries the rows' digest: unmoved means equal, whatever the clock read.
+      const atPause = auditEvidence(pause.evidence_json)?.[HOLD_SNAPSHOT_FIELD];
+      if (typeof atPause === "string") {
+        if (atPause !== this.#holdSnapshot(runId)) {
+          return kept("the run's tasks, executions, artifacts or candidate attempts changed under the hold");
+        }
+      } else {
+        // A legacy pause, written before the digest existed (the live run_ab77268b's, 04:09:28Z): no row of
+        // the run may be written at or after the pause's time, or be RUNNING. A row of the pause's own
+        // millisecond keeps the hold, the safe side.
+        const touched = this.#writtenSince(runId, pause.at);
+        if (touched) return kept(`${touched} of the run was written at or after continuity's pause`);
+      }
+      const rebound = this.db.all<{ event_id: number; kind: string; role_key: string | null }>(
+        `SELECT event_id, kind, role_key FROM audit_events
+          WHERE event_id > ? AND role_key IS NOT NULL AND role_key <> ?
+            AND kind IN (${CONTINUITY_HOLD_BINDING_KINDS.map(() => "?").join(", ")})`,
+        [pause.event_id, held.roleKey, ...CONTINUITY_HOLD_BINDING_KINDS],
+      );
+      const moved = rebound.find((row) => row.role_key !== null && this.#lossPauses(run, row.role_key));
+      if (moved) {
+        return kept(`another role this run depends on changed its binding under the hold: ${moved.kind} (event ${moved.event_id}) of ${moved.role_key}`);
+      }
+      const legal = canTransition(RunState.BLOCKED, RunState.ACTIVE, run.kind);
+      if (!legal.allowed) return legal as Decision<{ run: RunRow; released: boolean; kept: string | null }>;
+      const reason = `continuity hold released: ${held.roleKey} covered again`;
+      const written = this.db.applyRunStateTransition(this.#stateTransitions, {
+        runId,
+        toState: RunState.ACTIVE,
+        recordTransitionEvidence: () => {
+          this.audit.record({
+            kind: "RUN_TRANSITION",
+            runId,
+            projectId: run.projectId,
+            evidence: {
+              from: RunState.BLOCKED,
+              to: RunState.ACTIVE,
+              reason,
+              continuityRelease: held.roleKey,
+              pauseEventId: pause.event_id,
+              toGeneration: held.bindingGeneration,
+              ownerBindingGeneration: run.ownerBindingGeneration,
+            },
+          });
+          return allow(ReasonCode.OK, undefined);
+        },
+        enqueueTransitionEnvelope: () => allow(ReasonCode.OK, undefined),
+        updateState: () =>
+          this.db.run(
+            `UPDATE runs SET state = 'ACTIVE', state_reason = ?, continuity_hold_role_key = NULL
+              WHERE run_id = ? AND state = 'BLOCKED' AND continuity_hold_role_key = ? AND state_reason IS ?
+                AND owner_role_key IS ? AND owner_session_id IS ? AND owner_session_incarnation IS ?
+                AND owner_binding_generation IS ?`,
+            [
+              reason, runId, held.roleKey, run.stateReason,
+              run.ownerRoleKey, run.ownerSessionId, run.ownerSessionIncarnation, run.ownerBindingGeneration,
+            ],
+          ),
+      });
+      if (written.changes !== 1) {
+        return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "the run moved between the hold's check and its release", { runId });
+      }
+      return allow(ReasonCode.OK, { run: this.require(runId), released: true, kept: null });
+    });
+  }
+
+  /**
+   * #1162 r3 — the run's task branch creation that is in flight or unresolved, named (its attempt id and its
+   * intent's event id), or null: a TASK_BRANCH_CREATING whose scope `unresolvedCreationAttempt` finds
+   * unresolved and whose own attempt has neither a TASK_BRANCH_CREATED nor a TASK_BRANCH_CREATION_UNDONE.
+   *
+   * An unresolved attempt is a blocking state: while it stands the hold is never released, however long
+   * that is. There is no operator tool to clear it yet (S-TB's own Limit), and it is never to be cleared by
+   * editing the database by hand: only the writer's own completion or verified undo resolves it.
+   */
+  #unresolvedBranchCreation(runId: string): string | null {
+    const intents = this.db.all<{ event_id: number; evidence_json: string }>(
+      `SELECT event_id, evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
+      [TASK_BRANCH_CREATING, runId],
+    );
+    for (const row of intents) {
+      const intent = auditEvidence(row.evidence_json);
+      const [taskId, repositoryIdentity, branch, baseSha] = ["taskId", "repositoryIdentity", "branch", "baseSha"]
+        .map((field) => intent?.[field]);
+      // An intent whose scope cannot be read cannot be shown resolved: in flight.
+      if (typeof taskId !== "string" || typeof repositoryIdentity !== "string" || typeof branch !== "string" ||
+        typeof baseSha !== "string") {
+        return `intent event ${row.event_id} (its scope cannot be read)`;
+      }
+      if (!unresolvedCreationAttempt(this.db, { runId, taskId, repositoryIdentity, branch, baseSha })) continue;
+      const attemptId = intent?.["attemptId"];
+      if (typeof attemptId !== "string") return `intent event ${row.event_id} (an attempt with no id)`;
+      const resolved = this.db.get<{ n: number }>(
+        `SELECT 1 AS n FROM audit_events
+          WHERE kind IN (?, ?) AND run_id = ? AND json_extract(evidence_json, '$.attemptId') = ? LIMIT 1`,
+        [TASK_BRANCH_CREATED, TASK_BRANCH_CREATION_UNDONE, runId, attemptId],
+      );
+      if (!resolved) return `attempt ${attemptId} (intent event ${row.event_id})`;
+    }
+    return null;
+  }
+
+  /**
+   * S-HOLD — for a legacy pause with no snapshot: which row of the run, if any, was written at or after
+   * `at` (`>=`, so one of the pause's own millisecond counts) or is RUNNING.
+   */
+  #writtenSince(runId: string, at: string): string | null {
+    const touched = this.db.get<{ what: string }>(
+      `SELECT 'a task' AS what FROM tasks WHERE run_id = ? AND updated_at >= ?
+       UNION ALL
+       SELECT 'a task execution' FROM task_executions
+        WHERE run_id = ? AND (status = 'RUNNING' OR started_at >= ? OR ended_at >= ? OR last_activity_at >= ?
+                              OR worker_process_released_at >= ?)
+       UNION ALL
+       SELECT 'an artifact' FROM run_artifacts WHERE run_id = ? AND created_at >= ?
+       UNION ALL
+       SELECT 'a candidate pipeline attempt' FROM candidate_pipeline_attempts
+        WHERE run_id = ? AND (state = 'RUNNING' OR started_at >= ? OR released_at >= ?)
+       LIMIT 1`,
+      [runId, at, runId, at, at, at, at, runId, at, runId, at, at],
+    );
+    return touched?.what ?? null;
+  }
+
+  /**
+   * A role's ACTIVE binding as the database has it now: its assignment, generation and the session it
+   * was bound on, and whether the runtime serving it is READY on its current incarnation.
+   */
+  #activeBindingNow(roleKey: string): {
+    assignmentId: string;
+    generation: number;
+    boundSessionId: string;
+    boundIncarnation: string;
+    ready: boolean;
+  } | null {
+    const row = this.db.get<{
+      assignment_id: string;
+      binding_generation: number;
+      session_id: string;
+      session_incarnation: string;
+      lifecycle: string | null;
+      live_incarnation: string | null;
+      expected_incarnation: string;
+    }>(
+      `SELECT a.assignment_id, a.binding_generation, a.session_id, a.session_incarnation,
+              s.lifecycle, s.incarnation AS live_incarnation,
+              COALESCE(c.current_session_incarnation, a.session_incarnation) AS expected_incarnation
+         FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+         LEFT JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
+        WHERE a.role_key = ? AND a.status = 'ACTIVE'`,
+      [roleKey],
+    );
+    if (!row) return null;
+    return {
+      assignmentId: row.assignment_id,
+      generation: row.binding_generation,
+      boundSessionId: row.session_id,
+      boundIncarnation: row.session_incarnation,
+      ready: row.lifecycle === "READY" && row.live_incarnation === row.expected_incarnation,
+    };
   }
 
   /**

@@ -199,6 +199,10 @@ const EXPECTED_CONVERTED_SITES = [
   // diagnostics.
   { file: "run/worker-turn.ts", symbol: "conclude", label: "WorkerTurnRunner.conclude (success receipt and evidence)", evidence: "direct" },
   { file: "run/worker-turn.ts", symbol: "fail", label: "WorkerTurnRunner.fail (failure receipt and diagnostics)", evidence: "direct" },
+  // S-HOLD (#1162): continuity's BLOCKED hold is released with its RUN_TRANSITION record written first,
+  // then a state UPDATE conditional on the state, hold, reason and owner pin it read; a run that moved in
+  // between updates no row and is refused, and that refusal has to take the transition record back.
+  { file: "run/run-engine.ts", symbol: "releaseContinuityHold", label: "RunEngine.releaseContinuityHold", evidence: "direct" },
 ];
 
 /**
