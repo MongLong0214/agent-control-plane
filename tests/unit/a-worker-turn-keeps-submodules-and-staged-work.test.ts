@@ -6,7 +6,7 @@ import { WorkerTurnRunner, type WorkerTurnOptions } from "../../src/run/worker-t
 import { plumbingWorkerCommit } from "../../src/run/worker-git.ts";
 import type { ProviderAdapter } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeCore, makeRepo, tempDir } from "../helpers/fixtures.ts";
-import { FakeWorkerAdapter, seedWorkerWorld, type FakeTurnScript, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
+import { FakeWorkerAdapter, recordSeededTarget, seedWorkerWorld, type FakeTurnScript, type WorkerWorld } from "../helpers/worker-turn-fixture.ts";
 
 /**
  * #1070 round 2 siblings — what a WORKER turn's three git passes (preparation, observation, the
@@ -67,6 +67,7 @@ const withEmptyGitlink = (world: WorkerWorld): string => {
   const commit = gitSync(dependency, ["rev-parse", "HEAD"]);
   gitSync(world.repoPath, ["update-index", "--add", "--cacheinfo", `160000,${commit},vendor/dependency`]);
   gitSync(world.repoPath, ["commit", "-q", "-m", "add an unpopulated gitlink"]);
+  recordSeededTarget(world); // #512 S-TB: that commit is the task branch's recorded base
   const path = join(world.repoPath, "vendor", "dependency");
   mkdirSync(path, { recursive: true });
   return path;
@@ -115,6 +116,7 @@ describe("#1070 ACP-WORKER-05 a gitlink is admitted only empty, and never left o
     const dependency = makeRepo({ "lib.js": "module.exports = 'dependency';\n" });
     gitSync(world.repoPath, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "vendor/dependency"]);
     commitAll(world.repoPath, "add a submodule");
+    recordSeededTarget(world); // #512 S-TB: that commit is the task branch's recorded base
     expect(gitSync(world.repoPath, ["status", "--porcelain"])).toBe("");
     const outcome = await turn(world, { writes: { "src/app.js": CHANGE } });
     expect(outcome.status).toBe("REFUSED");
@@ -155,6 +157,7 @@ describe("#1070 symlinks, executable bits and type changes are changes like any 
     const world = seedWorkerWorld(makeCore());
     symlinkSync("README.md", join(world.repoPath, "pointer"));
     commitAll(world.repoPath, "add a symlink outside the claim");
+    recordSeededTarget(world); // #512 S-TB: that commit is the task branch's recorded base
     const outcome = await turn(world, {
       writes: { "src/app.js": CHANGE },
       whileLatched: () => {

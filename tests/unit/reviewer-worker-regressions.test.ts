@@ -16,6 +16,7 @@ import {
   admittingCapacity,
   fileCore,
   forgeWorkerProcessRecord,
+  recordSeededTarget,
   seedWorkerWorld,
   type WorkerWorld,
 } from "../helpers/worker-turn-fixture.ts";
@@ -98,6 +99,7 @@ describe("#1070 round 1 reviewer reproductions", () => {
     // Before the turn: the repository includes a tracked, owned file into its configuration.
     writeFileSync(join(world.repoPath, "src", "git.inc"), "[user]\n\tname = worker fixture\n");
     commitAll(world.repoPath, "add an included config");
+    recordSeededTarget(world); // #512 S-TB: that commit is the task branch's recorded base
     gitSync(world.repoPath, ["config", "include.path", "../src/git.inc"]);
     const adapter = fakeFor(world);
     adapter.script = {

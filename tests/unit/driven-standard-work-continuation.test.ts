@@ -836,7 +836,8 @@ describe("R1-01 (b), CEO e64aa10b — re-entry goes by the run's record, and a p
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const real = realWorkerRuntime(f);
-      checkoutOn(f, WORK_BRANCH);
+      // #512 S-TB (c98ea8a3): the control plane makes the declared branch at the run's pinned base; a branch
+      // pre-created by anyone else is refused, so the checkout stays on the run's base branch here.
       const { owner, runId, sessionId, taskId } = await stalledAfterPlan(f, "std-reentry", "follow-prompt");
       // The interrupted turn: the owner provisioned the task's worker through the real tool, then ended.
       const provisioned = await f.cto(sessionId, "task_worker_provision", { runId, taskId, provider: "claude" });
@@ -942,11 +943,12 @@ describe("R1-01 (b), CEO e64aa10b — re-entry goes by the run's record, and a p
 
 describe("R1-01 (c), CEO e64aa10b — the real claim and runner take the write target the PLAN declared", () => {
   it("review probe 4, ported: the real resource_claim and task_worker_run start an execution on the declared target; a branch the checkout is not on is refused, escalated and never replaced", async () => {
-    // Correct target: the PLAN declared the work branch the registered checkout is on.
+    // Correct target: the PLAN declared the work branch, which the control plane makes on the registered checkout.
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const real = realWorkerRuntime(f);
-      checkoutOn(f, WORK_BRANCH);
+      // #512 S-TB (c98ea8a3): the control plane makes the declared branch at the run's pinned base; a branch
+      // pre-created by anyone else is refused, so the checkout stays on the run's base branch here.
       const { owner, runId } = await dispatchedStandard(f, "std-real", { onDispatch: "follow-prompt", onContinuation: "ignore" });
       expect(toolsOf(owner.calls.filter((call) => call.runId === runId))).toEqual([
         ["contract_get", true],
@@ -1098,7 +1100,8 @@ describe("R1-01, CEO 07b5b0df — re-entry takes every task by its execution's s
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const real = realWorkerRuntime(f);
-      checkoutOn(f, WORK_BRANCH);
+      // #512 S-TB (c98ea8a3): the control plane makes the declared branch at the run's pinned base; a branch
+      // pre-created by anyone else is refused, so the checkout stays on the run's base branch here.
       const run = await stalledAfterPlan(f, `std-first-${String(worker)}`, "follow-prompt");
       const { owner, runId, sessionId, taskId } = run;
       if (worker) bindRunWorker(f, runId, taskId);

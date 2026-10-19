@@ -990,10 +990,11 @@ export const reviewRetryTriggerId = (
  * if it has one, is read by its id first, and a RUNNING one is read until it settles; one that
  * SUCCEEDED leaves the task done, and one that did not succeed or cannot be read is escalated, never
  * retried. Only a READY task with no execution gets a first execution: its worker reused if it has
- * one, otherwise staffed; the claim takes the write target the task's spec declared in its PLAN, with
- * the registered checkout as its worktree, because `task_worker_run` starts only on that checkout, on
- * that branch and clean; no branch is chosen here. Once every task SUCCEEDED, the result is submitted,
- * which runs the blind review.
+ * one, otherwise staffed; the claim takes the write target recorded in the task's spec, with the
+ * registered checkout as its worktree: the control plane records it when it provisions the task's
+ * worker (#512 S-TB, CEO 0a16329c) and `task_worker_run` makes or re-enters that branch on that
+ * checkout; no branch is chosen here. Once every task SUCCEEDED, the result is submitted, which runs
+ * the blind review.
  */
 const STANDARD_WORK_STEPS =
   "staffing no more workers at once than its contract allows, one at a time when it states no limit, first read mcp__acp-cto__contract_get for that run: its tasks list each task's taskId, state, spec, worker and executions, and they are the record to go by, whatever this conversation remembers. " +
@@ -1002,8 +1003,8 @@ const STANDARD_WORK_STEPS =
   "an execution that SUCCEEDED leaves its task done; an execution that did not succeed, or one you cannot read, is reported for that run with mcp__acp-cto__escalation_open, its task is never run again, and no result is submitted. " +
   "Only a READY task with no execution gets a first execution: reuse its worker if it has one and never provision another (a worker whose state is not ACTIVE is reported with mcp__acp-cto__escalation_open); " +
   `otherwise staff it with mcp__acp-cto__task_worker_provision, using a new idempotencyKey and provider "${FIXED_ROLE_RUNTIME[Role.WORKER]!.provider}" with no model (the control plane fixes it); ` +
-  "then claim its write target with mcp__acp-cto__resource_claim exactly as its spec's writeTarget names it: repositoryIdentity, branch and paths as declaredPaths, with that repository's checkoutPath from contract_get's repositories as the worktreeId; " +
-  "task_worker_run starts only when that registered checkout is on that branch and clean, so never choose, derive or change a branch yourself, and when the spec names no writeTarget, report it with mcp__acp-cto__escalation_open; " +
+  "then claim its write target with mcp__acp-cto__resource_claim exactly as its spec's writeTarget names it: repositoryIdentity, branch and paths as declaredPaths, with that repository's checkoutPath from contract_get's repositories as the worktreeId (the control plane records a task's writeTarget when it provisions the task's worker and answers task_worker_provision with it, so after provisioning take it from that answer or read contract_get again); " +
+  "task_worker_run then creates that branch at the run's pinned base and checks it out, or continues on it, and refuses a checkout that is not clean, so never choose, derive, create or change a branch yourself; when the spec names no writeTarget, report it with mcp__acp-cto__escalation_open (task_worker_provision answers writeTargetRefused when the control plane cannot record one); " +
   "start that first execution with mcp__acp-cto__task_worker_run, naming the task and the claimId resource_claim returned for that worktree, and read the execution it returns as above. " +
   "A task with no execution that is not READY is left as it is. " +
   "Once every task of the run has SUCCEEDED, submit the run's result with mcp__acp-cto__result_submit and a new idempotencyKey; result_submit runs the blind review itself and answers when it is done. " +
@@ -1012,10 +1013,11 @@ const STANDARD_WORK_STEPS =
 
 /**
  * #512 — what a STANDARD_WORK run's PLAN gives each task, so that its claim later takes a declared
- * write target rather than one chosen at claim time (CEO e64aa10b).
+ * write target rather than one chosen at claim time (CEO e64aa10b). The branch is the control plane's
+ * to derive (S-TB, CEO f5879479) unless the run's contract names one.
  */
 const STANDARD_PLAN_WRITE_TARGET =
-  "When you plan such a run, give each task's spec a writeTarget: repositoryIdentity (one of the repositories contract_get returned), branch (the work branch the run's contract names for that repository; when it names none, report that with mcp__acp-cto__escalation_open rather than choose one) and paths (the repository-relative paths the task changes)";
+  "When you plan such a run, give each task's spec a writeTarget: repositoryIdentity (one of the repositories contract_get returned), paths (the repository-relative paths the task changes) and branch only when the run's contract names a work branch for that repository; otherwise leave branch out rather than choose one: the control plane derives the task's branch and records the whole writeTarget when it provisions the task's worker";
 
 /**
  * The audit kind that records one standard work continuation wake: an ACTIVE STANDARD_WORK run whose

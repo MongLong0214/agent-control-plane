@@ -14,6 +14,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { parseVerificationCommand } from "../contracts/verification-command.ts";
 import type { CtoLifecycle, HandoffAcknowledgement } from "../cto/cto-lifecycle.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
+import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import { ArtifactKind, Role, RunKind, roleKeyFor } from "../domain/types.ts";
@@ -25,6 +26,7 @@ import type { BlindReviewGate } from "../review/blind-review.ts";
 import type { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
+import { TaskWriteTargets } from "../run/task-write-target.ts";
 import { WORKER_TURN_MAX_TIMEOUT_MS, type WorkerTurnRequest, type WorkerTurnRunner } from "../run/worker-turn.ts";
 import type { WorkerProvisionRequest, WorkerStaffing } from "../run/worker-staffing.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -55,6 +57,7 @@ export interface CtoMcpSource extends McpMutationSource {
   readonly db: Db;
   readonly clock: Clock;
   readonly artifacts: ArtifactStore;
+  readonly audit: AuditLog;
   readonly bootstrap: BootstrapActivation;
   readonly capacity: CapacityMonitor;
   readonly ceo: ProductionGate;
@@ -158,6 +161,7 @@ const assertCtoRunPeerFromSource = (
  * a database executor from the daemon (#352).
  */
 export const createCtoMcpPort = (source: CtoMcpSource) => {
+  const writeTargets = new TaskWriteTargets({ db: source.db, clock: source.clock, audit: source.audit });
   const port = Object.freeze({
     mutation: createMcpMutationPort(source),
     assertRunPeer: (peer: AuthenticatedMcpPeer, runId: string) => assertCtoRunPeerFromSource(source, peer, runId),
@@ -263,7 +267,38 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
         [taskId],
       )),
     // #512 — mints a task's first WORKER binding on a session the control plane constitutes.
-    provisionWorker: (request: WorkerProvisionRequest) => source.workers.provision(request),
+    // #512 S-TB (CEO 0a16329c) — a STANDARD_WORK task's write target is recorded when its first worker
+    // is provisioned: the control plane derives what the PLAN left out (never the prompt), writes it
+    // into the task's spec, which contract_get answers, and returns it here. A target it cannot derive
+    // is refused by name in `writeTargetRefused`; the worker stays staffed, and a claim has nothing to
+    // take until the CTO escalates. Any other run kind is answered exactly as before.
+    provisionWorker: async (request: WorkerProvisionRequest) => {
+      const provisioned = await source.workers.provision(request);
+      if (!provisioned.allowed) return provisioned;
+      const fence = () => {
+        const fenced = request.fence();
+        return fenced.allowed && fenced.value.bindingGeneration !== request.ownerBindingGeneration
+          ? deny(ReasonCode.BINDING_GENERATION_STALE, "the run's owner generation changed while its worker was provisioned", { runId: request.runId })
+          : fenced;
+      };
+      let target: Decision<unknown>;
+      try {
+        target = await writeTargets.ensure(request.runId, request.taskId, fence);
+      } catch (error) {
+        target = deny(ReasonCode.INTERNAL_ERROR, "the task's write target could not be recorded", {
+          taskId: request.taskId,
+          error: error instanceof Error ? error.message.slice(0, 300) : String(error),
+        });
+      }
+      if (target.allowed && target.value === null) return provisioned;
+      return allow(provisioned.reasonCode, target.allowed
+        ? { ...provisioned.value, writeTarget: target.value }
+        : {
+            ...provisioned.value,
+            writeTarget: null,
+            writeTargetRefused: { reasonCode: target.reasonCode, message: target.message, evidence: target.evidence },
+          });
+    },
     recordTaskActivity: (executionId: string, runId: string) => source.tasks.recordActivity(executionId, runId),
     finishTaskExecution: (
       executionId: string,

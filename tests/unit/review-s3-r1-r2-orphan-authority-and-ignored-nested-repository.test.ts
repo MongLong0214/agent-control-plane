@@ -4,7 +4,7 @@ import { afterAll, expect, it } from 'vitest';
 import { WorkerTurnRunner } from '../../src/run/worker-turn.ts';
 import { ignoredPathState, ignoredPathsChanged, pinRepository, headOf } from '../../src/run/worker-git.ts';
 import { cleanupTempDirs, gitSync, makeCore, makeRepo, tempDir } from '../helpers/fixtures.ts';
-import { FakeWorkerAdapter, seedWorkerWorld } from '../helpers/worker-turn-fixture.ts';
+import { FakeWorkerAdapter, recordSeededTarget, seedWorkerWorld } from '../helpers/worker-turn-fixture.ts';
 import type { InvocationRequest } from '../../src/runtime/provider.ts';
 import Database from 'better-sqlite3';
 import { fileCore } from '../helpers/worker-turn-fixture.ts';
@@ -57,6 +57,7 @@ it.each(['success','failure'])('R2 an entire worker %s result names an ignored n
  const world=seedWorkerWorld(makeCore());
  writeFileSync(join(world.repoPath,'.gitignore'),'build/\n');
  gitSync(world.repoPath,['add','.gitignore']);gitSync(world.repoPath,['commit','-qm','ignore build']);
+ recordSeededTarget(world); // #512 S-TB: that commit is the task branch's recorded base
  const nested=join(world.repoPath,'build','cache');mkdirSync(nested,{recursive:true});gitSync(nested,['init','-q']);
  writeFileSync(join(nested,'result.txt'),'before');
  const adapter=new FakeWorkerAdapter(world.broker);

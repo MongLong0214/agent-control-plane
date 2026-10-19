@@ -220,13 +220,48 @@ export const seedWorkerWorld = (
   const claimId = acquired.value.find((claim) => claim.worktreeId !== null)!.claimId;
 
   const guard = new ManagedWriteGuard(db, realWorkspaceProbe, audit, clock);
-  return {
+  const world: WorkerWorld = {
     db, clock, audit, sessions, bindings, tasks, claims, guard,
     broker: new GuardedInvocationWriteBroker(guard),
     runId, projectId, repositoryId, identity, repoPath, mainRepoPath, branch,
     cto: { sessionId: ctoSessionId, incarnation: ctoIncarnation, roleKey, generation },
     taskId, worker, claimId, ownedPaths,
   };
+  recordSeededTarget(world);
+  return world;
+};
+
+/**
+ * #512 S-TB (c98ea8a3) — a STANDARD_WORK task runs only on the write target the control plane
+ * recorded for it, on a branch it recorded creating. These are the records provisioning and the
+ * task's first turn leave, written here for the seeded task as they would have been: the target
+ * (the claim's repository, branch and paths, parent dev, based at the branch's tip now) into the
+ * task's spec and the audit log, and the branch's creation for this run, task and base. A witness
+ * that commits onto the branch before its turn records again, so that commit is the base it was cut
+ * from rather than a commit nobody made for the task. Literal kinds, so this fixture still imports
+ * nothing from the runner.
+ */
+export const recordSeededTarget = (world: Pick<WorkerWorld, "db" | "clock" | "audit" | "runId" | "taskId" | "identity" | "repoPath" | "branch">): void => {
+  const baseSha = gitSync(world.repoPath, ["rev-parse", "HEAD"]);
+  const paths = world.db
+    .all<{ declared_path: string }>(
+      `SELECT DISTINCT declared_path FROM resource_claims WHERE run_id = ? AND declared_path IS NOT NULL ORDER BY declared_path`,
+      [world.runId],
+    )
+    .map((row) => row.declared_path);
+  const writeTarget = { repositoryIdentity: world.identity, branch: world.branch, paths, declaredParent: "dev", baseSha };
+  const task = world.db.get<{ spec_json: string }>(`SELECT spec_json FROM tasks WHERE task_id = ?`, [world.taskId])!;
+  world.db.run(`UPDATE tasks SET spec_json = ?, updated_at = ? WHERE task_id = ?`, [
+    JSON.stringify({ ...(JSON.parse(task.spec_json) as Record<string, unknown>), writeTarget }),
+    world.clock.nowIso(),
+    world.taskId,
+  ]);
+  world.audit.record({ kind: "TASK_WRITE_TARGET_RECORDED", runId: world.runId, evidence: { taskId: world.taskId, writeTarget } });
+  world.audit.record({
+    kind: "TASK_BRANCH_CREATED",
+    runId: world.runId,
+    evidence: { taskId: world.taskId, repositoryIdentity: world.identity, branch: world.branch, baseSha, worktreeId: world.repoPath },
+  });
 };
 
 /** A fresh READY Claude/Opus session bound as the task's WORKER, the way PR-A provisions one. */
