@@ -258,7 +258,7 @@ export const recordSeededTarget = (world: Pick<WorkerWorld, "db" | "clock" | "au
   ]);
   world.audit.record({ kind: "TASK_WRITE_TARGET_RECORDED", runId: world.runId, evidence: { taskId: world.taskId, writeTarget } });
   world.audit.record({
-    kind: "TASK_BRANCH_CREATING",
+    kind: "TASK_BRANCH_CREATED",
     runId: world.runId,
     evidence: { taskId: world.taskId, repositoryIdentity: world.identity, branch: world.branch, baseSha, worktreeId: world.repoPath },
   });

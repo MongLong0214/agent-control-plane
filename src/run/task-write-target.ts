@@ -147,15 +147,23 @@ const isNormalRelativePath = (path: string): boolean =>
 const isSingleFileScope = (entry: string): boolean => isNormalRelativePath(entry) && /^[A-Za-z0-9._/-]+$/.test(entry);
 
 /**
- * #512 S-TB (c98ea8a3) — the audit kind the control plane writes immediately before it creates a
- * task's work branch, inside the guard's grant: the run (the event's `run_id`), the task, the
- * repository, the branch and the base commit it is created at. It is the one record that makes an
- * existing branch of that name the control plane's own: re-entry and the hand-off from a finished
- * task's branch both require it, and a branch with no such record is never used.
+ * #512 S-TB (c98ea8a3) — the audit kind the control plane writes immediately before it attempts to
+ * create a task's work branch, inside the guard's grant: the run (the event's `run_id`), the task,
+ * the repository, the branch and the base commit. An intent only: it proves nothing about the ref,
+ * and nothing reads it as ownership (review r2, S-TB-03). A ref left by an attempt that never wrote
+ * its completion is never adopted; it is refused, named by this record.
  */
 export const TASK_BRANCH_CREATING = "TASK_BRANCH_CREATING";
 
-/** Every creation record for a repository's branch, oldest first. */
+/**
+ * #512 S-TB (review r2, S-TB-03) — the completion of a task branch's creation, written only after the
+ * create-only ref update succeeded, the ref was read back at the pinned base, the checkout was moved
+ * onto it and found clean there. It is the one record that makes an existing branch of that name the
+ * control plane's own: re-entry and the hand-off from a finished task's branch read it and nothing else.
+ */
+export const TASK_BRANCH_CREATED = "TASK_BRANCH_CREATED";
+
+/** Every completed creation of a repository's branch, oldest first (`TASK_BRANCH_CREATED` only). */
 export const branchCreations = (
   db: Db,
   repositoryIdentity: string,
@@ -167,13 +175,27 @@ export const branchCreations = (
         WHERE kind = ? AND json_extract(evidence_json, '$.repositoryIdentity') = ?
           AND json_extract(evidence_json, '$.branch') = ?
         ORDER BY event_id`,
-      [TASK_BRANCH_CREATING, repositoryIdentity, branch],
+      [TASK_BRANCH_CREATED, repositoryIdentity, branch],
     )
     .map((row) => {
       const evidence = JSON.parse(row.evidence_json) as { taskId?: unknown; baseSha?: unknown };
       return { runId: row.run_id ?? "", taskId: String(evidence.taskId ?? ""), baseSha: String(evidence.baseSha ?? "") };
     })
     .filter((creation) => creation.runId.length > 0 && creation.taskId.length > 0 && creation.baseSha.length > 0);
+
+/** Whether an attempt to create this run and task's branch at this base was started (an intent, never ownership). */
+export const branchCreationAttempted = (
+  db: Db,
+  scope: { runId: string; taskId: string; repositoryIdentity: string; branch: string; baseSha: string },
+): boolean =>
+  Boolean(db.get<{ n: number }>(
+    `SELECT 1 AS n FROM audit_events
+      WHERE kind = ? AND run_id = ? AND json_extract(evidence_json, '$.taskId') = ?
+        AND json_extract(evidence_json, '$.repositoryIdentity') = ? AND json_extract(evidence_json, '$.branch') = ?
+        AND json_extract(evidence_json, '$.baseSha') = ?
+      LIMIT 1`,
+    [TASK_BRANCH_CREATING, scope.runId, scope.taskId, scope.repositoryIdentity, scope.branch, scope.baseSha],
+  ));
 
 /** The recorded write target of a run whose branch, in that repository, is `branch`; the newest. */
 export const recordedTargetForBranch = (

@@ -1,16 +1,16 @@
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import type { BranchProfile } from "../../src/contracts/manifest.ts";
-import { allow } from "../../src/core/errors.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunKind, SessionLifecycle } from "../../src/domain/types.ts";
 import { classifyBranch, validateBranchContract } from "../../src/github/branch-contract.ts";
 import { GuardedInvocationWriteBroker } from "../../src/runtime/provider.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
-import { cleanupTempDirs, commitAll, gitSync, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { fixtureManifest, registerFixtureProject } from "../helpers/harness.ts";
 import { FakeWorkerAdapter, type FakeTurnScript } from "../helpers/worker-turn-fixture.ts";
 
@@ -44,6 +44,7 @@ afterEach(() => vi.restoreAllMocks());
 const RECORDED = "TASK_WRITE_TARGET_RECORDED";
 const PREPARED = "TASK_BRANCH_PREPARED";
 const CREATING = "TASK_BRANCH_CREATING";
+const CREATED = "TASK_BRANCH_CREATED";
 const POLICY = "WORK_BRANCH_POLICY";
 const IDENTITY = "github:acme/fixture";
 
@@ -421,7 +422,10 @@ describe("re-entry: the same run and task, or nothing", () => {
       const first = await runTask(f, s, taskId, claimId);
       expect(first).toMatchObject({ ok: true });
       await settle(f, first);
-      expect(events(f, CREATING, s.runId)).toEqual([{ taskId, repositoryIdentity: IDENTITY, branch: target.branch, baseSha: target.baseSha, worktreeId: expect.any(String) }]);
+      // The intent before the create-only update, and its completion once the checkout stood clean on it.
+      const creation = { taskId, repositoryIdentity: IDENTITY, branch: target.branch, baseSha: target.baseSha, worktreeId: expect.any(String) };
+      expect(events(f, CREATING, s.runId)).toEqual([creation]);
+      expect(events(f, CREATED, s.runId)).toEqual([creation]);
       // A commit on it that this task's turn made, as its record names it; the checkout went back to dev.
       writeFiles(s.repo, { "README.md": "# by this task\n" });
       const ours = commitAll(s.repo, "this task's turn");
@@ -441,6 +445,7 @@ describe("re-entry: the same run and task, or nothing", () => {
       await settle(f, again);
       expect(events(f, PREPARED, s.runId)).toHaveLength(2);
       expect(events(f, CREATING, s.runId)).toHaveLength(1);
+      expect(events(f, CREATED, s.runId)).toHaveLength(1);
       expect(cp.tasks.executions(s.runId)).toHaveLength(3);
     });
   });
@@ -482,6 +487,55 @@ describe("re-entry: the same run and task, or nothing", () => {
         expect(events(f, PREPARED, s.runId)).toHaveLength(prepared);
       });
     }
+  });
+});
+
+describe("a creation intent is never ownership (review r2, S-TB-03)", () => {
+  it("an interrupted creation (its intent recorded, its ref there, no completion) is refused on re-entry by name and never adopted, from the base branch or checked out", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "stb-interrupted", {
+        tasks: [{ key: "readme", title: "update README.md", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } }],
+      });
+      const taskId = s.taskIds[0]!;
+      const { target, claimId } = await staffAndClaim(f, s, taskId);
+      // What a crash between the create-only ref update and its completion leaves: the intent and the ref.
+      cp.audit.record({ kind: CREATING, runId: s.runId, evidence: { taskId, repositoryIdentity: IDENTITY, branch: target.branch, baseSha: target.baseSha, worktreeId: s.checkoutPath } });
+      gitSync(s.repo, ["branch", target.branch, target.baseSha]);
+      for (const on of ["dev", target.branch]) {
+        gitSync(s.repo, ["checkout", "-q", on]);
+        const refsBefore = refsOf(s.repo);
+        const refused = await runTask(f, s, taskId, claimId);
+        expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { creationAttempted: true } });
+        expect(String(refused["message"])).toContain("never completed; it is not adopted");
+        expect(refsOf(s.repo)).toBe(refsBefore);
+        expect(branchOf(s.repo)).toBe(on);
+      }
+      expect(events(f, CREATED, s.runId)).toEqual([]);
+      expect(cp.tasks.executions(s.runId)).toEqual([]);
+    });
+  });
+
+  it("the hand-off reader trusts completions only: a branch with an intent and no completion is not left for the next task", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "stb-intent-handoff", {
+        tasks: [
+          { key: "one", title: "update readme", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } },
+          { key: "two", title: "update app", category: "implementation", spec: { writeTarget: { paths: ["src/app.js"] } } },
+        ],
+      });
+      const [one, two] = s.taskIds as [string, string];
+      const first = targetOf(await provision(f, s, one));
+      cp.audit.record({ kind: CREATING, runId: s.runId, evidence: { taskId: one, repositoryIdentity: IDENTITY, branch: first.branch, baseSha: first.baseSha, worktreeId: s.checkoutPath } });
+      gitSync(s.repo, ["checkout", "-q", "-b", first.branch]);
+      const second = await staffAndClaim(f, s, two);
+      const refsBefore = refsOf(s.repo);
+      expect(await runTask(f, s, two, second.claimId)).toMatchObject({ ok: false, reasonCode: ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH });
+      expect(refsOf(s.repo)).toBe(refsBefore);
+      expect(branchOf(s.repo)).toBe(first.branch);
+      expect(refOf(s.repo, `refs/heads/${second.target.branch}`)).toBeNull();
+    });
   });
 });
 
@@ -687,6 +741,107 @@ describe("single-file evidence (c98ea8a3, S-TB-08)", () => {
   });
 });
 
+/** The git the tests' PATH resolves, found without running anything. */
+const realGit = (): string => {
+  for (const dir of (process.env["PATH"] ?? "").split(delimiter)) {
+    if (dir && existsSync(join(dir, "git"))) return join(dir, "git");
+  }
+  throw new Error("no git on PATH");
+};
+
+/**
+ * A git first on PATH that, the first time its arguments contain `match`, runs `before` (a shell line)
+ * and then either runs the real git or exits 1 without it; every other call is the real git's.
+ */
+const gitOnce = (match: string, before: string, then: "run" | "fail"): { restore: () => void; fired: () => boolean } => {
+  const bin = tempDir("acp-stb-git-");
+  const fired = join(bin, "fired");
+  const real = realGit();
+  writeFileSync(join(bin, "git"), [
+    "#!/bin/sh",
+    `case "$*" in *"${match}"*)`,
+    `  if [ ! -e '${fired}' ]; then : > '${fired}'; ${before}; ${then === "fail" ? "exit 1" : ":"}; fi;;`,
+    "esac",
+    `exec '${real}' "$@"`,
+    "",
+  ].join("\n"));
+  chmodSync(join(bin, "git"), 0o755);
+  const path = process.env["PATH"];
+  process.env["PATH"] = `${bin}${delimiter}${path ?? ""}`;
+  return { restore: () => { process.env["PATH"] = path; }, fired: () => existsSync(fired) };
+};
+
+describe("every later failure of branch preparation leaves refs, HEAD and user bytes as they were (review r2, S-TB-07)", () => {
+  type Case = {
+    name: string;
+    moved: boolean;
+    match?: string;
+    before?: (repo: string) => string;
+    then?: "run" | "fail";
+    record?: boolean;
+    userFile: string;
+    userBytes?: string;
+    /** The refusal's own words, so each case is known to fail where it says, and whether a ref it made was removed. */
+    says: string;
+    created: boolean;
+  };
+  const edit = (repo: string): string => `printf '# a user edit, landed late\\n' > '${join(repo, "README.md")}'`;
+  const notes = (repo: string): string => `printf 'user notes\\n' > '${join(repo, "notes.txt")}'`;
+  const cases: Case[] = [
+    { name: "the stat-cache refresh finds a file changed", moved: true, match: "update-index --refresh", before: edit, then: "run", userFile: "README.md", userBytes: "# a user edit, landed late\n", says: "the checkout's files changed before its task branch was made", created: false },
+    { name: "read-tree refuses a file changed after the refresh", moved: true, match: "read-tree -m -u", before: edit, then: "run", userFile: "README.md", userBytes: "# a user edit, landed late\n", says: "could not be moved to the task's branch", created: true },
+    { name: "HEAD cannot be put on the branch, after the files moved", moved: true, match: "task branch HEAD", before: () => ":", then: "fail", userFile: "README.md", says: "could not be put on the task's branch", created: true },
+    { name: "HEAD cannot be put on the branch, with no file to move", moved: false, match: "task branch HEAD", before: () => ":", then: "fail", userFile: "README.md", says: "could not be put on the task's branch", created: true },
+    { name: "a user file appears while the checkout is moved", moved: true, match: "task branch HEAD", before: notes, then: "run", userFile: "notes.txt", userBytes: "user notes\n", says: "changed while it was moved to the task's branch", created: true },
+    { name: "a user file appears with no file to move", moved: false, match: "task branch HEAD", before: notes, then: "run", userFile: "notes.txt", userBytes: "user notes\n", says: "changed while it was moved to the task's branch", created: true },
+    { name: "the completion cannot be recorded", moved: true, record: true, userFile: "README.md", says: "could not be recorded complete", created: true },
+  ];
+  it.each(cases)("$name", async (c) => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, `stb-late-${cases.indexOf(c)}`, {
+        tasks: [{ key: "readme", title: "update README.md", category: "docs", spec: { writeTarget: { paths: ["README.md"] } } }],
+      });
+      const taskId = s.taskIds[0]!;
+      const { target, claimId } = await staffAndClaim(f, s, taskId);
+      // Files must move when the base has advanced past the pin; none when it has not.
+      if (c.moved) {
+        writeFiles(s.repo, { "README.md": "# the base moved on\n" });
+        commitAll(s.repo, "the base moves on");
+      }
+      const head = refOf(s.repo, "HEAD");
+      const refsBefore = refsOf(s.repo);
+      const readmeBefore = readFileSync(join(s.repo, "README.md"), "utf8");
+      const wrapper = c.match ? gitOnce(c.match, c.before!(s.repo), c.then!) : null;
+      if (c.record) {
+        const record = cp.audit.record.bind(cp.audit);
+        vi.spyOn(cp.audit, "record").mockImplementation((entry) =>
+          entry.kind === CREATED ? deny(ReasonCode.AUDIT_WRITE_FAILED, "injected: the completion is not recorded", {}) : record(entry));
+      }
+      let refused: Record<string, unknown>;
+      try {
+        refused = await runTask(f, s, taskId, claimId);
+      } finally {
+        wrapper?.restore();
+      }
+      if (wrapper) expect(wrapper.fired()).toBe(true);
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
+      expect(String(refused["message"])).toContain(c.says);
+      if (c.created) expect(refused["evidence"]).toMatchObject({ created: true, refRemoved: true, leftOnBranch: false, headMoved: false, filesMoved: false });
+      // Refs, HEAD and the user's bytes exactly as they were; the task's branch never left behind.
+      expect(refsOf(s.repo)).toBe(refsBefore);
+      expect(refOf(s.repo, `refs/heads/${target.branch}`)).toBeNull();
+      expect(branchOf(s.repo)).toBe("dev");
+      expect(refOf(s.repo, "HEAD")).toBe(head);
+      if (c.userBytes) expect(readFileSync(join(s.repo, c.userFile), "utf8")).toBe(c.userBytes);
+      else expect(readFileSync(join(s.repo, "README.md"), "utf8")).toBe(readmeBefore);
+      expect(events(f, CREATED, s.runId)).toEqual([]);
+      expect(events(f, PREPARED, s.runId)).toEqual([]);
+      expect(cp.tasks.executions(s.runId)).toEqual([]);
+    });
+  });
+});
+
 describe("a checkout that is not clean or not the writer's", () => {
   it("a dirty checkout is refused and the user's change is left intact; nothing is created", async () => {
     await withBootstrapRuntime(async (f) => {
@@ -738,6 +893,7 @@ describe("a checkout that is not clean or not the writer's", () => {
         expect(branchOf(s.repo)).toBe("dev");
         if (change === "edit") expect(readFileSync(join(s.repo, "README.md"), "utf8")).toBe("# a user's edit, just in time\n");
         expect(events(f, CREATING, s.runId)).toEqual([]);
+        expect(events(f, CREATED, s.runId)).toEqual([]);
         expect(cp.tasks.executions(s.runId)).toEqual([]);
       });
     }
