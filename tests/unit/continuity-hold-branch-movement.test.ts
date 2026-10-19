@@ -141,7 +141,10 @@ describe("#1162 r3 — a task branch made or being made under the hold keeps it"
           queueMicrotask(() => { release = attempt(); });
         },
       });
-      expect(release).toMatchObject({ allowed: true, value: { released: false, kept: `${CREATED} was recorded for the run after continuity's pause` } });
+      expect(release).toMatchObject({
+        allowed: true,
+        value: { released: false, kept: expect.stringMatching(new RegExp(`^${CREATED} \\(event \\d+\\) was recorded for the run after continuity's pause \\(event \\d+\\)$`)) },
+      });
       expect(cp.runs.require(s.runId).state).toBe("BLOCKED");
     });
   });
@@ -161,8 +164,41 @@ describe("#1162 r3 — a task branch made or being made under the hold keeps it"
       });
       // The release ran inside the creation: after its intent and the pause, before its completion.
       expect(completedBeforeRelease).toBe(false);
-      expect(release).toMatchObject({ allowed: true, value: { released: false, kept: "a task branch creation of the run is in flight or unresolved" } });
+      // Named by the unresolved attempt: its id, and its intent's event id.
+      const intent = cp.audit.forRun(s.runId).find((entry) => entry.kind === CREATING)!;
+      expect(release).toMatchObject({
+        allowed: true,
+        value: {
+          released: false,
+          kept: `a task branch creation of the run is in flight or unresolved: attempt ${String(intent.evidence["attemptId"])} (intent event ${intent.eventId})`,
+        },
+      });
       expect(cp.runs.require(s.runId).state).toBe("BLOCKED");
+    });
+  });
+
+  it("(b) a release committed first: the branch intent that follows proceeds on the ACTIVE run as normal, and nothing holds it", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const s = await standardRun(f, "hold-branch-after-release");
+      const { target, claimId } = await staffAndClaim(f, s);
+      expect(cp.runs.pauseForContinuity(s.runId, CEO, "failover refused: SESSION_NOT_READY", { continuityAction: "PAUSE_NEW_WORK" }).allowed).toBe(true);
+      // Execution admission refuses the held run: no intent is written while it is BLOCKED.
+      const refused = await f.cto(s.sessionId, "task_worker_run", { runId: s.runId, taskId: s.taskId, claimId });
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.WRITE_RUN_NOT_ACTIVE });
+      expect(cp.audit.forRun(s.runId).some((entry) => entry.kind === CREATING)).toBe(false);
+      // The release commits first, in its own transaction; then the turn writes its intent and completes.
+      expect(cp.runs.releaseContinuityHold(s.runId, cp.bindings.active(CEO)!)).toMatchObject({ allowed: true, value: { released: true } });
+      const released = cp.audit.forRun(s.runId).filter((entry) => entry.kind === "RUN_TRANSITION").at(-1)!;
+      const answer = await f.cto(s.sessionId, "task_worker_run", { runId: s.runId, taskId: s.taskId, claimId });
+      expect(answer).toMatchObject({ ok: true });
+      await cp.workerTurns.settled((answer["value"] as { executionId: string }).executionId);
+      const branchRecords = cp.audit.forRun(s.runId).filter((entry) => entry.kind === CREATING || entry.kind === CREATED);
+      expect(branchRecords.map((entry) => entry.kind)).toEqual([CREATING, CREATED]);
+      expect(branchRecords.every((entry) => entry.eventId > released.eventId)).toBe(true);
+      expect(refOf(s.repo, `refs/heads/${target.branch}`)).toBe(target.baseSha);
+      expect(cp.runs.require(s.runId)).toMatchObject({ continuityHoldRoleKey: null });
+      expect(cp.runs.require(s.runId).state).not.toBe("BLOCKED");
     });
   });
 });

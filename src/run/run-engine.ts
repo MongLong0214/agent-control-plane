@@ -1884,18 +1884,21 @@ export class RunEngine {
         return kept("the run's owner pin is not its PRIMARY_CTO's active binding");
       }
       if (!owner.ready) return kept("the run's owner session is not READY");
-      const recorded = this.db.all<{ kind: string; reason_code: string | null; evidence_json: string }>(
-        `SELECT kind, reason_code, evidence_json FROM audit_events
+      const recorded = this.db.all<{ event_id: number; kind: string; reason_code: string | null; evidence_json: string }>(
+        `SELECT event_id, kind, reason_code, evidence_json FROM audit_events
           WHERE run_id = ? AND event_id > ?
             AND kind IN (${CONTINUITY_HOLD_MUTATING_KINDS.map(() => "?").join(", ")})
           ORDER BY event_id`,
         [runId, pause.event_id, ...CONTINUITY_HOLD_MUTATING_KINDS],
       ).find(isRecordedMovement);
-      if (recorded) return kept(`${recorded.kind} was recorded for the run after continuity's pause`);
+      if (recorded) {
+        return kept(`${recorded.kind} (event ${recorded.event_id}) was recorded for the run after continuity's pause (event ${pause.event_id})`);
+      }
       // #1162 r3 — a task branch whose creation was started and has neither its completion nor a verified
       // undo is an effect in flight on the checkout, which no row of this database shows: never released
       // across it, whenever its intent was written.
-      if (this.#branchCreationInFlight(runId)) return kept("a task branch creation of the run is in flight or unresolved");
+      const unresolved = this.#unresolvedBranchCreation(runId);
+      if (unresolved) return kept(`a task branch creation of the run is in flight or unresolved: ${unresolved}`);
       // A pause written since S-HOLD carries the rows' digest: unmoved means equal, whatever the clock read.
       const atPause = auditEvidence(pause.evidence_json)?.[HOLD_SNAPSHOT_FIELD];
       if (typeof atPause === "string") {
@@ -1909,14 +1912,15 @@ export class RunEngine {
         const touched = this.#writtenSince(runId, pause.at);
         if (touched) return kept(`${touched} of the run was written at or after continuity's pause`);
       }
-      const rebound = this.db.all<{ role_key: string | null }>(
-        `SELECT role_key FROM audit_events
+      const rebound = this.db.all<{ event_id: number; kind: string; role_key: string | null }>(
+        `SELECT event_id, kind, role_key FROM audit_events
           WHERE event_id > ? AND role_key IS NOT NULL AND role_key <> ?
             AND kind IN (${CONTINUITY_HOLD_BINDING_KINDS.map(() => "?").join(", ")})`,
         [pause.event_id, held.roleKey, ...CONTINUITY_HOLD_BINDING_KINDS],
       );
-      if (rebound.some((row) => row.role_key !== null && this.#lossPauses(run, row.role_key))) {
-        return kept("another role this run depends on changed its binding under the hold");
+      const moved = rebound.find((row) => row.role_key !== null && this.#lossPauses(run, row.role_key));
+      if (moved) {
+        return kept(`another role this run depends on changed its binding under the hold: ${moved.kind} (event ${moved.event_id}) of ${moved.role_key}`);
       }
       const legal = canTransition(RunState.BLOCKED, RunState.ACTIVE, run.kind);
       if (!legal.allowed) return legal as Decision<{ run: RunRow; released: boolean; kept: string | null }>;
@@ -1961,23 +1965,40 @@ export class RunEngine {
     });
   }
 
-  /** #1162 r3 — whether any TASK_BRANCH_CREATING of the run is unresolved (`unresolvedCreationAttempt`). */
-  #branchCreationInFlight(runId: string): boolean {
-    const intents = this.db.all<{ evidence_json: string }>(
-      `SELECT evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
+  /**
+   * #1162 r3 — the run's task branch creation that is in flight or unresolved, named (its attempt id and its
+   * intent's event id), or null: a TASK_BRANCH_CREATING whose scope `unresolvedCreationAttempt` finds
+   * unresolved and whose own attempt has neither a TASK_BRANCH_CREATED nor a TASK_BRANCH_CREATION_UNDONE.
+   *
+   * An unresolved attempt is a blocking state: while it stands the hold is never released, however long
+   * that is. There is no operator tool to clear it yet (S-TB's own Limit), and it is never to be cleared by
+   * editing the database by hand: only the writer's own completion or verified undo resolves it.
+   */
+  #unresolvedBranchCreation(runId: string): string | null {
+    const intents = this.db.all<{ event_id: number; evidence_json: string }>(
+      `SELECT event_id, evidence_json FROM audit_events WHERE kind = ? AND run_id = ? ORDER BY event_id`,
       [TASK_BRANCH_CREATING, runId],
     );
-    return intents.some((row) => {
+    for (const row of intents) {
       const intent = auditEvidence(row.evidence_json);
       const [taskId, repositoryIdentity, branch, baseSha] = ["taskId", "repositoryIdentity", "branch", "baseSha"]
         .map((field) => intent?.[field]);
       // An intent whose scope cannot be read cannot be shown resolved: in flight.
       if (typeof taskId !== "string" || typeof repositoryIdentity !== "string" || typeof branch !== "string" ||
         typeof baseSha !== "string") {
-        return true;
+        return `intent event ${row.event_id} (its scope cannot be read)`;
       }
-      return unresolvedCreationAttempt(this.db, { runId, taskId, repositoryIdentity, branch, baseSha });
-    });
+      if (!unresolvedCreationAttempt(this.db, { runId, taskId, repositoryIdentity, branch, baseSha })) continue;
+      const attemptId = intent?.["attemptId"];
+      if (typeof attemptId !== "string") return `intent event ${row.event_id} (an attempt with no id)`;
+      const resolved = this.db.get<{ n: number }>(
+        `SELECT 1 AS n FROM audit_events
+          WHERE kind IN (?, ?) AND run_id = ? AND json_extract(evidence_json, '$.attemptId') = ? LIMIT 1`,
+        [TASK_BRANCH_CREATED, TASK_BRANCH_CREATION_UNDONE, runId, attemptId],
+      );
+      if (!resolved) return `attempt ${attemptId} (intent event ${row.event_id})`;
+    }
+    return null;
   }
 
   /**

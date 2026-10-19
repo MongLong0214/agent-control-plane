@@ -43,6 +43,9 @@ afterEach(() => vi.restoreAllMocks());
 
 const CEO = roleKeyFor(Role.CEO);
 const CHANGED = "the run's tasks, executions, artifacts or candidate attempts changed under the hold";
+/** The kept reason for a run-mutating record after the pause: its kind and event id, and the pause's. */
+const recordedAfterPause = (kind: string) =>
+  expect.stringMatching(new RegExp(`^${kind} \\(event \\d+\\) was recorded for the run after continuity's pause \\(event \\d+\\)$`));
 const RELEASE_REASON = `continuity hold released: ${CEO} covered again`;
 
 const contract = {
@@ -367,7 +370,7 @@ describe("S-HOLD witness 2 — not released while anything the hold depends on i
       const pass = await reconcile(f, "the CEO is bound again");
       expectReleased(f, controlRun);
       expect(pass.continuityHolds.released).toEqual([controlRun]);
-      expect(pass.continuityHolds.kept).toContainEqual({ runId: subjectRun, why: "TASK_GRAPH_SUBMITTED was recorded for the run after continuity's pause" });
+      expect(pass.continuityHolds.kept).toContainEqual({ runId: subjectRun, why: recordedAfterPause("TASK_GRAPH_SUBMITTED") });
       expectHeld(f, subjectRun);
     });
   });
@@ -491,7 +494,7 @@ describe("#1162 r1 — the hold's baseline is the authentic pause, and every wri
       const pass = await reconcile(f, "probe: restored CEO after counterfeit pause");
       expectHeld(f, runId);
       expect(pass.continuityHolds.released).toEqual([]);
-      expect(pass.continuityHolds.kept).toContainEqual({ runId, why: "TASK_GRAPH_SUBMITTED was recorded for the run after continuity's pause" });
+      expect(pass.continuityHolds.kept).toContainEqual({ runId, why: recordedAfterPause("TASK_GRAPH_SUBMITTED") });
     });
   });
 
@@ -534,7 +537,7 @@ describe("#1162 r1 — the hold's baseline is the authentic pause, and every wri
       expectReleased(f, controlRun);
       expectHeld(f, subjectRun);
       expect(pass.continuityHolds.released).toEqual([controlRun]);
-      expect(pass.continuityHolds.kept).toContainEqual({ runId: subjectRun, why: "RUN_TRANSITION was recorded for the run after continuity's pause" });
+      expect(pass.continuityHolds.kept).toContainEqual({ runId: subjectRun, why: recordedAfterPause("RUN_TRANSITION") });
     });
   });
 
@@ -842,9 +845,9 @@ describe("#1162 r3 — a refused or ignored input recorded under the hold is not
       expectReleased(f, stopFailed);
       for (const runId of [stopped, guardAllowed, guardUnreadable]) expectHeld(f, runId);
       expect(report.continuityHolds.kept).toEqual(expect.arrayContaining([
-        { runId: stopped, why: "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP was recorded for the run after continuity's pause" },
-        { runId: guardAllowed, why: "MANAGED_WRITE_GUARD was recorded for the run after continuity's pause" },
-        { runId: guardUnreadable, why: "MANAGED_WRITE_GUARD was recorded for the run after continuity's pause" },
+        { runId: stopped, why: recordedAfterPause("PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP") },
+        { runId: guardAllowed, why: recordedAfterPause("MANAGED_WRITE_GUARD") },
+        { runId: guardUnreadable, why: recordedAfterPause("MANAGED_WRITE_GUARD") },
       ]));
     });
   });
