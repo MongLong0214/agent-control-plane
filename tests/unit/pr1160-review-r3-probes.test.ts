@@ -18,7 +18,8 @@ afterAll(cleanupTempDirs);
 afterEach(() => vi.restoreAllMocks());
 
 /**
- * PR #1160 review r3 (BLOCK at de3721f0, S-TB-07): the reviewer's undo probes, ported as written. Five
+ * PR #1160 review r3 (BLOCK at de3721f0, S-TB-07): the reviewer's undo probes, ported as written, except
+ * the partial read-tree probe's expected outcome, changed by CEO 363fae88 (see its comment). Five
  * failed at de3721f0 (a user's concurrent HEAD selection rewritten, an actual completion database error
  * bypassing the undo, a partial read-tree failure taken as "nothing moved", and the backward and forward
  * symbolic-ref failures dropped from the refusal); the rest passed and still do. Changed only to drop
@@ -236,9 +237,15 @@ it("R3 S-TB-07 a partial read-tree failure preserves both tracked files",async()
   expect(hook.fired()).toBe(true);
   console.error("R3_PARTIAL_READ_TREE",JSON.stringify({refused,branch:branchOf(s.repo),readme:readFileSync(join(s.repo,"README.md"),"utf8"),app:readFileSync(join(s.repo,"src/app.js"),"utf8"),status:gitSync(s.repo,["status","--porcelain"])}));
   expect(refused).toMatchObject({ok:false});
-  expect.soft(readFileSync(join(s.repo,"README.md"),"utf8")).toBe(readme);
+  // Changed by CEO 363fae88 (the only change to this probe): a path the refused read-tree moved is never put
+  // back automatically, since a concurrent write to it cannot be excluded. README.md therefore stays exactly as
+  // git left it (the pin's bytes, where the reviewer expected the advanced readme restored), the worktree is
+  // not clean (where the reviewer expected ""), and the refusal names "recovery incomplete" and claims no rollback.
+  expect.soft(readFileSync(join(s.repo,"README.md"),"utf8")).toBe("# fixture project\n");
   expect.soft(readFileSync(join(s.repo,"src/app.js"),"utf8")).toBe(app);
-  expect.soft(gitSync(s.repo,["status","--porcelain"])).toBe("");
+  expect.soft(gitSync(s.repo,["status","--porcelain"])).toBe("M README.md");
+  expect(refused).toMatchObject({evidence:{rolledBack:false,undoRecorded:false}});
+  expect(JSON.stringify(refused)).toContain("recovery incomplete");
  });
 });
 it("R3 S-TB-07 leftOnBranch preserves files when the reverse read-tree really refuses",async()=>{

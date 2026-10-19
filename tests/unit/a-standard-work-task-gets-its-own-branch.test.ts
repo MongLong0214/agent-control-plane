@@ -893,13 +893,18 @@ describe("the undo verifies each step before it takes it, and names every step i
     });
   });
 
-  it("(b) a refused forward read-tree that moved files it then cannot put back keeps the ref and HEAD as they stand and names the exact paths", async () => {
+  /** The blob a commit holds at a path. */
+  const blobAt = (repo: string, commit: string, path: string): string => gitSync(repo, ["rev-parse", `${commit}:${path}`]);
+  const recoveryOf = (answer: Record<string, unknown>) => (answer["evidence"] as { recovery?: Record<string, unknown> }).recovery;
+
+  it("(b) a refused forward read-tree that moved a file is measured and never put back: files, index, HEAD and ref stay exactly as they stand, and recovery is incomplete, path by path (CEO 363fae88)", async () => {
     await withBootstrapRuntime(async (f) => {
-      const s = await oneTask(f, "stb-r3-stuck", true);
-      const head = refOf(s.repo, "HEAD");
+      const s = await oneTask(f, "stb-r3-partial", true);
+      const head = refOf(s.repo, "HEAD")!;
+      const marks = tempDir("acp-stb-marks-");
       const git = gitScripted(() => [
         `  *"read-tree -m -u"*) chmod 555 '${join(s.repo, "src")}';;`,
-        "  *\"checkout-index\"*) echo 'injected: cannot put back' >&2; exit 1;;",
+        `  *"checkout-index"*) : > '${join(marks, "checkout-index")}';;`,
       ].join("\n"));
       let refused: Record<string, unknown>;
       try {
@@ -908,16 +913,100 @@ describe("the undo verifies each step before it takes it, and names every step i
         git.restore();
         chmodSync(join(s.repo, "src"), 0o755);
       }
-      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { rolledBack: false, refRemoved: false, filesMoved: true, created: true } });
-      expect(String(refused["message"])).toContain("could not be put back; everything is left as it stands");
-      expect(blockersOf(refused)).toEqual([expect.objectContaining({ step: "files-forward", paths: ["README.md"], error: expect.stringContaining("injected: cannot put back") })]);
-      // Nothing claimed and nothing more moved: HEAD where it was, the ref kept at the pin, README as git left it.
+      // Nothing was written to put anything back.
+      expect(existsSync(join(marks, "checkout-index"))).toBe(false);
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { rolledBack: false, undoRecorded: false, refRemoved: false, filesMoved: true, headMoved: false, created: true } });
+      expect(String(refused["message"])).toContain("recovery is incomplete");
+      expect(blockersOf(refused)).toEqual([expect.objectContaining({ step: "recovery incomplete", paths: ["README.md"] })]);
+      // The recovery evidence: per path, the original blob, what is there now, and the attempt.
+      expect(recoveryOf(refused)).toEqual({
+        attemptId: events(f, CREATING, s.runId)[0]!["attemptId"],
+        from: head,
+        to: s.target.baseSha,
+        paths: [{
+          path: "README.md",
+          expected: { mode: "100644", oid: blobAt(s.repo, head, "README.md") },
+          current: { mode: "100644", blob: blobAt(s.repo, s.target.baseSha, "README.md") },
+          destination: { mode: "100644", oid: blobAt(s.repo, s.target.baseSha, "README.md") },
+        }],
+        indexChanged: [],
+        notOurs: [],
+      });
+      // Exactly as git left it: README at the pin's bytes, src/app.js untouched, the index still at HEAD's tree.
+      expect(readFileSync(join(s.repo, "README.md"), "utf8")).toBe("# fixture project\n");
+      expect(readFileSync(join(s.repo, "src/app.js"), "utf8")).toBe("module.exports = () => 9;\n");
+      expect(gitSync(s.repo, ["ls-files", "-s", "README.md"])).toContain(blobAt(s.repo, head, "README.md"));
       expect(branchOf(s.repo)).toBe("dev");
       expect(refOf(s.repo, "HEAD")).toBe(head);
       expect(refOf(s.repo, `refs/heads/${s.target.branch}`)).toBe(s.target.baseSha);
-      expect(readFileSync(join(s.repo, "src/app.js"), "utf8")).toBe("module.exports = () => 9;\n");
       expect(events(f, CREATED, s.runId)).toEqual([]);
       expect(events(f, UNDONE, s.runId)).toEqual([]);
+      // Unresolved, fail-closed: the next attempt is refused by name, not recovered automatically.
+      expect(await runTask(f, s, s.taskId, s.claimId)).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { creationAttempted: true } });
+    });
+  });
+
+  it("(b) counterexample: a user write landing after the measure, where the put-back used to write, is preserved, and the refusal claims no rollback (CEO 363fae88)", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await oneTask(f, "stb-r3-user-after-measure", true);
+      const head = refOf(s.repo, "HEAD")!;
+      const marks = tempDir("acp-stb-marks-");
+      const userBytes = "# a user write, after the measure\n";
+      // The seam: the measure reads the original tree for the paths it found moved, after deciding they
+      // are ours and before the old put-back wrote them. The user writes README.md exactly there.
+      const git = gitScripted((real) => [
+        `  *"read-tree -m -u"*) chmod 555 '${join(s.repo, "src")}';;`,
+        `  *"ls-tree -z --full-tree ${head}"*) if [ ! -e '${join(marks, "wrote")}' ]; then : > '${join(marks, "wrote")}'; printf '${userBytes.replace("\n", "\\n")}' > '${join(s.repo, "README.md")}'; fi; exec '${real}' "$@";;`,
+      ].join("\n"));
+      let refused: Record<string, unknown>;
+      try {
+        refused = await runTask(f, s, s.taskId, s.claimId);
+      } finally {
+        git.restore();
+        chmodSync(join(s.repo, "src"), 0o755);
+      }
+      expect(existsSync(join(marks, "wrote"))).toBe(true);
+      expect(readFileSync(join(s.repo, "README.md"), "utf8")).toBe(userBytes);
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { rolledBack: false, undoRecorded: false } });
+      expect(blockersOf(refused).map((blocker) => blocker.step)).toContain("recovery incomplete");
+      expect(events(f, UNDONE, s.runId)).toEqual([]);
+      expect(branchOf(s.repo)).toBe("dev");
+      expect(refOf(s.repo, `refs/heads/${s.target.branch}`)).toBe(s.target.baseSha);
+    });
+  });
+
+  it("(b) the reverse read-tree, when it moves some files back and stops, is measured and never put back either: HEAD stays where the undo left it, nothing follows (CEO 363fae88)", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await oneTask(f, "stb-r3-reverse-partial", true);
+      const head = refOf(s.repo, "HEAD")!;
+      const pin = s.target.baseSha;
+      const git = gitScripted((real) => [
+        `  *"read-tree -m -u ${pin} ${head}"*) chmod 555 '${join(s.repo, "src")}';;`,
+        `  *"task branch HEAD"*) '${real}' "$@"; code=$?; printf 'user notes\\n' > '${join(s.repo, "notes.txt")}'; exit "$code";;`,
+      ].join("\n"));
+      let refused: Record<string, unknown>;
+      try {
+        refused = await runTask(f, s, s.taskId, s.claimId);
+      } finally {
+        git.restore();
+        chmodSync(join(s.repo, "src"), 0o755);
+      }
+      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT, evidence: { rolledBack: false, undoRecorded: false, refRemoved: false, filesMoved: true, headMoved: false } });
+      expect(blockersOf(refused)).toEqual([expect.objectContaining({ step: "recovery incomplete", paths: ["README.md"] })]);
+      expect(recoveryOf(refused)).toMatchObject({
+        attemptId: events(f, CREATING, s.runId)[0]!["attemptId"],
+        from: pin,
+        to: head,
+        paths: [{ path: "README.md", expected: { oid: blobAt(s.repo, pin, "README.md") }, current: { blob: blobAt(s.repo, head, "README.md") } }],
+      });
+      // Left exactly as the reverse read-tree left them: README back at HEAD's bytes, src/app.js still at the pin's.
+      expect(readFileSync(join(s.repo, "README.md"), "utf8")).toBe("# the base moved on\n");
+      expect(readFileSync(join(s.repo, "src/app.js"), "utf8")).toBe("module.exports = () => 1;\n");
+      expect(readFileSync(join(s.repo, "notes.txt"), "utf8")).toBe("user notes\n");
+      expect(branchOf(s.repo)).toBe("dev");
+      expect(refOf(s.repo, `refs/heads/${s.target.branch}`)).toBe(pin);
+      expect(events(f, UNDONE, s.runId)).toEqual([]);
+      expect(events(f, CREATED, s.runId)).toEqual([]);
     });
   });
 

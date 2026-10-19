@@ -1387,6 +1387,7 @@ export class WorkerTurnRunner {
           format,
           needsCheckout,
           indexBaseline,
+          attemptId,
           // The intent, written immediately before the create-only ref update, and the completion,
           // written only once the branch exists at the pin and the checkout stands clean on it.
           recordCreation: (kind: CreationRecordKind) => this.ports.audit.record({
@@ -2239,7 +2240,7 @@ type CreationRecordKind = typeof TASK_BRANCH_CREATING | typeof TASK_BRANCH_CREAT
 
 /** One undo step that did not do what it was for: the step, git's (or the store's) own words, and where that leaves the checkout. */
 interface UndoBlocker {
-  step: "head-back" | "files-back" | "head-forward" | "ref-delete" | "files-forward" | "completion" | "undo";
+  step: "head-back" | "files-back" | "head-forward" | "ref-delete" | "recovery incomplete" | "completion" | "undo";
   error: string;
   state: string;
   paths?: string[];
@@ -2268,55 +2269,57 @@ const treeEntriesOf = async (repo: PinnedRepository, tree: string, paths: readon
   return entries;
 };
 
+/** One path a refused read-tree may have moved: what `from` holds, what the worktree holds now, what `dest` holds. */
+interface RecoveryPath {
+  path: string;
+  /** The original: `from`'s entry, null where `from` has no such path. */
+  expected: { mode: string; oid: string } | null;
+  /** What the worktree holds when measured: a regular file or symlink's mode and blob, null where it is gone. */
+  current: { mode: string; blob: string } | null;
+  /** The destination's entry, null where `dest` has no such path. */
+  destination: { mode: string; oid: string } | null;
+}
+
 /**
- * Review r3 (S-TB-07 b) — after a two-tree `read-tree -m -u` from `from` to `dest` failed. Git can have
- * written some files before it stopped (it never writes the index then), so nothing is assumed: what now
- * differs from `from` is measured. A path whose bytes and mode are exactly `dest`'s (or that `dest` lacks
- * and is gone) was written by that read-tree, and is put back from the index, which still holds `from`;
- * a path `dest` added is removed only while it holds exactly `dest`'s bytes. Anything else is not ours and
- * is never touched. Returns what was moved, what could not be put back, and what is not ours.
+ * Review r3 (S-TB-07 b), CEO 363fae88 — after a two-tree `read-tree -m -u` from `from` to `dest` failed.
+ * Git can have written some files before it stopped (it never writes the index then), so nothing is
+ * assumed: what now differs from `from` is measured, and only measured. A path whose bytes and mode are
+ * exactly `dest`'s (or that `dest` lacks and is gone) was moved by that read-tree; anything else is not
+ * ours. Nothing is written here: putting a moved path back would race any concurrent write to it, and no
+ * re-read or hash compare closes that window, so a moved path is left exactly as it is and reported.
  */
-const putBackPartialMove = async (
+const measurePartialMove = async (
   repo: PinnedRepository,
   from: string,
   dest: string,
   format: "sha1" | "sha256",
   label: string,
-): Promise<{ moved: string[]; stuck: string[]; foreign: string[]; error: string | null }> => {
+): Promise<{ moved: RecoveryPath[]; notOurs: string[]; indexChanged: string[]; error: string | null }> => {
   try {
-    const staged = await stagedAgainst(repo, from, indexSnapshot(repo, `${label}-index`));
-    if (staged.length > 0) {
-      return { moved: [], stuck: staged.slice(0, 50), foreign: [], error: "the index no longer holds the tree the files were moved from; nothing is put back" };
-    }
+    const indexChanged = await stagedAgainst(repo, from, indexSnapshot(repo, `${label}-index`));
     const scan = await scanAgainst(repo, from, format, label);
-    const wanted = await treeEntriesOf(repo, dest, scan.entries.map((entry) => entry.path));
-    const moved: string[] = [];
-    const foreign: string[] = [...scan.unsafe];
+    const paths = scan.entries.map((entry) => entry.path);
+    const wanted = await treeEntriesOf(repo, dest, paths);
+    const original = await treeEntriesOf(repo, from, paths);
+    const moved: RecoveryPath[] = [];
+    const notOurs: string[] = [...scan.unsafe];
     for (const entry of scan.entries) {
-      const target = wanted.get(entry.path);
-      const ours = target === undefined ? entry.mode === null : entry.blob === target.oid && entry.mode === target.mode;
-      (ours ? moved : foreign).push(entry.path);
-    }
-    if (moved.length === 0) return { moved, stuck: [], foreign, error: null };
-    const original = await treeEntriesOf(repo, from, moved);
-    const restore = moved.filter((path) => original.has(path));
-    let error: string | null = null;
-    if (restore.length > 0) {
-      const out = await runPinnedGit(repo, ["checkout-index", "-f", "-q", "--", ...restore]);
-      if (out.exitCode !== 0) error = `git checkout-index ${gitWords(out)}`;
-    }
-    for (const path of moved.filter((candidate) => !original.has(candidate))) {
-      try {
-        rmSync(join(repo.workTree, path), { force: true });
-      } catch (failure) {
-        error = `${path} could not be removed: ${errorText(failure).slice(0, 200)}`;
+      const destination = wanted.get(entry.path) ?? null;
+      const ours = destination === null ? entry.mode === null : entry.blob === destination.oid && entry.mode === destination.mode;
+      if (!ours) {
+        notOurs.push(entry.path);
+        continue;
       }
+      moved.push({
+        path: entry.path,
+        expected: original.get(entry.path) ?? null,
+        current: entry.mode === null || entry.blob === null ? null : { mode: entry.mode, blob: entry.blob },
+        destination,
+      });
     }
-    const again = new Set((await scanAgainst(repo, from, format, `${label}-again`)).entries.map((entry) => entry.path));
-    const stuck = moved.filter((path) => again.has(path));
-    return { moved, stuck, foreign, error: stuck.length > 0 ? (error ?? "the paths did not read back as they were") : null };
+    return { moved, notOurs, indexChanged: indexChanged.slice(0, 50), error: null };
   } catch (failure) {
-    return { moved: [], stuck: ["(unmeasured)"], foreign: [], error: `the checkout could not be measured: ${errorText(failure).slice(0, 300)}` };
+    return { moved: [], notOurs: [], indexChanged: [], error: `the checkout could not be measured: ${errorText(failure).slice(0, 300)}` };
   }
 };
 
@@ -2334,7 +2337,8 @@ const putBackPartialMove = async (
  * A refusal or a throw after the first write goes through one undo, step by step, each step only when its
  * own precondition is verified first: HEAD is moved back only while it still names the task branch this
  * attempt set (someone else's choice is left alone); files are moved back only once HEAD is back, by the
- * reverse `read-tree`, whose own partial failure is measured and put back; the ref is deleted only if this
+ * reverse `read-tree`, whose own partial failure is measured and never put back (CEO 363fae88: recovery is
+ * then incomplete, and reported path by path); the ref is deleted only if this
  * attempt created it, nothing stands on it and it still points at the pinned base (`update-ref -d` with
  * that old value). A step that fails, or is not taken because its precondition does not hold, is a named
  * blocker in the refusal with git's words and the state it leaves; nothing claims a rollback that did not
@@ -2356,6 +2360,8 @@ const switchToTaskBranch = async (
     /** `stagedContent` of the real index when the checkout was read clean. */
     indexBaseline: string;
     recordCreation: (kind: CreationRecordKind) => Decision<number>;
+    /** The id this attempt's records carry; named in a recovery that could not complete. */
+    attemptId: string;
   },
 ): Promise<Decision<void>> => {
   const branchRef = `refs/heads/${input.target.branch}`;
@@ -2429,20 +2435,23 @@ const switchToTaskBranch = async (
       }
       // 2. Files back, only once HEAD is back on the branch it left.
       let reverseRefused: string | null = null;
+      let recovery: Record<string, unknown> | null = null;
       if (filesMoved && !headMoved && headElsewhere === null) {
         const reverse = await runPinnedGit(repo, ["read-tree", "-m", "-u", input.to, input.head]);
         if (reverse.exitCode === 0) {
           filesMoved = false;
         } else {
           reverseRefused = gitWords(reverse);
-          const put = await putBackPartialMove(repo, input.to, input.head, input.format, "undo-reverse");
-          if (put.stuck.length > 0 || put.error !== null) {
+          const measured = await measurePartialMove(repo, input.to, input.head, input.format, "undo-reverse");
+          if (measured.moved.length > 0 || measured.error !== null || measured.indexChanged.length > 0) {
+            // CEO 363fae88: what the reverse read-tree moved is never put back; it is left exactly as it is.
             blockers.push({
-              step: "files-back",
-              error: `${reverseRefused}; ${put.error ?? ""}`,
-              state: `HEAD names ${input.branch} at ${input.head}, while these paths are at neither tree: ${put.stuck.join(", ")}`,
-              paths: put.stuck,
+              step: "recovery incomplete",
+              error: `${reverseRefused}${measured.error === null ? "" : `; ${measured.error}`}`,
+              state: `HEAD names ${input.branch} at ${input.head}; the index holds the task tree ${input.to}; the paths the reverse read-tree moved before it stopped are left exactly as they are, not put back`,
+              paths: measured.moved.map((path) => path.path),
             });
+            recovery = { attemptId: input.attemptId, from: input.to, to: input.head, paths: measured.moved, indexChanged: measured.indexChanged, notOurs: measured.notOurs.slice(0, 50) };
           } else {
             blockers.push({
               step: "files-back",
@@ -2506,6 +2515,7 @@ const switchToTaskBranch = async (
         undoRecorded,
         ...(refNowElsewhere === null ? {} : { refNowElsewhere }),
         ...(reverseRefused === null ? {} : { reverseRefused }),
+        ...(recovery === null ? {} : { recovery }),
         blockers,
       });
     } catch (failure) {
@@ -2537,17 +2547,19 @@ const switchToTaskBranch = async (
     if (input.needsCheckout) {
       const moved = await runPinnedGit(repo, ["read-tree", "-m", "-u", input.head, input.to]);
       if (moved.exitCode !== 0) {
-        // Review r3 (S-TB-07 b): never assume a refused read-tree moved nothing. Measure, put back what it
-        // wrote, and keep everything as it stands if that cannot be done.
-        const put = await putBackPartialMove(repo, input.head, input.to, input.format, "forward-refused");
-        if (put.stuck.length > 0 || put.error !== null) {
+        // Review r3 (S-TB-07 b): never assume a refused read-tree moved nothing; measure it. CEO 363fae88: a
+        // path it moved is never put back automatically (a concurrent write to it cannot be excluded), so if
+        // anything moved, the files, the index, HEAD and the ref are all left exactly as they stand, and the
+        // refusal carries what was measured. The attempt stays unresolved: no undo record is written.
+        const measured = await measurePartialMove(repo, input.head, input.to, input.format, "forward-refused");
+        if (measured.moved.length > 0 || measured.error !== null || measured.indexChanged.length > 0) {
           blockers.push({
-            step: "files-forward",
-            error: `${gitWords(moved)}; ${put.error ?? ""}`,
-            state: `HEAD names ${input.branch} at ${input.head}; ${createdHere ? `${branchRef} is kept at the pinned base; ` : ""}these paths are at neither tree: ${put.stuck.join(", ")}`,
-            paths: put.stuck,
+            step: "recovery incomplete",
+            error: `${gitWords(moved)}${measured.error === null ? "" : `; ${measured.error}`}`,
+            state: `HEAD names ${input.branch} at ${input.head}; the index holds ${input.head}; ${createdHere ? `${branchRef} is kept at the pinned base, the moved files standing on it; ` : ""}the paths the read-tree moved before it stopped are left exactly as they are, not put back`,
+            paths: measured.moved.map((path) => path.path),
           });
-          return refused("the checkout's files could not be moved to the task's branch, and what moved could not be put back; everything is left as it stands", {
+          return refused("the checkout's files could not be moved to the task's branch, and some had moved; recovery is incomplete and everything is left exactly as it stands", {
             error: moved.stderr.slice(0, 300),
             created: createdHere,
             refRemoved: false,
@@ -2555,13 +2567,15 @@ const switchToTaskBranch = async (
             headMoved: false,
             filesMoved: true,
             rolledBack: false,
+            undoRecorded: false,
+            recovery: { attemptId: input.attemptId, from: input.head, to: input.to, paths: measured.moved, indexChanged: measured.indexChanged, notOurs: measured.notOurs.slice(0, 50) },
             blockers,
           });
         }
+        // Git refused before writing anything of ours: there is nothing to put back.
         return await undo("the checkout's files could not be moved to the task's branch; they are left as they were", {
           error: moved.stderr.slice(0, 300),
-          ...(put.moved.length > 0 ? { putBack: put.moved } : {}),
-          ...(put.foreign.length > 0 ? { notOurs: put.foreign.slice(0, 50) } : {}),
+          ...(measured.notOurs.length > 0 ? { notOurs: measured.notOurs.slice(0, 50) } : {}),
         }, "git");
       }
       filesMoved = true;
