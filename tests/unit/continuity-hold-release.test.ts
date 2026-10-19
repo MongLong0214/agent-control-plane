@@ -19,6 +19,7 @@ import { standardWorkContinuationTriggerKind } from "../../src/runtime/provision
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { drivenPrimary } from "../helpers/driven-primary-cto.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { bindWorkerForTask } from "../helpers/harness.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 
 afterAll(cleanupTempDirs);
@@ -40,6 +41,7 @@ afterEach(() => vi.restoreAllMocks());
  */
 
 const CEO = roleKeyFor(Role.CEO);
+const CHANGED = "the run's tasks, executions, artifacts or candidate attempts changed under the hold";
 const RELEASE_REASON = `continuity hold released: ${CEO} covered again`;
 
 const contract = {
@@ -136,9 +138,10 @@ const stalledRun = async (f: BootstrapRuntimeFixture, project: Project): Promise
  * Time has passed since the run's last write, as it had live (task 01:24Z, pause 04:09:28Z): the release
  * keeps the hold for anything of the run written in the pause's own millisecond.
  */
-const loseCeo = async (f: BootstrapRuntimeFixture) => {
+const loseCeo = async (f: BootstrapRuntimeFixture, options: { frozenClock?: boolean } = {}) => {
   const cp = f.harness.cp;
-  f.harness.clock.advance(1_000);
+  // `frozenClock`: the clock does not move, so every write of the run shares the pause's millisecond.
+  if (options.frozenClock !== true) f.harness.clock.advance(1_000);
   const ceo = cp.bindings.active(CEO)!;
   expect(cp.sessions.transition(ceo.sessionId, SessionLifecycle.ERROR, "the CEO's Hermes session restarted").allowed).toBe(true);
   const failover = vi.spyOn(cp.continuity, "failover")
@@ -557,8 +560,8 @@ describe("#1162 r1 — the hold's baseline is the authentic pause, and every wri
       expectHeld(f, artifactRun);
       expect(pass.continuityHolds.released).toEqual([controlRun]);
       expect(pass.continuityHolds.kept).toEqual(expect.arrayContaining([
-        { runId: taskRun, why: "a task of the run was written at or after continuity's pause" },
-        { runId: artifactRun, why: "an artifact of the run was written at or after continuity's pause" },
+        { runId: taskRun, why: CHANGED },
+        { runId: artifactRun, why: CHANGED },
       ]));
     });
   });
@@ -581,6 +584,161 @@ describe("#1162 r1 — the hold's baseline is the authentic pause, and every wri
       expect(again.continuityHolds.released).toEqual([runId]);
       expect(pin(f, runId)).toEqual(before);
       expect(transitions(f, runId).filter((entry) => entry["reason"] === RELEASE_REASON)).toHaveLength(2);
+    });
+  });
+});
+
+/**
+ * #1162 r2 (CEO 3b9d8289) — movement under the hold is told from record order precisely, under a frozen
+ * clock as well:
+ *
+ * - R2-01: a refusal or a diagnostic recorded for the run (a repeated run_ack's OUTBOX_ACK_REJECTED) is
+ *   not movement; only a run-mutating audit kind after the pause is;
+ * - the pause records a digest of the run's tasks, executions, artifacts and candidate attempts, and the
+ *   release compares it: an unchanged run is released though every row shares the pause's millisecond, and
+ *   a real change is kept though no audit record orders it;
+ * - a legacy pause, written before the digest existed (the live run_ab77268b's), falls back to the row
+ *   times: none at or after the pause's time.
+ *
+ * R1-01's two-row forge through the in-process AuditLog.record is a stated Limit (CEO 3b9d8289, ruling A):
+ * its probe is kept here as an expected failure, never as a pass.
+ */
+describe("#1162 r2 — refusals are not movement, and rows are compared by digest, not by clock", () => {
+  it("R2-01 port: a repeated run_ack rejected over the CTO socket is not movement: the unchanged run is released", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "duplicate-ack");
+      const subject = await stalledRun(f, project);
+      const control = await stalledRun(f, project);
+      await loseCeo(f);
+      const before = {
+        run: cp.runs.require(subject), tasks: cp.tasks.list(subject),
+        artifacts: cp.db.all(`SELECT * FROM run_artifacts WHERE run_id = ?`, [subject]), outbox: cp.outbox.listByRun(subject),
+      };
+      const dispatch = before.outbox.find((row) => row.kind === MessageKind.RUN_DISPATCH)!;
+      expect(dispatch.status).toBe("ACKED");
+      const retried = await f.cto(project.sessionId, "run_ack", { runId: subject, messageId: dispatch.messageId });
+      expect(retried["ok"]).toBe(false);
+      expect(cp.audit.forRun(subject).at(-1)!.kind).toBe("OUTBOX_ACK_REJECTED");
+      expect({
+        run: cp.runs.require(subject), tasks: cp.tasks.list(subject),
+        artifacts: cp.db.all(`SELECT * FROM run_artifacts WHERE run_id = ?`, [subject]), outbox: cp.outbox.listByRun(subject),
+      }).toEqual(before);
+      readoptCeo(f);
+      const restored = await reconcile(f, "a rejected ACK did not move the run");
+      expectReleased(f, control);
+      expectReleased(f, subject);
+      expect(restored.continuityHolds.released).toEqual(expect.arrayContaining([subject, control]));
+    });
+  });
+
+  it("frozen clock, unchanged run: released, though its task and artifacts share the pause's millisecond", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "frozen-unchanged");
+      const runId = await stalledRun(f, project);
+      await loseCeo(f, { frozenClock: true });
+      const pause = cp.audit.forRun(runId).filter((entry) => entry.kind === "RUN_TRANSITION").at(-1)!;
+      expect(cp.tasks.list(runId)[0]!.updatedAt).toBe(pause.at);
+      expect(typeof pause.evidence["holdSnapshotDigest"]).toBe("string");
+      readoptCeo(f);
+      const pass = await reconcile(f, "the CEO is bound again");
+      expectReleased(f, runId);
+      expect(pass.continuityHolds.released).toEqual([runId]);
+    });
+  });
+
+  it("frozen clock, real changes no audit record orders — a task, an artifact, an execution, a candidate attempt — are kept; the unchanged run beside them is released", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "frozen-changed");
+      const taskRun = await stalledRun(f, project);
+      const artifactRun = await stalledRun(f, project);
+      const executionRun = await stalledRun(f, project);
+      const attemptRun = await stalledRun(f, project);
+      const controlRun = await stalledRun(f, project);
+      // The execution run's task ran once, before the pause: an execution row the hold must keep unmoved.
+      const executed = cp.tasks.list(executionRun)[0]!;
+      const worker = bindWorkerForTask(cp, executed.taskId, { provider: "claude", model: "opus" });
+      const opened = cp.tasks.startExecution({
+        runId: executionRun, taskId: executed.taskId, ownerBindingGeneration: cp.runs.require(executionRun).ownerBindingGeneration!,
+        workerSessionId: worker, provider: "claude", model: "opus",
+      });
+      if (!opened.allowed) throw new Error(opened.message);
+      await loseCeo(f, { frozenClock: true });
+      const now = f.harness.clock.nowIso();
+      cp.db.run(`UPDATE tasks SET spec_json = ?, updated_at = ? WHERE task_id = ?`, [
+        JSON.stringify({ note: "changed under the hold" }), now, cp.tasks.list(taskRun)[0]!.taskId,
+      ]);
+      cp.artifacts.put(artifactRun, ArtifactKind.PLAN, { summary: "a PLAN stored under the hold" });
+      cp.db.run(`UPDATE task_executions SET last_activity_at = ? WHERE execution_id = ?`, [now, opened.value.executionId]);
+      const owner = cp.runs.require(attemptRun);
+      cp.db.run(
+        `INSERT INTO candidate_pipeline_attempts
+           (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, deadline_at, released_at)
+         VALUES (?, 'attempt-under-the-hold', ?, ?, NULL, 'RELEASED', ?, ?, ?)`,
+        [attemptRun, owner.ownerSessionId, owner.ownerBindingGeneration, now, now, now],
+      );
+      for (const runId of [taskRun, artifactRun, executionRun, attemptRun]) {
+        expect(cp.audit.forRun(runId).at(-1)!.kind).toBe("RUN_TRANSITION");
+      }
+      readoptCeo(f);
+      const pass = await reconcile(f, "the CEO is bound again");
+      expectReleased(f, controlRun);
+      for (const runId of [taskRun, artifactRun, executionRun, attemptRun]) expectHeld(f, runId);
+      expect(pass.continuityHolds.released).toEqual([controlRun]);
+      expect(pass.continuityHolds.kept).toEqual(expect.arrayContaining(
+        [taskRun, artifactRun, executionRun, attemptRun].map((runId) => ({ runId, why: CHANGED })),
+      ));
+    });
+  });
+
+  it("a legacy pause with no digest (the live run_ab77268b's shape) falls back to row times: released when nothing was written since, kept for a row of the pause's millisecond", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "legacy-pause");
+      const quietRun = await stalledRun(f, project);
+      const sameMsRun = await stalledRun(f, project);
+      // The pause as the code before S-HOLD wrote it: the same transition, with no digest in its evidence.
+      const record = cp.audit.record.bind(cp.audit);
+      vi.spyOn(cp.audit, "record").mockImplementation((entry) => {
+        if (entry.kind !== "RUN_TRANSITION" || entry.evidence?.["continuityAction"] !== "PAUSE_NEW_WORK") return record(entry);
+        const { holdSnapshotDigest: _dropped, ...legacy } = entry.evidence;
+        return record({ ...entry, evidence: legacy });
+      });
+      await loseCeo(f);
+      vi.mocked(cp.audit.record).mockRestore();
+      for (const runId of [quietRun, sameMsRun]) {
+        const pause = cp.audit.forRun(runId).filter((entry) => entry.kind === "RUN_TRANSITION").at(-1)!;
+        expect(pause.evidence).not.toHaveProperty("holdSnapshotDigest");
+      }
+      cp.db.run(`UPDATE tasks SET updated_at = ? WHERE task_id = ?`, [f.harness.clock.nowIso(), cp.tasks.list(sameMsRun)[0]!.taskId]);
+      readoptCeo(f);
+      const pass = await reconcile(f, "the CEO is bound again");
+      expectReleased(f, quietRun);
+      expectHeld(f, sameMsRun);
+      expect(pass.continuityHolds.released).toEqual([quietRun]);
+      expect(pass.continuityHolds.kept).toContainEqual({ runId: sameMsRun, why: "a task of the run was written at or after continuity's pause" });
+    });
+  });
+
+  it.fails("LIMIT R1-01 (CEO 3b9d8289, ruling A) — an in-process AuditLog.record forge of a return to ACTIVE and a copied pause still releases a changed run: expected to FAIL", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const project = await ownedProject(f, scriptOwners(f), "forged-episode");
+      const runId = await stalledRun(f, project);
+      await loseCeo(f);
+      const pause = cp.audit.forRun(runId).filter((entry) => entry.kind === "RUN_TRANSITION").at(-1)!;
+      f.harness.clock.advance(10);
+      expect(cp.tasks.submit(runId, [{ key: "extra", title: "extra work", category: "docs" }]).allowed).toBe(true);
+      readoptCeo(f);
+      expect(ask(f, runId, cp.bindings.active(CEO)!)).toMatchObject({ released: false });
+      f.harness.clock.advance(10);
+      expect(cp.audit.record({ kind: "RUN_TRANSITION", runId, evidence: { from: RunState.BLOCKED, to: RunState.ACTIVE, reason: "forged" } }).allowed).toBe(true);
+      expect(cp.audit.record({ kind: "RUN_TRANSITION", runId, evidence: { ...pause.evidence, holdSnapshotDigest: undefined } }).allowed).toBe(true);
+      await reconcile(f, "the CEO is bound again after a forged episode");
+      // What a closed R1-01 would hold; today the forge releases the run, so this assertion fails.
+      expectHeld(f, runId);
     });
   });
 });

@@ -271,6 +271,58 @@ const isContinuityPause = (evidence: Record<string, unknown> | null, stateReason
   evidence["continuityAction"] === "PAUSE_NEW_WORK" &&
   evidence["reason"] === stateReason && isContinuityPauseReason(evidence["reason"]);
 
+/**
+ * S-HOLD (#1162 R2-01) — the audit kinds recorded for a run that say the run itself moved: its state,
+ * owner, tasks, write targets, executions and worker turns, candidates and reviews, decisions, escalations
+ * and their replies, claims, leases, guards, bindings it scopes, wakes and finalization. One of these
+ * after continuity's pause keeps the hold. A kind not listed here is a refusal or a diagnostic that
+ * changes nothing (OUTBOX_ACK_REJECTED, GATE_REJECTED, MERGE_REFUSED, REPAIR_REFUSED, REPAIR_DRY_RUN,
+ * CTO_DISPATCH_REFUSED_CANONICAL, CTO_SESSION_PROBE_FAILED, WORKER_PROBE_GROUP_UNCONFIRMED,
+ * CEO_NOTIFICATION_BLOCKED, BLIND_REVIEW_MANUAL_DENIED, TASK_WORKER_TURN_LATE_RESULT_REFUSED,
+ * WORKER_SESSION_STOP_FAILED, STANDARD_WORK_CONTINUATION_STALLED) and never keeps it. A writer that leaves
+ * no record, or a record of a kind added later, is still caught by the row snapshot (`#holdSnapshot`) or,
+ * for a pause that predates it, by the row times. A kind whose effect was unclear is listed: listing keeps
+ * the hold, the safe side.
+ */
+const CONTINUITY_HOLD_MUTATING_KINDS: readonly string[] = [
+  "RUN_CREATED", "DISPATCHED", "RUN_DISPATCH_DEFERRED", "RUN_TRANSITION", "RUN_PRIORITY_SET", "RUN_OWNER_RENEWED",
+  "RECOVERY_TAKEOVER", "PRIMARY_CTO_ACTIVATED", "PRIMARY_CTO_UNDELIVERABLE_REPLACED",
+  "PRIMARY_CTO_DRIVEN_SESSION_SPAWNED", "PRIMARY_CTO_DRIVEN_SPAWN_CLEANUP",
+  "BINDING_CREATED", "BINDING_RENEWED", "BINDING_RUNTIME_MOVED", "BINDING_SWITCHED",
+  "TASK_GRAPH_SUBMITTED", "TASK_GRAPH_CANCELLED", "TASK_WRITE_TARGET_RECORDED", "TASK_BRANCH_PREPARED",
+  "TASK_EXECUTION_STARTED", "TASK_EXECUTION_FINISHED", "TASK_EXECUTION_LATE_RESULT_IGNORED",
+  "TASK_EXECUTIONS_ABANDONED_FOR_TAKEOVER", "TASK_WORKER_TURN_STARTED", "TASK_WORKER_TURN_SUCCEEDED",
+  "TASK_WORKER_TURN_FAILED", "TASK_WORKER_TURN_GIT_STOPPED", "TASK_WORKER_TURNS_DRAINED",
+  "TASK_WORKER_ORPHAN_KILLED", "TASK_WORKER_ORPHAN_GONE", "TASK_WORKER_ORPHAN_UNIDENTIFIED",
+  "TASK_WORKER_ORPHAN_RESOLVED", "WORKER_RETIRED", "WORKER_RETIREMENT_DEFERRED",
+  "CANDIDATE_FROZEN", "CANDIDATE_PROMOTED", "CANDIDATE_INVALIDATED", "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED",
+  "BLIND_REVIEW_COMPLETED", "BLIND_REVIEW_FALLBACK", "BLIND_REVIEW_REJECTED", "BLIND_REVIEW_UNAVAILABLE",
+  "REVISION_RETURNED_TO_CTO", "VERIFICATION_COMPLETED",
+  "CEO_DECISION", "OWNER_DECISION", "OWNER_APPROVAL_INGRESS", "CTO_ESCALATION", "CEO_NOTIFICATION",
+  "BUZZ_OWNER_APPROVAL_PROMPTED", "ESCALATION_REPLY_HELD", "ESCALATION_REPLY_CARRIED",
+  "ESCALATION_REPLY_HOLD_REJECTED", "OUTBOX_ACKED_IN_BAND",
+  "CLAIM_ACQUIRED", "CLAIM_RELEASED", "SOURCE_READ_LEASE_ACQUIRED", "SOURCE_READ_LEASE_RELEASED",
+  "MANAGED_WRITE_GUARD", "MANAGED_WRITE_GUARD_CONSUMED", "MANAGED_WRITE_GUARD_REVOKED",
+  "REPOSITORY_TEMPORARY_BINDING", "MANIFEST_ACTIVATION_CONSUMER_BOUND", "PROJECT_MANIFEST_ACTIVATED",
+  "STANDARD_WORK_CONTINUATION_WAKE", "BOOTSTRAP_PLAN_RECOVERY_WAKE", "BOOTSTRAP_RESULT_RECOVERY_WAKE",
+  "BOOTSTRAP_REVIEW_RETRY_WAKE", "BOOTSTRAP_PLAN_TASKS", "BOOTSTRAP_TASKS_SUPERSEDED", "BOOTSTRAP_TASK_SETTLED",
+  "BOOTSTRAP_CTO_SESSION_SPAWNED", "BOOTSTRAP_CTO_PROVISIONED", "BOOTSTRAP_CTO_RECOVERED",
+  "BOOTSTRAP_CTO_RECLAIM_DEFERRED", "BOOTSTRAP_ACTIVATED", "BOOTSTRAP_ACTIVATION_INCOMPLETE",
+  "BOOTSTRAP_ACTIVATION_READY_FOR_CONFIRM", "BOOTSTRAP_APPLICATION_APPROVAL", "BOOTSTRAP_APPLICATION_ATTEMPT",
+  "BOOTSTRAP_APPLICATION_LEDGER_STAGE", "BOOTSTRAP_APPLICATION_RESERVED", "BOOTSTRAP_APPLICATION_WRITE_RECEIPTED",
+  "HANDOFF_SUBMITTED", "HANDOFF_ACK",
+  "FINALIZATION_ATTEMPT_ACQUIRED", "FINALIZATION_ATTEMPT_FAILED", "FINALIZATION_ATTEMPT_RECLAIMED",
+  "FINALIZATION_BLOCKED_POST_MERGE", "FINALIZATION_COMPLETED", "FINALIZATION_COMPLETION_RECONCILED",
+  "PRODUCTION_GATE_PUBLISHED", "MERGE_EXECUTED", "MERGE_REPLAY", "MERGE_BASE_DRIFT", "POST_MERGE_FAILED",
+  "HOTFIX_PROPAGATION", "REPAIR_EXECUTED",
+  "BASELINE_HARNESS_PINNED", "BASELINE_HARNESS_DISPATCH_CONTEXT", "BASELINE_ROLE_SESSION",
+  "BASELINE_INVOCATION_STARTED", "BASELINE_INVOCATION_FINISHED", "BASELINE_USAGE_RECORDED",
+  "BASELINE_GRAPH_SNAPSHOT", "BASELINE_TASK_CLASSIFICATION", "BASELINE_QUALITY_OBSERVATION", "BASELINE_RUN_OUTCOME",
+];
+
+/** The pause evidence field that carries `#holdSnapshot` at the pause (S-HOLD, CEO 3b9d8289). */
+const HOLD_SNAPSHOT_FIELD = "holdSnapshotDigest";
+
 /** S-HOLD — a binding change of a role whose loss pauses the run, other than the held role's own. */
 const CONTINUITY_HOLD_BINDING_KINDS = [
   "BINDING_CREATED", "BINDING_RENEWED", "BINDING_REVOKED", "BINDING_SWITCHED", "BINDING_RUNTIME_MOVED",
@@ -942,7 +994,39 @@ export class RunEngine {
     reason: string,
     evidence: Record<string, unknown> = {},
   ): Decision<RunRow> {
-    return this.#transition(runId, RunState.BLOCKED, reason, evidence, undefined, roleKey);
+    // S-HOLD (CEO 3b9d8289) — the pause records the digest of everything a release requires unmoved, so
+    // the release compares rows, not clocks. Read synchronously right before the transition: no await, and
+    // so no other writer of this process, lies between them.
+    const snapshot = { ...evidence, [HOLD_SNAPSHOT_FIELD]: this.#holdSnapshot(runId) };
+    return this.#transition(runId, RunState.BLOCKED, reason, snapshot, undefined, roleKey);
+  }
+
+  /**
+   * S-HOLD — the digest of what continuity's hold requires unmoved: the run's current candidate, its tasks
+   * (id, state, attempts, spec digest, updated_at), executions, artifacts (by digest) and candidate pipeline
+   * attempts, every row in full and in a fixed order. Equal digests at the pause and at the release mean
+   * none of them was written in between, whatever the clock read.
+   */
+  #holdSnapshot(runId: string): string {
+    const run = this.db.get<{ current_candidate_digest: string | null }>(
+      `SELECT current_candidate_digest FROM runs WHERE run_id = ?`,
+      [runId],
+    );
+    const tasks = this.db.all<{ spec_json: string }>(
+      `SELECT task_id, state, attempt_count, spec_json, updated_at FROM tasks WHERE run_id = ? ORDER BY task_id`,
+      [runId],
+    ).map(({ spec_json: spec, ...task }) => ({ ...task, spec: digestOf(spec) }));
+    return digestOf({
+      candidate: run?.current_candidate_digest ?? null,
+      tasks,
+      executions: this.db.all(`SELECT * FROM task_executions WHERE run_id = ? ORDER BY execution_id`, [runId]),
+      artifacts: this.db.all(
+        `SELECT artifact_id, kind, digest, candidate_snapshot_digest, produced_by, created_at, superseded
+           FROM run_artifacts WHERE run_id = ? ORDER BY artifact_id`,
+        [runId],
+      ),
+      attempts: this.db.all(`SELECT * FROM candidate_pipeline_attempts WHERE run_id = ? ORDER BY attempt_id`, [runId]),
+    });
   }
 
   #transition(
@@ -1725,12 +1809,11 @@ export class RunEngine {
    * - the run's owner pin is its project's PRIMARY_CTO's ACTIVE binding, exactly (session, incarnation,
    *   generation), on a READY session. The pin is only read: ownership never moves, least of all to the
    *   role that was held;
-   * - nothing moved under the hold since the pause, measured from its event id: no audit record of the
-   *   run at all after it (deny by default: a decision, an escalation, a repin, a task, target, execution
-   *   or candidate record, another transition), no binding change after it of any other role whose loss
-   *   pauses the run; and, for writers that leave no audit record, no task row, execution, artifact or
-   *   candidate attempt of the run written at or after the pause's time (`>=`: one written in the same
-   *   millisecond keeps the hold, which is the safe side), and none of them RUNNING.
+   * - nothing moved under the hold since the pause: no run-mutating audit record of the run after it by
+   *   event id (`CONTINUITY_HOLD_MUTATING_KINDS`; a refusal or a diagnostic such as OUTBOX_ACK_REJECTED is
+   *   not movement), no binding change after it of any other role whose loss pauses the run, and the
+   *   run's rows unmoved: equal to the digest the pause recorded (`#holdSnapshot`) or, for a legacy pause
+   *   written before the digest existed, none written at or after the pause's time (`#writtenSince`).
    *
    * The release is BLOCKED → ACTIVE under the transition authority, one RUN_TRANSITION, the hold cleared,
    * and the update conditional on the state, hold, reason and pin it read. Nothing is dispatched: the run is
@@ -1780,26 +1863,26 @@ export class RunEngine {
       }
       if (!owner.ready) return kept("the run's owner session is not READY");
       const recorded = this.db.get<{ kind: string }>(
-        `SELECT kind FROM audit_events WHERE run_id = ? AND event_id > ? ORDER BY event_id LIMIT 1`,
-        [runId, pause.event_id],
+        `SELECT kind FROM audit_events
+          WHERE run_id = ? AND event_id > ?
+            AND kind IN (${CONTINUITY_HOLD_MUTATING_KINDS.map(() => "?").join(", ")})
+          ORDER BY event_id LIMIT 1`,
+        [runId, pause.event_id, ...CONTINUITY_HOLD_MUTATING_KINDS],
       );
       if (recorded) return kept(`${recorded.kind} was recorded for the run after continuity's pause`);
-      const at = pause.at;
-      const touched = this.db.get<{ what: string }>(
-        `SELECT 'a task' AS what FROM tasks WHERE run_id = ? AND updated_at >= ?
-         UNION ALL
-         SELECT 'a task execution' FROM task_executions
-          WHERE run_id = ? AND (status = 'RUNNING' OR started_at >= ? OR ended_at >= ? OR last_activity_at >= ?
-                                OR worker_process_released_at >= ?)
-         UNION ALL
-         SELECT 'an artifact' FROM run_artifacts WHERE run_id = ? AND created_at >= ?
-         UNION ALL
-         SELECT 'a candidate pipeline attempt' FROM candidate_pipeline_attempts
-          WHERE run_id = ? AND (state = 'RUNNING' OR started_at >= ? OR released_at >= ?)
-         LIMIT 1`,
-        [runId, at, runId, at, at, at, at, runId, at, runId, at, at],
-      );
-      if (touched) return kept(`${touched.what} of the run was written at or after continuity's pause`);
+      // A pause written since S-HOLD carries the rows' digest: unmoved means equal, whatever the clock read.
+      const atPause = auditEvidence(pause.evidence_json)?.[HOLD_SNAPSHOT_FIELD];
+      if (typeof atPause === "string") {
+        if (atPause !== this.#holdSnapshot(runId)) {
+          return kept("the run's tasks, executions, artifacts or candidate attempts changed under the hold");
+        }
+      } else {
+        // A legacy pause, written before the digest existed (the live run_ab77268b's, 04:09:28Z): no row of
+        // the run may be written at or after the pause's time, or be RUNNING. A row of the pause's own
+        // millisecond keeps the hold, the safe side.
+        const touched = this.#writtenSince(runId, pause.at);
+        if (touched) return kept(`${touched} of the run was written at or after continuity's pause`);
+      }
       const rebound = this.db.all<{ role_key: string | null }>(
         `SELECT role_key FROM audit_events
           WHERE event_id > ? AND role_key IS NOT NULL AND role_key <> ?
@@ -1850,6 +1933,28 @@ export class RunEngine {
       }
       return allow(ReasonCode.OK, { run: this.require(runId), released: true, kept: null });
     });
+  }
+
+  /**
+   * S-HOLD — for a legacy pause with no snapshot: which row of the run, if any, was written at or after
+   * `at` (`>=`, so one of the pause's own millisecond counts) or is RUNNING.
+   */
+  #writtenSince(runId: string, at: string): string | null {
+    const touched = this.db.get<{ what: string }>(
+      `SELECT 'a task' AS what FROM tasks WHERE run_id = ? AND updated_at >= ?
+       UNION ALL
+       SELECT 'a task execution' FROM task_executions
+        WHERE run_id = ? AND (status = 'RUNNING' OR started_at >= ? OR ended_at >= ? OR last_activity_at >= ?
+                              OR worker_process_released_at >= ?)
+       UNION ALL
+       SELECT 'an artifact' FROM run_artifacts WHERE run_id = ? AND created_at >= ?
+       UNION ALL
+       SELECT 'a candidate pipeline attempt' FROM candidate_pipeline_attempts
+        WHERE run_id = ? AND (state = 'RUNNING' OR started_at >= ? OR released_at >= ?)
+       LIMIT 1`,
+      [runId, at, runId, at, at, at, at, runId, at, runId, at, at],
+    );
+    return touched?.what ?? null;
   }
 
   /**
