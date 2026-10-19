@@ -24,6 +24,7 @@ import {
 } from "../../src/runtime/provisioned-session-runtime.ts";
 import { type BootstrapRuntimeFixture, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { drivenPrimary } from "../helpers/driven-primary-cto.ts";
+import { planCarrying, stricter } from "../helpers/contract-change.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask } from "../helpers/harness.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
@@ -74,15 +75,48 @@ const contractFor = (branch: string) => ({
   references: [`work branch: ${branch}`],
 });
 
-const STANDARD_DIRECTIVE = "For a run whose contract_get returned no bootstrapPlanGuide";
+/** The STANDARD_WORK directive's opening, which names the runs it is for (CEO 07b5b0df). */
+const STANDARD_DIRECTIVE = "For a STANDARD_WORK run (contract_get's run.kind), a missing bootstrapPlanGuide is no reason to stop";
+/**
+ * The opening the directive had at d848191b and before, for every run with no bootstrapPlanGuide. The
+ * stand-in reads it as that prompt states it, so a tree that still says it shows what that prompt does.
+ */
+const GENERIC_DIRECTIVE = "For a run whose contract_get returned no bootstrapPlanGuide";
 const CONTINUATION_LINE = 'A wake for "standard work continuation: run <runId> has READY task <taskId> with no worker"';
 const CONTINUATION_KIND = /standard work continuation: run (\S+) has READY task (\S+) with (?:no worker|a provisioned worker and no execution)/;
-/** What the directive says a turn goes by: the run's record, read through contract_get. */
-const RECORD_DIRECTIVE = "its tasks list each task's taskId, state, spec, worker and executions, and they are the record to go by";
-/** What the directive says a claim takes: the write target the task's spec declared. */
-const WRITE_TARGET_DIRECTIVE = "exactly as its spec's writeTarget names it";
-/** What the directive says a PLAN gives each task. */
-const PLAN_WRITE_TARGET_DIRECTIVE = "give each task's spec a writeTarget";
+
+/**
+ * The directive's clauses, word for word as the prompt states them. The stand-in model acts on a
+ * clause only when the turn's prompt carries it, and on nothing else: no step of its own (CEO 07b5b0df).
+ */
+const CLAUSE = {
+  /** The run's record, read through contract_get, is what every step goes by. */
+  record: "its tasks list each task's taskId, state, spec, worker and executions, and they are the record to go by",
+  /** Which tasks are taken: every one, whatever its state. */
+  everyTask: "Then take every task of the run, whatever its state, in turn.",
+  /** A task's existing execution is read first, by its id. */
+  readNewest: "First, if the task has executions, read its newest execution with mcp__acp-cto__task_execution_get by that executionId",
+  /** A RUNNING execution is read until it settles. */
+  untilSettled: "while that execution is RUNNING, read it again until it is not",
+  /** A SUCCEEDED execution leaves its task done. */
+  succeededDone: "an execution that SUCCEEDED leaves its task done",
+  /** Anything else, or an unreadable one, is escalated. */
+  failedEscalate: "an execution that did not succeed, or one you cannot read, is reported for that run with mcp__acp-cto__escalation_open",
+  /** Only a READY task with no execution gets a first execution. */
+  firstExecution: "Only a READY task with no execution gets a first execution",
+  reuseWorker: "reuse its worker if it has one and never provision another",
+  inactiveWorker: "a worker whose state is not ACTIVE is reported with mcp__acp-cto__escalation_open",
+  provision: "otherwise staff it with mcp__acp-cto__task_worker_provision",
+  claim: "exactly as its spec's writeTarget names it",
+  missingTarget: "when the spec names no writeTarget, report it with mcp__acp-cto__escalation_open",
+  run: "start that first execution with mcp__acp-cto__task_worker_run",
+  readReturned: "read the execution it returns as above",
+  leaveOthers: "A task with no execution that is not READY is left as it is.",
+  result: "Once every task of the run has SUCCEEDED, submit the run's result with mcp__acp-cto__result_submit",
+  refusal: "A refused provision, claim or task_worker_run is reported for that run with mcp__acp-cto__escalation_open",
+  /** What a PLAN gives each task. */
+  planWriteTarget: "give each task's spec a writeTarget",
+} as const;
 
 /** One counter for every owner: an MCP idempotency key is reserved for whichever peer used it first. */
 let keys = 0;
@@ -106,26 +140,22 @@ interface RecordTask {
 
 /**
  * A scripted stand-in for the driven PRIMARY_CTO's model, acting only through the acp-cto tools with
- * the credential its relay took for the turn, and doing only what its prompt says:
+ * the credential its relay took for the turn, and doing only what its prompt literally says (CEO
+ * 07b5b0df): it keeps no task, worker or execution id across turns, and each step below happens only
+ * when the turn's prompt carries the clause (`CLAUSE`) that states it. What the prompt does not
+ * state, it does not do.
  *
- * - a RUN_DISPATCH it holds no PLAN for: `contract_get`, then one `plan_submit` with one docs task,
- *   whose spec carries the writeTarget the prompt asks for (the repository contract_get returned, the
- *   work branch the contract names, README.md);
- * - `onDispatch: "follow-prompt"` then carries the run past its PLAN when, and only when, the prompt
- *   carries the directive for a run with no bootstrapPlanGuide; `"plan-only"` does not (the stall
- *   observed live on run_ab77268b); `"plan-no-ack"` does not either, and leaves the RUN_DISPATCH
- *   unacknowledged;
+ * - A RUN_DISPATCH it holds no PLAN for: `contract_get`, then one `plan_submit` with one docs task,
+ *   whose spec carries a writeTarget when the prompt asks for one (the repository contract_get
+ *   returned, the work branch the contract names, README.md); a CONTRACT_CHANGE run's PLAN carries a
+ *   stricter manifest, as that run's contract requires. Then, when `onDispatch` is
+ *   `"follow-prompt"`, it carries the run if the prompt's directive is for that run: the
+ *   STANDARD_WORK directive for a STANDARD_WORK run, or the generic one d848191b had for any run with
+ *   no bootstrapPlanGuide. `"plan-only"` carries nothing (the stall observed live on run_ab77268b);
+ *   `"plan-no-ack"` leaves the RUN_DISPATCH unacknowledged as well.
  * - `onContinuation: "follow-prompt"` carries the run a continuation wake names when the prompt
- *   carries that wake's line; `"ignore"` answers such a wake with no tool call at all;
- * - every row it read is acknowledged with `run_ack` last.
- *
- * Carrying a run means what the directive says, and only when it says it: read the run's record
- * through contract_get (never this conversation's memory, which the stand-in keeps none of); for each
- * READY, RUNNING or FAILED task, read an existing execution by its id until it settles, reuse an
- * existing worker, staff a task with neither, claim the write target its spec declared with the
- * registered checkout as its worktree, start its first execution and read it until it settles; then
- * submit the result once every task SUCCEEDED. Anything else (an outcome that is not SUCCEEDED, a
- * refused provision, claim or run, a spec with no writeTarget) is escalated, never retried.
+ *   carries that wake's line; `"ignore"` answers such a wake with no tool call at all.
+ * - Every row it read is acknowledged with `run_ack` last.
  */
 const scriptStandardOwner = (
   f: BootstrapRuntimeFixture,
@@ -167,9 +197,12 @@ const scriptStandardOwner = (
       return answer;
     };
     const lines = request.prompt.split("\n");
-    const directive = lines.find((line) => line.startsWith(STANDARD_DIRECTIVE)) ?? null;
+    const directive = lines.find((line) => line.startsWith(STANDARD_DIRECTIVE) || line.startsWith(GENERIC_DIRECTIVE)) ?? null;
+    /** Whether the directive is for a run of this kind, as its opening words say. */
+    const directiveFor = (kind: string | undefined): boolean =>
+      directive !== null && (directive.startsWith(GENERIC_DIRECTIVE) || kind === RunKind.STANDARD_WORK);
+    const says = (clause: string): boolean => directive !== null && directive.includes(clause);
     const provider = directive === null ? null : /provider "([^"]+)"/.exec(directive)?.[1] ?? null;
-    const recordDriven = directive !== null && directive.includes(RECORD_DIRECTIVE) && directive.includes(WRITE_TARGET_DIRECTIVE);
 
     const readContract = async (runId: string): Promise<Record<string, unknown> | undefined> =>
       (await call("contract_get", runId, null, { runId }))["value"] as Record<string, unknown> | undefined;
@@ -178,61 +211,100 @@ const scriptStandardOwner = (
         idempotencyKey: `std-owner-${++keys}`, runId, question,
         options: ["investigate"], ctoRecommendation: "investigate", whyItMatters: "the run cannot complete", blocksCriticalPath: true,
       });
-    /** Reads one execution by its id until it is no longer RUNNING; its final state, or null when unreadable. */
-    const settle = async (runId: string, taskId: string, executionId: string): Promise<string | null> => {
-      for (let read = 0; read < 500; read += 1) {
+    /**
+     * One execution, read as the directive says: once by its id, again while it is RUNNING when the
+     * directive says so; then done if it SUCCEEDED, escalated if not or if unreadable. "stop" when the
+     * directive says nothing that covers what was read.
+     */
+    const readAsSaid = async (runId: string, taskId: string, executionId: string): Promise<"done" | "escalated" | "stop"> => {
+      const readOnce = async (): Promise<string | null> => {
         const answer = await call("task_execution_get", runId, taskId, { runId, executionId });
-        if (answer["ok"] !== true) return null;
-        const state = (answer["value"] as { execution: { status: string } }).execution.status;
-        if (state !== "RUNNING") return state;
+        return answer["ok"] === true ? (answer["value"] as { execution: { status: string } }).execution.status : null;
+      };
+      let state = await readOnce();
+      // A bounded wait: the harness's own guard, never reached by a row that settles.
+      for (let again = 0; state === "RUNNING" && says(CLAUSE.untilSettled) && again < 500; again += 1) {
         await new Promise((resolve) => setTimeout(resolve, 10));
+        state = await readOnce();
       }
-      return null;
+      if (state === "SUCCEEDED" && says(CLAUSE.succeededDone)) return "done";
+      if (state !== "SUCCEEDED" && state !== "RUNNING" && says(CLAUSE.failedEscalate)) {
+        await escalate(runId, taskId, `the task's execution ended ${state ?? "unreadable"}`);
+        return "escalated";
+      }
+      return "stop";
     };
 
-    /** The directive's steps for one run, from the run's record alone. */
+    /** The directive's steps for one run, from the run's record alone and as far as its clauses go. */
     const carry = async (runId: string): Promise<void> => {
-      if (!recordDriven || provider === null) return;
+      if (!says(CLAUSE.record)) return;
       const contract = await readContract(runId);
+      if (!says(CLAUSE.everyTask)) return;
       const repositories = (contract?.["repositories"] as Array<{ identity: string; checkoutPath: string }> | undefined) ?? [];
       const tasks = (contract?.["tasks"] as RecordTask[] | undefined) ?? [];
       if (tasks.length === 0) return;
+      const done = new Set<string>();
       for (const task of tasks) {
-        if (task.state === "SUCCEEDED") continue;
-        if (!["READY", "RUNNING", "FAILED"].includes(task.state)) return;
-        const existing = task.executions.at(-1);
-        if (existing) {
-          const state = await settle(runId, task.taskId, existing.executionId);
-          if (state !== "SUCCEEDED") return void (await escalate(runId, task.taskId, `the task's execution ended ${state ?? "unreadable"}`));
+        const newest = task.executions.at(-1);
+        if (newest) {
+          if (!says(CLAUSE.readNewest)) return;
+          if ((await readAsSaid(runId, task.taskId, newest.executionId)) !== "done") return;
+          done.add(task.taskId);
           continue;
         }
-        if (task.worker !== null && task.worker.state !== "ACTIVE") {
-          return void (await escalate(runId, task.taskId, "the task's worker is no longer ACTIVE"));
+        if (task.state !== "READY") {
+          if (says(CLAUSE.leaveOthers)) continue;
+          return;
         }
-        if (task.worker === null) {
+        if (!says(CLAUSE.firstExecution)) return;
+        if (task.worker !== null) {
+          if (task.worker.state !== "ACTIVE") {
+            if (says(CLAUSE.inactiveWorker)) await escalate(runId, task.taskId, "the task's worker is no longer ACTIVE");
+            return;
+          }
+          if (!says(CLAUSE.reuseWorker)) return;
+        } else {
+          if (!says(CLAUSE.provision) || provider === null) return;
           const provisioned = await call("task_worker_provision", runId, task.taskId, {
             idempotencyKey: `std-owner-${++keys}`, runId, taskId: task.taskId, provider,
           });
-          if (provisioned["ok"] !== true) return void (await escalate(runId, task.taskId, "task_worker_provision was refused"));
+          if (provisioned["ok"] !== true) {
+            if (says(CLAUSE.refusal)) await escalate(runId, task.taskId, "task_worker_provision was refused");
+            return;
+          }
         }
+        if (!says(CLAUSE.claim)) return;
         const target = task.spec.writeTarget;
         const repository = target && repositories.find((candidate) => candidate.identity === target.repositoryIdentity);
-        if (!target || !repository) return void (await escalate(runId, task.taskId, "the task's spec names no writeTarget"));
+        if (!target || !repository) {
+          if (says(CLAUSE.missingTarget)) await escalate(runId, task.taskId, "the task's spec names no writeTarget");
+          return;
+        }
         const claimed = await call("resource_claim", runId, task.taskId, {
           idempotencyKey: `std-owner-${++keys}`, runId, repositoryIdentity: target.repositoryIdentity,
           branch: target.branch, worktreeId: repository.checkoutPath, declaredPaths: target.paths,
         });
-        if (claimed["ok"] !== true) return void (await escalate(runId, task.taskId, "resource_claim was refused"));
+        if (claimed["ok"] !== true) {
+          if (says(CLAUSE.refusal)) await escalate(runId, task.taskId, "resource_claim was refused");
+          return;
+        }
+        if (!says(CLAUSE.run)) return;
         const claimId = (claimed["value"] as { claims: Array<{ claimId: string; worktreeId: string | null }> }).claims
           .find((claim) => claim.worktreeId !== null)!.claimId;
         const ran = await call("task_worker_run", runId, task.taskId, { idempotencyKey: `std-owner-${++keys}`, runId, taskId: task.taskId, claimId });
-        if (ran["ok"] !== true) return void (await escalate(runId, task.taskId, `task_worker_run was refused: ${String(ran["reasonCode"])}`));
-        const state = await settle(runId, task.taskId, (ran["value"] as { executionId: string }).executionId);
-        if (state !== "SUCCEEDED") return void (await escalate(runId, task.taskId, `the task's execution ended ${state ?? "unreadable"}`));
+        if (ran["ok"] !== true) {
+          if (says(CLAUSE.refusal)) await escalate(runId, task.taskId, `task_worker_run was refused: ${String(ran["reasonCode"])}`);
+          return;
+        }
+        if (!says(CLAUSE.readReturned)) return;
+        if ((await readAsSaid(runId, task.taskId, (ran["value"] as { executionId: string }).executionId)) !== "done") return;
+        done.add(task.taskId);
       }
-      await call("result_submit", runId, null, {
-        idempotencyKey: `std-owner-${++keys}`, runId, resultSummary: "README.md updated", recommendation: "merge",
-      });
+      if (says(CLAUSE.result) && tasks.every((task) => done.has(task.taskId))) {
+        await call("result_submit", runId, null, {
+          idempotencyKey: `std-owner-${++keys}`, runId, resultSummary: "README.md updated", recommendation: "merge",
+        });
+      }
     };
 
     const woke = CONTINUATION_KIND.exec(lines.find((line) => line.startsWith("The control plane woke you for:")) ?? "");
@@ -248,23 +320,27 @@ const scriptStandardOwner = (
         const runId = message.runId;
         const contract = await readContract(runId);
         const guided = Boolean(contract?.["bootstrapPlanGuide"]);
+        const kind = (contract?.["run"] as { kind?: string } | undefined)?.kind;
         // The write target the prompt asks a PLAN to declare: the repository contract_get returned and
         // the work branch the run's contract names.
         const repository = (contract?.["repositories"] as Array<{ identity: string }> | undefined)?.[0];
         const references = ((contract?.["contract"] as { references?: string[] } | null)?.references ?? []).join("\n");
         const branch = /work branch: (\S+)/.exec(references)?.[1];
-        const spec = directive?.includes(PLAN_WRITE_TARGET_DIRECTIVE) && repository && branch
+        const spec = says(CLAUSE.planWriteTarget) && directiveFor(kind) && repository && branch
           ? { writeTarget: { repositoryIdentity: repository.identity, branch, paths: ["README.md"] } }
           : {};
+        const plan = kind === RunKind.CONTRACT_CHANGE
+          ? planCarrying(stricter(f.harness.cp.projects.manifest(contract!["pinnedManifestDigest"] as string)!))
+          : { summary: "one README.md change by one worker" };
         const submitted = await call("plan_submit", runId, null, {
           idempotencyKey: `std-owner-${++keys}`,
           runId,
-          plan: { summary: "one README.md change by one worker" },
+          plan,
           tasks: [{ key: "readme", title: "update README.md", category: "docs", spec }],
         });
         if (submitted["ok"] === true) {
           planned.add(runId);
-          if (!guided && options.onDispatch === "follow-prompt") await carry(runId);
+          if (!guided && options.onDispatch === "follow-prompt" && directiveFor(kind)) await carry(runId);
         }
       }
       if (message.runId && options.onDispatch === "plan-no-ack") continue;
@@ -322,6 +398,7 @@ const dispatchedStandard = async (
   projectId: string,
   options: Parameters<typeof scriptStandardOwner>[2],
   branch: string = WORK_BRANCH,
+  kind: RunKind = RunKind.STANDARD_WORK,
 ) => {
   const cp = f.harness.cp;
   const { bootstrap, binding } = await drivenPrimary(f, projectId);
@@ -329,7 +406,7 @@ const dispatchedStandard = async (
   const owner = scriptStandardOwner(f, binding.sessionId, options);
   const created = cp.runs.create({
     projectId,
-    kind: RunKind.STANDARD_WORK,
+    kind,
     executionMode: ExecutionMode.SIMPLE,
     contract: contractFor(branch),
     repositories: [{ repositoryId: repository.repository_id, repositoryRole: "primary", baseBranch: "dev" }],
@@ -478,23 +555,33 @@ describe("witness 1 — the driven work prompt carries a STANDARD_WORK run past 
       const directive = owner.prompts.at(-1)!.split("\n").find((line) => line.startsWith(STANDARD_DIRECTIVE))!;
       expect(directive).toContain("a missing bootstrapPlanGuide is no reason to stop");
       expect(directive).toContain("before you acknowledge its RUN_DISPATCH");
+      // Updated for CEO 07b5b0df (R1-01, R2-01): the directive is for STANDARD_WORK runs, takes every
+      // task whatever its state, reads an existing execution by its id first and until it settles, and
+      // gives a first execution only to a READY task with none. Each clause the stand-in acts on is here,
+      // word for word, in the order a task meets it.
       const order = [
-        "mcp__acp-cto__task_worker_provision",
-        "mcp__acp-cto__resource_claim",
-        "mcp__acp-cto__task_worker_run",
-        "until that execution is no longer RUNNING",
-        "mcp__acp-cto__result_submit",
-      ].map((step) => directive.indexOf(step));
+        CLAUSE.record,
+        CLAUSE.everyTask,
+        CLAUSE.readNewest,
+        CLAUSE.untilSettled,
+        CLAUSE.succeededDone,
+        CLAUSE.failedEscalate,
+        CLAUSE.firstExecution,
+        CLAUSE.reuseWorker,
+        CLAUSE.inactiveWorker,
+        CLAUSE.provision,
+        CLAUSE.claim,
+        CLAUSE.missingTarget,
+        CLAUSE.run,
+        CLAUSE.readReturned,
+        CLAUSE.leaveOthers,
+        CLAUSE.result,
+        CLAUSE.refusal,
+        CLAUSE.planWriteTarget,
+      ].map((clause) => directive.indexOf(clause));
       expect(order.every((at) => at >= 0)).toBe(true);
       expect([...order].sort((a, b) => a - b)).toEqual(order);
-      // Re-entry reads the run's record before it staffs; nothing is staffed or run twice; uncertainty is
-      // escalated, never retried. Updated for CEO e64aa10b (R1-01): the record is contract_get's tasks,
-      // and an existing worker is reused rather than read with task_execution_get.
-      expect(directive.indexOf(RECORD_DIRECTIVE)).toBeLessThan(order[0]!);
-      expect(directive.indexOf("if it has an execution, read that execution with mcp__acp-cto__task_execution_get by its executionId")).toBeLessThan(order[0]!);
-      expect(directive.indexOf("if it has a worker, reuse that worker and never provision another")).toBeLessThan(order[0]!);
       expect(directive).toContain("never run an execution again or retry one on your own");
-      expect(directive).toContain("are reported for that run with mcp__acp-cto__escalation_open");
       expect(directive).toContain("staffing no more workers at once than its contract allows");
       expect(directive).toContain('provider "claude" with no model');
       expect(directive).toContain("result_submit runs the blind review itself");
@@ -915,6 +1002,148 @@ describe("review r1 probe 3, kept as written", () => {
       await vi.waitFor(() => expect(cp.sessionRuntime.turnInProgress(sessionId)).toBe(false));
       expect(f.finishedTurns(sessionId)).toBe(turns);
       expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
+    });
+  });
+});
+
+/** The prompt c65e73b2 wrote for a driven dispatch turn, after its first line, frozen from that tree's own output. */
+const C65E73B2_DISPATCH_PROMPT_TAIL: readonly string[] = [
+  "The control plane woke you for: in-band dispatch.",
+  "Your only interface is the acp-cto tools. Call mcp__acp-cto__role_dispatch_pending to read the messages addressed to you.",
+  "Act on each message as its kind requires, using the acp-cto tools, and acknowledge each one with mcp__acp-cto__run_ack (or mcp__acp-cto__role_dispatch_ack when it names no run).",
+  "A RUN_DISPATCH for a run you own and have not yet submitted a PLAN for means: read mcp__acp-cto__contract_get for that run; write a PLAN that satisfies its contract, following the bootstrapPlanGuide it returns when there is one; submit the PLAN with mcp__acp-cto__plan_submit, using a new idempotencyKey for every call; if plan_submit refuses it, correct the PLAN from the refusal's evidence and submit it again, at most 4 plan_submit calls for that run in this turn; then acknowledge the RUN_DISPATCH with mcp__acp-cto__run_ack.",
+  "For a run whose contract_get returned a bootstrapPlanGuide, once its PLAN is accepted and the run is ACTIVE, unless that PLAN's result was already submitted, and before you acknowledge its RUN_DISPATCH: submit the result of its current PLAN with mcp__acp-cto__result_submit, its resultSummary and recommendation taken from that PLAN and a new idempotencyKey; result_submit runs the blind review itself and answers when it is done. Do not provision a worker or submit a task receipt for that run: its task is settled by the control plane at CEO CONFIRM.",
+  "A REVISION_REQUEST for a run whose contract_get returned a bootstrapPlanGuide carries why its PLAN was sent back (the CEO's rationale, or the blind review's findings): for that run, read mcp__acp-cto__contract_get for that run; write a PLAN that satisfies its contract, following the bootstrapPlanGuide it returns when there is one; submit the PLAN with mcp__acp-cto__plan_submit, using a new idempotencyKey for every call; if plan_submit refuses it, correct the PLAN from the refusal's evidence and submit it again, at most 4 plan_submit calls for that run in this turn, writing the new PLAN so that it addresses that reason; then acknowledge the REVISION_REQUEST with mcp__acp-cto__run_ack. If the run is ACTIVE, submit the new PLAN's result first, as above; a run the CEO sent back is ACTIVE again with its next RUN_DISPATCH.",
+  "An ESCALATION_REPLY is the CEO's resolution of the escalation it names (its escalationId) for a run you are the current owner of: act on it only when it is addressed to you as that run's current owner and names that run's escalation, and then only for that run. Carry out its resolution, for example by planning that run again or submitting its result again as the lines above direct, then acknowledge the ESCALATION_REPLY with mcp__acp-cto__run_ack. The resolution never bypasses T3, the blind review or the CEO's CONFIRM: a new PLAN still goes through mcp__acp-cto__plan_submit and a result through mcp__acp-cto__result_submit, each with its normal gates. If carrying out the resolution fails or is refused, do not acknowledge it: report the refusal or failure for that run with mcp__acp-cto__escalation_open instead.",
+  "A HANDOFF_PACKAGE is accepted with mcp__acp-cto__handoff_ack for its handoffId before it is acknowledged.",
+  "When nothing addressed to you remains, reply with a one-line summary of what you did.",
+];
+
+/** The driven RUN_DISPATCH prompt c65e73b2 wrote for this holder: its first line, then the frozen rest. */
+const c65e73b2DispatchPrompt = (firstLine: string): string => [firstLine, ...C65E73B2_DISPATCH_PROMPT_TAIL].join("\n");
+
+/** Re-enters the owner as a continuation's wake would: the turn carries that wake's line, and the stand-in remembers no id. */
+const reenter = async (f: BootstrapRuntimeFixture, run: { runId: string; roleKey: string; sessionId: string; taskId: string }, id: string) => {
+  const turns = f.finishedTurns(run.sessionId);
+  expect(f.harness.cp.sessionRuntime.wake(run.roleKey, [{ id, kind: standardWorkContinuationTriggerKind(run.runId, run.taskId) }]).allowed).toBe(true);
+  return turns;
+};
+
+describe("R1-01, CEO 07b5b0df — re-entry takes every task by its execution's state, from the record alone", () => {
+  type Case = {
+    /** What the record holds for the run's one task when the owner re-enters. */
+    state: "RUNNING" | "SUCCEEDED" | "FAILED" | "TIMEOUT" | "ABANDONED";
+    /** The clauses of the prompt the case rests on, asserted word for word before the behaviour. */
+    clauses: string[];
+    tools: string[];
+    result: boolean;
+  };
+  const cases: Case[] = [
+    { state: "RUNNING", clauses: [CLAUSE.everyTask, CLAUSE.readNewest, CLAUSE.untilSettled, CLAUSE.succeededDone, CLAUSE.result],
+      tools: ["contract_get", "task_execution_get", "result_submit"], result: true },
+    { state: "SUCCEEDED", clauses: [CLAUSE.everyTask, CLAUSE.readNewest, CLAUSE.succeededDone, CLAUSE.result],
+      tools: ["contract_get", "task_execution_get", "result_submit"], result: true },
+    { state: "FAILED", clauses: [CLAUSE.everyTask, CLAUSE.readNewest, CLAUSE.failedEscalate],
+      tools: ["contract_get", "task_execution_get", "escalation_open"], result: false },
+    { state: "TIMEOUT", clauses: [CLAUSE.everyTask, CLAUSE.readNewest, CLAUSE.failedEscalate],
+      tools: ["contract_get", "task_execution_get", "escalation_open"], result: false },
+    { state: "ABANDONED", clauses: [CLAUSE.everyTask, CLAUSE.readNewest, CLAUSE.failedEscalate],
+      tools: ["contract_get", "task_execution_get", "escalation_open"], result: false },
+  ];
+  it.each(cases)("an execution $state when the owner re-enters, its id kept nowhere but the record: read by that id; $tools", async ({ state, clauses, tools, result }) => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const submit = vi.spyOn(cp.pipeline, "submitResult").mockResolvedValue(
+        allow(ReasonCode.OK, { stage: "STAND_IN" }) as unknown as Awaited<ReturnType<typeof cp.pipeline.submitResult>>,
+      );
+      const real = realWorkerRuntime(f);
+      const run = await stalledAfterPlan(f, `std-state-${state.toLowerCase()}`, "follow-prompt");
+      const { owner, runId, sessionId, taskId } = run;
+      const worker = bindRunWorker(f, runId, taskId);
+      const opened = cp.tasks.startExecution({ runId, taskId, ownerBindingGeneration: 1, workerSessionId: worker.sessionId, provider: "claude", model: "opus" });
+      if (!opened.allowed) throw new Error(opened.message);
+      if (state !== "RUNNING") {
+        const outcome = state === "SUCCEEDED"
+          ? { status: "SUCCEEDED" as const, resultDigest: "sha256:settled" }
+          : { status: state, failureClass: "unknown_observed" as const };
+        const closed = cp.tasks.finishExecution(opened.value.executionId, outcome, runId);
+        if (!closed.allowed) throw new Error(closed.message);
+      }
+      const turns = await reenter(f, run, `re-entry-${state}`);
+      if (state === "RUNNING") {
+        // Observed while it runs, then it settles: the owner keeps reading until it has.
+        await vi.waitFor(() => expect(owner.calls.some((call) => call.tool === "task_execution_get" && call.ok)).toBe(true), { timeout: 10_000, interval: 10 });
+        const closed = cp.tasks.finishExecution(opened.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:settled" }, runId);
+        if (!closed.allowed) throw new Error(closed.message);
+      }
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await idle(f, sessionId);
+      expect(toolsOf(owner.calls.slice(3)).map(([tool]) => tool)).toEqual(tools);
+      // The behaviour rests on the prompt's own words: each clause it follows is there, word for word.
+      const directive = owner.prompts.at(-1)!.split("\n").find((line) => line.startsWith(STANDARD_DIRECTIVE)) ?? "";
+      for (const clause of clauses) expect(directive).toContain(clause);
+      expect(owner.calls.filter((call) => call.tool === "task_execution_get").every((call) => call.ok)).toBe(true);
+      // Never run again, never provisioned: the one execution stays the task's only one.
+      expect(real.provision).not.toHaveBeenCalled();
+      expect(real.start).not.toHaveBeenCalled();
+      expect(cp.tasks.executions(runId).map((execution) => execution.executionId)).toEqual([opened.value.executionId]);
+      expect(submit).toHaveBeenCalledTimes(result ? 1 : 0);
+    });
+  });
+
+  it.each([
+    { worker: false, tools: ["contract_get", "task_worker_provision", "resource_claim", "task_worker_run", "task_execution_get", "escalation_open"], provisions: 1 },
+    { worker: true, tools: ["contract_get", "resource_claim", "task_worker_run", "task_execution_get", "escalation_open"], provisions: 0 },
+  ])("a READY task with no execution (worker provisioned before: $worker) gets its first execution on the real runner, staffed only when it has no worker", async ({ worker, tools, provisions }) => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const real = realWorkerRuntime(f);
+      checkoutOn(f, WORK_BRANCH);
+      const run = await stalledAfterPlan(f, `std-first-${String(worker)}`, "follow-prompt");
+      const { owner, runId, sessionId, taskId } = run;
+      if (worker) bindRunWorker(f, runId, taskId);
+      const turns = await reenter(f, run, `first-${String(worker)}`);
+      await f.awaitFinishedTurns(sessionId, turns + 1);
+      await idle(f, sessionId);
+      // The double launches no worker process, so the first execution ends FAILED, and is escalated.
+      expect(toolsOf(owner.calls.slice(3)).map(([tool]) => tool)).toEqual(tools);
+      const directive = owner.prompts.at(-1)!.split("\n").find((line) => line.startsWith(STANDARD_DIRECTIVE)) ?? "";
+      for (const clause of [CLAUSE.everyTask, CLAUSE.firstExecution, worker ? CLAUSE.reuseWorker : CLAUSE.provision, CLAUSE.claim, CLAUSE.run, CLAUSE.readReturned]) {
+        expect(directive).toContain(clause);
+      }
+      expect(real.provision).toHaveBeenCalledTimes(provisions);
+      expect(cp.tasks.executions(runId)).toEqual([expect.objectContaining({ runtimeManaged: true, status: "FAILED" })]);
+    });
+  });
+});
+
+describe("R2-01, CEO 07b5b0df — bootstrap and CONTRACT_CHANGE turns are exactly as at c65e73b2", () => {
+  it("a driven CONTRACT_CHANGE owner's dispatch prompt, and the bootstrap CTO's, are c65e73b2's byte for byte; the CONTRACT_CHANGE owner does what that prompt says and nothing more", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const cp = f.harness.cp;
+      const real = realWorkerRuntime(f);
+      checkoutOn(f, WORK_BRANCH);
+      const { owner, runId, sessionId, bootstrapRunId } = await dispatchedStandard(
+        f, "cc-regress", { onDispatch: "follow-prompt", onContinuation: "ignore" }, WORK_BRANCH, RunKind.CONTRACT_CHANGE,
+      );
+      expect(cp.runs.require(runId).kind).toBe(RunKind.CONTRACT_CHANGE);
+      // What c65e73b2's prompt says, and nothing more: plan, acknowledge. No record read, no worker.
+      expect(owner.calls.filter((call) => call.runId === runId).map((call) => [call.tool, call.ok])).toEqual([
+        ["contract_get", true],
+        ["plan_submit", true],
+        ["run_ack", true],
+      ]);
+      // The CONTRACT_CHANGE run's RUN_DISPATCH turn: c65e73b2's prompt, byte for byte.
+      expect(owner.prompts.at(-1)).toBe(c65e73b2DispatchPrompt("You are the PRIMARY_CTO in the agent control plane, at binding generation 1."));
+      expect(real.provision).not.toHaveBeenCalled();
+      expect(cp.tasks.executions(runId)).toEqual([]);
+      expect(cp.tasks.list(runId).map((task) => task.state)).toEqual([TaskState.READY]);
+      // Its contract_get carries no tasks: that reader is STANDARD_WORK's alone.
+      expect((await f.cto(sessionId, "contract_get", { runId }))["value"]).not.toHaveProperty("tasks");
+      // The project's bootstrap run's BOOTSTRAP_CTO dispatch turn, on the same double: c65e73b2's too.
+      const bootstrapPrompt = f.claude.turns.find((turn) =>
+        turn.relay !== null && turn.prompt.startsWith(`You are the BOOTSTRAP_CTO of run ${bootstrapRunId} `))!.prompt;
+      expect(bootstrapPrompt).toBe(c65e73b2DispatchPrompt(`You are the BOOTSTRAP_CTO of run ${bootstrapRunId} in the agent control plane, at binding generation 1.`));
     });
   });
 });
