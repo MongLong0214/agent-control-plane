@@ -20,7 +20,12 @@ import { lstartSecondStartMs, nativeStartIsInLstartSecond, processStartedAt } fr
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import type { BuzzMentionCounters } from "../buzz/buzz-mention-subscriber.ts";
-import { CONTINUITY_MODE_MAX_AGE_MS, CONTINUITY_PAUSE_OWNER_FIELDS } from "../run/run-engine.ts";
+import {
+  CONTINUITY_MODE_MAX_AGE_MS,
+  CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX,
+  CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON,
+  CONTINUITY_PAUSE_OWNER_FIELDS,
+} from "../run/run-engine.ts";
 import { BOOTSTRAP_PLAN_TASKS } from "../run/task-graph.ts";
 import { TASK_WRITE_TARGET_RECORDED, TaskWriteTargets } from "../run/task-write-target.ts";
 import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
@@ -520,6 +525,14 @@ export interface ContinuityReconcileReport {
   unresolved: Array<{ roleKey: string; reasonCode: ReasonCode }>;
   restored: string[];
   restorationDeferred: Array<{ roleKey: string; reasonCode: string }>;
+  /** S-HOLD — continuity's own BLOCKED holds this pass released, and those it kept, with why. */
+  continuityHolds: ContinuityHoldReleaseReport;
+}
+
+/** S-HOLD — what one reconcile pass did with continuity's BLOCKED holds whose role it found covered. */
+export interface ContinuityHoldReleaseReport {
+  released: string[];
+  kept: Array<{ runId: string; why: string }>;
 }
 
 /** The owners one bootstrap PLAN recovery pass woke (`Daemon.wakeBootstrapPlanRecovery`). */
@@ -1810,6 +1823,8 @@ export class Daemon {
       const reassigned: ContinuityReconcileReport["reassigned"] = [];
       const pausedRuns: ContinuityReconcileReport["pausedRuns"] = [];
       const unresolved: ContinuityReconcileReport["unresolved"] = [];
+      // S-HOLD — the bindings this pass found covering their role, for the hold release after the loop.
+      const covered: RoleBinding[] = [];
 
       for (const required of plan.requiredRoles) {
         const current = this.cp.bindings.active(required.roleKey);
@@ -1886,6 +1901,7 @@ export class Daemon {
         if (currentStillCovered) {
           this.releaseCoverageHold(required.roleKey, current.bindingGeneration, "the incumbent's provider covers the role again");
           this.releaseContinuityReviewHolds(current);
+          covered.push(current);
           continue;
         }
 
@@ -1958,7 +1974,7 @@ export class Daemon {
         );
         if (!failedOver.allowed) {
           unresolved.push({ roleKey: required.roleKey, reasonCode: failedOver.reasonCode });
-          pausedRuns.push(...this.pauseAffectedRuns(required, `failover refused: ${failedOver.reasonCode}`));
+          pausedRuns.push(...this.pauseAffectedRuns(required, `${CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX}${failedOver.reasonCode}`));
           this.revokePausedBinding(required, `${CONTINUITY_FAILOVER_REFUSED_REASON_PREFIX}${failedOver.reasonCode}`);
           continue;
         }
@@ -1975,7 +1991,7 @@ export class Daemon {
           active.bindingGeneration !== failedOver.value.generation
         ) {
           unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.SESSION_NOT_READY });
-          pausedRuns.push(...this.pauseAffectedRuns(required, "failover did not leave a ready planned binding"));
+          pausedRuns.push(...this.pauseAffectedRuns(required, CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON));
           this.revokePausedBinding(required, CONTINUITY_INCOMPLETE_FAILOVER_REVOCATION_REASON);
           continue;
         }
@@ -2020,6 +2036,9 @@ export class Daemon {
       const restoration = restorationNeeded && unresolved.length === 0
         ? await this.cp.continuity.restore()
         : { restored: [], deferred: this.cp.continuity.recordClaimNeeds() };
+      // S-HOLD — after every revocation and restoration of this pass, so the run engine reads the owner
+      // and the held role as the pass leaves them.
+      const continuityHolds = this.releaseContinuityHolds(covered);
 
       this.cp.audit.record({
         kind: "CONTINUITY_RECONCILED",
@@ -2043,6 +2062,7 @@ export class Daemon {
           unresolved,
           restoration,
           restorationPending: plan.restorationPending,
+          continuityHolds,
         },
       });
 
@@ -2060,6 +2080,7 @@ export class Daemon {
         unresolved,
         restored: restoration.restored,
         restorationDeferred: restoration.deferred,
+        continuityHolds,
       };
     } finally {
       this.#continuityReconciling = false;
@@ -2166,6 +2187,27 @@ export class Daemon {
       if (run.ownerRoleKey !== binding.roleKey) continue;
       this.cp.runs.releaseContinuityReviewHold(run.runId, binding);
     }
+  }
+
+  /**
+   * S-HOLD — continuity's own BLOCKED hold on a run, for a role this pass found covered again by its
+   * incumbent (`covered`), is handed back. The run engine decides each run inside its own transaction
+   * (`RunEngine.releaseContinuityHold`): the hold must be continuity's, the owner pin unchanged and
+   * still its PRIMARY_CTO's READY binding, and nothing moved under it; anything else is kept, and why is
+   * recorded in this pass's CONTINUITY_RECONCILED. Nothing is dispatched here: a released STANDARD_WORK
+   * run is advanced, or not, by the existing continuation wake (#1158) and its once-marker.
+   */
+  private releaseContinuityHolds(covered: readonly RoleBinding[]): ContinuityHoldReleaseReport {
+    const report: ContinuityHoldReleaseReport = { released: [], kept: [] };
+    if (covered.length === 0) return report;
+    for (const run of this.cp.runs.list({ state: RunState.BLOCKED })) {
+      const held = covered.find((binding) => binding.roleKey === run.continuityHoldRoleKey);
+      if (!held) continue;
+      const released = this.cp.runs.releaseContinuityHold(run.runId, held);
+      if (released.allowed && released.value.released) report.released.push(run.runId);
+      else report.kept.push({ runId: run.runId, why: released.allowed ? released.value.kept ?? "" : released.reasonCode });
+    }
+    return report;
   }
 
   /**

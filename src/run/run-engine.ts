@@ -250,6 +250,38 @@ const recordedPauseOwner = (evidence: Record<string, unknown>): Omit<ContinuityO
   return { sessionId, incarnation, generation };
 };
 
+/**
+ * S-HOLD — the reasons `Daemon.pauseAffectedRuns` pauses an ACTIVE run with that are not themselves a
+ * continuity revocation reason: a refused failover (`failover refused: <reasonCode>`) and a failover
+ * that left no ready planned binding. Every other pause reason is one of continuity's revocation reasons.
+ */
+export const CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX = "failover refused: ";
+export const CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON = "failover did not leave a ready planned binding";
+
+const isContinuityPauseReason = (reason: unknown): reason is string =>
+  typeof reason === "string" &&
+  (isContinuityRevocationReason(reason) ||
+    reason.startsWith(CONTINUITY_PAUSE_FAILOVER_REFUSED_PREFIX) ||
+    reason === CONTINUITY_PAUSE_INCOMPLETE_FAILOVER_REASON);
+
+/**
+ * S-HOLD — what, written for a run after continuity paused it, means something moved under the hold: a
+ * candidate, a decision or escalation, an owner repin, or its tasks and their executions.
+ */
+const CONTINUITY_HOLD_MOVED_KINDS = [
+  "CANDIDATE_FROZEN", "CANDIDATE_PROMOTED", "CANDIDATE_INVALIDATED",
+  "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED", "CEO_DECISION", "OWNER_DECISION", "CTO_ESCALATION",
+  "RUN_OWNER_RENEWED", "RECOVERY_TAKEOVER", "TASK_GRAPH_SUBMITTED", "TASK_GRAPH_CANCELLED",
+  "TASK_EXECUTION_STARTED", "TASK_EXECUTION_FINISHED", "TASK_EXECUTIONS_ABANDONED_FOR_TAKEOVER",
+  "TASK_EXECUTION_LATE_RESULT_IGNORED",
+] as const;
+
+/** S-HOLD — a binding change of a role whose loss pauses the run, other than the held role's own. */
+const CONTINUITY_HOLD_BINDING_KINDS = [
+  "BINDING_CREATED", "BINDING_RENEWED", "BINDING_REVOKED", "BINDING_SWITCHED", "BINDING_RUNTIME_MOVED",
+  "CONTINUITY_REVOKE_DEFERRED", "RECOVERY_TAKEOVER",
+] as const;
+
 /** An audit row's evidence as a plain object, or null when it is not one. */
 const auditEvidence = (json: string): Record<string, unknown> | null => {
   try {
@@ -1674,6 +1706,180 @@ export class RunEngine {
       }, { generation: binding.bindingGeneration });
       return allow(ReasonCode.OK, { run: this.require(runId), released: true });
     });
+  }
+
+  /**
+   * S-HOLD — continuity's own BLOCKED hold on a STANDARD_WORK run, handed back once the role it held the
+   * run for is covered again by `held`. Before this, the only doors out of that hold were a bootstrap
+   * CTO's recovery and the review-wait release, so one CEO session restart left every ACTIVE STANDARD_WORK
+   * run BLOCKED for good (#512, run_ab77268b).
+   *
+   * Read and decided inside this one transaction, and released only when every one of these holds;
+   * otherwise nothing is written and `kept` says why:
+   *
+   * - the run is a STANDARD_WORK run, BLOCKED, with `continuity_hold_role_key` = `held.roleKey`, which
+   *   only `pauseForContinuity` writes and every other edge clears;
+   * - its latest RUN_TRANSITION is that pause: ACTIVE → BLOCKED, continuityAction PAUSE_NEW_WORK, its
+   *   reason the run's state reason and one continuity pauses with. A run BLOCKED for anything else (a
+   *   CEO decision, a human gate) has neither, and is never released here;
+   * - `held` is still its role's ACTIVE binding (assignment and generation) and its runtime is READY on
+   *   its current incarnation; the old session the pause lost is never asked for;
+   * - the run's owner pin is its project's PRIMARY_CTO's ACTIVE binding, exactly (session, incarnation,
+   *   generation), on a READY session. The pin is only read: ownership never moves, least of all to the
+   *   role that was held;
+   * - nothing moved under the hold since the pause: no candidate, decision, escalation, owner repin, task
+   *   or execution record of the run, no task row updated after it, and no binding change of any other
+   *   role whose loss pauses the run.
+   *
+   * The release is BLOCKED → ACTIVE under the transition authority, one RUN_TRANSITION, the hold cleared,
+   * and the update conditional on the state, hold, reason and pin it read. Nothing is dispatched: the run is
+   * left runnable and the daemon's existing STANDARD_WORK continuation wake (#1158) decides whether its
+   * owner is woken, once per (run, task, task state) by its own marker.
+   */
+  releaseContinuityHold(
+    runId: string,
+    held: RoleBinding,
+  ): Decision<{ run: RunRow; released: boolean; kept: string | null }> {
+    return this.db.txDecision(() => {
+      const run = this.get(runId);
+      if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+      const kept = (why: string) => allow(ReasonCode.OK, { run, released: false, kept: why });
+      if (run.kind !== RunKind.STANDARD_WORK) return kept("only a STANDARD_WORK run's continuity hold is released here");
+      if (run.state !== RunState.BLOCKED) return kept(`the run is ${run.state}, not BLOCKED`);
+      if (run.continuityHoldRoleKey === null || run.continuityHoldRoleKey !== held.roleKey) {
+        return kept("the run is not under continuity's hold for this role");
+      }
+      const pause = this.db.get<{ event_id: number; at: string; evidence_json: string }>(
+        `SELECT event_id, at, evidence_json FROM audit_events
+          WHERE kind = 'RUN_TRANSITION' AND run_id = ?
+          ORDER BY event_id DESC LIMIT 1`,
+        [runId],
+      );
+      const paused = pause ? auditEvidence(pause.evidence_json) : null;
+      if (
+        !pause || !paused ||
+        paused["from"] !== RunState.ACTIVE || paused["to"] !== RunState.BLOCKED ||
+        paused["continuityAction"] !== "PAUSE_NEW_WORK" ||
+        paused["reason"] !== run.stateReason || !isContinuityPauseReason(paused["reason"])
+      ) {
+        return kept("the run's latest transition is not continuity's own pause");
+      }
+      const covering = this.#activeBindingNow(held.roleKey);
+      if (covering?.assignmentId !== held.assignmentId || covering.generation !== held.bindingGeneration) {
+        return kept("the held role's binding is no longer its active one");
+      }
+      if (!covering.ready) return kept("the held role's session is not READY");
+      const ownerRoleKey = run.projectId === null ? null : roleKeyFor(Role.PRIMARY_CTO, { projectId: run.projectId });
+      const owner = ownerRoleKey === null ? null : this.#activeBindingNow(ownerRoleKey);
+      if (
+        ownerRoleKey === null || run.ownerRoleKey !== ownerRoleKey || !owner ||
+        owner.boundSessionId !== run.ownerSessionId ||
+        owner.boundIncarnation !== run.ownerSessionIncarnation ||
+        owner.generation !== run.ownerBindingGeneration
+      ) {
+        return kept("the run's owner pin is not its PRIMARY_CTO's active binding");
+      }
+      if (!owner.ready) return kept("the run's owner session is not READY");
+      const moved = this.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM audit_events
+          WHERE run_id = ? AND event_id > ?
+            AND kind IN (${CONTINUITY_HOLD_MOVED_KINDS.map(() => "?").join(", ")})`,
+        [runId, pause.event_id, ...CONTINUITY_HOLD_MOVED_KINDS],
+      );
+      const tasksMoved = this.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM tasks WHERE run_id = ? AND updated_at > ?`,
+        [runId, pause.at],
+      );
+      if ((moved?.n ?? 1) !== 0 || (tasksMoved?.n ?? 1) !== 0) return kept("the run's candidate, decisions or tasks moved under the hold");
+      const rebound = this.db.all<{ role_key: string | null }>(
+        `SELECT role_key FROM audit_events
+          WHERE event_id > ? AND role_key IS NOT NULL AND role_key <> ?
+            AND kind IN (${CONTINUITY_HOLD_BINDING_KINDS.map(() => "?").join(", ")})`,
+        [pause.event_id, held.roleKey, ...CONTINUITY_HOLD_BINDING_KINDS],
+      );
+      if (rebound.some((row) => row.role_key !== null && this.#lossPauses(run, row.role_key))) {
+        return kept("another role this run depends on changed its binding under the hold");
+      }
+      const legal = canTransition(RunState.BLOCKED, RunState.ACTIVE, run.kind);
+      if (!legal.allowed) return legal as Decision<{ run: RunRow; released: boolean; kept: string | null }>;
+      const reason = `continuity hold released: ${held.roleKey} covered again`;
+      const written = this.db.applyRunStateTransition(this.#stateTransitions, {
+        runId,
+        toState: RunState.ACTIVE,
+        recordTransitionEvidence: () => {
+          this.audit.record({
+            kind: "RUN_TRANSITION",
+            runId,
+            projectId: run.projectId,
+            evidence: {
+              from: RunState.BLOCKED,
+              to: RunState.ACTIVE,
+              reason,
+              continuityRelease: held.roleKey,
+              pauseEventId: pause.event_id,
+              toGeneration: held.bindingGeneration,
+              ownerBindingGeneration: run.ownerBindingGeneration,
+            },
+          });
+          return allow(ReasonCode.OK, undefined);
+        },
+        enqueueTransitionEnvelope: () => allow(ReasonCode.OK, undefined),
+        updateState: () =>
+          this.db.run(
+            `UPDATE runs SET state = 'ACTIVE', state_reason = ?, continuity_hold_role_key = NULL
+              WHERE run_id = ? AND state = 'BLOCKED' AND continuity_hold_role_key = ? AND state_reason IS ?
+                AND owner_role_key IS ? AND owner_session_id IS ? AND owner_session_incarnation IS ?
+                AND owner_binding_generation IS ?`,
+            [
+              reason, runId, held.roleKey, run.stateReason,
+              run.ownerRoleKey, run.ownerSessionId, run.ownerSessionIncarnation, run.ownerBindingGeneration,
+            ],
+          ),
+      });
+      if (written.changes !== 1) {
+        return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "the run moved between the hold's check and its release", { runId });
+      }
+      return allow(ReasonCode.OK, { run: this.require(runId), released: true, kept: null });
+    });
+  }
+
+  /**
+   * A role's ACTIVE binding as the database has it now: its assignment, generation and the session it
+   * was bound on, and whether the runtime serving it is READY on its current incarnation.
+   */
+  #activeBindingNow(roleKey: string): {
+    assignmentId: string;
+    generation: number;
+    boundSessionId: string;
+    boundIncarnation: string;
+    ready: boolean;
+  } | null {
+    const row = this.db.get<{
+      assignment_id: string;
+      binding_generation: number;
+      session_id: string;
+      session_incarnation: string;
+      lifecycle: string | null;
+      live_incarnation: string | null;
+      expected_incarnation: string;
+    }>(
+      `SELECT a.assignment_id, a.binding_generation, a.session_id, a.session_incarnation,
+              s.lifecycle, s.incarnation AS live_incarnation,
+              COALESCE(c.current_session_incarnation, a.session_incarnation) AS expected_incarnation
+         FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+         LEFT JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
+        WHERE a.role_key = ? AND a.status = 'ACTIVE'`,
+      [roleKey],
+    );
+    if (!row) return null;
+    return {
+      assignmentId: row.assignment_id,
+      generation: row.binding_generation,
+      boundSessionId: row.session_id,
+      boundIncarnation: row.session_incarnation,
+      ready: row.lifecycle === "READY" && row.live_incarnation === row.expected_incarnation,
+    };
   }
 
   /**
