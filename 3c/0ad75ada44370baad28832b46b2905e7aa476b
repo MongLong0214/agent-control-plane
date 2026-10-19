@@ -1,0 +1,17 @@
+Limit: the CTO waits for the worker inside its own turn before result_submit and run_ack; a worker turn can take up to 30 minutes, the same as the CTO turn timeout and the RUN_DISPATCH lifetime, and the continuation only re-drives a READY task with nothing started, so a CTO turn that times out after its worker settled but before result_submit is left stalled (not woken again)
+Warn: a driven PRIMARY_CTO's work-turn prompt now carries a run with no bootstrapPlanGuide past its accepted PLAN (staff, claim, run and read each READY task within the contract's worker limit, then result_submit), and the daemon wakes a STANDARD_WORK owner that stopped after its PLAN exactly once per (run, owner generation, task, task state), recording STANDARD_WORK_CONTINUATION_STALLED instead of waking again when that turn made no progress; before this a STANDARD_WORK run dispatched to a driven owner stopped after plan_submit (#512 run_ab77268b: 'no bootstrapPlanGuide') and nothing re-drove it
+Record-Id: r-62f382e54888
+Provenance: inherited 94add6599888e73f3dc88554a80dc00de5cd8ee0
+
+Warn: the standard work continuation wake and its STALLED blocker are keyed on (run, task, task state) without the owner's binding generation: a generation change is not progress, so an unprogressed task state is woken at most once across generations and, once STALLED, never again; a key that included the generation re-woke the same state after every rebind
+Record-Id: r-be44e2c09b16
+Provenance: inherited e984a4986a4180c4d48cdb6675bc583cdf8b5beb
+
+Limit: the claim's branch comes only from the write target written into the task spec at planning time and the runner requires the registered checkout to be on that branch and clean; no driven-CTO tool creates or checks out that branch, so a task planned without one (the live task_e959ee8b) escalates instead of starting a worker
+Warn: for a STANDARD_WORK run, contract_get answers its current owner (after the existing owner check) with the run's tasks, each task's worker and its executions as identities and states only, no credential or secret; a driven CTO re-entering after an interruption reads this to reuse a provisioned worker, start a never-run worker's first execution, or read an execution whose id the conversation lost, and the continuation wake treats READY_WORKER_PROVISIONED as its own state (one wake, one blocker) instead of excluding any task with a worker (R1-01)
+Record-Id: r-3a9ad2e71209
+Provenance: inherited d848191b08dd66174fe0bc6b004d4d0ae69c41a1
+
+Warn: the driven STANDARD_WORK directive and the contract_get tasks[] extension apply to STANDARD_WORK runs only (the prompt reads run.kind through the runs port), so bootstrap and CONTRACT_CHANGE dispatch prompts stay byte-identical to c65e73b2's; and the CTO walks every task whatever its state, reading its newest execution by id first (RUNNING is waited on, SUCCEEDED is done, failed or unreadable escalates, never retried) before a READY task with no execution gets its first run (R1-01, R2-01: a READY-only walk missed started executions, and an unscoped directive stalled CONTRACT_CHANGE runs)
+Record-Id: r-670a5d3c0601
+Provenance: inherited a90c2f8a9238f26951b92bfefcfae29f6cbac27f
