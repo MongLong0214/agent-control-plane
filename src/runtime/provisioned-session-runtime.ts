@@ -5,8 +5,10 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { Role, type RoleBinding, SessionLifecycle } from "../domain/types.ts";
+import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
+import { Role, type RoleBinding, RunKind, SessionLifecycle } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
+import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionAttestations } from "../session/session-attestations.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -42,6 +44,11 @@ export interface ProvisionedSessionRuntimePorts {
    * and not when a turn for it exited 0.
    */
   readonly outbox: Pick<Outbox, "get" | "drivenModeOf" | "drivenSpawnRecordOf">;
+  /**
+   * #512 — where a turn's in-band envelope's run is read, so that the STANDARD_WORK directive is
+   * written only into a turn that concerns a STANDARD_WORK run (CEO 07b5b0df).
+   */
+  readonly runs: Pick<RunEngine, "get">;
 }
 
 export interface ProvisionedSessionRuntimeOptions {
@@ -570,8 +577,10 @@ export class ProvisionedSessionRuntime {
       // The prompt is written after the final check, so a gated trigger dropped there without a
       // `served` answer (a plan recovery whose run moved on) is not named in it. A mention's trigger
       // keeps its place in the prompt whatever its gate answered, as it always has.
-      const prompt = () =>
-        workPrompt(binding, triggers.filter((trigger) => trigger.served !== undefined || !notAdmitted.has(trigger.id)));
+      const prompt = () => {
+        const admitted = triggers.filter((trigger) => trigger.served !== undefined || !notAdmitted.has(trigger.id));
+        return workPrompt(binding, admitted, admitted.some((trigger) => this.#concernsStandardWork(trigger)));
+      };
       const turn = await this.#turn(binding.sessionId, "resume", prompt, {
         relay: true,
         timeoutMs: this.options.turnTimeoutMs ?? 30 * 60_000,
@@ -616,6 +625,18 @@ export class ProvisionedSessionRuntime {
         }
       }
     }
+  }
+
+  /**
+   * #512 (CEO 07b5b0df) — whether a trigger concerns a STANDARD_WORK run: a standard work
+   * continuation, or an in-band envelope (a RUN_DISPATCH, REVISION_REQUEST or ESCALATION_REPLY) whose
+   * run is one. Only such a turn's prompt carries the STANDARD_WORK directive, so the prompt of a
+   * turn for a bootstrap or CONTRACT_CHANGE run is exactly what it was before that directive existed.
+   */
+  #concernsStandardWork(trigger: SessionWakeTrigger): boolean {
+    if (trigger.kind.startsWith(STANDARD_CONTINUATION_KIND_PREFIX)) return true;
+    const runId = this.ports.outbox.get(trigger.id)?.runId ?? null;
+    return runId !== null && this.ports.runs.get(runId)?.kind === RunKind.STANDARD_WORK;
   }
 
   /** Whether this trigger names an outbox row: its settlement is then the row's, not this lane's. */
@@ -961,7 +982,87 @@ export const reviewRetryTriggerId = (
   unavailableEventId: number,
 ): string => `bootstrap-review-retry:${runId}:${bindingGeneration}:${candidateSnapshotDigest}:${unavailableEventId}`;
 
-const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[]): string =>
+/**
+ * #512 — what carrying a STANDARD_WORK run past its accepted PLAN means, in the words both its
+ * directive and the continuation wake's line use. The run's record, as `contract_get` answers it
+ * (each task's state, spec, worker and executions), decides every step, never what the conversation
+ * kept (CEO e64aa10b). Every task is taken whatever its state (CEO 07b5b0df): its existing execution,
+ * if it has one, is read by its id first, and a RUNNING one is read until it settles; one that
+ * SUCCEEDED leaves the task done, and one that did not succeed or cannot be read is escalated, never
+ * retried. Only a READY task with no execution gets a first execution: its worker reused if it has
+ * one, otherwise staffed; the claim takes the write target the task's spec declared in its PLAN, with
+ * the registered checkout as its worktree, because `task_worker_run` starts only on that checkout, on
+ * that branch and clean; no branch is chosen here. Once every task SUCCEEDED, the result is submitted,
+ * which runs the blind review.
+ */
+const STANDARD_WORK_STEPS =
+  "staffing no more workers at once than its contract allows, one at a time when it states no limit, first read mcp__acp-cto__contract_get for that run: its tasks list each task's taskId, state, spec, worker and executions, and they are the record to go by, whatever this conversation remembers. " +
+  "Then take every task of the run, whatever its state, in turn. " +
+  "First, if the task has executions, read its newest execution with mcp__acp-cto__task_execution_get by that executionId; while that execution is RUNNING, read it again until it is not; " +
+  "an execution that SUCCEEDED leaves its task done; an execution that did not succeed, or one you cannot read, is reported for that run with mcp__acp-cto__escalation_open, its task is never run again, and no result is submitted. " +
+  "Only a READY task with no execution gets a first execution: reuse its worker if it has one and never provision another (a worker whose state is not ACTIVE is reported with mcp__acp-cto__escalation_open); " +
+  `otherwise staff it with mcp__acp-cto__task_worker_provision, using a new idempotencyKey and provider "${FIXED_ROLE_RUNTIME[Role.WORKER]!.provider}" with no model (the control plane fixes it); ` +
+  "then claim its write target with mcp__acp-cto__resource_claim exactly as its spec's writeTarget names it: repositoryIdentity, branch and paths as declaredPaths, with that repository's checkoutPath from contract_get's repositories as the worktreeId; " +
+  "task_worker_run starts only when that registered checkout is on that branch and clean, so never choose, derive or change a branch yourself, and when the spec names no writeTarget, report it with mcp__acp-cto__escalation_open; " +
+  "start that first execution with mcp__acp-cto__task_worker_run, naming the task and the claimId resource_claim returned for that worktree, and read the execution it returns as above. " +
+  "A task with no execution that is not READY is left as it is. " +
+  "Once every task of the run has SUCCEEDED, submit the run's result with mcp__acp-cto__result_submit and a new idempotencyKey; result_submit runs the blind review itself and answers when it is done. " +
+  "A refused provision, claim or task_worker_run is reported for that run with mcp__acp-cto__escalation_open, and no result is submitted: never run an execution again or retry one on your own. " +
+  "Never submit that run's PLAN again to carry it on: a second plan_submit adds its tasks again";
+
+/**
+ * #512 — what a STANDARD_WORK run's PLAN gives each task, so that its claim later takes a declared
+ * write target rather than one chosen at claim time (CEO e64aa10b).
+ */
+const STANDARD_PLAN_WRITE_TARGET =
+  "When you plan such a run, give each task's spec a writeTarget: repositoryIdentity (one of the repositories contract_get returned), branch (the work branch the run's contract names for that repository; when it names none, report that with mcp__acp-cto__escalation_open rather than choose one) and paths (the repository-relative paths the task changes)";
+
+/**
+ * The audit kind that records one standard work continuation wake: an ACTIVE STANDARD_WORK run whose
+ * PLAN was accepted and whose RUN_DISPATCH its driven owner acknowledged, left with a READY task no
+ * execution was started for, with no worker or with the one it was given. Keyed by its run,
+ * `evidence.taskId` and `evidence.taskState`, the continuation state (`STANDARD_CONTINUATION_STATE`);
+ * `evidence.bindingGeneration` is recorded but is not part of the key, so a renewed owner generation
+ * does not earn the same state another wake. Append only, as above.
+ */
+export const STANDARD_WORK_CONTINUATION_WAKE = "STANDARD_WORK_CONTINUATION_WAKE";
+
+/**
+ * The audit kind that records the explicit blocker a continuation leaves when the one turn it woke
+ * made no progress: the same run, task and continuation state, and no turn of the owner running or
+ * queued. Written once per that tuple, whatever the owner's generation; nothing wakes the owner for
+ * it again.
+ */
+export const STANDARD_WORK_CONTINUATION_STALLED = "STANDARD_WORK_CONTINUATION_STALLED";
+
+/**
+ * #512 (CEO e64aa10b) — the state component of a continuation's once-key. The task's own state is
+ * READY in both, so it does not tell a task nothing was started for from one whose worker was
+ * provisioned and never ran; each is a state of its own, woken at most once.
+ */
+export const STANDARD_CONTINUATION_STATE = Object.freeze({
+  /** READY, no WORKER ever bound, no execution: the unprogressed state `taskState: "READY"` named before. */
+  UNSTAFFED: "READY",
+  /** READY, its WORKER bound and ACTIVE, no execution: provisioned, never run. */
+  STAFFED: "READY_WORKER_PROVISIONED",
+});
+
+const STANDARD_CONTINUATION_KIND_PREFIX = "standard work continuation: run ";
+
+/** The wake kind that tells a run's owner why it was woken: its accepted PLAN left this task READY and unstarted. */
+export const standardWorkContinuationTriggerKind = (runId: string, taskId: string, taskState: string = STANDARD_CONTINUATION_STATE.UNSTAFFED): string =>
+  `${STANDARD_CONTINUATION_KIND_PREFIX}${runId} has READY task ${taskId} ${
+    taskState === STANDARD_CONTINUATION_STATE.STAFFED ? "with a provisioned worker and no execution" : "with no worker"
+  }`;
+
+/**
+ * The trigger id of one continuation wake: the runtime refuses a second wake for it as a duplicate.
+ * Like the once-marker, it names no binding generation.
+ */
+export const standardWorkContinuationTriggerId = (runId: string, taskId: string, taskState: string): string =>
+  `standard-work-continuation:${runId}:${taskId}:${taskState}`;
+
+const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[], standardWork: boolean): string =>
   [
     `You are the ${binding.role}${binding.runId ? ` of run ${binding.runId}` : ""} in the agent control plane, at binding generation ${binding.bindingGeneration}.`,
     `The control plane woke you for: ${[...new Set(triggers.map((trigger) => trigger.kind))].join(", ")}.`,
@@ -974,6 +1075,18 @@ const workPrompt = (binding: RoleBinding, triggers: readonly SessionWakeTrigger[
         ]
       : []),
     `For a run whose contract_get returned a bootstrapPlanGuide, once its PLAN is accepted and the run is ACTIVE, unless that PLAN's result was already submitted, and before you acknowledge its RUN_DISPATCH: ${RESULT_STEPS}.`,
+    // #512 — only a PRIMARY_CTO owns a STANDARD_WORK run, and only a turn that concerns one carries
+    // its directive (CEO 07b5b0df): a bootstrap or CONTRACT_CHANGE run's turn is written as before.
+    ...(binding.role === Role.PRIMARY_CTO && standardWork
+      ? [
+          `For a STANDARD_WORK run (contract_get's run.kind), a missing bootstrapPlanGuide is no reason to stop: once its PLAN is accepted and the run is ACTIVE, unless its result was already submitted, and before you acknowledge its RUN_DISPATCH: ${STANDARD_WORK_STEPS}. ${STANDARD_PLAN_WRITE_TARGET}.`,
+        ]
+      : []),
+    ...(triggers.some((trigger) => trigger.kind.startsWith(STANDARD_CONTINUATION_KIND_PREFIX))
+      ? [
+          `A wake for "${STANDARD_CONTINUATION_KIND_PREFIX}<runId> has READY task <taskId> with no worker" or "... with a provisioned worker and no execution" means that run's PLAN was accepted and its RUN_DISPATCH acknowledged, and that task is still READY with no execution started for it: for that run, starting with that task, ${STANDARD_WORK_STEPS}. No message is left to acknowledge for it.`,
+        ]
+      : []),
     `A REVISION_REQUEST for a run whose contract_get returned a bootstrapPlanGuide carries why its PLAN was sent back (the CEO's rationale, or the blind review's findings): for that run, ${PLAN_STEPS}, writing the new PLAN so that it addresses that reason; then acknowledge the REVISION_REQUEST with mcp__acp-cto__run_ack. If the run is ACTIVE, submit the new PLAN's result first, as above; a run the CEO sent back is ACTIVE again with its next RUN_DISPATCH.`,
     "An ESCALATION_REPLY is the CEO's resolution of the escalation it names (its escalationId) for a run you are the current owner of: act on it only when it is addressed to you as that run's current owner and names that run's escalation, and then only for that run. " +
       "Carry out its resolution, for example by planning that run again or submitting its result again as the lines above direct, then acknowledge the ESCALATION_REPLY with mcp__acp-cto__run_ack. " +

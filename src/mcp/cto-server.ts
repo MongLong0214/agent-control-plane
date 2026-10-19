@@ -16,7 +16,7 @@ import type { CtoLifecycle, HandoffAcknowledgement } from "../cto/cto-lifecycle.
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
-import { ArtifactKind } from "../domain/types.ts";
+import { ArtifactKind, Role, RunKind, roleKeyFor } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import { contractChangePlanForSubmission, isContractChangeRun } from "../registry/contract-change-plan.ts";
 import { firstActivationFactsOf } from "../registry/manifest-activation-grants.ts";
@@ -78,6 +78,46 @@ export interface CtoMcpSource extends McpMutationSource {
 
 /** Only ports constructed below may be attached to an MCP server. */
 const CTO_MCP_PORTS = new WeakSet<object>();
+
+/**
+ * #512 — what `contract_get` tells a STANDARD_WORK run's owner about the run's tasks, read from the
+ * task graph, the WORKER bindings and the executions: each task's id, title, category, state, spec
+ * (where its PLAN put the task's write target) and dependencies; its newest WORKER binding (session,
+ * generation, binding status and the session's lifecycle) or null when none was ever bound; and its
+ * executions (id, state, attempt, start and end). Identities and states only: no credential, secret
+ * or process detail is read here.
+ */
+const standardWorkTasks = (source: CtoMcpSource, runId: string) => {
+  const executions = source.tasks.executions(runId);
+  return source.tasks.list(runId).map((task) => {
+    const worker = source.bindings.history(roleKeyFor(Role.WORKER, { taskId: task.taskId })).at(-1) ?? null;
+    return {
+      taskId: task.taskId,
+      title: task.title,
+      category: task.category,
+      state: task.state,
+      spec: task.spec,
+      dependsOn: task.dependsOn,
+      worker: worker === null
+        ? null
+        : {
+            sessionId: worker.sessionId,
+            generation: worker.bindingGeneration,
+            state: worker.status,
+            sessionLifecycle: source.sessions.get(worker.sessionId)?.lifecycle ?? null,
+          },
+      executions: executions
+        .filter((execution) => execution.taskId === task.taskId)
+        .map((execution) => ({
+          executionId: execution.executionId,
+          state: execution.status,
+          attempt: execution.attempt,
+          startedAt: execution.startedAt,
+          endedAt: execution.endedAt,
+        })),
+    };
+  });
+};
 
 /**
  * Verifies the transport identity against durable session and binding facts. The session
@@ -147,8 +187,14 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
         repositories: source.runs.repositoriesOf(runId),
       };
       // A project-less bootstrap run's owner also reads what its PLAN must carry: it has no tool that
-      // runs code, and nothing else it can read says. Every other run's answer is exactly as before.
-      return isProjectlessBootstrap(run) ? { ...contract, bootstrapPlanGuide: bootstrapPlanGuide() } : contract;
+      // runs code, and nothing else it can read says.
+      if (isProjectlessBootstrap(run)) return { ...contract, bootstrapPlanGuide: bootstrapPlanGuide() };
+      // #512 (CEO e64aa10b) — a STANDARD_WORK run's owner also reads the run's tasks, each with its
+      // worker and its executions, so a turn that resumes after an interruption goes by the record
+      // rather than by what its conversation kept. Answered only through `contract_get`, after its
+      // owner fence admitted the caller as this run's current owner; identities and states only, never
+      // a credential. Every other run's answer is exactly as before.
+      return run.kind === RunKind.STANDARD_WORK ? { ...contract, tasks: standardWorkTasks(source, runId) } : contract;
     },
     // #246 C2 — a project-less bootstrap run's PLAN carries its manifest in full, checked portable
     // and against the digest the PLAN names before anything is stored. #246 B2-a — so does a
