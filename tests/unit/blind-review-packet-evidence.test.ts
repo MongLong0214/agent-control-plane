@@ -70,7 +70,8 @@ describe("frozen candidate packet evidence", () => {
     const { controlPlaneEvidence } = await import("../../src/review/candidate-review-evidence.ts");
     const core = makeCore();
     try {
-      expect(controlPlaneEvidence(core.db, "absent")).toEqual({ dispatched: false, tasks: [], owningPrimaryCtoDelegation: false });
+      expect(controlPlaneEvidence(core.db, "absent")).toEqual({ dispatched: false, tasks: [], owningPrimaryCtoDelegation: false,
+        taskSummary: { total: 0, byState: {}, workerBindingCount: 0, activeWorkerBindingCount: 0, listed: 0, truncated: false } });
     } finally { core.db.close(); }
   });
 
@@ -138,6 +139,7 @@ describe("frozen candidate packet evidence", () => {
       const prompt = prompts[1]!.prompt;
       expect(jsonSection(prompt, "Control-plane evidence")).toEqual({
         dispatched: true,
+        taskSummary: { total: 1, byState: { SUCCEEDED: 1 }, workerBindingCount: 1, activeWorkerBindingCount: 1, listed: 1, truncated: false },
         tasks: [{ taskId: task.taskId, category: "implementation", state: "SUCCEEDED", workerBindingCount: 1, activeWorkerBindingCount: 1 }],
         owningPrimaryCtoDelegation: true,
       });

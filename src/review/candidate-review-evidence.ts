@@ -26,17 +26,48 @@ export const readTrackedTree = async (
     truncated: paths.length > TREE_ENTRY_LIMIT, paths: paths.slice(0, TREE_ENTRY_LIMIT) };
 };
 
-/** A projection of canonical records only: no producer text, provider, actor or session identity. */
-export const controlPlaneEvidence = (db: Db, runId: string) => ({
-  dispatched: db.get(`SELECT 1 FROM audit_events WHERE run_id = ? AND kind = 'DISPATCHED' LIMIT 1`, [runId]) !== undefined,
+interface TaskEvidence { taskId: string; category: string; state: string; workerBindingCount: number; activeWorkerBindingCount: number }
+
+/**
+ * #1166 r2 — a run can hold hundreds of superseded tasks, so the per-task list has its own
+ * serialized budget. The summary is computed over every task and is never cut.
+ */
+export const TASK_CHAR_BUDGET = 16_000;
+
+const taskEvidence = (db: Db, runId: string) => {
   // task_id is globally unique; legacy task-scoped bindings may have NULL run_id.
-  tasks: db.all<{ taskId: string; category: string; state: string; workerBindingCount: number; activeWorkerBindingCount: number }>(
+  // Tasks that ever had a WORKER binding come first, so a cut drops unexecuted work first.
+  const all = db.all<TaskEvidence>(
     `SELECT t.task_id AS taskId, t.category, t.state,
             (SELECT COUNT(*) FROM assignments a
               WHERE a.task_id = t.task_id AND a.role = 'WORKER') AS workerBindingCount,
             (SELECT COUNT(*) FROM assignments a
               WHERE a.task_id = t.task_id AND a.role = 'WORKER' AND a.status = 'ACTIVE') AS activeWorkerBindingCount
-       FROM tasks t WHERE t.run_id = ? ORDER BY t.task_id`, [runId]),
+       FROM tasks t WHERE t.run_id = ? ORDER BY workerBindingCount > 0 DESC, t.task_id`, [runId]);
+  const tasks: TaskEvidence[] = [];
+  let used = 0;
+  for (const task of all) {
+    // Rendered two levels deep in the pretty-printed packet.
+    const cost = JSON.stringify(task, null, 6).length + 8;
+    if (used + cost > TASK_CHAR_BUDGET) break;
+    used += cost;
+    tasks.push(task);
+  }
+  const byState: Record<string, number> = {};
+  for (const task of all) byState[task.state] = (byState[task.state] ?? 0) + 1;
+  const taskSummary = {
+    total: all.length, byState,
+    workerBindingCount: all.reduce((sum, task) => sum + task.workerBindingCount, 0),
+    activeWorkerBindingCount: all.reduce((sum, task) => sum + task.activeWorkerBindingCount, 0),
+    listed: tasks.length, truncated: tasks.length < all.length,
+  };
+  return { taskSummary, tasks };
+};
+
+/** A projection of canonical records only: no producer text, provider, actor or session identity. */
+export const controlPlaneEvidence = (db: Db, runId: string) => ({
+  dispatched: db.get(`SELECT 1 FROM audit_events WHERE run_id = ? AND kind = 'DISPATCHED' LIMIT 1`, [runId]) !== undefined,
+  ...taskEvidence(db, runId),
   // Match the run's whole owner pin, not whichever CTO happens to be active now. This is the
   // dispatch/renewal delegation, including a historical binding if the owner has since changed.
   owningPrimaryCtoDelegation: db.get(
@@ -107,7 +138,7 @@ export const candidateEvidenceSection = (
   "Tracked paths at each candidate SHA, including unchanged paths. A truncated listing is incomplete; it cannot establish absence of unlisted paths.",
   "```json", JSON.stringify(budgetTrees(trees), null, 2), "```", "",
   "## Control-plane evidence",
-  "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately.",
+  "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately. taskSummary counts every task in the run; when it says truncated, the task list is incomplete and cannot establish absence of unlisted tasks.",
   "```json", JSON.stringify(controlPlaneEvidence(db, runId), null, 2), "```", "",
   ...laterGateSection(db.get<{ kind: string }>(`SELECT kind FROM runs WHERE run_id = ?`, [runId])?.kind ?? null, trees.length),
 ];
