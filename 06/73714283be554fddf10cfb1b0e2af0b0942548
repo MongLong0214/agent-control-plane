@@ -1,0 +1,5 @@
+Limit: a run blocked for any other reason stays terminal in BLOCKED_POST_MERGE; declared checks stay mandatory, and a missing or failing declared check still refuses
+Warn: a pinned manifest that was read and parsed and declares zero post-merge checks now completes post-merge verification with explicit NO_CHECKS_DECLARED evidence bound to the APPLIED merge receipt and exact merge SHA (not a CI PASS); an unreadable or unparsable manifest or an unresolved repository role is refused before any branch publish, PR or merge; live #512 merged FreshReadme#1 (ec36ea3c) and then sat in BLOCKED_POST_MERGE because that repository has no CI and the manifest declares none
+Warn: schema v50 opens exactly one edge out of the terminal BLOCKED_POST_MERGE, to POST_MERGE_VERIFYING, still behind the authority marker; the finalizer and the daemon sweep resume only a run blocked by POST_MERGE_CHECKS_NOT_DECLARED with an unchanged candidate and fully APPLIED, verified merge receipts, re-running post-merge verification only, with no publish, PR, gate or merge write
+Record-Id: r-5358fee054af
+Provenance: inherited 959e200325efe8129b6113061933850bcac34844
