@@ -69,13 +69,28 @@ describe("local owner consent", () => {
       delegation_depth: 0, peer_grant: digestOf("peer grant"),
     } } });
     const args = { idempotencyKey: "owner-decision", runId, item: ITEM, approved: true, note: "proceed" };
+    const suspension = { idempotencyKey: "suspend", projectId: "owner-suspend", reason: "pause" };
+    const expectPeerRefused = async (tool: string, input: Record<string, unknown>) => {
+      const result = await tools[tool]!.handler(input, meta("peer"));
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent?.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+    };
     try {
-      expect((await tools.owner_decision_submit!.handler(args, meta("peer"))).isError).toBe(true);
+      await expectPeerRefused("owner_decision_submit", args);
       expect((await tools.owner_decision_submit!.handler(args, {})).isError).toBe(true);
+      await expectPeerRefused("cto_suspend", suspension);
+      expect((await tools.cto_suspend!.handler(suspension, {})).isError).toBe(true);
+      expect(harness.cp.db.all("SELECT nonce FROM inbound_messages WHERE channel = 'mcp'")).toEqual([]);
+      expect(harness.cp.ceo.humanGateStatus(runId).satisfied).toBe(false);
+      expect(harness.cp.projects.get("owner-suspend")?.suspended).toBe(false);
       expect((await tools.owner_decision_submit!.handler(args, meta("owner"))).isError).toBeUndefined();
       expect(harness.cp.ceo.humanGateStatus(runId).satisfied).toBe(true);
-      expect((await tools.cto_suspend!.handler({ idempotencyKey: "suspend", projectId: "owner-suspend", reason: "pause" }, meta("owner"))).isError).toBeUndefined();
+      expect((await tools.cto_suspend!.handler(suspension, meta("owner"))).isError).toBeUndefined();
       expect(harness.cp.projects.get("owner-suspend")?.suspended).toBe(true);
+      await expectPeerRefused("owner_decision_submit", args);
+      await expectPeerRefused("cto_suspend", suspension);
+      expect((await tools.owner_decision_submit!.handler(args, meta("owner"))).isError).toBeUndefined();
+      expect((await tools.cto_suspend!.handler(suspension, meta("owner"))).isError).toBeUndefined();
     } finally {
       await server.close();
     }

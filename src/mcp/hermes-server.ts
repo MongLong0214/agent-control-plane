@@ -318,6 +318,20 @@ const createHermesServerFromPort = (
       const peer = authenticateMcpPeer(authenticate);
       return peer.allowed ? port.mutation.execute(peer.value, idempotencyKey, execute) : respond(peer);
     });
+  const writeAsOwner = (
+    idempotencyKey: string,
+    extra: unknown,
+    refusal: string,
+    execute: (actor: string) => Promise<ToolResult> | ToolResult,
+  ) => guarded(() => {
+    const peer = authenticateMcpPeer(authenticate);
+    if (!peer.allowed) return respond(peer);
+    // Check before reserving a key or replaying its result: peers share the owner's channel actor.
+    if (admittedTurnOf(extra)?.principal !== "owner") {
+      return respond(deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, refusal));
+    }
+    return port.mutation.execute(peer.value, idempotencyKey, () => execute(peer.value.actor));
+  });
 
   server.registerTool(
     "run_create",
@@ -392,13 +406,9 @@ const createHermesServerFromPort = (
   server.registerTool(
     "cto_suspend",
     { description: "Suspend a project on an authenticated owner turn.", inputSchema: { ...mutation, projectId: z.string(), reason: z.string() } },
-    async (args, extra) => write(args.idempotencyKey, () => {
-      const peer = authenticateMcpPeer(authenticate);
-      if (!peer.allowed) return respond(peer);
-      if (admittedTurnOf(extra)?.principal !== "owner") return respond(deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "project suspension requires an authenticated owner turn"));
-      return port.suspendProject(args.projectId, args.reason, peer.value.actor).then(respond);
-    }),
+    async (args, extra) => writeAsOwner(args.idempotencyKey, extra,
+      "project suspension requires an authenticated owner turn",
+      (actor) => port.suspendProject(args.projectId, args.reason, actor).then(respond)),
   );
   server.registerTool(
     "cto_resume",
@@ -493,13 +503,9 @@ const createHermesServerFromPort = (
   server.registerTool(
     "owner_decision_submit",
     { description: "Record a decision on an authenticated owner turn.", inputSchema: { ...mutation, runId: z.string(), item: z.string(), approved: z.boolean(), note: z.string().default("") } },
-    async (args, extra) => write(args.idempotencyKey, () => {
-      const peer = authenticateMcpPeer(authenticate);
-      if (!peer.allowed) return respond(peer);
-      if (admittedTurnOf(extra)?.principal !== "owner") return respond(deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "owner decisions require an authenticated owner turn"));
-      return respond(port.recordOwnerDecision(args, peer.value.actor));
-    }),
+    async (args, extra) => writeAsOwner(args.idempotencyKey, extra,
+      "owner decisions require an authenticated owner turn",
+      (actor) => respond(port.recordOwnerDecision(args, actor))),
   );
   server.registerTool(
     "repair_execute",
