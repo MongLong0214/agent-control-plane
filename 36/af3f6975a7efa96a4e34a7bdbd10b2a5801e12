@@ -1,0 +1,14 @@
+Limit: Codex's own sandbox is off for worker writes, so any gap in the outer seatbelt profile is not backstopped by Codex; probeSession is HEALTHY only for a session this adapter recorded as a worker on gpt-6.1-sol; the claude worker path is unchanged
+Warn: a gpt WORKER (codex, gpt-6.1-sol) runs its turn as codex exec inside ACP's outer seatbelt profile with --dangerously-bypass-approvals-and-sandbox, because macOS rejects a nested sandbox-exec and Codex's own workspace-write sandbox fails closed inside it; containment is the outer profile (writes only to the guard target, the -o scratch and the account home) plus the managed-write guard, and --ignore-user-config keeps operator MCP servers and hooks out of the turn
+Record-Id: r-8afb2851befa
+Provenance: inherited a77aad61dbf782a5d66c4bb4bdd25e423e84d538
+
+Limit: the confinement proof is a real codex 0.163.0 run on a scratch repo (README edit allowed; curl, /tmp and $TMPDIR writes refused); the worker holder is identified after restart by --thread-source, the marker the installed Codex accepts; probe, capacity and execution share the configured CODEX_HOME; this supersedes the bypass described in r-8afb2851befa
+Warn: #1163 r1: a gpt WORKER turn runs codex exec under Codex's OWN workspace-write sandbox, not nested in ACP's outer sandbox-exec profile, with -c sandbox_workspace_write.exclude_slash_tmp=true, exclude_tmpdir_env_var=true and network_access=false, so the child shell can write only the workdir and has no network; no approvals/sandbox bypass flag is used, the choice applies only to gpt worker turns (login, read-only, claude and reviewer calls keep the outer profile), and the managed-write guard, broker and finalizer are unchanged (CEO 9796b89d)
+Record-Id: r-4eab729cf0c4
+Provenance: inherited 3edb94c4b00bfb93f097ab010694f6cb148f0501
+
+Limit: real codex 0.163.0 proofs on scratch targets: child-shell git push to https is refused (network off) and to a local bare remote outside the workdir (write denied); a linked-worktree turn is committed by ACP (c87ce235) with its digest collected
+Warn: #1163 r2: the gpt worker exec also pins -c sandbox_workspace_write.writable_roots=[] so no surviving config layer can add a writable root (verified: a loaded user-config grant widens the banner without the pin and is refused with it); CODEX_HOME reaches probe and execution only through the child environment, never by mutating process.env
+Record-Id: r-68c1b6df3216
+Provenance: inherited c5b36d2232254d7147153874719f34c9a82a823b
