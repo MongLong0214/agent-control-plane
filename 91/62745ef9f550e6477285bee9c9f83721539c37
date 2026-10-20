@@ -1,0 +1,4 @@
+Limit: the fallback reads only the legacy spec.files key; a legacy task that declared its file under any other key still needs a writeTarget or a one-file contract scope
+Warn: a docs task whose spec has no writeTarget at all may take its own spec.files as its one path, only when it names exactly one normal repository-relative file and the pinned base holds a regular file there; a declared writeTarget (even without paths) is never overridden by spec.files, and several files, an escape, a directory or a non-docs task stay refused (CEO 9a1f70bf, #512 legacy task_e959ee8b)
+Record-Id: r-9681a76c2acf
+Provenance: inherited 108e5fe053ff5ba3319de0ed8ace80f6e892e34c
