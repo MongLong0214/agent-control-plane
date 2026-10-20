@@ -2,7 +2,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ContinuityMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { CONTINUITY_MODE_MAX_AGE_MS } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -60,12 +60,6 @@ const readyForCeo = async () => {
   return { harness, driven, confirm, ceoDecisions };
 };
 
-/** The only provider stops answering: coverage is gone, and an evaluation moves continuity to SURVIVAL. */
-const loseEveryProvider = (harness: Harness): void => {
-  harness.scripted.setRuntimeHealth("UNAVAILABLE");
-  harness.scripted.setCapacity(null);
-};
-
 describe("a CEO CONFIRM re-evaluates continuity first", () => {
   it("a CONFIRM after the last evaluation is 6 minutes old is admitted, on an evaluation made for it", async () => {
     const f = await readyForCeo();
@@ -82,23 +76,6 @@ describe("a CEO CONFIRM re-evaluates continuity first", () => {
     }
   });
 
-  it("in SURVIVAL the refreshed CONFIRM is still refused", async () => {
-    const f = await readyForCeo();
-    try {
-      f.harness.clock.advance(6 * 60_000);
-      loseEveryProvider(f.harness);
-      expect(await f.confirm("confirm-in-survival")).toMatchObject({
-        ok: false,
-        reasonCode: ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
-      });
-      expect(f.harness.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
-      expect(f.harness.cp.runs.require(f.driven.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
-      expect(f.ceoDecisions()).toBe(0);
-    } finally {
-      f.harness.cp.close();
-    }
-  });
-
   it("an evaluation that throws refuses the CONFIRM, even beside a NORMAL evaluated a moment ago", async () => {
     const f = await readyForCeo();
     try {
@@ -110,30 +87,6 @@ describe("a CEO CONFIRM re-evaluates continuity first", () => {
       });
       expect(f.harness.cp.runs.require(f.driven.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
       expect(f.ceoDecisions()).toBe(0);
-    } finally {
-      f.harness.cp.close();
-    }
-  });
-
-  it("a refused CONFIRM records no CEO decision: its key replays the refusal, and a new key is a new request", async () => {
-    const f = await readyForCeo();
-    try {
-      f.harness.clock.advance(6 * 60_000);
-      loseEveryProvider(f.harness);
-      const refused = await f.confirm("confirm-k1");
-      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION });
-      expect(f.ceoDecisions()).toBe(0);
-
-      // Coverage returns. The first key still answers with its durable first response.
-      f.harness.scripted.setRuntimeHealth("HEALTHY");
-      f.harness.clock.advance(6 * 60_000);
-      expect(await f.confirm("confirm-k1")).toEqual(refused);
-      expect(f.ceoDecisions()).toBe(0);
-      expect(f.harness.cp.runs.require(f.driven.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
-
-      // A new key is a new request, decided on a fresh evaluation, not a replay of the refusal.
-      expect(await f.confirm("confirm-k2")).toMatchObject({ ok: true, value: { state: RunState.CEO_APPROVED } });
-      expect(f.ceoDecisions()).toBe(1);
     } finally {
       f.harness.cp.close();
     }

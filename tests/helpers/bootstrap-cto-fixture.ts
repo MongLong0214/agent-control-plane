@@ -50,6 +50,7 @@ export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof 
   const harness = makeHarness(harnessOptions);
   const launch = await startSessionLaunchChannel(tempDir("acp-c1b-launch-"), { mcpToken: BOOTSTRAP_FIXTURE_TOKEN });
   const claude = new RecordingRuntimeDouble(harness.clock, "claude");
+  claude.observeCredentialCustody(harness.cp.sessionRuntime, harness.cp.sessions, BOOTSTRAP_FIXTURE_TOKEN);
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
   const gpt = new RecordingRuntimeDouble(harness.clock, "gpt");
   gpt.setCapacity({
@@ -121,7 +122,7 @@ export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof 
     };
   };
   /** Claude's runtime stops answering: the role it fixes cannot be covered. */
-  const loseClaude = (): void => {
+  const loseClaude = (forgetCredential = true): void => {
     const reading: CapacityReading = {
       provider: "claude",
       sensorHealth: "HEALTHY",
@@ -131,9 +132,17 @@ export const bootstrapRuntimeFixture = async (harnessOptions: Parameters<typeof 
       buckets: [],
     };
     claude.setCapacity(reading);
+    claude.setRuntimeHealth("UNAVAILABLE");
+    // Simulate the runtime connection being lost, rather than treating its quota as authority.
+    for (const session of harness.cp.db.all<{ session_id: string }>("SELECT session_id FROM sessions WHERE provider = 'claude'")) {
+      if (forgetCredential) harness.cp.sessionRuntime.release(session.session_id);
+    }
   };
   /** Claude answers again with a healthy window. */
-  const restoreClaude = (): void => claude.setCapacity(null);
+  const restoreClaude = (): void => {
+    claude.setCapacity(null);
+    claude.setRuntimeHealth("HEALTHY");
+  };
   /** Turns of this session that have finished: the driver records one when a turn returns. */
   const finishedTurns = (sessionId: string): number =>
     harness.cp.db.get<{ n: number }>(

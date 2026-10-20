@@ -1,11 +1,11 @@
 import type { Clock } from "../../src/core/clock.ts";
-import { type Decision, allow, deny } from "../../src/core/errors.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { SessionLaunchCredential } from "../../src/cto/cto-lifecycle.ts";
-import type { SessionCredentialDelivery } from "../../src/runtime/provisioned-session-runtime.ts";
+import type { ProvisionedSessionRuntime, SessionCredentialDelivery } from "../../src/runtime/provisioned-session-runtime.ts";
 import type { SessionTurnRequest, SessionTurnResult } from "../../src/runtime/provider.ts";
-import type { AttestingPeer } from "../../src/session/session-attestations.ts";
-import { callMcpToolOverSocket, claimLaunchedCredential } from "./mcp-socket.ts";
+import { claimLaunchedCredential } from "./mcp-socket.ts";
+import type { SessionRegistry } from "../../src/session/session-registry.ts";
 import { TestProductionAdapter } from "./production-adapter.ts";
 
 /** A credential a test runtime took from the launch channel, as the real relay would hold it. */
@@ -49,35 +49,17 @@ export const inProcessLaunchChannel = (): InProcessLaunchChannel => {
   };
 };
 
-/** How the in-process mode presents an attestation: the same registry the `session_attest` tool calls. */
+/** An in-process launch channel for fixtures without sockets. */
 export interface InProcessAttestation {
   launch: InProcessLaunchChannel;
-  attest(peer: AttestingPeer, nonce: string): Decision<void>;
 }
 
-const ATTESTATION_NONCE = /nonce set to "([^"]+)"/;
-
-/**
- * #246 C1b — a Claude double that runs a provisioned session's turns the way the real runtime
- * does, minus the model: per turn it takes the session's credential from the launch channel (the
- * relay's job), and when the prompt carries a readiness challenge it presents it through
- * `session_attest` over the CTO MCP socket with that credential (the model's job). With
- * `inProcess`, a fixture that runs no sockets gets the same two steps against an in-process
- * channel and the attestation registry itself.
- *
- * The provider side is still the scripted double's: a session it does not know, or whose next
- * health was set UNAVAILABLE, fails its turn. What it took is kept in `credentials`, by control-plane
- * session id, so a row can act as that session over the socket exactly as its runtime would.
- */
+/** A provider double whose work turns take the same credential that a real relay takes. */
 export class HeadlessRuntimeDouble extends TestProductionAdapter {
   readonly turns: SessionTurnRequest[] = [];
   readonly credentials = new Map<string, TakenCredential>();
   /** False: the relay never takes its credential. */
   takeCredential = true;
-  /** False: the model never calls `session_attest`. */
-  presentAttestation = true;
-  /** True: the relay presents the credential it held before this turn, not the one it just took. */
-  presentStaleCredential = false;
   /** How many of the next work turns (no challenge) fail as a transient CLI failure would. */
   failNextWorkTurns = 0;
   /** Called for a work turn (no challenge) with what the relay took. */
@@ -86,6 +68,21 @@ export class HeadlessRuntimeDouble extends TestProductionAdapter {
 
   constructor(clock: Clock, provider = "claude") {
     super(clock, provider);
+  }
+
+  /** Manual socket fixtures act as this runtime without spending a model turn on readiness. */
+  observeCredentialCustody(runtime: ProvisionedSessionRuntime, sessions: SessionRegistry, token: string): this {
+    const adopt = runtime.adopt.bind(runtime);
+    runtime.adopt = (sessionId, role, secret, epoch) => {
+      const result = adopt(sessionId, role, secret, epoch);
+      if (result.allowed && sessions.require(sessionId).provider === this.provider) {
+        this.credentials.set(sessionId, {
+          sessionId, sessionIncarnation: sessions.require(sessionId).incarnation, sessionSecret: secret, token,
+        });
+      }
+      return result;
+    };
+    return this;
   }
 
   useInProcess(attestation: InProcessAttestation): this {
@@ -104,21 +101,14 @@ export class HeadlessRuntimeDouble extends TestProductionAdapter {
       durationMs: 1,
     });
     if ((await this.probeSession(request.handle)) !== "HEALTHY") return failed("No conversation found");
-    if (request.relay && !ATTESTATION_NONCE.test(request.prompt) && this.failNextWorkTurns > 0) {
+    if (request.relay && this.failNextWorkTurns > 0) {
       this.failNextWorkTurns -= 1;
       return failed("transient CLI failure");
     }
     if (request.relay) {
       const taken = this.takeCredential ? await this.#take(request) : null;
-      const previous = taken ? this.credentials.get(taken.sessionId) ?? null : null;
       if (taken) this.credentials.set(taken.sessionId, taken);
-      const credential = this.presentStaleCredential && previous ? previous : taken;
-      const nonce = ATTESTATION_NONCE.exec(request.prompt)?.[1] ?? null;
-      if (nonce !== null) {
-        if (credential && this.presentAttestation) await this.#attest(request, credential, nonce);
-      } else if (this.onWorkTurn) {
-        await this.onWorkTurn(request, credential);
-      }
+      if (this.onWorkTurn) await this.onWorkTurn(request, taken);
     }
     return {
       ok: true,
@@ -156,19 +146,4 @@ export class HeadlessRuntimeDouble extends TestProductionAdapter {
     }
   }
 
-  async #attest(request: SessionTurnRequest, credential: TakenCredential, nonce: string): Promise<void> {
-    if (this.#inProcess) {
-      this.#inProcess.attest(
-        { sessionId: credential.sessionId, sessionIncarnation: credential.sessionIncarnation, sessionSecret: credential.sessionSecret },
-        nonce,
-      );
-      return;
-    }
-    await callMcpToolOverSocket(
-      request.relay!.mcpSocketPath,
-      { token: credential.token ?? "", sessionId: credential.sessionId, sessionSecret: credential.sessionSecret },
-      "session_attest",
-      { nonce },
-    ).catch(() => undefined);
-  }
 }

@@ -58,6 +58,7 @@ const reviewFixture = async () => {
   // Claude Opus staffs the bootstrap CTO; the reviewer is the harness's own. No worker is staffed: the
   // PLAN's task stays READY until CEO CONFIRM settles it (CEO 1792120507).
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
+  claude.observeCredentialCustody(harness.cp.sessionRuntime, harness.cp.sessions, TOKEN);
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
 
   const ceo = harness.cp.sessions.create({ provider: "scripted", model: "c2-ceo" });
@@ -239,8 +240,8 @@ describe("#246 C2 W5: a PASS for one plan never stands for another", () => {
       expect(f.harness.cp.bootstrap.readinessForFactoryResult(run.runId, bootstrapActivationHandoff(m2), s1))
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
       expect(f.harness.cp.bootstrap.reviewForConfirmation(run.runId, s1)).toMatchObject({ allowed: false });
-      // #246 C3 reopens the CONFIRM through the runner's full path; with no owner approval of the
-      // GitHub writes recorded, it is refused there, writing nothing and reserving nothing.
+      // The reviewed plan reaches execution without another owner approval. This
+      // review-only fixture has no execution work root, so it stops before any write.
       const confirm = await f.hermes("ceo_decision_submit", {
         runId: run.runId,
         decision: "CONFIRM",
@@ -250,8 +251,8 @@ describe("#246 C2 W5: a PASS for one plan never stands for another", () => {
       });
       expect(confirm).toMatchObject({
         ok: false,
-        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        evidence: { stage: "approval", refusal: "APPROVAL_MISSING" },
+        reasonCode: ReasonCode.INVALID_ARGUMENT,
+        evidence: { refusal: "WORK_ROOT_UNCONFIGURED" },
       });
       expect(f.harness.cp.bootstrapApplications.get(run.runId)).toBeNull();
     });

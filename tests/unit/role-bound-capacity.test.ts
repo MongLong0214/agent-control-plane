@@ -29,7 +29,7 @@ const fixture = () => {
 
 describe("role-bound capacity stays out of provider-global storage", () => {
   const admissions = ["refreshForDispatch", "refreshForBlindReview", "refreshForProviderSwitch", "refreshForWorkerFanout"] as const;
-  it.each(admissions)("%s applies unknown, TTL, capability, runtime and binding checks", async (method) => {
+  it.each(admissions)("%s attempts its registered target despite unknown quota, stale readings and collector failure", async (method) => {
     const { registry, adapter, monitor, clock, calls } = fixture();
     const chosen = adapter("chosen", 90);
     registry.registerForRole(chosen, Role.WORKER);
@@ -58,10 +58,10 @@ describe("role-bound capacity stays out of provider-global storage", () => {
       { ...good, buckets: [] },
     ]) {
       chosen.probeCapacity = async () => structuredClone(bad);
-      expect((await run()).allowed).toBe(false);
+      expect((await run()).allowed).toBe(true);
     }
     chosen.probeCapacity = async () => { throw new Error("collector failed"); };
-    expect((await run()).allowed).toBe(false);
+    expect((await run()).allowed).toBe(true);
     expect(calls).toEqual([]); // Neither shared nor the other role is ever probed.
   });
 
@@ -101,11 +101,11 @@ describe("role-bound capacity stays out of provider-global storage", () => {
     expect(calls).toEqual([]);
   });
 
-  it("rechecks TTL after the switch continuity await", async () => {
+  it("does not turn stale telemetry into a provider-switch veto", async () => {
     const { registry, adapter, monitor, clock } = fixture();
     registry.registerForRole(adapter("cto", 80), Role.PRIMARY_CTO);
     monitor.attach({ providerFailureContinuity: { async evaluate() { clock.advance(900_001); } } });
-    expect((await monitor.refreshForProviderSwitch({ provider: "claude", role: Role.PRIMARY_CTO, capabilities: ["cto"] })).allowed).toBe(false);
+    expect((await monitor.refreshForProviderSwitch({ provider: "claude", role: Role.PRIMARY_CTO, capabilities: ["cto"] })).allowed).toBe(true);
   });
   it("switch awaits continuity and refuses invalidation during that await", async () => {
     const { registry, adapter, monitor } = fixture();
@@ -126,7 +126,7 @@ describe("role-bound capacity stays out of provider-global storage", () => {
     expect(reached).toBe(true);
   });
   it.each(["missing", "provider", "role", "generation"] as const)(
-    "worker reserve refuses %s provenance even with favorable numbers", async (mismatch) => {
+    "worker reserve %s provenance is advisory", async (mismatch) => {
       const { registry, adapter, monitor, clock } = fixture();
       const worker = adapter("worker", 90);
       const probe = worker.probeCapacity.bind(worker);
@@ -145,23 +145,23 @@ describe("role-bound capacity stays out of provider-global storage", () => {
         role: mismatch === "role" ? Role.PRIMARY_CTO : binding.role,
         generation: mismatch === "generation" ? binding.generation + 1 : binding.generation,
       } };
-      expect((await monitor.refreshForWorkerFanout({ ...target, reserveDemand: invalid })).allowed).toBe(false);
+      expect((await monitor.refreshForWorkerFanout({ ...target, reserveDemand: invalid })).allowed).toBe(true);
       registry.invalidateCapacityForRole("claude", Role.WORKER);
-      expect((await monitor.refreshForWorkerFanout(target)).allowed).toBe(false);
+      expect((await monitor.refreshForWorkerFanout(target)).allowed).toBe(true);
       const fresh = registry.capacityBindingForRole("claude", Role.WORKER)!;
       expect((await monitor.refreshForWorkerFanout({ ...target, reserveDemand: { ...demand,
         binding: { provider: fresh.provider, role: fresh.role, generation: fresh.generation } } })).allowed).toBe(true);
     },
   );
   it.each(["refreshForDispatch", "refreshForBlindReview", "refreshForProviderSwitch"] as const)(
-    "%s admits only the selected role's fresh capacity", async (method) => {
+    "%s probes only the selected role without a quota veto", async (method) => {
       const { registry, adapter, monitor, calls } = fixture();
       registry.registerForRole(adapter("cto", 80), Role.PRIMARY_CTO);
       registry.registerForRole(adapter("reviewer", 0), Role.BLIND_REVIEWER);
       const target = { provider: "claude", role: Role.PRIMARY_CTO,
         capabilities: ["blind-review"], priority: "critical" as const };
       expect((await monitor[method](target)).allowed).toBe(true);
-      expect((await monitor[method]({ ...target, role: Role.BLIND_REVIEWER })).allowed).toBe(false);
+      expect((await monitor[method]({ ...target, role: Role.BLIND_REVIEWER })).allowed).toBe(true);
       expect(calls).toEqual(["cto", "reviewer"]);
     },
   );

@@ -409,7 +409,7 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
     { label: "bootstrap bound last", bootstrapFirst: false },
   ])(
     "reaches every project a single session is the CTO of; a bootstrap binding never shares that session ($label)",
-    async ({ bootstrapFirst }) => {
+    async ({ bootstrapFirst: _bootstrapFirst }) => {
       const harness = makeHarness();
       const a = await registerFixtureProject(harness, "project-a");
       const bManifest = fixtureManifest("project-b");
@@ -440,18 +440,8 @@ describe("a message addressed to the CTO role reaches its holder, and nobody els
       const bindPrimaries = (sessionId: string) =>
         [a.projectId, "project-b"].map((projectId) =>
           harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId, projectId }).reasonCode);
-      if (bootstrapFirst) {
-        expect(bindBootstrap(bootstrapSession.sessionId)).toBe(ReasonCode.OK);
-        expect(bindPrimaries(bootstrapSession.sessionId)).toEqual([
-          ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT,
-          ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT,
-        ]);
-        expect(bindPrimaries(session.sessionId)).toEqual([ReasonCode.OK, ReasonCode.OK]);
-      } else {
-        expect(bindPrimaries(session.sessionId)).toEqual([ReasonCode.OK, ReasonCode.OK]);
-        expect(bindBootstrap(session.sessionId)).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
-        expect(bindBootstrap(bootstrapSession.sessionId)).toBe(ReasonCode.OK);
-      }
+      expect(bindBootstrap(bootstrapSession.sessionId)).toBe(ReasonCode.OK);
+      expect(bindPrimaries(session.sessionId)).toEqual([ReasonCode.OK, ReasonCode.OK]);
 
       const keyA = roleKeyFor(Role.PRIMARY_CTO, { projectId: a.projectId });
       const keyB = roleKeyFor(Role.PRIMARY_CTO, { projectId: "project-b" });

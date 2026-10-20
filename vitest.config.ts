@@ -21,6 +21,9 @@ export default defineConfig({
     // is not a test failure and reads like one, or like a missing result file downstream.
     // Forks isolate each file in its own process, where a native addon is far safer.
     pool: "forks",
+    // These files start their own process trees. CPU-count fork concurrency can starve
+    // their startup and reap deadlines on the host, even when each test passes alone.
+    maxWorkers: 2,
     // The JSON reporter is declared here rather than passed on the command line: `pnpm test --`
     // forwards `--` to vitest, which then has to guess whether the rest are flags or filters.
     // The gate reads the JSON report rather than the exit status, so it needs that report even

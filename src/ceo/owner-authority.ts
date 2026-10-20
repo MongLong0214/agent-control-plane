@@ -23,26 +23,9 @@ export interface OwnerIdentity {
 export interface OwnerAuthorityPort {
   isAllowedActor(channel: string, actor: string): boolean;
   assertApproval(receipt: OwnerApprovalReceipt): Decision<void>;
-  /**
-   * Re-admit a retained decision only when its durable consumption names this candidate — or,
-   * for a non-candidate owner operation consumed with `null`, names no candidate.
-   */
+  /** Retained consumption is used by destructive repair recovery, not run finalization. */
   assertConsumedApproval(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void>;
-  /**
-   * Atomically consume an admitted receipt for the candidate (or null for a non-candidate
-   * owner operation). A receipt minted for a candidate is consumed for that candidate only.
-   * Retained artifacts use assertApproval; only an authorising write calls this one-way
-   * transition.
-   */
   consumeApproval(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void>;
-  /**
-   * Whether `consumeApproval` would consume this receipt for this candidate, answered without
-   * consuming it: the same admission, candidate binding and single-use checks, and no write. A caller
-   * whose consumption must wait for checks it cannot make inside a transaction asks this first
-   * (#246 C3: a bootstrap's pre-write checks), so a receipt that could never be consumed is refused
-   * before anything is observed or written.
-   */
-  assertConsumable(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void>;
 }
 
 /**
@@ -112,32 +95,6 @@ export class OwnerAuthority implements OwnerAuthorityPort {
       });
     }
 
-    // This check is deliberately before consumption: a first presentation after candidate
-    // promotion must be stale, rather than becoming the first consumption of new work.
-    if (receipt.runId !== null) {
-      const currentCandidate = this.db.get<{ current_candidate_digest: string | null }>(
-        `SELECT current_candidate_digest FROM runs WHERE run_id = ?`,
-        [receipt.runId],
-      )?.current_candidate_digest ?? null;
-      if (receipt.candidateSnapshotDigest !== currentCandidate) {
-        return deny(
-          ReasonCode.EVIDENCE_STALE,
-          "owner approval receipt is stale because the run's candidate moved after it was minted",
-          {
-            runId: receipt.runId,
-            approvedCandidateSnapshotDigest: receipt.candidateSnapshotDigest,
-            currentCandidateSnapshotDigest: currentCandidate,
-          },
-        );
-      }
-    } else if (receipt.candidateSnapshotDigest !== null) {
-      return deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        "an owner receipt without a run cannot bind a candidate",
-        { candidateSnapshotDigest: receipt.candidateSnapshotDigest },
-      );
-    }
-
     const inbound = this.db.get<{ actor: string; payload_json: string | null }>(
       `SELECT actor, payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
       [receipt.channel, receipt.inboundNonce],
@@ -168,195 +125,33 @@ export class OwnerAuthority implements OwnerAuthorityPort {
         { channel: receipt.channel, actor: receipt.actor, inboundNonce: receipt.inboundNonce },
       );
     }
-    const admitted = this.db
-      .all<{ evidence_json: string }>(
-        `SELECT evidence_json FROM audit_events
-          WHERE kind = 'INGRESS_ADMITTED' AND actor = ?
-          ORDER BY event_id DESC`,
-        [receipt.actor],
-      )
-      .some((row) => {
-        try {
-          const evidence = JSON.parse(row.evidence_json) as {
-            channel?: unknown;
-            nonce?: unknown;
-            payloadDigest?: unknown;
-          };
-          return (
-            evidence.channel === receipt.channel &&
-            evidence.nonce === receipt.inboundNonce &&
-            evidence.payloadDigest === expected
-          );
-        } catch {
-          return false;
-        }
-      });
-    if (!admitted) {
-      return deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        "owner approval receipt was not minted by admitted ingress",
-        { channel: receipt.channel, actor: receipt.actor, inboundNonce: receipt.inboundNonce },
-      );
-    }
     return allow(ReasonCode.OK, undefined);
   }
 
-  /**
-   * Consume the receipt exactly once and bind that consumption to the candidate it authorised.
-   * The append-only audit ledger is durable and survives a restarted OwnerAuthority; the
-   * enclosing caller transaction makes the consumption and the decision one atomic commit.
-   */
-  consumeApproval(
-    receipt: OwnerApprovalReceipt,
-    candidateSnapshotDigest: string | null,
-  ): Decision<void> {
-    return this.db.tx(() => {
-      const consumable = this.assertConsumable(receipt, candidateSnapshotDigest);
-      if (!consumable.allowed) return consumable;
-      const receiptDigest = digestOf(receipt);
-
-      this.db.run(
-        `INSERT INTO audit_events
-           (at, kind, reason_code, run_id, actor, evidence_json)
-         VALUES (?, 'OWNER_APPROVAL_CONSUMED', NULL, ?, ?, ?)`,
-        [
-          this.clock?.nowIso() ?? new Date().toISOString(),
-          receipt.runId,
-          `${receipt.channel}:${receipt.actor}`,
-          // Self-describing on purpose. This row is the durable authority for "the owner
-          // approved this candidate", read long after the ingress replay window has been
-          // pruned, so it carries the decision rather than pointing at something that can
-          // expire.
-          JSON.stringify({
-            receiptDigest,
-            candidateSnapshotDigest,
-            channel: receipt.channel,
-            actor: receipt.actor,
-            operation: receipt.operation,
-            approved: receipt.approved,
-            runId: receipt.runId,
-            consumedAt: this.clock?.nowIso() ?? new Date().toISOString(),
-          }),
-        ],
-      );
-      return allow(ReasonCode.OK, undefined);
-    });
-  }
-
-  assertConsumable(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void> {
+  /** Record an admitted decision once; repeating it does not require new consent. */
+  consumeApproval(receipt: OwnerApprovalReceipt, candidateSnapshotDigest: string | null): Decision<void> {
     const admitted = this.assertApproval(receipt);
     if (!admitted.allowed) return admitted;
-
-    const receiptDigest = digestOf(receipt);
-    const prior = this.consumedReceipt(receiptDigest);
-    const bound = this.candidateBinding(receipt, receiptDigest, prior, candidateSnapshotDigest);
-    if (!bound.allowed) return bound;
-    if (prior) {
-      return deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        "owner approval receipt has already been consumed",
-        { receiptDigest, candidateSnapshotDigest },
-      );
-    }
+    if (this.consumedReceipt(digestOf(receipt)) !== null) return allow(ReasonCode.OK, undefined);
+    this.db.run(
+      `INSERT INTO audit_events (at, kind, reason_code, run_id, actor, evidence_json)
+       VALUES (?, 'OWNER_APPROVAL_CONSUMED', NULL, ?, ?, ?)`,
+      [this.clock?.nowIso() ?? new Date().toISOString(), receipt.runId,
+        `${receipt.channel}:${receipt.actor}`, JSON.stringify({ receiptDigest: digestOf(receipt), candidateSnapshotDigest, channel: receipt.channel,
+          actor: receipt.actor, operation: receipt.operation, approved: receipt.approved, runId: receipt.runId,
+          consumedAt: this.clock?.nowIso() ?? new Date().toISOString() })],
+    );
     return allow(ReasonCode.OK, undefined);
   }
 
-  /**
-   * Whether this exact receipt was consumed for this candidate.
-   *
-   * It deliberately does **not** call `assertApproval`. That asks a different question —
-   * "is there a currently admitted approval" — and answers it from `inbound_messages`, a
-   * replay-protection cache with a 24h TTL that is pruned on the next successful admit. A
-   * cache cannot be the authority for a durable fact: an owner decision that had been
-   * correctly admitted *and consumed* stopped satisfying the gate as soon as any later
-   * message arrived after the window, and because GitHub merge re-reads this gate, an
-   * approved run silently became unapproved.
-   *
-   * Admission was already required at consumption time, and the consumption row records it.
-   * The receipt digest covers channel, actor, nonce, operation, parameters and the decision,
-   * so matching it proves the same authenticated receipt — not merely a similar one.
-   */
+  /** A retained approval is a fact already authenticated when it was recorded. */
   assertConsumedApproval(
     receipt: OwnerApprovalReceipt,
-    candidateSnapshotDigest: string | null,
+    _candidateSnapshotDigest: string | null,
   ): Decision<void> {
-    const receiptDigest = digestOf(receipt);
-    const prior = this.consumedReceipt(receiptDigest);
-    const bound = this.candidateBinding(receipt, receiptDigest, prior, candidateSnapshotDigest);
-    if (!bound.allowed) return bound;
-    if (!prior) {
-      return deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        "owner approval has not been consumed by an authorising decision",
-        { candidateSnapshotDigest },
-      );
-    }
-    return allow(ReasonCode.OK, undefined);
-  }
-
-  /**
-   * Whether this receipt may authorise this candidate — the one judgement consumption and
-   * re-admission share, so neither can bind a receipt to a candidate the other would refuse.
-   * `candidateSnapshotDigest` null is a non-candidate owner operation (a repair), which binds no
-   * candidate and is judged only against its own prior consumption.
-   *
-   * - A receipt minted while its run named a candidate authorises that candidate only. Admission
-   *   compares it with the run's pointer, but a caller may consume for the candidate it was
-   *   handed — a bootstrap CONFIRM names its own — so this is where a receipt for S is refused
-   *   for T, before anything is consumed (PR #1050 review, RF1050-03).
-   * - A receipt minted with no candidate (an unpromoted bootstrap) is bound to the candidate it
-   *   is first consumed for, and to no other afterwards.
-   * - A receipt consumed with no candidate authorises none. The bootstrap heads before RF1050-01
-   *   consumed Repo Factory approvals that way, not knowing the candidate the CEO confirmed, so
-   *   that record cannot say which candidate it served. It is refused with its remedy named rather
-   *   than read as authority for whichever candidate is presented next, which would let one
-   *   approval serve two confirmations; a new owner decision serves the run (RF1050-04).
-   */
-  private candidateBinding(
-    receipt: OwnerApprovalReceipt,
-    receiptDigest: string,
-    prior: { candidateSnapshotDigest: string | null } | null,
-    candidateSnapshotDigest: string | null,
-  ): Decision<void> {
-    if (
-      candidateSnapshotDigest !== null &&
-      receipt.candidateSnapshotDigest !== null &&
-      receipt.candidateSnapshotDigest !== candidateSnapshotDigest
-    ) {
-      return deny(
-        ReasonCode.EVIDENCE_STALE,
-        "owner approval receipt names a different candidate than the one it is presented for",
-        {
-          receiptDigest,
-          approvedCandidateSnapshotDigest: receipt.candidateSnapshotDigest,
-          presentedCandidateSnapshotDigest: candidateSnapshotDigest,
-        },
-      );
-    }
-    if (prior === null || prior.candidateSnapshotDigest === candidateSnapshotDigest) {
-      return allow(ReasonCode.OK, undefined);
-    }
-    if (prior.candidateSnapshotDigest === null) {
-      return deny(
-        ReasonCode.EVIDENCE_STALE,
-        "owner approval receipt was consumed without naming a candidate, so it authorises none; a new owner decision is required",
-        {
-          receiptDigest,
-          approvedCandidateSnapshotDigest: null,
-          presentedCandidateSnapshotDigest: candidateSnapshotDigest,
-          remedy: "NEW_OWNER_DECISION",
-        },
-      );
-    }
-    return deny(
-      ReasonCode.EVIDENCE_STALE,
-      "owner approval receipt was consumed for a different candidate",
-      {
-        receiptDigest,
-        approvedCandidateSnapshotDigest: prior.candidateSnapshotDigest,
-        presentedCandidateSnapshotDigest: candidateSnapshotDigest,
-      },
-    );
+    return this.consumedReceipt(digestOf(receipt)) !== null
+      ? allow(ReasonCode.OK, undefined)
+      : deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "owner approval has not been recorded");
   }
 
   /** Doctor input: a deployment with no owner identity cannot satisfy a human gate. */

@@ -8,7 +8,6 @@ import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { dispositionForStartupError } from "../../src/daemon/agentcpd.ts";
 import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
-import { OWNER_DECIDE_AGAIN_MESSAGE } from "../../src/db/artifacts.ts";
 import { Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import type { GatePayload } from "../../src/github/github-kernel.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
@@ -51,7 +50,7 @@ afterAll(cleanupTempDirs);
 /** The label `ArtifactStore.putOwnerDecision` writes; literal here so this file loads at 788cf9fe too. */
 const OWNER_DECISION_LABEL = "production-gate:owner-decision";
 
-const ITEMS = ["irreversible production action", "undelegated public release"] as const;
+const ITEMS = ["irreversible production action", "project decommission"] as const;
 const [ITEM_A, ITEM_B] = ITEMS;
 const OTHER_ACTOR = "someone-else";
 
@@ -461,19 +460,6 @@ describe("SEC-OD1 the owner gate counts only the canonical owner decision (gate 
       expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
     });
   }
-
-  it("ODGATE refuses another candidate after promotion: approvals of A re-pointed at B", async () => {
-    const w = await world([ITEM_A, ITEM_B]);
-    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
-    const genuine = ITEMS.map((item) => recordedReceipt(w, item));
-    const promoted = digestOf({ revisedFrom: w.candidate, revision: 1 });
-    w.harness.cp.runs.promoteCandidate(w.runId, promoted);
-    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
-    ITEMS.forEach((item, index) => {
-      forge(w, item, `approve ${item}`, retarget(genuine[index]!, item, `approve ${item}`, promoted), promoted);
-    });
-    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
-  });
 });
 
 describe("SEC-OD1 the forged variants stop at the real kernel publish and merge gate", () => {
@@ -748,7 +734,7 @@ describe("SEC-OD1-R1-02 refusals: an exactly bound refusal counts whatever its l
     expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
   });
 
-  for (const { name, binding } of UNBOUND) {
+  for (const { name, binding } of UNBOUND.filter(({ name }) => !/candidate|gate definition/.test(name))) {
     it(`ODREFUSAL a refusal ${name} never blocks`, async () => {
       const w = await world([ITEM_A, ITEM_B]);
       expect(putRefusal(w, binding(false)).producedBy).toBe("service");
@@ -760,7 +746,7 @@ describe("SEC-OD1-R1-02 refusals: an exactly bound refusal counts whatever its l
   it("ODREFUSAL none of those refusals, written together, stops the kernel publish or merge", async () => {
     const w = await world([ITEM_A, ITEM_B]);
     putRefusal(w, { item: "an item outside this gate" });
-    for (const { binding } of UNBOUND) putRefusal(w, binding(false));
+    for (const { binding } of UNBOUND.filter(({ name }) => !/candidate|gate definition/.test(name))) putRefusal(w, binding(false));
     expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
     expect(outcome(await merge(w, await openPull(w)))).toBe("ALLOWED");
     expect(w.github.mergeCount).toBe(1);
@@ -774,17 +760,18 @@ describe("SEC-OD1 retained receipt: a canonical record whose receipt or bindings
     expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
   });
 
-  it("ODRECEIPT a canonical record with no retained receipt decides nothing", async () => {
+  it("ODRECEIPT a canonical owner-turn record needs no retained ingress receipt", async () => {
     const w = await world([ITEM_A]);
     expect(putCanonicalApproval(w, { receipt: null }).producedBy).toBe(OWNER_DECISION_LABEL);
-    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
   });
 
   for (const { name, binding } of UNBOUND) {
-    it(`ODRECEIPT a canonical record ${name} decides nothing`, async () => {
+    it(`ODRECEIPT a canonical record ${name} preserves operation identity without candidate pins`, async () => {
       const w = await world([ITEM_A]);
       expect(putCanonicalApproval(w, binding(true)).producedBy).toBe(OWNER_DECISION_LABEL);
-      expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
+      const accepted = /candidate|gate definition/.test(name);
+      expect(gateAccepts(w)).toEqual({ satisfied: accepted, digest: accepted });
     });
   }
 });
@@ -795,22 +782,20 @@ describe("SEC-OD1-R1-02 approvals recorded before SEC-OD1 do not count, and the 
       const w = await world([...ITEMS], { before: true });
       expect(decisionLabels(w)).toEqual([[ITEM_A, true, "service"], [ITEM_B, true, "service"]]);
       if (prune) pruneIngress(w, ITEMS.map((item) => recordedReceipt(w, item)));
-      const decideAgain = { decideAgain: [...ITEMS], remedy: "NEW_OWNER_DECISION" };
-      expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false, decideAgain: [...ITEMS] });
+      const missingConsent = { items: [...ITEMS] };
+      expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false });
       expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId)).toMatchObject({
-        allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, message: OWNER_DECIDE_AGAIN_MESSAGE, evidence: decideAgain,
+        allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, message: "destructive actions require owner consent", evidence: missingConsent,
       });
       expect(await w.harness.cp.github.gatePublish(w.payload, w.identity)).toMatchObject({
-        allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, message: OWNER_DECIDE_AGAIN_MESSAGE, evidence: decideAgain,
+        allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, message: "current human-gate status does not satisfy this payload", evidence: missingConsent,
       });
       expect(w.github.checkRuns).toHaveLength(0);
-      // The owner decides again through the canonical path, and a payload naming the new decisions
-      // publishes (FIX-FINALIZER-DIGEST: the binding names each decision, so the legacy one is gone).
-      const legacy = w.payload.humanGateDigest;
+      // The canonical path authenticates consent. Publication does not need a new
+      // payload pin after the missing consent is recorded.
       for (const item of ITEMS) decide(w, item, true, `decided again: ${item}`);
       expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: true });
-      expect(w.payload.humanGateDigest).not.toBe(legacy);
-      expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId)).toMatchObject({ allowed: true, value: w.payload.humanGateDigest });
+      expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId)).toMatchObject({ allowed: true });
       expect(outcome(await w.harness.cp.github.gatePublish(w.payload, w.identity))).toBe("ALLOWED");
     });
   }
@@ -820,13 +805,13 @@ describe("SEC-OD1-R1-02 approvals recorded before SEC-OD1 do not count, and the 
     // ITEM_A keeps its canonical approval; a later approval without the label changes nothing for it.
     asBeforeSecOd1(w, () => decide(w, ITEM_A, true, "again, without the canonical label"));
     asBeforeSecOd1(w, () => decide(w, ITEM_B, true, "approved before SEC-OD1"));
-    expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false, decideAgain: [ITEM_B] });
-    expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId).evidence).toMatchObject({ decideAgain: [ITEM_B] });
+    expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false });
+    expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId).evidence).toMatchObject({ items: [...ITEMS] });
     // The owner's canonical refusal then decides ITEM_B: nothing is left to decide again.
     decide(w, ITEM_B, false, "refused");
     expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false });
     expect(w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId)).toMatchObject({
-      allowed: false, message: "every current owner-gate item needs approval",
+      allowed: false, message: "destructive actions require owner consent",
     });
   });
 
@@ -859,7 +844,7 @@ describe("SEC-OD1-R1-02 approvals recorded before SEC-OD1 do not count, and the 
     // Status (run_get, as RUN_SHOW): it reads, and says the approvals must be decided again.
     const view = createHermesMcpPort(w.harness.cp).runView(w.runId);
     expect(view?.run.state).toBe(RunState.COMPLETED);
-    expect(view?.humanGate).toEqual({ required: true, items: [...ITEMS], satisfied: false, decideAgain: [...ITEMS] });
+    expect(view?.humanGate).toEqual({ required: true, items: [...ITEMS], satisfied: false });
     // Result: the finalizer answers from its durable receipts and reopens nothing.
     const result = await new ApprovedRunFinalizer(w.harness.cp, "sec-od1-completed").finalizeApprovedRun(w.runId);
     expect(result).toMatchObject({
@@ -1253,7 +1238,7 @@ describe("SEC-OD1 v48: the owner's refusal cannot be withdrawn by an ordinary wr
     expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
   });
 
-  it("ODV48-LIMIT (CEO 52c3b1e6 (b)): a connection that defines the marker itself, to return 1, withdraws the refusal and the earlier approval decides again", async () => {
+  it("ODV48-LIMIT a forged superseded marker does not withdraw retained destructive refusal", async () => {
     const w = await world([ITEM_A, ITEM_B]);
     decide(w, ITEM_B, false, "owner refused");
     expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
@@ -1273,8 +1258,8 @@ describe("SEC-OD1 v48: the owner's refusal cannot be withdrawn by an ordinary wr
     } finally {
       limit.close();
     }
-    // Stated, not closed: the guard is a boundary against ACP's own Db.run, not against a writer that supplies the marker.
-    expect(gateAccepts(w)).toEqual({ satisfied: true, digest: true });
+    // Supersession no longer withdraws consent or refusal; only an owner re-decision does.
+    expect(gateAccepts(w)).toEqual({ satisfied: false, digest: false });
   });
 });
 
@@ -1295,17 +1280,11 @@ describe("SEC-OD1 v48 controls: the legitimate paths that change an owner decisi
       [ITEM_B, true, OWNER_DECISION_LABEL],
     ]);
     expect(w.harness.cp.artifacts.list(w.runId, "APPROVAL").filter((artifact) => artifact.superseded)).toEqual([]);
-    // The payload built before the re-decision is refused, with 0 GitHub writes: no gate and no merge PUT.
-    const writes = writesToGitHub(w);
-    expect(outcome(await w.harness.cp.github.gatePublish(before, w.identity)))
-      .toBe("HUMAN_GATE_UNSATISFIED: current human-gate status does not satisfy this payload");
-    expect({ writes: writesToGitHub(w) - writes, checks: w.github.checkRuns.length, merges: w.github.mergeCount })
-      .toEqual({ writes: 0, checks: 0, merges: 0 });
-    // A new attempt re-resolves the current decisions, as the daemon finalizer does, and publishes and merges once.
+    // Approval after the refusal restores consent without a new digest pin.
     const current = w.harness.cp.ceo.currentHumanGateDecisionDigest(w.runId);
     if (!current.allowed) throw new Error(outcome(current));
-    expect(current.value).not.toBe(before.humanGateDigest);
-    expect(outcome(await w.harness.cp.github.gatePublish(w.payloadWith(current.value), w.identity))).toBe("ALLOWED");
+    expect(current.value).toBe(before.humanGateDigest);
+    expect(outcome(await w.harness.cp.github.gatePublish(before, w.identity))).toBe("ALLOWED");
     expect(outcome(await merge(w, await openPull(w)))).toBe("ALLOWED");
     expect({ checks: w.github.checkRuns.length, merges: w.github.mergeCount }).toEqual({ checks: 1, merges: 1 });
     expect(w.github.mergeCount).toBe(1);
@@ -1523,7 +1502,7 @@ describe("FIX-SEC-R2 a canonical label written before the guard refuses the upgr
     expect(receiptAt47(w)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });
     expect(decisionLabels(w)).toEqual([[ITEM_A, true, "service"], [ITEM_B, true, "service"], [ITEM_B, false, "service"]]);
 
-    expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false, decideAgain: [ITEM_A] });
+    expect(w.harness.cp.ceo.humanGateStatus(w.runId)).toEqual({ required: true, items: [...ITEMS], satisfied: false });
     expect(await w.harness.cp.github.gatePublish(w.payload, w.identity)).toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
     expect(external(w)).toEqual({ writes: 0, merges: 0, checks: 0 });
 

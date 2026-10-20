@@ -5,61 +5,16 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 
 /**
- * Issue #246 PR-C slice C3 — the durable record of a project-less PROJECT_BOOTSTRAP run's
- * application: the GitHub writes its CEO CONFIRM performs, and what became of them.
+ * Recovery ledger for a bootstrap run's GitHub writes. A reservation holds the project and target
+ * before any external effect. Every attempt is recorded before writing; WRITTEN preserves its result;
+ * COMPLETED and STRANDED retain the reservation and its evidence.
  *
- * `createRepository` can succeed and then crash or time out before the result is stored, so the
- * application is recorded before anything external happens and every phase is kept:
+ * Target uniqueness, the frozen PLAN and candidate, writer attribution, and the per-operation GitHub
+ * ledger prevent clobbering or replaying uncertain writes. A cancelled reservation can be released
+ * only when no external effect is possible; missing or unreadable evidence keeps it in doubt.
  *
- * - RESERVED, inserted with its first attempt in the transaction that consumes the owner's approval.
- *   The reservation holds the manifest's project id and the repository identity (UNIQUE on both, so
- *   the race two runs would run to one of them is closed by the database), and the digests of what
- *   was confirmed: PLAN, manifest, planned outputs, candidate, review and approval. A recovery can
- *   only re-apply that candidate; nothing about it can be changed afterwards.
- * - Every later attempt is recorded (`attempts` + 1) before that attempt's first external write.
- * - WRITTEN, in the transaction that stores the produced result.
- * - COMPLETED, in the CEO's completion transaction.
- * - STRANDED, when what GitHub holds at the target cannot be attributed to this run by the evidence
- *   it recorded. The reservation and the evidence are kept; nothing is created, adopted, retried or
- *   deleted automatically, and the doctor names the cause and the recovery a person performs.
- *
- * The phase only moves forward and the row is never replaced or deleted, which schema v43's
- * triggers enforce for every writer; this class is the one that writes it.
- *
- * What `approval_digest` is (CEO decision (a), 2026-10-10). It is the write scope the owner
- * approved: the parameter digest of the approval receipt, over owner, visibility, the PLAN and its
- * operations. It is not an approval and never stands in for one. Every CONFIRM, a recovery
- * included, re-admits the official receipt itself (its ingress admission, or its durable
- * consumption for this candidate), recomputes the scope from the owner, visibility, PLAN and
- * operations it is about to execute, and checks the target and visibility against the plan; the
- * reserved digest is only compared with that, so a CONFIRM of another scope is refused.
- *
- * The freeze (CEO decision (b), as corrected 2026-10-10). It starts at the reservation: from the
- * transaction that inserts the row, the run's plan cannot be replaced by `plan_submit` or by a
- * FINAL_REVISE that would send it back for one (BOOTSTRAP_APPLICATION_FROZEN), and a CONFIRM may only
- * re-apply the reserved candidate under the reserved write scope; the scope that approval and its
- * attempts carry never changes. A scope change never reuses the approval the reservation consumed:
- * an approval of another scope is refused, not substituted. On failure, cancel and recovery:
- * - Failure (a refused, timed-out or crashed attempt): the application stays RESERVED and frozen,
- *   and the next CEO CONFIRM of the same candidate under the same scope resumes it from the attempt
- *   ledger, once the earlier attempts are shown to have ended with no writer left. Each attempt
- *   creates a checkout of its own, bound to the run and the attempt; an earlier attempt's checkout is
- *   preserved where it is, never moved, reused or removed, and the resuming CONFIRM passes every check
- *   again.
- * - Recovery: the same CONFIRM again, never a new plan or a new scope.
- * - Cancel: the run is cancelled first, and then the repair `release_bootstrap_reservation` releases
- *   its reservation, only on positive proof of no external effect: no attempt is in flight, this
- *   process is the only control-plane writer, and either no attempt durably reached the stage that
- *   precedes the attempt ledger's first write (and no ledger exists), or the ledger those attempts
- *   wrote — synced before every GitHub request is sent — holds no receipt and no pending request. A
- *   missing ledger is not that proof, and neither is GitHub's present state. The row becomes RELEASED and keeps
- *   everything it recorded, with the release record beside it; it no longer holds the project id or
- *   repository identity, so a new run may reserve them under its own new approval. The old approval
- *   cannot serve that run: it names the cancelled run, which can never be confirmed again. A pending
- *   request, a ledger that is missing or unreadable after an attempt reached it, or a ledger nothing
- *   explains keeps the reservation RESERVED with RELEASE_IN_DOUBT as its last refusal; a write that
- *   landed keeps it as it is.
- * - STRANDED and COMPLETED are terminal: the reservation is never released or reused.
+ * The legacy approval_digest column stores the write scope for conflict checks. It does not require
+ * an owner receipt. Historical approval records are left in place and are no longer consulted.
  */
 
 export type BootstrapApplicationPhase = "RESERVED" | "WRITTEN" | "COMPLETED" | "STRANDED" | "RELEASED";
@@ -103,8 +58,6 @@ export interface AttemptWriter {
 
 /** What else a reservation records beside its row: the approval it consumed and who made its first attempt. */
 export interface ReservationProvenance {
-  /** The digest of the owner receipt consumed with the reservation: the execution's approval identity. */
-  approvalReceiptDigest: string;
   writer: AttemptWriter | null;
 }
 
@@ -273,7 +226,7 @@ export class BootstrapApplications {
         kind: "BOOTSTRAP_APPLICATION_RESERVED",
         runId: reservation.runId,
         projectId: null,
-        evidence: { ...reservation, approvalReceiptDigest: provenance.approvalReceiptDigest },
+        evidence: { ...reservation },
       });
       return this.recordAttempt(reservation.runId, 0, provenance.writer);
     });
@@ -378,31 +331,6 @@ export class BootstrapApplications {
       runId,
       projectId: null,
       evidence: { attempt },
-    });
-    if (!recorded.allowed) throw acpError(recorded.reasonCode, recorded.message, recorded.evidence);
-  }
-
-  /**
-   * The approval identity of this application's execution: the digest of the owner receipt its
-   * reservation consumed, or of the new owner approval a later attempt was required to consume when
-   * that identity could not be proven. Null when neither is recorded: the identity is unproven.
-   */
-  approvalIdentity(runId: string): string | null {
-    const recorded = [
-      ...this.events("BOOTSTRAP_APPLICATION_RESERVED", runId).map((event) => event["approvalReceiptDigest"]),
-      ...this.events("BOOTSTRAP_APPLICATION_APPROVAL", runId).map((event) => event["approvalReceiptDigest"]),
-    ];
-    const last = recorded.at(-1);
-    return typeof last === "string" && last.length > 0 ? last : null;
-  }
-
-  /** A new owner approval consumed for this execution because its earlier identity was unproven. */
-  recordApprovalIdentity(runId: string, approvalReceiptDigest: string): void {
-    const recorded = this.audit.record({
-      kind: "BOOTSTRAP_APPLICATION_APPROVAL",
-      runId,
-      projectId: null,
-      evidence: { approvalReceiptDigest },
     });
     if (!recorded.allowed) throw acpError(recorded.reasonCode, recorded.message, recorded.evidence);
   }

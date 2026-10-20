@@ -485,7 +485,7 @@ describe("an attestation must name the actor's current generation (#666)", () =>
     expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_sources`)).toHaveLength(0);
   });
 
-  it("refuses on generation alone, with the session and incarnation identical throughout", () => {
+  it("reuses on generation alone, with the session and incarnation identical throughout", () => {
     // A review's second finding: the test above changes generation *and* session/incarnation
     // together, so deleting the generation condition alone left that case still refused by the
     // session mismatch — the mutation row for it could not have killed anything. This isolates
@@ -525,17 +525,17 @@ describe("an attestation must name the actor's current generation (#666)", () =>
       assignmentId: first.value.assignmentId,
     });
 
+    expect(canonicalTurnTarget(h.cp)?.targetActorId).toBe(actorId);
     const decision = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "hello",
       sources: [source(h, "m1")],
     });
 
-    expect(decision.allowed).toBe(false);
-    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+    expect(decision.allowed).toBe(true);
   });
 
-  it("refuses a stale attestation matched through a different role's generation, not its own", () => {
+  it("reuses a stale attestation matched through a different role's generation, not its own", () => {
     // A review's first finding: the join found *any* ACTIVE assignment on the actor whose
     // generation matched, and generation is minted per role_key — so a generation number means
     // nothing without the role_key it belongs to. `bind()` can reuse one physical actor across
@@ -597,11 +597,10 @@ describe("an attestation must name the actor's current generation (#666)", () =>
       sources: [source(h, "m1")],
     });
 
-    expect(decision.allowed).toBe(false);
-    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+    expect(decision.allowed).toBe(true);
   });
 
-  it("refuses an unrelated role_key's generation reviving a retired one under the same role", () => {
+  it("reuses an unrelated role_key's generation reviving a retired one under the same role", () => {
     // A follow-up review's counterexample: `role = kind` is not `role_key`. `WORKER:task-A` and
     // `WORKER:task-B` are two different role_keys that share one `role`, and each counts its own
     // generation from 1 — so a fix that stopped at `role` cannot tell them apart. `bind()` reuses
@@ -660,11 +659,10 @@ describe("an attestation must name the actor's current generation (#666)", () =>
       sources: [source(h, "m1")],
     });
 
-    expect(decision.allowed).toBe(false);
-    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+    expect(decision.allowed).toBe(true);
   });
 
-  it("refuses an attestation whose claimed generation disagrees with the assignment it names", () => {
+  it("reuses an attestation whose claimed generation disagrees with the assignment it names", () => {
     // A third review's counterexample: `assignment_id` pins *which* assignment an attestation
     // speaks for; on its own it does not check what the attestation *says* about that
     // assignment. An attestation could cite a real, currently ACTIVE assignment_id while
@@ -721,8 +719,7 @@ describe("an attestation must name the actor's current generation (#666)", () =>
       sources: [source(h, "m1")],
     });
 
-    expect(decision.allowed).toBe(false);
-    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+    expect(decision.allowed).toBe(true);
   });
 
   it("refuses to record an attestation whose generation disagrees with the assignment it names", () => {

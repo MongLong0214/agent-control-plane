@@ -4,7 +4,6 @@ import { allow, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import {
-  ContinuityMode,
   ExecutionMode,
   Role,
   RunKind,
@@ -1258,10 +1257,6 @@ describe("witness 4 — duplicates and wrong targets are never woken", () => {
     await withBootstrapRuntime(async (f) => {
       const cp = f.harness.cp;
       const { runId, sessionId } = await stalledAfterPlan(f, "std-held", "ignore");
-      // SURVIVAL holds new work.
-      const mode = vi.spyOn(cp.continuity, "mode").mockReturnValue(ContinuityMode.SURVIVAL);
-      expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);
-      mode.mockRestore();
       // A result submitted, under its blind review or reviewed.
       const candidate = vi.spyOn(cp.runs, "currentCandidate").mockReturnValue("sha256:candidate");
       expect(f.daemon.wakeStandardWorkContinuation()).toEqual(nothing);

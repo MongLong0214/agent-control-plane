@@ -61,18 +61,11 @@ export const ReasonCode = {
   // --- CP-HI-04 Independent Quality Role ----------------------------------
   REVIEWER_NOT_INDEPENDENT: "REVIEWER_NOT_INDEPENDENT",
   REVIEWER_SESSION_IS_PRODUCER: "REVIEWER_SESSION_IS_PRODUCER",
-  FINAL_CEO_SESSION_NOT_INDEPENDENT: "FINAL_CEO_SESSION_NOT_INDEPENDENT",
   /**
-   * A WORKER binding named a session that holds another role or owns the task's run. The CTO
-   * routes and reviews; the implementer is a separate session (#512).
+   * A WORKER binding named a session that reviewed the same run, or violated a storage-level
+   * worker separation constraint. Implementer/reviewer separation survives role reuse.
    */
   WORKER_SESSION_NOT_INDEPENDENT: "WORKER_SESSION_NOT_INDEPENDENT",
-  /**
-   * A BOOTSTRAP_CTO binding named a session that holds another role, or another role named a
-   * session holding a BOOTSTRAP_CTO. A run's bootstrap CTO is its own session, never promoted and
-   * never shared with another run (issue #246, RF PRD:156).
-   */
-  BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT: "BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT",
   /**
    * A role with a fixed runtime (a BOOTSTRAP_CTO or a WORKER: Claude Opus) would run on another
    * provider or model. Continuity asked to constitute one elsewhere is refused before anything
@@ -357,7 +350,6 @@ export const ReasonCode = {
   CAPACITY_SENSOR_FILE_STALE: "CAPACITY_SENSOR_FILE_STALE",
   CAPACITY_SENSOR_FILE_INVALID: "CAPACITY_SENSOR_FILE_INVALID",
   CAPACITY_ADMISSION_SUSPENDED: "CAPACITY_ADMISSION_SUSPENDED",
-  CAPACITY_ADMISSION_CONSERVE: "CAPACITY_ADMISSION_CONSERVE",
   CAPACITY_UNKNOWN_NOT_ROUTABLE: "CAPACITY_UNKNOWN_NOT_ROUTABLE",
   CAPACITY_OBSERVATION_PROVENANCE_REQUIRED: "CAPACITY_OBSERVATION_PROVENANCE_REQUIRED",
 
@@ -560,36 +552,6 @@ export const ReasonCode = {
    * again gives the same answer. Not a staleness code, because nothing re-derived would admit it.
    */
   BUZZ_MENTION_PRECEDES_BINDING: "BUZZ_MENTION_PRECEDES_BINDING",
-
-  // --- #246 owner approval of a bootstrap's GitHub writes by a Buzz reply ----
-  /**
-   * An envelope whose text carries the owner-approval marker, in any spelling, reached the message
-   * seam. Approval replies are judged only by their Nostr signature, on the subscriber's approval
-   * route; the seam's relay-attested envelopes can neither approve nor be delivered as work.
-   */
-  BUZZ_OWNER_APPROVAL_NOT_A_MESSAGE: "BUZZ_OWNER_APPROVAL_NOT_A_MESSAGE",
-  /** The approval event's verified signer is not a declared `buzz` owner key. Nothing is written. */
-  BUZZ_APPROVAL_NOT_OWNER: "BUZZ_APPROVAL_NOT_OWNER",
-  /** The event carries the approval marker but not exactly one well-formed token and nothing else like it. */
-  BUZZ_APPROVAL_MALFORMED: "BUZZ_APPROVAL_MALFORMED",
-  /** No single reply reference names a stored approval prompt. */
-  BUZZ_APPROVAL_PROMPT_UNRESOLVED: "BUZZ_APPROVAL_PROMPT_UNRESOLVED",
-  /** The reply's room, or the identity that received it, is not the prompt's. */
-  BUZZ_APPROVAL_PROMPT_WRONG_ROOM: "BUZZ_APPROVAL_PROMPT_WRONG_ROOM",
-  /** The token's code is not the code of the prompt the reply references. */
-  BUZZ_APPROVAL_PROMPT_CODE_MISMATCH: "BUZZ_APPROVAL_PROMPT_CODE_MISMATCH",
-  /** The prompt was cancelled: its run left review, its scope changed, or it was re-issued. */
-  BUZZ_APPROVAL_PROMPT_CANCELLED: "BUZZ_APPROVAL_PROMPT_CANCELLED",
-  /** The prompt already holds a different answer; a prompt is answered once. */
-  BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED: "BUZZ_APPROVAL_PROMPT_ALREADY_ANSWERED",
-  /** The prompt's server-stored expiry has passed, or the reply was signed before the prompt existed. */
-  BUZZ_APPROVAL_PROMPT_EXPIRED: "BUZZ_APPROVAL_PROMPT_EXPIRED",
-  /** The run's current approval scope is no longer the one the prompt binds; the evidence names the field. */
-  BUZZ_APPROVAL_PROMPT_STALE: "BUZZ_APPROVAL_PROMPT_STALE",
-  /** The run is not awaiting an owner decision on this scope, so nothing is minted. */
-  BUZZ_APPROVAL_RUN_NOT_AWAITING_APPROVAL: "BUZZ_APPROVAL_RUN_NOT_AWAITING_APPROVAL",
-  /** No prompt can be posted now: the approval identity is unset, not admitted, not held or not connected. */
-  BUZZ_APPROVAL_IDENTITY_UNAVAILABLE: "BUZZ_APPROVAL_IDENTITY_UNAVAILABLE",
 
   // --- canonical turns -----------------------------------------------------
   /**
@@ -912,7 +874,6 @@ export const ReasonCode = {
   // --- bootstrap -----------------------------------------------------------
   BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT: "BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT",
   BOOTSTRAP_ACTIVATION_INCOMPLETE: "BOOTSTRAP_ACTIVATION_INCOMPLETE",
-  BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION: "BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION",
   /**
    * A PROJECT_BOOTSTRAP CONFIRM completes only on its durable application record (issue #246 PR-C
    * slice C3) WRITTEN for the candidate it names, which only the Repo Factory runner's full path
@@ -1018,7 +979,6 @@ export const isReasonCode = (value: string): value is ReasonCode => ALL.has(valu
  */
 export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.BINDING_GENERATION_STALE,
-  ReasonCode.BUZZ_APPROVAL_PROMPT_STALE,
   ReasonCode.BUZZ_PEER_GENERATION_STALE,
   ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
   ReasonCode.CAPACITY_SENSOR_FILE_STALE,

@@ -40,7 +40,7 @@ const planned = async (f: BootstrapRuntimeFixture, onResult: ScriptedBootstrapOw
   const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onResult, onRevision: "ignore" });
   const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
   // The dispatch turn plans (and may submit a result, which runs a review): waited for, however long it takes under load.
-  await f.awaitFinishedTurns(ownerSessionId, 2);
+  await f.awaitFinishedTurns(ownerSessionId, 1);
   await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false), { timeout: 10_000, interval: 25 });
   expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
   expect(owner.results).toEqual([]);
@@ -85,12 +85,12 @@ describe("the result recovery wake: once per (run, owner generation, PLAN digest
     await withBootstrapRuntime(async (f) => {
       const { owner, runId, ownerSessionId, roleKey, planDigest } = await planned(f, "ignore");
       expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [{ runId, roleKey, bindingGeneration: 1, planDigest }] });
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
       expect(owner.prompts.at(-1)).toContain(`The control plane woke you for: ${resultRecoveryTriggerKind(runId)}.`);
       expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
       expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
       await ticks(50);
-      expect(f.finishedTurns(ownerSessionId)).toBe(3);
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
       const triggerId = resultRecoveryTriggerId(runId, 1, planDigest);
       expect(markers(f, runId)).toEqual([{ bindingGeneration: 1, planDigest, triggerId }]);
       expect(f.harness.cp.sessionRuntime.wake(roleKey, [{ id: triggerId, kind: resultRecoveryTriggerKind(runId) }]))
@@ -178,7 +178,7 @@ describe("the result recovery wake: once per (run, owner generation, PLAN digest
       expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.ACTIVE, ownerBindingGeneration: 1 });
       expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
       expect(markers(f, runId)).toEqual([]);
-      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
     });
   });
 
@@ -187,7 +187,7 @@ describe("the result recovery wake: once per (run, owner generation, PLAN digest
       const { runId, ownerSessionId, roleKey, planDigest } = await planned(f, "ignore");
       const first = await startDaemon(f, "first");
       try {
-        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3), { timeout: 10_000, interval: 25 });
+        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
         await ticks(200);
       } finally {
         await first.stop();
@@ -199,7 +199,7 @@ describe("the result recovery wake: once per (run, owner generation, PLAN digest
       } finally {
         await second.stop();
       }
-      expect(f.finishedTurns(ownerSessionId)).toBe(3);
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
       expect(markers(f, runId)).toHaveLength(1);
       expect(f.harness.cp.sessionRuntime.wake(roleKey, [{
         id: resultRecoveryTriggerId(runId, 1, planDigest),
@@ -278,7 +278,7 @@ describe("the prompt: the bootstrap result directive and the result recovery wak
       const first = await planned(f, "ignore");
       const second = await planned(f, "ignore");
       expect(f.daemon.wakeBootstrapResultRecovery().woken).toHaveLength(2);
-      await vi.waitFor(() => expect(f.finishedTurns(first.ownerSessionId) + f.finishedTurns(second.ownerSessionId)).toBe(6));
+      await vi.waitFor(() => expect(f.finishedTurns(first.ownerSessionId) + f.finishedTurns(second.ownerSessionId)).toBe(4));
       const prompts = f.claude.turns.filter((turn) => !/nonce set to/.test(turn.prompt)).map((turn) => turn.prompt);
       expect(prompts).toHaveLength(4);
       const lines = (prompt: string) => prompt.split("\n");

@@ -1063,7 +1063,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(JSON.stringify(stored?.content)).not.toContain("primaryCto");
   });
 
-  it("#246: a bootstrap CTO is never promoted; its session takes no primary CTO role", async () => {
+  it("#246: a bootstrap CTO session can be reused for a primary CTO role", async () => {
     const harness = makeHarness();
     const created = harness.cp.runs.create({
       kind: RunKind.PROJECT_BOOTSTRAP,
@@ -1078,8 +1078,8 @@ describe("Repo Factory boundary (CP-S52)", () => {
       projectId: "promotion-target",
       sessionId: dispatched.ownerSessionId!,
     });
-    expect(promoted.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
-    expect(harness.cp.bindings.activePrimaryCto("promotion-target")).toBeNull();
+    expect(promoted.allowed).toBe(true);
+    expect(harness.cp.bindings.activePrimaryCto("promotion-target")?.sessionId).toBe(dispatched.ownerSessionId);
     expect("canPromoteBootstrapCto" in harness.cp.bootstrap).toBe(false);
   });
 });

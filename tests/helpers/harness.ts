@@ -322,7 +322,6 @@ export const bootstrapCtoProvider = (cp: ControlPlane, clock: Clock): HeadlessRu
   const launch = inProcessLaunchChannel();
   const claude = new HeadlessRuntimeDouble(clock, "claude").useInProcess({
     launch,
-    attest: (peer, nonce) => cp.sessionAttestations.attest(peer, nonce),
   });
   cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
   cp.providers.registerForRole(claude, Role.PRIMARY_CTO);

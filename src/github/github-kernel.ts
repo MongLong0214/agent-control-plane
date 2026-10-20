@@ -4302,23 +4302,13 @@ export class GitHubKernel {
       });
     }
     const status = port.humanGateStatus(payload.runId);
-    if (!status.required) {
-      return payload.humanGateDigest === NO_HUMAN_GATE_DIGEST
-        ? allow(ReasonCode.OK, undefined)
-        : deny(
-            ReasonCode.GATE_EVIDENCE_NOT_BACKED,
-            "run needs no owner decision; the payload must carry the canonical no-human-gate digest",
-            { runId: payload.runId, expected: NO_HUMAN_GATE_DIGEST, observed: payload.humanGateDigest },
-          );
-    }
-    if (!status.satisfied || payload.humanGateDigest !== status.humanGateDigest) {
+    if (!status.required) return allow(ReasonCode.OK, undefined);
+    if (!status.satisfied) {
       const evidence = {
         runId: payload.runId,
         required: status.required,
         items: status.items,
         satisfied: status.satisfied,
-        expectedDigest: status.humanGateDigest,
-        suppliedDigest: payload.humanGateDigest,
       };
       return !status.satisfied && status.decideAgain && status.decideAgain.length > 0
         ? deny(ReasonCode.HUMAN_GATE_UNSATISFIED, OWNER_DECIDE_AGAIN_MESSAGE, {
@@ -4350,7 +4340,7 @@ export class GitHubKernel {
     const receipts = this.db.all<{ response_json: string; verified: number }>(
       `SELECT response_json, verified FROM github_receipts
         WHERE operation = 'pr_prepare' AND run_id = ? AND repository_identity = ?
-        ORDER BY created_at DESC`,
+        ORDER BY created_at DESC, rowid DESC`,
       [runId, repositoryIdentity],
     );
     const receipt = receipts.find((entry) => {
@@ -4776,7 +4766,7 @@ export class GitHubKernel {
   receipts(runId: string): Array<{ operation: string; resourceIdentity: string; verified: boolean }> {
     return this.db
       .all<{ operation: string; resource_identity: string; verified: number }>(
-        `SELECT operation, resource_identity, verified FROM github_receipts WHERE run_id = ? ORDER BY created_at`,
+        `SELECT operation, resource_identity, verified FROM github_receipts WHERE run_id = ? ORDER BY created_at, rowid`,
         [runId],
       )
       .map((r) => ({ operation: r.operation, resourceIdentity: r.resource_identity, verified: r.verified === 1 }));

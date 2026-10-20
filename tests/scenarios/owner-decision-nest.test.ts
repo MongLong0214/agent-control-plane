@@ -31,7 +31,7 @@ import {
 
 afterAll(cleanupTempDirs);
 
-const ITEMS = ["irreversible production action", "undelegated public release"] as const;
+const ITEMS = ["irreversible production action", "project decommission"] as const;
 const [ITEM_A, ITEM_B] = ITEMS;
 const CI_WORKFLOWS = [
   { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, unapprovedFirstActivation: true, repositoryRole: "primary" },
@@ -251,7 +251,7 @@ describe("FIX-SEC-NEST controls: what SQLite reads as an owner decision is judge
     });
   });
 
-  it("ODNESTCONTROL a flat \"service\" refusal bound to another candidate, gate or receipt is ignored", async () => {
+  it("ODNESTCONTROL a retained refusal survives candidate and gate changes", async () => {
     const w = await world([ITEM_A], true);
     decide(w, ITEM_B, true, "approved");
     const path = w.harness.cp.config.databasePath;
@@ -259,14 +259,14 @@ describe("FIX-SEC-NEST controls: what SQLite reads as an owner decision is judge
     writeOutsideTheGuard(path, w.runId, decision(w, "other gate", { gate: digestOf([ITEM_B]) }), w.candidate, FUTURE);
     writeOutsideTheGuard(path, w.runId, decision(w, "other receipt run", { receipt: { runId: "run_other" } }), w.candidate, FUTURE);
     writeOutsideTheGuard(path, w.runId, decision(w, "stored for another candidate"), OTHER_CANDIDATE, FUTURE);
-    expect({ gate: gate(w), confirm: confirm(w), publish: await publish(w) }).toEqual({ gate: SATISFIED, confirm: "ALLOWED", publish: "ALLOWED" });
+    expect({ gate: gate(w), confirm: confirm(w), publish: await publish(w) }).toEqual({ gate: UNSATISFIED, confirm: ReasonCode.HUMAN_GATE_UNSATISFIED, publish: ReasonCode.HUMAN_GATE_UNSATISFIED });
   });
 
   it("ODNESTCONTROL a flat \"service\" approval is never promoted: the item is named to decide again", async () => {
     const w = await world([ITEM_A], true);
     writeOutsideTheGuard(w.harness.cp.config.databasePath, w.runId, decision(w, "flat approve", { approved: true }), w.candidate, w.harness.clock.nowIso());
     expect({ gate: gate(w), confirm: confirm(w) }).toEqual({
-      gate: { satisfied: false, decideAgain: [ITEM_B], digest: false }, confirm: ReasonCode.HUMAN_GATE_UNSATISFIED,
+      gate: { satisfied: false, decideAgain: [], digest: false }, confirm: ReasonCode.HUMAN_GATE_UNSATISFIED,
     });
   });
 });

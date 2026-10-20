@@ -35,7 +35,7 @@ let keys = 0;
 const quietOwner = async (f: BootstrapRuntimeFixture) => {
   acknowledgeInBandOnWorkTurns(f);
   const run = await f.dispatchBootstrap();
-  await f.awaitFinishedTurns(run.ownerSessionId, 2);
+  await f.awaitFinishedTurns(run.ownerSessionId, 1);
   f.claude.onWorkTurn = async () => {};
   return run;
 };
@@ -62,7 +62,7 @@ const latchFirstWorkTurn = (f: BootstrapRuntimeFixture) => {
   });
   let held = 0;
   f.claude.runSessionTurn = async (request) => {
-    if (held === 0 && request.relay !== null && request.conversation === "resume") {
+    if (held === 0 && request.relay !== null) {
       held += 1;
       enter();
       await released;
@@ -134,7 +134,7 @@ const failResultStore = (f: BootstrapRuntimeFixture, key: string) => {
 };
 
 describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", () => {
-  it("while the RUN_DISPATCH turn is held past vi.waitFor's default 1000 ms quietOwner stays pending; once it is released, quietOwner resolves with two finished turns", async ({ signal, onTestFinished }) => {
+  it("while the RUN_DISPATCH turn is held past vi.waitFor's default 1000 ms quietOwner stays pending; once it is released, quietOwner resolves with one finished turn", async ({ signal, onTestFinished }) => {
     // This test's own end, which the runner awaits before the next test on every cooperative exit (a pass,
     // an assertion failure, a rejection, its timeout), bounded by hookTimeout: release the held turn, then
     // collect the body, fixture close included. The body never waits on this hook. Its failure is already
@@ -219,7 +219,7 @@ describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", 
         );
         expect(state).toBe("pending");
         expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(true);
-        expect(f.finishedTurns(ownerSessionId)).toBe(1);
+        expect(f.finishedTurns(ownerSessionId)).toBe(0);
       } catch (error) {
         failure = { error };
         throw error;
@@ -255,7 +255,7 @@ describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", 
       const { runId, ownerSessionId } = run!;
       expect(outcome.run).toMatchObject({ runId, ownerSessionId });
       expect(latch.held()).toBe(1);
-      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
       expect(f.harness.cp.outbox.listByRun(runId).filter((m) => m.kind === MessageKind.RUN_DISPATCH)).toMatchObject([{ status: "ACKED" }]);
     });
     await body;
@@ -266,7 +266,7 @@ describe("#1156: quietOwner waits for the RUN_DISPATCH turn, not a wall clock", 
       // The commit's wake reaches nothing, so no turn follows the attestation.
       f.harness.cp.outbox.attachInBandWake(async () => allow(ReasonCode.OK, undefined));
       await expect(quietOwner(f)).rejects.toThrow(
-        /expected 2 finished turns of \S+; reached 1 finished, no turn running or queued; turns \[SESSION_TURN\(attestation, OK\)\]; in-band rows \[RUN_DISPATCH:PENDING\]$/,
+        /expected 1 finished turns of \S+; reached 0 finished, no turn running or queued; turns \[\]; in-band rows \[RUN_DISPATCH:PENDING\]$/,
       );
     });
   });
