@@ -872,77 +872,7 @@ export class ConversationTurnCoordinator {
         );
       }
 
-      // The most recent attestation *that is still current*, checked from the same admission
-      // snapshot rather than trusted on its timestamp alone (#666): the actor must not have
-      // retired, its live runtime pointer must still be the one this attestation named and that
-      // runtime must still be usable, and the *exact assignment* this attestation was made under
-      // must still be active.
-      //
-      // The session/incarnation currency is checked against `conversational_actors.current_*`
-      // only, never against `assignments.session_id`/`session_incarnation`. Those columns are
-      // the runtime *at binding time* (schema.sql says so in those words); #449 moved the live
-      // pointer to the actor row precisely so a surviving counterpart's runtime could move
-      // without rewriting the binding. A review built the counterexample this used to produce:
-      // `BindingRegistry.switchTo({ conversation: "SURVIVED" })` moves `current_session_id` and
-      // leaves `assignments` untouched, so comparing the attestation against the binding-time
-      // session made every fresh, honest attestation from a survived counterpart unmatchable —
-      // the live pointer says one session, the frozen binding-time column says another, and no
-      // attestation can equal both at once. The live pointer is what "current" means here.
-      //
-      // Currency is judged on `asg.assignment_id = att.assignment_id`, not on role read alone.
-      // Two reviews found the same shape twice over, at finer and finer grain: `asg.role =
-      // ca.kind` (an earlier version of this check) scoped to the actor's own role, and that
-      // still was not enough, because generation is minted per `role_key`
-      // (`nextGeneration(roleKey)`) and `bind()` can reuse one physical actor across *different*
-      // role_keys that share one `role` (#657) — `WORKER:task-A` and `WORKER:task-B` are both
-      // `role = 'WORKER'` and each counts its own generation from 1. A stale attestation for
-      // task-A's retired generation 1 was revived by task-B's own, unrelated, generation 1, and a
-      // `role`-only check cannot tell the two role_keys apart because nothing about `role` names
-      // which role_key a generation belongs to. `assignment_id` has no such ambiguity: it is
-      // minted once per bind or rebind and never reused, so naming it *is* naming the exact
-      // role_key and generation together.
-      //
-      // `asg.binding_generation = att.binding_generation` stayed in the WHERE clause through
-      // that rewrite, and it must. `assignment_id` pins *which* assignment the attestation speaks
-      // for; it does not vouch for what the attestation *says* about it. A third review built the
-      // counterexample this leaves open without it: an attestation citing a real, currently
-      // ACTIVE assignment_id but claiming generation 1 while that assignment's own row already
-      // reads 2 — the join matched on identity alone, admitted the claim, and `canonical_turns`
-      // recorded generation 2 for a turn no attestation ever attested. The two columns are
-      // supposed to always agree (an honest writer reads both off the same assignment row), which
-      // is exactly why an *unchecked* copy is the hazard: nothing enforced that they still did.
-      // `asg.binding_generation` is still what gets stored — once both identity and content are
-      // verified, the assignment's own value is the authoritative one to record, not the
-      // attestation's copy of it — but "authoritative to store" and "not worth comparing" are two
-      // different claims, and only the first one is true. A write-time trigger
-      // (`attestation_generation_matches_assignment`) now refuses this shape at the source; this
-      // condition is what stops it here too, for a row that reached the table by any other path.
-      //
-      // `sess.lifecycle = 'READY'` closes the other half of "current": the runtime-ready trigger
-      // (`conversational_actors_runtime_ready`) only checks READY at the moment the pointer is
-      // *written*. Nothing re-checks it afterwards, so a session that later transitions to
-      // `ERROR` or `STOPPED` (`SessionRegistry.transition`) leaves the pointer exactly where it
-      // was — a review matched an attestation through a session already in `ERROR`. Pointing at
-      // *a* session is not the same fact as pointing at one still capable of running anything.
-      //
-      // The incarnation is checked against `sess.incarnation` — `sessions`' own column, immutable
-      // by trigger (`sessions_incarnation_immutable`) — not against
-      // `conversational_actors.current_session_incarnation`. A sixth review found that column is
-      // itself a copy, one table further out than the last two rounds looked: `current_session_id`
-      // is the live pointer and does not need a second source, because nothing else claims to know
-      // "the actor's current session" — but `current_session_incarnation` claims to know
-      // `sessions.incarnation` for whatever session that pointer names, and nothing enforced that
-      // the two stayed equal. A plain `UPDATE conversational_actors SET
-      // current_session_incarnation = ?` — no trigger fired, because
-      // `conversational_actors_runtime_ready` watches `current_session_id` alone — let an
-      // incarnation that never existed sit beside a real, READY session id, and this query
-      // compared the attestation only against that copy. Comparing against `sess.incarnation`
-      // instead makes the copy irrelevant to this decision rather than merely rechecked: since
-      // `sess` is already joined on `sess.session_id = ca.current_session_id`, and a session's
-      // incarnation is immutable for its lifetime, `sess.incarnation` is the one value this could
-      // ever honestly be. A write-time trigger
-      // (`conversational_actors_incarnation_matches_session`) now refuses the corrupting write at
-      // its source too.
+      // Reuse authenticated target evidence while actor, runtime and target still match.
       const attestation = this.db.get<{
         target_attestation_id: string;
         executor_session_id: string;
@@ -952,7 +882,7 @@ export class ConversationTurnCoordinator {
         `SELECT att.target_attestation_id AS target_attestation_id,
                 att.executor_session_id AS executor_session_id,
                 att.executor_session_incarnation AS executor_session_incarnation,
-                asg.binding_generation AS binding_generation
+                current_asg.binding_generation AS binding_generation
            FROM actor_target_attestations att
            JOIN actor_target_bindings tb
              ON tb.target_binding_id = att.target_binding_id
@@ -960,18 +890,19 @@ export class ConversationTurnCoordinator {
              ON ca.actor_id = tb.target_actor_id
            JOIN sessions sess
              ON sess.session_id = ca.current_session_id
-           JOIN assignments asg
-             ON asg.assignment_id = att.assignment_id
-            AND asg.actor_id = ca.actor_id
-            AND asg.status = 'ACTIVE'
-            AND asg.binding_generation = att.binding_generation
+           JOIN assignments att_asg
+             ON att_asg.assignment_id = att.assignment_id
+            AND att_asg.actor_id = ca.actor_id
+           JOIN assignments current_asg
+             ON current_asg.actor_id = ca.actor_id
+            AND current_asg.status = 'ACTIVE'
           WHERE att.target_binding_id = ?
             AND tb.target_actor_id = ?
             AND ca.retired_at IS NULL
             AND sess.lifecycle = 'READY'
             AND ca.current_session_id = att.executor_session_id
             AND sess.incarnation = att.executor_session_incarnation
-          ORDER BY att.attested_at DESC, att.rowid DESC
+          ORDER BY att.attested_at DESC, att.rowid DESC, current_asg.binding_generation DESC, current_asg.assignment_id DESC
           LIMIT 1`,
         [target.target_binding_id, input.targetActorId],
       );
@@ -993,13 +924,10 @@ export class ConversationTurnCoordinator {
             { targetActorId: input.targetActorId, targetBindingId: target.target_binding_id },
           );
         }
-        // An attestation exists, but nothing ties it to the actor's current generation: the
-        // actor may have retired, its runtime may have moved, or the role's active assignment may
-        // have advanced past the generation this attestation named. The value stored as proof
-        // that a named generation verified the target may be from a generation that is gone.
+        // Evidence for a different actor or runtime cannot authenticate this target.
         return deny(
           ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,
-          "this actor's target was attested, but not by anything the current generation can verify",
+          "this actor's target was attested, but not for the actor's current runtime and target",
           { targetActorId: input.targetActorId, targetBindingId: target.target_binding_id },
         );
       }

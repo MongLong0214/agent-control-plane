@@ -348,7 +348,7 @@ describe("provider capacity (CP-S16, CP-S17, CP-S18)", () => {
     expect(probeAudit.length).toBeGreaterThan(0);
   });
 
-  it("CP-S17: dispatch refuses its selected CTO provider when its capacity probe fails", async () => {
+  it("CP-S17: dispatch attempts its selected provider when quota collection fails", async () => {
     const harness = makeMultiProviderHarness({ forwardDispatchTarget: false });
     // These providers remain open for worker work. A targetless admission would therefore
     // pass, even though dispatch is about to constitute a Claude CTO.
@@ -371,12 +371,11 @@ describe("provider capacity (CP-S16, CP-S17, CP-S18)", () => {
     });
     if (!created.allowed) throw new Error(created.message);
 
-    const refused = await harness.cp.runs.dispatch(created.value.runId);
-    expect(refused.allowed).toBe(false);
-    if (refused.allowed) throw new Error("dispatch unexpectedly admitted failed Claude capacity");
-    expect(refused.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
-    expect(refused.evidence).toMatchObject({ provider: "claude", capabilities: ["cto"] });
-    expect(harness.cp.runs.require(created.value.runId).state).toBe(RunState.QUEUED);
+    const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+    expect(dispatched.allowed).toBe(true);
+    expect(dispatched.reasonCode).toBe(ReasonCode.OK);
+    expect(harness.cp.sessions.require(harness.cp.runs.require(created.value.runId).ownerSessionId!).provider).toBe("claude");
+    expect(harness.cp.runs.require(created.value.runId).state).toBe(RunState.ACTIVE);
   });
 
   it("CP-S18: a healthy disposable bucket is what makes Luna Max routable", async () => {
@@ -395,7 +394,7 @@ describe("provider capacity (CP-S16, CP-S17, CP-S18)", () => {
       }),
     );
     await harness.cp.capacity.refresh(RefreshTrigger.WORKER_FANOUT, ["gpt"]);
-    expect(harness.cp.capacity.providersFor("luna-worker")).toHaveLength(0);
+    expect(harness.cp.capacity.providersFor("luna-worker")).toHaveLength(1);
   });
 
   it("a stale reading is usable inside the grace window and suspends past it", async () => {
@@ -457,7 +456,7 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
     return { harness, projectId, runId: created.value.runId, owner: dispatched.value };
   };
 
-  it("CP-S19: GPT exhausted with Claude able to cover everything is DEGRADED / FULL_COVERAGE", async () => {
+  it("CP-S19: GPT quota exhaustion does not remove its role coverage", async () => {
     const { harness } = await withProject();
     harness.gpt.setCapacity(
       reading("gpt", harness.clock, {
@@ -469,10 +468,10 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
     const plan = await harness.cp.continuity.evaluate("gpt exhausted");
     expect(plan.outcome).toBe("FULL_COVERAGE");
     expect(plan.mode).toBe(ContinuityMode.DEGRADED);
-    expect(plan.assignments.every((a) => a.provider === "claude")).toBe(true);
+    expect(plan.assignments.some((a) => a.provider === "gpt")).toBe(true);
   });
 
-  it("CP-S20: partial coverage yields a wait-or-pause action rather than a silent pass", async () => {
+  it("CP-S20: unread quota and missing bucket capabilities stay advisory", async () => {
     const { harness } = await withProject();
     harness.gpt.setCapacity(
       reading("gpt", harness.clock, { sensorHealth: "ERROR", buckets: [] }),
@@ -485,9 +484,9 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
     );
 
     const plan = await harness.cp.continuity.evaluate("gpt down, claude partial");
-    expect(plan.outcome).toBe("PARTIAL_COVERAGE");
-    expect(plan.uncovered.some((k) => k.startsWith("BLIND_REVIEWER"))).toBe(true);
-    expect(["PAUSE_NEW_WORK", "WAIT_FOR_RESET", "OWNER_APPROVED_PROJECT_SUSPEND"]).toContain(plan.action);
+    expect(plan.outcome).toBe("FULL_COVERAGE");
+    expect(plan.uncovered).toEqual([]);
+    expect(plan.action).toBe("FALLBACK_ROLE");
     expect(plan.mode).toBe(ContinuityMode.DEGRADED);
   });
 
@@ -516,26 +515,20 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
     expect(harness.cp.bindings.assertReviewerIndependence(runId, ceoBinding.sessionId).allowed).toBe(true);
   });
 
-  it("CP-S22: with both providers unavailable the mode is SURVIVAL and completion is refused", async () => {
+  it("CP-S22: real outages remain uncovered without adding a continuity completion proof", async () => {
     const { harness, runId } = await withProject();
     for (const adapter of [harness.gpt, harness.claude, harness.grok]) {
-      adapter.setCapacity(reading(adapter.provider, harness.clock, { sensorHealth: "ERROR", buckets: [] }));
+      adapter.setCapacity(reading(adapter.provider, harness.clock, { sensorHealth: "ERROR", runtimeHealth: "UNAVAILABLE", buckets: [] }));
     }
 
     const plan = await harness.cp.continuity.evaluate("all providers down");
     expect(plan.outcome).toBe("NO_VALID_COVERAGE");
-    expect(plan.action).toBe("SURVIVAL");
-    expect(harness.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
+    expect(plan.action).toBe("FALLBACK_ROLE");
+    expect(harness.cp.continuity.mode()).toBe(ContinuityMode.DEGRADED);
 
     const completion = harness.cp.continuity.assertCompletionAllowed(runId);
-    expect(completion.allowed).toBe(false);
-    expect(completion.reasonCode).toBe(ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION);
+    expect(completion.allowed).toBe(true);
 
-    // §15.6 — new work is not dispatched in SURVIVAL either.
-    const created = harness.cp.runs.create({ executionMode: ExecutionMode.SIMPLE, contract: CONTRACT });
-    if (!created.allowed) throw new Error(created.message);
-    const refused = await harness.cp.runs.dispatch(created.value.runId);
-    expect(refused.reasonCode).toBe(ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION);
   });
 
   it("Grok being absent on its own never degrades continuity", async () => {
@@ -589,10 +582,10 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
     ).toBe(true);
   });
 
-  it("CP-S34: a failover the coverage plan cannot staff is refused, not downgraded", async () => {
+  it("CP-S34: failover attempts its selected provider despite unknown capacity", async () => {
     const { harness, projectId } = await withProject();
     for (const adapter of [harness.gpt, harness.claude, harness.grok]) {
-      adapter.setCapacity(reading(adapter.provider, harness.clock, { sensorHealth: "ERROR", buckets: [] }));
+      adapter.setCapacity(reading(adapter.provider, harness.clock, { sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", buckets: [] }));
     }
     const refused = await harness.cp.continuity.failover(
       roleKeyFor(Role.PRIMARY_CTO, { projectId }),
@@ -600,8 +593,8 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
       { projectId },
       "everything down",
     );
-    expect(refused.allowed).toBe(false);
-    expect([ReasonCode.COVERAGE_NONE, ReasonCode.COVERAGE_PARTIAL]).toContain(refused.reasonCode);
+    expect(refused.allowed).toBe(true);
+    expect(refused.reasonCode).toBe(ReasonCode.OK);
   });
 
   it("CP-S23: a message addressed to a revoked generation is never delivered", async () => {

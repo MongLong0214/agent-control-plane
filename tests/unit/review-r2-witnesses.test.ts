@@ -24,7 +24,7 @@ describe("ROUND1-ESCAPE-01: a successful CLI return does not settle an unacknowl
         });
       }
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       const pending = () => f.harness.cp.outbox.listByRun(runId).filter((m) => m.kind === MessageKind.RUN_DISPATCH);
       expect(pending().map((m) => m.status)).toEqual(["PENDING"]);
       const handled = acknowledgeInBandOnWorkTurns(f);
@@ -37,7 +37,7 @@ describe("ROUND1-ESCAPE-01: a successful CLI return does not settle an unacknowl
       );
       process.stdout.write(`UNACKED-WITNESS ${JSON.stringify({ cause, turns: f.finishedTurns(ownerSessionId), messages: pending().map((m) => m.status), refusals, handled })}\n`);
       expect(refusals).toEqual([]);
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
       expect(handled).toEqual([{ kind: MessageKind.RUN_DISPATCH, generation: 1, acked: true }]);
       expect(pending().map((m) => m.status)).toEqual(["ACKED"]);
     });
@@ -71,17 +71,17 @@ describe("repair recovery siblings", () => {
     await withBootstrapRuntime(async (f) => {
       acknowledgeInBandOnWorkTurns(f);
       const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       expect(f.harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "review fixture").allowed).toBe(true);
       expect(f.harness.cp.runs.transition(runId, state, "semantic hold fixture").allowed).toBe(true);
       f.harness.cp.sessionRuntime.release(ownerSessionId);
       await f.daemon.reconcileContinuity("credential lost");
-      f.claude.presentAttestation = false;
+      vi.spyOn(f.claude, "probeRuntime").mockResolvedValueOnce("HEALTHY").mockResolvedValueOnce("UNAVAILABLE");
       await f.daemon.reconcileContinuity("failed recovery");
       expect(f.harness.cp.bindings.active(roleKey)).toBeNull();
       expect(f.harness.cp.runs.require(runId)).toMatchObject({ state, ownerBindingGeneration: 1 });
       expect(f.harness.cp.db.all("SELECT * FROM audit_events WHERE kind = 'BOOTSTRAP_CTO_RECOVERY_REVOKE_DEFERRED'")).toEqual([]);
-      f.claude.presentAttestation = true;
+      vi.mocked(f.claude.probeRuntime).mockRestore();
       f.harness.clock.advance(BOOTSTRAP_CTO_RECOVERY_BACKOFF_MS + 1);
       await f.daemon.reconcileContinuity("recovery retry");
       expect(f.harness.cp.bindings.active(roleKey)?.bindingGeneration).toBe(3);
@@ -94,12 +94,12 @@ describe("repair recovery siblings", () => {
     await withBootstrapRuntime(async (f) => {
       const handled = acknowledgeInBandOnWorkTurns(f);
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       for (let revision = 1; revision <= 2; revision++) {
         expect(f.harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "review fixture").allowed).toBe(true);
         expect(f.harness.cp.runs.transition(runId, RunState.REVISION_REQUIRED, "revision fixture").allowed).toBe(true);
         expect(await f.hermes("run_dispatch", { runId })).toMatchObject({ ok: true });
-        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2 + 2 * revision));
+        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(1 + revision));
         expect(await f.hermes("run_dispatch", { runId })).toMatchObject({ ok: false, reasonCode: ReasonCode.RUN_TRANSITION_ILLEGAL });
       }
       expect(handled).toHaveLength(3);

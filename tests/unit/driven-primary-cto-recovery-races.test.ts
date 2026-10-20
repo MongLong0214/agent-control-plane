@@ -117,17 +117,17 @@ it("1084-R1-03: a changed binding during probe must not authorize rotation of th
     cp.sessionRuntime.release(old.sessionId);
     cp.sessionRuntime.release(other.sessionId);
     const before = cp.sessions.require(old.sessionId).credentialEpoch;
-    const original = f.claude.runSessionTurn.bind(f.claude);
+    const original = f.claude.probeSession.bind(f.claude);
     let moved = false;
-    f.claude.runSessionTurn = async (request) => {
-      if (!moved && request.handle.externalSessionId === externalOf(f, old.sessionId) && request.relay === null) {
+    f.claude.probeSession = async (handle) => {
+      if (!moved && handle.externalSessionId === externalOf(f, old.sessionId)) {
         moved = true;
         const changed = cp.bindings.switchTo({ roleKey: old.roleKey, role: Role.PRIMARY_CTO, projectId: old.projectId,
           sessionId: other.sessionId, mode: "PREFERRED", reason: "fixture concurrent bind", conversation: "SURVIVED" });
         if (!changed.allowed) throw new Error(changed.message);
         expect(cp.bindings.active(old.roleKey)?.sessionId).toBe(other.sessionId);
       }
-      return original(request);
+      return original(handle);
     };
     const recovered = await cp.cto.recoverDrivenPrimaryCto(old.roleKey, { capacity: cp.capacity, runtime: cp.sessionRuntime });
     expect(moved).toBe(true);
@@ -142,11 +142,11 @@ it("1084-R1-03 (replaced binding): a newer driven binding for the role during th
     const { binding: old, bootstrap } = await drivenPrimary(f, "review-binding-replaced");
     cp.sessionRuntime.release(old.sessionId);
     const before = cp.sessions.require(old.sessionId).credentialEpoch;
-    const original = f.claude.runSessionTurn.bind(f.claude);
+    const original = f.claude.probeSession.bind(f.claude);
     let replacement = "";
     let replacementEpoch = -1;
-    f.claude.runSessionTurn = async (request) => {
-      if (!replacement && request.handle.externalSessionId === externalOf(f, old.sessionId) && request.relay === null) {
+    f.claude.probeSession = async (handle) => {
+      if (!replacement && handle.externalSessionId === externalOf(f, old.sessionId)) {
         // During the old session's probe the role is released and given to a new driven session.
         expect(cp.bindings.revoke(old.roleKey, "fixture released during the probe").allowed).toBe(true);
         replacement = "pending";
@@ -156,7 +156,7 @@ it("1084-R1-03 (replaced binding): a newer driven binding for the role during th
         cp.sessionRuntime.release(replacement);
         replacementEpoch = cp.sessions.require(replacement).credentialEpoch;
       }
-      return original(request);
+      return original(handle);
     };
     const recovered = await cp.cto.recoverDrivenPrimaryCto(old.roleKey, { capacity: cp.capacity, runtime: cp.sessionRuntime });
     expect(recovered).toMatchObject({ allowed: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE });

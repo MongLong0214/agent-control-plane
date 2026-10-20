@@ -46,11 +46,12 @@ afterEach(async () => {
 const acceptedSocket = async (): Promise<Socket> => {
   const dir = mkdtempSync("/tmp/acprc-");
   const path = join(dir, "s.sock");
-  const accepted = new Promise<Socket>((resolve) => {
+  const accepted = new Promise<Socket>((resolve, reject) => {
     const server: Server = createServer((socket) => {
       socket.on("error", () => undefined);
       resolve(socket);
     });
+    server.once("error", reject);
     server.listen(path);
     cleanups.push(() => new Promise<void>((done) => server.close(() => done())));
   });

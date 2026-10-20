@@ -112,15 +112,8 @@ describe("#246 C4-R2 — a driven PRIMARY_CTO is recovered on its own session, a
       expect(sessionCount(f)).toBe(sessionsBefore);
       expect(f.claude.started.length).toBe(startedBefore);
       expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(true);
-      // The probe was a real turn resuming the session's own conversation, with no credential.
-      const recoveryTurns = f.claude.turns.slice(turnsBefore);
-      expect(recoveryTurns[0]).toMatchObject({
-        conversation: "resume",
-        relay: null,
-        handle: { externalSessionId: externalOf(f, binding.sessionId) },
-      });
-      expect(recoveryTurns[1]).toMatchObject({ conversation: "resume" });
-      expect(recoveryTurns[1]!.prompt).toMatch(/session_attest/);
+      // Recovery checks the provider's existing session without spending a model turn.
+      expect(f.claude.turns.slice(turnsBefore)).toEqual([]);
       // Every provider turn of the recovery ran on the PRIMARY_CTO's own role-scoped adapter.
       const claudeRoles = adapterRoles.mock.calls.filter(([provider]) => provider === "claude").map(([, role]) => role);
       expect(claudeRoles.length).toBeGreaterThan(0);
@@ -162,7 +155,7 @@ describe("#246 C4-R2 — a driven PRIMARY_CTO is recovered on its own session, a
       const startedBefore = f.claude.started.length;
 
       const report = await f.daemon.reconcileContinuity("the daemon restarted");
-      expect(report?.unresolved).toContainEqual({ roleKey: binding.roleKey, reasonCode: ReasonCode.SESSION_TURN_FAILED });
+      expect(report?.unresolved).toContainEqual({ roleKey: binding.roleKey, reasonCode: ReasonCode.SESSION_NOT_READY });
       expect(countAudit(f, "PRIMARY_CTO_RECOVERY_REFUSED", binding.sessionId)).toBe(1);
       // Nothing spawned or bound in its place; the binding, session and epoch are as they were.
       expect(sessionCount(f)).toBe(sessionsBefore);
@@ -191,13 +184,13 @@ describe("#246 C4-R2 — a driven PRIMARY_CTO is recovered on its own session, a
       const { binding } = await drivenPrimary(f, "attestation-refused");
       cp.sessionRuntime.release(binding.sessionId);
       const epoch = cp.sessions.require(binding.sessionId).credentialEpoch;
-      f.claude.presentAttestation = false;
+      vi.spyOn(f.claude, "probeRuntime").mockResolvedValueOnce("HEALTHY").mockResolvedValueOnce("UNAVAILABLE");
       const first = await f.daemon.reconcileContinuity("the daemon restarted");
       expect(first?.unresolved).toContainEqual({ roleKey: binding.roleKey, reasonCode: ReasonCode.SESSION_NOT_READY });
       // The rotated credential was never proven: the daemon holds nothing, so the next pass tries again.
       expect(cp.sessions.require(binding.sessionId).credentialEpoch).toBe(epoch + 1);
       expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(false);
-      f.claude.presentAttestation = true;
+      vi.mocked(f.claude.probeRuntime).mockRestore();
       f.harness.clock.advance(15 * 60_000 + 1);
       const second = await f.daemon.reconcileContinuity("the next pass");
       expect(second?.unresolved ?? []).not.toContainEqual(expect.objectContaining({ roleKey: binding.roleKey }));
@@ -260,16 +253,16 @@ describe("#246 C4-R2 — a driven PRIMARY_CTO is recovered on its own session, a
       const { binding } = await drivenPrimary(f, "moved-during-probe");
       cp.sessionRuntime.release(binding.sessionId);
       const external = externalOf(f, binding.sessionId);
-      const original = f.claude.runSessionTurn.bind(f.claude);
+      const original = f.claude.probeSession.bind(f.claude);
       let moved = false;
-      f.claude.runSessionTurn = async (request) => {
+      f.claude.probeSession = async (handle) => {
         // Inside the recovery's own `--resume` probe, someone else rotates the credential.
-        if (!moved && request.handle.externalSessionId === external && request.relay === null) {
+        if (!moved && handle.externalSessionId === external) {
           moved = true;
           const rotated = cp.sessions.rotateSecret(binding.sessionId, cp.sessions.require(binding.sessionId).credentialEpoch);
           if (!rotated.allowed) throw new Error(rotated.message);
         }
-        return original(request);
+        return original(handle);
       };
       const epoch = cp.sessions.require(binding.sessionId).credentialEpoch;
       const recovered = await cp.cto.recoverDrivenPrimaryCto(binding.roleKey, { capacity: cp.capacity, runtime: cp.sessionRuntime });
@@ -288,14 +281,14 @@ describe("#246 C4-R2 — a driven PRIMARY_CTO is recovered on its own session, a
       const { binding } = await drivenPrimary(f, "revoked-during-probe");
       cp.sessionRuntime.release(binding.sessionId);
       const external = externalOf(f, binding.sessionId);
-      const original = f.claude.runSessionTurn.bind(f.claude);
+      const original = f.claude.probeSession.bind(f.claude);
       let revoked = false;
-      f.claude.runSessionTurn = async (request) => {
-        if (!revoked && request.handle.externalSessionId === external && request.relay === null) {
+      f.claude.probeSession = async (handle) => {
+        if (!revoked && handle.externalSessionId === external) {
           revoked = true;
           expect(cp.bindings.revoke(binding.roleKey, "fixture: released while the recovery probed").allowed).toBe(true);
         }
-        return original(request);
+        return original(handle);
       };
       const epoch = cp.sessions.require(binding.sessionId).credentialEpoch;
       const recovered = await cp.cto.recoverDrivenPrimaryCto(binding.roleKey, { capacity: cp.capacity, runtime: cp.sessionRuntime });
@@ -350,7 +343,7 @@ describe("#246 C4-R2 — a driven spawn cleans up only what it created", () => {
       cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
       await registerFixtureProject(f.harness, "refused-spawn");
       const bootstrap = await f.dispatchBootstrap();
-      f.claude.presentAttestation = false;
+      vi.spyOn(f.claude, "probeRuntime").mockResolvedValueOnce("HEALTHY").mockResolvedValueOnce("UNAVAILABLE");
       const refused = await cp.cto.ensureDrivenPrimaryCto("refused-spawn", bootstrap.runId);
       expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
       const loser = spawnedSession(f, "refused-spawn");
@@ -407,7 +400,7 @@ describe("#246 C4-R2 — a driven spawn cleans up only what it created", () => {
       cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
       await registerFixtureProject(f.harness, "refused-stop-failed");
       const bootstrap = await f.dispatchBootstrap();
-      f.claude.presentAttestation = false;
+      vi.spyOn(f.claude, "probeRuntime").mockResolvedValueOnce("HEALTHY").mockResolvedValueOnce("UNAVAILABLE");
       vi.spyOn(f.claude, "stopSession").mockRejectedValueOnce(new Error("provider stop failed"));
       expect((await cp.cto.ensureDrivenPrimaryCto("refused-stop-failed", bootstrap.runId)).allowed).toBe(false);
       const loser = spawnedSession(f, "refused-stop-failed");

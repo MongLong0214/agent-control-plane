@@ -2480,8 +2480,22 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     );
   }
 
-  async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
+  async probeSession(handle: SessionHandle, options?: { conversation: ConversationStep }): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
     if (handle.provider !== this.provider) return "UNAVAILABLE";
+    if (options) {
+      // Driven CTO readiness spends no model turn. A resume must still find its own transcript;
+      // absence must never turn into a fresh conversation under --session-id.
+      if (options.conversation === "new") return "HEALTHY";
+      if (!handle.workdir || !/^[a-zA-Z0-9-]+$/.test(handle.externalSessionId)) return "UNAVAILABLE";
+      try {
+        const directory = claudeTranscriptDirectory(realpathSync(handle.workdir));
+        if (!directory) return "UNAVAILABLE";
+        const transcript = lstatSync(join(directory, `${handle.externalSessionId}.jsonl`));
+        return transcript.isFile() && transcript.size > 0 ? "HEALTHY" : "UNAVAILABLE";
+      } catch {
+        return "UNAVAILABLE";
+      }
+    }
     const result = await runCli(this.#binary, [
       "-p", "--output-format", "json", "--model", handle.model, "--session-id", handle.externalSessionId,
       // #1077 — the probe runs to completion now, so it runs as a WORKER turn does: the sanctioned

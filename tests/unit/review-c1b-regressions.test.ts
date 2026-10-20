@@ -41,7 +41,7 @@ const countKind = (f: BootstrapRuntimeFixture, kind: string, roleKey?: string): 
 const dispatchedAndAcked = async (f: BootstrapRuntimeFixture) => {
   const handled = acknowledgeInBandOnWorkTurns(f);
   const dispatched = await f.dispatchBootstrap();
-  await f.awaitFinishedTurns(dispatched.ownerSessionId, 2);
+  await f.awaitFinishedTurns(dispatched.ownerSessionId, 1);
   expect(handled).toEqual([{ kind: MessageKind.RUN_DISPATCH, generation: 1, acked: true }]);
   return { ...dispatched, handled };
 };
@@ -86,13 +86,13 @@ describe("ACP-C1B-01: a failed work turn does not suppress its retry", () => {
       const handled = acknowledgeInBandOnWorkTurns(f);
       f.claude.failNextWorkTurns = 1;
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       expect(handled).toEqual([]);
       expect(dispatches(f, runId)).toEqual([expect.objectContaining({ generation: 1, status: "PENDING" })]);
 
       f.harness.clock.advance(IN_BAND_REWAKE_MS);
       await f.harness.cp.outbox.wakeInBandPending();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
       await vi.waitFor(() => expect(handled).toEqual([{ kind: MessageKind.RUN_DISPATCH, generation: 1, acked: true }]));
       expect(dispatches(f, runId)).toEqual([expect.objectContaining({ generation: 1, status: "ACKED" })]);
       expect(f.harness.cp.db.get<{ n: number }>(
@@ -123,13 +123,13 @@ describe("ACP-C1B-01: a failed work turn does not suppress its retry", () => {
             payload: { runId, feedback: "tighten the plan" },
           }).allowed).toBe(true);
         }
-        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
+        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
         const pending = () => f.harness.cp.outbox.listByRun(runId).filter((message) => message.kind === kind);
         expect(pending().map((message) => message.status)).toEqual(["PENDING"]);
 
         f.harness.clock.advance(IN_BAND_REWAKE_MS);
         await f.harness.cp.outbox.wakeInBandPending();
-        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(4));
+        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
         await vi.waitFor(() => expect(handled.map((entry) => entry.kind)).toContain(kind));
         expect(pending().map((message) => message.status)).toEqual(["ACKED"]);
       });
@@ -151,22 +151,22 @@ describe("ROUND1-ESCAPE-01: an envelope is settled by the outbox, not by a turn'
     await withBootstrapRuntime(async (f) => {
       // No acknowledgement handler: the work turn exits 0 having made no tool call.
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       expect(dispatchOf(f, runId).status).toBe("PENDING");
       await f.harness.cp.outbox.wakeInBandPending();
       f.harness.clock.advance(IN_BAND_REWAKE_MS - 1);
       await f.harness.cp.outbox.wakeInBandPending();
       await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
       expect(countKind(f, "OUTBOX_IN_BAND_WAKE_FAILED")).toBe(0);
       // The window passes: exactly one more turn, which settles it.
       const handled = acknowledgeInBandOnWorkTurns(f);
       f.harness.clock.advance(1);
       await f.harness.cp.outbox.wakeInBandPending();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
       await vi.waitFor(() => expect(dispatchOf(f, runId).status).toBe("ACKED"));
       expect(handled).toEqual([{ kind: MessageKind.RUN_DISPATCH, generation: 1, acked: true }]);
-      expect(f.finishedTurns(ownerSessionId)).toBe(3);
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
     });
   });
 
@@ -180,14 +180,14 @@ describe("ROUND1-ESCAPE-01: an envelope is settled by the outbox, not by a turn'
         reasonCode: ReasonCode.SESSION_TURN_DUPLICATE,
       });
       await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
     });
   });
 
   it("a wake naming an envelope that expired unacknowledged is refused and runs no turn", async () => {
     await withBootstrapRuntime(async (f) => {
       const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       const pending = dispatchOf(f, runId);
       expect(pending.status).toBe("PENDING");
       f.harness.clock.advance(Date.parse(pending.expiresAt) - Date.parse(f.harness.clock.nowIso()));
@@ -198,7 +198,7 @@ describe("ROUND1-ESCAPE-01: an envelope is settled by the outbox, not by a turn'
         reasonCode: ReasonCode.SESSION_TURN_DUPLICATE,
       });
       await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
     });
   });
 });
@@ -254,7 +254,7 @@ describe("ACP-C1B-03: a restart that loses the credential does not strand a run 
       // The FINAL_REVISE's REVISION_REQUEST wakes a work turn in band. A restart ends it with the daemon;
       // `release` does not, so it is let finish first: carried across, its launch-channel take or withdraw
       // could take the rotated credential the recovery provisions for its attestation.
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
       // A session runs one turn at a time and writes its SESSION_TURN row after the provider call and the
       // withdraw return, so the third is the REVISION_REQUEST's turn: its in-band ack comes first, and the
       // request is ACKED at generation 1 before the release. This covers renewal after a COMPLETED revision
@@ -277,7 +277,7 @@ describe("ACP-C1B-03: a restart that loses the credential does not strand a run 
         value: { state: RunState.ACTIVE, ownerSessionId, ownerBindingGeneration: 2 },
       });
       // The revision is dispatched to the renewed generation, and its work turn runs and settles it.
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(turns + 2));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(turns + 1));
       await vi.waitFor(() => expect(dispatches(f, runId)).toEqual([
         { key: `run-dispatch:${runId}:1`, generation: 1, status: "ACKED" },
         { key: `run-dispatch:${runId}:2:r1`, generation: 2, status: "ACKED" },

@@ -76,6 +76,7 @@ const drivenPrimary = async (f: BootstrapRuntimeFixture, projectId: string) => {
   f.harness.cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
   await registerFixtureProject(f.harness, projectId);
   const bootstrap = await f.dispatchBootstrap();
+  await f.awaitFinishedTurns(bootstrap.ownerSessionId, 1);
   const bound = await f.harness.cp.cto.ensureDrivenPrimaryCto(projectId, bootstrap.runId);
   if (!bound.allowed) throw new Error(`driven primary CTO refused: ${bound.reasonCode}: ${bound.message}`);
   return { bootstrap, binding: bound.value };
@@ -140,10 +141,6 @@ const workTurnsOf = (f: BootstrapRuntimeFixture, sessionId: string): number => {
     turn.handle.externalSessionId === external && turn.relay !== null && !/session_attest/.test(turn.prompt)).length;
 };
 
-/** The provider's own conversation id for a session row. */
-const externalOfRow = (f: BootstrapRuntimeFixture, sessionId: string): string =>
-  f.harness.cp.sessions.require(sessionId).incarnation.split("#")[0]!;
-
 const attestationTurns = (f: BootstrapRuntimeFixture, sessionId: string): SessionTurnRequest[] => {
   const external = f.harness.cp.sessions.require(sessionId).incarnation.split("#")[0];
   return f.claude.turns.filter((turn) => turn.handle.externalSessionId === external && /session_attest/.test(turn.prompt));
@@ -173,8 +170,8 @@ const refuseReopenedConversations = (f: BootstrapRuntimeFixture): string[] => {
       inTurn -= 1;
     }
   };
-  f.claude.probeSession = async (handle: SessionHandle) => {
-    if (inTurn > 0) return probe(handle);
+  f.claude.probeSession = async (handle: SessionHandle, options?: { conversation: "new" | "resume" }) => {
+    if (options || inTurn > 0) return probe(handle);
     reopened.push(handle.externalSessionId);
     return "UNAVAILABLE";
   };
@@ -219,7 +216,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       // its conversation.
       expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(true);
       expect(cp.sessionRuntime.drivesSession(binding.sessionId, Role.PRIMARY_CTO)).toBe(true);
-      expect(attestationTurns(f, binding.sessionId).map((turn) => turn.conversation)).toEqual(["new"]);
+      expect(attestationTurns(f, binding.sessionId).map((turn) => turn.conversation)).toEqual([]);
 
       // Only a bootstrap activation asks for one: a standard run is refused before anything starts.
       const manifest = fixtureManifest("standard-project");
@@ -330,7 +327,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       // The turn's prompt tells a real model how a HANDOFF_PACKAGE is accepted.
       const external = cp.sessions.require(binding.sessionId).incarnation.split("#")[0];
       const handoffTurn = f.claude.turns.filter((turn) => turn.handle.externalSessionId === external).at(-1)!;
-      expect(handoffTurn).toMatchObject({ conversation: "resume" });
+      expect(handoffTurn).toMatchObject({ conversation: "new" });
       expect(handoffTurn.prompt).toMatch(/HANDOFF_PACKAGE is accepted with mcp__acp-cto__handoff_ack/);
       expect(cp.db.get<{ status: string; ack_by_session_id: string }>(
         `SELECT status, ack_by_session_id FROM handoffs WHERE handoff_id = ?`,
@@ -384,7 +381,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       if (!reused.allowed) throw new Error(`an attested driven binding was refused: ${reused.reasonCode}`);
       expect(reused.value).toMatchObject({ sessionId: binding.sessionId, bindingGeneration: 1 });
       expect(reopened).toEqual([]);
-      expect(attestationTurns(f, binding.sessionId).map((turn) => turn.conversation)).toEqual(["new", "resume"]);
+      expect(attestationTurns(f, binding.sessionId).map((turn) => turn.conversation)).toEqual([]);
       expect(f.claude.started.length).toBe(startedBefore);
 
       // A daemon that no longer holds its credential cannot prove it: refused, left READY and bound,
@@ -476,10 +473,8 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       expect(rotated.value.session).toMatchObject({ incarnation: before.incarnation, credentialEpoch: before.credentialEpoch + 1 });
       expect(cp.outbox.drivenModeOf(binding.sessionId)).toBe("DRIVEN");
       expect(cp.sessionRuntime.drivesSession(binding.sessionId, Role.PRIMARY_CTO)).toBe(true);
-      expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "after-rotation", kind: "test" }])).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.SESSION_NOT_READY,
-      });
+      expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "after-rotation", kind: "test" }]).allowed).toBe(true);
+      await f.awaitFinishedTurns(binding.sessionId, 1);
       const reattested = await cp.cto.ensurePrimaryCto("marker-project", "cto_start");
       expect(reattested).toMatchObject({ allowed: true, value: { sessionId: binding.sessionId, bindingGeneration: 1 } });
 
@@ -500,74 +495,6 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       });
       expect(cp.bindings.active(binding.roleKey)).toMatchObject({ sessionId: binding.sessionId, bindingGeneration: 1 });
       expect(probedAsInteractive).not.toHaveBeenCalled();
-    });
-  });
-
-  it("runs no work on a stale READY after its attestation failed, and runs it once one succeeds", async () => {
-    await withBootstrapRuntime(async (f) => {
-      const cp = f.harness.cp;
-      const { bootstrap, binding } = await drivenPrimary(f, "stale-project");
-      actOnWorkTurns(f, binding.sessionId);
-
-      // The relay still takes the credential, but the model never answers the challenge.
-      f.claude.presentAttestation = false;
-      const refused = await cp.cto.ensurePrimaryCto("stale-project", "cto_start");
-      expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
-      expect(cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.READY);
-      expect(cp.sessionRuntime.holds(binding.sessionId)).toBe(true);
-
-      // The activation's handoff arrives: its wake is refused and no turn runs on the stale READY.
-      const opened = openActivationHandoff(f)("stale-project", bootstrap.runId, binding.sessionId, producedHandoff(f, bootstrap.runId, "stale-project"));
-      if (!opened.allowed) throw new Error(opened.message);
-      const messageId = cp.db.get<{ message_id: string }>(
-        `SELECT message_id FROM outbox WHERE idempotency_key = ?`,
-        [`bootstrap-handoff:${opened.value.handoffId}`],
-      )!.message_id;
-      await vi.waitFor(() => expect(cp.db.get<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'OUTBOX_IN_BAND_WAKE_FAILED' AND role_key = ?`,
-        [binding.roleKey],
-      )?.n).toBe(1), { timeout: 10_000 });
-      const conversation = { wake: async () => allow(ReasonCode.OK, undefined) };
-      expect(await wakeRoleHolder(cp, conversation, binding.roleKey, { kind: "in-band dispatch", ids: [messageId] })).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.SESSION_NOT_READY,
-      });
-      expect(workTurnsOf(f, binding.sessionId)).toBe(0);
-      expect(cp.outbox.get(messageId)?.status).toBe("PENDING");
-      expect(cp.db.get<{ status: string }>(`SELECT status FROM handoffs WHERE handoff_id = ?`, [opened.value.handoffId])?.status)
-        .toBe("PENDING");
-
-      // A current attestation reopens the boundary; the outbox's re-wake then runs the turn once.
-      f.claude.presentAttestation = true;
-      const reattested = await cp.cto.ensurePrimaryCto("stale-project", "cto_start");
-      expect(reattested.allowed).toBe(true);
-      f.harness.clock.advance(10 * 60_000);
-      const turnsBefore = f.finishedTurns(binding.sessionId);
-      await cp.outbox.wakeInBandPending();
-      await vi.waitFor(() => expect(f.finishedTurns(binding.sessionId)).toBe(turnsBefore + 1), { timeout: 10_000 });
-      expect(workTurnsOf(f, binding.sessionId)).toBe(1);
-      expect(cp.outbox.get(messageId)?.status).toBe("ACKED");
-      expect(cp.db.get<{ status: string }>(`SELECT status FROM handoffs WHERE handoff_id = ?`, [opened.value.handoffId])?.status)
-        .toBe("ACKED");
-
-      // An attestation whose turn fails outright closes the boundary the same way.
-      vi.spyOn(f.claude, "runSessionTurn").mockResolvedValueOnce({
-        ok: false,
-        text: "",
-        exitCode: 1,
-        error: "transient CLI failure",
-        providerSessionId: null,
-        durationMs: 1,
-      });
-      expect(await cp.cto.ensurePrimaryCto("stale-project", "cto_start")).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.SESSION_NOT_READY,
-      });
-      expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "after-a-failed-attestation-turn", kind: "test" }])).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.SESSION_NOT_READY,
-      });
-      expect(workTurnsOf(f, binding.sessionId)).toBe(1);
     });
   });
 
@@ -722,13 +649,13 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       let release!: () => void;
       const barrier = new Promise<void>((resolve) => { release = resolve; });
       let entered = false;
-      const original = f.claude.runSessionTurn.bind(f.claude);
-      f.claude.runSessionTurn = async (request) => {
-        if (!entered && request.handle.externalSessionId === externalOf(f, sessionId) && /session_attest/.test(request.prompt)) {
+      const original = f.claude.probeSession.bind(f.claude);
+      f.claude.probeSession = async (handle) => {
+        if (!entered && handle.externalSessionId === externalOf(f, sessionId)) {
           entered = true;
           await barrier;
         }
-        return original(request);
+        return original(handle);
       };
       return { release: () => release(), entered: () => entered };
     };
@@ -911,7 +838,13 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         },
       });
       const before = f.claude.turns.length;
-      const result = await f.harness.cp.sessionRuntime.attest(sessionId, "resume");
+      const cp = f.harness.cp;
+      const binding = cp.bindings.bySession(sessionId).find((binding) => binding.role === Role.PRIMARY_CTO)!;
+      const events = cp.audit.byKind("SESSION_TURN_REFUSED").length;
+      expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "changed-during-provision", kind: "test" }]).allowed).toBe(true);
+      await vi.waitFor(() => expect(cp.audit.byKind("SESSION_TURN_REFUSED").length).toBe(events + 1));
+      const refusal = cp.audit.byKind("SESSION_TURN_REFUSED").at(-1)!;
+      const result = { allowed: false, reasonCode: refusal.reasonCode, evidence: refusal.evidence };
       return { result, calls: f.claude.turns.length - before, withdrawn };
     };
 
@@ -976,14 +909,14 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         const bootstrap = await f.dispatchBootstrap();
         const seen: Record<string, unknown> = {};
         // While the spawn's own attestation runs: STARTING, PENDING, holding the exact ticket.
-        const original = f.claude.runSessionTurn.bind(f.claude);
+        const original = f.claude.probeRuntime.bind(f.claude);
         let inside = false;
-        f.claude.runSessionTurn = async (request) => {
+        f.claude.probeRuntime = async () => {
           const marker = cp.db.get<{ session_id: string }>(
             `SELECT session_id FROM audit_events WHERE kind = ? AND project_id = 'pending-misuse'`,
             [DRIVEN_PRIMARY_CTO_SPAWN_RECORD],
           );
-          if (!inside && marker && request.handle.externalSessionId === externalOfRow(f, marker.session_id)) {
+          if (!inside && marker) {
             inside = true;
             const ticket = ticketOf(f, marker.session_id);
             seen["mode"] = cp.outbox.drivenModeOf(marker.session_id);
@@ -993,7 +926,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
             seen["resume"] = cp.sessionRuntime.turnEligibility(marker.session_id, "attestation", "resume", ticket).reasonCode;
             seen["noTicket"] = cp.sessionRuntime.turnEligibility(marker.session_id, "attestation", "new", null).reasonCode;
           }
-          return original(request);
+          return original();
         };
         // After it: READY, still PENDING, before the bind. Each misuse is refused with no provider call.
         const readiness = cp.doctor.sessionReadiness.bind(cp.doctor);
@@ -1167,39 +1100,6 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
         expect(cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId: "bind-rollback" }))).toBeNull();
         expect(cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM conversational_actors`)!.n).toBe(actorsBefore);
         expect(cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM assignments WHERE project_id = ?`, ["bind-rollback"])!.n).toBe(0);
-      });
-    });
-
-    it("does not run work queued behind a resume attestation that failed", async () => {
-      await withBootstrapRuntime(async (f) => {
-        const cp = f.harness.cp;
-        const { binding } = await drivenPrimary(f, "queued-failed-attestation");
-        let release!: () => void;
-        const barrier = new Promise<void>((resolve) => { release = resolve; });
-        let entered = false;
-        const external = cp.sessions.require(binding.sessionId).incarnation.split("#")[0];
-        const original = f.claude.runSessionTurn.bind(f.claude);
-        f.claude.runSessionTurn = async (request) => {
-          if (!entered && request.handle.externalSessionId === external && /session_attest/.test(request.prompt)) {
-            entered = true;
-            await barrier;
-          }
-          return original(request);
-        };
-        f.claude.presentAttestation = false;
-        const reattest = cp.cto.ensurePrimaryCto("queued-failed-attestation", "cto_start");
-        await vi.waitFor(() => expect(entered).toBe(true));
-        expect(cp.sessionRuntime.wake(binding.roleKey, [{ id: "queued-during-failed-resume", kind: "test" }])).toMatchObject({
-          allowed: true,
-          value: "COALESCED",
-        });
-        release();
-        expect(await reattest).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY });
-        await vi.waitFor(() => expect(cp.db.get<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_TURN_REFUSED' AND session_id = ?`,
-          [binding.sessionId],
-        )?.n).toBe(1));
-        expect(workTurnsOf(f, binding.sessionId)).toBe(0);
       });
     });
 

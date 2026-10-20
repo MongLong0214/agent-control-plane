@@ -31,7 +31,7 @@ let escalationKeys = 0;
 const dispatchedAndAcked = async (f: BootstrapRuntimeFixture) => {
   const handled = acknowledgeInBandOnWorkTurns(f);
   const dispatched = await f.dispatchBootstrap();
-  await f.awaitFinishedTurns(dispatched.ownerSessionId, 2);
+  await f.awaitFinishedTurns(dispatched.ownerSessionId, 1);
   return { ...dispatched, handled };
 };
 

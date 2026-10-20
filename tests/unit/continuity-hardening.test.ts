@@ -151,8 +151,8 @@ const bindCeoSessionWithTarget = (plane: ReturnType<typeof makePlane>, attest = 
   return bound.value;
 };
 
-describe("capacity routability (§14.3 — no UNKNOWN routing)", () => {
-  it("a bucket with no remaining percentage is not routable and does not staff a role", async () => {
+describe("capacity telemetry remains advisory", () => {
+  it("a bucket with no remaining percentage stays unknown while its provider gets an attempt", async () => {
     const { cp, clock, gpt, claude } = makePlane();
     // Quota is genuinely unknown for gpt: the bucket exists, its remaining is not known.
     gpt.setCapacity(
@@ -166,14 +166,14 @@ describe("capacity routability (§14.3 — no UNKNOWN routing)", () => {
     const gptCapacity = cp.capacity.current("gpt")!;
     expect(gptCapacity.unknownBuckets).toEqual(["rolling-5h"]);
     expect(gptCapacity.allocationAdmission).toBe("SUSPENDED");
-    expect(cp.capacity.isRoutableFor(gptCapacity, "cto")).toBe(false);
-    expect(cp.capacity.providersFor("cto").map((c) => c.provider)).toEqual(["claude"]);
+    expect(cp.capacity.isRoutableFor(gptCapacity, "cto")).toBe(true);
+    expect(cp.capacity.providersFor("cto").map((c) => c.provider)).toEqual(["gpt", "claude"]);
 
     const plan = await cp.continuity.evaluate("unknown gpt quota");
-    expect(plan.assignments.every((a) => a.provider === "claude")).toBe(true);
+    expect(plan.assignments.some((a) => a.provider === "gpt")).toBe(true);
   });
 
-  it("an unprobed runtime suspends the provider even with quota remaining", async () => {
+  it("an unprobed runtime keeps its unknown telemetry without blocking an attempt", async () => {
     const { cp, clock, gpt } = makePlane();
     gpt.setCapacity({
       ...reading("gpt", clock, [
@@ -185,7 +185,7 @@ describe("capacity routability (§14.3 — no UNKNOWN routing)", () => {
     await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
     const capacity = cp.capacity.current("gpt")!;
     expect(capacity.allocationAdmission).toBe("SUSPENDED");
-    expect(cp.capacity.isRoutableFor(capacity, "cto")).toBe(false);
+    expect(cp.capacity.isRoutableFor(capacity, "cto")).toBe(true);
   });
 });
 
@@ -271,7 +271,7 @@ describe("capacity sensor honesty (§14.2)", () => {
       capabilities: ["blind-review"],
       priority: "critical",
     });
-    expect(admission).toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+    expect(admission).toMatchObject({ allowed: true });
     // If the exception catch/persist step is removed, refresh throws or retains OPEN;
     // either outcome breaks this test instead of routing on the old quota.
   });
@@ -317,7 +317,7 @@ describe("capacity sensor honesty (§14.2)", () => {
       source: "fixture-collector-error",
     });
     expect(current.operatorObservation).toBeUndefined();
-    expect(cp.capacity.isRoutableFor(current, "cto")).toBe(false);
+    expect(cp.capacity.isRoutableFor(current, "cto")).toBe(true);
   });
 
   it("a measured runtime outage governs a preserved operator quota after refresh", async () => {
@@ -372,7 +372,7 @@ describe("capacity sensor honesty (§14.2)", () => {
     const failoverAdmission = await cp.capacity.refreshForProviderSwitch({
       provider: "gpt", capabilities: ["cto"], priority: "critical",
     });
-    expect(failoverAdmission).toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+    expect(failoverAdmission).toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_ADMISSION_SUSPENDED });
   });
 
   it("a healthy runtime keeps an operator quota usable through a collector ERROR", async () => {
@@ -625,14 +625,13 @@ describe("completion requires a current continuity mode (§15.6)", () => {
     await plane.cp.continuity.evaluate("seed");
   };
 
-  it("refuses completion when coverage has never been evaluated", () => {
+  it("does not require a coverage evaluation for completion", () => {
     const plane = makePlane();
     const decision = plane.cp.continuity.assertCompletionAllowed("run_x");
-    expect(decision.allowed).toBe(false);
-    expect(decision.reasonCode).toBe(ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION);
+    expect(decision.allowed).toBe(true);
   });
 
-  it("allows completion right after an evaluation and refuses once that evaluation is stale", async () => {
+  it("keeps coverage freshness advisory for completion", async () => {
     const plane = makePlane();
     await seed(plane);
     expect(plane.cp.continuity.mode()).toBe(ContinuityMode.NORMAL);
@@ -643,12 +642,10 @@ describe("completion requires a current continuity mode (§15.6)", () => {
     plane.clock.advance(10 * 60 * 1000);
     expect(plane.cp.continuity.mode()).toBe(ContinuityMode.NORMAL);
     const stale = plane.cp.continuity.assertCompletionAllowed("run_x");
-    expect(stale.allowed).toBe(false);
-    expect(stale.reasonCode).toBe(ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION);
-    expect(stale.allowed === false && stale.message.includes("stale")).toBe(true);
+    expect(stale.allowed).toBe(true);
   });
 
-  it("a re-evaluation after both providers fail turns the stale NORMAL into SURVIVAL", async () => {
+  it("a provider outage is reported as degraded coverage without blocking completion", async () => {
     const plane = makePlane();
     await seed(plane);
     plane.gpt.setRuntimeHealth("UNAVAILABLE");
@@ -658,8 +655,8 @@ describe("completion requires a current continuity mode (§15.6)", () => {
 
     const plan = await plane.cp.continuity.evaluate("both providers down");
     expect(plan.outcome).toBe("NO_VALID_COVERAGE");
-    expect(plane.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
-    expect(plane.cp.continuity.assertCompletionAllowed("run_x").allowed).toBe(false);
+    expect(plane.cp.continuity.mode()).toBe(ContinuityMode.DEGRADED);
+    expect(plane.cp.continuity.assertCompletionAllowed("run_x").allowed).toBe(true);
   });
 });
 

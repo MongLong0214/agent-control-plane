@@ -1030,9 +1030,7 @@ export const startLocalMcpListeners = async (
       auth,
       opening.kind === "PENDING_HANDOFF_ACK"
         ? { pendingHandoffId: opening.handoffId }
-        : opening.kind === "PENDING_ATTESTATION"
-          ? { attestationOnly: true }
-          : undefined,
+        : undefined,
     );
     // The line the CEO socket has had and this one did not. The binding the connection was
     // admitted under is what the port keys and verifies on: this socket also admits
@@ -1206,7 +1204,7 @@ export const startLocalMcpListeners = async (
             ),
           "session-secret",
         ),
-      { pendingHandoffAck: true, pendingAttestation: true },
+      { pendingHandoffAck: true },
       options.attachments ? { authority: options.attachments, port: ctoConversation } : undefined,
     );
   } catch (err) {
@@ -3903,23 +3901,11 @@ interface PendingHandoffSocketPeer {
   credentialEpoch: number;
 }
 
-/**
- * #246 C1b — the other unbound peer shape: a provisioned session the runtime driver asked to attest,
- * which may answer that challenge (`session_attest`) and nothing else. A spawn attests before it is
- * READY or bound, so a STARTING session is admitted here and nowhere else.
- */
-interface PendingAttestationSocketPeer {
-  kind: "PENDING_ATTESTATION";
-  sessionIncarnation: string;
-  credentialEpoch: number;
-}
-
-type BoundSocketPeer = ActiveBoundSocketPeer | PendingHandoffSocketPeer | PendingAttestationSocketPeer;
+type BoundSocketPeer = ActiveBoundSocketPeer | PendingHandoffSocketPeer;
 
 /** Which unbound peers a socket admits besides its bound role holders. */
 interface UnboundPeerAdmission {
   pendingHandoffAck?: boolean;
-  pendingAttestation?: boolean;
 }
 
 interface PendingNormalHandoff {
@@ -3939,19 +3925,6 @@ const authenticateSocketPeer = (
 ): Decision<BoundSocketPeer> => {
   const session = cp.sessions.verifySecret(credential.sessionId, credential.sessionSecret);
   if (!session.allowed) return session as Decision<BoundSocketPeer>;
-  const attesting = (): Decision<BoundSocketPeer> | null =>
-    admission.pendingAttestation &&
-    cp.sessionAttestations.isPending(credential.sessionId, session.value.incarnation, session.value.credentialEpoch)
-      ? allow(ReasonCode.OK, {
-          kind: "PENDING_ATTESTATION",
-          sessionIncarnation: session.value.incarnation,
-          credentialEpoch: session.value.credentialEpoch,
-        })
-      : null;
-  if (session.value.lifecycle === SessionLifecycle.STARTING) {
-    const admitted = attesting();
-    if (admitted) return admitted;
-  }
   if (
     session.value.lifecycle !== SessionLifecycle.READY &&
     session.value.lifecycle !== SessionLifecycle.DRAINING
@@ -3983,10 +3956,6 @@ const authenticateSocketPeer = (
           credentialEpoch: session.value.credentialEpoch,
         });
       }
-    }
-    if (session.value.lifecycle === SessionLifecycle.READY) {
-      const admitted = attesting();
-      if (admitted) return admitted;
     }
     return deny(ReasonCode.BINDING_GENERATION_STALE, "session does not hold this socket's current role", {
       sessionId: credential.sessionId,
@@ -4184,14 +4153,6 @@ const peerAuthenticator =
         handshakeEpoch: opening.credentialEpoch,
         currentEpoch: session.value.credentialEpoch,
       });
-    }
-    if (opening.kind === "PENDING_ATTESTATION") {
-      if (!cp.sessionAttestations.isPending(credential.sessionId, session.value.incarnation, session.value.credentialEpoch)) {
-        return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "the attestation this connection was admitted for is no longer pending", {
-          sessionId: credential.sessionId,
-        });
-      }
-      return allow(ReasonCode.OK, authenticatedPeer(credential, opening.sessionIncarnation));
     }
     if (opening.kind === "PENDING_HANDOFF_ACK") {
       if (session.value.lifecycle !== SessionLifecycle.READY) {

@@ -174,6 +174,7 @@ const applicationFixture = async () => {
   const launch = await startSessionLaunchChannel(tempDir("acp-c3-launch-"), { mcpToken: TEST_MCP_TOKEN });
   harness.cp.cto.attach({ sessionLaunch: launch });
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
+  claude.observeCredentialCustody(harness.cp.sessionRuntime, harness.cp.sessions, TEST_MCP_TOKEN);
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
   // #246 C4 — the PRIMARY_CTO activation provisions is driven on the same Claude runtime.
   harness.cp.providers.registerForRole(claude, Role.PRIMARY_CTO);

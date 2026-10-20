@@ -79,6 +79,7 @@ export const drivenPrimary = async (f: BootstrapRuntimeFixture, projectId: strin
   f.harness.cp.providers.registerForRole(f.claude, Role.PRIMARY_CTO);
   await registerFixtureProject(f.harness, projectId);
   const bootstrap = await f.dispatchBootstrap();
+  await f.awaitFinishedTurns(bootstrap.ownerSessionId, 1);
   const bound = await f.harness.cp.cto.ensureDrivenPrimaryCto(projectId, bootstrap.runId);
   if (!bound.allowed) throw new Error(`driven primary CTO refused: ${bound.reasonCode}: ${bound.message}`);
   return { bootstrap, binding: bound.value };
@@ -144,19 +145,19 @@ export const routeInBandWakes = (f: BootstrapRuntimeFixture): { knocks: () => nu
   return { knocks: () => knocks };
 };
 
-/** Holds this session's next attestation turn inside the provider until `release`. */
+/** Holds the next liveness check for this session, without running a readiness model turn. */
 export const holdNextAttestation = (f: BootstrapRuntimeFixture, sessionId: string) => {
   let release!: () => void;
   const barrier = new Promise<void>((resolve) => { release = resolve; });
   let entered = false;
   const external = externalOf(f, sessionId);
-  const original = f.claude.runSessionTurn.bind(f.claude);
-  f.claude.runSessionTurn = async (request) => {
-    if (!entered && request.handle.externalSessionId === external && /session_attest/.test(request.prompt)) {
+  const original = f.claude.probeSession.bind(f.claude);
+  f.claude.probeSession = async (handle) => {
+    if (!entered && handle.externalSessionId === external) {
       entered = true;
       await barrier;
     }
-    return original(request);
+    return original(handle);
   };
   return { release: () => release(), entered: () => entered };
 };

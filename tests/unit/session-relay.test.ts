@@ -2,7 +2,6 @@ import { spawn } from "node:child_process";
 
 import { afterAll, describe, expect, it } from "vitest";
 
-import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { sessionRelayScript } from "../../src/runtime/cli-adapters.ts";
 import { type BootstrapRuntimeFixture, openHeldCtoConnection, withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -78,7 +77,7 @@ const offer = async (f: BootstrapRuntimeFixture, ownerSessionId: string, secret?
 const dispatchedSession = async (f: BootstrapRuntimeFixture) => {
   const { ownerSessionId } = await f.dispatchBootstrap();
   // The attestation and the RUN_DISPATCH turn, both finished: nothing is left on offer.
-  await f.awaitFinishedTurns(ownerSessionId, 2);
+  await f.awaitFinishedTurns(ownerSessionId, 1);
   return ownerSessionId;
 };
 
@@ -142,34 +141,12 @@ describe("C1b relay: the credential crosses the launch channel once and the MCP 
   });
 });
 
-describe("C1b socket: a session asked to attest may answer that challenge and nothing else", () => {
-  it("admits a STARTING session only while its challenge is pending, and only to session_attest", async () => {
+describe("readiness does not open an unbound MCP authority", () => {
+  it("keeps an unbound STARTING session off the role socket without readiness challenges", async () => {
     await withBootstrapRuntime(async (f) => {
       const created = f.harness.cp.sessions.create({ provider: "claude", model: "opus" });
       const credential = { sessionId: created.sessionId, sessionSecret: created.sessionSecret! };
-      // No challenge: an unbound STARTING session is not a peer at all.
       expect(await openHeldCtoConnection(f.ctoSocket, credential)).toMatchObject({ refused: { ok: false } });
-
-      const challenge = f.harness.cp.sessionAttestations.challenge(created.sessionId);
-      if (!challenge.allowed) throw new Error(challenge.message);
-      const held = await openHeldCtoConnection(f.ctoSocket, credential);
-      if (!("call" in held)) throw new Error(`refused: ${JSON.stringify(held.refused)}`);
-      expect(await held.call("role_dispatch_pending", {})).toMatchObject({
-        ok: false,
-        reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
-      });
-      expect(await held.call("session_attest", { nonce: "att_not-the-challenge" })).toMatchObject({
-        ok: false,
-        reasonCode: ReasonCode.SESSION_ATTESTATION_FAILED,
-      });
-      expect(await held.call("session_attest", { nonce: challenge.value.nonce })).toMatchObject({ ok: true });
-      expect(f.harness.cp.sessionAttestations.settle(created.sessionId, challenge.value.nonce).allowed).toBe(true);
-      // Answered and settled: the connection it was admitted for is over.
-      expect(await held.call("session_attest", { nonce: challenge.value.nonce })).toMatchObject({
-        ok: false,
-        reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
-      });
-      held.close();
     });
   });
 });

@@ -140,7 +140,7 @@ const claudeReviewer = (f: BootstrapRuntimeFixture, verdict: "PASS" | "NO_ANSWER
 const planned = async (f: BootstrapRuntimeFixture, options: Partial<Pick<ScriptedBootstrapOwner, "onResult" | "onRetry">> = {}) => {
   const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onRevision: "ignore", onResult: "ignore", ...options });
   const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-  await f.awaitFinishedTurns(ownerSessionId, 2);
+  await f.awaitFinishedTurns(ownerSessionId, 1);
   await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false), { timeout: 10_000, interval: 25 });
   expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
   return { owner, runId, ownerSessionId, roleKey, planDigest: f.harness.cp.artifacts.latest(runId, ArtifactKind.PLAN)!.digest };
@@ -316,10 +316,11 @@ describe("a configured scope never reaches the fallback, whatever stops its revi
     }, harnessOptions);
   });
 
-  it("(b) an authenticated default home whose capacity is denied stays unavailable", async () => {
+  it("(b) an authenticated default home with exhausted quota still attempts its reviewer", async () => {
     await withBootstrapRuntime(async (f) => {
       const adapter = codexAdapter({ codexHome: authenticatedHome() });
       expect(adapter.packetReviewerScope().state).toBe("DEFAULT");
+      stubCodex({ invocationExitCode: 1 });
       const { isolated } = preferCodex(f, () => adapter);
       const claude = claudeReviewer(f, "PASS");
       const { runId, ownerSessionId } = await planned(f);
@@ -330,7 +331,7 @@ describe("a configured scope never reaches the fallback, whatever stops its revi
       });
 
       expect(await submitResult(f, runId, ownerSessionId)).toBe("REVIEW_UNAVAILABLE");
-      expect(isolated).toEqual([]);
+      expect(isolated).toHaveLength(1);
       noFallback(f, runId, claude);
     }, harnessOptions);
   });
@@ -414,7 +415,7 @@ describe("a frozen result whose review was unavailable gets one official retry o
       claudeReviewer(f, "PASS");
       const { owner, runId, ownerSessionId, candidate } = await liveShape(f, { onRetry: "ignore" });
       expect(f.daemon.wakeBootstrapResultRecovery().woken).toHaveLength(1);
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3), { timeout: 10_000, interval: 25 });
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
       await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
       expect(f.daemon.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
       const daemon = await startDaemon(f, "restart");
@@ -423,7 +424,7 @@ describe("a frozen result whose review was unavailable gets one official retry o
       } finally {
         await daemon.stop();
       }
-      expect(f.finishedTurns(ownerSessionId)).toBe(3);
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
       expect(owner.results).toHaveLength(1);
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, runId)).toHaveLength(1);
       expect(resultState(f, runId)).toEqual({ state: RunState.ACTIVE, candidate, attempts: ["RELEASED"] });

@@ -347,7 +347,7 @@ export class FakeGateway {
       send(match ? this.answer(Number(match[1])) : { kind: "json" as const, status: 404, body: {} });
     });
     this.#server = server;
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("fake gateway has no port");
     return address.port;

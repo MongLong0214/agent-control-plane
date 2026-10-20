@@ -1,4 +1,5 @@
-import { realpathSync } from "node:fs";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
@@ -77,6 +78,20 @@ const flagValue = (args: readonly string[], flag: string): string | undefined =>
   const index = args.indexOf(flag);
   return index === -1 ? undefined : args[index + 1];
 };
+
+it("checks an existing Claude conversation without a model turn, and never substitutes a missing transcript", async () => {
+  const workdir = realpathSync(tempDir("acp-session-exists-"));
+  const handle = turn({ workdir }).handle;
+  const spawned = captureRunCli(() => ({}));
+  const claude = adapter();
+  expect(await claude.probeSession(handle, { conversation: "new" })).toBe("HEALTHY");
+  expect(await claude.probeSession(handle, { conversation: "resume" })).toBe("UNAVAILABLE");
+  const directory = claudeTranscriptDirectory(workdir)!;
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, `${handle.externalSessionId}.jsonl`), '{"type":"assistant"}\n');
+  expect(await claude.probeSession(handle, { conversation: "resume" })).toBe("HEALTHY");
+  expect(spawned).toEqual([]);
+});
 
 describe("C1b adapter: a session turn is one conversation, opened once and resumed after", () => {
   it("the first call opens the conversation with --session-id and every later call continues it with --resume, never both", async () => {
@@ -174,36 +189,15 @@ const dispatched = async () => {
 };
 
 describe("C1b driver: the spawn's readiness is an authenticated attestation, never a row or a UUID", () => {
-  it("the spawn's first turn opens the conversation and its relay presents the challenge with the delivered credential", async () => {
+  it("becomes ready without a model turn or a session_attest response", async () => {
     const { harness, claude, run } = await dispatched();
-    expect(claude.turns).toHaveLength(1);
-    expect(claude.turns[0]).toMatchObject({ conversation: "new", relay: expect.anything() });
+    expect(claude.turns).toHaveLength(0);
     const session = harness.cp.sessions.require(run.ownerSessionId!);
-    expect(claude.credentials.get(session.sessionId)).toMatchObject({ sessionId: session.sessionId });
-    const attested = harness.cp.db.get<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_ATTESTED' AND session_id = ?`, [session.sessionId],
-    )?.n;
-    expect(attested).toBe(1);
-  });
-
-  it.each([
-    ["the relay never takes the credential", (double: HeadlessRuntimeDouble) => { double.takeCredential = false; }],
-    ["the model never presents the challenge", (double: HeadlessRuntimeDouble) => { double.presentAttestation = false; }],
-  ] as const)("refused when %s: no READY session, no binding, the spawn stopped", async (_name, arrange) => {
-    const harness = makeHarness();
-    const claude = bootstrapCtoProvider(harness.cp, harness.clock);
-    arrange(claude);
-    const created = harness.cp.runs.create({
-      kind: RunKind.PROJECT_BOOTSTRAP,
-      executionMode: ExecutionMode.STANDARD,
-      contract: { goal: "g", why: "w", scope: [], nonGoals: [], acceptance: ["a"], priority: "NORMAL", humanGate: [], references: [] },
-    });
-    if (!created.allowed) throw new Error(created.message);
-    const refused = await harness.cp.runs.dispatch(created.value.runId);
-    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_NOT_READY, evidence: { cause: ReasonCode.SESSION_ATTESTATION_FAILED } });
-    expect(harness.cp.bindings.history(roleKeyFor(Role.BOOTSTRAP_CTO, { runId: created.value.runId }))).toEqual([]);
-    expect(harness.cp.db.all<{ lifecycle: string }>(`SELECT lifecycle FROM sessions WHERE provider = 'claude'`))
-      .toEqual([{ lifecycle: "STOPPED" }]);
+    expect(session.lifecycle).toBe("READY");
+    expect(harness.cp.sessionAttestations.attest({
+      sessionId: session.sessionId, sessionIncarnation: session.incarnation, sessionSecret: "wrong",
+    }).allowed).toBe(false);
+    expect(harness.cp.audit.byKind("SESSION_ATTESTED").filter((event) => event.sessionId === session.sessionId)).toHaveLength(1);
   });
 
   it("a spawn whose runtime has no route to the daemon is refused: nothing can authenticate it", async () => {
@@ -251,16 +245,16 @@ describe("C1b driver: one turn at a time; concurrent wakes coalesce; a duplicate
     expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }])).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_TURN_DUPLICATE });
     expect(runtime.wake(roleKey, [{ id: "m1", kind: "test" }])).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_TURN_DUPLICATE });
     release();
-    await vi.waitFor(() => expect(claude.turns).toHaveLength(3));
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(2));
     release();
     await vi.waitFor(() => expect(running).toBe(0));
-    // The attestation, the first work turn, and one coalesced follow-up for m2 and m3.
-    expect(claude.turns.map((turn) => turn.conversation)).toEqual(["new", "resume", "resume"]);
-    expect(claude.turns[2]!.prompt).toContain("test");
+    // The first work turn and one coalesced follow-up for m2 and m3.
+    expect(claude.turns.map((turn) => turn.conversation)).toEqual(["new", "resume"]);
+    expect(claude.turns[1]!.prompt).toContain("test");
     expect(most).toBe(1);
     // Once run, a trigger is never run again.
     expect(runtime.wake(roleKey, [{ id: "m3", kind: "test" }])).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_TURN_DUPLICATE });
-    expect(claude.turns).toHaveLength(3);
+    expect(claude.turns).toHaveLength(2);
   });
 
   it("ACP-C1B-01: a coalesced follow-up turn that fails releases its triggers to the next wake; a completed one never runs again", async () => {
@@ -275,7 +269,7 @@ describe("C1b driver: one turn at a time; concurrent wakes coalesce; a duplicate
     };
     const runtime = harness.cp.sessionRuntime;
     expect(runtime.wake(roleKey, [{ id: "m1", kind: "test" }])).toMatchObject({ allowed: true, value: "STARTED" });
-    await vi.waitFor(() => expect(claude.turns).toHaveLength(2));
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(1));
     expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }, { id: "m3", kind: "test" }])).toMatchObject({
       allowed: true,
       value: "COALESCED",
@@ -288,14 +282,14 @@ describe("C1b driver: one turn at a time; concurrent wakes coalesce; a duplicate
       `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_TURN' AND reason_code = ?`,
       [ReasonCode.SESSION_TURN_FAILED],
     )?.n).toBe(1));
-    expect(claude.turns).toHaveLength(3);
+    expect(claude.turns).toHaveLength(2);
     // m1 completed and is never run again; m2 and m3 failed and are taken by the next wake.
     expect(runtime.wake(roleKey, [{ id: "m1", kind: "test" }])).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_TURN_DUPLICATE });
     expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }, { id: "m3", kind: "test" }])).toMatchObject({
       allowed: true,
       value: "STARTED",
     });
-    await vi.waitFor(() => expect(claude.turns).toHaveLength(4));
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(3));
     await vi.waitFor(() => expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }])).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.SESSION_TURN_DUPLICATE,
@@ -316,7 +310,7 @@ describe("C1b driver: one turn at a time; concurrent wakes coalesce; a duplicate
     const sessionId = run.ownerSessionId!;
     const epoch = harness.cp.sessions.require(sessionId).credentialEpoch;
     expect(runtime.wake(roleKey, [{ id: "m1", kind: "test" }])).toMatchObject({ allowed: true, value: "STARTED" });
-    await vi.waitFor(() => expect(claude.turns).toHaveLength(2));
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(1));
     expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }])).toMatchObject({ allowed: true, value: "COALESCED" });
     // While m1 runs, the session stops holding its current credential (a rotation it has not
     // received yet): the follow-up for m2 cannot run when m1 ends.
@@ -325,18 +319,18 @@ describe("C1b driver: one turn at a time; concurrent wakes coalesce; a duplicate
     release();
     await vi.waitFor(() => expect(runtime.holds(sessionId)).toBe(false));
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(claude.turns).toHaveLength(2);
+    expect(claude.turns).toHaveLength(1);
     // Once the session holds its credential again, the wake that names m2 runs it.
     runtime.adopt(sessionId, Role.BOOTSTRAP_CTO, "current-credential", epoch);
     expect(runtime.wake(roleKey, [{ id: "m2", kind: "test" }])).toMatchObject({ allowed: true, value: "STARTED" });
-    await vi.waitFor(() => expect(claude.turns).toHaveLength(3));
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(2));
   });
 
   it("the credential is offered for exactly one turn and withdrawn after it; an untaken one is recorded", async () => {
     const { harness, claude, roleKey, run } = await dispatched();
     claude.takeCredential = false;
     expect(harness.cp.sessionRuntime.wake(roleKey, [{ id: "w1", kind: "test" }]).allowed).toBe(true);
-    await vi.waitFor(() => expect(claude.turns).toHaveLength(2));
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(1));
     await vi.waitFor(() => expect(harness.cp.db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'SESSION_CREDENTIAL_NOT_TAKEN' AND session_id = ?`, [run.ownerSessionId],
     )?.n).toBe(1));
@@ -349,30 +343,14 @@ describe("C1b driver: one turn at a time; concurrent wakes coalesce; a duplicate
       allowed: false,
       reasonCode: ReasonCode.SESSION_RUNTIME_UNAVAILABLE,
     });
-    expect(claude.turns).toHaveLength(1);
+    expect(claude.turns).toHaveLength(0);
   });
 
-  it("the plaintext credential reaches no argv, stdin or environment of the real adapter's turn", async () => {
-    const { harness, run } = await dispatched();
+  it("rejects a stale credential before readiness without running the model", async () => {
+    const { harness, run, claude } = await dispatched();
     const session = harness.cp.sessions.require(run.ownerSessionId!);
-    const secret = "never-in-argv-" + "x".repeat(32);
-    harness.cp.sessionRuntime.adopt(session.sessionId, Role.BOOTSTRAP_CTO, secret, session.credentialEpoch);
-    // Route the session through the real Claude adapter, with the CLI replaced by a recorder.
-    const workdir = tempDir("acp-c1b-real-");
-    const real = adapter();
-    vi.spyOn(harness.cp.providers, "requireForRole").mockReturnValue(real);
-    vi.spyOn(harness.cp.sessions, "get").mockImplementation((sessionId) => {
-      const row = harness.cp.db.get<{ session_id: string }>(`SELECT session_id FROM sessions WHERE session_id = ?`, [sessionId]);
-      if (!row) return null;
-      return { ...session, workdir };
-    });
-    const spawned = captureRunCli(() => ({ session_id: session.incarnation.split("#", 1)[0], result: "ok" }));
-    // The recorder presents no challenge, so the turn runs and the attestation is refused.
-    const attested = await harness.cp.sessionRuntime.attest(session.sessionId, "resume");
-    expect(attested).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_ATTESTATION_FAILED });
-    expect(spawned).toHaveLength(1);
-    const seen = JSON.stringify({ args: spawned[0]!.args, stdin: spawned[0]!.options["stdin"], env: process.env });
-    expect(seen).not.toContain(secret);
-    expect(seen).not.toContain(session.sessionId + ":");
+    harness.cp.sessionRuntime.adopt(session.sessionId, Role.BOOTSTRAP_CTO, "wrong-secret", session.credentialEpoch);
+    expect((await harness.cp.sessionRuntime.attest(session.sessionId, "resume")).allowed).toBe(false);
+    expect(claude.turns).toHaveLength(0);
   });
 });

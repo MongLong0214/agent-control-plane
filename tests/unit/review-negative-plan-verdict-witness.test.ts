@@ -52,6 +52,7 @@ const fixture = async () => {
   const launch = await startSessionLaunchChannel(tempDir("acp-rf02-launch-"), { mcpToken: TOKEN });
   harness.cp.cto.attach({ sessionLaunch: launch });
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
+  claude.observeCredentialCustody(harness.cp.sessionRuntime, harness.cp.sessions, TOKEN);
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
 
   const ceo = harness.cp.sessions.create({ provider: "scripted", model: "rf02-ceo" });

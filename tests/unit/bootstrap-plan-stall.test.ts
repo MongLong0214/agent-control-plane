@@ -57,21 +57,21 @@ describe("the ack-only stall: a driven bootstrap owner that acknowledges its RUN
       const owner = scriptBootstrapOwner(f, { onDispatch: "ack-only", onRecovery: "follow-prompt" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
       // The attestation, then the RUN_DISPATCH's work turn, which only acknowledged.
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       expect(owner.acknowledged).toEqual([expect.objectContaining({ kind: MessageKind.RUN_DISPATCH, ok: true })]);
       expect(runDispatches(f, runId)).toEqual([{ generation: 1, status: "ACKED" }]);
       expect(planOf(f, runId)).toBeNull();
       // Nothing addressed to it is pending, so the outbox's own re-wake has nothing to wake it for.
       await f.harness.cp.outbox.wakeInBandPending();
       await ticks(50);
-      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
 
       const daemon = await startDaemon(f);
       try {
-        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3), { timeout: 10_000, interval: 25 });
+        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
         // Several more watchdog ticks: the owner is never woken a second time.
         await ticks(400);
-        expect(f.finishedTurns(ownerSessionId)).toBe(3);
+        expect(f.finishedTurns(ownerSessionId)).toBe(2);
       } finally {
         await daemon.stop();
       }
@@ -108,7 +108,7 @@ describe("the ack-only stall: a driven bootstrap owner that acknowledges its RUN
       const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onRecovery: "follow-prompt" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
       // That turn now also submits the result, which runs the review: waited for, however long it takes under load.
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       // The RUN_DISPATCH's own turn carries the directive, and the ack rule is still there.
       const prompt = owner.prompts[0]!;
       expect(prompt).toContain(RUN_DISPATCH_DIRECTIVE);
@@ -123,7 +123,7 @@ describe("the ack-only stall: a driven bootstrap owner that acknowledges its RUN
       } finally {
         await daemon.stop();
       }
-      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
       expect(recoveryWakes(f, runId)).toBe(0);
     });
   });

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
-import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger, type ProviderCapacity } from "../capacity/capacity-monitor.ts";
+import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
 import { RECONCILE_SWEEP_BUDGET_MS } from "../conversation/turn-coordinator.ts";
 import {
@@ -59,7 +59,6 @@ import { REPO_FACTORY_GITHUB_WRITE_OPERATION } from "../bootstrap/repo-factory-b
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import {
   ArtifactKind,
-  ContinuityMode,
   Role,
   type RoleBinding,
   RunKind,
@@ -1879,22 +1878,11 @@ export class Daemon {
           ? this.cp.capacity.currentForRole(session.provider, required.role) ??
             this.cp.capacity.current(session.provider)
           : null;
-        // Capacity constrains the providers it manages. It has nothing to say about one it does
-        // not, and "nothing to say" is not "not covered" — reading it that way evicted the only
-        // authority the once-ever bootstrap can create. The generation-1 CEO runs as
-        // `provider: "hermes"`, no collector writes a snapshot for that name, so `current()`
-        // returned null on every pass and this predicate handed the role to continuity, which
-        // replaced it with gpt/claude or revoked the binding. The bootstrap door is closed by
-        // history, so there was no second one to make.
-        //
-        // Liveness still decides. A hermes CEO whose session is not READY falls through to
-        // failover exactly as before, which is the path §15 relies on once the door is shut.
-        const capacityManaged = session !== null && this.cp.capacity.manages(session.provider);
-        const currentStillCovered =
-          session?.lifecycle === SessionLifecycle.READY &&
-          (!capacityManaged ||
-            (currentCapacity !== null &&
-              this.cp.capacity.isRoutableFor(currentCapacity, required.capability)));
+        // Quota/coverage readings are advisory. A live holder keeps its role and gets the
+        // next attempt; only loss of the session drives replacement or recovery.
+        const currentStillCovered = session?.lifecycle === SessionLifecycle.READY &&
+          currentCapacity?.runtimeHealth !== "UNAVAILABLE" &&
+          (currentCapacity?.runtimeHealth === "HEALTHY" || session.osPid === null || this.incumbentIsLive(session));
         // A new plan may prefer a recovered provider over an already healthy fallback.
         // That is restoration, not failure, and §15.8 keeps the acting owner in place
         // until the explicit non-preemptive restore path can safely move it.
@@ -1905,46 +1893,11 @@ export class Daemon {
           continue;
         }
 
-        // #811: allocation needs a readable quota; eviction needs evidence against the
-        // incumbent. An observed exhausted window dominates an unread window beside it.
-        // Otherwise a failed sensor or unknown quota is neither exhaustion nor a dead
-        // runtime. Keep the READY binding and surface the
-        // unresolved reading, without making this provider eligible for new work.
-        // A failed role probe can also report UNAVAILABLE when its runtime check fails.
-        // That verdict is not proof that the *bound* process died: only the exact native
-        // (pid, start token) pair can establish that this READY incumbent is still here.
-        // Never compare a native token to ps's whole-second lstart string.
-        const nativeIncumbentAlive =
-          currentCapacity?.sensorHealth === "ERROR" &&
-          currentCapacity.runtimeHealth === "UNAVAILABLE" &&
-          session?.lifecycle === SessionLifecycle.READY &&
-          session?.osPid != null && session.osProcessStartedAt != null &&
-          session.osProcessStartedAt === readProcessStartToken(session.osPid);
-        if (
-          session?.lifecycle === SessionLifecycle.READY &&
-          currentCapacity !== null &&
-          (currentCapacity.runtimeHealth !== "UNAVAILABLE" || nativeIncumbentAlive) &&
-          !this.cp.capacity.hasExhaustedQuotaFor(currentCapacity, required.capability) &&
-          (currentCapacity.sensorHealth === "ERROR" ||
-            this.cp.capacity.hasUnknownQuotaFor(currentCapacity, required.capability))
-        ) {
-          unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
-          continue;
-        }
-        // The same rule when there is no reading at all. The guard above needs a snapshot to
-        // read, so a managed provider with none fell through to the coverage gap and, after its
-        // grace, to revocation or failover of a binding whose process was still running.
-        if (this.keepsIncumbentThroughUnreadCapacity(session, currentCapacity)) {
-          unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
-          continue;
-        }
-
         if (!assignment?.provider) {
           unresolved.push({
             roleKey: required.roleKey,
             reasonCode: plan.outcome === "NO_VALID_COVERAGE" ? ReasonCode.COVERAGE_NONE : ReasonCode.COVERAGE_PARTIAL,
           });
-          if (this.holdsThroughCoverageGap(required.roleKey, current.bindingGeneration, session, currentCapacity)) continue;
           // The reason is the continuity kernel's, not a literal this site owns: `requiredRoles`
           // reads it back off the revoked row to tell a revocation it performed from an operator
           // release, which is what decides whether the role is still owed a binding (#954).
@@ -2210,41 +2163,8 @@ export class Daemon {
     return report;
   }
 
-  /**
-   * Whether a READY incumbent keeps its binding although its provider has no capacity reading.
-   *
-   * Unknown capacity is neither exhaustion nor a dead runtime, and it says nothing about the
-   * bound process. The role stays unresolved (`CAPACITY_UNKNOWN_NOT_ROUTABLE`): unknown is not
-   * turned into routable, and new work is still refused by routing. Only the binding is kept.
-   *
-   * The keep lasts for as long as the provider stays unread, so it needs a decisive identity, not
-   * `recordedProcessIsRunning` (ACP1045-R1-01): that test's lstart branch compares whole-second
-   * text and then a native start truncated to the millisecond of `createdAt`, so a replacement
-   * that took the pid later in that same millisecond passes it. The coverage hold keeps that test
-   * rather than this one, because the hold ends (r-364403fc103a). Decisive here means, in order:
-   *
-   *   (a) a row that recorded a native token: equal to the live token, or not this process;
-   *   (b) a row whose process has a pinned native token (written by the CTO launch and continuity
-   *       provisioning paths through `SessionRegistry.createWithPinnedStart`, and by (c) below):
-   *       equal to it and in the recorded lstart second, or not this process;
-   *   (c) a legacy row that recorded only `ps` lstart (ACP1045-R2-01): the live native start,
-   *       truncated to the second, is the recorded lstart second, and the row was written after
-   *       that second ended. The recorded process was alive when the row was written, so a process
-   *       that later took its pid started after that, in a later second, and has a different
-   *       lstart. The live token is pinned then, so later passes are exact. A row written inside
-   *       its process's own start second cannot tell that process from a successor, and is not
-   *       kept. The adopted Gateway's lineage admission (#1037) has no such rule: it compares
-   *       the native start exactly, or refuses.
-   *
-   * Anything else — a session that is not READY, no pid, no recorded start, an unreadable live
-   * token, a mismatch, or the ambiguous same-second row — returns false and takes the hold, revoke
-   * and failover paths exactly as before.
-   */
-  private keepsIncumbentThroughUnreadCapacity(
-    session: SessionRecord | null,
-    capacity: ProviderCapacity | null,
-  ): boolean {
-    if (capacity !== null) return false;
+  /** Check the recorded process identity directly, independently of quota readings. */
+  private incumbentIsLive(session: SessionRecord | null): boolean {
     if (session?.lifecycle !== SessionLifecycle.READY) return false;
     if (session.osPid == null) return false;
     if (session.osProcessStartedAt == null) return false;
@@ -2263,45 +2183,6 @@ export class Daemon {
     if (Date.parse(session.createdAt) < recordedSecond + 1000) return false;
     this.cp.sessions.pinNativeStart(session.sessionId, live);
     return true;
-  }
-
-  /**
-   * #954 — whether this pass keeps the binding of a role the coverage plan cannot staff.
-   *
-   * Only an incumbent that is provably still running is held: its session READY and its exact
-   * process alive, its start read again in the form the session recorded it. Anything else is the
-   * dead endpoint the revocation exists for. A runtime its own reading calls UNAVAILABLE is evidence
-   * against the incumbent rather than a gap in quota or admission, and is revoked at once as before.
-   * The hold is per generation. It ends when the role is covered again or once
-   * `COVERAGE_REVOCATION_GRACE_MS` has passed since its `CONTINUITY_REVOCATION_HELD` row was written,
-   * whichever comes first.
-   */
-  private holdsThroughCoverageGap(
-    roleKey: string,
-    generation: number,
-    session: SessionRecord | null,
-    capacity: ProviderCapacity | null,
-  ): boolean {
-    if (capacity?.runtimeHealth === "UNAVAILABLE") return false;
-    if (session?.lifecycle !== SessionLifecycle.READY) return false;
-    if (!recordedProcessIsRunning(session)) return false;
-    const nowMs = Date.parse(this.cp.clock.nowIso());
-    const heldAt = this.openCoverageHoldAt(roleKey, generation);
-    if (heldAt === null) {
-      this.cp.audit.record({
-        kind: "CONTINUITY_REVOCATION_HELD",
-        roleKey,
-        sessionId: session.sessionId,
-        reasonCode: ReasonCode.COVERAGE_INCOMPLETE,
-        evidence: {
-          generation,
-          graceMs: COVERAGE_REVOCATION_GRACE_MS,
-          revokeAfter: new Date(nowMs + COVERAGE_REVOCATION_GRACE_MS).toISOString(),
-        },
-      });
-      return true;
-    }
-    return nowMs - Date.parse(heldAt) < COVERAGE_REVOCATION_GRACE_MS;
   }
 
   /**
@@ -3029,7 +2910,6 @@ export class Daemon {
     if (!run || run.state !== RunState.ACTIVE || run.kind !== RunKind.STANDARD_WORK || !run.projectId) return null;
     if (run.continuityHoldRoleKey) return null;
     if (this.cp.projects.get(run.projectId)?.suspended !== false) return null;
-    if (this.cp.continuity.mode() === ContinuityMode.SURVIVAL) return null;
     if (this.cp.artifacts.latest(runId, ArtifactKind.PLAN) === null) return null;
     const running = this.cp.db.get<{ n: number }>(
       `SELECT 1 AS n FROM candidate_pipeline_attempts WHERE run_id = ? AND state = 'RUNNING' LIMIT 1`,
