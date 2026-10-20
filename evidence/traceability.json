@@ -3,13 +3,13 @@
     "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
     "docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md"
   ],
-  "measuredAt": "07cbfe54cf1ccf0feead97acfa1eed4e1631c4e3 (working tree modified)",
+  "measuredAt": "1b3cd9bc63ec9c7eef8e0d7f8b4f2fd6622be05b",
   "testRun": {
     "reporter": "vitest-json",
-    "success": false,
-    "total": 6821,
-    "passed": 6801,
-    "failed": 8,
+    "success": true,
+    "total": 6475,
+    "passed": 6463,
+    "failed": 0,
     "pending": 12
   },
   "summary": {
@@ -20,8 +20,10 @@
     "scenariosWithPassedDeclarations": 59,
     "scenariosMissing": [],
     "repoFactoryScenarios": 25,
-    "repoFactoryScenariosWithPassedDeclarations": 17,
-    "repoFactoryScenariosMissing": [],
+    "repoFactoryScenariosWithPassedDeclarations": 16,
+    "repoFactoryScenariosMissing": [
+      "RF-S25"
+    ],
     "repoFactoryScenariosExternal": [
       "RF-S02",
       "RF-S03",
@@ -679,7 +681,7 @@
         },
         {
           "file": "tests/scenarios/graph-capacity-continuity.test.ts",
-          "title": "CP-S17: dispatch refuses its selected CTO provider when its capacity probe fails"
+          "title": "CP-S17: dispatch attempts its selected provider when quota collection fails"
         },
         {
           "file": "tests/scenarios/graph-capacity-continuity.test.ts",
@@ -717,7 +719,7 @@
       "tests": [
         {
           "file": "tests/scenarios/graph-capacity-continuity.test.ts",
-          "title": "CP-S19: GPT exhausted with Claude able to cover everything is DEGRADED / FULL_COVERAGE"
+          "title": "CP-S19: GPT quota exhaustion does not remove its role coverage"
         },
         {
           "file": "tests/scenarios/graph-capacity-continuity.test.ts",
@@ -732,7 +734,7 @@
       "tests": [
         {
           "file": "tests/scenarios/graph-capacity-continuity.test.ts",
-          "title": "CP-S20: partial coverage yields a wait-or-pause action rather than a silent pass"
+          "title": "CP-S20: unread quota and missing bucket capabilities stay advisory"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -754,7 +756,7 @@
       "tests": [
         {
           "file": "tests/scenarios/graph-capacity-continuity.test.ts",
-          "title": "CP-S22: with both providers unavailable the mode is SURVIVAL and completion is refused"
+          "title": "CP-S22: real outages remain uncovered without adding a continuity completion proof"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -934,7 +936,7 @@
       "tests": [
         {
           "file": "tests/scenarios/graph-capacity-continuity.test.ts",
-          "title": "CP-S34: a failover the coverage plan cannot staff is refused, not downgraded"
+          "title": "CP-S34: failover attempts its selected provider despite unknown capacity"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -1268,7 +1270,7 @@
         },
         {
           "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
-          "title": "#246: a bootstrap CTO is never promoted; its session takes no primary CTO role"
+          "title": "#246: a bootstrap CTO session can be reused for a primary CTO role"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -2141,19 +2143,12 @@
               "title": "refuses a public repository when the approval covers only a private one, with no GitHub call"
             }
           ]
-        },
-        {
-          "arm": "owner-authority",
-          "tests": [
-            {
-              "file": "tests/unit/repo-factory-run-wiring.test.ts",
-              "title": "the CEO cannot mint it: Hermes refuses an owner decision for this operation and has no tool that mints one"
-            }
-          ]
         }
       ],
-      "missingArms": [],
-      "status": "DECLARATION_COVERED",
+      "missingArms": [
+        "owner-authority"
+      ],
+      "status": "DECLARATION_MISSING",
       "external": []
     }
   ]
