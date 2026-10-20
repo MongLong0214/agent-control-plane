@@ -328,6 +328,8 @@ const unparsableAnswerEvidence = (text: string): Record<string, string | number 
 
 /** Diff size above which a single reviewer context is not trusted to hold everything. */
 const CHUNK_THRESHOLD_CHARS = 120_000;
+/** Room kept for the change itself before the packet's tree and task listings take any. */
+const EVIDENCE_DIFF_RESERVE_CHARS = 32_000;
 const REVIEW_TIMEOUT_MS = 20 * 60 * 1000;
 
 /**
@@ -472,9 +474,18 @@ export class BlindReviewGate {
       const collected = await this.collectDiffs(request.snapshot);
       if (!collected.allowed) return collected as Decision<ReviewPacket>;
       const { diffs, binaryArtifacts, trees } = collected.value;
-      const evidenceSection = candidateEvidenceSection(this.db, request.runId, trees);
+      // #1166 r3 — the listings get only the room left under the reviewer budget after the other
+      // metadata, the chunk envelope and a share for the change itself, so they never crowd out
+      // the diff or push the metadata past the budget. A cut is marked in the packet.
+      const diffChars = diffs.reduce((n, d) => n + d.diff.length, 0);
+      const bareEvidence = candidateEvidenceSection(this.db, request.runId, trees, 0);
+      const bareOverhead = this.promptOverhead(request, change, bareEvidence);
+      // The change's real share of a prompt, repository and file fences included.
+      const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence).length - bareOverhead;
+      const evidenceRoom = CHUNK_THRESHOLD_CHARS - 4_096 - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
+      const evidenceSection = candidateEvidenceSection(this.db, request.runId, trees, evidenceRoom);
 
-      const totalChars = diffs.reduce((n, d) => n + d.diff.length, 0) + this.promptOverhead(request, change, evidenceSection);
+      const totalChars = diffChars + this.promptOverhead(request, change, evidenceSection);
       const chunked = totalChars > CHUNK_THRESHOLD_CHARS;
 
       let outcome: Decision<ReviewOutcome>;

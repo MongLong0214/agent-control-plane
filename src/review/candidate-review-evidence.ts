@@ -34,7 +34,7 @@ interface TaskEvidence { taskId: string; category: string; state: string; worker
  */
 export const TASK_CHAR_BUDGET = 16_000;
 
-const taskEvidence = (db: Db, runId: string) => {
+const taskEvidence = (db: Db, runId: string, budget: number) => {
   // task_id is globally unique; legacy task-scoped bindings may have NULL run_id.
   // Tasks that ever had a WORKER binding come first, so a cut drops unexecuted work first.
   const all = db.all<TaskEvidence>(
@@ -47,9 +47,9 @@ const taskEvidence = (db: Db, runId: string) => {
   const tasks: TaskEvidence[] = [];
   let used = 0;
   for (const task of all) {
-    // Rendered two levels deep in the pretty-printed packet.
-    const cost = JSON.stringify(task, null, 6).length + 8;
-    if (used + cost > TASK_CHAR_BUDGET) break;
+    // Rendered two levels deep in the pretty-printed packet: brace indentation and separator included.
+    const cost = JSON.stringify(task, null, 6).length + 12;
+    if (used + cost > budget) break;
     used += cost;
     tasks.push(task);
   }
@@ -65,9 +65,9 @@ const taskEvidence = (db: Db, runId: string) => {
 };
 
 /** A projection of canonical records only: no producer text, provider, actor or session identity. */
-export const controlPlaneEvidence = (db: Db, runId: string) => ({
+export const controlPlaneEvidence = (db: Db, runId: string, taskBudget = TASK_CHAR_BUDGET) => ({
   dispatched: db.get(`SELECT 1 FROM audit_events WHERE run_id = ? AND kind = 'DISPATCHED' LIMIT 1`, [runId]) !== undefined,
-  ...taskEvidence(db, runId),
+  ...taskEvidence(db, runId, taskBudget),
   // Match the run's whole owner pin, not whichever CTO happens to be active now. This is the
   // dispatch/renewal delegation, including a historical binding if the owner has since changed.
   owningPrimaryCtoDelegation: db.get(
@@ -109,36 +109,65 @@ export const laterGateSection = (runKind: string | null, repositoryCount: number
 };
 
 /**
- * #1166 r1 — the listing's serialized size is bounded across the whole packet, not only its entry
- * count: long paths could otherwise fill the review's metadata budget and refuse review for good.
- * Paths are kept in order while the shared budget lasts; a repository cut here is marked truncated.
+ * #1166 r1/r3 — the whole serialized listing is bounded, repository envelopes included: long paths
+ * or many participating repositories could otherwise fill the review's metadata budget and refuse
+ * review for good. Every envelope that fits is reserved before any path, so repositories are named
+ * first; paths then fill the rest in order. A repository cut here is marked truncated, and
+ * repositories whose envelope does not fit are omitted and counted in the packet.
  */
 export const TREE_CHAR_BUDGET = 24_000;
 
-const budgetTrees = (trees: readonly TrackedTreeEvidence[]): TrackedTreeEvidence[] => {
-  let used = 0;
-  return trees.map((tree) => {
+// Upper bounds on the pretty-printed cost: elements one level deep, paths three levels deep.
+const envelopeCost = (tree: TrackedTreeEvidence): number => {
+  const text = JSON.stringify({ ...tree, paths: [] }, null, 2);
+  // Indentation of every line, the element separator, and the brackets of a non-empty path list.
+  return text.length + 2 * text.split("\n").length + 2 + 8;
+};
+
+const budgetTrees = (trees: readonly TrackedTreeEvidence[], budget: number) => {
+  let used = 4; // the array's own brackets
+  const envelopes: TrackedTreeEvidence[] = [];
+  for (const tree of trees) {
+    const cost = envelopeCost(tree);
+    if (used + cost > budget) break;
+    used += cost;
+    envelopes.push(tree);
+  }
+  const listed = envelopes.map((tree) => {
     const kept: string[] = [];
     for (const path of tree.paths) {
       const cost = JSON.stringify(path).length + 8;
-      if (used + cost > TREE_CHAR_BUDGET) break;
+      if (used + cost > budget) break;
       used += cost;
       kept.push(path);
     }
     return { ...tree, truncated: tree.truncated || kept.length < tree.paths.length, paths: kept };
   });
+  return { listed, omitted: trees.length - listed.length };
 };
 
+/**
+ * `budget` is the room the caller has for the two listings, measured against the reviewer's real
+ * context budget; it is split between them and never exceeds their own limits.
+ */
 export const candidateEvidenceSection = (
   db: Db,
   runId: string,
   trees: readonly TrackedTreeEvidence[],
-): string[] => [
-  "## Frozen candidate tracked trees",
-  "Tracked paths at each candidate SHA, including unchanged paths. A truncated listing is incomplete; it cannot establish absence of unlisted paths.",
-  "```json", JSON.stringify(budgetTrees(trees), null, 2), "```", "",
-  "## Control-plane evidence",
-  "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately. taskSummary counts every task in the run; when it says truncated, the task list is incomplete and cannot establish absence of unlisted tasks.",
-  "```json", JSON.stringify(controlPlaneEvidence(db, runId), null, 2), "```", "",
-  ...laterGateSection(db.get<{ kind: string }>(`SELECT kind FROM runs WHERE run_id = ?`, [runId])?.kind ?? null, trees.length),
-];
+  budget = TREE_CHAR_BUDGET + TASK_CHAR_BUDGET,
+): string[] => {
+  const room = Math.max(0, budget);
+  const treeBudget = Math.min(TREE_CHAR_BUDGET, Math.floor((room * 3) / 5));
+  const { listed, omitted } = budgetTrees(trees, treeBudget);
+  return [
+    "## Frozen candidate tracked trees",
+    "Tracked paths at each candidate SHA, including unchanged paths. A truncated listing is incomplete; it cannot establish absence of unlisted paths.",
+    "```json", JSON.stringify(listed, null, 2), "```",
+    ...(omitted === 0 ? [] : [`${omitted} of ${trees.length} participating repositories are omitted from this listing for size; it establishes nothing about their tracked trees.`]),
+    "",
+    "## Control-plane evidence",
+    "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately. taskSummary counts every task in the run; when it says truncated, the task list is incomplete and cannot establish absence of unlisted tasks.",
+    "```json", JSON.stringify(controlPlaneEvidence(db, runId, Math.min(TASK_CHAR_BUDGET, room - treeBudget)), null, 2), "```", "",
+    ...laterGateSection(db.get<{ kind: string }>(`SELECT kind FROM runs WHERE run_id = ?`, [runId])?.kind ?? null, trees.length),
+  ];
+};
