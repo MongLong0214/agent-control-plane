@@ -1,0 +1,17 @@
+Limit: kept: the author must be the resolved CEO identity, the target must be exactly one bound PRIMARY_CTO on its project channel, and the guard's signature and nonce replay checks; a CEO key that never had any binding still has no identity and is refused
+Warn: owner directive 2026-10-20 (ACP is local and single-user): a CEO peer turn may call any CEO tool with any arguments; the CEO's Buzz identity is the live runtime's buzz_actor_id or else the latest identified CEO binding's, so a new CEO generation no longer silently refuses every CEO mention (live: about 27 hours from 2026-10-19); the #1044 reuse/recovery and generation-window refusals are gone, and a refused CEO envelope leaves one BUZZ_PEER_REFUSED audit row
+Record-Id: r-6d4fa2bae70d
+Provenance: inherited 93e46f0a8f92f63fda52b791dbed4b4a6e800b48
+
+Warn: BUZZ_PEER_EVENT_OUTSIDE_GENERATION and BUZZ_PEER_ORIGIN_AMBIGUOUS are no longer declared: #1167 removed the only refusals that emitted them, and the reason-code census requires every declared code to have a static outflow
+Record-Id: r-5850ae12cab9
+Provenance: inherited 78a64946abf4be2587b4a541b12f9b880bda05ce
+
+Limit: a claim taken under an older owner generation, or a branch another claim holds, is still refused; before CONFIRM an expired claim is still refused
+Warn: after the CEO's CONFIRM (CEO_APPROVED, MERGING, POST_MERGE_VERIFYING) the daemon finalizer renews the run owner's own EXPIRED branch claim for 2 hours when the same owner generation held it and no other claim holds that branch, and records CLAIM_RENEWED_FOR_FINALIZATION; live #512 stopped at MERGE_CLAIM_INVALID because the branch claim lapsed at 05:50Z while the run waited for review and CONFIRM
+Record-Id: r-341c845f9a04
+Provenance: inherited a34e17298e02ba4f998f83ee64455509033be124
+
+Warn: the two github-kernel.ts timestamp-ordering exclusions are re-keyed from lines 4281/4707 to 4313/4739 because the claim-renewal code above them moved them; the exclusion list is keyed by line, so any edit above these queries must re-key it
+Record-Id: r-9118a97ccd14
+Provenance: inherited 717184146d006684f7d63694934f4649092f9533
