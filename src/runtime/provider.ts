@@ -512,9 +512,11 @@ export interface ProviderAdapter {
   /**
    * Authenticated liveness check for the exact session that would receive a critical
    * role. A binary version check cannot establish this: it says nothing about provider
-   * authentication, network reachability, or the constituted session.
+   * authentication, network reachability, or the constituted session. Driven runtimes pass
+   * `conversation` for a local existence check without a model turn: `new` before any work was
+   * attempted, `resume` once the provider must retain that conversation.
    */
-  probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE">;
+  probeSession(handle: SessionHandle, options?: { conversation: ConversationStep }): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE">;
   probeCapacity(): Promise<CapacityReading>;
   /**
    * #246 C1b — one turn of a provisioned session's own conversation, with the acp-cto relay as
@@ -632,8 +634,8 @@ class CapacityObservedAdapter implements ProviderAdapter {
     return this.inner.probeRuntime();
   }
 
-  async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    return this.inner.probeSession(handle);
+  async probeSession(handle: SessionHandle, options?: { conversation: ConversationStep }): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
+    return this.inner.probeSession(handle, options);
   }
 
   async probeCapacity(): Promise<CapacityReading> {

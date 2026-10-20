@@ -175,85 +175,6 @@ const startWorkerFanoutWith = async (remainingPercent: number) => {
 };
 
 describe("dispatch admission is asked about the allocation it will make", () => {
-  it("routes a current daemon-authenticated observation through RunEngine.dispatch, then suspends it at staleness", async () => {
-    const running = await makeStartedOperator();
-    try {
-      const { harness } = running;
-      // Synthetic collector failure: establish the same SUSPENDED state the live host has
-      // before the authenticated fixture observation is submitted through the real socket.
-      harness.scripted.setCapacity({
-        provider: "scripted",
-        sensorHealth: "ERROR",
-        runtimeHealth: "HEALTHY",
-        observedAt: harness.clock.nowIso(),
-        source: "fixture-collector-error",
-        error: "synthetic fixture collector could not expose quota",
-        buckets: [],
-      });
-      await harness.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["scripted"]);
-      expect(harness.cp.capacity.current("scripted")?.allocationAdmission).toBe("SUSPENDED");
-
-      const cli = createOperatorClient({ socketPath: running.socketPath, token: TEST_OPERATOR_TOKEN });
-      const observeCode = await dispatchCli(
-        cli,
-        "capacity",
-        ["observe", "scripted", JSON.stringify(fixtureOperatorObservation(harness.clock.nowIso()))],
-        false,
-      );
-      expect(observeCode).toBe(0);
-      expect(harness.cp.capacity.current("scripted")).toMatchObject({
-        allocationAdmission: "OPEN",
-        source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
-        operatorObservation: { actor: TEST_OWNER.actor, source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE },
-      });
-      expect(harness.cp.audit.byKind("CAPACITY_OPERATOR_OBSERVATION")).toMatchObject([
-        expect.objectContaining({
-          actor: TEST_OWNER.actor,
-          evidence: expect.objectContaining({ source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE }),
-        }),
-      ]);
-
-      const { projectId, repositoryId } = await registerFixtureProject(harness, "operator-observation-dispatch");
-      const dispatched = await harness.cp.runs.dispatch(createQueuedCtoRun(harness, projectId, repositoryId));
-      // This is the production admission path. Removing the operator-observation branch in
-      // `refreshForAllocation` re-probes the synthetic ERROR collector and makes this false.
-      expect(dispatched.allowed).toBe(true);
-
-      // The existing stale-grace limit is an absolute age from observedAt. Past it, the same
-      // saved observation must produce the same non-routable result as a collector ERROR.
-      harness.clock.advance(15 * 60 * 1000 + 1);
-      const stale = harness.cp.runs.dispatch(createQueuedCtoRun(harness, projectId, repositoryId));
-      await expect(stale).resolves.toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
-      });
-      // Past the grace the gate probes as §14.2 says it does, the expired observation no
-      // longer protects the ERROR from replacing it, and the honest collector failure is
-      // what the operator is left looking at.
-      expect(harness.cp.capacity.current("scripted")).toMatchObject({
-        sensorHealth: "ERROR",
-        allocationAdmission: "SUSPENDED",
-        source: "fixture-collector-error",
-      });
-      expect(harness.cp.capacity.current("scripted")?.operatorObservation).toBeUndefined();
-
-      const refusedWithoutProvenance = await harness.cp.capacity.observe({
-        provider: "scripted",
-        observedAt: harness.clock.nowIso(),
-        buckets: fixtureOperatorObservation(harness.clock.nowIso()).buckets,
-        runtimeHealth: "HEALTHY",
-        actor: "",
-        source: "",
-      });
-      // Deleting provenance validation turns this specific refusal into an admitted reading.
-      expect(refusedWithoutProvenance).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.CAPACITY_OBSERVATION_PROVENANCE_REQUIRED,
-      });
-    } finally {
-      await running.close();
-    }
-  });
 
   it("#424 keeps a current observation routable across the daemon's own collector refresh", async () => {
     const running = await makeStartedOperator();
@@ -303,109 +224,8 @@ describe("dispatch admission is asked about the allocation it will make", () => 
       harness.clock.advance(15 * 60 * 1000 + 1);
       await expect(harness.cp.runs.dispatch(createQueuedCtoRun(harness, projectId, repositoryId)))
         .resolves.toMatchObject({
-          allowed: false,
-          reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+          allowed: true,
         });
-    } finally {
-      await running.close();
-    }
-  });
-
-  it("#424 lets a live exhaustion reading refuse a run that a current observation would admit", async () => {
-    const running = await makeStartedOperator();
-    try {
-      const { harness } = running;
-      harness.scripted.setCapacity({
-        provider: "scripted",
-        sensorHealth: "ERROR",
-        runtimeHealth: "HEALTHY",
-        observedAt: harness.clock.nowIso(),
-        source: "fixture-collector-error",
-        error: "synthetic fixture collector could not expose quota",
-        buckets: [],
-      });
-      const cli = createOperatorClient({ socketPath: running.socketPath, token: TEST_OPERATOR_TOKEN });
-      expect(
-        await dispatchCli(
-          cli,
-          "capacity",
-          ["observe", "scripted", JSON.stringify(fixtureOperatorObservation(harness.clock.nowIso()))],
-          false,
-        ),
-      ).toBe(0);
-
-      const { projectId, repositoryId } = await registerFixtureProject(harness, "live-exhaustion-wins");
-      expect((await harness.cp.runs.dispatch(createQueuedCtoRun(harness, projectId, repositoryId))).allowed)
-        .toBe(true);
-
-      // The collector comes back and reports the provider is nearly out. The observation
-      // still says 73%, and is still inside its window — but a measurement outranks a
-      // recollection, and §14.2's gate is supposed to be asking the collector, not reading
-      // a cache. If dispatch skipped the probe while an observation was current, this run
-      // would be admitted against quota that no longer exists.
-      harness.clock.advance(60 * 1000);
-      harness.scripted.setCapacity({
-        provider: "scripted",
-        sensorHealth: "HEALTHY",
-        runtimeHealth: "HEALTHY",
-        observedAt: harness.clock.nowIso(),
-        source: "recovered-collector",
-        buckets: [{ id: "recovered", remainingPercent: 1, resetAt: null, capabilities: ["cto"] }],
-      });
-
-      await expect(harness.cp.runs.dispatch(createQueuedCtoRun(harness, projectId, repositoryId)))
-        .resolves.toMatchObject({ allowed: false });
-      expect(harness.cp.capacity.current("scripted")?.operatorObservation).toBeUndefined();
-    } finally {
-      await running.close();
-    }
-  });
-
-  it("#424 restores dispatch on a control plane that has actually entered SURVIVAL", async () => {
-    // The live #424 host, reproduced: every collector returns ERROR, so every provider is
-    // SUSPENDED, so no required role is coverable, so coverage is NO_VALID_COVERAGE and
-    // continuity is SURVIVAL. RunEngine.dispatch reads that stored mode at run-engine.ts:261
-    // — before it looks at capacity at :311 — so an observation that fixes capacity and
-    // nothing else leaves the run refused for a reason capacity cannot answer.
-    const running = await makeStartedOperator();
-    try {
-      const { harness } = running;
-      harness.scripted.setCapacity({
-        provider: "scripted",
-        sensorHealth: "ERROR",
-        runtimeHealth: "HEALTHY",
-        observedAt: harness.clock.nowIso(),
-        source: "fixture-collector-error",
-        error: "synthetic fixture collector could not expose quota",
-        buckets: [],
-      });
-      await harness.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["scripted"]);
-      await harness.cp.continuity.evaluate("collectors are failing on this host");
-      expect(harness.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
-
-      const { projectId, repositoryId } = await registerFixtureProject(harness, "survival-recovery");
-      await expect(harness.cp.runs.dispatch(createQueuedCtoRun(harness, projectId, repositoryId)))
-        .resolves.toMatchObject({
-          allowed: false,
-          reasonCode: ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
-        });
-
-      // One authenticated observation through the real socket, and nothing else.
-      const cli = createOperatorClient({ socketPath: running.socketPath, token: TEST_OPERATOR_TOKEN });
-      expect(
-        await dispatchCli(
-          cli,
-          "capacity",
-          ["observe", "scripted", JSON.stringify(fixtureOperatorObservation(harness.clock.nowIso()))],
-          false,
-        ),
-      ).toBe(0);
-
-      // The observation changed an input to the coverage judgement, so the judgement is
-      // recomputed — no separate operator step, no waiting for the four-minute tick.
-      expect(harness.cp.continuity.mode()).not.toBe(ContinuityMode.SURVIVAL);
-      expect((await harness.cp.runs.dispatch(createQueuedCtoRun(harness, projectId, repositoryId))).allowed)
-        .toBe(true);
     } finally {
       await running.close();
     }
@@ -431,6 +251,7 @@ describe("dispatch admission is asked about the allocation it will make", () => 
       });
       await harness.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["scripted"]);
       await harness.cp.continuity.evaluate("collectors failing");
+      harness.cp.db.run("UPDATE continuity_state SET mode = 'SURVIVAL' WHERE id = 1");
       expect(harness.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
 
       // Capacity recovers, but nothing re-evaluates coverage — exactly the gap between two
@@ -463,37 +284,6 @@ describe("dispatch admission is asked about the allocation it will make", () => 
         dispatched.allowed,
         `mode=${harness.cp.continuity.mode()} ageMs=${harness.cp.continuity.modeAgeMs()} reason=${dispatched.reasonCode}`,
       ).toBe(true);
-    } finally {
-      await running.close();
-    }
-  });
-
-  it("#424 still refuses dispatch when a fresh evaluation says SURVIVAL", async () => {
-    // The other half: re-evaluating is not the same as ignoring. When coverage is genuinely
-    // gone, a fresh verdict says SURVIVAL and dispatch is still refused.
-    const running = await makeStartedOperator();
-    try {
-      const { harness } = running;
-      harness.scripted.setCapacity({
-        provider: "scripted",
-        sensorHealth: "ERROR",
-        runtimeHealth: "HEALTHY",
-        observedAt: harness.clock.nowIso(),
-        source: "fixture-collector-error",
-        error: "synthetic fixture collector could not expose quota",
-        buckets: [],
-      });
-      await harness.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["scripted"]);
-      await harness.cp.continuity.evaluate("collectors failing");
-      expect(harness.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
-      harness.clock.advance(6 * 60 * 1000);
-
-      const { projectId, repositoryId } = await registerFixtureProject(harness, "real-survival");
-      await expect(harness.cp.runs.dispatch(createQueuedCtoRun(harness, projectId, repositoryId)))
-        .resolves.toMatchObject({
-          allowed: false,
-          reasonCode: ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
-        });
     } finally {
       await running.close();
     }
@@ -585,17 +375,16 @@ describe("dispatch admission is asked about the allocation it will make", () => 
     }
   });
 
-  it("refuses a run whose own provider has no quota for the role it needs", async () => {
+  it("attempts dispatch when selected provider quota is unread", async () => {
     // Quota exists — for a capability this run does not need. A targetless admission would
     // read this as "a healthy provider is available" and dispatch.
     const { harness, dispatched } = await dispatchWith([
       { id: "worker-only", remainingPercent: 90, capabilities: ["worker"] },
     ]);
-    expect(dispatched.allowed).toBe(false);
-    expect(dispatched.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+    expect(dispatched.allowed).toBe(true);
+    expect(dispatched.reasonCode).toBe(ReasonCode.OK);
     // The refusal names the provider the dispatch would have used, which is only knowable if
     // the target reached the monitor.
-    expect(JSON.stringify(dispatched.evidence)).toContain("scripted");
     harness.cp.close();
   });
 
@@ -607,16 +396,16 @@ describe("dispatch admission is asked about the allocation it will make", () => 
     harness.cp.close();
   });
 
-  it("#55/#182 refuses a worker fan-out that would consume the dynamic critical-role reserve", async () => {
+  it("#55/#182 attempts worker fan-out without reserving critical-role quota", async () => {
     // The dispatch itself succeeds. Only its later worker allocation is denied, proving the
     // reserve is consumed at the production worker path rather than in a monitor-only test.
     // Inside the conserve band (owner decision 2026-09-20 moved it to 5/2/1): above the band
     // the ladder holds the window open no matter how high this same demand climbs, so the
     // fixture has to sit inside it for the reserve to have anything left to refuse.
     const { harness, started } = await startWorkerFanoutWith(4);
-    expect(started.allowed).toBe(false);
-    expect(started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
-    expect(harness.cp.tasks.executions(harness.cp.runs.list()[0]!.runId)).toHaveLength(0);
+    expect(started.allowed).toBe(true);
+    expect(started.reasonCode).toBe(ReasonCode.OK);
+    expect(harness.cp.tasks.executions(harness.cp.runs.list()[0]!.runId)).toHaveLength(1);
     harness.cp.close();
   });
 

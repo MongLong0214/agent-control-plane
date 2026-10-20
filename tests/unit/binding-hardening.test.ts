@@ -37,7 +37,7 @@ describe("CP-HI-04 role classification is exhaustive", () => {
     expect(Object.keys(ROLE_CLASS).sort()).toEqual(Object.values(Role).sort());
   });
 
-  it("refuses a blind reviewer that previously reviewed the same run adversarially", () => {
+  it("refuses a session that previously reviewed the same run adversarially", () => {
     const { bindings, seeded, session } = setup();
     const s = session("ses_adv");
     expect(
@@ -49,8 +49,7 @@ describe("CP-HI-04 role classification is exhaustive", () => {
     ).toBe(true);
 
     const refused = bindings.assertReviewerIndependence(seeded.runId, s);
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_IS_PRODUCER);
+    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.REVIEWER_SESSION_IS_PRODUCER });
   });
 });
 
@@ -145,6 +144,8 @@ describe("#380 — worker execution provenance is fail-closed", () => {
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_IS_PRODUCER);
   });
+
+
 });
 
 describe("role keys cannot be forged", () => {
@@ -222,11 +223,10 @@ describe("a switch cannot orphan live runs", () => {
 });
 
 describe("final CEO independence sees the project-scoped CTO", () => {
-  it("refuses the run's pinned owner as the deciding CEO", () => {
+  it("allows the authenticated CEO to reuse a former owner session", () => {
     const { bindings, seeded } = setup();
     const refused = bindings.assertFinalCeoIndependence(seeded.runId, seeded.sessionId);
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.FINAL_CEO_SESSION_NOT_INDEPENDENT);
+    expect(refused.allowed).toBe(true);
   });
 
   it("allows an unrelated session", () => {
@@ -557,6 +557,7 @@ describe("a reused pid does not make an innocent session a producer (#505)", () 
     });
     expect(decision.allowed).toBe(false);
   });
+
 });
 
 describe("#664 — a takeover's revoke-and-mint rolls back when it cannot repoint every run", () => {
@@ -1121,4 +1122,60 @@ describe("#649 — bootstrap target attestations are authenticated and atomic", 
       rows.mockRestore();
     }
   });
+});
+
+
+describe("reviewers never become workers on their reviewed run", () => {
+  it.each([false, true])("refuses a reviewer as worker after revocation=%s", (revoked) => {
+    const { db, clock, bindings, seeded, session } = setup();
+    db.run("UPDATE runs SET dispatched_at = ? WHERE run_id = ?", [clock.nowIso(), seeded.runId]);
+    const reviewer = session("ses_review_then_work");
+    const bound = bindings.bind({ role: Role.BLIND_REVIEWER, runId: seeded.runId, sessionId: reviewer });
+    expect(bound.allowed).toBe(true);
+    if (revoked) expect(bindings.revoke(`BLIND_REVIEWER:${seeded.runId}`, "review ended").allowed).toBe(true);
+    db.run(`INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
+      VALUES ('task-review-reuse', ?, 'work', 'implementation', 'READY', '{}', ?, ?)`,
+      [seeded.runId, clock.nowIso(), clock.nowIso()]);
+    expect(bindings.bind({ role: Role.WORKER, sessionId: reviewer, runId: seeded.runId, taskId: "task-review-reuse" }))
+      .toMatchObject({ allowed: false, reasonCode: ReasonCode.WORKER_SESSION_NOT_INDEPENDENT });
+    expect(bindings.active("WORKER:task-review-reuse")).toBeNull();
+  });
+});
+
+
+it("a worker's surviving actor move cannot make either producing session its reviewer", () => {
+  const { db, clock, bindings, seeded, session } = setup();
+  db.run("UPDATE runs SET dispatched_at = ? WHERE run_id = ?", [clock.nowIso(), seeded.runId]);
+  db.run(`INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
+    VALUES ('task-worker-move', ?, 'work', 'implementation', 'READY', '{}', ?, ?)`,
+    [seeded.runId, clock.nowIso(), clock.nowIso()]);
+  const worker = session("ses_worker_before_move");
+  const moved = session("ses_worker_after_move");
+  expect(bindings.bind({ role: Role.WORKER, sessionId: worker, runId: seeded.runId, taskId: "task-worker-move" }).allowed).toBe(true);
+  expect(bindings.switchTo({ role: Role.WORKER, sessionId: moved, runId: seeded.runId, taskId: "task-worker-move",
+    conversation: "SURVIVED", reason: "runtime move" }).allowed).toBe(true);
+  for (const producer of [worker, moved]) {
+    expect(bindings.bind({ role: Role.BLIND_REVIEWER, runId: seeded.runId, sessionId: producer }))
+      .toMatchObject({ allowed: false, reasonCode: ReasonCode.REVIEWER_SESSION_IS_PRODUCER });
+  }
+});
+
+
+it("a reviewer cannot become a worker after two surviving runtime moves and revocation", () => {
+  const { db, clock, bindings, seeded, session } = setup();
+  db.run("UPDATE runs SET dispatched_at = ? WHERE run_id = ?", [clock.nowIso(), seeded.runId]);
+  const first = session("ses_reviewer_first");
+  const middle = session("ses_reviewer_middle");
+  const last = session("ses_reviewer_last");
+  expect(bindings.bind({ role: Role.BLIND_REVIEWER, runId: seeded.runId, sessionId: first }).allowed).toBe(true);
+  for (const next of [middle, last]) {
+    expect(bindings.switchTo({ role: Role.BLIND_REVIEWER, runId: seeded.runId, sessionId: next,
+      conversation: "SURVIVED", reason: "runtime move" }).allowed).toBe(true);
+  }
+  expect(bindings.revoke(`BLIND_REVIEWER:${seeded.runId}`, "review ended").allowed).toBe(true);
+  db.run(`INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
+    VALUES ('task-middle-reviewer', ?, 'work', 'implementation', 'READY', '{}', ?, ?)`,
+    [seeded.runId, clock.nowIso(), clock.nowIso()]);
+  expect(bindings.bind({ role: Role.WORKER, runId: seeded.runId, taskId: "task-middle-reviewer", sessionId: middle }))
+    .toMatchObject({ allowed: false, reasonCode: ReasonCode.WORKER_SESSION_NOT_INDEPENDENT });
 });

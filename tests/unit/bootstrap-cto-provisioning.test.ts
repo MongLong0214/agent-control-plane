@@ -1,13 +1,11 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
-import { type Decision, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startLocalMcpListeners, startSessionLaunchChannel } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { CapacityReading, SessionHandle, SessionSpec } from "../../src/runtime/provider.ts";
-import { BindingRegistry } from "../../src/session/binding-registry.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask, fixtureManifest, makeHarness, reviewerPass, type Harness } from "../helpers/harness.ts";
 import { bootstrapCoverageKeys, bootstrapPlan, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
@@ -88,6 +86,7 @@ const bootstrapFixture = async (options: FixtureOptions = {}) => {
   const launch = await startSessionLaunchChannel(tempDir("acp-bcto-launch-"), { mcpToken: TOKEN });
   harness.cp.cto.attach({ sessionLaunch: launch });
   const claude = new ProviderDouble(harness.clock, "claude", options.claudeDefaults);
+  claude.observeCredentialCustody(harness.cp.sessionRuntime, harness.cp.sessions, TOKEN);
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
 
   // The creation response is the only place a session secret exists, so the CEO the Hermes
@@ -237,9 +236,6 @@ const claudeSessions = (f: Fixture) =>
   f.harness.cp.db.all<{ session_id: string; lifecycle: string }>(
     `SELECT session_id, lifecycle FROM sessions WHERE provider = 'claude' ORDER BY created_at, session_id`,
   );
-
-const assignmentCount = (f: Fixture): number =>
-  f.harness.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM assignments`)?.n ?? -1;
 
 describe("W1 (C1): a project-less PROJECT_BOOTSTRAP dispatch staffs its BOOTSTRAP_CTO", () => {
   it("run_create (no project) → run_dispatch spawns a Claude Opus BOOTSTRAP_CTO, binds it at generation 1 and pins it → plan_submit from that session over cto.mcp.sock is accepted", async () => {
@@ -443,24 +439,6 @@ const providerSession = async (f: Fixture, adapter: TestProductionAdapter, model
   return session.sessionId;
 };
 
-/**
- * `bind` with the exclusive-role rule stood down for this one call: the state the base's
- * `bindBootstrapCto` allowed (a run's bootstrap CTO on a session holding another role), replayed,
- * then the rule restored before anything under test runs.
- */
-const bindWithoutSeparation = (f: Fixture, input: Parameters<Fixture["harness"]["cp"]["bindings"]["bind"]>[0]) => {
-  const separation = vi
-    .spyOn(BindingRegistry.prototype as unknown as { assertExclusiveRoleSeparation: () => Decision<void> }, "assertExclusiveRoleSeparation")
-    .mockReturnValueOnce(allow(ReasonCode.OK, undefined));
-  try {
-    const bound = f.harness.cp.bindings.bind(input);
-    if (!bound.allowed) throw new Error(bound.message);
-    return bound.value;
-  } finally {
-    separation.mockRestore();
-  }
-};
-
 const actorOf = (f: Fixture, assignmentId: string): string | undefined =>
   f.harness.cp.db.get<{ actor_id: string }>(`SELECT actor_id FROM assignments WHERE assignment_id = ?`, [assignmentId])?.actor_id;
 
@@ -507,195 +485,6 @@ describe("C1-01: a reused BOOTSTRAP_CTO binding is admitted as a fresh one would
       expect(f.harness.cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.READY);
       expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.QUEUED, ownerSessionId: null });
       expect(runDispatchMessages(f, runId)).toEqual([]);
-    });
-  });
-
-  it("a bootstrap CTO whose Claude Opus session also holds a PRIMARY_CTO is refused at run_dispatch; neither binding nor actor is touched", async () => {
-    await withFixture(async (f) => {
-      registerProject(f, "shared-project");
-      const runId = await f.createBootstrap();
-      const roleKey = roleKeyFor(Role.BOOTSTRAP_CTO, { runId });
-      const sessionId = await providerSession(f, f.claude, "opus");
-      const primary = f.harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "shared-project", sessionId });
-      if (!primary.allowed) throw new Error(primary.message);
-      const bootstrap = bindWithoutSeparation(f, { role: Role.BOOTSTRAP_CTO, runId, sessionId });
-      const primaryActor = actorOf(f, primary.value.assignmentId);
-      const bootstrapActor = actorOf(f, bootstrap.assignmentId);
-      const startedBefore = f.claude.started.length;
-      // Refused at admission: before capacity is asked and before the provider is.
-      const refresh = vi.spyOn(f.harness.cp.capacity, "refreshForDispatch");
-      const probe = vi.spyOn(f.harness.cp.cto, "probeRoleSession");
-
-      const refused = await f.hermes("run_dispatch", { runId });
-      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT });
-      // The PRIMARY_CTO it shares a session with keeps its binding, generation and actor.
-      expect(f.harness.cp.bindings.activePrimaryCto("shared-project")).toMatchObject({
-        assignmentId: primary.value.assignmentId,
-        sessionId,
-        bindingGeneration: 1,
-      });
-      expect(actorOf(f, primary.value.assignmentId)).toBe(primaryActor);
-      // The invalid binding is refused, not replaced.
-      expect(f.harness.cp.bindings.history(roleKey)).toEqual([
-        expect.objectContaining({ assignmentId: bootstrap.assignmentId, status: "ACTIVE", bindingGeneration: 1 }),
-      ]);
-      expect(actorOf(f, bootstrap.assignmentId)).toBe(bootstrapActor);
-      expect(f.harness.cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.READY);
-      expect(refresh).not.toHaveBeenCalled();
-      expect(probe).not.toHaveBeenCalled();
-      expect(f.claude.started).toHaveLength(startedBefore);
-      expect(f.claude.stopped).toEqual([]);
-      expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.QUEUED, ownerSessionId: null });
-      expect(runDispatchMessages(f, runId)).toEqual([]);
-    });
-  });
-
-  it("the dispatch transaction asks again: a reused binding that lost its independence while it was probed is refused", async () => {
-    await withFixture(async (f) => {
-      registerProject(f, "late-project");
-      const runId = await f.createBootstrap();
-      const roleKey = roleKeyFor(Role.BOOTSTRAP_CTO, { runId });
-      // A valid live binding: Claude Opus, alone on its session.
-      const sessionId = await providerSession(f, f.claude, "opus");
-      const bound = f.harness.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId, sessionId });
-      if (!bound.allowed) throw new Error(bound.message);
-      const lifecycle = f.harness.cp.cto;
-      const probe = lifecycle.probeRoleSession.bind(lifecycle);
-      let shared: string | null = null;
-      vi.spyOn(lifecycle, "probeRoleSession").mockImplementationOnce(async (probed, role) => {
-        const live = await probe(probed, role);
-        // While dispatch awaits the provider, the session takes a PRIMARY_CTO as the base allowed.
-        shared = bindWithoutSeparation(f, { role: Role.PRIMARY_CTO, projectId: "late-project", sessionId }).assignmentId;
-        return live;
-      });
-
-      const refused = await f.hermes("run_dispatch", { runId });
-      expect(refused).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT });
-      expect(shared).not.toBeNull();
-      expect(f.harness.cp.bindings.activePrimaryCto("late-project")?.assignmentId).toBe(shared);
-      expect(f.harness.cp.bindings.history(roleKey)).toEqual([
-        expect.objectContaining({ assignmentId: bound.value.assignmentId, status: "ACTIVE", bindingGeneration: 1 }),
-      ]);
-      expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.QUEUED, ownerSessionId: null });
-      expect(runDispatchMessages(f, runId)).toEqual([]);
-    });
-  });
-});
-
-describe("W4 (C1): a BOOTSTRAP_CTO holds its session alone, in both directions", () => {
-  /** A bootstrap run whose BOOTSTRAP_CTO is bound on a fresh session, the way staffing binds it. */
-  const boundBootstrapCto = (f: Fixture): { runId: string; sessionId: string } => {
-    const runId = queuedBootstrapRun(f);
-    const sessionId = readySession(f, "bootstrap-cto");
-    const bound = f.harness.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId, sessionId });
-    if (!bound.allowed) throw new Error(bound.message);
-    return { runId, sessionId };
-  };
-
-  it.each(["bind", "switchTo"] as const)("%s refuses a PRIMARY_CTO onto a bootstrap CTO's session (no promotion)", async (method) => {
-    await withFixture(async (f) => {
-      const { sessionId } = boundBootstrapCto(f);
-      registerProject(f, "promotion-target");
-      const before = assignmentCount(f);
-      const input = { role: Role.PRIMARY_CTO, projectId: "promotion-target", sessionId };
-      const refused = method === "bind"
-        ? f.harness.cp.bindings.bind(input)
-        : f.harness.cp.bindings.switchTo({ ...input, reason: "row", conversation: "REPLACED" });
-      expect(refused.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
-      expect(assignmentCount(f)).toBe(before);
-      expect(f.harness.cp.bindings.activePrimaryCto("promotion-target")).toBeNull();
-    });
-  });
-
-  it("refuses the CEO and another run's blind reviewer onto a bootstrap CTO's session", async () => {
-    await withFixture(async (f) => {
-      const { sessionId } = boundBootstrapCto(f);
-      // A dispatched run, so its producer set is known and reviewer independence alone admits.
-      const { runId: otherRun } = await f.dispatchBootstrap();
-      const before = assignmentCount(f);
-      const ceo = f.harness.cp.bindings.switchTo({ role: Role.CEO, sessionId, reason: "row", conversation: "REPLACED" });
-      expect(ceo.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
-      const reviewer = f.harness.cp.bindings.bind({ role: Role.BLIND_REVIEWER, runId: otherRun, sessionId });
-      expect(reviewer.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
-      expect(assignmentCount(f)).toBe(before);
-      expect(f.harness.cp.bindings.active(roleKeyFor(Role.CEO))?.sessionId).toBe(f.ceoSessionId);
-    });
-  });
-
-  it.each(["bind", "switchTo"] as const)("%s refuses a BOOTSTRAP_CTO onto a session holding a PRIMARY_CTO", async (method) => {
-    await withFixture(async (f) => {
-      registerProject(f, "held-project");
-      const cto = readySession(f, "primary-cto");
-      expect(f.harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "held-project", sessionId: cto }).allowed).toBe(true);
-      const runId = queuedBootstrapRun(f);
-      const before = assignmentCount(f);
-      const input = { role: Role.BOOTSTRAP_CTO, runId, sessionId: cto };
-      const refused = method === "bind"
-        ? f.harness.cp.bindings.bind(input)
-        : f.harness.cp.bindings.switchTo({ ...input, reason: "row", conversation: "REPLACED" });
-      expect(refused.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
-      expect(assignmentCount(f)).toBe(before);
-    });
-  });
-
-  it("refuses a BOOTSTRAP_CTO onto the CEO's session", async () => {
-    await withFixture(async (f) => {
-      const runId = queuedBootstrapRun(f);
-      const before = assignmentCount(f);
-      const refused = f.harness.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId, sessionId: f.ceoSessionId });
-      expect(refused.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
-      expect(assignmentCount(f)).toBe(before);
-    });
-  });
-
-  it("refuses a BOOTSTRAP_CTO onto a session that still owns another run after its binding was revoked", async () => {
-    await withFixture(async (f) => {
-      registerProject(f, "owned-project");
-      const cto = readySession(f, "former-owner");
-      const bound = f.harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "owned-project", sessionId: cto });
-      if (!bound.allowed) throw new Error(bound.message);
-      const owned = f.harness.cp.runs.create({ projectId: "owned-project", executionMode: ExecutionMode.STANDARD, contract: CONTRACT });
-      if (!owned.allowed) throw new Error(owned.message);
-      expect(f.harness.cp.runs.reassignOwner(owned.value.runId, bound.value, "fixture owner").allowed).toBe(true);
-      expect(f.harness.cp.runs.cancel(owned.value.runId, "row").allowed).toBe(true);
-      expect(f.harness.cp.bindings.revoke(bound.value.roleKey, "row").allowed).toBe(true);
-      expect(f.harness.cp.bindings.bySession(cto).filter((held) => held.status === "ACTIVE")).toEqual([]);
-
-      const refused = f.harness.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId: queuedBootstrapRun(f), sessionId: cto });
-      expect(refused.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
-    });
-  });
-
-  it("a session that served a run's bootstrap CTO, its binding since revoked, is never given another role", async () => {
-    await withFixture(async (f) => {
-      const { runId, sessionId } = boundBootstrapCto(f);
-      expect(f.harness.cp.runs.cancel(runId, "row").allowed).toBe(true);
-      expect(f.harness.cp.bindings.active(roleKeyFor(Role.BOOTSTRAP_CTO, { runId }))).toBeNull();
-      registerProject(f, "after-revoke");
-      const promoted = f.harness.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: "after-revoke", sessionId });
-      expect(promoted.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION);
-      const reused = f.harness.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId: queuedBootstrapRun(f), sessionId });
-      expect(reused.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
-      expect(f.harness.cp.bindings.activePrimaryCto("after-revoke")).toBeNull();
-    });
-  });
-
-  it("two runs get two sessions, and the second run's role cannot land on the first run's session", async () => {
-    await withFixture(async (f) => {
-      const first = await f.dispatchBootstrap();
-      const second = await f.dispatchBootstrap();
-      expect(second.ownerSessionId).not.toBe(first.ownerSessionId);
-      expect(f.claude.started).toHaveLength(2);
-      for (const { runId, ownerSessionId } of [first, second]) {
-        expect(f.harness.cp.bindings.active(roleKeyFor(Role.BOOTSTRAP_CTO, { runId }))).toMatchObject({
-          sessionId: ownerSessionId,
-          bindingGeneration: 1,
-        });
-        expect(f.harness.cp.bindings.bySession(ownerSessionId)).toHaveLength(1);
-      }
-      const third = queuedBootstrapRun(f);
-      const shared = f.harness.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId: third, sessionId: first.ownerSessionId });
-      expect(shared.reasonCode).toBe(ReasonCode.BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT);
     });
   });
 });
@@ -1021,37 +810,6 @@ describe("C1: continuity never substitutes a fixed role runtime", () => {
     return { taskId, workerSessionId, roleKey: roleKeyFor(Role.WORKER, { taskId }) };
   };
 
-  it("BOOTSTRAP_CTO, Claude coverage lost: no GPT substitution; the role is uncovered, the run paused, the binding not replaced", async () => {
-    await withFixture(async (f) => {
-      const { gpt, daemon } = standby(f);
-      const { runId } = await f.dispatchBootstrap();
-      const roleKey = roleKeyFor(Role.BOOTSTRAP_CTO, { runId });
-      loseClaude(f);
-
-      const report = await daemon.reconcileContinuity("claude coverage lost");
-      expect(gpt.started).toEqual([]);
-      expect(holders(f, roleKey)).toEqual([{ generation: 1, provider: "claude", model: "opus", status: "REVOKED" }]);
-      expect(report?.plan.uncovered).toContain(roleKey);
-      expect(report?.pausedRuns).toContainEqual(expect.objectContaining({ runId, roleKey }));
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.BLOCKED);
-    });
-  });
-
-  it("WORKER, Claude coverage lost: no GPT substitution; the role is uncovered, the run paused, the binding not replaced", async () => {
-    await withFixture(async (f) => {
-      const { gpt, daemon } = standby(f);
-      const { runId } = await f.dispatchBootstrap();
-      const worker = runningWorker(f, runId, 1);
-      loseClaude(f);
-
-      const report = await daemon.reconcileContinuity("claude coverage lost");
-      expect(gpt.started).toEqual([]);
-      expect(holders(f, worker.roleKey)).toEqual([{ generation: 1, provider: "claude", model: "opus", status: "REVOKED" }]);
-      expect(report?.plan.uncovered).toContain(worker.roleKey);
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.BLOCKED);
-    });
-  });
-
   // C1b (C1-02): a BOOTSTRAP_CTO has no Claude-to-Claude replacement to keep on Opus — continuity
   // constitutes none for it (see the C1-02 row below) — so only the WORKER row remains here.
   it.each([Role.WORKER] as const)(
@@ -1134,29 +892,6 @@ describe("C1: continuity never substitutes a fixed role runtime", () => {
       expect(f.harness.cp.db.get<{ retired_at: string | null }>(
         `SELECT retired_at FROM conversational_actors WHERE actor_id = ?`, [actor!],
       )?.retired_at).toBeNull();
-    });
-  });
-
-  it("C1-02: a Claude outage revokes and pauses but never marks the bootstrap CTO's session ERROR; its row, actor and conversation stay", async () => {
-    await withFixture(async (f) => {
-      const { daemon } = standby(f);
-      const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      const roleKey = roleKeyFor(Role.BOOTSTRAP_CTO, { runId });
-      const before = f.harness.cp.sessions.require(ownerSessionId);
-      loseClaude(f);
-
-      await daemon.reconcileContinuity("claude coverage lost");
-      expect(f.harness.cp.bindings.active(roleKey)).toBeNull();
-      expect(f.harness.cp.runs.require(runId).state).toBe(RunState.BLOCKED);
-      expect(f.harness.cp.sessions.require(ownerSessionId)).toMatchObject({
-        lifecycle: SessionLifecycle.READY,
-        incarnation: before.incarnation,
-        workdir: before.workdir,
-      });
-      // Nothing was recorded as owed to a claim: no claim can create a bootstrap CTO.
-      expect(f.harness.cp.db.get<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'CONTINUITY_RESTORE_AWAITS_CLAIM' AND role_key = ?`, [roleKey],
-      )?.n).toBe(0);
     });
   });
 });

@@ -61,18 +61,11 @@ export const ReasonCode = {
   // --- CP-HI-04 Independent Quality Role ----------------------------------
   REVIEWER_NOT_INDEPENDENT: "REVIEWER_NOT_INDEPENDENT",
   REVIEWER_SESSION_IS_PRODUCER: "REVIEWER_SESSION_IS_PRODUCER",
-  FINAL_CEO_SESSION_NOT_INDEPENDENT: "FINAL_CEO_SESSION_NOT_INDEPENDENT",
   /**
-   * A WORKER binding named a session that holds another role or owns the task's run. The CTO
-   * routes and reviews; the implementer is a separate session (#512).
+   * A WORKER binding named a session that reviewed the same run, or violated a storage-level
+   * worker separation constraint. Implementer/reviewer separation survives role reuse.
    */
   WORKER_SESSION_NOT_INDEPENDENT: "WORKER_SESSION_NOT_INDEPENDENT",
-  /**
-   * A BOOTSTRAP_CTO binding named a session that holds another role, or another role named a
-   * session holding a BOOTSTRAP_CTO. A run's bootstrap CTO is its own session, never promoted and
-   * never shared with another run (issue #246, RF PRD:156).
-   */
-  BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT: "BOOTSTRAP_CTO_SESSION_NOT_INDEPENDENT",
   /**
    * A role with a fixed runtime (a BOOTSTRAP_CTO or a WORKER: Claude Opus) would run on another
    * provider or model. Continuity asked to constitute one elsewhere is refused before anything
@@ -357,7 +350,6 @@ export const ReasonCode = {
   CAPACITY_SENSOR_FILE_STALE: "CAPACITY_SENSOR_FILE_STALE",
   CAPACITY_SENSOR_FILE_INVALID: "CAPACITY_SENSOR_FILE_INVALID",
   CAPACITY_ADMISSION_SUSPENDED: "CAPACITY_ADMISSION_SUSPENDED",
-  CAPACITY_ADMISSION_CONSERVE: "CAPACITY_ADMISSION_CONSERVE",
   CAPACITY_UNKNOWN_NOT_ROUTABLE: "CAPACITY_UNKNOWN_NOT_ROUTABLE",
   CAPACITY_OBSERVATION_PROVENANCE_REQUIRED: "CAPACITY_OBSERVATION_PROVENANCE_REQUIRED",
 
@@ -882,7 +874,6 @@ export const ReasonCode = {
   // --- bootstrap -----------------------------------------------------------
   BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT: "BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT",
   BOOTSTRAP_ACTIVATION_INCOMPLETE: "BOOTSTRAP_ACTIVATION_INCOMPLETE",
-  BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION: "BOOTSTRAP_CTO_INELIGIBLE_FOR_PROMOTION",
   /**
    * A PROJECT_BOOTSTRAP CONFIRM completes only on its durable application record (issue #246 PR-C
    * slice C3) WRITTEN for the candidate it names, which only the Repo Factory runner's full path

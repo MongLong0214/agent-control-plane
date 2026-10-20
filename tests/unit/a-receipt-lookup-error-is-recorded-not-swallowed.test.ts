@@ -508,7 +508,7 @@ describe("#1036 a receipt lookup error is recorded, not swallowed", () => {
 /** A loopback server answering one fixed raw response, for shapes the fake Gateway does not send. */
 const rawServer = async (respond: Parameters<typeof createServer>[1]): Promise<{ port: number; close: () => Promise<void> }> => {
   const server: Server = createServer(respond);
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   return {
     port: (server.address() as AddressInfo).port,
     close: async () => {
@@ -691,7 +691,7 @@ describe("#1036 the Gateway port names every cause", () => {
       ["not http", (socket: Socket) => socket.end("NOT HTTP AT ALL\r\n\r\n"), "other"],
     ] as const) {
       const raw = createNetServer((socket) => socket.once("data", () => reply(socket)));
-      await new Promise<void>((resolve) => raw.listen(0, "127.0.0.1", resolve));
+      await new Promise<void>((resolve, reject) => { raw.once("error", reject); raw.listen(0, "127.0.0.1", resolve); });
       try {
         await expect(ask((raw.address() as AddressInfo).port), name)
           .resolves.toEqual({ found: false, lookupError: { kind: "TRANSPORT", detail } });

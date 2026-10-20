@@ -23,7 +23,7 @@ import type { Db } from "../db/database.ts";
 import { strandedBootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { contractChangeRunsWithoutGrant } from "../registry/manifest-activation-grants.ts";
 import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
-import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import { Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { isClean, tryRevParse } from "../git/git.ts";
 import { HOLDER_CLAIMED_KIND_SQL, type Outbox, sourceNeverSpentSql } from "../outbox/outbox.ts";
@@ -568,11 +568,6 @@ export class Doctor {
     if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
     if (session.lifecycle !== SessionLifecycle.READY) {
       return deny(ReasonCode.SESSION_NOT_READY, `session is ${session.lifecycle}`, { sessionId });
-    }
-    if (this.continuity.mode() === ContinuityMode.SURVIVAL) {
-      return deny(ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION, "continuity is in SURVIVAL", {
-        sessionId,
-      });
     }
     return allow(ReasonCode.OK, undefined);
   }

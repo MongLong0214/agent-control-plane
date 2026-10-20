@@ -69,7 +69,7 @@ const stalled = async (
 ) => {
   const owner = scriptBootstrapOwner(f, { onDispatch: "ack-only", onRecovery, onResult });
   const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-  await f.awaitFinishedTurns(ownerSessionId, 2);
+  await f.awaitFinishedTurns(ownerSessionId, 1);
   await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
   const [dispatch] = runDispatches(f, runId);
   expect(dispatch).toMatchObject({ binding_generation: 1, status: "ACKED" });
@@ -99,14 +99,14 @@ describe("the recovery wake: once per (run, owner generation, acknowledged RUN_D
     await withBootstrapRuntime(async (f) => {
       const { owner, runId, ownerSessionId, roleKey, messageId } = await stalled(f, "ignore");
       expect(f.daemon.wakeBootstrapPlanRecovery()).toEqual({ woken: [{ runId, roleKey, bindingGeneration: 1, messageId }] });
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
       expect(owner.prompts.at(-1)).toContain(`The control plane woke you for: ${planRecoveryTriggerKind(runId)}.`);
       // The owner did not answer; still no PLAN, and every later pass leaves it alone.
       expect(planOf(f, runId)).toBeNull();
       expect(f.daemon.wakeBootstrapPlanRecovery()).toEqual({ woken: [] });
       expect(f.daemon.wakeBootstrapPlanRecovery()).toEqual({ woken: [] });
       await ticks(50);
-      expect(f.finishedTurns(ownerSessionId)).toBe(3);
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
       const triggerId = planRecoveryTriggerId(runId, 1, messageId);
       expect(markers(f, runId)).toEqual([{ bindingGeneration: 1, messageId, triggerId }]);
       // The runtime's own duplicate refusal applies to the same trigger as well.
@@ -119,7 +119,7 @@ describe("the recovery wake: once per (run, owner generation, acknowledged RUN_D
     await withBootstrapRuntime(async (f) => {
       const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onResult: "ignore" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
       expect(runDispatches(f, runId)).toEqual([expect.objectContaining({ status: "ACKED" })]);
       expect(f.daemon.wakeBootstrapPlanRecovery()).toEqual({ woken: [] });
@@ -140,10 +140,10 @@ describe("the recovery wake: once per (run, owner generation, acknowledged RUN_D
       expect(f.daemon.wakeBootstrapPlanRecovery()).toEqual({ woken: [] });
       expect(markers(f, runId)).toEqual([]);
       release();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(4));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
       await vi.waitFor(() => expect(runtime.turnInProgress(ownerSessionId)).toBe(false));
       expect(f.daemon.wakeBootstrapPlanRecovery().woken).toHaveLength(1);
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(5));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(4));
       expect(markers(f, runId)).toHaveLength(1);
     });
   });
@@ -183,7 +183,7 @@ describe("the recovery wake: once per (run, owner generation, acknowledged RUN_D
       expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.ACTIVE, ownerBindingGeneration: 1 });
       expect(f.daemon.wakeBootstrapPlanRecovery()).toEqual({ woken: [] });
       expect(markers(f, runId)).toEqual([]);
-      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
     });
   });
 
@@ -192,7 +192,7 @@ describe("the recovery wake: once per (run, owner generation, acknowledged RUN_D
       const { runId, ownerSessionId, roleKey, messageId } = await stalled(f, "ignore");
       const first = await startDaemon(f, "first");
       try {
-        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3), { timeout: 10_000, interval: 25 });
+        await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
       } finally {
         await first.stop();
       }
@@ -203,7 +203,7 @@ describe("the recovery wake: once per (run, owner generation, acknowledged RUN_D
       } finally {
         await second.stop();
       }
-      expect(f.finishedTurns(ownerSessionId)).toBe(3);
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
       expect(markers(f, runId)).toHaveLength(1);
       // Only the recorded wake held the second daemon back: the runtime itself would take the trigger again.
       expect(f.harness.cp.sessionRuntime.wake(roleKey, [{
@@ -308,7 +308,7 @@ describe("R1-01: the recovery wake's eligibility is asked again immediately befo
       expect(await plannedElsewhere(f, runId, ownerSessionId)).toMatchObject({ ok: true });
       const original = planOf(f, runId)!;
       release();
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(4));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
       await vi.waitFor(() => expect(runtime.turnInProgress(ownerSessionId)).toBe(false));
       expect(owner.prompts).toHaveLength(3);
       const followUp = owner.prompts.at(-1)!;
@@ -375,7 +375,7 @@ describe("separation: an accepted PLAN is not an approval and writes nothing to 
     await withBootstrapRuntime(async (f) => {
       const { owner, runId, ownerSessionId } = await stalled(f, "follow-prompt");
       expect(f.daemon.wakeBootstrapPlanRecovery().woken).toHaveLength(1);
-      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(3));
+      await vi.waitFor(() => expect(f.finishedTurns(ownerSessionId)).toBe(2));
       expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
       expect(planOf(f, runId)).not.toBeNull();
 
@@ -406,7 +406,7 @@ describe("the prompt: the RUN_DISPATCH planning directive, and the recovery wake
       const first = await stalled(f, "ignore");
       const second = await stalled(f, "ignore");
       expect(f.daemon.wakeBootstrapPlanRecovery().woken).toHaveLength(2);
-      await vi.waitFor(() => expect(f.finishedTurns(first.ownerSessionId) + f.finishedTurns(second.ownerSessionId)).toBe(6));
+      await vi.waitFor(() => expect(f.finishedTurns(first.ownerSessionId) + f.finishedTurns(second.ownerSessionId)).toBe(4));
       const prompts = f.claude.turns.filter((turn) => !/nonce set to/.test(turn.prompt)).map((turn) => turn.prompt);
       expect(prompts).toHaveLength(4);
       const lines = (prompt: string) => prompt.split("\n");

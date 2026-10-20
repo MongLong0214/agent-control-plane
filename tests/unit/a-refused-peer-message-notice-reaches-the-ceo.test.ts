@@ -171,7 +171,7 @@ const fakeGateway = async (script: Script[], options: { ikm?: string } = {}) => 
       }
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("expected a TCP listener");
   return {

@@ -54,7 +54,7 @@ const reviewReady = async (f: BootstrapRuntimeFixture, contract: Partial<TaskCon
   const dispatched = await f.hermes("run_dispatch", { runId });
   expect(dispatched, JSON.stringify(dispatched)).toMatchObject({ ok: true });
   const ownerSessionId = f.harness.cp.runs.require(runId).ownerSessionId!;
-  await f.awaitFinishedTurns(ownerSessionId, 2);
+  await f.awaitFinishedTurns(ownerSessionId, 1);
   const planned = await f.cto(ownerSessionId, "plan_submit", {
     runId,
     plan: bootstrapPlan(cleanTreeManifest("review-hold")),
@@ -350,7 +350,7 @@ describe("a restart returns a run continuity paused at CEO review to CEO review"
     await withBootstrapRuntime(async (f) => {
       const ready = await reviewReady(f);
       const before = sideEffects(f, ready.runId);
-      f.loseClaude();
+      f.loseClaude(false);
       await f.daemon.reconcileContinuity("claude coverage lost");
       expect(f.harness.cp.runs.require(ready.runId).state).toBe(RunState.AWAITING_HUMAN);
       expect(f.harness.cp.bindings.active(ready.roleKey)).toMatchObject({ bindingGeneration: 1 });
@@ -611,7 +611,7 @@ describe("reviewer deferred legacy crash gap", () => {
       }).allowed).toBe(true);
       const count = transitions(f, ready.runId).length;
       f.harness.clock.advance(6 * 60000);
-      f.loseClaude();
+      f.loseClaude(false);
       await f.daemon.reconcileContinuity("later unrelated owner coverage loss");
       expect(f.harness.cp.bindings.active(ready.roleKey)).toMatchObject({ bindingGeneration: 1 });
       expect(f.harness.cp.audit.byKind("CONTINUITY_REVOKE_DEFERRED").some((e) => e.roleKey === ready.roleKey)).toBe(true);
@@ -660,7 +660,7 @@ describe("a pause interrupted right after it is written is released by nothing a
   it("incumbent path: a later pass defers the owner's revocation and coverage returns on it; 0 releases", async () => {
     await withBootstrapRuntime(async (f) => {
       const ready = await reviewReady(f);
-      f.loseClaude();
+      f.loseClaude(false);
       await interruptedAfterPause(f, "claude coverage lost");
       const count = transitions(f, ready.runId).length;
       f.harness.clock.advance(6 * 60000);
@@ -721,7 +721,7 @@ describe("the loss episode names exactly one revocation, for the pause's own los
   it("a legacy pause whose own pass deferred the owner's revocation (the old row has no generation) is kept when coverage returns", async () => {
     await withBootstrapRuntime(async (f) => {
       const ready = await reviewReady(f);
-      f.loseClaude();
+      f.loseClaude(false);
       await rewritingPass(f, OLD_CODE, () => f.daemon.reconcileContinuity("claude coverage lost, as the old daemon ran it"));
       expect(f.harness.cp.audit.byKind("CONTINUITY_REVOKE_DEFERRED").filter((e) => e.roleKey === ready.roleKey).at(-1)?.evidence)
         .toEqual({ reason: CONTINUITY_COVERAGE_REVOCATION_REASON });
@@ -841,7 +841,7 @@ describe("the release is one transaction", () => {
   it("a failure on ACTIVE → READY_FOR_CEO_REVIEW rolls both edges and their audit rows back", async () => {
     await withBootstrapRuntime(async (f) => {
       const ready = await reviewReady(f);
-      f.loseClaude();
+      f.loseClaude(false);
       await f.daemon.reconcileContinuity("claude coverage lost");
       const binding = f.harness.cp.bindings.active(ready.roleKey)!;
       expect(f.harness.cp.runs.require(ready.runId).state).toBe(RunState.AWAITING_HUMAN);

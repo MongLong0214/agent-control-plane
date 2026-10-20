@@ -50,7 +50,7 @@ export const canonicalTurnTarget = (cp: ControlPlane): {
     executor_session_incarnation: string;
   }>(
     `SELECT tb.target_actor_id AS target_actor_id,
-            asg.binding_generation AS binding_generation,
+            current_asg.binding_generation AS binding_generation,
             tb.target_binding_id AS target_binding_id,
             att.target_attestation_id AS target_attestation_id,
             att.executor_session_id AS executor_session_id,
@@ -62,16 +62,17 @@ export const canonicalTurnTarget = (cp: ControlPlane): {
          ON ca.actor_id = tb.target_actor_id
        JOIN sessions sess
          ON sess.session_id = ca.current_session_id
-       JOIN assignments asg
-         ON asg.assignment_id = att.assignment_id
-        AND asg.actor_id = ca.actor_id
-        AND asg.status = 'ACTIVE'
-        AND asg.binding_generation = att.binding_generation
+       JOIN assignments att_asg
+         ON att_asg.assignment_id = att.assignment_id
+        AND att_asg.actor_id = ca.actor_id
+       JOIN assignments current_asg
+         ON current_asg.actor_id = ca.actor_id
+        AND current_asg.status = 'ACTIVE'
       WHERE ca.retired_at IS NULL
         AND sess.lifecycle = 'READY'
         AND ca.current_session_id = att.executor_session_id
         AND sess.incarnation = att.executor_session_incarnation
-      ORDER BY att.attested_at DESC, att.rowid DESC`,
+      ORDER BY att.attested_at DESC, att.rowid DESC, current_asg.binding_generation DESC, current_asg.assignment_id DESC`,
     [],
   );
   if (rows.length === 0) return null;

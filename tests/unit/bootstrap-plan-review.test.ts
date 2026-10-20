@@ -58,6 +58,7 @@ const reviewFixture = async () => {
   // Claude Opus staffs the bootstrap CTO; the reviewer is the harness's own. No worker is staffed: the
   // PLAN's task stays READY until CEO CONFIRM settles it (CEO 1792120507).
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
+  claude.observeCredentialCustody(harness.cp.sessionRuntime, harness.cp.sessions, TOKEN);
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
 
   const ceo = harness.cp.sessions.create({ provider: "scripted", model: "c2-ceo" });

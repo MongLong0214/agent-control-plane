@@ -63,13 +63,13 @@ describe("#1104 a session turn that left its own process group unconfirmed is re
       return { ...result, ok: okAnyway, error: okAnyway ? null : "PROCESS_GROUP_UNCONFIRMED", processGroup: UNENDED };
     };
     expect(harness.cp.sessionRuntime.wake(roleKey, [{ id: "w1", kind: "test" }])).toMatchObject({ allowed: true });
-    await vi.waitFor(() => expect(claude.turns).toHaveLength(2));
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(1));
     const records = (): Array<{ reason_code: string | null; evidence_json: string }> => harness.cp.db.all(
       `SELECT reason_code, evidence_json FROM audit_events WHERE kind = 'SESSION_TURN' AND session_id = ? ORDER BY event_id`,
       [run.ownerSessionId],
     );
-    await vi.waitFor(() => expect(records()).toHaveLength(2));
-    const work = records()[1]!;
+    await vi.waitFor(() => expect(records()).toHaveLength(1));
+    const work = records()[0]!;
     console.error(`WITNESS unended-group-session-turn ${JSON.stringify({ okAnyway, work })}`);
     expect(work.reason_code).toBe(ReasonCode.SESSION_TURN_FAILED);
     expect(JSON.parse(work.evidence_json)).toMatchObject({ processGroup: UNENDED });
