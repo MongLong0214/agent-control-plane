@@ -446,7 +446,7 @@ describe("a Buzz mention signed before its role's binding generation", () => {
       const before = f.footprint();
       await f.relayDelivers(early);
 
-      expect(f.footprint()).toEqual(before);
+      expect(f.footprint()).toEqual({ ...before, audit: before.audit + 1 });
       expect(f.admitted(early.id)).toBeUndefined();
       expect(f.rowsOf(MessageKind.PEER_MESSAGE)).toEqual([]);
       expect(f.precedesBinding()).toBe(1);
@@ -483,7 +483,7 @@ describe("a mention admitted under an earlier binding generation, redelivered af
 
   for (const { author, claim } of rows) {
     const sender = author === "peer" ? "CEO's peer mention" : "owner's mention";
-    it(`refuses the ${sender} whose prior claim is ${claim} as preceding the binding, writing nothing`, async () => {
+    it(`refuses the ${sender} whose prior claim is ${claim} as preceding the binding, with only the CEO refusal audit`, async () => {
       const f = await start(author === "peer" ? { ceoBoundBeforeCtoMs: 120_000 } : {});
       try {
         const key = author === "peer" ? f.ceo : f.owner;
@@ -515,7 +515,7 @@ describe("a mention admitted under an earlier binding generation, redelivered af
         const alreadyDurable = f.alreadyDurable();
         await f.relayDelivers(event);
 
-        expect(f.footprint()).toEqual(before);
+        expect(f.footprint()).toEqual({ ...before, audit: before.audit + (author === "peer" ? 1 : 0) });
         expect(f.precedesBinding()).toBe(1);
         expect(f.alreadyDurable()).toBe(alreadyDurable);
         expect(f.claimOf(event.id)).toBe(claim);
