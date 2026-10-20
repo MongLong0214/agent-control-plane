@@ -70,6 +70,7 @@ import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import { bootstrapPlanTaskRecorded } from "../run/task-graph.ts";
+import { candidateEvidenceSection, readTrackedTree, type TrackedTreeEvidence } from "./candidate-review-evidence.ts";
 
 export interface ReviewFinding {
   category: ReviewFindingCategory;
@@ -327,6 +328,8 @@ const unparsableAnswerEvidence = (text: string): Record<string, string | number 
 
 /** Diff size above which a single reviewer context is not trusted to hold everything. */
 const CHUNK_THRESHOLD_CHARS = 120_000;
+/** Room kept for the change itself before the packet's tree and task listings take any. */
+const EVIDENCE_DIFF_RESERVE_CHARS = 32_000;
 const REVIEW_TIMEOUT_MS = 20 * 60 * 1000;
 
 /**
@@ -470,19 +473,29 @@ export class BlindReviewGate {
     try {
       const collected = await this.collectDiffs(request.snapshot);
       if (!collected.allowed) return collected as Decision<ReviewPacket>;
-      const { diffs, binaryArtifacts } = collected.value;
+      const { diffs, binaryArtifacts, trees } = collected.value;
+      // #1166 r3 — the listings get only the room left under the reviewer budget after the other
+      // metadata, the chunk envelope and a share for the change itself, so they never crowd out
+      // the diff or push the metadata past the budget. A cut is marked in the packet.
+      const diffChars = diffs.reduce((n, d) => n + d.diff.length, 0);
+      const bareEvidence = candidateEvidenceSection(this.db, request.runId, trees, 0);
+      const bareOverhead = this.promptOverhead(request, change, bareEvidence);
+      // The change's real share of a prompt, repository and file fences included.
+      const diffShare = this.buildPrompt(request, diffs, undefined, change, bareEvidence).length - bareOverhead;
+      const evidenceRoom = CHUNK_THRESHOLD_CHARS - 4_096 - Math.min(diffShare, EVIDENCE_DIFF_RESERVE_CHARS) - bareOverhead;
+      const evidenceSection = candidateEvidenceSection(this.db, request.runId, trees, evidenceRoom);
 
-      const totalChars = diffs.reduce((n, d) => n + d.diff.length, 0) + this.promptOverhead(request, change);
+      const totalChars = diffChars + this.promptOverhead(request, change, evidenceSection);
       const chunked = totalChars > CHUNK_THRESHOLD_CHARS;
 
       let outcome: Decision<ReviewOutcome>;
       if (chunked) {
-        outcome = await this.chunkedReview(request, diffs, rememberReviewer, change);
+        outcome = await this.chunkedReview(request, diffs, rememberReviewer, change, evidenceSection);
       } else {
         const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
-        outcome = await this.singleReview(request, this.buildPrompt(request, diffs, undefined, change), reviewer.value);
+        outcome = await this.singleReview(request, this.buildPrompt(request, diffs, undefined, change, evidenceSection), reviewer.value);
       }
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
@@ -1016,10 +1029,12 @@ export class BlindReviewGate {
   ): Promise<
     Decision<{
       diffs: Array<{ identity: string; diff: string; files: string[] }>;
+      trees: TrackedTreeEvidence[];
       binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
     }>
   > {
     const diffs: Array<{ identity: string; diff: string; files: string[] }> = [];
+    const trees: TrackedTreeEvidence[] = [];
     const binaryArtifacts: Array<{
       repository: string;
       path: string;
@@ -1069,10 +1084,11 @@ export class BlindReviewGate {
         });
       }
 
+      trees.push(await readTrackedTree(record.checkoutPath, repo.identity, repo.candidateHead));
       diffs.push({ identity: repo.identity, diff, files: repo.touchedPaths });
     }
 
-    return allow(ReasonCode.OK, { diffs, binaryArtifacts });
+    return allow(ReasonCode.OK, { diffs, binaryArtifacts, trees });
   }
 
   private reviewInvocation(
@@ -1245,15 +1261,16 @@ export class BlindReviewGate {
     diffs: Array<{ identity: string; diff: string; files: string[] }>,
     rememberReviewer: (reviewer: ReviewerBinding) => void,
     change: TrustedContractChange | null = null,
+    evidenceSection: readonly string[] = [],
   ): Promise<Decision<ReviewOutcome>> {
     // A chunk adds repository/file fences and the chunk heading beyond the empty-prompt
     // measurement. Reserve a bounded envelope so the complete serialized prompt, not only
     // the patch body, remains inside the review budget.
-    const chunkBudget = CHUNK_THRESHOLD_CHARS - this.promptOverhead(request, change) - 4_096;
+    const chunkBudget = CHUNK_THRESHOLD_CHARS - this.promptOverhead(request, change, evidenceSection) - 4_096;
     if (chunkBudget <= 0) {
       return deny(ReasonCode.EVIDENCE_MISSING, "review prompt metadata exceeds the reviewer context budget", {
         runId: request.runId,
-        overhead: this.promptOverhead(request, change),
+        overhead: this.promptOverhead(request, change, evidenceSection),
         budget: CHUNK_THRESHOLD_CHARS,
       });
     }
@@ -1282,7 +1299,7 @@ export class BlindReviewGate {
     let worst: ReviewVerdict = "PASS";
 
     for (const [index, chunk] of chunks.entries()) {
-      const prompt = this.buildPrompt(request, chunk, { chunk: index + 1, of: chunks.length }, change);
+      const prompt = this.buildPrompt(request, chunk, { chunk: index + 1, of: chunks.length }, change, evidenceSection);
       if (prompt.length > CHUNK_THRESHOLD_CHARS) {
         return deny(ReasonCode.EVIDENCE_MISSING, "a review chunk exceeds the context budget", {
           runId: request.runId,
@@ -1378,7 +1395,7 @@ export class BlindReviewGate {
     if (!finalReviewer.allowed) return finalReviewer as Decision<never>;
     rememberReviewer(finalReviewer.value);
 
-    const finalPrompt = this.buildFinalPrompt(request, reduced, chunks.length, change);
+    const finalPrompt = this.buildFinalPrompt(request, reduced, chunks.length, change, evidenceSection);
     if (finalPrompt.length > CHUNK_THRESHOLD_CHARS) {
       return deny(ReasonCode.EVIDENCE_MISSING, "the reduced final-review prompt exceeds the context budget", {
         runId: request.runId,
@@ -1456,6 +1473,7 @@ export class BlindReviewGate {
     reduced: RawVerdict,
     chunkCount: number,
     change: TrustedContractChange | null = null,
+    evidenceSection: readonly string[] = [],
   ): string {
     return [
       `# Final review over a reduced ${chunkCount}-chunk result`,
@@ -1473,6 +1491,7 @@ export class BlindReviewGate {
       "Acceptance criteria:",
       ...request.contract.acceptance.map((a) => `- ${a}`),
       "",
+      ...evidenceSection,
       "## Reduced coverage and findings",
       "```json",
       JSON.stringify(reduced, null, 2),
@@ -1490,6 +1509,7 @@ export class BlindReviewGate {
     diffs: Array<{ identity: string; diff: string; files: string[] }>,
     chunk?: { chunk: number; of: number },
     change: TrustedContractChange | null = null,
+    evidenceSection: readonly string[] = [],
   ): string {
     const sections = [
       chunk ? `# Review chunk ${chunk.chunk} of ${chunk.of}` : "# Candidate review",
@@ -1512,6 +1532,7 @@ export class BlindReviewGate {
       "Required coverage:",
       ...candidateCoverageTargets(request.snapshot, change).map((target) => `- ${target.identity}:${target.path}`),
       "",
+      ...evidenceSection,
       ...(change === null ? [] : contractChangeSection(change)),
       "## Deterministic verification evidence",
       "```json",
@@ -2143,8 +2164,8 @@ export class BlindReviewGate {
     return allow(ReasonCode.OK, undefined);
   }
 
-  private promptOverhead(request: BlindReviewRequest, change: TrustedContractChange | null = null): number {
-    return this.buildPrompt(request, [], undefined, change).length;
+  private promptOverhead(request: BlindReviewRequest, change: TrustedContractChange | null = null, evidenceSection: readonly string[] = []): number {
+    return this.buildPrompt(request, [], undefined, change, evidenceSection).length;
   }
 
   /**
