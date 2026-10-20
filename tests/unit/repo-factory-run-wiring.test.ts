@@ -398,6 +398,7 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
   });
 
   it("the CEO cannot mint it: Hermes refuses an owner decision for this operation and has no tool that mints one", async () => {
+    // RF-S25 arm:owner-authority: Hermes cannot approve the public-repository operation or cause its writes.
     const wired = await wire("wired-ceo-mint");
     const tools = registeredTools(hermesServer(wired.harness));
     expect(Object.keys(tools).filter((name) => /repo.?factory|github.?write|approve/i.test(name))).toEqual([]);
