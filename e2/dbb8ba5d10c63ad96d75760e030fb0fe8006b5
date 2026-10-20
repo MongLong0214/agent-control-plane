@@ -1,0 +1,23 @@
+Limit: the post-merge readback obligation covers the trusted required CI checks at the merge SHA, not arbitrary content claims; a REVISE'd candidate is reviewed again only through result_submit with a fresh idempotency key, because blind_review_request is denied to the CTO
+Warn: the blind review packet now carries, from canonical records only, the frozen candidate's tracked tree (bounded at 2000 paths per repository and marked truncated when cut), the run's DISPATCHED fact, its tasks, WORKER binding counts and the pinned PRIMARY_CTO delegation, plus the obligations that later gates enforce (candidate-bound CEO CONFIRM, finalizer publish/PR/merge, post-merge exact-SHA readback) with their enforcing code cited; no identities or prior verdicts are added and the PASS/omission rules are unchanged (CEO 370bd328)
+Record-Id: r-3416dfe1dffa
+Provenance: inherited 516ca8ae020e30db328bb42d2cf61926542c2e9d
+
+Limit: with long paths the listing can hold far fewer than 2000 entries; a claim about the absence of unlisted paths stays unverifiable whenever the listing is truncated
+Warn: the blind review packet's tracked-tree listing is bounded by serialized size across the whole packet (TREE_CHAR_BUDGET 24_000 chars) as well as by entry count, and a repository cut by the budget is marked truncated, so long paths can no longer fill the review's metadata budget and refuse review for good (#1166 r1)
+Record-Id: r-55a0e05bfd73
+Provenance: inherited a271892072d2b720cda47d2458f40c88d53d0d7d
+
+Limit: when taskSummary says truncated, the task list cannot establish the absence of unlisted tasks; only the summary's counts cover the whole run
+Warn: the blind review packet's per-task list is bounded by its own serialized budget (TASK_CHAR_BUDGET 16_000 chars) with tasks that ever had a WORKER binding listed first, and a taskSummary computed over every task (total, byState, WORKER binding sums, listed, truncated) is never cut, so hundreds of superseded tasks can no longer push the packet past the review's metadata budget and refuse review for good (#1166 r2)
+Record-Id: r-d87c077d13c4
+Provenance: inherited b252e851e9b4fd26f445cb1111fbb979fc7dfb12
+
+Limit: with little room the packet may name only some repositories and list few paths or tasks; a claim about an omitted repository or an unlisted path or task stays unverifiable from the packet
+Warn: the packet's tree and task listings get only the room left under the 120,000-char reviewer budget after the other metadata, the 4,096-char chunk envelope and the change's real share of a prompt (fences included, reserved up to EVIDENCE_DIFF_RESERVE_CHARS 32,000), capped at TREE_CHAR_BUDGET and TASK_CHAR_BUDGET; repository envelopes are charged before any path and repositories that do not fit are omitted and counted in the packet, so many repositories, long paths or many tasks, alone or together, cannot refuse review for good (#1166 r3)
+Record-Id: r-798f9f8413f8
+Provenance: inherited de57ff556edb8a956c1704ffd6aee1cdd725ad2f
+
+Warn: the combined 140-repository, 650-task witness also asserts that the candidate's own SUCCEEDED task with its WORKER binding is listed first in the packet, not only counted in taskSummary; the summary is not a substitute for per-task acceptance evidence (CEO 826520de)
+Record-Id: r-83ef9669d902
+Provenance: inherited bc6ecbae2ae708549c3071bf948d7a72ace328ab
