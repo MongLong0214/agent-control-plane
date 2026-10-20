@@ -34,7 +34,7 @@ import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
 import { BootstrapCtoStaffing } from "../run/bootstrap-cto-staffing.ts";
-import { WORKER_TURN_PROVIDER, WorkerTurnRunner } from "../run/worker-turn.ts";
+import { WorkerTurnRunner } from "../run/worker-turn.ts";
 import { WorkerRetirement } from "../run/worker-retirement.ts";
 import { WorkerStaffing } from "../run/worker-staffing.ts";
 import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter, type CliAdapterOptions } from "../runtime/cli-adapters.ts";
@@ -587,7 +587,7 @@ export class ControlPlane {
         audit: this.audit,
         tasks: this.tasks,
         guard: this.guard,
-        workerAdapter: () => this.providers.requireForRole(WORKER_TURN_PROVIDER, Role.WORKER),
+        workerAdapter: (provider: string) => this.providers.requireForRole(provider, Role.WORKER),
       });
       // The shared packet-reviewer predicate, read from the raw reviewer adapter (the registry hands
       // out only wrapped ones): the gate may pass over its preferred reviewer only when this says

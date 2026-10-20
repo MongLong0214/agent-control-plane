@@ -6,6 +6,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { type FailureClass, Role, RunKind, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import { type ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
@@ -78,7 +79,11 @@ export type { WorkerCommitPort, WorkerDiffEntry } from "./worker-git.ts";
 
 /** A worker turn may not be asked to run longer than this (#512). */
 export const WORKER_TURN_MAX_TIMEOUT_MS = 30 * 60 * 1000;
-/** The worker runtime this path launches: a Claude session on Opus, nothing else. */
+/**
+ * The Claude pair this path used to launch for every worker. A turn now runs on the bound
+ * session's own fixed pair (`fixedRuntimes(Role.WORKER)`). These stay exported for callers that
+ * name the Claude pair; they are not the only runtime.
+ */
 export const WORKER_TURN_PROVIDER = "claude";
 export const WORKER_TURN_MODEL = "opus";
 
@@ -204,8 +209,8 @@ export interface WorkerTurnPorts {
   audit: AuditLog;
   tasks: TaskGraph;
   guard: ManagedWriteGuard;
-  /** The adapter that serves the WORKER role for the Claude provider. */
-  workerAdapter: () => ProviderAdapter;
+  /** The adapter that serves the WORKER role for the bound session's provider. */
+  workerAdapter: (provider: string) => ProviderAdapter;
 }
 
 interface WorkerIdentity {
@@ -214,6 +219,8 @@ interface WorkerIdentity {
   incarnation: string;
   generation: number;
   externalSessionId: string;
+  provider: string;
+  model: string;
 }
 
 interface ClaimFacts {
@@ -449,10 +456,10 @@ export class WorkerTurnRunner {
     const facts = durable.value;
     let adapter: ProviderAdapter;
     try {
-      adapter = this.ports.workerAdapter();
+      adapter = this.ports.workerAdapter(facts.worker.provider);
     } catch (error) {
       return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "no worker runtime is registered for this deployment", {
-        provider: WORKER_TURN_PROVIDER,
+        provider: facts.worker.provider,
         error: errorText(error).slice(0, 300),
       });
     }
@@ -483,8 +490,8 @@ export class WorkerTurnRunner {
         taskId: turn.taskId,
         ownerBindingGeneration: turn.ownerBindingGeneration,
         workerSessionId: turn.worker.sessionId,
-        provider: WORKER_TURN_PROVIDER,
-        model: WORKER_TURN_MODEL,
+        provider: facts.worker.provider,
+        model: facts.worker.model,
         repositoryId: turn.claim.repositoryId,
         worktreeId: worktree,
         concurrencyWidth: this.ports.tasks.runningWidth(turn.runId) + 1,
@@ -979,7 +986,7 @@ export class WorkerTurnRunner {
     return allow(ReasonCode.OK, undefined);
   }
 
-  /** The ACTIVE `WORKER:<taskId>` binding of this run and the READY Claude/Opus session its actor serves now. */
+  /** The ACTIVE `WORKER:<taskId>` binding of this run and the READY fixed-runtime session its actor serves now. */
   private liveWorker(runId: string, taskId: string): Decision<WorkerIdentity> {
     const row = this.ports.db.get<{
       role_key: string;
@@ -1022,11 +1029,14 @@ export class WorkerTurnRunner {
         sessionId: row.current_session_id,
       });
     }
-    if (row.provider !== WORKER_TURN_PROVIDER || row.model !== WORKER_TURN_MODEL) {
-      return deny(ReasonCode.INVALID_ARGUMENT, "a worker turn runs on a Claude session with model opus", {
+    const provider = row.provider ?? "";
+    const fixed = fixedRuntimes(Role.WORKER).find((runtime) => runtime.provider === provider);
+    if (!fixed || row.model !== fixed.model) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "a worker turn runs on the session's fixed provider and model", {
         taskId,
         provider: row.provider,
         model: row.model,
+        ...(fixed ? { required: fixed.model } : {}),
       });
     }
     return allow(ReasonCode.OK, {
@@ -1035,6 +1045,8 @@ export class WorkerTurnRunner {
       incarnation: row.current_session_incarnation,
       generation: row.binding_generation,
       externalSessionId: row.current_session_incarnation.split("#", 1)[0] ?? row.current_session_id,
+      provider: fixed.provider,
+      model: fixed.model,
     });
   }
 
@@ -1530,7 +1542,7 @@ export class WorkerTurnRunner {
         prompt: workerPrompt(facts),
         workdir: facts.claim.worktree,
         timeoutMs,
-        model: WORKER_TURN_MODEL,
+        model: facts.worker.model,
         readOnly: false,
         correlationId: executionId,
         externalSessionId: facts.worker.externalSessionId,
@@ -2005,9 +2017,9 @@ export class WorkerTurnRunner {
   /**
    * Whether a live pid is, right now, the process this execution launched (#1070) — asked immediately
    * before any kill. The OS start time it reports must be the recorded one, and its command line must
-   * carry this execution's worker session as `--session-id <id>`, as every provider invocation the
-   * runner makes does. A pid whose start time or command line cannot be read is not confirmed, and
-   * nothing that is not confirmed is killed: it stays outstanding and blocks its task instead.
+   * carry this execution's worker session as the argv element after `--session-id` (Claude) or
+   * `--thread-source` (Codex). A pid whose start time or command line cannot be read is not confirmed,
+   * and nothing that is not confirmed is killed: it stays outstanding and blocks its task instead.
    */
   private ownershipOf(executionId: string, pid: number, startedAt: string | null): ProcessOwnership {
     const now = this.#processes.alive(pid) ? this.#processes.startToken(pid) : null;
@@ -2021,7 +2033,8 @@ export class WorkerTurnRunner {
     const argv = this.#processes.argv(pid);
     if (expected === "" || argv === null) return "COMMAND_LINE_NOT_CONFIRMED";
     for (let index = 0; index + 1 < argv.length; index += 1) {
-      if (argv[index] === "--session-id" && argv[index + 1] === expected) return "OWNED";
+      const flag = argv[index];
+      if ((flag === "--session-id" || flag === "--thread-source") && argv[index + 1] === expected) return "OWNED";
     }
     return "COMMAND_LINE_NOT_CONFIRMED";
   }

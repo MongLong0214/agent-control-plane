@@ -9,7 +9,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { BOOTSTRAP_CTO_SPAWN_RECORD, type CtoLifecycle, type CtoPreference } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
+import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { isTerminal } from "../domain/run-state.ts";
 import {
   Role,
@@ -27,14 +27,16 @@ import type { RunEngine } from "./run-engine.ts";
 
 /**
  * The runtime a run's BOOTSTRAP_CTO is constituted on: Claude Opus, fixed (RF PRD:156), from the
- * one table continuity reads too (`FIXED_ROLE_RUNTIME`).
+ * one table continuity reads too (`fixedRuntimes`).
  *
  * Not the deployment's `ctoPreference`, which a project's primary CTO follows and an operator may
  * change, and not an adapter's `defaultModels.cto`. Nothing is substituted: a deployment with no
  * Claude adapter for the BOOTSTRAP_CTO role refuses the dispatch rather than staffing another one.
  */
+const bootstrapRuntime = fixedRuntimes(Role.BOOTSTRAP_CTO)[0]!;
 export const BOOTSTRAP_CTO_RUNTIME: Readonly<CtoPreference> = Object.freeze({
-  ...FIXED_ROLE_RUNTIME[Role.BOOTSTRAP_CTO]!,
+  provider: bootstrapRuntime.provider,
+  model: bootstrapRuntime.model,
   effort: null,
 });
 

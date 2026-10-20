@@ -7,6 +7,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -28,6 +29,8 @@ import {
   type ReviewerCodexHome,
 } from "./reviewer-codex-home.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
+import { Role } from "../domain/types.ts";
 import {
   ClaudeUsageCollector,
   CodexUsageCollector,
@@ -763,6 +766,21 @@ const productionRunCli = async (
     /** #512 — aborting kills the child's process group; an abort before the spawn spawns nothing. */
     signal?: AbortSignal;
     /**
+     * The configured Codex account. Set on the child as `CODEX_HOME` for the worker login probe
+     * and the worker execution, the same directory `CodexUsageCollector` reads. Unset leaves the
+     * constructor's account selection alone (Claude, Grok, and the packet reviewer, which names
+     * its home on `reviewerEnvironment`).
+     */
+    codexHome?: string;
+    /**
+     * Whose sandbox confines this child. Unset means ACP's outer seatbelt profile, which is what
+     * every invocation except a GPT worker turn uses. `"codex-workspace-write"` is set only by
+     * that turn: macOS rejects a nested `sandbox-exec`, so the outer profile is not applied and
+     * Codex's own `-s workspace-write` is the confinement. An isolated reviewer never takes this
+     * path; a packet profile is not dropped because a caller also named it.
+     */
+    sandbox?: "outer-profile" | "codex-workspace-write";
+    /**
      * #1077 — the invocation intends no process to outlive it. It runs under `PROBE_HOLDER_SCRIPT`,
      * and once the CLI has exited, timed out or been aborted, its group is signalled only while the
      * holder provably still holds it (`endHeldGroup`); otherwise nothing is signalled and the result
@@ -787,7 +805,11 @@ const productionRunCli = async (
   processGroup?: ProcessGroupReap;
 }> => {
   const scratch = acpScratchDir("acp-runtime-");
-  if (!existsSync("/usr/bin/sandbox-exec")) {
+  // A GPT worker turn is the one caller that sets this, and it is not an isolated review.
+  // Every other invocation keeps the outer profile, including when this flag is combined
+  // with a packet isolation request.
+  const codexWorkspaceWrite = options.sandbox === "codex-workspace-write" && options.isolation === undefined;
+  if (!codexWorkspaceWrite && !existsSync("/usr/bin/sandbox-exec")) {
     rmSync(scratch, { recursive: true, force: true });
     return {
       stdout: "",
@@ -825,7 +847,12 @@ const productionRunCli = async (
 
     const environment: NodeJS.ProcessEnv = isolated
       ? { ...(options.reviewerEnvironment ?? reviewerEnvironment(workdir, options.reviewerConfigDirectory)) }
-      : runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch), options.providerCredentialDir);
+      : runtimeEnvironment(
+          options.environmentAllowlist ?? [],
+          realpathSync(scratch),
+          options.providerCredentialDir,
+          options.codexHome,
+        );
     if (egress) {
       // The child receives only the loopback proxy route. Do not let a caller-supplied
       // environment retain an alternate proxy, no-proxy escape hatch, or credentials.
@@ -925,18 +952,24 @@ const productionRunCli = async (
       const holding = options.reapProcessGroup === true;
       try {
         if (options.reviewerPrivateHome) assertReviewerCodexHome(options.reviewerPrivateHome);
-        child = spawn("/usr/bin/sandbox-exec", reviewerSandboxArgs(
-          profile,
-          holding ? "/bin/ksh" : file,
-          holding ? ["-c", PROBE_HOLDER_SCRIPT, "acp-group-holder", ...holderRestoredEnvironment(environment), file, ...args] : args,
-          egress ?? undefined,
-          composedProfilePath,
-        ), {
-          cwd: workdir,
-          env: environment,
-          detached: true,
-          stdio: holding ? ["pipe", "pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
-        });
+        const command = holding ? "/bin/ksh" : file;
+        const commandArgs = holding
+          ? ["-c", PROBE_HOLDER_SCRIPT, "acp-group-holder", ...holderRestoredEnvironment(environment), file, ...args]
+          : [...args];
+        // The worker turn's child is Codex itself (or the group holder), not sandbox-exec.
+        // Codex then applies `-s workspace-write` to the commands it runs.
+        child = spawn(
+          codexWorkspaceWrite ? command : "/usr/bin/sandbox-exec",
+          codexWorkspaceWrite
+            ? commandArgs
+            : reviewerSandboxArgs(profile, command, commandArgs, egress ?? undefined, composedProfilePath),
+          {
+            cwd: workdir,
+            env: environment,
+            detached: true,
+            stdio: holding ? ["pipe", "pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
+          },
+        );
       } catch (error) {
         resolve({ stdout: "", stderr: error instanceof Error ? error.message : String(error), exitCode: null, timedOut: false, egressLost: false });
         return;
@@ -1783,6 +1816,7 @@ export const runtimeEnvironment = (
   allowlist: readonly string[],
   scratch: string,
   providerCredentialDir?: string,
+  codexHome?: string,
 ): NodeJS.ProcessEnv => {
   const environment: NodeJS.ProcessEnv = {
     PATH: agentPath(),
@@ -1808,6 +1842,9 @@ export const runtimeEnvironment = (
     const value = process.env[name];
     if (value !== undefined && !looksLikeCredential(value)) environment[name] = value;
   }
+  // The configured account wins over an allowlisted inherited CODEX_HOME. A worker probe and a
+  // worker execution pass the same directory the capacity collector reads.
+  if (codexHome !== undefined) environment["CODEX_HOME"] = codexHome;
   return environment;
 };
 
@@ -2649,6 +2686,19 @@ export const claudeTranscriptDirectory = (workdir: string): string | null => {
  * installed" but "did it get scheduled in time".
  */
 const RUNTIME_PROBE_TIMEOUT_MS = 15_000;
+/** A worker `login status` is a local auth check. It is not a turn and not a `--version` probe. */
+const CODEX_WORKER_PROBE_TIMEOUT_MS = 15_000;
+
+/** The fixed GPT worker model, when the table names one. Reviewer and CTO models are not this. */
+const codexWorkerModel = (): string | undefined =>
+  fixedRuntimes(Role.WORKER).find((runtime) => runtime.provider === "gpt")?.model;
+
+/**
+ * A Codex session this adapter constituted for a WORKER, at staffing or at that role's continuity.
+ * Account auth is not proof of any other handle.
+ */
+const isCodexWorkerPurpose = (purpose: string): boolean =>
+  purpose.startsWith("worker:") || purpose === `continuity:${Role.WORKER}`;
 
 /**
  * What a `--version` probe established, keeping *it did not answer* apart from *it answered and
@@ -2824,6 +2874,8 @@ export class CodexCliAdapter implements ProviderAdapter {
     effort: string | null;
     bootstrapEgressEvidence: ReviewerEgressRecord[];
   }>();
+  /** One-shot WORKER sessions this adapter constituted. A probe of anything else stays UNAVAILABLE. */
+  readonly #workerSessions = new Map<string, { workdir: string; model: string }>();
   readonly #usageCollector: UsageCollector;
 
   constructor(options: CliAdapterOptions) {
@@ -2894,6 +2946,16 @@ export class CodexCliAdapter implements ProviderAdapter {
     return { kind: "SHARED", root: realpathSync(scope.root) };
   }
 
+  /**
+   * Directories a non-isolation Codex child may read and write: the invocation's `-o` scratch,
+   * and the account home when it exists. Absent in a unit sandbox that has no account home.
+   */
+  private codexWritableRoots(scratch: string): string[] {
+    const roots = [scratch];
+    if (existsSync(this.#codexHome)) roots.push(realpathSync(this.#codexHome));
+    return roots;
+  }
+
   /** The runCli options that put a reviewer process under its home. */
   private reviewerHomeOptions(home: CodexReviewerHome, workdir: string) {
     return {
@@ -2916,7 +2978,7 @@ export class CodexCliAdapter implements ProviderAdapter {
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
     if (spec.isolation) return this.startPacketReviewerSession(spec);
-    return {
+    const handle: SessionHandle = {
       externalSessionId: randomUUID(),
       provider: this.provider,
       model: spec.model,
@@ -2924,6 +2986,11 @@ export class CodexCliAdapter implements ProviderAdapter {
       pid: null,
       workdir: spec.workdir,
     };
+    const workerModel = codexWorkerModel();
+    if (workerModel !== undefined && spec.model === workerModel && isCodexWorkerPurpose(spec.purpose)) {
+      this.#workerSessions.set(handle.externalSessionId, { workdir: spec.workdir, model: spec.model });
+    }
+    return handle;
   }
 
   async stopSession(handle: SessionHandle): Promise<void> {
@@ -2931,6 +2998,22 @@ export class CodexCliAdapter implements ProviderAdapter {
     // auth state and is never removed or reset here. Only forget the one freshly constituted
     // reviewer id; the review gate removes its packet root in its own finally block.
     this.#reviewerSessions.delete(handle.externalSessionId);
+    this.#workerSessions.delete(handle.externalSessionId);
+  }
+
+  /**
+   * The account the capacity collector reads. The child receives it as `codexHome` on `runCli`,
+   * which `runtimeEnvironment` writes onto that child's environment. The process environment is
+   * not touched: overlapping probes each carry their own option and cannot restore one another's
+   * saved value.
+   */
+  private codexAccountOptions(): { environmentAllowlist: readonly string[]; codexHome: string } {
+    return {
+      environmentAllowlist: this.#environmentAllowlist.includes("CODEX_HOME")
+        ? this.#environmentAllowlist
+        : [...this.#environmentAllowlist, "CODEX_HOME"],
+      codexHome: this.#codexHome,
+    };
   }
 
   async invoke(request: InvocationRequest): Promise<InvocationResult> {
@@ -2938,13 +3021,43 @@ export class CodexCliAdapter implements ProviderAdapter {
     if (request.isolation) {
       return this.invokePacketReviewer(request, started);
     }
-    const scratch = acpScratchDir("acp-codex-");
+    // Resolved: seatbelt matches real paths, and this directory is the one the child must be
+    // able to write `-o` into. It is not the checkout; the guard still names that.
+    const scratch = realpathSync(acpScratchDir("acp-codex-"));
     const lastMessage = join(scratch, "last-message.txt");
     const model = request.model ?? this.defaultModels.reviewer;
 
-    const args = ["exec", "-m", model, "--skip-git-repo-check", "-o", lastMessage];
+    // `--ignore-user-config` keeps the operator's MCP servers and hooks out of the turn. On this
+    // host those servers write under the checkout's `.git`, which the turn then refuses. Auth
+    // still comes from CODEX_HOME. The model and `-o` are unchanged.
+    const args = ["exec", "-m", model, "--skip-git-repo-check", "-o", lastMessage, "--ignore-user-config"];
     if (request.effort) args.push("-c", `model_reasoning_effort="${request.effort}"`);
     args.push("-s", request.readOnly ? "read-only" : "workspace-write");
+    // Only a GPT worker turn drops the outer profile. Codex `workspace-write` otherwise also
+    // opens /tmp and $TMPDIR, and network follows `[sandbox_workspace_write]`. These keys are
+    // that table (codex 0.163.0): the checkout is the only writable root, and network is off.
+    // `--ignore-user-config` skips only `$CODEX_HOME/config.toml`. A project `.codex/config.toml`
+    // or a profile can still grant `writable_roots`, so the worker pins that list to empty on
+    // the `-c` layer, which overrides those surviving layers. Login probes, read-only exec, and
+    // a writable exec that forgot `onSpawn` do not get them. `-o` stays in ACP scratch, outside
+    // the checkout. The parent Codex process writes that file after the turn; the path is not a
+    // workspace-write root and is not passed with `--add-dir`, so a sandboxed shell cannot write
+    // it. The ACP parent reads the file after the child exits.
+    const gptWorkerTurn = request.readOnly === false
+      && request.externalSessionId !== undefined
+      && request.onSpawn !== undefined;
+    if (gptWorkerTurn) {
+      args.push(
+        "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+        "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "-c", "sandbox_workspace_write.network_access=false",
+        "-c", "sandbox_workspace_write.writable_roots=[]",
+      );
+    }
+    // Codex rejects `--session-id`. The worker session is the argv element after `--thread-source`,
+    // a free classification string the CLI accepts. Ownership and the orphan scan both read that
+    // whole element. Claude still passes `--session-id`.
+    if (request.externalSessionId !== undefined) args.push("--thread-source", request.externalSessionId);
     if (request.responseSchema) {
       const schemaFile = join(scratch, "schema.json");
       writeFileSync(schemaFile, JSON.stringify(request.responseSchema));
@@ -2955,13 +3068,25 @@ export class CodexCliAdapter implements ProviderAdapter {
       ? `${request.systemPrompt}\n\n---\n\n${request.prompt}`
       : request.prompt;
 
+    // A worker turn names its child and ends that child's group. Any other one-shot exec keeps
+    // the previous launch: no spawn callback and no reap.
+    const tracked = request.onSpawn !== undefined || request.signal !== undefined;
+    // Only `gptWorkerTurn` drops the outer profile. A writable exec that forgot `onSpawn` stays
+    // inside it and, with the bypass gone, fails closed rather than running unconfined.
     const execute = (writablePaths: readonly string[], cwd = request.workdir) => runCli(this.#binary, [...args, prompt], {
       cwd,
       timeoutMs: request.timeoutMs,
-      environmentAllowlist: this.#environmentAllowlist,
+      ...this.codexAccountOptions(),
       denyReadPaths: this.#denyReadPaths,
       providerCredentialDir: this.#providerCredentialDir,
-      writablePaths,
+      // Outside a GPT worker turn these paths are what the outer profile re-opens. `-o` lives in
+      // the scratch, under the read-denied state root. A GPT worker turn does not apply that
+      // profile: Codex's own `-s workspace-write` confines the turn, because a nested sandbox-exec
+      // fails closed. The broker still authorises the checkout before launch.
+      writablePaths: [...writablePaths, ...this.codexWritableRoots(scratch)],
+      readablePaths: { subtrees: this.codexWritableRoots(scratch) },
+      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const } : {}),
+      ...(tracked ? { onSpawn: request.onSpawn, signal: request.signal, reapProcessGroup: true as const } : {}),
     });
     let result: Awaited<ReturnType<typeof runCli>>;
     if (request.readOnly) {
@@ -3001,17 +3126,28 @@ export class CodexCliAdapter implements ProviderAdapter {
 
     const text = existsSync(lastMessage) ? readFileSync(lastMessage, "utf8") : result.stdout;
     rmSync(scratch, { recursive: true, force: true });
+    const reported = /session[_ ]id[:=]\s*([0-9a-f-]{16,})/i.exec(result.stdout)?.[1] ?? null;
+    // A one-shot `exec` does not echo the control plane's session id. The turn that launched this
+    // answer already named that id, and a thread id in stdout must not fail the turn's match.
+    const unended = tracked ? unendedGroupOf(result.processGroup) : undefined;
 
     return {
-      ok: result.exitCode === 0 && !result.timedOut,
+      ok: result.exitCode === 0 && !result.timedOut && unended === undefined,
       text,
       json: extractJson(text),
       provider: this.provider,
       model,
       durationMs: Date.now() - started,
       exitCode: result.exitCode,
-      error: result.timedOut ? "timeout" : result.exitCode === 0 ? null : result.stderr.slice(0, 2000),
-      providerSessionId: /session[_ ]id[:=]\s*([0-9a-f-]{16,})/i.exec(result.stdout)?.[1] ?? null,
+      error: result.timedOut
+        ? "timeout"
+        : unended !== undefined
+          ? unendedGroupError(unended)
+          : result.exitCode === 0
+            ? null
+            : result.stderr.slice(0, 2000),
+      ...(unended === undefined ? {} : { processGroup: unended }),
+      providerSessionId: request.externalSessionId ?? reported,
       isolationAttested: false,
     };
   }
@@ -3033,11 +3169,40 @@ export class CodexCliAdapter implements ProviderAdapter {
   }
 
   async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    // Codex's one-shot CLI currently exposes no way to attach a randomly constituted
-    // external id to an authenticated operation. Treating `--version` as session proof
-    // would revive the exact false-ready path this interface prevents.
-    void handle;
-    return "UNAVAILABLE";
+    // Only a WORKER session this adapter constituted is probed. `--version` and the presence of
+    // auth.json are not session proof, and a logged-in account is not proof of a reviewer, a CTO
+    // failover, or a handle this process never recorded.
+    const recorded = this.#workerSessions.get(handle.externalSessionId);
+    if (
+      handle.provider !== this.provider
+      || recorded === undefined
+      || recorded.model !== handle.model
+      || recorded.workdir !== handle.workdir
+    ) {
+      return "UNAVAILABLE";
+    }
+    try {
+      accessSync(this.#binary, constants.X_OK);
+      if (!statSync(recorded.workdir).isDirectory()) return "UNAVAILABLE";
+    } catch {
+      return "UNAVAILABLE";
+    }
+    const accountHome = existsSync(this.#codexHome) ? realpathSync(this.#codexHome) : undefined;
+    const result = await runCli(this.#binary, ["login", "status"], {
+      // The session workdir is the managed runtime root under the read-denied state root. The
+      // probe's cwd stays the scratch `runCli` allocates; the workdir is checked by stat above.
+      cwd: undefined,
+      timeoutMs: CODEX_WORKER_PROBE_TIMEOUT_MS,
+      ...this.codexAccountOptions(),
+      denyReadPaths: this.#denyReadPaths,
+      ...(accountHome
+        ? { writablePaths: [accountHome], readablePaths: { subtrees: [accountHome] } }
+        : {}),
+      reapProcessGroup: true,
+    });
+    if (result.processGroup && !result.processGroup.reaped) throw new ProbeProcessGroupUnconfirmed(result.processGroup);
+    if (result.exitCode !== 0 || result.timedOut || !result.processGroup) return "UNAVAILABLE";
+    return "HEALTHY";
   }
 
   async probeCapacity(): Promise<CapacityReading> {

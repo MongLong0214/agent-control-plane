@@ -4,7 +4,7 @@ import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { CtoLifecycle } from "../../src/cto/cto-lifecycle.ts";
-import { FIXED_ROLE_RUNTIME } from "../../src/domain/fixed-role-runtime.ts";
+import { fixedRuntimes } from "../../src/domain/fixed-role-runtime.ts";
 import { ProviderRegistry } from "../../src/runtime/provider.ts";
 import { join } from "node:path";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -142,10 +142,10 @@ describe("continuity role caller", () => {
       const { cp, clock, scripted } = makeHarness();
       try {
         cp.continuity.attach({ readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) } });
-        // A BOOTSTRAP_CTO or WORKER is constituted only on its fixed runtime, Claude Opus (#246), so
-        // its role-scoped adapters are Claude's; every other role is exercised on the scripted name.
-        const fixed = FIXED_ROLE_RUNTIME[role];
-        const provider = fixed?.provider ?? "scripted";
+        // A role with a fixed runtime is constituted only on a provider in that table. The first
+        // entry is the one this row exercises; every other role is exercised on the scripted name.
+        const runtime = fixedRuntimes(role)[0];
+        const provider = runtime?.provider ?? "scripted";
         const selected = new TestProductionAdapter(clock, provider);
         const wrong = new TestProductionAdapter(clock, provider);
         cp.providers.registerForRole(selected, role);
@@ -154,7 +154,7 @@ describe("continuity role caller", () => {
         const probe = vi.spyOn(selected, "probeSession");
         const wrongStart = vi.spyOn(wrong, "startSession");
         const sharedStart = vi.spyOn(scripted, "startSession");
-        if (fixed) {
+        if (runtime) {
           const substituted = await cp.continuity["provisionRoutableSession"](role, "scripted", "role test");
           expect(substituted.reasonCode).toBe(ReasonCode.ROLE_RUNTIME_SUBSTITUTION_REFUSED);
           expect(sharedStart).not.toHaveBeenCalled();
@@ -162,7 +162,7 @@ describe("continuity role caller", () => {
         const result = await cp.continuity["provisionRoutableSession"](role, provider, "role test");
         expect(result.allowed).toBe(true);
         expect(start).toHaveBeenCalledOnce();
-        if (fixed) expect(start.mock.calls[0]![0]).toMatchObject({ model: fixed.model });
+        if (runtime) expect(start.mock.calls[0]![0]).toMatchObject({ model: runtime.model });
         expect(probe).toHaveBeenCalledOnce();
         expect(wrongStart).not.toHaveBeenCalled();
         expect(sharedStart).not.toHaveBeenCalled();

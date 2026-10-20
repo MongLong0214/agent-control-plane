@@ -727,10 +727,10 @@ describe("task_worker_provision mints a task's first WORKER binding (#512)", () 
     });
   });
 
-  it("refuses a provider other than Claude and a Claude model other than Opus; never substitutes", async () => {
+  it("refuses a provider the worker table does not list and a Claude model other than Opus; never substitutes", async () => {
     await withFixture(async (f) => {
-      const gpt = await f.provision({ provider: "gpt" });
-      expect(gpt.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+      const unlisted = await f.provision({ provider: "grok" });
+      expect(unlisted.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
       const sonnet = await f.provision({ model: "sonnet" });
       expect(sonnet.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
       expect(f.claude.capacityProbes).toBe(0);

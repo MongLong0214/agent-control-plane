@@ -4,7 +4,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { containedWorkdir, probeSessionHealth } from "../cto/cto-lifecycle.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { FIXED_ROLE_RUNTIME } from "../domain/fixed-role-runtime.ts";
+import { fixedRuntimes } from "../domain/fixed-role-runtime.ts";
 import { Role, type RoleBinding, RunState, SessionLifecycle, TaskState, roleKeyFor } from "../domain/types.ts";
 import type { ProcessGroupReap } from "../runtime/cli-adapters.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
@@ -14,17 +14,18 @@ import type { RunEngine } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
 
 /**
- * The one provider a worker may be staffed on, and the model it runs.
+ * The providers a worker may be staffed on, and the model each one runs.
  *
- * Fixed rather than chosen per call: implementation work runs on Claude Opus, and GPT does no
- * code work. The caller still names the provider — nothing is substituted for a provider it did
- * not ask for — and a provider or model outside this table is refused rather than mapped to one
- * inside it. The model is not the adapter's `defaultModels.worker`, which for Claude is Sonnet.
+ * Fixed rather than chosen per call: Claude Opus, or GPT 6.1 Sol (CEO decision 129edfa1; owner
+ * instruction of 2026-10-19). The caller still names the provider — nothing is substituted for a
+ * provider it did not ask for — and a provider or model outside this table is refused rather than
+ * mapped to one inside it. The model is not the adapter's `defaultModels.worker`, which for Claude
+ * is Sonnet and for GPT is Luna. Built from the one table continuity reads too (`fixedRuntimes`),
+ * so a failover cannot pick a runtime staffing refuses.
  */
-export const WORKER_MODEL_BY_PROVIDER: Readonly<Record<string, string>> = Object.freeze({
-  // The one table continuity reads too (#246), so a failover cannot pick a runtime staffing refuses.
-  [FIXED_ROLE_RUNTIME[Role.WORKER]!.provider]: FIXED_ROLE_RUNTIME[Role.WORKER]!.model,
-});
+export const WORKER_MODEL_BY_PROVIDER: Readonly<Record<string, string>> = Object.freeze(
+  Object.fromEntries(fixedRuntimes(Role.WORKER).map((runtime) => [runtime.provider, runtime.model])),
+);
 
 /** The run owner the caller authenticated as, re-derived from durable state on every call. */
 export type WorkerOwnerFence = () => Decision<{ sessionId: string; bindingGeneration: number }>;
@@ -302,7 +303,7 @@ const unconfirmedProbeGroup = (evidence: Evidence): ProcessGroupReap | null => {
 };
 
 /** The worker model for a provider: the fixed one, or a refusal. Never a substitute. */
-const resolveWorkerModel = (provider: string, requested: string | undefined): Decision<string> => {
+export const resolveWorkerModel = (provider: string, requested: string | undefined): Decision<string> => {
   const fixed = WORKER_MODEL_BY_PROVIDER[provider];
   if (fixed === undefined) {
     return deny(ReasonCode.INVALID_ARGUMENT, "this provider is not staffed for worker implementation", {
