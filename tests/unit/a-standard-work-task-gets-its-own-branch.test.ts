@@ -742,6 +742,34 @@ describe("single-file evidence (c98ea8a3, S-TB-08)", () => {
       });
     }
   });
+
+  // #512 (CEO 9a1f70bf) — the live legacy task: a prose contract scope, and the task's own spec.files.
+  const prose = ["Improve one usage item in README.md so it matches the repository."];
+  it("a legacy docs task with no writeTarget takes its own spec.files when it names exactly one regular file at the pinned base", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const s = await standardRun(f, "stb-legacy-files", { scope: prose, tasks: [{ key: "docs", title: "document", category: "docs", spec: { files: ["README.md"] } }] });
+      expect(await provision(f, s, s.taskIds[0]!)).toMatchObject({ ok: true, value: { writeTarget: { paths: ["README.md"] } } });
+      expect(events(f, RECORDED, s.runId)).toHaveLength(1);
+    });
+  });
+
+  it("the spec.files fallback refuses several files, an escape, a directory, a declared writeTarget and a non-docs task, recording nothing", async () => {
+    const cases: Array<{ name: string; category: "docs" | "implementation"; spec: Record<string, unknown> }> = [
+      { name: "two-files", category: "docs", spec: { files: ["README.md", "NOTES.md"] } },
+      { name: "escape", category: "docs", spec: { files: ["../README.md"] } },
+      { name: "directory", category: "docs", spec: { files: ["src"] } },
+      { name: "declared-target", category: "docs", spec: { files: ["README.md"], writeTarget: { branch: "task/x" } } },
+      { name: "not-docs", category: "implementation", spec: { files: ["README.md"] } },
+    ];
+    for (const c of cases) {
+      await withBootstrapRuntime(async (f) => {
+        const s = await standardRun(f, `stb-legacy-${c.name}`, { scope: prose, tasks: [{ key: "t", title: "document", category: c.category, spec: c.spec }] });
+        const result = await provision(f, s, s.taskIds[0]!);
+        expect({ name: c.name, result }).toMatchObject({ name: c.name, result: { ok: true, value: { writeTarget: null } } });
+        expect(events(f, RECORDED, s.runId)).toEqual([]);
+      });
+    }
+  });
 });
 
 /** The git the tests' PATH resolves, found without running anything. */
