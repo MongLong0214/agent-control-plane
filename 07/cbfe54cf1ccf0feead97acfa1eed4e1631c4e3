@@ -1,0 +1,4 @@
+Limit: only owner authors and only un-mentioned events take this path; an event that mentions anyone is left to the mention path, other authors' un-mentioned events are never delivered, and no session is created
+Warn: owner directive 2026-10-20: an owner-authored kind-9 Buzz event with no p tag (un-mentioned, top-level or thread reply) in a subscribed identity's room is delivered once to that room's PRIMARY_CTO as an OWNER_MESSAGE; live, the owner's un-mentioned thread reply reached nobody because the subscription filtered on #p only
+Record-Id: r-36bbdf3cecf9
+Provenance: inherited 0b97e6074f220a28970398bfa665330ad1a2fbca
