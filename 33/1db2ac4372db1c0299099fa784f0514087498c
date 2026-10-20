@@ -1,0 +1,4 @@
+Limit: read-only is an instruction to the model; the enforcement is Codex's own workspace-write sandbox (workdir-only writes, network off) plus the control plane's verify-and-commit, not a command allowlist
+Warn: the worker prompt is provider-aware: a gpt (Codex) worker may run read-only shell commands in its working tree to read files and must make every change with apply_patch, never write, install, reach the network, commit or touch .git; the claude prompt keeps 'Do not run commands'. Without this the live #512 Codex turn ended NO_CHANGE because Codex reads only through its shell
+Record-Id: r-a3cd7d504b98
+Provenance: inherited e18a9a729f7251dd820e04ef0d0a7dee360ced75
