@@ -1995,14 +1995,16 @@ export const buzzMentionInputFor = (
   secret: string,
   request: BuzzMentionAdmissionRequest,
 ): BuzzMessageIngressInput => {
+  const replyToEventId = request.event.tags.find((tag) => tag[0] === "e" && tag[3] === "reply")?.[1];
   const input: BuzzMessageIngressInput = {
     // The event's own author, checked against the declared buzz owners by the seam. A
     // subscriber cannot widen that: it presents who signed the event and nothing else.
     actor: request.event.pubkey,
     conversation: request.conversation,
     eventId: request.event.id,
+    ...(replyToEventId ? { replyToEventId } : {}),
     addressedTo: BUZZ_MENTION_ADDRESSED_TO,
-    // The identity whose `p` tag matched, which is the address the seam resolves to a role.
+    // The subscribed recipient: the mention target, or the room's CTO for an un-mentioned owner.
     mention: request.identityPubkey,
     text: request.event.content,
     // The signed time, which is inside the payload only once a generation proof is attached.
@@ -2183,6 +2185,7 @@ export const startDaemonBuzzMentionSubscriber = (
     },
   };
   const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+    ownerAuthors: messageIngress.seam.ingress.ownerActors,
     reportEventRefusal: ({ author, eventId, reasonCode }) => auditBuzzPeerRefusal(
       cp,
       author,
@@ -3745,10 +3748,11 @@ const endWithBuzzMessage = (socket: Socket, decision: Decision<unknown>): void =
 
 const presentedBuzzMessage = (value: unknown): BuzzMessageIngressInput | null => {
   if (!value || typeof value !== "object") return null;
-  const { actor, conversation, eventId, addressedTo, mention, text, signature } = value as {
+  const { actor, conversation, eventId, replyToEventId, addressedTo, mention, text, signature } = value as {
     actor?: unknown;
     conversation?: unknown;
     eventId?: unknown;
+    replyToEventId?: unknown;
     addressedTo?: unknown;
     mention?: unknown;
     text?: unknown;
@@ -3758,6 +3762,7 @@ const presentedBuzzMessage = (value: unknown): BuzzMessageIngressInput | null =>
     typeof actor !== "string" ||
     typeof conversation !== "string" ||
     typeof eventId !== "string" ||
+    (replyToEventId !== undefined && typeof replyToEventId !== "string") ||
     typeof addressedTo !== "string" ||
     // `mention` is deliberately not type-checked here. It is inside the signature, so it has to
     // reach `buzzMessagePayload` byte-identical to what the relay sent; rejecting a number or an
@@ -3773,6 +3778,7 @@ const presentedBuzzMessage = (value: unknown): BuzzMessageIngressInput | null =>
     actor,
     conversation,
     eventId,
+    ...(replyToEventId === undefined ? {} : { replyToEventId }),
     addressedTo,
     mention: mention ?? null,
     text,
@@ -4566,10 +4572,12 @@ export const ownerMessageProvenanceOf = (
   payload: unknown,
 ): OwnerMessageProvenance => {
   const buzz = channel === "buzz";
-  const conversation =
+  const source =
     typeof payload === "object" && payload !== null && !Array.isArray(payload)
-      ? (payload as Record<string, unknown>)["conversation"]
-      : undefined;
+      ? payload as Record<string, unknown>
+      : null;
+  const conversation = source?.["conversation"];
+  const replyToEventId = source?.["replyToEventId"];
   const eventId = nonce.startsWith(BUZZ_MESSAGE_NONCE_PREFIX) ? nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length) : "";
   return {
     channel,
@@ -4578,7 +4586,7 @@ export const ownerMessageProvenanceOf = (
     senderKey: null,
     storedActorUnverified: actor.length > 0 ? actor : null,
     eventId: buzz && eventId.length > 0 ? eventId : null,
-    replyToEventId: null,
+    replyToEventId: buzz && typeof replyToEventId === "string" && replyToEventId.length > 0 ? replyToEventId : null,
   };
 };
 

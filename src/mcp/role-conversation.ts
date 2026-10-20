@@ -152,10 +152,10 @@ export interface OwnerMessageProvenance {
   /** The original Buzz event id, from the source row's nonce. */
   eventId: string | null;
   /**
-   * The event this one replied to. Admission does not store an event's reply or thread tags, so
-   * this is always `null`: unknown. A thread is never taken as correlation from the text either.
+   * The event this one explicitly replied to, from the digest-covered source payload.
+   * Unknown on legacy messages or when there was no reply tag; never inferred from text.
    */
-  replyToEventId: null;
+  replyToEventId: string | null;
 }
 
 /**
