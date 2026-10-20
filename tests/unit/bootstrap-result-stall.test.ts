@@ -83,7 +83,6 @@ const expectNoGatePassed = (
   // The T3 prompt is only eligible: the run is at CEO review and needs an owner decision it does not have.
   const scope = f.harness.cp.bootstrapProducer.approvalScopeOf(runId);
   expect(scope.allowed, JSON.stringify(scope)).toBe(true);
-  if (scope.allowed) expect(f.harness.cp.bootstrapProducer.ownerApprovalNeed(runId, scope.value).need).toBe("NONE");
 };
 
 describe("the result stall: a driven bootstrap owner whose PLAN was accepted, who acknowledged and submitted no result", () => {

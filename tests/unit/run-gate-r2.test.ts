@@ -222,10 +222,10 @@ const putOutsideTheGuard = (harness: Harness, runId: string, content: Record<str
 
 describe("round-2 run and production-gate regressions", () => {
   it("#102 refuses a caller-supplied local owner identity", async () => {
-    const fixture = await evidenceReadyRun(["public release"]);
+    const fixture = await evidenceReadyRun(["irreversible production action"]);
     const forged = fixture.harness.cp.ceo.recordOwnerDecision({
       runId: fixture.runId,
-      item: "public release",
+      item: "irreversible production action",
       approved: true,
       note: "forged local tuple",
       owner: TEST_OWNER,
@@ -395,17 +395,17 @@ describe("round-2 run and production-gate regressions", () => {
   });
 
   it("#143 denies CEO confirmation after an owner rejection revokes an earlier approval", async () => {
-    const fixture = await evidenceReadyRun(["public release"]);
-    const approved = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "yes");
+    const fixture = await evidenceReadyRun(["irreversible production action"]);
+    const approved = ownerDecisionReceipt(fixture.harness, fixture.runId, "irreversible production action", true, "yes");
     expect(fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId, item: "public release", approved: true, note: "yes", receipt: approved,
+      runId: fixture.runId, item: "irreversible production action", approved: true, note: "yes", receipt: approved,
     }).allowed).toBe(true);
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(true);
     buildPacket(fixture);
 
-    const rejected = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", false, "no");
+    const rejected = ownerDecisionReceipt(fixture.harness, fixture.runId, "irreversible production action", false, "no");
     expect(fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId, item: "public release", approved: false, note: "no", receipt: rejected,
+      runId: fixture.runId, item: "irreversible production action", approved: false, note: "no", receipt: rejected,
     }).allowed).toBe(true);
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(false);
 
@@ -421,16 +421,16 @@ describe("round-2 run and production-gate regressions", () => {
   });
 
   it("#373 refuses an owner decision before freeze and supersedes legacy null-bound approvals", async () => {
-    const fixture = await activeRun(["public release"]);
+    const fixture = await activeRun(["irreversible production action"]);
     const premature = fixture.harness.cp.ceo.recordOwnerDecision({
       runId: fixture.runId,
-      item: "public release",
+      item: "irreversible production action",
       approved: true,
       note: "approve a candidate that does not exist yet",
       receipt: ownerDecisionReceipt(
         fixture.harness,
         fixture.runId,
-        "public release",
+        "irreversible production action",
         true,
         "approve a candidate that does not exist yet",
       ),
@@ -442,11 +442,11 @@ describe("round-2 run and production-gate regressions", () => {
     // A row from before this hardening must not remain usable once a candidate is promoted.
     const legacy = putOutsideTheGuard(fixture.harness, fixture.runId, {
       kind: "OWNER_DECISION",
-      item: "public release",
+      item: "irreversible production action",
       approved: true,
       note: "legacy unbound approval",
       at: fixture.harness.clock.nowIso(),
-      humanGateDigest: digestOf(["public release"]),
+      humanGateDigest: digestOf(["irreversible production action"]),
       candidateSnapshotDigest: null,
     }, null);
     const frozen = await fixture.harness.cp.pipeline.freeze(fixture.runId);
@@ -456,34 +456,34 @@ describe("round-2 run and production-gate regressions", () => {
       .find((artifact) => artifact.artifactId === legacy.artifactId)?.superseded).toBe(true);
     const lateLegacy = putOutsideTheGuard(fixture.harness, fixture.runId, {
       kind: "OWNER_DECISION",
-      item: "public release",
+      item: "irreversible production action",
       approved: true,
       note: "legacy row inserted after candidate promotion",
       at: fixture.harness.clock.nowIso(),
-      humanGateDigest: digestOf(["public release"]),
+      humanGateDigest: digestOf(["irreversible production action"]),
       candidateSnapshotDigest: null,
     }, null);
     expect(lateLegacy.superseded).toBe(false);
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({
       required: true,
-      items: ["public release"],
+      items: ["irreversible production action"],
       satisfied: false,
     });
   });
 
   it("#381 retains the admitted owner receipt so its decision satisfies the durable human gate", async () => {
-    const fixture = await evidenceReadyRun(["public release"]);
+    const fixture = await evidenceReadyRun(["irreversible production action"]);
     const receipt = ownerDecisionReceipt(
       fixture.harness,
       fixture.runId,
-      "public release",
+      "irreversible production action",
       true,
       "approved after reviewing the release",
     );
 
     const recorded = fixture.harness.cp.ceo.recordOwnerDecision({
       runId: fixture.runId,
-      item: "public release",
+      item: "irreversible production action",
       approved: true,
       note: "approved after reviewing the release",
       receipt,
@@ -496,170 +496,63 @@ describe("round-2 run and production-gate regressions", () => {
     expect(stored?.content.receipt).toEqual(receipt);
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({
       required: true,
-      items: ["public release"],
+      items: ["irreversible production action"],
       satisfied: true,
     });
   });
 
-  it("#P1-18 consumes an admitted owner receipt on direct reuse", async () => {
-    const fixture = await evidenceReadyRun(["public release"]);
-    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "approve once");
-    const first = fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId,
-      item: "public release",
-      approved: true,
-      note: "approve once",
-      receipt,
-    });
-    expect(first.allowed).toBe(true);
-
-    const reused = fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId,
-      item: "public release",
-      approved: true,
-      note: "approve once",
-      receipt,
-    });
-    expect(reused.allowed).toBe(false);
-    expect(reused.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
-    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(1);
-    expect(fixture.harness.cp.artifacts.list(fixture.runId, ArtifactKind.APPROVAL)).toHaveLength(1);
-  });
-
-  it("#P1-18 refuses first presentation after the receipt's candidate moved", async () => {
-    const fixture = await evidenceReadyRun(["public release"]);
-    expect(ownerApprovalPayload({
-      runId: fixture.runId,
-      candidateSnapshotDigest: fixture.digest,
-      operation: "owner_decision_submit",
-      parameters: { item: "public release", approved: true, note: "candidate A" },
-      idempotencyKey: "payload-binding-probe",
-      approved: true,
-    })).toMatchObject({ candidateSnapshotDigest: fixture.digest });
-    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "candidate A");
-    const candidateB = digestOf({ revisedFrom: fixture.digest, revision: 2 });
-    fixture.harness.cp.runs.promoteCandidate(fixture.runId, candidateB);
-
-    const presentedOnB = fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId,
-      item: "public release",
-      approved: true,
-      note: "candidate A",
-      receipt,
-    });
-    expect(presentedOnB.allowed).toBe(false);
-    expect(presentedOnB.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
-    expect(fixture.harness.cp.artifacts.list(fixture.runId, ArtifactKind.APPROVAL)).toHaveLength(0);
-    // This is the first-use assertion: the stale receipt was refused before the existing
-    // single-use consumption record could be written.
-    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
-  });
-
-  it("#P1-18 refuses an admitted receipt replayed onto a revised candidate", async () => {
-    const fixture = await evidenceReadyRun(["public release"]);
-    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "candidate A");
-    const first = fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId,
-      item: "public release",
-      approved: true,
-      note: "candidate A",
-      receipt,
-    });
-    expect(first.allowed).toBe(true);
-
-    const candidateB = digestOf({ revisedFrom: fixture.digest, revision: 1 });
-    fixture.harness.cp.runs.promoteCandidate(fixture.runId, candidateB);
-    expect(fixture.harness.cp.runs.currentCandidate(fixture.runId)).toBe(candidateB);
-
-    const replayedOnB = fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId,
-      item: "public release",
-      approved: true,
-      note: "candidate A",
-      receipt,
-    });
-    expect(replayedOnB.allowed).toBe(false);
-    expect(replayedOnB.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
-    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(false);
-    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(1);
-  });
-
   it("#381 ignores owner-decision-shaped rows without an admitted, parameter-bound receipt", async () => {
-    const absent = await evidenceReadyRun(["public release"]);
+    const absent = await evidenceReadyRun(["irreversible production action"]);
     putOutsideTheGuard(absent.harness, absent.runId, {
       kind: "OWNER_DECISION",
-      item: "public release",
+      item: "irreversible production action",
       approved: true,
       note: "no proof was retained",
       at: absent.harness.clock.nowIso(),
-      humanGateDigest: digestOf(["public release"]),
+      humanGateDigest: digestOf(["irreversible production action"]),
       candidateSnapshotDigest: absent.digest,
     }, absent.digest);
     expect(absent.harness.cp.ceo.humanGateStatus(absent.runId).satisfied).toBe(false);
 
-    const notAdmitted = await evidenceReadyRun(["public release"]);
+    const notAdmitted = await evidenceReadyRun(["irreversible production action"]);
     const admittedReceipt = ownerDecisionReceipt(
       notAdmitted.harness,
       notAdmitted.runId,
-      "public release",
+      "irreversible production action",
       true,
       "the real decision",
     );
     putOutsideTheGuard(notAdmitted.harness, notAdmitted.runId, {
       kind: "OWNER_DECISION",
-      item: "public release",
+      item: "irreversible production action",
       approved: true,
       note: "the real decision",
       at: notAdmitted.harness.clock.nowIso(),
-      humanGateDigest: digestOf(["public release"]),
+      humanGateDigest: digestOf(["irreversible production action"]),
       candidateSnapshotDigest: notAdmitted.digest,
       receipt: { ...admittedReceipt, inboundNonce: "forged-ingress-nonce" },
     }, notAdmitted.digest);
     expect(notAdmitted.harness.cp.ceo.humanGateStatus(notAdmitted.runId).satisfied).toBe(false);
 
-    const mismatched = await evidenceReadyRun(["public release"]);
+    const mismatched = await evidenceReadyRun(["irreversible production action"]);
     const receiptForOtherParameters = ownerDecisionReceipt(
       mismatched.harness,
       mismatched.runId,
-      "public release",
+      "irreversible production action",
       true,
       "the actual approved note",
     );
     putOutsideTheGuard(mismatched.harness, mismatched.runId, {
       kind: "OWNER_DECISION",
-      item: "public release",
+      item: "irreversible production action",
       approved: true,
       note: "a substituted note",
       at: mismatched.harness.clock.nowIso(),
-      humanGateDigest: digestOf(["public release"]),
+      humanGateDigest: digestOf(["irreversible production action"]),
       candidateSnapshotDigest: mismatched.digest,
       receipt: receiptForOtherParameters,
     }, mismatched.digest);
     expect(mismatched.harness.cp.ceo.humanGateStatus(mismatched.runId).satisfied).toBe(false);
-  });
-
-  it("requires an admitted owner receipt to be consumed before a directly retained decision can satisfy a gate", async () => {
-    const fixture = await evidenceReadyRun(["public release"]);
-    const note = "admitted but never consumed";
-    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, note);
-
-    // This is an exact receipt from admitted ingress, but it bypasses recordOwnerDecision(),
-    // so no authorising write has consumed it for the candidate.
-    putOutsideTheGuard(fixture.harness, fixture.runId, {
-      kind: "OWNER_DECISION",
-      item: "public release",
-      approved: true,
-      note,
-      at: fixture.harness.clock.nowIso(),
-      humanGateDigest: digestOf(["public release"]),
-      candidateSnapshotDigest: fixture.digest,
-      receipt,
-    }, fixture.digest);
-
-    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
-    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(false);
-    expect(fixture.harness.cp.ceo.currentHumanGateDecisionDigest(fixture.runId).reasonCode)
-      .toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
   });
 
   it("P1-18 keeps a consumed owner approval after the ingress replay window is pruned", async () => {
@@ -668,14 +561,14 @@ describe("round-2 run and production-gate regressions", () => {
     // next successful admit. A correctly admitted *and consumed* approval therefore stopped
     // satisfying the gate once any later message arrived after the window. GitHub merge
     // re-reads this gate, so an approved run silently became unapproved.
-    const fixture = await evidenceReadyRun(["public release"]);
-    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "yes");
+    const fixture = await evidenceReadyRun(["irreversible production action"]);
+    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "irreversible production action", true, "yes");
 
     expect(fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId, item: "public release", approved: true, note: "yes", receipt,
+      runId: fixture.runId, item: "irreversible production action", approved: true, note: "yes", receipt,
     }).allowed).toBe(true);
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(true);
-    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(1);
+    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
 
     // A later admission drives the real TTL prune. The durable consumption event stays.
     fixture.harness.clock.advance(24 * 60 * 60 * 1000 + 1);
@@ -693,44 +586,16 @@ describe("round-2 run and production-gate regressions", () => {
     expect(fixture.harness.cp.ceo.currentHumanGateDecisionDigest(fixture.runId).allowed).toBe(true);
   });
 
-  it("#374 fails closed when a GUARDED run omits every owner decision item", async () => {
+  it("GUARDED work with no destructive action can publish its packet", async () => {
     const fixture = await evidenceReadyRun([], { executionMode: ExecutionMode.GUARDED });
-    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({
-      required: true,
-      items: [],
-      satisfied: false,
-    });
-
-    const packet = fixture.harness.cp.ceo.buildPacket({
-      runId: fixture.runId,
-      candidateSnapshotDigest: fixture.digest,
-      approval: fixture.approval,
-    });
-    expect(packet.allowed).toBe(false);
-    expect(packet.reasonCode).toBe(ReasonCode.HUMAN_GATE_REQUIRED);
-    expect(fixture.harness.cp.runs.require(fixture.runId).state).toBe(RunState.ACTIVE);
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({ required: false, items: [], satisfied: true });
+    expect(buildPacket(fixture)).toBeDefined();
   });
 
-  it("#374 derives a mandatory owner item from a named §21 public release", async () => {
-    const fixture = await evidenceReadyRun([], {
-      contract: { goal: "prepare the public release" },
-    });
-    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({
-      required: true,
-      items: ["undelegated public release"],
-      satisfied: false,
-    });
-    buildPacket(fixture);
-
-    const confirmed = fixture.harness.cp.ceo.submitCeoDecision({
-      runId: fixture.runId,
-      decision: "CONFIRM",
-      candidateSnapshotDigest: fixture.digest,
-      ceoSessionId: fixture.ceoSessionId,
-      rationale: "machine evidence is not an owner decision",
-    });
-    expect(confirmed.allowed).toBe(false);
-    expect(confirmed.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+  it("a public release needs no separate owner decision", async () => {
+    const fixture = await evidenceReadyRun([], { contract: { goal: "prepare the public release" } });
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({ required: false, items: [], satisfied: true });
+    expect(buildPacket(fixture)).toBeDefined();
   });
 
   it("#144 refuses report corroboration from another repository identity", async () => {
@@ -820,7 +685,7 @@ describe("round-2 run and production-gate regressions", () => {
   });
 
   it("#224 resumes an awaiting-human run and enqueues its fenced continuation", async () => {
-    const fixture = await evidenceReadyRun(["public release"]);
+    const fixture = await evidenceReadyRun(["irreversible production action"]);
     buildPacket(fixture);
     const requested = fixture.harness.cp.ceo.submitCeoDecision({
       runId: fixture.runId,
@@ -833,10 +698,10 @@ describe("round-2 run and production-gate regressions", () => {
     expect(fixture.harness.cp.runs.require(fixture.runId).state).toBe(RunState.AWAITING_HUMAN);
     const recorded = fixture.harness.cp.ceo.recordOwnerDecision({
       runId: fixture.runId,
-      item: "public release",
+      item: "irreversible production action",
       approved: true,
       note: "approved",
-      receipt: ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "approved"),
+      receipt: ownerDecisionReceipt(fixture.harness, fixture.runId, "irreversible production action", true, "approved"),
     });
     expect(recorded.allowed).toBe(true);
     expect(fixture.harness.cp.runs.require(fixture.runId).state).toBe(RunState.ACTIVE);

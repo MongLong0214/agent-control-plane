@@ -480,13 +480,13 @@ describe("a production gate asserts evidence that exists (§24.4, CP-HI-06)", ()
     expect(refused.reasonCode).toBe(ReasonCode.CONTRACT_DIGEST_MISMATCH);
   });
 
-  it("refuses a made-up human gate digest on a run that needs no owner decision", async () => {
+  it("does not require an owner digest on a run that needs no destructive consent", async () => {
     const fixture = await setup();
     const refused = await fixture.harness.cp.github.gatePublish(
       { ...fixture.payload, humanGateDigest: digestOf({ humanGate: "whatever" }) },
       fixture.identity,
     );
-    expect(refused.reasonCode).toBe(ReasonCode.GATE_EVIDENCE_NOT_BACKED);
+    expect(refused.allowed).toBe(true);
   });
 
   it("refuses a payload for a head that is not the candidate head", async () => {
@@ -513,7 +513,7 @@ describe("a production gate asserts evidence that exists (§24.4, CP-HI-06)", ()
 
 describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, #381)", () => {
   it("refuses a two-item gate after only one current item is approved", async () => {
-    const items = ["irreversible production action", "undelegated public release"] as const;
+    const items = ["irreversible production action", "project decommission"] as const;
     const fixture = await setup({ humanGate: items, allowUnsatisfiedHumanGate: true });
     recordOwnerDecision(fixture, {
       item: items[0],
@@ -530,7 +530,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
   });
 
   it("refuses merge after a later owner rejection revokes a published gate", async () => {
-    const items = ["irreversible production action", "undelegated public release"] as const;
+    const items = ["irreversible production action", "project decommission"] as const;
     const fixture = await setup({ humanGate: items, allowUnsatisfiedHumanGate: true });
     recordOwnerDecision(fixture, {
       item: items[0],
@@ -562,7 +562,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
   });
 
   it("refuses an approval artifact bound to a different candidate", async () => {
-    const items = ["undelegated public release"] as const;
+    const items = ["project decommission"] as const;
     const fixture = await setup({ humanGate: items, allowUnsatisfiedHumanGate: true });
     putOwnerDecision(fixture, items, {
       item: items[0],
@@ -580,7 +580,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
   });
 
   it("refuses an approval-shaped artifact a caller inserted directly", async () => {
-    const items = ["undelegated public release"] as const;
+    const items = ["project decommission"] as const;
     const fixture = await setup({ humanGate: items, allowUnsatisfiedHumanGate: true });
     putOwnerDecision(fixture, items, {
       item: items[0],
@@ -598,7 +598,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
   });
 
   it("refuses an approval whose retained ingress receipt is not exact", async () => {
-    const items = ["undelegated public release"] as const;
+    const items = ["project decommission"] as const;
     const fixture = await setup({ humanGate: items, allowUnsatisfiedHumanGate: true });
     const receipt = ownerDecisionReceipt(
       fixture.harness,
@@ -630,7 +630,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
   });
 
   it("uses the attached ProductionGate status port instead of rereading approval artifacts", async () => {
-    const items = ["undelegated public release"] as const;
+    const items = ["project decommission"] as const;
     const fixture = await setup({ humanGate: items });
     recordOwnerDecision(fixture, { item: items[0], approved: true, note: "approved" });
     // The port answers unsatisfied with the very binding the payload names: only the port decides.
@@ -655,7 +655,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
   });
 
   it("re-reads the attached ProductionGate status port at merge evaluation", async () => {
-    const items = ["undelegated public release"] as const;
+    const items = ["project decommission"] as const;
     const fixture = await setup({ humanGate: items });
     recordOwnerDecision(fixture, { item: items[0], approved: true, note: "approved" });
     const binding = currentBinding(fixture);

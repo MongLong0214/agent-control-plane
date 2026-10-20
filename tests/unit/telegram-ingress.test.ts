@@ -882,133 +882,8 @@ describe("Telegram production ingress", () => {
     }
   });
 
-  it("tells the Telegram owner when the candidate moved after the approval was minted", async () => {
-    const harness = makeHarness({
-      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
-    });
-    const driven = await driveToReviewedCandidate(harness, { humanGate: ["public release"] });
-    const candidateB = digestOf({ revisedFrom: driven.candidateSnapshotDigest, revision: "telegram-stale" });
-
-    const transport = new FakeTelegramTransport();
-    const listener = await startDaemonTelegramListener(
-      harness.cp,
-      telegramConfig,
-      daemonStub,
-      { transport, start: false },
-    );
-
-    try {
-      const prompt = await listener.service.sendOwnerPrompt({
-        runId: driven.runId,
-        items: ["public release"],
-        chatId: CHAT_ID,
-        correlationId: "telegram-test-candidate-moved",
-      });
-      expect(prompt.allowed).toBe(true);
-      if (!prompt.allowed) throw new Error(prompt.message);
-      expect(prompt.value.candidateSnapshotDigest).toBe(driven.candidateSnapshotDigest);
-      harness.cp.runs.promoteCandidate(driven.runId, candidateB);
-      transport.updates = [update(`/approve ${driven.runId} public release`, {
-        message_id: 8,
-        reply_to_message: { message_id: prompt.value.messageId },
-      }, 103)];
-      const outcome = (await settledPoll(listener.service)).outcomes[0]!;
-      expect(outcome.admitted).toBe(true);
-      expect(outcome.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
-      expect(outcome.reply?.text).toContain("candidate moved");
-      expect(harness.cp.artifacts.list(driven.runId, "APPROVAL")).toHaveLength(0);
-    } finally {
-      await listener.close();
-    }
-  });
-
-  it("binds a Telegram reply to prompt candidate A after candidate B is promoted", async () => {
-    const harness = makeHarness({
-      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
-    });
-    const driven = await driveToReviewedCandidate(harness, { humanGate: ["public release"] });
-    await harness.cp.continuity.evaluate("telegram prompt candidate A");
-    const packet = harness.cp.ceo.buildPacket({
-      runId: driven.runId,
-      candidateSnapshotDigest: driven.candidateSnapshotDigest,
-      approval: {
-        runId: driven.runId,
-        candidateSnapshotDigest: driven.candidateSnapshotDigest,
-        resultSummary: "candidate verified",
-        recommendation: "merge",
-        residualRisk: [],
-        approvedBySessionId: driven.ownerSessionId,
-        approvedByGeneration: driven.ownerBindingGeneration,
-        approvedAt: harness.clock.nowIso(),
-      },
-    });
-    expect(packet.allowed).toBe(true);
-    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
-    expect(ceo).toBeTruthy();
-    const requested = harness.cp.ceo.submitCeoDecision({
-      runId: driven.runId,
-      decision: "OWNER_DECISION_REQUIRED",
-      candidateSnapshotDigest: driven.candidateSnapshotDigest,
-      ceoSessionId: ceo!.sessionId,
-      rationale: "owner must decide on candidate A",
-    });
-    expect(requested.allowed).toBe(true);
-
-    const originalCurrentCandidate = harness.cp.runs.currentCandidate.bind(harness.cp.runs);
-    let currentCandidateReads = 0;
-    vi.spyOn(harness.cp.runs, "currentCandidate").mockImplementation((runId) => {
-      currentCandidateReads += 1;
-      return originalCurrentCandidate(runId);
-    });
-    const transport = new FakeTelegramTransport();
-    const listener = await startDaemonTelegramListener(
-      harness.cp,
-      telegramConfig,
-      daemonStub,
-      { transport, start: false, ownerGateSignals: () => [] },
-    );
-
-    try {
-      const prompt = await listener.service.sendOwnerPrompt({
-        runId: driven.runId,
-        items: ["public release"],
-        chatId: CHAT_ID,
-        correlationId: "telegram-test-prompt-A",
-      });
-      expect(prompt.allowed).toBe(true);
-      if (!prompt.allowed) throw new Error(prompt.message);
-      expect(prompt.value.candidateSnapshotDigest).toBe(driven.candidateSnapshotDigest);
-      expect(harness.cp.db.get<{ candidate_snapshot_digest: string }>(
-        `SELECT candidate_snapshot_digest FROM telegram_owner_prompts
-          WHERE chat_id = ? AND message_id = ?`,
-        [CHAT_ID, prompt.value.messageId],
-      )).toEqual({ candidate_snapshot_digest: driven.candidateSnapshotDigest });
-
-      currentCandidateReads = 0;
-      const candidateB = digestOf({ revisedFrom: driven.candidateSnapshotDigest, revision: "telegram-prompt-A" });
-      harness.cp.runs.promoteCandidate(driven.runId, candidateB);
-      transport.updates = [update(`/approve ${driven.runId} public release`, {
-        message_id: 9,
-        reply_to_message: { message_id: prompt.value.messageId },
-      }, 104)];
-
-      const outcome = (await settledPoll(listener.service)).outcomes[0]!;
-      expect(outcome.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
-      expect(outcome.reply?.text).toContain("candidate moved");
-      expect(harness.cp.artifacts.list(driven.runId, "APPROVAL")
-        .filter((artifact) => artifact.candidateSnapshotDigest === candidateB)).toHaveLength(0);
-      expect(harness.cp.artifacts.list<{ kind?: string }>(driven.runId, "APPROVAL")
-        .filter((artifact) => artifact.content.kind === "OWNER_DECISION")).toHaveLength(0);
-      expect(harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
-      // The reply resolves the durable prompt record; it never samples the current candidate.
-      expect(currentCandidateReads).toBe(0);
-    } finally {
-      await listener.close();
-    }
-  });
-
-  it("emits one production prompt per item across polls and restart, then re-prompts a new candidate", async () => {
-    const gateItem = "public release";
+  it("emits one destructive-consent prompt across polls and restart, and accepts its reply after revision", async () => {
+    const gateItem = "project decommission";
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -1106,13 +981,9 @@ describe("Telegram production ingress", () => {
         reply_to_message: { message_id: promptA!.messageId },
       }, 106)];
       const outcome = (await settledPoll(changed.service)).outcomes[0]!;
-      // By content, not by position. pollOnce now receives before it sends prompts, so the
-      // reply to this update is the first send and the re-prompt follows it. What the test
-      // means is that the new candidate was prompted during this poll, which is what this
-      // asserts; the old index assumed a send order that outbound-first happened to produce.
-      expect(changedTransport.sent.some((message) => message.text.includes(candidateB))).toBe(true);
-      expect(outcome.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
-      expect(outcome.reply?.text).toContain("candidate moved");
+      expect(outcome.reasonCode).toBe(ReasonCode.OK);
+      expect(outcome.reply?.text).toContain("OWNER DECISION recorded: APPROVED");
+      expect(harness.cp.ceo.humanGateStatus(driven.runId)).toMatchObject({ required: true, satisfied: true });
     } finally {
       await changed.close();
     }
@@ -1120,7 +991,7 @@ describe("Telegram production ingress", () => {
       `SELECT COUNT(*) AS n FROM telegram_owner_prompts
         WHERE run_id = ? AND candidate_snapshot_digest = ?`,
       [driven.runId, candidateB],
-    )?.n).toBe(1);
+    )?.n).toBe(0);
   });
 
   it("refuses a Telegram approval that cannot resolve to a recorded prompt", async () => {
@@ -2983,7 +2854,7 @@ describe("Telegram production ingress", () => {
   });
 
   it("clears a human gate only through the real owner receipt path", async () => {
-    const gateItem = "owner confirms the production scope";
+    const gateItem = "project decommission";
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });

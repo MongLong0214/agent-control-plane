@@ -300,7 +300,7 @@ describe("a restart returns a run continuity paused at CEO review to CEO review"
 
   it("the live sequence from the reconcile, real owner gate: legacy pause at gen 1, old recovery to gen 2 keeps it, restart revokes gen 2, gen 3 releases once", async () => {
     await withBootstrapRuntime(async (f) => {
-      const item = "the owner's T3 signature before the real create";
+      const item = "project decommission";
       const ready = await reviewReady(f, { humanGate: [item] });
       // The owner signs at CEO review through the owner path, as the live run's OWNER_DECISION was.
       expect(f.harness.cp.ceo.recordOwnerDecision({
@@ -383,7 +383,7 @@ describe("a wait continuity did not place, or that something moved since, is kep
 
   it("an unsatisfied human gate is kept", async () => {
     await withBootstrapRuntime(async (f) => {
-      const ready = await reviewReady(f, { humanGate: ["public release"] });
+      const ready = await reviewReady(f, { humanGate: ["project decommission"] });
       const count = transitions(f, ready.runId).length + 1;
       await restart(f, ready);
       await recover(f, ready);

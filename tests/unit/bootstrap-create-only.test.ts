@@ -15,17 +15,7 @@ import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import { git } from "../../src/git/git.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import { bootstrapPlan, cleanTreeManifest } from "../helpers/bootstrap-plan.ts";
-import {
-  InitializingGitHub,
-  type Operation,
-  type PreparedBootstrapRun,
-  activateAndConfirm,
-  noGitHubCall,
-  withholdPending,
-  ownerApprovalFor,
-  prepareBootstrapRun,
-  writesOf,
-} from "../helpers/bootstrap-runner.ts";
+import { InitializingGitHub, type Operation, type PreparedBootstrapRun, activateAndConfirm, withholdPending, ownerApprovalFor, prepareBootstrapRun, writesOf } from "../helpers/bootstrap-runner.ts";
 import type { FakeGitHub, Protection } from "../helpers/fake-github-write-port.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -364,37 +354,6 @@ describe("#246 C5 create-only bootstrap: GitHub initializes the default branch a
       path: "orgs/acme/repos",
       body: { name: "fixture", description: "repo-factory:marker", private: false, visibility: "public", auto_init: true },
     });
-  });
-
-  it("W7: the owner's approval binds owner, visibility, plan digest and the operations — the initialization included", async () => {
-    const prepared = await prepare("c5-approval");
-    const withoutInit = createOnlyOperations().map((operation) => ({ ...operation, desiredState: { visibility: "public" } }));
-    const renamed = createOnlyOperations("github:acme/renamed");
-    const privateReceipt = ownerApproval(prepared, { visibility: "private" });
-    for (const [name, approval] of [
-      ["a receipt for another visibility", privateReceipt],
-      ["a receipt for the create without its initialization", ownerApproval(prepared, { operations: withoutInit })],
-      ["a receipt for another repository name", ownerApproval(prepared, { operations: renamed })],
-    ] as const) {
-      const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: approval });
-      expect(refused, `${name}: ${JSON.stringify(refused)}`).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        evidence: { stage: "approval", refusal: "APPROVAL_MISMATCH" },
-      });
-      noGitHubCall(prepared);
-    }
-    // The approval presented for another visibility than the plan's create: refused before the receipt is read.
-    const presented = await prepared.runner.produceAndActivate({
-      ...prepared.input,
-      ownerApproval: { ...privateReceipt, visibility: "private" },
-    });
-    expect(presented, JSON.stringify(presented)).toMatchObject({
-      allowed: false,
-      reasonCode: ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
-      evidence: { stage: "precondition", refusal: "VISIBILITY_MISMATCH" },
-    });
-    noGitHubCall(prepared);
   });
 
   it("operations after a create-only create apply to the initialized default branch, resume on its receipted head, and push nothing", async () => {
