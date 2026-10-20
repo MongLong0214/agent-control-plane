@@ -76,6 +76,11 @@ describe("packet listings share the reviewer budget", () => {
       for (const p of prompts) expect(p.prompt.length).toBeLessThanOrEqual(120_000);
       expect(prompts[0]!.prompt).toMatch(/\d+ of 140 participating repositories are omitted from this listing for size/);
       expect(prompts[0]!.prompt).toMatch(/"total": 651/);
+      // The candidate's own task and its WORKER binding are listed, not only counted in the summary.
+      const section = prompts[0]!.prompt.split("## Control-plane evidence\n")[1]!;
+      const evidence = JSON.parse(section.split("```json\n")[1]!.split("\n```")[0]!) as {
+        tasks: { taskId: string; state: string; workerBindingCount: number }[] };
+      expect(evidence.tasks[0]).toMatchObject({ taskId: task.taskId, state: "SUCCEEDED", workerBindingCount: 1 });
       expect(prompts[0]!.prompt).toMatch(/"truncated": true/);
     } finally { harness.cp.close(); }
   }, 120_000);
