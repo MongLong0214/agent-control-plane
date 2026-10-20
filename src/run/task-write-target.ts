@@ -458,13 +458,19 @@ export class TaskWriteTargets {
         [runId],
       );
       const scope = contract ? (JSON.parse(contract.content_json) as { scope?: unknown }).scope : undefined;
-      const single = Array.isArray(scope) && scope.length === 1 && typeof scope[0] === "string" && isSingleFileScope(scope[0])
-        ? scope[0]
-        : null;
+      const oneFile = (entries: unknown): string | null =>
+        Array.isArray(entries) && entries.length === 1 && typeof entries[0] === "string" && isSingleFileScope(entries[0])
+          ? entries[0]
+          : null;
+      // #512 (CEO 9a1f70bf) — a docs task planned before writeTarget existed declares its one file in
+      // its own spec.files. That is the task's declaration, not a guess: it is used only when the spec
+      // has no writeTarget at all, names exactly one normal file, and (pathFromScope) the pinned base
+      // holds a regular file there. A declared writeTarget is never overridden by it.
+      const single = declared === null ? (oneFile(isRecord(spec) ? spec["files"] : undefined) ?? oneFile(scope)) : oneFile(scope);
       if (task.category !== "docs" || single === null) {
         return deny(
           ReasonCode.INVALID_ARGUMENT,
-          "the task declares no paths, and it is not a docs task whose contract declares exactly one file; the control plane does not guess its paths",
+          "the task declares no paths, and it is not a docs task whose spec files or contract declare exactly one file; the control plane does not guess its paths",
           { taskId, category: task.category },
         );
       }
@@ -542,7 +548,7 @@ export class TaskWriteTargets {
       if (listed.exitCode !== 0 || !entry || entry[2] !== "blob" || (entry[1] !== "100644" && entry[1] !== "100755") || entry[3] !== path) {
         return deny(
           ReasonCode.INVALID_ARGUMENT,
-          "the contract's one scope entry is not a single regular file at the run's pinned base; the control plane does not widen it to a directory or guess one",
+          "the one file the task spec or its contract declares is not a single regular file at the run's pinned base; the control plane does not widen it to a directory or guess one",
           { repositoryIdentity: repository.identity, path, baseSha, found: entries.map((line) => line.split("\t", 1)[0]).slice(0, 5) },
         );
       }
