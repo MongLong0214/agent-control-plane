@@ -4,6 +4,7 @@ import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunState, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
+import { ApprovedRunFinalizer } from "../../src/daemon/finalizer.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
@@ -47,7 +48,7 @@ const reflectMergedBase = (github: FakeGitHub): void => {
   };
 };
 
-const approvedFixture = async (options: { confirm?: boolean } = {}) => {
+const approvedFixture = async (options: { confirm?: boolean; noChecks?: boolean } = {}) => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
   const harness = makeHarness({ githubClient: github });
@@ -60,14 +61,14 @@ const approvedFixture = async (options: { confirm?: boolean } = {}) => {
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: "feature/F1-finalizer",
     manifestOverrides: {
-      ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW), unapprovedFirstActivation: false, repositoryRole: "primary" }],
+      ciWorkflows: options.noChecks ? [] : [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW), unapprovedFirstActivation: false, repositoryRole: "primary" }],
     },
   });
   github.setBranch("dev", driven.baseHead);
   github.setBranch("main", "m".repeat(40));
   github.setBranch(driven.workBranch, driven.candidateHead);
   github.nextMergeSha = driven.candidateHead;
-  github.onMerge = ({ mergeSha }) => github.setTrustedPostMergeCheck(mergeSha, "project-ci", WORKFLOW_PATH);
+  github.onMerge = options.noChecks ? null : ({ mergeSha }) => github.setTrustedPostMergeCheck(mergeSha, "project-ci", WORKFLOW_PATH);
 
   const claimed = harness.cp.claims.acquire({
     runId: driven.runId,
@@ -520,13 +521,8 @@ describe("daemon-owned approved-run finalization", () => {
     await daemon.stop();
   });
 
-  // #448: `deriveConfirmedMergePlan` used to report CONTRACT_DIGEST_MISMATCH here too, the same
-  // code `prPrepare()`'s `branchProfile()` reported before it was fixed. The manifest not being
-  // retrievable during post-CEO-approval finalization is exactly the same fact as during PR
-  // preparation — nothing was compared, so a reader who trusts the reason code learns "the
-  // candidate and the run disagree" when what actually happened is "there was nothing to check
-  // it against". It must read the same way at both entry points.
-  it("#448 reports CONTRACT_UNVERIFIED when a CEO-approved run's pinned manifest cannot be retrieved during finalization", async () => {
+  // Missing pinned inputs are refused before planning can publish or merge anything.
+  it("refuses unreadable post-merge inputs before any GitHub writes", async () => {
     const { github, harness, driven } = await approvedFixture();
     const manifest = vi.spyOn(harness.cp.projects, "manifest").mockReturnValue(null);
     try {
@@ -535,8 +531,9 @@ describe("daemon-owned approved-run finalization", () => {
       expect(started.allowed).toBe(true);
       const finalized = await daemon.finalizeApprovedRun(driven.runId);
       expect(finalized.allowed).toBe(false);
-      expect(finalized.reasonCode).toBe(ReasonCode.CONTRACT_UNVERIFIED);
+      expect(finalized.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
       expect(github.mergeCount).toBe(0);
+      expect(github.calls.filter((call) => call.method !== "GET")).toHaveLength(0);
       await daemon.stop();
     } finally {
       manifest.mockRestore();
@@ -793,5 +790,164 @@ describe("daemon-owned approved-run finalization", () => {
       `SELECT status, verified FROM github_receipts WHERE receipt_id = 'receipt_crashed_gate'`,
     )).toEqual({ status: "APPLIED", verified: 1 });
     await daemon.stop();
+  });
+});
+
+
+describe("post-merge no-check declarations and recovery", () => {
+  const writeCalls = (github: FakeGitHub) => github.calls.filter((call) => call.method !== "GET");
+  const blockLikeOldBuild = async () => {
+    const fixture = await approvedFixture({ noChecks: true });
+    const verifier = vi.spyOn(fixture.harness.cp.github, "postMergeVerify").mockResolvedValueOnce({
+      allowed: false, reasonCode: ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED,
+      message: "the pinned manifest declares no post-merge checks", evidence: {},
+    });
+    const result = await new ApprovedRunFinalizer(fixture.harness.cp).finalizeApprovedRun(fixture.driven.runId);
+    verifier.mockRestore();
+    expect(result.reasonCode).toBe(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED);
+    expect(fixture.harness.cp.runs.require(fixture.driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+    return fixture;
+  };
+
+  it("records NO_CHECKS_DECLARED, marks MERGED, and replays the empty receipt", async () => {
+    const { harness, driven, github } = await approvedFixture({ noChecks: true });
+    const beforeMerge = await harness.cp.github.postMergeVerify(driven.runId, driven.identity, driven.candidateHead);
+    expect(beforeMerge.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    const result = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(result.allowed).toBe(true);
+    expect(harness.cp.db.get<{ merge_state: string }>(
+      "SELECT merge_state FROM run_repositories WHERE run_id = ?", [driven.runId])?.merge_state).toBe("MERGED");
+    const receipt = harness.cp.db.get<{ response_json: string }>(
+      "SELECT response_json FROM github_receipts WHERE run_id = ? AND operation = 'post_merge_verify'", [driven.runId]);
+    expect(JSON.parse(receipt!.response_json)).toEqual({ checks: [], noChecksDeclared: true });
+    expect(harness.cp.audit.byKind("POST_MERGE_NO_CHECKS_DECLARED").map((entry) => entry.evidence)).toEqual([
+      { repositoryIdentity: driven.identity, mergeCommitSha: driven.candidateHead },
+    ]);
+    const calls = github.calls.length;
+    const replay = await harness.cp.github.postMergeVerify(driven.runId, driven.identity, driven.candidateHead);
+    expect(replay).toMatchObject({ allowed: true, value: { checks: [], noChecksDeclared: true } });
+    expect(github.calls).toHaveLength(calls);
+    const undeclared = await harness.cp.github.postMergeVerify(driven.runId, driven.identity, driven.candidateHead, ["other-ci"]);
+    expect(undeclared.reasonCode).toBe(ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED);
+  });
+
+  it.each(["missing", "unparseable", "invalid"])("refuses a %s pinned manifest and releases the attempt before remote writes", async (mode) => {
+    const { harness, driven, github } = await approvedFixture({ noChecks: true });
+    const manifest = vi.spyOn(harness.cp.projects, "manifest");
+    if (mode === "missing") manifest.mockReturnValue(null);
+    else if (mode === "unparseable") manifest.mockImplementation(() => { throw new SyntaxError("invalid JSON"); });
+    else manifest.mockReturnValue({} as ReturnType<typeof harness.cp.projects.manifest>);
+    try {
+      expect((await harness.cp.github.postMergeVerify(driven.runId, driven.identity, driven.candidateHead)).reasonCode)
+        .toBe(ReasonCode.EVIDENCE_MISSING);
+      const result = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+      expect(result.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+      expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+      expect(harness.cp.db.get<{ state: string }>("SELECT state FROM finalization_attempts WHERE run_id = ?", [driven.runId])?.state).toBe("RELEASED");
+      expect(harness.cp.audit.byKind("FINALIZATION_ATTEMPT_FAILED")).toHaveLength(1);
+      expect(github.mergeCount).toBe(0);
+      expect(writeCalls(github)).toHaveLength(0);
+    } finally { manifest.mockRestore(); }
+  });
+
+  it("refuses an unresolved repository role rather than treating it as empty", async () => {
+    const { harness, driven } = await approvedFixture({ noChecks: true });
+    expect(harness.cp.github.postMergeVerificationInputs(driven.runId, "github:acme/absent").reasonCode)
+      .toBe(ReasonCode.EVIDENCE_MISSING);
+    const manifest = harness.cp.projects.manifest(harness.cp.runs.require(driven.runId).pinnedManifestDigest!)!;
+    const read = vi.spyOn(harness.cp.projects, "manifest").mockReturnValue({
+      ...manifest, repositories: manifest.repositories.map((repository) => ({ ...repository, role: "unresolved" })),
+    });
+    try {
+      expect(harness.cp.github.postMergeVerificationInputs(driven.runId, driven.identity).reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    } finally { read.mockRestore(); }
+  });
+
+  it.each(["missing", "failure"])("keeps a declared %s check mandatory", async (conclusion) => {
+    const { harness, driven, github } = await approvedFixture();
+    github.onMerge = conclusion === "missing" ? () => {} : ({ mergeSha }) => github.setPostMergeCheck(mergeSha, "project-ci", "failure");
+    const result = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(result.reasonCode).toBe(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED);
+    expect(harness.cp.audit.byKind("POST_MERGE_FAILED")[0]?.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+  });
+
+  it("the daemon sweep resumes the historical refusal without publishing, preparing a PR, gating, or merging again; the second call replays completion", async () => {
+    const { harness, driven, github } = await blockLikeOldBuild();
+    const prior = harness.cp.db.get<{ attempt_id: string; state: string; failure_reason: string }>(
+      "SELECT * FROM finalization_attempts WHERE run_id = ?", [driven.runId])!;
+    const history = harness.cp.audit.forRun(driven.runId);
+    const before = writeCalls(github);
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-no-check-recovery-") });
+    try {
+      expect((await daemon.start()).allowed).toBe(true);
+      expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
+      expect(writeCalls(github)).toEqual(before);
+      const current = harness.cp.db.get<{ attempt_id: string; state: string }>("SELECT * FROM finalization_attempts WHERE run_id = ?", [driven.runId])!;
+      expect(current.state).toBe("COMPLETED");
+      expect(current.attempt_id).not.toBe(prior.attempt_id);
+      expect(harness.cp.audit.forRun(driven.runId).slice(0, history.length)).toEqual(history);
+      expect(harness.cp.audit.byKind("FINALIZATION_POST_MERGE_RESUMED")[0]?.evidence).toMatchObject({
+        resumedFromAttemptId: prior.attempt_id,
+        priorAttempt: { attempt_id: prior.attempt_id, state: "BLOCKED", failure_reason: ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED },
+      });
+      expect(harness.cp.audit.byKind("FINALIZATION_COMPLETED")[0]?.evidence).toMatchObject({ resumed: true });
+      expect(harness.cp.audit.forRun(driven.runId).find((entry) => entry.kind === "RUN_TRANSITION" && entry.evidence["from"] === RunState.BLOCKED_POST_MERGE)?.evidence)
+        .toMatchObject({ to: RunState.POST_MERGE_VERIFYING, resumedFromAttemptId: prior.attempt_id, reason: ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED });
+      const replay = await daemon.finalizeApprovedRun(driven.runId);
+      expect(replay.reasonCode).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+      expect(writeCalls(github)).toEqual(before);
+    } finally { await daemon.stop(); }
+  });
+
+  it("refuses recovery if the candidate changed", async () => {
+    const { harness, driven, github } = await blockLikeOldBuild();
+    const candidate = vi.spyOn(harness.cp.runs, "currentCandidate").mockReturnValue("changed-candidate");
+    const calls = github.calls.length;
+    try {
+      const result = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+      expect(result.reasonCode).toBe(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED);
+      expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+      expect(github.calls).toHaveLength(calls);
+    } finally { candidate.mockRestore(); }
+  });
+
+  it.each(["PENDING", "missing SHA"])("refuses recovery with an additional %s durable merge receipt", async (mode) => {
+    const { harness, driven, github } = await blockLikeOldBuild();
+    harness.cp.db.run(`INSERT INTO github_receipts
+      (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type,
+       resource_identity, preexisting, request_digest, response_json, created_at, verified, status)
+      VALUES ('receipt_unresolved', 'merge_execute:unresolved', 'merge_execute', ?, ?, 'merge',
+              'acme/fixture#unresolved', 0, 'sha256:request', '{"pending":true}', ?, 0, 'PENDING')`,
+    [driven.runId, driven.identity, harness.clock.nowIso()]);
+    if (mode === "missing SHA") {
+      harness.cp.db.run(`UPDATE github_receipts SET status = 'APPLIED', verified = 1,
+        after_state_digest = 'sha256:unresolved', response_json = '{}', reread_at = ?
+        WHERE receipt_id = 'receipt_unresolved'`, [harness.clock.nowIso()]);
+    }
+    const before = github.calls.length;
+    const result = await new ApprovedRunFinalizer(harness.cp).finalizeApprovedRun(driven.runId);
+    expect(result.reasonCode).toBe(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.BLOCKED_POST_MERGE);
+    expect(github.calls).toHaveLength(before);
+    expect(harness.cp.audit.byKind("FINALIZATION_POST_MERGE_RESUMED")).toHaveLength(0);
+  });
+
+  it("recovers an interrupted receipt-only attempt without returning to publishing", async () => {
+    const { harness, driven, github } = await blockLikeOldBuild();
+    const finalizer = new ApprovedRunFinalizer(harness.cp);
+    const next = new ApprovedRunFinalizer(harness.cp);
+    let reentered: unknown;
+    const verify = harness.cp.github.postMergeVerify.bind(harness.cp.github);
+    const spy = vi.spyOn(harness.cp.github, "postMergeVerify").mockImplementationOnce(async (...args) => {
+      harness.cp.db.run("UPDATE finalization_attempts SET deadline_at = ? WHERE run_id = ?", [harness.clock.nowIso(), driven.runId]);
+      reentered = await next.finalizeApprovedRun(driven.runId);
+      return verify(...args);
+    });
+    const before = writeCalls(github);
+    try {
+      expect((await finalizer.finalizeApprovedRun(driven.runId)).allowed).toBe(true);
+      expect(reentered).toMatchObject({ allowed: true, value: { state: RunState.COMPLETED } });
+      expect(writeCalls(github)).toEqual(before);
+    } finally { spy.mockRestore(); }
   });
 });

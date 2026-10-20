@@ -126,7 +126,7 @@ describe("the v48 freeze (CEO 3d0daed0)", () => {
     expect(userVersionOf(path)).toBe(SCHEMA_VERSION);
     const receipts = receiptsOf(path);
     expect(receipts.find((receipt) => receipt.version === 48)).toEqual({ version: 48, migration_id: "v48-owner-decision-supersede-guard", checksum: V48_BASE_CHECKSUM });
-    expect(receipts.at(-1)).toEqual({ version: 49, migration_id: "v49-branch-publish-receipts", checksum: V49.checksum() });
+    expect(receipts.find((receipt) => receipt.version === 49)).toEqual({ version: 49, migration_id: "v49-branch-publish-receipts", checksum: V49.checksum() });
     expect(receiptObjects(schemaRowsOf(path))).toEqual(freshReceiptObjects());
   });
 });
@@ -141,10 +141,12 @@ describe("v48 → v49 on the released v48 image", () => {
     const schemaBefore = schemaRowsOf(path);
     const migrationReceiptsBefore = receiptsOf(path);
     approveMigration(path, "v49 upgrade witness");
-    new Db(path).close();
-    expect(userVersionOf(path)).toBe(49);
+    let schemaAfter: SchemaRow[] = [];
+    new Db(path, { afterMigration: (migration) => {
+      if (migration.toVersion === 49) schemaAfter = schemaRowsOf(path);
+    } }).close();
+    expect(userVersionOf(path)).toBe(SCHEMA_VERSION);
     expect(receiptRows(path)).toEqual(rowsBefore);
-    const schemaAfter = schemaRowsOf(path);
     expect(otherObjects(schemaAfter)).toEqual(otherObjects(schemaBefore));
     expect(receiptObjects(schemaAfter)).toEqual(freshReceiptObjects());
     // Exactly two definitions changed: the CHECK and the reservation guard.
@@ -154,7 +156,7 @@ describe("v48 → v49 on the released v48 image", () => {
       ["github_receipts", V49_RECEIPT_INDEX, ...V49_RECEIPT_TRIGGERS, "sqlite_autoindex_github_receipts_1", "sqlite_autoindex_github_receipts_2"].sort(),
     );
     expect(receiptsOf(path).filter((receipt) => receipt.version <= 48)).toEqual(migrationReceiptsBefore);
-    expect(receiptsOf(path).at(-1)).toEqual({ version: 49, migration_id: "v49-branch-publish-receipts", checksum: V49.checksum() });
+    expect(receiptsOf(path).find((receipt) => receipt.version === 49)).toEqual({ version: 49, migration_id: "v49-branch-publish-receipts", checksum: V49.checksum() });
   });
 
   it("accepts branch_publish only through a reservation (or as an observation), and the v48 image refuses it outright", () => {

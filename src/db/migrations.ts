@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 49;
+export const SCHEMA_VERSION = 50;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -18,6 +18,7 @@ const v45SchemaPath = fileURLToPath(new URL("./schema-v45.sql", import.meta.url)
 const v46SchemaPath = fileURLToPath(new URL("./schema-v46.sql", import.meta.url)); // released v46 reads only this
 const v47SchemaPath = fileURLToPath(new URL("./schema-v47.sql", import.meta.url)); // released v47 reads only this
 const v48SchemaPath = fileURLToPath(new URL("./schema-v48.sql", import.meta.url)); // released v48 reads only this
+const v49SchemaPath = fileURLToPath(new URL("./schema-v49.sql", import.meta.url)); // released v49 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -26,7 +27,8 @@ const schemaSqlAt = (version: number): string =>
       : version <= 45 ? readFileSync(v45SchemaPath, "utf8")
         : version <= 46 ? readFileSync(v46SchemaPath, "utf8")
           : version <= 47 ? readFileSync(v47SchemaPath, "utf8")
-            : version <= LATEST_FROZEN_VERSION ? readFileSync(v48SchemaPath, "utf8") : schemaSql();
+            : version <= 48 ? readFileSync(v48SchemaPath, "utf8")
+              : version <= LATEST_FROZEN_VERSION ? readFileSync(v49SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -3972,6 +3974,22 @@ const v49: SchemaMigration = {
   checksum: () => migrationChecksum("v49-branch-publish-receipts", 49),
 };
 
+/** v50 changes only the two state guards, admitting authority-marked post-merge recovery. */
+const v50: SchemaMigration = {
+  id: "v50-post-merge-verification-reentry",
+  fromVersion: 49,
+  toVersion: 50,
+  apply(raw) {
+    const names = ["runs_state_transition_guard", "runs_state_transition_authority_guard"];
+    const objects = stepTriggerObjects(50, names, { version: 49, names });
+    assertStepNames(raw, 50, objects, "before");
+    raw.exec(dropsFor(names));
+    raw.exec(triggerDdlFor(names, 50));
+    assertStepNames(raw, 50, objects, "after");
+  },
+  checksum: () => migrationChecksum("v50-post-merge-verification-reentry", 50),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -4011,6 +4029,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v47,
   v48,
   v49,
+  v50,
 ]);
 
 interface RequiredTrigger {
@@ -4346,7 +4365,7 @@ export const assertMigrationLedgerAt = (raw: Database.Database, version: number)
  * release commits to now (4263f001…, aa2aa099…), but they are not compared either, so a database
  * carrying them opens and migrates exactly as before. Receipts v12–v46 keep the format check only.
  *
- * Why not later than the frozen steps. A step that still reads the live schema.sql (v49 until the next
+ * Why not later than the frozen steps. A step that still reads the live schema.sql (v50 until the next
  * freeze) changes its checksum with any schema edit. v48 is frozen (`LATEST_FROZEN_VERSION`) but its
  * receipt is still not compared (`RECEIPT_VALUE_CHECKED_THROUGH`). A bootstrap receipt (`bootstrap-v<n>`)
  * is not compared: a database created at v47 or later had the guard from its first transaction.
@@ -4358,12 +4377,13 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * reads the live schema.sql, so its checksum still moves with any schema edit until the next freeze.
  * Declared here, below the anchors other gates hold into this file, and read only inside functions.
  *
- * #512 S-PUSH (CEO 3d0daed0): v48 is frozen as v49's prerequisite. It reads `schema-v48.sql`, a byte copy
+ * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
+ * #512 S-PUSH (CEO 3d0daed0): v48 was frozen as v49's prerequisite. It reads `schema-v48.sql`, a byte copy
  * of schema.sql at c65e73b2 (blob 29f2a057, unchanged since v48's merge ab136549), so v49's receipts table
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 48;
+const LATEST_FROZEN_VERSION = 49;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when
