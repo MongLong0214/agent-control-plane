@@ -71,6 +71,17 @@ describe("a CEO session with no Buzz identity bound is named by doctor (#1112)",
     expect(await findingsOf(harness)).not.toContainEqual(expect.objectContaining({ code: CODE }));
   });
 
+  it("resolves the previous CEO identity when a new generation has none", async () => {
+    const harness = makeHarness();
+    const previous = bindCeo(harness);
+    harness.cp.db.run(`UPDATE sessions SET buzz_actor_id = ? WHERE session_id = ?`, ["a".repeat(64), previous]);
+    expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "rotation").allowed).toBe(true);
+    const current = bindCeo(harness);
+    expect(current).not.toBe(previous);
+    expect(harness.cp.sessions.get(current)?.buzzActorId).toBeNull();
+    expect(await findingsOf(harness)).not.toContainEqual(expect.objectContaining({ code: CODE }));
+  });
+
   it("stays quiet with no CEO bound: that state is CEO_ROLE_UNBOUND's, not this one's", async () => {
     const harness = makeHarness();
     const findings = await findingsOf(harness);

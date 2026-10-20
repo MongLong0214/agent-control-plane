@@ -9,7 +9,6 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import {
   admitHermesProvenance,
-  HERMES_PEER_DELEGABLE_TOOLS,
   HERMES_PROVENANCE_META_KEY,
   HERMES_READ_ONLY_TOOLS,
 } from "../../src/mcp/hermes-provenance.ts";
@@ -278,8 +277,7 @@ describe("admitHermesProvenance, as a pure decision", () => {
 
 /**
  * A peer turn of the CEO binding under a Hermes peer grant (CEO ad57675b): the same channel, the
- * same anchor and every owner check, plus a well-formed `peer_grant`, one of four fixed tools, and,
- * for `ceo_decision_submit`, only FINAL_REVISE or CONFIRM. The admitted turn is recorded with the
+ * same anchor and every owner check, plus a well-formed `peer_grant`. The admitted turn is recorded with the
  * mutation's own audit evidence.
  */
 const PEER_GRANT = `sha256:${"c".repeat(64)}`;
@@ -370,56 +368,29 @@ describe("a peer turn of the CEO binding, under a Hermes peer grant", () => {
     await expectRefused(subject, "run_create", runCreate({ peer_grant: PEER_GRANT, _meta: peerTurn() }), peerWithout("peer_grant"));
   });
 
-  it.each([
-    ["run_cancel", (runId: string) => ({ idempotencyKey: "peer-cancel", runId, reason: "peer asked" })],
-    ["run_priority_set", (runId: string) => ({ idempotencyKey: "peer-priority", runId, priority: "CRITICAL" })],
-    ["cto_start", () => ({ idempotencyKey: "peer-cto-start", projectId: "proj_absent" })],
-    ["cto_replace", () => ({ idempotencyKey: "peer-cto-replace", projectId: "proj_absent", reason: "peer asked" })],
-    ["cto_suspend", () => ({ idempotencyKey: "peer-cto-suspend", projectId: "proj_absent", reason: "peer asked" })],
-    ["cto_resume", () => ({ idempotencyKey: "peer-cto-resume", projectId: "proj_absent" })],
-    ["repair_execute", () => ({ idempotencyKey: "peer-repair", operationId: "noop", authorizedBy: "HERMES", dryRun: false })],
-    ["owner_decision_submit", (runId: string) => ({ idempotencyKey: "peer-owner-decision", runId, item: "merge", approved: true })],
-    ["doctor_run", () => ({ scope: "system" })],
-  ])("refuses a peer's %s, writing nothing", async (tool, args) => {
-    const subject = await channel();
-    const runId = await ownerRun(subject);
-    await expectRefused(subject, tool, args(runId), peerTurn());
-    expect(runState(subject, runId)).toBe("QUEUED");
-  });
-
-  it("refuses a peer's tool registered after construction, which is not in the fixed peer set", async () => {
+  it.each(["buzz_actor_bind", "fixture_arbitrary_tool"])("admits a peer's %s with its parsed arguments", async (tool) => {
     const subject = await channel(true, (server) => {
       server.registerTool(
-        "fixture_registered_later",
+        tool,
         { description: "fixture", inputSchema: { request: z.record(z.unknown()) } },
-        async () => respond(allow(ReasonCode.OK, { reached: true })),
+        async (args) => respond(allow(ReasonCode.OK, { reached: true, request: args.request })),
       );
     });
-    await expectRefused(subject, "fixture_registered_later", { request: {} }, peerTurn());
-    expect(await subject.call("fixture_registered_later", { request: {} }, provenance())).toMatchObject({ ok: true });
+    const request = { actor: "peer actor", decision: "OWNER_DECISION_REQUIRED", arbitrary: [1, null] };
+    expect(await subject.call(tool, { request }, peerTurn()))
+      .toMatchObject({ ok: true, value: { reached: true, request } });
   });
 
-  it("lets a peer submit FINAL_REVISE or CONFIRM to the CEO gate, and refuses OWNER_DECISION_REQUIRED before it", async () => {
+  it("lets every peer CEO decision reach the tool's own gate", async () => {
     const subject = await channel();
     const runId = await ownerRun(subject);
-    const decision = (value: string, key: string) => ({
-      idempotencyKey: key,
-      runId,
-      decision: value,
-      candidateSnapshotDigest: DIGEST,
-      ceoSessionId: subject.admitted.sessionId,
-      rationale: "the review is complete",
-    });
-    await expectRefused(subject, "ceo_decision_submit", decision("OWNER_DECISION_REQUIRED", "peer-odr"), peerTurn());
-    for (const value of ["FINAL_REVISE", "CONFIRM"]) {
-      // Past provenance, and refused by the CEO gate itself: a QUEUED run has no candidate to decide.
-      expect(await subject.call("ceo_decision_submit", decision(value, `peer-${value}`), peerTurn()))
-        .toMatchObject({ ok: false, reasonCode: ReasonCode.RUN_TRANSITION_ILLEGAL });
+    for (const decision of ["OWNER_DECISION_REQUIRED", "FINAL_REVISE", "CONFIRM"]) {
+      expect(await subject.call("ceo_decision_submit", {
+        idempotencyKey: `peer-${decision}`, runId, decision, candidateSnapshotDigest: DIGEST,
+        ceoSessionId: subject.admitted.sessionId, rationale: "reviewed",
+      }, peerTurn())).toMatchObject({ ok: false, reasonCode: ReasonCode.RUN_TRANSITION_ILLEGAL });
       expect(runState(subject, runId)).toBe("QUEUED");
     }
-    // The owner's OWNER_DECISION_REQUIRED is unchanged: it reaches the same gate.
-    expect(await subject.call("ceo_decision_submit", decision("OWNER_DECISION_REQUIRED", "owner-odr"), provenance()))
-      .toMatchObject({ ok: false, reasonCode: ReasonCode.RUN_TRANSITION_ILLEGAL });
   });
 
   it("refuses a valid peer turn once the CEO binding has moved off the admitted runtime", async () => {
@@ -437,21 +408,16 @@ describe("admitHermesProvenance for a peer turn, as a pure decision", () => {
   const anchor = { liveHermesSessionId: LIVE, lineageRootDigest: DIGEST };
   const call = (tool: string, args: unknown = {}) => ({ tool, arguments: args });
 
-  it("names exactly the four delegable tools", () => {
-    expect([...HERMES_PEER_DELEGABLE_TOOLS].sort())
-      .toEqual(["ceo_decision_submit", "escalation_resolve", "run_create", "run_dispatch"]);
-  });
-
-  it("admits a peer for each delegable tool and answers with the turn it admitted", () => {
-    for (const tool of ["escalation_resolve", "run_create", "run_dispatch"]) {
-      expect(admitHermesProvenance(peerTurn(), anchor, call(tool))).toMatchObject({
-        allowed: true,
-        value: { principal: "peer", peerGrant: PEER_GRANT },
-      });
+  it("admits any tool and arguments with a well-formed peer grant", () => {
+    for (const tool of ["buzz_actor_bind", "arbitrary_tool", "run_cancel", "ceo_decision_submit"]) {
+      for (const args of [{ decision: "OWNER_DECISION_REQUIRED" }, null, [1], undefined]) {
+        expect(admitHermesProvenance(peerTurn(), anchor, call(tool, args))).toMatchObject({
+          allowed: true, value: { principal: "peer", peerGrant: PEER_GRANT },
+        });
+      }
     }
-    for (const decision of ["FINAL_REVISE", "CONFIRM"]) {
-      expect(admitHermesProvenance(peerTurn(), anchor, call("ceo_decision_submit", { decision })).allowed).toBe(true);
-    }
+    expect(admitHermesProvenance(peerTurn(), anchor).allowed).toBe(true);
+    expect(admitHermesProvenance(peerTurn(), null).allowed).toBe(false);
   });
 
   it("answers an owner's turn as the owner's, with no grant, whatever the tool", () => {
@@ -460,17 +426,4 @@ describe("admitHermesProvenance for a peer turn, as a pure decision", () => {
       .toMatchObject({ allowed: true, value: { principal: "owner", peerGrant: null } });
   });
 
-  it("refuses a peer without an anchor, without the call, or outside the fixed set", () => {
-    expect(admitHermesProvenance(peerTurn(), null, call("run_create")).allowed).toBe(false);
-    expect(admitHermesProvenance(peerTurn(), anchor).allowed).toBe(false);
-    for (const tool of ["run_cancel", "run_priority_set", "cto_start", "cto_replace", "repair_execute", "doctor_run", "owner_decision_submit", "run_get"]) {
-      expect(admitHermesProvenance(peerTurn(), anchor, call(tool)).allowed).toBe(false);
-    }
-  });
-
-  it("refuses a peer's ceo_decision_submit for any decision but FINAL_REVISE or CONFIRM", () => {
-    for (const args of [{ decision: "OWNER_DECISION_REQUIRED" }, { decision: "confirm" }, { decision: 1 }, {}, undefined, null, ["CONFIRM"]]) {
-      expect(admitHermesProvenance(peerTurn(), anchor, call("ceo_decision_submit", args)).allowed).toBe(false);
-    }
-  });
 });

@@ -31,8 +31,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
  *                        (`actor_target_bindings.target_locator_digest`, written from the Gateway
  *                        readback or the target-bind receipt), so the two are the same function's
  *                        output by construction, not by a second implementation agreeing.
- *   principal            "owner" | "peer"; any other value is refused. A peer may mutate only as
- *                        `admitPeerTurn` below allows (CEO ad57675b)
+ *   principal            "owner" | "peer"; any other value is refused. Both may call any tool.
  *   cron                 boolean; only `false` may mutate
  *   delegation_depth     integer; 0 is a top-level turn, > 0 a subagent; only 0 may mutate, and a
  *                        missing value is refused rather than read as 0
@@ -70,22 +69,6 @@ export const HERMES_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "continuity_status",
 ]);
 
-/**
- * The tools a peer turn of the CEO binding may call (CEO ad57675b): a fixed set, so a tool added
- * later, and every tool not named here — run_cancel, run_priority_set, cto_*, repair_execute,
- * doctor_run, owner_decision_submit — stays the owner's alone. Hermes narrows this further by its own
- * configured allowlist; neither side's permission alone executes anything.
- */
-export const HERMES_PEER_DELEGABLE_TOOLS: ReadonlySet<string> = new Set([
-  "escalation_resolve",
-  "ceo_decision_submit",
-  "run_create",
-  "run_dispatch",
-]);
-
-/** The decisions a peer turn may submit; OWNER_DECISION_REQUIRED and anything else are the owner's. */
-export const HERMES_PEER_CEO_DECISIONS: ReadonlySet<string> = new Set(["FINAL_REVISE", "CONFIRM"]);
-
 /** The call being admitted: the tool's name and the arguments the SDK parsed for its handler. */
 export interface HermesToolCall {
   tool: string;
@@ -116,28 +99,12 @@ const isRecord = (value: unknown): value is Record<string, unknown> => {
   return !Array.isArray(value);
 };
 
-/**
- * A peer turn's own conditions, asked only after every condition an owner's turn meets has passed.
- *
- * The one argument read anywhere in admission is `ceo_decision_submit`'s `decision`, and only here:
- * it is what the call asks to do, not who is asking, and it can only refuse. `call.arguments` is the
- * object the SDK parsed for the handler, so the decision checked is the decision executed.
- */
+/** A peer turn carries a well-formed grant; tool arguments are left to each tool. */
 const admitPeerTurn = (
   provenance: Record<string, unknown>,
-  call: HermesToolCall | undefined,
 ): Decision<HermesAdmittedTurn> => {
   const peerGrant = provenance["peer_grant"];
   if (!isDigest(peerGrant)) return refuse("a peer's turn carries no well-formed peer_grant digest");
-  if (call === undefined) return refuse("a peer's turn may call only a delegable tool, and this call names none");
-  if (!HERMES_PEER_DELEGABLE_TOOLS.has(call.tool)) return refuse("this tool is not delegable to a peer's turn");
-  if (call.tool === "ceo_decision_submit") {
-    const decision = isRecord(call.arguments) ? call.arguments["decision"] : undefined;
-    if (typeof decision !== "string") return refuse("a peer's ceo_decision_submit names no decision");
-    if (!HERMES_PEER_CEO_DECISIONS.has(decision)) {
-      return refuse("a peer's turn may submit only FINAL_REVISE or CONFIRM");
-    }
-  }
   return allow<HermesAdmittedTurn>(ReasonCode.OK, { principal: "peer", peerGrant });
 };
 
@@ -146,13 +113,12 @@ const admitPeerTurn = (
  *
  * `meta` is the request's `params._meta` exactly as the SDK delivered it; `anchor` is what the
  * connection's admission read from the binding, `null` when there is nothing to compare against;
- * `call` is the tool and its parsed arguments. An owner's turn never needs `call`; a peer's turn
- * without it is refused.
+ * `call` is the tool and its parsed arguments, retained for callers; neither limits admission.
  */
 export const admitHermesProvenance = (
   meta: unknown,
   anchor: HermesProvenanceAnchor | null,
-  call?: HermesToolCall,
+  _call?: HermesToolCall,
 ): Decision<HermesAdmittedTurn> => {
   if (anchor === null) return refuse("this channel's runtime does not hold the live CEO binding");
   if (!isRecord(meta)) return refuse("the call carries no provenance");
@@ -170,6 +136,6 @@ export const admitHermesProvenance = (
   if (provenance["lineage_root_digest"] !== anchor.lineageRootDigest) {
     return refuse("the call's lineage root is not the bound lineage");
   }
-  if (provenance["principal"] === "peer") return admitPeerTurn(provenance, call);
+  if (provenance["principal"] === "peer") return admitPeerTurn(provenance);
   return allow<HermesAdmittedTurn>(ReasonCode.OK, { principal: "owner", peerGrant: null });
 };

@@ -791,7 +791,7 @@ describe("a merge needs a live claim (§24.3, CP-HI-01)", () => {
     expect(fixture.github.pulls).toHaveLength(0);
   });
 
-  it("refuses a merge once the claim has expired", async () => {
+  it("renews the owner's own expired claim after CONFIRM instead of refusing the merge", async () => {
     const fixture = await setup();
     const published = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
     if (!published.allowed) throw new Error(published.message);
@@ -800,6 +800,36 @@ describe("a merge needs a live claim (§24.3, CP-HI-01)", () => {
     fixture.harness.cp.db.run(
       `UPDATE resource_claims SET expires_at = '2020-01-01T00:00:00.000Z' WHERE run_id = ?`,
       [fixture.runId],
+    );
+
+    const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(merged.reasonCode).not.toBe(ReasonCode.MERGE_CLAIM_INVALID);
+    expect(fixture.harness.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'CLAIM_RENEWED_FOR_FINALIZATION' AND run_id = ?`,
+      [fixture.runId],
+    )!.n).toBeGreaterThanOrEqual(1);
+  });
+
+  it("still refuses a merge when another run holds the branch", async () => {
+    const fixture = await setup();
+    const published = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
+    if (!published.allowed) throw new Error(published.message);
+    const pullNumber = await openPull(fixture);
+
+    fixture.harness.cp.db.run(
+      `UPDATE resource_claims SET expires_at = '2020-01-01T00:00:00.000Z' WHERE run_id = ?`,
+      [fixture.runId],
+    );
+    // Sweep the lapsed row, then let a different holder take the branch.
+    fixture.harness.cp.db.run(`UPDATE resource_claims SET status = 'EXPIRED' WHERE run_id = ?`, [fixture.runId]);
+    const other = fixture.harness.cp.db.get<{ run_id: string }>(`SELECT run_id FROM runs WHERE run_id != ? LIMIT 1`, [fixture.runId]);
+    const otherRunId = other?.run_id ?? fixture.runId;
+    const row = fixture.harness.cp.db.get<{ branch: string; owner_session_id: string }>(
+      `SELECT branch, owner_session_id FROM resource_claims WHERE run_id = ? AND branch IS NOT NULL LIMIT 1`, [fixture.runId])!;
+    fixture.harness.cp.db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id, owner_session_id, owner_binding_generation, acquired_at, expires_at, status)
+       VALUES ('claim_other_holder', ?, ?, ?, ?, 999, '2030-01-01T00:00:00.000Z', '2031-01-01T00:00:00.000Z', 'HELD')`,
+      [fixture.identity, row.branch, otherRunId, row.owner_session_id],
     );
 
     const refused = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
