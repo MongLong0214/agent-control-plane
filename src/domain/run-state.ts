@@ -40,7 +40,7 @@ const TRANSITIONS: Readonly<Record<RunState, readonly RunState[]>> = {
     RunState.COMPLETED,
     RunState.BLOCKED_POST_MERGE,
   ],
-  [RunState.BLOCKED_POST_MERGE]: [],
+  [RunState.BLOCKED_POST_MERGE]: [RunState.POST_MERGE_VERIFYING],
   [RunState.REVISION_REQUIRED]: [RunState.ACTIVE, RunState.FAILED, RunState.CANCELLED],
   [RunState.AWAITING_HUMAN]: [RunState.ACTIVE, RunState.CANCELLED, RunState.FAILED],
   [RunState.COMPLETED]: [],
@@ -72,7 +72,7 @@ export const canTransition = (from: RunState, to: RunState, kind?: RunKind): Dec
   if (from === to) {
     return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is already ${to}`, { from, to });
   }
-  if (isTerminal(from)) {
+  if (isTerminal(from) && !(from === RunState.BLOCKED_POST_MERGE && to === RunState.POST_MERGE_VERIFYING)) {
     return deny(ReasonCode.RUN_ALREADY_TERMINAL, `run is terminal in ${from}`, { from, to });
   }
   // A bootstrap activation has no repository merge to perform. Its CEO-confirmed activation

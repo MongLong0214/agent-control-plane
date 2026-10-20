@@ -32,7 +32,7 @@ export const RECEIPT_BYTES_SHA256 =
   "aa90c6af77754fce9861cb4f57501879c24f66f5616cf46225c5375adfd2a19d";
 
 /**
- * `src/db/migrations.ts`, its historical schema snapshots (v37, v44, v45, v46, v47 and v48), and
+ * `src/db/migrations.ts`, its historical schema snapshots (v37, v44, v45, v46, v47, v48 and v49), and
  * `tests/fixtures/schema-v25-lineage.sql` are append-only, frozen inputs: pinning their exact
  * bytes here means a coordinated edit changes the value a reader compares against, not merely
  * the file being read. These digests are not recomputed from the files they describe: a pin a run
@@ -56,7 +56,7 @@ export const RECEIPT_BYTES_SHA256 =
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
   {
     path: "src/db/migrations.ts",
-    sha256: "343465d5f6bf50116a60c3b13a96c1ad1f9bd2ad775382429d31387a57e36595",
+    sha256: "2ccb2d2b6e7e9e4ade791f90b9c5720afb6e33d45cd63652a8351e8ec345660b",
   },
   {
     path: "src/db/schema-v37.sql",
@@ -84,6 +84,11 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     path: "src/db/schema-v48.sql",
     sha256: "eb0b3b5b7b50e665a3ae2518af470a80bc2d6b8116133f5e248dd9fa9606a753",
     gitBlob: "29f2a057a7892cb60292880a26bce747a5e32826",
+  },
+  {
+    path: "src/db/schema-v49.sql",
+    sha256: "945685a38f7413f01944d3e09171a6b722de4bb618a783f604de1f484de00684",
+    gitBlob: "fa96bf02b980c8d7f1e81851ad2223a2cfea2cbb",
   },
   {
     path: "tests/fixtures/schema-v13.sql",

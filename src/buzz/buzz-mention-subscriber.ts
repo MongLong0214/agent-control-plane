@@ -1178,7 +1178,15 @@ const rejected = (why: BuzzMentionRejection): BuzzMentionFrameOutcome => ({
   admission: null,
 });
 
+/** Metadata only: the daemon can journal a verified event refused before reaching its sink. */
+export type BuzzEventRefusalReporter = (refusal: {
+  author: string;
+  eventId: string;
+  reasonCode: string;
+}) => void;
+
 interface SubscriptionDeps {
+  readonly reportEventRefusal?: BuzzEventRefusalReporter;
   readonly relayUrl: string;
   readonly sink: BuzzMentionSink;
   readonly registry: BuzzMentionRegistry;
@@ -1917,7 +1925,11 @@ class BuzzMentionSubscription {
     // copy this module built, and before anything reads a field for meaning.
     if (!validateEvent(event)) return rejected("event-malformed");
     if (!verifyEvent(event)) return rejected("event-signature-invalid");
-    if (event.kind !== BUZZ_MENTION_KIND) return rejected("event-wrong-kind");
+    const refuseEvent = (reasonCode: BuzzMentionRejection): BuzzMentionFrameOutcome => {
+      this.#deps.reportEventRefusal?.({ author: event.pubkey, eventId: event.id, reasonCode });
+      return rejected(reasonCode);
+    };
+    if (event.kind !== BUZZ_MENTION_KIND) return refuseEvent("event-wrong-kind");
     // Exactly one `p`, and it is this identity. The `p` filter is the relay's promise; this is the
     // daemon checking it, and a relay that widened the filter would otherwise hand this subscriber
     // someone else's mail to speak for.
@@ -1931,7 +1943,7 @@ class BuzzMentionSubscription {
     // tag is a duplicate of this identity.
     const recipients = tagValues(event, "p");
     if (recipients.length !== 1 || recipients[0] !== this.#pubkey) {
-      return rejected("event-not-addressed");
+      return refuseEvent("event-not-addressed");
     }
     // Exactly one `h`, non-empty. The `h` tag is the Buzz room, and the room is what the answer
     // goes back to: none means there is no thread to answer, and two means picking one — which is
@@ -1946,7 +1958,7 @@ class BuzzMentionSubscription {
     const rooms = tagValues(event, "h");
     const conversation = rooms.length === 1 ? rooms[0] : undefined;
     if (conversation === undefined || conversation.trim().length === 0) {
-      return rejected("event-conversation-unusable");
+      return refuseEvent("event-conversation-unusable");
     }
 
     // Re-judged here, immediately before delivery, not only at startup. The role can move between
@@ -1966,7 +1978,7 @@ class BuzzMentionSubscription {
       if (this.#isCurrent(generation)) {
         this.exclude(fresh.verdict === "EXCLUDED" ? fresh.reason : BuzzMentionExclusion.ROLE_NOT_HELD, false);
       }
-      return rejected("role-not-held");
+      return refuseEvent("role-not-held");
     }
     // The run ends here and only here: the binding answered, so whatever it was, it was a race.
     this.#roleNotHeldRun = 0;
@@ -1981,7 +1993,7 @@ class BuzzMentionSubscription {
     // Exactly the stored room, and one this identity subscribes in. The room tag's cardinality was
     // checked above (none and several are refused); this is its value, against the binding just
     // judged rather than against the relay's filter or the `p` tag.
-    if (conversation !== bound.room || !this.#rooms.includes(conversation)) return rejected("event-room-not-bound");
+    if (conversation !== bound.room || !this.#rooms.includes(conversation)) return refuseEvent("event-room-not-bound");
 
     // An event the seam already refused as preceding this role's binding is not submitted again.
     // The refusal is permanent for the role — a later binding generation is created later, so it
@@ -1990,7 +2002,7 @@ class BuzzMentionSubscription {
     const refusedBefore = this.#notDelivered.get(event.id);
     if (refusedBefore !== undefined && refusedBefore.roleKey === bound.roleKey) {
       refusedBefore.redeliveriesNotResubmitted += 1;
-      return rejected("precedes-binding-not-resubmitted");
+      return refuseEvent("precedes-binding-not-resubmitted");
     }
 
     const frozen: BuzzMentionEvent = deepFreeze(event);
@@ -2271,6 +2283,7 @@ const DISABLED: BuzzMentionSubscriberHandle = {
 };
 
 export interface BuzzMentionSubscriberOptions {
+  readonly reportEventRefusal?: BuzzEventRefusalReporter;
   readonly config: BuzzSubscriberConfig;
   readonly registry: BuzzMentionRegistry;
   readonly sink: BuzzMentionSink;
@@ -2343,6 +2356,7 @@ export const startBuzzMentionSubscriber = (
   };
 
   const deps: SubscriptionDeps = {
+    ...(options.reportEventRefusal ? { reportEventRefusal: options.reportEventRefusal } : {}),
     relayUrl: options.config.relayUrl,
     sink: options.sink,
     registry: options.registry,

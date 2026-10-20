@@ -610,6 +610,16 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
     await bindByChallenge(f);
   });
 
+  it("lets a peer turn call the real buzz_actor_bind tool", async () => {
+    const f = await startBindFixture();
+    const result = await f.callBind({ actor: f.ceo.pubkey }, {
+      [HERMES_PROVENANCE_META_KEY]: {
+        ...OWNER_TURN[HERMES_PROVENANCE_META_KEY], principal: "peer", peer_grant: `sha256:${"c".repeat(64)}`,
+      },
+    });
+    expect(result.result?.structuredContent).toMatchObject({ ok: true });
+  });
+
   it("mints a challenge only for the admitted CEO connection's own owner turn", async () => {
     const f = await startBindFixture();
     const before = f.h.cp.db.all(`SELECT * FROM sessions ORDER BY session_id`);
@@ -824,7 +834,7 @@ describe("the re-adopted CEO recovers its own key from a terminal earlier CEO se
     const before = rowOf(f, earlier.sessionId());
     expect(before).toMatchObject({ buzz_actor_id: f.ceo.pubkey, lifecycle: "ERROR" });
     expect(f.ceoIdentity()).toBeNull();
-    // The window the peer rule then reads starts at the recovery, not at the generation's start.
+    // Recovery changes the runtime binding, without setting a peer-message time floor.
     f.h.clock.advance(120_000);
 
     const token = await f.mint();
@@ -850,16 +860,15 @@ describe("the re-adopted CEO recovers its own key from a terminal earlier CEO se
       channelIdentityReused: false,
     });
 
-    // Signed before the recovery, inside the generation: not this CEO's for certain, so refused.
+    // Signed before the recovery: the CEO identity still admits the message.
     const stale = f.mention(f.ceo, "복구 전에 서명됨", f.nowSeconds() - 60);
     await f.relayDelivers(stale);
-    expect(f.refusedWith(ReasonCode.BUZZ_PEER_EVENT_OUTSIDE_GENERATION)).toBe(1);
-    expect(f.inbound(stale.id)).toBeUndefined();
+    expect(f.inbound(stale.id)).toBeDefined();
 
     const after = f.mention(f.ceo, "CTO, 이 작업을 맡아 주세요", f.nowSeconds() + 1);
     await f.relayDelivers(after);
     expect(f.inbound(after.id)).toBeDefined();
-    expect(f.peerRows()).toHaveLength(1);
+    expect(f.peerRows()).toHaveLength(2);
   });
 
   it("refuses the key while another session holding it is live, and when a terminal holder is not of the CEO lineage", async () => {
@@ -1027,30 +1036,6 @@ describe("review ceobuzz-r1: the recovery boundary and the recovery record", () 
     }
   };
 
-  it("ceobuzz-r1-01: refuses a mention signed before the recovery in the recovery's own second", async () => {
-    const f = await startBindFixture({ history: earlierCeos(1) });
-    f.h.clock.advance(120_100);
-    const signedBefore = f.h.clock.nowIso();
-    const stale = f.mention(f.ceo, "signed before key recovery in this same second");
-    const token = await f.mint();
-    f.h.clock.advance(400);
-    await f.relayDelivers(f.mention(f.ceo, `recover identity: ${token}`));
-    expect(f.ceoIdentity()).toBe(f.ceo.pubkey);
-    const recovery = f.h.cp.sessions.buzzActorRecovery(f.ceoSessionId, f.ceo.pubkey)!;
-    expect(Date.parse(signedBefore)).toBeLessThan(Date.parse(recovery.at));
-    expect(stale.created_at * 1000).toBeLessThan(Date.parse(recovery.at));
-
-    await f.relayDelivers(stale);
-    expect(f.inbound(stale.id)).toBeUndefined();
-    expect(f.refusedWith(ReasonCode.BUZZ_PEER_EVENT_OUTSIDE_GENERATION)).toBe(1);
-
-    // Control: the CEO's next mention, signed in a later second, is a peer.
-    const fresh = f.mention(f.ceo, "fresh peer mention after recovery", f.nowSeconds() + 1);
-    await f.relayDelivers(fresh);
-    expect(f.inbound(fresh.id)).toBeDefined();
-    expect(f.peerRows()).toHaveLength(1);
-  });
-
   it("ceobuzz-r1-01 Limit (accepted, CEO 1791634542): admits a mention an earlier generation signed before the recovery and dated after it", async () => {
     // LIMIT, not a guarantee. `created_at` is the signer's own claim, so no boundary the daemon
     // fixes can say when an event was signed: an event the previous CEO generation signed with the
@@ -1087,7 +1072,7 @@ describe("review ceobuzz-r1: the recovery boundary and the recovery record", () 
     expect(f.peerRows()).toHaveLength(1);
   });
 
-  it("counts a recovered key's events from the verified answer's signed time, and refuses an answer dated beyond the signing skew", async () => {
+  it("refuses a binding answer beyond signing skew while ordinary peer messages have no recovery floor", async () => {
     const f = await startBindFixture({ history: earlierCeos(1) });
     f.h.clock.advance(120_000);
     const token = await f.mint();
@@ -1106,15 +1091,14 @@ describe("review ceobuzz-r1: the recovery boundary and the recovery record", () 
 
     const before = f.mention(f.ceo, "dated before the answer", f.nowSeconds() + 1);
     await f.relayDelivers(before);
-    expect(f.inbound(before.id)).toBeUndefined();
+    expect(f.inbound(before.id)).toBeDefined();
     const atAnswer = f.mention(f.ceo, "dated in the answer's own second", answeredAt);
     await f.relayDelivers(atAnswer);
-    expect(f.inbound(atAnswer.id)).toBeUndefined();
-    expect(f.refusedWith(ReasonCode.BUZZ_PEER_EVENT_OUTSIDE_GENERATION)).toBe(2);
+    expect(f.inbound(atAnswer.id)).toBeDefined();
     const after = f.mention(f.ceo, "dated after the answer", answeredAt + 1);
     await f.relayDelivers(after);
     expect(f.inbound(after.id)).toBeDefined();
-    expect(f.peerRows()).toHaveLength(1);
+    expect(f.peerRows()).toHaveLength(3);
   });
 
   it("ceobuzz-r1-02: records every one of 201 earlier holders and admits the next mention", async () => {
@@ -1136,37 +1120,6 @@ describe("review ceobuzz-r1: the recovery boundary and the recovery record", () 
     await f.relayDelivers(fresh);
     expect(f.inbound(fresh.id)).toBeDefined();
     expect(f.peerRows()).toHaveLength(1);
-  });
-
-  it("refuses the recovered key as a peer once an earlier holder the recovery record does not name appears", async () => {
-    let unnamed = "";
-    const f = await startBindFixture({ history: (h, key) => {
-      earlierCeos(1)(h, key);
-      // A second earlier CEO generation that never carried the key.
-      const other = h.cp.sessions.create({ provider: "hermes", model: "earlier-ceo" });
-      unnamed = other.sessionId;
-      expect(h.cp.sessions.transition(other.sessionId, SessionLifecycle.READY).allowed).toBe(true);
-      expect(h.cp.bindings.bind({ role: Role.CEO, sessionId: other.sessionId }).allowed).toBe(true);
-      expect(h.cp.bindings.revoke(CEO, "official re-adoption").allowed).toBe(true);
-      expect(h.cp.sessions.transition(other.sessionId, SessionLifecycle.ERROR).allowed).toBe(true);
-    } });
-    f.h.clock.advance(120_000);
-    const token = await f.mint();
-    await f.relayDelivers(f.mention(f.ceo, `recover identity: ${token}`));
-    expect(f.ceoIdentity()).toBe(f.ceo.pubkey);
-    expect(buzzPeerRegistry(f.h.cp).currentCeo()).toMatchObject({ channelIdentityReused: false });
-
-    // No registry path gives a terminal row the key while the CEO's live row holds it, so the
-    // unnamed holder is written the way a raw database writer would: the schema permits NULL to a
-    // key on a terminal row.
-    f.h.cp.db.run(`UPDATE sessions SET buzz_actor_id = ? WHERE session_id = ?`, [f.ceo.pubkey, unnamed]);
-    expect(f.h.cp.sessions.buzzActorHolders(f.ceo.pubkey, f.ceoSessionId).history).toHaveLength(2);
-    expect(buzzPeerRegistry(f.h.cp).currentCeo()).toMatchObject({ channelIdentityReused: true });
-
-    const mention = f.mention(f.ceo, "after an unnamed holder appeared", f.nowSeconds() + 1);
-    await f.relayDelivers(mention);
-    expect(f.inbound(mention.id)).toBeUndefined();
-    expect(f.refusedWith(ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS)).toBe(1);
   });
 
   it("refuses the recovery, with nothing written, when its record does not persist as written", async () => {

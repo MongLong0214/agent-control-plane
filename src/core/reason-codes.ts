@@ -537,29 +537,9 @@ export const ReasonCode = {
    * generation, the CEO runtime, and the receiving PRIMARY_CTO's generation and session. It is
    * compared against the registry immediately before the admission's first write, and anything
    * else — a proof from before a rotation, or none at all — is refused there, before the replay
-   * slot is spent. Distinct from `BUZZ_PEER_EVENT_OUTSIDE_GENERATION`, which is about the event's
-   * own signed time rather than what it was bound to.
+   * slot is spent.
    */
   BUZZ_PEER_GENERATION_STALE: "BUZZ_PEER_GENERATION_STALE",
-  /**
-   * #1038 — the event was signed outside the current CEO generation's window.
-   *
-   * A Buzz channel identity can be reused across generations, and an event the previous
-   * generation signed still verifies under the same key. Its signed `created_at` is the one fact
-   * that places it, so an event dated before the current CEO binding was created — or further in
-   * the future than clock skew explains — is not this generation's.
-   */
-  BUZZ_PEER_EVENT_OUTSIDE_GENERATION: "BUZZ_PEER_EVENT_OUTSIDE_GENERATION",
-  /**
-   * #1044 — the CEO's Buzz channel identity is not this CEO generation's alone.
-   *
-   * Another runtime carries or carried it, or this runtime carried it while serving an earlier CEO
-   * generation. An event signed with it may then be an earlier holder's, the signature cannot say,
-   * and `created_at` is the signer's own claim — so every event signed with that identity is
-   * refused, whatever it says about itself. Distinct from `BUZZ_PEER_GENERATION_STALE`: nothing here is out of date and
-   * re-deriving changes nothing; the remedy is a fresh identity for the generation.
-   */
-  BUZZ_PEER_ORIGIN_AMBIGUOUS: "BUZZ_PEER_ORIGIN_AMBIGUOUS",
   /**
    * #1038 — a CEO-authored envelope that does not address exactly one bound PRIMARY_CTO.
    *

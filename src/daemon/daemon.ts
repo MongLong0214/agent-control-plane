@@ -2284,7 +2284,7 @@ export class Daemon {
   /** Recover CEO-approved work after the durable lease and GitHub receipt reconciliations. */
   private async resumeApprovedRuns(): Promise<string[]> {
     const resumed: string[] = [];
-    const states = [RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING];
+    const states = [RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE];
     for (const state of states) {
       for (const run of this.cp.runs.list({ state })) {
         const finalized = await this.finalizeApprovedRun(run.runId);

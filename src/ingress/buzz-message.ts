@@ -69,9 +69,8 @@ export interface BuzzMessageIngressInput {
    * The relay event's own signed `created_at`, in seconds.
    *
    * Inside the signature only beside `peer` (#1038), because it is the one fact that places a
-   * CEO-authored event inside or outside the current CEO generation when that generation reuses the
-   * previous one's Buzz channel identity. An owner's payload keeps the shape every recorded digest
-   * was taken over, so there it travels beside the signature.
+   * CEO-authored event within the future-skew sanity bound. An owner's payload keeps the shape
+   * every recorded digest was taken over, so there it travels beside the signature.
    *
    * The daemon's own subscriber always sets it, from an event whose Nostr signature it verified, and
    * a role-addressed admission refuses an event signed before the addressed role's binding generation
@@ -87,30 +86,10 @@ export interface BuzzMessageIngressInput {
   peer?: BuzzPeerBinding;
 }
 
-/**
- * What a CEO-authored event is bound to, from receipt to dispatch (#1038, #1044).
- *
- * The three necessary conditions — the author is the current CEO binding's Buzz channel identity,
- * it addresses exactly the bound PRIMARY_CTO, it arrived on that project's channel — are not a
- * generation proof: a reused pubkey signs an earlier generation's events just as validly. So:
- *
- *   - the subscriber reads this binding off the registry **when the frame arrives**, before the
- *     frame waits in its queue, and carries it with the frame (`BuzzMentionAdmissionRequest`);
- *   - the sink presents that receipt as the envelope's proof and never builds a fresh one, so a
- *     frame that waited across a rotation is not re-attributed to the generation it was processed
- *     under;
- *   - the proof is inside the signed payload, so it is in the replay record and the outbox
- *     pointer's digest, and admission compares it with the registry immediately before its first
- *     write;
- *   - and the hand-over compares it again before the hand-over's first write.
- *
- * None of that can say which generation *signed* an event when two generations held the same key:
- * `created_at` is the signer's own claim. So a key carried by more than one runtime or generation
- * is refused outright (`BUZZ_PEER_ORIGIN_AMBIGUOUS`); see `BuzzPeerRegistry.currentCeo`.
- */
+/** The receipt records the sender's CEO context and the exact receiving CTO. */
 export interface BuzzPeerBinding {
   readonly ceoBindingGeneration: number;
-  /** The CEO binding's live runtime whose `buzz_actor_id` signed the event. */
+  /** The CEO binding's live runtime at receipt; its identity may come from an earlier binding. */
   readonly ceoSessionId: string;
   readonly ctoRoleKey: string;
   readonly ctoBindingGeneration: number;
@@ -122,48 +101,18 @@ export interface BuzzPeerBinding {
 export interface BuzzPeerCurrentCeo {
   readonly bindingGeneration: number;
   readonly sessionId: string;
-  /**
-   * That runtime's `sessions.buzz_actor_id`, or null when it is not READY/DRAINING or carries
-   * none. Null is the live state on 2026-10-02 and it refuses every CEO mention: nothing here
-   * binds one, and #1037 is what issues the credential that lets `bindActor` do it.
-   */
+  /** Live runtime identity, or the latest non-null identity from a CEO binding's session. */
   readonly channelIdentity: string | null;
-  /** When this generation's assignment was created. */
   readonly generationStartedAt: string;
-  /**
-   * For an identity this runtime recovered past terminal earlier CEO rows by proving possession
-   * (CEO 1791632040), the boundary its events count from: the latest of `generationStartedAt`, the
-   * recovery's audit time and the verified challenge answer's signed time (CEO 1791634542). Null for
-   * any other identity. An event must be dated in a whole second strictly after the boundary's
-   * second; the boundary's own second is refused, never floored (review ceobuzz-r1-01).
-   *
-   * This bounds what an event *claims*, not when it was signed: `created_at` is the signer's own
-   * value. An event the earlier generation signed before the recovery, dated after the boundary and
-   * held back, is admitted — the accepted Limit. Closing it needs a recovery-specific value inside
-   * the event, which this rule does not ask for.
-   */
+  /** Retained for receipt compatibility; peer admission has no recovery boundary. */
   readonly recoveryBoundary: string | null;
-  /**
-   * Whether that identity is anything but this generation's alone (#1044): another session row —
-   * of any lifecycle — carries it, or this runtime carried it while serving an earlier CEO
-   * generation. Either way an event signed with it may be an earlier holder's, and nothing in the
-   * event can say which, so every event signed with it is refused. A fresh identity per CEO
-   * generation is one remedy; the other is the possession-proven recovery (CEO 1791632040), after
-   * which terminal earlier CEO rows the recovery's record names exactly are history, not reuse, and
-   * `recoveryBoundary` applies. A live second holder, or any other row, is still reuse.
-   *
-   * It is the identity's history, not the runtime's: a runtime that served an earlier generation
-   * with no identity and took this one only afterwards holds an identity no earlier generation used.
-   * The order of events is read from the audit record's `event_id` and the generation each binding
-   * record names — never from timestamps, which tie when a move and the next binding share a clock
-   * reading.
-   */
+  /** Retained for receipt compatibility; shared identities do not block peer admission. */
   readonly channelIdentityReused: boolean;
 }
 
 /**
  * The registry facts the peer rule reads. Supplied by the daemon, and reads only: nothing the peer
- * rule asks may write, because every refusal it makes must leave the database untouched.
+ * rule asks may write. The daemon journals CEO refusals outside this read-only rule.
  */
 export interface BuzzPeerRegistry {
   /** The ACTIVE CEO binding and its live runtime, or null when there is no CEO binding. */
@@ -182,15 +131,7 @@ export interface BuzzPeerRegistry {
   nowMs(): number;
 }
 
-/**
- * How far past the daemon's clock a CEO-authored event may be dated.
- *
- * The window is a check on the current runtime's own clock, not provenance: the signer chooses
- * `created_at`, so the window cannot tell one holder of a key from another and is not asked to.
- * Reused identities are refused before it is reached (`channelIdentityReused`). What it still
- * refuses is an exclusive identity's event dated before its generation began or implausibly far
- * ahead.
- */
+/** Sanity bound on how far a CEO-authored event may be dated ahead of the daemon's clock. */
 export const BUZZ_PEER_FUTURE_SKEW_SECONDS = 60;
 
 /**
@@ -202,8 +143,7 @@ export const BUZZ_PEER_FUTURE_SKEW_SECONDS = 60;
  * milliseconds refused every event signed in the second the generation began, after the start as
  * well as before it. Truncating admits the fraction of that second before the start.
  *
- * One definition for both floors this path applies: the CEO generation a peer event must be signed
- * inside (rule 5 of the peer rule), and the binding generation of the role a mention addresses.
+ * This floor applies to the receiving role binding, independently of the CEO generation.
  */
 const signedSince = (signedAt: unknown, startedAt: string): number | null => {
   const startedAtSeconds = Math.floor(Date.parse(startedAt) / 1000);
@@ -213,18 +153,6 @@ const signedSince = (signedAt: unknown, startedAt: string): number | null => {
     signedAt >= startedAtSeconds
     ? signedAt
     : null;
-};
-
-/**
- * Whether a signed time is in a whole second strictly after a boundary's second, or there is no
- * boundary. The boundary's own second is ambiguous — `created_at` cannot say which side of the
- * boundary's fraction it was signed on — so it is refused rather than floored (review ceobuzz-r1-01).
- * A boundary that does not parse refuses.
- */
-const signedAfterBoundarySecond = (signedAt: number, boundary: string | null): boolean => {
-  if (boundary === null) return true;
-  const boundarySecond = Math.floor(Date.parse(boundary) / 1000);
-  return Number.isFinite(boundarySecond) && signedAt > boundarySecond;
 };
 
 const sameChannelIdentity = (a: string, b: string): boolean => {
@@ -238,8 +166,6 @@ const samePeerBinding = (presented: unknown, current: BuzzPeerBinding): boolean 
   const fields = presented as Record<string, unknown>;
   return (
     Object.keys(fields).length === 5 &&
-    fields["ceoBindingGeneration"] === current.ceoBindingGeneration &&
-    fields["ceoSessionId"] === current.ceoSessionId &&
     fields["ctoRoleKey"] === current.ctoRoleKey &&
     fields["ctoBindingGeneration"] === current.ctoBindingGeneration &&
     fields["ctoSessionId"] === current.ctoSessionId
@@ -271,24 +197,9 @@ export interface PeerProofCto {
 const noSuccessor = (): boolean => false;
 
 /**
- * Whether a queued peer message may still be handed to this holder (#1044) — the hand-over's
- * question, asked before the hand-over writes anything.
- *
- * Every identity the admission was decided on is asked again, against the registry as it stands
- * now: the CEO binding generation **and** its live runtime, that runtime's Buzz channel identity —
- * still the one that signed, still not reused — exactly this receiving CTO, and that CTO's project
- * channel, which must still be the room the event arrived on. A CEO runtime move keeps the
- * generation, so the generation alone would hand a departed runtime's instruction over; a CTO whose
- * channel changed is no longer the recipient admission found on that room.
- *
- * The CTO half is compared field by field with the holder rather than trusted from the outbox row:
- * a row's addressing columns are the outbox's, while the proof is what admission signed.
- *
- * One holder besides the proof's own is accepted (2026-10-03): the same canonical conversation
- * restarted once, which the self-claim's dead-predecessor recovery carried the row to. The proof is
- * not rewritten to name it; `successorOf` establishes it from that carry's record alone
- * (`selfClaimCarriedTo`, ACP-PEER-SUCCESSION-01), one hop only, and every CEO and room clause above
- * is asked of it unchanged.
+ * Recheck the CEO author's identity, the receiving CTO holder and its channel before hand-over.
+ * CEO generations and runtime moves do not invalidate a message. A CTO successor still needs
+ * the existing one-hop canonical carry record, and the CTO proof is never rewritten.
  */
 export const peerProofIsCurrent = (
   source: AdmittedPeerSource | undefined,
@@ -304,15 +215,13 @@ export const peerProofIsCurrent = (
    */
   successorOf: (proofCto: PeerProofCto) => boolean = noSuccessor,
 ): boolean => {
-  if (!source || !ceo || ceo.channelIdentityReused) return false;
+  if (!source || !ceo) return false;
   const stored = source.proof;
   if (!stored || typeof stored !== "object" || Array.isArray(stored)) return false;
   const proof = stored as Record<string, unknown>;
   const ctoGeneration = proof["ctoBindingGeneration"];
   const ctoSession = proof["ctoSessionId"];
   return (
-    proof["ceoBindingGeneration"] === ceo.bindingGeneration &&
-    proof["ceoSessionId"] === ceo.sessionId &&
     ceo.channelIdentity !== null &&
     sameChannelIdentity(ceo.channelIdentity, source.author) &&
     proof["ctoRoleKey"] === holder.roleKey &&
@@ -667,7 +576,7 @@ export class BuzzMessageIngress {
    *
    * Reads only. The sink asks it only to decide whether an envelope is a peer's at all — the proof
    * it then presents is the subscriber's receipt, never this answer (#1044) — and `admit` asks it
-   * again immediately before its first write and compares the receipt with what it says.
+   * again immediately before its first write and compares the receipt's CTO holder.
    */
   observePeer(input: BuzzMessageIngressInput): Decision<BuzzPeerBinding> {
     return this.#peerBinding(input);
@@ -679,12 +588,11 @@ export class BuzzMessageIngress {
    *
    *   1. the author is the current CEO binding's Buzz channel identity — a NULL identity, no CEO
    *      binding, or anyone else is not a peer at all, and is refused as a non-owner;
-   *   2. that identity is this generation's alone — a reused one is refused (#1044);
-   *   3. it addresses exactly the bound PRIMARY_CTO — never the owner's CEO conversation;
-   *   4. it arrived on that CTO's project channel;
-   *   5. its signed time falls inside the current CEO generation, to the second.
+   *   2. it addresses exactly the bound PRIMARY_CTO — never the owner's CEO conversation;
+   *   3. it arrived on that CTO's project channel;
+   *   4. its signed time does not exceed the future-skew sanity bound.
    *
-   * Whether the envelope carries the matching generation proof is `#admitPeer`'s question, asked
+   * Whether the envelope carries the matching CTO receipt is `#admitPeer`'s question, asked
    * after these, so a refusal names the first of these that failed rather than "no proof".
    */
   #peerBinding(input: BuzzMessageIngressInput): Decision<BuzzPeerBinding> {
@@ -701,14 +609,6 @@ export class BuzzMessageIngress {
         "buzz message ingress delivers only messages from a declared buzz owner identity or, as a " +
           "peer, from the Buzz channel identity of the current CEO binding",
         { channel: "buzz", actor: input.actor },
-      );
-    }
-    if (ceo.channelIdentityReused) {
-      return deny(
-        ReasonCode.BUZZ_PEER_ORIGIN_AMBIGUOUS,
-        "the CEO's Buzz channel identity was carried by another runtime or generation, so no event " +
-          "signed with it can be attributed to the current CEO generation",
-        { channel: "buzz", ceoBindingGeneration: ceo.bindingGeneration },
       );
     }
     const mention = typeof input.mention === "string" ? input.mention.trim() : "";
@@ -730,20 +630,16 @@ export class BuzzMessageIngress {
         { channel: "buzz", roleKey: cto.roleKey },
       );
     }
-    // In whole seconds (`signedSince`). Truncating admits the fraction of the start second before
-    // the start, and only for an identity no earlier generation held — so it reopens nothing for an
-    // earlier generation. A recovered identity, which an earlier generation did hold, must instead
-    // be dated after its boundary's whole second (`recoveryBoundary`), which refuses that second.
-    const signedAt = signedSince(input.createdAt, ceo.generationStartedAt);
+    // The signed time is only a sanity check, independent of CEO rotations.
     if (
-      signedAt === null ||
-      !signedAfterBoundarySecond(signedAt, ceo.recoveryBoundary) ||
-      signedAt * 1000 > peers.nowMs() + BUZZ_PEER_FUTURE_SKEW_SECONDS * 1000
+      typeof input.createdAt !== "number" ||
+      !Number.isSafeInteger(input.createdAt) ||
+      input.createdAt * 1000 > peers.nowMs() + BUZZ_PEER_FUTURE_SKEW_SECONDS * 1000
     ) {
       return deny(
-        ReasonCode.BUZZ_PEER_EVENT_OUTSIDE_GENERATION,
-        "the event was not signed inside the current CEO generation",
-        { channel: "buzz", ceoBindingGeneration: ceo.bindingGeneration },
+        ReasonCode.INVALID_ARGUMENT,
+        "the peer event has an invalid signed time or exceeds the future-skew bound",
+        { channel: "buzz" },
       );
     }
     return allow(ReasonCode.OK, {
@@ -843,15 +739,11 @@ export class BuzzMessageIngress {
       // rule resolves its own address by reading alone, and journals nothing.
       return current as Decision<AdmittedBuzzMessage>;
     }
-    // The proof the event was bound to at receipt, against the registry now. Anything but an exact
-    // match — an earlier generation, another CEO runtime, a CTO that has since moved, or no proof
-    // at all — is a stale proof, and is refused here rather than re-bound: re-binding is exactly
-    // what would let an event signed under a reused key be read as the current generation's, and
-    // an envelope with no proof is never read as the owner's instead.
+    // Keep the receipt's CTO holder fence across dispatch; CEO rotations do not change it.
     if (!samePeerBinding(input.peer, current.value)) {
       return deny(
         ReasonCode.BUZZ_PEER_GENERATION_STALE,
-        "the envelope was bound to a CEO generation or CTO session that is no longer current",
+        "the envelope was bound to a CTO session that is no longer current",
         {
           channel: "buzz",
           ceoBindingGeneration: current.value.ceoBindingGeneration,

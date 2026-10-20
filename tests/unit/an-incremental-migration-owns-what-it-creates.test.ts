@@ -386,6 +386,7 @@ describe("#762 the sealed trace refuses the ways it could quietly stop being tru
       "src/db/schema-v46.sql",
       "src/db/schema-v47.sql",
       "src/db/schema-v48.sql",
+      "src/db/schema-v49.sql",
       "tests/fixtures/schema-v13.sql",
       "tests/fixtures/schema-v25-lineage.sql",
       "tests/fixtures/v25-lineage-receipts.json",
