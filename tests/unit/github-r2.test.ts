@@ -436,7 +436,7 @@ describe("round-two GitHub hardening", () => {
     });
   });
 
-  it("handoff P1-03: the GitHub guard expires a claim before the partial index is reused", async () => {
+  it("handoff P1-03: the GitHub guard expires a claim before the partial index is reused, then renews the owner's own lapsed claim after CONFIRM", async () => {
     const fixture = await ready();
     const gate = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.driven.identity);
     if (!gate.allowed) throw new Error(gate.message);
@@ -444,7 +444,7 @@ describe("round-two GitHub hardening", () => {
     if (!prepared.allowed) throw new Error(prepared.message);
 
     fixture.harness.clock.advance(2 * 60 * 60 * 1000);
-    const refused = await fixture.harness.cp.github.mergeEvaluate({
+    const evaluated = await fixture.harness.cp.github.mergeEvaluate({
       runId: fixture.driven.runId,
       repositoryIdentity: fixture.driven.identity,
       pullNumber: prepared.value.pullNumber,
@@ -454,32 +454,24 @@ describe("round-two GitHub hardening", () => {
       ownerSessionId: fixture.driven.ownerSessionId,
       ownerBindingGeneration: fixture.driven.ownerBindingGeneration,
     });
-    expect(refused.reasonCode).toBe(ReasonCode.MERGE_CLAIM_INVALID);
-    expect(
-      fixture.harness.cp.db.get<{ status: string }>(
-        `SELECT status FROM resource_claims WHERE run_id = ? AND branch = ?`,
-        [fixture.driven.runId, fixture.driven.workBranch],
-      ),
-    ).toEqual({ status: "EXPIRED" });
-
-    const now = fixture.harness.clock.nowIso();
-    const reclaimedUntil = new Date(new Date(now).getTime() + 60 * 60 * 1000).toISOString();
-    expect(() => fixture.harness.cp.db.run(
-      `INSERT INTO resource_claims
-         (claim_id, repository_identity, branch, run_id, owner_session_id,
-          owner_binding_generation, acquired_at, expires_at, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'HELD')`,
-      [
-        "claim_reclaimed_after_expiry",
-        fixture.driven.identity,
-        fixture.driven.workBranch,
-        fixture.driven.runId,
-        fixture.driven.ownerSessionId,
-        fixture.driven.ownerBindingGeneration,
-        now,
-        reclaimedUntil,
-      ],
-    )).not.toThrow();
+    // Owner directive 2026-10-20: the lapse alone no longer stops finalization.
+    expect(evaluated.reasonCode).not.toBe(ReasonCode.MERGE_CLAIM_INVALID);
+    const row = fixture.harness.cp.db.get<{ status: string; expires_at: string }>(
+      `SELECT status, expires_at FROM resource_claims WHERE run_id = ? AND branch = ?`,
+      [fixture.driven.runId, fixture.driven.workBranch],
+    )!;
+    // The sweep marked it EXPIRED first (otherwise the HELD update below the index would collide
+    // with nothing to renew); it is the same row, renewed, not a second one.
+    expect(row.status).toBe("HELD");
+    expect(new Date(row.expires_at).getTime()).toBeGreaterThan(new Date(fixture.harness.clock.nowIso()).getTime());
+    expect(fixture.harness.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM resource_claims WHERE run_id = ? AND branch = ?`,
+      [fixture.driven.runId, fixture.driven.workBranch],
+    )!.n).toBe(1);
+    expect(fixture.harness.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM audit_events WHERE kind = 'CLAIM_RENEWED_FOR_FINALIZATION' AND run_id = ?`,
+      [fixture.driven.runId],
+    )!.n).toBe(1);
   });
 
   it("#384: does not advertise an atomic expected-base capability the REST merge endpoint cannot honor", () => {
