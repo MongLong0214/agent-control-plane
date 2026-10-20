@@ -77,6 +77,27 @@ export const laterGateSection = (runKind: string | null, repositoryCount: number
   ];
 };
 
+/**
+ * #1166 r1 — the listing's serialized size is bounded across the whole packet, not only its entry
+ * count: long paths could otherwise fill the review's metadata budget and refuse review for good.
+ * Paths are kept in order while the shared budget lasts; a repository cut here is marked truncated.
+ */
+export const TREE_CHAR_BUDGET = 24_000;
+
+const budgetTrees = (trees: readonly TrackedTreeEvidence[]): TrackedTreeEvidence[] => {
+  let used = 0;
+  return trees.map((tree) => {
+    const kept: string[] = [];
+    for (const path of tree.paths) {
+      const cost = JSON.stringify(path).length + 8;
+      if (used + cost > TREE_CHAR_BUDGET) break;
+      used += cost;
+      kept.push(path);
+    }
+    return { ...tree, truncated: tree.truncated || kept.length < tree.paths.length, paths: kept };
+  });
+};
+
 export const candidateEvidenceSection = (
   db: Db,
   runId: string,
@@ -84,7 +105,7 @@ export const candidateEvidenceSection = (
 ): string[] => [
   "## Frozen candidate tracked trees",
   "Tracked paths at each candidate SHA, including unchanged paths. A truncated listing is incomplete; it cannot establish absence of unlisted paths.",
-  "```json", JSON.stringify(trees, null, 2), "```", "",
+  "```json", JSON.stringify(budgetTrees(trees), null, 2), "```", "",
   "## Control-plane evidence",
   "Read from canonical audit, task and assignment records. Worker counts include all recorded bindings, with active bindings counted separately.",
   "```json", JSON.stringify(controlPlaneEvidence(db, runId), null, 2), "```", "",

@@ -96,7 +96,10 @@ describe("frozen candidate packet evidence", () => {
       const prompt = harness.scripted.invocations.find((r) => r.prompt.includes("# Candidate review"))!.prompt;
       const trees = jsonSection(prompt, "Frozen candidate tracked trees") as Array<{ truncated: boolean; paths: string[] }>;
       expect(trees[0]!.truncated).toBe(true);
-      expect(trees[0]!.paths).toHaveLength(2000);
+      // #1166 r1: the packet's listing is also bounded by its serialized size (TREE_CHAR_BUDGET 24_000), so it holds fewer than 2000 here.
+      expect(trees[0]!.paths.length).toBeGreaterThan(0);
+      expect(trees[0]!.paths.length).toBeLessThan(2000);
+      expect(JSON.stringify(trees[0]!.paths).length).toBeLessThanOrEqual(24_000);
       expect(prompt).toContain("A truncated listing is incomplete");
     } finally { harness.cp.close(); }
   });
