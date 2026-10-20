@@ -41,12 +41,11 @@ export const BUZZ_SUBSCRIBER_CONFIG_FILENAME = "buzz-nostr-subscriber.json";
 export const BUZZ_MENTION_KIND = 9;
 
 /**
- * What a mention-sourced envelope declares as its recipient class.
+ * What a subscriber-sourced envelope declares as its recipient class.
  *
- * Not `"CEO"`, and that is the whole of it: `BuzzMessageIngress` reads `"CEO"` as "the owner's own
- * conversation, no `p` tag consulted", and every event this subscriber sees arrived because its
- * `p` tag named a role's channel identity. Declaring the recipient class as anything else routes
- * the envelope through the address resolver, which is where the `p` tag becomes a role key.
+ * `BuzzMessageIngress` reads `"CEO"` as the owner's own conversation. These events address a
+ * subscribed role identity instead, through either a `p` tag or an un-mentioned owner's message
+ * in its bound room. The address resolver turns that identity into the current role key.
  */
 export const BUZZ_MENTION_ADDRESSED_TO = "ROLE";
 
@@ -501,9 +500,9 @@ export type BuzzMentionAdmission =
 
 /** One verified event, addressed, on its way to the admission seam. */
 export interface BuzzMentionAdmissionRequest {
-  /** The role the `p`-tagged identity holds right now, re-checked immediately before this call. */
+  /** The subscribed identity's role, re-checked immediately before this call. */
   readonly roleKey: string;
-  /** The channel identity the event's `p` tag named: this daemon's own subscribed pubkey. */
+  /** The subscribed recipient, named by `p` or selected for an un-mentioned owner message. */
   readonly identityPubkey: string;
   /** The Buzz room the event arrived on — its single `h` tag. */
   readonly conversation: string;
@@ -1187,6 +1186,7 @@ export type BuzzEventRefusalReporter = (refusal: {
 
 interface SubscriptionDeps {
   readonly reportEventRefusal?: BuzzEventRefusalReporter;
+  readonly ownerAuthors: ReadonlySet<string>;
   readonly relayUrl: string;
   readonly sink: BuzzMentionSink;
   readonly registry: BuzzMentionRegistry;
@@ -1856,7 +1856,16 @@ class BuzzMentionSubscription {
       "#h": this.#rooms,
     };
     if (this.#since !== null) filter["since"] = this.#since;
-    this.#send(generation, JSON.stringify(["REQ", this.#subscriptionId, filter]));
+    const filters = [filter];
+    if (this.#deps.ownerAuthors.size > 0) {
+      filters.push({
+        kinds: [BUZZ_MENTION_KIND],
+        authors: [...this.#deps.ownerAuthors],
+        "#h": this.#rooms,
+        ...(this.#since === null ? {} : { since: this.#since }),
+      });
+    }
+    this.#send(generation, JSON.stringify(["REQ", this.#subscriptionId, ...filters]));
     this.#deps.authenticated();
     return ACCEPTED;
   }
@@ -1930,6 +1939,8 @@ class BuzzMentionSubscription {
       return rejected(reasonCode);
     };
     if (event.kind !== BUZZ_MENTION_KIND) return refuseEvent("event-wrong-kind");
+    // With no `p` tag at all, only a declared owner's message may address this room's CTO.
+    // An `e` reply tag does not change that. Any `p` tag keeps the existing mention rule.
     // Exactly one `p`, and it is this identity. The `p` filter is the relay's promise; this is the
     // daemon checking it, and a relay that widened the filter would otherwise hand this subscriber
     // someone else's mail to speak for.
@@ -1942,7 +1953,8 @@ class BuzzMentionSubscription {
     // A membership test would accept exactly that, including the degenerate case where the extra
     // tag is a duplicate of this identity.
     const recipients = tagValues(event, "p");
-    if (recipients.length !== 1 || recipients[0] !== this.#pubkey) {
+    const unmentionedOwner = recipients.length === 0 && this.#deps.ownerAuthors.has(event.pubkey);
+    if (!unmentionedOwner && (recipients.length !== 1 || recipients[0] !== this.#pubkey)) {
       return refuseEvent("event-not-addressed");
     }
     // Exactly one `h`, non-empty. The `h` tag is the Buzz room, and the room is what the answer
@@ -2284,6 +2296,8 @@ const DISABLED: BuzzMentionSubscriberHandle = {
 
 export interface BuzzMentionSubscriberOptions {
   readonly reportEventRefusal?: BuzzEventRefusalReporter;
+  /** The ingress's declared owners; only their messages with no `p` tag may address the room's CTO. */
+  readonly ownerAuthors?: readonly string[];
   readonly config: BuzzSubscriberConfig;
   readonly registry: BuzzMentionRegistry;
   readonly sink: BuzzMentionSink;
@@ -2357,6 +2371,7 @@ export const startBuzzMentionSubscriber = (
 
   const deps: SubscriptionDeps = {
     ...(options.reportEventRefusal ? { reportEventRefusal: options.reportEventRefusal } : {}),
+    ownerAuthors: new Set(options.ownerAuthors ?? []),
     relayUrl: options.config.relayUrl,
     sink: options.sink,
     registry: options.registry,

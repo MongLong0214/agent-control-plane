@@ -37,6 +37,8 @@ export interface BuzzMessageIngressInput {
   conversation: string;
   /** The relay's own event id; the durable replay key for this message. */
   eventId: string;
+  /** The signed event's explicit `e` reply tag, retained as provenance when present. */
+  replyToEventId?: string;
   /**
    * Which recipient class the relay addressed the event to, and the only thing that decides
    * whether this envelope is for the CEO room or for a role.
@@ -366,7 +368,7 @@ export const buzzMessageNonce = (eventId: string): string =>
 export const buzzMessagePayload = (
   input: Pick<
     BuzzMessageIngressInput,
-    "conversation" | "addressedTo" | "mention" | "text" | "peer" | "createdAt"
+    "conversation" | "addressedTo" | "mention" | "text" | "peer" | "createdAt" | "replyToEventId"
   >,
 ): Record<string, unknown> => ({
   type: "BUZZ_MESSAGE",
@@ -378,8 +380,9 @@ export const buzzMessagePayload = (
   // remove it and that tampered envelope verifies.
   mention: input.mention ?? null,
   text: input.text,
-  // #1038. Only on a peer envelope, so an owner's payload — and every digest already recorded
-  // over one — is byte-for-byte what it was. Adding or removing the pair changes the payload
+  ...(input.replyToEventId === undefined ? {} : { replyToEventId: input.replyToEventId }),
+  // #1038. Only on a peer envelope, preserving owner payloads without the optional reply field
+  // and the digests already recorded over them. Adding or removing the pair changes the payload
   // either way, so neither a captured owner envelope nor a captured peer one survives the edit.
   ...(input.peer === undefined ? {} : { peer: input.peer, createdAt: input.createdAt ?? null }),
 });
@@ -407,7 +410,7 @@ export interface OwnerMessagePointer {
 export const ownerMessagePointer = (
   input: Pick<
     BuzzMessageIngressInput,
-    "conversation" | "addressedTo" | "mention" | "text" | "peer" | "createdAt"
+    "conversation" | "addressedTo" | "mention" | "text" | "peer" | "createdAt" | "replyToEventId"
   >,
   nonce: string,
 ): OwnerMessagePointer => ({
@@ -437,7 +440,7 @@ export const ownerMessagePointerOf = (payload: unknown): OwnerMessagePointer | n
 export const buzzMessageSigningRequest = (
   input: Pick<
     BuzzMessageIngressInput,
-    "actor" | "conversation" | "eventId" | "addressedTo" | "mention" | "text" | "peer" | "createdAt"
+    "actor" | "conversation" | "eventId" | "addressedTo" | "mention" | "text" | "peer" | "createdAt" | "replyToEventId"
   >,
 ): IngressRequest => ({
   channel: "buzz",
@@ -569,6 +572,11 @@ export class BuzzMessageIngress {
     }
     this.#ownerActors = new Set(owners);
     this.#peers = peers;
+  }
+
+  /** A snapshot of the same declared owner set admission checks. */
+  get ownerActors(): readonly string[] {
+    return [...this.#ownerActors];
   }
 
   /**
