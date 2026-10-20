@@ -2649,7 +2649,12 @@ const workerPrompt = (facts: TurnFacts): string =>
     "",
     "Rules:",
     `- Change only files under these repository paths: ${facts.claim.ownedPaths.join(", ")}.`,
-    "- Do not run commands, do not commit, and do not touch the .git directory. The control plane verifies your change and commits it.",
+    ...(facts.worker.provider === "gpt"
+      // #512 — a Codex worker has no file-reading tool of its own: its shell is how it reads. Its own
+      // workspace-write sandbox (workdir only, no network) bounds that shell; edits still go through
+      // apply_patch, and the control plane still verifies and commits.
+      ? ["- You may run read-only shell commands inside this working tree to read files (for example cat, ls, rg, sed -n, git status, git log, git show, git diff). Make every change with apply_patch. Do not run commands that write, install, or reach the network; do not commit, and do not touch the .git directory. The control plane verifies your change and commits it."]
+      : ["- Do not run commands, do not commit, and do not touch the .git directory. The control plane verifies your change and commits it."]),
     "- When you are done, reply with a short summary of what you changed.",
   ].join("\n");
 

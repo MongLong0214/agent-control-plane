@@ -259,6 +259,7 @@ describe("a worker turn runs on the bound session", () => {
     const claudeCalls: string[] = [];
     const claude = { invoke: () => { claudeCalls.push("claude"); throw new Error("claude must not run"); } } as unknown as ProviderAdapter;
     const texts: string[] = [];
+    const prompts: string[] = [];
     const runner = new WorkerTurnRunner(
       {
         db: world.db,
@@ -273,6 +274,7 @@ describe("a worker turn runs on the bound session", () => {
             isProduction: codex.isProduction,
             defaultModels: codex.defaultModels,
             invoke: async (request: InvocationRequest) => {
+              prompts.push(request.prompt);
               const answer = await codex.invoke(request);
               texts.push(answer.text);
               return answer;
@@ -302,6 +304,12 @@ describe("a worker turn runs on the bound session", () => {
     expect(report.args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
     expect(report.args[report.args.indexOf("--thread-source") + 1]).toBe(world.worker.externalSessionId);
     expect(report.stdin).toBe("");
+    // #512 — a Codex worker reads through its shell, so its prompt allows read-only commands (the live
+    // turn ended NO_CHANGE under "Do not run commands"); writes still go through apply_patch.
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("You may run read-only shell commands inside this working tree");
+    expect(prompts[0]).toContain("Make every change with apply_patch");
+    expect(prompts[0]).not.toContain("- Do not run commands,");
     expect(report.cwd).toBe(realpathSync(world.repoPath));
     expect(gitSync(world.repoPath, ["rev-parse", "HEAD"])).not.toBe(gitSync(world.repoPath, ["rev-parse", "HEAD^"]));
     const succeeded = world.audit.byKind("TASK_WORKER_TURN_SUCCEEDED");
