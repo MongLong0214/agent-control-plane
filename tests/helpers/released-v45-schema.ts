@@ -8,6 +8,7 @@ import { dropV46Triggers } from "./released-v46-schema.ts";
 import { dropV47Triggers } from "./released-v47-schema.ts";
 import { dropV48Triggers } from "./released-v48-schema.ts";
 import { takeBackV49 } from "./released-v49-schema.ts";
+import { takeBackV50 } from "./released-v50-schema.ts";
 
 /**
  * #512 (v45) — fixtures for the v44 → v45 step.
@@ -37,6 +38,7 @@ export const v44TriggerBody = (name: string): string => {
 export const toV44Image = (path: string): string => {
   const legacy = new Database(path);
   try {
+    takeBackV50(legacy);
     takeBackV49(legacy);
     dropV48Triggers(legacy);
     dropV47Triggers(legacy);

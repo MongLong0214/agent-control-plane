@@ -33,7 +33,7 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   // The ordering is a `LIMIT 1` that picks which row is named in a v35 refusal message, so the
   // consequence of the tie is a person sent to the wrong nonce — real, and still not a reason to
   // edit a frozen input without the authority that froze it.
-  ["src/db/migrations.ts:2344", "ORDER BY received_at ASC"],
+  ["src/db/migrations.ts:2346", "ORDER BY received_at ASC"],
   ["src/cto/cto-lifecycle.ts:1173", "ORDER BY created_at DESC"],
   // `currentPendingNormalHandoff` was here, re-keyed from 1956 to 1918 and due to move again. Four
   // changes in a row went red on it and none of them touched the query: the entry is keyed to a
@@ -41,8 +41,8 @@ export const PARTIAL_TIMESTAMP_ORDERINGS = new Map([
   // so the ordering was given `handoff_id` instead — the remedy this file's header prescribes — and
   // the entry is gone rather than relocated. The query refuses unless `rows.length === 1`, so the
   // tiebreaker changes no decision; what it removes is this file's claim on an unrelated edit.
-  ["src/github/github-kernel.ts:4313", "ORDER BY created_at DESC"],
-  ["src/github/github-kernel.ts:4739", "ORDER BY created_at"],
+  ["src/github/github-kernel.ts:4353", "ORDER BY created_at DESC"],
+  ["src/github/github-kernel.ts:4779", "ORDER BY created_at"],
   // `RunEngine.list` was here at run-engine.ts:1260. Its ordering was given `rowid` rather than
   // re-keyed when an edit above it moved it: insertion order is what ties already returned.
 ]);

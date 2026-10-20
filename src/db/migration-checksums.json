@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 49,
+  "schemaVersion": 50,
   "live": {
     "v12-migration-ledger-and-invariant-replay": "sha256:ec8955aed2d499e13d313e3fed473e0cb4e2ecb1c45af2e7fc95f2537ec91261",
     "v13-finalization-state-machine": "sha256:1d8ff28d8f21296e0380b76b76637813e825b7f9c91029dc03ac52d877af3936",
@@ -37,6 +37,7 @@
     "v45-first-manifest-activation": "sha256:4263f0011ebdd53fb8e645f55b4e391e8247755debd8961fe74c312c983ad1ee",
     "v46-rowid-no-replace": "sha256:aa2aa099fe49482d7c9ae5e32ffc6a587287e5cdd9e97b44e268a22a3883e04a",
     "v47-owner-decision-authority-guard": "sha256:c267706968989846716794ae98529b6f33a027b0d085c08e80f169769b58b586",
-    "v48-owner-decision-supersede-guard": "sha256:2f5037b3a17199018dafd2db4833a2815ba5eeeb15be3de65d49395aa7772f32"
+    "v48-owner-decision-supersede-guard": "sha256:2f5037b3a17199018dafd2db4833a2815ba5eeeb15be3de65d49395aa7772f32",
+    "v49-branch-publish-receipts": "sha256:9a3b1287045bc5857c8415d2018ccfc267d31910bd1e6ab57fbc200b791c59b0"
   }
 }

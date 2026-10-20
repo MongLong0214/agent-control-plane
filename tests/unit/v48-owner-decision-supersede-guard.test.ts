@@ -15,7 +15,7 @@ import { V45_BASE_CHECKSUM, contentDigests } from "../helpers/released-v45-schem
 import { V46_BASE_CHECKSUM } from "../helpers/released-v46-schema.ts";
 import { V47_BASE_CHECKSUM, V47_SCHEMA_DIGEST_FROM_RELEASED_CHAIN } from "../helpers/released-v47-schema.ts";
 import { OWNER_DECISION_SUPERSEDE_DENIED, V48_ADDED_TRIGGERS } from "../helpers/released-v48-schema.ts";
-import { V49_CHANGED_OBJECTS } from "../helpers/released-v49-schema.ts";
+
 
 afterAll(cleanupTempDirs);
 
@@ -559,10 +559,13 @@ const seedAsV47 = (path: string): { kept: Row[]; withdrawnPreV48: Row; removedPr
 };
 
 describe("S1: the v47 → v48 step on the released v47 image", () => {
-  it("is the step from 47, followed only by #512 S-PUSH's v49, and v47 keeps the full checksum it shipped with", () => {
-    expect(SCHEMA_VERSION).toBe(49);
+  it("is the step from 47, followed by v49 and v50, and v47 keeps the full checksum it shipped with", () => {
+    expect(SCHEMA_VERSION).toBe(50);
     expect(MIGRATIONS.find((step) => step.fromVersion === 47)).toMatchObject({ id: "v48-owner-decision-supersede-guard", fromVersion: 47, toVersion: 48 });
-    expect(MIGRATIONS.at(-1)).toMatchObject({ id: "v49-branch-publish-receipts", fromVersion: 48, toVersion: 49 });
+    expect(MIGRATIONS.slice(-2)).toMatchObject([
+      { id: "v49-branch-publish-receipts", fromVersion: 48, toVersion: 49 },
+      { id: "v50-post-merge-verification-reentry", fromVersion: 49, toVersion: 50 },
+    ]);
     expect(MIGRATIONS.find((step) => step.toVersion === 47)!.checksum()).toBe(V47_BASE_CHECKSUM);
   });
 
@@ -633,11 +636,11 @@ describe("S1: the v47 → v48 step on the released v47 image", () => {
     const path = releasedV47("acp-v48-m3-");
     const before = schemaRowsOf(path);
     approveMigration(path, "v48 M3 witness");
-    new Db(path).close();
-    const after = schemaRowsOf(path);
-    // #512 S-PUSH: v49 follows on the same chain and changes only github_receipts' table and one of its guards.
-    expect(after.filter((r) => !V48_ADDED_TRIGGERS.includes(r.name) && !V49_CHANGED_OBJECTS.includes(r.name)))
-      .toEqual(before.filter((r) => !V49_CHANGED_OBJECTS.includes(r.name)));
+    let after: ReturnType<typeof schemaRowsOf> = [];
+    new Db(path, { afterMigration: (migration) => {
+      if (migration.toVersion === 48) after = schemaRowsOf(path);
+    } }).close();
+    expect(after.filter((r) => !V48_ADDED_TRIGGERS.includes(r.name))).toEqual(before);
     expect(after.filter((r) => V48_ADDED_TRIGGERS.includes(r.name))).toEqual(freshGuards);
   });
 });

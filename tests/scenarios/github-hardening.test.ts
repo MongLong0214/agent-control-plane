@@ -950,7 +950,7 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
     expect(refused.reasonCode).toBe(ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED);
   });
 
-  it("refuses an empty required set instead of passing every commit", async () => {
+  it("requires an exact applied merge receipt even when no checks are declared", async () => {
     const fixture = await setup({ declareChecks: false });
     const refused = await fixture.harness.cp.github.postMergeVerify(
       fixture.runId,
@@ -959,7 +959,7 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
       [],
     );
     expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED);
+    expect(refused.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
   });
 
   it("uses the manifest's declared checks when the caller names none", async () => {

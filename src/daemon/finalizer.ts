@@ -202,12 +202,9 @@ export class ApprovedRunFinalizer {
         { replayed: true },
       );
     }
-    if (initial.state === RunState.BLOCKED_POST_MERGE) {
-      return deny(
-        ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
-        "run has a partial merge failure and requires its durable compensation plan",
-        { runId, attempt: this.attempt(runId) },
-      );
+    if (initial.state === RunState.BLOCKED_POST_MERGE ||
+        (initial.state === RunState.POST_MERGE_VERIFYING && this.wasPostMergeResumed(runId))) {
+      return this.resumePostMerge(runId);
     }
     if (!this.isFinalizingState(initial.state)) {
       return deny(ReasonCode.GATE_AUTHORITY_DENIED, "run has no durable CEO approval to finalize", {
@@ -242,6 +239,11 @@ export class ApprovedRunFinalizer {
     const consumer = initial.kind === RunKind.CONTRACT_CHANGE ? this.cp.manifestGrants.consumerOf(runId) : null;
     let completed = false;
     try {
+      // Resolve every participant before planning or any remote write.
+      for (const repository of this.cp.runs.repositoriesOf(runId)) {
+        const inputs = this.cp.github.postMergeVerificationInputs(runId, repository.identity);
+        if (!inputs.allowed) return this.handleFailure(runId, attemptId, inputs);
+      }
       const plans = await this.reconfirmAndPlan(runId, candidateDigest, consumer);
       if (!plans.allowed) return this.handleFailure(runId, attemptId, plans as Decision<unknown>);
 
@@ -395,7 +397,7 @@ export class ApprovedRunFinalizer {
             runId,
             attemptId,
             consumer,
-            "all ordered merges passed exact post-merge verification",
+            "all ordered merges completed exact post-merge verification",
             { attemptId, merged },
           );
           if (!done.allowed) return this.handleFailure(runId, attemptId, done);
@@ -424,6 +426,103 @@ export class ApprovedRunFinalizer {
           error: error instanceof Error ? error.message : String(error),
         }),
       );
+    } finally {
+      if (!completed) this.releaseAttemptIfRunning(runId, attemptId);
+    }
+  }
+
+  private wasPostMergeResumed(runId: string): boolean {
+    return this.cp.audit.forRun(runId).some((entry) => entry.kind === "FINALIZATION_POST_MERGE_RESUMED");
+  }
+
+  /** Receipt-only recovery: terminal cleanup has already retired workers and released claims. */
+  private async resumePostMerge(runId: string): Promise<Decision<FinalizationResult>> {
+    const acquired = this.cp.db.txDecision<{ attemptId: string; repositories: FinalizationResult["repositories"] }>(() => {
+      const prior = this.attempt(runId);
+      const run = this.cp.runs.require(runId);
+      const candidateDigest = this.cp.runs.currentCandidate(runId);
+      const receipts = this.durableMergeReceipts(runId);
+      const blocked = run.state === RunState.BLOCKED_POST_MERGE;
+      if (!prior || !candidateDigest || prior.candidate_digest !== candidateDigest || receipts.length === 0 ||
+          receipts.some((receipt) => receipt.status !== "APPLIED" || receipt.verified !== 1 || !this.mergeSha(receipt)) ||
+          (blocked && (prior.state !== "BLOCKED" || prior.failure_reason !== ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED)) ||
+          (!blocked && (run.state !== RunState.POST_MERGE_VERIFYING || !this.wasPostMergeResumed(runId)))) {
+        return deny(ReasonCode.FINALIZATION_COMPENSATION_REQUIRED,
+          "run has a partial merge failure and requires its durable compensation plan", { runId, attempt: prior });
+      }
+      const repositories = receipts.map((receipt) => ({
+        repositoryIdentity: receipt.repository_identity,
+        mergeCommitSha: this.mergeSha(receipt)!,
+      }));
+      const now = this.cp.clock.now();
+      const startedAt = now.toISOString();
+      const deadlineAt = new Date(now.getTime() + FINALIZATION_LEASE_TTL_MS).toISOString();
+      const attemptId = `finalize_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+      if (blocked) {
+        const changed = this.cp.db.run(
+          `UPDATE finalization_attempts
+              SET attempt_id = ?, lease_owner = ?, state = 'RUNNING', started_at = ?, deadline_at = ?,
+                  released_at = NULL, completed_at = NULL, last_step = 'POST_MERGE_RESUMED',
+                  failure_reason = NULL, compensation_plan_json = NULL
+            WHERE run_id = ? AND attempt_id = ? AND state = 'BLOCKED'
+              AND failure_reason = ? AND candidate_digest = ?`,
+          [attemptId, this.leaseOwner, startedAt, deadlineAt, runId, prior.attempt_id,
+            ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED, candidateDigest],
+        );
+        if (changed.changes !== 1) return deny(ReasonCode.CONFLICT, "blocked attempt no longer owns this run", { runId });
+        // The lease table holds only the current attempt. Preserve the entire old attempt in a
+        // new immutable audit row before replacing its bookkeeping with the new lease.
+        const history = this.cp.audit.record({
+          kind: "FINALIZATION_POST_MERGE_RESUMED", runId,
+          evidence: {
+            resumedFromAttemptId: prior.attempt_id,
+            reason: prior.failure_reason,
+            priorAttempt: {
+              ...prior,
+              compensation_plan_json: prior.compensation_plan_json ? JSON.parse(prior.compensation_plan_json) : null,
+            },
+          },
+        });
+        if (!history.allowed) return history;
+        this.cp.audit.record({
+          kind: "FINALIZATION_ATTEMPT_ACQUIRED", runId,
+          evidence: { attemptId, candidateSnapshotDigest: candidateDigest, leaseOwner: this.leaseOwner, deadlineAt, resumed: true },
+        });
+        const transitioned = this.cp.runs.transition(runId, RunState.POST_MERGE_VERIFYING,
+          "resume post-merge verification with no checks declared", {
+            resumedFromAttemptId: prior.attempt_id, reason: ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED,
+          });
+        if (!transitioned.allowed) return transitioned;
+        return allow(ReasonCode.OK, { attemptId, repositories });
+      }
+      // A process death after the recovery transition must also stay on this receipt-only path.
+      const retry = this.acquireAttempt(runId, candidateDigest);
+      if (!retry.allowed) return retry;
+      return allow(ReasonCode.OK, { attemptId: retry.value, repositories });
+    });
+    if (!acquired.allowed) return acquired;
+    const { attemptId, repositories } = acquired.value;
+    let completed = false;
+    try {
+      for (const repository of repositories) {
+        this.touchAttempt(runId, attemptId, `POST_MERGE_VERIFY:${repository.repositoryIdentity}`);
+        const verified = await this.cp.github.postMergeVerify(runId, repository.repositoryIdentity,
+          repository.mergeCommitSha, [], this.#ports.daemonFinalizerAuthority);
+        if (!verified.allowed) return this.handleFailure(runId, attemptId, verified);
+      }
+      const run = this.cp.runs.require(runId);
+      const consumer = run.kind === RunKind.CONTRACT_CHANGE ? this.cp.manifestGrants.consumerOf(runId) : null;
+      const done = await this.complete(runId, attemptId, consumer, "resumed post-merge verification completed",
+        { attemptId, repositories, resumed: true });
+      if (!done.allowed) return this.handleFailure(runId, attemptId, done);
+      this.completeAttempt(runId, attemptId);
+      completed = true;
+      this.cp.audit.record({ kind: "FINALIZATION_COMPLETED", runId, evidence: { attemptId, repositories, resumed: true } });
+      return allow(ReasonCode.OK, { runId, state: RunState.COMPLETED, attemptId, repositories });
+    } catch (error) {
+      return this.handleFailure(runId, attemptId, deny(ReasonCode.INTERNAL_ERROR, "post-merge recovery raised an unexpected error", {
+        runId, error: error instanceof Error ? error.message : String(error),
+      }));
     } finally {
       if (!completed) this.releaseAttemptIfRunning(runId, attemptId);
     }

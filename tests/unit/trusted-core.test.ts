@@ -80,6 +80,10 @@ describe("run state machine (PRD §29.2)", () => {
     const terminal = canTransition(RunState.COMPLETED, RunState.ACTIVE);
     expect(terminal.reasonCode).toBe(ReasonCode.RUN_ALREADY_TERMINAL);
     expect(isTerminal(RunState.CANCELLED)).toBe(true);
+    expect(isTerminal(RunState.BLOCKED_POST_MERGE)).toBe(true);
+    for (const target of Object.values(RunState)) {
+      expect(canTransition(RunState.BLOCKED_POST_MERGE, target).allowed).toBe(target === RunState.POST_MERGE_VERIFYING);
+    }
   });
 });
 
