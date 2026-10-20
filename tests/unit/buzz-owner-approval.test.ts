@@ -515,15 +515,16 @@ describe("W2: wrong key", () => {
       expect(w.counts()).toMatchObject({ ...NOTHING_MINTED, refusalRows: 0 });
       expect(receiveDirect(w, fromCeo).reasonCode).toBe(ReasonCode.BUZZ_APPROVAL_NOT_OWNER);
       // The marker-carrying event never reached the seam's peer rule; the same CEO mention without
-      // the marker does, and is judged there as a peer's (this fixture's CEO key is not a bound one).
-      const seamAsked = (): number =>
+      // the marker does, and is judged there as a peer's: admitted or refused by the peer rule.
+      const seamAsked = (): number => w.subscriber.counters().admitted +
         Object.entries(w.subscriber.counters().rejections)
           .filter(([key]) => key.startsWith("admission-refused:BUZZ_PEER_"))
           .reduce((sum, [, n]) => sum + n, 0);
-      expect(seamAsked()).toBe(0);
+      const askedBefore = seamAsked();
       await w.send(w.reply({ author: w.keys.ceo, content: "repo-factory, status" }));
-      expect(seamAsked()).toBe(1);
-      expect(w.counts()).toMatchObject({ ...NOTHING_MINTED });
+      expect(seamAsked()).toBe(askedBefore + 1);
+      // Delivered as an ordinary peer message at most; never an approval.
+      expect(w.counts()).toMatchObject({ answers: 0, receipts: 0, artifacts: 0, consumptions: 0, githubCalls: 0 });
     } finally {
       await w.close();
     }

@@ -5,8 +5,9 @@ import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny, fromErrorPayload, isAcpError } from "../core/errors.ts";
 import { parseGitHubIdentity } from "../core/ids.ts";
+import { RunState } from "../domain/types.ts";
 import { isStalenessReasonCode, ReasonCode } from "../core/reason-codes.ts";
-import type { BranchProfile, ProjectManifest } from "../contracts/manifest.ts";
+import { projectManifestSchema, type BranchProfile, type ProjectManifest } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
@@ -52,6 +53,11 @@ export const GATE_CHECK_NAME = "acp-production-gate";
  */
 export const NO_HUMAN_GATE_DIGEST = digestOf({ humanGate: "NOT_REQUIRED" });
 export const PROJECT_CHECK_NAME = "project-ci";
+
+/** Run states after the CEO's CONFIRM, in which the daemon finalizer writes to GitHub. */
+const FINALIZING_STATES: ReadonlySet<string> = new Set([RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING]);
+/** How long a branch claim renewed for finalization stays held. */
+const FINALIZATION_CLAIM_RENEWAL_MS = 2 * 60 * 60 * 1000;
 
 /**
  * Whether a failed GitHub call was *answered* or merely *unheard* (#533).
@@ -2007,12 +2013,38 @@ export class GitHubKernel {
           claimed: rows.map((r) => r.branch),
         });
       }
-      const valid = onBranch.find(
+      let valid = onBranch.find(
         (r) =>
           r.status === "HELD" &&
           new Date(r.expires_at).getTime() > now &&
           r.owner_binding_generation === run?.ownerBindingGeneration,
       );
+      // Owner directive 2026-10-20: once the CEO has confirmed, the owner's own branch claim
+      // lapsing while the run waited is not a reason to stop finalization. Renew it when nobody
+      // else holds the branch; the unique HELD-branch index still refuses a real conflict.
+      if (!valid && run && FINALIZING_STATES.has(run.state)) {
+        const lapsed = onBranch.find(
+          (r) => r.status === "EXPIRED" && r.owner_binding_generation === run.ownerBindingGeneration,
+        );
+        const holder = this.db.get<{ claim_id: string }>(
+          `SELECT claim_id FROM resource_claims WHERE repository_identity = ? AND branch = ? AND status = 'HELD'`,
+          [repositoryIdentity, branch],
+        );
+        if (lapsed && !holder) {
+          const renewedUntil = new Date(now + FINALIZATION_CLAIM_RENEWAL_MS).toISOString();
+          this.db.run(
+            `UPDATE resource_claims SET status = 'HELD', expires_at = ?, released_at = NULL WHERE claim_id = ?`,
+            [renewedUntil, lapsed.claim_id],
+          );
+          this.audit.record({
+            kind: "CLAIM_RENEWED_FOR_FINALIZATION",
+            runId,
+            reasonCode: ReasonCode.OK,
+            evidence: { claimId: lapsed.claim_id, repositoryIdentity, branch, expiredAt: lapsed.expires_at, renewedUntil },
+          });
+          valid = { ...lapsed, status: "HELD", expires_at: renewedUntil };
+        }
+      }
       if (!valid) {
         return deny(ReasonCode.MERGE_CLAIM_INVALID, "the claim on this branch is not currently valid", {
           runId,
@@ -3005,14 +3037,16 @@ export class GitHubKernel {
     mergeCommitSha: string,
     requiredChecks: readonly string[] = [],
     daemonFinalizerAuthority?: DaemonFinalizerAuthority,
-  ): Promise<Decision<{ checks: Array<{ name: string; conclusion: string }> }>> {
+  ): Promise<Decision<{ checks: Array<{ name: string; conclusion: string }>; noChecksDeclared?: true }>> {
     const slug = this.slug(repositoryIdentity);
     if (!slug.allowed) return slug as Decision<{ checks: Array<{ name: string; conclusion: string }> }>;
     const { owner, repo } = slug.value;
 
     // The required set comes from the project contract, not the caller: a caller-supplied
     // empty list would make this a vacuous PASS for any commit (§24.7).
-    const declared = this.declaredPostMergeChecks(runId, repositoryIdentity);
+    const resolved = this.declaredPostMergeChecks(runId, repositoryIdentity);
+    if (!resolved.allowed) return resolved;
+    const declared = resolved.value;
     const undeclared = requiredChecks.filter((name) => !declared.includes(name));
     if (undeclared.length > 0) {
       return deny(
@@ -3024,20 +3058,12 @@ export class GitHubKernel {
     // Every declared check is required. A caller-supplied subset would be silent coverage
     // reduction: naming one of two declared checks must not make the other optional.
     const effective = [...new Set([...declared, ...requiredChecks])];
-    if (effective.length === 0) {
-      return deny(
-        ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED,
-        "the pinned manifest declares no post-merge checks, so a merge cannot be verified",
-        { runId, repositoryIdentity, mergeCommitSha },
-      );
-    }
-
     // §24.7 — the commit under verification must be the one this run actually merged into
     // this repository. Otherwise an unrelated green commit could stand in for a red merge.
     const mergedHere = this.db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM github_receipts
         WHERE operation = 'merge_execute' AND run_id = ? AND repository_identity = ?
-          AND after_state_digest = ?`,
+          AND after_state_digest = ? AND status = 'APPLIED' AND verified = 1`,
       [runId, repositoryIdentity, sha256(mergeCommitSha)],
     );
     if ((mergedHere?.n ?? 0) === 0) {
@@ -3058,8 +3084,10 @@ export class GitHubKernel {
           verified: existing.verified === 1,
         });
       }
-      const cached = JSON.parse(existing.response_json) as { checks?: Array<{ name: string; conclusion: string }> };
-      if (!Array.isArray(cached.checks)) {
+      const cached = JSON.parse(existing.response_json) as { checks?: Array<{ name: string; conclusion: string }>; noChecksDeclared?: true };
+      if (!Array.isArray(cached.checks) ||
+          (effective.length === 0 && (cached.checks.length !== 0 || cached.noChecksDeclared !== true)) ||
+          effective.some((name) => !cached.checks!.some((check) => check.name === name))) {
         return deny(ReasonCode.EVIDENCE_MISSING, "post-merge verification receipt is malformed", {
           idempotencyKey,
         });
@@ -3074,7 +3102,9 @@ export class GitHubKernel {
         );
       }
       this.setMergeState(runId, repositoryIdentity, "MERGED");
-      return allow(ReasonCode.OK, { checks: cached.checks });
+      return allow(ReasonCode.OK, effective.length === 0
+        ? { checks: [], noChecksDeclared: true as const }
+        : { checks: cached.checks });
     }
 
     const finalization = this.assertFreshDaemonFinalization(
@@ -3083,6 +3113,33 @@ export class GitHubKernel {
       "post_merge_verify",
     );
     if (!finalization.allowed) return finalization as Decision<{ checks: Array<{ name: string; conclusion: string }> }>;
+
+    if (effective.length === 0) {
+      return this.db.tx(() => {
+        const response = { checks: [], noChecksDeclared: true as const };
+        this.writeReceipt({
+          idempotencyKey,
+          operation: "post_merge_verify",
+          runId,
+          repositoryIdentity,
+          resourceType: "commit",
+          resourceIdentity: `${owner}/${repo}@${mergeCommitSha}`,
+          preexisting: false,
+          beforeStateDigest: null,
+          afterStateDigest: digestOf(response),
+          requestDigest,
+          response,
+          reread: true,
+        });
+        this.setMergeState(runId, repositoryIdentity, "MERGED");
+        this.audit.record({
+          kind: "POST_MERGE_NO_CHECKS_DECLARED",
+          runId,
+          evidence: { repositoryIdentity, mergeCommitSha },
+        });
+        return allow(ReasonCode.OK, response);
+      });
+    }
 
     const observedResult = await this.waitForPostMergeChecks(
       runId,
@@ -3209,15 +3266,30 @@ export class GitHubKernel {
    * repository — so returning every entry for every participant required each one to carry a
    * byte-identical workflow file. `postMergeCommands` carry no role and stay run-wide.
    */
-  private declaredPostMergeChecks(runId: string, repositoryIdentity: string): string[] {
-    const run = this.runs.get(runId);
-    const manifest = run?.pinnedManifestDigest ? this.projects.manifest(run.pinnedManifestDigest) : null;
-    const role = this.repositoryRoleInRun(runId, repositoryIdentity);
-    const fromWorkflows = (manifest?.ciWorkflows ?? [])
-      .filter((w) => w.repositoryRole === role)
-      .map((w) => w.checkName);
-    const fromCommands = manifest?.postMergeCommands ?? [];
-    return [...new Set([...fromWorkflows, ...fromCommands])];
+  postMergeVerificationInputs(runId: string, repositoryIdentity: string): Decision<readonly string[]> {
+    return this.declaredPostMergeChecks(runId, repositoryIdentity);
+  }
+
+  private declaredPostMergeChecks(runId: string, repositoryIdentity: string): Decision<string[]> {
+    try {
+      const run = this.runs.get(runId);
+      const stored = run?.pinnedManifestDigest ? this.projects.manifest(run.pinnedManifestDigest) : null;
+      const manifest = projectManifestSchema.safeParse(stored);
+      const role = this.repositoryRoleInRun(runId, repositoryIdentity);
+      if (!manifest.success || !role || !manifest.data.repositories.some((repository) => repository.role === role)) {
+        return deny(ReasonCode.EVIDENCE_MISSING, "pinned post-merge manifest or repository role could not be resolved", {
+          runId, repositoryIdentity,
+        });
+      }
+      const fromWorkflows = manifest.data.ciWorkflows
+        .filter((workflow) => workflow.repositoryRole === role)
+        .map((workflow) => workflow.checkName);
+      return allow(ReasonCode.OK, [...new Set([...fromWorkflows, ...manifest.data.postMergeCommands])]);
+    } catch {
+      return deny(ReasonCode.EVIDENCE_MISSING, "pinned post-merge manifest could not be read or parsed", {
+        runId, repositoryIdentity,
+      });
+    }
   }
 
   /**

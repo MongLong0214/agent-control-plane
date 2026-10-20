@@ -68,9 +68,8 @@ export const projectManifestSchema = z
              *
              * Defaults to `primary`: every manifest written before this field existed described
              * a run with one repository, and that repository is the primary, so the default
-             * leaves their behaviour unchanged. A secondary that declares nothing does not
-             * thereby become exempt — `postMergeVerify` denies on an empty effective set, which
-             * is the fail-closed direction.
+             * leaves their behaviour unchanged. A resolved role with no effective declarations
+             * records NO_CHECKS_DECLARED after the exact merge receipt is verified.
              */
             repositoryRole: z.string().min(1).default("primary"),
             /**

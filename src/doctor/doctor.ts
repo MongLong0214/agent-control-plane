@@ -34,6 +34,7 @@ import type { TaskGraph } from "../run/task-graph.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import { defaultCodexHome, inspectReviewerCodexHome, packetReviewerScope } from "../runtime/reviewer-codex-home.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
+import { resolveCeoBuzzIdentity } from "../session/ceo-buzz-identity.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 
 const exec = promisify(execFile);
@@ -754,14 +755,10 @@ export class Doctor {
         recommendedAction: "bind the CEO role so production-ready notifications are deliverable",
       });
     } else {
-      // #1112 — the Buzz peer rule reads the CEO's identity off the binding's live runtime
-      // (`buzzPeerRegistry.currentCeo`), so a READY/DRAINING CEO runtime with no `buzz_actor_id`
-      // has every CEO->CTO peer mention refused, and only the subscriber's rejection counters said
-      // so. Same session and lifecycle the peer rule reads; a runtime that is not live is a dead
-      // CEO, a different repair, and is left to the session checks.
+      // Use the same live identity and binding-history fallback as the Buzz peer rule.
       const runtime = this.sessions.get(ceo.sessionId);
       const live = runtime?.lifecycle === SessionLifecycle.READY || runtime?.lifecycle === SessionLifecycle.DRAINING;
-      if (runtime && live && runtime.buzzActorId === null) {
+      if (runtime && live && resolveCeoBuzzIdentity(this.db, ceo.sessionId) === null) {
         findings.push({
           code: "CEO_BUZZ_IDENTITY_UNBOUND",
           severity: "WARN",

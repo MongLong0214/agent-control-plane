@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { copyFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { boundedExecFileSync, boundedSpawnSync } from "../helpers/bounded-sync-child.ts";
@@ -40,6 +40,13 @@ const scratchRepo = (): string => {
   // script classifies a migration changes which ids belong in the manifest, so copying one without
   // the other measures a script against an answer key written for a different script.
   copyFileSync(join(ROOT, MANIFEST), join(dir, MANIFEST));
+  // The manifest also names newly frozen migrations. Exercise the working tree's migrator
+  // and snapshots together, including files the local clone cannot carry until committed.
+  for (const file of readdirSync(join(ROOT, "src/db"))) {
+    if (file === "migrations.ts" || /^schema(?:-v\d+)?\.sql$/.test(file)) {
+      copyFileSync(join(ROOT, "src/db", file), join(dir, "src/db", file));
+    }
+  }
   return dir;
 };
 

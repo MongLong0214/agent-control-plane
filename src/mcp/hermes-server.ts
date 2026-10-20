@@ -217,8 +217,8 @@ export interface HermesServerOptions {
    * read. Every tool outside `HERMES_READ_ONLY_TOOLS` — including any the caller registers on the
    * returned server afterwards — is admitted only when the call's `params._meta` provenance names
    * a top-level, non-scheduled turn in that session and lineage: the owner's, or a peer's carrying a
-   * peer grant for one of `HERMES_PEER_DELEGABLE_TOOLS`. A refusal happens before the idempotency
-   * reservation, so it writes nothing. The admitted turn reaches the delegable tools' audit evidence.
+   * well-formed peer grant. A refusal happens before the idempotency
+   * reservation, so it writes nothing. The admitted turn reaches the tools' audit evidence.
    */
   provenance?: HermesProvenanceAnchor;
 }

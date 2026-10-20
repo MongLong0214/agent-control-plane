@@ -98,7 +98,8 @@ import { OwnerReplyConsumer, type OwnerReplyTimers } from "../conversation/owner
 import type { OwnerIdentity } from "../ceo/owner-authority.ts";
 import { canonicalTurnTarget } from "../conversation/canonical-turn-target.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
-import { ReasonCode } from "../core/reason-codes.ts";
+import { resolveCeoBuzzIdentity } from "../session/ceo-buzz-identity.ts";
+import { isReasonCode, ReasonCode } from "../core/reason-codes.ts";
 import { recordMigrationRefusal } from "../db/migration-approval.ts";
 import {
   BuzzActorIngress,
@@ -1470,132 +1471,19 @@ const buzzMentionRouter = (cp: ControlPlane): BuzzMentionRouter => ({
   },
 });
 
-/**
- * Whether `runtime` carried `identity` at any moment it was serving a CEO generation earlier than
- * `generation` (#1044) — the identity's history, not the runtime's.
- *
- * `sessions.buzz_actor_id` is written once per session, so a runtime carries an identity from the
- * moment it took it onward. That moment is the runtime's first `SESSION_BUZZ_ACTOR_BOUND` record
- * for it, and the CEO generations the runtime served are replayed from the binding records in
- * `event_id` order — which is total, so two records that share one clock reading are still ordered —
- * reading each record's own generation. The identity was used by an earlier generation exactly when
- * this runtime was serving one at or after the moment it took the identity.
- *
- * Fails closed: no record of the binding, or a binding record whose generation is not readable,
- * counts as used, because nothing can then show that no earlier generation saw the identity.
- */
-const identityUsedInAnEarlierCeoGeneration = (
-  cp: ControlPlane,
-  runtime: string,
-  identity: string,
-  generation: number,
-): boolean => {
-  const tookIdentityAt =
-    cp.db.get<{ first: number | null }>(
-      `SELECT MIN(event_id) AS first FROM audit_events
-        WHERE kind = 'SESSION_BUZZ_ACTOR_BOUND' AND session_id = ? AND actor = ?`,
-      [runtime, `buzz:${identity}`],
-    )?.first ?? null;
-  if (tookIdentityAt === null) return true;
-  const records = cp.db.all<{ event_id: number; kind: string; session_id: string | null; evidence_json: string }>(
-    `SELECT event_id, kind, session_id, evidence_json FROM audit_events
-      WHERE role_key = ?
-        AND kind IN ('BINDING_CREATED','BINDING_SWITCHED','BINDING_RUNTIME_MOVED','BINDING_REVOKED')
-      ORDER BY event_id`,
-    [roleKeyFor(Role.CEO)],
-  );
-  let serving: { generation: number; runtime: string | null } | null = null;
-  const servingAnEarlierGenerationHere = (): boolean =>
-    serving !== null && serving.runtime === runtime && serving.generation < generation;
-  for (const record of records) {
-    // The state in force just before this record covers the moment the identity was taken, or a
-    // moment after it, once this record comes after that moment.
-    if (record.event_id > tookIdentityAt && servingAnEarlierGenerationHere()) return true;
-    if (record.kind === "BINDING_REVOKED") {
-      serving = null;
-      continue;
-    }
-    let evidence: Record<string, unknown>;
-    try {
-      evidence = JSON.parse(record.evidence_json) as Record<string, unknown>;
-    } catch {
-      return true;
-    }
-    const recorded = record.kind === "BINDING_SWITCHED" ? evidence["toGeneration"] : evidence["generation"];
-    if (typeof recorded !== "number") return true;
-    serving = { generation: recorded, runtime: record.session_id };
-  }
-  return servingAnEarlierGenerationHere();
-};
-
-/**
- * The registry facts the Buzz peer rule reads (#1038). Reads only, like `buzzMentionRouter`.
- *
- * `currentCeo` reads the column off the CEO binding's *live* runtime, so a NULL there — the adopted
- * runtime's state on 2026-10-02 — answers with a null identity and every CEO mention is refused.
- * Nothing here binds one: `BuzzActorIngress.bindActor` is still the only writer, and it needs the
- * session secret #1037 issues.
- *
- * `primaryCtoFor` asks `buzzMentionSubscriberRegistry`'s question — a live session whose one
- * mentionable role is a PRIMARY_CTO — without its stderr diagnostics, because a refused peer
- * envelope is an ordinary event here rather than a subscriber that cannot start; and it adds the two
- * facts the peer rule binds to: the binding's generation and that session's project channel.
- *
- * Two deployment facts this change does not configure: the guard every sender meets needs the
- * CEO's key on `ACP_BUZZ_ALLOWED_ACTORS`, and the peer rule needs the CTO runtime's `buzz_address`
- * to be the room the CEO writes in.
- */
+/** The live CEO identity (with binding-history fallback) and the addressed CTO's channel. */
 export const buzzPeerRegistry = (cp: ControlPlane): BuzzPeerRegistry => ({
   currentCeo: () => {
     const ceo = cp.bindings.active(roleKeyFor(Role.CEO));
     if (!ceo) return null;
-    const runtime = cp.db.get<{ buzz_actor_id: string | null }>(
-      `SELECT buzz_actor_id FROM sessions
-        WHERE session_id = ? AND lifecycle IN ('READY','DRAINING')`,
-      [ceo.sessionId],
-    );
-    const channelIdentity = runtime?.buzz_actor_id ?? null;
-    // #1044. Two ways an identity is not this generation's alone, and both are about the identity's
-    // own history rather than the runtime's. Another session row carries it — a stopped one keeps
-    // the column, which is what makes a key's earlier holder visible — or this runtime carried it
-    // while serving an earlier CEO generation. A runtime that served an earlier generation with no
-    // identity, and took this one only later, holds an identity no earlier generation used.
-    //
-    // CEO 1791632040: one kind of other row is history rather than ambiguity — a terminal earlier
-    // CEO row (`buzzActorHolders`) that this runtime's own binding recovered the key past by proving
-    // possession, when the recovery's record names exactly the history rows there are now (count and
-    // set digest, `buzzActorRecoveryNames`). Any other holder, a row the record does not name, or a
-    // terminal earlier row the key was rebound past without a possession proof is still reuse.
-    //
-    // A recovered key's events then count from a boundary this daemon fixes (CEO 1791634542): the
-    // latest of the generation's start, the recovery's audit time and the verified answer's signed
-    // time, with the boundary's own second refused. That refuses an event dated at or before the
-    // recovery. It does not say when an event was signed — `created_at` is the signer's own claim —
-    // so an event the earlier generation signed before the recovery, dated past the boundary and held
-    // back, is admitted: the accepted Limit.
-    let reused = false;
-    let recoveryBoundary: string | null = null;
-    if (channelIdentity !== null) {
-      const holders = cp.sessions.buzzActorHolders(channelIdentity, ceo.sessionId);
-      const recovery = holders.history.length === 0 ? null : cp.sessions.buzzActorRecovery(ceo.sessionId, channelIdentity);
-      // An unreadable time cannot fix a boundary, so it fails closed as reuse.
-      const boundaryMs = recovery === null
-        ? Number.NaN
-        : Math.max(Date.parse(ceo.createdAt), Date.parse(recovery.at), recovery.answerSignedAt * 1000);
-      const recovered = recovery !== null && Number.isFinite(boundaryMs) &&
-        cp.sessions.buzzActorRecoveryNames(recovery, holders.history);
-      const onlyHistory = holders.blocking === null && (holders.history.length === 0 || recovered);
-      if (recovered && onlyHistory) recoveryBoundary = new Date(boundaryMs).toISOString();
-      reused = !onlyHistory ||
-        identityUsedInAnEarlierCeoGeneration(cp, ceo.sessionId, channelIdentity, ceo.bindingGeneration);
-    }
+    const channelIdentity = resolveCeoBuzzIdentity(cp.db, ceo.sessionId);
     return {
       bindingGeneration: ceo.bindingGeneration,
       sessionId: ceo.sessionId,
       channelIdentity,
       generationStartedAt: ceo.createdAt,
-      recoveryBoundary,
-      channelIdentityReused: reused,
+      recoveryBoundary: null,
+      channelIdentityReused: false,
     };
   },
   primaryCtoFor: (mention) => {
@@ -1651,21 +1539,56 @@ export const startBuzzMessageIngressListener = async (
   cp: ControlPlane,
   stateDir: string,
   policy: IngressPolicy,
-  options: {
-    ceoConversation: CeoConversationPort;
-    ownerActors: readonly string[];
-    /** Daemon-owned existing-session sender; when present, never fall back to MCP. */
-    gatewayConversation?: (text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>;
-    /**
-     * B2's live-peer port, for events addressed to a role by `p` tag.
-     *
-     * Optional, and its absence fails closed rather than open: with no port every resolved role
-     * is unreachable, so a mention is refused with `ROLE_PEER_ABSENT` and nothing is delivered.
-     * A composition that forgets to wire it loses delivery, never gains a wrong recipient.
-     */
-    roleConversation?: RoleConversationPort;
-  },
+  options: BuzzMessageIngressOptions,
 ): Promise<LocalBuzzMessageIngress> => {
+  const seam = createBuzzMessageIngress(cp, policy, options);
+  const { ingress, port } = seam;
+  const socketPath = join(stateDir, "buzz-message.ingress.sock");
+  removeStaleSocket(socketPath);
+  const server = createServer((socket) => serveBuzzMessageTurn(cp, socket, ingress, port));
+
+  try {
+    await listenSocket(server, socketPath);
+  } catch (err) {
+    if (existsSync(socketPath)) unlinkSync(socketPath);
+    throw err;
+  }
+
+  return {
+    socketPath,
+    seam,
+    close: async () => {
+      await closeSocketServer(server);
+      try {
+        if (existsSync(socketPath)) unlinkSync(socketPath);
+      } catch {
+        /* closing the server already releases its socket; this is only cleanup */
+      }
+    },
+  };
+};
+
+interface BuzzMessageIngressOptions {
+  ceoConversation: CeoConversationPort;
+  ownerActors: readonly string[];
+  /** Daemon-owned existing-session sender; when present, never fall back to MCP. */
+  gatewayConversation?: (text: string, source: GatewayEventSource) => Promise<CeoTurnOutcome>;
+  /**
+   * B2's live-peer port, for events addressed to a role by `p` tag.
+   *
+   * Optional, and its absence fails closed rather than open: with no port every resolved role
+   * is unreachable, so a mention is refused with `ROLE_PEER_ABSENT` and nothing is delivered.
+   * A composition that forgets to wire it loses delivery, never gains a wrong recipient.
+   */
+  roleConversation?: RoleConversationPort;
+}
+
+/** Build the shared daemon/relay admission path independently of its local socket transport. */
+export const createBuzzMessageIngress = (
+  cp: ControlPlane,
+  policy: IngressPolicy,
+  options: BuzzMessageIngressOptions,
+): LocalBuzzMessageIngress["seam"] => {
   if (!policy.secret || policy.secret.trim().length === 0) {
     throw new Error("Buzz message ingress requires a non-empty signing secret");
   }
@@ -1784,29 +1707,7 @@ export const startBuzzMessageIngressListener = async (
             roleKey,
           }),
   };
-  const socketPath = join(stateDir, "buzz-message.ingress.sock");
-  removeStaleSocket(socketPath);
-  const server = createServer((socket) => serveBuzzMessageTurn(socket, ingress, port));
-
-  try {
-    await listenSocket(server, socketPath);
-  } catch (err) {
-    if (existsSync(socketPath)) unlinkSync(socketPath);
-    throw err;
-  }
-
-  return {
-    socketPath,
-    seam: { ingress, port, roleConversation },
-    close: async () => {
-      await closeSocketServer(server);
-      try {
-        if (existsSync(socketPath)) unlinkSync(socketPath);
-      } catch {
-        /* closing the server already releases its socket; this is only cleanup */
-      }
-    },
-  };
+  return { ingress, port, roleConversation };
 };
 
 /**
@@ -2065,15 +1966,29 @@ export const buzzMentionVerdictOf = (decision: Decision<unknown>): BuzzMentionVe
   return admission === "REFUSED" ? { admission, reasonCode: decision.reasonCode } : { admission };
 };
 
+/** Record a refused CEO envelope at the daemon boundary, without retaining its content. */
+const auditBuzzPeerRefusal = (
+  cp: ControlPlane,
+  author: string,
+  eventId: string,
+  reasonCode: string | undefined,
+): void => {
+  if (author.trim() !== buzzPeerRegistry(cp).currentCeo()?.channelIdentity) return;
+  cp.audit.record({
+    kind: "BUZZ_PEER_REFUSED",
+    reasonCode: reasonCode !== undefined && isReasonCode(reasonCode) ? reasonCode : ReasonCode.INVALID_ARGUMENT,
+    actor: author,
+    evidence: { eventId },
+  });
+};
+
 /**
  * The envelope the daemon's sink presents for one verified relay event (#760 Part C, #1038).
  *
  * The event's author is presented as the actor and the seam decides what it is: an owner, the
- * current CEO binding speaking as a peer, or nobody. For the CEO's event this is also where the
- * event is bound to its generation — at receipt, through the same rule admission re-runs before
- * its first write — so an envelope built here and dispatched after a rotation is refused rather
- * than re-attributed. Exported so that "built at receipt, dispatched later" is a row a test can
- * write against the exact envelope the sink builds.
+ * current CEO binding speaking as a peer, or nobody. The receipt preserves the addressed CTO
+ * across queueing; a CEO generation change does not invalidate it. Exported so a test can exercise
+ * "built at receipt, dispatched later" against the exact envelope the sink builds.
  */
 export const buzzMentionInputFor = (
   ingress: BuzzMessageIngress,
@@ -2093,10 +2008,8 @@ export const buzzMentionInputFor = (
     // The signed time, which is inside the payload only once a generation proof is attached.
     createdAt: request.event.created_at,
   };
-  // #1044. The proof presented is the subscriber's receipt — what was current when the frame
-  // arrived — rather than one built here: a frame that waited across a rotation would otherwise be
-  // stamped with the generation it happened to be processed under. `observePeer` only decides
-  // whether this is a peer's envelope at all, so an owner's payload stays exactly what it was.
+  // Preserve the receipt's CTO target across queueing. `observePeer` decides whether the author
+  // is the resolved CEO, so an owner's payload stays exactly what it was.
   const peer = ingress.observePeer(input).allowed ? request.receipt : null;
   const bound = peer ? { ...input, peer } : input;
   return { ...bound, signature: ingressSignature(secret, buzzMessageSigningRequest(bound)) };
@@ -2208,7 +2121,7 @@ export const startDaemonBuzzMentionSubscriber = (
   if (secret.length === 0) {
     throw new Error("Buzz mention subscriber requires a non-empty signing secret");
   }
-  const sink: BuzzMentionSink = {
+  const messageSink: BuzzMentionSink = {
     admit: async (request) => {
       // #246 — a verified event carrying the owner-approval marker in any form is judged by the
       // approval route and nothing else: first, ahead of the binding marker and the seam, whoever
@@ -2259,7 +2172,25 @@ export const startDaemonBuzzMentionSubscriber = (
       return buzzMentionVerdictOf(delivered);
     },
   };
+  const sink: BuzzMentionSink = {
+    admit: async (request) => {
+      const verdict = await messageSink.admit(request);
+      if (typeof verdict === "object" && (verdict.admission === "REFUSED" || verdict.admission === "PRECEDES_BINDING")) {
+        auditBuzzPeerRefusal(cp, request.event.pubkey, request.event.id,
+          verdict.admission === "PRECEDES_BINDING" ? ReasonCode.BUZZ_MENTION_PRECEDES_BINDING : verdict.reasonCode);
+      }
+      return verdict;
+    },
+  };
   const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
+    reportEventRefusal: ({ author, eventId, reasonCode }) => auditBuzzPeerRefusal(
+      cp,
+      author,
+      eventId,
+      reasonCode === "event-room-not-bound" ? ReasonCode.BUZZ_PEER_CHANNEL_MISMATCH
+        : reasonCode === "event-not-addressed" ? ReasonCode.BUZZ_PEER_TARGET_NOT_BOUND_CTO
+        : reasonCode === "precedes-binding-not-resubmitted" ? ReasonCode.BUZZ_MENTION_PRECEDES_BINDING : reasonCode,
+    ),
     registry: buzzMentionSubscriberRegistry(cp, options.canonical ?? null),
     sink,
     ...(options.openSocket ? { openSocket: options.openSocket } : {}),
@@ -3723,6 +3654,7 @@ const presentedBuzzActorBinding = (value: unknown): {
  * and says nothing cannot hold a slot open.
  */
 const serveBuzzMessageTurn = (
+  cp: ControlPlane,
   socket: Socket,
   ingress: BuzzMessageIngress,
   port: BuzzMessageTurnPort,
@@ -3766,7 +3698,10 @@ const serveBuzzMessageTurn = (
       return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz message ingress message is incomplete"));
     }
     void deliverBuzzMessage(ingress, port, input).then(
-      (decision) => finish(decision),
+      (decision) => {
+        if (!decision.allowed) auditBuzzPeerRefusal(cp, input.actor, input.eventId, decision.reasonCode);
+        finish(decision);
+      },
       (error: unknown) => finish(deny(
         ReasonCode.INTERNAL_ERROR,
         error instanceof Error ? error.message : String(error),

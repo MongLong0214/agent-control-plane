@@ -29,7 +29,7 @@ import {
   asCandidateV47,
 } from "../helpers/released-v47-schema.ts";
 import { V48_ADDED_TRIGGERS } from "../helpers/released-v48-schema.ts";
-import { V49_CHANGED_OBJECTS } from "../helpers/released-v49-schema.ts";
+
 
 afterAll(cleanupTempDirs);
 
@@ -433,7 +433,7 @@ describe("S1: the v46 → v47 step on the released v46 image", () => {
     }
   });
 
-  it("the released v46 image migrated to v47 differs from it by exactly the guard (and v48's four, which follow, and v49's receipts table), whose stored definition is a fresh install's", () => {
+  it("the released v46 image migrated to v47 differs at v47 by exactly the guard, whose stored definition is a fresh install's", () => {
     const fresh = privateStatePath("acp-v47-fresh-");
     new Db(fresh).close();
     const freshGuard = schemaRowsOf(fresh).filter((r) => r.name === GUARD);
@@ -441,10 +441,11 @@ describe("S1: the v46 → v47 step on the released v46 image", () => {
     const path = releasedV46("acp-v47-m3-");
     const before = schemaRowsOf(path);
     approveMigration(path, "v47 M3 witness");
-    new Db(path).close();
-    const after = schemaRowsOf(path);
-    expect(after.filter((r) => r.name !== GUARD && !V48_ADDED_TRIGGERS.includes(r.name) && !V49_CHANGED_OBJECTS.includes(r.name)))
-      .toEqual(before.filter((r) => !V49_CHANGED_OBJECTS.includes(r.name)));
+    let after: ReturnType<typeof schemaRowsOf> = [];
+    new Db(path, { afterMigration: (migration) => {
+      if (migration.toVersion === 47) after = schemaRowsOf(path);
+    } }).close();
+    expect(after.filter((r) => r.name !== GUARD)).toEqual(before);
     expect(after.filter((r) => r.name === GUARD)).toEqual(freshGuard);
   });
 });
