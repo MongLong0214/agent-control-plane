@@ -124,7 +124,7 @@ const start = async () => {
 };
 
 describe("a claimed mention's provenance", () => {
-  it("is the stored room, sender and event id, whatever the text and the tags claim, and knows no thread", async () => {
+  it("is the stored room, sender, event and explicit reply tag, whatever the text claims", async () => {
     const f = await start();
     try {
       f.h.clock.advance(1_000);
@@ -143,7 +143,7 @@ describe("a claimed mention's provenance", () => {
         senderKey: null,
         storedActorUnverified: f.owner.pubkey,
         eventId: forged.id,
-        replyToEventId: null,
+        replyToEventId: "a".repeat(64),
       });
       // Unchanged authority: the principal is still the row's own fact, and the words are data.
       expect(claimed?.principal).toBe("owner");
