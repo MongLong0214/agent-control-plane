@@ -3001,7 +3001,12 @@ export class CodexCliAdapter implements ProviderAdapter {
     this.#workerSessions.delete(handle.externalSessionId);
   }
 
-  /** The account the capacity collector reads, named both on the child and on the allowlist a probe reconstructs. */
+  /**
+   * The account the capacity collector reads. The child receives it as `codexHome` on `runCli`,
+   * which `runtimeEnvironment` writes onto that child's environment. The process environment is
+   * not touched: overlapping probes each carry their own option and cannot restore one another's
+   * saved value.
+   */
   private codexAccountOptions(): { environmentAllowlist: readonly string[]; codexHome: string } {
     return {
       environmentAllowlist: this.#environmentAllowlist.includes("CODEX_HOME")
@@ -3009,23 +3014,6 @@ export class CodexCliAdapter implements ProviderAdapter {
         : [...this.#environmentAllowlist, "CODEX_HOME"],
       codexHome: this.#codexHome,
     };
-  }
-
-  /**
-   * Publish that account as `CODEX_HOME` for one worker probe or worker execution.
-   * `runtimeEnvironment` copies an allowlisted value from the process environment, so a caller that
-   * rebuilds the child env without the explicit `codexHome` argument still sees the configured
-   * account. The explicit argument is what the spawned child receives.
-   */
-  private async runWithCodexHome<T>(effect: () => Promise<T>): Promise<T> {
-    const previous = process.env["CODEX_HOME"];
-    process.env["CODEX_HOME"] = this.#codexHome;
-    try {
-      return await effect();
-    } finally {
-      if (previous === undefined) delete process.env["CODEX_HOME"];
-      else process.env["CODEX_HOME"] = previous;
-    }
   }
 
   async invoke(request: InvocationRequest): Promise<InvocationResult> {
@@ -3046,12 +3034,15 @@ export class CodexCliAdapter implements ProviderAdapter {
     if (request.effort) args.push("-c", `model_reasoning_effort="${request.effort}"`);
     args.push("-s", request.readOnly ? "read-only" : "workspace-write");
     // Only a GPT worker turn drops the outer profile. Codex `workspace-write` otherwise also
-    // opens /tmp and $TMPDIR, and network follows `[sandbox_workspace_write]`. These three keys
-    // are that table (codex 0.163.0): the checkout is the only writable root, and network is off.
-    // Login probes, read-only exec, and a writable exec that forgot `onSpawn` do not get them.
-    // `-o` stays in ACP scratch, outside the checkout. The parent Codex process writes that file
-    // after the turn; the path is not a workspace-write root and is not passed with `--add-dir`,
-    // so a sandboxed shell cannot write it. The ACP parent reads the file after the child exits.
+    // opens /tmp and $TMPDIR, and network follows `[sandbox_workspace_write]`. These keys are
+    // that table (codex 0.163.0): the checkout is the only writable root, and network is off.
+    // `--ignore-user-config` skips only `$CODEX_HOME/config.toml`. A project `.codex/config.toml`
+    // or a profile can still grant `writable_roots`, so the worker pins that list to empty on
+    // the `-c` layer, which overrides those surviving layers. Login probes, read-only exec, and
+    // a writable exec that forgot `onSpawn` do not get them. `-o` stays in ACP scratch, outside
+    // the checkout. The parent Codex process writes that file after the turn; the path is not a
+    // workspace-write root and is not passed with `--add-dir`, so a sandboxed shell cannot write
+    // it. The ACP parent reads the file after the child exits.
     const gptWorkerTurn = request.readOnly === false
       && request.externalSessionId !== undefined
       && request.onSpawn !== undefined;
@@ -3060,6 +3051,7 @@ export class CodexCliAdapter implements ProviderAdapter {
         "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
         "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
         "-c", "sandbox_workspace_write.network_access=false",
+        "-c", "sandbox_workspace_write.writable_roots=[]",
       );
     }
     // Codex rejects `--session-id`. The worker session is the argv element after `--thread-source`,
@@ -3081,7 +3073,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     const tracked = request.onSpawn !== undefined || request.signal !== undefined;
     // Only `gptWorkerTurn` drops the outer profile. A writable exec that forgot `onSpawn` stays
     // inside it and, with the bypass gone, fails closed rather than running unconfined.
-    const execute = (writablePaths: readonly string[], cwd = request.workdir) => this.runWithCodexHome(() => runCli(this.#binary, [...args, prompt], {
+    const execute = (writablePaths: readonly string[], cwd = request.workdir) => runCli(this.#binary, [...args, prompt], {
       cwd,
       timeoutMs: request.timeoutMs,
       ...this.codexAccountOptions(),
@@ -3095,7 +3087,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       readablePaths: { subtrees: this.codexWritableRoots(scratch) },
       ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const } : {}),
       ...(tracked ? { onSpawn: request.onSpawn, signal: request.signal, reapProcessGroup: true as const } : {}),
-    }));
+    });
     let result: Awaited<ReturnType<typeof runCli>>;
     if (request.readOnly) {
       result = await execute([]);
@@ -3196,7 +3188,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       return "UNAVAILABLE";
     }
     const accountHome = existsSync(this.#codexHome) ? realpathSync(this.#codexHome) : undefined;
-    const result = await this.runWithCodexHome(() => runCli(this.#binary, ["login", "status"], {
+    const result = await runCli(this.#binary, ["login", "status"], {
       // The session workdir is the managed runtime root under the read-denied state root. The
       // probe's cwd stays the scratch `runCli` allocates; the workdir is checked by stat above.
       cwd: undefined,
@@ -3207,7 +3199,7 @@ export class CodexCliAdapter implements ProviderAdapter {
         ? { writablePaths: [accountHome], readablePaths: { subtrees: [accountHome] } }
         : {}),
       reapProcessGroup: true,
-    }));
+    });
     if (result.processGroup && !result.processGroup.reaped) throw new ProbeProcessGroupUnconfirmed(result.processGroup);
     if (result.exitCode !== 0 || result.timedOut || !result.processGroup) return "UNAVAILABLE";
     return "HEALTHY";

@@ -5,7 +5,7 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { WorkerTurnRunner, type WorkerProcessPort } from "../../src/run/worker-turn.ts";
-import { ClaudeCliAdapter, CodexCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
+import { ClaudeCliAdapter, CodexCliAdapter, runtimeEnvironment, __testing } from "../../src/runtime/cli-adapters.ts";
 import type { InvocationRequest } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, makeCore, tempDir } from "../helpers/fixtures.ts";
 import { seedWorkerWorld } from "../helpers/worker-turn-fixture.ts";
@@ -113,6 +113,7 @@ it("restarts a Codex worker from its real --thread-source launch and still requi
   expect(matched.argv).toContain("sandbox_workspace_write.exclude_slash_tmp=true");
   expect(matched.argv).toContain("sandbox_workspace_write.exclude_tmpdir_env_var=true");
   expect(matched.argv).toContain("sandbox_workspace_write.network_access=false");
+  expect(matched.argv).toContain("sandbox_workspace_write.writable_roots=[]");
   expect(matched.codexHome).toContain("/home");
 
   const mismatched = await reconcileCodexLaunch(({ token }) => { token.value = "darwin-tv:9999.000009"; });
@@ -133,15 +134,17 @@ it("pins the configured Codex home on the login probe and keeps the outer profil
   mkdirSync(account);
   const previous = process.env["CODEX_HOME"];
   const clock = new ManualClock("2026-10-20T00:00:00.000Z");
-  const seen: Array<{ command: string; sandbox: string; home: string | undefined; during: string | undefined }> = [];
+  const seen: Array<{ command: string; sandbox: string; home: string | undefined; during: string | undefined; child: string | undefined }> = [];
   __testing.setRunCli(async (_file, args, options) => {
     expect(args).not.toContain("sandbox_workspace_write.exclude_slash_tmp=true");
     expect(args).not.toContain("sandbox_workspace_write.network_access=false");
+    expect(args).not.toContain("sandbox_workspace_write.writable_roots=[]");
     seen.push({
       command: args.slice(0, 2).join(" "),
       sandbox: options.sandbox ?? "outer-profile",
       home: options.codexHome,
       during: process.env["CODEX_HOME"],
+      child: runtimeEnvironment(options.environmentAllowlist ?? [], root, undefined, options.codexHome)["CODEX_HOME"],
     });
     return ok;
   });
@@ -171,6 +174,7 @@ it("pins the configured Codex home on the login probe and keeps the outer profil
     expect(args).toContain("sandbox_workspace_write.exclude_slash_tmp=true");
     expect(args).toContain("sandbox_workspace_write.exclude_tmpdir_env_var=true");
     expect(args).toContain("sandbox_workspace_write.network_access=false");
+    expect(args).toContain("sandbox_workspace_write.writable_roots=[]");
     expect(args[args.indexOf("--thread-source") + 1]).toBe(session);
     expect(options.codexHome).toBe(account);
     return ok;
@@ -189,7 +193,8 @@ it("pins the configured Codex home on the login probe and keeps the outer profil
   expect(seen.map((call) => call.command)).toEqual(["login status", "exec -m"]);
   expect(seen.map((call) => call.sandbox)).toEqual(["outer-profile", "outer-profile"]);
   expect(seen.map((call) => call.home)).toEqual([account, account]);
-  expect(seen.map((call) => call.during)).toEqual([account, account]);
+  expect(seen.map((call) => call.child)).toEqual([account, account]);
+  expect(seen.map((call) => call.during)).toEqual([previous, previous]);
   expect(workerSandbox).toBe("codex-workspace-write");
   expect(process.env["CODEX_HOME"]).toBe(previous);
 
@@ -209,4 +214,50 @@ it("pins the configured Codex home on the login probe and keeps the outer profil
     onSpawn: () => undefined,
   });
   expect(claudeSeen).toEqual(["outer-profile"]);
+});
+
+it("overlapping account probes leave process.env.CODEX_HOME unchanged", async () => {
+  const root = tempDir("codex-r1-overlap-");
+  const inherited = join(root, "inherited");
+  const account = join(root, "configured-account");
+  mkdirSync(account);
+  const previous = process.env["CODEX_HOME"];
+  process.env["CODEX_HOME"] = inherited;
+  const release: Array<() => void> = [];
+  const seen: Array<{ phase: "start" | "end"; env: string | undefined; child: string | undefined }> = [];
+  try {
+    __testing.setRunCli(async (_file, _args, options) => {
+      const child = runtimeEnvironment(options.environmentAllowlist ?? [], root, undefined, options.codexHome)["CODEX_HOME"];
+      seen.push({ phase: "start", env: process.env["CODEX_HOME"], child });
+      await new Promise<void>((resolve) => release.push(resolve));
+      seen.push({ phase: "end", env: process.env["CODEX_HOME"], child });
+      return ok;
+    });
+    const clock = new ManualClock("2026-10-20T00:00:00.000Z");
+    const adapter = new CodexCliAdapter({
+      clock,
+      binary: process.execPath,
+      capacityFile: join(root, "capacity.json"),
+      codexHome: account,
+    });
+    const one = await adapter.startSession({ model: "gpt-6.1-sol", workdir: root, purpose: "worker:one" });
+    const two = await adapter.startSession({ model: "gpt-6.1-sol", workdir: root, purpose: "worker:two" });
+    const first = adapter.probeSession(one);
+    const second = adapter.probeSession(two);
+    expect(release).toHaveLength(2);
+    expect(process.env["CODEX_HOME"]).toBe(inherited);
+    release[0]!();
+    expect(await first).toBe("HEALTHY");
+    expect(process.env["CODEX_HOME"]).toBe(inherited);
+    release[1]!();
+    expect(await second).toBe("HEALTHY");
+    expect(process.env["CODEX_HOME"]).toBe(inherited);
+    expect(seen.map((row) => row.phase)).toEqual(["start", "start", "end", "end"]);
+    expect(seen.map((row) => row.env)).toEqual([inherited, inherited, inherited, inherited]);
+    expect(seen.map((row) => row.child)).toEqual([account, account, account, account]);
+  } finally {
+    for (const end of release) end();
+    if (previous === undefined) delete process.env["CODEX_HOME"];
+    else process.env["CODEX_HOME"] = previous;
+  }
 });

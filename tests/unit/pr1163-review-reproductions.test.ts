@@ -78,8 +78,9 @@ it("PR1163-R1-02: capacity, login and worker exec use the configured Codex accou
   const capacity = vi.spyOn(SpawnCodexRateLimitProbe.prototype, "read").mockResolvedValue({ primary: { usedPercent: 5, windowDurationMins: 300, resetsAt: 1792468800 } });
   const seen: Array<{ command: string; home: string; granted: readonly string[] }> = [];
   __testing.setRunCli(async (_file, args, options) => {
-    // This is the same environment constructor used by productionRunCli for both calls.
-    const env = runtimeEnvironment(options.environmentAllowlist ?? [], root, options.providerCredentialDir);
+    // productionRunCli passes the configured account as the explicit codexHome argument.
+    // The process environment is not a channel for it.
+    const env = runtimeEnvironment(options.environmentAllowlist ?? [], root, options.providerCredentialDir, options.codexHome);
     seen.push({ command: args.slice(0, 2).join(" "), home: env["CODEX_HOME"] ?? join(env["HOME"]!, ".codex"), granted: options.writablePaths ?? [] });
     return ok;
   });
