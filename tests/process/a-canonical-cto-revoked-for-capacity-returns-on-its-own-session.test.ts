@@ -349,7 +349,9 @@ const started = async (relayProject = PROJECT) => {
   const revokeForCapacity = async (): Promise<void> => {
     claude.setCapacity(exhausted(clock));
     await daemon.reconcileContinuity("weekly window exhausted");
-    expect(cp.bindings.active(CTO)).toBeNull();
+    expect(cp.bindings.active(CTO)).toMatchObject({ sessionId: session.sessionId, bindingGeneration: 1 });
+    // Simulate a persisted revocation from the old quota-gated daemon.
+    expect(cp.bindings.revoke(CTO, CONTINUITY_CAPACITY_EXHAUSTED_REVOCATION_REASON).allowed).toBe(true);
     expect(latest().revoked_reason).toBe(CONTINUITY_CAPACITY_EXHAUSTED_REVOCATION_REASON);
   };
   const windowResets = (): void => {
@@ -530,34 +532,16 @@ describe("#1106: a canonical CTO revoked only for capacity returns on its own se
     expect(f.cp.sessions.require(f.sessionId).credentialEpoch).toBe(1);
   });
 
-  it("refuses an old measurement and an UNKNOWN one", async () => {
-    const f = await started();
-    await f.revokeForCapacity();
-    const revokedAt = Date.parse(f.clock.nowIso());
-    f.clock.advance(60_000);
-    // HEALTHY and past the window, but measured before the revocation.
-    f.claude.setCapacity(healthy(f.clock, new Date(revokedAt - 1_000).toISOString()));
-    const old = await f.port().restore(CTO);
-    expect(old?.evidence).toMatchObject({ condition: CanonicalCtoRestoreCondition.CAPACITY_NOT_FRESH });
-
-    f.clock.advance(CANONICAL_CTO_RESTORE_BACKOFF_MS);
-    f.claude.setCapacity({ ...healthy(f.clock), runtimeHealth: "UNKNOWN" });
-    const unknown = await f.port().restore(CTO);
-    expect(unknown?.evidence).toMatchObject({ condition: CanonicalCtoRestoreCondition.CAPACITY_NOT_FRESH });
-
-    expect(f.cp.bindings.active(CTO)).toBeNull();
-    expect(f.refusals()).toEqual([CanonicalCtoRestoreCondition.CAPACITY_NOT_FRESH, CanonicalCtoRestoreCondition.CAPACITY_NOT_FRESH]);
-  });
-
-  it("refuses while the window has not reset", async () => {
+  it.each(["old", "unknown", "exhausted"] as const)("restores a legacy revocation with %s advisory capacity", async (kind) => {
     const f = await started();
     await f.revokeForCapacity();
     f.clock.advance(60_000);
-    // A new HEALTHY measurement, still exhausted.
-    f.claude.setCapacity(exhausted(f.clock));
-    const refused = await f.port().restore(CTO);
-    expect(refused?.evidence).toMatchObject({ condition: CanonicalCtoRestoreCondition.CAPACITY_WINDOW_NOT_RESET });
-    expect(f.cp.bindings.active(CTO)).toBeNull();
+    f.claude.setCapacity(kind === "old" ? healthy(f.clock, "2020-01-01T00:00:00Z")
+      : kind === "unknown" ? { ...healthy(f.clock), runtimeHealth: "UNKNOWN", buckets: [] }
+      : exhausted(f.clock));
+    expect(await f.port().restore(CTO)).toMatchObject({ allowed: true });
+    expect(f.cp.bindings.active(CTO)).toMatchObject({ sessionId: f.sessionId, bindingGeneration: 2 });
+    expect(f.refusals()).toEqual([]);
   });
 
   // Keyed by name and resolved inside the case, so the file still loads at a base without the split.
@@ -609,7 +593,7 @@ describe("#1106: a canonical CTO revoked only for capacity returns on its own se
     expect(f.cp.sessions.require(f.sessionId).credentialEpoch).toBe(0);
   });
 
-  it("refuses when the window closes again while the challenge is answered", async () => {
+  it("restores when quota falls again while the authenticated connection is checked", async () => {
     const f = await started();
     await f.revokeForCapacity();
     f.windowResets();
@@ -622,8 +606,8 @@ describe("#1106: a canonical CTO revoked only for capacity returns on its own se
     await f.cp.capacity.refresh(RefreshTrigger.CONTINUITY_EVALUATION, ["claude"]);
     f.transport.release();
     const refused = await restoring;
-    expect(refused?.evidence).toMatchObject({ condition: CanonicalCtoRestoreCondition.CAPACITY_WINDOW_NOT_RESET });
-    expect(f.cp.bindings.active(CTO)).toBeNull();
+    expect(refused).toMatchObject({ allowed: true });
+    expect(f.cp.bindings.active(CTO)).toMatchObject({ sessionId: f.sessionId, bindingGeneration: 2 });
   });
 
   it("re-proves the attach target inside the bind, and refuses when the claude ends as the bind opens", async () => {
@@ -953,7 +937,7 @@ describe("review S2B-R1-01: a relay takes a succession only for its own role, bi
       });
       onConnect(index, socket);
     });
-    await new Promise<void>((resolve) => server.listen(path, resolve));
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(path, resolve); });
     closers.push(async () => {
       for (const socket of connections) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));

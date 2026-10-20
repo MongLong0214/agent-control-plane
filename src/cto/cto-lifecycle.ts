@@ -1027,10 +1027,11 @@ export class CtoLifecycle {
     ownerApproved: boolean,
     reason: string,
     owner?: { channel: string; actor: string },
+    authenticatedOwner?: string,
   ): Promise<Decision<void>> {
     // §14.6 — suspension is an owner decision. A bare boolean is a claim, not an
     // authorisation, so an allowlisted owner identity has to carry it.
-    if (ownerApproved) {
+    if (ownerApproved && !authenticatedOwner) {
       const authorised =
         owner && this.#ownerAuthority?.isAllowedActor(owner.channel, owner.actor) === true;
       if (!authorised) {
@@ -1170,7 +1171,7 @@ export class CtoLifecycle {
 
   latestHandoff(projectId: string): (HandoffPackage & { handoffId: string; status: string }) | null {
     const row = this.db.get<RawHandoff>(
-      `SELECT * FROM handoffs WHERE project_id = ? ORDER BY created_at DESC LIMIT 1`,
+      `SELECT * FROM handoffs WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
       [projectId],
     );
     if (!row) return null;

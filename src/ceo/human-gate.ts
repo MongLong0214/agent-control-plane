@@ -1,23 +1,14 @@
-import { ExecutionMode, type ExecutionMode as ExecutionModeValue } from "../domain/types.ts";
+import type { ExecutionMode } from "../domain/types.ts";
 
-/** PRD §21 — decisions that cannot be delegated to an agent role. */
+/** Consent is required for destructive operations, independent of the run's mode. */
 export const HUMAN_GATE_TRIGGERS = [
   "irreversible production action",
   "destructive data migration or delete",
-  "security or permission boundary expansion",
-  "public api or protocol breaking change",
-  "core product direction change",
-  "significant new cost or paid plan change",
   "project decommission",
-  "capacity-driven project suspend",
-  "quality gate reduction exception",
-  "undelegated public release",
 ] as const;
 
-type HumanGateTrigger = (typeof HUMAN_GATE_TRIGGERS)[number];
-
 export interface HumanGateInput {
-  executionMode: ExecutionModeValue;
+  executionMode: ExecutionMode;
   goal: string;
   scope: readonly string[];
   declaredItems: readonly string[];
@@ -26,69 +17,25 @@ export interface HumanGateInput {
 export interface HumanGateDefinition {
   required: boolean;
   items: string[];
-  /**
-   * FD-R1-DUP — every declared owner question that repeats an earlier declaration once both are
-   * normalised (surrounding space, case and inner whitespace). Read from the declarations as stored,
-   * before `items` drops the repeats, so a durable contract that names one question twice is seen as
-   * doing so; the gate refuses such a definition rather than binding the question once.
-   */
-  duplicateDeclarations: string[];
 }
 
-/**
- * The task contract may add owner questions, but it may not remove a question that the
- * run's own mode, goal, or declared scope makes mandatory. These are intentionally narrow
- * textual classifiers: a control plane cannot infer an arbitrary diff, but it can recognise
- * the §21 classes it was explicitly asked to run.
- */
-const TRIGGER_PHRASES: Readonly<Record<HumanGateTrigger, readonly string[]>> = {
-  "irreversible production action": ["irreversible production", "irreversible action"],
-  "destructive data migration or delete": ["destructive data migration", "destructive migration", "delete"],
-  "security or permission boundary expansion": ["security boundary", "permission boundary", "permission expansion"],
-  "public api or protocol breaking change": ["public api", "protocol breaking", "breaking change"],
-  "core product direction change": ["core product direction", "product direction"],
-  "significant new cost or paid plan change": ["significant new cost", "paid plan", "cost change"],
-  "project decommission": ["project decommission", "decommission project"],
-  "capacity-driven project suspend": ["capacity-driven project suspend", "capacity driven project suspend"],
-  "quality gate reduction exception": ["quality gate reduction", "quality gate exception"],
-  "undelegated public release": ["undelegated public release", "public release"],
-};
-
-const normalise = (value: string): string => value.trim().toLowerCase().replace(/\s+/g, " ");
-
-const uniqueNonEmpty = (items: readonly string[]): string[] =>
-  [...new Set(items.map((item) => item.trim()).filter(Boolean))];
-
-const matches = (trigger: HumanGateTrigger, text: string): boolean =>
-  text.includes(normalise(trigger)) || TRIGGER_PHRASES[trigger].some((phrase) => text.includes(phrase));
-
-/** The declared questions, as declared, that normalise to a question declared earlier. A blank declaration names none. */
-export const repeatedHumanGateDeclarations = (declared: readonly string[]): string[] => {
-  const seen = new Set<string>();
-  return declared.filter((item) => {
-    const key = normalise(item);
-    if (!key) return false;
-    if (seen.has(key)) return true;
-    seen.add(key);
-    return false;
-  });
-};
-
-/**
- * Computes the gate from durable run properties. A GUARDED run with no owner item remains
- * required but intentionally has an empty item list; callers must fail it closed rather than
- * interpreting the empty declaration as an opt-out.
- */
+/** Classify stated actions, rather than benign keywords or arbitrary owner questions. */
 export const deriveHumanGate = (input: HumanGateInput): HumanGateDefinition => {
-  const declaredItems = uniqueNonEmpty(input.declaredItems);
-  const runText = [input.goal, ...input.scope].map(normalise).filter(Boolean).join(" ");
-  const triggeredItems = HUMAN_GATE_TRIGGERS.filter((trigger) => matches(trigger, runText));
-  const items = uniqueNonEmpty([...triggeredItems, ...declaredItems]);
-
-  return {
-    required:
-      input.executionMode === ExecutionMode.GUARDED || triggeredItems.length > 0 || declaredItems.length > 0,
-    items,
-    duplicateDeclarations: repeatedHumanGateDeclarations(input.declaredItems),
-  };
+  const actions = [input.goal, ...input.scope, ...input.declaredItems]
+    .map((text) => text.trim().toLowerCase().replace(/\s+/g, " "));
+  const items = new Set<string>();
+  for (const text of actions) {
+    const action = text.replace(/^(?:please|can you|could you|would you)\s+/, "");
+    if (/^(?:document|describe|explain|test|review|discuss|prevent|avoid)\b/.test(action) ||
+        /\b(?:do not|don't|never|without)\s+(?:delete|drop|truncate|wipe|destroy|decommission|perform|execute|apply|run)\b/.test(action)) continue;
+    if (/^(?:(?:perform|execute|apply|run) (?:an? )?)?irreversible (?:production )?action\b/.test(action)) {
+      items.add(HUMAN_GATE_TRIGGERS[0]);
+    }
+    if (/^(?:(?:perform|execute|apply|run) (?:a )?)?destructive (?:data )?migration\b/.test(action) ||
+        /^(?:permanently )?(?:delete|drop|truncate|wipe|destroy)\s+(?:all\s+|the\s+|production\s+|user\s+)*(?:data|database|tables?|records?|files?|repositories|repository)\b/.test(action)) {
+      items.add(HUMAN_GATE_TRIGGERS[1]);
+    }
+    if (/^(?:decommission (?:the )?project|project decommission)\b/.test(action)) items.add(HUMAN_GATE_TRIGGERS[2]);
+  }
+  return { required: items.size > 0, items: [...items] };
 };

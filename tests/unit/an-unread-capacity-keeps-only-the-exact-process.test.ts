@@ -147,7 +147,7 @@ const incumbentWithoutReading = (osPid: number, osStartedAt: string | null) => {
   return { cp, clock, daemon, roleKey, incumbent: bound.value, session: cp.sessions.require(session.sessionId), held };
 };
 
-const kept = (roleKey: string) => [{ roleKey, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE }];
+const kept = (_roleKey: string) => [];
 const notKept = (roleKey: string) => [{ roleKey, reasonCode: ReasonCode.COVERAGE_NONE }];
 
 describe("the keep for an unread provider needs a decisive identity for the incumbent", () => {
@@ -167,8 +167,8 @@ describe("the keep for an unread provider needs a decisive identity for the incu
 
     expect(first?.unresolved).toEqual(notKept(fixture.roleKey));
     // The finite hold is unchanged: it still accepts this record, and it still ends.
-    expect(fixture.held()).toBe(1);
-    expect(fixture.cp.bindings.active(fixture.roleKey)).not.toBeNull();
+    expect(fixture.held()).toBe(0);
+    expect(fixture.cp.bindings.active(fixture.roleKey)).toBeNull();
     expect(fixture.cp.sessions.pinnedNativeStart(fixture.session.sessionId)).toBeNull();
 
     fixture.clock.advance(COVERAGE_REVOCATION_GRACE_MS + 1_000);
@@ -188,7 +188,7 @@ describe("the keep for an unread provider needs a decisive identity for the incu
     const report = await fixture.daemon.reconcileContinuity("no reading, row inside the start second");
 
     expect(report?.unresolved).toEqual(notKept(fixture.roleKey));
-    expect(fixture.held()).toBe(1);
+    expect(fixture.held()).toBe(0);
     expect(fixture.cp.sessions.pinnedNativeStart(fixture.session.sessionId)).toBeNull();
   });
 
@@ -317,6 +317,7 @@ describe("ACP1045-R3-01: a pin names the process whose lstart its row records", 
     });
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
 
+    cp.sessions.transition(incumbent.sessionId, SessionLifecycle.ERROR, "runtime lost");
     const report = await new Daemon(cp, { stateDir: join(root, "daemon") }).reconcileContinuity("provision under a race");
 
     expect(report?.reassigned).toHaveLength(1);

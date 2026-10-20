@@ -131,7 +131,7 @@ it('R6 a previously refused but unconsumed receipt can release the orphan when i
   const refused=await repairs.execute(repairRequest); expect(refused.allowed).toBe(false);
   expect(world.audit.byKind('OWNER_APPROVAL_CONSUMED')).toHaveLength(0);
   adapter.killAll(); await first.settled(started.value.executionId); scan.listing='';
-  expect(authority.assertConsumable(admitted.value,null).allowed).toBe(true);
+  expect(authority.assertApproval(admitted.value).allowed).toBe(true);
   const released=await repairs.execute(repairRequest); expect(released.allowed).toBe(true);
   adapter.script={neverRuns:true}; const retry=await restarted.start(request);
   console.error('R6_SUCCESS_STILL_BLOCKED',JSON.stringify({refused,released,retry}));

@@ -354,7 +354,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     const created = harness.cp.runs.create({
       projectId,
       executionMode: ExecutionMode.GUARDED,
-      contract: { ...CONTRACT, humanGate: ["public release"] },
+      contract: { ...CONTRACT, humanGate: ["irreversible production action"] },
       repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
     });
     if (!created.allowed) throw new Error(created.message);
@@ -363,7 +363,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
 
     expect(harness.cp.ceo.humanGateStatus(created.value.runId)).toEqual({
       required: true,
-      items: ["public release"],
+      items: ["irreversible production action"],
       satisfied: false,
     });
 
@@ -374,10 +374,10 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     harness.cp.runs.transition(created.value.runId, RunState.AWAITING_HUMAN, "owner decision needed");
     const approved = harness.cp.ceo.recordOwnerDecision({
       runId: created.value.runId,
-      item: "public release",
+      item: "irreversible production action",
       approved: true,
       note: "approved by owner",
-      receipt: ownerDecisionReceipt(harness, created.value.runId, "public release", true, "approved by owner"),
+      receipt: ownerDecisionReceipt(harness, created.value.runId, "irreversible production action", true, "approved by owner"),
     });
     expect(approved.allowed).toBe(true);
     expect(harness.cp.ceo.humanGateStatus(created.value.runId).satisfied).toBe(true);

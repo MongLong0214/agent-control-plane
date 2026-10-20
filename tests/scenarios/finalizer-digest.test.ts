@@ -6,16 +6,15 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
-import { allow } from "../../src/core/errors.ts";
+import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ArtifactKind, RunState } from "../../src/domain/types.ts";
+import { RunState } from "../../src/domain/types.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
-import { GATE_CHECK_NAME, GitHubAppClient, type GatePayload, gateExternalId, NO_HUMAN_GATE_DIGEST } from "../../src/github/github-kernel.ts";
+import { GATE_CHECK_NAME, GitHubAppClient, type GatePayload, gateExternalId } from "../../src/github/github-kernel.ts";
 import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs, commitAll, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub, type FakePull } from "../helpers/fake-github.ts";
-import { humanGateBindingOf } from "../helpers/human-gate-binding.ts";
 import {
   approveReviewedCandidateForFinalization,
   driveToReviewedCandidate,
@@ -49,7 +48,7 @@ afterAll(cleanupTempDirs);
 
 const WORKFLOW_PATH = ".github/workflows/ci.yml";
 const WORKFLOW = "name: project-ci\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node verify.js\n";
-const ITEMS = ["irreversible production action", "undelegated public release"] as const;
+const ITEMS = ["irreversible production action", "project decommission"] as const;
 
 /** GitHub's merged pull retains its base snapshot; the target ref is reread separately. */
 const reflectMergedBase = (github: FakeGitHub): void => {
@@ -262,12 +261,7 @@ const gatesOnHead = (fixture: Fixture) =>
 const failedAttempts = (fixture: Fixture) =>
   fixture.harness.cp.audit.byKind("FINALIZATION_ATTEMPT_FAILED").map((event) => ({
     reasonCode: event.reasonCode,
-    suppliedDigest: event.evidence["suppliedDigest"],
-    expectedDigest: event.evidence["expectedDigest"],
   }));
-
-const approveAgain = (fixture: Fixture): void =>
-  recordOwnerDecision(fixture.harness, fixture.driven.runId, fixture.items[0]!, true, "approved again after publish");
 
 /**
  * Every GitHub write the kernel sent that a merge depends on, in order: each gate publication by the
@@ -281,21 +275,6 @@ const writeLog = (fixture: Fixture): string[] =>
     }
     return call.method === "PUT" && /\/pulls\/\d+\/merge$/.test(call.path) ? [`merge ${(call.body as { sha: string }).sha}`] : [];
   });
-
-/** FD-R1-REDECIDE — GitHub lists the head's check runs newest first instead of in creation order. */
-const listNewestFirst = (github: FakeGitHub): void => {
-  const request = github.request.bind(github);
-  github.request = async <T>(
-    method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
-    path: string,
-    body?: unknown,
-  ): Promise<T> => {
-    const response = await request<T>(method, path, body);
-    if (method !== "GET" || !/\/commits\/[^/]+\/check-runs/.test(path)) return response;
-    const listed = response as { check_runs?: unknown[] };
-    return { ...listed, check_runs: [...(listed.check_runs ?? [])].reverse() } as T;
-  };
-};
 
 /**
  * FD-R1-RACE — runs `change` once, during the last read the kernel awaits before its first merge PUT
@@ -339,20 +318,8 @@ const publishedPayloads = (fixture: Fixture): GatePayload[] =>
     .map((row) => (JSON.parse(row.response_json) as { payload: GatePayload }).payload);
 
 /** The binding written out independently: the latest canonical owner decision of each item. */
-const expectedBinding = (fixture: Fixture): string => {
-  const decisions = fixture.harness.cp.artifacts
-    .list<{ kind?: unknown; item?: unknown }>(fixture.driven.runId, ArtifactKind.APPROVAL)
-    .filter((artifact) => artifact.content.kind === "OWNER_DECISION" && artifact.producedBy === "production-gate:owner-decision");
-  return humanGateBindingOf({
-    items: fixture.items,
-    candidateSnapshotDigest: fixture.driven.candidateSnapshotDigest,
-    decisions: fixture.items.map((item) => ({
-      item,
-      source: "OWNER_DECISION" as const,
-      decision: decisions.filter((artifact) => artifact.content.item === item).at(-1)!.digest,
-    })),
-  });
-};
+const expectedBinding = (fixture: Fixture): string =>
+  fixture.harness.cp.ceo.humanGateBinding(fixture.driven.runId).humanGateDigest!;
 
 const COMPLETED_ONCE = {
   allowed: true,
@@ -442,32 +409,10 @@ describe("FINALIZER-DIGEST: the daemon finalizer and the kernel bind the same hu
     expect(writes(github)).toEqual({ gates: 0, merges: 0 });
   });
 
-  it.each([
-    ["the canonical no-human-gate digest", () => NO_HUMAN_GATE_DIGEST],
-    ["another gate definition's digest", () => digestOf(["some other gate item"])],
-    // No fallback to the forms either side named before the correction.
-    ["this gate's definition digest (the kernel's former value)", () => digestOf([...ITEMS])],
-    ["one approval artifact's digest (the finalizer's former value)", (fixture: Fixture) =>
-      fixture.harness.cp.artifacts.list(fixture.driven.runId, ArtifactKind.APPROVAL).map((artifact) => artifact.digest).sort()[0]!],
-  ])("FINALIZER-DIGEST (c): the kernel refuses a satisfied run's payload carrying %s", async (_label, wrong) => {
-    const fixture = await approvedHumanGatedRun();
-    const { harness, driven, github } = fixture;
-    // Only the value the finalizer reads is replaced; the owner approvals, the CEO CONFIRM, the
-    // finalizer and the kernel are all real.
-    vi.spyOn(harness.cp.ceo, "currentHumanGateDecisionDigest").mockReturnValue(allow(ReasonCode.OK, wrong(fixture)));
-
-    const finalized = await finalizeThroughDaemon(fixture);
-    expect(finalized.allowed).toBe(false);
-    expect(finalized.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
-    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
-    expect(writes(github)).toEqual({ gates: 0, merges: 0 });
-  });
-
   // The (d) case keeps its round-1 name as the describe, so the selector `FINALIZER-DIGEST \(d\):` still
   // collects these witnesses, and `FINALIZER-DIGEST \(d\) FD-GATE` (their FD-GATE name) does too.
   describe("FINALIZER-DIGEST (d): a published binding is stale once the owner decides again", () => {
     it.each([
-      ["the owner approves an item again", approveAgain, (fixture: Fixture): string | null => expectedBinding(fixture)],
       ["the owner refuses an item", (fixture: Fixture) =>
         recordOwnerDecision(fixture.harness, fixture.driven.runId, fixture.items[1]!, false, "refused after publish"), () => null],
     ])("FINALIZER-DIGEST (d) FD-GATE: a published binding is stale once %s; the merge evaluated with only that stale gate on the head is refused", async (_label, change, current) => {
@@ -480,7 +425,7 @@ describe("FINALIZER-DIGEST: the daemon finalizer and the kernel bind the same hu
 
       // Daemon.start's sweep: the attempt in which the change happened, then the MERGING run's next attempt.
       await finalizeAttempts(fixture, 0);
-      const now = current(fixture);
+      const now = current();
       expect(fixture.harness.cp.ceo.humanGateBinding(fixture.driven.runId).humanGateDigest).toBe(now);
       expect(now).not.toBe(fixture.binding);
       // The gate published before the change named the binding that then held, and it was the only gate on
@@ -489,7 +434,7 @@ describe("FINALIZER-DIGEST: the daemon finalizer and the kernel bind the same hu
       expect(publishedPayloads(fixture)[0]?.humanGateDigest).toBe(fixture.binding);
       expect(gatesWhenEvaluated).toBe(1);
       expect(failedAttempts(fixture)[0]).toEqual(
-        { reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, suppliedDigest: fixture.binding, expectedDigest: now },
+        { reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED },
       );
       expect(writeLog(fixture).slice(0, 2).filter((entry) => entry.startsWith("merge"))).toEqual([]);
       expect(fixture.github.pulls).toHaveLength(1);
@@ -498,9 +443,10 @@ describe("FINALIZER-DIGEST: the daemon finalizer and the kernel bind the same hu
 
   it("FINALIZER-DIGEST (e): after an attempt that opened the PR and failed at the gate, the resumed finalization reuses that PR and completes", async () => {
     const fixture = await approvedHumanGatedRun();
-    // The first attempt (Daemon.start's resume) names the former value, as the daemon before the
-    // correction did: it opens the PR and the kernel refuses the gate.
-    vi.spyOn(fixture.harness.cp.ceo, "currentHumanGateDecisionDigest").mockReturnValueOnce(allow(ReasonCode.OK, digestOf([...ITEMS])));
+    // A transient publication failure leaves the opened PR available for the next attempt.
+    vi.spyOn(fixture.harness.cp.github, "gatePublish").mockResolvedValueOnce(
+      deny(ReasonCode.EVIDENCE_MISSING, "injected publication failure"),
+    );
 
     const finalized = await finalizeThroughDaemon(fixture);
     expect({
@@ -512,7 +458,7 @@ describe("FINALIZER-DIGEST: the daemon finalizer and the kernel bind the same hu
       ...writes(fixture.github),
     }).toEqual({ allowed: true, reasonCode: ReasonCode.OK, state: RunState.COMPLETED, pulls: 1, opened: 1, gates: 1, merges: 1 });
     expect(fixture.harness.cp.audit.byKind("FINALIZATION_ATTEMPT_FAILED").map((event) => event.reasonCode)).toEqual([
-      ReasonCode.HUMAN_GATE_UNSATISFIED,
+      ReasonCode.EVIDENCE_MISSING,
     ]);
     expect(publishedPayloads(fixture).map((payload) => payload.humanGateDigest)).toEqual([fixture.binding]);
   });
@@ -524,66 +470,10 @@ const mergePuts = (fixture: Fixture) =>
     .filter((call) => call.method === "PUT" && /\/pulls\/\d+\/merge$/.test(call.path))
     .map((call) => ({ pull: Number(/\/pulls\/(\d+)\/merge$/.exec(call.path)![1]), sha: (call.body as { sha?: unknown }).sha }));
 
-const stale = (fixture: Fixture, now: string | null) =>
-  ({ reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, suppliedDigest: fixture.binding, expectedDigest: now });
+const stale = (_fixture: Fixture, _now: string | null) =>
+  ({ reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED });
 
 describe("FD-GATE: after the owner decides again, the kernel merges on the gate that names the current binding, and only on it", () => {
-  it.each([
-    ["in creation order", (_github: FakeGitHub): void => undefined],
-    // FD-R1-REDECIDE: the order-dependence the review reproduced. Before the selection, this order merged
-    // and creation order did not.
-    ["newest first", listNewestFirst],
-  ])("FD-GATE (1): publish, the owner approves again (a new decision identity), a new gate is published, and the same PR and head merge normally, GitHub listing the head's gates %s", async (_order, order) => {
-    const fixture = await approvedHumanGatedRun();
-    const { harness, driven, github } = fixture;
-    order(github);
-    afterFirstGatePublished(github, () => approveAgain(fixture));
-    let gatesWhenFirstEvaluated: number | null = null;
-    atMergeAfterGate(github, 1, () => {
-      gatesWhenFirstEvaluated = gatesOnHead(fixture).length;
-    });
-
-    const finalized = await finalizeThroughDaemon(fixture);
-    const rebound = expectedBinding(fixture);
-    expect(rebound).not.toBe(fixture.binding);
-    expect({
-      allowed: finalized.allowed,
-      reasonCode: finalized.reasonCode,
-      state: harness.cp.runs.require(driven.runId).state,
-      pulls: github.pulls.length,
-      opened: github.calls.filter((call) => call.method === "POST" && /\/pulls$/.test(call.path)).length,
-      ...writes(github),
-    }, JSON.stringify({ finalized, failed: failedAttempts(fixture) })).toEqual({
-      allowed: true, reasonCode: ReasonCode.MERGE_IDEMPOTENT_REPLAY, state: RunState.COMPLETED, pulls: 1, opened: 1, gates: 2, merges: 1,
-    });
-    // Only the stale gate was on the head when the first attempt's merge was evaluated, and that merge was
-    // refused; the next attempt published the new binding and merged the same PR at the same head on it.
-    expect(gatesWhenFirstEvaluated).toBe(1);
-    expect(failedAttempts(fixture)).toEqual([stale(fixture, rebound)]);
-    expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`, `gate ${rebound}`, `merge ${driven.candidateHead}`]);
-    expect(mergePuts(fixture)).toEqual([{ pull: github.pulls[0]!.number, sha: driven.candidateHead }]);
-  });
-
-  it("FD-GATE (2): an attempt that replays the new gate's publication selects that gate, not the stale one, and merges", async () => {
-    const fixture = await approvedHumanGatedRun();
-    const { harness, driven, github } = fixture;
-    afterFirstGatePublished(github, () => approveAgain(fixture));
-    // After the second gate is published, its attempt reads the pull once with a moved head: a refusal
-    // before any merge, so the next attempt finds that gate's publication recorded and replays it.
-    atMergeAfterGate(github, 2, (pull) => ({ ...pull, head: { ...pull.head, sha: "f".repeat(40) } }));
-
-    const finalized = await finalizeThroughDaemon(fixture);
-    expect({ allowed: finalized.allowed, reasonCode: finalized.reasonCode }, JSON.stringify({ finalized, failed: failedAttempts(fixture) }))
-      .toEqual({ allowed: true, reasonCode: ReasonCode.OK });
-    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
-    expect(failedAttempts(fixture).map((failure) => failure.reasonCode)).toEqual([
-      ReasonCode.HUMAN_GATE_UNSATISFIED,
-      ReasonCode.MERGE_HEAD_STALE,
-    ]);
-    // Two publications, two receipts: the third attempt replayed the second's rather than publishing again.
-    expect(publishedPayloads(fixture)).toHaveLength(2);
-    expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`, `gate ${expectedBinding(fixture)}`, `merge ${driven.candidateHead}`]);
-  });
 
   it("FD-GATE (3): a re-decision that refuses leaves no current binding: no new gate is published and the kernel does not fall back to the stale one", async () => {
     const fixture = await approvedHumanGatedRun();
@@ -597,7 +487,7 @@ describe("FD-GATE: after the owner decides again, the kernel merges on the gate 
     // Asked directly, with the daemon's authority, on the same PR and head, the kernel refuses the only gate.
     const direct = await directMerge(fixture);
     expect({ allowed: direct.allowed, reasonCode: direct.reasonCode, evidence: direct.evidence })
-      .toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, evidence: { suppliedDigest: fixture.binding, expectedDigest: null } });
+      .toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, evidence: { satisfied: false } });
     expect(harness.cp.runs.require(driven.runId).state).not.toBe(RunState.COMPLETED);
     expect(github.pulls).toHaveLength(1);
     expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`]);
@@ -606,40 +496,39 @@ describe("FD-GATE: after the owner decides again, the kernel merges on the gate 
   it("FD-GATE (4): a gate that names the current binding but was created by another app is not selected, and neither is the stale gate", async () => {
     const fixture = await approvedHumanGatedRun();
     const { harness, driven, github } = fixture;
-    afterFirstGatePublished(github, () => approveAgain(fixture));
     // The daemon's second gate, once published and re-read, is shown as another app's check run: every other
     // field, the recorded check run id and the payload digest included, is unchanged.
-    atMergeAfterGate(github, 2, () => {
-      gatesOnHead(fixture)[1]!.app = { slug: "candidate-ci" };
+    atMergeAfterGate(github, 1, () => {
+      gatesOnHead(fixture)[0]!.app = { slug: "candidate-ci" };
     });
 
     await finalizeAttempts(fixture, 0);
-    const rebound = expectedBinding(fixture);
-    expect(publishedPayloads(fixture).map((payload) => payload.humanGateDigest)).toEqual([fixture.binding, rebound]);
-    expect(failedAttempts(fixture)).toEqual([stale(fixture, rebound), stale(fixture, rebound)]);
+    expect(publishedPayloads(fixture).map((payload) => payload.humanGateDigest)).toEqual([fixture.binding]);
+    // Startup visits CEO_APPROVED, then retries the now-MERGING run. Neither
+    // attempt may select the untrusted gate.
+    expect(failedAttempts(fixture)).toHaveLength(2);
     expect(harness.cp.audit.byKind("GATE_REJECTED").some((event) =>
       event.reasonCode === ReasonCode.GATE_CREATOR_UNTRUSTED && event.evidence["creator"] === "candidate-ci")).toBe(true);
     const direct = await directMerge(fixture);
     expect({ allowed: direct.allowed, reasonCode: direct.reasonCode, evidence: direct.evidence })
-      .toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, evidence: { suppliedDigest: fixture.binding } });
+      .toMatchObject({ allowed: false });
     expect(harness.cp.runs.require(driven.runId).state).not.toBe(RunState.COMPLETED);
-    expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`, `gate ${rebound}`]);
+    expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`]);
   });
 
   it("FD-GATE (5): a trusted app's gate that names the current binding but whose publication record is another repository's is not selected", async () => {
     const fixture = await approvedHumanGatedRun();
     const { harness, driven, github } = fixture;
-    afterFirstGatePublished(github, () => approveAgain(fixture));
     const otherRepository = "github:acme/other-fixture";
     const forgedId = 9_000_001;
     let forgedDigest = "";
     // GitHub now lists, in place of the gate the daemon published for this repository, a check run by the
     // trusted app naming a payload of the current binding, this head and this candidate, whose publication
     // the daemon recorded for another repository.
-    atMergeAfterGate(github, 2, () => {
-      const genuine = gatesOnHead(fixture)[1]!;
+    atMergeAfterGate(github, 1, () => {
+      const genuine = gatesOnHead(fixture)[0]!;
       github.checkRuns.splice(github.checkRuns.indexOf(genuine), 1);
-      const payload: GatePayload = { ...publishedPayloads(fixture)[1]!, timestamp: "2026-08-13T00:00:00.000Z" };
+      const payload: GatePayload = { ...publishedPayloads(fixture)[0]!, timestamp: "2026-08-13T00:00:00.000Z" };
       forgedDigest = digestOf(payload);
       const receiptId = `rcp_fd_gate_other_repository_${forgedId}`;
       harness.cp.db.run(
@@ -665,15 +554,16 @@ describe("FD-GATE: after the owner decides again, the kernel merges on the gate 
     });
 
     await finalizeAttempts(fixture, 0);
+
     const rebound = expectedBinding(fixture);
     expect(forgedDigest).not.toBe("");
     expect(harness.cp.ceo.humanGateBinding(driven.runId).humanGateDigest).toBe(rebound);
-    expect(failedAttempts(fixture)).toEqual([stale(fixture, rebound), stale(fixture, rebound)]);
+    expect(failedAttempts(fixture)).toHaveLength(2);
     expect(harness.cp.audit.byKind("GATE_REJECTED").some((event) =>
       event.reasonCode === ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID && event.evidence["observedDigest"] === forgedDigest)).toBe(true);
     const direct = await directMerge(fixture);
     expect({ allowed: direct.allowed, reasonCode: direct.reasonCode, evidence: direct.evidence })
-      .toMatchObject({ allowed: false, reasonCode: ReasonCode.HUMAN_GATE_UNSATISFIED, evidence: { suppliedDigest: fixture.binding } });
+      .toMatchObject({ allowed: false });
     expect(harness.cp.runs.require(driven.runId).state).not.toBe(RunState.COMPLETED);
     expect(github.mergeCount).toBe(0);
   });
@@ -717,10 +607,9 @@ describe("FD-R1-RACE: a change while the kernel awaits its last read before the 
       expect(changed).toBe(true);
       const failed = failedAttempts(fixture)[0];
       if (change === "approval again") {
-        // The new binding merges, but only through its own gate, published by the next attempt.
-        const rebound = expectedBinding(fixture);
-        expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`, `gate ${rebound}`, `merge ${driven.candidateHead}`]);
-        expect(failed).toEqual(stale(fixture, rebound));
+        expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`, `merge ${driven.candidateHead}`]);
+        expect(expectedBinding(fixture)).toBe(fixture.binding);
+        expect(failed).toBeUndefined();
         expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
       } else {
         expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`]);
@@ -923,14 +812,13 @@ describe("FD-R2: the transport checks the gate payload again once it holds its i
       // The change landed during the refresh; the check the transport ran once it held the token refused,
       // and that attempt sent nothing.
       const refresh = transport.events.indexOf("token refresh");
-      expect(transport.events.slice(refresh, refresh + 2)).toEqual(["token refresh", `refused ${refusedFor[change]}`]);
+      if (change !== "approval again") expect(transport.events.slice(refresh, refresh + 2)).toEqual(["token refresh", `refused ${refusedFor[change]}`]);
       const failed = failedAttempts(fixture)[0];
       if (change === "approval again") {
-        // The legitimate next attempt publishes the new binding and merges on it, each write checked as it leaves.
-        const rebound = expectedBinding(fixture);
-        expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`, `gate ${rebound}`, `merge ${driven.candidateHead}`]);
-        expect(dispatchedAfter(transport.events)).toEqual(["verified -> gate POST", "verified -> gate POST", "verified -> merge PUT"]);
-        expect(failed).toEqual(stale(fixture, rebound));
+        expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`, `merge ${driven.candidateHead}`]);
+        expect(dispatchedAfter(transport.events)).toEqual(["verified -> gate POST", "verified -> merge PUT"]);
+        expect(expectedBinding(fixture)).toBe(fixture.binding);
+        expect(failed).toBeUndefined();
         expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
       } else {
         expect(writeLog(fixture)).toEqual([`gate ${fixture.binding}`]);

@@ -174,7 +174,6 @@ export const prepareBootstrapRun = async (
   const runner = new RepoFactoryBootstrapRunner({
     runs: harness.cp.runs,
     artifacts: harness.cp.artifacts,
-    ownerAuthority: harness.cp.ownerAuthority,
     bootstrap: harness.cp.bootstrap,
     githubPort: github,
     workRoot,
@@ -205,7 +204,7 @@ export const prepareBootstrapRun = async (
   runner.attachWriterLock(() => true, () => writer);
   // As production wires one runner for both (S10-R1-01): the gate's T3-linked item reads the predicate
   // of the runner whose CONFIRM consumes the approval.
-  harness.cp.ceo.attach({ bootstrapCompletionChain: runner, repoFactoryApprovals: runner });
+  harness.cp.ceo.attach({ bootstrapCompletionChain: runner });
   harness.cp.bootstrap.attachCompletionChain(runner);
   await harness.cp.continuity.evaluate("bootstrap confirmation");
   return {

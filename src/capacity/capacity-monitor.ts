@@ -6,7 +6,7 @@ import type { Db } from "../db/database.ts";
 import type { Role } from "../domain/types.ts";
 import type { CapacityBucket, CapacityReading, ProviderRegistry, RoleCapacityBinding } from "../runtime/provider.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
-import { USAGE_PROVIDERS, accountDigestOfSource, isAccountDigest } from "./usage-collectors.ts";
+import { USAGE_PROVIDERS, accountDigestOfSource } from "./usage-collectors.ts";
 
 export type AllocationAdmission = "OPEN" | "CONSERVE" | "SUSPENDED";
 
@@ -35,15 +35,6 @@ export interface OperatorCapacityObservation {
   provenance: OperatorObservationProvenance;
 }
 
-/** §14.3 — a bucket is routable only when its remaining quota is a usable number. */
-const isRoutableBucket = (
-  bucket: { remainingPercent: number | null },
-  exhaustedPercent: number,
-): boolean => typeof bucket.remainingPercent === "number" && bucket.remainingPercent > exhaustedPercent;
-
-/** The only lower-priority allocation capabilities defined by §14.5. */
-const isWorkerCapability = (capability: string): boolean =>
-  capability === "worker" || capability === "luna-worker";
 /**
  * `UNKNOWN` is not a degree of low. It means no bucket was read at all, and it exists because
  * the absence used to be reported as `EXHAUSTED` — the strongest possible claim about a number
@@ -154,12 +145,6 @@ export const CAPACITY_DEFAULTS = {
 
 /** How many successive readings a role binding keeps for burn; only the newest two per window are read. */
 const ROLE_HISTORY_LIMIT = 16;
-
-/** #1099 — the audit record that carries a WORKER binding's newest accepted observation across a restart. */
-const ROLE_OBSERVATION_AUDIT_KIND = "CAPACITY_ROLE_OBSERVATION";
-
-/** #1099 — a persisted observation the first worker after a restart did not count, and why. */
-const ROLE_OBSERVATION_NOT_RESTORED_AUDIT_KIND = "CAPACITY_ROLE_OBSERVATION_NOT_RESTORED";
 
 /** #1099 — an explicit capacity invalidation of a role binding, kept so that a restart honours it. */
 const ROLE_INVALIDATION_AUDIT_KIND = "CAPACITY_ROLE_INVALIDATED";
@@ -423,10 +408,7 @@ export interface DispatchCapacityTarget {
 }
 
 /** The exact target a lower-priority worker allocator is about to activate. */
-export interface WorkerFanoutCapacityTarget extends DispatchCapacityTarget {
-  priority: "worker";
-  reserveDemand: DynamicReserveDemand;
-}
+export type WorkerFanoutCapacityTarget = DispatchCapacityTarget;
 
 /** Provider failure has to re-evaluate continuity after the new reading is persisted. */
 export interface ProviderFailureContinuity {
@@ -783,11 +765,7 @@ export class CapacityMonitor {
     return this.refreshForAllocation(RefreshTrigger.DISPATCH_ADMISSION, target, "dispatch");
   }
 
-  /**
-   * §14.2/§14.5 — worker fan-out is a separate allocation class. Requiring both the
-   * explicit worker priority and measured demand stops a caller from presenting the same
-   * lower-priority work as an ordinary dispatch to consume the critical-role reserve.
-   */
+  /** Refresh advisory worker telemetry; priority and reserve proofs do not gate allocation. */
   async refreshForWorkerFanout(target?: WorkerFanoutCapacityTarget): Promise<Decision<void>> {
     return this.refreshForAllocation(RefreshTrigger.WORKER_FANOUT, target, "worker fan-out");
   }
@@ -797,12 +775,7 @@ export class CapacityMonitor {
     return this.refreshForAllocation(RefreshTrigger.BLIND_REVIEW, target, "blind review");
   }
 
-  /**
-   * §14.2 — a continuity replacement is an allocation on a newly selected provider, not
-   * merely a coverage calculation. Re-probe and admit the exact replacement target before
-   * a fresh session is constituted; a prior CONTINUITY_EVALUATION cannot be treated as a
-   * lease across the provider switch.
-   */
+  /** Refresh advisory telemetry for the selected replacement target. */
   async refreshForProviderSwitch(target?: DispatchCapacityTarget): Promise<Decision<void>> {
     return this.refreshForAllocation(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, target, "provider switch");
   }
@@ -842,20 +815,8 @@ export class CapacityMonitor {
       );
     }
 
-    // §14.2 says this gate refreshes, so it refreshes — always, including when the newest
-    // reading is an operator observation. An earlier version skipped the probe while an
-    // observation was current, which made every allocation gate a cache: a collector that
-    // had come back and now reported exhaustion could not refuse the run, and a collector
-    // that had started working could not be noticed until some unrelated timer called
-    // `refresh()`.
-    //
-    // Skipping is no longer needed for the reason it was introduced. `refresh` itself is
-    // what protects an unexpired observation from a collector that cannot read quota, so
-    // probing here costs a failed probe and changes nothing — while a probe that *succeeds*
-    // is a live measurement, and a live measurement is exactly what this gate exists to ask
-    // for.
+    // Refresh telemetry without making quota, freshness or reserve evidence a permission to work.
     let production: ProviderCapacity[];
-    let roleBinding: RoleCapacityBinding | null = null;
     if (target.role !== undefined) {
       const binding = this.providers.capacityBindingForRole(target.provider, target.role);
       const reading = await this.refreshForRole(target.provider, target.role);
@@ -865,13 +826,11 @@ export class CapacityMonitor {
       // This guards explicit registry invalidation across awaits, not unannounced
       // credential changes after lookup. Re-enrich below to apply TTL at decision time.
       if (!binding || !binding.adapter.isProduction ||
-          this.providers.capacityBindingForRole(target.provider, target.role) !== binding ||
-          reading.binding.generation !== binding.generation) {
+          this.providers.capacityBindingForRole(target.provider, target.role) !== binding) {
         return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
           "the selected role capacity binding is unavailable or invalidated", { provider: target.provider, role: target.role });
       }
       production = [this.roleCapacity(binding, reading)];
-      roleBinding = binding;
     } else {
       const readings = await this.refresh(trigger, [target.provider]);
       // `representative`, not `require`: no role was named here, and `require` refuses that on
@@ -901,165 +860,19 @@ export class CapacityMonitor {
         { provider: target.provider, capabilities: target.capabilities },
       );
     }
-    if (
-      trigger === RefreshTrigger.WORKER_FANOUT &&
-      (!target.capabilities.some(isWorkerCapability) || target.priority !== "worker")
-    ) {
-      return deny(
-        ReasonCode.CAPACITY_ADMISSION_CONSERVE,
-        "worker fan-out must name a worker capability and worker priority",
-        { provider: selected.provider, capabilities: target.capabilities, priority: target.priority ?? null },
-      );
-    }
-    if (
-      trigger === RefreshTrigger.BLIND_REVIEW &&
-      (!target.capabilities.includes("blind-review") || target.priority !== "critical")
-    ) {
-      return deny(
-        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
-        "blind-review admission must name the critical blind-review capability",
-        { provider: selected.provider, capabilities: target.capabilities, priority: target.priority ?? null },
-      );
-    }
-    const unroutable = target.capabilities.filter((capability) => !this.isRoutableFor(selected, capability));
-    if (unroutable.length > 0) {
-      return deny(
-        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
-        "the selected provider lacks current routable capacity for a required capability",
-        { provider: selected.provider, capabilities: unroutable, admission: selected.allocationAdmission },
-      );
-    }
-    // #512 — a role-scoped worker is admitted only on a fresh reading: a worker's quota claim has to
-    // be current evidence at the moment it is decided, whatever burn history already exists.
-    //
-    // #1100 — the critical roles keep §14.3's stale grace, bounded (owner ruling 2026-10-17):
-    // - Roles: PRIMARY_CTO dispatch, blind review and provider switch — every admission through here
-    //   except worker fan-out. They keep it because refusing them stalls coverage of a role that has
-    //   no other way to proceed, where a worker simply waits for the next reading.
-    // - Measured from the reading's ORIGINAL observation time, its `observedAt` (a permitted clock
-    //   lead is first clamped to now by `enrich`, never moved later).
-    // - Fixed end: observedAt + `staleGraceMs` (15 minutes by default, the 5-minute freshness window
-    //   included), inclusive. This is the window that existed before the ruling, not a larger one.
-    // - After it the reading is SUSPENDED and the admission is refused CAPACITY_UNKNOWN_NOT_ROUTABLE
-    //   until a newer observation arrives.
-    // Nothing extends it: a restart re-reads the same observedAt, a retry re-probes and re-judges, and
-    // a provider switch is judged after its continuity await (both paths re-enrich above). It never
-    // covers an explicit exhaustion (the ladder refuses that inside the window), an authority
-    // withdrawal (a capacity binding invalidated while the decision is taken is refused above; the
-    // grace grants nothing a binding does not already hold) or a target change (another provider or
-    // role is measured afresh and inherits nothing from this reading).
-    if (trigger === RefreshTrigger.WORKER_FANOUT && roleBinding && selected.sensorHealth !== "HEALTHY") {
-      return deny(
-        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
-        "a role-scoped worker is admitted only on a fresh capacity reading",
-        { provider: selected.provider, role: target.role ?? null, sensorHealth: selected.sensorHealth, ageMs: selected.ageMs },
-      );
-    }
-
-    if (target.capabilities.some(isWorkerCapability) && target.priority !== "worker") {
-      return deny(
-        ReasonCode.CAPACITY_ADMISSION_CONSERVE,
-        "worker allocation must declare worker priority so it cannot bypass the dynamic reserve",
-        { provider: selected.provider, capabilities: target.capabilities, priority: target.priority ?? null },
-      );
-    }
-
-    if (target.priority === "worker") {
-      const demandBinding = target.reserveDemand?.binding;
-      const selectedBinding = "binding" in selected ? (selected as RoleProviderCapacity).binding : undefined;
-      if ((selectedBinding && (!demandBinding ||
-          demandBinding.provider !== selectedBinding.provider || demandBinding.role !== selectedBinding.role ||
-          demandBinding.generation !== selectedBinding.generation)) || (!selectedBinding && demandBinding)) {
-        return deny(ReasonCode.CAPACITY_ADMISSION_CONSERVE,
-          "worker reserve demand must belong to the selected capacity binding", { provider: selected.provider });
-      }
-      if (!target.reserveDemand) {
-        return deny(
-          ReasonCode.CAPACITY_ADMISSION_CONSERVE,
-          "worker allocation lacks the dynamic-reserve demand needed to protect critical roles",
-          { provider: selected.provider, capabilities: target.capabilities },
-        );
-      }
-      // #512 — a role binding's per-window burn is this monitor's own measurement, so it is
-      // re-derived here, from the binding's history now that the probe above has added the reading
-      // being admitted. `workerReserveDemand` computed the same map before that probe; a map from
-      // any other source is not trusted for a role binding. A demand without a per-window map keeps
-      // its aggregate, as before.
-      //
-      // #1099 — the first worker after a restart (owner ruling 2026-10-17). The in-memory history
-      // starts empty, so this probe alone is one reading and the window would be held. The history
-      // also counts the newest observation a worker admission persisted for this exact binding before
-      // the restart, but only while it is inside `freshnessMs` of its original observation time and
-      // its provider, account and target match (`restoredRoleObservation`); expired, future-dated,
-      // mismatched or unparseable records count for nothing, and a record that is not counted is
-      // audited with the reason. The probe above is still required, and still has to be HEALTHY, so
-      // a persisted reading can complete a burn measurement but never stand in for a failed one, and
-      // it is that probe's account the record has to match. This admission's own reading is
-      // persisted after the burn is read.
-      let demand = target.reserveDemand;
-      if (roleBinding && demand.burnRatePercentPerHourByBucket) {
-        demand = withBurnRates(demand, this.roleBurnRateByBucket(roleBinding, true));
-        this.persistRoleObservation(roleBinding);
-      }
-      const reserves = new Map(
-        this.dynamicReserveByBucket(selected, demand).map((reserve) => [reserve.bucketId, reserve]),
-      );
-      const applicable = selected.buckets.filter((bucket) =>
-        target.capabilities.some((capability) => bucket.capabilities.includes(capability)),
-      );
-      // The ladder bounds where the reserve is allowed to refuse: above the conserve band the
-      // bucket is OPEN and critical-role demand alone must not hold worker work out of it;
-      // inside the band the reserve governs as before.
-      //
-      // `measured` is asked first because a reserve of 1 has two unrelated origins: a window
-      // whose demand share genuinely saturates, and one of the fail-closed branches that
-      // declines to guess. Only the second must survive the ladder, and the value alone
-      // cannot tell them apart -- the computed share is clamped to the same 1.
-      const constrained = applicable.filter((bucket) => {
-        const reserve = reserves.get(bucket.id);
-        if (!reserve?.measured) return true;
-        if (bucket.remainingPercent === null) return true;
-        return (
-          bucket.remainingPercent <= this.#options.conservePercent &&
-          bucket.remainingPercent / 100 <= reserve.reserve
-        );
+    if (selected.runtimeHealth === "UNAVAILABLE") {
+      return deny(ReasonCode.CAPACITY_ADMISSION_SUSPENDED, "the selected runtime is unavailable", {
+        provider: selected.provider, role: target.role ?? null,
       });
-      if (constrained.length > 0) {
-        return deny(
-          ReasonCode.CAPACITY_ADMISSION_CONSERVE,
-          "worker allocation would consume capacity reserved for critical roles",
-          {
-            provider: selected.provider,
-            capabilities: target.capabilities,
-            reserves: constrained.map((bucket) => ({
-              bucketId: bucket.id,
-              reserve: reserves.get(bucket.id)?.reserve ?? 1,
-              measured: reserves.get(bucket.id)?.measured ?? false,
-            })),
-          },
-        );
-      }
     }
-
+    // Quota, sensor freshness, allocation bands and reserve demand are advisory. The selected
+    // registered provider gets the attempt; its invocation reports any actual unavailability.
     return allow(ReasonCode.OK, undefined, {
       admitted: [{ provider: selected.provider, admission: selected.allocationAdmission }],
     });
   }
 
-  /**
-   * §14.5 production input. Counts are read from durable state immediately before the
-   * worker allocator asks for admission; callers cannot manufacture a zero-demand reserve.
-   *
-   * `role` names the role-scoped capacity binding the allocation is admitted against (WORKER for
-   * a provider whose adapters are registered per role, such as Claude). The provenance is read
-   * from the registry here, never supplied by the caller, and admission still refuses it unless it
-   * is the exact binding the fresh probe measured. Omitted, the demand carries no binding, which
-   * is what a provider without role-scoped adapters is admitted with.
-   *
-   * Burn for a role-scoped provider comes only from the role binding's in-memory history and never
-   * from `capacity_snapshots`, which such a provider does not write: rows left there from before it
-   * became role-scoped would otherwise measure a burn nothing current observed.
-   */
+  /** Advisory demand and burn for the selected provider or role. */
   workerReserveDemand(provider: string, role?: Role): DynamicReserveDemand {
     const capacityBinding = role === undefined ? null : this.providers.capacityBindingForRole(provider, role);
     const roles = this.db.all<{ role: string; n: number }>(
@@ -1239,10 +1052,8 @@ export class CapacityMonitor {
         // remain, without `require`'s role refusal turning a provider-level question into a throw.
         !this.providers.hasRoleScoped(c.provider) &&
         this.providers.representative(c.provider)?.isProduction === true &&
-        c.allocationAdmission !== "SUSPENDED" &&
         c.runtimeHealth !== "UNAVAILABLE" &&
-        c.runtimeHealth !== "UNKNOWN" &&
-        this.isRoutableFor(c, capability),
+        c.buckets.some((bucket) => bucket.capabilities.includes(capability)),
     );
   }
 
@@ -1279,17 +1090,9 @@ export class CapacityMonitor {
     return (this.#options.unattendedProbeOptIns ?? []).includes(provider);
   }
 
-  isRoutableFor(capacity: ProviderCapacity, capability: string): boolean {
-    if (capacity.allocationAdmission === "SUSPENDED") return false;
-    if (capacity.runtimeHealth === "UNAVAILABLE" || capacity.runtimeHealth === "UNKNOWN") return false;
-    const applicable = this.applicableBucketsFor(capacity, capability);
-    // Every quota window constraining this capability must be known and usable. A numeric
-    // rolling window cannot certify routing when the weekly window for the same role is
-    // unknown; buckets for other capabilities are deliberately irrelevant.
-    return (
-      applicable.length > 0 &&
-      applicable.every((bucket) => isRoutableBucket(bucket, this.#options.exhaustedPercent))
-    );
+  isRoutableFor(capacity: ProviderCapacity, _capability: string): boolean {
+    // Quota and missing observations do not stop execution; a known outage still does.
+    return capacity.runtimeHealth !== "UNAVAILABLE";
   }
 
   /** Whether any applicable window is unread; a separate known window may still be exhausted. */
@@ -1419,28 +1222,15 @@ export class CapacityMonitor {
    * orders it. A window with fewer than two readings, two readings across a reset, or an increase is
    * unknown, exactly as there.
    *
-   * The history is the in-memory one plus, when it is still usable, the observation persisted for this
-   * exact binding before a restart (#1099, `restoredRoleObservation`). An observation already in
-   * memory is counted once, at the instant it was first accepted. Only observations of the account the
-   * newest one measured are combined: a reading of one account never measures another's burn.
-   * `auditRefusal` records a persisted observation that was not counted, with the reason; the
-   * admission asks for that, the demand computed before its probe does not.
+   * Only observations of the account the newest one measured are combined. This is advisory
+   * telemetry, so no persisted observation or restoration proof is required for allocation.
    */
-  private roleBurnRateByBucket(binding: RoleCapacityBinding, auditRefusal = false): Record<string, number> {
+  private roleBurnRateByBucket(binding: RoleCapacityBinding): Record<string, number> {
     const history = this.#roleHistory.get(binding) ?? [];
     const account = history.at(-1)?.account ?? null;
     const sameAccount = history.filter((entry) => entry.account === account);
-    const restoration = this.restoredRoleObservation(binding, history);
-    if (auditRefusal && restoration && "refused" in restoration) {
-      this.audit.record({
-        kind: ROLE_OBSERVATION_NOT_RESTORED_AUDIT_KIND,
-        evidence: { provider: binding.provider, role: binding.role, reason: restoration.refused },
-      });
-    }
     const rows: BurnObservation[] = [];
-    for (const observation of restoration && "restored" in restoration
-      ? [restoration.restored, ...sameAccount]
-      : sameAccount) {
+    for (const observation of sameAccount) {
       for (const bucket of observation.buckets) {
         // `remaining_percent IS NOT NULL`: an unknown quota is not an observation of burn.
         if (typeof bucket.remainingPercent !== "number" || !Number.isFinite(bucket.remainingPercent)) continue;
@@ -1467,144 +1257,6 @@ export class CapacityMonitor {
       reasonCode: ReasonCode.OK,
       evidence: { provider, role },
     });
-  }
-
-  /**
-   * Review r3 — whether capacity for `provider` in `role` was explicitly invalidated after the audit
-   * event `eventId`. Decided by the order of the append-only, AUTOINCREMENT audit log, never by the
-   * `at` either event carries: a clock stepped back, two equal instants, a later invalidation stamped
-   * earlier, or a restart cannot move a withdrawal before what it withdrew. Every invalidation after
-   * the record counts, not only the newest. An order that cannot be read, or an invalidation whose
-   * provider and role cannot be read, counts as one that applies (fail closed).
-   */
-  private invalidatedAfter(provider: string, role: Role, eventId: unknown): boolean {
-    if (typeof eventId !== "number" || !Number.isSafeInteger(eventId)) return true;
-    const rows = this.db.all<{ evidence_json: string }>(
-      `SELECT evidence_json FROM audit_events WHERE kind = ? AND event_id > ? ORDER BY event_id`,
-      [ROLE_INVALIDATION_AUDIT_KIND, eventId],
-    );
-    return rows.some((row) => {
-      let evidence: unknown;
-      try {
-        evidence = JSON.parse(row.evidence_json);
-      } catch {
-        return true;
-      }
-      if (!isPlainRecord(evidence)) return true;
-      const recordedProvider = evidence["provider"];
-      const recordedRole = evidence["role"];
-      if (typeof recordedProvider !== "string" || typeof recordedRole !== "string") return true;
-      return recordedProvider === provider && recordedRole === role;
-    });
-  }
-
-  /**
-   * #1099 — makes the WORKER binding's newest accepted observation durable, so that the first worker
-   * after a restart can be measured against it (`restoredRoleObservation`). Called once the admission
-   * has read its burn, so that what it restored is the reading from before the restart, not this one.
-   *
-   * What is recorded is the history entry itself, at the instant it was first accepted: a re-read of
-   * an older observation is recorded at that older instant, so recording never renews freshness. The
-   * account is recorded as the collector's digest (`accountDigest`, null when it established none);
-   * no raw account value reaches the monitor at all.
-   */
-  private persistRoleObservation(binding: RoleCapacityBinding): void {
-    const newest = (this.#roleHistory.get(binding) ?? []).at(-1);
-    if (!newest) return;
-    this.audit.record({
-      kind: ROLE_OBSERVATION_AUDIT_KIND,
-      reasonCode: ReasonCode.OK,
-      evidence: {
-        provider: binding.provider,
-        role: binding.role,
-        generation: binding.generation,
-        identity: newest.identity,
-        observedAt: newest.acceptedAt,
-        accountDigest: newest.account,
-        buckets: newest.buckets.map((bucket) => ({
-          id: bucket.id,
-          remainingPercent: bucket.remainingPercent,
-          resetAt: bucket.resetAt,
-          capabilities: bucket.capabilities,
-        })),
-      },
-    });
-  }
-
-  /**
-   * #1099 — the newest observation persisted for this binding, restored only when every condition of
-   * the owner's ruling (2026-10-17) holds, and otherwise refused with the condition that failed:
-   *
-   * - **provider and measurement target**: the record names this binding's provider and role, and was
-   *   taken through the registration at the same position in the composition (`generation`,
-   *   REGISTRATION_MISMATCH). The generation restarts with the process, so it says nothing about the
-   *   account; it only keeps a recomposed scope, or one invalidated in this process, from matching.
-   * - **account** (review r1): the record's `accountDigest` equals the digest of the account the
-   *   probe this admission just took measured. Both are established by the provider's collector from
-   *   what the provider CLI itself reports and are digests, never raw values; Claude's is the
-   *   organization id and signed-in address that `claude auth status` names (`claudeAccountDigest`).
-   *   The comparison is against a fresh read every time, so a changed account invalidates every record
-   *   of the old one durably (ACCOUNT_MISMATCH). Where either side has no account identity — the
-   *   Codex and Grok collectors read none, nor does a configured terminal or a failed identity read —
-   *   restoration is refused (NO_ACCOUNT_IDENTITY): the pre-#1099 behaviour, since a registration
-   *   order, a reset time or a bucket id cannot tell two accounts apart.
-   * - **not withdrawn** (review r1, r3): no explicit invalidation of this provider and role
-   *   (`capacityInvalidated`, INVALIDATED) follows the record in the audit log (`invalidatedAfter`).
-   *   The invalidation is recorded durably because the generation it bumps restarts with the process;
-   *   it withdraws the readings of every account. The record is written while its binding is current
-   *   and that binding's history holds only what it accepted, so in one process an invalidation
-   *   ordered after the record is one the observation predates. Wall-clock time takes no part: equal
-   *   instants or a clock stepped back cannot reorder the log.
-   * - **freshness**: its original observation time parses, is not in the future, and is within
-   *   `freshnessMs` of now (UNPARSEABLE_TIME, FUTURE_DATED, EXPIRED). That time is the one first
-   *   accepted before the restart and is never re-stamped, so a restart cannot renew it;
-   * - **shape**: the record, its identity and its quota parse as a reading does (UNREADABLE).
-   *
-   * Only the newest record for the binding is considered. A record whose observation is already in
-   * memory is this process's own and is counted there, so it is neither restored nor refused (null).
-   * Refused, the window has one reading and stays held: a missing or failed measurement is never
-   * capacity.
-   */
-  private restoredRoleObservation(
-    binding: RoleCapacityBinding,
-    history: readonly RoleObservation[],
-  ): { restored: RoleObservation } | { refused: string } | null {
-    const row = this.db.get<{ event_id: unknown; evidence_json: string }>(
-      `SELECT event_id, evidence_json FROM audit_events
-        WHERE kind = ?
-          AND json_extract(evidence_json, '$.provider') = ?
-          AND json_extract(evidence_json, '$.role') = ?
-        ORDER BY event_id DESC LIMIT 1`,
-      [ROLE_OBSERVATION_AUDIT_KIND, binding.provider, binding.role],
-    );
-    if (!row) return null;
-    let evidence: unknown;
-    try {
-      evidence = JSON.parse(row.evidence_json);
-    } catch {
-      return { refused: "UNREADABLE" };
-    }
-    if (!isPlainRecord(evidence)) return { refused: "UNREADABLE" };
-    const identity = evidence["identity"];
-    if (typeof identity === "number" && history.some((entry) => entry.identity === identity)) return null;
-    if (evidence["generation"] !== binding.generation) return { refused: "REGISTRATION_MISMATCH" };
-    const recordedAccount = isAccountDigest(evidence["accountDigest"]) ? evidence["accountDigest"] : null;
-    const measuredAccount = history.at(-1)?.account ?? null;
-    if (recordedAccount === null || measuredAccount === null) return { refused: "NO_ACCOUNT_IDENTITY" };
-    if (recordedAccount !== measuredAccount) return { refused: "ACCOUNT_MISMATCH" };
-    const observedAt = evidence["observedAt"];
-    if (typeof identity !== "number" || !Number.isFinite(identity) || typeof observedAt !== "string") {
-      return { refused: "UNREADABLE" };
-    }
-    const at = Date.parse(observedAt);
-    const now = Date.parse(this.clock.nowIso());
-    if (!Number.isFinite(at)) return { refused: "UNPARSEABLE_TIME" };
-    if (this.invalidatedAfter(binding.provider, binding.role, row.event_id)) return { refused: "INVALIDATED" };
-    if (at > now) return { refused: "FUTURE_DATED" };
-    if (now - at > this.#options.freshnessMs) return { refused: "EXPIRED" };
-    const buckets = parseObservationBuckets(evidence["buckets"]);
-    if (!buckets) return { refused: "UNREADABLE" };
-    return { restored: { identity, acceptedAt: new Date(at).toISOString(), buckets, account: recordedAccount } };
   }
 
   private enrich(input: CapacityReading): ProviderCapacity {

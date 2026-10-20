@@ -160,7 +160,7 @@ describe("a legacy UNAVAILABLE row with no candidate digest gets the one officia
         Promise.resolve().then(() => other.wakeBootstrapResultRecovery()),
       ]);
       expect([...retries(a), ...retries(b)]).toHaveLength(1);
-      await vi.waitFor(() => expect(f.finishedTurns(run.ownerSessionId)).toBe(3), { timeout: 10_000, interval: 25 });
+      await vi.waitFor(() => expect(f.finishedTurns(run.ownerSessionId)).toBe(2), { timeout: 10_000, interval: 25 });
       await idle(f, run.ownerSessionId);
       expect(sweep(f)).toEqual({ woken: [] });
       expect(other.wakeBootstrapResultRecovery()).toEqual({ woken: [] });
@@ -170,7 +170,7 @@ describe("a legacy UNAVAILABLE row with no candidate digest gets the one officia
       } finally {
         await daemon.stop();
       }
-      expect(f.finishedTurns(run.ownerSessionId)).toBe(3);
+      expect(f.finishedTurns(run.ownerSessionId)).toBe(2);
       expect(run.owner.results).toHaveLength(1);
       expect(auditOf(f, BOOTSTRAP_REVIEW_RETRY_WAKE, run.runId)).toHaveLength(1);
       expect(resultState(f, run.runId)).toEqual({ state: RunState.ACTIVE, candidate: run.candidate, attempts: ["RELEASED"] });

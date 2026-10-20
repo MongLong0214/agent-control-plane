@@ -113,15 +113,17 @@ describe("W4: CONFIRM settles the current PLAN's task from the real create recei
     expect(prepared.github.createRequests).toHaveLength(1);
   });
 
-  it("a producer refusal (no owner approval) leaves the task READY and the run at CEO review", async () => {
+  it("a producer refusal leaves the task READY and the run at CEO review", async () => {
     const prepared = await prepare("brs-producer-refusal");
+    prepared.github.failNext = "createRepository";
     const refused = await prepared.runner.produceAndActivate(prepared.input);
     expect(refused.allowed).toBe(false);
     expect(confirm(prepared).allowed).toBe(false);
     expect(prepared.harness.cp.runs.require(prepared.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
     expect(tasks(prepared).map((task) => task.state)).toEqual(["READY"]);
     expect(settlements(prepared)).toEqual([]);
-    expect(prepared.github.writes).toEqual([]);
+    expect(prepared.github.createRequests).toHaveLength(1);
+    expect(prepared.github.repository("acme", "fixture")).toBeUndefined();
   });
 });
 

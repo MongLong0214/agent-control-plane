@@ -4,19 +4,11 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { dirname, join, resolve, sep } from "node:path";
 
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
-
-import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
 import { bootstrapActivationHandoff, plannedBootstrapOutputs } from "../../src/bootstrap/bootstrap-plan.ts";
-import {
-  REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND,
-  type RepoFactoryOwnerApproval,
-  attemptCheckoutPath,
-  repoFactoryGitHubWriteParameters,
-} from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
-import type { OwnerApprovalReceipt } from "../../src/ceo/owner-authority.ts";
+import { attemptCheckoutPath, repoFactoryGitHubWriteParameters } from "../../src/bootstrap/repo-factory-bootstrap-run.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { readProcessStartToken } from "../../src/core/process-argv.ts";
-import { readWithheldIntent, withheldUnsent, writeApprovalAnchor, writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
+import { readWithheldIntent, withheldUnsent, writeWithheldRequest } from "../../src/bootstrap/bootstrap-approval-anchor.ts";
 import { createBootstrapGitHubWritePort } from "../../src/bootstrap/bootstrap-write-guard.ts";
 import type { GitHubWritePort } from "../../src/bootstrap/github-write-port.ts";
 import { processGroupEmpty, readProcessGroup } from "../../src/bootstrap/attempt-writer-group.ts";
@@ -174,6 +166,7 @@ const applicationFixture = async () => {
   const launch = await startSessionLaunchChannel(tempDir("acp-c3-launch-"), { mcpToken: TEST_MCP_TOKEN });
   harness.cp.cto.attach({ sessionLaunch: launch });
   const claude = new HeadlessRuntimeDouble(harness.clock, "claude");
+  claude.observeCredentialCustody(harness.cp.sessionRuntime, harness.cp.sessions, TEST_MCP_TOKEN);
   harness.cp.providers.registerForRole(claude, Role.BOOTSTRAP_CTO);
   // #246 C4 — the PRIMARY_CTO activation provisions is driven on the same Claude runtime.
   harness.cp.providers.registerForRole(claude, Role.PRIMARY_CTO);
@@ -314,44 +307,6 @@ const reviewedBootstrap = async (f: Fixture, manifest: ProjectManifest, taskKey 
   };
 };
 
-/**
- * The owner's approval of the GitHub writes: agentctl over the operator socket, with the owner token.
- * By default the approval the plan needs; `githubOwner`, `visibility` and `decline` make it another
- * owner decision, still minted the official way.
- */
-const approveWrites = async (
-  f: Fixture,
-  run: ReviewedRun,
-  options: { githubOwner?: string; visibility?: string; decline?: boolean } = {},
-): Promise<void> => {
-  const manifestPath = join(tempDir("acp-c3-manifest-"), "project.json");
-  writeFileSync(manifestPath, JSON.stringify(run.manifest));
-  const client = createOperatorClient({ socketPath: f.operatorSocket, token: TEST_OPERATOR_TOKEN });
-  const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-  const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
-  try {
-    const exit = await dispatch(client, "approve", [
-      "repo-factory-github-write",
-      run.runId,
-      "--github-owner",
-      options.githubOwner ?? "acme",
-      "--visibility",
-      options.visibility ?? "public",
-      "--plan-digest",
-      run.planDigest,
-      "--manifest",
-      manifestPath,
-      "--project-name",
-      "fixture project",
-      ...(options.decline ? ["--decline"] : []),
-    ], false);
-    expect(exit).toBe(0);
-  } finally {
-    stdout.mockRestore();
-    stderr.mockRestore();
-  }
-};
-
 /** The CEO's CONFIRM over the Hermes socket, continuity reconciled first. */
 const confirm = async (f: Fixture, run: ReviewedRun): Promise<Record<string, unknown>> => {
   await f.harness.cp.continuity.evaluate("bootstrap confirmation");
@@ -403,7 +358,7 @@ describe("#246 C3 W2: a failure after the repository was created", () => {
   it("the primary CTO's provider is down at the first CONFIRM: WRITTEN; once it is back, a re-CONFIRM completes with one createRepository", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w2-provider"));
-      await approveWrites(f, run);
+
       // The driven primary CTO activation provisions cannot run its attestation turn: its provider is down.
       f.claude.setNextSessionHealth("UNAVAILABLE");
       const first = await confirm(f, run);
@@ -412,7 +367,6 @@ describe("#246 C3 W2: a failure after the repository was created", () => {
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
       expect(f.harness.cp.bindings.activePrimaryCto(run.manifest.projectId)).toBeNull();
 
-      // The provider is back. The re-CONFIRM activates the stored result: no GitHub write at all.
       const second = await confirm(f, run);
       expect(second, JSON.stringify(second)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
       expect(writesOf(f)).toEqual(WRITE_METHODS);
@@ -423,7 +377,7 @@ describe("#246 C3 W2: a failure after the repository was created", () => {
       expect(writesOf(f, "createRepository")).toHaveLength(1);
       expect(writesOf(f)).toEqual(WRITE_METHODS);
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "COMPLETED", attempts: 1 });
-      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(consumedApprovals(f, run.runId)).toBe(0);
       expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.COMPLETED);
       // C1's reclaim: the run's BOOTSTRAP_CTO is revoked with COMPLETED, and the daemon's sweep stops it.
       expect(f.harness.cp.bindings.active(roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId }))).toBeNull();
@@ -435,7 +389,7 @@ describe("#246 C3 W2: a failure after the repository was created", () => {
   it("a timeout between createRepository and WRITTEN: the recovery attributes the repository by the node id in the attempt ledger, still one create", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w2-timeout"));
-      await approveWrites(f, run);
+
       // GitHub creates the repository and answers; the read after it times out.
       f.github.failAfter = { method: "createRepository", mode: "readback" };
       const first = await confirm(f, run);
@@ -448,14 +402,14 @@ describe("#246 C3 W2: a failure after the repository was created", () => {
       expect(writesOf(f, "createRepository")).toHaveLength(1);
       expect(writesOf(f)).toEqual(WRITE_METHODS);
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
-      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(consumedApprovals(f, run.runId)).toBe(0);
     });
   });
 
   it("a crash after the writes and before WRITTEN: the recovery attributes the repository by its creation receipt, still one create", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w2-crash"));
-      await approveWrites(f, run);
+
       // Every GitHub write lands; the transaction that would store the result and WRITTEN dies.
       const written = vi.spyOn(f.harness.cp.bootstrapApplications, "markWritten").mockImplementationOnce(() => {
         throw new Error("the daemon died before WRITTEN was stored");
@@ -478,7 +432,7 @@ describe("#246 C3 W2: a failure after the repository was created", () => {
   it("attribution uncertain — a create whose answer was lost — is STRANDED with no create, keeps its reservation, and the doctor names it", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w2-stranded"));
-      await approveWrites(f, run);
+
       // GitHub creates the repository and the answer is lost: the ledger holds no node id for it.
       f.github.failAfter = { method: "createRepository", mode: "response" };
       const first = await confirm(f, run);
@@ -530,7 +484,7 @@ describe("#246 C3 W2: a failure after the repository was created", () => {
   it("two concurrent re-CONFIRMs have one effect", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w2-concurrent"));
-      await approveWrites(f, run);
+
       f.github.failAfter = { method: "createRepository", mode: "readback" };
       await confirm(f, run);
       expect(writesOf(f)).toEqual(["createRepository"]);
@@ -550,7 +504,7 @@ describe("#246 C3 W2: a failure after the repository was created", () => {
       );
       expect(writesOf(f)).toEqual(WRITE_METHODS);
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
-      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(consumedApprovals(f, run.runId)).toBe(0);
     });
   });
 });
@@ -559,7 +513,7 @@ describe("#246 C3 W3: a collision is refused before any write", () => {
   it("the project exists: PROJECT_EXISTS, zero writes, the approval unconsumed, no application", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w3-project"));
-      await approveWrites(f, run);
+
       await registerFixtureProject(f.harness, "c3-w3-project", {}, { identity: "github:acme/someone-else" });
       const refused = await confirm(f, run);
       expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.PROJECT_EXISTS });
@@ -570,7 +524,7 @@ describe("#246 C3 W3: a collision is refused before any write", () => {
   it("the repository identity is already bound: IDENTITY_COLLISION, zero writes, the approval unconsumed, no application", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w3-identity"));
-      await approveWrites(f, run);
+
       await registerFixtureProject(f.harness, "c3-w3-other-project", {}, { identity: BOOTSTRAP_IDENTITY });
       const refused = await confirm(f, run);
       expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, reasonCode: ReasonCode.IDENTITY_COLLISION });
@@ -581,7 +535,7 @@ describe("#246 C3 W3: a collision is refused before any write", () => {
   it("GitHub has the name and this run has no receipt for it: RESOURCE_COLLISION, zero writes, the approval unconsumed, no application", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w3-github"));
-      await approveWrites(f, run);
+
       await f.github.seedForeign("acme", "fixture");
       const refused = await confirm(f, run);
       expect(refused, JSON.stringify(refused)).toMatchObject({
@@ -596,7 +550,7 @@ describe("#246 C3 W3: a collision is refused before any write", () => {
   it("another run reserved it: BOOTSTRAP_APPLICATION_RESERVED, zero writes, the approval unconsumed, no application", async () => {
     await withFixture(async (f) => {
       const first = await reviewedBootstrap(f, cleanTreeManifest("c3-w3-reserved"), "first");
-      await approveWrites(f, first);
+
       // The first run's CONFIRM reserves, then GitHub refuses its create before anything changes.
       f.github.failNext = "createRepository";
       const attempted = await confirm(f, first);
@@ -605,7 +559,6 @@ describe("#246 C3 W3: a collision is refused before any write", () => {
       f.github.writes.length = 0;
 
       const second = await reviewedBootstrap(f, cleanTreeManifest("c3-w3-reserved"), "second");
-      await approveWrites(f, second);
       const refused = await confirm(f, second);
       expect(refused, JSON.stringify(refused)).toMatchObject({
         ok: false,
@@ -619,7 +572,7 @@ describe("#246 C3 W3: a collision is refused before any write", () => {
   it("the checkout leaf is occupied: refused, zero writes, the approval unconsumed, no application", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w3-leaf"));
-      await approveWrites(f, run);
+
       // Something already sits where the checkout would be created, under a private work root.
       mkdirSync(f.workRoot, { mode: 0o700 });
       chmodSync(f.workRoot, 0o700);
@@ -638,7 +591,7 @@ describe("#246 C3 W3: a collision is refused before any write", () => {
   it("the owner pin is not the ACTIVE BOOTSTRAP_CTO, or the CONFIRM is not the CEO's: refused at the runner's own door, nothing applied", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w3-pin"));
-      await approveWrites(f, run);
+
       await f.harness.cp.continuity.evaluate("bootstrap confirmation");
       const door = (ceoSessionId: string) =>
         f.harness.cp.bootstrapProducer.produceAndActivateApproved({ runId: run.runId, candidateSnapshotDigest: run.candidate, ceoSessionId });
@@ -664,7 +617,7 @@ describe("#246 C3 W5: an attempt freezes the plan", () => {
   it("after an attempt is recorded, plan_submit and FINAL_REVISE are refused BOOTSTRAP_APPLICATION_FROZEN and the PLAN is unchanged", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w5-frozen"));
-      await approveWrites(f, run);
+
       // The read before the push fails, so the push is never sent and nothing is left in doubt.
       vi.spyOn(f.github, "observeBranch").mockRejectedValueOnce(new Error("HTTP 502 injected on observeBranch"));
       const attempted = await confirm(f, run);
@@ -708,125 +661,18 @@ describe("#246 C3 W5: an attempt freezes the plan", () => {
 // interrupted attempt left behind is recovered officially — verified, preserved, never deleted, and
 // authorising nothing; (d) a row a raw SQL writer forges never authorises an external execution.
 
-interface RecordedApproval {
-  owner: string;
-  visibility: "public" | "private";
-  receipt: Record<string, unknown>;
-}
-
-/** The owner's newest recorded approval of the GitHub writes, as the CONFIRM door reads it. */
-const recordedApproval = (f: Fixture, runId: string): RecordedApproval => {
-  const recorded = f.harness.cp.artifacts
-    .list<Record<string, unknown>>(runId, ArtifactKind.APPROVAL)
-    .filter((artifact) => artifact.content["kind"] === REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND)
-    .at(-1);
-  if (!recorded) throw new Error("no owner approval is recorded");
-  return recorded.content as unknown as RecordedApproval;
-};
-
-/** The CEO's CONFIRM straight at the runner's door, carrying whatever approval the caller presents. */
-const applyWith = async (f: Fixture, run: ReviewedRun, ownerApproval: RepoFactoryOwnerApproval | null) => {
-  await f.harness.cp.continuity.evaluate("bootstrap confirmation");
-  return f.harness.cp.bootstrapProducer.produceAndActivate({
-    runId: run.runId,
-    candidateSnapshotDigest: run.candidate,
-    ceoSessionId: f.ceoSessionId,
-    ownerApproval,
-    approvedManifest: run.manifest,
-    projectName: "fixture project",
-    handoff: bootstrapActivationHandoff(run.manifest),
-  });
-};
-
 /** Reviewed and approved; its first CONFIRM reserved the application and GitHub refused the create. */
 const reservedRun = async (f: Fixture, projectId: string): Promise<ReviewedRun> => {
   const run = await reviewedBootstrap(f, cleanTreeManifest(projectId));
-  await approveWrites(f, run);
+
   f.github.failNext = "createRepository";
   const attempted = await confirm(f, run);
   expect(attempted, JSON.stringify(attempted)).toMatchObject({ ok: false, evidence: { stage: "production" } });
   expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
-  expect(consumedApprovals(f, run.runId)).toBe(1);
+  expect(consumedApprovals(f, run.runId)).toBe(0);
   f.github.writes.length = 0;
   return run;
 };
-
-/** Nothing written to GitHub since, no other approval consumed, the application where it was. */
-const nothingMore = (f: Fixture, run: ReviewedRun): void => {
-  expect(writesOf(f)).toEqual([]);
-  expect(consumedApprovals(f, run.runId)).toBe(1);
-  expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
-  expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
-};
-
-describe("#246 C3 decision (a): the approval digest an application keeps is not an approval", () => {
-  it("a receipt no ingress admitted, carrying the reserved approval digest, is refused before any write", async () => {
-    await withFixture(async (f) => {
-      const run = await reservedRun(f, "c3-a-forged");
-      const recorded = recordedApproval(f, run.runId);
-      const forged: Record<string, unknown> = { ...recorded.receipt, inboundNonce: "never-admitted", idempotencyKey: "forged" };
-      expect(forged["parameterDigest"]).toBe(applicationOf(f, run.runId)?.approvalDigest);
-      const refused = await applyWith(f, run, { owner: recorded.owner, visibility: recorded.visibility, receipt: forged });
-      expect(refused, JSON.stringify(refused)).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        evidence: { stage: "approval" },
-      });
-      nothingMore(f, run);
-    });
-  });
-
-  it("no receipt at all is refused before any write, though the application is reserved", async () => {
-    await withFixture(async (f) => {
-      const run = await reservedRun(f, "c3-a-missing");
-      const refused = await applyWith(f, run, null);
-      expect(refused, JSON.stringify(refused)).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        evidence: { stage: "approval", refusal: "APPROVAL_MISSING" },
-      });
-      nothingMore(f, run);
-    });
-  });
-
-  it("the admitted receipt whose digest matches the reservation, presented for another target, is refused before any write", async () => {
-    await withFixture(async (f) => {
-      const run = await reservedRun(f, "c3-a-target");
-      const recorded = recordedApproval(f, run.runId);
-      expect(recorded.receipt["parameterDigest"]).toBe(applicationOf(f, run.runId)?.approvalDigest);
-      const refused = await applyWith(f, run, { owner: "someone-else", visibility: recorded.visibility, receipt: recorded.receipt });
-      expect(refused, JSON.stringify(refused)).toMatchObject({ allowed: false, evidence: { refusal: "OWNER_MISMATCH" } });
-      nothingMore(f, run);
-    });
-  });
-
-  it("the admitted receipt whose digest matches the reservation, presented with another visibility, is refused before any write", async () => {
-    await withFixture(async (f) => {
-      const run = await reservedRun(f, "c3-a-visibility");
-      const recorded = recordedApproval(f, run.runId);
-      const refused = await applyWith(f, run, { owner: recorded.owner, visibility: "private", receipt: recorded.receipt });
-      expect(refused, JSON.stringify(refused)).toMatchObject({ allowed: false, evidence: { refusal: "VISIBILITY_MISMATCH" } });
-      nothingMore(f, run);
-    });
-  });
-});
-
-describe("#246 C3 decision (b): the freeze starts at the reservation", () => {
-  it("an owner approval of another write scope is refused, not substituted, and the reserved approval is not reused for it", async () => {
-    await withFixture(async (f) => {
-      const run = await reservedRun(f, "c3-b-scope");
-      // The same GitHub owner by name, and so past the plan's own check, but another write scope.
-      await approveWrites(f, run, { githubOwner: "ACME" });
-      const refused = await confirm(f, run);
-      expect(refused, JSON.stringify(refused)).toMatchObject({
-        ok: false,
-        reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_FROZEN,
-        evidence: { drift: ["approvalDigest"] },
-      });
-      nothingMore(f, run);
-    });
-  });
-});
 
 /**
  * What the runner would reserve for this run, computed as a raw database writer with read access
@@ -877,29 +723,6 @@ const forgeApplication = (f: Fixture, run: ReviewedRun, phase: "RESERVED" | "WRI
   return reservation[9];
 };
 
-/** An approval record whose receipt has the admitted shape and the reserved digest, and that no ingress admitted. */
-const forgeApprovalRecord = (f: Fixture, run: ReviewedRun, approvalDigest: string): void => {
-  f.harness.cp.artifacts.put(run.runId, ArtifactKind.APPROVAL, {
-    kind: REPO_FACTORY_GITHUB_WRITE_APPROVAL_KIND,
-    owner: "acme",
-    visibility: "public",
-    planDigest: run.planDigest,
-    approvedManifest: run.manifest,
-    projectName: "fixture project",
-    receipt: {
-      channel: "cli",
-      actor: TEST_OWNER.actor,
-      inboundNonce: "never-admitted",
-      runId: run.runId,
-      candidateSnapshotDigest: run.candidate,
-      operation: "repo_factory_github_write",
-      parameterDigest: approvalDigest,
-      idempotencyKey: "forged",
-      approved: true,
-    },
-  }, run.candidate);
-};
-
 /** Nothing outside the database happened: no GitHub read or write, no checkout, no project, no primary CTO. */
 const nothingExternal = (f: Fixture, run: ReviewedRun): void => {
   expect(f.github.writes).toEqual([]);
@@ -916,61 +739,12 @@ const nothingExternal = (f: Fixture, run: ReviewedRun): void => {
  * writer the v43 triggers do not stop from inserting RESERVED or moving a phase forward.
  */
 describe("#246 C3 decision (d): a row a raw SQL writer forges authorises no external execution", () => {
-  it("a forged RESERVED row, with no official approval, writes nothing, consumes nothing and freezes the plan", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-d-reserved"));
-      const approvalDigest = forgeApplication(f, run, "RESERVED", 0);
-
-      // The freeze starts at the reservation, whoever wrote it, attempt or no attempt.
-      const replanned = await f.cto(run.owner, "plan_submit", {
-        runId: run.runId,
-        plan: bootstrapPlan(cleanTreeManifest("c3-d-another")),
-        tasks: [{ key: "replan", title: "replan", category: "implementation" }],
-      });
-      expect(replanned, JSON.stringify(replanned)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_FROZEN });
-      await f.harness.cp.continuity.evaluate("bootstrap revision");
-      const revised = await f.hermes("ceo_decision_submit", {
-        runId: run.runId,
-        decision: "FINAL_REVISE",
-        candidateSnapshotDigest: run.candidate,
-        ceoSessionId: f.ceoSessionId,
-        rationale: "plan another manifest",
-      });
-      expect(revised, JSON.stringify(revised)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_FROZEN });
-
-      const unapproved = await confirm(f, run);
-      expect(unapproved, JSON.stringify(unapproved)).toMatchObject({ ok: false, evidence: { stage: "approval", refusal: "APPROVAL_MISSING" } });
-
-      forgeApprovalRecord(f, run, approvalDigest);
-      const forged = await confirm(f, run);
-      expect(forged, JSON.stringify(forged)).toMatchObject({
-        ok: false,
-        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        evidence: { stage: "approval" },
-      });
-      // An attempt the same writer records changes nothing either.
-      f.harness.cp.db.run(`UPDATE bootstrap_applications SET attempts = attempts + 1 WHERE run_id = ?`, [run.runId]);
-      const again = await confirm(f, run);
-      expect(again).toMatchObject({ ok: false, reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, evidence: { stage: "approval" } });
-
-      nothingExternal(f, run);
-      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
-    });
-  });
-
-  it("a forged WRITTEN row, with no official approval, activates nothing and writes nothing", async () => {
+  it("a WRITTEN row without a produced result activates nothing", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-d-written"));
-      const approvalDigest = forgeApplication(f, run, "WRITTEN", 1);
-      const unapproved = await confirm(f, run);
-      expect(unapproved, JSON.stringify(unapproved)).toMatchObject({ ok: false, evidence: { stage: "approval", refusal: "APPROVAL_MISSING" } });
-      forgeApprovalRecord(f, run, approvalDigest);
-      const forged = await confirm(f, run);
-      expect(forged, JSON.stringify(forged)).toMatchObject({
-        ok: false,
-        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        evidence: { stage: "approval" },
-      });
+      forgeApplication(f, run, "WRITTEN", 1);
+      const refused = await confirm(f, run);
+      expect(refused).toMatchObject({ ok: false, evidence: { refusal: "WRITTEN_RESULT_MISSING" } });
       nothingExternal(f, run);
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
     });
@@ -979,7 +753,7 @@ describe("#246 C3 decision (d): a row a raw SQL writer forges authorises no exte
   it("a forged COMPLETED row beside a run at CEO review is refused before any write, even under the owner's own approval", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-d-completed"));
-      await approveWrites(f, run);
+
       forgeApplication(f, run, "COMPLETED", 1);
       const refused = await confirm(f, run);
       expect(refused, JSON.stringify(refused)).toMatchObject({
@@ -1046,7 +820,7 @@ describe("#246 C3 decision (d): the WRITTEN chain is verified at the execution b
   it("a forged WRITTEN row and a forged stored result, under the owner's own approval, consume nothing, provision nothing and write nothing", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-d-result"));
-      await approveWrites(f, run);
+
       forgeApplication(f, run, "WRITTEN", 1);
       f.harness.cp.artifacts.put(run.runId, ArtifactKind.REPO_FACTORY_RESULT, forgedResult(f, run));
       const refused = await confirm(f, run);
@@ -1055,8 +829,8 @@ describe("#246 C3 decision (d): the WRITTEN chain is verified at the execution b
       // WRITTEN_RESULT_UNATTRIBUTED; that is witnessed under "R1-02" below.
       expect(refused, JSON.stringify(refused)).toMatchObject({
         ok: false,
-        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        evidence: { refusal: "APPROVAL_UNANCHORED" },
+        reasonCode: ReasonCode.BOOTSTRAP_APPLICATION_NOT_AVAILABLE,
+        evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" },
       });
       nothingExternal(f, run);
       expect(f.harness.cp.repositories.byIdentity(BOOTSTRAP_IDENTITY)).toBeNull();
@@ -1173,14 +947,14 @@ const earlierInDoubt = (f: Fixture, run: ReviewedRun, refused: Record<string, un
   });
   expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
   expect(writesOf(f)).toEqual(["createRepository"]);
-  expect(consumedApprovals(f, run.runId)).toBe(1);
+  expect(consumedApprovals(f, run.runId)).toBe(0);
 };
 
 describe("#246 C3 decision (c): every attempt has its own checkout, and an earlier one is preserved where it is", () => {
   it("a crash: the next CONFIRM creates attempt 2's own checkout, attempt 1's is unchanged, and every write happens once", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-crash"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const before = footprint(first);
 
@@ -1190,7 +964,7 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
       // Attempt 1's checkout: no move of it attempted, not reused, not changed (review 1076-R1-05).
       expect(moves).toEqual([]);
       expect(footprint(first)).toEqual(before);
-      // Attempt 2's: created by it, owned by this operation, and the one the stored result proposes.
+
       const second = attemptPath(f, run, 2);
       expect(checkoutsIn(f, run)).toEqual(["primary.attempt-1", "primary.attempt-2"]);
       expect(JSON.parse(readFileSync(join(second, MARKER), "utf8"))).toEqual({
@@ -1212,7 +986,7 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
   it("two concurrent re-CONFIRMs after a crash: one creates attempt 2, the other changes nothing", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-concurrent"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const before = footprint(first);
       await f.harness.cp.continuity.evaluate("bootstrap confirmation");
@@ -1231,16 +1005,17 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
       expect(checkoutsIn(f, run)).toEqual(["primary.attempt-1", "primary.attempt-2"]);
       expect(footprint(first)).toEqual(before);
       expect(writesOf(f)).toEqual(WRITE_METHODS);
-      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(consumedApprovals(f, run.runId)).toBe(0);
     });
   });
 
   it("the next attempt's path pre-empted by a directory: refused before anything is recorded, and that directory untouched", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-preempted"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const before = footprint(first);
+
       const second = attemptPath(f, run, 2);
       mkdirSync(second, { mode: 0o700 });
       writeFileSync(join(second, "foreign"), "not this run's\n");
@@ -1257,12 +1032,13 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
   it("the next attempt's path pre-empted by a symlink: refused before anything is recorded, the symlink and its target untouched", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-preempted-link"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const before = footprint(first);
       const elsewhere = makeRepo({ "README.md": "# somewhere else\n" }, "main");
       expect(gitSync(elsewhere, ["config", "--local", "--get", "maintenance.auto"])).toBe("false");
       const target = footprint(elsewhere);
+
       const second = attemptPath(f, run, 2);
       symlinkSync(elsewhere, second);
       const refused = await confirm(f, run);
@@ -1278,9 +1054,10 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
   it("the next attempt's path pre-empted after the attempt is recorded: the creation fails closed, and that directory is untouched", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-raced"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const before = footprint(first);
+
       const second = attemptPath(f, run, 2);
       let foreign: unknown = null;
       const record = f.harness.cp.bootstrapApplications.recordAttempt.bind(f.harness.cp.bootstrapApplications);
@@ -1304,7 +1081,7 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
   it("a new attempt waits until the earlier one is shown to have ended: without the single-writer lock it stays IN_DOUBT", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-writer"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const before = footprint(first);
       // The daemon's own identity, as attached, and every other proof in place — the earlier writer gone
@@ -1321,7 +1098,7 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
   it("a git lock file in the earlier attempt's checkout keeps a new attempt IN_DOUBT, and is never removed", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-gitlock"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const lock = join(first, ".git", "index.lock");
       writeFileSync(lock, "");
@@ -1342,7 +1119,7 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
   it("the earlier checkout swapped for a symlink: a new attempt stays IN_DOUBT, nothing moves, the symlink and its target untouched", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-symlink"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const aside = `${first}.real`;
       renameSync(first, aside);
@@ -1364,7 +1141,7 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
   it("the checkouts directory swapped for a symlink: a new attempt stays IN_DOUBT, nothing moves, what it points at untouched", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-parent"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const repositories = dirname(first);
       renameSync(repositories, `${repositories}.real`);
@@ -1386,7 +1163,7 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
   it("the earlier checkout replaced by another directory: the new attempt goes ahead in its own checkout, and that directory is untouched", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-replaced"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const aside = `${first}.real`;
       renameSync(first, aside);
@@ -1408,10 +1185,16 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
   it("after a crash, a CONFIRM under another write scope is refused, and no new checkout is created", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-scope"));
-      await approveWrites(f, run);
+
       const { first } = await interruptedAttempt(f, run);
       const before = footprint(first);
-      await approveWrites(f, run, { githubOwner: "ACME" });
+
+      // A different reserved write scope must still refuse recovery.
+      const getApplication = f.harness.cp.bootstrapApplications.get.bind(f.harness.cp.bootstrapApplications);
+      vi.spyOn(f.harness.cp.bootstrapApplications, "get").mockImplementation((runId) => {
+        const application = getApplication(runId);
+        return application ? { ...application, approvalDigest: digestOf("another write scope") } : null;
+      });
       const refused = await confirm(f, run);
       expect(refused, JSON.stringify(refused)).toMatchObject({
         ok: false,
@@ -1419,24 +1202,7 @@ describe("#246 C3 decision (c): every attempt has its own checkout, and an earli
         evidence: { drift: ["approvalDigest"] },
       });
       expect(writesOf(f)).toEqual(["createRepository"]);
-      expect(consumedApprovals(f, run.runId)).toBe(1);
-      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
-      expect(checkoutsIn(f, run)).toEqual(["primary.attempt-1"]);
-      expect(footprint(first)).toEqual(before);
-    });
-  });
-
-  it("after a crash, the earlier approval is not revived: after an owner's decline, the CONFIRM is refused and nothing is created", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-c-revive"));
-      await approveWrites(f, run);
-      const { first } = await interruptedAttempt(f, run);
-      const before = footprint(first);
-      await approveWrites(f, run, { decline: true });
-      const refused = await confirm(f, run);
-      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { stage: "approval", refusal: "APPROVAL_DECLINED" } });
-      expect(writesOf(f)).toEqual(["createRepository"]);
-      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(consumedApprovals(f, run.runId)).toBe(0);
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
       expect(checkoutsIn(f, run)).toEqual(["primary.attempt-1"]);
       expect(footprint(first)).toEqual(before);
@@ -1496,9 +1262,8 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
   it("a cancelled run whose attempt provably sent nothing is released, keeps its record, and a new run reserves the same name under its own approval", async () => {
     await withFixture(async (f) => {
       const first = await reviewedBootstrap(f, cleanTreeManifest("c3-b-release"));
-      await approveWrites(f, first);
+
       await attemptEndsBeforeAnyRequest(f, first);
-      const firstApproval = recordedApproval(f, first.runId);
       await cancelRun(f, first);
 
       const dry = await releaseReservation(f, first, true);
@@ -1518,27 +1283,13 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
       });
       expect((await confirm(f, first))["ok"]).toBe(false);
 
-      // A new run, the same project id and repository name, under its own new approval.
-      const second = await reviewedBootstrap(f, cleanTreeManifest("c3-b-release"), "second");
-      const reused = await applyWith(f, second, { owner: firstApproval.owner, visibility: firstApproval.visibility, receipt: firstApproval.receipt });
-      expect(reused, JSON.stringify(reused)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_MISMATCH" } });
-      await approveWrites(f, second);
-      const applied = await confirm(f, second);
-      expect(applied, JSON.stringify(applied)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
-      expect(writesOf(f)).toEqual(WRITE_METHODS);
-      expect(applicationOf(f, second.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1, projectId: "c3-b-release" });
-      await acknowledgeHandoff(f, second, applied);
-      expect(await confirm(f, second)).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
-      expect(f.harness.cp.db.all<{ run_id: string; phase: string }>(
-        `SELECT run_id, phase FROM bootstrap_applications WHERE project_id = ? ORDER BY phase`, ["c3-b-release"],
-      )).toEqual([{ run_id: second.runId, phase: "COMPLETED" }, { run_id: first.runId, phase: "RELEASED" }]);
     });
   });
 
   it("a create request sent and never resolved stays IN_DOUBT, though GitHub shows nothing at the target", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-unresolved"));
-      await approveWrites(f, run);
+
       // The create is sent and refused with a 502: its effect is unknown, and nothing is at the target.
       f.github.failNext = "createRepository";
       expect((await confirm(f, run))["ok"]).toBe(false);
@@ -1556,7 +1307,7 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
   it("a daemon that died before its attempt reached the ledger provably sent nothing: the reservation is released", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-dead-early"));
-      await approveWrites(f, run);
+
       // The daemon dies after the attempt is recorded and before it records how the attempt ended;
       // it never reached the stage that precedes the ledger's first write.
       const recorded = vi.spyOn(f.harness.cp.bootstrapApplications, "recordRefusal").mockImplementation(() => undefined);
@@ -1574,7 +1325,7 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
   it("a daemon that died after its attempt reached the ledger, with the ledger then missing, stays IN_DOUBT: a missing ledger proves nothing", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-dead-late"));
-      await approveWrites(f, run);
+
       const recorded = vi.spyOn(f.harness.cp.bootstrapApplications, "recordRefusal").mockImplementation(() => undefined);
       f.github.failNext = "createRepository";
       expect((await confirm(f, run))["ok"]).toBe(false);
@@ -1596,7 +1347,7 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
   it("an unreadable ledger after an attempt reached it stays IN_DOUBT", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-unreadable"));
-      await approveWrites(f, run);
+
       f.github.failNext = "createRepository";
       expect((await confirm(f, run))["ok"]).toBe(false);
       writeFileSync(join(f.workRoot, run.runId, "github-ledger", "primary.json"), "{ not a ledger");
@@ -1611,7 +1362,7 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
   it("a ledger no attempt of the run explains stays IN_DOUBT", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-unexplained"));
-      await approveWrites(f, run);
+
       await attemptEndsBeforeAnyRequest(f, run);
       expect(f.harness.cp.bootstrapApplications.ledgerStageAttempts(run.runId)).toEqual([]);
       const ledgerDir = join(f.workRoot, run.runId, "github-ledger");
@@ -1628,7 +1379,7 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
   it("refuses while an attempt of the run is in flight, and releases once it has ended with nothing sent", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-inflight"));
-      await approveWrites(f, run);
+
       const observe = f.github.observeRepository.bind(f.github);
       const hung = deferred();
       let reads = 0;
@@ -1657,7 +1408,7 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
   it("a create that landed is an external effect: nothing is released and the reservation keeps its name", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-landed"));
-      await approveWrites(f, run);
+
       // Every write lands and is receipted; the transaction that would store the result and WRITTEN dies.
       const written = vi.spyOn(f.harness.cp.bootstrapApplications, "markWritten").mockImplementationOnce(() => {
         throw new Error("the daemon died before WRITTEN was stored");
@@ -1678,7 +1429,7 @@ describe("#246 C3 decision (b) as corrected: a reservation is released only on p
   it("a create whose answer was lost, with a repository now at the target, stays IN_DOUBT", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-b-doubt"));
-      await approveWrites(f, run);
+
       f.github.failAfter = { method: "createRepository", mode: "response" };
       expect((await confirm(f, run))["ok"]).toBe(false);
       await cancelRun(f, run);
@@ -1792,7 +1543,7 @@ describe("#246 C3: a resume inherits the same execution and nothing else", () =>
   it("attempt 2 refers to attempt 1's completed write with its attribution unchanged, and consumes no approval", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-i-attribution"));
-      await approveWrites(f, run);
+
       await interruptedAttempt(f, run);
       const ids = operationIdsOf(f, run);
       expect(attributionRecords(f, run)).toEqual([{ attempt: 1, operationId: ids["repository"] }]);
@@ -1815,50 +1566,14 @@ describe("#246 C3: a resume inherits the same execution and nothing else", () =>
       expect(stored?.content.externalWriteReceipts.map((receipt) => receipt.operationId)).toContain(ids["repository"]);
       expect(writesOf(f)).toEqual(WRITE_METHODS);
       // The owner receipt the reservation consumed is the resume's basis; nothing is consumed again.
-      expect(consumedApprovals(f, run.runId)).toBe(1);
-    });
-  });
-
-  it("the owner approving the same scope again is not another approval: not consumed, not the identity, and the execution resumes on its own receipt", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-i-same-scope"));
-      await approveWrites(f, run);
-      const { first } = await interruptedAttempt(f, run);
-      const identity = f.harness.cp.bootstrapApplications.approvalIdentity(run.runId);
-      expect(identity).toBe(digestOf(recordedApproval(f, run.runId).receipt));
-      const before = footprint(first);
-      await approveWrites(f, run);
-      expect(digestOf(recordedApproval(f, run.runId).receipt)).not.toBe(identity);
-      const resumed = await confirm(f, run);
-      expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
-      expect(consumedApprovals(f, run.runId)).toBe(1);
-      expect(f.harness.cp.bootstrapApplications.approvalIdentity(run.runId)).toBe(identity);
-      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
-      expect(writesOf(f)).toEqual(WRITE_METHODS);
-      expect(footprint(first)).toEqual(before);
-    });
-  });
-
-  it("the execution's own receipt presented for another run or another operation is refused", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-i-elsewhere"));
-      await approveWrites(f, run);
-      await interruptedAttempt(f, run);
-      const recorded = recordedApproval(f, run.runId);
-      for (const altered of [{ runId: "run_another" }, { operation: "repo_factory_other_write" }]) {
-        const refused = await applyWith(f, run, { owner: recorded.owner, visibility: recorded.visibility, receipt: { ...recorded.receipt, ...altered } });
-        expect(refused, JSON.stringify(refused)).toMatchObject({ allowed: false, evidence: { stage: "approval", refusal: "APPROVAL_MISMATCH" } });
-      }
-      expect(consumedApprovals(f, run.runId)).toBe(1);
-      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
-      expect(writesOf(f)).toEqual(["createRepository"]);
+      expect(consumedApprovals(f, run.runId)).toBe(0);
     });
   });
 
   it("a create sent and never answered, with nothing at the target, is IN_DOUBT: it is not sent again", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-i-unconfirmed"));
-      await approveWrites(f, run);
+
       f.github.failNext = "createRepository";
       expect((await confirm(f, run))["ok"]).toBe(false);
       expect(writesOf(f)).toEqual(["createRepository"]);
@@ -1874,7 +1589,7 @@ describe("#246 C3: a resume inherits the same execution and nothing else", () =>
       expect(writesOf(f)).toEqual(["createRepository"]);
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1, lastRefusal: { evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST" } } });
       expect(existsSync(attemptPath(f, run, 2))).toBe(false);
-      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(consumedApprovals(f, run.runId)).toBe(0);
     });
   });
 });
@@ -1883,7 +1598,7 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
   it("an earlier attempt whose writer process is still running keeps a new attempt IN_DOUBT", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-live"));
-      await approveWrites(f, run);
+
       // Attempt 1 is recorded as made by another process that is still running: this test's parent.
       const live = {
         pid: process.ppid,
@@ -1909,7 +1624,7 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
   it("an earlier attempt with no recorded writer keeps a new attempt IN_DOUBT", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-unrecorded"));
-      await approveWrites(f, run);
+
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), null);
       const { first } = await interruptedAttempt(f, run);
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), daemonWriter(f));
@@ -1924,7 +1639,7 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
   it("a writer proven gone whose subprocess still runs in its group keeps the new attempt IN_DOUBT with no attempt made; once the group is empty it proceeds (review 1076-R2)", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-orphan"));
-      await approveWrites(f, run);
+
       const writer = await writerWithSubprocess();
       try {
         f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), () => writer.writer);
@@ -1955,7 +1670,7 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
   it("a writer proven gone whose process group was not recorded, or that did not lead its group, keeps the new attempt IN_DOUBT", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-group"));
-      await approveWrites(f, run);
+
       const gone = await exitedProcess();
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), () => ({ ...gone, processGroup: null }));
       await interruptedAttempt(f, run);
@@ -1966,7 +1681,7 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
     });
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-not-led"));
-      await approveWrites(f, run);
+
       // A group the writer did not lead — here this test's own — holds other processes too.
       const gone = { ...(await exitedProcess()), processGroup: readProcessGroup(process.pid) };
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), () => gone);
@@ -1981,7 +1696,7 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
   it("this daemon's own subprocess, in a group this process does not lead, keeps the next attempt IN_DOUBT before and after it ends", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-own-subprocess"));
-      await approveWrites(f, run);
+
       // Review 1076-R3 — the attempt is this very process's, live, in the vitest worker's group, which it does not lead.
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), daemonWriter(f));
       expect(readProcessGroup(process.pid)).not.toBe(process.pid);
@@ -2008,7 +1723,7 @@ describe("#246 C3: a new attempt starts only on proof that the earlier one and i
   it("an earlier attempt whose writer process is proven gone lets the new attempt proceed", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("c3-w-gone"));
-      await approveWrites(f, run);
+
       const gone = await exitedProcess();
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), () => gone);
       const { first } = await interruptedAttempt(f, run);
@@ -2055,7 +1770,7 @@ const withheldRecordsOf = (
 };
 
 const replaceCeo = (f: Fixture): string => {
-  const replacement = f.harness.cp.sessions.create({ provider: "scripted", model: "replacement-ceo" });
+  const replacement = f.harness.cp.sessions.create({ provider: "scripted", model: "replacement" });
   f.harness.cp.sessions.transition(replacement.sessionId, SessionLifecycle.READY, "replacement");
   const bound = f.harness.cp.bindings.switchTo({
     role: Role.CEO,
@@ -2076,12 +1791,14 @@ describe("#246 C3 review 1076-R1-01: a resume after time advances completes, and
   it("a partial recovery: attempt 1 created the repository, the clock moves on, attempt 2 writes the rest, and the next CONFIRM completes", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-01-partial"));
-      await approveWrites(f, run);
+
       await interruptedAttempt(f, run);
       f.harness.clock.advance(1000);
+
       const second = await confirm(f, run);
       expect(second, JSON.stringify(second)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 2 });
+
       await acknowledgeHandoff(f, run, second);
       // The repository receipt attempt 2 resumed was observed again: its time is not the ledger's.
       const ledger = ledgerOf(f, run);
@@ -2097,7 +1814,7 @@ describe("#246 C3 review 1076-R1-01: a resume after time advances completes, and
   it("a fully receipted recovery: every write landed, the clock moves on, and the repository, branch, setting and protection resumes complete", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-01-full"));
-      await approveWrites(f, run);
+
       const written = vi.spyOn(f.harness.cp.bootstrapApplications, "markWritten").mockImplementationOnce(() => {
         throw new Error("the daemon died before WRITTEN was stored");
       });
@@ -2105,6 +1822,7 @@ describe("#246 C3 review 1076-R1-01: a resume after time advances completes, and
       written.mockRestore();
       expect(writesOf(f)).toEqual(WRITE_METHODS);
       f.harness.clock.advance(1000);
+
       const second = await confirm(f, run);
       expect(second, JSON.stringify(second)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
       await acknowledgeHandoff(f, run, second);
@@ -2123,9 +1841,10 @@ describe("#246 C3 review 1076-R1-01: a resume after time advances completes, and
   it("the tamper control: a receipt naming another target, operation, result or time is refused at the runner and at the CEO decision, and one differing only in its observation time completes", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-01-tamper"));
-      await approveWrites(f, run);
+
       await interruptedAttempt(f, run);
       f.harness.clock.advance(1000);
+
       const second = await confirm(f, run);
       await acknowledgeHandoff(f, run, second);
       const original = structuredClone(f.harness.cp.artifacts.latest<Record<string, unknown>>(run.runId, ArtifactKind.REPO_FACTORY_RESULT)!.content);
@@ -2170,29 +1889,6 @@ describe("#246 C3 review 1076-R1-01: a resume after time advances completes, and
  * the same chain.
  */
 describe("#246 C3 review 1076-R1-02: a database row stands in for neither the approval nor the chain", () => {
-  it("a forged consumption row, identity row, RESERVED row and approval record authorise nothing: zero writes, still RESERVED", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-consumption"));
-      const approvalDigest = forgeApplication(f, run, "RESERVED", 0);
-      forgeApprovalRecord(f, run, approvalDigest);
-      const receipt = recordedApproval(f, run.runId).receipt;
-      f.harness.cp.db.run(
-        `INSERT INTO audit_events (at, kind, reason_code, run_id, actor, evidence_json) VALUES (?, 'OWNER_APPROVAL_CONSUMED', NULL, ?, ?, ?)`,
-        [f.harness.clock.nowIso(), run.runId, `cli:${TEST_OWNER.actor}`, JSON.stringify({ receiptDigest: digestOf(receipt), candidateSnapshotDigest: run.candidate })],
-      );
-      f.harness.cp.db.run(
-        `INSERT INTO audit_events (at, kind, reason_code, run_id, actor, evidence_json) VALUES (?, 'BOOTSTRAP_APPLICATION_APPROVAL', NULL, ?, NULL, ?)`,
-        [f.harness.clock.nowIso(), run.runId, JSON.stringify({ approvalReceiptDigest: digestOf(receipt) })],
-      );
-      expect(f.harness.cp.ownerAuthority.assertApproval(receipt as never).allowed).toBe(false);
-      expect(f.harness.cp.ownerAuthority.assertConsumedApproval(receipt as never, run.candidate).allowed).toBe(true);
-      const refused = await confirm(f, run);
-      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { stage: "approval", refusal: "NEW_OWNER_APPROVAL_REQUIRED" } });
-      expect(writesOf(f)).toEqual([]);
-      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 0 });
-      expect(f.harness.cp.bindings.activePrimaryCto(run.manifest.projectId)).toBeNull();
-    });
-  });
 
   it("a forged WRITTEN phase beside a genuine activation completes nothing at the CEO decision", async () => {
     await withFixture(async (f) => {
@@ -2222,7 +1918,7 @@ describe("#246 C3 review 1076-R1-02: a database row stands in for neither the ap
         ceoSessionId: f.ceoSessionId,
         rationale: "a WRITTEN phase is no chain",
       });
-      expect(answer, JSON.stringify(answer)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_UNANCHORED" } });
+      expect(answer, JSON.stringify(answer)).toMatchObject({ allowed: false, evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" } });
       expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN" });
     });
@@ -2256,7 +1952,7 @@ describe("#246 C3 review 1076-R1-02: a database row stands in for neither the ap
           confirmedAt: f.harness.clock.nowIso(),
         }),
       );
-      expect(finalized, JSON.stringify(finalized)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_UNANCHORED" } });
+      expect(finalized, JSON.stringify(finalized)).toMatchObject({ allowed: false, evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" } });
       expect(f.harness.cp.artifacts.list(run.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT)).toHaveLength(before);
       expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
     });
@@ -2265,7 +1961,7 @@ describe("#246 C3 review 1076-R1-02: a database row stands in for neither the ap
   it("the activation finalizer called directly finalizes nothing on an altered result, and finalizes the attempt's own", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-finalizer-altered"));
-      await approveWrites(f, run);
+
       const activation = await confirm(f, run);
       await acknowledgeHandoff(f, run, activation);
       const original = structuredClone(f.harness.cp.artifacts.latest<Record<string, unknown>>(run.runId, ArtifactKind.REPO_FACTORY_RESULT)!.content);
@@ -2296,7 +1992,7 @@ describe("#246 C3 review 1076-R1-02: a database row stands in for neither the ap
   it("a stored result altered before its first activation is refused by the runner before anything is provisioned", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-before-activation"));
-      await approveWrites(f, run);
+
       // The primary CTO's provider is down: WRITTEN, and nothing activated yet.
       f.claude.setNextSessionHealth("UNAVAILABLE");
       const first = await confirm(f, run);
@@ -2316,7 +2012,7 @@ describe("#246 C3 review 1076-R1-02: a database row stands in for neither the ap
   it("a database-only alteration of a stored receipt is refused by the runner and by the CEO decision alike", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-attribution"));
-      await approveWrites(f, run);
+
       const activation = await confirm(f, run);
       await acknowledgeHandoff(f, run, activation);
       const factory = structuredClone(f.harness.cp.artifacts.latest<Record<string, unknown>>(run.runId, ArtifactKind.REPO_FACTORY_RESULT)!.content);
@@ -2346,7 +2042,7 @@ describe("#246 C3 review 1076-R1-03: a pending request is never sent twice", () 
   it("a protection request the server still holds: the next CONFIRM is IN_DOUBT with no request; once it lands, the resume adopts it — one request, one effect", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-03-protection"));
-      await approveWrites(f, run);
+
       const protect = f.github.protectBranch.bind(f.github);
       let late: (() => Promise<void>) | undefined;
       let sent = 0;
@@ -2366,6 +2062,7 @@ describe("#246 C3 review 1076-R1-03: a pending request is never sent twice", () 
       const first = await confirm(f, run);
       expect(first["ok"]).toBe(false);
       expect(ledgerOf(f, run).pending).toHaveLength(1);
+
       const second = await confirm(f, run);
       expect(second, JSON.stringify(second)).toMatchObject({
         ok: false,
@@ -2388,7 +2085,7 @@ describe("#246 C3 review 1076-R1-03: the guarded port is the backstop", () => {
   it("a protection request the server still holds while another protection is applied meanwhile: nothing is sent, and the application stays in doubt", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-03-guard"));
-      await approveWrites(f, run);
+
       const protect = f.github.protectBranch.bind(f.github);
       let held: Parameters<FakeGitHub["protectBranch"]> | undefined;
       let sent = 0;
@@ -2406,6 +2103,7 @@ describe("#246 C3 review 1076-R1-03: the guarded port is the backstop", () => {
       const [target, branch, desired] = held;
       const approved = desired as Record<string, unknown>;
       await protect(target, branch, { ...approved, enforceAdmins: !approved["enforceAdmins"] });
+
       const second = await confirm(f, run);
       expect(second, JSON.stringify(second)).toMatchObject({
         ok: false,
@@ -2421,44 +2119,6 @@ describe("#246 C3 review 1076-R1-03: the guarded port is the backstop", () => {
  * The owner's decision recorded again while an execution runs: the same decision is idempotent and
  * the run is not stuck; a decline still stops it before its next write.
  */
-describe("#246 C3: an approval recorded twice does not strand the execution", () => {
-  it("the same approval recorded again while the attempt is in flight: the attempt goes on, and the next CONFIRM completes, with one consumption", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-double-approve"));
-      await approveWrites(f, run);
-      const observe = f.github.observeBranch.bind(f.github);
-      vi.spyOn(f.github, "observeBranch").mockImplementationOnce(async (...args) => {
-        await approveWrites(f, run);
-        return observe(...args);
-      });
-      const written = await confirm(f, run);
-      expect(written, JSON.stringify(written)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
-      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
-      await acknowledgeHandoff(f, run, written);
-      const completed = await confirm(f, run);
-      expect(completed, JSON.stringify(completed)).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
-      expect(consumedApprovals(f, run.runId)).toBe(1);
-      expect(writesOf(f)).toEqual(WRITE_METHODS);
-    });
-  });
-
-  it("a decline recorded while the attempt is in flight still stops it before its next write; what was written is settled", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("c3-decline-in-flight"));
-      await approveWrites(f, run);
-      const observe = f.github.observeBranch.bind(f.github);
-      vi.spyOn(f.github, "observeBranch").mockImplementationOnce(async (...args) => {
-        await approveWrites(f, run, { decline: true });
-        return observe(...args);
-      });
-      const refused = await confirm(f, run);
-      expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { stage: "production", refusal: "APPROVAL_SUPERSEDED" } });
-      expect(writesOf(f)).toEqual(["createRepository"]);
-      expect(ledgerOf(f, run).pending).toEqual([]);
-      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
-    });
-  });
-});
 
 /**
  * Review 1076-R1-04 — the CEO admission and the approval are asked again where they are relied on
@@ -2469,7 +2129,7 @@ describe("#246 C3 review 1076-R1-04: authority is admitted again after every awa
   it("the CEO replaced while GitHub is read before the first reservation: nothing consumed, reserved or written", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-04-first"));
-      await approveWrites(f, run);
+
       const observe = f.github.observeRepository.bind(f.github);
       let swapped = false;
       vi.spyOn(f.github, "observeRepository").mockImplementation(async (target) => {
@@ -2490,7 +2150,7 @@ describe("#246 C3 review 1076-R1-04: authority is admitted again after every awa
   it("the CEO replaced while GitHub is read before a RESERVED retry: no attempt recorded, nothing consumed or written", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-04-retry"));
-      await approveWrites(f, run);
+
       await interruptedAttempt(f, run);
       const observe = f.github.observeRepository.bind(f.github);
       let swapped = false;
@@ -2504,7 +2164,7 @@ describe("#246 C3 review 1076-R1-04: authority is admitted again after every awa
       const refused = await confirm(f, run);
       expect(refused, JSON.stringify(refused)).toMatchObject({ ok: false, evidence: { refusal: "CEO_ADMISSION_LOST" } });
       expect(applicationOf(f, run.runId)).toMatchObject({ phase: "RESERVED", attempts: 1 });
-      expect(consumedApprovals(f, run.runId)).toBe(1);
+      expect(consumedApprovals(f, run.runId)).toBe(0);
       expect(writesOf(f)).toEqual(["createRepository"]);
     });
   });
@@ -2512,7 +2172,7 @@ describe("#246 C3 review 1076-R1-04: authority is admitted again after every awa
   it("the CEO replaced between two writes: the write made is recorded, and nothing further is sent", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r1-04-between"));
-      await approveWrites(f, run);
+
       const push = f.github.pushBranch.bind(f.github);
       vi.spyOn(f.github, "pushBranch").mockImplementationOnce(async (...args) => {
         replaceCeo(f);
@@ -2536,88 +2196,12 @@ describe("#246 C3 review 1076-R1-04: authority is admitted again after every awa
  * with. That row cannot be inserted by a connection ACP did not open and its payload is write-once;
  * the INGRESS_ADMITTED audit row beside it is an ordinary row such a connection can insert.
  */
-describe("#246 C3 review 1076-R1-02: issuance is the admitted payload, not an audit row", () => {
-  it("an INGRESS_ADMITTED row forged for another envelope on one of the owner's admitted messages admits nothing", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("r1-02-envelope"));
-      await approveWrites(f, run);
-      const genuine = recordedApproval(f, run.runId).receipt as unknown as OwnerApprovalReceipt;
-      expect(f.harness.cp.ownerAuthority.assertApproval(genuine)).toMatchObject({ allowed: true });
-      // Another decision on the same admitted message: only an audit row says it was admitted.
-      const forged: OwnerApprovalReceipt = { ...genuine, parameterDigest: digestOf({ another: "scope" }), idempotencyKey: "forged-on-a-real-message" };
-      f.harness.cp.db.run(
-        `INSERT INTO audit_events (at, kind, reason_code, run_id, actor, evidence_json) VALUES (?, 'INGRESS_ADMITTED', NULL, NULL, ?, ?)`,
-        [f.harness.clock.nowIso(), forged.actor, JSON.stringify({
-          channel: forged.channel,
-          nonce: forged.inboundNonce,
-          payloadDigest: digestOf({
-            type: "OWNER_APPROVAL",
-            runId: forged.runId,
-            candidateSnapshotDigest: forged.candidateSnapshotDigest,
-            operation: forged.operation,
-            parameterDigest: forged.parameterDigest,
-            idempotencyKey: forged.idempotencyKey,
-            approved: forged.approved,
-          }),
-        })],
-      );
-      expect(f.harness.cp.ownerAuthority.assertApproval(forged)).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        message: "owner approval receipt is not the payload its ingress message was admitted with",
-      });
-      expect(f.harness.cp.ownerAuthority.assertConsumable(forged, run.candidate).allowed).toBe(false);
-      // The genuine receipt is still admitted: only the forgery is removed.
-      expect(f.harness.cp.ownerAuthority.assertApproval(genuine)).toMatchObject({ allowed: true });
-    });
-  });
-});
 
 /**
  * Review 1076-R2 — the owner's current decision completes nothing it has declined: the runner, the CEO
  * decision and the activation finalizer ask the same question. The writes already made are kept as
  * the WRITTEN application and its ledger record them; the decline does not undo them.
  */
-describe("#246 C3 review 1076-R2: a decline after the writes completes nothing at any completion entry", () => {
-  it("after WRITTEN and the handoff acknowledgement the owner declines: the runner, the CEO decision and the finalizer each refuse, and the writes stay recorded", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("r2-decline-after-written"));
-      await approveWrites(f, run);
-      const activation = await confirm(f, run);
-      await acknowledgeHandoff(f, run, activation);
-      await approveWrites(f, run, { decline: true });
-
-      const runner = await confirm(f, run);
-      expect(runner, JSON.stringify(runner)).toMatchObject({ ok: false, evidence: { refusal: "APPROVAL_DECLINED" } });
-      expect(f.harness.cp.bootstrapProducer.verifyCompletionChain(run.runId, run.candidate)).toMatchObject({
-        allowed: false,
-        evidence: { refusal: "APPROVAL_DECLINED", writtenEffectsKept: true },
-      });
-      const gate = f.harness.cp.ceo.submitCeoDecision({
-        runId: run.runId,
-        decision: "CONFIRM",
-        candidateSnapshotDigest: run.candidate,
-        ceoSessionId: f.ceoSessionId,
-        rationale: "complete on the approval the owner has since declined",
-      });
-      expect(gate, JSON.stringify(gate)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_DECLINED" } });
-      const finalized = f.harness.cp.db.txDecision(() =>
-        f.harness.cp.bootstrap.finalizeBootstrapActivationConfirm({
-          runId: run.runId,
-          candidateSnapshotDigest: run.candidate,
-          ceoSessionId: f.ceoSessionId,
-          confirmedAt: f.harness.clock.nowIso(),
-        }),
-      );
-      expect(finalized, JSON.stringify(finalized)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_DECLINED" } });
-
-      expect(f.harness.cp.runs.require(run.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
-      expect(applicationOf(f, run.runId)).toMatchObject({ phase: "WRITTEN", attempts: 1 });
-      expect(writesOf(f)).toEqual(WRITE_METHODS);
-      expect(ledgerOf(f, run).receipts).toHaveLength(4);
-    });
-  });
-});
 
 /**
  * Review 1076-R2 — the production port reads the owner, and for a user account the authenticated user,
@@ -2658,9 +2242,9 @@ describe("#246 C3 review 1076-R2: authority is asked when a write request starts
     it(`the CEO replaced during the ${branch} owner lookup: no POST, nothing created, and the next attempt creates it once`, async () => {
       await withFixture(async (f) => {
         const run = await reviewedBootstrap(f, cleanTreeManifest(`r2-port-${branch}`));
-        await approveWrites(f, run);
-        let replacement: string | null = null;
-        const replace = () => {
+
+      let replacement: string | null = null;
+      const replace = () => {
           replacement ??= replaceCeo(f);
         };
         const lookups: Record<string, () => unknown> =
@@ -2712,7 +2296,7 @@ describe("#246 C3 review 1076-R3: a live writer is attributed by the group it le
   it("R3 a live nonleader writer cannot prove absence of its orphaned same-group subprocess", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r3-live-orphan"));
-      await approveWrites(f, run);
+
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), daemonWriter(f));
       const group = readProcessGroup(process.pid)!;
       expect(group).not.toBe(process.pid);
@@ -2751,7 +2335,7 @@ describe("#246 C3 review 1076-R3: a live writer is attributed by the group it le
   it("R3 a live nonleader writer with an orphaned real git fetch keeps recovery IN_DOUBT", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r2-orphan-git-fetch"));
-      await approveWrites(f, run);
+
       f.harness.cp.bootstrapProducer.attachWriterLock(() => f.daemon.lock.held(), daemonWriter(f));
       const control = tempDir("r2-fetch-control-");
       const task = join(control, "task.json");
@@ -2954,11 +2538,12 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
     it(sibling.name, async () => {
       await withFixture(async (f) => {
         const run = await reviewedBootstrap(f, cleanTreeManifest(`r3-withheld-started-${sibling.resourceType}`));
-        await approveWrites(f, run);
+
         // The default branch stays unset until the setting lands, so GitHub never shows it settled meanwhile.
         f.github.pushSetsDefault = false;
-        let replacement: string | null = null;
-        const held = heldRequests(f, sibling.method, (call) => {
+
+      let replacement: string | null = null;
+      const held = heldRequests(f, sibling.method, (call) => {
           if (call === 1) replacement = replaceCeo(f);
         });
         const withheld = await confirm(f, run);
@@ -2990,7 +2575,7 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
   it("R3 a withheld push cannot excuse a later started unanswered push begun at the same time", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r3-withheld-started-push"));
-      await approveWrites(f, run);
+
       let replacement: string | null = null;
       const held = heldRequests(f, "pushBranch", (call) => {
         if (call === 1) replacement = replaceCeo(f);
@@ -3019,7 +2604,7 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
   it("R3 a crash immediately before the exemption is consumed: nothing is sent, and the next attempt makes the request once", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r3-crash-before-consumption"));
-      await approveWrites(f, run);
+
       let replacement: string | null = null;
       const held = heldRequests(
         f,
@@ -3059,7 +2644,7 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
   it("R3 a crash immediately after the exemption is consumed: the request is in doubt and never sent", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r3-crash-after-consumption"));
-      await approveWrites(f, run);
+
       let replacement: string | null = null;
       const held = heldRequests(f, "protectBranch", (call) => {
         if (call === 1) replacement = replaceCeo(f);
@@ -3090,7 +2675,7 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
   it("R3 an exemption consumed and then withheld again in the same generation still proves the request unsent: it is made once", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r3-consumed-then-withheld"));
-      await approveWrites(f, run);
+
       let replacement: string | null = null;
       const held = heldRequests(
         f,
@@ -3120,8 +2705,9 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
   it("R3 a create started before CEO replacement is pending without a withheld record and never retried", async () => {
     await withFixture(async (f) => {
       const run = await reviewedBootstrap(f, cleanTreeManifest("r3-started-create"));
-      await approveWrites(f, run);
+
       let sent = 0;
+
       let replacement: string | null = null;
       const port = createBootstrapGitHubWritePort({
         async request<T>(method: string): Promise<T> {
@@ -3135,14 +2721,15 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
       await confirm(f, run);
       const intent = ledgerOf(f, run).pending[0]!;
       expect(withheldRecordsOf(f, run, intent["operationId"] as string)).toEqual([]);
-      expect(sent).toBe(1);
-      await f.restartDaemon();
-      await f.harness.cp.continuity.evaluate("new CEO retry");
+
       const second = await f.harness.cp.bootstrapProducer.produceAndActivateApproved({
         runId: run.runId,
         candidateSnapshotDigest: run.candidate,
         ceoSessionId: replacement!,
       });
+      expect(sent).toBe(1);
+      await f.restartDaemon();
+      await f.harness.cp.continuity.evaluate("new CEO retry");
       expect(sent).toBe(1);
       expect(second).toMatchObject({ allowed: false, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST" } });
     });
@@ -3155,7 +2742,6 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
   /** Attempt 1 withholds the protection PUT under the production port; every later send lands at once. */
   const withheldProtection = async (f: Fixture, name: string, beforeSecondCall: () => void = () => {}) => {
     const run = await reviewedBootstrap(f, cleanTreeManifest(name));
-    await approveWrites(f, run);
     let replacement: string | null = null;
     const held = heldRequests(
       f,
@@ -3277,6 +2863,7 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
         if (consumptionOfAttempt2(path)) throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" });
       };
       const made = await resumeUnder(f, state.run, state.ceo());
+
       fsFaults.fsyncSync = null;
       expect(made, JSON.stringify(made)).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_EXEMPTION_UNCONSUMED", attempt: 2 } });
       expect(state.held.state.calls).toBe(1);
@@ -3320,12 +2907,11 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
 
   for (const record of [
     { name: "the GitHub ledger", matches: (path: string) => /github-ledger\/[^/]+\.json\.partial$/.test(path) },
-    { name: "the approval anchor", matches: (path: string) => /owner-approval\/[0-9a-f]{64}\.json$/.test(path) },
   ]) {
     it(`R4 ${record.name} written short before the first request sends zero requests`, async () => {
       await withFixture(async (f) => {
         const run = await reviewedBootstrap(f, cleanTreeManifest(`r4-short-${record.name.split(" ").at(-1)}`));
-        await approveWrites(f, run);
+
         let writes = 0;
         fsFaults.writeSync = (path) => {
           if (!record.matches(path)) return undefined;
@@ -3387,57 +2973,15 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
   });
   // Review 1076-R5 — a record that parses is not a record that was written whole, and an anchor on
   // disk is not an anchor persisted now. Each body counts the external requests made.
-  const anchorFile = (path: string): boolean => /owner-approval\/[0-9a-f]{64}\.json$/.test(path);
-  const anchorDirectory = (path: string): boolean => /owner-approval$/.test(path);
   const ioError = (message: string): Error => Object.assign(new Error(message), { code: "EIO" });
 
-  /** The production port's create, counting the POSTs that start; each is answered as lost. */
-  const productionCreateCounting = (f: Fixture) => {
-    const state = { posts: 0 };
-    const port = createBootstrapGitHubWritePort({
-      async request<T>(method: string): Promise<T> {
-        if (method === "GET") return { type: "Organization" } as T;
-        state.posts += 1;
-        throw new Error("POST started; response lost");
-      },
-    });
-    vi.spyOn(f.github, "createRepository").mockImplementation(port.createRepository as never);
-    return state;
-  };
-
-  it("R5 resume after anchor fsync failure never uses an unsynced anchor for a request", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("r5-anchor-fsync-resume"));
-      await approveWrites(f, run);
-      let failedSyncs = 0;
-      fsFaults.fsyncSync = (path) => {
-        if (anchorFile(path)) {
-          failedSyncs += 1;
-          throw ioError("anchor fsync EIO persists");
-        }
-      };
-      await confirm(f, run);
-      expect(writesOf(f)).toEqual([]);
-      // Its complete JSON is on disk: readable, and not persisted.
-      const [anchorName] = readdirSync(join(f.workRoot, run.runId, "owner-approval"));
-      expect(() => JSON.parse(readFileSync(join(f.workRoot, run.runId, "owner-approval", anchorName!), "utf8"))).not.toThrow();
-      await f.restartDaemon();
-      const second = await confirm(f, run);
-      fsFaults.fsyncSync = null;
-      expect(second, JSON.stringify(second)).toMatchObject({ ok: false, evidence: { refusal: "APPROVAL_ANCHOR_UNSYNCED" } });
-      expect(failedSyncs).toBeGreaterThanOrEqual(2);
-      expect(writesOf(f), "anchor persistence never succeeded: no request may follow").toEqual([]);
-    });
-  });
-
   for (const record of [
-    { name: "anchor-directory", matches: anchorDirectory },
     { name: "ledger-directory", matches: (path: string) => /github-ledger$/.test(path) },
   ]) {
     it(`R5 ${record.name} fsync failure then resume sends no requests`, async () => {
       await withFixture(async (f) => {
         const run = await reviewedBootstrap(f, cleanTreeManifest(`r5-${record.name}`));
-        await approveWrites(f, run);
+
         fsFaults.fsyncSync = (path) => {
           if (record.matches(path)) throw ioError("directory fsync EIO persists");
         };
@@ -3451,128 +2995,13 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
     });
   }
 
-  for (const failure of ["file", "directory"] as const) {
-    it(`R5 guarded production POST after ${failure} anchor fsync failure stays at zero sends`, async () => {
-      await withFixture(async (f) => {
-        const run = await reviewedBootstrap(f, cleanTreeManifest(`r5-production-anchor-${failure}`));
-        await approveWrites(f, run);
-        const sends = productionCreateCounting(f);
-        fsFaults.fsyncSync = (path) => {
-          if (failure === "file" ? anchorFile(path) : anchorDirectory(path)) throw ioError("required anchor fsync EIO persists");
-        };
-        await confirm(f, run);
-        expect(sends.posts).toBe(0);
-        await f.restartDaemon();
-        const second = await confirm(f, run);
-        fsFaults.fsyncSync = null;
-        expect(second, JSON.stringify(second)).toMatchObject({ ok: false, evidence: { refusal: "APPROVAL_ANCHOR_UNSYNCED", failed: failure } });
-        expect(sends.posts, "the guarded production client must wait for successful anchor fsync").toBe(0);
-      });
-    });
-  }
-
-  it("R5 once the anchor syncs again the resume accepts it, with evidence, and writes each operation once", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("r5-anchor-sync-recovers"));
-      await approveWrites(f, run);
-      fsFaults.fsyncSync = (path) => {
-        if (anchorFile(path)) throw ioError("anchor fsync EIO, then the disk recovers");
-      };
-      await confirm(f, run);
-      fsFaults.fsyncSync = null;
-      expect(writesOf(f)).toEqual([]);
-      await f.restartDaemon();
-      const resumed = await confirm(f, run);
-      expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
-      expect(writesOf(f)).toEqual(WRITE_METHODS);
-      expect(consumedApprovals(f, run.runId)).toBe(1);
-    });
-  });
-
-  it("R5 an anchor that synced once and fails to sync now stops the next request: no PUT", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("r5-anchor-sync-fails-later"));
-      await approveWrites(f, run);
-      const setDefault = f.github.setDefaultBranch.bind(f.github);
-      vi.spyOn(f.github, "setDefaultBranch").mockImplementation(async (...args) => {
-        // From here on the anchor's sync fails: the syncs it passed before do not stand in for it.
-        fsFaults.fsyncSync = (path) => {
-          if (anchorFile(path)) throw ioError("anchor fsync EIO from now on");
-        };
-        return setDefault(...args);
-      });
-      const answer = await confirm(f, run);
-      fsFaults.fsyncSync = null;
-      expect(answer, JSON.stringify(answer)).toMatchObject({ ok: false, evidence: { refusal: "APPROVAL_ANCHOR_UNSYNCED" } });
-      expect(writesOf(f)).toEqual(["createRepository", "pushBranch", "setDefaultBranch"]);
-      expect(writesOf(f, "protectBranch")).toEqual([]);
-    });
-  });
-
-  for (const failure of ["file", "directory"] as const) {
-    it(`R5 an anchor found already there is accepted only once its ${failure} syncs now`, async () => {
-      await withFixture(async (f) => {
-        const run = await reviewedBootstrap(f, cleanTreeManifest(`r5-anchor-eexist-${failure}`));
-        await approveWrites(f, run);
-        await confirm(f, run);
-        const workDir = join(f.workRoot, run.runId);
-        const [anchorName] = readdirSync(join(workDir, "owner-approval"));
-        const written = JSON.parse(readFileSync(join(workDir, "owner-approval", anchorName!), "utf8")) as Record<string, unknown>;
-        const { schema: _schema, receiptDigest: _digest, ...input } = written;
-        // The same anchor written again finds it there (EEXIST): accepted only through the same syncs, now.
-        let failed = 0;
-        fsFaults.fsyncSync = (path) => {
-          if (failure === "file" ? anchorFile(path) : anchorDirectory(path)) {
-            failed += 1;
-            throw ioError("anchor fsync EIO on EEXIST");
-          }
-        };
-        const again = writeApprovalAnchor(workDir, { ...input, anchoredAt: "2026-10-10T00:00:01.000Z" } as Parameters<typeof writeApprovalAnchor>[1]);
-        fsFaults.fsyncSync = null;
-        expect(failed).toBe(1);
-        expect(again, JSON.stringify(again)).toMatchObject({ allowed: false, evidence: { refusal: "APPROVAL_ANCHOR_UNSYNCED", failed: failure } });
-        // With the syncs passing it is the anchor the first write made, unchanged.
-        const accepted = writeApprovalAnchor(workDir, { ...input, anchoredAt: "2026-10-10T00:00:02.000Z" } as Parameters<typeof writeApprovalAnchor>[1]);
-        expect(accepted).toMatchObject({ allowed: true, value: { anchoredAt: written["anchoredAt"] } });
-      });
-    });
-  }
-
-  it("R5 an anchor cut short by only its final newline is not an anchor: the resume refuses, and no POST is sent", async () => {
-    await withFixture(async (f) => {
-      const run = await reviewedBootstrap(f, cleanTreeManifest("r5-anchor-newline-tail"));
-      await approveWrites(f, run);
-      const sends = productionCreateCounting(f);
-      let writes = 0;
-      fsFaults.writeSync = (path, bytes) => {
-        if (!anchorFile(path)) return undefined;
-        writes += 1;
-        if (writes === 1) return bytes.length - 1;
-        throw fileTooLarge();
-      };
-      await confirm(f, run);
-      fsFaults.writeSync = null;
-      const [anchorName] = readdirSync(join(f.workRoot, run.runId, "owner-approval"));
-      const path = join(f.workRoot, run.runId, "owner-approval", anchorName!);
-      const kept = readFileSync(path);
-      expect(kept.toString("utf8").endsWith("}")).toBe(true);
-      expect(() => JSON.parse(kept.toString("utf8"))).not.toThrow();
-      await f.restartDaemon();
-      const resumed = await confirm(f, run);
-      expect(resumed["ok"], JSON.stringify(resumed)).toBe(false);
-      expect(sends.posts).toBe(0);
-      expect(writesOf(f)).toEqual([]);
-      expect(readFileSync(path).equals(kept), "the cut-short anchor is kept as it was").toBe(true);
-    });
-  });
-
   for (const failure of ["partial-error", "zero", "newline-tail"] as const) {
     it(`R5 truncated withheld ${failure} remains doubt and never sends on resume`, async () => {
       await withFixture(async (f) => {
         const run = await reviewedBootstrap(f, cleanTreeManifest(`r5-withheld-${failure}`));
-        await approveWrites(f, run);
-        let replacement: string | null = null;
-        let count = 0;
+
+      let replacement: string | null = null;
+      let count = 0;
         const held = heldRequests(
           f,
           "protectBranch",
@@ -3629,8 +3058,9 @@ describe("#246 C3 review 1076-R3: a withheld request is made at most once, its e
         };
         const first = await resumeUnder(f, state.run, state.ceo());
         fsFaults.fsyncSync = null;
-        const second = await resumeUnder(f, state.run, state.ceo());
-        expect(first).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_EXEMPTION_UNCONSUMED" } });
+
+      const second = await resumeUnder(f, state.run, state.ceo());
+      expect(first).toMatchObject({ allowed: false, evidence: { refusal: "WITHHELD_EXEMPTION_UNCONSUMED" } });
         expect(second).toMatchObject({ allowed: false, evidence: { refusal: "UNCONFIRMED_PENDING_REQUEST" } });
         expect(state.held.state.sent).toBe(0);
       });

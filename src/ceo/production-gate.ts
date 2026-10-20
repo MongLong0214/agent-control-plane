@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 
-import { deriveHumanGate, repeatedHumanGateDeclarations } from "./human-gate.ts";
+import { deriveHumanGate } from "./human-gate.ts";
 import {
   bootstrapPlanIntentTasks,
   bootstrapReviewIntentCurrent,
@@ -8,7 +8,6 @@ import {
   isProjectlessBootstrap,
   sameBootstrapPlanBinding,
 } from "../bootstrap/bootstrap-plan.ts";
-import { REPO_FACTORY_GITHUB_WRITE_OPERATION, type RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
@@ -19,9 +18,7 @@ import type { AuditLog } from "../db/audit.ts";
 import {
   type ArtifactStore,
   type EvidenceWriter,
-  OWNER_DECIDE_AGAIN_MESSAGE,
   OWNER_DECISION_PRODUCER,
-  ownerDecideAgainEvidence,
   type StoredArtifact,
 } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
@@ -180,33 +177,10 @@ export type NotificationKind = (typeof NotificationKind)[keyof typeof Notificati
 export const OWNER_DECISION_OPERATION = "owner_decision_submit";
 
 /**
- * S10 (#246 defect b; CEO c07863f8) — the human-gate item that declares, by name, that the owner's T3
- * approval of this run's Repo Factory GitHub writes is this item's owner decision. A task contract
- * names it exactly. Any other item text, however it describes the same approval, keeps the
- * OWNER_DECISION rule: a description is not a declaration, and text matching is not a link.
- */
-export const REPO_FACTORY_GITHUB_WRITE_GATE_ITEM = `owner-approval:${REPO_FACTORY_GITHUB_WRITE_OPERATION}`;
-
-/**
- * S10-R1-01 — the bootstrap runner's own read-only approval predicate (`ownerApprovalHolds`): the item
- * linked to the T3 approval is decided by exactly the judgement C3 acts on, never by a second reader.
- */
-export type RepoFactoryApprovalPort = Pick<RepoFactoryBootstrapRunner, "ownerApprovalHolds">;
-
-/**
  * FIX-FINALIZER-DIGEST — the binding of a run that needs no owner decision: the GitHub kernel's
  * `NO_HUMAN_GATE_DIGEST`, the only value its payload may carry for such a run.
  */
 const NO_HUMAN_GATE_BINDING = digestOf({ humanGate: "NOT_REQUIRED" });
-
-/** FIX-FINALIZER-DIGEST — one required item's authenticated decision, as the human-gate binding names it. */
-interface HumanGateItemDecision {
-  /** The item's stable id: the item text an owner decision binds. */
-  item: string;
-  source: "OWNER_DECISION" | "T3_APPROVAL";
-  /** The canonical record's artifact digest, or the digest of the T3 receipt `ownerApprovalHolds` admitted. */
-  decision: string;
-}
 
 /** FIX-FINALIZER-DIGEST — what `ProductionGate.resolveHumanGate` found: the binding, or why there is none. */
 type HumanGateResolution =
@@ -254,7 +228,6 @@ export class ProductionGate {
   #bootstrapActivation: BootstrapActivationFinalizer | null = null;
   #sourceReadLeases: SourceReadLeasePort | null = null;
   #manifestGrants: ManifestGrantsPort | null = null;
-  #repoFactoryApprovals: RepoFactoryApprovalPort | null = null;
 
   constructor(
     private readonly db: Db,
@@ -280,8 +253,6 @@ export class ProductionGate {
     bootstrapCompletionChain?: BootstrapCompletionChainPort;
     sourceReadLeases?: SourceReadLeasePort;
     manifestGrants?: ManifestGrantsPort;
-    /** S10 — the predicate the T3-linked human-gate item is judged on; without it that item reads unsatisfied. */
-    repoFactoryApprovals?: RepoFactoryApprovalPort;
   }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
@@ -290,7 +261,6 @@ export class ProductionGate {
     if (ports.bootstrapCompletionChain) this.#bootstrapCompletionChain = ports.bootstrapCompletionChain;
     if (ports.sourceReadLeases) this.#sourceReadLeases = ports.sourceReadLeases;
     if (ports.manifestGrants) this.#manifestGrants = ports.manifestGrants;
-    if (ports.repoFactoryApprovals) this.#repoFactoryApprovals = ports.repoFactoryApprovals;
   }
 
   /**
@@ -1036,17 +1006,8 @@ export class ProductionGate {
     // authenticated rejection is authoritative at confirmation time.
     const humanGate = this.humanGateStatus(input.runId);
     if (input.decision === "CONFIRM" && humanGate.required && !humanGate.satisfied) {
-      return humanGate.decideAgain
-        ? deny(ReasonCode.HUMAN_GATE_UNSATISFIED, OWNER_DECIDE_AGAIN_MESSAGE, {
-          runId: input.runId,
-          items: humanGate.items,
-          ...ownerDecideAgainEvidence(humanGate.decideAgain),
-        })
-        : deny(
-          ReasonCode.HUMAN_GATE_UNSATISFIED,
-          "candidate requires owner approval that has not been recorded",
-          { runId: input.runId, items: humanGate.items },
-        );
+      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED,
+        "destructive actions require owner consent", { runId: input.runId, items: humanGate.items });
     }
     return allow(ReasonCode.OK, { isBootstrap });
   }
@@ -1427,9 +1388,7 @@ export class ProductionGate {
   private humanGateDefinition(runId: string): {
     required: boolean;
     items: string[];
-    duplicateDeclarations: string[];
     digest: string;
-    linksT3: boolean;
   } {
     const run = this.runs.get(runId);
     const contract = this.artifacts.latest<{ humanGate?: unknown; scope?: unknown }>(
@@ -1449,14 +1408,8 @@ export class ProductionGate {
           scope,
           declaredItems,
         })
-      : { required: declaredItems.length > 0, items: declaredItems, duplicateDeclarations: repeatedHumanGateDeclarations(declaredItems) };
-    // S10-R1-04 — the link is judged on the declared values as stored, before `deriveHumanGate` trims
-    // them: no declared value is a noncanonical spelling of the item, so the item `humanGateStatus`
-    // finds after the trim was declared exactly. The digest is unchanged.
-    const linksT3 = declaredItems.every(
-      (item) => item === REPO_FACTORY_GITHUB_WRITE_GATE_ITEM || item.trim() !== REPO_FACTORY_GITHUB_WRITE_GATE_ITEM,
-    );
-    return { ...definition, digest: digestOf(definition.items), linksT3 };
+      : { required: false, items: [] };
+    return { ...definition, digest: digestOf(definition.items) };
   }
 
   /**
@@ -1591,15 +1544,7 @@ export class ProductionGate {
    * process can be reached by an untrusted request path, so only an admitted receipt that
    * binds this exact operation proves non-delegable owner authority (CP-HI-07).
    */
-  /**
-   * `requireLiveAdmission` separates two different questions that share this shape check.
-   *
-   * Recording a decision must prove the receipt is admitted *now* — that is the moment the
-   * owner's authority is being exercised. Re-reading a retained artifact must not: admission
-   * happened when the decision was consumed, and `assertApproval` answers from
-   * `inbound_messages`, a 24h replay cache. Asking it again later makes an approved run
-   * become unapproved when the cache is pruned, which is the P1-18 defect.
-   */
+  /** Authenticate the actor and exact operation when recording a decision. */
   private assertOwnerDecisionReceipt(input: {
     runId: string;
     item: string;
@@ -1607,7 +1552,6 @@ export class ProductionGate {
     note: string;
     receipt?: unknown;
     owner?: { channel: string; actor: string };
-    requireLiveAdmission?: boolean;
   }): Decision<OwnerApprovalReceipt> {
     const authority = this.#ownerAuthority;
     if (!authority) {
@@ -1644,10 +1588,8 @@ export class ProductionGate {
         { runId: input.runId, operation: receipt.operation },
       );
     }
-    if (input.requireLiveAdmission !== false) {
-      const authorised = authority.assertApproval(receipt);
-      if (!authorised.allowed) return authorised as Decision<OwnerApprovalReceipt>;
-    }
+    const authorised = authority.assertApproval(receipt);
+    if (!authorised.allowed) return authorised as Decision<OwnerApprovalReceipt>;
     return allow(ReasonCode.OK, receipt);
   }
 
@@ -1665,13 +1607,11 @@ export class ProductionGate {
     receipt?: OwnerApprovalReceipt;
     /** @deprecated Identity alone is never authority; use an admitted receipt. */
     owner?: { channel: string; actor: string };
-  }): Decision<void> {
-    // Preserve the established authority-first denial ordering: an invalid or non-owner
-    // receipt is refused before candidate freshness is even considered. The same receipt is
-    // re-checked by consumeApproval inside the candidate transaction below.
-    const admittedReceipt = this.assertOwnerDecisionReceipt(input);
-    if (!admittedReceipt.allowed) return admittedReceipt as Decision<void>;
-    const receipt = admittedReceipt.value;
+  }, authenticatedOwner?: string): Decision<void> {
+    // The transport may supply an actor only after admitting an owner turn.
+    const admittedReceipt = authenticatedOwner ? null : this.assertOwnerDecisionReceipt(input);
+    if (admittedReceipt && !admittedReceipt.allowed) return admittedReceipt as Decision<void>;
+    const receipt = admittedReceipt?.allowed ? admittedReceipt.value : undefined;
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
 
@@ -1687,16 +1627,10 @@ export class ProductionGate {
           );
         }
 
-        // Validate and consume while the same write transaction holds the current candidate
-        // stable. This is the receipt's candidate binding: a later revision cannot inherit an
-        // approval first consumed for the previous snapshot.
-        const consumed = this.#ownerAuthority!.consumeApproval(receipt, candidateSnapshotDigest);
-        if (!consumed.allowed) return consumed;
-
-        const actor = `${receipt.channel}:${receipt.actor}`;
+        const actor = authenticatedOwner ?? `${receipt!.channel}:${receipt!.actor}`;
         const gate = this.humanGateDefinition(input.runId);
         // SEC-OD1 — the canonical owner decision: written only here, through this gate's capability, in
-        // the transaction that admitted the receipt from live ingress and consumed it. The readers count
+        // the transaction that authenticated the owner. The readers count
         // no other APPROVAL artifact as an owner decision.
         this.artifacts.putOwnerDecision(this.packetWriter, input.runId, {
           kind: "OWNER_DECISION",
@@ -1706,8 +1640,7 @@ export class ProductionGate {
           at: this.clock.nowIso(),
           humanGateDigest: gate.digest,
           candidateSnapshotDigest,
-          // The receipt is part of the durable decision, not a one-time ingress check. A
-          // later consumer must be able to re-admit the exact operation and parameters.
+          // Retained for attribution; later readers trust this canonical decision.
           receipt,
         }, candidateSnapshotDigest);
         this.audit.record({
@@ -1764,58 +1697,35 @@ export class ProductionGate {
     }
   }
 
-  /**
-   * SEC-OD1 — the owner decision an APPROVAL artifact records, exactly bound to this run's current gate
-   * and candidate, or null. `resolveHumanGate`, which `humanGateStatus`, `humanGateBinding` and
-   * `currentHumanGateDecisionDigest` all answer from, judges every artifact here (through
-   * `ownerDecisionsOf`), so none of them can count a record another refuses.
-   *
-   * The source of truth is the record `recordOwnerDecision` writes through `putOwnerDecision`, in the
-   * one transaction that admits the receipt from live ingress (an allowlisted owner, and the write-once
-   * `inbound_messages` row whose actor and admitted payload are the receipt's) and consumes it for the
-   * candidate. Its label is the authority the actor held at that time. It outlives the 24h ingress
-   * replay cache, so a legitimate past approval is never asked for a live admission again. The rest of
-   * the record is then checked against this run: the receipt binds the exact item, decision and note,
-   * this run and the owner-decision operation, and the gate definition and the current candidate.
-   *
-   * `canonical` says whether the record carries that label. Only a canonical record can approve; an
-   * exactly bound refusal counts whatever its label (SEC-OD1-R1-02, below in `ownerDecisionsOf`).
-   *
-   * OWNER_APPROVAL_CONSUMED and OWNER_DECISION audit rows are ordinary rows a connection ACP did not
-   * open can insert, so here they neither satisfy an item nor take a recorded decision away.
-   */
+  /** Canonical records carry the authentication established at their write boundary. */
   private boundOwnerDecision(
     runId: string,
     artifact: StoredArtifact<OwnerDecisionRecord>,
-    gateDigest: string,
-    currentCandidate: string,
   ): { item: string; approved: boolean; canonical: boolean } | null {
     const decision = artifact.content;
     if (
-      artifact.superseded ||
       // The one shape test, shared with v47's refusal of decisions written before its guard.
       !isOwnerDecisionContent(decision) ||
       typeof decision.item !== "string" ||
       decision.item.length === 0 ||
       typeof decision.approved !== "boolean" ||
-      typeof decision.note !== "string" ||
-      decision.humanGateDigest !== gateDigest ||
-      artifact.candidateSnapshotDigest !== currentCandidate ||
-      decision.candidateSnapshotDigest !== currentCandidate
+      typeof decision.note !== "string"
     ) {
       return null;
     }
-    const receipt = this.assertOwnerDecisionReceipt({
-      runId,
-      item: decision.item,
-      approved: decision.approved,
-      note: decision.note,
-      receipt: decision.receipt,
-      // Admission was proven when the canonical record was written; a pruned cache is not asked again.
-      requireLiveAdmission: false,
-    });
-    // The receipt was minted for the candidate it was consumed for, and that is the current one.
-    if (!receipt.allowed || receipt.value.candidateSnapshotDigest !== currentCandidate) return null;
+    // Retain operation and payload identity without re-pinning consent to a candidate
+    // or asking the prunable ingress cache to authenticate the owner again.
+    if (decision.receipt !== undefined) {
+      const receipt = decision.receipt;
+      if (!isOwnerApprovalReceipt(receipt) ||
+          receipt.runId !== runId || receipt.operation !== OWNER_DECISION_OPERATION ||
+          receipt.approved !== decision.approved ||
+          receipt.parameterDigest !== digestOf({ item: decision.item, approved: decision.approved, note: decision.note })) {
+        return null;
+      }
+    } else if (artifact.producedBy !== OWNER_DECISION_PRODUCER) {
+      return null;
+    }
     return {
       item: decision.item,
       approved: decision.approved,
@@ -1823,122 +1733,40 @@ export class ProductionGate {
     };
   }
 
-  /**
-   * SEC-OD1 — every owner decision that counts for this run's current gate and candidate, the latest
-   * per item, and the items whose latest exactly bound record is an approval that does not count.
-   *
-   * SEC-OD1-R1-02. Before SEC-OD1 every owner decision was written with the "service" label. A refusal
-   * can only withhold, so an exactly bound refusal (same item, run, operation, gate and candidate, by
-   * `boundOwnerDecision`) counts whatever its label: an old refusal is never discarded, and the T3 link
-   * cannot then satisfy its item. A refusal bound to anything else is not read at all. An approval
-   * counts only as the canonical record (CEO 52c3b1e6 (a)); a non-canonical one is reported back as
-   * `decideAgain` so the refusal can say why, and never decides the item.
-   *
-   * FIX-SEC-NEST (CEO 4170f7c5). A non-canonical record is read at all only when SQLite itself judges its
-   * content OWNER_DECISION-shaped, by the guards' clause (`ArtifactStore.listOwnerDecisions`): a row the
-   * v47 guard admitted because SQLite cannot read it (nested past json1's depth limit, or not JSON) is
-   * left out in the query, so it neither counts as a refusal, whatever its `created_at`, nor fails this
-   * read. Only rows so identified are left out; no error is caught here.
-   */
+  /** The latest decision per destructive action, in durable creation order. */
   private ownerDecisionsOf(
     runId: string,
-    gateDigest: string,
-    currentCandidate: string,
-  ): { latest: Map<string, { approved: boolean; digest: string }>; decideAgain: Set<string> } {
-    const latest = new Map<string, { approved: boolean; digest: string }>();
-    const decideAgain = new Set<string>();
+  ): Map<string, boolean> {
+    const latest = new Map<string, boolean>();
     for (const artifact of this.artifacts.listOwnerDecisions<OwnerDecisionRecord>(runId)) {
-      const decision = this.boundOwnerDecision(runId, artifact, gateDigest, currentCandidate);
+      const decision = this.boundOwnerDecision(runId, artifact);
       if (!decision) continue;
       // listOwnerDecisions is durable creation order (then rowid), so assignment makes
       // a later explicit rejection revoke an earlier approval for the same gate item.
       if (decision.canonical || !decision.approved) {
-        latest.set(decision.item, { approved: decision.approved, digest: artifact.digest });
-        decideAgain.delete(decision.item);
-      } else {
-        decideAgain.add(decision.item);
+        latest.set(decision.item, decision.approved);
       }
     }
-    return { latest, decideAgain };
+    return latest;
   }
 
-  /**
-   * FIX-FINALIZER-DIGEST — the one reading of this run's human gate. `humanGateStatus`,
-   * `currentHumanGateDecisionDigest` (the value the daemon finalizer puts in the gate payload) and
-   * `humanGateBinding` (the GitHub kernel's port, re-read when it publishes and again when it merges)
-   * all answer from it, so no two of them can judge the gate differently.
-   *
-   * Every required item is bound by its stable id, the item text `recordOwnerDecision` binds, to its
-   * own authenticated decision: the latest owner decision exactly bound to this gate and candidate
-   * (`ownerDecisionsOf`, SEC-OD1), or, for the item the contract declares as the S10 T3 link and only
-   * while it has no decision of its own, the owner's T3 approval as `ownerApprovalHolds` judges it
-   * (actor, scope, candidate and anchor; S10-R1-01). A missing or refused item, a decision for another
-   * candidate (never read) or an item named twice leaves the gate unsatisfied, and an unsatisfied gate
-   * has no binding at all.
-   *
-   * The binding is the digest of the gate definition digest, the current candidate and each item's
-   * decision identity: the canonical record's artifact digest, or the T3 receipt's digest (the identity
-   * its anchor names). Neither depends on the 24h ingress replay cache, so pruning leaves the binding
-   * unchanged, while any new decision, refusal or candidate changes it: a payload named before that
-   * change is neither published nor merged after it. Each reader runs this resolution again, which
-   * re-verifies every decision; a digest is never accepted on its own, and the definition digest is
-   * never accepted in place of the binding.
-   */
+  /** Read the authenticated decisions once recorded; revisions do not require repeat consent. */
   private resolveHumanGate(runId: string): HumanGateResolution {
     const gate = this.humanGateDefinition(runId);
-    const { items } = gate;
     if (!gate.required) return { required: false, items: [], binding: NO_HUMAN_GATE_BINDING };
-    const refused = (message: string, evidence: Record<string, unknown>, decideAgain?: string[]): HumanGateResolution =>
-      ({ required: true, items, binding: null, refusal: { message, evidence }, ...(decideAgain ? { decideAgain } : {}) });
-    if (items.length === 0) return refused("run requires a human gate with no durable gate items", { runId });
-    // FD-R1-DUP — the declarations as the durable contract stores them, before the derivation drops a
-    // repeat: a question declared twice, even in two spellings that normalise to one, is refused here
-    // rather than bound once. The items themselves are also checked, for a definition built otherwise.
-    if (gate.duplicateDeclarations.length > 0 || new Set(items).size !== items.length) {
-      return refused("the human-gate definition names an item more than once", {
-        runId,
-        items,
-        ...(gate.duplicateDeclarations.length > 0 ? { duplicateDeclarations: gate.duplicateDeclarations } : {}),
-      });
+    const latest = this.ownerDecisionsOf(runId);
+    if (gate.items.every((item) => latest.get(item) === true)) {
+      return { required: true, items: gate.items, binding: digestOf({ humanGate: "APPROVED", runId }) };
     }
-    const currentCandidate = this.runs.currentCandidate(runId);
-    // Only a canonical owner decision approves an item (SEC-OD1): never a direct ArtifactStore
-    // write of an APPROVAL-shaped object (CP-HI-07), and never an audit row.
-    if (!currentCandidate || !this.#ownerAuthority) return refused("no current authenticated owner decision exists", { runId });
-    const { latest, decideAgain } = this.ownerDecisionsOf(runId, gate.digest, currentCandidate);
-
-    // S10 — an item's own OWNER_DECISION, approval or refusal, decides it, so an explicit refusal is
-    // never overridden. Only the item the contract declares, exactly, as the T3 link (S10-R1-04: its raw
-    // value), with no decision of its own, is decided by the owner's T3 approval, and that by the
-    // bootstrap runner's own predicate (S10-R1-01); every other item still needs its OWNER_DECISION.
-    const decisionOf = (item: string): HumanGateItemDecision | null => {
-      const own = latest.get(item);
-      if (own) return own.approved ? { item, source: "OWNER_DECISION", decision: own.digest } : null;
-      if (item !== REPO_FACTORY_GITHUB_WRITE_GATE_ITEM || !gate.linksT3) return null;
-      const t3 = this.#repoFactoryApprovals?.ownerApprovalHolds(runId, currentCandidate);
-      return t3?.allowed === true ? { item, source: "T3_APPROVAL", decision: digestOf(t3.value) } : null;
-    };
-    const decisions = items.map(decisionOf);
-    if (decisions.every((decision): decision is HumanGateItemDecision => decision !== null)) {
-      return {
-        required: true,
-        items,
-        binding: digestOf({ humanGateDefinition: gate.digest, candidateSnapshotDigest: currentCandidate, decisions }),
-      };
-    }
-    // SEC-OD1-R1-02 — named only for an item still undecided, and only when there is one, so every
-    // other status (and every packet that carries it) is unchanged.
-    const redecide = items.filter((item, index) => decisions[index] === null && decideAgain.has(item));
-    return redecide.length > 0
-      ? refused(OWNER_DECIDE_AGAIN_MESSAGE, { runId, items, ...ownerDecideAgainEvidence(redecide) }, redecide)
-      : refused("every current owner-gate item needs approval", { runId, items });
+    return { required: true, items: gate.items, binding: null,
+      refusal: { message: "destructive actions require owner consent", evidence: { runId, items: gate.items } } };
   }
 
   humanGateStatus(runId: string): { required: boolean; items: string[]; satisfied: boolean; decideAgain?: string[] } {
     const resolved = this.resolveHumanGate(runId);
     if (!resolved.required) return { required: false, items: [], satisfied: true };
     const status = { required: true, items: resolved.items, satisfied: resolved.binding !== null };
-    return resolved.decideAgain ? { ...status, decideAgain: resolved.decideAgain } : status;
+    return status;
   }
 
   /**
@@ -1956,13 +1784,12 @@ export class ProductionGate {
     const resolved = this.resolveHumanGate(runId);
     if (!resolved.required) return { required: false, items: [], satisfied: true, humanGateDigest: resolved.binding };
     const status = { required: true, items: resolved.items, satisfied: resolved.binding !== null, humanGateDigest: resolved.binding };
-    return resolved.decideAgain ? { ...status, decideAgain: resolved.decideAgain } : status;
+    return status;
   }
 
   /**
    * The value the daemon finalizer names as the gate payload's `humanGateDigest`: the binding
-   * `resolveHumanGate` derives, never a free-form digest. The kernel independently resolves the gate
-   * again when it publishes and again when it merges, and refuses a payload that no longer names it.
+   * kept for payload compatibility. Consent is a retained fact, not a candidate digest chain.
    */
   currentHumanGateDecisionDigest(runId: string): Decision<string> {
     const resolved = this.resolveHumanGate(runId);

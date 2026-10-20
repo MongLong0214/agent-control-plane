@@ -130,7 +130,6 @@ describe("W1/W3: a project-less bootstrap reaches CEO review on the owner's resu
       .toEqual([run.ownerSessionId]);
     const scope = harness.cp.bootstrapProducer.approvalScopeOf(run.runId);
     expect(scope.allowed, JSON.stringify(scope)).toBe(true);
-    if (scope.allowed) expect(harness.cp.bootstrapProducer.ownerApprovalNeed(run.runId, scope.value).need).toBe("NONE");
   });
 });
 

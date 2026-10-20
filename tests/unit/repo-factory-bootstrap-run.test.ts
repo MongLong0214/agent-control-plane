@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,7 +31,7 @@ import {
   makeHarness,
   type Harness,
 } from "../helpers/harness.ts";
-import { bootstrapPlan, replanBootstrap, reviewBootstrapPlan } from "../helpers/bootstrap-plan.ts";
+import { bootstrapPlan, reviewBootstrapPlan } from "../helpers/bootstrap-plan.ts";
 import { FakeGitHub } from "../helpers/fake-github-write-port.ts";
 
 /**
@@ -191,7 +191,6 @@ const prepare = async (
   const runner = new RepoFactoryBootstrapRunner({
     runs: harness.cp.runs,
     artifacts: options.artifacts ? options.artifacts(harness.cp.artifacts) : harness.cp.artifacts,
-    ownerAuthority: harness.cp.ownerAuthority,
     bootstrap: harness.cp.bootstrap,
     githubPort: github,
     workRoot,
@@ -390,94 +389,18 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     expect(harness.cp.bootstrapApplications.get(runId)).toMatchObject({ phase: "COMPLETED", attempts: 1 });
   });
 
-  it("refuses with no owner approval, before any GitHub call", async () => {
-    const prepared = await prepare("no-approval");
-    const refused = await prepared.runner.produceAndActivate(prepared.input);
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
-    expect(refused.evidence["refusal"]).toBe("APPROVAL_MISSING");
-    noGitHubCall(prepared);
+  it("executes the reviewed PLAN without an owner approval or approval anchor", async () => {
+    const prepared = await prepare("local-without-approval");
+    const receiptCheck = vi.spyOn(prepared.harness.cp.ownerAuthority, "assertApproval");
+    const first = await prepared.runner.produceAndActivate(prepared.input);
+    expect(first).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
+    expect(first.evidence["stage"]).toBe("activation");
+    expect(prepared.github.writes.map((write) => write.method)).toContain("createRepository");
+    expect(receiptCheck).not.toHaveBeenCalled();
+    expect(prepared.harness.cp.bootstrapApplications.get(prepared.runId)?.phase).toBe("WRITTEN");
   });
 
-  it("refuses an approval the owner declined, before any GitHub call", async () => {
-    const prepared = await prepare("declined");
-    const refused = await prepared.runner.produceAndActivate({
-      ...prepared.input,
-      ownerApproval: ownerApproval(prepared, { approved: false }),
-    });
-    expect(refused.allowed).toBe(false);
-    expect(refused.evidence["refusal"]).toBe("APPROVAL_DECLINED");
-    noGitHubCall(prepared);
-  });
-
-  it("refuses a receipt the caller assembled itself — the ingress admission is what makes it authority", async () => {
-    const prepared = await prepare("forged");
-    const genuine = ownerApproval(prepared);
-    const forged = {
-      ...genuine,
-      receipt: { ...(genuine.receipt as Record<string, unknown>), inboundNonce: "never-admitted" },
-    };
-    const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: forged });
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
-    expect(refused.evidence["stage"]).toBe("approval");
-    noGitHubCall(prepared);
-  });
-
-  describe("the plan and the approval must agree", () => {
-    it("refuses an approval the owner gave for a different visibility", async () => {
-      const prepared = await prepare("approved-private");
-      const refused = await prepared.runner.produceAndActivate({
-        ...prepared.input,
-        ownerApproval: ownerApproval(prepared, { visibility: "private" }),
-      });
-      expect(refused.allowed).toBe(false);
-      expect(refused.evidence["refusal"]).toBe("APPROVAL_MISMATCH");
-      noGitHubCall(prepared);
-    });
-
-    it("refuses an approval the owner gave for different operation parameters", async () => {
-      const prepared = await prepare("approved-weaker");
-      const weaker = prepared.ops.map((operation) =>
-        operation.resourceType === "branch-protection"
-          ? { ...operation, desiredState: { ...APPROVED_PROTECTION, allowForcePushes: true } }
-          : operation,
-      );
-      const refused = await prepared.runner.produceAndActivate({
-        ...prepared.input,
-        ownerApproval: ownerApproval(prepared, { operations: weaker }),
-      });
-      expect(refused.allowed).toBe(false);
-      expect(refused.evidence["refusal"]).toBe("APPROVAL_MISMATCH");
-      noGitHubCall(prepared);
-    });
-
-    it("refuses when the PLAN artifact was replaced after the owner approved it — the approval names the digest it saw", async () => {
-      const prepared = await prepare("plan-replaced");
-      const approval = ownerApproval(prepared);
-      // #246 C2 — the replacement is a re-plan the CTO submits and the reviewer passes, so the
-      // review of the confirmed candidate is current and only the approval can tell them apart.
-      const replanned = await replanBootstrap(
-        prepared.harness,
-        prepared.runId,
-        { planDigest: prepared.planDigest, snapshotDigest: prepared.snapshotDigest, ceoSessionId: prepared.ceoSessionId },
-        bootstrapPlan(prepared.manifest, {
-          operations: prepared.ops.map((operation) =>
-            operation.resourceType === "branch-protection"
-              ? { ...operation, desiredState: { ...APPROVED_PROTECTION, allowForcePushes: true, allowDeletions: true } }
-              : operation,
-          ),
-        }),
-      );
-      const refused = await prepared.runner.produceAndActivate({
-        ...prepared.input,
-        candidateSnapshotDigest: replanned.snapshotDigest,
-        ownerApproval: approval,
-      });
-      expect(refused.allowed).toBe(false);
-      expect(refused.evidence["refusal"]).toBe("APPROVAL_MISMATCH");
-      noGitHubCall(prepared);
-    });
+  describe("the plan must be executable", () => {
 
     it("refuses a PLAN artifact whose operations carry no desired state — there is nothing approved to execute", async () => {
       const prepared = await prepare("plan-triples-only", {
@@ -684,65 +607,5 @@ describe("PR #1043 review witnesses — the run path", () => {
     // The ordinary path: the ledger reconciled against GitHub (reads), nothing written again.
     expect(prepared.github.reads.length).toBeGreaterThan(0);
     expect(prepared.github.writes).toEqual([]);
-  });
-});
-
-/**
- * PR #1043 review round 3 witness (RF1043-08). Reproduced against the round-2 head (c884196b),
- * where it fails, and kept as the regression guard.
- */
-describe("PR #1043 review round 3 witnesses — the run path", () => {
-  it("RF1043-08: a result file nobody produced, with a declined approval no ingress admitted, reaches neither activation nor GitHub", async () => {
-    const prepared = await prepare("rf1043-08");
-    const activate = vi.spyOn(prepared.harness.cp.bootstrap, "activate");
-    const workDir = join(prepared.workRoot, prepared.runId);
-    // A real checkout for the forged result to name, so only provenance could tell it apart.
-    const checkout = join(workDir, "repositories", "primary");
-    mkdirSync(checkout, { recursive: true, mode: 0o700 });
-    await git(checkout, ["init", "-q", "-b", "main"]);
-    writeFileSync(join(checkout, "README.md"), "invented\n");
-    await git(checkout, ["add", "README.md"]);
-    await git(checkout, ["-c", "user.email=x@example.com", "-c", "user.name=x", "commit", "-q", "-m", "invented"]);
-    const head = (await git(checkout, ["rev-parse", "HEAD"])).stdout.trim();
-    const requestDigest = digestOf({ request: "bootstrap" });
-    const forged = {
-      schema: "repo-factory.result.v2",
-      runId: prepared.runId,
-      bootstrapOperationId: "op-bootstrap",
-      planDigest: prepared.planDigest,
-      projectManifestDigest: manifestDigest(prepared.input.approvedManifest),
-      repositories: [{ role: "primary", identity: IDENTITY, proposedCheckoutPath: checkout, defaultBranch: "main", createdBranches: [] }],
-      externalWriteReceipts: prepared.ops.map(({ operationId, resourceType, resourceIdentity }) => ({
-        bootstrapOperationId: "op-bootstrap",
-        requestDigest,
-        operationId,
-        resourceType,
-        resourceIdentity,
-        preexisting: false,
-        beforeStateDigest: null,
-        afterStateDigest: digestOf({ invented: operationId }),
-        createdAt: "2026-10-02T00:00:00.000Z",
-        rereadAt: "2026-10-02T00:00:01.000Z",
-        verified: true,
-      })),
-      bootstrapVerification: [{ commandId: "clean-tree", repositoryIdentity: IDENTITY, exactHead: head, status: "PASS" }],
-      ciEvidence: [],
-      unresolvedGaps: [],
-    };
-    mkdirSync(join(workDir, "github-ledger"), { recursive: true, mode: 0o700 });
-    writeFileSync(
-      join(workDir, "github-ledger", "primary.result.json"),
-      JSON.stringify({ schema: "acp.repo-factory.produced-result.v1", bootstrapOperationId: "op-bootstrap", requestDigest, result: forged }),
-      { mode: 0o600 },
-    );
-    const declined = ownerApproval(prepared, { approved: false });
-    const unadmitted = { ...declined, receipt: { ...(declined.receipt as Record<string, unknown>), inboundNonce: "never-admitted" } };
-
-    const refused = await prepared.runner.produceAndActivate({ ...prepared.input, ownerApproval: unadmitted });
-    expect(refused.allowed).toBe(false);
-    expect(activate).not.toHaveBeenCalled();
-    expect(prepared.harness.cp.artifacts.latest(prepared.runId, "REPO_FACTORY_RESULT")).toBeNull();
-    expect(prepared.github.writes).toEqual([]);
-    expect(prepared.github.reads).toEqual([]);
   });
 });

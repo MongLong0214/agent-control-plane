@@ -346,7 +346,8 @@ describe("Unit 2 kill(0): ExpectUsageTerminal signals only a process group it ow
   it("control: an owned expect group that never answers is SIGKILLed at its own group and reaped before the call returns, within the timeout", async () => {
     const pidsPath = join(home, "hung.pids");
     const hung = script("claude-hangs", `echo $PPID $$ > '${pidsPath}'\nexec sleep 30`);
-    const timeoutMs = 1_100;
+    // Include host process startup: the fixture must run before we exercise its cleanup.
+    const timeoutMs = 5_000;
     const watch = watchNextSpawn();
     const kill = vi.spyOn(process, "kill");
     let result: UsageTerminalResult;
@@ -355,7 +356,7 @@ describe("Unit 2 kill(0): ExpectUsageTerminal signals only a process group it ow
     let returnedAfterMs: number;
     const startedAt = performance.now();
     try {
-      // expect's own wait is ceil(1.1 s) = 2 s, so the outer timer is what ends this run.
+      // expect's own wait is 5 s; the outer work deadline ends this run before it.
       result = await new ExpectUsageTerminal().run({ binary: hung, args: [], steps: [], timeoutMs, environment: process.env });
       returnedAfterMs = performance.now() - startedAt;
       exitedAtReturn = watch.exited;
@@ -534,7 +535,8 @@ describe("FIX-1148-R1 R1148-02: the pseudo-terminal's cleanup confirms the owned
 
   it("an expect stopped before the trust prompt's SIGTERM is SIGKILLed inside the existing deadline, and exited and reaped when the call returns", async () => {
     const pidsPath = join(home, "stopped-trust.pids");
-    const timeoutMs = 1_100;
+    // Leave time for the real expect and CLI to start before stopping expect on the prompt.
+    const timeoutMs = 5_000;
     try {
       const watched = await runWatched(trustThenSleep("claude-trust-stopped", pidsPath), timeoutMs, true);
       expect(watched.stopped).toBe(true);

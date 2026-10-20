@@ -70,14 +70,6 @@ import { processStartedAt } from "../core/process-identity.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import { BuzzBindChallenges, buzzBindContentOf } from "../buzz/buzz-bind-challenge.ts";
 import {
-  BuzzOwnerApprovals,
-  buzzOwnerApprovalContentOf,
-  buzzOwnerApprovalIdentityOf,
-  type BuzzOwnerApprovalAnswer,
-  type BuzzOwnerApprovalHealth,
-  type BuzzOwnerApprovalRunnerPort,
-} from "../buzz/buzz-owner-approval.ts";
-import {
   BUZZ_MENTION_ADDRESSED_TO,
   nativeSubscriberScheduler,
   startBuzzMentionSubscriberFromStateDir,
@@ -1031,9 +1023,7 @@ export const startLocalMcpListeners = async (
       auth,
       opening.kind === "PENDING_HANDOFF_ACK"
         ? { pendingHandoffId: opening.handoffId }
-        : opening.kind === "PENDING_ATTESTATION"
-          ? { attestationOnly: true }
-          : undefined,
+        : undefined,
     );
     // The line the CEO socket has had and this one did not. The binding the connection was
     // admitted under is what the port keys and verifies on: this socket also admits
@@ -1207,7 +1197,7 @@ export const startLocalMcpListeners = async (
             ),
           "session-secret",
         ),
-      { pendingHandoffAck: true, pendingAttestation: true },
+      { pendingHandoffAck: true },
       options.attachments ? { authority: options.attachments, port: ctoConversation } : undefined,
     );
   } catch (err) {
@@ -2116,30 +2106,15 @@ export const startDaemonBuzzMentionSubscriber = (
     canonical?: BuzzMentionCanonicalEntries | null;
     /** Where admission changes are reported; the subscriber's own stderr line when absent. */
     reportAdmission?: BuzzMentionAdmissionReporter;
-    /** #246 — the owner-approval store: the marker route's handler and the approval reply filter. */
-    ownerApprovals?: Pick<BuzzOwnerApprovals, "receive" | "replyFilter">;
+
   } = {},
 ): BuzzMentionSubscriberHandle => {
   const secret = policy.secret?.trim() ?? "";
-  const ownerApprovals = options.ownerApprovals;
   if (secret.length === 0) {
     throw new Error("Buzz mention subscriber requires a non-empty signing secret");
   }
   const messageSink: BuzzMentionSink = {
     admit: async (request) => {
-      // #246 — a verified event carrying the owner-approval marker in any form is judged by the
-      // approval route and nothing else: first, ahead of the binding marker and the seam, whoever
-      // signed it — a CEO peer mention included — so it is never delivered as a message to anyone.
-      // Decided by the content, not by whether a store is wired: without one it is refused outright.
-      if (buzzOwnerApprovalContentOf(request.event.content).kind !== "NONE") {
-        return buzzOwnerApprovalVerdictOf(
-          ownerApprovals?.receive({
-            identityPubkey: request.identityPubkey,
-            conversation: request.conversation,
-            event: request.event,
-          }) ?? deny(ReasonCode.BUZZ_OWNER_APPROVAL_NOT_A_MESSAGE, "this daemon serves no owner approval prompt"),
-        );
-      }
       // A verified event carrying the binding marker in any form goes to the binding, and never to
       // admission, so it is not delivered as a message to anyone (ACP1055-01). Decided by the
       // content, not by whether a store is wired: without one, such an event is refused outright.
@@ -2201,143 +2176,11 @@ export const startDaemonBuzzMentionSubscriber = (
     ...(options.openSocket ? { openSocket: options.openSocket } : {}),
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
     ...(options.reportAdmission ? { reportAdmission: options.reportAdmission } : {}),
-    // #246 — the replies to this daemon's prompts, asked for by the prompts' own ids, not by mention.
-    ...(ownerApprovals === undefined
-      ? {}
-      : {
-          approvalReplies: {
-            filterFor: (pubkey: string) => ownerApprovals.replyFilter(pubkey),
-            receive: async (request: { identityPubkey: string; conversation: string; event: BuzzMentionAdmissionRequest["event"] }) =>
-              buzzOwnerApprovalVerdictOf(ownerApprovals.receive(request)),
-          },
-        }),
+
   });
   runningMentionSubscribers.set(cp, handle);
   return handle;
 };
-
-/**
- * #246 — what the owner-approval route answered, as the subscriber reads an answer: a newly recorded
- * decision is durable; a replay, or the same decision again, is already durable; anything else is a
- * refusal about this one event, with its code kept for health, and it moves no window.
- */
-export const buzzOwnerApprovalVerdictOf = (decision: Decision<BuzzOwnerApprovalAnswer>): BuzzMentionVerdict => {
-  if (decision.allowed) return { admission: decision.value.result === "MINTED" ? "DURABLE" : "ALREADY_DURABLE" };
-  if (decision.reasonCode === ReasonCode.INGRESS_REPLAY_IGNORED) return { admission: "ALREADY_DURABLE" };
-  return { admission: "REFUSED", reasonCode: decision.reasonCode };
-};
-
-/** #246 — the variable naming the approval identity X: a non-secret x-only key, never an owner key. */
-export const OWNER_APPROVAL_BUZZ_IDENTITY_ENV = "ACP_OWNER_APPROVAL_BUZZ_IDENTITY";
-
-/**
- * #246 T3 — the variable naming the repo-factory project: its registered project id, as the
- * operator configures it (the `ACP_TELEGRAM_DEFAULT_PROJECT_ID` precedent). The trimmed value is the
- * id and nothing else: not a display name, not a literal, and not checked against an id pattern,
- * which would make this file a second authority for what a project id is (r-5586d6cc13d9). The
- * registry is the authority; an id it does not hold refuses.
- */
-export const REPO_FACTORY_PROJECT_ID_ENV = "ACP_REPO_FACTORY_PROJECT_ID";
-
-/**
- * #246 — the owner-approval store over this daemon's registries: the bootstrap runner's scope and
- * need, the run list for the prompt tick, the declared `buzz` owners, the deployment's Buzz replay
- * window for the receipt's admission, and the current CEO binding for a re-issue request (O2).
- *
- * T3 — the canonical signer is the CTO of the project `ACP_REPO_FACTORY_PROJECT_ID` names, and only
- * when every link holds: the id is configured and registered, the project has an ACTIVE PRIMARY_CTO
- * binding, that binding's runtime is live (READY or DRAINING, as `currentCeo` reads it) and carries
- * a Buzz identity and room, and that identity is held by exactly one ACTIVE PRIMARY_CTO binding
- * across all projects. The store then compares it with X and X's admitted room; that comparison is
- * what refuses X being another project's CTO.
- */
-export const createDaemonBuzzOwnerApprovals = (
-  cp: ControlPlane,
-  options: {
-    environment?: Readonly<Record<string, string | undefined>>;
-    ownerActors: readonly string[];
-    policy: IngressPolicy | null;
-    runner?: BuzzOwnerApprovalRunnerPort;
-    publishTimeoutMs?: number;
-  },
-): BuzzOwnerApprovals => {
-  const environment = options.environment ?? process.env;
-  const identity = buzzOwnerApprovalIdentityOf(environment[OWNER_APPROVAL_BUZZ_IDENTITY_ENV]);
-  const repoFactoryProjectId = environment[REPO_FACTORY_PROJECT_ID_ENV]?.trim() ?? "";
-  return new BuzzOwnerApprovals({
-    db: cp.db,
-    clock: cp.clock,
-    audit: cp.audit,
-    runner: options.runner ?? cp.bootstrapProducer,
-    runs: cp.runs,
-    ownerActors: options.ownerActors,
-    identity: identity === "INVALID" ? null : identity,
-    repoFactoryAuthority: () => {
-      if (repoFactoryProjectId.length === 0) return { excluded: "REPO_FACTORY_PROJECT_NOT_CONFIGURED" };
-      if (cp.projects.get(repoFactoryProjectId) === null) return { excluded: "REPO_FACTORY_PROJECT_NOT_REGISTERED" };
-      const binding = cp.bindings.activePrimaryCto(repoFactoryProjectId);
-      if (binding === null) return { excluded: "NO_ACTIVE_REPO_FACTORY_CTO" };
-      const session = cp.sessions.get(binding.sessionId);
-      const lifecycle = session?.lifecycle;
-      if (session === null || (lifecycle !== SessionLifecycle.READY && lifecycle !== SessionLifecycle.DRAINING)) {
-        return { excluded: "REPO_FACTORY_CTO_NOT_LIVE" };
-      }
-      const signer = session.buzzActorId;
-      if (signer === null || session.buzzAddress === null) return { excluded: "REPO_FACTORY_CTO_HAS_NO_BUZZ_IDENTITY" };
-      // Counted over every ACTIVE PRIMARY_CTO binding, live runtime or not: a stopped runtime keeps its
-      // key, so a second binding resolving to one carrying this key is a second holder, not history.
-      const holders = cp.bindings.activePrimaryCtos().filter((held) => cp.sessions.get(held.sessionId)?.buzzActorId === signer);
-      if (holders.length !== 1) return { excluded: "REPO_FACTORY_CTO_IDENTITY_AMBIGUOUS" };
-      return { signer, room: session.buzzAddress };
-    },
-    identityInvalid: identity === "INVALID",
-    ingressPolicy:
-      options.policy === null
-        ? null
-        : {
-            ...(options.policy.nonceTtlMs === undefined ? {} : { nonceTtlMs: options.policy.nonceTtlMs }),
-            ...(options.policy.transportRetentionMs === undefined ? {} : { transportRetentionMs: options.policy.transportRetentionMs }),
-          },
-    currentCeo: () => {
-      const ceo = cp.bindings.active(roleKeyFor(Role.CEO));
-      if (!ceo) return null;
-      const lifecycle = cp.sessions.get(ceo.sessionId)?.lifecycle;
-      return {
-        sessionId: ceo.sessionId,
-        sessionIncarnation: ceo.sessionIncarnation,
-        live: lifecycle === SessionLifecycle.READY || lifecycle === SessionLifecycle.DRAINING,
-      };
-    },
-    ...(options.publishTimeoutMs === undefined ? {} : { publishTimeoutMs: options.publishTimeoutMs }),
-  });
-};
-
-/**
- * #246 — hands the store the subscriber it posts through (O1): the identity's admission judged now
- * against its live binding and the room its session answers in, and the publisher's two fixed
- * owner-approval messages.
- */
-export const attachDaemonBuzzOwnerApprovals = (approvals: BuzzOwnerApprovals, subscriber: BuzzMentionSubscriberHandle): void => {
-  approvals.attach(subscriber.replies, {
-    admitted: (pubkey) => {
-      const entry = subscriber.admission().identities.find((one) => one.identityPubkey === pubkey);
-      if (entry === undefined) return { excluded: "IDENTITY_NOT_SUBSCRIBED" };
-      if (entry.state !== "ADMITTED" || entry.roleKey === null) return { excluded: entry.reason ?? "EXCLUDED" };
-      const eligibility = subscriber.deliveryEligibility({ actorId: pubkey, roleKey: entry.roleKey });
-      return eligibility?.eligible === true && eligibility.room !== null
-        ? { roleKey: entry.roleKey, room: eligibility.room }
-        : { excluded: "BINDING_NOT_ELIGIBLE" };
-    },
-    refreshReplies: () => subscriber.refreshApprovalReplies(),
-  });
-};
-
-/** #246 — the subscriber's counters with the owner-approval health beside them, as `health.json` carries them. */
-export const buzzMentionReceiptCounters = (
-  subscriber: Pick<BuzzMentionSubscriberHandle, "counters">,
-  approvals: Pick<BuzzOwnerApprovals, "health"> | null,
-): (() => ReturnType<BuzzMentionSubscriberHandle["counters"]> & { buzzOwnerApproval?: BuzzOwnerApprovalHealth }) =>
-  () => (approvals === null ? subscriber.counters() : { ...subscriber.counters(), buzzOwnerApproval: approvals.health() });
 
 /**
  * The mention subscriber started over each control plane, read by the CTO port's wake eligibility.
@@ -3844,23 +3687,11 @@ interface PendingHandoffSocketPeer {
   credentialEpoch: number;
 }
 
-/**
- * #246 C1b — the other unbound peer shape: a provisioned session the runtime driver asked to attest,
- * which may answer that challenge (`session_attest`) and nothing else. A spawn attests before it is
- * READY or bound, so a STARTING session is admitted here and nowhere else.
- */
-interface PendingAttestationSocketPeer {
-  kind: "PENDING_ATTESTATION";
-  sessionIncarnation: string;
-  credentialEpoch: number;
-}
-
-type BoundSocketPeer = ActiveBoundSocketPeer | PendingHandoffSocketPeer | PendingAttestationSocketPeer;
+type BoundSocketPeer = ActiveBoundSocketPeer | PendingHandoffSocketPeer;
 
 /** Which unbound peers a socket admits besides its bound role holders. */
 interface UnboundPeerAdmission {
   pendingHandoffAck?: boolean;
-  pendingAttestation?: boolean;
 }
 
 interface PendingNormalHandoff {
@@ -3880,19 +3711,6 @@ const authenticateSocketPeer = (
 ): Decision<BoundSocketPeer> => {
   const session = cp.sessions.verifySecret(credential.sessionId, credential.sessionSecret);
   if (!session.allowed) return session as Decision<BoundSocketPeer>;
-  const attesting = (): Decision<BoundSocketPeer> | null =>
-    admission.pendingAttestation &&
-    cp.sessionAttestations.isPending(credential.sessionId, session.value.incarnation, session.value.credentialEpoch)
-      ? allow(ReasonCode.OK, {
-          kind: "PENDING_ATTESTATION",
-          sessionIncarnation: session.value.incarnation,
-          credentialEpoch: session.value.credentialEpoch,
-        })
-      : null;
-  if (session.value.lifecycle === SessionLifecycle.STARTING) {
-    const admitted = attesting();
-    if (admitted) return admitted;
-  }
   if (
     session.value.lifecycle !== SessionLifecycle.READY &&
     session.value.lifecycle !== SessionLifecycle.DRAINING
@@ -3924,10 +3742,6 @@ const authenticateSocketPeer = (
           credentialEpoch: session.value.credentialEpoch,
         });
       }
-    }
-    if (session.value.lifecycle === SessionLifecycle.READY) {
-      const admitted = attesting();
-      if (admitted) return admitted;
     }
     return deny(ReasonCode.BINDING_GENERATION_STALE, "session does not hold this socket's current role", {
       sessionId: credential.sessionId,
@@ -4125,14 +3939,6 @@ const peerAuthenticator =
         handshakeEpoch: opening.credentialEpoch,
         currentEpoch: session.value.credentialEpoch,
       });
-    }
-    if (opening.kind === "PENDING_ATTESTATION") {
-      if (!cp.sessionAttestations.isPending(credential.sessionId, session.value.incarnation, session.value.credentialEpoch)) {
-        return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "the attestation this connection was admitted for is no longer pending", {
-          sessionId: credential.sessionId,
-        });
-      }
-      return allow(ReasonCode.OK, authenticatedPeer(credential, opening.sessionIncarnation));
     }
     if (opening.kind === "PENDING_HANDOFF_ACK") {
       if (session.value.lifecycle !== SessionLifecycle.READY) {
@@ -5298,8 +5104,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     };
   });
   let ownerReplies: DaemonOwnerReplyConsumer | null = null;
-  /** #246 — the owner-approval store, once the subscriber it posts through exists. */
-  let ownerApprovals: BuzzOwnerApprovals | null = null;
+
   let peerMessageNotices: DaemonPeerMessageNoticeDelivery | null = null;
   let operator: LocalOperatorListener | null = null;
   let canonicalSelfClaim: CanonicalSelfClaimListener | null = null;
@@ -5323,7 +5128,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     await telegram?.close();
     ownerReplies?.close();
     peerMessageNotices?.close();
-    ownerApprovals?.close();
     await telegramExternal?.close();
     buzzMentionSubscriber?.close();
     await buzzMessageIngress?.close();
@@ -5570,27 +5374,10 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         // An identity without a live binding no longer refuses the subscriber: it is excluded,
         // reported, and re-judged on every binding switch and on the subscriber's own schedule,
         // while every other identity subscribes. One paused CTO used to silence all of them.
-        // #246 — the owner-approval store the subscriber's marker route and reply filter answer to.
-        const approvals = createDaemonBuzzOwnerApprovals(cp, {
-          ownerActors: buzzMessageOwnerActors,
-          policy: buzzActorIngressPolicy,
-        });
-        ownerApprovals = approvals;
         buzzMentionSubscriber = startDaemonBuzzMentionSubscriber(cp, stateDir, buzzActorIngressPolicy, buzzMessageIngress, {
           ...(buzzBindChallenges === undefined ? {} : { bindChallenges: buzzBindChallenges }),
           canonical: canonicalSessions === null ? null : { sessions: canonicalSessions },
-          ownerApprovals: approvals,
         });
-        attachDaemonBuzzOwnerApprovals(approvals, buzzMentionSubscriber);
-        // Asked once now, and again whenever an identity's connection authenticates and on the
-        // health tick: the prompt tick never waits on anything a CONFIRM or a reply waits on.
-        const tickApprovals = (): void => {
-          void approvals.tick().catch((error: unknown) => {
-            process.stderr.write(`owner approval tick failed: ${error instanceof Error ? error.message : String(error)}\n`);
-          });
-        };
-        buzzMentionSubscriber.replies.onAuthenticated(tickApprovals);
-        tickApprovals();
         rejudgeBuzzMentionSubscriberOnBindingSwitch(cp, () => buzzMentionSubscriber);
         process.stdout.write(
           `Buzz mention subscriber configured identities: ${buzzMentionSubscriber.socketCount}\n`,
@@ -5617,7 +5404,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         if (startedSubscriber && startedSubscriber.socketCount > 0) {
           daemon.setBuzzMentionReceipt({
             configuredIdentities: startedSubscriber.socketCount,
-            counters: buzzMentionReceiptCounters(startedSubscriber, ownerApprovals),
+            counters: () => startedSubscriber.counters(),
           });
         }
         // The room the daemon *answers* in already has a name (`ACP_BUZZ_CHANNEL`, the outbound
@@ -5711,7 +5498,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // failed after it opened them would leave a daemon that exited still subscribed.
     ownerReplies?.close();
     peerMessageNotices?.close();
-    ownerApprovals?.close();
     buzzMentionSubscriber?.close();
     await buzzMessageIngress?.close();
     await buzzActorIngress?.close();
@@ -5745,10 +5531,6 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // so the health written on the same tick reports the result.
     setInterval(() => {
       buzzMentionSubscriber?.rejudge();
-      // #246 — the owner-approval prompt and cancellation tick rides the same one.
-      void ownerApprovals?.tick().catch((error: unknown) => {
-        process.stderr.write(`owner approval tick failed: ${error instanceof Error ? error.message : String(error)}\n`);
-      });
       daemon.writeHealth(null);
     }, 30_000).unref();
     await new Promise<void>(() => undefined);

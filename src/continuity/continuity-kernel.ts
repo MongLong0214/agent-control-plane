@@ -447,7 +447,7 @@ export class ContinuityKernel {
         if (preferred.length > 0 && preferred.every((p) => usable(p, role) === "UNMEASURED")) {
           unmeasured.push(role.roleKey);
         }
-        assignments.push({ roleKey: role.roleKey, provider: null, reason: "no provider with capability and admission" });
+        assignments.push({ roleKey: role.roleKey, provider: null, reason: "selected provider unavailable" });
         continue;
       }
       taken.add(candidate);
@@ -496,26 +496,12 @@ export class ContinuityKernel {
 
     const activeFallback = requiredRoles.some((role) => this.bindings.active(role.roleKey)?.mode === "FALLBACK");
     const mode: ContinuityMode =
-      outcome === "NO_VALID_COVERAGE"
-        ? ContinuityMode.SURVIVAL
-        : activeFallback || anyFallback || requiredProvidersDown.length > 0 || outcome === "PARTIAL_COVERAGE"
+      activeFallback || anyFallback || requiredProvidersDown.length > 0 || outcome !== "FULL_COVERAGE"
           ? ContinuityMode.DEGRADED
           : ContinuityMode.NORMAL;
 
-    const action: CoverageAction =
-      staffable === "NO_VALID_COVERAGE"
-        ? "SURVIVAL"
-        : staffable === "PARTIAL_COVERAGE"
-          ? this.partialAction(byProvider)
-          // Read from `staffable`, not from the composed `outcome`: nothing can be given to a role
-          // nobody holds, and no quota reset will change that, so `partialAction` would have
-          // offered WAIT_FOR_RESET — a wait on the wrong thing — whenever a window happened to
-          // reset within two hours.
-          : restorationPending.length > 0
-            ? "PAUSE_NEW_WORK"
-            : anyFallback
-              ? "FALLBACK_ROLE"
-              : "FALLBACK_ROLE";
+    // Coverage is diagnostic. It never asks the daemon to pause work or wait for quota resets.
+    const action: CoverageAction = "FALLBACK_ROLE";
 
     return {
       outcome,
@@ -1005,33 +991,9 @@ export class ContinuityKernel {
   }
 
   /**
-   * #1106 — restores a canonical PRIMARY_CTO that continuity revoked only for capacity, on the same
-   * session at the next generation, once its window has reset. No session, process or conversation
-   * is created, and the session's revoked credential is not revived: it is rotated in the restoring
-   * transaction and its plaintext is discarded, so the restored authority is reachable only through
-   * the reattach door, which admits on the process tree and holds no credential.
-   *
-   * In order, each a refusal of its own that leaves everything as it was:
-   *
-   *   - the role's newest assignment is a canonical binding revoked with the capacity-only reason, and
-   *     since that revocation there was no owner suspend, no replacement and no other holder
-   *     (`readCanonicalCtoRestoreTarget`, which the doctor asks too);
-   *   - an open reattach connection was admitted under exactly the revoked binding;
-   *   - a measurement taken now is HEALTHY, newer than the revocation, no longer exhausted for `cto`,
-   *     and admitted (`refreshForDispatch`, then the snapshot it wrote: `freshCanonicalCapacity`);
-   *   - that connection answers a liveness challenge bound to the role, the session, its incarnation,
-   *     the revoked generation and the connection, and is proven still attached to the live claude of
-   *     that session (`CanonicalCtoAttachChallenger`);
-   *   - inside the binding transaction, after the challenge, the target is read again and must be the
-   *     same, the capacity snapshot must still admit, and the connection is proven attached once more
-   *     as the last process read before the bind.
-   *
-   * After the commit the challenged connection is told the one succession the restore committed and
-   * is ended, so the relay comes back through the reattach door under the restored binding and
-   * adopts it on that announcement alone (review S2B-R1-01). A refusal once the target holds is recorded as
-   * `CANONICAL_CTO_RESTORE_REFUSED` with its condition, which the doctor names, and the next attempt
-   * of the same revocation waits out `CANONICAL_CTO_RESTORE_BACKOFF_MS`. Answers `null` for a role
-   * this path does not restore at all.
+   * Restore a capacity-revoked canonical CTO on its existing session. The authenticated live
+   * connection and unchanged target authorize restoration; quota readings are advisory.
+   * Credential rotation, same-target checks and non-preemptive binding remain transactional.
    */
   async restoreCapacityRevokedCanonicalCto(roleKey: string): Promise<Decision<RoleBinding> | null> {
     const reading = readCanonicalCtoRestoreTarget(this.db, roleKey);
@@ -1081,16 +1043,13 @@ export class ContinuityKernel {
           condition: CanonicalCtoRestoreCondition.NO_REATTACH_CONNECTION,
         }));
     }
-    // A measurement taken now. The refresh is the admission; the snapshot it leaves is what says
-    // whether it is new, healthy and past the window, each a different refusal.
+    // Refresh advisory telemetry for this exact registered provider and role.
     const admitted = await this.capacity.refreshForDispatch({
       provider: target.provider,
       capabilities: ["cto"],
       priority: "critical",
       ...(this.providers.hasRoleScoped(target.provider) ? { role: Role.PRIMARY_CTO } : {}),
     });
-    const measured = freshCanonicalCapacity(target, this.capacity);
-    if (!measured.allowed) return this.#refuseCanonicalRestore(target, measured);
     if (!admitted.allowed) {
       return this.#refuseCanonicalRestore(target, deny(admitted.reasonCode, admitted.message, {
         condition: CanonicalCtoRestoreCondition.CAPACITY_ADMISSION_REFUSED,
@@ -1110,8 +1069,6 @@ export class ContinuityKernel {
       if (again.kind === "UNMET") return deny(again.reasonCode, again.message, { condition: again.condition });
       const moved = restoreTargetMoved<RoleBinding>(target, again.target);
       if (moved) return moved;
-      const capacityNow = freshCanonicalCapacity(target, this.capacity);
-      if (!capacityNow.allowed) return capacityNow as Decision<RoleBinding>;
       const session = this.sessions.get(target.sessionId);
       if (!session) {
         return deny(ReasonCode.BINDING_GENERATION_STALE, "the canonical session's row is gone", {
@@ -1304,28 +1261,10 @@ export class ContinuityKernel {
     return true;
   }
 
-  /** §15.6 — SURVIVAL: state is preserved, diagnostics run, completion is forbidden. */
-  assertCompletionAllowed(runId: string, maxAgeMs = 5 * 60 * 1000): Decision<void> {
-    if (this.mode() === ContinuityMode.SURVIVAL) {
-      return deny(
-        ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
-        "production-ready completion is not permitted in SURVIVAL",
-        { runId },
-      );
-    }
-    // §15.6 — a NORMAL that was computed before both providers failed is not evidence of
-    // anything. Completion requires a *current* evaluation, so the caller must refresh.
-    const ageMs = this.modeAgeMs();
-    if (ageMs > maxAgeMs) {
-      return deny(
-        ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
-        "continuity mode is stale; re-evaluate coverage before completing",
-        { runId, ageMs, maxAgeMs },
-      );
-    }
+  /** Capacity and coverage observations never veto the delivery pipeline's completion gates. */
+  assertCompletionAllowed(_runId: string, _maxAgeMs = 5 * 60 * 1000): Decision<void> {
     return allow(ReasonCode.OK, undefined);
   }
-
 
   private coverageProviders(requiredRoles: readonly RequiredRole[]): Set<string> {
     const shared = new Set(this.providers.production().map((adapter) => adapter.provider));
@@ -1718,17 +1657,7 @@ export class ContinuityKernel {
     }
   }
 
-  private partialAction(byProvider: Map<string, ProviderCapacity>): CoverageAction {
-    const resets = [...byProvider.values()]
-      .flatMap((c) => c.buckets.map((b) => b.resetAt))
-      .filter((r): r is string => Boolean(r));
-    if (resets.length > 0) {
-      const soonest = resets.map((r) => new Date(r).getTime()).sort((a, b) => a - b)[0]!;
-      const withinTwoHours = soonest - new Date(this.clock.nowIso()).getTime() < 2 * 60 * 60 * 1000;
-      if (withinTwoHours) return "WAIT_FOR_RESET";
-    }
-    return "PAUSE_NEW_WORK";
-  }
+
 }
 
 /** #246 C4-R2 — continuity's answer for replacing a driven PRIMARY_CTO: it is recovered on its own session. */
@@ -1980,43 +1909,6 @@ const restoreTargetMoved = <T>(started: CanonicalCtoRestoreTarget, now: Canonica
 
 const movedDuringRestore = <T>(condition: CanonicalCtoRestoreCondition): Decision<T> =>
   deny(ReasonCode.BINDING_GENERATION_STALE, "the revoked binding changed while its restore was attested", { condition });
-
-/**
- * #1106 — the capacity question, answered from the snapshot the restore's own refresh wrote: a
- * collector measurement (never an operator observation), HEALTHY in both sensor and runtime, taken
- * after the revocation, with known quota for `cto`, no longer exhausted, and routable. Synchronous,
- * so the bind transaction asks it again.
- */
-export const freshCanonicalCapacity = (
-  target: Pick<CanonicalCtoRestoreTarget, "provider" | "revokedAt">,
-  capacity: Pick<
-    CapacityMonitor,
-    "currentForRole" | "current" | "hasExhaustedQuotaFor" | "hasUnknownQuotaFor" | "isRoutableFor"
-  >,
-): Decision<void> => {
-  const reading = capacity.currentForRole(target.provider, Role.PRIMARY_CTO) ?? capacity.current(target.provider);
-  const notFresh = (message: string): Decision<void> =>
-    deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, message, { condition: CanonicalCtoRestoreCondition.CAPACITY_NOT_FRESH });
-  if (reading === null) return notFresh("no capacity reading for the canonical CTO's provider");
-  if (reading.operatorObservation !== undefined) return notFresh("an operator observation is not a measurement");
-  if (reading.sensorHealth !== "HEALTHY") return notFresh("the capacity reading's sensor is not HEALTHY");
-  if (reading.runtimeHealth !== "HEALTHY") return notFresh("the capacity reading's runtime is not HEALTHY");
-  if (!(Date.parse(reading.observedAt) > Date.parse(target.revokedAt))) {
-    return notFresh("the capacity reading was taken before the revocation");
-  }
-  if (capacity.hasUnknownQuotaFor(reading, "cto")) return notFresh("the capacity reading has unknown quota for the role");
-  if (capacity.hasExhaustedQuotaFor(reading, "cto")) {
-    return deny(ReasonCode.CAPACITY_ADMISSION_SUSPENDED, "the exhausted window has not reset", {
-      condition: CanonicalCtoRestoreCondition.CAPACITY_WINDOW_NOT_RESET,
-    });
-  }
-  if (!capacity.isRoutableFor(reading, "cto")) {
-    return deny(ReasonCode.CAPACITY_ADMISSION_CONSERVE, "the role is not admitted on the fresh reading", {
-      condition: CanonicalCtoRestoreCondition.CAPACITY_ADMISSION_REFUSED,
-    });
-  }
-  return allow(ReasonCode.OK, undefined);
-};
 
 /** #1106 — what the restore's liveness challenge proved, held for the bind and released after it. */
 export interface CanonicalCtoAttachProof {

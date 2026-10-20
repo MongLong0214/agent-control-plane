@@ -206,7 +206,7 @@ describe("the doctor measures the role before it scores it", () => {
       // Unknown is not turned into routable: the plan the router reads still refuses new work.
       expect(cp.continuity.computeCoveragePlan()).toMatchObject({
         outcome: "NO_VALID_COVERAGE",
-        action: "SURVIVAL",
+        action: "FALLBACK_ROLE",
       });
     } finally {
       cp.db.close();

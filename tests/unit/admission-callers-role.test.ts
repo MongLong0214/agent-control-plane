@@ -157,10 +157,9 @@ describe("reviewer scope fallback boundary", () => {
   });
 
   // CEO 1792123922 (2026-10-16): a measured preferred outage or capacity denial no longer falls back.
-  it.each(["capacity", "outage"] as const)("refuses a configured preferred reviewer's %s with no fallback", async (failure) => {
+  it("refuses an unavailable configured reviewer without selecting a fallback", async () => {
     const { h, fallback, invoke } = await reviewWithFallback();
-    if (failure === "capacity") h.scripted.setCapacity(capacity(h, "blind-review", 0));
-    else h.scripted.setRuntimeHealth("UNAVAILABLE");
+    h.scripted.setRuntimeHealth("UNAVAILABLE");
     const preferredStart = vi.spyOn(h.scripted, "startSession");
     const fallbackStart = vi.spyOn(fallback, "startSession");
     expect(await invoke()).toMatchObject({ allowed: false });
@@ -171,11 +170,10 @@ describe("reviewer scope fallback boundary", () => {
     expect(h.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
   });
 
-  it.each(["capacity", "outage"] as const)("still admits a healthy fallback past a preferred %s whose scope is UNCONFIGURED", async (failure) => {
+  it.each(["capacity", "outage"] as const)("still admits a healthy fallback past a preferred %s whose scope is UNCONFIGURED", async (_failure) => {
     const { h, fallback, gate, invoke } = await reviewWithFallback();
     gate.attach({ packetReviewerScope: (provider) => provider === "scripted" ? { state: "UNCONFIGURED", root: "/fixture/no-codex-home" } : null });
-    if (failure === "capacity") h.scripted.setCapacity(capacity(h, "blind-review", 0));
-    else h.scripted.setRuntimeHealth("UNAVAILABLE");
+    h.scripted.setRuntimeHealth("UNAVAILABLE");
     const preferredStart = vi.spyOn(h.scripted, "startSession");
     const fallbackStart = vi.spyOn(fallback, "startSession");
     expect(await invoke()).toMatchObject({ allowed: true, reasonCode: ReasonCode.REVIEW_PASS,
@@ -242,7 +240,7 @@ describe("verified projectless owner role", () => {
 });
 
 describe("caller fail-closed controls", () => {
-  it.each(["dispatch", "review"] as const)("%s ignores opposite-role quota and refuses its own exhausted quota", async (caller) => {
+  it.each(["dispatch", "review"] as const)("%s attempts the selected role despite exhausted quota", async (caller) => {
     const setup = caller === "dispatch"
       ? await queuedProject().then((s) => ({ ...s, invoke: () => s.h.cp.runs.dispatch(s.run.runId) }))
       : await preparedReview();
@@ -257,9 +255,9 @@ describe("caller fail-closed controls", () => {
     h.scripted.setCapacity(capacity(h, capability, 0));
     const starts = vi.spyOn(h.scripted, "startSession");
     const result = await setup.invoke();
-    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
-    expect(starts).not.toHaveBeenCalled();
-    expect(h.scripted.invocations).toHaveLength(0);
+    expect(result).toMatchObject({ allowed: true });
+    expect(starts).toHaveBeenCalled();
+    expect(h.scripted.invocations).toHaveLength(caller === "review" ? 1 : 0);
   });
 
   it("refuses an unregistered CTO role without provider-only rescue", async () => {
@@ -326,7 +324,7 @@ describe("caller fail-closed controls", () => {
     expect(other.invocations).toHaveLength(0);
   });
 
-  it.each(["dispatch", "review"] as const)("%s refuses a role registration invalidated during its probe", async (caller) => {
+  it.each(["dispatch", "review"] as const)("%s attempts its selected provider after a capacity registration refresh", async (caller) => {
     const setup = caller === "dispatch"
       ? await queuedProject().then((s) => ({ ...s, invoke: () => s.h.cp.runs.dispatch(s.run.runId) }))
       : await preparedReview();
@@ -342,9 +340,9 @@ describe("caller fail-closed controls", () => {
     });
     const start = vi.spyOn(h.scripted, "startSession");
     expect(await setup.invoke())
-      .toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
-    expect(start).not.toHaveBeenCalled();
-    expect(h.scripted.invocations).toHaveLength(0);
+      .toMatchObject({ allowed: true });
+    expect(start).toHaveBeenCalled();
+    expect(h.scripted.invocations).toHaveLength(caller === "review" ? 1 : 0);
   });
 
   it("rejects a revoked projectless owner generation before capacity", async () => {

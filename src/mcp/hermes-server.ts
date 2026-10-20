@@ -125,6 +125,10 @@ export const createHermesMcpPort = (
     },
     ensurePrimaryCto: (projectId: string) => source.cto.ensurePrimaryCto(projectId, "cto_start"),
     requestCtoReplacement: (projectId: string, reason: string) => source.cto.requestReplacement(projectId, reason),
+    suspendProject: (projectId: string, reason: string, actor: string) =>
+      source.cto.suspendProject(projectId, true, reason, undefined, actor),
+    recordOwnerDecision: (input: Parameters<ProductionGate["recordOwnerDecision"]>[0], actor: string) =>
+      source.ceo.recordOwnerDecision(input, actor),
     resumeProject: (projectId: string) => source.cto.resumeProject(projectId),
     doctorRun: (...args: Parameters<Doctor["run"]>) => source.doctor.run(...args),
     continuityStatus: () => ({
@@ -314,6 +318,20 @@ const createHermesServerFromPort = (
       const peer = authenticateMcpPeer(authenticate);
       return peer.allowed ? port.mutation.execute(peer.value, idempotencyKey, execute) : respond(peer);
     });
+  const writeAsOwner = (
+    idempotencyKey: string,
+    extra: unknown,
+    refusal: string,
+    execute: (actor: string) => Promise<ToolResult> | ToolResult,
+  ) => guarded(() => {
+    const peer = authenticateMcpPeer(authenticate);
+    if (!peer.allowed) return respond(peer);
+    // Check before reserving a key or replaying its result: peers share the owner's channel actor.
+    if (admittedTurnOf(extra)?.principal !== "owner") {
+      return respond(deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, refusal));
+    }
+    return port.mutation.execute(peer.value, idempotencyKey, () => execute(peer.value.actor));
+  });
 
   server.registerTool(
     "run_create",
@@ -387,12 +405,10 @@ const createHermesServerFromPort = (
 
   server.registerTool(
     "cto_suspend",
-    { description: "Owner-only project suspension; Hermes cannot submit owner authority.", inputSchema: { ...mutation, projectId: z.string(), reason: z.string() } },
-    async (args) => write(args.idempotencyKey, () => respond(deny(
-      ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-      "owner approval must arrive through authenticated owner ingress, not Hermes MCP",
-      { projectId: args.projectId, reason: args.reason },
-    ))),
+    { description: "Suspend a project on an authenticated owner turn.", inputSchema: { ...mutation, projectId: z.string(), reason: z.string() } },
+    async (args, extra) => writeAsOwner(args.idempotencyKey, extra,
+      "project suspension requires an authenticated owner turn",
+      (actor) => port.suspendProject(args.projectId, args.reason, actor).then(respond)),
   );
   server.registerTool(
     "cto_resume",
@@ -486,12 +502,10 @@ const createHermesServerFromPort = (
 
   server.registerTool(
     "owner_decision_submit",
-    { description: "Unavailable over Hermes MCP: owner decisions require authenticated owner ingress.", inputSchema: { ...mutation, runId: z.string(), item: z.string(), approved: z.boolean(), note: z.string().default("") } },
-    async (args) => write(args.idempotencyKey, () => respond(deny(
-      ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-      "Hermes MCP cannot assert an owner decision",
-      { runId: args.runId, item: args.item },
-    ))),
+    { description: "Record a decision on an authenticated owner turn.", inputSchema: { ...mutation, runId: z.string(), item: z.string(), approved: z.boolean(), note: z.string().default("") } },
+    async (args, extra) => writeAsOwner(args.idempotencyKey, extra,
+      "owner decisions require an authenticated owner turn",
+      (actor) => respond(port.recordOwnerDecision(args, actor))),
   );
   server.registerTool(
     "repair_execute",

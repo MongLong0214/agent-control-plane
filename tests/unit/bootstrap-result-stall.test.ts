@@ -83,7 +83,6 @@ const expectNoGatePassed = (
   // The T3 prompt is only eligible: the run is at CEO review and needs an owner decision it does not have.
   const scope = f.harness.cp.bootstrapProducer.approvalScopeOf(runId);
   expect(scope.allowed, JSON.stringify(scope)).toBe(true);
-  if (scope.allowed) expect(f.harness.cp.bootstrapProducer.ownerApprovalNeed(runId, scope.value).need).toBe("NONE");
 };
 
 describe("the result stall: a driven bootstrap owner whose PLAN was accepted, who acknowledged and submitted no result", () => {
@@ -95,7 +94,7 @@ describe("the result stall: a driven bootstrap owner whose PLAN was accepted, wh
       const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onResult: "recovery-only" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
       // The attestation, then the RUN_DISPATCH's work turn: a PLAN accepted, the dispatch acknowledged, no result.
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
       expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
       expect(runDispatches(f, runId)).toEqual([{ generation: 1, status: "ACKED" }]);
@@ -104,7 +103,7 @@ describe("the result stall: a driven bootstrap owner whose PLAN was accepted, wh
       expect(resultState(f, runId)).toEqual({ state: RunState.ACTIVE, candidate: null, attempts: [] });
       await f.harness.cp.outbox.wakeInBandPending();
       await ticks(50);
-      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
 
       const daemon = await startDaemon(f, "stall");
       try {
@@ -117,7 +116,7 @@ describe("the result stall: a driven bootstrap owner whose PLAN was accepted, wh
       } finally {
         await daemon.stop();
       }
-      expect(f.finishedTurns(ownerSessionId)).toBe(3);
+      expect(f.finishedTurns(ownerSessionId)).toBe(2);
       expect(resultWakes(f, runId)).toBe(1);
       const woken = owner.prompts.at(-1)!;
       expect(woken).toContain(`result recovery: run ${runId} has a PLAN and no result`);
@@ -138,7 +137,7 @@ describe("the result stall: a driven bootstrap owner whose PLAN was accepted, wh
       // Generation 1 acknowledged its RUN_DISPATCH and planned nothing, as before #1113.
       const owner = scriptBootstrapOwner(f, { onDispatch: "ack-only", onResult: "recovery-only" });
       const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       await vi.waitFor(() => expect(f.harness.cp.sessionRuntime.turnInProgress(ownerSessionId)).toBe(false));
       // The restart loses the credential; continuity recovers the same session at generation 2 and
       // dispatches again. That turn plans (#1113's directive), acknowledges, and submits no result.
@@ -183,7 +182,7 @@ describe("the result stall: a driven bootstrap owner whose PLAN was accepted, wh
       const reviews = passBootstrapPlanReviews(f);
       const owner = scriptBootstrapOwner(f, { onDispatch: "follow-prompt", onResult: "follow-prompt" });
       const { runId, ownerSessionId } = await f.dispatchBootstrap();
-      await f.awaitFinishedTurns(ownerSessionId, 2);
+      await f.awaitFinishedTurns(ownerSessionId, 1);
       expect(f.harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
       expect(owner.submissions.at(-1)).toMatchObject({ ok: true });
       expect(owner.results).toEqual([{ runId, ok: true, stage: "COMPLETED_REVIEW" }]);
@@ -199,7 +198,7 @@ describe("the result stall: a driven bootstrap owner whose PLAN was accepted, wh
       } finally {
         await daemon.stop();
       }
-      expect(f.finishedTurns(ownerSessionId)).toBe(2);
+      expect(f.finishedTurns(ownerSessionId)).toBe(1);
       expect(resultWakes(f, runId)).toBe(0);
       expect(owner.results).toHaveLength(1);
       expectNoGatePassed(f, runId, ownerSessionId, client, writePort);

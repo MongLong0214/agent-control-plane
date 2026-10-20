@@ -176,18 +176,12 @@ const liveShape = async (w: World): Promise<{ handoffId: string; holder: RoleBin
   return { handoffId, holder };
 };
 
-
 import { createHermesMcpPort } from "../src/mcp/hermes-server.ts";
 import { registerFixtureProject } from "../tests/helpers/harness.ts";
 
 it("official CEO re-CONFIRM recovers and completes only after the driven ACK", async () => {
   await withWorld("review-official", async (w) => {
     const { cp } = w;
-    const recorded = w.prepared.runner.recordOwnerApproval(w.runId, {
-      ...w.input.ownerApproval, planDigest: w.prepared.planDigest,
-      approvedManifest: w.prepared.manifest, projectName: w.projectId,
-    });
-    expect(recorded.allowed).toBe(true);
     const stale = await liveShape(w);
     const github = w.github();
     const port = createHermesMcpPort({ ...cp, bootstrapProducer: w.prepared.runner });
@@ -247,7 +241,6 @@ it("replacement fences the retired session before an awaited provider stop permi
     expect(cp.sessions.require(w.primary().sessionId).lifecycle).toBe(SessionLifecycle.READY);
   });
 });
-
 
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../src/registry/canonical-self-claim.ts";
 import { digestOf, sha256 } from "../src/core/digest.ts";

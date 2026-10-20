@@ -52,8 +52,6 @@ export interface ProvisionedSessionRuntimePorts {
 }
 
 export interface ProvisionedSessionRuntimeOptions {
-  attestTimeoutMs?: number;
-  probeTimeoutMs?: number;
   turnTimeoutMs?: number;
 }
 
@@ -252,9 +250,8 @@ interface TurnLane {
  * - **The credential never travels as data.** The daemon keeps the plaintext in memory, offers it on
  *   the take-once launch channel for the length of one turn, and withdraws whatever that turn's
  *   relay did not take. Argv carries socket paths and the provider's conversation id; nothing else.
- * - **Readiness is authenticated.** `attest` mints a challenge, runs a turn whose relay must present
- *   it over a connection authenticated with the delivered credential, and only a settled challenge
- *   answers OK. A turn that exited 0 proves nothing on its own.
+ * - **Readiness is authenticated.** `attest` checks the current credential and runtime liveness
+ *   directly. The first work turn opens the conversation; readiness consumes no model turn.
  * - **Serialized.** A session runs one turn at a time. A wake that arrives while a turn runs is
  *   coalesced into one follow-up turn; a wake for a trigger queued or running is refused
  *   `SESSION_TURN_DUPLICATE`, and so is one for an envelope already settled, for an owner-message
@@ -275,8 +272,8 @@ export class ProvisionedSessionRuntime {
   #delivery: SessionCredentialDelivery | null = null;
   #route: SessionRelayRoute | null = null;
   readonly #held = new Map<string, HeldCredential>();
-  /** The incarnation and epoch each session last proved by an attestation; a failed one clears it. */
-  readonly #attested = new Map<string, { incarnation: string; credentialEpoch: number }>();
+  /** Conversations not opened by a work turn yet; readiness no longer opens them. */
+  readonly #newConversations = new Set<string>();
   readonly #lanes = new Map<string, TurnLane>();
 
   constructor(
@@ -307,18 +304,6 @@ export class ProvisionedSessionRuntime {
   }
 
   /**
-   * #246 C4 — whether a driven PRIMARY_CTO session may run work now: its last attestation, for its
-   * current incarnation and credential epoch, succeeded. READY is what was last written about the
-   * session; a failed attestation since then is newer than it, and no work turn runs past it.
-   */
-  #attestedNow(sessionId: string): boolean {
-    const attested = this.#attested.get(sessionId);
-    const session = this.ports.sessions.get(sessionId);
-    return attested !== undefined && session !== null &&
-      attested.incarnation === session.incarnation && attested.credentialEpoch === session.credentialEpoch;
-  }
-
-  /**
    * #246 C4 — whether a turn for `purpose` may run on this session now, read from current state and
    * never carried over from an earlier answer: `#turn` asks it immediately before the provider call,
    * after every awaited preparation; `wake` and `attest` ask it first, so a refusal costs nothing;
@@ -327,7 +312,7 @@ export class ProvisionedSessionRuntime {
    * A session with no driven-spawn record (a run's BOOTSTRAP_CTO) keeps the contract C1b shipped and
    * is answered yes. A driven PRIMARY_CTO's turn needs its record to be `DRIVEN` — the current
    * creation and actor, holding the role's ACTIVE binding — and a READY or DRAINING session; work
-   * also needs a current attestation. The one exception is `PENDING`: only an attestation of a new
+   * uses the held current credential. The one exception is `PENDING`: only readiness for a new
    * conversation, carrying the exact `SpawnAttestation` of the spawn that created this STARTING
    * session, may run on it. No work, no probe, and no other session or spawn.
    */
@@ -364,23 +349,7 @@ export class ProvisionedSessionRuntime {
     if (session.lifecycle !== SessionLifecycle.READY && session.lifecycle !== SessionLifecycle.DRAINING) {
       return refuse(ReasonCode.SESSION_NOT_READY, "the session is not READY");
     }
-    if (purpose === "work" && !this.#attestedNow(sessionId)) {
-      return refuse(ReasonCode.SESSION_NOT_READY, "the session has no current attestation; a stale READY runs no work");
-    }
     return allow(ReasonCode.OK, undefined);
-  }
-
-  /**
-   * #246 C4-R2 — takes back the attestation a failed attempt would have proved, and only that one:
-   * the stored attestation is cleared when it is for the attempt's own incarnation and credential
-   * epoch. One a newer epoch earned while this attempt was still out is left exactly as it is.
-   */
-  #withdrawAttestation(sessionId: string, attempt: { incarnation: string; credentialEpoch: number } | null): void {
-    const stored = this.#attested.get(sessionId);
-    if (!stored || !attempt) return;
-    if (stored.incarnation === attempt.incarnation && stored.credentialEpoch === attempt.credentialEpoch) {
-      this.#attested.delete(sessionId);
-    }
   }
 
   /** The daemon's launch channel and socket paths. Until both are attached no turn can run. */
@@ -423,15 +392,13 @@ export class ProvisionedSessionRuntime {
       });
     }
     this.#held.set(sessionId, { role, sessionSecret, credentialEpoch });
-    // A credential nobody has presented yet is not attested, whatever the last one was.
-    this.#attested.delete(sessionId);
     return allow(ReasonCode.OK, undefined);
   }
 
   /** Forgets a session's credential and the record of its triggers; a running turn finishes. */
   release(sessionId: string): void {
     this.#held.delete(sessionId);
-    this.#attested.delete(sessionId);
+    this.#newConversations.delete(sessionId);
     this.#lanes.delete(sessionId);
   }
 
@@ -442,68 +409,78 @@ export class ProvisionedSessionRuntime {
    */
   relinquish(sessionId: string, incarnation: string, credentialEpoch: number): void {
     if (this.#held.get(sessionId)?.credentialEpoch === credentialEpoch) this.#held.delete(sessionId);
-    this.#withdrawAttestation(sessionId, { incarnation, credentialEpoch });
+    if (this.ports.sessions.get(sessionId)?.incarnation === incarnation && !this.#held.has(sessionId)) {
+      this.#newConversations.delete(sessionId);
+    }
   }
 
-  /**
-   * Proves the session's runtime is reachable and holds its current credential: one turn of its
-   * own conversation whose relay presents a fresh challenge over an authenticated connection.
-   */
+  /** Authenticate the current credential and check runtime liveness without a model turn. */
   async attest(
     sessionId: string,
     conversation: ConversationStep,
     spawn: SpawnAttestation | null = null,
   ): Promise<Decision<void>> {
     return this.#serialized(sessionId, async () => {
-      // Refused before any turn: nothing was learned about the runtime, so an attestation it already
-      // has stands — a turn it may not run is no evidence against the one it ran.
       const eligible = this.turnEligibility(sessionId, "attestation", conversation, spawn);
       if (!eligible.allowed) return eligible;
-      // #246 C4-R2 — the incarnation and credential epoch this attempt proves, fixed before it awaits
-      // anything. Its outcome is written for exactly these and nothing newer: a late failure of an
-      // earlier epoch never takes back an attestation a later epoch has since earned.
-      const before = this.ports.sessions.get(sessionId);
-      const attempt = before ? { incarnation: before.incarnation, credentialEpoch: before.credentialEpoch } : null;
-      const challenge = this.ports.attestations.challenge(sessionId);
-      if (!challenge.allowed) return challenge as Decision<void>;
-      const nonce = challenge.value.nonce;
-      const turn = await this.#turn(sessionId, conversation, attestationPrompt(nonce), {
-        relay: true,
-        timeoutMs: this.options.attestTimeoutMs ?? 5 * 60_000,
-        purpose: "attestation",
-        spawn,
-      });
-      // The turn awaited; whatever made it eligible is read again before the answer counts.
-      const still = turn.allowed ? this.turnEligibility(sessionId, "attestation", conversation, spawn) : turn;
-      if (!still.allowed) {
-        this.#withdrawAttestation(sessionId, attempt);
-        this.ports.attestations.withdraw(sessionId, nonce);
-        return still as Decision<void>;
+      const session = this.ports.sessions.get(sessionId);
+      const held = this.#held.get(sessionId);
+      if (!session || !held || held.credentialEpoch !== session.credentialEpoch || !this.#delivery || !this.#route) {
+        return deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "no current authenticated runtime route for this session", { sessionId });
       }
-      const settled = this.ports.attestations.settle(sessionId, nonce);
-      // `settle` refuses a challenge whose epoch moved, so a settled attempt is the current one.
-      if (settled.allowed && attempt) {
-        this.#attested.set(sessionId, attempt);
-      } else {
-        this.#withdrawAttestation(sessionId, attempt);
+      const peer = { sessionId, sessionIncarnation: session.incarnation, sessionSecret: held.sessionSecret };
+      const live = await this.#runtimeLiveness(session, held.role, conversation === "resume");
+      if (!live.allowed) return live;
+      // Keep the credential fence across the liveness await.
+      const still = this.ports.attestations.attest(peer);
+      if (!still.allowed) return still;
+      if (this.#held.get(sessionId) !== held) {
+        return deny(ReasonCode.SESSION_CREDENTIAL_EPOCH_STALE, "runtime credential custody changed", { sessionId });
       }
-      return settled;
+      const current = this.turnEligibility(sessionId, "attestation", conversation, spawn);
+      if (!current.allowed) return current;
+      if (conversation === "new" || !this.ports.audit.byKind("SESSION_TURN").some((event) => event.sessionId === sessionId)) {
+        this.#newConversations.add(sessionId);
+      }
+      return allow(ReasonCode.OK, undefined);
     });
   }
 
-  /**
-   * Asks the session's own conversation to answer, continuing it, with no MCP server and no
-   * credential: the provider still has this conversation. Never readiness on its own.
-   */
+  /** Recovery checks runtime liveness directly; it never spends a model turn proving readiness. */
   async probe(sessionId: string): Promise<Decision<void>> {
     return this.#serialized(sessionId, async () => {
-      const turn = await this.#turn(sessionId, "resume", "Reply with the single word READY.", {
-        relay: false,
-        timeoutMs: this.options.probeTimeoutMs ?? 2 * 60_000,
-        purpose: "probe",
-      });
-      return turn.allowed ? allow(ReasonCode.OK, undefined) : (turn as Decision<void>);
+      const eligible = this.turnEligibility(sessionId, "probe");
+      if (!eligible.allowed) return eligible;
+      const session = this.ports.sessions.get(sessionId);
+      if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
+      const role = this.#held.get(sessionId)?.role ??
+        (this.drivenModeOf(sessionId) === "NONE" ? Role.BOOTSTRAP_CTO : Role.PRIMARY_CTO);
+      const live = await this.#runtimeLiveness(session, role, true);
+      return live;
     });
+  }
+
+  async #runtimeLiveness(session: SessionRecord, role: Role, resume: boolean): Promise<Decision<void>> {
+    const adapter = this.#adapterFor(session, role);
+    if (!adapter.allowed) return adapter as Decision<void>;
+    try {
+      if (await adapter.value.probeRuntime() === "UNAVAILABLE") {
+        return deny(ReasonCode.SESSION_NOT_READY, "the selected runtime is unavailable", { sessionId: session.sessionId });
+      }
+      const attempted = this.ports.audit.byKind("SESSION_TURN").some((event) => event.sessionId === session.sessionId);
+      const conversation = resume && attempted ? "resume" : "new";
+      if (await adapter.value.probeSession(handleFor(session), { conversation }) === "UNAVAILABLE") {
+        return deny(ReasonCode.SESSION_NOT_READY, "the provider no longer has this session", { sessionId: session.sessionId });
+      }
+      return allow(ReasonCode.OK, undefined);
+    } catch (error) {
+      return deny(ReasonCode.SESSION_NOT_READY, "the selected runtime liveness check failed", {
+        sessionId: session.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+        ...(error instanceof Error && error.name === "ProbeProcessGroupUnconfirmed" && "reap" in error
+          ? { processGroup: error.reap } : {}),
+      });
+    }
   }
 
   /**
@@ -800,6 +777,7 @@ export class ProvisionedSessionRuntime {
       return refused(wanted);
     }
     const text = typeof prompt === "string" ? prompt : prompt();
+    if (turn.purpose === "work" && this.#newConversations.delete(sessionId)) conversation = "new";
     let result: SessionTurnResult;
     try {
       result = await provider.runSessionTurn({
@@ -896,13 +874,6 @@ const handleFor = (session: SessionRecord): SessionHandle => ({
   pid: null,
   ...(session.workdir ? { workdir: session.workdir } : {}),
 });
-
-const attestationPrompt = (nonce: string): string =>
-  [
-    "Control-plane readiness check for this session.",
-    `Call the tool mcp__acp-cto__session_attest exactly once with the argument nonce set to "${nonce}".`,
-    "Do not call any other tool. After the tool answers, reply with the single word ATTESTED.",
-  ].join("\n");
 
 /** How many `plan_submit` calls one turn makes for one run before it stops correcting its PLAN. */
 export const PLAN_SUBMISSIONS_PER_TURN = 4;

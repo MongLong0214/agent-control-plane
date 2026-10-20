@@ -95,7 +95,7 @@ describe("capacity holds only near exhaustion", () => {
     expect(CAPACITY_DEFAULTS.criticalPercent).toBeLessThan(CAPACITY_DEFAULTS.conservePercent);
   });
 
-  it("admits the live reading that used to conserve, and still holds one inside the band", async () => {
+  it("admits the selected worker even inside the advisory conserve band", async () => {
     // Comparing 20 against the threshold would pass even against a gate that never reads
     // `conservePercent` and refuses solely on the dynamic reserve. So the allocation itself,
     // not the threshold value, is what this asserts.
@@ -106,7 +106,7 @@ describe("capacity holds only near exhaustion", () => {
     // The same demand against a window inside the band: the reserve still governs there, so this
     // case fails if the ladder is mistaken for permission to admit everything.
     const nearlyGone = await admitWorkerAt(CAPACITY_DEFAULTS.conservePercent);
-    expect(nearlyGone.allowed).toBe(false);
-    expect(nearlyGone.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    expect(nearlyGone.allowed).toBe(true);
+    expect(nearlyGone.reasonCode).toBe(ReasonCode.OK);
   });
 });
