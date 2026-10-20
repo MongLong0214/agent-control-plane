@@ -295,6 +295,11 @@ describe("a worker turn runs on the bound session", () => {
     expect(report.args.slice(0, 5)).toEqual(["exec", "-m", "gpt-6.1-sol", "--skip-git-repo-check", "-o"]);
     expect(report.args).toContain("-s");
     expect(report.args).toContain("workspace-write");
+    expect(report.args).toContain("sandbox_workspace_write.exclude_slash_tmp=true");
+    expect(report.args).toContain("sandbox_workspace_write.exclude_tmpdir_env_var=true");
+    expect(report.args).toContain("sandbox_workspace_write.network_access=false");
+    expect(report.args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(report.args[report.args.indexOf("--thread-source") + 1]).toBe(world.worker.externalSessionId);
     expect(report.stdin).toBe("");
     expect(report.cwd).toBe(realpathSync(world.repoPath));
     expect(gitSync(world.repoPath, ["rev-parse", "HEAD"])).not.toBe(gitSync(world.repoPath, ["rev-parse", "HEAD^"]));

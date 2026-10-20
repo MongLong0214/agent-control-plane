@@ -338,18 +338,24 @@ export class ContinuityKernel {
   /**
    * Providers from a fixed-runtime table that this role may be planned onto.
    *
-   * One entry is that provider. Several stay on the provider the running execution already
-   * names, so one listed provider is not swapped for another when coverage is lost. No such
-   * execution, or a provider outside the table, yields no candidate.
+   * One entry is that provider. Several keep the original entry — Claude, when it was the
+   * table's only WORKER runtime — unless the running execution's provider and model are a
+   * later entry. A provider string that merely shares a name with a later entry is not that
+   * runtime, and is not swapped onto it. No running execution yields no candidate.
    */
   private fixedCandidates(role: RequiredRole, fixed: readonly FixedRoleRuntime[]): readonly string[] {
     if (fixed.length === 1) return [fixed[0]!.provider];
     if (!role.taskId) return [];
-    const incumbent = this.db.get<{ provider: string }>(
-      `SELECT provider FROM task_executions WHERE task_id = ? AND status = 'RUNNING' ORDER BY started_at DESC LIMIT 1`,
+    const incumbent = this.db.get<{ provider: string; model: string }>(
+      `SELECT provider, model FROM task_executions WHERE task_id = ? AND status = 'RUNNING' ORDER BY started_at DESC LIMIT 1`,
       [role.taskId],
-    )?.provider;
-    return incumbent !== undefined && fixed.some((runtime) => runtime.provider === incumbent) ? [incumbent] : [];
+    );
+    if (!incumbent) return [];
+    const pinned = fixed.find(
+      (runtime, index) =>
+        index > 0 && runtime.provider === incumbent.provider && runtime.model === incumbent.model,
+    );
+    return [pinned?.provider ?? fixed[0]!.provider];
   }
 
   /** §15.3 — computed before any failover, never after. */
@@ -416,9 +422,10 @@ export class ContinuityKernel {
     for (const role of [...requiredRoles].sort((left, right) => Number(right.inFlight) - Number(left.inFlight))) {
       // #246 — a role with a fixed runtime is planned only onto a provider in that table.
       // BOOTSTRAP_CTO has Claude Opus. WORKER has Claude Opus or GPT 6.1 Sol (CEO decision
-      // 129edfa1; owner instruction of 2026-10-19) and stays on the provider its running execution
-      // already names. A provider outside the table is never a candidate, and one listed provider
-      // is not swapped for the other. When the pinned provider cannot cover the role, it is uncovered.
+      // 129edfa1; owner instruction of 2026-10-19). A running execution is pinned to a later
+      // entry only when its provider and model are that entry; a Claude worker stays on Claude,
+      // the candidate the single-entry table used. One listed runtime is not swapped for the
+      // other. When the pinned runtime cannot cover the role, it is uncovered.
       const fixed = fixedRuntimes(role.role);
       const preferred = fixed.length === 0
         ? candidatesFor(role.capability)

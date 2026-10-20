@@ -557,7 +557,8 @@ export class RepairService {
         const incarnation = execution
           ? this.db.get<{ incarnation: string }>(`SELECT incarnation FROM sessions WHERE session_id = ?`, [execution.worker_session_id])?.incarnation
           : undefined;
-        // The provider CLI of every worker turn carries its session as `--session-id <id>`.
+        // Claude carries the session as `--session-id <id>`. A Codex worker carries the same id as
+        // the argv element after `--thread-source`. Either way it is one whole argument.
         const workerSessionId = incarnation?.split("#", 1)[0] ?? "";
         const scan = workerSessionId === "" ? { carriers: [], error: "the worker session's id is unknown" } : processesCarrying(workerSessionId);
         const confirmation = request.parameters["confirm"] ?? null;

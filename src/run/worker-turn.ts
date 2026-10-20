@@ -2017,9 +2017,9 @@ export class WorkerTurnRunner {
   /**
    * Whether a live pid is, right now, the process this execution launched (#1070) — asked immediately
    * before any kill. The OS start time it reports must be the recorded one, and its command line must
-   * carry this execution's worker session as `--session-id <id>`, as every provider invocation the
-   * runner makes does. A pid whose start time or command line cannot be read is not confirmed, and
-   * nothing that is not confirmed is killed: it stays outstanding and blocks its task instead.
+   * carry this execution's worker session as the argv element after `--session-id` (Claude) or
+   * `--thread-source` (Codex). A pid whose start time or command line cannot be read is not confirmed,
+   * and nothing that is not confirmed is killed: it stays outstanding and blocks its task instead.
    */
   private ownershipOf(executionId: string, pid: number, startedAt: string | null): ProcessOwnership {
     const now = this.#processes.alive(pid) ? this.#processes.startToken(pid) : null;
@@ -2033,7 +2033,8 @@ export class WorkerTurnRunner {
     const argv = this.#processes.argv(pid);
     if (expected === "" || argv === null) return "COMMAND_LINE_NOT_CONFIRMED";
     for (let index = 0; index + 1 < argv.length; index += 1) {
-      if (argv[index] === "--session-id" && argv[index + 1] === expected) return "OWNED";
+      const flag = argv[index];
+      if ((flag === "--session-id" || flag === "--thread-source") && argv[index + 1] === expected) return "OWNED";
     }
     return "COMMAND_LINE_NOT_CONFIRMED";
   }

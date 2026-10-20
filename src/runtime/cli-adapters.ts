@@ -766,6 +766,21 @@ const productionRunCli = async (
     /** #512 — aborting kills the child's process group; an abort before the spawn spawns nothing. */
     signal?: AbortSignal;
     /**
+     * The configured Codex account. Set on the child as `CODEX_HOME` for the worker login probe
+     * and the worker execution, the same directory `CodexUsageCollector` reads. Unset leaves the
+     * constructor's account selection alone (Claude, Grok, and the packet reviewer, which names
+     * its home on `reviewerEnvironment`).
+     */
+    codexHome?: string;
+    /**
+     * Whose sandbox confines this child. Unset means ACP's outer seatbelt profile, which is what
+     * every invocation except a GPT worker turn uses. `"codex-workspace-write"` is set only by
+     * that turn: macOS rejects a nested `sandbox-exec`, so the outer profile is not applied and
+     * Codex's own `-s workspace-write` is the confinement. An isolated reviewer never takes this
+     * path; a packet profile is not dropped because a caller also named it.
+     */
+    sandbox?: "outer-profile" | "codex-workspace-write";
+    /**
      * #1077 — the invocation intends no process to outlive it. It runs under `PROBE_HOLDER_SCRIPT`,
      * and once the CLI has exited, timed out or been aborted, its group is signalled only while the
      * holder provably still holds it (`endHeldGroup`); otherwise nothing is signalled and the result
@@ -790,7 +805,11 @@ const productionRunCli = async (
   processGroup?: ProcessGroupReap;
 }> => {
   const scratch = acpScratchDir("acp-runtime-");
-  if (!existsSync("/usr/bin/sandbox-exec")) {
+  // A GPT worker turn is the one caller that sets this, and it is not an isolated review.
+  // Every other invocation keeps the outer profile, including when this flag is combined
+  // with a packet isolation request.
+  const codexWorkspaceWrite = options.sandbox === "codex-workspace-write" && options.isolation === undefined;
+  if (!codexWorkspaceWrite && !existsSync("/usr/bin/sandbox-exec")) {
     rmSync(scratch, { recursive: true, force: true });
     return {
       stdout: "",
@@ -828,7 +847,12 @@ const productionRunCli = async (
 
     const environment: NodeJS.ProcessEnv = isolated
       ? { ...(options.reviewerEnvironment ?? reviewerEnvironment(workdir, options.reviewerConfigDirectory)) }
-      : runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch), options.providerCredentialDir);
+      : runtimeEnvironment(
+          options.environmentAllowlist ?? [],
+          realpathSync(scratch),
+          options.providerCredentialDir,
+          options.codexHome,
+        );
     if (egress) {
       // The child receives only the loopback proxy route. Do not let a caller-supplied
       // environment retain an alternate proxy, no-proxy escape hatch, or credentials.
@@ -928,18 +952,24 @@ const productionRunCli = async (
       const holding = options.reapProcessGroup === true;
       try {
         if (options.reviewerPrivateHome) assertReviewerCodexHome(options.reviewerPrivateHome);
-        child = spawn("/usr/bin/sandbox-exec", reviewerSandboxArgs(
-          profile,
-          holding ? "/bin/ksh" : file,
-          holding ? ["-c", PROBE_HOLDER_SCRIPT, "acp-group-holder", ...holderRestoredEnvironment(environment), file, ...args] : args,
-          egress ?? undefined,
-          composedProfilePath,
-        ), {
-          cwd: workdir,
-          env: environment,
-          detached: true,
-          stdio: holding ? ["pipe", "pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
-        });
+        const command = holding ? "/bin/ksh" : file;
+        const commandArgs = holding
+          ? ["-c", PROBE_HOLDER_SCRIPT, "acp-group-holder", ...holderRestoredEnvironment(environment), file, ...args]
+          : [...args];
+        // The worker turn's child is Codex itself (or the group holder), not sandbox-exec.
+        // Codex then applies `-s workspace-write` to the commands it runs.
+        child = spawn(
+          codexWorkspaceWrite ? command : "/usr/bin/sandbox-exec",
+          codexWorkspaceWrite
+            ? commandArgs
+            : reviewerSandboxArgs(profile, command, commandArgs, egress ?? undefined, composedProfilePath),
+          {
+            cwd: workdir,
+            env: environment,
+            detached: true,
+            stdio: holding ? ["pipe", "pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
+          },
+        );
       } catch (error) {
         resolve({ stdout: "", stderr: error instanceof Error ? error.message : String(error), exitCode: null, timedOut: false, egressLost: false });
         return;
@@ -1786,6 +1816,7 @@ export const runtimeEnvironment = (
   allowlist: readonly string[],
   scratch: string,
   providerCredentialDir?: string,
+  codexHome?: string,
 ): NodeJS.ProcessEnv => {
   const environment: NodeJS.ProcessEnv = {
     PATH: agentPath(),
@@ -1811,6 +1842,9 @@ export const runtimeEnvironment = (
     const value = process.env[name];
     if (value !== undefined && !looksLikeCredential(value)) environment[name] = value;
   }
+  // The configured account wins over an allowlisted inherited CODEX_HOME. A worker probe and a
+  // worker execution pass the same directory the capacity collector reads.
+  if (codexHome !== undefined) environment["CODEX_HOME"] = codexHome;
   return environment;
 };
 
@@ -2967,6 +3001,33 @@ export class CodexCliAdapter implements ProviderAdapter {
     this.#workerSessions.delete(handle.externalSessionId);
   }
 
+  /** The account the capacity collector reads, named both on the child and on the allowlist a probe reconstructs. */
+  private codexAccountOptions(): { environmentAllowlist: readonly string[]; codexHome: string } {
+    return {
+      environmentAllowlist: this.#environmentAllowlist.includes("CODEX_HOME")
+        ? this.#environmentAllowlist
+        : [...this.#environmentAllowlist, "CODEX_HOME"],
+      codexHome: this.#codexHome,
+    };
+  }
+
+  /**
+   * Publish that account as `CODEX_HOME` for one worker probe or worker execution.
+   * `runtimeEnvironment` copies an allowlisted value from the process environment, so a caller that
+   * rebuilds the child env without the explicit `codexHome` argument still sees the configured
+   * account. The explicit argument is what the spawned child receives.
+   */
+  private async runWithCodexHome<T>(effect: () => Promise<T>): Promise<T> {
+    const previous = process.env["CODEX_HOME"];
+    process.env["CODEX_HOME"] = this.#codexHome;
+    try {
+      return await effect();
+    } finally {
+      if (previous === undefined) delete process.env["CODEX_HOME"];
+      else process.env["CODEX_HOME"] = previous;
+    }
+  }
+
   async invoke(request: InvocationRequest): Promise<InvocationResult> {
     const started = Date.now();
     if (request.isolation) {
@@ -2980,17 +3041,31 @@ export class CodexCliAdapter implements ProviderAdapter {
 
     // `--ignore-user-config` keeps the operator's MCP servers and hooks out of the turn. On this
     // host those servers write under the checkout's `.git`, which the turn then refuses. Auth
-    // still comes from CODEX_HOME. The model, the sandbox and `-o` are unchanged.
+    // still comes from CODEX_HOME. The model and `-o` are unchanged.
     const args = ["exec", "-m", model, "--skip-git-repo-check", "-o", lastMessage, "--ignore-user-config"];
     if (request.effort) args.push("-c", `model_reasoning_effort="${request.effort}"`);
     args.push("-s", request.readOnly ? "read-only" : "workspace-write");
-    if (!request.readOnly) {
-      // macOS rejects a nested sandbox-exec, so Codex cannot arm its own workspace-write
-      // sandbox inside this profile and its file tool fails closed. This flag is the CLI's
-      // switch for a run that is already sandboxed. The profile above still denies every
-      // write outside the guard target, the `-o` scratch and the account home.
-      args.push("--dangerously-bypass-approvals-and-sandbox");
+    // Only a GPT worker turn drops the outer profile. Codex `workspace-write` otherwise also
+    // opens /tmp and $TMPDIR, and network follows `[sandbox_workspace_write]`. These three keys
+    // are that table (codex 0.163.0): the checkout is the only writable root, and network is off.
+    // Login probes, read-only exec, and a writable exec that forgot `onSpawn` do not get them.
+    // `-o` stays in ACP scratch, outside the checkout. The parent Codex process writes that file
+    // after the turn; the path is not a workspace-write root and is not passed with `--add-dir`,
+    // so a sandboxed shell cannot write it. The ACP parent reads the file after the child exits.
+    const gptWorkerTurn = request.readOnly === false
+      && request.externalSessionId !== undefined
+      && request.onSpawn !== undefined;
+    if (gptWorkerTurn) {
+      args.push(
+        "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+        "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "-c", "sandbox_workspace_write.network_access=false",
+      );
     }
+    // Codex rejects `--session-id`. The worker session is the argv element after `--thread-source`,
+    // a free classification string the CLI accepts. Ownership and the orphan scan both read that
+    // whole element. Claude still passes `--session-id`.
+    if (request.externalSessionId !== undefined) args.push("--thread-source", request.externalSessionId);
     if (request.responseSchema) {
       const schemaFile = join(scratch, "schema.json");
       writeFileSync(schemaFile, JSON.stringify(request.responseSchema));
@@ -3004,21 +3079,23 @@ export class CodexCliAdapter implements ProviderAdapter {
     // A worker turn names its child and ends that child's group. Any other one-shot exec keeps
     // the previous launch: no spawn callback and no reap.
     const tracked = request.onSpawn !== undefined || request.signal !== undefined;
-    const execute = (writablePaths: readonly string[], cwd = request.workdir) => runCli(this.#binary, [...args, prompt], {
+    // Only `gptWorkerTurn` drops the outer profile. A writable exec that forgot `onSpawn` stays
+    // inside it and, with the bypass gone, fails closed rather than running unconfined.
+    const execute = (writablePaths: readonly string[], cwd = request.workdir) => this.runWithCodexHome(() => runCli(this.#binary, [...args, prompt], {
       cwd,
       timeoutMs: request.timeoutMs,
-      environmentAllowlist: this.#environmentAllowlist,
+      ...this.codexAccountOptions(),
       denyReadPaths: this.#denyReadPaths,
       providerCredentialDir: this.#providerCredentialDir,
-      // The runtime profile re-opens only its own scratch and the guard's target. `-o` lives in
-      // this directory, under the read-denied state root, so the child cannot write it unless
-      // this one directory is named. Codex also reads and writes its account home (the same
-      // directory a reviewer re-opens). Nothing above either directory is re-opened, and the
-      // checkout write stays the guard's target.
+      // Outside a GPT worker turn these paths are what the outer profile re-opens. `-o` lives in
+      // the scratch, under the read-denied state root. A GPT worker turn does not apply that
+      // profile: Codex's own `-s workspace-write` confines the turn, because a nested sandbox-exec
+      // fails closed. The broker still authorises the checkout before launch.
       writablePaths: [...writablePaths, ...this.codexWritableRoots(scratch)],
       readablePaths: { subtrees: this.codexWritableRoots(scratch) },
+      ...(gptWorkerTurn ? { sandbox: "codex-workspace-write" as const } : {}),
       ...(tracked ? { onSpawn: request.onSpawn, signal: request.signal, reapProcessGroup: true as const } : {}),
-    });
+    }));
     let result: Awaited<ReturnType<typeof runCli>>;
     if (request.readOnly) {
       result = await execute([]);
@@ -3119,18 +3196,18 @@ export class CodexCliAdapter implements ProviderAdapter {
       return "UNAVAILABLE";
     }
     const accountHome = existsSync(this.#codexHome) ? realpathSync(this.#codexHome) : undefined;
-    const result = await runCli(this.#binary, ["login", "status"], {
+    const result = await this.runWithCodexHome(() => runCli(this.#binary, ["login", "status"], {
       // The session workdir is the managed runtime root under the read-denied state root. The
       // probe's cwd stays the scratch `runCli` allocates; the workdir is checked by stat above.
       cwd: undefined,
       timeoutMs: CODEX_WORKER_PROBE_TIMEOUT_MS,
-      environmentAllowlist: this.#environmentAllowlist,
+      ...this.codexAccountOptions(),
       denyReadPaths: this.#denyReadPaths,
       ...(accountHome
         ? { writablePaths: [accountHome], readablePaths: { subtrees: [accountHome] } }
         : {}),
       reapProcessGroup: true,
-    });
+    }));
     if (result.processGroup && !result.processGroup.reaped) throw new ProbeProcessGroupUnconfirmed(result.processGroup);
     if (result.exitCode !== 0 || result.timedOut || !result.processGroup) return "UNAVAILABLE";
     return "HEALTHY";
