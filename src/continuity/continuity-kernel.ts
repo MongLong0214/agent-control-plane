@@ -1810,11 +1810,8 @@ export const readCanonicalCtoRestoreTarget = (db: Db, roleKey: string): Canonica
   if (!canonical) return { kind: "NOT_APPLICABLE" };
   if (canonical.target_locator_digest !== sha256(canonical.target_locator)) return { kind: "NOT_APPLICABLE" };
   if (!isContinuityRevocationReason(latest.revoked_reason)) return { kind: "NOT_APPLICABLE" };
-  if (latest.revoked_reason === CONTINUITY_COVERAGE_REVOCATION_REASON) {
-    return unmet(CanonicalCtoRestoreCondition.REVOKE_REASON_UNDISTINGUISHED, ReasonCode.BINDING_REVOKED,
-      "the revocation predates the capacity/runtime split and is never read as capacity");
-  }
-  if (latest.revoked_reason !== CONTINUITY_CAPACITY_EXHAUSTED_REVOCATION_REASON) {
+  if (latest.revoked_reason !== CONTINUITY_CAPACITY_EXHAUSTED_REVOCATION_REASON &&
+      latest.revoked_reason !== CONTINUITY_COVERAGE_REVOCATION_REASON) {
     return unmet(CanonicalCtoRestoreCondition.REVOKE_NOT_CAPACITY_ONLY, ReasonCode.BINDING_REVOKED,
       "the newest revocation was not for capacity alone");
   }

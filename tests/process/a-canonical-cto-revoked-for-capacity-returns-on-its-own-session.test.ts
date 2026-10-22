@@ -478,6 +478,9 @@ describe("#1106: a canonical CTO revoked only for capacity returns on its own se
       expect(f.cp.audit.byKind(CANONICAL_CTO_CAPACITY_RESTORED)).toHaveLength(0);
       if (holder === null) {
         expect(f.cp.bindings.active(CTO)).toBeNull();
+        const findings = (await f.cp.doctor.run("system")).findings;
+        expect(findings.filter((finding) => finding.scope === `project:${PROJECT}` &&
+          /^(?:CANONICAL_CTO_RESTORE_|CTO_MISSING_)/.test(finding.code))).toEqual([]);
       } else {
         expect(f.cp.bindings.active(CTO)?.sessionId).toBe(holder);
       }
@@ -544,13 +547,22 @@ describe("#1106: a canonical CTO revoked only for capacity returns on its own se
     expect(f.refusals()).toEqual([]);
   });
 
+  it("automatically restores the pre-split coverage revocation on its unchanged live session", async () => {
+    const f = await started();
+    expect(f.cp.bindings.revoke(CTO, CONTINUITY_COVERAGE_REVOCATION_REASON).allowed).toBe(true);
+    f.clock.advance(60_000);
+    await f.daemon.reconcileContinuity("legacy runtime is still live");
+    expect(f.cp.bindings.active(CTO)).toMatchObject({ sessionId: f.sessionId, bindingGeneration: 2 });
+    expect(f.cp.audit.byKind(CANONICAL_CTO_CAPACITY_RESTORED)).toHaveLength(1);
+    expect(f.cp.db.get<{ revoked_reason: string }>(`SELECT revoked_reason FROM assignments WHERE role_key = ? AND binding_generation = 1`, [CTO])?.revoked_reason)
+      .toBe(CONTINUITY_COVERAGE_REVOCATION_REASON);
+  });
+
   // Keyed by name and resolved inside the case, so the file still loads at a base without the split.
   const nonCapacityRevocations: Record<string, () => [reason: string, condition: string]> = {
     "a lost runtime": () => [CONTINUITY_RUNTIME_UNAVAILABLE_REVOCATION_REASON, CanonicalCtoRestoreCondition.REVOKE_NOT_CAPACITY_ONLY],
     "capacity and a lost runtime at once": () =>
       [CONTINUITY_CAPACITY_AND_RUNTIME_REVOCATION_REASON, CanonicalCtoRestoreCondition.REVOKE_NOT_CAPACITY_ONLY],
-    "the reason written before the split": () =>
-      [CONTINUITY_COVERAGE_REVOCATION_REASON, CanonicalCtoRestoreCondition.REVOKE_REASON_UNDISTINGUISHED],
   };
   it.each(Object.keys(nonCapacityRevocations))(
     "refuses a revocation for %s, and the doctor names the role and why", async (label) => {

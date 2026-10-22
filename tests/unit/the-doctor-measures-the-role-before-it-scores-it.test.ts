@@ -1,3 +1,4 @@
+import { writeFileSync } from "node:fs";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
 
@@ -127,7 +128,7 @@ describe("the doctor measures the role before it scores it", () => {
    * The scope carries the role because two roles on one provider are two quotas, and reporting
    * them under one `provider:claude` scope would collapse them into a single finding.
    */
-  it("reports a role-scoped provider that is running out of quota", async () => {
+  it.each(["missing", "ancient"])("reports role quota with a %s provider mirror", async (mirror) => {
     const { cp, clock, gpt, claude } = coldPlane();
     try {
       gpt.setCapacity(healthy("gpt", clock));
@@ -137,13 +138,39 @@ describe("the doctor measures the role before it scores it", () => {
       });
       cp.providers.registerForRole(claude, Role.CEO);
 
+      if (mirror === "ancient") writeFileSync(join(cp.config.capacityDir, "claude.json"), JSON.stringify({ observedAt: "2020-01-01T00:00:00Z" }));
       const report = await cp.doctor.run("system");
+      expect(report.findings.some((f) => f.code.startsWith("CAPACITY_SENSOR_FILE_"))).toBe(false);
       const low = report.findings.filter((finding) => finding.code === "CAPACITY_LOW");
 
       expect(low.map((finding) => finding.scope)).toContain("provider:claude:CEO");
     } finally {
       cp.db.close();
     }
+  });
+
+  it("reports unknown coverage when no capacity reading exists", async () => {
+    const { cp } = coldPlane();
+    try {
+      vi.spyOn(cp.capacity, "refresh").mockResolvedValue([]);
+      vi.spyOn(cp.continuity, "refreshRoleScopedCapacity").mockResolvedValue([]);
+      const report = await cp.doctor.run("capacity");
+      expect(report.findings).toContainEqual(expect.objectContaining({
+        code: "ROLE_COVERAGE_NOT_MEASURED", severity: "WARN",
+      }));
+      expect(report.status).toBe("DEGRADED");
+    } finally { vi.restoreAllMocks(); cp.db.close(); }
+  });
+
+  it("keeps real role collector failures visible", async () => {
+    const { cp, clock, gpt, claude } = coldPlane();
+    try {
+      gpt.setCapacity(healthy("gpt", clock));
+      claude.setCapacity({ ...healthy("claude", clock), sensorHealth: "ERROR", error: "collector failed", buckets: [] });
+      cp.providers.registerForRole(claude, Role.CEO);
+      const report = await cp.doctor.run("capacity");
+      expect(report.findings).toContainEqual(expect.objectContaining({ code: "CAPACITY_SENSOR_FAILED", scope: "provider:claude:CEO" }));
+    } finally { cp.db.close(); }
   });
 
   /**

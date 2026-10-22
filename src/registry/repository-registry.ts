@@ -8,8 +8,9 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import { bootstrapReservationsHolding } from "../bootstrap/bootstrap-applications.ts";
 import type { Db } from "../db/database.ts";
-import { isClean, remoteUrl, toplevel, tryRevParse } from "../git/git.ts";
+import { currentBranch, isClean, mergeBase, remoteUrl, toplevel, tryRevParse } from "../git/git.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
+import type { ProjectRegistry } from "./project-registry.ts";
 
 export interface RepositoryRecord {
   repositoryId: string;
@@ -117,6 +118,7 @@ export class RepositoryRegistry {
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
+    private readonly projects: ProjectRegistry,
   ) {}
 
   async register(input: {
@@ -313,10 +315,42 @@ export class RepositoryRegistry {
     return allow(ReasonCode.OK, this.byIdentity(identity)!);
   }
 
-  /** Re-reads the checkout and records its verdict without advancing the accepted head. */
+  /** Accept clean default-branch descendants; all other observations retain the baseline. */
   async observe(repositoryId: string): Promise<RepositoryRecord | null> {
-    const inspection = await this.inspect(repositoryId);
-    if (!inspection) return null;
+    const record = this.byId(repositoryId);
+    if (!record) return null;
+    let inspection: RepositoryInspection;
+    try {
+      inspection = (await this.inspect(repositoryId))!;
+      const manifest = record.projectId ? this.projects.activeManifest(record.projectId) : null;
+      const defaultBranch = manifest?.manifest.branchProfile.defaultBranch;
+      const branch = defaultBranch && inspection.observedHead ? await currentBranch(record.checkoutPath) : null;
+      const onDefaultBranch = defaultBranch !== undefined && branch !== "HEAD" && branch === defaultBranch;
+      if (defaultBranch && inspection.observedHead && !onDefaultBranch) inspection.driftState = "DRIFTED";
+      // An unchanged head needs no acceptance or ancestry probe; only its observed verdict changes.
+      if (onDefaultBranch && inspection.clean && inspection.observedHead === record.lastObservedHead) {
+        inspection.driftState = "IN_SYNC";
+      }
+      if (record.registration === "REGISTERED" && onDefaultBranch && inspection.clean &&
+          inspection.observedHead && inspection.observedHead !== record.lastObservedHead &&
+          record.lastObservedHead &&
+          await mergeBase(record.checkoutPath, record.lastObservedHead, inspection.observedHead) === record.lastObservedHead) {
+        // Git probes are separate observations. Recheck the local checkout before accepting it,
+        // and never substitute a remote merge SHA for a head actually present here.
+        if (await currentBranch(record.checkoutPath) === defaultBranch &&
+            await isClean(record.checkoutPath) &&
+            await tryRevParse(record.checkoutPath, "HEAD") === inspection.observedHead &&
+            this.byId(repositoryId)?.lastObservedHead === record.lastObservedHead &&
+            this.projects.get(record.projectId!)?.activeManifestDigest === manifest?.digest) {
+          this.acknowledgeHead(repositoryId, inspection.observedHead);
+          return this.byId(repositoryId);
+        }
+      }
+    } catch {
+      this.db.run(`UPDATE repositories SET last_observed_at = ?, drift_state = 'UNKNOWN' WHERE repository_id = ?`,
+        [this.clock.nowIso(), repositoryId]);
+      return this.byId(repositoryId);
+    }
 
     this.db.run(
       `UPDATE repositories SET last_observed_at = ?, drift_state = ?
@@ -354,7 +388,7 @@ export class RepositoryRegistry {
 
   /**
    * Read-only, synchronous diagnostic view used by Doctor. A passive probe must never
-   * accept a new baseline: only `acknowledgeHead` records owner-authorised acceptance.
+   * accept a new baseline: maintenance calls `observe` to accept safe descendants.
    */
   observed(identity: string): {
     baselineHead: string | null;

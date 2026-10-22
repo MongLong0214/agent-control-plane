@@ -505,7 +505,7 @@ export class ControlPlane {
       this.#bootstrapManifestAuthority = this.guard.claimBootstrapManifestAuthority();
 
       this.projects = new ProjectRegistry(this.db, this.clock, this.audit, this.guard);
-      this.repositories = new RepositoryRegistry(this.db, this.clock, this.audit);
+      this.repositories = new RepositoryRegistry(this.db, this.clock, this.audit, this.projects);
       this.sessions = new SessionRegistry(this.db, this.clock, this.audit);
       this.bindings = new BindingRegistry(this.db, this.clock, this.audit, this.sessions, this.outbox);
       this.actors = new ConversationalActorRegistry(this.db, this.clock);
@@ -671,10 +671,6 @@ export class ControlPlane {
         this.db, this.clock, this.audit, this.projects, this.repositories, this.sessions,
         this.bindings, this.runs, this.tasks, this.claims, this.capacity, this.providers, this.continuity,
         this.outbox, this.github, this.worktrees, {
-          directory: config.capacityDir,
-          freshnessMs: config.capacity?.freshnessMs ?? 5 * 60 * 1000,
-          maxClockSkewMs: config.capacity?.maxClockSkewMs ?? 60_000,
-        }, {
           databasePath: config.databasePath,
           worktreeRoot: config.worktreeRoot,
           secretsDir: config.secretsDir,

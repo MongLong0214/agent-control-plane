@@ -12,7 +12,6 @@ import {
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
-import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role } from "../../src/domain/types.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import {
@@ -1689,7 +1688,7 @@ setInterval(() => {}, 1_000);
     // merely defining a collector elsewhere is not enough to satisfy P0-11.
   });
 
-  it("#954 doctor checks the shared sensor file for a role-scoped production provider", async () => {
+  it("doctor reads role-scoped telemetry without requiring a shared sensor mirror", async () => {
     const root = tempDir("acp-role-scoped-doctor-");
     const adapter = (provider: string): ProviderAdapter => ({
       provider,
@@ -1722,10 +1721,8 @@ setInterval(() => {}, 1_000);
     try {
       cp.providers.registerForRole(adapter("claude"), Role.CEO);
       const report = await cp.doctor.run("capacity");
-      expect(report.findings).toContainEqual(expect.objectContaining({
-        code: ReasonCode.CAPACITY_SENSOR_FILE_MISSING,
-        scope: "provider:claude",
-      }));
+      expect(report.findings.some((finding) => finding.code.startsWith("CAPACITY_SENSOR_FILE_"))).toBe(false);
+      expect(cp.capacity.currentForRole("claude", Role.CEO)).not.toBeNull();
     } finally {
       cp.close();
     }

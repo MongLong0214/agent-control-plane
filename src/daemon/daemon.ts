@@ -1,5 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
@@ -85,6 +84,7 @@ import {
   type FinalizationResult,
 } from "./finalizer.ts";
 import {
+  probeSessionLiveness,
   recoverDeadCanonicalBinding,
   parseDeadBindingRecoveryRequest,
   type DeadBindingRecoveryReceipt,
@@ -1662,20 +1662,31 @@ export class Daemon {
     );
   }
 
+  /** Settle only confirmed process death, preserving session and binding history. */
+  private settleDeadSessions(): string[] {
+    const settled: string[] = [];
+    for (const session of this.cp.sessions.live()) {
+      if (probeSessionLiveness(session.osPid, session.osProcessStartedAt) !== "DEAD") continue;
+      const result = this.cp.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "session process is dead");
+      if (result.allowed) settled.push(session.sessionId);
+    }
+    return settled;
+  }
+
+  private async observeRepositories(): Promise<void> {
+    for (const repository of this.cp.repositories.list()) {
+      await this.cp.repositories.observe(repository.repositoryId);
+    }
+  }
+
   /** §34.5 — the documented restart sequence, in order. */
   async reconcile(): Promise<ReconcileReport> {
     const expiredClaims = this.cp.claims.expireOverdue();
     const expiredMessages = this.cp.outbox.expireOverdue();
     const reclaimedFinalizationAttempts = this.#finalizer.reclaimExpiredAttempts();
 
-    // Reconcile sessions against real processes before anything trusts a binding.
-    const sessionsMarkedError: string[] = [];
-    for (const session of this.cp.sessions.live()) {
-      if (session.osPid && !isAlive(session.osPid)) {
-        this.cp.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "process gone after restart");
-        sessionsMarkedError.push(session.sessionId);
-      }
-    }
+    const sessionsMarkedError = this.settleDeadSessions();
+    await this.observeRepositories();
 
     // #512 — a worker turn this control plane launched is never re-invoked. Its recorded process is
     // killed only when pid, OS start time and ownership all match; otherwise nothing is killed and
@@ -2917,15 +2928,21 @@ export class Daemon {
     );
     assertDoctorFreshnessOrdering(capacityRefreshMs, this.options.doctorFreshnessMs ?? DEFAULT_DOCTOR_FRESHNESS_MS);
 
+    let watchdogRunning = false;
     const watchdog = setInterval(() => {
-      void this.runPeriodic("watchdog", async () => {
-        const tick = await this.cp.watchdog.tick();
-        // This is a targeted recovery sweep, not a second workflow engine: the durable
-        // finalization lease and GitHub receipts remain the sole source of work. It retries
-        // an interrupted callback without requiring a daemon restart.
-        const finalized = await this.resumeApprovedRuns();
-        if (tick.overdue.length > 0 || finalized.length > 0) this.writeHealth(null);
-      });
+      if (!watchdogRunning) {
+        watchdogRunning = true;
+        void this.runPeriodic("watchdog", async () => {
+          this.settleDeadSessions();
+          await this.observeRepositories();
+          const tick = await this.cp.watchdog.tick();
+          // This is a targeted recovery sweep, not a second workflow engine: the durable
+          // finalization lease and GitHub receipts remain the sole source of work. It retries
+          // an interrupted callback without requiring a daemon restart.
+          const finalized = await this.resumeApprovedRuns();
+          if (tick.overdue.length > 0 || finalized.length > 0) this.writeHealth(null);
+        }).finally(() => { watchdogRunning = false; });
+      }
       // A failing reclaim backs off on its own and does not cost the watchdog its tick.
       void this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
       // A bootstrap owner that acknowledged its RUN_DISPATCH and planned nothing, woken once per dispatch;
@@ -3075,20 +3092,7 @@ export class Daemon {
   }
 
   private async refreshCapacitySensorsUnbounded(): Promise<void> {
-    const directory = this.cp.config.capacityDir;
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    chmodSync(directory, 0o700);
-
-    // The mirror must be a by-product of the monitor's persisted reading, not a parallel
-    // probe. Otherwise a periodic collector ERROR could be written to disk while an older
-    // operator observation remained routable in the database.
-    const readings = await this.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT);
-    for (const reading of readings) {
-      const file = capacitySensorFile(directory, reading.provider);
-      const temporary = join(directory, `.${reading.provider}.${process.pid}.${randomUUID()}.json`);
-      writeFileSync(temporary, JSON.stringify(reading, null, 2), { mode: 0o600 });
-      renameSync(temporary, file);
-    }
+    await this.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT);
   }
 
   /**
@@ -3765,13 +3769,6 @@ const isAlive = (pid: number): boolean => {
   } catch {
     return false;
   }
-};
-
-const capacitySensorFile = (directory: string, provider: string): string => {
-  if (!/^[A-Za-z0-9_-]+$/.test(provider)) {
-    throw new Error(`unsafe provider id for capacity sensor: ${provider}`);
-  }
-  return join(directory, `${provider}.json`);
 };
 
 const parseAuthenticatedOperatorPeer = (

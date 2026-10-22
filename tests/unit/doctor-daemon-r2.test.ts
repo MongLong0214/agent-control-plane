@@ -1,4 +1,5 @@
-import { readFileSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { resolveCeoBuzzIdentity } from "../../src/session/ceo-buzz-identity.ts";
+import { existsSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -215,6 +216,10 @@ describe("round 2 doctor regressions", () => {
     expect(first.findings.map((finding) => finding.code)).toContain("REPOSITORY_DRIFT");
     expect(second.findings.map((finding) => finding.code)).toContain("REPOSITORY_DRIFT");
     expect(harness.cp.repositories.list()[0]!.lastObservedHead).toBe(baseline.lastObservedHead);
+    await new Daemon(harness.cp, { stateDir: tempDir("acp-observe-") }).reconcile();
+    const after = await harness.cp.doctor.run("system");
+    expect(after.findings.map((finding) => finding.code)).not.toContain("REPOSITORY_DRIFT");
+    expect(harness.cp.repositories.list()[0]!.lastObservedHead).not.toBe(baseline.lastObservedHead);
   });
 
   it("#112/#209: an unbound session cannot create a RUNNING receipt", async () => {
@@ -364,6 +369,129 @@ describe("round 2 daemon regressions", () => {
     expect(harness.cp.outbox.listByRun(run.runId)).toHaveLength(0);
   });
 
+  it("periodic sweep settles dead CEO gen13 and preserves gen14 Buzz inheritance", async () => {
+    const { harness } = await makeDaemonStartHealthy();
+    let old = harness.cp.bindings.active("CEO")!.sessionId;
+    for (let generation = 1; generation < 13; generation++) {
+      expect(harness.cp.bindings.revoke("CEO", "generation replaced").allowed).toBe(true);
+      old = bindCeo(harness);
+    }
+    harness.cp.sessions.setPid(old, process.pid);
+    const actor = "a".repeat(64);
+    harness.cp.db.run(`UPDATE sessions SET buzz_actor_id = ? WHERE session_id = ?`, [actor, old]);
+    expect(harness.cp.bindings.revoke("CEO", "generation replaced").allowed).toBe(true);
+    const current = bindCeo(harness);
+    harness.cp.sessions.setPid(current, process.pid);
+    expect(harness.cp.bindings.active("CEO")?.bindingGeneration).toBe(14);
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-sweep-"), watchdogIntervalMs: 20 });
+    try {
+      expect((await daemon.start()).allowed).toBe(true);
+      // Dies after startup; no restart or ACTIVE assignment points to this generation.
+      harness.cp.sessions.setPid(old, 2147483647);
+      const finding = (await harness.cp.doctor.run("session", old)).findings.find((f) => f.code === "SESSION_PROCESS_MISSING");
+      expect(finding?.blocking).toBe(false);
+      await vi.waitFor(() => expect(harness.cp.sessions.require(old).lifecycle).toBe(SessionLifecycle.ERROR));
+      expect(harness.cp.sessions.require(current)).toMatchObject({ lifecycle: SessionLifecycle.READY, buzzActorId: null });
+      expect(resolveCeoBuzzIdentity(harness.cp.db, current)).toBe(actor);
+      const settledCount = harness.cp.audit.byKind("SESSION_LIFECYCLE").filter((e) => e.sessionId === old).length;
+      await new Promise<void>((done) => setTimeout(done, 80));
+      expect(harness.cp.audit.byKind("SESSION_LIFECYCLE").filter((e) => e.sessionId === old)).toHaveLength(settledCount);
+      expect(harness.cp.bindings.active("CEO")?.bindingGeneration).toBe(14);
+      expect(harness.cp.db.all(`SELECT * FROM assignments WHERE role_key = 'CEO'`)).toHaveLength(14);
+    } finally { await daemon.stop(); }
+  });
+
+  it("startup and periodic sweeps retain UNKNOWN and EPERM sessions but settle PID reuse", async () => {
+    const { harness } = await makeDaemonStartHealthy();
+    const unknown = harness.cp.sessions.create({ provider: "scripted", model: "test", osPid: process.pid, osStartedAt: "unrecognized" });
+    const denied = harness.cp.sessions.create({ provider: "scripted", model: "test", osPid: 2147483646, osStartedAt: null });
+    const reused = harness.cp.sessions.create({ provider: "scripted", model: "test", osPid: process.pid, osStartedAt: "Thu Jan  1 00:00:00 1970" });
+    for (const session of [unknown, denied, reused]) harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY);
+    const realKill = process.kill.bind(process);
+    const signal = vi.spyOn(process, "kill").mockImplementation((pid, sig) => {
+      if (pid === 2147483646 && sig === 0) throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+      return realKill(pid, sig);
+    });
+    const tick = vi.spyOn(harness.cp.watchdog, "tick");
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-unknown-"), watchdogIntervalMs: 20 });
+    try {
+      expect((await daemon.start()).allowed).toBe(true);
+      expect(harness.cp.sessions.require(reused.sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
+      await vi.waitFor(() => expect(tick).toHaveBeenCalled());
+      for (const session of [unknown, denied]) expect(harness.cp.sessions.require(session.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+    } finally { signal.mockRestore(); await daemon.stop(); }
+  });
+
+  it("keeps an active dead holder and dead owners of unfinished work actionable", async () => {
+    const { harness, run } = await makeDaemonStartHealthy();
+    const ceo = harness.cp.bindings.active("CEO")!.sessionId;
+    harness.cp.sessions.setPid(ceo, 2147483647);
+    expect((await harness.cp.doctor.run("session", ceo)).findings).toContainEqual(expect.objectContaining({ code: "SESSION_PROCESS_MISSING", blocking: true }));
+    harness.cp.sessions.setPid(run.ownerSessionId!, 2147483647);
+    expect(harness.cp.runs.transition(run.runId, RunState.BLOCKED, "test owner unavailable").allowed).toBe(true);
+    expect(harness.cp.bindings.revoke(run.ownerRoleKey!, "test", { allowBlockedRuns: true }).allowed).toBe(true);
+    expect((await harness.cp.doctor.run("session", run.ownerSessionId!)).findings).toContainEqual(expect.objectContaining({ code: "SESSION_PROCESS_MISSING", blocking: true }));
+    const reconciled = await new Daemon(harness.cp, { stateDir: tempDir("acp-startup-sweep-") }).reconcile();
+    expect(reconciled.sessionsMarkedError).toContain(ceo);
+  });
+
+  it("counts the current actor runtime as the ACTIVE holder after a surviving move", async () => {
+    const harness = makeHarness();
+    const previous = bindCeo(harness);
+    harness.cp.sessions.setPid(previous, 2147483647);
+    const current = harness.cp.sessions.create({ provider: "scripted", model: "scripted-ceo", osPid: 2147483647 });
+    expect(harness.cp.sessions.transition(current.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+    expect(harness.cp.bindings.switchTo({
+      role: Role.CEO, sessionId: current.sessionId, conversation: "SURVIVED", reason: "same CEO, new runtime",
+    }).allowed).toBe(true);
+    expect(harness.cp.bindings.active("CEO")?.sessionId).toBe(current.sessionId);
+    expect(harness.cp.db.get<{ session_id: string }>(`SELECT session_id FROM assignments WHERE status = 'ACTIVE'`)?.session_id).toBe(previous);
+    const oldFinding = (await harness.cp.doctor.run("session", previous)).findings.find((f) => f.code === "SESSION_PROCESS_MISSING");
+    const currentFinding = (await harness.cp.doctor.run("session", current.sessionId)).findings.find((f) => f.code === "SESSION_PROCESS_MISSING");
+    expect(oldFinding?.blocking).toBe(false);
+    expect(currentFinding?.blocking).toBe(true);
+  });
+
+  it("periodic reconciliation acknowledges a clean default-branch descendant", async () => {
+    const { harness, repositoryId } = await makeDaemonStartHealthy();
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-repo-tick-"), watchdogIntervalMs: 20 });
+    try {
+      expect((await daemon.start()).allowed).toBe(true);
+      writeFileSync(join(harness.repoPath, "README.md"), "# owner commit during uptime\n");
+      boundedExecFileSync("git", ["add", "README.md"], { cwd: harness.repoPath });
+      boundedExecFileSync("git", ["commit", "-m", "owner descendant"], { cwd: harness.repoPath });
+      const head = boundedExecFileSync("git", ["rev-parse", "HEAD"], { cwd: harness.repoPath, encoding: "utf8" }).trim();
+      await vi.waitFor(() => expect(harness.cp.repositories.byId(repositoryId)?.lastObservedHead).toBe(head));
+    } finally { await daemon.stop(); }
+  });
+
+  it("does not overlap watchdog maintenance while a previous tick is pending", async () => {
+    const { harness } = await makeDaemonStartHealthy();
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-watchdog-serial-"), watchdogIntervalMs: 5 });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const originalTick = harness.cp.watchdog.tick.bind(harness.cp.watchdog);
+    try {
+      expect((await daemon.start()).allowed).toBe(true);
+      const observation = vi.spyOn(harness.cp.repositories, "observe").mockResolvedValue(null);
+      const tick = vi.spyOn(harness.cp.watchdog, "tick").mockImplementation(async () => {
+        await gate;
+        return originalTick();
+      });
+      try {
+        await vi.waitFor(() => expect(tick).toHaveBeenCalled());
+        await new Promise<void>((done) => setTimeout(done, 50));
+        expect(tick).toHaveBeenCalledTimes(1);
+      } finally {
+        await daemon.stop();
+        release();
+        await Promise.all(tick.mock.results.map((result) => result.value));
+        tick.mockRestore();
+        observation.mockRestore();
+      }
+    } finally { release(); await daemon.stop(); }
+  });
+
   it("#117/#205: a periodic watchdog failure is audited and degrades the health file", async () => {
     const { harness } = await makeDaemonStartHealthy();
     const stateDir = tempDir("acp-daemon-r2-");
@@ -372,7 +500,7 @@ describe("round 2 daemon regressions", () => {
     const started = await daemon.start();
     expect(started.allowed).toBe(true);
 
-    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 25));
+    await vi.waitFor(() => expect(harness.cp.audit.byKind("DAEMON_TIMER_FAILED").length).toBeGreaterThan(0));
     const health = JSON.parse(readFileSync(join(stateDir, "health.json"), "utf8")) as {
       timerHealth: { status: string; failures: Record<string, { lastError: string }> };
     };
@@ -1029,36 +1157,23 @@ describe("round 2 daemon regressions", () => {
     }
   });
 
-  it("#244: daemon-owned capacity sensors expose missing and stale observations", async () => {
+  it("refreshes telemetry without creating provider mirror files", async () => {
     const { harness } = await makeDaemonStartHealthy();
-    const missing = await harness.cp.doctor.run("capacity");
-    expect(missing.findings.map((finding) => finding.code)).toContain(ReasonCode.CAPACITY_SENSOR_FILE_MISSING);
-
-    const stateDir = tempDir("acp-daemon-r2-");
     const probe = vi.spyOn(harness.scripted, "probeCapacity");
-    // A sweep must fit inside the interval between sweeps, so a test that shrinks the interval
-    // to drive the timer has to shrink the budget with it. 1ms left no room for any budget at
-    // all; 20ms still fires well inside the 25ms this test waits.
     const daemon = new Daemon(harness.cp, {
-      stateDir, capacityRefreshIntervalMs: 20, capacityRefreshBudgetMs: 10,
+      stateDir: tempDir("acp-capacity-"), capacityRefreshIntervalMs: 20, capacityRefreshBudgetMs: 10,
     });
-    const started = await daemon.start();
-    expect(started.allowed).toBe(true);
-
-    const sensor = join(harness.cp.config.capacityDir, "scripted.json");
-    expect(JSON.parse(readFileSync(sensor, "utf8"))).toMatchObject({
-      provider: "scripted",
-      observedAt: harness.clock.nowIso(),
-    });
-
-    probe.mockClear();
-    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 25));
-    expect(probe).toHaveBeenCalled();
-    await daemon.stop();
-
-    harness.clock.advance(5 * 60 * 1000 + 1);
-    const stale = await harness.cp.doctor.run("capacity");
-    expect(stale.findings.map((finding) => finding.code)).toContain(ReasonCode.CAPACITY_SENSOR_FILE_STALE);
+    try {
+      expect((await daemon.start()).allowed).toBe(true);
+      probe.mockClear();
+      await vi.waitFor(() => expect(probe).toHaveBeenCalled());
+      expect(existsSync(join(harness.cp.config.capacityDir, "scripted.json"))).toBe(false);
+      expect(harness.cp.capacity.all().length).toBeGreaterThan(0);
+      const report = await harness.cp.doctor.run("capacity");
+      expect(report.findings.some((finding) => finding.code.startsWith("CAPACITY_SENSOR_FILE_"))).toBe(false);
+    } finally {
+      await daemon.stop();
+    }
   });
 
   it("#206: a real startup failure records and enforces crash-loop backoff", async () => {

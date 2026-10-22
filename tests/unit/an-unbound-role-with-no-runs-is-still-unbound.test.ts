@@ -45,14 +45,15 @@ describe("an unbound role with no runs is still unbound", () => {
       .not.toContain("CTO_MISSING_WITH_NO_RUNS");
   });
 
-  it("says nothing about a suspended project, which is deliberately unbound", async () => {
+  it.each(["system", "project", "cto"] as const)("says nothing about a suspended project in a %s report", async (scope) => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
     expect(harness.cp.projects.setSuspended(projectId, true, true).allowed).toBe(true);
 
-    const report = await harness.cp.doctor.run("system");
-
+    const report = await harness.cp.doctor.run(scope);
     expect(report.findings.map((f) => f.code)).not.toContain("CTO_MISSING_WITH_NO_RUNS");
+    expect(report.findings.map((f) => f.code)).not.toContain("CANONICAL_CTO_RESTORE_PENDING");
+    expect(report.findings.map((f) => f.code)).not.toContain("CANONICAL_CTO_RESTORE_UNMET");
   });
 
   it("cannot be qualified by `activity`, which is the same fact under another name", async () => {
