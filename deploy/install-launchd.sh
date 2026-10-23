@@ -531,8 +531,11 @@ export ACP_MCP_TOKEN="$(required_keychain_value ACP_MCP_TOKEN)"
 export ACP_OPERATOR_TOKEN="$(required_keychain_value ACP_OPERATOR_TOKEN)"
 # ACP_REVIEWER_CODEX_HOME is the packet reviewer's optional private Codex home override; unset, the
 # reviewer reuses this user's own authenticated Codex home.
+# ACP_BUZZ_ADMISSION_COMMAND is the resident host provisioner's Buzz admission argv (a JSON array). It
+# is read here so that an operator's value survives every re-render of this launcher; unset, the
+# provisioner keeps the default written in its own script.
 for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_BUZZ_ALLOWED_ACTORS BUZZ_RELAY_URL ACP_BUZZ_BINARY ACP_BUZZ_CHANNEL \
-  ACP_OWNER_APPROVAL_BUZZ_IDENTITY ACP_REPO_FACTORY_PROJECT_ID \
+  ACP_OWNER_APPROVAL_BUZZ_IDENTITY ACP_REPO_FACTORY_PROJECT_ID ACP_BUZZ_ADMISSION_COMMAND \
   ACP_TELEGRAM_BOT_TOKEN ACP_TELEGRAM_OWNER_ID ACP_TELEGRAM_ALLOWED_OWNER_IDS \
   ACP_TELEGRAM_CHAT_ID ACP_TELEGRAM_ALLOWED_CHAT_IDS ACP_TELEGRAM_WEBHOOK_SECRET \
   ACP_TELEGRAM_POLL_TIMEOUT_SECONDS ACP_TELEGRAM_RETRY_DELAY_MS \
@@ -619,6 +622,37 @@ if [[ -z "${ACP_COMMITLORE_BINARY:-}" ]]; then
         "$commitlore_keychain_status" >&2
       ;;
   esac
+fi
+
+# The resident host provisioner. The daemon enables resident project provisioning only when
+# ACP_HOST_PROJECT_PROVISIONER names a script, and refuses every bootstrap as
+# BOOTSTRAP_ACTIVATION_INCOMPLETE without one, so this launcher always exports it.
+#
+# The default is this generation's own copy, beside the entrypoint exec'd below. It is derived from
+# ACP_APP_ROOT on every launch and never baked as a path, so it follows each install, upgrade and
+# rollback to the generation that launcher belongs to. The operator's persistent override is the
+# Keychain item of that name, read through the same loader as every optional account, which also
+# clears a value inherited from launchd: only this generation or the Keychain can name the script.
+#
+# Either way the launcher refuses to start unless the path is an absolute regular file that is not a
+# symlink, and the default must also sit inside this generation: its directory, resolved, has to be
+# this generation's own dist/host, so a dist/host that leads elsewhere is refused rather than run. The
+# refusal names the condition, never the path. An item that is present but empty, or a lookup that
+# fails, leaves the account unset as the loader leaves every optional account, so the default applies.
+optional_keychain_value ACP_HOST_PROJECT_PROVISIONER
+if [[ -n "${ACP_HOST_PROJECT_PROVISIONER:-}" ]]; then
+  if [[ "$ACP_HOST_PROJECT_PROVISIONER" != /* || ! -f "$ACP_HOST_PROJECT_PROVISIONER" || -L "$ACP_HOST_PROJECT_PROVISIONER" ]]; then
+    printf 'agentcpd launcher: the Keychain item ACP_HOST_PROJECT_PROVISIONER does not name an absolute regular file; refusing to start\n' >&2
+    exit 78
+  fi
+else
+  host_provisioner="$ACP_APP_ROOT/dist/host/host-project-provisioner.mjs"
+  host_provisioner_dir="$(cd -P -- "${host_provisioner%/*}" 2>/dev/null && pwd -P)" || host_provisioner_dir=""
+  if [[ "$host_provisioner_dir" != "$ACP_APP_ROOT/dist/host" || ! -f "$host_provisioner" || -L "$host_provisioner" ]]; then
+    printf 'agentcpd launcher: this generation has no resident host provisioner that is a regular file inside it at dist/host/host-project-provisioner.mjs; refusing to start\n' >&2
+    exit 78
+  fi
+  export ACP_HOST_PROJECT_PROVISIONER="$host_provisioner"
 fi
 
 exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"
