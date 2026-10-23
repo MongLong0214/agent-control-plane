@@ -1,0 +1,16 @@
+Limit: repository acknowledgement advances only for a clean checkout attached to the manifest's default branch whose old acknowledged head is an ancestor of HEAD; dirty, divergent, detached or wrong-branch checkouts stay DRIFTED and nothing in a registered checkout is reset, fetched or rewritten.
+Warn: a session whose process died while the daemon was up stayed READY forever, because only startup reconciliation swept all live sessions; the sweep now also runs on every watchdog tick and settles a session only when the start-aware probe says DEAD, never on UNKNOWN or EPERM, so a revoked CEO generation's identity history keeps serving its successor's Buzz identity fallback.
+Record-Id: r-364a12e79fcc
+Provenance: inherited d846c3e6b946008920b36c9b7b400be02517be5c
+
+Warn: a repository acknowledgement is accepted only from two matching observations of branch, cleanliness and HEAD; a single branch check followed by separate awaited probes could certify a checkout state that never existed, and a wrongly advanced baseline cannot be repaired by the descendant-only rule.
+Record-Id: r-937312f3f8ef
+Provenance: inherited e4ab3cd82a1bf5bce2bb9a285ee0dc83038120e3
+
+Limit: a dead, settled session is non-blocking in the system report only while its ACTIVE bindings are project PRIMARY_CTO roles with no unfinished owned runs and no running worker receipts, so the daemon can start and open the operator door to recover it; it stays a visible ERROR, and CEO authority, other roles and unfinished work remain system blockers.
+Record-Id: r-02d1d59d2a71
+Provenance: inherited fae679732c23d45270ccd712c8c0692d729a077b
+
+Warn: git status reads the branch name and the HEAD commit separately, so even one invocation can pair a branch with another branch's commit when the checkout switches mid-call; an acknowledgement additionally requires refs/heads/<branch> to name the observed commit, and an incoherent reading acknowledges nothing.
+Record-Id: r-04daed93ee7c
+Provenance: inherited bc675ac49e9cf86f5e44265083903856106f8f2b
