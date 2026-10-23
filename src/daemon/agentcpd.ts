@@ -95,6 +95,7 @@ import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { resolveCeoBuzzIdentity } from "../session/ceo-buzz-identity.ts";
 import { isReasonCode, ReasonCode } from "../core/reason-codes.ts";
 import { recordMigrationRefusal } from "../db/migration-approval.ts";
+import { ROLE_ROOM_KNOWN_SINCE_MIGRATION } from "../db/migrations.ts";
 import {
   BuzzActorIngress,
   IngressGuard,
@@ -2030,6 +2031,36 @@ const auditBuzzPeerRefusal = (
 };
 
 /**
+ * CEO decision f42efb13 — record, durably and for every author, a mention refused only because the
+ * addressed role's history in its room is unproven: v51 knew the role in that room only from the
+ * migration (`ROLE_ROOM_KNOWN_SINCE_MIGRATION`), so everything signed there before it is refused as
+ * `BUZZ_MENTION_PRECEDES_BINDING`, though some of it may have been the role's. Such a refusal is never
+ * a delivery and never silent: this row names the event, its room, the role and the reason, so the
+ * event can be fetched from the relay again. Its content is not kept. A refusal against a history that
+ * is proven (mail from before the role ever joined the room) is not this, and writes nothing here.
+ */
+const auditUnprovenHistoryRefusal = (cp: ControlPlane, request: BuzzMentionAdmissionRequest): void => {
+  const unproven = cp.db.get<{ present: number }>(
+    `SELECT 1 AS present FROM audit_events WHERE kind = ? AND role_key = ?
+       AND (CASE WHEN json_valid(evidence_json) THEN json_extract(evidence_json, '$.room') END) = ? LIMIT 1`,
+    [ROLE_ROOM_KNOWN_SINCE_MIGRATION, request.roleKey, request.conversation],
+  );
+  if (!unproven) return;
+  const signedAt = new Date(request.event.created_at * 1000);
+  cp.audit.record({
+    kind: "BUZZ_MENTION_REFUSED",
+    reasonCode: ReasonCode.BUZZ_MENTION_PRECEDES_BINDING,
+    actor: request.event.pubkey,
+    roleKey: request.roleKey,
+    evidence: {
+      eventId: request.event.id,
+      room: request.conversation,
+      signedAt: Number.isNaN(signedAt.getTime()) ? null : signedAt.toISOString(),
+    },
+  });
+};
+
+/**
  * The envelope the daemon's sink presents for one verified relay event (#760 Part C, #1038).
  *
  * The event's author is presented as the actor and the seam decides what it is: an owner, the
@@ -2215,6 +2246,7 @@ export const startDaemonBuzzMentionSubscriber = (
         auditBuzzPeerRefusal(cp, request.event.pubkey, request.event.id,
           verdict.admission === "PRECEDES_BINDING" ? ReasonCode.BUZZ_MENTION_PRECEDES_BINDING : verdict.reasonCode);
       }
+      if (typeof verdict === "object" && verdict.admission === "PRECEDES_BINDING") auditUnprovenHistoryRefusal(cp, request);
       return verdict;
     },
   };
