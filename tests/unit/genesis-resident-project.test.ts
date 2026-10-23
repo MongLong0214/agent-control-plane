@@ -213,10 +213,10 @@ describe('durable resident provisioning and retirement',() => {
     expect(h.cp.repositories.byIdentity('github:acme/fixture')).toBeNull();
     expect(h.cp.db.get('SELECT 1 FROM repositories WHERE project_id = ?',['old'])).toBeTruthy();h.cp.close();
   });
-  it('upgrades the released v50 image using v52 and preserves repository history',() => {
+  it('upgrades the released v50 image through v51 and v52 and preserves repository history',() => {
     const raw = new Database(':memory:');raw.exec(readFileSync(new URL('../../src/db/schema-v50.sql',import.meta.url),'utf8'));raw.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,migration_id TEXT,checksum TEXT,applied_at TEXT)');
     raw.exec("INSERT INTO projects(project_id,name,created_at) VALUES ('old','old','2026-01-01'); INSERT INTO repositories(rowid,repository_id,identity,checkout_path,project_id,created_at) VALUES (42,'repo-old','github:acme/reuse','/old','old','2026-01-01')");
-    MIGRATIONS.find(m => m.toVersion === 52)!.apply(raw);
+    MIGRATIONS.find(m => m.toVersion === 51)!.apply(raw);MIGRATIONS.find(m => m.toVersion === 52)!.apply(raw);
     expect(raw.prepare('SELECT rowid,repository_id,identity FROM repositories').get()).toEqual({rowid:42,repository_id:'repo-old',identity:'github:acme/reuse'});
     raw.exec("UPDATE repositories SET retired_at = '2026-10-23' WHERE repository_id = 'repo-old'; INSERT INTO repositories(repository_id,identity,checkout_path,project_id,created_at) VALUES ('repo-new','github:acme/reuse','/old','old','2026-10-23')");
     expect(raw.prepare('SELECT count(*) AS n FROM repositories').get()).toEqual({n:2});

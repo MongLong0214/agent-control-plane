@@ -2429,6 +2429,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     }
 
     const envelope = safeParse(result.stdout);
+    const providerError = claudeProviderError(envelope);
     const text =
       typeof envelope?.["result"] === "string" ? (envelope["result"] as string) : result.stdout;
     const isolationSucceeded = request.isolation === undefined || result.isolationEnforced;
@@ -2439,9 +2440,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       // A provider answer produced after a failed packet boundary is not a successful
       // invocation. Keeping `ok` false matches the attestation result and prevents a
       // caller that forgets the separate field from treating it as usable evidence.
-      ok: result.exitCode === 0 && !result.timedOut && isolationSucceeded && unended === undefined,
+      ok: result.exitCode === 0 && !result.timedOut && providerError === null && isolationSucceeded && unended === undefined,
       text,
-      json: extractJson(text),
+      json: providerError === null ? extractJson(text) : null,
       provider: this.provider,
       model: request.model ?? this.defaultModels.cto,
       durationMs: Date.now() - started,
@@ -2450,7 +2451,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
         ? "timeout"
         : unended !== undefined
           ? unendedGroupError(unended)
-          : result.exitCode === 0 && isolationSucceeded
+          : providerError !== null
+            ? providerError
+            : result.exitCode === 0 && isolationSucceeded
             ? null
             : result.stderr.slice(0, 2000),
       ...(unended === undefined ? {} : { processGroup: unended }),
@@ -2525,7 +2528,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     // carries its message into the refusal's evidence.
     if (result.processGroup && !result.processGroup.reaped) throw new ProbeProcessGroupUnconfirmed(result.processGroup);
     if (result.exitCode !== 0 || result.timedOut || !result.processGroup) return "UNAVAILABLE";
-    const sessionId = safeParse(result.stdout)?.["session_id"];
+    const envelope = safeParse(result.stdout);
+    if (claudeProviderError(envelope) !== null) return "UNAVAILABLE";
+    const sessionId = envelope?.["session_id"];
     return sessionId !== undefined && sessionId !== handle.externalSessionId ? "DEGRADED" : "HEALTHY";
   }
 
@@ -2630,13 +2635,14 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       reapProcessGroup: true,
     });
     const envelope = safeParse(result.stdout);
+    const providerError = claudeProviderError(envelope);
     const text = typeof envelope?.["result"] === "string" ? (envelope["result"] as string) : "";
     const providerSessionId =
       typeof envelope?.["session_id"] === "string" ? (envelope["session_id"] as string) : null;
     const answeredAsThisConversation = providerSessionId === handle.externalSessionId;
     // #1104 — a turn whose own group was not confirmed ended did not complete, whatever its CLI said.
     const unended = unendedGroupOf(result.processGroup);
-    const ok = result.exitCode === 0 && !result.timedOut && envelope?.["is_error"] !== true && answeredAsThisConversation &&
+    const ok = result.exitCode === 0 && !result.timedOut && providerError === null && answeredAsThisConversation &&
       unended === undefined;
     return {
       ok,
@@ -2650,13 +2656,20 @@ export class ClaudeCliAdapter implements ProviderAdapter {
             ? unendedGroupError(unended)
             : result.exitCode === 0 && !answeredAsThisConversation
               ? "SESSION_TURN_CONVERSATION_MISMATCH: the provider answered as a different conversation"
-              : result.stderr.slice(0, 2000) || (envelope?.["is_error"] === true ? text.slice(0, 2000) : "turn failed"),
+              : result.stderr.slice(0, 2000) || providerError || "turn failed",
       providerSessionId,
       durationMs: Date.now() - started,
       ...(unended === undefined ? {} : { processGroup: unended }),
     };
   }
 }
+
+/** A zero process exit cannot turn a structured provider failure into usable evidence. */
+const claudeProviderError = (envelope: Record<string, unknown> | null): string | null =>
+  envelope?.["is_error"] === true
+    ? (typeof envelope["result"] === "string" && envelope["result"].length > 0
+        ? envelope["result"].slice(0, 2000) : "Claude provider error")
+    : null;
 
 /** `--session-id` opens a conversation under its constituted id; `--resume` continues it. */
 const conversationFlag = (step: ConversationStep): "--session-id" | "--resume" =>

@@ -1,3 +1,4 @@
+import { buzzMessageEventId } from "../ingress/buzz-message.ts";
 import { createHash, createHmac, hkdfSync } from "node:crypto";
 
 /**
@@ -142,7 +143,7 @@ const BUZZ_NONCE_PREFIX = "buzz-message:";
  */
 export const daemonNoticeText = (subject: DaemonNoticeSubject): string => {
   const sourceEvent = subject.sourceNonce?.startsWith(BUZZ_NONCE_PREFIX)
-    ? subject.sourceNonce.slice(BUZZ_NONCE_PREFIX.length)
+    ? buzzMessageEventId(subject.sourceNonce)
     : subject.sourceNonce;
   const text = [
     "ACP refused a queued peer message addressed to the CTO; it was not delivered.",

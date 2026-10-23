@@ -74,11 +74,17 @@ describe("a delivery timeout is unknown, not a failure to deliver (#451)", () =>
     await adapter.deliverPending();
 
     const row = statusOf(core, messageId);
+    // ACP-R1-01: an actionable instruction is never ended by a failed attempt, and an unknown outcome
+    // is not put back in the queue either: it is SENT, awaiting its ACK.
     expect(
       row?.status,
       "a timed-out send went back to PENDING, so the same envelope will be delivered twice",
-    ).toBe("REJECTED");
+    ).toBe("SENT");
     expect(row?.failure_class).toBe("unknown_observed");
+    expect(core.outbox.claimDeliverable()).toHaveLength(0);
+    // With no ACK by its backoff deadline it is offered again under the same id (at-least-once).
+    core.clock.advance(60_000);
+    expect(core.outbox.claimDeliverable().map((m) => m.messageId)).toEqual([messageId]);
   });
 
   it("still retries a failure that happened before anything was sent", async () => {

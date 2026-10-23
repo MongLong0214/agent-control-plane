@@ -4037,6 +4037,85 @@ END;
 INSERT OR IGNORE INTO continuity_state (id, mode, changed_at)
 VALUES (1, 'NORMAL', '1970-01-01T00:00:00.000Z');
 
+
+-- ---------------------------------------------------------------------------
+-- Durable Buzz events and message-ID terminal deduplication (schema v51).
+-- Recipient admission/claim/ACK lives in inbound_messages and outbox; the signed body lives once.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS buzz_events (
+  event_id TEXT PRIMARY KEY NOT NULL,
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
+) WITHOUT ROWID;
+
+-- CP-HI-08 — accepted signed event bytes cannot be replaced.
+CREATE TRIGGER IF NOT EXISTS buzz_events_no_replace
+BEFORE INSERT ON buzz_events
+WHEN EXISTS (SELECT 1 FROM buzz_events WHERE event_id = NEW.event_id)
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
+-- CP-HI-08 — accepted signed event bytes cannot be rewritten.
+CREATE TRIGGER IF NOT EXISTS buzz_events_immutable
+BEFORE UPDATE ON buzz_events
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
+-- CP-HI-08 — accepted signed event bytes outlive every recipient delivery.
+CREATE TRIGGER IF NOT EXISTS buzz_events_no_delete
+BEFORE DELETE ON buzz_events
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
+
+-- Once ACKed or explicitly rejected, resetting a mutable outbox status cannot replay the ID.
+CREATE TABLE IF NOT EXISTS holder_message_terminals (
+  message_id TEXT PRIMARY KEY NOT NULL
+) WITHOUT ROWID;
+-- CP-HI-08 — a completed message ID remains durably deduplicated.
+CREATE TRIGGER IF NOT EXISTS outbox_holder_message_terminal
+AFTER UPDATE OF status ON outbox
+WHEN NEW.status IN ('ACKED','REJECTED','EXPIRED')
+  AND NOT EXISTS (SELECT 1 FROM holder_message_terminals WHERE message_id = NEW.message_id)
+BEGIN
+  INSERT INTO holder_message_terminals (message_id) VALUES (NEW.message_id);
+END;
+-- CP-HI-08 — a completion receipt cannot be rewritten.
+CREATE TRIGGER IF NOT EXISTS holder_message_terminals_immutable
+BEFORE UPDATE ON holder_message_terminals
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+-- CP-HI-08 — a deleted completion receipt must not enable replay.
+CREATE TRIGGER IF NOT EXISTS holder_message_terminals_no_delete
+BEFORE DELETE ON holder_message_terminals
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — a completion receipt cannot be replaced.
+CREATE TRIGGER IF NOT EXISTS holder_message_terminals_no_replace
+BEFORE INSERT ON holder_message_terminals
+WHEN EXISTS (SELECT 1 FROM holder_message_terminals WHERE message_id = NEW.message_id)
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+
+-- ---------------------------------------------------------------------------
+-- ACP-R1-04 — each role's own membership history per Buzz room (schema v51).
+-- When a role first became a recipient in a room: written when a binding, a runtime move or an
+-- address change puts the role's current runtime on that room, and never moved earlier. Historical
+-- suppression of retained room traffic is judged against this record alone — not against a
+-- session's current, mutable address or the role's current runtime pointer — and it is separate from
+-- delivery and ACK state.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS role_room_memberships (
+  role_key     TEXT NOT NULL,
+  conversation TEXT NOT NULL,
+  joined_at    TEXT NOT NULL,
+  session_id   TEXT NOT NULL,
+  PRIMARY KEY (role_key, conversation)
+) WITHOUT ROWID;
+
 -- v52: one frozen allocation/confirmation per bootstrap, and per-operation recovery evidence.
 CREATE TABLE IF NOT EXISTS resident_project_provisioning (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id),

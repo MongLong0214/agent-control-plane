@@ -194,35 +194,20 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
     for (const kind of HOLDER_CLAIMED_KINDS) expect(RETARGETABLE_KINDS.has(kind)).toBe(false);
   });
 
-  /**
-   * `PENDING -> SENT` happens before the payload is returned, so a second claim finds nothing to
-   * hand over. The unresolved report is what a successor reconciles from, and it carries no
-   * payload — which is the state a crash between claim and acknowledgement leaves behind.
-   */
-  it("hands the payload over once, then reports the row as unresolved without it", () => {
+  it("redelivers an unACKed message with the same ID and dedupes it durably after ACK", () => {
     const { core, seeded } = seededCore();
-    const owner = enqueueOwnerMessage(core, seeded, "say this exactly once");
-    expect(owner.allowed).toBe(true);
-    if (!owner.allowed) return;
+    const owner = enqueueOwnerMessage(core, seeded, "retry this same ID");
+    if (!owner.allowed) throw new Error(owner.message);
     const holder = holderOf(seeded);
-
-    const first = core.outbox.claimForHolder(holder);
-    expect(first.claimed.map((m) => m.messageId)).toEqual([owner.value.messageId]);
-    expect(first.claimed[0]?.payload).toEqual({ text: "say this exactly once" });
-    expect(first.unresolved).toEqual([]);
-    // Moved before the payload came back, not after the caller did something with it.
-    expect(core.outbox.get(owner.value.messageId)?.status).toBe("SENT");
-
-    // The crash: the holder was handed the message and never acknowledged it. A second claim —
-    // the same holder reconnecting, or a successor — must not be handed it again.
-    const second = core.outbox.claimForHolder(holder);
-    expect(second.claimed).toEqual([]);
-    expect(second.unresolved.map((m) => m.messageId)).toEqual([owner.value.messageId]);
-    // The whole serialized report, so a payload smuggled into any field is caught rather than
-    // only a payload on the field this row thought to name.
-    expect(JSON.stringify(second.unresolved)).not.toContain("say this exactly once");
-    expect(second.unresolved[0]).not.toHaveProperty("payload");
-    expect(second.unresolved[0]?.payloadDigest).toBe(owner.value.payloadDigest);
+    const first = core.outbox.claimForHolder(holder).claimed[0]!;
+    const second = core.outbox.claimForHolder(holder).claimed[0]!;
+    expect(second.messageId).toBe(first.messageId);
+    expect(second.payload).toEqual(first.payload);
+    expect(core.outbox.completeForHolder(first.messageId, holder).allowed).toBe(true);
+    expect(core.outbox.claimForHolder(holder).claimed).toEqual([]);
+    // Resetting mutable delivery state cannot erase the durable terminal ID.
+    core.db.run("UPDATE outbox SET status = 'SENT' WHERE message_id = ?", [first.messageId]);
+    expect(core.outbox.claimForHolder(holder).claimed).toEqual([]);
   });
 
   /**
@@ -311,138 +296,37 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
     expect(core.outbox.get(owner.value.messageId)?.status).toBe("ACKED");
   });
 
-  /**
-   * Failover splits the two states, and the split is the whole rule.
-   *
-   * A `PENDING` owner-message was never handed to anybody, so nothing observable has happened to
-   * it and the successor may safely have it — the owner addressed a *role*, and the role still
-   * exists. A `SENT` one was handed over and never acknowledged: its outcome is unknown, so
-   * retargeting it would replay an owner's words into a runtime they were never addressed to.
-   * That one is rejected, and — because rejecting it is a terminal transition out of `SENT` — its
-   * source ingress claim is settled in the same transaction.
-   *
-   * `retargetOrReject` historically looked only at `PENDING`/`IN_FLIGHT`, because for an outward
-   * delivery `SENT` means the transport succeeded and a later ACK is legitimate; the `SENT` arm
-   * here is the asymmetry only holder-claimed kinds get.
-   */
-  it("retargets a pending owner-message on failover and rejects the already-handed-over one", () => {
+  it("retargets both unread and handed-over unACKed mail on failover", () => {
     const { core, seeded } = seededCore();
-    // Oldest first: a claim takes exactly one message and takes the oldest, so the one that is to
-    // be handed over is enqueued first and the clock is advanced to make that order unambiguous.
-    const handedOver = enqueueOwnerMessage(core, seeded, "taken and unacknowledged");
-    core.clock.advance(1_000);
-    const stillPending = enqueueOwnerMessage(core, seeded, "never taken");
-    const dispatch = core.outbox.enqueue({
-      idempotencyKey: `dispatch:${crypto.randomUUID()}`,
-      roleKey: seeded.roleKey,
-      bindingGeneration: seeded.generation,
-      targetSessionId: seeded.sessionId,
-      runId: seeded.runId,
-      kind: MessageKind.RUN_DISPATCH,
-      payload: { runId: seeded.runId },
-    });
-    expect(stillPending.allowed && handedOver.allowed && dispatch.allowed).toBe(true);
-    if (!stillPending.allowed || !handedOver.allowed || !dispatch.allowed) return;
-
-    const claimed = core.outbox.claimForHolder(holderOf(seeded));
-    expect(claimed.claimed.map((m) => m.messageId)).toContain(handedOver.value.messageId);
-    expect(core.outbox.get(handedOver.value.messageId)?.status).toBe("SENT");
-
-    const successor = core.sessions.create({ provider: "claude", model: "successor-cto" });
-    expect(
-      core.sessions.transition(successor.sessionId, SessionLifecycle.READY, "failover").allowed,
-    ).toBe(true);
-
-    const moved = core.outbox.retargetOrReject(
-      seeded.roleKey,
-      seeded.generation,
-      seeded.generation + 1,
-      successor.sessionId,
-    );
-
-    // The role-level dispatch moves, and so does the untouched owner-message. The handed-over one
-    // does not, and is the only one of the three that ends terminal.
-    expect(moved.retargeted).toContain(dispatch.value.messageId);
-    expect(moved.retargeted).toContain(stillPending.value.messageId);
-    expect(moved.rejected).toEqual([handedOver.value.messageId]);
-
-    const movedOnward = core.outbox.get(stillPending.value.messageId);
-    expect(movedOnward?.status).toBe("PENDING");
-    expect(movedOnward?.bindingGeneration).toBe(seeded.generation + 1);
-    expect(movedOnward?.targetSessionId).toBe(successor.sessionId);
-
-    const burned = core.outbox.get(handedOver.value.messageId);
-    expect(burned?.status).toBe("REJECTED");
-    // Never rebound: the successor must not be able to find the handed-over one at all.
-    expect(burned?.bindingGeneration).toBe(seeded.generation);
-    expect(burned?.targetSessionId).toBe(seeded.sessionId);
-
-    // The runtime it was addressed to before the switch keeps nothing: not the retargeted row,
-    // which is somebody else's now, and not the burned one, which is terminal.
-    const previousHolder = core.outbox.claimForHolder(holderOf(seeded));
-    expect(previousHolder.claimed).toEqual([]);
-    expect(previousHolder.unresolved).toEqual([]);
-    expect(JSON.stringify(previousHolder)).not.toContain("taken and unacknowledged");
-    expect(JSON.stringify(previousHolder)).not.toContain("never taken");
-
-    // That the *successor* can then claim the retargeted row is measured through
-    // `BindingRegistry.switchTo` below, not here: `retargetOrReject` moves the outbox columns and
-    // the successor's `ACTIVE` assignment — the row `exactHolderTarget` joins against — is created
-    // by the binding switch. Asserting a claim here would only measure the absence of that
-    // assignment.
+    const first = enqueueOwnerMessage(core, seeded, "taken before crash");
+    const next = enqueueOwnerMessage(core, seeded, "still queued");
+    if (!first.allowed || !next.allowed) throw new Error("enqueue refused");
+    core.outbox.claimForHolder(holderOf(seeded));
+    const successor = core.sessions.create({ provider: "claude", model: "successor" });
+    core.sessions.transition(successor.sessionId, SessionLifecycle.READY, "test");
+    const moved = core.outbox.retargetOrReject(seeded.roleKey, seeded.generation, seeded.generation + 1, successor.sessionId);
+    expect(moved.retargeted).toEqual(expect.arrayContaining([first.value.messageId, next.value.messageId]));
+    expect(moved.rejected).toEqual([]);
+    expect(core.outbox.get(first.value.messageId)).toMatchObject({ status: "SENT", targetSessionId: successor.sessionId });
+    expect(core.outbox.get(next.value.messageId)).toMatchObject({ status: "PENDING", targetSessionId: successor.sessionId });
+    expect(core.outbox.claimForHolder(holderOf(seeded)).claimed).toEqual([]);
   });
 
-  /**
-   * An unknown outcome stops the queue; it is not reported *beside* a fresh payload.
-   *
-   * The second message is enqueued after the first hand-over, so exactly one row is claimable at
-   * every call here and the batch size plays no part — the only question is whether an unsettled
-   * predecessor stops the next payload moving. That isolation is the point: a row that asserted
-   * only "the SENT one is not served twice" is green against an implementation that reports the
-   * unresolved row *and* hands out the next payload in the same result, which is the state where
-   * a successor is given a second message to lose exactly the way it lost the first.
-   *
-   * Blocking is asserted twice, because "the second call is empty" is also true of an
-   * implementation that simply drained everything on the first call.
-   */
-  it("hands out no further payload while an earlier hand-over is unsettled", () => {
+  it("redelivers the oldest unACKed ID before handing over later mail", () => {
     const { core, seeded } = seededCore();
+    const first = enqueueOwnerMessage(core, seeded, "first");
+    core.clock.advance(1000);
+    const second = enqueueOwnerMessage(core, seeded, "second");
+    if (!first.allowed || !second.allowed) throw new Error("enqueue refused");
     const holder = holderOf(seeded);
-    const first = enqueueOwnerMessage(core, seeded, "the first words");
-    expect(first.allowed).toBe(true);
-    if (!first.allowed) return;
-
-    const takeFirst = core.outbox.claimForHolder(holder);
-    expect(takeFirst.claimed.map((m) => m.messageId)).toEqual([first.value.messageId]);
-
-    // The holder was handed it and died before acknowledging. The owner speaks again meanwhile.
-    core.clock.advance(1_000);
-    const second = enqueueOwnerMessage(core, seeded, "the second words");
-    expect(second.allowed).toBe(true);
-    if (!second.allowed) return;
-
-    const blocked = core.outbox.claimForHolder(holder);
-    expect(blocked.claimed).toEqual([]);
-    expect(blocked.unresolved.map((m) => m.messageId)).toEqual([first.value.messageId]);
-    // Metadata only: neither payload may appear anywhere in what came back.
-    expect(JSON.stringify(blocked)).not.toContain("the second words");
-    expect(JSON.stringify(blocked)).not.toContain("the first words");
-    // There *is* work queued, and the holder is told so without being handed it.
-    expect(blocked.hasMore).toBe(true);
-    expect(core.outbox.get(second.value.messageId)?.status).toBe("PENDING");
-
-    // Still blocked on the next wake — the block is the unsettled row, not a spent batch.
-    const stillBlocked = core.outbox.claimForHolder(holder);
-    expect(stillBlocked.claimed).toEqual([]);
-    expect(stillBlocked.unresolved.map((m) => m.messageId)).toEqual([first.value.messageId]);
-    expect(core.outbox.get(second.value.messageId)?.status).toBe("PENDING");
-
-    // Settling the unknown outcome is what releases it, and the payload then arrives exactly once.
+    for (let i = 0; i < 3; i++) {
+      const taken = core.outbox.claimForHolder(holder);
+      expect(taken.claimed.map((row) => row.messageId)).toEqual([first.value.messageId]);
+      expect(taken.hasMore).toBe(true);
+      expect(core.outbox.get(second.value.messageId)?.status).toBe("PENDING");
+    }
     expect(core.outbox.completeForHolder(first.value.messageId, holder).allowed).toBe(true);
-    const released = core.outbox.claimForHolder(holder);
-    expect(released.claimed.map((m) => m.messageId)).toEqual([second.value.messageId]);
-    expect(released.claimed[0]?.payload).toEqual({ text: "the second words" });
-    expect(released.unresolved).toEqual([]);
+    expect(core.outbox.claimForHolder(holder).claimed.map((row) => row.messageId)).toEqual([second.value.messageId]);
   });
 
   /**
@@ -473,7 +357,7 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
       const claim = core.outbox.claimForHolder(holder);
       expect(claim.claimed).toHaveLength(1);
       // Nothing beyond the one claimed row was disturbed: the others are still queued.
-      expect(JSON.stringify(claim)).not.toContain(words[wake + 1] ?? " ");
+      expect(JSON.stringify(claim)).not.toContain(words[wake + 1] ?? "\0");
       taken.push(claim.claimed[0]?.messageId ?? "");
       more.push(claim.hasMore);
       expect(core.outbox.completeForHolder(taken[wake] ?? "", holder).allowed).toBe(true);
@@ -607,55 +491,15 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
     expect(honest.claimed.map((m) => m.messageId)).toEqual([mine.value.messageId]);
   });
 
-  /**
-   * A handed-over owner-message whose target is gone must be fenced, not stranded.
-   *
-   * `SessionRegistry` fences `PENDING`/`IN_FLIGHT` rows when a session stops, and `SENT` is
-   * deliberately outside that sweep because for an outward delivery `SENT` means the transport
-   * succeeded. For an owner-message it means the previous holder was handed the payload and never
-   * came back — so after a restart the row is not claimable by the new holder (wrong incarnation),
-   * not fenced by either sweep, and never settled. It sits in the queue forever.
-   *
-   * The already-`SENT` dispatch is the collateral control: the new clause must reach holder-claimed
-   * kinds and nothing else, or it would fence deliveries that actually succeeded.
-   */
-  it("fences a handed-over owner-message whose target is gone, and leaves other kinds alone", () => {
+  it("retains handed-over mail when its target stops", () => {
     const { core, seeded } = seededCore();
-    const owner = enqueueOwnerMessage(core, seeded, "handed over, never answered");
-    const dispatch = core.outbox.enqueue({
-      idempotencyKey: `dispatch:${crypto.randomUUID()}`,
-      roleKey: seeded.roleKey,
-      bindingGeneration: seeded.generation,
-      targetSessionId: seeded.sessionId,
-      runId: seeded.runId,
-      kind: MessageKind.RUN_DISPATCH,
-      payload: { runId: seeded.runId },
-    });
-    expect(owner.allowed && dispatch.allowed).toBe(true);
-    if (!owner.allowed || !dispatch.allowed) return;
-
-    expect(core.outbox.claimForHolder(holderOf(seeded)).claimed).toHaveLength(1);
-    const swept = core.outbox.claimDeliverable(50);
-    expect(swept.map((m) => m.messageId)).toEqual([dispatch.value.messageId]);
-    expect(
-      core.outbox.markSent(dispatch.value.messageId, swept[0]?.claimToken ?? "").allowed,
-    ).toBe(true);
+    const owner = enqueueOwnerMessage(core, seeded, "unACKed");
+    if (!owner.allowed) throw new Error(owner.message);
+    core.outbox.claimForHolder(holderOf(seeded));
+    core.sessions.transition(seeded.sessionId, SessionLifecycle.STOPPED, "restart");
+    expect(core.outbox.fenceUndeliverable()).toBe(0);
     expect(core.outbox.get(owner.value.messageId)?.status).toBe("SENT");
-    expect(core.outbox.get(dispatch.value.messageId)?.status).toBe("SENT");
-
-    // The runtime is gone. The registry's own fence runs here and reaches neither row, which is
-    // the stranding: after this the owner-message is SENT against a target that cannot answer.
-    expect(
-      core.sessions.transition(seeded.sessionId, SessionLifecycle.STOPPED, "restart").allowed,
-    ).toBe(true);
-    expect(core.outbox.get(owner.value.messageId)?.status).toBe("SENT");
-
-    const fenced = core.outbox.fenceUndeliverable();
-    expect(fenced).toBe(1);
-    const settled = core.outbox.get(owner.value.messageId);
-    expect(settled?.status).toBe("REJECTED");
-    // The successful outward delivery is untouched: its ACK may still legitimately arrive.
-    expect(core.outbox.get(dispatch.value.messageId)?.status).toBe("SENT");
+    expect(core.outbox.claimForHolder(holderOf(seeded)).claimed).toEqual([]);
   });
 
   /**
@@ -674,7 +518,11 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
   it("never expires a queued owner-message, and still hands it over after its nominal TTL", () => {
     const { core, seeded } = seededCore();
     const owner = enqueueOwnerMessage(core, seeded, "still queued an hour later");
-    const dispatch = enqueueDispatch(core, seeded);
+    // The control is an outward kind with a delivery window; an actionable instruction has none
+    // (ACP-R1-01), so it is not the control any more.
+    const dispatch = core.outbox.enqueue({ idempotencyKey: `review:${crypto.randomUUID()}`, roleKey: seeded.roleKey,
+      bindingGeneration: seeded.generation, targetSessionId: seeded.sessionId, runId: seeded.runId,
+      kind: MessageKind.REVIEW_REQUEST, payload: { runId: seeded.runId } });
     expect(owner.allowed && dispatch.allowed).toBe(true);
     if (!owner.allowed || !dispatch.allowed) return;
 
@@ -692,24 +540,17 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
     expect(taken.hasMore).toBe(false);
   });
 
-  /**
-   * The queued count is the other expiry-gated read, and `hasMore` is the only thing that reports
-   * it. A row that only claimed one message would leave that query untested.
-   */
-  it("reports a long-queued owner-message through hasMore while another is unsettled", () => {
+  it("reports later mail through hasMore while redelivering an old unACKed ID", () => {
     const { core, seeded } = seededCore();
-    const first = enqueueOwnerMessage(core, seeded, "the first words");
-    core.clock.advance(1_000);
-    const second = enqueueOwnerMessage(core, seeded, "the second words");
-    expect(first.allowed && second.allowed).toBe(true);
-    if (!first.allowed || !second.allowed) return;
-
-    expect(core.outbox.claimForHolder(holderOf(seeded)).claimed).toHaveLength(1);
-    core.clock.advance(31 * 60 * 1000);
-    const blocked = core.outbox.claimForHolder(holderOf(seeded));
-    expect(blocked.unresolved.map((m) => m.messageId)).toEqual([first.value.messageId]);
-    // The second is still queued and still counted, an hour after it was enqueued.
-    expect(blocked.hasMore).toBe(true);
+    const first = enqueueOwnerMessage(core, seeded, "first");
+    core.clock.advance(1000);
+    const second = enqueueOwnerMessage(core, seeded, "second");
+    if (!first.allowed || !second.allowed) throw new Error("enqueue refused");
+    core.outbox.claimForHolder(holderOf(seeded));
+    core.clock.advance(31 * 60_000);
+    const taken = core.outbox.claimForHolder(holderOf(seeded));
+    expect(taken.claimed.map((row) => row.messageId)).toEqual([first.value.messageId]);
+    expect(taken.hasMore).toBe(true);
     expect(core.outbox.get(second.value.messageId)?.status).toBe("PENDING");
   });
 
@@ -722,7 +563,7 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
    * not by the outbox. A row that called `retargetOrReject` directly would move the columns and
    * never establish that anybody can claim the result.
    */
-  it("hands a queued owner-message to the successor exactly once after a takeover", () => {
+  it("hands an unACKed owner-message to the successor with its stable ID after a takeover", () => {
     const { core, seeded } = seededCore();
     const owner = enqueueOwnerMessage(core, seeded, "for whoever holds the role");
     expect(owner.allowed).toBe(true);
@@ -763,192 +604,57 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
     expect(first.claimed.map((m) => m.messageId)).toEqual([owner.value.messageId]);
     expect(first.claimed[0]?.payload).toEqual({ text: "for whoever holds the role" });
 
-    // Exactly once: the second wake reports it unsettled rather than handing the words again.
+    // A lost ACK causes at-least-once delivery with the same message ID.
     const second = core.outbox.claimForHolder(successorHolder);
-    expect(second.claimed).toEqual([]);
-    expect(second.unresolved.map((m) => m.messageId)).toEqual([owner.value.messageId]);
-    expect(JSON.stringify(second)).not.toContain("for whoever holds the role");
+    expect(second.claimed.map((m) => m.messageId)).toEqual([owner.value.messageId]);
+    expect(second.unresolved).toEqual([]);
 
     // And the runtime it was addressed to before the switch is handed nothing.
     expect(core.outbox.claimForHolder(holderOf(seeded)).claimed).toEqual([]);
   });
 
-  /**
-   * A `SURVIVED` switch moves the runtime and nothing else, and the owner-message lifecycle has to
-   * move with it — in the same transaction.
-   *
-   * The two notions of "current holder" are the whole defect. `BindingRegistry.switchTo` with
-   * `conversation: "SURVIVED"` writes only `conversational_actors.current_session_id`: the
-   * counterpart is the same conversation, its process is not, so the assignment row is not
-   * rewritten and keeps naming the runtime that is gone. The outbox predicates asked
-   * `assignments.session_id`, so after the move the queued row is addressed to a session no
-   * connection can present, the incoming runtime cannot claim it, and a *fresh* admission for the
-   * role is rolled back with `OUTBOX_TARGET_NOT_CURRENT` because the registry's own
-   * `activeRoleTarget` reports the actor's session while the outbox checks the assignment's. The
-   * owner is told none of it.
-   *
-   * So the row asserts both sides of the move. Before: the queued message is addressed to the
-   * outgoing runtime and the handed-over one is unresolved. After: the queued message is the
-   * incoming runtime's and carries the same words, the outgoing runtime is handed nothing, the
-   * handed-over one is terminal with its ingress claim settled — its outcome is unknown and the
-   * process it was handed to is gone, so replaying it into the new one is the single thing this
-   * kind must never do — and a new owner-message for the role is admitted rather than refused.
-   */
-  it("carries a queued owner-message across a surviving runtime move and closes the handed-over one", () => {
+  it("carries both pending and unACKed mail across a surviving runtime move", () => {
     const { core, seeded } = seededCore();
-
-    const handedOver = enqueueOwnerMessage(core, seeded, "handed over before the runtime moved");
-    expect(handedOver.allowed).toBe(true);
-    if (!handedOver.allowed) return;
-    const handedOverNonce = "buzz-message:evt-survived-sent";
-    seedIngressClaim(core, handedOver.value.messageId, handedOverNonce);
-    expect(core.outbox.claimForHolder(holderOf(seeded)).claimed).toHaveLength(1);
-
-    const queued = enqueueOwnerMessage(core, seeded, "queued before the runtime moved");
-    expect(queued.allowed).toBe(true);
-    if (!queued.allowed) return;
-    const queuedNonce = "buzz-message:evt-survived-pending";
-    seedIngressClaim(core, queued.value.messageId, queuedNonce);
-
-    // Before: both rows are the outgoing runtime's, and neither ingress claim is settled.
-    expect(core.bindings.active(seeded.roleKey)?.sessionId).toBe(seeded.sessionId);
-    expect(core.outbox.get(queued.value.messageId)?.status).toBe("PENDING");
-    expect(core.outbox.get(queued.value.messageId)?.targetSessionId).toBe(seeded.sessionId);
-    expect(core.outbox.get(handedOver.value.messageId)?.status).toBe("SENT");
-    expect(turnClaim(core, queuedNonce).noReplyAt).toBeUndefined();
-    expect(turnClaim(core, handedOverNonce).noReplyAt).toBeUndefined();
-
-    const incoming = core.sessions.create({ provider: "claude", model: "same-cto-new-process" });
-    expect(
-      core.sessions.transition(incoming.sessionId, SessionLifecycle.READY, "respawn").allowed,
-    ).toBe(true);
-    const switched = core.bindings.switchTo({
-      role: Role.PRIMARY_CTO,
-      projectId: seeded.projectId,
-      sessionId: incoming.sessionId,
-      reason: "the runtime died and the conversation did not",
-      conversation: "SURVIVED",
-    });
-    expect(switched.allowed).toBe(true);
-    if (!switched.allowed) return;
-    // The binding was not rewritten: same generation, new runtime.
-    expect(switched.value.bindingGeneration).toBe(seeded.generation);
-    expect(switched.value.sessionId).toBe(incoming.sessionId);
-    expect(switched.value.boundSessionId).toBe(seeded.sessionId);
-
-    // After: the queued row followed the runtime, still queued and still holding its claim open.
-    expect(core.outbox.get(queued.value.messageId)?.status).toBe("PENDING");
-    expect(core.outbox.get(queued.value.messageId)?.targetSessionId).toBe(incoming.sessionId);
-    expect(core.outbox.get(queued.value.messageId)?.bindingGeneration).toBe(seeded.generation);
-    expect(turnClaim(core, queuedNonce).noReplyAt).toBeUndefined();
-
-    // After: the handed-over row is terminal, and the turn it was holding open is settled here —
-    // never `repliedAt`, because nothing handed a reply to any transport.
-    expect(core.outbox.get(handedOver.value.messageId)?.status).toBe("REJECTED");
-    expect(turnClaim(core, handedOverNonce).noReplyAt).toEqual(expect.any(String));
-    expect(turnClaim(core, handedOverNonce).repliedAt).toBeUndefined();
-
-    // A fresh admission for the role is admitted against the runtime the registry reports, which
-    // is the incoming one. This is the enqueue that used to roll back `OUTBOX_TARGET_NOT_CURRENT`.
-    const afterMove = core.outbox.enqueue({
-      idempotencyKey: `owner:${crypto.randomUUID()}`,
-      roleKey: seeded.roleKey,
-      bindingGeneration: switched.value.bindingGeneration,
-      targetSessionId: switched.value.sessionId,
-      runId: null,
-      kind: MessageKind.OWNER_MESSAGE,
-      payload: { text: "written after the runtime moved" },
-    });
-    expect(afterMove.reasonCode).toBe(ReasonCode.OK);
-    expect(afterMove.allowed).toBe(true);
-
-    // The incoming runtime is handed the words the owner wrote before the move, oldest first.
-    const incomingHolder: HolderIdentity = {
-      roleKey: seeded.roleKey,
-      bindingGeneration: switched.value.bindingGeneration,
-      targetSessionId: incoming.sessionId,
-      sessionIncarnation: core.sessions.require(incoming.sessionId).incarnation,
-    };
-    const taken = core.outbox.claimForHolder(incomingHolder);
-    expect(taken.unresolved).toEqual([]);
-    expect(taken.claimed.map((m) => m.messageId)).toEqual([queued.value.messageId]);
-    expect(taken.claimed[0]?.payload).toEqual({ text: "queued before the runtime moved" });
-
-    // And the runtime that is gone is handed nothing, under the identity it used to hold.
+    const first = enqueueOwnerMessage(core, seeded, "first");
+    if (!first.allowed) throw new Error(first.message);
+    core.outbox.claimForHolder(holderOf(seeded));
+    core.clock.advance(1000);
+    const second = enqueueOwnerMessage(core, seeded, "second");
+    if (!second.allowed) throw new Error(second.message);
+    const session = core.sessions.create({ provider: "claude", model: "moved" });
+    core.sessions.transition(session.sessionId, SessionLifecycle.READY, "test");
+    const moved = core.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: seeded.projectId,
+      sessionId: session.sessionId, reason: "same conversation", conversation: "SURVIVED" });
+    if (!moved.allowed) throw new Error(moved.message);
+    const holder = { roleKey: seeded.roleKey, bindingGeneration: seeded.generation,
+      targetSessionId: session.sessionId, sessionIncarnation: session.incarnation };
+    expect(core.outbox.claimForHolder(holder).claimed.map((row) => row.messageId)).toEqual([first.value.messageId]);
+    expect(core.outbox.completeForHolder(first.value.messageId, holder).allowed).toBe(true);
+    expect(core.outbox.claimForHolder(holder).claimed.map((row) => row.messageId)).toEqual([second.value.messageId]);
     expect(core.outbox.claimForHolder(holderOf(seeded)).claimed).toEqual([]);
   });
 
-  /**
-   * A message that has already been carried once has had its one safe move.
-   *
-   * `retargetOrReject` moved a `PENDING` owner-message on every takeover, so `G1 -> G2 -> G3`
-   * carried the owner's words to a second stranger's conversation and would carry them to a third.
-   * The `PENDING` status alone cannot tell the two apart — a row carried once looks exactly like a
-   * row that was never moved — so the compare-and-set has to assert the absence of the mark a
-   * previous carry left, and a row that fails it is rejected *and settled* here rather than moved
-   * again or left queued for a generation nobody holds.
-   *
-   * Both takeovers are real `BindingRegistry.switchTo` calls: the rule has to hold where production
-   * enters, not where a unit test can call the fence directly with whatever generations it likes.
-   */
-  it("carries a queued owner-message through one takeover and rejects it on the next", () => {
+  it("carries queued mail through any number of takeovers until ACK", () => {
     const { core, seeded } = seededCore();
-    const owner = enqueueOwnerMessage(core, seeded, "carried once, and only once");
-    expect(owner.allowed).toBe(true);
-    if (!owner.allowed) return;
-    const nonce = "buzz-message:evt-carried-twice";
+    const owner = enqueueOwnerMessage(core, seeded, "still unread");
+    if (!owner.allowed) throw new Error(owner.message);
+    const nonce = "buzz-message:takeovers";
     seedIngressClaim(core, owner.value.messageId, nonce);
-
-    const takeoverBy = (model: string) => {
-      const session = core.sessions.create({ provider: "claude", model });
-      expect(
-        core.sessions.transition(session.sessionId, SessionLifecycle.READY, "failover").allowed,
-      ).toBe(true);
-      const switched = core.bindings.switchTo({
-        role: Role.PRIMARY_CTO,
-        projectId: seeded.projectId,
-        sessionId: session.sessionId,
-        reason: `${model} takes the role`,
-        conversation: "REPLACED",
-        takeover: true,
-      });
-      expect(switched.allowed).toBe(true);
-      return { sessionId: session.sessionId, switched };
-    };
-
-    const second = takeoverBy("second-cto");
-    if (!second.switched.allowed) return;
-    // One carry: the row is the successor's, queued, and its ingress claim is still open.
-    expect(core.outbox.get(owner.value.messageId)?.status).toBe("PENDING");
-    expect(core.outbox.get(owner.value.messageId)?.targetSessionId).toBe(second.sessionId);
-    expect(core.outbox.get(owner.value.messageId)?.bindingGeneration).toBe(
-      second.switched.value.bindingGeneration,
-    );
-    expect(turnClaim(core, nonce).noReplyAt).toBeUndefined();
-
-    const third = takeoverBy("third-cto");
-    if (!third.switched.allowed) return;
-    // Not a second carry. The row is terminal where the first takeover left it, and the turn it
-    // was holding open is settled in that same transaction.
-    expect(core.outbox.get(owner.value.messageId)?.status).toBe("REJECTED");
-    expect(core.outbox.get(owner.value.messageId)?.targetSessionId).toBe(second.sessionId);
-    expect(core.outbox.get(owner.value.messageId)?.bindingGeneration).toBe(
-      second.switched.value.bindingGeneration,
-    );
+    let holder = holderOf(seeded);
+    for (let i = 0; i < 4; i++) {
+      const session = core.sessions.create({ provider: "claude", model: `replacement-${i}` });
+      core.sessions.transition(session.sessionId, SessionLifecycle.READY, "test");
+      const switched = core.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: seeded.projectId,
+        sessionId: session.sessionId, reason: "restart", conversation: "REPLACED", takeover: true });
+      if (!switched.allowed) throw new Error(switched.message);
+      holder = { roleKey: seeded.roleKey, bindingGeneration: switched.value.bindingGeneration,
+        targetSessionId: session.sessionId, sessionIncarnation: session.incarnation };
+      expect(core.outbox.get(owner.value.messageId)).toMatchObject({ status: "PENDING", targetSessionId: session.sessionId });
+      expect(turnClaim(core, nonce).noReplyAt).toBeUndefined();
+    }
+    expect(core.outbox.claimForHolder(holder).claimed.map((row) => row.messageId)).toEqual([owner.value.messageId]);
+    expect(core.outbox.completeForHolder(owner.value.messageId, holder).allowed).toBe(true);
     expect(turnClaim(core, nonce).noReplyAt).toEqual(expect.any(String));
-    expect(turnClaim(core, nonce).repliedAt).toBeUndefined();
-
-    // And the third holder is handed nothing at all — not the owner's words, not an unresolved row.
-    const thirdHolder: HolderIdentity = {
-      roleKey: seeded.roleKey,
-      bindingGeneration: third.switched.value.bindingGeneration,
-      targetSessionId: third.sessionId,
-      sessionIncarnation: core.sessions.require(third.sessionId).incarnation,
-    };
-    const handed = core.outbox.claimForHolder(thirdHolder);
-    expect(handed.claimed).toEqual([]);
-    expect(handed.unresolved).toEqual([]);
-    expect(JSON.stringify(handed)).not.toContain("carried once, and only once");
   });
 
   /**
@@ -963,7 +669,7 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
    *
    * The `RUN_DISPATCH` is the control: the fence still runs and still reaches everything else.
    */
-  it("leaves a queued owner-message alone when its session stops, and still retargets it", () => {
+  it("leaves a queued owner-message and an actionable dispatch alone when their session stops, and still retargets both", () => {
     const { core, seeded } = seededCore();
     const owner = enqueueOwnerMessage(core, seeded, "queued when the runtime died");
     const dispatch = enqueueDispatch(core, seeded);
@@ -973,12 +679,14 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
     expect(
       core.sessions.transition(seeded.sessionId, SessionLifecycle.STOPPED, "restart").allowed,
     ).toBe(true);
-    expect(core.outbox.get(dispatch.value.messageId)?.status).toBe("REJECTED");
+    // ACP-R1-01: an actionable instruction is the role's too; the stop keeps it for the next holder.
+    expect(core.outbox.get(dispatch.value.messageId)?.status).toBe("PENDING");
     expect(core.outbox.get(owner.value.messageId)?.status).toBe("PENDING");
 
-    // The generic fence agrees: a queued holder-claimed row is not its business either.
+    // The generic fence agrees: neither is its business.
     core.outbox.fenceUndeliverable();
     expect(core.outbox.get(owner.value.messageId)?.status).toBe("PENDING");
+    expect(core.outbox.get(dispatch.value.messageId)?.status).toBe("PENDING");
 
     const successor = core.sessions.create({ provider: "claude", model: "successor-cto" });
     expect(
@@ -991,71 +699,35 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
       successor.sessionId,
     );
     expect(moved.retargeted).toContain(owner.value.messageId);
+    expect(moved.retargeted).toContain(dispatch.value.messageId);
     expect(core.outbox.get(owner.value.messageId)?.targetSessionId).toBe(successor.sessionId);
+    expect(core.outbox.get(dispatch.value.messageId)).toMatchObject({ status: "PENDING", targetSessionId: successor.sessionId });
   });
 
-  /**
-   * Fencing a handed-over owner-message settles the ingress claim it was holding open, in the same
-   * transaction as the outbox transition.
-   *
-   * Without it the claim carries no `repliedAt`, no `noReplyAt` and no `settledAt`, which makes the
-   * row permanently exempt from `IngressGuard.prune` — the `(buzz, nonce)` slot is never freed and
-   * `doctor` reports the turn outstanding forever, while the outbox row that was holding it open is
-   * terminal and gone.
-   */
-  it("settles the ingress claim in the same transaction as it fences a handed-over owner-message", () => {
+  it("keeps the ingress claim open while a crashed receiver has not ACKed", () => {
     const { core, seeded } = seededCore();
-    const owner = enqueueOwnerMessage(core, seeded, "handed over, never answered");
-    expect(owner.allowed).toBe(true);
-    if (!owner.allowed) return;
-    const nonce = "buzz-message:evt-fenced";
+    const owner = enqueueOwnerMessage(core, seeded, "not ACKed");
+    if (!owner.allowed) throw new Error(owner.message);
+    const nonce = "buzz-message:crashed";
     seedIngressClaim(core, owner.value.messageId, nonce);
-
-    expect(core.outbox.claimForHolder(holderOf(seeded)).claimed).toHaveLength(1);
-    // The claim is outstanding while the row is unresolved: that is what holds `prune` off it.
+    core.outbox.claimForHolder(holderOf(seeded));
+    core.sessions.transition(seeded.sessionId, SessionLifecycle.STOPPED, "crash");
+    expect(core.outbox.fenceUndeliverable()).toBe(0);
+    expect(core.outbox.get(owner.value.messageId)?.status).toBe("SENT");
     expect(turnClaim(core, nonce).noReplyAt).toBeUndefined();
-
-    expect(
-      core.sessions.transition(seeded.sessionId, SessionLifecycle.STOPPED, "restart").allowed,
-    ).toBe(true);
-    expect(core.outbox.fenceUndeliverable()).toBe(1);
-    expect(core.outbox.get(owner.value.messageId)?.status).toBe("REJECTED");
-
-    const claim = turnClaim(core, nonce);
-    expect(claim.noReplyAt).toEqual(expect.any(String));
-    // Never `repliedAt`: nothing handed a reply to any transport.
-    expect(claim.repliedAt).toBeUndefined();
   });
 
-  /**
-   * The revoke shape of `retargetOrReject` — `fromGeneration === toGeneration`, which is what
-   * `BindingRegistry.revoke` passes — must terminally reject and settle here, and must not report
-   * the row as retargeted.
-   *
-   * `revoke` runs its own direct `UPDATE outbox SET status = 'REJECTED'` over every id this
-   * returns as `retargeted`, because for a revoked role there is nothing to retarget onto. That
-   * write knows nothing about ingress claims, so an owner-message reaching it would be settled
-   * behind this method's back. The id not being in `retargeted` is what makes the bypass
-   * unreachable rather than merely unused.
-   */
-  it("rejects and settles a queued owner-message on a revoke, and never reports it retargeted", () => {
+  it("retains queued mail on revocation until there is a successor", () => {
     const { core, seeded } = seededCore();
-    const owner = enqueueOwnerMessage(core, seeded, "the role is going away");
-    expect(owner.allowed).toBe(true);
-    if (!owner.allowed) return;
-    const nonce = "buzz-message:evt-revoked";
+    const owner = enqueueOwnerMessage(core, seeded, "waiting for successor");
+    if (!owner.allowed) throw new Error(owner.message);
+    const nonce = "buzz-message:revoked";
     seedIngressClaim(core, owner.value.messageId, nonce);
-
-    const revoked = core.outbox.retargetOrReject(
-      seeded.roleKey,
-      seeded.generation,
-      seeded.generation,
-      seeded.sessionId,
-    );
-    expect(revoked.retargeted).not.toContain(owner.value.messageId);
-    expect(revoked.rejected).toContain(owner.value.messageId);
-    expect(core.outbox.get(owner.value.messageId)?.status).toBe("REJECTED");
-    expect(turnClaim(core, nonce).noReplyAt).toEqual(expect.any(String));
+    const revoked = core.outbox.retargetOrReject(seeded.roleKey, seeded.generation, seeded.generation, seeded.sessionId);
+    expect(revoked.retargeted).toEqual([]);
+    expect(revoked.rejected).toEqual([]);
+    expect(core.outbox.get(owner.value.messageId)?.status).toBe("PENDING");
+    expect(turnClaim(core, nonce).noReplyAt).toBeUndefined();
   });
 
   /**

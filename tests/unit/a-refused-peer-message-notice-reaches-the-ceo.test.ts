@@ -234,6 +234,10 @@ const refusedWithNoSuccessor = async () => {
     payload: { sourceChannel: "buzz", sourceNonce: nonce, sourcePayloadDigest: digestOf(admitted) },
   });
   if (!queued.allowed) throw new Error(`enqueue failed: ${queued.message}`);
+  // The authenticated holder explicitly revokes this instruction; a mere runtime loss retains it.
+  expect(h.cp.outbox.rejectForHolder(queued.value.messageId, { roleKey: ctoRoleKey,
+    bindingGeneration: bound.value.bindingGeneration, targetSessionId: cto.sessionId,
+    sessionIncarnation: cto.incarnation }).allowed).toBe(true);
   expect(h.cp.bindings.revoke(ctoRoleKey, "the CTO is gone").reasonCode).toBe(ReasonCode.OK);
   expect(h.cp.bindings.active(ctoRoleKey)).toBeNull();
   const owed = h.cp.db.all<{ message_id: string; role_key: string; reason: string }>(

@@ -10,7 +10,12 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
-import { HOLDER_CLAIMED_KIND_SQL } from "../outbox/outbox.ts";
+import {
+  HOLDER_CLAIMED_KIND_SQL,
+  handoverInstructionRowSql,
+  inBandRow,
+  settleStoppedSessionInstructions,
+} from "../outbox/outbox.ts";
 import { isBuzzKeyPossession, type BuzzKeyPossession } from "../buzz/buzz-bind-challenge.ts";
 import { isAdmittedRuntime, type AdmittedRuntime } from "./runtime-lineage.ts";
 
@@ -398,14 +403,22 @@ export class SessionRegistry {
    * slot then permanently exempt from `IngressGuard.prune`, and the turn reported outstanding
    * forever. It also fired *first* in the ordinary failure ordering (the runtime dies, then a
    * successor binds), so it destroyed the message before the takeover could ever reach it.
+   *
+   * ACP-R1-01: an actionable instruction is addressed to the role too, whatever its route, so it is
+   * not this write's either. The one handover policy keeps it, queued, for the role's next
+   * authenticated holder, or supersedes it with its reason when it no longer addresses anything live
+   * (`settleStoppedSessionInstructions`), in this same transaction.
    */
   private fenceUndeliveredMessages(sessionId: string, to: SessionLifecycle): string[] {
     if (to !== SessionLifecycle.ERROR && to !== SessionLifecycle.STOPPED) return [];
+    settleStoppedSessionInstructions(this.db, this.audit, sessionId);
     const doomed = this.db
       .all<{ message_id: string }>(
         `SELECT message_id FROM outbox
           WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')
-            AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})`,
+            AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION')
+            AND NOT ${inBandRow("outbox")}
+            AND NOT ${handoverInstructionRowSql("outbox")}`,
         [sessionId],
       )
       .map((row) => row.message_id);
@@ -414,7 +427,9 @@ export class SessionRegistry {
       `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
                          retry_eligible = 0, next_attempt_at = NULL
         WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')
-          AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})`,
+          AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION')
+            AND NOT ${inBandRow("outbox")}
+            AND NOT ${handoverInstructionRowSql("outbox")}`,
       [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, sessionId],
     );
     return doomed;
@@ -843,11 +858,36 @@ export class SessionRegistry {
   }
 
   setBuzzAddress(sessionId: string, address: string | null): void {
-    this.db.run(`UPDATE sessions SET buzz_address = ?, updated_at = ? WHERE session_id = ?`, [
-      address,
-      this.clock.nowIso(),
-      sessionId,
-    ]);
+    this.db.tx(() => {
+      this.db.run(`UPDATE sessions SET buzz_address = ?, updated_at = ? WHERE session_id = ?`, [
+        address,
+        this.clock.nowIso(),
+        sessionId,
+      ]);
+      // ACP-R1-04: a role whose current runtime this is joins the new room now, not when the
+      // session was created or bound.
+      this.recordRoomMembership(sessionId);
+    });
+  }
+
+  /**
+   * ACP-R1-04 — records, for every ACTIVE role whose current runtime is `sessionId` (the actor's
+   * runtime pointer, else the binding's own session), that the role is a recipient in that runtime's
+   * Buzz room from now on, unless the role already joined that room earlier. The first join stands:
+   * a later runtime move, address change or generation never moves it, and leaving a room does not
+   * erase it. Called in the transaction that put the runtime there — a binding, a runtime move or an
+   * address change. Writes nothing for a runtime with no room.
+   */
+  recordRoomMembership(sessionId: string): void {
+    this.db.run(
+      `INSERT OR IGNORE INTO role_room_memberships (role_key, conversation, joined_at, session_id)
+        SELECT a.role_key, s.buzz_address, ?, s.session_id
+          FROM assignments a
+          LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+          JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
+         WHERE a.status = 'ACTIVE' AND s.session_id = ? AND COALESCE(s.buzz_address, '') <> ''`,
+      [this.clock.nowIso(), sessionId],
+    );
   }
 
   /** PRD §9.3 — BUSY is computed, not stored. */

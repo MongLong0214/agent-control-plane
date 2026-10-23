@@ -143,8 +143,8 @@ const start = async (options: { canonical?: "missing" | "different" | "correct" 
       ]).length,
     requestsFor: (to: Cto) => relay.requested.filter((request) => request.pubkey === keys[to].pubkey).length,
     inboundRows: (eventId: string) =>
-      h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`, [
-        buzzMessageNonce(eventId),
+      h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM inbound_messages WHERE channel = 'buzz' AND (nonce = ? OR json_extract(payload_json, '$.sourceEventId') = ?)`, [
+        buzzMessageNonce(eventId), eventId,
       ])!.n,
     close: async () => {
       subscriber.close();

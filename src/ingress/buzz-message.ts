@@ -1,4 +1,5 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { verifyEvent, type Event } from "nostr-tools/pure";
 
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -33,6 +34,9 @@ export const BUZZ_MESSAGE_NONCE_PREFIX = "buzz-message:";
 export interface BuzzMessageIngressInput {
   /** Buzz channel identity (the relay's authenticated pubkey), not a role. */
   actor: string;
+  /** Verified relay event, stored once; routing and claims are per stable recipient role. */
+  signedEvent?: Event;
+  recipientRoleKey?: string;
   /** The Buzz room/thread the event arrived on, and the one its answer goes back to. */
   conversation: string;
   /** The relay's own event id; the durable replay key for this message. */
@@ -200,8 +204,9 @@ const noSuccessor = (): boolean => false;
 
 /**
  * Recheck the CEO author's identity, the receiving CTO holder and its channel before hand-over.
- * CEO generations and runtime moves do not invalidate a message. A CTO successor still needs
- * the existing one-hop canonical carry record, and the CTO proof is never rewritten.
+ * CEO generations and runtime moves do not invalidate a message. Any holder other than the
+ * proof's exact one must be proven to continue the same conversation (`successorOf`); the CTO
+ * proof is never rewritten.
  */
 export const peerProofIsCurrent = (
   source: AdmittedPeerSource | undefined,
@@ -210,10 +215,12 @@ export const peerProofIsCurrent = (
   /** The receiving CTO session's current `buzz_address`, or null. */
   ctoChannel: string | null,
   /**
-   * Whether this holder is the one-hop same-actor canonical successor of the CTO session the
-   * proof names, for this row (`selfClaimCarriedTo`). Asked only when the proof's CTO half names
-   * generation `holder.bindingGeneration - 1` and another session; the default answers no, so a
-   * caller that supplies nothing accepts the proof's exact holder alone.
+   * Whether this holder is an authenticated continuation of the CTO session the proof names, for
+   * this row: a canonical restart's carry (`selfClaimCarriedTo`), or a proven continuation of the
+   * same conversation. Asked only when the proof's CTO half names another session at this
+   * holder's generation or an earlier one — a surviving runtime move keeps the generation
+   * (ACP-R1-02) — never for a proof from a later generation; the default answers no, so a caller
+   * that supplies nothing accepts the proof's exact holder alone.
    */
   successorOf: (proofCto: PeerProofCto) => boolean = noSuccessor,
 ): boolean => {
@@ -229,13 +236,13 @@ export const peerProofIsCurrent = (
     proof["ctoRoleKey"] === holder.roleKey &&
     ctoChannel !== null &&
     source.conversation === ctoChannel &&
-    // The CTO the proof names is this holder — or, the one case besides it (2026-10-03), the
-    // holder is that CTO's conversation restarted once: generation + 1, another session, and the
-    // self-claim's carry record for this row says so. The proof itself is never rewritten.
+    // The CTO the proof names is this holder — or the holder continues that CTO's conversation on
+    // another session, at the same generation (a surviving runtime move) or a later one (a
+    // restart), and `successorOf` proves it for this row. The proof itself is never rewritten.
     ((ctoGeneration === holder.bindingGeneration && ctoSession === holder.targetSessionId) ||
       (typeof ctoGeneration === "number" &&
         Number.isSafeInteger(ctoGeneration) &&
-        holder.bindingGeneration === ctoGeneration + 1 &&
+        holder.bindingGeneration >= ctoGeneration &&
         typeof ctoSession === "string" &&
         ctoSession !== holder.targetSessionId &&
         successorOf({ roleKey: holder.roleKey, bindingGeneration: ctoGeneration, sessionId: ctoSession })))
@@ -347,15 +354,21 @@ export const peerMessageRefusalNoticeOf = (row: {
 }): PeerMessageRefusalNotice => ({
   messageId: row.message_id,
   sourceEventId: row.source_channel === "buzz" && row.source_nonce?.startsWith(BUZZ_MESSAGE_NONCE_PREFIX)
-    ? row.source_nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length)
+    ? buzzMessageEventId(row.source_nonce)
     : null,
   sender: row.sender,
   reason: row.reason,
 });
 
 /** The durable replay key for one Buzz event. */
-export const buzzMessageNonce = (eventId: string): string =>
-  `${BUZZ_MESSAGE_NONCE_PREFIX}${eventId}`;
+export const buzzMessageNonce = (eventId: string, recipientRoleKey?: string): string =>
+  `${BUZZ_MESSAGE_NONCE_PREFIX}${eventId}${recipientRoleKey === undefined ? "" : `:${digestOf(recipientRoleKey).slice(7)}`}`;
+
+/** Recover the native event ID from a per-recipient replay key; preserve legacy opaque IDs. */
+export const buzzMessageEventId = (nonce: string): string => {
+  const id = nonce.startsWith(BUZZ_MESSAGE_NONCE_PREFIX) ? nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length) : nonce;
+  return /^([a-f0-9]{64}):[a-f0-9]{64}$/.exec(id)?.[1] ?? id;
+};
 
 /**
  * The envelope the relay signs.
@@ -368,7 +381,7 @@ export const buzzMessageNonce = (eventId: string): string =>
 export const buzzMessagePayload = (
   input: Pick<
     BuzzMessageIngressInput,
-    "conversation" | "addressedTo" | "mention" | "text" | "peer" | "createdAt" | "replyToEventId"
+    "conversation" | "addressedTo" | "mention" | "text" | "peer" | "createdAt" | "replyToEventId" | "signedEvent" | "recipientRoleKey"
   >,
 ): Record<string, unknown> => ({
   type: "BUZZ_MESSAGE",
@@ -379,7 +392,9 @@ export const buzzMessagePayload = (
   // CEO envelope from being replayed with a `p` tag bolted on to redirect it at another role:
   // remove it and that tampered envelope verifies.
   mention: input.mention ?? null,
-  text: input.text,
+  ...(input.signedEvent === undefined ? { text: input.text } : {
+    sourceEventId: input.signedEvent.id, sourceEventDigest: digestOf(input.signedEvent), recipientRoleKey: input.recipientRoleKey,
+  }),
   ...(input.replyToEventId === undefined ? {} : { replyToEventId: input.replyToEventId }),
   // #1038. Only on a peer envelope, preserving owner payloads without the optional reply field
   // and the digests already recorded over them. Adding or removing the pair changes the payload
@@ -410,7 +425,7 @@ export interface OwnerMessagePointer {
 export const ownerMessagePointer = (
   input: Pick<
     BuzzMessageIngressInput,
-    "conversation" | "addressedTo" | "mention" | "text" | "peer" | "createdAt" | "replyToEventId"
+    "conversation" | "addressedTo" | "mention" | "text" | "peer" | "createdAt" | "replyToEventId" | "signedEvent" | "recipientRoleKey"
   >,
   nonce: string,
 ): OwnerMessagePointer => ({
@@ -440,13 +455,13 @@ export const ownerMessagePointerOf = (payload: unknown): OwnerMessagePointer | n
 export const buzzMessageSigningRequest = (
   input: Pick<
     BuzzMessageIngressInput,
-    "actor" | "conversation" | "eventId" | "addressedTo" | "mention" | "text" | "peer" | "createdAt" | "replyToEventId"
+    "actor" | "conversation" | "eventId" | "addressedTo" | "mention" | "text" | "peer" | "createdAt" | "replyToEventId" | "signedEvent" | "recipientRoleKey"
   >,
 ): IngressRequest => ({
   channel: "buzz",
   actor: input.actor,
   conversation: input.conversation,
-  nonce: buzzMessageNonce(input.eventId),
+  nonce: buzzMessageNonce(input.eventId, input.recipientRoleKey),
   payload: buzzMessagePayload(input),
 });
 
@@ -514,6 +529,8 @@ export interface BuzzMentionRouter {
   rolesFor(mention: string): readonly string[];
   /** Records one unresolvable tag. Called once per refused envelope, before any turn exists. */
   journalUnbound(record: UnboundMentionRecord): void;
+  /** Called only after the ingress HMAC/allowlist and signed-event validation. */
+  retainEvent?(event: Event): Decision<void>;
 }
 
 /** An admitted Buzz message, in the shape the turn machinery needs it. */
@@ -690,6 +707,23 @@ export class BuzzMessageIngress {
         "buzz message ingress requires an actor, conversation, event id and text",
       );
     }
+    // Sender/target authentication precedes interpretation of a relay event's body.
+    if (!this.#ownerActors.has(input.actor.trim())) {
+      const peer = this.#peerBinding(input);
+      if (!peer.allowed) return peer as Decision<AdmittedBuzzMessage>;
+    }
+    if (input.signedEvent !== undefined || input.recipientRoleKey !== undefined) {
+      const event = input.signedEvent;
+      if (!event || !input.recipientRoleKey || !verifyEvent(JSON.parse(JSON.stringify(event)) as Event) ||
+          event.id !== input.eventId || event.pubkey !== input.actor || event.content !== input.text ||
+          event.created_at !== input.createdAt || event.kind !== 9 ||
+          !event.tags.some((tag) => tag[0] === "h" && tag[1] === input.conversation) ||
+          (event.tags.some((tag) => tag[0] === "p")
+            ? !event.tags.some((tag) => tag[0] === "p" && tag[1] === input.mention)
+            : !this.#ownerActors.has(input.actor.trim()))) {
+        return deny(ReasonCode.INGRESS_SIGNATURE_INVALID, "the signed event does not bind this delivery");
+      }
+    }
     if (!this.#ownerActors.has(input.actor.trim())) {
       // Not an owner, so either the current CEO binding speaking as a peer to its bound
       // PRIMARY_CTO, or nobody. Never the owner path below: that is the owner's authority (#1038).
@@ -705,6 +739,10 @@ export class BuzzMessageIngress {
     const request = buzzMessageSigningRequest(input);
     const admitted = this.guard.admit({ ...request, signature: input.signature ?? null });
     if (!admitted.allowed) return admitted as Decision<AdmittedBuzzMessage>;
+    if (input.signedEvent) {
+      const retained = this.router.retainEvent?.(input.signedEvent);
+      if (!retained?.allowed) return deny(ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH, "signed event could not be retained");
+    }
 
     // Past this line the sender is authenticated and this event id is being seen for the first
     // time, so the address may be looked up and one journal row may be written. The nonce is
@@ -748,7 +786,8 @@ export class BuzzMessageIngress {
       return current as Decision<AdmittedBuzzMessage>;
     }
     // Keep the receipt's CTO holder fence across dispatch; CEO rotations do not change it.
-    if (!samePeerBinding(input.peer, current.value)) {
+    if (!samePeerBinding(input.peer, current.value) ||
+        (input.recipientRoleKey !== undefined && input.recipientRoleKey !== current.value.ctoRoleKey)) {
       return deny(
         ReasonCode.BUZZ_PEER_GENERATION_STALE,
         "the envelope was bound to a CTO session that is no longer current",
@@ -762,6 +801,10 @@ export class BuzzMessageIngress {
     const request = buzzMessageSigningRequest(input);
     const admitted = this.guard.admit({ ...request, signature: input.signature ?? null });
     if (!admitted.allowed) return admitted as Decision<AdmittedBuzzMessage>;
+    if (input.signedEvent) {
+      const retained = this.router.retainEvent?.(input.signedEvent);
+      if (!retained?.allowed) return deny(ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH, "signed event could not be retained");
+    }
     return allow(ReasonCode.UNTRUSTED_CONTENT_IS_DATA, {
       text: input.text,
       eventId: input.eventId,
@@ -818,6 +861,9 @@ export class BuzzMessageIngress {
           "the mentioned buzz channel identity does not name exactly one role this daemon can address",
           { channel: "buzz", target: mention, candidates: candidates.length, shape },
         );
+      }
+      if (input.recipientRoleKey !== undefined && input.recipientRoleKey !== roleKey) {
+        return deny(ReasonCode.MENTION_TARGET_UNBOUND, "the current recipient does not hold the intended role");
       }
       return allow(ReasonCode.OK, { kind: "ROLE", roleKey });
     }
@@ -923,7 +969,8 @@ export interface ActiveRoleTarget {
   targetSessionId: string;
   /**
    * When this binding generation was created: the assignment row's `created_at`, which a runtime
-   * move within the generation keeps. A mention signed before it is refused.
+   * move within the generation keeps. The binding floor's fallback when the port records no history
+   * of the role in the envelope's room (`BuzzMessageTurnPort.recipientHistorySince`).
    */
   createdAt: string;
 }
@@ -955,6 +1002,17 @@ export interface BuzzMessageTurnPort {
    * stamped with whichever generation the CEO happened to be at.
    */
   activeRoleTarget(roleKey: string): ActiveRoleTarget | null;
+  /**
+   * ACP-R1-04 — since when the stable role has been a recipient in `conversation` (the room the
+   * envelope arrived on), from the binding registry's own records and nothing about delivery: no
+   * outbox status, claim or ACK is read. Null when the registry records no history of the role in
+   * that room; the binding floor then falls back to the current generation's creation. A port
+   * without it judges every envelope against `ActiveRoleTarget.createdAt`.
+   */
+  recipientHistorySince?(roleKey: string, conversation: string): string | null;
+  existingRoleMessage?(input: { eventId: string; roleKey: string; actor: string; conversation: string; text: string }):
+    Decision<{ messageId: string; status: string } | null>;
+  queuedRoleMessage?(nonce: string): { messageId: string; roleKey: string; payload: unknown; status: string } | null;
   /**
    * The one non-retargetable outbox row this admission produces, carrying only the pointer.
    *
@@ -1033,6 +1091,7 @@ type BuzzMessageAdmission =
       readonly admitted: AdmittedBuzzMessage;
       readonly roleKey: string;
       readonly messageId: string;
+      readonly duplicate?: boolean;
     };
 
 /**
@@ -1063,16 +1122,21 @@ const rolledBackDecision = (err: unknown): Decision<never> | null =>
  * identity, a new room, the first start — asks for all of it; without this, mentions from weeks
  * before the binding are queued as new work for whoever holds the role now.
  *
- * The floor is the binding's creation, never "now": a message signed after it while no session was
- * attached is the holder's, and is admitted whenever it arrives. An envelope with no signed time
- * (the local socket's) has nothing to compare and is not refused here.
+ * The floor is never "now": a message signed after it while no session was attached is the
+ * holder's, and is admitted whenever it arrives. It is the stable role's history in the room the
+ * envelope arrived on (`recipientHistorySince`, ACP-R1-04), so mail signed in that room between two
+ * generations still reaches the role, while history from a room the role joined later is refused
+ * however long the role answered elsewhere. An envelope with no signed time (the local socket's)
+ * has nothing to compare and is not refused here.
  */
 const precedingBinding = (
   input: BuzzMessageIngressInput,
   roleKey: string,
   active: ActiveRoleTarget,
+  port: Pick<BuzzMessageTurnPort, "recipientHistorySince">,
 ): Decision<never> | null =>
-  input.createdAt !== undefined && signedSince(input.createdAt, active.createdAt) === null
+  input.createdAt !== undefined &&
+  signedSince(input.createdAt, port.recipientHistorySince?.(roleKey, input.conversation) ?? active.createdAt) === null
     ? deny(
         ReasonCode.BUZZ_MENTION_PRECEDES_BINDING,
         "the mention was signed before the addressed role's binding generation was created",
@@ -1129,8 +1193,19 @@ const admitBuzzMessage = (
         // forged, and no audit row would record the forgery.
         if (SPENT_NONCE_CODES.includes(admitted.reasonCode)) {
           const roleKey = ingress.addressedRole(input);
+          const existing = roleKey === null ? null : port.existingRoleMessage?.({ ...input, roleKey });
+          if (existing && !existing.allowed) return existing as Decision<BuzzMessageAdmission>;
+          const queued = existing?.allowed && existing.value
+            ? { ...existing.value, roleKey, payload: ownerMessagePointer(input, buzzMessageNonce(input.eventId, input.recipientRoleKey)) }
+            : port.queuedRoleMessage?.(buzzMessageNonce(input.eventId, input.recipientRoleKey));
+          if (queued && roleKey !== null && roleKey === queued.roleKey && ["PENDING", "SENT"].includes(queued.status) &&
+              (existing?.allowed || ownerMessagePointerOf(queued.payload)?.sourcePayloadDigest === digestOf(buzzMessagePayload(input)))) {
+            return allow(ReasonCode.UNTRUSTED_CONTENT_IS_DATA, { kind: "ROLE", roleKey, messageId: queued.messageId, duplicate: true,
+              admitted: { text: input.text, eventId: input.eventId, actor: input.actor, conversation: input.conversation,
+                nonce: buzzMessageNonce(input.eventId, input.recipientRoleKey), target: { kind: "ROLE", roleKey } } });
+          }
           const active = roleKey === null ? null : port.activeRoleTarget(roleKey);
-          const floor = roleKey !== null && active ? precedingBinding(input, roleKey, active) : null;
+          const floor = roleKey !== null && active ? precedingBinding(input, roleKey, active, port) : null;
           if (floor) throw rollingBack(floor);
         }
         return admitted as Decision<BuzzMessageAdmission>;
@@ -1143,6 +1218,17 @@ const admitBuzzMessage = (
       // The registry, once, inside the transaction — and the same answer is used for the outbox
       // row's fence and for the claim's `bindingDigest`. Reading it twice would let the two
       // disagree across a failover that landed between them.
+      const existing = port.existingRoleMessage?.({ ...input, roleKey: target.roleKey });
+      if (existing && !existing.allowed) throw rollingBack(existing);
+      if (existing?.allowed && existing.value) {
+        if (["PENDING", "SENT"].includes(existing.value.status)) {
+          throw rollingBack(allow(ReasonCode.UNTRUSTED_CONTENT_IS_DATA, {
+            kind: "ROLE", admitted: admitted.value, roleKey: target.roleKey, messageId: existing.value.messageId, duplicate: true,
+          }));
+        }
+        throw rollingBack(deny(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, "this recipient already settled the event",
+          { messageId: existing.value.messageId }));
+      }
       const active = port.activeRoleTarget(target.roleKey);
       if (!active) {
         throw rollingBack(
@@ -1171,7 +1257,7 @@ const admitBuzzMessage = (
       // The binding floor (`precedingBinding`). Thrown, so the admission rolls back and the refusal
       // writes nothing — the replay slot, the inbound row and the admission's audit row all go —
       // and a redelivery is refused the same way.
-      const floor = precedingBinding(input, target.roleKey, active);
+      const floor = precedingBinding(input, target.roleKey, active, port);
       if (floor) throw rollingBack(floor);
       const enqueued = port.enqueueOwnerMessage({
         roleKey: target.roleKey,
@@ -1228,7 +1314,7 @@ const queuedForRole = async (
     // has answered — the envelope was taken as durable data, which is precisely what `admit`
     // itself reports. Reusing the admission's own code keeps a relay from reading a queued
     // message as a delivered one.
-    ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
+    admission.duplicate ? ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED : ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
     {
       answer: ownerMessageQueuedSentence(woken.allowed ? null : woken.reasonCode),
       answeredByCeo: false,
@@ -1246,11 +1332,11 @@ const queuedForRole = async (
  * what happened when the wake was attempted. Nothing else is knowable from here.
  *
  * **No sentence may say that anyone takes the message.** Not the holder now, not a holder later,
- * not a successor. That is not a rule about phrasing, it is what the row can keep: the message is
- * addressed to one generation and one runtime, it reaches a successor only if a takeover carries it
- * — once, and only from `PENDING` — it is closed outright by a revoke or a second takeover, and a
- * hand-over that is never acknowledged ends terminal rather than repeated. Every one of those is a
- * path on which the owner would have been promised something that did not happen.
+ * not a successor. Storage and transport acceptance do not prove that a holder read the message.
+ * Unread and unACKed mail survives authenticated handovers with its original durable message ID.
+ * A crash before ACK can redeliver that ID, and terminal IDs suppress subsequent delivery.
+ * None of those delivery guarantees establishes that the holder has acted on the owner's words,
+ * so this response describes only the admission and wake facts this seam actually observed.
  *
  * The first attempt at this removed one phrase, "the next holder", and put the same promise back in
  * other words — "its holder takes it over its own connection whenever it next attaches". So the

@@ -163,6 +163,22 @@ const LATER_OBJECTS: ReadonlyArray<{ version: number; objects?: readonly string[
       "canonical_turns_no_rowid_replace", "canonical_turns_rowid_immutable", "canonical_turns_rowid_positive",
     ],
   },
+  { version: 51, objects: ["buzz_events", "holder_message_terminals", "outbox_holder_message_terminal", "role_room_memberships"] },
+  {
+    version: 52,
+    objects: [
+      "resident_project_provisioning", "canonical_session_entitlements", "project_retirements",
+      "canonical_entitlements_active_actor", "repositories_active_identity",
+      "resident_project_provisioning_identity_immutable", "resident_project_provisioning_no_replace",
+      "resident_project_provisioning_no_delete", "canonical_session_entitlements_identity_immutable",
+      "canonical_session_entitlements_no_replace", "canonical_session_entitlements_no_delete",
+      "project_retirements_identity_immutable", "project_retirements_no_replace", "project_retirements_no_delete",
+    ],
+    columns: [
+      "projects.buzz_address", "projects.retired_at", "projects.supersedes_project_id", "repositories.retired_at",
+      "bootstrap_applications.retired_at",
+    ],
+  },
   { version: 47, objects: ["run_artifacts_owner_decision_authority_guard"] },
   {
     version: 48,

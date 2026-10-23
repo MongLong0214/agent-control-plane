@@ -186,6 +186,7 @@ describe("integration of v40 (#1068) and v41 (#512 PR-B) from a v39 database", (
         { version: 48, migration_id: "v48-owner-decision-supersede-guard" },
         { version: 49, migration_id: "v49-branch-publish-receipts" },
         { version: 50, migration_id: "v50-post-merge-verification-reentry" },
+        { version: 51, migration_id: "v51-durable-recipient-delivery" },
         { version: 52, migration_id: "v52-resident-project-provisioning" },
       ]);
       const triggers = migrated.all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'trigger'`).map((row) => row.name);

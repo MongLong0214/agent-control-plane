@@ -132,7 +132,7 @@ export interface DeliveryFailure {
 }
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
-/** The append-only record that an ESCALATION_REPLY followed a takeover or a renewal; at most one per reply. */
+/** The append-only record that an ESCALATION_REPLY followed a takeover, a renewal or an in-band handover; one per carry. */
 const ESCALATION_REPLY_CARRIED = "ESCALATION_REPLY_CARRIED";
 /** The append-only record that a revocation held an ESCALATION_REPLY for its owner's renewal. */
 const ESCALATION_REPLY_HELD = "ESCALATION_REPLY_HELD";
@@ -244,19 +244,18 @@ const payloadUnambiguousSql = (alias: string): string =>
                        GROUP BY parent, key HAVING COUNT(*) > 1)
      ELSE 0 END)`;
 
-/**
- * The one hand-over predicate (review finding 01, round 3). The row `alias` names may go to anyone —
- * claimed by its holder, retargeted on a takeover, re-addressed on a runtime move, carried on a
- * restart — only if it never left PENDING, its admitted event was never spent — not taken out of
- * PENDING under another message id, and not answered — and SQLite reads its payload, one way. Answered means the event's turn once held a terminal fact (`TURN_TERMINAL`),
- * however its claim JSON reads now, so an ordinary `json_remove` after the ingress completed the turn
- * hands nothing over. Every one of those paths asserts exactly this, in the read that chooses the row
- * and in the statement that moves it, and nothing else does, so the paths cannot drift apart again.
- * Each read also asks `Outbox.#payloadHandOverEligible` of the parse the consumer itself delivers.
- */
+/** UnACKed IDs may replay; terminal IDs and another message's spent source may not. */
 export const handOverEligibleSql = (alias: string): string =>
-  `(${neverDepartedSql(alias)} AND ${sourceNeverSpentSql(alias, ["MESSAGE_DEPARTED", "TURN_TERMINAL"])}
-    AND ${payloadUnambiguousSql(alias)})`;
+  `(${payloadUnambiguousSql(alias)}
+    AND NOT EXISTS (SELECT 1 FROM holder_message_terminals terminal WHERE terminal.message_id = ${alias}.message_id)
+    AND (${neverDepartedSql(alias)} OR (${alias}.status = 'SENT' AND EXISTS (
+      SELECT 1 FROM holder_message_departures departed
+       WHERE departed.message_id = ${alias}.message_id AND departed.to_status = 'SENT')))
+    AND NOT EXISTS (SELECT 1 FROM holder_message_source_departures spent
+      WHERE spent.source_channel = 'buzz'
+        AND spent.source_nonce = (CASE WHEN json_valid(${alias}.payload_json) THEN json_extract(${alias}.payload_json, '$.sourceNonce') END)
+        AND (spent.reason = 'TURN_TERMINAL' OR spent.message_id <> ${alias}.message_id)))`;
+
 
 /**
  * The outward, role-level kinds an adopted canonical CTO receives in band rather than over Buzz.
@@ -290,6 +289,16 @@ export const IN_BAND_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
 export const IN_BAND_KIND_SQL = [...IN_BAND_KINDS]
   .map((kind) => `'${kind.replace(/'/g, "''")}'`)
   .join(", ");
+
+/**
+ * ACP-R1-01, ACP-R2-01 — the outward kinds whose message is never ended by a delivery window or a
+ * failed delivery attempt, only by an ACK or a recorded supersession: every actionable instruction
+ * (`IN_BAND_KINDS`), whatever its route, and a CEO notification. Their TTL is not a lifetime: the
+ * sweep does not expire them, delivery does not skip them for it, and ACK does not refuse them for it.
+ */
+const RETAINED_KIND_SQL = `${IN_BAND_KIND_SQL}, 'CEO_NOTIFICATION'`;
+const isRetainedKind = (kind: string): boolean =>
+  IN_BAND_KINDS.has(kind as MessageKind) || kind === MessageKind.CEO_NOTIFICATION;
 
 /**
  * #246 C4 — the kinds a provisioned (driven) runtime receives in band: every `IN_BAND_KINDS` kind,
@@ -332,7 +341,7 @@ export interface InBandDispatch {
  * An in-band row in the generic sweep's terms: the kind is in band and the target is an adopted
  * canonical runtime. `claimDeliverable` excludes it, and every in-band read below selects it.
  */
-const inBandRow = (outboxAlias: "o" | "outbox"): string =>
+export const inBandRow = (outboxAlias: "o" | "outbox"): string =>
   `((${outboxAlias}.kind IN (${IN_BAND_KIND_SQL})
      AND ${adoptedCanonicalRuntimeSql(`${outboxAlias}.target_session_id`)})
     OR (${outboxAlias}.kind IN (${PROVISIONED_IN_BAND_KIND_SQL})
@@ -365,6 +374,35 @@ const provisionedRuntimeSql = (sessionExpr: string): string => `EXISTS (
 const withheldFromSweep = (outboxAlias: "o" | "outbox"): string =>
   `(${inBandRow(outboxAlias)}
     OR ${drivenModeSql(`${outboxAlias}.target_session_id`)} NOT IN ('NONE', 'DRIVEN'))`;
+
+/**
+ * ACP-R1-03 — the session is the current runtime of an actor whose conversation target is a Hermes
+ * one: an adopted Hermes CEO, whose route is the canonical notice transport. The executor kind is a
+ * module constant, inlined for the reason `HOLDER_CLAIMED_KIND_SQL` gives.
+ */
+const HERMES_EXECUTOR_KIND = "hermes";
+const hermesCanonicalRuntimeSql = (sessionExpr: string): string => `EXISTS (
+  SELECT 1 FROM conversational_actors hermes_c
+    JOIN actor_target_bindings hermes_tb ON hermes_tb.target_actor_id = hermes_c.actor_id
+   WHERE hermes_tb.executor_kind = '${HERMES_EXECUTOR_KIND}'
+     AND hermes_c.current_session_id = ${sessionExpr}
+)`;
+
+/**
+ * ACP-R1-03 — which route a CEO notification row has, one partition with no overlap. With the
+ * canonical notice transport attached, an adopted Hermes CEO is reached through it and through
+ * nothing else. Every other CEO is reached over Buzz when its runtime carries both a room and a
+ * bound channel identity — the route a READY Buzz-backed CEO always had. A row with neither is
+ * withheld, PENDING: nothing rejects it for having no route, and the next binding, adoption or
+ * transport attachment that gives it one delivers it.
+ */
+const ceoCanonicalRouteSql = (alias: "o" | "outbox", canonicalAttached: boolean): string =>
+  canonicalAttached ? hermesCanonicalRuntimeSql(`${alias}.target_session_id`) : "0";
+const ceoBuzzSessionSql = (alias: "o" | "outbox"): string =>
+  `EXISTS (SELECT 1 FROM sessions ceo_s WHERE ceo_s.session_id = ${alias}.target_session_id
+             AND COALESCE(ceo_s.buzz_address, '') <> '' AND COALESCE(ceo_s.buzz_actor_id, '') <> '')`;
+const ceoBuzzRouteSql = (alias: "o" | "outbox", canonicalAttached: boolean): string =>
+  `(NOT ${ceoCanonicalRouteSql(alias, canonicalAttached)} AND ${ceoBuzzSessionSql(alias)})`;
 
 /** `inBandRow`, as a read of one kind and target: the same two halves, the same kind sets. */
 const deliveredInBand = (db: Pick<Db, "get">, kind: string, sessionId: string): boolean =>
@@ -461,6 +499,223 @@ const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
        AND outgoing.lifecycle IN ('READY','DRAINING')
   )
 )`;
+
+/**
+ * ACP-R1-01 — the rows the one handover policy decides: an actionable instruction (`IN_BAND_KINDS`),
+ * whatever its route, that nobody has ACKed — queued, claimed for delivery, or sent over Buzz and
+ * awaiting its ACK (at-least-once: a replaced holder may have lost it, so it is delivered again under
+ * the same message id). Never a reply a revocation held for a
+ * provisioned owner's renewal and nothing has carried since, whatever else was done to it:
+ * `carryHeldEscalationReplies` and the fences decide that one.
+ */
+export const handoverInstructionRowSql = (alias: "o" | "outbox"): string =>
+  `(${alias}.kind IN (${IN_BAND_KIND_SQL}) AND ${alias}.status IN ('PENDING','IN_FLIGHT','SENT')
+    AND NOT (${alias}.kind = '${MessageKind.ESCALATION_REPLY}'
+      AND EXISTS (SELECT 1 FROM audit_events held WHERE held.kind = '${ESCALATION_REPLY_HELD}'
+                   AND json_extract(held.evidence_json, '$.messageId') = ${alias}.message_id
+                   AND json_extract(held.evidence_json, '$.fromGeneration') = ${alias}.binding_generation)
+      AND NOT EXISTS (SELECT 1 FROM audit_events carried WHERE carried.kind = '${ESCALATION_REPLY_CARRIED}'
+                   AND json_extract(carried.evidence_json, '$.messageId') = ${alias}.message_id)))`;
+
+/**
+ * ACP-R1-01 — the one handover policy for an actionable instruction, asked by every path that moves
+ * a role's holder or loses it: a surviving runtime move (`carryHolderMessagesToRuntime`), a takeover
+ * and a revoke (`retargetOrReject`), the authenticated binding that follows a revoke
+ * (`adoptHolderMessages`, from `bind`, `renewSameSession` and a `switchTo` with no active binding),
+ * and the fences that find a target nobody holds (`SessionRegistry`'s stop fence,
+ * `fenceUndeliverable`). `to` is the successor, or null when there is none yet. Only reads.
+ *
+ * The instruction is never discarded for want of a holder or a delivery window. It is carried to the
+ * successor with its message id (`CARRY`), kept queued for the next authenticated holder (`KEEP`), or
+ * superseded, explicitly and with its reason, when it no longer addresses anything live
+ * (`SUPERSEDE`): its run has ended, is gone or is no longer the role's; the escalation a reply
+ * answers is no longer the run's open one; a drain request's replacement has happened. There is no
+ * once-only budget: the same instruction follows every authenticated recovery until it is ACKed.
+ */
+const instructionHandoverOf = (
+  db: Pick<Db, "get" | "all">,
+  row: RawOutbox,
+  to: { generation: number; sessionId: string } | null,
+): InstructionHandover => {
+  if (!IN_BAND_KINDS.has(row.kind as MessageKind) ||
+      (row.status !== "PENDING" && row.status !== "IN_FLIGHT" && row.status !== "SENT")) {
+    return { kind: "OUT_OF_SCOPE" };
+  }
+  const live = to === null ? { kind: "KEEP" as const } : { kind: "CARRY" as const };
+  if (row.kind === MessageKind.DRAIN_REQUEST) {
+    // A drain request asks one conversation to make way for a replacement: the same conversation on
+    // another runtime still owes it, a different one is the replacement it asked for.
+    if (to === null) return live;
+    const actors = db.all<{ binding_generation: number; actor_id: string }>(
+      `SELECT binding_generation, actor_id FROM assignments WHERE role_key = ? AND binding_generation IN (?, ?)`,
+      [row.role_key, row.binding_generation, to.generation],
+    );
+    const from = actors.find((a) => a.binding_generation === row.binding_generation)?.actor_id;
+    const next = actors.find((a) => a.binding_generation === to.generation)?.actor_id;
+    return from !== undefined && from === next ? live : { kind: "SUPERSEDE", reason: "ROLE_REPLACED", runState: null };
+  }
+  // Every other instruction kind addresses a run; one that names none addresses nothing live.
+  if (row.run_id === null) return { kind: "SUPERSEDE", reason: "RUN_MISSING", runState: null };
+  const run = db.get<{ state: RunState; project_id: string | null; owner_role_key: string | null }>(
+    `SELECT state, project_id, owner_role_key FROM runs WHERE run_id = ?`,
+    [row.run_id],
+  );
+  if (!run) return { kind: "SUPERSEDE", reason: "RUN_MISSING", runState: null };
+  if (isTerminal(run.state)) return { kind: "SUPERSEDE", reason: "RUN_TERMINAL", runState: run.state };
+  if (run.owner_role_key !== null && run.owner_role_key !== row.role_key) {
+    return { kind: "SUPERSEDE", reason: "RUN_OWNED_ELSEWHERE", runState: run.state };
+  }
+  if (row.kind === MessageKind.ESCALATION_REPLY && !escalationReplyStillAnswers(db, row, run.project_id, to)) {
+    return { kind: "SUPERSEDE", reason: "ESCALATION_SUPERSEDED", runState: run.state };
+  }
+  return live;
+};
+
+/**
+ * Whether an ESCALATION_REPLY still answers its run: the CEO_DECISION that enqueued it is on record
+ * for the run's project, no blocking escalation was opened after the one it answers (for a reply
+ * naming one, that escalation is still the run's latest), and a successor's assignment has the
+ * project scope of the generation the reply was addressed to. Only reads.
+ */
+const escalationReplyStillAnswers = (
+  db: Pick<Db, "get" | "all">,
+  row: RawOutbox,
+  projectId: string | null,
+  to: { generation: number } | null,
+): boolean => {
+  let escalationId: unknown;
+  try {
+    escalationId = (JSON.parse(row.payload_json) as { escalationId?: unknown }).escalationId;
+  } catch {
+    return false;
+  }
+  const decision = db.get<{ event_id: number; project_id: string | null; escalation_id: unknown }>(
+    `SELECT event_id, project_id, json_extract(evidence_json, '$.escalationId') AS escalation_id FROM audit_events
+      WHERE run_id = ? AND kind = 'CEO_DECISION' AND json_extract(evidence_json, '$.messageId') = ?
+      ORDER BY event_id DESC LIMIT 1`,
+    [row.run_id, row.message_id],
+  );
+  if (!decision || decision.project_id !== projectId) return false;
+  const latest = db.get<{ event_id: number | null }>(
+    `SELECT MAX(event_id) AS event_id FROM audit_events WHERE run_id = ? AND kind = 'CTO_ESCALATION'
+        AND json_extract(evidence_json, '$.blocksCriticalPath') = 1`,
+    [row.run_id],
+  )?.event_id ?? null;
+  if (typeof escalationId === "number") {
+    if (decision.escalation_id !== escalationId || latest !== escalationId) return false;
+  } else if (escalationId !== undefined || (latest !== null && latest > decision.event_id)) {
+    return false;
+  }
+  if (to === null) return true;
+  const scopes = db.all<{ binding_generation: number; project_id: string | null }>(
+    `SELECT binding_generation, project_id FROM assignments WHERE role_key = ? AND binding_generation IN (?, ?)`,
+    [row.role_key, row.binding_generation, to.generation],
+  );
+  const from = scopes.find((scope) => scope.binding_generation === row.binding_generation);
+  const next = scopes.find((scope) => scope.binding_generation === to.generation);
+  return from !== undefined && next !== undefined && from.project_id === next.project_id;
+};
+
+/**
+ * A kept instruction stays queued for the next holder: a delivery claim on it is released, and one
+ * sent over Buzz but never ACKed goes back to deliverable, keeping its message id.
+ */
+const keepInstruction = (db: Pick<Db, "run">, row: RawOutbox): void => {
+  db.run(
+    `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL,
+                       retry_eligible = 0, next_attempt_at = NULL, failure_class = NULL
+      WHERE message_id = ? AND status IN ('IN_FLIGHT','SENT')`,
+    [row.message_id],
+  );
+};
+
+/**
+ * A supersession: the row REJECTED and an `OUTBOX_INSTRUCTION_SUPERSEDED` record of why, written in
+ * the caller's transaction so neither exists without the other.
+ */
+const supersedeInstruction = (
+  db: Pick<Db, "run">,
+  audit: AuditLog,
+  row: RawOutbox,
+  decision: { reason: InstructionSupersession; runState: RunState | null },
+  to: { generation: number } | null,
+  path: InstructionHandoverPath,
+): boolean => {
+  const reasonCode = decision.reason === "RUN_TERMINAL" ? ReasonCode.RUN_ALREADY_TERMINAL : ReasonCode.OUTBOX_STALE_GENERATION_REJECTED;
+  const changed = db.run(
+    `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
+                       retry_eligible = 0, next_attempt_at = NULL
+      WHERE message_id = ? AND status IN ('PENDING','IN_FLIGHT','SENT')`,
+    [reasonCode, row.message_id],
+  ).changes;
+  if (changed !== 1) return false;
+  audit.record({
+    kind: "OUTBOX_INSTRUCTION_SUPERSEDED",
+    reasonCode,
+    runId: row.run_id,
+    roleKey: row.role_key,
+    sessionId: row.target_session_id,
+    evidence: {
+      messageId: row.message_id, kind: row.kind, reason: decision.reason, runState: decision.runState, path,
+      fromGeneration: row.binding_generation, toGeneration: to?.generation ?? null,
+    },
+  });
+  return true;
+};
+
+/** The no-successor half of the policy, for rows whose target nobody holds: keep or supersede. */
+const settleUnheldInstructions = (
+  db: Pick<Db, "get" | "all" | "run">,
+  audit: AuditLog,
+  rows: readonly RawOutbox[],
+  path: InstructionHandoverPath,
+): { kept: string[]; superseded: string[] } => {
+  const kept: string[] = [];
+  const superseded: string[] = [];
+  for (const row of rows) {
+    const decision = instructionHandoverOf(db, row, null);
+    if (decision.kind === "KEEP") {
+      keepInstruction(db, row);
+      kept.push(row.message_id);
+    } else if (decision.kind === "SUPERSEDE" && supersedeInstruction(db, audit, row, decision, null, path)) {
+      superseded.push(row.message_id);
+    }
+  }
+  return { kept, superseded };
+};
+
+/**
+ * ACP-R1-01 — `SessionRegistry`'s stop fence for the instructions addressed to a session that just
+ * stopped or failed, inside its transaction: each is kept for the role's next authenticated holder or
+ * superseded with its reason (`instructionHandoverOf`), whatever its route, instead of being
+ * rejected because this runtime is gone. Every other kind is still the stop fence's to reject.
+ */
+export const settleStoppedSessionInstructions = (
+  db: Pick<Db, "get" | "all" | "run">,
+  audit: AuditLog,
+  sessionId: string,
+): { kept: string[]; superseded: string[] } =>
+  settleUnheldInstructions(
+    db,
+    audit,
+    db.all<RawOutbox>(
+      `SELECT o.* FROM outbox o WHERE o.target_session_id = ? AND ${handoverInstructionRowSql("o")}
+        ORDER BY o.created_at, o.rowid`,
+      [sessionId],
+    ),
+    "SESSION_STOPPED",
+  );
+
+/**
+ * `Outbox.#readdressCeoNotifications` and the CEO half of `adoptHolderMessages`: every PENDING or
+ * SENT-but-unACKed CEO notification not addressed to the CEO's current holder is re-addressed to it
+ * and made deliverable again, keeping its message id. Parameters: generation, session, generation,
+ * session.
+ */
+const readdressCeoNotificationsSql = `UPDATE outbox SET binding_generation = ?, target_session_id = ?, status = 'PENDING',
+                              retry_eligible = 0, next_attempt_at = NULL, failure_class = NULL
+    WHERE kind = 'CEO_NOTIFICATION' AND role_key = 'CEO' AND status IN ('PENDING','SENT')
+      AND (binding_generation <> ? OR target_session_id <> ?)`;
 
 /**
  * Durable, fenced message queue (PRD §15.7, §27.5, §34.1).
@@ -592,6 +847,122 @@ export class Outbox {
     }
   }
 
+  #ceoDelivery: ((message: OutboxMessage) => Promise<Decision<void>>) | null = null;
+  #ceoDelivering: Promise<void> | null = null;
+  #ceoPending = false;
+
+  /**
+   * Installs the canonical notice transport (ACP-R1-03): from here on an adopted Hermes CEO's
+   * notifications go through it and are withheld from Buzz (`ceoCanonicalRouteSql`). Startup,
+   * enqueue, binding adoption and authenticated CEO traffic are delivery events.
+   */
+  attachCeoNotificationDelivery(send: (message: OutboxMessage) => Promise<Decision<void>>): void {
+    this.#ceoDelivery = send;
+    void this.deliverCeoNotifications();
+  }
+
+  /**
+   * A CEO notification is role mail: every unACKed one follows the role's current holder, whichever
+   * path moved the role (a bind or adoption, a takeover, a surviving runtime move, a revoke and
+   * rebind, or a stopped runtime replaced), so a route the current CEO has is the route every
+   * unsettled notification has. One the Buzz transport accepted for a holder that has since gone
+   * (SENT, never ACKed) goes back to deliverable with its message id and is delivered to the new
+   * holder — at-least-once, deduplicated by the id (ACP-R2-01).
+   */
+  #readdressCeoNotifications(): void {
+    const current = this.db.get<{ generation: number; session: string }>(`SELECT a.binding_generation AS generation,
+      ${CURRENT_HOLDER_SESSION} AS session FROM assignments a ${HOLDER_ACTOR_JOIN}
+      WHERE a.role_key = 'CEO' AND a.status = 'ACTIVE'`);
+    // A new target is a new route: a failure recorded against the previous one no longer holds it.
+    if (current) this.db.run(readdressCeoNotificationsSql, [current.generation, current.session, current.generation, current.session]);
+  }
+
+  /**
+   * ACP-R1-03 — a notification withheld because its live CEO has no route is never withheld
+   * silently: one `CEO_NOTIFICATION_ROUTE_UNAVAILABLE` record per message and target says so, and
+   * why — the CEO is an adopted Hermes runtime and the canonical notice transport is not attached
+   * (it signs every notice with the ACP-Hermes lane secret), or the CEO has neither that nor a Buzz
+   * room and channel identity. The row stays PENDING; the next route delivers it.
+   */
+  #recordUnroutableCeoNotifications(): void {
+    const attached = this.#ceoDelivery !== null;
+    const rows = this.db.all<{ message_id: string; target_session_id: string; role_key: string; run_id: string | null; hermes: number }>(
+      `SELECT o.message_id, o.target_session_id, o.role_key, o.run_id,
+              ${hermesCanonicalRuntimeSql("o.target_session_id")} AS hermes
+         FROM outbox o
+        WHERE o.kind = 'CEO_NOTIFICATION' AND o.status = 'PENDING' AND ${liveDeliveryTarget("o")}
+          AND NOT ${ceoCanonicalRouteSql("o", attached)} AND NOT ${ceoBuzzSessionSql("o")}
+          AND NOT EXISTS (SELECT 1 FROM audit_events e WHERE e.kind = 'CEO_NOTIFICATION_ROUTE_UNAVAILABLE'
+                            AND json_extract(e.evidence_json, '$.messageId') = o.message_id
+                            AND json_extract(e.evidence_json, '$.targetSessionId') = o.target_session_id)
+        ORDER BY o.created_at, o.rowid`,
+    );
+    for (const row of rows) {
+      this.audit.record({
+        kind: "CEO_NOTIFICATION_ROUTE_UNAVAILABLE",
+        reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+        roleKey: row.role_key,
+        sessionId: row.target_session_id,
+        runId: row.run_id,
+        evidence: {
+          messageId: row.message_id,
+          targetSessionId: row.target_session_id,
+          reason: row.hermes === 1 ? "CANONICAL_TRANSPORT_NOT_ATTACHED" : "NO_BUZZ_ROUTE",
+        },
+      });
+    }
+  }
+
+  deliverCeoNotifications(): Promise<void> {
+    this.#ceoPending = true;
+    if (this.#ceoDelivering) return this.#ceoDelivering;
+    if (!this.#ceoDelivery) {
+      // No canonical transport: the Buzz sweep owns every routable row; record the unroutable ones.
+      try {
+        this.#readdressCeoNotifications();
+        this.#recordUnroutableCeoNotifications();
+      } catch {
+        // A closed database records nothing; the next delivery pass records it.
+      }
+      return Promise.resolve();
+    }
+    const send = this.#ceoDelivery;
+    const run = (async () => {
+      do {
+        this.#ceoPending = false;
+        this.#readdressCeoNotifications();
+        this.#recordUnroutableCeoNotifications();
+        // Only the rows whose route is this transport; a Buzz-backed CEO's are the sweep's.
+        const rows = this.db.all<RawOutbox>(`SELECT o.* FROM outbox o
+          WHERE o.kind = 'CEO_NOTIFICATION' AND o.status = 'PENDING' AND ${liveDeliveryTarget("o")}
+            AND ${ceoCanonicalRouteSql("o", true)}
+          ORDER BY o.created_at, o.rowid`);
+        for (const row of rows) {
+          let accepted = false;
+          try { accepted = (await send(hydrate(row))).allowed; } catch { /* retained below */ }
+          this.db.run(`UPDATE outbox SET status = ?, attempts = attempts + 1, acked_at = ?
+            WHERE message_id = ? AND status = 'PENDING' AND binding_generation = ? AND target_session_id = ?
+              AND ${liveDeliveryTarget("outbox")}`,
+            [accepted ? "ACKED" : "PENDING", accepted ? this.clock.nowIso() : null,
+              row.message_id, row.binding_generation, row.target_session_id]);
+          this.audit.record({ kind: accepted ? "CEO_NOTIFICATION_ACCEPTED" : "CEO_NOTIFICATION_DELIVERY_FAILED",
+            reasonCode: accepted ? ReasonCode.OK : ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+            roleKey: row.role_key, sessionId: row.target_session_id, runId: row.run_id,
+            evidence: { messageId: row.message_id } });
+        }
+      } while (this.#ceoPending);
+    })();
+    // A delivery event that arrived after the loop's last look (one joined the run in flight) is
+    // served by a follow-up pass that the returned promise includes, so whoever awaits a delivery it
+    // triggered sees that delivery finished, not just the pass it happened to join.
+    const settle = (): Promise<void> => {
+      this.#ceoDelivering = null;
+      return this.#ceoPending ? this.deliverCeoNotifications() : Promise.resolve();
+    };
+    this.#ceoDelivering = run.then(settle, settle);
+    return this.#ceoDelivering;
+  }
+
   private enqueueInTx(input: EnqueueInput): Decision<OutboxMessage> {
     const existing = this.byIdempotencyKey(input.idempotencyKey);
     if (existing) return this.replayDecision(existing, input);
@@ -655,6 +1026,9 @@ export class Outbox {
         message.createdAt,
       ],
     );
+    if (message.kind === MessageKind.CEO_NOTIFICATION) {
+      this.db.afterCommit(() => { void this.deliverCeoNotifications(); });
+    }
     // An in-band row is never transmitted, so the role is told it has something to read — after
     // the enclosing transaction commits, so a wake cannot reach the CTO before the row it points
     // at is visible, and a rollback discards it.
@@ -692,6 +1066,10 @@ export class Outbox {
       const now = this.clock.nowIso();
       this.expireOverdue();
       this.reclaimStaleLeases();
+      this.#readdressCeoNotifications();
+      this.#recordUnroutableCeoNotifications();
+      this.#reofferUnacknowledgedSends(now);
+      const canonicalCeo = this.#ceoDelivery !== null;
 
       const rows = this.db.all<RawOutbox>(
         `SELECT o.* FROM outbox o
@@ -702,6 +1080,10 @@ export class Outbox {
             -- authenticated the holder — the exact disclosure the separate claim path exists to
             -- prevent. The holder takes these through claimForHolder instead.
             AND o.kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})
+            -- A CEO notification is this sweep's only when its route is Buzz (ACP-R1-03): an
+            -- adopted Hermes CEO's goes through the canonical transport, and one with no route is
+            -- withheld PENDING rather than handed to a send that would reject it.
+            AND (o.kind <> 'CEO_NOTIFICATION' OR ${ceoBuzzRouteSql("o", canonicalCeo)})
             -- So is an in-band row: a role-level kind addressed to an adopted canonical CTO. A
             -- Buzz send to it would be signed with the daemon's key, which the room's sender
             -- refuses — the row would go REJECTED before the CTO could acknowledge it — and the
@@ -709,14 +1091,19 @@ export class Outbox {
             -- the CTO reads it in band (pendingInBandFor), for the same reason as the line above:
             -- nothing here may transmit what only its exact target may read.
             AND NOT ${withheldFromSweep("o")}
-            AND o.expires_at > ?
+            -- An instruction or a CEO notification has no delivery TTL to miss: it is never expired
+            -- (expireOverdue) and is delivered whenever its target can be reached.
+            AND (o.expires_at > ? OR o.kind IN (${RETAINED_KIND_SQL}))
             -- A deferred retry is not deliverable until its window opens; the deferral is
             -- durable, so a restarted loop honours it instead of retrying immediately.
             AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
             -- An already-attempted row is deliverable again only while its recorded failure
             -- is retry-eligible. A queued row that carries attempts but no eligibility was
             -- never judged retryable, so it is not picked up.
-            AND (o.attempts = 0 OR o.retry_eligible = 1)
+            -- A retained kind (an instruction or a CEO notification) is also deliverable again once a
+            -- handover or a new CEO target re-armed it (no outstanding failure class): its failures
+            -- never end it (markAttemptFailed), so this is how a route change resumes it.
+            AND (o.attempts = 0 OR o.retry_eligible = 1 OR (o.kind IN (${RETAINED_KIND_SQL}) AND o.failure_class IS NULL))
             AND ${liveDeliveryTarget("o")}
           ORDER BY o.created_at, o.rowid
           LIMIT ?`,
@@ -730,6 +1117,7 @@ export class Outbox {
           `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = ?, claimed_at = ?
             WHERE message_id = ? AND status = 'PENDING'
               AND NOT ${withheldFromSweep("outbox")}
+              AND (kind <> 'CEO_NOTIFICATION' OR ${ceoBuzzRouteSql("outbox", canonicalCeo)})
               AND ${liveDeliveryTarget("outbox")}`,
           [token, now, row.message_id],
         );
@@ -741,36 +1129,9 @@ export class Outbox {
   }
 
   /**
-   * The holder takes its own owner-messages, over its own authenticated connection.
-   *
-   * Four things make this different from `claimDeliverable`, and each is a place a plausible
-   * implementation is still wrong:
-   *
-   * 1. **An unresolved hand-over stops the queue.** A row already `SENT` is not re-served — its
-   *    outcome is genuinely unknown, because the holder may have received it and died before
-   *    acknowledging — and while one exists this call hands over *nothing new*. Reporting the
-   *    unresolved row beside a fresh payload is the subtly wrong version: it looks like it honours
-   *    "never twice" while giving the holder a second message to lose exactly the same way, and it
-   *    lets an unknown outcome accumulate silently behind newer work. `UnresolvedOwnerMessage` has
-   *    no payload field at all, so "never the payload twice" is a property of the type rather than
-   *    of this method remembering not to fill one in.
-   * 2. **Exactly one message per call, oldest first, and the caller does not choose.** A
-   *    caller-supplied batch size is a caller-supplied blast radius: every row in a batch reaches
-   *    `SENT` before the caller has done anything with any of them, so a holder that asked for
-   *    twenty-five and then died put twenty-five owner-messages into the unknown-outcome path
-   *    instead of one. `hasMore` and another wake drain the rest.
-   * 3. **`PENDING -> SENT` happens before the payload is returned**, in the same transaction and
-   *    conditioned on the row still being `PENDING`. Reading the row and then marking it would
-   *    leave a window where a crash loses the message with no record that it was ever handed over.
-   *    The payload returned is re-read from the row the update actually moved, never from the
-   *    candidate read.
-   * 4. **The compare-and-set carries the caller's whole identity**, rather than standing next to a
-   *    check of it. The candidate read and the write are two statements; binding the write to the
-   *    row id alone trusts that nothing changed in between. See the `UPDATE` below.
-   * 5. **`admits` is asked about every candidate before anything is written** (#1044), inside this
-   *    same transaction, and a refused candidate is skipped rather than handed over or burned. Its
-   *    default withholds every `IDENTITY_BOUND_KINDS` row, so a caller that supplies no proof hands
-   *    over no peer message. The caller's predicate must only read.
+   * At most one oldest message for the authenticated current holder. An unACKed SENT row is
+   * redelivered with the same message ID; ACKed/rejected IDs and spent source aliases cannot
+   * replay. A crash before ACK therefore retains work instead of terminally disposing of it.
    */
   claimForHolder(
     holder: HolderIdentity,
@@ -785,13 +1146,13 @@ export class Outbox {
         holder.sessionIncarnation,
       ];
 
-      // Already handed over and never acknowledged. Read first because its presence decides
-      // whether anything new may move at all.
+      // Only unreadable or terminally deduped SENT rows are reported without their payload.
       const unresolved = this.db
         .all<RawOutbox>(
           `SELECT o.* FROM outbox o
             WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
               AND o.status = 'SENT'
+              AND NOT ${handOverEligibleSql("o")}
               AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
               AND ${exactHolderTarget("o")}
             ORDER BY o.created_at, o.message_id`,
@@ -800,82 +1161,21 @@ export class Outbox {
         .map(unresolvedOwnerMessage);
 
 
-      // No `expires_at` here. A holder-claimed row does not expire — see `expireOverdue` — and the
-      // exclusion has to hold at *every* query that reads the column, not only at the sweep.
-      // Excluding it from the sweep alone produces a subtler strand than the one it removes: the row
-      // keeps `status = 'PENDING'`, so nothing sweeps it and nothing reports it, while a condition
-      // here would mean no holder can ever be handed it.
-      //
-      // ORDER BY o.created_at, o.message_id — the tiebreaker is load-bearing here and this is
-      // the site where saying so matters most (#858).
-      //
-      // Two things this pair does not give, both measured rather than assumed.
-      //
-      // It is not total at the schema level: `message_id TEXT PRIMARY KEY` carries no `NOT NULL`
-      // and SQLite permits NULL in a non-INTEGER primary key, so two NULL-id rows insert and the
-      // composite ties again. Not reachable from `src/`, where every writer mints through
-      // `newMessageId()`, but a raw-SQL writer is in this repository's threat model.
-      //
-      // `o.rowid`, and the reason is which orders a tiebreaker preserves. Two minted ids were
-      // tried and both changed *which row* this `LIMIT` returns —
-      // `outbox-owner-message-holder.test.ts` expected the message it had queued and got another,
-      // under `message_id` and again under `idempotency_key`. `rowid` does not:
-      //
-      //     inserted c, a, b        ORDER BY created_at              -> c
-      //                             ORDER BY created_at, message_id  -> a   (a different row)
-      //                             ORDER BY created_at, rowid       -> c   (the same row)
-      //
-      // A minted id sorts arbitrarily; rowid is assigned in insertion order, which for a queue is
-      // the order the rows arrived. So this pair is total *and* keeps the answer the untied query
-      // already gave, which is the part a census cannot check and a consumer can.
-      //
-      // What it is not: a declared contract. `rowid` is SQLite's, not this schema's — a `VACUUM`
-      // or a table rebuild renumbers it, and a delete lets a value be reused, because this table
-      // is not `AUTOINCREMENT`. Both only reorder rows that are already tied on `created_at`, and
-      // nothing here reads the number itself. Making arrival order a column the schema states is a
-      // migration and remains #858's, not this query's.
-      //
-      // `created_at` is millisecond ISO text, and 400 consecutive `systemClock.nowIso()` calls
-      // were measured returning one distinct timestamp. This order decides which PENDING message
-      // the holder is handed next. With a tie and no second term, that choice was
-      // the query planner's, so two owner messages queued in the same millisecond had no defined
-      // order of answering.
-      //
-      // What the tiebreaker does and does not buy, stated rather than implied: `message_id` is
-      // random (`msg_97aa06bf…`), not time-ordered, so `(created_at, message_id)` is **total and
-      // reproducible, and it is not arrival order**. Within one millisecond the winner is
-      // arbitrary — but the same arbitrary one on every run and every replica, which is what the
-      // planner's choice was not. Making it arrival order needs a monotonic column, which is a
-      // schema change and is not this.
-      //
-      // Every queued row is read, not `LIMIT 1`, because `admits` decides which of them may be
-      // handed over at all (#1044) — and it decides before anything below writes. A withheld row is
-      // skipped, so one stale peer message does not stop the owner's messages queued behind it.
+      // Read all candidates in arrival order; one withheld row must not block readable mail.
       const queued = this.db.all<RawOutbox & { never_departed: number }>(
         `SELECT o.*, ${handOverEligibleSql("o")} AS never_departed
            FROM outbox o
           WHERE o.kind IN (${HOLDER_CLAIMED_KIND_SQL})
-            AND o.status = 'PENDING'
+            AND o.status IN ('PENDING','SENT')
             AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
             AND ${exactHolderTarget("o")}
           ORDER BY o.created_at, o.rowid`,
         tuple,
       );
-      // Each row is read on its own, and a row whose payload cannot be read is withheld on its own
-      // (#1044): an unreadable later row must not cost the holder the readable message ahead of it,
-      // nor the report of an unresolved hand-over. Only reading is caught here — a failure inside
-      // `admits` is the caller's, and still propagates.
-      //
-      // A row that ever left PENDING is withheld the same way, whatever it reads now (review
-      // finding 01): it was handed over, settled or moved once already, and a statement put it
-      // back. So is a row whose admitted event another message took, or whose turn was answered
-      // (`handOverEligibleSql`): the instruction is spent even though this row never moved. Withheld, it is never handed over again and never counted as work waiting, it does
-      // not stand at the head of the queue in front of a message nobody was handed; the holder is
-      // told its id, as for any withheld row. The write below asserts the same.
       const admitted: RawOutbox[] = [];
       const withheld: UnresolvedOwnerMessage[] = [];
       for (const { never_departed: neverDeparted, ...row } of queued) {
-        const message = neverDeparted === 1 && this.#payloadHandOverEligible(row.payload_json)
+        const message = neverDeparted === 1 && this.#payloadHandOverEligible(row.payload_json, row.message_id)
           ? readableMessage(row)
           : null;
         if (message !== null && admits(message)) admitted.push(row);
@@ -903,7 +1203,7 @@ export class Outbox {
         `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = attempts + 1,
                            claim_token = NULL, claimed_at = NULL,
                            retry_eligible = 0, next_attempt_at = NULL
-          WHERE message_id = ? AND status = 'PENDING'
+          WHERE message_id = ? AND status IN ('PENDING','SENT')
             AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
             AND role_key = ? AND binding_generation = ? AND target_session_id = ?
             AND ${exactHolderTarget("outbox")}
@@ -1001,6 +1301,8 @@ export class Outbox {
       if (changes !== 1) return this.holderTerminalReplay(messageId, holder, "REJECTED");
       const settled = this.settleHolderClaim(messageId);
       if (!settled.allowed) return settled;
+      const rejected = this.db.get<RawOutbox>("SELECT * FROM outbox WHERE message_id = ?", [messageId]);
+      if (rejected?.kind === MessageKind.PEER_MESSAGE) this.#owePeerMessageNotice(rejected, PeerMessageNoticeReason.REVOKED);
       return allow(ReasonCode.OK, undefined);
     });
   }
@@ -1056,13 +1358,38 @@ export class Outbox {
     );
   }
 
+  /**
+   * ACP-R1-01, ACP-R2-01 — a retained kind whose send ended with an unknown outcome is SENT (it may
+   * have arrived); once its backoff deadline passes with no ACK it is offered again, to its live
+   * target, under the same message id. Only rows the unknown outcome marked are re-offered: a send
+   * the transport accepted waits for its ACK, and a replaced holder's is the handover's.
+   */
+  #reofferUnacknowledgedSends(now: string): void {
+    const rows = this.db.all<{ message_id: string; attempts: number; retry_backoff_ms: number; sent_at: string | null }>(
+      `SELECT o.message_id, o.attempts, o.retry_backoff_ms, o.sent_at FROM outbox o
+        WHERE o.status = 'SENT' AND o.failure_class = 'unknown_observed' AND o.kind IN (${RETAINED_KIND_SQL})
+          AND ${liveDeliveryTarget("o")}`,
+    );
+    for (const row of rows) {
+      const base = Number.isSafeInteger(row.retry_backoff_ms) && row.retry_backoff_ms > 0 ? row.retry_backoff_ms : 1000;
+      if (row.sent_at !== null && isoPlus(row.sent_at, retryDelayMs(row.attempts, base)) > now) continue;
+      this.db.run(
+        `UPDATE outbox SET status = 'PENDING', failure_class = NULL
+          WHERE message_id = ? AND status = 'SENT' AND failure_class = 'unknown_observed'`,
+        [row.message_id],
+      );
+    }
+  }
+
   /** A claim whose holder died must return to PENDING rather than stay stuck IN_FLIGHT. */
   reclaimStaleLeases(leaseMs = 5 * 60 * 1000): number {
     this.fenceUndeliverable();
+    // A CEO notification is never fenced, so a stale claim on one returns to PENDING whatever its
+    // target now is, and follows the role's current holder from there (ACP-R1-03).
     return this.db.run(
       `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL
         WHERE status = 'IN_FLIGHT' AND claimed_at <= ?
-          AND ${liveDeliveryTarget("outbox")}`,
+          AND (${liveDeliveryTarget("outbox")} OR kind = 'CEO_NOTIFICATION')`,
       [new Date(new Date(this.clock.nowIso()).getTime() - leaseMs).toISOString()],
     ).changes;
   }
@@ -1072,7 +1399,9 @@ export class Outbox {
     const changes = this.db.run(
       `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = attempts + 1,
                          claim_token = NULL, claimed_at = NULL,
-                         retry_eligible = 0, next_attempt_at = NULL
+                         retry_eligible = 0, next_attempt_at = NULL,
+                         -- A retained kind's transport accepted it: no failure is outstanding.
+                         failure_class = CASE WHEN kind IN (${RETAINED_KIND_SQL}) THEN NULL ELSE failure_class END
         WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
           AND ${liveDeliveryTarget("outbox")}`,
       [this.clock.nowIso(), messageId, claimToken],
@@ -1104,13 +1433,59 @@ export class Outbox {
       attempts: number;
       retry_max_attempts: number;
       retry_backoff_ms: number;
+      kind: string;
     }>(
-      `SELECT attempts, retry_max_attempts, retry_backoff_ms
+      `SELECT attempts, retry_max_attempts, retry_backoff_ms, kind
          FROM outbox WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?`,
       [messageId, claimToken],
     );
     if (!row) return this.staleClaim(messageId);
     const attempts = row.attempts + 1;
+    // ACP-R1-01, ACP-R2-01 — a failed attempt never ends an actionable instruction or a CEO
+    // notification: whatever the failure class and however many attempts, it goes back to PENDING.
+    // Only an ACK or a recorded supersession ends it.
+    if (isRetainedKind(row.kind)) {
+      // An unknown outcome (#451: a timed-out send may already be at the far end) is not put back in
+      // the queue: it is SENT, awaiting the holder's ACK like any other send, and offered again only
+      // if no ACK has come by its backoff deadline (`#reofferUnacknowledgedSends`) — at-least-once,
+      // deduplicated by the message id.
+      if (classified.failureClass === "unknown_observed") {
+        const sent = this.db.run(
+          `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = ?, last_error = ?, failure_class = ?,
+                             retry_eligible = 0, next_attempt_at = NULL, reason_code = NULL,
+                             claim_token = NULL, claimed_at = NULL
+            WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
+              AND ${liveDeliveryTarget("outbox")}`,
+          [this.clock.nowIso(), attempts, classified.error.slice(0, 500), classified.failureClass, messageId, claimToken],
+        ).changes;
+        if (sent !== 1) return this.staleClaim(messageId);
+        return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true });
+      }
+      // A failure whose cause can clear on its own is deferred on the backoff schedule, with no
+      // attempt budget. A contract or security refusal is kept PENDING with its failure on record
+      // and is not re-sent unchanged into the same refusal: the next handover or new CEO target
+      // re-arms it (`claimDeliverable`).
+      const deferrable = RETRYABLE_FAILURE_CLASSES.has(classified.failureClass);
+      const base = Number.isSafeInteger(row.retry_backoff_ms) && row.retry_backoff_ms > 0 ? row.retry_backoff_ms : 1000;
+      const retainedNext = deferrable ? isoPlus(this.clock.nowIso(), retryDelayMs(attempts, base)) : null;
+      const kept = this.db.run(
+        `UPDATE outbox SET status = 'PENDING', attempts = ?, last_error = ?, failure_class = ?,
+                           retry_eligible = ?, next_attempt_at = ?, reason_code = NULL,
+                           claim_token = NULL, claimed_at = NULL
+          WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
+            AND ${liveDeliveryTarget("outbox")}`,
+        [attempts, classified.error.slice(0, 500), classified.failureClass, deferrable ? 1 : 0, retainedNext,
+          messageId, claimToken],
+      ).changes;
+      if (kept !== 1) return this.staleClaim(messageId);
+      return allow(ReasonCode.OK, undefined, {
+        messageId,
+        failureClass: classified.failureClass,
+        attempts,
+        nextAttemptAt: retainedNext,
+        retained: true,
+      });
+    }
     const retryPolicyIsValid =
       Number.isSafeInteger(row.retry_max_attempts) &&
       row.retry_max_attempts >= 0 &&
@@ -1234,9 +1609,12 @@ export class Outbox {
     // §15.7 / §34.4 — matching the stored envelope is not enough. A late ACK from a
     // generation that has since been revoked is audit-only, as is an ACK for a message
     // that has expired or was already rejected.
+    // The role's current holder is its actor's runtime (`CURRENT_HOLDER_SESSION`), the one delivery
+    // addresses: after a surviving runtime move the binding's own session is gone.
     const current = this.db.get<{ binding_generation: number; session_id: string }>(
-      `SELECT a.binding_generation, a.session_id FROM assignments a
-        JOIN sessions s ON s.session_id = a.session_id
+      `SELECT a.binding_generation, ${CURRENT_HOLDER_SESSION} AS session_id FROM assignments a
+        ${HOLDER_ACTOR_JOIN}
+        JOIN sessions s ON s.session_id = ${CURRENT_HOLDER_SESSION}
         WHERE a.role_key = ? AND a.status = 'ACTIVE' AND s.lifecycle IN ('READY','DRAINING')`,
       [row.role_key],
     );
@@ -1244,7 +1622,9 @@ export class Outbox {
       !current ||
       current.binding_generation !== generation ||
       current.session_id !== fromSessionId;
-    const expired = row.status === "EXPIRED" || row.expires_at <= this.clock.nowIso();
+    // Delivery and ACK agree on lifetime: a kind delivery never skips for its TTL is acknowledged past
+    // it too (ACP-R2-01).
+    const expired = row.status === "EXPIRED" || (!isRetainedKind(row.kind) && row.expires_at <= this.clock.nowIso());
     const ineligible =
       row.status === "REJECTED" ||
       expired ||
@@ -1374,7 +1754,7 @@ export class Outbox {
     if (!this.#isInBand(row)) {
       return refuse(ReasonCode.INVALID_ARGUMENT, "this message is not delivered in band; acknowledge it with run_ack");
     }
-    if (row.status === "EXPIRED" || row.expires_at <= this.clock.nowIso()) {
+    if (row.status === "EXPIRED") {
       return refuse(ReasonCode.OUTBOX_EXPIRED, `message is ${row.status} and cannot be acknowledged`);
     }
     if (row.status !== "PENDING") {
@@ -1419,19 +1799,18 @@ export class Outbox {
    * `sessionIncarnation` comes from the caller's authenticated connection, and the row must be
    * addressed to the current holder of its own role generation down to that incarnation
    * (`exactHolderTarget`) — so a session sees nothing addressed to another session, to a
-   * generation it no longer holds, or to a runtime it replaced. Expired rows are not listed; they
-   * cannot be acknowledged either.
+   * generation it no longer holds, or to a runtime it replaced. Delivery-attempt timestamps do
+   * not dispose of actionable instructions.
    */
   pendingInBandFor(sessionId: string, sessionIncarnation: string): InBandDispatch[] {
     const rows = this.db.all<RawOutbox>(
       `SELECT o.* FROM outbox o
         WHERE o.status = 'PENDING'
           AND o.target_session_id = ?
-          AND o.expires_at > ?
           AND ${inBandRow("o")}
           AND ${exactHolderTarget("o")}
         ORDER BY o.created_at, o.rowid`,
-      [sessionId, this.clock.nowIso(), sessionIncarnation],
+      [sessionId, sessionIncarnation],
     );
     return rows.map((row) => ({
       messageId: row.message_id,
@@ -1454,6 +1833,12 @@ export class Outbox {
    */
   hasWorkForHolder(holder: HolderIdentity): boolean {
     if (this.pendingInBandFor(holder.targetSessionId, holder.sessionIncarnation).length > 0) return true;
+    if (this.hasHolderMessagesFor(holder)) return true;
+    return this.peerMessageRefusalNoticesFor(holder).length > 0;
+  }
+
+  /** Whether this exact authenticated holder has owner/peer mail to drain. */
+  hasHolderMessagesFor(holder: HolderIdentity): boolean {
     const queued = this.db.get<{ queued: number }>(
       `SELECT EXISTS (
          SELECT 1 FROM outbox o
@@ -1464,8 +1849,7 @@ export class Outbox {
        ) AS queued`,
       [holder.roleKey, holder.bindingGeneration, holder.targetSessionId, holder.sessionIncarnation],
     );
-    if (queued?.queued === 1) return true;
-    return this.peerMessageRefusalNoticesFor(holder).length > 0;
+    return queued?.queued === 1;
   }
 
   /**
@@ -1479,9 +1863,9 @@ export class Outbox {
   /**
    * Wakes the role of every pending in-band row not woken for within `IN_BAND_REWAKE_MS`.
    *
-   * Run on the daemon's delivery tick and once when the wake port is attached at startup. A row
-   * whose target no longer holds its role generation is skipped: the fence sweeps will retire it,
-   * and a wake to a former holder is the mistake `RoleConversationPort.wake` exists to refuse.
+   * Run when the wake port is attached at startup. Delivery recovery otherwise follows work,
+   * registration and transport-availability events. A row whose target no longer holds its role
+   * generation is skipped; a wake to a former holder is the mistake `RoleConversationPort.wake` exists to refuse.
    * Never throws; a wake that fails is audited by `#wakeInBand` and tried again only after the
    * window, so an unreachable CTO costs one audit row per row per window, not a storm.
    */
@@ -1491,11 +1875,10 @@ export class Outbox {
     const rows = this.db.all<{ message_id: string; role_key: string }>(
       `SELECT o.message_id, o.role_key FROM outbox o
         WHERE o.status = 'PENDING'
-          AND o.expires_at > ?
           AND ${inBandRow("o")}
           AND ${liveDeliveryTarget("o")}
         ORDER BY o.created_at, o.rowid`,
-      [now],
+      [],
     );
     // The memory follows the queue: a row that left PENDING is forgotten, so it cannot grow.
     const pending = new Set(rows.map((row) => row.message_id));
@@ -1521,7 +1904,10 @@ export class Outbox {
    * `OUTBOX_IN_BAND_WAKE_FAILED` audit row carrying the decision's reason code and never the
    * thrown error's text, which for a socket error names the endpoint's private path.
    */
-  #wakeInBand(rows: ReadonlyArray<{ messageId: string; roleKey: string }>, trigger: "enqueue" | "rewake"): Promise<void> {
+  #wakeInBand(
+    rows: ReadonlyArray<{ messageId: string; roleKey: string }>,
+    trigger: "enqueue" | "rewake" | "handover",
+  ): Promise<void> {
     const wake = this.#inBandWake;
     if (!wake || rows.length === 0) return Promise.resolve();
     const nowMs = Date.parse(this.clock.nowIso());
@@ -1557,10 +1943,49 @@ export class Outbox {
   }
 
   /**
-   * Called inside the failover transaction (§15.7). A delivery already claimed by the
-   * revoked generation cannot be safely retargeted because the external send may have
-   * started, so it is terminally fenced. Only still-pending role-level intent moves.
+   * Rebind durable role mail inside the authenticated adoption transaction. Completion still
+   * requires the exact current holder; a crash before ACK preserves the original message ID.
    */
+  adoptHolderMessages(roleKey: string, generation: number, sessionId: string, deferCanonicalPeers = false): void {
+    // A CEO notification SENT to the previous holder and never ACKed is delivered again to this one.
+    if (roleKey === "CEO") this.db.run(readdressCeoNotificationsSql, [generation, sessionId, generation, sessionId]);
+    this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
+      WHERE role_key = ? AND kind IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION') AND status IN ('PENDING','SENT')
+        AND (? = 0 OR kind <> 'PEER_MESSAGE')`,
+      [generation, sessionId, ReasonCode.OUTBOX_RETARGETED, roleKey, deferCanonicalPeers ? 1 : 0]);
+    // A CEO notification adopted by a new holder has a new route: a failure recorded against the
+    // previous target no longer holds it back (ACP-R2-01).
+    this.db.run(`UPDATE outbox SET retry_eligible = 0, next_attempt_at = NULL, failure_class = NULL
+      WHERE role_key = ? AND kind = 'CEO_NOTIFICATION' AND status = 'PENDING' AND target_session_id = ?
+        AND binding_generation = ? AND failure_class IS NOT NULL`, [roleKey, sessionId, generation]);
+    // ACP-R1-01: the instructions a revoke or a stopped holder kept for this role are handed to the
+    // new holder under the one handover policy. A reply held for a provisioned owner's renewal stays
+    // the renewal's (`carryHeldEscalationReplies`).
+    const to = { generation, sessionId };
+    const kept = this.db.all<RawOutbox>(
+      `SELECT o.* FROM outbox o
+        WHERE o.role_key = ? AND o.binding_generation < ? AND ${handoverInstructionRowSql("o")}
+        ORDER BY o.created_at, o.rowid`,
+      [roleKey, generation],
+    );
+    const carried: string[] = [];
+    const superseded: string[] = [];
+    for (const row of kept) {
+      const handover = this.#instructionHandover(row, to);
+      if (!this.#applyInstructionHandover(row, handover, to, "ADOPTION")) continue;
+      (handover.kind === "CARRY" ? carried : superseded).push(row.message_id);
+    }
+    if (carried.length > 0 || superseded.length > 0) {
+      this.audit.record({
+        kind: "OUTBOX_INSTRUCTIONS_HANDED_OVER",
+        reasonCode: ReasonCode.OUTBOX_RETARGETED,
+        roleKey,
+        evidence: { path: "ADOPTION", toGeneration: generation, toSessionId: sessionId, retargeted: carried, rejected: superseded },
+      });
+    }
+    if (roleKey === "CEO") this.db.afterCommit(() => { void this.deliverCeoNotifications(); });
+  }
+
   retargetOrReject(
     roleKey: string,
     fromGeneration: number,
@@ -1593,17 +2018,7 @@ export class Outbox {
       `SELECT * FROM outbox WHERE role_key = ? AND binding_generation = ?
         AND (
           status IN ('PENDING','IN_FLIGHT')
-          -- A holder-claimed row that reached SENT is *also* swept, which no other kind is.
-          --
-          -- For an outward delivery, SENT means "the transport took it" and the row is waiting on
-          -- an ACK that a later generation can still legitimately supply, so sweeping it here
-          -- would fence a delivery that succeeded. For an owner-message, SENT means "the previous
-          -- holder was handed the payload and never acknowledged" — its outcome is unknown and it
-          -- is addressed to a conversation that no longer exists. Leaving it would strand it in a
-          -- state nothing sweeps; retargeting it would replay an owner's message into a runtime it
-          -- was never addressed to. So it is rejected, and the loop below cannot retarget it
-          -- because the kind is absent from RETARGETABLE_KINDS.
-          OR (status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL}))
+          OR (status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL}, ${IN_BAND_KIND_SQL}))
         )`,
       [roleKey, fromGeneration],
     );
@@ -1611,31 +2026,31 @@ export class Outbox {
     const retargeted: string[] = [];
     const rejected: string[] = [];
     const held: string[] = [];
-    const holdFor = toGeneration === fromGeneration ? options.holdPeerMessagesAddressedTo : undefined;
 
     for (const row of pending) {
       const holderClaimed = HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind);
-      const escalationReply = row.kind === MessageKind.ESCALATION_REPLY;
-      // Whether the restart's carry, not this fence, records the CEO's notice for this row.
-      let noticeOwedByCarry = false;
-      // The hold (2026-10-03). Only `PENDING` — a `SENT` peer row's outcome is unknown and it is
-      // rejected below as always — and only a row that has not been carried before. Whether it has
-      // is the carry record's answer (ACP-PEER-SUCCESSION-01), never the row's `OUTBOX_RETARGETED`
-      // mark, which any statement can set or clear: a row that already spent its one carry is
-      // rejected here, not held, and reported in `alreadyCarried` so its refusal is recorded.
-      if (
-        holdFor !== undefined &&
-        IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) &&
-        row.status === "PENDING" &&
-        row.target_session_id === holdFor.sessionId
-      ) {
-        if (!this.#peerMessageCarried(row.message_id)) {
-          held.push(row.message_id);
+      if (holderClaimed || row.kind === MessageKind.CEO_NOTIFICATION) {
+        // A canonical recovery owns the peer carry/refusal record in this transaction.
+        if (row.kind === MessageKind.PEER_MESSAGE && toGeneration === fromGeneration &&
+            options.holdPeerMessagesAddressedTo?.sessionId === row.target_session_id) continue;
+        if (holderClaimed && !this.#handOverEligible(row.message_id)) {
+          this.db.run("UPDATE outbox SET status = 'REJECTED', reason_code = ? WHERE message_id = ?",
+            [ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH, row.message_id]);
+          this.settleHolderClaimOrThrow(row.message_id);
+          rejected.push(row.message_id);
           continue;
         }
-        holdFor.alreadyCarried.push(row.message_id);
-        noticeOwedByCarry = true;
+        // Role mail outlives its holder. SENT without ACK is redelivered with the same durable ID.
+        // A revoke has no recipient yet; leave it queued until a later authenticated binding.
+        if (toGeneration !== fromGeneration) {
+          this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?,
+            claim_token = NULL, claimed_at = NULL WHERE message_id = ? AND status IN ('PENDING','SENT')`,
+            [toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id]);
+          retargeted.push(row.message_id);
+        }
+        continue;
       }
+      const escalationReply = row.kind === MessageKind.ESCALATION_REPLY;
       // The renewal hold: the reply stays exactly as it is, addressed to this generation, which only
       // the same owner's renewal at the next generation can take it from (see the option).
       if (
@@ -1654,76 +2069,30 @@ export class Outbox {
         });
         continue;
       }
-      const retargetable = holderClaimed
-        ? // A holder-claimed row moves only on a *successor takeover*, and only from `PENDING`.
-          //
-          // `PENDING` means nothing observable has happened to it: nobody was handed it, so the
-          // successor may safely have it — the owner addressed a role, and the role still exists.
-          // `SENT` falls through to the reject below, because its outcome is unknown and replaying
-          // an owner's words into a runtime they were never addressed to is the one thing this
-          // kind must never do.
-          //
-          // "May safely have it" is once. Whether this row has already been carried is not
-          // readable from its status, so the compare-and-set below asserts it and a row that
-          // fails that assertion falls through to the same reject.
-          //
-          // `fromGeneration === toGeneration` is the *revoke* shape, not a takeover:
-          // `BindingRegistry.revoke` passes the current generation and session because there is
-          // nothing to retarget onto, then runs its own direct `UPDATE outbox SET status =
-          // 'REJECTED'` over every id returned here as `retargeted`. That write knows nothing about
-          // ingress claims, so an owner-message reaching it would be settled behind this method's
-          // back. Falling through to the reject below — which settles — is what makes that
-          // unreachable rather than merely unused.
-          //
-          // No `expires_at` test: these rows do not expire. See `expireOverdue`.
-          //
-          // And never an `IDENTITY_BOUND_KINDS` row (#1044): a peer message was admitted for this
-          // generation's exact session, so a successor is exactly who must not be handed it. It
-          // falls through to the reject below, which settles its ingress claim. (The one exception,
-          // the same conversation restarted, never reaches this line: the hold above takes it.)
-          //
-          // And never a row the one hand-over predicate refuses (review finding 01): asked here, as
-          // the read that decides the row, and again by the compare-and-set below, as the write.
-          row.status === "PENDING" &&
-          toGeneration !== fromGeneration &&
-          !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) &&
-          this.#handOverEligible(row.message_id)
-        : escalationReply
-          ? // An ESCALATION_REPLY is not role-level intent (see `RETARGETABLE_KINDS`): it follows a
-            // takeover once, only while it is unclaimed and still PENDING, and only when the
-            // successor is the run's own new owner and the resolution still answers that run
-            // (`#escalationReplyCarriable`). Anything else falls through to the reject below.
-            toGeneration !== fromGeneration &&
-            this.#escalationReplyUnclaimed(row, now) &&
-            this.#escalationReplyCarriable(row, toGeneration, toSessionId)
-          : row.status === "PENDING" &&
-            RETARGETABLE_KINDS.has(row.kind as MessageKind) &&
-            row.expires_at > now;
-      // Compare-and-set rather than a bare write, and for a holder-claimed row the set it asserts
-      // includes *this row has not been carried before*. `PENDING` cannot tell the two apart: a
-      // row a previous takeover moved looks exactly like one that was never moved, so `G1 -> G2`
-      // followed by `G2 -> G3` handed the owner's words to a second stranger's conversation and
-      // would hand them to a third. `OUTBOX_RETARGETED` is the mark the first carry left, and a
-      // row already carrying it changes nothing here and falls through to the rejection below —
-      // which settles its ingress claim in this same transaction, rather than leaving it queued
-      // for a generation nobody holds.
-      //
-      // `PENDING` cannot tell a row nobody was handed from one handed over and put back by a
-      // statement either (review finding 01), so the set it asserts also includes *this row never
-      // left PENDING*; a row that did falls through to the same reject.
-      //
-      // An ESCALATION_REPLY asserts the same *not carried before*, and *still unclaimed*, in the
-      // write itself; its append-only carry record is the second half of "once".
-      const carriedOnce = holderClaimed
-        ? ` AND (reason_code IS NULL OR reason_code <> ?) AND ${handOverEligibleSql("outbox")}`
-        : escalationReply
-          ? ` AND claim_token IS NULL AND (reason_code IS NULL OR reason_code <> ?)`
-          : "";
+      // ACP-R1-01: an actionable instruction, whatever its route, follows the one handover policy —
+      // carried to the successor, kept for the next authenticated binding on a revoke, or superseded
+      // with its reason. A kept row is in neither list, so `BindingRegistry.revoke` does not reject it.
+      const successor = toGeneration === fromGeneration ? null : { generation: toGeneration, sessionId: toSessionId };
+      const handover = this.#instructionHandover(row, successor);
+      if (handover.kind !== "OUT_OF_SCOPE") {
+        const applied = this.#applyInstructionHandover(row, handover, successor, successor ? "TAKEOVER" : "REVOKE");
+        if (handover.kind === "CARRY" && applied) retargeted.push(row.message_id);
+        else if (handover.kind === "KEEP") held.push(row.message_id);
+        else if (handover.kind === "SUPERSEDE" && applied) rejected.push(row.message_id);
+        continue;
+      }
+      // Every other outward delivery keeps its delivery-window rules.
+      const retargetable = escalationReply
+        ? toGeneration !== fromGeneration && this.#escalationReplyUnclaimed(row, now) &&
+          this.#escalationReplyCarriable(row, toGeneration, toSessionId)
+        : row.status === "PENDING" && RETARGETABLE_KINDS.has(row.kind as MessageKind) && row.expires_at > now;
+      const carriedOnce = escalationReply
+        ? ` AND claim_token IS NULL AND (reason_code IS NULL OR reason_code <> ?)` : "";
       const moved = retargetable
         ? this.db.run(
             `UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
                WHERE message_id = ? AND status = 'PENDING'${carriedOnce}`,
-            holderClaimed || escalationReply
+            escalationReply
               ? [
                   toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id,
                   ReasonCode.OUTBOX_RETARGETED,
@@ -1747,20 +2116,6 @@ export class Outbox {
             row.message_id,
           ],
         );
-        // A terminal transition out of `PENDING`/`SENT` with no successor to take it: the ingress
-        // claim this row was holding open closes here, in this same transaction, or nothing does.
-        if (holderClaimed) this.settleHolderClaimOrThrow(row.message_id);
-        // ACP-RESTART-04: a queued CEO peer message rejected here is owed a notice to the CEO,
-        // which the role's next holder is shown until it reports it. A revoke has no successor at
-        // all and a takeover's is a different runtime, so this is never the carry's REFUSED record.
-        if (
-          IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) && row.status === "PENDING" && !noticeOwedByCarry
-        ) {
-          this.#owePeerMessageNotice(
-            row,
-            toGeneration === fromGeneration ? PeerMessageNoticeReason.REVOKED : PeerMessageNoticeReason.REPLACED,
-          );
-        }
         rejected.push(row.message_id);
       }
     }
@@ -1769,45 +2124,15 @@ export class Outbox {
       kind: "OUTBOX_FENCE",
       reasonCode: ReasonCode.OUTBOX_RETARGETED,
       roleKey,
-      evidence: holdFor === undefined
-        ? { fromGeneration, toGeneration, toSessionId, retargeted, rejected }
-        : { fromGeneration, toGeneration, toSessionId, retargeted, rejected, held },
+      evidence: { fromGeneration, toGeneration, toSessionId, retargeted, rejected, held },
     });
 
     return { retargeted, rejected };
   }
 
-  /**
-   * The carry for peer messages a same-actor dead-predecessor recovery held (2026-10-03), called
-   * inside the canonical self-claim's transaction once the successor generation is bound, with the
-   * carry authority that claim minted for exactly that succession (ACP-PEER-SUCCESSION-01).
-   *
-   * #1044 rejects a queued `PEER_MESSAGE` on every takeover and runtime move, because it was
-   * admitted for one exact CTO session and a successor is exactly who must not be handed it. A
-   * canonical restart is the one move that does not hand it to anyone else: the conversation, its
-   * actor and its Buzz channel identity are unchanged, and only the process and the generation
-   * moved. So a held row is carried to the successor once, keeping its message id, its admitted
-   * event and its stored proof, when — and only when — every one of these holds:
-   *
-   *   - the succession is proven (`PeerMessageSuccession.proven`): same actor, same conversation
-   *     UUID, same Buzz signer, and this transaction's own `DEAD_BINDING_RECOVERED` row;
-   *   - the row was never carried (no CARRIED record), never handed over, never in flight and never
-   *     attempted, and the turn it opened has no receipt — not replied, not resolved as no-reply,
-   *     not settled — and no canonical turn was dispatched for it;
-   *   - its source is readable, it was admitted for exactly the released CTO generation and session,
-   *     and it was addressed to the Buzz identity this conversation speaks as.
-   *
-   * A carry is a compare-and-set over the whole predecessor tuple plus a CARRIED record, written
-   * under the authority's marker: the record, not the row's `OUTBOX_RETARGETED` mark, is what the
-   * hand-over (`selfClaimCarriedTo`) accepts. The proof is never rewritten.
-   *
-   * Every other held row is rejected and its turn closed — which is what the revoke would have
-   * done to it, keeping a receipt that already settled it (ACP-RESTART-03) — and a REFUSED record
-   * with the reason category is written, with the notice the CEO is owed (ACP-RESTART-04), which
-   * the role's holder is shown until one reports it (`role_owner_message_claim`'s
-   * `refusedAtRestart`). So is each row in `alreadyCarried`, which the revoke itself rejected
-   * because an earlier restart had carried it. A row this call finds already decided by someone
-   * else inside this transaction is left exactly as it is.
+  /** Carry unread peer mail only across an authenticated same-conversation succession.
+   * The first carry record preserves the admitted source; later carries validate against it.
+   * UnACKed SENT mail keeps its ID for at-least-once delivery. Invalid or settled sources refuse.
    */
   carryPeerMessagesToSameActorSuccessor(
     authority: PeerMessageCarryAuthority,
@@ -1880,6 +2205,20 @@ export class Outbox {
       for (const read of rows) {
         let row = read;
         let refusal = this.#peerMessageCarryRefusal(row, succession);
+        // A verified continuation of the same conversation may recover the same unACKed ID
+        // after any restart, including a crash after handover. The old first-carry record remains
+        // historical evidence; it no longer acts as a delivery budget.
+        if ((refusal === PeerMessageCarryRefusal.ALREADY_CARRIED ||
+             (refusal === PeerMessageCarryRefusal.ALREADY_CLAIMED && row.status === "SENT")) &&
+            succession.proven && row.target_session_id === fromSessionId && this.#handOverEligible(row.message_id) &&
+            this.#peerSourceMatchesConversation(row, succession.buzzActorId)) {
+          const moved = this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
+            WHERE message_id = ? AND role_key = ? AND binding_generation = ? AND target_session_id = ?
+              AND status IN ('PENDING','SENT') AND ${handOverEligibleSql("outbox")}`,
+            [toGeneration, toSessionId, ReasonCode.OUTBOX_RETARGETED, row.message_id, roleKey, fromGeneration, fromSessionId]).changes;
+          if (moved === 1) retargeted.push(row.message_id);
+          continue;
+        }
         // Both writes name the whole tuple the read saw, so a row another writer decided in this
         // transaction — carried, handed over, rejected — changes nothing here and is left as it is.
         if (refusal === null) {
@@ -2073,8 +2412,8 @@ export class Outbox {
   #escalationReplyUnclaimed(row: RawOutbox, now: string): boolean {
     return row.status === "PENDING" &&
       (row.claim_token ?? null) === null &&
-      row.expires_at > now &&
-      (row.reason_code ?? null) !== ReasonCode.OUTBOX_RETARGETED;
+      (row.expires_at > now || this.#isInBand(row)) &&
+      ((row.reason_code ?? null) !== ReasonCode.OUTBOX_RETARGETED || this.#isInBand(row));
   }
 
   /**
@@ -2158,6 +2497,55 @@ export class Outbox {
     ) === undefined;
   }
 
+  /** The one handover policy's decision for `row` (`instructionHandoverOf`). Only reads. */
+  #instructionHandover(row: RawOutbox, to: { generation: number; sessionId: string } | null): InstructionHandover {
+    return instructionHandoverOf(this.db, row, to);
+  }
+
+  /**
+   * Applies `#instructionHandover`'s answer inside the caller's transaction. A carry keeps the
+   * message id and payload, compare-and-set on the row still being queued or claimed, and releases
+   * any delivery claim — at-least-once, deduplicated by the id. One whose Buzz delivery window
+   * already closed, carried to a successor reached over Buzz, is given a fresh window there, so the
+   * move itself never hands the successor a message it can no longer be sent. An in-band successor
+   * is woken after commit. A keep and a supersession are `keepInstruction` and
+   * `supersedeInstruction`, the same writes the session-stop fence makes.
+   */
+  #applyInstructionHandover(
+    row: RawOutbox,
+    decision: InstructionHandover,
+    to: { generation: number; sessionId: string } | null,
+    path: InstructionHandoverPath,
+  ): boolean {
+    if (decision.kind === "OUT_OF_SCOPE") return false;
+    if (decision.kind === "KEEP") {
+      keepInstruction(this.db, row);
+      return true;
+    }
+    if (decision.kind === "SUPERSEDE") return supersedeInstruction(this.db, this.audit, row, decision, to, path);
+    if (!to) return false;
+    const inBand = deliveredInBand(this.db, row.kind, to.sessionId);
+    const now = this.clock.nowIso();
+    const window = isoPlus(now, DEFAULT_TTL_MS);
+    const moved = this.db.run(
+      `UPDATE outbox SET binding_generation = ?, target_session_id = ?, status = 'PENDING',
+                         claim_token = NULL, claimed_at = NULL, retry_eligible = 0, next_attempt_at = NULL,
+                         failure_class = NULL,
+                         reason_code = CASE WHEN binding_generation = ? THEN reason_code ELSE ? END,
+                         expires_at = CASE WHEN ? = 1 OR expires_at > ? THEN expires_at ELSE ? END
+        WHERE message_id = ? AND status IN ('PENDING','IN_FLIGHT','SENT')`,
+      [to.generation, to.sessionId, to.generation, ReasonCode.OUTBOX_RETARGETED, inBand ? 1 : 0, now, window, row.message_id],
+    ).changes;
+    if (moved !== 1) return false;
+    if (row.kind === MessageKind.ESCALATION_REPLY) this.#recordEscalationReplyCarry(row, to.generation, to.sessionId);
+    if (inBand) {
+      this.db.afterCommit(() => {
+        void this.#wakeInBand([{ messageId: row.message_id, roleKey: row.role_key }], "handover");
+      });
+    }
+    return true;
+  }
+
   #peerMessageCarried(messageId: string): boolean {
     return this.db.get<{ present: number }>(
       `SELECT 1 AS present FROM peer_message_carries WHERE message_id = ? AND outcome = 'CARRIED'`,
@@ -2188,11 +2576,11 @@ export class Outbox {
 
   /** `handOverEligibleSql`, as a read of one row: the same predicate, never a second copy of it. */
   #handOverEligible(messageId: string): boolean {
-    const row = this.db.get<{ eligible: number; payload_json: string }>(
-      `SELECT ${handOverEligibleSql("o")} AS eligible, o.payload_json FROM outbox o WHERE o.message_id = ?`,
+    const row = this.db.get<{ eligible: number; payload_json: string; message_id: string }>(
+      `SELECT ${handOverEligibleSql("o")} AS eligible, o.payload_json, o.message_id FROM outbox o WHERE o.message_id = ?`,
       [messageId],
     );
-    return row?.eligible === 1 && this.#payloadHandOverEligible(row.payload_json);
+    return row?.eligible === 1 && this.#payloadHandOverEligible(row.payload_json, row.message_id);
   }
 
   /**
@@ -2208,7 +2596,7 @@ export class Outbox {
    * runtime move would otherwise re-address a message no holder can read. A parse with no Buzz
    * pointer names no event to check; `ownerMessageLedger` refuses a message that carries none.
    */
-  #payloadHandOverEligible(payloadJson: string): boolean {
+  #payloadHandOverEligible(payloadJson: string, messageId?: string): boolean {
     let parsed: unknown;
     try {
       parsed = JSON.parse(payloadJson) as unknown;
@@ -2218,7 +2606,10 @@ export class Outbox {
     if (JSON.stringify(parsed) !== payloadJson) return false;
     const pointer = ownerMessagePointerOf(parsed);
     return pointer === null ||
-      !this.#sourceSpent(pointer.sourceChannel, pointer.sourceNonce, ["MESSAGE_DEPARTED", "TURN_TERMINAL"]);
+      this.db.get(`SELECT 1 FROM holder_message_source_departures
+        WHERE source_channel = ? AND source_nonce = ?
+          AND (reason = 'TURN_TERMINAL' OR message_id IS NOT ?)`,
+        [pointer.sourceChannel, pointer.sourceNonce, messageId ?? null]) === undefined;
   }
 
   /** The digest of the admitted payload stored at this ingress key, or null when unreadable. */
@@ -2520,6 +2911,18 @@ export class Outbox {
    * Only reads. The order puts what already happened to the row before what it was admitted as,
    * so the category the successor is shown names the first thing that made a carry impossible.
    */
+  #peerSourceMatchesConversation(row: RawOutbox, identity: string): boolean {
+    const pointer = ownerMessagePointerOf(readPayload(row.payload_json));
+    if (!pointer) return false;
+    const source = this.db.get<{ payload_json: string }>(
+      "SELECT payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?", [pointer.sourceChannel, pointer.sourceNonce]);
+    if (!source) return false;
+    const payload = readPayload(source.payload_json);
+    return isPlainRecord(payload) && digestOf(payload) === pointer.sourcePayloadDigest && payload["mention"] === identity &&
+      this.db.get(`SELECT 1 FROM peer_message_carries WHERE message_id = ? AND outcome = 'CARRIED'
+        AND source_payload_digest IS NOT ?`, [row.message_id, pointer.sourcePayloadDigest]) === undefined;
+  }
+
   #peerMessageCarryRefusal(row: RawOutbox, succession: PeerMessageSuccession): PeerMessageCarryRefusal | null {
     if (this.#peerMessageCarried(row.message_id)) return PeerMessageCarryRefusal.ALREADY_CARRIED;
     // Unclaimed: never handed over, never in flight, never attempted. UNKNOWN and IN_DOUBT
@@ -2576,31 +2979,10 @@ export class Outbox {
   }
 
   /**
-   * The owner-message half of a *surviving* switch, called inside that switch's transaction.
-   *
-   * `retargetOrReject` above is the takeover: a new generation, a different counterpart, and the
-   * queued row is carried to it once. This is the other move #493 introduced and nothing here
-   * followed — `conversation: "SURVIVED"`, where the binding is not rewritten at all and only
-   * `conversational_actors.current_session_id` changes. The generation is the same, the
-   * conversation is the same, and the process the row is addressed to is gone.
-   *
-   * So the two statuses part company for the same reason they do on a takeover, and not for the
-   * same reason as each other:
-   *
-   *   `PENDING`  nothing observable happened to it. The counterpart it was addressed to is the one
-   *              still holding the role, so the row is simply re-addressed to where that
-   *              counterpart now runs. It is not stamped `OUTBOX_RETARGETED`: that mark means "was
-   *              carried across a generation to a different conversation", and spending it here
-   *              would cost the message the one takeover it is still entitled to.
-   *   `SENT`     the previous runtime was handed the payload and never came back, so its outcome
-   *              is unknown, and the process that would have known is the one that died. Handing
-   *              it to the new runtime would replay an owner's words into a process that never saw
-   *              them; leaving it would strand it, because no live holder can claim `SENT`. It is
-   *              rejected here and its ingress claim settled in this same transaction.
-   *
-   * A move that goes nowhere is not a move: when both ends of the carry name one and the same
-   * runtime, nothing was replaced, so there is no departed runtime for an unresolved hand-over to
-   * have died with, and burning it would be this method inventing a failure out of a no-op.
+   * Carries holder mail inside a surviving-conversation switch's transaction. The authenticated
+   * counterpart and binding generation stay the same; only its current runtime changes.
+   * Both PENDING and genuine unACKed SENT rows retain their ID and payload across this move.
+   * Terminal IDs, conflicting source departures and modified payloads cannot be replayed.
    */
   carryHolderMessagesToRuntime(
     roleKey: string,
@@ -2622,44 +3004,20 @@ export class Outbox {
       const carried: string[] = [];
       const rejected: string[] = [];
       for (const row of rows) {
-        // Exact compare-and-set on the whole tuple the caller named, not on the row id: the read
-        // above and this write are two statements, and a row that stopped being this role's, this
-        // generation's or this runtime's in between must move nothing.
-        // Never an `IDENTITY_BOUND_KINDS` row (#1044): the generation is the same, but the receiving
-        // session a peer message was admitted for is the one that just went, so it is rejected
-        // below rather than re-addressed to a runtime its proof does not name. Nor a row that ever
-        // left PENDING (review finding 01): it was handed over once already, so it is rejected
-        // below like the `SENT` row it really is. Nor one whose event was taken or answered: the one
-        // hand-over predicate is asked here, as the read, and again by the compare-and-set, as the write.
-        const moved =
-          row.status === "PENDING" && !IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) &&
-          this.#handOverEligible(row.message_id)
-            ? this.db.run(
-                `UPDATE outbox SET target_session_id = ?
-                  WHERE message_id = ? AND status = 'PENDING'
-                    AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
-                    AND role_key = ? AND binding_generation = ? AND target_session_id = ?
-                    AND ${handOverEligibleSql("outbox")}`,
-                [toSessionId, row.message_id, roleKey, bindingGeneration, fromSessionId],
-              ).changes
-            : 0;
-        if (moved === 1) {
-          carried.push(row.message_id);
+        if (!this.#handOverEligible(row.message_id)) {
+          this.db.run("UPDATE outbox SET status = 'REJECTED', reason_code = ? WHERE message_id = ?",
+            [ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH, row.message_id]);
+          this.settleHolderClaimOrThrow(row.message_id);
+          rejected.push(row.message_id);
           continue;
         }
-        this.db.run(
-          `UPDATE outbox SET status = 'REJECTED', reason_code = ?,
-                             claim_token = NULL, claimed_at = NULL,
-                             retry_eligible = 0, next_attempt_at = NULL
-            WHERE message_id = ? AND status IN ('PENDING','SENT')`,
-          [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, row.message_id],
-        );
-        this.settleHolderClaimOrThrow(row.message_id);
-        // ACP-RESTART-04: the queued CEO peer message this move rejected is owed a notice.
-        if (IDENTITY_BOUND_KINDS.has(row.kind as MessageKind) && row.status === "PENDING") {
-          this.#owePeerMessageNotice(row, PeerMessageNoticeReason.RUNTIME_MOVED);
-        }
-        rejected.push(row.message_id);
+        const moved = this.db.run(
+          `UPDATE outbox SET target_session_id = ?
+            WHERE message_id = ? AND status IN ('PENDING','SENT')
+              AND role_key = ? AND binding_generation = ? AND target_session_id = ?`,
+          [toSessionId, row.message_id, roleKey, bindingGeneration, fromSessionId],
+        ).changes;
+        if (moved === 1) carried.push(row.message_id);
       }
 
       this.audit.record({
@@ -2668,6 +3026,33 @@ export class Outbox {
         roleKey,
         evidence: { bindingGeneration, fromSessionId, toSessionId, carried, rejected },
       });
+
+      // ACP-R1-01: the instructions addressed to the outgoing runtime move with the conversation,
+      // whatever their route, under the one handover policy. Left behind, the runtime that now holds the
+      // role could not read them and the fence would reject them.
+      const to = { generation: bindingGeneration, sessionId: toSessionId };
+      const instructions = this.db.all<RawOutbox>(
+        `SELECT o.* FROM outbox o
+          WHERE o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
+            AND ${handoverInstructionRowSql("o")}
+          ORDER BY o.created_at, o.rowid`,
+        [roleKey, bindingGeneration, fromSessionId],
+      );
+      const handed: string[] = [];
+      const superseded: string[] = [];
+      for (const row of instructions) {
+        const handover = this.#instructionHandover(row, to);
+        if (!this.#applyInstructionHandover(row, handover, to, "RUNTIME_MOVE")) continue;
+        (handover.kind === "CARRY" ? handed : superseded).push(row.message_id);
+      }
+      if (handed.length > 0 || superseded.length > 0) {
+        this.audit.record({
+          kind: "OUTBOX_INSTRUCTIONS_HANDED_OVER",
+          reasonCode: ReasonCode.OUTBOX_RETARGETED,
+          roleKey,
+          evidence: { path: "RUNTIME_MOVE", bindingGeneration, fromSessionId, toSessionId, retargeted: handed, rejected: superseded },
+        });
+      }
 
       return { carried, rejected };
     });
@@ -2693,7 +3078,10 @@ export class Outbox {
       `UPDATE outbox SET status = 'EXPIRED', reason_code = ?,
                          retry_eligible = 0, next_attempt_at = NULL
         WHERE status IN ('PENDING','IN_FLIGHT')
-          AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})
+          -- An actionable instruction and a CEO notification end only by ACK or a recorded
+          -- supersession, never by a delivery window (ACP-R1-01, ACP-R2-01).
+          AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}, ${RETAINED_KIND_SQL})
+          AND NOT ${inBandRow("outbox")}
           AND expires_at <= ?`,
       [ReasonCode.OUTBOX_EXPIRED, this.clock.nowIso()],
     );
@@ -2717,27 +3105,8 @@ export class Outbox {
   }
 
   /**
-   * Fence queued and claimed rows whose binding or target lifecycle is no longer valid.
-   *
-   * A holder-claimed row that reached `SENT` is swept here too, which no other kind is — the same
-   * asymmetry `retargetOrReject` makes, and for the same reason. For an outward delivery `SENT`
-   * means the transport took it and an ACK may still legitimately arrive, so fencing it would
-   * reject a delivery that succeeded. For an owner-message it means the previous holder was handed
-   * the payload and never came back; once its target is no longer live, nothing can ever settle
-   * it. Without this clause a restart strands it exactly there: the new holder cannot claim it
-   * (wrong incarnation) and so the row sits `SENT` forever. The `NOT liveDeliveryTarget` condition
-   * is what keeps this off a live holder's outstanding message, which stays claimable and
-   * settleable.
-   *
-   * The mirror of that asymmetry is that a holder-claimed row is *excluded* from the
-   * `PENDING`/`IN_FLIGHT` arm, which every other kind is in. A queued owner-message was handed to
-   * nobody, so nothing observable has happened to it and it is still safely movable: it belongs to
-   * whoever takes the role next, and `retargetOrReject` is what moves it there on a takeover or
-   * closes it on a revoke. Fencing it here would be a terminal transition taken by a sweep that has
-   * no successor to offer and no idea a takeover is one instant away.
-   *
-   * Every row this *does* burn out of `SENT` has its ingress claim settled below, in this same
-   * transaction.
+   * Fence outward delivery attempts. UnACKed role mail and CEO notifications remain durable, and an
+   * instruction is kept or superseded by the handover policy (ACP-R1-01), never fenced.
    */
   fenceUndeliverable(): number {
     return this.db.tx(() => {
@@ -2755,30 +3124,29 @@ export class Outbox {
           heldRejected += 1;
         }
       }
-      // Read the holder-claimed rows this call is about to burn *before* burning them: after the
-      // UPDATE their status no longer says which ones moved, and each of them owns an ingress
-      // claim that closes in this same transaction.
-      const stranded = this.db
-        .all<{ message_id: string }>(
-          `SELECT message_id FROM outbox
-            WHERE status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL})
-              AND NOT ${liveDeliveryTarget("outbox")}`,
-        )
-        .map((row) => row.message_id);
+      // ACP-R1-01: an instruction whose target nobody holds is kept for the role's next holder or
+      // superseded with its reason, under the one handover policy — never fenced for want of one.
+      const unheld = settleUnheldInstructions(this.db, this.audit, this.db.all<RawOutbox>(
+        `SELECT o.* FROM outbox o
+          WHERE ${handoverInstructionRowSql("o")} AND NOT ${liveDeliveryTarget("o")}
+            AND o.message_id NOT IN (SELECT value FROM json_each(?))
+          ORDER BY o.created_at, o.rowid`,
+        [JSON.stringify(stillHeld)],
+      ), "FENCE");
       const changes = this.db.run(
         `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
                            retry_eligible = 0, next_attempt_at = NULL
           WHERE (
                   (status IN ('PENDING','IN_FLIGHT')
-                    AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}))
-                  OR (status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL}))
-                )
+                    AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION')
+                    AND NOT ${inBandRow("outbox")}
+                    AND NOT ${handoverInstructionRowSql("outbox")})
+                  )
             AND NOT ${liveDeliveryTarget("outbox")}
             AND message_id NOT IN (SELECT value FROM json_each(?))`,
         [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, JSON.stringify(stillHeld)],
       ).changes;
-      for (const messageId of stranded) this.settleHolderClaimOrThrow(messageId);
-      return changes + heldRejected;
+      return changes + heldRejected + unheld.superseded.length;
     });
   }
 
@@ -2847,6 +3215,19 @@ export class Outbox {
  * Stored on its REFUSED carry record and shown to the successor; the schema's CHECK lists the same
  * five.
  */
+/** Which handover asked the in-band instruction policy (ACP-R1-01). */
+type InstructionHandoverPath = "RUNTIME_MOVE" | "TAKEOVER" | "REVOKE" | "ADOPTION" | "SESSION_STOPPED" | "FENCE";
+
+/** Why a handover superseded an in-band instruction rather than carrying it (ACP-R1-01). */
+type InstructionSupersession = "RUN_TERMINAL" | "RUN_MISSING" | "RUN_OWNED_ELSEWHERE" | "ESCALATION_SUPERSEDED" | "ROLE_REPLACED";
+
+/** `Outbox.#instructionHandover`'s answer for one row. */
+type InstructionHandover =
+  | { readonly kind: "OUT_OF_SCOPE" }
+  | { readonly kind: "CARRY" }
+  | { readonly kind: "KEEP" }
+  | { readonly kind: "SUPERSEDE"; readonly reason: InstructionSupersession; readonly runState: RunState | null };
+
 export const PeerMessageCarryRefusal = {
   /** The actor, conversation UUID, Buzz signer or recovery record is not one continuous restart. */
   DIFFERENT_ACTOR_OR_SIGNER: "DIFFERENT_ACTOR_OR_SIGNER",

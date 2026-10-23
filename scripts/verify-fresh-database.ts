@@ -373,6 +373,7 @@ for (const table of tables) {
 
   const typedValue = (column: { name: string; type: string }): string => {
     if (patterns.has(column.name)) return patterns.get(column.name)!;
+    if (new RegExp(`json_valid\\(\\s*${column.name}\\s*\\)`, "i").test(sql)) return "'{}'";
     const type = column.type.toUpperCase();
     if (type.startsWith("INT")) return "1";
     if (type.startsWith("REAL") || type.startsWith("NUM")) return "0";

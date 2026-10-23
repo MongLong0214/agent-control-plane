@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { runBoundedChild } from "../helpers/bounded-child.ts";
@@ -52,7 +52,12 @@ const scratchRepo = async (): Promise<string> => {
   }
   copyFileSync(join(ROOT, "src/db/migrations.ts"), join(dir, "src/db/migrations.ts"));
   copyFileSync(join(ROOT, SCRIPT), join(dir, SCRIPT));
-  copyFileSync(join(ROOT, "src/db/schema.sql"), join(dir, "src/db/schema.sql"));
+  // The schema and required registry must describe the same working-tree migration.
+  for (const file of readdirSync(join(ROOT, "src/db"))) {
+    if (file === "migrations.ts" || /^schema(?:-v\d+)?\.sql$/.test(file)) {
+      copyFileSync(join(ROOT, "src/db", file), join(dir, "src/db", file));
+    }
+  }
   return dir;
 };
 

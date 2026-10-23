@@ -121,6 +121,8 @@ export interface BindInput {
   verifiedTarget?: VerifiedTargetBinding;
   /** Authenticated successor to `verifiedTarget`; legacy callers remain compatible. */
   authenticatedTarget?: AuthenticatedTargetBinding;
+  /** Canonical recovery records its peer-mail handover before publishing the transaction. */
+  deferPeerMailUntilCarry?: boolean;
   /** Owner-bootstrap-only restoration of an existing, revoked CEO; never a new actor. */
   restoreCeo?: { actorId: string; generation: number; sessionId: string; incarnation: string };
 }
@@ -380,6 +382,10 @@ export class BindingRegistry {
         evidence: { role: input.role, generation, mode: input.mode ?? "PREFERRED" },
       });
       const created = this.require(roleKey);
+      // ACP-R1-04: the role joins its runtime's room now, if it never had.
+      this.sessions.recordRoomMembership(created.sessionId);
+      this.outbox.adoptHolderMessages(roleKey, created.bindingGeneration, created.sessionId,
+        input.deferPeerMailUntilCarry === true);
       this.#notifySwitch(created, reused.value ?? undefined);
       return allow(ReasonCode.OK, created);
     });
@@ -581,6 +587,9 @@ export class BindingRegistry {
           current.sessionId,
           input.sessionId,
         );
+        // ACP-R1-04: a move into a room the role never answered on is a join, now; a move within
+        // a room keeps the role's first join there.
+        this.sessions.recordRoomMembership(input.sessionId);
         this.audit.record({
           kind: "BINDING_RUNTIME_MOVED",
           roleKey,
@@ -682,6 +691,12 @@ export class BindingRegistry {
             input.sessionId,
           )
         : { retargeted: [], rejected: [] };
+      // ACP-R1-01: with no active binding to take over (the role was revoked), this is the
+      // authenticated binding that follows the revoke, exactly as `bind` is: the role's queued mail,
+      // kept instructions and CEO notifications are handed to the new holder in this transaction.
+      if (!current) this.outbox.adoptHolderMessages(roleKey, generation, input.sessionId);
+      // ACP-R1-04: the role joins the incoming runtime's room now, if it never had.
+      this.sessions.recordRoomMembership(input.sessionId);
 
       this.audit.record({
         kind: "BINDING_SWITCHED",
@@ -795,6 +810,8 @@ export class BindingRegistry {
         evidence: { reason: input.reason, fromGeneration: latest.binding_generation, toGeneration: generation },
       });
       const renewed = this.require(input.roleKey);
+      this.sessions.recordRoomMembership(renewed.sessionId);
+      this.outbox.adoptHolderMessages(input.roleKey, renewed.bindingGeneration, renewed.sessionId);
       this.#notifySwitch(renewed);
       return allow(ReasonCode.OK, renewed);
     });

@@ -32,7 +32,7 @@ export const RECEIPT_BYTES_SHA256 =
   "aa90c6af77754fce9861cb4f57501879c24f66f5616cf46225c5375adfd2a19d";
 
 /**
- * `src/db/migrations.ts`, its historical schema snapshots (v37, v44, v45, v46, v47, v48 and v49), and
+ * `src/db/migrations.ts`, its historical schema snapshots (v37, v44, v45, v46, v47, v48, v49, v50 and v51), and
  * `tests/fixtures/schema-v25-lineage.sql` are append-only, frozen inputs: pinning their exact
  * bytes here means a coordinated edit changes the value a reader compares against, not merely
  * the file being read. These digests are not recomputed from the files they describe: a pin a run
@@ -52,8 +52,15 @@ export const RECEIPT_BYTES_SHA256 =
  *
  * `src/db/schema-v48.sql` is likewise `git show c65e73b2:src/db/schema.sql`, byte-identical to v48's squash
  * merge ab136549 and to 206d8bfe (#512 S-PUSH, CEO 3d0daed0), and carries that file's git blob id.
+ *
+ * `src/db/schema-v51.sql` is likewise `git show 2478b723:src/db/schema.sql` (v51's review r2 head, frozen as
+ * v52's prerequisite), and carries that file's git blob id.
  */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
+  {
+    path: "src/db/migrations.ts",
+    sha256: "6e767404175d889604aa26b9a0549b16a30e24eb04efbc9b3ff85973f3d930bd",
+  },
   {
     path: "src/db/schema-v37.sql",
     sha256: "4261e7641a2411bbfde1246a02a6718ead797ca722cd0c7194e92b0ef19b55ef",
@@ -85,6 +92,16 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
     path: "src/db/schema-v49.sql",
     sha256: "945685a38f7413f01944d3e09171a6b722de4bb618a783f604de1f484de00684",
     gitBlob: "fa96bf02b980c8d7f1e81851ad2223a2cfea2cbb",
+  },
+  {
+    path: "src/db/schema-v50.sql",
+    sha256: "9cd54ebb9402d851a2b43348322f466ba069676890f2b8b7c2187e0a06909f80",
+    gitBlob: "c021d048d6aab318bc2133d5e51ecdb03bdc4096",
+  },
+  {
+    path: "src/db/schema-v51.sql",
+    sha256: "c073c125a230a7fecbfbf0ecf877a5224c11afb7784c2b17da2c25bcf5215d81",
+    gitBlob: "d9f3adccd7b56c6b8c92ad6e9f9d515648050e73",
   },
   {
     path: "tests/fixtures/schema-v13.sql",

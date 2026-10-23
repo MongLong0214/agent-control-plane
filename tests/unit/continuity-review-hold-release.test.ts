@@ -235,8 +235,11 @@ const expectReleased = (f: BootstrapRuntimeFixture, ready: ReviewReady, before: 
 const expectKept = (f: BootstrapRuntimeFixture, ready: ReviewReady, transitionsBefore: number) => {
   expect(f.harness.cp.runs.require(ready.runId)).toMatchObject({ state: RunState.AWAITING_HUMAN, ownerBindingGeneration: 2 });
   expect(transitions(f, ready.runId)).toHaveLength(transitionsBefore);
-  expect(f.harness.cp.outbox.listByRun(ready.runId).filter((message) => message.kind === "RUN_DISPATCH").map((message) => message.bindingGeneration))
-    .toEqual([1]);
+  // No new dispatch. The run's one dispatch, never acknowledged in this fixture, is not discarded by
+  // the revoke: it follows the renewed owner with its id (ACP-R1-01, at-least-once by message id).
+  expect(f.harness.cp.outbox.listByRun(ready.runId).filter((message) => message.kind === "RUN_DISPATCH")
+    .map((message) => [message.bindingGeneration, message.status]))
+    .toEqual([[2, "PENDING"]]);
 };
 
 describe("a restart returns a run continuity paused at CEO review to CEO review", () => {

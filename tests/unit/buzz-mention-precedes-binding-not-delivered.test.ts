@@ -1,5 +1,4 @@
-import { chmodSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync } from "node:fs";
 
 import { afterAll, expect, it } from "vitest";
 
@@ -10,7 +9,6 @@ import {
   startBuzzMessageIngressListener,
   startDaemonBuzzMentionSubscriber,
 } from "../../src/daemon/agentcpd.ts";
-import { Daemon } from "../../src/daemon/daemon.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
@@ -21,15 +19,7 @@ import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
-/**
- * A mention signed while its CTO identity was excluded, before the binding that re-claimed the role,
- * is history for that binding and not work for it.
- *
- * The seam's floor refuses it and writes nothing, and that refusal stays. What this pins is the
- * subscriber's side of it: the event is never promoted into an execution request for the new
- * binding, it is not counted as processed or delivered, the seam is asked about it once rather
- * than on every redelivery the inclusive window brings, and its event id and reason stay readable.
- */
+// The stable role floor retains mail signed while a holder is unavailable.
 
 const SECRET = "buzz-precedes-binding-record-secret";
 const PROJECT = "repo-factory";
@@ -50,7 +40,7 @@ const liveSession = (h: Harness, key: ChannelKey): string => {
   return session.sessionId;
 };
 
-it("leaves a mention signed during exclusion undelivered, asks the seam about it once, and keeps its id and reason", async () => {
+it("retains mail signed during exclusion across replacement and relay redelivery", async () => {
   const dir = tempDir("acp-bpb-");
   chmodSync(dir, 0o700);
   const cto = channelKey(dir, "cto.key");
@@ -81,7 +71,7 @@ it("leaves a mention signed during exclusion undelivered, asks the seam about it
     h.cp.db.all(`SELECT message_id FROM outbox WHERE kind = ? AND target_session_id = ?`, [MessageKind.OWNER_MESSAGE, sessionId]).length;
   const inboundRows = (eventId: string): number =>
     h.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`, [
-      buzzMessageNonce(eventId),
+      buzzMessageNonce(eventId, roleKey),
     ])!.n;
 
   try {
@@ -105,7 +95,6 @@ it("leaves a mention signed during exclusion undelivered, asks the seam about it
     const next = liveSession(h, cto);
     expect(h.cp.bindings.bind({ role: Role.PRIMARY_CTO, sessionId: next, projectId: PROJECT }).allowed).toBe(true);
     await relay.drain(subscriber);
-    const generation = h.cp.bindings.active(roleKey)!.bindingGeneration;
 
     // The window is inclusive, so every reconnect hands the boundary event back.
     for (let drop = 0; drop < REDELIVERIES; drop += 1) {
@@ -116,43 +105,18 @@ it("leaves a mention signed during exclusion undelivered, asks the seam about it
       await relay.drain(subscriber);
     }
 
-    // Not delivered: no inbound row, no execution request for either session, not counted.
-    expect(inboundRows(duringExclusion.id)).toBe(0);
-    expect(ownerMessagesFor(next)).toBe(0);
-    expect(subscriber.counters().admitted).toBe(1);
+    expect(inboundRows(duringExclusion.id)).toBe(1);
+    expect(ownerMessagesFor(next)).toBe(2);
+    expect(subscriber.counters().admitted).toBe(2);
+    expect(subscriber.counters().rejections["admission-precedes-binding"] ?? 0).toBe(0);
+    expect(subscriber.admission().identities[0]?.notDelivered ?? []).toEqual([]);
 
-    // Bounded: the seam refused it once (and the pre-pause mention once, as a spent id under the new
-    // generation); each later redelivery was recognised and not submitted again.
-    const counters = subscriber.counters();
-    expect(counters.rejections["admission-precedes-binding"]).toBe(2);
-    expect(counters.rejections["precedes-binding-not-resubmitted"]).toBe(REDELIVERIES);
-
-    // Recoverable: its event id and reason, readable from the subscriber and from health.json.
-    const record = {
-      eventId: duringExclusion.id,
-      roleKey,
-      bindingGeneration: generation,
-      conversation: ROOM,
-      signedAtSeconds: duringExclusion.created_at,
-      outcome: "NOT_DELIVERED",
-      reason: "PRECEDES_BINDING",
-      seamRefusals: 1,
-      redeliveriesNotResubmitted: REDELIVERIES,
-    };
-    expect(subscriber.admission().identities[0]?.notDelivered).toContainEqual(expect.objectContaining(record));
-    const daemon = new Daemon(h.cp, { stateDir: dir });
-    daemon.setBuzzMentionReceipt({ configuredIdentities: subscriber.socketCount, counters: () => subscriber.counters() });
-    const health = JSON.parse(readFileSync(join(dir, "health.json"), "utf8")) as {
-      buzzMention: { admission: { identities: { notDelivered: unknown[] }[] } };
-    };
-    expect(health.buzzMention.admission.identities[0]?.notDelivered).toContainEqual(expect.objectContaining(record));
-
-    // A mention signed after the re-claim is the new binding's, and is the only thing it receives.
+    // New mail joins the retained work on the current holder.
     h.clock.advance(1_000);
     relay.publish(mention("after the re-claim"));
     await relay.drain(subscriber);
-    expect(ownerMessagesFor(next)).toBe(1);
-    expect(inboundRows(duringExclusion.id)).toBe(0);
+    expect(ownerMessagesFor(next)).toBe(3);
+    expect(inboundRows(duringExclusion.id)).toBe(1);
   } finally {
     subscriber.close();
     await ingress.close();

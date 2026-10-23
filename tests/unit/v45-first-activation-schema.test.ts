@@ -574,7 +574,7 @@ describe("the v44 → v45 step", () => {
     expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsBefore, ...restBefore } = before.tables;
     const { schema_migrations: receiptsAfter, manifest_first_activation_grants: added, ...restAfter } = after.tables;
-    expect(restAfter).toEqual(restBefore);
+    expect(Object.fromEntries(Object.keys(restBefore).map((name) => [name, restAfter[name]]))).toEqual(restBefore);
     expect(added).toBe(contentDigests(privateStatePathWithEmptyFirstGrants()).tables["manifest_first_activation_grants"]);
     expect(receiptsAfter).not.toBe(receiptsBefore);
     const raw = new Database(path, { readonly: true });

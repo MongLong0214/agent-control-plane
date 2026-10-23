@@ -19,6 +19,8 @@ const v46SchemaPath = fileURLToPath(new URL("./schema-v46.sql", import.meta.url)
 const v47SchemaPath = fileURLToPath(new URL("./schema-v47.sql", import.meta.url)); // released v47 reads only this
 const v48SchemaPath = fileURLToPath(new URL("./schema-v48.sql", import.meta.url)); // released v48 reads only this
 const v49SchemaPath = fileURLToPath(new URL("./schema-v49.sql", import.meta.url)); // released v49 reads only this
+const v50SchemaPath = fileURLToPath(new URL("./schema-v50.sql", import.meta.url)); // released v50 reads only this
+const v51SchemaPath = fileURLToPath(new URL("./schema-v51.sql", import.meta.url)); // released v51 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -28,7 +30,9 @@ const schemaSqlAt = (version: number): string =>
         : version <= 46 ? readFileSync(v46SchemaPath, "utf8")
           : version <= 47 ? readFileSync(v47SchemaPath, "utf8")
             : version <= 48 ? readFileSync(v48SchemaPath, "utf8")
-              : version <= 49 ? readFileSync(v49SchemaPath, "utf8") : version <= LATEST_FROZEN_VERSION ? readFileSync(new URL("./schema-v50.sql", import.meta.url), "utf8") : schemaSql();
+              : version <= 49 ? readFileSync(v49SchemaPath, "utf8")
+                : version <= 50 ? readFileSync(v50SchemaPath, "utf8")
+                  : version <= LATEST_FROZEN_VERSION ? readFileSync(v51SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -118,6 +122,7 @@ export const installMigrationLedger = (raw: Database.Database): void => {
  * must be excluded here and created by the migration that owns it.
  */
 const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
+  /-- -{75}\n-- Durable Buzz events[\s\S]*$/,
   /CREATE INDEX IF NOT EXISTS assignments_actor[^;]*;/,
   /-- CP-HI-04 — the identity columns of a binding are fixed once written\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable[\s\S]*?\nEND;/,
   /-- ---------------------------------------------------------------------------\n-- conversational_actor_registrations[\s\S]*?(?=-- ---------------------------------------------------------------------------\n-- assignments)/,
@@ -3990,9 +3995,60 @@ const v50: SchemaMigration = {
   checksum: () => migrationChecksum("v50-post-merge-verification-reentry", 50),
 };
 
-/** v51 belongs to the ingress lane. On integration insert it before this step and change this predecessor to 51. */
+/**
+ * v51 separates shared signed events from recipient delivery, preserves terminal message IDs, and
+ * records each role's room membership history (ACP-R1-04).
+ */
+const v51: SchemaMigration = {
+  id: "v51-durable-recipient-delivery",
+  fromVersion: 50,
+  toVersion: 51,
+  apply(raw) {
+    const tableNames = ["buzz_events", "holder_message_terminals", "role_room_memberships"];
+    const objects: StepObject[] = tableNames.map((name) => ({ type: "table", name, table: name,
+      ddl: schemaObject(new RegExp(String.raw`CREATE TABLE IF NOT EXISTS ${name} \([\s\S]*?\n\) WITHOUT ROWID;`), name, 51) }));
+    objects.push(...stepTriggerObjects(51, ["buzz_events_no_replace", "buzz_events_immutable", "buzz_events_no_delete", "outbox_holder_message_terminal", "holder_message_terminals_immutable", "holder_message_terminals_no_delete", "holder_message_terminals_no_replace"]));
+    assertStepNames(raw, 51, objects, "before");
+    const ddl = schemaSqlAt(51).split("-- Durable Buzz events")[1];
+    if (!ddl) throw new Error("v51 delivery DDL missing");
+    raw.exec("-- Durable Buzz events" + ddl);
+    raw.exec(`INSERT OR IGNORE INTO holder_message_terminals (message_id)
+      SELECT message_id FROM outbox WHERE status IN ('ACKED','REJECTED','EXPIRED')`);
+    // Room membership before this step was never recorded. The best evidence a v50 database holds is
+    // each generation's creation on its bound runtime's room, and a current runtime that moved into a
+    // room counting no earlier than its own creation: earliest per role and room.
+    raw.exec(`INSERT OR IGNORE INTO role_room_memberships (role_key, conversation, joined_at, session_id)
+      SELECT role_key, conversation, MIN(joined_at), session_id FROM (
+        SELECT a.role_key AS role_key, s.buzz_address AS conversation, a.created_at AS joined_at, s.session_id AS session_id
+          FROM assignments a JOIN sessions s ON s.session_id = a.session_id
+         WHERE COALESCE(s.buzz_address, '') <> ''
+        UNION ALL
+        SELECT a.role_key, s.buzz_address, MAX(a.created_at, s.created_at), s.session_id
+          FROM assignments a JOIN conversational_actors c ON c.actor_id = a.actor_id
+          JOIN sessions s ON s.session_id = c.current_session_id
+         WHERE a.status = 'ACTIVE' AND COALESCE(s.buzz_address, '') <> '')
+       GROUP BY role_key, conversation`);
+    assertStepNames(raw, 51, objects, "after");
+    // Revive delivery-window disposal, never an explicit rejection/supersession.
+    raw.exec(`UPDATE outbox SET status = 'PENDING', retry_eligible = 0, next_attempt_at = NULL,
+        claim_token = NULL, claimed_at = NULL
+      WHERE (kind = 'CEO_NOTIFICATION' AND (status = 'EXPIRED' OR
+        (status = 'REJECTED' AND last_error = 'target session has no buzz address')))
+        OR (status = 'EXPIRED' AND kind IN ('RUN_DISPATCH','REVISION_REQUEST','ESCALATION_REPLY','DRAIN_REQUEST','CANCEL_REQUEST')
+          AND (run_id IS NULL OR EXISTS (SELECT 1 FROM runs WHERE runs.run_id = outbox.run_id
+            AND state NOT IN ('COMPLETED','CANCELLED','FAILED'))))`);
+  },
+  checksum: () => migrationChecksum("v51-durable-recipient-delivery", 51),
+};
+
+/**
+ * v52 gives a new project a resident CTO: it rebuilds projects, repositories and bootstrap_applications
+ * to their schema.sql definitions, every row carried (with its rowid where the table has one), and adds
+ * the provisioning, entitlement and retirement tables. No object v51 created is on those three tables, so
+ * the rebuild neither drops nor re-creates one.
+ */
 const v52: SchemaMigration = {
-  id: "v52-resident-project-provisioning", fromVersion: 50, toVersion: 52,
+  id: "v52-resident-project-provisioning", fromVersion: 51, toVersion: 52,
   foreignKeysOffDuringApply: true,
   apply(raw) {
     const ddl = schemaSql();
@@ -4066,6 +4122,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v48,
   v49,
   v50,
+  v51,
   v52,
 ]);
 
@@ -4110,6 +4167,13 @@ const REQUIRED_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
  * list cannot fall behind schema.sql again.
  */
 const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
+  { name: "buzz_events_no_replace", sentinel: "INBOUND_PAYLOAD_IMMUTABLE", introducedIn: 51 },
+  { name: "buzz_events_immutable", sentinel: "INBOUND_PAYLOAD_IMMUTABLE", introducedIn: 51 },
+  { name: "buzz_events_no_delete", sentinel: "INBOUND_PAYLOAD_IMMUTABLE", introducedIn: 51 },
+  { name: "outbox_holder_message_terminal", sentinel: "INSERT INTO holder_message_terminals", introducedIn: 51 },
+  { name: "holder_message_terminals_immutable", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 51 },
+  { name: "holder_message_terminals_no_delete", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 51 },
+  { name: "holder_message_terminals_no_replace", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 51 },
   { name: "manifests_immutable", sentinel: "MANIFEST_IMMUTABLE" },
   { name: "sessions_incarnation_immutable", sentinel: "SESSION_INCARNATION_IMMUTABLE" },
   { name: "sessions_secret_hash_immutable", sentinel: "SESSION_SECRET_HASH_IMMUTABLE" },
@@ -4424,13 +4488,15 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * reads the live schema.sql, so its checksum still moves with any schema edit until the next freeze.
  * Declared here, below the anchors other gates hold into this file, and read only inside functions.
  *
+ * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 2478b723; v50 is
+ * frozen as v51's prerequisite in schema-v50.sql.
  * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
  * #512 S-PUSH (CEO 3d0daed0): v48 was frozen as v49's prerequisite. It reads `schema-v48.sql`, a byte copy
  * of schema.sql at c65e73b2 (blob 29f2a057, unchanged since v48's merge ab136549), so v49's receipts table
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 50;
+const LATEST_FROZEN_VERSION = 51;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when

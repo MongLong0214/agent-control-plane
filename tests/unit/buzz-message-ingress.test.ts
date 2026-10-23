@@ -298,17 +298,23 @@ const queuedOwnerMessages = (harness: ReturnType<typeof makeHarness>) =>
 /** The one durable copy of an admitted envelope's text. */
 const admittedText = (harness: ReturnType<typeof makeHarness>, eventId: string): string | null => {
   const row = harness.cp.db.get<{ payload_json: string | null }>(
-    `SELECT payload_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
-    [buzzMessageNonce(eventId)],
+    `SELECT payload_json FROM inbound_messages WHERE channel = 'buzz' AND (nonce = ? OR json_extract(payload_json, '$.sourceEventId') = ?)`,
+    [buzzMessageNonce(eventId), eventId],
   );
-  return row?.payload_json ? ((JSON.parse(row.payload_json) as { text?: string }).text ?? null) : null;
+  if (!row?.payload_json) return null;
+  const payload = JSON.parse(row.payload_json) as { text?: string; sourceEventId?: string };
+  if (payload.text !== undefined) return payload.text;
+  const event = harness.cp.db.get<{ payload_json: string }>(
+    `SELECT payload_json FROM buzz_events WHERE event_id = ?`, [payload.sourceEventId ?? eventId],
+  );
+  return event ? (JSON.parse(event.payload_json) as { content: string }).content : null;
 };
 
 /** The `(buzz, nonce)` row for one event id, and the turn claim on it if any. */
 const admittedRow = (harness: ReturnType<typeof makeHarness>, eventId: string) =>
   harness.cp.db.get<{ nonce: string; turn_claim_json: string | null }>(
-    `SELECT nonce, turn_claim_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
-    [buzzMessageNonce(eventId)],
+    `SELECT nonce, turn_claim_json FROM inbound_messages WHERE channel = 'buzz' AND (nonce = ? OR json_extract(payload_json, '$.sourceEventId') = ?)`,
+    [buzzMessageNonce(eventId), eventId],
   ) ?? null;
 
 /** Waits on a condition the daemon reaches asynchronously, rather than on a fixed delay. */
@@ -1080,15 +1086,10 @@ describe("the daemon's Buzz message ingress", () => {
         [envelope({ eventId: "evt-cto", text: "CTO, U6 상태", addressedTo: "CTO", mention: CTO_MENTION })],
         hasReasonCode,
       );
-      // Refused, and named for what it is. The turn claim this admission wrote is deliberately
-      // *unresolved* while the outbox row is pending — that is what keeps `prune` off the one
-      // durable copy the queued message points at — so a second copy of the event meets an
-      // unsettled turn rather than a finished one. Both refuse; only this one tells an operator
-      // that the message is still waiting to be taken. It becomes an ordinary
-      // `INGRESS_REPLAY_IGNORED` once its holder settles it, which the end-to-end row shows.
+      // A repeat re-wakes the same durable work without adding another delivery.
       expect(JSON.parse(replay.trim())).toMatchObject({
-        ok: false,
-        reasonCode: ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+        ok: true,
+        reasonCode: ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED,
       });
       expect(queuedOwnerMessages(harness)).toHaveLength(1);
 
@@ -1117,9 +1118,8 @@ describe("the daemon's Buzz message ingress", () => {
       const afterQueue = queuedOwnerMessages(harness);
       expect(afterQueue).toHaveLength(2);
       expect(afterQueue[1]).toMatchObject({ status: "PENDING", role_key: roleKey, target_session_id: second.sessionId });
-      // And the first message is still exactly where it was — addressed to a runtime that has
-      // gone, waiting for the sweep, never re-pointed at the replacement.
-      expect(afterQueue[0]?.target_session_id).toBe(first.sessionId);
+      // Unread mail follows the authenticated replacement with its original message ID.
+      expect(afterQueue[0]?.target_session_id).toBe(second.sessionId);
     } finally {
       await listener.close();
     }
@@ -1593,13 +1593,15 @@ describe("the daemon's Buzz message ingress", () => {
       expect(row.target_session_id).toBe(session.sessionId);
       expect(ownerMessagePointerOf(JSON.parse(row.payload_json) as unknown)).toEqual({
         sourceChannel: "buzz",
-        sourceNonce: buzzMessageNonce(event.id),
+        sourceNonce: buzzMessageNonce(event.id, roleKey),
         sourcePayloadDigest: digestOf(
           buzzMessagePayload({
             conversation: "buzz-cto-room",
             addressedTo: BUZZ_MENTION_ADDRESSED_TO,
             mention: ctoPubkey,
             text: "릴레이로 들어온 지시",
+            signedEvent: event,
+            recipientRoleKey: roleKey,
           }),
         ),
       });
@@ -1624,7 +1626,7 @@ describe("the daemon's Buzz message ingress", () => {
         "릴레이로 들어온 지시",
       );
       const again = await peer.callTool("role_owner_message_claim", { roleKey });
-      expect((again.value as { claimed?: unknown }).claimed ?? null).toBeNull();
+      expect((again.value as { claimed?: { messageId: string } }).claimed?.messageId).toBe(row.message_id);
 
       const completed = await peer.callTool("role_owner_message_complete", {
         roleKey,
