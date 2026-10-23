@@ -121,6 +121,8 @@ export interface BindInput {
   verifiedTarget?: VerifiedTargetBinding;
   /** Authenticated successor to `verifiedTarget`; legacy callers remain compatible. */
   authenticatedTarget?: AuthenticatedTargetBinding;
+  /** Canonical recovery records its peer-mail handover before publishing the transaction. */
+  deferPeerMailUntilCarry?: boolean;
   /** Owner-bootstrap-only restoration of an existing, revoked CEO; never a new actor. */
   restoreCeo?: { actorId: string; generation: number; sessionId: string; incarnation: string };
 }
@@ -380,6 +382,8 @@ export class BindingRegistry {
         evidence: { role: input.role, generation, mode: input.mode ?? "PREFERRED" },
       });
       const created = this.require(roleKey);
+      this.outbox.adoptHolderMessages(roleKey, created.bindingGeneration, created.sessionId,
+        input.deferPeerMailUntilCarry === true);
       this.#notifySwitch(created, reused.value ?? undefined);
       return allow(ReasonCode.OK, created);
     });
@@ -795,6 +799,7 @@ export class BindingRegistry {
         evidence: { reason: input.reason, fromGeneration: latest.binding_generation, toGeneration: generation },
       });
       const renewed = this.require(input.roleKey);
+      this.outbox.adoptHolderMessages(input.roleKey, renewed.bindingGeneration, renewed.sessionId);
       this.#notifySwitch(renewed);
       return allow(ReasonCode.OK, renewed);
     });

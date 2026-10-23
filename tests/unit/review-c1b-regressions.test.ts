@@ -184,21 +184,20 @@ describe("ROUND1-ESCAPE-01: an envelope is settled by the outbox, not by a turn'
     });
   });
 
-  it("a wake naming an envelope that expired unacknowledged is refused and runs no turn", async () => {
+  it("an actionable unacknowledged envelope survives its delivery timestamp and can wake another turn", async () => {
     await withBootstrapRuntime(async (f) => {
       const { runId, ownerSessionId, roleKey } = await f.dispatchBootstrap();
       await f.awaitFinishedTurns(ownerSessionId, 1);
       const pending = dispatchOf(f, runId);
       expect(pending.status).toBe("PENDING");
       f.harness.clock.advance(Date.parse(pending.expiresAt) - Date.parse(f.harness.clock.nowIso()));
-      expect(f.harness.cp.outbox.expireOverdue()).toBeGreaterThanOrEqual(1);
-      expect(dispatchOf(f, runId).status).toBe("EXPIRED");
+      expect(f.harness.cp.outbox.expireOverdue()).toBe(0);
+      expect(dispatchOf(f, runId).status).toBe("PENDING");
       expect(f.harness.cp.sessionRuntime.wake(roleKey, [{ id: pending.messageId, kind: "in-band dispatch" }])).toMatchObject({
-        allowed: false,
-        reasonCode: ReasonCode.SESSION_TURN_DUPLICATE,
+        allowed: true,
       });
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(f.finishedTurns(ownerSessionId)).toBe(1);
+      await f.awaitFinishedTurns(ownerSessionId, 2);
+      expect(dispatchOf(f, runId).status).toBe("PENDING");
     });
   });
 });

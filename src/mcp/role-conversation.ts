@@ -63,6 +63,7 @@ interface LivePeer {
    * `attach`'s detach by construction, rather than by a cleanup somebody has to remember to run.
    */
   endpoint: string | null;
+  acceptance: "relay-v1" | null;
   /**
    * Which registration of this connection this peer's endpoint belongs to.
    *
@@ -530,6 +531,7 @@ export class RoleConversationPort {
    * queues can be attributed: the daemon writes it as a `ROLE_WAKE_SENT` audit row. Absent, wakes
    * are sent as before and recorded nowhere.
    */
+  readonly #onWakeFailed: ((wake: WrittenRoleWake) => void) | null;
   readonly #onWakeWritten: ((wake: WrittenRoleWake) => void) | null;
   /**
    * FIX-ROLE-WAKE — whether the holder has anything its wake would send it to read. Asked only by
@@ -547,6 +549,7 @@ export class RoleConversationPort {
       wakeTimeoutMs?: number;
       ownerMessages?: OwnerMessageLedger;
       serializeWake?: <T>(body: () => T) => T;
+      onWakeFailed?: (wake: WrittenRoleWake) => void;
       onWakeWritten?: (wake: WrittenRoleWake) => void;
       holderHasWork?: (holder: HolderIdentity) => boolean;
     } = {},
@@ -555,6 +558,7 @@ export class RoleConversationPort {
     this.#bindings = bindings;
     this.#serializeWake = options.serializeWake ?? null;
     this.#onWakeWritten = options.onWakeWritten ?? null;
+    this.#onWakeFailed = options.onWakeFailed ?? null;
     this.#holderHasWork = options.holderHasWork ?? null;
     this.#ownerMessages = options.ownerMessages ?? null;
     this.#endpointDir = options.endpointDir === undefined ? null : resolvePath(options.endpointDir);
@@ -647,6 +651,7 @@ export class RoleConversationPort {
         authenticate,
         binding,
         endpoint: null,
+        acceptance: null,
         registration: 0,
         wakeFailure: null,
       });
@@ -922,7 +927,7 @@ export class RoleConversationPort {
    * `WAKE_TRANSPORT_QUALIFIED_CLIENTS`. Membership is exact, and a build outside the set is
    * refused however close its version is to a member's.
    */
-  async registerEndpoint(server: McpServer, endpoint: string): Promise<Decision<readonly string[]>> {
+  async registerEndpoint(server: McpServer, endpoint: string, acceptance?: "relay-v1"): Promise<Decision<readonly string[]>> {
     const owned = [...this.#live.entries()].filter(([, peer]) => peer.server === server);
     if (owned.length === 0) {
       return deny(
@@ -970,6 +975,7 @@ export class RoleConversationPort {
     }
     for (const [, peer] of owned) {
       peer.endpoint = validated.value;
+      peer.acceptance = acceptance ?? null;
       // A new registration, and a new identity for it. The endpoint string is not one: a holder
       // that rebinds the same pathname registers again under a value that compares equal, and a
       // wake still in flight from the previous registration would then complete into this one's
@@ -1202,6 +1208,7 @@ export class RoleConversationPort {
     // the previous endpoint's delivery as this one's. Both directions of that were reproduced.
     const registration = peer.registration;
     const endpoint = peer.endpoint;
+    const acceptance = peer.acceptance;
     let outcome: "written" | "stale" | "unsettled";
     try {
       outcome = await new Promise<"written" | "stale" | "unsettled">((resolveWake, rejectWake: (failure: WakeFailure) => void) => {
@@ -1225,6 +1232,19 @@ export class RoleConversationPort {
                   : "unclassified",
           }),
         );
+        let reply = "";
+        if (acceptance === "relay-v1") {
+          socket.setEncoding("utf8");
+          socket.on("data", (chunk: string) => {
+            reply += chunk;
+            if (reply.length > 128) return fail({ shape: "unclassified" });
+            if (!reply.includes("\n")) return;
+            if (reply !== '{"accepted":true}\n') return fail({ shape: "connection-refused" });
+            socket.destroy();
+            resolveWake("written");
+          });
+          socket.once("end", () => { if (reply !== '{"accepted":true}\n') fail({ shape: "connection-closed" }); });
+        }
         socket.once("connect", () => {
           // The holder is judged again here, in the same synchronous section as the write, and not
           // only before the connect: the connect is asynchronous, and a revoke, a takeover or a new
@@ -1250,7 +1270,7 @@ export class RoleConversationPort {
             // reader does not have to know the frame's length to know the wake is complete. This
             // is what C0 measured the runtime accepting.
             socket.end(ROLE_WAKE_FRAME, () => {
-              if (handedOff) resolveWake("written");
+              if (handedOff && acceptance !== "relay-v1") resolveWake("written");
             });
             handedOff = true;
           };
@@ -1270,6 +1290,7 @@ export class RoleConversationPort {
         });
       });
     } catch (failure) {
+      this.#onWakeFailed?.({ roleKey, cause: cause ?? (mention ? ROLE_WAKE_CAUSE.MENTION : ROLE_WAKE_CAUSE.UNSPECIFIED) });
       // Remembered against the registration it was sent under, so the scan can report a holder
       // whose registration is valid on the filesystem and still takes no wake -- the one unwakeable
       // state no check made before connecting can see. Not a probe: this is a delivery that was

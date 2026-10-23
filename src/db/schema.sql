@@ -4029,3 +4029,66 @@ END;
 
 INSERT OR IGNORE INTO continuity_state (id, mode, changed_at)
 VALUES (1, 'NORMAL', '1970-01-01T00:00:00.000Z');
+
+
+-- ---------------------------------------------------------------------------
+-- Durable Buzz events and message-ID terminal deduplication (schema v51).
+-- Recipient admission/claim/ACK lives in inbound_messages and outbox; the signed body lives once.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS buzz_events (
+  event_id TEXT PRIMARY KEY NOT NULL,
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
+) WITHOUT ROWID;
+
+-- CP-HI-08 — accepted signed event bytes cannot be replaced.
+CREATE TRIGGER IF NOT EXISTS buzz_events_no_replace
+BEFORE INSERT ON buzz_events
+WHEN EXISTS (SELECT 1 FROM buzz_events WHERE event_id = NEW.event_id)
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
+-- CP-HI-08 — accepted signed event bytes cannot be rewritten.
+CREATE TRIGGER IF NOT EXISTS buzz_events_immutable
+BEFORE UPDATE ON buzz_events
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
+-- CP-HI-08 — accepted signed event bytes outlive every recipient delivery.
+CREATE TRIGGER IF NOT EXISTS buzz_events_no_delete
+BEFORE DELETE ON buzz_events
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
+
+-- Once ACKed or explicitly rejected, resetting a mutable outbox status cannot replay the ID.
+CREATE TABLE IF NOT EXISTS holder_message_terminals (
+  message_id TEXT PRIMARY KEY NOT NULL
+) WITHOUT ROWID;
+-- CP-HI-08 — a completed message ID remains durably deduplicated.
+CREATE TRIGGER IF NOT EXISTS outbox_holder_message_terminal
+AFTER UPDATE OF status ON outbox
+WHEN NEW.status IN ('ACKED','REJECTED','EXPIRED')
+  AND NOT EXISTS (SELECT 1 FROM holder_message_terminals WHERE message_id = NEW.message_id)
+BEGIN
+  INSERT INTO holder_message_terminals (message_id) VALUES (NEW.message_id);
+END;
+-- CP-HI-08 — a completion receipt cannot be rewritten.
+CREATE TRIGGER IF NOT EXISTS holder_message_terminals_immutable
+BEFORE UPDATE ON holder_message_terminals
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+-- CP-HI-08 — a deleted completion receipt must not enable replay.
+CREATE TRIGGER IF NOT EXISTS holder_message_terminals_no_delete
+BEFORE DELETE ON holder_message_terminals
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — a completion receipt cannot be replaced.
+CREATE TRIGGER IF NOT EXISTS holder_message_terminals_no_replace
+BEFORE INSERT ON holder_message_terminals
+WHEN EXISTS (SELECT 1 FROM holder_message_terminals WHERE message_id = NEW.message_id)
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;

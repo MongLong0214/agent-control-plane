@@ -370,7 +370,7 @@ const startBindFixture = async (
         nonce: row.evidence["nonce"],
       })),
     inbound: (eventId: string) =>
-      h.cp.db.get(`SELECT nonce FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`, [buzzMessageNonce(eventId)]),
+      h.cp.db.get(`SELECT nonce FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`, [buzzMessageNonce(eventId, ctoRoleKey)]),
     peerRows: () => h.cp.db.all(`SELECT message_id FROM outbox WHERE kind = ?`, [MessageKind.PEER_MESSAGE]),
     /** Every row a delivered message leaves, for either principal: its ingress row and its outbox row. */
     messageRows: () => ({

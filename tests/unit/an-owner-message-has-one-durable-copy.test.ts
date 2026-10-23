@@ -307,7 +307,7 @@ describe("an owner's message has exactly one durable copy, and admission produce
    * `the-cto-socket-has-a-live-peer.test.ts`. What is measured here is what happens *after* an
    * identity has been derived, which is the half that touches two ledgers.
    */
-  it("hands over once, replays nothing after a crash, and closes both ledgers together", async () => {
+  it("redelivers the same ID after a crash and closes both ledgers together", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
@@ -347,17 +347,12 @@ describe("an owner's message has exactly one durable copy, and admission produce
       expect(first.value.unresolved).toEqual([]);
       expect(harness.cp.outbox.get(messageId)?.status).toBe("SENT");
 
-      // The crash: the holder took the payload and never came back. A second claim is what the
-      // replacement runtime — or the same one after a restart — does, and it must learn that
-      // something is unsettled without being handed the words a second time.
+      // A crash before ACK redelivers the same durable ID for receiver-side dedupe.
       const afterCrash = ledger.claim(holder);
       expect(afterCrash.allowed).toBe(true);
       if (!afterCrash.allowed) return;
-      expect(afterCrash.value.claimed).toBeNull();
-      expect(afterCrash.value.unresolved.map((row) => row.messageId)).toEqual([messageId]);
-      // Payload-free by the shape of what came back, not by a field that happens to be undefined.
-      expect(JSON.stringify(afterCrash.value.unresolved)).not.toContain(text);
-      expect(Object.keys(afterCrash.value.unresolved[0]!)).not.toContain("payload");
+      expect(afterCrash.value.claimed).toMatchObject({ messageId, text });
+      expect(afterCrash.value.unresolved).toEqual([]);
 
       // Both ledgers, together. Before the settle the ingress claim is outstanding: that is what
       // keeps `prune` off the one durable copy while the outbox row is unresolved.

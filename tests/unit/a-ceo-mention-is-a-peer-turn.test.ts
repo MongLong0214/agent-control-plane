@@ -316,7 +316,7 @@ const startPeerFixture = async (
       harness.cp.db.get<{ actor: string; payload_json: string; turn_claim_json: string | null }>(
         `SELECT actor, payload_json, turn_claim_json FROM inbound_messages
           WHERE channel = 'buzz' AND nonce = ?`,
-        [buzzMessageNonce(eventId)],
+        [buzzMessageNonce(eventId, ctoRoleKey)],
       ),
     refusedWith: (reasonCode: string): number =>
       subscriber.counters().rejections[`admission-refused:${reasonCode}`] ?? 0,
@@ -711,8 +711,7 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
         .toMatchObject({ allowed: false, reasonCode: ReasonCode.INGRESS_SIGNATURE_INVALID });
       expect(fixture.admitted(event.id)).toBeUndefined();
       expect(await deliverBuzzMessage(ingress, port, input)).toMatchObject({ allowed: true });
-      expect(await deliverBuzzMessage(ingress, port, input))
-        .toMatchObject({ allowed: false, reasonCode: ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN });
+      expect(await deliverBuzzMessage(ingress, port, input)).toMatchObject({ allowed: true });
       expect(fixture.peerRows()).toHaveLength(1);
     } finally {
       await fixture.close();
@@ -893,7 +892,7 @@ describe("#1038 a bound CEO's Buzz mention is a peer turn for the bound PRIMARY_
       const receipt = {
         channel: "buzz",
         actor: fixture.ceo.pubkey,
-        inboundNonce: buzzMessageNonce(peerEvent.id),
+        inboundNonce: buzzMessageNonce(peerEvent.id, fixture.ctoRoleKey),
         runId: null,
         candidateSnapshotDigest: null,
         operation: "PROJECT_SUSPEND",
@@ -1061,8 +1060,8 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
       const blocked = ledger.claim(fixture.holder());
       expect(blocked.allowed).toBe(true);
       expect(blocked.allowed ? blocked.value : null).toMatchObject({
-        claimed: null,
-        unresolved: [{ messageId: first!.message_id }],
+        claimed: { messageId: first!.message_id },
+        unresolved: [],
         withheld: [{ messageId: broken!.message_id }],
       });
     } finally {
@@ -1070,7 +1069,7 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
     }
   });
 
-  it("rejects a queued peer message on a CTO takeover instead of retargeting it to the successor", async () => {
+  it("retains peer mail across a CTO takeover and withholds it from an unproven conversation", async () => {
     const fixture = await startPeerFixture();
     try {
       const { harness } = fixture;
@@ -1082,9 +1081,9 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
 
       // The peer message is closed, with its turn, rather than handed to a session its proof does
       // not name ...
-      expect(fixture.peerRows().map((row) => row.status)).toEqual(["REJECTED"]);
+      expect(fixture.peerRows().map((row) => row.status)).toEqual(["PENDING"]);
       const claim = JSON.parse(fixture.admitted(peerEvent.id)!.turn_claim_json!) as Record<string, unknown>;
-      expect(claim["noReplyAt"]).toEqual(expect.any(String));
+      expect(claim["noReplyAt"]).toBeUndefined();
 
       // ... while the owner's message follows the role once, together with the mention's identity:
       // a successor that does not carry the channel identity the mention named is withheld it
@@ -1106,14 +1105,16 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
         text: "주인의 메시지",
         principal: "owner",
       });
+      const messageId = claimOf(taken.allowed ? taken.value : null).claimed!.messageId;
+      expect(ledger.complete(messageId, successor).allowed).toBe(true);
       const again = ledger.claim(successor);
-      expect(claimOf(again.allowed ? again.value : null)).toMatchObject({ claimed: null, withheld: [] });
+      expect(claimOf(again.allowed ? again.value : null)).toMatchObject({ claimed: null });
     } finally {
       await fixture.close();
     }
   });
 
-  it("rejects a queued peer message when the CTO runtime is replaced within its generation instead of carrying it", async () => {
+  it("retains peer mail across a runtime move until its current recipient is authenticated", async () => {
     const fixture = await startPeerFixture();
     try {
       const { harness } = fixture;
@@ -1125,9 +1126,9 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
       const next = replaceCto(fixture, { conversation: "SURVIVED" });
       expect(harness.cp.bindings.active(fixture.ctoRoleKey)!.bindingGeneration).toBe(generation);
 
-      expect(fixture.peerRows().map((row) => row.status)).toEqual(["REJECTED"]);
+      expect(fixture.peerRows().map((row) => row.status)).toEqual(["PENDING"]);
       const claim = JSON.parse(fixture.admitted(peerEvent.id)!.turn_claim_json!) as Record<string, unknown>;
-      expect(claim["noReplyAt"]).toEqual(expect.any(String));
+      expect(claim["noReplyAt"]).toBeUndefined();
 
       // The owner's message is carried, and is the successor's to take once the mention's channel
       // identity is its own (1080-N5); before that it is withheld.

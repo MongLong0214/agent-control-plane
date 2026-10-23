@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { lstatSync } from "node:fs";
+import { lstatSync, watch } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -701,10 +701,10 @@ const wakeFailureShape = (error: NodeJS.ErrnoException): string => {
  * The owner-only directory leaves that move to this uid, which can read this process's environment
  * anyway.
  *
- * **It answers the sender nothing**, as the session's own socket answers the daemon nothing: the
- * daemon's wake counts as delivered once its frame is written and reads no reply, so its
- * classification of a wake is what it was. A forward that fails after that shows only here, as
- * `attach: wake forward failed <shape>`, with no path and no token.
+ * The daemon waits for this proxy's acceptance reply. It is positive only after forwarding the
+ * complete authenticated frame to the session socket. Failure retains a pending signal; socket
+ * availability changes retry it. The durable inbox remains authoritative until the holder claims
+ * and ACKs its work. Diagnostics contain neither path nor token.
  */
 const openWakeProxy = (messaging: SessionMessaging, stderr: Writable): Promise<WakeProxy | null> => {
   const opening = inspectWakeTarget(messaging.socketPath);
@@ -715,40 +715,69 @@ const openWakeProxy = (messaging: SessionMessaging, stderr: Writable): Promise<W
   const path = join(dirname(messaging.socketPath), `acp-wake-proxy-${randomBytes(8).toString("hex")}.sock`);
   const connections = new Set<Socket>();
 
-  const forward = (): void => {
-    const before = inspectWakeTarget(messaging.socketPath);
-    if (before.refusal !== null) {
-      stderr.write(`attach: wake forward refused ${before.refusal}\n`);
-      return;
+  let requested = 0;
+  let forwarded = 0;
+  let forwarding = false;
+  let closed = false;
+  let availability = 0;
+  const waiting = new Map<Socket, number>();
+  const answer = (through: number, accepted: boolean): void => {
+    for (const [socket, sequence] of waiting) {
+      if (sequence > through) continue;
+      waiting.delete(socket);
+      socket.end(`${JSON.stringify({ accepted })}\n`);
     }
-    const out = createConnection(messaging.socketPath);
-    let written = false;
-    let reported = false;
-    const report = (line: string): void => {
-      out.destroy();
-      if (written) return;
-      if (reported) return;
-      reported = true;
-      stderr.write(line);
+  };
+  const forward = (): void => {
+    if (closed || forwarding || requested <= forwarded) return;
+    forwarding = true;
+    const through = requested;
+    const beganAtAvailability = availability;
+    const before = inspectWakeTarget(messaging.socketPath);
+    const failed = (shape: string): void => {
+      forwarding = false;
+      stderr.write(`attach: wake forward failed ${shape}\n`);
+      answer(through, false);
+      // An event during this attempt must survive the failure too.
+      if (requested > through || availability > beganAtAvailability) queueMicrotask(forward);
+      // Keep the outstanding signal. A filesystem change or another wake retries it.
     };
-    const failed = (shape: string): void => report(`attach: wake forward failed ${shape}\n`);
-    out.setTimeout(WAKE_PROXY_TIMEOUT_MS, () => failed("timeout"));
-    out.once("error", (error: NodeJS.ErrnoException) => failed(wakeFailureShape(error)));
+    if (before.refusal !== null) { failed(before.refusal); return; }
+    const out = createConnection(messaging.socketPath);
+    connections.add(out);
+    out.once("close", () => connections.delete(out));
+    let settled = false;
+    const finish = (accepted: boolean, shape = "connection-closed"): void => {
+      if (settled) return;
+      settled = true;
+      out.destroy();
+      if (!accepted) { failed(shape); return; }
+      forwarded = through;
+      forwarding = false;
+      answer(through, true);
+      // An arrival during forwarding is a follow-up signal, never erased by this completion.
+      if (requested > forwarded) forward();
+    };
+    out.setTimeout(WAKE_PROXY_TIMEOUT_MS, () => finish(false, "timeout"));
+    out.once("error", (error: NodeJS.ErrnoException) => finish(false, wakeFailureShape(error)));
+    out.once("close", () => { if (!settled) finish(false); });
     out.once("connect", () => {
-      // The token is written only to the file that passed before the connect, and passes still.
       const after = inspectWakeTarget(messaging.socketPath);
-      if (after.refusal !== null) return report(`attach: wake forward refused ${after.refusal}\n`);
-      if (after.identity !== before.identity) return report("attach: wake forward refused endpoint-replaced\n");
-      // One write: the auth line is the connection's first line, and the frame is its second.
-      out.end(`${JSON.stringify({ type: "auth", token: messaging.token })}\n${WAKE_FRAME}`, () => {
-        written = true;
-      });
+      if (after.refusal !== null) return finish(false, after.refusal);
+      if (after.identity !== before.identity) return finish(false, "endpoint-replaced");
+      out.end(`${JSON.stringify({ type: "auth", token: messaging.token })}\n${WAKE_FRAME}`, () => finish(true));
     });
   };
+  // Availability is an event. No timer probes the session or disposes of pending work.
+  const watcher = watch(dirname(messaging.socketPath), (_event, name) => {
+    if (name === null || String(name) === messaging.socketPath.split("/").at(-1)) { availability += 1; forward(); }
+  });
+  watcher.on("error", () => undefined);
+  watcher.unref();
 
-  const server: Server = createServer((socket) => {
+  const server: Server = createServer({ allowHalfOpen: true }, (socket) => {
     connections.add(socket);
-    socket.once("close", () => connections.delete(socket));
+    socket.once("close", () => { connections.delete(socket); waiting.delete(socket); });
     let held = Buffer.alloc(0);
     let decided = false;
     const drop = (): void => {
@@ -757,30 +786,28 @@ const openWakeProxy = (messaging: SessionMessaging, stderr: Writable): Promise<W
       socket.destroy();
       stderr.write("attach: wake proxy dropped a connection that was not a wake\n");
     };
-    socket.setTimeout(WAKE_PROXY_TIMEOUT_MS, drop);
+    socket.setTimeout(WAKE_PROXY_TIMEOUT_MS, () => { if (!decided) drop(); else socket.destroy(); });
     socket.on("data", (chunk: Buffer) => {
       if (decided) return;
       held = Buffer.concat([held, chunk]);
       if (held.length > WAKE_FRAME_BYTES.length) return drop();
-      // Refused at the first byte that differs, rather than read to the bound and compared then.
       if (!WAKE_FRAME_BYTES.subarray(0, held.length).equals(held)) drop();
     });
     socket.once("end", () => {
       if (decided) return;
       if (!held.equals(WAKE_FRAME_BYTES)) return drop();
       decided = true;
-      socket.destroy();
+      waiting.set(socket, ++requested);
       forward();
     });
-    socket.on("error", () => {
-      decided = true;
-      socket.destroy();
-    });
+    socket.on("error", () => { decided = true; socket.destroy(); });
   });
+
   server.maxConnections = WAKE_PROXY_MAX_CONNECTIONS;
 
   return new Promise<WakeProxy | null>((resolveProxy) => {
     const notListening = (): void => {
+      watcher.close();
       stderr.write("attach: wake proxy not opened listen-failed\n");
       resolveProxy(null);
     };
@@ -793,6 +820,8 @@ const openWakeProxy = (messaging: SessionMessaging, stderr: Writable): Promise<W
       resolveProxy({
         path,
         close: () => {
+          closed = true;
+          watcher.close();
           for (const socket of connections) socket.destroy();
           // Closing a listening unix socket removes its path.
           server.close();
@@ -1539,7 +1568,7 @@ const relayWithReattach = (
       if (params?.name !== WAKE_REGISTER_TOOL) return null;
       const registration = params.arguments as { endpoint?: unknown } | null | undefined;
       if (registration?.endpoint !== messaging.socketPath) return null;
-      return { ...message, params: { ...params, arguments: { ...registration, endpoint: opened.path } } };
+      return { ...message, params: { ...params, arguments: { ...registration, endpoint: opened.path, acceptance: "relay-v1" } } };
     };
 
     /**
@@ -1774,7 +1803,7 @@ const relayWithReattach = (
       if (clientInitialized === null) return true;
       link.proxyOffered = true;
       const id = nextInternalId(link, "acp-relay-wake-proxy");
-      const registration = { endpoint: opened.path };
+      const registration = { endpoint: opened.path, acceptance: "relay-v1" };
       const answer = await ask(link, id, JSON.stringify({
         jsonrpc: "2.0",
         id,

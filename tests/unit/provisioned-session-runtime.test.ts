@@ -354,3 +354,35 @@ describe("C1b driver: one turn at a time; concurrent wakes coalesce; a duplicate
     expect(claude.turns).toHaveLength(0);
   });
 });
+
+
+it("refuses a structured Claude provider failure on ordinary and session invocations despite a zero exit and parseable verdict", async () => {
+  const workdir = tempDir("acp-provider-error-");
+  captureRunCli(() => ({ session_id: turn({ workdir }).handle.externalSessionId, is_error: true,
+    result: '{"verdict":"APPROVE"}' }));
+  const ordinary = await adapter().invoke({ prompt: "review", workdir, readOnly: true, timeoutMs: 1_000, correlationId: "failed-review" });
+  const session = await adapter().runSessionTurn(turn({ workdir }));
+  for (const result of [ordinary, session]) {
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('"verdict":"APPROVE"');
+  }
+});
+
+it("#6 keeps a pending-work signal when the same durable message wakes a turn already handling it", async () => {
+  const { harness, claude, roleKey } = await dispatched();
+  try {
+    const id = harness.cp.db.get<{ message_id: string }>("SELECT message_id FROM outbox WHERE kind = 'RUN_DISPATCH'")!.message_id;
+    let release: () => void = () => undefined;
+    claude.onWorkTurn = async () => new Promise<void>((resolve) => { release = resolve; });
+    const runtime = harness.cp.sessionRuntime;
+    expect(runtime.wake(roleKey, [{ id, kind: "dispatch" }])).toMatchObject({ allowed: true, value: "STARTED" });
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(1));
+    expect(runtime.wake(roleKey, [{ id, kind: "dispatch" }])).toMatchObject({ allowed: true, value: "COALESCED" });
+    expect(runtime.wake(roleKey, [{ id, kind: "dispatch" }])).toMatchObject({ allowed: false, reasonCode: ReasonCode.SESSION_TURN_DUPLICATE });
+    release();
+    await vi.waitFor(() => expect(claude.turns).toHaveLength(2));
+    release();
+    await vi.waitFor(() => expect(runtime.turnInProgress(harness.cp.bindings.active(roleKey)!.sessionId)).toBe(false));
+    expect(claude.turns).toHaveLength(2);
+  } finally { harness.cp.close(); }
+});

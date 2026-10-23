@@ -10,7 +10,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
-import { HOLDER_CLAIMED_KIND_SQL } from "../outbox/outbox.ts";
+import { HOLDER_CLAIMED_KIND_SQL, inBandRow } from "../outbox/outbox.ts";
 import { isBuzzKeyPossession, type BuzzKeyPossession } from "../buzz/buzz-bind-challenge.ts";
 import { isAdmittedRuntime, type AdmittedRuntime } from "./runtime-lineage.ts";
 
@@ -405,7 +405,8 @@ export class SessionRegistry {
       .all<{ message_id: string }>(
         `SELECT message_id FROM outbox
           WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')
-            AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})`,
+            AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION')
+            AND NOT ${inBandRow("outbox")}`,
         [sessionId],
       )
       .map((row) => row.message_id);
@@ -414,7 +415,8 @@ export class SessionRegistry {
       `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
                          retry_eligible = 0, next_attempt_at = NULL
         WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')
-          AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL})`,
+          AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION')
+            AND NOT ${inBandRow("outbox")}`,
       [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, sessionId],
     );
     return doomed;

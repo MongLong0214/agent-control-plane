@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import type { OutboxMessage } from "../outbox/outbox.ts";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
@@ -49,6 +50,7 @@ import {
   type DaemonNoticeProbeReport,
   type DaemonNoticeTargetResolver,
   deliverOwedPeerMessageNotices,
+  daemonNoticeCanonical, daemonNoticeEventId, daemonNoticeFields, daemonNoticeKey, daemonNoticeSettlement, sealDaemonNotice,
   sendDaemonNoticeProbe,
 } from "../runtime/acp-daemon-notice.ts";
 import {
@@ -352,7 +354,7 @@ export const startDaemonMcpListeners = async (
   // In-band delivery to an adopted canonical CTO: a row withheld from Buzz wakes the role through
   // the same port a role-addressed Buzz message wakes it through. Then one pass for rows that were
   // queued while no port existed (before a restart, or before these listeners opened); the
-  // daemon's delivery tick repeats it, at most once per row per window.
+  // holder registration and subsequent work events retry it, without a delivery poll.
   cp.outbox.attachInBandWake((roleKey, messageIds) => wakeRoleHolder(cp, listeners.ctoConversation, roleKey, {
     kind: "in-band dispatch",
     ids: messageIds ?? [],
@@ -947,6 +949,8 @@ export const startLocalMcpListeners = async (
       serializeWake: (body) => cp.db.tx(body),
       // #1103 — every wake frame handed to a CTO, with its cause, so a wake that finds empty queues
       // can be attributed (a registration's, at a daemon start or a re-registration).
+      onWakeFailed: ({ roleKey, cause }) =>
+        cp.audit.record({ kind: "ROLE_WAKE_FAILED", reasonCode: ReasonCode.ROLE_PEER_FAILED, roleKey, evidence: { cause } }),
       onWakeWritten: ({ roleKey, cause }) =>
         cp.audit.record({ kind: "ROLE_WAKE_SENT", reasonCode: ReasonCode.OK, roleKey, evidence: { cause } }),
       // FIX-ROLE-WAKE — a registration wake with no confirmed work is skipped; a failed lookup wakes.
@@ -1051,10 +1055,10 @@ export const startLocalMcpListeners = async (
         {
           description:
             "Register this connection's own wake endpoint socket. Local runtime contract, version-pinned; not a public interface.",
-          inputSchema: { endpoint: z.string().min(1) },
+          inputSchema: { endpoint: z.string().min(1), acceptance: z.literal("relay-v1").optional() },
         },
-        async (args: { endpoint: string }) =>
-          respond(await ctoConversation.registerEndpoint(server, args.endpoint)),
+        async (args: { endpoint: string; acceptance?: "relay-v1" }) =>
+          respond(await ctoConversation.registerEndpoint(server, args.endpoint, args.acceptance)),
       );
       /*
        * The owner-message tools, registered in this same composition — not on a second
@@ -1440,6 +1444,14 @@ const buzzMentionRouter = (cp: ControlPlane): BuzzMentionRouter => ({
       .filter((binding) => binding.sessionId === session.session_id)
       .map((binding) => binding.roleKey);
   },
+  retainEvent: (event) => {
+    const existing = cp.db.get<{ payload_json: string }>("SELECT payload_json FROM buzz_events WHERE event_id = ?", [event.id]);
+    if (existing) return digestOf(JSON.parse(existing.payload_json)) === digestOf(event)
+      ? allow(ReasonCode.OK, undefined)
+      : deny(ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH, "the event ID already names different signed bytes");
+    cp.db.run("INSERT INTO buzz_events (event_id, payload_json) VALUES (?, ?)", [event.id, JSON.stringify(event)]);
+    return allow(ReasonCode.OK, undefined);
+  },
   journalUnbound: (record) => {
     cp.audit.record({
       kind: "BUZZ_MENTION_TARGET_UNBOUND",
@@ -1630,9 +1642,43 @@ export const createBuzzMessageIngress = (
         ? {
             bindingGeneration: binding.bindingGeneration,
             targetSessionId: binding.sessionId,
-            createdAt: binding.createdAt,
+            createdAt: cp.db.get<{ created_at: string }>(
+              "SELECT created_at FROM assignments WHERE role_key = ? ORDER BY binding_generation LIMIT 1", [roleKey],
+            )?.created_at ?? binding.createdAt,
           }
         : null;
+    },
+    existingRoleMessage: (input) => {
+      const row = cp.db.get<{ message_id: string }>(`SELECT message_id FROM outbox
+        WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE')
+          AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.sourceNonce') END) IN (?, ?) ORDER BY created_at, rowid LIMIT 1`,
+        [input.roleKey, buzzMessageNonce(input.eventId), buzzMessageNonce(input.eventId, input.roleKey)]);
+      const message = row ? cp.outbox.get(row.message_id) : null;
+      if (!message) return allow(ReasonCode.OK, null);
+      if (!["PENDING", "SENT"].includes(message.status)) return allow(ReasonCode.OK,
+        { messageId: message.messageId, status: message.status });
+      const pointer = ownerMessagePointerOf(message.payload);
+      const source = pointer ? cp.db.get<{ actor: string; payload_json: string }>(
+        "SELECT actor, payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?",
+        [pointer.sourceChannel, pointer.sourceNonce]) : null;
+      let payload: Record<string, unknown> | null = null;
+      try { payload = source ? JSON.parse(source.payload_json) as Record<string, unknown> : null; } catch { /* refused below */ }
+      let text = payload?.["text"];
+      if (typeof payload?.["sourceEventId"] === "string") {
+        const shared = cp.db.get<{ payload_json: string }>("SELECT payload_json FROM buzz_events WHERE event_id = ?", [payload["sourceEventId"]]);
+        const event = shared ? JSON.parse(shared.payload_json) as Record<string, unknown> : null;
+        text = event && digestOf(event) === payload["sourceEventDigest"] ? event["content"] : null;
+      }
+      return source?.actor === input.actor && payload?.["conversation"] === input.conversation && text === input.text &&
+        pointer?.sourcePayloadDigest === digestOf(payload)
+        ? allow(ReasonCode.OK, { messageId: message.messageId, status: message.status })
+        : deny(ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH, "the event already names a different admitted delivery");
+    },
+    queuedRoleMessage: (nonce) => {
+      const row = cp.db.get<{ message_id: string }>(`SELECT message_id FROM outbox
+        WHERE kind IN ('OWNER_MESSAGE','PEER_MESSAGE')
+          AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.sourceNonce') END) = ? LIMIT 1`, [nonce]);
+      return row ? cp.outbox.get(row.message_id) : null;
     },
     enqueueOwnerMessage: (input) => {
       const enqueued = cp.outbox.enqueue({
@@ -1934,7 +1980,7 @@ const SUBSCRIBER_ALREADY_DURABLE_CODES: readonly string[] = [
 
 /** What the admission seam's `Decision` means to a subscriber holding a volatile cursor. */
 export const buzzMentionAdmissionOf = (decision: Decision<unknown>): BuzzMentionAdmission => {
-  if (decision.allowed) return "DURABLE";
+  if (decision.allowed) return decision.reasonCode === ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED ? "ALREADY_DURABLE" : "DURABLE";
   if (SUBSCRIBER_ALREADY_DURABLE_CODES.includes(decision.reasonCode)) return "ALREADY_DURABLE";
   if (SUBSCRIBER_RETRY_CODES.includes(decision.reasonCode)) return "RETRY";
   // Terminal, and trusted with the cursor: the event was signed before the addressed role's binding
@@ -1994,6 +2040,8 @@ export const buzzMentionInputFor = (
     actor: request.event.pubkey,
     conversation: request.conversation,
     eventId: request.event.id,
+    signedEvent: { ...request.event, tags: request.event.tags.map((tag) => [...tag]) },
+    recipientRoleKey: request.roleKey,
     ...(replyToEventId ? { replyToEventId } : {}),
     addressedTo: BUZZ_MENTION_ADDRESSED_TO,
     // The subscribed recipient: the mention target, or the room's CTO for an un-mentioned owner.
@@ -2254,7 +2302,10 @@ const wakeForMention = (
   // CEO's a PEER_MESSAGE), or its turn held a terminal fact. Keyed by the verified event and read
   // from the append-only departure record the hand-over rule refuses on, rather than from a row's
   // writable pointer or status. A claim refused mid-turn spends nothing, so the trigger is released.
-  const served = (): boolean => cp.outbox.sourceEventSpent("buzz", buzzMessageNonce(mention.eventId));
+  const served = (): boolean => cp.outbox.sourceEventSpent("buzz", buzzMessageNonce(mention.eventId, roleKey)) ||
+    cp.db.get(`SELECT 1 FROM holder_message_source_departures d JOIN outbox o ON o.message_id = d.message_id
+      WHERE d.source_channel = 'buzz' AND d.source_nonce = ? AND o.role_key = ?`,
+      [buzzMessageNonce(mention.eventId), roleKey]) !== undefined;
   return wakeRoleHolder(cp, { wake: (key) => roleConversation.wake(key, mention) }, roleKey, {
     kind: "owner message",
     ids: [],
@@ -2638,6 +2689,34 @@ export const createConfiguredHermesGatewayDaemonNoticeTarget = (
   };
 };
 
+/** CEO notifications use the authenticated canonical daemon-notice surface, with receipt dedupe. */
+export const createCeoNotificationSender = (resolveTarget: DaemonNoticeTargetResolver, laneSecret: string) =>
+  async (message: OutboxMessage): Promise<Decision<void>> => {
+    const target = await resolveTarget();
+    if (!target) return deny(ReasonCode.CEO_CONVERSATION_UNAVAILABLE, "canonical CEO route unavailable");
+    const text = JSON.stringify({ messageId: message.messageId, kind: message.kind, payload: message.payload });
+    // The existing signed surface accepts bounded text. Preserve every character across parts.
+    const parts: string[] = [];
+    let part = "";
+    for (const character of text) {
+      if (part.length + character.length > 1500) { parts.push(part); part = ""; }
+      part += character;
+    }
+    if (part) parts.push(part);
+    for (const [index, part] of parts.entries()) {
+      const eventId = daemonNoticeEventId(message.messageId, message.roleKey,
+        `CEO_NOTIFICATION:${digestOf(target.destination)}:${index}`);
+      const canonical = daemonNoticeCanonical(daemonNoticeFields(eventId, target.destination,
+        `ACP notification ${message.messageId} part ${index + 1}/${parts.length}: ${part}`));
+      const body = sealDaemonNotice(canonical, daemonNoticeKey(laneSecret));
+      const result = await target.send(body);
+      if (result.kind !== "RESPONDED" || !daemonNoticeSettlement(result.status, result.body, {
+        eventId, payloadDigest: body.payload_digest, destination: target.destination,
+      }).settled) return deny(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED, "canonical CEO did not accept the notification");
+    }
+    return allow(ReasonCode.OK, undefined);
+  };
+
 /** The daemon's notice delivery loop, as the composition holds it. */
 export interface DaemonPeerMessageNoticeDelivery {
   /** One pass, single-flight: a pass already running is joined, never doubled. */
@@ -2806,7 +2885,11 @@ export const startAdoptedCeoToolSocket = (
     stateDir,
     (peer) => admission.admit(peer),
     (admitted, socket) => {
-      const server = createHermesServer(port, () => admission.authenticate(admitted), {
+      const server = createHermesServer(port, () => {
+        const peer = admission.authenticate(admitted);
+        if (peer.allowed) cp.db.afterCommit(() => { void cp.outbox.deliverCeoNotifications(); });
+        return peer;
+      }, {
         provenance: admitted.provenance,
       });
       const buzzActorIngress = options.buzzActorIngress;
@@ -4423,7 +4506,8 @@ export const ownerMessageProvenanceOf = (
       : null;
   const conversation = source?.["conversation"];
   const replyToEventId = source?.["replyToEventId"];
-  const eventId = nonce.startsWith(BUZZ_MESSAGE_NONCE_PREFIX) ? nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length) : "";
+  const eventId = typeof source?.["sourceEventId"] === "string" ? source["sourceEventId"]
+    : nonce.startsWith(BUZZ_MESSAGE_NONCE_PREFIX) ? nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length) : "";
   return {
     channel,
     room: buzz && typeof conversation === "string" && conversation.length > 0 ? conversation : null,
@@ -4539,7 +4623,21 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
               // The one holder besides the proof's own: its conversation restarted once, the row
               // carried to it by the canonical self-claim's recovery (2026-10-03) — accepted only
               // through that carry's record (ACP-PEER-SUCCESSION-01).
-              selfClaimCarriedTo(cp.db, candidate, holder, source),
+              (previous) => selfClaimCarriedTo(cp.db, candidate, holder, source)(previous) ||
+                (source?.mention === cp.sessions.get(holder.targetSessionId)?.buzzActorId &&
+                  previous.roleKey === holder.roleKey && source?.conversation === ctoChannel &&
+                  cp.db.get(`SELECT 1 FROM assignments old
+                    JOIN actor_target_bindings old_target ON old_target.target_actor_id = old.actor_id
+                    JOIN assignments current ON current.role_key = old.role_key AND current.binding_generation = ? AND current.status = 'ACTIVE'
+                    JOIN actor_target_bindings current_target ON current_target.target_actor_id = current.actor_id
+                    WHERE old.role_key = ? AND old.binding_generation = ? AND old.session_id = ?
+                      AND old_target.executor_kind = current_target.executor_kind
+                      AND old_target.target_locator = current_target.target_locator
+                      AND old_target.target_locator_digest = current_target.target_locator_digest
+                      AND NOT EXISTS (SELECT 1 FROM peer_message_carries carried WHERE carried.message_id = ?
+                        AND carried.outcome = 'CARRIED' AND carried.source_payload_digest IS NOT ?)`,
+                    [holder.bindingGeneration, previous.roleKey, previous.bindingGeneration, previous.sessionId,
+                      candidate.messageId, ownerMessagePointerOf(candidate.payload)?.sourcePayloadDigest ?? null]) !== undefined),
             );
           },
         );
@@ -4614,7 +4712,16 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         }
         // Parsed as data, never as instructions (§27.4). A `text` of the wrong type is a source
         // this route cannot read, not something to coerce into a string.
-        const text = (payload as { text?: unknown }).text;
+        const stored = payload as { text?: unknown; sourceEventId?: unknown; sourceEventDigest?: unknown };
+        let text = stored.text;
+        if (typeof stored.sourceEventId === "string") {
+          const shared = cp.db.get<{ payload_json: string }>("SELECT payload_json FROM buzz_events WHERE event_id = ?", [stored.sourceEventId]);
+          const event = shared ? JSON.parse(shared.payload_json) as { content?: unknown } : null;
+          if (event === null || digestOf(event) !== stored.sourceEventDigest) {
+            return refuseClaimed(ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH, "the retained signed event differs from this delivery");
+          }
+          text = event.content;
+        }
         if (typeof text !== "string") {
           return refuseClaimed(
             ReasonCode.INVALID_ARGUMENT,
@@ -5440,6 +5547,14 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       laneSecret: telegramExternalConfig?.sharedSecret ?? null,
       ports: { authorityHeld: () => daemon.lock.held() },
     });
+    const ceoTarget = createConfiguredHermesGatewayDaemonNoticeTarget(cp, hermesAdoptionConfiguration,
+      { authorityHeld: () => daemon.lock.held() });
+    if (ceoTarget && telegramExternalConfig?.sharedSecret) {
+      cp.outbox.attachCeoNotificationDelivery(createCeoNotificationSender(ceoTarget, telegramExternalConfig.sharedSecret));
+      cp.bindings.onSwitch((binding) => {
+        if (binding.role === Role.CEO && binding.status === "ACTIVE") void cp.outbox.deliverCeoNotifications();
+      });
+    }
     peerMessageNotices = notices.delivery;
     process.stdout.write(notices.delivery !== null
       ? "peer-message notice delivery started\n"

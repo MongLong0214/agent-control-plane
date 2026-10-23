@@ -311,15 +311,14 @@ describe("an adopted canonical CTO receives its dispatch in band", () => {
     }
   });
 
-  it("(c) an expired in-band row is neither listed nor acknowledged", async () => {
+  it("(c) an in-band row remains listed and acknowledgeable after its delivery TTL", async () => {
     const f = await dispatchedToCanonical(woken);
     try {
       f.h.clock.advance(31 * 60 * 1000);
-      expect(f.h.cp.outbox.pendingInBandFor(f.sessionId, f.incarnation)).toEqual([]);
-      expect(f.h.cp.outbox.acknowledge(f.messageId, f.sessionId, f.generation, f.incarnation))
-        .toMatchObject({ allowed: false, reasonCode: ReasonCode.OUTBOX_EXPIRED });
-      expect(outboxRow(f.h, f.messageId)?.status).not.toBe("ACKED");
-      expect(f.h.cp.audit.byKind("OUTBOX_ACKED_IN_BAND")).toHaveLength(0);
+      expect(f.h.cp.outbox.pendingInBandFor(f.sessionId, f.incarnation)).toHaveLength(1);
+      expect(f.h.cp.outbox.acknowledge(f.messageId, f.sessionId, f.generation, f.incarnation).allowed).toBe(true);
+      expect(outboxRow(f.h, f.messageId)?.status).toBe("ACKED");
+      expect(f.h.cp.audit.byKind("OUTBOX_ACKED_IN_BAND")).toHaveLength(1);
     } finally {
       f.h.cp.close();
     }
@@ -582,4 +581,32 @@ describe("an adopted canonical CTO receives its dispatch in band", () => {
       f.h.cp.close();
     }
   });
+});
+
+
+it("retains an undelivered actionable in-band instruction past its delivery TTL until authenticated ACK", async () => {
+  const f = await dispatchedToCanonical(() => async () => deny(ReasonCode.ROLE_PEER_FAILED, "transport down"));
+  try {
+    f.h.clock.advance(31 * 60_000);
+    expect(f.h.cp.outbox.expireOverdue()).toBe(0);
+    expect(outboxRow(f.h, f.messageId)?.status).toBe("PENDING");
+    expect(f.h.cp.outbox.pendingInBandFor(f.sessionId, f.incarnation).map((r) => r.messageId)).toContain(f.messageId);
+    await f.h.cp.outbox.wakeInBandPending();
+    expect(f.wake).toHaveBeenCalledTimes(2);
+    expect(f.h.cp.outbox.acknowledgeInBand(f.messageId, f.sessionId, "wrong-incarnation").allowed).toBe(false);
+    expect(f.h.cp.outbox.acknowledgeInBand(f.messageId, f.sessionId, f.incarnation).allowed).toBe(true);
+    expect(outboxRow(f.h, f.messageId)?.status).toBe("ACKED");
+  } finally { f.h.cp.close(); }
+});
+
+it("keeps an actionable in-band instruction when its runtime becomes temporarily unavailable", async () => {
+  const f = await dispatchedToCanonical(woken);
+  try {
+    expect(f.h.cp.sessions.transition(f.sessionId, SessionLifecycle.ERROR, "transport unavailable").allowed).toBe(true);
+    f.h.cp.outbox.fenceUndeliverable();
+    f.h.clock.advance(31 * 60_000);
+    f.h.cp.outbox.expireOverdue();
+    expect(outboxRow(f.h, f.messageId)?.status).toBe("PENDING");
+    expect(f.h.cp.outbox.acknowledgeInBand(f.messageId, f.sessionId, f.incarnation).allowed).toBe(false);
+  } finally { f.h.cp.close(); }
 });

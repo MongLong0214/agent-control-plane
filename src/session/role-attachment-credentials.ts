@@ -182,8 +182,8 @@ export class RoleAttachmentCredentials {
     const previousClose = server.server.onclose;
     server.server.onclose = () => { close(); previousClose?.(); };
     server.registerTool("role_wake_endpoint_register", {
-      description: "Register this connection's wake endpoint.", inputSchema: { endpoint: z.string().min(1) },
-    }, async ({ endpoint }) => respond(await port.registerEndpoint(server, endpoint)));
+      description: "Register this connection's wake endpoint.", inputSchema: { endpoint: z.string().min(1), acceptance: z.literal("relay-v1").optional() },
+    }, async ({ endpoint, acceptance }) => respond(await port.registerEndpoint(server, endpoint, acceptance)));
     server.registerTool("role_owner_message_claim", {
       description: "Take a message for this connection's role; `principal` peer carries no owner authority.",
       inputSchema: { roleKey: z.string().min(1) },

@@ -38,8 +38,8 @@ describe("v49 → v50 post-merge re-entry", () => {
     before.close();
     approveMigration(path, "v50 post-merge re-entry");
     new Db(path).close();
-    expect(userVersionOf(path)).toBe(50);
-    const afterSchema = schemaRowsOf(path);
+    expect(userVersionOf(path)).toBe(51);
+    const afterSchema = schemaRowsOf(path).filter((row) => !["buzz_events", "holder_message_terminals", "buzz_events_no_replace", "buzz_events_immutable", "buzz_events_no_delete", "outbox_holder_message_terminal", "holder_message_terminals_immutable", "holder_message_terminals_no_delete", "holder_message_terminals_no_replace"].includes(row.name));
     expect(afterSchema.filter((row) => !GUARDS.includes(row.name))).toEqual(beforeSchema.filter((row) => !GUARDS.includes(row.name)));
     expect(afterSchema.filter((row) => GUARDS.includes(row.name) && !beforeSchema.some((old) => old.name === row.name && old.sql === row.sql)).map((row) => row.name).sort()).toEqual([...GUARDS].sort());
     const raw = new Database(path);
