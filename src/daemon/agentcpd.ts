@@ -118,6 +118,7 @@ import {
   type AdmittedPeerSource,
   type BuzzPeerRegistry,
   type CeoTurnDelivery,
+  type PeerProofCto,
 } from "../ingress/buzz-message.ts";
 import {
   configuredTelegramExternalConsumerConfig,
@@ -1642,12 +1643,29 @@ export const createBuzzMessageIngress = (
         ? {
             bindingGeneration: binding.bindingGeneration,
             targetSessionId: binding.sessionId,
-            createdAt: cp.db.get<{ created_at: string }>(
-              "SELECT created_at FROM assignments WHERE role_key = ? ORDER BY binding_generation LIMIT 1", [roleKey],
-            )?.created_at ?? binding.createdAt,
+            createdAt: binding.createdAt,
           }
         : null;
     },
+    // ACP-R1-04 — the role's history in this room, from registry rows only. Every generation of the
+    // role whose bound runtime answers on the room counts from its creation, revoked ones included,
+    // so unread same-room mail survives generation changes (#5). A current runtime that moved into
+    // the room within its generation counts no earlier than that runtime's own creation. A room the
+    // role never answered on has no history here, however long the role answered elsewhere.
+    recipientHistorySince: (roleKey, conversation) =>
+      cp.db.get<{ since: string | null }>(
+        `SELECT MIN(since) AS since FROM (
+           SELECT a.created_at AS since
+             FROM assignments a JOIN sessions s ON s.session_id = a.session_id
+            WHERE a.role_key = ? AND s.buzz_address = ?
+           UNION ALL
+           SELECT MAX(a.created_at, s.created_at) AS since
+             FROM assignments a
+             JOIN conversational_actors c ON c.actor_id = a.actor_id
+             JOIN sessions s ON s.session_id = c.current_session_id
+            WHERE a.role_key = ? AND a.status = 'ACTIVE' AND s.buzz_address = ?)`,
+        [roleKey, conversation, roleKey, conversation],
+      )?.since ?? null,
     existingRoleMessage: (input) => {
       const row = cp.db.get<{ message_id: string }>(`SELECT message_id FROM outbox
         WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE')
@@ -4555,6 +4573,61 @@ const buzzMentionClaimHolds = (cp: ControlPlane, holder: HolderIdentity, pointer
   return actorId === mention && eligibility.eligible && eligibility.room === conversation;
 };
 
+/**
+ * ACP-R1-02 — whether `holder` is an authenticated continuation of the CTO the peer proof names,
+ * for one queued peer message (the second half of `peerProofIsCurrent`'s successor question).
+ *
+ * Every arm needs the same three facts about the message: the Buzz identity it was addressed to is
+ * now the holder's own channel identity, the room it arrived on is the holder's room, and no carry
+ * record names this message with a different admitted payload. Then, by generation:
+ *
+ *   - same generation (a surviving runtime move, which keeps the generation by design): the role's
+ *     ACTIVE assignment at that generation is the one the proof was admitted against — a generation
+ *     has one assignment, so the proof's session was a runtime of this assignment's actor — and its
+ *     conversation target was authenticated for exactly that assignment and generation. A move of an
+ *     unauthenticated binding proves nothing and is withheld;
+ *   - a later generation: the predecessor assignment at the proof's generation and session, and the
+ *     current ACTIVE assignment, are bound to the same conversation target.
+ *
+ * The caller has already authenticated `holder` as the exact current holder (`claimForHolder`), so a
+ * stale runtime of the same generation is never asked. Only reads.
+ */
+const peerContinuationProven = (
+  cp: ControlPlane,
+  candidate: { messageId: string; payload: unknown },
+  holder: HolderIdentity,
+  source: AdmittedPeerSource | undefined,
+  ctoChannel: string | null,
+) => (previous: PeerProofCto): boolean => {
+  const mention = source?.mention;
+  if (typeof mention !== "string" || mention.length === 0 ||
+      mention !== cp.sessions.get(holder.targetSessionId)?.buzzActorId ||
+      previous.roleKey !== holder.roleKey || ctoChannel === null || source?.conversation !== ctoChannel) return false;
+  const digest = ownerMessagePointerOf(candidate.payload)?.sourcePayloadDigest ?? null;
+  const noConflictingCarry = `NOT EXISTS (SELECT 1 FROM peer_message_carries carried WHERE carried.message_id = ?
+    AND carried.outcome = 'CARRIED' AND carried.source_payload_digest IS NOT ?)`;
+  if (previous.bindingGeneration === holder.bindingGeneration) {
+    return cp.db.get(`SELECT 1 FROM assignments current
+      JOIN actor_target_bindings target ON target.target_actor_id = current.actor_id
+      JOIN actor_target_attestations attested ON attested.target_binding_id = target.target_binding_id
+       AND attested.assignment_id = current.assignment_id AND attested.binding_generation = current.binding_generation
+      WHERE current.role_key = ? AND current.binding_generation = ? AND current.status = 'ACTIVE'
+        AND ${noConflictingCarry}`,
+      [holder.roleKey, holder.bindingGeneration, candidate.messageId, digest]) !== undefined;
+  }
+  return cp.db.get(`SELECT 1 FROM assignments old
+    JOIN actor_target_bindings old_target ON old_target.target_actor_id = old.actor_id
+    JOIN assignments current ON current.role_key = old.role_key AND current.binding_generation = ? AND current.status = 'ACTIVE'
+    JOIN actor_target_bindings current_target ON current_target.target_actor_id = current.actor_id
+    WHERE old.role_key = ? AND old.binding_generation = ? AND old.session_id = ?
+      AND old_target.executor_kind = current_target.executor_kind
+      AND old_target.target_locator = current_target.target_locator
+      AND old_target.target_locator_digest = current_target.target_locator_digest
+      AND ${noConflictingCarry}`,
+    [holder.bindingGeneration, previous.roleKey, previous.bindingGeneration, previous.sessionId,
+      candidate.messageId, digest]) !== undefined;
+};
+
 export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
   /** The pointer on one owner-message row, or a denial naming what is wrong with it. */
   const pointerOn = (messageId: string) => {
@@ -4620,24 +4693,12 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
               ceo,
               holder,
               ctoChannel,
-              // The one holder besides the proof's own: its conversation restarted once, the row
-              // carried to it by the canonical self-claim's recovery (2026-10-03) — accepted only
-              // through that carry's record (ACP-PEER-SUCCESSION-01).
+              // The holders besides the proof's own: its conversation restarted, the row carried to
+              // it by the canonical self-claim's recovery (ACP-PEER-SUCCESSION-01), or any other
+              // authenticated continuation of the same conversation, including a same-generation
+              // runtime move (ACP-R1-02).
               (previous) => selfClaimCarriedTo(cp.db, candidate, holder, source)(previous) ||
-                (source?.mention === cp.sessions.get(holder.targetSessionId)?.buzzActorId &&
-                  previous.roleKey === holder.roleKey && source?.conversation === ctoChannel &&
-                  cp.db.get(`SELECT 1 FROM assignments old
-                    JOIN actor_target_bindings old_target ON old_target.target_actor_id = old.actor_id
-                    JOIN assignments current ON current.role_key = old.role_key AND current.binding_generation = ? AND current.status = 'ACTIVE'
-                    JOIN actor_target_bindings current_target ON current_target.target_actor_id = current.actor_id
-                    WHERE old.role_key = ? AND old.binding_generation = ? AND old.session_id = ?
-                      AND old_target.executor_kind = current_target.executor_kind
-                      AND old_target.target_locator = current_target.target_locator
-                      AND old_target.target_locator_digest = current_target.target_locator_digest
-                      AND NOT EXISTS (SELECT 1 FROM peer_message_carries carried WHERE carried.message_id = ?
-                        AND carried.outcome = 'CARRIED' AND carried.source_payload_digest IS NOT ?)`,
-                    [holder.bindingGeneration, previous.roleKey, previous.bindingGeneration, previous.sessionId,
-                      candidate.messageId, ownerMessagePointerOf(candidate.payload)?.sourcePayloadDigest ?? null]) !== undefined),
+                peerContinuationProven(cp, candidate, holder, source, ctoChannel)(previous),
             );
           },
         );
@@ -5549,11 +5610,19 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     });
     const ceoTarget = createConfiguredHermesGatewayDaemonNoticeTarget(cp, hermesAdoptionConfiguration,
       { authorityHeld: () => daemon.lock.held() });
+    // ACP-R1-03: the canonical transport is an adopted Hermes CEO's route. Without it, a Buzz-backed
+    // CEO keeps its Buzz route through the delivery sweep, and an adopted Hermes CEO with no Buzz
+    // route has its notifications withheld PENDING until a route exists — never rejected.
     if (ceoTarget && telegramExternalConfig?.sharedSecret) {
       cp.outbox.attachCeoNotificationDelivery(createCeoNotificationSender(ceoTarget, telegramExternalConfig.sharedSecret));
       cp.bindings.onSwitch((binding) => {
         if (binding.role === Role.CEO && binding.status === "ACTIVE") void cp.outbox.deliverCeoNotifications();
       });
+      process.stdout.write("CEO notification canonical route started\n");
+    } else {
+      process.stdout.write(`CEO notification canonical route not started: ${ceoTarget
+        ? "ACP_TELEGRAM_EXTERNAL_SECRET is not configured"
+        : "no Hermes adoption configuration"}; CEO notifications use the CEO's Buzz route when it has one\n`);
     }
     peerMessageNotices = notices.delivery;
     process.stdout.write(notices.delivery !== null

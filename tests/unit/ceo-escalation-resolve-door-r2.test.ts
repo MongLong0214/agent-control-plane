@@ -427,7 +427,8 @@ describe("ESC-03: the official restart renewal carries a held reply once", () =>
     });
   });
 
-  it("a second restart does not carry it twice", async () => {
+  // ACP-R1-01 retired the once-only budget: an unACKed reply follows every authenticated recovery.
+  it("a second restart carries the same unACKed reply again, with its id, to generation 3", async () => {
     await withBootstrapRuntime(async (f) => {
       const { runId, ownerSessionId, roleKey, reply } = await resolvedWithPendingReply(f);
       await restart(f, ownerSessionId);
@@ -435,12 +436,14 @@ describe("ESC-03: the official restart renewal carries a held reply once", () =>
       expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "PENDING", bindingGeneration: 2 });
 
       await restart(f, ownerSessionId);
-      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "REJECTED", bindingGeneration: 2 });
+      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "PENDING", bindingGeneration: 2 });
       await recover(f);
       expect(f.harness.cp.bindings.active(roleKey)).toMatchObject({ bindingGeneration: 3 });
-      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "REJECTED", bindingGeneration: 2 });
+      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "PENDING", bindingGeneration: 3,
+        targetSessionId: ownerSessionId, payload: reply.payload });
       expect(records(f, "ESCALATION_REPLY_HELD", reply.messageId)).toHaveLength(1);
-      expect(records(f, "ESCALATION_REPLY_CARRIED", reply.messageId)).toHaveLength(1);
+      expect(records(f, "ESCALATION_REPLY_CARRIED", reply.messageId).map((carry) => [carry["fromGeneration"], carry["toGeneration"]]))
+        .toEqual([[1, 2], [2, 3]]);
       expect(replies(f, runId)).toHaveLength(1);
     });
   });
@@ -499,14 +502,17 @@ describe("ESC-03: the official restart renewal carries a held reply once", () =>
     });
   });
 
-  it("a revocation that is not a renewal path rejects the reply as before", async () => {
+  it("a revocation that is not a renewal path holds nothing, and keeps the reply queued for the role's next binding", async () => {
     await withBootstrapRuntime(async (f) => {
       const { roleKey, reply } = await resolvedWithPendingReply(f);
-      // A release, not an outage: no renewal follows it, so nothing asks for the hold.
+      // A release, not an outage: no renewal follows it, so nothing asks for the hold. The reply
+      // still answers its live run, so the one handover policy keeps it (ACP-R1-01).
       expect(f.harness.cp.runs.transition(reply.runId!, RunState.BLOCKED, "fixture hold")).toMatchObject({ allowed: true });
       expect(f.harness.cp.bindings.revoke(roleKey, "operator release", { allowBlockedRuns: true })).toMatchObject({ allowed: true });
-      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "REJECTED", bindingGeneration: 1 });
+      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "PENDING", bindingGeneration: 1 });
       expect(records(f, "ESCALATION_REPLY_HELD", reply.messageId)).toEqual([]);
+      f.harness.cp.outbox.fenceUndeliverable();
+      expect(f.harness.cp.outbox.get(reply.messageId)!.status).toBe("PENDING");
     });
   });
 });

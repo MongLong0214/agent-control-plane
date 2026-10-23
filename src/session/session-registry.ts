@@ -10,7 +10,12 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
-import { HOLDER_CLAIMED_KIND_SQL, inBandRow } from "../outbox/outbox.ts";
+import {
+  HOLDER_CLAIMED_KIND_SQL,
+  handoverInstructionRowSql,
+  inBandRow,
+  settleStoppedSessionInstructions,
+} from "../outbox/outbox.ts";
 import { isBuzzKeyPossession, type BuzzKeyPossession } from "../buzz/buzz-bind-challenge.ts";
 import { isAdmittedRuntime, type AdmittedRuntime } from "./runtime-lineage.ts";
 
@@ -398,15 +403,22 @@ export class SessionRegistry {
    * slot then permanently exempt from `IngressGuard.prune`, and the turn reported outstanding
    * forever. It also fired *first* in the ordinary failure ordering (the runtime dies, then a
    * successor binds), so it destroyed the message before the takeover could ever reach it.
+   *
+   * ACP-R1-01: an actionable instruction is addressed to the role too, whatever its route, so it is
+   * not this write's either. The one handover policy keeps it, queued, for the role's next
+   * authenticated holder, or supersedes it with its reason when it no longer addresses anything live
+   * (`settleStoppedSessionInstructions`), in this same transaction.
    */
   private fenceUndeliveredMessages(sessionId: string, to: SessionLifecycle): string[] {
     if (to !== SessionLifecycle.ERROR && to !== SessionLifecycle.STOPPED) return [];
+    settleStoppedSessionInstructions(this.db, this.audit, sessionId);
     const doomed = this.db
       .all<{ message_id: string }>(
         `SELECT message_id FROM outbox
           WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')
             AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION')
-            AND NOT ${inBandRow("outbox")}`,
+            AND NOT ${inBandRow("outbox")}
+            AND NOT ${handoverInstructionRowSql("outbox")}`,
         [sessionId],
       )
       .map((row) => row.message_id);
@@ -416,7 +428,8 @@ export class SessionRegistry {
                          retry_eligible = 0, next_attempt_at = NULL
         WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')
           AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION')
-            AND NOT ${inBandRow("outbox")}`,
+            AND NOT ${inBandRow("outbox")}
+            AND NOT ${handoverInstructionRowSql("outbox")}`,
       [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, sessionId],
     );
     return doomed;

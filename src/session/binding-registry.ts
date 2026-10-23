@@ -686,6 +686,10 @@ export class BindingRegistry {
             input.sessionId,
           )
         : { retargeted: [], rejected: [] };
+      // ACP-R1-01: with no active binding to take over (the role was revoked), this is the
+      // authenticated binding that follows the revoke, exactly as `bind` is: the role's queued mail,
+      // kept instructions and CEO notifications are handed to the new holder in this transaction.
+      if (!current) this.outbox.adoptHolderMessages(roleKey, generation, input.sessionId);
 
       this.audit.record({
         kind: "BINDING_SWITCHED",

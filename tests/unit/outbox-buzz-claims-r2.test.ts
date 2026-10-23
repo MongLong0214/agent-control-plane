@@ -108,7 +108,7 @@ describe("round-2 outbox fencing", () => {
     expect(core.outbox.markSent(message.value.messageId, claimed[0]!.claimToken).allowed).toBe(true);
   });
 
-  it("#48 fences an in-flight old-generation claim during failover", () => {
+  it("#48 fences an in-flight old-generation claim during failover, and hands the instruction to the successor", () => {
     const { core, seeded } = seededCore();
     const message = enqueue(core, seeded, "outbox:failover");
     expect(message.allowed).toBe(true);
@@ -127,7 +127,10 @@ describe("round-2 outbox fencing", () => {
     });
 
     expect(switched.allowed).toBe(true);
-    expect(core.outbox.get(claimed.messageId)?.status).toBe("REJECTED");
+    // ACP-R1-01: the old generation's claim is released and the actionable instruction follows the
+    // takeover with its id (at-least-once); the old claim token can settle nothing.
+    expect(core.outbox.get(claimed.messageId)).toMatchObject({ status: "PENDING", bindingGeneration: seeded.generation + 1,
+      targetSessionId: successor.sessionId });
     expect(core.outbox.markSent(claimed.messageId, claimed.claimToken).reasonCode).toBe(
       ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
     );
@@ -138,8 +141,10 @@ describe("round-2 outbox fencing", () => {
         error: "relay disconnected",
       }).reasonCode,
     ).toBe(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED);
-    expect(core.outbox.get(claimed.messageId)?.status).toBe("REJECTED");
-    expect(core.outbox.claimDeliverable()).toHaveLength(0);
+    expect(core.outbox.get(claimed.messageId)?.status).toBe("PENDING");
+    expect(core.outbox.claimDeliverable().map((m) => [m.messageId, m.targetSessionId])).toEqual([
+      [claimed.messageId, successor.sessionId],
+    ]);
   });
 
   it("#49 rejects an enqueue addressed to a session that does not hold the role", () => {
@@ -161,7 +166,7 @@ describe("round-2 outbox fencing", () => {
     expect(refused.reasonCode).toBe(ReasonCode.OUTBOX_TARGET_NOT_CURRENT);
   });
 
-  it("#175 atomically rejects pending and in-flight messages when their target enters ERROR or STOPPED", () => {
+  it("#175 atomically fences pending and in-flight messages when their target enters ERROR or STOPPED, keeping actionable instructions", () => {
     const { core, seeded } = seededCore();
     const inFlight = enqueue(core, seeded, "outbox:terminal-in-flight");
     expect(inFlight.allowed).toBe(true);
@@ -170,21 +175,35 @@ describe("round-2 outbox fencing", () => {
     const pending = enqueue(core, seeded, "outbox:terminal-pending");
     expect(pending.allowed).toBe(true);
     if (!pending.allowed) return;
+    // A message addressed to this runtime itself, not an instruction to the role.
+    const review = core.outbox.enqueue({ idempotencyKey: "outbox:terminal-review", roleKey: seeded.roleKey,
+      bindingGeneration: seeded.generation, targetSessionId: seeded.sessionId, runId: seeded.runId,
+      kind: MessageKind.REVIEW_REQUEST, payload: { runId: seeded.runId } });
+    expect(review.allowed).toBe(true);
+    if (!review.allowed) return;
 
     const errored = core.sessions.transition(seeded.sessionId, SessionLifecycle.ERROR, "runtime failed");
     expect(errored.reasonCode).toBe(ReasonCode.OK);
 
+    // ACP-R1-01: the actionable instructions are kept for the role's next holder, their claim
+    // released, so nothing stays claimed for a dead runtime; everything else is fenced as before.
     for (const messageId of [claimed.messageId, pending.value.messageId]) {
       expect(
-        core.db.get<{ status: string; reason_code: string }>(
-          "SELECT status, reason_code FROM outbox WHERE message_id = ?",
+        core.db.get<{ status: string; claim_token: string | null }>(
+          "SELECT status, claim_token FROM outbox WHERE message_id = ?",
           [messageId],
         ),
-      ).toEqual({
-        status: "REJECTED",
-        reason_code: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
-      });
+      ).toEqual({ status: "PENDING", claim_token: null });
     }
+    expect(
+      core.db.get<{ status: string; reason_code: string }>(
+        "SELECT status, reason_code FROM outbox WHERE message_id = ?",
+        [review.value.messageId],
+      ),
+    ).toEqual({
+      status: "REJECTED",
+      reason_code: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+    });
     expect(core.outbox.markSent(claimed.messageId, claimed.claimToken).reasonCode).toBe(
       ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
     );
@@ -200,15 +219,7 @@ describe("round-2 outbox fencing", () => {
       "operator stopped runtime",
     );
     expect(stoppedTransition.reasonCode).toBe(ReasonCode.OK);
-    expect(
-      stopped.core.db.get<{ status: string; reason_code: string }>(
-        "SELECT status, reason_code FROM outbox WHERE message_id = ?",
-        [stoppedMessage.value.messageId],
-      ),
-    ).toEqual({
-      status: "REJECTED",
-      reason_code: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
-    });
+    expect(stopped.core.outbox.get(stoppedMessage.value.messageId)?.status).toBe("PENDING");
 
     const missing = stopped.core.outbox.enqueue({
       idempotencyKey: "outbox:missing-target",

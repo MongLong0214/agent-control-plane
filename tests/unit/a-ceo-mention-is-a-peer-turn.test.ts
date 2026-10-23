@@ -13,6 +13,7 @@ import {
   type BuzzSubscriberScheduler,
 } from "../../src/buzz/buzz-mention-subscriber.ts";
 import { OWNER_REPLY_OUTBOX_CHANNEL } from "../../src/conversation/owner-reply-outbox.ts";
+import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
@@ -33,6 +34,7 @@ import { ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import type { RoleConversationPort } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
+import { SELF_CLAIM_EXECUTOR_KIND } from "../../src/registry/canonical-self-claim.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
@@ -172,6 +174,8 @@ const startPeerFixture = async (
      * awaiting while the next frame arrives — the real queue, not a simulated one (#1044).
      */
     wakeGate?: Promise<void>;
+    /** Binds the CTO with an authenticated canonical conversation target, as the self-claim does. */
+    authenticatedCto?: boolean;
   } = {},
 ) => {
   const owner = newKey();
@@ -186,10 +190,25 @@ const startPeerFixture = async (
   const ctoRoleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
 
   const ctoSession = readySession(harness, "cto", PROJECT_ROOM);
+  const ctoTarget = {
+    executorKind: SELF_CLAIM_EXECUTOR_KIND,
+    targetLocator: "66666666-6666-4666-8666-666666666666",
+    targetLocatorDigest: sha256("66666666-6666-4666-8666-666666666666"),
+  };
   const ctoBound = harness.cp.bindings.bind({
     role: Role.PRIMARY_CTO,
     sessionId: ctoSession.sessionId,
     projectId,
+    ...(options.authenticatedCto
+      ? {
+          authenticatedTarget: {
+            claimed: ctoTarget,
+            protocolVersion: "test-target/v1",
+            attestationDigest: digestOf(ctoTarget),
+            verify: () => ctoTarget,
+          },
+        }
+      : {}),
   });
   if (!ctoBound.allowed) throw new Error(`CTO binding failed: ${ctoBound.message}`);
   bindChannelIdentity(harness, ctoSession, cto.pubkey);
@@ -1114,39 +1133,79 @@ describe("#1044 a queued peer message keeps its identity fence until it is hande
     }
   });
 
-  it("retains peer mail across a runtime move until its current recipient is authenticated", async () => {
-    const fixture = await startPeerFixture();
+  it("retains peer mail across a runtime move until its current recipient is authenticated, then hands over and ACKs it", async () => {
+    const fixture = await startPeerFixture({ authenticatedCto: true });
     try {
       const { harness } = fixture;
       const peerEvent = fixture.mention(fixture.ceo, { text: "런타임 1 에게 보낸 지시" });
       await fixture.relayDelivers(peerEvent);
       await fixture.relayDelivers(fixture.mention(fixture.owner, { text: "주인의 메시지" }));
       const generation = harness.cp.bindings.active(fixture.ctoRoleKey)!.bindingGeneration;
+      const [peerRow] = fixture.peerRows();
 
       const next = replaceCto(fixture, { conversation: "SURVIVED" });
       expect(harness.cp.bindings.active(fixture.ctoRoleKey)!.bindingGeneration).toBe(generation);
 
-      expect(fixture.peerRows().map((row) => row.status)).toEqual(["PENDING"]);
+      expect(fixture.peerRows().map((row) => [row.status, row.target_session_id])).toEqual([["PENDING", next.sessionId]]);
       const claim = JSON.parse(fixture.admitted(peerEvent.id)!.turn_claim_json!) as Record<string, unknown>;
       expect(claim["noReplyAt"]).toBeUndefined();
 
-      // The owner's message is carried, and is the successor's to take once the mention's channel
-      // identity is its own (1080-N5); before that it is withheld.
       const successor = {
         roleKey: fixture.ctoRoleKey,
         bindingGeneration: generation,
         targetSessionId: next.sessionId,
         sessionIncarnation: next.incarnation,
       };
-      const withheld = ownerMessageLedger(harness.cp).claim(successor);
+      const ledger = ownerMessageLedger(harness.cp);
+      // Before the mention's channel identity is the successor's own, both are withheld.
+      const withheld = ledger.claim(successor);
+      expect(withheld.allowed && withheld.value.claimed).toBe(null);
+      expect(withheld.allowed && withheld.value.withheld.map((row) => row.messageId)).toContain(peerRow!.message_id);
       expect(withheld.allowed && withheld.value.mentionWithheld?.map((row) => row.reason)).toEqual(["MENTION_NOT_ELIGIBLE"]);
+      // The stale runtime can claim nothing it no longer holds.
+      const stale = ledger.claim(fixture.holder());
+      expect(stale.allowed && stale.value.claimed).toBeFalsy();
+
       expect(harness.cp.sessions.transition(fixture.ctoSession.sessionId, SessionLifecycle.STOPPED, "replaced").reasonCode).toBe(ReasonCode.OK);
       bindChannelIdentity(harness, next, fixture.cto.pubkey);
-      const taken = ownerMessageLedger(harness.cp).claim(successor);
-      expect(claimOf(taken.allowed ? taken.value : null).claimed).toMatchObject({
-        text: "주인의 메시지",
-        principal: "owner",
+      // The proven same-generation continuation is handed the peer message itself, and ACKs it.
+      const peer = ledger.claim(successor);
+      expect(claimOf(peer.allowed ? peer.value : null).claimed).toMatchObject({
+        messageId: peerRow!.message_id,
+        text: "런타임 1 에게 보낸 지시",
+        principal: "peer",
       });
+      expect(ledger.complete(peerRow!.message_id, successor).allowed).toBe(true);
+      expect(fixture.peerRows().map((row) => row.status)).toEqual(["ACKED"]);
+      const owner = ledger.claim(successor);
+      expect(claimOf(owner.allowed ? owner.value : null).claimed).toMatchObject({ text: "주인의 메시지", principal: "owner" });
+      expect(ledger.complete(claimOf(owner.allowed ? owner.value : null).claimed!.messageId, successor).allowed).toBe(true);
+      expect(claimOf((ledger.claim(successor) as { value: unknown }).value)).toMatchObject({ claimed: null, withheld: [] });
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("withholds peer mail from a same-generation runtime move whose conversation target was never authenticated", async () => {
+    const fixture = await startPeerFixture();
+    try {
+      const { harness } = fixture;
+      await fixture.relayDelivers(fixture.mention(fixture.ceo, { text: "증명되지 않은 이동" }));
+      const [peerRow] = fixture.peerRows();
+      const generation = harness.cp.bindings.active(fixture.ctoRoleKey)!.bindingGeneration;
+      const next = replaceCto(fixture, { conversation: "SURVIVED", takeIdentity: true });
+      const successor = {
+        roleKey: fixture.ctoRoleKey,
+        bindingGeneration: generation,
+        targetSessionId: next.sessionId,
+        sessionIncarnation: next.incarnation,
+      };
+      const taken = ownerMessageLedger(harness.cp).claim(successor);
+      expect(claimOf(taken.allowed ? taken.value : null)).toMatchObject({
+        claimed: null,
+        withheld: [{ messageId: peerRow!.message_id }],
+      });
+      expect(fixture.peerRows()[0]!.status).toBe("PENDING");
     } finally {
       await fixture.close();
     }

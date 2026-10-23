@@ -665,7 +665,7 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
    *
    * The `RUN_DISPATCH` is the control: the fence still runs and still reaches everything else.
    */
-  it("leaves a queued owner-message alone when its session stops, and still retargets it", () => {
+  it("leaves a queued owner-message and an actionable dispatch alone when their session stops, and still retargets both", () => {
     const { core, seeded } = seededCore();
     const owner = enqueueOwnerMessage(core, seeded, "queued when the runtime died");
     const dispatch = enqueueDispatch(core, seeded);
@@ -675,12 +675,14 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
     expect(
       core.sessions.transition(seeded.sessionId, SessionLifecycle.STOPPED, "restart").allowed,
     ).toBe(true);
-    expect(core.outbox.get(dispatch.value.messageId)?.status).toBe("REJECTED");
+    // ACP-R1-01: an actionable instruction is the role's too; the stop keeps it for the next holder.
+    expect(core.outbox.get(dispatch.value.messageId)?.status).toBe("PENDING");
     expect(core.outbox.get(owner.value.messageId)?.status).toBe("PENDING");
 
-    // The generic fence agrees: a queued holder-claimed row is not its business either.
+    // The generic fence agrees: neither is its business.
     core.outbox.fenceUndeliverable();
     expect(core.outbox.get(owner.value.messageId)?.status).toBe("PENDING");
+    expect(core.outbox.get(dispatch.value.messageId)?.status).toBe("PENDING");
 
     const successor = core.sessions.create({ provider: "claude", model: "successor-cto" });
     expect(
@@ -693,7 +695,9 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
       successor.sessionId,
     );
     expect(moved.retargeted).toContain(owner.value.messageId);
+    expect(moved.retargeted).toContain(dispatch.value.messageId);
     expect(core.outbox.get(owner.value.messageId)?.targetSessionId).toBe(successor.sessionId);
+    expect(core.outbox.get(dispatch.value.messageId)).toMatchObject({ status: "PENDING", targetSessionId: successor.sessionId });
   });
 
   it("keeps the ingress claim open while a crashed receiver has not ACKed", () => {

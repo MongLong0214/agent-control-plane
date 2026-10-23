@@ -17,8 +17,8 @@ afterEach(() => vi.restoreAllMocks());
 /**
  * Round-1 witnesses for the CEO's escalation door (#1120): a committed resolution keeps its request
  * identity however the MCP layer's stored response fares (ESC-01), a refused escalation opening
- * changes nothing (ESC-02), and a PENDING reply follows a takeover once, to the run's new owner only
- * (ESC-03).
+ * changes nothing (ESC-02), and a PENDING reply follows every takeover to the run's new owner only,
+ * until it is acknowledged (ESC-03; ACP-R1-01 retired the once-only budget).
  */
 
 let keys = 0;
@@ -257,8 +257,8 @@ const expectNotCarried = (f: BootstrapRuntimeFixture, messageId: string, replace
   expect(carries(f, messageId)).toEqual([]);
 };
 
-describe("ESC-03: a PENDING ESCALATION_REPLY follows a takeover once, to the run's new owner only", () => {
-  it("a takeover carries it once to the successor; the old generation cannot claim it; a second takeover does not carry it again", async () => {
+describe("ESC-03: a PENDING ESCALATION_REPLY follows every takeover, to the run's new owner only", () => {
+  it("a takeover carries it to the successor; the old generation cannot claim it; a second takeover carries it on until it is ACKed", async () => {
     await withBootstrapRuntime(async (f) => {
       const { runId, ownerSessionId, reply } = await resolvedWithPendingReply(f);
       const oldIncarnation = f.harness.cp.sessions.get(ownerSessionId)!.incarnation;
@@ -290,11 +290,18 @@ describe("ESC-03: a PENDING ESCALATION_REPLY follows a takeover once, to the run
       expect(f.harness.cp.outbox.pendingInBandFor(successor, successorIncarnation).filter((m) => m.messageId === reply.messageId))
         .toHaveLength(1);
 
-      // A second takeover does not carry it again.
+      // A second takeover carries the same unACKed reply on, with its id, to the run's next owner:
+      // repeated recovery never spends the CEO's resolution (ACP-R1-01).
       const third = replacementSession(f);
       expect(takeover(f, runId, third)).toMatchObject({ allowed: true, value: { bindingGeneration: 3 } });
-      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "REJECTED", bindingGeneration: 2, targetSessionId: successor });
-      expect(carries(f, reply.messageId)).toHaveLength(1);
+      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "PENDING", bindingGeneration: 3, targetSessionId: third,
+        payload: reply.payload });
+      expect(replies(f, runId)).toHaveLength(1);
+      expect(carries(f, reply.messageId).map((carry) => [carry["fromGeneration"], carry["toGeneration"]])).toEqual([[1, 2], [2, 3]]);
+      const thirdIncarnation = f.harness.cp.sessions.get(third)!.incarnation;
+      expect(f.harness.cp.outbox.acknowledge(reply.messageId, successor, 2, successorIncarnation)).toMatchObject({ allowed: false });
+      expect(f.harness.cp.outbox.acknowledge(reply.messageId, third, 3, thirdIncarnation)).toMatchObject({ allowed: true });
+      expect(f.harness.cp.outbox.get(reply.messageId)!.status).toBe("ACKED");
     });
   });
 
@@ -353,19 +360,34 @@ describe("ESC-03: a PENDING ESCALATION_REPLY follows a takeover once, to the run
     });
   });
 
-  it.each([
-    ["SENT", "UPDATE outbox SET status = 'SENT' WHERE message_id = ?"],
-    ["claimed", "UPDATE outbox SET status = 'IN_FLIGHT', claim_token = 'r1-claim', claimed_at = '2026-08-12T00:00:00.000Z' WHERE message_id = ?"],
-  ])("not carried once %s", async (_label, sql) => {
+  it("not carried once SENT", async () => {
     await withBootstrapRuntime(async (f) => {
       const { runId, reply } = await resolvedWithPendingReply(f);
-      f.harness.cp.db.run(sql, [reply.messageId]);
+      f.harness.cp.db.run("UPDATE outbox SET status = 'SENT' WHERE message_id = ?", [reply.messageId]);
       const successor = replacementSession(f);
       expect(takeover(f, runId, successor)).toMatchObject({ allowed: true });
       const row = f.harness.cp.outbox.get(reply.messageId)!;
       expect(row.targetSessionId).toBe(reply.targetSessionId);
       expect(row.bindingGeneration).toBe(1);
       expect(carries(f, reply.messageId)).toEqual([]);
+    });
+  });
+
+  // ACP-R1-01: a delivery claim the replaced holder's send still held proves nothing was received,
+  // so the claim is released and the reply follows the takeover with its id (at-least-once).
+  it("carried, its delivery claim released, once claimed", async () => {
+    await withBootstrapRuntime(async (f) => {
+      const { runId, reply } = await resolvedWithPendingReply(f);
+      f.harness.cp.db.run(
+        "UPDATE outbox SET status = 'IN_FLIGHT', claim_token = 'r1-claim', claimed_at = '2026-08-12T00:00:00.000Z' WHERE message_id = ?",
+        [reply.messageId],
+      );
+      const successor = replacementSession(f);
+      expect(takeover(f, runId, successor)).toMatchObject({ allowed: true });
+      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "PENDING", targetSessionId: successor, bindingGeneration: 2 });
+      expect(f.harness.cp.db.get<{ claim_token: string | null }>("SELECT claim_token FROM outbox WHERE message_id = ?",
+        [reply.messageId])?.claim_token).toBeNull();
+      expect(carries(f, reply.messageId)).toHaveLength(1);
     });
   });
 });

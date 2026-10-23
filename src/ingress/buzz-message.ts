@@ -204,8 +204,9 @@ const noSuccessor = (): boolean => false;
 
 /**
  * Recheck the CEO author's identity, the receiving CTO holder and its channel before hand-over.
- * CEO generations and runtime moves do not invalidate a message. A CTO successor still needs
- * the existing one-hop canonical carry record, and the CTO proof is never rewritten.
+ * CEO generations and runtime moves do not invalidate a message. Any holder other than the
+ * proof's exact one must be proven to continue the same conversation (`successorOf`); the CTO
+ * proof is never rewritten.
  */
 export const peerProofIsCurrent = (
   source: AdmittedPeerSource | undefined,
@@ -214,10 +215,12 @@ export const peerProofIsCurrent = (
   /** The receiving CTO session's current `buzz_address`, or null. */
   ctoChannel: string | null,
   /**
-   * Whether this holder is the one-hop same-actor canonical successor of the CTO session the
-   * proof names, for this row (`selfClaimCarriedTo`). Asked only when the proof's CTO half names
-   * generation `holder.bindingGeneration - 1` and another session; the default answers no, so a
-   * caller that supplies nothing accepts the proof's exact holder alone.
+   * Whether this holder is an authenticated continuation of the CTO session the proof names, for
+   * this row: a canonical restart's carry (`selfClaimCarriedTo`), or a proven continuation of the
+   * same conversation. Asked only when the proof's CTO half names another session at this
+   * holder's generation or an earlier one — a surviving runtime move keeps the generation
+   * (ACP-R1-02) — never for a proof from a later generation; the default answers no, so a caller
+   * that supplies nothing accepts the proof's exact holder alone.
    */
   successorOf: (proofCto: PeerProofCto) => boolean = noSuccessor,
 ): boolean => {
@@ -233,13 +236,13 @@ export const peerProofIsCurrent = (
     proof["ctoRoleKey"] === holder.roleKey &&
     ctoChannel !== null &&
     source.conversation === ctoChannel &&
-    // The CTO the proof names is this holder — or, the one case besides it (2026-10-03), the
-    // holder is that CTO's conversation restarted once: generation + 1, another session, and the
-    // self-claim's carry record for this row says so. The proof itself is never rewritten.
+    // The CTO the proof names is this holder — or the holder continues that CTO's conversation on
+    // another session, at the same generation (a surviving runtime move) or a later one (a
+    // restart), and `successorOf` proves it for this row. The proof itself is never rewritten.
     ((ctoGeneration === holder.bindingGeneration && ctoSession === holder.targetSessionId) ||
       (typeof ctoGeneration === "number" &&
         Number.isSafeInteger(ctoGeneration) &&
-        holder.bindingGeneration > ctoGeneration &&
+        holder.bindingGeneration >= ctoGeneration &&
         typeof ctoSession === "string" &&
         ctoSession !== holder.targetSessionId &&
         successorOf({ roleKey: holder.roleKey, bindingGeneration: ctoGeneration, sessionId: ctoSession })))
@@ -966,7 +969,8 @@ export interface ActiveRoleTarget {
   targetSessionId: string;
   /**
    * When this binding generation was created: the assignment row's `created_at`, which a runtime
-   * move within the generation keeps. A mention signed before it is refused.
+   * move within the generation keeps. The binding floor's fallback when the port records no history
+   * of the role in the envelope's room (`BuzzMessageTurnPort.recipientHistorySince`).
    */
   createdAt: string;
 }
@@ -998,6 +1002,14 @@ export interface BuzzMessageTurnPort {
    * stamped with whichever generation the CEO happened to be at.
    */
   activeRoleTarget(roleKey: string): ActiveRoleTarget | null;
+  /**
+   * ACP-R1-04 — since when the stable role has been a recipient in `conversation` (the room the
+   * envelope arrived on), from the binding registry's own records and nothing about delivery: no
+   * outbox status, claim or ACK is read. Null when the registry records no history of the role in
+   * that room; the binding floor then falls back to the current generation's creation. A port
+   * without it judges every envelope against `ActiveRoleTarget.createdAt`.
+   */
+  recipientHistorySince?(roleKey: string, conversation: string): string | null;
   existingRoleMessage?(input: { eventId: string; roleKey: string; actor: string; conversation: string; text: string }):
     Decision<{ messageId: string; status: string } | null>;
   queuedRoleMessage?(nonce: string): { messageId: string; roleKey: string; payload: unknown; status: string } | null;
@@ -1110,16 +1122,21 @@ const rolledBackDecision = (err: unknown): Decision<never> | null =>
  * identity, a new room, the first start — asks for all of it; without this, mentions from weeks
  * before the binding are queued as new work for whoever holds the role now.
  *
- * The floor is the binding's creation, never "now": a message signed after it while no session was
- * attached is the holder's, and is admitted whenever it arrives. An envelope with no signed time
- * (the local socket's) has nothing to compare and is not refused here.
+ * The floor is never "now": a message signed after it while no session was attached is the
+ * holder's, and is admitted whenever it arrives. It is the stable role's history in the room the
+ * envelope arrived on (`recipientHistorySince`, ACP-R1-04), so mail signed in that room between two
+ * generations still reaches the role, while history from a room the role joined later is refused
+ * however long the role answered elsewhere. An envelope with no signed time (the local socket's)
+ * has nothing to compare and is not refused here.
  */
 const precedingBinding = (
   input: BuzzMessageIngressInput,
   roleKey: string,
   active: ActiveRoleTarget,
+  port: Pick<BuzzMessageTurnPort, "recipientHistorySince">,
 ): Decision<never> | null =>
-  input.createdAt !== undefined && signedSince(input.createdAt, active.createdAt) === null
+  input.createdAt !== undefined &&
+  signedSince(input.createdAt, port.recipientHistorySince?.(roleKey, input.conversation) ?? active.createdAt) === null
     ? deny(
         ReasonCode.BUZZ_MENTION_PRECEDES_BINDING,
         "the mention was signed before the addressed role's binding generation was created",
@@ -1188,7 +1205,7 @@ const admitBuzzMessage = (
                 nonce: buzzMessageNonce(input.eventId, input.recipientRoleKey), target: { kind: "ROLE", roleKey } } });
           }
           const active = roleKey === null ? null : port.activeRoleTarget(roleKey);
-          const floor = roleKey !== null && active ? precedingBinding(input, roleKey, active) : null;
+          const floor = roleKey !== null && active ? precedingBinding(input, roleKey, active, port) : null;
           if (floor) throw rollingBack(floor);
         }
         return admitted as Decision<BuzzMessageAdmission>;
@@ -1240,7 +1257,7 @@ const admitBuzzMessage = (
       // The binding floor (`precedingBinding`). Thrown, so the admission rolls back and the refusal
       // writes nothing — the replay slot, the inbound row and the admission's audit row all go —
       // and a redelivery is refused the same way.
-      const floor = precedingBinding(input, target.roleKey, active);
+      const floor = precedingBinding(input, target.roleKey, active, port);
       if (floor) throw rollingBack(floor);
       const enqueued = port.enqueueOwnerMessage({
         roleKey: target.roleKey,
