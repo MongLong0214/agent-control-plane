@@ -51,10 +51,16 @@ try {
   locked = true;
   const origin = `https://github.com/${match[1]}/${repoName}.git`;
   const identityFile = join(a.clonePath,'.git','acp-repository.json');
-  // Git's own HEAD and branch, never the allocation's: a commit merely present proves nothing about
-  // what the CTO's checkout holds. `bootstrap` is the activation requirement (attached to dev, exactly
-  // at the approved head); otherwise a later descendant on any branch is legitimate development. A
-  // dirty or detached checkout is never ready, and nothing here resets, cleans or checks out.
+  // Git's own HEAD, never the allocation's: a commit merely present proves nothing about what the CTO's
+  // checkout holds. Nothing here ever resets, cleans, stashes or checks out.
+  // `bootstrap` — activation's requirement until a resident of this allocation has been observed on
+  // it: attached to dev, clean, exactly at the approved genesis head.
+  // `development` — once the CTO owns the clone (fleet recovery, and activation passes after that
+  // observation): the project's own clone whose HEAD's history contains the approved genesis head, in
+  // any working state — uncommitted or untracked edits, any branch, or a detached HEAD (a CTO may
+  // detach to bisect or inspect) — all preserved as they are.
+  const checkoutRequirement = req.operation === 'ensure-resident' || a.checkoutRequirement === 'development' ? 'development' : 'bootstrap';
+  check(a.checkoutRequirement === undefined || a.checkoutRequirement === 'development','checkout requirement');
   const checkout = (requirement) => {
     check(existsSync(identityFile),'clone receipt missing');
     const identity = read(identityFile);
@@ -63,12 +69,13 @@ try {
     check(realpathSync(a.clonePath) === a.clonePath,'clone path alias');
     check(run('git',['cat-file','-t',a.head],{cwd:a.clonePath}).trim() === 'commit','genesis absent');
     const head = run('git',['rev-parse','--verify','HEAD^{commit}'],{cwd:a.clonePath}).trim();
-    let branch = null;
-    try {branch = run('git',['symbolic-ref','--quiet','--short','HEAD'],{cwd:a.clonePath}).trim() || null;} catch(e) {if (e.status !== 1) throw e;}
-    check(branch !== null,'clone checkout is detached');
-    check(run('git',['status','--porcelain=v1','--untracked-files=all'],{cwd:a.clonePath}).trim() === '','clone checkout has uncommitted changes');
-    if (requirement === 'bootstrap') check(branch === 'dev' && head === a.head,'clone is not on dev at the approved genesis head');
-    else {
+    if (requirement === 'bootstrap') {
+      let branch = null;
+      try {branch = run('git',['symbolic-ref','--quiet','--short','HEAD'],{cwd:a.clonePath}).trim() || null;} catch(e) {if (e.status !== 1) throw e;}
+      check(branch !== null,'clone checkout is detached');
+      check(run('git',['status','--porcelain=v1','--untracked-files=all'],{cwd:a.clonePath}).trim() === '','clone checkout has uncommitted changes');
+      check(branch === 'dev' && head === a.head,'clone is not on dev at the approved genesis head');
+    } else {
       let contains = head === a.head;
       if (!contains) {try {run('git',['merge-base','--is-ancestor',a.head,head],{cwd:a.clonePath});contains = true;} catch(e) {if (e.status !== 1) throw e;}}
       check(contains,'clone checkout does not build on the approved genesis head');
@@ -117,7 +124,7 @@ try {
         atomic(identityFile,JSON.stringify({projectId:a.projectId,nodeId:a.repositoryNodeId,origin}));
       }
       // No reset, clean or checkout is ever run here, including crash recovery.
-      result = {checkout:checkout('bootstrap')}; break;
+      result = {checkout:checkout(checkoutRequirement)}; break;
     }
     case 'ensure-buzz': {
       if (!existsSync(a.privateKeyFile)) atomic(a.privateKeyFile,Buffer.from(generateSecretKey()).toString('hex')+'\n');
@@ -178,8 +185,8 @@ try {
       result = {routing:{generation:read(rosterFile).generation,roomId:a.roomId}}; break;
     }
     case 'ensure-resident': {
-      // Also the fleet watcher's recovery path, long after bootstrap: later commits are legitimate.
-      const observedCheckout = checkout('development');
+      // Also the fleet watcher's recovery path after a CTO dies: it relaunches over unfinished work.
+      const observedCheckout = checkout(checkoutRequirement);
       run(join(home,'.claude','scripts','claude-trust-dir.sh'),[a.clonePath]);
       const escaped = value => value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
       const mcpMatches = text => text.includes('acp-cto') && text.includes('agentctl') && /\battach\s+resident-cto\b/.test(text)
@@ -216,8 +223,8 @@ try {
       }
       result = {fleet:true,checkout:observedCheckout,resident:observeResident()}; break;
     }
-    // Activation's readback: the bootstrap requirement holds once the resident runs in the checkout.
-    case 'observe': result = {checkout:checkout('bootstrap'),resident:observeResident()}; break;
+    // Activation's readback: the bootstrap requirement holds until the CTO has been observed on the clone.
+    case 'observe': result = {checkout:checkout(checkoutRequirement),resident:observeResident()}; break;
     case 'retire': {
       rmSync(join(dirname(a.bootPacket),`${a.fleetName}.resident.json`),{force:true});
       if (existsSync(rosterFile)) { const roster = read(rosterFile); const route = roster.channels[a.roomId]; if (route && route.status !== 'retired') { check(route.acp_project_id === a.projectId,'retirement route conflict'); route.status = 'retired'; roster.generation++; atomic(rosterFile,JSON.stringify(roster,null,2)+'\n'); } }

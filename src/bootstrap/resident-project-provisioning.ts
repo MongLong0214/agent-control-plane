@@ -62,14 +62,23 @@ export class ResidentProjectProvisioning {
       if (a.projectId !== input.projectId || a.repositoryIdentity !== input.repositoryIdentity || a.repositoryNodeId !== input.repositoryNodeId || a.head !== input.head) throw new Error('provisioning resource conflict');
       const observations:HostObservation = {};
       // Every retry inspects the same allocation. Volatile observations never survive as readiness.
-      // Review V52-R1-03 — the host reports Git's own HEAD; activation needs the clone exactly at the
-      // approved head in every readback, and never resets it there. The host itself refuses a dirty or
-      // detached clone, and for ensure-checkout and observe one not attached to dev.
+      // Review V52-R1-03 — the host reports Git's own HEAD and never resets the clone. Until a resident
+      // of this allocation has been observed on it, activation needs it attached to dev, clean and
+      // exactly at the approved head (the host checks branch and cleanliness, this the head).
+      // Review V52-R2-01 — once that observation is recorded the clone is the CTO's workspace: a later
+      // activation pass (after the handoff ACK) asks only that it is the project's clone with history
+      // built on the approved head, the rule fleet recovery uses, so unfinished work never blocks it.
+      const recorded = JSON.parse(this.row(input.runId)!.steps_json) as {checkoutHandedOver?:unknown;observe?:{state?:string;observed?:HostObservation}};
+      const prior = recorded.observe?.state === 'OBSERVED' ? recorded.observe.observed : undefined;
+      const strictObserve = prior?.checkout?.head === a.head && prior.checkout.path === a.clonePath && prior.resident?.sessionUuid === a.sessionUuid && prior.resident.cwd === a.clonePath && prior.resident.tmuxAncestry === true && Boolean(prior.resident.bridgeSessionId);
+      let handedOver = recorded.checkoutHandedOver !== undefined || strictObserve;
+      if (handedOver && recorded.checkoutHandedOver === undefined) this.save(input.runId,'checkoutHandedOver',{head:a.head,at:this.clock.nowIso()});
+      const checkoutHost = ():ProjectAllocation => handedOver ? Object.assign({},a!,{checkoutRequirement:'development' as const}) : a!;
       const bootstrapCheckout = (observed:HostObservation, step:HostOperation):void => {
         const checkout = observed.checkout;
-        if (!checkout || checkout.path !== a!.clonePath || checkout.repositoryNodeId !== a!.repositoryNodeId || checkout.head !== a!.head) throw new Error(`${step} checkout readback is not the approved genesis head`);
+        if (!checkout || checkout.path !== a!.clonePath || checkout.repositoryNodeId !== a!.repositoryNodeId || (!handedOver && checkout.head !== a!.head)) throw new Error(`${step} checkout readback is not the approved genesis head`);
       };
-      const checkedOut = await this.step('ensure-checkout',a,input.packet);
+      const checkedOut = await this.step('ensure-checkout',checkoutHost(),input.packet);
       bootstrapCheckout(checkedOut,'ensure-checkout');
       Object.assign(observations,checkedOut);
       Object.assign(observations,await this.step('ensure-buzz',a,input.packet));
@@ -88,13 +97,15 @@ export class ResidentProjectProvisioning {
       const launched = await this.step('ensure-resident',a,input.packet);
       bootstrapCheckout(launched,'ensure-resident');
       Object.assign(observations,launched);
-      const latest = await this.step('observe',a);
+      const latest = await this.step('observe',checkoutHost());
       bootstrapCheckout(latest,'observe');
       delete observations.resident; delete observations.checkout;
       Object.assign(observations,latest);
       const resident = latest.resident;
       const checkout = latest.checkout;
-      if (!resident || !checkout || resident.cwd !== a.clonePath || resident.sessionUuid !== a.sessionUuid || !resident.tmuxAncestry || !resident.bridgeSessionId || checkout.repositoryNodeId !== a.repositoryNodeId || checkout.head !== a.head) throw new Error('resident/checkout readbacks mismatch');
+      if (!resident || !checkout || resident.cwd !== a.clonePath || resident.sessionUuid !== a.sessionUuid || !resident.tmuxAncestry || !resident.bridgeSessionId || checkout.repositoryNodeId !== a.repositoryNodeId) throw new Error('resident/checkout readbacks mismatch');
+      // The resident is verified on the approved checkout: from here on the clone is the CTO's workspace.
+      if (!handedOver) {handedOver = true;this.save(input.runId,'checkoutHandedOver',{head:a.head,at:this.clock.nowIso()});}
       const claim = this.db.get<{session_id:string}>(`SELECT s.session_id FROM sessions s JOIN conversational_actors c ON c.current_session_id = s.session_id JOIN assignments b ON b.actor_id = c.actor_id AND b.status = 'ACTIVE' JOIN actor_target_bindings tb ON tb.target_actor_id = b.actor_id WHERE b.project_id = ? AND b.role = 'PRIMARY_CTO' AND tb.target_locator = ? AND s.os_pid = ? AND s.os_process_started_at = ? AND s.workdir = ? AND s.buzz_actor_id = ? AND s.buzz_address = ? AND EXISTS (SELECT 1 FROM audit_events e WHERE e.kind = 'CANONICAL_SELF_CLAIM_ADMITTED' AND e.session_id = s.session_id AND json_extract(e.evidence_json,'$.identity') = ?)`,[a.projectId,a.sessionUuid,resident.pid,resident.startedAt,a.clonePath,pk,a.roomId,a.sessionUuid]);
       const subscriberReady = await this.#reconcile(a,pk);
       const evidence = {runId:a.runId,allocation:a,observations,claimSessionId:claim?.session_id ?? null,subscriberReady,observedAt:this.clock.nowIso(),complete:false};
