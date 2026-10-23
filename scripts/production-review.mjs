@@ -246,6 +246,29 @@ const prompt = (key, area, revision) =>
     "Return only the JSON object required by the output schema.",
   ].join("\n");
 
+/**
+ * The model `codex exec` says it is running, from the configuration header it prints before the
+ * session: `OpenAI Codex v…`, a `--------` line, `key: value` lines including `model: …`, and a
+ * closing `--------`. Only that block is read, on stderr and then stdout, because a `model:` line
+ * anywhere else could be the reviewer's own words. ANSI styling and a leading `[timestamp]` are
+ * tolerated. No header, or a header with no model line, is `null`: the model is then unverified.
+ */
+const observedModelOf = (...streams) => {
+  for (const text of streams) {
+    const lines = text
+      .replace(/\u001b\[[0-9;]*m/g, "")
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^\[[^\]]*\]\s*/, "").trim());
+    const start = lines.findIndex((line) => line.startsWith("OpenAI Codex v"));
+    if (start === -1 || lines[start + 1] !== "--------") continue;
+    for (let index = start + 2; index < lines.length && lines[index] !== "--------"; index += 1) {
+      const match = /^model:\s*(\S+)$/.exec(lines[index]);
+      if (match) return match[1];
+    }
+  }
+  return null;
+};
+
 const reviewArea = async (key, area, ctx) => {
   const schemaFile = `${key}.schema.json`;
   const schemaPath = join(ctx.outDir, schemaFile);
@@ -266,7 +289,7 @@ const reviewArea = async (key, area, ctx) => {
     prompt(key, area, ctx.revision),
   ]);
   // codex writes the report itself; it is read only if the child completed.
-  return { child, candidate: { kind: "file" }, artifacts: [schemaFile] };
+  return { child, candidate: { kind: "file" }, artifacts: [schemaFile], observedModel: observedModelOf(child.stderr, child.stdout) };
 };
 
 // Areas are independent — disjoint file sets, no shared state — so they run concurrently.

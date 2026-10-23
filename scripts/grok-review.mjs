@@ -4,8 +4,9 @@
  *
  * The model is selected here and passed with `-m`, never left to the CLI's configured default:
  * a default that moves would change the reviewer while every manifest still looked the same.
- * `--model=<id>` selects another. When an area's CLI reports a model other than the one selected,
- * the manifest and summary say the model identity is UNKNOWN.
+ * `--model=<id>` selects another. The model that actually ran is read from the CLI's own JSON
+ * envelope (`model`); an area whose envelope names no model, or a different one, is
+ * MODEL_UNVERIFIED and never counts as PASS.
  *
  * Same shape as `scripts/production-review.mjs` (GPT-6.1 Sol) on purpose: the areas are the
  * ones the PRD gives distinct authority to, the reviewer reads the repository itself rather
@@ -207,7 +208,7 @@ const reviewArea = async (key, area, ctx) => {
   const child = await ctx.runChild("grok", args);
   const artifacts = [];
   let candidate;
-  let reportedModel = null;
+  let observedModel = null;
   try {
     // The CLI prints one JSON envelope whose answer is `text` (measured, not assumed:
     // `result` does not exist on it). With --json-schema that text *is* the JSON report,
@@ -215,7 +216,7 @@ const reviewArea = async (key, area, ctx) => {
     const start = child.stdout.indexOf("{");
     if (start === -1) throw new Error("grok printed no JSON envelope");
     const envelope = JSON.parse(child.stdout.slice(start));
-    if (typeof envelope.model === "string") reportedModel = envelope.model;
+    if (typeof envelope.model === "string" && envelope.model !== "") observedModel = envelope.model;
     if (envelope.total_cost_usd) {
       writeFileSync(join(ctx.outDir, `${key}.cost`), String(envelope.total_cost_usd));
       artifacts.push(`${key}.cost`);
@@ -238,7 +239,7 @@ const reviewArea = async (key, area, ctx) => {
   }
   // A parsed report is used only if the child also exited 0: a CLI that printed a verdict and
   // then failed has not been shown to have finished the review.
-  return { child, candidate, artifacts, reportedModel };
+  return { child, candidate, artifacts, observedModel };
 };
 
 /**

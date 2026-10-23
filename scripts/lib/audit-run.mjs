@@ -31,8 +31,8 @@
  *   3. **Write a new directory.** Every run creates its own output directory and refuses one that
  *      already exists, so no file in it can predate the run.
  *   4. **Attribute every result.** `manifest.json` names the run, the exact revision and tree, the
- *      selected areas, the reviewer CLI and model (or that the model is UNKNOWN), and each area's
- *      execution result and artifacts with their digests. A report is read once, and its verdict,
+ *      selected areas, the reviewer CLI, and for each area the model requested, the model the CLI's
+ *      own output named, its execution result and its artifacts with their digests. A report is read once, and its verdict,
  *      finding count and digest all come from those bytes. `summary.json` is a view of the
  *      per-area reports on disk, restricted to the ones this manifest attributes and only while
  *      their bytes still match what was recorded.
@@ -40,9 +40,11 @@
  * Two outcomes are reported separately and never folded into each other: whether each reviewer
  * *ran* (`execution`) and what it *found* (`verdict`). A child that failed, timed out, was
  * interrupted or produced an unreadable report has no verdict — whatever file it left is renamed
- * `<area>.json.unconsumed` so no reader of `<area>.json` takes it for a report. The process exit
- * status describes execution only: 0 when every selected area returned a well-formed report, 1
- * when any did not, 2 when the run was refused before it started, 130 when it was interrupted.
+ * `<area>.json.unconsumed` so no reader of `<area>.json` takes it for a report. So does a child
+ * whose own output did not name the requested model (`MODEL_UNVERIFIED`): the model we asked for is
+ * not evidence of the model that ran, so its findings stay in the manifest as data and are never
+ * promoted to a verdict. The process exit status describes execution only: 0 when every selected
+ * area returned a well-formed report from an observed, requested model, 1 when any did not, 2 when the run was refused before it started, 130 when it was interrupted.
  * None of those, and no verdict, is a PR review or a merge approval.
  *
  * Limit: a process killed with SIGKILL cannot clean up. Its temporary checkout stays under the
@@ -669,7 +671,7 @@ const executeArea = async (key, area, ctx, reviewArea) => {
     const now = new Date();
     outcome = { child: { spawnError: messageOf(error), timedOut: false, interrupted: false, overflowed: false, code: null, signal: null, stdout: "", stderr: "", startedAt: now, endedAt: now }, candidate: null };
   }
-  const { child, candidate, reportedModel = null } = outcome;
+  const { child, candidate, observedModel = null } = outcome;
   const artifacts = [...(outcome.artifacts ?? [])];
   writeFileSync(join(ctx.outDir, `${key}.log`), `${child.stdout}\n--- stderr ---\n${child.stderr}`);
   artifacts.push(`${key}.log`);
@@ -681,7 +683,9 @@ const executeArea = async (key, area, ctx, reviewArea) => {
     startedAt: child.startedAt.toISOString(),
     endedAt: child.endedAt.toISOString(),
     seconds: Math.round((child.endedAt.getTime() - child.startedAt.getTime()) / 1000),
-    reportedModel,
+    // What this run asked for, and what the CLI's own output says ran. Only the second is evidence.
+    requestedModel: ctx.model ?? null,
+    observedModel,
     report: "NOT_CONSUMED",
     reportFile: null,
     verdict: null,
@@ -698,12 +702,28 @@ const executeArea = async (key, area, ctx, reviewArea) => {
     } else {
       notes.push(consumed.reason);
     }
+    // A model named only by our own flag is the requested model, not evidence of the one that ran.
+    if (record.requestedModel === null || record.observedModel !== record.requestedModel) {
+      record.execution = "MODEL_UNVERIFIED";
+      notes.push(
+        record.observedModel === null
+          ? `the CLI's output names no model, so ${record.requestedModel ?? "the model"} is requested, not observed`
+          : `the CLI's output names ${record.observedModel}, not the requested ${record.requestedModel}`,
+      );
+    }
   } else {
     notes.push(whyNotCompleted(child, ctx.timeoutMs));
   }
 
-  if (record.report !== "VALID" && quarantine(reportPath, "unconsumed") !== null) {
-    artifacts.push(`${reportFile}.unconsumed`);
+  // Only a completed, verified, well-formed report keeps the name `<area>.json`. Anything else is
+  // kept as data under a name no reader of reports takes for one; the manifest still records the
+  // verdict and finding count it carried.
+  if (record.execution !== "COMPLETED" || record.report !== "VALID") {
+    if (quarantine(reportPath, "unconsumed") !== null) {
+      if (reportDigest !== null) reportDigest = { ...reportDigest, name: `${reportFile}.unconsumed` };
+      else artifacts.push(`${reportFile}.unconsumed`);
+    }
+    record.reportFile = null;
   }
   // The report's digest is of the bytes that were validated, never of a later read of the path.
   record.artifacts = [
@@ -718,27 +738,35 @@ const executeArea = async (key, area, ctx, reviewArea) => {
 // The summary
 
 /**
- * A view of the per-area reports on disk — but only of the reports this run's manifest attributes
- * to itself, and only while each one's bytes still match the digest recorded when its reviewer
- * finished. An unselected area is NOT_RUN whatever file exists for it; a report that changed
- * afterwards is STALE; anything without a well-formed report is ERROR. None of them is PASS.
- */
-/**
- * The model is identified only when this run selected one explicitly and no area's CLI reported
- * a different one. Otherwise it is UNKNOWN, said so in plain words, and never filled with a
- * description of where the model might have come from.
+ * The model is ESTABLISHED only when every area's CLI output named the model this run requested.
+ * Otherwise it is UNKNOWN, said so in plain words, and never filled in from the flag we passed.
  */
 const modelIdentityOf = (reviewer, results) => {
-  if (reviewer.model === null) {
-    return { modelIdentity: "UNKNOWN", modelNote: "no model was selected, so the CLI used one this run cannot see" };
+  if (reviewer.requestedModel === null) {
+    return { modelIdentity: "UNKNOWN", modelNote: "no model was requested, so the CLI used one this run cannot name" };
   }
-  const others = [...new Set(Object.values(results).map((record) => record.reportedModel).filter((model) => typeof model === "string" && model !== reviewer.model))];
-  if (others.length > 0) {
-    return { modelIdentity: "UNKNOWN", modelNote: `${reviewer.model} was selected but the CLI reported ${others.join(", ")}` };
+  const records = Object.values(results);
+  const unverified = records.filter((record) => record.observedModel !== reviewer.requestedModel);
+  if (records.length === 0 || unverified.length > 0) {
+    const observed = [...new Set(unverified.map((record) => record.observedModel ?? "no model"))];
+    return {
+      modelIdentity: "UNKNOWN",
+      modelNote:
+        records.length === 0
+          ? "no reviewer ran, so no output named a model"
+          : `${reviewer.requestedModel} was requested; the CLI's own output named ${observed.join(", ")}`,
+    };
   }
   return { modelIdentity: "ESTABLISHED" };
 };
 
+/**
+ * A view of the per-area reports on disk — but only of the reports this run's manifest attributes
+ * to itself, and only while each one's bytes still match the digest recorded when its reviewer
+ * finished. An unselected area is NOT_RUN whatever file exists for it; a report that changed
+ * afterwards is STALE; anything without a well-formed report, or whose model was not observed to
+ * be the requested one, is ERROR. None of them is PASS.
+ */
 const summarize = ({ tool, manifest, outDir, areaKeys }) => {
   const results = areaKeys.map((key) => {
     if (!manifest.selectedAreas.includes(key)) {
@@ -748,8 +776,15 @@ const summarize = ({ tool, manifest, outDir, areaKeys }) => {
     if (record === undefined) {
       return { key, selected: true, result: "NOT_RUN", execution: "NOT_RUN", report: null, verdict: null, findings: null, reason: "the run stopped before this area started" };
     }
-    const base = { key, selected: true, execution: record.execution, seconds: record.seconds };
-    if (record.report !== "VALID") {
+    const base = {
+      key,
+      selected: true,
+      execution: record.execution,
+      requestedModel: record.requestedModel,
+      observedModel: record.observedModel,
+      seconds: record.seconds,
+    };
+    if (record.execution !== "COMPLETED" || record.report !== "VALID") {
       return { ...base, result: "ERROR", report: record.report, verdict: null, findings: null, reason: (record.notes ?? []).join("; ") };
     }
     const recorded = record.artifacts.find((artifact) => artifact.name === record.reportFile);
@@ -784,9 +819,9 @@ const summarize = ({ tool, manifest, outDir, areaKeys }) => {
     schema: "acp-audit-summary/1",
     tool,
     reviewer: manifest.reviewer.cli,
-    reviewerModel: manifest.reviewer.model,
-    reviewerModelIdentity: manifest.reviewer.modelIdentity,
-    ...(manifest.reviewer.modelNote === undefined ? {} : { reviewerModelNote: manifest.reviewer.modelNote }),
+    requestedModel: manifest.reviewer.requestedModel,
+    modelIdentity: manifest.reviewer.modelIdentity,
+    ...(manifest.reviewer.modelNote === undefined ? {} : { modelNote: manifest.reviewer.modelNote }),
     runId: manifest.runId,
     requestedRef: manifest.requestedRef,
     revision: manifest.revision,
@@ -820,7 +855,8 @@ export const runAudit = async ({ tool, script, repoRoot, areas, sequential, revi
   try {
     options = parseArguments(process.argv.slice(2), areaKeys, { modelSelectable });
     pinned = pinRevision(repoRoot, options);
-    identity = identify({ ...reviewerIdentity, model: options.model ?? reviewerIdentity.model ?? null });
+    const { model: pinnedModel = null, ...cliIdentity } = reviewerIdentity;
+    identity = identify({ ...cliIdentity, requestedModel: options.model ?? pinnedModel });
     // Before the output directory: a checkout that does not hold the commit's bytes is a refusal.
     checkout = createCheckout(repoRoot, pinned.revision);
     outDir = createOutputDirectory(repoRoot, { out: options.out, tool, runId });
@@ -870,7 +906,7 @@ export const runAudit = async ({ tool, script, repoRoot, areas, sequential, revi
   writeJson(manifestPath, manifest);
 
   try {
-    const ctx = { checkoutDir: checkout.dir, scratchDir: checkout.scratch, outDir, revision, model: identity.model, timeoutMs: options.areaTimeoutMs };
+    const ctx = { checkoutDir: checkout.dir, scratchDir: checkout.scratch, outDir, revision, model: identity.requestedModel, timeoutMs: options.areaTimeoutMs };
     const one = async (key) => {
       if (interruptedBy !== null) return;
       const record = await executeArea(key, areas[key], ctx, reviewArea);
@@ -921,7 +957,7 @@ export const runAudit = async ({ tool, script, repoRoot, areas, sequential, revi
   console.log(`\nexecution: ${summary.execution} — ${reported} of ${options.areas.length} selected area(s) returned a well-formed report`);
   console.log(`findings verdict: ${summary.findingsVerdict}${notPass.length > 0 ? ` (${notPass.join(", ")})` : ""}`);
   console.log(
-    `reviewer model: ${summary.reviewerModelIdentity === "ESTABLISHED" ? summary.reviewerModel : `UNKNOWN (${summary.reviewerModelNote})`}`,
+    `reviewer model: ${summary.modelIdentity === "ESTABLISHED" ? `${summary.requestedModel} (named by the CLI's own output)` : `UNKNOWN (${summary.modelNote})`}`,
   );
   if (summary.unattributedFiles.length > 0) {
     console.log(`not attributed to this run, so not read: ${summary.unattributedFiles.join(", ")}`);

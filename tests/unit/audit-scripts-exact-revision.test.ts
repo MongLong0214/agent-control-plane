@@ -107,13 +107,19 @@ try { subject = fs.readFileSync(path.join(viewDir, "src", "subject.txt"), "utf8"
 const nonce = Math.random().toString(36).slice(2) + "-" + process.pid;
 const model = after("-m") ?? null;
 fs.appendFileSync(process.env.FAKE_REVIEWER_LOG, JSON.stringify({ cli, area, mode, viewDir, subject, model }) + "\n");
+// The model the CLI's own output names: by default the one it was asked for, as the real CLIs do;
+// plan.observedModel "none" names none, any other value names that model instead.
+const observed = plan.observedModel === "none" ? null : (plan.observedModel ?? model);
+if (cli === "codex" && observed !== null) {
+  process.stderr.write("OpenAI Codex v0.0.0-fake (research preview)\n--------\nworkdir: " + process.cwd() + "\nmodel: " + observed + "\nprovider: fake\nsandbox: read-only\n--------\n");
+}
 const reportOf = (verdict, tag) => ({
   verdict,
   filesExamined: ["src/subject.txt", tag],
   omittedItems: [],
   findings: verdict === "PASS" ? [] : [{ severity: "MAJOR", category: "correctness", file: "src/subject.txt", line: 1, summary: "s", detail: "d", suggestedFix: "f" }],
 });
-const textOf = (report) => cli === "codex" ? JSON.stringify(report) : JSON.stringify({ text: "narration", structuredOutput: report, stopReason: "end_turn", ...(plan.reportedModel ? { model: plan.reportedModel } : {}) });
+const textOf = (report) => cli === "codex" ? JSON.stringify(report) : JSON.stringify({ text: "narration", structuredOutput: report, stopReason: "end_turn", ...(observed !== null ? { model: observed } : {}) });
 const emit = (text) => { if (cli === "codex") fs.writeFileSync(outPath, text); else process.stdout.write(text); };
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const report = textOf(reportOf(mode === "revise" ? "REVISE" : mode === "block" ? "BLOCK" : "PASS", "nonce " + nonce));
@@ -269,7 +275,8 @@ interface Plan {
   readonly mutateOriginal?: string;
   readonly tamperRepo?: string;
   readonly tamperOut?: string;
-  readonly reportedModel?: string;
+  /** What the fake CLI's own output names as its model; "none" names none. Default: what it was asked for. */
+  readonly observedModel?: string;
   readonly fifoDir?: string;
   readonly feeder?: string;
 }
@@ -431,9 +438,9 @@ interface Summary {
   readonly findingsVerdict?: string;
   readonly mergeApproval?: boolean;
   readonly unattributedFiles?: readonly string[];
-  readonly reviewerModel?: string | null;
-  readonly reviewerModelIdentity?: string;
-  readonly reviewerModelNote?: string;
+  readonly requestedModel?: string | null;
+  readonly modelIdentity?: string;
+  readonly modelNote?: string;
   readonly workingTree?: { readonly dirty: boolean; readonly uncommittedWorkReviewed: boolean };
 }
 
@@ -452,7 +459,7 @@ const entryOf = (summary: Summary | null, key: string): SummaryEntry | undefined
 const manifestIn = (dir: string): Record<string, unknown> & {
   revision: { commit: string; tree: string };
   selectedAreas: string[];
-  reviewer: { cli: string; path: string; version: string | null; model: string | null; modelIdentity?: string };
+  reviewer: { cli: string; path: string; version: string | null; requestedModel: string | null; modelIdentity?: string };
   results: Record<
     string,
     {
@@ -460,7 +467,8 @@ const manifestIn = (dir: string): Record<string, unknown> & {
       report: string;
       verdict: string | null;
       findings: number | null;
-      reportedModel?: string | null;
+      requestedModel?: string | null;
+      observedModel?: string | null;
       artifacts: { name: string; sha256: string | null }[];
     }
   >;
@@ -645,7 +653,10 @@ describe.each(SCRIPTS)("%s", (script) => {
       expect(result.status).toBe(1);
       expect(summary?.revision?.commit).toBe(second);
       expect(entryOf(summary, "guard")).toMatchObject({ result: "NOT_RUN", execution: "NOT_RUN" });
-      expect(entryOf(summary, "core")).toMatchObject({ result: "ERROR", execution: "COMPLETED", report: "UNPARSABLE" });
+      // codex names its model in a header the cut report does not touch; grok names it inside the
+      // envelope that was cut, so its model is unverified as well.
+      const execution = script === "grok-review.mjs" ? "MODEL_UNVERIFIED" : "COMPLETED";
+      expect(entryOf(summary, "core")).toMatchObject({ result: "ERROR", execution, report: "UNPARSABLE" });
       expect(summary?.findingsVerdict).toBe("UNDETERMINED");
     },
     TEST_TIMEOUT_MS,
@@ -852,6 +863,63 @@ describe.each(SCRIPTS)("%s", (script) => {
     },
     TEST_TIMEOUT_MS,
   );
+
+  const REQUESTED: Record<Script, string> = { "production-review.mjs": "gpt-6.1-sol", "grok-review.mjs": "grok-4.6" };
+  it.each([
+    ["names no model", "none", null],
+    ["names a different model", "some-other-model", "some-other-model"],
+  ] as const)(
+    "does not promote an area to COMPLETE/PASS when the CLI's own output %s",
+    async (_case, printed, observedModel) => {
+      const fixture = makeFixture();
+      setPlan(fixture, { default: "pass", observedModel: printed });
+
+      const result = await run(fixture, script, ["core"]);
+      const dir = runDirectoryOf(fixture, script, result);
+      const summary = summaryIn(dir);
+      // d8ba1998 took the requested model on trust: COMPLETE, PASS, exit 0.
+      expect(summary?.execution).toBe("INCOMPLETE");
+      expect(summary?.findingsVerdict).toBe("UNDETERMINED");
+      expect(result.status).toBe(1);
+      expect(entryOf(summary, "core")).toMatchObject({ result: "ERROR", execution: "MODEL_UNVERIFIED", verdict: null });
+      // The reviewer's answer is kept as data, never as a report under `core.json`.
+      expect(manifestIn(dir).results["core"]).toMatchObject({
+        execution: "MODEL_UNVERIFIED",
+        requestedModel: REQUESTED[script],
+        observedModel,
+        report: "VALID",
+        verdict: "PASS",
+        findings: 0,
+      });
+      expect(existsSync(join(dir, "core.json"))).toBe(false);
+      expect(existsSync(join(dir, "core.json.unconsumed"))).toBe(true);
+      expect(summary?.modelIdentity).toBe("UNKNOWN");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "promotes an area as before when the CLI's own output names the requested model",
+    async () => {
+      const fixture = makeFixture();
+      setPlan(fixture, { default: "pass" });
+
+      const result = await run(fixture, script, ["core"]);
+      const dir = runDirectoryOf(fixture, script, result);
+      const summary = summaryIn(dir);
+      expect(result.status).toBe(0);
+      expect(summary?.execution).toBe("COMPLETE");
+      expect(summary?.findingsVerdict).toBe("PASS");
+      expect(resultOf(summary, "core")).toBe("PASS");
+      expect(manifestIn(dir).results["core"]).toMatchObject({
+        execution: "COMPLETED",
+        requestedModel: REQUESTED[script],
+        observedModel: REQUESTED[script],
+      });
+      expect(summary?.modelIdentity).toBe("ESTABLISHED");
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
 
 describe("the reviewer model", () => {
@@ -864,22 +932,22 @@ describe("the reviewer model", () => {
       expect(callsOf(fixture).map((call) => call.model)).toEqual(["grok-4.6"]);
       expect(first.status).toBe(0);
       const firstDir = runDirectoryOf(fixture, "grok-review.mjs", first);
-      expect(manifestIn(firstDir).reviewer).toMatchObject({ model: "grok-4.6", modelIdentity: "ESTABLISHED" });
-      expect(summaryIn(firstDir)).toMatchObject({ reviewerModel: "grok-4.6", reviewerModelIdentity: "ESTABLISHED" });
+      expect(manifestIn(firstDir).reviewer).toMatchObject({ requestedModel: "grok-4.6", modelIdentity: "ESTABLISHED" });
+      expect(summaryIn(firstDir)).toMatchObject({ requestedModel: "grok-4.6", modelIdentity: "ESTABLISHED" });
 
       const chosen = await run(fixture, "grok-review.mjs", ["core", "--model=grok-4.7"]);
       expect(callsOf(fixture).at(-1)?.model).toBe("grok-4.7");
-      expect(manifestIn(runDirectoryOf(fixture, "grok-review.mjs", chosen)).reviewer.model).toBe("grok-4.7");
+      expect(manifestIn(runDirectoryOf(fixture, "grok-review.mjs", chosen)).reviewer.requestedModel).toBe("grok-4.7");
 
-      setPlan(fixture, { default: "pass", reportedModel: "grok-somebody-else" });
+      setPlan(fixture, { default: "pass", observedModel: "grok-somebody-else" });
       const other = await run(fixture, "grok-review.mjs", ["core"]);
       const otherDir = runDirectoryOf(fixture, "grok-review.mjs", other);
       const manifest = manifestIn(otherDir);
-      expect(manifest.results["core"]?.reportedModel).toBe("grok-somebody-else");
-      expect(manifest.reviewer).toMatchObject({ model: "grok-4.6", modelIdentity: "UNKNOWN" });
+      expect(manifest.results["core"]?.observedModel).toBe("grok-somebody-else");
+      expect(manifest.reviewer).toMatchObject({ requestedModel: "grok-4.6", modelIdentity: "UNKNOWN" });
       const summary = summaryIn(otherDir);
-      expect(summary?.reviewerModelIdentity).toBe("UNKNOWN");
-      expect(summary?.reviewerModelNote).toMatch(/grok-somebody-else/);
+      expect(summary?.modelIdentity).toBe("UNKNOWN");
+      expect(summary?.modelNote).toMatch(/grok-somebody-else/);
       expect(other.stdout).toMatch(/reviewer model: UNKNOWN/);
     },
     TEST_TIMEOUT_MS,
@@ -896,7 +964,7 @@ describe("the reviewer model", () => {
       const result = await run(fixture, "production-review.mjs", ["core"]);
       expect(callsOf(fixture).map((call) => call.model)).toEqual(["gpt-6.1-sol"]);
       const dir = runDirectoryOf(fixture, "production-review.mjs", result);
-      expect(summaryIn(dir)).toMatchObject({ reviewerModel: "gpt-6.1-sol", reviewerModelIdentity: "ESTABLISHED" });
+      expect(summaryIn(dir)).toMatchObject({ requestedModel: "gpt-6.1-sol", modelIdentity: "ESTABLISHED" });
     },
     TEST_TIMEOUT_MS,
   );
