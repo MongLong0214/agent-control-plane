@@ -208,7 +208,7 @@ export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[]
         enforces: ['drivenModeOf(this.db, binding.sessionId) !== "NONE"', "session.buzzActorId", 'message.status !== "REJECTED"', 'row?.status !== "PENDING"'],
       },
       { file: ACTIVATION, symbol: "reissuedToReplacement", enforces: ["PRIMARY_CTO_UNDELIVERABLE_REPLACED", 'row?.status !== "PENDING"'] },
-      { file: ACTIVATION, symbol: "acknowledgeActivationHandoff", enforces: ["row.to_session_id !== ackBySessionId", "ack must come from the incoming session"] },
+      { file: ACTIVATION, symbol: "acknowledgeActivationHandoffInTx", enforces: ["row.to_session_id !== ackBySessionId", "ack must come from the incoming session"] },
     ],
   },
   {
@@ -224,7 +224,7 @@ export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[]
         enforces: ["repository.identity !== target.repositoryIdentity", "heads.length !== 1", "row.commandId === target.verificationCommandId", "RESULT_FACTS_UNBOUND"],
       },
       { file: ACTIVATION, symbol: "activate", enforces: ["observedRepositoryFacts(result, factsTargetOf(current.value.outputs))", "deliveredBootstrapHandoff(input.handoff, facts.value)"] },
-      { file: ACTIVATION, symbol: "acknowledgeActivationHandoff", enforces: ["this.observedHandoffFacts("] },
+      { file: ACTIVATION, symbol: "acknowledgeActivationHandoffInTx", enforces: ["this.observedHandoffFacts("] },
       { file: ACTIVATION, symbol: "acknowledgedActivationHandoff", enforces: ["this.observedHandoffFacts(handoffId"] },
       { file: ACTIVATION, symbol: "finalizeBootstrapActivationConfirm", enforces: ["this.observedHandoffFacts(handoffArtifact.content.handoffId"] },
       {
@@ -280,7 +280,7 @@ export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[]
         symbol: "finalizeBootstrapActivationConfirm",
         enforces: ["primary.sessionId !== handoffArtifact.content.toSessionId", "ACK_RECIPIENT_NOT_PRIMARY_CTO"],
       },
-      { file: ACTIVATION, symbol: "acknowledgeActivationHandoff", enforces: ["row.to_session_id !== ackBySessionId"] },
+      { file: ACTIVATION, symbol: "acknowledgeActivationHandoffInTx", enforces: ["row.to_session_id !== ackBySessionId"] },
     ],
   },
   {
