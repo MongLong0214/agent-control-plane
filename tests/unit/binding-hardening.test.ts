@@ -267,12 +267,33 @@ describe("outbox delivery is claimed, not merely selected", () => {
   });
 
   it("rejects an unclassified delivery failure instead of retrying it", () => {
+    const core = setup();
+    const message = core.outbox.enqueue({
+      idempotencyKey: `k:review:${core.seeded.runId}`,
+      roleKey: core.seeded.roleKey,
+      bindingGeneration: 1,
+      targetSessionId: core.seeded.sessionId,
+      runId: core.seeded.runId,
+      kind: "REVIEW_REQUEST",
+      payload: { runId: core.seeded.runId },
+    });
+    if (!message.allowed) throw new Error(message.message);
+    const claimed = core.outbox.claimDeliverable()[0]!;
+    const failed = core.outbox.markAttemptFailed(claimed.messageId, claimed.claimToken, "boom");
+    expect(failed.allowed).toBe(false);
+    expect(failed.reasonCode).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
+    expect(core.outbox.get(claimed.messageId)?.status).toBe("REJECTED");
+    expect(core.outbox.claimDeliverable()).toHaveLength(0);
+  });
+
+  // ACP-R1-01: an actionable instruction is never ended by a failed attempt. An unclassified failure
+  // is an unknown outcome: SENT, awaiting the holder's ACK, and not retried in the meantime.
+  it("keeps an actionable instruction whose delivery failed unclassified, sent and awaiting its ACK", () => {
     const { outbox } = enqueued();
     const claimed = outbox.claimDeliverable()[0]!;
     const failed = outbox.markAttemptFailed(claimed.messageId, claimed.claimToken, "boom");
-    expect(failed.allowed).toBe(false);
-    expect(failed.reasonCode).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
-    expect(outbox.get(claimed.messageId)?.status).toBe("REJECTED");
+    expect(failed.allowed).toBe(true);
+    expect(outbox.get(claimed.messageId)?.status).toBe("SENT");
     expect(outbox.claimDeliverable()).toHaveLength(0);
   });
 
@@ -316,7 +337,7 @@ describe("an ACK from a revoked generation changes nothing", () => {
       roleKey: core.seeded.roleKey,
       bindingGeneration: 1,
       targetSessionId: core.seeded.sessionId,
-      kind: "RUN_DISPATCH",
+      kind: "REVIEW_REQUEST",
       payload: {},
     });
     if (!message.allowed) throw new Error(message.message);
@@ -326,6 +347,24 @@ describe("an ACK from a revoked generation changes nothing", () => {
     expect(ack.allowed).toBe(false);
     expect(ack.reasonCode).toBe(ReasonCode.OUTBOX_EXPIRED);
     expect(core.outbox.get(message.value.messageId)?.status).not.toBe("ACKED");
+  });
+
+  // ACP-R1-01 / ACP-R2-01: an actionable instruction has no delivery window, so delivery and ACK
+  // agree: past its nominal TTL it is still delivered, and still acknowledged.
+  it("accepts an ACK for an actionable instruction past its nominal TTL", () => {
+    const core = setup();
+    const message = core.outbox.enqueue({
+      idempotencyKey: "k:exp-dispatch",
+      roleKey: core.seeded.roleKey,
+      bindingGeneration: 1,
+      targetSessionId: core.seeded.sessionId,
+      kind: "RUN_DISPATCH",
+      payload: {},
+    });
+    if (!message.allowed) throw new Error(message.message);
+    core.clock.advance(31 * 60 * 1000);
+    expect(core.outbox.acknowledge(message.value.messageId, core.seeded.sessionId, 1).allowed).toBe(true);
+    expect(core.outbox.get(message.value.messageId)?.status).toBe("ACKED");
   });
 });
 

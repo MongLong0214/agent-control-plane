@@ -291,6 +291,16 @@ export const IN_BAND_KIND_SQL = [...IN_BAND_KINDS]
   .join(", ");
 
 /**
+ * ACP-R1-01, ACP-R2-01 — the outward kinds whose message is never ended by a delivery window or a
+ * failed delivery attempt, only by an ACK or a recorded supersession: every actionable instruction
+ * (`IN_BAND_KINDS`), whatever its route, and a CEO notification. Their TTL is not a lifetime: the
+ * sweep does not expire them, delivery does not skip them for it, and ACK does not refuse them for it.
+ */
+const RETAINED_KIND_SQL = `${IN_BAND_KIND_SQL}, 'CEO_NOTIFICATION'`;
+const isRetainedKind = (kind: string): boolean =>
+  IN_BAND_KINDS.has(kind as MessageKind) || kind === MessageKind.CEO_NOTIFICATION;
+
+/**
  * #246 C4 — the kinds a provisioned (driven) runtime receives in band: every `IN_BAND_KINDS` kind,
  * and `HANDOFF_PACKAGE`. An activation's handoff is addressed to the PRIMARY_CTO it has already
  * bound (`bootstrap-handoff:<id>`), so unlike a switchover's its recipient *is* the role's holder; a
@@ -388,10 +398,11 @@ const hermesCanonicalRuntimeSql = (sessionExpr: string): string => `EXISTS (
  */
 const ceoCanonicalRouteSql = (alias: "o" | "outbox", canonicalAttached: boolean): string =>
   canonicalAttached ? hermesCanonicalRuntimeSql(`${alias}.target_session_id`) : "0";
-const ceoBuzzRouteSql = (alias: "o" | "outbox", canonicalAttached: boolean): string => `(
-  NOT ${ceoCanonicalRouteSql(alias, canonicalAttached)}
-  AND EXISTS (SELECT 1 FROM sessions ceo_s WHERE ceo_s.session_id = ${alias}.target_session_id
-                 AND COALESCE(ceo_s.buzz_address, '') <> '' AND COALESCE(ceo_s.buzz_actor_id, '') <> ''))`;
+const ceoBuzzSessionSql = (alias: "o" | "outbox"): string =>
+  `EXISTS (SELECT 1 FROM sessions ceo_s WHERE ceo_s.session_id = ${alias}.target_session_id
+             AND COALESCE(ceo_s.buzz_address, '') <> '' AND COALESCE(ceo_s.buzz_actor_id, '') <> '')`;
+const ceoBuzzRouteSql = (alias: "o" | "outbox", canonicalAttached: boolean): string =>
+  `(NOT ${ceoCanonicalRouteSql(alias, canonicalAttached)} AND ${ceoBuzzSessionSql(alias)})`;
 
 /** `inBandRow`, as a read of one kind and target: the same two halves, the same kind sets. */
 const deliveredInBand = (db: Pick<Db, "get">, kind: string, sessionId: string): boolean =>
@@ -491,12 +502,14 @@ const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
 
 /**
  * ACP-R1-01 — the rows the one handover policy decides: an actionable instruction (`IN_BAND_KINDS`),
- * whatever its route, queued or claimed for delivery. Never a reply a revocation held for a
+ * whatever its route, that nobody has ACKed — queued, claimed for delivery, or sent over Buzz and
+ * awaiting its ACK (at-least-once: a replaced holder may have lost it, so it is delivered again under
+ * the same message id). Never a reply a revocation held for a
  * provisioned owner's renewal and nothing has carried since, whatever else was done to it:
  * `carryHeldEscalationReplies` and the fences decide that one.
  */
 export const handoverInstructionRowSql = (alias: "o" | "outbox"): string =>
-  `(${alias}.kind IN (${IN_BAND_KIND_SQL}) AND ${alias}.status IN ('PENDING','IN_FLIGHT')
+  `(${alias}.kind IN (${IN_BAND_KIND_SQL}) AND ${alias}.status IN ('PENDING','IN_FLIGHT','SENT')
     AND NOT (${alias}.kind = '${MessageKind.ESCALATION_REPLY}'
       AND EXISTS (SELECT 1 FROM audit_events held WHERE held.kind = '${ESCALATION_REPLY_HELD}'
                    AND json_extract(held.evidence_json, '$.messageId') = ${alias}.message_id
@@ -524,7 +537,8 @@ const instructionHandoverOf = (
   row: RawOutbox,
   to: { generation: number; sessionId: string } | null,
 ): InstructionHandover => {
-  if (!IN_BAND_KINDS.has(row.kind as MessageKind) || (row.status !== "PENDING" && row.status !== "IN_FLIGHT")) {
+  if (!IN_BAND_KINDS.has(row.kind as MessageKind) ||
+      (row.status !== "PENDING" && row.status !== "IN_FLIGHT" && row.status !== "SENT")) {
     return { kind: "OUT_OF_SCOPE" };
   }
   const live = to === null ? { kind: "KEEP" as const } : { kind: "CARRY" as const };
@@ -602,11 +616,15 @@ const escalationReplyStillAnswers = (
   return from !== undefined && next !== undefined && from.project_id === next.project_id;
 };
 
-/** A kept instruction stays queued for the next holder; a delivery claim on it is released. */
+/**
+ * A kept instruction stays queued for the next holder: a delivery claim on it is released, and one
+ * sent over Buzz but never ACKed goes back to deliverable, keeping its message id.
+ */
 const keepInstruction = (db: Pick<Db, "run">, row: RawOutbox): void => {
   db.run(
-    `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL
-      WHERE message_id = ? AND status = 'IN_FLIGHT'`,
+    `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL,
+                       retry_eligible = 0, next_attempt_at = NULL, failure_class = NULL
+      WHERE message_id = ? AND status IN ('IN_FLIGHT','SENT')`,
     [row.message_id],
   );
 };
@@ -627,7 +645,7 @@ const supersedeInstruction = (
   const changed = db.run(
     `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
                        retry_eligible = 0, next_attempt_at = NULL
-      WHERE message_id = ? AND status IN ('PENDING','IN_FLIGHT')`,
+      WHERE message_id = ? AND status IN ('PENDING','IN_FLIGHT','SENT')`,
     [reasonCode, row.message_id],
   ).changes;
   if (changed !== 1) return false;
@@ -687,6 +705,17 @@ export const settleStoppedSessionInstructions = (
     ),
     "SESSION_STOPPED",
   );
+
+/**
+ * `Outbox.#readdressCeoNotifications` and the CEO half of `adoptHolderMessages`: every PENDING or
+ * SENT-but-unACKed CEO notification not addressed to the CEO's current holder is re-addressed to it
+ * and made deliverable again, keeping its message id. Parameters: generation, session, generation,
+ * session.
+ */
+const readdressCeoNotificationsSql = `UPDATE outbox SET binding_generation = ?, target_session_id = ?, status = 'PENDING',
+                              retry_eligible = 0, next_attempt_at = NULL, failure_class = NULL
+    WHERE kind = 'CEO_NOTIFICATION' AND role_key = 'CEO' AND status IN ('PENDING','SENT')
+      AND (binding_generation <> ? OR target_session_id <> ?)`;
 
 /**
  * Durable, fenced message queue (PRD §15.7, §27.5, §34.1).
@@ -833,29 +862,76 @@ export class Outbox {
   }
 
   /**
-   * A CEO notification is role mail: every PENDING one follows the role's current holder, whichever
-   * path moved the role (a bind, a takeover, a surviving runtime move or a revoke and rebind), so a
-   * route the current CEO has is the route every queued notification has.
+   * A CEO notification is role mail: every unACKed one follows the role's current holder, whichever
+   * path moved the role (a bind or adoption, a takeover, a surviving runtime move, a revoke and
+   * rebind, or a stopped runtime replaced), so a route the current CEO has is the route every
+   * unsettled notification has. One the Buzz transport accepted for a holder that has since gone
+   * (SENT, never ACKed) goes back to deliverable with its message id and is delivered to the new
+   * holder — at-least-once, deduplicated by the id (ACP-R2-01).
    */
   #readdressCeoNotifications(): void {
     const current = this.db.get<{ generation: number; session: string }>(`SELECT a.binding_generation AS generation,
       ${CURRENT_HOLDER_SESSION} AS session FROM assignments a ${HOLDER_ACTOR_JOIN}
       WHERE a.role_key = 'CEO' AND a.status = 'ACTIVE'`);
-    if (current) this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?
-      WHERE kind = 'CEO_NOTIFICATION' AND role_key = 'CEO' AND status = 'PENDING'
-        AND (binding_generation <> ? OR target_session_id <> ?)`,
-      [current.generation, current.session, current.generation, current.session]);
+    // A new target is a new route: a failure recorded against the previous one no longer holds it.
+    if (current) this.db.run(readdressCeoNotificationsSql, [current.generation, current.session, current.generation, current.session]);
+  }
+
+  /**
+   * ACP-R1-03 — a notification withheld because its live CEO has no route is never withheld
+   * silently: one `CEO_NOTIFICATION_ROUTE_UNAVAILABLE` record per message and target says so, and
+   * why — the CEO is an adopted Hermes runtime and the canonical notice transport is not attached
+   * (it signs every notice with the ACP-Hermes lane secret), or the CEO has neither that nor a Buzz
+   * room and channel identity. The row stays PENDING; the next route delivers it.
+   */
+  #recordUnroutableCeoNotifications(): void {
+    const attached = this.#ceoDelivery !== null;
+    const rows = this.db.all<{ message_id: string; target_session_id: string; role_key: string; run_id: string | null; hermes: number }>(
+      `SELECT o.message_id, o.target_session_id, o.role_key, o.run_id,
+              ${hermesCanonicalRuntimeSql("o.target_session_id")} AS hermes
+         FROM outbox o
+        WHERE o.kind = 'CEO_NOTIFICATION' AND o.status = 'PENDING' AND ${liveDeliveryTarget("o")}
+          AND NOT ${ceoCanonicalRouteSql("o", attached)} AND NOT ${ceoBuzzSessionSql("o")}
+          AND NOT EXISTS (SELECT 1 FROM audit_events e WHERE e.kind = 'CEO_NOTIFICATION_ROUTE_UNAVAILABLE'
+                            AND json_extract(e.evidence_json, '$.messageId') = o.message_id
+                            AND json_extract(e.evidence_json, '$.targetSessionId') = o.target_session_id)
+        ORDER BY o.created_at, o.rowid`,
+    );
+    for (const row of rows) {
+      this.audit.record({
+        kind: "CEO_NOTIFICATION_ROUTE_UNAVAILABLE",
+        reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+        roleKey: row.role_key,
+        sessionId: row.target_session_id,
+        runId: row.run_id,
+        evidence: {
+          messageId: row.message_id,
+          targetSessionId: row.target_session_id,
+          reason: row.hermes === 1 ? "CANONICAL_TRANSPORT_NOT_ATTACHED" : "NO_BUZZ_ROUTE",
+        },
+      });
+    }
   }
 
   deliverCeoNotifications(): Promise<void> {
     this.#ceoPending = true;
     if (this.#ceoDelivering) return this.#ceoDelivering;
-    if (!this.#ceoDelivery) return Promise.resolve();
+    if (!this.#ceoDelivery) {
+      // No canonical transport: the Buzz sweep owns every routable row; record the unroutable ones.
+      try {
+        this.#readdressCeoNotifications();
+        this.#recordUnroutableCeoNotifications();
+      } catch {
+        // A closed database records nothing; the next delivery pass records it.
+      }
+      return Promise.resolve();
+    }
     const send = this.#ceoDelivery;
-    this.#ceoDelivering = (async () => {
+    const run = (async () => {
       do {
         this.#ceoPending = false;
         this.#readdressCeoNotifications();
+        this.#recordUnroutableCeoNotifications();
         // Only the rows whose route is this transport; a Buzz-backed CEO's are the sweep's.
         const rows = this.db.all<RawOutbox>(`SELECT o.* FROM outbox o
           WHERE o.kind = 'CEO_NOTIFICATION' AND o.status = 'PENDING' AND ${liveDeliveryTarget("o")}
@@ -875,10 +951,15 @@ export class Outbox {
             evidence: { messageId: row.message_id } });
         }
       } while (this.#ceoPending);
-    })().finally(() => {
+    })();
+    // A delivery event that arrived after the loop's last look (one joined the run in flight) is
+    // served by a follow-up pass that the returned promise includes, so whoever awaits a delivery it
+    // triggered sees that delivery finished, not just the pass it happened to join.
+    const settle = (): Promise<void> => {
       this.#ceoDelivering = null;
-      if (this.#ceoPending) void this.deliverCeoNotifications();
-    });
+      return this.#ceoPending ? this.deliverCeoNotifications() : Promise.resolve();
+    };
+    this.#ceoDelivering = run.then(settle, settle);
     return this.#ceoDelivering;
   }
 
@@ -986,6 +1067,8 @@ export class Outbox {
       this.expireOverdue();
       this.reclaimStaleLeases();
       this.#readdressCeoNotifications();
+      this.#recordUnroutableCeoNotifications();
+      this.#reofferUnacknowledgedSends(now);
       const canonicalCeo = this.#ceoDelivery !== null;
 
       const rows = this.db.all<RawOutbox>(
@@ -1008,15 +1091,19 @@ export class Outbox {
             -- the CTO reads it in band (pendingInBandFor), for the same reason as the line above:
             -- nothing here may transmit what only its exact target may read.
             AND NOT ${withheldFromSweep("o")}
-            -- A CEO notification has no delivery TTL to miss: it is never expired (expireOverdue).
-            AND (o.expires_at > ? OR o.kind = 'CEO_NOTIFICATION')
+            -- An instruction or a CEO notification has no delivery TTL to miss: it is never expired
+            -- (expireOverdue) and is delivered whenever its target can be reached.
+            AND (o.expires_at > ? OR o.kind IN (${RETAINED_KIND_SQL}))
             -- A deferred retry is not deliverable until its window opens; the deferral is
             -- durable, so a restarted loop honours it instead of retrying immediately.
             AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
             -- An already-attempted row is deliverable again only while its recorded failure
             -- is retry-eligible. A queued row that carries attempts but no eligibility was
             -- never judged retryable, so it is not picked up.
-            AND (o.attempts = 0 OR o.retry_eligible = 1)
+            -- A retained kind (an instruction or a CEO notification) is also deliverable again once a
+            -- handover or a new CEO target re-armed it (no outstanding failure class): its failures
+            -- never end it (markAttemptFailed), so this is how a route change resumes it.
+            AND (o.attempts = 0 OR o.retry_eligible = 1 OR (o.kind IN (${RETAINED_KIND_SQL}) AND o.failure_class IS NULL))
             AND ${liveDeliveryTarget("o")}
           ORDER BY o.created_at, o.rowid
           LIMIT ?`,
@@ -1271,6 +1358,29 @@ export class Outbox {
     );
   }
 
+  /**
+   * ACP-R1-01, ACP-R2-01 — a retained kind whose send ended with an unknown outcome is SENT (it may
+   * have arrived); once its backoff deadline passes with no ACK it is offered again, to its live
+   * target, under the same message id. Only rows the unknown outcome marked are re-offered: a send
+   * the transport accepted waits for its ACK, and a replaced holder's is the handover's.
+   */
+  #reofferUnacknowledgedSends(now: string): void {
+    const rows = this.db.all<{ message_id: string; attempts: number; retry_backoff_ms: number; sent_at: string | null }>(
+      `SELECT o.message_id, o.attempts, o.retry_backoff_ms, o.sent_at FROM outbox o
+        WHERE o.status = 'SENT' AND o.failure_class = 'unknown_observed' AND o.kind IN (${RETAINED_KIND_SQL})
+          AND ${liveDeliveryTarget("o")}`,
+    );
+    for (const row of rows) {
+      const base = Number.isSafeInteger(row.retry_backoff_ms) && row.retry_backoff_ms > 0 ? row.retry_backoff_ms : 1000;
+      if (row.sent_at !== null && isoPlus(row.sent_at, retryDelayMs(row.attempts, base)) > now) continue;
+      this.db.run(
+        `UPDATE outbox SET status = 'PENDING', failure_class = NULL
+          WHERE message_id = ? AND status = 'SENT' AND failure_class = 'unknown_observed'`,
+        [row.message_id],
+      );
+    }
+  }
+
   /** A claim whose holder died must return to PENDING rather than stay stuck IN_FLIGHT. */
   reclaimStaleLeases(leaseMs = 5 * 60 * 1000): number {
     this.fenceUndeliverable();
@@ -1289,7 +1399,9 @@ export class Outbox {
     const changes = this.db.run(
       `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = attempts + 1,
                          claim_token = NULL, claimed_at = NULL,
-                         retry_eligible = 0, next_attempt_at = NULL
+                         retry_eligible = 0, next_attempt_at = NULL,
+                         -- A retained kind's transport accepted it: no failure is outstanding.
+                         failure_class = CASE WHEN kind IN (${RETAINED_KIND_SQL}) THEN NULL ELSE failure_class END
         WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
           AND ${liveDeliveryTarget("outbox")}`,
       [this.clock.nowIso(), messageId, claimToken],
@@ -1321,13 +1433,59 @@ export class Outbox {
       attempts: number;
       retry_max_attempts: number;
       retry_backoff_ms: number;
+      kind: string;
     }>(
-      `SELECT attempts, retry_max_attempts, retry_backoff_ms
+      `SELECT attempts, retry_max_attempts, retry_backoff_ms, kind
          FROM outbox WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?`,
       [messageId, claimToken],
     );
     if (!row) return this.staleClaim(messageId);
     const attempts = row.attempts + 1;
+    // ACP-R1-01, ACP-R2-01 — a failed attempt never ends an actionable instruction or a CEO
+    // notification: whatever the failure class and however many attempts, it goes back to PENDING.
+    // Only an ACK or a recorded supersession ends it.
+    if (isRetainedKind(row.kind)) {
+      // An unknown outcome (#451: a timed-out send may already be at the far end) is not put back in
+      // the queue: it is SENT, awaiting the holder's ACK like any other send, and offered again only
+      // if no ACK has come by its backoff deadline (`#reofferUnacknowledgedSends`) — at-least-once,
+      // deduplicated by the message id.
+      if (classified.failureClass === "unknown_observed") {
+        const sent = this.db.run(
+          `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = ?, last_error = ?, failure_class = ?,
+                             retry_eligible = 0, next_attempt_at = NULL, reason_code = NULL,
+                             claim_token = NULL, claimed_at = NULL
+            WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
+              AND ${liveDeliveryTarget("outbox")}`,
+          [this.clock.nowIso(), attempts, classified.error.slice(0, 500), classified.failureClass, messageId, claimToken],
+        ).changes;
+        if (sent !== 1) return this.staleClaim(messageId);
+        return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true });
+      }
+      // A failure whose cause can clear on its own is deferred on the backoff schedule, with no
+      // attempt budget. A contract or security refusal is kept PENDING with its failure on record
+      // and is not re-sent unchanged into the same refusal: the next handover or new CEO target
+      // re-arms it (`claimDeliverable`).
+      const deferrable = RETRYABLE_FAILURE_CLASSES.has(classified.failureClass);
+      const base = Number.isSafeInteger(row.retry_backoff_ms) && row.retry_backoff_ms > 0 ? row.retry_backoff_ms : 1000;
+      const retainedNext = deferrable ? isoPlus(this.clock.nowIso(), retryDelayMs(attempts, base)) : null;
+      const kept = this.db.run(
+        `UPDATE outbox SET status = 'PENDING', attempts = ?, last_error = ?, failure_class = ?,
+                           retry_eligible = ?, next_attempt_at = ?, reason_code = NULL,
+                           claim_token = NULL, claimed_at = NULL
+          WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
+            AND ${liveDeliveryTarget("outbox")}`,
+        [attempts, classified.error.slice(0, 500), classified.failureClass, deferrable ? 1 : 0, retainedNext,
+          messageId, claimToken],
+      ).changes;
+      if (kept !== 1) return this.staleClaim(messageId);
+      return allow(ReasonCode.OK, undefined, {
+        messageId,
+        failureClass: classified.failureClass,
+        attempts,
+        nextAttemptAt: retainedNext,
+        retained: true,
+      });
+    }
     const retryPolicyIsValid =
       Number.isSafeInteger(row.retry_max_attempts) &&
       row.retry_max_attempts >= 0 &&
@@ -1451,9 +1609,12 @@ export class Outbox {
     // §15.7 / §34.4 — matching the stored envelope is not enough. A late ACK from a
     // generation that has since been revoked is audit-only, as is an ACK for a message
     // that has expired or was already rejected.
+    // The role's current holder is its actor's runtime (`CURRENT_HOLDER_SESSION`), the one delivery
+    // addresses: after a surviving runtime move the binding's own session is gone.
     const current = this.db.get<{ binding_generation: number; session_id: string }>(
-      `SELECT a.binding_generation, a.session_id FROM assignments a
-        JOIN sessions s ON s.session_id = a.session_id
+      `SELECT a.binding_generation, ${CURRENT_HOLDER_SESSION} AS session_id FROM assignments a
+        ${HOLDER_ACTOR_JOIN}
+        JOIN sessions s ON s.session_id = ${CURRENT_HOLDER_SESSION}
         WHERE a.role_key = ? AND a.status = 'ACTIVE' AND s.lifecycle IN ('READY','DRAINING')`,
       [row.role_key],
     );
@@ -1461,7 +1622,9 @@ export class Outbox {
       !current ||
       current.binding_generation !== generation ||
       current.session_id !== fromSessionId;
-    const expired = row.status === "EXPIRED" || row.expires_at <= this.clock.nowIso();
+    // Delivery and ACK agree on lifetime: a kind delivery never skips for its TTL is acknowledged past
+    // it too (ACP-R2-01).
+    const expired = row.status === "EXPIRED" || (!isRetainedKind(row.kind) && row.expires_at <= this.clock.nowIso());
     const ineligible =
       row.status === "REJECTED" ||
       expired ||
@@ -1784,10 +1947,17 @@ export class Outbox {
    * requires the exact current holder; a crash before ACK preserves the original message ID.
    */
   adoptHolderMessages(roleKey: string, generation: number, sessionId: string, deferCanonicalPeers = false): void {
+    // A CEO notification SENT to the previous holder and never ACKed is delivered again to this one.
+    if (roleKey === "CEO") this.db.run(readdressCeoNotificationsSql, [generation, sessionId, generation, sessionId]);
     this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
       WHERE role_key = ? AND kind IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION') AND status IN ('PENDING','SENT')
         AND (? = 0 OR kind <> 'PEER_MESSAGE')`,
       [generation, sessionId, ReasonCode.OUTBOX_RETARGETED, roleKey, deferCanonicalPeers ? 1 : 0]);
+    // A CEO notification adopted by a new holder has a new route: a failure recorded against the
+    // previous target no longer holds it back (ACP-R2-01).
+    this.db.run(`UPDATE outbox SET retry_eligible = 0, next_attempt_at = NULL, failure_class = NULL
+      WHERE role_key = ? AND kind = 'CEO_NOTIFICATION' AND status = 'PENDING' AND target_session_id = ?
+        AND binding_generation = ? AND failure_class IS NOT NULL`, [roleKey, sessionId, generation]);
     // ACP-R1-01: the instructions a revoke or a stopped holder kept for this role are handed to the
     // new holder under the one handover policy. A reply held for a provisioned owner's renewal stays
     // the renewal's (`carryHeldEscalationReplies`).
@@ -1848,7 +2018,7 @@ export class Outbox {
       `SELECT * FROM outbox WHERE role_key = ? AND binding_generation = ?
         AND (
           status IN ('PENDING','IN_FLIGHT')
-          OR (status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL}))
+          OR (status = 'SENT' AND kind IN (${HOLDER_CLAIMED_KIND_SQL}, ${IN_BAND_KIND_SQL}))
         )`,
       [roleKey, fromGeneration],
     );
@@ -2359,10 +2529,11 @@ export class Outbox {
     const window = isoPlus(now, DEFAULT_TTL_MS);
     const moved = this.db.run(
       `UPDATE outbox SET binding_generation = ?, target_session_id = ?, status = 'PENDING',
-                         claim_token = NULL, claimed_at = NULL,
+                         claim_token = NULL, claimed_at = NULL, retry_eligible = 0, next_attempt_at = NULL,
+                         failure_class = NULL,
                          reason_code = CASE WHEN binding_generation = ? THEN reason_code ELSE ? END,
                          expires_at = CASE WHEN ? = 1 OR expires_at > ? THEN expires_at ELSE ? END
-        WHERE message_id = ? AND status IN ('PENDING','IN_FLIGHT')`,
+        WHERE message_id = ? AND status IN ('PENDING','IN_FLIGHT','SENT')`,
       [to.generation, to.sessionId, to.generation, ReasonCode.OUTBOX_RETARGETED, inBand ? 1 : 0, now, window, row.message_id],
     ).changes;
     if (moved !== 1) return false;
@@ -2907,11 +3078,10 @@ export class Outbox {
       `UPDATE outbox SET status = 'EXPIRED', reason_code = ?,
                          retry_eligible = 0, next_attempt_at = NULL
         WHERE status IN ('PENDING','IN_FLIGHT')
-          AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION')
+          -- An actionable instruction and a CEO notification end only by ACK or a recorded
+          -- supersession, never by a delivery window (ACP-R1-01, ACP-R2-01).
+          AND kind NOT IN (${HOLDER_CLAIMED_KIND_SQL}, ${RETAINED_KIND_SQL})
           AND NOT ${inBandRow("outbox")}
-          -- An instruction whose target nobody holds is waiting for a holder, not being delivered:
-          -- the handover policy keeps it for the next one (ACP-R1-01).
-          AND NOT (${handoverInstructionRowSql("outbox")} AND NOT ${liveDeliveryTarget("outbox")})
           AND expires_at <= ?`,
       [ReasonCode.OUTBOX_EXPIRED, this.clock.nowIso()],
     );

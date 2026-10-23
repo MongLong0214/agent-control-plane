@@ -1647,25 +1647,16 @@ export const createBuzzMessageIngress = (
           }
         : null;
     },
-    // ACP-R1-04 — the role's history in this room, from registry rows only. Every generation of the
-    // role whose bound runtime answers on the room counts from its creation, revoked ones included,
-    // so unread same-room mail survives generation changes (#5). A current runtime that moved into
-    // the room within its generation counts no earlier than that runtime's own creation. A room the
-    // role never answered on has no history here, however long the role answered elsewhere.
+    // ACP-R1-04 — the role's own membership history in this room (`role_room_memberships`): its
+    // first join there, recorded when a binding, a runtime move or an address change put its runtime
+    // on the room. Never a session's current address or the current runtime pointer read now, so
+    // moving into a room does not backdate the role's history there, a later runtime in the same
+    // room keeps the first join, and unread same-room mail survives generation changes (#5).
     recipientHistorySince: (roleKey, conversation) =>
-      cp.db.get<{ since: string | null }>(
-        `SELECT MIN(since) AS since FROM (
-           SELECT a.created_at AS since
-             FROM assignments a JOIN sessions s ON s.session_id = a.session_id
-            WHERE a.role_key = ? AND s.buzz_address = ?
-           UNION ALL
-           SELECT MAX(a.created_at, s.created_at) AS since
-             FROM assignments a
-             JOIN conversational_actors c ON c.actor_id = a.actor_id
-             JOIN sessions s ON s.session_id = c.current_session_id
-            WHERE a.role_key = ? AND a.status = 'ACTIVE' AND s.buzz_address = ?)`,
-        [roleKey, conversation, roleKey, conversation],
-      )?.since ?? null,
+      cp.db.get<{ joined_at: string }>(
+        "SELECT joined_at FROM role_room_memberships WHERE role_key = ? AND conversation = ?",
+        [roleKey, conversation],
+      )?.joined_at ?? null,
     existingRoleMessage: (input) => {
       const row = cp.db.get<{ message_id: string }>(`SELECT message_id FROM outbox
         WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE')
@@ -2734,6 +2725,36 @@ export const createCeoNotificationSender = (resolveTarget: DaemonNoticeTargetRes
     }
     return allow(ReasonCode.OK, undefined);
   };
+
+/**
+ * ACP-R1-03 — attaches the canonical notice transport for CEO notifications from what that transport
+ * actually needs, and nothing else: the pinned Hermes CEO target (the `ACP_HERMES_*` adoption
+ * configuration, whose Gateway API key authenticates the channel) and the ACP-Hermes lane secret,
+ * from which every `acp-daemon-notice/v1` body's HMAC key is derived — the Hermes side verifies that
+ * signature with its own copy of the secret, so no notice can be authenticated without it. Whether the
+ * Telegram external consumer is enabled is not asked: the lane secret is the ACP-Hermes secret, read
+ * directly. Attaching drains what is queued, and every CEO adoption (`adoptHolderMessages`) and active
+ * CEO binding switch drains again. Not started, it says exactly why; the outbox then records each
+ * notification withheld for want of a route (`CEO_NOTIFICATION_ROUTE_UNAVAILABLE`).
+ */
+export const startConfiguredCeoNotificationRoute = (
+  cp: ControlPlane,
+  options: {
+    environment: Readonly<Record<string, string | undefined>>;
+    hermesConfiguration: Readonly<Record<string, string | undefined>>;
+    ports?: HermesCeoPinPorts & { noticeSenderFactory?: typeof createHermesGatewayDaemonNoticeSender };
+  },
+): { started: true } | { started: false; reason: string } => {
+  const target = createConfiguredHermesGatewayDaemonNoticeTarget(cp, options.hermesConfiguration, options.ports ?? {});
+  if (!target) return { started: false, reason: "no Hermes adoption configuration" };
+  const laneSecret = options.environment["ACP_TELEGRAM_EXTERNAL_SECRET"]?.trim();
+  if (!laneSecret) return { started: false, reason: "ACP_TELEGRAM_EXTERNAL_SECRET is not configured" };
+  cp.outbox.attachCeoNotificationDelivery(createCeoNotificationSender(target, laneSecret));
+  cp.bindings.onSwitch((binding) => {
+    if (binding.role === Role.CEO && binding.status === "ACTIVE") void cp.outbox.deliverCeoNotifications();
+  });
+  return { started: true };
+};
 
 /** The daemon's notice delivery loop, as the composition holds it. */
 export interface DaemonPeerMessageNoticeDelivery {
@@ -5608,22 +5629,15 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       laneSecret: telegramExternalConfig?.sharedSecret ?? null,
       ports: { authorityHeld: () => daemon.lock.held() },
     });
-    const ceoTarget = createConfiguredHermesGatewayDaemonNoticeTarget(cp, hermesAdoptionConfiguration,
-      { authorityHeld: () => daemon.lock.held() });
-    // ACP-R1-03: the canonical transport is an adopted Hermes CEO's route. Without it, a Buzz-backed
-    // CEO keeps its Buzz route through the delivery sweep, and an adopted Hermes CEO with no Buzz
-    // route has its notifications withheld PENDING until a route exists — never rejected.
-    if (ceoTarget && telegramExternalConfig?.sharedSecret) {
-      cp.outbox.attachCeoNotificationDelivery(createCeoNotificationSender(ceoTarget, telegramExternalConfig.sharedSecret));
-      cp.bindings.onSwitch((binding) => {
-        if (binding.role === Role.CEO && binding.status === "ACTIVE") void cp.outbox.deliverCeoNotifications();
-      });
-      process.stdout.write("CEO notification canonical route started\n");
-    } else {
-      process.stdout.write(`CEO notification canonical route not started: ${ceoTarget
-        ? "ACP_TELEGRAM_EXTERNAL_SECRET is not configured"
-        : "no Hermes adoption configuration"}; CEO notifications use the CEO's Buzz route when it has one\n`);
-    }
+    const ceoRoute = startConfiguredCeoNotificationRoute(cp, {
+      environment: process.env,
+      hermesConfiguration: hermesAdoptionConfiguration,
+      ports: { authorityHeld: () => daemon.lock.held() },
+    });
+    process.stdout.write(ceoRoute.started
+      ? "CEO notification canonical route started\n"
+      : `CEO notification canonical route not started: ${ceoRoute.reason}; CEO notifications use the CEO's Buzz route ` +
+        "when it has one, and are otherwise withheld PENDING and recorded as CEO_NOTIFICATION_ROUTE_UNAVAILABLE\n");
     peerMessageNotices = notices.delivery;
     process.stdout.write(notices.delivery !== null
       ? "peer-message notice delivery started\n"

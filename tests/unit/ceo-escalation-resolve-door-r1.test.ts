@@ -360,16 +360,16 @@ describe("ESC-03: a PENDING ESCALATION_REPLY follows every takeover, to the run'
     });
   });
 
-  it("not carried once SENT", async () => {
+  // ACP-R1-01: sent but never ACKed, the reply may have died with the replaced holder, so it goes
+  // back to deliverable and follows the takeover with its id (at-least-once).
+  it("carried, back to deliverable, once SENT without an ACK", async () => {
     await withBootstrapRuntime(async (f) => {
       const { runId, reply } = await resolvedWithPendingReply(f);
       f.harness.cp.db.run("UPDATE outbox SET status = 'SENT' WHERE message_id = ?", [reply.messageId]);
       const successor = replacementSession(f);
       expect(takeover(f, runId, successor)).toMatchObject({ allowed: true });
-      const row = f.harness.cp.outbox.get(reply.messageId)!;
-      expect(row.targetSessionId).toBe(reply.targetSessionId);
-      expect(row.bindingGeneration).toBe(1);
-      expect(carries(f, reply.messageId)).toEqual([]);
+      expect(f.harness.cp.outbox.get(reply.messageId)).toMatchObject({ status: "PENDING", targetSessionId: successor, bindingGeneration: 2 });
+      expect(carries(f, reply.messageId)).toHaveLength(1);
     });
   });
 

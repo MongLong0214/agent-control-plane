@@ -3993,13 +3993,16 @@ const v50: SchemaMigration = {
   checksum: () => migrationChecksum("v50-post-merge-verification-reentry", 50),
 };
 
-/** v51 separates shared signed events from recipient delivery and preserves terminal message IDs. */
+/**
+ * v51 separates shared signed events from recipient delivery, preserves terminal message IDs, and
+ * records each role's room membership history (ACP-R1-04).
+ */
 const v51: SchemaMigration = {
   id: "v51-durable-recipient-delivery",
   fromVersion: 50,
   toVersion: 51,
   apply(raw) {
-    const tableNames = ["buzz_events", "holder_message_terminals"];
+    const tableNames = ["buzz_events", "holder_message_terminals", "role_room_memberships"];
     const objects: StepObject[] = tableNames.map((name) => ({ type: "table", name, table: name,
       ddl: schemaObject(new RegExp(String.raw`CREATE TABLE IF NOT EXISTS ${name} \([\s\S]*?\n\) WITHOUT ROWID;`), name, 51) }));
     objects.push(...stepTriggerObjects(51, ["buzz_events_no_replace", "buzz_events_immutable", "buzz_events_no_delete", "outbox_holder_message_terminal", "holder_message_terminals_immutable", "holder_message_terminals_no_delete", "holder_message_terminals_no_replace"]));
@@ -4009,6 +4012,20 @@ const v51: SchemaMigration = {
     raw.exec("-- Durable Buzz events" + ddl);
     raw.exec(`INSERT OR IGNORE INTO holder_message_terminals (message_id)
       SELECT message_id FROM outbox WHERE status IN ('ACKED','REJECTED','EXPIRED')`);
+    // Room membership before this step was never recorded. The best evidence a v50 database holds is
+    // each generation's creation on its bound runtime's room, and a current runtime that moved into a
+    // room counting no earlier than its own creation: earliest per role and room.
+    raw.exec(`INSERT OR IGNORE INTO role_room_memberships (role_key, conversation, joined_at, session_id)
+      SELECT role_key, conversation, MIN(joined_at), session_id FROM (
+        SELECT a.role_key AS role_key, s.buzz_address AS conversation, a.created_at AS joined_at, s.session_id AS session_id
+          FROM assignments a JOIN sessions s ON s.session_id = a.session_id
+         WHERE COALESCE(s.buzz_address, '') <> ''
+        UNION ALL
+        SELECT a.role_key, s.buzz_address, MAX(a.created_at, s.created_at), s.session_id
+          FROM assignments a JOIN conversational_actors c ON c.actor_id = a.actor_id
+          JOIN sessions s ON s.session_id = c.current_session_id
+         WHERE a.status = 'ACTIVE' AND COALESCE(s.buzz_address, '') <> '')
+       GROUP BY role_key, conversation`);
     assertStepNames(raw, 51, objects, "after");
     // Revive delivery-window disposal, never an explicit rejection/supersession.
     raw.exec(`UPDATE outbox SET status = 'PENDING', retry_eligible = 0, next_attempt_at = NULL,

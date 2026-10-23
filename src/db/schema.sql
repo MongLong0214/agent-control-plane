@@ -4092,3 +4092,19 @@ WHEN EXISTS (SELECT 1 FROM holder_message_terminals WHERE message_id = NEW.messa
 BEGIN
   SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
 END;
+
+-- ---------------------------------------------------------------------------
+-- ACP-R1-04 — each role's own membership history per Buzz room (schema v51).
+-- When a role first became a recipient in a room: written when a binding, a runtime move or an
+-- address change puts the role's current runtime on that room, and never moved earlier. Historical
+-- suppression of retained room traffic is judged against this record alone — not against a
+-- session's current, mutable address or the role's current runtime pointer — and it is separate from
+-- delivery and ACK state.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS role_room_memberships (
+  role_key     TEXT NOT NULL,
+  conversation TEXT NOT NULL,
+  joined_at    TEXT NOT NULL,
+  session_id   TEXT NOT NULL,
+  PRIMARY KEY (role_key, conversation)
+) WITHOUT ROWID;

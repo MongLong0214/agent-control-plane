@@ -858,11 +858,36 @@ export class SessionRegistry {
   }
 
   setBuzzAddress(sessionId: string, address: string | null): void {
-    this.db.run(`UPDATE sessions SET buzz_address = ?, updated_at = ? WHERE session_id = ?`, [
-      address,
-      this.clock.nowIso(),
-      sessionId,
-    ]);
+    this.db.tx(() => {
+      this.db.run(`UPDATE sessions SET buzz_address = ?, updated_at = ? WHERE session_id = ?`, [
+        address,
+        this.clock.nowIso(),
+        sessionId,
+      ]);
+      // ACP-R1-04: a role whose current runtime this is joins the new room now, not when the
+      // session was created or bound.
+      this.recordRoomMembership(sessionId);
+    });
+  }
+
+  /**
+   * ACP-R1-04 — records, for every ACTIVE role whose current runtime is `sessionId` (the actor's
+   * runtime pointer, else the binding's own session), that the role is a recipient in that runtime's
+   * Buzz room from now on, unless the role already joined that room earlier. The first join stands:
+   * a later runtime move, address change or generation never moves it, and leaving a room does not
+   * erase it. Called in the transaction that put the runtime there — a binding, a runtime move or an
+   * address change. Writes nothing for a runtime with no room.
+   */
+  recordRoomMembership(sessionId: string): void {
+    this.db.run(
+      `INSERT OR IGNORE INTO role_room_memberships (role_key, conversation, joined_at, session_id)
+        SELECT a.role_key, s.buzz_address, ?, s.session_id
+          FROM assignments a
+          LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+          JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
+         WHERE a.status = 'ACTIVE' AND s.session_id = ? AND COALESCE(s.buzz_address, '') <> ''`,
+      [this.clock.nowIso(), sessionId],
+    );
   }
 
   /** PRD §9.3 — BUSY is computed, not stored. */

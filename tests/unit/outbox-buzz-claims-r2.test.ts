@@ -23,6 +23,7 @@ const enqueue = (
   seeded: ReturnType<typeof seedRun>,
   key = `outbox:${crypto.randomUUID()}`,
   ttlMs?: number,
+  kind: MessageKind = MessageKind.RUN_DISPATCH,
 ) =>
   core.outbox.enqueue({
     idempotencyKey: key,
@@ -30,7 +31,7 @@ const enqueue = (
     bindingGeneration: seeded.generation,
     targetSessionId: seeded.sessionId,
     runId: seeded.runId,
-    kind: MessageKind.RUN_DISPATCH,
+    kind,
     payload: { runId: seeded.runId },
     ttlMs,
   });
@@ -145,6 +146,23 @@ describe("round-2 outbox fencing", () => {
     expect(core.outbox.claimDeliverable().map((m) => [m.messageId, m.targetSessionId])).toEqual([
       [claimed.messageId, successor.sessionId],
     ]);
+  });
+
+  it("ACP-R1-01 keeps an actionable instruction a non-retryable delivery refused, with its classification, until it is re-armed", () => {
+    const { core, seeded } = seededCore();
+    const message = enqueue(core, seeded, "outbox:retained-refusal");
+    if (!message.allowed) throw new Error(message.message);
+    const claimed = core.outbox.claimDeliverable()[0]!;
+    expect(core.outbox.markAttemptFailed(claimed.messageId, claimed.claimToken, {
+      failureClass: "contract", retryable: false, error: "target address is invalid",
+    }).allowed).toBe(true);
+    expect(core.db.get<{ status: string; failure_class: string; retry_eligible: number }>(
+      "SELECT status, failure_class, retry_eligible FROM outbox WHERE message_id = ?", [claimed.messageId],
+    )).toEqual({ status: "PENDING", failure_class: "contract", retry_eligible: 0 });
+    // Not re-sent unchanged into the same refusal.
+    core.clock.advance(60 * 60 * 1000);
+    expect(core.outbox.claimDeliverable()).toHaveLength(0);
+    expect(core.outbox.get(claimed.messageId)?.status).toBe("PENDING");
   });
 
   it("#49 rejects an enqueue addressed to a session that does not hold the role", () => {
@@ -304,9 +322,11 @@ describe("round-2 outbox fencing", () => {
     expect(core.outbox.claimDeliverable()[0]?.targetSessionId).toBe(successor.sessionId);
   });
 
+  // ACP-R1-01: an actionable instruction is never ended by a failed attempt; this is the rule for
+  // every other outward kind, so the row here is one of those.
   it("#51 terminally rejects a non-retryable delivery with its durable classification", () => {
     const { core, seeded } = seededCore();
-    const message = enqueue(core, seeded, "outbox:permanent-failure");
+    const message = enqueue(core, seeded, "outbox:permanent-failure", undefined, MessageKind.REVIEW_REQUEST);
     expect(message.allowed).toBe(true);
     if (!message.allowed) return;
     const claimed = core.outbox.claimDeliverable()[0]!;
@@ -342,7 +362,7 @@ describe("round-2 outbox fencing", () => {
 
   it("#174 defers only retryable failures, then terminates at the bounded attempt policy", () => {
     const { core, seeded } = seededCore();
-    const retryMessage = enqueue(core, seeded, "outbox:bounded-retry", 3 * 60 * 60 * 1000);
+    const retryMessage = enqueue(core, seeded, "outbox:bounded-retry", 3 * 60 * 60 * 1000, MessageKind.REVIEW_REQUEST);
     expect(retryMessage.allowed).toBe(true);
     if (!retryMessage.allowed) return;
     core.db.run(
@@ -410,7 +430,7 @@ describe("round-2 outbox fencing", () => {
       reason_code: ReasonCode.OUTBOX_DELIVERY_REJECTED,
     });
 
-    const zeroBackoff = enqueue(core, seeded, "outbox:zero-backoff");
+    const zeroBackoff = enqueue(core, seeded, "outbox:zero-backoff", undefined, MessageKind.REVIEW_REQUEST);
     expect(zeroBackoff.allowed).toBe(true);
     if (!zeroBackoff.allowed) return;
     core.db.run(`UPDATE outbox SET retry_backoff_ms = 0 WHERE message_id = ?`, [

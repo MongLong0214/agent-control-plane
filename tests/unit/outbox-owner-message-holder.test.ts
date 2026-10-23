@@ -518,7 +518,11 @@ describe("an owner-message is taken by its exact holder, and by nothing else", (
   it("never expires a queued owner-message, and still hands it over after its nominal TTL", () => {
     const { core, seeded } = seededCore();
     const owner = enqueueOwnerMessage(core, seeded, "still queued an hour later");
-    const dispatch = enqueueDispatch(core, seeded);
+    // The control is an outward kind with a delivery window; an actionable instruction has none
+    // (ACP-R1-01), so it is not the control any more.
+    const dispatch = core.outbox.enqueue({ idempotencyKey: `review:${crypto.randomUUID()}`, roleKey: seeded.roleKey,
+      bindingGeneration: seeded.generation, targetSessionId: seeded.sessionId, runId: seeded.runId,
+      kind: MessageKind.REVIEW_REQUEST, payload: { runId: seeded.runId } });
     expect(owner.allowed && dispatch.allowed).toBe(true);
     if (!owner.allowed || !dispatch.allowed) return;
 
