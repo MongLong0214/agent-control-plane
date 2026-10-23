@@ -1654,11 +1654,34 @@ export const createBuzzMessageIngress = (
     // on the room. Never a session's current address or the current runtime pointer read now, so
     // moving into a room does not backdate the role's history there, a later runtime in the same
     // room keeps the first join, and unread same-room mail survives generation changes (#5).
-    recipientHistorySince: (roleKey, conversation) =>
-      cp.db.get<{ joined_at: string }>(
-        "SELECT joined_at FROM role_room_memberships WHERE role_key = ? AND conversation = ?",
+    //
+    // CEO decision 5f6ab731 (c): a room v51 anchored (`role_room_history_unknown`) admits mail signed
+    // before the migration — the deploy's stop window — only on that anchor's own authority: while the
+    // role's binding generation, runtime session and room are still exactly the anchored ones. Once any
+    // of them changes, the floor there is the migration itself, and such mail is refused (and recorded).
+    recipientHistorySince: (roleKey, conversation) => {
+      const row = cp.db.get<{
+        joined_at: string; unknown_before: string | null; anchored_room: string | null; anchored_generation: number | null;
+        anchored_session: string | null; current_generation: number | null; current_session: string | null; current_room: string | null;
+      }>(
+        `SELECT m.joined_at, u.unknown_before, u.room AS anchored_room, u.binding_generation AS anchored_generation,
+                u.session_id AS anchored_session, a.binding_generation AS current_generation,
+                s.session_id AS current_session, s.buzz_address AS current_room
+           FROM role_room_memberships m
+           LEFT JOIN role_room_history_unknown u ON u.role_key = m.role_key
+           LEFT JOIN assignments a ON a.role_key = m.role_key AND a.status = 'ACTIVE'
+           LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+           LEFT JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
+          WHERE m.role_key = ? AND m.conversation = ?`,
         [roleKey, conversation],
-      )?.joined_at ?? null,
+      );
+      if (!row) return null;
+      if (row.unknown_before === null) return row.joined_at;
+      const anchorHolds = row.anchored_room === conversation && row.current_room === conversation &&
+        row.anchored_generation !== null && row.anchored_generation === row.current_generation &&
+        row.anchored_session !== null && row.anchored_session === row.current_session;
+      return anchorHolds || Date.parse(row.joined_at) >= Date.parse(row.unknown_before) ? row.joined_at : row.unknown_before;
+    },
     existingRoleMessage: (input) => {
       const row = cp.db.get<{ message_id: string }>(`SELECT message_id FROM outbox
         WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE')

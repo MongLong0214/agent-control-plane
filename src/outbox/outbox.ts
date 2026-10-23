@@ -1549,6 +1549,13 @@ export class Outbox {
     failure: DeliveryFailure | string,
   ): Decision<void> {
     const classified = normalizeFailure(failure);
+    // FCR-10: an attempt whose outcome is unknown may have landed where it was addressed, whether or
+    // not this claim is still held (a handover may have taken the row while the send was pending):
+    // that evidence is written first, as an accepted send's is (`recordAcceptedSend`), so no later
+    // attempt sends to the same room and recipient again.
+    if (classified.failureClass === "unknown_observed" && typeof failure === "object" && failure.destination) {
+      recordSentDestination(this.db, messageId, failure.destination, "UNKNOWN", this.clock.nowIso());
+    }
     const row = this.db.get<{
       attempts: number;
       retry_max_attempts: number;
@@ -1570,22 +1577,14 @@ export class Outbox {
       // and no receipt lookup, so the row is SENT, flagged `unknown_observed`, awaiting the holder's
       // ACK. Only a handover to a new receiver delivers it again (`HANDED_TO_NEW_RECEIVER_SQL`).
       if (classified.failureClass === "unknown_observed") {
-        // The flag and where the send was addressed are written together (FCR-08).
-        const sent = this.db.tx(() => {
-          const changed = this.db.run(
-            `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = ?, last_error = ?, failure_class = ?,
-                               retry_eligible = 0, next_attempt_at = NULL, reason_code = NULL,
-                               claim_token = NULL, claimed_at = NULL
-              WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
-                AND ${liveDeliveryTarget("outbox")}`,
-            [this.clock.nowIso(), attempts, classified.error.slice(0, 500), classified.failureClass, messageId, claimToken],
-          ).changes;
-          // Where the send was addressed is evidence whether or not this claim is still held.
-          if (typeof failure === "object" && failure.destination) {
-            recordSentDestination(this.db, messageId, failure.destination, "UNKNOWN", this.clock.nowIso());
-          }
-          return changed;
-        });
+        const sent = this.db.run(
+          `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = ?, last_error = ?, failure_class = ?,
+                             retry_eligible = 0, next_attempt_at = NULL, reason_code = NULL,
+                             claim_token = NULL, claimed_at = NULL
+            WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
+              AND ${liveDeliveryTarget("outbox")}`,
+          [this.clock.nowIso(), attempts, classified.error.slice(0, 500), classified.failureClass, messageId, claimToken],
+        ).changes;
         if (sent !== 1) return this.staleClaim(messageId);
         return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true });
       }

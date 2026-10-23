@@ -1,11 +1,12 @@
 import Database from "better-sqlite3";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import { approveMigration } from "../../src/db/migration-approval.ts";
 import { MIGRATIONS } from "../../src/db/migrations.ts";
+import { main as stateAdmin } from "../../src/db/state-admin.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { laterObjectsIn, releasedChainImage } from "../helpers/released-chain-image.ts";
 import { privateStatePath, schemaRowsOf, userVersionOf, type SchemaRow } from "../helpers/released-v44-schema.ts";
@@ -13,8 +14,8 @@ import { contentDigests } from "../helpers/released-v45-schema.ts";
 
 afterAll(cleanupTempDirs);
 
-/** v51's receipt as the build before its freeze computed it, from schema.sql at 7f5ce1c3. */
-const V51_CHECKSUM = "sha256:e2477d390a7bc1355748083904b1da15d9207a4fa7bd64d07840e6fa3b969798";
+/** v51's receipt as the build before its freeze computed it, from schema.sql at bb09529f. */
+const V51_CHECKSUM = "sha256:3128001ba4f5691612e4f674295fcea8b074b59a57f5c8f9b180471c89ecc1aa";
 
 /** What v51 installs, named here rather than read from the code under test. */
 const V51_OBJECTS = [
@@ -65,6 +66,31 @@ describe("v52 follows v51", () => {
     for (const name of V51_OBJECTS) expect(frozen, name).toContain(`IF NOT EXISTS ${name}`);
     for (const name of V52_ADDED) expect(frozen, name).not.toContain(name);
     expect(frozen).not.toContain("-- v52:");
+  });
+
+  it("plans a v50 database's start through v51 and v52 and lists v51's anchor fallbacks for the deployment", async () => {
+    const path = releasedChainImage(privateStatePath("acp-v52-plan-from-v50-"), 50);
+    seedV50(path);
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      expect(await stateAdmin(["migration-plan", "--database", path])).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
+    const plan = JSON.parse(writes.join("")) as Record<string, unknown>;
+    expect(plan).toMatchObject({
+      onDiskVersion: 50,
+      buildVersion: 52,
+      plan: { fromVersion: 50, toVersion: 52, migrations: ["v51-durable-recipient-delivery", "v52-resident-project-provisioning"] },
+    });
+    // The field the deployment refuses on is present across the whole 50 → 52 span, and empty here.
+    expect(plan).toHaveProperty("v51AnchorFallback");
+    expect(plan["v51AnchorFallback"]).toEqual([]);
+    expect(userVersionOf(path)).toBe(50);
   });
 
   it("upgrades a v50 database through v51 and v52, keeping every row and every v51 object exactly once", () => {

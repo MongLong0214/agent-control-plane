@@ -53,13 +53,13 @@ export const RECEIPT_BYTES_SHA256 =
  * `src/db/schema-v48.sql` is likewise `git show c65e73b2:src/db/schema.sql`, byte-identical to v48's squash
  * merge ab136549 and to 206d8bfe (#512 S-PUSH, CEO 3d0daed0), and carries that file's git blob id.
  *
- * `src/db/schema-v51.sql` is likewise `git show 7f5ce1c3:src/db/schema.sql` (v51's focused review 2 head, frozen as
+ * `src/db/schema-v51.sql` is likewise `git show bb09529f:src/db/schema.sql` (v51's focused review 3 head, frozen as
  * v52's prerequisite), and carries that file's git blob id.
  */
 export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob?: string }> = [
   {
     path: "src/db/migrations.ts",
-    sha256: "e182772aa496ce9074d066b9384cbefc9c1a21319a580cd1e0c3d27b34cccb59",
+    sha256: "1f35469a281610e6f3101bd2f8b07778a56db66da82af06b735e56ac61194794",
   },
   {
     path: "src/db/schema-v37.sql",
@@ -100,8 +100,8 @@ export const FROZEN_BLOBS: ReadonlyArray<{ path: string; sha256: string; gitBlob
   },
   {
     path: "src/db/schema-v51.sql",
-    sha256: "16f05b7b1ea00d20e197b41e69add9fc8752ba0b851f3bce247757be80b6330c",
-    gitBlob: "af850a84b6f7aecf2dd01c2e2163cab62e0053a6",
+    sha256: "fdb7318136b6d524dc59d4713ccadac34a6bc491e6aac0549c3613731fa91098",
+    gitBlob: "07eee579e3a75a08a0c6226d1bf76def5fa007a7",
   },
   {
     path: "tests/fixtures/schema-v13.sql",

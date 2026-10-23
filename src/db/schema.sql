@@ -4121,15 +4121,21 @@ CREATE TABLE IF NOT EXISTS role_room_memberships (
 -- the migration: everything the role was addressed before `unknown_before` (the migration's own time)
 -- is unknown, because v50 kept no record that proves it, and v51 inferred none. `room` and
 -- `known_since` name the room the role's current binding is anchored in and since when, when it has
--- one; `anchor_json` is what that anchor rests on. Written once by the v51 step; the daemon records
--- every mention it refuses for the role that was signed before `unknown_before`.
+-- one, and `binding_generation` and `session_id` the anchored binding and runtime: mail signed before
+-- `unknown_before` is admitted only while the role's binding, runtime and room are still exactly these.
+-- `anchor_fallback` names why a role could be anchored only at the migration itself (its stop-window
+-- mail is refused); `anchor_json` is what the anchor rests on. Written once by the v51 step; the
+-- daemon records every mention it refuses for the role that was signed before `unknown_before`.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS role_room_history_unknown (
-  role_key       TEXT PRIMARY KEY NOT NULL,
-  unknown_before TEXT NOT NULL,
-  room           TEXT,
-  known_since    TEXT,
-  anchor_json    TEXT NOT NULL CHECK (json_valid(anchor_json))
+  role_key           TEXT PRIMARY KEY NOT NULL,
+  unknown_before     TEXT NOT NULL,
+  room               TEXT,
+  known_since        TEXT,
+  binding_generation INTEGER,
+  session_id         TEXT,
+  anchor_fallback    TEXT CHECK (anchor_fallback IS NULL OR anchor_fallback IN ('RUNTIME_MOVE_UNRECORDED')),
+  anchor_json        TEXT NOT NULL CHECK (json_valid(anchor_json))
 ) WITHOUT ROWID;
 
 -- ---------------------------------------------------------------------------

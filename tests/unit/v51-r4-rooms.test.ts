@@ -45,7 +45,10 @@ const PROJECT = "room-history";
 
 type Harness = ReturnType<typeof makeHarness>;
 /** A `role_room_history_unknown` row, as v51 writes it. */
-interface UnknownHistory { role_key: string; unknown_before: string; room: string | null; known_since: string | null; anchor_json: string }
+interface UnknownHistory {
+  role_key: string; unknown_before: string; room: string | null; known_since: string | null;
+  binding_generation: number | null; session_id: string | null; anchor_fallback: string | null; anchor_json: string;
+}
 const seconds = (iso: string): number => Math.floor(Date.parse(iso) / 1000);
 
 const readyIn = (h: Harness, room: string | null, key: ChannelKey) => {
@@ -109,8 +112,9 @@ const start = (firstRoom: string | null = ROOM_A) => {
         [row.role_key, row.conversation, row.joined_at, holder()?.sessionId ?? first.sessionId]);
     }
     for (const row of unknown) {
-      h.cp.db.run("INSERT INTO role_room_history_unknown (role_key, unknown_before, room, known_since, anchor_json) VALUES (?, ?, ?, ?, ?)",
-        [row.role_key, row.unknown_before, row.room, row.known_since, row.anchor_json]);
+      h.cp.db.run(`INSERT INTO role_room_history_unknown (role_key, unknown_before, room, known_since, binding_generation, session_id,
+          anchor_fallback, anchor_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [row.role_key, row.unknown_before, row.room, row.known_since,
+        row.binding_generation, row.session_id, row.anchor_fallback, row.anchor_json]);
     }
   };
   return { h, dir, owner, cto, opens, roleKey, first, bind, broadcast, deliver, holder, moveTo, install };
@@ -161,7 +165,8 @@ const migrated = (path: string) => {
         "SELECT role_key, conversation, joined_at FROM role_room_memberships ORDER BY role_key, joined_at"),
       // Read only where the step created the table, so a database without it shows no record rather than an error.
       unknown: db.all<{ name: string }>("SELECT name FROM sqlite_schema WHERE name = 'role_room_history_unknown'").length === 0 ? []
-        : db.all<UnknownHistory>("SELECT role_key, unknown_before, room, known_since, anchor_json FROM role_room_history_unknown ORDER BY role_key"),
+        : db.all<UnknownHistory>(`SELECT role_key, unknown_before, room, known_since, binding_generation, session_id, anchor_fallback,
+          anchor_json FROM role_room_history_unknown ORDER BY role_key`),
     };
   } finally { db.close(); }
 };
@@ -224,15 +229,16 @@ it("FCR-03: a history no record proves is known only from the current binding's 
     expect(evidence.refusals).toEqual([]);
     expect(evidence.anchored).toEqual([{ roleKey: f.roleKey, room: ROOM_A, sessionId: next.sessionId,
       bindingCreatedAt: binding.createdAt, sessionUpdatedAt: f.h.cp.sessions.require(next.sessionId).updatedAt,
-      runtimeMovedAt: null, knownSince: anchorAt }]);
+      runtimeMovedAt: null, bindingGeneration: expect.any(Number), fallback: null, knownSince: anchorAt }]);
     expect(Date.parse(anchorAt)).toBeGreaterThan(unread.created_at * 1000);
 
     // The full runner completes: the room is joined at the anchor, and the role's unknown history is on record.
     const { before, after, rows, unknown } = migrated(path);
     expect(rows).toEqual([{ role_key: f.roleKey, conversation: ROOM_A, joined_at: anchorAt }]);
     expect(unknown).toEqual([{ role_key: f.roleKey, unknown_before: expect.any(String), room: ROOM_A, known_since: anchorAt,
-      anchor_json: JSON.stringify({ sessionId: next.sessionId, bindingCreatedAt: binding.createdAt,
-        sessionUpdatedAt: f.h.cp.sessions.require(next.sessionId).updatedAt, runtimeMovedAt: null, knownAtMigration: false }) }]);
+      binding_generation: binding.bindingGeneration, session_id: next.sessionId, anchor_fallback: null,
+      anchor_json: JSON.stringify({ bindingCreatedAt: binding.createdAt,
+        sessionUpdatedAt: f.h.cp.sessions.require(next.sessionId).updatedAt, runtimeMovedAt: null }) }]);
     expect(unknown[0]!.unknown_before >= before && unknown[0]!.unknown_before <= after).toBe(true);
 
     // That output, live: the earlier A mail is refused, recorded with its reason, and not delivered.
@@ -327,7 +333,7 @@ it("FCR-05: an address change no audit records is never backdated; the room is k
     f.h.cp.db.run("UPDATE sessions SET buzz_address = ?, updated_at = ? WHERE session_id = ?", [ROOM_B, writtenAt, first]);
     const path = v50Image(f, "acp-r4-v50-unaudited-connect-");
     expect(judged(path).anchored).toEqual([{ roleKey: f.roleKey, room: ROOM_B, sessionId: first, bindingCreatedAt: boundAt,
-      sessionUpdatedAt: writtenAt, runtimeMovedAt: null, knownSince: writtenAt }]);
+      sessionUpdatedAt: writtenAt, runtimeMovedAt: null, bindingGeneration: expect.any(Number), fallback: null, knownSince: writtenAt }]);
     expect(migrated(path).rows).toEqual([{ role_key: f.roleKey, conversation: ROOM_B, joined_at: writtenAt }]);
   } finally { f.h.cp.close(); }
 });
@@ -345,7 +351,7 @@ it("an audited history is not inferred either: the role is known in its room sin
     f.h.cp.sessions.setBuzzAddress(first, ROOM_B);
     const path = v50Image(f, "acp-r4-v50-proven-");
     expect(judged(path).anchored).toEqual([{ roleKey: f.roleKey, room: ROOM_B, sessionId: first, bindingCreatedAt: boundAt,
-      sessionUpdatedAt: changedAt, runtimeMovedAt: null, knownSince: changedAt }]);
+      sessionUpdatedAt: changedAt, runtimeMovedAt: null, bindingGeneration: expect.any(Number), fallback: null, knownSince: changedAt }]);
     // No A row: the audits say the role was in A, but v51 infers no history from them.
     expect(membershipsOf(path)).toEqual([{ role_key: f.roleKey, conversation: ROOM_B, joined_at: changedAt }]);
   } finally { f.h.cp.close(); }

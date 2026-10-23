@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import Database from "better-sqlite3";
 import { closeSync, existsSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -23,7 +24,7 @@ import {
   onDiskSchemaVersion,
   readMigrationApproval,
 } from "./migration-approval.ts";
-import { SCHEMA_VERSION } from "./migrations.ts";
+import { SCHEMA_VERSION, v51AnchorFallbackRoles } from "./migrations.ts";
 import { targetIdentityOf } from "./target-identity.ts";
 import { assertPrivateDatabaseFiles, assertPrivatePath, databaseSidecarPaths, ensurePrivateDirectory } from "./state-preflight.ts";
 
@@ -61,7 +62,10 @@ replaced database under <state-dir>/backups/ before installing the checked snaps
 migration-plan reads the database read-only and reports what a start with these bytes
 would do to it — the version it is at, the version this build declares, the ordered
 migrations between them, any approval already on file, and the last refusal report. It
-is the observation path that still answers when the daemon will not start.
+is the observation path that still answers when the daemon will not start. At v50 it also
+lists v51AnchorFallback: the roles v51 can anchor only at the migration itself, whose mail
+signed while the daemon is stopped for the upgrade will be refused; a deployment should not
+proceed while that list is non-empty.
 
 approve-migration is the owner's decision to let that happen. It refuses a live agentcpd
 lock, takes the recovery point the approval will rest on, and writes an approval naming
@@ -303,6 +307,16 @@ const offlineSchemaVersion = (databasePath: string): number => {
   }
 };
 
+/** `v51AnchorFallbackRoles` over a read-only handle: the plan never opens a writable one. */
+const readV51AnchorFallback = (databasePath: string): Array<{ roleKey: string; reason: string }> => {
+  const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    return v51AnchorFallbackRoles(raw);
+  } finally {
+    raw.close();
+  }
+};
+
 export const main = async (argv: string[]): Promise<number> => {
   const parsed = parse(argv);
   if (parsed.command === "backup") {
@@ -333,6 +347,10 @@ export const main = async (argv: string[]): Promise<number> => {
           approvalOnFile: readApprovalForReport(parsed.databasePath),
           approvalIsStale: version === SCHEMA_VERSION && existsSync(migrationApprovalPath(parsed.databasePath)),
           lastRefusal: readJsonIfPresent(migrationRefusalPath(parsed.databasePath)),
+          // FCR-11 — the roles v51 could anchor only at the migration itself, whose stop-window mail
+          // it will refuse; a deployment should not proceed while this is non-empty. Read from the
+          // database's own records at v50, the version that step runs on; null at any other.
+          v51AnchorFallback: version === 50 ? readV51AnchorFallback(parsed.databasePath) : null,
         },
         null,
         2,
