@@ -896,6 +896,35 @@ export class CtoLifecycle {
     });
   }
 
+  /** Read-only validation for an MCP retry after a normal handoff's response was lost. */
+  reacknowledgeHandoff(handoffId: string, acknowledgement: HandoffAcknowledgement): Decision<void> {
+    return this.db.txDecision(() => {
+      const refuse = () => deny(ReasonCode.HANDOFF_ACK_REQUIRED, "re-ACK requires the same settled package and current incoming holder");
+      const row = this.db.get<RawHandoff>("SELECT * FROM handoffs WHERE handoff_id = ?", [handoffId]);
+      if (!row || row.kind !== "HANDOFF" || row.status !== "ACKED" ||
+        row.to_session_id !== acknowledgement.sessionId || row.ack_by_session_id !== acknowledgement.sessionId) return refuse();
+      const incoming = this.sessions.get(acknowledgement.sessionId);
+      const binding = this.bindings.activePrimaryCto(row.project_id);
+      const envelope = this.outbox.byIdempotencyKey(`handoff:${handoffId}`);
+      if (!incoming || incoming.incarnation !== acknowledgement.sessionIncarnation ||
+        (incoming.lifecycle !== SessionLifecycle.READY && incoming.lifecycle !== SessionLifecycle.DRAINING) ||
+        !binding || binding.sessionId !== incoming.sessionId || binding.sessionIncarnation !== incoming.incarnation ||
+        !envelope || envelope.kind !== MessageKind.HANDOFF_PACKAGE ||
+        !["SENT", "ACKED"].includes(envelope.status) || envelope.targetSessionId !== incoming.sessionId ||
+        envelope.roleKey !== binding.roleKey || envelope.bindingGeneration !== row.from_generation ||
+        acknowledgement.messageId !== envelope.messageId || acknowledgement.bindingGeneration !== envelope.bindingGeneration ||
+        acknowledgement.payloadDigest !== envelope.payloadDigest || digestOf(envelope.payload) !== envelope.payloadDigest ||
+        digestOf({ handoffId, projectId: row.project_id, handoff: JSON.parse(row.package_json) }) !== envelope.payloadDigest) return refuse();
+      const ack = this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'HANDOFF_ACK' AND session_id = ?
+        AND json_extract(evidence_json, '$.handoffId') = ?
+        AND json_extract(evidence_json, '$.fromGeneration') = ?
+        AND json_extract(evidence_json, '$.toGeneration') = ? LIMIT 1`,
+      [incoming.sessionId, handoffId, row.from_generation, binding.bindingGeneration]);
+      if (!ack || !this.#handoffAuthentication?.verifyHandoffAcknowledgement(acknowledgement).allowed) return refuse();
+      return allow(ReasonCode.OK, undefined);
+    });
+  }
+
   /**
    * §10.3 — emergency takeover. Used only when the bound session genuinely cannot act.
    * The recovery package is reconstructed from control plane and git evidence rather

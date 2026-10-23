@@ -10,6 +10,7 @@ import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import type { ProductionGate } from "../ceo/production-gate.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { Clock } from "../core/clock.ts";
+import { digestOf } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { parseVerificationCommand } from "../contracts/verification-command.ts";
@@ -315,9 +316,18 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     activePrimaryCto: (projectId: string) => source.bindings.activePrimaryCto(projectId),
     prepareSwitchover: (...args: Parameters<CtoLifecycle["prepareSwitchover"]>) => source.cto.prepareSwitchover(...args),
     handoffKind: (handoffId: string) => source.db.get<{ kind: string }>(`SELECT kind FROM handoffs WHERE handoff_id = ?`, [handoffId])?.kind ?? null,
-    acknowledgeBootstrap: (handoffId: string, sessionId: string, sessionIncarnation: string, receipt: BootstrapHandoffReceipt) => source.bootstrap.acknowledgeActivationHandoff(handoffId, sessionId, sessionIncarnation, receipt),
+    acknowledgeBootstrap: (handoffId: string, sessionId: string, sessionIncarnation: string, receipt: BootstrapHandoffReceipt, replayOnly = false) =>
+      source.db.txDecision(() => {
+        // Cache validation may only re-ACK a settled package, never execute a new ACK.
+        if (replayOnly && source.db.get<{ status: string }>("SELECT status FROM handoffs WHERE handoff_id = ?", [handoffId])?.status !== "ACKED") {
+          return deny(ReasonCode.HANDOFF_ACK_REQUIRED, "cached ACK requires an acknowledged handoff");
+        }
+        return source.bootstrap.acknowledgeActivationHandoff(handoffId, sessionId, sessionIncarnation, receipt);
+      }),
     acknowledgeCto: (handoffId: string, acknowledgement: HandoffAcknowledgement) =>
       source.cto.acknowledgeHandoff(handoffId, acknowledgement),
+    reacknowledgeCto: (handoffId: string, acknowledgement: HandoffAcknowledgement) =>
+      source.cto.reacknowledgeHandoff(handoffId, acknowledgement),
     // A read an operator asked for is a capacity *report*, not evidence that a worker
     // allocation was admitted — `startWorkerExecution` owns the WORKER_FANOUT trigger.
     refreshCapacity: () => source.capacity.refresh("DOCTOR_CAPACITY_REPORT"),
@@ -715,39 +725,62 @@ const createCtoServerFromPort = (
         bindingGeneration: z.number().int().positive(),
       },
     },
-    async (args) => write("handoff_ack", args.idempotencyKey, (peer) => {
-      if (!peer.sessionId || !peer.sessionIncarnation) return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation"));
-      if (!port.sessionIsCurrent(peer.sessionId, peer.sessionIncarnation)) {
-        return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP session incarnation is not current"));
-      }
-      if (access.pendingHandoffId && access.pendingHandoffId !== args.handoffId) {
-        return respond(deny(
-          ReasonCode.HANDOFF_ACK_REQUIRED,
-          "pending handoff recipient may acknowledge only its delivered handoff",
-          { expected: access.pendingHandoffId, got: args.handoffId },
-        ));
-      }
-      const kind = port.handoffKind(args.handoffId);
-      if (!kind) return respond(deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId: args.handoffId }));
-      if (kind === "BOOTSTRAP") return respond(port.acknowledgeBootstrap(args.handoffId, peer.sessionId, peer.sessionIncarnation, {
-        messageId: args.messageId, bindingGeneration: args.bindingGeneration, payloadDigest: args.payloadDigest,
-      }));
-      const sessionSecret = (peer as SessionSecretPeer).sessionSecret;
-      if (!sessionSecret) {
-        return respond(deny(
-          ReasonCode.MCP_PEER_UNAUTHENTICATED,
-          "CTO MCP peer has no session credential for a normal handoff acknowledgement",
-          { handoffId: args.handoffId },
-        ));
-      }
-      return respond(port.acknowledgeCto(args.handoffId, {
-        sessionId: peer.sessionId,
-        sessionIncarnation: peer.sessionIncarnation,
-        sessionSecret,
-        messageId: args.messageId,
-        payloadDigest: args.payloadDigest,
-        bindingGeneration: args.bindingGeneration,
-      }));
+    async (args) => guarded(async () => {
+      const authenticated = peerFor("handoff_ack");
+      if (!authenticated.allowed) return respond(authenticated);
+      const peer = authenticated.value;
+      const requestDigest = digestOf({
+        tool: "handoff_ack", handoffId: args.handoffId, messageId: args.messageId,
+        bindingGeneration: args.bindingGeneration, payloadDigest: args.payloadDigest,
+        sessionId: peer.sessionId, sessionIncarnation: peer.sessionIncarnation,
+      });
+      const acknowledge = (replayOnly = false): Decision<unknown> => {
+        if (!peer.sessionId || !peer.sessionIncarnation) return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation");
+        if (!port.sessionIsCurrent(peer.sessionId, peer.sessionIncarnation)) {
+          return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP session incarnation is not current");
+        }
+        if (access.pendingHandoffId && access.pendingHandoffId !== args.handoffId) {
+          return deny(
+            ReasonCode.HANDOFF_ACK_REQUIRED,
+            "pending handoff recipient may acknowledge only its delivered handoff",
+            { expected: access.pendingHandoffId, got: args.handoffId },
+          );
+        }
+        const kind = port.handoffKind(args.handoffId);
+        if (!kind) return deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId: args.handoffId });
+        if (kind === "BOOTSTRAP") return port.acknowledgeBootstrap(args.handoffId, peer.sessionId, peer.sessionIncarnation, {
+          messageId: args.messageId, bindingGeneration: args.bindingGeneration, payloadDigest: args.payloadDigest,
+        }, replayOnly);
+        const sessionSecret = (peer as SessionSecretPeer).sessionSecret;
+        if (!sessionSecret) {
+          return deny(
+            ReasonCode.MCP_PEER_UNAUTHENTICATED,
+            "CTO MCP peer has no session credential for a normal handoff acknowledgement",
+            { handoffId: args.handoffId },
+          );
+        }
+        return (replayOnly ? port.reacknowledgeCto : port.acknowledgeCto)(args.handoffId, {
+          sessionId: peer.sessionId,
+          sessionIncarnation: peer.sessionIncarnation,
+          sessionSecret,
+          messageId: args.messageId,
+          payloadDigest: args.payloadDigest,
+          bindingGeneration: args.bindingGeneration,
+        });
+      };
+      let executed = false;
+      const result = await port.mutation.execute(peer, args.idempotencyKey, () => {
+        executed = true;
+        const decision = acknowledge();
+        return respond({ ...decision, evidence: { ...decision.evidence, handoffAckRequestDigest: requestDigest } });
+      });
+      // Keep the shared reservation, in-flight refusal and other-peer refusal. Only this tool's
+      // cached successes need the extra request/principal binding and current domain authority.
+      if (executed || result.isError) return result;
+      const stored = result.structuredContent as { evidence?: { handoffAckRequestDigest?: unknown } } | undefined;
+      const refuse = () => respond(deny(ReasonCode.HANDOFF_ACK_REQUIRED, "cached ACK requires the same package, principal and current authority"));
+      if (stored?.evidence?.handoffAckRequestDigest !== requestDigest) return refuse();
+      return acknowledge(true).allowed ? result : refuse();
     }),
   );
   server.registerTool(
