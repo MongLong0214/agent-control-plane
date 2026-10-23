@@ -1471,6 +1471,7 @@ export interface CanonicalSelfClaimConfig {
    * which puts a second writer in a checkout a running session already holds.
    */
   canonicalSessions: readonly CanonicalAdoptableSession[];
+  entitlementCurrent?: () => boolean;
   /**
    * This deployment's default canonical project Buzz channel: the room of every entry that names
    * no `buzzAddress` of its own. Required — deployment-private configuration only, same
@@ -2187,6 +2188,7 @@ export class CanonicalSelfClaim {
     // than throwing) would otherwise be committed together with the session row already written
     // below. Only the outermost `txDecision` turns a propagated denial into a real ROLLBACK.
     return this.db.txDecision((): Decision<CanonicalSelfClaimReceipt> => {
+      if (this.config.entitlementCurrent && !this.config.entitlementCurrent()) return deny(ReasonCode.CONFLICT, "canonical entitlement changed during claim", {});
       // The owner approved this exact next generation for this exact role key. Checked before any
       // write — including before the owner approval is consumed — so a stale expectation denies
       // with nothing to roll back yet.

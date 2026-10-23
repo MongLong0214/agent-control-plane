@@ -1,3 +1,4 @@
+import { V52_ADDED_TRIGGERS } from "../helpers/released-v50-schema.ts";
 import Database from "better-sqlite3";
 import { existsSync } from "node:fs";
 
@@ -560,9 +561,9 @@ const seedAsV47 = (path: string): { kept: Row[]; withdrawnPreV48: Row; removedPr
 
 describe("S1: the v47 → v48 step on the released v47 image", () => {
   it("is the step from 47, followed by v49 and v50, and v47 keeps the full checksum it shipped with", () => {
-    expect(SCHEMA_VERSION).toBe(50);
+    expect(SCHEMA_VERSION).toBe(52);
     expect(MIGRATIONS.find((step) => step.fromVersion === 47)).toMatchObject({ id: "v48-owner-decision-supersede-guard", fromVersion: 47, toVersion: 48 });
-    expect(MIGRATIONS.slice(-2)).toMatchObject([
+    expect(MIGRATIONS.filter(m => m.toVersion === 49 || m.toVersion === 50)).toMatchObject([
       { id: "v49-branch-publish-receipts", fromVersion: 48, toVersion: 49 },
       { id: "v50-post-merge-verification-reentry", fromVersion: 49, toVersion: 50 },
     ]);
@@ -590,7 +591,7 @@ describe("S1: the v47 → v48 step on the released v47 image", () => {
     approveMigration(path, "v48 S1 preservation witness");
     new Db(path).close();
 
-    const after = contentDigests(path);
+    const after = contentDigests(path, before.userVersion);
     // #512 S-PUSH: the approved chain runs on to v49, which rebuilds github_receipts with every row kept.
     expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsDigestBefore, ...restBefore } = before.tables;
@@ -598,7 +599,7 @@ describe("S1: the v47 → v48 step on the released v47 image", () => {
     expect(restAfter).toEqual(restBefore);
     expect(receiptsDigestAfter).not.toBe(receiptsDigestBefore);
     expect(receiptsThrough47(path)).toEqual(receiptsBefore);
-    expect(triggersOf(path)).toEqual([...triggersBefore, ...V48_ADDED_TRIGGERS].sort());
+    expect(triggersOf(path)).toEqual([...triggersBefore, ...V48_ADDED_TRIGGERS, ...V52_ADDED_TRIGGERS].sort());
     expect([...kept, withdrawnPreV48].map((r) => stored(path, r.id))).toEqual(rowsBefore);
     const raw = new Database(path, { readonly: true });
     try {

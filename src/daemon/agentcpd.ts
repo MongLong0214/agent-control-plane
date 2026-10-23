@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
+import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
@@ -1879,14 +1881,14 @@ export const buzzMentionSubscriberRegistry = (
   // read from the request, and the numbers are counts — a pubkey is public but this stays a
   // diagnostic about the deployment's own shape rather than an echo of its input.
   primaryCtoBindingFor: (pubkey) => {
-    const judged = judgeBuzzMentionIdentity(cp, canonical, pubkey);
+    const judged = judgeBuzzMentionIdentity(cp, {sessions:new CanonicalSessionRegistry(cp.db).effective(canonical?.sessions ?? [])}, pubkey);
     if (judged.judgement.verdict === "ADMITTED") return judged.judgement.binding;
     process.stderr.write(`Buzz mention binding lookup refused: ${judged.said} ${JSON.stringify(judged.detail)}\n`);
     return null;
   },
   // The same judgement with its reason code and without the line above: the subscriber asks it at
   // startup, on every re-judgement and before every delivery, and writes the reason into health.
-  judgeIdentity: (pubkey) => judgeBuzzMentionIdentity(cp, canonical, pubkey).judgement,
+  judgeIdentity: (pubkey) => judgeBuzzMentionIdentity(cp, {sessions:new CanonicalSessionRegistry(cp.db).effective(canonical?.sessions ?? [])}, pubkey).judgement,
   // #1044. Read when a frame arrives, before it queues: the CEO binding and this role's binding as
   // they stand at that moment. The seam compares it with the registry when the frame is processed.
   peerReceiptFor: (roleKey) => {
@@ -2177,7 +2179,29 @@ export const startDaemonBuzzMentionSubscriber = (
     ...(options.scheduler ? { scheduler: options.scheduler } : {}),
     ...(options.reportAdmission ? { reportAdmission: options.reportAdmission } : {}),
 
-  });
+  }, process.env["ACP_BUZZ_RELAY_URL"]);
+  // The file remains the deployment baseline; resident allocations are merged dynamically.
+  const baseline = readBuzzSubscriberConfig(stateDir)?.identities ?? [];
+  const reconcileManaged = (): boolean => {
+    const rows = cp.db.all<{allocation_json:string;steps_json:string}>(`SELECT allocation_json,steps_json FROM resident_project_provisioning WHERE status IN ('PENDING','COMPLETE') ORDER BY run_id`);
+    const managed = rows.flatMap(row => {
+      const a = JSON.parse(row.allocation_json) as {privateKeyFile?:string;roomId?:string};
+      const roomBinding = (JSON.parse(row.steps_json) as {roomBinding?:{roomId:string}}).roomBinding;
+      if (roomBinding) a.roomId = roomBinding.roomId;
+      return a.privateKeyFile && a.roomId && cp.residentProjects.confirmedRoom(a.roomId) && existsSync(a.privateKeyFile) ? [{privateKeyFile:a.privateKeyFile,encoding:"hex" as const,rooms:[a.roomId]}] : [];
+    });
+    if (!handle.reconcile) return false;
+    handle.reconcile([...baseline,...managed.filter(m => !baseline.some(b => b.privateKeyFile === m.privateKeyFile))]);
+    handle.rejudge();
+    return true;
+  };
+  reconcileManaged();
+  const residentSubscriberReady = (allocation: {projectId:string},pubkey:string): boolean => Boolean(pubkey && handle.deliveryEligibility({actorId:pubkey,roleKey:roleKeyFor(Role.PRIMARY_CTO,{projectId:allocation.projectId})})?.eligible && handle.replies.ready(pubkey));
+  cp.residentProjects.attachSubscriber(async (allocation,pubkey) => {
+    if (!reconcileManaged()) return false;
+    await handle.settled();
+    return residentSubscriberReady(allocation,pubkey);
+  },residentSubscriberReady);
   runningMentionSubscribers.set(cp, handle);
   return handle;
 };
@@ -5018,7 +5042,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let canonicalSessions: readonly CanonicalAdoptableSession[] | null = null;
   if (canonicalActivationPresentCount > 0) {
     try {
-      canonicalSessions = configuredCanonicalSessions(canonicalActivationValues["ACP_CANONICAL_SESSIONS_JSON"]);
+      canonicalSessions = canonicalActivationValues["ACP_CANONICAL_SESSIONS_JSON"].trim() === "[]" ? [] : configuredCanonicalSessions(canonicalActivationValues["ACP_CANONICAL_SESSIONS_JSON"]);
+      const canonicalRegistry = new CanonicalSessionRegistry(cp.db);
+      canonicalSessions = canonicalRegistry.effective(canonicalSessions);
       const unregisteredEntryIndex = canonicalSessions.findIndex(
         (entry) => cp.projects.get(entry.projectId) === null,
       );
@@ -5031,6 +5057,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
             `${canonicalSessions.length} names a project that is not registered`,
         );
       }
+      for (const entry of canonicalSessions) canonicalRegistry.grant({...entry,buzzAddress:entry.buzzAddress ?? canonicalBuzzChannelId},null);
     } catch (err) {
       // Nothing past this point has started yet: the session-launch channel and the control plane
       // are the two things open, and both are closed before the refusal leaves.
@@ -5058,6 +5085,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     purpose: string,
     channelId: string,
   ): Promise<Decision<string>> => {
+    if (cp.residentProjects.confirmedRoom(channelId)) return allow(ReasonCode.OK,channelId);
     const roomTransport = new BuzzCliTransport(process.env["ACP_BUZZ_BINARY"] ?? "buzz", channelId);
     if (!(await roomTransport.available(purpose))) {
       return deny(ReasonCode.PROBE_FAILED, "buzz transport is not available", { purpose });
@@ -5265,7 +5293,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           // admissible here and the claim then uses the one belonging to the session the kernel
           // says is calling, so this guard bounds the set without choosing from it.
           buzzActorAuthenticator: new IngressGuard(cp.db, cp.clock, cp.audit, {
-            buzz: { allowedActors: canonicalSessions.map((entry) => entry.buzzActorId) },
+            buzz: { allowedActors: new CanonicalSessionRegistry(cp.db).effective(canonicalSessions).map((entry) => entry.buzzActorId) },
           }),
           resolveBuzzAddress: resolveCanonicalSelfClaimBuzzAddress,
           config: {

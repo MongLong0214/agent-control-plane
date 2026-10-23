@@ -1,3 +1,4 @@
+import { takeBackV52 } from "../helpers/released-v50-schema.ts";
 import Database from "better-sqlite3";
 import { chmodSync } from "node:fs";
 import { join } from "node:path";
@@ -494,6 +495,7 @@ describe("#512 a WORKER's session takes no other role, whichever is attached fir
 const asV40Image = (path: string, seed?: (raw: Database.Database) => void): void => {
   new Db(path).close();
   const raw = new Database(path);
+  takeBackV52(raw);
   try {
     for (const trigger of V41_TRIGGERS) raw.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
     for (const column of ["runtime_managed", "worker_process_started_at", "worker_process_released_at"]) {

@@ -1,3 +1,4 @@
+import type { ResidentProjectProvisioning, ProvisioningEvidence } from './resident-project-provisioning.ts';
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -59,6 +60,7 @@ export interface ACPBootstrapActivationResult {
   completedAt: string;
   /** G0a (RF-018) — what this activation did not observe, said rather than passed over silently. */
   warnings: ActivationWarning[];
+  provisioning?: ProvisioningEvidence;
 }
 
 /**
@@ -137,6 +139,8 @@ export class BootstrapActivation {
     private readonly doctor: Doctor,
     private readonly ceo: ProductionGate,
     private readonly outbox: Outbox,
+    private readonly residentProjects?: ResidentProjectProvisioning,
+    readonly residentGenesisRequired = true,
   ) {}
 
   #completionChain: BootstrapCompletionChainPort | null = null;
@@ -230,6 +234,7 @@ export class BootstrapActivation {
     // included) before anything is written or delivered.
     const current = currentBootstrapPlan(input.runId, this.artifacts.latest<unknown>(input.runId, ArtifactKind.PLAN));
     if (!current.allowed) return current as Decision<ACPBootstrapActivationResult>;
+    if (this.residentGenesisRequired && !current.value.outputs.genesis) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap requires an inline genesis bundle and resident CTO",{});
     const facts = observedRepositoryFacts(result, factsTargetOf(current.value.outputs));
     if (!facts.allowed) return facts as Decision<ACPBootstrapActivationResult>;
     // #246 B3 — the approved manifest's CommitLore mode, enforced on this result at those facts' heads.
@@ -275,6 +280,16 @@ export class BootstrapActivation {
       );
     }
 
+    let provisioning: ProvisioningEvidence | undefined;
+    if (current.value.outputs.genesis) {
+      const repository = result.repositories[0]!;
+      if (!this.residentProjects || !repository.repositoryNodeId) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident provisioning is required",{});
+      try {
+        provisioning = await this.residentProjects.ensure({runId:input.runId,projectId,repositoryIdentity:repository.identity,repositoryNodeId:repository.repositoryNodeId,head:facts.value[0]!.head!,packet:{handoff:input.handoff,plan:this.artifacts.latest<unknown>(input.runId,ArtifactKind.PLAN)}});
+      } catch { return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident provisioning readbacks pending",{runId:input.runId}); }
+      input = {...input,localBindings:[{identity:repository.identity,repositoryRole:repository.role,checkoutPath:provisioning.allocation.clonePath}]};
+    }
+
     // 3. Create local repository bindings. The committed manifest never holds a path.
     const localBindings: ACPBootstrapActivationResult["localBindings"] = [];
     for (const binding of input.localBindings) {
@@ -312,7 +327,10 @@ export class BootstrapActivation {
     // handoff could not reach (`undeliverableRecipient`): the retry replaces it with a driven one.
     const alreadyBound = this.bindings.active(primaryRoleKey);
     const undeliverable = alreadyBound ? this.undeliverableRecipient(input.runId, projectId, alreadyBound) : null;
-    if (alreadyBound && !undeliverable) {
+    if (provisioning) {
+      if (!alreadyBound || alreadyBound.sessionId !== provisioning.claimSessionId) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"awaiting resident canonical claim",{runId:input.runId});
+      primaryCtoBinding = {roleKey:primaryRoleKey,sessionId:alreadyBound.sessionId,bindingGeneration:alreadyBound.bindingGeneration,promotedFromBootstrap:false};
+    } else if (alreadyBound && !undeliverable) {
       await this.cto.ensureBuzz(alreadyBound.sessionId, `primary-cto:${projectId}`);
       primaryCtoBinding = {
         roleKey: primaryRoleKey,
@@ -374,7 +392,8 @@ export class BootstrapActivation {
       blindReview: reviewed.allowed ? { verdict: reviewed.value.verdict, digest: reviewed.value.digest } : null,
       ceoConfirm: null,
       primaryCtoBinding,
-      buzz: { connected: Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
+      ...(provisioning ? {provisioning} : {}),
+      buzz: { connected: provisioning ? this.residentProjects!.ready(input.runId,primaryCtoBinding.sessionId) : Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
       handoffAck,
       doctor: { status: report.status, findings: report.findings.length },
       activity: project.activity,
@@ -678,6 +697,8 @@ export class BootstrapActivation {
         projectId,
       });
     }
+    const provisioning = plan.value.outputs.genesis ? this.residentProjects?.evidence(input.runId) : undefined;
+    if (plan.value.outputs.genesis && (!provisioning || !primary || !this.residentProjects?.ready(input.runId,primary.sessionId))) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident provisioning readbacks unavailable at confirmation",{});
     const activation: ACPBootstrapActivationResult = {
       schema: "agent-control-plane.bootstrap-activation.v1",
       runId: input.runId,
@@ -697,7 +718,8 @@ export class BootstrapActivation {
             promotedFromBootstrap: this.servedAsBootstrapCto(input.runId, primary.sessionId),
           }
         : null,
-      buzz: { connected: Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
+      ...(provisioning ? {provisioning} : {}),
+      buzz: { connected: provisioning ? Boolean(primary && this.residentProjects?.ready(input.runId,primary.sessionId)) : Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
       handoffAck,
       doctor: {
         status: doctorArtifact.content.report.status,
@@ -718,6 +740,10 @@ export class BootstrapActivation {
       });
     }
 
+    if (activation.provisioning) {
+      activation.provisioning.complete = true;
+      this.residentProjects?.complete(input.runId);
+    }
     this.artifacts.put(input.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT, activation);
     this.audit.record({
       kind: "BOOTSTRAP_ACTIVATED",

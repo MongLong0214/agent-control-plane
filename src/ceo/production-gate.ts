@@ -643,7 +643,7 @@ export class ProductionGate {
         // completion token. Re-read completeness under the same write transaction as the
         // terminal transition so work admitted after publication cannot complete the run.
         if (input.decision === "CONFIRM" && !isBootstrap) {
-          const completeness = this.tasks.completeness(input.runId);
+          const completeness = this.tasks.administrativeReviewEntry(input.runId);
           if (!completeness.allowed) return completeness as Decision<{ state: RunState }>;
         }
 
@@ -845,7 +845,7 @@ export class ProductionGate {
    * every other run keeps `completeness` exactly.
    */
   private reviewEntry(run: RunRow): Decision<unknown> {
-    if (!isProjectlessBootstrap(run) || this.runs.repositoriesOf(run.runId).length > 0) return this.tasks.completeness(run.runId);
+    if (!isProjectlessBootstrap(run) || this.runs.repositoriesOf(run.runId).length > 0) return this.tasks.administrativeReviewEntry(run.runId);
     const current = currentBootstrapPlan(run.runId, this.artifacts.latest<unknown>(run.runId, ArtifactKind.PLAN));
     if (!current.allowed) return current;
     return this.tasks.bootstrapReviewEntry(run.runId, current.value.binding.planDigest);
@@ -1368,6 +1368,12 @@ export class ProductionGate {
       if (handoff?.status !== "ACKED" || handoff.acked_at !== handoffAck["ackedAt"]) {
         incomplete.push("handoffAckBinding");
       }
+    }
+    const plan = this.artifacts.latest<Record<string,unknown>>(runId,ArtifactKind.PLAN)?.content;
+    if (plan?.["genesis"] !== undefined) {
+      const provisioning = isRecord(value["provisioning"]) ? value["provisioning"] : null;
+      const row = this.db.get<{status:string}>(`SELECT status FROM resident_project_provisioning WHERE run_id = ? AND project_id = ?`,[runId,projectId]);
+      if (!provisioning || provisioning["complete"] !== true || row?.status !== "COMPLETE") incomplete.push("residentProvisioning");
     }
     const blindReview = isRecord(value["blindReview"]) ? value["blindReview"] : null;
     const review = blindReview

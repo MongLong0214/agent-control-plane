@@ -1,3 +1,4 @@
+import { takeBackV52 } from "../helpers/released-v50-schema.ts";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
@@ -1048,6 +1049,7 @@ describe("the #1056 review's six findings", () => {
     // The v38 image: the same file without the key guard, with v38's receipt as its newest, and
     // with the three v38 claim guards as v38 wrote them, live only beside a receipt at exactly 38.
     const legacy = new Database(w.path);
+  takeBackV52(legacy);
     const gated = legacy.prepare(
       `SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%WHERE version >= 38)%' ORDER BY name`,
     ).all() as { name: string; sql: string }[];

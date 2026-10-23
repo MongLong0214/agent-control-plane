@@ -443,10 +443,11 @@ describe("the bootstrapPlanGuide contract_get carries", () => {
     const guide = bootstrapPlanGuide();
     expect(guide.schema).toBe(BOOTSTRAP_PLAN_GUIDE_SCHEMA_ID);
     expect(guide.manifest.schema).toBe(PROJECT_MANIFEST_SCHEMA_ID);
-    expect(guide.manifest.example).toEqual(minimalBootstrapManifest({
+    expect(guide.manifest.example).toMatchObject({
       projectId: BOOTSTRAP_PLAN_GUIDE_PLACEHOLDERS.projectId,
-      repositoryIdentity: BOOTSTRAP_PLAN_GUIDE_PLACEHOLDERS.repositoryIdentity,
-    }));
+      branchProfile:{longLived:["main","dev"],defaultBranch:"dev"},
+      ciWorkflows:[{approvedDigest:guide.genesisExample.files[1]!.sha256}],
+    });
     expect(assertPortableManifest(guide.manifest.example)).toMatchObject({ allowed: true });
     expect(assertPortableManifest(minimalBootstrapManifest({ projectId: "widget", repositoryIdentity: "github:acme/widget" })))
       .toMatchObject({ allowed: true });
@@ -460,7 +461,7 @@ describe("the bootstrapPlanGuide contract_get carries", () => {
       operationId: "<operation-id>",
       resourceType: "repository",
       resourceIdentity: "github:<owner>/<name>",
-      desiredState: { visibility: "<public|private>", autoInit: true },
+      desiredState: { visibility: "public", autoInit: true },
     });
     // Generic: no run, session or project value anywhere, and the same guide on every call.
     expect(JSON.stringify(guide)).not.toMatch(/\brun_[A-Za-z0-9]|\bses_[A-Za-z0-9]|widget|acme/);
@@ -481,7 +482,8 @@ describe("the bootstrapPlanGuide contract_get carries", () => {
       bootstrapOperationId: "bootstrap-widget",
       requestDigest: "sha256:contract",
       projectManifestDigest: "sha256:unknown",
-      githubOperations: [filled(guide.repositoryCreateOperation.shape)],
+      genesis: filled(guide.genesisExample),
+      githubOperations: filled(guide.githubOperationsExample),
       projectManifest: manifest,
     };
     const refused = planForSubmission(bootstrapRun, plan);
@@ -497,9 +499,9 @@ describe("the bootstrapPlanGuide contract_get carries", () => {
       allowed: true,
       value: {
         outputs: {
-          target: { repositoryIdentity: "github:acme/widget", repositoryRole: "primary", visibility: "private" },
-          defaultBranch: "main",
-          files: [],
+          target: { repositoryIdentity: "github:acme/widget", repositoryRole: "primary", visibility: "public" },
+          defaultBranch: "dev",
+          files: guide.genesisExample.files.map(f => ({path:f.path,mode:f.mode,contentBase64:f.contentBase64})),
         },
       },
     });

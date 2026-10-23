@@ -73,7 +73,7 @@ const ROWID_NAMES = ["rowid", "_rowid_", "oid"];
  * the schema rows and user_version — the comparison step 4 of the rehearsal makes. Values are typed
  * and length-prefixed so `'1'`, `1` and `1.0` differ.
  */
-export const contentDigests = (path: string): { userVersion: number; schema: string; tables: Record<string, string> } => {
+export const contentDigests = (path: string, throughVersion = Infinity): { userVersion: number; schema: string; tables: Record<string, string> } => {
   const raw = new Database(path, { readonly: true, fileMustExist: true });
   try {
     const digestRows = (sql: string): string => {
@@ -96,16 +96,20 @@ export const contentDigests = (path: string): { userVersion: number; schema: str
       .prepare("SELECT name, wr FROM pragma_table_list WHERE schema = 'main' AND type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
       .all() as Array<{ name: string; wr: number }>;
     for (const table of listed) {
+      if (throughVersion < 52 && ['resident_project_provisioning','canonical_session_entitlements','project_retirements'].includes(table.name)) continue;
+      const v52Columns:Record<string,string[]> = {projects:['buzz_address','retired_at','supersedes_project_id'],repositories:['retired_at'],bootstrap_applications:['retired_at']};
+      const projection = throughVersion < 52 && v52Columns[table.name]
+        ? (raw.prepare('SELECT name FROM pragma_table_info(?)').pluck().all(table.name) as string[]).filter(c => !v52Columns[table.name]!.includes(c)).map(c => `"${c}"`).join(',') : '*';
       const quoted = `"${table.name.replace(/"/g, '""')}"`;
       if (table.wr === 0) {
         const columns = (raw.prepare("SELECT name FROM pragma_table_info(?)").pluck().all(table.name) as string[]).map((name) => name.toLowerCase());
         const rowid = ROWID_NAMES.find((name) => !columns.includes(name))!;
-        tables[table.name] = digestRows(`SELECT ${rowid}, * FROM ${quoted} ORDER BY ${rowid}`);
+        tables[table.name] = digestRows(`SELECT ${rowid}, ${projection} FROM ${quoted} ORDER BY ${rowid}`);
       } else {
         const key = (raw.prepare("SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk").pluck().all(table.name) as string[])
           .map((name) => `"${name}"`)
           .join(", ");
-        tables[table.name] = digestRows(`SELECT * FROM ${quoted} ORDER BY ${key}`);
+        tables[table.name] = digestRows(`SELECT ${projection} FROM ${quoted} ORDER BY ${key}`);
       }
     }
     return {

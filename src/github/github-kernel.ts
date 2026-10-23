@@ -4781,3 +4781,36 @@ export class GitHubKernel {
     };
   }
 }
+
+/** Bootstrap has no activated project yet. Its reviewed PLAN supplies this narrowly scoped
+ * merge contract; it uses the same GitHub client, exact-head merge API and parent proof as
+ * normal kernel merges. The caller persists intent before entry and reconciles the PR after. */
+export async function mergeBootstrapGenesis(client:GitHubClient, input:{owner:string;repo:string;pullNumber:number;headSha:string;baseSha:string;requiredChecks:readonly string[]}):Promise<void> {
+  const root = `/repos/${input.owner}/${input.repo}`;
+  const pull = await client.request<{state:string;merged:boolean;head:{ref:string;sha:string;repo:{full_name:string}};base:{ref:string;sha:string};merge_commit_sha:string|null}>("GET",`${root}/pulls/${input.pullNumber}`);
+  if (pull.head.ref !== "genesis" || pull.head.sha !== input.headSha || pull.base.ref !== "main" || pull.head.repo.full_name.toLowerCase() !== `${input.owner}/${input.repo}`.toLowerCase()) throw new Error("genesis merge target/head drift");
+  let mergeSha = pull.merge_commit_sha;
+  if (!pull.merged) {
+    if (pull.state !== "open" || pull.base.sha !== input.baseSha) throw new Error("genesis merge base drift");
+    const protection = await client.request<{allow_force_pushes:{enabled:boolean};allow_deletions:{enabled:boolean};enforce_admins:{enabled:boolean};required_status_checks:{strict:boolean;contexts:string[]}}>("GET",`${root}/branches/main/protection`);
+    if (protection.allow_force_pushes?.enabled !== false || protection.allow_deletions?.enabled !== false || protection.enforce_admins?.enabled !== true || protection.required_status_checks?.strict !== true || canonicalCheckNames(protection.required_status_checks.contexts) !== canonicalCheckNames(input.requiredChecks)) throw new Error("genesis main protection drift");
+    const checks = await client.request<{check_runs:Array<{name:string;head_sha:string;status:string;conclusion:string;app:{slug:string}}>}>("GET",`${root}/commits/${input.headSha}/check-runs?per_page=100`);
+    if (!input.requiredChecks.length || input.requiredChecks.some(name => {
+      const matches = checks.check_runs.filter(c => c.name === name && c.head_sha === input.headSha && c.app?.slug === "github-actions");
+      return matches.length === 0 || matches.some(c => c.status !== "completed" || c.conclusion !== "success");
+    })) throw new Error("genesis exact-head CI refused");
+    const ref = await client.request<{object:{sha:string}}>("GET",`${root}/git/ref/heads/main`);
+    if (ref.object.sha !== input.baseSha) throw new Error("genesis main moved before merge");
+    const response = await client.request<{merged:boolean;sha:string}>("PUT",`${root}/pulls/${input.pullNumber}/merge`,{sha:input.headSha,merge_method:"merge"});
+    if (!response.merged || !response.sha) throw new Error("genesis protected merge refused");
+    mergeSha = response.sha;
+  }
+  if (!mergeSha) throw new Error("genesis merge proof missing");
+  const [commit,ref,merged] = await Promise.all([
+    client.request<{parents:Array<{sha:string}>}>("GET",`${root}/git/commits/${mergeSha}`),
+    client.request<{object:{sha:string}}>("GET",`${root}/git/ref/heads/main`),
+    client.request<{merged:boolean;merge_commit_sha:string;head:{sha:string}}>("GET",`${root}/pulls/${input.pullNumber}`),
+  ]);
+  if (commit.parents.length !== 2 || commit.parents[0]?.sha !== input.baseSha || commit.parents[1]?.sha !== input.headSha || ref.object.sha !== mergeSha || !merged.merged || merged.merge_commit_sha !== mergeSha || merged.head.sha !== input.headSha) throw new Error("genesis merge parent/readback proof refused");
+}
+const canonicalCheckNames = (checks:readonly string[]):string => JSON.stringify([...checks].sort());

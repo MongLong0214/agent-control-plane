@@ -414,7 +414,7 @@ describe("the v45 → v46 step", () => {
     expect(before.userVersion).toBe(45);
     approveMigration(path, "V46 B4 preservation witness");
     new Db(path).close();
-    const after = contentDigests(path);
+    const after = contentDigests(path, before.userVersion);
     expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsBefore, ...restBefore } = before.tables;
     const { schema_migrations: receiptsAfter, ...restAfter } = after.tables;
@@ -433,6 +433,7 @@ describe("the v45 → v46 step", () => {
         { version: 48, migration_id: "v48-owner-decision-supersede-guard" },
         { version: 49, migration_id: "v49-branch-publish-receipts" },
         { version: 50, migration_id: "v50-post-merge-verification-reentry" },
+        { version: 52, migration_id: "v52-resident-project-provisioning" },
       ]);
     } finally {
       raw.close();
@@ -478,7 +479,7 @@ describe("the v45 → v46 step", () => {
     expect(approved).toMatchObject({
       fromVersion: 44,
       toVersion: SCHEMA_VERSION,
-      migrations: ["v45-first-manifest-activation", "v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry"],
+      migrations: ["v45-first-manifest-activation", "v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry", "v52-resident-project-provisioning"],
     });
     const databaseModule = new URL("../../src/db/database.ts", import.meta.url).href;
     const child = boundedSpawnSync(
@@ -513,7 +514,7 @@ describe("the v45 → v46 step", () => {
     expect(approveMigration(path, "V46 D5-b re-approval")).toMatchObject({
       fromVersion: 45,
       toVersion: SCHEMA_VERSION,
-      migrations: ["v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry"],
+      migrations: ["v46-rowid-no-replace", "v47-owner-decision-authority-guard", "v48-owner-decision-supersede-guard", "v49-branch-publish-receipts", "v50-post-merge-verification-reentry", "v52-resident-project-provisioning"],
     });
     new Db(path).close();
     expect(contentDigests(path).userVersion).toBe(SCHEMA_VERSION);

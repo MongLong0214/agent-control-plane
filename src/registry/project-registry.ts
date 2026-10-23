@@ -35,6 +35,9 @@ export interface ProjectRecord {
   activity: Activity;
   availability: Availability;
   suspended: boolean;
+  buzzAddress: string | null;
+  retiredAt: string | null;
+  supersedesProjectId: string | null;
   createdAt: string;
 }
 
@@ -102,6 +105,11 @@ export class ProjectRegistry {
       `INSERT INTO projects (project_id, name, active_manifest_digest, created_at) VALUES (?, ?, ?, ?)`,
       [projectId, input.name, digest, this.clock.nowIso()],
     );
+    const predecessor = input.manifest?.repositories[0]?.remote;
+    if (predecessor) {
+      const retired = this.db.get<{project_id:string}>(`SELECT project_id FROM repositories WHERE identity = ? AND retired_at IS NOT NULL ORDER BY retired_at DESC, repository_id DESC LIMIT 1`,[predecessor]);
+      if (retired) this.db.run(`UPDATE projects SET supersedes_project_id = ? WHERE project_id = ?`,[retired.project_id,projectId]);
+    }
     this.audit.record({
       kind: "PROJECT_REGISTERED",
       projectId,
@@ -296,6 +304,7 @@ export class ProjectRegistry {
     ownerApproved: boolean,
     approval?: { approvedBy: string; source: "agentcpd-state" },
   ): Decision<void> {
+    if (!suspended && this.get(projectId)?.retiredAt) return deny(ReasonCode.CONFLICT,"retired project cannot resume",{projectId});
     if (suspended && !ownerApproved) {
       // §10.4 — a capacity-driven project suspend is an owner gate, not a CEO call.
       return deny(
@@ -365,12 +374,18 @@ export class ProjectRegistry {
       activity: (bound?.n ?? 0) > 0 ? "ACTIVE" : "INACTIVE",
       availability: row.availability,
       suspended: row.suspended === 1,
+      buzzAddress: row.buzz_address,
+      retiredAt: row.retired_at,
+      supersedesProjectId: row.supersedes_project_id,
       createdAt: row.created_at,
     };
   }
 }
 
 interface RawProject {
+  buzz_address: string | null;
+  retired_at: string | null;
+  supersedes_project_id: string | null;
   project_id: string;
   name: string;
   active_manifest_digest: string | null;

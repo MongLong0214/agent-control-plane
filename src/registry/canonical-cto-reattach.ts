@@ -1,3 +1,4 @@
+import { CanonicalSessionRegistry } from './canonical-session-registry.ts';
 import type { ControlPlane } from "../app/control-plane.ts";
 import { sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -10,7 +11,6 @@ import {
   type ProcessLineageReader,
 } from "../session/runtime-lineage.ts";
 import {
-  assertCanonicalSessionsValid,
   assertClaudeIdentityStillLive,
   defaultProcessAncestryInspector,
   deriveClaimantIdentity,
@@ -18,6 +18,7 @@ import {
   SELF_CLAIM_EXECUTOR_KIND,
   unsubscribedRoomRefusal,
   type CanonicalAdoptableSession,
+  assertCanonicalSessionsValid,
   type DerivedClaimantIdentity,
   type HostSessionRegistryReader,
   type ProcessAncestryInspector,
@@ -143,20 +144,23 @@ export const createCanonicalCtoReattach = (
   const registryReader = options.registryReader ?? makeDefaultHostSessionRegistryReader();
   const maxAncestryHops = options.maxAncestryHops ?? MAX_ANCESTRY_HOPS;
   const correction = options.buzzAddress;
+  if (correction?.canonicalSessions.length) assertCanonicalSessionsValid(correction.canonicalSessions);
   // Through the one authority over what an adoptable set may be, at construction, so a malformed
   // room refuses here rather than being written. Copied and frozen like the claim's own set.
-  const correctable = correction === undefined
+  const correctable = () => correction === undefined
     ? []
-    : assertCanonicalSessionsValid(correction.canonicalSessions).map((entry) => Object.freeze({ ...entry }));
+    : new CanonicalSessionRegistry(cp.db).effective(correction.canonicalSessions).map((entry) => Object.freeze({ ...entry }));
   // A set in which no entry names a room has nothing a correction could move a row to, so it does
   // not walk the process tree a second time on every reattach just to find that out.
-  const namesARoom = correctable.some((entry) => entry.buzzAddress !== undefined);
+  const namesARoom = () => correctable().some((entry) => entry.buzzAddress !== undefined);
 
   /** `admit`, keeping the claude identity it derived so the correction's write can verify it again. */
   const admitHolder = (peer: { peerPid: number; uid: number }): Decision<AdmittedHolder> => {
     const identity = deriveClaimantIdentity(peer.peerPid, inspector, maxAncestryHops, registryReader);
     if (!identity.allowed) return identity as Decision<AdmittedHolder>;
     const conversation = identity.value.sessionUuid;
+    const revoked = cp.db.get(`SELECT 1 FROM canonical_session_entitlements e WHERE e.session_uuid = ? AND (e.revoked_at IS NOT NULL OR EXISTS(SELECT 1 FROM project_retirements r WHERE r.project_id = e.project_id))`,[conversation]);
+    if (revoked) return deny(ReasonCode.CONFLICT,"canonical entitlement is retired",{});
     const rows = cp.db.all<{
       assignment_id: string;
       role_key: string;
@@ -236,11 +240,12 @@ export const createCanonicalCtoReattach = (
     peer: { peerPid: number; uid: number },
   ): Promise<Decision<CanonicalCtoBuzzAddressCorrection>> => {
     if (correction === undefined) return allow(ReasonCode.OK, { outcome: "NOT_CONFIGURED", sessionId: null });
-    if (!namesARoom) return allow(ReasonCode.OK, { outcome: "NOT_CONFIGURED", sessionId: null });
+    if (!namesARoom()) return allow(ReasonCode.OK, { outcome: "NOT_CONFIGURED", sessionId: null });
     const first = admit(peer);
     if (!first.allowed) return first as Decision<CanonicalCtoBuzzAddressCorrection>;
     const held = first.value;
-    const entry = correctable.find((candidate) => candidate.sessionUuid === held.conversation);
+    const entitlementRevision = new CanonicalSessionRegistry(cp.db).fingerprint();
+    const entry = correctable().find((candidate) => candidate.sessionUuid === held.conversation);
     if (entry === undefined) return allow(ReasonCode.OK, { outcome: "NOT_CONFIGURED", sessionId: held.sessionId });
     const room = entry.buzzAddress;
     if (room === undefined) return allow(ReasonCode.OK, { outcome: "NOT_CONFIGURED", sessionId: held.sessionId });
@@ -262,6 +267,7 @@ export const createCanonicalCtoReattach = (
       return deny(ReasonCode.CONFLICT, "the Buzz transport opened another room than the configured one", {});
     }
     return cp.db.txDecision((): Decision<CanonicalCtoBuzzAddressCorrection> => {
+      if (new CanonicalSessionRegistry(cp.db).fingerprint() !== entitlementRevision) return deny(ReasonCode.CONFLICT,"canonical entitlement changed during room correction",{});
       const again = admitHolder(peer);
       if (!again.allowed) return again as Decision<CanonicalCtoBuzzAddressCorrection>;
       const changed = (): Decision<CanonicalCtoBuzzAddressCorrection> =>

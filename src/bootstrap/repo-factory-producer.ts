@@ -1,3 +1,6 @@
+import { runSandboxed } from '../verify/sandbox.ts';
+import { verificationCommandSchema } from '../contracts/verification-command.ts';
+import { parseGenesis, genesisBundleSchema, genesisPath } from './genesis-bundle.ts';
 import {
   lstatSync,
   mkdirSync,
@@ -34,6 +37,7 @@ import {
   githubLedgerPath,
   githubOperationSchema,
   isCreateOnlyPlan,
+  isGenesisPlan,
   preflightGitHubOperations,
   readGitHubLedger,
   toExternalWriteReceipt,
@@ -104,7 +108,7 @@ export const VERIFICATION_KINDS = {
   },
 } as const;
 
-export type VerificationKind = keyof typeof VERIFICATION_KINDS;
+export type VerificationKind = keyof typeof VERIFICATION_KINDS | "GENESIS_TEST";
 
 /**
  * The verification kind whose fixed invocation *is* this argv — run as `git <argv...>` in the
@@ -137,7 +141,10 @@ export const repoFactoryPlanFixtureSchema = z
      */
     verificationCommandId: z.string().min(1),
     /** Which of `VERIFICATION_KINDS` this producer actually runs. Closed, not free-form argv. */
-    verificationKind: z.enum(["CLEAN_TREE"]),
+    verificationKind: z.enum(["CLEAN_TREE", "GENESIS_TEST"]),
+    genesis: genesisBundleSchema.optional(),
+    ciWorkflows: z.array(z.object({path:z.string(),checkName:z.string(),approvedDigest:z.string()})).optional(),
+    verificationCommands: z.array(verificationCommandSchema).optional(),
     /**
      * GitHub-side operations the plan calls for, each with the state it asks for. Integration
      * §13.3/§16 define `ExternalWriteReceipt` around a *GitHub* resource write, so these are
@@ -157,8 +164,9 @@ export type RepoFactoryPlanFixture = z.infer<typeof repoFactoryPlanFixtureSchema
  */
 export interface PlannedBootstrapFile {
   path: string;
-  mode: "100644";
+  mode: "100644" | "100755";
   content: string;
+  contentBase64?: string;
 }
 
 /** The one content file this producer commits. Its name is fixed; only its bytes vary by plan. */
@@ -187,12 +195,9 @@ export const plannedBootstrapFiles = (
  */
 const plannedFileSchema = z
   .object({
-    path: z
-      .string()
-      .regex(/^[A-Za-z0-9._-]+$/, "a planned file is a single file name at the repository root")
-      .refine((path) => path !== "." && path !== ".." && path !== ".git", "a planned file cannot name git's own entries")
-      .refine((path) => path !== OPERATION_MARKER_NAME, "a planned file cannot name the producer's marker"),
-    mode: z.literal("100644"),
+    path: genesisPath.refine(path => path !== OPERATION_MARKER_NAME, "reserved marker"),
+    mode: z.enum(["100644", "100755"]),
+    contentBase64: z.string().optional(),
     content: z.string(),
   })
   .strict();
@@ -266,8 +271,8 @@ export interface RepoFactoryProducerInput {
 }
 
 /** The blob id git gives `content`, in the object format the repository's own ids use. */
-const blobId = (content: string, objectFormat: "sha1" | "sha256"): string => {
-  const bytes = Buffer.from(content, "utf8");
+const blobId = (content: string | Buffer, objectFormat: "sha1" | "sha256"): string => {
+  const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
   return createHash(objectFormat).update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
 };
 
@@ -309,7 +314,7 @@ export const producedTreeDrift = async (
     const [mode = "", type = "", id = ""] = entry.slice(0, tab).split(" ");
     observed.set(entry.slice(tab + 1), { mode, type, id });
   }
-  const expected = new Map(approved.map((file) => [file.path, { mode: file.mode, type: "blob", id: blobId(file.content, objectFormat) }]));
+  const expected = new Map(approved.map((file) => [file.path, { mode: file.mode, type: "blob", id: blobId(file.contentBase64 === undefined ? file.content : Buffer.from(file.contentBase64,"base64"), objectFormat) }]));
   const missing = [...expected.keys()].filter((path) => !observed.has(path)).sort();
   const extra = [...observed.keys()].filter((path) => !expected.has(path)).sort();
   const changed = [...expected.entries()]
@@ -789,6 +794,14 @@ export const produceRepoFactoryResult = async (
   }
   const plan = parsedPlan.data;
   const clock = input.clock ?? systemClock;
+  if (plan.genesis) {
+    try {
+      parseGenesis(plan.genesis);
+      if (!isGenesisPlan(plan.githubOperations) || !plan.ciWorkflows?.length || !plan.verificationCommands?.length || plan.verificationKind !== "GENESIS_TEST") throw new Error("genesis requires PR bootstrap");
+      const contexts = plan.ciWorkflows.map(w => w.checkName).sort();
+      if (plan.githubOperations.some(o => o.resourceType === "branch-protection" && canonicalJson(o.desiredState.requiredStatusChecks?.contexts.slice().sort()) !== canonicalJson(contexts))) throw new Error("genesis required checks differ from manifest");
+    } catch { return deny(ReasonCode.INVALID_ARGUMENT,"genesis bundle refused before GitHub writes",{}); }
+  }
   // #246 C5 — create-only: no local commit; the head is the one GitHub initialized, read back.
   const createOnly = isCreateOnlyPlan(plan.githubOperations);
   const parsedFiles = createOnly
@@ -940,9 +953,12 @@ export const produceRepoFactoryResult = async (
   // #246 C5 — a create-only plan makes no commit and pushes none: the checkout stays unborn until the
   // create's step fetches the commit GitHub's initialization made and resets onto it.
   let validatedHead: string | null = null;
-  if (!createOnly) {
+  if (!createOnly && !plan.genesis) {
     // The approved files and nothing else (#246 C2): the bytes the plan's review read.
-    for (const file of approvedFiles) writeFileSync(join(localRepoPath, file.path), file.content);
+    for (const file of approvedFiles) {
+      mkdirSync(dirname(join(localRepoPath,file.path)),{recursive:true,mode:0o700});
+      writeFileSync(join(localRepoPath, file.path), file.contentBase64 === undefined ? file.content : Buffer.from(file.contentBase64,"base64"), {mode:file.mode === "100755" ? 0o755 : 0o644});
+    }
 
     // Only the approved files are tracked — the ownership marker above is bookkeeping for this
     // function's own retry/cleanup logic, not part of the repository's real content.
@@ -1052,6 +1068,32 @@ export const produceRepoFactoryResult = async (
               });
             },
         approvedTree,
+        ciWorkflows: plan.ciWorkflows,
+        prepareGenesis: async (parent) => {
+          await gitOrCleanup(["reset","--hard",parent]);
+          // Exact reviewed tree; the autoInit README survives only if the bundle includes it.
+          await gitOrCleanup(["rm","-r","--ignore-unmatch","--","."]);
+          for (const file of approvedFiles) {
+            mkdirSync(dirname(join(localRepoPath,file.path)),{recursive:true,mode:0o700});
+            writeFileSync(join(localRepoPath,file.path),file.contentBase64 === undefined ? file.content : Buffer.from(file.contentBase64,"base64"),{mode:file.mode === "100755" ? 0o755 : 0o644});
+          }
+          await gitOrCleanup(["add","--",...approvedFiles.map(f => f.path)]);
+          await gitOrCleanup(["-c","user.email=repo-factory@local","-c","user.name=Repo Factory","commit","--allow-empty","-m",plan.genesis!.commitMessage]);
+          const head = (await tryRevParse(localRepoPath,"HEAD"))!;
+          const parents=(await gitOrCleanup(["--no-replace-objects","rev-list","--max-count=1","--parents",head])).stdout.trim().split(/\s+/).slice(1);
+          if (parents.length !== 1 || parents[0] !== parent) return deny(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"genesis parent differs from autoInit head",{});
+          const checked = await approvedTree(head);
+          return checked.allowed ? allow(ReasonCode.OK,head) : checked as Decision<string>;
+        },
+        verifyGenesis: async (head) => {
+          if (await tryRevParse(localRepoPath,"HEAD") !== head || !plan.verificationCommands?.length) return deny(ReasonCode.VERIFICATION_GAP,"genesis PR checkout/head mismatch",{});
+          for (const command of plan.verificationCommands) {
+            const outcome = await runSandboxed({command,worktreePath:localRepoPath,denyReadPaths:[dirname(dirname(input.workDir))]});
+            if (outcome.status !== "PASS") return deny(ReasonCode.VERIFICATION_GAP,"genesis PR local verification failed",{commandId:command.id,status:outcome.status});
+          }
+          if (await tryRevParse(localRepoPath,"HEAD") !== head) return deny(ReasonCode.VERIFICATION_GAP,"genesis PR head moved during verification",{});
+          return approvedTree(head);
+        },
         validatedHead,
       });
     } catch (thrown) {
@@ -1117,7 +1159,14 @@ export const produceRepoFactoryResult = async (
   // The real verification kind this run promises `bootstrapVerification` about. A judge
   // that denies is a genuine observation, not a fabricated one, and it must refuse rather
   // than record PASS regardless.
-  const verificationSpec = VERIFICATION_KINDS[plan.verificationKind];
+  if (plan.verificationKind === "GENESIS_TEST") {
+    if (!plan.genesis || !plan.verificationCommands?.length) return deny(ReasonCode.VERIFICATION_GAP,"genesis test commands missing",{});
+    for (const command of plan.verificationCommands) {
+      const outcome = await runSandboxed({command,worktreePath:localRepoPath,denyReadPaths:[dirname(dirname(input.workDir))]});
+      if (outcome.status !== "PASS") {cleanup();return deny(ReasonCode.VERIFICATION_GAP,"genesis tests failed or could not be confined",{commandId:command.id,status:outcome.status});}
+    }
+  }
+  const verificationSpec = VERIFICATION_KINDS.CLEAN_TREE;
   const verificationRun = await gitOrCleanup(verificationSpec.argv, { allowFailure: true });
   const verificationJudged = verificationSpec.judge(verificationRun);
   if (!verificationJudged.allowed) {
@@ -1184,6 +1233,10 @@ export const produceRepoFactoryResult = async (
     }
   }
 
+  if (plan.genesis && (!github || !input.github?.port.observeGenesisCi || !plan.ciWorkflows?.length || !(await input.github.port.observeGenesisCi(github.execution.target,head,plan.ciWorkflows)))) {
+    cleanup();
+    return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,"genesis CI is not yet verified at the published head",{});
+  }
   const result: RepoFactoryResult = {
     schema: REPO_FACTORY_RESULT_SCHEMA_ID,
     runId: plan.runId,
@@ -1199,11 +1252,13 @@ export const produceRepoFactoryResult = async (
         // created, offered as a proposal only.
         proposedCheckoutPath: localRepoPath,
         defaultBranch: plan.defaultBranch,
-        createdBranches: [],
+        createdBranches: plan.genesis ? ["main","genesis","dev"] : [],
+        ...(plan.genesis ? {repositoryNodeId:applied?.receipts.find(r => r.resourceType === "repository")?.repositoryNodeId} : {}),
       },
     ],
     externalWriteReceipts: receipts,
     bootstrapVerification: [
+      ...(plan.verificationCommands?.slice(1).map(command => ({commandId:command.id,repositoryIdentity:identity,exactHead:head,status:"PASS" as const})) ?? []),
       {
         commandId: plan.verificationCommandId,
         repositoryIdentity: identity,
@@ -1212,7 +1267,7 @@ export const produceRepoFactoryResult = async (
       },
       ...(commitlorePass === null ? [] : [{ commandId: COMMITLORE_VERIFICATION_ID, repositoryIdentity: identity, exactHead: head, status: "PASS" as const }]),
     ],
-    ciEvidence: [],
+    ciEvidence: (plan.ciWorkflows ?? []).map(w => ({repositoryIdentity:identity,checkName:w.checkName,head,conclusion:"PASS" as const,workflowDigest:w.approvedDigest})),
     unresolvedGaps: [],
   };
 

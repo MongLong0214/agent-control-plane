@@ -50,6 +50,7 @@ const scratchRepo = async (): Promise<string> => {
   if (cloned.status !== 0) {
     throw new Error(`the scratch clone exited ${cloned.status}: ${cloned.stderr.trim()}`);
   }
+  copyFileSync(join(ROOT, "src/db/migrations.ts"), join(dir, "src/db/migrations.ts"));
   copyFileSync(join(ROOT, SCRIPT), join(dir, SCRIPT));
   copyFileSync(join(ROOT, "src/db/schema.sql"), join(dir, "src/db/schema.sql"));
   return dir;

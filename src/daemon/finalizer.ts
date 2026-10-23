@@ -673,6 +673,8 @@ export class ApprovedRunFinalizer {
         consumer,
       });
       if (!activated.allowed) return activated as Decision<unknown>;
+      const settled = this.cp.tasks.settleAdministrativeActivation(runId,this.#completionAuthority);
+      if (!settled.allowed) return settled;
       return this.cp.runs.transition(
         runId,
         RunState.COMPLETED,

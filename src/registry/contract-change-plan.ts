@@ -551,7 +551,8 @@ const validateContractChangePlan = (
       baseManifestDigest: baseDigest,
     });
   }
-  const lowered = verificationBarLowerings(base.value, manifest.value);
+  // Workflow replacements are reviewed independently and activated only by a CEO-confirmed grant.
+  const lowered = verificationBarLowerings(base.value, manifest.value).filter(entry => entry.kind !== "CI_WORKFLOW_DIGEST_CHANGED" || manifest.value.ciWorkflows.some(w => w.approvedDigest === null));
   if (lowered.length > 0) {
     // Lowering the bar needs the owner's approval bound to these exact lowerings. Nothing can bind
     // one yet, so every lowering is refused; a stricter or equivalent manifest is not. A changed

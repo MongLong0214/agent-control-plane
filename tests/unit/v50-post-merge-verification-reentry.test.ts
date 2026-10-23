@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { Db } from "../../src/db/database.ts";
@@ -37,7 +37,10 @@ describe("v49 → v50 post-merge re-entry", () => {
     const receipts = before.prepare("SELECT * FROM schema_migrations ORDER BY version").all();
     before.close();
     approveMigration(path, "v50 post-merge re-entry");
-    new Db(path).close();
+    let at50: Buffer | undefined;
+    new Db(path,{afterMigration:m => {if (m.toVersion === 50) {const reader = new Database(path,{readonly:true});try {at50 = reader.serialize();} finally {reader.close();}}}}).close();
+    // This test judges the released v50 boundary, before later additive steps.
+    expect(at50).toBeDefined();writeFileSync(path,at50!);
     expect(userVersionOf(path)).toBe(50);
     const afterSchema = schemaRowsOf(path);
     expect(afterSchema.filter((row) => !GUARDS.includes(row.name))).toEqual(beforeSchema.filter((row) => !GUARDS.includes(row.name)));

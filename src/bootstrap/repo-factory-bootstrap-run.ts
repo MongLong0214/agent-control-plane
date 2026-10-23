@@ -1,3 +1,4 @@
+import type { ResidentProjectProvisioning } from './resident-project-provisioning.ts';
 import { lstatSync, readdirSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 
@@ -34,7 +35,7 @@ import type {
   BootstrapApplicationReservation,
   BootstrapApplications,
 } from "./bootstrap-applications.ts";
-import { bootstrapActivationHandoff, currentBootstrapPlan, executablePlanOf, factsTargetOf, handoffFactsAre, observedRepositoryFacts, type PlannedBootstrapOutputs, plannedBootstrapOutputs } from "./bootstrap-plan.ts";
+import { currentBootstrapPlan, executablePlanOf, factsTargetOf, handoffFactsAre, observedRepositoryFacts, type PlannedBootstrapOutputs, plannedBootstrapOutputs } from "./bootstrap-plan.ts";
 import { type GitHubWritePort, type ObservedRepository, parseGitHubIdentity } from "./github-write-port.ts";
 import {
   githubLedgerPath,
@@ -142,9 +143,10 @@ export interface BootstrapConfirmation {
 }
 
 export interface RepoFactoryBootstrapRunnerDeps {
+  residentProjects?: ResidentProjectProvisioning;
   runs: Pick<RunEngine, "get" | "currentCandidate">;
   artifacts: Pick<ArtifactStore, "latest" | "list" | "put">;
-  bootstrap: Pick<BootstrapActivation, "activate" | "readinessForFactoryResult" | "reviewForConfirmation">;
+  bootstrap: Pick<BootstrapActivation, "activate" | "readinessForFactoryResult" | "reviewForConfirmation" | "residentGenesisRequired">;
   /** The production composition passes `createBootstrapGitHubWritePort()`; tests pass a double. */
   githubPort: GitHubWritePort;
   /** Each run produces under `<workRoot>/<runId>`. Null means this deployment never configured one. */
@@ -187,6 +189,8 @@ const LEDGER_REFUSALS = new Set(["LEDGER_CORRUPT", "LEDGER_FOREIGN", "LEDGER_UNS
 const WRITE_REQUEST_KIND = {
   createRepository: "repository",
   pushBranch: "branch",
+  createBranch: "branch",
+  ensureGenesisResources: "genesis-resources",
   setDefaultBranch: "setting",
   protectBranch: "branch-protection",
 } as const satisfies Record<string, PendingWrite["resourceType"]>;
@@ -194,6 +198,8 @@ const WRITE_REQUEST_KIND = {
 /** The kind of ledger intent a GitHub request at its start belongs to, or null for one that is none. */
 const requestKind = (request: BootstrapWriteRequest): PendingWrite["resourceType"] | null => {
   if (request.kind === "git") return request.method === "push" ? "branch" : null;
+  if (/\/git\/refs(?:$|\/)/.test(request.target)) return "branch";
+  if (/\/(?:labels|milestones|issues)(?:[?\/]|$)/.test(request.target)) return "genesis-resources";
   if (request.method === "POST") return "repository";
   if (request.method === "PATCH") return "setting";
   if (request.method === "PUT") return "branch-protection";
@@ -404,11 +410,23 @@ export class RepoFactoryBootstrapRunner {
   async produceAndActivateApproved(confirmation: BootstrapConfirmation): Promise<Decision<ACPBootstrapActivationResult>> {
     const scope = this.approvalScopeOf(confirmation.runId);
     if (!scope.allowed) return scope as Decision<ACPBootstrapActivationResult>;
+    const admissible = this.deps.ceo.assertCeoDecisionAdmissible({...confirmation,decision:"CONFIRM",rationale:confirmation.rationale ?? ""});
+    if (!admissible.allowed) return admissible as Decision<ACPBootstrapActivationResult>;
+    const current = currentBootstrapPlan(confirmation.runId,this.deps.artifacts.latest<unknown>(confirmation.runId,ArtifactKind.PLAN));
+    if (!current.allowed) return current as Decision<ACPBootstrapActivationResult>;
+    if (this.deps.bootstrap.residentGenesisRequired && !current.value.outputs.genesis) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap requires an inline genesis bundle and resident CTO",{});
+    if (current.value.outputs.genesis) {
+      if (!this.deps.residentProjects?.configured()) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident host provisioner/subscriber is not configured",{});
+      const reviewed = this.deps.bootstrap.reviewForConfirmation(confirmation.runId,confirmation.candidateSnapshotDigest);
+      if (!reviewed.allowed) return reviewed as Decision<ACPBootstrapActivationResult>;
+      try {this.deps.residentProjects?.remember(confirmation,current.value.manifest.projectId,{...current.value.binding,candidateSnapshotDigest:confirmation.candidateSnapshotDigest});}
+      catch {return deny(ReasonCode.CONFLICT,"confirmed provisioning intent conflicts with stored tuple",{});}
+    }
     return this.produceAndActivate({
       ...confirmation,
       approvedManifest: scope.value.approvedManifest,
       projectName: scope.value.projectName,
-      handoff: bootstrapActivationHandoff(scope.value.approvedManifest),
+      handoff: current.value.outputs.handoff,
     });
   }
 
@@ -1288,7 +1306,8 @@ export class RepoFactoryBootstrapRunner {
           : null;
         if (kind === null) return (value as (...args: unknown[]) => unknown).bind(target);
         return async (...args: unknown[]) => {
-          const pending = pendingKinds.get(kind);
+          const branch = (property === "createBranch" || property === "pushBranch" || property === "protectBranch") && typeof args[1] === "string" ? args[1] : null;
+          const pending = kind === "genesis-resources" ? undefined : branch === null ? pendingKinds.get(kind) : [...pendingAtStart.values()].find(p => p.resourceType === kind && p.resourceIdentity.endsWith(`#${branch}`));
           if (pending !== undefined) {
             const evidence = { operationId: pending.operationId, resourceType: kind, attemptedAt: pending.attemptedAt };
             onWithheld(evidence);
@@ -1519,9 +1538,14 @@ export class RepoFactoryBootstrapRunner {
     const port = this.deps.githubPort;
     const unsettled: Array<{ operationId: string; resourceType: PendingWrite["resourceType"]; attemptedAt: string }> = [];
     for (const [operationId, intent] of pendingAtStart) {
-      let settled: boolean;
+      let settled = false;
       try {
         switch (intent.resourceType) {
+          case "genesis-resources": {
+            const operation = execution.operations.find(o => o.operationId === operationId);
+            settled = repository !== null && operation?.resourceType === "genesis-resources" && typeof port.ensureGenesisResources === "function"; // The port reads each stable key/marker before creating the remaining resources.
+            break;
+          }
           case "repository":
             settled = repository !== null || intent.respondedNodeId !== null;
             break;

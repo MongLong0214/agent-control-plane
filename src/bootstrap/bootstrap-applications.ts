@@ -140,7 +140,7 @@ export const bootstrapReservationsHolding = (
   db
     .all<ApplicationRow>(
       `SELECT ${COLUMNS} FROM bootstrap_applications
-        WHERE (project_id = ? OR repository_identity = ?) AND phase <> 'RELEASED'
+        WHERE (project_id = ? OR repository_identity = ?) AND phase <> 'RELEASED' AND retired_at IS NULL
         ORDER BY run_id`,
       [held.projectId ?? null, held.repositoryIdentity ?? null],
     )
@@ -186,7 +186,11 @@ export class BootstrapApplications {
    */
   assertNotFrozen(runId: string, via: "plan_submit" | "FINAL_REVISE"): Decision<void> {
     const application = this.get(runId);
-    if (!applicationIsFrozen(application)) return allow(ReasonCode.OK, undefined);
+    if (!applicationIsFrozen(application)) {
+      const intent = this.db.get<{status:string}>(`SELECT status FROM resident_project_provisioning WHERE run_id = ? AND status IN ('PENDING','COMPLETE')`,[runId]);
+      if (intent) return deny(ReasonCode.BOOTSTRAP_APPLICATION_FROZEN,"a reviewed CEO-confirmed resident provisioning intent freezes its PLAN",{runId,via,status:intent.status});
+      return allow(ReasonCode.OK, undefined);
+    }
     return deny(
       ReasonCode.BOOTSTRAP_APPLICATION_FROZEN,
       "this bootstrap run's application is reserved, so its plan is frozen; only the same candidate can be confirmed again, under the same approved write scope",

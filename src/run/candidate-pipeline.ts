@@ -622,7 +622,7 @@ export class CandidatePipeline {
    * keeps `completeness` exactly. The owner was asserted by the caller just before.
    */
   private reviewEntry(run: RunRow): Decision<unknown> {
-    if (!isProjectlessBootstrap(run) || this.runs.repositoriesOf(run.runId).length > 0) return this.tasks.completeness(run.runId);
+    if (!isProjectlessBootstrap(run) || this.runs.repositoriesOf(run.runId).length > 0) return this.tasks.administrativeReviewEntry(run.runId);
     const current = currentBootstrapPlan(run.runId, this.artifacts.latest<unknown>(run.runId, ArtifactKind.PLAN));
     if (!current.allowed) return current;
     return this.tasks.bootstrapReviewEntry(run.runId, current.value.binding.planDigest);

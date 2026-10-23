@@ -1,3 +1,4 @@
+import { isDaemonFinalizerCompletion, type CompletionAuthority } from './run-engine.ts';
 import { parseRepoFactoryResult } from "../bootstrap/repo-factory-result.ts";
 import type { Clock } from "../core/clock.ts";
 import type {
@@ -995,6 +996,36 @@ export class TaskGraph {
    * §34.3 — synthesis and completion are blocked unless every task reached a terminal
    * state and every started execution produced a receipt.
    */
+  /** Administrative activation has no worker execution: the finalizer owns its settlement. */
+  administrativeContractChange(runId: string): boolean {
+    const run = this.db.get<{ kind: string }>(`SELECT kind FROM runs WHERE run_id = ?`, [runId]);
+    if (run?.kind !== "CONTRACT_CHANGE") return false;
+    const row = this.db.get<{ content_json: string }>(`SELECT content_json FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN' AND superseded = 0 ORDER BY created_at DESC, rowid DESC LIMIT 1`, [runId]);
+    const plan = row ? JSON.parse(row.content_json) as Record<string, unknown> : null;
+    const tasks = this.list(runId).filter(t => t.state !== TaskState.CANCELLED);
+    return tasks.length === 1 && (plan?.["repositoryContentChange"] === false || tasks.every(t => t.spec["repositoryContentChange"] === false)) &&
+      !this.db.get(`SELECT 1 FROM run_repositories WHERE run_id = ? LIMIT 1`, [runId]);
+  }
+
+  administrativeReviewEntry(runId: string): Decision<unknown> {
+    if (!this.administrativeContractChange(runId)) return this.completeness(runId);
+    const tasks = this.list(runId).filter(t => t.state !== TaskState.CANCELLED);
+    if (tasks.some(t => t.state !== TaskState.READY) || this.db.get(`SELECT 1 FROM task_executions WHERE run_id = ? LIMIT 1`, [runId])) {
+      return deny(ReasonCode.TASK_RESULT_COUNT_MISMATCH, "administrative activation requires one unexecuted READY task", { runId });
+    }
+    return allow(ReasonCode.OK, { administrativeActivation: true });
+  }
+
+  settleAdministrativeActivation(runId: string, completion?: CompletionAuthority): Decision<unknown> {
+    const entry = this.administrativeReviewEntry(runId);
+    if (!entry.allowed) return entry;
+    if (!this.administrativeContractChange(runId)) return entry;
+    if (!this.db.inTransaction || !isDaemonFinalizerCompletion(completion)) return deny(ReasonCode.COMPLETION_AUTHORITY_DENIED,"only the daemon finalizer settles administrative activation inside its activation transaction",{runId});
+    this.db.run(`UPDATE tasks SET state = 'SUCCEEDED', updated_at = ? WHERE run_id = ? AND state = 'READY'`, [this.clock.nowIso(), runId]);
+    this.audit.record({ kind: "CONTRACT_CHANGE_ACTIVATION_TASK_SETTLED", runId, evidence: { authority: "daemon-finalizer" } });
+    return allow(ReasonCode.OK, { settled: true });
+  }
+
   completeness(runId: string): Decision<{ tasks: number; succeeded: number }> {
     const tasks = this.list(runId);
     if (tasks.length === 0) {

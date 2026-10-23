@@ -570,7 +570,7 @@ describe("the v44 → v45 step", () => {
     expect(before.userVersion).toBe(44);
     approveMigration(path, "V45 M1 witness");
     new Db(path).close();
-    const after = contentDigests(path);
+    const after = contentDigests(path, before.userVersion);
     expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsBefore, ...restBefore } = before.tables;
     const { schema_migrations: receiptsAfter, manifest_first_activation_grants: added, ...restAfter } = after.tables;

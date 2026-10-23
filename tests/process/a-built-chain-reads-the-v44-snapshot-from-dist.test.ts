@@ -79,10 +79,11 @@ const schemaFilesBesideMigrations = (): string[] =>
  */
 const scratchBuild = (): string => {
   const root = join(tempDir("acp-a0-build-"), "repo");
-  for (const file of ["package.json", "tsconfig.json", "tsconfig.build.json", "scripts/copy-native-fd-vfs-into-dist.mjs", NATIVE_EXTENSION]) {
+  for (const file of ["package.json", "tsconfig.json", "tsconfig.build.json", NATIVE_EXTENSION]) {
     mkdirSync(dirname(join(root, file)), { recursive: true });
     cpSync(join(ROOT, file), join(root, file));
   }
+  cpSync(join(ROOT, "scripts"), join(root, "scripts"), { recursive: true });
   cpSync(join(ROOT, "src"), join(root, "src"), { recursive: true });
   symlinkSync(join(ROOT, "node_modules"), join(root, "node_modules"));
   const { scripts } = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { scripts: { build: string } };

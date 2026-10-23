@@ -84,6 +84,7 @@ export const makeHarness = (
     root?: string;
     /** Issue #246 — the Repo Factory work root and GitHub double the composed runner uses. */
     repoFactory?: ControlPlaneConfig["repoFactory"];
+    residentProvisioner?: ControlPlaneConfig["residentProvisioner"];
     /** The blind reviewer's preference and fallbacks; the scripted reviewer alone when omitted. */
     reviewer?: ControlPlaneConfig["reviewer"];
   } = {},
@@ -135,6 +136,7 @@ console.log('verification ok');`,
     ...(options.githubAppEnvFile ? { githubAppEnvFile: options.githubAppEnvFile } : {}),
     ...(options.githubAppPrivateKeyPath ? { githubAppPrivateKeyPath: options.githubAppPrivateKeyPath } : {}),
     ...(options.repoFactory ? { repoFactory: options.repoFactory } : {}),
+    ...(options.residentProvisioner ? {residentProvisioner:options.residentProvisioner} : {}),
   });
 
   // A route for the roles the control plane binds. The daemon wires the real CLI

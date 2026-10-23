@@ -1,3 +1,4 @@
+import { genesisBundleSchema } from '../bootstrap/genesis-bundle.ts';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -210,11 +211,15 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       const frozen = source.bootstrapApplications.assertNotFrozen(runId, "plan_submit");
       if (!frozen.allowed) return frozen as Decision<{ digest: string }>;
       const run = source.runs.require(runId);
+      if (isProjectlessBootstrap(run) && source.bootstrap.residentGenesisRequired && plan["genesis"] === undefined) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap PLAN requires inline genesis bytes",{refusal:"GENESIS_MISSING"});
       const admitted = isContractChangeRun(run)
         ? contractChangePlanForSubmission(run, plan, (digest) => source.projects.manifest(digest), firstActivationFactsOf(source.db, run))
         : planForSubmission(run, plan);
       if (!admitted.allowed) return admitted as Decision<{ digest: string }>;
-      return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, admitted.value).digest });
+      const stored = isProjectlessBootstrap(run) && admitted.value["genesis"] !== undefined
+        ? {...admitted.value,originatingContract:source.artifacts.latest<unknown>(runId,ArtifactKind.TASK_CONTRACT)?.content ?? null}
+        : admitted.value;
+      return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, stored).digest });
     },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
     isProjectlessBootstrapRun: (runId: string) => isProjectlessBootstrap(source.runs.require(runId)),
@@ -490,6 +495,13 @@ const createCtoServerFromPort = (
         ...mutation, ...runIdentity,
         plan: z.object({
           summary: z.string(),
+          genesis: genesisBundleSchema.optional(),
+          repositoryContentChange: z.boolean().optional(),
+          firstActivation: z.boolean().optional(),
+          workflowRevisions: z.array(z.object({
+            repositoryRole: z.string(), repositoryIdentity: z.string(), path: z.string(), checkName: z.string(),
+            commitSha: z.string().regex(/^[a-f0-9]{40}$/), fileDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+          }).strict()).optional(),
           dependencies: z.array(z.string()).default([]),
           repositoryIntent: z.array(z.string()).default([]),
           verificationIntent: z.array(z.string()).default([]),

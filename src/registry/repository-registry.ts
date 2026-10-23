@@ -443,14 +443,14 @@ export class RepositoryRegistry {
   }
 
   byIdentity(identity: string): RepositoryRecord | null {
-    const row = this.db.get<RawRepository>(`SELECT * FROM repositories WHERE identity = ?`, [
+    const row = this.db.get<RawRepository>(`SELECT * FROM repositories WHERE identity = ? AND retired_at IS NULL`, [
       identity,
     ]);
     return row ? hydrate(row) : null;
   }
 
   byCheckoutPath(checkoutPath: string): RepositoryRecord | null {
-    const row = this.db.get<RawRepository>(`SELECT * FROM repositories WHERE checkout_path = ?`, [
+    const row = this.db.get<RawRepository>(`SELECT * FROM repositories WHERE checkout_path = ? AND retired_at IS NULL`, [
       canonical(checkoutPath),
     ]);
     return row ? hydrate(row) : null;
@@ -465,7 +465,7 @@ export class RepositoryRegistry {
 
   byProject(projectId: string): RepositoryRecord[] {
     return this.db
-      .all<RawRepository>(`SELECT * FROM repositories WHERE project_id = ? ORDER BY created_at, repository_id`, [
+      .all<RawRepository>(`SELECT * FROM repositories WHERE project_id = ? AND retired_at IS NULL ORDER BY created_at, repository_id`, [
         projectId,
       ])
       .map(hydrate);

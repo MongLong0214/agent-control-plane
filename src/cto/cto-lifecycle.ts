@@ -1295,6 +1295,9 @@ export class CtoLifecycle {
    */
   private async spawn(request: SpawnRequest): Promise<Decision<string>> {
     const { role, scope, purpose, runtime, canonicalGuard } = request;
+    const residentProject = () => role === Role.PRIMARY_CTO && this.db.get(`SELECT 1 FROM resident_project_provisioning WHERE project_id = ? UNION ALL SELECT 1 FROM canonical_session_entitlements WHERE project_id = ? LIMIT 1`,[scope,scope]);
+    const residentRefusal = () => deny<string>(ReasonCode.CONFLICT,"a resident canonical CTO is recovered on its allocated UUID by the host provisioner",{projectId:scope});
+    if (residentProject()) return residentRefusal();
     // #246 C1b — a BOOTSTRAP_CTO runs on the real headless runtime, and is refused before anything
     // starts when there is none: readiness then has nothing that could authenticate it. #246 C4 — so
     // does a PRIMARY_CTO a bootstrap activation asked for driven; any other PRIMARY_CTO does not.
@@ -1326,6 +1329,7 @@ export class CtoLifecycle {
       if (!prepared.allowed) return prepared as Decision<string>;
     }
 
+    if (residentProject()) return residentRefusal();
     if (canonicalGuard) {
       const claimed = this.#releasedCanonicalHolder(scope, canonicalGuard.roleKey);
       if (claimed) return this.#refuseAdoptedCanonical<string>(claimed, null, null, canonicalGuard.runId);

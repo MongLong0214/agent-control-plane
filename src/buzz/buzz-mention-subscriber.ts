@@ -2214,6 +2214,7 @@ export interface BuzzMentionSubscriberHandle {
    * with its window kept. The daemon calls this on every committed binding switch (bind, re-claim,
    * session change, revoke). Idempotent, and a no-op once closed.
    */
+  reconcile?(identities: readonly BuzzSubscriberIdentityConfig[]): void;
   rejudge(): void;
   /**
    * Whether the configured identity with channel key `actorId` may be woken for delivery to
@@ -2402,6 +2403,7 @@ export const startBuzzMentionSubscriber = (
   const identityRooms: BuzzSubscriberIdentityRooms[] = [];
 
   // The configuration pass. Every failure here refuses the whole start, before any judgement.
+  let configured = [...options.config.identities];
   options.config.identities.forEach((identity, index) => {
     const what = `identities[${index}]`;
     // The path is compared as configured. Two entries naming one path are one identity written
@@ -2501,7 +2503,7 @@ export const startBuzzMentionSubscriber = (
   };
 
   return {
-    socketCount: prepared.length,
+    get socketCount() { return prepared.length; },
     // Summed rather than per-identity: the operator question this answers is "is anything
     // arriving at all", and a per-identity breakdown is a later refinement of an answer that does
     // not exist yet. Admission is the per-identity part, and it rides beside the sums.
@@ -2530,6 +2532,27 @@ export const startBuzzMentionSubscriber = (
         subscription.admitted && judged.verdict === "ADMITTED" && judged.binding.roleKey === holder.roleKey;
       return { eligible, room: eligible && judged.verdict === "ADMITTED" ? judged.binding.room : null };
     },
+    reconcile: (identities) => {
+      if (closed) throw new Error("subscriber closed");
+      if (identities.length) parseBuzzSubscriberConfig(JSON.stringify({relayUrl:options.config.relayUrl,identities}));
+      // Validate every key/room before touching a live connection. Unchanged subscriptions retain cursors.
+      const loaded = identities.map((identity,index) => ({identity,material:loadBuzzSubscriberKey(identity,`identities[${index}]`)}));
+      if (new Set(loaded.map(x => x.material.pubkey)).size !== loaded.length) throw new Error("duplicate subscriber identity");
+      const next: BuzzMentionSubscription[] = [];
+      for (const {identity,material} of loaded) {
+        const oldIndex = configured.findIndex(c => c.privateKeyFile === identity.privateKeyFile && c.encoding === identity.encoding && JSON.stringify(c.rooms) === JSON.stringify(identity.rooms));
+        const old = oldIndex < 0 ? undefined : prepared[oldIndex];
+        if (old && old.pubkey !== material.pubkey) throw new Error("subscriber key changed at an allocated path");
+        const subscription = old ?? new BuzzMentionSubscription(deps,{ordinal:`identities[${next.length}]`,pubkey:material.pubkey,secretKey:material.secretKey,rooms:identity.rooms});
+        next.push(subscription);
+      }
+      for (const subscription of prepared) if (!next.includes(subscription)) subscription.close();
+      const added = next.filter(s => !prepared.includes(s));
+      prepared.splice(0,prepared.length,...next); configured = [...identities];
+      rooms.clear(); identityRooms.splice(0);
+      loaded.forEach(({identity,material}) => {identity.rooms.forEach(room => rooms.add(room));identityRooms.push({actorId:material.pubkey,rooms:[...identity.rooms]});});
+      for (const subscription of added) {apply(subscription,subscription.judge());subscription.open();}
+    },
     rejudge: () => {
       if (closed) return;
       // Every answer read first, as at startup; then the identities that are not admissible are
@@ -2551,7 +2574,7 @@ export const startBuzzMentionSubscriber = (
         subscription.admitted && subscription.roleKey !== null ? [subscription.roleKey] : [],
       );
     },
-    rooms: [...rooms],
+    get rooms() { return [...rooms]; },
     identityRooms,
     settled: async () => {
       for (const subscription of prepared) await subscription.settled();
@@ -2596,8 +2619,9 @@ export const startBuzzMentionSubscriber = (
 export const startBuzzMentionSubscriberFromStateDir = (
   stateDir: string,
   options: Omit<BuzzMentionSubscriberOptions, "config">,
+  fallbackRelayUrl?: string,
 ): BuzzMentionSubscriberHandle => {
   const config = readBuzzSubscriberConfig(stateDir);
-  if (config === null) return DISABLED;
+  if (config === null) return fallbackRelayUrl ? startBuzzMentionSubscriber({...options,config:{relayUrl:fallbackRelayUrl,identities:[]}}) : DISABLED;
   return startBuzzMentionSubscriber({ ...options, config });
 };

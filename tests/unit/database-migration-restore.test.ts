@@ -1,3 +1,4 @@
+import { takeBackV52 } from '../helpers/released-v50-schema.ts';
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
@@ -372,6 +373,7 @@ const asV33Fixture = (path: string): void => {
 
   const raw = new Database(path);
   try {
+    takeBackV52(raw);
     for (const column of ["target_bind_executor_runtime_identity", "target_bind_receipt_json"]) {
       const present = raw
         .prepare("SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = ?")
@@ -445,6 +447,7 @@ const asV34Fixture = (path: string, options: { unresolvedTurn?: boolean } = {}):
 
   const raw = new Database(path);
   try {
+    takeBackV52(raw);
     raw.exec(`
       DROP TRIGGER IF EXISTS inbound_messages_payload_immutable;
       DROP TRIGGER IF EXISTS inbound_messages_no_replace;
@@ -615,6 +618,7 @@ const asV35IngressClaimFixture = (
 
   const raw = new Database(path);
   try {
+    takeBackV52(raw);
     // v36/v38 guards are absent from the historical image before its seed is replayed.
     raw.exec(`
       DROP TRIGGER IF EXISTS inbound_messages_turn_claim_identity_immutable;
@@ -1100,7 +1104,7 @@ describe("versioned SQLite migration", () => {
       // without bumping SCHEMA_VERSION, or a gap in `fromVersion`/`toVersion` — the line above
       // passes in both cases, and these do not.
       expect(SCHEMA_VERSION).toBe(Math.max(...MIGRATIONS.map((m) => m.toVersion)));
-      expect(MIGRATIONS.map((m) => m.fromVersion)).toEqual(MIGRATIONS.map((m) => m.toVersion - 1));
+      expect(MIGRATIONS.map((m) => m.fromVersion)).toEqual([MIGRATIONS[0]!.fromVersion, ...MIGRATIONS.slice(0,-1).map(m => m.toVersion)]);
       expect(migrated.all<{ name: string }>(
         `SELECT name FROM sqlite_master WHERE type = 'trigger'
           AND name IN ('inbound_messages_delete_authority', 'inbound_messages_override_insert_authority')
@@ -1249,7 +1253,8 @@ describe("versioned SQLite migration", () => {
         [47, "v47-owner-decision-authority-guard"],
         [48, "v48-owner-decision-supersede-guard"],
         [49, "v49-branch-publish-receipts"],
-        [SCHEMA_VERSION, "v50-post-merge-verification-reentry"],
+        [50, "v50-post-merge-verification-reentry"],
+        [52, "v52-resident-project-provisioning"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

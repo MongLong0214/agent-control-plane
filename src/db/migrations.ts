@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 50;
+export const SCHEMA_VERSION = 52;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -28,7 +28,7 @@ const schemaSqlAt = (version: number): string =>
         : version <= 46 ? readFileSync(v46SchemaPath, "utf8")
           : version <= 47 ? readFileSync(v47SchemaPath, "utf8")
             : version <= 48 ? readFileSync(v48SchemaPath, "utf8")
-              : version <= LATEST_FROZEN_VERSION ? readFileSync(v49SchemaPath, "utf8") : schemaSql();
+              : version <= 49 ? readFileSync(v49SchemaPath, "utf8") : version <= LATEST_FROZEN_VERSION ? readFileSync(new URL("./schema-v50.sql", import.meta.url), "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -3990,6 +3990,42 @@ const v50: SchemaMigration = {
   checksum: () => migrationChecksum("v50-post-merge-verification-reentry", 50),
 };
 
+/** v51 belongs to the ingress lane. On integration insert it before this step and change this predecessor to 51. */
+const v52: SchemaMigration = {
+  id: "v52-resident-project-provisioning", fromVersion: 50, toVersion: 52,
+  foreignKeysOffDuringApply: true,
+  apply(raw) {
+    const ddl = schemaSql();
+    // Keep the canonical definitions identical on fresh installs and upgrades. Legacy rename
+    // semantics plus foreign_keys=OFF preserve every other table's references to these names.
+    raw.pragma("legacy_alter_table = ON");
+    try {
+      for (const table of ["projects", "repositories", "bootstrap_applications"]) {
+        const prior = `${table}_v52_prior`;
+        if (raw.prepare("SELECT 1 FROM sqlite_master WHERE name = ?").get(prior)) throw new Error("v52 temporary name occupied");
+        const definition = new RegExp(String.raw`CREATE TABLE IF NOT EXISTS ${table} \([\s\S]*?\n\)(?: WITHOUT ROWID)?;`).exec(ddl)?.[0];
+        if (!definition) throw new Error("v52 table definition absent");
+        const names = raw.prepare("SELECT type,name FROM sqlite_master WHERE tbl_name = ? AND type IN ('index','trigger') AND sql IS NOT NULL").all(table) as {type:string;name:string}[];
+        for (const object of names) raw.exec(`DROP ${object.type.toUpperCase()} "${object.name}"`);
+        raw.exec(`ALTER TABLE ${table} RENAME TO ${prior}`);
+        raw.exec(definition);
+        const columns = sharedColumns(raw,prior,table);
+        const rowid = table !== "bootstrap_applications";
+        const list = [...(rowid ? ["rowid"] : []),...columns].map(c => `"${c}"`).join(",");
+        const rows = (name:string):string => JSON.stringify(raw.prepare(`SELECT ${list} FROM ${name} ORDER BY ${rowid ? "rowid" : "run_id"}`).all());
+        const before = rows(prior);
+        raw.exec(`INSERT INTO ${table} (${list}) SELECT ${list} FROM ${prior}`);
+        if (rows(table) !== before) throw new Error("v52 row preservation failed");
+        raw.exec(`DROP TABLE ${prior}`);
+        for (const match of ddl.matchAll(/CREATE (?:UNIQUE )?INDEX IF NOT EXISTS \w+[\s\S]*?;/g)) if (new RegExp(String.raw`ON ${table}\(`).test(match[0])) raw.exec(match[0]);
+        for (const match of ddl.matchAll(/CREATE TRIGGER IF NOT EXISTS \w+[\s\S]*?\nEND;/g)) if (new RegExp(String.raw`ON ${table}\b`).test(match[0].split("BEGIN")[0]!)) raw.exec(match[0]);
+      }
+    } finally {raw.pragma("legacy_alter_table = OFF");}
+    raw.exec(ddl.slice(ddl.indexOf('-- v52:')));
+  },
+  checksum: () => migrationChecksum("v52-resident-project-provisioning", 52),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -4030,6 +4066,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v48,
   v49,
   v50,
+  v52,
 ]);
 
 interface RequiredTrigger {
@@ -4040,6 +4077,16 @@ interface RequiredTrigger {
 }
 
 const REQUIRED_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
+  {name:"project_retirements_identity_immutable",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"project_retirements_no_replace",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"project_retirements_no_delete",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+
+  {name:"resident_project_provisioning_identity_immutable",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"resident_project_provisioning_no_replace",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"resident_project_provisioning_no_delete",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"canonical_session_entitlements_identity_immutable",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"canonical_session_entitlements_no_replace",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"canonical_session_entitlements_no_delete",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
   { name: "runs_state_transition_authority_guard", sentinel: "RUN_STATE_TRANSITION_AUTHORITY_DENIED" },
   { name: "tasks_run_work_sealed", sentinel: "TASK_INSERT_RUN_SEALED" },
   { name: "run_artifacts_evidence_authority_guard", sentinel: "EVIDENCE_WRITE_AUTHORITY_DENIED" },
@@ -4383,7 +4430,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 49;
+const LATEST_FROZEN_VERSION = 50;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when
