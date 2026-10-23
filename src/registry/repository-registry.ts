@@ -8,7 +8,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import { bootstrapReservationsHolding } from "../bootstrap/bootstrap-applications.ts";
 import type { Db } from "../db/database.ts";
-import { currentBranch, isClean, mergeBase, remoteUrl, toplevel, tryRevParse } from "../git/git.ts";
+import { git, mergeBase, remoteUrl, toplevel, tryRevParse, withoutRepositoryPrograms } from "../git/git.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
 import type { ProjectRegistry } from "./project-registry.ts";
 
@@ -36,6 +36,7 @@ export interface RepositoryInspection {
   checkoutPath: string;
   acceptedHead: string | null;
   observedHead: string | null;
+  branch: string | null;
   observedAt: string;
   clean: boolean;
   driftState: RepositoryRecord["driftState"];
@@ -111,6 +112,33 @@ const toplevelOrRefusal = async (path: string): Promise<Decision<string>> => {
     return deny(ReasonCode.NOT_FOUND, "path is not inside a git work tree", { path });
   }
   return allow(ReasonCode.OK, root);
+};
+
+/** Branch, HEAD and worktree entries must come from the same bounded Git reading. */
+const checkoutSnapshot = async (path: string): Promise<{ head: string | null; branch: string | null; clean: boolean }> => {
+  const programs = await withoutRepositoryPrograms(path);
+  const { stdout } = await git(path, [
+    ...programs, "status", "--porcelain=v2", "--branch", "--untracked-files=all", "--ignore-submodules=dirty",
+  ]);
+  const lines = stdout.split("\n").filter((line) => line.length > 0);
+  const oid = lines.find((line) => line.startsWith("# branch.oid "))?.slice("# branch.oid ".length);
+  const head = oid === "(initial)" ? null : oid;
+  const branch = lines.find((line) => line.startsWith("# branch.head "))?.slice("# branch.head ".length);
+  if (head === undefined || branch === undefined) throw new Error("git status omitted branch headers");
+  const attached = branch === "(detached)" ? null : branch;
+  if (attached !== null && head !== null) {
+    // git status reads the branch name and the HEAD commit separately, so a checkout switched during
+    // the call can report a branch with another branch's commit (#1187 r3). The branch ref itself must
+    // name the observed commit; otherwise the observation is incoherent and nothing is acknowledged.
+    const ref = await git(path, [...programs, "rev-parse", "--verify", "--quiet", `refs/heads/${attached}^{commit}`])
+      .then((result) => result.stdout.trim(), () => null);
+    if (ref !== head) return { head, branch: null, clean: false };
+  }
+  return {
+    head,
+    branch: attached,
+    clean: head !== null && !lines.some((line) => !line.startsWith("# ")),
+  };
 };
 
 export class RepositoryRegistry {
@@ -324,26 +352,27 @@ export class RepositoryRegistry {
       inspection = (await this.inspect(repositoryId))!;
       const manifest = record.projectId ? this.projects.activeManifest(record.projectId) : null;
       const defaultBranch = manifest?.manifest.branchProfile.defaultBranch;
-      const branch = defaultBranch && inspection.observedHead ? await currentBranch(record.checkoutPath) : null;
-      const onDefaultBranch = defaultBranch !== undefined && branch !== "HEAD" && branch === defaultBranch;
+      const onDefaultBranch = defaultBranch !== undefined && inspection.branch !== null && inspection.branch === defaultBranch;
       if (defaultBranch && inspection.observedHead && !onDefaultBranch) inspection.driftState = "DRIFTED";
-      // An unchanged head needs no acceptance or ancestry probe; only its observed verdict changes.
-      if (onDefaultBranch && inspection.clean && inspection.observedHead === record.lastObservedHead) {
-        inspection.driftState = "IN_SYNC";
-      }
-      if (record.registration === "REGISTERED" && onDefaultBranch && inspection.clean &&
-          inspection.observedHead && inspection.observedHead !== record.lastObservedHead &&
-          record.lastObservedHead &&
-          await mergeBase(record.checkoutPath, record.lastObservedHead, inspection.observedHead) === record.lastObservedHead) {
-        // Git probes are separate observations. Recheck the local checkout before accepting it,
-        // and never substitute a remote merge SHA for a head actually present here.
-        if (await currentBranch(record.checkoutPath) === defaultBranch &&
-            await isClean(record.checkoutPath) &&
-            await tryRevParse(record.checkoutPath, "HEAD") === inspection.observedHead &&
-            this.byId(repositoryId)?.lastObservedHead === record.lastObservedHead &&
-            this.projects.get(record.projectId!)?.activeManifestDigest === manifest?.digest) {
-          this.acknowledgeHead(repositoryId, inspection.observedHead);
-          return this.byId(repositoryId);
+      if (onDefaultBranch && inspection.clean && inspection.observedHead) {
+        const unchanged = inspection.observedHead === record.lastObservedHead;
+        const descendant = record.registration === "REGISTERED" && !unchanged && record.lastObservedHead &&
+          await mergeBase(record.checkoutPath, record.lastObservedHead, inspection.observedHead) === record.lastObservedHead;
+        if (unchanged || descendant) {
+          // Recheck one coherent snapshot after the awaited ancestry probe. Repeating separate
+          // branch/status/HEAD probes can reproduce the same combination that never existed.
+          const latest = await checkoutSnapshot(record.checkoutPath);
+          if (latest.branch === defaultBranch && latest.clean && latest.head === inspection.observedHead &&
+              this.byId(repositoryId)?.lastObservedHead === record.lastObservedHead &&
+              this.projects.get(record.projectId!)?.activeManifestDigest === manifest?.digest) {
+            if (descendant) {
+              this.acknowledgeHead(repositoryId, inspection.observedHead);
+              return this.byId(repositoryId);
+            }
+            inspection.driftState = "IN_SYNC";
+          } else {
+            inspection.driftState = "DRIFTED";
+          }
         }
       }
     } catch {
@@ -365,8 +394,7 @@ export class RepositoryRegistry {
     const record = this.byId(repositoryId);
     if (!record) return null;
 
-    const observedHead = await tryRevParse(record.checkoutPath, "HEAD");
-    const clean = observedHead ? await isClean(record.checkoutPath) : false;
+    const { head: observedHead, branch, clean } = await checkoutSnapshot(record.checkoutPath);
     const driftState: RepositoryRecord["driftState"] =
       record.driftState === "DRIFTED"
         ? "DRIFTED"
@@ -380,6 +408,7 @@ export class RepositoryRegistry {
       checkoutPath: record.checkoutPath,
       acceptedHead: record.lastObservedHead,
       observedHead,
+      branch,
       observedAt: this.clock.nowIso(),
       clean,
       driftState,

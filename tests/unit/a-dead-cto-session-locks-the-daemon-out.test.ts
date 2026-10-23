@@ -802,3 +802,17 @@ describe("ACP1045-R1-02: project and CTO reports still block on a project's CTO"
     });
   });
 });
+
+
+it.each(["ERROR", "STOPPED"] as const)("a settled %s CTO stays visible without blocking its recovery door", async (lifecycle) => {
+  const { harness, sessionId } = await deadCanonicalCto({ lifecycle: "ERROR" });
+  if (lifecycle === "STOPPED") expect(harness.cp.sessions.transition(sessionId, SessionLifecycle.STOPPED).allowed).toBe(true);
+  expect((await harness.cp.doctor.run("system")).findings).toContainEqual(expect.objectContaining({
+    code: "SESSION_PROCESS_MISSING", scope: `session:${sessionId}`, severity: "ERROR", blocking: false,
+  }));
+  for (const target of [sessionId, undefined]) {
+    expect((await harness.cp.doctor.run("session", target)).findings).toContainEqual(expect.objectContaining({
+      code: "SESSION_PROCESS_MISSING", scope: `session:${sessionId}`, severity: "ERROR", blocking: true,
+    }));
+  }
+});
