@@ -148,8 +148,10 @@ describe("round-2 outbox fencing", () => {
     ]);
   });
 
-  it("ACP-R1-01 keeps an actionable instruction a non-retryable delivery refused, with its classification, until it is re-armed", () => {
+  it("ACP-R1-01 keeps an actionable instruction a non-retryable delivery refused, with its classification, and does not re-send it", () => {
     const { core, seeded } = seededCore();
+    // The target has a Buzz route, so the refusal is the relay's, not the absence of a route.
+    core.db.run("UPDATE sessions SET buzz_address = 'chan', buzz_actor_id = 'actor:target' WHERE session_id = ?", [seeded.sessionId]);
     const message = enqueue(core, seeded, "outbox:retained-refusal");
     if (!message.allowed) throw new Error(message.message);
     const claimed = core.outbox.claimDeliverable()[0]!;
@@ -203,16 +205,13 @@ describe("round-2 outbox fencing", () => {
     const errored = core.sessions.transition(seeded.sessionId, SessionLifecycle.ERROR, "runtime failed");
     expect(errored.reasonCode).toBe(ReasonCode.OK);
 
-    // ACP-R1-01: the actionable instructions are kept for the role's next holder, their claim
-    // released, so nothing stays claimed for a dead runtime; everything else is fenced as before.
-    for (const messageId of [claimed.messageId, pending.value.messageId]) {
-      expect(
-        core.db.get<{ status: string; claim_token: string | null }>(
-          "SELECT status, claim_token FROM outbox WHERE message_id = ?",
-          [messageId],
-        ),
-      ).toEqual({ status: "PENDING", claim_token: null });
-    }
+    // ACP-R1-01: the actionable instructions are kept exactly as they are for the role's next
+    // holder — queued, or claimed by a send whose outcome is unknown, which no claim of the dead
+    // runtime can complete — and only a handover to a new receiver delivers them again.
+    expect(core.db.get<{ status: string }>("SELECT status FROM outbox WHERE message_id = ?", [claimed.messageId]))
+      .toEqual({ status: "IN_FLIGHT" });
+    expect(core.db.get<{ status: string }>("SELECT status FROM outbox WHERE message_id = ?", [pending.value.messageId]))
+      .toEqual({ status: "PENDING" });
     expect(
       core.db.get<{ status: string; reason_code: string }>(
         "SELECT status, reason_code FROM outbox WHERE message_id = ?",

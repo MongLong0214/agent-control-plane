@@ -14,6 +14,7 @@ import {
   HOLDER_CLAIMED_KIND_SQL,
   handoverInstructionRowSql,
   inBandRow,
+  rearmRetainedDeliveries,
   settleStoppedSessionInstructions,
 } from "../outbox/outbox.ts";
 import { isBuzzKeyPossession, type BuzzKeyPossession } from "../buzz/buzz-bind-challenge.ts";
@@ -672,6 +673,8 @@ export class SessionRegistry {
           sessionId,
         });
       }
+      // ACP-R1-01, ACP-R2-01: a bound channel identity is a route change for this runtime.
+      rearmRetainedDeliveries(this.db, { sessionId });
       if (holders.history.length === 0) {
         this.audit.record({
           kind: "SESSION_BUZZ_ACTOR_BOUND",
@@ -767,6 +770,8 @@ export class SessionRegistry {
           { sessionId, buzzActorId: actorId },
         );
       }
+      // ACP-R1-01, ACP-R2-01: a bound channel identity is a route change for this runtime.
+      rearmRetainedDeliveries(this.db, { sessionId });
     } catch (err) {
       if (isAcpError(err) && err.reasonCode === ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND) {
         return deny(err.reasonCode, err.message, {
@@ -859,14 +864,28 @@ export class SessionRegistry {
 
   setBuzzAddress(sessionId: string, address: string | null): void {
     this.db.tx(() => {
+      const previous = this.db.get<{ buzz_address: string | null }>(
+        `SELECT buzz_address FROM sessions WHERE session_id = ?`, [sessionId],
+      );
       this.db.run(`UPDATE sessions SET buzz_address = ?, updated_at = ? WHERE session_id = ?`, [
         address,
         this.clock.nowIso(),
         sessionId,
       ]);
+      // ACP-R1-04: every address change leaves an immutable trail, so a session's room history is
+      // provable from the audit log rather than inferred from the column's current value.
+      if (previous && (previous.buzz_address ?? null) !== (address ?? null)) {
+        this.audit.record({
+          kind: "SESSION_BUZZ_ADDRESS_CHANGED",
+          sessionId,
+          evidence: { from: previous.buzz_address ?? null, to: address ?? null },
+        });
+      }
       // ACP-R1-04: a role whose current runtime this is joins the new room now, not when the
       // session was created or bound.
       this.recordRoomMembership(sessionId);
+      // ACP-R1-01, ACP-R2-01: an address set or restored is a route change for this runtime.
+      if ((address ?? "") !== "") rearmRetainedDeliveries(this.db, { sessionId });
     });
   }
 

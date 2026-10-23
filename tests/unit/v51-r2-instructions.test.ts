@@ -157,11 +157,12 @@ it("an unACKed SENT instruction is kept when its Buzz holder stops, and handed t
     expect((await f.h.buzzAdapter.deliverPending()).delivered).toContain(f.dispatchId);
     expect(row(f, f.dispatchId)?.status).toBe("SENT");
     expect(f.h.cp.sessions.transition(holder.sessionId, SessionLifecycle.STOPPED, "died before ACK").allowed).toBe(true);
-    expect(row(f, f.dispatchId)?.status).toBe("PENDING");
+    // Kept as it is for the next holder: never re-sent to the receiver that may already have it.
+    expect(row(f, f.dispatchId)?.status).toBe("SENT");
     f.h.cp.outbox.fenceUndeliverable();
     f.h.clock.advance(31 * 60_000);
     f.h.cp.outbox.expireOverdue();
-    expect(row(f, f.dispatchId)?.status).toBe("PENDING");
+    expect(row(f, f.dispatchId)?.status).toBe("SENT");
     const next = takeOver(f, "actor:after-the-stop");
     expect(row(f, f.dispatchId)).toMatchObject({ status: "PENDING", target_session_id: next.sessionId });
     expect((await f.h.buzzAdapter.deliverPending()).delivered).toContain(f.dispatchId);
@@ -185,7 +186,8 @@ it("a Buzz delivery that keeps failing never ends an actionable instruction", as
   } finally { f.h.cp.close(); }
 });
 
-it("a refused Buzz delivery keeps the instruction, unsent into the same refusal, until the next holder", async () => {
+// CEO decision 9b15c462: an authority refusal is retained and flagged, and no route change reactivates it.
+it("a refused Buzz delivery keeps the instruction, unsent into the same refusal, and a takeover does not reactivate it", async () => {
   const f = await dispatched();
   try {
     takeOver(f, "actor:refused");
@@ -201,6 +203,7 @@ it("a refused Buzz delivery keeps the instruction, unsent into the same refusal,
       ({ eventId: "next-holder", mentionPubkeys: [...recipients] }));
     const next = takeOver(f, "actor:next-route");
     expect(row(f, f.dispatchId)).toMatchObject({ status: "PENDING", target_session_id: next.sessionId });
-    expect((await f.h.buzzAdapter.deliverPending()).delivered).toContain(f.dispatchId);
+    expect((await f.h.buzzAdapter.deliverPending()).delivered).not.toContain(f.dispatchId);
+    expect(f.h.cp.db.get("SELECT failure_class FROM outbox WHERE message_id = ?", [f.dispatchId])).toEqual({ failure_class: "contract" });
   } finally { f.h.cp.close(); }
 });
