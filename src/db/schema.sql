@@ -4127,6 +4127,8 @@ CREATE TABLE IF NOT EXISTS role_room_history_unknown (
   known_since        TEXT,
   binding_generation INTEGER,
   session_id         TEXT,
+  -- Durable ordering: timestamp equality cannot prove that a later change preceded migration.
+  audit_high_water   INTEGER NOT NULL DEFAULT 0 CHECK (audit_high_water >= 0),
   anchor_fallback    TEXT CHECK (anchor_fallback IS NULL OR anchor_fallback IN ('RUNTIME_MOVE_UNRECORDED')),
   anchor_json        TEXT NOT NULL CHECK (json_valid(anchor_json))
 ) WITHOUT ROWID;

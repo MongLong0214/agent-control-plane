@@ -1474,16 +1474,16 @@ export class Outbox {
       return deny(
         ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
         "this holder does not own the message it tried to settle",
-        { messageId, status: row.status },
+        { messageId, ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }) },
       );
     }
     if (row.status === want) {
-      return allow(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, undefined, { messageId, status: row.status });
+      return allow(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, undefined, { messageId, ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }) });
     }
     return deny(
       ReasonCode.RESOURCE_COLLISION,
-      `message is ${row.status} and cannot move to ${want}`,
-      { messageId, status: row.status },
+      `message is ${outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }).status} and cannot move to ${want}`,
+      { messageId, ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }) },
     );
   }
 
@@ -1817,7 +1817,7 @@ export class Outbox {
         runId: row.run_id,
         sessionId: fromSessionId,
         roleKey: row.role_key,
-        evidence: { messageId, kind: row.kind, status: row.status, ackGeneration: generation },
+        evidence: { messageId, kind: row.kind, ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }), ackGeneration: generation },
       });
       return deny(
         ReasonCode.INVALID_ARGUMENT,
@@ -1862,7 +1862,7 @@ export class Outbox {
         roleKey: row.role_key,
         evidence: {
           messageId,
-          status: row.status,
+          ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }),
           ackGeneration: generation,
           currentGeneration: current?.binding_generation ?? null,
           currentSession: current?.session_id ?? null,
@@ -1872,8 +1872,8 @@ export class Outbox {
         rejectionCode,
         staleGeneration
           ? "ack came from a generation that is no longer active"
-          : `message is ${row.status} and cannot be acknowledged`,
-        { messageId, status: row.status, ackGeneration: generation },
+          : `message is ${outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }).status} and cannot be acknowledged`,
+        { messageId, ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }), ackGeneration: generation },
       );
     }
 
@@ -1961,9 +1961,9 @@ export class Outbox {
         runId: row.run_id,
         sessionId,
         roleKey: row.role_key,
-        evidence: { messageId, kind: row.kind, status: row.status, inBand: true },
+        evidence: { messageId, kind: row.kind, ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }), inBand: true },
       });
-      return deny(reasonCode, message, { messageId, status: row.status });
+      return deny(reasonCode, message, { messageId, ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }) });
     };
     if (HOLDER_CLAIMED_KINDS.has(row.kind as MessageKind)) {
       return refuse(
@@ -1975,10 +1975,10 @@ export class Outbox {
       return refuse(ReasonCode.INVALID_ARGUMENT, "this message is not delivered in band; acknowledge it with run_ack");
     }
     if (row.status === "EXPIRED") {
-      return refuse(ReasonCode.OUTBOX_EXPIRED, `message is ${row.status} and cannot be acknowledged`);
+      return refuse(ReasonCode.OUTBOX_EXPIRED, `message is ${outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }).status} and cannot be acknowledged`);
     }
     if (row.status !== "PENDING") {
-      return refuse(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, `message is ${row.status} and cannot be acknowledged`);
+      return refuse(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, `message is ${outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }).status} and cannot be acknowledged`);
     }
     const holder =
       sessionIncarnation !== null &&
@@ -2626,7 +2626,7 @@ export class Outbox {
       runId: row.run_id,
       roleKey: row.role_key,
       sessionId: row.target_session_id,
-      evidence: { messageId: row.message_id, generation: row.binding_generation, status: row.status, expired, reason },
+      evidence: { messageId: row.message_id, generation: row.binding_generation, ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }), expired, reason },
     });
   }
 
@@ -3347,7 +3347,7 @@ export class Outbox {
     const rows = this.db.all<{ message_id: string; status: OutboxMessage["status"]; failure_class: FailureClass | null }>(
       "SELECT message_id, status, failure_class FROM outbox ORDER BY created_at, message_id",
     ).map((row) => ({ messageId: row.message_id,
-      ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class }) }));
+      ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }) }));
     return {
       delivered: rows.filter((row) => row.delivered).length,
       completed: rows.filter((row) => row.completed).length,
