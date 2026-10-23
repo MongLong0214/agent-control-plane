@@ -471,11 +471,15 @@ export class BuzzAdapter {
     }
     try {
       const address = await this.transport.openChannel(purpose);
-      this.sessions.setBuzzAddress(sessionId, address);
-      this.audit.record({
-        kind: "BUZZ_CONNECTED",
-        sessionId,
-        evidence: { purpose, address },
+      // The address and its audit commit together or not at all: an address the log does not record
+      // is a room history nothing can prove.
+      this.db.tx(() => {
+        this.sessions.setBuzzAddress(sessionId, address);
+        this.audit.record({
+          kind: "BUZZ_CONNECTED",
+          sessionId,
+          evidence: { purpose, address },
+        });
       });
       return allow(ReasonCode.OK, address);
     } catch (err) {
@@ -529,6 +533,8 @@ export class BuzzAdapter {
             failureClass: "contract",
             retryable: false,
             error: "target session has no buzz address",
+            // Nothing was sent: the route is absent, known here rather than inferred afterwards.
+            routeAbsent: true,
           },
         );
         failed.push(message.messageId);
@@ -548,6 +554,8 @@ export class BuzzAdapter {
             failureClass: "contract",
             retryable: false,
             error: "target session has no bound buzz channel identity to address",
+            // Nothing was sent: the route is absent, known here rather than inferred afterwards.
+            routeAbsent: true,
           },
         );
         failed.push(message.messageId);

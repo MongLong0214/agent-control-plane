@@ -129,6 +129,13 @@ export interface DeliveryFailure {
   failureClass: FailureClass;
   retryable: boolean;
   error: string;
+  /**
+   * Set only by a refusal made before anything was sent because the target had no route (no Buzz
+   * room, or no bound channel identity). The cause is recorded where it is known, never inferred from
+   * the target's route after an attempt: a route that disappears while a send is in flight does not
+   * turn the relay's refusal into a route-absent one.
+   */
+  routeAbsent?: true;
 }
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
@@ -308,9 +315,27 @@ const ROUTE_ABSENT_FAILURE_CLASS = "repairable";
  * target): it is queued for that receiver; a send the previous receiver was handed (SENT, accepted or
  * of unknown outcome) is a first delivery to the new one; a route-absent failure is re-armed. An
  * authority refusal or wrong-target refusal, and a deferral on its backoff, keep what they were.
+ * A SENT row whose receiver does not really change (`sameReceiverSql`) is not handed over at all.
  */
 const HANDED_TO_NEW_RECEIVER_SQL = `status = 'PENDING', claim_token = NULL, claimed_at = NULL,
   failure_class = CASE WHEN status = 'SENT' OR failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' THEN NULL ELSE failure_class END`;
+
+/**
+ * Whether a row's new target is the receiver it was already sent to. Two parameters: the new target
+ * session id, twice.
+ *
+ * The same session is the same receiver: a session's incarnation never changes, so the same session
+ * is the same room and the same recipient, and a rebind of it at a new generation is not a new
+ * receiver. Another session is a new receiver — except, for a Buzz send whose outcome is unknown,
+ * when it answers as the very same Buzz recipient (the same room and the same channel identity): Buzz
+ * has no same-id dedupe or receipt lookup, so sending again there could deliver twice.
+ */
+const sameReceiverSql = (alias: string): string =>
+  `(${alias}.target_session_id = ? OR (${alias}.failure_class = 'unknown_observed' AND EXISTS (
+     SELECT 1 FROM sessions previous JOIN sessions next ON next.session_id = ?
+      WHERE previous.session_id = ${alias}.target_session_id
+        AND COALESCE(previous.buzz_address, '') <> '' AND previous.buzz_address = next.buzz_address
+        AND COALESCE(previous.buzz_actor_id, '') <> '' AND previous.buzz_actor_id = next.buzz_actor_id)))`;
 
 /**
  * ACP-R1-01, ACP-R2-01 — the one re-arm policy, within the CEO's boundaries (9b15c462).
@@ -746,12 +771,19 @@ export const settleStoppedSessionInstructions = (
 /**
  * `Outbox.#readdressCeoNotifications` and the CEO half of `adoptHolderMessages`: every PENDING or
  * SENT-but-unACKed CEO notification not addressed to the CEO's current holder is handed to it
- * (`HANDED_TO_NEW_RECEIVER_SQL`), keeping its message id. Parameters: generation, session,
- * generation, session.
+ * (`HANDED_TO_NEW_RECEIVER_SQL`), keeping its message id. A SENT one whose receiver does not really
+ * change (`sameReceiverSql`) is only re-addressed to the current generation: it stays SENT, with its
+ * failure on record, and is not sent again.
  */
-const readdressCeoNotificationsSql = `UPDATE outbox SET binding_generation = ?, target_session_id = ?, ${HANDED_TO_NEW_RECEIVER_SQL}
-    WHERE kind = 'CEO_NOTIFICATION' AND role_key = 'CEO' AND status IN ('PENDING','SENT')
-      AND (binding_generation <> ? OR target_session_id <> ?)`;
+const readdressCeoNotifications = (db: Pick<Db, "run">, generation: number, sessionId: string): void => {
+  const notCurrent = `kind = 'CEO_NOTIFICATION' AND role_key = 'CEO' AND (binding_generation <> ? OR target_session_id <> ?)`;
+  db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?
+      WHERE ${notCurrent} AND status = 'SENT' AND ${sameReceiverSql("outbox")}`,
+  [generation, sessionId, generation, sessionId, sessionId, sessionId]);
+  db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, ${HANDED_TO_NEW_RECEIVER_SQL}
+      WHERE ${notCurrent} AND status IN ('PENDING','SENT')`,
+  [generation, sessionId, generation, sessionId]);
+};
 
 /**
  * Durable, fenced message queue (PRD §15.7, §27.5, §34.1).
@@ -910,7 +942,7 @@ export class Outbox {
       ${CURRENT_HOLDER_SESSION} AS session FROM assignments a ${HOLDER_ACTOR_JOIN}
       WHERE a.role_key = 'CEO' AND a.status = 'ACTIVE'`);
     // A new target is a new route: a failure recorded against the previous one no longer holds it.
-    if (current) this.db.run(readdressCeoNotificationsSql, [current.generation, current.session, current.generation, current.session]);
+    if (current) readdressCeoNotifications(this.db, current.generation, current.session);
   }
 
   /**
@@ -1473,17 +1505,14 @@ export class Outbox {
         if (sent !== 1) return this.staleClaim(messageId);
         return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true });
       }
-      // An attempt that found no route (no Buzz room or no channel identity at its target) sent
-      // nothing: it is recorded as route-absent, and the route's return re-arms it
-      // (`rearmRetainedDeliveries`). A failure whose cause can clear on its own is deferred on the
-      // backoff schedule, with no attempt budget. An authority refusal or a wrong target (a contract or
-      // security refusal from the relay) is kept PENDING with its failure on record, unsent, and no
-      // route change reactivates it.
-      const routeAbsent = this.db.get<{ absent: number }>(
-        `SELECT NOT EXISTS (SELECT 1 FROM sessions s JOIN outbox o ON o.target_session_id = s.session_id
-           WHERE o.message_id = ? AND COALESCE(s.buzz_address, '') <> '' AND COALESCE(s.buzz_actor_id, '') <> '') AS absent`,
-        [messageId],
-      )?.absent === 1;
+      // An attempt refused before sending because its target had no route (no Buzz room or no channel
+      // identity — `DeliveryFailure.routeAbsent`, set at that refusal) sent nothing: it is recorded as
+      // route-absent, and the route's return re-arms it (`rearmRetainedDeliveries`). A failure whose
+      // cause can clear on its own is deferred on the backoff schedule, with no attempt budget. An
+      // authority refusal or a wrong target (a contract or security refusal from the relay) is kept
+      // PENDING with its failure on record, unsent, and no route change reactivates it — whatever
+      // the target's route is by the time the refusal is recorded.
+      const routeAbsent = typeof failure === "object" && failure.routeAbsent === true;
       const failureClass = routeAbsent ? ROUTE_ABSENT_FAILURE_CLASS : classified.failureClass;
       const deferrable = !routeAbsent && RETRYABLE_FAILURE_CLASSES.has(classified.failureClass);
       const base = Number.isSafeInteger(row.retry_backoff_ms) && row.retry_backoff_ms > 0 ? row.retry_backoff_ms : 1000;
@@ -1968,7 +1997,7 @@ export class Outbox {
    */
   adoptHolderMessages(roleKey: string, generation: number, sessionId: string, deferCanonicalPeers = false): void {
     // A CEO notification SENT to the previous holder and never ACKed is delivered again to this one.
-    if (roleKey === "CEO") this.db.run(readdressCeoNotificationsSql, [generation, sessionId, generation, sessionId]);
+    if (roleKey === "CEO") readdressCeoNotifications(this.db, generation, sessionId);
     this.db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, reason_code = ?
       WHERE role_key = ? AND kind IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION') AND status IN ('PENDING','SENT')
         AND (? = 0 OR kind <> 'PEER_MESSAGE')`,
@@ -2547,6 +2576,22 @@ export class Outbox {
     if (decision.kind === "SUPERSEDE") return supersedeInstruction(this.db, this.audit, row, decision, to, path);
     if (!to) return false;
     const inBand = deliveredInBand(this.db, row.kind, to.sessionId);
+    // FCR-02: a row already sent to the receiver it is handed to is only re-addressed to the new
+    // generation; it stays SENT, awaiting that receiver's ACK, and is not delivered again.
+    if (row.status === "SENT" && this.db.get<{ same: number }>(
+      `SELECT ${sameReceiverSql("o")} AS same FROM outbox o WHERE o.message_id = ?`,
+      [to.sessionId, to.sessionId, row.message_id],
+    )?.same === 1) {
+      const readdressed = this.db.run(
+        `UPDATE outbox SET binding_generation = ?, target_session_id = ?,
+                           reason_code = CASE WHEN binding_generation = ? THEN reason_code ELSE ? END
+          WHERE message_id = ? AND status = 'SENT'`,
+        [to.generation, to.sessionId, to.generation, ReasonCode.OUTBOX_RETARGETED, row.message_id],
+      ).changes;
+      if (readdressed !== 1) return false;
+      if (row.kind === MessageKind.ESCALATION_REPLY) this.#recordEscalationReplyCarry(row, to.generation, to.sessionId);
+      return true;
+    }
     const now = this.clock.nowIso();
     const window = isoPlus(now, DEFAULT_TTL_MS);
     const moved = this.db.run(
