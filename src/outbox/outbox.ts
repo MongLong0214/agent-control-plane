@@ -300,6 +300,49 @@ const RETAINED_KIND_SQL = `${IN_BAND_KIND_SQL}, 'CEO_NOTIFICATION'`;
 const isRetainedKind = (kind: string): boolean =>
   IN_BAND_KINDS.has(kind as MessageKind) || kind === MessageKind.CEO_NOTIFICATION;
 
+/** The class a retained delivery's failure is recorded under when its route was absent (re-armable). */
+const ROUTE_ABSENT_FAILURE_CLASS = "repairable";
+
+/**
+ * Handing a retained row to a new receiver (a takeover, an adoption, a runtime move, a new CEO
+ * target): it is queued for that receiver; a send the previous receiver was handed (SENT, accepted or
+ * of unknown outcome) is a first delivery to the new one; a route-absent failure is re-armed. An
+ * authority refusal or wrong-target refusal, and a deferral on its backoff, keep what they were.
+ */
+const HANDED_TO_NEW_RECEIVER_SQL = `status = 'PENDING', claim_token = NULL, claimed_at = NULL,
+  failure_class = CASE WHEN status = 'SENT' OR failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' THEN NULL ELSE failure_class END`;
+
+/**
+ * ACP-R1-01, ACP-R2-01 — the one re-arm policy, within the CEO's boundaries (9b15c462).
+ *
+ * Re-armed: only a retained delivery (an instruction or a CEO notification) whose retry was disabled
+ * solely because its route was absent — the attempt found its target with no Buzz room or no bound
+ * channel identity, so nothing was sent (`markAttemptFailed` records it as `repairable`). On every
+ * authenticated route change of the holder it is addressed to — an address set or restored, a channel
+ * identity bound, a takeover, an adoption or rebind, a runtime move, a new CEO target — it becomes
+ * deliverable again with the same message id. The outbox CHECKs allow `retry_eligible = 1` only with a
+ * deferral time and a self-clearing class, so "deliverable again" for a retained kind is: no failure
+ * class (`claimDeliverable` takes such a row whatever its attempt count).
+ *
+ * Not re-armed by a route change: an authority refusal or a wrong target (a contract or security
+ * refusal from the relay, kept on record and unsent), a deferral already on its own backoff, an
+ * outcome-unknown send (SENT and flagged; see `markAttemptFailed`), and every terminal row. Only rows
+ * addressed to exactly the holder the change concerns are touched, so nothing widens an item's
+ * authority or recipient scope, and a stale holder's ACK is still refused.
+ */
+export const rearmRetainedDeliveries = (
+  db: Pick<Db, "run">,
+  scope: { sessionId: string; roleKey?: string; bindingGeneration?: number },
+): number =>
+  db.run(
+    `UPDATE outbox SET failure_class = NULL
+      WHERE status = 'PENDING' AND kind IN (${IN_BAND_KIND_SQL}, 'CEO_NOTIFICATION')
+        AND failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' AND retry_eligible = 0
+        AND target_session_id = ?
+        AND (? IS NULL OR role_key = ?) AND (? IS NULL OR binding_generation = ?)`,
+    [scope.sessionId, scope.roleKey ?? null, scope.roleKey ?? null, scope.bindingGeneration ?? null, scope.bindingGeneration ?? null],
+  ).changes;
+
 /**
  * #246 C4 — the kinds a provisioned (driven) runtime receives in band: every `IN_BAND_KINDS` kind,
  * and `HANDOFF_PACKAGE`. An activation's handoff is addressed to the PRIMARY_CTO it has already
@@ -617,17 +660,11 @@ const escalationReplyStillAnswers = (
 };
 
 /**
- * A kept instruction stays queued for the next holder: a delivery claim on it is released, and one
- * sent over Buzz but never ACKed goes back to deliverable, keeping its message id.
+ * A kept instruction is left exactly as it is for the role's next authenticated holder: queued, or
+ * claimed or sent to a receiver that is gone. Nothing re-sends it to the same receiver (an outcome
+ * there may already have landed); the handover to a new receiver does (`HANDED_TO_NEW_RECEIVER_SQL`).
  */
-const keepInstruction = (db: Pick<Db, "run">, row: RawOutbox): void => {
-  db.run(
-    `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL,
-                       retry_eligible = 0, next_attempt_at = NULL, failure_class = NULL
-      WHERE message_id = ? AND status IN ('IN_FLIGHT','SENT')`,
-    [row.message_id],
-  );
-};
+const keepInstruction = (_db: Pick<Db, "run">, _row: RawOutbox): void => undefined;
 
 /**
  * A supersession: the row REJECTED and an `OUTBOX_INSTRUCTION_SUPERSEDED` record of why, written in
@@ -708,12 +745,11 @@ export const settleStoppedSessionInstructions = (
 
 /**
  * `Outbox.#readdressCeoNotifications` and the CEO half of `adoptHolderMessages`: every PENDING or
- * SENT-but-unACKed CEO notification not addressed to the CEO's current holder is re-addressed to it
- * and made deliverable again, keeping its message id. Parameters: generation, session, generation,
- * session.
+ * SENT-but-unACKed CEO notification not addressed to the CEO's current holder is handed to it
+ * (`HANDED_TO_NEW_RECEIVER_SQL`), keeping its message id. Parameters: generation, session,
+ * generation, session.
  */
-const readdressCeoNotificationsSql = `UPDATE outbox SET binding_generation = ?, target_session_id = ?, status = 'PENDING',
-                              retry_eligible = 0, next_attempt_at = NULL, failure_class = NULL
+const readdressCeoNotificationsSql = `UPDATE outbox SET binding_generation = ?, target_session_id = ?, ${HANDED_TO_NEW_RECEIVER_SQL}
     WHERE kind = 'CEO_NOTIFICATION' AND role_key = 'CEO' AND status IN ('PENDING','SENT')
       AND (binding_generation <> ? OR target_session_id <> ?)`;
 
@@ -1068,7 +1104,6 @@ export class Outbox {
       this.reclaimStaleLeases();
       this.#readdressCeoNotifications();
       this.#recordUnroutableCeoNotifications();
-      this.#reofferUnacknowledgedSends(now);
       const canonicalCeo = this.#ceoDelivery !== null;
 
       const rows = this.db.all<RawOutbox>(
@@ -1358,29 +1393,6 @@ export class Outbox {
     );
   }
 
-  /**
-   * ACP-R1-01, ACP-R2-01 — a retained kind whose send ended with an unknown outcome is SENT (it may
-   * have arrived); once its backoff deadline passes with no ACK it is offered again, to its live
-   * target, under the same message id. Only rows the unknown outcome marked are re-offered: a send
-   * the transport accepted waits for its ACK, and a replaced holder's is the handover's.
-   */
-  #reofferUnacknowledgedSends(now: string): void {
-    const rows = this.db.all<{ message_id: string; attempts: number; retry_backoff_ms: number; sent_at: string | null }>(
-      `SELECT o.message_id, o.attempts, o.retry_backoff_ms, o.sent_at FROM outbox o
-        WHERE o.status = 'SENT' AND o.failure_class = 'unknown_observed' AND o.kind IN (${RETAINED_KIND_SQL})
-          AND ${liveDeliveryTarget("o")}`,
-    );
-    for (const row of rows) {
-      const base = Number.isSafeInteger(row.retry_backoff_ms) && row.retry_backoff_ms > 0 ? row.retry_backoff_ms : 1000;
-      if (row.sent_at !== null && isoPlus(row.sent_at, retryDelayMs(row.attempts, base)) > now) continue;
-      this.db.run(
-        `UPDATE outbox SET status = 'PENDING', failure_class = NULL
-          WHERE message_id = ? AND status = 'SENT' AND failure_class = 'unknown_observed'`,
-        [row.message_id],
-      );
-    }
-  }
-
   /** A claim whose holder died must return to PENDING rather than stay stuck IN_FLIGHT. */
   reclaimStaleLeases(leaseMs = 5 * 60 * 1000): number {
     this.fenceUndeliverable();
@@ -1446,9 +1458,9 @@ export class Outbox {
     // Only an ACK or a recorded supersession ends it.
     if (isRetainedKind(row.kind)) {
       // An unknown outcome (#451: a timed-out send may already be at the far end) is not put back in
-      // the queue: it is SENT, awaiting the holder's ACK like any other send, and offered again only
-      // if no ACK has come by its backoff deadline (`#reofferUnacknowledgedSends`) — at-least-once,
-      // deduplicated by the message id.
+      // the queue and is never re-sent to the same receiver on a timer: Buzz has no same-id dedupe
+      // and no receipt lookup, so the row is SENT, flagged `unknown_observed`, awaiting the holder's
+      // ACK. Only a handover to a new receiver delivers it again (`HANDED_TO_NEW_RECEIVER_SQL`).
       if (classified.failureClass === "unknown_observed") {
         const sent = this.db.run(
           `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = ?, last_error = ?, failure_class = ?,
@@ -1461,11 +1473,19 @@ export class Outbox {
         if (sent !== 1) return this.staleClaim(messageId);
         return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true });
       }
-      // A failure whose cause can clear on its own is deferred on the backoff schedule, with no
-      // attempt budget. A contract or security refusal is kept PENDING with its failure on record
-      // and is not re-sent unchanged into the same refusal: the next handover or new CEO target
-      // re-arms it (`claimDeliverable`).
-      const deferrable = RETRYABLE_FAILURE_CLASSES.has(classified.failureClass);
+      // An attempt that found no route (no Buzz room or no channel identity at its target) sent
+      // nothing: it is recorded as route-absent, and the route's return re-arms it
+      // (`rearmRetainedDeliveries`). A failure whose cause can clear on its own is deferred on the
+      // backoff schedule, with no attempt budget. An authority refusal or a wrong target (a contract or
+      // security refusal from the relay) is kept PENDING with its failure on record, unsent, and no
+      // route change reactivates it.
+      const routeAbsent = this.db.get<{ absent: number }>(
+        `SELECT NOT EXISTS (SELECT 1 FROM sessions s JOIN outbox o ON o.target_session_id = s.session_id
+           WHERE o.message_id = ? AND COALESCE(s.buzz_address, '') <> '' AND COALESCE(s.buzz_actor_id, '') <> '') AS absent`,
+        [messageId],
+      )?.absent === 1;
+      const failureClass = routeAbsent ? ROUTE_ABSENT_FAILURE_CLASS : classified.failureClass;
+      const deferrable = !routeAbsent && RETRYABLE_FAILURE_CLASSES.has(classified.failureClass);
       const base = Number.isSafeInteger(row.retry_backoff_ms) && row.retry_backoff_ms > 0 ? row.retry_backoff_ms : 1000;
       const retainedNext = deferrable ? isoPlus(this.clock.nowIso(), retryDelayMs(attempts, base)) : null;
       const kept = this.db.run(
@@ -1474,13 +1494,13 @@ export class Outbox {
                            claim_token = NULL, claimed_at = NULL
           WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
             AND ${liveDeliveryTarget("outbox")}`,
-        [attempts, classified.error.slice(0, 500), classified.failureClass, deferrable ? 1 : 0, retainedNext,
+        [attempts, classified.error.slice(0, 500), failureClass, deferrable ? 1 : 0, retainedNext,
           messageId, claimToken],
       ).changes;
       if (kept !== 1) return this.staleClaim(messageId);
       return allow(ReasonCode.OK, undefined, {
         messageId,
-        failureClass: classified.failureClass,
+        failureClass,
         attempts,
         nextAttemptAt: retainedNext,
         retained: true,
@@ -1953,11 +1973,6 @@ export class Outbox {
       WHERE role_key = ? AND kind IN (${HOLDER_CLAIMED_KIND_SQL}, 'CEO_NOTIFICATION') AND status IN ('PENDING','SENT')
         AND (? = 0 OR kind <> 'PEER_MESSAGE')`,
       [generation, sessionId, ReasonCode.OUTBOX_RETARGETED, roleKey, deferCanonicalPeers ? 1 : 0]);
-    // A CEO notification adopted by a new holder has a new route: a failure recorded against the
-    // previous target no longer holds it back (ACP-R2-01).
-    this.db.run(`UPDATE outbox SET retry_eligible = 0, next_attempt_at = NULL, failure_class = NULL
-      WHERE role_key = ? AND kind = 'CEO_NOTIFICATION' AND status = 'PENDING' AND target_session_id = ?
-        AND binding_generation = ? AND failure_class IS NOT NULL`, [roleKey, sessionId, generation]);
     // ACP-R1-01: the instructions a revoke or a stopped holder kept for this role are handed to the
     // new holder under the one handover policy. A reply held for a provisioned owner's renewal stays
     // the renewal's (`carryHeldEscalationReplies`).
@@ -1983,6 +1998,8 @@ export class Outbox {
         evidence: { path: "ADOPTION", toGeneration: generation, toSessionId: sessionId, retargeted: carried, rejected: superseded },
       });
     }
+    // An adoption or rebind is a route change for everything the new holder now holds.
+    rearmRetainedDeliveries(this.db, { sessionId, roleKey, bindingGeneration: generation });
     if (roleKey === "CEO") this.db.afterCommit(() => { void this.deliverCeoNotifications(); });
   }
 
@@ -2118,6 +2135,11 @@ export class Outbox {
         );
         rejected.push(row.message_id);
       }
+    }
+
+    // A takeover is a route change for everything it addressed to the successor.
+    if (toGeneration !== fromGeneration) {
+      rearmRetainedDeliveries(this.db, { sessionId: toSessionId, roleKey, bindingGeneration: toGeneration });
     }
 
     this.audit.record({
@@ -2528,9 +2550,7 @@ export class Outbox {
     const now = this.clock.nowIso();
     const window = isoPlus(now, DEFAULT_TTL_MS);
     const moved = this.db.run(
-      `UPDATE outbox SET binding_generation = ?, target_session_id = ?, status = 'PENDING',
-                         claim_token = NULL, claimed_at = NULL, retry_eligible = 0, next_attempt_at = NULL,
-                         failure_class = NULL,
+      `UPDATE outbox SET binding_generation = ?, target_session_id = ?, ${HANDED_TO_NEW_RECEIVER_SQL},
                          reason_code = CASE WHEN binding_generation = ? THEN reason_code ELSE ? END,
                          expires_at = CASE WHEN ? = 1 OR expires_at > ? THEN expires_at ELSE ? END
         WHERE message_id = ? AND status IN ('PENDING','IN_FLIGHT','SENT')`,
@@ -3053,6 +3073,8 @@ export class Outbox {
           evidence: { path: "RUNTIME_MOVE", bindingGeneration, fromSessionId, toSessionId, retargeted: handed, rejected: superseded },
         });
       }
+      // A runtime move is a route change for everything now addressed to the incoming runtime.
+      rearmRetainedDeliveries(this.db, { sessionId: toSessionId, roleKey, bindingGeneration });
 
       return { carried, rejected };
     });

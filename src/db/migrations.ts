@@ -3996,6 +3996,174 @@ const v50: SchemaMigration = {
 };
 
 /**
+ * ACP-R1-04 — v51's room-membership backfill, from provable evidence only, or not at all.
+ *
+ * The evidence: each role's placements — its assignment rows (the binding-time runtime and its
+ * creation) and its `BINDING_RUNTIME_MOVED` audit rows (a same-generation move to another runtime) —
+ * and each placed session's room history from the append-only audit log: `BUZZ_CONNECTED` (the
+ * adapter assigned an address), `CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED` (an in-place correction,
+ * with the previous address) and `SESSION_BUZZ_ADDRESS_CHANGED` (every change from v51 on). A
+ * session with no such audit has only its creation address, which is its current one: v50 audits
+ * every non-null address change, so a session nothing changed is in the room it was created in.
+ *
+ * A role joins a room at the earliest moment that evidence puts its runtime there: the placement
+ * (binding or runtime move) onto a session in that room, or the audited change that put its runtime
+ * there — never a later runtime's creation, and never earlier than the evidence. Roles without a room
+ * get no membership.
+ *
+ * Any role whose history cannot be proven makes the step refuse, naming every such role, rather than
+ * record a guessed cutoff: a session whose current address differs from its last audited address (an
+ * in-place change without an audit trail), an audited change that does not follow the session's
+ * audited address, or a placement that moves the role into a different room on a session whose
+ * address there is not audited (several rooms across its sessions with no trail between them).
+ */
+export interface RoleRoomMembershipEvidence {
+  memberships: Array<{ roleKey: string; room: string; at: string; sessionId: string }>;
+  /** Each role whose history cannot be proven, with why; any entry makes the step refuse. */
+  refusals: string[];
+  /** For every role, the evidence each of its placements and audited changes rested on. */
+  evidence: Record<string, string[]>;
+}
+
+/** The backfill's judgment from the database's own records; only reads. */
+export const roleRoomMembershipEvidence = (raw: Database.Database): RoleRoomMembershipEvidence => {
+  interface AddressEvent { at: string; kind: string; to: string | null; from: string | null; hasFrom: boolean }
+  const addressOf = (value: unknown): string | null => (typeof value === "string" && value.length > 0 ? value : null);
+  const timelines = new Map<string, { current: string | null; events: AddressEvent[] }>();
+  const timelineOf = (sessionId: string) => {
+    const known = timelines.get(sessionId);
+    if (known) return known;
+    const row = raw.prepare(`SELECT buzz_address FROM sessions WHERE session_id = ?`).get(sessionId) as
+      { buzz_address: string | null } | undefined;
+    const events = (raw.prepare(
+      `SELECT at, kind, evidence_json FROM audit_events
+        WHERE session_id = ? AND kind IN ('BUZZ_CONNECTED', 'CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED', 'SESSION_BUZZ_ADDRESS_CHANGED')
+        ORDER BY at, event_id`,
+    ).all(sessionId) as Array<{ at: string; kind: string; evidence_json: string }>).map((event): AddressEvent => {
+      const evidence = JSON.parse(event.evidence_json) as Record<string, unknown>;
+      if (event.kind === "BUZZ_CONNECTED") {
+        return { at: event.at, kind: event.kind, to: addressOf(evidence["address"]), from: null, hasFrom: false };
+      }
+      if (event.kind === "CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED") {
+        return { at: event.at, kind: event.kind, to: addressOf(evidence["buzzAddress"]),
+          from: addressOf(evidence["previousBuzzAddress"]), hasFrom: true };
+      }
+      return { at: event.at, kind: event.kind, to: addressOf(evidence["to"]), from: addressOf(evidence["from"]), hasFrom: true };
+    });
+    const timeline = { current: addressOf(row?.buzz_address), events };
+    timelines.set(sessionId, timeline);
+    return timeline;
+  };
+  /** Why this session's audited room history does not account for it, or null when it does. */
+  const inconsistency = (sessionId: string): string | null => {
+    const { current, events } = timelineOf(sessionId);
+    if (events.length === 0) return null;
+    let implied: string | null | undefined = events[0]!.hasFrom ? events[0]!.from : undefined;
+    for (const event of events) {
+      if (event.hasFrom && implied !== undefined && event.from !== implied) {
+        return `session ${sessionId}: an audited change from ${event.from ?? "no room"} at ${event.at} does not follow its audited room ${implied ?? "no room"}`;
+      }
+      implied = event.to;
+    }
+    // A v50 disconnect clears the address without an audit; it moves the runtime into no room.
+    if (current !== null && current !== implied) {
+      return `session ${sessionId}: its room ${current} is not its last audited room ${implied ?? "no room"} (an in-place address change without an audit trail)`;
+    }
+    return null;
+  };
+  /** The session's room at `at`, whether an audit row evidences it, and which. */
+  const roomAt = (sessionId: string, at: string): { room: string | null; audited: boolean; source: string } => {
+    const { current, events } = timelineOf(sessionId);
+    if (events.length === 0) {
+      return { room: current, audited: false, source: "its creation room (no address audit; v50 audits every non-null change)" };
+    }
+    const before = events.filter((event) => event.at <= at);
+    if (before.length > 0) {
+      const last = before[before.length - 1]!;
+      return { room: last.to, audited: true, source: `audit ${last.kind} at ${last.at}` };
+    }
+    return events[0]!.hasFrom
+      ? { room: events[0]!.from, audited: true, source: `the previous room named by audit ${events[0]!.kind} at ${events[0]!.at}` }
+      : { room: null, audited: true, source: `no room before audit ${events[0]!.kind} at ${events[0]!.at}` };
+  };
+
+  const roles = (raw.prepare(`SELECT DISTINCT role_key FROM assignments ORDER BY role_key`).all() as Array<{ role_key: string }>)
+    .map((row) => row.role_key);
+  const refusals: string[] = [];
+  const memberships: Array<{ roleKey: string; room: string; at: string; sessionId: string }> = [];
+  const evidence: Record<string, string[]> = {};
+  for (const roleKey of roles) {
+    const proof: string[] = [];
+    evidence[roleKey] = proof;
+    const placements = [
+      ...(raw.prepare(`SELECT session_id, created_at AS at, 0 AS rank FROM assignments WHERE role_key = ?`).all(roleKey) as
+        Array<{ session_id: string; at: string; rank: number }>),
+      ...(raw.prepare(`SELECT session_id, at, 1 AS rank FROM audit_events
+          WHERE kind = 'BINDING_RUNTIME_MOVED' AND role_key = ? AND session_id IS NOT NULL`).all(roleKey) as
+        Array<{ session_id: string; at: string; rank: number }>),
+    ].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.rank - b.rank));
+    const joined = new Map<string, { at: string; sessionId: string }>();
+    const join = (room: string, at: string, sessionId: string) => {
+      const earlier = joined.get(room);
+      if (!earlier || at < earlier.at) joined.set(room, { at, sessionId });
+    };
+    let currentRoom: string | null = null;
+    let refused: string | null = null;
+    for (const [index, placement] of placements.entries()) {
+      const broken = inconsistency(placement.session_id);
+      if (broken !== null) { refused = broken; break; }
+      const placedIn = roomAt(placement.session_id, placement.at);
+      proof.push(`${placement.rank === 0 ? "binding" : "runtime move (audit BINDING_RUNTIME_MOVED)"} at ${placement.at} onto ` +
+        `${placement.session_id}: room ${placedIn.room ?? "none"} from ${placedIn.source}`);
+      if (placedIn.room !== null) {
+        if (currentRoom !== null && placedIn.room !== currentRoom && !placedIn.audited) {
+          refused = `moves from room ${currentRoom} to room ${placedIn.room} at ${placement.at} onto session ` +
+            `${placement.session_id}, whose room there no audit records`;
+          break;
+        }
+        join(placedIn.room, placement.at, placement.session_id);
+        currentRoom = placedIn.room;
+      }
+      // Audited changes while this session is the role's runtime: until its next placement.
+      const until = placements[index + 1]?.at ?? null;
+      for (const event of timelineOf(placement.session_id).events) {
+        if (event.at <= placement.at || (until !== null && event.at >= until) || event.to === null) continue;
+        proof.push(`audit ${event.kind} at ${event.at} on ${placement.session_id}: room ${event.to}`);
+        join(event.to, event.at, placement.session_id);
+        currentRoom = event.to;
+      }
+    }
+    if (refused !== null) {
+      refusals.push(`${roleKey} (${refused})`);
+      continue;
+    }
+    for (const [room, first] of joined) memberships.push({ roleKey, room, at: first.at, sessionId: first.sessionId });
+  }
+  return { memberships, refusals, evidence };
+};
+
+/**
+ * Writes `roleRoomMembershipEvidence`'s memberships, or refuses the whole step, naming every role
+ * whose history it cannot prove: the step's transaction rolls back and the database is left as it was.
+ */
+const backfillRoleRoomMemberships = (raw: Database.Database): void => {
+  const { memberships, refusals } = roleRoomMembershipEvidence(raw);
+  if (refusals.length > 0) {
+    throw acpError(
+      ReasonCode.CONFLICT,
+      `v51 cannot prove the room membership history of ${refusals.length} role(s), so it records none rather than a ` +
+        `guessed cutoff: ${refusals.join("; ")}. Make each named role's history provable (one room, or audited ` +
+        `address changes) and migrate again.`,
+      { roles: refusals },
+    );
+  }
+  const insert = raw.prepare(
+    `INSERT INTO role_room_memberships (role_key, conversation, joined_at, session_id) VALUES (?, ?, ?, ?)`,
+  );
+  for (const membership of memberships) insert.run(membership.roleKey, membership.room, membership.at, membership.sessionId);
+};
+
+/**
  * v51 separates shared signed events from recipient delivery, preserves terminal message IDs, and
  * records each role's room membership history (ACP-R1-04).
  */
@@ -4014,24 +4182,11 @@ const v51: SchemaMigration = {
     raw.exec("-- Durable Buzz events" + ddl);
     raw.exec(`INSERT OR IGNORE INTO holder_message_terminals (message_id)
       SELECT message_id FROM outbox WHERE status IN ('ACKED','REJECTED','EXPIRED')`);
-    // Room membership before this step was never recorded. The best evidence a v50 database holds is
-    // each generation's creation on its bound runtime's room, and a current runtime that moved into a
-    // room counting no earlier than its own creation: earliest per role and room.
-    raw.exec(`INSERT OR IGNORE INTO role_room_memberships (role_key, conversation, joined_at, session_id)
-      SELECT role_key, conversation, MIN(joined_at), session_id FROM (
-        SELECT a.role_key AS role_key, s.buzz_address AS conversation, a.created_at AS joined_at, s.session_id AS session_id
-          FROM assignments a JOIN sessions s ON s.session_id = a.session_id
-         WHERE COALESCE(s.buzz_address, '') <> ''
-        UNION ALL
-        SELECT a.role_key, s.buzz_address, MAX(a.created_at, s.created_at), s.session_id
-          FROM assignments a JOIN conversational_actors c ON c.actor_id = a.actor_id
-          JOIN sessions s ON s.session_id = c.current_session_id
-         WHERE a.status = 'ACTIVE' AND COALESCE(s.buzz_address, '') <> '')
-       GROUP BY role_key, conversation`);
+    backfillRoleRoomMemberships(raw);
     assertStepNames(raw, 51, objects, "after");
     // Revive delivery-window disposal, never an explicit rejection/supersession.
     raw.exec(`UPDATE outbox SET status = 'PENDING', retry_eligible = 0, next_attempt_at = NULL,
-        claim_token = NULL, claimed_at = NULL
+        claim_token = NULL, claimed_at = NULL, failure_class = NULL
       WHERE (kind = 'CEO_NOTIFICATION' AND (status = 'EXPIRED' OR
         (status = 'REJECTED' AND last_error = 'target session has no buzz address')))
         OR (status = 'EXPIRED' AND kind IN ('RUN_DISPATCH','REVISION_REQUEST','ESCALATION_REPLY','DRAIN_REQUEST','CANCEL_REQUEST')

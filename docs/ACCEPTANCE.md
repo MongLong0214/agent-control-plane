@@ -336,6 +336,17 @@ blind spot is exactly what a second round from the same reviewer cannot catch.
 The final gate is a Grok review of all nine areas (`node scripts/grok-review.mjs`), which has not
 been run against a settled tree yet.
 
+"Gate" there means the last diagnostic pass planned before publication, not a merge gate. Both
+review scripts (`scripts/production-review.mjs`, `scripts/grok-review.mjs`) are broad one-off
+diagnostics, and frontier PR review serves a different purpose: frontier judges one change within
+its bounded attempts, while these read whole areas of one commit for defects nobody asked about.
+They are not meant to run on every PR. Running one is not a way around frontier's three-attempt
+limit and does not count as an additional approving review. Since #1189 each run reviews one pinned
+commit from a disposable checkout, refuses a dirty HEAD or an unknown ref, and writes a new
+directory whose `manifest.json` attributes every area result to that run; its exit status says
+whether the reviewers ran, its findings verdict says what they found, and neither is a merge
+approval. The `evidence/review*` directories above predate this and carry no manifest.
+
 | Round | Verdict | BLOCKER | MAJOR | Closed | Open |
 |---|---|---|---|---|---|
 | 1 | BLOCK in all 9 areas | 57 | 66 (+1 minor) | 57 / 52 / 1 | 0 / 14 / 0 |
