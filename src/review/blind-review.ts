@@ -310,6 +310,45 @@ const VERDICT_SCHEMA_PROMPT: readonly string[] = [
 ];
 
 /**
+ * #1189 §2.B — what every reviewer prompt asks a finding's `detail` to carry. The JSON shape is
+ * unchanged; only the evidence a finding states is. Static evidence is enough: the reviewer has no
+ * tools, and running a witness belongs to verification. No line number is asked for where none
+ * exists. This is guidance to the reviewer, not a host rule: nothing reads a verdict's severities
+ * to turn a REVISE or BLOCK into a PASS.
+ */
+const FINDING_EVIDENCE_PROMPT: readonly string[] = [
+  "## What a finding must show",
+  "Report a defect only when the material above shows it, missing evidence included. Static evidence is enough: when",
+  "the code in the packet shows the failing path, no executed witness is needed, and you have no tools to run one.",
+  "Each finding's `detail` must state all five of these:",
+  "1. Contract: the contract, invariant or acceptance criterion that breaks, and a reachable input or call order that breaks it.",
+  "2. Location: the packet file and a concrete location or construct in it (a hunk, function, statement or key), or a",
+  "   canonical artifact reference (a `#manifest/...` or `#operation/...` item, or an artifact digest). A line number is not",
+  "   required, and must not be invented for a binary file, a deletion, a `#manifest/...` or `#operation/...` item, or an",
+  "   evidence or freshness finding.",
+  "3. Effect: the result the contract expects, the result the current code produces, and the consumer or boundary affected.",
+  "4. Origin: whether it is pre-existing or a regression introduced by this change (or pre-existing and in this task's",
+  "   scope), and why.",
+  "5. Evidence gap: anything you could not confirm from the packet, stated as an evidence gap, never as an established defect.",
+  "A remark only about style, naming or a possible future extension is not a blocker: do not return REVISE or BLOCK for it",
+  "and do not mark it MAJOR or BLOCKER. A maintainability problem that breaks a stated contract is a defect; report it as one.",
+  "Your verdict stands as you return it; severities do not change it. Give the reason for a REVISE or BLOCK in `findings`",
+  "or `omittedItems`.",
+];
+
+/** The example finding's `detail`, naming the five parts `FINDING_EVIDENCE_PROMPT` asks for. */
+const FINDING_DETAIL_EXAMPLE =
+  "Contract: ... broken by input/call order ... Location: <file> <construct> (or artifact reference). " +
+  "Effect: expected ..., current code produces ..., affects ... Origin: pre-existing | regression, because ... " +
+  "Evidence gap: none | ...";
+
+/** The input description closing every reviewer prompt: what the packet is, and what the reviewer has. */
+const REVIEW_INPUT_STATEMENT =
+  "`findings` may be empty. Everything you need is above; you have no tools and are not expected to look anything up " +
+  "or run anything. Evidence the packet should carry and does not is itself a finding (category `evidence`); a guess " +
+  "about code the packet does not show is not.";
+
+/**
  * Free-form provider text (an answer, stderr, an adapter error) as review evidence: its digest and
  * length under `<name>Digest` / `<name>Length`, never the text. A denial's evidence is returned to
  * the run's owner and summarised into the BLIND_REVIEW_UNAVAILABLE audit row, and provider text is
@@ -1497,6 +1536,8 @@ export class BlindReviewGate {
       JSON.stringify(reduced, null, 2),
       "```",
       "",
+      ...FINDING_EVIDENCE_PROMPT,
+      "",
       "## Required response",
       "Return a single JSON object matching the schema, and nothing else.",
       ...VERDICT_SCHEMA_PROMPT,
@@ -1548,6 +1589,8 @@ export class BlindReviewGate {
 
     sections.push(
       "",
+      ...FINDING_EVIDENCE_PROMPT,
+      "",
       "## Required response",
       // Only some runtimes enforce a response schema, so the shape is stated here too.
       "Return a single JSON object and nothing else — no prose before or after it:",
@@ -1564,7 +1607,7 @@ export class BlindReviewGate {
               repository: "<repository-identity>",
               path: "<path or null>",
               summary: "one line",
-              detail: "what is wrong and why it matters",
+              detail: FINDING_DETAIL_EXAMPLE,
             },
           ],
         },
@@ -1575,7 +1618,7 @@ export class BlindReviewGate {
       ...VERDICT_SCHEMA_PROMPT,
       "`coveredFiles` must list every file you actually examined, formatted `<repository-identity>:<path>`.",
       "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
-      "`findings` may be empty. Everything you need is above; you have no tools and are not expected to look anything up.",
+      REVIEW_INPUT_STATEMENT,
     );
     return sections.filter(Boolean).join("\n");
   }
@@ -1635,6 +1678,8 @@ export class BlindReviewGate {
       "## Required coverage",
       ...expected.map((target) => `- ${target.identity}:${target.path}`),
       "",
+      ...FINDING_EVIDENCE_PROMPT,
+      "",
       "## Required response",
       "Return a single JSON object and nothing else — no prose before or after it:",
       "```json",
@@ -1652,7 +1697,7 @@ export class BlindReviewGate {
       ...VERDICT_SCHEMA_PROMPT,
       "`coveredFiles` must list every required coverage item you actually examined, exactly as written above.",
       "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
-      "`findings` may be empty. Everything you need is above; you have no tools and are not expected to look anything up.",
+      REVIEW_INPUT_STATEMENT,
     ].join("\n");
   }
 
@@ -1684,6 +1729,8 @@ export class BlindReviewGate {
       "## Required coverage",
       ...expected.map((target) => `- ${target.identity}:${target.path}`),
       "",
+      ...FINDING_EVIDENCE_PROMPT,
+      "",
       "## Required response",
       "Return a single JSON object and nothing else — no prose before or after it:",
       "```json",
@@ -1701,7 +1748,7 @@ export class BlindReviewGate {
       ...VERDICT_SCHEMA_PROMPT,
       "`coveredFiles` must list every required coverage item you actually examined, exactly as written above.",
       "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
-      "`findings` may be empty. Everything you need is above; you have no tools and are not expected to look anything up.",
+      REVIEW_INPUT_STATEMENT,
     ].join("\n");
   }
 
