@@ -4008,8 +4008,10 @@ const v50: SchemaMigration = {
  * `SessionRegistry.create` INSERTs and `SessionRegistry.setBuzzAddress` — sets `updated_at` to the
  * current time in the same statement, and every other writer of `updated_at` only sets it to the
  * current time too. So the role is known there since the latest of the binding's creation, the
- * runtime move onto that session, and the session's `updated_at`; a moved runtime with no move
- * record is known there only since the migration.
+ * latest recorded runtime move onto that session (one back onto the binding's own session included),
+ * and the session's `updated_at`; its membership starts at that time rounded up to a whole second
+ * (`wholeSecondFloor`). A runtime no move record explains is known there only since the migration, and
+ * is listed as a fallback (`v51AnchorFallbackRoles`).
  *
  * Every role on record gets a `role_room_history_unknown` row. Mail signed before a role's
  * anchor is refused, recorded and never delivered; rows that already carry an admission or a receipt
@@ -4024,10 +4026,19 @@ export interface RoleRoomMembershipEvidence {
     sessionId: string;
     bindingCreatedAt: string;
     sessionUpdatedAt: string;
-    /** The runtime move onto `sessionId`, when the runtime is not the binding's own session. */
+    /** The anchored binding: its generation (with `sessionId`, what stop-window mail is admitted on). */
+    bindingGeneration: number;
+    /** The latest recorded runtime move onto `sessionId` within this binding, even back onto its own session. */
     runtimeMovedAt: string | null;
-    /** The latest of the three; null when a moved runtime has no move record: then the migration. */
+    /** The latest of the three; null on a fallback: the role is then known in the room only since the migration. */
     knownSince: string | null;
+    /**
+     * FCR-11 — why no anchor before the migration could be proven, or null: RUNTIME_MOVE_UNRECORDED when
+     * the role's current runtime is not the session its binding names (or not the session its latest
+     * recorded move names) and no move record explains it. Such a role's stop-window mail is refused,
+     * so a deployment with any must not proceed (`v51AnchorFallbackRoles`).
+     */
+    fallback: "RUNTIME_MOVE_UNRECORDED" | null;
   }>;
   /** Every role on record: each gets the record that its history before the migration is unknown. */
   roles: string[];
@@ -4052,12 +4063,12 @@ export const roleRoomMembershipEvidence = (raw: Database.Database): RoleRoomMemb
     const proof: string[] = [];
     evidence[roleKey] = proof;
     const current = raw.prepare(`SELECT a.assignment_id, a.session_id AS bound_session_id, a.created_at AS binding_created_at,
-          s.session_id, s.buzz_address, s.updated_at
+          a.binding_generation, s.session_id, s.buzz_address, s.updated_at
         FROM assignments a
         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
         JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
        WHERE a.role_key = ? AND a.status = 'ACTIVE'`).get(roleKey) as {
-      assignment_id: string; bound_session_id: string; binding_created_at: string;
+      assignment_id: string; bound_session_id: string; binding_created_at: string; binding_generation: number;
       session_id: string; buzz_address: string | null; updated_at: string;
     } | undefined;
     if (!current) {
@@ -4073,26 +4084,49 @@ export const roleRoomMembershipEvidence = (raw: Database.Database): RoleRoomMemb
       refusals.push(`${roleKey} (binding ${current.assignment_id} or session ${current.session_id} has a timestamp that is not one)`);
       continue;
     }
-    let runtimeMovedAt: string | null = null;
-    let moveUnknown = false;
-    if (current.session_id !== current.bound_session_id) {
-      const moved = raw.prepare(`SELECT at FROM audit_events WHERE kind = 'BINDING_RUNTIME_MOVED' AND role_key = ? AND session_id = ?
-          ORDER BY event_id DESC`).all(roleKey, current.session_id) as Array<{ at: string }>;
-      const within = moved.find((row) => (instant(row.at) ?? -Infinity) >= instant(current.binding_created_at)!);
-      if (within) runtimeMovedAt = within.at;
-      else moveUnknown = true;
-    }
+    // FCR-09: every recorded runtime move within this binding counts, including one back onto the
+    // session the binding names. The latest must be onto the current runtime; with none, the current
+    // runtime must be that session. Anything else is a runtime no record explains: a fallback.
+    const moves = (raw.prepare(`SELECT at, session_id FROM audit_events WHERE kind = 'BINDING_RUNTIME_MOVED' AND role_key = ?
+        ORDER BY event_id`).all(roleKey) as Array<{ at: string; session_id: string | null }>)
+      .filter((row) => (instant(row.at) ?? -Infinity) >= instant(current.binding_created_at)!);
+    const latestMove = moves.at(-1);
+    const runtimeMovedAt = latestMove && latestMove.session_id === current.session_id ? latestMove.at : null;
+    const fallback = (latestMove ? latestMove.session_id !== current.session_id : current.session_id !== current.bound_session_id)
+      ? "RUNTIME_MOVE_UNRECORDED" as const : null;
     const candidates = [current.binding_created_at, current.updated_at, ...(runtimeMovedAt === null ? [] : [runtimeMovedAt])];
     const latest = candidates.reduce((a, b) => (instant(b)! > instant(a)! ? b : a));
-    const knownSince = moveUnknown ? null : latest;
+    const knownSince = fallback ? null : latest;
     anchored.push({ roleKey, room, sessionId: current.session_id, bindingCreatedAt: current.binding_created_at,
-      sessionUpdatedAt: current.updated_at, runtimeMovedAt, knownSince });
-    proof.push(`binding ${current.assignment_id} created ${current.binding_created_at}; runtime ${current.session_id} in room ${room}, ` +
-      `its address unchanged since its updated_at ${current.updated_at}` +
-      (runtimeMovedAt !== null ? `; moved onto it ${runtimeMovedAt}` : "") +
-      (moveUnknown ? "; moved onto it with no move record, so known only since the migration" : `: known since ${latest}`));
+      sessionUpdatedAt: current.updated_at, bindingGeneration: current.binding_generation, runtimeMovedAt, knownSince, fallback });
+    proof.push(`binding ${current.assignment_id} (generation ${current.binding_generation}) created ${current.binding_created_at}; ` +
+      `runtime ${current.session_id} in room ${room}, its address unchanged since its updated_at ${current.updated_at}` +
+      (runtimeMovedAt !== null ? `; latest recorded move onto it ${runtimeMovedAt}` : "") +
+      (fallback ? `; no move record explains this runtime (${fallback}), so known only since the migration` : `: known since ${latest}`));
   }
   return { anchored, roles, refusals, evidence };
+};
+
+/**
+ * FCR-11 — every role whose room v51 can anchor only at the migration itself (a fallback): mail signed
+ * for it while the daemon was stopped for the upgrade is refused (recorded, never delivered). A
+ * deployment should not proceed while this is non-empty. Reported by `agentcpd-state migration-plan`
+ * for a database at v50, and recorded by the step in `role_room_history_unknown.anchor_fallback`.
+ */
+export const v51AnchorFallbackRoles = (raw: Database.Database): Array<{ roleKey: string; reason: string }> =>
+  roleRoomMembershipEvidence(raw).anchored
+    .filter((anchor) => anchor.fallback !== null)
+    .map((anchor) => ({ roleKey: anchor.roleKey, reason: anchor.fallback! }));
+
+/**
+ * A membership's floor: `knownSince` rounded up to a whole second. A Buzz event is signed in whole
+ * seconds, so one signed in the anchor's own second cannot be shown to postdate a sub-second anchor;
+ * admission compares the signed second with the floor's second, and from the rounded floor on, every
+ * admitted event provably postdates the anchor. An anchor on a whole second is its own floor.
+ */
+const wholeSecondFloor = (iso: string): string => {
+  const ms = Date.parse(iso);
+  return ms % 1000 === 0 ? iso : new Date(Math.ceil(ms / 1000) * 1000).toISOString();
 };
 
 /**
@@ -4113,19 +4147,19 @@ const backfillRoleRoomMemberships = (raw: Database.Database): void => {
   const insert = raw.prepare(
     `INSERT INTO role_room_memberships (role_key, conversation, joined_at, session_id) VALUES (?, ?, ?, ?)`,
   );
-  const unknown = raw.prepare(`INSERT INTO role_room_history_unknown (role_key, unknown_before, room, known_since, anchor_json)
-    VALUES (?, ?, ?, ?, ?)`);
+  const unknown = raw.prepare(`INSERT INTO role_room_history_unknown (role_key, unknown_before, room, known_since,
+      binding_generation, session_id, anchor_fallback, anchor_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
   const anchorOf = new Map(anchored.map((anchor) => [anchor.roleKey, anchor]));
   for (const roleKey of roles) {
     const anchor = anchorOf.get(roleKey);
     const knownSince = anchor ? (anchor.knownSince ?? migratedAt) : null;
-    if (anchor) insert.run(roleKey, anchor.room, knownSince, anchor.sessionId);
+    if (anchor) insert.run(roleKey, anchor.room, wholeSecondFloor(knownSince!), anchor.sessionId);
     // A clock that ran backwards cannot leave mail between the migration and a later anchor unrecorded.
     const unknownBefore = knownSince !== null && Date.parse(knownSince) > Date.parse(migratedAt) ? knownSince : migratedAt;
-    unknown.run(roleKey, unknownBefore, anchor?.room ?? null, knownSince, JSON.stringify(anchor
-      ? { sessionId: anchor.sessionId, bindingCreatedAt: anchor.bindingCreatedAt, sessionUpdatedAt: anchor.sessionUpdatedAt,
-        runtimeMovedAt: anchor.runtimeMovedAt, knownAtMigration: anchor.knownSince === null }
-      : {}));
+    unknown.run(roleKey, unknownBefore, anchor?.room ?? null, knownSince, anchor?.bindingGeneration ?? null,
+      anchor?.sessionId ?? null, anchor?.fallback ?? null, JSON.stringify(anchor
+        ? { bindingCreatedAt: anchor.bindingCreatedAt, sessionUpdatedAt: anchor.sessionUpdatedAt, runtimeMovedAt: anchor.runtimeMovedAt }
+        : {}));
   }
 };
 

@@ -47,7 +47,10 @@ const PROJECT = "room-history";
 
 type Harness = ReturnType<typeof makeHarness>;
 /** A `role_room_history_unknown` row, as v51 writes it. */
-interface UnknownHistory { role_key: string; unknown_before: string; room: string | null; known_since: string | null; anchor_json: string }
+interface UnknownHistory {
+  role_key: string; unknown_before: string; room: string | null; known_since: string | null;
+  binding_generation: number | null; session_id: string | null; anchor_fallback: string | null; anchor_json: string;
+}
 const seconds = (iso: string): number => Math.floor(Date.parse(iso) / 1000);
 
 const readyIn = (h: Harness, room: string | null, key: ChannelKey) => {
@@ -111,8 +114,9 @@ const start = (firstRoom: string | null = ROOM_A) => {
         [row.role_key, row.conversation, row.joined_at, holder()?.sessionId ?? first.sessionId]);
     }
     for (const row of unknown) {
-      h.cp.db.run("INSERT INTO role_room_history_unknown (role_key, unknown_before, room, known_since, anchor_json) VALUES (?, ?, ?, ?, ?)",
-        [row.role_key, row.unknown_before, row.room, row.known_since, row.anchor_json]);
+      h.cp.db.run(`INSERT INTO role_room_history_unknown (role_key, unknown_before, room, known_since, binding_generation, session_id,
+          anchor_fallback, anchor_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [row.role_key, row.unknown_before, row.room, row.known_since,
+        row.binding_generation, row.session_id, row.anchor_fallback, row.anchor_json]);
     }
   };
   return { h, dir, owner, cto, opens, roleKey, first, bind, broadcast, deliver, holder, moveTo, install };
@@ -148,7 +152,8 @@ const migrated = (path: string) => {
         "SELECT role_key, conversation, joined_at FROM role_room_memberships ORDER BY role_key, joined_at"),
       // Read only where the step created the table, so a database without it shows no record rather than an error.
       unknown: db.all<{ name: string }>("SELECT name FROM sqlite_schema WHERE name = 'role_room_history_unknown'").length === 0 ? []
-        : db.all<UnknownHistory>("SELECT role_key, unknown_before, room, known_since, anchor_json FROM role_room_history_unknown ORDER BY role_key"),
+        : db.all<UnknownHistory>(`SELECT role_key, unknown_before, room, known_since, binding_generation, session_id, anchor_fallback,
+          anchor_json FROM role_room_history_unknown ORDER BY role_key`),
     };
   } finally { db.close(); }
 };
@@ -225,7 +230,7 @@ it("FCR-06: equal audited endpoints around a v50 connect whose audit failed prov
     const { rows, unknown } = migrated(path);
     expect(rows).toEqual([{ role_key: f.roleKey, conversation: ROOM_A, joined_at: returnedAt }]);
     expect(anchored).toEqual([{ roleKey: f.roleKey, room: ROOM_A, sessionId: first, bindingCreatedAt: boundAt,
-      sessionUpdatedAt: returnedAt, runtimeMovedAt: null, knownSince: returnedAt }]);
+      sessionUpdatedAt: returnedAt, runtimeMovedAt: null, bindingGeneration: expect.any(Number), fallback: null, knownSince: returnedAt }]);
     f.install(rows, unknown);
     const live = await daemon(f, [ROOM_A]);
     try {
@@ -275,8 +280,9 @@ it("unknown history is every room's: mail signed before the migration in a room 
     const migratedAt = f.h.clock.nowIso();
     // The row v51 writes for a role on record at the migration (see the anchor tests above).
     if (f.h.cp.db.all("SELECT name FROM sqlite_schema WHERE name = 'role_room_history_unknown'").length > 0) {
-      f.h.cp.db.run("INSERT INTO role_room_history_unknown (role_key, unknown_before, room, known_since, anchor_json) VALUES (?, ?, ?, ?, '{}')",
-        [f.roleKey, migratedAt, ROOM_A, f.holder().createdAt]);
+      f.h.cp.db.run(`INSERT INTO role_room_history_unknown (role_key, unknown_before, room, known_since, binding_generation, session_id,
+          anchor_json) VALUES (?, ?, ?, ?, ?, ?, '{}')`,
+        [f.roleKey, migratedAt, ROOM_A, f.holder().createdAt, f.holder().bindingGeneration, f.first.sessionId]);
     }
     f.h.clock.advance(1000);
     const afterMigration = mention(f, ROOM_B, "B mail after the migration, before the role joined B");
