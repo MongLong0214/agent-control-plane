@@ -1,3 +1,4 @@
+import { acknowledgeBootstrapHandoff } from "../helpers/bootstrap-handoff-ack.ts";
 
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, statSync, symlinkSync } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -290,7 +291,7 @@ describe("#246 wiring: owner approval, then the CEO confirm runs Repo Factory", 
     const primary = wired.harness.cp.bindings.activePrimaryCto("wired-normal");
     if (!primary) throw new Error("activation bound no primary CTO");
     const handoffId = (first["evidence"] as Record<string, unknown>)["pendingHandoffId"] as string;
-    expect(wired.harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primary.sessionId).allowed).toBe(true);
+    expect((await acknowledgeBootstrapHandoff(wired.harness, handoffId, primary.sessionId)).allowed).toBe(true);
 
     wired.github.writes.length = 0;
     const second = await confirm(wired, "confirm-2");
@@ -418,7 +419,7 @@ const approveAndConfirm = async (wired: Wired, projectId: string): Promise<void>
   const primary = wired.harness.cp.bindings.activePrimaryCto(projectId);
   if (!primary) throw new Error("activation bound no primary CTO");
   const handoffId = (first["evidence"] as Record<string, unknown>)["pendingHandoffId"] as string;
-  expect(wired.harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primary.sessionId).allowed).toBe(true);
+  expect((await acknowledgeBootstrapHandoff(wired.harness, handoffId, primary.sessionId)).allowed).toBe(true);
   const second = await confirm(wired, `${projectId}-confirm-2`);
   expect(second).toMatchObject({ ok: true, value: { state: RunState.COMPLETED } });
   expect(wired.harness.cp.runs.require(wired.runId).state).toBe(RunState.COMPLETED);

@@ -219,6 +219,12 @@ case "$account" in
     [[ "\${ACP_FAKE_COMMITLORE_EMPTY_ITEM:-0}" != "1" ]] || { printf '\\n'; exit 0; }
     [[ -n "\${ACP_FAKE_COMMITLORE_BINARY_ITEM:-}" ]] || exit 44
     answer "$ACP_FAKE_COMMITLORE_BINARY_ITEM" ;;
+  # The resident host provisioner's override and its Buzz admission argv (v52) are optional: no item
+  # unless a row stores one, so the catch-all cannot answer for either.
+  ACP_HOST_PROJECT_PROVISIONER) [[ -n "\${ACP_FAKE_HOST_PROJECT_PROVISIONER_ITEM:-}" ]] || exit 44
+                                answer "$ACP_FAKE_HOST_PROJECT_PROVISIONER_ITEM" ;;
+  ACP_BUZZ_ADMISSION_COMMAND) [[ -n "\${ACP_FAKE_BUZZ_ADMISSION_COMMAND_ITEM:-}" ]] || exit 44
+                              answer "$ACP_FAKE_BUZZ_ADMISSION_COMMAND_ITEM" ;;
   ACP_CANONICAL_*)
     case ",\${ACP_CANONICAL_KEYCHAIN_ACCOUNTS:-}," in
       *,"$account",*) ;;
@@ -304,7 +310,8 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # its own PATH can find, whether the handed path runs, which interpreter its PATH resolves,
   # whether an unrelated executable sitting beside a provider CLI is reachable, then the atomic
   # canonical activation group, then where the bare name lsof resolves and what a real scan through
-  # it reports, then the optional Hermes adoption group, then the reviewer's Codex home override.
+  # it reports, then the optional Hermes adoption group, then the reviewer's Codex home override, then
+  # the resident host provisioner and its Buzz admission argv (v52).
   # These are separate observations and a launcher can satisfy any of them without the others. The
   # CommitLore pin is recorded below, in a file of its own.
   #
@@ -313,7 +320,7 @@ if [[ "$target" == *"agentcpd.js" ]]; then
   # to carry had already gone stale twice: it said the canonical group ran 17-24 when it runs 17-22,
   # put lsof at 25-26 when it is 23-24, and gave Hermes an overlapping 26-33. A comment restating a
   # derived position is the second authority the derivation was introduced to remove.
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \\
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \\
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \\
     "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" \\
@@ -331,7 +338,8 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "\${ACP_HERMES_LINEAGE_ROOT_DIGEST-}" "\${ACP_HERMES_EXECUTABLE-}" \\
     "\${ACP_HERMES_PROFILE-}" "\${ACP_HERMES_HOME-}" \\
     "\${ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY-}" "\${ACP_HERMES_GATEWAY_API_KEY-}" \\
-    "\${ACP_REVIEWER_CODEX_HOME:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
+    "\${ACP_REVIEWER_CODEX_HOME:-<unset>}" \\
+    "\${ACP_HOST_PROJECT_PROVISIONER:-<unset>}" "\${ACP_BUZZ_ADMISSION_COMMAND:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
   # The CommitLore pin (#246 B3), byte for byte. Its reader trims and splits the line above, which would
   # erase the difference between the newline security appends and a newline in the stored value. No
   # file means the variable was not exported.
@@ -538,6 +546,10 @@ const launcherObservations = (harness: InstallerHarness) => {
     ) as Record<(typeof HERMES_ADOPTION_VARIABLES)[number], string>,
     /** The packet reviewer's optional private Codex home override, appended after the Hermes group. */
     reviewerCodexHome: f[HERMES_BASE_FIELD + HERMES_ADOPTION_VARIABLES.length],
+    /** The resident host provisioner the daemon was handed (v52), appended after the reviewer override. */
+    hostProvisioner: f[HERMES_BASE_FIELD + HERMES_ADOPTION_VARIABLES.length + 1],
+    /** The provisioner's Buzz admission argv the daemon was handed (v52), appended after it. */
+    buzzAdmissionCommand: f[HERMES_BASE_FIELD + HERMES_ADOPTION_VARIABLES.length + 2],
     /** The `ACP_BUZZ_BINARY` the daemon was handed (field 7). */
     buzz: f[7],
     /**
@@ -1462,6 +1474,173 @@ exec /bin/cp "$@"
     launched = runGeneratedLauncher(harness);
     expect(launched.status, launched.stderr).toBe(0);
     expect(launcherObservations(harness).reviewerCodexHome).toBe("/keychain/reviewer-codex-homes/capsule/home");
+  });
+
+  /**
+   * v52: the daemon enables resident project provisioning only when ACP_HOST_PROJECT_PROVISIONER names a
+   * script (src/app/control-plane.ts), and without one it refuses every bootstrap
+   * BOOTSTRAP_ACTIVATION_INCOMPLETE. The plist is re-rendered on every install and upgrade, so the
+   * launcher is the only place a value can live. These rows run the rendered launcher and read what the
+   * daemon was handed; the file holding a line is not the daemon receiving it.
+   */
+  const ownProvisioner = (appRoot: string): string => join(appRoot, "dist", "host", "host-project-provisioner.mjs");
+
+  const deployGeneration = (harness: InstallerHarness, command: "install" | "upgrade", appRoot: string): void => {
+    const deployed = runInstaller(
+      installer,
+      [command, "--app-root", appRoot, "--node", harness.node, "--keychain-service", "test-service"],
+      harness,
+    );
+    expect(deployed.status, deployed.stderr).toBe(0);
+  };
+
+  /** One launch: its exit, its stderr, and what the daemon was handed — or null when it was never reached. */
+  const launchOnce = (harness: InstallerHarness) => {
+    rmSync(harness.launcherEnvLog, { force: true });
+    const launched = runGeneratedLauncher(harness);
+    return {
+      status: launched.status,
+      stderr: launched.stderr,
+      seen: existsSync(harness.launcherEnvLog) ? launcherObservations(harness) : null,
+    };
+  };
+
+  /** A plain, non-executable file standing in for a provisioner script: node runs it, nothing execs it. */
+  const writeProvisionerFile = (path: string): string => {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "// a resident host provisioner stand-in\n", { mode: 0o600 });
+    return path;
+  };
+
+  it("v52 hands the daemon this generation's own resident host provisioner by default, never an inherited one", () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    expect(statSync(ownProvisioner(appRoot)).isFile(), "the build carries no provisioner to default to").toBe(true);
+    // Values inherited from launchd (`launchctl setenv`): a real regular file and a well-formed argv,
+    // neither of which an install wrote or an operator stored.
+    harness.env["ACP_HOST_PROJECT_PROVISIONER"] = writeProvisionerFile(join(harness.home, "inherited", "provisioner.mjs"));
+    harness.env["ACP_BUZZ_ADMISSION_COMMAND"] = JSON.stringify(["/inherited/admission"]);
+    deployGeneration(harness, "install", appRoot);
+
+    rmSync(harness.securityLog, { force: true });
+    const launch = launchOnce(harness);
+    expect(launch.status, launch.stderr).toBe(0);
+    expect(launch.seen?.hostProvisioner, "the daemon was not handed this generation's own provisioner").toBe(
+      ownProvisioner(appRoot),
+    );
+    // No admission item: nothing is handed, so the provisioner keeps the default in its own script.
+    expect(launch.seen?.buzzAdmissionCommand, "an inherited admission argv reached the daemon").toBe("<unset>");
+    // The default applied because the Keychain was asked and had no item, not because it was never asked.
+    const lookups = readFileSync(harness.securityLog, "utf8").split("\n");
+    expect(lookups.filter((line) => line.endsWith("-s test-service -a ACP_HOST_PROJECT_PROVISIONER"))).toHaveLength(1);
+    expect(lookups.filter((line) => line.endsWith("-s test-service -a ACP_BUZZ_ADMISSION_COMMAND"))).toHaveLength(1);
+  });
+
+  it("v52 lets a Keychain ACP_HOST_PROJECT_PROVISIONER win over the generation's own, and takes the admission argv from the Keychain", () => {
+    const harness = makeHarness();
+    expect(installWithPins(harness).status).toBe(0);
+    const override = writeProvisionerFile(join(harness.home, "operator-provisioner", "host-project-provisioner.mjs"));
+    const admission = JSON.stringify(["/opt/operator/bin/admit", "add-member"]);
+    harness.env["ACP_FAKE_HOST_PROJECT_PROVISIONER_ITEM"] = override;
+    harness.env["ACP_FAKE_BUZZ_ADMISSION_COMMAND_ITEM"] = admission;
+
+    const launch = launchOnce(harness);
+    expect(launch.status, launch.stderr).toBe(0);
+    expect(launch.seen?.hostProvisioner, "the Keychain override did not win").toBe(override);
+    expect(launch.seen?.hostProvisioner).not.toBe(ownProvisioner(root));
+    expect(launch.seen?.buzzAdmissionCommand, "the Keychain admission argv was not handed through unchanged").toBe(admission);
+  });
+
+  it("v52 refuses to start when the resident host provisioner is missing or not a regular file, and never names the path", () => {
+    const harness = makeHarness();
+    const appRoot = makeDisposableAppRoot();
+    deployGeneration(harness, "install", appRoot);
+    const own = ownProvisioner(appRoot);
+    const ownHost = dirname(own);
+
+    const refusedBy = (reason: string, kind: string, named: string) => {
+      const launch = launchOnce(harness);
+      expect(launch.status, `${kind}: ${launch.stderr}`).toBe(78);
+      expect(launch.seen, `${kind}: the daemon was started`).toBeNull();
+      expect(launch.stderr, kind).toContain(reason);
+      expect(launch.stderr, `${kind}: the refusal named the path`).not.toContain(named);
+    };
+
+    // The generation's own copy: absent, a directory, a symlink to a regular file elsewhere, and a
+    // dist/host that is itself a symlink to a directory outside the generation holding a regular file.
+    const ownRefusal = "this generation has no resident host provisioner";
+    const ownBytes = readFileSync(own);
+    rmSync(own);
+    refusedBy(ownRefusal, "absent", appRoot);
+    mkdirSync(own);
+    refusedBy(ownRefusal, "a directory", appRoot);
+    rmSync(own, { recursive: true });
+    const elsewhere = writeProvisionerFile(join(harness.home, "elsewhere", "host-project-provisioner.mjs"));
+    symlinkSync(elsewhere, own);
+    refusedBy(ownRefusal, "a symlink to a regular file outside the generation", appRoot);
+    rmSync(own);
+    renameSync(ownHost, `${ownHost}.moved`);
+    symlinkSync(dirname(elsewhere), ownHost);
+    refusedBy(ownRefusal, "a dist/host that leads outside the generation", appRoot);
+    rmSync(ownHost);
+    renameSync(`${ownHost}.moved`, ownHost);
+    writeFileSync(own, ownBytes, { mode: 0o600 });
+    // The control: the same generation with its own file back starts and hands it over.
+    const restored = launchOnce(harness);
+    expect(restored.status, restored.stderr).toBe(0);
+    expect(restored.seen?.hostProvisioner).toBe(own);
+
+    // A Keychain override: absent, relative, a directory, and a symlink to a regular file.
+    const overrideRefusal = "the Keychain item ACP_HOST_PROJECT_PROVISIONER does not name an absolute regular file";
+    const directory = join(harness.home, "operator-provisioner-directory");
+    mkdirSync(directory, { recursive: true });
+    const link = join(harness.home, "operator-provisioner-link.mjs");
+    symlinkSync(elsewhere, link);
+    for (const [kind, value] of Object.entries({
+      "a missing absolute path": join(harness.home, "operator-named-nothing", "provisioner.mjs"),
+      "a bare name": "operator-provisioner.mjs",
+      "a directory": directory,
+      "a symlink to a regular file": link,
+    })) {
+      harness.env["ACP_FAKE_HOST_PROJECT_PROVISIONER_ITEM"] = value;
+      refusedBy(overrideRefusal, kind, value);
+    }
+  });
+
+  it("v52 keeps the provisioner across re-rendering: the default follows the generation and a Keychain value survives", () => {
+    const harness = makeHarness();
+    const first = makeDisposableAppRoot();
+    const second = makeDisposableAppRoot();
+
+    deployGeneration(harness, "install", first);
+    let launch = launchOnce(harness);
+    expect(launch.status, launch.stderr).toBe(0);
+    expect(launch.seen?.hostProvisioner).toBe(ownProvisioner(first));
+
+    // An upgrade re-renders the launcher for a new generation, and the default moves with it.
+    deployGeneration(harness, "upgrade", second);
+    launch = launchOnce(harness);
+    expect(launch.status, launch.stderr).toBe(0);
+    expect(launch.seen?.hostProvisioner, "the re-rendered launcher kept the previous generation's provisioner").toBe(
+      ownProvisioner(second),
+    );
+
+    // The operator's values live in the Keychain, never in the rendered file, so another re-render of
+    // the same generation cannot drop them; every launch after it reads them again.
+    const override = writeProvisionerFile(join(harness.home, "operator-provisioner", "host-project-provisioner.mjs"));
+    const admission = JSON.stringify(["/opt/operator/bin/admit", "add-member"]);
+    harness.env["ACP_FAKE_HOST_PROJECT_PROVISIONER_ITEM"] = override;
+    harness.env["ACP_FAKE_BUZZ_ADMISSION_COMMAND_ITEM"] = admission;
+    deployGeneration(harness, "upgrade", second);
+    const rendered = readFileSync(launcherPath(harness), "utf8");
+    expect(rendered, "the override was baked into the launcher").not.toContain(override);
+    expect(rendered, "the admission argv was baked into the launcher").not.toContain(admission);
+    for (const run of [1, 2]) {
+      launch = launchOnce(harness);
+      expect(launch.status, `launch ${run}: ${launch.stderr}`).toBe(0);
+      expect(launch.seen?.hostProvisioner, `launch ${run}`).toBe(override);
+      expect(launch.seen?.buzzAdmissionCommand, `launch ${run}`).toBe(admission);
+    }
   });
 
   it("#423 takes BUZZ_PRIVATE_KEY from the desktop store when it has no item of its own", () => {

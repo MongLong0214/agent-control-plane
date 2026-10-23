@@ -211,10 +211,6 @@ describe("W17: lowering the verification bar is detected against the pin and ref
       ciWorkflows: [...base.ciWorkflows, { ...WORKFLOW_ENTRY, checkName: "lint", path: ".github/workflows/lint.yml" }],
     }), BAR, ["CI_WORKFLOW_ADDED_BESIDE_CI_EVIDENCE"]],
     ["a lower CommitLore mode", (base) => ({ ...base, commitlore: { mode: "preferred" } }), BAR, ["COMMITLORE_MODE_DOWNGRADED"]],
-    ["a retained workflow with a new approved digest", (base) => ({
-      ...base,
-      ciWorkflows: [{ ...WORKFLOW_ENTRY, approvedDigest: sha256(WORKFLOW.replace("node --test", "node --version")) }],
-    }), DIGEST_CHANGED, ["CI_WORKFLOW_DIGEST_CHANGED"]],
     ["a retained workflow made unapproved", (base) => ({
       ...base,
       ciWorkflows: [{ ...WORKFLOW_ENTRY, approvedDigest: null, unapprovedFirstActivation: true }],

@@ -1,3 +1,4 @@
+import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -129,6 +130,10 @@ export const executeCanonicalSelfClaimOperator = async (
   if (!parsed.allowed) return parsed;
   const request = parsed.value;
 
+  const registry = new CanonicalSessionRegistry(deps.db);
+  const revision = registry.fingerprint();
+  const entries = registry.effective(deps.config.canonicalSessions);
+  if (!entries.length) return deny(ReasonCode.CONFLICT, "no active canonical entitlement", {});
   const claim = new CanonicalSelfClaim(
     deps.db,
     deps.clock,
@@ -137,7 +142,7 @@ export const executeCanonicalSelfClaimOperator = async (
     deps.bindings,
     deps.buzzActorAuthenticator,
     deps.resolveBuzzAddress,
-    deps.config,
+    { ...deps.config, canonicalSessions: entries, entitlementCurrent: () => registry.fingerprint() === revision },
     {
       ...(deps.claimDeps ?? {}),
       ...(deps.subscribedBuzzRooms === undefined ? {} : { subscribedBuzzRooms: deps.subscribedBuzzRooms }),

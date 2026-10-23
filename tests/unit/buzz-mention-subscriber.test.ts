@@ -2806,3 +2806,16 @@ describe("a canonical CTO routed to its own room hears it only through its own i
     }
   });
 });
+
+it('hot-adds and retires a resident identity without replacing the unchanged subscription',() => {
+  const root = tempDir('hot-add-resident-');const first = hexIdentity(root,'first.key');const second = hexIdentity(root,'second.key');
+  writeConfig(root,configFor([{keyFile:first.keyFile,encoding:'hex'}]));
+  const transport = manualTransport();const clock = virtualClock();
+  const handle = startBuzzMentionSubscriberFromStateDir(root,{registry:registryHolding({[first.pubkey]:{roleKey:ROLE_KEY,buzzActorId:first.pubkey},[second.pubkey]:{roleKey:'PRIMARY_CTO:resident-new',buzzActorId:second.pubkey}}),sink:recordingSink(),openSocket:transport.factory,scheduler:clock.scheduler});
+  const original = transport.sockets[0]!;
+  const firstConfig = {privateKeyFile:first.keyFile,encoding:'hex' as const,rooms:[ROOM]};const secondConfig = {privateKeyFile:second.keyFile,encoding:'hex' as const,rooms:[ROOM]};
+  expect(handle.reconcile).toBeTypeOf('function');
+  handle.reconcile!([firstConfig,secondConfig]);expect(transport.sockets).toHaveLength(2);expect(original.closed).toBe(false);expect(handle.socketCount).toBe(2);
+  handle.reconcile!([firstConfig,secondConfig]);expect(transport.sockets).toHaveLength(2);
+  handle.reconcile!([firstConfig]);expect(transport.sockets[1]!.closed).toBe(true);expect(original.closed).toBe(false);expect(handle.identityRooms).toEqual([{actorId:first.pubkey,rooms:[ROOM]}]);handle.close();
+});

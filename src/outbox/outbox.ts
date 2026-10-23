@@ -17,7 +17,6 @@ import {
   type PeerMessageCarryAuthority,
   type PeerMessageSuccession,
   adoptedCanonicalRuntimeSql,
-  isAdoptedCanonicalRuntime,
   peerMessageCarrySuccessionOf,
 } from "../registry/canonical-self-claim.ts";
 import {
@@ -336,8 +335,9 @@ export const handOverEligibleSql = (alias: string): string =>
  * to a canonical CTO depends on that send: `RUN_DISPATCH` (run engine, owner-decision resume),
  * `REVISION_REQUEST` (candidate pipeline, candidate invalidation), `ESCALATION_REPLY` (the CEO's
  * resolution), `DRAIN_REQUEST` (replacement) and `CANCEL_REQUEST`. All are settled by `run_ack`,
- * the only generic acknowledgement there is. Left out: `HANDOFF_PACKAGE`, whose recipient is by
- * construction not yet the role's holder and is settled by `handoff_ack`; `CEO_NOTIFICATION`,
+ * the only generic acknowledgement there is. A `HANDOFF_PACKAGE` is also in band when addressed
+ * to its role's current holder (bootstrap); a switchover's unbound recipient keeps its Buzz route.
+ * It is settled by `handoff_ack`. Left out: `CEO_NOTIFICATION`,
  * addressed to the CEO; and `TASK_ASSIGN`, `REVIEW_REQUEST` and `RECOVERY_PACKAGE`, which nothing
  * enqueues. Disjoint from `HOLDER_CLAIMED_KINDS`, which never reach the sweep at all.
  */
@@ -460,6 +460,8 @@ export type InBandWake = (roleKey: string, messageIds?: readonly string[]) => Pr
 /** What an adopted canonical CTO is shown of a row addressed to it in band. */
 export interface InBandDispatch {
   messageId: string;
+  bindingGeneration: number;
+  payloadDigest: string;
   kind: MessageKind;
   runId: string | null;
   createdAt: string;
@@ -472,7 +474,8 @@ export interface InBandDispatch {
  * canonical runtime. `claimDeliverable` excludes it, and every in-band read below selects it.
  */
 export const inBandRow = (outboxAlias: "o" | "outbox"): string =>
-  `((${outboxAlias}.kind IN (${IN_BAND_KIND_SQL})
+  `(((${outboxAlias}.kind IN (${IN_BAND_KIND_SQL})
+       OR (${outboxAlias}.kind = 'HANDOFF_PACKAGE' AND ${currentRoleDeliveryTarget(outboxAlias)}))
      AND ${adoptedCanonicalRuntimeSql(`${outboxAlias}.target_session_id`)})
     OR (${outboxAlias}.kind IN (${PROVISIONED_IN_BAND_KIND_SQL})
      AND ${provisionedRuntimeSql(`${outboxAlias}.target_session_id`)}))`;
@@ -534,11 +537,14 @@ const ceoBuzzSessionSql = (alias: "o" | "outbox"): string =>
 const ceoBuzzRouteSql = (alias: "o" | "outbox", canonicalAttached: boolean): string =>
   `(NOT ${ceoCanonicalRouteSql(alias, canonicalAttached)} AND ${ceoBuzzSessionSql(alias)})`;
 
-/** `inBandRow`, as a read of one kind and target: the same two halves, the same kind sets. */
-const deliveredInBand = (db: Pick<Db, "get">, kind: string, sessionId: string): boolean =>
-  (IN_BAND_KINDS.has(kind as MessageKind) && isAdoptedCanonicalRuntime(db, sessionId)) ||
-  (PROVISIONED_IN_BAND_KINDS.has(kind as MessageKind) &&
-    db.get<{ held: number }>(`SELECT ${provisionedRuntimeSql("?")} AS held`, [sessionId])?.held === 1);
+/** The TS callers evaluate the same row predicate as the sweep, read and ACK. */
+const deliveredInBand = (
+  db: Pick<Db, "get">, kind: string, sessionId: string, roleKey: string, generation: number,
+): boolean => db.get<{ held: number }>(
+  `SELECT ${inBandRow("o")} AS held
+     FROM (SELECT ? AS kind, ? AS target_session_id, ? AS role_key, ? AS binding_generation) o`,
+  [kind, sessionId, roleKey, generation],
+)?.held === 1;
 
 /**
  * Which runtime holds a role *right now* — one notion of it, shared by every predicate below.
@@ -600,8 +606,7 @@ const exactHolderTarget = (source: "o" | "outbox" | "bound"): string => {
 )`;
 };
 
-const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
-  EXISTS (
+const currentRoleDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `EXISTS (
     SELECT 1 FROM assignments a
       ${HOLDER_ACTOR_JOIN}
       JOIN sessions s ON s.session_id = ${CURRENT_HOLDER_SESSION}
@@ -610,7 +615,10 @@ const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
        AND ${CURRENT_HOLDER_SESSION} = ${outboxAlias}.target_session_id
        AND a.status = 'ACTIVE'
        AND s.lifecycle IN ('READY','DRAINING')
-  )
+  )`;
+
+const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
+  ${currentRoleDeliveryTarget(outboxAlias)}
   OR EXISTS (
     SELECT 1 FROM handoffs h
       JOIN sessions recipient ON recipient.session_id = h.to_session_id
@@ -1162,7 +1170,7 @@ export class Outbox {
     // An in-band row is never transmitted, so the role is told it has something to read — after
     // the enclosing transaction commits, so a wake cannot reach the CTO before the row it points
     // at is visible, and a rollback discards it.
-    if (deliveredInBand(this.db, message.kind, message.targetSessionId)) {
+    if (deliveredInBand(this.db, message.kind, message.targetSessionId, message.roleKey, message.bindingGeneration)) {
       this.db.afterCommit(() => {
         void this.#wakeInBand([{ messageId: message.messageId, roleKey: message.roleKey }], "enqueue");
       });
@@ -1925,6 +1933,16 @@ export class Outbox {
     });
   }
 
+  /** Called by the handoff service after its package checks, in the same transaction. */
+  acknowledgeHandoffInBand(messageId: string, sessionId: string, sessionIncarnation: string): Decision<void> {
+    return this.db.tx(() => {
+      const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [messageId]);
+      if (!row) return deny(ReasonCode.NOT_FOUND, "unknown message", { messageId });
+      if (row.kind !== MessageKind.HANDOFF_PACKAGE) return deny(ReasonCode.INVALID_ARGUMENT, "message is not a handoff package");
+      return this.#acknowledgeInBandInTx(row, sessionId, sessionIncarnation, true);
+    });
+  }
+
   /**
    * #246 C4 — the `DrivenMode` of a session, by the one predicate the in-band routing above reads, so
    * the runtime that drives a session and the outbox that routes to it never disagree about it.
@@ -1940,7 +1958,7 @@ export class Outbox {
 
   /** In-band, in `claimDeliverable`'s terms: an in-band kind addressed to a canonical or provisioned runtime. */
   #isInBand(row: RawOutbox): boolean {
-    return deliveredInBand(this.db, row.kind, row.target_session_id);
+    return deliveredInBand(this.db, row.kind, row.target_session_id, row.role_key, row.binding_generation);
   }
 
   /**
@@ -1952,7 +1970,7 @@ export class Outbox {
    * can see. A holder-claimed kind, a row that is not in band, and a row that is expired, rejected or
    * already settled are refused. Only `PENDING -> ACKED` is written, as a compare-and-set.
    */
-  #acknowledgeInBandInTx(row: RawOutbox, sessionId: string, sessionIncarnation: string | null): Decision<void> {
+  #acknowledgeInBandInTx(row: RawOutbox, sessionId: string, sessionIncarnation: string | null, handoff = false): Decision<void> {
     const messageId = row.message_id;
     const refuse = (reasonCode: ReasonCode, message: string): Decision<void> => {
       this.audit.record({
@@ -1973,6 +1991,9 @@ export class Outbox {
     }
     if (!this.#isInBand(row)) {
       return refuse(ReasonCode.INVALID_ARGUMENT, "this message is not delivered in band; acknowledge it with run_ack");
+    }
+    if (row.kind === MessageKind.HANDOFF_PACKAGE && !handoff) {
+      return refuse(ReasonCode.HANDOFF_ACK_REQUIRED, "a handoff package is settled with handoff_ack");
     }
     if (row.status === "EXPIRED") {
       return refuse(ReasonCode.OUTBOX_EXPIRED, `message is ${outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }).status} and cannot be acknowledged`);
@@ -2034,6 +2055,8 @@ export class Outbox {
     );
     return rows.map((row) => ({
       messageId: row.message_id,
+      bindingGeneration: row.binding_generation,
+      payloadDigest: row.payload_digest,
       kind: row.kind as MessageKind,
       runId: row.run_id,
       createdAt: row.created_at,
@@ -2746,7 +2769,7 @@ export class Outbox {
     }
     if (decision.kind === "SUPERSEDE") return supersedeInstruction(this.db, this.audit, row, decision, to, path);
     if (!to) return false;
-    const inBand = deliveredInBand(this.db, row.kind, to.sessionId);
+    const inBand = deliveredInBand(this.db, row.kind, to.sessionId, row.role_key, to.generation);
     // FCR-02: a row already sent to the receiver it is handed to is only re-addressed to the new
     // generation; it stays SENT, awaiting that receiver's ACK, and is not delivered again.
     if (row.status === "SENT" && this.db.get<{ same: number }>(

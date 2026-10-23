@@ -1,3 +1,4 @@
+import { V52_ADDED_TRIGGERS } from "../helpers/released-v50-schema.ts";
 import Database from "better-sqlite3";
 import { existsSync } from "node:fs";
 
@@ -559,13 +560,14 @@ const seedAsV47 = (path: string): { kept: Row[]; withdrawnPreV48: Row; removedPr
 };
 
 describe("S1: the v47 → v48 step on the released v47 image", () => {
-  it("is the step from 47, followed by v49, v50 and v51, and v47 keeps the full checksum it shipped with", () => {
-    expect(SCHEMA_VERSION).toBe(51);
+  it("is the step from 47, followed by v49, v50, v51 and v52, and v47 keeps the full checksum it shipped with", () => {
+    expect(SCHEMA_VERSION).toBe(52);
     expect(MIGRATIONS.find((step) => step.fromVersion === 47)).toMatchObject({ id: "v48-owner-decision-supersede-guard", fromVersion: 47, toVersion: 48 });
-    expect(MIGRATIONS.slice(-3)).toMatchObject([
+    expect(MIGRATIONS.slice(-4)).toMatchObject([
       { id: "v49-branch-publish-receipts", fromVersion: 48, toVersion: 49 },
       { id: "v50-post-merge-verification-reentry", fromVersion: 49, toVersion: 50 },
       { id: "v51-durable-recipient-delivery", fromVersion: 50, toVersion: 51 },
+      { id: "v52-resident-project-provisioning", fromVersion: 51, toVersion: 52 },
     ]);
     expect(MIGRATIONS.find((step) => step.toVersion === 47)!.checksum()).toBe(V47_BASE_CHECKSUM);
   });
@@ -591,7 +593,7 @@ describe("S1: the v47 → v48 step on the released v47 image", () => {
     approveMigration(path, "v48 S1 preservation witness");
     new Db(path).close();
 
-    const after = contentDigests(path);
+    const after = contentDigests(path, before.userVersion);
     // #512 S-PUSH: the approved chain runs on to v49, which rebuilds github_receipts with every row kept.
     expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsDigestBefore, ...restBefore } = before.tables;
@@ -599,7 +601,7 @@ describe("S1: the v47 → v48 step on the released v47 image", () => {
     expect(Object.fromEntries(Object.keys(restBefore).map((name) => [name, restAfter[name]]))).toEqual(restBefore);
     expect(receiptsDigestAfter).not.toBe(receiptsDigestBefore);
     expect(receiptsThrough47(path)).toEqual(receiptsBefore);
-    expect(triggersOf(path)).toEqual([...triggersBefore, ...V48_ADDED_TRIGGERS, "buzz_events_no_replace", "buzz_events_immutable", "buzz_events_no_delete", "outbox_holder_message_terminal", "holder_message_terminals_immutable", "holder_message_terminals_no_delete", "holder_message_terminals_no_replace"].sort());
+    expect(triggersOf(path)).toEqual([...triggersBefore, ...V48_ADDED_TRIGGERS, "buzz_events_no_replace", "buzz_events_immutable", "buzz_events_no_delete", "outbox_holder_message_terminal", "holder_message_terminals_immutable", "holder_message_terminals_no_delete", "holder_message_terminals_no_replace", ...V52_ADDED_TRIGGERS].sort());
     expect([...kept, withdrawnPreV48].map((r) => stored(path, r.id))).toEqual(rowsBefore);
     const raw = new Database(path, { readonly: true });
     try {

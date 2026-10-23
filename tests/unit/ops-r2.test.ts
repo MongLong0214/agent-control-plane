@@ -1,3 +1,4 @@
+import { acknowledgeBootstrapHandoff } from "../helpers/bootstrap-handoff-ack.ts";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { createConnection } from "node:net";
 import { readFileSync } from "node:fs";
@@ -352,7 +353,7 @@ describe("round-2 ops regressions", () => {
     const handoffId = pending.evidence["pendingHandoffId"] as string;
     const primary = harness.cp.bindings.activePrimaryCto("activation-finalize");
     if (!primary) throw new Error("primary CTO was not bound");
-    expect(harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primary.sessionId).allowed).toBe(true);
+    expect((await acknowledgeBootstrapHandoff(harness, handoffId, primary.sessionId)).allowed).toBe(true);
 
     const preparedForConfirm = await harness.cp.bootstrap.activate(input);
     expect(preparedForConfirm.allowed).toBe(true);
@@ -468,7 +469,7 @@ describe("round-2 ops regressions", () => {
 
     // A's valid ACK after B has opened must still leave B pending: B queries its own
     // run-scoped handoff artifact rather than any ACK for the project/recipient tuple.
-    expect(harness.cp.bootstrap.acknowledgeActivationHandoff(firstHandoff, primary.sessionId).reasonCode)
+    expect((await acknowledgeBootstrapHandoff(harness, firstHandoff, primary.sessionId)).reasonCode)
       .toBe(ReasonCode.OK);
     const stillPending = await harness.cp.bootstrap.activate(
       activationInput(harness, second.runId, "shared-project", second.plan),
@@ -593,9 +594,15 @@ describe("round-2 ops regressions", () => {
       sessionId: primary.sessionId,
       sessionIncarnation: primary.sessionIncarnation,
     }));
-    const acknowledged = await tool(server, "handoff_ack")({ idempotencyKey: "bootstrap-ack", handoffId });
+    const message = harness.cp.outbox.byIdempotencyKey(`bootstrap-handoff:${handoffId}`)!;
+    const received = harness.cp.outbox.pendingInBandFor(primary.sessionId, primary.sessionIncarnation)
+      .find(row => row.messageId === message.messageId);
+    if (!received) await harness.buzzAdapter.deliverPending();
+    const acknowledged = await tool(server, "handoff_ack")({ idempotencyKey: "bootstrap-ack", handoffId,
+      messageId: message.messageId, bindingGeneration: message.bindingGeneration, payloadDigest: message.payloadDigest });
     expect(acknowledged.structuredContent?.["ok"]).toBe(true);
     expect(harness.cp.db.get<{ status: string }>(`SELECT status FROM handoffs WHERE handoff_id = ?`, [handoffId])?.status).toBe("ACKED");
+    expect(harness.cp.outbox.get(message.messageId)?.status).toBe("ACKED");
   });
 
   it("#120/#213: Telegram cannot be constructed without a non-empty webhook secret", () => {

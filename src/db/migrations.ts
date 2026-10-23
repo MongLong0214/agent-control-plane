@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 51;
+export const SCHEMA_VERSION = 52;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -20,6 +20,7 @@ const v47SchemaPath = fileURLToPath(new URL("./schema-v47.sql", import.meta.url)
 const v48SchemaPath = fileURLToPath(new URL("./schema-v48.sql", import.meta.url)); // released v48 reads only this
 const v49SchemaPath = fileURLToPath(new URL("./schema-v49.sql", import.meta.url)); // released v49 reads only this
 const v50SchemaPath = fileURLToPath(new URL("./schema-v50.sql", import.meta.url)); // released v50 reads only this
+const v51SchemaPath = fileURLToPath(new URL("./schema-v51.sql", import.meta.url)); // released v51 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -30,7 +31,8 @@ const schemaSqlAt = (version: number): string =>
           : version <= 47 ? readFileSync(v47SchemaPath, "utf8")
             : version <= 48 ? readFileSync(v48SchemaPath, "utf8")
               : version <= 49 ? readFileSync(v49SchemaPath, "utf8")
-                : version <= LATEST_FROZEN_VERSION ? readFileSync(v50SchemaPath, "utf8") : schemaSql();
+                : version <= 50 ? readFileSync(v50SchemaPath, "utf8")
+                  : version <= LATEST_FROZEN_VERSION ? readFileSync(v51SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -4203,6 +4205,47 @@ const v51: SchemaMigration = {
   checksum: () => migrationChecksum("v51-durable-recipient-delivery", 51),
 };
 
+/**
+ * v52 gives a new project a resident CTO: it rebuilds projects, repositories and bootstrap_applications
+ * to their schema.sql definitions, every row carried (with its rowid where the table has one), and adds
+ * the provisioning, entitlement and retirement tables. No object v51 created is on those three tables, so
+ * the rebuild neither drops nor re-creates one.
+ */
+const v52: SchemaMigration = {
+  id: "v52-resident-project-provisioning", fromVersion: 51, toVersion: 52,
+  foreignKeysOffDuringApply: true,
+  apply(raw) {
+    const ddl = schemaSql();
+    // Keep the canonical definitions identical on fresh installs and upgrades. Legacy rename
+    // semantics plus foreign_keys=OFF preserve every other table's references to these names.
+    raw.pragma("legacy_alter_table = ON");
+    try {
+      for (const table of ["projects", "repositories", "bootstrap_applications"]) {
+        const prior = `${table}_v52_prior`;
+        if (raw.prepare("SELECT 1 FROM sqlite_master WHERE name = ?").get(prior)) throw new Error("v52 temporary name occupied");
+        const definition = new RegExp(String.raw`CREATE TABLE IF NOT EXISTS ${table} \([\s\S]*?\n\)(?: WITHOUT ROWID)?;`).exec(ddl)?.[0];
+        if (!definition) throw new Error("v52 table definition absent");
+        const names = raw.prepare("SELECT type,name FROM sqlite_master WHERE tbl_name = ? AND type IN ('index','trigger') AND sql IS NOT NULL").all(table) as {type:string;name:string}[];
+        for (const object of names) raw.exec(`DROP ${object.type.toUpperCase()} "${object.name}"`);
+        raw.exec(`ALTER TABLE ${table} RENAME TO ${prior}`);
+        raw.exec(definition);
+        const columns = sharedColumns(raw,prior,table);
+        const rowid = table !== "bootstrap_applications";
+        const list = [...(rowid ? ["rowid"] : []),...columns].map(c => `"${c}"`).join(",");
+        const rows = (name:string):string => JSON.stringify(raw.prepare(`SELECT ${list} FROM ${name} ORDER BY ${rowid ? "rowid" : "run_id"}`).all());
+        const before = rows(prior);
+        raw.exec(`INSERT INTO ${table} (${list}) SELECT ${list} FROM ${prior}`);
+        if (rows(table) !== before) throw new Error("v52 row preservation failed");
+        raw.exec(`DROP TABLE ${prior}`);
+        for (const match of ddl.matchAll(/CREATE (?:UNIQUE )?INDEX IF NOT EXISTS \w+[\s\S]*?;/g)) if (new RegExp(String.raw`ON ${table}\(`).test(match[0])) raw.exec(match[0]);
+        for (const match of ddl.matchAll(/CREATE TRIGGER IF NOT EXISTS \w+[\s\S]*?\nEND;/g)) if (new RegExp(String.raw`ON ${table}\b`).test(match[0].split("BEGIN")[0]!)) raw.exec(match[0]);
+      }
+    } finally {raw.pragma("legacy_alter_table = OFF");}
+    raw.exec(ddl.slice(ddl.indexOf('-- v52:')));
+  },
+  checksum: () => migrationChecksum("v52-resident-project-provisioning", 52),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -4244,6 +4287,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v49,
   v50,
   v51,
+  v52,
 ]);
 
 interface RequiredTrigger {
@@ -4254,6 +4298,16 @@ interface RequiredTrigger {
 }
 
 const REQUIRED_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
+  {name:"project_retirements_identity_immutable",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"project_retirements_no_replace",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"project_retirements_no_delete",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+
+  {name:"resident_project_provisioning_identity_immutable",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"resident_project_provisioning_no_replace",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"resident_project_provisioning_no_delete",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"canonical_session_entitlements_identity_immutable",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"canonical_session_entitlements_no_replace",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
+  {name:"canonical_session_entitlements_no_delete",sentinel:"BOOTSTRAP_APPLICATION_IMMUTABLE",introducedIn:52},
   { name: "runs_state_transition_authority_guard", sentinel: "RUN_STATE_TRANSITION_AUTHORITY_DENIED" },
   { name: "tasks_run_work_sealed", sentinel: "TASK_INSERT_RUN_SEALED" },
   { name: "run_artifacts_evidence_authority_guard", sentinel: "EVIDENCE_WRITE_AUTHORITY_DENIED" },
@@ -4598,13 +4652,15 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * reads the live schema.sql, so its checksum still moves with any schema edit until the next freeze.
  * Declared here, below the anchors other gates hold into this file, and read only inside functions.
  *
+ * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 3915f78c; v50 is
+ * frozen as v51's prerequisite in schema-v50.sql.
  * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
  * #512 S-PUSH (CEO 3d0daed0): v48 was frozen as v49's prerequisite. It reads `schema-v48.sql`, a byte copy
  * of schema.sql at c65e73b2 (blob 29f2a057, unchanged since v48's merge ab136549), so v49's receipts table
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 50;
+const LATEST_FROZEN_VERSION = 51;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when

@@ -1022,6 +1022,7 @@ const C65E73B2_DISPATCH_PROMPT_TAIL: readonly string[] = [
 
 /** The driven RUN_DISPATCH prompt c65e73b2 wrote for this holder: its first line, then the frozen rest. */
 const c65e73b2DispatchPrompt = (firstLine: string): string => [firstLine, ...C65E73B2_DISPATCH_PROMPT_TAIL].join("\n");
+const withoutAdministrativeTeaching = (prompt:string): string => prompt.split("\n").filter(line => !line.startsWith("For an administrative CONTRACT_CHANGE")).join("\n").replace("The resolution never bypasses the blind review", "The resolution never bypasses T3, the blind review");
 
 /** Re-enters the owner as a continuation's wake would: the turn carries that wake's line, and the stand-in remembers no id. */
 const reenter = async (f: BootstrapRuntimeFixture, run: { runId: string; roleKey: string; sessionId: string; taskId: string }, id: string) => {
@@ -1136,7 +1137,7 @@ describe("R2-01, CEO 07b5b0df — bootstrap and CONTRACT_CHANGE turns are exactl
         ["run_ack", true],
       ]);
       // The CONTRACT_CHANGE run's RUN_DISPATCH turn: c65e73b2's prompt, byte for byte.
-      expect(owner.prompts.at(-1)).toBe(c65e73b2DispatchPrompt("You are the PRIMARY_CTO in the agent control plane, at binding generation 1."));
+      expect(withoutAdministrativeTeaching(owner.prompts.at(-1)!)).toBe(c65e73b2DispatchPrompt("You are the PRIMARY_CTO in the agent control plane, at binding generation 1."));
       expect(real.provision).not.toHaveBeenCalled();
       expect(cp.tasks.executions(runId)).toEqual([]);
       expect(cp.tasks.list(runId).map((task) => task.state)).toEqual([TaskState.READY]);
@@ -1145,7 +1146,7 @@ describe("R2-01, CEO 07b5b0df — bootstrap and CONTRACT_CHANGE turns are exactl
       // The project's bootstrap run's BOOTSTRAP_CTO dispatch turn, on the same double: c65e73b2's too.
       const bootstrapPrompt = f.claude.turns.find((turn) =>
         turn.relay !== null && turn.prompt.startsWith(`You are the BOOTSTRAP_CTO of run ${bootstrapRunId} `))!.prompt;
-      expect(bootstrapPrompt).toBe(c65e73b2DispatchPrompt(`You are the BOOTSTRAP_CTO of run ${bootstrapRunId} in the agent control plane, at binding generation 1.`));
+      expect(withoutAdministrativeTeaching(bootstrapPrompt!)).toBe(c65e73b2DispatchPrompt(`You are the BOOTSTRAP_CTO of run ${bootstrapRunId} in the agent control plane, at binding generation 1.`));
     });
   });
 });

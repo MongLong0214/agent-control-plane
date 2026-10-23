@@ -1,3 +1,4 @@
+import { takeBackV52 } from "../helpers/released-v50-schema.ts";
 import { afterAll, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import { readFileSync } from "node:fs";
@@ -1126,6 +1127,7 @@ describe("a claim takes the hold in the same transaction", () => {
 const restoreV37Shape = (file: string): void => {
   // Recreate the old on-disk shape without rewriting a historical migration.
   const legacy = new Database(file);
+  takeBackV52(legacy);
   const v37NoReplace = /CREATE TRIGGER IF NOT EXISTS canonical_turns_no_replace[\s\S]*?\nEND;/.exec(
     readFileSync(new URL("../../src/db/schema-v37.sql", import.meta.url), "utf8"),
   )?.[0];

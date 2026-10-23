@@ -3539,3 +3539,12 @@ describe("each adopted session is written into its own entry's Buzz room (2026-1
     expect(resolver.asked).toEqual([]);
   });
 });
+
+it('refuses canonical admission when DB entitlement is revoked during the awaited room resolution',async () => {
+  const core = makeCore();insertProject(core,'revoked-during-buzz');let current = true;
+  const subject = makeSubject(core,'revoked-during-buzz',{configOverrides:{entitlementCurrent:() => current},resolveBuzzAddress:async () => {current=false;return allow(ReasonCode.OK,BUZZ_ADDRESS);}});
+  const result = await subject.claim(baseRequest(core,'revoked-during-buzz'));
+  expect(result.allowed).toBe(false);
+  for (const table of FIVE_TABLES) expect(core.db.get<{n:number}>(`SELECT count(*) AS n FROM ${table}`)?.n).toBe(0);
+  core.db.close();
+});

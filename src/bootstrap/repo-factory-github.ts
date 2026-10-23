@@ -1,3 +1,4 @@
+import { genesisBundleSchema } from './genesis-bundle.ts';
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -127,7 +128,9 @@ export const githubOperationSchema = z.discriminatedUnion("resourceType", [
     })
     .strict(),
   /** Pushes the bootstrap commit this producer made to `<identity>#<defaultBranch>`. */
-  z.object({ ...operationIdentity, resourceType: z.literal("branch") }).strict(),
+  z.object({ ...operationIdentity, resourceType: z.literal("branch"), desiredState: z.object({fromBranch:z.literal("main")}).strict().optional() }).strict(),
+  z.object({ ...operationIdentity, resourceType: z.literal("genesis-bootstrap"), desiredState: z.object({action:z.enum(["open","verify","merge"])}).strict() }).strict(),
+  z.object({ ...operationIdentity, resourceType: z.literal("genesis-resources"), desiredState: genesisBundleSchema.pick({labels:true,milestones:true,issues:true}) }).strict(),
   /** `<identity>#default-branch` — the repository's default branch setting. */
   z
     .object({
@@ -147,13 +150,28 @@ export const githubOperationSchema = z.discriminatedUnion("resourceType", [
 
 export type GitHubOperation = z.infer<typeof githubOperationSchema>;
 
+/** Repo Factory's public six-operation contract; ACP inserts its bootstrap steps at submission. */
+export const genesisRepositoryOperations = (identity:string, checks:readonly string[]):GitHubOperation[] => {
+  const protection:BranchProtectionState={requiredStatusChecks:{strict:true,contexts:[...checks].sort()},enforceAdmins:true,requiredApprovingReviewCount:null,allowForcePushes:false,allowDeletions:false};
+  return [
+    {operationId:"create-repository",resourceType:"repository",resourceIdentity:identity,desiredState:{visibility:"public",autoInit:true}},
+    {operationId:"protect-main",resourceType:"branch-protection",resourceIdentity:identity+"#main",desiredState:protection},
+    {operationId:"push-genesis-branch",resourceType:"branch",resourceIdentity:identity+"#genesis"},
+    {operationId:"create-dev",resourceType:"branch",resourceIdentity:identity+"#dev"},
+    {operationId:"protect-dev",resourceType:"branch-protection",resourceIdentity:identity+"#dev",desiredState:protection},
+    {operationId:"set-default-branch",resourceType:"setting",resourceIdentity:identity+"#default-branch",desiredState:{defaultBranch:"dev"}},
+  ];
+};
+
 /**
  * #246 C5 — whether a plan's create is create-only (`autoInit: true`): GitHub makes the default
  * branch's first commit, and the plan pushes nothing. Only the approved plan's own create says so;
  * every relaxation of the pushed-head checks below is gated on it, and on nothing else.
  */
 export const isCreateOnlyPlan = (operations: readonly GitHubOperation[]): boolean =>
-  operations.some((operation) => (operation.resourceType === "repository" ? operation.desiredState.autoInit === true : false));
+  !isGenesisPlan(operations) && operations.some((operation) => (operation.resourceType === "repository" ? operation.desiredState.autoInit === true : false));
+
+export const isGenesisPlan = (operations: readonly GitHubOperation[]): boolean => operations.some(o => o.resourceType === "branch" && parseGitHubIdentity(o.resourceIdentity)?.ref === "genesis");
 
 /**
  * What the owner approved, supplied by the caller rather than read from the plan. A plan that
@@ -305,8 +323,16 @@ export const preflightGitHubOperations = (
 
   // #246 C5 — a create-only create leaves the default branch existing, at the commit GitHub made;
   // otherwise the branch exists only once the plan's push has run.
-  const createOnly = first.desiredState.autoInit === true;
-  let pushIndex = createOnly ? 0 : -1;
+  const genesis = isGenesisPlan(operations);
+  const createOnly = isCreateOnlyPlan(operations);
+  if (genesis) {
+    const refs = operations.map(o => `${o.resourceType}:${parseGitHubIdentity(o.resourceIdentity)?.ref ?? ""}`);
+    const expected = ["repository:","branch-protection:main","branch:genesis","genesis-bootstrap:genesis-open","genesis-bootstrap:genesis-verify","genesis-bootstrap:genesis-merge","branch:dev","branch-protection:dev","setting:default-branch","genesis-resources:genesis-labels","genesis-resources:genesis-milestones","genesis-resources:genesis-issues"];
+    if (canonicalJson(refs) !== canonicalJson(expected) || first.desiredState.autoInit !== true || first.desiredState.visibility !== "public" || plan.defaultBranch !== "dev") return shape("genesis requires autoInit PUBLIC main, protection, genesis PR open/verify/merge, dev, protection, default dev, resources in order");
+    const protections = operations.filter(o => o.resourceType === "branch-protection");
+    if (protections.some(o => o.desiredState.allowForcePushes || o.desiredState.allowDeletions || !o.desiredState.enforceAdmins || !o.desiredState.requiredStatusChecks?.strict || !o.desiredState.requiredStatusChecks.contexts.length)) return shape("genesis protection cannot be bypassed");
+  }
+  let pushIndex = createOnly || genesis ? 0 : -1;
   let pushOperationId: string | null = null;
   for (const [index, operation] of operations.entries()) {
     if (index === 0) continue;
@@ -333,10 +359,14 @@ export const preflightGitHubOperations = (
           { operationId: operation.operationId },
         );
       }
+      if (operation.desiredState?.fromBranch === "main" || (genesis && parsed.ref === "dev")) {
+        if (pushOperationId === null || parsed.ref !== "dev") return shape("dev must be created after the genesis push");
+        continue;
+      }
       if (pushOperationId !== null) {
         return shape("a plan pushes the bootstrap commit once", { operationId: operation.operationId });
       }
-      if (parsed.ref !== plan.defaultBranch) {
+      if (parsed.ref !== plan.defaultBranch && parsed.ref !== (genesis ? "genesis" : "main")) {
         return shape("the bootstrap commit is pushed to the plan's default branch only", {
           operationId: operation.operationId,
           ref: parsed.ref,
@@ -361,8 +391,9 @@ export const preflightGitHubOperations = (
       }
       continue;
     }
+    if (operation.resourceType === "genesis-resources" || operation.resourceType === "genesis-bootstrap") continue;
     // branch-protection — the last member of the union.
-    if (parsed.ref !== plan.defaultBranch) {
+    if (parsed.ref !== plan.defaultBranch && parsed.ref !== "main") {
       return shape("branch protection is applied to the plan's default branch only", {
         operationId: operation.operationId,
       });
@@ -453,6 +484,8 @@ export const githubOperationReceiptSchema = z.discriminatedUnion("resourceType",
       observed: z.object({ defaultBranch: z.string().min(1) }).strict(),
     })
     .strict(),
+  z.object({ ...receiptCommon, resourceType: z.literal("genesis-bootstrap"), observed: z.object({number:z.number().int().positive(),headSha:z.string(),baseSha:z.string(),merged:z.boolean(),mergeCommitSha:z.string().nullable()}).strict() }).strict(),
+  z.object({ ...receiptCommon, resourceType: z.literal("genesis-resources"), observed: z.record(z.unknown()) }).strict(),
   z
     .object({ ...receiptCommon, resourceType: z.literal("branch-protection"), observed: observedProtectionSchema })
     .strict(),
@@ -467,7 +500,7 @@ export type GitHubOperationReceipt = z.infer<typeof githubOperationReceiptSchema
 export const pendingWriteSchema = z
   .object({
     operationId: z.string().min(1),
-    resourceType: z.enum(["repository", "branch", "setting", "branch-protection"]),
+    resourceType: z.enum(["repository", "branch", "setting", "branch-protection", "genesis-resources", "genesis-bootstrap"]),
     resourceIdentity: z.string().min(1),
     /** When the write was first attempted — the receipt's `createdAt` if it is adopted. */
     attemptedAt: z.string().min(1),
@@ -706,6 +739,9 @@ export interface ApplyGitHubOperationsInput {
    * create's own step.
    */
   validatedHead: string | null;
+  prepareGenesis?: (parent:string) => Promise<Decision<string>>;
+  verifyGenesis?: (head:string) => Promise<Decision<void>>;
+  ciWorkflows?: readonly {path:string;checkName:string;approvedDigest:string}[];
 }
 
 export interface AppliedGitHubOperations {
@@ -1092,7 +1128,7 @@ export const applyGitHubOperations = async (
     };
     begin(intent);
     // The initialization option is always stated, never left to the port's default (#246 C5).
-    const created = await remote(id, () => port.createRepository(target, execution.visibility, marker, execution.createOnly));
+    const created = await remote(id, () => port.createRepository(target, execution.visibility, marker, operation.desiredState.autoInit === true));
     if (!created.allowed) return created as Decision<Step>;
     // Review C5I-R1-03 — an answer that names no valid repository identity is not an answer: the create
     // may still have landed, so it is neither recorded as the create's identity nor accepted, and the
@@ -1171,7 +1207,8 @@ export const applyGitHubOperations = async (
     operation: Extract<GitHubOperation, { resourceType: "repository" }>,
   ): Promise<Decision<Step>> => {
     const id = operation.operationId;
-    const branch = input.defaultBranch;
+    const genesis = isGenesisPlan(execution.operations);
+    const branch = genesis ? "main" : input.defaultBranch;
     const created = await repositoryStep(operation);
     if (!created.allowed) return created;
     const { receipt, outcome } = created.value;
@@ -1227,7 +1264,7 @@ export const applyGitHubOperations = async (
         planned: branch,
       });
     }
-    if (reportedDefault !== branch) {
+    if (reportedDefault !== branch && !(genesis && reportedDefault === "dev" && receiptedHead)) {
       return stop(
         ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
         "INITIALIZED_BRANCH_MISMATCH",
@@ -1244,7 +1281,7 @@ export const applyGitHubOperations = async (
     }
     const named = sameBranch(head.value.name, branch, id);
     if (!named.allowed) return named as Decision<Step>;
-    const initializedHead = head.value.headSha;
+    const initializedHead = genesis && receiptedHead ? receiptedHead : head.value.headSha;
     if (receiptedHead !== null) {
       if (initializedHead !== receiptedHead) {
         return stop(
@@ -1296,7 +1333,7 @@ export const applyGitHubOperations = async (
 
   const branchStep = async (operation: Extract<GitHubOperation, { resourceType: "branch" }>): Promise<Decision<Step>> => {
     const id = operation.operationId;
-    const branch = input.defaultBranch;
+    const branch = parseGitHubIdentity(operation.resourceIdentity)!.ref!;
     const repository = await confirmRepository(id);
     if (!repository.allowed) return repository as Decision<Step>;
     const prior = input.prior.receipts.get(id);
@@ -1320,6 +1357,11 @@ export const applyGitHubOperations = async (
       // The pushed head is what the setting and the protection after it are applied to, and what the
       // result reports; one that is not the approved files stops here, before either is written
       // (RF-REVIEW-01). The tree check's own evidence — its refusal and the differing paths — is kept.
+      if (isGenesisPlan(execution.operations) && branch === "genesis") {
+        const initial = completed.find(r => r.resourceType === "repository");
+        const parents = (await git(input.checkoutPath,["--no-replace-objects","rev-list","--max-count=1","--parents",head])).stdout.trim().split(/\s+/).slice(1);
+        if (initial?.resourceType !== "repository" || parents.length !== 1 || parents[0] !== initial.observed.initializedHead) return localFailure("genesis parent must be autoInit head",{}) as Decision<void>;
+      }
       const approved = await input.approvedTree(head);
       if (!approved.allowed) {
         return stop(approved.reasonCode, "PUSHED_HEAD_NOT_APPROVED", approved.message, id, approved.evidence, false);
@@ -1399,7 +1441,21 @@ export const applyGitHubOperations = async (
     const pushInDoubt = unresolvedPending(pendingWrite);
     if (pushInDoubt !== null) return pushInDoubt;
     // The checked commit, by its id — not a HEAD read now, after the awaited calls above (RF-REVIEW-01).
-    const localHead = input.validatedHead;
+    let localHead = input.validatedHead;
+    if (isGenesisPlan(execution.operations)) {
+      if (branch === "genesis") {
+        const initial = completed.find(r => r.resourceType === "repository");
+        const parent = initial?.resourceType === "repository" ? initial.observed.initializedHead : undefined;
+        if (!parent || !input.prepareGenesis) return localFailure("genesis preparation unavailable",{});
+        const prepared = await input.prepareGenesis(parent);
+        if (!prepared.allowed) return prepared as Decision<Step>;
+        localHead = prepared.value;
+      } else {
+        const main = await port.observeBranch(target,"main");
+        if (!main || !completed.some(r => r.resourceType === "genesis-bootstrap" && r.resourceIdentity.endsWith("#genesis-merge") && r.observed.mergeCommitSha === main.headSha)) return localFailure("dev requires receipted merged main",{});
+        localHead = main.headSha;
+      }
+    }
     if (localHead === null) {
       // A create-only plan makes no commit, and `preflightGitHubOperations` refuses its push.
       return localFailure("a push needs the commit this run made and checked, and this run made none", {});
@@ -1416,7 +1472,9 @@ export const applyGitHubOperations = async (
       respondedNodeId: null,
       pushedHead: localHead,
     });
-    const pushed = await remote(id, () => port.pushBranch(target, branch, input.checkoutPath, localHead));
+    const pushed = await remote(id, () => operation.desiredState?.fromBranch || (isGenesisPlan(execution.operations) && branch === "dev")
+      ? (port.createBranch ? port.createBranch(target,branch,localHead) : Promise.reject(new Error("branch creation port unavailable")))
+      : port.pushBranch(target, branch, input.checkoutPath, localHead));
     if (!pushed.allowed) return pushed as Decision<Step>;
     const reread = await remote(id, () => port.observeBranch(target, branch));
     if (!reread.allowed) return reread as Decision<Step>;
@@ -1442,6 +1500,7 @@ export const applyGitHubOperations = async (
         false,
       );
     }
+    if (isGenesisPlan(execution.operations) && branch === "dev") { const checked = await checkOut(localHead); if (!checked.allowed) return checked as Decision<Step>; }
     return allow(ReasonCode.OK, {
       receipt: {
         operationId: id,
@@ -1553,7 +1612,7 @@ export const applyGitHubOperations = async (
     operation: Extract<GitHubOperation, { resourceType: "branch-protection" }>,
   ): Promise<Decision<Step>> => {
     const id = operation.operationId;
-    const branch = input.defaultBranch;
+    const branch = parseGitHubIdentity(operation.resourceIdentity)!.ref!;
     const desired = operation.desiredState;
     const repository = await confirmRepository(id);
     if (!repository.allowed) return repository as Decision<Step>;
@@ -1663,17 +1722,89 @@ export const applyGitHubOperations = async (
     });
   };
 
+  const resourcesStep = async (operation: Extract<GitHubOperation,{resourceType:"genesis-resources"}>): Promise<Decision<Step>> => {
+    const id = operation.operationId;
+    const repository = await confirmRepository(id); if (!repository.allowed) return repository as Decision<Step>;
+    if (!port.observeGenesisResources || !port.ensureGenesisResources) return stop(ReasonCode.VERIFICATION_GAP,"GENESIS_RESOURCES_UNSUPPORTED","GitHub port cannot provision genesis resources",id,{},false);
+    const prior = input.prior.receipts.get(id);
+    let observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState));
+    if (!observed.allowed) return observed as Decision<Step>;
+    if (prior && (observed.value === null || digestOf(observed.value) !== digestOf(prior.observed))) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"RESUMED_RESOURCE_DRIFTED","genesis resources drifted",id,{},false);
+    const intent = pending.get(id) ?? {operationId:id,resourceType:operation.resourceType,resourceIdentity:operation.resourceIdentity,attemptedAt:clock.nowIso(),preexisting:false,beforeStateDigest:null,marker:null,respondedNodeId:null,pushedHead:null};
+    if (!observed.value) {
+      begin(intent);
+      const written = await remote(id,() => port.ensureGenesisResources!(target,operation.desiredState)); if (!written.allowed) return written as Decision<Step>;
+      observed = await remote(id,() => port.observeGenesisResources!(target,operation.desiredState));
+    }
+    if (!observed.allowed) return observed as Decision<Step>;
+    if (!observed.value) return stop(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,"REREAD_MISMATCH","genesis resource readback failed",id,{},true);
+    return allow(ReasonCode.OK,{receipt:{operationId:id,resourceType:"genesis-resources",resourceIdentity:operation.resourceIdentity,repositoryNodeId:repository.value.nodeId,preexisting:false,beforeStateDigest:null,createdAt:prior?.createdAt ?? intent.attemptedAt,rereadAt:clock.nowIso(),observed:observed.value},outcome:prior ? "resumed" : "written"});
+  };
+
+  const genesisBootstrapStep = async (operation:Extract<GitHubOperation,{resourceType:"genesis-bootstrap"}>):Promise<Decision<Step>> => {
+    const id = operation.operationId;
+    const repository = await confirmRepository(id); if (!repository.allowed) return repository as Decision<Step>;
+    if (!port.observeGenesisPull || !port.openGenesisPull || !port.mergeGenesisPull || !port.observeGenesisCi || !input.verifyGenesis || !input.ciWorkflows?.length) return stop(ReasonCode.VERIFICATION_GAP,"GENESIS_PR_UNSUPPORTED","genesis PR verification/merge port unavailable",id,{},false);
+    const marker = `<!-- acp-genesis:${digestOf({repository:execution.repositoryIdentity,operations:execution.operations})} -->`;
+    const prior = input.prior.receipts.get(id);
+    const initial = completed.find(r => r.resourceType === "repository");
+    const pushed = completed.find(r => r.resourceType === "branch" && r.resourceIdentity.endsWith("#genesis"));
+    const base = initial?.resourceType === "repository" ? initial.observed.initializedHead : undefined;
+    const head = pushed?.resourceType === "branch" ? pushed.observed.headSha : undefined;
+    if (!base || !head || (prior && prior.resourceType !== "genesis-bootstrap")) return corruptPrior(id);
+    let read = await remote(id,() => port.observeGenesisPull!(target,marker));
+    if (!read.allowed) return read as Decision<Step>;
+    if (operation.desiredState.action === "open" && !read.value) {
+      if (prior) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"RESUMED_RESOURCE_ABSENT","genesis PR disappeared",id,{},false);
+      const doubtful = unresolvedPending(pending.get(id)); if (doubtful) return doubtful;
+      begin({operationId:id,resourceType:operation.resourceType,resourceIdentity:operation.resourceIdentity,attemptedAt:clock.nowIso(),preexisting:false,beforeStateDigest:null,marker,respondedNodeId:null,pushedHead:head});
+      const opened = await remote(id,() => port.openGenesisPull!(target,marker)); if (!opened.allowed) return opened as Decision<Step>;
+      read = await remote(id,() => port.observeGenesisPull!(target,marker)); if (!read.allowed) return read as Decision<Step>;
+    }
+    let pull = read.value;
+    if (!pull || pull.headSha !== head || pull.baseSha !== base || (prior?.resourceType === "genesis-bootstrap" && prior.observed.number !== pull.number)) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"GENESIS_PR_DRIFT","genesis PR head/base/identity readback refused",id,{},false);
+    if (operation.desiredState.action === "verify") {
+      // Reverify even on resume: a receipt cannot make later red CI green.
+      receipts.delete(id);
+      begin({operationId:id,resourceType:operation.resourceType,resourceIdentity:operation.resourceIdentity,attemptedAt:clock.nowIso(),preexisting:false,beforeStateDigest:null,marker,respondedNodeId:null,pushedHead:head});
+      const local = await input.verifyGenesis(head); if (!local.allowed) return local as Decision<Step>;
+      const ci = await remote(id,() => port.observeGenesisCi!(target,head,input.ciWorkflows!)); if (!ci.allowed) return ci as Decision<Step>;
+      if (!ci.value) return stop(ReasonCode.VERIFICATION_GAP,"GENESIS_PR_CI_REFUSED","required CI failed or is incomplete at genesis PR head",id,{head},true);
+      const reread = await remote(id,() => port.observeGenesisPull!(target,marker)); if (!reread.allowed) return reread as Decision<Step>;
+      if (!reread.value || reread.value.headSha !== head || reread.value.baseSha !== base) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"GENESIS_PR_DRIFT","genesis PR moved during verification",id,{},false);
+      pull = reread.value;
+    }
+    if (operation.desiredState.action === "merge") {
+      if (!completed.some(r => r.resourceType === "genesis-bootstrap" && r.resourceIdentity.endsWith("#genesis-verify") && r.observed.headSha === head)) return corruptPrior(id);
+      if (!pull.merged) {
+        if (prior) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"GENESIS_MERGE_DRIFT","receipted merge disappeared",id,{},false);
+        const doubtful = unresolvedPending(pending.get(id)); if (doubtful) return doubtful;
+        begin({operationId:id,resourceType:operation.resourceType,resourceIdentity:operation.resourceIdentity,attemptedAt:clock.nowIso(),preexisting:false,beforeStateDigest:null,marker,respondedNodeId:null,pushedHead:head});
+      }
+      // Kernel reconciles an already merged PR without sending another merge.
+      const merged = await remote(id,() => port.mergeGenesisPull!(target,pull!,input.ciWorkflows!)); if (!merged.allowed) return merged as Decision<Step>;
+      const reread = await remote(id,() => port.observeGenesisPull!(target,marker)); if (!reread.allowed) return reread as Decision<Step>;
+      const main = await remote(id,() => port.observeBranch(target,"main")); if (!main.allowed) return main as Decision<Step>;
+      if (!reread.value?.merged || !reread.value.mergeCommitSha || reread.value.headSha !== head || reread.value.baseSha !== base || main.value?.headSha !== reread.value.mergeCommitSha || (prior?.resourceType === "genesis-bootstrap" && prior.observed.mergeCommitSha !== reread.value.mergeCommitSha)) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"GENESIS_MERGE_DRIFT","genesis merge readback refused",id,{},false);
+      pull = reread.value;
+    }
+    if (prior?.resourceType === "genesis-bootstrap" && operation.desiredState.action === "open") {
+      return allow(ReasonCode.OK,{receipt:{...prior,rereadAt:clock.nowIso()},outcome:"resumed"});
+    }
+    return allow(ReasonCode.OK,{receipt:{operationId:id,resourceType:"genesis-bootstrap",resourceIdentity:operation.resourceIdentity,repositoryNodeId:repository.value.nodeId,preexisting:false,beforeStateDigest:null,createdAt:prior?.createdAt ?? pending.get(id)?.attemptedAt ?? clock.nowIso(),rereadAt:clock.nowIso(),observed:pull},outcome:prior ? "resumed" : "written"});
+  };
+
   for (const operation of execution.operations) {
     const step: Decision<Step> =
       operation.resourceType === "repository"
-        ? execution.createOnly
+        ? execution.createOnly || isGenesisPlan(execution.operations)
           ? await initializedRepositoryStep(operation)
           : await repositoryStep(operation)
         : operation.resourceType === "branch"
           ? await branchStep(operation)
           : operation.resourceType === "setting"
             ? await settingStep(operation)
-            : await protectionStep(operation);
+            : operation.resourceType === "genesis-bootstrap" ? await genesisBootstrapStep(operation) : operation.resourceType === "genesis-resources" ? await resourcesStep(operation) : await protectionStep(operation);
     if (!step.allowed) return step as Decision<AppliedGitHubOperations>;
     const { receipt, outcome } = step.value;
     if (receipt.resourceType === "repository") {
@@ -1683,6 +1814,7 @@ export const applyGitHubOperations = async (
     if (receipt.resourceType === "branch") publishedHead = receipt.observed.headSha;
     completed.push(receipt);
     if (outcome === "resumed") {
+      if (pending.has(receipt.operationId)) {pending.delete(receipt.operationId);receipts.set(receipt.operationId,receipt);persist();}
       resumed.push(receipt.operationId);
       continue;
     }

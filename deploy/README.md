@@ -146,6 +146,8 @@ pin too and says so on the launcher's stderr. `ACP_COMMITLORE_BINARY` is the dae
 bootstrap's CommitLore (no `PATH` search), and a delivered pin is still vetted by the daemon's own
 checks, so it does not by itself make a bootstrap succeed.
 
+The launcher exports `ACP_HOST_PROJECT_PROVISIONER` from the Keychain account of that name when set, otherwise as this generation's own `dist/host/host-project-provisioner.mjs` under its app root, and refuses to start unless that is an absolute regular file (inside the generation, for the default); `ACP_BUZZ_ADMISSION_COMMAND` comes only from its Keychain account, and unset leaves the provisioner's own default.
+
 Only an absolute, executable path is pinned. A CLI the installer cannot resolve is named on
 stderr and left unpinned rather than refused, so a host without an optional CLI can still deploy.
 An unpinned provider is searched for on the launcher's `PATH` as any bare name would be, and if it

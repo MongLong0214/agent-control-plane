@@ -1,0 +1,45 @@
+import { callCtoToolAsOwner } from '../helpers/bootstrap-plan.ts';
+import { afterAll, expect, it } from 'vitest';
+import { manifestDigest } from '../../src/contracts/manifest.ts';
+import { RunKind, RunState } from '../../src/domain/types.ts';
+import { Daemon } from '../../src/daemon/daemon.ts';
+import { contractChangePlanForSubmission } from '../../src/registry/contract-change-plan.ts';
+import { sha256 } from '../../src/core/digest.ts';
+import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
+import { carryContractChange, decideThroughHermes, makeHarness, fixtureManifest, registerFixtureProject } from '../helpers/harness.ts';
+import { dispatchRun, normalized } from '../helpers/contract-change.ts';
+import { createRun, firstManifest, firstPlan, operatorRegisteredProject, revisionsFor } from '../helpers/first-activation.ts';
+afterAll(cleanupTempDirs);
+it('reviews an unexecuted metadata activation task and lets only the daemon settle it after CEO CONFIRM',async () => {
+  const h = makeHarness();const project = await registerFixtureProject(h,'admin-contract');
+  const run = await dispatchRun(h,project.projectId,RunKind.CONTRACT_CHANGE);
+  const proposed = carryContractChange(h,run.runId,normalized({...run.base,commitlore:{mode:'required'}}));
+  const tasks = h.cp.tasks.submit(run.runId,[{key:'activate',title:'Activate approved manifest',category:'docs',spec:{repositoryContentChange:false}}]);expect(tasks.allowed).toBe(true);
+  await h.cp.continuity.evaluate('admin review');
+  const result = await h.cp.pipeline.submitResult({runId:run.runId,ownerSessionId:run.ownerSessionId,ownerBindingGeneration:run.ownerBindingGeneration,resultSummary:'activate metadata',recommendation:'activate'});
+  expect(result.allowed,JSON.stringify(result)).toBe(true);
+  expect(h.cp.runs.get(run.runId)?.state).toBe(RunState.READY_FOR_CEO_REVIEW);
+  expect(h.cp.tasks.list(run.runId)[0]!.state).toBe('READY');
+  expect(h.cp.tasks.settleAdministrativeActivation(run.runId).allowed).toBe(false);
+  expect(h.cp.db.get<{n:number}>('SELECT count(*) AS n FROM task_executions WHERE run_id = ?',[run.runId])?.n).toBe(0);
+  const confirmed = await decideThroughHermes(h,{runId:run.runId,decision:'CONFIRM',candidateSnapshotDigest:h.cp.runs.currentCandidate(run.runId)!,rationale:'reviewed metadata'});expect(confirmed.allowed,JSON.stringify(confirmed)).toBe(true);
+  expect(h.cp.tasks.list(run.runId)[0]!.state).toBe('READY');
+  const daemon = new Daemon(h.cp,{stateDir:tempDir('admin-daemon-')});await daemon.start();await daemon.stop();
+  expect(h.cp.runs.get(run.runId)?.state).toBe(RunState.COMPLETED);expect(h.cp.tasks.list(run.runId)[0]!.state).toBe('SUCCEEDED');expect(h.cp.projects.get(project.projectId)?.activeManifestDigest).toBe(manifestDigest(proposed));h.cp.close();
+});
+it('permits workflow digest replacement in the reviewed PLAN while still refusing verification removal',() => {
+  const workflow = {path:'.github/workflows/ci.yml',checkName:'ci',approvedDigest:sha256('before'),repositoryRole:'primary',unapprovedFirstActivation:false};
+  const base = normalized(fixtureManifest('replace-ci',{ciWorkflows:[workflow]}));
+  const proposed = normalized({...base,ciWorkflows:[{...workflow,approvedDigest:sha256('after')}]});
+  const run = {kind:RunKind.CONTRACT_CHANGE,projectId:'replace-ci',pinnedManifestDigest:manifestDigest(base)};
+  expect(contractChangePlanForSubmission(run,{projectManifest:proposed,projectManifestDigest:manifestDigest(proposed)},() => base).allowed).toBe(true);
+  const weaker = normalized({...proposed,verificationCommands:[],verificationProfiles:{simple:[],standard:[],guarded:[]}});
+  expect(contractChangePlanForSubmission(run,{projectManifest:weaker,projectManifestDigest:manifestDigest(weaker)},() => base).allowed).toBe(false);
+});
+it('the public MCP plan_submit preserves firstActivation and workflowRevisions',async () => {
+  const h = makeHarness();const project = await operatorRegisteredProject(h,'public-first');const run = await createRun(h,project.projectId,RunKind.CONTRACT_CHANGE);
+  const manifest = firstManifest(project.projectId);const revisions = revisionsFor(manifest,'a'.repeat(40));
+  const answer = await callCtoToolAsOwner(h,run.runId,'plan_submit',{idempotencyKey:'public-first-plan',runId:run.runId,plan:firstPlan(manifest,revisions),tasks:[{key:'activate',title:'Activate first manifest',category:'docs',spec:{repositoryContentChange:false}}]});
+  expect(answer.isError,JSON.stringify(answer)).not.toBe(true);
+  expect(h.cp.artifacts.latest<Record<string,unknown>>(run.runId,'PLAN')?.content).toMatchObject({firstActivation:true,workflowRevisions:revisions});h.cp.close();
+});

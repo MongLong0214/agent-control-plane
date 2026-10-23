@@ -344,3 +344,45 @@ describe("PR #1043 review round 2 witnesses — the port", () => {
     expect(await contexts(["a", 7])).toBeNull();
   });
 });
+
+it('genesis metadata resumes after GitHub accepted an issue but its response was lost, with no duplicate POST',async () => {
+  const labels:Record<string,unknown>[] = [], milestones:Record<string,unknown>[] = [], issues:Record<string,unknown>[] = [];
+  const calls:Call[] = [];let lost = true;
+  const client:GitHubClient = {async request<T>(method:"GET"|"POST"|"PATCH"|"PUT"|"DELETE",path:string,body?:unknown):Promise<T> {
+    calls.push({method,path,body});
+    const rows = path.includes('/labels') ? labels : path.includes('/milestones') ? milestones : issues;
+    if (method === 'GET') return rows as T;
+    const value = body as Record<string,unknown>;
+    const stored = path.endsWith('/issues') ? {...value,labels:(value['labels'] as string[]).map(name => ({name})),milestone:{number:value['milestone']}} : path.endsWith('/milestones') ? {...value,number:1} : value;
+    rows.push(stored);
+    if (path.endsWith('/issues') && lost) {lost=false;throw new Error('response lost after acceptance');}
+    return stored as T;
+  }};
+  const port = createGitHubApiWritePort({client});
+  const bundle = {labels:[{name:'ready',color:'abcdef',description:'Ready'}],milestones:[{key:'m1',title:'First',description:'Milestone'}],issues:[{key:'i1',title:'Build product',body:'Preserve intent',labels:['ready'],milestoneKey:'m1'}]};
+  await expect(port.ensureGenesisResources!(target,bundle)).rejects.toThrow('response lost');
+  await port.ensureGenesisResources!(target,bundle);
+  expect(calls.filter(c => c.method === 'POST')).toHaveLength(3);
+  expect(await port.observeGenesisResources!(target,bundle)).toEqual(bundle);
+  issues[0]!['labels']=[];expect(await port.observeGenesisResources!(target,bundle)).toBeNull();
+});
+
+it('genesis CI requires successful Actions checks at the exact head and the workflow SHA-256 bytes',async () => {
+  const {sha256} = await import('../../src/core/digest.ts');const head='a'.repeat(40), content='name: test\n';
+  // Review V52-R1-02 — the check names its Actions suite and job, and both are read back at the head.
+  const check = {id:7,name:'test',head_sha:head,status:'completed',conclusion:'success',app:{slug:'github-actions'},check_suite:{id:9},details_url:'https://github.com/acme/fixture/actions/runs/11/job/7'};
+  const file = {encoding:'base64',content:Buffer.from(content).toString('base64')};
+  const client = scriptedClient({[`GET repos/acme/fixture/commits/${head}/check-runs?check_name=test&per_page=100&page=1`]:{check_runs:[check]},[`GET repos/acme/fixture/contents/.github/workflows/ci.yml?ref=${head}`]:file,
+    'GET repos/acme/fixture/check-suites/9':{head_sha:head,app:{slug:'github-actions'}},'GET repos/acme/fixture/actions/runs/11':{head_sha:head,path:'.github/workflows/ci.yml',status:'completed',conclusion:'success'}});
+  const port = createGitHubApiWritePort({client});const workflows=[{path:'.github/workflows/ci.yml',checkName:'test',approvedDigest:sha256(content)}];
+  expect(await port.observeGenesisCi!(target,head,workflows)).toBe(true);
+  file.content=Buffer.from('changed').toString('base64');expect(await port.observeGenesisCi!(target,head,workflows)).toBe(false);file.content=Buffer.from(content).toString('base64');
+  check.app.slug='untrusted-app';expect(await port.observeGenesisCi!(target,head,workflows)).toBe(false);check.app.slug='github-actions';
+  check.head_sha='b'.repeat(40);expect(await port.observeGenesisCi!(target,head,workflows)).toBe(false);
+});
+
+it('creates dev at the observed genesis head by a ref API request, without another push',async () => {
+  const client=scriptedClient({'POST repos/acme/fixture/git/refs':{}});const port=createGitHubApiWritePort({client});
+  await port.createBranch!(target,'dev','a'.repeat(40));
+  expect(client.calls).toEqual([{method:'POST',path:'repos/acme/fixture/git/refs',body:{ref:'refs/heads/dev',sha:'a'.repeat(40)}}]);
+});

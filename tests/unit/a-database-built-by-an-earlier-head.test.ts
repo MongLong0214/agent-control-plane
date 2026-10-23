@@ -1,3 +1,5 @@
+import Database from "better-sqlite3";
+import { takeBackV52 } from "../helpers/released-v50-schema.ts";
 import { afterAll, describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, mkdirSync } from "node:fs";
@@ -72,6 +74,7 @@ const databaseWithHistoricalTrigger = (): string => {
   const path = join(stateDir(), "state.sqlite");
   openDb(path).close();
 
+  const prior = new Database(path);takeBackV52(prior);prior.close();
   const raw = new DatabaseSync(path);
   raw.exec("DROP TRIGGER canonical_turns_settlement_authority");
   raw.exec(HISTORICAL_SETTLEMENT_TRIGGER);

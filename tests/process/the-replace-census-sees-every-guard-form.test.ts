@@ -50,6 +50,7 @@ const scratchRepo = async (): Promise<string> => {
   if (cloned.status !== 0) {
     throw new Error(`the scratch clone exited ${cloned.status}: ${cloned.stderr.trim()}`);
   }
+  copyFileSync(join(ROOT, "src/db/migrations.ts"), join(dir, "src/db/migrations.ts"));
   copyFileSync(join(ROOT, SCRIPT), join(dir, SCRIPT));
   // The schema and required registry must describe the same working-tree migration.
   for (const file of readdirSync(join(ROOT, "src/db"))) {

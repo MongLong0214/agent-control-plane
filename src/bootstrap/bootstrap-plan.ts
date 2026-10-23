@@ -1,6 +1,7 @@
+import { parseGenesis, genesisDigest, bytesDigest, type GenesisBundle } from './genesis-bundle.ts';
 import { z } from "zod";
 
-import { digestOf } from "../core/digest.ts";
+import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import {
@@ -16,7 +17,7 @@ import type { Db } from "../db/database.ts";
 import { RunKind } from "../domain/types.ts";
 import { parseGitHubIdentity } from "./github-write-port.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
-import { githubOperationSchema, isCreateOnlyPlan, preflightGitHubOperations, type GitHubOperation } from "./repo-factory-github.ts";
+import { githubOperationSchema, genesisRepositoryOperations, isCreateOnlyPlan, preflightGitHubOperations, type GitHubOperation } from "./repo-factory-github.ts";
 import {
   VERIFICATION_KINDS,
   plannedBootstrapFiles,
@@ -93,10 +94,10 @@ export const sameBootstrapPlanBinding = (
  * on this path supplies one, so it is derived from the approved manifest alone — and is therefore
  * the same package on every call, which `activate` requires of a retry.
  */
-export const bootstrapActivationHandoff = (manifest: ProjectManifest): HandoffPackage => ({
+export const bootstrapActivationHandoff = (manifest: ProjectManifest, genesis?: GenesisBundle): HandoffPackage => ({
   projectStatus: "BOOTSTRAPPED",
   activeManifestDigest: manifestDigest(manifest),
-  recentDecisions: [],
+  recentDecisions: genesis ? [JSON.stringify({productIntent:genesis.productIntent,genesis,genesisDigest:genesisDigest(genesis)})] : [],
   openBlockers: [],
   queuedWork: [],
   repositoryFacts: manifest.repositories.map((repository) => ({
@@ -238,6 +239,15 @@ export const bootstrapPlanPreflight = (input: {
     );
   }
   const operations = executableOperations.data;
+  const carriedGenesis = (planArtifact.content as Record<string,unknown>)["genesis"];
+  let genesis: GenesisBundle | undefined;
+  if (carriedGenesis !== undefined) {
+    try {
+      genesis = parseGenesis(carriedGenesis,manifest);
+      const normalized = planForSubmission({kind:"PROJECT_BOOTSTRAP",projectId:null},planArtifact.content as Record<string,unknown>);
+      if (!normalized.allowed || canonicalJson(normalized.value["githubOperations"]) !== canonicalJson(operations)) throw new Error("genesis operations differ from approved contract");
+    } catch {return refuse(ReasonCode.INVALID_ARGUMENT,"GENESIS_INVALID","genesis bytes, secret screen or manifest verification failed");}
+  }
 
   const manifestMismatch = (message: string, evidence: Evidence): Decision<BootstrapPlanPreflight> =>
     refuse(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "MANIFEST_MISMATCH", message, evidence);
@@ -261,7 +271,7 @@ export const bootstrapPlanPreflight = (input: {
   // activation would find that only after the repository already existed.
   const unsupported = (message: string, evidence: Evidence): Decision<BootstrapPlanPreflight> =>
     refuse(ReasonCode.VERIFICATION_GAP, "UNSUPPORTED_VERIFICATION", message, evidence);
-  if (manifest.ciWorkflows.length > 0) {
+  if (!genesis && manifest.ciWorkflows.length > 0) {
     return unsupported("the manifest requires CI evidence, and this producer produces none", {
       ciWorkflows: manifest.ciWorkflows.map((workflow) => workflow.checkName),
     });
@@ -272,13 +282,13 @@ export const bootstrapPlanPreflight = (input: {
   // the published head, and activation refuses a result that does not carry that verification
   // (`commitlore-observation.ts`). `preferred` activates named NOT_OBSERVED; `off` asks for nothing.
   const command = manifest.verificationCommands[0];
-  if (manifest.verificationCommands.length !== 1) {
+  if (!genesis && manifest.verificationCommands.length !== 1) {
     return unsupported("this producer runs exactly one verification, and the manifest requires a different count", {
       commands: manifest.verificationCommands.map((candidate) => candidate.id),
     });
   }
   if (command === undefined) return unsupported("the manifest requires no verification command", {});
-  const verificationKind = verificationKindRunning(command.argv);
+  const verificationKind = genesis ? "GENESIS_TEST" : verificationKindRunning(command.argv);
   if (verificationKind === null) {
     return unsupported(`the manifest's command ${command.id} is not an invocation this producer runs`, {
       commandId: command.id,
@@ -306,7 +316,7 @@ export const bootstrapPlanPreflight = (input: {
   // ref, as before.
   const push = operations.find((operation) => operation.resourceType === "branch");
   const pushed = push === undefined ? null : parseGitHubIdentity(push.resourceIdentity);
-  const defaultBranch = isCreateOnlyPlan(operations) ? manifest.branchProfile.defaultBranch : pushed === null ? null : pushed.ref;
+  const defaultBranch = genesis ? "dev" : isCreateOnlyPlan(operations) ? manifest.branchProfile.defaultBranch : pushed === null ? null : pushed.ref;
   if (defaultBranch === null) {
     return refuse(
       ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
@@ -332,6 +342,7 @@ export const bootstrapPlanPreflight = (input: {
       verificationCommandId: command.id,
       verificationKind,
       githubOperations: operations,
+      ...(genesis ? {genesis,ciWorkflows:manifest.ciWorkflows.map(w => ({path:w.path,checkName:w.checkName,approvedDigest:w.approvedDigest!})),verificationCommands:manifest.verificationCommands} : {}),
     },
   });
 };
@@ -350,6 +361,9 @@ export interface PlannedBootstrapOutputs {
   defaultBranch: string;
   /** Every file the produced commit holds, with its exact bytes. */
   files: PlannedBootstrapFile[];
+  genesis?: GenesisBundle;
+  verificationCommands?: RepoFactoryPlanFixture["verificationCommands"];
+  ciWorkflows?: RepoFactoryPlanFixture["ciWorkflows"];
   /** The GitHub operations in the order they run, desired state included. */
   githubOperations: GitHubOperation[];
   verification: { commandId: string; argv: string[]; cwd: string; kind: VerificationKind };
@@ -420,10 +434,11 @@ export const plannedBootstrapOutputs = (
     },
     defaultBranch,
     // #246 C5 — a create-only plan commits nothing: no file, the bootstrap content file included.
-    files: shape.value.createOnly ? [] : plannedBootstrapFiles(executable),
+    files: executable.genesis ? executable.genesis.files.map(f => ({path:f.path,mode:f.mode,content:Buffer.from(f.contentBase64,"base64").toString("utf8"),contentBase64:f.contentBase64})) : shape.value.createOnly ? [] : plannedBootstrapFiles(executable),
+    ...(executable.genesis ? {genesis:executable.genesis,verificationCommands:executable.verificationCommands,ciWorkflows:executable.ciWorkflows} : {}),
     githubOperations: shape.value.operations,
     verification: { commandId: command.id, argv: [...command.argv], cwd: command.cwd, kind: verificationKind },
-    handoff: bootstrapActivationHandoff(manifest),
+    handoff: {...bootstrapActivationHandoff(manifest,executable.genesis),recentDecisions:[...bootstrapActivationHandoff(manifest,executable.genesis).recentDecisions,...(executable.genesis && (plan.planArtifact?.content as Record<string,unknown>)["originatingContract"] ? [JSON.stringify({originatingContract:(plan.planArtifact!.content as Record<string,unknown>)["originatingContract"]})] : [])]},
   });
 };
 
@@ -442,6 +457,7 @@ export const executablePlanOf = (outputs: PlannedBootstrapOutputs, planDigest: s
   verificationCommandId: outputs.verification.commandId,
   verificationKind: outputs.verification.kind,
   githubOperations: outputs.githubOperations,
+  ...(outputs.genesis ? {genesis:outputs.genesis,verificationCommands:outputs.verificationCommands,ciWorkflows:outputs.ciWorkflows} : {}),
 });
 
 /** A bootstrap run's current plan, reloaded from its PLAN artifact alone. */
@@ -716,6 +732,26 @@ export const planForSubmission = (
       named: named ?? null,
     });
   }
+  if (rest["genesis"] !== undefined) {
+    try {
+      const genesis = parseGenesis(rest["genesis"],manifest.value);
+      const identity = manifest.value.repositories[0]!.remote;
+      const op = (suffix:string,resourceType:string,ref:string,desiredState?:unknown) => ({operationId:suffix,resourceType,resourceIdentity:`${identity}${ref ? `#${ref}` : ""}`,...(desiredState === undefined ? {} : {desiredState})});
+      const base = genesisRepositoryOperations(identity,manifest.value.ciWorkflows.map(w => w.checkName));
+      // Preserve Repo Factory's operation identities and approved state; never silently replace an unsafe plan.
+      const supplied = rest["githubOperations"] === undefined ? base : executableOperationsSchema.parse(rest["githubOperations"]);
+      const bootstrap = ["open","verify","merge"].map(action => op(`acp-genesis-${action}`,"genesis-bootstrap",`genesis-${action}`,{action}));
+      const resources = [
+        op("acp-genesis-labels","genesis-resources","genesis-labels",{labels:genesis.labels,milestones:[],issues:[]}),
+        op("acp-genesis-milestones","genesis-resources","genesis-milestones",{labels:genesis.labels,milestones:genesis.milestones,issues:[]}),
+        op("acp-genesis-issues","genesis-resources","genesis-issues",{labels:genesis.labels,milestones:genesis.milestones,issues:genesis.issues}),
+      ];
+      const expanded = supplied.length === 6 ? [...supplied.slice(0,3),...bootstrap,...supplied.slice(3),...resources] : supplied;
+      const githubOperations = executableOperationsSchema.parse(expanded);
+      if (canonicalJson(githubOperations.map(o => ({...o,operationId:""}))) !== canonicalJson([...base.slice(0,3),...bootstrap,...base.slice(3),...resources].map(o => ({...o,operationId:""})))) throw new Error("genesis operation order/state differs from the shared contract");
+      return allow(ReasonCode.OK,{...rest,genesis,genesisDigest:genesisDigest(genesis),githubOperations,projectManifest:manifest.value});
+    } catch {return deny(ReasonCode.INVALID_ARGUMENT,"genesis bundle/manifest refused",{refusal:"GENESIS_INVALID"});}
+  }
   return allow(ReasonCode.OK, { ...rest, projectManifest: manifest.value });
 };
 
@@ -780,7 +816,7 @@ export interface BootstrapPlanGuide {
   submit: string[];
   planFields: Array<{ field: string; carries: string }>;
   repositoryCreateOperation: {
-    shape: { operationId: string; resourceType: "repository"; resourceIdentity: string; desiredState: { visibility: string; autoInit: true } };
+    shape: { operationId: string; resourceType: "repository"; resourceIdentity: string; desiredState: { visibility: string; autoInit: boolean } };
     rules: string[];
   };
   manifest: {
@@ -791,13 +827,17 @@ export interface BootstrapPlanGuide {
     example: z.input<typeof projectManifestSchema>;
   };
   digestRule: string[];
+  genesisExample: GenesisBundle;
+  githubOperationsExample: GitHubOperation[];
   afterAcceptance: string;
 }
 
 /** The guide `contract_get` carries for a project-less PROJECT_BOOTSTRAP run, and for no other run. */
 export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
   const placeholders = BOOTSTRAP_PLAN_GUIDE_PLACEHOLDERS;
-  const cleanTreeArgv = JSON.stringify(["git", ...VERIFICATION_KINDS.CLEAN_TREE.argv]);
+  const test = "const assert = require('node:assert/strict'); assert.equal(2 + 2, 4);\n";
+  const workflow = "name: ci\non: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: node test.js\n";
+  const genesis:GenesisBundle = {schema:"acp.genesis-bundle.v1",commitMessage:"Create runnable project",files:[{path:"test.js",mode:"100644",contentBase64:Buffer.from(test).toString("base64"),sha256:bytesDigest(Buffer.from(test))},{path:".github/workflows/ci.yml",mode:"100644",contentBase64:Buffer.from(workflow).toString("base64"),sha256:bytesDigest(Buffer.from(workflow))}],branches:{main:"main",integration:"dev",genesis:"genesis"},labels:[],milestones:[],issues:[],productIntent:{summary:"Replace with the owner's product intent",references:[],ownerInstructions:[]}};
   return {
     schema: BOOTSTRAP_PLAN_GUIDE_SCHEMA_ID,
     submit: [
@@ -806,6 +846,7 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
       "tasks: at least one task { key, title, category }, for example one implementation task that creates the repository.",
     ],
     planFields: [
+      { field:"genesis",carries:"INLINE acp.genesis-bundle.v1 bytes+SHA-256, branches main/dev/genesis, labels/milestones/issues, productIntent with references and ownerInstructions; never local filenames. See genesisExample." },
       { field: "summary", carries: "what this bootstrap creates and why, from the contract" },
       { field: "bootstrapOperationId", carries: "a non-empty id you choose for this bootstrap; keep it unchanged when you resubmit" },
       { field: "requestDigest", carries: "the run's contractDigest, as contract_get's run.contractDigest states it" },
@@ -818,14 +859,14 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
         operationId: placeholders.operationId,
         resourceType: "repository",
         resourceIdentity: placeholders.repositoryIdentity,
-        desiredState: { visibility: placeholders.visibility, autoInit: true },
+        desiredState: { visibility: "public", autoInit: true },
       },
       rules: [
         "It is the first operation, and a plan creates exactly one repository; operation ids are unique.",
         "resourceIdentity is github:<owner>/<name> with no #ref: the repository the contract asks for, and exactly the manifest's repository remote.",
-        "desiredState.visibility is the visibility the contract asks for: public or private.",
-        "desiredState.autoInit true makes the plan create-only: GitHub initializes the default branch and nothing is pushed, so this operation is the whole plan, and the manifest's branchProfile.defaultBranch must be the branch GitHub initializes (main).",
-        "Without autoInit true the plan must also push the bootstrap commit after the create (a branch operation on github:<owner>/<name>#<defaultBranch>).",
+        "PUBLIC autoInit:true; protect main, push genesis, ACP opens/verifies/merges genesis PR, create/protect dev, default dev, labels/milestones/issues.",
+        "GitHub initializes README on main; genesis has that head as parent and reaches main only through a protected PR merge commit.",
+        "No force pushes or deletion; required protection checks are the manifest CI check names. ACP owns merges.",
       ],
     },
     manifest: {
@@ -833,14 +874,14 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
       requiredKeys: requiredManifestKeys(),
       producerAccepts: [
         "exactly one repository { role, remote }, whose remote is the repository the first operation creates",
-        `exactly one verification command, argv ${cleanTreeArgv}, cwd ".", in that repository's role, evidenceMode LOCAL_COMMAND, named by every verification profile`,
-        "no ciWorkflows",
+        "real test commands in genesis, cwd root, included in the standard verification profile",
+        "ciWorkflows pinned to each genesis workflow file SHA-256; main/dev, default dev, merge_commit, semver",
         "commitlore.mode \"required\" only where this deployment can run CommitLore: the producer runs commitlore init and commitlore doctor --json in the checkout at the head it publishes, and refuses without a passing report; \"preferred\" is not observed and activates named NOT_OBSERVED; \"off\" asks for nothing",
         "branchProfile.defaultBranch is one of branchProfile.longLived",
         "portable: no absolute or home paths, and no secret, token or session identifier anywhere",
       ],
       placeholders: `Replace ${placeholders.projectId}, <owner> and <name> with the values the contract names; ${placeholders.projectId} is the new project's id.`,
-      example: minimalBootstrapManifest({ projectId: placeholders.projectId, repositoryIdentity: placeholders.repositoryIdentity }),
+      example: { ...minimalBootstrapManifest({projectId:placeholders.projectId,repositoryIdentity:placeholders.repositoryIdentity,defaultBranch:"dev"}),branchProfile:{longLived:["main","dev"],defaultBranch:"dev",mergeStrategy:"merge_commit",releaseTagPolicy:"semver"},verificationCommands:[{id:"test",argv:["node","test.js"],repositoryRole:"primary",cwd:".",timeoutSeconds:120,required:true,evidenceMode:"LOCAL_COMMAND"}],verificationProfiles:{simple:["test"],standard:["test"],guarded:["test"]},ciWorkflows:[{path:".github/workflows/ci.yml",checkName:"test",approvedDigest:genesis.files[1]!.sha256,unapprovedFirstActivation:false}],commitlore:{mode:"preferred"} },
     },
     digestRule: [
       "projectManifestDigest is \"sha256:\" and the lowercase hex SHA-256 of the manifest's canonical JSON (object keys sorted, no whitespace), taken after the manifest schema fills in its defaults; the PLAN stores that normalized manifest.",
@@ -848,7 +889,9 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
       "Then submit the same PLAN again with projectManifestDigest set to evidence.supplied and a new idempotencyKey. Any change to the manifest changes its digest: read supplied again from the next refusal.",
       "A manifest that fails the schema or is not portable is refused first, with refusal MANIFEST_NOT_PORTABLE and the issues or violations, before any digest is compared.",
     ],
+    genesisExample: genesis,
+    githubOperationsExample: genesisRepositoryOperations(placeholders.repositoryIdentity,["test"]),
     afterAcceptance:
-      "An accepted PLAN approves nothing and writes nothing to GitHub: its review, the owner's approval and the CEO's confirmation are separate steps that follow it.",
+      "After independent review and authenticated CEO CONFIRM, ACP creates the repository and resumes resident provisioning without another CONFIRM. Completion requires the dedicated room/subscriber, canonical claim, Remote Control and same-session handoff ACK.",
   };
 };

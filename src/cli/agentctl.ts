@@ -40,6 +40,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl capacity observe <provider> <json> record a short-lived, authenticated quota observation
   agentctl capacity show                  current provider capacity and admission
   agentctl project register <name> <path> register a project and its primary repository
+  agentctl project retire <id> <reason>    retire a project, preserving history
   agentctl project list                   list projects with derived activity
   agentctl actor register <id> <generation> <expected-set-generation>
   agentctl actor list                     list registered conversational actors
@@ -69,6 +70,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            adopt the existing canonical CTO conversation in place;
                                            never launches a runtime the way bootstrap hermes does;
                                            reaches its own token-less socket, never ACP_OPERATOR_TOKEN
+  agentctl attach resident-cto --claimed-session-id <uuid> --project-id <id>
   agentctl attach canonical-cto --claimed-session-id <uuid> --project-id <id> --expected-binding-generation <n>
                                            claim in memory, then relay this process's own stdin and
                                            stdout to the CTO MCP socket as the claimed session.
@@ -104,6 +106,7 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
   "repair.execute",
   "capacity.observe",
   "project.register",
+  "project.retire",
   "actor.register",
   "actor.unregister",
   "conversation.adjudicate",
@@ -131,7 +134,7 @@ export const main = async (argv: string[]): Promise<number> => {
     return 0;
   }
 
-  const config = defaultConfig();
+  const config = defaultConfig(process.env["ACP_STATE_DIR"]);
 
   // Dispatched before `ACP_OPERATOR_TOKEN` is ever read, not merely before it is used (#760). A
   // claimant must not possess the owner/admin credential, and the only way to make that literally
@@ -298,6 +301,17 @@ const dispatchAdoptedCeoAttach = (args: string[], config: { databasePath: string
 };
 
 const dispatchAttach = (args: string[], config: { databasePath: string }): Promise<number> => {
+  if (args[0] === "resident-cto") {
+    return (async () => {
+      const { default: Database } = await import("better-sqlite3");
+      const project = args[args.indexOf("--project-id") + 1];
+      if (!project || !args.includes("--project-id")) return fail("resident attach requires project id");
+      const db = new Database(config.databasePath,{readonly:true,fileMustExist:true});
+      let generation: number;
+      try {generation = (db.prepare("SELECT MAX(binding_generation) AS n FROM assignments WHERE role_key = ?").get(`PRIMARY_CTO:${project}`) as {n:number|null}).n ?? 0;} finally {db.close();}
+      return dispatchAttach(["canonical-cto",...args.slice(1),"--expected-binding-generation",String(generation + 1)],config);
+    })();
+  }
   if (args[0] === "adopted-ceo") return dispatchAdoptedCeoAttach(args.slice(1), config);
   if (args[0] !== "canonical-cto") return Promise.resolve(fail(`unknown attach subcommand: ${args[0] ?? ""}`));
   const parsed = parseCanonicalClaimSelectors(args.slice(1), "attach canonical-cto");
@@ -525,6 +539,7 @@ export const dispatch = async (
 
   if (command === "project") {
     if (args[0] === "list") return call("project.list");
+    if (args[0] === "retire") return call("project.retire",{projectId:required(args[1],"projectId"),reason:args.slice(2).join(" ") || "operator retirement"});
     if (args[0] === "register") {
       return call("project.register", {
         name: required(args[1], "name"),

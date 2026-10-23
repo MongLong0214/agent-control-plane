@@ -1,3 +1,4 @@
+import type { ResidentProjectProvisioning, ProvisioningEvidence } from './resident-project-provisioning.ts';
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -59,6 +60,7 @@ export interface ACPBootstrapActivationResult {
   completedAt: string;
   /** G0a (RF-018) — what this activation did not observe, said rather than passed over silently. */
   warnings: ActivationWarning[];
+  provisioning?: ProvisioningEvidence;
 }
 
 /**
@@ -70,6 +72,12 @@ export interface ACPBootstrapActivationResult {
 export interface ActivationWarning {
   commitlore: "NOT_OBSERVED";
   mode: "required" | "preferred";
+}
+
+export interface BootstrapHandoffReceipt {
+  messageId: string;
+  bindingGeneration: number;
+  payloadDigest: string;
 }
 
 const activationWarnings = (manifest: ProjectManifest | null, observed: boolean): ActivationWarning[] => {
@@ -137,6 +145,8 @@ export class BootstrapActivation {
     private readonly doctor: Doctor,
     private readonly ceo: ProductionGate,
     private readonly outbox: Outbox,
+    private readonly residentProjects?: ResidentProjectProvisioning,
+    readonly residentGenesisRequired = true,
   ) {}
 
   #completionChain: BootstrapCompletionChainPort | null = null;
@@ -230,6 +240,7 @@ export class BootstrapActivation {
     // included) before anything is written or delivered.
     const current = currentBootstrapPlan(input.runId, this.artifacts.latest<unknown>(input.runId, ArtifactKind.PLAN));
     if (!current.allowed) return current as Decision<ACPBootstrapActivationResult>;
+    if (this.residentGenesisRequired && !current.value.outputs.genesis) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap requires an inline genesis bundle and resident CTO",{});
     const facts = observedRepositoryFacts(result, factsTargetOf(current.value.outputs));
     if (!facts.allowed) return facts as Decision<ACPBootstrapActivationResult>;
     // #246 B3 — the approved manifest's CommitLore mode, enforced on this result at those facts' heads.
@@ -275,6 +286,16 @@ export class BootstrapActivation {
       );
     }
 
+    let provisioning: ProvisioningEvidence | undefined;
+    if (current.value.outputs.genesis) {
+      const repository = result.repositories[0]!;
+      if (!this.residentProjects || !repository.repositoryNodeId) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident provisioning is required",{});
+      try {
+        provisioning = await this.residentProjects.ensure({runId:input.runId,projectId,repositoryIdentity:repository.identity,repositoryNodeId:repository.repositoryNodeId,head:facts.value[0]!.head!,packet:{handoff:input.handoff,plan:this.artifacts.latest<unknown>(input.runId,ArtifactKind.PLAN)}});
+      } catch { return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident provisioning readbacks pending",{runId:input.runId}); }
+      input = {...input,localBindings:[{identity:repository.identity,repositoryRole:repository.role,checkoutPath:provisioning.allocation.clonePath}]};
+    }
+
     // 3. Create local repository bindings. The committed manifest never holds a path.
     const localBindings: ACPBootstrapActivationResult["localBindings"] = [];
     for (const binding of input.localBindings) {
@@ -312,7 +333,10 @@ export class BootstrapActivation {
     // handoff could not reach (`undeliverableRecipient`): the retry replaces it with a driven one.
     const alreadyBound = this.bindings.active(primaryRoleKey);
     const undeliverable = alreadyBound ? this.undeliverableRecipient(input.runId, projectId, alreadyBound) : null;
-    if (alreadyBound && !undeliverable) {
+    if (provisioning) {
+      if (!alreadyBound || alreadyBound.sessionId !== provisioning.claimSessionId) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"awaiting resident canonical claim",{runId:input.runId});
+      primaryCtoBinding = {roleKey:primaryRoleKey,sessionId:alreadyBound.sessionId,bindingGeneration:alreadyBound.bindingGeneration,promotedFromBootstrap:false};
+    } else if (alreadyBound && !undeliverable) {
       await this.cto.ensureBuzz(alreadyBound.sessionId, `primary-cto:${projectId}`);
       primaryCtoBinding = {
         roleKey: primaryRoleKey,
@@ -374,7 +398,8 @@ export class BootstrapActivation {
       blindReview: reviewed.allowed ? { verdict: reviewed.value.verdict, digest: reviewed.value.digest } : null,
       ceoConfirm: null,
       primaryCtoBinding,
-      buzz: { connected: Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
+      ...(provisioning ? {provisioning} : {}),
+      buzz: { connected: provisioning ? this.residentProjects!.ready(input.runId,primaryCtoBinding.sessionId) : Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
       handoffAck,
       doctor: { status: report.status, findings: report.findings.length },
       activity: project.activity,
@@ -678,6 +703,8 @@ export class BootstrapActivation {
         projectId,
       });
     }
+    const provisioning = plan.value.outputs.genesis ? this.residentProjects?.evidence(input.runId) : undefined;
+    if (plan.value.outputs.genesis && (!provisioning || !primary || !this.residentProjects?.ready(input.runId,primary.sessionId))) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident provisioning readbacks unavailable at confirmation",{});
     const activation: ACPBootstrapActivationResult = {
       schema: "agent-control-plane.bootstrap-activation.v1",
       runId: input.runId,
@@ -697,7 +724,8 @@ export class BootstrapActivation {
             promotedFromBootstrap: this.servedAsBootstrapCto(input.runId, primary.sessionId),
           }
         : null,
-      buzz: { connected: Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
+      ...(provisioning ? {provisioning} : {}),
+      buzz: { connected: provisioning ? Boolean(primary && this.residentProjects?.ready(input.runId,primary.sessionId)) : Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
       handoffAck,
       doctor: {
         status: doctorArtifact.content.report.status,
@@ -718,6 +746,10 @@ export class BootstrapActivation {
       });
     }
 
+    if (activation.provisioning) {
+      activation.provisioning.complete = true;
+      this.residentProjects?.complete(input.runId);
+    }
     this.artifacts.put(input.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT, activation);
     this.audit.record({
       kind: "BOOTSTRAP_ACTIVATED",
@@ -766,7 +798,9 @@ export class BootstrapActivation {
     // earlier handoff row and artifact are kept as they are, and its ACK, if any, is evidence of nothing.
     // #246 C4 — so is one whose recipient this activation replaced as undeliverable (`reissuedToReplacement`).
     const reissues = recorded !== null &&
-      (this.reissuable(projectId, recorded.content, handoff) || this.reissuedToReplacement(projectId, recorded.content, toSessionId, handoff));
+      (this.reissuable(projectId, recorded.content, handoff) ||
+        this.reissuedToReplacement(projectId, recorded.content, toSessionId, handoff) ||
+        this.reissuesUnreadablePackage(projectId, recorded.content, toSessionId, handoff));
     if (recorded && !reissues) {
       const recordedDigest = digestOf(recorded.content.handoff);
       if (
@@ -803,7 +837,9 @@ export class BootstrapActivation {
       return allow(ReasonCode.OK, { handoffId: recorded.content.handoffId });
     }
 
-    const handoffId = `hof_${digestOf({ runId, toSessionId, handoffDigest }).slice(7, 27)}`;
+    const handoffId = `hof_${digestOf({ runId, toSessionId, handoffDigest,
+      ...(reissues ? { reissuedFrom: recorded.content.handoffId } : {}),
+    }).slice(7, 27)}`;
     this.db.run(
       `INSERT INTO handoffs (handoff_id, project_id, kind, from_session_id, from_generation,
                              to_session_id, package_json, digest, status, created_at)
@@ -838,6 +874,29 @@ export class BootstrapActivation {
       evidence: { handoffId, source: "bootstrap-activation", ...(reissues ? { reissuedFrom: recorded.content.handoffId } : {}) },
     });
     return allow(ReasonCode.OK, { handoffId });
+  }
+
+  /** Keep the current in-band holder; preserve unusable historical rows and issue a fresh package. */
+  private reissuesUnreadablePackage(
+    projectId: string,
+    recorded: { handoffId: string; projectId: string; toSessionId: string; handoff: HandoffPackage },
+    toSessionId: string,
+    handoff: HandoffPackage,
+  ): boolean {
+    const holder = this.bindings.activePrimaryCto(projectId);
+    if (recorded.projectId !== projectId || recorded.toSessionId !== toSessionId ||
+      holder?.sessionId !== toSessionId || digestOf(recorded.handoff) !== digestOf(handoff) ||
+      (!isAdoptedCanonicalRuntime(this.db, toSessionId) && drivenModeOf(this.db, toSessionId) !== "DRIVEN")) return false;
+    const row = this.db.get<{ status: string; digest: string; to_session_id: string }>(
+      `SELECT status, digest, to_session_id FROM handoffs WHERE handoff_id = ? AND kind = 'BOOTSTRAP' AND project_id = ?`,
+      [recorded.handoffId, projectId],
+    );
+    const message = this.outbox.byIdempotencyKey(`bootstrap-handoff:${recorded.handoffId}`);
+    return row?.status === "PENDING" && row.to_session_id === toSessionId && row.digest === digestOf(handoff) &&
+      message?.kind === MessageKind.HANDOFF_PACKAGE && message.targetSessionId === toSessionId &&
+      message.roleKey === holder.roleKey &&
+      (message.status === "REJECTED" || message.status === "EXPIRED" ||
+        (message.status === "PENDING" && message.bindingGeneration !== holder.bindingGeneration));
   }
 
   /**
@@ -952,9 +1011,13 @@ export class BootstrapActivation {
   }
 
   /** The ack, as recorded by the incoming session itself. */
-  acknowledgeActivationHandoff(handoffId: string, ackBySessionId: string): Decision<void> {
-    const row = this.db.get<{ to_session_id: string; status: string; kind: string; package_json: string }>(
-      `SELECT to_session_id, status, kind, package_json FROM handoffs WHERE handoff_id = ?`,
+  acknowledgeActivationHandoff(handoffId: string, ackBySessionId: string, sessionIncarnation?: string, receipt?: BootstrapHandoffReceipt): Decision<void> {
+    return this.db.txDecision(() => this.acknowledgeActivationHandoffInTx(handoffId, ackBySessionId, sessionIncarnation, receipt));
+  }
+
+  private acknowledgeActivationHandoffInTx(handoffId: string, ackBySessionId: string, sessionIncarnation?: string, receipt?: BootstrapHandoffReceipt): Decision<void> {
+    const row = this.db.get<{ project_id: string; to_session_id: string; status: string; kind: string; package_json: string; ack_by_session_id: string | null }>(
+      `SELECT project_id, to_session_id, status, kind, package_json, ack_by_session_id FROM handoffs WHERE handoff_id = ?`,
       [handoffId],
     );
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId });
@@ -968,9 +1031,51 @@ export class BootstrapActivation {
         got: ackBySessionId,
       });
     }
+    const holder = this.bindings.activePrimaryCto(row.project_id);
+    if (holder?.sessionId !== ackBySessionId ||
+      (sessionIncarnation !== undefined && holder.sessionIncarnation !== sessionIncarnation)) {
+      return deny(ReasonCode.HANDOFF_ACK_REQUIRED, "ack must come from the current PRIMARY_CTO holder", { handoffId });
+    }
     const observed = this.observedHandoffFacts(handoffId, JSON.parse(row.package_json) as Partial<HandoffPackage>);
     if (!observed.allowed) return observed;
-    if (row.status === "ACKED") return allow(ReasonCode.OK, undefined);
+    const refuse = () => deny(ReasonCode.HANDOFF_ACK_REQUIRED, "ack requires this session's current bootstrap package authority", { handoffId });
+    const message = this.outbox.byIdempotencyKey(`bootstrap-handoff:${handoffId}`);
+    const session = this.sessions.get(ackBySessionId);
+    if (!sessionIncarnation || !receipt || !message ||
+      session?.incarnation !== sessionIncarnation || !["READY", "DRAINING"].includes(session.lifecycle) ||
+      message.kind !== MessageKind.HANDOFF_PACKAGE || message.targetSessionId !== ackBySessionId ||
+      message.roleKey !== holder.roleKey || message.bindingGeneration !== holder.bindingGeneration ||
+      receipt.messageId !== message.messageId || receipt.bindingGeneration !== message.bindingGeneration ||
+      receipt.payloadDigest !== message.payloadDigest ||
+      message.payloadDigest !== digestOf(message.payload) ||
+      digestOf(message.payload) !== digestOf({ handoffId, projectId: row.project_id, handoff: JSON.parse(row.package_json) })) return refuse();
+
+    // A replay is valid only for the incarnation that settled both records, with the same package.
+    if (row.status === "ACKED") {
+      const ack = this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'HANDOFF_ACK' AND session_id = ?
+        AND json_extract(evidence_json, '$.handoffId') = ?
+        AND json_extract(evidence_json, '$.sessionIncarnation') = ?
+        AND json_extract(evidence_json, '$.messageId') = ?
+        AND json_extract(evidence_json, '$.bindingGeneration') = ?
+        AND json_extract(evidence_json, '$.payloadDigest') = ? LIMIT 1`,
+      [ackBySessionId, handoffId, sessionIncarnation, message.messageId, receipt.bindingGeneration, receipt.payloadDigest]);
+      return message.status === "ACKED" && row.ack_by_session_id === ackBySessionId && ack ? allow(ReasonCode.OK, undefined) : refuse();
+    }
+    if (row.status !== "PENDING") return refuse();
+    const inBand = isAdoptedCanonicalRuntime(this.db, ackBySessionId) || drivenModeOf(this.db, ackBySessionId) !== "NONE";
+    if (inBand) {
+      if (!this.outbox.pendingInBandFor(ackBySessionId, sessionIncarnation)
+        .some((pending) => pending.messageId === message.messageId)) return refuse();
+      const acked = this.outbox.acknowledgeHandoffInBand(message.messageId, ackBySessionId, sessionIncarnation);
+      if (!acked.allowed) return acked;
+    } else {
+      // Ordinary interactive holders still receive bootstrap packages over Buzz. Only a sent
+      // package, bound to the supplied digest and current holder above, can settle that route.
+      if (message.status !== "SENT") return refuse();
+      const acked = this.outbox.acknowledge(message.messageId, ackBySessionId, receipt.bindingGeneration, sessionIncarnation);
+      if (!acked.allowed) return acked;
+    }
+
     this.db.run(
       `UPDATE handoffs SET status = 'ACKED', acked_at = ?, ack_by_session_id = ? WHERE handoff_id = ?`,
       [this.clock.nowIso(), ackBySessionId, handoffId],
@@ -979,7 +1084,7 @@ export class BootstrapActivation {
       kind: "HANDOFF_ACK",
       runId: null,
       sessionId: ackBySessionId,
-      evidence: { handoffId, source: "bootstrap-activation" },
+      evidence: { handoffId, source: "bootstrap-activation", sessionIncarnation, ...receipt },
     });
     return allow(ReasonCode.OK, undefined);
   }

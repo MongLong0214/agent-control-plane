@@ -367,8 +367,9 @@ it("the anchor's precondition: every writer of sessions.buzz_address stamps upda
   const writers: string[] = [];
   for (const file of files) {
     const text = readFileSync(file, "utf8");
-    for (const match of text.matchAll(/`([^`]*?\b(?:UPDATE\s+sessions\s+SET|INSERT\s+(?:OR\s+\w+\s+)?INTO\s+sessions\b)[^`]*)`/g)) {
-      const statement = match[1]!;
+    for (const match of text.matchAll(/`([^`]*)`|'((?:\\.|[^'\\\r\n])*)'|"((?:\\.|[^"\\\r\n])*)"/g)) {
+      const statement = match[1] ?? match[2] ?? match[3]!;
+      if (!/\b(?:UPDATE\s+sessions\s+SET|INSERT\s+(?:OR\s+\w+\s+)?INTO\s+sessions\b)/.test(statement)) continue;
       if (!/\bbuzz_address\b/.test(statement)) continue;
       writers.push(`${file.split("/src/")[1]}: ${statement.replace(/\s+/g, " ").slice(0, 60)}`);
       expect(statement, `${file}: ${statement}`).toMatch(/\bupdated_at\b/);

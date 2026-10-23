@@ -1,3 +1,4 @@
+import type { ResidentProjectProvisioning } from './resident-project-provisioning.ts';
 import { lstatSync, readdirSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 
@@ -34,7 +35,7 @@ import type {
   BootstrapApplicationReservation,
   BootstrapApplications,
 } from "./bootstrap-applications.ts";
-import { bootstrapActivationHandoff, currentBootstrapPlan, executablePlanOf, factsTargetOf, handoffFactsAre, observedRepositoryFacts, type PlannedBootstrapOutputs, plannedBootstrapOutputs } from "./bootstrap-plan.ts";
+import { currentBootstrapPlan, executablePlanOf, factsTargetOf, handoffFactsAre, observedRepositoryFacts, type PlannedBootstrapOutputs, plannedBootstrapOutputs } from "./bootstrap-plan.ts";
 import { type GitHubWritePort, type ObservedRepository, parseGitHubIdentity } from "./github-write-port.ts";
 import {
   githubLedgerPath,
@@ -142,9 +143,10 @@ export interface BootstrapConfirmation {
 }
 
 export interface RepoFactoryBootstrapRunnerDeps {
+  residentProjects?: ResidentProjectProvisioning;
   runs: Pick<RunEngine, "get" | "currentCandidate">;
   artifacts: Pick<ArtifactStore, "latest" | "list" | "put">;
-  bootstrap: Pick<BootstrapActivation, "activate" | "readinessForFactoryResult" | "reviewForConfirmation">;
+  bootstrap: Pick<BootstrapActivation, "activate" | "readinessForFactoryResult" | "reviewForConfirmation" | "residentGenesisRequired">;
   /** The production composition passes `createBootstrapGitHubWritePort()`; tests pass a double. */
   githubPort: GitHubWritePort;
   /** Each run produces under `<workRoot>/<runId>`. Null means this deployment never configured one. */
@@ -187,13 +189,21 @@ const LEDGER_REFUSALS = new Set(["LEDGER_CORRUPT", "LEDGER_FOREIGN", "LEDGER_UNS
 const WRITE_REQUEST_KIND = {
   createRepository: "repository",
   pushBranch: "branch",
+  createBranch: "branch",
+  ensureGenesisResources: "genesis-resources",
   setDefaultBranch: "setting",
   protectBranch: "branch-protection",
+  openGenesisPull: "genesis-bootstrap",
+  mergeGenesisPull: "genesis-bootstrap",
 } as const satisfies Record<string, PendingWrite["resourceType"]>;
 
 /** The kind of ledger intent a GitHub request at its start belongs to, or null for one that is none. */
 const requestKind = (request: BootstrapWriteRequest): PendingWrite["resourceType"] | null => {
   if (request.kind === "git") return request.method === "push" ? "branch" : null;
+  if (/\/git\/refs(?:$|\/)/.test(request.target)) return "branch";
+  if (/\/(?:labels|milestones|issues)(?:[?\/]|$)/.test(request.target)) return "genesis-resources";
+  // The genesis PR's open (POST) and merge (PUT) are genesis-bootstrap writes, not a create or a protection.
+  if (/\/pulls(?:[?\/]|$)/.test(request.target)) return "genesis-bootstrap";
   if (request.method === "POST") return "repository";
   if (request.method === "PATCH") return "setting";
   if (request.method === "PUT") return "branch-protection";
@@ -404,11 +414,23 @@ export class RepoFactoryBootstrapRunner {
   async produceAndActivateApproved(confirmation: BootstrapConfirmation): Promise<Decision<ACPBootstrapActivationResult>> {
     const scope = this.approvalScopeOf(confirmation.runId);
     if (!scope.allowed) return scope as Decision<ACPBootstrapActivationResult>;
+    const admissible = this.deps.ceo.assertCeoDecisionAdmissible({...confirmation,decision:"CONFIRM",rationale:confirmation.rationale ?? ""});
+    if (!admissible.allowed) return admissible as Decision<ACPBootstrapActivationResult>;
+    const current = currentBootstrapPlan(confirmation.runId,this.deps.artifacts.latest<unknown>(confirmation.runId,ArtifactKind.PLAN));
+    if (!current.allowed) return current as Decision<ACPBootstrapActivationResult>;
+    if (this.deps.bootstrap.residentGenesisRequired && !current.value.outputs.genesis) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap requires an inline genesis bundle and resident CTO",{});
+    if (current.value.outputs.genesis) {
+      if (!this.deps.residentProjects?.configured()) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident host provisioner/subscriber is not configured",{});
+      const reviewed = this.deps.bootstrap.reviewForConfirmation(confirmation.runId,confirmation.candidateSnapshotDigest);
+      if (!reviewed.allowed) return reviewed as Decision<ACPBootstrapActivationResult>;
+      try {this.deps.residentProjects?.remember(confirmation,current.value.manifest.projectId,{...current.value.binding,candidateSnapshotDigest:confirmation.candidateSnapshotDigest});}
+      catch {return deny(ReasonCode.CONFLICT,"confirmed provisioning intent conflicts with stored tuple",{});}
+    }
     return this.produceAndActivate({
       ...confirmation,
       approvedManifest: scope.value.approvedManifest,
       projectName: scope.value.projectName,
-      handoff: bootstrapActivationHandoff(scope.value.approvedManifest),
+      handoff: current.value.outputs.handoff,
     });
   }
 
@@ -1288,7 +1310,15 @@ export class RepoFactoryBootstrapRunner {
           : null;
         if (kind === null) return (value as (...args: unknown[]) => unknown).bind(target);
         return async (...args: unknown[]) => {
-          const pending = pendingKinds.get(kind);
+          // A merge call for a PR GitHub already shows merged sends no merge: the kernel only reads it back.
+          if (property === "mergeGenesisPull" && (args[1] as { merged?: unknown } | undefined)?.merged === true) {
+            return (value as (...args: unknown[]) => Promise<unknown>).apply(target, args);
+          }
+          const branch = (property === "createBranch" || property === "pushBranch" || property === "protectBranch") && typeof args[1] === "string" ? args[1] : null;
+          const step = property === "openGenesisPull" ? "genesis-open" : property === "mergeGenesisPull" ? "genesis-merge" : null;
+          const pending = kind === "genesis-resources" ? undefined
+            : step !== null ? [...pendingAtStart.values()].find(p => p.resourceType === kind && p.resourceIdentity.endsWith(`#${step}`))
+            : branch === null ? pendingKinds.get(kind) : [...pendingAtStart.values()].find(p => p.resourceType === kind && p.resourceIdentity.endsWith(`#${branch}`));
           if (pending !== undefined) {
             const evidence = { operationId: pending.operationId, resourceType: kind, attemptedAt: pending.attemptedAt };
             onWithheld(evidence);
@@ -1509,6 +1539,12 @@ export class RepoFactoryBootstrapRunner {
    * A read that fails proves nothing, so its request is unsettled too. A pending request whose effect
    * GitHub shows, or that main's resume stops on without sending, is not listed; a protection present
    * but not the approved one is left to the guarded port, which refuses to send it.
+   *
+   * Review V52-R1-01 — each request is read back at its own target: a push or a protection at the
+   * branch its operation names (`genesis`, `main` or `dev`), not the plan's default branch; the genesis
+   * PR open by the marker its intent recorded; the genesis merge by that PR showing merged. The genesis
+   * verification sends nothing — local commands and CI reads — so it repeats safely and is never in
+   * doubt. A merge GitHub does not show, or an open with no PR to show for it, stays unsettled.
    */
   private async unsettledRequests(
     pendingAtStart: ReadonlyMap<string, PendingWrite>,
@@ -1519,17 +1555,24 @@ export class RepoFactoryBootstrapRunner {
     const port = this.deps.githubPort;
     const unsettled: Array<{ operationId: string; resourceType: PendingWrite["resourceType"]; attemptedAt: string }> = [];
     for (const [operationId, intent] of pendingAtStart) {
-      let settled: boolean;
+      const operation = execution.operations.find((candidate) => candidate.operationId === operationId);
+      // The branch the operation itself names; a plan whose identity names none targets its default branch.
+      const branchOf = (): string =>
+        parseGitHubIdentity(operation?.resourceIdentity ?? intent.resourceIdentity)?.ref ?? plan.defaultBranch;
+      let settled = false;
       try {
         switch (intent.resourceType) {
+          case "genesis-resources": {
+            settled = repository !== null && operation?.resourceType === "genesis-resources" && typeof port.ensureGenesisResources === "function"; // The port reads each stable key/marker before creating the remaining resources.
+            break;
+          }
           case "repository":
             settled = repository !== null || intent.respondedNodeId !== null;
             break;
           case "branch":
-            settled = repository !== null && (await port.observeBranch(execution.target, plan.defaultBranch)) !== null;
+            settled = repository !== null && operation?.resourceType === "branch" && (await port.observeBranch(execution.target, branchOf())) !== null;
             break;
           case "setting": {
-            const operation = execution.operations.find((candidate) => candidate.operationId === operationId);
             settled =
               repository !== null &&
               operation?.resourceType === "setting" &&
@@ -1537,8 +1580,20 @@ export class RepoFactoryBootstrapRunner {
             break;
           }
           case "branch-protection":
-            settled = repository !== null && (await port.observeBranchProtection(execution.target, plan.defaultBranch)) !== null;
+            settled = repository !== null && operation?.resourceType === "branch-protection" && (await port.observeBranchProtection(execution.target, branchOf())) !== null;
             break;
+          case "genesis-bootstrap": {
+            if (repository === null || operation?.resourceType !== "genesis-bootstrap") break;
+            const action = operation.desiredState.action;
+            if (action === "verify") {
+              settled = true;
+              break;
+            }
+            if (intent.marker === null || typeof port.observeGenesisPull !== "function") break;
+            const pull = await port.observeGenesisPull(execution.target, intent.marker);
+            settled = action === "open" ? pull !== null : pull?.merged === true && pull.mergeCommitSha !== null;
+            break;
+          }
         }
       } catch {
         settled = false;

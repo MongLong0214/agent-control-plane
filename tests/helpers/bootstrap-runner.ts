@@ -1,3 +1,4 @@
+import { acknowledgeBootstrapHandoff } from "./bootstrap-handoff-ack.ts";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -310,7 +311,7 @@ export const activateAndConfirm = async (
   }
   const primary = harness.cp.bindings.activePrimaryCto(prepared.manifest.projectId);
   if (!primary) throw new Error("activation bound no primary CTO");
-  const acked = harness.cp.bootstrap.acknowledgeActivationHandoff(first.evidence["pendingHandoffId"] as string, primary.sessionId);
+  const acked = await acknowledgeBootstrapHandoff(harness, first.evidence["pendingHandoffId"] as string, primary.sessionId);
   if (!acked.allowed) throw new Error(acked.message);
   const second = await prepared.runner.produceAndActivate(input);
   if (!second.allowed) throw new Error(`${second.reasonCode}: ${second.message} ${JSON.stringify(second.evidence)}`);

@@ -1047,10 +1047,22 @@ export class ManagedWriteGuard {
 
   private relativePath(grant: GuardGrant): string | null {
     if (!grant.resolvedPath || !grant.repositoryIdentity) return null;
-    const repository = this.db.get<{ checkout_path: string }>(
-      `SELECT checkout_path FROM repositories WHERE identity = ?`,
-      [grant.repositoryIdentity],
-    );
+    // An identity can name a retired row and its active replacement (R6). A run's own participant is
+    // bound by repository id, which keeps a run on the row it was authorized for; anything else has
+    // only the identity's current, unretired row as authority.
+    const repository =
+      (grant.runId
+        ? this.db.get<{ checkout_path: string }>(
+            `SELECT r.checkout_path FROM run_repositories rr
+               JOIN repositories r ON r.repository_id = rr.repository_id
+              WHERE rr.run_id = ? AND r.identity = ?`,
+            [grant.runId, grant.repositoryIdentity],
+          )
+        : undefined) ??
+      this.db.get<{ checkout_path: string }>(
+        `SELECT checkout_path FROM repositories WHERE identity = ? AND retired_at IS NULL`,
+        [grant.repositoryIdentity],
+      );
     if (!repository) return null;
     const checkout = grant.assignedWorktreeId
       ? this.probe.canonical(grant.assignedWorktreeId)
@@ -1563,9 +1575,10 @@ export class ManagedWriteGuard {
       request.bindingGeneration == null &&
       RepairWorktreeAuthorityToken.belongsTo(request.repairWorktreeAuthority, this);
     if (runlessRepairWorktree) {
+      // Current authority only: a retired row sharing the identity is history, never a repair target.
       const repository = request.repositoryIdentity
         ? this.db.get<{ checkout_path: string }>(
-            `SELECT checkout_path FROM repositories WHERE identity = ?`,
+            `SELECT checkout_path FROM repositories WHERE identity = ? AND retired_at IS NULL`,
             [request.repositoryIdentity],
           )
         : null;

@@ -1,3 +1,5 @@
+import { ResidentProjectProvisioning } from '../bootstrap/resident-project-provisioning.ts';
+import { ExecFileHostProjectProvisioner, type HostProjectProvisioner } from '../runtime/host-project-provisioner.ts';
 import { dirname, join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -165,6 +167,7 @@ export interface ControlPlaneConfig {
    * any GitHub call. `githubPort` replaces the production `gh` port in tests; `commitlore` replaces
    * the production `commitlore` CLI port that observes a manifest's required CommitLore (#246 B3).
    */
+  residentProvisioner?: {port?: HostProjectProvisioner; script?: string; home?: string};
   repoFactory?: { workRoot: string; githubPort?: GitHubWritePort; commitlore?: CommitLorePort };
 }
 
@@ -315,6 +318,7 @@ export class ControlPlane {
   readonly doctor: Doctor;
   readonly watchdog: Watchdog;
   readonly repair: RepairService;
+  readonly residentProjects: ResidentProjectProvisioning;
   readonly bootstrap: BootstrapActivation;
   /** Issue #246 — performs a bootstrap plan's GitHub writes, then hands the result to `bootstrap`. */
   readonly bootstrapProducer: RepoFactoryBootstrapRunner;
@@ -679,9 +683,13 @@ export class ControlPlane {
       );
       this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
       this.bootstrapApplications = new BootstrapApplications(this.db, this.clock, this.audit);
+      const hostScript = config.residentProvisioner?.script ?? process.env["ACP_HOST_PROJECT_PROVISIONER"];
+      const residentHome = config.residentProvisioner?.home ?? homedir();
+      this.residentProjects = new ResidentProjectProvisioning(this.db,this.clock,
+        config.residentProvisioner?.port ?? (hostScript ? new ExecFileHostProjectProvisioner(hostScript,residentHome,dirname(config.databasePath)) : null),residentHome,dirname(config.databasePath));
       this.bootstrap = new BootstrapActivation(
         this.db, this.clock, this.audit, this.artifacts, this.projects, this.repositories,
-        this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox,
+        this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox, this.residentProjects, !config.allowTestEvidenceWriters,
       );
 
       this.sessionAttestations = new SessionAttestations(this.sessions, this.audit);
@@ -752,6 +760,7 @@ export class ControlPlane {
       });
       this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? [], this.clock);
       this.bootstrapProducer = new RepoFactoryBootstrapRunner({
+        residentProjects: this.residentProjects,
         runs: this.runs,
         artifacts: this.artifacts,
         bootstrap: this.bootstrap,

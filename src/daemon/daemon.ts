@@ -1,3 +1,4 @@
+import { retireProject } from '../registry/project-retirement.ts';
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -347,6 +348,7 @@ export const OPERATOR_METHOD = {
   CAPACITY_SHOW: "capacity.show",
   CAPACITY_OBSERVE: "capacity.observe",
   PROJECT_LIST: "project.list",
+  PROJECT_RETIRE: "project.retire",
   PROJECT_REGISTER: "project.register",
   ACTOR_LIST: "actor.list",
   ACTOR_REGISTER: "actor.register",
@@ -374,6 +376,7 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.REPAIR_EXECUTE,
   OPERATOR_METHOD.CAPACITY_OBSERVE,
   OPERATOR_METHOD.PROJECT_REGISTER,
+  OPERATOR_METHOD.PROJECT_RETIRE,
   OPERATOR_METHOD.ACTOR_REGISTER,
   OPERATOR_METHOD.ACTOR_UNREGISTER,
   OPERATOR_METHOD.CONVERSATION_ADJUDICATE,
@@ -949,6 +952,10 @@ export class Daemon {
           return observed;
         }
 
+        case OPERATOR_METHOD.PROJECT_RETIRE: {
+          const projectId = requiredOperatorString(request.params,"projectId");if (!projectId.allowed) return projectId;
+          return retireProject(this.cp,projectId.value,typeof request.params["reason"] === "string" ? request.params["reason"] : "operator retirement");
+        }
         case OPERATOR_METHOD.PROJECT_LIST:
           return allow(
             ReasonCode.OK,
@@ -1462,6 +1469,7 @@ export class Daemon {
       await this.runPeriodic("cto_canonical_switchover_settle", () => this.settleCanonicalSwitchovers());
       report.resumedRuns = await this.resumeQueuedRuns();
       report.resumedFinalizations = await this.resumeApprovedRuns();
+      await this.resumeResidentProjects();
       // Issue #246 — a bootstrap run that ended while no daemon was running left its BOOTSTRAP_CTO
       // bound or its session running; the watchdog repeats this, through the same backoff.
       await this.runPeriodic("bootstrap_cto_reclaim", () => this.reclaimBootstrapCtos());
@@ -2175,6 +2183,18 @@ export class Daemon {
   }
 
   /** Recover CEO-approved work after the durable lease and GitHub receipt reconciliations. */
+  async resumeResidentProjects(): Promise<void> {
+    for (const row of this.cp.db.all<{project_id:string;reason:string}>(`SELECT project_id,reason FROM project_retirements WHERE completed_at IS NULL ORDER BY requested_at,project_id`)) await retireProject(this.cp,row.project_id,row.reason);
+    for (const confirmation of this.cp.residentProjects.pending()) {
+      const run = this.cp.runs.get(confirmation.runId);
+      if (!run || run.state === RunState.COMPLETED || run.state === RunState.CANCELLED) continue;
+      const produced = await this.cp.bootstrapProducer.produceAndActivateApproved(confirmation);
+      if (!produced.allowed) continue;
+      const decision = this.cp.ceo.submitCeoDecision({...confirmation,decision:"CONFIRM",rationale:confirmation.rationale ?? ""});
+      if (decision.allowed) this.cp.residentProjects.complete(confirmation.runId);
+    }
+  }
+
   private async resumeApprovedRuns(): Promise<string[]> {
     const resumed: string[] = [];
     const states = [RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING, RunState.BLOCKED_POST_MERGE];
@@ -2941,6 +2961,7 @@ export class Daemon {
           // finalization lease and GitHub receipts remain the sole source of work. It retries
           // an interrupted callback without requiring a daemon restart.
           const finalized = await this.resumeApprovedRuns();
+          await this.resumeResidentProjects();
           if (tick.overdue.length > 0 || finalized.length > 0) this.writeHealth(null);
         }).finally(() => { watchdogRunning = false; });
       }

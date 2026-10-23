@@ -36,6 +36,7 @@ export const repoFactoryResultSchema = z
         z
           .object({
             role: z.string().min(1),
+            repositoryNodeId: z.string().min(1).optional(),
             identity: z.string().min(1),
             /** Repo Factory may *propose* a local binding; it never commits one. */
             proposedCheckoutPath: z.string().nullable().default(null),

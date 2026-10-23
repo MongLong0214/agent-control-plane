@@ -1,3 +1,5 @@
+import { mergeBootstrapGenesis, observeApprovedWorkflowChecks } from '../github/github-kernel.ts';
+import type { GenesisBundle } from './genesis-bundle.ts';
 import { spawn } from "node:child_process";
 
 import { acpError, isAcpError } from "../core/errors.ts";
@@ -33,6 +35,8 @@ import type { GitHubClient } from "../github/github-kernel.ts";
  * that creates repositories has no business holding it (Repo Factory's `github_port.py` draws
  * the same line), and an installation token cannot create a repository under a user account.
  */
+
+const canonicalLabels = (labels: string[]): string => JSON.stringify([...labels].sort());
 
 export type GitHubVisibility = "public" | "private";
 
@@ -92,6 +96,8 @@ export interface ObservedBranchProtection {
 /** A field GitHub's answer carried no value for, where `null` already means something else. */
 export const UNOBSERVED = "unobserved";
 
+export interface GenesisPull {number:number; headSha:string; baseSha:string; merged:boolean; mergeCommitSha:string|null}
+
 export interface GitHubWritePort {
   observeRepository(target: GitHubRepositoryTarget): Promise<ObservedRepository | null>;
   /**
@@ -106,6 +112,13 @@ export interface GitHubWritePort {
     description: string,
     autoInit?: boolean,
   ): Promise<ObservedRepository>;
+  observeGenesisPull?(target:GitHubRepositoryTarget, marker:string):Promise<GenesisPull|null>;
+  openGenesisPull?(target:GitHubRepositoryTarget, marker:string):Promise<void>;
+  mergeGenesisPull?(target:GitHubRepositoryTarget, pull:GenesisPull, workflows:readonly {path:string;checkName:string;approvedDigest:string}[]):Promise<void>;
+  observeGenesisCi?(target:GitHubRepositoryTarget,head:string,workflows:readonly {path:string;checkName:string;approvedDigest:string}[]):Promise<boolean>;
+  createBranch?(target: GitHubRepositoryTarget, branch: string, head: string): Promise<void>;
+  ensureGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>): Promise<void>;
+  observeGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>): Promise<Record<string, unknown> | null>;
   observeBranch(target: GitHubRepositoryTarget, branch: string): Promise<ObservedBranch | null>;
   pushBranch(target: GitHubRepositoryTarget, branch: string, checkoutPath: string, commitSha: string): Promise<void>;
   /** A read: brings an already-pushed commit into a fresh local checkout on resume. */
@@ -389,6 +402,75 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
       );
     },
 
+    async observeGenesisPull(target,marker) {
+      const pulls = await client.request<Array<{number:number;body:string;head:{ref:string;sha:string;repo:{full_name:string}};base:{ref:string;sha:string};merged_at:string|null}>>("GET",`${repoPath(target)}/pulls?state=all&head=${encodeURIComponent(target.owner+":genesis")}&base=main&per_page=100`);
+      const matches = pulls.filter(p => p.body?.includes(marker));
+      if (matches.length > 1 || pulls.some(p => !p.body?.includes(marker))) throw new Error("ambiguous genesis PR");
+      const p = matches[0]; if (!p) return null;
+      const detail = await client.request<{state:string;merged:boolean;merge_commit_sha:string|null}>("GET",`${repoPath(target)}/pulls/${p.number}`);
+      if (p.head.ref !== "genesis" || p.base.ref !== "main" || p.head.repo.full_name.toLowerCase() !== `${target.owner}/${target.name}`.toLowerCase() || (detail.state !== "open" && !detail.merged)) throw new Error("genesis PR identity/state drift");
+      let baseSha = p.base.sha;
+      if (detail.merged) {
+        const commit = await client.request<{parents:Array<{sha:string}>}>("GET",`${repoPath(target)}/git/commits/${detail.merge_commit_sha}`);
+        if (commit.parents.length !== 2 || commit.parents[1]?.sha !== p.head.sha) throw new Error("genesis requires merge commit");
+        baseSha = commit.parents[0]!.sha;
+      }
+      return {number:p.number,headSha:p.head.sha,baseSha,merged:detail.merged,mergeCommitSha:detail.merged ? detail.merge_commit_sha : null};
+    },
+    async openGenesisPull(target,marker) {
+      await client.request("POST",`${repoPath(target)}/pulls`,{head:"genesis",base:"main",title:"Bootstrap genesis",body:marker});
+    },
+    async mergeGenesisPull(target,pull,workflows) {
+      await mergeBootstrapGenesis(client,{owner:target.owner,repo:target.name,pullNumber:pull.number,headSha:pull.headSha,baseSha:pull.baseSha,workflows});
+    },
+    async observeGenesisCi(target,head,workflows) {
+      // The same suite -> Actions run -> workflow path -> exact-head digest proof the kernel's merges
+      // use: a successful check of the right name proves nothing until the approved workflow made it.
+      for (let attempt = 0; attempt < 30; attempt++) {
+        const checks = await observeApprovedWorkflowChecks(client,{root:repoPath(target),owner:target.owner,repo:target.name,head,workflows});
+        if (checks.state === 'success') return true;
+        if (checks.state === 'refused') return false;
+        if (attempt < 29) await new Promise(resolve => setTimeout(resolve,1000));
+      }
+      return false;
+    },
+    async createBranch(target, branch, head) {
+      await client.request("POST", `${repoPath(target)}/git/refs`, { ref: `refs/heads/${branch}`, sha: head });
+    },
+    async ensureGenesisResources(target, bundle) {
+      const labels = await client.request<Array<{name:string;color:string;description:string}>>("GET", `${repoPath(target)}/labels?per_page=100`);
+      for (const label of bundle.labels) {
+        const existing = labels.find(l => l.name === label.name);
+        if (existing) {
+          if (existing.color !== label.color || (existing.description ?? '') !== label.description) throw new Error('genesis label conflict');
+        } else await client.request("POST", `${repoPath(target)}/labels`, label);
+      }
+      const milestones = await client.request<Array<{number:number;title:string;description:string}>>("GET", `${repoPath(target)}/milestones?state=all&per_page=100`);
+      const numbers = new Map<string,number>();
+      for (const milestone of bundle.milestones) {
+        const description = `${milestone.description}\n<!-- acp-genesis:${milestone.key} -->`;
+        let existing = milestones.find(m => m.description === description);
+        if (existing && existing.title !== milestone.title) throw new Error('genesis milestone conflict');
+        existing ??= await client.request("POST", `${repoPath(target)}/milestones`, {title:milestone.title,description});
+        numbers.set(milestone.key,existing!.number);
+      }
+      const issues = await client.request<Array<{title:string;body:string}>>("GET", `${repoPath(target)}/issues?state=all&per_page=100`);
+      for (const issue of bundle.issues) {
+        const body = `${issue.body}\n<!-- acp-genesis:${issue.key} -->`;
+        const existing = issues.find(i => i.body === body);
+        if (existing && existing.title !== issue.title) throw new Error('genesis issue conflict');
+        if (!existing) await client.request("POST", `${repoPath(target)}/issues`, {title:issue.title,body,labels:issue.labels,...(issue.milestoneKey === null ? {} : {milestone:numbers.get(issue.milestoneKey)})});
+      }
+    },
+    async observeGenesisResources(target, bundle) {
+      const labels = await client.request<Array<{name:string;color:string;description:string}>>("GET", `${repoPath(target)}/labels?per_page=100`);
+      const milestones = await client.request<Array<{number:number;title:string;description:string}>>("GET", `${repoPath(target)}/milestones?state=all&per_page=100`);
+      const issues = await client.request<Array<{title:string;body:string;labels:Array<{name:string}>;milestone:{number:number}|null}>>("GET", `${repoPath(target)}/issues?state=all&per_page=100`);
+      if (!bundle.labels.every(l => labels.some(x => x.name === l.name && x.color === l.color && (x.description ?? '') === l.description))) return null;
+      if (!bundle.milestones.every(m => milestones.some(x => x.title === m.title && x.description === `${m.description}\n<!-- acp-genesis:${m.key} -->`))) return null;
+      if (!bundle.issues.every(i => issues.some(x => x.title === i.title && x.body === `${i.body}\n<!-- acp-genesis:${i.key} -->` && canonicalLabels(x.labels.map(l => l.name)) === canonicalLabels(i.labels) && (i.milestoneKey === null ? x.milestone === null : x.milestone?.number === milestones.find(m => m.description.endsWith(`<!-- acp-genesis:${i.milestoneKey} -->`))?.number)))) return null;
+      return { labels:bundle.labels, milestones:bundle.milestones, issues:bundle.issues };
+    },
     async setDefaultBranch(target, branch) {
       await client.request("PATCH", repoPath(target), { default_branch: branch });
     },

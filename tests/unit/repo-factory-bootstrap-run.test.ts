@@ -1,3 +1,4 @@
+import { acknowledgeBootstrapHandoff } from "../helpers/bootstrap-handoff-ack.ts";
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -354,7 +355,7 @@ describe("PROJECT_BOOTSTRAP run path: produce, then activate (#246)", () => {
     const primary = harness.cp.bindings.activePrimaryCto("produced-activation");
     if (!primary) throw new Error("activation bound no primary CTO");
     const handoffId = first.evidence["pendingHandoffId"] as string;
-    expect(harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primary.sessionId).allowed).toBe(true);
+    expect((await acknowledgeBootstrapHandoff(harness, handoffId, primary.sessionId)).allowed).toBe(true);
 
     github.writes.length = 0;
     const second = await prepared.runner.produceAndActivate(input);

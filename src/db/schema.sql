@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS projects (
   active_manifest_digest TEXT REFERENCES manifests(digest),
   availability           TEXT NOT NULL DEFAULT 'HEALTHY'
                            CHECK (availability IN ('HEALTHY','DEGRADED','UNAVAILABLE')),
+  buzz_address           TEXT,
+  retired_at             TEXT,
+  supersedes_project_id  TEXT REFERENCES projects(project_id),
   suspended              INTEGER NOT NULL DEFAULT 0 CHECK (suspended IN (0,1)),
   created_at             TEXT NOT NULL
 );
@@ -63,7 +66,7 @@ CREATE TABLE IF NOT EXISTS projects (
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS repositories (
   repository_id          TEXT PRIMARY KEY,
-  identity               TEXT NOT NULL UNIQUE,     -- normalized remote identity
+  identity               TEXT NOT NULL,     -- normalized remote identity
   checkout_path          TEXT NOT NULL,            -- absolute, machine-local
   project_id             TEXT REFERENCES projects(project_id) ON DELETE SET NULL,
   repository_role        TEXT,                     -- 'primary' | 'secondary' | ...
@@ -75,6 +78,7 @@ CREATE TABLE IF NOT EXISTS repositories (
   last_observed_at       TEXT,
   drift_state            TEXT NOT NULL DEFAULT 'UNKNOWN'
                            CHECK (drift_state IN ('UNKNOWN','IN_SYNC','DRIFTED')),
+  retired_at             TEXT,
   registration           TEXT NOT NULL DEFAULT 'REGISTERED'
                            CHECK (registration IN ('REGISTERED','TEMPORARY')),
   temporary_for_run      TEXT,                     -- §16.3 run-scoped binding
@@ -85,7 +89,8 @@ CREATE INDEX IF NOT EXISTS repositories_project ON repositories(project_id);
 
 -- A checkout is a machine-local identity binding, not an alias that two repository
 -- identities may claim. Sharing it would let write guards disagree about provenance.
-CREATE UNIQUE INDEX IF NOT EXISTS repositories_checkout_path ON repositories(checkout_path);
+CREATE UNIQUE INDEX IF NOT EXISTS repositories_checkout_path ON repositories(checkout_path) WHERE retired_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS repositories_active_identity ON repositories(identity) WHERE retired_at IS NULL;
 
 -- ---------------------------------------------------------------------------
 -- sessions  (PRD §9.3, §5.5, §5.6)
@@ -1456,6 +1461,7 @@ CREATE TABLE IF NOT EXISTS bootstrap_applications (
   -- The last refusal an attempt met; on a STRANDED row, the cause and the evidence; on a RELEASED
   -- row, the release record and the evidence that no external effect happened.
   last_refusal_json         TEXT,
+  retired_at                TEXT,
   reserved_at               TEXT NOT NULL,
   CHECK (phase = 'RESERVED' OR attempts >= 1),
   CHECK (phase <> 'STRANDED' OR last_refusal_json IS NOT NULL),
@@ -1464,9 +1470,9 @@ CREATE TABLE IF NOT EXISTS bootstrap_applications (
 -- One unreleased reservation per project id and per repository identity: a RELEASED row keeps its
 -- record and no longer holds the name.
 CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_project_held
-  ON bootstrap_applications(project_id) WHERE phase <> 'RELEASED';
+  ON bootstrap_applications(project_id) WHERE phase <> 'RELEASED' AND retired_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS bootstrap_applications_identity_held
-  ON bootstrap_applications(repository_identity) WHERE phase <> 'RELEASED';
+  ON bootstrap_applications(repository_identity) WHERE phase <> 'RELEASED' AND retired_at IS NULL;
 
 -- CP-HI-02 — #246 C3: a reservation is born RESERVED with no attempt and no refusal; every later
 -- phase is reached by an update the phase guard below admits, never written directly.
@@ -1485,8 +1491,8 @@ BEFORE INSERT ON bootstrap_applications
 WHEN EXISTS (
   SELECT 1 FROM bootstrap_applications
    WHERE run_id = NEW.run_id
-      OR (project_id = NEW.project_id AND phase <> 'RELEASED')
-      OR (repository_identity = NEW.repository_identity AND phase <> 'RELEASED')
+      OR (project_id = NEW.project_id AND phase <> 'RELEASED' AND retired_at IS NULL)
+      OR (repository_identity = NEW.repository_identity AND phase <> 'RELEASED' AND retired_at IS NULL)
 )
 BEGIN
   SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_NO_REPLACE');
@@ -1518,7 +1524,8 @@ END;
 CREATE TRIGGER IF NOT EXISTS bootstrap_applications_phase_forward
 BEFORE UPDATE ON bootstrap_applications
 WHEN NOT (
-     (OLD.phase = 'RESERVED' AND NEW.phase = 'RESERVED' AND NEW.attempts = OLD.attempts + 1)
+     (NEW.retired_at IS NOT NULL AND OLD.retired_at IS NULL AND NEW.phase = OLD.phase AND NEW.attempts = OLD.attempts)
+  OR (OLD.phase = 'RESERVED' AND NEW.phase = 'RESERVED' AND NEW.attempts = OLD.attempts + 1)
   OR (OLD.phase IN ('RESERVED','WRITTEN') AND NEW.phase = OLD.phase AND NEW.attempts = OLD.attempts)
   OR (OLD.phase = 'RESERVED' AND NEW.phase = 'WRITTEN' AND NEW.attempts = OLD.attempts AND OLD.attempts >= 1)
   OR (OLD.phase = 'RESERVED' AND NEW.phase = 'STRANDED' AND NEW.attempts = OLD.attempts
@@ -4150,3 +4157,102 @@ CREATE TABLE IF NOT EXISTS outbox_sent_destinations (
   sent_at    TEXT NOT NULL,
   PRIMARY KEY (message_id, room, recipient)
 ) WITHOUT ROWID;
+
+-- v52: one frozen allocation/confirmation per bootstrap, and per-operation recovery evidence.
+CREATE TABLE IF NOT EXISTS resident_project_provisioning (
+  run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+  project_id TEXT NOT NULL UNIQUE,
+  binding_json TEXT NOT NULL,
+  allocation_json TEXT NOT NULL,
+  confirmation_json TEXT NOT NULL,
+  steps_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','COMPLETE','RETIRING','RETIRED')),
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS canonical_session_entitlements (
+  session_uuid TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL UNIQUE REFERENCES projects(project_id),
+  buzz_actor_id TEXT NOT NULL,
+  buzz_address TEXT NOT NULL,
+  provisioning_run_id TEXT REFERENCES resident_project_provisioning(run_id),
+  revision INTEGER NOT NULL DEFAULT 1,
+  revoked_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS canonical_entitlements_active_actor
+  ON canonical_session_entitlements(buzz_actor_id) WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS project_retirements (
+  project_id TEXT PRIMARY KEY REFERENCES projects(project_id),
+  requested_at TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  completed_at TEXT
+);
+-- CP-HI-03 — the frozen allocation and confirmation retain their original identity and history.
+CREATE TRIGGER IF NOT EXISTS resident_project_provisioning_identity_immutable
+BEFORE UPDATE ON resident_project_provisioning
+WHEN NEW.run_id IS NOT OLD.run_id OR NEW.project_id IS NOT OLD.project_id
+  OR NEW.binding_json IS NOT OLD.binding_json OR NEW.confirmation_json IS NOT OLD.confirmation_json
+  OR (OLD.allocation_json <> '{}' AND NEW.allocation_json IS NOT OLD.allocation_json)
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+-- CP-HI-03 — the frozen allocation and confirmation retain their original identity and history.
+CREATE TRIGGER IF NOT EXISTS resident_project_provisioning_no_replace
+BEFORE INSERT ON resident_project_provisioning
+WHEN EXISTS (SELECT 1 FROM resident_project_provisioning WHERE run_id = NEW.run_id OR project_id = NEW.project_id)
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+-- CP-HI-03 — the frozen allocation and confirmation retain their original identity and history.
+CREATE TRIGGER IF NOT EXISTS resident_project_provisioning_no_delete
+BEFORE DELETE ON resident_project_provisioning
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+-- CP-HI-02 — entitlement identities and retirement tombstones cannot be replaced or erased.
+CREATE TRIGGER IF NOT EXISTS canonical_session_entitlements_identity_immutable
+BEFORE UPDATE ON canonical_session_entitlements
+WHEN NEW.session_uuid IS NOT OLD.session_uuid OR NEW.project_id IS NOT OLD.project_id
+ OR NEW.buzz_actor_id IS NOT OLD.buzz_actor_id OR NEW.buzz_address IS NOT OLD.buzz_address
+ OR NEW.provisioning_run_id IS NOT OLD.provisioning_run_id
+ OR OLD.revoked_at IS NOT NULL
+ OR NEW.revision <> OLD.revision + 1 OR NEW.revoked_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+-- CP-HI-02 — entitlement identities and retirement tombstones cannot be replaced or erased.
+CREATE TRIGGER IF NOT EXISTS canonical_session_entitlements_no_replace
+BEFORE INSERT ON canonical_session_entitlements
+WHEN EXISTS (SELECT 1 FROM canonical_session_entitlements WHERE session_uuid = NEW.session_uuid OR project_id = NEW.project_id OR (buzz_actor_id = NEW.buzz_actor_id AND revoked_at IS NULL AND NEW.revoked_at IS NULL))
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+-- CP-HI-02 — entitlement identities and retirement tombstones cannot be replaced or erased.
+CREATE TRIGGER IF NOT EXISTS canonical_session_entitlements_no_delete
+BEFORE DELETE ON canonical_session_entitlements
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+
+-- CP-HI-02 — a retirement preserves history and permanently suppresses old entitlement sources.
+CREATE TRIGGER IF NOT EXISTS project_retirements_identity_immutable
+BEFORE UPDATE ON project_retirements
+WHEN NEW.project_id IS NOT OLD.project_id OR NEW.requested_at IS NOT OLD.requested_at
+ OR NEW.reason IS NOT OLD.reason OR OLD.completed_at IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+-- CP-HI-02 — a retirement preserves history and permanently suppresses old entitlement sources.
+CREATE TRIGGER IF NOT EXISTS project_retirements_no_replace
+BEFORE INSERT ON project_retirements
+WHEN EXISTS (SELECT 1 FROM project_retirements WHERE project_id = NEW.project_id)
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;
+-- CP-HI-02 — a retirement preserves history and permanently suppresses old entitlement sources.
+CREATE TRIGGER IF NOT EXISTS project_retirements_no_delete
+BEFORE DELETE ON project_retirements
+BEGIN
+  SELECT RAISE(ABORT, 'BOOTSTRAP_APPLICATION_IMMUTABLE');
+END;

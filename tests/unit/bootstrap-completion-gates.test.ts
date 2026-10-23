@@ -1,3 +1,4 @@
+import { acknowledgeBootstrapHandoff } from "../helpers/bootstrap-handoff-ack.ts";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -61,7 +62,7 @@ const primaryOf = (prepared: PreparedBootstrapRun) => prepared.harness.cp.bindin
 
 /** ACK by the recipient, activate again (the WRITTEN application resumes): ready for the CONFIRM. */
 const ackAndActivate = async (prepared: PreparedBootstrapRun, handoffId: string) => {
-  expect(prepared.harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primaryOf(prepared).sessionId)).toMatchObject({ allowed: true });
+  expect((await acknowledgeBootstrapHandoff(prepared.harness, handoffId, primaryOf(prepared).sessionId))).toMatchObject({ allowed: true });
   const second = await prepared.runner.produceAndActivate(prepared.input);
   expect(second, JSON.stringify(second)).toMatchObject({ allowed: true });
   await prepared.harness.cp.continuity.evaluate("bootstrap confirmation");
@@ -382,7 +383,7 @@ describe("BCG-R1-02: the delivered head is bound to the required verification an
     expect(moved).toMatch(/^[0-9a-f]{40}$/);
     expect(moved).not.toBe(readback.initializedHead);
     expect(deliveredHandoff(prepared, handoffId).repositoryFacts).toEqual([{ identity: IDENTITY, branch: "main", head: moved }]);
-    expect(prepared.harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primaryOf(prepared).sessionId)).toMatchObject({ allowed: true });
+    expect((await acknowledgeBootstrapHandoff(prepared.harness, handoffId, primaryOf(prepared).sessionId))).toMatchObject({ allowed: true });
     const resumed = await prepared.runner.produceAndActivate(prepared.input);
     expect(resumed).toMatchObject({ allowed: false, evidence: { refusal: "WRITTEN_RESULT_UNATTRIBUTED" } });
     const refused = confirm(prepared);

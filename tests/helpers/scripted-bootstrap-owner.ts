@@ -57,7 +57,7 @@ export const SCRIPTED_CONTRACT_VALUES: Readonly<Record<string, string>> = Object
   "<owner>": "acme",
   "<name>": "widget",
   "<operation-id>": "create-repository",
-  "<public|private>": "private",
+  "<public|private>": "public",
 });
 
 export const RUN_DISPATCH_DIRECTIVE = "A RUN_DISPATCH for a run you own and have not yet submitted a PLAN for means:";
@@ -145,18 +145,19 @@ export const scriptBootstrapOwner = (
       const value = (contract["value"] ?? {}) as Record<string, unknown>;
       owner.contracts.push(value);
       const guide = value["bootstrapPlanGuide"] as
-        | { manifest: { example: unknown }; repositoryCreateOperation: { shape: unknown } }
+        | { manifest: { example: unknown }; repositoryCreateOperation: { shape: unknown }; genesisExample: unknown; githubOperationsExample: unknown }
         | undefined;
       if (guide === undefined) return null;
       const run = value["run"] as { contractDigest: string; state: string };
-      const summary = "create the private repository the contract asks for, create-only";
+      const summary = "create the public repository from the approved genesis bundle";
       const plan: Record<string, unknown> = {
         summary: revision === null ? summary : `${summary}; revised: ${revision}`,
         bootstrapOperationId: "bootstrap-widget",
         requestDigest: run.contractDigest,
         // No tool here computes a digest: name a placeholder and take the refusal's `supplied`.
         projectManifestDigest: "sha256:unknown",
-        githubOperations: [fill(guide.repositoryCreateOperation.shape)],
+        genesis: fill(guide.genesisExample),
+        githubOperations: fill(guide.githubOperationsExample),
         projectManifest: revision === null ? fill(guide.manifest.example) : revisedManifest(fill(guide.manifest.example), revision),
       };
       for (let attempt = 0; attempt < bound; attempt += 1) {

@@ -129,7 +129,9 @@ const actOnWorkTurns = (f: BootstrapRuntimeFixture, sessionId: string): void => 
           bindingGeneration: row.bindingGeneration,
         });
       }
-      await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId });
+      if (message.kind !== MessageKind.HANDOFF_PACKAGE) {
+        await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId });
+      }
     }
   };
 };
@@ -305,7 +307,8 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
                   bindingGeneration: row.bindingGeneration,
                 }))["ok"]
               : null;
-            const dispatchAck = (await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId }))["ok"];
+            const dispatchAck = message.kind === MessageKind.HANDOFF_PACKAGE ? null
+              : (await callMcpToolOverSocket(f.ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId }))["ok"];
             handled.push({ kind: message.kind, handoffAck, dispatchAck });
           }
         }
@@ -323,7 +326,7 @@ describe("#246 C4-R1 — a driven PRIMARY_CTO", () => {
       // The enqueue's own wake ran a turn of the driven session's conversation, which settled it.
       await vi.waitFor(() => expect(f.finishedTurns(binding.sessionId)).toBe(turnsBeforeHandoff + 1), { timeout: 10_000 });
       expect(cp.outbox.get(row.message_id)?.status).toBe("ACKED");
-      expect(handled).toEqual([{ kind: MessageKind.HANDOFF_PACKAGE, handoffAck: true, dispatchAck: true }]);
+      expect(handled).toEqual([{ kind: MessageKind.HANDOFF_PACKAGE, handoffAck: true, dispatchAck: null }]);
       // The turn's prompt tells a real model how a HANDOFF_PACKAGE is accepted.
       const external = cp.sessions.require(binding.sessionId).incarnation.split("#")[0];
       const handoffTurn = f.claude.turns.filter((turn) => turn.handle.externalSessionId === external).at(-1)!;
