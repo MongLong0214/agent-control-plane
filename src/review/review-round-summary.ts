@@ -7,6 +7,7 @@ import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox, OutboxMessage } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
+import { type CandidateSnapshot, candidateSnapshotDigest } from "../snapshot/candidate-snapshot.ts";
 import type { ReviewFinding, ReviewPacket } from "./blind-review.ts";
 
 /**
@@ -22,18 +23,28 @@ import type { ReviewFinding, ReviewPacket } from "./blind-review.ts";
  *   by the finding's digest. It is shown beside the finding and changes no verdict, outcome or
  *   readiness field: a new candidate still has to pass verification and a fresh review.
  *
- * A round is one candidate freeze (`CANDIDATE_FROZEN`) and what the trail records after it until
- * the next freeze. Submissions are serialised per run by the durable attempt lease, so a freeze
- * starts each attempt that reached one; a lease reclaimed while its holder still runs can interleave
- * two attempts, whose rows are then placed by freeze order. A chunked review is one review: its chunk
- * reviewers and the final reviewer are counted as reviewer invocations of that one round. An outcome
- * row repeated inside one round is counted once. A row whose evidence the audit refused names no
- * candidate and is not placed in any round.
+ * A round is one candidate freeze (`CANDIDATE_FROZEN`): one submission attempt that reached a freeze.
+ * A record is placed on the attempt that wrote it, not on the freeze window it happens to fall in:
+ * - A review record names its reviewer session (the completion row's session, the stored review's
+ *   `reviewerSessionId`, the delivered packet's), and the reviewer's binding row places that session
+ *   on the attempt that constituted it. A replayed row therefore lands on its own round, whatever
+ *   window it falls in, and is counted there once.
+ * - A record with no such identity (an unavailable review, a verification return, the move to CEO
+ *   review) belongs to the window's own attempt, since the durable lease serialises submissions;
+ *   only an attempt whose lease was reclaimed (`CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED`) can still
+ *   write after the next freeze. Where such an attempt is open, a record goes to the one attempt
+ *   that can still take it (each attempt has at most one review outcome, one return and one move to
+ *   CEO review); when more than one could, it is listed in `unattributedEvents` with the rounds it
+ *   could belong to, and placed on none.
+ * A chunked review is one review: its chunk reviewers and the final reviewer are reviewer
+ * invocations of one round. A row whose evidence the audit refused names no candidate and is not
+ * placed on any round.
  */
 
 /**
  * Audit kinds that record an owner, CEO or escalation step: someone outside the CTO–reviewer loop
- * acting on the run. They are listed against the round they precede.
+ * acting on the run. Each is shown on the round whose candidate was the latest frozen when it
+ * happened, at once — it does not wait for, or make, another round.
  */
 export const REVIEW_ROUND_INTERVENTION_KINDS: readonly string[] = Object.freeze([
   "OWNER_DECISION",
@@ -49,8 +60,15 @@ export const REVIEW_ROUND_INTERVENTION_KINDS: readonly string[] = Object.freeze(
 /** How a round's candidate relates to the round before it. */
 export type ReviewRoundEntry =
   | "FIRST_SUBMISSION"
-  /** A different candidate digest than the previous round: the source changed. */
+  /** A new candidate whose stored content evidence (trees and diffs, planned outputs, manifest) differs. */
   | "SOURCE_CHANGE"
+  /**
+   * A new candidate digest with the same content evidence: an empty commit, a moved lineage, or a PLAN
+   * whose text alone changed. It is still a new candidate, and still needs its own review.
+   */
+  | "CANDIDATE_IDENTITY_CHANGE"
+  /** A new candidate digest, but a snapshot to compare its content with is not stored. */
+  | "NEW_CANDIDATE_CONTENT_UNRECORDED"
   /** The same candidate again after it was judged (returned or passed): nothing was changed. */
   | "SAME_CANDIDATE_RESUBMISSION"
   /** The same candidate again after nothing judged it (review unavailable, or no outcome recorded). */
@@ -121,20 +139,32 @@ export interface ReviewRound {
   round: number;
   frozenEventId: number;
   candidateSnapshotDigest: string | null;
+  /** Digest of the candidate's content evidence, from its stored snapshot; null when none is stored. */
+  contentDigest: string | null;
   entry: ReviewRoundEntry;
-  /** Owner, CEO or escalation facts after the previous freeze and before this one. */
+  /** Owner, CEO or escalation facts after this freeze and before the next one, shown at once. */
   interventions: Array<{ eventId: number; kind: string }>;
   outcome: ReviewRoundOutcome;
   reasonCode: string | null;
-  /** The submission attempt this round belongs to, when a record names it. */
+  /** The submission attempt this round belongs to, when the records name exactly one. */
   attemptId: string | null;
+  /** The attempt's lease was reclaimed while it ran: it may have written after the next freeze. */
+  attemptReclaimed: boolean;
   review: ReviewRoundReview | null;
   deliveries: ReviewRoundDelivery[];
-  /** The run moved to READY_FOR_CEO_REVIEW for this candidate within this round. */
+  /** This attempt moved the run to READY_FOR_CEO_REVIEW. Never true unless its review passed. */
   readyForCeo: boolean;
   /** The first later round with a different candidate digest. */
   nextNewCandidate: { round: number; candidateSnapshotDigest: string } | null;
   duplicateEventsIgnored: number;
+}
+
+/** A record this projection could not place on exactly one round. */
+export interface UnattributedReviewEvent {
+  eventId: number;
+  kind: string;
+  /** The rounds it could belong to: two or more when ambiguous, none when no round can take it. */
+  candidateRounds: number[];
 }
 
 export interface ReviewRoundSummary {
@@ -145,6 +175,10 @@ export interface ReviewRoundSummary {
   /** The run's submission lease: the latest attempt only, which is all the lease row keeps. */
   latestAttempt: { attemptId: string; state: string; candidateDigest: string | null; startedAt: string; releasedAt: string | null } | null;
   rounds: ReviewRound[];
+  /** Interventions recorded before the run's first freeze. */
+  interventionsBeforeFirstRound: Array<{ eventId: number; kind: string }>;
+  /** Records placed on no round, with the rounds each could belong to. Never guessed onto one. */
+  unattributedEvents: UnattributedReviewEvent[];
   /** The first round whose review returned findings, preserved whatever later rounds did. */
   firstFindings: { round: number; findings: ReviewRoundFinding[] } | null;
   /** Dispositions whose digest names no finding of this run. */
@@ -157,10 +191,12 @@ export interface ReviewRoundSummary {
     verificationReturns: number;
     reviewUnavailable: number;
     sourceChanges: number;
+    candidateIdentityChanges: number;
     sameCandidateResubmissions: number;
     infrastructureRetries: number;
     roundsWithIntervention: number;
     duplicateEventsIgnored: number;
+    unattributedEvents: number;
   };
 }
 
@@ -227,13 +263,6 @@ const text = (value: unknown): string | null => (typeof value === "string" ? val
 const record = (value: unknown): Record<string, unknown> | null =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 
-/** One round's rows of one kind, a repeated row (same `key`) counted once. */
-const distinctRows = (rows: readonly AuditRow[], key: (row: AuditRow) => string): { rows: AuditRow[]; duplicates: number } => {
-  const seen = new Map<string, AuditRow>();
-  for (const row of rows) if (!seen.has(key(row))) seen.set(key(row), row);
-  return { rows: [...seen.values()], duplicates: rows.length - seen.size };
-};
-
 const attemptOfKey = (idempotencyKey: string): string | null => {
   const last = idempotencyKey.slice(idempotencyKey.lastIndexOf(":") + 1);
   return last.startsWith("attempt_") ? last : null;
@@ -241,6 +270,64 @@ const attemptOfKey = (idempotencyKey: string): string | null => {
 
 const reviewKindOf = (packet: ReviewPacket): ReviewRoundReview["reviewKind"] =>
   packet.bootstrapPlan ? "BOOTSTRAP_PLAN" : packet.contractChange ? "CONTRACT_CHANGE" : "CANDIDATE";
+
+/**
+ * What a candidate's content is, apart from its identity: each repository's tree and diff, a
+ * bootstrap PLAN's planned outputs and the manifest it plans, a contract change's manifests and
+ * workflow revisions. Heads, lineage, the PLAN's own text and the task contract are identity only.
+ */
+const contentDigestOf = (snapshot: CandidateSnapshot): string =>
+  digestOf({
+    repositories: snapshot.repositories
+      .map((repository) => ({ identity: repository.identity, treeDigest: repository.treeDigest, diffDigest: repository.diffDigest }))
+      .sort((a, b) => (a.identity < b.identity ? -1 : a.identity > b.identity ? 1 : 0)),
+    bootstrapPlan: snapshot.bootstrapPlan
+      ? { plannedOutputsDigest: snapshot.bootstrapPlan.plannedOutputsDigest, projectManifestDigest: snapshot.bootstrapPlan.projectManifestDigest }
+      : null,
+    contractChange: snapshot.contractChange
+      ? {
+          manifestDigest: snapshot.contractChange.manifestDigest,
+          baseManifestDigest: snapshot.contractChange.baseManifestDigest,
+          workflowRevisionsDigest: "workflowRevisionsDigest" in snapshot.contractChange ? snapshot.contractChange.workflowRevisionsDigest : null,
+        }
+      : null,
+  });
+
+/** The role key prefix of a run's blind-reviewer bindings (`roleKeyFor(BLIND_REVIEWER, { runId })`). */
+const REVIEWER_ROLE_PREFIX = "BLIND_REVIEWER:";
+/** A review constitutes exactly one of these per attempt: its single reviewer, or its final one. */
+const TERMINAL_PURPOSES = new Set(["blind-review", "blind-review-final"]);
+
+interface RoundState {
+  index: number;
+  freeze: AuditRow;
+  digest: string | null;
+  reclaimed: boolean;
+  attemptIds: Set<string>;
+  bindings: Array<{ sessionId: string; purpose: string | null }>;
+  completed: AuditRow[];
+  unavailable: AuditRow[];
+  returned: AuditRow[];
+  ready: AuditRow[];
+  keys: Set<string>;
+  duplicates: number;
+  interventions: Array<{ eventId: number; kind: string }>;
+}
+
+type Slot = "completed" | "unavailable" | "returned" | "ready";
+
+/** What makes two rows the same record: a replay repeats every one of these. */
+const keyOf = (row: AuditRow): string =>
+  [
+    row.kind,
+    row.sessionId ?? "",
+    row.reasonCode ?? "",
+    text(row.evidence["candidateSnapshotDigest"]) ?? "",
+    String(row.evidence["verdict"] ?? ""),
+    String(row.evidence["stage"] ?? ""),
+    String(row.evidence["reviewArtifactDigest"] ?? row.evidence["reportDigest"] ?? ""),
+    String(row.evidence["to"] ?? ""),
+  ].join("|");
 
 export const summarizeReviewRounds = (
   sources: ReviewRoundSources,
@@ -255,6 +342,167 @@ export const summarizeReviewRounds = (
   const revisionMessages = sources.outbox.filter((message) => message.kind === MessageKind.REVISION_REQUEST);
   const dispositions = options.dispositions ?? [];
   const linked = new Set<string>();
+  const unattributed: UnattributedReviewEvent[] = [];
+  const interventionsBeforeFirstRound: Array<{ eventId: number; kind: string }> = [];
+
+  const states: RoundState[] = freezes.map((freeze, index) => ({
+    index,
+    freeze,
+    digest: text(freeze.evidence["candidateSnapshotDigest"]),
+    reclaimed: false,
+    attemptIds: new Set<string>(),
+    bindings: [],
+    completed: [],
+    unavailable: [],
+    returned: [],
+    ready: [],
+    keys: new Set<string>(),
+    duplicates: 0,
+    interventions: [],
+  }));
+
+  /** The round whose freeze is the latest before `eventId`, or -1 before the first freeze. */
+  const windowOf = (eventId: number): number => {
+    let found = -1;
+    for (const state of states) if (state.freeze.eventId < eventId) found = state.index;
+    return found;
+  };
+  /** The window's own round, then every earlier round whose attempt was reclaimed; for `digest` when given. */
+  const roundsThatCouldWrite = (eventId: number, digest: string | null): RoundState[] => {
+    const window = windowOf(eventId);
+    if (window < 0) return [];
+    return states.filter(
+      (state) =>
+        (state.index === window || (state.index < window && state.reclaimed)) && (digest === null || state.digest === digest),
+    );
+  };
+  const place = (state: RoundState, slot: Slot, row: AuditRow): void => {
+    const key = keyOf(row);
+    if (state.keys.has(key)) {
+      state.duplicates += 1;
+      return;
+    }
+    state.keys.add(key);
+    state[slot].push(row);
+  };
+
+  // An attempt reclaimed while it ran, by the lease's own record: it started no later than its freeze.
+  for (const row of audit.filter((entry) => entry.kind === "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED")) {
+    const window = windowOf(row.eventId);
+    const startedAt = text(row.evidence["startedAt"]);
+    const attemptId = text(row.evidence["attemptId"]);
+    const state = states[window];
+    if (state === undefined || startedAt === null || startedAt > state.freeze.at) continue;
+    state.reclaimed = true;
+    const previous = states[window - 1];
+    if (attemptId !== null && (previous === undefined || startedAt > previous.freeze.at)) state.attemptIds.add(attemptId);
+  }
+
+  // Each reviewer session, on the attempt that constituted it. A review constitutes one terminal
+  // reviewer ("blind-review", or "blind-review-final" after its chunks), so an attempt that already
+  // has a reviewer cannot be the one constituting a later single review's reviewer.
+  const sessionRounds = new Map<string, number[]>();
+  for (const row of audit) {
+    if ((row.kind !== "BINDING_CREATED" && row.kind !== "BINDING_SWITCHED") || !row.roleKey?.startsWith(REVIEWER_ROLE_PREFIX) || !row.sessionId) {
+      continue;
+    }
+    const reason = text(row.evidence["reason"]);
+    const purpose = row.kind === "BINDING_SWITCHED" && reason?.startsWith("constituting ") ? reason.slice("constituting ".length) : null;
+    const candidates = roundsThatCouldWrite(row.eventId, null).filter((state) =>
+      purpose === "blind-review"
+        ? state.bindings.length === 0
+        : !state.bindings.some((binding) => binding.purpose !== null && TERMINAL_PURPOSES.has(binding.purpose)),
+    );
+    sessionRounds.set(row.sessionId, candidates.map((state) => state.index));
+    if (candidates.length === 1) candidates[0]!.bindings.push({ sessionId: row.sessionId, purpose });
+  }
+
+  const reviewSessionOf = (row: AuditRow): string | null => {
+    if (row.kind === "BLIND_REVIEW_COMPLETED") return row.sessionId;
+    const named = text(row.evidence["reviewArtifactDigest"]);
+    return named === null ? null : (reviewArtifacts.find((artifact) => artifact.digest === named)?.content.reviewerSessionId ?? null);
+  };
+  const slotOf = (row: AuditRow): Slot =>
+    row.kind === "BLIND_REVIEW_COMPLETED" ? "completed" : row.kind === "BLIND_REVIEW_UNAVAILABLE" ? "unavailable" : "returned";
+  /** Whether a round can still take a record of this slot: one review outcome and one return per attempt. */
+  const open = (state: RoundState, slot: Slot): boolean =>
+    slot === "returned" ? state.returned.length === 0 : state.completed.length === 0 && state.unavailable.length === 0;
+
+  // Records that name their reviewer go where that reviewer was constituted.
+  const pending: AuditRow[] = [];
+  for (const row of audit) {
+    if (row.kind !== "BLIND_REVIEW_COMPLETED" && row.kind !== "BLIND_REVIEW_UNAVAILABLE" && row.kind !== "REVISION_RETURNED_TO_CTO") continue;
+    const digest = text(row.evidence["candidateSnapshotDigest"]);
+    if (digest === null) continue;
+    const session = row.kind === "BLIND_REVIEW_UNAVAILABLE" || row.evidence["stage"] === "verification" ? null : reviewSessionOf(row);
+    const rounds = session === null ? undefined : sessionRounds.get(session);
+    if (rounds === undefined) {
+      pending.push(row);
+      continue;
+    }
+    const matching = rounds.filter((index) => states[index]!.digest === digest);
+    if (matching.length === 1) place(states[matching[0]!]!, slotOf(row), row);
+    else unattributed.push({ eventId: row.eventId, kind: row.kind, candidateRounds: matching.map((index) => index + 1) });
+  }
+
+  // The rest go to the one attempt that could still have written them, or to none.
+  let progressed = true;
+  while (progressed && pending.length > 0) {
+    progressed = false;
+    for (const row of [...pending]) {
+      const slot = slotOf(row);
+      const candidates = roundsThatCouldWrite(row.eventId, text(row.evidence["candidateSnapshotDigest"]));
+      const free = candidates.filter((state) => open(state, slot));
+      if (free.length > 1) continue;
+      const repeats = candidates.filter((state) => state.keys.has(keyOf(row)));
+      const target = free.length === 1 ? free[0] : repeats.length === 1 ? repeats[0] : undefined;
+      if (target !== undefined) place(target, slot, row);
+      else unattributed.push({ eventId: row.eventId, kind: row.kind, candidateRounds: repeats.map((state) => state.index + 1) });
+      pending.splice(pending.indexOf(row), 1);
+      progressed = true;
+    }
+  }
+  for (const row of pending) {
+    const candidates = roundsThatCouldWrite(row.eventId, text(row.evidence["candidateSnapshotDigest"]));
+    unattributed.push({
+      eventId: row.eventId,
+      kind: row.kind,
+      candidateRounds: candidates.filter((state) => open(state, slotOf(row))).map((state) => state.index + 1),
+    });
+  }
+
+  // The move to CEO review belongs to the attempt whose review passed, never to an unavailable one.
+  const verdictOf = (state: RoundState): string | null => text(state.completed.at(-1)?.evidence["verdict"]);
+  for (const row of audit) {
+    if (row.kind !== "RUN_TRANSITION" || row.evidence["to"] !== RunState.READY_FOR_CEO_REVIEW) continue;
+    const candidates = roundsThatCouldWrite(row.eventId, text(row.evidence["candidateSnapshotDigest"])).filter(
+      (state) => state.unavailable.length === 0 && state.returned.length === 0,
+    );
+    const passed = candidates.filter((state) => verdictOf(state) === "PASS");
+    const unreviewed = candidates.filter((state) => state.completed.length === 0);
+    const target = passed.length === 1 ? passed[0] : passed.length === 0 && unreviewed.length === 1 ? unreviewed[0] : undefined;
+    if (target !== undefined) place(target, "ready", row);
+    else unattributed.push({ eventId: row.eventId, kind: row.kind, candidateRounds: [...passed, ...unreviewed].map((state) => state.index + 1) });
+  }
+
+  // Interventions are run facts: shown on the latest frozen candidate at once.
+  for (const row of audit) {
+    if (!REVIEW_ROUND_INTERVENTION_KINDS.includes(row.kind)) continue;
+    const window = windowOf(row.eventId);
+    (window < 0 ? interventionsBeforeFirstRound : states[window]!.interventions).push({ eventId: row.eventId, kind: row.kind });
+  }
+
+  // Content evidence by candidate, from snapshots whose own content proves the digest they are stored under.
+  const contentByCandidate = new Map<string, string>();
+  for (const artifact of sources.artifacts) {
+    if (artifact.kind !== ArtifactKind.CANDIDATE_SNAPSHOT || artifact.candidateSnapshotDigest === null) continue;
+    const content = record(artifact.content);
+    if (content === null || !Array.isArray(content["repositories"])) continue;
+    const snapshot = content as unknown as CandidateSnapshot;
+    if (candidateSnapshotDigest(snapshot) === artifact.candidateSnapshotDigest) {
+      contentByCandidate.set(artifact.candidateSnapshotDigest, contentDigestOf(snapshot));
+    }
+  }
 
   const findingsOf = (packet: ReviewPacket): ReviewRoundFinding[] =>
     (Array.isArray(packet.findings) ? packet.findings : []).map((finding) => {
@@ -290,36 +538,10 @@ export const summarizeReviewRounds = (
     };
   };
 
-  const rounds: ReviewRound[] = freezes.map((freeze, index) => {
-    const next = freezes[index + 1];
-    const previous = freezes[index - 1];
-    const digest = text(freeze.evidence["candidateSnapshotDigest"]);
-    const window = audit.filter((row) => row.eventId > freeze.eventId && (next === undefined || row.eventId < next.eventId));
-    const forCandidate = (row: AuditRow): boolean => text(row.evidence["candidateSnapshotDigest"]) === digest;
-
-    const completed = distinctRows(
-      window.filter((row) => row.kind === "BLIND_REVIEW_COMPLETED" && forCandidate(row)),
-      (row) => `${row.sessionId ?? ""}|${String(row.evidence["verdict"])}`,
-    );
-    const unavailable = distinctRows(
-      window.filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE" && forCandidate(row)),
-      (row) => row.reasonCode ?? "",
-    );
-    const returned = distinctRows(
-      window.filter((row) => row.kind === "REVISION_RETURNED_TO_CTO" && forCandidate(row)),
-      (row) => [
-        String(row.evidence["stage"]),
-        row.reasonCode ?? "",
-        String(row.evidence["reviewArtifactDigest"] ?? row.evidence["reportDigest"] ?? ""),
-      ].join("|"),
-    );
-    const readyForCeo = window.some(
-      (row) => row.kind === "RUN_TRANSITION" && row.evidence["to"] === RunState.READY_FOR_CEO_REVIEW && forCandidate(row),
-    );
-
-    // The review of this round: the artifact a return names, else the one its reviewer session wrote.
-    const lastReturn = returned.rows.at(-1);
-    const lastCompleted = completed.rows.at(-1);
+  const rounds: ReviewRound[] = states.map((state) => {
+    const digest = state.digest;
+    const lastReturn = state.returned.at(-1);
+    const lastCompleted = state.completed.at(-1);
     const namedDigest = text(lastReturn?.evidence["reviewArtifactDigest"]);
     const artifact =
       (namedDigest === null ? undefined : reviewArtifacts.find((entry) => entry.digest === namedDigest)) ??
@@ -350,9 +572,9 @@ export const summarizeReviewRounds = (
     if (lastReturn) {
       outcome = lastReturn.evidence["stage"] === "verification" ? "VERIFICATION_RETURNED" : "REVISION_RETURNED";
       reasonCode = lastReturn.reasonCode;
-    } else if (unavailable.rows.length > 0) {
+    } else if (state.unavailable.length > 0) {
       outcome = "REVIEW_UNAVAILABLE";
-      reasonCode = unavailable.rows.at(-1)!.reasonCode;
+      reasonCode = state.unavailable.at(-1)!.reasonCode;
     } else if (review?.verdict === "PASS") {
       outcome = "REVIEW_PASSED";
       reasonCode = lastCompleted?.reasonCode ?? null;
@@ -373,35 +595,28 @@ export const summarizeReviewRounds = (
           })
           .map(toDelivery)
       : [];
-
+    for (const delivery of deliveries) if (delivery.attemptId !== null) state.attemptIds.add(delivery.attemptId);
     const lease = sources.latestAttempt;
-    const attemptId =
-      deliveries.find((delivery) => delivery.attemptId !== null)?.attemptId ??
-      (next === undefined && lease !== null && digest !== null && lease.candidateDigest === digest ? lease.attemptId : null);
-
-    const interventions = audit
-      .filter(
-        (row) =>
-          row.eventId < freeze.eventId &&
-          (previous === undefined || row.eventId > previous.eventId) &&
-          REVIEW_ROUND_INTERVENTION_KINDS.includes(row.kind),
-      )
-      .map((row) => ({ eventId: row.eventId, kind: row.kind }));
+    if (state.index === states.length - 1 && lease !== null && digest !== null && lease.candidateDigest === digest) {
+      state.attemptIds.add(lease.attemptId);
+    }
 
     return {
-      round: index + 1,
-      frozenEventId: freeze.eventId,
+      round: state.index + 1,
+      frozenEventId: state.freeze.eventId,
       candidateSnapshotDigest: digest,
+      contentDigest: digest === null ? null : (contentByCandidate.get(digest) ?? null),
       entry: "FIRST_SUBMISSION",
-      interventions,
+      interventions: state.interventions,
       outcome,
       reasonCode,
-      attemptId,
+      attemptId: state.attemptIds.size === 1 ? [...state.attemptIds][0]! : null,
+      attemptReclaimed: state.reclaimed,
       review,
       deliveries,
-      readyForCeo,
+      readyForCeo: state.ready.length > 0 && outcome !== "REVIEW_UNAVAILABLE" && (review === null || review.verdict === "PASS"),
       nextNewCandidate: null,
-      duplicateEventsIgnored: completed.duplicates + unavailable.duplicates + returned.duplicates,
+      duplicateEventsIgnored: state.duplicates,
     };
   });
 
@@ -412,7 +627,11 @@ export const summarizeReviewRounds = (
         round.candidateSnapshotDigest === null || previous.candidateSnapshotDigest === null
           ? "CANDIDATE_UNRECORDED"
           : round.candidateSnapshotDigest !== previous.candidateSnapshotDigest
-            ? "SOURCE_CHANGE"
+            ? round.contentDigest === null || previous.contentDigest === null
+              ? "NEW_CANDIDATE_CONTENT_UNRECORDED"
+              : round.contentDigest !== previous.contentDigest
+                ? "SOURCE_CHANGE"
+                : "CANDIDATE_IDENTITY_CHANGE"
             : previous.outcome === "REVIEW_UNAVAILABLE" || previous.outcome === "NO_OUTCOME_RECORDED"
               ? "INFRASTRUCTURE_RETRY"
               : "SAME_CANDIDATE_RESUBMISSION";
@@ -425,6 +644,7 @@ export const summarizeReviewRounds = (
 
   const first = rounds.find((round) => (round.review?.findings.length ?? 0) > 0);
   const count = (predicate: (round: ReviewRound) => boolean): number => rounds.filter(predicate).length;
+  unattributed.sort((a, b) => a.eventId - b.eventId);
   return {
     runId: sources.runId,
     runState: sources.runState,
@@ -432,6 +652,8 @@ export const summarizeReviewRounds = (
     ownerBinding: sources.ownerBinding,
     latestAttempt: sources.latestAttempt,
     rounds,
+    interventionsBeforeFirstRound,
+    unattributedEvents: unattributed,
     firstFindings: first ? { round: first.round, findings: first.review!.findings } : null,
     unlinkedDispositions: dispositions.filter((entry) => !linked.has(entry.findingDigest)).map((entry) => ({ ...entry })),
     totals: {
@@ -442,10 +664,12 @@ export const summarizeReviewRounds = (
       verificationReturns: count((round) => round.outcome === "VERIFICATION_RETURNED"),
       reviewUnavailable: count((round) => round.outcome === "REVIEW_UNAVAILABLE"),
       sourceChanges: count((round) => round.entry === "SOURCE_CHANGE"),
+      candidateIdentityChanges: count((round) => round.entry === "CANDIDATE_IDENTITY_CHANGE"),
       sameCandidateResubmissions: count((round) => round.entry === "SAME_CANDIDATE_RESUBMISSION"),
       infrastructureRetries: count((round) => round.entry === "INFRASTRUCTURE_RETRY"),
       roundsWithIntervention: count((round) => round.interventions.length > 0),
       duplicateEventsIgnored: rounds.reduce((sum, round) => sum + round.duplicateEventsIgnored, 0),
+      unattributedEvents: unattributed.length,
     },
   };
 };

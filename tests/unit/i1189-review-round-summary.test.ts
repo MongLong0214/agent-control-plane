@@ -283,7 +283,7 @@ describe("#1189 §2.C: a run's review rounds, from existing records", () => {
     });
   });
 
-  it("lists an escalation before the round it preceded", async () => {
+  it("shows an escalation on the round it followed, before any next candidate, and keeps it there", async () => {
     const harness = makeHarness();
     const { runId, run, submit, covered } = await startRun(harness);
     harness.scripted.script({ match: /Candidate review/, text: reviewerRevise(covered, "a finding") });
@@ -299,17 +299,21 @@ describe("#1189 §2.C: a run's review rounds, from existing records", () => {
       openedAt: harness.clock.nowIso(),
     });
     expect(escalated.allowed, JSON.stringify(escalated)).toBe(true);
+    // Visible at once, on the candidate it was about, with no new round.
+    const waiting = summaryOf(harness, runId);
+    expect(waiting.rounds.map((round) => round.interventions.map((entry) => entry.kind))).toEqual([["CTO_ESCALATION"]]);
+    expect(waiting.totals).toMatchObject({ rounds: 1, roundsWithIntervention: 1 });
     commitFix(harness, "fix after the escalation");
     harness.scripted.script({ match: /Candidate review/, text: reviewerPass(covered) });
     expect(stageOf(await submit())).toBe("COMPLETED_REVIEW");
 
     const summary = summaryOf(harness, runId);
-    expect(summary.rounds.map((round) => round.interventions.map((entry) => entry.kind))).toEqual([[], ["CTO_ESCALATION"]]);
+    expect(summary.rounds.map((round) => round.interventions.map((entry) => entry.kind))).toEqual([["CTO_ESCALATION"], []]);
     expect(summary.rounds[1]!.entry).toBe("SOURCE_CHANGE");
     expect(summary.totals.roundsWithIntervention).toBe(1);
   });
 
-  it("a CEO's FINAL_REVISE is an intervention, and the new PLAN candidate is reviewed afresh", async () => {
+  it("a CEO's FINAL_REVISE is an intervention, and a PLAN whose text alone changed is a new candidate but not a source change", async () => {
     const harness = makeHarness();
     bindCeo(harness);
     const created = harness.cp.runs.create({
@@ -324,11 +328,16 @@ describe("#1189 §2.C: a run's review rounds, from existing records", () => {
     await replanBootstrap(harness, runId, first, bootstrapPlan(cleanTreeManifest("i1189-round"), { summary: "a revised plan" }));
 
     const summary = summaryOf(harness, runId);
+    // The replanned PLAN changes only its summary text: same planned outputs, same manifest.
     expect(summary.rounds.map((round) => [round.entry, round.outcome, round.readyForCeo])).toEqual([
       ["FIRST_SUBMISSION", "REVIEW_PASSED", true],
-      ["SOURCE_CHANGE", "REVIEW_PASSED", true],
+      ["CANDIDATE_IDENTITY_CHANGE", "REVIEW_PASSED", true],
     ]);
-    expect(summary.rounds[1]!.interventions.map((entry) => entry.kind)).toContain("CEO_DECISION");
+    expect(summary.rounds[1]!.candidateSnapshotDigest).not.toBe(summary.rounds[0]!.candidateSnapshotDigest);
+    expect(summary.rounds[1]!.contentDigest).toBe(summary.rounds[0]!.contentDigest);
+    expect(summary.rounds[0]!.nextNewCandidate?.round).toBe(2);
+    expect(summary.totals).toMatchObject({ sourceChanges: 0, candidateIdentityChanges: 1 });
+    expect(summary.rounds[0]!.interventions.map((entry) => entry.kind)).toContain("CEO_DECISION");
     expect(summary.rounds.map((round) => round.review?.reviewKind)).toEqual(["BOOTSTRAP_PLAN", "BOOTSTRAP_PLAN"]);
     expect(summary.rounds[0]!.review!.reviewerSessionId).not.toBe(summary.rounds[1]!.review!.reviewerSessionId);
     expect(harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
