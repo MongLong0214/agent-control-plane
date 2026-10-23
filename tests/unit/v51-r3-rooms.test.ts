@@ -21,14 +21,13 @@ import { makeHarness } from "../helpers/harness.ts";
 afterAll(cleanupTempDirs);
 
 /**
- * ACP-R1-04, review round 3, within CEO decision 9b15c462 and, since the focused review, CEO decision
- * f42efb13 — v51's room-membership backfill reads only provable history: binding rows, runtime-move
- * audits and the audit trail of session addresses (BUZZ_CONNECTED, CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED,
- * and SESSION_BUZZ_ADDRESS_CHANGED, which every address change writes from v51 on). An audited history
- * migrates exactly; a creation address or a current address proves nothing, so a role whose current
- * room no audit proves is known there only since the migration (no longer a refusal: the role's rows
- * are kept and its earlier mail there is refused and recorded; see v51-r4-rooms). Built on the
- * round-3 review's released-v50-image probes.
+ * ACP-R1-04, review round 3, within CEO decision 9b15c462 and, since the focused reviews, CEO
+ * decisions f42efb13 and 1fd967e8 — v51 infers no room history: a creation address, a current address
+ * and address audits prove nothing about the past. A role is known in its current room only since its
+ * current binding's anchor: the latest of the binding's creation, a runtime move onto its runtime, and
+ * that runtime session's last address write (every v50 and v51 address writer stamps `updated_at` in
+ * the same statement). Earlier mail there is refused and recorded (see v51-r4-rooms, v51-r5-history).
+ * Built on the round-3 review's released-v50-image probes.
  */
 
 const SECRET = "v51-r1-room-history-secret";
@@ -110,19 +109,14 @@ const v50Image = (f: ReturnType<typeof start>, prefix: string, outOfBand?: (raw:
   return path;
 };
 
-/**
- * The full runner on the image: approved and opened, with the wall-clock window it migrated in (a room
- * known only since the migration is joined inside that window).
- */
+/** The full runner on the image: approved and opened, and the memberships it wrote. */
 const migratedByTheRunner = (path: string) => {
   approveMigration(path, "v51-r3 room history");
-  const before = new Date().toISOString();
   const db = new Db(path);
-  const after = new Date().toISOString();
   try {
     const rows = db.all<{ role_key: string; conversation: string; joined_at: string }>(
       "SELECT role_key, conversation, joined_at FROM role_room_memberships ORDER BY role_key, joined_at");
-    return { rows, during: (at: string) => at >= before && at <= after };
+    return { rows };
   } finally { db.close(); }
 };
 
@@ -148,12 +142,9 @@ it("R3 migration probe: a v50-image address change does not backdate B membershi
     const changedAt = f.h.clock.nowIso();
     f.h.cp.sessions.setBuzzAddress(f.holder().targetSessionId, ROOM_B);
     const path = v50Image(f, "acp-r3-v50-room-");
-    // A's creation address proves nothing; the audited change proves A and B at its own instant.
+    // No history is inferred (CEO 1fd967e8): the role is known in B since the address was written there.
     expect(boundAt < changedAt).toBe(true);
-    expect(membershipsOf(path)).toEqual([
-      { role_key: f.roleKey, conversation: ROOM_A, joined_at: changedAt },
-      { role_key: f.roleKey, conversation: ROOM_B, joined_at: changedAt },
-    ]);
+    expect(membershipsOf(path)).toEqual([{ role_key: f.roleKey, conversation: ROOM_B, joined_at: changedAt }]);
     // The migration's own output, installed into the live ingress, refuses B's pre-join broadcast and
     // admits B work after the join.
     f.h.cp.db.run("UPDATE role_room_memberships SET joined_at = ? WHERE role_key = ? AND conversation = ?", [changedAt, f.roleKey, ROOM_B]);
@@ -163,7 +154,7 @@ it("R3 migration probe: a v50-image address change does not backdate B membershi
   } finally { f.h.cp.close(); }
 });
 
-it("R3 migration probe: an in-place address change without an audit trail is not carried forward; the room is known only since the migration", () => {
+it("R3 migration probe: an in-place address change without an audit trail is never backdated; the room is known since that write", () => {
   const f = start();
   try {
     // The runtime's room A is on record (an audited address assignment) before the role is moved onto it.
@@ -172,27 +163,24 @@ it("R3 migration probe: an in-place address change without an audit trail is not
     expect(f.h.cp.sessions.transition(runtime.sessionId, SessionLifecycle.READY, "test").allowed).toBe(true);
     f.h.cp.sessions.setBuzzAddress(runtime.sessionId, ROOM_A);
     f.moveToSession(runtime.sessionId, runtime.sessionSecret!);
-    // Then its room changes behind the audit's back, as no v50 code path does.
+    // Then its room changes with no audit, through v50's own setter statement.
+    f.h.clock.advance(5000);
+    const writtenAt = f.h.clock.nowIso();
     const path = v50Image(f, "acp-r3-v50-unaudited-", (raw) => {
-      raw.prepare("UPDATE sessions SET buzz_address = ? WHERE session_id = ?").run(ROOM_B, runtime.sessionId);
+      raw.prepare("UPDATE sessions SET buzz_address = ?, updated_at = ? WHERE session_id = ?").run(ROOM_B, writtenAt, runtime.sessionId);
     });
     const raw = new Database(path, { readonly: true });
     try {
       const judged = roleRoomMembershipEvidence(raw);
       expect(judged.refusals).toEqual([]);
-      expect(judged.memberships.filter((row) => row.roleKey === f.roleKey)).toEqual([]);
-      expect(judged.knownSinceMigration).toEqual([{ roleKey: f.roleKey, room: ROOM_B, sessionId: runtime.sessionId }]);
-      expect(judged.evidence[f.roleKey]).toEqual(expect.arrayContaining([
-        expect.stringContaining(`its audit trail does not account for its address ${ROOM_B}`),
-      ]));
+      expect(judged.anchored).toEqual([expect.objectContaining({ roleKey: f.roleKey, room: ROOM_B, sessionId: runtime.sessionId,
+        sessionUpdatedAt: writtenAt, knownSince: writtenAt })]);
     } finally { raw.close(); }
-    const { rows, during } = migratedByTheRunner(path);
-    expect(rows).toEqual([{ role_key: f.roleKey, conversation: ROOM_B, joined_at: expect.any(String) }]);
-    expect(during(rows[0]!.joined_at)).toBe(true);
+    expect(migratedByTheRunner(path).rows).toEqual([{ role_key: f.roleKey, conversation: ROOM_B, joined_at: writtenAt }]);
   } finally { f.h.cp.close(); }
 });
 
-it("R3 migration probe: same-generation runtime moves across rooms with no address trail prove no room; the current one is known only since the migration", () => {
+it("R3 migration probe: same-generation runtime moves across rooms prove no history; the current room is known since the move onto its runtime", () => {
   const f = start();
   try {
     const runtimeKey = { pubkey: f.h.cp.sessions.require(f.holder().targetSessionId).buzzActorId! } as ChannelKey;
@@ -206,23 +194,28 @@ it("R3 migration probe: same-generation runtime moves across rooms with no addre
     moveRuntime();
     f.h.clock.advance(1000);
     moveRuntime();
+    const movedAt = f.h.clock.nowIso();
     const path = v50Image(f, "acp-r3-v50-runtime-room-");
-    const { rows, during } = migratedByTheRunner(path);
-    expect(rows).toEqual([{ role_key: f.roleKey, conversation: ROOM_B, joined_at: expect.any(String) }]);
-    expect(during(rows[0]!.joined_at)).toBe(true);
+    // Known since the last runtime move onto the current runtime, the latest of the anchor's parts.
+    const raw = new Database(path, { readonly: true });
+    try {
+      expect(roleRoomMembershipEvidence(raw).anchored).toEqual([expect.objectContaining({ roleKey: f.roleKey, room: ROOM_B,
+        sessionId: f.holder().targetSessionId, runtimeMovedAt: movedAt, knownSince: movedAt })]);
+    } finally { raw.close(); }
+    expect(migratedByTheRunner(path).rows).toEqual([{ role_key: f.roleKey, conversation: ROOM_B, joined_at: movedAt }]);
   } finally { f.h.cp.close(); }
 });
 
-it("R3 migration: a single-room history no audit records is known only since the migration, never from its earliest binding", () => {
+it("R3 migration: a single-room history is known only since the current binding's anchor, never from its earliest binding", () => {
   const f = start();
   try {
     const boundAt = f.h.cp.bindings.active(f.roleKey)!.createdAt;
     f.moveTo(ROOM_A);
     f.moveTo(ROOM_A);
+    const anchorAt = f.h.cp.bindings.active(f.roleKey)!.createdAt;
     const path = v50Image(f, "acp-r3-v50-single-room-");
-    const { rows, during } = migratedByTheRunner(path);
-    expect(rows).toEqual([{ role_key: f.roleKey, conversation: ROOM_A, joined_at: expect.any(String) }]);
+    const { rows } = migratedByTheRunner(path);
+    expect(rows).toEqual([{ role_key: f.roleKey, conversation: ROOM_A, joined_at: anchorAt }]);
     expect(rows[0]!.joined_at).not.toBe(boundAt);
-    expect(during(rows[0]!.joined_at)).toBe(true);
   } finally { f.h.cp.close(); }
 });

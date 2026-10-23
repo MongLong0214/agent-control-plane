@@ -10,7 +10,8 @@ export const takeBackV50 = (raw: Database.Database): void => {
   // v51 objects must not survive in a fixture claiming to predate this step.
   raw.exec(`DROP TRIGGER IF EXISTS outbox_holder_message_terminal;
     DROP TABLE IF EXISTS buzz_events; DROP TABLE IF EXISTS holder_message_terminals;
-    DROP TABLE IF EXISTS role_room_memberships;`);
+    DROP TABLE IF EXISTS role_room_memberships; DROP TABLE IF EXISTS role_room_history_unknown;
+    DROP TABLE IF EXISTS outbox_sent_destinations;`);
   for (const name of V50_CHANGED_GUARDS) {
     const ddl = new RegExp(`CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`).exec(V49_SNAPSHOT)?.[0];
     if (!ddl) throw new Error(`${name} is absent from the v49 snapshot`);

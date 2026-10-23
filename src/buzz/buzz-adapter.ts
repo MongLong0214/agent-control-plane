@@ -561,8 +561,19 @@ export class BuzzAdapter {
         failed.push(message.messageId);
         continue;
       }
+      // FCR-08: the exact destination of this attempt. A row that may already be there (the relay
+      // accepted it there, or a send there had an unknown outcome) is not sent there again: Buzz has
+      // no same-id dedupe or receipt lookup. It is SENT again, awaiting that receiver's ACK.
+      const destination = { room: channel, recipient };
+      const already = this.outbox.sentTo(message.messageId, destination);
+      if (already !== null) {
+        this.outbox.markAlreadySent(message.messageId, message.claimToken, already);
+        continue;
+      }
       try {
         await this.transport.send(channel, render(message), [recipient]);
+        // Where it landed is recorded first, whatever happens to the claim next.
+        this.outbox.recordAcceptedSend(message.messageId, destination);
         // Completing the delivery is a compare-and-set on the claim: if the claim was
         // reclaimed or the message retargeted while we were sending, this fails and the
         // message stays eligible rather than being marked sent to a revoked session.
@@ -573,7 +584,7 @@ export class BuzzAdapter {
         this.outbox.markAttemptFailed(
           message.messageId,
           message.claimToken,
-          classifyTransportFailure(err),
+          { ...classifyTransportFailure(err), destination },
         );
         failed.push(message.messageId);
       }
