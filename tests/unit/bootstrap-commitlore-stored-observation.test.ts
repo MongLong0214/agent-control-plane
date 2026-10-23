@@ -1,3 +1,4 @@
+import { acknowledgeBootstrapHandoff } from "../helpers/bootstrap-handoff-ack.ts";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -127,7 +128,7 @@ describe("review S11-R1-03: a stored CommitLore PASS is bound to the observation
     const first = await prepared.runner.produceAndActivate(input);
     expect(first).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     const primary = harness.cp.bindings.activePrimaryCto(prepared.manifest.projectId)!;
-    expect(harness.cp.bootstrap.acknowledgeActivationHandoff(first.evidence["pendingHandoffId"] as string, primary.sessionId).allowed).toBe(true);
+    expect((await acknowledgeBootstrapHandoff(harness, first.evidence["pendingHandoffId"] as string, primary.sessionId)).allowed).toBe(true);
     const second = await prepared.runner.produceAndActivate(input);
     expect(second.allowed, JSON.stringify(second)).toBe(true);
 

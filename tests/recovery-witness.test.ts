@@ -271,8 +271,16 @@ it.each(["PENDING", "REJECTED"] as const)("an adopted canonical CTO with a %s pa
     }
     await w.prepared.harness.buzzAdapter.deliverPending();
     expect(w.message(handoffId)).toMatchObject({ status, failure_class: status === "REJECTED" ? "contract" : null });
+    const original = w.message(handoffId);
     const retry = await w.activate();
-    expect(retry).toMatchObject({ allowed: false, evidence: { pendingHandoffId: handoffId } });
+    expect(retry.allowed).toBe(false);
+    const currentHandoffId = retry.evidence["pendingHandoffId"] as string;
+    if (status === "REJECTED") {
+      expect(currentHandoffId).not.toBe(handoffId);
+      expect(w.message(currentHandoffId)).toMatchObject({status:"PENDING",target_session_id:holder.sessionId});
+      expect(w.message(handoffId)).toEqual(original);
+    } else expect(currentHandoffId).toBe(handoffId);
+    expect(await w.activate()).toMatchObject({allowed:false,evidence:{pendingHandoffId:currentHandoffId}});
     expect(w.primary().assignmentId).toBe(holder.assignmentId);
     expect(cp.sessions.require(holder.sessionId).lifecycle).toBe(SessionLifecycle.READY);
     expect(w.audits("PRIMARY_CTO_UNDELIVERABLE_REPLACED")).toHaveLength(0);

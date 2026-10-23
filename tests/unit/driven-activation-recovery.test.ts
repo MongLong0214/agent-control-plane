@@ -1,3 +1,4 @@
+import { acknowledgeBootstrapHandoff } from "../helpers/bootstrap-handoff-ack.ts";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { bootstrapActivationHandoff } from "../../src/bootstrap/bootstrap-plan.ts";
@@ -343,7 +344,7 @@ describe("#246 C4, live run_7717: the activation retry recovers an undeliverable
       expect(w.audits("PRIMARY_CTO_UNDELIVERABLE_REPLACED")).toEqual([]);
       expect(w.audits("HANDOFF_SUBMITTED")).toHaveLength(1);
 
-      expect(cp.bootstrap.acknowledgeActivationHandoff(handoffId, holder.sessionId)).toMatchObject({ allowed: true });
+      expect(await acknowledgeBootstrapHandoff(w.prepared.harness, handoffId, holder.sessionId)).toMatchObject({ allowed: true });
       expect(await w.activate()).toMatchObject({ allowed: true, value: { handoffAck: { handoffId } } });
       expect(await w.confirm()).toMatchObject({ allowed: true, value: { state: RunState.COMPLETED } });
     });

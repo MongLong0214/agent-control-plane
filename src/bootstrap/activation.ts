@@ -74,6 +74,12 @@ export interface ActivationWarning {
   mode: "required" | "preferred";
 }
 
+export interface BootstrapHandoffReceipt {
+  messageId: string;
+  bindingGeneration: number;
+  payloadDigest: string;
+}
+
 const activationWarnings = (manifest: ProjectManifest | null, observed: boolean): ActivationWarning[] => {
   const mode = manifest?.commitlore.mode ?? null;
   if (observed) return [];
@@ -792,7 +798,9 @@ export class BootstrapActivation {
     // earlier handoff row and artifact are kept as they are, and its ACK, if any, is evidence of nothing.
     // #246 C4 — so is one whose recipient this activation replaced as undeliverable (`reissuedToReplacement`).
     const reissues = recorded !== null &&
-      (this.reissuable(projectId, recorded.content, handoff) || this.reissuedToReplacement(projectId, recorded.content, toSessionId, handoff));
+      (this.reissuable(projectId, recorded.content, handoff) ||
+        this.reissuedToReplacement(projectId, recorded.content, toSessionId, handoff) ||
+        this.reissuesUnreadablePackage(projectId, recorded.content, toSessionId, handoff));
     if (recorded && !reissues) {
       const recordedDigest = digestOf(recorded.content.handoff);
       if (
@@ -829,7 +837,9 @@ export class BootstrapActivation {
       return allow(ReasonCode.OK, { handoffId: recorded.content.handoffId });
     }
 
-    const handoffId = `hof_${digestOf({ runId, toSessionId, handoffDigest }).slice(7, 27)}`;
+    const handoffId = `hof_${digestOf({ runId, toSessionId, handoffDigest,
+      ...(reissues ? { reissuedFrom: recorded.content.handoffId } : {}),
+    }).slice(7, 27)}`;
     this.db.run(
       `INSERT INTO handoffs (handoff_id, project_id, kind, from_session_id, from_generation,
                              to_session_id, package_json, digest, status, created_at)
@@ -864,6 +874,29 @@ export class BootstrapActivation {
       evidence: { handoffId, source: "bootstrap-activation", ...(reissues ? { reissuedFrom: recorded.content.handoffId } : {}) },
     });
     return allow(ReasonCode.OK, { handoffId });
+  }
+
+  /** Keep the current in-band holder; preserve unusable historical rows and issue a fresh package. */
+  private reissuesUnreadablePackage(
+    projectId: string,
+    recorded: { handoffId: string; projectId: string; toSessionId: string; handoff: HandoffPackage },
+    toSessionId: string,
+    handoff: HandoffPackage,
+  ): boolean {
+    const holder = this.bindings.activePrimaryCto(projectId);
+    if (recorded.projectId !== projectId || recorded.toSessionId !== toSessionId ||
+      holder?.sessionId !== toSessionId || digestOf(recorded.handoff) !== digestOf(handoff) ||
+      (!isAdoptedCanonicalRuntime(this.db, toSessionId) && drivenModeOf(this.db, toSessionId) !== "DRIVEN")) return false;
+    const row = this.db.get<{ status: string; digest: string; to_session_id: string }>(
+      `SELECT status, digest, to_session_id FROM handoffs WHERE handoff_id = ? AND kind = 'BOOTSTRAP' AND project_id = ?`,
+      [recorded.handoffId, projectId],
+    );
+    const message = this.outbox.byIdempotencyKey(`bootstrap-handoff:${recorded.handoffId}`);
+    return row?.status === "PENDING" && row.to_session_id === toSessionId && row.digest === digestOf(handoff) &&
+      message?.kind === MessageKind.HANDOFF_PACKAGE && message.targetSessionId === toSessionId &&
+      message.roleKey === holder.roleKey &&
+      (message.status === "REJECTED" || message.status === "EXPIRED" ||
+        (message.status === "PENDING" && message.bindingGeneration !== holder.bindingGeneration));
   }
 
   /**
@@ -978,13 +1011,13 @@ export class BootstrapActivation {
   }
 
   /** The ack, as recorded by the incoming session itself. */
-  acknowledgeActivationHandoff(handoffId: string, ackBySessionId: string, sessionIncarnation?: string): Decision<void> {
-    return this.db.txDecision(() => this.acknowledgeActivationHandoffInTx(handoffId, ackBySessionId, sessionIncarnation));
+  acknowledgeActivationHandoff(handoffId: string, ackBySessionId: string, sessionIncarnation?: string, receipt?: BootstrapHandoffReceipt): Decision<void> {
+    return this.db.txDecision(() => this.acknowledgeActivationHandoffInTx(handoffId, ackBySessionId, sessionIncarnation, receipt));
   }
 
-  private acknowledgeActivationHandoffInTx(handoffId: string, ackBySessionId: string, sessionIncarnation?: string): Decision<void> {
-    const row = this.db.get<{ project_id: string; to_session_id: string; status: string; kind: string; package_json: string }>(
-      `SELECT project_id, to_session_id, status, kind, package_json FROM handoffs WHERE handoff_id = ?`,
+  private acknowledgeActivationHandoffInTx(handoffId: string, ackBySessionId: string, sessionIncarnation?: string, receipt?: BootstrapHandoffReceipt): Decision<void> {
+    const row = this.db.get<{ project_id: string; to_session_id: string; status: string; kind: string; package_json: string; ack_by_session_id: string | null }>(
+      `SELECT project_id, to_session_id, status, kind, package_json, ack_by_session_id FROM handoffs WHERE handoff_id = ?`,
       [handoffId],
     );
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId });
@@ -1005,15 +1038,41 @@ export class BootstrapActivation {
     }
     const observed = this.observedHandoffFacts(handoffId, JSON.parse(row.package_json) as Partial<HandoffPackage>);
     if (!observed.allowed) return observed;
-    if (row.status === "ACKED") return allow(ReasonCode.OK, undefined);
-    // Bootstrap's recipient already holds the role. Settle exactly the row its connection can
-    // read, using the outbox's shared holder/incarnation authority, in this handoff transaction.
-    // Legacy Buzz delivery retains its existing ACK path.
-    const incarnation = sessionIncarnation ?? holder.sessionIncarnation;
+    const refuse = () => deny(ReasonCode.HANDOFF_ACK_REQUIRED, "ack requires this session's current bootstrap package authority", { handoffId });
     const message = this.outbox.byIdempotencyKey(`bootstrap-handoff:${handoffId}`);
-    if (incarnation && message && this.outbox.pendingInBandFor(ackBySessionId, incarnation)
-      .some((pending) => pending.messageId === message.messageId)) {
-      const acked = this.outbox.acknowledgeHandoffInBand(message.messageId, ackBySessionId, incarnation);
+    const session = this.sessions.get(ackBySessionId);
+    if (!sessionIncarnation || !receipt || !message ||
+      session?.incarnation !== sessionIncarnation || !["READY", "DRAINING"].includes(session.lifecycle) ||
+      message.kind !== MessageKind.HANDOFF_PACKAGE || message.targetSessionId !== ackBySessionId ||
+      message.roleKey !== holder.roleKey || message.bindingGeneration !== holder.bindingGeneration ||
+      receipt.messageId !== message.messageId || receipt.bindingGeneration !== message.bindingGeneration ||
+      receipt.payloadDigest !== message.payloadDigest ||
+      message.payloadDigest !== digestOf(message.payload) ||
+      digestOf(message.payload) !== digestOf({ handoffId, projectId: row.project_id, handoff: JSON.parse(row.package_json) })) return refuse();
+
+    // A replay is valid only for the incarnation that settled both records, with the same package.
+    if (row.status === "ACKED") {
+      const ack = this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'HANDOFF_ACK' AND session_id = ?
+        AND json_extract(evidence_json, '$.handoffId') = ?
+        AND json_extract(evidence_json, '$.sessionIncarnation') = ?
+        AND json_extract(evidence_json, '$.messageId') = ?
+        AND json_extract(evidence_json, '$.bindingGeneration') = ?
+        AND json_extract(evidence_json, '$.payloadDigest') = ? LIMIT 1`,
+      [ackBySessionId, handoffId, sessionIncarnation, message.messageId, receipt.bindingGeneration, receipt.payloadDigest]);
+      return message.status === "ACKED" && row.ack_by_session_id === ackBySessionId && ack ? allow(ReasonCode.OK, undefined) : refuse();
+    }
+    if (row.status !== "PENDING") return refuse();
+    const inBand = isAdoptedCanonicalRuntime(this.db, ackBySessionId) || drivenModeOf(this.db, ackBySessionId) !== "NONE";
+    if (inBand) {
+      if (!this.outbox.pendingInBandFor(ackBySessionId, sessionIncarnation)
+        .some((pending) => pending.messageId === message.messageId)) return refuse();
+      const acked = this.outbox.acknowledgeHandoffInBand(message.messageId, ackBySessionId, sessionIncarnation);
+      if (!acked.allowed) return acked;
+    } else {
+      // Ordinary interactive holders still receive bootstrap packages over Buzz. Only a sent
+      // package, bound to the supplied digest and current holder above, can settle that route.
+      if (message.status !== "SENT") return refuse();
+      const acked = this.outbox.acknowledge(message.messageId, ackBySessionId, receipt.bindingGeneration, sessionIncarnation);
       if (!acked.allowed) return acked;
     }
 
@@ -1025,7 +1084,7 @@ export class BootstrapActivation {
       kind: "HANDOFF_ACK",
       runId: null,
       sessionId: ackBySessionId,
-      evidence: { handoffId, source: "bootstrap-activation" },
+      evidence: { handoffId, source: "bootstrap-activation", sessionIncarnation, ...receipt },
     });
     return allow(ReasonCode.OK, undefined);
   }

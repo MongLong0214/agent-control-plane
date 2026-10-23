@@ -47,6 +47,12 @@ it.each([false,true])('FV52-01: host retirement failure excludes the revoked ent
     expect(h.cp.bindings.activePrimaryCto(entry.projectId)?.sessionId).toBe(session.sessionId);
     expect(subject.judgeIdentity!(entry.buzzActorId)).toEqual({verdict:'EXCLUDED',reason:'CANONICAL_ENTITLEMENT_REVOKED'});
     expect(subject.primaryCtoBindingFor!(entry.buzzActorId)).toBeNull();
+    // CEO c8eeff10 A: a second failed host retirement must retain negative authority too.
+    expect((await retireProject(h.cp,entry.projectId,'retry retirement')).allowed).toBe(false);
+    expect(subject.judgeIdentity!(entry.buzzActorId)).toEqual({verdict:'EXCLUDED',reason:'CANONICAL_ENTITLEMENT_REVOKED'});
+    expect(subject.primaryCtoBindingFor!(entry.buzzActorId)).toBeNull();
+    expect(buzzMentionSubscriberRegistry(h.cp,legacy ? {sessions:[entry]} : null).judgeIdentity!(entry.buzzActorId))
+      .toEqual({verdict:'EXCLUDED',reason:'CANONICAL_ENTITLEMENT_REVOKED'});
     expect(stderr.mock.calls.flat().join('')).toContain('CANONICAL_ENTITLEMENT_REVOKED');
   } finally {stderr.mockRestore();h.cp.close();}
 });

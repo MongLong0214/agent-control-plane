@@ -2,7 +2,7 @@ import { genesisBundleSchema } from '../bootstrap/genesis-bundle.ts';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import type { BootstrapActivation } from "../bootstrap/activation.ts";
+import type { BootstrapActivation, BootstrapHandoffReceipt } from "../bootstrap/activation.ts";
 import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { bootstrapPlanGuide, isProjectlessBootstrap, planForSubmission } from "../bootstrap/bootstrap-plan.ts";
 import { githubOperationSchema } from "../bootstrap/repo-factory-github.ts";
@@ -315,7 +315,7 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     activePrimaryCto: (projectId: string) => source.bindings.activePrimaryCto(projectId),
     prepareSwitchover: (...args: Parameters<CtoLifecycle["prepareSwitchover"]>) => source.cto.prepareSwitchover(...args),
     handoffKind: (handoffId: string) => source.db.get<{ kind: string }>(`SELECT kind FROM handoffs WHERE handoff_id = ?`, [handoffId])?.kind ?? null,
-    acknowledgeBootstrap: (handoffId: string, sessionId: string, sessionIncarnation: string) => source.bootstrap.acknowledgeActivationHandoff(handoffId, sessionId, sessionIncarnation),
+    acknowledgeBootstrap: (handoffId: string, sessionId: string, sessionIncarnation: string, receipt: BootstrapHandoffReceipt) => source.bootstrap.acknowledgeActivationHandoff(handoffId, sessionId, sessionIncarnation, receipt),
     acknowledgeCto: (handoffId: string, acknowledgement: HandoffAcknowledgement) =>
       source.cto.acknowledgeHandoff(handoffId, acknowledgement),
     // A read an operator asked for is a capacity *report*, not evidence that a worker
@@ -729,7 +729,9 @@ const createCtoServerFromPort = (
       }
       const kind = port.handoffKind(args.handoffId);
       if (!kind) return respond(deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId: args.handoffId }));
-      if (kind === "BOOTSTRAP") return respond(port.acknowledgeBootstrap(args.handoffId, peer.sessionId, peer.sessionIncarnation));
+      if (kind === "BOOTSTRAP") return respond(port.acknowledgeBootstrap(args.handoffId, peer.sessionId, peer.sessionIncarnation, {
+        messageId: args.messageId, bindingGeneration: args.bindingGeneration, payloadDigest: args.payloadDigest,
+      }));
       const sessionSecret = (peer as SessionSecretPeer).sessionSecret;
       if (!sessionSecret) {
         return respond(deny(

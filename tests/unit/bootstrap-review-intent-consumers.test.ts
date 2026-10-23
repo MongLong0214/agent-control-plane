@@ -1,3 +1,4 @@
+import { acknowledgeBootstrapHandoff } from "../helpers/bootstrap-handoff-ack.ts";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { bootstrapPlanIntent } from "../../src/bootstrap/bootstrap-plan.ts";
@@ -45,7 +46,7 @@ const produceAndActivate = async (prepared: PreparedBootstrapRun): Promise<void>
   const first = await prepared.runner.produceAndActivate(input);
   expect(first).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
   const primary = harness.cp.bindings.activePrimaryCto(prepared.manifest.projectId)!;
-  expect(harness.cp.bootstrap.acknowledgeActivationHandoff(first.evidence["pendingHandoffId"] as string, primary.sessionId).allowed).toBe(true);
+  expect((await acknowledgeBootstrapHandoff(harness, first.evidence["pendingHandoffId"] as string, primary.sessionId)).allowed).toBe(true);
   const second = await prepared.runner.produceAndActivate(input);
   expect(second, JSON.stringify(second)).toMatchObject({ allowed: true });
   await harness.cp.continuity.evaluate("bootstrap confirmation");

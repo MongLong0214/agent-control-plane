@@ -1,3 +1,4 @@
+import { acknowledgeBootstrapHandoff } from "../helpers/bootstrap-handoff-ack.ts";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -1026,7 +1027,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
     const wrongAck = harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, unrelated.sessionId);
     expect(wrongAck.allowed).toBe(false);
     expect(wrongAck.reasonCode).toBe(ReasonCode.HANDOFF_ACK_REQUIRED);
-    const acked = harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primaryCto.sessionId);
+    const acked = await acknowledgeBootstrapHandoff(harness, handoffId, primaryCto.sessionId);
     expect(acked.allowed).toBe(true);
 
     const awaitingCeo = await harness.cp.bootstrap.activate(input);
