@@ -416,6 +416,14 @@ describe("the prompt: the RUN_DISPATCH planning directive, and the recovery wake
         expect(prompt).toContain("A HANDOFF_PACKAGE is accepted with mcp__acp-cto__handoff_ack");
         expect(prompt).toContain("When nothing addressed to you remains, reply with a one-line summary of what you did.");
         expect(prompt).toContain(`at most ${PLAN_SUBMISSIONS_PER_TURN} plan_submit calls for that run in this turn`);
+        expect(prompt).toContain("recover a completed effect from durable state");
+        expect(prompt).toContain("proof of non-execution");
+        expect(prompt).toContain("no automatic new key");
+        expect(prompt).toContain("MCP_REPLAY_UNVERIFIABLE");
+        expect(prompt).toContain("MCP_MUTATION_OUTCOME_UNKNOWN");
+        expect(prompt).toContain("only when the durable effect matches THIS request");
+        expect(prompt).toContain("stored PLAN digest equals the digest of the PLAN this request would submit");
+        expect(prompt).toContain("an unclear refusal never authorizes resubmitting under a new key");
       }
       // The directive is the same bytes for every run: no run, project or README in it.
       const directive = (prompt: string) => lines(prompt).find((line) => line.startsWith("A RUN_DISPATCH for a run you own"))!;

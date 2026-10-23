@@ -385,7 +385,16 @@ export const ReasonCode = {
    */
   INGRESS_TURN_UNRESOLVED_CONVERSATION: "INGRESS_TURN_UNRESOLVED_CONVERSATION",
   UNTRUSTED_CONTENT_IS_DATA: "UNTRUSTED_CONTENT_IS_DATA",
+  /**
+   * Recovery for MCP_REPLAY_UNVERIFIABLE and MCP_MUTATION_OUTCOME_UNKNOWN:
+   * recover a completed effect only when durable state proves it matches THIS request
+   * (for PLAN, its expected stored digest and tasks); a different or unprovable effect is
+   * neither completion nor proof of non-execution. Allow a new request only with proof of
+   * non-execution; keep uncertain outcomes refused. An unclear refusal never authorizes a new key.
+   * Neither age, a missing response, nor an ordinary thrown error proves non-execution.
+   */
   MCP_REPLAY_UNVERIFIABLE: "MCP_REPLAY_UNVERIFIABLE",
+  MCP_MUTATION_OUTCOME_UNKNOWN: "MCP_MUTATION_OUTCOME_UNKNOWN",
   MCP_PEER_UNAUTHENTICATED: "MCP_PEER_UNAUTHENTICATED",
   /**
    * #1037 — a mutation on the adopted CEO's tool channel whose caller provenance is not the owner's

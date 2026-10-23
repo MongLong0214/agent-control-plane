@@ -1,3 +1,4 @@
+import { MCP_MUTATION_RECOVERY } from "../core/mcp-recovery.ts";
 import { randomUUID } from "node:crypto";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -891,8 +892,8 @@ export const PLAN_SUBMISSIONS_PER_TURN = 4;
  */
 const PLAN_STEPS =
   "read mcp__acp-cto__contract_get for that run; write a PLAN that satisfies its contract, following the bootstrapPlanGuide it returns when there is one; " +
-  "submit the PLAN with mcp__acp-cto__plan_submit, using a new idempotencyKey for every call; " +
-  `if plan_submit refuses it, correct the PLAN from the refusal's evidence and submit it again, at most ${PLAN_SUBMISSIONS_PER_TURN} plan_submit calls for that run in this turn`;
+  "submit the PLAN with mcp__acp-cto__plan_submit; use the same key for an identical retry. " + MCP_MUTATION_RECOVERY + " " +
+  `Only after proving non-execution, correct a refused PLAN from its evidence and submit the new request with a new key, at most ${PLAN_SUBMISSIONS_PER_TURN} plan_submit calls for that run in this turn`;
 
 /**
  * The audit kind that records one bootstrap PLAN recovery wake, for its run, the owner's binding

@@ -1,3 +1,4 @@
+import { MCP_MUTATION_RECOVERY } from "../core/mcp-recovery.ts";
 import { parseGenesis, genesisDigest, bytesDigest, type GenesisBundle } from './genesis-bundle.ts';
 import { z } from "zod";
 
@@ -842,7 +843,7 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
     schema: BOOTSTRAP_PLAN_GUIDE_SCHEMA_ID,
     submit: [
       "Call mcp__acp-cto__plan_submit with { idempotencyKey, runId, plan, tasks }.",
-      "Use a new idempotencyKey for every call: a key already used answers with its first result again.",
+      "Use the same idempotencyKey for an identical retry. " + MCP_MUTATION_RECOVERY,
       "tasks: at least one task { key, title, category }, for example one implementation task that creates the repository.",
     ],
     planFields: [

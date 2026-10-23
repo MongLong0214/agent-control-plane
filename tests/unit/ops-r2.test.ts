@@ -501,15 +501,15 @@ describe("round-2 ops regressions", () => {
     expect(replay).toEqual(first);
   });
 
-  it("#345: an unfinished MCP mutation reservation recovers after a throw or bounded crash delay", async () => {
+  it("#345: an unfinished MCP mutation reservation releases a certified pre-effect failure and refuses ambiguous crash reservations", async () => {
     const harness = makeHarness();
     const peer = { actor: "authenticated-peer" };
     let executions = 0;
 
     await expect(idempotentMcpMutation(harness.cp, peer, "mcp-throw", () => {
       executions += 1;
-      throw new Error("tool process exited");
-    })).rejects.toThrow("tool process exited");
+      throw new ingressGuardExports.McpMutationNotExecuted("tool process exited before attempting any effect");
+    })).rejects.toThrow("tool process exited before attempting any effect");
     expect(harness.cp.db.get(`SELECT nonce FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`, ["mcp-throw"])).toBeUndefined();
 
     const afterThrow = await idempotentMcpMutation(harness.cp, peer, "mcp-throw", () => {
@@ -526,14 +526,14 @@ describe("round-2 ops regressions", () => {
     const inProgress = await idempotentMcpMutation(harness.cp, peer, "mcp-crash", () => {
       throw new Error("must not execute during recovery window");
     });
-    expect(inProgress.structuredContent?.["reasonCode"]).toBe(ReasonCode.INGRESS_REPLAY_IGNORED);
+    expect(inProgress.structuredContent?.["reasonCode"]).toBe(ReasonCode.MCP_REPLAY_UNVERIFIABLE);
 
     harness.clock.advance(60_000);
     const recovered = await idempotentMcpMutation(harness.cp, peer, "mcp-crash", () => ({
       content: [{ type: "text" as const, text: "recovered" }],
       structuredContent: { reasonCode: ReasonCode.OK },
     }));
-    expect(recovered.structuredContent?.["reasonCode"]).toBe(ReasonCode.OK);
+    expect(recovered.structuredContent?.["reasonCode"]).toBe(ReasonCode.MCP_REPLAY_UNVERIFIABLE);
   });
 
   it("keeps an in-flight MCP reservation sealed from raw deletes and exported release issuers", async () => {

@@ -50,15 +50,13 @@ class IngressDeleteAuthorityToken {
 export type IngressDeleteAuthority = IngressDeleteAuthorityToken;
 export const isIngressDeleteAuthority = IngressDeleteAuthorityToken.matches;
 
-const MCP_RESERVATION_TTL_MS = 60_000;
+/** Only trusted pre-effect validation paths may certify that no effect was attempted.
+ * An ordinary throw (including a rejected external operation) proves no such thing.
+ */
+export class McpMutationNotExecuted extends Error {}
 
-/**
- * The reservations whose handler is running in this process, per database.
- *
- * The staleness test reads the caller's own timestamp, so on its own it lets a caller call a live
- * reservation stale and run the mutation beside a handler still in flight. A reservation held
- * here is never taken over, whatever time the caller claims. The TTL takeover remains for the case
- * it exists for: a handler whose process died, which leaves a row and no entry in this set.
+/** Running handlers are sealed until their response is stored. Persisted reservations
+ * are never taken over: neither time nor process-local absence proves non-execution.
  */
 const mcpReservationsInFlight = new WeakMap<Db, Map<string, { actor: string; pendingResultJson: string | null }>>();
 
@@ -81,8 +79,7 @@ export const isMcpReservationInFlight = (db: Db, nonce: string, actor?: string):
 /**
  * Run only the mutation that acquired this reservation; no delete capability leaves this module.
  *
- * A failed run deletes only a row this call inserted. A reservation it took over by renewal is put
- * back to the time it held before.
+ * Only an explicitly certified pre-effect failure releases the row this call inserted.
  */
 export const runMcpReservedMutation = async <T>(
   db: Db,
@@ -90,59 +87,27 @@ export const runMcpReservedMutation = async <T>(
   nonce: string,
   receivedAt: string,
   execute: () => Promise<T> | T,
-  // An opaque unfinished value owned by the caller. Only that exact reservation may renew;
-  // null retains the pre-fingerprint recovery contract. Replay interpretation stays in MCP.
+  // Opaque reservation bytes owned by the caller. Replay interpretation stays in MCP.
   pendingResultJson: string | null = null,
   storeResult?: (result: T) => void,
-): Promise<{ kind: "existing"; actor: string; resultJson: string | null } | { kind: "executed"; result: T }> => {
+): Promise<{ kind: "existing"; actor: string; resultJson: string | null; inFlight: boolean } | { kind: "executed"; result: T }> => {
   const reservation = db.tx(() => {
     const existing = db.get<{ actor: string; received_at: string; result_json: string | null }>(
       `SELECT actor, received_at, result_json FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`,
       [nonce],
     );
-    let renewedFrom: string | null = null;
-    let previousResultJson: string | null = null;
-    if (existing && mcpReservationsInFlight.get(db)?.has(nonce)) {
-      return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json };
-    }
     if (existing) {
-      const reservedAtMs = Date.parse(existing.received_at);
-      const nowMs = Date.parse(receivedAt);
-      if (existing.actor !== actor || (existing.result_json !== null && existing.result_json !== pendingResultJson)
-          || !Number.isFinite(reservedAtMs) || !Number.isFinite(nowMs)
-          || nowMs - reservedAtMs < MCP_RESERVATION_TTL_MS) {
-        return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json };
-      }
-      const renewed = db.run(
-        `UPDATE inbound_messages SET received_at = ?, result_json = ?
-          WHERE channel = 'mcp' AND nonce = ? AND actor = ?
-            AND result_json IS ? AND turn_claim_json IS NULL`,
-        [receivedAt, pendingResultJson, nonce, actor, existing.result_json],
-      );
-      if (renewed.changes !== 1) {
-        return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json };
-      }
-      renewedFrom = existing.received_at;
-      previousResultJson = existing.result_json;
-    } else {
-      db.run(
-        `INSERT INTO inbound_messages (channel, nonce, actor, received_at, result_json) VALUES ('mcp', ?, ?, ?, ?)`,
-        [nonce, actor, receivedAt, pendingResultJson],
-      );
+      return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json,
+        inFlight: mcpReservationsInFlight.get(db)?.has(nonce) ?? false };
     }
+    db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, result_json) VALUES ('mcp', ?, ?, ?, ?)`,
+      [nonce, actor, receivedAt, pendingResultJson],
+    );
     let used = false;
     const release = (): void => {
       if (used) return;
       used = true;
-      if (renewedFrom !== null) {
-        db.run(
-          `UPDATE inbound_messages SET received_at = ?, result_json = ?
-            WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND received_at = ?
-              AND result_json IS ? AND turn_claim_json IS NULL`,
-          [renewedFrom, previousResultJson, nonce, actor, receivedAt, pendingResultJson],
-        );
-        return;
-      }
       const authority = new IngressDeleteAuthorityToken(db, "mcp");
       db.withIngressDelete(authority, "mcp", () => db.run(
         `DELETE FROM inbound_messages
@@ -166,7 +131,7 @@ export const runMcpReservedMutation = async <T>(
     storeResult?.(result);
     return { kind: "executed", result };
   } catch (error) {
-    if (!handlerFinished) reservation.release();
+    if (!handlerFinished && error instanceof McpMutationNotExecuted) reservation.release();
     throw error;
   } finally {
     inFlight.delete(nonce);

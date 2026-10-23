@@ -203,15 +203,18 @@ export const createHermesMcpPort = (
     resolveEscalation: (
       runId: string, escalationId: number, resolution: string, ceoSessionId: string, idempotencyKey: string,
       hermesTurn?: HermesAdmittedTurn,
+      mcpFingerprint?: string,
     ) =>
       source.ceo.resolveEscalation(runId, resolution, ceoSessionId, {
         escalationId, idempotencyKey, ...(hermesTurn === undefined ? {} : { hermesTurn }),
+        ...(mcpFingerprint === undefined ? {} : { mcpFingerprint }),
       }),
     replayEscalationResolution: (
       idempotencyKey: string,
       request: { runId: string; escalationId: number; resolution: string },
       ceoSessionId: string,
-    ) => source.ceo.escalationResolutionReplay(idempotencyKey, request, ceoSessionId),
+      mcpFingerprint: string,
+    ) => source.ceo.escalationResolutionReplay(idempotencyKey, request, ceoSessionId, mcpFingerprint),
   });
   HERMES_MCP_PORTS.add(port);
   return port;
@@ -328,7 +331,7 @@ const createHermesServerFromPort = (
     toolName: string,
     args: Record<string, unknown> & { idempotencyKey: string },
     extra: unknown,
-    execute: () => Promise<ToolResult> | ToolResult,
+    execute: (fingerprint: string) => Promise<ToolResult> | ToolResult,
     durableReplay?: McpMutationRequest["durableReplay"],
   ) => guarded(async () => {
     const peer = authenticateMcpPeer(authenticate);
@@ -481,19 +484,19 @@ const createHermesServerFromPort = (
       const requestDigest = escalationRequestDigestOf(args.runId, args.escalationId, args.resolution);
       const answer = <T>(decision: Decision<T>) =>
         respond({ ...decision, evidence: { ...decision.evidence, requestDigest } } as Decision<T>);
-      const committed = (): ToolResult | null => {
+      const committed = (fingerprint: string): ToolResult | null => {
         const peer = authenticateMcpPeer(authenticate);
         if (!peer.allowed || !peer.value.sessionId) return null;
         const recorded = port.replayEscalationResolution(args.idempotencyKey,
-          { runId: args.runId, escalationId: args.escalationId, resolution: args.resolution }, peer.value.sessionId);
+          { runId: args.runId, escalationId: args.escalationId, resolution: args.resolution }, peer.value.sessionId, fingerprint);
         return recorded ? answer(recorded) : null;
       };
-      return write("escalation_resolve", args, extra, () => {
+      return write("escalation_resolve", args, extra, fingerprint => {
         const peer = authenticateMcpPeer(authenticate);
         if (!peer.allowed) return respond(peer);
         if (!peer.value.sessionId) return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "Hermes MCP peer has no session"));
         return answer(port.resolveEscalation(args.runId, args.escalationId, args.resolution,
-          peer.value.sessionId, args.idempotencyKey, admittedTurnOf(extra)));
+          peer.value.sessionId, args.idempotencyKey, admittedTurnOf(extra), fingerprint));
       }, committed);
     }),
   );

@@ -362,18 +362,16 @@ it.each([JSON.stringify(ok("legacy")), "", "{}", "invalid json", '{"kind":"mcp-m
   } finally { h.cp.close(); }
 });
 
-it("legacy in-flight rows keep the refusal and bounded abandoned recovery", async () => {
+it.each([0, 60_000, 120_000])("legacy pending rows are unverifiable and unchanged at age %i", async age => {
   const h = makeHarness();
-  const effect = vi.fn(() => ok("recovered"));
+  const effect = vi.fn(() => ok("must not run"));
   try {
     h.cp.db.run("INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('mcp', 'legacy-pending', 'peer', ?)", [h.clock.nowIso()]);
     const before = h.cp.db.all("SELECT * FROM inbound_messages");
-    expect((await idempotentMcpMutation(h.cp, { actor: "peer" }, "legacy-pending", effect, request())).structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED });
+    h.clock.advance(age);
+    expect((await idempotentMcpMutation(h.cp, { actor: "peer" }, "legacy-pending", effect, request())).structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_REPLAY_UNVERIFIABLE });
     expect(h.cp.db.all("SELECT * FROM inbound_messages")).toEqual(before);
     expect(effect).not.toHaveBeenCalled();
-    h.clock.advance(60_000);
-    expect((await idempotentMcpMutation(h.cp, { actor: "peer" }, "legacy-pending", effect, request())).structuredContent).toMatchObject({ ok: true });
-    expect(effect).toHaveBeenCalledTimes(1);
   } finally { h.cp.close(); }
 });
 
@@ -419,7 +417,7 @@ it("a matching replay must pass the current authority hook without changing the 
   } finally { h.cp.close(); }
 });
 
-it("fingerprinted abandoned reservations recover only the same request and restore the row after failure", async () => {
+it("fingerprinted abandoned reservations refuse unknown outcomes without executing or changing evidence", async () => {
   const h = makeHarness();
   const peer = { actor: "peer" };
   const effect = vi.fn(() => ok("first"));
@@ -432,10 +430,9 @@ it("fingerprinted abandoned reservations recover only the same request and resto
     h.clock.advance(60_000);
     expect((await idempotentMcpMutation(h.cp, peer, "abandoned", effect, request({ value: 2 }))).structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
     expect(h.cp.db.all("SELECT * FROM inbound_messages")).toEqual(before);
-    await expect(idempotentMcpMutation(h.cp, peer, "abandoned", () => { throw new Error("recovery failed"); }, request({ value: 1 }))).rejects.toThrow("recovery failed");
+    expect((await idempotentMcpMutation(h.cp, peer, "abandoned", effect, request({ value: 1 }))).structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_MUTATION_OUTCOME_UNKNOWN });
     expect(h.cp.db.all("SELECT * FROM inbound_messages")).toEqual(before);
-    expect((await idempotentMcpMutation(h.cp, peer, "abandoned", effect, request({ value: 1 }))).structuredContent).toMatchObject({ ok: true });
-    expect(effect).toHaveBeenCalledTimes(2);
+    expect(effect).toHaveBeenCalledTimes(1);
     expect(h.cp.db.all("SELECT * FROM inbound_messages")).toHaveLength(1);
   } finally { h.cp.close(); }
 });
@@ -474,7 +471,7 @@ it("handoff_submit rechecks the current project-primary fence before replay", as
 it.each(["cto", "hermes"] as const)("%s authenticates every retry before replay", async kind => {
   const f = fixture();
   let current = true;
-  const authenticate = () => current ? allow(ReasonCode.OK, { actor: f.ceo, sessionId: f.ceo, sessionIncarnation: f.h.cp.sessions.require(f.ceo).incarnation }) : deny<never>(ReasonCode.MCP_PEER_UNAUTHENTICATED, "credential revoked");
+  const authenticate = () => current ? allow(ReasonCode.OK, { actor: f.ceo, sessionId: f.ceo, sessionIncarnation: f.h.cp.sessions.require(f.ceo).incarnation, binding: { roleKey: f.run.roleKey, bindingGeneration: 1 } }) : deny<never>(ReasonCode.MCP_PEER_UNAUTHENTICATED, "credential revoked");
   const server = kind === "cto" ? createCtoServer(createCtoMcpPort(f.h.cp), authenticate) : createHermesServer(createHermesMcpPort(f.h.cp), authenticate);
   const name = kind === "cto" ? "capacity_get" : "run_create";
   const args = kind === "cto" ? { idempotencyKey: "auth", refresh: false } : { idempotencyKey: "auth", executionMode: "SIMPLE", contract, repositories: [] };
@@ -520,7 +517,7 @@ it("replay rechecks authority after the reservation lookup yields", async () => 
   } finally { h.cp.close(); }
 });
 
-it("response-store failure retains the fingerprint and bounded recovery window", async () => {
+it("response-store failure retains the fingerprint and refuses every uncertain retry", async () => {
   const h = makeHarness();
   const effect = vi.fn(() => ok("first"));
   const original = h.cp.db.run.bind(h.cp.db);
@@ -537,11 +534,12 @@ it("response-store failure retains the fingerprint and bounded recovery window",
     const before = h.cp.db.all("SELECT * FROM inbound_messages");
     expect(before).toHaveLength(1);
     expect(JSON.parse((before[0] as { result_json: string }).result_json)).toMatchObject({ version: 1, result: null });
-    expect((await idempotentMcpMutation(h.cp, { actor: "peer" }, "store-failure", effect, request())).structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED });
+    expect((await idempotentMcpMutation(h.cp, { actor: "peer" }, "store-failure", effect, request())).structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_MUTATION_OUTCOME_UNKNOWN });
     expect(effect).toHaveBeenCalledTimes(1);
     expect(h.cp.db.all("SELECT * FROM inbound_messages")).toEqual(before);
     h.clock.advance(60_000);
-    expect((await idempotentMcpMutation(h.cp, { actor: "peer" }, "store-failure", effect, request())).structuredContent).toMatchObject({ ok: true });
-    expect(effect).toHaveBeenCalledTimes(2);
+    expect((await idempotentMcpMutation(h.cp, { actor: "peer" }, "store-failure", effect, request())).structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_MUTATION_OUTCOME_UNKNOWN });
+    expect(effect).toHaveBeenCalledTimes(1);
+    expect(h.cp.db.all("SELECT * FROM inbound_messages")).toEqual(before);
   } finally { h.cp.close(); }
 });

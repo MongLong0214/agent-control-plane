@@ -183,9 +183,11 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     contractForRun: (runId: string) => {
       const run = source.runs.require(runId);
       const manifest = run.pinnedManifestDigest ? source.projects.manifest(run.pinnedManifestDigest) : null;
+      const plan = source.artifacts.latest(runId, ArtifactKind.PLAN);
       const contract = {
         run,
         contract: source.artifacts.latest(runId, ArtifactKind.TASK_CONTRACT)?.content ?? null,
+        ...(plan ? { plan: plan.content, tasks: standardWorkTasks(source, runId) } : {}),
         pinnedManifestDigest: run.pinnedManifestDigest,
         verificationCommands: manifest?.verificationCommands ?? [],
         branchProfile: manifest?.branchProfile ?? null,
@@ -198,8 +200,8 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       // worker and its executions, so a turn that resumes after an interruption goes by the record
       // rather than by what its conversation kept. Answered only through `contract_get`, after its
       // owner fence admitted the caller as this run's current owner; identities and states only, never
-      // a credential. Every other run's answer is exactly as before.
-      return run.kind === RunKind.STANDARD_WORK ? { ...contract, tasks: standardWorkTasks(source, runId) } : contract;
+      // a credential. A stored PLAN also exposes its tasks for outcome reconciliation.
+      return run.kind === RunKind.STANDARD_WORK && !plan ? { ...contract, tasks: standardWorkTasks(source, runId) } : contract;
     },
     // #246 C2 — a project-less bootstrap run's PLAN carries its manifest in full, checked portable
     // and against the digest the PLAN names before anything is stored. #246 B2-a — so does a
@@ -413,7 +415,7 @@ const createCtoServerFromPort = (
       ? port.mutation.execute(peer.value, args.idempotencyKey, () => execute(peer.value), {
           toolName, arguments: args, authority: () => {
             const current = peerFor(toolName);
-            return current.allowed ? authority(peer.value) : current;
+            return current.allowed ? authority(current.value) : current;
           },
         })
       : respond(peer);
@@ -793,7 +795,9 @@ const createCtoServerFromPort = (
     async (args) => write("capacity_get", args, async () => {
       if (args.refresh) await port.refreshCapacity();
       return ok({ providers: port.capacity(), continuityMode: port.continuityMode() });
-    }),
+    }, peer => peer.binding
+      ? allow(ReasonCode.OK, { ...peer.binding })
+      : deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "capacity_get requires current socket binding authority")),
   );
   server.registerTool(
     "doctor_run",

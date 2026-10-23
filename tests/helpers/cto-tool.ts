@@ -14,6 +14,10 @@ export async function callCtoTool(
 ): Promise<Record<string, unknown>> {
   const server = createCtoServer(createCtoMcpPort(h.cp), () => allow(ReasonCode.OK, {
     actor: `cto:${peer.sessionId}`, sessionId: peer.sessionId, sessionIncarnation: peer.incarnation,
+    binding: (() => {
+      const held = h.cp.bindings.bySession(peer.sessionId).find(binding => binding.status === "ACTIVE");
+      return held ? { roleKey: held.roleKey, bindingGeneration: held.bindingGeneration } : undefined;
+    })(),
   }));
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);

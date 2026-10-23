@@ -130,7 +130,7 @@ describe("ESC-01: the decision record is the replay source of truth", () => {
     });
   });
 
-  it("(c) a concurrent resend that bypassed the reservation answers the committed result; the same key with different content is CONFLICT; one enqueue", async () => {
+  it("(c) direct domain retries preserve the committed result; MCP refuses receipts without a shared principal fingerprint", async () => {
     await withBootstrapRuntime(async (f) => {
       const { runId, escalationId } = await blocked(f);
       const ceo = f.harness.cp.ceo;
@@ -149,9 +149,9 @@ describe("ESC-01: the decision record is the replay source of truth", () => {
       expect(replies(f, runId)).toHaveLength(1);
       expect(count(f, "CEO_DECISION", runId)).toBe(1);
 
-      // Over the door, two identical requests at once: every answer is the committed result.
+      // A direct domain receipt has no shared MCP principal fingerprint. The door cannot prove identity.
       const answers = await Promise.all([resolve(f, runId, escalationId, "r1-concurrent"), resolve(f, runId, escalationId, "r1-concurrent")]);
-      for (const answer of answers) expect(answer).toMatchObject({ ok: true, value: first.allowed ? first.value : {} });
+      for (const answer of answers) expect(answer).toMatchObject({ ok: false, reasonCode: ReasonCode.MCP_REPLAY_UNVERIFIABLE });
       expect(replies(f, runId)).toHaveLength(1);
     });
   });

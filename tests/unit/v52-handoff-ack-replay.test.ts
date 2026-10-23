@@ -47,7 +47,8 @@ const fixture = (canonical: boolean) => {
     ...(canonical ? { authenticatedTarget: { claimed, protocolVersion: SELF_CLAIM_PROTOCOL, attestationDigest: digestOf(claimed), verify: () => claimed } } : {}),
   });
   if (!binding.allowed) throw new Error(binding.message);
-  const peer: Peer = { actor: `cto:${session.sessionId}`, sessionId: session.sessionId, sessionIncarnation: session.incarnation };
+  const peer: Peer = { actor: `cto:${session.sessionId}`, sessionId: session.sessionId, sessionIncarnation: session.incarnation,
+    binding: { roleKey: binding.value.roleKey, bindingGeneration: binding.value.bindingGeneration } };
   const open = () => {
     const run = cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: "STANDARD", contract: {
       goal: "bootstrap", why: "replay boundary", scope: [], nonGoals: [], acceptance: ["ready"], priority: "NORMAL", humanGate: [], references: [],
