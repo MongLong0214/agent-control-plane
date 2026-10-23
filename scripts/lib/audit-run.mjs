@@ -351,13 +351,16 @@ const blobId = (commit, bytes) =>
   createHash(commit.length === 64 ? "sha256" : "sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
 
 /**
- * Where the checkout's bytes differ from the pinned commit's blobs, compared byte for byte.
+ * Where the checkout differs from the pinned commit: a tracked path's type (regular file or
+ * symbolic link), its executable bit (`100755` against `100644`), or its bytes.
  *
  * `git status` is not this question. A smudge filter, an `eol` attribute or `ident` rewrites the
  * file as it is checked out while the index still names the committed blob, and whether status
  * notices depends on its stat cache; measured, a repository-local smudge filter made the reviewer
  * read `NOT IN PINNED COMMIT` where the commit holds `pinned v1`, and the run reported PASS. So each
  * tracked path is hashed here as raw bytes, with no filter, and compared with the tree entry.
+ * The executable bit is read the way Git reads it, from the owner's execute permission; a bytes-only
+ * comparison let a reviewer clear it on a committed script and the run still report PASS.
  * Gitlinks are skipped: a worktree does not check out submodules. `extraFiles` also reports files
  * the commit does not have; after a run that is off, because a reviewer CLI may leave a cache.
  */
@@ -384,8 +387,10 @@ const checkoutDifferences = (dir, commit, { extraFiles }) => {
       else if (blobId(commit, readlinkSync(full, { encoding: "buffer" })) !== entry.oid) differences.push(`${path}: link target differs from the commit`);
     } else if (!stat.isFile()) {
       differences.push(`${path}: not a regular file`);
-    } else if (blobId(commit, readFileSync(full)) !== entry.oid) {
-      differences.push(`${path}: bytes differ from the commit`);
+    } else {
+      const mode = (stat.mode & 0o100) === 0 ? "100644" : "100755";
+      if (mode !== entry.mode) differences.push(`${path}: mode ${mode} where the commit has ${entry.mode}`);
+      if (blobId(commit, readFileSync(full)) !== entry.oid) differences.push(`${path}: bytes differ from the commit`);
     }
   }
   if (extraFiles) {
@@ -406,12 +411,19 @@ const describeDifferences = (differences) =>
   `${differences.slice(0, 5).map((difference) => JSON.stringify(difference)).join(", ")}${differences.length > 5 ? `, and ${differences.length - 5} more` : ""}`;
 
 const createCheckout = (repoRoot, revision) => {
-  const scratch = realpathSync(mkdtempSync(join(tmpdir(), "acp-audit-")));
+  let scratch;
+  try {
+    scratch = realpathSync(mkdtempSync(join(tmpdir(), "acp-audit-")));
+  } catch (error) {
+    throw new Refusal(`could not prepare a disposable checkout of ${revision.commit.slice(0, 12)}: ${messageOf(error)}`);
+  }
   const dir = join(scratch, "checkout");
   const noHooks = join(scratch, "no-hooks");
-  mkdirSync(noHooks);
   const checkout = { scratch, dir };
   try {
+    // Inside the try: a umask without the owner's execute bit fails here, and the directory
+    // mkdtemp made must still be removed.
+    mkdirSync(noHooks);
     git(repoRoot, ["-c", `core.hooksPath=${noHooks}`, "worktree", "add", "--detach", "--quiet", dir, revision.commit]);
     const [commit, tree] = git(dir, ["rev-parse", "HEAD", "HEAD^{tree}"]).trim().split("\n");
     if (commit !== revision.commit || tree !== revision.tree) {
@@ -420,9 +432,9 @@ const createCheckout = (repoRoot, revision) => {
     const differences = checkoutDifferences(dir, revision.commit, { extraFiles: true });
     if (differences.length > 0) {
       throw new Refusal(
-        `the disposable checkout of ${revision.commit.slice(0, 12)} does not hold that commit's bytes ` +
+        `the disposable checkout of ${revision.commit.slice(0, 12)} does not hold exactly that commit ` +
           `(${differences.length} path(s): ${describeDifferences(differences)}). Something in this repository's ` +
-          "checkout configuration (a smudge filter, an eol or ident attribute) changed what a reviewer would read, " +
+          "checkout configuration (a smudge filter, an eol or ident attribute, core.symlinks=false) changed what a reviewer would read, " +
           `so no review of it would be a review of ${revision.commit.slice(0, 12)}. No reviewer was started.`,
       );
     }
@@ -874,7 +886,10 @@ export const runAudit = async ({ tool, script, repoRoot, areas, sequential, revi
     else await Promise.all(options.areas.map(one));
     const changed = checkoutDifferences(checkout.dir, revision.commit, { extraFiles: false });
     manifest.checkout.trackedChangesDuringRun = changed.length > 0;
-    if (changed.length > 0) manifest.checkout.changedDuringRun = changed.slice(0, 20);
+    if (changed.length > 0) {
+      manifest.checkout.changedDuringRun = changed.slice(0, 20);
+      console.error(`${tool}: the checkout changed while the reviewers ran (${describeDifferences(changed)}); this run is INCOMPLETE`);
+    }
   } catch (error) {
     manifest.error = messageOf(error);
     console.error(`${tool}: ${manifest.error}`);

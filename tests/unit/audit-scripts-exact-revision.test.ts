@@ -13,6 +13,8 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -120,6 +122,12 @@ const report = textOf(reportOf(mode === "revise" ? "REVISE" : mode === "block" ?
     case "pass":
     case "revise":
     case "block":
+      emit(report);
+      process.exit(0);
+    case "chmod-off":
+    case "chmod-on":
+      // Changes only the executable bit of a committed file in the checkout it was given.
+      fs.chmodSync(path.join(viewDir, "src", mode === "chmod-off" ? "tool.sh" : "subject.txt"), mode === "chmod-off" ? 0o644 : 0o755);
       emit(report);
       process.exit(0);
     case "fifo": {
@@ -270,8 +278,11 @@ interface Plan {
  * `smudged`: the commit carries a `.gitattributes` filter and the repository's own config defines
  * it to rewrite `src/subject.txt` on checkout. The original checkout stays clean — its file was
  * written before the filter existed — while any new checkout reads bytes the commit does not hold.
+ * `executable`: the commit also holds `src/tool.sh` as `100755`. `symlinksOff`: the commit holds
+ * `src/link` as a symbolic link and the repository's config then sets `core.symlinks=false`, so
+ * any new checkout writes it as a plain file while the original keeps its link.
  */
-const makeFixture = (options: { smudged?: boolean } = {}): Fixture => {
+const makeFixture = (options: { smudged?: boolean; executable?: boolean; symlinksOff?: boolean } = {}): Fixture => {
   // Physical path: a script resolves its own location through symlinks (`/var` -> `/private/var`).
   const base = realpathSync(mkdtempSync(join(tmpdir(), "acp-audit-scripts-")));
   roots.push(base);
@@ -291,6 +302,11 @@ const makeFixture = (options: { smudged?: boolean } = {}): Fixture => {
     mkdirSync(dirname(join(root, name)), { recursive: true });
     writeFileSync(join(root, name), body);
   }
+  if (options.executable === true) {
+    writeFileSync(join(root, "src", "tool.sh"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(root, "src", "tool.sh"), 0o755);
+  }
+  if (options.symlinksOff === true) symlinkSync("subject.txt", join(root, "src", "link"));
   for (const name of [...SCRIPTS, join("lib", "audit-run.mjs")]) {
     if (!existsSync(join(ACP_SCRIPTS, name))) continue; // a680e971 had no shared helper
     mkdirSync(dirname(join(root, "scripts", name)), { recursive: true });
@@ -298,6 +314,7 @@ const makeFixture = (options: { smudged?: boolean } = {}): Fixture => {
   }
   git(root, "add", "-A");
   git(root, "commit", "-q", "--no-verify", "-m", "base");
+  if (options.symlinksOff === true) git(root, "config", "--local", "core.symlinks", "false");
   if (options.smudged === true) {
     git(root, "config", "--local", "filter.inject.smudge", "sed 's/pinned v1/NOT IN PINNED COMMIT/'");
     git(root, "config", "--local", "filter.inject.clean", "cat");
@@ -335,6 +352,8 @@ interface Run {
 interface Launch {
   readonly nodeArgs?: readonly string[];
   readonly env?: NodeJS.ProcessEnv;
+  /** Started through `/bin/sh` with this umask, which then `exec`s node. */
+  readonly umask?: string;
 }
 
 const start = (
@@ -343,7 +362,12 @@ const start = (
   argv: readonly string[],
   launch: Launch = {},
 ): { child: ChildProcess; done: Promise<Run> } => {
-  const child = spawn(process.execPath, [...(launch.nodeArgs ?? []), join(fixture.root, "scripts", script), ...argv], {
+  const nodeArgv = [...(launch.nodeArgs ?? []), join(fixture.root, "scripts", script), ...argv];
+  const [file, args] =
+    launch.umask === undefined
+      ? [process.execPath, nodeArgv]
+      : ["/bin/sh", ["-c", `umask ${launch.umask}; exec "$0" "$@"`, process.execPath, ...nodeArgv]];
+  const child = spawn(file, args, {
     cwd: fixture.root,
     env: { ...fixture.env, ...launch.env },
     detached: true,
@@ -446,7 +470,7 @@ const manifestIn = (dir: string): Record<string, unknown> & {
   endedAt: string;
   artifacts: { name: string; sha256: string }[];
   workingTree: { dirty: boolean; uncommittedWorkReviewed: boolean };
-  checkout: { removed: boolean };
+  checkout: { removed: boolean; trackedChangesDuringRun?: boolean; changedDuringRun?: string[] };
 } => JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"));
 
 const snapshot = (dir: string): Record<string, string> =>
@@ -715,7 +739,7 @@ describe.each(SCRIPTS)("%s", (script) => {
       // a680e971..ea57c9b0: the reviewer read `NOT IN PINNED COMMIT` and the run said PASS.
       expect(callsOf(fixture).map((call) => call.subject)).toEqual([]);
       expect(result.status).toBe(2);
-      expect(result.stderr).toMatch(/does not hold that commit's bytes/);
+      expect(result.stderr).toMatch(/disposable checkout of [0-9a-f]{12} does not hold/);
       expect(result.stderr).toMatch(/src\/subject\.txt: bytes differ from the commit/);
       expect(existsSync(join(fixture.root, "evidence"))).toBe(false);
       expect(git(fixture.root, "worktree", "list", "--porcelain")).toBe(worktrees);
@@ -765,6 +789,66 @@ describe.each(SCRIPTS)("%s", (script) => {
       expect(entryOf(summary, "core")).toMatchObject({ result: "ERROR", execution: "COMPLETED", report: "INVALID" });
       expect(summary?.findingsVerdict).toBe("UNDETERMINED");
       expect(existsSync(join(fixture.root, out, "core.json"))).toBe(false);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it.each([
+    ["loses", "chmod-off", "src/tool.sh: mode 100644 where the commit has 100755"],
+    ["gains", "chmod-on", "src/subject.txt: mode 100755 where the commit has 100644"],
+  ] as const)(
+    "does not report COMPLETE when a committed file %s its executable bit during the review",
+    async (_direction, mode, difference) => {
+      const fixture = makeFixture({ executable: true });
+      setPlan(fixture, { default: mode });
+
+      const result = await run(fixture, script, ["core"]);
+      const dir = runDirectoryOf(fixture, script, result);
+      const summary = summaryIn(dir);
+      // 02a3a7a6 compared bytes only: COMPLETE, PASS, exit 0, trackedChangesDuringRun false.
+      expect(summary?.execution).toBe("INCOMPLETE");
+      expect(result.status).toBe(1);
+      expect(summary?.findingsVerdict).toBe("UNDETERMINED");
+      expect(manifestIn(dir).checkout).toMatchObject({ trackedChangesDuringRun: true, changedDuringRun: [difference] });
+      expect(result.stderr).toMatch(/the checkout changed while the reviewers ran/);
+      expect(statSync(join(fixture.root, "src", "tool.sh")).mode & 0o100).toBe(0o100);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "refuses a checkout that git wrote with a symbolic link as a plain file, before any reviewer starts",
+    async () => {
+      const fixture = makeFixture({ symlinksOff: true });
+      setPlan(fixture, { default: "pass" });
+      expect(git(fixture.root, "status", "--porcelain", "--untracked-files=all")).toBe("");
+      const worktrees = git(fixture.root, "worktree", "list", "--porcelain");
+
+      const result = await run(fixture, script, ["core"]);
+      expect(callsOf(fixture)).toEqual([]);
+      expect(result.status).toBe(2);
+      expect(result.stderr).toMatch(/src\/link: not the symbolic link the commit holds/);
+      expect(existsSync(join(fixture.root, "evidence"))).toBe(false);
+      expect(git(fixture.root, "worktree", "list", "--porcelain")).toBe(worktrees);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "cannot be handed a checkout without its executable bit: the umask that would strip it stops the run first",
+    async () => {
+      const fixture = makeFixture({ executable: true });
+      setPlan(fixture, { default: "pass" });
+      const worktrees = git(fixture.root, "worktree", "list", "--porcelain");
+
+      // Git creates a 100755 file as 0777 & ~umask. A umask without the owner's execute bit also
+      // takes it from every directory, so neither git nor this script can build a checkout at all.
+      const result = await run(fixture, script, ["core"], { umask: "0100" });
+      expect(callsOf(fixture)).toEqual([]);
+      expect(result.status).toBe(2);
+      expect(result.stderr).toMatch(/could not prepare a disposable checkout/);
+      expect(existsSync(join(fixture.root, "evidence"))).toBe(false);
+      expect(git(fixture.root, "worktree", "list", "--porcelain")).toBe(worktrees);
     },
     TEST_TIMEOUT_MS,
   );
