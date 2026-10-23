@@ -393,6 +393,9 @@ describe("round 2 daemon regressions", () => {
       await vi.waitFor(() => expect(harness.cp.sessions.require(old).lifecycle).toBe(SessionLifecycle.ERROR));
       expect(harness.cp.sessions.require(current)).toMatchObject({ lifecycle: SessionLifecycle.READY, buzzActorId: null });
       expect(resolveCeoBuzzIdentity(harness.cp.db, current)).toBe(actor);
+      expect((await harness.cp.doctor.run("system")).findings.some(
+        (finding) => finding.scope === `session:${old}` && finding.blocking,
+      )).toBe(false);
       const settledCount = harness.cp.audit.byKind("SESSION_LIFECYCLE").filter((e) => e.sessionId === old).length;
       await new Promise<void>((done) => setTimeout(done, 80));
       expect(harness.cp.audit.byKind("SESSION_LIFECYCLE").filter((e) => e.sessionId === old)).toHaveLength(settledCount);
@@ -422,18 +425,29 @@ describe("round 2 daemon regressions", () => {
     } finally { signal.mockRestore(); await daemon.stop(); }
   });
 
-  it("keeps an active dead holder and dead owners of unfinished work actionable", async () => {
-    const { harness, run } = await makeDaemonStartHealthy();
-    const ceo = harness.cp.bindings.active("CEO")!.sessionId;
-    harness.cp.sessions.setPid(ceo, 2147483647);
-    expect((await harness.cp.doctor.run("session", ceo)).findings).toContainEqual(expect.objectContaining({ code: "SESSION_PROCESS_MISSING", blocking: true }));
-    harness.cp.sessions.setPid(run.ownerSessionId!, 2147483647);
-    expect(harness.cp.runs.transition(run.runId, RunState.BLOCKED, "test owner unavailable").allowed).toBe(true);
-    expect(harness.cp.bindings.revoke(run.ownerRoleKey!, "test", { allowBlockedRuns: true }).allowed).toBe(true);
-    expect((await harness.cp.doctor.run("session", run.ownerSessionId!)).findings).toContainEqual(expect.objectContaining({ code: "SESSION_PROCESS_MISSING", blocking: true }));
-    const reconciled = await new Daemon(harness.cp, { stateDir: tempDir("acp-startup-sweep-") }).reconcile();
-    expect(reconciled.sessionsMarkedError).toContain(ceo);
-  });
+  it.each(["active CEO", "revoked unfinished-work owner"])(
+    "ACP1187-R1-01: keeps a dead %s actionable after settlement", async (reference) => {
+      const { harness, run } = await makeDaemonStartHealthy();
+      const sessionId = reference === "active CEO"
+        ? harness.cp.bindings.active("CEO")!.sessionId
+        : run.ownerSessionId!;
+      harness.cp.sessions.setPid(sessionId, 2147483647);
+      if (reference === "revoked unfinished-work owner") {
+        expect(harness.cp.runs.transition(run.runId, RunState.BLOCKED, "test owner unavailable").allowed).toBe(true);
+        expect(harness.cp.bindings.revoke(run.ownerRoleKey!, "test", { allowBlockedRuns: true }).allowed).toBe(true);
+      }
+      const expected = expect.objectContaining({
+        code: "SESSION_PROCESS_MISSING", scope: `session:${sessionId}`, blocking: true,
+      });
+      expect((await harness.cp.doctor.run("system")).findings).toContainEqual(expected);
+      const reconciled = await new Daemon(harness.cp, { stateDir: tempDir("acp-startup-sweep-") }).reconcile();
+      expect(reconciled.sessionsMarkedError).toContain(sessionId);
+      expect(harness.cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
+      if (reference === "active CEO") expect(harness.cp.bindings.active("CEO")?.sessionId).toBe(sessionId);
+      else expect(harness.cp.runs.activeRunsOwnedBy(sessionId).map((owned) => owned.runId)).toContain(run.runId);
+      expect((await harness.cp.doctor.run("system")).findings).toContainEqual(expected);
+    },
+  );
 
   it("counts the current actor runtime as the ACTIVE holder after a surviving move", async () => {
     const harness = makeHarness();

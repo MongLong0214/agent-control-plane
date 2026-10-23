@@ -411,6 +411,47 @@ describe("round-2 registry regressions", () => {
     expect(await harness.cp.repositories.observe(repositoryId)).toMatchObject({ lastObservedHead: baseline, driftState: "DRIFTED" });
   });
 
+  it("ACP1187-R1-02: rejects HEAD and branch readings from an interleaved checkout", async () => {
+    const harness = makeHarness();
+    const { repositoryId } = await registerFixtureProject(harness);
+    const baseline = harness.cp.repositories.byId(repositoryId)!.lastObservedHead;
+    gitSync(harness.repoPath, ["checkout", "-b", "owner-feature"]);
+    writeFiles(harness.repoPath, { "README.md": "# feature descendant\n" });
+    const descendant = commitAll(harness.repoPath, "owner feature");
+    const readHead = git.tryRevParse;
+    const readBranch = git.currentBranch;
+    const readClean = git.isClean;
+    let headReads = 0;
+    let branchReads = 0;
+    let switchedBack = false;
+    const headProbe = vi.spyOn(git, "tryRevParse").mockImplementation(async (cwd, ref) => {
+      const head = await readHead(cwd, ref);
+      // Inspection sees B, while every branch probe up to acceptance sees dev at A.
+      if (++headReads === 1) gitSync(cwd, ["checkout", "dev"]);
+      return head;
+    });
+    const branchProbe = vi.spyOn(git, "currentBranch").mockImplementation(async (cwd) => {
+      branchReads++;
+      return readBranch(cwd);
+    });
+    const cleanProbe = vi.spyOn(git, "isClean").mockImplementation(async (cwd) => {
+      // After the original final branch probe, cleanliness and HEAD see owner-feature at B.
+      if (branchReads >= 2 && !switchedBack) {
+        gitSync(cwd, ["checkout", "owner-feature"]);
+        switchedBack = true;
+      }
+      return readClean(cwd);
+    });
+    try {
+      const observed = await harness.cp.repositories.observe(repositoryId);
+      expect(switchedBack).toBe(true);
+      expect(gitSync(harness.repoPath, ["rev-parse", "dev"])).toBe(baseline);
+      expect(gitSync(harness.repoPath, ["rev-parse", "HEAD"])).toBe(descendant);
+      expect(await readBranch(harness.repoPath)).toBe("owner-feature");
+      expect(observed).toMatchObject({ lastObservedHead: baseline, driftState: "DRIFTED" });
+    } finally { headProbe.mockRestore(); branchProbe.mockRestore(); cleanProbe.mockRestore(); }
+  });
+
   it.each(["head", "branch", "cleanliness", "manifest"])("rechecks %s before acknowledging a descendant", async (change) => {
     const harness = makeHarness();
     const { repositoryId } = await registerFixtureProject(harness);
@@ -438,7 +479,7 @@ describe("round-2 registry regressions", () => {
     });
     try {
       expect((await harness.cp.repositories.observe(repositoryId))?.lastObservedHead).toBe(baseline);
-      expect(reads).toBe(2);
+      expect(reads).toBeGreaterThanOrEqual(2);
     } finally { probe.mockRestore(); projectProbe.mockRestore(); }
   });
 

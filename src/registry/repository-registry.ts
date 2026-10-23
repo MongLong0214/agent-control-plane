@@ -327,23 +327,29 @@ export class RepositoryRegistry {
       const branch = defaultBranch && inspection.observedHead ? await currentBranch(record.checkoutPath) : null;
       const onDefaultBranch = defaultBranch !== undefined && branch !== "HEAD" && branch === defaultBranch;
       if (defaultBranch && inspection.observedHead && !onDefaultBranch) inspection.driftState = "DRIFTED";
-      // An unchanged head needs no acceptance or ancestry probe; only its observed verdict changes.
-      if (onDefaultBranch && inspection.clean && inspection.observedHead === record.lastObservedHead) {
-        inspection.driftState = "IN_SYNC";
-      }
-      if (record.registration === "REGISTERED" && onDefaultBranch && inspection.clean &&
-          inspection.observedHead && inspection.observedHead !== record.lastObservedHead &&
-          record.lastObservedHead &&
-          await mergeBase(record.checkoutPath, record.lastObservedHead, inspection.observedHead) === record.lastObservedHead) {
-        // Git probes are separate observations. Recheck the local checkout before accepting it,
-        // and never substitute a remote merge SHA for a head actually present here.
-        if (await currentBranch(record.checkoutPath) === defaultBranch &&
+      if (onDefaultBranch && inspection.clean && inspection.observedHead) {
+        const unchanged = inspection.observedHead === record.lastObservedHead;
+        const descendant = record.registration === "REGISTERED" && !unchanged && record.lastObservedHead &&
+          await mergeBase(record.checkoutPath, record.lastObservedHead, inspection.observedHead) === record.lastObservedHead;
+        if (unchanged || descendant) {
+          // A branch check alone cannot certify HEAD and cleanliness read later. Require two
+          // complete matching observations so a switch between probes cannot accept a head
+          // that was only ever present on another branch. No await follows the final DB checks.
+          const matchesCheckout = async (): Promise<boolean> =>
+            await currentBranch(record.checkoutPath) === defaultBranch &&
             await isClean(record.checkoutPath) &&
-            await tryRevParse(record.checkoutPath, "HEAD") === inspection.observedHead &&
-            this.byId(repositoryId)?.lastObservedHead === record.lastObservedHead &&
-            this.projects.get(record.projectId!)?.activeManifestDigest === manifest?.digest) {
-          this.acknowledgeHead(repositoryId, inspection.observedHead);
-          return this.byId(repositoryId);
+            await tryRevParse(record.checkoutPath, "HEAD") === inspection.observedHead;
+          if (await matchesCheckout() && await matchesCheckout() &&
+              this.byId(repositoryId)?.lastObservedHead === record.lastObservedHead &&
+              this.projects.get(record.projectId!)?.activeManifestDigest === manifest?.digest) {
+            if (descendant) {
+              this.acknowledgeHead(repositoryId, inspection.observedHead);
+              return this.byId(repositoryId);
+            }
+            inspection.driftState = "IN_SYNC";
+          } else {
+            inspection.driftState = "DRIFTED";
+          }
         }
       }
     } catch {

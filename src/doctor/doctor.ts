@@ -951,7 +951,8 @@ export class Doctor {
 
   private checkSessions(sessionId: string | null): Finding[] {
     const findings: Finding[] = [];
-    const sessions = sessionId ? [this.sessions.get(sessionId)].filter(Boolean) : this.sessions.live();
+    // Settlement changes lifecycle, not the authority or unfinished work referencing a session.
+    const sessions = sessionId ? [this.sessions.get(sessionId)].filter(Boolean) : this.sessions.list();
     for (const session of sessions) {
       if (!session) continue;
       if (session.lifecycle === SessionLifecycle.DRAINING) {
@@ -980,6 +981,8 @@ export class Doctor {
         const unfinishedWork = this.runs.activeRunsOwnedBy(session.sessionId).length > 0 || Boolean(this.db.get(
           `SELECT 1 FROM task_executions WHERE worker_session_id = ? AND status = 'RUNNING'`, [session.sessionId],
         ));
+        const terminal = session.lifecycle === SessionLifecycle.ERROR || session.lifecycle === SessionLifecycle.STOPPED;
+        if (!sessionId && terminal && !activeBinding && !unfinishedWork) continue;
         findings.push({
           code: "SESSION_PROCESS_MISSING",
           severity: activeBinding || unfinishedWork ? "ERROR" : "WARN",

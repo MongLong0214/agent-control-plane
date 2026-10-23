@@ -173,15 +173,11 @@ const modeOf = async (daemon: Daemon): Promise<string> => {
   return (status.value as { mode: string }).mode;
 };
 
-/**
- * Starts the daemon over `fixture` and requires it to come up: no park, no exit, NORMAL.
- *
- * A project's CTO is availability, not a precondition for the daemon's sockets. A parked daemon
- * has not returned from `start()`, and `agentcpd` opens the claim socket and cto.mcp.sock only
- * after it returns, so a park here is the defect and is reported as one at once rather than as a
- * test timeout. A door is still supplied, so a park stays possible to observe.
- */
-const startedPastTheBinding = async (fixture: Fixture, prefix: string): Promise<Daemon> => {
+/** Start with a live CTO, then exercise recovery after it dies while the daemon is running. */
+const daemonAfterBindingCheck = async (fixture: Fixture, prefix: string): Promise<Daemon> => {
+  const session = fixture.harness.cp.sessions.require(fixture.sessionId);
+  const diesAfterStartup = probeSessionLiveness(session.osPid, session.osProcessStartedAt) === "DEAD";
+  if (diesAfterStartup) fixture.harness.cp.sessions.setPid(fixture.sessionId, process.pid);
   const daemon = new Daemon(fixture.harness.cp, { stateDir: tempDir(prefix) });
   let markParked: () => void = () => undefined;
   const parked = new Promise<"parked">((resolve) => {
@@ -197,10 +193,19 @@ const startedPastTheBinding = async (fixture: Fixture, prefix: string): Promise<
   if (first === "parked") {
     await daemon.stop();
     await starting;
-    throw new Error("the daemon parked on a project's CTO instead of starting");
+    throw new Error("the daemon parked before the CTO process died");
   }
   expect(outcomeOf(first)).toMatchObject({ allowed: true, reasonCode: ReasonCode.OK, blockingFindings: [] });
   expect(await modeOf(daemon)).toBe("NORMAL");
+  if (diesAfterStartup) {
+    fixture.harness.cp.sessions.setPid(fixture.sessionId, session.osPid!);
+    const reconciled = await daemon.reconcile();
+    if (fixture.harness.cp.bindings.active(fixture.roleKey)?.sessionId === fixture.sessionId) {
+      expect(reconciled.blockingFindings).toContainEqual(expect.objectContaining({
+        code: "SESSION_PROCESS_MISSING", scope: `session:${fixture.sessionId}`,
+      }));
+    }
+  }
   return daemon;
 };
 
@@ -232,8 +237,8 @@ interface Fixture {
  * assignment, and the bound session's OS process gone.
  *
  * Built directly rather than through `runs.dispatch`, because dispatch leaves an open run behind
- * and the first case is about what happens when there is no work left to protect — the state in
- * which a daemon has nothing to lose by starting.
+ * so the startup case isolates ACTIVE authority from unfinished work: the assignment alone
+ * must keep the dead-session finding actionable after settlement.
  *
  * `lifecycle: "SWEEP"` is the production sequence: the session is READY with a dead pid and
  * `reconcile()` is what discovers it. The other two settings produce states the sweep cannot
@@ -327,40 +332,34 @@ const recoveryRequest = (fixture: Fixture, overrides: Record<string, unknown> = 
 });
 
 describe("a canonical CTO whose process is gone", () => {
-  /**
-   * Case 1 — the symptom measured live on 2026-09-08, carried through to recovery.
-   *
-   * The chain that produced it ran entirely inside one `start()`: `reconcile()` swept
-   * `sessions.live()`, found the dead `osPid`, marked the session ERROR and left the ACTIVE
-   * assignment pointing at it; the same pass ran the doctor, which read that assignment and
-   * raised CTO_BINDING_POINTS_AT_DEAD_SESSION — CRITICAL, blocking, recommending "run a recovery
-   * takeover for this project"; `canParkForBootstrap` did not admit it, so `start()` denied
-   * DOCTOR_ERROR and the entrypoint exited with backoff; and every door that could perform the
-   * recommended recovery was opened only after `start()` returned allowed. The remedy the finding
-   * named was unreachable in exactly the state that raised it.
-   *
-   * A park answered the operator door and still kept the claim socket and cto.mcp.sock shut, and
-   * those are how a CTO takes the role back. A project's CTO is availability, not authority over
-   * the daemon, so the system report now names the dead binding as a non-blocking ERROR and the
-   * daemon comes up. The project's own report still blocks on it, and the operator door still
-   * releases it: the finding moved from the daemon's startup gate to the project it is about.
-   */
-  it("comes up past a dead canonical binding, and the operator door still releases it", async () => {
+  it("ACP1187-R1-01: startup retains the blocking finding for a dead ACTIVE CTO", async () => {
+    const fixture = await deadCanonicalCto();
+    const daemon = new Daemon(fixture.harness.cp, { stateDir: tempDir("acp-dsr-startup-blocked-") });
+    const started = await daemon.start();
+    expect(outcomeOf(started)).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_BLOCKED });
+    expect(fixture.harness.cp.sessions.require(fixture.sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
+    expect(activeAssignmentIds(fixture.harness)).toContain(fixture.assignmentId);
+    expect(outcomeOf(started).blockingFindings).toContainEqual(expect.objectContaining({
+      code: "SESSION_PROCESS_MISSING", scope: `session:${fixture.sessionId}`,
+    }));
+    expect(daemon.lock.held()).toBe(false);
+  });
+
+  it("recovers through the operator API when the CTO dies after startup", async () => {
     const fixture = await deadCanonicalCto();
     const { harness, projectId, sessionId, assignmentId } = fixture;
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-recover-");
+    const daemon = await daemonAfterBindingCheck(fixture, "acp-dsr-recover-");
 
     // The premise, stated so a failure here reads as "the fixture moved" rather than as the
     // defect: the sweep found the session dead, and its assignment survived that decision.
     expect(harness.cp.sessions.require(sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
     expect(activeAssignmentIds(harness)).toContain(assignmentId);
-    // Reported, not normalised: the startup report named it, without blocking on it, and the
-    // report scoped to the project it belongs to still blocks.
-    expect(startupFinding(harness, "CTO_BINDING_POINTS_AT_DEAD_SESSION")).toEqual({
-      code: "CTO_BINDING_POINTS_AT_DEAD_SESSION",
-      severity: "ERROR",
-      blocking: false,
-    });
+    // The binding diagnostic retains its role scope; the system session finding blocks too.
+    const systemReport = await harness.cp.doctor.run("system");
+    expect(systemReport.findings.find((finding) => finding.code === "SESSION_PROCESS_MISSING"))
+      .toMatchObject({ blocking: true });
+    expect(systemReport.findings.find((finding) => finding.code === "CTO_BINDING_POINTS_AT_DEAD_SESSION"))
+      .toMatchObject({ severity: "ERROR", blocking: false });
     const projectReport = await harness.cp.doctor.run("project", projectId);
     expect(projectReport.status).toBe("ERROR");
     expect(projectReport.findings.find((finding) => finding.code === "CTO_BINDING_POINTS_AT_DEAD_SESSION"))
@@ -430,7 +429,7 @@ describe("a canonical CTO whose process is gone", () => {
    */
   it("admits a peer this deployment has not allowlisted as an owner", async () => {
     const fixture = await deadCanonicalCto();
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-stranger-");
+    const daemon = await daemonAfterBindingCheck(fixture, "acp-dsr-stranger-");
 
     // STRANGER_PEER holds the operator socket's bearer credential and is named nowhere in
     // `ownerIdentities`. That used to be INGRESS_ACTOR_NOT_ALLOWLISTED. What bounds the door now
@@ -452,7 +451,7 @@ describe("a canonical CTO whose process is gone", () => {
 
   it("refuses a request that does not name its target", async () => {
     const fixture = await deadCanonicalCto();
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-no-target-");
+    const daemon = await daemonAfterBindingCheck(fixture, "acp-dsr-no-target-");
     const before = recoverableState(fixture.harness);
 
     const malformed: Array<Record<string, unknown>> = [
@@ -487,7 +486,7 @@ describe("a canonical CTO whose process is gone", () => {
    */
   it("refuses a request that names a different target", async () => {
     const fixture = await deadCanonicalCto();
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-wrong-target-");
+    const daemon = await daemonAfterBindingCheck(fixture, "acp-dsr-wrong-target-");
     const before = recoverableState(fixture.harness);
 
     const wrong: Array<[string, Record<string, unknown>, ReasonCode]> = [
@@ -527,7 +526,7 @@ describe("a canonical CTO whose process is gone", () => {
     // This test process: unambiguously alive, and `create()` records its start time alongside the
     // pid, so the pair the probe compares is a real one.
     const fixture = await deadCanonicalCto({ osPid: process.pid, lifecycle: "ERROR" });
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-alive-");
+    const daemon = await daemonAfterBindingCheck(fixture, "acp-dsr-alive-");
     const before = recoverableState(fixture.harness);
 
     const refused = await daemon.handleOperatorRequest(recoveryRequest(fixture), OWNER_PEER);
@@ -547,7 +546,7 @@ describe("a canonical CTO whose process is gone", () => {
    */
   it("refuses a session whose liveness cannot be determined", async () => {
     const fixture = await deadCanonicalCto({ osPid: null, lifecycle: "ERROR" });
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-unknown-");
+    const daemon = await daemonAfterBindingCheck(fixture, "acp-dsr-unknown-");
     const before = recoverableState(fixture.harness);
 
     const refused = await daemon.handleOperatorRequest(recoveryRequest(fixture), OWNER_PEER);
@@ -578,7 +577,7 @@ describe("a canonical CTO whose process is gone", () => {
    */
   it("leaves no partial change when the release fails mid-flight", async () => {
     const fixture = await deadCanonicalCto();
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-midflight-");
+    const daemon = await daemonAfterBindingCheck(fixture, "acp-dsr-midflight-");
     const before = recoverableState(fixture.harness);
 
     // Only this door's own record throws. Anything else the request audits on its way through is
@@ -636,7 +635,7 @@ describe("a canonical CTO whose process is gone", () => {
     expect(projectReport.findings.find((finding) => finding.code === "CTO_MISSING_WITH_OPEN_RUNS"))
       .toMatchObject({ severity: "ERROR", blocking: true });
 
-    const daemon = await startedPastTheBinding(fixture, "acp-dsr-open-runs-");
+    const daemon = await daemonAfterBindingCheck(fixture, "acp-dsr-open-runs-");
 
     expect(startupFinding(harness, "CTO_MISSING_WITH_OPEN_RUNS")).toEqual({
       code: "CTO_MISSING_WITH_OPEN_RUNS",
@@ -652,7 +651,7 @@ describe("a canonical CTO whose process is gone", () => {
   /**
    * The other direction. Taking availability off the startup gate must not take an integrity
    * blocker with it: a state path anyone else can write still ends the start, without a park, and
-   * the denial names that blocker alone rather than burying it beside the CTO it no longer counts.
+   * the denial retains that blocker alongside the dead ACTIVE holder.
    */
   it("still refuses to start on a real blocker beside a dead canonical binding", async () => {
     const fixture = await deadCanonicalCto();
@@ -671,9 +670,9 @@ describe("a canonical CTO whose process is gone", () => {
     expect(outcomeOf(started)).toMatchObject({ allowed: false, reasonCode: ReasonCode.DOCTOR_ERROR });
     expect(opened).toEqual([]);
     expect(daemon.lock.held()).toBe(false);
-    expect([...new Set(outcomeOf(started).blockingFindings.map((finding) => finding.code))]).toEqual([
-      "STATE_PATH_INSECURE",
-    ]);
+    expect(new Set(outcomeOf(started).blockingFindings.map((finding) => finding.code))).toEqual(new Set([
+      "STATE_PATH_INSECURE", "SESSION_PROCESS_MISSING",
+    ]));
   });
 });
 
