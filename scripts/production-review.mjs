@@ -6,22 +6,46 @@
  * for structured findings per area. The reviewer reads the repository itself under a
  * read-only sandbox, so it sees the real code rather than an excerpt someone chose.
  *
+ * What it reads, and where it writes (#1189, `scripts/lib/audit-run.mjs`): one pinned commit, in a
+ * disposable detached checkout of that commit, never the live working tree. A dirty working tree
+ * whose HEAD is the requested commit, or a ref that names no commit, is refused before any reviewer
+ * starts. Every run writes a new directory holding `manifest.json` (run id, commit and tree,
+ * selected areas, reviewer identity, per-area execution and artifacts) and a `summary.json` that
+ * counts only the reports that manifest attributes. A reviewer that failed, timed out or was
+ * interrupted has no verdict, and nothing an earlier run wrote can stand in for it.
+ *
+ * What it is not. A frontier PR review and this broad, one-off diagnostic serve different purposes:
+ * frontier judges one change within its bounded attempts; this reads whole areas of one commit for
+ * defects nobody asked about. It is not meant to run on every PR. Running it is not a way around
+ * frontier's three-attempt limit and does not count as an additional approving review; its exit
+ * status says whether the reviewers ran, its findings verdict says what they found, and neither is
+ * a merge approval.
+ *
  * Usage:
- *   node scripts/production-review.mjs                          # every area
+ *   node scripts/production-review.mjs                          # every area, at HEAD
  *   node scripts/production-review.mjs core guard               # named areas only
- *   node scripts/production-review.mjs --out=evidence/review-round3
+ *   node scripts/production-review.mjs --rev=<commit-ish>       # another recorded commit
+ *   node scripts/production-review.mjs --out=evidence/review-round3   # must not exist yet
+ *   node scripts/production-review.mjs --allow-dirty            # HEAD, recording that uncommitted work was not reviewed
+ *   node scripts/production-review.mjs --area-timeout-ms=600000 # per-area bound (default 45 minutes)
+ *
+ * The default output directory is `evidence/local/audit-runs/production-review-<run id>/`. A named
+ * one is refused if it exists: filed issues cite a round's evidence path, and
+ * `scripts/ssot-report.mjs` reconciles the tracker against it, so a later run must not rewrite it.
+ * Exit status: 0 every selected area returned a well-formed report, 1 at least one did not,
+ * 2 refused before starting, 130 interrupted.
  */
-import { execFile } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { runAudit } from "./lib/audit-run.mjs";
+
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
-// A later round must not overwrite an earlier one: the filed issues cite their round's
-// evidence path, and `scripts/ssot-report.mjs` reconciles the tracker against it.
-const outArg = process.argv.find((a) => a.startsWith("--out="));
-const outDir = outArg ? join(repoRoot, outArg.slice("--out=".length)) : join(repoRoot, "evidence", "review");
-mkdirSync(outDir, { recursive: true });
+
+// The model is pinned by owner directive; see the record on this file before changing it.
+const MODEL = "gpt-6.1-sol";
+const REASONING_EFFORT = "xhigh";
 
 const SCHEMA = {
   type: "object",
@@ -174,10 +198,13 @@ const AREAS = {
   },
 };
 
-const prompt = (key, area) =>
+const prompt = (key, area, revision) =>
   [
     "You are an independent production-readiness reviewer. You did not write this code.",
     "Your job is to attack it, not to praise it. Report only defects you can point at in the code.",
+    "",
+    `Revision under review: commit ${revision.commit} (tree ${revision.tree}). Your working directory`,
+    "is a disposable checkout of exactly that commit; review it, not any other state of the repository.",
     "",
     `# Area under review: ${area.title}`,
     "",
@@ -219,71 +246,69 @@ const prompt = (key, area) =>
     "Return only the JSON object required by the output schema.",
   ].join("\n");
 
-const run = (key, area) =>
-  new Promise((resolve) => {
-    const schemaPath = join(outDir, `${key}.schema.json`);
-    const outPath = join(outDir, `${key}.json`);
-    const logPath = join(outDir, `${key}.log`);
-    writeFileSync(schemaPath, JSON.stringify(SCHEMA));
-
-    const started = Date.now();
-    const child = execFile(
-      "codex",
-      [
-        "exec",
-        "-m",
-        "gpt-6.1-sol",
-        "-c",
-        'model_reasoning_effort="xhigh"',
-        "-s",
-        "read-only",
-        "--skip-git-repo-check",
-        "--output-schema",
-        schemaPath,
-        "-o",
-        outPath,
-        prompt(key, area),
-      ],
-      { cwd: repoRoot, maxBuffer: 64 * 1024 * 1024, timeout: 45 * 60 * 1000 },
-      (err, stdout, stderr) => {
-        writeFileSync(logPath, `${stdout ?? ""}\n--- stderr ---\n${stderr ?? ""}`);
-        const seconds = Math.round((Date.now() - started) / 1000);
-        const ok = existsSync(outPath);
-        let verdict = "NO_OUTPUT";
-        let findings = 0;
-        if (ok) {
-          try {
-            const parsed = JSON.parse(readFileSync(outPath, "utf8"));
-            verdict = parsed.verdict;
-            findings = (parsed.findings ?? []).length;
-          } catch {
-            verdict = "UNPARSABLE";
-          }
-        }
-        console.log(
-          `${key.padEnd(11)} ${verdict.padEnd(10)} findings=${String(findings).padEnd(3)} ${seconds}s${err ? ` (exec error: ${err.message.slice(0, 80)})` : ""}`,
-        );
-        resolve({ key, verdict, findings, seconds });
-      },
-    );
-    child.stdin?.end();
-  });
-
-const requested = process.argv.slice(2).filter((a) => !a.startsWith("--"));
-const keys = requested.length > 0 ? requested : Object.keys(AREAS);
-
-for (const key of keys) {
-  if (!AREAS[key]) {
-    console.error(`unknown area: ${key}`);
-    process.exit(2);
+/**
+ * The model `codex exec` says it is running, read only from its own configuration header, which
+ * it writes to stderr before anything else: `OpenAI Codex v…`, `--------`, `key: value` lines,
+ * `--------`. Only that first block is read — blank lines may precede it, nothing else may — and
+ * never anything after it, and never stdout, which carries the reviewer's own final message. A
+ * header that is absent, does not open the stream, is interrupted by a line that is not
+ * `key: value`, is never closed, or does not hold exactly one `model:` line names no model, and
+ * the area is then MODEL_UNVERIFIED. Measured: searching the whole output let a model-less
+ * genuine header be "completed" by a sample header the reviewer copied from the PRD to stdout,
+ * and an unclosed block take a later `model:` line from the session. ANSI styling and a leading
+ * `[timestamp]` on each line are tolerated.
+ */
+const HEADER_RULE = "--------";
+const observedModelOf = (stderr) => {
+  const lines = stderr
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\[[^\]]*\]\s*/, "").trimEnd());
+  let index = 0;
+  while (index < lines.length && lines[index].trim() === "") index += 1;
+  if (!(lines[index] ?? "").startsWith("OpenAI Codex v") || lines[index + 1] !== HEADER_RULE) return null;
+  const models = [];
+  for (index += 2; index < lines.length; index += 1) {
+    if (lines[index] === HEADER_RULE) return models.length === 1 ? models[0] : null;
+    const entry = /^([a-z][a-z ]*): (.*)$/.exec(lines[index]);
+    if (entry === null) return null; // session content before the header closed
+    if (entry[1] === "model") models.push(/^\S+$/.test(entry[2]) ? entry[2] : null);
   }
-}
+  return null; // never closed
+};
+
+const reviewArea = async (key, area, ctx) => {
+  const schemaFile = `${key}.schema.json`;
+  const schemaPath = join(ctx.outDir, schemaFile);
+  writeFileSync(schemaPath, JSON.stringify(SCHEMA));
+  const child = await ctx.runChild("codex", [
+    "exec",
+    "-m",
+    ctx.model,
+    "-c",
+    `model_reasoning_effort="${REASONING_EFFORT}"`,
+    "-s",
+    "read-only",
+    "--skip-git-repo-check",
+    "--output-schema",
+    schemaPath,
+    "-o",
+    ctx.reportPath,
+    prompt(key, area, ctx.revision),
+  ]);
+  // codex writes the report itself; it is read only if the child completed.
+  return { child, candidate: { kind: "file" }, artifacts: [schemaFile], observedModel: observedModelOf(child.stderr) };
+};
 
 // Areas are independent — disjoint file sets, no shared state — so they run concurrently.
 // Each is its own `codex exec` process; the only shared resource is provider quota, which
 // the caller decides to spend.
-const results = await Promise.all(keys.map((key) => run(key, AREAS[key])));
-
-writeFileSync(join(outDir, "summary.json"), JSON.stringify({ results }, null, 2));
-const blocked = results.filter((r) => r.verdict !== "PASS");
-console.log(`\n${results.length} areas reviewed; ${blocked.length} not PASS`);
+await runAudit({
+  tool: "production-review",
+  script: "scripts/production-review.mjs",
+  repoRoot,
+  areas: AREAS,
+  sequential: false,
+  reviewer: { cli: "codex", model: MODEL, reasoningEffort: REASONING_EFFORT, sandbox: "read-only" },
+  reviewArea,
+});
