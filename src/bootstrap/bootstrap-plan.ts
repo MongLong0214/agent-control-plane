@@ -842,7 +842,8 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
   return {
     schema: BOOTSTRAP_PLAN_GUIDE_SCHEMA_ID,
     submit: [
-      "Call mcp__acp-cto__plan_submit with { idempotencyKey, runId, plan, tasks }.",
+      "If contract_get carries bootstrapPlanDigest, read mcp__acp-cto__bootstrap_plan_get with { runId }, then call mcp__acp-cto__plan_submit with { idempotencyKey, runId, bootstrapPlanDigest }, without plan or tasks. This submits the exact CEO-delivered input; it grants no execution approval.",
+      "Otherwise call mcp__acp-cto__plan_submit with { idempotencyKey, runId, plan, tasks }.",
       "Use the same idempotencyKey for an identical retry. " + MCP_MUTATION_RECOVERY,
       "tasks: at least one task { key, title, category }, for example one implementation task that creates the repository.",
     ],

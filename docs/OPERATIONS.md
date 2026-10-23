@@ -145,3 +145,85 @@ The daemon also refuses to fabricate the following configuration:
 
 Each absent input should be treated as a non-passing operating condition, not filled with a
 placeholder or a guessed default. The current tracker links are collected in [STATUS.md](STATUS.md).
+
+## Supplying a compiled bootstrap PLAN
+
+This is input delivery through the existing Hermes/CTO MCP authentication and
+`run_artifacts` storage. It creates no owner approval, CONFIRM, application
+reservation or permission to execute an external write.
+
+1. Create the run, then have RF compile the final submission with that run id:
+   UTF-8 JSON `{ "runId": "run_...", "plan": { ... }, "tasks": [ ... ] }`.
+   Keep the resulting bytes; do not parse and reserialize the file for transport.
+   `plan.requestDigest` must equal the run's `contractDigest`. The full manifest,
+   inline genesis, operation id and repository operations must name the intended
+   project and repository. The body limit is 131,072 bytes (128 KiB).
+2. The CEO reviews the complete final body and computes `sha256:<lowercase hex>`
+   over its exact UTF-8 bytes, including whitespace and trailing newlines. Never
+   attach a temporary draft before this review.
+3. On the current CEO's authenticated Hermes **owner turn**, call:
+
+   ```text
+   bootstrap_plan_attach({
+     idempotencyKey, runId, planBody, expectedSha256,
+     contractDigest, bootstrapOperationId, projectId, repositoryIdentity
+   })
+   ```
+
+   `planBody` is a string carrying the original file contents. MCP JSON escaping
+   preserves that string; ACP never reserializes its JSON to determine the hash.
+   The binding arguments must match the run and the body: `requestDigest`,
+   `bootstrapOperationId`, manifest project id, and the single manifest repository
+   remote / GitHub operation target. `repositoryIdentity` is `github:<owner>/<repo>`.
+4. The bound BOOTSTRAP_CTO reads `bootstrap_plan_get({ runId })`, which returns
+   `{ digest, planBody }`. `digest` is the exact-byte SHA-256, and `planBody`
+   decodes to the original bytes. `contract_get` also advertises this digest.
+   Submit with `plan_submit({ idempotencyKey, runId, bootstrapPlanDigest: digest })`,
+   omitting `plan` and `tasks`; ACP resolves both from the stored bytes.
+
+At attach ACP compares `expectedSha256` with the exact bytes and binds them to
+the run, contract, operation and target. At read it checks the immutable artifact
+row's canonical digest, its attachment audit receipt, the exact bytes' SHA-256,
+and the current binding context. At submit it repeats these checks and compares
+`bootstrapPlanDigest` with the current input's exact-byte hash, including on a
+cached mutation retry. It then uses the existing manifest/genesis normalization
+and semantic digest checks. The response's `digest` is the input SHA-256;
+`planDigest` is the separate canonical digest of the normalized PLAN, including
+its `bootstrapPlanDigest` source binding. Neither digest is an execution approval.
+
+Initial attachment is accepted before any PLAN exists while the run is `QUEUED`,
+`ACTIVE` or `BLOCKED`. A queued run may have no owner yet; otherwise the run's
+owner pin must separately match the current binding generation and incarnation.
+An identical retry is idempotent, with one artifact/audit/wake. Different bytes
+are refused unless replacement is explicit. Cancelled/terminal runs and stale
+owners are refused, including cached attach and submit retries. Use the same
+idempotency key for identical retries under the existing MCP fingerprint rules.
+
+For a later final correction, the CEO reviews/hashes the new bytes and calls the
+same attach tool with a new idempotency key and
+`replacesSha256: <current input's exact-byte digest>`. Its run/contract/operation/
+project/repository binding must stay the same. ACP invokes existing candidate
+invalidation and artifact supersession atomically: previous input and PLAN stay
+immutable but superseded; earlier candidate-bound review/approval evidence is
+withdrawn. Old references and submit receipts cannot authorize the replacement.
+The owner must submit the new digest and obtain fresh review and CONFIRM. A
+`REVISION_REQUIRED` run still needs the ordinary CEO redispatch before submit.
+Reserved/confirmed applications remain frozen under the existing guard; a
+superseded input cannot be resurrected. No implicit overwrite or retarget exists.
+
+Attaching enqueues a digest-only `RUN_DISPATCH` using the existing in-band outbox
+and wake. It does not resolve an escalation. For blocked
+`run_284fdfe39d4a405b9b763b10`, after deployment: inspect `run_get` for its current
+owner, contract digest and open escalation; compile/review/attach as above; then
+resolve that **current** escalation with a short read/submit instruction. Do not
+assume historical escalation 142936 or 143182 remains open. The run must be
+`ACTIVE` to submit. Independent blind review, owner approval, CEO CONFIRM, genesis
+PR and exact-head CI gates continue unchanged.
+
+Input uses a versioned `ArtifactKind.HANDOFF` envelope
+(`acp.bootstrap-plan-input.v1`) in the existing `run_artifacts` table. Base64
+preserves exact UTF-8 bytes despite canonical JSON newline normalization;
+activation handoff readers exclude this subtype. No schema migration, separate
+store or delivery system is added. Genesis secret screening remains at RF compile
+and ACP normalization. Runs without attachments keep the existing body-based
+contract/`plan_submit` flow.

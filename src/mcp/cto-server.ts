@@ -1,11 +1,11 @@
-import { genesisBundleSchema } from '../bootstrap/genesis-bundle.ts';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
+import { submittedPlanSchema, submittedTasksSchema } from "../bootstrap/plan-input-schema.ts";
+import { readBootstrapPlanAttachment, resolveBootstrapPlanInput, bootstrapInputMutationAuthority } from "../bootstrap/bootstrap-plan-artifact.ts";
 import type { BootstrapActivation, BootstrapHandoffReceipt } from "../bootstrap/activation.ts";
 import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { bootstrapPlanGuide, isProjectlessBootstrap, planForSubmission } from "../bootstrap/bootstrap-plan.ts";
-import { githubOperationSchema } from "../bootstrap/repo-factory-github.ts";
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import type { ProductionGate } from "../ceo/production-gate.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
@@ -184,8 +184,10 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       const run = source.runs.require(runId);
       const manifest = run.pinnedManifestDigest ? source.projects.manifest(run.pinnedManifestDigest) : null;
       const plan = source.artifacts.latest(runId, ArtifactKind.PLAN);
+      const input = run.kind === RunKind.PROJECT_BOOTSTRAP ? readBootstrapPlanAttachment(source, runId) : null;
       const contract = {
         run,
+        ...(input?.allowed ? { bootstrapPlanDigest: input.value.digest } : {}),
         contract: source.artifacts.latest(runId, ArtifactKind.TASK_CONTRACT)?.content ?? null,
         ...(plan ? { plan: plan.content, tasks: standardWorkTasks(source, runId) } : {}),
         pinnedManifestDigest: run.pinnedManifestDigest,
@@ -203,11 +205,15 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       // a credential. A stored PLAN also exposes its tasks for outcome reconciliation.
       return run.kind === RunKind.STANDARD_WORK && !plan ? { ...contract, tasks: standardWorkTasks(source, runId) } : contract;
     },
+    bootstrapInputMutationAuthority: (runId: string, result: boolean) => bootstrapInputMutationAuthority(source, runId, result),
+    bootstrapPlanForRun: (runId: string) => readBootstrapPlanAttachment(source, runId),
+    resolvePlanInput: (runId: string, input: { bootstrapPlanDigest?: string; plan?: Record<string, unknown>; tasks?: z.infer<typeof submittedTasksSchema> }) =>
+      resolveBootstrapPlanInput(source, runId, input),
     // #246 C2 — a project-less bootstrap run's PLAN carries its manifest in full, checked portable
     // and against the digest the PLAN names before anything is stored. #246 B2-a — so does a
     // CONTRACT_CHANGE run's, checked against the run's pinned manifest as well. Any other run's is
     // stored exactly as before.
-    submitPlan: (runId: string, plan: Record<string, unknown>): Decision<{ digest: string }> => {
+    submitPlan: (runId: string, plan: Record<string, unknown>, bootstrapPlanDigest?: string): Decision<{ digest: string }> => {
       // #246 C3 — the contract freeze: once an external write of a bootstrap run's application may
       // have happened, its PLAN is never replaced, so a recovery can only re-apply what was frozen.
       const frozen = source.bootstrapApplications.assertNotFrozen(runId, "plan_submit");
@@ -221,7 +227,7 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       const stored = isProjectlessBootstrap(run) && admitted.value["genesis"] !== undefined
         ? {...admitted.value,originatingContract:source.artifacts.latest<unknown>(runId,ArtifactKind.TASK_CONTRACT)?.content ?? null}
         : admitted.value;
-      return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, stored).digest });
+      return allow(ReasonCode.OK, { digest: source.artifacts.put(runId, ArtifactKind.PLAN, bootstrapPlanDigest ? { ...stored, bootstrapPlanDigest } : stored).digest });
     },
     submitTasks: (runId: string, tasks: Parameters<TaskGraph["submit"]>[1]) => source.tasks.submit(runId, tasks),
     isProjectlessBootstrapRun: (runId: string) => isProjectlessBootstrap(source.runs.require(runId)),
@@ -229,9 +235,9 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     // supersession of the earlier PLAN's tasks, the one new task and its BOOTSTRAP_PLAN_TASKS binding
     // commit in one transaction, and any refusal rolls every one of them back. BOOT-01 — the graph is
     // one task with no dependency: the repository create that CEO CONFIRM settles from its receipt.
-    submitBootstrapPlan: (runId: string, plan: Record<string, unknown>, tasks: Parameters<TaskGraph["submit"]>[1]) =>
+    submitBootstrapPlan: (runId: string, plan: Record<string, unknown>, tasks: Parameters<TaskGraph["submit"]>[1], bootstrapPlanDigest?: string) =>
       source.db.txDecision((): Decision<unknown> => {
-        const stored = port.submitPlan(runId, plan);
+        const stored = port.submitPlan(runId, plan, bootstrapPlanDigest);
         if (!stored.allowed) return stored;
         // ROUND1-ESCAPE-01 — the artifact store hands back an identical earlier PLAN without making it
         // current, so a re-plan to it would leave the newer PLAN current behind its tasks. It is refused
@@ -251,7 +257,10 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
             { runId, refusal: "BOOTSTRAP_PLAN_TASK_COUNT", tasks: tasks.length },
           );
         }
-        return port.submitTasks(runId, tasks);
+        const submitted = port.submitTasks(runId, tasks);
+        return submitted.allowed && bootstrapPlanDigest
+          ? allow(ReasonCode.OK, { digest: bootstrapPlanDigest, planDigest: current, tasks: submitted.value })
+          : submitted;
       }),
     ownerRoleKeyForRun: (runId: string) => source.runs.ownerRoleKeyFor(source.runs.require(runId)),
     acquireClaims: (input: Parameters<ClaimRegistry["acquire"]>[0]) => source.claims.acquire(input),
@@ -430,7 +439,13 @@ const createCtoServerFromPort = (
     let current!: { sessionId: string; bindingGeneration: number; roleKey: string };
     return write(toolName, args, peer => execute(peer, current), peer => {
       const fenced = owner(peer, args.runId);
-      if (fenced.allowed) current = fenced.value;
+      if (fenced.allowed) {
+        current = fenced.value;
+        if (toolName === "plan_submit" || toolName === "result_submit") {
+          const input = port.bootstrapInputMutationAuthority(args.runId, toolName === "result_submit");
+          return input.allowed ? allow(ReasonCode.OK, { ...fenced.value, ...input.value }) : input;
+        }
+      }
       return fenced;
     });
   };
@@ -527,55 +542,32 @@ const createCtoServerFromPort = (
     }),
   );
   server.registerTool(
+    "bootstrap_plan_get",
+    { description: "Read this run's CEO-delivered bootstrap PLAN input and exact-byte digest.", inputSchema: runIdentity },
+    async (args) => read("bootstrap_plan_get", (peer) => {
+      const fenced = owner(peer, args.runId);
+      return fenced.allowed ? respond(port.bootstrapPlanForRun(args.runId)) : respond(fenced);
+    }),
+  );
+  server.registerTool(
     "plan_submit",
     {
       description: "Submit the lean plan and dynamic task graph.",
       inputSchema: {
         ...mutation, ...runIdentity,
-        plan: z.object({
-          summary: z.string(),
-          genesis: genesisBundleSchema.optional(),
-          repositoryContentChange: z.boolean().optional(),
-          firstActivation: z.boolean().optional(),
-          workflowRevisions: z.array(z.object({
-            repositoryRole: z.string(), repositoryIdentity: z.string(), path: z.string(), checkName: z.string(),
-            commitSha: z.string().regex(/^[a-f0-9]{40}$/), fileDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-          }).strict()).optional(),
-          dependencies: z.array(z.string()).default([]),
-          repositoryIntent: z.array(z.string()).default([]),
-          verificationIntent: z.array(z.string()).default([]),
-          knownConflicts: z.array(z.string()).default([]),
-          risks: z.array(z.string()).default([]),
-          removedOverengineering: z.array(z.string()).default([]),
-          bootstrapOperationId: z.string().min(1).optional(),
-          requestDigest: z.string().min(1).optional(),
-          projectManifestDigest: z.string().min(1).optional(),
-          // Issue #246 — each operation as the Repo Factory runner executes it and the owner
-          // approves it, desired state included: `githubOperationSchema` itself, rather than a
-          // second copy of its rules here. An operation named by identity only is still accepted,
-          // as before; such a PLAN is refused as PLAN_NOT_EXECUTABLE at approval and execution.
-          githubOperations: z.array(z.union([
-            githubOperationSchema,
-            z.object({
-              operationId: z.string().min(1),
-              resourceType: z.string().min(1),
-              resourceIdentity: z.string().min(1),
-            }).strict(),
-          ])).optional(),
-          // Issue #246 PR-C slice C2 — a project-less bootstrap run's full project manifest. It must be
-          // portable and its digest must be `projectManifestDigest`; the PLAN keeps it, so the PLAN
-          // digest covers it. #246 B2-a — a CONTRACT_CHANGE run's PLAN must carry it, under the same
-          // rules and checked against the run's pinned manifest. Any other run's plan never stores it.
-          projectManifest: z.record(z.unknown()).optional(),
-        }),
-        tasks: z.array(z.object({ key: z.string(), title: z.string(), category: z.enum(["mechanical", "implementation", "investigation", "integration", "test", "review", "docs", "migration", "benchmark", "security"]), dependsOn: z.array(z.string()).default([]), spec: z.record(z.unknown()).default({}) })).min(1),
+        bootstrapPlanDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+        plan: submittedPlanSchema.optional(),
+        tasks: submittedTasksSchema.optional(),
       },
     },
     async (args) => writeOwned("plan_submit", args, () => {
-      if (port.isProjectlessBootstrapRun(args.runId)) return respond(port.submitBootstrapPlan(args.runId, args.plan, args.tasks));
-      const stored = port.submitPlan(args.runId, args.plan);
+      const resolved = port.resolvePlanInput(args.runId, args);
+      if (!resolved.allowed) return respond(resolved);
+      const { plan, tasks, bootstrapPlanDigest } = resolved.value;
+      if (port.isProjectlessBootstrapRun(args.runId)) return respond(port.submitBootstrapPlan(args.runId, plan, tasks, bootstrapPlanDigest));
+      const stored = port.submitPlan(args.runId, plan, bootstrapPlanDigest);
       if (!stored.allowed) return respond(stored);
-      return respond(port.submitTasks(args.runId, args.tasks));
+      return respond(port.submitTasks(args.runId, tasks));
     }),
   );
   server.registerTool(
