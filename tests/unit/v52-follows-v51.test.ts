@@ -14,8 +14,8 @@ import { contentDigests } from "../helpers/released-v45-schema.ts";
 
 afterAll(cleanupTempDirs);
 
-/** v51's receipt as the build before its freeze computed it, from schema.sql at 267a8142. */
-const V51_CHECKSUM = "sha256:53de3dd7c9967d544843502d6ef5d058f164aa63796d5f67f2a666fff748b6c7";
+/** v51's receipt as the build before its freeze computed it, from schema.sql at 3915f78c. */
+const V51_CHECKSUM = "sha256:35966ee416fc1e79d53c1eeb8f00c51b92a2c4e10309838d93fab77060e9d39c";
 
 /** What v51 installs, named here rather than read from the code under test. */
 const V51_OBJECTS = [

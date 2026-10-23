@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { readBuzzSubscriberConfig } from '../buzz/buzz-mention-subscriber.ts';
 import { CanonicalSessionRegistry } from '../registry/canonical-session-registry.ts';
-import type { OutboxMessage } from "../outbox/outbox.ts";
+import { outboxDeliveryReadback, type OutboxMessage } from "../outbox/outbox.ts";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
@@ -1664,21 +1664,21 @@ export const createBuzzMessageIngress = (
     // (S→T→S cannot hide). Unrelated session writes at restart do not change this proof. Each change
     // record commits in the transaction that changes the address or runtime; new bindings advance
     // the generation. This is read from the records each time, never from a
-    // remembered flag; every comparison is at the records' own precision. Otherwise the floor there is
-    // the migration itself. Either floor v51 derived is rounded up to a whole second for admission only
+    // remembered flag; change ordering uses the migration's durable audit high-water, never wall-clock
+    // equality. Otherwise the floor there is the migration itself. Either floor v51 derived is rounded up to a whole second for admission only
     // (`wholeSecondFloor`; FCR-12), so mail signed in the anchor's or the migration's own second is
     // refused (and recorded) rather than admitted.
     recipientHistorySince: (roleKey, conversation) => {
       const row = cp.db.get<{
         joined_at: string; unknown_before: string | null; anchored_room: string | null; anchored_generation: number | null;
         anchored_session: string | null; current_generation: number | null; current_session: string | null; current_room: string | null;
-        last_address_change_at: string | null; last_move_at: string | null;
+        audit_high_water: number | null; last_address_change_id: number | null; last_move_id: number | null;
       }>(
-        `SELECT m.joined_at, u.unknown_before, u.room AS anchored_room, u.binding_generation AS anchored_generation,
+        `SELECT m.joined_at, u.unknown_before, u.audit_high_water, u.room AS anchored_room, u.binding_generation AS anchored_generation,
                 u.session_id AS anchored_session, a.binding_generation AS current_generation,
                 s.session_id AS current_session, s.buzz_address AS current_room,
-                (SELECT MAX(e.at) FROM audit_events e WHERE e.kind = 'SESSION_BUZZ_ADDRESS_CHANGED' AND e.session_id = u.session_id) AS last_address_change_at,
-                (SELECT MAX(e.at) FROM audit_events e WHERE e.kind = 'BINDING_RUNTIME_MOVED' AND e.role_key = m.role_key) AS last_move_at
+                (SELECT MAX(e.event_id) FROM audit_events e WHERE e.kind = 'SESSION_BUZZ_ADDRESS_CHANGED' AND e.session_id = u.session_id) AS last_address_change_id,
+                (SELECT MAX(e.event_id) FROM audit_events e WHERE e.kind = 'BINDING_RUNTIME_MOVED' AND e.role_key = m.role_key) AS last_move_id
            FROM role_room_memberships m
            LEFT JOIN role_room_history_unknown u ON u.role_key = m.role_key
            LEFT JOIN assignments a ON a.role_key = m.role_key AND a.status = 'ACTIVE'
@@ -1688,13 +1688,15 @@ export const createBuzzMessageIngress = (
         [roleKey, conversation],
       );
       if (!row) return null;
-      if (row.unknown_before === null || Date.parse(row.joined_at) >= Date.parse(row.unknown_before)) return row.joined_at;
-      const migratedAt = Date.parse(row.unknown_before);
+      if (row.unknown_before === null || Date.parse(row.joined_at) >= Date.parse(row.unknown_before)) {
+        return wholeSecondFloor(row.joined_at);
+      }
       const unchangedSinceMigration = row.anchored_room === conversation && row.current_room === conversation &&
         row.anchored_generation !== null && row.anchored_generation === row.current_generation &&
         row.anchored_session !== null && row.anchored_session === row.current_session &&
-        (row.last_address_change_at === null || Date.parse(row.last_address_change_at) <= migratedAt) &&
-        (row.last_move_at === null || Date.parse(row.last_move_at) <= migratedAt);
+        row.audit_high_water !== null &&
+        (row.last_address_change_id === null || row.last_address_change_id <= row.audit_high_water) &&
+        (row.last_move_id === null || row.last_move_id <= row.audit_high_water);
       return wholeSecondFloor(unchangedSinceMigration ? row.joined_at : row.unknown_before);
     },
     existingRoleMessage: (input) => {
@@ -1760,7 +1762,7 @@ export const createBuzzMessageIngress = (
         return deny(
           ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED,
           "this event id already has an owner-message row, so nothing new was queued for it",
-          { messageId: enqueued.value.messageId, status: enqueued.value.status },
+          { messageId: enqueued.value.messageId, ...outboxDeliveryReadback(enqueued.value) },
         );
       }
       return allow(enqueued.reasonCode, { messageId: enqueued.value.messageId });

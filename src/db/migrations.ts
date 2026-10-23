@@ -4149,11 +4149,12 @@ const backfillRoleRoomMemberships = (raw: Database.Database): void => {
     );
   }
   const { now: migratedAt } = raw.prepare(`SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS now`).get() as { now: string };
+  const { highWater } = raw.prepare(`SELECT COALESCE(MAX(event_id), 0) AS highWater FROM audit_events`).get() as { highWater: number };
   const insert = raw.prepare(
     `INSERT INTO role_room_memberships (role_key, conversation, joined_at, session_id) VALUES (?, ?, ?, ?)`,
   );
   const unknown = raw.prepare(`INSERT INTO role_room_history_unknown (role_key, unknown_before, room, known_since,
-      binding_generation, session_id, anchor_fallback, anchor_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+      binding_generation, session_id, audit_high_water, anchor_fallback, anchor_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   const anchorOf = new Map(anchored.map((anchor) => [anchor.roleKey, anchor]));
   for (const roleKey of roles) {
     const anchor = anchorOf.get(roleKey);
@@ -4163,7 +4164,7 @@ const backfillRoleRoomMemberships = (raw: Database.Database): void => {
     // A clock that ran backwards cannot leave mail between the migration and a later anchor unrecorded.
     const unknownBefore = knownSince !== null && Date.parse(knownSince) > Date.parse(migratedAt) ? knownSince : migratedAt;
     unknown.run(roleKey, unknownBefore, anchor?.room ?? null, knownSince, anchor?.bindingGeneration ?? null,
-      anchor?.sessionId ?? null, anchor?.fallback ?? null, JSON.stringify(anchor
+      anchor?.sessionId ?? null, highWater, anchor?.fallback ?? null, JSON.stringify(anchor
         ? { bindingCreatedAt: anchor.bindingCreatedAt, sessionUpdatedAt: anchor.sessionUpdatedAt, runtimeMovedAt: anchor.runtimeMovedAt }
         : {}));
   }
@@ -4651,7 +4652,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * reads the live schema.sql, so its checksum still moves with any schema edit until the next freeze.
  * Declared here, below the anchors other gates hold into this file, and read only inside functions.
  *
- * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 267a8142; v50 is
+ * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 3915f78c; v50 is
  * frozen as v51's prerequisite in schema-v50.sql.
  * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
  * #512 S-PUSH (CEO 3d0daed0): v48 was frozen as v49's prerequisite. It reads `schema-v48.sql`, a byte copy
