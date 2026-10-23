@@ -11,20 +11,40 @@
  * Two reviewers of different lineage matter more than two rounds from one: a shared blind
  * spot is the failure mode a second round cannot catch.
  *
+ * What it reads, and where it writes (#1189, `scripts/lib/audit-run.mjs`): one pinned commit, in a
+ * disposable detached checkout of that commit, never the live working tree. A dirty working tree
+ * whose HEAD is the requested commit, or a ref that names no commit, is refused before any reviewer
+ * starts. Every run writes a new directory holding `manifest.json` (run id, commit and tree,
+ * selected areas, reviewer identity, per-area execution and artifacts) and a `summary.json` that
+ * counts only the reports that manifest attributes. A reviewer that failed, timed out, stopped
+ * early or was interrupted has no verdict, and nothing an earlier run wrote can stand in for it.
+ *
+ * What it is not. A frontier PR review and this broad, one-off diagnostic serve different purposes:
+ * frontier judges one change within its bounded attempts; this reads whole areas of one commit for
+ * defects nobody asked about. It is not meant to run on every PR. Running it is not a way around
+ * frontier's three-attempt limit and does not count as an additional approving review; its exit
+ * status says whether the reviewers ran, its findings verdict says what they found, and neither is
+ * a merge approval.
+ *
  * Usage:
- *   node scripts/grok-review.mjs                              # every area
+ *   node scripts/grok-review.mjs                              # every area, at HEAD
  *   node scripts/grok-review.mjs guard review                 # named areas
- *   node scripts/grok-review.mjs --out=evidence/review-grok   # default shown
+ *   node scripts/grok-review.mjs --rev=<commit-ish>           # another recorded commit
+ *   node scripts/grok-review.mjs --out=evidence/review-grok-2 # must not exist yet
+ *   node scripts/grok-review.mjs --allow-dirty                # HEAD, recording that uncommitted work was not reviewed
+ *   node scripts/grok-review.mjs --area-timeout-ms=600000     # per-area bound (default 45 minutes)
+ *
+ * The default output directory is `evidence/local/audit-runs/grok-review-<run id>/`.
+ * Exit status: 0 every selected area returned a well-formed report, 1 at least one did not,
+ * 2 refused before starting, 130 interrupted.
  */
-import { execFile } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { runAudit } from "./lib/audit-run.mjs";
+
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
-const outArg = process.argv.find((a) => a.startsWith("--out="));
-const outDir = join(repoRoot, outArg ? outArg.slice("--out=".length) : join("evidence", "review-grok"));
-mkdirSync(outDir, { recursive: true });
 
 const SCHEMA = {
   type: "object",
@@ -107,18 +127,21 @@ const AREAS = {
   },
 };
 
-const PREAMBLE = readFileSync(join(repoRoot, "docs", "prd", "AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md"), "utf8").length;
+const PRD = join("docs", "prd", "AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md");
 
-const prompt = (key, area) => `You are performing an independent, adversarial production-readiness
+const prompt = (key, area, revision, preamble) => `You are performing an independent, adversarial production-readiness
 review of one area of a repository you did not write. You are the final reviewer before this
 project is made public, and the people who built it are asking you to find what they missed —
 not to confirm what they believe.
+
+Revision under review: commit ${revision.commit} (tree ${revision.tree}). Your working directory
+is a disposable checkout of exactly that commit; review it, not any other state of the repository.
 
 **Area: ${key}** — ${area.focus}
 Relevant PRD sections: ${area.prd}
 Start with: ${area.paths.join(", ")}
 
-The implementation SSOT is \`docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md\` (${PREAMBLE} bytes;
+The implementation SSOT is \`docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md\` (${preamble} bytes;
 read the sections named above). \`docs/adr/\` holds the decisions the implementation rests on.
 \`docs/ACCEPTANCE.md\` states what the authors claim is met.
 
@@ -150,124 +173,90 @@ MAJOR = a real defect with a bounded blast radius. MINOR = correctness or clarit
 observation. Do not inflate; a BLOCKER you cannot demonstrate with a concrete sequence is a
 MAJOR at most, and say so.
 
-Read the code. Do not run the test suite — other agents are editing this repository right now,
-so a red test tells you nothing about the code you are reading. Do not modify any file.
+Read the code. Do not run the test suite — this checkout has no installed dependencies, and
+execution evidence comes from the repository's own gates, not from this review. Do not modify any
+file.
 
 Return only the structured JSON the schema describes.`;
 
-const run = (key, area) =>
-  new Promise((resolve) => {
-    const started = Date.now();
-    const args = [
-      "-p", prompt(key, area),
-      "--output-format", "json",
-      "--json-schema", JSON.stringify(SCHEMA),
-      "--reasoning-effort", "xhigh",
-      "--permission-mode", "plan",
-      "--disable-web-search",
-      "--no-subagents",
-      "--max-turns", "120",
-      "--cwd", repoRoot,
-      "--leader-socket", join(outDir, `${key}.leader.sock`),
-    ];
-    const child = execFile(
-      "grok",
-      args,
-      { cwd: repoRoot, maxBuffer: 64 * 1024 * 1024, timeout: 45 * 60 * 1000 },
-      (err, stdout, stderr) => {
-        const seconds = Math.round((Date.now() - started) / 1000);
-        writeFileSync(join(outDir, `${key}.log`), `${stdout}\n--- stderr ---\n${stderr}`);
-        let verdict = "ERROR";
-        let findings = 0;
-        try {
-          // The CLI prints one JSON envelope whose answer is `text` (measured, not assumed:
-          // `result` does not exist on it). With --json-schema that text *is* the JSON report,
-          // but the field also carries narration, so the report is the last JSON object in it.
-          const envelope = JSON.parse(stdout.slice(stdout.indexOf("{")));
-          // `structuredOutput` is the schema-validated answer. `text` is not it: with a
-          // schema the CLI streams a snapshot per turn and concatenates them, so parsing text
-          // yields "unexpected character after JSON" — measured, three reviews were recorded as
-          // ERROR before this was understood.
-          const report = envelope.structuredOutput ??
-            JSON.parse(typeof envelope.text === "string" ? envelope.text.slice(envelope.text.lastIndexOf('{"verdict"')) : "{}");
-          if (envelope.stopReason && envelope.stopReason !== "end_turn") {
-            // A cancelled run has partial narration and no verdict; treating it as a review
-            // would let an interrupted reviewer read as a clean one.
-            throw new Error(`grok stopped with ${envelope.stopReason}`);
-          }
-          writeFileSync(join(outDir, `${key}.json`), JSON.stringify(report, null, 2));
-          verdict = report.verdict ?? "ERROR";
-          findings = (report.findings ?? []).length;
-          if (envelope.total_cost_usd) {
-            writeFileSync(join(outDir, `${key}.cost`), String(envelope.total_cost_usd));
-          }
-        } catch (parseError) {
-          writeFileSync(
-            join(outDir, `${key}.json`),
-            JSON.stringify({ verdict: "ERROR", error: parseError instanceof Error ? parseError.message : String(parseError), stderr: stderr.slice(0, 4000) }, null, 2),
-          );
-        }
-        console.log(
-          `${key.padEnd(11)} ${verdict.padEnd(7)} findings=${String(findings).padEnd(3)} ${seconds}s${err ? ` (exec: ${err.message.slice(0, 60)})` : ""}`,
-        );
-        resolve({ key, verdict, findings, seconds });
-      },
-    );
-    child.stdin?.end();
-  });
-
-const requested = process.argv.slice(2).filter((a) => !a.startsWith("--"));
-const keys = requested.length > 0 ? requested : Object.keys(AREAS);
-for (const key of keys) {
-  if (!AREAS[key]) {
-    console.error(`unknown area: ${key}`);
-    process.exit(2);
+const reviewArea = async (key, area, ctx) => {
+  const preamble = readFileSync(join(ctx.checkoutDir, PRD), "utf8").length;
+  const args = [
+    "-p", prompt(key, area, ctx.revision, preamble),
+    "--output-format", "json",
+    "--json-schema", JSON.stringify(SCHEMA),
+    "--reasoning-effort", "xhigh",
+    "--permission-mode", "plan",
+    "--disable-web-search",
+    "--no-subagents",
+    "--max-turns", "120",
+    "--cwd", ctx.checkoutDir,
+    // In the run's own temporary directory: a socket path has a length limit the output
+    // directory's would exceed, and the socket is not evidence.
+    "--leader-socket", join(ctx.scratchDir, `${key}.leader.sock`),
+  ];
+  const child = await ctx.runChild("grok", args);
+  const artifacts = [];
+  let candidate;
+  try {
+    // The CLI prints one JSON envelope whose answer is `text` (measured, not assumed:
+    // `result` does not exist on it). With --json-schema that text *is* the JSON report,
+    // but the field also carries narration, so the report is the last JSON object in it.
+    const start = child.stdout.indexOf("{");
+    if (start === -1) throw new Error("grok printed no JSON envelope");
+    const envelope = JSON.parse(child.stdout.slice(start));
+    if (envelope.total_cost_usd) {
+      writeFileSync(join(ctx.outDir, `${key}.cost`), String(envelope.total_cost_usd));
+      artifacts.push(`${key}.cost`);
+    }
+    if (envelope.stopReason && envelope.stopReason !== "end_turn") {
+      // A cancelled run has partial narration and no verdict; treating it as a review
+      // would let an interrupted reviewer read as a clean one.
+      candidate = { kind: "invalid", reason: `grok stopped with ${envelope.stopReason}` };
+    } else {
+      // `structuredOutput` is the schema-validated answer. `text` is not it: with a
+      // schema the CLI streams a snapshot per turn and concatenates them, so parsing text
+      // yields "unexpected character after JSON" — measured, three reviews were recorded as
+      // ERROR before this was understood.
+      const report = envelope.structuredOutput ??
+        JSON.parse(typeof envelope.text === "string" ? envelope.text.slice(envelope.text.lastIndexOf('{"verdict"')) : "{}");
+      candidate = { kind: "value", value: report };
+    }
+  } catch (parseError) {
+    candidate = { kind: "unparsable", reason: parseError instanceof Error ? parseError.message : String(parseError) };
   }
-}
-
-// Sequential on purpose. Concurrent `grok` processes contend over the leader socket and
-// cancel each other — measured, and a cancelled review is worse than a slow one because its
-// partial output looks like a verdict.
-const results = [];
-for (const key of keys) results.push(await run(key, AREAS[key]));
+  // A parsed report is used only if the child also exited 0: a CLI that printed a verdict and
+  // then failed has not been shown to have finished the review.
+  return { child, candidate, artifacts };
+};
 
 /**
  * The summary is derived from the per-area files on disk, never from this run's in-memory
- * results alone.
+ * results alone — and, since #1189, only from the files this run's manifest attributes to itself.
  *
- * Writing `results` directly meant a partial re-run — `grok-review.mjs binding github
- * summary` — rewrote the whole summary while only knowing about the areas it had just run,
- * and recorded every other area as ERROR/0. That is how `evidence/review-grok/summary.json`
- * came to report guard and review as "did not run" when `guard.json` held REVISE with 8
- * findings and `review.json` held BLOCK with 8. Sixteen findings, including a BLOCK, read as
- * nothing having happened.
- *
- * That is the CP-HI-08 failure this product exists to prevent, in its own evidence tree, and
- * pointing the wrong way: not a failure dressed as a pass, but real findings dressed as an
- * absence. So the summary reads what the reviews actually said, and refuses to write at all
- * if a freshly produced result disagrees with the file it just wrote.
+ * Writing `results` directly once meant a partial re-run — `grok-review.mjs binding github` —
+ * rewrote the whole summary while only knowing about the areas it had just run, and recorded
+ * every other area as ERROR/0: sixteen real findings, including a BLOCK, read as nothing having
+ * happened. Reading every file in a shared directory fixed that and opened the opposite hole: an
+ * area this run never selected, written by some earlier run against some other commit, counted
+ * as a current PASS. Each run now has its own directory, so an area another run reviewed stays in
+ * that run's summary, an unselected area here is NOT_RUN, and a report whose bytes no longer
+ * match what this run recorded is STALE. None of those is PASS.
  */
-const summaryFromDisk = Object.keys(AREAS).map((key) => {
-  const path = join(outDir, `${key}.json`);
-  if (!existsSync(path)) return { key, verdict: "NOT_RUN", findings: 0 };
-  const report = JSON.parse(readFileSync(path, "utf8"));
-  const fresh = results.find((r) => r.key === key);
-  const verdict = report.verdict ?? "ERROR";
-  const findings = (report.findings ?? []).length;
-  if (fresh && (fresh.verdict !== verdict || fresh.findings !== findings)) {
-    console.error(
-      `refusing to write summary: ${key} was just recorded as ${fresh.verdict}/${fresh.findings} but ${key}.json says ${verdict}/${findings}`,
-    );
-    process.exit(3);
-  }
-  return { key, verdict, findings, ...(fresh ? { seconds: fresh.seconds } : {}) };
+// Sequential on purpose. Concurrent `grok` processes contend over the leader socket and
+// cancel each other — measured, and a cancelled review is worse than a slow one because its
+// partial output looks like a verdict.
+await runAudit({
+  tool: "grok-review",
+  script: "scripts/grok-review.mjs",
+  repoRoot,
+  areas: AREAS,
+  sequential: true,
+  reviewer: {
+    cli: "grok",
+    model: "the CLI's configured default (this script passes no model flag)",
+    reasoningEffort: "xhigh",
+    permissionMode: "plan",
+  },
+  reviewArea,
 });
-writeFileSync(
-  join(outDir, "summary.json"),
-  JSON.stringify({ reviewer: "grok", results: summaryFromDisk }, null, 2),
-);
-const blocked = results.filter((r) => r.verdict !== "PASS");
-console.log(`\n${results.length} areas reviewed by grok; ${blocked.length} not PASS`);
-if (existsSync(join(outDir, "guard.cost"))) {
-  console.log("per-area cost recorded alongside each report");
-}
