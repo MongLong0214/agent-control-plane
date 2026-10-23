@@ -196,6 +196,11 @@ export class ApprovedRunFinalizer {
       // its lease row is marked complete. Reconcile that harmless bookkeeping gap without
       // reopening any managed write or converting a successful run into a compensation case.
       this.completeAnyRunningAttempt(runId);
+      for (const receipt of this.durableMergeReceipts(runId)) {
+        if (receipt.status !== "APPLIED" || receipt.verified !== 1) continue;
+        const repository = this.cp.repositories.byIdentity(receipt.repository_identity);
+        if (repository) await this.cp.repositories.observe(repository.repositoryId);
+      }
       return allow(
         ReasonCode.MERGE_IDEMPOTENT_REPLAY,
         this.completedResult(runId),
@@ -370,6 +375,8 @@ export class ApprovedRunFinalizer {
           if (!executed.allowed) return this.handleFailure(runId, attemptId, executed as Decision<unknown>);
           mergeCommitSha = executed.value.mergeCommitSha;
         }
+        const localRepository = this.cp.repositories.byIdentity(repository.plan.repositoryIdentity);
+        if (localRepository) await this.cp.repositories.observe(localRepository.repositoryId);
         merged.push({ repositoryIdentity: repository.plan.repositoryIdentity, mergeCommitSha });
 
         const afterMerge = this.cp.runs.require(runId);
@@ -505,6 +512,8 @@ export class ApprovedRunFinalizer {
     let completed = false;
     try {
       for (const repository of repositories) {
+        const localRepository = this.cp.repositories.byIdentity(repository.repositoryIdentity);
+        if (localRepository) await this.cp.repositories.observe(localRepository.repositoryId);
         this.touchAttempt(runId, attemptId, `POST_MERGE_VERIFY:${repository.repositoryIdentity}`);
         const verified = await this.cp.github.postMergeVerify(runId, repository.repositoryIdentity,
           repository.mergeCommitSha, [], this.#ports.daemonFinalizerAuthority);

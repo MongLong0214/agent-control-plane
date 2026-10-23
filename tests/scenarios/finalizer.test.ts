@@ -575,6 +575,33 @@ describe("daemon-owned approved-run finalization", () => {
     await daemon.stop();
   });
 
+  it.each(["already observed", "catches up on replay"])(
+    "acknowledges only the clean local merge head when the checkout %s", async (timing) => {
+      const { github, harness, driven } = await approvedFixture();
+      const repository = harness.cp.repositories.byIdentity(driven.identity)!;
+      const accepted = repository.lastObservedHead;
+      const catchUp = () => {
+        gitSync(harness.repoPath, ["checkout", "dev"]);
+        gitSync(harness.repoPath, ["merge", "--ff-only", driven.candidateHead]);
+      };
+      github.onMerge = ({ mergeSha }) => {
+        github.setTrustedPostMergeCheck(mergeSha, "project-ci", WORKFLOW_PATH);
+        if (timing === "already observed") catchUp();
+      };
+      const finalizer = new ApprovedRunFinalizer(harness.cp);
+      expect((await finalizer.finalizeApprovedRun(driven.runId)).allowed).toBe(true);
+      expect(harness.cp.repositories.byId(repository.repositoryId)?.lastObservedHead)
+        .toBe(timing === "already observed" ? driven.candidateHead : accepted);
+      if (timing === "catches up on replay") catchUp();
+      const merges = github.mergeCount;
+      expect((await finalizer.finalizeApprovedRun(driven.runId)).reasonCode).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+      expect(harness.cp.repositories.byId(repository.repositoryId)).toMatchObject({
+        lastObservedHead: driven.candidateHead, driftState: "IN_SYNC",
+      });
+      expect(github.mergeCount).toBe(merges);
+    },
+  );
+
   it("returns completed gate, merge and tag receipts without issuing another GitHub write", async () => {
     const fixture = await approvedFixture();
     const { github, harness, driven } = fixture;

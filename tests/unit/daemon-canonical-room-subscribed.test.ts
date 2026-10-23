@@ -9,6 +9,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { ControlPlane, defaultConfig } from "../../src/app/control-plane.ts";
 import { BUZZ_SUBSCRIBER_CONFIG_FILENAME } from "../../src/buzz/buzz-mention-subscriber.ts";
 import { systemClock } from "../../src/core/clock.ts";
+import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { type Decision, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -123,7 +124,11 @@ const FRESH_PROJECT = "fresh-room-project";
 /** A real channel identity, so a deployment can configure it as a subscriber identity (1080-N1-02). */
 const FRESH_SECRET = generateSecretKey();
 const FRESH_ACTOR = getPublicKey(FRESH_SECRET);
-const HOLDER_START = "darwin-tv:1790000100.000001";
+const HOLDER_START = (() => {
+  const startedAt = readProcessStartToken(process.pid);
+  if (startedAt === null) throw new Error("test holder's native process start token is unavailable");
+  return startedAt;
+})();
 const RELAY = 545_454;
 const CLAIMANT = 100;
 

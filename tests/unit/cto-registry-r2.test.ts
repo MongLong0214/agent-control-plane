@@ -1,4 +1,5 @@
-import { afterAll, describe, expect, it } from "vitest";
+import * as git from "../../src/git/git.ts";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
 
 import { type HandoffAcknowledgement, type HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
@@ -6,7 +7,7 @@ import { readProcessStartToken } from "../../src/core/process-argv.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
-import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, makeRepo, writeFiles } from "../helpers/fixtures.ts";
 import {
   TEST_OWNER,
   type Harness,
@@ -348,7 +349,7 @@ describe("round-2 registry regressions", () => {
     expect(retried.value.activeManifestDigest).toBe(first.value.activeManifestDigest);
   });
 
-  it("#156 and #227 retain the accepted head after repeated observations of an out-of-band move", async () => {
+  it("accepts a clean default-branch descendant and clears sticky drift during observation", async () => {
     const harness = makeHarness();
     const { repositoryId, identity } = await registerFixtureProject(harness);
     const accepted = harness.cp.repositories.byId(repositoryId)!.lastObservedHead;
@@ -363,11 +364,139 @@ describe("round-2 registry regressions", () => {
     expect(diagnostic.currentHead).not.toBe(accepted);
     expect(harness.cp.repositories.byId(repositoryId)!.lastObservedHead).toBe(accepted);
 
+    harness.cp.db.run(`UPDATE repositories SET drift_state = 'DRIFTED' WHERE repository_id = ?`, [repositoryId]);
     const first = await harness.cp.repositories.observe(repositoryId);
     const second = await harness.cp.repositories.observe(repositoryId);
-    expect(first?.driftState).toBe("DRIFTED");
-    expect(second?.driftState).toBe("DRIFTED");
-    expect(second?.lastObservedHead).toBe(accepted);
+    expect(first?.driftState).toBe("IN_SYNC");
+    expect(second?.driftState).toBe("IN_SYNC");
+    expect(second?.lastObservedHead).toBe(diagnostic.currentHead);
+  });
+
+  it.each(["dirty", "divergent", "detached", "wrong branch", "unreadable"])(
+    "does not acknowledge a %s checkout", async (state) => {
+      const harness = makeHarness();
+      const { repositoryId } = await registerFixtureProject(harness);
+      const baseline = harness.cp.repositories.byId(repositoryId)!.lastObservedHead;
+      writeFiles(harness.repoPath, { "README.md": "# descendant\n" });
+      const descendant = commitAll(harness.repoPath, "descendant");
+      if (state === "dirty") writeFiles(harness.repoPath, { "untracked.txt": "owner edits" });
+      if (state === "divergent") {
+        gitSync(harness.repoPath, ["checkout", "--orphan", "unrelated"]);
+        commitAll(harness.repoPath, "unrelated root");
+        gitSync(harness.repoPath, ["branch", "-M", "dev"]);
+      }
+      if (state === "detached") gitSync(harness.repoPath, ["checkout", "--detach", descendant]);
+      if (state === "wrong branch") gitSync(harness.repoPath, ["checkout", "-b", "owner-feature"]);
+      if (state === "unreadable") harness.cp.db.run(`UPDATE repositories SET checkout_path = ? WHERE repository_id = ?`,
+        [join(harness.root, "missing-checkout"), repositoryId]);
+      const before = state === "unreadable" ? null : gitSync(harness.repoPath, ["status", "--porcelain=v1", "--branch"]);
+      const observed = await harness.cp.repositories.observe(repositoryId);
+      expect(observed?.lastObservedHead).toBe(baseline);
+      expect(observed?.driftState).not.toBe("IN_SYNC");
+      const report = await harness.cp.doctor.run("system");
+      expect(report.findings.some((f) => ["REPOSITORY_DRIFT", "REPOSITORY_PROBE_FAILED", "REPOSITORY_UNREADABLE"].includes(f.code))).toBe(true);
+      if (state !== "unreadable") expect(gitSync(harness.repoPath, ["status", "--porcelain=v1", "--branch"])).toBe(before);
+    },
+  );
+
+  it("does not interpret a detached HEAD as an attached branch named by the manifest", async () => {
+    const harness = makeHarness();
+    const { repositoryId } = await registerFixtureProject(harness, "fixture-project", {
+      branchProfile: { ...fixtureManifest("fixture-project").branchProfile, longLived: ["HEAD"], defaultBranch: "HEAD" },
+    });
+    const baseline = harness.cp.repositories.byId(repositoryId)!.lastObservedHead;
+    writeFiles(harness.repoPath, { "README.md": "# descendant\n" });
+    const head = commitAll(harness.repoPath, "descendant");
+    gitSync(harness.repoPath, ["checkout", "--detach", head]);
+    expect(await harness.cp.repositories.observe(repositoryId)).toMatchObject({ lastObservedHead: baseline, driftState: "DRIFTED" });
+  });
+
+  it("ACP1187-R1-02: rejects HEAD and branch readings from an interleaved checkout", async () => {
+    const harness = makeHarness();
+    const { repositoryId } = await registerFixtureProject(harness);
+    const baseline = harness.cp.repositories.byId(repositoryId)!.lastObservedHead;
+    gitSync(harness.repoPath, ["checkout", "-b", "owner-feature"]);
+    writeFiles(harness.repoPath, { "README.md": "# feature descendant\n" });
+    const descendant = commitAll(harness.repoPath, "owner feature");
+    const readHead = git.tryRevParse;
+    const readBranch = git.currentBranch;
+    const readClean = git.isClean;
+    let headReads = 0;
+    let branchReads = 0;
+    let switchedBack = false;
+    const invoke = git.git;
+    const snapshots = vi.spyOn(git, "git").mockImplementation(async (cwd, args, options) => {
+      const result = await invoke(cwd, args, options);
+      if (args.includes("status")) {
+        expect(args.slice(-5)).toEqual(["status", "--porcelain=v2", "--branch", "--untracked-files=all", "--ignore-submodules=dirty"]);
+        expect(result.stdout).toContain(`# branch.oid ${descendant}\n`);
+        expect(result.stdout).toContain("# branch.head owner-feature\n");
+        // The checkout changes after Git answers, without changing any returned evidence.
+        gitSync(cwd, ["checkout", "dev"]);
+      }
+      return result;
+    });
+    const headProbe = vi.spyOn(git, "tryRevParse").mockImplementation(async (cwd, ref) => {
+      const head = await readHead(cwd, ref);
+      // Inspection sees B, while every branch probe up to acceptance sees dev at A.
+      if (++headReads === 1) gitSync(cwd, ["checkout", "dev"]);
+      return head;
+    });
+    const branchProbe = vi.spyOn(git, "currentBranch").mockImplementation(async (cwd) => {
+      branchReads++;
+      return readBranch(cwd);
+    });
+    const cleanProbe = vi.spyOn(git, "isClean").mockImplementation(async (cwd) => {
+      // After the original final branch probe, cleanliness and HEAD see owner-feature at B.
+      if (branchReads >= 2 && !switchedBack) {
+        gitSync(cwd, ["checkout", "owner-feature"]);
+        switchedBack = true;
+      }
+      return readClean(cwd);
+    });
+    try {
+      const observed = await harness.cp.repositories.observe(repositoryId);
+      if (headReads > 0) expect(switchedBack).toBe(true);
+      else expect(snapshots.mock.calls.filter(([, args]) => args.includes("status"))).toHaveLength(1);
+      expect(gitSync(harness.repoPath, ["rev-parse", "dev"])).toBe(baseline);
+      expect(gitSync(harness.repoPath, ["rev-parse", "HEAD"])).toBe(headReads > 0 ? descendant : baseline);
+      expect(await readBranch(harness.repoPath)).toBe(headReads > 0 ? "owner-feature" : "dev");
+      expect(observed).toMatchObject({ lastObservedHead: baseline, driftState: "DRIFTED" });
+    } finally { headProbe.mockRestore(); branchProbe.mockRestore(); cleanProbe.mockRestore(); snapshots.mockRestore(); }
+  });
+
+  it.each(["head", "branch", "cleanliness", "manifest", "baseline"])("rechecks %s before acknowledging a descendant", async (change) => {
+    const harness = makeHarness();
+    const { repositoryId } = await registerFixtureProject(harness);
+    const baseline = harness.cp.repositories.byId(repositoryId)!.lastObservedHead;
+    writeFiles(harness.repoPath, { "README.md": "# descendant\n" });
+    commitAll(harness.repoPath, "descendant");
+    const readMergeBase = git.mergeBase;
+    const readProject = harness.cp.projects.get.bind(harness.cp.projects);
+    let manifestChanged = false;
+    const projectProbe = vi.spyOn(harness.cp.projects, "get").mockImplementation((id) => {
+      const project = readProject(id);
+      return manifestChanged && project ? { ...project, activeManifestDigest: "changed-manifest" } : project;
+    });
+    let reads = 0;
+    const probe = vi.spyOn(git, "mergeBase").mockImplementation(async (cwd, ...args) => {
+      const ancestor = await readMergeBase(cwd, ...args);
+      if (++reads === 1) {
+        if (change === "manifest") manifestChanged = true;
+        else if (change === "baseline") harness.cp.repositories.acknowledgeHead(repositoryId, "b".repeat(40));
+        else if (change === "branch") gitSync(cwd, ["checkout", "-b", "owner-moved"]);
+        else {
+          writeFiles(cwd, { "owner.txt": "arrived during observation" });
+          if (change === "head") commitAll(cwd, "owner moved head");
+        }
+      }
+      return ancestor;
+    });
+    try {
+      expect((await harness.cp.repositories.observe(repositoryId))?.lastObservedHead)
+        .toBe(change === "baseline" ? "b".repeat(40) : baseline);
+      expect(reads).toBe(1);
+    } finally { probe.mockRestore(); projectProbe.mockRestore(); }
   });
 
   it("#228 refuses to reuse a temporary repository binding created for another run", async () => {

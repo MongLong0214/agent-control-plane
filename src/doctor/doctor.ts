@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { totalmem } from "node:os";
@@ -23,9 +23,10 @@ import type { Db } from "../db/database.ts";
 import { strandedBootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { contractChangeRunsWithoutGrant } from "../registry/manifest-activation-grants.ts";
 import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
+import { probeSessionLiveness } from "../daemon/dead-binding-recovery.ts";
 import { Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
-import { isClean, tryRevParse } from "../git/git.ts";
+import { git, isClean, tryRevParse } from "../git/git.ts";
 import { HOLDER_CLAIMED_KIND_SQL, type Outbox, sourceNeverSpentSql } from "../outbox/outbox.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
@@ -449,11 +450,6 @@ export class Doctor {
     private readonly outbox: Outbox,
     private readonly github: GitHubKernel,
     private readonly worktrees: { orphans(repo: string, live: ReadonlySet<string>): Promise<string[]> },
-    private readonly capacitySensorFiles: {
-      directory: string;
-      freshnessMs: number;
-      maxClockSkewMs: number;
-    },
     private readonly statePaths: {
       databasePath: string;
       worktreeRoot: string;
@@ -512,14 +508,13 @@ export class Doctor {
       findings.push(...this.checkWorkers());
     }
     if (scope === "system" || scope === "session") {
-      findings.push(...this.checkSessions(target ?? null));
+      findings.push(...this.checkSessions(target ?? null, scope));
     }
     if (scope === "system" || scope === "capacity") {
-      // Before the sensor files and before the sweep, because a pin that cannot be spawned is the
-      // cause of what both of those report. `--scope capacity` is where an operator looks when the
+      // Before the sweep: a pin that cannot be spawned causes a failed measurement.
+      // `--scope capacity` is where an operator looks when the
       // numbers are wrong, so the cause has to be reachable from there and not only from `system`.
       findings.push(...this.checkProviderExecutables());
-      findings.push(...this.checkCapacitySensorFiles());
       findings.push(...(await this.checkCapacity()));
     }
     if (scope === "system") {
@@ -640,8 +635,8 @@ export class Doctor {
       confidence: "HIGH",
       observedEvidence: { roleKey, condition: "AWAITING_RESTORE", generation: reading.target.revokedGeneration },
       recommendedAction:
-        `${roleKey} was revoked for capacity alone and is restored on its own session at the next generation ` +
-        "once a fresh HEALTHY reading shows its window reset and its reattach connection answers",
+        `${roleKey} can return on its original session at the next generation ` +
+        "when its unchanged runtime and authenticated reattach connection are confirmed live",
     }];
   }
 
@@ -661,7 +656,7 @@ export class Doctor {
     for (const project of projects) {
       if (!project) continue;
       const binding = this.bindings.activePrimaryCto(project.projectId);
-      if (!binding) findings.push(...this.canonicalCtoRestoreFindings(project.projectId));
+      if (!binding && !project.suspended) findings.push(...this.canonicalCtoRestoreFindings(project.projectId));
       const openRuns = this.runs
         .list({ projectId: project.projectId })
         .filter((r) =>
@@ -954,9 +949,10 @@ export class Doctor {
     return findings;
   }
 
-  private checkSessions(sessionId: string | null): Finding[] {
+  private checkSessions(sessionId: string | null, scope: DoctorScope): Finding[] {
     const findings: Finding[] = [];
-    const sessions = sessionId ? [this.sessions.get(sessionId)].filter(Boolean) : this.sessions.live();
+    // Settlement changes lifecycle, not the authority or unfinished work referencing a session.
+    const sessions = sessionId ? [this.sessions.get(sessionId)].filter(Boolean) : this.sessions.list();
     for (const session of sessions) {
       if (!session) continue;
       if (session.lifecycle === SessionLifecycle.DRAINING) {
@@ -974,12 +970,31 @@ export class Doctor {
               : "complete the switchover",
         });
       }
-      if (session.osPid && !isProcessAlive(session.osPid)) {
+      if (probeSessionLiveness(session.osPid, session.osProcessStartedAt) === "DEAD") {
+        const activeBindings = this.db.all<{ role: Role; project_id: string | null }>(
+          `SELECT a.role, a.project_id FROM assignments a
+            LEFT JOIN conversational_actors actor ON actor.actor_id = a.actor_id
+            WHERE a.status = 'ACTIVE' AND COALESCE(actor.current_session_id, a.session_id) = ?
+              AND COALESCE(actor.current_session_incarnation, a.session_incarnation) = ?`,
+          [session.sessionId, session.incarnation],
+        );
+        const activeBinding = activeBindings.length > 0;
+        const unfinishedWork = this.runs.activeRunsOwnedBy(session.sessionId).length > 0 || Boolean(this.db.get(
+          `SELECT 1 FROM task_executions WHERE worker_session_id = ? AND status = 'RUNNING'`, [session.sessionId],
+        ));
+        const terminal = session.lifecycle === SessionLifecycle.ERROR || session.lifecycle === SessionLifecycle.STOPPED;
+        if (!sessionId && terminal && !activeBinding && !unfinishedWork) continue;
+        // Match checkBindings' project-availability policy: a settled PRIMARY_CTO with no
+        // unfinished work can be released through the operator door after startup. Keep the
+        // error visible; only the system gate relaxes it, never session/role diagnostics or
+        // another authority (including CEO), an unfinished run, or an open worker receipt.
+        const recoverableBinding = scope === "system" && terminal && activeBinding && !unfinishedWork &&
+          activeBindings.every((binding) => binding.role === Role.PRIMARY_CTO && binding.project_id !== null);
         findings.push({
           code: "SESSION_PROCESS_MISSING",
-          severity: "ERROR",
+          severity: activeBinding || unfinishedWork ? "ERROR" : "WARN",
           scope: `session:${session.sessionId}`,
-          blocking: true,
+          blocking: Boolean(activeBinding || unfinishedWork) && !recoverableBinding,
           confidence: "HIGH",
           observedEvidence: { pid: session.osPid, lifecycle: session.lifecycle },
           recommendedAction: "mark the session ERROR and recover its bindings",
@@ -1409,87 +1424,6 @@ export class Doctor {
     return value === path || resolve(value) === path ? variable : undefined;
   }
 
-  /** The daemon owns these files, so their timestamp is independently checkable evidence. */
-  private checkCapacitySensorFiles(): Finding[] {
-    const findings: Finding[] = [];
-    const now = Date.parse(this.clock.nowIso());
-
-    // This asks which production providers own sensor files, not which unscoped adapter may act
-    // for a role. `production()` deliberately excludes role-scoped providers; `list()` retains
-    // them once per provider without choosing an identity for dispatch.
-    for (const adapter of this.providers.list().filter((candidate) => candidate.isProduction)) {
-      const provider = adapter.provider;
-      // A provider excluded from the unattended probe (#735) never gets this file refreshed
-      // again by that sweep. Checking its age would resurrect exactly the always-on warning
-      // retirement removes — a registered-but-unprobed provider is expected to have no
-      // fresh file, not a stale one, and a missing file is not evidence of anything here.
-      if (!this.capacity.isAutoProbeEnabled(provider)) continue;
-      const file = capacitySensorFile(this.capacitySensorFiles.directory, provider);
-      if (!existsSync(file)) {
-        findings.push({
-          code: ReasonCode.CAPACITY_SENSOR_FILE_MISSING,
-          severity: "ERROR",
-          scope: `provider:${provider}`,
-          blocking: false,
-          confidence: "HIGH",
-          observedEvidence: { provider, file },
-          recommendedAction: "start the daemon capacity sensor or restore its structured local file",
-        });
-        continue;
-      }
-
-      let observedAt: string | null = null;
-      try {
-        const parsed = JSON.parse(readFileSync(file, "utf8")) as { observedAt?: unknown };
-        observedAt = typeof parsed.observedAt === "string" ? parsed.observedAt : null;
-      } catch (err) {
-        findings.push({
-          code: ReasonCode.CAPACITY_SENSOR_FILE_INVALID,
-          severity: "ERROR",
-          scope: `provider:${provider}`,
-          blocking: false,
-          confidence: "HIGH",
-          observedEvidence: { provider, file, error: safeErrorMessage(err) },
-          recommendedAction: "replace the capacity sensor file with a valid daemon observation",
-        });
-        continue;
-      }
-
-      const observedMs = observedAt ? Date.parse(observedAt) : Number.NaN;
-      const ageMs = now - observedMs;
-      if (!Number.isFinite(observedMs) || ageMs < -this.capacitySensorFiles.maxClockSkewMs) {
-        findings.push({
-          code: ReasonCode.CAPACITY_SENSOR_FILE_INVALID,
-          severity: "ERROR",
-          scope: `provider:${provider}`,
-          blocking: false,
-          confidence: "HIGH",
-          observedEvidence: { provider, file, observedAt, now: this.clock.nowIso() },
-          recommendedAction: "write a capacity observation with a valid current timestamp",
-        });
-        continue;
-      }
-      if (ageMs > this.capacitySensorFiles.freshnessMs) {
-        findings.push({
-          code: ReasonCode.CAPACITY_SENSOR_FILE_STALE,
-          severity: "WARN",
-          scope: `provider:${provider}`,
-          blocking: false,
-          confidence: "HIGH",
-          observedEvidence: {
-            provider,
-            file,
-            observedAt,
-            ageMs,
-            freshnessMs: this.capacitySensorFiles.freshnessMs,
-          },
-          recommendedAction: "refresh the daemon-owned capacity sensor before allocating new work",
-        });
-      }
-    }
-    return findings;
-  }
-
   /** CP-S45 — host pressure maps deterministically to DEGRADED. */
   private async checkHostResources(): Promise<Finding[]> {
     const findings: Finding[] = [];
@@ -1914,6 +1848,10 @@ export class Doctor {
       // carrying every unrelated finding already collected with it (#859).
       let head: string | null;
       let clean: boolean;
+      let branch: string | null;
+      const defaultBranch = repository.projectId
+        ? this.projects.activeManifest(repository.projectId)?.manifest.branchProfile.defaultBranch
+        : undefined;
       try {
         head = await tryRevParse(repository.checkoutPath, "HEAD", { timeoutMs: remainingMs });
         // Re-read the clock rather than reusing `remainingMs`: the first probe has already spent
@@ -1924,6 +1862,10 @@ export class Doctor {
               timeoutMs: Math.max(1, deadlineMs - this.clock.now().getTime()),
             })
           : false;
+        const branchProbe = await git(repository.checkoutPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+          allowFailure: true, timeoutMs: Math.max(1, deadlineMs - this.clock.now().getTime()),
+        });
+        branch = branchProbe.exitCode === 0 ? branchProbe.stdout.trim() : null;
       } catch (err) {
         const projectSuspended = this.repositoryProjectSuspended(repository.projectId);
         findings.push({
@@ -1945,7 +1887,8 @@ export class Doctor {
         continue;
       }
       const driftState =
-        head === null ? "UNKNOWN" : head === repository.lastObservedHead && clean ? "IN_SYNC" : "DRIFTED";
+        head === null ? "UNKNOWN" : head === repository.lastObservedHead && clean &&
+          (!defaultBranch || branch === defaultBranch) ? "IN_SYNC" : "DRIFTED";
 
       if (driftState === "DRIFTED") {
         findings.push({
@@ -1955,6 +1898,8 @@ export class Doctor {
           blocking: false,
           confidence: "MEDIUM",
           observedEvidence: {
+            branch,
+            defaultBranch,
             acknowledgedHead: repository.lastObservedHead,
             observedHead: head,
             clean,
@@ -2093,13 +2038,6 @@ const isProcessAlive = (pid: number): boolean => {
 const safeErrorMessage = (err: unknown): string => {
   const message = err instanceof Error ? err.message : String(err);
   return message.replace(/[\r\n\t]/g, " ").slice(0, 500);
-};
-
-const capacitySensorFile = (directory: string, provider: string): string => {
-  if (!/^[A-Za-z0-9_-]+$/.test(provider)) {
-    throw new Error(`unsafe provider id for capacity sensor: ${provider}`);
-  }
-  return join(directory, `${provider}.json`);
 };
 
 const loadAverage = async (): Promise<number[]> => {
