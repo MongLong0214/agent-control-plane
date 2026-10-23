@@ -1,0 +1,24 @@
+Warn: the evidence requirements for a finding's detail are reviewer guidance only: no host rule turns a non-pass verdict into PASS because its findings are INFO, MINOR or empty, and the read-only review-round summary is a projection no gate or reviewer reads; dispositions such as 'fixed' never change a verdict.
+Record-Id: r-965bee5a38d7
+Provenance: inherited 1b23f6b6c94b08e3f04dbb6c30984cff06fcba2f
+
+Limit: audit rows do not carry the pipeline attempt id, so the summary infers each record's attempt from the reviewer binding, the lease serialization and reclaim records; a record that more than one attempt could own goes to unattributedEvents and onto no round. Stamping attemptId on those rows in candidate-pipeline.ts would remove the inference.
+Record-Id: r-f878e8e5a573
+Provenance: inherited 1de17e8dc2c27046d65b792657e34fb286122af0
+
+Warn: the review-round summary places a record only where ownership is provable: binding replays are ignored, a round keeps the first review/return/outcome/findings placed on it, and an identity-free record that could be a replay or belongs to several attempts is listed in unattributedEvents instead of the latest open slot; adding a placement that overwrites or guesses reintroduces the replay defects.
+Record-Id: r-53019310bef9
+Provenance: inherited f7c5cd4f80287f1838c3c479ab57329b2fad8591
+
+Warn: a round's attempt id is set once (reclaim record, lease, or a delivery matching exactly one round without an attempt) and nothing later replaces or clears it; a delivery whose own attempt belongs to a known round is placed by that attempt, and when it contradicts the only matching return it is listed in unattributedDeliveries rather than placed.
+Record-Id: r-410d1d3441df
+Provenance: inherited 69353b627a25a6655adcd53cdb077f39330e9b59
+
+Limit: return rows (REVISION_RETURNED_TO_CTO) are not stamped because revision-audit-bounded pins their exact field list; a return's attempt is identified through the pipeline's REVISION_REQUEST key, and review completion and the CEO move come from other gates attributed by reviewer session and production-ready packet.
+Warn: the candidate pipeline stamps its attempt id on CANDIDATE_FROZEN and BLIND_REVIEW_UNAVAILABLE; the round summary trusts a stamp only when one freeze carries it and nothing (lease row, reclaim, delivery key) ties that attempt to another candidate or run, and attributes unstamped history only by a unique correspondence, never by event order; identical repeats of a resubmitted candidate stay unattributed.
+Record-Id: r-4c3a59d4d52a
+Provenance: inherited 84ab0786eea40c5b0a41a6b6bf61fe4e000faa1f
+
+Warn: an untrusted freeze stamp taints its round and puts the attempt id in a rejected set that every later attribution path (stamped, session-pinned, single-candidate, proven-return, delivery fallback) honours; a delivery attaches only when its key matches the run, the round's candidate, the payload reason and a non-rejected attempt that is the round's own.
+Record-Id: r-aa5608e8e900
+Provenance: inherited 81f3815e8ded00846a1c4641a2a530664e95c2eb
