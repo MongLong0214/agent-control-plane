@@ -478,7 +478,9 @@ const readoptSameActor = (h: Harness, ceo: ReturnType<typeof bindRestorableCeo>)
   h.cp.sessions.transition(ceo.old.sessionId, SessionLifecycle.ERROR, "runtime died");
   const replacement = h.cp.sessions.create({ provider: "hermes", model: "test", osPid: process.pid });
   h.cp.sessions.transition(replacement.sessionId, SessionLifecycle.READY, "replacement");
-  vi.spyOn(liveness, "probeSessionLiveness").mockImplementation((pid) => (pid === process.pid ? "ALIVE" : "DEAD"));
+  const probeLiveness = liveness.probeSessionLiveness;
+  vi.spyOn(liveness, "probeSessionLiveness").mockImplementation((pid, startedAt) =>
+    pid === 12345 ? "DEAD" : probeLiveness(pid, startedAt));
   const claimed = { executorKind: "hermes", targetLocator: "canonical-session", targetLocatorDigest: digestOf({ root: "canonical" }) };
   let receipt: unknown;
   const authenticatedTarget: AuthenticatedTargetBinding = {
