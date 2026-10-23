@@ -1,0 +1,93 @@
+Limit: repository acknowledgement advances only for a clean checkout attached to the manifest's default branch whose old acknowledged head is an ancestor of HEAD; dirty, divergent, detached or wrong-branch checkouts stay DRIFTED and nothing in a registered checkout is reset, fetched or rewritten.
+Warn: a session whose process died while the daemon was up stayed READY forever, because only startup reconciliation swept all live sessions; the sweep now also runs on every watchdog tick and settles a session only when the start-aware probe says DEAD, never on UNKNOWN or EPERM, so a revoked CEO generation's identity history keeps serving its successor's Buzz identity fallback.
+Record-Id: r-364a12e79fcc
+Provenance: inherited d846c3e6b946008920b36c9b7b400be02517be5c
+
+Limit: delivery is at-least-once between send and ACK: an unACKed SENT message keeps its durable ID across CTO generations and crashes and is redelivered, so every consumer must dedupe effects by that message ID; transport acceptance proves handoff to the session, not that the model completed the work.
+Record-Id: r-28bbc64d3ba3
+Provenance: inherited 78522a3cbb41028733d162dc95b7f93132bb55b0
+
+Limit: genesis never writes the default branch directly: the plan pushes branch genesis (parent = the autoInit head), opens one PR into main and ACP merges it after local verification and required CI at the PR head; a second matching PR or a closed unmerged genesis PR refuses as ambiguous rather than being reused.
+Warn: Buzz room creation is idempotent by name, not by a caller-chosen id: the provisioner persists the intended room name before creating it and on restart reuses the single room the CTO identity owns with that name; more than one match refuses, so duplicating or renaming that room by hand stops provisioning instead of letting it guess.
+Record-Id: r-8c984f45ebda
+Provenance: inherited 135d736ab87d9f26eb3e2925b293d7753c0a275b
+
+Limit: a Buzz-route instruction already SENT whose holder is replaced before ACK is not redelivered, and a live Buzz target's 30-minute delivery window can still expire an instruction; a renewed bootstrap owner receives its predecessor's unACKed dispatch again under the same id, so consumers dedupe by message id.
+Warn: in-band instructions follow one handover policy on every recovery path (runtime move, revoke, takeover, adoption, switchTo after a revoke, session stop): an actionable instruction keeps its id and goes to the next authenticated holder, and is superseded only with a recorded reason (RUN_TERMINAL, RUN_MISSING, ROLE_REPLACED, a newer escalation, a completed drain) in the same transaction; a new path that rejects instructions on its own reintroduces the loss.
+Record-Id: r-2edc37e69d7c
+Provenance: inherited b9127f198c3e7fd08dd07bc2ee786d0c40b255f0
+
+Limit: activation needs the resident clone exactly at the approved genesis head and fleet recovery refuses a dirty tree, so a CTO that commits before activation completes keeps activation pending and a dead CTO with uncommitted edits is not relaunched until its tree is clean; nothing is ever reset.
+Warn: genesis CI is accepted only through the kernel's one provenance chain (check suite -> Actions run -> workflow path -> exact head -> workflow file digest), the same proof normal merges use; a same-name check from another workflow or without Actions provenance refuses verification and the merge, so a new genesis check path must call proveActionsCheckProvenance rather than match names.
+Record-Id: r-f7fda67e21ed
+Provenance: inherited 77c89de5a3a56327ee00ad66aa33cc3e37001fb2
+
+Warn: a resident project's checkout has two rules: the bootstrap rule (dev, clean, exactly the approved head) applies to ensure-checkout and activation-time observe only until the resident has once been verified running on the approved checkout; after that, and always for ensure-resident (fleet recovery), only the development rule applies (the project's own clone whose history contains the approved genesis head; dirty, untracked, any branch and detached HEAD are kept). Applying the bootstrap rule to recovery strands a dead CTO with unfinished work.
+Record-Id: r-e8a16723f025
+Provenance: inherited 45eb7e75dc9ab7fbbb928c733eb35b652e405f7f
+
+Limit: the canonical CEO notice transport requires the ACP-Hermes lane secret for its HMAC signature (CEO decision: no unsigned gateway fallback); without it notifications stay PENDING with a CEO_NOTIFICATION_ROUTE_UNAVAILABLE audit row and are delivered only once a route exists. role_room_memberships rows backfilled by v51 come from addresses current at migration time.
+Warn: instructions and CEO notifications are one retained set that only an ACK or a recorded supersession ends: TTL never expires them, delivery and ACK ignore TTL for them, failed attempts never reject them, and a SENT-but-unACKed row goes back to deliverable with the same id whenever its holder or CEO target changes; any new terminal path for these kinds reintroduces loss.
+Record-Id: r-6b2239c63486
+Provenance: inherited 2478b7234b23b2f1ff812531287416640311a08a
+
+Limit: the v51 membership backfill trusts v50's rule that every non-null address change is audited (connect, reattach and canonical correction audit; disconnect sets null), so later generations without an address audit inherit their room from the last proven one; an unaudited in-place change or a room change without an address audit makes the migration refuse, naming the roles, and roll back.
+Warn: only a failure recorded as repairable (the target had no room or identity) is re-armed, and only for rows addressed to the holder whose route changed; authority, wrong-target, security and terminal failures are never reactivated by a route change, and a Buzz send with an unknown outcome is never re-sent to the same receiver because Buzz has no same-id dedupe or receipt.
+Record-Id: r-d395cc714e4e
+Provenance: inherited 3a5494c8de755fe310fdad7d3e9a389aff35373b
+
+Warn: v51 room history comes only from address audits inside a placement, each placement bounded by the next placement and its binding's revocation; an audited room carries forward only when the session's audits chain and end at its current address, and a role whose current room has no proven join is recorded as known since migration (ROLE_ROOM_KNOWN_SINCE_MIGRATION) so mail signed before that is refused with a durable BUZZ_MENTION_REFUSED record instead of being admitted on inferred history (CEO f42efb13).
+Record-Id: r-d1e2a886294a
+Provenance: inherited 083008c303c028e01afa09add3ae326c8a8880b8
+
+Warn: the rendered launcher always exports ACP_HOST_PROJECT_PROVISIONER (Keychain override, else the installed generation's own dist/host/host-project-provisioner.mjs) and exits 78 unless it is an absolute regular non-symlink file; without it the daemon refuses every resident bootstrap, and a hand-set plist value would be lost on the next re-render.
+Record-Id: r-72cdcff92df8
+Provenance: inherited 8f05cc6ed3929c4b9b9e699bfb7189ae3aa5d06e
+
+Limit: receiver equality for a handed-over send is judged only from outbox_sent_destinations (room, recipient key, ACCEPTED/UNKNOWN) recorded at send time; a crash between the relay accepting a send and its ACCEPTED record leaves no evidence, so the claim lease expires and the row is sent again (at-least-once).
+Warn: v51 records no historical room membership: each active role's room is known only from max(binding creation, recorded runtime move, session.updated_at), which holds because every writer of sessions.buzz_address sets updated_at in the same statement (a test pins the writer set); mail signed before that is refused with a durable SIGNED_BEFORE_KNOWN_ROOM_HISTORY record and never replayed on inferred authority. A new address writer that does not stamp updated_at breaks the anchor.
+Record-Id: r-c2e57f62261e
+Provenance: inherited 7f5ce1c3d022b5b0741604759606f29a146afe48
+
+Limit: Buzz signs whole seconds, so the membership floor is known-since rounded up to the next whole second; and a handover plus a fresh send to the same destination while the first send is still pending can duplicate the message (a duplicate, not a loss).
+Warn: a v51 anchor needs the latest recorded runtime move (including a return to the binding's own session) to land on the current runtime, or, with no move record, the current runtime to be the binding's own session; otherwise the role is a RUNTIME_MOVE_UNRECORDED fallback anchored at migration time, listed by migration-plan's v51AnchorFallback, and a deploy must refuse while that list is non-empty because its stop-window mail would be refused.
+Record-Id: r-7b544636cc36
+Provenance: inherited bb09529f9bd805242bffc4374dd463945a94d141
+
+Limit: stop-window admission currently requires the anchored session's updated_at to stay at or before the migration, so any post-migration write to that session (pid update or credential rotation at restart) ends stop-window admission and that mail is refused and recorded rather than delivered.
+Warn: a send's destination is recorded as PENDING_SEND before the transport call and settles to ACCEPTED or UNKNOWN (a definite relay refusal deletes it); another attempt that finds a send in flight there gives its claim back without sending, a record older than the claim lease counts as UNKNOWN, and a row withheld for that reason stays SENT with unknown_observed and an OUTBOX_SEND_WITHHELD record so it is never silently lost.
+Record-Id: r-0132c2afc5e6
+Provenance: inherited afde40f5bb36f727c6293a44ffc8249496340d14
+
+Warn: after the v51 migration a role's anchor stays valid only while its ACTIVE binding generation, runtime and room are unchanged and no SESSION_BUZZ_ADDRESS_CHANGED or BINDING_RUNTIME_MOVED is recorded after the migration; sessions.updated_at is deliberately not used because restart writes (setPid, credential rotation) bump it, and a pointer write that moves several roles sharing an actor must record a move for each of them.
+Record-Id: r-8e01bf4bcef0
+Provenance: inherited b22fd026140e024f7895607a0d5b9bb9340da38d
+
+Warn: a row withheld because its only destination is UNKNOWN or PENDING_SEND stays internally SENT only to suppress a resend; every external reader (receipts, operator and health readbacks, doctor, handoff receipts, review-round summaries, completion counts) must project it through outboxDeliveryReadback as outcome unknown / delivery unconfirmed / automatic resend held, never as delivered, and only an ACK completes it.
+Record-Id: r-3d9b78be4d6c
+Provenance: inherited 267a8142233605df71ba52937e5cfe5e76f45478
+
+Warn: post-migration room changes are ordered by audit_events.event_id (INTEGER PRIMARY KEY AUTOINCREMENT, strictly increasing) against the audit high-water the v51 step stores with each history row, not by wall-clock time, because a change in the migration's own millisecond cannot be ordered by timestamp; every floor ingress compares is rounded up to the next whole second while the stored value keeps full precision.
+Record-Id: r-e842c03a36d8
+Provenance: inherited 73f8fa6fe274bc6cc50cda07a9757b2b3ecddd22
+
+Limit: only floors derived from the v51 migration or an anchor (unknown history, refusals recorded) round up to the next whole second; a fresh binding or post-migration membership keeps the pre-v51 contract and rounds down, so because Buzz signs whole seconds a mail signed less than one second before a new binding can be admitted. This is a time-boundary allowance only and never bypasses the signature, room, current-binding, generation or revoke checks. It corrects the 'every floor rounds up' wording of r-e842c03a36d8 (CEO bc1d8d46).
+Record-Id: r-d037ed527235
+Provenance: inherited 642ee472d75ec7ddbdd5c7153f6105c76cfbcfda
+
+Limit: a tombstoned canonical entitlement is negative authority: Buzz mention admission refuses it with CANONICAL_ENTITLEMENT_REVOKED even while a retirement is pending or its host step failed, instead of treating the tombstone as 'no entry' and falling through to ordinary PRIMARY_CTO admission (review FV52-01). CEO dc3a8c11 limited this change to the admission judge shared by primaryCtoBindingFor and judgeIdentity.
+Limit: a bootstrap HANDOFF_PACKAGE is in band for an adopted canonical (resident) runtime only when it is addressed to the role's current authenticated holder; a switchover's unbound recipient keeps its Buzz route, and no previous holder, other role, other project or private-room bypass is opened (CEO dc3a8c11, review FV52-03).
+Warn: handoff_ack settles both the handoff and its outbox row in one transaction, so role_dispatch_ack now refuses a HANDOFF_PACKAGE with HANDOFF_ACK_REQUIRED; a driven or resident turn that used to call both gets a refusal on the second call, not a second effect.
+Record-Id: r-c259916fbaa1
+Provenance: inherited ca56dfa114f4279ba6c0332d2d65f497322b9bed
+
+Limit: a bootstrap handoff ACK settles the handoff and its outbox row only inside one transaction that re-validates package authority at ACK time: the bootstrap-handoff row readable in band by this exact session, incarnation and binding generation, bound to the messageId, bindingGeneration and payloadDigest the caller read; otherwise HANDOFF_ACK_REQUIRED and neither row changes (review FV52-04, CEO d05d1875).
+Limit: an unreadable bootstrap package (REJECTED, EXPIRED or stale generation) is never turned into success; the activation retry issues a fresh in-band package to the same current holder instead, and the old row, failure_class and receipt stay as they were.
+Warn: ordinary interactive PRIMARY_CTOs (not adopted canonical, not driven) still receive bootstrap packages over Buzz; that route settles only a SENT package bound to the supplied digest and the current holder, and an in-band validation failure never falls through to it.
+Record-Id: r-8432768e8cc3
+Provenance: inherited e6bbe7671023a7dc69d3c24284fe85a0079bb1bc
+
+Limit: a replayed handoff_ack (an existing MCP idempotency key) returns its stored success only when the stored response carries the same request digest (handoffId, messageId, bindingGeneration, payloadDigest, session, incarnation) and the domain re-ACK still passes for that exact settled package under current authority; otherwise HANDOFF_ACK_REQUIRED and nothing changes (review FV52-05, CEO b0ca0a10).
+Warn: the shared idempotentMcpMutation is unchanged for every other MCP mutation tool and still returns a stored first response for a reused key without comparing arguments; CEO b0ca0a10 split that into a separate slice rather than widening this correction.
+Record-Id: r-1acc2b342903
+Provenance: inherited 93d38cfa7ff14e25ba5e51a0b0b6d005c07d41ce
