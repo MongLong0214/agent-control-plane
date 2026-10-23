@@ -26,16 +26,23 @@ import type { ReviewFinding, ReviewPacket } from "./blind-review.ts";
  * A round is one candidate freeze (`CANDIDATE_FROZEN`): one submission attempt that reached a freeze.
  * A record is placed on the attempt that wrote it, not on the freeze window it happens to fall in:
  * - A review record names its reviewer session (the completion row's session, the stored review's
- *   `reviewerSessionId`, the delivered packet's), and the reviewer's binding row places that session
- *   on the attempt that constituted it. A replayed row therefore lands on its own round, whatever
- *   window it falls in, and is counted there once.
- * - A record with no such identity (an unavailable review, a verification return, the move to CEO
- *   review) belongs to the window's own attempt, since the durable lease serialises submissions;
- *   only an attempt whose lease was reclaimed (`CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED`) can still
- *   write after the next freeze. Where such an attempt is open, a record goes to the one attempt
- *   that can still take it (each attempt has at most one review outcome, one return and one move to
- *   CEO review); when more than one could, it is listed in `unattributedEvents` with the rounds it
- *   could belong to, and placed on none.
+ *   `reviewerSessionId`), and the reviewer's first binding row places that session on the attempt
+ *   that constituted it; a binding row seen again (same session or same generation) is ignored. A
+ *   replayed row therefore lands on its own round, whatever window it falls in, and is counted there
+ *   once. A record never replaces one its round already holds: a round's review, return and first
+ *   findings are the first placed, and a conflicting later record is listed, not used.
+ * - The move to CEO review of a reviewed candidate is read from its production-ready packet, which
+ *   names the review it rests on; the transition row names no attempt.
+ * - A record with no such identity (an unavailable review, a verification return, an unreviewed
+ *   candidate's move to CEO review) belongs to the window's own attempt, since the durable lease
+ *   serialises submissions; only an attempt whose lease was reclaimed
+ *   (`CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED`) can still write after the next freeze. Each attempt has
+ *   at most one review outcome, one return and one move to CEO review. Such a record is placed only
+ *   where that is proven: on the one attempt that can still take it, when no round already holds an
+ *   identical record (which it could be a replay of); or as a repeat of the one identical record, when
+ *   no attempt can still take it. Anything else is listed in `unattributedEvents` with the rounds it
+ *   could belong to, and placed on none. A retry that fails with a record identical to an earlier
+ *   attempt's is therefore listed rather than placed: the records cannot tell it from a replay.
  * A chunked review is one review: its chunk reviewers and the final reviewer are reviewer
  * invocations of one round. A row whose evidence the audit refused names no candidate and is not
  * placed on any round.
@@ -179,6 +186,8 @@ export interface ReviewRoundSummary {
   interventionsBeforeFirstRound: Array<{ eventId: number; kind: string }>;
   /** Records placed on no round, with the rounds each could belong to. Never guessed onto one. */
   unattributedEvents: UnattributedReviewEvent[];
+  /** REVISION_REQUEST deliveries that match more than one round's return and no single attempt. */
+  unattributedDeliveries: Array<{ messageId: string; candidateRounds: number[] }>;
   /** The first round whose review returned findings, preserved whatever later rounds did. */
   firstFindings: { round: number; findings: ReviewRoundFinding[] } | null;
   /** Dispositions whose digest names no finding of this run. */
@@ -309,6 +318,8 @@ interface RoundState {
   unavailable: AuditRow[];
   returned: AuditRow[];
   ready: AuditRow[];
+  /** Production-ready packets resting on this round's review, by artifact digest. */
+  readyPackets: Set<string>;
   keys: Set<string>;
   duplicates: number;
   interventions: Array<{ eventId: number; kind: string }>;
@@ -329,6 +340,9 @@ const keyOf = (row: AuditRow): string =>
     String(row.evidence["to"] ?? ""),
   ].join("|");
 
+const isReadyTransition = (row: AuditRow): boolean =>
+  row.kind === "RUN_TRANSITION" && row.evidence["to"] === RunState.READY_FOR_CEO_REVIEW;
+
 export const summarizeReviewRounds = (
   sources: ReviewRoundSources,
   options: { dispositions?: readonly FindingDisposition[] } = {},
@@ -339,10 +353,15 @@ export const summarizeReviewRounds = (
   const reviewArtifacts = sources.artifacts.filter(
     (artifact) => artifact.kind === ArtifactKind.BLIND_REVIEW && artifact.producedBy === EVIDENCE_PRODUCERS.BLIND_REVIEW,
   ) as Array<StoredArtifact<ReviewPacket>>;
+  const readyPackets = sources.artifacts.filter(
+    (artifact) =>
+      artifact.kind === ArtifactKind.PRODUCTION_READY_PACKET && artifact.producedBy === EVIDENCE_PRODUCERS.PRODUCTION_READY_PACKET,
+  );
   const revisionMessages = sources.outbox.filter((message) => message.kind === MessageKind.REVISION_REQUEST);
   const dispositions = options.dispositions ?? [];
   const linked = new Set<string>();
   const unattributed: UnattributedReviewEvent[] = [];
+  const unattributedDeliveries: ReviewRoundSummary["unattributedDeliveries"] = [];
   const interventionsBeforeFirstRound: Array<{ eventId: number; kind: string }> = [];
 
   const states: RoundState[] = freezes.map((freeze, index) => ({
@@ -356,6 +375,7 @@ export const summarizeReviewRounds = (
     unavailable: [],
     returned: [],
     ready: [],
+    readyPackets: new Set<string>(),
     keys: new Set<string>(),
     duplicates: 0,
     interventions: [],
@@ -376,14 +396,32 @@ export const summarizeReviewRounds = (
         (state.index === window || (state.index < window && state.reclaimed)) && (digest === null || state.digest === digest),
     );
   };
-  const place = (state: RoundState, slot: Slot, row: AuditRow): void => {
-    const key = keyOf(row);
-    if (state.keys.has(key)) {
-      state.duplicates += 1;
-      return;
-    }
-    state.keys.add(key);
-    state[slot].push(row);
+  const slotOf = (row: AuditRow): Slot =>
+    row.kind === "BLIND_REVIEW_COMPLETED"
+      ? "completed"
+      : row.kind === "BLIND_REVIEW_UNAVAILABLE"
+        ? "unavailable"
+        : row.kind === "REVISION_RETURNED_TO_CTO"
+          ? "returned"
+          : "ready";
+  /** Whether a round can still take a record of this slot: one review outcome, one return, one move to CEO review. */
+  const open = (state: RoundState, slot: Slot): boolean =>
+    slot === "returned"
+      ? state.returned.length === 0
+      : slot === "ready"
+        ? state.ready.length === 0
+        : state.completed.length === 0 && state.unavailable.length === 0;
+  const duplicateOf = (state: RoundState, row: AuditRow): boolean => {
+    if (!state.keys.has(keyOf(row))) return false;
+    state.duplicates += 1;
+    return true;
+  };
+  const occupy = (state: RoundState, row: AuditRow): void => {
+    state.keys.add(keyOf(row));
+    state[slotOf(row)].push(row);
+  };
+  const unplaced = (row: AuditRow, rounds: readonly RoundState[]): void => {
+    unattributed.push({ eventId: row.eventId, kind: row.kind, candidateRounds: rounds.map((state) => state.index + 1) });
   };
 
   // An attempt reclaimed while it ran, by the lease's own record: it started no later than its freeze.
@@ -398,14 +436,20 @@ export const summarizeReviewRounds = (
     if (attemptId !== null && (previous === undefined || startedAt > previous.freeze.at)) state.attemptIds.add(attemptId);
   }
 
-  // Each reviewer session, on the attempt that constituted it. A review constitutes one terminal
-  // reviewer ("blind-review", or "blind-review-final" after its chunks), so an attempt that already
-  // has a reviewer cannot be the one constituting a later single review's reviewer.
+  // Each reviewer session, on the attempt that constituted it: its first binding row only, so a
+  // replayed binding cannot move it. A review constitutes one terminal reviewer ("blind-review", or
+  // "blind-review-final" after its chunks), so an attempt that already has a reviewer cannot be the
+  // one constituting a later single review's reviewer.
   const sessionRounds = new Map<string, number[]>();
+  const generationsSeen = new Set<string>();
   for (const row of audit) {
     if ((row.kind !== "BINDING_CREATED" && row.kind !== "BINDING_SWITCHED") || !row.roleKey?.startsWith(REVIEWER_ROLE_PREFIX) || !row.sessionId) {
       continue;
     }
+    const generation = row.evidence[row.kind === "BINDING_CREATED" ? "generation" : "toGeneration"];
+    const generationKey = `${row.roleKey}#${String(generation)}`;
+    if (sessionRounds.has(row.sessionId) || generationsSeen.has(generationKey)) continue;
+    generationsSeen.add(generationKey);
     const reason = text(row.evidence["reason"]);
     const purpose = row.kind === "BINDING_SWITCHED" && reason?.startsWith("constituting ") ? reason.slice("constituting ".length) : null;
     const candidates = roundsThatCouldWrite(row.eventId, null).filter((state) =>
@@ -422,13 +466,9 @@ export const summarizeReviewRounds = (
     const named = text(row.evidence["reviewArtifactDigest"]);
     return named === null ? null : (reviewArtifacts.find((artifact) => artifact.digest === named)?.content.reviewerSessionId ?? null);
   };
-  const slotOf = (row: AuditRow): Slot =>
-    row.kind === "BLIND_REVIEW_COMPLETED" ? "completed" : row.kind === "BLIND_REVIEW_UNAVAILABLE" ? "unavailable" : "returned";
-  /** Whether a round can still take a record of this slot: one review outcome and one return per attempt. */
-  const open = (state: RoundState, slot: Slot): boolean =>
-    slot === "returned" ? state.returned.length === 0 : state.completed.length === 0 && state.unavailable.length === 0;
 
-  // Records that name their reviewer go where that reviewer was constituted.
+  // Records that name their reviewer go where that reviewer was constituted, and never replace what
+  // that round already holds.
   const pending: AuditRow[] = [];
   for (const row of audit) {
     if (row.kind !== "BLIND_REVIEW_COMPLETED" && row.kind !== "BLIND_REVIEW_UNAVAILABLE" && row.kind !== "REVISION_RETURNED_TO_CTO") continue;
@@ -440,50 +480,90 @@ export const summarizeReviewRounds = (
       pending.push(row);
       continue;
     }
-    const matching = rounds.filter((index) => states[index]!.digest === digest);
-    if (matching.length === 1) place(states[matching[0]!]!, slotOf(row), row);
-    else unattributed.push({ eventId: row.eventId, kind: row.kind, candidateRounds: matching.map((index) => index + 1) });
+    const matching = rounds.map((index) => states[index]!).filter((state) => state.digest === digest);
+    const target = matching.length === 1 ? matching[0]! : undefined;
+    if (target === undefined) unplaced(row, matching);
+    else if (duplicateOf(target, row)) continue;
+    else if (open(target, slotOf(row))) occupy(target, row);
+    else unplaced(row, [target]);
   }
 
-  // The rest go to the one attempt that could still have written them, or to none.
-  let progressed = true;
-  while (progressed && pending.length > 0) {
-    progressed = false;
-    for (const row of [...pending]) {
-      const slot = slotOf(row);
-      const candidates = roundsThatCouldWrite(row.eventId, text(row.evidence["candidateSnapshotDigest"]));
-      const free = candidates.filter((state) => open(state, slot));
-      if (free.length > 1) continue;
-      const repeats = candidates.filter((state) => state.keys.has(keyOf(row)));
-      const target = free.length === 1 ? free[0] : repeats.length === 1 ? repeats[0] : undefined;
-      if (target !== undefined) place(target, slot, row);
-      else unattributed.push({ eventId: row.eventId, kind: row.kind, candidateRounds: repeats.map((state) => state.index + 1) });
-      pending.splice(pending.indexOf(row), 1);
-      progressed = true;
+  // A record with no identity is placed only where that is proven, never into the latest open slot
+  // when it could be a replay of a record another round already holds.
+  const resolveIdentityFree = (rows: AuditRow[], couldWrite: (row: AuditRow) => RoundState[]): void => {
+    const waiting = [...rows];
+    let progressed = true;
+    while (progressed && waiting.length > 0) {
+      progressed = false;
+      for (const row of [...waiting]) {
+        const free = couldWrite(row).filter((state) => open(state, slotOf(row)));
+        const identical = states.filter((state) => state.keys.has(keyOf(row)));
+        let settled = true;
+        if (identical.length === 0 && free.length === 1) occupy(free[0]!, row);
+        else if (identical.length === 0 && free.length === 0) unplaced(row, []);
+        else if (identical.length === 1 && free.length === 0) duplicateOf(identical[0]!, row);
+        else settled = false;
+        if (settled) {
+          waiting.splice(waiting.indexOf(row), 1);
+          progressed = true;
+        }
+      }
+    }
+    for (const row of waiting) {
+      const free = couldWrite(row).filter((state) => open(state, slotOf(row)));
+      const identical = states.filter((state) => state.keys.has(keyOf(row)));
+      unplaced(row, [...new Set([...identical, ...free])].sort((a, b) => a.index - b.index));
+    }
+  };
+  resolveIdentityFree(pending, (row) => roundsThatCouldWrite(row.eventId, text(row.evidence["candidateSnapshotDigest"])));
+
+  // Content evidence by candidate, from snapshots whose own content proves the digest they are stored
+  // under; and whether that candidate is reviewed at all (an administrative candidate is not).
+  const contentByCandidate = new Map<string, string>();
+  const unreviewedCandidates = new Set<string>();
+  for (const artifact of sources.artifacts) {
+    if (artifact.kind !== ArtifactKind.CANDIDATE_SNAPSHOT || artifact.candidateSnapshotDigest === null) continue;
+    const content = record(artifact.content);
+    if (content === null || !Array.isArray(content["repositories"])) continue;
+    const snapshot = content as unknown as CandidateSnapshot;
+    if (candidateSnapshotDigest(snapshot) === artifact.candidateSnapshotDigest) {
+      contentByCandidate.set(artifact.candidateSnapshotDigest, contentDigestOf(snapshot));
+      if (snapshot.repositories.length === 0 && snapshot.bootstrapPlan === undefined && snapshot.contractChange === undefined) {
+        unreviewedCandidates.add(artifact.candidateSnapshotDigest);
+      }
     }
   }
-  for (const row of pending) {
-    const candidates = roundsThatCouldWrite(row.eventId, text(row.evidence["candidateSnapshotDigest"]));
-    unattributed.push({
-      eventId: row.eventId,
-      kind: row.kind,
-      candidateRounds: candidates.filter((state) => open(state, slotOf(row))).map((state) => state.index + 1),
-    });
-  }
 
-  // The move to CEO review belongs to the attempt whose review passed, never to an unavailable one.
-  const verdictOf = (state: RoundState): string | null => text(state.completed.at(-1)?.evidence["verdict"]);
-  for (const row of audit) {
-    if (row.kind !== "RUN_TRANSITION" || row.evidence["to"] !== RunState.READY_FOR_CEO_REVIEW) continue;
-    const candidates = roundsThatCouldWrite(row.eventId, text(row.evidence["candidateSnapshotDigest"])).filter(
-      (state) => state.unavailable.length === 0 && state.returned.length === 0,
+  // Each round's review: the artifact its first return names, else the one its first completion's reviewer wrote.
+  const reviewArtifactOf = (state: RoundState): StoredArtifact<ReviewPacket> | undefined => {
+    const namedDigest = text(state.returned[0]?.evidence["reviewArtifactDigest"]);
+    const completed = state.completed[0];
+    return (
+      (namedDigest === null ? undefined : reviewArtifacts.find((entry) => entry.digest === namedDigest)) ??
+      (completed?.sessionId
+        ? reviewArtifacts.find((entry) => entry.candidateSnapshotDigest === state.digest && entry.content.reviewerSessionId === completed.sessionId)
+        : undefined)
     );
-    const passed = candidates.filter((state) => verdictOf(state) === "PASS");
-    const unreviewed = candidates.filter((state) => state.completed.length === 0);
-    const target = passed.length === 1 ? passed[0] : passed.length === 0 && unreviewed.length === 1 ? unreviewed[0] : undefined;
-    if (target !== undefined) place(target, "ready", row);
-    else unattributed.push({ eventId: row.eventId, kind: row.kind, candidateRounds: [...passed, ...unreviewed].map((state) => state.index + 1) });
+  };
+
+  // A reviewed candidate reached CEO review when a production-ready packet rests on this round's
+  // passed review; an unreviewed one by its transition row, placed like any identity-free record.
+  for (const packet of readyPackets) {
+    const review = record(record(packet.content)?.["blindReview"]);
+    const reviewDigest = text(review?.["digest"]);
+    const owners = states.filter((state) => {
+      const artifact = reviewArtifactOf(state);
+      return artifact !== undefined && artifact.digest === reviewDigest && artifact.content.verdict === "PASS" && state.digest === packet.candidateSnapshotDigest;
+    });
+    if (owners.length === 1) owners[0]!.readyPackets.add(packet.digest);
   }
+  resolveIdentityFree(
+    audit.filter((row) => isReadyTransition(row) && unreviewedCandidates.has(text(row.evidence["candidateSnapshotDigest"]) ?? "")),
+    (row) =>
+      roundsThatCouldWrite(row.eventId, text(row.evidence["candidateSnapshotDigest"])).filter(
+        (state) => state.completed.length === 0 && state.unavailable.length === 0 && state.returned.length === 0,
+      ),
+  );
 
   // Interventions are run facts: shown on the latest frozen candidate at once.
   for (const row of audit) {
@@ -492,15 +572,34 @@ export const summarizeReviewRounds = (
     (window < 0 ? interventionsBeforeFirstRound : states[window]!.interventions).push({ eventId: row.eventId, kind: row.kind });
   }
 
-  // Content evidence by candidate, from snapshots whose own content proves the digest they are stored under.
-  const contentByCandidate = new Map<string, string>();
-  for (const artifact of sources.artifacts) {
-    if (artifact.kind !== ArtifactKind.CANDIDATE_SNAPSHOT || artifact.candidateSnapshotDigest === null) continue;
-    const content = record(artifact.content);
-    if (content === null || !Array.isArray(content["repositories"])) continue;
-    const snapshot = content as unknown as CandidateSnapshot;
-    if (candidateSnapshotDigest(snapshot) === artifact.candidateSnapshotDigest) {
-      contentByCandidate.set(artifact.candidateSnapshotDigest, contentDigestOf(snapshot));
+  // A delivery is a round's when it carries exactly that round's return: its review packet's reviewer,
+  // or its verification report. One that matches several rounds is placed by its attempt, or listed.
+  const lease = sources.latestAttempt;
+  const last = states.at(-1);
+  if (last !== undefined && lease !== null && last.digest !== null && lease.candidateDigest === last.digest) last.attemptIds.add(lease.attemptId);
+  const carries = (message: OutboxMessage, state: RoundState): boolean => {
+    const returned = state.returned[0];
+    const payload = record(message.payload);
+    if (returned === undefined || payload === null) return false;
+    if (payload["candidateSnapshotDigest"] !== state.digest || payload["reasonCode"] !== returned.reasonCode) return false;
+    if (returned.evidence["stage"] === "verification") {
+      const reportDigest = text(returned.evidence["reportDigest"]);
+      return reportDigest !== null && digestOf(payload["report"] ?? null) === reportDigest;
+    }
+    const reviewerSessionId = reviewArtifactOf(state)?.content.reviewerSessionId ?? state.completed[0]?.sessionId ?? null;
+    return reviewerSessionId !== null && record(payload["packet"])?.["reviewerSessionId"] === reviewerSessionId;
+  };
+  const deliveriesOf = new Map<number, OutboxMessage[]>();
+  for (const message of revisionMessages) {
+    const matching = states.filter((state) => carries(message, state));
+    const attemptId = attemptOfKey(message.idempotencyKey);
+    const byAttempt = attemptId === null ? [] : matching.filter((state) => state.attemptIds.has(attemptId));
+    const owner = matching.length === 1 ? matching[0] : byAttempt.length === 1 ? byAttempt[0] : undefined;
+    if (owner !== undefined) {
+      deliveriesOf.set(owner.index, [...(deliveriesOf.get(owner.index) ?? []), message]);
+      if (attemptId !== null) owner.attemptIds.add(attemptId);
+    } else if (matching.length > 1) {
+      unattributedDeliveries.push({ messageId: message.messageId, candidateRounds: matching.map((state) => state.index + 1) });
     }
   }
 
@@ -540,25 +639,18 @@ export const summarizeReviewRounds = (
 
   const rounds: ReviewRound[] = states.map((state) => {
     const digest = state.digest;
-    const lastReturn = state.returned.at(-1);
-    const lastCompleted = state.completed.at(-1);
-    const namedDigest = text(lastReturn?.evidence["reviewArtifactDigest"]);
-    const artifact =
-      (namedDigest === null ? undefined : reviewArtifacts.find((entry) => entry.digest === namedDigest)) ??
-      (lastCompleted?.sessionId
-        ? reviewArtifacts.find(
-            (entry) => entry.candidateSnapshotDigest === digest && entry.content.reviewerSessionId === lastCompleted.sessionId,
-          )
-        : undefined);
-    const chunkSessions = lastCompleted?.evidence["chunkReviewerSessions"];
-    const chunked = artifact?.content.chunked ?? lastCompleted?.evidence["chunked"] === true;
-    const verdict = (artifact?.content.verdict ?? text(lastCompleted?.evidence["verdict"])) as ReviewVerdict | null;
+    const firstReturn = state.returned[0];
+    const firstCompleted = state.completed[0];
+    const artifact = reviewArtifactOf(state);
+    const chunkSessions = firstCompleted?.evidence["chunkReviewerSessions"];
+    const chunked = artifact?.content.chunked ?? firstCompleted?.evidence["chunked"] === true;
+    const verdict = (artifact?.content.verdict ?? text(firstCompleted?.evidence["verdict"])) as ReviewVerdict | null;
     const review: ReviewRoundReview | null =
       verdict === null
         ? null
         : {
             artifactDigest: artifact?.digest ?? null,
-            reviewerSessionId: artifact?.content.reviewerSessionId ?? lastCompleted?.sessionId ?? null,
+            reviewerSessionId: artifact?.content.reviewerSessionId ?? firstCompleted?.sessionId ?? null,
             verdict,
             reviewKind: artifact ? reviewKindOf(artifact.content) : "CANDIDATE",
             chunked,
@@ -569,38 +661,18 @@ export const summarizeReviewRounds = (
 
     let outcome: ReviewRoundOutcome = "NO_OUTCOME_RECORDED";
     let reasonCode: string | null = null;
-    if (lastReturn) {
-      outcome = lastReturn.evidence["stage"] === "verification" ? "VERIFICATION_RETURNED" : "REVISION_RETURNED";
-      reasonCode = lastReturn.reasonCode;
+    if (firstReturn) {
+      outcome = firstReturn.evidence["stage"] === "verification" ? "VERIFICATION_RETURNED" : "REVISION_RETURNED";
+      reasonCode = firstReturn.reasonCode;
     } else if (state.unavailable.length > 0) {
       outcome = "REVIEW_UNAVAILABLE";
-      reasonCode = state.unavailable.at(-1)!.reasonCode;
+      reasonCode = state.unavailable[0]!.reasonCode;
     } else if (review?.verdict === "PASS") {
       outcome = "REVIEW_PASSED";
-      reasonCode = lastCompleted?.reasonCode ?? null;
+      reasonCode = firstCompleted?.reasonCode ?? null;
     }
 
-    // The delivery of a return: the REVISION_REQUEST that carried this review, or this report.
-    const reportDigest = text(lastReturn?.evidence["reportDigest"]);
-    const deliveries = lastReturn
-      ? revisionMessages
-          .filter((message) => {
-            const payload = record(message.payload);
-            if (payload === null || payload["candidateSnapshotDigest"] !== digest || payload["reasonCode"] !== lastReturn.reasonCode) {
-              return false;
-            }
-            if (outcome === "VERIFICATION_RETURNED") return reportDigest !== null && digestOf(payload["report"] ?? null) === reportDigest;
-            const packet = record(payload["packet"]);
-            return review?.reviewerSessionId != null && packet?.["reviewerSessionId"] === review.reviewerSessionId;
-          })
-          .map(toDelivery)
-      : [];
-    for (const delivery of deliveries) if (delivery.attemptId !== null) state.attemptIds.add(delivery.attemptId);
-    const lease = sources.latestAttempt;
-    if (state.index === states.length - 1 && lease !== null && digest !== null && lease.candidateDigest === digest) {
-      state.attemptIds.add(lease.attemptId);
-    }
-
+    const reached = review === null ? state.ready.length > 0 : state.readyPackets.size > 0 && review.verdict === "PASS";
     return {
       round: state.index + 1,
       frozenEventId: state.freeze.eventId,
@@ -613,8 +685,8 @@ export const summarizeReviewRounds = (
       attemptId: state.attemptIds.size === 1 ? [...state.attemptIds][0]! : null,
       attemptReclaimed: state.reclaimed,
       review,
-      deliveries,
-      readyForCeo: state.ready.length > 0 && outcome !== "REVIEW_UNAVAILABLE" && (review === null || review.verdict === "PASS"),
+      deliveries: (deliveriesOf.get(state.index) ?? []).map(toDelivery),
+      readyForCeo: reached && outcome !== "REVIEW_UNAVAILABLE" && outcome !== "REVISION_RETURNED" && outcome !== "VERIFICATION_RETURNED",
       nextNewCandidate: null,
       duplicateEventsIgnored: state.duplicates,
     };
@@ -642,6 +714,7 @@ export const summarizeReviewRounds = (
     round.nextNewCandidate = later ? { round: later.round, candidateSnapshotDigest: later.candidateSnapshotDigest! } : null;
   }
 
+  // The first findings are the earliest round's, from the review that round first holds.
   const first = rounds.find((round) => (round.review?.findings.length ?? 0) > 0);
   const count = (predicate: (round: ReviewRound) => boolean): number => rounds.filter(predicate).length;
   unattributed.sort((a, b) => a.eventId - b.eventId);
@@ -654,6 +727,7 @@ export const summarizeReviewRounds = (
     rounds,
     interventionsBeforeFirstRound,
     unattributedEvents: unattributed,
+    unattributedDeliveries,
     firstFindings: first ? { round: first.round, findings: first.review!.findings } : null,
     unlinkedDispositions: dispositions.filter((entry) => !linked.has(entry.findingDigest)).map((entry) => ({ ...entry })),
     totals: {
