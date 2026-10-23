@@ -4,7 +4,7 @@ import type { AuditLog, AuditRow } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type ReviewFindingCategory, type ReviewVerdict, RunState } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
-import type { Outbox, OutboxMessage } from "../outbox/outbox.ts";
+import { outboxDeliveryReadback, type Outbox, type OutboxMessage } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import { type CandidateSnapshot, candidateSnapshotDigest } from "../snapshot/candidate-snapshot.ts";
@@ -133,7 +133,11 @@ export interface ReviewRoundDelivery {
   messageId: string;
   /** The submission attempt the revision was keyed by (`revision:<run>:<candidate>:<reason>:<attempt>`). */
   attemptId: string | null;
-  status: OutboxMessage["status"];
+  status: ReturnType<typeof outboxDeliveryReadback>["status"];
+  delivery: string;
+  automaticResendHeld: boolean;
+  delivered: boolean;
+  completed: boolean;
   roleKey: string;
   bindingGeneration: number;
   targetSessionId: string;
@@ -187,7 +191,7 @@ export interface ReviewRoundSummary {
   /** Records placed on no round, with the rounds each could belong to. Never guessed onto one. */
   unattributedEvents: UnattributedReviewEvent[];
   /** REVISION_REQUEST deliveries that match more than one round's return and no single attempt. */
-  unattributedDeliveries: Array<{ messageId: string; candidateRounds: number[] }>;
+  unattributedDeliveries: Array<{ messageId: string; candidateRounds: number[] } & Partial<ReturnType<typeof outboxDeliveryReadback>>>;
   /** The first round whose review returned findings, preserved whatever later rounds did. */
   firstFindings: { round: number; findings: ReviewRoundFinding[] } | null;
   /** Dispositions whose digest names no finding of this run. */
@@ -743,6 +747,7 @@ export const summarizeReviewRounds = (
     }
     unattributedDeliveries.push({
       messageId: message.messageId,
+      ...(outboxDeliveryReadback(message).automaticResendHeld ? outboxDeliveryReadback(message) : {}),
       candidateRounds: [...new Set([...carriers, ...(known === undefined ? [] : [states[known]!])])]
         .sort((a, b) => a.index - b.index)
         .map((state) => state.index + 1),
@@ -770,7 +775,7 @@ export const summarizeReviewRounds = (
     return {
       messageId: message.messageId,
       attemptId: attemptOfKey(message.idempotencyKey),
-      status: message.status,
+      ...outboxDeliveryReadback(message),
       roleKey: message.roleKey,
       bindingGeneration: message.bindingGeneration,
       targetSessionId: message.targetSessionId,

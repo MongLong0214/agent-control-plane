@@ -64,6 +64,19 @@ export interface OutboxMessage extends FencedEnvelope {
   createdAt: string;
 }
 
+/** A readback, never a new durable state. SENT + unknown_observed suppresses automatic resend;
+ * it proves neither delivery nor completion. Only an authenticated ACK confirms completion. */
+export const outboxDeliveryReadback = (message: Pick<OutboxMessage, "status" | "failureClass">) => {
+  const held = message.status === "SENT" && message.failureClass === "unknown_observed";
+  return {
+    status: held ? "OUTCOME_UNKNOWN" as const : message.status,
+    delivery: held ? "outcome unknown / delivery unconfirmed / automatic resend held" : message.status,
+    automaticResendHeld: held,
+    delivered: !held && (message.status === "SENT" || message.status === "ACKED"),
+    completed: message.status === "ACKED",
+  };
+};
+
 /**
  * Who is claiming — every field read from the authenticated connection, none from the row.
  *
@@ -1595,7 +1608,8 @@ export class Outbox {
         sessionId: row?.target_session_id ?? null,
         evidence: { messageId, room: destination.room, recipient: destination.recipient, outcome, reason },
       });
-      return allow(ReasonCode.OK, undefined, { messageId, alreadySent: outcome });
+      return allow(ReasonCode.OK, undefined, { messageId, alreadySent: outcome,
+        ...outboxDeliveryReadback({ status: "SENT", failureClass: outcome === "UNKNOWN" ? "unknown_observed" : null }) });
     });
   }
 
@@ -1659,7 +1673,8 @@ export class Outbox {
           [this.clock.nowIso(), attempts, classified.error.slice(0, 500), classified.failureClass, messageId, claimToken],
         ).changes;
         if (sent !== 1) return this.staleClaim(messageId);
-        return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true });
+        return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true,
+          ...outboxDeliveryReadback({ status: "SENT", failureClass: classified.failureClass }) });
       }
       // An attempt refused before sending because its target had no route (no Buzz room or no channel
       // identity — `DeliveryFailure.routeAbsent`, set at that refusal) sent nothing: it is recorded as
@@ -3325,6 +3340,19 @@ export class Outbox {
     return this.db
       .all<RawOutbox>(`SELECT * FROM outbox WHERE run_id = ? ORDER BY created_at, message_id`, [runId])
       .map(hydrate);
+  }
+
+  /** Operator/doctor/health counts use the same interpretation as individual receipts. */
+  deliveryReadback() {
+    const rows = this.db.all<{ message_id: string; status: OutboxMessage["status"]; failure_class: FailureClass | null }>(
+      "SELECT message_id, status, failure_class FROM outbox ORDER BY created_at, message_id",
+    ).map((row) => ({ messageId: row.message_id,
+      ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class }) }));
+    return {
+      delivered: rows.filter((row) => row.delivered).length,
+      completed: rows.filter((row) => row.completed).length,
+      unconfirmed: rows.filter((row) => row.automaticResendHeld),
+    };
   }
 
   /**

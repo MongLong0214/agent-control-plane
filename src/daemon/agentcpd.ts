@@ -2211,41 +2211,13 @@ export const createDaemonBuzzBindChallenges = (cp: ControlPlane, policy: Ingress
   });
 };
 
-/**
- * The daemon's own front door on the relay, feeding the seam a person's CLI feeds (#760 Part C).
- *
- * Two things are worth stating about the signature this composes. The subscriber has already
- * verified the *event's* signature — that is what says the owner wrote these words — and the
- * envelope it hands the seam is then signed with the deployment's ingress secret, because that is
- * the credential `IngressGuard` authenticates a local submission with. The daemon is standing
- * where the relay-side CLI stood, so it presents the credential that surface has always presented.
- *
- * What it deliberately does not do is skip the seam. Calling `enqueue` directly would be shorter
- * and would bypass the owner allowlist, the `(buzz, nonce)` replay slot, the address resolution
- * and the single-transaction admission — every one of which is a refusal this path is required to
- * make, and none of which this module is allowed to be a second authority for.
- *
- * A daemon with no `buzz-nostr-subscriber.json` gets a handle reporting zero sockets. That is the
- * configured-off state, and it is a value rather than a `null` so a caller cannot read "absent"
- * as "running".
- */
-export const startDaemonBuzzMentionSubscriber = (
+/** The production admission/audit sink, also usable without relay credentials on an offline copy. */
+export const createDaemonBuzzMentionSink = (
   cp: ControlPlane,
-  stateDir: string,
   policy: IngressPolicy,
   messageIngress: Pick<LocalBuzzMessageIngress, "seam">,
-  options: {
-    openSocket?: BuzzRelaySocketFactory;
-    scheduler?: BuzzSubscriberScheduler;
-    /** The adopted CEO's pending Buzz binding challenges, shared with its tool socket. */
-    bindChallenges?: BuzzBindChallenges;
-    /** The canonical session entries, so an identity's binding must be on its entry's project. */
-    canonical?: BuzzMentionCanonicalEntries | null;
-    /** Where admission changes are reported; the subscriber's own stderr line when absent. */
-    reportAdmission?: BuzzMentionAdmissionReporter;
-
-  } = {},
-): BuzzMentionSubscriberHandle => {
+  options: { bindChallenges?: BuzzBindChallenges } = {},
+): BuzzMentionSink => {
   const secret = policy.secret?.trim() ?? "";
   if (secret.length === 0) {
     throw new Error("Buzz mention subscriber requires a non-empty signing secret");
@@ -2299,6 +2271,45 @@ export const startDaemonBuzzMentionSubscriber = (
       return verdict;
     },
   };
+  return sink;
+};
+
+/**
+ * The daemon's own front door on the relay, feeding the seam a person's CLI feeds (#760 Part C).
+ *
+ * Two things are worth stating about the signature this composes. The subscriber has already
+ * verified the *event's* signature — that is what says the owner wrote these words — and the
+ * envelope it hands the seam is then signed with the deployment's ingress secret, because that is
+ * the credential `IngressGuard` authenticates a local submission with. The daemon is standing
+ * where the relay-side CLI stood, so it presents the credential that surface has always presented.
+ *
+ * What it deliberately does not do is skip the seam. Calling `enqueue` directly would be shorter
+ * and would bypass the owner allowlist, the `(buzz, nonce)` replay slot, the address resolution
+ * and the single-transaction admission — every one of which is a refusal this path is required to
+ * make, and none of which this module is allowed to be a second authority for.
+ *
+ * A daemon with no `buzz-nostr-subscriber.json` gets a handle reporting zero sockets. That is the
+ * configured-off state, and it is a value rather than a `null` so a caller cannot read "absent"
+ * as "running".
+ */
+export const startDaemonBuzzMentionSubscriber = (
+  cp: ControlPlane,
+  stateDir: string,
+  policy: IngressPolicy,
+  messageIngress: Pick<LocalBuzzMessageIngress, "seam">,
+  options: {
+    openSocket?: BuzzRelaySocketFactory;
+    scheduler?: BuzzSubscriberScheduler;
+    /** The adopted CEO's pending Buzz binding challenges, shared with its tool socket. */
+    bindChallenges?: BuzzBindChallenges;
+    /** The canonical session entries, so an identity's binding must be on its entry's project. */
+    canonical?: BuzzMentionCanonicalEntries | null;
+    /** Where admission changes are reported; the subscriber's own stderr line when absent. */
+    reportAdmission?: BuzzMentionAdmissionReporter;
+
+  } = {},
+): BuzzMentionSubscriberHandle => {
+  const sink = createDaemonBuzzMentionSink(cp, policy, messageIngress, options);
   const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
     ownerAuthors: messageIngress.seam.ingress.ownerActors,
     reportEventRefusal: ({ author, eventId, reasonCode }) => auditBuzzPeerRefusal(

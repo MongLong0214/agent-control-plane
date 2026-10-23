@@ -194,3 +194,80 @@ it.each(["switch", "rebind"] as const)("a shared actor's %s through a sibling ro
     expect(await f.deliver(`shared actor after ${writer}`)).toBe("refused and recorded");
   } finally { await f.close(); }
 });
+
+// GREEN-ONLY at r8: writer classification witnesses; no authority is inferred from updated_at.
+it.each(["setPid", "rotateSecret", "bindBuzzActor", "transition DRAINING"] as const)(
+  "GREEN-ONLY: unrelated/idempotent %s preserves the room anchor", async (writer) => {
+    const f = await restart();
+    try {
+      const { cp } = f.h;
+      if (writer === "setPid") cp.sessions.setPid(f.first.sessionId, null);
+      if (writer === "rotateSecret") expect(cp.sessions.rotateSecret(f.first.sessionId, 1).allowed).toBe(true);
+      if (writer === "bindBuzzActor") {
+        const rotated = cp.sessions.rotateSecret(f.first.sessionId, 1);
+        if (!rotated.allowed) throw new Error(rotated.message);
+        expect(cp.sessions.bindBuzzActor({ sessionId: f.first.sessionId, sessionSecret: rotated.value.sessionSecret,
+          buzzActorId: cp.sessions.require(f.first.sessionId).buzzActorId! }, { isAllowedActor: () => true }).allowed).toBe(true);
+      }
+      if (writer === "transition DRAINING") expect(cp.sessions.transition(f.first.sessionId, SessionLifecycle.DRAINING).allowed).toBe(true);
+      expect(await f.deliver(writer)).toBe("admitted");
+    } finally { await f.close(); }
+  });
+
+it.each(["rebind", "takeover", "revoke", "transition STOPPED"] as const)(
+  "GREEN-ONLY: authority writer %s invalidates the room anchor", async (writer) => {
+    const f = await restart();
+    try {
+      expect(await f.deliver(`before ${writer}`)).toBe("admitted");
+      const { cp } = f.h;
+      if (writer === "transition STOPPED") expect(cp.sessions.transition(f.first.sessionId, SessionLifecycle.STOPPED).allowed).toBe(true);
+      else if (writer === "takeover") expect(cp.bindings.switchTo({ role: Role.PRIMARY_CTO, projectId: PROJECT,
+        sessionId: f.first.sessionId, conversation: "REPLACED", takeover: true, reason: writer }).allowed).toBe(true);
+      else {
+        expect(cp.bindings.revoke(f.roleKey, writer).allowed).toBe(true);
+        if (writer === "rebind") expect(cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: PROJECT,
+          sessionId: f.first.sessionId, verifiedTarget: f.target }).allowed).toBe(true);
+      }
+      expect(await f.deliver(`after ${writer}`)).not.toBe("admitted");
+      if (writer === "takeover" || writer === "rebind") {
+        expect(cp.bindings.active(f.roleKey)!.bindingGeneration).toBe(2);
+        expect(await f.deliver(`floor moved ${writer}`)).toBe("refused and recorded");
+      }
+    } finally { await f.close(); }
+  });
+
+// GREEN-ONLY at r8. These execute each writer; source census is not atomicity evidence.
+it.each(["address", "runtime", "sibling switch", "sibling rebind"] as const)(
+  "GREEN-ONLY: %s rolls back both mutation and evidence on failures before and after audit insertion", async (writer) => {
+    const f = await restart(writer.startsWith("sibling"));
+    const raw = new Database(join(f.h.root, "state.sqlite"));
+    try {
+      const { cp } = f.h;
+      const next = f.ready();
+      const role = writer.startsWith("sibling") ? Role.OPTIONAL_ADVERSARIAL_REVIEWER : Role.PRIMARY_CTO;
+      const scope = writer.startsWith("sibling") ? { runId: f.siblingRun! } : { projectId: PROJECT };
+      const key = roleKeyFor(role, scope);
+      if (writer === "sibling rebind") expect(cp.bindings.revoke(key, "prepare rebind").allowed).toBe(true);
+      const kind = writer === "address" ? "SESSION_BUZZ_ADDRESS_CHANGED" : "BINDING_RUNTIME_MOVED";
+      const before = () => ({
+        address: cp.sessions.require(f.first.sessionId).buzzAddress,
+        pointers: cp.db.all("SELECT actor_id, current_session_id FROM conversational_actors ORDER BY actor_id"),
+        assignments: cp.db.all("SELECT assignment_id, status FROM assignments ORDER BY assignment_id"),
+        audits: cp.db.all("SELECT * FROM audit_events ORDER BY event_id"),
+        rooms: cp.db.all("SELECT * FROM role_room_memberships ORDER BY role_key, conversation"),
+      });
+      for (const timing of ["BEFORE", "AFTER"]) {
+        const snapshot = before();
+        raw.exec(`CREATE TRIGGER r8b_fail ${timing} INSERT ON audit_events WHEN NEW.kind = '${kind}'
+          BEGIN SELECT RAISE(ABORT, 'r8b injected failure'); END`);
+        try {
+          const change = () => writer === "address" ? cp.sessions.setBuzzAddress(f.first.sessionId, OTHER_ROOM)
+            : writer === "sibling rebind" ? cp.bindings.bind({ role, ...scope, sessionId: next.sessionId, verifiedTarget: f.target })
+              : cp.bindings.switchTo({ role, ...scope, sessionId: next.sessionId, conversation: "SURVIVED", reason: writer });
+          expect(change).toThrow("r8b injected failure");
+          expect(before()).toEqual(snapshot);
+        } finally { raw.exec("DROP TRIGGER r8b_fail"); }
+      }
+      expect(await f.deliver(`rollback ${writer}`)).toBe("admitted");
+    } finally { raw.close(); await f.close(); }
+  });
