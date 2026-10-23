@@ -425,7 +425,7 @@ describe("round 2 daemon regressions", () => {
     } finally { signal.mockRestore(); await daemon.stop(); }
   });
 
-  it.each(["active CEO", "revoked unfinished-work owner"])(
+  it.each(["active CEO", "active CTO with unfinished work", "revoked unfinished-work owner"])(
     "ACP1187-R1-01: keeps a dead %s actionable after settlement", async (reference) => {
       const { harness, run } = await makeDaemonStartHealthy();
       const sessionId = reference === "active CEO"

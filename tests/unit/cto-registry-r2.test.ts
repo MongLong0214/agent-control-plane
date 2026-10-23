@@ -424,6 +424,18 @@ describe("round-2 registry regressions", () => {
     let headReads = 0;
     let branchReads = 0;
     let switchedBack = false;
+    const invoke = git.git;
+    const snapshots = vi.spyOn(git, "git").mockImplementation(async (cwd, args, options) => {
+      const result = await invoke(cwd, args, options);
+      if (args.includes("status")) {
+        expect(args.slice(-5)).toEqual(["status", "--porcelain=v2", "--branch", "--untracked-files=all", "--ignore-submodules=dirty"]);
+        expect(result.stdout).toContain(`# branch.oid ${descendant}\n`);
+        expect(result.stdout).toContain("# branch.head owner-feature\n");
+        // The checkout changes after Git answers, without changing any returned evidence.
+        gitSync(cwd, ["checkout", "dev"]);
+      }
+      return result;
+    });
     const headProbe = vi.spyOn(git, "tryRevParse").mockImplementation(async (cwd, ref) => {
       const head = await readHead(cwd, ref);
       // Inspection sees B, while every branch probe up to acceptance sees dev at A.
@@ -444,21 +456,22 @@ describe("round-2 registry regressions", () => {
     });
     try {
       const observed = await harness.cp.repositories.observe(repositoryId);
-      expect(switchedBack).toBe(true);
+      if (headReads > 0) expect(switchedBack).toBe(true);
+      else expect(snapshots).toHaveBeenCalledTimes(1);
       expect(gitSync(harness.repoPath, ["rev-parse", "dev"])).toBe(baseline);
-      expect(gitSync(harness.repoPath, ["rev-parse", "HEAD"])).toBe(descendant);
-      expect(await readBranch(harness.repoPath)).toBe("owner-feature");
+      expect(gitSync(harness.repoPath, ["rev-parse", "HEAD"])).toBe(headReads > 0 ? descendant : baseline);
+      expect(await readBranch(harness.repoPath)).toBe(headReads > 0 ? "owner-feature" : "dev");
       expect(observed).toMatchObject({ lastObservedHead: baseline, driftState: "DRIFTED" });
-    } finally { headProbe.mockRestore(); branchProbe.mockRestore(); cleanProbe.mockRestore(); }
+    } finally { headProbe.mockRestore(); branchProbe.mockRestore(); cleanProbe.mockRestore(); snapshots.mockRestore(); }
   });
 
-  it.each(["head", "branch", "cleanliness", "manifest"])("rechecks %s before acknowledging a descendant", async (change) => {
+  it.each(["head", "branch", "cleanliness", "manifest", "baseline"])("rechecks %s before acknowledging a descendant", async (change) => {
     const harness = makeHarness();
     const { repositoryId } = await registerFixtureProject(harness);
     const baseline = harness.cp.repositories.byId(repositoryId)!.lastObservedHead;
     writeFiles(harness.repoPath, { "README.md": "# descendant\n" });
     commitAll(harness.repoPath, "descendant");
-    const readBranch = git.currentBranch;
+    const readMergeBase = git.mergeBase;
     const readProject = harness.cp.projects.get.bind(harness.cp.projects);
     let manifestChanged = false;
     const projectProbe = vi.spyOn(harness.cp.projects, "get").mockImplementation((id) => {
@@ -466,20 +479,23 @@ describe("round-2 registry regressions", () => {
       return manifestChanged && project ? { ...project, activeManifestDigest: "changed-manifest" } : project;
     });
     let reads = 0;
-    const probe = vi.spyOn(git, "currentBranch").mockImplementation(async (cwd) => {
-      if (++reads === 2) {
+    const probe = vi.spyOn(git, "mergeBase").mockImplementation(async (cwd, ...args) => {
+      const ancestor = await readMergeBase(cwd, ...args);
+      if (++reads === 1) {
         if (change === "manifest") manifestChanged = true;
+        else if (change === "baseline") harness.cp.repositories.acknowledgeHead(repositoryId, "b".repeat(40));
         else if (change === "branch") gitSync(cwd, ["checkout", "-b", "owner-moved"]);
         else {
           writeFiles(cwd, { "owner.txt": "arrived during observation" });
           if (change === "head") commitAll(cwd, "owner moved head");
         }
       }
-      return readBranch(cwd);
+      return ancestor;
     });
     try {
-      expect((await harness.cp.repositories.observe(repositoryId))?.lastObservedHead).toBe(baseline);
-      expect(reads).toBeGreaterThanOrEqual(2);
+      expect((await harness.cp.repositories.observe(repositoryId))?.lastObservedHead)
+        .toBe(change === "baseline" ? "b".repeat(40) : baseline);
+      expect(reads).toBe(1);
     } finally { probe.mockRestore(); projectProbe.mockRestore(); }
   });
 

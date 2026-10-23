@@ -508,7 +508,7 @@ export class Doctor {
       findings.push(...this.checkWorkers());
     }
     if (scope === "system" || scope === "session") {
-      findings.push(...this.checkSessions(target ?? null));
+      findings.push(...this.checkSessions(target ?? null, scope));
     }
     if (scope === "system" || scope === "capacity") {
       // Before the sweep: a pin that cannot be spawned causes a failed measurement.
@@ -949,7 +949,7 @@ export class Doctor {
     return findings;
   }
 
-  private checkSessions(sessionId: string | null): Finding[] {
+  private checkSessions(sessionId: string | null, scope: DoctorScope): Finding[] {
     const findings: Finding[] = [];
     // Settlement changes lifecycle, not the authority or unfinished work referencing a session.
     const sessions = sessionId ? [this.sessions.get(sessionId)].filter(Boolean) : this.sessions.list();
@@ -971,23 +971,30 @@ export class Doctor {
         });
       }
       if (probeSessionLiveness(session.osPid, session.osProcessStartedAt) === "DEAD") {
-        const activeBinding = this.db.get(
-          `SELECT 1 FROM assignments a
+        const activeBindings = this.db.all<{ role: Role; project_id: string | null }>(
+          `SELECT a.role, a.project_id FROM assignments a
             LEFT JOIN conversational_actors actor ON actor.actor_id = a.actor_id
             WHERE a.status = 'ACTIVE' AND COALESCE(actor.current_session_id, a.session_id) = ?
               AND COALESCE(actor.current_session_incarnation, a.session_incarnation) = ?`,
           [session.sessionId, session.incarnation],
         );
+        const activeBinding = activeBindings.length > 0;
         const unfinishedWork = this.runs.activeRunsOwnedBy(session.sessionId).length > 0 || Boolean(this.db.get(
           `SELECT 1 FROM task_executions WHERE worker_session_id = ? AND status = 'RUNNING'`, [session.sessionId],
         ));
         const terminal = session.lifecycle === SessionLifecycle.ERROR || session.lifecycle === SessionLifecycle.STOPPED;
         if (!sessionId && terminal && !activeBinding && !unfinishedWork) continue;
+        // Match checkBindings' project-availability policy: a settled PRIMARY_CTO with no
+        // unfinished work can be released through the operator door after startup. Keep the
+        // error visible; only the system gate relaxes it, never session/role diagnostics or
+        // another authority (including CEO), an unfinished run, or an open worker receipt.
+        const recoverableBinding = scope === "system" && terminal && activeBinding && !unfinishedWork &&
+          activeBindings.every((binding) => binding.role === Role.PRIMARY_CTO && binding.project_id !== null);
         findings.push({
           code: "SESSION_PROCESS_MISSING",
           severity: activeBinding || unfinishedWork ? "ERROR" : "WARN",
           scope: `session:${session.sessionId}`,
-          blocking: Boolean(activeBinding || unfinishedWork),
+          blocking: Boolean(activeBinding || unfinishedWork) && !recoverableBinding,
           confidence: "HIGH",
           observedEvidence: { pid: session.osPid, lifecycle: session.lifecycle },
           recommendedAction: "mark the session ERROR and recover its bindings",
