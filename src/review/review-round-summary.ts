@@ -312,7 +312,8 @@ interface RoundState {
   freeze: AuditRow;
   digest: string | null;
   reclaimed: boolean;
-  attemptIds: Set<string>;
+  /** The attempt this round is, once a record proves it; never replaced or cleared afterwards. */
+  attemptId: string | null;
   bindings: Array<{ sessionId: string; purpose: string | null }>;
   completed: AuditRow[];
   unavailable: AuditRow[];
@@ -369,7 +370,7 @@ export const summarizeReviewRounds = (
     freeze,
     digest: text(freeze.evidence["candidateSnapshotDigest"]),
     reclaimed: false,
-    attemptIds: new Set<string>(),
+    attemptId: null,
     bindings: [],
     completed: [],
     unavailable: [],
@@ -424,6 +425,15 @@ export const summarizeReviewRounds = (
     unattributed.push({ eventId: row.eventId, kind: row.kind, candidateRounds: rounds.map((state) => state.index + 1) });
   };
 
+  // Attempt identity. A round's attempt is set once, by the first record that proves it, and a later
+  // record never replaces or clears it; an attempt belongs to at most one round.
+  const roundOfAttempt = new Map<string, number>();
+  const establish = (state: RoundState, attemptId: string): void => {
+    if (state.attemptId !== null || roundOfAttempt.has(attemptId)) return;
+    state.attemptId = attemptId;
+    roundOfAttempt.set(attemptId, state.index);
+  };
+
   // An attempt reclaimed while it ran, by the lease's own record: it started no later than its freeze.
   for (const row of audit.filter((entry) => entry.kind === "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED")) {
     const window = windowOf(row.eventId);
@@ -433,8 +443,12 @@ export const summarizeReviewRounds = (
     if (state === undefined || startedAt === null || startedAt > state.freeze.at) continue;
     state.reclaimed = true;
     const previous = states[window - 1];
-    if (attemptId !== null && (previous === undefined || startedAt > previous.freeze.at)) state.attemptIds.add(attemptId);
+    if (attemptId !== null && (previous === undefined || startedAt > previous.freeze.at)) establish(state, attemptId);
   }
+  // The lease row keeps the latest attempt and the candidate it bound: the last round's, when they agree.
+  const lease = sources.latestAttempt;
+  const last = states.at(-1);
+  if (last !== undefined && lease !== null && last.digest !== null && lease.candidateDigest === last.digest) establish(last, lease.attemptId);
 
   // Each reviewer session, on the attempt that constituted it: its first binding row only, so a
   // replayed binding cannot move it. A review constitutes one terminal reviewer ("blind-review", or
@@ -465,6 +479,19 @@ export const summarizeReviewRounds = (
     if (row.kind === "BLIND_REVIEW_COMPLETED") return row.sessionId;
     const named = text(row.evidence["reviewArtifactDigest"]);
     return named === null ? null : (reviewArtifacts.find((artifact) => artifact.digest === named)?.content.reviewerSessionId ?? null);
+  };
+
+  /** Whether a REVISION_REQUEST delivered exactly this return: the same candidate, reason, and report or review. */
+  const deliveredReturn = (message: OutboxMessage, row: AuditRow, fallbackReviewerSessionId: string | null = null): boolean => {
+    const payload = record(message.payload);
+    if (payload === null || payload["candidateSnapshotDigest"] !== text(row.evidence["candidateSnapshotDigest"])) return false;
+    if (payload["reasonCode"] !== row.reasonCode) return false;
+    if (row.evidence["stage"] === "verification") {
+      const reportDigest = text(row.evidence["reportDigest"]);
+      return reportDigest !== null && digestOf(payload["report"] ?? null) === reportDigest;
+    }
+    const reviewerSessionId = reviewSessionOf(row) ?? fallbackReviewerSessionId;
+    return reviewerSessionId !== null && record(payload["packet"])?.["reviewerSessionId"] === reviewerSessionId;
   };
 
   // Records that name their reviewer go where that reviewer was constituted, and never replace what
@@ -498,8 +525,18 @@ export const summarizeReviewRounds = (
       for (const row of [...waiting]) {
         const free = couldWrite(row).filter((state) => open(state, slotOf(row)));
         const identical = states.filter((state) => state.keys.has(keyOf(row)));
+        // A return its own attempt delivered is that attempt's, even when an earlier one is identical.
+        const proven = slotOf(row) !== "returned"
+          ? []
+          : free.filter((state) =>
+              revisionMessages.some((message) => {
+                const attemptId = attemptOfKey(message.idempotencyKey);
+                return attemptId !== null && roundOfAttempt.get(attemptId) === state.index && deliveredReturn(message, row);
+              }),
+            );
         let settled = true;
-        if (identical.length === 0 && free.length === 1) occupy(free[0]!, row);
+        if (proven.length === 1) occupy(proven[0]!, row);
+        else if (identical.length === 0 && free.length === 1) occupy(free[0]!, row);
         else if (identical.length === 0 && free.length === 0) unplaced(row, []);
         else if (identical.length === 1 && free.length === 0) duplicateOf(identical[0]!, row);
         else settled = false;
@@ -572,34 +609,41 @@ export const summarizeReviewRounds = (
     (window < 0 ? interventionsBeforeFirstRound : states[window]!.interventions).push({ eventId: row.eventId, kind: row.kind });
   }
 
-  // A delivery is a round's when it carries exactly that round's return: its review packet's reviewer,
-  // or its verification report. One that matches several rounds is placed by its attempt, or listed.
-  const lease = sources.latestAttempt;
-  const last = states.at(-1);
-  if (last !== undefined && lease !== null && last.digest !== null && lease.candidateDigest === last.digest) last.attemptIds.add(lease.attemptId);
-  const carries = (message: OutboxMessage, state: RoundState): boolean => {
-    const returned = state.returned[0];
-    const payload = record(message.payload);
-    if (returned === undefined || payload === null) return false;
-    if (payload["candidateSnapshotDigest"] !== state.digest || payload["reasonCode"] !== returned.reasonCode) return false;
-    if (returned.evidence["stage"] === "verification") {
-      const reportDigest = text(returned.evidence["reportDigest"]);
-      return reportDigest !== null && digestOf(payload["report"] ?? null) === reportDigest;
-    }
-    const reviewerSessionId = reviewArtifactOf(state)?.content.reviewerSessionId ?? state.completed[0]?.sessionId ?? null;
-    return reviewerSessionId !== null && record(payload["packet"])?.["reviewerSessionId"] === reviewerSessionId;
-  };
+  // A delivery goes to the round whose return it carries. When its own attempt is a known round's,
+  // that decides: it goes there only if that round's return is the one it carries, and is listed
+  // otherwise, never placed on another round that happens to match. A delivery whose attempt is not
+  // yet known goes to the one matching round with no attempt of its own, which it then names.
   const deliveriesOf = new Map<number, OutboxMessage[]>();
-  for (const message of revisionMessages) {
-    const matching = states.filter((state) => carries(message, state));
+  const deliver = (state: RoundState, message: OutboxMessage): void => {
+    deliveriesOf.set(state.index, [...(deliveriesOf.get(state.index) ?? []), message]);
+  };
+  const knownAttemptFirst = [...revisionMessages].sort(
+    (a, b) =>
+      Number(!roundOfAttempt.has(attemptOfKey(a.idempotencyKey) ?? "")) - Number(!roundOfAttempt.has(attemptOfKey(b.idempotencyKey) ?? "")),
+  );
+  for (const message of knownAttemptFirst) {
+    const carriers = states.filter(
+      (state) => state.returned[0] !== undefined && deliveredReturn(message, state.returned[0], state.completed[0]?.sessionId ?? null),
+    );
     const attemptId = attemptOfKey(message.idempotencyKey);
-    const byAttempt = attemptId === null ? [] : matching.filter((state) => state.attemptIds.has(attemptId));
-    const owner = matching.length === 1 ? matching[0] : byAttempt.length === 1 ? byAttempt[0] : undefined;
-    if (owner !== undefined) {
-      deliveriesOf.set(owner.index, [...(deliveriesOf.get(owner.index) ?? []), message]);
-      if (attemptId !== null) owner.attemptIds.add(attemptId);
-    } else if (matching.length > 1) {
-      unattributedDeliveries.push({ messageId: message.messageId, candidateRounds: matching.map((state) => state.index + 1) });
+    const known = attemptId === null ? undefined : roundOfAttempt.get(attemptId);
+    if (known !== undefined) {
+      const owner = states[known]!;
+      if (carriers.includes(owner)) deliver(owner, message);
+      else {
+        unattributedDeliveries.push({
+          messageId: message.messageId,
+          candidateRounds: [...new Set([...carriers, owner])].sort((a, b) => a.index - b.index).map((state) => state.index + 1),
+        });
+      }
+      continue;
+    }
+    const eligible = carriers.filter((state) => state.attemptId === null);
+    if (eligible.length === 1) {
+      deliver(eligible[0]!, message);
+      if (attemptId !== null) establish(eligible[0]!, attemptId);
+    } else {
+      unattributedDeliveries.push({ messageId: message.messageId, candidateRounds: carriers.map((state) => state.index + 1) });
     }
   }
 
@@ -682,7 +726,7 @@ export const summarizeReviewRounds = (
       interventions: state.interventions,
       outcome,
       reasonCode,
-      attemptId: state.attemptIds.size === 1 ? [...state.attemptIds][0]! : null,
+      attemptId: state.attemptId,
       attemptReclaimed: state.reclaimed,
       review,
       deliveries: (deliveriesOf.get(state.index) ?? []).map(toDelivery),
