@@ -247,26 +247,34 @@ const prompt = (key, area, revision) =>
   ].join("\n");
 
 /**
- * The model `codex exec` says it is running, from the configuration header it prints before the
- * session: `OpenAI Codex v…`, a `--------` line, `key: value` lines including `model: …`, and a
- * closing `--------`. Only that block is read, on stderr and then stdout, because a `model:` line
- * anywhere else could be the reviewer's own words. ANSI styling and a leading `[timestamp]` are
- * tolerated. No header, or a header with no model line, is `null`: the model is then unverified.
+ * The model `codex exec` says it is running, read only from its own configuration header, which
+ * it writes to stderr before anything else: `OpenAI Codex v…`, `--------`, `key: value` lines,
+ * `--------`. Only that first block is read — blank lines may precede it, nothing else may — and
+ * never anything after it, and never stdout, which carries the reviewer's own final message. A
+ * header that is absent, does not open the stream, is interrupted by a line that is not
+ * `key: value`, is never closed, or does not hold exactly one `model:` line names no model, and
+ * the area is then MODEL_UNVERIFIED. Measured: searching the whole output let a model-less
+ * genuine header be "completed" by a sample header the reviewer copied from the PRD to stdout,
+ * and an unclosed block take a later `model:` line from the session. ANSI styling and a leading
+ * `[timestamp]` on each line are tolerated.
  */
-const observedModelOf = (...streams) => {
-  for (const text of streams) {
-    const lines = text
-      .replace(/\u001b\[[0-9;]*m/g, "")
-      .split(/\r?\n/)
-      .map((line) => line.replace(/^\[[^\]]*\]\s*/, "").trim());
-    const start = lines.findIndex((line) => line.startsWith("OpenAI Codex v"));
-    if (start === -1 || lines[start + 1] !== "--------") continue;
-    for (let index = start + 2; index < lines.length && lines[index] !== "--------"; index += 1) {
-      const match = /^model:\s*(\S+)$/.exec(lines[index]);
-      if (match) return match[1];
-    }
+const HEADER_RULE = "--------";
+const observedModelOf = (stderr) => {
+  const lines = stderr
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\[[^\]]*\]\s*/, "").trimEnd());
+  let index = 0;
+  while (index < lines.length && lines[index].trim() === "") index += 1;
+  if (!(lines[index] ?? "").startsWith("OpenAI Codex v") || lines[index + 1] !== HEADER_RULE) return null;
+  const models = [];
+  for (index += 2; index < lines.length; index += 1) {
+    if (lines[index] === HEADER_RULE) return models.length === 1 ? models[0] : null;
+    const entry = /^([a-z][a-z ]*): (.*)$/.exec(lines[index]);
+    if (entry === null) return null; // session content before the header closed
+    if (entry[1] === "model") models.push(/^\S+$/.test(entry[2]) ? entry[2] : null);
   }
-  return null;
+  return null; // never closed
 };
 
 const reviewArea = async (key, area, ctx) => {
@@ -289,7 +297,7 @@ const reviewArea = async (key, area, ctx) => {
     prompt(key, area, ctx.revision),
   ]);
   // codex writes the report itself; it is read only if the child completed.
-  return { child, candidate: { kind: "file" }, artifacts: [schemaFile], observedModel: observedModelOf(child.stderr, child.stdout) };
+  return { child, candidate: { kind: "file" }, artifacts: [schemaFile], observedModel: observedModelOf(child.stderr) };
 };
 
 // Areas are independent — disjoint file sets, no shared state — so they run concurrently.

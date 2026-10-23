@@ -216,7 +216,11 @@ const reviewArea = async (key, area, ctx) => {
     const start = child.stdout.indexOf("{");
     if (start === -1) throw new Error("grok printed no JSON envelope");
     const envelope = JSON.parse(child.stdout.slice(start));
-    if (typeof envelope.model === "string" && envelope.model !== "") observedModel = envelope.model;
+    // The CLI's own top-level field only. The report (`structuredOutput`, `text`) is the reviewer's
+    // words, so a model named anywhere inside it is never evidence of the model that ran.
+    if (envelope !== null && typeof envelope === "object" && !Array.isArray(envelope) && typeof envelope.model === "string" && envelope.model !== "") {
+      observedModel = envelope.model;
+    }
     if (envelope.total_cost_usd) {
       writeFileSync(join(ctx.outDir, `${key}.cost`), String(envelope.total_cost_usd));
       artifacts.push(`${key}.cost`);

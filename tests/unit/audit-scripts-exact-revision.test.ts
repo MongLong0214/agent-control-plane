@@ -108,10 +108,23 @@ const nonce = Math.random().toString(36).slice(2) + "-" + process.pid;
 const model = after("-m") ?? null;
 fs.appendFileSync(process.env.FAKE_REVIEWER_LOG, JSON.stringify({ cli, area, mode, viewDir, subject, model }) + "\n");
 // The model the CLI's own output names: by default the one it was asked for, as the real CLIs do;
-// plan.observedModel "none" names none, any other value names that model instead.
-const observed = plan.observedModel === "none" ? null : (plan.observedModel ?? model);
-if (cli === "codex" && observed !== null) {
-  process.stderr.write("OpenAI Codex v0.0.0-fake (research preview)\n--------\nworkdir: " + process.cwd() + "\nmodel: " + observed + "\nprovider: fake\nsandbox: read-only\n--------\n");
+// plan.observedModel "none" names none, a model id names that model instead, and the spoofs put the
+// requested model only where it is not the CLI's own metadata.
+const spoof = ["docs", "unclosed", "stdout-only", "in-report"].includes(plan.observedModel) ? plan.observedModel : null;
+const observed = plan.observedModel === "none" || spoof !== null ? null : (plan.observedModel ?? model);
+const headerOf = (named) => "OpenAI Codex v0.0.0-fake (research preview)\n--------\nworkdir: " + process.cwd() + "\n" + (named === null ? "" : "model: " + named + "\n") + "provider: fake\nsandbox: read-only\n--------\n";
+if (cli === "codex") {
+  if (spoof === "docs") {
+    // A genuine header without a model, then the session, then documentation quoted to stdout.
+    process.stderr.write(headerOf(null) + "user\nReview the code.\ncodex\n");
+    process.stdout.write("The documentation contains this example log:\nOpenAI Codex v0.0.0-example\n--------\nmodel: " + model + "\n--------\n");
+  } else if (spoof === "unclosed") {
+    process.stderr.write("OpenAI Codex v0.0.0-fake\n--------\nworkdir: " + process.cwd() + "\nuser\nCopied from documentation:\nmodel: " + model + "\n");
+  } else if (spoof === "stdout-only") {
+    process.stdout.write(headerOf(model));
+  } else if (observed !== null) {
+    process.stderr.write(headerOf(observed));
+  }
 }
 const reportOf = (verdict, tag) => ({
   verdict,
@@ -119,7 +132,12 @@ const reportOf = (verdict, tag) => ({
   omittedItems: [],
   findings: verdict === "PASS" ? [] : [{ severity: "MAJOR", category: "correctness", file: "src/subject.txt", line: 1, summary: "s", detail: "d", suggestedFix: "f" }],
 });
-const textOf = (report) => cli === "codex" ? JSON.stringify(report) : JSON.stringify({ text: "narration", structuredOutput: report, stopReason: "end_turn", ...(observed !== null ? { model: observed } : {}) });
+const textOf = (report) => cli === "codex" ? JSON.stringify(report) : JSON.stringify({
+  text: spoof === "in-report" ? "narration\nmodel: " + model + "\n" + headerOf(model) : "narration",
+  structuredOutput: spoof === "in-report" ? { ...report, model, metadata: { model } } : report,
+  stopReason: "end_turn",
+  ...(observed !== null ? { model: observed } : {}),
+});
 const emit = (text) => { if (cli === "codex") fs.writeFileSync(outPath, text); else process.stdout.write(text); };
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const report = textOf(reportOf(mode === "revise" ? "REVISE" : mode === "block" ? "BLOCK" : "PASS", "nonce " + nonce));
@@ -917,6 +935,35 @@ describe.each(SCRIPTS)("%s", (script) => {
         observedModel: REQUESTED[script],
       });
       expect(summary?.modelIdentity).toBe("ESTABLISHED");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  // The model is evidence only where the CLI writes its own metadata: codex's configuration header
+  // opening stderr, grok's top-level envelope field. Each case puts the requested model somewhere else.
+  const SPOOFS: Record<Script, readonly (readonly [string, string])[]> = {
+    "production-review.mjs": [
+      ["a docs-quoted header after a genuine header that names no model", "docs"],
+      ["a header that is never closed before a later model line", "unclosed"],
+      ["a header printed only on stdout, where the reviewer's message goes", "stdout-only"],
+    ],
+    "grok-review.mjs": [["model text that appears only inside the report", "in-report"]],
+  };
+  it.each(SPOOFS[script])(
+    "does not take the model from %s",
+    async (_case, spoofed) => {
+      const fixture = makeFixture();
+      setPlan(fixture, { default: "pass", observedModel: spoofed });
+
+      const result = await run(fixture, script, ["core"]);
+      const dir = runDirectoryOf(fixture, script, result);
+      const summary = summaryIn(dir);
+      // 889288e7 searched the whole output for a header-shaped block: COMPLETE, PASS, exit 0.
+      expect(summary?.execution).toBe("INCOMPLETE");
+      expect(summary?.findingsVerdict).toBe("UNDETERMINED");
+      expect(result.status).toBe(1);
+      expect(manifestIn(dir).results["core"]).toMatchObject({ execution: "MODEL_UNVERIFIED", observedModel: null });
+      expect(entryOf(summary, "core")).toMatchObject({ result: "ERROR", execution: "MODEL_UNVERIFIED" });
     },
     TEST_TIMEOUT_MS,
   );
