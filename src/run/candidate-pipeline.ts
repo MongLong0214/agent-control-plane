@@ -66,7 +66,7 @@ const boundedScalar = (value: unknown, shape: RegExp = BOUNDED_IDENTIFIER): stri
   return typeof value === "string" && shape.test(value) ? value : undefined;
 };
 
-const unavailableReviewEvidence = (candidateSnapshotDigest: string, denial: Evidence | undefined): Evidence => {
+const unavailableReviewEvidence = (candidateSnapshotDigest: string, denial: Evidence | undefined, attemptId: string): Evidence => {
   const source: Record<string, unknown> = denial ?? {};
   const evidence: Record<string, unknown> = {};
   for (const field of UNAVAILABLE_REVIEW_FIELDS) {
@@ -88,6 +88,8 @@ const unavailableReviewEvidence = (candidateSnapshotDigest: string, denial: Evid
     });
   }
   evidence["candidateSnapshotDigest"] = candidateSnapshotDigest;
+  // #1189 — the submission attempt that wrote this row, so a reader can tell it from another attempt's.
+  evidence["attemptId"] = attemptId;
   return evidence as Evidence;
 };
 
@@ -235,8 +237,11 @@ export class CandidatePipeline {
     if (ports.continuity) this.#continuity = ports.continuity;
   }
 
-  /** Freeze the candidate across every repository participating in the run (§16.2). */
-  async freeze(runId: string): Promise<Decision<CandidateSnapshot>> {
+  /**
+   * Freeze the candidate across every repository participating in the run (§16.2). A submission
+   * passes its attempt id, which the CANDIDATE_FROZEN row then names (#1189).
+   */
+  async freeze(runId: string, attemptId?: string): Promise<Decision<CandidateSnapshot>> {
     const run = this.runs.get(runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
 
@@ -332,6 +337,7 @@ export class CandidatePipeline {
           sourceHead: r.sourceHead ?? null,
           files: r.touchedPaths.length,
         })),
+        ...(attemptId === undefined ? {} : { attemptId }),
       },
     });
     return allow(ReasonCode.OK, snapshot);
@@ -377,7 +383,7 @@ export class CandidatePipeline {
     const completeness = this.reviewEntry(run);
     if (!completeness.allowed) return completeness as Decision<PipelineOutcome>;
 
-    const frozen = await this.freeze(input.runId);
+    const frozen = await this.freeze(input.runId, attemptId);
     if (!frozen.allowed) return frozen as Decision<PipelineOutcome>;
     const snapshot = frozen.value;
     const snapshotDigest = candidateSnapshotDigest(snapshot);
@@ -687,7 +693,7 @@ export class CandidatePipeline {
         kind: "BLIND_REVIEW_UNAVAILABLE",
         runId,
         reasonCode: reviewed.reasonCode,
-        evidence: unavailableReviewEvidence(snapshotDigest, reviewed.evidence),
+        evidence: unavailableReviewEvidence(snapshotDigest, reviewed.evidence, attemptId),
       });
       return allow(ReasonCode.OK, {
         stage: "REVIEW_UNAVAILABLE",

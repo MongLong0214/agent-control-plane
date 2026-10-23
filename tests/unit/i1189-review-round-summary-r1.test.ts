@@ -158,12 +158,19 @@ describe("#1189 round-1 repairs, beyond the witnesses", () => {
     expect(result.rounds.every((round) => !(round.readyForCeo && round.outcome === "REVIEW_UNAVAILABLE"))).toBe(true);
   });
 
-  it("R1-01: a record two open attempts could have written is listed as ambiguous and placed on neither", async () => {
+  it("R1-01: in history without attempt stamps, a record two open attempts could have written is listed as ambiguous and placed on neither", async () => {
     const { h, runId } = await overlap();
     const sources = readReviewRoundSources(h.cp, runId);
-    // Without attempt 2's completion and its move to CEO review, nothing tells which attempt was unavailable.
+    // History written before the pipeline stamped its attempt, and without attempt 2's completion and
+    // its move to CEO review: nothing tells which attempt was unavailable.
     const withheld = new Set(["BLIND_REVIEW_COMPLETED", "RUN_TRANSITION"]);
-    const result = summarizeReviewRounds({ ...sources, audit: sources.audit.filter((row) => !withheld.has(row.kind)) });
+    const history = sources.audit
+      .filter((row) => !withheld.has(row.kind))
+      .map((row) => {
+        const { attemptId: _stamp, ...evidence } = row.evidence;
+        return row.kind === "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED" ? row : { ...row, evidence };
+      });
+    const result = summarizeReviewRounds({ ...sources, audit: history });
     const unavailable = sources.audit.find((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE")!;
     expect(result.unattributedEvents).toEqual([{ eventId: unavailable.eventId, kind: "BLIND_REVIEW_UNAVAILABLE", candidateRounds: [1, 2] }]);
     expect(result.rounds.map((round) => [round.outcome, round.readyForCeo])).toEqual([

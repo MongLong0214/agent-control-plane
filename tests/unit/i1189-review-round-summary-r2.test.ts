@@ -83,7 +83,7 @@ describe("#1189 round-2 review witnesses", () => {
     expect(during.rounds[1]!.outcome, JSON.stringify(during)).toBe("NO_OUTCOME_RECORDED");
   });
 
-  it("R2-W2 detail: the replay is listed while the retry runs, and a repeat of round 1 once it fails on its own", async () => {
+  it("R2-W2 detail: the replay names round 1's attempt, so it is a repeat of round 1 at once, and the retry keeps its own failure", async () => {
     const { h, runId, submit } = await setup();
     h.scripted.setRuntimeHealth("UNAVAILABLE");
     expect(await submit()).toMatchObject({ allowed: true, value: { stage: "REVIEW_UNAVAILABLE" } });
@@ -101,12 +101,14 @@ describe("#1189 round-2 review witnesses", () => {
     h.scripted.script({ match: /Bootstrap plan review/, text: "not a JSON verdict" });
     const second = submit();
     await hasEntered;
-    const replayed = h.cp.audit.record({ ...unavailable, reasonCode: unavailable.reasonCode as never });
+    expect(unavailable.evidence["attemptId"]).toEqual(expect.stringMatching(/^attempt_/));
+    expect(h.cp.audit.record({ ...unavailable, reasonCode: unavailable.reasonCode as never }).allowed).toBe(true);
     const during = summarizeReviewRounds(readReviewRoundSources(h.cp, runId));
     release();
     await second;
     const after = summarizeReviewRounds(readReviewRoundSources(h.cp, runId));
-    expect(during.unattributedEvents).toEqual([{ eventId: replayed.allowed ? replayed.value : -1, kind: "BLIND_REVIEW_UNAVAILABLE", candidateRounds: [1, 2] }]);
+    expect(during.unattributedEvents).toEqual([]);
+    expect(during.rounds.map((round) => [round.outcome, round.duplicateEventsIgnored])).toEqual([["REVIEW_UNAVAILABLE", 1], ["NO_OUTCOME_RECORDED", 0]]);
     expect(after.unattributedEvents).toEqual([]);
     expect(after.rounds.map((round) => [round.outcome, round.reasonCode, round.duplicateEventsIgnored])).toEqual([
       ["REVIEW_UNAVAILABLE", unavailable.reasonCode, 1],
@@ -221,10 +223,11 @@ describe("#1189 round-2 siblings: identity-free records replayed while a retry r
     expect(retry!.deliveries[0]!.messageId).not.toBe(first!.deliveries[0]!.messageId);
     expect(retry!.attemptId).not.toBe(first!.attemptId);
     expect(after.totals).toMatchObject({ verificationReturns: 2 });
-    // While the retry ran, the replay could have been either attempt's: listed, placed on neither.
+    // While the retry runs, the copy could still be the retry's own return: listed, placed on neither.
     const replayed = during.unattributedEvents.find((event) => event.kind === "REVISION_RETURNED_TO_CTO");
     expect(replayed?.candidateRounds).toEqual([1, 2]);
-    // Once the retry holds its own return, the replay can only repeat round 1's.
+    expect(during.rounds.map((round) => round.duplicateEventsIgnored)).toEqual([0, 0]);
+    // Once the retry's own attempt has delivered a different return, the copy can only repeat round 1's.
     expect(after.unattributedEvents).toEqual([]);
     expect(after.rounds.map((round) => round.duplicateEventsIgnored)).toEqual([1, 0]);
   });
@@ -306,18 +309,19 @@ describe("#1189 round-2 siblings: what a round holds first stays", () => {
     expect(after.unattributedEvents).toEqual([{ eventId: conflicting.allowed ? conflicting.value : -1, kind: "BLIND_REVIEW_COMPLETED", candidateRounds: [1] }]);
   });
 
-  it("R2-S4: a retry that fails with a record identical to the earlier attempt's is listed, not guessed", async () => {
+  it("R2-S4: a retry whose failure is identical but for its attempt lands on its own round", async () => {
     const { h, runId, submit } = await setup();
     h.scripted.setRuntimeHealth("UNAVAILABLE");
     expect(await submit()).toMatchObject({ allowed: true, value: { stage: "REVIEW_UNAVAILABLE" } });
     expect(await submit()).toMatchObject({ allowed: true, value: { stage: "REVIEW_UNAVAILABLE" } });
     const rows = h.cp.audit.forRun(runId).filter((row) => row.kind === "BLIND_REVIEW_UNAVAILABLE");
     expect(rows).toHaveLength(2);
+    expect(rows[0]!.evidence["attemptId"]).not.toBe(rows[1]!.evidence["attemptId"]);
     const result = summarizeReviewRounds(readReviewRoundSources(h.cp, runId));
-    expect(result.rounds.map((round) => [round.entry, round.outcome])).toEqual([
-      ["FIRST_SUBMISSION", "REVIEW_UNAVAILABLE"],
-      ["INFRASTRUCTURE_RETRY", "NO_OUTCOME_RECORDED"],
+    expect(result.rounds.map((round) => [round.entry, round.outcome, round.attemptId])).toEqual([
+      ["FIRST_SUBMISSION", "REVIEW_UNAVAILABLE", rows[0]!.evidence["attemptId"]],
+      ["INFRASTRUCTURE_RETRY", "REVIEW_UNAVAILABLE", rows[1]!.evidence["attemptId"]],
     ]);
-    expect(result.unattributedEvents).toEqual([{ eventId: rows[1]!.eventId, kind: "BLIND_REVIEW_UNAVAILABLE", candidateRounds: [1, 2] }]);
+    expect(result.unattributedEvents).toEqual([]);
   });
 });
