@@ -1308,7 +1308,9 @@ const queuedForRole = async (
   port: BuzzMessageTurnPort,
   admission: Extract<BuzzMessageAdmission, { kind: "ROLE" }>,
 ): Promise<Decision<BuzzMessageAnswer>> => {
-  const woken = await port.wakeRole(admission.roleKey);
+  // Events have one durable admission per recipient. A replay has already passed
+  // the authority checks above, but cannot emit another wake, including while the first awaits IO.
+  const woken = admission.duplicate ? null : await port.wakeRole(admission.roleKey);
   return allow(
     // Not `OK`. `OK` on this surface has always meant "the addressed peer answered", and nobody
     // has answered — the envelope was taken as durable data, which is precisely what `admit`
@@ -1316,12 +1318,14 @@ const queuedForRole = async (
     // message as a delivered one.
     admission.duplicate ? ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED : ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
     {
-      answer: ownerMessageQueuedSentence(woken.allowed ? null : woken.reasonCode),
+      answer: woken === null ? "This event is already stored for the role. No additional wake was sent."
+        : ownerMessageQueuedSentence(woken.allowed ? null : woken.reasonCode),
       answeredByCeo: false,
       turnRequestId: admission.messageId,
       conversation: admission.admitted.conversation,
     },
-    { queued: true, messageId: admission.messageId, wake: woken.reasonCode },
+    { queued: true, messageId: admission.messageId,
+      ...(woken === null ? { duplicate: true, wakeSent: false } : { wake: woken.reasonCode }) },
   );
 };
 

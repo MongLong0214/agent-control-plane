@@ -2265,20 +2265,27 @@ export const createDaemonBuzzMentionSink = (
   }
   const messageSink: BuzzMentionSink = {
     admit: async (request) => {
-      // A verified event carrying the binding marker in any form goes to the binding, and never to
-      // admission, so it is not delivered as a message to anyone (ACP1055-01). Decided by the
-      // content, not by whether a store is wired: without one, such an event is refused outright.
+      // Binding and mention admission are independent effects of the same signed event. Settle
+      // first so a successful CEO bind is visible to the ordinary peer rule below. A refused
+      // challenge grants nothing and cannot veto an otherwise authorized mention.
       if (buzzBindContentOf(request.event.content).kind !== "NONE") {
-        return buzzMentionVerdictOf(
-          options.bindChallenges?.settle(request.event) ??
-            deny(ReasonCode.INVALID_ARGUMENT, "this daemon serves no Buzz binding challenge"),
-        );
+        // An event without a mention retains its binding-only outcome.
+        if (!request.event.tags.some((tag) => tag[0] === "p")) {
+          return buzzMentionVerdictOf(options.bindChallenges?.settle(request.event) ??
+            deny(ReasonCode.INVALID_ARGUMENT, "this daemon serves no Buzz binding challenge"));
+        }
+        try {
+          options.bindChallenges?.settle(request.event);
+        } catch {
+          // The binding writer rolls back and its nonce remains spent. Admission still judges
+          // the signed author against the resulting state; a binding failure grants no authority.
+        }
       }
       // The subscriber judged this delivery against the binding it names, immediately before
       // calling here. Read once more before the seam's first write: a re-claim or a session change
       // committed in between makes this a retry, never a delivery on the strength of a binding that
       // has moved. The retry asks the relay again and is judged against the binding that holds then.
-      if (request.binding !== undefined && buzzMentionBindingMoved(cp, request.roleKey, request.binding)) {
+      if (request.binding !== undefined && buzzMentionBindingMoved(cp, request.roleKey, request.binding, request)) {
         return "RETRY";
       }
       // The seam's own port, with its wake replaced for this one delivery: the wake this admission
@@ -2408,11 +2415,17 @@ export const buzzMentionBindingMoved = (
   cp: ControlPlane,
   roleKey: string,
   binding: BuzzMentionDeliveryBinding,
+  delivery?: Pick<BuzzMentionAdmissionRequest, "identityPubkey" | "conversation">,
 ): boolean => {
   const current = cp.bindings.active(roleKey);
   if (!current) return true;
   if (binding.bindingGeneration !== null && current.bindingGeneration !== binding.bindingGeneration) return true;
-  return binding.sessionId !== null && current.sessionId !== binding.sessionId;
+  if (binding.sessionId !== null && current.sessionId !== binding.sessionId) return true;
+  if (delivery !== undefined) {
+    const session = cp.sessions.get(current.sessionId);
+    if (session?.buzzActorId !== delivery.identityPubkey || session.buzzAddress !== delivery.conversation) return true;
+  }
+  return false;
 };
 
 /**

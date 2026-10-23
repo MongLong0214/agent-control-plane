@@ -1036,19 +1036,32 @@ export class Outbox {
         ORDER BY o.created_at, o.rowid`,
     );
     for (const row of rows) {
-      this.audit.record({
-        kind: "CEO_NOTIFICATION_ROUTE_UNAVAILABLE",
-        reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
-        roleKey: row.role_key,
-        sessionId: row.target_session_id,
-        runId: row.run_id,
-        evidence: {
-          messageId: row.message_id,
-          targetSessionId: row.target_session_id,
-          reason: row.hermes === 1 ? "CANONICAL_TRANSPORT_NOT_ATTACHED" : "NO_BUZZ_ROUTE",
-        },
-      });
+      this.#recordWithheldCeoNotification({
+        messageId: row.message_id, targetSessionId: row.target_session_id, roleKey: row.role_key, runId: row.run_id,
+      }, row.hermes === 1 ? "CANONICAL_TRANSPORT_NOT_ATTACHED" : "NO_BUZZ_ROUTE");
     }
+  }
+
+  /** Route discovery can also withhold an attached canonical transport before it sends. */
+  #recordWithheldCeoNotification(
+    message: Pick<OutboxMessage, "messageId" | "targetSessionId" | "roleKey" | "runId">,
+    reason: string,
+  ): void {
+    if (this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'CEO_NOTIFICATION_ROUTE_UNAVAILABLE'
+      AND json_extract(evidence_json, '$.messageId') = ?
+      AND json_extract(evidence_json, '$.targetSessionId') = ?`, [message.messageId, message.targetSessionId])) return;
+    this.audit.record({
+      kind: "CEO_NOTIFICATION_ROUTE_UNAVAILABLE",
+      reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+      roleKey: message.roleKey,
+      sessionId: message.targetSessionId,
+      runId: message.runId,
+      evidence: {
+        messageId: message.messageId,
+        targetSessionId: message.targetSessionId,
+        reason,
+      },
+    });
   }
 
   deliverCeoNotifications(): Promise<void> {
@@ -1077,7 +1090,18 @@ export class Outbox {
           ORDER BY o.created_at, o.rowid`);
         for (const row of rows) {
           let accepted = false;
-          try { accepted = (await send(hydrate(row))).allowed; } catch { /* retained below */ }
+          let unavailable = false;
+          try {
+            const result = await send(hydrate(row));
+            unavailable = !result.allowed && result.reasonCode === ReasonCode.CEO_CONVERSATION_UNAVAILABLE;
+            accepted = result.allowed;
+          } catch { /* retained below */ }
+          if (unavailable) {
+            // No target was found, so no transport attempt took place. Retain PENDING and
+            // record withholding once per message/target, just like the unattached route.
+            this.#recordWithheldCeoNotification(hydrate(row), "CANONICAL_TARGET_UNAVAILABLE");
+            continue;
+          }
           this.db.run(`UPDATE outbox SET status = ?, attempts = attempts + 1, acked_at = ?
             WHERE message_id = ? AND status = 'PENDING' AND binding_generation = ? AND target_session_id = ?
               AND ${liveDeliveryTarget("outbox")}`,
@@ -3371,10 +3395,16 @@ export class Outbox {
       "SELECT message_id, status, failure_class FROM outbox ORDER BY created_at, message_id",
     ).map((row) => ({ messageId: row.message_id,
       ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }) }));
+    // Retention and withholding must remain visible even when no transport attempt took place.
+    const pendingCeoNotifications = this.db.all<RawOutbox>(
+      "SELECT * FROM outbox WHERE kind = 'CEO_NOTIFICATION' AND status = 'PENDING' ORDER BY created_at, message_id",
+    ).map((row) => ({ messageId: row.message_id, targetSessionId: row.target_session_id,
+      ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class ?? null }) }));
     return {
       delivered: rows.filter((row) => row.delivered).length,
       completed: rows.filter((row) => row.completed).length,
       unconfirmed: rows.filter((row) => row.automaticResendHeld),
+      pendingCeoNotifications,
     };
   }
 
