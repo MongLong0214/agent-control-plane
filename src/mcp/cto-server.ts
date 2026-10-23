@@ -315,7 +315,7 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     activePrimaryCto: (projectId: string) => source.bindings.activePrimaryCto(projectId),
     prepareSwitchover: (...args: Parameters<CtoLifecycle["prepareSwitchover"]>) => source.cto.prepareSwitchover(...args),
     handoffKind: (handoffId: string) => source.db.get<{ kind: string }>(`SELECT kind FROM handoffs WHERE handoff_id = ?`, [handoffId])?.kind ?? null,
-    acknowledgeBootstrap: (handoffId: string, sessionId: string) => source.bootstrap.acknowledgeActivationHandoff(handoffId, sessionId),
+    acknowledgeBootstrap: (handoffId: string, sessionId: string, sessionIncarnation: string) => source.bootstrap.acknowledgeActivationHandoff(handoffId, sessionId, sessionIncarnation),
     acknowledgeCto: (handoffId: string, acknowledgement: HandoffAcknowledgement) =>
       source.cto.acknowledgeHandoff(handoffId, acknowledgement),
     // A read an operator asked for is a capacity *report*, not evidence that a worker
@@ -418,7 +418,7 @@ const createCtoServerFromPort = (
     "role_dispatch_pending",
     {
       description:
-        "The pending control-plane messages (dispatch, revision, escalation reply, drain, cancel) addressed in band to this exact session at its active generation. Acknowledge each with role_dispatch_ack (or run_ack, for a row that names a run this session owns).",
+        "The pending control-plane messages (dispatch, revision, escalation reply, drain, cancel, bootstrap handoff) addressed in band to this exact session at its active generation. Acknowledge a HANDOFF_PACKAGE with handoff_ack; other messages use role_dispatch_ack (or run_ack, for a row that names a run this session owns).",
       inputSchema: {},
     },
     async () => read("role_dispatch_pending", (peer) => {
@@ -729,7 +729,7 @@ const createCtoServerFromPort = (
       }
       const kind = port.handoffKind(args.handoffId);
       if (!kind) return respond(deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId: args.handoffId }));
-      if (kind === "BOOTSTRAP") return respond(port.acknowledgeBootstrap(args.handoffId, peer.sessionId));
+      if (kind === "BOOTSTRAP") return respond(port.acknowledgeBootstrap(args.handoffId, peer.sessionId, peer.sessionIncarnation));
       const sessionSecret = (peer as SessionSecretPeer).sessionSecret;
       if (!sessionSecret) {
         return respond(deny(

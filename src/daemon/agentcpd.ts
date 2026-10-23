@@ -1874,6 +1874,26 @@ const judgeBuzzMentionIdentity = (
       WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
     [channelIdentity],
   );
+  // effective() lists positive entitlements only. Read negative authority before that projection:
+  // neither an env override nor a new channel key for the same canonical conversation revives it.
+  const configured = canonical?.sessions.find((entry) => entry.buzzActorId === channelIdentity);
+  const revoked = cp.db.get(
+    `SELECT 1 FROM canonical_session_entitlements e
+      WHERE (e.revoked_at IS NOT NULL
+        OR EXISTS (SELECT 1 FROM project_retirements r WHERE r.project_id = e.project_id)
+        OR EXISTS (SELECT 1 FROM projects p WHERE p.project_id = e.project_id AND p.retired_at IS NOT NULL))
+        AND (e.buzz_actor_id = ? OR e.session_uuid = ? OR e.project_id = ?
+          OR EXISTS (SELECT 1 FROM conversational_actors c
+            JOIN actor_target_bindings tb ON tb.target_actor_id = c.actor_id
+            WHERE c.current_session_id = ? AND tb.executor_kind = ? AND tb.target_locator = e.session_uuid))`,
+    [channelIdentity, configured?.sessionUuid ?? null, configured?.projectId ?? null,
+      session?.session_id ?? null, SELF_CLAIM_EXECUTOR_KIND],
+  ) || (configured && cp.db.get(
+    `SELECT 1 FROM project_retirements WHERE project_id = ?
+      UNION SELECT 1 FROM projects WHERE project_id = ? AND retired_at IS NOT NULL`,
+    [configured.projectId, configured.projectId],
+  ));
+  if (revoked) return refuse("CANONICAL_ENTITLEMENT_REVOKED", "the canonical entitlement is revoked or its project is retiring");
   if (!session || session.buzz_actor_id === null) {
     return refuse("NO_LIVE_SESSION", "no READY or DRAINING session carries this channel identity", {
       sessionsWithThisActor: cp.db.all<{ n: number }>(
@@ -1896,7 +1916,8 @@ const judgeBuzzMentionIdentity = (
   if (only.role !== Role.PRIMARY_CTO) {
     return refuse("NOT_PRIMARY_CTO", "the one role that session holds is not PRIMARY_CTO", { role: only.role });
   }
-  const entry = canonical?.sessions.find((one) => one.buzzActorId === channelIdentity);
+  const entry = new CanonicalSessionRegistry(cp.db).effective(canonical?.sessions ?? [])
+    .find((one) => one.buzzActorId === channelIdentity);
   if (entry && entry.projectId !== only.projectId) {
     return refuse("PROJECT_MISMATCH", "the binding's project is not the one its canonical entry names");
   }
@@ -1985,14 +2006,14 @@ export const buzzMentionSubscriberRegistry = (
   // read from the request, and the numbers are counts — a pubkey is public but this stays a
   // diagnostic about the deployment's own shape rather than an echo of its input.
   primaryCtoBindingFor: (pubkey) => {
-    const judged = judgeBuzzMentionIdentity(cp, {sessions:new CanonicalSessionRegistry(cp.db).effective(canonical?.sessions ?? [])}, pubkey);
+    const judged = judgeBuzzMentionIdentity(cp, canonical ?? null, pubkey);
     if (judged.judgement.verdict === "ADMITTED") return judged.judgement.binding;
-    process.stderr.write(`Buzz mention binding lookup refused: ${judged.said} ${JSON.stringify(judged.detail)}\n`);
+    process.stderr.write(`Buzz mention binding lookup refused (${judged.judgement.reason}): ${judged.said} ${JSON.stringify(judged.detail)}\n`);
     return null;
   },
   // The same judgement with its reason code and without the line above: the subscriber asks it at
   // startup, on every re-judgement and before every delivery, and writes the reason into health.
-  judgeIdentity: (pubkey) => judgeBuzzMentionIdentity(cp, {sessions:new CanonicalSessionRegistry(cp.db).effective(canonical?.sessions ?? [])}, pubkey).judgement,
+  judgeIdentity: (pubkey) => judgeBuzzMentionIdentity(cp, canonical ?? null, pubkey).judgement,
   // #1044. Read when a frame arrives, before it queues: the CEO binding and this role's binding as
   // they stand at that moment. The seam compares it with the registry when the frame is processed.
   peerReceiptFor: (roleKey) => {

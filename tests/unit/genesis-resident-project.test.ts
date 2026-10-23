@@ -1,3 +1,4 @@
+import { callCtoTool } from '../helpers/cto-tool.ts';
 import { GenesisGitHub, genesisBundle, genesisFile, genesisPlanFixture } from '../helpers/genesis-github.ts';
 import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
 import { readProcessStartToken } from '../../src/core/process-argv.ts';
@@ -262,7 +263,23 @@ it('completes a reviewed genesis bootstrap on its resident claim and same-sessio
   const pending = h.cp.db.get<{handoff_id:string;to_session_id:string}>(`SELECT handoff_id,to_session_id FROM handoffs WHERE project_id = ? AND status = 'PENDING'`,[f.manifest.projectId]);
   expect(pending,JSON.stringify(first)).toBeTruthy();if (!pending) throw new Error('handoff missing');
   expect(h.cp.bootstrap.acknowledgeActivationHandoff(pending.handoff_id,'wrong-session').allowed).toBe(false);
-  expect(h.cp.bootstrap.acknowledgeActivationHandoff(pending.handoff_id,pending.to_session_id).allowed).toBe(true);
+  const recipient = h.cp.sessions.require(pending.to_session_id);
+  const peer = {sessionId:recipient.sessionId,incarnation:recipient.incarnation};
+  const message = h.cp.outbox.byIdempotencyKey(`bootstrap-handoff:${pending.handoff_id}`)!;
+  const listed = await callCtoTool(h,peer,'role_dispatch_pending');
+  expect(listed).toMatchObject({ok:true,value:{messages:expect.arrayContaining([
+    expect.objectContaining({messageId:message.messageId,kind:'HANDOFF_PACKAGE',payload:expect.objectContaining({handoffId:pending.handoff_id})}),
+  ])}});
+  const received = (listed.value as {messages:Array<{messageId:string;payloadDigest:string;bindingGeneration:number;payload:{handoffId:string}}>}).messages
+    .find(row => row.messageId === message.messageId)!;
+  expect(h.cp.bootstrap.acknowledgeActivationHandoff(pending.handoff_id,pending.to_session_id,'stale').allowed).toBe(false);
+  const acked = await callCtoTool(h,peer,'handoff_ack',{
+    idempotencyKey:'resident-bootstrap-ack',handoffId:received.payload.handoffId,messageId:received.messageId,
+    payloadDigest:received.payloadDigest,bindingGeneration:received.bindingGeneration,
+  });
+  expect(acked,JSON.stringify(acked)).toMatchObject({ok:true});
+  expect(h.cp.outbox.get(message.messageId)?.status).toBe('ACKED');
+  expect(h.cp.db.all('SELECT * FROM outbox_sent_destinations WHERE message_id = ?',[message.messageId])).toEqual([]);
   const daemon = new Daemon(h.cp,{stateDir:join(root,'daemon')});h.cp.bootstrapProducer.attachWriterLock(() => true);
   await daemon.resumeResidentProjects();
   expect(h.cp.runs.get(run.value.runId)?.state).toBe('COMPLETED');

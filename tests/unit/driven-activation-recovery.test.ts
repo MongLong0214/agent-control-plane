@@ -82,7 +82,9 @@ const world = async (projectId: string) => {
         });
         acks.push({ sessionId: credential.sessionId, handoffId: message.payload.handoffId!, ok: acked["ok"] });
       }
-      await callMcpToolOverSocket(ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId });
+      if (message.kind !== MessageKind.HANDOFF_PACKAGE) {
+        await callMcpToolOverSocket(ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId });
+      }
     }
   };
 
@@ -273,8 +275,9 @@ describe("#246 C4, live run_7717: the activation retry recovers an undeliverable
       await w.prepared.harness.buzzAdapter.deliverPending();
       expect(w.message(reissued)).toMatchObject({ status: "PENDING", attempts: 0 });
 
-      // An ACK of the old package is never the one required: nothing completes on it.
-      expect(cp.bootstrap.acknowledgeActivationHandoff(stale, holder.sessionId)).toMatchObject({ allowed: true });
+      // The previous holder cannot ACK its old package, and nothing completes on it.
+      expect(cp.bootstrap.acknowledgeActivationHandoff(stale, holder.sessionId)).toMatchObject({ allowed: false, reasonCode: ReasonCode.HANDOFF_ACK_REQUIRED });
+      expect(w.handoff(stale)?.status).toBe("PENDING");
       const refused = await w.confirm();
       expect(refused, JSON.stringify(refused)).toMatchObject({
         allowed: false,

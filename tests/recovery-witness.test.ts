@@ -82,7 +82,9 @@ const world = async (projectId: string) => {
         });
         acks.push({ sessionId: credential.sessionId, handoffId: message.payload.handoffId!, ok: acked["ok"] });
       }
-      await callMcpToolOverSocket(ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId });
+      if (message.kind !== MessageKind.HANDOFF_PACKAGE) {
+        await callMcpToolOverSocket(ctoSocket, as, "role_dispatch_ack", { messageId: message.messageId });
+      }
     }
   };
 
@@ -245,7 +247,7 @@ it("replacement fences the retired session before an awaited provider stop permi
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../src/registry/canonical-self-claim.ts";
 import { digestOf, sha256 } from "../src/core/digest.ts";
 
-it("an adopted canonical CTO with the rejected-package shape is preserved", async () => {
+it.each(["PENDING", "REJECTED"] as const)("an adopted canonical CTO with a %s package is preserved", async (status) => {
   await withWorld("review-canonical", async (w) => {
     const { cp } = w;
     vi.spyOn(cp.cto, "ensureDrivenPrimaryCto").mockImplementationOnce(async (projectId) => {
@@ -261,8 +263,14 @@ it("an adopted canonical CTO with the rejected-package shape is preserved", asyn
     expect(first).toMatchObject({ allowed: false, reasonCode: ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE });
     const handoffId = first.evidence["pendingHandoffId"] as string;
     const holder = w.primary();
+    if (status === "REJECTED") {
+      // A legacy authority refusal remains refused. Construct that historical row explicitly:
+      // canonical bootstrap packages now stay in band and cannot acquire it through the sweep.
+      cp.db.run(`UPDATE outbox SET status = 'REJECTED', failure_class = 'contract', retry_eligible = 0,
+        attempts = 1 WHERE idempotency_key = ?`, [`bootstrap-handoff:${handoffId}`]);
+    }
     await w.prepared.harness.buzzAdapter.deliverPending();
-    expect(w.message(handoffId)).toMatchObject({ status: "REJECTED", failure_class: "contract" });
+    expect(w.message(handoffId)).toMatchObject({ status, failure_class: status === "REJECTED" ? "contract" : null });
     const retry = await w.activate();
     expect(retry).toMatchObject({ allowed: false, evidence: { pendingHandoffId: handoffId } });
     expect(w.primary().assignmentId).toBe(holder.assignmentId);

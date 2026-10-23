@@ -310,7 +310,7 @@ it("CEO fc5e4bdf (2): every writer of a role's room, runtime and binding leaves 
   const sources = readdirSync(new URL("../../src/", import.meta.url), { recursive: true, encoding: "utf8" })
     .filter((file) => file.endsWith(".ts") && file !== "db/migrations.ts")
     .map((file) => [file, readFileSync(new URL(`../../src/${file}`, import.meta.url), "utf8")] as const);
-  const statements = (text: string, pattern: RegExp) => [...text.matchAll(/`([^`]*)`/g)].map((m) => m[1]!).filter((sql) => pattern.test(sql));
+  const statements = (text: string, pattern: RegExp) => [...text.matchAll(/`([^`]*)`|'((?:\\.|[^'\\\r\n])*)'|"((?:\\.|[^"\\\r\n])*)"/g)].map((m) => m[1] ?? m[2] ?? m[3]!).filter((sql) => pattern.test(sql));
   // sessions: only SessionRegistry writes, and every statement stamps updated_at.
   for (const [file, text] of sources) {
     const writes = statements(text, /\b(UPDATE\s+sessions\s+SET|INSERT\s+(?:OR\s+\w+\s+)?INTO\s+sessions\s*\()/);

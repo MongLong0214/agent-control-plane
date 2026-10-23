@@ -978,9 +978,13 @@ export class BootstrapActivation {
   }
 
   /** The ack, as recorded by the incoming session itself. */
-  acknowledgeActivationHandoff(handoffId: string, ackBySessionId: string): Decision<void> {
-    const row = this.db.get<{ to_session_id: string; status: string; kind: string; package_json: string }>(
-      `SELECT to_session_id, status, kind, package_json FROM handoffs WHERE handoff_id = ?`,
+  acknowledgeActivationHandoff(handoffId: string, ackBySessionId: string, sessionIncarnation?: string): Decision<void> {
+    return this.db.txDecision(() => this.acknowledgeActivationHandoffInTx(handoffId, ackBySessionId, sessionIncarnation));
+  }
+
+  private acknowledgeActivationHandoffInTx(handoffId: string, ackBySessionId: string, sessionIncarnation?: string): Decision<void> {
+    const row = this.db.get<{ project_id: string; to_session_id: string; status: string; kind: string; package_json: string }>(
+      `SELECT project_id, to_session_id, status, kind, package_json FROM handoffs WHERE handoff_id = ?`,
       [handoffId],
     );
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId });
@@ -994,9 +998,25 @@ export class BootstrapActivation {
         got: ackBySessionId,
       });
     }
+    const holder = this.bindings.activePrimaryCto(row.project_id);
+    if (holder?.sessionId !== ackBySessionId ||
+      (sessionIncarnation !== undefined && holder.sessionIncarnation !== sessionIncarnation)) {
+      return deny(ReasonCode.HANDOFF_ACK_REQUIRED, "ack must come from the current PRIMARY_CTO holder", { handoffId });
+    }
     const observed = this.observedHandoffFacts(handoffId, JSON.parse(row.package_json) as Partial<HandoffPackage>);
     if (!observed.allowed) return observed;
     if (row.status === "ACKED") return allow(ReasonCode.OK, undefined);
+    // Bootstrap's recipient already holds the role. Settle exactly the row its connection can
+    // read, using the outbox's shared holder/incarnation authority, in this handoff transaction.
+    // Legacy Buzz delivery retains its existing ACK path.
+    const incarnation = sessionIncarnation ?? holder.sessionIncarnation;
+    const message = this.outbox.byIdempotencyKey(`bootstrap-handoff:${handoffId}`);
+    if (incarnation && message && this.outbox.pendingInBandFor(ackBySessionId, incarnation)
+      .some((pending) => pending.messageId === message.messageId)) {
+      const acked = this.outbox.acknowledgeHandoffInBand(message.messageId, ackBySessionId, incarnation);
+      if (!acked.allowed) return acked;
+    }
+
     this.db.run(
       `UPDATE handoffs SET status = 'ACKED', acked_at = ?, ack_by_session_id = ? WHERE handoff_id = ?`,
       [this.clock.nowIso(), ackBySessionId, handoffId],

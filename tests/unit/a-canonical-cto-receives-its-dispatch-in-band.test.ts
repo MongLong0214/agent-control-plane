@@ -245,7 +245,8 @@ describe("an adopted canonical CTO receives its dispatch in band", () => {
       expect(messages).toHaveLength(1);
       expect(messages[0]).toMatchObject({ messageId: f.messageId, kind: MessageKind.RUN_DISPATCH, runId: f.runId });
       expect(messages[0]?.payload).toMatchObject({ runId: f.runId, goal: CONTRACT.goal });
-      expect(Object.keys(messages[0] ?? {}).sort()).toEqual(["createdAt", "expiresAt", "kind", "messageId", "payload", "runId"]);
+      expect(messages[0]).toMatchObject({ bindingGeneration: f.generation, payloadDigest: f.h.cp.outbox.get(f.messageId)!.payloadDigest });
+      expect(Object.keys(messages[0] ?? {}).sort()).toEqual(["bindingGeneration", "createdAt", "expiresAt", "kind", "messageId", "payload", "payloadDigest", "runId"]);
 
       // Another live session sees nothing; a stale incarnation is refused before any read.
       const other = f.h.cp.sessions.create({ provider: "claude", model: "claude-cli" });
