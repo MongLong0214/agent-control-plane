@@ -276,10 +276,10 @@ it("FCR-16: a non-fallback anchor later than migration also keeps its comparison
 });
 
 
-it("FCR-16: a newly recorded membership also rounds only its comparison floor", () => {
+it.each([0, 500])("r10: a newly recorded membership at S + %i ms keeps the round-down comparison contract", (fraction) => {
   const f = start(null);
   try {
-    f.h.clock.advance(500);
+    f.h.clock.advance(fraction);
     f.h.cp.sessions.setBuzzAddress(f.first.sessionId, ROOM_A);
     f.bind(f.first.sessionId);
     const joinedAt = f.h.clock.nowIso();
@@ -287,7 +287,7 @@ it("FCR-16: a newly recorded membership also rounds only its comparison floor", 
       ownerActors: [f.owner.pubkey], ceoConversation: new CeoConversationPort(),
     });
     expect(seam.port.recipientHistorySince!(f.roleKey, ROOM_A))
-      .toBe(new Date(Math.ceil(Date.parse(joinedAt) / 1000) * 1000).toISOString());
+      .toBe(joinedAt);
     expect(f.h.cp.db.get<{ joined_at: string }>(
       "SELECT joined_at FROM role_room_memberships WHERE role_key = ? AND conversation = ?", [f.roleKey, ROOM_A])!.joined_at).toBe(joinedAt);
   } finally { f.h.cp.close(); }
@@ -367,7 +367,7 @@ it.each(boundaryCases)("r9b: $floor at S.$precision refuses past mail and admits
     const live = await daemon(f, [ROOM_A]);
     try {
       const s = base / 1000;
-      const refused = signedIn(f, fraction === 0 ? s - 1 : s, "before the floor");
+      const refused = signedIn(f, floor === "fresh membership" || fraction === 0 ? s - 1 : s, "before the floor");
       if (floor === "fresh membership") {
         // A fresh post-migration join proves history, so pre-join mail is refused without an unknown-history record.
         expect.soft(await outcomeOf(f, live, refused)).toBe("refused unrecorded");
@@ -385,10 +385,58 @@ it.each(boundaryCases)("r9b: $floor at S.$precision refuses past mail and admits
           evidence_json: expect.objectContaining({ eventId: refused.id }),
         })]));
       }
-      const admitted = signedIn(f, fraction === 0 ? s : s + 1, "first safe second, no extra delay");
+      const admitted = signedIn(f, floor === "fresh membership" || fraction === 0 ? s : s + 1, "first safe second, no extra delay");
       f.h.clock.advance(Math.max(0, admitted.created_at * 1000 - Date.parse(f.h.clock.nowIso())));
       expect(await outcomeOf(f, live, admitted)).toBe("admitted");
       expect(stored()).toEqual(before);
     } finally { await live.close(); }
   } finally { f.h.cp.close(); }
+});
+
+it("r10: a migration floor at S.500 refuses S with a record while a fresh binding admits S", async () => {
+  for (const path of ["migration", "fresh binding", "plain binding", "fresh room after migration"] as const) {
+    const f = start(path === "fresh binding" || path === "plain binding" ? null : ROOM_A);
+    try {
+      const s = seconds(f.h.clock.nowIso()) + 10;
+      const floorAt = new Date(s * 1000 + 500).toISOString();
+      const room = path === "fresh room after migration" ? ROOM_B : ROOM_A;
+      if (path === "fresh room after migration") {
+        migratedAt(f, "acp-r10-fresh-room-", new Date((s - 5) * 1000).toISOString());
+      }
+      f.h.clock.advance(Date.parse(floorAt) - Date.parse(f.h.clock.nowIso()));
+      if (path === "migration") {
+        f.h.cp.sessions.setPid(f.first.sessionId, null);
+        migratedAt(f, "acp-r10-fractional-", new Date((s + 10) * 1000).toISOString());
+      } else {
+        f.h.cp.sessions.setBuzzAddress(f.first.sessionId, room);
+        if (path !== "fresh room after migration") f.bind(f.first.sessionId);
+        if (path === "plain binding") {
+          f.h.cp.db.run("DELETE FROM role_room_memberships WHERE role_key = ?", [f.roleKey]);
+          expect(f.h.cp.bindings.active(f.roleKey)!.createdAt).toBe(floorAt);
+        }
+      }
+      const stored = () => f.h.cp.db.get<{ joined_at: string }>(
+        "SELECT joined_at FROM role_room_memberships WHERE role_key = ? AND conversation = ?", [f.roleKey, room]);
+      expect(stored()?.joined_at).toBe(path === "plain binding" ? undefined : floorAt);
+      const live = await daemon(f, [room]);
+      try {
+        const eventAt = (second: number) => signedMention({
+          author: f.owner.secretKey, addressedTo: f.cto.pubkey, room, createdAt: second, text: `${path} at ${second}`,
+        });
+        const before = eventAt(s - 1);
+        const sameSecond = eventAt(s);
+        expect(await outcomeOf(f, live, before)).toBe(path === "migration" ? "refused and recorded" : "refused unrecorded");
+        expect(await outcomeOf(f, live, sameSecond)).toBe(path === "migration" ? "refused and recorded" : "admitted");
+        if (path === "migration") {
+          expect(refusalsRecorded(f.h)).toEqual(expect.arrayContaining([expect.objectContaining({
+            role_key: f.roleKey, actor: f.owner.pubkey, reason_code: ReasonCode.BUZZ_MENTION_PRECEDES_BINDING,
+            evidence_json: expect.objectContaining({ eventId: sameSecond.id, knownSince: floorAt }),
+          })]));
+        } else expect(refusalsRecorded(f.h)).toEqual([]);
+        f.h.clock.advance(500);
+        expect(await outcomeOf(f, live, eventAt(s + 1))).toBe("admitted");
+        expect(stored()?.joined_at).toBe(path === "plain binding" ? undefined : floorAt);
+      } finally { await live.close(); }
+    } finally { f.h.cp.close(); }
+  }
 });
