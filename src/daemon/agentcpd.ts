@@ -1657,9 +1657,11 @@ export const createBuzzMessageIngress = (
     // CEO decision 5f6ab731 (c): a room v51 anchored (`role_room_history_unknown`) admits mail signed
     // before the migration — the deploy's stop window — only on that anchor's own authority, and only
     // while nothing has changed since the migration: the role's binding generation, runtime session and
-    // room are exactly the anchored ones, that session has not been written since the migration (an
-    // address write always stamps `updated_at`, so A→B→A cannot hide), and no runtime move of the role
-    // was recorded after it (S→T→S cannot hide). This is read from the records each time, never from a
+    // room are exactly the anchored ones, no SESSION_BUZZ_ADDRESS_CHANGED for that session was
+    // recorded since (A→B→A cannot hide), and no runtime move of the role was recorded after it
+    // (S→T→S cannot hide). Unrelated session writes at restart do not change this proof. Each change
+    // record commits in the transaction that changes the address or runtime; new bindings advance
+    // the generation. This is read from the records each time, never from a
     // remembered flag; every comparison is at the records' own precision. Otherwise the floor there is
     // the migration itself. Either floor v51 derived is rounded up to a whole second for admission only
     // (`wholeSecondFloor`; FCR-12), so mail signed in the anchor's or the migration's own second is
@@ -1668,11 +1670,12 @@ export const createBuzzMessageIngress = (
       const row = cp.db.get<{
         joined_at: string; unknown_before: string | null; anchored_room: string | null; anchored_generation: number | null;
         anchored_session: string | null; current_generation: number | null; current_session: string | null; current_room: string | null;
-        current_updated_at: string | null; last_move_at: string | null;
+        last_address_change_at: string | null; last_move_at: string | null;
       }>(
         `SELECT m.joined_at, u.unknown_before, u.room AS anchored_room, u.binding_generation AS anchored_generation,
                 u.session_id AS anchored_session, a.binding_generation AS current_generation,
-                s.session_id AS current_session, s.buzz_address AS current_room, s.updated_at AS current_updated_at,
+                s.session_id AS current_session, s.buzz_address AS current_room,
+                (SELECT MAX(e.at) FROM audit_events e WHERE e.kind = 'SESSION_BUZZ_ADDRESS_CHANGED' AND e.session_id = u.session_id) AS last_address_change_at,
                 (SELECT MAX(e.at) FROM audit_events e WHERE e.kind = 'BINDING_RUNTIME_MOVED' AND e.role_key = m.role_key) AS last_move_at
            FROM role_room_memberships m
            LEFT JOIN role_room_history_unknown u ON u.role_key = m.role_key
@@ -1688,7 +1691,7 @@ export const createBuzzMessageIngress = (
       const unchangedSinceMigration = row.anchored_room === conversation && row.current_room === conversation &&
         row.anchored_generation !== null && row.anchored_generation === row.current_generation &&
         row.anchored_session !== null && row.anchored_session === row.current_session &&
-        row.current_updated_at !== null && Date.parse(row.current_updated_at) <= migratedAt &&
+        (row.last_address_change_at === null || Date.parse(row.last_address_change_at) <= migratedAt) &&
         (row.last_move_at === null || Date.parse(row.last_move_at) <= migratedAt);
       return wholeSecondFloor(unchangedSinceMigration ? row.joined_at : row.unknown_before);
     },

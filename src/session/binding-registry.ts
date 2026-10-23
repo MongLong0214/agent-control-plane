@@ -333,6 +333,7 @@ export class BindingRegistry {
         // `mintActor` sets this pointer for a new actor; without the same move here the recovered
         // actor would still name the process that died, and every reader of the live pointer —
         // routing, doctor, the conversation port — would be sent to it.
+        this.recordSiblingRuntimeMoves(actorId, input.sessionId, roleKey, "shared actor rebound");
         this.db.run(
           `UPDATE conversational_actors
               SET current_session_id = ?, current_session_incarnation = ?
@@ -556,6 +557,7 @@ export class BindingRegistry {
             assignmentId: current.assignmentId,
           });
         }
+        this.recordSiblingRuntimeMoves(owner.actor_id, input.sessionId, roleKey, input.reason);
         const moved = this.db.run(
           `UPDATE conversational_actors
               SET current_session_id = ?, current_session_incarnation = ?
@@ -854,6 +856,33 @@ export class BindingRegistry {
       });
     }
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * One actor can serve several active roles. A pointer write moves all of them, even when only
+   * the initiating role receives a new generation. Record each sibling's move in that same
+   * transaction, before replacing the pointer, so v51 cannot revive its anchor after S→T→S.
+   * The initiating role is covered by its own new generation or BINDING_RUNTIME_MOVED below.
+   */
+  private recordSiblingRuntimeMoves(actorId: string, sessionId: string, initiatingRole: string, reason: string): void {
+    const previous = this.db.get<{ current_session_id: string | null }>(
+      `SELECT current_session_id FROM conversational_actors WHERE actor_id = ?`, [actorId],
+    );
+    if (!previous || previous.current_session_id === sessionId) return;
+    const siblings = this.db.all<{
+      role_key: string; binding_generation: number; project_id: string | null; run_id: string | null;
+    }>(`SELECT role_key, binding_generation, project_id, run_id FROM assignments
+         WHERE actor_id = ? AND status = 'ACTIVE' AND role_key <> ?`, [actorId, initiatingRole]);
+    for (const sibling of siblings) {
+      this.audit.record({
+        kind: "BINDING_RUNTIME_MOVED",
+        roleKey: sibling.role_key,
+        sessionId,
+        projectId: sibling.project_id,
+        runId: sibling.run_id,
+        evidence: { actorId, generation: sibling.binding_generation, reason, fromSession: previous.current_session_id },
+      });
+    }
   }
 
   #notifySwitch(binding: RoleBinding, movedActorId?: string): void {

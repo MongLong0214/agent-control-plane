@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { chmodSync, readFileSync } from "node:fs";
+import { chmodSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { finalizeEvent } from "nostr-tools/pure";
 import { afterAll, expect, it } from "vitest";
@@ -31,9 +31,9 @@ afterAll(cleanupTempDirs);
  * derives — the anchor, and the migration itself once the anchor no longer holds — is rounded up to a
  * whole second for admission only, so mail signed in that time's own second is refused and recorded;
  * nothing stored is rounded. FCR-13: the stop window is admitted on the anchor only while nothing has
- * changed since the migration — the binding generation and runtime are the anchored ones, the runtime
- * session has not been written since (every address write stamps `updated_at`), and no runtime move
- * was recorded since — so A→B→A or S→T→S cannot revive it. Each change that could move a role's room
+ * changed since the migration — the binding generation and runtime are the anchored ones, no address
+ * change audit for the anchored session and no runtime move were recorded since — so A→B→A or
+ * S→T→S cannot revive it. Restart writes preserve admission (r8). Each change that could move a role's room
  * or runtime leaves one of those records, which a census below pins. Ported from the fourth focused
  * review's probes.
  */
@@ -258,8 +258,9 @@ it.each(["room", "runtime"] as const)("FCR-13: changing the anchored %s away and
 
 it.each([
   ["no change", "admitted", null],
-  ["an address write 500 ms after the migration, in its own second", "refused and recorded", "address"],
-  ["any other write to the anchored session after the migration (a pid update)", "refused and recorded", "pid"],
+  ["an address change 500 ms after the migration, in its own second", "refused and recorded", "address"],
+  ["a same-address write after the migration", "admitted", "same-address"],
+  ["any other write to the anchored session after the migration (a pid update)", "admitted", "pid"],
 ] as const)("FCR-13 / CEO fc5e4bdf: with %s, stop-window mail is %s", async (_what, expected, change) => {
   const f = start();
   try {
@@ -270,7 +271,11 @@ it.each([
     f.h.clock.advance(200);
     migratedAt(f, "acp-r7-v50-same-second-", f.h.clock.nowIso());
     f.h.clock.advance(500);
-    if (change === "address") f.h.cp.sessions.setBuzzAddress(f.first.sessionId, ROOM_A);
+    if (change === "address") {
+      f.h.cp.sessions.setBuzzAddress(f.first.sessionId, ROOM_B);
+      f.h.cp.sessions.setBuzzAddress(f.first.sessionId, ROOM_A);
+    }
+    if (change === "same-address") f.h.cp.sessions.setBuzzAddress(f.first.sessionId, ROOM_A);
     if (change === "pid") f.h.cp.sessions.setPid(f.first.sessionId, null);
     const live = await daemon(f, [ROOM_A]);
     try {
@@ -282,12 +287,15 @@ it.each([
 /**
  * CEO fc5e4bdf (2) — the census the stop-window authority rests on. A role's room or runtime can change
  * only through these writers, and each leaves a record the check reads:
- *   - `sessions` (address, and every other column): `SessionRegistry` create (two INSERTs),
- *     `rotateCredential`, `transition`, `setPid`, `bindBuzzActor` (two) and `setBuzzAddress` — each sets
- *     `updated_at` to the current time in the same statement;
+ *   - `sessions.buzz_address`: `SessionRegistry.create` (two INSERTs) makes a new session, which
+ *     requires a new binding or a recorded move to become a role's runtime. `setBuzzAddress` writes
+ *     SESSION_BUZZ_ADDRESS_CHANGED in its address transaction, including canonical reattach's
+ *     correction. Every session writer still stamps updated_at for the pre-migration v50 proof;
+ *     unrelated post-migration writes do not invalidate an anchor;
  *   - `conversational_actors.current_session_id`: `BindingRegistry.bind` reusing an actor (in the same
  *     transaction as its new assignment: a new generation), `switchTo` SURVIVED (in the same transaction
- *     as its `BINDING_RUNTIME_MOVED` record), and `mintActor`'s INSERT (a new actor, minted only by
+ *     as its `BINDING_RUNTIME_MOVED` record); both UPDATE paths also record moves for every active
+ *     sibling sharing that actor (a new initiating generation cannot fence a sibling), and `mintActor`'s INSERT (a new actor, minted only by
  *     `bind` and `switchTo` REPLACED, each for its own new assignment);
  *   - `assignments`: INSERT (a new generation) and the revocations, which set only status, revoked_at
  *     and revoked_reason — no writer changes a binding's generation, session or actor in place.
@@ -298,8 +306,9 @@ it.each([
 it("CEO fc5e4bdf (2): every writer of a role's room, runtime and binding leaves a record the stop-window check reads", () => {
   const sessionRegistry = readFileSync(new URL("../../src/session/session-registry.ts", import.meta.url), "utf8");
   const bindingRegistry = readFileSync(new URL("../../src/session/binding-registry.ts", import.meta.url), "utf8");
-  const sources = ["session/session-registry.ts", "session/binding-registry.ts", "registry/canonical-self-claim.ts",
-    "registry/canonical-cto-reattach.ts", "outbox/outbox.ts", "daemon/agentcpd.ts", "doctor/repair.ts", "db/state-admin.ts"]
+  // Scan all runtime TS sources: a newly added writer cannot escape a hand-picked file list.
+  const sources = readdirSync(new URL("../../src/", import.meta.url), { recursive: true, encoding: "utf8" })
+    .filter((file) => file.endsWith(".ts") && file !== "db/migrations.ts")
     .map((file) => [file, readFileSync(new URL(`../../src/${file}`, import.meta.url), "utf8")] as const);
   const statements = (text: string, pattern: RegExp) => [...text.matchAll(/`([^`]*)`/g)].map((m) => m[1]!).filter((sql) => pattern.test(sql));
   // sessions: only SessionRegistry writes, and every statement stamps updated_at.
@@ -310,6 +319,24 @@ it("CEO fc5e4bdf (2): every writer of a role's room, runtime and binding leaves 
   const sessionWrites = statements(sessionRegistry, /\b(UPDATE\s+sessions\s+SET|INSERT\s+(?:OR\s+\w+\s+)?INTO\s+sessions\s*\()/);
   expect(sessionWrites).toHaveLength(8);
   for (const sql of sessionWrites) expect(sql).toMatch(/\bupdated_at\b/);
+  // Post-migration address evidence: creation cannot replace a session; its only UPDATE is audited.
+  const addressWrites = sessionWrites.filter((sql) => /\bbuzz_address\b/.test(sql));
+  expect(addressWrites).toHaveLength(3);
+  expect(addressWrites.filter((sql) => /INSERT INTO sessions/.test(sql))).toHaveLength(2);
+  expect(addressWrites.every((sql) => !/REPLACE|ON CONFLICT/.test(sql))).toBe(true);
+  const setAddress = sessionRegistry.slice(sessionRegistry.indexOf("  setBuzzAddress("), sessionRegistry.indexOf("  recordRoomMembership("));
+  expect(setAddress).toMatch(/this\.db\.tx\([\s\S]*UPDATE sessions SET buzz_address[\s\S]*this\.audit\.record\(\{\s*kind: "SESSION_BUZZ_ADDRESS_CHANGED"/);
+  const correction = sources.find(([file]) => file === "registry/canonical-cto-reattach.ts")![1];
+  expect(correction).toContain("cp.sessions.setBuzzAddress(held.sessionId, room)");
+  // Every assignment insertion (bind/rebind, switch/takeover, renewal) advances generation
+  // inside its transaction. A fresh session's address alone never grants a role authority.
+  for (const [start, end] of [["  bind(input:", "  switchTo("], ["  switchTo(", "  renewSameSession("],
+    ["  renewSameSession(", "  #assertWorkerScope("]] as const) {
+    const body = bindingRegistry.slice(bindingRegistry.indexOf(start), bindingRegistry.indexOf(end));
+    expect(body).toContain("this.db.txDecision(");
+    expect(body).toContain("this.nextGeneration(");
+    expect(body).toContain("INSERT INTO assignments");
+  }
   // The runtime pointer: three writers, each beside a new generation or a recorded move.
   for (const [file, text] of sources) {
     if (file !== "session/binding-registry.ts") {
@@ -330,6 +357,15 @@ it("CEO fc5e4bdf (2): every writer of a role's room, runtime and binding leaves 
       expect(/INSERT INTO assignments|kind: "BINDING_RUNTIME_MOVED"/.test(around)).toBe(true);
     }
   }
+  // Both pointer UPDATEs also record the affected sibling roles, whose generations stay put.
+  expect([...bindingRegistry.matchAll(/this\.recordSiblingRuntimeMoves\(/g)]).toHaveLength(2);
+  for (const write of pointerWrites.filter((write) => write[1]!.startsWith("UPDATE"))) {
+    expect(bindingRegistry.slice(write.index! - 250, write.index!)).toContain("this.recordSiblingRuntimeMoves(");
+  }
+  const siblings = bindingRegistry.slice(bindingRegistry.indexOf("  private recordSiblingRuntimeMoves("), bindingRegistry.indexOf("  #notifySwitch("));
+  expect(siblings).toContain("status = 'ACTIVE' AND role_key <> ?");
+  expect(siblings).toContain('kind: "BINDING_RUNTIME_MOVED"');
+  expect(siblings).toContain("roleKey: sibling.role_key");
   // assignments: inserted, or revoked; never re-pointed or re-numbered in place.
   for (const [file, text] of sources) {
     for (const sql of statements(text, /\bUPDATE\s+assignments\s+SET\b/)) {
