@@ -1,0 +1,21 @@
+Warn: the audit scripts are diagnostics bound to one pinned commit and one fresh output directory: the summary counts only area files the run's manifest attributes and whose sha256 still matches, anything else is NOT_RUN/STALE/ERROR, a failed or timed-out child never reuses an earlier report, and exit 0 means the reviewers ran, never approval (mergeApproval is always false); they are not a way around frontier's three-attempt limit.
+Record-Id: r-2c5210f2b643
+Provenance: inherited ea57c9b032f71d778158729d5fdcd05d3a21f829
+
+Limit: a repository that relies on smudge filters or eol/ident attributes is always refused, because its checkout bytes never equal the committed blobs.
+Ruled-out: trusting git status to confirm the disposable checkout matches the pinned commit | whether status notices a smudge-filtered file depends on its stat cache, and a repository-local smudge filter let the reviewer read bytes that are not in the commit while status stayed clean, so the raw bytes are hashed instead
+Record-Id: r-11daab506f4d
+Provenance: inherited 02a3a7a66ba0835b3ca3413bf8df4e310a5f61b3
+
+Warn: the disposable checkout is compared with the pinned tree on file type, executable mode (100644/100755, as Git reads the owner execute bit) and raw blob bytes, before the reviewers start and after they finish; dropping any of the three lets a reviewer read or leave a state that is not the pinned commit while the run reports COMPLETE.
+Record-Id: r-0aea76b05469
+Provenance: inherited d8ba199817c106cc4e4adbfbb2b8e29347f9e1d2
+
+Limit: the codex header layout was taken from the installed binary and known output, not a real run; if real codex prints its header differently every production area fails closed as MODEL_UNVERIFIED.
+Warn: an area is COMPLETE only when the CLI's own output names the model we requested (codex: the model line of its header block; grok: the envelope's model field); a missing or different observed model is MODEL_UNVERIFIED, making the run INCOMPLETE/UNDETERMINED with exit 1, and a value from our flag or the CLI docs is never evidence of the model that ran.
+Record-Id: r-3e2b59c1ee77
+Provenance: inherited 889288e704ea2180c8500dc27064f03546529aee
+
+Warn: codex's observed model comes only from the configuration header that opens its stderr (blank lines may precede it; key: value lines only; closed by a delimiter; exactly one model line); nothing after the header and nothing on stdout is read, because the reviewer's own message can quote a header. grok's comes only from the envelope's top-level model field.
+Record-Id: r-ace3f0ddf1d4
+Provenance: inherited 08a5a555ee8c209c647a331d52f6bf6ac9e531a1
