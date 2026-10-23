@@ -457,7 +457,7 @@ describe("round-2 registry regressions", () => {
     try {
       const observed = await harness.cp.repositories.observe(repositoryId);
       if (headReads > 0) expect(switchedBack).toBe(true);
-      else expect(snapshots).toHaveBeenCalledTimes(1);
+      else expect(snapshots.mock.calls.filter(([, args]) => args.includes("status"))).toHaveLength(1);
       expect(gitSync(harness.repoPath, ["rev-parse", "dev"])).toBe(baseline);
       expect(gitSync(harness.repoPath, ["rev-parse", "HEAD"])).toBe(headReads > 0 ? descendant : baseline);
       expect(await readBranch(harness.repoPath)).toBe(headReads > 0 ? "owner-feature" : "dev");

@@ -125,9 +125,18 @@ const checkoutSnapshot = async (path: string): Promise<{ head: string | null; br
   const head = oid === "(initial)" ? null : oid;
   const branch = lines.find((line) => line.startsWith("# branch.head "))?.slice("# branch.head ".length);
   if (head === undefined || branch === undefined) throw new Error("git status omitted branch headers");
+  const attached = branch === "(detached)" ? null : branch;
+  if (attached !== null && head !== null) {
+    // git status reads the branch name and the HEAD commit separately, so a checkout switched during
+    // the call can report a branch with another branch's commit (#1187 r3). The branch ref itself must
+    // name the observed commit; otherwise the observation is incoherent and nothing is acknowledged.
+    const ref = await git(path, [...programs, "rev-parse", "--verify", "--quiet", `refs/heads/${attached}^{commit}`])
+      .then((result) => result.stdout.trim(), () => null);
+    if (ref !== head) return { head, branch: null, clean: false };
+  }
   return {
     head,
-    branch: branch === "(detached)" ? null : branch,
+    branch: attached,
     clean: head !== null && !lines.some((line) => !line.startsWith("# ")),
   };
 };

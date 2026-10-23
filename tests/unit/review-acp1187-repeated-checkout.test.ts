@@ -46,7 +46,7 @@ it("ACP1187-R1-02: repeated interleaving must not accept feature HEAD as default
       expect(headReads).toBe(3);
       expect(branchReads).toBe(3);
     } else {
-      expect(snapshots).toHaveBeenCalledTimes(1);
+      expect(snapshots.mock.calls.filter(([, args]) => args.includes("status"))).toHaveLength(1);
       expect(branchReads).toBe(0);
     }
     expect(gitSync(h.repoPath, ["rev-parse", "dev"])).toBe(baseline);
