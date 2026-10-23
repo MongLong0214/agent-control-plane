@@ -1,0 +1,9 @@
+Limit: every MCP mutation reservation now carries a versioned fingerprint of the tool, its canonical parsed arguments and the authenticated principal with its role/generation; a replay re-obtains current authority first, and a different request or principal under the same key is refused with CONFLICT without running the handler or touching the stored result (CEO 3da3bde3).
+Warn: a reservation completed before this change has no fingerprint and now replays as MCP_REPLAY_UNVERIFIABLE, even for a legitimate lost-response retry; the row is kept and never re-executed, so the caller must reconcile durable state before deliberately using a new key.
+Record-Id: r-691e5d60851a
+Provenance: inherited 16955daad5cccf7e4929c5ba86f75e70bf7374ed
+
+Limit: elapsed time never authorizes re-executing an MCP mutation: an expired fingerprinted reservation without a stored result is refused as MCP_MUTATION_OUTCOME_UNKNOWN and a legacy one as MCP_REPLAY_UNVERIFIABLE, and a reservation is released only when the handler raised McpMutationNotExecuted before any effect; an ordinary throw keeps the outcome unknown (review ACP1193-R1, CEO bbc884ee/20a509cb).
+Limit: for MCP_REPLAY_UNVERIFIABLE or MCP_MUTATION_OUTCOME_UNKNOWN a caller treats durable state as completion only when it matches THIS request (for a PLAN, the stored digest and tasks), proceeds with a new request only on proof of non-execution, and otherwise stays refused with no new key (review ACP1193-R4, CEO 20a509cb).
+Record-Id: r-c7386a959828
+Provenance: inherited 8abb24e1c962891494804258425f02b51c4194d9
