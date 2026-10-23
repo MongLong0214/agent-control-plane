@@ -1028,7 +1028,14 @@ export const startLocalMcpListeners = async (
     // this connection was admitted under, and `createCtoServer` must keep getting it.
     const server = createCtoServer(
       ctoPort,
-      auth,
+      () => {
+        const peer = auth();
+        return peer.allowed && opening.kind === "BOUND"
+          ? allow(ReasonCode.OK, { ...peer.value, binding: {
+              roleKey: opening.binding.roleKey, bindingGeneration: opening.binding.bindingGeneration,
+            } })
+          : peer;
+      },
       opening.kind === "PENDING_HANDOFF_ACK"
         ? { pendingHandoffId: opening.handoffId }
         : undefined,

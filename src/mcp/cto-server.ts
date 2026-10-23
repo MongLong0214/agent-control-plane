@@ -10,7 +10,6 @@ import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import type { ProductionGate } from "../ceo/production-gate.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { Clock } from "../core/clock.ts";
-import { digestOf } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { parseVerificationCommand } from "../contracts/verification-command.ts";
@@ -133,7 +132,7 @@ const assertCtoRunPeerFromSource = (
   source: CtoMcpSource,
   peer: AuthenticatedMcpPeer,
   runId: string,
-): Decision<{ sessionId: string; bindingGeneration: number }> => {
+): Decision<{ sessionId: string; bindingGeneration: number; roleKey: string }> => {
   if (!peer.sessionId || !peer.sessionIncarnation) {
     return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation");
   }
@@ -153,8 +152,8 @@ const assertCtoRunPeerFromSource = (
     return deny(ReasonCode.BINDING_GENERATION_STALE, "run owner binding is no longer current", { runId });
   }
   const owner = source.runs.assertOwner(runId, peer.sessionId, binding.bindingGeneration);
-  if (!owner.allowed) return owner as Decision<{ sessionId: string; bindingGeneration: number }>;
-  return allow(ReasonCode.OK, { sessionId: peer.sessionId, bindingGeneration: binding.bindingGeneration });
+  if (!owner.allowed) return owner as Decision<{ sessionId: string; bindingGeneration: number; roleKey: string }>;
+  return allow(ReasonCode.OK, { sessionId: peer.sessionId, bindingGeneration: binding.bindingGeneration, roleKey: binding.roleKey });
 };
 
 /**
@@ -184,9 +183,11 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     contractForRun: (runId: string) => {
       const run = source.runs.require(runId);
       const manifest = run.pinnedManifestDigest ? source.projects.manifest(run.pinnedManifestDigest) : null;
+      const plan = source.artifacts.latest(runId, ArtifactKind.PLAN);
       const contract = {
         run,
         contract: source.artifacts.latest(runId, ArtifactKind.TASK_CONTRACT)?.content ?? null,
+        ...(plan ? { plan: plan.content, tasks: standardWorkTasks(source, runId) } : {}),
         pinnedManifestDigest: run.pinnedManifestDigest,
         verificationCommands: manifest?.verificationCommands ?? [],
         branchProfile: manifest?.branchProfile ?? null,
@@ -199,8 +200,8 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       // worker and its executions, so a turn that resumes after an interruption goes by the record
       // rather than by what its conversation kept. Answered only through `contract_get`, after its
       // owner fence admitted the caller as this run's current owner; identities and states only, never
-      // a credential. Every other run's answer is exactly as before.
-      return run.kind === RunKind.STANDARD_WORK ? { ...contract, tasks: standardWorkTasks(source, runId) } : contract;
+      // a credential. A stored PLAN also exposes its tasks for outcome reconciliation.
+      return run.kind === RunKind.STANDARD_WORK && !plan ? { ...contract, tasks: standardWorkTasks(source, runId) } : contract;
     },
     // #246 C2 — a project-less bootstrap run's PLAN carries its manifest in full, checked portable
     // and against the digest the PLAN names before anything is stored. #246 B2-a — so does a
@@ -315,6 +316,10 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     openEscalation: (input: Parameters<ProductionGate["openEscalation"]>[0]) => source.ceo.openEscalation(input),
     activePrimaryCto: (projectId: string) => source.bindings.activePrimaryCto(projectId),
     prepareSwitchover: (...args: Parameters<CtoLifecycle["prepareSwitchover"]>) => source.cto.prepareSwitchover(...args),
+    handoffAuthority: (messageId: string) => {
+      const message = source.outbox.get(messageId);
+      return { roleKey: message?.roleKey ?? null, bindingGeneration: message?.bindingGeneration ?? null };
+    },
     handoffKind: (handoffId: string) => source.db.get<{ kind: string }>(`SELECT kind FROM handoffs WHERE handoff_id = ?`, [handoffId])?.kind ?? null,
     acknowledgeBootstrap: (handoffId: string, sessionId: string, sessionIncarnation: string, receipt: BootstrapHandoffReceipt, replayOnly = false) =>
       source.db.txDecision(() => {
@@ -367,7 +372,7 @@ export const assertCtoRunPeer = (
   port: CtoMcpPort,
   peer: AuthenticatedMcpPeer,
   runId: string,
-): Decision<{ sessionId: string; bindingGeneration: number }> => port.assertRunPeer(peer, runId);
+): Decision<{ sessionId: string; bindingGeneration: number; roleKey: string }> => port.assertRunPeer(peer, runId);
 
 /**
  * This scope deliberately receives only the port. Every registered handler closes over this
@@ -401,27 +406,51 @@ const createCtoServerFromPort = (
     });
   const write = (
     toolName: string,
-    idempotencyKey: string,
+    args: Record<string, unknown> & { idempotencyKey: string },
     execute: (peer: AuthenticatedMcpPeer) => Promise<ToolResult> | ToolResult,
+    authority: (peer: AuthenticatedMcpPeer) => Decision<Record<string, unknown>> = () => allow(ReasonCode.OK, {}),
   ) => guarded(async () => {
     const peer = peerFor(toolName);
     return peer.allowed
-      ? port.mutation.execute(peer.value, idempotencyKey, () => execute(peer.value))
+      ? port.mutation.execute(peer.value, args.idempotencyKey, () => execute(peer.value), {
+          toolName, arguments: args, authority: () => {
+            const current = peerFor(toolName);
+            return current.allowed ? authority(current.value) : current;
+          },
+        })
       : respond(peer);
   });
-  const owner = (peer: AuthenticatedMcpPeer, runId: string): Decision<{ sessionId: string; bindingGeneration: number }> =>
+  const owner = (peer: AuthenticatedMcpPeer, runId: string): Decision<{ sessionId: string; bindingGeneration: number; roleKey: string }> =>
     assertCtoRunPeer(port, peer, runId);
+  const writeOwned = (
+    toolName: string,
+    args: Record<string, unknown> & { idempotencyKey: string; runId: string },
+    execute: (peer: AuthenticatedMcpPeer, owner: { sessionId: string; bindingGeneration: number; roleKey: string }) => Promise<ToolResult> | ToolResult,
+  ) => {
+    let current!: { sessionId: string; bindingGeneration: number; roleKey: string };
+    return write(toolName, args, peer => execute(peer, current), peer => {
+      const fenced = owner(peer, args.runId);
+      if (fenced.allowed) current = fenced.value;
+      return fenced;
+    });
+  };
+  const primary = (peer: AuthenticatedMcpPeer, projectId: string): Decision<Record<string, unknown>> => {
+    if (!peer.sessionId || !peer.sessionIncarnation) return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation");
+    const binding = port.activePrimaryCto(projectId);
+    if (!binding || binding.sessionId !== peer.sessionId || binding.sessionIncarnation !== peer.sessionIncarnation
+        || !port.sessionIsCurrent(peer.sessionId, peer.sessionIncarnation)) {
+      return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "authenticated peer is not this project's primary CTO", { projectId });
+    }
+    return allow(ReasonCode.OK, { roleKey: binding.roleKey, bindingGeneration: binding.bindingGeneration });
+  };
 
   server.registerTool(
     "run_ack",
     { description: "Acknowledge a dispatched run and its fenced envelope.", inputSchema: { ...mutation, ...runIdentity, messageId: z.string() } },
-    async (args) => write("run_ack", args.idempotencyKey, (peer) => {
-      const fenced = owner(peer, args.runId);
+    async (args) => writeOwned("run_ack", args, (peer, fenced) => {
       // The run fence passed, so the peer carries an incarnation; an in-band row is then settled by
       // the same authority `role_dispatch_ack` uses (`Outbox.acknowledge` routes it there).
-      return fenced.allowed
-        ? respond(port.acknowledge(args.messageId, fenced.value.sessionId, fenced.value.bindingGeneration, peer.sessionIncarnation ?? ""))
-        : respond(fenced);
+      return respond(port.acknowledge(args.messageId, fenced.sessionId, fenced.bindingGeneration, peer.sessionIncarnation ?? ""));
     }),
   );
   server.registerTool(
@@ -542,9 +571,7 @@ const createCtoServerFromPort = (
         tasks: z.array(z.object({ key: z.string(), title: z.string(), category: z.enum(["mechanical", "implementation", "investigation", "integration", "test", "review", "docs", "migration", "benchmark", "security"]), dependsOn: z.array(z.string()).default([]), spec: z.record(z.unknown()).default({}) })).min(1),
       },
     },
-    async (args) => write("plan_submit", args.idempotencyKey, (peer) => {
-      const fenced = owner(peer, args.runId);
-      if (!fenced.allowed) return respond(fenced);
+    async (args) => writeOwned("plan_submit", args, () => {
       if (port.isProjectlessBootstrapRun(args.runId)) return respond(port.submitBootstrapPlan(args.runId, args.plan, args.tasks));
       const stored = port.submitPlan(args.runId, args.plan);
       if (!stored.allowed) return respond(stored);
@@ -554,12 +581,10 @@ const createCtoServerFromPort = (
   server.registerTool(
     "resource_claim",
     { description: "Claim a branch, worktree and exact write paths.", inputSchema: { ...mutation, ...runIdentity, repositoryIdentity: z.string(), branch: z.string().nullable().optional(), worktreeId: z.string().nullable().optional(), declaredPaths: z.array(z.string()).default([]), ttlMs: z.number().int().positive().optional() } },
-    async (args) => write("resource_claim", args.idempotencyKey, (peer) => {
-      const fenced = owner(peer, args.runId);
-      if (!fenced.allowed) return respond(fenced);
+    async (args) => writeOwned("resource_claim", args, (peer, fenced) => {
       const roleKey = port.ownerRoleKeyForRun(args.runId);
       if (!roleKey) return respond(deny(ReasonCode.RUN_OWNER_NOT_PINNED, "run has no owner role key", {}));
-      const acquired = port.acquireClaims({ runId: args.runId, ownerSessionId: fenced.value.sessionId, ownerBindingGeneration: fenced.value.bindingGeneration, ownerRoleKey: roleKey, repositoryIdentity: args.repositoryIdentity, branch: args.branch ?? null, worktreeId: args.worktreeId ?? null, declaredPaths: args.declaredPaths, ...(args.ttlMs === undefined ? {} : { ttlMs: args.ttlMs }) });
+      const acquired = port.acquireClaims({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, ownerRoleKey: roleKey, repositoryIdentity: args.repositoryIdentity, branch: args.branch ?? null, worktreeId: args.worktreeId ?? null, declaredPaths: args.declaredPaths, ...(args.ttlMs === undefined ? {} : { ttlMs: args.ttlMs }) });
       if (!acquired.allowed) return respond(acquired);
       const advisory = port.advisoryOverlaps(args.repositoryIdentity, args.runId, args.declaredPaths);
       return respond(allow(advisory.length > 0 ? ReasonCode.SEMANTIC_CONFLICT_ADVISORY : ReasonCode.OK, { claims: acquired.value, advisoryOverlaps: advisory }));
@@ -568,9 +593,7 @@ const createCtoServerFromPort = (
   server.registerTool(
     "resource_release",
     { description: "Release held claims.", inputSchema: { ...mutation, ...runIdentity, claimId: z.string().nullable().optional() } },
-    async (args) => write("resource_release", args.idempotencyKey, (peer) => {
-      const fenced = owner(peer, args.runId);
-      if (!fenced.allowed) return respond(fenced);
+    async (args) => writeOwned("resource_release", args, () => {
       return args.claimId ? respond(port.releaseClaim(args.claimId, args.runId)) : ok({ released: port.releaseRunClaims(args.runId) });
     }),
   );
@@ -581,9 +604,7 @@ const createCtoServerFromPort = (
         "Open or close a task execution receipt. A started receipt runs under its worker session's own provider and model: omit them, or state the session's.",
       inputSchema: { ...mutation, ...runIdentity, taskId: z.string(), phase: z.enum(["started", "activity", "finished"]), executionId: z.string().nullable().optional(), provider: z.string().min(1).optional(), model: z.string().min(1).optional(), workerSessionId: z.string(), workerProcessId: z.number().int().nullable().optional(), repositoryId: z.string().nullable().optional(), worktreeId: z.string().nullable().optional(), status: z.enum(["SUCCEEDED", "FAILED", "ABANDONED", "TIMEOUT"]).optional(), failureClass: z.enum(["transient", "repairable", "contract", "security", "policy", "capacity", "infrastructure", "unknown_observed"]).optional(), resultDigest: z.string().nullable().optional() },
     },
-    async (args) => write("task_receipt_submit", args.idempotencyKey, async (peer) => {
-      const fenced = owner(peer, args.runId);
-      if (!fenced.allowed) return respond(fenced);
+    async (args) => writeOwned("task_receipt_submit", args, async (peer, fenced) => {
       // #512 — a runtime-managed execution's started and finished receipts are the control plane's.
       // The CTO may not open one for a task the runtime runs, nor close one with a status of its choosing.
       if (
@@ -602,7 +623,7 @@ const createCtoServerFromPort = (
           await port.startTaskExecution({
             runId: args.runId,
             taskId: args.taskId,
-            ownerBindingGeneration: fenced.value.bindingGeneration,
+            ownerBindingGeneration: fenced.bindingGeneration,
             workerSessionId: args.workerSessionId,
             workerProcessId: args.workerProcessId ?? null,
             provider: args.provider,
@@ -632,16 +653,14 @@ const createCtoServerFromPort = (
         timeoutMs: z.number().int().positive().max(WORKER_TURN_MAX_TIMEOUT_MS).optional(),
       },
     },
-    async (args) => write("task_worker_run", args.idempotencyKey, async (peer) => {
-      const fenced = owner(peer, args.runId);
-      if (!fenced.allowed) return respond(fenced);
+    async (args) => writeOwned("task_worker_run", args, async (peer, fenced) => {
       return respond(await port.startWorkerTurn({
         runId: args.runId,
         taskId: args.taskId,
         claimId: args.claimId,
         ...(args.timeoutMs === undefined ? {} : { timeoutMs: args.timeoutMs }),
-        ownerSessionId: fenced.value.sessionId,
-        ownerBindingGeneration: fenced.value.bindingGeneration,
+        ownerSessionId: fenced.sessionId,
+        ownerBindingGeneration: fenced.bindingGeneration,
       }));
     }),
   );
@@ -658,15 +677,13 @@ const createCtoServerFromPort = (
         model: z.string().min(1).optional(),
       },
     },
-    async (args) => write("task_worker_provision", args.idempotencyKey, async (peer) => {
-      const fenced = owner(peer, args.runId);
-      if (!fenced.allowed) return respond(fenced);
+    async (args) => writeOwned("task_worker_provision", args, async (peer, fenced) => {
       return respond(await port.provisionWorker({
         runId: args.runId,
         taskId: args.taskId,
         provider: args.provider,
         model: args.model,
-        ownerBindingGeneration: fenced.value.bindingGeneration,
+        ownerBindingGeneration: fenced.bindingGeneration,
         // The same fence, asked again after the capacity await and inside the bind transaction.
         fence: () => owner(peer, args.runId),
       }));
@@ -687,31 +704,24 @@ const createCtoServerFromPort = (
   server.registerTool(
     "result_submit",
     { description: "Submit a candidate for automatic verification and blind review.", inputSchema: { ...mutation, ...runIdentity, resultSummary: z.string(), recommendation: z.string(), residualRisk: z.array(z.string()).default([]), runScopedCommands: z.array(z.record(z.unknown())).default([]) } },
-    async (args) => write("result_submit", args.idempotencyKey, async (peer) => {
-      const fenced = owner(peer, args.runId);
-      if (!fenced.allowed) return respond(fenced);
+    async (args) => writeOwned("result_submit", args, async (peer, fenced) => {
       const commands = args.runScopedCommands.map((command) => parseVerificationCommand(command));
-      return respond(await port.submitResult({ runId: args.runId, ownerSessionId: fenced.value.sessionId, ownerBindingGeneration: fenced.value.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }) }));
+      return respond(await port.submitResult({ runId: args.runId, ownerSessionId: fenced.sessionId, ownerBindingGeneration: fenced.bindingGeneration, resultSummary: args.resultSummary, recommendation: args.recommendation, residualRisk: args.residualRisk, ...(commands.length === 0 ? {} : { runScopedCommands: commands }) }));
     }),
   );
   server.registerTool(
     "escalation_open",
     { description: "Escalate a decision to the CEO.", inputSchema: { ...mutation, ...runIdentity, question: z.string(), options: z.array(z.string()).min(1), ctoRecommendation: z.string(), whyItMatters: z.string(), blocksCriticalPath: z.boolean() } },
-    async (args) => write("escalation_open", args.idempotencyKey, (peer) => {
-      const fenced = owner(peer, args.runId);
-      if (!fenced.allowed) return respond(fenced);
-      return respond(port.openEscalation({ runId: args.runId, question: args.question, options: args.options, ctoRecommendation: args.ctoRecommendation, whyItMatters: args.whyItMatters, blocksCriticalPath: args.blocksCriticalPath, openedBySessionId: fenced.value.sessionId, openedAt: new Date().toISOString() }));
+    async (args) => writeOwned("escalation_open", args, (peer, fenced) => {
+      return respond(port.openEscalation({ runId: args.runId, question: args.question, options: args.options, ctoRecommendation: args.ctoRecommendation, whyItMatters: args.whyItMatters, blocksCriticalPath: args.blocksCriticalPath, openedBySessionId: fenced.sessionId, openedAt: new Date().toISOString() }));
     }),
   );
   server.registerTool(
     "handoff_submit",
     { description: "Submit a structured CTO handoff.", inputSchema: { ...mutation, projectId: z.string(), handoff: z.object({ projectStatus: z.string(), activeManifestDigest: z.string().nullable(), recentDecisions: z.array(z.string()).default([]), openBlockers: z.array(z.string()).default([]), queuedWork: z.array(z.string()).default([]), repositoryFacts: z.array(z.object({ identity: z.string(), branch: z.string().nullable(), head: z.string().nullable() })).default([]), knownRisks: z.array(z.string()).default([]), recommendedNextAction: z.string() }) } },
-    async (args) => write("handoff_submit", args.idempotencyKey, async (peer) => {
-      if (!peer.sessionId || !peer.sessionIncarnation) return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation"));
-      const binding = port.activePrimaryCto(args.projectId);
-      if (!binding || binding.sessionId !== peer.sessionId || binding.sessionIncarnation !== peer.sessionIncarnation) return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "authenticated peer is not this project's primary CTO", { projectId: args.projectId }));
-      return respond(await port.prepareSwitchover(args.projectId, args.handoff));
-    }),
+    async (args) => write("handoff_submit", args,
+      async () => respond(await port.prepareSwitchover(args.projectId, args.handoff)),
+      peer => primary(peer, args.projectId)),
   );
   server.registerTool(
     "handoff_ack",
@@ -729,11 +739,6 @@ const createCtoServerFromPort = (
       const authenticated = peerFor("handoff_ack");
       if (!authenticated.allowed) return respond(authenticated);
       const peer = authenticated.value;
-      const requestDigest = digestOf({
-        tool: "handoff_ack", handoffId: args.handoffId, messageId: args.messageId,
-        bindingGeneration: args.bindingGeneration, payloadDigest: args.payloadDigest,
-        sessionId: peer.sessionId, sessionIncarnation: peer.sessionIncarnation,
-      });
       const acknowledge = (replayOnly = false): Decision<unknown> => {
         if (!peer.sessionId || !peer.sessionIncarnation) return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation");
         if (!port.sessionIsCurrent(peer.sessionId, peer.sessionIncarnation)) {
@@ -768,28 +773,31 @@ const createCtoServerFromPort = (
           bindingGeneration: args.bindingGeneration,
         });
       };
-      let executed = false;
-      const result = await port.mutation.execute(peer, args.idempotencyKey, () => {
-        executed = true;
-        const decision = acknowledge();
-        return respond({ ...decision, evidence: { ...decision.evidence, handoffAckRequestDigest: requestDigest } });
+      return port.mutation.execute(peer, args.idempotencyKey, () => respond(acknowledge()), {
+        toolName: "handoff_ack", arguments: args,
+        // Domain re-ACK validates the package's current role/generation, including switchover
+        // recipients that were unbound at the first ACK. It must remain a replay-only check.
+        authority: () => {
+          const current = peerFor("handoff_ack");
+          return current.allowed ? allow(ReasonCode.OK, port.handoffAuthority(args.messageId)) : current;
+        },
+        replayAuthority: () => {
+          const decision = acknowledge(true);
+          return decision.allowed ? decision : deny(ReasonCode.HANDOFF_ACK_REQUIRED,
+            "cached ACK requires the same package, principal and current authority");
+        },
       });
-      // Keep the shared reservation, in-flight refusal and other-peer refusal. Only this tool's
-      // cached successes need the extra request/principal binding and current domain authority.
-      if (executed || result.isError) return result;
-      const stored = result.structuredContent as { evidence?: { handoffAckRequestDigest?: unknown } } | undefined;
-      const refuse = () => respond(deny(ReasonCode.HANDOFF_ACK_REQUIRED, "cached ACK requires the same package, principal and current authority"));
-      if (stored?.evidence?.handoffAckRequestDigest !== requestDigest) return refuse();
-      return acknowledge(true).allowed ? result : refuse();
     }),
   );
   server.registerTool(
     "capacity_get",
     { description: "Normalized provider capacity.", inputSchema: { ...mutation, refresh: z.boolean().default(false) } },
-    async (args) => write("capacity_get", args.idempotencyKey, async () => {
+    async (args) => write("capacity_get", args, async () => {
       if (args.refresh) await port.refreshCapacity();
       return ok({ providers: port.capacity(), continuityMode: port.continuityMode() });
-    }),
+    }, peer => peer.binding
+      ? allow(ReasonCode.OK, { ...peer.binding })
+      : deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "capacity_get requires current socket binding authority")),
   );
   server.registerTool(
     "doctor_run",

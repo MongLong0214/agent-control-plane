@@ -11,13 +11,13 @@ import {
 } from "../ceo/production-gate.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { Clock } from "../core/clock.ts";
-import { type Decision, deny } from "../core/errors.ts";
+import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { CtoLifecycle } from "../cto/cto-lifecycle.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import type { ExecutionMode, RunPriority } from "../domain/types.ts";
-import { RunKind, RunState } from "../domain/types.ts";
+import { Role, roleKeyFor, RunKind, RunState } from "../domain/types.ts";
 import type { RepairService } from "../doctor/repair.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
@@ -33,10 +33,12 @@ import {
   type HermesToolCall,
 } from "./hermes-provenance.ts";
 import {
+  type AuthenticatedMcpPeer,
   authenticateMcpPeer,
   createMcpMutationPort,
   guarded,
   ok,
+  type McpMutationRequest,
   type McpMutationSource,
   type McpPeerAuthenticator,
   respond,
@@ -93,6 +95,15 @@ export const createHermesMcpPort = (
 ) => {
   const port = Object.freeze({
     mutation: createMcpMutationPort(source),
+    // Authentication owns admission; capture the role that authorized a session-bearing peer.
+    peerAuthority: (peer: AuthenticatedMcpPeer): Decision<Record<string, unknown>> => {
+      if (!peer.sessionId) return allow(ReasonCode.OK, {});
+      const binding = source.bindings.active(roleKeyFor(Role.CEO));
+      if (!binding || binding.sessionId !== peer.sessionId || binding.sessionIncarnation !== peer.sessionIncarnation) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "Hermes peer is no longer the current CEO");
+      }
+      return allow(ReasonCode.OK, { roleKey: binding.roleKey, bindingGeneration: binding.bindingGeneration });
+    },
     createRun: (input: Parameters<RunEngine["create"]>[0]) => source.runs.create(input),
     dispatchRun: (runId: string, hermesTurn?: HermesAdmittedTurn) =>
       source.runs.dispatch(runId, hermesTurn === undefined ? {} : { hermesTurn }),
@@ -192,15 +203,18 @@ export const createHermesMcpPort = (
     resolveEscalation: (
       runId: string, escalationId: number, resolution: string, ceoSessionId: string, idempotencyKey: string,
       hermesTurn?: HermesAdmittedTurn,
+      mcpFingerprint?: string,
     ) =>
       source.ceo.resolveEscalation(runId, resolution, ceoSessionId, {
         escalationId, idempotencyKey, ...(hermesTurn === undefined ? {} : { hermesTurn }),
+        ...(mcpFingerprint === undefined ? {} : { mcpFingerprint }),
       }),
     replayEscalationResolution: (
       idempotencyKey: string,
       request: { runId: string; escalationId: number; resolution: string },
       ceoSessionId: string,
-    ) => source.ceo.escalationResolutionReplay(idempotencyKey, request, ceoSessionId),
+      mcpFingerprint: string,
+    ) => source.ceo.escalationResolutionReplay(idempotencyKey, request, ceoSessionId, mcpFingerprint),
   });
   HERMES_MCP_PORTS.add(port);
   return port;
@@ -313,13 +327,28 @@ const createHermesServerFromPort = (
       const peer = authenticateMcpPeer(authenticate);
       return peer.allowed ? execute() : respond(peer);
     });
-  const write = (idempotencyKey: string, execute: () => Promise<ToolResult> | ToolResult) =>
-    guarded(async () => {
-      const peer = authenticateMcpPeer(authenticate);
-      return peer.allowed ? port.mutation.execute(peer.value, idempotencyKey, execute) : respond(peer);
+  const write = (
+    toolName: string,
+    args: Record<string, unknown> & { idempotencyKey: string },
+    extra: unknown,
+    execute: (fingerprint: string) => Promise<ToolResult> | ToolResult,
+    durableReplay?: McpMutationRequest["durableReplay"],
+  ) => guarded(async () => {
+    const peer = authenticateMcpPeer(authenticate);
+    if (!peer.allowed) return respond(peer);
+    return port.mutation.execute(peer.value, args.idempotencyKey, execute, {
+      toolName, arguments: args,
+      ...(durableReplay === undefined ? {} : { durableReplay }),
+      authority: () => {
+        const current = authenticateMcpPeer(authenticate);
+        return current.allowed ? port.peerAuthority(peer.value) : current;
+      },
+      provenance: anchor === undefined ? null : { ...anchor, ...admittedTurnOf(extra) },
     });
+  });
   const writeAsOwner = (
-    idempotencyKey: string,
+    toolName: string,
+    args: Record<string, unknown> & { idempotencyKey: string },
     extra: unknown,
     refusal: string,
     execute: (actor: string) => Promise<ToolResult> | ToolResult,
@@ -330,7 +359,7 @@ const createHermesServerFromPort = (
     if (admittedTurnOf(extra)?.principal !== "owner") {
       return respond(deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, refusal));
     }
-    return port.mutation.execute(peer.value, idempotencyKey, () => execute(peer.value.actor));
+    return write(toolName, args, extra, () => execute(peer.value.actor));
   });
 
   server.registerTool(
@@ -349,7 +378,7 @@ const createHermesServerFromPort = (
         })).default([]),
       },
     },
-    async (args, extra) => write(args.idempotencyKey, () => respond(port.createRun({
+    async (args, extra) => write("run_create", args, extra, () => respond(port.createRun({
       projectId: args.projectId ?? null,
       kind: (args.kind as RunKind | undefined) ?? RunKind.STANDARD_WORK,
       executionMode: args.executionMode as ExecutionMode,
@@ -362,7 +391,7 @@ const createHermesServerFromPort = (
   server.registerTool(
     "run_dispatch",
     { description: "Admit a queued run.", inputSchema: { ...mutation, runId: z.string() } },
-    async (args, extra) => write(args.idempotencyKey, async () => respond(await port.dispatchRun(args.runId, admittedTurnOf(extra)))),
+    async (args, extra) => write("run_dispatch", args, extra, async () => respond(await port.dispatchRun(args.runId, admittedTurnOf(extra)))),
   );
 
   server.registerTool(
@@ -377,12 +406,12 @@ const createHermesServerFromPort = (
   server.registerTool(
     "run_cancel",
     { description: "Cancel a run and its task graph.", inputSchema: { ...mutation, runId: z.string(), reason: z.string() } },
-    async (args) => write(args.idempotencyKey, () => respond(port.cancelRun(args.runId, args.reason))),
+    async (args, extra) => write("run_cancel", args, extra, () => respond(port.cancelRun(args.runId, args.reason))),
   );
   server.registerTool(
     "run_priority_set",
     { description: "Set run priority.", inputSchema: { ...mutation, runId: z.string(), priority: z.enum(["CRITICAL", "NORMAL", "LOW"]) } },
-    async (args) => write(args.idempotencyKey, () => respond(port.setRunPriority(args.runId, args.priority as RunPriority))),
+    async (args, extra) => write("run_priority_set", args, extra, () => respond(port.setRunPriority(args.runId, args.priority as RunPriority))),
   );
   server.registerTool(
     "project_get",
@@ -395,25 +424,25 @@ const createHermesServerFromPort = (
   server.registerTool(
     "cto_start",
     { description: "Provision a primary CTO for a project if it has none.", inputSchema: { ...mutation, projectId: z.string() } },
-    async (args) => write(args.idempotencyKey, async () => respond(await port.ensurePrimaryCto(args.projectId))),
+    async (args, extra) => write("cto_start", args, extra, async () => respond(await port.ensurePrimaryCto(args.projectId))),
   );
   server.registerTool(
     "cto_replace",
     { description: "Request CTO replacement.", inputSchema: { ...mutation, projectId: z.string(), reason: z.string() } },
-    async (args) => write(args.idempotencyKey, () => respond(port.requestCtoReplacement(args.projectId, args.reason))),
+    async (args, extra) => write("cto_replace", args, extra, () => respond(port.requestCtoReplacement(args.projectId, args.reason))),
   );
 
   server.registerTool(
     "cto_suspend",
     { description: "Suspend a project on an authenticated owner turn.", inputSchema: { ...mutation, projectId: z.string(), reason: z.string() } },
-    async (args, extra) => writeAsOwner(args.idempotencyKey, extra,
+    async (args, extra) => writeAsOwner("cto_suspend", args, extra,
       "project suspension requires an authenticated owner turn",
       (actor) => port.suspendProject(args.projectId, args.reason, actor).then(respond)),
   );
   server.registerTool(
     "cto_resume",
     { description: "Resume a suspended project.", inputSchema: { ...mutation, projectId: z.string() } },
-    async (args) => write(args.idempotencyKey, () => respond(port.resumeProject(args.projectId))),
+    async (args, extra) => write("cto_resume", args, extra, () => respond(port.resumeProject(args.projectId))),
   );
   server.registerTool(
     "doctor_run",
@@ -428,7 +457,7 @@ const createHermesServerFromPort = (
   server.registerTool(
     "ceo_decision_submit",
     { description: "Submit the CEO's final decision.", inputSchema: { ...mutation, runId: z.string(), decision: z.enum(["CONFIRM", "FINAL_REVISE", "OWNER_DECISION_REQUIRED"]), candidateSnapshotDigest: z.string(), ceoSessionId: z.string(), rationale: z.string() } },
-    async (args, extra) => write(args.idempotencyKey, async () => {
+    async (args, extra) => write("ceo_decision_submit", args, extra, async () => {
       // #246 B2-b — the door's authenticated session travels with the decision, never an argument, so a
       // CONTRACT_CHANGE grant is issued, or its consumer re-bound, only when it is the CEO session the call
       // names and this mutation is in flight.
@@ -452,58 +481,30 @@ const createHermesServerFromPort = (
       inputSchema: { ...mutation, runId: z.string(), escalationId: z.number().int().positive(), resolution: z.string() },
     },
     async (args, extra) => guarded(async () => {
-      // The idempotency key names one request. The CEO_DECISION that answers it commits the key's
-      // digest beside the request's, and `resolveEscalation` reads that record first, before any
-      // state: the same request is answered with its first result, and the same key carrying
-      // anything else is refused, never answered as if it were the first request.
-      //
-      // That record, not the response `write()` stores, is the answer to a replay. So every call is
-      // authenticated first — the current-CEO fence included — then answered from the committed
-      // decision when one exists, and only then handed to `write()` and its cache: a cached response
-      // (a CONFLICT a changed retry left behind, a missing store) can never shadow a committed
-      // success. The record is read again after `write()` for a decision that committed while this
-      // request's reservation was held.
       const requestDigest = escalationRequestDigestOf(args.runId, args.escalationId, args.resolution);
       const answer = <T>(decision: Decision<T>) =>
         respond({ ...decision, evidence: { ...decision.evidence, requestDigest } } as Decision<T>);
-      const committed = (): ToolResult | null => {
+      const committed = (fingerprint: string): ToolResult | null => {
         const peer = authenticateMcpPeer(authenticate);
         if (!peer.allowed || !peer.value.sessionId) return null;
-        const recorded = port.replayEscalationResolution(
-          args.idempotencyKey,
-          { runId: args.runId, escalationId: args.escalationId, resolution: args.resolution },
-          peer.value.sessionId,
-        );
+        const recorded = port.replayEscalationResolution(args.idempotencyKey,
+          { runId: args.runId, escalationId: args.escalationId, resolution: args.resolution }, peer.value.sessionId, fingerprint);
         return recorded ? answer(recorded) : null;
       };
-      const before = committed();
-      if (before) return before;
-      let executed = false;
-      const result = await write(args.idempotencyKey, () => {
-        executed = true;
-        // The deciding session is the door's authenticated CEO peer, never an argument.
+      return write("escalation_resolve", args, extra, fingerprint => {
         const peer = authenticateMcpPeer(authenticate);
-        return answer(!peer.allowed
-          ? peer
-          : peer.value.sessionId
-            ? port.resolveEscalation(args.runId, args.escalationId, args.resolution, peer.value.sessionId, args.idempotencyKey, admittedTurnOf(extra))
-            : deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "Hermes MCP peer has no session"));
-      });
-      if (executed) return result;
-      const after = committed();
-      if (after) return after;
-      const stored = (result.structuredContent as { evidence?: { requestDigest?: unknown } } | undefined)?.evidence?.requestDigest;
-      if (stored === requestDigest || (stored === undefined && result.isError === true)) return result;
-      return respond(deny(ReasonCode.CONFLICT, "this idempotencyKey already names a different request", {
-        idempotencyKey: args.idempotencyKey,
-      }));
+        if (!peer.allowed) return respond(peer);
+        if (!peer.value.sessionId) return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "Hermes MCP peer has no session"));
+        return answer(port.resolveEscalation(args.runId, args.escalationId, args.resolution,
+          peer.value.sessionId, args.idempotencyKey, admittedTurnOf(extra), fingerprint));
+      }, committed);
     }),
   );
 
   server.registerTool(
     "owner_decision_submit",
     { description: "Record a decision on an authenticated owner turn.", inputSchema: { ...mutation, runId: z.string(), item: z.string(), approved: z.boolean(), note: z.string().default("") } },
-    async (args, extra) => writeAsOwner(args.idempotencyKey, extra,
+    async (args, extra) => writeAsOwner("owner_decision_submit", args, extra,
       "owner decisions require an authenticated owner turn",
       (actor) => respond(port.recordOwnerDecision(args, actor))),
   );
@@ -513,7 +514,7 @@ const createHermesServerFromPort = (
       description: "Run an allowlisted repair. Owner-authorised repairs require owner ingress.",
       inputSchema: { ...mutation, operationId: z.string(), parameters: z.record(z.string()).default({}), authorizedBy: z.enum(["HERMES", "OWNER"]), dryRun: z.boolean().default(true), runId: z.string().nullable().optional() },
     },
-    async (args) => write(args.idempotencyKey, async () => {
+    async (args, extra) => write("repair_execute", args, extra, async () => {
       if (args.authorizedBy === "OWNER") {
         return respond(deny(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE, "Hermes MCP cannot assert owner repair authority", { operationId: args.operationId }));
       }

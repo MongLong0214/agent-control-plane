@@ -9,7 +9,7 @@ import {
   sameBootstrapPlanBinding,
 } from "../bootstrap/bootstrap-plan.ts";
 import type { Clock } from "../core/clock.ts";
-import { digestOf } from "../core/digest.ts";
+import { digestOf, sha256 } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "./owner-authority.ts";
@@ -114,10 +114,14 @@ export interface EscalationResolution {
 
 /** The identity of one `escalation_resolve` request: the run, the escalation it names, the resolution. */
 export const escalationRequestDigestOf = (runId: string, escalationId: number, resolution: string): string =>
-  digestOf({ runId, escalationId, resolution: digestOf(resolution) });
+  sha256(JSON.stringify(["acp.escalation-resolve.request.v1", runId, escalationId, resolution]));
 
 /** The digest an `escalation_resolve` idempotency key is recorded under; the key itself is never stored. */
 const escalationKeyDigestOf = (idempotencyKey: string): string =>
+  sha256(JSON.stringify(["acp.escalation-resolve.key.v1", idempotencyKey]));
+
+// Lookup only: older normalized digests cannot establish byte identity and must be refused.
+const legacyEscalationKeyDigestOf = (idempotencyKey: string): string =>
   digestOf({ door: "escalation_resolve", idempotencyKey });
 
 /**
@@ -1887,24 +1891,34 @@ export class ProductionGate {
     idempotencyKey: string,
     request: { runId: string; escalationId: number; resolution: string },
     byCeoSession: string,
+    mcpFingerprint?: string,
   ): Decision<EscalationResolution> | null {
     if (!this.assertCurrentCeo(byCeoSession).allowed) return null;
     return this.#replayEscalationResolution(
-      escalationKeyDigestOf(idempotencyKey),
+      idempotencyKey,
       escalationRequestDigestOf(request.runId, request.escalationId, request.resolution),
+      mcpFingerprint,
     );
   }
 
-  #replayEscalationResolution(keyDigest: string, requestDigest: string): Decision<EscalationResolution> | null {
+  #replayEscalationResolution(idempotencyKey: string, requestDigest: string, mcpFingerprint?: string): Decision<EscalationResolution> | null {
     const prior = this.db.get<{ run_id: string; evidence_json: string }>(
       `SELECT run_id, evidence_json FROM audit_events WHERE kind = 'CEO_DECISION'
-         AND json_extract(evidence_json, '$.idempotencyKeyDigest') = ? ORDER BY event_id LIMIT 1`,
-      [keyDigest],
+         AND json_extract(evidence_json, '$.idempotencyKeyDigest') IN (?, ?) ORDER BY event_id LIMIT 1`,
+      [escalationKeyDigestOf(idempotencyKey), legacyEscalationKeyDigestOf(idempotencyKey)],
     );
     if (!prior) return null;
-    const recorded = JSON.parse(prior.evidence_json) as { requestDigest?: unknown; escalationId?: unknown; messageId?: unknown };
+    const recorded = JSON.parse(prior.evidence_json) as { mcpFingerprint?: unknown; replayIdentityVersion?: unknown; idempotencyKeyDigest?: unknown; requestDigest?: unknown; escalationId?: unknown; messageId?: unknown };
+    if (recorded.replayIdentityVersion !== 1 || recorded.idempotencyKeyDigest !== escalationKeyDigestOf(idempotencyKey)) {
+      return deny(ReasonCode.MCP_REPLAY_UNVERIFIABLE, "escalation receipt has no verifiable byte-preserving request identity");
+    }
     if (recorded.requestDigest !== requestDigest) {
       return deny(ReasonCode.CONFLICT, "this idempotencyKey already names a different request", { requestDigest });
+    }
+    // This value is minted by the shared MCP authority, never recomputed by the fallback.
+    if (mcpFingerprint !== undefined && recorded.mcpFingerprint !== mcpFingerprint) {
+      return deny(recorded.mcpFingerprint === undefined ? ReasonCode.MCP_REPLAY_UNVERIFIABLE : ReasonCode.CONFLICT,
+        "escalation receipt cannot prove the same MCP request and principal");
     }
     return allow(ReasonCode.OK, {
       runId: prior.run_id,
@@ -1966,7 +1980,7 @@ export class ProductionGate {
     runId: string,
     resolution: string,
     byCeoSession: string,
-    target?: { escalationId: number; idempotencyKey?: string; hermesTurn?: HermesAdmittedTurn },
+    target?: { escalationId: number; idempotencyKey?: string; hermesTurn?: HermesAdmittedTurn; mcpFingerprint?: string },
   ): Decision<EscalationResolution> {
     return this.db.txDecision(() => {
       const run = this.runs.get(runId);
@@ -1983,11 +1997,13 @@ export class ProductionGate {
       const request = target?.idempotencyKey === undefined
         ? null
         : {
+            ...(target.mcpFingerprint === undefined ? {} : { mcpFingerprint: target.mcpFingerprint }),
+            replayIdentityVersion: 1,
             idempotencyKeyDigest: escalationKeyDigestOf(target.idempotencyKey),
             requestDigest: escalationRequestDigestOf(runId, target.escalationId, resolution),
           };
       if (request) {
-        const replayed = this.#replayEscalationResolution(request.idempotencyKeyDigest, request.requestDigest);
+        const replayed = this.#replayEscalationResolution(target!.idempotencyKey!, request.requestDigest, target?.mcpFingerprint);
         if (replayed) return replayed;
       }
       if (target) {

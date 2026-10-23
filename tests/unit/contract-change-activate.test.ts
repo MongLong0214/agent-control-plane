@@ -1008,7 +1008,8 @@ describe("ruling 9: a CONTRACT_CHANGE CONFIRM and another ceoSessionId", () => {
       { runId: run.runId, decision: "CONFIRM", candidateSnapshotDigest: candidate, ceoSessionId: ceo.sessionId },
       { peerSessionId: run.ownerSessionId },
     );
-    expect(refused).toMatchObject({ allowed: false, reasonCode: "MANIFEST_ACTIVATION_AUTHORITY_STALE" });
+    // The shared MCP authority fence refuses the non-CEO session before the grant gate.
+    expect(refused).toMatchObject({ allowed: false, reasonCode: "BINDING_GENERATION_STALE" });
     expect(stateOf(harness, run.runId)).toBe(RunState.READY_FOR_CEO_REVIEW);
     expect(grantRow(harness, run.runId)).toBeNull();
   });

@@ -955,12 +955,7 @@ export class ManifestActivationGrants {
         ingress: ingress ? "INCOMPLETE" : "ABSENT",
       });
     }
-    const reserved = this.db.get<{ n: number }>(
-      `SELECT COUNT(*) AS n FROM inbound_messages
-        WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND result_json IS NULL`,
-      [ingress.idempotencyKey, ingress.actor],
-    );
-    if (!isMcpReservationInFlight(this.db, ingress.idempotencyKey) || (reserved?.n ?? 0) !== 1) {
+    if (!isMcpReservationInFlight(this.db, ingress.idempotencyKey, ingress.actor)) {
       return deny(ReasonCode.GATE_AUTHORITY_DENIED, "the confirmation is not an MCP mutation in flight in this process", {
         runId,
         idempotencyKey: ingress.idempotencyKey,

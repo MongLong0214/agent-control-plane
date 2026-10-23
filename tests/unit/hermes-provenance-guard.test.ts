@@ -105,7 +105,7 @@ const channel = async (adopted = true, register?: (server: ReturnType<typeof cre
     createHermesMcpPort(h.cp),
     adopted
       ? () => admission.authenticate(admitted)
-      : () => allow(ReasonCode.OK, { actor: admitted.sessionId, sessionId: admitted.sessionId }),
+      : () => allow(ReasonCode.OK, { actor: admitted.sessionId, sessionId: admitted.sessionId, sessionIncarnation: h.cp.sessions.require(admitted.sessionId).incarnation }),
     adopted ? { provenance: admitted.provenance } : {},
   );
   register?.(server);
