@@ -1,5 +1,4 @@
-import { mergeBootstrapGenesis, type GitHubClient } from '../../src/github/github-kernel.ts';
-import type { GenesisPull } from '../../src/bootstrap/github-write-port.ts';
+import { GenesisGitHub, genesisBundle, genesisFile, genesisPlanFixture } from '../helpers/genesis-github.ts';
 import { createCtoMcpPort } from "../../src/mcp/cto-server.ts";
 import { readProcessStartToken } from '../../src/core/process-argv.ts';
 import { CanonicalSelfClaim, hostSessionRegistryAbsent } from '../../src/registry/canonical-self-claim.ts';
@@ -10,10 +9,9 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
 import Database from 'better-sqlite3';
-import { bytesDigest, genesisDigest, parseGenesis, type GenesisBundle } from '../../src/bootstrap/genesis-bundle.ts';
-import { bootstrapPlanPreflight, currentBootstrapPlan, executablePlanOf, planForSubmission } from '../../src/bootstrap/bootstrap-plan.ts';
+import { bytesDigest, genesisDigest, parseGenesis } from '../../src/bootstrap/genesis-bundle.ts';
+import { bootstrapPlanPreflight, executablePlanOf, planForSubmission } from '../../src/bootstrap/bootstrap-plan.ts';
 import { produceRepoFactoryResult } from '../../src/bootstrap/repo-factory-producer.ts';
-import { manifestDigest, projectManifestSchema } from '../../src/contracts/manifest.ts';
 import { digestOf } from '../../src/core/digest.ts';
 import { ResidentProjectProvisioning } from '../../src/bootstrap/resident-project-provisioning.ts';
 import { CanonicalSessionRegistry } from '../../src/registry/canonical-session-registry.ts';
@@ -22,77 +20,15 @@ import type { HostOperation, HostProjectProvisioner, ProjectAllocation, HostObse
 import { git } from '../../src/git/git.ts';
 import { Db } from '../../src/db/database.ts';
 import { MIGRATIONS } from '../../src/db/migrations.ts';
-import { FakeGitHub, type Target } from '../helpers/fake-github-write-port.ts';
-import { fixtureManifest, makeHarness } from '../helpers/harness.ts';
+import { makeHarness } from '../helpers/harness.ts';
 import { cleanupTempDirs, tempDir } from '../helpers/fixtures.ts';
 import { RunKind } from '../../src/domain/types.ts';
 
 afterAll(cleanupTempDirs);
-const file = (path:string,content:string,mode:'100644'|'100755'='100644') => ({path,mode,contentBase64:Buffer.from(content).toString('base64'),sha256:bytesDigest(Buffer.from(content))});
-export const bundle = ():GenesisBundle => ({schema:'acp.genesis-bundle.v1',commitMessage:'Create runnable project',files:[file('test.js',"const assert=require('node:assert');assert.equal(2+2,4);assert.equal(process.env.ACP_OPERATOR_TOKEN,undefined);assert.equal(process.env.GH_TOKEN,undefined);\n"),file('.github/workflows/ci.yml','name: ci\non: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: node test.js\n'),file('bin/check','#!/bin/sh\nexit 0\n','100755')],branches:{main:'main',integration:'dev',genesis:'genesis'},labels:[{name:'ready',color:'123abc',description:'ready'}],milestones:[{key:'m1',title:'Develop',description:'first increment'}],issues:[{key:'i1',title:'Implement feature',body:'Keep the owner reference',labels:['ready'],milestoneKey:'m1'}],productIntent:{summary:'An immediately developable product',references:['https://example.test/design'],ownerInstructions:['Preserve this intent']}});
-function planFixture() {
-  const genesis = bundle();
-  const manifest = projectManifestSchema.parse(fixtureManifest('resident-test',{verificationCommands:[{id:'test',argv:['node','test.js'],repositoryRole:'primary',cwd:'.',timeoutSeconds:30,envAllowlist:[],network:'deny',networkAllowlist:[],required:true,evidenceMode:'LOCAL_COMMAND',maxOutputBytes:1048576,maxMemoryMb:1024,maxCpuSeconds:30}],verificationProfiles:{simple:['test'],standard:['test'],guarded:['test']},ciWorkflows:[{repositoryRole:'primary',path:'.github/workflows/ci.yml',checkName:'test',approvedDigest:genesis.files[1]!.sha256,unapprovedFirstActivation:false}]}));
-  const normalized = planForSubmission({kind:'PROJECT_BOOTSTRAP',projectId:null},{summary:'create',bootstrapOperationId:'genesis-op',requestDigest:digestOf('request'),projectManifest:manifest,projectManifestDigest:manifestDigest(manifest),genesis});
-  if (!normalized.allowed) throw new Error(normalized.message);
-  const artifact = {content:normalized.value,digest:digestOf(normalized.value)};
-  const current = currentBootstrapPlan('run_genesis',artifact);
-  if (!current.allowed) throw new Error(current.message);
-  return {genesis,artifact,...current.value};
-}
-class GenesisGitHub extends FakeGitHub {
-  resources: Record<string,unknown>|null = null;
-  ciReady = true;
-  ciHeads:string[] = [];
-  pull:GenesisPull|null = null;
-  opens = 0; merges = 0;
-  events:string[] = [];
-  marker = '';
-  override async createRepository(target:Target,visibility:string,description?:string,autoInit?:boolean) {
-    expect(autoInit).toBe(true);this.events.push('create-repository');
-    await super.createRepository(target,visibility,description);
-    const repo = this.repository(target.owner,target.name)!;
-    const seed = tempDir('github-autoinit-');await git(seed,['init','-b','main']);
-    writeFileSync(join(seed,'README.md'),'# GitHub initialization\n');await git(seed,['add','README.md']);
-    await git(seed,['-c','user.name=GitHub','-c','user.email=github@local','commit','-m','Initial commit']);
-    await git(seed,['push',repo.bare,'HEAD:refs/heads/main']);repo.defaultBranch = 'main';
-    return (await this.observeRepository(target))!;
-  }
-  override async protectBranch(target:Target,branch:string,desired:Parameters<FakeGitHub['protectBranch']>[2]) {this.events.push('protect-'+branch);await super.protectBranch(target,branch,desired);}
-  override async pushBranch(target:Target,branch:string,path:string,head:string) {expect(branch).toBe('genesis');this.events.push('push-genesis-branch');await super.pushBranch(target,branch,path,head);}
-  override async setDefaultBranch(target:Target,branch:string) {this.events.push('set-default-branch');await super.setDefaultBranch(target,branch);}
-  async createBranch(target:Target,branch:string,head:string) {expect(branch).toBe('dev');this.events.push('create-dev');await git(this.repository(target.owner,target.name)!.bare,['update-ref',`refs/heads/${branch}`,head]);}
-  async ensureGenesisResources(_target:Target,b:Pick<GenesisBundle,'labels'|'milestones'|'issues'>) {this.events.push('resources');this.resources = b;}
-  async observeGenesisResources(_target:Target,b:Pick<GenesisBundle,'labels'|'milestones'|'issues'>) {
-    if (!this.resources) return null;
-    return (['labels','milestones','issues'] as const).every(key => b[key].every(x => (this.resources![key] as unknown[]).some(y => JSON.stringify(x)===JSON.stringify(y)))) ? b : null;
-  }
-  async observeGenesisCi(_target:Target,head:string) {this.ciHeads.push(head);return this.ciReady;}
-  async observeGenesisPull(_target:Target,marker:string) {if (this.pull) expect(marker).toBe(this.marker);return this.pull && {...this.pull};}
-  async openGenesisPull(target:Target,marker:string) {
-    expect(this.pull).toBeNull();this.marker=marker;this.opens++;this.events.push('open');
-    this.pull={number:1,headSha:(await this.observeBranch(target,'genesis'))!.headSha,baseSha:(await this.observeBranch(target,'main'))!.headSha,merged:false,mergeCommitSha:null};
-  }
-  async mergeGenesisPull(target:Target,pull:GenesisPull,workflows:readonly {checkName:string}[]) {
-    const fake = this;const bare=this.repository(target.owner,target.name)!.bare;
-    const client:GitHubClient = {async request<T>(method:string,path:string,body?:unknown):Promise<T> {
-      let answer:unknown;
-      if (method === 'PUT') {
-        expect(path).toBe('/repos/acme/fixture/pulls/1/merge');expect(body).toEqual({sha:pull.headSha,merge_method:'merge'});
-        const tree=(await git(bare,['rev-parse',pull.headSha+'^{tree}'])).stdout.trim();
-        const sha=(await git(bare,['-c','user.name=GitHub','-c','user.email=github@local','commit-tree',tree,'-p',pull.baseSha,'-p',pull.headSha,'-m','Merge genesis PR'])).stdout.trim();
-        await git(bare,['update-ref','refs/heads/main',sha,pull.baseSha]);fake.pull={...pull,merged:true,mergeCommitSha:sha};fake.merges++;fake.events.push('merge');answer={merged:true,sha};
-      } else if (path.endsWith('/pulls/1')) answer={state:fake.pull!.merged ? 'closed':'open',merged:fake.pull!.merged,head:{ref:'genesis',sha:pull.headSha,repo:{full_name:'acme/fixture'}},base:{ref:'main',sha:pull.baseSha},merge_commit_sha:fake.pull!.mergeCommitSha};
-      else if (path.endsWith('/branches/main/protection')) {const p=await fake.observeBranchProtection(target,'main');answer={allow_force_pushes:{enabled:p!.allowForcePushes},allow_deletions:{enabled:p!.allowDeletions},enforce_admins:{enabled:p!.enforceAdmins},required_status_checks:p!.requiredStatusChecks};}
-      else if (path.includes('/check-runs')) answer={check_runs:workflows.map(w=>({name:w.checkName,head_sha:pull.headSha,status:'completed',conclusion:fake.ciReady ? 'success':'failure',app:{slug:'github-actions'}}))};
-      else if (path.endsWith('/git/ref/heads/main')) answer={object:{sha:(await fake.observeBranch(target,'main'))!.headSha}};
-      else if (path.includes('/git/commits/')) {const parents=(await git(bare,['rev-list','--max-count=1','--parents',path.split('/').at(-1)!])).stdout.trim().split(/\s+/).slice(1);answer={parents:parents.map(sha=>({sha}))};}
-      else throw new Error('unexpected kernel request '+method+' '+path);
-      return answer as T;
-    }};
-    await mergeBootstrapGenesis(client,{...target,repo:target.name,pullNumber:pull.number,headSha:pull.headSha,baseSha:pull.baseSha,requiredChecks:workflows.map(w=>w.checkName)});
-  }
-}
+// The genesis fixtures, with CI checks that carry real Actions provenance (review V52-R1-02).
+const file = genesisFile;
+const bundle = genesisBundle;
+const planFixture = genesisPlanFixture;
 describe('inline genesis bootstrap',() => {
   it('production composition refuses a legacy PLAN before it can launch a driven primary CTO',() => {
     const h = makeHarness({allowTestEvidenceWriters:false});
@@ -183,7 +119,7 @@ class FakeHost implements HostProjectProvisioner {
     if (op === 'ensure-checkout') return {checkout:{path:a.clonePath,origin:'https://github.com/acme/fixture.git',head:a.head,repositoryNodeId:a.repositoryNodeId}};
     if (op === 'ensure-buzz') return {buzz:{pubkey:'a'.repeat(64),roomId:this.actualRoomId ?? a.roomId,rosterVerified:true,nonceEventId:'b'.repeat(64),nonceReadable:true}};
     if (op === 'ensure-routing') return {routing:{generation:1,roomId:a.roomId}};
-    if (op === 'ensure-resident' || op === 'observe') return {...(op === 'observe' ? {checkout:{path:a.clonePath,origin:'https://github.com/acme/fixture.git',head:a.head,repositoryNodeId:a.repositoryNodeId}} : {}),resident:{pid:12345,startedAt:'start',cwd:a.clonePath,sessionUuid:a.sessionUuid,tmuxName:a.tmuxName,tmuxAncestry:true,bridgeSessionId:'rc'}};
+    if (op === 'ensure-resident' || op === 'observe') return {checkout:{path:a.clonePath,origin:'https://github.com/acme/fixture.git',head:a.head,repositoryNodeId:a.repositoryNodeId},resident:{pid:12345,startedAt:'start',cwd:a.clonePath,sessionUuid:a.sessionUuid,tmuxName:a.tmuxName,tmuxAncestry:true,bridgeSessionId:'rc'}};
     return {retired:true};
   }
 }

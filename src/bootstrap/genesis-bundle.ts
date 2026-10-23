@@ -19,11 +19,26 @@ export const genesisBundleSchema = z.object({
 export type GenesisBundle = z.infer<typeof genesisBundleSchema>;
 export const bytesDigest = (bytes: Uint8Array): string => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 // Never include the matching bytes in an error, audit event or subprocess output.
+// Besides the generic shapes, this covers the Buzz/Nostr identity key the resident provisioner itself
+// writes: 64 hex characters in `~/.hermes/bridge/keys/cto-<project>.priv` and in `BUZZ_PRIVATE_KEY`,
+// assigned under any key-like name (quoted JSON/YAML keys included), as its bech32 `nsec1` form, or as a
+// text that is nothing but that key, which is what a copied `.priv` file is.
+const CREDENTIAL_SHAPES = [
+  /-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----/i,
+  /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|sk-(?:proj-)?[A-Za-z0-9_-]{20,})\b/i,
+  /(?:password|passwd|api[_-]?key|secret(?:[_-]?key)?|priv(?:ate)?[_-]?key|access[_-]?token)["']?\s*[:=]\s*["']?[^\s"']{8,}/i,
+  /\bnsec1[a-z0-9]{20,}/i,
+  /^\s*[0-9a-fA-F]{64}\s*$/,
+];
 export function screenPublicText(value: string): void {
-  if (/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|sk-(?:proj-)?[A-Za-z0-9_-]{20,})\b|(?:password|passwd|api[_-]?key|secret|access[_-]?token)\s*[:=]\s*["']?[^\s"']{8,}/i.test(value)) {
+  if (CREDENTIAL_SHAPES.some(shape => shape.test(value))) {
     throw new Error('credential-shaped content refused before publication');
   }
 }
+/** Every string a public sink receives, each screened on its own so a whole-value shape is seen. */
+const publicStrings = (value: unknown): string[] =>
+  typeof value === 'string' ? [value] : Array.isArray(value) ? value.flatMap(publicStrings)
+    : value !== null && typeof value === 'object' ? Object.values(value).flatMap(publicStrings) : [];
 export function parseGenesis(value: unknown, manifest?: ProjectManifest): GenesisBundle {
   const bundle = genesisBundleSchema.parse(value);
   const paths = new Set<string>();
@@ -38,7 +53,9 @@ export function parseGenesis(value: unknown, manifest?: ProjectManifest): Genesi
     screenPublicText(bytes.toString('utf8'));
   }
   for (const p of paths) for (const q of paths) if (q.startsWith(`${p}/`)) throw new Error('genesis file/directory collision');
-  screenPublicText(JSON.stringify({ ...bundle, files: [] }));
+  const metadata = { ...bundle, files: bundle.files.map(f => f.path) };
+  screenPublicText(JSON.stringify(metadata));
+  for (const value of publicStrings(metadata)) screenPublicText(value);
   for (const key of ['labels', 'milestones', 'issues'] as const) {
     const values = bundle[key].map(x => 'key' in x ? x.key : x.name);
     if (new Set(values).size !== values.length) throw new Error(`duplicate genesis ${key}`);

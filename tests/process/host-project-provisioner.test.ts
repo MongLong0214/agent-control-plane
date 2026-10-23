@@ -1,5 +1,5 @@
 import { afterAll, expect, it } from 'vitest';
-import { mkdirSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -22,7 +22,7 @@ const out = x => process.stdout.write(typeof x === 'string' ? x : JSON.stringify
 const save = () => fs.writeFileSync(stateFile,JSON.stringify(s));
 const value = f => args[args.indexOf(f)+1];
 if(cmd === 'gh') out('R_node');
-else if(cmd === 'git') { if(args[0] === 'clone') fs.mkdirSync(path.join(a.clonePath,'.git'),{recursive:true}); else if(args[0] === 'remote') out(s.badOrigin ? 'https://github.com/other/repo.git' : 'https://github.com/acme/fixture.git'); else if(args[0] === 'cat-file') out('commit'); else process.exit(2); }
+else if(cmd === 'git') { if(args[0] === 'clone') fs.mkdirSync(path.join(a.clonePath,'.git'),{recursive:true}); else if(args[0] === 'remote') out(s.badOrigin ? 'https://github.com/other/repo.git' : 'https://github.com/acme/fixture.git'); else if(args[0] === 'cat-file') out('commit'); else if(args[0] === 'rev-parse') out(a.head); else if(args[0] === 'symbolic-ref') out('dev'); else if(args[0] === 'status') out(fs.existsSync(path.join(a.clonePath,'dirty.txt')) ? '?? dirty.txt\\n' : ''); else process.exit(2); }
 else if(cmd === 'docker') out('{}');
 else if(cmd === 'claude') {if(args[0] !== 'mcp') process.exit(2);if(args[1] === 'add') {s.mcp=true;s.mcpUuid=a.sessionUuid;} else if(args[1] === 'remove') {s.mcp=false;s.mcpRemovals=(s.mcpRemovals||0)+1;} else if(!s.mcp) process.exit(1);else out('acp-cto agentctl attach resident-cto --claimed-session-id '+s.mcpUuid+' --project-id test');}
 else if(cmd === 'tmux') {
@@ -55,7 +55,9 @@ save();
     return JSON.parse(stdout) as Record<string,unknown>;
   };
   await invoke('ensure-checkout');
-  writeFileSync(join(a.clonePath,'dirty.txt'),'owner edits');await invoke('ensure-checkout');expect(readFileSync(join(a.clonePath,'dirty.txt'),'utf8')).toBe('owner edits');
+  // A dirty checkout is never ready, and is never reset: the edits stay until a person settles them.
+  writeFileSync(join(a.clonePath,'dirty.txt'),'owner edits');await expect(invoke('ensure-checkout')).rejects.toThrow('uncommitted changes');expect(readFileSync(join(a.clonePath,'dirty.txt'),'utf8')).toBe('owner edits');
+  rmSync(join(a.clonePath,'dirty.txt'));await invoke('ensure-checkout');
   const initial = JSON.parse(readFileSync(join(home,'fake.json'),'utf8'));initial.badOrigin=true;writeFileSync(join(home,'fake.json'),JSON.stringify(initial));await expect(invoke('ensure-checkout')).rejects.toThrow();initial.badOrigin=false;writeFileSync(join(home,'fake.json'),JSON.stringify(initial));
   if(recovery === 'lost-response-after-create') {
     const saved=JSON.parse(readFileSync(join(home,'fake.json'),'utf8'));saved.loseCreate=true;writeFileSync(join(home,'fake.json'),JSON.stringify(saved));
@@ -87,6 +89,7 @@ save();
   await new Promise<void>((resolve,reject) => {execFile(process.execPath,[recoveryScript],{env:{...process.env,HOME:home,ACP_STATE_DIR:state,ACP_HOST_PROJECT_PROVISIONER:script,PATH:bin+':'+process.env.PATH,TEST_CLAUDE_PID:String(process.pid)},timeout:30_000},error=>error ? reject(error) : resolve());});
   expect(readFileSync(join(state,'resident-test.sh'),'utf8')).toContain('--resume');
   const recovered = JSON.parse(readFileSync(join(home,'fake.json'),'utf8'));expect(recovered.launches).toBe(2);recovered.launched=false;recovered.pane=false;writeFileSync(join(home,'fake.json'),JSON.stringify(recovered));
+  writeFileSync(join(a.clonePath,'dirty.txt'),'owner edits');
   expect(await invoke('retire')).toMatchObject({retired:true,retirementArchivePath:join(home,'projects','.retired','fixture-test')});
   expect(readFileSync(join(home,'projects','.retired','fixture-test','dirty.txt'),'utf8')).toBe('owner edits');
   expect(JSON.parse(readFileSync(join(home,'.hermes','bridge','required-mentions.json'),'utf8')).channels[a.roomId].status).toBe('retired');

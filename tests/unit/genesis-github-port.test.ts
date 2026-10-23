@@ -7,7 +7,8 @@ const target={owner:'acme',name:'fixture'};
 const head='a'.repeat(40), base='b'.repeat(40), merge='c'.repeat(40);
 const workflow='name: ci\n';
 const workflows=[{path:'.github/workflows/ci.yml',checkName:'test',approvedDigest:bytesDigest(Buffer.from(workflow))}];
-const check=(sha=head,conclusion='success')=>({name:'test',head_sha:sha,status:'completed',conclusion,app:{slug:'github-actions'}});
+// Review V52-R1-02 — each check names its Actions suite and job; the fixture answers both at the head.
+const check=(sha=head,conclusion='success')=>({id:7,name:'test',head_sha:sha,status:'completed',conclusion,app:{slug:'github-actions'},check_suite:{id:9},details_url:'https://github.com/acme/fixture/actions/runs/11/job/7'});
 const protection={allow_force_pushes:{enabled:false},allow_deletions:{enabled:false},enforce_admins:{enabled:true},required_status_checks:{strict:true,contexts:['test']}};
 const pr={number:1,body:'marker',state:'open',merged:false,merged_at:null,merge_commit_sha:null as string|null,head:{ref:'genesis',sha:head,repo:{full_name:'acme/fixture'}},base:{ref:'main',sha:base}};
 function fixture() {
@@ -23,6 +24,8 @@ function fixture() {
     else if(p.includes('/check-runs')) answer={check_runs:state.checks};
     else if(p.includes('/contents/')) answer={encoding:'base64',content:Buffer.from(workflow).toString('base64')};
     else if(p.includes('/git/commits/')) answer={parents:state.parents.map(sha=>({sha}))};
+    else if(p.includes('/check-suites/9')) answer={head_sha:head,app:{slug:'github-actions'}};
+    else if(p.includes('/actions/runs/11')) answer={head_sha:head,path:'.github/workflows/ci.yml',status:'completed',conclusion:'success'};
     else if(p.endsWith('/git/ref/heads/main')) answer={object:{sha:state.main}};
     else throw new Error('unexpected '+method+' '+path);
     return answer as T;
@@ -49,7 +52,7 @@ describe('genesis production GitHub port and kernel',()=>{
     if(fault==='weak-protection') f.state.protection={...protection,enforce_admins:{enabled:false}};
     if(fault==='moved-main') f.state.main=merge;
     if(fault==='wrong-pr-head') f.state.pull={...pr,head:{...pr.head,sha:base}};
-    await expect(mergeBootstrapGenesis(f.client,{owner:'acme',repo:'fixture',pullNumber:1,headSha:head,baseSha:base,requiredChecks:['test']})).rejects.toThrow();
+    await expect(mergeBootstrapGenesis(f.client,{owner:'acme',repo:'fixture',pullNumber:1,headSha:head,baseSha:base,workflows})).rejects.toThrow();
     expect(f.calls.filter(c=>c.method==='PUT')).toHaveLength(0);
   });
   it('refuses a merge acknowledgement whose parents do not prove a merge onto autoInit main',async()=>{

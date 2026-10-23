@@ -1,5 +1,4 @@
-import { mergeBootstrapGenesis } from '../github/github-kernel.ts';
-import { bytesDigest } from './genesis-bundle.ts';
+import { mergeBootstrapGenesis, observeApprovedWorkflowChecks } from '../github/github-kernel.ts';
 import type { GenesisBundle } from './genesis-bundle.ts';
 import { spawn } from "node:child_process";
 
@@ -422,20 +421,15 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
       await client.request("POST",`${repoPath(target)}/pulls`,{head:"genesis",base:"main",title:"Bootstrap genesis",body:marker});
     },
     async mergeGenesisPull(target,pull,workflows) {
-      await mergeBootstrapGenesis(client,{owner:target.owner,repo:target.name,pullNumber:pull.number,headSha:pull.headSha,baseSha:pull.baseSha,requiredChecks:workflows.map(w => w.checkName)});
+      await mergeBootstrapGenesis(client,{owner:target.owner,repo:target.name,pullNumber:pull.number,headSha:pull.headSha,baseSha:pull.baseSha,workflows});
     },
     async observeGenesisCi(target,head,workflows) {
+      // The same suite -> Actions run -> workflow path -> exact-head digest proof the kernel's merges
+      // use: a successful check of the right name proves nothing until the approved workflow made it.
       for (let attempt = 0; attempt < 30; attempt++) {
-        const checks = await client.request<{check_runs:Array<{name:string;head_sha:string;conclusion:string|null;status:string;app:{slug:string}}>}>('GET',`${repoPath(target)}/commits/${head}/check-runs?per_page=100`);
-        let ready = true;
-        for (const workflow of workflows) {
-          const matching = checks.check_runs.filter(c => c.name === workflow.checkName && c.head_sha === head && c.app?.slug === 'github-actions');
-          if (matching.some(c => c.status === 'completed' && c.conclusion !== 'success')) return false;
-          if (!matching.length || matching.some(c => c.status !== 'completed' || c.conclusion !== 'success')) ready = false;
-          const file = await client.request<{content:string;encoding:string}>('GET',`${repoPath(target)}/contents/${workflow.path}?ref=${head}`);
-          if (file.encoding !== 'base64' || bytesDigest(Buffer.from(file.content.replace(/\s/g,''),'base64')) !== workflow.approvedDigest) return false;
-        }
-        if (ready) return true;
+        const checks = await observeApprovedWorkflowChecks(client,{root:repoPath(target),owner:target.owner,repo:target.name,head,workflows});
+        if (checks.state === 'success') return true;
+        if (checks.state === 'refused') return false;
         if (attempt < 29) await new Promise(resolve => setTimeout(resolve,1000));
       }
       return false;

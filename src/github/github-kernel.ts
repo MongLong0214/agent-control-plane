@@ -3924,70 +3924,21 @@ export class GitHubKernel {
         { checkRunId: check.id, checkName: check.name, path: workflow.path },
       );
     }
-    if (!workflow?.approvedDigest || check.head_sha !== head || check.app?.slug !== "github-actions") {
-      return deny(ReasonCode.GATE_CREATOR_UNTRUSTED, "check has no approved Actions workflow provenance", {
-        checkRunId: check.id,
-        checkName: check.name,
-      });
-    }
-    const suiteId = check.check_suite?.id;
-    const runIdFromUrl = /\/actions\/runs\/(\d+)\/job\/\d+/.exec(check.details_url ?? "")?.[1];
-    if (!suiteId || !runIdFromUrl) {
-      return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "check does not identify an Actions job and suite", {
-        checkRunId: check.id,
-      });
-    }
-    const slug = this.slug(repositoryIdentity);
-    if (!slug.allowed) return slug as Decision<{ workflowDigest: string }>;
-    const { owner, repo } = slug.value;
-    try {
-      const [suite, run] = await Promise.all([
-        this.api().request<{ head_sha: string; app?: { slug?: string } | null }>(
-          "GET",
-          `/repos/${owner}/${repo}/check-suites/${suiteId}`,
-        ),
-        this.api().request<{ head_sha: string; path?: string; status?: string; conclusion?: string | null }>(
-          "GET",
-          `/repos/${owner}/${repo}/actions/runs/${runIdFromUrl}`,
-        ),
-      ]);
-      if (
-        suite.head_sha !== head ||
-        suite.app?.slug !== "github-actions" ||
-        run.head_sha !== head ||
-        run.path !== workflow.path ||
-        run.status !== "completed" ||
-        run.conclusion !== "success"
-      ) {
-        return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "Actions suite or run differs from the required check", {
-          checkRunId: check.id,
-          suiteHead: suite.head_sha,
-          runHead: run.head_sha,
-          runPath: run.path ?? null,
-        });
-      }
-      const content = await this.workflowContentAtExactHead(
-        repositoryIdentity,
-        owner,
-        repo,
-        head,
-        workflow.path,
-      );
-      if (!content.allowed) return content as Decision<{ workflowDigest: string }>;
-      const workflowDigest = sha256(content.value);
-      return workflowDigest === workflow.approvedDigest
-        ? allow(ReasonCode.OK, { workflowDigest })
-        : deny(ReasonCode.VERIFICATION_CI_WORKFLOW_DIGEST_MISMATCH, "Actions workflow differs from pinned approval", {
-            checkRunId: check.id,
-            expected: workflow.approvedDigest,
-            observed: workflowDigest,
-          });
-    } catch (err) {
-      return deny(ReasonCode.PROBE_FAILED, "could not resolve Actions provenance for check", {
-        checkRunId: check.id,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    return proveActionsCheckProvenance(this.api(), {
+      head,
+      check,
+      workflow: workflow ?? null,
+      root: () => {
+        const slug = this.slug(repositoryIdentity);
+        return slug.allowed
+          ? allow(ReasonCode.OK, { root: `/repos/${slug.value.owner}/${slug.value.repo}`, ...slug.value })
+          : (slug as Decision<never>);
+      },
+      workflowDigest: async ({ owner, repo }, path) => {
+        const content = await this.workflowContentAtExactHead(repositoryIdentity, owner, repo, head, path);
+        return content.allowed ? allow(ReasonCode.OK, sha256(content.value)) : (content as Decision<never>);
+      },
+    });
   }
 
   /**
@@ -4782,23 +4733,185 @@ export class GitHubKernel {
   }
 }
 
+/** One approved Actions workflow: the check it reports and the SHA-256 its bytes were approved at. */
+export interface ApprovedActionsWorkflow {
+  path: string;
+  checkName: string;
+  approvedDigest: string;
+}
+
+/**
+ * Trust an Actions check only after resolving the actual suite, Actions run and workflow path, at the
+ * exact head, and the workflow file's digest at that head. A check name and `github-actions` app slug
+ * are candidate-controlled: any workflow in the repository can report a check of any name, so only
+ * this chain proves that the approved workflow produced it. Normal kernel merges, the bootstrap
+ * genesis verification and the genesis merge all prove a check through this one function.
+ */
+export async function proveActionsCheckProvenance(
+  client: GitHubClient,
+  input: {
+    head: string;
+    check: CheckRun;
+    workflow: { path: string; approvedDigest?: string | null } | null;
+    /** The repository the check belongs to, resolved only once the check names a job and suite. */
+    root: () => Decision<{ root: string; owner: string; repo: string }>;
+    /** The digest of the workflow file's bytes at `head`, in the approval's own form. */
+    workflowDigest: (target: { owner: string; repo: string }, path: string) => Promise<Decision<string>>;
+  },
+): Promise<Decision<{ workflowDigest: string }>> {
+  const { head, check, workflow } = input;
+  if (!workflow?.approvedDigest || check.head_sha !== head || check.app?.slug !== "github-actions") {
+    return deny(ReasonCode.GATE_CREATOR_UNTRUSTED, "check has no approved Actions workflow provenance", {
+      checkRunId: check.id,
+      checkName: check.name,
+    });
+  }
+  const suiteId = check.check_suite?.id;
+  const runIdFromUrl = /\/actions\/runs\/(\d+)\/job\/\d+/.exec(check.details_url ?? "")?.[1];
+  if (!suiteId || !runIdFromUrl) {
+    return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "check does not identify an Actions job and suite", {
+      checkRunId: check.id,
+    });
+  }
+  const target = input.root();
+  if (!target.allowed) return target as Decision<{ workflowDigest: string }>;
+  const { root, owner, repo } = target.value;
+  try {
+    const [suite, run] = await Promise.all([
+      client.request<{ head_sha: string; app?: { slug?: string } | null }>("GET", `${root}/check-suites/${suiteId}`),
+      client.request<{ head_sha: string; path?: string; status?: string; conclusion?: string | null }>(
+        "GET",
+        `${root}/actions/runs/${runIdFromUrl}`,
+      ),
+    ]);
+    if (
+      suite.head_sha !== head ||
+      suite.app?.slug !== "github-actions" ||
+      run.head_sha !== head ||
+      run.path !== workflow.path ||
+      run.status !== "completed" ||
+      run.conclusion !== "success"
+    ) {
+      // The approved workflow's own run at this head, still finishing after this job completed, is
+      // the one difference a later read can clear; every other difference is a different producer.
+      const runIncomplete =
+        suite.head_sha === head && suite.app?.slug === "github-actions" && run.head_sha === head &&
+        run.path === workflow.path && run.status !== "completed";
+      return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "Actions suite or run differs from the required check", {
+        checkRunId: check.id,
+        suiteHead: suite.head_sha,
+        runHead: run.head_sha,
+        runPath: run.path ?? null,
+        ...(runIncomplete ? { runIncomplete: true } : {}),
+      });
+    }
+    const digest = await input.workflowDigest({ owner, repo }, workflow.path);
+    if (!digest.allowed) return digest as Decision<{ workflowDigest: string }>;
+    return digest.value === workflow.approvedDigest
+      ? allow(ReasonCode.OK, { workflowDigest: digest.value })
+      : deny(ReasonCode.VERIFICATION_CI_WORKFLOW_DIGEST_MISMATCH, "Actions workflow differs from pinned approval", {
+          checkRunId: check.id,
+          expected: workflow.approvedDigest,
+          observed: digest.value,
+        });
+  } catch (err) {
+    return deny(ReasonCode.PROBE_FAILED, "could not resolve Actions provenance for check", {
+      checkRunId: check.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/** What the required checks at one head say, once each is proven against its approved workflow. */
+export type ApprovedWorkflowChecks =
+  | { state: "success" }
+  | { state: "pending"; checkName: string }
+  | { state: "refused"; checkName: string | null; reasonCode: ReasonCode; message: string };
+
+/**
+ * #246 genesis — the required checks of a bootstrap's approved workflows at an exact head, before any
+ * project or run exists to pin a manifest: the reviewed PLAN supplies the workflows. Every check of a
+ * required name must be completed, successful and proven by `proveActionsCheckProvenance`; a same-name
+ * check from any other workflow or app, a failed lane, or a check that cannot be proven refuses. A
+ * name with no check yet, or one still running, is pending. Reads only.
+ */
+export async function observeApprovedWorkflowChecks(
+  client: GitHubClient,
+  input: { root: string; owner: string; repo: string; head: string; workflows: readonly ApprovedActionsWorkflow[] },
+): Promise<ApprovedWorkflowChecks> {
+  if (input.workflows.length === 0) {
+    return { state: "refused", checkName: null, reasonCode: ReasonCode.VERIFICATION_GAP, message: "no approved workflow is required" };
+  }
+  let pending: string | null = null;
+  for (const workflow of input.workflows) {
+    const checks: CheckRun[] = [];
+    for (let page = 1; ; page += 1) {
+      if (page > 10) {
+        return { state: "refused", checkName: workflow.checkName, reasonCode: ReasonCode.PROBE_FAILED, message: "check-run enumeration exceeded its bound" };
+      }
+      const query = new URLSearchParams({ check_name: workflow.checkName, per_page: "100", page: String(page) });
+      const listed = await client.request<{ check_runs?: CheckRun[] }>(
+        "GET",
+        `${input.root}/commits/${encodeURIComponent(input.head)}/check-runs?${query.toString()}`,
+      );
+      const runs = listed.check_runs ?? [];
+      checks.push(...runs);
+      if (runs.length < 100) break;
+    }
+    const matching = checks.filter((check) => check.name === workflow.checkName);
+    if (matching.some((check) => check.status === "completed" && check.conclusion !== "success")) {
+      return { state: "refused", checkName: workflow.checkName, reasonCode: ReasonCode.VERIFICATION_GAP, message: "a required check failed at this head" };
+    }
+    if (matching.length === 0 || matching.some((check) => check.status !== "completed")) {
+      pending ??= workflow.checkName;
+      continue;
+    }
+    for (const check of matching) {
+      const proven = await proveActionsCheckProvenance(client, {
+        head: input.head,
+        check,
+        workflow,
+        root: () => allow(ReasonCode.OK, { root: input.root, owner: input.owner, repo: input.repo }),
+        workflowDigest: async (_target, path) => {
+          const encoded = path.split("/").map(encodeURIComponent).join("/");
+          const file = await client.request<{ type?: string; encoding?: string; content?: string }>(
+            "GET",
+            `${input.root}/contents/${encoded}?ref=${encodeURIComponent(input.head)}`,
+          );
+          if ((file.type !== undefined && file.type !== "file") || file.encoding !== "base64" || typeof file.content !== "string") {
+            return deny(ReasonCode.PROBE_FAILED, "GitHub did not return the exact workflow file", { path, head: input.head });
+          }
+          // Approved over the file's exact bytes, as the genesis bundle's SHA-256 is.
+          return allow(ReasonCode.OK, sha256(Buffer.from(file.content.replace(/\s/g, ""), "base64")));
+        },
+      });
+      if (proven.allowed) continue;
+      if (proven.evidence["runIncomplete"] === true) {
+        pending ??= workflow.checkName;
+        continue;
+      }
+      return { state: "refused", checkName: workflow.checkName, reasonCode: proven.reasonCode, message: proven.message };
+    }
+  }
+  return pending === null ? { state: "success" } : { state: "pending", checkName: pending };
+}
+
 /** Bootstrap has no activated project yet. Its reviewed PLAN supplies this narrowly scoped
- * merge contract; it uses the same GitHub client, exact-head merge API and parent proof as
- * normal kernel merges. The caller persists intent before entry and reconciles the PR after. */
-export async function mergeBootstrapGenesis(client:GitHubClient, input:{owner:string;repo:string;pullNumber:number;headSha:string;baseSha:string;requiredChecks:readonly string[]}):Promise<void> {
+ * merge contract; it uses the same GitHub client, exact-head merge API, parent proof and Actions
+ * workflow provenance as normal kernel merges. The caller persists intent before entry and
+ * reconciles the PR after. */
+export async function mergeBootstrapGenesis(client:GitHubClient, input:{owner:string;repo:string;pullNumber:number;headSha:string;baseSha:string;workflows:readonly ApprovedActionsWorkflow[]}):Promise<void> {
   const root = `/repos/${input.owner}/${input.repo}`;
+  const requiredChecks = input.workflows.map(workflow => workflow.checkName);
   const pull = await client.request<{state:string;merged:boolean;head:{ref:string;sha:string;repo:{full_name:string}};base:{ref:string;sha:string};merge_commit_sha:string|null}>("GET",`${root}/pulls/${input.pullNumber}`);
   if (pull.head.ref !== "genesis" || pull.head.sha !== input.headSha || pull.base.ref !== "main" || pull.head.repo.full_name.toLowerCase() !== `${input.owner}/${input.repo}`.toLowerCase()) throw new Error("genesis merge target/head drift");
   let mergeSha = pull.merge_commit_sha;
   if (!pull.merged) {
     if (pull.state !== "open" || pull.base.sha !== input.baseSha) throw new Error("genesis merge base drift");
     const protection = await client.request<{allow_force_pushes:{enabled:boolean};allow_deletions:{enabled:boolean};enforce_admins:{enabled:boolean};required_status_checks:{strict:boolean;contexts:string[]}}>("GET",`${root}/branches/main/protection`);
-    if (protection.allow_force_pushes?.enabled !== false || protection.allow_deletions?.enabled !== false || protection.enforce_admins?.enabled !== true || protection.required_status_checks?.strict !== true || canonicalCheckNames(protection.required_status_checks.contexts) !== canonicalCheckNames(input.requiredChecks)) throw new Error("genesis main protection drift");
-    const checks = await client.request<{check_runs:Array<{name:string;head_sha:string;status:string;conclusion:string;app:{slug:string}}>}>("GET",`${root}/commits/${input.headSha}/check-runs?per_page=100`);
-    if (!input.requiredChecks.length || input.requiredChecks.some(name => {
-      const matches = checks.check_runs.filter(c => c.name === name && c.head_sha === input.headSha && c.app?.slug === "github-actions");
-      return matches.length === 0 || matches.some(c => c.status !== "completed" || c.conclusion !== "success");
-    })) throw new Error("genesis exact-head CI refused");
+    if (protection.allow_force_pushes?.enabled !== false || protection.allow_deletions?.enabled !== false || protection.enforce_admins?.enabled !== true || protection.required_status_checks?.strict !== true || canonicalCheckNames(protection.required_status_checks.contexts) !== canonicalCheckNames(requiredChecks)) throw new Error("genesis main protection drift");
+    const checks = await observeApprovedWorkflowChecks(client, { root, owner: input.owner, repo: input.repo, head: input.headSha, workflows: input.workflows });
+    if (checks.state !== "success") throw new Error("genesis exact-head CI refused");
     const ref = await client.request<{object:{sha:string}}>("GET",`${root}/git/ref/heads/main`);
     if (ref.object.sha !== input.baseSha) throw new Error("genesis main moved before merge");
     const response = await client.request<{merged:boolean;sha:string}>("PUT",`${root}/pulls/${input.pullNumber}/merge`,{sha:input.headSha,merge_method:"merge"});

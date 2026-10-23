@@ -62,7 +62,16 @@ export class ResidentProjectProvisioning {
       if (a.projectId !== input.projectId || a.repositoryIdentity !== input.repositoryIdentity || a.repositoryNodeId !== input.repositoryNodeId || a.head !== input.head) throw new Error('provisioning resource conflict');
       const observations:HostObservation = {};
       // Every retry inspects the same allocation. Volatile observations never survive as readiness.
-      Object.assign(observations,await this.step('ensure-checkout',a,input.packet));
+      // Review V52-R1-03 — the host reports Git's own HEAD; activation needs the clone exactly at the
+      // approved head in every readback, and never resets it there. The host itself refuses a dirty or
+      // detached clone, and for ensure-checkout and observe one not attached to dev.
+      const bootstrapCheckout = (observed:HostObservation, step:HostOperation):void => {
+        const checkout = observed.checkout;
+        if (!checkout || checkout.path !== a!.clonePath || checkout.repositoryNodeId !== a!.repositoryNodeId || checkout.head !== a!.head) throw new Error(`${step} checkout readback is not the approved genesis head`);
+      };
+      const checkedOut = await this.step('ensure-checkout',a,input.packet);
+      bootstrapCheckout(checkedOut,'ensure-checkout');
+      Object.assign(observations,checkedOut);
       Object.assign(observations,await this.step('ensure-buzz',a,input.packet));
       if (!observations.buzz) throw new Error('dedicated Buzz room not verified');
       const binding = (JSON.parse(this.row(input.runId)!.steps_json) as {roomBinding?:{roomId:string}}).roomBinding;
@@ -76,8 +85,11 @@ export class ResidentProjectProvisioning {
       this.db.run(`UPDATE projects SET buzz_address = ? WHERE project_id = ? AND retired_at IS NULL`,[a.roomId,a.projectId]);
       if (!this.#subscriberConfigured) throw new Error("subscriber and canonical tools are not configured yet");
       await this.#reconcile(a,pk); // configure before launch; admission waits for the canonical claim
-      Object.assign(observations,await this.step('ensure-resident',a,input.packet));
+      const launched = await this.step('ensure-resident',a,input.packet);
+      bootstrapCheckout(launched,'ensure-resident');
+      Object.assign(observations,launched);
       const latest = await this.step('observe',a);
+      bootstrapCheckout(latest,'observe');
       delete observations.resident; delete observations.checkout;
       Object.assign(observations,latest);
       const resident = latest.resident;
