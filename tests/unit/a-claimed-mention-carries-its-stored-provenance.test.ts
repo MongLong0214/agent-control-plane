@@ -16,6 +16,7 @@ import {
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import { RoleConversationPort, type OwnerMessageHandover } from "../../src/mcp/role-conversation.ts";
+import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { channelKey, type ChannelKey, steppedClock, storingRelay, writeSubscriberConfig } from "../helpers/buzz-mention-relay.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -220,7 +221,7 @@ describe("a claimed mention's provenance", () => {
       // A raw writer rewrites the source row's actor: the column carries no trigger and no digest.
       f.h.cp.db.run(`UPDATE inbound_messages SET actor = ? WHERE channel = 'buzz' AND nonce = ?`, [
         f.secondOwner.pubkey,
-        `buzz-message:${event.id}`,
+        buzzMessageNonce(event.id, ROLE_KEY),
       ]);
 
       const claimed = f.claim();

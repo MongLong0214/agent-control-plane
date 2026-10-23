@@ -121,8 +121,8 @@ const start = async (options: { logicBound: boolean }) => {
       ),
     admittedRow: (eventId: string) =>
       h.cp.db.get<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
-        [buzzMessageNonce(eventId)],
+        `SELECT COUNT(*) AS n FROM inbound_messages WHERE channel = 'buzz' AND (nonce = ? OR json_extract(payload_json, '$.sourceEventId') = ?)`,
+        [buzzMessageNonce(eventId), eventId],
       )!.n,
     close: async () => {
       subscriber.close();
@@ -220,10 +220,9 @@ describe("re-judgement through the binding registry's own switch events", () => 
       await f.relay.drain(f.subscriber);
 
       const rows = f.ownerMessages().filter((row) => row.role_key === roleKey);
-      expect(rows.map((row) => row.target_session_id)).toEqual([f.sessions.repoFactory, next]);
-      // The mention sent while revoked was signed before the new binding existed, and the seam's
-      // floor refuses it for that binding: it reached neither session.
-      expect(f.admittedRow(whileRevoked.id)).toBe(0);
+      expect(rows.map((row) => row.target_session_id)).toEqual([next, next, next]);
+      // The stable role retains the mail signed while its holder was unavailable.
+      expect(f.admittedRow(whileRevoked.id)).toBe(1);
       expect(f.changes).toEqual(["identities[1]:EXCLUDED:NO_SINGLE_MENTIONABLE_ROLE", `identities[1]:ADMITTED:${roleKey}`]);
     } finally {
       await f.close();

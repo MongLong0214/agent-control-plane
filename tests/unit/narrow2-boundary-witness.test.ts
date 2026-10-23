@@ -31,13 +31,14 @@ it.each(["takeover", "runtime-move"] as const)("NARROW2: %s refuses bytes that h
 it.each(["selecting read", "moving write"] as const)("NARROW2: the shared SQL %s refuses deep repeated keys", (layer) => {
   const db = new Database(":memory:");
   try {
-    db.exec(`CREATE TABLE outbox (message_id TEXT, payload_json TEXT);
-      CREATE TABLE holder_message_departures (message_id TEXT);
-      CREATE TABLE holder_message_source_departures (source_channel TEXT, source_nonce TEXT, reason TEXT);`);
+    db.exec(`CREATE TABLE outbox (message_id TEXT, payload_json TEXT, status TEXT DEFAULT 'PENDING');
+      CREATE TABLE holder_message_departures (message_id TEXT, to_status TEXT);
+      CREATE TABLE holder_message_terminals (message_id TEXT);
+      CREATE TABLE holder_message_source_departures (source_channel TEXT, source_nonce TEXT, reason TEXT, message_id TEXT);`);
     const payload = '{"deep":' + "[".repeat(1001) + '{"k":1,"k":2}' + "]".repeat(1001) + "}";
     expect(() => JSON.parse(payload)).not.toThrow();
     expect(db.prepare("SELECT json_valid(?) AS valid").get(payload)).toEqual({ valid: 0 });
-    db.prepare("INSERT INTO outbox VALUES (?, ?)").run("narrow2-deep", payload);
+    db.prepare("INSERT INTO outbox (message_id, payload_json) VALUES (?, ?)").run("narrow2-deep", payload);
     if (layer === "selecting read") {
       expect(db.prepare(`SELECT ${handOverEligibleSql("o")} AS eligible FROM outbox o`).get())
         .toEqual({ eligible: 0 });

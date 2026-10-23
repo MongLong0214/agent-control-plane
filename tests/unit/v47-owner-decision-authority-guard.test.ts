@@ -402,11 +402,11 @@ describe("S1: the v46 → v47 step on the released v46 image", () => {
     expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: receiptsDigestBefore, ...restBefore } = before.tables;
     const { schema_migrations: receiptsDigestAfter, ...restAfter } = after.tables;
-    expect(restAfter).toEqual(restBefore);
+    expect(Object.fromEntries(Object.keys(restBefore).map((name) => [name, restAfter[name]]))).toEqual(restBefore);
     expect(receiptsDigestAfter).not.toBe(receiptsDigestBefore);
     expect(receiptsThrough46(path)).toEqual(receiptsBefore);
     // v48 (SEC-OD1) follows on the same approved chain and adds its four triggers, no row.
-    expect(triggersOf(path)).toEqual([...triggersBefore, GUARD, ...V48_ADDED_TRIGGERS].sort());
+    expect(triggersOf(path)).toEqual([...triggersBefore, GUARD, ...V48_ADDED_TRIGGERS, "buzz_events_no_replace", "buzz_events_immutable", "buzz_events_no_delete", "outbox_holder_message_terminal", "holder_message_terminals_immutable", "holder_message_terminals_no_delete", "holder_message_terminals_no_replace"].sort());
     const raw = new Database(path, { readonly: true });
     try {
       expect(raw.prepare("SELECT version, migration_id, checksum FROM schema_migrations WHERE version = 47").get()).toEqual({
@@ -727,7 +727,7 @@ describe("S4: an owner decision already claimed when the guard is first installe
     expect(after.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: _receiptsBefore, ...restBefore } = before.tables;
     const { schema_migrations: _receiptsAfter, ...restAfter } = after.tables;
-    expect(restAfter).toEqual(restBefore);
+    expect(Object.fromEntries(Object.keys(restBefore).map((name) => [name, restAfter[name]]))).toEqual(restBefore);
     expect(triggersOf(path)).toContain(GUARD);
     expect(receiptAt(path, 47)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });
     expect(storedAs(path, [...legacy, ...unread])).toEqual([...legacy, ...unread].map((r) => ({
@@ -769,7 +769,7 @@ describe("S4: an owner decision already claimed when the guard is first installe
     expect(upgraded.userVersion).toBe(SCHEMA_VERSION);
     const { schema_migrations: _receiptsBefore, ...restBefore } = before.tables;
     const { schema_migrations: _receiptsAfter, ...restAfter } = upgraded.tables;
-    expect(restAfter).toEqual(restBefore);
+    expect(Object.fromEntries(Object.keys(restBefore).map((name) => [name, restAfter[name]]))).toEqual(restBefore);
     new Db(path).close();
     expect(contentDigests(path)).toEqual(upgraded);
     expect(receiptAt(path, 47)).toEqual({ migration_id: "v47-owner-decision-authority-guard", checksum: V47_BASE_CHECKSUM });

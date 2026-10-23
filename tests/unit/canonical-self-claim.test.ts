@@ -392,7 +392,7 @@ const successorFixture = async () => {
   const first = await subject.claim(baseRequest(core, projectId));
   if (!first.allowed) throw new Error(JSON.stringify(first));
   const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
-  // Admit against the original ACTIVE holder; revoke preserves bytes but terminally rejects delivery.
+  // Admit against the original ACTIVE holder; revoke preserves unread role mail.
   const envelope = { idempotencyKey: "owner-late", roleKey, bindingGeneration: 1,
     targetSessionId: first.value.sessionId, kind: MessageKind.OWNER_MESSAGE,
     payload: { text: "original owner envelope", nonce: "original-nonce" },
@@ -402,11 +402,9 @@ const successorFixture = async () => {
   const pendingBeforeRevoke = core.db.all<Record<string, unknown>>(`SELECT * FROM outbox`);
   expect(pendingBeforeRevoke).toEqual([expect.objectContaining({ status: "PENDING" })]);
   expect(core.bindings.revoke(roleKey, "lost attachment").allowed).toBe(true);
-  // Recovery starts after revoke: preserve its terminal refusal, never resurrect PENDING.
+  // A temporary loss of attachment leaves the original durable delivery pending.
   const beforeRecovery = core.db.all(`SELECT * FROM outbox`);
-  expect(beforeRecovery).toEqual(pendingBeforeRevoke.map((row) => ({
-    ...row, status: "REJECTED", reason_code: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
-  })));
+  expect(beforeRecovery).toEqual(pendingBeforeRevoke);
   expect(core.outbox.enqueue({ ...envelope, idempotencyKey: "owner-after-revoke" })).toMatchObject({
     allowed: false, reasonCode: ReasonCode.OUTBOX_TARGET_NOT_CURRENT,
   });
@@ -448,11 +446,15 @@ const expectDurablyRolledBack = (
 describe("same-live successor transaction", () => {
   it("same-live recovery concurrent claims have exactly one winner", async () => {
     const { core, subject, request, first } = await successorFixture();
-    const envelopeBefore = core.db.all(`SELECT * FROM outbox`);
+    const envelopeBefore = core.db.all<Record<string, unknown>>(`SELECT * FROM outbox`);
     expect(envelopeBefore).toHaveLength(1);
     const before = rowCounts(core);
     const results = await Promise.all([subject.claim(request), subject.claim(request)]);
-    expect(core.db.all(`SELECT * FROM outbox`)).toEqual(envelopeBefore);
+    const winner = results.find((result) => result.allowed)!;
+    if (!winner.allowed) throw new Error("no recovery winner");
+    expect(core.db.all(`SELECT * FROM outbox`)).toEqual(envelopeBefore.map((row) => ({ ...row,
+      binding_generation: 2, target_session_id: winner.value.sessionId, reason_code: ReasonCode.OUTBOX_RETARGETED,
+    })));
     expect(results.filter((r) => r.allowed)).toHaveLength(1);
     expect(results.filter((r) => !r.allowed)).toHaveLength(1);
     expect(rowCounts(core).sessions).toBe(before.sessions + 1);
@@ -466,7 +468,7 @@ describe("same-live successor transaction", () => {
     "same-live recovery rollback after real %s callee restores every table and approval", async (stage) => {
       const { core, subject, request } = await successorFixture();
       const before = durableSnapshot(core);
-      const envelopeBefore = core.db.all(`SELECT * FROM outbox`);
+      const envelopeBefore = core.db.all<Record<string, unknown>>(`SELECT * FROM outbox`);
       const refusal = deny<never>(ReasonCode.CONFLICT, "injected after real callee", {});
       let invoked = false;
       const transition = core.sessions.transition.bind(core.sessions);
@@ -506,8 +508,12 @@ describe("same-live successor transaction", () => {
         expect(invoked).toBe(true);
         expectDurablyRolledBack(core, before, refused);
       } finally { spies.forEach((spy) => spy.mockRestore()); }
-      expect((await subject.claim(request)).allowed).toBe(true);
-      expect(core.db.all(`SELECT * FROM outbox`)).toEqual(envelopeBefore);
+      const recovered = await subject.claim(request);
+      expect(recovered.allowed).toBe(true);
+      if (!recovered.allowed) throw new Error(recovered.message);
+      expect(core.db.all(`SELECT * FROM outbox`)).toEqual(envelopeBefore.map((row) => ({ ...row,
+        binding_generation: 2, target_session_id: recovered.value.sessionId, reason_code: ReasonCode.OUTBOX_RETARGETED,
+      })));
     },
   );
 

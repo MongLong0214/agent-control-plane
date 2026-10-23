@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
+import { outboxDeliveryReadback } from "../outbox/outbox.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
 import { RECONCILE_SWEEP_BUDGET_MS } from "../conversation/turn-coordinator.ts";
@@ -854,7 +855,7 @@ export class Daemon {
             humanGate: this.cp.ceo.humanGateStatus(runId.value),
             outbox: this.cp.outbox.listByRun(runId.value).map((message) => ({
               kind: message.kind,
-              status: message.status,
+              ...outboxDeliveryReadback(message),
               bindingGeneration: message.bindingGeneration,
             })),
           });
@@ -3010,9 +3011,6 @@ export class Daemon {
     if (this.options.buzz) {
       const delivery = setInterval(() => {
         void this.runPeriodic("buzz_delivery", async () => {
-          // Rows `deliverPending` withholds as in band are woken for instead, at most once per row
-          // per window; this never throws, so it cannot turn a good delivery tick into a failure.
-          await this.cp.outbox.wakeInBandPending();
           const result = await this.options.buzz!.deliverPending();
           if (result.failed.length > 0) {
             throw new Error(`delivery failed for ${result.failed.length} outbox message(s)`);
@@ -3425,6 +3423,7 @@ export class Daemon {
         blockedPostMerge: this.cp.runs.list({ state: RunState.BLOCKED_POST_MERGE }).length,
       },
       lastReconcile: reconcile,
+      outbox: this.cp.outbox.deliveryReadback(),
       // #734 — freshness-bounded, recomputed against the live clock on every write rather than
       // read back from whatever was last persisted. A caller that never advances the doctor
       // still gets a correct answer here: age is derived from `checkedAt`, not cached.

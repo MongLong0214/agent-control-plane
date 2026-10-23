@@ -1112,6 +1112,7 @@ describe("baseline boundary contracts", () => {
       "v48-owner-decision-supersede-guard",
       "v49-branch-publish-receipts",
       "v50-post-merge-verification-reentry",
+      "v51-durable-recipient-delivery",
     ]);
   });
 

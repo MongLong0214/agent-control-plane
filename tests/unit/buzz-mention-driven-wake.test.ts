@@ -67,8 +67,10 @@ for (const change of ["none", "room lost", "room changed", "identity excluded"] 
         expect(cp.sessionRuntime.drivenModeOf(binding.sessionId)).toBe("DRIVEN");
 
         const claims: { ok?: boolean; value?: { claimed?: unknown } }[] = [];
-        f.claude.onWorkTurn = async (_request, credential) => {
+        f.claude.onWorkTurn = async (request, credential) => {
           if (credential?.sessionId !== binding.sessionId) return;
+          expect(request.prompt).toContain("mcp__acp-cto__role_owner_message_claim");
+          expect(request.prompt).toContain("deduplicate effects");
           claims.push(await callMcpToolOverSocket(
             f.ctoSocket,
             { sessionId: credential.sessionId, sessionSecret: credential.sessionSecret, token: credential.token ?? "" },

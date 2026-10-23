@@ -2472,6 +2472,7 @@ export class CanonicalSelfClaim {
         sessionId: created.sessionId,
         mode: "PREFERRED",
         authenticatedTarget,
+        deferPeerMailUntilCarry: recoveredFrom !== null,
       });
       if (!bound.allowed) return bound as Decision<CanonicalSelfClaimReceipt>;
 

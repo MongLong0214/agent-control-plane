@@ -219,14 +219,23 @@ describe("#1189 §3: a new candidate never reuses an earlier PASS", () => {
 });
 
 describe("#1189 §3: a return is never delivered to a stale CTO binding", () => {
-  it("a revision queued for a CTO that is then replaced is fenced, not delivered to either", async () => {
+  it("a valid revision left undelivered for want of a route, whose CTO is then replaced, goes to the new holder under the same id, claimed and completed once in ACP, and never to the replaced binding", async () => {
     const harness = makeHarness();
-    const { projectId, runId, submit, covered } = await startRun(harness);
+    const { projectId, runId, run, submit, covered } = await startRun(harness);
     harness.scripted.script({ match: /Candidate review/, text: reviewerRevise(covered, "a finding") });
     const outcome = await submit();
     expect(outcome.allowed && outcome.value.stage).toBe("REVISION_REQUIRED");
     const [queued] = harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST);
     expect(queued).toMatchObject({ status: "PENDING", bindingGeneration: 1 });
+    const replaced = { sessionId: run.ownerSessionId!, incarnation: harness.cp.sessions.require(run.ownerSessionId!).incarnation };
+    const failureOf = (messageId: string) =>
+      harness.cp.db.get<{ failure_class: string | null }>("SELECT failure_class FROM outbox WHERE message_id = ?", [messageId])?.failure_class ?? null;
+
+    // The replaced binding's runtime loses its Buzz route: the attempt sends nothing and is recorded as route-absent.
+    harness.cp.sessions.setBuzzAddress(replaced.sessionId, null);
+    expect((await harness.buzzAdapter.deliverPending()).failed).toContain(queued!.messageId);
+    expect(harness.cp.outbox.get(queued!.messageId)).toMatchObject({ status: "PENDING", bindingGeneration: 1 });
+    expect(failureOf(queued!.messageId)).toBe("repairable");
 
     const replacement = harness.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
     harness.cp.sessions.transition(replacement.sessionId, SessionLifecycle.READY, "replacement CTO");
@@ -240,12 +249,34 @@ describe("#1189 §3: a return is never delivered to a stale CTO binding", () => 
     });
     if (!switched.allowed) throw new Error(switched.message);
     expect(switched.value.bindingGeneration).toBe(2);
+    const holder = { sessionId: replacement.sessionId, incarnation: harness.cp.sessions.require(replacement.sessionId).incarnation };
 
+    // v51: the valid revision is handed to the authenticated current holder with its message id, re-armed.
     harness.cp.outbox.fenceUndeliverable();
+    expect(harness.cp.outbox.get(queued!.messageId)).toMatchObject({
+      status: "PENDING", bindingGeneration: 2, targetSessionId: replacement.sessionId,
+    });
+    expect(failureOf(queued!.messageId)).toBeNull();
+    // The replaced binding is never handed it and cannot settle it.
+    expect(harness.cp.outbox.acknowledge(queued!.messageId, replaced.sessionId, 1, replaced.incarnation).allowed).toBe(false);
     const claimed = harness.cp.outbox.claimDeliverable();
-    expect(claimed.filter((message) => message.kind === MessageKind.REVISION_REQUEST)).toEqual([]);
-    expect(claimed.filter((message) => message.bindingGeneration === 1)).toEqual([]);
-    expect(harness.cp.outbox.get(queued!.messageId)).toMatchObject({ status: "REJECTED", bindingGeneration: 1 });
+    expect(claimed.filter((message) => message.bindingGeneration === 1 || message.targetSessionId === replaced.sessionId)).toEqual([]);
+    const revisions = claimed.filter((message) => message.kind === MessageKind.REVISION_REQUEST);
+    expect(revisions).toEqual([expect.objectContaining({
+      messageId: queued!.messageId, bindingGeneration: 2, targetSessionId: replacement.sessionId,
+    })]);
+
+    // Inside ACP, one claim and one completion for that id: once marked sent it is not handed out
+    // again, and no second row carries the revision. (Delivery itself stays at-least-once.)
+    expect(harness.cp.outbox.markSent(revisions[0]!.messageId, revisions[0]!.claimToken).allowed).toBe(true);
+    expect(harness.cp.outbox.markSent(revisions[0]!.messageId, revisions[0]!.claimToken).allowed).toBe(false);
+    harness.cp.outbox.fenceUndeliverable();
+    expect(harness.cp.outbox.claimDeliverable().filter((message) => message.kind === MessageKind.REVISION_REQUEST)).toEqual([]);
+    expect(harness.cp.outbox.listByRun(runId).filter((message) => message.kind === MessageKind.REVISION_REQUEST))
+      .toEqual([expect.objectContaining({ messageId: queued!.messageId, status: "SENT", bindingGeneration: 2 })]);
+    expect(harness.cp.outbox.acknowledge(queued!.messageId, replaced.sessionId, 1, replaced.incarnation).allowed).toBe(false);
+    expect(harness.cp.outbox.acknowledge(queued!.messageId, holder.sessionId, 2, holder.incarnation).allowed).toBe(true);
+    expect(harness.cp.outbox.get(queued!.messageId)).toMatchObject({ status: "ACKED", bindingGeneration: 2, targetSessionId: replacement.sessionId });
   });
 });
 

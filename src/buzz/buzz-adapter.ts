@@ -471,11 +471,15 @@ export class BuzzAdapter {
     }
     try {
       const address = await this.transport.openChannel(purpose);
-      this.sessions.setBuzzAddress(sessionId, address);
-      this.audit.record({
-        kind: "BUZZ_CONNECTED",
-        sessionId,
-        evidence: { purpose, address },
+      // The address and its audit commit together or not at all: an address the log does not record
+      // is a room history nothing can prove.
+      this.db.tx(() => {
+        this.sessions.setBuzzAddress(sessionId, address);
+        this.audit.record({
+          kind: "BUZZ_CONNECTED",
+          sessionId,
+          evidence: { purpose, address },
+        });
       });
       return allow(ReasonCode.OK, address);
     } catch (err) {
@@ -529,6 +533,8 @@ export class BuzzAdapter {
             failureClass: "contract",
             retryable: false,
             error: "target session has no buzz address",
+            // Nothing was sent: the route is absent, known here rather than inferred afterwards.
+            routeAbsent: true,
           },
         );
         failed.push(message.messageId);
@@ -548,13 +554,34 @@ export class BuzzAdapter {
             failureClass: "contract",
             retryable: false,
             error: "target session has no bound buzz channel identity to address",
+            // Nothing was sent: the route is absent, known here rather than inferred afterwards.
+            routeAbsent: true,
           },
         );
         failed.push(message.messageId);
         continue;
       }
+      // FCR-08: the exact destination of this attempt. A row that may already be there (the relay
+      // accepted it there, or a send there had an unknown outcome) is not sent there again: Buzz has
+      // no same-id dedupe or receipt lookup. It is SENT again, awaiting that receiver's ACK.
+      const destination = { room: channel, recipient };
+      const already = this.outbox.sentTo(message.messageId, destination);
+      // FCR-14: a send there still in flight (a handover took the row while it was pending) is waited
+      // for, never doubled: the claim is given back and the row is judged again once that send settles.
+      if (already === "IN_FLIGHT") {
+        this.outbox.awaitSendInFlight(message.messageId, message.claimToken);
+        continue;
+      }
+      if (already !== null) {
+        this.outbox.markAlreadySent(message.messageId, message.claimToken, already, destination);
+        continue;
+      }
+      // Where this attempt is going is on record before the transport is called.
+      this.outbox.recordSendInFlight(message.messageId, destination);
       try {
         await this.transport.send(channel, render(message), [recipient]);
+        // Where it landed is recorded first, whatever happens to the claim next.
+        this.outbox.recordAcceptedSend(message.messageId, destination);
         // Completing the delivery is a compare-and-set on the claim: if the claim was
         // reclaimed or the message retargeted while we were sending, this fails and the
         // message stays eligible rather than being marked sent to a revoked session.
@@ -565,7 +592,7 @@ export class BuzzAdapter {
         this.outbox.markAttemptFailed(
           message.messageId,
           message.claimToken,
-          classifyTransportFailure(err),
+          { ...classifyTransportFailure(err), destination },
         );
         failed.push(message.messageId);
       }

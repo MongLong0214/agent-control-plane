@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { outboxDeliveryReadback, type OutboxMessage } from "../outbox/outbox.ts";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
@@ -49,6 +50,7 @@ import {
   type DaemonNoticeProbeReport,
   type DaemonNoticeTargetResolver,
   deliverOwedPeerMessageNotices,
+  daemonNoticeCanonical, daemonNoticeEventId, daemonNoticeFields, daemonNoticeKey, daemonNoticeSettlement, sealDaemonNotice,
   sendDaemonNoticeProbe,
 } from "../runtime/acp-daemon-notice.ts";
 import {
@@ -93,6 +95,7 @@ import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { resolveCeoBuzzIdentity } from "../session/ceo-buzz-identity.ts";
 import { isReasonCode, ReasonCode } from "../core/reason-codes.ts";
 import { recordMigrationRefusal } from "../db/migration-approval.ts";
+import { wholeSecondFloor } from "../db/migrations.ts";
 import {
   BuzzActorIngress,
   IngressGuard,
@@ -116,6 +119,7 @@ import {
   type AdmittedPeerSource,
   type BuzzPeerRegistry,
   type CeoTurnDelivery,
+  type PeerProofCto,
 } from "../ingress/buzz-message.ts";
 import {
   configuredTelegramExternalConsumerConfig,
@@ -352,7 +356,7 @@ export const startDaemonMcpListeners = async (
   // In-band delivery to an adopted canonical CTO: a row withheld from Buzz wakes the role through
   // the same port a role-addressed Buzz message wakes it through. Then one pass for rows that were
   // queued while no port existed (before a restart, or before these listeners opened); the
-  // daemon's delivery tick repeats it, at most once per row per window.
+  // holder registration and subsequent work events retry it, without a delivery poll.
   cp.outbox.attachInBandWake((roleKey, messageIds) => wakeRoleHolder(cp, listeners.ctoConversation, roleKey, {
     kind: "in-band dispatch",
     ids: messageIds ?? [],
@@ -947,6 +951,8 @@ export const startLocalMcpListeners = async (
       serializeWake: (body) => cp.db.tx(body),
       // #1103 — every wake frame handed to a CTO, with its cause, so a wake that finds empty queues
       // can be attributed (a registration's, at a daemon start or a re-registration).
+      onWakeFailed: ({ roleKey, cause }) =>
+        cp.audit.record({ kind: "ROLE_WAKE_FAILED", reasonCode: ReasonCode.ROLE_PEER_FAILED, roleKey, evidence: { cause } }),
       onWakeWritten: ({ roleKey, cause }) =>
         cp.audit.record({ kind: "ROLE_WAKE_SENT", reasonCode: ReasonCode.OK, roleKey, evidence: { cause } }),
       // FIX-ROLE-WAKE — a registration wake with no confirmed work is skipped; a failed lookup wakes.
@@ -1051,10 +1057,10 @@ export const startLocalMcpListeners = async (
         {
           description:
             "Register this connection's own wake endpoint socket. Local runtime contract, version-pinned; not a public interface.",
-          inputSchema: { endpoint: z.string().min(1) },
+          inputSchema: { endpoint: z.string().min(1), acceptance: z.literal("relay-v1").optional() },
         },
-        async (args: { endpoint: string }) =>
-          respond(await ctoConversation.registerEndpoint(server, args.endpoint)),
+        async (args: { endpoint: string; acceptance?: "relay-v1" }) =>
+          respond(await ctoConversation.registerEndpoint(server, args.endpoint, args.acceptance)),
       );
       /*
        * The owner-message tools, registered in this same composition — not on a second
@@ -1440,6 +1446,14 @@ const buzzMentionRouter = (cp: ControlPlane): BuzzMentionRouter => ({
       .filter((binding) => binding.sessionId === session.session_id)
       .map((binding) => binding.roleKey);
   },
+  retainEvent: (event) => {
+    const existing = cp.db.get<{ payload_json: string }>("SELECT payload_json FROM buzz_events WHERE event_id = ?", [event.id]);
+    if (existing) return digestOf(JSON.parse(existing.payload_json)) === digestOf(event)
+      ? allow(ReasonCode.OK, undefined)
+      : deny(ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH, "the event ID already names different signed bytes");
+    cp.db.run("INSERT INTO buzz_events (event_id, payload_json) VALUES (?, ?)", [event.id, JSON.stringify(event)]);
+    return allow(ReasonCode.OK, undefined);
+  },
   journalUnbound: (record) => {
     cp.audit.record({
       kind: "BUZZ_MENTION_TARGET_UNBOUND",
@@ -1634,6 +1648,96 @@ export const createBuzzMessageIngress = (
           }
         : null;
     },
+    // ACP-R1-04 — the role's own membership history in this room (`role_room_memberships`): its
+    // first join there, recorded when a binding, a runtime move or an address change put its runtime
+    // on the room. Never a session's current address or the current runtime pointer read now, so
+    // moving into a room does not backdate the role's history there, a later runtime in the same
+    // room keeps the first join, and unread same-room mail survives generation changes (#5).
+    //
+    // CEO decision 5f6ab731 (c): a room v51 anchored (`role_room_history_unknown`) admits mail signed
+    // before the migration — the deploy's stop window — only on that anchor's own authority, and only
+    // while nothing has changed since the migration: the role's binding generation, runtime session and
+    // room are exactly the anchored ones, no SESSION_BUZZ_ADDRESS_CHANGED for that session was
+    // recorded since (A→B→A cannot hide), and no runtime move of the role was recorded after it
+    // (S→T→S cannot hide). Unrelated session writes at restart do not change this proof. Each change
+    // record commits in the transaction that changes the address or runtime; new bindings advance
+    // the generation. This is read from the records each time, never from a
+    // remembered flag; change ordering uses the migration's durable audit high-water, never wall-clock
+    // equality. Otherwise the floor there is the migration itself. Only migration-derived floors
+    // round up (`wholeSecondFloor`; FCR-12), refusing and recording mail in a fractional floor's
+    // own second. Stored timestamps keep their precision.
+    // CEO bc1d8d46: fresh memberships and plain bindings keep signedSince's round-down contract.
+    // Buzz signs whole seconds, so mail signed less than one second BEFORE a fresh binding can
+    // be admitted. This time boundary never bypasses signature, room, current-binding, generation
+    // or revoke checks; it never applies to a migration-derived floor.
+    recipientHistorySince: (roleKey, conversation) => {
+      const row = cp.db.get<{
+        joined_at: string; unknown_before: string | null; known_since: string | null; anchored_room: string | null; anchored_generation: number | null;
+        anchored_session: string | null; current_generation: number | null; current_session: string | null; current_room: string | null;
+        audit_high_water: number | null; last_address_change_id: number | null; last_move_id: number | null;
+      }>(
+        `SELECT m.joined_at, u.unknown_before, u.known_since, u.audit_high_water, u.room AS anchored_room, u.binding_generation AS anchored_generation,
+                u.session_id AS anchored_session, a.binding_generation AS current_generation,
+                s.session_id AS current_session, s.buzz_address AS current_room,
+                (SELECT MAX(e.event_id) FROM audit_events e WHERE e.kind = 'SESSION_BUZZ_ADDRESS_CHANGED' AND e.session_id = u.session_id) AS last_address_change_id,
+                (SELECT MAX(e.event_id) FROM audit_events e WHERE e.kind = 'BINDING_RUNTIME_MOVED' AND e.role_key = m.role_key) AS last_move_id
+           FROM role_room_memberships m
+           LEFT JOIN role_room_history_unknown u ON u.role_key = m.role_key
+           LEFT JOIN assignments a ON a.role_key = m.role_key AND a.status = 'ACTIVE'
+           LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+           LEFT JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
+          WHERE m.role_key = ? AND m.conversation = ?`,
+        [roleKey, conversation],
+      );
+      if (!row) return null;
+      // A role's migration marker also survives joins to new rooms; only its backfilled membership
+      // is migration-derived. Fallback and future anchors may equal unknown_before, so keep them here.
+      if (row.unknown_before === null || row.anchored_room !== conversation || row.known_since !== row.joined_at) {
+        return row.joined_at;
+      }
+      if (Date.parse(row.joined_at) >= Date.parse(row.unknown_before)) {
+        return wholeSecondFloor(row.joined_at);
+      }
+      const unchangedSinceMigration = row.anchored_room === conversation && row.current_room === conversation &&
+        row.anchored_generation !== null && row.anchored_generation === row.current_generation &&
+        row.anchored_session !== null && row.anchored_session === row.current_session &&
+        row.audit_high_water !== null &&
+        (row.last_address_change_id === null || row.last_address_change_id <= row.audit_high_water) &&
+        (row.last_move_id === null || row.last_move_id <= row.audit_high_water);
+      return wholeSecondFloor(unchangedSinceMigration ? row.joined_at : row.unknown_before);
+    },
+    existingRoleMessage: (input) => {
+      const row = cp.db.get<{ message_id: string }>(`SELECT message_id FROM outbox
+        WHERE role_key = ? AND kind IN ('OWNER_MESSAGE','PEER_MESSAGE')
+          AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.sourceNonce') END) IN (?, ?) ORDER BY created_at, rowid LIMIT 1`,
+        [input.roleKey, buzzMessageNonce(input.eventId), buzzMessageNonce(input.eventId, input.roleKey)]);
+      const message = row ? cp.outbox.get(row.message_id) : null;
+      if (!message) return allow(ReasonCode.OK, null);
+      if (!["PENDING", "SENT"].includes(message.status)) return allow(ReasonCode.OK,
+        { messageId: message.messageId, status: message.status });
+      const pointer = ownerMessagePointerOf(message.payload);
+      const source = pointer ? cp.db.get<{ actor: string; payload_json: string }>(
+        "SELECT actor, payload_json FROM inbound_messages WHERE channel = ? AND nonce = ?",
+        [pointer.sourceChannel, pointer.sourceNonce]) : null;
+      let payload: Record<string, unknown> | null = null;
+      try { payload = source ? JSON.parse(source.payload_json) as Record<string, unknown> : null; } catch { /* refused below */ }
+      let text = payload?.["text"];
+      if (typeof payload?.["sourceEventId"] === "string") {
+        const shared = cp.db.get<{ payload_json: string }>("SELECT payload_json FROM buzz_events WHERE event_id = ?", [payload["sourceEventId"]]);
+        const event = shared ? JSON.parse(shared.payload_json) as Record<string, unknown> : null;
+        text = event && digestOf(event) === payload["sourceEventDigest"] ? event["content"] : null;
+      }
+      return source?.actor === input.actor && payload?.["conversation"] === input.conversation && text === input.text &&
+        pointer?.sourcePayloadDigest === digestOf(payload)
+        ? allow(ReasonCode.OK, { messageId: message.messageId, status: message.status })
+        : deny(ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH, "the event already names a different admitted delivery");
+    },
+    queuedRoleMessage: (nonce) => {
+      const row = cp.db.get<{ message_id: string }>(`SELECT message_id FROM outbox
+        WHERE kind IN ('OWNER_MESSAGE','PEER_MESSAGE')
+          AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.sourceNonce') END) = ? LIMIT 1`, [nonce]);
+      return row ? cp.outbox.get(row.message_id) : null;
+    },
     enqueueOwnerMessage: (input) => {
       const enqueued = cp.outbox.enqueue({
         // The `(buzz, nonce)` slot the guard just consumed *is* the idempotency of this row. A
@@ -1665,7 +1769,7 @@ export const createBuzzMessageIngress = (
         return deny(
           ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED,
           "this event id already has an owner-message row, so nothing new was queued for it",
-          { messageId: enqueued.value.messageId, status: enqueued.value.status },
+          { messageId: enqueued.value.messageId, ...outboxDeliveryReadback(enqueued.value) },
         );
       }
       return allow(enqueued.reasonCode, { messageId: enqueued.value.messageId });
@@ -1934,7 +2038,7 @@ const SUBSCRIBER_ALREADY_DURABLE_CODES: readonly string[] = [
 
 /** What the admission seam's `Decision` means to a subscriber holding a volatile cursor. */
 export const buzzMentionAdmissionOf = (decision: Decision<unknown>): BuzzMentionAdmission => {
-  if (decision.allowed) return "DURABLE";
+  if (decision.allowed) return decision.reasonCode === ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED ? "ALREADY_DURABLE" : "DURABLE";
   if (SUBSCRIBER_ALREADY_DURABLE_CODES.includes(decision.reasonCode)) return "ALREADY_DURABLE";
   if (SUBSCRIBER_RETRY_CODES.includes(decision.reasonCode)) return "RETRY";
   // Terminal, and trusted with the cursor: the event was signed before the addressed role's binding
@@ -1975,6 +2079,48 @@ const auditBuzzPeerRefusal = (
 };
 
 /**
+ * CEO decisions f42efb13 and 1fd967e8 — record, durably and for every author, each mention refused
+ * whose refusal unknown history decides. v51 inferred no Buzz room history for a role on record at
+ * the migration (`role_room_history_unknown`): what the role was addressed before then is unknown,
+ * so a mention signed before then and refused as `BUZZ_MENTION_PRECEDES_BINDING` — before the role's
+ * anchor in its current room, or in any room it joins later — may have been the role's. Such a
+ * refusal is never a delivery and never silent: this row names the event, its room, the role, when it
+ * was signed, the role's known-since time in that room and the cause, so the event can be fetched
+ * from the relay again; it is never replayed on inferred authority. Its content is not kept. A
+ * refusal of mail signed after the migration rests on history v51 recorded as it happened, and
+ * writes nothing here.
+ */
+const auditUnknownHistoryRefusal = (cp: ControlPlane, request: BuzzMentionAdmissionRequest): void => {
+  const signedAt = new Date(request.event.created_at * 1000);
+  const signed = Number.isNaN(signedAt.getTime()) ? null : signedAt.toISOString();
+  const marker = cp.db.get<{ unknown_before: string | null }>(
+    "SELECT unknown_before FROM role_room_history_unknown WHERE role_key = ?",
+    [request.roleKey],
+  );
+  if (!marker) return;
+  // An unreadable signed time or record is recorded too: it cannot be shown to postdate the unknown history.
+  if (signed !== null && typeof marker.unknown_before === "string" && Date.parse(signed) >= Date.parse(marker.unknown_before)) return;
+  const knownSince = cp.db.get<{ joined_at: string }>(
+    "SELECT joined_at FROM role_room_memberships WHERE role_key = ? AND conversation = ?",
+    [request.roleKey, request.conversation],
+  )?.joined_at ?? null;
+  cp.audit.record({
+    kind: "BUZZ_MENTION_REFUSED",
+    reasonCode: ReasonCode.BUZZ_MENTION_PRECEDES_BINDING,
+    actor: request.event.pubkey,
+    roleKey: request.roleKey,
+    evidence: {
+      eventId: request.event.id,
+      room: request.conversation,
+      signedAt: signed,
+      cause: "SIGNED_BEFORE_KNOWN_ROOM_HISTORY",
+      knownSince,
+      unknownBefore: marker.unknown_before,
+    },
+  });
+};
+
+/**
  * The envelope the daemon's sink presents for one verified relay event (#760 Part C, #1038).
  *
  * The event's author is presented as the actor and the seam decides what it is: an owner, the
@@ -1994,6 +2140,8 @@ export const buzzMentionInputFor = (
     actor: request.event.pubkey,
     conversation: request.conversation,
     eventId: request.event.id,
+    signedEvent: { ...request.event, tags: request.event.tags.map((tag) => [...tag]) },
+    recipientRoleKey: request.roleKey,
     ...(replyToEventId ? { replyToEventId } : {}),
     addressedTo: BUZZ_MENTION_ADDRESSED_TO,
     // The subscribed recipient: the mention target, or the room's CTO for an un-mentioned owner.
@@ -2074,41 +2222,13 @@ export const createDaemonBuzzBindChallenges = (cp: ControlPlane, policy: Ingress
   });
 };
 
-/**
- * The daemon's own front door on the relay, feeding the seam a person's CLI feeds (#760 Part C).
- *
- * Two things are worth stating about the signature this composes. The subscriber has already
- * verified the *event's* signature — that is what says the owner wrote these words — and the
- * envelope it hands the seam is then signed with the deployment's ingress secret, because that is
- * the credential `IngressGuard` authenticates a local submission with. The daemon is standing
- * where the relay-side CLI stood, so it presents the credential that surface has always presented.
- *
- * What it deliberately does not do is skip the seam. Calling `enqueue` directly would be shorter
- * and would bypass the owner allowlist, the `(buzz, nonce)` replay slot, the address resolution
- * and the single-transaction admission — every one of which is a refusal this path is required to
- * make, and none of which this module is allowed to be a second authority for.
- *
- * A daemon with no `buzz-nostr-subscriber.json` gets a handle reporting zero sockets. That is the
- * configured-off state, and it is a value rather than a `null` so a caller cannot read "absent"
- * as "running".
- */
-export const startDaemonBuzzMentionSubscriber = (
+/** The production admission/audit sink, also usable without relay credentials on an offline copy. */
+export const createDaemonBuzzMentionSink = (
   cp: ControlPlane,
-  stateDir: string,
   policy: IngressPolicy,
   messageIngress: Pick<LocalBuzzMessageIngress, "seam">,
-  options: {
-    openSocket?: BuzzRelaySocketFactory;
-    scheduler?: BuzzSubscriberScheduler;
-    /** The adopted CEO's pending Buzz binding challenges, shared with its tool socket. */
-    bindChallenges?: BuzzBindChallenges;
-    /** The canonical session entries, so an identity's binding must be on its entry's project. */
-    canonical?: BuzzMentionCanonicalEntries | null;
-    /** Where admission changes are reported; the subscriber's own stderr line when absent. */
-    reportAdmission?: BuzzMentionAdmissionReporter;
-
-  } = {},
-): BuzzMentionSubscriberHandle => {
+  options: { bindChallenges?: BuzzBindChallenges } = {},
+): BuzzMentionSink => {
   const secret = policy.secret?.trim() ?? "";
   if (secret.length === 0) {
     throw new Error("Buzz mention subscriber requires a non-empty signing secret");
@@ -2158,9 +2278,49 @@ export const startDaemonBuzzMentionSubscriber = (
         auditBuzzPeerRefusal(cp, request.event.pubkey, request.event.id,
           verdict.admission === "PRECEDES_BINDING" ? ReasonCode.BUZZ_MENTION_PRECEDES_BINDING : verdict.reasonCode);
       }
+      if (typeof verdict === "object" && verdict.admission === "PRECEDES_BINDING") auditUnknownHistoryRefusal(cp, request);
       return verdict;
     },
   };
+  return sink;
+};
+
+/**
+ * The daemon's own front door on the relay, feeding the seam a person's CLI feeds (#760 Part C).
+ *
+ * Two things are worth stating about the signature this composes. The subscriber has already
+ * verified the *event's* signature — that is what says the owner wrote these words — and the
+ * envelope it hands the seam is then signed with the deployment's ingress secret, because that is
+ * the credential `IngressGuard` authenticates a local submission with. The daemon is standing
+ * where the relay-side CLI stood, so it presents the credential that surface has always presented.
+ *
+ * What it deliberately does not do is skip the seam. Calling `enqueue` directly would be shorter
+ * and would bypass the owner allowlist, the `(buzz, nonce)` replay slot, the address resolution
+ * and the single-transaction admission — every one of which is a refusal this path is required to
+ * make, and none of which this module is allowed to be a second authority for.
+ *
+ * A daemon with no `buzz-nostr-subscriber.json` gets a handle reporting zero sockets. That is the
+ * configured-off state, and it is a value rather than a `null` so a caller cannot read "absent"
+ * as "running".
+ */
+export const startDaemonBuzzMentionSubscriber = (
+  cp: ControlPlane,
+  stateDir: string,
+  policy: IngressPolicy,
+  messageIngress: Pick<LocalBuzzMessageIngress, "seam">,
+  options: {
+    openSocket?: BuzzRelaySocketFactory;
+    scheduler?: BuzzSubscriberScheduler;
+    /** The adopted CEO's pending Buzz binding challenges, shared with its tool socket. */
+    bindChallenges?: BuzzBindChallenges;
+    /** The canonical session entries, so an identity's binding must be on its entry's project. */
+    canonical?: BuzzMentionCanonicalEntries | null;
+    /** Where admission changes are reported; the subscriber's own stderr line when absent. */
+    reportAdmission?: BuzzMentionAdmissionReporter;
+
+  } = {},
+): BuzzMentionSubscriberHandle => {
+  const sink = createDaemonBuzzMentionSink(cp, policy, messageIngress, options);
   const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
     ownerAuthors: messageIngress.seam.ingress.ownerActors,
     reportEventRefusal: ({ author, eventId, reasonCode }) => auditBuzzPeerRefusal(
@@ -2254,7 +2414,10 @@ const wakeForMention = (
   // CEO's a PEER_MESSAGE), or its turn held a terminal fact. Keyed by the verified event and read
   // from the append-only departure record the hand-over rule refuses on, rather than from a row's
   // writable pointer or status. A claim refused mid-turn spends nothing, so the trigger is released.
-  const served = (): boolean => cp.outbox.sourceEventSpent("buzz", buzzMessageNonce(mention.eventId));
+  const served = (): boolean => cp.outbox.sourceEventSpent("buzz", buzzMessageNonce(mention.eventId, roleKey)) ||
+    cp.db.get(`SELECT 1 FROM holder_message_source_departures d JOIN outbox o ON o.message_id = d.message_id
+      WHERE d.source_channel = 'buzz' AND d.source_nonce = ? AND o.role_key = ?`,
+      [buzzMessageNonce(mention.eventId), roleKey]) !== undefined;
   return wakeRoleHolder(cp, { wake: (key) => roleConversation.wake(key, mention) }, roleKey, {
     kind: "owner message",
     ids: [],
@@ -2638,6 +2801,64 @@ export const createConfiguredHermesGatewayDaemonNoticeTarget = (
   };
 };
 
+/** CEO notifications use the authenticated canonical daemon-notice surface, with receipt dedupe. */
+export const createCeoNotificationSender = (resolveTarget: DaemonNoticeTargetResolver, laneSecret: string) =>
+  async (message: OutboxMessage): Promise<Decision<void>> => {
+    const target = await resolveTarget();
+    if (!target) return deny(ReasonCode.CEO_CONVERSATION_UNAVAILABLE, "canonical CEO route unavailable");
+    const text = JSON.stringify({ messageId: message.messageId, kind: message.kind, payload: message.payload });
+    // The existing signed surface accepts bounded text. Preserve every character across parts.
+    const parts: string[] = [];
+    let part = "";
+    for (const character of text) {
+      if (part.length + character.length > 1500) { parts.push(part); part = ""; }
+      part += character;
+    }
+    if (part) parts.push(part);
+    for (const [index, part] of parts.entries()) {
+      const eventId = daemonNoticeEventId(message.messageId, message.roleKey,
+        `CEO_NOTIFICATION:${digestOf(target.destination)}:${index}`);
+      const canonical = daemonNoticeCanonical(daemonNoticeFields(eventId, target.destination,
+        `ACP notification ${message.messageId} part ${index + 1}/${parts.length}: ${part}`));
+      const body = sealDaemonNotice(canonical, daemonNoticeKey(laneSecret));
+      const result = await target.send(body);
+      if (result.kind !== "RESPONDED" || !daemonNoticeSettlement(result.status, result.body, {
+        eventId, payloadDigest: body.payload_digest, destination: target.destination,
+      }).settled) return deny(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED, "canonical CEO did not accept the notification");
+    }
+    return allow(ReasonCode.OK, undefined);
+  };
+
+/**
+ * ACP-R1-03 — attaches the canonical notice transport for CEO notifications from what that transport
+ * actually needs, and nothing else: the pinned Hermes CEO target (the `ACP_HERMES_*` adoption
+ * configuration, whose Gateway API key authenticates the channel) and the ACP-Hermes lane secret,
+ * from which every `acp-daemon-notice/v1` body's HMAC key is derived — the Hermes side verifies that
+ * signature with its own copy of the secret, so no notice can be authenticated without it. Whether the
+ * Telegram external consumer is enabled is not asked: the lane secret is the ACP-Hermes secret, read
+ * directly. Attaching drains what is queued, and every CEO adoption (`adoptHolderMessages`) and active
+ * CEO binding switch drains again. Not started, it says exactly why; the outbox then records each
+ * notification withheld for want of a route (`CEO_NOTIFICATION_ROUTE_UNAVAILABLE`).
+ */
+export const startConfiguredCeoNotificationRoute = (
+  cp: ControlPlane,
+  options: {
+    environment: Readonly<Record<string, string | undefined>>;
+    hermesConfiguration: Readonly<Record<string, string | undefined>>;
+    ports?: HermesCeoPinPorts & { noticeSenderFactory?: typeof createHermesGatewayDaemonNoticeSender };
+  },
+): { started: true } | { started: false; reason: string } => {
+  const target = createConfiguredHermesGatewayDaemonNoticeTarget(cp, options.hermesConfiguration, options.ports ?? {});
+  if (!target) return { started: false, reason: "no Hermes adoption configuration" };
+  const laneSecret = options.environment["ACP_TELEGRAM_EXTERNAL_SECRET"]?.trim();
+  if (!laneSecret) return { started: false, reason: "ACP_TELEGRAM_EXTERNAL_SECRET is not configured" };
+  cp.outbox.attachCeoNotificationDelivery(createCeoNotificationSender(target, laneSecret));
+  cp.bindings.onSwitch((binding) => {
+    if (binding.role === Role.CEO && binding.status === "ACTIVE") void cp.outbox.deliverCeoNotifications();
+  });
+  return { started: true };
+};
+
 /** The daemon's notice delivery loop, as the composition holds it. */
 export interface DaemonPeerMessageNoticeDelivery {
   /** One pass, single-flight: a pass already running is joined, never doubled. */
@@ -2806,7 +3027,11 @@ export const startAdoptedCeoToolSocket = (
     stateDir,
     (peer) => admission.admit(peer),
     (admitted, socket) => {
-      const server = createHermesServer(port, () => admission.authenticate(admitted), {
+      const server = createHermesServer(port, () => {
+        const peer = admission.authenticate(admitted);
+        if (peer.allowed) cp.db.afterCommit(() => { void cp.outbox.deliverCeoNotifications(); });
+        return peer;
+      }, {
         provenance: admitted.provenance,
       });
       const buzzActorIngress = options.buzzActorIngress;
@@ -4423,7 +4648,8 @@ export const ownerMessageProvenanceOf = (
       : null;
   const conversation = source?.["conversation"];
   const replyToEventId = source?.["replyToEventId"];
-  const eventId = nonce.startsWith(BUZZ_MESSAGE_NONCE_PREFIX) ? nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length) : "";
+  const eventId = typeof source?.["sourceEventId"] === "string" ? source["sourceEventId"]
+    : nonce.startsWith(BUZZ_MESSAGE_NONCE_PREFIX) ? nonce.slice(BUZZ_MESSAGE_NONCE_PREFIX.length) : "";
   return {
     channel,
     room: buzz && typeof conversation === "string" && conversation.length > 0 ? conversation : null,
@@ -4469,6 +4695,61 @@ const buzzMentionClaimHolds = (cp: ControlPlane, holder: HolderIdentity, pointer
     holder.targetSessionId,
   ])?.buzz_actor_id ?? null;
   return actorId === mention && eligibility.eligible && eligibility.room === conversation;
+};
+
+/**
+ * ACP-R1-02 — whether `holder` is an authenticated continuation of the CTO the peer proof names,
+ * for one queued peer message (the second half of `peerProofIsCurrent`'s successor question).
+ *
+ * Every arm needs the same three facts about the message: the Buzz identity it was addressed to is
+ * now the holder's own channel identity, the room it arrived on is the holder's room, and no carry
+ * record names this message with a different admitted payload. Then, by generation:
+ *
+ *   - same generation (a surviving runtime move, which keeps the generation by design): the role's
+ *     ACTIVE assignment at that generation is the one the proof was admitted against — a generation
+ *     has one assignment, so the proof's session was a runtime of this assignment's actor — and its
+ *     conversation target was authenticated for exactly that assignment and generation. A move of an
+ *     unauthenticated binding proves nothing and is withheld;
+ *   - a later generation: the predecessor assignment at the proof's generation and session, and the
+ *     current ACTIVE assignment, are bound to the same conversation target.
+ *
+ * The caller has already authenticated `holder` as the exact current holder (`claimForHolder`), so a
+ * stale runtime of the same generation is never asked. Only reads.
+ */
+const peerContinuationProven = (
+  cp: ControlPlane,
+  candidate: { messageId: string; payload: unknown },
+  holder: HolderIdentity,
+  source: AdmittedPeerSource | undefined,
+  ctoChannel: string | null,
+) => (previous: PeerProofCto): boolean => {
+  const mention = source?.mention;
+  if (typeof mention !== "string" || mention.length === 0 ||
+      mention !== cp.sessions.get(holder.targetSessionId)?.buzzActorId ||
+      previous.roleKey !== holder.roleKey || ctoChannel === null || source?.conversation !== ctoChannel) return false;
+  const digest = ownerMessagePointerOf(candidate.payload)?.sourcePayloadDigest ?? null;
+  const noConflictingCarry = `NOT EXISTS (SELECT 1 FROM peer_message_carries carried WHERE carried.message_id = ?
+    AND carried.outcome = 'CARRIED' AND carried.source_payload_digest IS NOT ?)`;
+  if (previous.bindingGeneration === holder.bindingGeneration) {
+    return cp.db.get(`SELECT 1 FROM assignments current
+      JOIN actor_target_bindings target ON target.target_actor_id = current.actor_id
+      JOIN actor_target_attestations attested ON attested.target_binding_id = target.target_binding_id
+       AND attested.assignment_id = current.assignment_id AND attested.binding_generation = current.binding_generation
+      WHERE current.role_key = ? AND current.binding_generation = ? AND current.status = 'ACTIVE'
+        AND ${noConflictingCarry}`,
+      [holder.roleKey, holder.bindingGeneration, candidate.messageId, digest]) !== undefined;
+  }
+  return cp.db.get(`SELECT 1 FROM assignments old
+    JOIN actor_target_bindings old_target ON old_target.target_actor_id = old.actor_id
+    JOIN assignments current ON current.role_key = old.role_key AND current.binding_generation = ? AND current.status = 'ACTIVE'
+    JOIN actor_target_bindings current_target ON current_target.target_actor_id = current.actor_id
+    WHERE old.role_key = ? AND old.binding_generation = ? AND old.session_id = ?
+      AND old_target.executor_kind = current_target.executor_kind
+      AND old_target.target_locator = current_target.target_locator
+      AND old_target.target_locator_digest = current_target.target_locator_digest
+      AND ${noConflictingCarry}`,
+    [holder.bindingGeneration, previous.roleKey, previous.bindingGeneration, previous.sessionId,
+      candidate.messageId, digest]) !== undefined;
 };
 
 export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
@@ -4536,10 +4817,12 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
               ceo,
               holder,
               ctoChannel,
-              // The one holder besides the proof's own: its conversation restarted once, the row
-              // carried to it by the canonical self-claim's recovery (2026-10-03) — accepted only
-              // through that carry's record (ACP-PEER-SUCCESSION-01).
-              selfClaimCarriedTo(cp.db, candidate, holder, source),
+              // The holders besides the proof's own: its conversation restarted, the row carried to
+              // it by the canonical self-claim's recovery (ACP-PEER-SUCCESSION-01), or any other
+              // authenticated continuation of the same conversation, including a same-generation
+              // runtime move (ACP-R1-02).
+              (previous) => selfClaimCarriedTo(cp.db, candidate, holder, source)(previous) ||
+                peerContinuationProven(cp, candidate, holder, source, ctoChannel)(previous),
             );
           },
         );
@@ -4614,7 +4897,16 @@ export const ownerMessageLedger = (cp: ControlPlane): OwnerMessageLedger => {
         }
         // Parsed as data, never as instructions (§27.4). A `text` of the wrong type is a source
         // this route cannot read, not something to coerce into a string.
-        const text = (payload as { text?: unknown }).text;
+        const stored = payload as { text?: unknown; sourceEventId?: unknown; sourceEventDigest?: unknown };
+        let text = stored.text;
+        if (typeof stored.sourceEventId === "string") {
+          const shared = cp.db.get<{ payload_json: string }>("SELECT payload_json FROM buzz_events WHERE event_id = ?", [stored.sourceEventId]);
+          const event = shared ? JSON.parse(shared.payload_json) as { content?: unknown } : null;
+          if (event === null || digestOf(event) !== stored.sourceEventDigest) {
+            return refuseClaimed(ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH, "the retained signed event differs from this delivery");
+          }
+          text = event.content;
+        }
         if (typeof text !== "string") {
           return refuseClaimed(
             ReasonCode.INVALID_ARGUMENT,
@@ -5440,6 +5732,15 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
       laneSecret: telegramExternalConfig?.sharedSecret ?? null,
       ports: { authorityHeld: () => daemon.lock.held() },
     });
+    const ceoRoute = startConfiguredCeoNotificationRoute(cp, {
+      environment: process.env,
+      hermesConfiguration: hermesAdoptionConfiguration,
+      ports: { authorityHeld: () => daemon.lock.held() },
+    });
+    process.stdout.write(ceoRoute.started
+      ? "CEO notification canonical route started\n"
+      : `CEO notification canonical route not started: ${ceoRoute.reason}; CEO notifications use the CEO's Buzz route ` +
+        "when it has one, and are otherwise withheld PENDING and recorded as CEO_NOTIFICATION_ROUTE_UNAVAILABLE\n");
     peerMessageNotices = notices.delivery;
     process.stdout.write(notices.delivery !== null
       ? "peer-message notice delivery started\n"

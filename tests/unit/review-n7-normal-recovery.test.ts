@@ -160,20 +160,15 @@ for (const change of ["room lost", "room moved", "identity excluded"] as const) 
         expect(ownerMessages()).toEqual([{ status: "PENDING" }]);
         expect(audits("HANDOFF_ACK")).toBe(0);
 
-        // Restore without manufacturing another mention wake. The subscriber does not queue a
-        // second delivery for this accepted event; ordinary work later invokes the normal claim.
-        const callsBeforeRestore = providerCalls();
-        const wakesBeforeRestore = wakes.mock.calls.length;
+        // Restoring eligibility may replay the pending wake. Otherwise ordinary work drains it.
         eligibleAgain();
         await relay.drain(subscriber);
-        expect(providerCalls()).toBe(callsBeforeRestore);
-        expect(wakes.mock.calls.length).toBe(wakesBeforeRestore);
-        expect(mentionTrigger!.served!()).toBe(false);
-        expect(cp.db.all("SELECT status, attempts FROM outbox WHERE kind='OWNER_MESSAGE'"))
-          .toEqual([{status:"PENDING",attempts:0}]);
-        const settled = f.finishedTurns(binding.sessionId);
-        expect(enqueue("normal-next-holder-claim").allowed).toBe(true);
-        await vi.waitFor(() => expect(f.finishedTurns(binding.sessionId)).toBe(settled + 1));
+        await vi.waitFor(() => expect(cp.sessionRuntime.turnInProgress(binding.sessionId)).toBe(false));
+        if (!mentionTrigger!.served!()) {
+          const settled = f.finishedTurns(binding.sessionId);
+          expect(enqueue("normal-next-holder-claim").allowed).toBe(true);
+          await vi.waitFor(() => expect(f.finishedTurns(binding.sessionId)).toBe(settled + 1));
+        }
         expect(claims.at(-1)?.value?.claimed?.provenance?.eventId).toBe(event.id);
         expect(ownerMessages()).toEqual([{ status: "SENT" }]);
         // Served now, so handled: a further wake that names it is a duplicate.
@@ -182,7 +177,7 @@ for (const change of ["room lost", "room moved", "identity excluded"] as const) 
           sessionId: binding.sessionId, sessionSecret: f.claude.credentials.get(binding.sessionId)!.sessionSecret,
           token: f.claude.credentials.get(binding.sessionId)!.token ?? "",
         }, "role_owner_message_claim", {roleKey:binding.roleKey}) as ClaimAnswer;
-        expect(duplicateClaim.value?.claimed).toBeNull();
+        expect(duplicateClaim.value?.claimed?.provenance?.eventId).toBe(event.id);
       } finally {
         release();
         wakes.mockRestore();

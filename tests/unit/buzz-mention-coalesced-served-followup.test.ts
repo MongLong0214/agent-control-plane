@@ -6,6 +6,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startBuzzMessageIngressListener, startDaemonBuzzMentionSubscriber, startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Role } from "../../src/domain/types.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { SessionWakeTrigger } from "../../src/runtime/provisioned-session-runtime.ts";
 import { withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
@@ -119,7 +120,7 @@ for (const variant of ["mention only", "mention and ordinary work"] as const) {
         await relay.drain(subscriber);
         const messageId = cp.db.get<{ message_id: string }>(
           "SELECT message_id FROM outbox WHERE json_extract(payload_json, '$.sourceNonce') = ?",
-          [`buzz-message:${event.id}`],
+          [buzzMessageNonce(event.id, binding.roleKey)],
         )!.message_id;
         if (variant === "mention and ordinary work") expect(enqueue("coalesced-second-ordinary").allowed).toBe(true);
         const mentionTrigger: SessionWakeTrigger | undefined = wakes.mock.calls
@@ -132,7 +133,8 @@ for (const variant of ["mention only", "mention and ordinary work"] as const) {
         release();
         // The follow-up either runs (a finished turn) or is refused before the provider (a
         // duplicate refusal); wait for whichever it does, then count provider calls.
-        await vi.waitFor(() => expect(f.finishedTurns(binding.sessionId) - finishedBefore + duplicateRefusals()).toBe(2), WAIT);
+        await vi.waitFor(() => expect(cp.sessionRuntime.turnInProgress(binding.sessionId)).toBe(false), WAIT);
+        expect(f.finishedTurns(binding.sessionId) - finishedBefore).toBe(variant === "mention only" ? 1 : 2);
 
         expect(claims[0]?.value?.claimed?.provenance?.eventId).toBe(event.id);
         expect(cp.outbox.get(messageId)?.status).toBe("SENT");
@@ -140,12 +142,12 @@ for (const variant of ["mention only", "mention and ordinary work"] as const) {
         if (variant === "mention only") {
           expect(providerCalls() - before, "the follow-up made a provider call for a mention already served").toBe(0);
           expect(workTurns).toBe(1);
-          expect(duplicateRefusals()).toBe(1);
+          expect(duplicateRefusals()).toBe(0);
         } else {
-          // The ordinary request still has its follow-up turn, which finds nothing more to claim.
+          // Ordinary work still runs; a crash-before-ACK retry keeps the same durable message ID.
           expect(providerCalls() - before).toBe(1);
           expect(workTurns).toBe(2);
-          expect(claims[1]?.value?.claimed).toBeNull();
+          expect(claims[1]?.value?.claimed?.provenance?.eventId).toBe(event.id);
           expect(duplicateRefusals()).toBe(0);
         }
         // Either way the mention's trigger is handled: a wake that names it again is a duplicate.

@@ -4029,3 +4029,124 @@ END;
 
 INSERT OR IGNORE INTO continuity_state (id, mode, changed_at)
 VALUES (1, 'NORMAL', '1970-01-01T00:00:00.000Z');
+
+
+-- ---------------------------------------------------------------------------
+-- Durable Buzz events and message-ID terminal deduplication (schema v51).
+-- Recipient admission/claim/ACK lives in inbound_messages and outbox; the signed body lives once.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS buzz_events (
+  event_id TEXT PRIMARY KEY NOT NULL,
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
+) WITHOUT ROWID;
+
+-- CP-HI-08 — accepted signed event bytes cannot be replaced.
+CREATE TRIGGER IF NOT EXISTS buzz_events_no_replace
+BEFORE INSERT ON buzz_events
+WHEN EXISTS (SELECT 1 FROM buzz_events WHERE event_id = NEW.event_id)
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
+-- CP-HI-08 — accepted signed event bytes cannot be rewritten.
+CREATE TRIGGER IF NOT EXISTS buzz_events_immutable
+BEFORE UPDATE ON buzz_events
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
+-- CP-HI-08 — accepted signed event bytes outlive every recipient delivery.
+CREATE TRIGGER IF NOT EXISTS buzz_events_no_delete
+BEFORE DELETE ON buzz_events
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_IMMUTABLE');
+END;
+
+-- Once ACKed or explicitly rejected, resetting a mutable outbox status cannot replay the ID.
+CREATE TABLE IF NOT EXISTS holder_message_terminals (
+  message_id TEXT PRIMARY KEY NOT NULL
+) WITHOUT ROWID;
+-- CP-HI-08 — a completed message ID remains durably deduplicated.
+CREATE TRIGGER IF NOT EXISTS outbox_holder_message_terminal
+AFTER UPDATE OF status ON outbox
+WHEN NEW.status IN ('ACKED','REJECTED','EXPIRED')
+  AND NOT EXISTS (SELECT 1 FROM holder_message_terminals WHERE message_id = NEW.message_id)
+BEGIN
+  INSERT INTO holder_message_terminals (message_id) VALUES (NEW.message_id);
+END;
+-- CP-HI-08 — a completion receipt cannot be rewritten.
+CREATE TRIGGER IF NOT EXISTS holder_message_terminals_immutable
+BEFORE UPDATE ON holder_message_terminals
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+-- CP-HI-08 — a deleted completion receipt must not enable replay.
+CREATE TRIGGER IF NOT EXISTS holder_message_terminals_no_delete
+BEFORE DELETE ON holder_message_terminals
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — a completion receipt cannot be replaced.
+CREATE TRIGGER IF NOT EXISTS holder_message_terminals_no_replace
+BEFORE INSERT ON holder_message_terminals
+WHEN EXISTS (SELECT 1 FROM holder_message_terminals WHERE message_id = NEW.message_id)
+BEGIN
+  SELECT RAISE(ABORT, 'HOLDER_MESSAGE_DEPARTURE_IMMUTABLE');
+END;
+
+-- ---------------------------------------------------------------------------
+-- ACP-R1-04 — each role's own membership history per Buzz room (schema v51).
+-- When a role first became a recipient in a room: written when a binding, a runtime move or an
+-- address change puts the role's current runtime on that room, and never moved earlier. Historical
+-- suppression of retained room traffic is judged against this record alone — not against a
+-- session's current, mutable address or the role's current runtime pointer — and it is separate from
+-- delivery and ACK state.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS role_room_memberships (
+  role_key     TEXT NOT NULL,
+  conversation TEXT NOT NULL,
+  joined_at    TEXT NOT NULL,
+  session_id   TEXT NOT NULL,
+  PRIMARY KEY (role_key, conversation)
+) WITHOUT ROWID;
+
+-- ---------------------------------------------------------------------------
+-- ACP-R1-04 — the Buzz room history v51 could not prove (schema v51), one row per role on record at
+-- the migration: everything the role was addressed before `unknown_before` (the migration's own time)
+-- is unknown, because v50 kept no record that proves it, and v51 inferred none. `room` and
+-- `known_since` name the room the role's current binding is anchored in and since when, when it has
+-- one, and `binding_generation` and `session_id` the anchored binding and runtime: mail signed before
+-- `unknown_before` is admitted only while the role's binding, runtime and room are still exactly these.
+-- `anchor_fallback` names why a role could be anchored only at the migration itself (its stop-window
+-- mail is refused); `anchor_json` is what the anchor rests on. Written once by the v51 step; the
+-- daemon records every mention it refuses for the role that was signed before `unknown_before`.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS role_room_history_unknown (
+  role_key           TEXT PRIMARY KEY NOT NULL,
+  unknown_before     TEXT NOT NULL,
+  room               TEXT,
+  known_since        TEXT,
+  binding_generation INTEGER,
+  session_id         TEXT,
+  -- Durable ordering: timestamp equality cannot prove that a later change preceded migration.
+  audit_high_water   INTEGER NOT NULL DEFAULT 0 CHECK (audit_high_water >= 0),
+  anchor_fallback    TEXT CHECK (anchor_fallback IS NULL OR anchor_fallback IN ('RUNTIME_MOVE_UNRECORDED')),
+  anchor_json        TEXT NOT NULL CHECK (json_valid(anchor_json))
+) WITHOUT ROWID;
+
+-- ---------------------------------------------------------------------------
+-- FCR-08 — where a Buzz send of an outbox row may have landed (schema v51): the exact room and
+-- recipient key of each attempt, written before the transport call and settled with its outcome. Whether a later receiver is the one a row was already sent to is judged from this record
+-- alone — never from a session's current, mutable address or identity. A row with no entry here has
+-- no such evidence, and its earlier receiver is unknown.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS outbox_sent_destinations (
+  message_id TEXT NOT NULL,
+  room       TEXT NOT NULL,
+  recipient  TEXT NOT NULL,
+  -- PENDING_SEND: a send there is in flight (written before the transport call); ACCEPTED: the relay
+  -- took it there; UNKNOWN: the send's outcome is unknown (it may be there). A refused send removes
+  -- its own PENDING_SEND; one that never settles counts as UNKNOWN after the claim lease.
+  outcome    TEXT NOT NULL CHECK (outcome IN ('PENDING_SEND','ACCEPTED','UNKNOWN')),
+  sent_at    TEXT NOT NULL,
+  PRIMARY KEY (message_id, room, recipient)
+) WITHOUT ROWID;

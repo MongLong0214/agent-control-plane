@@ -15,7 +15,7 @@ import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { DRIVEN_PRIMARY_CTO_RUNTIME } from "../domain/fixed-role-runtime.ts";
 import { Role, type RoleBinding, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
-import type { Outbox } from "../outbox/outbox.ts";
+import { outboxDeliveryReadback, type Outbox } from "../outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, defaultProcessAncestryInspector, isAdoptedCanonicalRuntime } from "../registry/canonical-self-claim.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
@@ -808,7 +808,8 @@ export class CtoLifecycle {
           {
             handoffId,
             messageId: acknowledgement.messageId,
-            delivered: envelope?.status === "SENT",
+            delivered: envelope ? outboxDeliveryReadback(envelope).delivered : false,
+            ...(envelope ? { delivery: outboxDeliveryReadback(envelope) } : {}),
           },
         );
       }

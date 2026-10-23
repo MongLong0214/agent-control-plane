@@ -346,6 +346,7 @@ const sendTo = (path: string, bytes: string, end = true): Promise<void> =>
   new Promise<void>((resolve) => {
     const socket = createConnection(path);
     socket.on("error", () => undefined);
+    socket.resume();
     socket.once("close", () => resolve());
     socket.once("connect", () => {
       if (end) socket.end(bytes);
@@ -452,7 +453,7 @@ describe("the canonical CTO relay wakes its session as the session's own child",
     linkSync(f.session.path, stale);
     await f.session.close();
     renameSync(stale, f.session.path);
-    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
+    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(false);
     expect(await until(() => r.err().includes("attach: wake forward failed "))).toBe(true);
     await r.finish();
 
@@ -705,15 +706,15 @@ describe("the wake proxy forwards only to a messaging socket the daemon itself w
     // The proxy the daemon validates is unchanged; the name its forward connects to now leads elsewhere.
     rmSync(f.session.path);
     symlinkSync(decoy.path, f.session.path);
-    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
+    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(false);
     await until(() => r.err() !== "" || decoy.received.length > 0);
     expect(decoy.received).toEqual([]);
-    expect(r.err()).toBe("attach: wake forward refused endpoint-is-symlink\n");
+    expect(r.err()).toBe("attach: wake forward failed endpoint-is-symlink\n");
 
     // Refused per forward, not for good: the session's own socket back at its name is woken again.
     rmSync(f.session.path);
     const back = await recordingSocket(f.session.path);
-    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
+    // The pending signal recovers on the socket-availability event, with no extra wake or poll.
     expect(await until(() => back.received.length === 1)).toBe(true);
     expect(back.received).toEqual([AUTHENTICATED_WAKE]);
     expect(decoy.received).toEqual([]);
@@ -728,10 +729,10 @@ describe("the wake proxy forwards only to a messaging socket the daemon itself w
     await proxyRegistered(f);
 
     forged.foreignOwned.add(f.session.path);
-    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
+    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(false);
     await until(() => r.err() !== "" || f.session.received.length > 0);
     expect(f.session.received).toEqual([]);
-    expect(r.err()).toBe("attach: wake forward refused endpoint-owner-mismatch\n");
+    expect(r.err()).toBe("attach: wake forward failed endpoint-owner-mismatch\n");
 
     forged.foreignOwned.delete(f.session.path);
     expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
@@ -749,10 +750,10 @@ describe("the wake proxy forwards only to a messaging socket the daemon itself w
     // Each look passes every check, and each finds another inode: the look before the connect and
     // the look after it disagree about which file the connection reached.
     forged.swappedEveryLook.add(f.session.path);
-    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(true);
+    expect((await f.daemon.live().ctoConversation.wake(CTO)).allowed).toBe(false);
     await until(() => r.err() !== "" || f.session.received.some((bytes) => bytes !== ""));
     expect(f.session.received.filter((bytes) => bytes !== "")).toEqual([]);
-    expect(r.err()).toBe("attach: wake forward refused endpoint-replaced\n");
+    expect(r.err()).toBe("attach: wake forward failed endpoint-replaced\n");
     await r.finish();
   });
 });

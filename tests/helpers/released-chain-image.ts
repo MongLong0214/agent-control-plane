@@ -163,6 +163,7 @@ const LATER_OBJECTS: ReadonlyArray<{ version: number; objects?: readonly string[
       "canonical_turns_no_rowid_replace", "canonical_turns_rowid_immutable", "canonical_turns_rowid_positive",
     ],
   },
+  { version: 51, objects: ["buzz_events", "holder_message_terminals", "outbox_holder_message_terminal", "role_room_memberships", "role_room_history_unknown", "outbox_sent_destinations"] },
   { version: 47, objects: ["run_artifacts_owner_decision_authority_guard"] },
   {
     version: 48,

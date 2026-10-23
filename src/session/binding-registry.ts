@@ -121,6 +121,8 @@ export interface BindInput {
   verifiedTarget?: VerifiedTargetBinding;
   /** Authenticated successor to `verifiedTarget`; legacy callers remain compatible. */
   authenticatedTarget?: AuthenticatedTargetBinding;
+  /** Canonical recovery records its peer-mail handover before publishing the transaction. */
+  deferPeerMailUntilCarry?: boolean;
   /** Owner-bootstrap-only restoration of an existing, revoked CEO; never a new actor. */
   restoreCeo?: { actorId: string; generation: number; sessionId: string; incarnation: string };
 }
@@ -331,6 +333,7 @@ export class BindingRegistry {
         // `mintActor` sets this pointer for a new actor; without the same move here the recovered
         // actor would still name the process that died, and every reader of the live pointer —
         // routing, doctor, the conversation port — would be sent to it.
+        this.recordSiblingRuntimeMoves(actorId, input.sessionId, roleKey, "shared actor rebound");
         this.db.run(
           `UPDATE conversational_actors
               SET current_session_id = ?, current_session_incarnation = ?
@@ -380,6 +383,10 @@ export class BindingRegistry {
         evidence: { role: input.role, generation, mode: input.mode ?? "PREFERRED" },
       });
       const created = this.require(roleKey);
+      // ACP-R1-04: the role joins its runtime's room now, if it never had.
+      this.sessions.recordRoomMembership(created.sessionId);
+      this.outbox.adoptHolderMessages(roleKey, created.bindingGeneration, created.sessionId,
+        input.deferPeerMailUntilCarry === true);
       this.#notifySwitch(created, reused.value ?? undefined);
       return allow(ReasonCode.OK, created);
     });
@@ -550,6 +557,7 @@ export class BindingRegistry {
             assignmentId: current.assignmentId,
           });
         }
+        this.recordSiblingRuntimeMoves(owner.actor_id, input.sessionId, roleKey, input.reason);
         const moved = this.db.run(
           `UPDATE conversational_actors
               SET current_session_id = ?, current_session_incarnation = ?
@@ -581,6 +589,9 @@ export class BindingRegistry {
           current.sessionId,
           input.sessionId,
         );
+        // ACP-R1-04: a move into a room the role never answered on is a join, now; a move within
+        // a room keeps the role's first join there.
+        this.sessions.recordRoomMembership(input.sessionId);
         this.audit.record({
           kind: "BINDING_RUNTIME_MOVED",
           roleKey,
@@ -682,6 +693,12 @@ export class BindingRegistry {
             input.sessionId,
           )
         : { retargeted: [], rejected: [] };
+      // ACP-R1-01: with no active binding to take over (the role was revoked), this is the
+      // authenticated binding that follows the revoke, exactly as `bind` is: the role's queued mail,
+      // kept instructions and CEO notifications are handed to the new holder in this transaction.
+      if (!current) this.outbox.adoptHolderMessages(roleKey, generation, input.sessionId);
+      // ACP-R1-04: the role joins the incoming runtime's room now, if it never had.
+      this.sessions.recordRoomMembership(input.sessionId);
 
       this.audit.record({
         kind: "BINDING_SWITCHED",
@@ -795,6 +812,8 @@ export class BindingRegistry {
         evidence: { reason: input.reason, fromGeneration: latest.binding_generation, toGeneration: generation },
       });
       const renewed = this.require(input.roleKey);
+      this.sessions.recordRoomMembership(renewed.sessionId);
+      this.outbox.adoptHolderMessages(input.roleKey, renewed.bindingGeneration, renewed.sessionId);
       this.#notifySwitch(renewed);
       return allow(ReasonCode.OK, renewed);
     });
@@ -837,6 +856,33 @@ export class BindingRegistry {
       });
     }
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * One actor can serve several active roles. A pointer write moves all of them, even when only
+   * the initiating role receives a new generation. Record each sibling's move in that same
+   * transaction, before replacing the pointer, so v51 cannot revive its anchor after S→T→S.
+   * The initiating role is covered by its own new generation or BINDING_RUNTIME_MOVED below.
+   */
+  private recordSiblingRuntimeMoves(actorId: string, sessionId: string, initiatingRole: string, reason: string): void {
+    const previous = this.db.get<{ current_session_id: string | null }>(
+      `SELECT current_session_id FROM conversational_actors WHERE actor_id = ?`, [actorId],
+    );
+    if (!previous || previous.current_session_id === sessionId) return;
+    const siblings = this.db.all<{
+      role_key: string; binding_generation: number; project_id: string | null; run_id: string | null;
+    }>(`SELECT role_key, binding_generation, project_id, run_id FROM assignments
+         WHERE actor_id = ? AND status = 'ACTIVE' AND role_key <> ?`, [actorId, initiatingRole]);
+    for (const sibling of siblings) {
+      this.audit.record({
+        kind: "BINDING_RUNTIME_MOVED",
+        roleKey: sibling.role_key,
+        sessionId,
+        projectId: sibling.project_id,
+        runId: sibling.run_id,
+        evidence: { actorId, generation: sibling.binding_generation, reason, fromSession: previous.current_session_id },
+      });
+    }
   }
 
   #notifySwitch(binding: RoleBinding, movedActorId?: string): void {

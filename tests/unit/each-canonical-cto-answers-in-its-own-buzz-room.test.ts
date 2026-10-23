@@ -162,7 +162,11 @@ describe("the same live holder's reattach corrects its own row's room", () => {
     expect(after["sessions"]!.map((row) => JSON.parse(row) as unknown)).toEqual([
       { ...sessionBefore, buzz_address: ROOM, updated_at: expect.any(String) },
     ]);
-    expect(after["audit_events"]).toHaveLength(before["audit_events"]!.length + 1);
+    // Two audit rows: the correction, and the address change every address write records from v51 on
+    // (ACP-R1-04: a session's room history is provable from the audit log).
+    const added = after["audit_events"]!.filter((row) => !before["audit_events"]!.includes(row))
+      .map((row) => (JSON.parse(row) as { kind: string }).kind).sort();
+    expect(added).toEqual(["CANONICAL_CTO_BUZZ_ADDRESS_CORRECTED", "SESSION_BUZZ_ADDRESS_CHANGED"]);
     expect({ ...after, sessions: [], audit_events: [] }).toEqual({ ...before, sessions: [], audit_events: [] });
     // The connection the holder already has is still admitted, under the same binding.
     expect(reattach.admit({ peerPid: RELAY, uid: 501 })).toEqual(admission);

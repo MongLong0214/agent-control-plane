@@ -9,7 +9,7 @@ import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 50;
+export const SCHEMA_VERSION = 51;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const historicalSchemaPath = fileURLToPath(new URL("./schema-v37.sql", import.meta.url));
@@ -19,6 +19,7 @@ const v46SchemaPath = fileURLToPath(new URL("./schema-v46.sql", import.meta.url)
 const v47SchemaPath = fileURLToPath(new URL("./schema-v47.sql", import.meta.url)); // released v47 reads only this
 const v48SchemaPath = fileURLToPath(new URL("./schema-v48.sql", import.meta.url)); // released v48 reads only this
 const v49SchemaPath = fileURLToPath(new URL("./schema-v49.sql", import.meta.url)); // released v49 reads only this
+const v50SchemaPath = fileURLToPath(new URL("./schema-v50.sql", import.meta.url)); // released v50 reads only this
 export const schemaSql = (): string => readFileSync(schemaPath, "utf8");
 const historicalSchemaSql = (): string => readFileSync(historicalSchemaPath, "utf8");
 const schemaSqlAt = (version: number): string =>
@@ -28,7 +29,8 @@ const schemaSqlAt = (version: number): string =>
         : version <= 46 ? readFileSync(v46SchemaPath, "utf8")
           : version <= 47 ? readFileSync(v47SchemaPath, "utf8")
             : version <= 48 ? readFileSync(v48SchemaPath, "utf8")
-              : version <= LATEST_FROZEN_VERSION ? readFileSync(v49SchemaPath, "utf8") : schemaSql();
+              : version <= 49 ? readFileSync(v49SchemaPath, "utf8")
+                : version <= LATEST_FROZEN_VERSION ? readFileSync(v50SchemaPath, "utf8") : schemaSql();
 
 /** Connection PRAGMAs are established by Db before any migration transaction begins. */
 export const schemaDdl = (): string =>
@@ -118,6 +120,7 @@ export const installMigrationLedger = (raw: Database.Database): void => {
  * must be excluded here and created by the migration that owns it.
  */
 const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
+  /-- -{75}\n-- Durable Buzz events[\s\S]*$/,
   /CREATE INDEX IF NOT EXISTS assignments_actor[^;]*;/,
   /-- CP-HI-04 — the identity columns of a binding are fixed once written\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable[\s\S]*?\nEND;/,
   /-- ---------------------------------------------------------------------------\n-- conversational_actor_registrations[\s\S]*?(?=-- ---------------------------------------------------------------------------\n-- assignments)/,
@@ -3990,6 +3993,216 @@ const v50: SchemaMigration = {
   checksum: () => migrationChecksum("v50-post-merge-verification-reentry", 50),
 };
 
+/**
+ * ACP-R1-04 — v51's room membership: one provable anchor per role, and no history (CEO decisions
+ * f42efb13 and 1fd967e8).
+ *
+ * No membership before the migration is inferred — not from a creation address, not from a current
+ * address, and not from address audits: an address write whose audit failed leaves a trail that
+ * looks continuous and is not (FCR-06), and a later audited presence says nothing about the time
+ * before it (FCR-07). A role is known in a room only from a point at which its current authenticated
+ * binding is provably there: the binding's runtime is the session its assignment names (or, after a
+ * same-generation runtime move, the session a `BINDING_RUNTIME_MOVED` record moved it to), that
+ * session's address is the room, and the address has not changed since the session's `updated_at`.
+ * That last holds because every writer of `sessions.buzz_address` — at v50 and at v51, the two
+ * `SessionRegistry.create` INSERTs and `SessionRegistry.setBuzzAddress` — sets `updated_at` to the
+ * current time in the same statement, and every other writer of `updated_at` only sets it to the
+ * current time too. So the role is known there since the latest of the binding's creation, the
+ * latest recorded runtime move onto that session (one back onto the binding's own session included),
+ * and the session's `updated_at`; its membership starts at that time (admission rounds it up to a
+ * whole second, `wholeSecondFloor`). A runtime no move record explains is known there only since the migration, and
+ * is listed as a fallback (`v51AnchorFallbackRoles`).
+ *
+ * Every role on record gets a `role_room_history_unknown` row. Mail signed before a role's
+ * anchor is refused, recorded and never delivered; rows that already carry an admission or a receipt
+ * are not touched. A role whose anchor cannot be read (a timestamp that is not one) cannot be judged:
+ * the step refuses, naming it, and applies nothing.
+ */
+export interface RoleRoomMembershipEvidence {
+  /** Each role whose current binding is in a room, and the anchor it is known there since. */
+  anchored: Array<{
+    roleKey: string;
+    room: string;
+    sessionId: string;
+    bindingCreatedAt: string;
+    sessionUpdatedAt: string;
+    /** The anchored binding: its generation (with `sessionId`, what stop-window mail is admitted on). */
+    bindingGeneration: number;
+    /** The latest recorded runtime move onto `sessionId` within this binding, even back onto its own session. */
+    runtimeMovedAt: string | null;
+    /** The latest of the three; null on a fallback: the role is then known in the room only since the migration. */
+    knownSince: string | null;
+    /**
+     * FCR-11 — why no anchor before the migration could be proven, or null: RUNTIME_MOVE_UNRECORDED when
+     * the role's current runtime is not the session its binding names (or not the session its latest
+     * recorded move names) and no move record explains it. Such a role's stop-window mail is refused,
+     * so a deployment with any must not proceed (`v51AnchorFallbackRoles`).
+     */
+    fallback: "RUNTIME_MOVE_UNRECORDED" | null;
+  }>;
+  /** Every role on record: each gets the record that its history before the migration is unknown. */
+  roles: string[];
+  /** Each role whose anchor cannot be read, with why; any entry makes the step refuse. */
+  refusals: string[];
+  /** For every role, what its anchor rests on, or why it has none. */
+  evidence: Record<string, string[]>;
+}
+
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+
+/** The backfill's judgment from the database's own records; only reads. */
+export const roleRoomMembershipEvidence = (raw: Database.Database): RoleRoomMembershipEvidence => {
+  const instant = (value: unknown): number | null =>
+    typeof value === "string" && ISO_INSTANT.test(value) && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
+  const roles = (raw.prepare(`SELECT DISTINCT role_key FROM assignments ORDER BY role_key`).all() as Array<{ role_key: string }>)
+    .map((row) => row.role_key);
+  const anchored: RoleRoomMembershipEvidence["anchored"] = [];
+  const refusals: string[] = [];
+  const evidence: Record<string, string[]> = {};
+  for (const roleKey of roles) {
+    const proof: string[] = [];
+    evidence[roleKey] = proof;
+    const current = raw.prepare(`SELECT a.assignment_id, a.session_id AS bound_session_id, a.created_at AS binding_created_at,
+          a.binding_generation, s.session_id, s.buzz_address, s.updated_at
+        FROM assignments a
+        LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
+       WHERE a.role_key = ? AND a.status = 'ACTIVE'`).get(roleKey) as {
+      assignment_id: string; bound_session_id: string; binding_created_at: string; binding_generation: number;
+      session_id: string; buzz_address: string | null; updated_at: string;
+    } | undefined;
+    if (!current) {
+      proof.push("no active binding: no room is known");
+      continue;
+    }
+    if (current.buzz_address === null || current.buzz_address === "") {
+      proof.push(`binding ${current.assignment_id} on ${current.session_id}: the runtime has no room, so none is known`);
+      continue;
+    }
+    const room = current.buzz_address;
+    if (instant(current.binding_created_at) === null || instant(current.updated_at) === null) {
+      refusals.push(`${roleKey} (binding ${current.assignment_id} or session ${current.session_id} has a timestamp that is not one)`);
+      continue;
+    }
+    // FCR-09: every recorded runtime move within this binding counts, including one back onto the
+    // session the binding names. The latest must be onto the current runtime; with none, the current
+    // runtime must be that session. Anything else is a runtime no record explains: a fallback.
+    const moves = (raw.prepare(`SELECT at, session_id FROM audit_events WHERE kind = 'BINDING_RUNTIME_MOVED' AND role_key = ?
+        ORDER BY event_id`).all(roleKey) as Array<{ at: string; session_id: string | null }>)
+      .filter((row) => (instant(row.at) ?? -Infinity) >= instant(current.binding_created_at)!);
+    const latestMove = moves.at(-1);
+    const runtimeMovedAt = latestMove && latestMove.session_id === current.session_id ? latestMove.at : null;
+    const fallback = (latestMove ? latestMove.session_id !== current.session_id : current.session_id !== current.bound_session_id)
+      ? "RUNTIME_MOVE_UNRECORDED" as const : null;
+    const candidates = [current.binding_created_at, current.updated_at, ...(runtimeMovedAt === null ? [] : [runtimeMovedAt])];
+    const latest = candidates.reduce((a, b) => (instant(b)! > instant(a)! ? b : a));
+    const knownSince = fallback ? null : latest;
+    anchored.push({ roleKey, room, sessionId: current.session_id, bindingCreatedAt: current.binding_created_at,
+      sessionUpdatedAt: current.updated_at, bindingGeneration: current.binding_generation, runtimeMovedAt, knownSince, fallback });
+    proof.push(`binding ${current.assignment_id} (generation ${current.binding_generation}) created ${current.binding_created_at}; ` +
+      `runtime ${current.session_id} in room ${room}, its address unchanged since its updated_at ${current.updated_at}` +
+      (runtimeMovedAt !== null ? `; latest recorded move onto it ${runtimeMovedAt}` : "") +
+      (fallback ? `; no move record explains this runtime (${fallback}), so known only since the migration` : `: known since ${latest}`));
+  }
+  return { anchored, roles, refusals, evidence };
+};
+
+/**
+ * FCR-11 — every role whose room v51 can anchor only at the migration itself (a fallback): mail signed
+ * for it while the daemon was stopped for the upgrade is refused (recorded, never delivered). A
+ * deployment should not proceed while this is non-empty. Reported by `agentcpd-state migration-plan`
+ * for a database at v50, and recorded by the step in `role_room_history_unknown.anchor_fallback`.
+ */
+export const v51AnchorFallbackRoles = (raw: Database.Database): Array<{ roleKey: string; reason: string }> =>
+  roleRoomMembershipEvidence(raw).anchored
+    .filter((anchor) => anchor.fallback !== null)
+    .map((anchor) => ({ roleKey: anchor.roleKey, reason: anchor.fallback! }));
+
+/**
+ * The floor admission uses for a time v51 derived (an anchor, or the migration itself): that time
+ * rounded up to a whole second, for conservative refusal only. A Buzz event is signed in whole
+ * seconds, so one signed in the time's own second cannot be shown to postdate a sub-second time;
+ * admission compares the signed second with the floor's second, and from the rounded floor on, every
+ * admitted event provably postdates it. A time on a whole second is its own floor. Nothing stored is
+ * rounded — the anchor, the migration time and every change compared with them keep their own
+ * precision — so the rounding can only refuse more, never move a real change before the migration.
+ */
+export const wholeSecondFloor = (iso: string): string => {
+  const ms = Date.parse(iso);
+  return ms % 1000 === 0 ? iso : new Date(Math.ceil(ms / 1000) * 1000).toISOString();
+};
+
+/**
+ * Writes `roleRoomMembershipEvidence`'s anchors and the record of every role's unknown history, or
+ * refuses the whole step, naming every role whose anchor cannot be read: the step's transaction
+ * rolls back and the database is left as it was.
+ */
+const backfillRoleRoomMemberships = (raw: Database.Database): void => {
+  const { anchored, roles, refusals } = roleRoomMembershipEvidence(raw);
+  if (refusals.length > 0) {
+    throw acpError(
+      ReasonCode.CONFLICT,
+      `v51 cannot read the room anchor of ${refusals.length} role(s), so it records none: ${refusals.join("; ")}.`,
+      { roles: refusals },
+    );
+  }
+  const { now: migratedAt } = raw.prepare(`SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS now`).get() as { now: string };
+  const { highWater } = raw.prepare(`SELECT COALESCE(MAX(event_id), 0) AS highWater FROM audit_events`).get() as { highWater: number };
+  const insert = raw.prepare(
+    `INSERT INTO role_room_memberships (role_key, conversation, joined_at, session_id) VALUES (?, ?, ?, ?)`,
+  );
+  const unknown = raw.prepare(`INSERT INTO role_room_history_unknown (role_key, unknown_before, room, known_since,
+      binding_generation, session_id, audit_high_water, anchor_fallback, anchor_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const anchorOf = new Map(anchored.map((anchor) => [anchor.roleKey, anchor]));
+  for (const roleKey of roles) {
+    const anchor = anchorOf.get(roleKey);
+    const knownSince = anchor ? (anchor.knownSince ?? migratedAt) : null;
+    // Stored at its own precision; the whole-second rounding is applied where it is compared (`wholeSecondFloor`).
+    if (anchor) insert.run(roleKey, anchor.room, knownSince, anchor.sessionId);
+    // A clock that ran backwards cannot leave mail between the migration and a later anchor unrecorded.
+    const unknownBefore = knownSince !== null && Date.parse(knownSince) > Date.parse(migratedAt) ? knownSince : migratedAt;
+    unknown.run(roleKey, unknownBefore, anchor?.room ?? null, knownSince, anchor?.bindingGeneration ?? null,
+      anchor?.sessionId ?? null, highWater, anchor?.fallback ?? null, JSON.stringify(anchor
+        ? { bindingCreatedAt: anchor.bindingCreatedAt, sessionUpdatedAt: anchor.sessionUpdatedAt, runtimeMovedAt: anchor.runtimeMovedAt }
+        : {}));
+  }
+};
+
+/**
+ * v51 separates shared signed events from recipient delivery, preserves terminal message IDs, and
+ * records each role's room membership history (ACP-R1-04).
+ */
+const v51: SchemaMigration = {
+  id: "v51-durable-recipient-delivery",
+  fromVersion: 50,
+  toVersion: 51,
+  apply(raw) {
+    const tableNames = ["buzz_events", "holder_message_terminals", "role_room_memberships", "role_room_history_unknown", "outbox_sent_destinations"];
+    const objects: StepObject[] = tableNames.map((name) => ({ type: "table", name, table: name,
+      ddl: schemaObject(new RegExp(String.raw`CREATE TABLE IF NOT EXISTS ${name} \([\s\S]*?\n\) WITHOUT ROWID;`), name, 51) }));
+    objects.push(...stepTriggerObjects(51, ["buzz_events_no_replace", "buzz_events_immutable", "buzz_events_no_delete", "outbox_holder_message_terminal", "holder_message_terminals_immutable", "holder_message_terminals_no_delete", "holder_message_terminals_no_replace"]));
+    assertStepNames(raw, 51, objects, "before");
+    const ddl = schemaSqlAt(51).split("-- Durable Buzz events")[1];
+    if (!ddl) throw new Error("v51 delivery DDL missing");
+    raw.exec("-- Durable Buzz events" + ddl);
+    // Revive delivery-window disposal, never an explicit rejection/supersession. First: a revived row
+    // is live again, so its id is not recorded as terminal below.
+    raw.exec(`UPDATE outbox SET status = 'PENDING', retry_eligible = 0, next_attempt_at = NULL,
+        claim_token = NULL, claimed_at = NULL, failure_class = NULL
+      WHERE (kind = 'CEO_NOTIFICATION' AND (status = 'EXPIRED' OR
+        (status = 'REJECTED' AND last_error = 'target session has no buzz address')))
+        OR (status = 'EXPIRED' AND kind IN ('RUN_DISPATCH','REVISION_REQUEST','ESCALATION_REPLY','DRAIN_REQUEST','CANCEL_REQUEST')
+          AND (run_id IS NULL OR EXISTS (SELECT 1 FROM runs WHERE runs.run_id = outbox.run_id
+            AND state NOT IN ('COMPLETED','CANCELLED','FAILED'))))`);
+    // Only the rows still terminal after the revival.
+    raw.exec(`INSERT OR IGNORE INTO holder_message_terminals (message_id)
+      SELECT message_id FROM outbox WHERE status IN ('ACKED','REJECTED','EXPIRED')`);
+    backfillRoleRoomMemberships(raw);
+    assertStepNames(raw, 51, objects, "after");
+  },
+  checksum: () => migrationChecksum("v51-durable-recipient-delivery", 51),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -4030,6 +4243,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v48,
   v49,
   v50,
+  v51,
 ]);
 
 interface RequiredTrigger {
@@ -4063,6 +4277,13 @@ const REQUIRED_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
  * list cannot fall behind schema.sql again.
  */
 const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
+  { name: "buzz_events_no_replace", sentinel: "INBOUND_PAYLOAD_IMMUTABLE", introducedIn: 51 },
+  { name: "buzz_events_immutable", sentinel: "INBOUND_PAYLOAD_IMMUTABLE", introducedIn: 51 },
+  { name: "buzz_events_no_delete", sentinel: "INBOUND_PAYLOAD_IMMUTABLE", introducedIn: 51 },
+  { name: "outbox_holder_message_terminal", sentinel: "INSERT INTO holder_message_terminals", introducedIn: 51 },
+  { name: "holder_message_terminals_immutable", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 51 },
+  { name: "holder_message_terminals_no_delete", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 51 },
+  { name: "holder_message_terminals_no_replace", sentinel: "HOLDER_MESSAGE_DEPARTURE_IMMUTABLE", introducedIn: 51 },
   { name: "manifests_immutable", sentinel: "MANIFEST_IMMUTABLE" },
   { name: "sessions_incarnation_immutable", sentinel: "SESSION_INCARNATION_IMMUTABLE" },
   { name: "sessions_secret_hash_immutable", sentinel: "SESSION_SECRET_HASH_IMMUTABLE" },
@@ -4383,7 +4604,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * cannot leak back into what a database receives at its v48 step, and v48's checksum is the value the
  * pre-freeze build computed.
  */
-const LATEST_FROZEN_VERSION = 49;
+const LATEST_FROZEN_VERSION = 50;
 
 /**
  * The last version whose stored receipt is compared by value (`receiptMismatches`). It stays at 47 when

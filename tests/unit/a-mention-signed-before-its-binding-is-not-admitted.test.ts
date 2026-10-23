@@ -243,7 +243,7 @@ const start = async (options: { ceoBoundBeforeCtoMs?: number } = {}) => {
     admitted: (eventId: string) =>
       h.cp.db.get<{ actor: string }>(
         `SELECT actor FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
-        [buzzMessageNonce(eventId)],
+        [buzzMessageNonce(eventId, ctoRoleKey)],
       ),
     rowsOf: (kind: MessageKind) =>
       h.cp.db.all<{ message_id: string; status: string }>(
@@ -280,7 +280,7 @@ const start = async (options: { ceoBoundBeforeCtoMs?: number } = {}) => {
     claimOf: (eventId: string): "unresolved" | "settled" | null => {
       const row = h.cp.db.get<{ turn_claim_json: string | null }>(
         `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
-        [buzzMessageNonce(eventId)],
+        [buzzMessageNonce(eventId, ctoRoleKey)],
       );
       if (!row?.turn_claim_json) return null;
       const claim = JSON.parse(row.turn_claim_json) as Record<string, unknown>;
@@ -302,7 +302,7 @@ const start = async (options: { ceoBoundBeforeCtoMs?: number } = {}) => {
         `UPDATE inbound_messages
             SET turn_claim_json = json_remove(turn_claim_json, '$.repliedAt', '$.noReplyAt', '$.settledAt')
           WHERE channel = 'buzz' AND nonce = ?`,
-        [buzzMessageNonce(eventId)],
+        [buzzMessageNonce(eventId, ctoRoleKey)],
       );
     },
     /**
@@ -483,7 +483,7 @@ describe("a mention admitted under an earlier binding generation, redelivered af
 
   for (const { author, claim } of rows) {
     const sender = author === "peer" ? "CEO's peer mention" : "owner's mention";
-    it(`refuses the ${sender} whose prior claim is ${claim} as preceding the binding, with only the CEO refusal audit`, async () => {
+    it(`keeps the ${sender} and its ${claim} delivery state across a takeover`, async () => {
       const f = await start(author === "peer" ? { ceoBoundBeforeCtoMs: 120_000 } : {});
       try {
         const key = author === "peer" ? f.ceo : f.owner;
@@ -494,15 +494,14 @@ describe("a mention admitted under an earlier binding generation, redelivered af
         expect(f.admitted(event.id)?.actor).toBe(key.pubkey);
         expect(f.subscriber.counters().admitted).toBe(1);
 
-        // Settled for the owner by the first holder taking the message and never acknowledging it,
-        // which the takeover then rejects; for the CEO's, by the takeover rejecting the queued row.
-        // Unresolved for the owner because the takeover carries a queued message to the successor.
-        if (author === "owner" && claim === "settled") {
-          expect(claimedText(ownerMessageLedger(f.h.cp).claim(f.holder()))).toBe("첫 세대에 받은 지시");
+        if (claim === "settled") {
+          const ledger = ownerMessageLedger(f.h.cp);
+          const taken = ledger.claim(f.holder());
+          if (!taken.allowed || !taken.value.claimed) throw new Error("fixture message was not claimed");
+          expect(ledger.complete(taken.value.claimed.messageId, f.holder()).allowed).toBe(true);
         }
         const takenOverAt = f.takeOverCto(60_000);
         expect(event.created_at).toBeLessThan(takenOverAt);
-        if (author === "peer" && claim === "unresolved") f.reopenClaim(event.id);
         expect(f.claimOf(event.id)).toBe(claim);
 
         // The relay drops; the reconnect asks from the admitted event on, inclusive, so the relay
@@ -515,9 +514,9 @@ describe("a mention admitted under an earlier binding generation, redelivered af
         const alreadyDurable = f.alreadyDurable();
         await f.relayDelivers(event);
 
-        expect(f.footprint()).toEqual({ ...before, audit: before.audit + (author === "peer" ? 1 : 0) });
-        expect(f.precedesBinding()).toBe(1);
-        expect(f.alreadyDurable()).toBe(alreadyDurable);
+        expect(f.footprint()).toEqual({ ...before, audit: before.audit + 1 });
+        expect(f.precedesBinding()).toBe(0);
+        expect(f.alreadyDurable()).toBe(alreadyDurable + 1);
         expect(f.claimOf(event.id)).toBe(claim);
         // Terminal and cursor-trusted, as on a first delivery: the connection stays, nothing is
         // retried, and the window stays on the event.
@@ -566,9 +565,9 @@ describe("a mention admitted under an earlier binding generation, redelivered af
       const before = f.footprint();
       const answer = await f.socketDelivers(event);
 
-      expect(answer.allowed).toBe(false);
-      expect(answer.reasonCode).toBe(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN);
-      expect(f.footprint()).toEqual({ ...before, audit: before.audit + 1 });
+      expect(answer.allowed).toBe(true);
+      expect(f.footprint()).toEqual(before);
+      expect(f.rowsOf(MessageKind.OWNER_MESSAGE)).toHaveLength(1);
     } finally {
       await f.close();
     }

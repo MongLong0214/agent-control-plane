@@ -7,6 +7,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { startBuzzMessageIngressListener, startDaemonBuzzMentionSubscriber, startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Role } from "../../src/domain/types.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import type { SessionWakeTrigger } from "../../src/runtime/provisioned-session-runtime.ts";
 import { withBootstrapRuntime } from "../helpers/bootstrap-cto-fixture.ts";
@@ -117,7 +118,7 @@ for (const variant of ["claimed-reset", "claimed-pointer-moved", "wrong-event-ro
               claims.push(await callMcpToolOverSocket(f.ctoSocket, as, "role_owner_message_claim", { roleKey: binding.roleKey }) as ClaimAnswer);
               // The previous event was really claimed. Only its writable pointer is changed:
               // neither the current event's row nor its immutable departure evidence is touched.
-              cp.db.run("UPDATE outbox SET payload_json = json_set(payload_json, '$.sourceNonce', ?) WHERE message_id = ?", [`buzz-message:${eventId}`, priorMessageId]);
+              cp.db.run("UPDATE outbox SET payload_json = json_set(payload_json, '$.sourceNonce', ?) WHERE message_id = ?", [buzzMessageNonce(eventId, binding.roleKey), priorMessageId]);
             } else if (variant === "terminal-rejection") {
               const rejected=await callMcpToolOverSocket(f.ctoSocket,as,"role_owner_message_reject",{roleKey:binding.roleKey,messageId});
               expect(rejected.ok).toBe(true);
@@ -154,7 +155,7 @@ for (const variant of ["claimed-reset", "claimed-pointer-moved", "wrong-event-ro
         eventId=event.id;
         relay.publish(event);
         await relay.drain(subscriber);
-        messageId=cp.db.get<{message_id:string}>("SELECT message_id FROM outbox WHERE json_extract(payload_json,'$.sourceNonce')=?",[`buzz-message:${event.id}`])!.message_id;
+        messageId=cp.db.get<{message_id:string}>("SELECT message_id FROM outbox WHERE json_extract(payload_json,'$.sourceNonce')=?",[buzzMessageNonce(event.id, binding.roleKey)])!.message_id;
         expect(enqueue("drift-coalesced-ordinary").allowed).toBe(true);
         const mentionTrigger: SessionWakeTrigger | undefined = wakes.mock.calls
           .flatMap(([, triggers]) => triggers)
@@ -164,7 +165,7 @@ for (const variant of ["claimed-reset", "claimed-pointer-moved", "wrong-event-ro
         await vi.waitFor(() => expect(f.finishedTurns(binding.sessionId)).toBe(finishedBefore + 2));
 
         const served=mentionTrigger!.served!();
-        const departures=cp.db.all<{ reason: string }>("SELECT * FROM holder_message_source_departures WHERE source_nonce=?",[`buzz-message:${event.id}`]);
+        const departures=cp.db.all<{ reason: string }>("SELECT * FROM holder_message_source_departures WHERE source_nonce=?",[buzzMessageNonce(event.id, binding.roleKey)]);
         const retry=cp.sessionRuntime.wake(binding.roleKey,[mentionTrigger!]);
         if(retry.allowed && variant !== "wrong-event-row") {
           const settled=f.finishedTurns(binding.sessionId);
@@ -173,7 +174,7 @@ for (const variant of ["claimed-reset", "claimed-pointer-moved", "wrong-event-ro
         }
         if(variant === "wrong-event-row") {
           expect(departures).toEqual([]);
-          expect(claims[0]?.value?.claimed).toBeNull();
+          expect(claims[0]?.value?.claimed?.provenance?.eventId).toBe("prior-event");
           expect(cp.outbox.get(messageId)?.status).toBe("PENDING");
           expect(served,"a different event's remapped SENT row is not claim evidence for this event").toBe(false);
           expect(retry.allowed,"the withheld mention must be released").toBe(true);

@@ -505,10 +505,18 @@ describe("outbox fencing (PRD §15.7, §27.5)", () => {
   });
 
   it("expires overdue messages instead of delivering them late", () => {
-    const { outbox, clock } = enqueue();
+    const { outbox, clock } = enqueue(MessageKind.REVIEW_REQUEST);
     clock.advance(31 * 60 * 1000);
     expect(outbox.expireOverdue()).toBe(1);
     expect(outbox.claimDeliverable()).toHaveLength(0);
+  });
+
+  // ACP-R1-01: an actionable instruction ends only by ACK or a recorded supersession.
+  it("never expires an actionable instruction, and delivers it late", () => {
+    const { outbox, clock, message } = enqueue();
+    clock.advance(31 * 60 * 1000);
+    expect(outbox.expireOverdue()).toBe(0);
+    expect(outbox.claimDeliverable().map((m) => m.messageId)).toEqual([message.allowed ? message.value.messageId : ""]);
   });
 });
 

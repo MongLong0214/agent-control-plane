@@ -74,11 +74,19 @@ describe("a delivery timeout is unknown, not a failure to deliver (#451)", () =>
     await adapter.deliverPending();
 
     const row = statusOf(core, messageId);
+    // ACP-R1-01: an actionable instruction is never ended by a failed attempt, and an unknown outcome
+    // is not put back in the queue either: it is SENT, awaiting its ACK.
     expect(
       row?.status,
       "a timed-out send went back to PENDING, so the same envelope will be delivered twice",
-    ).toBe("REJECTED");
+    ).toBe("SENT");
     expect(row?.failure_class).toBe("unknown_observed");
+    expect(core.outbox.claimDeliverable()).toHaveLength(0);
+    // Buzz has no same-id dedupe or receipt lookup, so it is never re-sent to the same receiver on a
+    // timer (CEO decision 9b15c462): retained and flagged, awaiting its ACK or a new receiver.
+    core.clock.advance(24 * 60 * 60_000);
+    expect(core.outbox.claimDeliverable()).toHaveLength(0);
+    expect(statusOf(core, messageId)).toEqual({ status: "SENT", failure_class: "unknown_observed" });
   });
 
   it("still retries a failure that happened before anything was sent", async () => {

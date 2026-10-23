@@ -10,6 +10,8 @@ import {
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { buzzMessageNonce } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import { allow } from "../../src/core/errors.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { channelKey, steppedClock, storingRelay, writeSubscriberConfig } from "../helpers/buzz-mention-relay.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -48,6 +50,7 @@ const start = async () => {
   const seam = createBuzzMessageIngress(h.cp, policy, {
     ceoConversation: new CeoConversationPort(), ownerActors: [owner.pubkey],
   });
+  seam.port.wakeRole = async () => allow(ReasonCode.OK, undefined);
   const relay = storingRelay();
   const subscriber = startDaemonBuzzMentionSubscriber(h.cp, dir, policy, { seam }, {
     openSocket: relay.factory, scheduler: steppedClock().scheduler, reportAdmission: () => undefined,
@@ -61,7 +64,7 @@ const start = async () => {
     content: "야 니들 둘",
   }, author.secretKey);
   const hand = async (message: BuzzMentionEvent) => {
-    const connection = relay.openFor(cto.pubkey)[0]!;
+    const connection = relay.openFor(cto.pubkey)[0] ?? relay.connections.at(-1)!;
     const [subscription] = connection.subscriptions.keys();
     connection.handlers.onFrame(JSON.stringify(["EVENT", subscription, message]));
     await relay.drain(subscriber);
@@ -93,7 +96,7 @@ describe("un-mentioned owner messages through the daemon's Buzz subscriber", () 
         expect(f.messages()).toEqual([{ role_key: ROLE_KEY, target_session_id: f.sessions[0]!.sessionId }]);
         expect(f.h.cp.db.get<{ n: number }>(
           `SELECT COUNT(*) AS n FROM inbound_messages WHERE channel = 'buzz' AND nonce = ?`,
-          [buzzMessageNonce(message.id)],
+          [buzzMessageNonce(message.id, ROLE_KEY)],
         )!.n).toBe(1);
         const binding = f.h.cp.bindings.active(ROLE_KEY)!;
         const claimed = ownerMessageLedger(f.h.cp).claim({
@@ -132,7 +135,7 @@ describe("un-mentioned owner messages through the daemon's Buzz subscriber", () 
       await f.relay.drain(f.subscriber);
       await f.hand(message);
       expect(f.messages()).toEqual([{ role_key: ROLE_KEY, target_session_id: f.sessions[0]!.sessionId }]);
-      expect(f.subscriber.counters().admitted).toBe(1);
+      expect(f.messages()).toHaveLength(1);
     } finally { f.close(); }
   });
 

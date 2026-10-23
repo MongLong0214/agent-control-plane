@@ -253,12 +253,44 @@ describe("#1189 §2.C: a run's review rounds, from existing records", () => {
     expect(failed!.nextNewCandidate?.candidateSnapshotDigest).toBe(fixed!.candidateSnapshotDigest);
   });
 
-  it("shows a return whose CTO binding was replaced as not delivered to the binding now", async () => {
+  it("shows a return whose CTO binding was replaced as handed to the new binding under the same id, never the replaced one, and still refuses a delivery whose own key is invalid", async () => {
     const harness = makeHarness();
-    const { projectId, runId, submit, covered } = await startRun(harness);
+    const { projectId, runId, run, submit, covered } = await startRun(harness);
     harness.scripted.script({ match: /Candidate review/, text: reviewerRevise(covered, "a finding") });
     expect(stageOf(await submit())).toBe("REVISION_REQUIRED");
-    expect(summaryOf(harness, runId).rounds[0]!.deliveries[0]).toMatchObject({ bindingGeneration: 1, toCurrentBinding: true });
+    const before = summaryOf(harness, runId).rounds[0]!.deliveries;
+    expect(before).toEqual([expect.objectContaining({ bindingGeneration: 1, toCurrentBinding: true })]);
+    const messageId = before[0]!.messageId;
+    const replaced = { sessionId: run.ownerSessionId!, incarnation: harness.cp.sessions.require(run.ownerSessionId!).incarnation };
+
+    // #1192's anti-bypass contract: a delivery whose own attempt or candidate is not the round's is
+    // never that round's delivery, wherever it is addressed. Each forgery copies the real row.
+    const judged = () => {
+      const sources = readReviewRoundSources(harness.cp, runId);
+      const real = sources.outbox.find((message) => message.messageId === messageId)!;
+      const candidate = (real.payload as { candidateSnapshotDigest: string }).candidateSnapshotDigest;
+      const otherCandidate = `sha256:${"0".repeat(64)}`;
+      const forgeries = {
+        // Keyed by an attempt no freeze of this run names.
+        attempt: { ...real, messageId: "forged-attempt", idempotencyKey: real.idempotencyKey.replace(/:[^:]+$/, `:attempt_${"f".repeat(24)}`) },
+        // Keyed by the round's own attempt, for another candidate: that contradicts the round's stamp.
+        candidate: { ...real, messageId: "forged-candidate", idempotencyKey: real.idempotencyKey.replace(candidate, otherCandidate),
+          payload: { ...(real.payload as Record<string, unknown>), candidateSnapshotDigest: otherCandidate } },
+      };
+      return Object.fromEntries(Object.entries(forgeries).map(([name, forgery]) => {
+        const summary = summarizeReviewRounds({ ...sources, outbox: [...sources.outbox, forgery] });
+        return [name, {
+          unattributed: summary.unattributedDeliveries.map((entry) => entry.messageId).sort(),
+          attributed: summary.rounds.flatMap((round) => round.deliveries.map((delivery) => delivery.messageId)),
+        }];
+      }));
+    };
+    const refusedBefore = judged();
+    expect(refusedBefore).toEqual({
+      attempt: { unattributed: ["forged-attempt"], attributed: [messageId] },
+      // The round's stamp is no longer trusted, so it takes no delivery at all.
+      candidate: { unattributed: ["forged-candidate", messageId].sort(), attributed: [] },
+    });
 
     const replacement = harness.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
     harness.cp.sessions.transition(replacement.sessionId, SessionLifecycle.READY, "replacement CTO");
@@ -272,15 +304,34 @@ describe("#1189 §2.C: a run's review rounds, from existing records", () => {
     });
     if (!switched.allowed) throw new Error(switched.message);
 
+    // v51: the same message id, handed to the authenticated current holder; no delivery remains with
+    // the replaced binding.
     const summary = summaryOf(harness, runId);
     expect(summary.ownerBinding).toMatchObject({ bindingGeneration: 2, sessionId: replacement.sessionId });
-    expect(summary.rounds[0]!.deliveries).toHaveLength(1);
-    expect(summary.rounds[0]!.deliveries[0]).toMatchObject({
-      bindingGeneration: 1,
-      status: "REJECTED",
-      toCurrentBinding: false,
+    expect(summary.rounds[0]!.deliveries).toEqual([expect.objectContaining({
+      messageId,
+      bindingGeneration: 2,
+      targetSessionId: replacement.sessionId,
+      status: "PENDING",
+      toCurrentBinding: true,
       acknowledged: false,
-    });
+    })]);
+    // The forgeries, now addressed to the current binding too, are refused exactly as before.
+    expect(judged()).toEqual(refusedBefore);
+
+    // The replaced binding is never handed it and cannot settle it; the current holder's claim and
+    // completion happen once inside ACP, and the summary shows that delivery at the new generation.
+    expect(harness.cp.outbox.acknowledge(messageId, replaced.sessionId, 1, replaced.incarnation).allowed).toBe(false);
+    harness.cp.outbox.fenceUndeliverable();
+    const claimed = harness.cp.outbox.claimDeliverable();
+    expect(claimed.filter((message) => message.bindingGeneration === 1 || message.targetSessionId === replaced.sessionId)).toEqual([]);
+    const revisions = claimed.filter((message) => message.messageId === messageId);
+    expect(revisions).toHaveLength(1);
+    expect(harness.cp.outbox.markSent(messageId, revisions[0]!.claimToken).allowed).toBe(true);
+    expect(harness.cp.outbox.claimDeliverable().filter((message) => message.messageId === messageId)).toEqual([]);
+    expect(summaryOf(harness, runId).rounds[0]!.deliveries).toEqual([expect.objectContaining({
+      messageId, bindingGeneration: 2, status: "SENT", toCurrentBinding: true, acknowledged: false,
+    })]);
   });
 
   it("shows an escalation on the round it followed, before any next candidate, and keeps it there", async () => {
