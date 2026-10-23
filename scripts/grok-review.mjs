@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 /**
- * Independent production-readiness review by Grok (grok-4.6-build, reasoning effort `xhigh`,
- * which is the CLI's maximum — `max` is rejected).
+ * Independent production-readiness review by Grok, reasoning effort `xhigh`.
+ *
+ * The model is selected here and passed with `-m`, never left to the CLI's configured default:
+ * a default that moves would change the reviewer while every manifest still looked the same.
+ * `--model=<id>` selects another. When an area's CLI reports a model other than the one selected,
+ * the manifest and summary say the model identity is UNKNOWN.
  *
  * Same shape as `scripts/production-review.mjs` (GPT-6.1 Sol) on purpose: the areas are the
  * ones the PRD gives distinct authority to, the reviewer reads the repository itself rather
@@ -33,6 +37,7 @@
  *   node scripts/grok-review.mjs --out=evidence/review-grok-2 # must not exist yet
  *   node scripts/grok-review.mjs --allow-dirty                # HEAD, recording that uncommitted work was not reviewed
  *   node scripts/grok-review.mjs --area-timeout-ms=600000     # per-area bound (default 45 minutes)
+ *   node scripts/grok-review.mjs --model=grok-4.7             # another model (default grok-4.6)
  *
  * The default output directory is `evidence/local/audit-runs/grok-review-<run id>/`.
  * Exit status: 0 every selected area returned a well-formed report, 1 at least one did not,
@@ -45,6 +50,9 @@ import { fileURLToPath } from "node:url";
 import { runAudit } from "./lib/audit-run.mjs";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+
+// The installed CLI's own default id when this was written; `--model=<id>` overrides it per run.
+const DEFAULT_MODEL = "grok-4.6";
 
 const SCHEMA = {
   type: "object",
@@ -183,6 +191,7 @@ const reviewArea = async (key, area, ctx) => {
   const preamble = readFileSync(join(ctx.checkoutDir, PRD), "utf8").length;
   const args = [
     "-p", prompt(key, area, ctx.revision, preamble),
+    "-m", ctx.model,
     "--output-format", "json",
     "--json-schema", JSON.stringify(SCHEMA),
     "--reasoning-effort", "xhigh",
@@ -198,6 +207,7 @@ const reviewArea = async (key, area, ctx) => {
   const child = await ctx.runChild("grok", args);
   const artifacts = [];
   let candidate;
+  let reportedModel = null;
   try {
     // The CLI prints one JSON envelope whose answer is `text` (measured, not assumed:
     // `result` does not exist on it). With --json-schema that text *is* the JSON report,
@@ -205,6 +215,7 @@ const reviewArea = async (key, area, ctx) => {
     const start = child.stdout.indexOf("{");
     if (start === -1) throw new Error("grok printed no JSON envelope");
     const envelope = JSON.parse(child.stdout.slice(start));
+    if (typeof envelope.model === "string") reportedModel = envelope.model;
     if (envelope.total_cost_usd) {
       writeFileSync(join(ctx.outDir, `${key}.cost`), String(envelope.total_cost_usd));
       artifacts.push(`${key}.cost`);
@@ -227,7 +238,7 @@ const reviewArea = async (key, area, ctx) => {
   }
   // A parsed report is used only if the child also exited 0: a CLI that printed a verdict and
   // then failed has not been shown to have finished the review.
-  return { child, candidate, artifacts };
+  return { child, candidate, artifacts, reportedModel };
 };
 
 /**
@@ -254,7 +265,8 @@ await runAudit({
   sequential: true,
   reviewer: {
     cli: "grok",
-    model: "the CLI's configured default (this script passes no model flag)",
+    model: DEFAULT_MODEL,
+    modelSelectable: true,
     reasoningEffort: "xhigh",
     permissionMode: "plan",
   },

@@ -253,7 +253,7 @@ const reviewArea = async (key, area, ctx) => {
   const child = await ctx.runChild("codex", [
     "exec",
     "-m",
-    MODEL,
+    ctx.model,
     "-c",
     `model_reasoning_effort="${REASONING_EFFORT}"`,
     "-s",

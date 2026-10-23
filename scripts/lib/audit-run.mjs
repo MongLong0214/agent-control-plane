@@ -18,19 +18,24 @@
  *
  *   1. **Pin a commit.** `--rev=<ref>` (default `HEAD`) is resolved to a commit and its tree. An
  *      unknown ref is refused. When the commit is the working tree's own HEAD and the tree holds
- *      tracked or untracked changes anywhere (ignored files aside), the run is refused too: reviewing HEAD would leave that work
- *      out, and calling the result "a review of the current work" would be false. `--allow-dirty`
- *      reviews HEAD anyway and records that the uncommitted changes were not reviewed.
+ *      tracked or untracked changes anywhere (ignored files aside), the run is refused too:
+ *      reviewing HEAD would leave that work out, and calling the result "a review of the current
+ *      work" would be false. `--allow-dirty` reviews HEAD anyway and records that the uncommitted
+ *      changes were not reviewed.
  *   2. **Read a separate checkout.** The reviewer's working directory is a disposable
  *      `git worktree add --detach` of that commit under the system temporary directory, with hooks
- *      disabled. The user's working tree, index and branch are never reset or written; cleanup
- *      removes only that checkout.
+ *      disabled, compared byte for byte with the commit's blobs before any reviewer starts. A
+ *      checkout that differs — a smudge filter or an eol attribute rewrote it — is refused. The
+ *      user's working tree, index and branch are never reset or written; cleanup removes only
+ *      that checkout.
  *   3. **Write a new directory.** Every run creates its own output directory and refuses one that
  *      already exists, so no file in it can predate the run.
  *   4. **Attribute every result.** `manifest.json` names the run, the exact revision and tree, the
- *      selected areas, the reviewer CLI and model, and each area's execution result and artifacts
- *      with their digests. `summary.json` is a view of the per-area reports on disk, restricted to
- *      the ones this manifest attributes and only while their bytes still match what was recorded.
+ *      selected areas, the reviewer CLI and model (or that the model is UNKNOWN), and each area's
+ *      execution result and artifacts with their digests. A report is read once, and its verdict,
+ *      finding count and digest all come from those bytes. `summary.json` is a view of the
+ *      per-area reports on disk, restricted to the ones this manifest attributes and only while
+ *      their bytes still match what was recorded.
  *
  * Two outcomes are reported separately and never folded into each other: whether each reviewer
  * *ran* (`execution`) and what it *found* (`verdict`). A child that failed, timed out, was
@@ -48,12 +53,17 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   accessSync,
+  closeSync,
   constants,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -113,10 +123,45 @@ const git = (cwd, args) =>
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
+/** Writes through a temporary name and returns the exact bytes written. */
 const writeJson = (path, value) => {
+  const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
   const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`);
+  writeFileSync(temporary, bytes);
   renameSync(temporary, path);
+  return bytes;
+};
+
+/** `lstat`, so a dangling symbolic link or a FIFO still counts as something being there. */
+const present = (path) => {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * One read of a regular file through one descriptor: `{ bytes }` or `{ problem }`. A symbolic
+ * link, FIFO or anything else that could hand a second reader different bytes is refused rather
+ * than read; `O_NONBLOCK` keeps a FIFO from holding this process until something writes to it.
+ */
+const readRegularFile = (path) => {
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { problem: "missing" };
+    if (error?.code === "ELOOP") return { problem: "a symbolic link, not a regular file" };
+    return { problem: messageOf(error) };
+  }
+  try {
+    if (!fstatSync(fd).isFile()) return { problem: "not a regular file" };
+    return { bytes: readFileSync(fd) };
+  } finally {
+    closeSync(fd);
+  }
 };
 
 const tildify = (path) => {
@@ -136,8 +181,8 @@ const shown = (repoRoot, path) => {
  * An option this script does not know is refused rather than ignored. `--ref=HEAD~1` for
  * `--rev=HEAD~1` used to run a full review of HEAD and say nothing about it.
  */
-const parseArguments = (argv, areaKeys) => {
-  const options = { out: undefined, rev: "HEAD", allowDirty: false, areaTimeoutMs: DEFAULT_AREA_TIMEOUT_MS };
+const parseArguments = (argv, areaKeys, { modelSelectable }) => {
+  const options = { out: undefined, rev: "HEAD", allowDirty: false, areaTimeoutMs: DEFAULT_AREA_TIMEOUT_MS, model: undefined };
   const seen = new Set();
   const areas = [];
   const valueOf = (name, value) => {
@@ -177,9 +222,16 @@ const parseArguments = (argv, areaKeys) => {
         options.areaTimeoutMs = milliseconds;
         break;
       }
+      case "--model":
+        if (modelSelectable) {
+          options.model = valueOf(name, value);
+          break;
+        }
+      // falls through: this script's model is pinned
       default:
         throw new Refusal(
-          `unknown option: ${name} (accepted: --rev=<ref>, --out=<new directory>, --allow-dirty, --area-timeout-ms=<n>)`,
+          `unknown option: ${name} (accepted: --rev=<ref>, --out=<new directory>, --allow-dirty, --area-timeout-ms=<n>` +
+            `${modelSelectable ? ", --model=<id>" : ""})`,
         );
     }
   }
@@ -294,8 +346,64 @@ const identify = (reviewer) => {
 // ---------------------------------------------------------------------------------------------
 // The disposable checkout
 
-const trackedChangesIn = (dir) =>
-  git(dir, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=no"]);
+/** Git's object id for `bytes` as a blob, in the repository's own hash (the commit id's length says which). */
+const blobId = (commit, bytes) =>
+  createHash(commit.length === 64 ? "sha256" : "sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+
+/**
+ * Where the checkout's bytes differ from the pinned commit's blobs, compared byte for byte.
+ *
+ * `git status` is not this question. A smudge filter, an `eol` attribute or `ident` rewrites the
+ * file as it is checked out while the index still names the committed blob, and whether status
+ * notices depends on its stat cache; measured, a repository-local smudge filter made the reviewer
+ * read `NOT IN PINNED COMMIT` where the commit holds `pinned v1`, and the run reported PASS. So each
+ * tracked path is hashed here as raw bytes, with no filter, and compared with the tree entry.
+ * Gitlinks are skipped: a worktree does not check out submodules. `extraFiles` also reports files
+ * the commit does not have; after a run that is off, because a reviewer CLI may leave a cache.
+ */
+const checkoutDifferences = (dir, commit, { extraFiles }) => {
+  const expected = new Map();
+  for (const entry of git(dir, ["ls-tree", "-r", "-z", "--full-tree", commit]).split("\0").filter(Boolean)) {
+    const tab = entry.indexOf("\t");
+    const [mode, type, oid] = entry.slice(0, tab).split(" ");
+    expected.set(entry.slice(tab + 1), { mode, type, oid });
+  }
+  const differences = [];
+  for (const [path, entry] of expected) {
+    if (entry.type !== "blob") continue;
+    const full = join(dir, path);
+    let stat;
+    try {
+      stat = lstatSync(full);
+    } catch {
+      differences.push(`${path}: missing`);
+      continue;
+    }
+    if (entry.mode === "120000") {
+      if (!stat.isSymbolicLink()) differences.push(`${path}: not the symbolic link the commit holds`);
+      else if (blobId(commit, readlinkSync(full, { encoding: "buffer" })) !== entry.oid) differences.push(`${path}: link target differs from the commit`);
+    } else if (!stat.isFile()) {
+      differences.push(`${path}: not a regular file`);
+    } else if (blobId(commit, readFileSync(full)) !== entry.oid) {
+      differences.push(`${path}: bytes differ from the commit`);
+    }
+  }
+  if (extraFiles) {
+    const walk = (relativeDir) => {
+      for (const dirent of readdirSync(join(dir, relativeDir), { withFileTypes: true })) {
+        const path = relativeDir === "" ? dirent.name : `${relativeDir}/${dirent.name}`;
+        if (path === ".git") continue; // the linked worktree's pointer to its git directory
+        if (dirent.isDirectory()) walk(path);
+        else if (!expected.has(path)) differences.push(`${path}: not in the commit`);
+      }
+    };
+    walk("");
+  }
+  return differences;
+};
+
+const describeDifferences = (differences) =>
+  `${differences.slice(0, 5).map((difference) => JSON.stringify(difference)).join(", ")}${differences.length > 5 ? `, and ${differences.length - 5} more` : ""}`;
 
 const createCheckout = (repoRoot, revision) => {
   const scratch = realpathSync(mkdtempSync(join(tmpdir(), "acp-audit-")));
@@ -307,13 +415,22 @@ const createCheckout = (repoRoot, revision) => {
     git(repoRoot, ["-c", `core.hooksPath=${noHooks}`, "worktree", "add", "--detach", "--quiet", dir, revision.commit]);
     const [commit, tree] = git(dir, ["rev-parse", "HEAD", "HEAD^{tree}"]).trim().split("\n");
     if (commit !== revision.commit || tree !== revision.tree) {
-      throw new Error(`the disposable checkout holds ${commit}/${tree}, not the pinned ${revision.commit}/${revision.tree}`);
+      throw new Refusal(`the disposable checkout holds ${commit}/${tree}, not the pinned ${revision.commit}/${revision.tree}`);
     }
-    checkout.trackedChanges = trackedChangesIn(dir);
+    const differences = checkoutDifferences(dir, revision.commit, { extraFiles: true });
+    if (differences.length > 0) {
+      throw new Refusal(
+        `the disposable checkout of ${revision.commit.slice(0, 12)} does not hold that commit's bytes ` +
+          `(${differences.length} path(s): ${describeDifferences(differences)}). Something in this repository's ` +
+          "checkout configuration (a smudge filter, an eol or ident attribute) changed what a reviewer would read, " +
+          `so no review of it would be a review of ${revision.commit.slice(0, 12)}. No reviewer was started.`,
+      );
+    }
     return checkout;
   } catch (error) {
     removeCheckout(repoRoot, checkout);
-    throw error;
+    if (error instanceof Refusal) throw error;
+    throw new Refusal(`could not prepare a disposable checkout of ${revision.commit.slice(0, 12)}: ${messageOf(error)}`);
   }
 };
 
@@ -466,38 +583,59 @@ const reportProblem = (value) => {
   return null;
 };
 
-/** Reads a completed child's report. `{ report: "VALID", value }`, or a report state and a reason. */
-const consume = (candidate, reportPath, reportFile) => {
+/**
+ * Validation, verdict, finding count and digest all come from one byte sequence, captured once.
+ * A report that is read twice — once to validate, once to digest — can be two different reports:
+ * measured, a BLOCK with one finding was validated, another invocation's PASS was digested, and
+ * the manifest and the summary disagreed while the run exited 0.
+ */
+const fromBytes = (bytes, reportFile) => {
   let value;
-  if (candidate?.kind === "value") {
-    value = candidate.value;
-  } else if (candidate?.kind === "file") {
-    if (!existsSync(reportPath)) return { report: "MISSING", reason: `the reviewer exited 0 without writing ${reportFile}` };
-    try {
-      value = JSON.parse(readFileSync(reportPath, "utf8"));
-    } catch (error) {
-      return { report: "UNPARSABLE", reason: `${reportFile} is not JSON (truncated or partial): ${messageOf(error)}` };
-    }
-  } else {
-    return {
-      report: candidate?.kind === "invalid" ? "INVALID" : "UNPARSABLE",
-      reason: candidate?.reason ?? "the reviewer returned no report",
-    };
+  try {
+    value = JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    return { report: "UNPARSABLE", reason: `${reportFile} is not JSON (truncated or partial): ${messageOf(error)}` };
   }
   const problem = reportProblem(value);
-  return problem === null ? { report: "VALID", value } : { report: "INVALID", reason: problem };
+  return problem === null ? { report: "VALID", value, bytes } : { report: "INVALID", reason: problem };
+};
+
+/** A completed child's report: `{ report: "VALID", value, bytes }`, or a report state and a reason. */
+const consume = (candidate, reportPath, reportFile) => {
+  if (candidate?.kind === "file") {
+    const read = readRegularFile(reportPath);
+    if (read.problem === "missing") return { report: "MISSING", reason: `the reviewer exited 0 without writing ${reportFile}` };
+    if (read.problem !== undefined) return { report: "INVALID", reason: `${reportFile} is ${read.problem}` };
+    return fromBytes(read.bytes, reportFile);
+  }
+  if (candidate?.kind === "value") {
+    const consumed = fromBytes(Buffer.from(`${JSON.stringify(candidate.value, null, 2)}\n`), reportFile);
+    if (consumed.report !== "VALID") return consumed;
+    try {
+      // Exclusive: if anything is at this path, this run did not put it there.
+      writeFileSync(reportPath, consumed.bytes, { flag: "wx" });
+    } catch (error) {
+      return { report: "INVALID", reason: `could not write ${reportFile} as this run's own file: ${messageOf(error)}` };
+    }
+    return consumed;
+  }
+  return {
+    report: candidate?.kind === "invalid" ? "INVALID" : "UNPARSABLE",
+    reason: candidate?.reason ?? "the reviewer returned no report",
+  };
 };
 
 const quarantine = (path, suffix) => {
-  if (!existsSync(path)) return null;
+  if (!present(path)) return null;
   const moved = `${path}.${suffix}`;
   renameSync(path, moved);
   return moved;
 };
 
 const digestOf = (outDir, name) => {
-  const bytes = readFileSync(join(outDir, name));
-  return { name, sha256: sha256(bytes), bytes: bytes.length };
+  const read = readRegularFile(join(outDir, name));
+  if (read.problem !== undefined) return { name, sha256: null, bytes: null, problem: read.problem };
+  return { name, sha256: sha256(read.bytes), bytes: read.bytes.length };
 };
 
 /**
@@ -519,7 +657,7 @@ const executeArea = async (key, area, ctx, reviewArea) => {
     const now = new Date();
     outcome = { child: { spawnError: messageOf(error), timedOut: false, interrupted: false, overflowed: false, code: null, signal: null, stdout: "", stderr: "", startedAt: now, endedAt: now }, candidate: null };
   }
-  const { child, candidate } = outcome;
+  const { child, candidate, reportedModel = null } = outcome;
   const artifacts = [...(outcome.artifacts ?? [])];
   writeFileSync(join(ctx.outDir, `${key}.log`), `${child.stdout}\n--- stderr ---\n${child.stderr}`);
   artifacts.push(`${key}.log`);
@@ -531,18 +669,20 @@ const executeArea = async (key, area, ctx, reviewArea) => {
     startedAt: child.startedAt.toISOString(),
     endedAt: child.endedAt.toISOString(),
     seconds: Math.round((child.endedAt.getTime() - child.startedAt.getTime()) / 1000),
+    reportedModel,
     report: "NOT_CONSUMED",
     reportFile: null,
     verdict: null,
     findings: null,
   };
+  let reportDigest = null;
 
   if (record.execution === "COMPLETED") {
     const consumed = consume(candidate, reportPath, reportFile);
     record.report = consumed.report;
     if (consumed.report === "VALID") {
-      if (candidate.kind === "value") writeFileSync(reportPath, `${JSON.stringify(consumed.value, null, 2)}\n`);
       Object.assign(record, { reportFile, verdict: consumed.value.verdict, findings: consumed.value.findings.length });
+      reportDigest = { name: reportFile, sha256: sha256(consumed.bytes), bytes: consumed.bytes.length };
     } else {
       notes.push(consumed.reason);
     }
@@ -550,12 +690,14 @@ const executeArea = async (key, area, ctx, reviewArea) => {
     notes.push(whyNotCompleted(child, ctx.timeoutMs));
   }
 
-  if (record.report === "VALID") {
-    artifacts.push(reportFile);
-  } else if (quarantine(reportPath, "unconsumed") !== null) {
+  if (record.report !== "VALID" && quarantine(reportPath, "unconsumed") !== null) {
     artifacts.push(`${reportFile}.unconsumed`);
   }
-  record.artifacts = artifacts.filter((name) => existsSync(join(ctx.outDir, name))).map((name) => digestOf(ctx.outDir, name));
+  // The report's digest is of the bytes that were validated, never of a later read of the path.
+  record.artifacts = [
+    ...artifacts.filter((name) => present(join(ctx.outDir, name))).map((name) => digestOf(ctx.outDir, name)),
+    ...(reportDigest === null ? [] : [reportDigest]),
+  ];
   if (notes.length > 0) record.notes = notes;
   return record;
 };
@@ -569,6 +711,22 @@ const executeArea = async (key, area, ctx, reviewArea) => {
  * finished. An unselected area is NOT_RUN whatever file exists for it; a report that changed
  * afterwards is STALE; anything without a well-formed report is ERROR. None of them is PASS.
  */
+/**
+ * The model is identified only when this run selected one explicitly and no area's CLI reported
+ * a different one. Otherwise it is UNKNOWN, said so in plain words, and never filled with a
+ * description of where the model might have come from.
+ */
+const modelIdentityOf = (reviewer, results) => {
+  if (reviewer.model === null) {
+    return { modelIdentity: "UNKNOWN", modelNote: "no model was selected, so the CLI used one this run cannot see" };
+  }
+  const others = [...new Set(Object.values(results).map((record) => record.reportedModel).filter((model) => typeof model === "string" && model !== reviewer.model))];
+  if (others.length > 0) {
+    return { modelIdentity: "UNKNOWN", modelNote: `${reviewer.model} was selected but the CLI reported ${others.join(", ")}` };
+  }
+  return { modelIdentity: "ESTABLISHED" };
+};
+
 const summarize = ({ tool, manifest, outDir, areaKeys }) => {
   const results = areaKeys.map((key) => {
     if (!manifest.selectedAreas.includes(key)) {
@@ -583,17 +741,16 @@ const summarize = ({ tool, manifest, outDir, areaKeys }) => {
       return { ...base, result: "ERROR", report: record.report, verdict: null, findings: null, reason: (record.notes ?? []).join("; ") };
     }
     const recorded = record.artifacts.find((artifact) => artifact.name === record.reportFile);
-    let bytes = null;
-    try {
-      bytes = readFileSync(join(outDir, record.reportFile));
-    } catch {
-      // gone, which is STALE below
-    }
-    if (bytes === null || recorded === undefined || sha256(bytes) !== recorded.sha256) {
+    const read = readRegularFile(join(outDir, record.reportFile));
+    if (read.problem !== undefined || recorded === undefined || sha256(read.bytes) !== recorded.sha256) {
       return { ...base, result: "STALE", report: "STALE", verdict: null, findings: null, reason: `${record.reportFile} is not the report this run recorded for ${key}` };
     }
-    const report = JSON.parse(bytes.toString("utf8"));
-    return { ...base, result: report.verdict, report: "VALID", verdict: report.verdict, findings: report.findings.length };
+    // Same bytes as were validated, so the same answer; checked anyway rather than assumed.
+    const report = fromBytes(read.bytes, record.reportFile);
+    if (report.report !== "VALID" || report.value.verdict !== record.verdict || report.value.findings.length !== record.findings) {
+      return { ...base, result: "ERROR", report: "STALE", verdict: null, findings: null, reason: `${record.reportFile} does not say what this run recorded for ${key}` };
+    }
+    return { ...base, result: record.verdict, report: "VALID", verdict: record.verdict, findings: record.findings };
   });
 
   const selected = results.filter((result) => result.selected);
@@ -615,6 +772,9 @@ const summarize = ({ tool, manifest, outDir, areaKeys }) => {
     schema: "acp-audit-summary/1",
     tool,
     reviewer: manifest.reviewer.cli,
+    reviewerModel: manifest.reviewer.model,
+    reviewerModelIdentity: manifest.reviewer.modelIdentity,
+    ...(manifest.reviewer.modelNote === undefined ? {} : { reviewerModelNote: manifest.reviewer.modelNote }),
     runId: manifest.runId,
     requestedRef: manifest.requestedRef,
     revision: manifest.revision,
@@ -639,16 +799,21 @@ export const runAudit = async ({ tool, script, repoRoot, areas, sequential, revi
   installInterruptHandlers();
   const areaKeys = Object.keys(areas);
   const runId = newRunId();
+  const { modelSelectable = false, ...reviewerIdentity } = reviewer;
   let options;
   let pinned;
   let identity;
+  let checkout = null;
   let outDir;
   try {
-    options = parseArguments(process.argv.slice(2), areaKeys);
+    options = parseArguments(process.argv.slice(2), areaKeys, { modelSelectable });
     pinned = pinRevision(repoRoot, options);
-    identity = identify(reviewer);
+    identity = identify({ ...reviewerIdentity, model: options.model ?? reviewerIdentity.model ?? null });
+    // Before the output directory: a checkout that does not hold the commit's bytes is a refusal.
+    checkout = createCheckout(repoRoot, pinned.revision);
     outDir = createOutputDirectory(repoRoot, { out: options.out, tool, runId });
   } catch (error) {
+    if (checkout !== null) removeCheckout(repoRoot, checkout);
     if (!(error instanceof Refusal)) throw error;
     console.error(`${tool}: refused: ${error.message}`);
     process.exit(EXIT.REFUSED);
@@ -683,16 +848,17 @@ export const runAudit = async ({ tool, script, repoRoot, areas, sequential, revi
     status: "RUNNING",
     exitCode: null,
     interruptedBy: null,
-    checkout: { method: "git worktree add --detach, hooks disabled, under the system temporary directory" },
+    checkout: {
+      method: "git worktree add --detach, hooks disabled, under the system temporary directory",
+      verified: "every tracked path's bytes equal the commit's blob, and nothing else is present",
+    },
     results: {},
     artifacts: [],
   };
   writeJson(manifestPath, manifest);
 
-  let checkout = null;
   try {
-    checkout = createCheckout(repoRoot, revision);
-    const ctx = { checkoutDir: checkout.dir, scratchDir: checkout.scratch, outDir, revision, timeoutMs: options.areaTimeoutMs };
+    const ctx = { checkoutDir: checkout.dir, scratchDir: checkout.scratch, outDir, revision, model: identity.model, timeoutMs: options.areaTimeoutMs };
     const one = async (key) => {
       if (interruptedBy !== null) return;
       const record = await executeArea(key, areas[key], ctx, reviewArea);
@@ -706,17 +872,20 @@ export const runAudit = async ({ tool, script, repoRoot, areas, sequential, revi
     };
     if (sequential) for (const key of options.areas) await one(key);
     else await Promise.all(options.areas.map(one));
-    manifest.checkout.trackedChangesDuringRun = trackedChangesIn(checkout.dir) !== checkout.trackedChanges;
+    const changed = checkoutDifferences(checkout.dir, revision.commit, { extraFiles: false });
+    manifest.checkout.trackedChangesDuringRun = changed.length > 0;
+    if (changed.length > 0) manifest.checkout.changedDuringRun = changed.slice(0, 20);
   } catch (error) {
     manifest.error = messageOf(error);
     console.error(`${tool}: ${manifest.error}`);
   } finally {
-    if (checkout !== null) Object.assign(manifest.checkout, removeCheckout(repoRoot, checkout));
+    Object.assign(manifest.checkout, removeCheckout(repoRoot, checkout));
   }
 
   manifest.interruptedBy = interruptedBy;
+  Object.assign(manifest.reviewer, modelIdentityOf(manifest.reviewer, manifest.results));
   const summary = summarize({ tool, manifest, outDir, areaKeys });
-  writeJson(join(outDir, "summary.json"), summary);
+  const summaryBytes = writeJson(join(outDir, "summary.json"), summary);
   const exitCode =
     summary.execution === "INTERRUPTED" ? EXIT.INTERRUPTED : summary.execution === "COMPLETE" ? EXIT.COMPLETE : EXIT.INCOMPLETE;
   // What this run wrote, as recorded when each area finished, plus its summary. A file someone else
@@ -726,7 +895,9 @@ export const runAudit = async ({ tool, script, repoRoot, areas, sequential, revi
     endedAt: new Date().toISOString(),
     status: summary.execution,
     exitCode,
-    artifacts: [...artifacts, digestOf(outDir, "summary.json")].sort((a, b) => (a.name < b.name ? -1 : 1)),
+    artifacts: [...artifacts, { name: "summary.json", sha256: sha256(summaryBytes), bytes: summaryBytes.length }].sort((a, b) =>
+      a.name < b.name ? -1 : 1,
+    ),
   });
   writeJson(manifestPath, manifest);
 
@@ -734,6 +905,9 @@ export const runAudit = async ({ tool, script, repoRoot, areas, sequential, revi
   const notPass = summary.results.filter((result) => result.selected && result.result !== "PASS").map((result) => `${result.key}=${result.result}`);
   console.log(`\nexecution: ${summary.execution} — ${reported} of ${options.areas.length} selected area(s) returned a well-formed report`);
   console.log(`findings verdict: ${summary.findingsVerdict}${notPass.length > 0 ? ` (${notPass.join(", ")})` : ""}`);
+  console.log(
+    `reviewer model: ${summary.reviewerModelIdentity === "ESTABLISHED" ? summary.reviewerModel : `UNKNOWN (${summary.reviewerModelNote})`}`,
+  );
   if (summary.unattributedFiles.length > 0) {
     console.log(`not attributed to this run, so not read: ${summary.unattributedFiles.join(", ")}`);
   }

@@ -103,23 +103,35 @@ if (plan.mutateOriginal) fs.writeFileSync(path.join(plan.mutateOriginal, "src", 
 let subject = null;
 try { subject = fs.readFileSync(path.join(viewDir, "src", "subject.txt"), "utf8"); } catch {}
 const nonce = Math.random().toString(36).slice(2) + "-" + process.pid;
-fs.appendFileSync(process.env.FAKE_REVIEWER_LOG, JSON.stringify({ cli, area, mode, viewDir, subject }) + "\n");
+const model = after("-m") ?? null;
+fs.appendFileSync(process.env.FAKE_REVIEWER_LOG, JSON.stringify({ cli, area, mode, viewDir, subject, model }) + "\n");
 const reportOf = (verdict, tag) => ({
   verdict,
   filesExamined: ["src/subject.txt", tag],
   omittedItems: [],
   findings: verdict === "PASS" ? [] : [{ severity: "MAJOR", category: "correctness", file: "src/subject.txt", line: 1, summary: "s", detail: "d", suggestedFix: "f" }],
 });
-const textOf = (report) => cli === "codex" ? JSON.stringify(report) : JSON.stringify({ text: "narration", structuredOutput: report, stopReason: "end_turn" });
+const textOf = (report) => cli === "codex" ? JSON.stringify(report) : JSON.stringify({ text: "narration", structuredOutput: report, stopReason: "end_turn", ...(plan.reportedModel ? { model: plan.reportedModel } : {}) });
 const emit = (text) => { if (cli === "codex") fs.writeFileSync(outPath, text); else process.stdout.write(text); };
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
-const report = textOf(reportOf(mode === "revise" ? "REVISE" : "PASS", "nonce " + nonce));
+const report = textOf(reportOf(mode === "revise" ? "REVISE" : mode === "block" ? "BLOCK" : "PASS", "nonce " + nonce));
 (async () => {
   switch (mode) {
     case "pass":
     case "revise":
+    case "block":
       emit(report);
       process.exit(0);
+    case "fifo": {
+      // A FIFO where the report goes, fed by a detached writer that hands successive readers
+      // different reports. grok's report path is one the script writes, so it is named in the plan.
+      const cp = require("node:child_process");
+      const target = cli === "codex" ? outPath : path.join(plan.fifoDir, area + ".json");
+      cp.execFileSync("mkfifo", [target], { timeout: 5000 });
+      cp.spawn(process.execPath, [plan.feeder, cli, target], { stdio: "ignore", detached: true }).unref();
+      if (cli === "grok") process.stdout.write(textOf(reportOf("BLOCK", "fifo")));
+      process.exit(0);
+    }
     case "fail":
       process.stderr.write("fake reviewer: failed\n");
       process.exit(1);
@@ -157,7 +169,77 @@ const report = textOf(reportOf(mode === "revise" ? "REVISE" : "PASS", "nonce " +
 })();
 `;
 
+/**
+ * Feeds the FIFO: a BLOCK to the first reader (or, for grok, accepts the runner's own write), then
+ * another invocation's PASS to each later reader. Opens without O_CREAT so it never leaves a
+ * regular file behind, and exits after three seconds whatever it is waiting on.
+ */
+const FIFO_FEEDER = String.raw`
+const fs = require("node:fs");
+const [kind, file] = process.argv.slice(2);
+const block = JSON.stringify({ verdict: "BLOCK", filesExamined: ["fifo"], omittedItems: [], findings: [{ severity: "MAJOR", category: "correctness", file: "src/subject.txt", line: 1, summary: "s", detail: "d", suggestedFix: "f" }] });
+const pass = JSON.stringify({ verdict: "PASS", filesExamined: ["another invocation"], omittedItems: [], findings: [] });
+setTimeout(() => process.exit(0), 3000);
+const nap = () => new Promise((done) => setTimeout(done, 200));
+const write = async (text) => { const handle = await fs.promises.open(file, fs.constants.O_WRONLY); try { await handle.writeFile(text); } finally { await handle.close(); } };
+const read = async () => { const handle = await fs.promises.open(file, fs.constants.O_RDONLY); try { await handle.readFile(); } finally { await handle.close(); } };
+(async () => {
+  try {
+    if (kind === "grok") await read(); else await write(block);
+    await nap();
+    await write(pass);
+    await nap();
+    await write(pass);
+  } catch {}
+})();
+`;
+
+/**
+ * Loaded into the script with `--import`. The first time the runner reads or writes a BLOCK report
+ * at `core.json` — by path or through a descriptor opened on it — another writer atomically
+ * replaces that path with a different invocation's PASS. Whatever the runner captured before that
+ * moment is all it may vouch for; the marker file proves the replacement happened.
+ */
+const SWAP_PRELOAD = String.raw`
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const original = { openSync: fs.openSync, closeSync: fs.closeSync, readFileSync: fs.readFileSync, readSync: fs.readSync, writeFileSync: fs.writeFileSync };
+const opened = new Map();
+let swapped = false;
+const isReport = (path) => typeof path === "string" && path.endsWith("/core.json");
+const holdsBlock = (data) => {
+  try { return (Buffer.isBuffer(data) || data instanceof Uint8Array ? Buffer.from(data).toString("utf8") : String(data)).includes('"BLOCK"'); } catch { return false; }
+};
+const pathOf = (target) => (typeof target === "number" ? opened.get(target) : target);
+const swap = (path) => {
+  if (swapped) return;
+  swapped = true;
+  original.writeFileSync(path + ".swap", JSON.stringify({ verdict: "PASS", filesExamined: ["another invocation"], omittedItems: [], findings: [] }));
+  fs.renameSync(path + ".swap", path);
+  original.writeFileSync(process.env.SWAP_MARKER, path);
+};
+fs.openSync = function (path, ...rest) { const fd = original.openSync.call(this, path, ...rest); if (isReport(path)) opened.set(fd, path); return fd; };
+fs.closeSync = function (fd, ...rest) { opened.delete(fd); return original.closeSync.call(this, fd, ...rest); };
+fs.readFileSync = function (target, ...rest) {
+  const result = original.readFileSync.call(this, target, ...rest);
+  if (isReport(pathOf(target)) && holdsBlock(result)) swap(pathOf(target));
+  return result;
+};
+fs.readSync = function (fd, buffer, ...rest) {
+  const result = original.readSync.call(this, fd, buffer, ...rest);
+  if (isReport(pathOf(fd)) && holdsBlock(buffer)) swap(pathOf(fd));
+  return result;
+};
+fs.writeFileSync = function (target, data, ...rest) {
+  const result = original.writeFileSync.call(this, target, data, ...rest);
+  if (isReport(pathOf(target)) && holdsBlock(data)) swap(pathOf(target));
+  return result;
+};
+syncBuiltinESMExports();
+`;
+
 interface Fixture {
+  readonly base: string;
   readonly root: string;
   readonly bin: string;
   readonly plan: string;
@@ -170,6 +252,7 @@ interface Call {
   readonly area: string;
   readonly viewDir: string;
   readonly subject: string | null;
+  readonly model: string | null;
 }
 
 interface Plan {
@@ -178,9 +261,17 @@ interface Plan {
   readonly mutateOriginal?: string;
   readonly tamperRepo?: string;
   readonly tamperOut?: string;
+  readonly reportedModel?: string;
+  readonly fifoDir?: string;
+  readonly feeder?: string;
 }
 
-const makeFixture = (): Fixture => {
+/**
+ * `smudged`: the commit carries a `.gitattributes` filter and the repository's own config defines
+ * it to rewrite `src/subject.txt` on checkout. The original checkout stays clean — its file was
+ * written before the filter existed — while any new checkout reads bytes the commit does not hold.
+ */
+const makeFixture = (options: { smudged?: boolean } = {}): Fixture => {
   // Physical path: a script resolves its own location through symlinks (`/var` -> `/private/var`).
   const base = realpathSync(mkdtempSync(join(tmpdir(), "acp-audit-scripts-")));
   roots.push(base);
@@ -193,6 +284,7 @@ const makeFixture = (): Fixture => {
   const files: Record<string, string> = {
     ".gitignore": "evidence/local/\n",
     "src/subject.txt": "pinned v1\n",
+    ...(options.smudged === true ? { ".gitattributes": "src/subject.txt filter=inject\n" } : {}),
     "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md": "# fixture PRD\n",
   };
   for (const [name, body] of Object.entries(files)) {
@@ -206,6 +298,10 @@ const makeFixture = (): Fixture => {
   }
   git(root, "add", "-A");
   git(root, "commit", "-q", "--no-verify", "-m", "base");
+  if (options.smudged === true) {
+    git(root, "config", "--local", "filter.inject.smudge", "sed 's/pinned v1/NOT IN PINNED COMMIT/'");
+    git(root, "config", "--local", "filter.inject.clean", "cat");
+  }
   for (const cli of Object.values(CLI)) {
     writeFileSync(join(bin, cli), `#!${process.execPath}\n${FAKE_REVIEWER}`);
     chmodSync(join(bin, cli), 0o755);
@@ -214,7 +310,7 @@ const makeFixture = (): Fixture => {
   const log = join(base, "reviewer.log");
   writeFileSync(log, "");
   const path = [...new Set([bin, gitDirectory(), "/usr/bin", "/bin"])].join(delimiter);
-  return { root, bin, plan, log, env: { ...baseEnv(), PATH: path, FAKE_REVIEWER_PLAN: plan, FAKE_REVIEWER_LOG: log } };
+  return { base, root, bin, plan, log, env: { ...baseEnv(), PATH: path, FAKE_REVIEWER_PLAN: plan, FAKE_REVIEWER_LOG: log } };
 };
 
 const setPlan = (fixture: Fixture, plan: Plan): void => writeFileSync(fixture.plan, JSON.stringify(plan));
@@ -236,10 +332,20 @@ interface Run {
  * The script runs in its own process group, and the bound reaps that group. A script that waits on
  * a hung reviewer forever — a680e971 waited 45 minutes — fails here with a message naming the bound.
  */
-const start = (fixture: Fixture, script: Script, argv: readonly string[]): { child: ChildProcess; done: Promise<Run> } => {
-  const child = spawn(process.execPath, [join(fixture.root, "scripts", script), ...argv], {
+interface Launch {
+  readonly nodeArgs?: readonly string[];
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+const start = (
+  fixture: Fixture,
+  script: Script,
+  argv: readonly string[],
+  launch: Launch = {},
+): { child: ChildProcess; done: Promise<Run> } => {
+  const child = spawn(process.execPath, [...(launch.nodeArgs ?? []), join(fixture.root, "scripts", script), ...argv], {
     cwd: fixture.root,
-    env: fixture.env,
+    env: { ...fixture.env, ...launch.env },
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -272,7 +378,8 @@ const start = (fixture: Fixture, script: Script, argv: readonly string[]): { chi
   return { child, done };
 };
 
-const run = (fixture: Fixture, script: Script, argv: readonly string[]): Promise<Run> => start(fixture, script, argv).done;
+const run = (fixture: Fixture, script: Script, argv: readonly string[], launch: Launch = {}): Promise<Run> =>
+  start(fixture, script, argv, launch).done;
 
 const waitFor = async (condition: () => boolean, what: string): Promise<void> => {
   const deadline = Date.now() + RUN_BUDGET_MS;
@@ -300,6 +407,9 @@ interface Summary {
   readonly findingsVerdict?: string;
   readonly mergeApproval?: boolean;
   readonly unattributedFiles?: readonly string[];
+  readonly reviewerModel?: string | null;
+  readonly reviewerModelIdentity?: string;
+  readonly reviewerModelNote?: string;
   readonly workingTree?: { readonly dirty: boolean; readonly uncommittedWorkReviewed: boolean };
 }
 
@@ -318,8 +428,18 @@ const entryOf = (summary: Summary | null, key: string): SummaryEntry | undefined
 const manifestIn = (dir: string): Record<string, unknown> & {
   revision: { commit: string; tree: string };
   selectedAreas: string[];
-  reviewer: { cli: string; path: string; version: string | null };
-  results: Record<string, { execution: string; report: string }>;
+  reviewer: { cli: string; path: string; version: string | null; model: string | null; modelIdentity?: string };
+  results: Record<
+    string,
+    {
+      execution: string;
+      report: string;
+      verdict: string | null;
+      findings: number | null;
+      reportedModel?: string | null;
+      artifacts: { name: string; sha256: string | null }[];
+    }
+  >;
   status: string;
   runId: string;
   startedAt: string;
@@ -579,6 +699,120 @@ describe.each(SCRIPTS)("%s", (script) => {
         expect(samePath(call.viewDir, fixture.root)).toBe(false);
         expect(existsSync(call.viewDir)).toBe(false);
       }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "refuses a disposable checkout that does not hold the pinned commit's bytes, before any reviewer starts",
+    async () => {
+      const fixture = makeFixture({ smudged: true });
+      setPlan(fixture, { default: "pass" });
+      expect(git(fixture.root, "status", "--porcelain", "--untracked-files=all")).toBe("");
+      const worktrees = git(fixture.root, "worktree", "list", "--porcelain");
+
+      const result = await run(fixture, script, ["core"]);
+      // a680e971..ea57c9b0: the reviewer read `NOT IN PINNED COMMIT` and the run said PASS.
+      expect(callsOf(fixture).map((call) => call.subject)).toEqual([]);
+      expect(result.status).toBe(2);
+      expect(result.stderr).toMatch(/does not hold that commit's bytes/);
+      expect(result.stderr).toMatch(/src\/subject\.txt: bytes differ from the commit/);
+      expect(existsSync(join(fixture.root, "evidence"))).toBe(false);
+      expect(git(fixture.root, "worktree", "list", "--porcelain")).toBe(worktrees);
+      expect(readFileSync(join(fixture.root, SUBJECT), "utf8")).toBe("pinned v1\n");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "vouches only for the report bytes it validated when another writer replaces them right after",
+    async () => {
+      const fixture = makeFixture();
+      setPlan(fixture, { default: "block" });
+      const preload = join(fixture.base, "swap-preload.mjs");
+      const marker = join(fixture.base, "swapped");
+      writeFileSync(preload, SWAP_PRELOAD);
+
+      const result = await run(fixture, script, ["core"], { nodeArgs: ["--import", preload], env: { SWAP_MARKER: marker } });
+      const dir = runDirectoryOf(fixture, script, result);
+      const summary = summaryIn(dir);
+      expect(resultOf(summary, "core")).not.toBe("PASS");
+      expect(existsSync(marker)).toBe(true);
+      expect(result.status).toBe(1);
+      const core = manifestIn(dir).results["core"];
+      expect(core).toMatchObject({ verdict: "BLOCK", findings: 1, report: "VALID" });
+      const recorded = core?.artifacts.find((artifact) => artifact.name === "core.json")?.sha256;
+      expect(recorded).not.toBe(createHash("sha256").update(readFileSync(join(dir, "core.json"))).digest("hex"));
+      expect(entryOf(summary, "core")).toMatchObject({ result: "STALE", verdict: null });
+      expect(summary?.findingsVerdict).toBe("UNDETERMINED");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "does not read a report from a FIFO that hands each reader different bytes",
+    async () => {
+      const fixture = makeFixture();
+      const out = join("evidence", "local", "fifo");
+      const feeder = join(fixture.base, "feeder.cjs");
+      writeFileSync(feeder, FIFO_FEEDER);
+      setPlan(fixture, { default: "fifo", fifoDir: join(fixture.root, out), feeder });
+
+      const result = await run(fixture, script, ["core", `--out=${out}`]);
+      const summary = summaryIn(join(fixture.root, out));
+      expect(resultOf(summary, "core")).not.toBe("PASS");
+      expect(result.status).toBe(1);
+      expect(entryOf(summary, "core")).toMatchObject({ result: "ERROR", execution: "COMPLETED", report: "INVALID" });
+      expect(summary?.findingsVerdict).toBe("UNDETERMINED");
+      expect(existsSync(join(fixture.root, out, "core.json"))).toBe(false);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe("the reviewer model", () => {
+  it(
+    "grok-review.mjs selects its model explicitly, records it, and says UNKNOWN when the CLI reports another",
+    async () => {
+      const fixture = makeFixture();
+      setPlan(fixture, { default: "pass" });
+      const first = await run(fixture, "grok-review.mjs", ["core"]);
+      expect(callsOf(fixture).map((call) => call.model)).toEqual(["grok-4.6"]);
+      expect(first.status).toBe(0);
+      const firstDir = runDirectoryOf(fixture, "grok-review.mjs", first);
+      expect(manifestIn(firstDir).reviewer).toMatchObject({ model: "grok-4.6", modelIdentity: "ESTABLISHED" });
+      expect(summaryIn(firstDir)).toMatchObject({ reviewerModel: "grok-4.6", reviewerModelIdentity: "ESTABLISHED" });
+
+      const chosen = await run(fixture, "grok-review.mjs", ["core", "--model=grok-4.7"]);
+      expect(callsOf(fixture).at(-1)?.model).toBe("grok-4.7");
+      expect(manifestIn(runDirectoryOf(fixture, "grok-review.mjs", chosen)).reviewer.model).toBe("grok-4.7");
+
+      setPlan(fixture, { default: "pass", reportedModel: "grok-somebody-else" });
+      const other = await run(fixture, "grok-review.mjs", ["core"]);
+      const otherDir = runDirectoryOf(fixture, "grok-review.mjs", other);
+      const manifest = manifestIn(otherDir);
+      expect(manifest.results["core"]?.reportedModel).toBe("grok-somebody-else");
+      expect(manifest.reviewer).toMatchObject({ model: "grok-4.6", modelIdentity: "UNKNOWN" });
+      const summary = summaryIn(otherDir);
+      expect(summary?.reviewerModelIdentity).toBe("UNKNOWN");
+      expect(summary?.reviewerModelNote).toMatch(/grok-somebody-else/);
+      expect(other.stdout).toMatch(/reviewer model: UNKNOWN/);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "production-review.mjs passes and records its pinned model and refuses another",
+    async () => {
+      const fixture = makeFixture();
+      setPlan(fixture, { default: "pass" });
+      const refused = await run(fixture, "production-review.mjs", ["core", "--model=gpt-other"]);
+      expect(refused.status).toBe(2);
+      expect(callsOf(fixture)).toEqual([]);
+      const result = await run(fixture, "production-review.mjs", ["core"]);
+      expect(callsOf(fixture).map((call) => call.model)).toEqual(["gpt-6.1-sol"]);
+      const dir = runDirectoryOf(fixture, "production-review.mjs", result);
+      expect(summaryIn(dir)).toMatchObject({ reviewerModel: "gpt-6.1-sol", reviewerModelIdentity: "ESTABLISHED" });
     },
     TEST_TIMEOUT_MS,
   );
