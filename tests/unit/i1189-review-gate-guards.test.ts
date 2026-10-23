@@ -253,14 +253,14 @@ describe("#1189 §3: a new reviewer judges only the candidate", () => {
   it("the next reviewer sees no earlier verdict, no producer claim and no CTO reasoning, and a 'fixed' claim passes nothing", async () => {
     const harness = makeHarness();
     const { runId, ceoSessionId, submit, covered } = await startRun(harness);
-    const firstFinding = "first-round finding text 7f3a";
+    const firstFinding = "first-round finding text zqvwk";
     harness.scripted.script({ match: /Candidate review/, text: reviewerRevise(covered, firstFinding) });
-    expect((await submit("first producer summary 91c2", "first recommendation 4d0e"))).toMatchObject({
+    expect((await submit("first producer summary xqzvj", "first recommendation wqzky"))).toMatchObject({
       allowed: true,
       value: { stage: "REVISION_REQUIRED" },
     });
     harness.scripted.script({ match: /Candidate review/, text: reviewerRevise(covered, "still wrong") });
-    const second = await submit("All review findings are fixed 5b8c.", "merge now 2e6f");
+    const second = await submit("All review findings are fixed zkqxw.", "merge now yqzjv");
     if (!second.allowed || second.value.stage !== "REVISION_REQUIRED") {
       throw new Error(`unexpected outcome: ${JSON.stringify(second).slice(0, 400)}`);
     }
@@ -273,10 +273,11 @@ describe("#1189 §3: a new reviewer judges only the candidate", () => {
       firstFinding,
       firstReview.digest,
       firstReview.content.reviewerSessionId,
-      "first producer summary 91c2",
-      "first recommendation 4d0e",
-      "5b8c",
-      "2e6f",
+      // Markers spelt with letters no digest or id can contain, so a hash in the prompt cannot match them.
+      "first producer summary xqzvj",
+      "first recommendation wqzky",
+      "zkqxw",
+      "yqzjv",
     ]) {
       expect(later).not.toContain(withheld);
     }

@@ -272,6 +272,26 @@ const text = (value: unknown): string | null => (typeof value === "string" ? val
 const record = (value: unknown): Record<string, unknown> | null =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 
+/** A revision's key, `revision:<run>:<candidate>:<reason>:<attempt>`, read back; null when it is not one. */
+const revisionKeyOf = (
+  idempotencyKey: string,
+): { runId: string; candidateDigest: string; reasonCode: string; attemptId: string } | null => {
+  if (!idempotencyKey.startsWith("revision:")) return null;
+  const rest = idempotencyKey.slice("revision:".length);
+  const runEnd = rest.indexOf(":");
+  const attemptStart = rest.lastIndexOf(":");
+  const reasonStart = rest.lastIndexOf(":", attemptStart - 1);
+  if (runEnd <= 0 || reasonStart <= runEnd || attemptStart <= reasonStart + 1) return null;
+  const attemptId = rest.slice(attemptStart + 1);
+  if (!ATTEMPT_ID.test(attemptId)) return null;
+  return {
+    runId: rest.slice(0, runEnd),
+    candidateDigest: rest.slice(runEnd + 1, reasonStart),
+    reasonCode: rest.slice(reasonStart + 1, attemptStart),
+    attemptId,
+  };
+};
+
 const attemptOfKey = (idempotencyKey: string): string | null => {
   const last = idempotencyKey.slice(idempotencyKey.lastIndexOf(":") + 1);
   return last.startsWith("attempt_") ? last : null;
@@ -315,6 +335,8 @@ interface RoundState {
   freeze: AuditRow;
   digest: string | null;
   reclaimed: boolean;
+  /** Its freeze carries an attempt stamp the run's own records contradict: nothing is attributed to it. */
+  tainted: boolean;
   /** The attempt this round is, once a record proves it; never replaced or cleared afterwards. */
   attemptId: string | null;
   bindings: Array<{ sessionId: string; purpose: string | null }>;
@@ -372,6 +394,7 @@ export const summarizeReviewRounds = (
     freeze,
     digest: text(freeze.evidence["candidateSnapshotDigest"]),
     reclaimed: false,
+    tainted: false,
     attemptId: null,
     bindings: [],
     completed: [],
@@ -417,8 +440,10 @@ export const summarizeReviewRounds = (
   // replaced or cleared; an attempt belongs to at most one round. The lease row keeps only the
   // latest attempt, so it is used to contradict a stamp, never to name one.
   const roundOfAttempt = new Map<string, number>();
+  /** Attempt ids a stamp check refused: no later path may name them again. */
+  const rejectedAttempts = new Set<string>();
   const establish = (state: RoundState, attemptId: string): void => {
-    if (state.attemptId !== null || roundOfAttempt.has(attemptId)) return;
+    if (state.attemptId !== null || state.tainted || roundOfAttempt.has(attemptId) || rejectedAttempts.has(attemptId)) return;
     state.attemptId = attemptId;
     roundOfAttempt.set(attemptId, state.index);
   };
@@ -444,9 +469,17 @@ export const summarizeReviewRounds = (
         (message.runId !== sources.runId || !message.idempotencyKey.startsWith(`revision:${sources.runId}:${state.digest}:`)),
     );
   };
+  // A stamp that is present but not trusted taints its round and its attempt id for every later path.
+  for (const state of states) {
+    if (!Object.hasOwn(state.freeze.evidence, "attemptId")) continue;
+    const stamp = state.freeze.evidence["attemptId"];
+    if (typeof stamp === "string" && !contradicted(state, stamp)) continue;
+    state.tainted = true;
+    if (typeof stamp === "string") rejectedAttempts.add(stamp);
+  }
   for (const state of states) {
     const stamp = state.freeze.evidence["attemptId"];
-    if (typeof stamp === "string" && !contradicted(state, stamp)) establish(state, stamp);
+    if (typeof stamp === "string" && !state.tainted) establish(state, stamp);
   }
 
   // A reclaimed attempt may still write after the next freeze: exactly that round when its stamp is
@@ -527,6 +560,11 @@ export const summarizeReviewRounds = (
   // round's slot takes its claims together, so no outcome depends on which claim is read first.
   const claims = new Map<RoundState, AuditRow[]>();
   const claim = (state: RoundState, row: AuditRow): void => {
+    // A round whose stamp was refused takes nothing, by any path: what would be its own is listed.
+    if (state.tainted) {
+      unplaced(row, [state]);
+      return;
+    }
     claims.set(state, [...(claims.get(state) ?? []), row]);
   };
   const frozenAs = (digest: string): RoundState[] => states.filter((state) => state.digest === digest);
@@ -674,10 +712,22 @@ export const summarizeReviewRounds = (
 
   // A delivery goes to the round its own trusted attempt is, and only if that round's return is the
   // one it carries. Without a trusted attempt it goes to the one round whose return it alone carries.
-  // Anything else is listed with the rounds it matches.
+  // Either way its key must agree first: this run, that round's candidate, the reason it carries, and
+  // an attempt that is not refused, not another round's, and not other than the round's own. Anything
+  // else is listed with the rounds it matches, and names no attempt.
   const deliveriesOf = new Map<number, OutboxMessage[]>();
   const carriersOf = (message: OutboxMessage): RoundState[] =>
     states.filter((state) => state.returned[0] !== undefined && deliveredReturn(message, state.returned[0], state.completed[0]?.sessionId ?? null));
+  const keyAgrees = (message: OutboxMessage, owner: RoundState): boolean => {
+    const key = revisionKeyOf(message.idempotencyKey);
+    const payload = record(message.payload);
+    if (key === null || owner.tainted || message.runId !== sources.runId || key.runId !== sources.runId) return false;
+    if (key.candidateDigest !== owner.digest || payload?.["candidateSnapshotDigest"] !== owner.digest || payload?.["reasonCode"] !== key.reasonCode) return false;
+    if (rejectedAttempts.has(key.attemptId)) return false;
+    const holder = roundOfAttempt.get(key.attemptId);
+    if (holder !== undefined && holder !== owner.index) return false;
+    return owner.attemptId === null || owner.attemptId === key.attemptId;
+  };
   for (const message of revisionMessages) {
     const carriers = carriersOf(message);
     const attemptId = attemptOfKey(message.idempotencyKey);
@@ -685,6 +735,7 @@ export const summarizeReviewRounds = (
     let owner: RoundState | undefined;
     if (known !== undefined) owner = carriers.includes(states[known]!) ? states[known]! : undefined;
     else if (carriers.length === 1 && revisionMessages.filter((other) => carriersOf(other).includes(carriers[0]!)).length === 1) owner = carriers[0]!;
+    if (owner !== undefined && !keyAgrees(message, owner)) owner = undefined;
     if (owner !== undefined) {
       deliveriesOf.set(owner.index, [...(deliveriesOf.get(owner.index) ?? []), message]);
       if (known === undefined && attemptId !== null) establish(owner, attemptId);
