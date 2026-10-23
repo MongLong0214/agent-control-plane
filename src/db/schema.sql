@@ -4140,8 +4140,7 @@ CREATE TABLE IF NOT EXISTS role_room_history_unknown (
 
 -- ---------------------------------------------------------------------------
 -- FCR-08 — where a Buzz send of an outbox row may have landed (schema v51): the exact room and
--- recipient key of each attempt the relay accepted or whose outcome is unknown, written with that
--- outcome. Whether a later receiver is the one a row was already sent to is judged from this record
+-- recipient key of each attempt, written before the transport call and settled with its outcome. Whether a later receiver is the one a row was already sent to is judged from this record
 -- alone — never from a session's current, mutable address or identity. A row with no entry here has
 -- no such evidence, and its earlier receiver is unknown.
 -- ---------------------------------------------------------------------------
@@ -4149,8 +4148,10 @@ CREATE TABLE IF NOT EXISTS outbox_sent_destinations (
   message_id TEXT NOT NULL,
   room       TEXT NOT NULL,
   recipient  TEXT NOT NULL,
-  -- ACCEPTED: the relay took it there; UNKNOWN: the send's outcome is unknown (it may be there).
-  outcome    TEXT NOT NULL CHECK (outcome IN ('ACCEPTED','UNKNOWN')),
+  -- PENDING_SEND: a send there is in flight (written before the transport call); ACCEPTED: the relay
+  -- took it there; UNKNOWN: the send's outcome is unknown (it may be there). A refused send removes
+  -- its own PENDING_SEND; one that never settles counts as UNKNOWN after the claim lease.
+  outcome    TEXT NOT NULL CHECK (outcome IN ('PENDING_SEND','ACCEPTED','UNKNOWN')),
   sent_at    TEXT NOT NULL,
   PRIMARY KEY (message_id, room, recipient)
 ) WITHOUT ROWID;

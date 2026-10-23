@@ -4011,8 +4011,8 @@ const v50: SchemaMigration = {
  * current time in the same statement, and every other writer of `updated_at` only sets it to the
  * current time too. So the role is known there since the latest of the binding's creation, the
  * latest recorded runtime move onto that session (one back onto the binding's own session included),
- * and the session's `updated_at`; its membership starts at that time rounded up to a whole second
- * (`wholeSecondFloor`). A runtime no move record explains is known there only since the migration, and
+ * and the session's `updated_at`; its membership starts at that time (admission rounds it up to a
+ * whole second, `wholeSecondFloor`). A runtime no move record explains is known there only since the migration, and
  * is listed as a fallback (`v51AnchorFallbackRoles`).
  *
  * Every role on record gets a `role_room_history_unknown` row. Mail signed before a role's
@@ -4121,12 +4121,15 @@ export const v51AnchorFallbackRoles = (raw: Database.Database): Array<{ roleKey:
     .map((anchor) => ({ roleKey: anchor.roleKey, reason: anchor.fallback! }));
 
 /**
- * A membership's floor: `knownSince` rounded up to a whole second. A Buzz event is signed in whole
- * seconds, so one signed in the anchor's own second cannot be shown to postdate a sub-second anchor;
+ * The floor admission uses for a time v51 derived (an anchor, or the migration itself): that time
+ * rounded up to a whole second, for conservative refusal only. A Buzz event is signed in whole
+ * seconds, so one signed in the time's own second cannot be shown to postdate a sub-second time;
  * admission compares the signed second with the floor's second, and from the rounded floor on, every
- * admitted event provably postdates the anchor. An anchor on a whole second is its own floor.
+ * admitted event provably postdates it. A time on a whole second is its own floor. Nothing stored is
+ * rounded — the anchor, the migration time and every change compared with them keep their own
+ * precision — so the rounding can only refuse more, never move a real change before the migration.
  */
-const wholeSecondFloor = (iso: string): string => {
+export const wholeSecondFloor = (iso: string): string => {
   const ms = Date.parse(iso);
   return ms % 1000 === 0 ? iso : new Date(Math.ceil(ms / 1000) * 1000).toISOString();
 };
@@ -4155,7 +4158,8 @@ const backfillRoleRoomMemberships = (raw: Database.Database): void => {
   for (const roleKey of roles) {
     const anchor = anchorOf.get(roleKey);
     const knownSince = anchor ? (anchor.knownSince ?? migratedAt) : null;
-    if (anchor) insert.run(roleKey, anchor.room, wholeSecondFloor(knownSince!), anchor.sessionId);
+    // Stored at its own precision; the whole-second rounding is applied where it is compared (`wholeSecondFloor`).
+    if (anchor) insert.run(roleKey, anchor.room, knownSince, anchor.sessionId);
     // A clock that ran backwards cannot leave mail between the migration and a later anchor unrecorded.
     const unknownBefore = knownSince !== null && Date.parse(knownSince) > Date.parse(migratedAt) ? knownSince : migratedAt;
     unknown.run(roleKey, unknownBefore, anchor?.room ?? null, knownSince, anchor?.bindingGeneration ?? null,
@@ -4647,7 +4651,7 @@ export const RECEIPT_VALUE_CHECKED_FROM = 47;
  * reads the live schema.sql, so its checksum still moves with any schema edit until the next freeze.
  * Declared here, below the anchors other gates hold into this file, and read only inside functions.
  *
- * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at bb09529f; v50 is
+ * v51 is frozen as v52's prerequisite in schema-v51.sql, byte-identical to schema.sql at 267a8142; v50 is
  * frozen as v51's prerequisite in schema-v50.sql.
  * v49 is frozen as v50's prerequisite in schema-v49.sql, byte-identical to a620b8d2.
  * #512 S-PUSH (CEO 3d0daed0): v48 was frozen as v49's prerequisite. It reads `schema-v48.sql`, a byte copy

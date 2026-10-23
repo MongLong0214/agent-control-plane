@@ -364,24 +364,28 @@ const boundaryCase = async (offsetMs: number) => {
       outcomes[name] = ownerMessages(f.h).length > admittedBefore ? "admitted" : recorded ? "refused and recorded" : "refused unrecorded";
     }
   } finally { await live.close(); f.h.cp.close(); }
-  return { joinedAt: rows[0]!.joined_at, wholeSecond: new Date(wholeSecond * 1000).toISOString(), outcomes };
+  return { joinedAt: rows[0]!.joined_at, anchorAt, wholeSecond: new Date(wholeSecond * 1000).toISOString(), outcomes };
 };
 
 it("limit (b): an anchor exactly on a whole second S admits mail signed in S and refuses (with a record) mail signed in S-1", async () => {
-  const { joinedAt, wholeSecond, outcomes } = await boundaryCase(0);
-  expect(joinedAt).toBe(wholeSecond);
+  const { joinedAt, anchorAt, wholeSecond, outcomes } = await boundaryCase(0);
+  // Stored at its own precision (CEO fc5e4bdf); admission rounds it up to a whole second.
+  expect(joinedAt).toBe(anchorAt);
+  expect(anchorAt).toBe(wholeSecond);
   expect(outcomes).toEqual({ "S-1": "refused and recorded", S: "admitted", "S+1": "admitted" });
 });
 
 it("limit (b): an anchor 1 ms after S refuses mail signed in S, which may precede it (with a record), and admits S+1", async () => {
-  const { joinedAt, wholeSecond, outcomes } = await boundaryCase(1);
-  expect(joinedAt).toBe(new Date(Date.parse(wholeSecond) + 1000).toISOString());
+  const { joinedAt, anchorAt, wholeSecond, outcomes } = await boundaryCase(1);
+  expect(joinedAt).toBe(anchorAt);
+  expect(anchorAt).toBe(new Date(Date.parse(wholeSecond) + 1).toISOString());
   expect(outcomes).toEqual({ "S-1": "refused and recorded", S: "refused and recorded", "S+1": "admitted" });
 });
 
 it("limit (b): an anchor 1 ms before S admits mail signed in S, and refuses mail signed in S-1, which may precede it (with a record)", async () => {
-  const { joinedAt, wholeSecond, outcomes } = await boundaryCase(-1);
-  expect(joinedAt).toBe(wholeSecond);
+  const { joinedAt, anchorAt, wholeSecond, outcomes } = await boundaryCase(-1);
+  expect(joinedAt).toBe(anchorAt);
+  expect(anchorAt).toBe(new Date(Date.parse(wholeSecond) - 1).toISOString());
   expect(outcomes).toEqual({ "S-1": "refused and recorded", S: "admitted", "S+1": "admitted" });
 });
 

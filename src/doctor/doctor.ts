@@ -1724,6 +1724,16 @@ export class Doctor {
 
   private checkOutbox(): Finding[] {
     const findings: Finding[] = [];
+    const delivery = this.outbox.deliveryReadback();
+    if (delivery.unconfirmed.length > 0) findings.push({
+      code: "OUTBOX_DELIVERY_UNCONFIRMED",
+      severity: "WARN",
+      scope: "outbox",
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: delivery,
+      recommendedAction: "outcome unknown / delivery unconfirmed / automatic resend held; obtain the receiver's ACK or reconcile the destination",
+    });
     const stuck = this.db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM outbox WHERE status = 'PENDING' AND attempts >= 3`,
     );

@@ -64,6 +64,19 @@ export interface OutboxMessage extends FencedEnvelope {
   createdAt: string;
 }
 
+/** A readback, never a new durable state. SENT + unknown_observed suppresses automatic resend;
+ * it proves neither delivery nor completion. Only an authenticated ACK confirms completion. */
+export const outboxDeliveryReadback = (message: Pick<OutboxMessage, "status" | "failureClass">) => {
+  const held = message.status === "SENT" && message.failureClass === "unknown_observed";
+  return {
+    status: held ? "OUTCOME_UNKNOWN" as const : message.status,
+    delivery: held ? "outcome unknown / delivery unconfirmed / automatic resend held" : message.status,
+    automaticResendHeld: held,
+    delivered: !held && (message.status === "SENT" || message.status === "ACKED"),
+    completed: message.status === "ACKED",
+  };
+};
+
 /**
  * Who is claiming — every field read from the authenticated connection, none from the row.
  *
@@ -150,21 +163,34 @@ export interface SentDestination {
 }
 
 /**
- * FCR-08 — records that a send of `messageId` may have landed at `destination`: the relay accepted it
- * (ACCEPTED), or its outcome is unknown (UNKNOWN). An accepted send to a destination is never
- * downgraded to unknown.
+ * FCR-08, FCR-14 — what is known about a send of an outbox row to one exact destination:
+ * PENDING_SEND while the transport call is in flight (written before it), then ACCEPTED (the relay
+ * took it there) or UNKNOWN (its outcome is unknown: it may be there). An attempt the relay refused
+ * outright removes its own PENDING_SEND. A PENDING_SEND older than `SEND_LEASE_MS` — a send that never
+ * settled, such as one a crash interrupted — counts as UNKNOWN.
+ */
+type SentOutcome = "ACCEPTED" | "UNKNOWN" | "PENDING_SEND";
+
+/** How long a claim, and an in-flight send under it, may stay unsettled before it is presumed dead. */
+const SEND_LEASE_MS = 5 * 60 * 1000;
+
+/**
+ * FCR-08 — records what is known about a send of `messageId` to `destination`. Knowledge only grows:
+ * an in-flight send settles to UNKNOWN or ACCEPTED, an unknown one may become ACCEPTED, and nothing
+ * moves back.
  */
 const recordSentDestination = (
   db: Pick<Db, "run">,
   messageId: string,
   destination: SentDestination,
-  outcome: "ACCEPTED" | "UNKNOWN",
+  outcome: SentOutcome,
   at: string,
 ): void => {
   db.run(
     `INSERT INTO outbox_sent_destinations (message_id, room, recipient, outcome, sent_at) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT (message_id, room, recipient) DO UPDATE SET outcome = 'ACCEPTED', sent_at = excluded.sent_at
-        WHERE excluded.outcome = 'ACCEPTED' AND outbox_sent_destinations.outcome <> 'ACCEPTED'`,
+      ON CONFLICT (message_id, room, recipient) DO UPDATE SET outcome = excluded.outcome, sent_at = excluded.sent_at
+        WHERE (excluded.outcome = 'ACCEPTED' AND outbox_sent_destinations.outcome <> 'ACCEPTED')
+           OR (excluded.outcome = 'UNKNOWN' AND outbox_sent_destinations.outcome = 'PENDING_SEND')`,
     [messageId, destination.room, destination.recipient, outcome, at],
   );
 };
@@ -1462,7 +1488,7 @@ export class Outbox {
   }
 
   /** A claim whose holder died must return to PENDING rather than stay stuck IN_FLIGHT. */
-  reclaimStaleLeases(leaseMs = 5 * 60 * 1000): number {
+  reclaimStaleLeases(leaseMs = SEND_LEASE_MS): number {
     this.fenceUndeliverable();
     // A CEO notification is never fenced, so a stale claim on one returns to PENDING whatever its
     // target now is, and follows the role's current holder from there (ACP-R1-03).
@@ -1504,15 +1530,43 @@ export class Outbox {
   }
 
   /**
-   * FCR-08 — whether a send of this row may already have landed at exactly `destination` (the relay
-   * accepted it there, or its outcome there is unknown), and which: the transport asks before sending,
-   * and sends nothing to a destination the row may already be at.
+   * FCR-14 — records, before the transport is called, that a send of this row to exactly `destination`
+   * is in flight. Until it settles, no other attempt sends there (`sentTo` answers IN_FLIGHT), whoever
+   * holds the row by then: a handover during the send does not open that destination again.
    */
-  sentTo(messageId: string, destination: SentDestination): "ACCEPTED" | "UNKNOWN" | null {
-    return this.db.get<{ outcome: "ACCEPTED" | "UNKNOWN" }>(
-      `SELECT outcome FROM outbox_sent_destinations WHERE message_id = ? AND room = ? AND recipient = ?`,
+  recordSendInFlight(messageId: string, destination: SentDestination): void {
+    recordSentDestination(this.db, messageId, destination, "PENDING_SEND", this.clock.nowIso());
+  }
+
+  /**
+   * FCR-08, FCR-14 — whether a send of this row may already be at exactly `destination`, or is on its
+   * way there: ACCEPTED, UNKNOWN, IN_FLIGHT (a send there has not settled yet), or null (nothing was
+   * sent there). The transport asks before sending, and sends nothing to a destination that is not
+   * null. An in-flight send older than the claim lease never settled and counts as UNKNOWN.
+   */
+  sentTo(messageId: string, destination: SentDestination): "ACCEPTED" | "UNKNOWN" | "IN_FLIGHT" | null {
+    const row = this.db.get<{ outcome: SentOutcome; sent_at: string }>(
+      `SELECT outcome, sent_at FROM outbox_sent_destinations WHERE message_id = ? AND room = ? AND recipient = ?`,
       [messageId, destination.room, destination.recipient],
-    )?.outcome ?? null;
+    );
+    if (!row) return null;
+    if (row.outcome !== "PENDING_SEND") return row.outcome;
+    return Date.parse(this.clock.nowIso()) - Date.parse(row.sent_at) >= SEND_LEASE_MS ? "UNKNOWN" : "IN_FLIGHT";
+  }
+
+  /**
+   * FCR-14 — gives a claim back untouched because a send of this row to the same destination is still
+   * in flight: the row returns to PENDING with no attempt counted and nothing transmitted, and is
+   * judged again once that send settles (`sentTo`). Only the holder of the current claim may do this.
+   */
+  awaitSendInFlight(messageId: string, claimToken: string): Decision<void> {
+    const changes = this.db.run(
+      `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL
+        WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?`,
+      [messageId, claimToken],
+    ).changes;
+    if (changes !== 1) return this.staleClaim(messageId);
+    return allow(ReasonCode.OK, undefined, { messageId, awaiting: "IN_FLIGHT_SEND" });
   }
 
   /**
@@ -1521,17 +1575,42 @@ export class Outbox {
    * `unknown_observed` unless the relay accepted it there. Nothing is transmitted and no attempt is
    * counted. Only the holder of the current claim may do this.
    */
-  markAlreadySent(messageId: string, claimToken: string, outcome: "ACCEPTED" | "UNKNOWN"): Decision<void> {
-    const changes = this.db.run(
-      `UPDATE outbox SET status = 'SENT', sent_at = COALESCE(sent_at, ?), claim_token = NULL, claimed_at = NULL,
-                         retry_eligible = 0, next_attempt_at = NULL,
-                         failure_class = ?
-        WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
-          AND ${liveDeliveryTarget("outbox")}`,
-      [this.clock.nowIso(), outcome === "ACCEPTED" ? null : "unknown_observed", messageId, claimToken],
-    ).changes;
-    if (changes !== 1) return this.staleClaim(messageId);
-    return allow(ReasonCode.OK, undefined, { messageId, alreadySent: outcome });
+  markAlreadySent(
+    messageId: string,
+    claimToken: string,
+    outcome: "ACCEPTED" | "UNKNOWN",
+    destination: SentDestination,
+  ): Decision<void> {
+    return this.db.tx(() => {
+      const reason = outcome === "ACCEPTED"
+        ? "withheld: the relay already accepted this message at this room and recipient; awaiting its ACK"
+        : "withheld: a send of this message to this room and recipient has an unknown outcome and may be there; " +
+          "awaiting its ACK, or a holder at another destination";
+      const changes = this.db.run(
+        `UPDATE outbox SET status = 'SENT', sent_at = COALESCE(sent_at, ?), claim_token = NULL, claimed_at = NULL,
+                           retry_eligible = 0, next_attempt_at = NULL, last_error = ?,
+                           failure_class = ?
+          WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
+            AND ${liveDeliveryTarget("outbox")}`,
+        [this.clock.nowIso(), reason, outcome === "ACCEPTED" ? null : "unknown_observed", messageId, claimToken],
+      ).changes;
+      if (changes !== 1) return this.staleClaim(messageId);
+      // A send that never settled (`sentTo` answered UNKNOWN for a stale in-flight record) is settled
+      // as UNKNOWN on record, with its real destination; never as accepted.
+      recordSentDestination(this.db, messageId, destination, outcome, this.clock.nowIso());
+      // Never silent: the withheld row stays flagged, and why is on record.
+      const row = this.db.get<{ role_key: string; run_id: string | null; target_session_id: string }>(
+        "SELECT role_key, run_id, target_session_id FROM outbox WHERE message_id = ?", [messageId]);
+      this.audit.record({
+        kind: "OUTBOX_SEND_WITHHELD",
+        roleKey: row?.role_key ?? null,
+        runId: row?.run_id ?? null,
+        sessionId: row?.target_session_id ?? null,
+        evidence: { messageId, room: destination.room, recipient: destination.recipient, outcome, reason },
+      });
+      return allow(ReasonCode.OK, undefined, { messageId, alreadySent: outcome,
+        ...outboxDeliveryReadback({ status: "SENT", failureClass: outcome === "UNKNOWN" ? "unknown_observed" : null }) });
+    });
   }
 
   /**
@@ -1549,12 +1628,20 @@ export class Outbox {
     failure: DeliveryFailure | string,
   ): Decision<void> {
     const classified = normalizeFailure(failure);
-    // FCR-10: an attempt whose outcome is unknown may have landed where it was addressed, whether or
-    // not this claim is still held (a handover may have taken the row while the send was pending):
-    // that evidence is written first, as an accepted send's is (`recordAcceptedSend`), so no later
-    // attempt sends to the same room and recipient again.
-    if (classified.failureClass === "unknown_observed" && typeof failure === "object" && failure.destination) {
-      recordSentDestination(this.db, messageId, failure.destination, "UNKNOWN", this.clock.nowIso());
+    // FCR-10, FCR-14: the in-flight send this attempt recorded settles here, whether or not this claim
+    // is still held (a handover may have taken the row while the send was pending): an unknown outcome
+    // stays on record as UNKNOWN, as an accepted send's ACCEPTED does (`recordAcceptedSend`), so no
+    // later attempt sends to the same room and recipient again; a send the relay refused outright did
+    // not land, and its in-flight record is removed so the row can be tried there again.
+    if (typeof failure === "object" && failure.destination) {
+      if (classified.failureClass === "unknown_observed") {
+        recordSentDestination(this.db, messageId, failure.destination, "UNKNOWN", this.clock.nowIso());
+      } else {
+        this.db.run(
+          `DELETE FROM outbox_sent_destinations WHERE message_id = ? AND room = ? AND recipient = ? AND outcome = 'PENDING_SEND'`,
+          [messageId, failure.destination.room, failure.destination.recipient],
+        );
+      }
     }
     const row = this.db.get<{
       attempts: number;
@@ -1586,7 +1673,8 @@ export class Outbox {
           [this.clock.nowIso(), attempts, classified.error.slice(0, 500), classified.failureClass, messageId, claimToken],
         ).changes;
         if (sent !== 1) return this.staleClaim(messageId);
-        return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true });
+        return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true,
+          ...outboxDeliveryReadback({ status: "SENT", failureClass: classified.failureClass }) });
       }
       // An attempt refused before sending because its target had no route (no Buzz room or no channel
       // identity — `DeliveryFailure.routeAbsent`, set at that refusal) sent nothing: it is recorded as
@@ -3252,6 +3340,19 @@ export class Outbox {
     return this.db
       .all<RawOutbox>(`SELECT * FROM outbox WHERE run_id = ? ORDER BY created_at, message_id`, [runId])
       .map(hydrate);
+  }
+
+  /** Operator/doctor/health counts use the same interpretation as individual receipts. */
+  deliveryReadback() {
+    const rows = this.db.all<{ message_id: string; status: OutboxMessage["status"]; failure_class: FailureClass | null }>(
+      "SELECT message_id, status, failure_class FROM outbox ORDER BY created_at, message_id",
+    ).map((row) => ({ messageId: row.message_id,
+      ...outboxDeliveryReadback({ status: row.status, failureClass: row.failure_class }) }));
+    return {
+      delivered: rows.filter((row) => row.delivered).length,
+      completed: rows.filter((row) => row.completed).length,
+      unconfirmed: rows.filter((row) => row.automaticResendHeld),
+    };
   }
 
   /**

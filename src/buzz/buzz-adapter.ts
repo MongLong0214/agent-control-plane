@@ -566,10 +566,18 @@ export class BuzzAdapter {
       // no same-id dedupe or receipt lookup. It is SENT again, awaiting that receiver's ACK.
       const destination = { room: channel, recipient };
       const already = this.outbox.sentTo(message.messageId, destination);
-      if (already !== null) {
-        this.outbox.markAlreadySent(message.messageId, message.claimToken, already);
+      // FCR-14: a send there still in flight (a handover took the row while it was pending) is waited
+      // for, never doubled: the claim is given back and the row is judged again once that send settles.
+      if (already === "IN_FLIGHT") {
+        this.outbox.awaitSendInFlight(message.messageId, message.claimToken);
         continue;
       }
+      if (already !== null) {
+        this.outbox.markAlreadySent(message.messageId, message.claimToken, already, destination);
+        continue;
+      }
+      // Where this attempt is going is on record before the transport is called.
+      this.outbox.recordSendInFlight(message.messageId, destination);
       try {
         await this.transport.send(channel, render(message), [recipient]);
         // Where it landed is recorded first, whatever happens to the claim next.

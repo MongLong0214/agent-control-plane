@@ -97,6 +97,7 @@ import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { resolveCeoBuzzIdentity } from "../session/ceo-buzz-identity.ts";
 import { isReasonCode, ReasonCode } from "../core/reason-codes.ts";
 import { recordMigrationRefusal } from "../db/migration-approval.ts";
+import { wholeSecondFloor } from "../db/migrations.ts";
 import {
   BuzzActorIngress,
   IngressGuard,
@@ -1656,17 +1657,28 @@ export const createBuzzMessageIngress = (
     // room keeps the first join, and unread same-room mail survives generation changes (#5).
     //
     // CEO decision 5f6ab731 (c): a room v51 anchored (`role_room_history_unknown`) admits mail signed
-    // before the migration — the deploy's stop window — only on that anchor's own authority: while the
-    // role's binding generation, runtime session and room are still exactly the anchored ones. Once any
-    // of them changes, the floor there is the migration itself, and such mail is refused (and recorded).
+    // before the migration — the deploy's stop window — only on that anchor's own authority, and only
+    // while nothing has changed since the migration: the role's binding generation, runtime session and
+    // room are exactly the anchored ones, no SESSION_BUZZ_ADDRESS_CHANGED for that session was
+    // recorded since (A→B→A cannot hide), and no runtime move of the role was recorded after it
+    // (S→T→S cannot hide). Unrelated session writes at restart do not change this proof. Each change
+    // record commits in the transaction that changes the address or runtime; new bindings advance
+    // the generation. This is read from the records each time, never from a
+    // remembered flag; every comparison is at the records' own precision. Otherwise the floor there is
+    // the migration itself. Either floor v51 derived is rounded up to a whole second for admission only
+    // (`wholeSecondFloor`; FCR-12), so mail signed in the anchor's or the migration's own second is
+    // refused (and recorded) rather than admitted.
     recipientHistorySince: (roleKey, conversation) => {
       const row = cp.db.get<{
         joined_at: string; unknown_before: string | null; anchored_room: string | null; anchored_generation: number | null;
         anchored_session: string | null; current_generation: number | null; current_session: string | null; current_room: string | null;
+        last_address_change_at: string | null; last_move_at: string | null;
       }>(
         `SELECT m.joined_at, u.unknown_before, u.room AS anchored_room, u.binding_generation AS anchored_generation,
                 u.session_id AS anchored_session, a.binding_generation AS current_generation,
-                s.session_id AS current_session, s.buzz_address AS current_room
+                s.session_id AS current_session, s.buzz_address AS current_room,
+                (SELECT MAX(e.at) FROM audit_events e WHERE e.kind = 'SESSION_BUZZ_ADDRESS_CHANGED' AND e.session_id = u.session_id) AS last_address_change_at,
+                (SELECT MAX(e.at) FROM audit_events e WHERE e.kind = 'BINDING_RUNTIME_MOVED' AND e.role_key = m.role_key) AS last_move_at
            FROM role_room_memberships m
            LEFT JOIN role_room_history_unknown u ON u.role_key = m.role_key
            LEFT JOIN assignments a ON a.role_key = m.role_key AND a.status = 'ACTIVE'
@@ -1676,11 +1688,14 @@ export const createBuzzMessageIngress = (
         [roleKey, conversation],
       );
       if (!row) return null;
-      if (row.unknown_before === null) return row.joined_at;
-      const anchorHolds = row.anchored_room === conversation && row.current_room === conversation &&
+      if (row.unknown_before === null || Date.parse(row.joined_at) >= Date.parse(row.unknown_before)) return row.joined_at;
+      const migratedAt = Date.parse(row.unknown_before);
+      const unchangedSinceMigration = row.anchored_room === conversation && row.current_room === conversation &&
         row.anchored_generation !== null && row.anchored_generation === row.current_generation &&
-        row.anchored_session !== null && row.anchored_session === row.current_session;
-      return anchorHolds || Date.parse(row.joined_at) >= Date.parse(row.unknown_before) ? row.joined_at : row.unknown_before;
+        row.anchored_session !== null && row.anchored_session === row.current_session &&
+        (row.last_address_change_at === null || Date.parse(row.last_address_change_at) <= migratedAt) &&
+        (row.last_move_at === null || Date.parse(row.last_move_at) <= migratedAt);
+      return wholeSecondFloor(unchangedSinceMigration ? row.joined_at : row.unknown_before);
     },
     existingRoleMessage: (input) => {
       const row = cp.db.get<{ message_id: string }>(`SELECT message_id FROM outbox
@@ -2198,41 +2213,13 @@ export const createDaemonBuzzBindChallenges = (cp: ControlPlane, policy: Ingress
   });
 };
 
-/**
- * The daemon's own front door on the relay, feeding the seam a person's CLI feeds (#760 Part C).
- *
- * Two things are worth stating about the signature this composes. The subscriber has already
- * verified the *event's* signature — that is what says the owner wrote these words — and the
- * envelope it hands the seam is then signed with the deployment's ingress secret, because that is
- * the credential `IngressGuard` authenticates a local submission with. The daemon is standing
- * where the relay-side CLI stood, so it presents the credential that surface has always presented.
- *
- * What it deliberately does not do is skip the seam. Calling `enqueue` directly would be shorter
- * and would bypass the owner allowlist, the `(buzz, nonce)` replay slot, the address resolution
- * and the single-transaction admission — every one of which is a refusal this path is required to
- * make, and none of which this module is allowed to be a second authority for.
- *
- * A daemon with no `buzz-nostr-subscriber.json` gets a handle reporting zero sockets. That is the
- * configured-off state, and it is a value rather than a `null` so a caller cannot read "absent"
- * as "running".
- */
-export const startDaemonBuzzMentionSubscriber = (
+/** The production admission/audit sink, also usable without relay credentials on an offline copy. */
+export const createDaemonBuzzMentionSink = (
   cp: ControlPlane,
-  stateDir: string,
   policy: IngressPolicy,
   messageIngress: Pick<LocalBuzzMessageIngress, "seam">,
-  options: {
-    openSocket?: BuzzRelaySocketFactory;
-    scheduler?: BuzzSubscriberScheduler;
-    /** The adopted CEO's pending Buzz binding challenges, shared with its tool socket. */
-    bindChallenges?: BuzzBindChallenges;
-    /** The canonical session entries, so an identity's binding must be on its entry's project. */
-    canonical?: BuzzMentionCanonicalEntries | null;
-    /** Where admission changes are reported; the subscriber's own stderr line when absent. */
-    reportAdmission?: BuzzMentionAdmissionReporter;
-
-  } = {},
-): BuzzMentionSubscriberHandle => {
+  options: { bindChallenges?: BuzzBindChallenges } = {},
+): BuzzMentionSink => {
   const secret = policy.secret?.trim() ?? "";
   if (secret.length === 0) {
     throw new Error("Buzz mention subscriber requires a non-empty signing secret");
@@ -2286,6 +2273,45 @@ export const startDaemonBuzzMentionSubscriber = (
       return verdict;
     },
   };
+  return sink;
+};
+
+/**
+ * The daemon's own front door on the relay, feeding the seam a person's CLI feeds (#760 Part C).
+ *
+ * Two things are worth stating about the signature this composes. The subscriber has already
+ * verified the *event's* signature — that is what says the owner wrote these words — and the
+ * envelope it hands the seam is then signed with the deployment's ingress secret, because that is
+ * the credential `IngressGuard` authenticates a local submission with. The daemon is standing
+ * where the relay-side CLI stood, so it presents the credential that surface has always presented.
+ *
+ * What it deliberately does not do is skip the seam. Calling `enqueue` directly would be shorter
+ * and would bypass the owner allowlist, the `(buzz, nonce)` replay slot, the address resolution
+ * and the single-transaction admission — every one of which is a refusal this path is required to
+ * make, and none of which this module is allowed to be a second authority for.
+ *
+ * A daemon with no `buzz-nostr-subscriber.json` gets a handle reporting zero sockets. That is the
+ * configured-off state, and it is a value rather than a `null` so a caller cannot read "absent"
+ * as "running".
+ */
+export const startDaemonBuzzMentionSubscriber = (
+  cp: ControlPlane,
+  stateDir: string,
+  policy: IngressPolicy,
+  messageIngress: Pick<LocalBuzzMessageIngress, "seam">,
+  options: {
+    openSocket?: BuzzRelaySocketFactory;
+    scheduler?: BuzzSubscriberScheduler;
+    /** The adopted CEO's pending Buzz binding challenges, shared with its tool socket. */
+    bindChallenges?: BuzzBindChallenges;
+    /** The canonical session entries, so an identity's binding must be on its entry's project. */
+    canonical?: BuzzMentionCanonicalEntries | null;
+    /** Where admission changes are reported; the subscriber's own stderr line when absent. */
+    reportAdmission?: BuzzMentionAdmissionReporter;
+
+  } = {},
+): BuzzMentionSubscriberHandle => {
+  const sink = createDaemonBuzzMentionSink(cp, policy, messageIngress, options);
   const handle = startBuzzMentionSubscriberFromStateDir(stateDir, {
     ownerAuthors: messageIngress.seam.ingress.ownerActors,
     reportEventRefusal: ({ author, eventId, reasonCode }) => auditBuzzPeerRefusal(
