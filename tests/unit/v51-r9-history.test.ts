@@ -292,3 +292,103 @@ it("FCR-16: a newly recorded membership also rounds only its comparison floor", 
       "SELECT joined_at FROM role_room_memberships WHERE role_key = ? AND conversation = ?", [f.roleKey, ROOM_A])!.joined_at).toBe(joinedAt);
   } finally { f.h.cp.close(); }
 });
+
+// v51-r9b / CEO 41c27e93: exercise both sides of each floor through signed relay mail,
+// the daemon listener and production admission. Whole seconds must not acquire an extra second.
+const boundaryFloors = ["anchor", "invalidated anchor", "fallback anchor", "anchor after migration", "fresh membership"] as const;
+const boundaryCases = boundaryFloors.flatMap((floor) => [0, 500].map((fraction) => ({
+  floor, fraction, precision: fraction === 0 ? "000" : "500",
+})));
+
+it.each(boundaryCases)("r9b: $floor at S.$precision refuses past mail and admits the first safe second", async ({ floor, fraction }) => {
+  const f = start(floor === "fresh membership" ? null : ROOM_A);
+  try {
+    const base = floor === "anchor after migration"
+      ? Math.floor(Date.now() / 1000) * 1000 + 3_600_000
+      : Date.parse(f.h.clock.nowIso()) + 10_000;
+    const floorAt = new Date(base + fraction).toISOString();
+    const atFloor = () => f.h.clock.advance(Date.parse(floorAt) - Date.parse(f.h.clock.nowIso()));
+
+    if (floor === "fresh membership") {
+      atFloor();
+      f.h.cp.sessions.setBuzzAddress(f.first.sessionId, ROOM_A);
+      f.bind(f.first.sessionId);
+      expect(f.h.cp.db.get("SELECT * FROM role_room_history_unknown WHERE role_key = ?", [f.roleKey])).toBeUndefined();
+    } else if (floor === "fallback anchor") {
+      const other = readyIn(f.h, ROOM_B, channelKey(f.dir, "other-boundary"));
+      f.h.clock.advance(1000);
+      moveRuntime(f, other.sessionId, "away before migration");
+      f.h.cp.db.run("UPDATE conversational_actors SET current_session_id = ?, current_session_incarnation = ? WHERE current_session_id = ?",
+        [f.first.sessionId, f.first.incarnation, other.sessionId]);
+      const { rows, unknown } = migrated(v50Image(f, "acp-r9b-fallback-"));
+      expect(unknown[0]!.anchor_fallback).toBe("RUNTIME_MOVE_UNRECORDED");
+      expect(rows[0]!.joined_at).toBe(unknown[0]!.known_since);
+      expect(unknown[0]!.known_since).toBe(unknown[0]!.unknown_before);
+      // Pin the migration clock in all three output columns, as migratedAt pins its marker.
+      f.install(rows.map((row) => ({ ...row, joined_at: floorAt })),
+        unknown.map((row) => ({ ...row, known_since: floorAt, unknown_before: floorAt })));
+      atFloor();
+    } else {
+      // For an invalidated anchor the join is earlier; the migration clock is the tested floor.
+      if (floor !== "invalidated anchor") {
+        atFloor();
+        f.h.cp.sessions.setPid(f.first.sessionId, null);
+      }
+      const migrationAt = floor === "anchor" ? new Date(base + 10_000).toISOString() : floorAt;
+      const result = floor === "anchor after migration"
+        ? migrated(v50Image(f, "acp-r9b-future-"))
+        : migratedAt(f, "acp-r9b-anchor-", migrationAt);
+      expect(result.unknown[0]!.anchor_fallback).toBeNull();
+      if (floor === "anchor after migration") {
+        expect(Date.now()).toBeLessThan(base);
+        expect(result.unknown[0]!.unknown_before).toBe(floorAt);
+        f.install(result.rows, result.unknown);
+      }
+      if (floor === "invalidated anchor") {
+        expect(Date.parse(result.rows[0]!.joined_at)).toBeLessThan(base);
+        atFloor();
+        f.h.cp.sessions.setBuzzAddress(f.first.sessionId, ROOM_B);
+        f.h.cp.sessions.setBuzzAddress(f.first.sessionId, ROOM_A);
+        expect(f.h.cp.audit.byKind("SESSION_BUZZ_ADDRESS_CHANGED").slice(-2)
+          .every((row) => row.eventId > result.unknown[0]!.audit_high_water)).toBe(true);
+      } else {
+        expect(result.rows[0]!.joined_at).toBe(floorAt);
+        expect(result.unknown[0]!.known_since).toBe(floorAt);
+      }
+    }
+
+    const stored = () => ({
+      membership: f.h.cp.db.get<{ joined_at: string }>(
+        "SELECT joined_at FROM role_room_memberships WHERE role_key = ? AND conversation = ?", [f.roleKey, ROOM_A]),
+      history: f.h.cp.db.get<UnknownHistory>("SELECT * FROM role_room_history_unknown WHERE role_key = ?", [f.roleKey]),
+    });
+    const before = stored();
+    expect(floor === "invalidated anchor" ? before.history!.unknown_before : before.membership!.joined_at).toBe(floorAt);
+    const live = await daemon(f, [ROOM_A]);
+    try {
+      const s = base / 1000;
+      const refused = signedIn(f, fraction === 0 ? s - 1 : s, "before the floor");
+      if (floor === "fresh membership") {
+        // A fresh post-migration join proves history, so pre-join mail is refused without an unknown-history record.
+        expect.soft(await outcomeOf(f, live, refused)).toBe("refused unrecorded");
+        // Proven-history pre-join refusals return PRECEDES_BINDING and write no unknown-history record.
+        expect.soft({
+          decision: await f.deliver(ROOM_A, finalizeEvent({ ...refused, tags: refused.tags.map((tag) => [...tag]) }, f.owner.secretKey)),
+          records: refusalsRecorded(f.h),
+        }).toMatchObject({
+          decision: { allowed: false, reasonCode: ReasonCode.BUZZ_MENTION_PRECEDES_BINDING }, records: [],
+        });
+      } else {
+        expect.soft(await outcomeOf(f, live, refused)).toBe("refused and recorded");
+        expect.soft(refusalsRecorded(f.h)).toEqual(expect.arrayContaining([expect.objectContaining({
+          role_key: f.roleKey, actor: f.owner.pubkey, reason_code: ReasonCode.BUZZ_MENTION_PRECEDES_BINDING,
+          evidence_json: expect.objectContaining({ eventId: refused.id }),
+        })]));
+      }
+      const admitted = signedIn(f, fraction === 0 ? s : s + 1, "first safe second, no extra delay");
+      f.h.clock.advance(Math.max(0, admitted.created_at * 1000 - Date.parse(f.h.clock.nowIso())));
+      expect(await outcomeOf(f, live, admitted)).toBe("admitted");
+      expect(stored()).toEqual(before);
+    } finally { await live.close(); }
+  } finally { f.h.cp.close(); }
+});
