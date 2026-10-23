@@ -40,6 +40,6 @@
     "v48-owner-decision-supersede-guard": "sha256:2f5037b3a17199018dafd2db4833a2815ba5eeeb15be3de65d49395aa7772f32",
     "v49-branch-publish-receipts": "sha256:9a3b1287045bc5857c8415d2018ccfc267d31910bd1e6ab57fbc200b791c59b0",
     "v50-post-merge-verification-reentry": "sha256:d11a305c889c249e03b2fa480f9dada95d1bb20c427c675d6437d2a8b315c824",
-    "v51-durable-recipient-delivery": "sha256:f8df51f3f10fb1cee21f06eca9838f670e25eefb546d6cc582528d01524b4d90"
+    "v51-durable-recipient-delivery": "sha256:e2477d390a7bc1355748083904b1da15d9207a4fa7bd64d07840e6fa3b969798"
   }
 }

@@ -4116,6 +4116,39 @@ CREATE TABLE IF NOT EXISTS role_room_memberships (
   PRIMARY KEY (role_key, conversation)
 ) WITHOUT ROWID;
 
+-- ---------------------------------------------------------------------------
+-- ACP-R1-04 — the Buzz room history v51 could not prove (schema v51), one row per role on record at
+-- the migration: everything the role was addressed before `unknown_before` (the migration's own time)
+-- is unknown, because v50 kept no record that proves it, and v51 inferred none. `room` and
+-- `known_since` name the room the role's current binding is anchored in and since when, when it has
+-- one; `anchor_json` is what that anchor rests on. Written once by the v51 step; the daemon records
+-- every mention it refuses for the role that was signed before `unknown_before`.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS role_room_history_unknown (
+  role_key       TEXT PRIMARY KEY NOT NULL,
+  unknown_before TEXT NOT NULL,
+  room           TEXT,
+  known_since    TEXT,
+  anchor_json    TEXT NOT NULL CHECK (json_valid(anchor_json))
+) WITHOUT ROWID;
+
+-- ---------------------------------------------------------------------------
+-- FCR-08 — where a Buzz send of an outbox row may have landed (schema v51): the exact room and
+-- recipient key of each attempt the relay accepted or whose outcome is unknown, written with that
+-- outcome. Whether a later receiver is the one a row was already sent to is judged from this record
+-- alone — never from a session's current, mutable address or identity. A row with no entry here has
+-- no such evidence, and its earlier receiver is unknown.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS outbox_sent_destinations (
+  message_id TEXT NOT NULL,
+  room       TEXT NOT NULL,
+  recipient  TEXT NOT NULL,
+  -- ACCEPTED: the relay took it there; UNKNOWN: the send's outcome is unknown (it may be there).
+  outcome    TEXT NOT NULL CHECK (outcome IN ('ACCEPTED','UNKNOWN')),
+  sent_at    TEXT NOT NULL,
+  PRIMARY KEY (message_id, room, recipient)
+) WITHOUT ROWID;
+
 -- v52: one frozen allocation/confirmation per bootstrap, and per-operation recovery evidence.
 CREATE TABLE IF NOT EXISTS resident_project_provisioning (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id),

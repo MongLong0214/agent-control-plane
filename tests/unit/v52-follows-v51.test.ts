@@ -13,14 +13,15 @@ import { contentDigests } from "../helpers/released-v45-schema.ts";
 
 afterAll(cleanupTempDirs);
 
-/** v51's receipt as the build before its freeze computed it, from schema.sql at 2478b723. */
-const V51_CHECKSUM = "sha256:f8df51f3f10fb1cee21f06eca9838f670e25eefb546d6cc582528d01524b4d90";
+/** v51's receipt as the build before its freeze computed it, from schema.sql at 7f5ce1c3. */
+const V51_CHECKSUM = "sha256:e2477d390a7bc1355748083904b1da15d9207a4fa7bd64d07840e6fa3b969798";
 
 /** What v51 installs, named here rather than read from the code under test. */
 const V51_OBJECTS = [
   "buzz_events", "buzz_events_no_replace", "buzz_events_immutable", "buzz_events_no_delete",
   "holder_message_terminals", "outbox_holder_message_terminal", "holder_message_terminals_immutable",
   "holder_message_terminals_no_delete", "holder_message_terminals_no_replace", "role_room_memberships",
+  "role_room_history_unknown", "outbox_sent_destinations",
 ];
 
 /** The three tables v52 rebuilds, and what it adds. */

@@ -136,7 +136,38 @@ export interface DeliveryFailure {
    * turn the relay's refusal into a route-absent one.
    */
   routeAbsent?: true;
+  /**
+   * FCR-08 — the exact room and recipient key the attempt addressed, set by a transport that sent.
+   * Recorded only for an outcome that may have landed (`unknown_observed`), in `outbox_sent_destinations`.
+   */
+  destination?: SentDestination;
 }
+
+/** FCR-08 — where a Buzz send was addressed: its room and its recipient's channel identity key. */
+export interface SentDestination {
+  room: string;
+  recipient: string;
+}
+
+/**
+ * FCR-08 — records that a send of `messageId` may have landed at `destination`: the relay accepted it
+ * (ACCEPTED), or its outcome is unknown (UNKNOWN). An accepted send to a destination is never
+ * downgraded to unknown.
+ */
+const recordSentDestination = (
+  db: Pick<Db, "run">,
+  messageId: string,
+  destination: SentDestination,
+  outcome: "ACCEPTED" | "UNKNOWN",
+  at: string,
+): void => {
+  db.run(
+    `INSERT INTO outbox_sent_destinations (message_id, room, recipient, outcome, sent_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (message_id, room, recipient) DO UPDATE SET outcome = 'ACCEPTED', sent_at = excluded.sent_at
+        WHERE excluded.outcome = 'ACCEPTED' AND outbox_sent_destinations.outcome <> 'ACCEPTED'`,
+    [messageId, destination.room, destination.recipient, outcome, at],
+  );
+};
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
 /** The append-only record that an ESCALATION_REPLY followed a takeover, a renewal or an in-band handover; one per carry. */
@@ -321,21 +352,26 @@ const HANDED_TO_NEW_RECEIVER_SQL = `status = 'PENDING', claim_token = NULL, clai
   failure_class = CASE WHEN status = 'SENT' OR failure_class = '${ROUTE_ABSENT_FAILURE_CLASS}' THEN NULL ELSE failure_class END`;
 
 /**
- * Whether a row's new target is the receiver it was already sent to. Two parameters: the new target
- * session id, twice.
+ * Whether handing a SENT row to `next` would send it to a receiver it was already sent to. Two
+ * parameters: the new target session id, twice.
  *
- * The same session is the same receiver: a session's incarnation never changes, so the same session
- * is the same room and the same recipient, and a rebind of it at a new generation is not a new
- * receiver. Another session is a new receiver — except, for a Buzz send whose outcome is unknown,
- * when it answers as the very same Buzz recipient (the same room and the same channel identity): Buzz
- * has no same-id dedupe or receipt lookup, so sending again there could deliver twice.
+ * FCR-08: judged only from where the row was actually sent (`outbox_sent_destinations`, the room and
+ * recipient key each send that may have landed addressed), never from any session's current, mutable
+ * address or identity. A row with that record is the same receiver's exactly when the new target's
+ * route — where it would be sent now — is one of the recorded destinations. A row without it has no
+ * evidence of where it went: one whose outcome is unknown is never treated as a new receiver's (it is
+ * not sent again on a holder change), and one handed over in band or written before v51 is the same
+ * receiver's only when it stays with the same session (a session's incarnation never changes).
  */
 const sameReceiverSql = (alias: string): string =>
-  `(${alias}.target_session_id = ? OR (${alias}.failure_class = 'unknown_observed' AND EXISTS (
-     SELECT 1 FROM sessions previous JOIN sessions next ON next.session_id = ?
-      WHERE previous.session_id = ${alias}.target_session_id
-        AND COALESCE(previous.buzz_address, '') <> '' AND previous.buzz_address = next.buzz_address
-        AND COALESCE(previous.buzz_actor_id, '') <> '' AND previous.buzz_actor_id = next.buzz_actor_id)))`;
+  `(CASE
+     WHEN EXISTS (SELECT 1 FROM outbox_sent_destinations sent WHERE sent.message_id = ${alias}.message_id)
+       THEN EXISTS (SELECT 1 FROM outbox_sent_destinations sent JOIN sessions next ON next.session_id = ?
+              WHERE sent.message_id = ${alias}.message_id
+                AND sent.room = next.buzz_address AND sent.recipient = next.buzz_actor_id)
+     WHEN ${alias}.failure_class = 'unknown_observed' THEN 1
+     ELSE ${alias}.target_session_id = ?
+   END)`;
 
 /**
  * ACP-R1-01, ACP-R2-01 — the one re-arm policy, within the CEO's boundaries (9b15c462).
@@ -1459,6 +1495,46 @@ export class Outbox {
   }
 
   /**
+   * FCR-08 — records that the relay accepted a send of this row at exactly `destination`. Written by
+   * the transport as soon as the send returns, before the claim is completed: whether or not that claim
+   * is still held, that is where the row may be now, and a later attempt reads it (`sentTo`).
+   */
+  recordAcceptedSend(messageId: string, destination: SentDestination): void {
+    recordSentDestination(this.db, messageId, destination, "ACCEPTED", this.clock.nowIso());
+  }
+
+  /**
+   * FCR-08 — whether a send of this row may already have landed at exactly `destination` (the relay
+   * accepted it there, or its outcome there is unknown), and which: the transport asks before sending,
+   * and sends nothing to a destination the row may already be at.
+   */
+  sentTo(messageId: string, destination: SentDestination): "ACCEPTED" | "UNKNOWN" | null {
+    return this.db.get<{ outcome: "ACCEPTED" | "UNKNOWN" }>(
+      `SELECT outcome FROM outbox_sent_destinations WHERE message_id = ? AND room = ? AND recipient = ?`,
+      [messageId, destination.room, destination.recipient],
+    )?.outcome ?? null;
+  }
+
+  /**
+   * FCR-08 — settles a claim without sending, because the row may already be at the destination it
+   * would be sent to (`sentTo`): it is SENT again, awaiting that receiver's ACK, flagged
+   * `unknown_observed` unless the relay accepted it there. Nothing is transmitted and no attempt is
+   * counted. Only the holder of the current claim may do this.
+   */
+  markAlreadySent(messageId: string, claimToken: string, outcome: "ACCEPTED" | "UNKNOWN"): Decision<void> {
+    const changes = this.db.run(
+      `UPDATE outbox SET status = 'SENT', sent_at = COALESCE(sent_at, ?), claim_token = NULL, claimed_at = NULL,
+                         retry_eligible = 0, next_attempt_at = NULL,
+                         failure_class = ?
+        WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
+          AND ${liveDeliveryTarget("outbox")}`,
+      [this.clock.nowIso(), outcome === "ACCEPTED" ? null : "unknown_observed", messageId, claimToken],
+    ).changes;
+    if (changes !== 1) return this.staleClaim(messageId);
+    return allow(ReasonCode.OK, undefined, { messageId, alreadySent: outcome });
+  }
+
+  /**
    * Records a failed delivery attempt against the durable retry policy (§34.1).
    *
    * A failure is either *deferred* or terminal — never immediately re-queued. The row
@@ -1494,14 +1570,22 @@ export class Outbox {
       // and no receipt lookup, so the row is SENT, flagged `unknown_observed`, awaiting the holder's
       // ACK. Only a handover to a new receiver delivers it again (`HANDED_TO_NEW_RECEIVER_SQL`).
       if (classified.failureClass === "unknown_observed") {
-        const sent = this.db.run(
-          `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = ?, last_error = ?, failure_class = ?,
-                             retry_eligible = 0, next_attempt_at = NULL, reason_code = NULL,
-                             claim_token = NULL, claimed_at = NULL
-            WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
-              AND ${liveDeliveryTarget("outbox")}`,
-          [this.clock.nowIso(), attempts, classified.error.slice(0, 500), classified.failureClass, messageId, claimToken],
-        ).changes;
+        // The flag and where the send was addressed are written together (FCR-08).
+        const sent = this.db.tx(() => {
+          const changed = this.db.run(
+            `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = ?, last_error = ?, failure_class = ?,
+                               retry_eligible = 0, next_attempt_at = NULL, reason_code = NULL,
+                               claim_token = NULL, claimed_at = NULL
+              WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
+                AND ${liveDeliveryTarget("outbox")}`,
+            [this.clock.nowIso(), attempts, classified.error.slice(0, 500), classified.failureClass, messageId, claimToken],
+          ).changes;
+          // Where the send was addressed is evidence whether or not this claim is still held.
+          if (typeof failure === "object" && failure.destination) {
+            recordSentDestination(this.db, messageId, failure.destination, "UNKNOWN", this.clock.nowIso());
+          }
+          return changed;
+        });
         if (sent !== 1) return this.staleClaim(messageId);
         return allow(ReasonCode.OK, undefined, { messageId, failureClass: classified.failureClass, attempts, retained: true });
       }
