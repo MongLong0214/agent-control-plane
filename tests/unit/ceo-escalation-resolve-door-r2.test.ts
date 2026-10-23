@@ -319,13 +319,13 @@ describe("ESC-01: the committed decision answers before the response cache", () 
       const key = "r2-cached-conflict";
       const original = await resolve(f, runId, escalationId, key);
       expect(original).toMatchObject({ ok: true });
-      // Whatever the response cache holds for the key, the committed decision is the answer.
+      // A verified reservation still uses the domain decision when its cached result is an error.
       const conflict = {
         content: [{ type: "text", text: "{}" }],
         isError: true,
         structuredContent: { ok: false, reasonCode: ReasonCode.CONFLICT, message: "cached", evidence: { requestDigest: "sha256:other" } },
       };
-      f.harness.cp.db.run(`UPDATE inbound_messages SET result_json = ? WHERE channel = 'mcp' AND nonce = ?`, [JSON.stringify(conflict), key]);
+      f.harness.cp.db.run(`UPDATE inbound_messages SET result_json = ? WHERE channel = 'mcp' AND nonce = ?`, [JSON.stringify({ ...JSON.parse(f.harness.cp.db.get<{ result_json: string }>("SELECT result_json FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?", [key])!.result_json), result: conflict }), key]);
       expect(await resolve(f, runId, escalationId, key)).toEqual(original);
       expect(replies(f, runId)).toHaveLength(1);
       expect(count(f, "CEO_DECISION", runId)).toBe(1);

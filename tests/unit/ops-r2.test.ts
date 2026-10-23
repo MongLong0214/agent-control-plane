@@ -11,7 +11,12 @@ import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { startDaemonMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { idempotentMcpMutation } from "../../src/mcp/shared.ts";
+import { idempotentMcpMutation as mutateMcp, type McpMutationSource, type AuthenticatedMcpPeer, type ToolResult } from "../../src/mcp/shared.ts";
+const idempotentMcpMutation = (source: McpMutationSource, peer: AuthenticatedMcpPeer, key: string,
+  execute: () => Promise<ToolResult> | ToolResult) => mutateMcp(source, peer, key, execute, {
+    toolName: "reservation-test", arguments: {}, authority: () => allow(ReasonCode.OK, {}),
+  });
+
 import * as ingressGuardExports from "../../src/ingress/ingress-guard.ts";
 import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { TelegramIngress } from "../../src/ingress/telegram.ts";

@@ -153,7 +153,7 @@ describe("escalation_resolve: the CEO's door to a CTO escalation", () => {
           name: "escalation_resolve",
           arguments: { idempotencyKey: "stranger-1", runId, escalationId, resolution: "use acp-new" },
         });
-        expect(refused.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.GATE_AUTHORITY_DENIED });
+        expect(refused.structuredContent).toMatchObject({ ok: false, reasonCode: ReasonCode.BINDING_GENERATION_STALE });
       } finally {
         await client.close();
       }

@@ -5,7 +5,7 @@ import { ExecutionMode, RunKind } from "../domain/types.ts";
 import type { ExecutionMode as ExecutionModeValue, RunPriority, RunRow } from "../domain/types.ts";
 import { OWNER_DECISION_OPERATION } from "../ceo/production-gate.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
-import { respond, type AuthenticatedMcpPeer, type ToolResult } from "../mcp/shared.ts";
+import { respond, type AuthenticatedMcpPeer, type McpMutationRequest, type ToolResult } from "../mcp/shared.ts";
 import type { HermesMcpPort } from "../mcp/hermes-server.ts";
 import type { TaskContract } from "../run/run-engine.ts";
 import type {
@@ -1130,13 +1130,15 @@ export class TelegramHermesRouter {
     let runId = stored?.runId;
     if (!runId || stored?.phase === "ADMITTED") {
       const createKey = this.ingress.idempotencyKeyFor(admitted, "hermes-run-create");
-      const created = await this.hermesMutation<RunRow>(peer, createKey, () => this.hermes.createRun({
+      const createInput = {
         projectId: input.projectId,
         kind: RunKind.STANDARD_WORK,
         executionMode: input.executionMode,
         contract: input.contract,
         repositories: [],
-      }));
+      } satisfies Parameters<HermesMcpPort["createRun"]>[0];
+      const created = await this.hermesMutation<RunRow>(peer, createKey,
+        { toolName: "run_create", arguments: createInput }, () => this.hermes.createRun(createInput));
       if (!created.allowed) {
         return this.outcomeWithReply(
           update,
@@ -1170,7 +1172,8 @@ export class TelegramHermesRouter {
 
     if (stored?.phase !== "DISPATCHED") {
       const dispatchKey = this.ingress.idempotencyKeyFor(admitted, "hermes-run-dispatch");
-      const dispatched = await this.hermesMutation<RunRow>(peer, dispatchKey, () => this.hermes.dispatchRun(runId!));
+      const dispatched = await this.hermesMutation<RunRow>(peer, dispatchKey,
+        { toolName: "run_dispatch", arguments: { runId } }, () => this.hermes.dispatchRun(runId!));
       if (!dispatched.allowed) {
         return this.outcomeWithReply(
           update,
@@ -1205,10 +1208,12 @@ export class TelegramHermesRouter {
   private async hermesMutation<T>(
     peer: AuthenticatedMcpPeer,
     idempotencyKey: string,
+    request: Pick<McpMutationRequest, "toolName" | "arguments">,
     operation: () => Decision<T> | Promise<Decision<T>>,
   ): Promise<Decision<T>> {
     const wire = await this.hermes.mutation.execute(peer, idempotencyKey, async () =>
       respond(await operation()),
+      { ...request, authority: () => allow(ReasonCode.OK, {}) },
     );
     return decisionFromToolResult<T>(wire);
   }

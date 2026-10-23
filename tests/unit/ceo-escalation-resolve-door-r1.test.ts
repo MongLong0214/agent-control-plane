@@ -89,19 +89,21 @@ describe("ESC-01: the decision record is the replay source of truth", () => {
       const fault = failResultStore(f, key);
       const first = await resolve(f, runId, escalationId, key);
       vi.restoreAllMocks();
+      const handler = vi.spyOn(f.harness.cp.ceo, "resolveEscalation");
       expect(fault.injected).toBe(true);
       expect(first).toMatchObject({ ok: false, reasonCode: ReasonCode.INTERNAL_ERROR });
       expect(f.harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
       const [reply] = replies(f, runId);
       const committed = { ok: true, value: { runId, escalationId, state: RunState.ACTIVE, messageId: reply!.messageId } };
 
-      // While the reservation is still held, and after it lapsed and the handler runs again.
+      // Both before and after the recovery window, the receipt answers without rerunning the handler.
       expect(await resolve(f, runId, escalationId, key)).toMatchObject(committed);
       f.harness.clock.advance(60_001);
       expect(await resolve(f, runId, escalationId, key)).toMatchObject(committed);
       expect(await resolve(f, runId, escalationId, key, "use two")).toMatchObject({ ok: false, reasonCode: ReasonCode.CONFLICT });
       expect(replies(f, runId)).toHaveLength(1);
       expect(count(f, "CEO_DECISION", runId)).toBe(1);
+      expect(handler).not.toHaveBeenCalled();
     });
   });
 

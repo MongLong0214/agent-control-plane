@@ -60,15 +60,23 @@ const MCP_RESERVATION_TTL_MS = 60_000;
  * here is never taken over, whatever time the caller claims. The TTL takeover remains for the case
  * it exists for: a handler whose process died, which leaves a row and no entry in this set.
  */
-const mcpReservationsInFlight = new WeakMap<Db, Set<string>>();
+const mcpReservationsInFlight = new WeakMap<Db, Map<string, { actor: string; pendingResultJson: string | null }>>();
 
 /**
  * #246 B2-b — whether the MCP mutation reserved under `nonce` is running its handler in this process
  * now. A CONTRACT_CHANGE activation grant is issued, or its consumer re-bound, only inside such a call:
  * the set is this module's own, so a caller outside an admitted MCP mutation cannot make it true.
  */
-export const isMcpReservationInFlight = (db: Db, nonce: string): boolean =>
-  mcpReservationsInFlight.get(db)?.has(nonce) === true;
+export const isMcpReservationInFlight = (db: Db, nonce: string, actor?: string): boolean => {
+  const reservation = mcpReservationsInFlight.get(db)?.get(nonce);
+  if (!reservation) return false;
+  if (actor === undefined) return true;
+  // The same unfinished bytes this invocation reserved, not a guessed JSON shape.
+  return actor === reservation.actor && db.get(
+    `SELECT nonce FROM inbound_messages WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND result_json IS ?`,
+    [nonce, actor, reservation.pendingResultJson],
+  ) !== undefined;
+};
 
 /**
  * Run only the mutation that acquired this reservation; no delete capability leaves this module.
@@ -82,6 +90,10 @@ export const runMcpReservedMutation = async <T>(
   nonce: string,
   receivedAt: string,
   execute: () => Promise<T> | T,
+  // An opaque unfinished value owned by the caller. Only that exact reservation may renew;
+  // null retains the pre-fingerprint recovery contract. Replay interpretation stays in MCP.
+  pendingResultJson: string | null = null,
+  storeResult?: (result: T) => void,
 ): Promise<{ kind: "existing"; actor: string; resultJson: string | null } | { kind: "executed"; result: T }> => {
   const reservation = db.tx(() => {
     const existing = db.get<{ actor: string; received_at: string; result_json: string | null }>(
@@ -89,31 +101,33 @@ export const runMcpReservedMutation = async <T>(
       [nonce],
     );
     let renewedFrom: string | null = null;
+    let previousResultJson: string | null = null;
     if (existing && mcpReservationsInFlight.get(db)?.has(nonce)) {
       return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json };
     }
     if (existing) {
       const reservedAtMs = Date.parse(existing.received_at);
       const nowMs = Date.parse(receivedAt);
-      if (existing.actor !== actor || existing.result_json !== null
+      if (existing.actor !== actor || (existing.result_json !== null && existing.result_json !== pendingResultJson)
           || !Number.isFinite(reservedAtMs) || !Number.isFinite(nowMs)
           || nowMs - reservedAtMs < MCP_RESERVATION_TTL_MS) {
         return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json };
       }
       const renewed = db.run(
-        `UPDATE inbound_messages SET received_at = ?
+        `UPDATE inbound_messages SET received_at = ?, result_json = ?
           WHERE channel = 'mcp' AND nonce = ? AND actor = ?
-            AND result_json IS NULL AND turn_claim_json IS NULL`,
-        [receivedAt, nonce, actor],
+            AND result_json IS ? AND turn_claim_json IS NULL`,
+        [receivedAt, pendingResultJson, nonce, actor, existing.result_json],
       );
       if (renewed.changes !== 1) {
         return { kind: "existing" as const, actor: existing.actor, resultJson: existing.result_json };
       }
       renewedFrom = existing.received_at;
+      previousResultJson = existing.result_json;
     } else {
       db.run(
-        `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('mcp', ?, ?, ?)`,
-        [nonce, actor, receivedAt],
+        `INSERT INTO inbound_messages (channel, nonce, actor, received_at, result_json) VALUES ('mcp', ?, ?, ?, ?)`,
+        [nonce, actor, receivedAt, pendingResultJson],
       );
     }
     let used = false;
@@ -122,10 +136,10 @@ export const runMcpReservedMutation = async <T>(
       used = true;
       if (renewedFrom !== null) {
         db.run(
-          `UPDATE inbound_messages SET received_at = ?
+          `UPDATE inbound_messages SET received_at = ?, result_json = ?
             WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND received_at = ?
-              AND result_json IS NULL AND turn_claim_json IS NULL`,
-          [renewedFrom, nonce, actor, receivedAt],
+              AND result_json IS ? AND turn_claim_json IS NULL`,
+          [renewedFrom, previousResultJson, nonce, actor, receivedAt, pendingResultJson],
         );
         return;
       }
@@ -133,20 +147,26 @@ export const runMcpReservedMutation = async <T>(
       db.withIngressDelete(authority, "mcp", () => db.run(
         `DELETE FROM inbound_messages
           WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND received_at = ?
-            AND result_json IS NULL AND turn_claim_json IS NULL`,
-        [nonce, actor, receivedAt],
+            AND result_json IS ? AND turn_claim_json IS NULL`,
+        [nonce, actor, receivedAt, pendingResultJson],
       ));
     };
     return { kind: "acquired" as const, release };
   });
   if (reservation.kind === "existing") return reservation;
-  const inFlight = mcpReservationsInFlight.get(db) ?? new Set<string>();
+  const inFlight = mcpReservationsInFlight.get(db) ?? new Map<string, { actor: string; pendingResultJson: string | null }>();
   mcpReservationsInFlight.set(db, inFlight);
-  inFlight.add(nonce);
+  inFlight.set(nonce, { actor, pendingResultJson });
+  let handlerFinished = false;
   try {
-    return { kind: "executed", result: await execute() };
+    const result = await execute();
+    handlerFinished = true;
+    // Keep the in-process seal until the response is durable. A store failure after
+    // an effect leaves an abandoned reservation, just as the old NULL store did.
+    storeResult?.(result);
+    return { kind: "executed", result };
   } catch (error) {
-    reservation.release();
+    if (!handlerFinished) reservation.release();
     throw error;
   } finally {
     inFlight.delete(nonce);

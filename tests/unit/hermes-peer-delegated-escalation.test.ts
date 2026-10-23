@@ -43,7 +43,7 @@ const PEER_TURN = {
 const peerChannel = async (f: BootstrapRuntimeFixture) => {
   const server = createHermesServer(
     createHermesMcpPort(f.harness.cp),
-    () => allow(ReasonCode.OK, { actor: f.ceoSessionId, sessionId: f.ceoSessionId }),
+    () => allow(ReasonCode.OK, { actor: f.ceoSessionId, sessionId: f.ceoSessionId, sessionIncarnation: f.harness.cp.sessions.require(f.ceoSessionId).incarnation }),
     { provenance: { liveHermesSessionId: LIVE, lineageRootDigest: DIGEST } },
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

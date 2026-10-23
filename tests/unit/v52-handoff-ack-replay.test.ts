@@ -97,7 +97,7 @@ for (const canonical of [true, false]) {
         expect(w.cp.bindings.authenticateBoundSession({ roleKey: sibling.value.roleKey, sessionId: w.session.sessionId, sessionSecret: w.session.sessionSecret!, bindingGeneration: sibling.value.bindingGeneration }).allowed).toBe(true);
       }
       const before = w.snapshot();
-      expect(await call(w.h, w.peer, retry)).toMatchObject({ ok: false, reasonCode: "HANDOFF_ACK_REQUIRED" });
+      expect(await call(w.h, w.peer, retry)).toMatchObject({ ok: false, reasonCode: changed === "REVOKED_PROJECT" ? "HANDOFF_ACK_REQUIRED" : "CONFLICT" });
       expect(w.snapshot()).toEqual(before);
       const domainBefore = w.snapshot(false);
       expect(await call(w.h, w.peer, { ...retry, idempotencyKey: "fresh-key" })).toMatchObject({ ok: false, reasonCode: "HANDOFF_ACK_REQUIRED" });
@@ -139,7 +139,7 @@ it.each(["handoffId", "messageId", "bindingGeneration", "payloadDigest"] as cons
     await w.deliver();
     expect(await call(w.h, w.peer, w.request)).toMatchObject({ ok: true });
     const before = w.snapshot();
-    expect(await call(w.h, w.peer, { ...w.request, [field]: field === "bindingGeneration" ? 99 : "changed" })).toMatchObject({ ok: false, reasonCode: "HANDOFF_ACK_REQUIRED" });
+    expect(await call(w.h, w.peer, { ...w.request, [field]: field === "bindingGeneration" ? 99 : "changed" })).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
     expect(w.snapshot()).toEqual(before);
   } finally { w.cp.close(); }
 });
@@ -149,7 +149,7 @@ it.each(["sessionId", "sessionIncarnation"] as const)("same actor cannot replay 
   try {
     expect(await call(w.h, w.peer, w.request)).toMatchObject({ ok: true });
     const before = w.snapshot();
-    expect(await call(w.h, { ...w.peer, [field]: "different" }, w.request)).toMatchObject({ ok: false, reasonCode: "HANDOFF_ACK_REQUIRED" });
+    expect(await call(w.h, { ...w.peer, [field]: "different" }, w.request)).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
     expect(w.snapshot()).toEqual(before);
   } finally { w.cp.close(); }
 });
@@ -161,7 +161,7 @@ it("a key for package A cannot replay success for an independently ACKED package
     const second = w.open();
     expect(await call(w.h, w.peer, { ...second, idempotencyKey: "second-ack" })).toMatchObject({ ok: true });
     const before = w.snapshot();
-    expect(await call(w.h, w.peer, { ...second, idempotencyKey: w.request.idempotencyKey })).toMatchObject({ ok: false, reasonCode: "HANDOFF_ACK_REQUIRED" });
+    expect(await call(w.h, w.peer, { ...second, idempotencyKey: w.request.idempotencyKey })).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
     expect(w.snapshot()).toEqual(before);
   } finally { w.cp.close(); }
 });
@@ -189,7 +189,7 @@ it("handoff_ack cannot trust another tool's cached success", async () => {
   try {
     expect(await call(w.h, w.peer, { idempotencyKey: w.request.idempotencyKey }, "capacity_get")).toMatchObject({ ok: true });
     const before = w.snapshot();
-    expect(await call(w.h, w.peer, w.request)).toMatchObject({ ok: false, reasonCode: "HANDOFF_ACK_REQUIRED" });
+    expect(await call(w.h, w.peer, w.request)).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
     expect(w.snapshot()).toEqual(before);
   } finally { w.cp.close(); }
 });
@@ -221,7 +221,7 @@ it.each(["UNCHANGED", "IDENTIFIERS", "REVOKED_PROJECT", "INCARNATION"] as const)
     const result = await call(w.h, changed === "INCARNATION" ? { ...w.peer, sessionIncarnation: "different" } : w.peer,
       changed === "IDENTIFIERS" ? { ...w.request, payloadDigest: "sha256:different" } : w.request);
     if (changed === "UNCHANGED") expect(result).toEqual(first);
-    else expect(result).toMatchObject({ ok: false, reasonCode: "HANDOFF_ACK_REQUIRED" });
+    else expect(result).toMatchObject({ ok: false, reasonCode: changed === "REVOKED_PROJECT" ? "HANDOFF_ACK_REQUIRED" : "CONFLICT" });
     expect(w.snapshot()).toEqual(before);
     expect(w.cp.audit.byKind("HANDOFF_ACK")).toHaveLength(1);
   } finally { w.cp.close(); }
