@@ -71,7 +71,7 @@ const OWNER_TURN = {
 
 interface Wire {
   id?: number;
-  result?: { structuredContent?: Record<string, unknown>; tools?: Array<{ name: string }> };
+  result?: { structuredContent?: Record<string, unknown>; tools?: Array<{ name: string; description?: string }> };
   error?: unknown;
 }
 
@@ -390,6 +390,23 @@ describe("the adopted CEO tool socket, through the relay", () => {
       }
       expect((await r.request("tools/call", attach)).result?.structuredContent).toMatchObject({ ok: true, value: { digest } });
       expect((await r.request("tools/call", attach)).result?.structuredContent).toMatchObject({ ok: true, value: { digest } });
+      const listed = await r.request("tools/list", {});
+      expect(listed.result?.tools?.find(t => t.name === "bootstrap_review_resume")?.description).toContain("new blind review");
+      const resume = { name: "bootstrap_review_resume", _meta: turn, arguments: {
+        idempotencyKey: "socket-review-resume", runId, contractDigest: run.contractDigest, bootstrapPlanDigest: digest,
+        ownerSessionId: run.ownerSessionId, ownerSessionIncarnation: run.ownerSessionIncarnation,
+        ownerBindingGeneration: run.ownerBindingGeneration,
+      } };
+      const instructed = await r.request("tools/call", resume);
+      expect(instructed.result?.structuredContent).toMatchObject({ ok: true, value: { runId, bootstrapPlanDigest: digest } });
+      expect((await r.request("tools/call", resume)).result?.structuredContent).toEqual(instructed.result?.structuredContent);
+      const instructions = h.cp.outbox.listByRun(runId).filter(m => m.kind === "RESUME_REVIEW");
+      expect(instructions).toHaveLength(1);
+      expect((await callCtoToolAsOwner(h, runId, "role_dispatch_pending", {})).body).toMatchObject({ ok: true,
+        value: { messages: expect.arrayContaining([expect.objectContaining({ kind: "RESUME_REVIEW", payload: expect.objectContaining({ bootstrapPlanDigest: digest }) })]) } });
+      expect(h.cp.audit.byKind("CEO_DECISION")).toHaveLength(1);
+      expect(h.cp.audit.byKind("CEO_DECISION")[0]?.evidence).toMatchObject({ instruction: "RESUME_REVIEW", hermesPrincipal: principal });
+      expect(h.cp.runs.require(runId).state).toBe("ACTIVE");
       expect((await callCtoToolAsOwner(h, runId, "bootstrap_plan_get", { runId })).body)
         .toMatchObject({ ok: true, value: { digest, planBody: body } });
       expect((await callCtoToolAsOwner(h, runId, "plan_submit", { idempotencyKey: "plan-socket-submit", runId, bootstrapPlanDigest: digest })).body)

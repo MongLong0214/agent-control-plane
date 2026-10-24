@@ -1,7 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import { attachBootstrapPlan, bootstrapPlanAttachAccess, bootstrapPlanAttachAuthority, validateBootstrapPlanDigests, BOOTSTRAP_PLAN_MAX_BYTES, type BootstrapPlanAttachInput } from "../bootstrap/bootstrap-plan-artifact.ts";
+import {
+  attachBootstrapPlan, bootstrapPlanAttachAccess, bootstrapPlanAttachAuthority, validateBootstrapPlanDigests,
+  BOOTSTRAP_PLAN_MAX_BYTES, type BootstrapPlanAttachInput, bootstrapReviewResumeAccess,
+  replayBootstrapReviewResume, resumeBootstrapReview, type BootstrapReviewResumeInput,
+} from "../bootstrap/bootstrap-plan-artifact.ts";
 import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -113,6 +117,11 @@ export const createHermesMcpPort = (
       }
       return allow(ReasonCode.OK, { roleKey: binding.roleKey, bindingGeneration: binding.bindingGeneration });
     },
+    replayBootstrapReviewResume: (peer: AuthenticatedMcpPeer, input: BootstrapReviewResumeInput, fingerprint: string) =>
+      replayBootstrapReviewResume(source, peer, input, fingerprint),
+    resumeBootstrapReview: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: BootstrapReviewResumeInput, fingerprint: string) =>
+      resumeBootstrapReview(source, peer, turn, input, fingerprint),
+    bootstrapReviewResumeAccess: (input: BootstrapReviewResumeInput) => bootstrapReviewResumeAccess(source, input),
     attachBootstrapPlan: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: BootstrapPlanAttachInput) =>
       attachBootstrapPlan(source, peer, turn, input),
     bootstrapPlanAttachAuthority: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined) =>
@@ -366,9 +375,13 @@ const createHermesServerFromPort = (
       authority: () => {
         const current = authenticateMcpPeer(authenticate);
         const authority = current.allowed ? port.peerAuthority(peer.value) : current;
-        if (!authority.allowed || toolName !== "bootstrap_plan_attach") return authority;
+        if (!authority.allowed || (toolName !== "bootstrap_plan_attach" && toolName !== "bootstrap_review_resume")) return authority;
         const identity = port.bootstrapPlanAttachAuthority(peer.value, admittedTurnOf(extra));
         if (!identity.allowed) return identity;
+        if (toolName === "bootstrap_review_resume") {
+          const access = port.bootstrapReviewResumeAccess(args as unknown as BootstrapReviewResumeInput);
+          return access.allowed ? authority : access;
+        }
         const digests = validateBootstrapPlanDigests({ contractDigest: args.contractDigest as string,
           expectedSha256: args.expectedSha256 as string, replacesSha256: args.replacesSha256 as string | undefined });
         if (!digests.allowed) return digests;
@@ -394,6 +407,23 @@ const createHermesServerFromPort = (
     return write(toolName, args, extra, () => execute(peer.value.actor));
   });
 
+  server.registerTool(
+    "bootstrap_review_resume",
+    {
+      description: "Tell the current owner of an ACTIVE bootstrap run to resubmit the current attached PLAN by digest for a new blind review. Requires current CEO Hermes owner or delegated peer provenance, contract, attachment digest and exact owner session/incarnation/generation. This is not CONFIRM, genesis or workflow approval, or a review PASS. Same key replays one instruction; different keys enqueue separate instructions even while pending.",
+      inputSchema: { ...mutation, runId: z.string(), contractDigest: z.string(), bootstrapPlanDigest: z.string(),
+        ownerSessionId: z.string(), ownerSessionIncarnation: z.string(), ownerBindingGeneration: z.number().int() },
+    },
+    async (args, extra) => write("bootstrap_review_resume", args, extra, fingerprint => {
+      const peer = authenticateMcpPeer(authenticate);
+      return peer.allowed ? respond(port.resumeBootstrapReview(peer.value, admittedTurnOf(extra), args, fingerprint)) : respond(peer);
+    }, fingerprint => {
+      const peer = authenticateMcpPeer(authenticate);
+      if (!peer.allowed) return respond(peer);
+      const replay = port.replayBootstrapReviewResume(peer.value, args, fingerprint);
+      return replay ? respond(replay) : null;
+    }),
+  );
   server.registerTool(
     "bootstrap_plan_attach",
     {

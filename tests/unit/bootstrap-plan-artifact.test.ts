@@ -1,3 +1,4 @@
+import { collectBootstrapCeoDecisions } from "../../src/bootstrap/bootstrap-ceo-decisions.ts";
 import { chmodSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -17,7 +18,7 @@ import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 import { cleanupTempDirs, seedRun, tempDir } from "../helpers/fixtures.ts";
-import { bindCeo, dispatchBootstrapRun, makeHarness, reviewerPass } from "../helpers/harness.ts";
+import { bindCeo, dispatchBootstrapRun, makeHarness, reviewerPass, reviewerRevise } from "../helpers/harness.ts";
 import { openActivationHandoff, producedHandoff } from "../helpers/driven-primary-cto.ts";
 import { bootstrapCoverageKeys } from "../helpers/bootstrap-plan.ts";
 import { genesisFile, genesisPlanFixture } from "../helpers/genesis-github.ts";
@@ -57,10 +58,11 @@ async function fixture(principal: "owner" | "peer" = "owner") {
     const client = new Client({ name: "bootstrap-plan-artifact", version: "1" });
     await client.connect(ct);
     servers.push(server, client);
-    return async (name: string, args: Args, callMeta: Args = meta): Promise<Args> => {
+    const call = async (name: string, args: Args, callMeta: Args = meta): Promise<Args> => {
       const result = await client.callTool({ name, arguments: args, _meta: callMeta });
       return (result.structuredContent ?? { ok: false, rpcError: result.content }) as Args;
     };
+    return Object.assign(call, { listTools: () => client.listTools() });
   }
   const hermes = await connect("hermes", ceo);
   const cto = await connect("cto", run.ownerSessionId!);
@@ -1353,6 +1355,286 @@ describe("B2 candidates are non-authoritative uploads selected by run, stager an
           handoffId: input.artifactId, messageId: "missing", payloadDigest: input.digest, bindingGeneration: 1 }))
           .toMatchObject({ ok: false, reasonCode: "NOT_FOUND" });
       }
+    } finally { await f.close(); }
+  });
+});
+
+
+// CEO 26c72ba9: one digest-bound instruction to the ACTIVE run's current owner.
+describe("bootstrap_review_resume", () => {
+  const args = (f: Awaited<ReturnType<typeof fixture>>, overrides: Args = {}) => ({
+    idempotencyKey: "resume-review", runId: f.run.runId, contractDigest: f.run.contractDigest,
+    bootstrapPlanDigest: f.digest, ownerSessionId: f.run.ownerSessionId,
+    ownerSessionIncarnation: f.run.ownerSessionIncarnation, ownerBindingGeneration: f.run.ownerBindingGeneration,
+    ...overrides,
+  });
+  const instructions = (f: Awaited<ReturnType<typeof fixture>>) => f.h.cp.outbox.listByRun(f.run.runId)
+    .filter(m => m.kind === "RESUME_REVIEW");
+
+  it("lists and calls as the authenticated CEO, wakes once, and the owner resubmits the same digest for a new blind review", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await f.cto("plan_submit", { idempotencyKey: "first-plan", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerRevise(bootstrapCoverageKeys(f.h, f.run.runId), "review again on CEO instruction") });
+      expect(await f.cto("result_submit", { idempotencyKey: "first-review", runId: f.run.runId, resultSummary: "compiled PLAN", recommendation: "review" }))
+        .toMatchObject({ ok: true, value: { stage: "REVISION_REQUIRED" } });
+      const firstCandidate = f.h.cp.runs.currentCandidate(f.run.runId);
+      expect(f.h.cp.runs.require(f.run.runId).state).toBe("ACTIVE");
+      expect(f.h.cp.outbox.listByRun(f.run.runId).some(m => m.kind === "REVISION_REQUEST" && m.status === "PENDING")).toBe(true);
+      const listed = (await f.hermes.listTools()).tools.find(t => t.name === "bootstrap_review_resume");
+      expect(listed?.description).toContain("new blind review");
+      const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
+      f.h.cp.outbox.attachInBandWake(wake);
+      const first = await f.hermes("bootstrap_review_resume", args(f));
+      expect(first).toMatchObject({ ok: true, value: { runId: f.run.runId, bootstrapPlanDigest: f.digest, messageId: expect.any(String) } });
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toEqual(first);
+      expect(instructions(f)).toHaveLength(1);
+      const instruction = instructions(f)[0]!;
+      await vi.waitFor(() => expect(wake).toHaveBeenCalledTimes(1));
+      expect(wake).toHaveBeenCalledWith(f.run.ownerRoleKey, [instruction.messageId]);
+      const inbox = await f.cto("role_dispatch_pending", {});
+      expect(inbox).toMatchObject({ ok: true });
+      const received = ((inbox.value as Args).messages as Array<{ messageId: string; payload: Args }>)
+        .find(m => m.messageId === instruction.messageId)!;
+      expect(received.payload).toMatchObject({ runId: f.run.runId, bootstrapPlanDigest: f.digest, intent: "RESUME_REVIEW" });
+      expect(JSON.stringify(received.payload)).toContain("not CONFIRM");
+      expect(JSON.stringify(received.payload)).toContain("not genesis or workflow approval");
+      expect(JSON.stringify(received.payload)).toContain("not a review PASS");
+      expect(f.h.cp.audit.byKind("CEO_DECISION")).toHaveLength(1);
+      expect(f.h.cp.audit.byKind("CEO_DECISION")[0]!.evidence).toMatchObject({ instruction: "RESUME_REVIEW", messageId: instruction.messageId });
+      expect(f.h.cp.artifacts.list(f.run.runId, "APPROVAL")).toEqual([]);
+      expect(f.h.cp.bootstrapApplications.get(f.run.runId)).toBeNull();
+      expect(collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId)).toEqual([]);
+      expect(f.h.cp.audit.byKind("OWNER_DECISION")).toEqual([]);
+      expect(f.h.cp.audit.byKind("CEO_DECISION").some(a => a.evidence["decision"] === "CONFIRM")).toBe(false);
+      expect(f.h.cp.runs.require(f.run.runId).state).toBe("ACTIVE");
+      expect(f.h.cp.runs.currentCandidate(f.run.runId)).toEqual(firstCandidate);
+      expect(await f.cto("plan_submit", { idempotencyKey: "resume-plan", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      expect(await f.cto("result_submit", { idempotencyKey: "resume-result", runId: f.run.runId, resultSummary: "resubmitted current PLAN", recommendation: "review" })).toMatchObject({ ok: true });
+      // Snapshot identity is content-based: a second freeze of these same bytes keeps the digest.
+      expect(f.h.cp.runs.currentCandidate(f.run.runId)).toEqual(firstCandidate);
+      const freezes = f.h.cp.audit.forRun(f.run.runId).filter(a => a.kind === "CANDIDATE_FROZEN");
+      expect(freezes).toHaveLength(2);
+      expect(freezes[0]!.evidence["attemptId"]).not.toEqual(freezes[1]!.evidence["attemptId"]);
+      expect(f.h.scripted.invocations.filter(i => /Bootstrap plan review/.test(i.prompt))).toHaveLength(2);
+      expect(f.h.cp.runs.require(f.run.runId).state).toBe("READY_FOR_CEO_REVIEW");
+      expect(await f.cto("run_ack", { idempotencyKey: "resume-ack", runId: f.run.runId, messageId: instruction.messageId,
+        bindingGeneration: instruction.bindingGeneration })).toMatchObject({ ok: true });
+    } finally { await f.close(); }
+  });
+
+  it.each([
+    ["wrong run", { runId: "run_missing" }, "NOT_FOUND"],
+    ["wrong contract", { contractDigest: sha256("other") }, "BOOTSTRAP_CONTRACT_DRIFT"],
+    ["wrong attachment", { bootstrapPlanDigest: sha256("other") }, "SNAPSHOT_DIGEST_MISMATCH"],
+    ["stale generation", { ownerBindingGeneration: 0 }, "BINDING_GENERATION_STALE"],
+    ["stale session", { ownerSessionId: "ses_other" }, "BINDING_GENERATION_STALE"],
+    ["stale incarnation", { ownerSessionIncarnation: "other" }, "BINDING_GENERATION_STALE"],
+  ])("refuses %s without an instruction or CEO decision", async (_name, overrides, reasonCode) => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await f.hermes("bootstrap_review_resume", args(f, overrides as Args))).toMatchObject({ ok: false, reasonCode });
+      expect(instructions(f)).toEqual([]);
+      expect(f.h.cp.audit.byKind("CEO_DECISION")).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it("keeps different keys as separate pending instructions, and replays one key without a second audit", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const first = await f.hermes("bootstrap_review_resume", args(f));
+      expect(first).toMatchObject({ ok: true });
+
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toEqual(first);
+      const second = await f.hermes("bootstrap_review_resume", args(f, { idempotencyKey: "another-review" }));
+      expect(second).toMatchObject({ ok: true });
+      expect(second).not.toEqual(first);
+      expect(instructions(f)).toHaveLength(2);
+      expect(instructions(f).every(m => m.status === "PENDING")).toBe(true);
+      expect(f.h.cp.audit.byKind("CEO_DECISION")).toHaveLength(2);
+      expect(await f.hermes("bootstrap_review_resume", args(f, { contractDigest: sha256("changed request") })))
+        .toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_CONTRACT_DRIFT" });
+      expect(instructions(f)).toHaveLength(2);
+    } finally { await f.close(); }
+  });
+
+  it("recovers the same committed instruction after a response-store failure, without another audit or wake", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
+      f.h.cp.outbox.attachInBandWake(wake);
+      const original = f.h.cp.db.run.bind(f.h.cp.db);
+      let injected = false;
+      vi.spyOn(f.h.cp.db, "run").mockImplementation((sql, params) => {
+        if (!injected && sql.includes("UPDATE inbound_messages SET result_json") && params?.[1] === "resume-review") {
+          injected = true;
+          throw new Error("fixture response-store loss after commit");
+        }
+        return original(sql, params);
+      });
+      await f.hermes("bootstrap_review_resume", args(f));
+      expect(injected).toBe(true);
+      expect(instructions(f)).toHaveLength(1);
+      const messageId = instructions(f)[0]!.messageId;
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: true, value: { messageId } });
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: true, value: { messageId } });
+      expect(instructions(f)).toHaveLength(1);
+      expect(f.h.cp.audit.byKind("CEO_DECISION")).toHaveLength(1);
+      await vi.waitFor(() => expect(wake).toHaveBeenCalledTimes(1));
+    } finally { vi.restoreAllMocks(); await f.close(); }
+  });
+
+  it.each(["enqueue", "audit"])("rolls back instruction, audit and wake when %s refuses", async stage => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
+      f.h.cp.outbox.attachInBandWake(wake);
+      const before = f.h.cp.outbox.listByRun(f.run.runId);
+      if (stage === "enqueue") vi.spyOn(f.h.cp.outbox, "enqueue").mockReturnValue(deny(ReasonCode.CONFLICT, "test refusal"));
+      else {
+        const record = f.h.cp.audit.record.bind(f.h.cp.audit);
+        vi.spyOn(f.h.cp.audit, "record").mockImplementation(input => input.kind === "CEO_DECISION"
+          ? deny(ReasonCode.CONFLICT, "test refusal") : record(input));
+      }
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+      expect(f.h.cp.outbox.listByRun(f.run.runId)).toEqual(before);
+      expect(f.h.cp.audit.byKind("CEO_DECISION")).toEqual([]);
+      expect(wake).not.toHaveBeenCalled();
+    } finally { vi.restoreAllMocks(); await f.close(); }
+  });
+
+  it.each(["receipt", "claim", "ack"])("voids a replaced attachment on %s with SNAPSHOT_DIGEST_MISMATCH", async door => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: true });
+      const message = instructions(f)[0]!;
+      const input = JSON.parse(f.body);
+      input.plan.summary = "explicit replacement";
+      const body = JSON.stringify(input);
+      expect(await f.attach({ idempotencyKey: "replace-after-enqueue", replacesSha256: f.digest, expectedSha256: sha256(body), planBody: body }))
+        .toMatchObject({ ok: true });
+      if (door === "receipt") {
+        const inbox = await f.cto("role_dispatch_pending", {});
+        expect(inbox).toMatchObject({ ok: true });
+        expect(((inbox.value as Args).messages as Args[]).some(m => m.messageId === message.messageId)).toBe(false);
+      } else if (door === "claim") {
+        // Handover must void the instruction before the successor can claim or read it.
+        const next = f.h.cp.sessions.create({ provider: "scripted", model: "claim-successor" });
+        f.h.cp.sessions.transition(next.sessionId, SessionLifecycle.READY, "fixture");
+        expect(f.h.cp.bindings.switchTo({ role: Role.BOOTSTRAP_CTO, runId: f.run.runId,
+          sessionId: next.sessionId, conversation: "REPLACED", reason: "fixture takeover", takeover: true }).allowed).toBe(true);
+        expect(f.h.cp.outbox.claimDeliverable().some(m => m.messageId === message.messageId)).toBe(false);
+      } else {
+        expect(await f.cto("run_ack", { idempotencyKey: "void-ack", runId: f.run.runId, messageId: message.messageId }))
+          .toMatchObject({ ok: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+      }
+      expect(f.h.cp.outbox.get(message.messageId)?.status).toBe("REJECTED");
+      expect(f.h.cp.db.get("SELECT reason_code FROM outbox WHERE message_id = ?", [message.messageId]))
+        .toEqual({ reason_code: "SNAPSHOT_DIGEST_MISMATCH" });
+      expect(f.h.cp.audit.byKind("OUTBOX_INSTRUCTION_SUPERSEDED").find(a => a.evidence["messageId"] === message.messageId)?.evidence)
+        .toMatchObject({ reason: "BOOTSTRAP_PLAN_CHANGED" });
+    } finally { await f.close(); }
+  });
+
+  it("voids attached body corruption after enqueue and refuses corruption before enqueue", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: true });
+      const message = instructions(f)[0]!;
+      const attachment = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")[0]!;
+      const raw = new Database(f.h.cp.db.raw.name);
+      try {
+        raw.function("acp_evidence_write_authorized", () => 0);
+        raw.exec("DROP TRIGGER run_artifacts_content_immutable");
+        raw.prepare("UPDATE run_artifacts SET content_json = ? WHERE artifact_id = ?")
+          .run(JSON.stringify({ ...attachment.content, bodyBase64: Buffer.from(f.body + " ").toString("base64") }), attachment.artifactId);
+      } finally { raw.close(); }
+      expect(await f.hermes("bootstrap_review_resume", args(f, { idempotencyKey: "damaged-input" })))
+        .toMatchObject({ ok: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+      const inbox = await f.cto("role_dispatch_pending", {});
+      expect(((inbox.value as Args).messages as Args[]).some(m => m.messageId === message.messageId)).toBe(false);
+      expect(f.h.cp.db.get("SELECT status, reason_code FROM outbox WHERE message_id = ?", [message.messageId]))
+        .toEqual({ status: "REJECTED", reason_code: "SNAPSHOT_DIGEST_MISMATCH" });
+      expect(instructions(f)).toHaveLength(1);
+      expect(f.h.cp.audit.byKind("CEO_DECISION")).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it("carries the same instruction through authenticated takeover and revoke/rebind, withholding it from the stale owner", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: true });
+      const message = instructions(f)[0]!;
+      const next = f.h.cp.sessions.create({ provider: "scripted", model: "resume-successor" });
+      f.h.cp.sessions.transition(next.sessionId, SessionLifecycle.READY, "fixture");
+      expect(f.h.cp.bindings.switchTo({ role: Role.BOOTSTRAP_CTO, runId: f.run.runId,
+        sessionId: next.sessionId, conversation: "REPLACED", reason: "fixture takeover", takeover: true }).allowed).toBe(true);
+      const carried = f.h.cp.outbox.get(message.messageId)!;
+      expect(carried).toMatchObject({ messageId: message.messageId, targetSessionId: next.sessionId,
+        bindingGeneration: message.bindingGeneration + 1, status: "PENDING", payload: message.payload });
+      const oldInbox = await f.cto("role_dispatch_pending", {});
+      expect(((oldInbox.value as Args).messages as Args[]).some(m => m.messageId === message.messageId)).toBe(false);
+      expect(f.h.cp.outbox.acknowledge(message.messageId, f.run.ownerSessionId!, message.bindingGeneration, f.run.ownerSessionIncarnation!).allowed).toBe(false);
+      expect(f.h.cp.runs.transition(f.run.runId, RunState.BLOCKED, "fixture hold").allowed).toBe(true);
+      expect(f.h.cp.bindings.revoke(f.run.ownerRoleKey!, "fixture revoke", { allowBlockedRuns: true }).allowed).toBe(true);
+      expect(f.h.cp.outbox.claimDeliverable().some(m => m.messageId === message.messageId)).toBe(false);
+      expect(f.h.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId: f.run.runId, sessionId: next.sessionId }).allowed).toBe(true);
+      expect(f.h.cp.outbox.get(message.messageId)).toMatchObject({ messageId: message.messageId,
+        targetSessionId: next.sessionId, bindingGeneration: message.bindingGeneration + 2, status: "PENDING", payload: message.payload });
+      const successor = await f.connect("cto", next.sessionId);
+      const inbox = await successor("role_dispatch_pending", {});
+      expect(((inbox.value as Args).messages as Args[]).filter(m => m.messageId === message.messageId)).toHaveLength(1);
+      expect(f.h.cp.outbox.claimDeliverable().some(m => m.messageId === message.messageId)).toBe(false);
+      expect(instructions(f)).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+
+  it.each(["owner", "peer"] as const)("requires complete CEO identity and valid provenance before digest validation on a %s turn", async principal => {
+    const f = await fixture(principal);
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const incomplete = await f.connect("hermes", f.ceo, true, "actor-only");
+      expect(await incomplete("bootstrap_review_resume", args(f, { bootstrapPlanDigest: "not-a-digest" })))
+        .toMatchObject({ ok: false, reasonCode: "MCP_PEER_UNAUTHENTICATED" });
+      expect(await f.hermes("bootstrap_review_resume", args(f), {})).toMatchObject({ ok: false, reasonCode: "MCP_TOOL_PROVENANCE_REFUSED" });
+      expect(await f.hermes("bootstrap_review_resume", args(f, { bootstrapPlanDigest: "not-a-digest" })))
+        .toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT", evidence: { refusal: "BOOTSTRAP_PLAN_DIGEST_INVALID" } });
+      expect(instructions(f)).toEqual([]);
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: true });
+      expect(f.h.cp.audit.byKind("CEO_DECISION")[0]!.evidence).toMatchObject({ hermesPrincipal: principal });
+    } finally { await f.close(); }
+  });
+
+  it("refuses BLOCKED and unrelated runs", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(f.h.cp.runs.transition(f.run.runId, RunState.BLOCKED, "fixture hold").allowed).toBe(true);
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: false, reasonCode: "RUN_TRANSITION_ILLEGAL" });
+      const other = seedRun({ db: f.h.cp.db, clock: f.h.clock, repoPath: f.h.repoPath });
+      expect(await f.hermes("bootstrap_review_resume", args(f, { runId: other.runId }))).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
+      expect(instructions(f)).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it("refuses a terminal run and a non-CEO", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const stranger = await f.connect("hermes", f.run.ownerSessionId!);
+      expect(await stranger("bootstrap_review_resume", args(f))).toMatchObject({ ok: false, reasonCode: "BINDING_GENERATION_STALE" });
+      expect(f.h.cp.runs.cancel(f.run.runId, "finished").allowed).toBe(true);
+      expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: false, reasonCode: "RUN_ALREADY_TERMINAL" });
+      expect(instructions(f)).toEqual([]);
     } finally { await f.close(); }
   });
 });

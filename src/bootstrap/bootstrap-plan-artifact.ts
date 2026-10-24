@@ -1,5 +1,5 @@
 import type { z } from "zod";
-import { isDigest, sha256 } from "../core/digest.ts";
+import { digestOf, isDigest, sha256 } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { artifactDigestMatches, type ArtifactStore, type StoredArtifact } from "../db/artifacts.ts";
@@ -8,6 +8,7 @@ import type { Db } from "../db/database.ts";
 import { ArtifactKind, Role, roleKeyFor, RunKind, RunState, SessionLifecycle, type RoleBinding, type RunRow } from "../domain/types.ts";
 import type { AuthenticatedMcpPeer } from "../mcp/shared.ts";
 import type { HermesAdmittedTurn } from "../mcp/hermes-provenance.ts";
+import { isTerminal } from "../domain/run-state.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -429,3 +430,112 @@ export const resolveBootstrapPlanInput = (
   if (!input.plan || !input.tasks) return deny(ReasonCode.INVALID_ARGUMENT, "plan_submit requires plan and tasks, or bootstrapPlanDigest");
   return allow(ReasonCode.OK, { plan: input.plan, tasks: input.tasks });
 };
+
+export interface BootstrapReviewResumeInput {
+  idempotencyKey: string;
+  runId: string;
+  contractDigest: string;
+  bootstrapPlanDigest: string;
+  ownerSessionId: string;
+  ownerSessionIncarnation: string;
+  ownerBindingGeneration: number;
+}
+
+/** Exact attachment identity and bytes, also checked at outbox receipt/claim and handover. */
+export const resumeReviewAttachmentMatches = (
+  db: Pick<Db, "get" | "all">, runId: string, payload: unknown,
+): boolean => {
+  try {
+    const p = payload as { runId: string; contractDigest: string; bootstrapPlanDigest: string; attachmentDigest: string };
+    if (p.runId !== runId) return false;
+    const run = db.get<{ contract_digest: string }>("SELECT contract_digest FROM runs WHERE run_id = ?", [runId]);
+    if (!run || run.contract_digest !== p.contractDigest) return false;
+    const rows = db.all<{ digest: string; content_json: string }>(
+      `SELECT digest, content_json FROM run_artifacts WHERE run_id = ? AND kind = 'HANDOFF' AND superseded = 0
+        ORDER BY created_at DESC, rowid DESC`, [runId]);
+    const attachments = rows.map(a => ({ digest: a.digest, content: JSON.parse(a.content_json) as PlanAttachment }))
+      .filter(a => isBootstrapPlanAttachment(a.content));
+    if (attachments.length !== 1) return false;
+    const a = attachments[0]!;
+    const bytes = Buffer.from(a.content.bodyBase64, "base64");
+    return a.digest === p.attachmentDigest && digestOf(a.content) === a.digest
+      && a.content.runId === runId && a.content.contractDigest === p.contractDigest
+      && a.content.sha256 === p.bootstrapPlanDigest && sha256(bytes) === p.bootstrapPlanDigest
+      && bytes.toString("base64") === a.content.bodyBase64
+      && Buffer.from(bytes.toString("utf8"), "utf8").equals(bytes)
+      && JSON.parse(bytes.toString("utf8")).runId === runId
+      && !!db.get(`SELECT 1 FROM audit_events WHERE run_id = ? AND kind = 'BOOTSTRAP_PLAN_ATTACHED'
+        AND json_extract(evidence_json, '$.digest') = ? AND json_extract(evidence_json, '$.payloadDigest') = ?`,
+      [runId, a.digest, p.bootstrapPlanDigest]);
+  } catch { return false; }
+};
+
+/** Admission is repeated inside the atomic decision/enqueue transaction. No state transition. */
+export const bootstrapReviewResumeAccess = (source: Source, input: BootstrapReviewResumeInput): Decision<RunRow> => {
+  const digests = validateBootstrapPlanDigests({ contractDigest: input.contractDigest, bootstrapPlanDigest: input.bootstrapPlanDigest });
+  if (!digests.allowed) return digests;
+  const run = source.runs.get(input.runId);
+  if (!run) return deny(ReasonCode.NOT_FOUND, "unknown resume-review run");
+  if (isTerminal(run.state)) return deny(ReasonCode.RUN_ALREADY_TERMINAL, "resume review requires a live run");
+  if (run.kind !== RunKind.PROJECT_BOOTSTRAP) return deny(ReasonCode.INVALID_ARGUMENT, "resume review requires a PROJECT_BOOTSTRAP run");
+  if (run.state !== RunState.ACTIVE) return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "resume review requires an ACTIVE run");
+  if (run.contractDigest !== input.contractDigest) return deny(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "resume-review contract is no longer current");
+  const binding = run.ownerRoleKey ? source.bindings.active(run.ownerRoleKey) : null;
+  if (!binding || binding.sessionId !== run.ownerSessionId || binding.sessionIncarnation !== run.ownerSessionIncarnation
+      || binding.bindingGeneration !== run.ownerBindingGeneration || binding.sessionId !== input.ownerSessionId
+      || binding.sessionIncarnation !== input.ownerSessionIncarnation || binding.bindingGeneration !== input.ownerBindingGeneration) {
+    return deny(ReasonCode.BINDING_GENERATION_STALE, "resume-review owner session, incarnation or generation is stale");
+  }
+  const attachment = readBootstrapPlanAttachment(source, run.runId);
+  if (!attachment.allowed || attachment.value.digest !== input.bootstrapPlanDigest) {
+    return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "resume review requires the current, intact attached PLAN digest");
+  }
+  return allow(ReasonCode.OK, run);
+};
+
+type ResumeReviewResult = { runId: string; bootstrapPlanDigest: string; messageId: string };
+const resumeReviewKey = (peer: AuthenticatedMcpPeer, input: BootstrapReviewResumeInput) =>
+  `bootstrap-review-resume:${sha256(JSON.stringify({ sessionId: peer.sessionId, idempotencyKey: input.idempotencyKey }))}`;
+
+/** Recover the committed instruction when the shared MCP response store failed after commit. */
+export const replayBootstrapReviewResume = (
+  source: Source & { outbox: Outbox }, peer: AuthenticatedMcpPeer, input: BootstrapReviewResumeInput, mcpFingerprint: string,
+): Decision<ResumeReviewResult> | null => {
+  const prior = source.outbox.byIdempotencyKey(resumeReviewKey(peer, input));
+  if (!prior) return null;
+  const recorded = source.audit.forRun(input.runId).some(a => a.kind === "CEO_DECISION"
+    && a.evidence["instruction"] === "RESUME_REVIEW" && a.evidence["messageId"] === prior.messageId
+    && a.evidence["requestDigest"] === digestOf(input) && a.evidence["mcpFingerprint"] === mcpFingerprint);
+  return recorded ? allow(ReasonCode.OK, { runId: input.runId, bootstrapPlanDigest: input.bootstrapPlanDigest, messageId: prior.messageId })
+    : deny(ReasonCode.CONFLICT, "resume-review key belongs to another request or principal");
+};
+
+export const resumeBootstrapReview = (
+  source: Source & { outbox: Outbox }, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined,
+  input: BootstrapReviewResumeInput, mcpFingerprint: string,
+): Decision<ResumeReviewResult> => source.db.txDecision(() => {
+  const identity = bootstrapPlanAttachAuthority(source, peer, turn);
+  if (!identity.allowed) return identity;
+  const admitted = bootstrapReviewResumeAccess(source, input);
+  if (!admitted.allowed) return admitted;
+  const run = admitted.value;
+  const attachment = attachmentOf(source, run.runId)!;
+  const replay = replayBootstrapReviewResume(source, peer, input, mcpFingerprint);
+  if (replay) return replay;
+  // As with ordinary outbox enqueue, distinct keys create distinct instructions, even while pending.
+  const queued = source.outbox.enqueue({ idempotencyKey: resumeReviewKey(peer, input), roleKey: run.ownerRoleKey!,
+    bindingGeneration: run.ownerBindingGeneration!, targetSessionId: run.ownerSessionId!, runId: run.runId,
+    kind: MessageKind.RESUME_REVIEW,
+    payload: { intent: "RESUME_REVIEW", runId: run.runId, contractDigest: input.contractDigest,
+      bootstrapPlanDigest: input.bootstrapPlanDigest, attachmentDigest: attachment.digest,
+      directive: "Resume review only: read bootstrap_plan_get and verify bootstrapPlanDigest is still current, then plan_submit with idempotencyKey, runId and bootstrapPlanDigest, followed by result_submit for a new blind review. Acknowledge this message with run_ack after handling it; deduplicate effects by messageId. If the digest changed, this instruction is void. This is not CONFIRM, not genesis or workflow approval, not a review PASS, and grants no execution authority. Blind review and CEO CONFIRM are still required." } });
+  if (!queued.allowed) return queued;
+  const audit = source.audit.record({ kind: "CEO_DECISION", runId: run.runId, projectId: run.projectId,
+    sessionId: peer.sessionId, roleKey: identity.value.ceo.roleKey,
+    evidence: { instruction: "RESUME_REVIEW", messageId: queued.value.messageId, requestDigest: digestOf(input), mcpFingerprint,
+      contractDigest: input.contractDigest, payloadDigest: input.bootstrapPlanDigest, digest: attachment.digest,
+      ownerSessionId: input.ownerSessionId, ownerSessionIncarnation: input.ownerSessionIncarnation,
+      ownerBindingGeneration: input.ownerBindingGeneration, bindingGeneration: identity.value.ceo.bindingGeneration,
+      hermesPrincipal: identity.value.turn.principal, hermesPeerGrant: identity.value.turn.peerGrant } });
+  return audit.allowed ? allow(ReasonCode.OK, { runId: run.runId, bootstrapPlanDigest: input.bootstrapPlanDigest, messageId: queued.value.messageId }) : audit;
+});
