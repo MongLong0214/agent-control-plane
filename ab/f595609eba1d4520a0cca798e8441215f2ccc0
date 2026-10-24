@@ -1,0 +1,21 @@
+Limit: a CEO notification is ready only when the actual signer is qualified in the exact room's roster AND the local send policy accepts it; once that exact local policy refusal is seen the row is held with one audit and no further send, and it is re-validated through the existing resume path only after the binding, target or signer changes or the policy file digest changes (ACP_BUZZ_SEND_POLICY_FILE); the policy's rules are not copied into ACP, and the refusal proves only that attempt was blocked (CEO 7c85e82d).
+Record-Id: r-1c45d84d44e4
+Provenance: inherited 0204a5b6dfb66bbf077fe59cb1a93b8100bd25a9
+
+Limit: the exactly identified legacy signer-policy refusal is carried into the policy hold and a positive roster alone never releases it; a refusal keeps the policy identity observed before that attempt, so a mid-attempt policy edit is never recorded as the new policy's refusal; an unavailable-to-readable fingerprint recovery alone keeps the hold; the 12 legacy unknown rows are untouched (review ACP1202-R1-01..03, CEO 961c88a4).
+Warn: resume has no non-sending policy verdict: a policy digest change can only lead to a re-validated send attempt, and a hold whose refusal fingerprint was unavailable is released only by a binding, target or signer change.
+Record-Id: r-6b50a26b2ccd
+Provenance: inherited ff7e5623842dbf9b08f255c578afe7a7b137dd12
+
+Limit: a held CEO notification is released only by the explicit resume path after the local wrapper's read-only policy check (__acp_policy_check_v1__, the same evaluator as send) returns allowed and the current roster and binding re-validate; refused or undeterminable stays held, a null-identity hold recovers only through that fresh verdict, the real send still evaluates the current policy itself, and a send-time refusal re-holds against that attempt's identity (CEO 2cb822a9).
+Record-Id: r-5d3d3f344902
+Provenance: inherited 4bd63dc764bfce922250614c3f84f488caabacbb
+
+Limit: the launchd installer refuses, before stopping the service or replacing anything, when ACP_BUZZ_SEND_POLICY_FILE cannot be determined, and renders it with %q; at runtime a CEO notification is ready only when the wrapper's read-only check for the actual daemon signer and exact CEO target reports allowed with the same resolved policy file and digest ACP computes, otherwise it is held with BUZZ_SEND_POLICY_BINDING_UNVERIFIED and one audit (CEO 34ce28ce, 23ddeab7).
+Limit: only a check verdict whose wrapper-supplied cause is ROSTER_STATE goes to the roster re-validation path and may get a fresh read-only check under an unchanged policy digest; policy, credential, authority and unknown or missing causes keep their hold fail-closed, and repeated re-validation adds no audits (review ACP1202-R2-01, CEO 3e3a89f9).
+Record-Id: r-a7c594147892
+Provenance: inherited 60c2bd2cfe9877b91c3a716ca0462dd31f951320
+
+Limit: after the asynchronous policy check and immediately before BuzzCliTransport.send spawns messages send, the full claim, current-binding, lifecycle and exact-destination fence runs again; a revocation, room change or session end during an allowed check posts nothing, and routeDigest or a null canonical route is never taken as proof of validity (review ACP1202-R3-01, CEO c46f6885).
+Record-Id: r-b989bfed5b4f
+Provenance: inherited 520b9fa78068f36d5f4b2be63cb4c9c21eb08f2e
