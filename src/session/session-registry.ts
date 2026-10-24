@@ -537,7 +537,18 @@ export class SessionRegistry {
     input: BindBuzzActorInput | AdmittedBindBuzzActorInput | PossessedBindBuzzActorInput,
     authenticator: BuzzActorAuthenticator,
   ): Decision<SessionRecord> {
-    if ("possession" in input) return this.#bindPossessedBuzzActor(input.possession, authenticator);
+    if ("possession" in input) {
+      return this.db.txDecision(() => {
+        const bound = this.#bindPossessedBuzzActor(input.possession, authenticator);
+        if (!bound.allowed) return bound;
+        // The proof carries the authenticated answer's room. Use the existing audited writer,
+        // in the binding transaction, including a fresh proof for an already-bound runtime.
+        if (bound.value.buzzAddress !== input.possession.buzzAddress) {
+          this.setBuzzAddress(bound.value.sessionId, input.possession.buzzAddress);
+        }
+        return allow(ReasonCode.OK, this.require(bound.value.sessionId));
+      });
+    }
     if ("admitted" in input) return this.#bindAdmittedBuzzActor(input, authenticator);
     const authenticated = this.verifySecret(input.sessionId, input.sessionSecret);
     if (!authenticated.allowed) return authenticated;
@@ -604,6 +615,21 @@ export class SessionRegistry {
         lifecycle,
       });
     }
+    const ceo = this.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.role_key = ? AND a.status = 'ACTIVE' AND a.binding_generation = ?
+          AND COALESCE(c.current_session_id, a.session_id) = ?
+          AND COALESCE(c.current_session_incarnation, a.session_incarnation) = ?`,
+      [CEO_ROLE_KEY, possession.ceoBindingGeneration, sessionId, possession.runtime.sessionIncarnation],
+    )?.n ?? 0;
+    if (ceo !== 1) {
+      return deny(
+        ReasonCode.BINDING_GENERATION_STALE,
+        "the CEO binding's runtime or generation changed since the challenge was minted",
+        { sessionId },
+      );
+    }
     if (authenticated.value.buzzActorId === actorId) return authenticated;
     if (authenticated.value.buzzActorId !== null) {
       return deny(ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE, "session already speaks as a different buzz channel identity", {
@@ -633,21 +659,6 @@ export class SessionRegistry {
     const sessionId = possession.runtime.sessionId;
     const incarnation = possession.runtime.sessionIncarnation;
     return this.db.txDecision((): Decision<SessionRecord> => {
-      const ceo = this.db.get<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM assignments a
-           LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
-          WHERE a.role_key = ? AND a.status = 'ACTIVE' AND a.binding_generation = ?
-            AND COALESCE(c.current_session_id, a.session_id) = ?
-            AND COALESCE(c.current_session_incarnation, a.session_incarnation) = ?`,
-        [CEO_ROLE_KEY, possession.ceoBindingGeneration, sessionId, incarnation],
-      )?.n ?? 0;
-      if (ceo !== 1) {
-        return deny(
-          ReasonCode.BINDING_GENERATION_STALE,
-          "the CEO binding's runtime or generation changed since the challenge was minted",
-          { sessionId },
-        );
-      }
       const holders = this.buzzActorHolders(actorId, sessionId);
       if (holders.blocking !== null) {
         return deny(ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "another session row already carries this identity", {

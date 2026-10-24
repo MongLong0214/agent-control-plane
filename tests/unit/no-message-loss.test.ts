@@ -118,7 +118,7 @@ it("#5 admits offline mail against the stable role floor and retains the same ID
   } finally { h.cp.close(); }
 });
 
-it("#6 retains a refused wake and retries delivery on replay without duplicating the message", async () => {
+it("#6 retains a refused wake but a replay creates neither a second wake nor a duplicate message", async () => {
   const h = makeHarness();
   try {
     const session = ready(h, "wake-replay", "cto");
@@ -133,8 +133,8 @@ it("#6 retains a refused wake and retries delivery on replay without duplicating
     const one = await deliverBuzzMessage(seam.ingress, seam.port, signed);
     expect(one).toMatchObject({ allowed: true, evidence: { wake: ReasonCode.ROLE_PEER_FAILED } });
     const two = await deliverBuzzMessage(seam.ingress, seam.port, signed);
-    expect(two).toMatchObject({ allowed: true, evidence: { wake: ReasonCode.OK } });
-    expect(attempts).toBe(2);
+    expect(two).toMatchObject({ allowed: true, reasonCode: ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, evidence: { wakeSent: false } });
+    expect(attempts).toBe(1);
     expect(h.cp.db.all("SELECT * FROM outbox")).toHaveLength(1);
   } finally { h.cp.close(); }
 });

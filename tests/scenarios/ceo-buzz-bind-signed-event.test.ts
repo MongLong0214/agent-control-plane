@@ -47,7 +47,7 @@ import { clearSessionMessagingEnv, inheritedSessionMessagingNames, SESSION_MESSA
  * The CEO asks its admitted tool socket for a challenge (`buzz_actor_bind({actor})`), then posts the
  * challenge token in an ordinary Buzz mention of the CTO signed with its own Nostr key. That event
  * reaches the daemon through the real mention subscriber — `validateEvent`, `verifyEvent`, the `p`
- * and `h` checks, the role check — and the subscriber's sink hands it to the binding rather than to
+ * and `h` checks, the role check — and the subscriber's sink settles the binding before
  * admission. The only stated facts are the process tree above this test process and the Gateway's
  * readback; the events are real nostr-tools events, signed by real keys.
  */
@@ -405,7 +405,7 @@ const bindByChallenge = async (f: BindFixture): Promise<BuzzMentionEvent> => {
 };
 
 describe("the adopted CEO binds its Buzz channel identity with an event its own key signed", () => {
-  it("binds the key that signed the challenge token, and the binding event is delivered to no one", async () => {
+  it("binds the key that signed the challenge token, then delivers its mention", async () => {
     const f = await startBindFixture();
     expect(f.ceoIdentity()).toBeNull();
     // The npub form names the same x-only key.
@@ -424,9 +424,9 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
       actor: `buzz:${f.ceo.pubkey}`,
     });
     expect(f.refusalRows()).toEqual([]);
-    // Not a message: no ingress row, no peer message for the CTO.
-    expect(f.inbound(proof.id)).toBeUndefined();
-    expect(f.peerRows()).toEqual([]);
+    // The same signed event is also ordinary CTO mail.
+    expect(f.inbound(proof.id)).toBeDefined();
+    expect(f.peerRows()).toHaveLength(1);
     expect(f.subscriber.counters().framesHandled).toBeGreaterThan(0);
   });
 
@@ -437,7 +437,7 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
 
     const wrongCaller = f.mention(f.stranger, `나도 바인딩: ${token}`);
     await f.relayDelivers(wrongCaller);
-    expect(f.refusedWith(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED)).toBe(1);
+    expect(f.refusedWith(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED)).toBe(1);
     expect(f.ceoIdentity()).toBeNull();
     expect(f.sessionsRows()).toEqual(sessions);
     expect(f.boundRows()).toBe(0);
@@ -451,7 +451,7 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
     }]);
     // Repeated, it is refused again and recorded no further.
     await f.relayDelivers(f.mention(f.stranger, `다시: ${token}`, f.nowSeconds() + 1));
-    expect(f.refusedWith(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED)).toBe(2);
+    expect(f.refusedWith(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED)).toBe(2);
     expect(f.refusalRows()).toHaveLength(1);
     expect(f.ceoIdentity()).toBeNull();
 
@@ -478,8 +478,8 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
       cause: "event-replayed",
       nonce: buzzMessageNonce(proof.id),
     }]);
-    expect(f.inbound(proof.id)).toBeUndefined();
-    expect(f.peerRows()).toEqual([]);
+    expect(f.inbound(proof.id)).toBeDefined();
+    expect(f.peerRows()).toHaveLength(1);
   });
 
   it("refuses a second event that reuses a nonce the binding already consumed", async () => {
@@ -490,13 +490,13 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
 
     const reuse = f.mention(f.ceo, `한 번 더: ${token}`, f.nowSeconds() + 1);
     await f.relayDelivers(reuse);
-    expect(f.refusedWith(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED)).toBe(1);
+    expect(f.refusedWith(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED)).toBe(0);
     expect(f.sessionsRows()).toEqual(sessions);
     expect(f.boundRows()).toBe(1);
     expect(f.refusalRows()).toEqual([expect.objectContaining({ cause: "challenge-consumed" })]);
-    // Not delivered as a peer message either, although the CEO's identity is now bound.
-    expect(f.inbound(reuse.id)).toBeUndefined();
-    expect(f.peerRows()).toEqual([]);
+    // Reusing the challenge grants nothing, but the now-bound CEO can still send ordinary mail.
+    expect(f.inbound(reuse.id)).toBeDefined();
+    expect(f.peerRows()).toHaveLength(2);
   });
 
   it("refuses an answer that arrives after the challenge expired", async () => {
@@ -506,7 +506,7 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
     const late = f.mention(f.ceo, `늦은 바인딩: ${token}`, f.nowSeconds() + 1);
     f.h.clock.advance(TEN_MINUTES_MS + 1_000);
     await f.relayDelivers(late);
-    expect(f.refusedWith(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED)).toBe(1);
+    expect(f.refusedWith(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED)).toBe(1);
     expect(f.ceoIdentity()).toBeNull();
     expect(f.boundRows()).toBe(0);
     expect(f.refusalRows()).toEqual([expect.objectContaining({ cause: "challenge-expired" })]);
@@ -520,7 +520,7 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
     const token = await f.mint();
     const early = f.mention(f.ceo, `미리 서명됨: ${token}`, f.nowSeconds() - 61);
     await f.relayDelivers(early);
-    expect(f.refusedWith(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED)).toBe(1);
+    expect(f.refusedWith(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED)).toBe(1);
     expect(f.ceoIdentity()).toBeNull();
     expect(f.boundRows()).toBe(0);
     expect(f.refusalRows()).toEqual([expect.objectContaining({ cause: "signed-outside-challenge" })]);
@@ -541,7 +541,7 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
     const sessions = f.sessionsRows();
 
     await f.relayDelivers(f.mention(f.ceo, `바인딩: ${token}`));
-    expect(f.refusedWith(ReasonCode.BINDING_GENERATION_STALE)).toBe(1);
+    expect(f.refusedWith(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED)).toBe(1);
     expect(f.ceoIdentity()).toBeNull();
     expect(f.sessionsRows()).toEqual(sessions);
     expect(f.boundRows()).toBe(0);
@@ -585,7 +585,7 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
     await f.relayDelivers(after);
     expect(f.refusedWith(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED)).toBe(1);
     expect(f.inbound(after.id)).toBeDefined();
-    expect(f.peerRows()).toHaveLength(1);
+    expect(f.peerRows()).toHaveLength(2);
   });
 
   it("refuses, at the one writer, a possession proof the challenge store did not mint", async () => {
@@ -600,6 +600,7 @@ describe("the adopted CEO binds its Buzz channel identity with an event its own 
       buzzActorId: f.ceo.pubkey,
       ceoBindingGeneration: f.h.cp.bindings.active(CEO)!.bindingGeneration,
       answerSignedAt: f.nowSeconds(),
+      buzzAddress: PROJECT_ROOM,
     };
     const refused = f.h.cp.sessions.bindBuzzActor({ possession: forged }, { isAllowedActor: () => true });
     expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONFLICT });
@@ -667,9 +668,9 @@ const MALFORMED_SHAPES: ReadonlyArray<readonly [string, (token: string) => strin
   ["a token whose prefix hides a zero-width space", (token) => token.replace("buzz", "bu​zz")],
 ];
 
-describe("ACP1055: a binding-shaped message is never delivered, and a refused binding is never durable", () => {
+describe("a refused binding is independent of normal mention admission", () => {
   for (const [shape, contentOf] of MALFORMED_SHAPES) {
-    it(`ACP1055-01: delivers ${shape} to neither the owner's path nor the peer's`, async () => {
+    it(`delivers ${shape} through both the owner's path and the peer's`, async () => {
       const f = await startBindFixture();
       // The CEO's key bound, so a CEO mention without a binding marker is a peer message.
       await bindByChallenge(f);
@@ -679,10 +680,10 @@ describe("ACP1055: a binding-shaped message is never delivered, and a refused bi
       for (const author of [f.owner, f.ceo]) {
         const event = f.mention(author, `CTO, ${contentOf(token)}`, signedAt + 1);
         await f.relayDelivers(event);
-        expect(f.inbound(event.id)).toBeUndefined();
+        expect(f.inbound(event.id)).toBeDefined();
       }
-      expect(f.messageRows()).toEqual(before);
-      expect(f.refusedWith(ReasonCode.INVALID_ARGUMENT)).toBe(2);
+      expect(f.messageRows()).toEqual({ inbound: before.inbound + 2, outbox: before.outbox + 2 });
+      expect(f.refusedWith(ReasonCode.INVALID_ARGUMENT)).toBe(0);
       expect(f.ceoIdentity()).toBe(f.ceo.pubkey);
 
       // Control: the same two principals' messages without the marker are each delivered.
@@ -691,21 +692,21 @@ describe("ACP1055: a binding-shaped message is never delivered, and a refused bi
         await f.relayDelivers(plain);
         expect(f.inbound(plain.id)).toBeDefined();
       }
-      expect(f.messageRows().inbound).toBe(before.inbound + 2);
+      expect(f.messageRows().inbound).toBe(before.inbound + 4);
     });
   }
 
-  it("ACP1055-01: delivers no token-carrying message from either principal when no challenge store is wired", async () => {
+  it("ACP1055-01: delivers token-carrying mentions from both principals when no challenge store is wired", async () => {
     const f = await startBindFixture({ challengeStore: false });
     await bindByRelayEnvelope(f, f.ceo.pubkey, "acp1055-no-store");
     const before = f.messageRows();
     for (const author of [f.owner, f.ceo]) {
       const event = f.mention(author, `CTO, acp-buzz-bind:${"0".repeat(32)}`);
       await f.relayDelivers(event);
-      expect(f.inbound(event.id)).toBeUndefined();
+      expect(f.inbound(event.id)).toBeDefined();
     }
-    expect(f.messageRows()).toEqual(before);
-    expect(f.refusedWith(ReasonCode.INVALID_ARGUMENT)).toBe(2);
+    expect(f.messageRows()).toEqual({ inbound: before.inbound + 2, outbox: before.outbox + 2 });
+    expect(f.refusedWith(ReasonCode.INVALID_ARGUMENT)).toBe(0);
 
     const plain = f.mention(f.ceo, "CTO, 표식 없는 지시", f.nowSeconds() + 1);
     await f.relayDelivers(plain);
@@ -723,11 +724,11 @@ describe("ACP1055: a binding-shaped message is never delivered, and a refused bi
     await bindByRelayEnvelope(f, f.otherCeoKey.pubkey, "acp1055-other-key");
     const answer = f.mention(f.ceo, `바인딩: ${token}`);
     await f.relayDelivers(answer);
-    expect(f.refusedWith(ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE)).toBe(1);
+    expect(f.refusedWith(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED)).toBe(1);
     const sessions = f.sessionsRows();
 
     await f.relayDelivers(answer);
-    expect(f.refusedWith(ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE)).toBe(2);
+    expect(f.refusedWith(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED)).toBe(2);
     expect(f.subscriber.counters().rejections["admission-already-durable"]).toBeUndefined();
     expect(f.sessionsRows()).toEqual(sessions);
     expect(f.ceoIdentity()).toBe(f.otherCeoKey.pubkey);
@@ -868,7 +869,7 @@ describe("the re-adopted CEO recovers its own key from a terminal earlier CEO se
     const after = f.mention(f.ceo, "CTO, 이 작업을 맡아 주세요", f.nowSeconds() + 1);
     await f.relayDelivers(after);
     expect(f.inbound(after.id)).toBeDefined();
-    expect(f.peerRows()).toHaveLength(2);
+    expect(f.peerRows()).toHaveLength(3);
   });
 
   it("refuses the key while another session holding it is live, and when a terminal holder is not of the CEO lineage", async () => {
@@ -941,7 +942,7 @@ describe("the re-adopted CEO recovers its own key from a terminal earlier CEO se
     expect(f.h.cp.sessions.transition(f.ceoSessionId, SessionLifecycle.ERROR, "the Gateway died").allowed).toBe(true);
     const rows = f.sessionsRows();
     await f.relayDelivers(f.mention(f.ceo, `채널 신원 복구: ${token}`));
-    expect(f.refusedWith(ReasonCode.BINDING_GENERATION_STALE)).toBe(1);
+    expect(f.refusalRows()).toEqual([expect.objectContaining({ cause: "ceo-binding-moved" })]);
     expect(store.settle(f.mention(f.ceo, `채널 신원 복구: ${minted.value.challenge}`))).toMatchObject({
       allowed: false,
       reasonCode: ReasonCode.SESSION_NOT_READY,
@@ -1069,7 +1070,7 @@ describe("review ceobuzz-r1: the recovery boundary and the recovery record", () 
 
     await f.relayDelivers(stale);
     expect(f.inbound(stale.id)).toBeDefined();
-    expect(f.peerRows()).toHaveLength(1);
+    expect(f.peerRows()).toHaveLength(2);
   });
 
   it("refuses a binding answer beyond signing skew while ordinary peer messages have no recovery floor", async () => {
@@ -1098,7 +1099,7 @@ describe("review ceobuzz-r1: the recovery boundary and the recovery record", () 
     const after = f.mention(f.ceo, "dated after the answer", answeredAt + 1);
     await f.relayDelivers(after);
     expect(f.inbound(after.id)).toBeDefined();
-    expect(f.peerRows()).toHaveLength(3);
+    expect(f.peerRows()).toHaveLength(4);
   });
 
   it("ceobuzz-r1-02: records every one of 201 earlier holders and admits the next mention", async () => {
@@ -1119,7 +1120,7 @@ describe("review ceobuzz-r1: the recovery boundary and the recovery record", () 
     const fresh = f.mention(f.ceo, "fresh peer mention after recovery", f.nowSeconds() + 1);
     await f.relayDelivers(fresh);
     expect(f.inbound(fresh.id)).toBeDefined();
-    expect(f.peerRows()).toHaveLength(1);
+    expect(f.peerRows()).toHaveLength(2);
   });
 
   it("refuses the recovery, with nothing written, when its record does not persist as written", async () => {
