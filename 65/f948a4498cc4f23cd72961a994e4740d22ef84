@@ -1,0 +1,4 @@
+Limit: a PRIMARY_CTO may stage a replacement bootstrap PLAN candidate only while the run has a current attachment and every earlier candidate of that same stager was CEO-attached, so a stager holds at most one unattached candidate; candidates are append-only and immutable, selected only by run, stager and exact digest, and the admission check and append share one transaction (CEO 4c381bcd, replacing the one-slot rule of #1197).
+Warn: staging is not approval or replacement: only CEO attach with replacesSha256 naming the current attachment replaces input, and a superseded input can never become current again; a replacement candidate is checked against those same attach rules at stage time.
+Record-Id: r-456e9427c091
+Provenance: inherited 5e5faa31e6fbd6fb6febd1f8600659db746047e0
