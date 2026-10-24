@@ -30,7 +30,10 @@ afterAll(cleanupTempDirs);
 const recordingTransport = () => {
   const send = vi.fn(async (_channel: string, _content: string, recipients: readonly string[]): Promise<BuzzSendReceipt> =>
     ({ eventId: `evt-${send.mock.calls.length}`, mentionPubkeys: [...recipients] }));
-  const transport: BuzzTransport = { openChannel: async (purpose) => `channel:${purpose}`, available: async () => true, send };
+  const transport: BuzzTransport = { openChannel: async (purpose) => `channel:${purpose}`, available: async () => true, send,
+    signerReadiness: async () => ({ signer: "a".repeat(64), registered: true }),
+    policyReadiness: async (_room, _body, recipient, signer) => ({ verdict: "allowed", policyDigest: "fixture-policy", recipient, signer }),
+  };
   return { transport, send };
 };
 

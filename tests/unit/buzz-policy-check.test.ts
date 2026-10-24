@@ -1,9 +1,10 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { cpSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 import { BuzzCliTransport } from "../../src/buzz/buzz-adapter.ts";
 import { sha256Hex } from "../../src/core/digest.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { stableFixtureLink } from "../helpers/stable-fixture-executable.ts";
 
 afterAll(cleanupTempDirs);
 afterEach(() => vi.unstubAllEnvs());
@@ -13,10 +14,10 @@ const fixture = () => {
   const file = join(root, "required-mentions.json");
   const reply = join(root, "reply.json");
   const log = join(root, "checks.jsonl");
-  const real = join(root, "fake-real");
+  const real = join(root, "buzz");
   writeFileSync(file, '{"fixture":"policy bytes"}');
   writeFileSync(reply, '{}');
-  writeFileSync(real, '#!/bin/sh\nexit 99\n', { mode: 0o700 });
+  stableFixtureLink(real, '#!/bin/sh\nexec python3 -B "$(dirname "$0")/buzz-mention-enforce.py" "$0" "$@"\n');
   writeFileSync(join(root, "buzz-mention-enforce.py"), `import hashlib,json,os,sys
 from pathlib import Path
 root=Path(__file__).parent
@@ -38,7 +39,7 @@ sys.exit(config.get('code',{'allowed':0,'refused':1,'undeterminable':2}[verdict]
   vi.stubEnv("BUZZ_PRIVATE_KEY", "fixture-credential");
   const transport = new BuzzCliTransport(real, null, file);
   vi.stubEnv("BUZZ_PRIVATE_KEY", "replacement-fixture-credential");
-  return { file, reply, log, transport };
+  return { file, reply, log, transport, binary: real };
 };
 
 it.each(["allowed", "refused", "undeterminable"] as const)("wrapper check protocol: %s is distinct and never calls send", async verdict => {
@@ -71,4 +72,57 @@ it("wrapper check protocol: unavailable configuration or checker fails closed", 
     const transport = new BuzzCliTransport("unused-real", null, policyFile);
     expect((await transport.policyReadiness("room", "body", "ceo", "a".repeat(64))).verdict).toBe("undeterminable");
   }
+});
+
+
+it("ACP1202 runtime binding: a well-formed but different reported digest fails closed with both identities", async () => {
+  const f = fixture(); const reported = "b".repeat(64);
+  writeFileSync(f.reply, JSON.stringify({ overrides: { policy_digest: reported } }));
+  expect(await f.transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
+    verdict: "undeterminable", policyIdentity: {
+      configured: { file: f.file, digest: sha256Hex(readFileSync(f.file)) },
+      reported: { file: f.file, digest: reported },
+    },
+  });
+});
+
+
+it("ACP1202 runtime binding: compares resolved policy paths without guessing another copy", async () => {
+  const f = fixture(); const alias = join(f.file, "..", "policy-alias.json"); symlinkSync(f.file, alias);
+  const transport = new BuzzCliTransport(f.binary, null, alias);
+  expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
+    verdict: "allowed", policyIdentity: { configured: { file: f.file }, reported: { file: f.file } },
+  });
+  writeFileSync(f.reply, JSON.stringify({ overrides: { policy_file: "/another/copy.json" } }));
+  expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
+    verdict: "undeterminable", policyIdentity: { configured: { file: f.file }, reported: { file: "/another/copy.json" } },
+  });
+});
+
+
+it("ACP1202 runtime binding: checks the sending executable, never a wrapper beside a policy copy", async () => {
+  const f = fixture(); const copy = tempDir("policy-copy-"); const file = join(copy, "required-mentions.json");
+  cpSync(f.file, file); cpSync(f.reply, join(copy, "reply.json"));
+  cpSync(join(f.file, "..", "buzz-mention-enforce.py"), join(copy, "buzz-mention-enforce.py"));
+  const transport = new BuzzCliTransport(f.binary, null, file);
+  expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
+    verdict: "undeterminable", policyIdentity: { configured: { file }, reported: { file: f.file } },
+  });
+  expect(readFileSync(f.log, "utf8").trim().split("\n")).toHaveLength(1);
+});
+
+
+it.each(["ROSTER_STATE", "POLICY", "CREDENTIAL", "AUTHORITY", "UNKNOWN", undefined, "not-a-cause", { retryable: true }].flatMap(cause => ["refused", "undeterminable"].map(verdict => ({ cause, verdict }))))(
+  "ACP1202-R2-01: wrapper cause is explicit, never inferred from a fixed message (%j)", async ({ cause, verdict }) => {
+    const f = fixture(); writeFileSync(f.reply, JSON.stringify({ verdict, overrides: { cause, message: "current roster does not match expected pair" } }));
+    expect(await f.transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
+      verdict, cause: typeof cause === "string" && ["ROSTER_STATE", "POLICY", "CREDENTIAL", "AUTHORITY", "UNKNOWN"].includes(cause) ? cause : "UNKNOWN",
+    });
+  },
+);
+
+
+it.each([{ signer: "b".repeat(64) }, { recipient: "another-ceo" }])("ACP1202-R2-01: a roster cause for another identity is not re-validatable (%j)", async overrides => {
+  const f = fixture(); writeFileSync(f.reply, JSON.stringify({ verdict: "refused", overrides: { ...overrides, cause: "ROSTER_STATE" } }));
+  expect(await f.transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({ verdict: "refused", cause: "UNKNOWN" });
 });

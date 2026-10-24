@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { nsecEncode } from "nostr-tools/nip19";
 import { getPublicKey } from "nostr-tools/pure";
@@ -6,7 +6,7 @@ import { getPublicKey } from "nostr-tools/pure";
 import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import type * as Http from "node:http";
 
-import { digestOf } from "../../src/core/digest.ts";
+import { digestOf, sha256Hex } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { createConfiguredHermesGatewayDaemonNoticeTarget, startConfiguredCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
@@ -22,6 +22,7 @@ import { createHermesGatewayDaemonNoticeSender } from "../../src/runtime/hermes-
 import { adoptedFixture, DIGEST, GATEWAY, LIVE, LSTART, RUNTIME, TOKEN } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
+import { stableFixtureLink } from "../helpers/stable-fixture-executable.ts";
 
 const http = vi.hoisted(() => ({
   request: vi.fn(),
@@ -985,6 +986,8 @@ else process.exitCode=8;
 `, { mode: 0o700 });
   vi.stubEnv("BUZZ_PRIVATE_KEY", credential);
   const transport = new BuzzCliTransport(binary);
+  // This witness isolates the real send's credential/refusal after an authoritative allowance.
+  vi.spyOn(transport, "policyReadiness").mockResolvedValue({ verdict: "allowed", policyDigest: "fixture-policy", signer, recipient: "ceo-key" });
   vi.unstubAllEnvs(); // The transport continues using the pinned fixture credential.
   f.h.buzzAdapter = new BuzzAdapter(f.h.cp.db, f.h.cp.clock, f.h.cp.audit, f.h.cp.sessions, f.h.cp.bindings, f.h.cp.outbox, transport);
   const markSent = vi.spyOn(f.h.cp.outbox, "markSent"); const send = vi.spyOn(transport, "send");
@@ -1268,7 +1271,7 @@ it.each(["permitting", "still-refusing"] as const)("ACP1202-R1-02: a concurrent 
   const { f } = await signerRoute(); let policy = "v1";
   Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy,
     policyReadiness: async (_room: string, _body: string, recipient: string, signer: string) =>
-      ({ verdict: replacement === "permitting" ? "allowed" : "refused", policyDigest: policy, signer, recipient,
+      ({ verdict: policy === "v1" || replacement === "permitting" ? "allowed" : "refused", policyDigest: policy, signer, recipient,
         ...(replacement === "still-refusing" ? { message: "signer not registered for channel" } : {}) }) });
   const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
   let reject!: (error: Error) => void;
@@ -1316,9 +1319,9 @@ it("ACP1202-R1-03: fingerprint read recovery alone does not release an unavailab
   const send = vi.spyOn(f.h.buzz, "send").mockRejectedValue(new Error(signerRefusal));
   await f.h.buzzAdapter.deliverPending(); readable = true;
   for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
-  expect(send).toHaveBeenCalledTimes(1);
+  expect(send).not.toHaveBeenCalled();
   expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY")).toHaveLength(1);
-  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 1, reason_code: "BUZZ_LOCAL_SEND_POLICY_REFUSED" });
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 1, reason_code: "BUZZ_SEND_POLICY_BINDING_UNVERIFIED" });
 });
 
 it("ACP1202-R1-01 CEO 961c88a4: migrating an exact refusal never reclassifies or releases the 12 legacy unknown rows", async () => {
@@ -1383,7 +1386,7 @@ it.each(["refused", "undeterminable"] as const)("ACP1202 policy check: a changed
   const send = vi.spyOn(f.h.buzz, "send").mockRejectedValue(new Error(signerRefusal));
   await f.h.buzzAdapter.deliverPending(); policy = "v2";
   for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
-  expect(send).toHaveBeenCalledTimes(1);
+  expect(send).not.toHaveBeenCalled();
   expect(check).toHaveBeenCalled();
   expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 1, retry_eligible: 0 });
 });
@@ -1394,7 +1397,7 @@ it.each(["observation", "signer", "binding"] as const)("ACP1202 policy check: a 
     ({ verdict: allowed ? "allowed" : "undeterminable", policyDigest: policy, signer, recipient }));
   Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy, policyReadiness: check });
   const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
-  const send = vi.spyOn(f.h.buzz, "send").mockRejectedValueOnce(new Error(signerRefusal));
+  const send = vi.spyOn(f.h.buzz, "send");
   await f.h.buzzAdapter.deliverPending(); policy = "current-policy";
   if (change === "signer") readiness.mockResolvedValue({ signer: "new-daemon-signer", registered: true });
   if (change === "binding") {
@@ -1402,10 +1405,10 @@ it.each(["observation", "signer", "binding"] as const)("ACP1202 policy check: a 
     expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId: f.gatewaySessionId }).allowed).toBe(true);
     await f.h.cp.outbox.deliverCeoNotifications();
   }
-  await f.h.buzzAdapter.deliverPending(); expect(send).toHaveBeenCalledTimes(1);
+  await f.h.buzzAdapter.deliverPending(); expect(send).not.toHaveBeenCalled();
   allowed = true;
   await f.h.buzzAdapter.deliverPending();
-  expect(send).toHaveBeenCalledTimes(2); expect(check).toHaveBeenCalledTimes(2);
+  expect(send).toHaveBeenCalledTimes(1); expect(check).toHaveBeenCalledTimes(3);
   expect(processingOf(f, id)).toMatchObject({ status: "SENT", attempts: 2 });
 });
 
@@ -1420,7 +1423,7 @@ it("ACP1202 policy check: an allowed check reserves nothing and an actual refusa
   const send = vi.spyOn(f.h.buzz, "send").mockRejectedValue(new Error(signerRefusal));
   await f.h.buzzAdapter.deliverPending(); policy = "v2";
   for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
-  expect(check).toHaveBeenCalledTimes(1); expect(send).toHaveBeenCalledTimes(2);
+  expect(check).toHaveBeenCalledTimes(2); expect(send).toHaveBeenCalledTimes(2);
   expect(events(f, "CEO_NOTIFICATION_BUZZ_POLICY_CHECK").at(-1)?.evidence).toMatchObject({ verdict: "allowed", policyBinding: { policyDigest: "v2" } });
   expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY").at(-1)?.evidence).toMatchObject({ policyBinding: { policyDigest: "v3" } });
   expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 2, reason_code: "BUZZ_LOCAL_SEND_POLICY_REFUSED" });
@@ -1449,10 +1452,11 @@ it("ACP1202 policy check: a transport without an authoritative checker stays hel
   const send = vi.spyOn(f.h.buzz, "send").mockRejectedValue(new Error(signerRefusal));
   await f.h.buzzAdapter.deliverPending(); policy = "v2";
   for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
-  expect(send).toHaveBeenCalledTimes(1);
+  expect(send).not.toHaveBeenCalled();
   expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 1 });
-  expect(events(f, "CEO_NOTIFICATION_BUZZ_POLICY_CHECK")).toHaveLength(1);
-  expect(events(f, "CEO_NOTIFICATION_BUZZ_POLICY_CHECK")[0]?.evidence.verdict).toBe("undeterminable");
+  expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY")).toHaveLength(1);
+  expect(events(f, "CEO_NOTIFICATION_BUZZ_POLICY_CHECK")).toHaveLength(0);
+  expect(processingOf(f, id)?.reason_code).toBe("BUZZ_SEND_POLICY_BINDING_UNVERIFIED");
 });
 
 
@@ -1471,3 +1475,160 @@ it("ACP1202 policy check: an unidentified historical policy is not today's bytes
   ]);
   expect(processingOf(f, id)).toMatchObject({ status: "SENT", attempts: 2 });
 });
+
+
+it.each(["match", "mismatched-file", "mismatched-digest", "missing", "refused", "undeterminable", "wrong-signer", "wrong-target", "wrong-room"] as const)("ACP1202 runtime binding: first readiness %s checks the actual signer and exact CEO target", async mode => {
+  const { f } = await signerRoute();
+  const root = tempDir("runtime-policy-binding-"); const policy = join(root, "required-mentions.json");
+  writeFileSync(policy, "fixture-policy"); writeFileSync(join(root, "mode"), mode);
+  const binary = stableFixtureLink(join(root, "buzz"), '#!/bin/sh\nexec python3 -B "$(dirname "$0")/buzz-mention-enforce.py" "$0" "$@"\n');
+  const signer = getPublicKey(Buffer.from("1".repeat(64), "hex"));
+  writeFileSync(join(root, "buzz-mention-enforce.py"), `import hashlib,json,sys
+from pathlib import Path
+root=Path(__file__).parent
+mode=(root/'mode').read_text()
+args=sys.argv[1:]
+assert args[0]==str(root/'buzz') and args[1]=='__acp_policy_check_v1__'
+body=sys.stdin.read()
+with (root/'check-log').open('a') as log: log.write(json.dumps({'args':args,'body':body})+'\\n')
+value={'protocol':'acp.buzz-policy-check/v1', 'policy_file':str((root/'required-mentions.json').resolve()),
+ 'policy_digest':hashlib.sha256((root/'required-mentions.json').read_bytes()).hexdigest(),
+ 'channel':args[args.index('--channel')+1], 'recipient':args[args.index('--mention')+1], 'signer':${JSON.stringify(signer)}, 'verdict':'allowed'}
+if mode=='mismatched-file': value['policy_file']='/another/policy'
+if mode=='mismatched-digest': value['policy_digest']='b'*64
+if mode=='refused': value.update(verdict='refused',error='mention_policy',message='signer not registered for channel',retryable=False)
+if mode=='undeterminable': value.update(verdict='undeterminable',error='mention_policy',message='policy or identity read failed',retryable=False)
+if mode=='wrong-signer': value['signer']='b'*64
+if mode=='wrong-target': value['recipient']='other-ceo'
+if mode=='wrong-room': value['channel']='other-room'
+print(json.dumps(value))
+sys.exit(2 if mode=='undeterminable' else 1 if mode=='refused' else 0)
+`);
+  vi.stubEnv("BUZZ_PRIVATE_KEY", "1".repeat(64));
+  const transport = new BuzzCliTransport(binary, null, mode === "missing" ? "" : policy);
+  vi.unstubAllEnvs(); // The sending credential is pinned by the transport.
+  vi.spyOn(transport, "signerReadiness").mockResolvedValue({ signer, registered: true });
+  const check = vi.spyOn(transport, "policyReadiness");
+  const send = vi.spyOn(transport, "send").mockResolvedValue({ eventId: "fake-send", mentionPubkeys: ["ceo-key"] });
+  f.h.buzzAdapter = new BuzzAdapter(f.h.cp.db, f.h.cp.clock, f.h.cp.audit, f.h.cp.sessions, f.h.cp.bindings, f.h.cp.outbox, transport);
+  const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications(); await f.h.buzzAdapter.deliverPending();
+  expect(check).toHaveBeenCalledWith("ceo-room", expect.stringContaining(id), "ceo-key", signer);
+  if (mode === "match") {
+    expect(send).toHaveBeenCalledTimes(1); expect(processingOf(f, id)?.status).toBe("SENT");
+  } else {
+    for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
+    expect(send).not.toHaveBeenCalled();
+    expect(processingOf(f, id)).toMatchObject({ status: "PENDING", reason_code: mode === "refused" || mode === "undeterminable" ? "BUZZ_LOCAL_SEND_POLICY_REFUSED" : "BUZZ_SEND_POLICY_BINDING_UNVERIFIED", retry_eligible: 0 });
+    const configured = { file: mode === "missing" ? null : policy, digest: mode === "missing" ? null : sha256Hex(readFileSync(policy)) };
+    const reported = { file: mode === "missing" ? null : mode === "mismatched-file" ? "/another/policy" : policy,
+      digest: mode === "missing" ? null : mode === "mismatched-digest" ? "b".repeat(64) : configured.digest };
+    expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY")).toMatchObject([{ evidence: { messageId: id, policyBinding: { policyIdentity: { configured, reported } } } }]);
+    if (mode === "refused" || mode === "undeterminable") {
+      expect(configured).toEqual(reported); // Matching identities alone never grant permission.
+      expect(await check.mock.results[0]!.value).toMatchObject({ verdict: mode, policyDigest: configured.digest });
+      expect(check).toHaveBeenCalledTimes(1); // A missing cause on a decoded refusal is not a roster retry.
+    }
+    expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY")).toHaveLength(1);
+    expect(events(f, "CEO_NOTIFICATION_BUZZ_POLICY_CHECK")).toHaveLength(0);
+    expect(JSON.stringify(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY"))).not.toContain("decision needed");
+    expect(JSON.stringify(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY"))).not.toContain("1".repeat(64));
+    // Repair the binding and obtain a fresh allowance through the existing resume path.
+    writeFileSync(join(root, "mode"), "match");
+    if (mode === "refused" || mode === "undeterminable") writeFileSync(policy, "fixture-policy v2"); // Relevant policy change requests resume.
+    vi.stubEnv("BUZZ_PRIVATE_KEY", "1".repeat(64));
+    const repaired = new BuzzCliTransport(binary, null, policy);
+    vi.unstubAllEnvs();
+    vi.spyOn(repaired, "signerReadiness").mockResolvedValue({ signer, registered: true });
+    const resumedSend = vi.spyOn(repaired, "send").mockResolvedValue({ eventId: "fake-resumed", mentionPubkeys: ["ceo-key"] });
+    f.h.buzzAdapter = new BuzzAdapter(f.h.cp.db, f.h.cp.clock, f.h.cp.audit, f.h.cp.sessions, f.h.cp.bindings, f.h.cp.outbox, repaired);
+    expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
+    expect(resumedSend).toHaveBeenCalledTimes(1);
+  }
+});
+
+
+it.each([
+  ["counterpart absent", "refused"], ["counterpart profile mismatch", "refused"], ["roster unavailable", "undeterminable"],
+] as const)("ACP1202-R2-01: %s recovers through roster revalidation with identical policy bytes", async (state, verdict) => {
+  const { f, readiness } = await signerRoute(); let recovered = false;
+  const check = vi.fn(async (_room: string, _body: string, recipient: string, signer: string) => ({
+    verdict: recovered ? "allowed" : verdict, cause: recovered ? undefined : "ROSTER_STATE",
+    policyDigest: "identical-policy-bytes", signer, recipient, ...(!recovered ? { message: state } : {}),
+  }));
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => "identical-policy-bytes", policyReadiness: check });
+  const id = notify(f, "r2-roster-recovery");
+  const legacy = state === "counterpart absent" ? Array.from({ length: 12 }, (_, n) => notify(f, `r2-legacy-unknown-${n}`)) : [];
+  await f.h.cp.outbox.deliverCeoNotifications();
+  for (const unknown of legacy) {
+    f.h.cp.audit.record({ kind: "CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN", evidence: { messageId: unknown } });
+    f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, unknown]);
+  }
+  const retained = legacy.map(unknown => processingOf(f, unknown));
+  readiness.mockResolvedValue({ signer: "daemon-signer", registered: false });
+  const send = vi.spyOn(f.h.buzz, "send");
+  await f.h.buzzAdapter.deliverPending(); expect(check).not.toHaveBeenCalled();
+  readiness.mockResolvedValue({ signer: "daemon-signer", registered: true });
+  await f.h.buzzAdapter.deliverPending();
+  expect.soft(processingOf(f, id)).toMatchObject({ status: "PENDING", reason_code: "BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED" });
+  for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
+  expect.soft(check).toHaveBeenCalledTimes(4); expect(send).not.toHaveBeenCalled();
+  expect(events(f, "CEO_NOTIFICATION_BUZZ_POLICY_CHECK")).toHaveLength(1);
+  expect.soft(events(f, "CEO_NOTIFICATION_BUZZ_POLICY_CHECK")[0]?.evidence).toMatchObject({ cause: "ROSTER_STATE", verdict });
+  expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY")).toHaveLength(1);
+  recovered = true;
+  // Counterpart recovery does not bypass the daemon signer's own exact-room membership.
+  readiness.mockResolvedValue({ signer: "daemon-signer", registered: false });
+  await f.h.buzzAdapter.deliverPending(); expect.soft(check).toHaveBeenCalledTimes(4); expect(send).not.toHaveBeenCalled();
+  readiness.mockResolvedValue({ signer: "daemon-signer", registered: true });
+  const delivered: string[] = [];
+  for (let n = 0; n < 3; n++) delivered.push(...(await f.h.buzzAdapter.deliverPending()).delivered);
+  expect(delivered).toEqual([id]);
+  expect(check).toHaveBeenCalledTimes(5); expect(send).toHaveBeenCalledTimes(1);
+  expect(processingOf(f, id)).toMatchObject({ status: "SENT", attempts: 2 });
+  expect(legacy.map(unknown => processingOf(f, unknown))).toEqual(retained);
+  expect(check.mock.calls.every(([room, body, recipient, signer]) => room === "ceo-room" && body.includes(id) && recipient === "ceo-key" && signer === "daemon-signer")).toBe(true);
+});
+
+it.each(["POLICY", "CREDENTIAL", "AUTHORITY", "UNKNOWN", undefined, "unrecognized"])(
+  "ACP1202-R2-01: a refused check with cause %s stays held under unchanged policy without guessing its message", async cause => {
+    const { f, readiness } = await signerRoute(); let allowed = false;
+    const check = vi.fn(async (_room: string, _body: string, recipient: string, signer: string) => ({
+      verdict: allowed ? "allowed" : "refused", cause, policyDigest: "unchanged-policy", signer, recipient,
+      message: "current roster does not match expected pair",
+    }));
+    Object.assign(f.h.buzz, { localSendPolicyDigest: () => "unchanged-policy", policyReadiness: check });
+    const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+    const send = vi.spyOn(f.h.buzz, "send");
+    readiness.mockResolvedValue({ signer: "daemon-signer", registered: false }); await f.h.buzzAdapter.deliverPending();
+    readiness.mockResolvedValue({ signer: "daemon-signer", registered: true }); await f.h.buzzAdapter.deliverPending();
+    allowed = true;
+    for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
+    expect(check).toHaveBeenCalledTimes(1); expect(send).not.toHaveBeenCalled();
+    expect(processingOf(f, id)).toMatchObject({ status: "PENDING", reason_code: "BUZZ_LOCAL_SEND_POLICY_REFUSED" });
+    expect(events(f, "CEO_NOTIFICATION_BUZZ_POLICY_CHECK")).toHaveLength(1);
+  },
+);
+
+
+it.each(["CREDENTIAL", "AUTHORITY", "UNKNOWN"].flatMap(cause => ["policy", "signer"].map(change => ({ cause, change }))))(
+  "ACP1202-R2-01: undeterminable $cause is not a roster retry and needs a relevant $change change", async ({ cause, change }) => {
+    const { f, readiness } = await signerRoute(); let allowed = false; let policy = "v1";
+    const check = vi.fn(async (_room: string, _body: string, recipient: string, signer: string) => ({
+      verdict: allowed ? "allowed" : "undeterminable", cause, policyDigest: policy, signer, recipient, message: "current roster does not match expected pair",
+    }));
+    Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy, policyReadiness: check });
+    const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+    readiness.mockResolvedValue({ signer: "daemon-signer", registered: false }); await f.h.buzzAdapter.deliverPending();
+    const send = vi.spyOn(f.h.buzz, "send");
+    readiness.mockResolvedValue({ signer: "daemon-signer", registered: true }); await f.h.buzzAdapter.deliverPending();
+    allowed = true;
+    for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
+    expect(check).toHaveBeenCalledTimes(1); expect(send).not.toHaveBeenCalled();
+    expect(processingOf(f, id)).toMatchObject({ status: "PENDING", reason_code: "BUZZ_LOCAL_SEND_POLICY_REFUSED" });
+    expect(events(f, "CEO_NOTIFICATION_BUZZ_POLICY_CHECK")).toHaveLength(1);
+    if (change === "policy") policy = "v2";
+    else readiness.mockResolvedValue({ signer: "replacement-signer", registered: true });
+    expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
+    expect(check).toHaveBeenCalledTimes(2); expect(send).toHaveBeenCalledTimes(1);
+  },
+);
