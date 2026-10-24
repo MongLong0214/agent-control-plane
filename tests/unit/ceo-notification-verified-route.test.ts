@@ -8,6 +8,7 @@ import type * as Http from "node:http";
 
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { Role } from "../../src/domain/types.ts";
 import { createConfiguredHermesGatewayDaemonNoticeTarget, startConfiguredCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
 import { currentCanonicalCeoBuzzRoute } from "../../src/outbox/ceo-buzz-signer.ts";
 import { HostProvisionerError, type HostAllocation, type HostObservation, type HostOperation } from "../../src/runtime/host-project-provisioner.ts";
@@ -18,7 +19,7 @@ import { daemonNoticeCanonical, daemonNoticeFields, daemonNoticePayloadDigest,
   sendDaemonNoticeProbe, type DaemonNoticeBody } from "../../src/runtime/acp-daemon-notice.ts";
 import { createHermesGatewayIdentityReader } from "../../src/runtime/hermes-gateway-identity.ts";
 import { createHermesGatewayDaemonNoticeSender } from "../../src/runtime/hermes-gateway-conversation.ts";
-import { adoptedFixture, DIGEST, GATEWAY, LIVE, LSTART, TOKEN } from "../helpers/adopted-ceo.ts";
+import { adoptedFixture, DIGEST, GATEWAY, LIVE, LSTART, RUNTIME, TOKEN } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -960,4 +961,94 @@ it.each(["absent", "unreadable"])("CEO d0d06bc1: durable intent with %s membersh
   for (let i = 0; i < 3; i++) await f.h.buzzAdapter.deliverPending();
   expect(invoke).not.toHaveBeenCalled(); expect(send).not.toHaveBeenCalled();
   expect(processingOf(f, id)).toMatchObject({ status: "PENDING", failure_class: "repairable", sent_at: null, retry_eligible: 0 });
+});
+
+it("REVIEW-PROBE: a new daemon signer cannot erase a known invalid host result", async () => {
+  const { f, invoke, setMember, signer } = await systemicFixture();
+  const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  invoke.mockImplementationOnce(async (_op, allocation) => {
+    if (!("mode" in allocation)) throw new Error("unexpected allocation");
+    setMember(true);
+    return { ceoBuzzSigner: { route: { ...allocation.route, roomId: "wrong-room" }, signer, changed: true, rosterVerified: true } };
+  });
+  const send = vi.spyOn(f.h.buzz, "send");
+  await f.h.buzzAdapter.deliverPending();
+  expect(events(f, "CEO_BUZZ_SIGNER_ENSURE").at(-1)?.evidence).toMatchObject({ state: "INVALID" });
+  expect(send).not.toHaveBeenCalled();
+  // Rebuild the adapter as on a daemon restart with a replacement sending credential.
+  const transport = { openChannel: async () => "unused", available: async () => true, send,
+    signerReadiness: async () => ({ signer: "b".repeat(64), registered: true }) };
+  f.h.buzzAdapter = new BuzzAdapter(f.h.cp.db, f.h.cp.clock, f.h.cp.audit, f.h.cp.sessions,
+    f.h.cp.bindings, f.h.cp.outbox, transport, { invoke });
+  await f.h.buzzAdapter.deliverPending();
+  expect(invoke).toHaveBeenCalledTimes(1);
+  expect(send).not.toHaveBeenCalled();
+  expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
+});
+
+it.each([
+  ["signer", "INVALID"], ["binding", "INVALID"], ["signer and binding", "INVALID"],
+  ["signer", "REFUSED"], ["binding", "REFUSED"], ["signer and binding", "REFUSED"],
+] as const)("ACP1199-03 r2: %s change preserves %s until the exact current receipt", async (change, outcome) => {
+  const { f, room, invoke, setMember, readback, signer } = await systemicFixture();
+  // Establish a confirmed canonical refusal before Buzz is selected, so changing generation
+  // exercises membership readiness rather than the separate pre-journal/unknown-history hold.
+  f.h.cp.sessions.setBuzzAddress(f.gatewaySessionId, null);
+  const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  expect(events(f, "CEO_NOTIFICATION_CANONICAL_RESULT")).toMatchObject([{ evidence: { outcome: "REFUSED" } }]);
+  f.h.cp.sessions.setBuzzAddress(f.gatewaySessionId, room);
+  await f.h.cp.outbox.deliverCeoNotifications();
+  const oldRoute = currentCanonicalCeoBuzzRoute(f.h.cp.db)!;
+  invoke.mockImplementationOnce(async (_op, allocation) => {
+    if (!("mode" in allocation)) throw new Error("unexpected allocation");
+    setMember(true);
+    if (outcome === "REFUSED") throw new HostProvisionerError("REFUSED", { code: "authorization", message: "permission denied" });
+    return { ceoBuzzSigner: { route: { ...allocation.route, roomId: "wrong-room" }, signer, changed: true, rosterVerified: true } };
+  });
+  const send = vi.spyOn(f.h.buzz, "send");
+  await f.h.buzzAdapter.deliverPending(); expect(send).not.toHaveBeenCalled();
+  const currentSigner = change.includes("signer") ? "b".repeat(64) : signer;
+  readback.mockResolvedValue({ signer: currentSigner, registered: true });
+  if (change.includes("binding")) {
+    expect(f.h.cp.bindings.revoke("CEO", "same-room generation transition").allowed).toBe(true);
+    const claimed = { executorKind: "hermes", targetLocator: LIVE, targetLocatorDigest: DIGEST };
+    let receipt: unknown; let attestationDigest = "";
+    const rebound = f.h.cp.bindings.bind({ role: Role.CEO, sessionId: f.gatewaySessionId, authenticatedTarget: {
+      claimed, protocolVersion: "hermes.target-bind/v1", expectedExecutorRuntimeIdentity: RUNTIME,
+      get targetBindReceipt() { return receipt; }, get attestationDigest() { return attestationDigest; },
+      verify: tuple => {
+        const fields = { domain: "hermes.target-bind", version: 1, actor_id: tuple.actorId, binding_generation: tuple.generation,
+          executor_runtime_identity: RUNTIME, requested_session_id: LIVE, lineage_root_digest: DIGEST };
+        attestationDigest = digestOf(fields); receipt = { ...fields, receipt_digest: attestationDigest }; return claimed;
+      },
+    } });
+    expect(rebound.allowed).toBe(true);
+    await f.h.cp.outbox.deliverCeoNotifications();
+  }
+  // Restart is independent of either changed credential or generation.
+  f.h.buzzAdapter = new BuzzAdapter(f.h.cp.db, f.h.cp.clock, f.h.cp.audit, f.h.cp.sessions,
+    f.h.cp.bindings, f.h.cp.outbox, f.h.buzz, { invoke });
+  const route = currentCanonicalCeoBuzzRoute(f.h.cp.db)!;
+  expect(route.roomId).toBe(oldRoute.roomId);
+  if (change.includes("binding")) expect(route.bindingGeneration).toBeGreaterThan(oldRoute.bindingGeneration);
+  const receipt = { route, signer: currentSigner, changed: false, rosterVerified: true };
+  const record = (value: typeof receipt) => f.h.cp.audit.record({ kind: "CEO_BUZZ_SIGNER_ENSURE",
+    evidence: { route: value.route, signer: value.signer, ensureDigest: digestOf({ route: value.route, signer: value.signer }),
+      state: "SUCCEEDED", receipt: value } });
+  await f.h.buzzAdapter.deliverPending(); expect(send).not.toHaveBeenCalled();
+  for (const wrong of [
+    { ...receipt, route: oldRoute, signer },
+    { ...receipt, route: { ...route, roomId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } },
+    { ...receipt, signer: "c".repeat(64) },
+    { ...receipt, route: { ...route, bindingGeneration: route.bindingGeneration + 1 } },
+  ]) {
+    record(wrong);
+    await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
+    expect(send).not.toHaveBeenCalled();
+  }
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", sent_at: null, retry_eligible: 0 });
+  record(receipt);
+  await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
+  expect(send).toHaveBeenCalledTimes(1); expect(f.h.cp.outbox.get(id)?.status).toBe("SENT");
+  expect(invoke).toHaveBeenCalledTimes(1);
 });

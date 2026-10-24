@@ -3,6 +3,7 @@ import { afterAll, expect, it, vi } from "vitest";
 import type { BuzzSendReceipt, BuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
+import { outboxDeliveryReadback } from "../../src/outbox/outbox.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -128,7 +129,10 @@ it("FCR-08: a holder with no route yet gets the row, and when its route turns ou
     f.h.cp.sessions.setBuzzAddress(next.sessionId, "first-room");
     expect((await f.h.buzzAdapter.deliverPending()).delivered).not.toContain(f.id);
     expect(sendsOf(f.send, f.id)).toBe(f.sent);
-    expect(stateOf(f.h, f.id)).toMatchObject({ status: "SENT", failure_class: "unknown_observed", target_session_id: next.sessionId });
+    // A route with no accepted post has no inherited sent_at; its unknown outcome stays PENDING.
+    expect(stateOf(f.h, f.id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed", target_session_id: next.sessionId });
+    expect(outboxDeliveryReadback(f.h.cp.outbox.get(f.id)!)).toMatchObject({ status: "OUTCOME_UNKNOWN",
+      delivered: false, automaticResendHeld: true });
     const incarnation = f.h.cp.sessions.require(next.sessionId).incarnation;
     const generation = f.h.cp.bindings.active("CEO")!.bindingGeneration;
     expect(f.h.cp.outbox.acknowledge(f.id, next.sessionId, generation, incarnation).allowed).toBe(true);

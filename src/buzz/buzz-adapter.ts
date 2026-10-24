@@ -538,14 +538,18 @@ export class BuzzAdapter {
       canonicalJson(parsed.data.ceoBuzzSigner.route) === canonicalJson(route);
   }
 
-  #invalidEnsure(ensureDigest: string, route: CanonicalCeoBuzzRoute, signer: string): boolean {
+  #invalidEnsure(route: CanonicalCeoBuzzRoute, signer: string): boolean {
+    // There is one systemic CEO route. Neither a new signer nor a new binding can hide its refusal.
     const history = this.db.all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events
-      WHERE kind = 'CEO_BUZZ_SIGNER_ENSURE' AND json_extract(evidence_json, '$.ensureDigest') = ? ORDER BY rowid`, [ensureDigest]);
+      WHERE kind = 'CEO_BUZZ_SIGNER_ENSURE' ORDER BY rowid`);
     let invalid = false;
     for (const event of history) {
       const evidence = JSON.parse(event.evidence_json);
       if (['INVALID','REFUSED','FAILED'].includes(evidence.state)) invalid = true;
-      if (evidence.state === 'SUCCEEDED') invalid = !this.#validatedReceipt(evidence.receipt, route, signer);
+      if (evidence.state === 'SUCCEEDED') {
+        if (this.#validatedReceipt(evidence.receipt, route, signer)) invalid = false;
+        else if (!this.#validatedReceipt(evidence.receipt, evidence.route, evidence.signer)) invalid = true;
+      }
     }
     return invalid;
   }
@@ -562,8 +566,8 @@ export class BuzzAdapter {
     const ensureDigest = digestOf({ route, signer: before.signer });
     const active = activeCeoMembershipEnsures.get(this.db) ?? new Set<string>();
     activeCeoMembershipEnsures.set(this.db, active);
-    if (this.#invalidEnsure(ensureDigest, route, before.signer)) return null;
-    if (before.registered) return active.has(ensureDigest) ? null : before;
+    if (this.#invalidEnsure(route, before.signer) || active.size > 0) return null;
+    if (before.registered) return before;
     // Durable intent precedes the call. A failed/lost response never schedules another join,
     // including across overlapping sweeps, other notifications and daemon restarts.
     const ensure = this.db.tx(() => {

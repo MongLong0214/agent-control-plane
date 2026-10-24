@@ -859,15 +859,28 @@ export const settleStoppedSessionInstructions = (
  * SENT-but-unACKed CEO notification not addressed to the CEO's current holder is handed to it
  * (`HANDED_TO_NEW_RECEIVER_SQL`), keeping its message id. A SENT or outcome-unknown one whose receiver
  * does not really change (`sameReceiverSql`) is only re-addressed to the current generation: its
- * status and failure stay on record, and it is not sent again.
+ * delivery state comes from that destination's own outcome, and it is not sent again.
  */
 const readdressCeoNotifications = (db: Pick<Db, "run">, generation: number, sessionId: string): void => {
   const notCurrent = `kind = 'CEO_NOTIFICATION' AND role_key = 'CEO' AND (binding_generation <> ? OR target_session_id <> ?)`;
-  db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?
+  const outcome = `(SELECT outcome FROM destination WHERE message_id = outbox.message_id)`;
+  db.run(`WITH destination AS (
+      SELECT sent.message_id, sent.outcome, sent.sent_at FROM outbox_sent_destinations sent
+        JOIN sessions next ON next.session_id = ? AND next.buzz_address = sent.room AND next.buzz_actor_id = sent.recipient
+    ) UPDATE outbox SET binding_generation = ?, target_session_id = ?,
+      status = CASE WHEN ${outcome} = 'ACCEPTED' THEN 'SENT'
+                    WHEN ${outcome} = 'UNKNOWN' THEN CASE WHEN status = 'SENT' AND failure_class = 'unknown_observed' THEN 'SENT' ELSE 'PENDING' END
+                    ELSE status END,
+      failure_class = CASE ${outcome} WHEN 'ACCEPTED' THEN NULL WHEN 'UNKNOWN' THEN 'unknown_observed' ELSE failure_class END,
+      sent_at = CASE ${outcome} WHEN 'ACCEPTED' THEN (SELECT sent_at FROM destination WHERE message_id = outbox.message_id)
+                               WHEN 'UNKNOWN' THEN NULL ELSE sent_at END,
+      last_error = CASE ${outcome} WHEN 'ACCEPTED' THEN NULL
+        WHEN 'UNKNOWN' THEN 'withheld: this destination has an unknown send outcome; awaiting its ACK' ELSE last_error END
       WHERE ${notCurrent} AND (status = 'SENT' OR (status = 'PENDING' AND failure_class = 'unknown_observed'))
-        AND ${sameReceiverSql("outbox")}`,
-  [generation, sessionId, generation, sessionId, sessionId, sessionId]);
-  db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, ${HANDED_TO_NEW_RECEIVER_SQL}
+        AND ${sameReceiverSql("outbox")} AND COALESCE(${outcome}, '') <> 'PENDING_SEND'`,
+  [sessionId, generation, sessionId, generation, sessionId, sessionId, sessionId]);
+  db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ?, ${HANDED_TO_NEW_RECEIVER_SQL}, sent_at = NULL,
+      last_error = CASE WHEN status = 'SENT' OR failure_class = 'unknown_observed' THEN NULL ELSE last_error END
       WHERE ${notCurrent} AND status IN ('PENDING','SENT')`,
   [generation, sessionId, generation, sessionId]);
 };

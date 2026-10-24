@@ -190,3 +190,101 @@ it("CEO d0d06bc1: verified unknown sends retain destination suppression across a
       .toEqual({ status: "PENDING", sent_at: null, failure_class: "unknown_observed" });
   } finally { f.h.cp.close(); }
 });
+
+it("REVIEW-PROBE: known accepted earlier destination cannot make a later unknown destination SENT", async () => {
+  const f = buzzCeo(true);
+  try {
+    const id = notify(f.h, "accepted-then-unknown");
+    await f.h.buzzAdapter.deliverPending();
+    expect(stateOf(f.h,id)?.status).toBe("SENT");
+    f.h.cp.bindings.revoke("CEO", "new receiver");
+    const next = readyCeo(f.h, { room: "next-room", identity: "next-key" });
+    expect(f.h.cp.bindings.bind({role:Role.CEO, sessionId:next.sessionId}).allowed).toBe(true);
+    f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
+    await f.h.buzzAdapter.deliverPending();
+    expect(stateOf(f.h,id)?.failure_class).toBe("unknown_observed");
+    f.h.cp.bindings.revoke("CEO", "third receiver");
+    const third=readyCeo(f.h, {room:"third-room",identity:"third-key"});
+    expect(f.h.cp.bindings.bind({role:Role.CEO, sessionId:third.sessionId}).allowed).toBe(true);
+    await f.h.buzzAdapter.deliverPending();
+    f.h.cp.bindings.revoke("CEO", "return unknown receiver");
+    expect(f.h.cp.bindings.bind({role:Role.CEO, sessionId:next.sessionId}).allowed).toBe(true);
+    await f.h.buzzAdapter.deliverPending();
+    expect(sendsOf(f.send,id)).toBe(3);
+    expect(f.h.cp.outbox.sentTo(id,{room:"next-room",recipient:"next-key"})).toBe("UNKNOWN");
+    expect(stateOf(f.h,id)?.failure_class).toBe("unknown_observed");
+    expect(outboxDeliveryReadback(f.h.cp.outbox.get(id)!).automaticResendHeld).toBe(true);
+  } finally { f.h.cp.close(); }
+});
+
+it.each(["accepted→unknown", "unknown→accepted", "accepted→accepted", "accepted→new"] as const)(
+  "ROUND1-ESCAPE-01: retarget %s uses only that destination's outcome", async transition => {
+    const f = buzzCeo(true);
+    try {
+      const id = notify(f.h, transition);
+      const sealed = f.h.cp.outbox.get(id)!;
+      await f.h.buzzAdapter.deliverPending(); // A accepted.
+      const acceptedAt = f.h.cp.db.get<{ sent_at: string }>("SELECT sent_at FROM outbox_sent_destinations WHERE message_id = ? AND room = ?", [id, "first-room"])!.sent_at;
+      const bind = (sessionId: string) => {
+        expect(f.h.cp.bindings.revoke("CEO", transition).allowed).toBe(true);
+        expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId }).allowed).toBe(true);
+      };
+      f.h.clock.advance(1000);
+      const second = readyCeo(f.h, { room: "second-room", identity: "second-key" }); bind(second.sessionId);
+      if (transition !== "accepted→accepted") f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
+      await f.h.buzzAdapter.deliverPending(); // B accepted or unknown.
+      if (transition.startsWith("accepted→") && transition !== "accepted→accepted") {
+        f.h.clock.advance(1000);
+        const third = readyCeo(f.h, { room: "third-room", identity: "third-key" }); bind(third.sessionId);
+        await f.h.buzzAdapter.deliverPending(); // C accepted.
+      }
+      const sent = sendsOf(f.send, id);
+      const target = transition === "accepted→new"
+        ? readyCeo(f.h, { room: "new-room", identity: "new-key" }).sessionId
+        : transition === "accepted→unknown" ? second.sessionId : f.first.sessionId;
+      bind(target);
+      const readback = outboxDeliveryReadback(f.h.cp.outbox.get(id)!);
+      expect(readback).toMatchObject({ delivered: transition.endsWith("→accepted"),
+        automaticResendHeld: transition.endsWith("→unknown"), completed: false });
+      if (transition.endsWith("→unknown")) expect(stateOf(f.h, id)?.status).toBe("PENDING");
+      expect(f.h.cp.db.get("SELECT sent_at FROM outbox WHERE message_id = ?", [id]))
+        .toEqual({ sent_at: transition.endsWith("→accepted") ? acceptedAt : null });
+      await f.h.buzzAdapter.deliverPending(); await f.h.buzzAdapter.deliverPending();
+      expect(sendsOf(f.send, id)).toBe(sent + (transition.endsWith("→new") ? 1 : 0));
+      expect(f.h.cp.outbox.get(id)).toMatchObject({ messageId: id, payloadDigest: sealed.payloadDigest, payload: sealed.payload });
+      expect(f.h.cp.outbox.get(id)?.status).not.toBe("ACKED");
+    } finally { f.h.cp.close(); }
+  },
+);
+
+it.each(["ACCEPTED", "UNKNOWN"] as const)("ROUND1-ESCAPE-01: returning to an in-flight destination waits for its own %s result", async outcome => {
+  const f = buzzCeo(true);
+  let release = () => {}; let pending: Promise<unknown> | undefined;
+  try {
+    const id = notify(f.h, `in-flight-${outcome}`); await f.h.buzzAdapter.deliverPending();
+    const bind = (sessionId: string) => {
+      expect(f.h.cp.bindings.revoke("CEO", "in-flight return").allowed).toBe(true);
+      expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId }).allowed).toBe(true);
+    };
+    const second = readyCeo(f.h, { room: "second-room", identity: "second-key" }); bind(second.sessionId);
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let started!: () => void; const began = new Promise<void>(resolve => { started = resolve; });
+    f.send.mockImplementationOnce(async (_channel, _content, recipients) => {
+      started(); await held;
+      if (outcome === "UNKNOWN") throw new Error("send timed out after 10000ms");
+      return { eventId: "second-event", mentionPubkeys: [...recipients] };
+    });
+    pending = f.h.buzzAdapter.deliverPending(); await began;
+    const third = readyCeo(f.h, { room: "third-room", identity: "third-key" }); bind(third.sessionId);
+    await f.h.buzzAdapter.deliverPending();
+    bind(second.sessionId); await f.h.buzzAdapter.deliverPending();
+    expect(outboxDeliveryReadback(f.h.cp.outbox.get(id)!).delivered).toBe(false);
+    expect(sendsOf(f.send, id)).toBe(2); // The outstanding CEO claim also withholds C.
+    release(); await pending;
+    f.h.clock.advance(60 * 60_000); // Existing stale-claim recovery, no wall-clock sleep.
+    await f.h.buzzAdapter.deliverPending(); await f.h.buzzAdapter.deliverPending();
+    expect(outboxDeliveryReadback(f.h.cp.outbox.get(id)!)).toMatchObject({ delivered: outcome === "ACCEPTED",
+      automaticResendHeld: outcome === "UNKNOWN", completed: false });
+    expect(sendsOf(f.send, id)).toBe(2);
+  } finally { release(); await pending; f.h.cp.close(); }
+});
