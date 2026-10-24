@@ -1,0 +1,8 @@
+Limit: bootstrap_plan_attach is a delegable CEO write: the current CEO's owner or Hermes-delegated peer turn may attach (superseding the owner-turn-only rule of d91499fa), with identity before digest checks unchanged. A staged candidate is a non-authoritative upload keyed by (run, server-derived stager PRIMARY_CTO roleKey, exact-byte sha256) and bound to contract, operation and target, never to the run owner pin; attach-by-digest must name stagedBy and selects exactly that slot with no fallback, re-validating the current owner and bindings inside the attach transaction (CEO fc773a85, 57d53c00, 5bd3f781, 50ad7a07).
+Warn: bootstrap PLAN attachments and staged candidates are stored as HANDOFF artifacts distinguished only by their content schema; every HANDOFF reader (activationHandoff, observedHandoffFacts) must exclude both input subtypes, or an input is read as the run's handoff package.
+Record-Id: r-b03343b26383
+Provenance: inherited 4f43f5c77e4d58f8bcae8c756fe2b19fa9b6594e
+
+Limit: bootstrap_plan_stage derives the stager only from the authenticated peer.binding itself (PRIMARY_CTO role, canonical roleKey, session, incarnation, generation all equal to the role's current binding); it never searches the session's bindings by order, and a binding-free caller is refused MCP_PEER_UNAUTHENTICATED with nothing written (review ACP1197-R1-01, CEO 6a6604cb).
+Record-Id: r-f1541a60b332
+Provenance: inherited 8893b2ff1ee3f39b0e054506efe61b0c17dca39f
