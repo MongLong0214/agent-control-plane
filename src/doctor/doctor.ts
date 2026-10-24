@@ -1725,6 +1725,15 @@ export class Doctor {
   private checkOutbox(): Finding[] {
     const findings: Finding[] = [];
     const delivery = this.outbox.deliveryReadback();
+    if (delivery.pendingCeoNotifications.length > 0) findings.push({
+      code: "CEO_NOTIFICATION_PENDING",
+      severity: "WARN",
+      scope: "outbox",
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: { pending: delivery.pendingCeoNotifications },
+      recommendedAction: "inspect the current CEO's authenticated route and last delivery failure; retained notifications retry with their existing message ids when the route is restored",
+    });
     if (delivery.unconfirmed.length > 0) findings.push({
       code: "OUTBOX_DELIVERY_UNCONFIRMED",
       severity: "WARN",

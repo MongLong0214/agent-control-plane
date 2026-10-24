@@ -112,6 +112,8 @@ export interface BuzzKeyPossession {
    * would otherwise hold back the CEO's ordinary messages until that time.
    */
   readonly answerSignedAt: number;
+  /** The sole room in the verified answer's signed `h` tags. */
+  readonly buzzAddress: string;
 }
 
 const POSSESSIONS = new WeakSet<object>();
@@ -239,6 +241,11 @@ export class BuzzBindChallenges {
     if (!verifyEvent(plainCopy(event))) {
       return deny(ReasonCode.INGRESS_SIGNATURE_INVALID, "the binding event's signature does not verify");
     }
+    const rooms = event.tags.filter((tag) => tag[0] === "h");
+    const room = rooms.length === 1 ? rooms[0]?.[1] : undefined;
+    if (!room || room.trim() !== room) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "the binding event must name exactly one non-empty Buzz room");
+    }
     if (content.kind === "MALFORMED") {
       // Nothing is looked up or recorded: like an unknown nonce, it names no challenge for certain.
       return deny(
@@ -323,6 +330,7 @@ export class BuzzBindChallenges {
       buzzActorId: challenge.actor,
       ceoBindingGeneration: challenge.ceoBindingGeneration,
       answerSignedAt: event.created_at,
+      buzzAddress: room,
     });
     POSSESSIONS.add(possession);
     const bound = this.#ports.bind(possession);
