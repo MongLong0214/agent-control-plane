@@ -1,4 +1,4 @@
-import { ceoBuzzHistoryIsPrePost, isBuzzSignerRefusal, type BuzzPolicyBinding } from "./ceo-buzz-signer.ts";
+import { ceoBuzzHistoryIsPrePost, isBuzzSignerRefusal, type BuzzPolicyBinding, type BuzzPolicyReadiness } from "./ceo-buzz-signer.ts";
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
 import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
@@ -425,8 +425,9 @@ const sameReceiverSql = (alias: string): string =>
  * A signer-membership refusal uses the same policy, but a receiving route change cannot clear it:
  * only a positive readback of the transport's sending signer in that exact room may do so, after
  * verifying the whole row's attempt history is pre-post (`resumeCeoBuzzSigner`). A local send-policy
- * refusal also binds that hold to the route, actual signer and opaque policy-file digest: unchanged
- * authority cannot be re-armed by roster membership alone.
+ * refusal also binds that hold to the route, actual signer and opaque policy-file digest. A fresh
+ * non-sending verdict from the wrapper is required to release it; fingerprints and roster membership
+ * alone grant nothing.
  *
  * Not re-armed by a route change: an authority refusal or a wrong target (a contract or security
  * refusal from the relay, kept on record and unsent), a deferral already on its own backoff, an
@@ -1753,10 +1754,10 @@ export class Outbox {
         isBuzzSignerRefusal(row.last_error ?? "")) && ceoBuzzHistoryIsPrePost(this.db, row)).map(hydrate);
   }
 
-  /** Existing resume boundary. False means the local-policy hold has no relevant change to validate.
-   * Positive roster readback can release membership holds; policy holds also need changed authority.
+  /** Existing resume boundary. Without a verdict, true only requests authoritative revalidation.
+   * Re-arming requires current roster qualification AND the wrapper's fresh non-sending allowance.
    */
-  resumeCeoBuzzSigner(message: OutboxMessage, destination: SentDestination, registered: boolean, policyBinding?: BuzzPolicyBinding): boolean {
+  resumeCeoBuzzSigner(message: OutboxMessage, destination: SentDestination, registered: boolean, policyBinding?: BuzzPolicyBinding, policyCheck?: BuzzPolicyReadiness): boolean {
     return this.db.tx(() => {
       const row = this.db.get<RawOutbox>(`SELECT o.* FROM outbox o JOIN sessions s ON s.session_id = o.target_session_id
         WHERE o.message_id = ? AND o.status = 'PENDING' AND o.target_session_id = ? AND o.binding_generation = ?
@@ -1776,24 +1777,46 @@ export class Outbox {
           WHERE kind = 'CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY'
             AND json_extract(evidence_json, '$.messageId') = ? ORDER BY rowid DESC LIMIT 1`, [message.messageId]);
         if (previous && ["SEND_REFUSAL", "LEGACY_SEND_REFUSAL"].includes(JSON.parse(previous.evidence_json).source)) {
+          // Historical evidence identifies the refusal, not the old policy bytes. A fresh check
+          // may now determine permission; never bind an old refusal to today's policy.
           this.#recordSignerNotReady(message, destination, policyBinding.signer, "SEND_REFUSAL", row.attempts,
-            ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED, policyBinding);
+            ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED, { ...policyBinding, policyDigest: null });
           this.db.run("UPDATE outbox SET reason_code = ? WHERE message_id = ?", [ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED, message.messageId]);
-          return false;
+          return true;
         }
       }
       if (row.reason_code === ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED) {
         const held = this.db.get<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events
-          WHERE kind = 'CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY' AND reason_code = 'BUZZ_LOCAL_SEND_POLICY_REFUSED'
+          WHERE (kind = 'CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY' OR (kind = 'CEO_NOTIFICATION_BUZZ_POLICY_CHECK'
+              AND json_extract(evidence_json, '$.verdict') = 'refused')) AND reason_code = 'BUZZ_LOCAL_SEND_POLICY_REFUSED'
             AND json_extract(evidence_json, '$.messageId') = ? ORDER BY rowid DESC LIMIT 1`, [message.messageId]);
         const previous = held ? JSON.parse(held.evidence_json).policyBinding as BuzzPolicyBinding | undefined : undefined;
         if (!previous || !policyBinding || !policyBinding.signer) return false;
         const changed = previous.routeDigest !== policyBinding.routeDigest || previous.signer !== policyBinding.signer ||
-          (typeof previous.policyDigest === "string" && typeof policyBinding.policyDigest === "string" &&
-            previous.policyDigest !== policyBinding.policyDigest);
-        if (!changed) return false;
+          (typeof policyBinding.policyDigest === "string" && previous.policyDigest !== policyBinding.policyDigest);
+        // Recovery of observation may request a check, but only a fresh allowed verdict can release.
+        if (!changed && !policyCheck) return false;
       }
-      if (!registered) return true;
+      if (!registered || !policyCheck || !policyBinding) return true;
+      if (policyCheck.verdict === "allowed" && (policyCheck.signer !== policyBinding.signer ||
+        policyCheck.recipient !== destination.recipient || !policyCheck.policyDigest ||
+        policyCheck.policyDigest !== policyBinding.policyDigest)) return false;
+      const checkDigest = digestOf({ messageId: message.messageId, policyBinding, policyCheck });
+      if (!this.db.get(`SELECT 1 FROM audit_events WHERE kind = 'CEO_NOTIFICATION_BUZZ_POLICY_CHECK'
+        AND json_extract(evidence_json, '$.checkDigest') = ?`, [checkDigest])) {
+        const recorded = this.audit.record({ kind: "CEO_NOTIFICATION_BUZZ_POLICY_CHECK",
+          reasonCode: policyCheck.verdict === "allowed" ? ReasonCode.OK : ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED,
+          roleKey: message.roleKey, sessionId: message.targetSessionId, runId: message.runId,
+          evidence: { messageId: message.messageId, targetSessionId: message.targetSessionId,
+            bindingGeneration: message.bindingGeneration, ...destination, policyBinding,
+            verdict: policyCheck.verdict, ...(policyCheck.message ? { message: policyCheck.message } : {}), checkDigest } });
+        if (!recorded.allowed) throw new Error("Buzz policy check evidence was not recorded");
+      }
+      if (policyCheck.verdict !== "allowed") {
+        if (policyCheck.verdict === "refused") this.db.run("UPDATE outbox SET reason_code = ? WHERE message_id = ?",
+          [ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED, message.messageId]);
+        return false;
+      }
       rearmRetainedDeliveries(this.db, { sessionId: message.targetSessionId, roleKey: message.roleKey,
         bindingGeneration: message.bindingGeneration, signerReadyMessageId: message.messageId });
       return true;

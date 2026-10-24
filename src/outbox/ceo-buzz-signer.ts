@@ -20,6 +20,15 @@ export interface BuzzPolicyBinding {
   policyDigest: string | null;
 }
 
+/** A non-sending verdict from the wrapper's own evaluator, never inferred from a digest. */
+export interface BuzzPolicyReadiness {
+  verdict: "allowed" | "refused" | "undeterminable";
+  policyDigest: string | null;
+  signer: string | null;
+  recipient: string | null;
+  message?: string;
+}
+
 /** Only this structured refusal proves this attempt was blocked by local send policy. */
 export const isBuzzSignerRefusal = (message: string): boolean => {
   const prefix = "buzz send failed: ";
