@@ -7,7 +7,7 @@ import { screenPublicText } from "./genesis-bundle.ts";
 /** A safe projection of ACP's admitted escalation reply, never an author-supplied authority claim. */
 export const authenticatedCeoDecisionSchema = z.object({
   runId: z.string(),
-  escalationId: z.number().int().positive(),
+  escalationId: z.number().int().positive().nullable(),
   resolution: z.string(),
   resolutionDigest: z.string(),
   source: z.object({
@@ -35,14 +35,21 @@ export function collectBootstrapCeoDecisions(db: Db, runId: string): Authenticat
      WHERE run_id = ? AND kind = 'CEO_DECISION' AND reason_code IS NULL
        AND json_extract(evidence_json, '$.escalation') = 1 ORDER BY event_id`, [runId]);
   const records: AuthenticatedCeoDecision[] = [];
-  const seen = new Set<number>();
+  const seen = new Set<string>();
   for (const decision of decisions) {
     const evidence = JSON.parse(decision.evidence_json) as Record<string,unknown>;
     const escalationId = evidence["escalationId"];
     const messageId = evidence["messageId"];
-    if (typeof escalationId !== "number" || typeof messageId !== "string" || !decision.session_id || seen.has(escalationId)) continue;
-    const opened = db.get<{event_id:number}>(`SELECT event_id FROM audit_events WHERE event_id = ? AND run_id = ?
-      AND kind = 'CTO_ESCALATION' AND event_id < ? AND json_extract(evidence_json, '$.blocksCriticalPath') = 1`, [escalationId,runId,decision.event_id]);
+    if ((typeof escalationId !== "number" && escalationId !== null) || typeof messageId !== "string" || !decision.session_id) continue;
+    // The retained compatibility API records no target id and omits it from the reply. Keep that
+    // fact in the projection; prove run membership from the escalation history and reply instead.
+    const key = escalationId === null ? `reply:${messageId}` : `escalation:${escalationId}`;
+    if (seen.has(key)) continue;
+    const opened = escalationId === null
+      ? db.get<{event_id:number}>(`SELECT event_id FROM audit_events WHERE run_id = ? AND kind = 'CTO_ESCALATION'
+          AND event_id < ? LIMIT 1`, [runId,decision.event_id])
+      : db.get<{event_id:number}>(`SELECT event_id FROM audit_events WHERE event_id = ? AND run_id = ?
+          AND kind = 'CTO_ESCALATION' AND event_id < ? AND json_extract(evidence_json, '$.blocksCriticalPath') = 1`, [escalationId,runId,decision.event_id]);
     if (!opened) continue;
     const binding = db.get<{event_id:number;kind:string;session_id:string;evidence_json:string}>(
       `SELECT event_id, kind, session_id, evidence_json FROM audit_events WHERE role_key = 'CEO'
@@ -58,7 +65,7 @@ export function collectBootstrapCeoDecisions(db: Db, runId: string): Authenticat
       `SELECT payload_json, payload_digest FROM outbox WHERE message_id = ? AND run_id = ? AND kind = 'ESCALATION_REPLY'`, [messageId,runId]);
     if (!reply) continue;
     const payload = JSON.parse(reply.payload_json) as {runId?:unknown;escalationId?:unknown;resolution?:unknown};
-    if (digestOf(payload) !== reply.payload_digest || payload.runId !== runId || payload.escalationId !== escalationId || typeof payload.resolution !== "string" ||
+    if (digestOf(payload) !== reply.payload_digest || payload.runId !== runId || (payload.escalationId ?? null) !== escalationId || typeof payload.resolution !== "string" ||
         digestOf(payload.resolution) !== evidence["resolutionDigest"] || payload.resolution.length !== evidence["resolutionLength"]) continue;
     let resolution = payload.resolution;
     try { screenPublicText(resolution); } catch { resolution = "[withheld: credential-shaped content]"; }
@@ -66,7 +73,7 @@ export function collectBootstrapCeoDecisions(db: Db, runId: string): Authenticat
       decisionEventId:decision.event_id,messageId,sessionId:decision.session_id,actorId:assignment.actor_id,assignmentId:assignment.assignment_id,
       bindingGeneration:generation,bindingEventId:binding.event_id}};
     records.push({...record,digest:digestOf(record)});
-    seen.add(escalationId);
+    seen.add(key);
   }
   return records;
 }

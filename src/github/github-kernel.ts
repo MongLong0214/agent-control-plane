@@ -4768,7 +4768,9 @@ export async function proveActionsCheckProvenance(
   }
   const suiteId = check.check_suite?.id;
   const runIdFromUrl = /\/actions\/runs\/(\d+)\/job\/\d+/.exec(check.details_url ?? "")?.[1];
-  if (!suiteId || !runIdFromUrl) {
+  const runId = Number(runIdFromUrl);
+  if (!Number.isSafeInteger(check.id) || check.id < 1 || !Number.isSafeInteger(suiteId) || !suiteId || suiteId < 1 ||
+      !Number.isSafeInteger(runId) || runId < 1) {
     return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "check does not identify an Actions job and suite", {
       checkRunId: check.id,
     });
@@ -4777,13 +4779,24 @@ export async function proveActionsCheckProvenance(
   if (!target.allowed) return target as Decision<{ workflowDigest: string }>;
   const { root, owner, repo } = target.value;
   try {
+    type RepositoryIdentity = { id?: number; full_name?: string };
     const [suite, run] = await Promise.all([
-      client.request<{ head_sha: string; app?: { slug?: string } | null }>("GET", `${root}/check-suites/${suiteId}`),
-      client.request<{ head_sha: string; path?: string; status?: string; conclusion?: string | null }>(
+      client.request<{ id?: number; repository?: RepositoryIdentity; head_sha: string; app?: { slug?: string } | null }>("GET", `${root}/check-suites/${suiteId}`),
+      client.request<{ id?: number; repository?: RepositoryIdentity; check_suite_id?: number; head_sha: string; path?: string; status?: string; conclusion?: string | null }>(
         "GET",
-        `${root}/actions/runs/${runIdFromUrl}`,
+        `${root}/actions/runs/${runId}`,
       ),
     ]);
+    // details_url is only an integrator-supplied lookup hint. Prove the returned GitHub identities
+    // and repository before accepting either successful or legitimately pending provenance.
+    const repositoryName = `${owner}/${repo}`.toLowerCase();
+    if (suite.id !== suiteId || run.id !== runId || run.check_suite_id !== suiteId ||
+        !Number.isSafeInteger(suite.repository?.id) || (suite.repository?.id ?? 0) < 1 ||
+        suite.repository?.id !== run.repository?.id ||
+        suite.repository?.full_name?.toLowerCase() !== repositoryName ||
+        run.repository?.full_name?.toLowerCase() !== repositoryName) {
+      return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "Actions suite/run identity or repository differs from the check", { checkRunId: check.id });
+    }
     if (
       suite.head_sha !== head ||
       suite.app?.slug !== "github-actions" ||

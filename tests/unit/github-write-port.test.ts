@@ -373,7 +373,7 @@ it('genesis CI requires successful Actions checks at the exact head and the work
   const check = {id:7,name:'test',head_sha:head,status:'completed',conclusion:'success',app:{slug:'github-actions'},check_suite:{id:9},details_url:'https://github.com/acme/fixture/actions/runs/11/job/7'};
   const file = {encoding:'base64',content:Buffer.from(content).toString('base64')};
   const client = scriptedClient({[`GET repos/acme/fixture/commits/${head}/check-runs?check_name=test&per_page=100&page=1`]:{check_runs:[check]},[`GET repos/acme/fixture/contents/.github/workflows/ci.yml?ref=${head}`]:file,
-    'GET repos/acme/fixture/check-suites/9':{head_sha:head,app:{slug:'github-actions'}},'GET repos/acme/fixture/actions/runs/11':{head_sha:head,path:'.github/workflows/ci.yml',status:'completed',conclusion:'success'}});
+    'GET repos/acme/fixture/check-suites/9':{id:9,repository:{id:42,full_name:'acme/fixture'},head_sha:head,app:{slug:'github-actions'}},'GET repos/acme/fixture/actions/runs/11':{id:11,repository:{id:42,full_name:'acme/fixture'},check_suite_id:9,head_sha:head,path:'.github/workflows/ci.yml',status:'completed',conclusion:'success'}});
   const port = createGitHubApiWritePort({client});const workflows=[{path:'.github/workflows/ci.yml',checkName:'test',approvedDigest:sha256(content)}];
   expect(await port.observeGenesisCi!(target,head,workflows)).toBe(true);
   file.content=Buffer.from('changed').toString('base64');expect(await port.observeGenesisCi!(target,head,workflows)).toBe(false);file.content=Buffer.from(content).toString('base64');

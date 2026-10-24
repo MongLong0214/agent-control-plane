@@ -161,13 +161,13 @@ export class FakeGitHub implements GitHubClient {
       const id = Number(/\/check-suites\/(\d+)$/.exec(path)![1]);
       const suite = this.#checkSuites.get(id);
       if (!suite) throw new Error(`no check suite ${id}`);
-      return suite as unknown as T;
+      return { ...suite, id, repository: { id: 42, full_name: /(?:^|\/)repos\/([^/]+\/[^/]+)\//.exec(path)![1] } } as unknown as T;
     }
     if (method === "GET" && /\/actions\/runs\/\d+$/.test(path)) {
       const id = Number(/\/actions\/runs\/(\d+)$/.exec(path)![1]);
       const run = this.#actionsRuns.get(id);
       if (!run) throw new Error(`no actions run ${id}`);
-      return run as unknown as T;
+      return { ...run, id, repository: { id: 42, full_name: /(?:^|\/)repos\/([^/]+\/[^/]+)\//.exec(path)![1] } } as unknown as T;
     }
 
     if (method === "GET" && /\/commits\/[^/]+$/.test(path)) {
@@ -315,6 +315,7 @@ export class FakeGitHub implements GitHubClient {
     const actionRunId = this.#nextId++;
     this.#checkSuites.set(suiteId, { head_sha: mergeSha, app: { slug: "github-actions" } });
     this.#actionsRuns.set(actionRunId, {
+      check_suite_id: suiteId,
       head_sha: mergeSha,
       path: workflowPath,
       status: "completed",
@@ -336,6 +337,7 @@ export class FakeGitHub implements GitHubClient {
   readonly #heads = new Map<string, string>();
   readonly #checkSuites = new Map<number, { head_sha: string; app: { slug: string } }>();
   readonly #actionsRuns = new Map<number, {
+    check_suite_id: number;
     head_sha: string;
     path: string;
     status: string;

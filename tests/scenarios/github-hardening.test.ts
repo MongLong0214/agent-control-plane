@@ -938,6 +938,30 @@ describe("the merge must land on the evaluated base (§24.6)", () => {
 });
 
 describe("post-merge verification cannot be made vacuous (§24.7)", () => {
+  it.each(["unrelated-suite","missing-suite","wrong-run-id","wrong-repository","missing-repository"] as const)("ACP1201-R1-01: ordinary CI and post-merge verification reject %s",async fault=>{
+    const fixture=await setupTrustedPostMergeFixture();
+    fixture.github.setTrustedPostMergeCheck(fixture.head,"project-ci",".github/workflows/ci.yml");
+    const source=fixture.harness.cp.github.ciEvidenceSource();
+    expect(await source.fetch(fixture.identity,fixture.head)).toHaveLength(1);
+    const request=fixture.github.request.bind(fixture.github);
+    fixture.github.request=async <T>(method:"GET"|"POST"|"PATCH"|"PUT"|"DELETE",path:string,body?:unknown):Promise<T>=>{
+      if (method === "GET" && /\/actions\/runs\/\d+$/.test(path)) {
+        const run=await request<Record<string,unknown>>(method,path,body);
+        if (fault === "unrelated-suite") return {...run,check_suite_id:19_000} as T;
+        if (fault === "missing-suite") return {...run,check_suite_id:undefined} as T;
+        if (fault === "wrong-run-id") return {...run,id:19_000} as T;
+        if (fault === "wrong-repository") return {...run,repository:{id:42,full_name:"other/fixture"}} as T;
+        return {...run,repository:undefined} as T;
+      }
+      return request<T>(method,path,body);
+    };
+    expect(await source.fetch(fixture.identity,fixture.head)).toEqual([]);
+    const mergeSha=await mergeForReal(fixture);
+    expect(mergeSha).toBe(fixture.head); // This fixture merges onto the candidate tree/head.
+    const refused=await fixture.harness.cp.github.postMergeVerify(fixture.runId,fixture.identity,mergeSha);
+    expect(refused.allowed).toBe(false);
+    expect(refused.evidence["failed"]).toEqual([{name:"project-ci",conclusion:"untrusted"}]);
+  });
   it("refuses check names the pinned manifest does not declare", async () => {
     const fixture = await setup();
     const refused = await fixture.harness.cp.github.postMergeVerify(
@@ -1008,10 +1032,13 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
       body?: unknown,
     ) => {
       if (method === "GET" && /\/check-suites\/71$/.test(path)) {
-        return { head_sha: fixture.head, app: { slug: "github-actions" } } as T;
+        return { id:71, repository:{id:42,full_name:"acme/fixture"}, head_sha: fixture.head, app: { slug: "github-actions" } } as T;
       }
       if (method === "GET" && /\/actions\/runs\/81$/.test(path)) {
         return {
+          id:81,
+          repository:{id:42,full_name:"acme/fixture"},
+          check_suite_id: 71,
           head_sha: fixture.head,
           path: ".github/workflows/ci.yml",
           status: "completed",
