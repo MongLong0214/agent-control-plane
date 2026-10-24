@@ -1,0 +1,8 @@
+Limit: a CEO notification moves from the canonical notice transport to the verified canonical CEO Buzz route only when every earlier attempt of that row is known not to have delivered: an attempt is journaled in audit_events before HTTP, and only an exact pre-claim HTTP 400 canonical_invalid_request refusal of that request proves non-delivery; a timeout, lost response, UNCERTAIN or 409 stays unknown and keeps the row withheld PENDING, and Buzz success leaves it SENT until the authenticated CEO ACK (CEO b603fb84, f8d2a020).
+Warn: rows attempted before this attempt journal existed (the 12 live CEO_NOTIFICATION rows of 10-16..10-23) cannot be classified from their failure counts, because Hermes parses a body before it looks up the event-id receipt; they stay withheld PENDING as unknown, and only a matching completed receipt or an explicit CEO decision can release them.
+Record-Id: r-892899abd6f1
+Provenance: inherited 3018fd284874302e32ce54ccd458ebc68f8c59ee
+
+Warn: a CEO_NOTIFICATION row attempted before the attempt journal existed (the 12 live rows of 10-16..10-23) is never sent again over any route by this code: no HTTP, no Buzz, no ACK or deletion; it records one CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN audit and stays PENDING-visible across restarts. A CEO decision neither proves its past non-delivery nor clears that unknown; this corrects the 3018fd28 record that said an explicit CEO decision could release them (CEO 18fbc5c4, 5067e7e6).
+Record-Id: r-f66b3f18d2a3
+Provenance: inherited 14db9c39d290d607c278cfb2b98f24e44d88a288
