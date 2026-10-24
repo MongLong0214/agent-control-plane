@@ -15,7 +15,7 @@ afterAll(cleanupTempDirs);
 /**
  * ACP-R1-03 — every supported CEO configuration keeps an authenticated route for its notifications.
  * A READY CEO with a bound Buzz identity and address keeps the Buzz route without any Hermes
- * configuration; an adopted Hermes CEO uses the canonical notice transport; a notification is
+ * configuration; an adopted Hermes CEO uses verified canonical support or its verified Buzz route; a notification is
  * withheld (PENDING, never REJECTED) only while no route exists, and binding a routable CEO
  * establishes the route.
  */
@@ -96,21 +96,24 @@ it("withholds a notification as PENDING while no route exists, and the binding o
   } finally { h.cp.close(); }
 });
 
-it("routes an adopted Hermes CEO's notification only over the canonical transport, and withholds it until that transport exists", async () => {
+it("uses verified Buzz for newly queued adopted CEO mail when attached transport support is unverified", async () => {
   const f = adoptedFixture();
   try {
     const cp = f.h.cp;
-    // Even with a Buzz route on the adopted runtime, the canonical transport is its route once attached.
+    // Attaching transport configuration alone proves no receiver support.
     cp.db.run("UPDATE sessions SET buzz_address = 'ceo-room', buzz_actor_id = 'ceo-key' WHERE session_id = ?", [f.gatewaySessionId]);
-    const messageId = notify(f.h, "adopted-canonical");
     const sent: string[] = [];
     cp.outbox.attachCeoNotificationDelivery(async (message) => { sent.push(message.messageId); return allow(ReasonCode.OK, undefined); });
     await cp.outbox.deliverCeoNotifications();
-    expect(sent).toEqual([messageId]);
-    expect(statusOf(f.h, messageId)).toBe("ACKED");
-    const second = notify(f.h, "adopted-canonical-2");
-    expect(cp.outbox.claimDeliverable()).toEqual([]);
+    const messageId = notify(f.h, "adopted-canonical");
     await cp.outbox.deliverCeoNotifications();
-    expect(statusOf(f.h, second)).toBe("ACKED");
+    expect(sent).toEqual([]);
+    expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([messageId]);
+    expect(statusOf(f.h, messageId)).toBe("SENT");
+    const second = notify(f.h, "adopted-canonical-2");
+    await cp.outbox.deliverCeoNotifications();
+    expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([second]);
+    expect(statusOf(f.h, second)).toBe("SENT");
+    expect(sent).toEqual([]);
   } finally { f.h.cp.close(); }
 });

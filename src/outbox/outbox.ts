@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { digestOf } from "../core/digest.ts";
 
 import { newMessageId } from "../core/ids.ts";
-import { CeoNoticeRoute, ceoBuzzGrantSql, type CeoNoticeAttempt, type CeoNoticeOutcome } from "./ceo-notification-route.ts";
+import { CeoNoticeRoute, ceoBuzzGrantSql, recordCeoNoticeReceiptSupport, type CeoNoticeAttempt, type CeoNoticeOutcome } from "./ceo-notification-route.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -1050,6 +1050,8 @@ export class Outbox {
          FROM outbox o
         WHERE o.kind = 'CEO_NOTIFICATION' AND o.status = 'PENDING' AND ${liveDeliveryTarget("o")}
           AND NOT ${ceoCanonicalRouteSql("o", attached)} AND NOT ${ceoBuzzSessionSql("o")}
+          AND NOT EXISTS (SELECT 1 FROM audit_events e WHERE e.kind = 'CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN'
+                            AND json_extract(e.evidence_json, '$.messageId') = o.message_id)
           AND NOT EXISTS (SELECT 1 FROM audit_events e WHERE e.kind = 'CEO_NOTIFICATION_ROUTE_UNAVAILABLE'
                             AND json_extract(e.evidence_json, '$.messageId') = o.message_id
                             AND json_extract(e.evidence_json, '$.targetSessionId') = o.target_session_id)
@@ -1114,6 +1116,7 @@ export class Outbox {
           let reasonCode: ReasonCode = ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED;
           let outcome: CeoNoticeOutcome = "UNKNOWN";
           const attempt = new CeoNoticeRoute(this.db, this.audit, hydrate(row));
+          if (attempt.withholdBeforeSend()) continue;
           try {
             const result = await send(hydrate(row), attempt);
             unavailable = !result.allowed && result.reasonCode === ReasonCode.CEO_CONVERSATION_UNAVAILABLE;
@@ -3209,6 +3212,10 @@ export class Outbox {
           columns.diagnosticsJson ?? null, this.clock.nowIso(),
         ],
       ));
+    if (entry.entry === "SETTLED" || (entry.entry === "RESENT" && entry.receiptId &&
+        JSON.parse(columns.diagnosticsJson ?? "{}").outcome === "SETTLED")) {
+      recordCeoNoticeReceiptSupport(this.db, this.audit, entry.eventId);
+    }
   }
 
   /** `exactHolderTarget` for a caller-supplied holder tuple. Only reads. */

@@ -2,20 +2,26 @@ import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import type * as Http from "node:http";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { startConfiguredCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
+import { createConfiguredHermesGatewayDaemonNoticeTarget, startConfiguredCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
+import { InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { Outbox } from "../../src/outbox/outbox.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { daemonNoticeCanonical, daemonNoticeFields, daemonNoticePayloadDigest,
-  type DaemonNoticeBody } from "../../src/runtime/acp-daemon-notice.ts";
+  sendDaemonNoticeProbe, type DaemonNoticeBody } from "../../src/runtime/acp-daemon-notice.ts";
+import { createHermesGatewayIdentityReader } from "../../src/runtime/hermes-gateway-identity.ts";
 import { createHermesGatewayDaemonNoticeSender } from "../../src/runtime/hermes-gateway-conversation.ts";
 import { adoptedFixture, DIGEST, GATEWAY, LIVE, LSTART, TOKEN } from "../helpers/adopted-ceo.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { makeHarness } from "../helpers/harness.ts";
 
 const http = vi.hoisted(() => ({
+  request: vi.fn(),
   posts: [] as DaemonNoticeBody[],
   mode: "refused" as "refused" | "completed" | "timeout" | "lost" | "uncertain" | "409" | "other400" | "wrongShape" | "partial" | "notSent",
   hold: false,
   release: null as (() => void) | null,
+  lostMessageId: null as string | null,
+  turns: new Map<string, string>(),
 }));
 
 // The production HTTP senders and outbox run unchanged. Only the HTTP socket edge is fake:
@@ -23,7 +29,7 @@ const http = vi.hoisted(() => ({
 vi.mock("node:http", async (original) => {
   const real = await original<typeof Http>();
   const { EventEmitter } = await import("node:events");
-  return { ...real, request: (_options: { method: string }, respond: (res: unknown) => void) => {
+  return { ...real, request: http.request.mockImplementation((_options: { method: string }, respond: (res: unknown) => void) => {
     const req = Object.assign(new EventEmitter(), {
       destroy: () => { req.emit("close"); },
       end: (bytes?: string) => {
@@ -31,8 +37,16 @@ vi.mock("node:http", async (original) => {
         const notice = isPost ? JSON.parse(bytes!) as DaemonNoticeBody : null;
         if (notice) http.posts.push(notice);
         const deliver = () => {
+          if (notice && (http.mode === "completed" || http.mode === "lost" || http.lostMessageId === notice.text.match(/ACP notification (\S+)/)?.[1])) {
+            const raw = JSON.stringify(notice);
+            const seen = http.turns.get(notice.event_id);
+            if (seen && seen !== raw) throw new Error("same event id with different bytes");
+            http.turns.set(notice.event_id, raw);
+          }
           if (isPost && http.mode === "timeout") return;
-          if (isPost && http.mode === "lost") { req.emit("error", new Error("response lost")); return; }
+          if (isPost && (http.mode === "lost" || (http.lostMessageId && notice?.text.includes(http.lostMessageId)))) {
+            req.emit("error", new Error("response lost")); return;
+          }
           const res = Object.assign(new EventEmitter(), { statusCode: 200,
             headers: { "content-type": "application/json" }, destroy: () => undefined });
           let body: unknown = { session_id: LIVE, lineage_root_digest: DIGEST, process_pid: GATEWAY, process_started_at: TOKEN };
@@ -59,29 +73,37 @@ vi.mock("node:http", async (original) => {
       },
     });
     return req;
-  } };
+  }) };
 });
 
 type Fixture = ReturnType<typeof adoptedFixture>;
 const fixtures: Fixture[] = [];
-beforeEach(() => { http.posts = []; http.mode = "refused"; http.hold = false; http.release = null; });
+beforeEach(() => { http.request.mockClear(); http.posts = []; http.turns.clear(); http.mode = "refused"; http.hold = false; http.release = null; http.lostMessageId = null; });
 afterEach(async () => {
   for (const f of fixtures.splice(0)) { await f.h.cp.outbox.deliverCeoNotifications(); f.h.cp.close(); }
+  vi.restoreAllMocks();
 });
 afterAll(cleanupTempDirs);
 
 const destination = { session_id: LIVE, lineage_root_digest: DIGEST, process_pid: GATEWAY, process_started_at: TOKEN };
-const start = async (f: Fixture) => {
-  expect(startConfiguredCeoNotificationRoute(f.h.cp, {
+const routeOptions = (httpDiscovery = false) => ({
     environment: { ACP_TELEGRAM_EXTERNAL_SECRET: "lane-secret" },
     hermesConfiguration: { ACP_HERMES_LINEAGE_ROOT_DIGEST: DIGEST, ACP_HERMES_EXECUTABLE: "/opt/test/hermes",
       ACP_HERMES_PROFILE: "test", ACP_HERMES_HOME: "/opt/test/home",
       ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY: "hermes-runtime:test", ACP_HERMES_GATEWAY_API_KEY: "test-key" },
     ports: { authorityHeld: () => true, processStartToken: () => TOKEN, processStartedAt: () => LSTART,
-      identityReader: () => async () => destination,
-      noticeSenderFactory: (options) => createHermesGatewayDaemonNoticeSender({ ...options, timeoutMs: http.hold ? 5000 : 20 }) },
-  })).toEqual({ started: true });
+      identityReader: httpDiscovery ? createHermesGatewayIdentityReader : () => async () => destination,
+      noticeSenderFactory: (options: Parameters<typeof createHermesGatewayDaemonNoticeSender>[0]) =>
+        createHermesGatewayDaemonNoticeSender({ ...options, timeoutMs: http.hold ? 5000 : 20 }) },
+});
+const start = async (f: Fixture, httpDiscovery = false) => {
+  expect(startConfiguredCeoNotificationRoute(f.h.cp, routeOptions(httpDiscovery))).toEqual({ started: true });
   await f.h.cp.outbox.deliverCeoNotifications();
+};
+const probe = async (f: Fixture, nonce: string) => {
+  const options = routeOptions();
+  const target = createConfiguredHermesGatewayDaemonNoticeTarget(f.h.cp, options.hermesConfiguration, options.ports)!;
+  return sendDaemonNoticeProbe(f.h.cp.outbox, target, "lane-secret", nonce);
 };
 const fixture = async () => {
   const f = adoptedFixture(); fixtures.push(f); await start(f); return f;
@@ -101,6 +123,8 @@ const bindBuzz = async (f: Fixture) => {
     { isAllowedActor: () => true }).allowed).toBe(true);
 };
 const events = (f: Fixture, kind: string) => f.h.cp.audit.byKind(kind);
+const processingOf = (f: Fixture, id: string) =>
+  f.h.cp.db.get<Record<string, unknown>>("SELECT * FROM outbox WHERE message_id = ?", [id]);
 
 it("records an exact pre-claim 400 per row, switches the SAME id to verified Buzz, then consumes and ACKs once", async () => {
   const f = await fixture();
@@ -131,11 +155,12 @@ it("records an exact pre-claim 400 per row, switches the SAME id to verified Buz
 });
 
 it.each(["timeout", "lost", "uncertain", "409", "other400", "wrongShape"] as const)(
-  "%s remains unknown; even a subsequent exact 400 cannot authorize Buzz", async (mode) => {
+  "%s remains withheld without HTTP while receiver support is unverified", async (mode) => {
     const f = await fixture(); http.mode = mode;
     const id = notify(f);
     await f.h.cp.outbox.deliverCeoNotifications();
     expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
+    const calls = http.request.mock.calls.length;
     await bindBuzz(f);
     await f.h.buzzAdapter.deliverPending();
     expect(f.h.buzz.sent).toHaveLength(0);
@@ -145,6 +170,7 @@ it.each(["timeout", "lost", "uncertain", "409", "other400", "wrongShape"] as con
     await f.h.cp.outbox.deliverCeoNotifications();
     await f.h.buzzAdapter.deliverPending();
     expect(http.posts).toHaveLength(refusedCount);
+    expect(http.request).toHaveBeenCalledTimes(calls);
     expect(f.h.buzz.sent).toHaveLength(0);
     expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
     expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE")).toHaveLength(0);
@@ -226,7 +252,8 @@ it("keeps a receiver whose completed notice verifies support on canonical after 
   expect(events(f, "CEO_NOTIFICATION_ACCEPTED")).toHaveLength(2);
 });
 
-it("classifies all 12 pre-journal live-style rows as unknown even after their own new 400", async () => {
+it("holds all 12 pre-journal live-style rows without any HTTP across sweeps and database restarts, one audit each", async () => {
+  const buzz = vi.spyOn(InMemoryBuzzTransport.prototype, "send");
   const f = adoptedFixture(); fixtures.push(f);
   const ids = Array.from({ length: 12 }, (_, i) => notify(f, `legacy-${i}`));
   for (const id of ids) {
@@ -236,13 +263,27 @@ it("classifies all 12 pre-journal live-style rows as unknown even after their ow
   }
   // A handover may reset a mutable counter. The legacy failure audit still holds the uncertainty.
   f.h.cp.db.run("UPDATE outbox SET attempts = 0 WHERE message_id = ?", [ids[0]!]);
+  const processing = ids.map((id) => processingOf(f, id));
   await bindBuzz(f); await start(f);
-  for (let i = 0; i < 3; i++) { await f.h.cp.outbox.deliverCeoNotifications(); await f.h.buzzAdapter.deliverPending(); }
-  expect(http.posts).toHaveLength(12);
+  for (let i = 0; i < 3; i++) {
+    await f.h.cp.outbox.deliverCeoNotifications(); await f.h.buzzAdapter.deliverPending();
+    const { root, repoPath, clock } = f.h;
+    f.h.cp.close();
+    f.h = makeHarness({ root, repoPath, clock });
+    await start(f);
+    expect(ids.map((id) => processingOf(f, id))).toEqual(processing);
+    expect(buzz).not.toHaveBeenCalled();
+  }
+  expect(http.request).not.toHaveBeenCalled();
+  expect(buzz).not.toHaveBeenCalled();
+  expect(http.posts).toHaveLength(0);
   expect(f.h.buzz.sent).toHaveLength(0);
-  expect(events(f, "CEO_NOTIFICATION_CANONICAL_ATTEMPT")).toHaveLength(12);
-  for (const event of events(f, "CEO_NOTIFICATION_CANONICAL_ATTEMPT")) expect(event.evidence).toMatchObject({ legacyUnknown: true });
+  expect(events(f, "CEO_NOTIFICATION_CANONICAL_ATTEMPT")).toHaveLength(0);
+  const held = events(f, "CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN");
+  expect(held).toHaveLength(12);
+  for (const id of ids) expect(held.filter((e) => e.evidence["messageId"] === id)).toHaveLength(1);
   expect(ids.map((id) => f.h.cp.outbox.get(id)?.status)).toEqual(Array(12).fill("PENDING"));
+  expect(f.h.cp.outbox.deliveryReadback().pendingCeoNotifications.map((r) => r.messageId).sort()).toEqual([...ids].sort());
   // Detaching the transport cannot erase the durable unknown-outcome fence.
   const restarted = new Outbox(f.h.cp.db, f.h.cp.clock, f.h.cp.audit);
   expect(restarted.claimDeliverable()).toEqual([]);
@@ -258,12 +299,13 @@ it("keeps a partial multipart delivery canonical, never reposting the whole noti
   expect(events(f, "CEO_NOTIFICATION_CANONICAL_RESULT")[0]?.evidence).toMatchObject({ outcome: "UNKNOWN" });
 });
 
-it("a pre-journal pending row is not called unsent merely because an old crash left its counter at zero", async () => {
+it("a pre-journal pending row stays held without HTTP even when an old crash left its counter at zero", async () => {
   const f = adoptedFixture(); fixtures.push(f);
   const id = notify(f, "pre-journal-zero-counter");
   await bindBuzz(f); await start(f); await f.h.buzzAdapter.deliverPending();
   expect(events(f, "CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN")).toMatchObject([{ evidence: { messageId: id } }]);
-  expect(events(f, "CEO_NOTIFICATION_CANONICAL_ATTEMPT")).toMatchObject([{ evidence: { legacyUnknown: true } }]);
+  expect(events(f, "CEO_NOTIFICATION_CANONICAL_ATTEMPT")).toHaveLength(0);
+  expect(http.request).not.toHaveBeenCalled();
   expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
   expect(f.h.buzz.sent).toHaveLength(0);
 });
@@ -320,11 +362,10 @@ it.each(["room", "actor"] as const)("a %s alone is not a verified Buzz route", a
   expect(events(f, "CEO_NOTIFICATION_DELIVERY_FAILED")).toHaveLength(1);
 });
 
-it("a newer matching completed existing probe permits original canonical receipt lookup after receiver recovery", async () => {
-  const f = adoptedFixture(); fixtures.push(f);
-  const id = notify(f, "old-unknown");
-  f.h.cp.db.run("UPDATE outbox SET attempts = 1 WHERE message_id = ?", [id]);
-  await start(f);
+it("a newer matching completed existing probe permits a journaled v51 receipt lookup after receiver recovery", async () => {
+  const f = await fixture(); http.mode = "lost";
+  const id = notify(f, "journaled-unknown");
+  await f.h.cp.outbox.deliverCeoNotifications();
   expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
   f.h.clock.advance(1000);
   const eventId = `acp-notice-probe:${"a".repeat(64)}`;
@@ -337,4 +378,131 @@ it("a newer matching completed existing probe permits original canonical receipt
   expect(f.h.cp.outbox.get(id)?.status).toBe("ACKED");
   expect(new Set(http.posts.map((r) => JSON.stringify(r))).size).toBe(1);
   expect(f.h.buzz.sent).toHaveLength(0);
+});
+
+it("a journaled unknown row makes no HTTP calls when a different notice establishes UNSUPPORTED", async () => {
+  const buzz = vi.spyOn(InMemoryBuzzTransport.prototype, "send");
+  const f = await fixture(); http.mode = "lost";
+  const id = notify(f, "unknown-before-refutation");
+  await f.h.cp.outbox.deliverCeoNotifications();
+  http.lostMessageId = id;
+  http.mode = "refused";
+  notify(f, "separate-support-observation");
+  await f.h.cp.outbox.deliverCeoNotifications();
+  expect(events(f, "CEO_NOTIFICATION_PROTOCOL_SUPPORT").at(-1)?.evidence).toMatchObject({ support: "UNSUPPORTED" });
+  const calls = http.request.mock.calls.length;
+  const posts = http.posts.length;
+  await bindBuzz(f);
+  await f.h.buzzAdapter.deliverPending(); // Settle only the independently refused, safely routable notice.
+  expect(buzz.mock.calls.filter(([, content]) => content.includes(id))).toHaveLength(0);
+  buzz.mockClear();
+  const processing = processingOf(f, id);
+  for (let i = 0; i < 3; i++) { await f.h.cp.outbox.deliverCeoNotifications(); await f.h.buzzAdapter.deliverPending(); }
+  expect(http.request).toHaveBeenCalledTimes(calls);
+  const { root, repoPath, clock } = f.h;
+  f.h.cp.close();
+  f.h = makeHarness({ root, repoPath, clock });
+  await start(f); await f.h.buzzAdapter.deliverPending();
+  expect(http.request).toHaveBeenCalledTimes(calls);
+  expect(buzz).not.toHaveBeenCalled();
+  expect(processingOf(f, id)).toEqual(processing);
+  expect(http.posts).toHaveLength(posts);
+  expect(events(f, "CEO_NOTIFICATION_CANONICAL_ATTEMPT").filter((e) => e.evidence["messageId"] === id)).toHaveLength(1);
+  expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
+  expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE").some((e) => e.evidence["messageId"] === id)).toBe(false);
+});
+
+it.each([false, true])("R1-01: verified Buzz works with identity GET 503, prior refusal = %s", async (refuted) => {
+  const f = await fixture();
+  if (refuted) { notify(f, "prior-refusal"); await f.h.cp.outbox.deliverCeoNotifications(); }
+  await bindBuzz(f);
+  http.mode = "notSent";
+  await start(f, true);
+  http.request.mockClear();
+  const id = notify(f, "buzz-without-discovery");
+  await f.h.cp.outbox.deliverCeoNotifications();
+  expect((await f.h.buzzAdapter.deliverPending()).delivered).toContain(id);
+  expect(f.h.cp.outbox.get(id)?.status).toBe("SENT");
+  expect(http.request).not.toHaveBeenCalled();
+  expect(f.h.buzz.sent.filter((s) => s.content.includes(id))).toHaveLength(1);
+});
+
+it("R1-02: a completed authenticated probe alone establishes canonical support", async () => {
+  const f = await fixture(); http.mode = "completed";
+  expect(await probe(f, "initial-support-proof-01")).toMatchObject({ sent: true, sameReceipt: true });
+  await bindBuzz(f);
+  const id = notify(f, "after-initial-probe");
+  await f.h.cp.outbox.deliverCeoNotifications(); await f.h.buzzAdapter.deliverPending();
+  expect(f.h.cp.outbox.get(id)?.status).toBe("ACKED");
+  expect(http.posts.filter((r) => r.text.includes(id))).toHaveLength(1);
+  expect(f.h.buzz.sent).toHaveLength(0);
+});
+
+it("R1-02: a later completed probe recovers support even at the refusal's identical timestamp", async () => {
+  const f = await fixture(); http.mode = "completed";
+  notify(f, "establish-support"); await f.h.cp.outbox.deliverCeoNotifications();
+  http.mode = "lost";
+  const id = notify(f, "unknown-then-refused"); await f.h.cp.outbox.deliverCeoNotifications();
+  http.mode = "refused";
+  await f.h.cp.outbox.deliverCeoNotifications();
+  expect(events(f, "CEO_NOTIFICATION_PROTOCOL_SUPPORT").at(-1)?.evidence).toMatchObject({ support: "UNSUPPORTED" });
+  const at = f.h.clock.nowIso();
+  http.mode = "completed";
+  expect(await probe(f, "same-clock-recovery-01")).toMatchObject({ sent: true, sameReceipt: true });
+  expect(f.h.clock.nowIso()).toBe(at);
+  await f.h.cp.outbox.deliverCeoNotifications();
+  expect(f.h.cp.outbox.get(id)?.status).toBe("ACKED");
+  const bodies = http.posts.filter((r) => r.text.includes(id));
+  expect(new Set(bodies.map((r) => JSON.stringify(r))).size).toBe(1);
+  expect(http.turns.has(bodies[0]!.event_id)).toBe(true);
+  expect(f.h.buzz.sent).toHaveLength(0);
+});
+
+it("R1-02: a later refusal wins over an earlier probe at the same timestamp", async () => {
+  const f = await fixture(); http.mode = "completed";
+  await probe(f, "earlier-support-proof-01");
+  http.mode = "refused";
+  notify(f, "later-refusal"); await f.h.cp.outbox.deliverCeoNotifications();
+  await bindBuzz(f);
+  const calls = http.request.mock.calls.length;
+  const id = notify(f, "after-later-refusal");
+  await f.h.cp.outbox.deliverCeoNotifications();
+  expect((await f.h.buzzAdapter.deliverPending()).delivered).toContain(id);
+  expect(http.request).toHaveBeenCalledTimes(calls);
+});
+
+it("R1-03: 201-part receipt retries retain a complete manifest despite audit array truncation", async () => {
+  const f = await fixture(); http.mode = "completed";
+  notify(f, "verify-large-receiver"); await f.h.cp.outbox.deliverCeoNotifications();
+  http.posts = []; http.turns.clear(); http.mode = "lost";
+  const id = notify(f, "large-manifest", "x".repeat(301000));
+  await f.h.cp.outbox.deliverCeoNotifications();
+  const lost = http.posts.length;
+  const intent = events(f, "CEO_NOTIFICATION_CANONICAL_ATTEMPT").filter((e) => e.evidence["messageId"] === id)[0]!;
+  http.mode = "completed";
+  await f.h.cp.outbox.deliverCeoNotifications();
+  expect(f.h.cp.outbox.get(id)?.status).toBe("ACKED");
+  expect(intent.evidence).toMatchObject({ requestCount: 201, manifestDigest: expect.stringMatching(/^sha256:/) });
+  expect(intent.evidence["requests"]).toHaveLength(200);
+  expect(http.posts).toHaveLength(lost + 201);
+  expect(http.turns.size).toBe(201);
+  expect(JSON.stringify(http.posts[lost])).toBe(JSON.stringify(http.posts[0]));
+  expect(f.h.buzz.sent).toHaveLength(0);
+});
+
+it("verified receiver support cannot release a legacy row", async () => {
+  const f = adoptedFixture(); fixtures.push(f);
+  const id = notify(f, "legacy-stays-held");
+  await start(f);
+  http.mode = "completed";
+  const fresh = notify(f, "independent-supported-notice");
+  await f.h.cp.outbox.deliverCeoNotifications();
+  expect(f.h.cp.outbox.get(fresh)?.status).toBe("ACKED");
+  const calls = http.request.mock.calls.length;
+  await bindBuzz(f);
+  await f.h.cp.outbox.deliverCeoNotifications(); await f.h.buzzAdapter.deliverPending();
+  expect(http.request).toHaveBeenCalledTimes(calls);
+  expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
+  expect(events(f, "CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN")).toHaveLength(1);
+  expect(http.posts.some((r) => r.text.includes(id))).toBe(false);
 });

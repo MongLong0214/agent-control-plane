@@ -182,7 +182,7 @@ it("R3 boundary: the canonical Hermes route re-sends an uncertain notice only as
   const f = adoptedFixture();
   try {
     const bodies: DaemonNoticeBody[] = [];
-    let answer: "UNCERTAIN" | "COMPLETED" = "UNCERTAIN";
+    let answer: "UNCERTAIN" | "COMPLETED" = "COMPLETED";
     const noticeSenderFactory = () => async (body: DaemonNoticeBody): Promise<DaemonNoticeSendOutcome> => {
       bodies.push(body);
       if (answer === "UNCERTAIN") return { kind: "UNCERTAIN", reason: "no answer was read" };
@@ -195,6 +195,11 @@ it("R3 boundary: the canonical Hermes route re-sends an uncertain notice only as
       ports: { authorityHeld: () => true, processStartToken: () => TOKEN, processStartedAt: () => LSTART,
         identityReader: () => async () => ({ session_id: LIVE, lineage_root_digest: DIGEST, process_pid: GATEWAY, process_started_at: TOKEN }),
         noticeSenderFactory } })).toEqual({ started: true });
+    // Receiver support is established independently before any in-doubt receipt lookup.
+    notify(f.h, "verify-canonical-support");
+    await f.h.cp.outbox.deliverCeoNotifications();
+    bodies.length = 0;
+    answer = "UNCERTAIN";
     const id = notify(f.h, "uncertain-canonical");
     await f.h.cp.outbox.deliverCeoNotifications();
     expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
@@ -205,7 +210,7 @@ it("R3 boundary: the canonical Hermes route re-sends an uncertain notice only as
     expect(new Set(bodies.map((body) => body.event_id)).size).toBe(1);
     expect(new Set(bodies.map((body) => body.payload_digest)).size).toBe(1);
     expect(new Set(bodies.map((body) => body.signature)).size).toBe(1);
-    expect(f.h.cp.audit.byKind("CEO_NOTIFICATION_ACCEPTED")).toHaveLength(1);
+    expect(f.h.cp.audit.byKind("CEO_NOTIFICATION_ACCEPTED")).toHaveLength(2);
   } finally { f.h.cp.close(); }
 });
 
