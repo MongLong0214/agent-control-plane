@@ -1,0 +1,22 @@
+Limit: only the exact Buzz refusal mention_policy / 'signer not registered for channel' makes a CEO notification route-not-ready (BUZZ_SIGNER_NOT_REGISTERED, repairable, PENDING, one audit, no timer); readiness compares the daemon's actual sending key with the exact current CEO room's member readback, and a held row resumes once under the same id only after a positive readback and a whole history of pre-post outcomes; the ceo-route-signer ensure adds only the missing daemon member to that exact room (CEO b3d3e886, 169f7e83).
+Warn: adding the daemon member uses the relay's channels add-member under the daemon credential; if the relay refuses that authorization the row stays withheld without repeated joins, and no administrator identity or owner key is ever acquired to force it.
+Record-Id: r-db8e2f8eb96c
+Provenance: inherited 3697ea488a55efd71b258b4a803e97143520a394
+
+Limit: a CEO notification Buzz send re-checks the current holder at the final send fence, so a binding revoked during or after asynchronous readiness gets zero posts; a known-invalid or refused host result stays withheld across sweeps until a validated receipt for the exact current route exists, while a lost response recovers only through roster readback with no re-join; host provisioning gates only the canonical Hermes CEO, and other supported CEO bindings keep their existing delivery (review ACP1199-R1-01..04, CEO eb5ad191).
+Record-Id: r-3f41cef887e0
+Provenance: inherited 3ef0f3bd95bd06e8bc83d7794e572eb3dea61a8a
+
+Limit: a known-invalid or refused signer-readiness result is kept per CEO route, not per signer: a signer rotation, a binding change or a rebuilt adapter never releases it, and only a newer validated receipt for the current binding, the exact room and the actual signer does (review ACP1199-03, CEO eb5ad191 and 508259ea).
+Limit: on retargeting, a CEO notification row takes its delivery state and sent_at from the selected destination's own ledger outcome; an UNKNOWN destination stays not-delivered and resend-held and never inherits another destination's acceptance (review ROUND1-ESCAPE-01).
+Record-Id: r-76a8ed07b56c
+Provenance: inherited 72e422419659a03ba2e439b7be17d9ab141d4e12
+
+Limit: after any retarget, a CEO notification's delivery state is restored only from the selected destination's ledger, whatever the row's prior state or failure class: ACCEPTED becomes SENT with that destination's sent_at, UNKNOWN stays held and not delivered, no entry stays queued; acceptance never creates an ACK, and legacy holds and in-flight suppression stay separate safeguards (review ROUND1-ESCAPE-01 sibling, CEO 8fa870fa).
+Record-Id: r-e8631671fc55
+Provenance: inherited 42cfa73e081a097c5c46eb1daa3305a93b4f9043
+
+Limit: only a genuinely new, verified holder and destination may leave a previous destination's refusal behind, and only an explicit recipient-registration refusal is destination-scoped; a runtime move or rebind that keeps the same holder, recipient or room, or an address notation change, keeps the refusal; credential, send-authority and known-invalid provisioning holds stay separate from the destination ledger; refusals are kept in the audit log and apply again on return; the first send to a new destination still needs its binding, authority and exact-room signer readiness (CEO 6bd2011d).
+Warn: UNKNOWN (PENDING + unknown_observed, delivered false) means delivery unconfirmed with automatic resend held, not proof that nothing was posted; duplicate handling across destinations relies on the message id and processing idempotency.
+Record-Id: r-a74169afd61d
+Provenance: inherited fa55acc502c17e38bf327e2ab630bd07e7ef36e2
