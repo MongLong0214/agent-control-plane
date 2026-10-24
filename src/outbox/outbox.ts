@@ -66,7 +66,9 @@ export interface OutboxMessage extends FencedEnvelope {
 }
 
 /** A readback, never a new durable state. unknown_observed suppresses automatic resend;
- * it proves neither delivery nor completion. Only an authenticated ACK confirms completion. */
+ * it proves neither delivery nor completion. Only an authenticated ACK confirms completion.
+ * delivered=false alone also covers queued/refused rows; OUTCOME_UNKNOWN and automaticResendHeld
+ * distinguish uncertainty. None of those unknown-state fields proves that nothing was posted. */
 export const outboxDeliveryReadback = (message: Pick<OutboxMessage, "status" | "failureClass">) => {
   const held = (message.status === "SENT" || message.status === "PENDING") && message.failureClass === "unknown_observed";
   return {
@@ -152,6 +154,8 @@ export interface DeliveryFailure {
   routeAbsent?: true;
   /** Readiness was verified before this CEO Buzz attempt; delivery still needs its own receipt. */
   buzzSignerReady?: true;
+  /** Only an explicit recipient refusal may be left behind for a genuinely different receiver. */
+  ceoRefusal?: { scope: "DESTINATION" | "SENDER"; targetSessionId: string; bindingGeneration: number; attemptNumber: number };
   /** Exact daemon-signer membership evidence, distinct from a missing receiving route. */
   signerNotRegistered?: { signer: string | null; source: "SEND_REFUSAL" | "READBACK";
     reasonCode?: typeof ReasonCode.BUZZ_SIGNER_NOT_REGISTERED | typeof ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED };
@@ -857,16 +861,22 @@ export const settleStoppedSessionInstructions = (
 /**
  * Every unsettled CEO notification follows the current holder with its sealed content and id.
  * Restore delivery from only the selected room/recipient's ledger, independently of the previous
- * row state. Acceptance proves SENT, never ACKED; UNKNOWN stays held; no entry starts queued.
+ * row state. Acceptance proves SENT, never ACKED; UNKNOWN stays held. An eligible new receiver
+ * with no entry starts queued; refusal history and sender holds are preserved independently.
  * Legacy unknown history is a separate hold, and an outstanding claim is never taken over here.
  */
 const readdressCeoNotifications = (db: Pick<Db, "run">, generation: number, sessionId: string): void => {
   const notCurrent = `kind = 'CEO_NOTIFICATION' AND role_key = 'CEO' AND (binding_generation <> ? OR target_session_id <> ?)`;
-  // Neither a destination receipt nor its absence can settle unlocated pre-journal history.
-  // Move only the holder tuple of these legacy rows, preserving every delivery field.
+  // Legacy unknowns, unscoped older authority refusals and signer re-arm requirements are
+  // separate safety holds. Move only their holder tuple, preserving every delivery field.
   db.run(`UPDATE outbox SET binding_generation = ?, target_session_id = ? WHERE ${notCurrent}
       AND status IN ('PENDING','SENT') AND (
-        EXISTS (SELECT 1 FROM audit_events legacy WHERE legacy.kind = 'CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN'
+        reason_code IN ('BUZZ_SIGNER_NOT_REGISTERED','BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED')
+        OR (failure_class IN ('contract','security') AND NOT EXISTS (
+          SELECT 1 FROM audit_events refused WHERE refused.kind = 'CEO_NOTIFICATION_BUZZ_REFUSED'
+            AND json_extract(refused.evidence_json, '$.messageId') = outbox.message_id
+            AND json_extract(refused.evidence_json, '$.error') = outbox.last_error))
+        OR EXISTS (SELECT 1 FROM audit_events legacy WHERE legacy.kind = 'CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN'
           AND json_extract(legacy.evidence_json, '$.messageId') = outbox.message_id)
         OR (failure_class = 'unknown_observed' AND NOT EXISTS (
           SELECT 1 FROM outbox_sent_destinations sent WHERE sent.message_id = outbox.message_id)))`,
@@ -875,14 +885,38 @@ const readdressCeoNotifications = (db: Pick<Db, "run">, generation: number, sess
   db.run(`WITH destination AS (
       SELECT sent.message_id, sent.outcome, sent.sent_at FROM outbox_sent_destinations sent
         JOIN sessions next ON next.session_id = ? AND next.buzz_address = sent.room AND next.buzz_actor_id = sent.recipient
+      UNION
+      -- A changed address/key on a surviving holder, or another room for the same key,
+      -- is no verified replacement recipient.
+      -- With no exact-room evidence, hold rather than invent acceptance at the new address.
+      SELECT sent.message_id, 'UNKNOWN', NULL FROM outbox_sent_destinations sent
+        JOIN sessions next ON next.session_id = ?
+        JOIN outbox held ON held.message_id = sent.message_id
+        WHERE (next.buzz_actor_id = sent.recipient OR held.binding_generation = ?) AND NOT EXISTS (SELECT 1 FROM outbox_sent_destinations exact
+          WHERE exact.message_id = sent.message_id AND exact.room = next.buzz_address AND exact.recipient = next.buzz_actor_id)
+    ), refusal AS (
+      SELECT json_extract(e.evidence_json, '$.messageId') AS message_id,
+        json_extract(e.evidence_json, '$.failureClass') AS failure_class,
+        json_extract(e.evidence_json, '$.error') AS error,
+        ROW_NUMBER() OVER (PARTITION BY json_extract(e.evidence_json, '$.messageId') ORDER BY CASE json_extract(e.evidence_json, '$.scope') WHEN 'SENDER' THEN 0 ELSE 1 END, e.event_id DESC) AS latest
+      FROM audit_events e JOIN sessions next ON next.session_id = ?
+      WHERE e.kind = 'CEO_NOTIFICATION_BUZZ_REFUSED' AND (
+        json_extract(e.evidence_json, '$.scope') = 'SENDER' OR
+        json_extract(e.evidence_json, '$.recipient') = next.buzz_actor_id OR
+        json_extract(e.evidence_json, '$.targetSessionId') = next.session_id OR
+        EXISTS (SELECT 1 FROM assignments a WHERE a.role_key = 'CEO' AND a.status = 'ACTIVE'
+          AND a.actor_id = json_extract(e.evidence_json, '$.actorId')))
     ) UPDATE outbox SET binding_generation = ?, target_session_id = ?,
       status = CASE ${outcome} WHEN 'ACCEPTED' THEN 'SENT' ELSE 'PENDING' END,
-      failure_class = CASE ${outcome} WHEN 'UNKNOWN' THEN 'unknown_observed' ELSE NULL END,
+      failure_class = CASE ${outcome} WHEN 'ACCEPTED' THEN NULL WHEN 'UNKNOWN' THEN 'unknown_observed'
+        ELSE (SELECT failure_class FROM refusal WHERE message_id = outbox.message_id AND latest = 1) END,
       sent_at = CASE ${outcome} WHEN 'ACCEPTED' THEN (SELECT sent_at FROM destination WHERE message_id = outbox.message_id) ELSE NULL END,
       claim_token = NULL, claimed_at = NULL, retry_eligible = 0, next_attempt_at = NULL, reason_code = NULL,
-      last_error = CASE ${outcome} WHEN 'UNKNOWN' THEN 'withheld: this destination has an unknown send outcome; awaiting its ACK' ELSE NULL END
+      last_error = CASE ${outcome} WHEN 'ACCEPTED' THEN NULL
+        WHEN 'UNKNOWN' THEN 'delivery unconfirmed, automatic resend held; awaiting its ACK'
+        ELSE (SELECT error FROM refusal WHERE message_id = outbox.message_id AND latest = 1) END
       WHERE ${notCurrent} AND status IN ('PENDING','SENT')`,
-  [sessionId, generation, sessionId, generation, sessionId]);
+  [sessionId, sessionId, generation, sessionId, generation, sessionId, generation, sessionId]);
 };
 
 /**
@@ -1677,7 +1711,8 @@ export class Outbox {
         ? "withheld: the relay already accepted this message at this room and recipient; awaiting its ACK"
         : "withheld: a send of this message to this room and recipient has an unknown outcome and may be there; " +
           "awaiting its ACK, or a holder at another destination";
-      // New CEO failures after verified readiness remain unsent. Preserve old SENT records.
+      // PENDING with unknown_observed means delivery unconfirmed, not proof that nothing posted.
+      // Preserve old SENT records; neither representation proves completion.
       const status = outcome === "UNKNOWN" && this.db.get(`SELECT 1 FROM outbox
         WHERE message_id = ? AND kind = 'CEO_NOTIFICATION' AND sent_at IS NULL`, [messageId]) ? "PENDING" : "SENT";
       const changes = this.db.run(
@@ -1790,6 +1825,16 @@ export class Outbox {
       return this.#markSignerNotReady(messageId, claimToken, failure);
     }
     const classified = normalizeFailure(failure);
+    if (typeof failure === "object" && failure.ceoRefusal && failure.destination &&
+      !failure.routeAbsent && (classified.failureClass === "contract" || classified.failureClass === "security")) {
+      const actor = this.db.get<{ actor_id: string }>("SELECT actor_id FROM assignments WHERE role_key = 'CEO' AND binding_generation = ?",
+        [failure.ceoRefusal.bindingGeneration]);
+      const recorded = this.audit.record({ kind: "CEO_NOTIFICATION_BUZZ_REFUSED", sessionId: failure.ceoRefusal.targetSessionId,
+        evidence: { messageId, ...failure.destination, ...failure.ceoRefusal, actorId: actor?.actor_id ?? null,
+          failureClass: classified.failureClass, error: classified.error.slice(0, 500) } });
+      if (!recorded.allowed) throw new Error("Buzz refusal history was not recorded");
+    }
+
     // FCR-10, FCR-14: the in-flight send this attempt recorded settles here, whether or not this claim
     // is still held (a handover may have taken the row while the send was pending): an unknown outcome
     // stays on record as UNKNOWN, as an accepted send's ACCEPTED does (`recordAcceptedSend`), so no

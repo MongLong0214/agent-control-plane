@@ -8,7 +8,7 @@ import type * as Http from "node:http";
 
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { Role } from "../../src/domain/types.ts";
+import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { createConfiguredHermesGatewayDaemonNoticeTarget, startConfiguredCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
 import { currentCanonicalCeoBuzzRoute } from "../../src/outbox/ceo-buzz-signer.ts";
 import { HostProvisionerError, type HostAllocation, type HostObservation, type HostOperation } from "../../src/runtime/host-project-provisioner.ts";
@@ -1050,5 +1050,61 @@ it.each([
   record(receipt);
   await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
   expect(send).toHaveBeenCalledTimes(1); expect(f.h.cp.outbox.get(id)?.status).toBe("SENT");
+  expect(invoke).toHaveBeenCalledTimes(1);
+});
+
+
+it.each([false, true])("CEO 6bd2011d: invalid provisioning survives a new-destination takeover; canonical history = %s", async canonicalHistory => {
+  const { f, room, invoke, signer, readback, setMember } = await systemicFixture();
+  // Exercise both the ordinary Buzz route and the canonical route's independent history fence.
+  if (canonicalHistory) f.h.cp.sessions.setBuzzAddress(f.gatewaySessionId, null);
+  const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  if (canonicalHistory) {
+    f.h.cp.sessions.setBuzzAddress(f.gatewaySessionId, room);
+    await f.h.cp.outbox.deliverCeoNotifications();
+  }
+  invoke.mockImplementationOnce(async (_op, allocation) => {
+    if (!("mode" in allocation)) throw new Error("unexpected allocation");
+    setMember(true);
+    return { ceoBuzzSigner: { route: { ...allocation.route, roomId: "wrong-room" }, signer, changed: true, rosterVerified: true } };
+  });
+  const send = vi.spyOn(f.h.buzz, "send");
+  await f.h.buzzAdapter.deliverPending();
+  const oldRoute = currentCanonicalCeoBuzzRoute(f.h.cp.db)!;
+  expect(events(f, "CEO_BUZZ_SIGNER_ENSURE").at(-1)?.evidence.state).toBe("INVALID");
+  const next = f.h.cp.sessions.create({ provider: "hermes", model: "next-ceo", buzzAddress: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" });
+  expect(f.h.cp.sessions.transition(next.sessionId, SessionLifecycle.READY, "ready").allowed).toBe(true);
+  expect(f.h.cp.sessions.bindBuzzActor({ sessionId: next.sessionId, sessionSecret: next.sessionSecret!, buzzActorId: "next-ceo-key" },
+    { isAllowedActor: () => true }).allowed).toBe(true);
+  expect(f.h.cp.bindings.switchTo({ role: Role.CEO, sessionId: next.sessionId, conversation: "REPLACED", takeover: true,
+    reason: "new verified recipient" }).allowed).toBe(true);
+  readback.mockResolvedValue({ signer, registered: true });
+  for (let n = 0; n < 2; n++) { await f.h.buzzAdapter.deliverPending(); expect(send).not.toHaveBeenCalled(); }
+  expect(invoke).toHaveBeenCalledTimes(1);
+  if (!canonicalHistory) return; // No canonical target exists here: no supported ensure or receipt may be invented.
+  // Bind the replacement's own canonical target through the existing authenticated boundary.
+  expect(f.h.cp.bindings.revoke("CEO", "attest current target").allowed).toBe(true);
+  const claimed = { executorKind: "hermes", targetLocator: "next-live-target", targetLocatorDigest: DIGEST };
+  let receipt: unknown; let attestationDigest = "";
+  expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId: next.sessionId, authenticatedTarget: {
+    claimed, protocolVersion: "hermes.target-bind/v1", expectedExecutorRuntimeIdentity: RUNTIME,
+    get targetBindReceipt() { return receipt; }, get attestationDigest() { return attestationDigest; },
+    verify: tuple => {
+      const fields = { domain: "hermes.target-bind", version: 1, actor_id: tuple.actorId, binding_generation: tuple.generation,
+        executor_runtime_identity: RUNTIME, requested_session_id: claimed.targetLocator, lineage_root_digest: DIGEST };
+      attestationDigest = digestOf(fields); receipt = { ...fields, receipt_digest: attestationDigest }; return claimed;
+    },
+  } }).allowed).toBe(true);
+  await f.h.cp.outbox.deliverCeoNotifications();
+  const route = currentCanonicalCeoBuzzRoute(f.h.cp.db)!;
+  expect(route.roomId).not.toBe(oldRoute.roomId); expect(route.recipient).not.toBe(oldRoute.recipient);
+  const record = (current: typeof route) => f.h.cp.audit.record({ kind: "CEO_BUZZ_SIGNER_ENSURE", evidence: {
+    route: current, signer, ensureDigest: digestOf({ route: current, signer }), state: "SUCCEEDED",
+    receipt: { route: current, signer, changed: false, rosterVerified: true } } });
+  record(oldRoute); await f.h.buzzAdapter.deliverPending(); expect(send).not.toHaveBeenCalled();
+  record(route);
+  await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(f.h.cp.outbox.get(id)).toMatchObject({ messageId: id, status: "SENT" });
   expect(invoke).toHaveBeenCalledTimes(1);
 });

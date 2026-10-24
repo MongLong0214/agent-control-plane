@@ -304,7 +304,7 @@ it.each(["queued", "contract"] as const)("R3-PROBE: pending %s intermediate dest
     await f.h.buzzAdapter.deliverPending(); // B UNKNOWN.
     const third = readyCeo(f.h, { room: "third-room", identity: "third-key" }); bind(third.sessionId);
     if (intermediate === "contract") {
-      f.send.mockRejectedValueOnce(new Error("mention_policy: recipient not registered for channel"));
+      f.send.mockRejectedValueOnce(new Error('buzz send failed: {"error":"mention_policy","message":"recipient not registered for channel","retryable":false}'));
       await f.h.buzzAdapter.deliverPending(); // C confirmed refusal.
     }
     const sent = sendsOf(f.send, id);
@@ -331,7 +331,7 @@ it.each(retargetStates.flatMap(previous => selectedStates.flatMap(selected =>
     try {
       const id = notify(f.h, `matrix-${previous}-${selected}`);
       const sealed = f.h.cp.outbox.get(id)!;
-      const refusal = new Error("mention_policy: recipient not registered for channel");
+      const refusal = new Error('buzz send failed: {"error":"mention_policy","message":"recipient not registered for channel","retryable":false}');
       if (selected !== "unseen") {
         if (selected === "UNKNOWN") f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
         if (selected === "refused") f.send.mockRejectedValueOnce(refusal);
@@ -359,14 +359,11 @@ it.each(retargetStates.flatMap(previous => selectedStates.flatMap(selected =>
         failure_class: previous === "UNKNOWN" ? "unknown_observed" : previous === "contract-refused" ? "contract" : null });
       const sent = sendsOf(f.send, id);
       bind(f.first.sessionId);
-      const matching = selected === "accepted" || selected === "UNKNOWN";
-      // Confirmed refusal removes PENDING_SEND: with no durable destination evidence,
-      // the selected destination starts queued and may make one new attempt.
-      if (selected === "refused") f.send.mockRejectedValueOnce(refusal);
+      // Refusal history belongs to this destination and must hold again on return.
       const check = (sweep: number) => {
         const delivered = selected === "accepted" || (selected === "unseen" && sweep > 0);
         const unknown = selected === "UNKNOWN";
-        const contract = selected === "refused" && sweep > 0;
+        const contract = selected === "refused";
         const row = f.h.cp.outbox.get(id)!;
         const ledger = f.h.cp.db.get<{ outcome: string; sent_at: string | null }>(
           "SELECT outcome, sent_at FROM outbox_sent_destinations WHERE message_id = ? AND room = ? AND recipient = ?",
@@ -381,7 +378,7 @@ it.each(retargetStates.flatMap(previous => selectedStates.flatMap(selected =>
           "SELECT sent_at, acked_at FROM outbox WHERE message_id = ?", [id])!;
         expect.soft(timestamps.acked_at).toBeNull();
         expect.soft(timestamps.sent_at).toBe(ledger?.outcome === "ACCEPTED" ? ledger.sent_at : null);
-        expect.soft(sendsOf(f.send, id)).toBe(sent + (!matching && sweep > 0 ? 1 : 0));
+        expect.soft(sendsOf(f.send, id)).toBe(sent + (selected === "unseen" && sweep > 0 ? 1 : 0));
       };
       check(0);
       for (const sweep of [1, 2]) { await f.h.buzzAdapter.deliverPending(); check(sweep); }
@@ -443,5 +440,33 @@ it.each(["rebind", "takeover"] as const)("R3-LEGACY: %s with matching evidence c
     await f.h.buzzAdapter.deliverPending(); await f.h.buzzAdapter.deliverPending();
     expect(snapshot()).toEqual(held); expect(snapshot()).toHaveLength(12);
     expect(f.send).toHaveBeenCalledTimes(12);
+  } finally { f.h.cp.close(); }
+});
+
+
+it.each((["UNKNOWN", "ACCEPTED"] as const).flatMap(outcome =>
+  (["same-key rebind", "surviving holder"] as const).map(mode => [outcome, mode] as const)))(
+  "CEO 6bd2011d: %s history cannot replay for a %s", async (outcome, mode) => {
+  const f = buzzCeo(true);
+  try {
+    const id = notify(f.h, `same-recipient-${outcome}`);
+    if (outcome === "UNKNOWN") f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
+    await f.h.buzzAdapter.deliverPending();
+    expect(f.h.cp.sessions.transition(f.first.sessionId, SessionLifecycle.STOPPED, "replaced").allowed).toBe(true);
+    const recipient = mode === "surviving holder" ? "changed-key" : "first-key";
+    const next = readyCeo(f.h, { room: "first-room-alias", identity: recipient });
+    if (mode === "surviving holder") {
+      expect(f.h.cp.bindings.switchTo({ role: Role.CEO, sessionId: next.sessionId, conversation: "SURVIVED", reason: "runtime move" }).allowed).toBe(true);
+    } else {
+      expect(f.h.cp.bindings.revoke("CEO", "runtime replacement").allowed).toBe(true);
+      expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId: next.sessionId }).allowed).toBe(true);
+    }
+    for (let n = 0; n < 2; n++) {
+      await f.h.buzzAdapter.deliverPending();
+      expect(sendsOf(f.send, id)).toBe(1);
+      expect(outboxDeliveryReadback(f.h.cp.outbox.get(id)!)).toMatchObject({ delivered: false, automaticResendHeld: true, completed: false });
+    }
+    expect(f.h.cp.outbox.sentTo(id, { room: "first-room", recipient: "first-key" })).toBe(outcome);
+    expect(f.h.cp.outbox.sentTo(id, { room: "first-room-alias", recipient })).toBeNull();
   } finally { f.h.cp.close(); }
 });

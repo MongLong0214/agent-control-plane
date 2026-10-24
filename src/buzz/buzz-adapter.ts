@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 
 import { canonicalJson, digestOf } from "../core/digest.ts";
 import { HostProvisionerError, hostObservationSchema, type HostProjectProvisioner } from "../runtime/host-project-provisioner.ts";
-import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner, isBuzzSignerRefusal, type CanonicalCeoBuzzRoute } from "../outbox/ceo-buzz-signer.ts";
+import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner, isBuzzRecipientRefusal, isBuzzSignerRefusal, type CanonicalCeoBuzzRoute } from "../outbox/ceo-buzz-signer.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 
 import type { Clock } from "../core/clock.ts";
@@ -538,7 +538,7 @@ export class BuzzAdapter {
       canonicalJson(parsed.data.ceoBuzzSigner.route) === canonicalJson(route);
   }
 
-  #invalidEnsure(route: CanonicalCeoBuzzRoute, signer: string): boolean {
+  #invalidEnsure(route: CanonicalCeoBuzzRoute | null, signer: string | null): boolean {
     // There is one systemic CEO route. Neither a new signer nor a new binding can hide its refusal.
     const history = this.db.all<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events
       WHERE kind = 'CEO_BUZZ_SIGNER_ENSURE' ORDER BY rowid`);
@@ -547,7 +547,7 @@ export class BuzzAdapter {
       const evidence = JSON.parse(event.evidence_json);
       if (['INVALID','REFUSED','FAILED'].includes(evidence.state)) invalid = true;
       if (evidence.state === 'SUCCEEDED') {
-        if (this.#validatedReceipt(evidence.receipt, route, signer)) invalid = false;
+        if (route && signer && this.#validatedReceipt(evidence.receipt, route, signer)) invalid = false;
         else if (!this.#validatedReceipt(evidence.receipt, evidence.route, evidence.signer)) invalid = true;
       }
     }
@@ -556,7 +556,10 @@ export class BuzzAdapter {
 
   /** Read-only target lookup is separate from ensure-buzz's sole provisioning effect. */
   async #ceoSignerReadiness(message: OutboxMessage, room: string, recipient: string): Promise<BuzzSignerReadiness | null> {
-    if (!this.#hostGatesCeo(message)) return this.#signerReadiness(room);
+    if (!this.#hostGatesCeo(message)) {
+      const ready = await this.#signerReadiness(room);
+      return this.#invalidEnsure(this.#currentCeoRoute(message, room, recipient), ready?.signer ?? null) ? null : ready;
+    }
     const route = this.#currentCeoRoute(message, room, recipient);
     if (!route) return null;
     const stillCurrent = () => canonicalJson(this.#currentCeoRoute(message, room, recipient)) === canonicalJson(route);
@@ -732,7 +735,9 @@ export class BuzzAdapter {
       // Fence this destination across the asynchronous roster read, too.
       this.outbox.recordSendInFlight(message.messageId, destination);
       const readiness = message.kind === MessageKind.CEO_NOTIFICATION ? await this.#ceoSignerReadiness(message, channel, recipient) : null;
-      if ((readiness && !readiness.registered) || (message.kind === MessageKind.CEO_NOTIFICATION && this.#hostGatesCeo(message) && !readiness)) {
+      if ((readiness && !readiness.registered) || (message.kind === MessageKind.CEO_NOTIFICATION &&
+        ((this.#hostGatesCeo(message) && !readiness) ||
+          this.#invalidEnsure(this.#currentCeoRoute(message, channel, recipient), readiness?.signer ?? null)))) {
         this.outbox.markAttemptFailed(message.messageId, message.claimToken, {
           failureClass: "repairable", retryable: false,
           error: readiness ? "Buzz roster does not include the daemon signer in the target room" : "CEO signer provisioning/readback is unverified",
@@ -767,6 +772,10 @@ export class BuzzAdapter {
           message.messageId,
           message.claimToken,
           { ...classifyTransportFailure(err), destination,
+            ...(message.kind === MessageKind.CEO_NOTIFICATION ? { ceoRefusal: {
+              scope: isBuzzRecipientRefusal(err instanceof Error ? err.message : String(err)) ? "DESTINATION" as const : "SENDER" as const,
+              targetSessionId: message.targetSessionId, bindingGeneration: message.bindingGeneration, attemptNumber: message.attempts + 1,
+            } } : {}),
             ...(message.kind === MessageKind.CEO_NOTIFICATION && readiness?.registered ? { buzzSignerReady: true as const } : {}),
             ...(message.kind === MessageKind.CEO_NOTIFICATION &&
               isBuzzSignerRefusal(err instanceof Error ? err.message : String(err))

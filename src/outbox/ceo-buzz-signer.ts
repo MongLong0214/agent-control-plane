@@ -23,6 +23,16 @@ export const isBuzzSignerRefusal = (message: string): boolean => {
   } catch { return false; }
 };
 
+/** Only this explicit recipient refusal is limited to the receiving destination. */
+export const isBuzzRecipientRefusal = (message: string): boolean => {
+  const prefix = "buzz send failed: ";
+  if (!message.startsWith(prefix)) return false;
+  try {
+    const body = JSON.parse(message.slice(prefix.length));
+    return body?.error === "mention_policy" && body?.message === "recipient not registered for channel";
+  } catch { return false; }
+};
+
 /** Counts never clear unknowns: every counted attempt must have pre-post evidence. The single
  * pre-fix Buzz attempt can be recovered from its exact last_error, because attempts never reset
  * and every possibly posted Buzz destination persists. No inference covers a second missing result.
@@ -34,7 +44,7 @@ export const ceoBuzzHistoryIsPrePost = (db: Db, row: {
   if (row.sent_at || db.get("SELECT 1 FROM outbox_sent_destinations WHERE message_id = ?", [row.message_id])) return false;
   const history = db.all<{ kind: string; evidence_json: string }>(`SELECT kind, evidence_json FROM audit_events
     WHERE kind IN ('CEO_NOTIFICATION_CANONICAL_ATTEMPT','CEO_NOTIFICATION_CANONICAL_RESULT',
-      'CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN','CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY')
+      'CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN','CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY','CEO_NOTIFICATION_BUZZ_REFUSED')
       AND json_extract(evidence_json, '$.messageId') = ? ORDER BY rowid`, [row.message_id]);
   if (history.some(e => e.kind === "CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN")) return false;
   const attempts = history.filter(e => e.kind === "CEO_NOTIFICATION_CANONICAL_ATTEMPT").map(e => JSON.parse(e.evidence_json));
@@ -45,7 +55,10 @@ export const ceoBuzzHistoryIsPrePost = (db: Db, row: {
   const pauses = history.filter(e => e.kind === "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY").map(e => JSON.parse(e.evidence_json));
   if (pauses.some(p => !Number.isSafeInteger(p.attemptNumber) || p.attemptNumber < 1 || p.attemptNumber > row.attempts ||
     !(p.source === "READBACK" || (p.code === "mention_policy" && p.message === "signer not registered for channel")))) return false;
-  const accounted = attempts.length + new Set(pauses.map(p => p.attemptNumber)).size;
+  const refusals = history.filter(e => e.kind === "CEO_NOTIFICATION_BUZZ_REFUSED").map(e => JSON.parse(e.evidence_json));
+  if (refusals.some(r => r.scope !== "DESTINATION" || !isBuzzRecipientRefusal(r.error) ||
+    !Number.isSafeInteger(r.attemptNumber) || r.attemptNumber < 1 || r.attemptNumber > row.attempts)) return false;
+  const accounted = attempts.length + new Set([...pauses, ...refusals].map(p => p.attemptNumber)).size;
   return row.attempts === accounted || (row.failure_class === "contract" && row.attempts === accounted + 1 &&
     isBuzzSignerRefusal(row.last_error ?? ""));
 };
