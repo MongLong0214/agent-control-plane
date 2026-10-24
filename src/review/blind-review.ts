@@ -583,7 +583,9 @@ export class BlindReviewGate {
         inputs,
         this.buildBootstrapPlanPrompt(inputs, expected),
         reviewer.value,
-        BOOTSTRAP_PLAN_REVIEWER_SYSTEM_PROMPT,
+        BOOTSTRAP_PLAN_REVIEWER_SYSTEM_PROMPT + (inputs.outputs.authenticatedCeoDecisions?.length
+          ? " Also account for the separately labelled authenticated CEO decisions from ACP records as the CEO's acceptance judgment. They do not prove tests passed or replace original verification evidence. Worker/CTO reasoning, chat history and producer self-assessment remain withheld."
+          : ""),
       );
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
       // Review round 1 (RF-REVIEW-02) — the reviewer answered asynchronously, and `plan_submit` may
@@ -1661,6 +1663,12 @@ export class BlindReviewGate {
       JSON.stringify(inputs.intent, null, 2),
       "```",
       "",
+      ...(inputs.outputs.authenticatedCeoDecisions?.length ? [
+        "## Authenticated CEO decisions (ACP records)",
+        "These are the CEO's acceptance judgment, with ACP source identity and record digests frozen at PLAN submission.",
+        "They are distinct from original verification evidence of tests and from producer statements. Worker/CTO reasoning, chat history and producer self-assessment remain withheld.",
+        "```json", JSON.stringify(inputs.outputs.authenticatedCeoDecisions, null, 2), "```", "",
+      ] : []),
       "## Project manifest",
       "```json",
       JSON.stringify(inputs.manifest, null, 2),
@@ -1789,6 +1797,9 @@ export class BlindReviewGate {
         snapshotManifest: true,
         diff: !planReview,
         verificationEvidence: !planReview,
+        // Bootstrap context includes the separately labelled ACP CEO records, when present;
+        // they are acceptance judgments, never verification evidence. Their exact set is bound
+        // by bootstrapPlan's PLAN and planned-output digests in this existing evidence envelope.
         projectContext: planReview || input.contractChange !== null,
         withheld: [...LOGICAL_WITHHELD_INPUTS],
         binaryArtifacts: input.binaryArtifacts,

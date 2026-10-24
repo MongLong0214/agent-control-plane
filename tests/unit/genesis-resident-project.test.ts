@@ -5,7 +5,7 @@ import { readProcessStartToken } from '../../src/core/process-argv.ts';
 import { CanonicalSelfClaim, hostSessionRegistryAbsent } from '../../src/registry/canonical-self-claim.ts';
 import { Daemon } from '../../src/daemon/daemon.ts';
 import { reviewBootstrapPlan } from '../helpers/bootstrap-plan.ts';
-import { dispatchBootstrapRun, decideThroughHermes } from '../helpers/harness.ts';
+import { bindCeo, dispatchBootstrapRun, decideThroughHermes } from '../helpers/harness.ts';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs';
@@ -74,6 +74,45 @@ describe('inline genesis bootstrap',() => {
     expect(port.opens).toBe(1);expect(port.merges).toBe(1);
     expect(port.writes.filter(w => w.method === 'pushBranch')).toHaveLength(1);
     vi.unstubAllEnvs();
+  });
+  it.each(["pending", "missing", "failure", "cancelled", "skipped", "wrong-sha", "wrong-workflow", "unknown"] as const)("blocks all later writes at merged main with %s CI, then rechecks M on resume", async state => {
+    const f = planFixture(); const root = tempDir("merged-main-"); const port = new GenesisGitHub(root);
+    port.mergeCiState = state;
+    const input = {plan: executablePlanOf(f.outputs, f.binding.planDigest), workDir: join(root,"work"), approvedFiles:f.outputs.files,
+      github:{port,authority:{owner:"acme",visibility:"public" as const,approvedOperations:f.outputs.githubOperations.map(({operationId,resourceIdentity,resourceType})=>({operationId,resourceIdentity,resourceType}))}}};
+    const blocked = await produceRepoFactoryResult(input);
+    expect(blocked.allowed).toBe(false);
+    expect(port.merges).toBe(1);
+    expect(port.events).not.toContain("create-dev");
+    expect(port.events).not.toContain("set-default-branch");
+    expect(port.resources).toBeNull();
+    expect(blocked.evidence["refusal"]).toBe(["pending","missing"].includes(state) ? "GENESIS_POST_MERGE_CI_PENDING" : "GENESIS_POST_MERGE_CI_REFUSED");
+    const ledgerPath = join(root,"work/github-ledger/primary.json");
+    expect(readFileSync(ledgerPath,"utf8")).not.toContain('"postMergeVerification"');
+    port.mergeCiState = "success";
+    const done = await produceRepoFactoryResult(input);
+    expect(done.allowed, done.allowed ? "" : done.message).toBe(true);
+    const ledger = JSON.parse(readFileSync(ledgerPath,"utf8")) as {receipts:Array<{resourceIdentity:string;observed:unknown}>};
+    expect(ledger.receipts.find(r=>r.resourceIdentity.endsWith("#genesis-merge"))!.observed).toMatchObject({postMergeVerification:{headSha:port.pull!.mergeCommitSha,checkNames:["test"],conclusion:"success"}});
+    expect(port.merges).toBe(1);
+    const main = port.pull!.mergeCommitSha!;
+    await git(port.repository("acme","fixture")!.bare,["update-ref","refs/heads/main",port.pull!.headSha,main]);
+    const drift = await produceRepoFactoryResult({...input,checkoutPath:join(root,"work/repositories/retry-main-drift")});
+    expect(drift.allowed).toBe(false);
+    expect(drift.evidence["refusal"]).toBe("GENESIS_MERGE_DRIFT");
+  });
+  it('requires postMergeCommands in addition to the repository role workflow checks at M',async()=>{
+    const f=planFixture();const root=tempDir('merged-extra-check-');const port=new GenesisGitHub(root);
+    port.mergeCiCheckName="after-merge";port.mergeCiState="failure";
+    const plan={...executablePlanOf(f.outputs,f.binding.planDigest),postMergeCommands:["after-merge"]};
+    const input={plan,workDir:join(root,"work"),approvedFiles:f.outputs.files,github:{port,authority:{owner:"acme",visibility:"public" as const,approvedOperations:f.outputs.githubOperations.map(({operationId,resourceIdentity,resourceType})=>({operationId,resourceIdentity,resourceType}))}}};
+    const refused=await produceRepoFactoryResult(input);
+    expect(refused.allowed).toBe(false);expect(refused.evidence["refusal"]).toBe("GENESIS_POST_MERGE_CI_REFUSED");
+    expect(port.events).not.toContain("create-dev");
+    port.mergeCiState="success";
+    const success=await produceRepoFactoryResult(input);expect(success.allowed,JSON.stringify(success)).toBe(true);
+    const ledger=JSON.parse(readFileSync(join(root,"work/github-ledger/primary.json"),"utf8")) as {receipts:Array<{resourceIdentity:string;observed:unknown}>};
+    expect(ledger.receipts.find(r=>r.resourceIdentity.endsWith("#genesis-merge"))!.observed).toMatchObject({postMergeVerification:{headSha:port.pull!.mergeCommitSha,checkNames:["test","after-merge"]}});
   });
   it.each(Array.from({length:12},(_,i)=>i))('resumes crash before receipt %i without duplicate PR, merge, resources or direct main push',async crashAt => {
     const f=planFixture();const root=tempDir('genesis-crash-');const port=new GenesisGitHub(root);
@@ -254,7 +293,15 @@ it('completes a reviewed genesis bootstrap on its resident claim and same-sessio
   h.cp.bootstrapProducer.attachWriterLock(() => true);
   const run = h.cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:'STANDARD',contract});if (!run.allowed) throw new Error(run.message);
   await dispatchBootstrapRun(h.cp,h.clock,run.value.runId);
-  const f = planFixture();const reviewed = await reviewBootstrapPlan(h,run.value.runId,{...f.artifact.content,requestDigest:h.cp.runs.get(run.value.runId)!.contractDigest});
+  const ceoSessionId = bindCeo(h);
+  for (const resolution of ["Accept stage-one bootstrap; verify seeded issue acceptance in follow-on STANDARD_WORK.","The resident CTO owns every seeded issue's follow-on acceptance."]) {
+    const opened = h.cp.ceo.openEscalation({runId:run.value.runId,openedBySessionId:h.cp.runs.require(run.value.runId).ownerSessionId!,openedAt:h.clock.nowIso(),question:"stage split?",options:["yes"],ctoRecommendation:"yes",whyItMatters:"acceptance",blocksCriticalPath:true});
+    if (!opened.allowed) throw new Error(opened.message);
+    expect(h.cp.ceo.resolveEscalation(run.value.runId,resolution,ceoSessionId,{escalationId:opened.value.escalationId!}).allowed).toBe(true);
+  }
+  const f = planFixture();
+  const genesis = {...f.genesis,issues:Array.from({length:7},(_,i)=>({...f.genesis.issues[0]!,key:`issue-${i+1}`,title:`Seeded issue ${i+1}`,body:`Acceptance for seeded issue ${i+1}`}))};
+  const reviewed = await reviewBootstrapPlan(h,run.value.runId,{...f.artifact.content,genesis,githubOperations:undefined,summary:"이번 단계는 부트스트랩까지만 수행하고 각 이슈의 인수 조건 검증은 후속 작업에서 진행한다",requestDigest:h.cp.runs.get(run.value.runId)!.contractDigest});
   const refused = await h.cp.bootstrapProducer.produceAndActivateApproved({runId:run.value.runId,candidateSnapshotDigest:'unreviewed-candidate',ceoSessionId:reviewed.ceoSessionId});
   expect(refused.allowed).toBe(false);expect(h.cp.residentProjects.row(run.value.runId)).toBeUndefined();
   const first = await decideThroughHermes(h,{runId:run.value.runId,decision:'CONFIRM',candidateSnapshotDigest:reviewed.snapshotDigest,ceoSessionId:reviewed.ceoSessionId,rationale:'create and activate'});
@@ -266,6 +313,25 @@ it('completes a reviewed genesis bootstrap on its resident claim and same-sessio
   const recipient = h.cp.sessions.require(pending.to_session_id);
   const peer = {sessionId:recipient.sessionId,incarnation:recipient.incarnation};
   const message = h.cp.outbox.byIdempotencyKey(`bootstrap-handoff:${pending.handoff_id}`)!;
+  const originalPayload = JSON.stringify(message.payload);
+  const delivered = (message.payload as {handoff:{recentDecisions:string[];queuedWork:unknown[];recommendedNextAction:string}}).handoff;
+  const frozen = h.cp.artifacts.latest<{authenticatedCeoDecisions:unknown[]}>(run.value.runId,"PLAN")!.content.authenticatedCeoDecisions;
+  expect(delivered.recentDecisions.map(x=>JSON.parse(x) as {authenticatedCeoDecision?:unknown}).filter(x=>x.authenticatedCeoDecision).map(x=>x.authenticatedCeoDecision)).toEqual(frozen);
+  expect(frozen).toHaveLength(2);
+  expect(delivered.queuedWork).toEqual([]);
+  expect(delivered.recommendedNextAction).toContain("existing runs");
+  for (const issue of genesis.issues) expect(delivered.recommendedNextAction).toContain(issue.body);
+  const confirmation = {runId:run.value.runId,candidateSnapshotDigest:reviewed.snapshotDigest,ceoSessionId:reviewed.ceoSessionId,rationale:"create and activate"};
+  for (const state of ["pending","failure"] as const) {
+    port.mergeCiState = state;
+    const retry = await h.cp.bootstrapProducer.produceAndActivateApproved(confirmation);
+    expect(retry.allowed).toBe(false);
+    expect(retry.evidence["refusal"],JSON.stringify(retry)).toBe(state === "pending" ? "GENESIS_POST_MERGE_CI_PENDING" : "GENESIS_POST_MERGE_CI_REFUSED");
+    expect(h.cp.runs.require(run.value.runId).state).not.toBe("COMPLETED");
+    expect(JSON.stringify(h.cp.outbox.get(message.messageId)!.payload)).toBe(originalPayload);
+  }
+  port.mergeCiState = "success";
+
   const listed = await callCtoTool(h,peer,'role_dispatch_pending');
   expect(listed).toMatchObject({ok:true,value:{messages:expect.arrayContaining([
     expect.objectContaining({messageId:message.messageId,kind:'HANDOFF_PACKAGE',payload:expect.objectContaining({handoffId:pending.handoff_id})}),
@@ -284,6 +350,7 @@ it('completes a reviewed genesis bootstrap on its resident claim and same-sessio
   await daemon.resumeResidentProjects();
   expect(h.cp.runs.get(run.value.runId)?.state).toBe('COMPLETED');
   expect(h.cp.residentProjects.row(run.value.runId)?.status).toBe('COMPLETE');
+  expect(JSON.stringify(h.cp.outbox.get(message.messageId)!.payload)).toBe(originalPayload);
   expect(port.writes.filter(w => w.method === 'pushBranch')).toHaveLength(1);
   expect(h.cp.sessions.get(pending.to_session_id)?.provider).toBe('claude');
   probe.mockRestore();h.cp.close();

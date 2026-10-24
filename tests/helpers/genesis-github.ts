@@ -75,6 +75,8 @@ export type CiProvenance = "approved" | "other-workflow" | "none";
 export class GenesisGitHub extends FakeGitHub {
   resources: Record<string, unknown> | null = null;
   ciReady = true;
+  mergeCiState: "success" | "pending" | "failure" | "cancelled" | "skipped" | "missing" | "wrong-sha" | "wrong-workflow" | "unknown" = "success";
+  mergeCiCheckName: string | null = null;
   ciProvenance: CiProvenance = "approved";
   ciHeads: string[] = [];
   pull: GenesisPull | null = null;
@@ -172,6 +174,27 @@ export class GenesisGitHub extends FakeGitHub {
     const checks = await observeApprovedWorkflowChecks(this.rest(target), { root: `/repos/${target.owner}/${target.name}`, owner: target.owner, repo: target.name, head, workflows });
     this.lose("verify-ci");
     return checks.state === "success";
+  }
+
+  async observeGenesisPostMergeCi(target: Target, head: string, workflows: readonly ApprovedActionsWorkflow[], requiredChecks: readonly string[]) {
+    this.ciHeads.push(head);
+    if (this.mergeCiState === "unknown") throw new Error("CI observation unavailable");
+    const client = this.rest(target);
+    return observeApprovedWorkflowChecks({request: async <T>(method: Parameters<GitHubClient["request"]>[0], path: string, body?: unknown): Promise<T> => {
+      const answer = await client.request<T>(method, path, body);
+      if (path.includes("/check-runs?")) {
+        const result = answer as {check_runs: Array<Record<string, unknown>>};
+        if (this.mergeCiState === "missing") result.check_runs = [];
+        for (const check of result.check_runs) {
+          if (this.mergeCiCheckName !== null && check["name"] !== this.mergeCiCheckName) continue;
+          if (this.mergeCiState === "pending") check["status"] = "in_progress";
+          if (["failure", "cancelled", "skipped"].includes(this.mergeCiState)) check["conclusion"] = this.mergeCiState;
+          if (this.mergeCiState === "wrong-sha") check["head_sha"] = this.pull!.headSha;
+        }
+      }
+      if (path.includes("/actions/runs/") && this.mergeCiState === "wrong-workflow") (answer as {path:string}).path = ".github/workflows/unapproved.yml";
+      return answer;
+    }}, {root: `/repos/${target.owner}/${target.name}`, owner: target.owner, repo: target.name, head, workflows, requiredChecks});
   }
 
   async observeGenesisPull(_target: Target, marker: string) {

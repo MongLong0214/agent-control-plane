@@ -1811,6 +1811,32 @@ export class RepoFactoryBootstrapRunner {
     input: ProduceAndActivateInput,
     result: RepoFactoryResult,
   ): Promise<Decision<ACPBootstrapActivationResult>> {
+    const current = currentBootstrapPlan(input.runId, this.deps.artifacts.latest(input.runId, ArtifactKind.PLAN));
+    if (!current.allowed) return current as Decision<ACPBootstrapActivationResult>;
+    if (current.value.outputs.genesis) {
+      // WRITTEN retries skip production. They must still observe the exact published merge head,
+      // its approved Actions checks and main's currency before delivering/activating the handoff.
+      const outputs = current.value.outputs;
+      const target = parseGitHubIdentity(outputs.target.repositoryIdentity);
+      const facts = observedRepositoryFacts(result, factsTargetOf(outputs));
+      const head = facts.allowed ? facts.value[0]?.head : null;
+      const workflows = outputs.ciWorkflows;
+      const port = this.deps.githubPort;
+      const refuse = (refusal: string): Decision<ACPBootstrapActivationResult> => {
+        const decision = deny<ACPBootstrapActivationResult>(ReasonCode.VERIFICATION_GAP, "merged-main activation verification refused", {stage:"activation",refusal,runId:input.runId});
+        this.deps.applications.recordRefusal(input.runId, refusalRecord(decision, "activation"));
+        return decision;
+      };
+      if (!target || !head || !workflows?.length || !port.observeGenesisPostMergeCi) return refuse("GENESIS_POST_MERGE_CI_REFUSED");
+      try {
+        const checkNames = [...new Set([...workflows.map(w=>w.checkName),...(outputs.postMergeCommands ?? [])])];
+        const main = await port.observeBranch(target,"main");
+        if (main?.headSha !== head) return refuse("GENESIS_MERGE_DRIFT");
+        const ci = await port.observeGenesisPostMergeCi(target,head,workflows,checkNames);
+        if (ci.state !== "success") return refuse(ci.state === "pending" ? "GENESIS_POST_MERGE_CI_PENDING" : "GENESIS_POST_MERGE_CI_REFUSED");
+        if ((await port.observeBranch(target,"main"))?.headSha !== head) return refuse("GENESIS_MERGE_DRIFT");
+      } catch { return refuse("GENESIS_POST_MERGE_CI_REFUSED"); }
+    }
     const localBindings: Array<{ identity: string; checkoutPath: string; repositoryRole: string }> = [];
     for (const repository of result.repositories) {
       if (repository.proposedCheckoutPath === null) {

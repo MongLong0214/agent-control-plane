@@ -53,6 +53,13 @@ const APPLICATIONS = "src/bootstrap/bootstrap-applications.ts";
 
 export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[] = Object.freeze([
   {
+    id: "merged-main-ci-before-activation",
+    kind: BootstrapLifecycleKind.IMPLEMENTED_GUARANTEE,
+    statement: "After genesis merge and before dev creation, later protections, default-branch switch, seeding or activation, every required CI check for this repository role and every postMergeCommands check must succeed at the exact merge SHA M with Actions provenance and the approved workflow digest. Missing or pending checks leave the merge step incomplete for re-drive without a timer; failed or unknown checks refuse. Every resume rechecks that main still points at M and re-verifies CI before completing the merge receipt.",
+    sites: [{file:GITHUB,symbol:"genesisBootstrapStep",enforces:["observeGenesisPostMergeCi", "GENESIS_POST_MERGE_CI_REFUSED", "GENESIS_POST_MERGE_CI_PENDING", "currentMain.value?.headSha !== mergeHead", "postMergeVerification"]},
+      {file:RUNNER,symbol:"activate",enforces:["observeGenesisPostMergeCi", "GENESIS_MERGE_DRIFT", "GENESIS_POST_MERGE_CI_PENDING", "GENESIS_POST_MERGE_CI_REFUSED"]}],
+  },
+  {
     id: "resident-cto-dedicated-buzz",
     kind: BootstrapLifecycleKind.IMPLEMENTED_GUARANTEE,
     statement:

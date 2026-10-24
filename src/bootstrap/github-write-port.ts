@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { acpError, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { git, type GitResult } from "../git/git.ts";
-import type { GitHubClient } from "../github/github-kernel.ts";
+import type { ApprovedWorkflowChecks, GitHubClient } from "../github/github-kernel.ts";
 
 /**
  * Issue #246 — the GitHub surface the repo factory producer performs its planned operations
@@ -116,6 +116,8 @@ export interface GitHubWritePort {
   openGenesisPull?(target:GitHubRepositoryTarget, marker:string):Promise<void>;
   mergeGenesisPull?(target:GitHubRepositoryTarget, pull:GenesisPull, workflows:readonly {path:string;checkName:string;approvedDigest:string}[]):Promise<void>;
   observeGenesisCi?(target:GitHubRepositoryTarget,head:string,workflows:readonly {path:string;checkName:string;approvedDigest:string}[]):Promise<boolean>;
+  /** One observation, without polling: pending leaves genesis-merge incomplete for the next drive. */
+  observeGenesisPostMergeCi?(target:GitHubRepositoryTarget,head:string,workflows:readonly {path:string;checkName:string;approvedDigest:string}[],requiredChecks:readonly string[]):Promise<ApprovedWorkflowChecks>;
   createBranch?(target: GitHubRepositoryTarget, branch: string, head: string): Promise<void>;
   ensureGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>): Promise<void>;
   observeGenesisResources?(target: GitHubRepositoryTarget, bundle: Pick<GenesisBundle, 'labels' | 'milestones' | 'issues'>): Promise<Record<string, unknown> | null>;
@@ -433,6 +435,9 @@ export const createGitHubApiWritePort = (options: GitHubApiWritePortOptions): Gi
         if (attempt < 29) await new Promise(resolve => setTimeout(resolve,1000));
       }
       return false;
+    },
+    async observeGenesisPostMergeCi(target,head,workflows,requiredChecks) {
+      return observeApprovedWorkflowChecks(client,{root:repoPath(target),owner:target.owner,repo:target.name,head,workflows,requiredChecks});
     },
     async createBranch(target, branch, head) {
       await client.request("POST", `${repoPath(target)}/git/refs`, { ref: `refs/heads/${branch}`, sha: head });

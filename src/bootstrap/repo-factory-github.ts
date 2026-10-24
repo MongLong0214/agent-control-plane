@@ -484,7 +484,7 @@ export const githubOperationReceiptSchema = z.discriminatedUnion("resourceType",
       observed: z.object({ defaultBranch: z.string().min(1) }).strict(),
     })
     .strict(),
-  z.object({ ...receiptCommon, resourceType: z.literal("genesis-bootstrap"), observed: z.object({number:z.number().int().positive(),headSha:z.string(),baseSha:z.string(),merged:z.boolean(),mergeCommitSha:z.string().nullable()}).strict() }).strict(),
+  z.object({ ...receiptCommon, resourceType: z.literal("genesis-bootstrap"), observed: z.object({number:z.number().int().positive(),headSha:z.string(),baseSha:z.string(),merged:z.boolean(),mergeCommitSha:z.string().nullable(),postMergeVerification:z.object({headSha:z.string(),checkNames:z.array(z.string()),workflowsDigest:z.string(),conclusion:z.literal("success")}).strict().optional()}).strict() }).strict(),
   z.object({ ...receiptCommon, resourceType: z.literal("genesis-resources"), observed: z.record(z.unknown()) }).strict(),
   z
     .object({ ...receiptCommon, resourceType: z.literal("branch-protection"), observed: observedProtectionSchema })
@@ -742,6 +742,7 @@ export interface ApplyGitHubOperationsInput {
   prepareGenesis?: (parent:string) => Promise<Decision<string>>;
   verifyGenesis?: (head:string) => Promise<Decision<void>>;
   ciWorkflows?: readonly {path:string;checkName:string;approvedDigest:string}[];
+  postMergeCommands?: readonly string[];
 }
 
 export interface AppliedGitHubOperations {
@@ -1761,7 +1762,7 @@ export const applyGitHubOperations = async (
       const opened = await remote(id,() => port.openGenesisPull!(target,marker)); if (!opened.allowed) return opened as Decision<Step>;
       read = await remote(id,() => port.observeGenesisPull!(target,marker)); if (!read.allowed) return read as Decision<Step>;
     }
-    let pull = read.value;
+    let pull: (NonNullable<typeof read.value> & {postMergeVerification?: {headSha:string;checkNames:string[];workflowsDigest:string;conclusion:"success"}}) | null = read.value;
     if (!pull || pull.headSha !== head || pull.baseSha !== base || (prior?.resourceType === "genesis-bootstrap" && prior.observed.number !== pull.number)) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"GENESIS_PR_DRIFT","genesis PR head/base/identity readback refused",id,{},false);
     if (operation.desiredState.action === "verify") {
       // Reverify even on resume: a receipt cannot make later red CI green.
@@ -1781,12 +1782,31 @@ export const applyGitHubOperations = async (
         const doubtful = unresolvedPending(pending.get(id)); if (doubtful) return doubtful;
         begin({operationId:id,resourceType:operation.resourceType,resourceIdentity:operation.resourceIdentity,attemptedAt:clock.nowIso(),preexisting:false,beforeStateDigest:null,marker,respondedNodeId:null,pushedHead:head});
       }
+      if (pull.merged) {
+        const currentMain = await remote(id,() => port.observeBranch(target,"main"));
+        if (!currentMain.allowed) return currentMain as Decision<Step>;
+        if (currentMain.value?.headSha !== pull.mergeCommitSha) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"GENESIS_MERGE_DRIFT","main no longer points at the genesis merge",id,{},false);
+      }
       // Kernel reconciles an already merged PR without sending another merge.
       const merged = await remote(id,() => port.mergeGenesisPull!(target,pull!,input.ciWorkflows!)); if (!merged.allowed) return merged as Decision<Step>;
       const reread = await remote(id,() => port.observeGenesisPull!(target,marker)); if (!reread.allowed) return reread as Decision<Step>;
       const main = await remote(id,() => port.observeBranch(target,"main")); if (!main.allowed) return main as Decision<Step>;
       if (!reread.value?.merged || !reread.value.mergeCommitSha || reread.value.headSha !== head || reread.value.baseSha !== base || main.value?.headSha !== reread.value.mergeCommitSha || (prior?.resourceType === "genesis-bootstrap" && prior.observed.mergeCommitSha !== reread.value.mergeCommitSha)) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"GENESIS_MERGE_DRIFT","genesis merge readback refused",id,{},false);
       pull = reread.value;
+      // Completion of genesis-merge is the activation gate: a PASS at H cannot stand in for M.
+      // Re-observe on every drive, including a receipted retry, before any later operation.
+      receipts.delete(id);
+      persist();
+      const mergeHead = pull.mergeCommitSha!;
+      const checkNames = [...new Set([...input.ciWorkflows!.map(w => w.checkName), ...(input.postMergeCommands ?? [])])];
+      if (!port.observeGenesisPostMergeCi) return stop(ReasonCode.VERIFICATION_GAP,"GENESIS_POST_MERGE_CI_REFUSED","merged-main CI observation unavailable",id,{head:mergeHead},false);
+      const ci = await remote(id,() => port.observeGenesisPostMergeCi!(target,mergeHead,input.ciWorkflows!,checkNames));
+      if (!ci.allowed || !ci.value || !["success","pending"].includes(ci.value.state)) return stop(ReasonCode.VERIFICATION_GAP,"GENESIS_POST_MERGE_CI_REFUSED","required approved-workflow CI refused at exact merge SHA",id,{head:mergeHead},false);
+      if (ci.value.state !== "success") return stop(ReasonCode.VERIFICATION_GAP,"GENESIS_POST_MERGE_CI_PENDING","required CI is pending at exact merge SHA; re-drive this step",id,{head:mergeHead},true);
+      const currentMain = await remote(id,() => port.observeBranch(target,"main"));
+      if (!currentMain.allowed) return currentMain as Decision<Step>;
+      if (currentMain.value?.headSha !== mergeHead) return stop(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,"GENESIS_MERGE_DRIFT","main moved during merged-main verification",id,{head:mergeHead},false);
+      pull = {...pull,postMergeVerification:{headSha:mergeHead,checkNames,workflowsDigest:digestOf(input.ciWorkflows),conclusion:"success"}};
     }
     if (prior?.resourceType === "genesis-bootstrap" && operation.desiredState.action === "open") {
       return allow(ReasonCode.OK,{receipt:{...prior,rereadAt:clock.nowIso()},outcome:"resumed"});
@@ -1814,7 +1834,7 @@ export const applyGitHubOperations = async (
     if (receipt.resourceType === "branch") publishedHead = receipt.observed.headSha;
     completed.push(receipt);
     if (outcome === "resumed") {
-      if (pending.has(receipt.operationId)) {pending.delete(receipt.operationId);receipts.set(receipt.operationId,receipt);persist();}
+      if (pending.has(receipt.operationId) || !receipts.has(receipt.operationId)) {pending.delete(receipt.operationId);receipts.set(receipt.operationId,receipt);persist();}
       resumed.push(receipt.operationId);
       continue;
     }

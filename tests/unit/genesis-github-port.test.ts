@@ -8,12 +8,12 @@ const head='a'.repeat(40), base='b'.repeat(40), merge='c'.repeat(40);
 const workflow='name: ci\n';
 const workflows=[{path:'.github/workflows/ci.yml',checkName:'test',approvedDigest:bytesDigest(Buffer.from(workflow))}];
 // Review V52-R1-02 — each check names its Actions suite and job; the fixture answers both at the head.
-const check=(sha=head,conclusion='success')=>({id:7,name:'test',head_sha:sha,status:'completed',conclusion,app:{slug:'github-actions'},check_suite:{id:9},details_url:'https://github.com/acme/fixture/actions/runs/11/job/7'});
+const check=(sha=head,conclusion:string|null='success')=>({id:7,name:'test',head_sha:sha,status:'completed',conclusion,app:{slug:'github-actions'},check_suite:{id:9},details_url:'https://github.com/acme/fixture/actions/runs/11/job/7'});
 const protection={allow_force_pushes:{enabled:false},allow_deletions:{enabled:false},enforce_admins:{enabled:true},required_status_checks:{strict:true,contexts:['test']}};
 const pr={number:1,body:'marker',state:'open',merged:false,merged_at:null,merge_commit_sha:null as string|null,head:{ref:'genesis',sha:head,repo:{full_name:'acme/fixture'}},base:{ref:'main',sha:base}};
 function fixture() {
   let merged=false;const calls:Array<{method:string;path:string;body:unknown}>=[];
-  const state={checks:[check()],protection,parents:[base,head],pull:{...pr},main:base};
+  const state={runStatus:"completed" as string | undefined,checks:[check()],protection,parents:[base,head],pull:{...pr},main:base};
   const client:GitHubClient={async request<T>(method:"GET"|"POST"|"PATCH"|"PUT"|"DELETE",path:string,body?:unknown):Promise<T> {
     calls.push({method,path,body});const p=path.replace(/^\//,'');let answer:unknown;
     if(method==='PUT') {merged=true;state.main=merge;answer={merged:true,sha:merge};}
@@ -25,7 +25,7 @@ function fixture() {
     else if(p.includes('/contents/')) answer={encoding:'base64',content:Buffer.from(workflow).toString('base64')};
     else if(p.includes('/git/commits/')) answer={parents:state.parents.map(sha=>({sha}))};
     else if(p.includes('/check-suites/9')) answer={head_sha:head,app:{slug:'github-actions'}};
-    else if(p.includes('/actions/runs/11')) answer={head_sha:head,path:'.github/workflows/ci.yml',status:'completed',conclusion:'success'};
+    else if(p.includes('/actions/runs/11')) answer={head_sha:head,path:'.github/workflows/ci.yml',status:state.runStatus,conclusion:'success'};
     else if(p.endsWith('/git/ref/heads/main')) answer={object:{sha:state.main}};
     else throw new Error('unexpected '+method+' '+path);
     return answer as T;
@@ -64,6 +64,25 @@ describe('genesis production GitHub port and kernel',()=>{
     await expect(f.port.observeGenesisPull!(target,'marker')).rejects.toThrow('ambiguous');
     f.state.pull={...pr,state:'closed'};
     await expect(f.port.observeGenesisPull!(target,'marker')).rejects.toThrow('identity/state');
+  });
+  it('observes merged-main checks once without a polling timer and requires postMergeCommands too',async()=>{
+    vi.useFakeTimers();const f=fixture();f.state.checks=[];
+    expect(await f.port.observeGenesisPostMergeCi!(target,merge,workflows,["test","after-merge"])).toMatchObject({state:"pending"});
+    expect(vi.getTimerCount()).toBe(0);
+    expect(f.calls.filter(c=>c.path.includes('/check-runs'))).toHaveLength(2);
+    expect(f.calls.filter(c=>c.path.includes('/check-runs')).every(c=>c.path.includes(`/commits/${merge}/`))).toBe(true);
+    f.state.checks=[{...check(merge),status:"unknown"}];
+    expect(await f.port.observeGenesisPostMergeCi!(target,merge,workflows,["test"])).toMatchObject({state:"refused"});
+    f.state.checks=[check(merge)];
+    // A successful check at M with suite/run provenance at H is never a pass.
+    expect(await f.port.observeGenesisPostMergeCi!(target,merge,workflows,["test"])).toMatchObject({state:"refused"});
+  });
+  it.each(["wrong-sha", "unknown-run-status", "missing-run-status"] as const)('refuses %s provenance instead of treating it as pending',async fault=>{
+    const f=fixture();
+    if (fault === "wrong-sha") f.state.checks=[{...check(base,null),status:"queued"}];
+    if (fault === "unknown-run-status") f.state.runStatus="unknown";
+    if (fault === "missing-run-status") f.state.runStatus=undefined;
+    expect(await f.port.observeGenesisPostMergeCi!(target,head,workflows,["test"])).toMatchObject({state:"refused"});
   });
   it('waits boundedly for exact-head CI and checks workflow bytes',async()=>{
     vi.useFakeTimers();const f=fixture();f.state.checks=[];
