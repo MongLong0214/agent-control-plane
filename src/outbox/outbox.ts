@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { digestOf } from "../core/digest.ts";
 
 import { newMessageId } from "../core/ids.ts";
+import { CeoNoticeRoute, ceoBuzzGrantSql, type CeoNoticeAttempt, type CeoNoticeOutcome } from "./ceo-notification-route.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -522,20 +523,23 @@ const hermesCanonicalRuntimeSql = (sessionExpr: string): string => `EXISTS (
 )`;
 
 /**
- * ACP-R1-03 — which route a CEO notification row has, one partition with no overlap. With the
- * canonical notice transport attached, an adopted Hermes CEO is reached through it and through
- * nothing else. Every other CEO is reached over Buzz when its runtime carries both a room and a
- * bound channel identity — the route a READY Buzz-backed CEO always had. A row with neither is
- * withheld, PENDING: nothing rejects it for having no route, and the next binding, adoption or
- * transport attachment that gives it one delivers it.
+ * One route partition: a Hermes row stays canonical until its durable per-row Buzz grant. Only
+ * unsent rows or rows whose EVERY attempt is known not to have delivered receive that grant.
+ * The sweep still requires the live holder's bound Buzz room and identity. Removing transport
+ * configuration cannot remove a recorded unknown-outcome fence.
  */
 const ceoCanonicalRouteSql = (alias: "o" | "outbox", canonicalAttached: boolean): string =>
-  canonicalAttached ? hermesCanonicalRuntimeSql(`${alias}.target_session_id`) : "0";
+  canonicalAttached ? `(${hermesCanonicalRuntimeSql(`${alias}.target_session_id`)} AND NOT ${ceoBuzzGrantSql(alias)})` : "0";
 const ceoBuzzSessionSql = (alias: "o" | "outbox"): string =>
   `EXISTS (SELECT 1 FROM sessions ceo_s WHERE ceo_s.session_id = ${alias}.target_session_id
              AND COALESCE(ceo_s.buzz_address, '') <> '' AND COALESCE(ceo_s.buzz_actor_id, '') <> '')`;
 const ceoBuzzRouteSql = (alias: "o" | "outbox", canonicalAttached: boolean): string =>
-  `(NOT ${ceoCanonicalRouteSql(alias, canonicalAttached)} AND ${ceoBuzzSessionSql(alias)})`;
+  `(NOT ${ceoCanonicalRouteSql(alias, canonicalAttached)} AND ${ceoBuzzSessionSql(alias)}
+    AND (${ceoBuzzGrantSql(alias)} OR NOT EXISTS (
+      SELECT 1 FROM audit_events ceo_history
+       WHERE ceo_history.kind IN ('CEO_NOTIFICATION_CANONICAL_ATTEMPT', 'CEO_NOTIFICATION_DELIVERY_FAILED',
+                                  'CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN')
+         AND json_extract(ceo_history.evidence_json, '$.messageId') = ${alias}.message_id)))`;
 
 /** The TS callers evaluate the same row predicate as the sweep, read and ACK. */
 const deliveredInBand = (
@@ -985,16 +989,32 @@ export class Outbox {
     }
   }
 
-  #ceoDelivery: ((message: OutboxMessage) => Promise<Decision<void>>) | null = null;
+  #ceoDelivery: ((message: OutboxMessage, attempt: CeoNoticeAttempt) => Promise<Decision<void>>) | null = null;
   #ceoDelivering: Promise<void> | null = null;
   #ceoPending = false;
 
   /**
-   * Installs the canonical notice transport (ACP-R1-03): from here on an adopted Hermes CEO's
-   * notifications go through it and are withheld from Buzz (`ceoCanonicalRouteSql`). Startup,
+   * Installs the canonical notice transport. Its configuration alone does not prove receiver
+   * support: the per-row journal decides whether a verified Buzz route may take over. Startup,
    * enqueue, binding adoption and authenticated CEO traffic are delivery events.
    */
-  attachCeoNotificationDelivery(send: (message: OutboxMessage) => Promise<Decision<void>>): void {
+  attachCeoNotificationDelivery(send: (message: OutboxMessage, attempt: CeoNoticeAttempt) => Promise<Decision<void>>): void {
+    this.db.tx(() => {
+      if (this.db.get("SELECT 1 FROM audit_events WHERE kind = 'CEO_NOTIFICATION_ATTEMPT_JOURNAL_STARTED'")) return;
+      // A pre-upgrade crash could have dispatched without incrementing attempts. Absence of an
+      // old failure count is not proof that an already queued Hermes row was never sent.
+      const legacy = this.db.all<{ message_id: string; target_session_id: string }>(`SELECT message_id, target_session_id
+        FROM outbox WHERE kind = 'CEO_NOTIFICATION' AND status = 'PENDING'
+          AND ${hermesCanonicalRuntimeSql("outbox.target_session_id")} ORDER BY created_at, rowid`);
+      for (const row of legacy) {
+        const recorded = this.audit.record({ kind: "CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN",
+          reasonCode: ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED, sessionId: row.target_session_id,
+          evidence: { messageId: row.message_id, basis: "PREDATES_ATTEMPT_JOURNAL" } });
+        if (!recorded.allowed) throw new Error("CEO legacy outcome evidence was not recorded");
+      }
+      const started = this.audit.record({ kind: "CEO_NOTIFICATION_ATTEMPT_JOURNAL_STARTED", reasonCode: ReasonCode.OK });
+      if (!started.allowed) throw new Error("CEO attempt journal boundary was not recorded");
+    });
     this.#ceoDelivery = send;
     void this.deliverCeoNotifications();
   }
@@ -1038,7 +1058,7 @@ export class Outbox {
     for (const row of rows) {
       this.#recordWithheldCeoNotification({
         messageId: row.message_id, targetSessionId: row.target_session_id, roleKey: row.role_key, runId: row.run_id,
-      }, row.hermes === 1 ? "CANONICAL_TRANSPORT_NOT_ATTACHED" : "NO_BUZZ_ROUTE");
+      }, row.hermes === 1 && !attached ? "CANONICAL_TRANSPORT_NOT_ATTACHED" : "NO_BUZZ_ROUTE");
     }
   }
 
@@ -1091,26 +1111,36 @@ export class Outbox {
         for (const row of rows) {
           let accepted = false;
           let unavailable = false;
+          let reasonCode: ReasonCode = ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED;
+          let outcome: CeoNoticeOutcome = "UNKNOWN";
+          const attempt = new CeoNoticeRoute(this.db, this.audit, hydrate(row));
           try {
-            const result = await send(hydrate(row));
+            const result = await send(hydrate(row), attempt);
             unavailable = !result.allowed && result.reasonCode === ReasonCode.CEO_CONVERSATION_UNAVAILABLE;
             accepted = result.allowed;
+            reasonCode = result.reasonCode;
+            outcome = (result.evidence["noticeOutcome"] as CeoNoticeOutcome | undefined) ?? (accepted ? "SETTLED" : "UNKNOWN");
           } catch { /* retained below */ }
+          if (attempt.route !== "CANONICAL") continue;
           if (unavailable) {
             // No target was found, so no transport attempt took place. Retain PENDING and
             // record withholding once per message/target, just like the unattached route.
             this.#recordWithheldCeoNotification(hydrate(row), "CANONICAL_TARGET_UNAVAILABLE");
             continue;
           }
-          this.db.run(`UPDATE outbox SET status = ?, attempts = attempts + 1, acked_at = ?
+          this.db.tx(() => {
+            attempt.finish(outcome);
+            const updated = this.db.run(`UPDATE outbox SET status = ?, attempts = attempts + 1, acked_at = ?
             WHERE message_id = ? AND status = 'PENDING' AND binding_generation = ? AND target_session_id = ?
               AND ${liveDeliveryTarget("outbox")}`,
             [accepted ? "ACKED" : "PENDING", accepted ? this.clock.nowIso() : null,
               row.message_id, row.binding_generation, row.target_session_id]);
-          this.audit.record({ kind: accepted ? "CEO_NOTIFICATION_ACCEPTED" : "CEO_NOTIFICATION_DELIVERY_FAILED",
-            reasonCode: accepted ? ReasonCode.OK : ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+            if (updated.changes !== 1) return;
+            this.audit.record({ kind: accepted ? "CEO_NOTIFICATION_ACCEPTED" : "CEO_NOTIFICATION_DELIVERY_FAILED",
+            reasonCode,
             roleKey: row.role_key, sessionId: row.target_session_id, runId: row.run_id,
             evidence: { messageId: row.message_id } });
+          });
         }
       } while (this.#ceoPending);
     })();
