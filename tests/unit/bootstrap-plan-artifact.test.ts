@@ -7,6 +7,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { allow, deny } from "../../src/core/errors.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import type { BootstrapPlanStageInput } from "../../src/bootstrap/bootstrap-plan-artifact.ts";
 import { Role, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
@@ -618,6 +619,259 @@ async function stagingFixture(principal: "owner" | "peer" = "owner") {
 }
 
 describe("bounded PRIMARY_CTO bootstrap candidate staging", () => {
+  it.each(["owner", "peer"] as const)("stages and %s-attaches a replacement after submission and review, then submits its exact bytes", async principal => {
+    const f = await stagingFixture(principal);
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true });
+      expect(await f.cto("plan_submit", { idempotencyKey: "submit-A", runId: f.run.runId, bootstrapPlanDigest: f.digest }))
+        .toMatchObject({ ok: true, value: { digest: f.digest } });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      expect(await f.cto("result_submit", { idempotencyKey: "review-A", runId: f.run.runId, resultSummary: "ready", recommendation: "review" }))
+        .toMatchObject({ ok: true });
+      const oldReview = f.h.cp.artifacts.latest(f.run.runId, "BLIND_REVIEW")!;
+      const input = JSON.parse(f.body);
+      input.plan.summary = "Corrected staged replacement";
+      const body = JSON.stringify(input, null, 2) + "\r\n";
+      const digest = sha256(body);
+      const beforeStage = f.state();
+      expect(await f.stage({ idempotencyKey: "stage-B", planBody: body, expectedSha256: digest }))
+        .toMatchObject({ ok: true, value: { digest, stagedBy: f.primary.roleKey } });
+      expect(f.h.cp.runs.require(f.run.runId)).toEqual(beforeStage.run);
+      expect(f.h.cp.runs.currentCandidate(f.run.runId)).toEqual(beforeStage.candidate);
+      expect(f.h.cp.artifacts.latest(f.run.runId, "BLIND_REVIEW")).toEqual(oldReview);
+      expect(f.h.cp.artifacts.latest(f.run.runId, "PLAN"))
+        .toEqual(beforeStage.artifacts.find(a => a.kind === "PLAN" && !a.superseded));
+      expect(f.h.cp.outbox.listByRun(f.run.runId)).toEqual(beforeStage.outbox);
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId }))
+        .toMatchObject({ ok: true, value: { digest: f.digest, planBody: f.body } });
+      expect(await f.attach({ idempotencyKey: "attach-B", planBody: undefined, expectedSha256: digest, replacesSha256: f.digest }))
+        .toMatchObject({ ok: true, value: { digest } });
+      expect(f.h.cp.artifacts.byDigest(oldReview.digest)?.superseded).toBe(true);
+      expect(f.h.cp.runs.currentCandidate(f.run.runId)).toBeNull();
+      expect(f.h.cp.artifacts.latest(f.run.runId, "PLAN")).toBeNull();
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId }))
+        .toMatchObject({ ok: true, value: { digest, planBody: body } });
+      expect(await f.cto("plan_submit", { idempotencyKey: "submit-B", runId: f.run.runId, bootstrapPlanDigest: digest }))
+        .toMatchObject({ ok: true, value: { digest } });
+    } finally { await f.close(); }
+  });
+
+  it("keeps one unattached candidate, retries B once, and permits C only after B is attached", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true });
+      const body = f.body + " ";
+      const digest = sha256(body);
+      const args = { idempotencyKey: "stage-B", planBody: body, expectedSha256: digest };
+      const a = f.h.cp.artifacts.list(f.run.runId, "HANDOFF");
+      expect(await f.stage(args)).toMatchObject({ ok: true, value: { digest } });
+      const before = f.state();
+      expect(await f.stage(args)).toMatchObject({ ok: true, value: { digest } });
+      expect(await f.stage({ ...args, idempotencyKey: "retry-B" })).toMatchObject({ ok: true, value: { digest } });
+      expect(await f.stage({ ...args, idempotencyKey: "same-sha-different-bytes", planBody: body + " " }))
+        .toMatchObject({ ok: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+      expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(before.artifacts);
+      expect(f.h.cp.audit.forRun(f.run.runId)).toEqual(before.audit);
+      expect(before.artifacts.filter(a => a.content && (a.content as Args).sha256 === digest)).toHaveLength(1);
+      expect(before.audit.filter(e => e.kind === "BOOTSTRAP_PLAN_STAGED" && e.evidence.payloadDigest === digest)).toHaveLength(1);
+      const c = { idempotencyKey: "stage-C", planBody: body + " ", expectedSha256: sha256(body + " ") };
+      expect(await f.stage(c)).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+      expect(await f.attach({ idempotencyKey: "missing-replaces", planBody: undefined, expectedSha256: digest }))
+        .toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+      expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(before.artifacts);
+      expect(await f.attach({ idempotencyKey: "attach-B", planBody: undefined, expectedSha256: digest, replacesSha256: f.digest }))
+        .toMatchObject({ ok: true });
+      expect(await f.attach({ idempotencyKey: "revive-A", planBody: undefined, replacesSha256: digest }))
+        .toMatchObject({ ok: false, reasonCode: "CONFLICT", message: "a superseded input cannot be made current again" });
+      expect(await f.stage(c)).toMatchObject({ ok: true });
+      const candidates = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF").filter(a => a.content.stagedBy);
+      expect(candidates).toHaveLength(3);
+      expect(candidates.every(a => !a.superseded)).toBe(true);
+      expect(candidates[0]).toEqual(a[0]);
+      expect(f.h.cp.audit.byKind("BOOTSTRAP_PLAN_STAGED")).toHaveLength(3);
+    } finally { await f.close(); }
+  });
+
+  it.each([false, true])("overlapping MCP stages leave one unattached candidate and one CONFLICT (replacement=%s)", async replacement => {
+    const f = await stagingFixture();
+    try {
+      if (replacement) {
+        expect(await f.stage()).toMatchObject({ ok: true });
+        expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true });
+      }
+      const second = await f.connect("cto", f.primary.sessionId, true, "complete", f.h.cp,
+        { roleKey: f.primary.roleKey, bindingGeneration: f.primary.generation });
+      const before = f.state();
+      const bodies = [f.body + " ", f.body + "\n"];
+      const answers = await Promise.all([
+        f.stage({ idempotencyKey: "concurrent-B", planBody: bodies[0], expectedSha256: sha256(bodies[0]!) }),
+        second("bootstrap_plan_stage", { ...f.attachArgs, idempotencyKey: "concurrent-C", planBody: bodies[1], expectedSha256: sha256(bodies[1]!) }),
+      ]);
+      expect(answers.filter(a => a.ok === true)).toHaveLength(1);
+      expect(answers.filter(a => a.ok !== true)).toEqual([expect.objectContaining({ ok: false, reasonCode: "CONFLICT" })]);
+      const appended = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")
+        .filter(a => !before.artifacts.some(old => old.artifactId === a.artifactId));
+      expect(appended).toHaveLength(1);
+      expect(appended[0]!.content).toMatchObject({ stagedBy: f.primary.roleKey, sha256: (answers.find(a => a.ok === true)!.value as Args).digest });
+      expect(f.h.cp.audit.forRun(f.run.runId).filter(e => e.kind === "BOOTSTRAP_PLAN_STAGED"))
+        .toHaveLength(before.audit.filter(e => e.kind === "BOOTSTRAP_PLAN_STAGED").length + 1);
+      expect(f.h.cp.runs.require(f.run.runId)).toEqual(before.run);
+      expect(f.h.cp.outbox.listByRun(f.run.runId)).toEqual(before.outbox);
+    } finally { await f.close(); }
+  });
+
+  it.each([false, true])("rechecks admission when a competing stage commits as its transaction opens (replacement=%s)", async replacement => {
+    const f = await stagingFixture();
+    try {
+      if (replacement) {
+        expect(await f.stage()).toMatchObject({ ok: true });
+        expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true });
+      }
+      const port = createCtoMcpPort(f.h.cp);
+      const peer = { actor: f.primary.sessionId, sessionId: f.primary.sessionId,
+        sessionIncarnation: f.h.cp.sessions.require(f.primary.sessionId).incarnation,
+        binding: { roleKey: f.primary.roleKey, bindingGeneration: f.primary.generation } };
+      const inputs = [f.body + " ", f.body + "\n"].map(planBody => ({ ...f.attachArgs, planBody, expectedSha256: sha256(planBody) }) as BootstrapPlanStageInput);
+      // Both requests pass the MCP preflight before either appends anything.
+      for (const input of inputs) expect(port.bootstrapPlanStageAuthority(peer, input).allowed).toBe(true);
+      const before = f.state();
+      const txDecision = f.h.cp.db.txDecision.bind(f.h.cp.db);
+      const frozen = f.h.cp.bootstrapApplications.assertNotFrozen.bind(f.h.cp.bootstrapApplications);
+      vi.spyOn(f.h.cp.bootstrapApplications, "assertNotFrozen").mockImplementation((...args) => {
+        expect(f.h.cp.db.inTransaction).toBe(true);
+        return frozen(...args);
+      });
+      let competing: ReturnType<typeof port.stageBootstrapPlan> | undefined;
+      let interleaved = false;
+      vi.spyOn(f.h.cp.db, "txDecision").mockImplementation(body => {
+        if (!interleaved) {
+          // The competing request commits after preflight, just before the first transaction opens.
+          interleaved = true;
+          expect(f.h.cp.db.inTransaction).toBe(false);
+          competing = port.stageBootstrapPlan(peer, inputs[1]!);
+        }
+        return txDecision(body);
+      });
+      const first = port.stageBootstrapPlan(peer, inputs[0]!);
+      expect(interleaved).toBe(true);
+      expect(competing).toMatchObject({ allowed: true, value: { digest: inputs[1]!.expectedSha256 } });
+      expect(first).toMatchObject({ allowed: false, reasonCode: "CONFLICT" });
+      const appended = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")
+        .filter(a => !before.artifacts.some(old => old.artifactId === a.artifactId));
+      expect(appended).toHaveLength(1);
+      expect(appended[0]!.content).toMatchObject({ stagedBy: f.primary.roleKey, sha256: inputs[1]!.expectedSha256 });
+      expect(f.h.cp.audit.forRun(f.run.runId).filter(e => e.kind === "BOOTSTRAP_PLAN_STAGED"))
+        .toHaveLength(before.audit.filter(e => e.kind === "BOOTSTRAP_PLAN_STAGED").length + 1);
+    } finally { vi.restoreAllMocks(); await f.close(); }
+  });
+
+  it("still refuses initial staging after a PLAN without an attachment", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.cto("plan_submit", { idempotencyKey: "legacy-submit", ...JSON.parse(f.body) })).toMatchObject({ ok: true });
+      const before = f.state();
+      expect(await f.stage()).toMatchObject({ ok: false, reasonCode: "CONFLICT", message: "this run no longer accepts initial PLAN staging" });
+      expect(f.state()).toEqual(before);
+    } finally { await f.close(); }
+  });
+
+  it("stages a replacement after an inline attachment and PLAN, even without an earlier candidate", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await f.cto("plan_submit", { idempotencyKey: "inline-submit", runId: f.run.runId, bootstrapPlanDigest: f.digest }))
+        .toMatchObject({ ok: true });
+      const body = f.body + " ";
+      const digest = sha256(body);
+      expect(await f.stage({ idempotencyKey: "first-candidate-is-replacement", planBody: body, expectedSha256: digest }))
+        .toMatchObject({ ok: true, value: { digest } });
+      expect(await f.attach({ idempotencyKey: "attach-first-candidate", planBody: undefined, expectedSha256: digest, replacesSha256: f.digest }))
+        .toMatchObject({ ok: true, value: { digest } });
+    } finally { await f.close(); }
+  });
+
+  it.each([RunState.ACTIVE, RunState.BLOCKED, RunState.REVISION_REQUIRED, RunState.AWAITING_HUMAN])(
+    "uses attach's replacement admission in %s, including the frozen check", async state => {
+      const f = await stagingFixture();
+      try {
+        expect(await f.stage()).toMatchObject({ ok: true });
+        expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true });
+        if (state === RunState.REVISION_REQUIRED) {
+          expect(await f.cto("plan_submit", { idempotencyKey: "revision-plan", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
+          f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+          expect(await f.cto("result_submit", { idempotencyKey: "revision-review", runId: f.run.runId, resultSummary: "ready", recommendation: "review" }))
+            .toMatchObject({ ok: true });
+        }
+        if (state !== RunState.ACTIVE) expect(f.h.cp.runs.transition(f.run.runId, state, "replacement state fixture").allowed).toBe(true);
+        const args = { idempotencyKey: "replacement", planBody: f.body + " ", expectedSha256: sha256(f.body + " ") };
+        const before = f.state();
+        const frozen = vi.spyOn(f.h.cp.bootstrapApplications, "assertNotFrozen")
+          .mockReturnValue(deny(ReasonCode.CONFLICT, "frozen fixture"));
+        expect(await f.stage(args)).toMatchObject({ ok: false, message: "frozen fixture" });
+        expect(f.state()).toEqual(before);
+        frozen.mockRestore();
+        expect(await f.stage(args)).toMatchObject({ ok: true });
+        expect(await f.attach({ ...args, idempotencyKey: "replace", planBody: undefined, replacesSha256: f.digest }))
+          .toMatchObject({ ok: true });
+      } finally { await f.close(); }
+    });
+
+  it("rechecks replacement contract and current PRIMARY_CTO generation before writing", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true });
+      const args = { idempotencyKey: "replacement", planBody: f.body + " ", expectedSha256: sha256(f.body + " ") };
+      const before = f.state();
+      expect(await f.stage({ ...args, contractDigest: sha256("drift") }))
+        .toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_CONTRACT_DRIFT" });
+      expect(f.state()).toEqual(before);
+      expect(f.h.cp.runs.transition(f.primary.runId, RunState.BLOCKED, "renew primary").allowed).toBe(true);
+      expect(f.h.cp.bindings.revoke(f.primary.roleKey, "renew primary", { allowBlockedRuns: true }).allowed).toBe(true);
+      expect(f.h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: f.primary.projectId, sessionId: f.primary.sessionId }).allowed).toBe(true);
+      const renewed = f.state();
+      expect(await f.stage(args)).toMatchObject({ ok: false, reasonCode: "BINDING_GENERATION_STALE" });
+      expect(f.state()).toEqual(renewed);
+    } finally { await f.close(); }
+  });
+
+  it.each(["receipt", "artifact", "bytes", "binding", "duplicate"])("selects by digest with two candidates and isolates damaged %s", async damage => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true });
+      const body = f.body + " ";
+      const digest = sha256(body);
+      expect(await f.stage({ idempotencyKey: "stage-B", planBody: body, expectedSha256: digest })).toMatchObject({ ok: true });
+      // Both digest selections work before corrupting just A in this test's read view.
+      expect(await f.attach({ idempotencyKey: "read-A", planBody: undefined })).toMatchObject({ ok: true });
+      if (damage === "receipt") {
+        const read = f.h.cp.audit.forRun.bind(f.h.cp.audit);
+        vi.spyOn(f.h.cp.audit, "forRun").mockImplementation(runId => read(runId)
+          .filter(e => e.kind !== "BOOTSTRAP_PLAN_STAGED" || e.evidence.payloadDigest !== f.digest));
+      } else {
+        const read = f.h.cp.artifacts.list.bind(f.h.cp.artifacts);
+        vi.spyOn(f.h.cp.artifacts, "list").mockImplementation((runId, kind) => {
+          const rows = read<Args>(runId, kind);
+          const a = rows.find(a => a.content.stagedBy && a.content.sha256 === f.digest);
+          if (!a) return rows;
+          if (damage === "duplicate") return [...rows, a];
+          return rows.map(row => row !== a ? row : {
+            ...a, ...(damage === "artifact" ? { digest: sha256("damaged artifact") } : {}),
+            content: { ...a.content, ...(damage === "bytes" ? { bodyBase64: Buffer.from(body).toString("base64") } : {}),
+              ...(damage === "binding" ? { contractDigest: sha256("damaged binding") } : {}) },
+          });
+        });
+      }
+      expect(await f.attach({ idempotencyKey: "damaged-A", planBody: undefined }))
+        .toMatchObject({ ok: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+      expect(await f.attach({ idempotencyKey: "good-B", planBody: undefined, expectedSha256: digest, replacesSha256: f.digest }))
+        .toMatchObject({ ok: true, value: { digest } });
+    } finally { vi.restoreAllMocks(); await f.close(); }
+  });
+
   it("stages as the exact CTO socket binding when project and assignment enumeration orders differ", async () => {
     const f = await fixture();
     // Projects sort first by creation time, then id; assignments sort by assignment id.
@@ -958,6 +1212,64 @@ async function anotherStager(f: Awaited<ReturnType<typeof stagingFixture>>, cano
 }
 
 describe("B2 candidates are non-authoritative uploads selected by run, stager and digest", () => {
+  it("counts only the authenticated stager's history when another stager has attached or pending candidates", async () => {
+    const f = await stagingFixture();
+    try {
+      const other = await anotherStager(f);
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(await other.stage()).toMatchObject({ ok: true });
+      expect(await f.attach({ planBody: undefined, stagedBy: other.roleKey, expectedSha256: other.digest }))
+        .toMatchObject({ ok: true });
+      const body = f.body + "\n";
+      const replacement = { idempotencyKey: "own-replacement", planBody: body, expectedSha256: sha256(body) };
+      const before = f.state();
+      // The other stager's attached candidate does not consume this stager's pending upload.
+      expect(await f.stage({ ...replacement, stagedBy: other.roleKey }))
+        .toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+      expect(f.state()).toEqual(before);
+      expect(await f.attach({ idempotencyKey: "consume-own", planBody: undefined, replacesSha256: other.digest }))
+        .toMatchObject({ ok: true });
+      const otherBody = f.body + "\t";
+      expect(await other.stage({ idempotencyKey: "other-pending", planBody: otherBody, expectedSha256: sha256(otherBody) }))
+        .toMatchObject({ ok: true });
+      // Conversely, the other stager's pending candidate cannot block this consumed history.
+      expect(await f.stage(replacement)).toMatchObject({ ok: true, value: { digest: sha256(body), stagedBy: f.primary.roleKey } });
+      const candidates = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF").filter(a => a.content.stagedBy);
+      expect(candidates.filter(a => a.content.stagedBy === f.primary.roleKey).map(a => a.content.sha256)).toEqual([f.digest, sha256(body)]);
+      expect(candidates.filter(a => a.content.stagedBy === other.roleKey).map(a => a.content.sha256)).toEqual([other.digest, sha256(otherBody)]);
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId }))
+        .toMatchObject({ ok: true, value: { digest: f.digest, planBody: f.body } });
+    } finally { await f.close(); }
+  });
+
+  it("selects an older exact candidate without falling back to a newer candidate or another stager", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true });
+      const body = f.body + "\n";
+      const digest = sha256(body);
+      expect(await f.stage({ idempotencyKey: "own-newer", planBody: body, expectedSha256: digest })).toMatchObject({ ok: true });
+      const other = await anotherStager(f);
+      expect(await other.stage()).toMatchObject({ ok: true });
+      const before = f.state();
+      for (const selection of [
+        { stagedBy: f.primary.roleKey, expectedSha256: other.digest },
+        { stagedBy: other.roleKey, expectedSha256: digest },
+        { stagedBy: f.primary.roleKey, expectedSha256: sha256("absent candidate") },
+      ]) {
+        expect(await f.attach({ idempotencyKey: "no-fallback", planBody: undefined, replacesSha256: f.digest, ...selection }))
+          .toMatchObject({ ok: false, reasonCode: "NOT_FOUND" });
+        expect(f.state()).toEqual(before);
+      }
+      // A remains selectable even though B and the other stager's upload are newer.
+      expect(await f.attach({ idempotencyKey: "select-older-A", planBody: undefined }))
+        .toMatchObject({ ok: true, value: { digest: f.digest } });
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId }))
+        .toMatchObject({ ok: true, value: { digest: f.digest, planBody: f.body } });
+    } finally { await f.close(); }
+  });
+
   it("keeps stager slots independent and derives identity from authentication even when arguments name another role", async () => {
     const f = await stagingFixture();
     try {
@@ -1017,6 +1329,11 @@ describe("B2 candidates are non-authoritative uploads selected by run, stager an
       const opened = open(recipient.projectId, f.run.runId, recipient.sessionId, handoff);
       expect(opened).toMatchObject({ allowed: true });
       if (!opened.allowed) throw new Error(opened.message);
+      // A second candidate is newer than the real handoff and must never hide it.
+      const replacementBody = f.body + " ";
+      expect(await f.stage({ idempotencyKey: "handoff-stage-B", planBody: replacementBody, expectedSha256: sha256(replacementBody) }))
+        .toMatchObject({ ok: true });
+      expect(f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF").filter(a => a.content.stagedBy)).toHaveLength(2);
       expect(open(recipient.projectId, f.run.runId, recipient.sessionId, handoff))
         .toMatchObject({ allowed: true, value: { handoffId: opened.value.handoffId } });
       const reader = f.h.cp.bootstrap as unknown as { activationHandoff(runId: string): { content: Args } | null };

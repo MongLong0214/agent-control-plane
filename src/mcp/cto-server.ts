@@ -554,7 +554,7 @@ const createCtoServerFromPort = (
   server.registerTool(
     "bootstrap_plan_stage",
     {
-      description: "Non-authoritative upload of bounded exact UTF-8 PLAN input for a project-less bootstrap run. The server derives stagedBy from the current PRIMARY_CTO roleKey; each stager has its own immutable slot per run. No run authority, approval, delivery, wake or submission. Returns digest and stagedBy for explicit CEO selection at attach.",
+      description: "Non-authoritative upload of bounded exact UTF-8 PLAN input for a project-less bootstrap run. The server derives stagedBy from the current PRIMARY_CTO roleKey. Candidates are immutable; each stager may have at most one unattached candidate per run. Different bytes may be staged as a replacement only with a current attachment and after all earlier candidates were CEO-attached. Identical bytes are idempotent. No run authority, approval, delivery, wake or submission. Returns digest and stagedBy for explicit CEO selection at attach.",
       inputSchema: { ...mutation, ...runIdentity, planBody: z.string(), expectedSha256: z.string(),
         contractDigest: z.string(), bootstrapOperationId: z.string().min(1), projectId: z.string().min(1), repositoryIdentity: z.string().min(1) },
     },
