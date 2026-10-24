@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
@@ -13,12 +13,16 @@ describe("ACP observed serving runtime", () => {
     try {
       const generation = "generation-" + "a".repeat(40);
       const directory = join(tempDir(), generation, "dist", "daemon"); mkdirSync(directory, { recursive: true });
-      const entrypoint = join(directory, "agentcpd.js"); writeFileSync(entrypoint, "// fixture daemon runtime\n");
+      const actualEntrypoint = join(directory, "agentcpd.js"); writeFileSync(actualEntrypoint, "// fixture daemon runtime\n");
+      // Reproduce /var → /private/var even when the host TMPDIR is already canonical.
+      const alias = join(tempDir(), "daemon-alias"); symlinkSync(directory, alias, "dir");
+      const entrypoint = join(alias, "agentcpd.js");
       const eventId = recordBootstrapServingRuntime(f.audit, pathToFileURL(entrypoint).href);
       const original = bootstrapServingRuntime(f.audit, eventId);
       expect(original).toMatchObject({ eventId, generation, runtimeSha256: digestOf([{ path: "daemon/agentcpd.js", sha256: sha256("// fixture daemon runtime\n") }]),
         entrypointSha256: sha256("// fixture daemon runtime\n"), runtimeFileCount: 1,
-        entrypoint, pid: process.pid, lifecycleDigest: digestOf(bootstrapCodeGuarantees()) });
+        entrypoint: realpathSync(entrypoint), pid: process.pid, lifecycleDigest: digestOf(bootstrapCodeGuarantees()) });
+      expect(bootstrapServingRuntime(f.audit, recordBootstrapServingRuntime(f.audit, pathToFileURL(actualEntrypoint).href))?.entrypoint).toBe(original?.entrypoint);
       writeFileSync(join(directory, "correction.js"), "// correction changed without changing the entrypoint\n");
       const later = bootstrapServingRuntime(f.audit, recordBootstrapServingRuntime(f.audit, pathToFileURL(entrypoint).href));
       expect(later?.entrypointSha256).toBe(original?.entrypointSha256);

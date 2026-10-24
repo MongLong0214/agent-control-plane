@@ -571,8 +571,8 @@ const createCtoServerFromPort = (
   );
   server.registerTool(
     "bootstrap_review_evidence_stage",
-    { description: "Stage one immutable private review evidence bundle (files, path/sha256/origin/grade manifest and explicit missing items) within the existing 128 KiB UTF-8 staging limit. Current PRIMARY_CTO only. No verification or approval; CEO must select this run/stager/digest. No automatic summaries, split uploads or external file references.",
-      inputSchema: { ...mutation, ...runIdentity, contractDigest: z.string(), evidenceBody: z.string(), expectedSha256: z.string() } },
+    { description: "Stage one immutable private review evidence bundle (files, path/sha256/origin/grade manifest and explicit missing items) within the existing 128 KiB UTF-8 staging limit. Current PRIMARY_CTO only. Binds this run, contract and current bootstrapPlanDigest; CEO must select this exact attachment/stager/digest. No verification or approval. No automatic summaries, split uploads or external file references.",
+      inputSchema: { ...mutation, ...runIdentity, contractDigest: z.string(), bootstrapPlanDigest: z.string(), evidenceBody: z.string(), expectedSha256: z.string() } },
     async args => write("bootstrap_review_evidence_stage", args, peer => respond(port.stageBootstrapReviewEvidence(peer, args)),
       peer => port.reviewEvidenceStageAuthority(peer, args)),
   );

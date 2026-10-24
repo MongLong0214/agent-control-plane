@@ -2061,7 +2061,7 @@ export class BlindReviewGate {
       });
     }
     let reviewEvidence: FrozenReviewEvidence | null;
-    try { reviewEvidence = frozenBootstrapReviewEvidence(planArtifact.content); }
+    try { reviewEvidence = frozenBootstrapReviewEvidence({ artifacts: this.artifacts, audit: this.audit }, request.runId, planArtifact.content); }
     catch { return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "frozen review evidence failed validation"); }
     // What the PLAN says it intends, from the same PLAN artifact and the run's one live task. A field
     // over its bound refuses the review here, before any reviewer is constituted.

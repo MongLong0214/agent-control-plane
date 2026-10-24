@@ -1,5 +1,8 @@
 import type { BootstrapReviewContext } from "../../src/review/blind-review.ts";
 import type { Decision } from "../../src/core/errors.ts";
+import { frozenBootstrapReviewEvidence, type FrozenReviewEvidenceReference } from "../../src/bootstrap/bootstrap-review-evidence.ts";
+import { RunEvidenceExporter } from "../../src/export/run-evidence.ts";
+import { artifactDigestMatches } from "../../src/db/artifacts.ts";
 import { collectBootstrapCeoDecisions } from "../../src/bootstrap/bootstrap-ceo-decisions.ts";
 import { recordBootstrapServingRuntime } from "../../src/bootstrap/bootstrap-runtime-observation.ts";
 import { currentBootstrapPlan, planForSubmission, deliveredBootstrapHandoff } from "../../src/bootstrap/bootstrap-plan.ts";
@@ -1767,21 +1770,23 @@ describe("private bootstrap review originals and serving runtime", () => {
     } finally { await f.close(); }
   });
 
-  it.each(["wrong run", "file digest", "duplicate path", "forged verification", "missing excerpt sections", "oversized"])(
+  it.each(["wrong run", "file digest", "duplicate path", "forged verification", "author reasoning", "CTO reasoning", "worker reasoning", "chat history", "missing excerpt sections", "oversized"])(
     "refuses %s evidence before an immutable upload exists", async fault => {
       const f = await stagingFixture();
       try {
+        expect(await f.attach()).toMatchObject({ ok: true });
         const text = "failure\nfix\nresult\n";
         const file: Args = { path: "original.log", origin: "execution stdout", grade: "execution-log", sha256: sha256(text), bodyBase64: Buffer.from(text).toString("base64") };
         if (fault === "file digest") file.sha256 = sha256("other");
         if (fault === "forged verification") file.verification = "ACP-verified";
+        if (["author reasoning", "CTO reasoning", "worker reasoning", "chat history"].includes(fault)) file.grade = fault;
         if (fault === "missing excerpt sections") file.excerpt = { originalSha256: sha256("original"), omitted: true, ranges: [{ section: "result", startLine: 20, endLine: 22 }] };
         if (fault === "oversized") file.origin = "x".repeat(128 * 1024);
         const body = JSON.stringify({ runId: fault === "wrong run" ? "run_other" : f.run.runId, contractDigest: f.run.contractDigest,
           files: fault === "duplicate path" ? [file, file] : [file], missing: ["#58 raw RED/GREEN", "#60 raw RED/GREEN", "#59 raw output"] });
         const before = f.h.cp.artifacts.list(f.run.runId);
         expect(await f.call("bootstrap_review_evidence_stage", { idempotencyKey: "invalid-evidence", runId: f.run.runId,
-          contractDigest: f.run.contractDigest, evidenceBody: body, expectedSha256: sha256(body) })).toMatchObject({ ok: false });
+          contractDigest: f.run.contractDigest, bootstrapPlanDigest: f.digest, evidenceBody: body, expectedSha256: sha256(body) })).toMatchObject({ ok: false });
         expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(before);
       } finally { await f.close(); }
     });
@@ -1789,6 +1794,7 @@ describe("private bootstrap review originals and serving runtime", () => {
   it("admits only current PRIMARY_CTO staging and CEO selection; freezes the selected originals", async () => {
     const f = await stagingFixture();
     try {
+      expect(await f.attach()).toMatchObject({ ok: true });
       const text = "failure: original failed\nfix: original fix\nresult: original passed\n";
       const originalSha256 = sha256("full original file retained by collector");
       const bundle = { runId: f.run.runId, contractDigest: f.run.contractDigest, files: [{ path: "execution.log", sha256: sha256(text),
@@ -1797,7 +1803,7 @@ describe("private bootstrap review originals and serving runtime", () => {
           { section: "fix", startLine: 20, endLine: 25 }, { section: "result", startLine: 40, endLine: 42 }] } }],
         missing: ["#58 raw RED/GREEN", "#60 raw RED/GREEN", "#59 raw output"] };
       const body = JSON.stringify(bundle);
-      const args = { idempotencyKey: "originals", runId: f.run.runId, contractDigest: f.run.contractDigest, evidenceBody: body, expectedSha256: sha256(body) };
+      const args = { idempotencyKey: "originals", runId: f.run.runId, contractDigest: f.run.contractDigest, bootstrapPlanDigest: f.digest, evidenceBody: body, expectedSha256: sha256(body) };
       expect(await f.cto("bootstrap_review_evidence_stage", args)).toMatchObject({ ok: false });
       const stale = await f.connect("cto", f.primary.sessionId, true, "complete", f.h.cp, { roleKey: f.primary.roleKey, bindingGeneration: f.primary.generation + 1 });
       expect(await stale("bootstrap_review_evidence_stage", args)).toMatchObject({ ok: false });
@@ -1810,15 +1816,256 @@ describe("private bootstrap review originals and serving runtime", () => {
       expect(await f.hermes("bootstrap_review_evidence_attach", { ...select, idempotencyKey: "wrong-digest", expectedSha256: sha256("other") })).toMatchObject({ ok: false });
       const attached = await f.hermes("bootstrap_review_evidence_attach", select);
       expect(attached, JSON.stringify(attached)).toMatchObject({ ok: true });
-      expect(await f.attach()).toMatchObject({ ok: true });
       expect(await f.cto("plan_submit", { idempotencyKey: "frozen-originals", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
       const frozen = f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!;
-      expect(frozen.content.reviewEvidence).toMatchObject({ bundle, source: { stagedBy: f.primary.roleKey, attachedBySessionId: f.ceo } });
+      expect(frozen.content.reviewEvidence).toMatchObject({ source: { bootstrapPlanDigest: f.digest, stagedBy: f.primary.roleKey, attachedBySessionId: f.ceo } });
+      expect(frozen.content.reviewEvidence).not.toHaveProperty("bundle");
+      const privateCandidate = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")
+        .find(a => a.digest === (frozen.content.reviewEvidence as FrozenReviewEvidenceReference).source.candidateDigest)!;
+      expect(JSON.parse(Buffer.from(privateCandidate.content.bodyBase64 as string, "base64").toString("utf8"))).toEqual(bundle);
       const nextBody = JSON.stringify({ ...bundle, missing: [...bundle.missing, "later missing item"] });
       expect(await f.call("bootstrap_review_evidence_stage", { ...args, idempotencyKey: "later-originals", evidenceBody: nextBody, expectedSha256: sha256(nextBody) })).toMatchObject({ ok: true });
       expect(await f.hermes("bootstrap_review_evidence_attach", { ...select, idempotencyKey: "later-attach", expectedSha256: sha256(nextBody), replacesSha256: sha256(body) })).toMatchObject({ ok: true });
       expect(f.h.cp.artifacts.latest(f.run.runId, "PLAN")).toEqual(frozen);
+      const privateSource = { artifacts: f.h.cp.artifacts, audit: f.h.cp.audit };
+      // Later CEO selection cannot change the originals addressed by the submitted PLAN.
+      expect(frozenBootstrapReviewEvidence(privateSource, f.run.runId, frozen.content)?.bundle).toEqual(bundle);
+      const reference = frozen.content.reviewEvidence as FrozenReviewEvidenceReference;
+      expect(() => frozenBootstrapReviewEvidence(privateSource, f.run.runId, { ...frozen.content,
+        reviewEvidence: { ...reference, source: { ...reference.source, candidateDigest: sha256("forged private reference") } } })).toThrow();
     } finally { await f.close(); }
+  });
+
+  describe("#1204 R2 boundary witnesses", () => {
+    const evidenceFixture = async () => {
+      const f = await stagingFixture();
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const text = "original execution result\n";
+      const bundle = { runId: f.run.runId, contractDigest: f.run.contractDigest, files: [{ path: "execution.log", sha256: sha256(text),
+        origin: "execution stdout", grade: "execution-log", bodyBase64: Buffer.from(text).toString("base64") }], missing: [] };
+      const body = JSON.stringify(bundle);
+      const upload = { idempotencyKey: "boundary-stage", runId: f.run.runId, contractDigest: f.run.contractDigest,
+        bootstrapPlanDigest: f.digest, evidenceBody: body, expectedSha256: sha256(body) };
+      const select = { idempotencyKey: "boundary-attach", runId: f.run.runId, contractDigest: f.run.contractDigest,
+        bootstrapPlanDigest: f.digest, stagedBy: f.primary.roleKey, expectedSha256: sha256(body) };
+      const stageEvidence = (overrides: Args = {}) => f.call("bootstrap_review_evidence_stage", { ...upload, ...overrides });
+      const attachEvidence = (overrides: Args = {}) => f.hermes("bootstrap_review_evidence_attach", { ...select, ...overrides });
+      const effects = () => ({ artifacts: f.h.cp.artifacts.list(f.run.runId), run: f.h.cp.runs.require(f.run.runId),
+        attached: f.h.cp.audit.forRun(f.run.runId).filter(e => e.kind === "BOOTSTRAP_REVIEW_EVIDENCE_ATTACHED") });
+      return { ...f, bundle, bundleBody: body, upload, select, stageEvidence, attachEvidence, effects };
+    };
+
+    it("ACP1204-R1-02 refuses A→B→A atomically and preserves current-B retries and submission", async () => {
+      const f = await evidenceFixture();
+      try {
+        expect(await f.stageEvidence()).toMatchObject({ ok: true });
+        expect(await f.attachEvidence()).toMatchObject({ ok: true });
+        const bodyB = JSON.stringify({ ...f.bundle, missing: ["B: raw output unavailable"] });
+        expect(await f.stageEvidence({ idempotencyKey: "stage-B", evidenceBody: bodyB, expectedSha256: sha256(bodyB) })).toMatchObject({ ok: true });
+        const selectB = { idempotencyKey: "attach-B", expectedSha256: sha256(bodyB), replacesSha256: f.select.expectedSha256 };
+        const attachedB = await f.attachEvidence(selectB);
+        expect(attachedB).toMatchObject({ ok: true });
+        const state = () => ({ ...f.effects(), audit: f.h.cp.audit.forRun(f.run.runId),
+          messages: f.h.cp.db.all("SELECT * FROM inbound_messages WHERE channel = 'mcp'"), outbox: f.h.cp.outbox.listByRun(f.run.runId) });
+        const before = state();
+        expect(await f.attachEvidence({ idempotencyKey: "reselect-A", replacesSha256: sha256(bodyB) })).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+        // Even the original cached A selection must not conceal its superseded status.
+        expect(await f.attachEvidence()).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+        expect(state()).toEqual(before);
+        const current = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")
+          .filter(a => a.content.schema === "acp.bootstrap-review-evidence-attached.v1" && !a.superseded);
+        expect(current).toHaveLength(1);
+        expect(current[0]!.content.sha256).toBe(sha256(bodyB));
+        expect(await f.attachEvidence(selectB)).toEqual(attachedB);
+        expect(state()).toEqual(before);
+        expect(await f.attachEvidence({ ...selectB, idempotencyKey: "same-B-fresh-key" })).toMatchObject({ ok: true });
+        expect(await f.cto("plan_submit", { idempotencyKey: "after-refused-reselection", runId: f.run.runId,
+          bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
+        expect(f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!.content.reviewEvidence).toMatchObject({ source: { bundleSha256: sha256(bodyB) } });
+      } finally { await f.close(); }
+    });
+
+    it.each(["run", "baseline"])("ACP1204-R1-01 keeps private originals out of %s export and available to the reviewer", async kind => {
+      const f = await evidenceFixture();
+      try {
+        const permitted = "PRIVATE_PERMITTED_EXECUTION_ORIGINAL: failure\nfix\nresult\n";
+        const reasoning = "WITHHELD_AUTHOR_AND_CTO_REASONING: private implementer report\n";
+        const bundle = { ...f.bundle, files: [
+          { path: "execution.log", origin: "PRIVATE_EXECUTION_ORIGIN", grade: "execution-log", sha256: sha256(permitted), bodyBase64: Buffer.from(permitted).toString("base64") },
+          { path: "WITHHELD_REASONING_PATH.txt", origin: "WITHHELD_REASONING_ORIGIN", grade: "implementer-final-report", sha256: sha256(reasoning), bodyBase64: Buffer.from(reasoning).toString("base64") },
+        ] };
+        const evidenceBody = JSON.stringify(bundle);
+        expect(await f.stageEvidence({ evidenceBody, expectedSha256: sha256(evidenceBody) })).toMatchObject({ ok: true });
+        expect(await f.attachEvidence({ expectedSha256: sha256(evidenceBody) })).toMatchObject({ ok: true });
+        expect(await f.cto("plan_submit", { idempotencyKey: "export-private-plan", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
+        const plan = f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!;
+        f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+        expect(await f.cto("result_submit", { idempotencyKey: "export-private-review", runId: f.run.runId,
+          resultSummary: "review", recommendation: "review" })).toMatchObject({ ok: true });
+        const prompt = f.h.scripted.invocations.find(i => /Bootstrap plan review/.test(i.prompt))!.prompt;
+        expect(prompt).toContain(permitted.trim());
+        expect(prompt).not.toContain(reasoning.trim());
+        expect(prompt).not.toContain(Buffer.from(reasoning).toString("base64"));
+        if (kind === "baseline") {
+          // Export fixture only: baseline windows select completed runs. No activation is claimed.
+          expect(f.h.cp.runs.transition(f.run.runId, RunState.COMPLETED, "baseline export fixture", {},
+            f.h.cp.completionAuthoritiesForTests().bootstrapActivation).allowed).toBe(true);
+        }
+        const artifactsBefore = f.h.cp.artifacts.list(f.run.runId);
+        const exporter = new RunEvidenceExporter(f.h.cp.db, f.h.cp.artifacts, f.h.clock, f.h.cp.audit);
+        const result = kind === "run" ? exporter.exportRun(f.run.runId)
+          : exporter.exportBaseline({ from: f.run.createdAt, to: f.h.clock.nowIso() });
+        if (!result.allowed) throw new Error(result.message);
+        const exported = "runs" in result.value ? result.value.runs.find(r => r.run.runId === f.run.runId)! : result.value;
+        expect(exported).toBeDefined();
+        const serialized = JSON.stringify(result.value);
+        for (const text of [permitted, reasoning]) {
+          expect(serialized).not.toContain(text.trim());
+          expect(serialized).not.toContain(Buffer.from(text).toString("base64"));
+        }
+        for (const metadata of ["PRIVATE_EXECUTION_ORIGIN", "WITHHELD_REASONING_PATH", "WITHHELD_REASONING_ORIGIN"]) expect(serialized).not.toContain(metadata);
+        const exportedPlan = exported.artifactManifest.artifacts.find(a => a.artifactId === plan.artifactId)!;
+        // The exporter carries the certified PLAN unchanged, never a scrubbed replacement.
+        expect(exportedPlan.digest).toBe(plan.digest);
+        expect(exportedPlan.content).toEqual(plan.content);
+        expect(artifactDigestMatches(plan)).toBe(true);
+        expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(artifactsBefore);
+        // Pre-fix inline PLANs are immutable too: omit their whole content, never scrub it.
+        const legacy = f.h.cp.artifacts.put(f.run.runId, "PLAN", { ...plan.content,
+          reviewEvidence: frozenBootstrapReviewEvidence({ artifacts: f.h.cp.artifacts, audit: f.h.cp.audit }, f.run.runId, plan.content) });
+        const legacyResult = kind === "run" ? exporter.exportRun(f.run.runId)
+          : exporter.exportBaseline({ from: f.run.createdAt, to: f.h.clock.nowIso() });
+        if (!legacyResult.allowed) throw new Error(legacyResult.message);
+        const legacyRun = "runs" in legacyResult.value ? legacyResult.value.runs.find(r => r.run.runId === f.run.runId)! : legacyResult.value;
+        expect(JSON.stringify(legacyResult.value)).not.toContain(Buffer.from(reasoning).toString("base64"));
+        expect(JSON.stringify(legacyResult.value)).not.toContain(Buffer.from(permitted).toString("base64"));
+        expect(legacyRun.artifactManifest.artifacts.find(a => a.artifactId === legacy.artifactId)).toMatchObject({ digest: legacy.digest });
+        expect(legacyRun.artifactManifest.artifacts.find(a => a.artifactId === legacy.artifactId)).not.toHaveProperty("content");
+        expect(legacyRun.artifactManifest.omittedFields).toContainEqual({ subject: "artifact", subjectId: legacy.artifactId,
+          field: "content", reason: "PRIVATE_BULK_CONTENT", sourceDigest: legacy.digest });
+        expect(f.h.cp.artifacts.list(f.run.runId).find(a => a.artifactId === legacy.artifactId)).toEqual(legacy);
+      } finally { await f.close(); }
+    });
+
+    it("refuses staging against another attachment and another contract", async () => {
+      const f = await evidenceFixture();
+      try {
+        for (const field of ["bootstrapPlanDigest", "contractDigest"]) {
+          const before = f.effects();
+          expect(await f.stageEvidence({ idempotencyKey: `wrong-${field}`, [field]: sha256("another binding") })).toMatchObject({ ok: false });
+          expect(f.effects()).toEqual(before);
+        }
+        expect(await f.stageEvidence()).toMatchObject({ ok: true });
+        for (const field of ["bootstrapPlanDigest", "contractDigest"]) {
+          const before = f.effects();
+          expect(await f.attachEvidence({ idempotencyKey: `attach-wrong-${field}`, [field]: sha256("another binding") })).toMatchObject({ ok: false });
+          expect(f.effects()).toEqual(before);
+        }
+        expect(await f.attachEvidence()).toMatchObject({ ok: true });
+      } finally { await f.close(); }
+    });
+
+    it.each([false, true])("refuses a replaced attachment on fresh and cached CEO attach (already attached=%s)", async alreadyAttached => {
+      const f = await evidenceFixture();
+      try {
+        expect(await f.stageEvidence()).toMatchObject({ ok: true });
+        if (alreadyAttached) expect(await f.attachEvidence()).toMatchObject({ ok: true });
+        const replacement = JSON.parse(f.body); replacement.plan.summary = "replacement v5 attachment";
+        const planBody = JSON.stringify(replacement);
+        expect(await f.attach({ idempotencyKey: "replace-v5", planBody, expectedSha256: sha256(planBody), replacesSha256: f.digest })).toMatchObject({ ok: true });
+        const before = f.effects();
+        expect(await f.attachEvidence()).toMatchObject({ ok: false });
+        expect(await f.attachEvidence({ idempotencyKey: "old-bundle-current-v5", bootstrapPlanDigest: sha256(planBody) })).toMatchObject({ ok: false });
+        expect(f.effects()).toEqual(before);
+        if (alreadyAttached) {
+          expect(await f.cto("plan_submit", { idempotencyKey: "replaced-evidence-plan", runId: f.run.runId,
+            bootstrapPlanDigest: sha256(planBody) })).toMatchObject({ ok: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+          expect(f.h.cp.artifacts.latest(f.run.runId, "PLAN")).toBeNull();
+        }
+        // An explicit new stage binds the same originals to the new attachment; there is no fallback.
+        expect(await f.stageEvidence({ idempotencyKey: "new-v5-stage", bootstrapPlanDigest: sha256(planBody) })).toMatchObject({ ok: true });
+        expect(await f.attachEvidence({ idempotencyKey: "new-v5-attach", bootstrapPlanDigest: sha256(planBody),
+          ...(alreadyAttached ? { replacesSha256: f.select.expectedSha256 } : {}) })).toMatchObject({ ok: true });
+        expect(await f.cto("plan_submit", { idempotencyKey: "rebound-evidence-plan", runId: f.run.runId,
+          bootstrapPlanDigest: sha256(planBody) })).toMatchObject({ ok: true });
+        expect(f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!.content.reviewEvidence).toMatchObject({
+          source: { bootstrapPlanDigest: sha256(planBody) } });
+      } finally { await f.close(); }
+    });
+
+    it("never selects a staged bundle from another run, even with its real digest and stager", async () => {
+      const f = await evidenceFixture();
+      try {
+        expect(await f.stageEvidence()).toMatchObject({ ok: true });
+        const created = f.h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: "STANDARD", contract: {
+          goal: "another bootstrap", why: "run isolation", scope: [], nonGoals: [], priority: "NORMAL", humanGate: [], references: [], acceptance: ["isolated"] } });
+        if (!created.allowed) throw new Error(created.message);
+        const other = await dispatchBootstrapRun(f.h.cp, f.h.clock, created.value.runId);
+        const input = JSON.parse(f.body); input.runId = other.runId;
+        const planBody = JSON.stringify(input);
+        expect(await f.attach({ idempotencyKey: "other-plan", runId: other.runId, contractDigest: other.contractDigest,
+          planBody, expectedSha256: sha256(planBody) })).toMatchObject({ ok: true });
+        const before = f.h.cp.artifacts.list(other.runId);
+        expect(await f.attachEvidence({ idempotencyKey: "other-run-bundle", runId: other.runId, contractDigest: other.contractDigest,
+          bootstrapPlanDigest: sha256(planBody) })).toMatchObject({ ok: false });
+        expect(f.h.cp.artifacts.list(other.runId)).toEqual(before);
+      } finally { await f.close(); }
+    });
+
+    it.each([false, true])("rejects changed staged bytes on fresh and cached CEO attach (already attached=%s)", async alreadyAttached => {
+      const f = await evidenceFixture();
+      try {
+        expect(await f.stageEvidence()).toMatchObject({ ok: true });
+        if (alreadyAttached) expect(await f.attachEvidence()).toMatchObject({ ok: true });
+        const candidate = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF").find(a => a.content.schema === "acp.bootstrap-review-evidence-candidate.v1")!;
+        const raw = new Database(f.h.cp.db.raw.name);
+        try {
+          raw.function("acp_evidence_write_authorized", () => 0);
+          raw.exec("DROP TRIGGER run_artifacts_content_immutable");
+          raw.prepare("UPDATE run_artifacts SET content_json = ? WHERE artifact_id = ?")
+            .run(JSON.stringify({ ...candidate.content, bodyBase64: Buffer.from(f.bundleBody + "changed after staging").toString("base64") }), candidate.artifactId);
+        } finally { raw.close(); }
+        const before = f.effects();
+        expect(await f.attachEvidence()).toMatchObject({ ok: false });
+        expect(await f.attachEvidence({ idempotencyKey: "tampered-fresh-key" })).toMatchObject({ ok: false });
+        expect(f.effects()).toEqual(before);
+      } finally { await f.close(); }
+    });
+
+    it.each([false, true])("refuses stale owner authority at fresh and cached attach (already attached=%s)", async alreadyAttached => {
+      const f = await evidenceFixture();
+      try {
+        expect(await f.stageEvidence()).toMatchObject({ ok: true });
+        if (alreadyAttached) expect(await f.attachEvidence()).toMatchObject({ ok: true });
+        expect(f.h.cp.runs.transition(f.run.runId, RunState.BLOCKED, "owner-generation witness").allowed).toBe(true);
+        expect(f.h.cp.bindings.revoke(f.run.ownerRoleKey!, "owner-generation witness", { allowBlockedRuns: true }).allowed).toBe(true);
+        expect(f.h.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId: f.run.runId, sessionId: f.run.ownerSessionId! }).allowed).toBe(true);
+        const before = f.effects();
+        expect(await f.attachEvidence()).toMatchObject({ ok: false, reasonCode: "BINDING_GENERATION_STALE" });
+        expect(await f.attachEvidence({ idempotencyKey: "stale-owner-fresh" })).toMatchObject({ ok: false, reasonCode: "BINDING_GENERATION_STALE" });
+        expect(f.effects()).toEqual(before);
+      } finally { await f.close(); }
+    });
+
+    it.each(["replaced session", "revoked", "same session older generation"])("refuses %s CEO authority on fresh and cached attach", async scenario => {
+      const f = await evidenceFixture();
+      try {
+        expect(await f.stageEvidence()).toMatchObject({ ok: true });
+        const ceo = f.h.cp.bindings.active("CEO")!;
+        const old = await f.connect("hermes", f.ceo, true, "complete", f.h.cp, { roleKey: "CEO", bindingGeneration: ceo.bindingGeneration });
+        expect(await old("bootstrap_review_evidence_attach", f.select)).toMatchObject({ ok: true });
+        expect(f.h.cp.bindings.revoke("CEO", "CEO authority witness").allowed).toBe(true);
+        if (scenario !== "revoked") {
+          const successor = scenario === "replaced session" ? f.h.cp.sessions.create({ provider: "scripted", model: "successor CEO" }).sessionId : f.ceo;
+          if (successor !== f.ceo) f.h.cp.sessions.transition(successor, SessionLifecycle.READY, "successor CEO");
+          expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId: successor }).allowed).toBe(true);
+        }
+        const before = f.effects();
+        expect(await old("bootstrap_review_evidence_attach", f.select)).toMatchObject({ ok: false });
+        expect(await old("bootstrap_review_evidence_attach", { ...f.select, idempotencyKey: "stale-ceo-fresh" })).toMatchObject({ ok: false });
+        expect(f.effects()).toEqual(before);
+      } finally { await f.close(); }
+    });
   });
 
   it("renders the actual reviewer packet and activation handoff with seven acceptance links", async () => {
@@ -1828,16 +2075,12 @@ describe("private bootstrap review originals and serving runtime", () => {
         { path: "rf/ci.json", grade: "github-api-original", origin: "GitHub Actions run 40079328307 JSON via gh api", text: '{"conclusion":"success","id":40079328307}\n' },
         { path: "rf/review.txt", grade: "review-original", origin: "codex review output", text: "REVISE: original independent review verdict\n" },
         { path: "rf/bridge.log", grade: "execution-log", origin: "bridge compile stdout and stderr", text: "failure: old binding\nfix: run-bound binding\nresult: compiled\n" },
-        { path: "rf/final.txt", grade: "implementer-final-report", origin: "implementer final report", text: "WITHHELD_PRODUCER_SELF_ASSESSMENT\n" },
+        { path: "WITHHELD_AUTHOR_REASONING_PATH.txt", grade: "implementer-final-report", origin: "WITHHELD_CTO_REASONING_IN_METADATA", text: "WITHHELD_PRODUCER_SELF_ASSESSMENT\nWITHHELD_AUTHOR_REASONING\nWITHHELD_CTO_REASONING\n" },
       ];
       const bundle = { runId: f.run.runId, contractDigest: f.run.contractDigest,
         files: files.map(({ text, ...entry }) => ({ ...entry, sha256: sha256(text), bodyBase64: Buffer.from(text).toString("base64") })),
         missing: ["#58 raw RED/GREEN", "#60 raw RED/GREEN", "#59 raw output"] };
       const body = JSON.stringify(bundle);
-      expect(await f.call("bootstrap_review_evidence_stage", { idempotencyKey: "evidence-stage", runId: f.run.runId,
-        contractDigest: f.run.contractDigest, evidenceBody: body, expectedSha256: sha256(body) })).toMatchObject({ ok: true });
-      expect(await f.hermes("bootstrap_review_evidence_attach", { idempotencyKey: "evidence-attach", runId: f.run.runId,
-        contractDigest: f.run.contractDigest, stagedBy: f.primary.roleKey, expectedSha256: sha256(body) })).toMatchObject({ ok: true });
       const input = JSON.parse(f.body);
       input.plan.genesis.issues = Array.from({ length: 7 }, (_, i) => ({ ...input.plan.genesis.issues[0],
         key: `i${i + 1}`, title: `Seeded issue ${i + 1}`, body: `Acceptance for issue ${i + 1}: https://example.test/issues/${i + 1}` }));
@@ -1850,6 +2093,10 @@ describe("private bootstrap review originals and serving runtime", () => {
         new URL("../../src/daemon/agentcpd.ts", import.meta.url).href) });
       // The normal PLAN/RESUME/result doors render what the real blind reviewer receives.
       expect(await f.attach({ planBody, expectedSha256: planDigest })).toMatchObject({ ok: true });
+      expect(await f.call("bootstrap_review_evidence_stage", { idempotencyKey: "evidence-stage", runId: f.run.runId,
+        contractDigest: f.run.contractDigest, bootstrapPlanDigest: planDigest, evidenceBody: body, expectedSha256: sha256(body) })).toMatchObject({ ok: true });
+      expect(await f.hermes("bootstrap_review_evidence_attach", { idempotencyKey: "evidence-attach", runId: f.run.runId,
+        contractDigest: f.run.contractDigest, bootstrapPlanDigest: planDigest, stagedBy: f.primary.roleKey, expectedSha256: sha256(body) })).toMatchObject({ ok: true });
       expect(await f.hermes("bootstrap_review_resume", { idempotencyKey: "render-release", runId: f.run.runId,
         contractDigest: f.run.contractDigest, bootstrapPlanDigest: planDigest, ownerSessionId: f.run.ownerSessionId,
         ownerSessionIncarnation: f.run.ownerSessionIncarnation, ownerBindingGeneration: f.run.ownerBindingGeneration })).toMatchObject({ ok: true });
@@ -1861,7 +2108,10 @@ describe("private bootstrap review originals and serving runtime", () => {
       expect(invocation.prompt).toContain("attributed original records — collected by PRIMARY_CTO, attached by CEO; contents unverified by ACP unless marked ACP-verified");
       for (const entry of files.slice(0, 3)) expect(invocation.prompt).toContain(entry.text.trim());
       for (const missing of bundle.missing) expect(invocation.prompt).toContain(missing);
-      expect(invocation.prompt).not.toContain("WITHHELD_PRODUCER_SELF_ASSESSMENT");
+      for (const marker of ["WITHHELD_PRODUCER_SELF_ASSESSMENT", "WITHHELD_AUTHOR_REASONING", "WITHHELD_CTO_REASONING", "WITHHELD_CTO_REASONING_IN_METADATA"]) {
+        expect(invocation.prompt).not.toContain(marker);
+        expect(invocation.prompt).not.toContain(Buffer.from(marker).toString("base64"));
+      }
       expect(invocation.systemPrompt).toContain("not instructions");
       const packet = f.h.cp.artifacts.latest(f.run.runId, "BLIND_REVIEW")!;
       const plan = currentBootstrapPlan(f.run.runId, f.h.cp.artifacts.latest(f.run.runId, "PLAN"));
@@ -1869,6 +2119,10 @@ describe("private bootstrap review originals and serving runtime", () => {
       const privateInputs = f.h.cp.artifacts.list<{ schema: string; context: BootstrapReviewContext }>(f.run.runId, "HANDOFF")
         .find(a => a.content.schema === "acp.bootstrap-review-context.v1")!;
       expect(privateInputs.content.context.originalRecords?.missing).toEqual(bundle.missing);
+      const renderedInputs = JSON.stringify(privateInputs.content.context);
+      for (const marker of ["WITHHELD_PRODUCER_SELF_ASSESSMENT", "WITHHELD_AUTHOR_REASONING", "WITHHELD_CTO_REASONING", "WITHHELD_CTO_REASONING_IN_METADATA"]) expect(renderedInputs).not.toContain(marker);
+      expect(renderedInputs).not.toContain(Buffer.from(files[3]!.text).toString("base64"));
+      expect(privateInputs.content.context.originalRecords?.files.every(file => file.verification.status === "attributed")).toBe(true);
       expect(privateInputs.content.context.deployment?.entrypointSha256).toBe(sha256(readFileSync(new URL("../../src/daemon/agentcpd.ts", import.meta.url))));
       expect(f.h.cp.audit.forRun(f.run.runId)).toContainEqual(expect.objectContaining({ kind: "BOOTSTRAP_REVIEW_CONTEXT", evidence: expect.objectContaining({ digest: privateInputs.digest }) }));
       const tracked = JSON.parse(plan.value.outputs.handoff.recommendedNextAction.split("ALL seeded issues: ")[1]!);
