@@ -105,6 +105,15 @@ const DOOR_R1_TEST = "tests/unit/ceo-escalation-resolve-door-r1.test.ts";
 
 const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witnesses?: RollbackWitness[] }> = [
   {
+    label: "resumeBootstrapReview",
+    file: "bootstrap/bootstrap-plan-artifact.ts",
+    anchor: "): Decision<ResumeReviewResult> => source.db.txDecision(() => {",
+    witnesses: [{ file: "tests/unit/bootstrap-plan-artifact.test.ts",
+      title: "rolls back instruction, audit and wake when %s refuses" },
+    { file: "tests/unit/bootstrap-plan-artifact.test.ts",
+      title: "commits the CEO audit and resume instruction together before waking the owner" }],
+  },
+  {
     label: "stageBootstrapPlan",
     file: "bootstrap/bootstrap-plan-artifact.ts",
     anchor: "  : Decision<{ digest: string; stagedBy: string }> => source.db.txDecision(() => {",
