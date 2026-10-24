@@ -28,7 +28,10 @@ type Harness = ReturnType<typeof makeHarness>;
 const recordingTransport = () => {
   const send = vi.fn(async (_channel: string, _content: string, recipients: readonly string[]): Promise<BuzzSendReceipt> =>
     ({ eventId: `evt-${send.mock.calls.length}`, mentionPubkeys: [...recipients] }));
-  const transport: BuzzTransport = { openChannel: async (purpose) => `channel:${purpose}`, available: async () => true, send };
+  const transport: BuzzTransport = { openChannel: async (purpose) => `channel:${purpose}`, available: async () => true, send,
+    signerReadiness: async () => ({ signer: "a".repeat(64), registered: true }),
+    policyReadiness: async (_room, _body, recipient, signer) => ({ verdict: "allowed", policyDigest: "fixture-policy", recipient, signer }),
+  };
   return { transport, send };
 };
 
@@ -197,7 +200,8 @@ it("R3 boundary: an outcome-unknown Buzz send to the CEO is flagged, never re-se
     const id = notify(f.h, "timed-out");
     f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
     expect((await f.h.buzzAdapter.deliverPending()).failed).toEqual([id]);
-    expect(stateOf(f.h, id)).toMatchObject({ status: "SENT", failure_class: "unknown_observed" });
+    // A roster-verified send retains the existing PENDING/unknown representation.
+    expect(stateOf(f.h, id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed" });
     const sends = f.send.mock.calls.length;
     f.h.clock.advance(24 * 60 * 60_000);
     f.h.cp.sessions.setBuzzAddress(f.first.sessionId, "first-room-renamed");
@@ -300,8 +304,9 @@ it.each(["permission denied for sending credential", "mention_policy: signer not
     } finally { f.h.cp.close(); }
   });
 
-it("CEO 6bd2011d: a new room without daemon signer readiness is withheld", async () => {
+it("CEO 6bd2011d: a new room requires daemon signer and authoritative policy readiness", async () => {
   const f = await relayRefused();
+  Object.assign(f.transport, { policyReadiness: undefined });
   try {
     const sends = f.send.mock.calls.length;
     replaceCeo(f, "REPLACED");
@@ -312,6 +317,12 @@ it("CEO 6bd2011d: a new room without daemon signer readiness is withheld", async
     for (let n = 0; n < 2; n++) { await f.h.buzzAdapter.deliverPending(); expect(f.send.mock.calls.length).toBe(sends); }
     expect(f.h.cp.outbox.get(f.id)).toMatchObject({ status: "PENDING", failureClass: "repairable" });
     member = true;
+    await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
+    expect(f.send.mock.calls.length).toBe(sends); // Membership cannot stand in for missing policy authority.
+    Object.assign(f.transport, { policyReadiness: async (room: string, _body: string, recipient: string, signer: string) => {
+      expect(room).toBe("next-room");
+      return { verdict: "allowed", policyDigest: "next-room-policy", recipient, signer };
+    } });
     await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
     expect(f.send.mock.calls.length).toBe(sends + 1);
     expect(f.h.cp.outbox.get(f.id)).toMatchObject({ status: "SENT" });

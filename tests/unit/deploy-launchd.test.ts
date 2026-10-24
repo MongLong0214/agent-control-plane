@@ -340,6 +340,7 @@ if [[ "$target" == *"agentcpd.js" ]]; then
     "\${ACP_HERMES_EXECUTOR_RUNTIME_IDENTITY-}" "\${ACP_HERMES_GATEWAY_API_KEY-}" \\
     "\${ACP_REVIEWER_CODEX_HOME:-<unset>}" \\
     "\${ACP_HOST_PROJECT_PROVISIONER:-<unset>}" "\${ACP_BUZZ_ADMISSION_COMMAND:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
+  printf '%s' "\${ACP_BUZZ_SEND_POLICY_FILE-}" > "$ACP_LAUNCHER_POLICY_RAW"
   # The CommitLore pin (#246 B3), byte for byte. Its reader trims and splits the line above, which would
   # erase the difference between the newline security appends and a newline in the stored value. No
   # file means the variable was not exported.
@@ -376,6 +377,8 @@ exit 90
   const stdoutLog = join(home, ".agent-control-plane", "agentcpd.out.log");
   const lock = join(home, ".agent-control-plane", "agentcpd.lock");
 
+  const policyFile = join(home, "required-mentions.json");
+  writeFileSync(policyFile, "{}");
   return {
     home,
     bin,
@@ -389,11 +392,13 @@ exit 90
     env: {
       ...process.env,
       HOME: home,
+      ACP_BUZZ_SEND_POLICY_FILE: policyFile,
       PATH: `${bin}:${process.env["PATH"] ?? "/usr/bin:/bin"}`,
       ACP_LAUNCHCTL_LOG: launchLog,
       ACP_SECURITY_LOG: securityLog,
       ACP_LAUNCHER_ENV_LOG: launcherEnvLog,
       ACP_LAUNCHER_COMMITLORE_RAW: join(home, "launcher-commitlore.raw"),
+      ACP_LAUNCHER_POLICY_RAW: join(home, "launcher-policy.raw"),
       ACP_STATE_ADMIN_LOG: stateAdminLog,
       ACP_LAUNCHD_LOADED: loaded,
       ACP_LAUNCHD_BOOTOUT_PENDING: join(home, "launchd.bootout-pending"),
@@ -3535,4 +3540,59 @@ describe("the suite's executable fixture writers", () => {
       "a repeated run wrote these as new executable inodes",
     ).toEqual([]);
   });
+});
+
+
+it.each(["policy ' $ literal.json", 'policy $(literal) `literal`; "quote" [x] \\ end.json', "policy\nline\ttab.json"])("ACP1202 launcher binding: sources the generated launcher with an identical quoted policy value (%j)", name => {
+  const harness = makeHarness();
+  const policy = join(harness.home, name); writeFileSync(policy, "{}");
+  harness.env["ACP_BUZZ_SEND_POLICY_FILE"] = policy;
+  const result = runInstaller(installer, ["install", "--app-root", root, "--node", harness.node, "--no-start"], harness);
+  expect(result.status, result.stderr).toBe(0);
+  const launcher = readFileSync(launcherPath(harness), "utf8");
+  const assignment = launcher.split("\n").filter(line => line.startsWith("export ACP_BUZZ_SEND_POLICY_FILE="));
+  expect(assignment).toHaveLength(1);
+  // Source the complete generated file. Stub only its Keychain edge and final exec, so
+  // sourcing returns and we can compare the restored value byte for byte.
+  const observed = boundedSpawnSync("bash", ["-c",
+    'security() { "$ACP_TEST_SECURITY" "$@"; }; exec() { :; }; source "$1"; printf "%s" "$ACP_BUZZ_SEND_POLICY_FILE"',
+    "source-rendered-launcher", launcherPath(harness)], {
+    encoding: "utf8", env: { ...harness.env, ACP_TEST_SECURITY: join(harness.bin, "security"), ACP_BUZZ_SEND_POLICY_FILE: "/another/policy" },
+  });
+  expect(observed.status, observed.stderr).toBe(0); expect(observed.stdout).toBe(policy);
+  harness.env["ACP_BUZZ_SEND_POLICY_FILE"] = "/another/policy";
+  const launched = runGeneratedLauncher(harness);
+  expect(launched.status, launched.stderr).toBe(0);
+  expect(readFileSync(join(harness.home, "launcher-policy.raw"), "utf8")).toBe(policy);
+});
+
+it.each(["install", "upgrade"].flatMap(command => [undefined, "", "relative-policy", "/no-such-acp1202-policy"].map(policy => ({ command, policy }))))("ACP1202 launcher binding: refuses an unavailable policy before mutation ($command, $policy)", ({ command, policy }) => {
+  const harness = makeHarness();
+  if (policy === undefined) delete harness.env["ACP_BUZZ_SEND_POLICY_FILE"];
+  else harness.env["ACP_BUZZ_SEND_POLICY_FILE"] = policy;
+  const result = runInstaller(installer, [command, "--app-root", root, "--node", harness.node, "--no-start"], harness);
+  expect(result.status).not.toBe(0); expect(result.stderr).toContain("ACP_BUZZ_SEND_POLICY_FILE");
+  expect(existsSync(join(harness.home, ".agent-control-plane"))).toBe(false);
+  expect(existsSync(harness.launchLog)).toBe(false);
+});
+
+
+it.each(["install", "upgrade"].flatMap(command => [undefined, "/no-such-acp1202-policy"].map(policy => ({ command, policy }))))("ACP1202 launcher binding: undeterminable policy preserves an existing installation ($command, $policy)", ({ command, policy }) => {
+  const harness = makeHarness(); const appRoot = makeDisposableAppRoot();
+  const installed = runInstaller(installer, ["install", "--app-root", appRoot, "--node", harness.node], harness);
+  expect(installed.status, installed.stderr).toBe(0); expect(existsSync(harness.loaded)).toBe(true);
+  const runtime = join(appRoot, "dist", "bin", "node");
+  const before = { launcher: readFileSync(launcherPath(harness)), plist: readFileSync(plistPath(harness)),
+    runtime: readFileSync(runtime), launchLog: readFileSync(harness.launchLog), link: readlinkSync(currentLinkPath(harness)) };
+  if (policy === undefined) delete harness.env["ACP_BUZZ_SEND_POLICY_FILE"];
+  else harness.env["ACP_BUZZ_SEND_POLICY_FILE"] = policy;
+  const replacement = makeDisposableAppRoot();
+  const refused = runInstaller(installer, [command, "--app-root", replacement, "--node", harness.node], harness);
+  expect(readFileSync(harness.launchLog), "refusal must precede any launchd stop or other operation").toEqual(before.launchLog);
+  expect(readFileSync(launcherPath(harness)), "refusal must preserve the existing launcher").toEqual(before.launcher);
+  expect(readFileSync(plistPath(harness))).toEqual(before.plist);
+  expect(readFileSync(runtime)).toEqual(before.runtime);
+  expect(readlinkSync(currentLinkPath(harness))).toBe(before.link);
+  expect(existsSync(harness.loaded), "the original service must remain loaded").toBe(true);
+  expect(refused.status).not.toBe(0); expect(refused.stderr).toContain("ACP_BUZZ_SEND_POLICY_FILE");
 });

@@ -1,6 +1,7 @@
 import { decode } from "nostr-tools/nip19";
 import { getPublicKey } from "nostr-tools/pure";
 import type { Db } from "../db/database.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
 
 /** Decode only the daemon credential formats supported by Buzz; never change the sending bytes. */
 export const daemonBuzzSigner = (credential: string | undefined): string | null => {
@@ -13,7 +14,46 @@ export const daemonBuzzSigner = (credential: string | undefined): string | null 
   } catch { return null; }
 };
 
-/** Only this structured pre-post refusal proves sender membership is missing. */
+/** Fixed failure categories emitted by the shared wrapper evaluator, never inferred from text. */
+export type BuzzPolicyCause = "POLICY" | "ROSTER_STATE" | "CREDENTIAL" | "AUTHORITY" | "UNKNOWN";
+
+/** Public file identities only; never credentials, notification bodies or policy contents. */
+export interface BuzzPolicyIdentity {
+  configured: { file: string | null; digest: string | null };
+  reported: { file: string | null; digest: string | null };
+}
+
+/** Authority consulted by a blocked attempt; contains no copy of its rules. */
+export interface BuzzPolicyBinding {
+  routeDigest: string;
+  signer: string | null;
+  policyDigest: string | null;
+  policyIdentity?: BuzzPolicyIdentity;
+  policyCause?: BuzzPolicyCause;
+}
+
+/** A non-sending verdict from the wrapper's own evaluator, never inferred from a digest. */
+export interface BuzzPolicyReadiness {
+  verdict: "allowed" | "refused" | "undeterminable";
+  policyDigest: string | null;
+  signer: string | null;
+  recipient: string | null;
+  message?: string;
+  cause?: BuzzPolicyCause;
+  policyIdentity?: BuzzPolicyIdentity;
+}
+
+/** Only the evaluator's explicit roster-state cause may revalidate under unchanged policy.
+ * An absent cause on an undecoded transport result means binding verification never completed;
+ * decoded missing/unknown causes are normalized to UNKNOWN and keep the policy hold.
+ */
+export const buzzPolicyHoldReason = (check: Pick<BuzzPolicyReadiness, "verdict" | "cause">) => {
+  if (check.cause === "ROSTER_STATE") return ReasonCode.BUZZ_SIGNER_MEMBERSHIP_UNVERIFIED;
+  if (check.verdict === "undeterminable" && check.cause === undefined) return ReasonCode.BUZZ_SEND_POLICY_BINDING_UNVERIFIED;
+  return ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED;
+};
+
+/** Only this structured refusal proves this attempt was blocked by local send policy. */
 export const isBuzzSignerRefusal = (message: string): boolean => {
   const prefix = "buzz send failed: ";
   if (!message.startsWith(prefix)) return false;

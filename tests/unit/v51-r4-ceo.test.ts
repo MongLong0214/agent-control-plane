@@ -22,7 +22,10 @@ type Harness = ReturnType<typeof makeHarness>;
 const recordingTransport = () => {
   const send = vi.fn(async (_channel: string, _content: string, recipients: readonly string[]): Promise<BuzzSendReceipt> =>
     ({ eventId: `evt-${send.mock.calls.length}`, mentionPubkeys: [...recipients] }));
-  const transport: BuzzTransport = { openChannel: async (purpose) => `channel:${purpose}`, available: async () => true, send };
+  const transport: BuzzTransport = { openChannel: async (purpose) => `channel:${purpose}`, available: async () => true, send,
+    signerReadiness: async () => ({ signer: "a".repeat(64), registered: true }),
+    policyReadiness: async (_room, _body, recipient, signer) => ({ verdict: "allowed", policyDigest: "fixture-policy", recipient, signer }),
+  };
   return { transport, send };
 };
 
@@ -79,12 +82,16 @@ it("FCR-01 CEO: a relay's refusal stays a contract refusal when the route disapp
   } finally { f.h.cp.close(); }
 });
 
-/** A CEO notification whose Buzz send timed out: SENT, outcome unknown, at the first CEO. */
+/** Retained pre-readiness SENT/unknown history at the first CEO, with the same destination ledger. */
 const timedOut = async (key: string) => {
   const f = buzzCeo();
   const id = notify(f.h, key);
   f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
   await f.h.buzzAdapter.deliverPending();
+  expect(stateOf(f.h, id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed", target_session_id: f.first.sessionId });
+  // New sends now need readiness. Keep testing the persisted representation from the old
+  // unverified-send path, which must retain exactly its previous handover/suppression behavior.
+  f.h.cp.db.run("UPDATE outbox SET status = 'SENT', sent_at = ? WHERE message_id = ?", [f.h.clock.nowIso(), id]);
   expect(stateOf(f.h, id)).toMatchObject({ status: "SENT", failure_class: "unknown_observed", target_session_id: f.first.sessionId });
   return { ...f, id, sent: sendsOf(f.send, id) };
 };

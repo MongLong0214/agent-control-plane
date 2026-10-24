@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { finalizeEvent } from "nostr-tools/pure";
 import { afterAll, expect, it, vi } from "vitest";
 
-import { BuzzAdapter, type BuzzSendReceipt } from "../../src/buzz/buzz-adapter.ts";
+import { BuzzAdapter, type BuzzSendReceipt, type BuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { buzzMentionWakeGate, createBuzzMessageIngress, createCeoNotificationSender, createDaemonBuzzBindChallenges, createDaemonBuzzMentionSink, startDaemonBuzzMentionSubscriber } from "../../src/daemon/agentcpd.ts";
@@ -14,6 +14,7 @@ import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import { RoleConversationPort, ROLE_WAKE_FRAME, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
+import { outboxDeliveryReadback } from "../../src/outbox/outbox.ts";
 import type { DaemonNoticeTarget } from "../../src/runtime/acp-daemon-notice.ts";
 import { adoptedFixture, DIGEST, GATEWAY, LIVE, TOKEN } from "../helpers/adopted-ceo.ts";
 import { channelKey, steppedClock, storingRelay, writeSubscriberConfig } from "../helpers/buzz-mention-relay.ts";
@@ -75,14 +76,21 @@ const start = async (options: { registerWake?: boolean } = {}) => {
   const event = (content: string, author = ceo, mentioned = true) => finalizeEvent({ kind: 9, created_at: Math.floor(cp.clock.now().getTime() / 1000), tags: [...(mentioned ? [["p", cto.pubkey]] : []), ["h", ROOM]], content }, author.secretKey);
   const deliver = async (message: ReturnType<typeof event>) => { relay.publish(message); await relay.drain(subscriber); };
   const send = vi.fn(async (_room: string, _content: string, recipients: readonly string[]): Promise<BuzzSendReceipt> => ({ eventId: `sent-${send.mock.calls.length}`, mentionPubkeys: [...recipients] }));
-  const adapter = new BuzzAdapter(cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, { available: async () => true, openChannel: async () => ROOM, send });
+  const policyReadiness = vi.fn<NonNullable<BuzzTransport["policyReadiness"]>>(async (_room, _content, recipient, signer) =>
+    ({ verdict: "allowed", policyDigest: "fixture-policy", signer, recipient }));
+  const adapter = new BuzzAdapter(cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, {
+    available: async () => true, openChannel: async () => ROOM, send,
+    signerReadiness: async () => ({ signer: "fixture-signer", registered: true }),
+    localSendPolicyDigest: () => "fixture-policy",
+    policyReadiness,
+  });
   const notify = (key: string) => {
     const binding = cp.bindings.active("CEO")!;
     const result = cp.outbox.enqueue({ idempotencyKey: key, roleKey: "CEO", bindingGeneration: binding.bindingGeneration, targetSessionId: binding.sessionId, kind: MessageKind.CEO_NOTIFICATION, payload: { key } });
     if (!result.allowed) throw new Error(result.message);
     return result.value.messageId;
   };
-  return { f, cp, ceo, owner, mint, event, deliver, frames, send, adapter, notify, challenges, dir, conversation, registerWake,
+  return { f, cp, ceo, owner, mint, event, deliver, frames, send, policyReadiness, adapter, notify, challenges, dir, conversation, registerWake,
     noStoreSink: createDaemonBuzzMentionSink(cp, policy, { seam }),
     sink: createDaemonBuzzMentionSink(cp, policy, { seam }, { bindChallenges: challenges }), cto,
     bound: () => cp.audit.byKind("SESSION_BUZZ_ACTOR_BOUND").filter((row) => row.sessionId === f.gatewaySessionId),
@@ -328,7 +336,9 @@ it("a fresh signed bind restores the same CEO runtime's room and the real sweep 
     expect(f.cp.audit.byKind("SESSION_BUZZ_ADDRESS_CHANGED").filter((row) => row.sessionId === f.f.gatewaySessionId)).toEqual([expect.objectContaining({ evidence: { from: null, to: ROOM } })]);
     expect((await f.adapter.deliverPending()).delivered).toEqual(ids);
     expect(f.send).toHaveBeenCalledTimes(12);
+    expect(f.policyReadiness).toHaveBeenCalledTimes(12);
     for (const id of ids) {
+      expect(f.policyReadiness).toHaveBeenCalledWith(ROOM, expect.stringContaining(id), f.ceo.pubkey, "fixture-signer");
       expect(f.send).toHaveBeenCalledWith(ROOM, expect.stringContaining(id), [f.ceo.pubkey]);
       expect(f.cp.outbox.get(id)).toMatchObject({ status: "SENT", attempts: 1 });
       expect(f.cp.db.get("SELECT acked_at FROM outbox WHERE message_id = ?", [id])).toEqual({ acked_at: null });
@@ -389,13 +399,32 @@ it("restoring the same signed room after a Buzz timeout preserves the unknown ou
     const id = f.notify("unknown-outcome");
     f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
     expect((await f.adapter.deliverPending()).failed).toEqual([id]);
-    expect(f.cp.outbox.get(id)).toMatchObject({ status: "SENT", attempts: 1 });
+    expect(f.policyReadiness).toHaveBeenCalledExactlyOnceWith(ROOM, expect.stringContaining(id), f.ceo.pubkey, "fixture-signer");
+    // With explicit readiness this follows the existing PENDING/unknown branch, not the legacy
+    // unchecked transport's SENT branch. Neither state proves delivery or permits a resend.
+    expect(f.cp.outbox.get(id)).toMatchObject({ status: "PENDING", attempts: 1, failureClass: "unknown_observed" });
+    expect(outboxDeliveryReadback(f.cp.outbox.get(id)!)).toMatchObject({ status: "OUTCOME_UNKNOWN",
+      delivered: false, completed: false, automaticResendHeld: true });
     f.cp.sessions.setBuzzAddress(f.f.gatewaySessionId, null);
     await f.deliver(f.event(`${f.mint()}\n@cto-repo-factory restore`));
     expect(f.cp.sessions.require(f.f.gatewaySessionId).buzzAddress).toBe(ROOM);
     f.f.h.clock.advance(60 * 60_000);
     expect((await f.adapter.deliverPending()).delivered).toEqual([]);
     expect(f.send).toHaveBeenCalledTimes(1);
-    expect(f.cp.db.get("SELECT status, failure_class FROM outbox WHERE message_id = ?", [id])).toEqual({ status: "SENT", failure_class: "unknown_observed" });
+    expect(f.cp.db.get("SELECT status, failure_class FROM outbox WHERE message_id = ?", [id])).toEqual({ status: "PENDING", failure_class: "unknown_observed" });
+  } finally { await f.close(); }
+});
+
+it.each(["refused", "undeterminable"] as const)("a restored signed room still enforces a %s policy verdict", async verdict => {
+  const f = await start();
+  try {
+    await f.deliver(f.event(`${f.mint()}\n@cto-repo-factory restore`));
+    const id = f.notify(`policy-${verdict}`);
+    f.policyReadiness.mockResolvedValue({ verdict, cause: "POLICY", policyDigest: "fixture-policy", signer: "fixture-signer", recipient: f.ceo.pubkey });
+    expect((await f.adapter.deliverPending()).delivered).toEqual([]);
+    expect(f.policyReadiness).toHaveBeenCalledExactlyOnceWith(ROOM, expect.stringContaining(id), f.ceo.pubkey, "fixture-signer");
+    expect(f.send).not.toHaveBeenCalled();
+    expect(f.cp.outbox.get(id)).toMatchObject({ status: "PENDING" });
+    expect(f.cp.db.all("SELECT * FROM outbox_sent_destinations WHERE message_id = ?", [id])).toEqual([]);
   } finally { await f.close(); }
 });
