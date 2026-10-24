@@ -149,6 +149,13 @@ export const attachBootstrapPlan = (
       || ceo.sessionIncarnation !== peer.sessionIncarnation || turn?.principal !== "owner") {
     return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "attaching input requires the current CEO's authenticated Hermes owner turn");
   }
+  // Canonical artifact JSON normalizes CR/CRLF. Identifiers must survive storage unchanged;
+  // use ACP's C0/DEL exclusion for identifiers, without restricting the exact-bytes body.
+  if (Object.values(bindingOf(input)).some(value => /[\x00-\x1f\x7f]/.test(value))) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "bootstrap PLAN binding identifiers must not contain control characters", {
+      refusal: "BOOTSTRAP_PLAN_BINDING_INVALID",
+    });
+  }
   const admitted = assertBootstrapPlanAttachable(source, input);
   if (!admitted.allowed) return admitted;
   const run = admitted.value;

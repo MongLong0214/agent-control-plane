@@ -170,6 +170,8 @@ reservation or permission to execute an external write.
    })
    ```
 
+   Binding identifiers reject C0 control characters and DEL before any artifact,
+   audit event or wake is written; this does not restrict newlines in the body.
    `planBody` is a string carrying the original file contents. MCP JSON escaping
    preserves that string; ACP never reserializes its JSON to determine the hash.
    The binding arguments must match the run and the body: `requestDigest`,

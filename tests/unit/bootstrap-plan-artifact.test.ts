@@ -79,6 +79,10 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
       ]));
       expect(await f.cto("plan_submit", { idempotencyKey: "submit", runId: f.run.runId, bootstrapPlanDigest: f.digest }))
         .toMatchObject({ ok: true, value: { digest: f.digest } });
+      const afterSubmit = f.h.cp.artifacts.list(f.run.runId);
+      expect(await f.attach()).toMatchObject({ ok: true, value: { digest: f.digest } });
+      expect(await f.attach({ idempotencyKey: "retry-after-submit" })).toMatchObject({ ok: true, value: { digest: f.digest } });
+      expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(afterSubmit);
       expect(await f.cto("plan_submit", { idempotencyKey: "submit", runId: f.run.runId, bootstrapPlanDigest: sha256("changed reference") }))
         .toMatchObject({ ok: false, reasonCode: "CONFLICT" });
       const storedPlan = f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!;
@@ -96,6 +100,28 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
         resultSummary: "compiled bootstrap inputs", recommendation: "review" })).toMatchObject({ ok: true });
       expect(f.h.cp.artifacts.latest<Args>(f.run.runId, "BLIND_REVIEW")?.content).toMatchObject({ verdict: "PASS" });
       expect(f.h.cp.runs.require(f.run.runId).state).toBe("READY_FOR_CEO_REVIEW");
+    } finally { await f.close(); }
+  });
+
+  it.each(["\r", "\r\n"])("preserves body string values containing %j through attach, read, submit and retry", async (control) => {
+    const f = await fixture();
+    try {
+      const input = JSON.parse(f.body);
+      input.plan.summary = `First line${control}Second line`;
+      const body = JSON.stringify(input, null, 2).replace(/\n/g, "\r\n") + "\r\n";
+      const digest = sha256(body);
+      const args = { planBody: body, expectedSha256: digest };
+      expect(JSON.parse(body).plan.summary).toBe(input.plan.summary);
+      expect(await f.attach(args)).toMatchObject({ ok: true, value: { digest } });
+      const attachment = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")[0]!;
+      expect(Buffer.from(attachment.content.bodyBase64 as string, "base64")).toEqual(Buffer.from(body, "utf8"));
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId })).toMatchObject({ ok: true, value: { digest, planBody: body } });
+      expect(await f.cto("plan_submit", { idempotencyKey: "body-controls-submit", runId: f.run.runId, bootstrapPlanDigest: digest }))
+        .toMatchObject({ ok: true, value: { digest } });
+      const artifacts = f.h.cp.artifacts.list(f.run.runId);
+      expect(await f.attach(args)).toMatchObject({ ok: true, value: { digest } });
+      expect(await f.attach({ ...args, idempotencyKey: "body-controls-retry" })).toMatchObject({ ok: true, value: { digest } });
+      expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(artifacts);
     } finally { await f.close(); }
   });
 
@@ -393,6 +419,54 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
       expect(f.h.cp.artifacts.list(f.run.runId, "HANDOFF")).toHaveLength(2);
     } finally { await f.close(); }
   });
+
+  it.each(["bootstrapOperationId", "projectId", "repositoryIdentity", "contractDigest"].flatMap(field =>
+    ["\r", "\r\n"].map(control => ({ field, control }))))(
+    "ACP1195-R1-01: atomically rejects $field containing $control", async ({ field, control }) => {
+      const f = await fixture();
+      try {
+        const input = JSON.parse(f.body);
+        const value = `${f.attachArgs[field as keyof typeof f.attachArgs]}${control}id`;
+        if (field === "bootstrapOperationId") input.plan.bootstrapOperationId = value;
+        if (field === "projectId") input.plan.projectManifest.projectId = value;
+        if (field === "contractDigest") input.plan.requestDigest = value;
+        if (field === "repositoryIdentity") {
+          const previous = input.plan.projectManifest.repositories[0].remote;
+          input.plan.projectManifest.repositories[0].remote = value;
+          for (const operation of input.plan.githubOperations) operation.resourceIdentity = operation.resourceIdentity.replace(previous, value);
+        }
+        const body = JSON.stringify(input, null, 2) + "\r\n";
+        const args = { ...f.attachArgs, [field]: value, planBody: body, expectedSha256: sha256(body) };
+        const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
+        f.h.cp.outbox.attachInBandWake(wake);
+        const state = () => ({ artifacts: f.h.cp.artifacts.list(f.run.runId),
+          plan: f.h.cp.artifacts.latest(f.run.runId, "PLAN"), run: f.h.cp.runs.require(f.run.runId),
+          candidate: f.h.cp.runs.currentCandidate(f.run.runId), application: f.h.cp.bootstrapApplications.get(f.run.runId),
+          audit: f.h.cp.audit.forRun(f.run.runId), outbox: f.h.cp.outbox.listByRun(f.run.runId) });
+        // Also test the sealed port: contractDigest already has a strict MCP digest schema,
+        // while every binding field must receive the same domain-level refusal before writes.
+        const rejectWithoutChanges = async (rejected: typeof args & { replacesSha256?: string }) => {
+          const before = state();
+          expect(createHermesMcpPort(f.h.cp).attachBootstrapPlan({ actor: f.ceo, sessionId: f.ceo,
+            sessionIncarnation: f.h.cp.sessions.require(f.ceo).incarnation }, { principal: "owner", peerGrant: null }, rejected as Parameters<ReturnType<typeof createHermesMcpPort>["attachBootstrapPlan"]>[2]))
+            .toMatchObject({ allowed: false, reasonCode: "INVALID_ARGUMENT", evidence: { refusal: "BOOTSTRAP_PLAN_BINDING_INVALID" } });
+          expect(await f.attach(rejected)).toMatchObject({ ok: false });
+          expect(state()).toEqual(before);
+          expect(wake).not.toHaveBeenCalled();
+        };
+        await rejectWithoutChanges(args);
+        // A rejected correction must also leave an existing PLAN and approval intact.
+        expect(await f.attach({ idempotencyKey: "valid-input" })).toMatchObject({ ok: true });
+        await vi.waitFor(() => expect(wake).toHaveBeenCalled());
+        expect(await f.cto("plan_submit", { idempotencyKey: "valid-submit", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
+        f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+        expect(await f.cto("result_submit", { idempotencyKey: "valid-review", runId: f.run.runId, resultSummary: "ready", recommendation: "review" })).toMatchObject({ ok: true });
+        expect(f.h.cp.artifacts.latest(f.run.runId, "PLAN")).not.toBeNull();
+        expect(f.h.cp.artifacts.latest(f.run.runId, "APPROVAL")).not.toBeNull();
+        wake.mockClear();
+        await rejectWithoutChanges({ ...args, idempotencyKey: "invalid-correction", replacesSha256: f.digest });
+      } finally { await f.close(); }
+    });
 
   it("bounds bytes and refuses malformed JSON, a different run, and terminal runs", async () => {
     const f = await fixture();

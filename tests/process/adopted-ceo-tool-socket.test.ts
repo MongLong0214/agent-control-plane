@@ -5,6 +5,10 @@ import { PassThrough } from "node:stream";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ATTACH_EXIT, runAdoptedCeoAttachRelay } from "../../src/cli/attach-relay.ts";
+import { sha256 } from "../../src/core/digest.ts";
+import { callCtoToolAsOwner } from "../helpers/bootstrap-plan.ts";
+import { bootstrapCtoProvider } from "../helpers/harness.ts";
+import { genesisPlanFixture } from "../helpers/genesis-github.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   BuzzActorIngress,
@@ -309,6 +313,38 @@ describe("the adopted CEO tool socket, through the relay", () => {
 
     r.stdin.end();
     expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
+  });
+
+  it("attaches a bootstrap PLAN through the adopted CEO socket and the owner reads and submits its exact digest", async () => {
+    const { fixture, tools } = await started(true);
+    const { h } = fixture;
+    bootstrapCtoProvider(h.cp, h.clock);
+    const r = await initialized(tools.socketPath);
+    try {
+      const create = runCreate("plan-socket-create", OWNER_TURN);
+      create.arguments = { ...(create.arguments as Record<string, unknown>), kind: "PROJECT_BOOTSTRAP", executionMode: "STANDARD" };
+      const created = await r.request("tools/call", create);
+      expect(created.result?.structuredContent).toMatchObject({ ok: true });
+      const runId = (created.result!.structuredContent!.value as { runId: string }).runId;
+      expect((await r.request("tools/call", { name: "run_dispatch", arguments: { idempotencyKey: "plan-socket-dispatch", runId }, _meta: OWNER_TURN }))
+        .result?.structuredContent).toMatchObject({ ok: true });
+      const run = h.cp.runs.require(runId);
+      const plan: Record<string, unknown> = { ...genesisPlanFixture().artifact.content, requestDigest: run.contractDigest };
+      const manifest = plan["projectManifest"] as { projectId: string; repositories: Array<{ remote: string }> };
+      const body = JSON.stringify({ runId, plan, tasks: [{ key: "create", title: "Create repository", category: "implementation" }] }, null, 2) + "\r\n";
+      const digest = sha256(body);
+      const attach = { name: "bootstrap_plan_attach", arguments: { idempotencyKey: "plan-socket-attach", runId,
+        planBody: body, expectedSha256: digest, contractDigest: run.contractDigest,
+        bootstrapOperationId: plan["bootstrapOperationId"], projectId: manifest.projectId,
+        repositoryIdentity: manifest.repositories[0]!.remote }, _meta: OWNER_TURN };
+      expect((await r.request("tools/call", attach)).result?.structuredContent).toMatchObject({ ok: true, value: { digest } });
+      expect((await r.request("tools/call", attach)).result?.structuredContent).toMatchObject({ ok: true, value: { digest } });
+      expect((await callCtoToolAsOwner(h, runId, "bootstrap_plan_get", { runId })).body)
+        .toMatchObject({ ok: true, value: { digest, planBody: body } });
+      expect((await callCtoToolAsOwner(h, runId, "plan_submit", { idempotencyKey: "plan-socket-submit", runId, bootstrapPlanDigest: digest })).body)
+        .toMatchObject({ ok: true, value: { digest } });
+      expect(h.cp.artifacts.list(runId, "HANDOFF")).toHaveLength(1);
+    } finally { r.stdin.end(); await settles(r.exit); }
   });
 
   it("admits the same Gateway again on reconnect and concurrently, with the generation unchanged", async () => {
