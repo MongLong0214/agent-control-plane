@@ -1,0 +1,7 @@
+Limit: bootstrap_review_resume lets only the authenticated current CEO tell the current owner of an ACTIVE bootstrap run to resubmit the CURRENT attached PLAN by digest for a new blind review; it validates run, contract digest, attachment digest and owner session/incarnation/generation, records the CEO audit and a durable RESUME_REVIEW delivery in one transaction, voids on receipt if the attachment changed, never auto-resubmits and never grants CONFIRM, genesis, workflow approval or a review PASS (CEO 26c72ba9).
+Record-Id: r-8610150c4be9
+Provenance: inherited d8c49590b07fa2583515c82504d61b35241360e5
+
+Limit: a RESUME_REVIEW instruction wakes its current canonical holder through the existing in-band path even while the holder's mention identity is excluded, but a wrong-run, stale-owner-generation or unauthenticated call produces zero wakes, instructions and audits; its transaction is a census-registered txDecision site whose refusal leaves no audit and no enqueue (CI 40102104818, CEO a9e51f52).
+Record-Id: r-429bdad0b0bd
+Provenance: inherited e081ff82ad1588f01b98069ea582ec0942010416
