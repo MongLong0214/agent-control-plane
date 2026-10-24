@@ -1,5 +1,9 @@
+import type { BootstrapReviewContext } from "../../src/review/blind-review.ts";
+import type { Decision } from "../../src/core/errors.ts";
 import { collectBootstrapCeoDecisions } from "../../src/bootstrap/bootstrap-ceo-decisions.ts";
-import { chmodSync } from "node:fs";
+import { recordBootstrapServingRuntime } from "../../src/bootstrap/bootstrap-runtime-observation.ts";
+import { currentBootstrapPlan, planForSubmission, deliveredBootstrapHandoff } from "../../src/bootstrap/bootstrap-plan.ts";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -541,7 +545,7 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
       expect(f.h.cp.artifacts.latest(f.run.runId, "BLIND_REVIEW")).toBeNull();
       expect(f.h.cp.artifacts.list(f.run.runId, "APPROVAL").filter(a => !a.superseded)).toHaveLength(0);
       expect(f.h.cp.bootstrapApplications.get(f.run.runId)).toBeNull();
-      expect(f.h.cp.artifacts.list(f.run.runId, "HANDOFF")).toHaveLength(2);
+      expect(f.h.cp.artifacts.list<{ schema: string }>(f.run.runId, "HANDOFF").filter(a => a.content.schema === "acp.bootstrap-plan-input.v1")).toHaveLength(2);
     } finally { await f.close(); }
   });
 
@@ -617,7 +621,7 @@ async function stagingFixture(principal: "owner" | "peer" = "owner") {
     audit: f.h.cp.audit.forRun(f.run.runId), outbox: f.h.cp.outbox.listByRun(f.run.runId),
     receipts: f.h.cp.db.all("SELECT * FROM inbound_messages WHERE channel = 'mcp'") });
   const attach = (overrides: Args = {}) => f.attach({ stagedBy: primary.roleKey, ...overrides });
-  return { ...f, primary, stage, state, attach };
+  return { ...f, primary, call, stage, state, attach };
 }
 
 describe("bounded PRIMARY_CTO bootstrap candidate staging", () => {
@@ -1405,16 +1409,49 @@ describe("bootstrap_review_resume", () => {
       expect(f.h.cp.audit.byKind("CEO_DECISION")[0]!.evidence).toMatchObject({ instruction: "RESUME_REVIEW", messageId: instruction.messageId });
       expect(f.h.cp.artifacts.list(f.run.runId, "APPROVAL")).toEqual([]);
       expect(f.h.cp.bootstrapApplications.get(f.run.runId)).toBeNull();
-      expect(collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId)).toEqual([]);
+      const records = collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId);
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        runId: f.run.runId, escalationId: null, resolution: received.payload.directive,
+        source: { kind: "ACP_CEO_REVIEW_ENTRY_RELEASE", sessionId: f.ceo,
+          decisionEventId: f.h.cp.audit.byKind("CEO_DECISION")[0]!.eventId,
+          messageId: instruction.messageId, payloadDigest: instruction.payloadDigest,
+          contractDigest: f.run.contractDigest, bootstrapPlanDigest: f.digest },
+      });
       expect(f.h.cp.audit.byKind("OWNER_DECISION")).toEqual([]);
       expect(f.h.cp.audit.byKind("CEO_DECISION").some(a => a.evidence["decision"] === "CONFIRM")).toBe(false);
       expect(f.h.cp.runs.require(f.run.runId).state).toBe("ACTIVE");
       expect(f.h.cp.runs.currentCandidate(f.run.runId)).toEqual(firstCandidate);
       expect(await f.cto("plan_submit", { idempotencyKey: "resume-plan", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
+      const frozen = f.h.cp.artifacts.latest(f.run.runId, "PLAN")!;
+      expect(frozen.content).toMatchObject({ authenticatedCeoDecisions: records });
+      const planned = currentBootstrapPlan(f.run.runId, frozen);
+      if (!planned.allowed) throw new Error(planned.message);
+      expect(planned.value.outputs.handoff.recentDecisions).toContain(JSON.stringify({ authenticatedCeoDecision: records[0] }));
+      const instructionText = planned.value.outputs.handoff.recommendedNextAction;
+      expect(instructionText).toContain("existing runs and dependencies first");
+      expect(instructionText).toContain("rollback-able");
+      expect(instructionText).toContain("never create runs mechanically one per issue");
+      expect(instructionText).toContain("EVERY seeded issue's acceptance");
+      const issues = (f.plan["genesis"] as { issues: Array<{ key: string; title: string; body: string }> }).issues;
+      expect(JSON.parse(instructionText.split("ALL seeded issues: ")[1]!)).toEqual(issues.map(issue => ({
+        repository: f.attachArgs.repositoryIdentity, key: issue.key, title: issue.title, acceptance: issue.body,
+      })));
+      // Another genuine release after submission stays outside this PLAN's review and handoff.
+      expect(await f.hermes("bootstrap_review_resume", args(f, { idempotencyKey: "later-release" }))).toMatchObject({ ok: true });
+      expect(collectBootstrapCeoDecisions(f.h.cp.db, f.run.runId)).toHaveLength(2);
+      expect(currentBootstrapPlan(f.run.runId, f.h.cp.artifacts.latest(f.run.runId, "PLAN")))
+        .toMatchObject({ allowed: true, value: { outputs: { handoff: planned.value.outputs.handoff } } });
       f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
       expect(await f.cto("result_submit", { idempotencyKey: "resume-result", runId: f.run.runId, resultSummary: "resubmitted current PLAN", recommendation: "review" })).toMatchObject({ ok: true });
-      // Snapshot identity is content-based: a second freeze of these same bytes keeps the digest.
-      expect(f.h.cp.runs.currentCandidate(f.run.runId)).toEqual(firstCandidate);
+      // The release is newly frozen authority, so the re-review judges a new candidate.
+      expect(f.h.cp.runs.currentCandidate(f.run.runId)).not.toEqual(firstCandidate);
+      const prompt = f.h.scripted.invocations.filter(i => /Bootstrap plan review/.test(i.prompt)).at(-1)!.prompt;
+      expect(prompt).toContain("release of review entry");
+      expect(prompt).toContain("distinct from escalation resolutions");
+      expect(prompt).toContain(records[0]!.digest);
+      const decisionSection = prompt.split("## Authenticated CEO decisions (ACP records)")[1]!.split("```json\n")[1]!.split("\n```")[0]!;
+      expect(JSON.parse(decisionSection)).toEqual(records);
       const freezes = f.h.cp.audit.forRun(f.run.runId).filter(a => a.kind === "CANDIDATE_FROZEN");
       expect(freezes).toHaveLength(2);
       expect(freezes[0]!.evidence["attemptId"]).not.toEqual(freezes[1]!.evidence["attemptId"]);
@@ -1709,6 +1746,155 @@ describe("bootstrap_review_resume", () => {
       expect(f.h.cp.runs.cancel(f.run.runId, "finished").allowed).toBe(true);
       expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: false, reasonCode: "RUN_ALREADY_TERMINAL" });
       expect(instructions(f)).toEqual([]);
+    } finally { await f.close(); }
+  });
+});
+
+describe("private bootstrap review originals and serving runtime", () => {
+  it("shows ACP deployment observation separately from code guarantees and execution results", async () => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await f.cto("plan_submit", { idempotencyKey: "runtime-plan", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      const reviewed = await f.cto("result_submit", { idempotencyKey: "runtime-review", runId: f.run.runId, resultSummary: "review", recommendation: "review" });
+      expect(reviewed, JSON.stringify(reviewed)).toMatchObject({ ok: true });
+      const prompt = f.h.scripted.invocations.find(i => /Bootstrap plan review/.test(i.prompt))!.prompt;
+      expect(prompt).toContain("## Observed serving daemon (ACP record)");
+      expect(prompt).toContain("No ACP startup observation for this process");
+      expect(prompt).toContain("## Individual gate execution records");
+      expect(prompt).toContain("Code guarantees are not individual gate execution results");
+    } finally { await f.close(); }
+  });
+
+  it.each(["wrong run", "file digest", "duplicate path", "forged verification", "missing excerpt sections", "oversized"])(
+    "refuses %s evidence before an immutable upload exists", async fault => {
+      const f = await stagingFixture();
+      try {
+        const text = "failure\nfix\nresult\n";
+        const file: Args = { path: "original.log", origin: "execution stdout", grade: "execution-log", sha256: sha256(text), bodyBase64: Buffer.from(text).toString("base64") };
+        if (fault === "file digest") file.sha256 = sha256("other");
+        if (fault === "forged verification") file.verification = "ACP-verified";
+        if (fault === "missing excerpt sections") file.excerpt = { originalSha256: sha256("original"), omitted: true, ranges: [{ section: "result", startLine: 20, endLine: 22 }] };
+        if (fault === "oversized") file.origin = "x".repeat(128 * 1024);
+        const body = JSON.stringify({ runId: fault === "wrong run" ? "run_other" : f.run.runId, contractDigest: f.run.contractDigest,
+          files: fault === "duplicate path" ? [file, file] : [file], missing: ["#58 raw RED/GREEN", "#60 raw RED/GREEN", "#59 raw output"] });
+        const before = f.h.cp.artifacts.list(f.run.runId);
+        expect(await f.call("bootstrap_review_evidence_stage", { idempotencyKey: "invalid-evidence", runId: f.run.runId,
+          contractDigest: f.run.contractDigest, evidenceBody: body, expectedSha256: sha256(body) })).toMatchObject({ ok: false });
+        expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(before);
+      } finally { await f.close(); }
+    });
+
+  it("admits only current PRIMARY_CTO staging and CEO selection; freezes the selected originals", async () => {
+    const f = await stagingFixture();
+    try {
+      const text = "failure: original failed\nfix: original fix\nresult: original passed\n";
+      const originalSha256 = sha256("full original file retained by collector");
+      const bundle = { runId: f.run.runId, contractDigest: f.run.contractDigest, files: [{ path: "execution.log", sha256: sha256(text),
+        origin: "original execution stdout; explicit excerpt", grade: "execution-log", bodyBase64: Buffer.from(text).toString("base64"),
+        excerpt: { originalSha256, omitted: true, ranges: [{ section: "failure", startLine: 2, endLine: 4 },
+          { section: "fix", startLine: 20, endLine: 25 }, { section: "result", startLine: 40, endLine: 42 }] } }],
+        missing: ["#58 raw RED/GREEN", "#60 raw RED/GREEN", "#59 raw output"] };
+      const body = JSON.stringify(bundle);
+      const args = { idempotencyKey: "originals", runId: f.run.runId, contractDigest: f.run.contractDigest, evidenceBody: body, expectedSha256: sha256(body) };
+      expect(await f.cto("bootstrap_review_evidence_stage", args)).toMatchObject({ ok: false });
+      const stale = await f.connect("cto", f.primary.sessionId, true, "complete", f.h.cp, { roleKey: f.primary.roleKey, bindingGeneration: f.primary.generation + 1 });
+      expect(await stale("bootstrap_review_evidence_stage", args)).toMatchObject({ ok: false });
+      expect(await f.call("bootstrap_review_evidence_stage", args)).toMatchObject({ ok: true });
+      expect(await f.call("bootstrap_review_evidence_stage", args)).toMatchObject({ ok: true });
+      const select = { ...args, idempotencyKey: "select-originals", evidenceBody: undefined, stagedBy: f.primary.roleKey };
+      const notCeo = await f.connect("hermes", f.primary.sessionId);
+      expect(await notCeo("bootstrap_review_evidence_attach", select)).toMatchObject({ ok: false });
+      expect(await f.hermes("bootstrap_review_evidence_attach", { ...select, idempotencyKey: "wrong-slot", stagedBy: "PRIMARY_CTO:other" })).toMatchObject({ ok: false });
+      expect(await f.hermes("bootstrap_review_evidence_attach", { ...select, idempotencyKey: "wrong-digest", expectedSha256: sha256("other") })).toMatchObject({ ok: false });
+      const attached = await f.hermes("bootstrap_review_evidence_attach", select);
+      expect(attached, JSON.stringify(attached)).toMatchObject({ ok: true });
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(await f.cto("plan_submit", { idempotencyKey: "frozen-originals", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true });
+      const frozen = f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")!;
+      expect(frozen.content.reviewEvidence).toMatchObject({ bundle, source: { stagedBy: f.primary.roleKey, attachedBySessionId: f.ceo } });
+      const nextBody = JSON.stringify({ ...bundle, missing: [...bundle.missing, "later missing item"] });
+      expect(await f.call("bootstrap_review_evidence_stage", { ...args, idempotencyKey: "later-originals", evidenceBody: nextBody, expectedSha256: sha256(nextBody) })).toMatchObject({ ok: true });
+      expect(await f.hermes("bootstrap_review_evidence_attach", { ...select, idempotencyKey: "later-attach", expectedSha256: sha256(nextBody), replacesSha256: sha256(body) })).toMatchObject({ ok: true });
+      expect(f.h.cp.artifacts.latest(f.run.runId, "PLAN")).toEqual(frozen);
+    } finally { await f.close(); }
+  });
+
+  it("renders the actual reviewer packet and activation handoff with seven acceptance links", async () => {
+    const f = await stagingFixture();
+    try {
+      const files = [
+        { path: "rf/ci.json", grade: "github-api-original", origin: "GitHub Actions run 40079328307 JSON via gh api", text: '{"conclusion":"success","id":40079328307}\n' },
+        { path: "rf/review.txt", grade: "review-original", origin: "codex review output", text: "REVISE: original independent review verdict\n" },
+        { path: "rf/bridge.log", grade: "execution-log", origin: "bridge compile stdout and stderr", text: "failure: old binding\nfix: run-bound binding\nresult: compiled\n" },
+        { path: "rf/final.txt", grade: "implementer-final-report", origin: "implementer final report", text: "WITHHELD_PRODUCER_SELF_ASSESSMENT\n" },
+      ];
+      const bundle = { runId: f.run.runId, contractDigest: f.run.contractDigest,
+        files: files.map(({ text, ...entry }) => ({ ...entry, sha256: sha256(text), bodyBase64: Buffer.from(text).toString("base64") })),
+        missing: ["#58 raw RED/GREEN", "#60 raw RED/GREEN", "#59 raw output"] };
+      const body = JSON.stringify(bundle);
+      expect(await f.call("bootstrap_review_evidence_stage", { idempotencyKey: "evidence-stage", runId: f.run.runId,
+        contractDigest: f.run.contractDigest, evidenceBody: body, expectedSha256: sha256(body) })).toMatchObject({ ok: true });
+      expect(await f.hermes("bootstrap_review_evidence_attach", { idempotencyKey: "evidence-attach", runId: f.run.runId,
+        contractDigest: f.run.contractDigest, stagedBy: f.primary.roleKey, expectedSha256: sha256(body) })).toMatchObject({ ok: true });
+      const input = JSON.parse(f.body);
+      input.plan.genesis.issues = Array.from({ length: 7 }, (_, i) => ({ ...input.plan.genesis.issues[0],
+        key: `i${i + 1}`, title: `Seeded issue ${i + 1}`, body: `Acceptance for issue ${i + 1}: https://example.test/issues/${i + 1}` }));
+      delete input.plan.githubOperations;
+      const normalized = planForSubmission(f.run, input.plan);
+      if (!normalized.allowed) throw new Error(normalized.message);
+      const planBody = JSON.stringify({ ...input, plan: normalized.value });
+      const planDigest = sha256(planBody);
+      f.h.cp.review.attach({ servingRuntimeEventId: recordBootstrapServingRuntime(f.h.cp.audit,
+        new URL("../../src/daemon/agentcpd.ts", import.meta.url).href) });
+      // The normal PLAN/RESUME/result doors render what the real blind reviewer receives.
+      expect(await f.attach({ planBody, expectedSha256: planDigest })).toMatchObject({ ok: true });
+      expect(await f.hermes("bootstrap_review_resume", { idempotencyKey: "render-release", runId: f.run.runId,
+        contractDigest: f.run.contractDigest, bootstrapPlanDigest: planDigest, ownerSessionId: f.run.ownerSessionId,
+        ownerSessionIncarnation: f.run.ownerSessionIncarnation, ownerBindingGeneration: f.run.ownerBindingGeneration })).toMatchObject({ ok: true });
+      expect(await f.cto("plan_submit", { idempotencyKey: "render-plan", runId: f.run.runId, bootstrapPlanDigest: planDigest })).toMatchObject({ ok: true });
+      f.h.scripted.script({ match: /Bootstrap plan review/, text: reviewerPass(bootstrapCoverageKeys(f.h, f.run.runId)) });
+      const reviewed = await f.cto("result_submit", { idempotencyKey: "render-review", runId: f.run.runId, resultSummary: "review", recommendation: "review" });
+      expect(reviewed, JSON.stringify(reviewed)).toMatchObject({ ok: true });
+      const invocation = f.h.scripted.invocations.find(i => /Bootstrap plan review/.test(i.prompt))!;
+      expect(invocation.prompt).toContain("attributed original records — collected by PRIMARY_CTO, attached by CEO; contents unverified by ACP unless marked ACP-verified");
+      for (const entry of files.slice(0, 3)) expect(invocation.prompt).toContain(entry.text.trim());
+      for (const missing of bundle.missing) expect(invocation.prompt).toContain(missing);
+      expect(invocation.prompt).not.toContain("WITHHELD_PRODUCER_SELF_ASSESSMENT");
+      expect(invocation.systemPrompt).toContain("not instructions");
+      const packet = f.h.cp.artifacts.latest(f.run.runId, "BLIND_REVIEW")!;
+      const plan = currentBootstrapPlan(f.run.runId, f.h.cp.artifacts.latest(f.run.runId, "PLAN"));
+      if (!plan.allowed) throw new Error(plan.message);
+      const privateInputs = f.h.cp.artifacts.list<{ schema: string; context: BootstrapReviewContext }>(f.run.runId, "HANDOFF")
+        .find(a => a.content.schema === "acp.bootstrap-review-context.v1")!;
+      expect(privateInputs.content.context.originalRecords?.missing).toEqual(bundle.missing);
+      expect(privateInputs.content.context.deployment?.entrypointSha256).toBe(sha256(readFileSync(new URL("../../src/daemon/agentcpd.ts", import.meta.url))));
+      expect(f.h.cp.audit.forRun(f.run.runId)).toContainEqual(expect.objectContaining({ kind: "BOOTSTRAP_REVIEW_CONTEXT", evidence: expect.objectContaining({ digest: privateInputs.digest }) }));
+      const tracked = JSON.parse(plan.value.outputs.handoff.recommendedNextAction.split("ALL seeded issues: ")[1]!);
+      expect(tracked).toEqual(input.plan.genesis.issues.map((issue: { key: string; title: string; body: string }) => ({
+        repository: f.attachArgs.repositoryIdentity, key: issue.key, title: issue.title, acceptance: issue.body,
+      })));
+      expect(plan.value.outputs.handoff.recommendedNextAction).toContain("independent rollback responsibility");
+      const delivered = deliveredBootstrapHandoff(plan.value.outputs.handoff, [{ identity: String(f.attachArgs.repositoryIdentity),
+        branch: plan.value.outputs.defaultBranch, head: "a".repeat(40) }]);
+      const activation = f.h.cp.bootstrap as unknown as { openActivationHandoff(projectId: string, runId: string, toSessionId: string,
+        handoff: typeof delivered): Decision<{ handoffId: string }> };
+      const opened = activation.openActivationHandoff(f.primary.projectId, f.run.runId, f.primary.sessionId, delivered);
+      if (!opened.allowed) throw new Error(opened.message);
+      const actual = f.h.cp.artifacts.list<{ handoffId: string; handoff: typeof delivered }>(f.run.runId, "HANDOFF")
+        .find(a => a.content.handoffId === opened.value.handoffId)!.content.handoff;
+      // Compare the actual activation payload with the reviewer-visible planned responsibility.
+      expect(actual.recommendedNextAction).toBe(plan.value.outputs.handoff.recommendedNextAction);
+      expect(actual.recentDecisions).toEqual(plan.value.outputs.handoff.recentDecisions);
+      const renderDir = process.env["ACP_REVIEW_RENDER_DIR"];
+      if (renderDir) {
+        mkdirSync(renderDir, { recursive: true });
+        writeFileSync(join(renderDir, "plan-review.txt"), invocation.systemPrompt + "\n\n" + invocation.prompt);
+        writeFileSync(join(renderDir, "packet.json"), JSON.stringify({ verdictPacket: packet.content, privateInputs: privateInputs.content }, null, 2));
+        writeFileSync(join(renderDir, "activation-handoff.json"), JSON.stringify(actual, null, 2));
+        expect(readFileSync(join(renderDir, "activation-handoff.json"), "utf8")).toContain("EVERY seeded issue's acceptance");
+      }
     } finally { await f.close(); }
   });
 });

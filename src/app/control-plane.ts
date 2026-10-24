@@ -1,3 +1,5 @@
+import { verifyReviewGithubEntry } from "../bootstrap/bootstrap-review-evidence-github.ts";
+import { GhCliGitHubClient } from "../bootstrap/github-write-port.ts";
 import { ResidentProjectProvisioning } from '../bootstrap/resident-project-provisioning.ts';
 import { ExecFileHostProjectProvisioner, type HostProjectProvisioner } from '../runtime/host-project-provisioner.ts';
 import { dirname, join } from "node:path";
@@ -601,6 +603,11 @@ export class ControlPlane {
         .filter(({ roles }) => roles === undefined || roles.includes(Role.BLIND_REVIEWER))
         .map(({ adapter }) => adapter);
       this.review.attach({
+        verifyOriginalRecord: file => {
+          const manifest = this.projects.list().map(project => this.projects.activeManifest(project.projectId)?.manifest)
+            .find(manifest => manifest?.repositories.some(repo => repo.remote.toLowerCase() === file.github?.repositoryIdentity.toLowerCase())) ?? null;
+          return verifyReviewGithubEntry(config.githubClient ?? new GhCliGitHubClient(), file, manifest);
+        },
         capacity: { refreshForBlindReview: (target) => this.capacity.refreshForBlindReview(target) },
         packetReviewerScope: (provider) => {
           const adapter = reviewerAdapters.find((candidate) => candidate.provider === provider);

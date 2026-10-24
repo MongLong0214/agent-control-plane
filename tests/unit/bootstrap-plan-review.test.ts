@@ -663,6 +663,10 @@ describe("authenticated run-bound CEO decisions", () => {
       expect(handoff.recommendedNextAction).toContain("STANDARD_WORK");
       expect(handoff.recommendedNextAction).toContain("existing runs");
       expect(handoff.recommendedNextAction).toContain("never create duplicates");
+      expect(handoff.recommendedNextAction).toContain("existing runs and dependencies first");
+      expect(handoff.recommendedNextAction).toContain("rollback-able");
+      expect(handoff.recommendedNextAction).toContain("never create runs mechanically one per issue");
+      expect(handoff.recommendedNextAction).not.toContain("create one follow-on STANDARD_WORK run per seeded issue");
       const later = cp.ceo.openEscalation({runId:run.runId,openedBySessionId:run.owner,openedAt:f.harness.clock.nowIso(),question:"later?",options:["yes"],ctoRecommendation:"yes",whyItMatters:"later",blocksCriticalPath:true});
       if (!later.allowed) throw new Error(later.message);
       expect(cp.ceo.resolveEscalation(run.runId,"A later authentic decision stays outside the frozen set",f.ceoSessionId,{escalationId:later.value.escalationId!}).allowed).toBe(true);
