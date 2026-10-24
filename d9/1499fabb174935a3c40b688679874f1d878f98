@@ -1,0 +1,21 @@
+Limit: a PROJECT_BOOTSTRAP PLAN reaches the run's owner only through the CEO's bootstrap_plan_attach: the exact UTF-8 bytes are stored as a run artifact bound to run, contract digest, operation id and project/repository target, read back unchanged by the current owner generation, and plan_submit takes it by its sha256; ACP's normalized PLAN digest stays a separate semantic check (CEO df91fd5e).
+Warn: attaching is input delivery only: expectedSha256 creates no owner approval, reservation or execution authority, and different bytes never overwrite an attached PLAN except by an explicit replacesSha256 that withdraws the old PLAN's review and approval currency.
+Record-Id: r-5e4243140447
+Provenance: inherited a8b2d5ffdc3b8be44714aa6ff86c135f38468fc0
+
+Limit: a bootstrap PLAN binding identifier (operation id, project id, repository identity, contract digest) carrying a C0 control character or DEL is refused with BOOTSTRAP_PLAN_BINDING_INVALID before any artifact, audit or wake is written, because the shared ArtifactStore canonicalisation would rewrite CR/CRLF and strand the run's input; the identifier is never trimmed or substituted and the shared normalisation is unchanged, while CR/CRLF inside the PLAN body stays byte-identical (review ACP1195-R1-01, CEO e441063c).
+Record-Id: r-2585ee5db447
+Provenance: inherited 5067642c05d783f0902f294c320772dc5fe5ca1e
+
+Limit: bootstrap_plan_attach (and CTO plan_submit's bootstrapPlanDigest) keep strict sha256 digest syntax, but check it after authentication so a control character returns the fixed BOOTSTRAP_PLAN_BINDING_INVALID refusal and any other malformed digest BOOTSTRAP_PLAN_DIGEST_INVALID, with no artifact, audit, outbox or wake written, instead of the MCP schema's RPC -32602 (review ACP1195-R1-01 r2, CEO f2e36503).
+Warn: the driven CTO dispatch prompt carries one named amendment, the bootstrapPlanDigest -> bootstrap_plan_get line in RUN_DISPATCH and REVISION_REQUEST; the R2-01 pin strips exactly that text and keeps every other c65e73b2/bbc884ee byte frozen, so any further prompt change still fails that test and needs its own CEO verdict.
+Record-Id: r-14412a889e3e
+Provenance: inherited 2d5e85c58dba55b8a5e975a8d9aca9dbeb0d4b8e
+
+Limit: bootstrap_plan_attach establishes the complete attachment identity (current CEO binding with session and incarnation, Hermes owner turn) before it inspects any digest argument, so an actor-only or otherwise incompletely identified peer gets MCP_PEER_UNAUTHENTICATED for every digest shape and learns nothing from the digest checks; attach itself runs the same extracted check (review ACP1195-R1-01 r3, CEO 46295164).
+Record-Id: r-214ebf5bf9bd
+Provenance: inherited d2381c7cdd989660d2a29dc16781da800beec67f
+
+Limit: a bootstrap PLAN input binds to its run through the explicit contractDigest argument (equal to the run's current contractDigest), the body's runId, bootstrapOperationId, manifest projectId and single repository/operation identity; plan.requestDigest is the Repo Factory compile request's digest and is independent of ACP's run contractDigest, so it keeps only its format and required-field checks (CEO e6bee87f).
+Record-Id: r-1584023bd378
+Provenance: inherited 9eac0e91b6c8de86b49a52d2483876200a24ec89
