@@ -2126,8 +2126,8 @@ export class Outbox {
       );
     }
 
-    if (row.kind === MessageKind.RESUME_REVIEW
-        && !resumeReviewAttachmentMatches(this.db, row.run_id ?? "", readPayload(row.payload_json))) {
+    if (row.kind === MessageKind.RESUME_REVIEW && row.run_id !== null
+        && !resumeReviewAttachmentMatches(this.db, row.run_id, readPayload(row.payload_json))) {
       supersedeInstruction(this.db, this.audit, row, { reason: "BOOTSTRAP_PLAN_CHANGED", runState: null }, null, "RECEIPT");
       return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "resume-review instruction is void: attached PLAN changed");
     }
@@ -2233,8 +2233,8 @@ export class Outbox {
         "ack came from a session, generation or incarnation that does not hold this message",
       );
     }
-    if (row.kind === MessageKind.RESUME_REVIEW
-        && !resumeReviewAttachmentMatches(this.db, row.run_id ?? "", readPayload(row.payload_json))) {
+    if (row.kind === MessageKind.RESUME_REVIEW && row.run_id !== null
+        && !resumeReviewAttachmentMatches(this.db, row.run_id, readPayload(row.payload_json))) {
       supersedeInstruction(this.db, this.audit, row, { reason: "BOOTSTRAP_PLAN_CHANGED", runState: null }, null, "RECEIPT");
       return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "resume-review instruction is void: attached PLAN changed");
     }
@@ -2979,7 +2979,9 @@ export class Outbox {
 
   /** Receipt/claim uses the same supersession rules as handover, before exposing the payload. */
   #resumeReviewAdmitted(row: RawOutbox): boolean {
-    if (row.kind !== MessageKind.RESUME_REVIEW) return true;
+    // Runless in-band work has only the ordinary current-holder fence. The CEO resume-review
+    // producer always names a run; only those instructions carry attachment authority to recheck.
+    if (row.kind !== MessageKind.RESUME_REVIEW || row.run_id === null) return true;
     const decision = this.#instructionHandover(row, null);
     if (decision.kind !== "SUPERSEDE") return true;
     supersedeInstruction(this.db, this.audit, row, decision, null, "RECEIPT");

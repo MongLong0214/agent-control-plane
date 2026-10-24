@@ -1496,17 +1496,91 @@ describe("bootstrap_review_resume", () => {
       const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
       f.h.cp.outbox.attachInBandWake(wake);
       const before = f.h.cp.outbox.listByRun(f.run.runId);
-      if (stage === "enqueue") vi.spyOn(f.h.cp.outbox, "enqueue").mockReturnValue(deny(ReasonCode.CONFLICT, "test refusal"));
+      const beforeAudit = f.h.cp.audit.forRun(f.run.runId);
+      const beforeRun = f.h.cp.runs.require(f.run.runId);
+      let wroteBeforeRefusing = false;
+      if (stage === "enqueue") {
+        const enqueue = f.h.cp.outbox.enqueue.bind(f.h.cp.outbox);
+        vi.spyOn(f.h.cp.outbox, "enqueue").mockImplementation(input => {
+          const queued = enqueue(input);
+          expect(queued.allowed).toBe(true);
+          expect(instructions(f)).toHaveLength(1);
+          wroteBeforeRefusing = true;
+          return deny(ReasonCode.CONFLICT, "test refusal after enqueue writes");
+        });
+      }
       else {
         const record = f.h.cp.audit.record.bind(f.h.cp.audit);
-        vi.spyOn(f.h.cp.audit, "record").mockImplementation(input => input.kind === "CEO_DECISION"
-          ? deny(ReasonCode.CONFLICT, "test refusal") : record(input));
+        vi.spyOn(f.h.cp.audit, "record").mockImplementation(input => {
+          const recorded = record(input);
+          if (input.kind !== "CEO_DECISION") return recorded;
+          expect(recorded.allowed).toBe(true);
+          expect(instructions(f)).toHaveLength(1);
+          expect(f.h.cp.audit.byKind("CEO_DECISION")).toHaveLength(1);
+          wroteBeforeRefusing = true;
+          return deny(ReasonCode.CONFLICT, "test refusal after audit writes");
+        });
       }
       expect(await f.hermes("bootstrap_review_resume", args(f))).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+      expect(wroteBeforeRefusing).toBe(true);
       expect(f.h.cp.outbox.listByRun(f.run.runId)).toEqual(before);
+      expect(f.h.cp.audit.forRun(f.run.runId)).toEqual(beforeAudit);
+      expect(f.h.cp.runs.require(f.run.runId)).toEqual(beforeRun);
       expect(f.h.cp.audit.byKind("CEO_DECISION")).toEqual([]);
       expect(wake).not.toHaveBeenCalled();
     } finally { vi.restoreAllMocks(); await f.close(); }
+  });
+
+  it("commits the CEO audit and resume instruction together before waking the owner", async () => {
+    const f = await fixture();
+    const observer = new Database(f.h.cp.db.raw.name, { readonly: true });
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const visible = () => ({
+        instructions: observer.prepare("SELECT message_id FROM outbox WHERE kind = 'RESUME_REVIEW'").all(),
+        decisions: observer.prepare("SELECT evidence_json FROM audit_events WHERE kind = 'CEO_DECISION'").all(),
+      });
+      const phases: string[] = [];
+      const enqueue = f.h.cp.outbox.enqueue.bind(f.h.cp.outbox);
+      vi.spyOn(f.h.cp.outbox, "enqueue").mockImplementation(input => {
+        const queued = enqueue(input);
+        expect(queued.allowed).toBe(true);
+        expect(instructions(f)).toHaveLength(1);
+        expect(visible()).toEqual({ instructions: [], decisions: [] });
+        phases.push("enqueue");
+        return queued;
+      });
+      const record = f.h.cp.audit.record.bind(f.h.cp.audit);
+      vi.spyOn(f.h.cp.audit, "record").mockImplementation(input => {
+        const recorded = record(input);
+        if (input.kind === "CEO_DECISION") {
+          expect(recorded.allowed).toBe(true);
+          expect(f.h.cp.audit.byKind("CEO_DECISION")).toHaveLength(1);
+          expect(visible()).toEqual({ instructions: [], decisions: [] });
+          phases.push("audit");
+        }
+        return recorded;
+      });
+      const observations: ReturnType<typeof visible>[] = [];
+      const wake = vi.fn(async () => {
+        observations.push(visible());
+        phases.push("wake");
+        return allow(ReasonCode.OK, undefined);
+      });
+      f.h.cp.outbox.attachInBandWake(wake);
+      const result = await f.hermes("bootstrap_review_resume", args(f));
+      expect(result).toMatchObject({ ok: true });
+      await vi.waitFor(() => expect(wake).toHaveBeenCalledTimes(1));
+      const messageId = (result.value as Args).messageId;
+      expect(phases).toEqual(["enqueue", "audit", "wake"]);
+      expect(observations).toEqual([{
+        instructions: [{ message_id: messageId }],
+        decisions: [{ evidence_json: expect.any(String) }],
+      }]);
+      expect(JSON.parse((observations[0]!.decisions[0] as { evidence_json: string }).evidence_json))
+        .toMatchObject({ instruction: "RESUME_REVIEW", messageId });
+      expect(wake).toHaveBeenCalledWith(f.run.ownerRoleKey, [messageId]);
+    } finally { observer.close(); vi.restoreAllMocks(); await f.close(); }
   });
 
   it.each(["receipt", "claim", "ack"])("voids a replaced attachment on %s with SNAPSHOT_DIGEST_MISMATCH", async door => {

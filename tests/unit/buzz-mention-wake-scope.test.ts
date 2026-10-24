@@ -4,11 +4,13 @@ import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import type { BuzzMentionEvent } from "../../src/buzz/buzz-mention-subscriber.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
-import { allow } from "../../src/core/errors.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   buzzMentionInputFor,
@@ -17,16 +19,19 @@ import {
   startDaemonBuzzMentionSubscriber,
   startDaemonMcpListeners,
 } from "../../src/daemon/agentcpd.ts";
-import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { Role, RunKind, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { deliverBuzzMessage } from "../../src/ingress/buzz-message.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
+import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { ROLE_WAKE_FRAME, WAKE_TRANSPORT_QUALIFIED_CLIENTS } from "../../src/mcp/role-conversation.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { IN_BAND_KINDS } from "../../src/outbox/outbox.ts";
 import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../../src/registry/canonical-self-claim.ts";
 import { channelKey, signedMention, steppedClock, storingRelay, writeSubscriberConfig } from "../helpers/buzz-mention-relay.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { makeHarness } from "../helpers/harness.ts";
+import { bindCeo, dispatchBootstrapRun, makeHarness } from "../helpers/harness.ts";
+import { genesisPlanFixture } from "../helpers/genesis-github.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -233,6 +238,73 @@ describe("wakes the mention gate does not govern keep the current-holder check a
       }
     });
   }
+
+  it.each([
+    ["wrong-run", "NOT_FOUND"],
+    ["stale-owner", "BINDING_GENERATION_STALE"],
+    ["unauthenticated", "MCP_PEER_UNAUTHENTICATED"],
+  ])("mention exclusion does not admit a %s CEO resume-review instruction", async (refusal, reasonCode) => {
+    const f = await start();
+    const ceoId = bindCeo(f.h);
+    const ceo = f.h.cp.sessions.require(ceoId);
+    let authenticated = true;
+    const anchor = { liveHermesSessionId: "wake-scope-ceo", lineageRootDigest: digestOf("wake-scope-lineage") };
+    const server = createHermesServer(createHermesMcpPort(f.h.cp), () => authenticated
+      ? allow(ReasonCode.OK, { actor: ceoId, sessionId: ceoId, sessionIncarnation: ceo.incarnation })
+      : deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "unauthenticated fixture connection"), { provenance: anchor });
+    const client = new Client({ name: "wake-scope-ceo", version: "1" });
+    try {
+      const [ct, st] = InMemoryTransport.createLinkedPair();
+      await server.connect(st);
+      await client.connect(ct);
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const result = await client.callTool({ name, arguments: args, _meta: {
+          [HERMES_PROVENANCE_META_KEY]: { principal: "owner", session_id: anchor.liveHermesSessionId,
+            lineage_root_digest: anchor.lineageRootDigest, cron: false, delegation_depth: 0 },
+        } });
+        return result.structuredContent;
+      };
+      const created = f.h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: "STANDARD",
+        contract: { goal: "Resume the current PLAN", why: "wake scope", scope: [], nonGoals: [],
+          priority: "NORMAL", humanGate: [], references: [], acceptance: ["blind review"] } });
+      if (!created.allowed) throw new Error(created.message);
+      const run = await dispatchBootstrapRun(f.h.cp, f.h.clock, created.value.runId);
+      const plan: Record<string, unknown> = { ...genesisPlanFixture().artifact.content, requestDigest: run.contractDigest };
+      const manifest = plan.projectManifest as { projectId: string; repositories: Array<{ remote: string }> };
+      const body = JSON.stringify({ runId: run.runId, plan, tasks: [{ key: "create", title: "Create repository", category: "implementation" }] });
+      const digest = sha256(body);
+      expect(await call("bootstrap_plan_attach", {
+        idempotencyKey: "wake-scope-attach", runId: run.runId, planBody: body, expectedSha256: digest,
+        contractDigest: run.contractDigest, bootstrapOperationId: plan.bootstrapOperationId,
+        projectId: manifest.projectId, repositoryIdentity: manifest.repositories[0]!.remote,
+      })).toMatchObject({ ok: true });
+      await completeDials(wakes.dialled.length);
+      f.excludeIdentity();
+      const conversationWake = vi.spyOn(f.conversation, "wake");
+      const runtimeWake = vi.spyOn(f.h.cp.sessionRuntime, "wake");
+      const beforeDials = wakes.dialled.length;
+      const beforeOutbox = f.h.cp.outbox.listByRun(run.runId);
+      const beforeAudit = f.h.cp.audit.forRun(run.runId);
+      authenticated = refusal !== "unauthenticated";
+      expect(await call("bootstrap_review_resume", {
+        idempotencyKey: "wake-scope-resume", runId: refusal === "wrong-run" ? "run_missing" : run.runId,
+        contractDigest: run.contractDigest, bootstrapPlanDigest: digest,
+        ownerSessionId: run.ownerSessionId, ownerSessionIncarnation: run.ownerSessionIncarnation,
+        ownerBindingGeneration: refusal === "stale-owner" ? run.ownerBindingGeneration! - 1 : run.ownerBindingGeneration,
+      })).toMatchObject({ ok: false, reasonCode });
+      expect(await completeDials(beforeDials)).toBe(0);
+      expect(conversationWake).not.toHaveBeenCalled();
+      expect(runtimeWake).not.toHaveBeenCalled();
+      expect(f.h.cp.outbox.listByRun(run.runId)).toEqual(beforeOutbox);
+      expect(f.h.cp.audit.forRun(run.runId)).toEqual(beforeAudit);
+      expect(f.h.cp.audit.byKind("CEO_DECISION")).toEqual([]);
+    } finally {
+      vi.restoreAllMocks();
+      await client.close();
+      await server.close();
+      await f.close();
+    }
+  });
 
   it("wakes a peer turn admitted through the local socket while the CTO's mention identity is excluded", async () => {
     const f = await start();
