@@ -99,7 +99,7 @@ const parseBody = (run: RunRow, body: string, expected: PlanBinding) => {
   const manifest = plan.projectManifest;
   const repositories = manifest?.["repositories"];
   const operations = plan.githubOperations;
-  if (expected.runId !== run.runId || expected.contractDigest !== run.contractDigest || plan.requestDigest !== run.contractDigest
+  if (expected.runId !== run.runId || expected.contractDigest !== run.contractDigest
       || plan.bootstrapOperationId !== expected.bootstrapOperationId || manifest?.["projectId"] !== expected.projectId
       || (run.projectId !== null && run.projectId !== expected.projectId)
       || (run.pinnedManifestDigest !== null && plan.projectManifestDigest !== run.pinnedManifestDigest)

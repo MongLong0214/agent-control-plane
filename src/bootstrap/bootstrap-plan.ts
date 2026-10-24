@@ -851,7 +851,7 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
       { field:"genesis",carries:"INLINE acp.genesis-bundle.v1 bytes+SHA-256, branches main/dev/genesis, labels/milestones/issues, productIntent with references and ownerInstructions; never local filenames. See genesisExample." },
       { field: "summary", carries: "what this bootstrap creates and why, from the contract" },
       { field: "bootstrapOperationId", carries: "a non-empty id you choose for this bootstrap; keep it unchanged when you resubmit" },
-      { field: "requestDigest", carries: "the run's contractDigest, as contract_get's run.contractDigest states it" },
+      { field: "requestDigest", carries: "the digest of the Repo Factory compile request; independent of ACP's run contractDigest" },
       { field: "githubOperations", carries: "the GitHub operations in the order they run, each with its desiredState; the first is repositoryCreateOperation" },
       { field: "projectManifest", carries: "the full project manifest (manifest); its one repository's remote is the repository the first operation creates" },
       { field: "projectManifestDigest", carries: "the digest of projectManifest (digestRule)" },

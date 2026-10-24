@@ -382,28 +382,70 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
   it("directly refuses a different run even when the CEO supplies an otherwise valid attachment", async () => {
     const f = await fixture();
     try {
-      const body = f.body.replace(f.run.runId, "run_wrong");
+      const input = JSON.parse(f.body);
+      input.runId = "run_wrong";
+      input.plan.requestDigest = sha256("Repo Factory compile request");
+      const body = JSON.stringify(input);
+      const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
+      f.h.cp.outbox.attachInBandWake(wake);
+      const state = () => ({ artifacts: f.h.cp.artifacts.list(f.run.runId), run: f.h.cp.runs.require(f.run.runId),
+        audit: f.h.cp.audit.forRun(f.run.runId), outbox: f.h.cp.outbox.listByRun(f.run.runId) });
+      const before = state();
       expect(await f.attach({ planBody: body, expectedSha256: sha256(body) })).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
-      expect(f.h.cp.artifacts.list(f.run.runId, "HANDOFF")).toHaveLength(0);
+      expect(state()).toEqual(before);
+      expect(wake).not.toHaveBeenCalled();
     } finally { await f.close(); }
   });
 
   it.each(["contractDigest", "bootstrapOperationId", "projectId", "repositoryIdentity"])("binds attachment metadata to %s", async (field) => {
     const f = await fixture();
     try {
-      expect(await f.attach({ [field]: field === "contractDigest" ? sha256("another contract") : "different-target" }))
+      const input = JSON.parse(f.body);
+      input.plan.requestDigest = sha256("Repo Factory compile request");
+      const body = JSON.stringify(input);
+      const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
+      f.h.cp.outbox.attachInBandWake(wake);
+      const state = () => ({ artifacts: f.h.cp.artifacts.list(f.run.runId), run: f.h.cp.runs.require(f.run.runId),
+        audit: f.h.cp.audit.forRun(f.run.runId), outbox: f.h.cp.outbox.listByRun(f.run.runId) });
+      const before = state();
+      expect(await f.attach({ planBody: body, expectedSha256: sha256(body),
+        [field]: field === "contractDigest" ? sha256("another contract") : "different-target" }))
         .toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_CONTRACT_DRIFT" });
-      expect(f.h.cp.artifacts.list(f.run.runId, "HANDOFF")).toHaveLength(0);
+      expect(state()).toEqual(before);
+      expect(wake).not.toHaveBeenCalled();
     } finally { await f.close(); }
   });
 
-  it("requires the body's requestDigest to match the run contract", async () => {
+  it("round-trips an RF request digest independent of the ACP contract and submits only the exact attached input", async () => {
     const f = await fixture();
     try {
       const input = JSON.parse(f.body);
-      input.plan.requestDigest = sha256("different request");
-      const body = JSON.stringify(input);
-      expect(await f.attach({ planBody: body, expectedSha256: sha256(body) })).toMatchObject({ ok: false, reasonCode: "BOOTSTRAP_CONTRACT_DRIFT" });
+      const requestDigest = sha256("Repo Factory compile request");
+      expect(requestDigest).not.toBe(f.run.contractDigest);
+      input.plan.requestDigest = requestDigest;
+      const body = JSON.stringify(input, null, 2) + "\r\n";
+      const digest = sha256(body);
+      expect(await f.attach({ planBody: body, expectedSha256: digest })).toMatchObject({ ok: true, value: { digest } });
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId })).toMatchObject({ ok: true, value: { digest, planBody: body } });
+      expect((await f.cto("contract_get", { runId: f.run.runId })).value).toMatchObject({ bootstrapPlanGuide: {
+        planFields: expect.arrayContaining([{ field: "requestDigest",
+          carries: "the digest of the Repo Factory compile request; independent of ACP's run contractDigest" }]),
+      } });
+      const attachment = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF")[0]!;
+      expect(Buffer.from(attachment.content.bodyBase64 as string, "base64")).toEqual(Buffer.from(body));
+      const before = f.h.cp.artifacts.list(f.run.runId);
+      // The same JSON with different whitespace still names different attached bytes.
+      expect(await f.cto("plan_submit", { idempotencyKey: "rf-wrong-bytes", runId: f.run.runId, bootstrapPlanDigest: sha256(body + " ") }))
+        .toMatchObject({ ok: false, reasonCode: "SNAPSHOT_DIGEST_MISMATCH" });
+      expect(await f.cto("plan_submit", { idempotencyKey: "rf-body-bypass", ...input, bootstrapPlanDigest: digest }))
+        .toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT" });
+      expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(before);
+      expect(f.h.cp.tasks.list(f.run.runId)).toHaveLength(0);
+      expect(await f.cto("plan_submit", { idempotencyKey: "rf-submit", runId: f.run.runId, bootstrapPlanDigest: digest }))
+        .toMatchObject({ ok: true, value: { digest } });
+      expect(f.h.cp.artifacts.latest<Args>(f.run.runId, "PLAN")?.content).toMatchObject({ requestDigest, bootstrapPlanDigest: digest });
+      expect(await f.attach({ idempotencyKey: "rf-retry", planBody: body, expectedSha256: digest })).toMatchObject({ ok: true, value: { digest } });
+      expect(f.h.cp.artifacts.list(f.run.runId, "HANDOFF")).toHaveLength(1);
     } finally { await f.close(); }
   });
 

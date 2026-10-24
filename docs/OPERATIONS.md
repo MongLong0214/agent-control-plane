@@ -155,8 +155,9 @@ reservation or permission to execute an external write.
 1. Create the run, then have RF compile the final submission with that run id:
    UTF-8 JSON `{ "runId": "run_...", "plan": { ... }, "tasks": [ ... ] }`.
    Keep the resulting bytes; do not parse and reserialize the file for transport.
-   `plan.requestDigest` must equal the run's `contractDigest`. The full manifest,
-   inline genesis, operation id and repository operations must name the intended
+   `plan.requestDigest` identifies the RF compile request, independently of ACP's
+   run `contractDigest`. The full manifest, inline genesis, operation id and
+   repository operations must name the intended
    project and repository. The body limit is 131,072 bytes (128 KiB).
 2. The CEO reviews the complete final body and computes `sha256:<lowercase hex>`
    over its exact UTF-8 bytes, including whitespace and trailing newlines. Never
@@ -174,9 +175,10 @@ reservation or permission to execute an external write.
    audit event or wake is written; this does not restrict newlines in the body.
    `planBody` is a string carrying the original file contents. MCP JSON escaping
    preserves that string; ACP never reserializes its JSON to determine the hash.
-   The binding arguments must match the run and the body: `requestDigest`,
-   `bootstrapOperationId`, manifest project id, and the single manifest repository
-   remote / GitHub operation target. `repositoryIdentity` is `github:<owner>/<repo>`.
+   The `contractDigest` argument must match the current run. The other binding
+   arguments must match the body: `runId`, `bootstrapOperationId`, manifest project
+   id, and the single manifest repository remote / GitHub operation target.
+   `repositoryIdentity` is `github:<owner>/<repo>`.
 4. The bound BOOTSTRAP_CTO reads `bootstrap_plan_get({ runId })`, which returns
    `{ digest, planBody }`. `digest` is the exact-byte SHA-256, and `planBody`
    decodes to the original bytes. `contract_get` also advertises this digest.
