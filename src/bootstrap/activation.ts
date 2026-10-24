@@ -1,3 +1,5 @@
+import { isBootstrapPlanAttachment } from "./bootstrap-plan-artifact.ts";
+import type { StoredArtifact } from "../db/artifacts.ts";
 import type { ResidentProjectProvisioning, ProvisioningEvidence } from './resident-project-provisioning.ts';
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
@@ -131,6 +133,12 @@ interface ApprovedBootstrapPlan {
  * activation facts that only this runtime may assert.
  */
 export class BootstrapActivation {
+  // CEO-to-CTO PLAN input is also a HANDOFF artifact; it is never an activation handoff.
+  private activationHandoff<T>(runId: string): StoredArtifact<T> | null {
+    return this.artifacts.list<T>(runId, ArtifactKind.HANDOFF).reverse()
+      .find(artifact => !isBootstrapPlanAttachment(artifact.content)) ?? null;
+  }
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -585,11 +593,11 @@ export class BootstrapActivation {
     const review = this.reviewForConfirmation(input.runId, input.candidateSnapshotDigest);
     if (!review.allowed) return review as Decision<ACPBootstrapActivationResult>;
     const factory = this.artifacts.latest<RepoFactoryResult>(input.runId, ArtifactKind.REPO_FACTORY_RESULT);
-    const handoffArtifact = this.artifacts.latest<{
+    const handoffArtifact = this.activationHandoff<{
       handoffId: string;
       projectId: string;
       toSessionId: string;
-    }>(input.runId, ArtifactKind.HANDOFF);
+    }>(input.runId);
     const doctorArtifact = this.artifacts.latest<{
       source?: string;
       projectId?: string;
@@ -786,12 +794,12 @@ export class BootstrapActivation {
     }
 
     const handoffDigest = digestOf(handoff);
-    const recorded = this.artifacts.latest<{
+    const recorded = this.activationHandoff<{
       handoffId: string;
       projectId: string;
       toSessionId: string;
       handoff: HandoffPackage;
-    }>(runId, ArtifactKind.HANDOFF);
+    }>(runId);
     // PR #1122 R1 (BCG-R1-01) — a recorded handoff whose delivered package lacks the observed facts (one
     // persisted before they were delivered) is reissued: a fresh PENDING handoff, to the current
     // PRIMARY_CTO, of the same package with the observed facts, for a new ACK. Only that differs; the
@@ -975,7 +983,7 @@ export class BootstrapActivation {
     if (isAdoptedCanonicalRuntime(this.db, binding.sessionId)) return null;
     const session = this.sessions.get(binding.sessionId);
     if (!session || session.buzzActorId) return null;
-    const recorded = this.artifacts.latest<{ handoffId?: string; projectId?: string; toSessionId?: string }>(runId, ArtifactKind.HANDOFF);
+    const recorded = this.activationHandoff<{ handoffId?: string; projectId?: string; toSessionId?: string }>(runId);
     const handoffId = recorded?.content.handoffId;
     if (!handoffId || recorded.content.projectId !== projectId || recorded.content.toSessionId !== binding.sessionId) return null;
     const row = this.db.get<{ status: string; to_session_id: string }>(
@@ -1136,7 +1144,7 @@ export class BootstrapActivation {
         WHERE handoff_id = ? AND kind = 'BOOTSTRAP' AND to_session_id = ? AND status = 'ACKED'`,
       [handoffId, toSessionId],
     );
-    const artifact = this.artifacts.latest<{ handoffId: string }>(runId, ArtifactKind.HANDOFF);
+    const artifact = this.activationHandoff<{ handoffId: string }>(runId);
     if (artifact?.content.handoffId !== handoffId) return null;
     // PR #1122 R1 (BCG-R1-01) — an ACK of a package without the observed facts acknowledges nothing.
     if (row && !this.observedHandoffFacts(handoffId, JSON.parse(row.package_json) as Partial<HandoffPackage>).allowed) return null;

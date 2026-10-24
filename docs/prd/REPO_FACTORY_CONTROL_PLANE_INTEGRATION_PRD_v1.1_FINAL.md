@@ -1,5 +1,20 @@
 # Repo Factory × Agent Control Plane 통합 PRD
 
+ACP-readable compiled input: after `run_create`, RF compiles the complete
+`{ runId, plan, tasks }` JSON body with that run id. The CEO reviews the body and
+approves its exact UTF-8 SHA-256 digest, then calls Hermes
+`bootstrap_plan_attach({ idempotencyKey, runId, planBody, expectedSha256, contractDigest, bootstrapOperationId, projectId, repositoryIdentity })` on an
+authenticated owner turn. The current BOOTSTRAP_CTO reads
+`bootstrap_plan_get({ runId })` and calls
+`plan_submit({ idempotencyKey, runId, bootstrapPlanDigest })` with the returned
+digest. This is the supported channel for a compiler output larger than an
+escalation reply; the CTO does not need a shell or the RF runtime.
+See [the operational API and blocked-run steps](../OPERATIONS.md#supplying-a-compiled-bootstrap-plan)
+for the 128 KiB bound, exact-byte comparisons, explicit replacement through
+existing candidate invalidation, and the separate normalized review digest.
+Attachment is input delivery only; it creates no owner approval or execution
+authority. Blind review, CEO CONFIRM and genesis PR/CI gates remain required.
+
 - **버전:** 1.1 FINAL
 - **상태:** 구현·원자 티켓 분해 승인
 - **대체 문서:** `REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.0.md`
