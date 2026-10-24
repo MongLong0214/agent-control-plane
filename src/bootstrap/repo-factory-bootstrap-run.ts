@@ -418,6 +418,10 @@ export class RepoFactoryBootstrapRunner {
     if (!admissible.allowed) return admissible as Decision<ACPBootstrapActivationResult>;
     const current = currentBootstrapPlan(confirmation.runId,this.deps.artifacts.latest<unknown>(confirmation.runId,ArtifactKind.PLAN));
     if (!current.allowed) return current as Decision<ACPBootstrapActivationResult>;
+    if (current.value.outputs.supersedesProjectId !== undefined) {
+      const ready = this.deps.bootstrap.readinessForFactoryResult(confirmation.runId, current.value.outputs.handoff, confirmation.candidateSnapshotDigest);
+      if (!ready.allowed) return ready;
+    }
     if (this.deps.bootstrap.residentGenesisRequired && !current.value.outputs.genesis) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap requires an inline genesis bundle and resident CTO",{});
     if (current.value.outputs.genesis) {
       if (!this.deps.residentProjects?.configured()) return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,"resident host provisioner/subscriber is not configured",{});

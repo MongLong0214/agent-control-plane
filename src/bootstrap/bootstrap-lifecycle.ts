@@ -28,7 +28,7 @@ export type BootstrapLifecycleKind = (typeof BootstrapLifecycleKind)[keyof typeo
 export interface BootstrapLifecycleSite {
   /** Repository-relative source file. */
   file: string;
-  /** The function or method whose body (with its doc comment) enforces the item. */
+  /** The function or method whose body enforces the item, or <module> for a script's top-level checks. */
   symbol: string;
   /** Text that must appear in that body: the refusal or the check the statement rests on. */
   enforces: readonly string[];
@@ -52,6 +52,36 @@ const PLAN = "src/bootstrap/bootstrap-plan.ts";
 const APPLICATIONS = "src/bootstrap/bootstrap-applications.ts";
 
 export const BOOTSTRAP_POST_CONFIRM_LIFECYCLE: readonly BootstrapLifecycleItem[] = Object.freeze([
+  {
+    id: "resident-cto-dedicated-buzz",
+    kind: BootstrapLifecycleKind.IMPLEMENTED_GUARANTEE,
+    statement:
+      "For an inline genesis bootstrap, resident provisioning requires the CTO's dedicated Buzz identity and private room, a verified roster and a nonce readable as that identity; activation and CONFIRM require resident provisioning readiness. These are provisioning readbacks, not a guarantee of future message delivery or CTO execution.",
+    sites: [
+      {
+        file: "scripts/host-project-provisioner.mjs",
+        symbol: "<module>",
+        enforces: ["room.visibility === 'private'", "members.length === 3", "[[pk,'owner'],[owner,'owner'],[ceo,'admin']]", "m.content === nonce && m.pubkey === pk", "check(post?.id,'nonce unreadable')"],
+      },
+      {
+        file: "src/bootstrap/resident-project-provisioning.ts",
+        symbol: "ensure",
+        enforces: ["dedicated Buzz room not verified", "Buzz room identity drift", "observations.buzz.roomId !== a.roomId", "buzzActorId:pk,buzzAddress:a.roomId"],
+      },
+      {
+        file: "src/bootstrap/resident-project-provisioning.ts",
+        symbol: "confirmedRoom",
+        enforces: ["buzz?.roomId === roomId", "buzz.rosterVerified", "buzz.nonceReadable", "buzz.nonceEventId", "buzz.pubkey"],
+      },
+      {
+        file: "src/runtime/host-project-provisioner.ts",
+        symbol: "hostObservationSchema",
+        enforces: ["rosterVerified: z.literal(true)", "nonceReadable: z.literal(true)", "pubkey: z.string().regex(/^[a-f0-9]{64}$/)"],
+      },
+      { file: ACTIVATION, symbol: "activate", enforces: ["this.residentProjects.ensure(", "this.residentProjects!.ready("] },
+      { file: ACTIVATION, symbol: "finalizeBootstrapActivationConfirm", enforces: ["this.residentProjects?.ready(input.runId,primary.sessionId)"] },
+    ],
+  },
   {
     id: "plan-one-repository-create",
     kind: BootstrapLifecycleKind.PLAN_REQUIREMENT,

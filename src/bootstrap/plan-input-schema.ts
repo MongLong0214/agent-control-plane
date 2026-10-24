@@ -19,6 +19,8 @@ export const submittedPlanSchema = z.object({
   risks: z.array(z.string()).default([]),
   removedOverengineering: z.array(z.string()).default([]),
   bootstrapOperationId: z.string().min(1).optional(),
+  // Explicit retired project replaced by this bootstrap; covered by the normalized PLAN digest.
+  supersedesProjectId: z.string().min(1).regex(/^[^\x00-\x1f\x7f]+$/).optional(),
   requestDigest: z.string().min(1).optional(),
   projectManifestDigest: z.string().min(1).optional(),
   // Issue #246 — each operation as the Repo Factory runner executes it and the owner

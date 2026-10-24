@@ -1,6 +1,7 @@
 import { MCP_MUTATION_RECOVERY } from "../core/mcp-recovery.ts";
 import { parseGenesis, genesisDigest, bytesDigest, type GenesisBundle } from './genesis-bundle.ts';
 import { z } from "zod";
+import { BOOTSTRAP_POST_CONFIRM_LIFECYCLE, type BootstrapLifecycleItem } from "./bootstrap-lifecycle.ts";
 
 import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
@@ -49,6 +50,7 @@ import {
 /** The approved PLAN artifact's provenance, as `BootstrapActivation` already requires it. */
 export const approvedPlanSchema = z.object({
   bootstrapOperationId: z.string().min(1),
+  supersedesProjectId: z.string().min(1).regex(/^[^\x00-\x1f\x7f]+$/).optional(),
   requestDigest: z.string().min(1),
   projectManifestDigest: z.string().min(1),
   githubOperations: z.array(z.unknown()),
@@ -357,6 +359,9 @@ export interface PlannedBootstrapOutputs {
   bootstrapOperationId: string;
   requestDigest: string;
   projectManifestDigest: string;
+  supersedesProjectId?: string;
+  /** The lifecycle statements shown to review, bound by plannedOutputsDigest. */
+  lifecycle: Pick<BootstrapLifecycleItem, "id" | "kind" | "statement">[];
   /** The repository the operations create, exactly as the manifest's one repository names it. */
   target: { repositoryIdentity: string; repositoryRole: string; visibility: "public" | "private" };
   defaultBranch: string;
@@ -428,6 +433,8 @@ export const plannedBootstrapOutputs = (
     bootstrapOperationId: executable.bootstrapOperationId,
     requestDigest: executable.requestDigest,
     projectManifestDigest: executable.projectManifestDigest,
+    ...(preflight.value.plan.supersedesProjectId === undefined ? {} : { supersedesProjectId: preflight.value.plan.supersedesProjectId }),
+    lifecycle: BOOTSTRAP_POST_CONFIRM_LIFECYCLE.map(({ id, kind, statement }) => ({ id, kind, statement })),
     target: {
       repositoryIdentity: shape.value.repositoryIdentity,
       repositoryRole: repository.role,
@@ -711,7 +718,8 @@ export const planForSubmission = (
   run: { kind: string; projectId: string | null },
   plan: Record<string, unknown>,
 ): Decision<Record<string, unknown>> => {
-  const { projectManifest: carried, ...rest } = plan;
+  const { projectManifest: carried, supersedesProjectId, ...ordinary } = plan;
+  const rest = isProjectlessBootstrap(run) && supersedesProjectId !== undefined ? { ...ordinary, supersedesProjectId } : ordinary;
   if (!isProjectlessBootstrap(run)) return allow(ReasonCode.OK, rest);
   const named = plan["projectManifestDigest"];
   if (carried === undefined) {

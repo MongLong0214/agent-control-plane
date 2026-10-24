@@ -49,7 +49,7 @@ export interface ACPBootstrapActivationResult {
   schema: "agent-control-plane.bootstrap-activation.v1";
   runId: string;
   projectId: string;
-  projectRegistration: { registered: boolean; activeManifestDigest: string };
+  projectRegistration: { registered: boolean; activeManifestDigest: string; supersedesProjectId?: string | null };
   localBindings: Array<{ identity: string; checkoutPath: string; repositoryRole: string }>;
   blindReview: { verdict: string; digest: string } | null;
   ceoConfirm: { decision: string; at: string } | null;
@@ -248,6 +248,8 @@ export class BootstrapActivation {
     // included) before anything is written or delivered.
     const current = currentBootstrapPlan(input.runId, this.artifacts.latest<unknown>(input.runId, ArtifactKind.PLAN));
     if (!current.allowed) return current as Decision<ACPBootstrapActivationResult>;
+    const predecessor = this.projects.validatePredecessor(run.projectId ?? input.approvedManifest.projectId, current.value.outputs.supersedesProjectId);
+    if (!predecessor.allowed) return predecessor;
     if (this.residentGenesisRequired && !current.value.outputs.genesis) return deny(ReasonCode.INVALID_ARGUMENT,"bootstrap requires an inline genesis bundle and resident CTO",{});
     const facts = observedRepositoryFacts(result, factsTargetOf(current.value.outputs));
     if (!facts.allowed) return facts as Decision<ACPBootstrapActivationResult>;
@@ -270,29 +272,38 @@ export class BootstrapActivation {
       bindingGeneration: run.ownerBindingGeneration,
       expectedManifestDigest: approvedDigest,
     };
-    const existing = this.projects.get(projectId);
-    if (!existing) {
-      const registered = this.projects.register({
-        projectId,
-        name: input.projectName,
-        manifest: input.approvedManifest,
-        authorization: manifestAuthorization,
-      });
-      if (!registered.allowed) return registered as Decision<ACPBootstrapActivationResult>;
-    } else if (existing.activeManifestDigest === approvedDigest) {
-      // A resumed or repeated activation finds the project this run already registered, on the approved
-      // manifest: nothing moves, and the run's authority to write that manifest is asked again.
-      const authorized = this.projects.storeManifest(input.approvedManifest, manifestAuthorization);
-      if (!authorized.allowed) return authorized as Decision<ACPBootstrapActivationResult>;
-    } else {
-      // #246 B2-b — a bootstrap never moves an existing project's active manifest. That move is a
-      // CONTRACT_CHANGE run's alone, on the grant its CEO CONFIRM issued.
-      return deny(
-        ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN,
-        "a PROJECT_BOOTSTRAP run never changes an existing project's manifest; that is a CONTRACT_CHANGE run",
-        { runId: input.runId, projectId, activeManifestDigest: existing.activeManifestDigest, approvedManifestDigest: approvedDigest },
-      );
-    }
+    const register = (): Decision<void> => {
+      // Recheck under the registration write lock on both first activation and a resumed activation.
+      const predecessor = this.projects.validatePredecessor(projectId, current.value.outputs.supersedesProjectId);
+      if (!predecessor.allowed) return predecessor;
+      const existing = this.projects.get(projectId);
+      if (!existing) {
+        const registered = this.projects.register({
+          projectId,
+          name: input.projectName,
+          ...(current.value.outputs.supersedesProjectId === undefined ? {} : { supersedesProjectId: current.value.outputs.supersedesProjectId }),
+          manifest: input.approvedManifest,
+          authorization: manifestAuthorization,
+        });
+        if (!registered.allowed) return registered;
+      } else if (existing.activeManifestDigest === approvedDigest) {
+        // A resumed or repeated activation finds the project this run already registered, on the approved
+        // manifest: nothing moves, and the run's authority to write that manifest is asked again.
+        const authorized = this.projects.storeManifest(input.approvedManifest, manifestAuthorization);
+        if (!authorized.allowed) return authorized;
+      } else {
+        // #246 B2-b — a bootstrap never moves an existing project's active manifest. That move is a
+        // CONTRACT_CHANGE run's alone, on the grant its CEO CONFIRM issued.
+        return deny(
+          ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN,
+          "a PROJECT_BOOTSTRAP run never changes an existing project's manifest; that is a CONTRACT_CHANGE run",
+          { runId: input.runId, projectId, activeManifestDigest: existing.activeManifestDigest, approvedManifestDigest: approvedDigest },
+        );
+      }
+      return allow(ReasonCode.OK, undefined);
+    };
+    const registration = current.value.outputs.supersedesProjectId === undefined ? register() : this.db.txDecision(register);
+    if (!registration.allowed) return registration;
 
     let provisioning: ProvisioningEvidence | undefined;
     if (current.value.outputs.genesis) {
@@ -401,7 +412,7 @@ export class BootstrapActivation {
       schema: "agent-control-plane.bootstrap-activation.v1",
       runId: input.runId,
       projectId,
-      projectRegistration: { registered: true, activeManifestDigest: approvedDigest },
+      projectRegistration: { registered: true, activeManifestDigest: approvedDigest, supersedesProjectId: project.supersedesProjectId },
       localBindings,
       blindReview: reviewed.allowed ? { verdict: reviewed.value.verdict, digest: reviewed.value.digest } : null,
       ceoConfirm: null,
@@ -632,6 +643,8 @@ export class BootstrapActivation {
     // and its repository bindings are the PLAN's planned target (checked with the bindings below).
     const plan = currentBootstrapPlan(input.runId, this.artifacts.latest<unknown>(input.runId, ArtifactKind.PLAN));
     if (!plan.allowed) return plan as Decision<ACPBootstrapActivationResult>;
+    const predecessor = this.projects.validatePredecessor(projectId, plan.value.outputs.supersedesProjectId);
+    if (!predecessor.allowed) return predecessor;
     const plannedManifestDigest = plan.value.binding.projectManifestDigest;
     if (project?.activeManifestDigest !== plannedManifestDigest) {
       return deny(
@@ -720,6 +733,7 @@ export class BootstrapActivation {
       projectRegistration: {
         registered: Boolean(project),
         activeManifestDigest: project?.activeManifestDigest ?? "",
+        supersedesProjectId: project?.supersedesProjectId ?? null,
       },
       localBindings,
       blindReview: { verdict: "PASS", digest: review.value.digest },
@@ -1407,7 +1421,10 @@ export class BootstrapActivation {
       );
     }
 
-    return allow(ReasonCode.OK, undefined);
+    // The runner asks readiness before consuming approval or sending a GitHub write.
+    const plan = currentBootstrapPlan(runId, this.artifacts.latest<unknown>(runId, ArtifactKind.PLAN));
+    if (!plan.allowed) return plan;
+    return this.projects.validatePredecessor(plan.value.manifest.projectId, plan.value.outputs.supersedesProjectId);
   }
 
   /**

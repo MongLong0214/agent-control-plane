@@ -140,6 +140,7 @@ export const prepareBootstrapRun = async (
   options: {
     ops: Operation[];
     manifest: ProjectManifest;
+    supersedesProjectId?: string;
     ownerIdentities?: readonly OwnerIdentity[];
     /** A PLAN the owner submits first and then replaces with the reviewed one, superseding its task. */
     earlierPlan?: Record<string, unknown>;
@@ -162,7 +163,7 @@ export const prepareBootstrapRun = async (
   await dispatchBootstrapRun(harness.cp, harness.clock, runId);
 
   const { manifest, ops } = options;
-  const plan = bootstrapPlan(manifest, { operations: ops });
+  const plan = { ...bootstrapPlan(manifest, { operations: ops }), ...(options.supersedesProjectId === undefined ? {} : { supersedesProjectId: options.supersedesProjectId }) };
   const plannable = plannedBootstrapOutputs({ runId, planArtifact: { digest: "probe", content: plan } }, manifest).allowed;
   if (options.earlierPlan !== undefined) await submitBootstrapPlan(harness, runId, options.earlierPlan);
   const reviewed = options.legacyTask === true

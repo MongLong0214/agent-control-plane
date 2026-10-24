@@ -67,14 +67,64 @@ export class ProjectRegistry {
     private readonly guard: ManagedWriteGuard,
   ) {}
 
+  /** Read-only preflight, repeated under registration's write transaction to close competing claims. */
+  validatePredecessor(projectId: string, supersedesProjectId: string | undefined): Decision<void> {
+    if (supersedesProjectId === undefined) return allow(ReasonCode.OK, undefined);
+    const evidence = { projectId, supersedesProjectId };
+    if (supersedesProjectId === projectId) {
+      return deny(ReasonCode.PROJECT_PREDECESSOR_SELF, "a project cannot supersede itself", evidence);
+    }
+    const predecessor = this.get(supersedesProjectId);
+    if (!predecessor) {
+      return deny(ReasonCode.PROJECT_PREDECESSOR_NOT_FOUND, "the named predecessor is not registered", evidence);
+    }
+    if (predecessor.retiredAt === null) {
+      return deny(ReasonCode.PROJECT_PREDECESSOR_NOT_RETIRED, "the named predecessor is not retired", evidence);
+    }
+    const claimant = this.db.get<{ project_id: string }>(
+      `SELECT project_id FROM projects WHERE supersedes_project_id = ? AND project_id <> ? ORDER BY project_id LIMIT 1`,
+      [supersedesProjectId, projectId],
+    );
+    if (claimant) {
+      return deny(ReasonCode.PROJECT_PREDECESSOR_ALREADY_SUPERSEDED, "another project already claims the predecessor", { ...evidence, claimedBy: claimant.project_id });
+    }
+    const existing = this.get(projectId);
+    if (existing && existing.supersedesProjectId !== supersedesProjectId) {
+      return deny(ReasonCode.PROJECT_PREDECESSOR_LINK_CONFLICT, "an existing project's predecessor link cannot be overwritten", evidence);
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
   register(input: {
     name: string;
     projectId?: string;
+    supersedesProjectId?: string;
+    manifest?: ProjectManifest | null;
+    authorization?: ManagedManifestWrite;
+  }): Decision<ProjectRecord> {
+    // Keep the legacy path unchanged; explicit claims validate and register under one write lock.
+    return input.supersedesProjectId === undefined
+      ? this.registerProject(input)
+      : this.db.txDecision(() => this.registerProject(input));
+  }
+
+  private registerProject(input: {
+    name: string;
+    projectId?: string;
+    supersedesProjectId?: string;
     manifest?: ProjectManifest | null;
     authorization?: ManagedManifestWrite;
   }): Decision<ProjectRecord> {
     const projectId = input.projectId ?? newProjectId();
-    if (this.db.get(`SELECT 1 FROM projects WHERE project_id = ?`, [projectId])) {
+    const predecessorCheck = this.validatePredecessor(projectId, input.supersedesProjectId);
+    if (!predecessorCheck.allowed) return predecessorCheck;
+    const existing = this.get(projectId);
+    if (existing) {
+      // The explicit link was revalidated under the write lock, excluding this row as a claimant.
+      // A retry returns the original registration without storing a manifest or auditing it again.
+      if (input.supersedesProjectId !== undefined && (!input.manifest || manifestDigest(input.manifest) === existing.activeManifestDigest)) {
+        return allow(ReasonCode.OK, existing);
+      }
       return deny(ReasonCode.CONFLICT, "project already registered", { projectId });
     }
     // #246 C3 — a project id a bootstrap run reserved is registered by that run's activation alone;
@@ -102,11 +152,11 @@ export class ProjectRegistry {
     }
 
     this.db.run(
-      `INSERT INTO projects (project_id, name, active_manifest_digest, created_at) VALUES (?, ?, ?, ?)`,
-      [projectId, input.name, digest, this.clock.nowIso()],
+      `INSERT INTO projects (project_id, name, active_manifest_digest, created_at, supersedes_project_id) VALUES (?, ?, ?, ?, ?)`,
+      [projectId, input.name, digest, this.clock.nowIso(), input.supersedesProjectId ?? null],
     );
     const predecessor = input.manifest?.repositories[0]?.remote;
-    if (predecessor) {
+    if (predecessor && input.supersedesProjectId === undefined) {
       const retired = this.db.get<{project_id:string}>(`SELECT project_id FROM repositories WHERE identity = ? AND retired_at IS NOT NULL ORDER BY retired_at DESC, repository_id DESC LIMIT 1`,[predecessor]);
       if (retired) this.db.run(`UPDATE projects SET supersedes_project_id = ? WHERE project_id = ?`,[retired.project_id,projectId]);
     }
