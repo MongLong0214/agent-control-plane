@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { nsecEncode } from "nostr-tools/nip19";
 import { getPublicKey } from "nostr-tools/pure";
@@ -1479,8 +1479,9 @@ it("ACP1202 policy check: an unidentified historical policy is not today's bytes
 
 it.each(["match", "mismatched-file", "mismatched-digest", "missing", "refused", "undeterminable", "wrong-signer", "wrong-target", "wrong-room"] as const)("ACP1202 runtime binding: first readiness %s checks the actual signer and exact CEO target", async mode => {
   const { f } = await signerRoute();
-  const root = tempDir("runtime-policy-binding-"); const policy = join(root, "required-mentions.json");
-  writeFileSync(policy, "fixture-policy"); writeFileSync(join(root, "mode"), mode);
+  const root = tempDir("runtime-policy-binding-"); const policy = join(root, "policy-link.json");
+  writeFileSync(join(root, "required-mentions.json"), "fixture-policy");
+  symlinkSync(join(root, "required-mentions.json"), policy); writeFileSync(join(root, "mode"), mode);
   const binary = stableFixtureLink(join(root, "buzz"), '#!/bin/sh\nexec python3 -B "$(dirname "$0")/buzz-mention-enforce.py" "$0" "$@"\n');
   const signer = getPublicKey(Buffer.from("1".repeat(64), "hex"));
   writeFileSync(join(root, "buzz-mention-enforce.py"), `import hashlib,json,sys
@@ -1519,8 +1520,8 @@ sys.exit(2 if mode=='undeterminable' else 1 if mode=='refused' else 0)
     for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
     expect(send).not.toHaveBeenCalled();
     expect(processingOf(f, id)).toMatchObject({ status: "PENDING", reason_code: mode === "refused" || mode === "undeterminable" ? "BUZZ_LOCAL_SEND_POLICY_REFUSED" : "BUZZ_SEND_POLICY_BINDING_UNVERIFIED", retry_eligible: 0 });
-    const configured = { file: mode === "missing" ? null : policy, digest: mode === "missing" ? null : sha256Hex(readFileSync(policy)) };
-    const reported = { file: mode === "missing" ? null : mode === "mismatched-file" ? "/another/policy" : policy,
+    const configured = { file: mode === "missing" ? null : realpathSync(policy), digest: mode === "missing" ? null : sha256Hex(readFileSync(policy)) };
+    const reported = { file: mode === "missing" ? null : mode === "mismatched-file" ? "/another/policy" : realpathSync(policy),
       digest: mode === "missing" ? null : mode === "mismatched-digest" ? "b".repeat(64) : configured.digest };
     expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY")).toMatchObject([{ evidence: { messageId: id, policyBinding: { policyIdentity: { configured, reported } } } }]);
     if (mode === "refused" || mode === "undeterminable") {
@@ -1632,3 +1633,53 @@ it.each(["CREDENTIAL", "AUTHORITY", "UNKNOWN"].flatMap(cause => ["policy", "sign
     expect(check).toHaveBeenCalledTimes(2); expect(send).toHaveBeenCalledTimes(1);
   },
 );
+
+const policyFenceWitness = async (change: "revocation" | "room change" | "session termination" | "unchanged") => {
+  const h = makeHarness();
+  try {
+    const ceo = h.cp.sessions.create({ provider: "scripted", model: "ceo", buzzAddress: "original-room" });
+    expect(h.cp.sessions.transition(ceo.sessionId, SessionLifecycle.READY).allowed).toBe(true);
+    expect(h.cp.sessions.bindBuzzActor({ sessionId: ceo.sessionId, sessionSecret: ceo.sessionSecret!, buzzActorId: "original-ceo" },
+      { isAllowedActor: () => true }).allowed).toBe(true);
+    const binding = h.cp.bindings.bind({ role: Role.CEO, sessionId: ceo.sessionId });
+    if (!binding.allowed) throw new Error(binding.message);
+    const queued = h.cp.outbox.enqueue({ idempotencyKey: `r3-fence-${change}`, roleKey: "CEO",
+      bindingGeneration: binding.value.bindingGeneration, targetSessionId: ceo.sessionId,
+      kind: MessageKind.CEO_NOTIFICATION, payload: { question: "fence witness" } });
+    if (!queued.allowed) throw new Error(queued.message);
+    const id = queued.value.messageId;
+    const check = vi.spyOn(h.buzz, "policyReadiness").mockImplementation(async (room, _body, recipient, signer) => {
+      expect(room).toBe("original-room"); expect(recipient).toBe("original-ceo");
+      expect(h.cp.db.get("SELECT 1 FROM outbox WHERE message_id = ? AND status = 'IN_FLIGHT'", [id])).toBeDefined();
+      await Promise.resolve();
+      if (change === "revocation") expect(h.cp.bindings.revoke("CEO", "during policy check").allowed).toBe(true);
+      if (change === "room change") h.cp.sessions.setBuzzAddress(ceo.sessionId, "replacement-room");
+      if (change === "session termination") expect(h.cp.sessions.transition(ceo.sessionId, SessionLifecycle.STOPPED).allowed).toBe(true);
+      return { verdict: "allowed", policyDigest: "same-policy", signer, recipient };
+    });
+    const send = vi.spyOn(h.buzz, "send");
+    expect((await h.buzzAdapter.deliverPending()).delivered).toEqual(change === "unchanged" ? [id] : []);
+    expect(check).toHaveBeenCalledTimes(1);
+    if (change === "unchanged") {
+      expect(send).toHaveBeenCalledExactlyOnceWith("original-room", expect.stringContaining(id), ["original-ceo"]);
+      expect(h.cp.outbox.get(id)).toMatchObject({ status: "SENT", attempts: 1 });
+      expect(h.cp.db.get("SELECT acked_at FROM outbox WHERE message_id = ?", [id])).toEqual({ acked_at: null });
+      expect(h.cp.db.all("SELECT room, recipient, outcome FROM outbox_sent_destinations WHERE message_id = ?", [id]))
+        .toEqual([{ room: "original-room", recipient: "original-ceo", outcome: "ACCEPTED" }]);
+      expect((await h.buzzAdapter.deliverPending()).delivered).toEqual([]);
+      expect(send).toHaveBeenCalledTimes(1);
+    } else {
+      expect(send).not.toHaveBeenCalled();
+      expect(h.cp.db.get("SELECT status FROM outbox WHERE message_id = ?", [id])).not.toMatchObject({ status: "SENT" });
+      expect(h.cp.db.all("SELECT * FROM outbox_sent_destinations WHERE message_id = ?", [id])).toEqual([]);
+    }
+  } finally { h.cp.close(); }
+};
+
+it.each(["revocation", "room change", "session termination"] as const)(
+  "ACP1202-R3-01: an ordinary CEO %s during an allowed policy check prevents the post", policyFenceWitness,
+);
+
+it("ACP1202-R3-01: an ordinary CEO with unchanged authority after the allowed check delivers once", async () => {
+  await policyFenceWitness("unchanged");
+});

@@ -858,11 +858,12 @@ export class BuzzAdapter {
         continue;
       }
       // A holder/room change during readback must not authorize a post to the old binding.
-      if (!this.db.get(`SELECT 1 FROM outbox o JOIN sessions s ON s.session_id = o.target_session_id
+      const currentHolder = () => this.db.get(`SELECT 1 FROM outbox o JOIN sessions s ON s.session_id = o.target_session_id
         WHERE o.message_id = ? AND o.status = 'IN_FLIGHT' AND o.claim_token = ?
           AND o.target_session_id = ? AND o.binding_generation = ? AND s.buzz_address = ? AND s.buzz_actor_id = ?
           AND ${liveDeliveryTarget("o")}`,
-      [message.messageId, message.claimToken, message.targetSessionId, message.bindingGeneration, channel, recipient])) {
+      [message.messageId, message.claimToken, message.targetSessionId, message.bindingGeneration, channel, recipient]);
+      if (!currentHolder()) {
         this.outbox.markAttemptFailed(message.messageId, message.claimToken,
           { failureClass: "contract", retryable: false, error: "target changed before Buzz post", destination, routeAbsent: true });
         continue;
@@ -890,8 +891,17 @@ export class BuzzAdapter {
       // Retain this attempt's policy identity; later bytes belong to resume, not its refusal.
       const policyBinding = message.kind === MessageKind.CEO_NOTIFICATION
         ? this.#policyBinding(message, channel, recipient, readiness?.signer ?? null) : undefined;
+      const content = render(message);
+      // Policy readback is asynchronous too: digest equality cannot fence an ordinary CEO.
+      // Revalidate the full claim, active binding, lifecycle and exact destination before send.
+      // BuzzCliTransport.send spawns messages send synchronously before its first await.
+      if (!currentHolder()) {
+        this.outbox.markAttemptFailed(message.messageId, message.claimToken,
+          { failureClass: "contract", retryable: false, error: "target changed before Buzz post", destination, routeAbsent: true });
+        continue;
+      }
       try {
-        await this.transport.send(channel, render(message), [recipient]);
+        await this.transport.send(channel, content, [recipient]);
         // Where it landed is recorded first, whatever happens to the claim next.
         this.outbox.recordAcceptedSend(message.messageId, destination);
         // Completing the delivery is a compare-and-set on the claim: if the claim was

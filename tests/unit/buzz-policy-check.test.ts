@@ -1,4 +1,4 @@
-import { cpSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 import { BuzzCliTransport } from "../../src/buzz/buzz-adapter.ts";
@@ -11,11 +11,13 @@ afterEach(() => vi.unstubAllEnvs());
 
 const fixture = () => {
   const root = tempDir("policy-check-cli-");
-  const file = join(root, "required-mentions.json");
+  const file = join(root, "policy-link.json");
+  const canonicalFile = join(root, "required-mentions.json");
   const reply = join(root, "reply.json");
   const log = join(root, "checks.jsonl");
   const real = join(root, "buzz");
-  writeFileSync(file, '{"fixture":"policy bytes"}');
+  writeFileSync(canonicalFile, '{"fixture":"policy bytes"}');
+  symlinkSync(canonicalFile, file);
   writeFileSync(reply, '{}');
   stableFixtureLink(real, '#!/bin/sh\nexec python3 -B "$(dirname "$0")/buzz-mention-enforce.py" "$0" "$@"\n');
   writeFileSync(join(root, "buzz-mention-enforce.py"), `import hashlib,json,os,sys
@@ -80,8 +82,8 @@ it("ACP1202 runtime binding: a well-formed but different reported digest fails c
   writeFileSync(f.reply, JSON.stringify({ overrides: { policy_digest: reported } }));
   expect(await f.transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
     verdict: "undeterminable", policyIdentity: {
-      configured: { file: f.file, digest: sha256Hex(readFileSync(f.file)) },
-      reported: { file: f.file, digest: reported },
+      configured: { file: realpathSync(f.file), digest: sha256Hex(readFileSync(f.file)) },
+      reported: { file: realpathSync(f.file), digest: reported },
     },
   });
 });
@@ -91,25 +93,47 @@ it("ACP1202 runtime binding: compares resolved policy paths without guessing ano
   const f = fixture(); const alias = join(f.file, "..", "policy-alias.json"); symlinkSync(f.file, alias);
   const transport = new BuzzCliTransport(f.binary, null, alias);
   expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
-    verdict: "allowed", policyIdentity: { configured: { file: f.file }, reported: { file: f.file } },
+    verdict: "allowed", policyIdentity: { configured: { file: realpathSync(f.file) }, reported: { file: realpathSync(f.file) } },
   });
   writeFileSync(f.reply, JSON.stringify({ overrides: { policy_file: "/another/copy.json" } }));
   expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
-    verdict: "undeterminable", policyIdentity: { configured: { file: f.file }, reported: { file: "/another/copy.json" } },
+    verdict: "undeterminable", policyIdentity: { configured: { file: realpathSync(f.file) }, reported: { file: "/another/copy.json" } },
   });
 });
 
 
 it("ACP1202 runtime binding: checks the sending executable, never a wrapper beside a policy copy", async () => {
   const f = fixture(); const copy = tempDir("policy-copy-"); const file = join(copy, "required-mentions.json");
-  cpSync(f.file, file); cpSync(f.reply, join(copy, "reply.json"));
+  writeFileSync(file, readFileSync(f.file)); cpSync(f.reply, join(copy, "reply.json"));
   cpSync(join(f.file, "..", "buzz-mention-enforce.py"), join(copy, "buzz-mention-enforce.py"));
   const transport = new BuzzCliTransport(f.binary, null, file);
   expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
-    verdict: "undeterminable", policyIdentity: { configured: { file }, reported: { file: f.file } },
+    verdict: "undeterminable", policyIdentity: { configured: { file: realpathSync(file) }, reported: { file: realpathSync(f.file) } },
   });
   expect(readFileSync(f.log, "utf8").trim().split("\n")).toHaveLength(1);
 });
+
+it.each(["different file", "different digest"] as const)(
+  "ACP1202 path normalization: a same-file alias never excuses a %s", async difference => {
+    const f = fixture();
+    const alias = join(f.file, "..", "another-alias.json"); symlinkSync(f.file, alias);
+    const transport = new BuzzCliTransport(f.binary, null, alias);
+    const send = vi.spyOn(transport, "send");
+    const configured = { file: realpathSync(f.file), digest: sha256Hex(readFileSync(f.file)) };
+    expect((await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).verdict).toBe("allowed");
+    const copy = join(f.file, "..", "equal-bytes-different-file.json"); writeFileSync(copy, readFileSync(f.file));
+    expect(realpathSync(copy)).not.toBe(configured.file);
+    expect(sha256Hex(readFileSync(copy))).toBe(configured.digest);
+    const reported = difference === "different file"
+      ? { file: realpathSync(copy), digest: configured.digest } : { file: configured.file, digest: "b".repeat(64) };
+    writeFileSync(f.reply, JSON.stringify({ overrides: { policy_file: reported.file, policy_digest: reported.digest } }));
+    expect(await transport.policyReadiness("exact-room", "body", "ceo-key", "a".repeat(64))).toMatchObject({
+      verdict: "undeterminable", policyIdentity: { configured, reported },
+    });
+    expect(send).not.toHaveBeenCalled();
+    expect(readFileSync(f.log, "utf8").trim().split("\n")).toHaveLength(2);
+  },
+);
 
 
 it.each(["ROSTER_STATE", "POLICY", "CREDENTIAL", "AUTHORITY", "UNKNOWN", undefined, "not-a-cause", { retryable: true }].flatMap(cause => ["refused", "undeterminable"].map(verdict => ({ cause, verdict }))))(

@@ -22,8 +22,14 @@ type Harness = ReturnType<typeof makeHarness>;
 const recordingTransport = () => {
   const send = vi.fn(async (_channel: string, _content: string, recipients: readonly string[]): Promise<BuzzSendReceipt> =>
     ({ eventId: `evt-${send.mock.calls.length}`, mentionPubkeys: [...recipients] }));
-  const transport: BuzzTransport = { openChannel: async (purpose) => `channel:${purpose}`, available: async () => true, send };
-  return { transport, send };
+  const policyReadiness = vi.fn<NonNullable<BuzzTransport["policyReadiness"]>>(async (_room, _content, recipient, signer) =>
+    ({ verdict: "allowed", policyDigest: "fixture-policy", signer, recipient }));
+  const transport: BuzzTransport = { openChannel: async (purpose) => `channel:${purpose}`, available: async () => true, send,
+    signerReadiness: async () => ({ signer: "fixture-signer", registered: true }),
+    localSendPolicyDigest: () => "fixture-policy",
+    policyReadiness,
+  };
+  return { transport, send, policyReadiness };
 };
 
 const readyCeo = (h: Harness, route: { room: string | null; identity: string | null }) => {
@@ -49,23 +55,27 @@ const stateOf = (h: Harness, id: string) =>
 
 /** A Buzz-backed CEO at generation N, in "first-room" as "first-key". */
 const buzzCeo = () => {
-  const { transport, send } = recordingTransport();
+  const { transport, send, policyReadiness } = recordingTransport();
   const h = makeHarness({ buzzTransport: transport });
   const first = readyCeo(h, { room: "first-room", identity: "first-key" });
   const bound = h.cp.bindings.bind({ role: Role.CEO, sessionId: first.sessionId });
   if (!bound.allowed) throw new Error(bound.message);
-  return { h, send, first, firstGeneration: bound.value.bindingGeneration };
+  return { h, send, policyReadiness, first, firstGeneration: bound.value.bindingGeneration };
 };
 const sendsOf = (send: ReturnType<typeof recordingTransport>["send"], id: string) =>
   send.mock.calls.filter((call) => String(call[1]).includes(id)).length;
 
-/** A CEO notification whose Buzz send timed out: SENT, outcome unknown, at the first CEO. */
+/** A readiness-qualified CEO send timed out: PENDING/unknown, resend held at the first CEO. */
 const timedOut = async (key: string) => {
   const f = buzzCeo();
   const id = notify(f.h, key);
   f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
   await f.h.buzzAdapter.deliverPending();
-  expect(stateOf(f.h, id)).toMatchObject({ status: "SENT", failure_class: "unknown_observed", target_session_id: f.first.sessionId });
+  expect(f.policyReadiness).toHaveBeenCalledExactlyOnceWith("first-room", expect.stringContaining(id), "first-key", "fixture-signer");
+  expect(stateOf(f.h, id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed", target_session_id: f.first.sessionId });
+  expect(sendsOf(f.send, id)).toBe(1);
+  expect(outboxDeliveryReadback(f.h.cp.outbox.get(id)!)).toMatchObject({ status: "OUTCOME_UNKNOWN",
+    delivered: false, completed: false, automaticResendHeld: true });
   return { ...f, id, sent: sendsOf(f.send, id) };
 };
 
@@ -80,6 +90,19 @@ const replaceWith = (f: Awaited<ReturnType<typeof timedOut>>, route: { room: str
   expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId: next.sessionId }).allowed).toBe(true);
   return next;
 };
+
+it.each(["refused", "undeterminable"] as const)("FCR-08: the recording fixture still enforces a %s policy verdict", async verdict => {
+  const f = buzzCeo();
+  try {
+    const id = notify(f.h, `policy-${verdict}`);
+    f.policyReadiness.mockResolvedValue({ verdict, cause: "POLICY", policyDigest: "fixture-policy", signer: "fixture-signer", recipient: "first-key" });
+    expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([]);
+    expect(f.policyReadiness).toHaveBeenCalledExactlyOnceWith("first-room", expect.stringContaining(id), "first-key", "fixture-signer");
+    expect(f.send).not.toHaveBeenCalled();
+    expect(stateOf(f.h, id)).toMatchObject({ status: "PENDING" });
+    expect(destinationsOf(f.h, id)).toEqual([]);
+  } finally { f.h.cp.close(); }
+});
 
 it("FCR-08: each send that may have landed records its exact room and recipient key, with its outcome", async () => {
   const f = await timedOut("destination-recorded");
@@ -142,7 +165,9 @@ it("FCR-08: a holder with no route yet gets the row, and when its route turns ou
 it("FCR-08: a row with an unknown outcome and no record of where it went is never sent again on a holder change", async () => {
   const f = await timedOut("legacy-unknown");
   try {
-    // A row written before v51 recorded destinations: the same state, with no evidence of where it went.
+    // A row written before v51 recorded destinations: retain its legacy SENT/unknown representation
+    // explicitly, even though this fixture's newly qualified timeout follows the PENDING branch.
+    f.h.cp.db.run("UPDATE outbox SET status = 'SENT', sent_at = ? WHERE message_id = ?", [f.h.clock.nowIso(), f.id]);
     if (f.h.cp.db.all("SELECT name FROM sqlite_schema WHERE name = 'outbox_sent_destinations'").length > 0) {
       f.h.cp.db.run("DELETE FROM outbox_sent_destinations WHERE message_id = ?", [f.id]);
     }
