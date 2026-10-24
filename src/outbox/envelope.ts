@@ -20,6 +20,8 @@ export const MessageKind = {
   RECOVERY_PACKAGE: "RECOVERY_PACKAGE",
   DRAIN_REQUEST: "DRAIN_REQUEST",
   ESCALATION_REPLY: "ESCALATION_REPLY",
+  /** CEO instruction to resubmit the current attached bootstrap PLAN for blind review; no approval. */
+  RESUME_REVIEW: "RESUME_REVIEW",
   CEO_NOTIFICATION: "CEO_NOTIFICATION",
   CANCEL_REQUEST: "CANCEL_REQUEST",
   /**

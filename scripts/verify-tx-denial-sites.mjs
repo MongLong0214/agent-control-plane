@@ -147,6 +147,8 @@ const EXPECTED_CONVERTED_SITES = [
   { file: "bootstrap/bootstrap-plan-artifact.ts", symbol: "stageBootstrapPlan", label: "stageBootstrapPlan", evidence: "direct" },
   // Input storage, replacement invalidation and notification must roll back if enqueue/audit denies.
   { file: "bootstrap/bootstrap-plan-artifact.ts", symbol: "attachBootstrapPlan", label: "attachBootstrapPlan", evidence: "direct" },
+  // The owner's instruction and CEO decision must both roll back if enqueue or audit refuses.
+  { file: "bootstrap/bootstrap-plan-artifact.ts", symbol: "resumeBootstrapReview", label: "resumeBootstrapReview", evidence: "direct" },
   { file: "verify/verification-engine.ts", symbol: "pinRunScopedCommands", label: "VerificationEngine.pinRunScopedCommands", evidence: "direct" },
   { file: "cto/cto-lifecycle.ts", symbol: "prepareSwitchover", label: "CtoLifecycle.prepareSwitchover", evidence: "direct" },
   { file: "cto/cto-lifecycle.ts", symbol: "acknowledgeHandoff", label: "CtoLifecycle.acknowledgeHandoff", evidence: "direct" },

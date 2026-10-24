@@ -489,7 +489,7 @@ const createCtoServerFromPort = (
     "role_dispatch_pending",
     {
       description:
-        "The pending control-plane messages (dispatch, revision, escalation reply, drain, cancel, bootstrap handoff) addressed in band to this exact session at its active generation. Acknowledge a HANDOFF_PACKAGE with handoff_ack; other messages use role_dispatch_ack (or run_ack, for a row that names a run this session owns).",
+        "The pending control-plane messages (dispatch, revision, resume review, escalation reply, drain, cancel, bootstrap handoff) addressed in band to this exact session at its active generation. Acknowledge a HANDOFF_PACKAGE with handoff_ack; other messages use role_dispatch_ack (or run_ack, for a row that names a run this session owns).",
       inputSchema: {},
     },
     async () => read("role_dispatch_pending", (peer) => {

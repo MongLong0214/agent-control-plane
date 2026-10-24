@@ -1,3 +1,4 @@
+import { resumeReviewAttachmentMatches } from "../bootstrap/bootstrap-plan-artifact.ts";
 import { ceoBuzzHistoryIsPrePost, isBuzzSignerRefusal } from "./ceo-buzz-signer.ts";
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
@@ -357,6 +358,7 @@ export const IN_BAND_KINDS: ReadonlySet<MessageKind> = new Set<MessageKind>([
   MessageKind.CANCEL_REQUEST,
   MessageKind.REVISION_REQUEST,
   MessageKind.ESCALATION_REPLY,
+  MessageKind.RESUME_REVIEW,
   MessageKind.DRAIN_REQUEST,
 ]);
 
@@ -723,6 +725,12 @@ const instructionHandoverOf = (
   if (run.owner_role_key !== null && run.owner_role_key !== row.role_key) {
     return { kind: "SUPERSEDE", reason: "RUN_OWNED_ELSEWHERE", runState: run.state };
   }
+  if (row.kind === MessageKind.RESUME_REVIEW) {
+    if (!resumeReviewAttachmentMatches(db, row.run_id, readPayload(row.payload_json))
+        || payloadDigestOf(readPayload(row.payload_json)) !== row.payload_digest) {
+      return { kind: "SUPERSEDE", reason: "BOOTSTRAP_PLAN_CHANGED", runState: run.state };
+    }
+  }
   if (row.kind === MessageKind.ESCALATION_REPLY && !escalationReplyStillAnswers(db, row, run.project_id, to)) {
     return { kind: "SUPERSEDE", reason: "ESCALATION_SUPERSEDED", runState: run.state };
   }
@@ -793,7 +801,9 @@ const supersedeInstruction = (
   to: { generation: number } | null,
   path: InstructionHandoverPath,
 ): boolean => {
-  const reasonCode = decision.reason === "RUN_TERMINAL" ? ReasonCode.RUN_ALREADY_TERMINAL : ReasonCode.OUTBOX_STALE_GENERATION_REJECTED;
+  const reasonCode = decision.reason === "RUN_TERMINAL" ? ReasonCode.RUN_ALREADY_TERMINAL
+    : decision.reason === "BOOTSTRAP_PLAN_CHANGED" ? ReasonCode.SNAPSHOT_DIGEST_MISMATCH
+    : ReasonCode.OUTBOX_STALE_GENERATION_REJECTED;
   const changed = db.run(
     `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
                        retry_eligible = 0, next_attempt_at = NULL
@@ -1366,6 +1376,7 @@ export class Outbox {
 
       const claimed: Array<OutboxMessage & { claimToken: string }> = [];
       for (const row of rows) {
+        if (!this.#resumeReviewAdmitted(row)) continue;
         const token = `clm_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
         const updated = this.db.run(
           `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = ?, claimed_at = ?
@@ -2115,6 +2126,12 @@ export class Outbox {
       );
     }
 
+    if (row.kind === MessageKind.RESUME_REVIEW && row.run_id !== null
+        && !resumeReviewAttachmentMatches(this.db, row.run_id, readPayload(row.payload_json))) {
+      supersedeInstruction(this.db, this.audit, row, { reason: "BOOTSTRAP_PLAN_CHANGED", runState: null }, null, "RECEIPT");
+      return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "resume-review instruction is void: attached PLAN changed");
+    }
+
     this.db.run(`UPDATE outbox SET status = 'ACKED', acked_at = ? WHERE message_id = ?`, [
       this.clock.nowIso(),
       messageId,
@@ -2216,6 +2233,11 @@ export class Outbox {
         "ack came from a session, generation or incarnation that does not hold this message",
       );
     }
+    if (row.kind === MessageKind.RESUME_REVIEW && row.run_id !== null
+        && !resumeReviewAttachmentMatches(this.db, row.run_id, readPayload(row.payload_json))) {
+      supersedeInstruction(this.db, this.audit, row, { reason: "BOOTSTRAP_PLAN_CHANGED", runState: null }, null, "RECEIPT");
+      return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "resume-review instruction is void: attached PLAN changed");
+    }
     const now = this.clock.nowIso();
     const changed = this.db.run(
       `UPDATE outbox SET status = 'ACKED', acked_at = ? WHERE message_id = ? AND status = 'PENDING'`,
@@ -2237,7 +2259,8 @@ export class Outbox {
   }
 
   /**
-   * The pending in-band rows addressed to one exact runtime, oldest first: read-only.
+   * The pending in-band rows addressed to one exact runtime, oldest first.
+   * A resume-review instruction whose attachment changed is voided before its payload is exposed.
    *
    * `sessionIncarnation` comes from the caller's authenticated connection, and the row must be
    * addressed to the current holder of its own role generation down to that incarnation
@@ -2246,25 +2269,27 @@ export class Outbox {
    * not dispose of actionable instructions.
    */
   pendingInBandFor(sessionId: string, sessionIncarnation: string): InBandDispatch[] {
-    const rows = this.db.all<RawOutbox>(
-      `SELECT o.* FROM outbox o
-        WHERE o.status = 'PENDING'
-          AND o.target_session_id = ?
-          AND ${inBandRow("o")}
-          AND ${exactHolderTarget("o")}
-        ORDER BY o.created_at, o.rowid`,
-      [sessionId, sessionIncarnation],
-    );
-    return rows.map((row) => ({
-      messageId: row.message_id,
-      bindingGeneration: row.binding_generation,
-      payloadDigest: row.payload_digest,
-      kind: row.kind as MessageKind,
-      runId: row.run_id,
-      createdAt: row.created_at,
-      expiresAt: row.expires_at,
-      payload: readPayload(row.payload_json),
-    }));
+    return this.db.tx(() => {
+      const rows = this.db.all<RawOutbox>(
+        `SELECT o.* FROM outbox o
+          WHERE o.status = 'PENDING'
+            AND o.target_session_id = ?
+            AND ${inBandRow("o")}
+            AND ${exactHolderTarget("o")}
+          ORDER BY o.created_at, o.rowid`,
+        [sessionId, sessionIncarnation],
+      );
+      return rows.filter(row => this.#resumeReviewAdmitted(row)).map((row) => ({
+        messageId: row.message_id,
+        bindingGeneration: row.binding_generation,
+        payloadDigest: row.payload_digest,
+        kind: row.kind as MessageKind,
+        runId: row.run_id,
+        createdAt: row.created_at,
+        expiresAt: row.expires_at,
+        payload: readPayload(row.payload_json),
+      }));
+    });
   }
 
   /**
@@ -2950,6 +2975,17 @@ export class Outbox {
       `SELECT 1 AS present FROM audit_events WHERE kind = ? AND json_extract(evidence_json, '$.messageId') = ?`,
       [ESCALATION_REPLY_CARRIED, row.message_id],
     ) === undefined;
+  }
+
+  /** Receipt/claim uses the same supersession rules as handover, before exposing the payload. */
+  #resumeReviewAdmitted(row: RawOutbox): boolean {
+    // Runless in-band work has only the ordinary current-holder fence. The CEO resume-review
+    // producer always names a run; only those instructions carry attachment authority to recheck.
+    if (row.kind !== MessageKind.RESUME_REVIEW || row.run_id === null) return true;
+    const decision = this.#instructionHandover(row, null);
+    if (decision.kind !== "SUPERSEDE") return true;
+    supersedeInstruction(this.db, this.audit, row, decision, null, "RECEIPT");
+    return false;
   }
 
   /** The one handover policy's decision for `row` (`instructionHandoverOf`). Only reads. */
@@ -3710,10 +3746,10 @@ export class Outbox {
  * five.
  */
 /** Which handover asked the in-band instruction policy (ACP-R1-01). */
-type InstructionHandoverPath = "RUNTIME_MOVE" | "TAKEOVER" | "REVOKE" | "ADOPTION" | "SESSION_STOPPED" | "FENCE";
+type InstructionHandoverPath = "RUNTIME_MOVE" | "TAKEOVER" | "REVOKE" | "ADOPTION" | "SESSION_STOPPED" | "FENCE" | "RECEIPT";
 
 /** Why a handover superseded an in-band instruction rather than carrying it (ACP-R1-01). */
-type InstructionSupersession = "RUN_TERMINAL" | "RUN_MISSING" | "RUN_OWNED_ELSEWHERE" | "ESCALATION_SUPERSEDED" | "ROLE_REPLACED";
+type InstructionSupersession = "RUN_TERMINAL" | "RUN_MISSING" | "RUN_OWNED_ELSEWHERE" | "ESCALATION_SUPERSEDED" | "ROLE_REPLACED" | "BOOTSTRAP_PLAN_CHANGED";
 
 /** `Outbox.#instructionHandover`'s answer for one row. */
 type InstructionHandover =
