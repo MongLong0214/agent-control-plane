@@ -586,13 +586,21 @@ it.each(["recipient not registered for channel", "signer not registered for chan
   },
 );
 
-it.each([false, true])("recovers a live-style contract row only with complete pre-post history; prior unknown = %s", async (unknown) => {
-  const { f } = await signerRoute(); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
-  // Before this fix Buzz logged only the row's last error and aggregate BUZZ_DELIVERY.
+it.each([false, true])("holds a live-style contract refusal and resumes only with complete history plus a policy change; prior unknown = %s", async (unknown) => {
+  const { f } = await signerRoute(); let policy = "v1";
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy });
+  const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  // Before the attempt journal Buzz logged only the last error and aggregate BUZZ_DELIVERY.
   f.h.cp.db.run("UPDATE outbox SET attempts = ?, failure_class = 'contract', last_error = ? WHERE message_id = ?",
     [unknown ? 2 : 1, signerRefusal, id]);
+  const before = processingOf(f, id);
   const send = vi.spyOn(f.h.buzz, "send");
   await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
+  expect(send).not.toHaveBeenCalled();
+  expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
+  if (unknown) expect(processingOf(f, id)).toEqual(before);
+  else expect(processingOf(f, id)).toMatchObject({ reason_code: "BUZZ_LOCAL_SEND_POLICY_REFUSED", attempts: 1 });
+  policy = "v2"; await f.h.buzzAdapter.deliverPending();
   expect(send).toHaveBeenCalledTimes(unknown ? 0 : 1);
   expect(f.h.cp.outbox.get(id)?.status).toBe(unknown ? "PENDING" : "SENT");
 });
@@ -636,27 +644,35 @@ it.each(["canonical-unknown", "legacy-unknown"])("an exact signer refusal never 
   expect(send).not.toHaveBeenCalled(); expect(processingOf(f, id)).toEqual(before);
 });
 
-it("reclassifies the safe live-style refusal while membership is still absent, with one audit", async () => {
-  const { f, readiness } = await signerRoute(); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+it("reclassifies the safe live-style refusal while membership is still absent, without a roster-only release", async () => {
+  const { f, readiness } = await signerRoute(); let policy = "v1";
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy });
+  const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
   f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, id]);
   readiness.mockResolvedValue({ signer: "daemon-signer", registered: false });
   const send = vi.spyOn(f.h.buzz, "send");
   await f.h.buzzAdapter.deliverPending(); await f.h.buzzAdapter.deliverPending();
   expect(send).not.toHaveBeenCalled();
-  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 1, reason_code: "BUZZ_SIGNER_NOT_REGISTERED", failure_class: "repairable" });
-  expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY")).toHaveLength(1);
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 1, reason_code: "BUZZ_LOCAL_SEND_POLICY_REFUSED", failure_class: "repairable" });
+  expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY").filter(e => e.reasonCode === ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED)).toHaveLength(1);
   readiness.mockResolvedValue({ signer: "daemon-signer", registered: true });
+  await f.h.buzzAdapter.deliverPending(); expect(send).not.toHaveBeenCalled();
+  policy = "v2";
   expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
 });
 
-it("a complete canonical pre-claim refusal plus the one pre-fix Buzz refusal can resume", async () => {
-  const f = await fixture(); const id = notify(f);
+it("a complete canonical pre-claim refusal plus the one pre-fix Buzz refusal resumes only after a policy change", async () => {
+  const f = await fixture(); let policy = "v1";
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy });
+  const id = notify(f);
   await f.h.cp.outbox.deliverCeoNotifications();
   expect(events(f, "CEO_NOTIFICATION_CANONICAL_RESULT")[0]?.evidence).toMatchObject({ outcome: "REFUSED" });
   await bindBuzz(f);
   Object.assign(f.h.buzz, { signerReadiness: async () => ({ signer: "daemon-signer", registered: true }) });
   f.h.cp.db.run("UPDATE outbox SET attempts = 2, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, id]);
   const send = vi.spyOn(f.h.buzz, "send");
+  await f.h.buzzAdapter.deliverPending(); expect(send).not.toHaveBeenCalled();
+  policy = "v2";
   expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
   expect(send).toHaveBeenCalledTimes(1);
   expect(f.h.cp.outbox.get(id)?.status).toBe("SENT");
@@ -699,7 +715,9 @@ const systemicFixture = async (mode: "success" | "fail" | "mismatch" = "success"
 };
 
 it("ensures only the actual daemon member of the current canonical CEO room, reads back, then sends once and ACKs", async () => {
+  let policy = "v1";
   const { f, invoke, room, signer, readback } = await systemicFixture();
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy });
   const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
   f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, id]);
   const sealed = processingOf(f, id)!;
@@ -710,6 +728,8 @@ it("ensures only the actual daemon member of the current canonical CEO room, rea
     signer, route: currentCanonicalCeoBuzzRoute(f.h.cp.db) }]);
   expect(readback.mock.calls.every(([channel]) => channel === room)).toBe(true);
   expect(readback.mock.calls.length).toBeGreaterThanOrEqual(2);
+  expect(send).not.toHaveBeenCalled();
+  policy = "v2"; await f.h.buzzAdapter.deliverPending();
   expect(send).toHaveBeenCalledTimes(1);
   expect(processingOf(f, id)).toMatchObject({ status: "SENT", payload_json: sealed.payload_json,
     payload_digest: sealed.payload_digest, target_session_id: sealed.target_session_id, binding_generation: sealed.binding_generation });
@@ -819,7 +839,9 @@ it("systemic membership never touches the 12 legacy-unknown rows, even with an e
 });
 
 it("an overlapping positive roster cannot bypass a still-pending host ensure receipt", async () => {
+  let policy = "v1";
   const { f, invoke, setMember } = await systemicFixture(); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy });
   f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, id]);
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
@@ -832,19 +854,24 @@ it("an overlapping positive roster cannot bypass a still-pending host ensure rec
   const first = f.h.buzzAdapter.deliverPending(); await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
   await f.h.buzzAdapter.deliverPending();
   expect(send).not.toHaveBeenCalled(); expect(f.h.cp.outbox.get(id)?.status).toBe("PENDING");
-  release(); await first;
+  release(); await first; expect(send).not.toHaveBeenCalled();
+  policy = "v2"; await f.h.buzzAdapter.deliverPending();
   expect(invoke).toHaveBeenCalledTimes(1); expect(send).toHaveBeenCalledTimes(1);
   expect(f.h.cp.outbox.get(id)?.status).toBe("SENT");
 });
 
 it("a lost ensure receipt recovers through independent membership readback without a second join", async () => {
+  let policy = "v1";
   const { f, invoke, signer, setMember } = await systemicFixture(); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy });
   f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, id]);
   const route = currentCanonicalCeoBuzzRoute(f.h.cp.db)!;
   // A previous daemon committed intent and died after the member was added, before its receipt.
   f.h.cp.audit.record({ kind: "CEO_BUZZ_SIGNER_ENSURE", evidence: { route, signer, state: "INTENT", ensureDigest: digestOf({ route, signer }) } });
   setMember(true);
   const send = vi.spyOn(f.h.buzz, "send"); await f.h.buzzAdapter.deliverPending();
+  expect(send).not.toHaveBeenCalled();
+  policy = "v2"; await f.h.buzzAdapter.deliverPending();
   expect(invoke).not.toHaveBeenCalled(); expect(send).toHaveBeenCalledTimes(1);
   expect(f.h.cp.outbox.get(id)?.status).toBe("SENT");
   expect(events(f, "CEO_BUZZ_SIGNER_READBACK").at(-1)?.evidence).toMatchObject({ registered: true, signer });
@@ -878,7 +905,8 @@ it("ACP1199-01: revocation after positive canonical readiness but before its con
 });
 
 it.each([false, true])("ACP1199-03: known invalid host receipts cannot be bypassed on later sweeps; resumed = %s", async resumed => {
-  const { f, invoke, setMember, signer } = await systemicFixture(); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  const { f, invoke, setMember, signer } = await systemicFixture(); let policy = "v1";
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy }); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
   if (resumed) f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, id]);
   invoke.mockImplementationOnce(async (_op, allocation) => {
     if (!("mode" in allocation)) throw new Error("unexpected allocation");
@@ -896,6 +924,10 @@ it.each([false, true])("ACP1199-03: known invalid host receipts cannot be bypass
   // A separately obtained, validated exact-room receipt supplies the missing verification.
   f.h.cp.audit.record({ kind: "CEO_BUZZ_SIGNER_ENSURE", evidence: { ensureDigest, route, signer, state: "SUCCEEDED",
     receipt: { route, signer, changed: false, rosterVerified: true } } });
+  if (resumed) {
+    await f.h.buzzAdapter.deliverPending(); expect(send).not.toHaveBeenCalled();
+    policy = "v2";
+  }
   await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
   expect(send).toHaveBeenCalledTimes(1); expect(f.h.cp.outbox.get(id)?.status).toBe("SENT"); expect(invoke).toHaveBeenCalledTimes(1);
 });
@@ -1225,16 +1257,103 @@ it("D2: unchanged policy holds never provision a subsequently missing roster mem
 });
 
 
-it("D2: a policy edit during the refused attempt cannot immediately repeat the refusal", async () => {
+it.each(["permitting", "still-refusing"] as const)("ACP1202-R1-02: a concurrent %s policy replacement is revalidated through resume", async replacement => {
   const { f } = await signerRoute(); let policy = "v1";
   Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy });
   const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
-  const send = vi.spyOn(f.h.buzz, "send").mockImplementation(async () => {
-    policy = "v2"; throw new Error(signerRefusal);
-  });
-  for (let n = 0; n < 4; n++) await f.h.buzzAdapter.deliverPending();
+  let reject!: (error: Error) => void;
+  const refused = new Promise<never>((_resolve, fail) => { reject = fail; });
+  const send = vi.spyOn(f.h.buzz, "send").mockRejectedValue(new Error(signerRefusal));
+  if (replacement === "permitting") send.mockResolvedValue({ eventId: "fake-permitted", mentionPubkeys: ["ceo-key"] });
+  send.mockImplementationOnce(() => refused);
+  const first = f.h.buzzAdapter.deliverPending();
+  await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+  policy = "v2"; // The wrapper evaluated v1; v2 arrived before its refusal reached ACP.
+  reject(new Error(signerRefusal)); await first;
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 1 });
+  for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
+  expect(send).toHaveBeenCalledTimes(2);
+  expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY").map(e => e.evidence.policyBinding))
+    .toEqual(replacement === "permitting"
+      ? [expect.objectContaining({ policyDigest: "v1" })]
+      : [expect.objectContaining({ policyDigest: "v1" }), expect.objectContaining({ policyDigest: "v2" })]);
+  expect(processingOf(f, id)).toMatchObject({ status: replacement === "permitting" ? "SENT" : "PENDING", attempts: 2 });
+});
+
+it.each(["contract", "LEGACY_SEND_REFUSAL"] as const)("ACP1202-R1-01: an older exact %s refusal stays policy-held without a change", async source => {
+  const { f } = await signerRoute();
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => "unchanged-policy" });
+  const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = ?, reason_code = ?, last_error = ? WHERE message_id = ?",
+    [source === "contract" ? "contract" : "repairable", source === "contract" ? null : ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, signerRefusal, id]);
+  if (source !== "contract") f.h.cp.audit.record({ kind: "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY", reasonCode: ReasonCode.BUZZ_SIGNER_NOT_REGISTERED,
+    evidence: { messageId: id, source, attemptNumber: 1, code: "mention_policy", message: "signer not registered for channel" } });
+  const send = vi.spyOn(f.h.buzz, "send").mockRejectedValue(new Error(signerRefusal));
+  for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
+  expect(send).not.toHaveBeenCalled();
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 1, reason_code: "BUZZ_LOCAL_SEND_POLICY_REFUSED" });
+  expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY").filter(e => e.reasonCode === ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED)).toHaveLength(1);
+});
+
+it("ACP1202-R1-03: fingerprint read recovery alone does not release an unavailable-policy hold", async () => {
+  const { f } = await signerRoute(); let readable = false;
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => readable ? "unchanged-policy" : null });
+  const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  const send = vi.spyOn(f.h.buzz, "send").mockRejectedValue(new Error(signerRefusal));
+  await f.h.buzzAdapter.deliverPending(); readable = true;
+  for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
   expect(send).toHaveBeenCalledTimes(1);
-  expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY")).toMatchObject([
-    { evidence: { messageId: id, policyBinding: { policyDigest: "v2" } } },
-  ]);
+  expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY")).toHaveLength(1);
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 1, reason_code: "BUZZ_LOCAL_SEND_POLICY_REFUSED" });
+});
+
+it("ACP1202-R1-01 CEO 961c88a4: migrating an exact refusal never reclassifies or releases the 12 legacy unknown rows", async () => {
+  const { f } = await signerRoute(); let policy = "v1";
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy });
+  const ids = Array.from({ length: 12 }, (_, n) => notify(f, `ceo-961c88a4-legacy-${n}`));
+  const control = notify(f, "ceo-961c88a4-safe-refusal");
+  await f.h.cp.outbox.deliverCeoNotifications();
+  for (const id of ids) {
+    f.h.cp.audit.record({ kind: "CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN", evidence: { messageId: id } });
+    f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, id]);
+  }
+  f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, control]);
+  const before = ids.map(id => processingOf(f, id));
+  const send = vi.spyOn(f.h.buzz, "send");
+  await f.h.buzzAdapter.deliverPending();
+  expect(processingOf(f, control)).toMatchObject({ reason_code: "BUZZ_LOCAL_SEND_POLICY_REFUSED", attempts: 1 });
+  const held = events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY").find(e => e.evidence.messageId === control)!;
+  const binding = held.evidence.policyBinding as { routeDigest: string; signer: string | null; policyDigest: string | null };
+  // Exercise the resume boundary directly as well as candidate selection. Neither may trust an
+  // exact later refusal, a positive roster or a changed digest over explicit unknown history.
+  policy = "v2";
+  for (const id of ids) expect(f.h.cp.outbox.resumeCeoBuzzSigner(f.h.cp.outbox.get(id)!,
+    { room: "ceo-room", recipient: "ceo-key" }, true, { ...binding, policyDigest: policy })).toBe(false);
+  // A day beyond the original expiry does not terminate retained CEO mail (CEO 53f6d0d6).
+  f.h.clock.advance(24 * 60 * 60_000);
+  // Leave the safe control held while checking only the legacy rows across ordinary triggers.
+  policy = "v1";
+  for (let n = 0; n < 3; n++) {
+    await f.h.cp.outbox.deliverCeoNotifications(); await f.h.buzzAdapter.deliverPending();
+  }
+  expect(send).not.toHaveBeenCalled();
+  expect(ids.map(id => processingOf(f, id))).toEqual(before);
+  expect(events(f, "CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY").filter(e => ids.includes(e.evidence.messageId as string))).toEqual([]);
+  expect(events(f, "CEO_NOTIFICATION_LEGACY_OUTCOME_UNKNOWN")).toHaveLength(12);
+});
+
+it.each(["roster", "binding"] as const)("ACP1202-R1-02 CEO 961c88a4: a changed fingerprint cannot bypass current %s validation", async boundary => {
+  const { f, readiness } = await signerRoute(); let policy = "v1";
+  Object.assign(f.h.buzz, { localSendPolicyDigest: () => policy });
+  const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  const send = vi.spyOn(f.h.buzz, "send").mockRejectedValueOnce(new Error(signerRefusal));
+  await f.h.buzzAdapter.deliverPending(); policy = "v2";
+  if (boundary === "roster") readiness.mockResolvedValue({ signer: "daemon-signer", registered: false });
+  else readiness.mockImplementationOnce(async () => {
+    expect(f.h.cp.bindings.revoke("CEO", "changed policy cannot outlive its binding").allowed).toBe(true);
+    return { signer: "daemon-signer", registered: true };
+  });
+  for (let n = 0; n < 3; n++) await f.h.buzzAdapter.deliverPending();
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", attempts: 1, reason_code: "BUZZ_LOCAL_SEND_POLICY_REFUSED" });
 });

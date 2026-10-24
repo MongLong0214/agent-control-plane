@@ -1770,13 +1770,12 @@ export class Outbox {
         this.db.run("UPDATE outbox SET failure_class = 'repairable', reason_code = ? WHERE message_id = ?",
           [ReasonCode.BUZZ_SIGNER_NOT_REGISTERED, message.messageId]);
       }
-      // Upgrade the prior release's exact local-policy hold without retrying the blocked route.
-      // Older contract-only errors keep their existing whole-history recovery semantics.
+      // Upgrade either historical representation of the exact local-policy refusal without sending.
       if (row.reason_code === ReasonCode.BUZZ_SIGNER_NOT_REGISTERED && policyBinding) {
         const previous = this.db.get<{ evidence_json: string }>(`SELECT evidence_json FROM audit_events
           WHERE kind = 'CEO_NOTIFICATION_BUZZ_ROUTE_NOT_READY'
             AND json_extract(evidence_json, '$.messageId') = ? ORDER BY rowid DESC LIMIT 1`, [message.messageId]);
-        if (previous && JSON.parse(previous.evidence_json).source === "SEND_REFUSAL") {
+        if (previous && ["SEND_REFUSAL", "LEGACY_SEND_REFUSAL"].includes(JSON.parse(previous.evidence_json).source)) {
           this.#recordSignerNotReady(message, destination, policyBinding.signer, "SEND_REFUSAL", row.attempts,
             ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED, policyBinding);
           this.db.run("UPDATE outbox SET reason_code = ? WHERE message_id = ?", [ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED, message.messageId]);
@@ -1790,7 +1789,8 @@ export class Outbox {
         const previous = held ? JSON.parse(held.evidence_json).policyBinding as BuzzPolicyBinding | undefined : undefined;
         if (!previous || !policyBinding || !policyBinding.signer) return false;
         const changed = previous.routeDigest !== policyBinding.routeDigest || previous.signer !== policyBinding.signer ||
-          (policyBinding.policyDigest !== null && previous.policyDigest !== policyBinding.policyDigest);
+          (typeof previous.policyDigest === "string" && typeof policyBinding.policyDigest === "string" &&
+            previous.policyDigest !== policyBinding.policyDigest);
         if (!changed) return false;
       }
       if (!registered) return true;

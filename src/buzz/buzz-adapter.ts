@@ -786,6 +786,9 @@ export class BuzzAdapter {
           { failureClass: "contract", retryable: false, error: "target changed before Buzz post", destination, routeAbsent: true });
         continue;
       }
+      // Retain this attempt's policy identity; later bytes belong to resume, not its refusal.
+      const policyBinding = message.kind === MessageKind.CEO_NOTIFICATION
+        ? this.#policyBinding(message, channel, recipient, readiness?.signer ?? null) : undefined;
       try {
         await this.transport.send(channel, render(message), [recipient]);
         // Where it landed is recorded first, whatever happens to the claim next.
@@ -797,11 +800,6 @@ export class BuzzAdapter {
         if (completed.allowed) delivered.push(message.messageId);
         else failed.push(message.messageId);
       } catch (err) {
-        // Start the hold with the policy observed at refusal. An edit during the attempt must not
-        // immediately re-arm an identical refusal on the next sweep.
-        const policyBinding = message.kind === MessageKind.CEO_NOTIFICATION &&
-          isBuzzSignerRefusal(err instanceof Error ? err.message : String(err))
-          ? this.#policyBinding(message, channel, recipient, readiness?.signer ?? null) : undefined;
         this.outbox.markAttemptFailed(
           message.messageId,
           message.claimToken,
