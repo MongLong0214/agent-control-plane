@@ -5,7 +5,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { artifactDigestMatches, type ArtifactStore, type StoredArtifact } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { ArtifactKind, Role, roleKeyFor, RunKind, RunState, type RunRow } from "../domain/types.ts";
+import { ArtifactKind, Role, roleKeyFor, RunKind, RunState, type RoleBinding, type RunRow } from "../domain/types.ts";
 import type { AuthenticatedMcpPeer } from "../mcp/shared.ts";
 import type { HermesAdmittedTurn } from "../mcp/hermes-provenance.ts";
 import { MessageKind } from "../outbox/envelope.ts";
@@ -157,14 +157,24 @@ const assertBootstrapPlanAttachable = (source: AttachSource, input: BootstrapPla
   return run;
 };
 
-export const attachBootstrapPlan = (
-  source: AttachSource, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: BootstrapPlanAttachInput,
-): Decision<{ digest: string }> => source.db.txDecision(() => {
+/** The complete attachment identity check also runs before MCP argument validation and replay. */
+export const bootstrapPlanAttachAuthority = (
+  source: Pick<Source, "bindings">, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined,
+): Decision<{ ceo: RoleBinding; turn: HermesAdmittedTurn }> => {
   const ceo = source.bindings.active(roleKeyFor(Role.CEO));
   if (!peer.sessionId || !peer.sessionIncarnation || !ceo || ceo.sessionId !== peer.sessionId
       || ceo.sessionIncarnation !== peer.sessionIncarnation || turn?.principal !== "owner") {
     return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "attaching input requires the current CEO's authenticated Hermes owner turn");
   }
+  return allow(ReasonCode.OK, { ceo, turn });
+};
+
+export const attachBootstrapPlan = (
+  source: AttachSource, peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: BootstrapPlanAttachInput,
+): Decision<{ digest: string }> => source.db.txDecision(() => {
+  const identity = bootstrapPlanAttachAuthority(source, peer, turn);
+  if (!identity.allowed) return identity;
+  const { ceo, turn: ownerTurn } = identity.value;
   // Canonical artifact JSON normalizes CR/CRLF. Identifiers must survive storage unchanged;
   // use ACP's C0/DEL exclusion for identifiers, without restricting the exact-bytes body.
   if (Object.values(bindingOf(input)).some(value => /[\x00-\x1f\x7f]/.test(value))) {
@@ -222,7 +232,7 @@ export const attachBootstrapPlan = (
     roleKey: ceo.roleKey, evidence: { digest: artifact.digest, payloadDigest: input.expectedSha256,
       contractDigest: input.contractDigest, operationId: input.bootstrapOperationId, projectId: input.projectId,
       repositoryIdentity: input.repositoryIdentity, replacesSha256: input.replacesSha256 ?? null,
-      byteLength: bytes.length, bindingGeneration: ceo.bindingGeneration, hermesPrincipal: turn.principal } });
+      byteLength: bytes.length, bindingGeneration: ceo.bindingGeneration, hermesPrincipal: ownerTurn.principal } });
   return audit.allowed ? allow(ReasonCode.OK, { digest: input.expectedSha256 }) : audit;
 });
 

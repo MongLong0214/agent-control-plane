@@ -36,9 +36,12 @@ async function fixture() {
   const meta = { [HERMES_PROVENANCE_META_KEY]: { principal: "owner", session_id: anchor.liveHermesSessionId,
     lineage_root_digest: lineage, cron: false, delegation_depth: 0 } };
   const servers: Array<{ close(): Promise<void> }> = [];
-  async function connect(kind: "cto" | "hermes", sessionId: string, provenance = true) {
+  async function connect(kind: "cto" | "hermes", sessionId: string, provenance = true,
+    identity: "complete" | "actor-only" | "session-only" | "incarnation-only" = "complete") {
     const session = h.cp.sessions.require(sessionId);
-    const auth = () => allow(ReasonCode.OK, { actor: sessionId, sessionId, sessionIncarnation: session.incarnation });
+    const auth = () => allow(ReasonCode.OK, { actor: sessionId,
+      ...(identity === "complete" || identity === "session-only" ? { sessionId } : {}),
+      ...(identity === "complete" || identity === "incarnation-only" ? { sessionIncarnation: session.incarnation } : {}) });
     const server = kind === "cto" ? createCtoServer(createCtoMcpPort(h.cp), auth)
       : createHermesServer(createHermesMcpPort(h.cp), auth, provenance ? { provenance: anchor } : {});
     const [ct, st] = InMemoryTransport.createLinkedPair();
@@ -65,6 +68,37 @@ async function fixture() {
 }
 
 describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers", () => {
+  it.each((["hermes", "cto"] as const).flatMap(kind =>
+    (["actor-only", "session-only", "incarnation-only"] as const).map(identity => ({ kind, identity }))))(
+    "authenticates an incomplete $kind $identity peer before inspecting digest shape", async ({ kind, identity }) => {
+      const f = await fixture();
+      try {
+        const call = await f.connect(kind, kind === "hermes" ? f.ceo : f.run.ownerSessionId!, true, identity);
+        const tool = kind === "hermes" ? "bootstrap_plan_attach" : "plan_submit";
+        const args = kind === "hermes" ? f.attachArgs
+          : { idempotencyKey: "incomplete", runId: f.run.runId, bootstrapPlanDigest: f.digest };
+        const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
+        f.h.cp.outbox.attachInBandWake(wake);
+        const state = () => ({ artifacts: f.h.cp.artifacts.list(f.run.runId), plan: f.h.cp.artifacts.latest(f.run.runId, "PLAN"),
+          run: f.h.cp.runs.require(f.run.runId), candidate: f.h.cp.runs.currentCandidate(f.run.runId),
+          application: f.h.cp.bootstrapApplications.get(f.run.runId), audit: f.h.cp.audit.forRun(f.run.runId),
+          outbox: f.h.cp.outbox.listByRun(f.run.runId),
+          mcpReceipts: f.h.cp.db.all("SELECT * FROM inbound_messages WHERE channel = 'mcp'") });
+        const before = state();
+        const baseline = await call(tool, args);
+        expect(baseline).toMatchObject({ ok: false, reasonCode: kind === "hermes" && identity === "session-only"
+          ? "BINDING_GENERATION_STALE" : "MCP_PEER_UNAUTHENTICATED" });
+        expect(state()).toEqual(before);
+        for (const field of kind === "hermes" ? ["contractDigest", "expectedSha256", "replacesSha256"] : ["bootstrapPlanDigest"]) {
+          for (const [index, value] of [f.digest, `${f.digest}\rid`, `${f.digest}\r\nid`, `${f.digest}\x00id`, `${f.digest}\x7fid`, "not-a-digest"].entries()) {
+            expect(await call(tool, { ...args, idempotencyKey: `${field}-${index}`, [field]: value })).toEqual(baseline);
+            expect(state()).toEqual(before);
+            expect(wake).not.toHaveBeenCalled();
+          }
+        }
+      } finally { await f.close(); }
+    });
+
   it("round-trips a realistic PLAN larger than 22 KB byte for byte, wakes the owner, and submits by approved digest", async () => {
     const f = await fixture();
     try {

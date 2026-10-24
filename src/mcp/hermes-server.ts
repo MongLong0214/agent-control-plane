@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import { attachBootstrapPlan, bootstrapPlanAttachAccess, validateBootstrapPlanDigests, BOOTSTRAP_PLAN_MAX_BYTES, type BootstrapPlanAttachInput } from "../bootstrap/bootstrap-plan-artifact.ts";
+import { attachBootstrapPlan, bootstrapPlanAttachAccess, bootstrapPlanAttachAuthority, validateBootstrapPlanDigests, BOOTSTRAP_PLAN_MAX_BYTES, type BootstrapPlanAttachInput } from "../bootstrap/bootstrap-plan-artifact.ts";
 import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -115,6 +115,8 @@ export const createHermesMcpPort = (
     },
     attachBootstrapPlan: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: BootstrapPlanAttachInput) =>
       attachBootstrapPlan(source, peer, turn, input),
+    bootstrapPlanAttachAuthority: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined) =>
+      bootstrapPlanAttachAuthority(source, peer, turn),
     bootstrapPlanAttachAccess: (input: BootstrapPlanAttachInput) => bootstrapPlanAttachAccess(source, input),
     createRun: (input: Parameters<RunEngine["create"]>[0]) => source.runs.create(input),
     dispatchRun: (runId: string, hermesTurn?: HermesAdmittedTurn) =>
@@ -355,6 +357,8 @@ const createHermesServerFromPort = (
         const current = authenticateMcpPeer(authenticate);
         const authority = current.allowed ? port.peerAuthority(peer.value) : current;
         if (!authority.allowed || toolName !== "bootstrap_plan_attach") return authority;
+        const identity = port.bootstrapPlanAttachAuthority(peer.value, admittedTurnOf(extra));
+        if (!identity.allowed) return identity;
         const digests = validateBootstrapPlanDigests({ contractDigest: args.contractDigest as string,
           expectedSha256: args.expectedSha256 as string, replacesSha256: args.replacesSha256 as string | undefined });
         if (!digests.allowed) return digests;
