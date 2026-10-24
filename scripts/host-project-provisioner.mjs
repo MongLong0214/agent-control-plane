@@ -6,7 +6,7 @@ import { join, resolve, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { generateSecretKey, getPublicKey } from 'nostr-tools';
 import Database from 'better-sqlite3';
-import { currentCanonicalCeoBuzzRoute } from '../src/outbox/ceo-buzz-signer.ts';
+import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner } from '../src/outbox/ceo-buzz-signer.ts';
 import { canonicalJson } from '../src/core/digest.ts';
 import { readProcessStartToken } from '../src/core/process-argv.ts';
 const home = process.env.HOME;
@@ -24,11 +24,12 @@ const read = p => JSON.parse(readFileSync(p,'utf8'));
 const lock = join(state ?? '/invalid','host-provisioner.lock');
 let locked = false;
 let ownLock = null;
+let ceoSigner = false;
 try {
   const req = JSON.parse(readFileSync(0,'utf8'));
   check(req.version === 1 && home && state, 'protocol');
   const a = req.allocation;
-  const ceoSigner = req.operation === 'ensure-buzz' && a?.mode === 'ceo-route-signer';
+  ceoSigner = req.operation === 'ensure-buzz' && a?.mode === 'ceo-route-signer';
   const match = ceoSigner ? null : /^github:([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/.exec(a.repositoryIdentity);
   const repoName = match?.[2];
   let routeDb = null;
@@ -146,8 +147,8 @@ try {
     case 'ensure-buzz': {
       if (ceoSigner) {
         // Never load a CEO/CTO key. The environment is the daemon's own sending identity.
-        check(/^[a-f0-9]{64}$/i.test(process.env.BUZZ_PRIVATE_KEY ?? ''), 'daemon signer unavailable');
-        const signer = getPublicKey(Buffer.from(process.env.BUZZ_PRIVATE_KEY,'hex'));
+        const signer = daemonBuzzSigner(process.env.BUZZ_PRIVATE_KEY);
+        check(signer, 'daemon signer unavailable');
         check(signer === a.signer, 'daemon sending signer mismatch');
         const route = currentCeo();
         const room = json('buzz',['channels','get','--channel',route.roomId]);
@@ -308,5 +309,19 @@ try {
     default: throw new Error('unknown operation');
   }
   process.stdout.write(JSON.stringify(result));
-} catch (error) {process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal ? ': '+error.message : ''}\n`);process.exitCode = 1;}
+} catch (error) {
+  if (ceoSigner) {
+    let failure = {outcome:'LOST',code:'host_response_unknown',message:'host provisioning outcome unknown'};
+    if (error instanceof ProvisionerRefusal) failure = {outcome:'INVALID',code:'host_verification_failed',message:error.message};
+    else {
+      try {
+        const refusal = JSON.parse(String(error.stderr).trim());
+        if (typeof refusal.error === 'string' && typeof refusal.message === 'string' && refusal.retryable === false)
+          failure = {outcome:'REFUSED',code:refusal.error,message:refusal.message};
+      } catch { /* No precise relay refusal was received. */ }
+    }
+    process.stderr.write(JSON.stringify({ceoBuzzSignerFailure:failure}));
+  } else process.stderr.write(`host project provisioner refused operation${error instanceof ProvisionerRefusal ? ': '+error.message : ''}\n`);
+  process.exitCode = 1;
+}
 finally {if (locked && readlinkSync(lock) === ownLock) rmSync(lock,{force:true});if (ownLock) rmSync(ownLock,{recursive:true,force:true});}

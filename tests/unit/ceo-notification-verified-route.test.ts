@@ -1,3 +1,8 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { nsecEncode } from "nostr-tools/nip19";
+import { getPublicKey } from "nostr-tools/pure";
+
 import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import type * as Http from "node:http";
 
@@ -5,8 +10,8 @@ import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createConfiguredHermesGatewayDaemonNoticeTarget, startConfiguredCeoNotificationRoute } from "../../src/daemon/agentcpd.ts";
 import { currentCanonicalCeoBuzzRoute } from "../../src/outbox/ceo-buzz-signer.ts";
-import type { HostAllocation, HostObservation, HostOperation } from "../../src/runtime/host-project-provisioner.ts";
-import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
+import { HostProvisionerError, type HostAllocation, type HostObservation, type HostOperation } from "../../src/runtime/host-project-provisioner.ts";
+import { BuzzAdapter, BuzzCliTransport, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { Outbox } from "../../src/outbox/outbox.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { daemonNoticeCanonical, daemonNoticeFields, daemonNoticePayloadDigest,
@@ -14,7 +19,7 @@ import { daemonNoticeCanonical, daemonNoticeFields, daemonNoticePayloadDigest,
 import { createHermesGatewayIdentityReader } from "../../src/runtime/hermes-gateway-identity.ts";
 import { createHermesGatewayDaemonNoticeSender } from "../../src/runtime/hermes-gateway-conversation.ts";
 import { adoptedFixture, DIGEST, GATEWAY, LIVE, LSTART, TOKEN } from "../helpers/adopted-ceo.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
 const http = vi.hoisted(() => ({
@@ -678,7 +683,7 @@ const systemicFixture = async (mode: "success" | "fail" | "mismatch" = "success"
   const invoke = vi.fn(async (operation: HostOperation, allocation: HostAllocation): Promise<HostObservation> => {
     expect(operation).toBe("ensure-buzz");
     if (!("mode" in allocation)) throw new Error("unexpected project allocation");
-    if (mode === "fail") throw new Error("host ensure refused");
+    if (mode === "fail") throw new HostProvisionerError("REFUSED", { code: "mention_policy", message: "signer not registered for channel" });
     member = mode !== "mismatch";
     return { ceoBuzzSigner: { route: allocation.route, signer: allocation.signer, changed: true, rosterVerified: true } };
   });
@@ -717,8 +722,8 @@ it("an existing daemon member needs no ensure call or join write", async () => {
   expect(invoke).not.toHaveBeenCalled(); expect(f.h.cp.outbox.get(id)?.status).toBe("SENT");
 });
 
-it.each(["fail", "mismatch"] as const)("a host %s remains route-not-ready without repeated joins, then resumes only on positive readback", async mode => {
-  const { f, invoke, setMember } = await systemicFixture(mode);
+it.each(["fail", "mismatch"] as const)("ACP1199-03: known host %s requires a validated receipt as well as positive readback", async mode => {
+  const { f, invoke, setMember, signer } = await systemicFixture(mode);
   const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
   const send = vi.spyOn(f.h.buzz, "send");
   await f.h.buzzAdapter.deliverPending();
@@ -731,8 +736,14 @@ it.each(["fail", "mismatch"] as const)("a host %s remains route-not-ready withou
   expect(events(f, "CEO_BUZZ_SIGNER_READBACK").at(-1)?.evidence).toMatchObject({ registered: false });
   setMember(true);
   await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
-  expect(send).toHaveBeenCalledTimes(1); expect(invoke).toHaveBeenCalledTimes(1);
-  expect(f.h.cp.outbox.get(id)?.status).toBe("SENT");
+  expect(send).not.toHaveBeenCalled(); expect(invoke).toHaveBeenCalledTimes(1);
+  if (mode === "fail") expect(events(f, "CEO_BUZZ_SIGNER_ENSURE").at(-1)?.evidence).toMatchObject({ state: "REFUSED",
+    refusal: { code: "mention_policy", message: "signer not registered for channel" } });
+  const route = currentCanonicalCeoBuzzRoute(f.h.cp.db)!;
+  f.h.cp.audit.record({ kind: "CEO_BUZZ_SIGNER_ENSURE", evidence: { route, signer, ensureDigest: digestOf({ route, signer }), state: "SUCCEEDED",
+    receipt: { route, signer, changed: false, rosterVerified: true } } });
+  await f.h.buzzAdapter.deliverPending();
+  expect(send).toHaveBeenCalledTimes(1); expect(f.h.cp.outbox.get(id)?.status).toBe("SENT");
 });
 
 it.each(["room", "binding"] as const)("a %s changed during the read-only lookup causes no ensure call", async changed => {
@@ -757,14 +768,14 @@ it("a host response naming a different room is withheld even if a membership rea
   });
   const send = vi.spyOn(f.h.buzz, "send"); await f.h.buzzAdapter.deliverPending();
   expect(send).not.toHaveBeenCalled(); expect(f.h.cp.outbox.get(id)).toMatchObject({ status: "PENDING", failureClass: "repairable" });
-  expect(events(f, "CEO_BUZZ_SIGNER_ENSURE").at(-1)?.evidence).toMatchObject({ state: "FAILED" });
+  expect(events(f, "CEO_BUZZ_SIGNER_ENSURE").at(-1)?.evidence).toMatchObject({ state: "INVALID" });
 });
 
 it("membership ensure intent is shared across overlapping rows, sweeps and a lost host response", async () => {
   const { f, invoke } = await systemicFixture();
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
-  invoke.mockImplementationOnce(async () => { await held; throw new Error("host response lost"); });
+  invoke.mockImplementationOnce(async () => { await held; throw new HostProvisionerError("LOST"); });
   notify(f, "first-ensure"); await f.h.cp.outbox.deliverCeoNotifications();
   const first = f.h.buzzAdapter.deliverPending(); await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
   const secondId = notify(f, "overlapping-ensure"); await f.h.cp.outbox.deliverCeoNotifications();
@@ -831,4 +842,122 @@ it("a lost ensure receipt recovers through independent membership readback witho
   expect(invoke).not.toHaveBeenCalled(); expect(send).toHaveBeenCalledTimes(1);
   expect(f.h.cp.outbox.get(id)?.status).toBe("SENT");
   expect(events(f, "CEO_BUZZ_SIGNER_READBACK").at(-1)?.evidence).toMatchObject({ registered: true, signer });
+});
+
+it("ACP1199-01: revocation during a no-host roster read prevents every post", async () => {
+  const { f, readiness } = await signerRoute(); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  readiness.mockImplementationOnce(async () => {
+    expect(f.h.cp.bindings.revoke("CEO", "revoke during roster read").allowed).toBe(true);
+    return { signer: "daemon-signer", registered: true };
+  });
+  const send = vi.spyOn(f.h.buzz, "send"); await f.h.buzzAdapter.deliverPending();
+  expect(send).not.toHaveBeenCalled(); expect(f.h.cp.outbox.get(id)?.status).not.toBe("SENT");
+});
+
+it("ACP1199-01: revocation after positive canonical readiness but before its continuation prevents every post", async () => {
+  const { f, setMember, invoke } = await systemicFixture(); setMember(true);
+  const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  const all = f.h.cp.db.all.bind(f.h.cp.db);
+  let reads = 0; let revoked = false;
+  vi.spyOn(f.h.cp.db, "all").mockImplementation((sql, params) => {
+    const rows = all(sql, params);
+    if (sql.includes("SELECT DISTINCT a.assignment_id AS assignmentId") && ++reads === 2) {
+      queueMicrotask(() => { revoked = f.h.cp.bindings.revoke("CEO", "revoke after readiness").allowed; });
+    }
+    return rows;
+  });
+  const send = vi.spyOn(f.h.buzz, "send"); await f.h.buzzAdapter.deliverPending();
+  expect(revoked).toBe(true); expect(send).not.toHaveBeenCalled(); expect(invoke).not.toHaveBeenCalled();
+  expect(f.h.cp.outbox.get(id)?.status).not.toBe("SENT");
+});
+
+it.each([false, true])("ACP1199-03: known invalid host receipts cannot be bypassed on later sweeps; resumed = %s", async resumed => {
+  const { f, invoke, setMember, signer } = await systemicFixture(); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  if (resumed) f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, id]);
+  invoke.mockImplementationOnce(async (_op, allocation) => {
+    if (!("mode" in allocation)) throw new Error("unexpected allocation");
+    setMember(true);
+    return { ceoBuzzSigner: { route: { ...allocation.route, roomId: "wrong-room" }, signer, changed: true, rosterVerified: true } };
+  });
+  const send = vi.spyOn(f.h.buzz, "send");
+  for (let i = 0; i < 3; i++) await f.h.buzzAdapter.deliverPending();
+  expect(invoke).toHaveBeenCalledTimes(1); expect(send).not.toHaveBeenCalled();
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", sent_at: null, retry_eligible: 0 });
+  // Membership, a lost result, or a self-declared success cannot erase a known mismatch.
+  const route = currentCanonicalCeoBuzzRoute(f.h.cp.db)!; const ensureDigest = digestOf({ route, signer });
+  f.h.cp.audit.record({ kind: "CEO_BUZZ_SIGNER_ENSURE", evidence: { ensureDigest, route, signer, state: "SUCCEEDED" } });
+  await f.h.buzzAdapter.deliverPending(); expect(send).not.toHaveBeenCalled();
+  // A separately obtained, validated exact-room receipt supplies the missing verification.
+  f.h.cp.audit.record({ kind: "CEO_BUZZ_SIGNER_ENSURE", evidence: { ensureDigest, route, signer, state: "SUCCEEDED",
+    receipt: { route, signer, changed: false, rosterVerified: true } } });
+  await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
+  expect(send).toHaveBeenCalledTimes(1); expect(f.h.cp.outbox.get(id)?.status).toBe("SENT"); expect(invoke).toHaveBeenCalledTimes(1);
+});
+
+it("ACP1199-03: overlapping ensures cannot release mail after a known invalid receipt", async () => {
+  const { f, invoke, setMember } = await systemicFixture(); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  f.h.cp.db.run("UPDATE outbox SET attempts = 1, failure_class = 'contract', last_error = ? WHERE message_id = ?", [signerRefusal, id]);
+  let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+  invoke.mockImplementationOnce(async (_op, allocation) => {
+    if (!("mode" in allocation)) throw new Error("unexpected allocation");
+    setMember(true); await held;
+    return { ceoBuzzSigner: { route: allocation.route, signer: "b".repeat(64), changed: true, rosterVerified: true } };
+  });
+  const send = vi.spyOn(f.h.buzz, "send"); const first = f.h.buzzAdapter.deliverPending();
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+  await f.h.buzzAdapter.deliverPending(); expect(send).not.toHaveBeenCalled();
+  release(); await first;
+  await Promise.all([f.h.buzzAdapter.deliverPending(), f.h.buzzAdapter.deliverPending()]);
+  expect(invoke).toHaveBeenCalledTimes(1); expect(send).not.toHaveBeenCalled();
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", failure_class: "repairable", sent_at: null });
+});
+
+it.each(["roster", "policy"])("ACP1199-03: a known %s mismatch remains withheld on subsequent sweeps", async mismatch => {
+  const { f, invoke, setMember } = await systemicFixture(); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  invoke.mockImplementationOnce(async (_op, allocation) => {
+    if (!("mode" in allocation)) throw new Error("unexpected allocation");
+    setMember(true);
+    return { ceoBuzzSigner: { route: allocation.route, signer: allocation.signer, changed: true,
+      rosterVerified: mismatch !== "roster", ...(mismatch === "policy" ? { policyVerified: false } : {}) } } as unknown as HostObservation;
+  });
+  const send = vi.spyOn(f.h.buzz, "send");
+  for (let i = 0; i < 3; i++) await f.h.buzzAdapter.deliverPending();
+  expect(send).not.toHaveBeenCalled(); expect(invoke).toHaveBeenCalledTimes(1);
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", failure_class: "repairable", sent_at: null });
+});
+
+it("CEO d0d06bc1: an nsec-authenticated CLI refusal after readiness preserves its exact reason and never marks SENT", async () => {
+  const f = await fixture(); await bindBuzz(f); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  const secret = Buffer.from("1".repeat(64), "hex"); const credential = nsecEncode(secret); const signer = getPublicKey(secret);
+  const refusal = JSON.stringify({ error: "authorization", message: "permission denied for this signer", retryable: false });
+  const binary = join(tempDir("r1-buzz-cli-"), "buzz.cjs");
+  writeFileSync(binary, `#!${process.execPath}
+const args = process.argv.slice(2);
+if (process.env.BUZZ_PRIVATE_KEY !== ${JSON.stringify(credential)}) process.exit(9);
+if (args[0] === 'channels' && args[1] === 'get') process.stdout.write(JSON.stringify({channel_id:args[args.indexOf('--channel')+1]}));
+else if (args[0] === 'channels' && args[1] === 'members') process.stdout.write(JSON.stringify([{pubkey:${JSON.stringify(signer)},role:'member'}]));
+else if (args[0] === 'messages' && args[1] === 'send') { process.stdin.resume();process.stdin.on('end',()=>{process.stderr.write(${JSON.stringify(refusal)});process.exitCode=1;}); }
+else process.exitCode=8;
+`, { mode: 0o700 });
+  vi.stubEnv("BUZZ_PRIVATE_KEY", credential);
+  const transport = new BuzzCliTransport(binary);
+  vi.unstubAllEnvs(); // The transport continues using the pinned fixture credential.
+  f.h.buzzAdapter = new BuzzAdapter(f.h.cp.db, f.h.cp.clock, f.h.cp.audit, f.h.cp.sessions, f.h.cp.bindings, f.h.cp.outbox, transport);
+  const markSent = vi.spyOn(f.h.cp.outbox, "markSent"); const send = vi.spyOn(transport, "send");
+  expect((await f.h.buzzAdapter.deliverPending()).failed).toEqual([id]);
+  await f.h.buzzAdapter.deliverPending();
+  expect(send).toHaveBeenCalledTimes(1); expect(markSent).not.toHaveBeenCalled();
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", failure_class: "security", retry_eligible: 0,
+    last_error: `buzz send failed: ${refusal}`, sent_at: null });
+});
+
+it.each(["absent", "unreadable"])("CEO d0d06bc1: durable intent with %s membership is not a successful join", async membership => {
+  const { f, invoke, signer, readback } = await systemicFixture(); const id = notify(f); await f.h.cp.outbox.deliverCeoNotifications();
+  const route = currentCanonicalCeoBuzzRoute(f.h.cp.db)!;
+  f.h.cp.audit.record({ kind: "CEO_BUZZ_SIGNER_ENSURE", evidence: { route, signer, state: "INTENT", ensureDigest: digestOf({ route, signer }) } });
+  if (membership === "unreadable") readback.mockRejectedValue(new Error("roster response lost"));
+  const send = vi.spyOn(f.h.buzz, "send");
+  for (let i = 0; i < 3; i++) await f.h.buzzAdapter.deliverPending();
+  expect(invoke).not.toHaveBeenCalled(); expect(send).not.toHaveBeenCalled();
+  expect(processingOf(f, id)).toMatchObject({ status: "PENDING", failure_class: "repairable", sent_at: null, retry_eligible: 0 });
 });

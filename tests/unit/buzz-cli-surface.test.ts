@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { nsecEncode } from "nostr-tools/nip19";
 import { getPublicKey } from "nostr-tools/pure";
 
 import { BuzzCliTransport } from "../../src/buzz/buzz-adapter.ts";
@@ -61,6 +62,7 @@ const stubCli = (root: string): Stub => {
     `#!/usr/bin/env node
 const fs = require("node:fs");
 const argv = process.argv.slice(2);
+if (process.env.ACP_TEST_BUZZ_EXPECT_SIGNING_KEY && process.env.BUZZ_PRIVATE_KEY !== process.env.ACP_TEST_BUZZ_EXPECT_SIGNING_KEY) process.exit(9);
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(argv) + "\\n");
 
 const die = (message) => {
@@ -156,11 +158,13 @@ describe("#423 BuzzCliTransport against the installed CLI surface", () => {
   afterEach(() => {
     delete process.env["BUZZ_PRIVATE_KEY"];
     delete process.env["ACP_TEST_BUZZ_MEMBERS"];
+    delete process.env["ACP_TEST_BUZZ_EXPECT_SIGNING_KEY"];
   });
 
-  it("checks the pinned sending signer against the exact room roster, never a receiver key", async () => {
+  it.each(["hex", "nsec"] as const)("ACP1199-02: checks the pinned %s signer against the exact room roster", async encoding => {
     const key = "1".repeat(64);
-    process.env["BUZZ_PRIVATE_KEY"] = key;
+    process.env["BUZZ_PRIVATE_KEY"] = encoding === "hex" ? key : nsecEncode(Buffer.from(key, "hex"));
+    process.env["ACP_TEST_BUZZ_EXPECT_SIGNING_KEY"] = process.env["BUZZ_PRIVATE_KEY"];
     const signer = getPublicKey(Buffer.from(key, "hex"));
     const transport = new BuzzCliTransport(stub.binary);
     // A later ambient key cannot turn readiness into a check of some other sender.

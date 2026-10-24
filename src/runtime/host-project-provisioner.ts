@@ -32,6 +32,13 @@ export type HostObservation = z.infer<typeof hostObservationSchema>;
 export interface HostProjectProvisioner {
   invoke(operation: HostOperation, allocation: HostAllocation, packet?: unknown): Promise<HostObservation>;
 }
+/** A lost response is recoverable by readback; a known refusal/invalid receipt is not. */
+export class HostProvisionerError extends Error {
+  constructor(readonly outcome: 'LOST' | 'INVALID' | 'REFUSED', readonly refusal?: { code: string; message: string }) {
+    super(refusal ? `host provisioner refused: ${refusal.code}: ${refusal.message}` : `host provisioner result ${outcome.toLowerCase()}`);
+  }
+}
+
 /** One bounded execFile protocol. No shell, command text, credentials or raw child errors cross it. */
 export class ExecFileHostProjectProvisioner implements HostProjectProvisioner {
   constructor(private readonly script: string, private readonly home: string, private readonly stateDir: string, private readonly timeoutMs = 120_000, private readonly databasePath = join(stateDir, "state.sqlite")) {}
@@ -39,9 +46,22 @@ export class ExecFileHostProjectProvisioner implements HostProjectProvisioner {
     if ('mode' in allocation && operation !== 'ensure-buzz') return Promise.reject(new Error('CEO signer allocation requires ensure-buzz'));
     return new Promise((resolve, reject) => {
       const child = execFile(process.execPath, [this.script], { timeout: this.timeoutMs, maxBuffer: 2_000_000,
-        env: { ...process.env, HOME: this.home, ACP_STATE_DIR: this.stateDir, ACP_HOST_DATABASE_PATH: this.databasePath }, killSignal: 'SIGKILL' }, (error, stdout) => {
-        if (error) { reject(new Error(`host provisioner ${operation} failed`)); return; }
-        try { resolve(hostObservationSchema.parse(JSON.parse(stdout))); } catch { reject(new Error('invalid host provisioner response')); }
+        env: { ...process.env, HOME: this.home, ACP_STATE_DIR: this.stateDir, ACP_HOST_DATABASE_PATH: this.databasePath }, killSignal: 'SIGKILL' }, (error, stdout, stderr) => {
+        if (error) {
+          if ('mode' in allocation) {
+            try {
+              const failure = JSON.parse(stderr).ceoBuzzSignerFailure;
+              if (failure && ['INVALID','REFUSED','LOST'].includes(failure.outcome) &&
+                typeof failure.code === 'string' && typeof failure.message === 'string') {
+                reject(new HostProvisionerError(failure.outcome, {code:failure.code,message:failure.message})); return;
+              }
+            } catch { /* An unclassified failure supplies no verification. */ }
+            reject(new HostProvisionerError(error.killed || error.code === 'ETIMEDOUT' ? 'LOST' : 'INVALID')); return;
+          }
+          reject(new Error(`host provisioner ${operation} failed`)); return;
+        }
+        try { resolve(hostObservationSchema.parse(JSON.parse(stdout))); }
+        catch { reject('mode' in allocation ? new HostProvisionerError('INVALID') : new Error('invalid host provisioner response')); }
       });
       child.stdin?.end(JSON.stringify({ version: 1, operation, allocation, packet }));
     });

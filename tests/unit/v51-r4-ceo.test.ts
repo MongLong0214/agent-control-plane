@@ -3,6 +3,7 @@ import { afterAll, expect, it, vi } from "vitest";
 import type { BuzzSendReceipt, BuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
+import { outboxDeliveryReadback } from "../../src/outbox/outbox.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
@@ -47,8 +48,9 @@ const stateOf = (h: Harness, id: string) =>
     "SELECT status, failure_class, target_session_id FROM outbox WHERE message_id = ?", [id]);
 
 /** A Buzz-backed CEO at generation N, in "first-room" as "first-key". */
-const buzzCeo = () => {
+const buzzCeo = (verifiedSigner = false) => {
   const { transport, send } = recordingTransport();
+  if (verifiedSigner) transport.signerReadiness = async () => ({ signer: "a".repeat(64), registered: true });
   const h = makeHarness({ buzzTransport: transport });
   const first = readyCeo(h, { room: "first-room", identity: "first-key" });
   const bound = h.cp.bindings.bind({ role: Role.CEO, sessionId: first.sessionId });
@@ -128,5 +130,63 @@ it("FCR-02 CEO: a CEO that really differs (another room and channel identity) re
     expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([f.id]);
     expect((await f.h.buzzAdapter.deliverPending()).delivered).toEqual([]);
     expect(sendsOf(f.send, f.id)).toBe(f.sent + 1);
+  } finally { f.h.cp.close(); }
+});
+
+it("ACP1199-04: an ordinary CEO keeps Buzz delivery with a host configured", async () => {
+  const { transport, send } = recordingTransport();
+  const invoke = vi.fn(async () => ({}));
+  const h = makeHarness({ buzzTransport: { ...transport, signerReadiness: async () => ({ signer: "a".repeat(64), registered: true }) },
+    residentProvisioner: { port: { invoke } } });
+  try {
+    const ceo = readyCeo(h, { room: "ordinary-room", identity: "ordinary-key" });
+    expect(h.cp.bindings.bind({ role: Role.CEO, sessionId: ceo.sessionId }).allowed).toBe(true);
+    const id = notify(h, "ordinary-with-host");
+    expect((await h.buzzAdapter.deliverPending()).delivered).toEqual([id]);
+    expect(stateOf(h, id)).toMatchObject({ status: "SENT" });
+    expect(sendsOf(send, id)).toBe(1); expect(invoke).not.toHaveBeenCalled();
+  } finally { h.cp.close(); }
+});
+
+it("CEO d0d06bc1: a timeout after positive signer readiness stays PENDING and unknown, never SENT or resent", async () => {
+  const f = buzzCeo(true);
+  try {
+    const id = notify(f.h, "verified-timeout");
+    f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
+    await f.h.buzzAdapter.deliverPending();
+    expect(f.h.cp.db.get("SELECT status, sent_at, failure_class, retry_eligible FROM outbox WHERE message_id = ?", [id]))
+      .toEqual({ status: "PENDING", sent_at: null, failure_class: "unknown_observed", retry_eligible: 0 });
+    expect(outboxDeliveryReadback(f.h.cp.outbox.get(id)!)).toMatchObject({ status: "OUTCOME_UNKNOWN", delivered: false, automaticResendHeld: true });
+    expect(f.h.cp.outbox.sentTo(id, { room: "first-room", recipient: "first-key" })).toBe("UNKNOWN");
+    expect(f.h.cp.bindings.revoke("CEO", "rebind same unknown receiver").allowed).toBe(true);
+    const rebound = f.h.cp.bindings.bind({ role: Role.CEO, sessionId: f.first.sessionId });
+    if (!rebound.allowed) throw new Error(rebound.message);
+    for (let i = 0; i < 3; i++) await f.h.buzzAdapter.deliverPending();
+    expect(sendsOf(f.send, id)).toBe(1);
+    expect(stateOf(f.h, id)).toMatchObject({ status: "PENDING", failure_class: "unknown_observed" });
+    expect(f.h.cp.outbox.acknowledge(id, f.first.sessionId, rebound.value.bindingGeneration,
+      f.h.cp.sessions.require(f.first.sessionId).incarnation).allowed).toBe(true);
+    expect(f.h.cp.outbox.get(id)?.status).toBe("ACKED");
+  } finally { f.h.cp.close(); }
+});
+
+it("CEO d0d06bc1: verified unknown sends retain destination suppression across a receiver round trip", async () => {
+  const f = buzzCeo(true);
+  try {
+    const id = notify(f.h, "verified-timeout-round-trip");
+    f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
+    await f.h.buzzAdapter.deliverPending();
+    expect(f.h.cp.bindings.revoke("CEO", "new receiver").allowed).toBe(true);
+    const next = readyCeo(f.h, { room: "next-room", identity: "next-key" });
+    expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId: next.sessionId }).allowed).toBe(true);
+    expect(stateOf(f.h, id)).toMatchObject({ status: "PENDING", failure_class: null });
+    f.send.mockRejectedValueOnce(new Error("send timed out after 10000ms"));
+    await f.h.buzzAdapter.deliverPending();
+    expect(f.h.cp.bindings.revoke("CEO", "return to first receiver").allowed).toBe(true);
+    expect(f.h.cp.bindings.bind({ role: Role.CEO, sessionId: f.first.sessionId }).allowed).toBe(true);
+    await f.h.buzzAdapter.deliverPending(); await f.h.buzzAdapter.deliverPending();
+    expect(sendsOf(f.send, id)).toBe(2);
+    expect(f.h.cp.db.get("SELECT status, sent_at, failure_class FROM outbox WHERE message_id = ?", [id]))
+      .toEqual({ status: "PENDING", sent_at: null, failure_class: "unknown_observed" });
   } finally { f.h.cp.close(); }
 });

@@ -1,4 +1,17 @@
+import { decode } from "nostr-tools/nip19";
+import { getPublicKey } from "nostr-tools/pure";
 import type { Db } from "../db/database.ts";
+
+/** Decode only the daemon credential formats supported by Buzz; never change the sending bytes. */
+export const daemonBuzzSigner = (credential: string | undefined): string | null => {
+  if (!credential) return null;
+  try {
+    const text = credential.trim();
+    if (/^[a-f0-9]{64}$/i.test(text)) return getPublicKey(Buffer.from(text, "hex"));
+    const decoded = decode(text);
+    return decoded.type === "nsec" ? getPublicKey(decoded.data) : null;
+  } catch { return null; }
+};
 
 /** Only this structured pre-post refusal proves sender membership is missing. */
 export const isBuzzSignerRefusal = (message: string): boolean => {
