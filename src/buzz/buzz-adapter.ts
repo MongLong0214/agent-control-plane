@@ -1,9 +1,11 @@
 import { execFile, spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { promisify } from "node:util";
 
 import { canonicalJson, digestOf } from "../core/digest.ts";
 import { HostProvisionerError, hostObservationSchema, type HostProjectProvisioner } from "../runtime/host-project-provisioner.ts";
-import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner, isBuzzRecipientRefusal, isBuzzSignerRefusal, type CanonicalCeoBuzzRoute } from "../outbox/ceo-buzz-signer.ts";
+import { currentCanonicalCeoBuzzRoute, daemonBuzzSigner, isBuzzRecipientRefusal, isBuzzSignerRefusal, type BuzzPolicyBinding, type CanonicalCeoBuzzRoute } from "../outbox/ceo-buzz-signer.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 
 import type { Clock } from "../core/clock.ts";
@@ -65,6 +67,8 @@ export interface BuzzTransport {
   available(purpose?: string): Promise<boolean>;
   /** Observe this transport's actual sending key in the exact room; null means unverified. */
   signerReadiness?(channel: string): Promise<BuzzSignerReadiness | null>;
+  /** Fingerprint only. The wrapper remains the sole send-policy authority. */
+  localSendPolicyDigest?(): string | null;
 }
 
 /**
@@ -180,7 +184,14 @@ export class BuzzCliTransport implements BuzzTransport {
   constructor(
     private readonly binary = "buzz",
     private readonly defaultChannel: string | null = null,
+    private readonly sendPolicyFile = process.env["ACP_BUZZ_SEND_POLICY_FILE"],
   ) {}
+
+  localSendPolicyDigest(): string | null {
+    if (!this.sendPolicyFile || !isAbsolute(this.sendPolicyFile)) return null;
+    try { return digestOf({ path: this.sendPolicyFile, bytes: readFileSync(this.sendPolicyFile).toString("base64") }); }
+    catch { return null; }
+  }
 
   /**
    * Proves this transport can open the channel it is about to use — not that the binary is
@@ -507,6 +518,13 @@ export class BuzzAdapter {
     catch { return null; }
   }
 
+  #policyBinding(message: OutboxMessage, room: string, recipient: string, signer: string | null): BuzzPolicyBinding {
+    let policyDigest: string | null = null;
+    try { policyDigest = this.transport.localSendPolicyDigest?.() ?? null; } catch { /* Unreadable never releases a hold. */ }
+    return { routeDigest: digestOf({ targetSessionId: message.targetSessionId, bindingGeneration: message.bindingGeneration,
+      room, recipient, canonical: this.#currentCeoRoute(message, room, recipient) }), signer, policyDigest };
+  }
+
   #currentCeoRoute(message: OutboxMessage, room: string, recipient: string): CanonicalCeoBuzzRoute | null {
     const route = currentCanonicalCeoBuzzRoute(this.db);
     return route && route.sessionId === message.targetSessionId && route.bindingGeneration === message.bindingGeneration &&
@@ -671,11 +689,22 @@ export class BuzzAdapter {
     for (const message of this.outbox.pendingCeoBuzzSignerRoutes()) {
       const session = this.sessions.get(message.targetSessionId);
       if (!session?.buzzAddress || !session.buzzActorId) continue;
+      // A local-policy hold does not provision membership merely because a later roster differs.
+      const policyHeld = this.db.get(`SELECT 1 FROM outbox WHERE message_id = ? AND reason_code = 'BUZZ_LOCAL_SEND_POLICY_REFUSED'`,
+        [message.messageId]);
+      if (policyHeld) {
+        const observed = await this.#signerReadiness(session.buzzAddress);
+        if (!observed || !this.outbox.resumeCeoBuzzSigner(message,
+          { room: session.buzzAddress, recipient: session.buzzActorId }, false,
+          this.#policyBinding(message, session.buzzAddress, session.buzzActorId, observed.signer))) continue;
+        if (!observed.registered && !this.#hostGatesCeo(message)) continue;
+      }
       // Normalize only a proven old pre-post refusal before attempting membership repair.
       this.outbox.resumeCeoBuzzSigner(message, { room: session.buzzAddress, recipient: session.buzzActorId }, false);
       const ready = await this.#ceoSignerReadiness(message, session.buzzAddress, session.buzzActorId);
       if (ready) this.outbox.resumeCeoBuzzSigner(message,
-        { room: session.buzzAddress, recipient: session.buzzActorId }, ready.registered);
+        { room: session.buzzAddress, recipient: session.buzzActorId }, ready.registered,
+        this.#policyBinding(message, session.buzzAddress, session.buzzActorId, ready.signer));
     }
 
     for (const message of this.outbox.claimDeliverable(limit)) {
@@ -768,6 +797,11 @@ export class BuzzAdapter {
         if (completed.allowed) delivered.push(message.messageId);
         else failed.push(message.messageId);
       } catch (err) {
+        // Start the hold with the policy observed at refusal. An edit during the attempt must not
+        // immediately re-arm an identical refusal on the next sweep.
+        const policyBinding = message.kind === MessageKind.CEO_NOTIFICATION &&
+          isBuzzSignerRefusal(err instanceof Error ? err.message : String(err))
+          ? this.#policyBinding(message, channel, recipient, readiness?.signer ?? null) : undefined;
         this.outbox.markAttemptFailed(
           message.messageId,
           message.claimToken,
@@ -779,7 +813,7 @@ export class BuzzAdapter {
             ...(message.kind === MessageKind.CEO_NOTIFICATION && readiness?.registered ? { buzzSignerReady: true as const } : {}),
             ...(message.kind === MessageKind.CEO_NOTIFICATION &&
               isBuzzSignerRefusal(err instanceof Error ? err.message : String(err))
-              ? { signerNotRegistered: { signer: readiness?.signer ?? null, source: "SEND_REFUSAL" as const } } : {}) },
+              ? { signerNotRegistered: { signer: readiness?.signer ?? null, source: "SEND_REFUSAL" as const, policyBinding, reasonCode: ReasonCode.BUZZ_LOCAL_SEND_POLICY_REFUSED } } : {}) },
         );
         failed.push(message.messageId);
       }
