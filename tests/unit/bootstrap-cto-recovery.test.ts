@@ -356,3 +356,145 @@ describe("C1-02: continuity records no claim need for a bootstrap CTO", () => {
     });
   });
 });
+
+
+/** A CEO hold keeps restoration from creating a new RUN_DISPATCH that could mask the lost wake. */
+const pendingRecovery = async (f: BootstrapRuntimeFixture) => {
+  const dispatched = await f.dispatchBootstrap();
+  await f.awaitFinishedTurns(dispatched.ownerSessionId, 1);
+  const pending = f.harness.cp.outbox.listByRun(dispatched.runId).find(m => m.kind === "RUN_DISPATCH")!;
+  expect(pending.status).toBe("PENDING");
+  expect(await f.cto(dispatched.ownerSessionId, "escalation_open", { runId: dispatched.runId,
+    question: "wait for compiled input", options: ["wait"], ctoRecommendation: "wait", whyItMatters: "input", blocksCriticalPath: true }))
+    .toMatchObject({ ok: true });
+  f.loseClaude();
+  await f.daemon.reconcileContinuity("pending owner lost its credential");
+  expect(f.harness.cp.runs.require(dispatched.runId)).toMatchObject({ state: "BLOCKED", continuityHoldRoleKey: null });
+  f.restoreClaude();
+  return { ...dispatched, messageId: pending.messageId };
+};
+
+describe("B5 recovered bootstrap owner gets its pending in-band wake after credentials and owner restoration", () => {
+  it("preserves the early failed handover audit, then wakes the same id once and the recovered owner claims and ACKs it without processing twice", async () => {
+    await withBootstrapRuntime(async f => {
+      const { runId, ownerSessionId, roleKey, messageId } = await pendingRecovery(f);
+      const cp = f.harness.cp;
+      const calls: Array<{ held: boolean; ids: string[]; allowed: boolean }> = [];
+      const wake = cp.sessionRuntime.wake.bind(cp.sessionRuntime);
+      vi.spyOn(cp.sessionRuntime, "wake").mockImplementation((role, triggers) => {
+        const held = cp.sessionRuntime.holds(ownerSessionId);
+        const result = wake(role, triggers);
+        calls.push({ held, ids: triggers.map(t => t.id), allowed: result.allowed });
+        return result;
+      });
+      const order: string[] = [];
+      const adopt = cp.sessionRuntime.adopt.bind(cp.sessionRuntime);
+      vi.spyOn(cp.sessionRuntime, "adopt").mockImplementation((...args) => { order.push("adopt"); return adopt(...args); });
+      const attest = cp.sessionRuntime.attest.bind(cp.sessionRuntime);
+      vi.spyOn(cp.sessionRuntime, "attest").mockImplementation(async (...args) => { const result = await attest(...args); order.push("attest"); return result; });
+      const restore = cp.runs.restoreRecoveredBootstrapOwner.bind(cp.runs);
+      vi.spyOn(cp.runs, "restoreRecoveredBootstrapOwner").mockImplementation((...args) => { const result = restore(...args); order.push("restore"); return result; });
+      const processed: string[] = [];
+      let finish!: () => void;
+      const processing = new Promise<void>(resolve => { finish = resolve; });
+      f.claude.onWorkTurn = async (_request, credential) => {
+        if (!credential) return;
+        order.push("claim");
+        const result = await f.cto(ownerSessionId, "role_dispatch_pending", {});
+        const messages = (result.value as { messages: Array<{ messageId: string; bindingGeneration: number }> }).messages;
+        expect(messages).toContainEqual(expect.objectContaining({ messageId, bindingGeneration: 2 }));
+        processed.push(messageId);
+        await processing;
+        expect(await f.cto(ownerSessionId, "run_ack", { runId, messageId })).toMatchObject({ ok: true });
+      };
+      const before = cp.outbox.listByRun(runId).map(m => m.messageId);
+      try {
+        expect(await cp.bootstrapCtos.recover(roleKey)).toMatchObject({ allowed: true });
+        await vi.waitFor(() => expect(processed).toEqual([messageId]));
+        expect(calls).toEqual([
+          { held: false, ids: [messageId], allowed: false },
+          { held: true, ids: [messageId], allowed: true },
+        ]);
+        expect(order).toEqual(["adopt", "attest", "restore", "claim"]);
+        expect(cp.outbox.get(messageId)).toMatchObject({ status: "PENDING", bindingGeneration: 2, attempts: 0 });
+        const scope = { runId, roleKey, targetSessionId: ownerSessionId,
+          sessionIncarnation: cp.sessions.require(ownerSessionId).incarnation, bindingGeneration: 2 };
+        // Even an explicit second wake cannot process a trigger the runtime already claimed.
+        await cp.outbox.wakeInBandPending(scope);
+        expect(processed).toEqual([messageId]);
+        finish();
+        await f.awaitFinishedTurns(ownerSessionId, 2);
+        expect(cp.outbox.get(messageId)?.status).toBe("ACKED");
+        await cp.outbox.wakeInBandPending(scope);
+        expect(processed).toEqual([messageId]);
+        expect(cp.outbox.listByRun(runId).map(m => m.messageId)).toEqual(before);
+        const events = cp.audit.all();
+        const early = events.find(e => e.kind === "OUTBOX_IN_BAND_WAKE_FAILED" && e.evidence["trigger"] === "handover" && e.roleKey === roleKey)!;
+        const attested = events.find(e => e.kind === "SESSION_ATTESTED" && e.sessionId === ownerSessionId && e.eventId > early.eventId)!;
+        expect(early).toBeDefined();
+        expect(early.eventId).toBeLessThan(attested.eventId);
+        expect(events.some(e => e.kind === "BOOTSTRAP_CTO_RECOVERED" && e.roleKey === roleKey)).toBe(true);
+      } finally { finish(); }
+    });
+  });
+
+  it("rewakes only the recovered run and role, leaving another current owner's pending message alone", async () => {
+    await withBootstrapRuntime(async f => {
+      const { runId, ownerSessionId, roleKey, messageId } = await pendingRecovery(f);
+      const other = await f.dispatchBootstrap();
+      await f.awaitFinishedTurns(other.ownerSessionId, 1);
+      const cp = f.harness.cp;
+      const otherBefore = cp.outbox.listByRun(other.runId);
+      f.harness.clock.advance(60_000);
+      const wake = vi.spyOn(cp.sessionRuntime, "wake");
+      f.claude.onWorkTurn = async (_request, credential) => {
+        if (credential?.sessionId !== ownerSessionId) return;
+        expect(await f.cto(ownerSessionId, "run_ack", { runId, messageId })).toMatchObject({ ok: true });
+      };
+      expect(await cp.bootstrapCtos.recover(roleKey)).toMatchObject({ allowed: true });
+      await f.awaitFinishedTurns(ownerSessionId, 2);
+      expect(wake.mock.calls.map(([role, triggers]) => [role, triggers.map(t => t.id)]))
+        .toEqual([[roleKey, [messageId]], [roleKey, [messageId]]]);
+      expect(cp.outbox.listByRun(other.runId)).toEqual(otherBefore);
+      expect(cp.outbox.get(messageId)).toMatchObject({ status: "ACKED", bindingGeneration: 2 });
+    });
+  });
+
+  it.each(["adopt", "attest", "restore", "stale-owner"])("does not rewake after %s failure", async failure => {
+    await withBootstrapRuntime(async f => {
+      const { roleKey } = await pendingRecovery(f);
+      const cp = f.harness.cp;
+      const rewake = vi.spyOn(cp.outbox, "wakeInBandPending");
+      if (failure === "adopt") vi.spyOn(cp.sessionRuntime, "adopt").mockReturnValueOnce(deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "fixture"));
+      if (failure === "attest") vi.spyOn(cp.sessionRuntime, "attest").mockResolvedValueOnce(deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "fixture"));
+      if (failure === "restore") vi.spyOn(cp.runs, "restoreRecoveredBootstrapOwner").mockReturnValueOnce(deny(ReasonCode.RUN_OWNER_REVOKED, "fixture"));
+      if (failure === "stale-owner") {
+        const restore = cp.runs.restoreRecoveredBootstrapOwner.bind(cp.runs);
+        vi.spyOn(cp.runs, "restoreRecoveredBootstrapOwner").mockImplementation((...args) => {
+          const result = restore(...args);
+          cp.db.run("UPDATE runs SET owner_binding_generation = 1 WHERE run_id = ?", [args[0]]);
+          return result;
+        });
+      }
+      expect(await cp.bootstrapCtos.recover(roleKey)).toMatchObject({ allowed: false });
+      expect(rewake).not.toHaveBeenCalled();
+    });
+  });
+
+  it("records a post-recovery wake failure separately from successful recovery", async () => {
+    await withBootstrapRuntime(async f => {
+      const { roleKey, ownerSessionId } = await pendingRecovery(f);
+      const cp = f.harness.cp;
+      const wake = cp.sessionRuntime.wake.bind(cp.sessionRuntime);
+      vi.spyOn(cp.sessionRuntime, "wake").mockImplementation((...args) => cp.sessionRuntime.holds(ownerSessionId)
+        ? deny(ReasonCode.SESSION_RUNTIME_UNAVAILABLE, "fixture post-recovery wake failure") : wake(...args));
+      expect(await cp.bootstrapCtos.recover(roleKey)).toMatchObject({ allowed: true });
+      const events = cp.audit.all();
+      const recovered = events.find(e => e.kind === "BOOTSTRAP_CTO_RECOVERED" && e.roleKey === roleKey)!;
+      const failedWake = events.find(e => e.kind === "OUTBOX_IN_BAND_WAKE_FAILED" && e.roleKey === roleKey && e.evidence["trigger"] === "rewake")!;
+      expect(failedWake).toBeDefined();
+      expect(failedWake.eventId).toBeGreaterThan(recovered.eventId);
+      expect(events.filter(e => e.kind === "BOOTSTRAP_CTO_RECOVERY_REFUSED" && e.roleKey === roleKey)).toHaveLength(0);
+    });
+  });
+});

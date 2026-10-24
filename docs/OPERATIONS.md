@@ -162,7 +162,7 @@ reservation or permission to execute an external write.
 2. The CEO reviews the complete final body and computes `sha256:<lowercase hex>`
    over its exact UTF-8 bytes, including whitespace and trailing newlines. Never
    attach a temporary draft before this review.
-3. On the current CEO's authenticated Hermes **owner turn**, call:
+3. On the current CEO's authenticated Hermes **owner or delegated peer turn**, call:
 
    ```text
    bootstrap_plan_attach({
@@ -179,6 +179,26 @@ reservation or permission to execute an external write.
    arguments must match the body: `runId`, `bootstrapOperationId`, manifest project
    id, and the single manifest repository remote / GitHub operation target.
    `repositoryIdentity` is `github:<owner>/<repo>`.
+   If the CEO cannot transport the body, a current PRIMARY_CTO may first call
+   `bootstrap_plan_stage` with the same binding arguments and original `planBody`.
+   This is a **non-authoritative candidate upload**: no provenance links that CTO
+   to the project-less run, and upload grants no run authority, PLAN, approval,
+   execution permission or wake. The server derives `stagedBy` from the authenticated
+   current PRIMARY_CTO binding and returns `{ digest, stagedBy }`; arguments cannot
+   choose another stager's identity. Each stager has its own immutable slot per run.
+   Identical bytes are idempotent; a stager cannot replace or read another slot.
+
+   The CEO's attach is the selection for the target run. Omit `planBody` and pass
+   **`stagedBy: "PRIMARY_CTO:<projectId>"`**, all binding arguments and `expectedSha256`.
+   ACP selects exactly `(runId, stagedBy, expectedSha256)` with no latest, cross-slot
+   or cross-run fallback. The CEO may explicitly select any stager's valid upload.
+   Candidate bytes bind to run, contract, operation, project, repository and stager,
+   without an owner pin. Attach validates the **current** run owner just like inline
+   attach, so a same-session owner generation renewal does not invalidate the upload.
+
+   Peer calls require the same bound Hermes session and lineage, `cron: false`,
+   `delegation_depth: 0`, and a well-formed `peer_grant`, recorded with the attachment.
+   `owner_decision_submit` and `cto_suspend` remain owner-only.
 4. The bound BOOTSTRAP_CTO reads `bootstrap_plan_get({ runId })`, which returns
    `{ digest, planBody }`. `digest` is the exact-byte SHA-256, and `planBody`
    decodes to the original bytes. `contract_get` also advertises this digest.
@@ -225,9 +245,16 @@ assume historical escalation 142936 or 143182 remains open. The run must be
 PR and exact-head CI gates continue unchanged.
 
 Input uses a versioned `ArtifactKind.HANDOFF` envelope
-(`acp.bootstrap-plan-input.v1`) in the existing `run_artifacts` table. Base64
+(`acp.bootstrap-plan-input.v1`, or `acp.bootstrap-plan-candidate.v1` for inert staging)
+in the existing `run_artifacts` table. Base64
 preserves exact UTF-8 bytes despite canonical JSON newline normalization;
 activation handoff readers exclude this subtype. No schema migration, separate
 store or delivery system is added. Genesis secret screening remains at RF compile
 and ACP normalization. Runs without attachments keep the existing body-based
 contract/`plan_submit` flow.
+
+The adopted CEO tool server emits one `notifications/tools/list_changed` per
+connection after the client's `notifications/initialized`; `agentctl attach adopted-ceo`
+forwards it to Hermes unchanged. SDK acceptance tests prove ACP's notification and
+client re-list. After a deploy, Hermes's own refresh is verified from its `agent.log`
+("tools changed dynamically") and the CEO's next-turn tool list.

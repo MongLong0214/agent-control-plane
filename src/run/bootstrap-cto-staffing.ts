@@ -20,6 +20,7 @@ import {
   SessionLifecycle,
   roleKeyFor,
 } from "../domain/types.ts";
+import type { Outbox } from "../outbox/outbox.ts";
 import type { ProvisionedSessionRuntime } from "../runtime/provisioned-session-runtime.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
@@ -75,6 +76,7 @@ export interface BootstrapCtoRecoveryPorts {
   readonly sessions: Pick<SessionRegistry, "get" | "rotateSecret">;
   readonly bindings: Pick<BindingRegistry, "renewSameSession" | "revoke">;
   readonly runs: Pick<RunEngine, "restoreRecoveredBootstrapOwner">;
+  readonly outbox: Pick<Outbox, "wakeInBandPending">;
 }
 
 /**
@@ -566,6 +568,11 @@ export class BootstrapCtoStaffing {
     if (!attested.allowed) return abandon(attested);
     const restored = recovery.runs.restoreRecoveredBootstrapOwner(start.value.run.runId, renewed, start.value.pinnedGeneration);
     if (!restored.allowed) return abandon(restored);
+    const owner = this.ports.runs.get(start.value.run.runId);
+    if (!owner || owner.ownerRoleKey !== renewed.roleKey || owner.ownerSessionId !== renewed.sessionId
+        || owner.ownerSessionIncarnation !== renewed.sessionIncarnation || owner.ownerBindingGeneration !== renewed.bindingGeneration) {
+      return deny(ReasonCode.BINDING_GENERATION_STALE, "bootstrap owner moved after recovery");
+    }
     this.audit.record({
       kind: "BOOTSTRAP_CTO_RECOVERED",
       runId: start.value.run.runId,
@@ -579,6 +586,12 @@ export class BootstrapCtoStaffing {
         state: restored.value.run.state,
       },
     });
+    // The handover wake precedes adopt/attest and can fail for lack of a current credential.
+    // Reuse pending rows after restoration, once, scoped to this run and exact owner. Wake failure
+    // stays on Outbox's existing failure audit path; it does not undo successful recovery.
+    await recovery.outbox.wakeInBandPending({ runId: owner.runId, roleKey: renewed.roleKey,
+      targetSessionId: renewed.sessionId, sessionIncarnation: renewed.sessionIncarnation,
+      bindingGeneration: renewed.bindingGeneration });
     return allow(ReasonCode.OK, renewed);
   }
 

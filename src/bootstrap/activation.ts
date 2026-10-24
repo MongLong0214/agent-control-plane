@@ -1,4 +1,4 @@
-import { isBootstrapPlanAttachment } from "./bootstrap-plan-artifact.ts";
+import { isBootstrapPlanInputArtifact, BOOTSTRAP_PLAN_INPUT_SCHEMA, BOOTSTRAP_PLAN_CANDIDATE_SCHEMA } from "./bootstrap-plan-artifact.ts";
 import type { StoredArtifact } from "../db/artifacts.ts";
 import type { ResidentProjectProvisioning, ProvisioningEvidence } from './resident-project-provisioning.ts';
 import type { Clock } from "../core/clock.ts";
@@ -133,10 +133,10 @@ interface ApprovedBootstrapPlan {
  * activation facts that only this runtime may assert.
  */
 export class BootstrapActivation {
-  // CEO-to-CTO PLAN input is also a HANDOFF artifact; it is never an activation handoff.
+  // PLAN attachments and non-authoritative candidates share storage, never activation handoff authority.
   private activationHandoff<T>(runId: string): StoredArtifact<T> | null {
     return this.artifacts.list<T>(runId, ArtifactKind.HANDOFF).reverse()
-      .find(artifact => !isBootstrapPlanAttachment(artifact.content)) ?? null;
+      .find(artifact => !isBootstrapPlanInputArtifact(artifact.content)) ?? null;
   }
 
   constructor(
@@ -1106,8 +1106,9 @@ export class BootstrapActivation {
   private observedHandoffFacts(handoffId: string, handoff: Partial<HandoffPackage>): Decision<void> {
     const owner = this.db.get<{ run_id: string }>(
       `SELECT run_id FROM run_artifacts WHERE kind = ? AND superseded = 0 AND json_extract(content_json, '$.handoffId') = ?
+        AND COALESCE(json_extract(content_json, '$.schema'), '') NOT IN (?, ?)
         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-      [ArtifactKind.HANDOFF, handoffId],
+      [ArtifactKind.HANDOFF, handoffId, BOOTSTRAP_PLAN_INPUT_SCHEMA, BOOTSTRAP_PLAN_CANDIDATE_SCHEMA],
     );
     return this.handoffFactsObserved(owner?.run_id ?? null, handoffId, handoff);
   }

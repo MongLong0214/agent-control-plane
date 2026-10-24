@@ -326,6 +326,16 @@ const createHermesServerFromPort = (
   options: HermesServerOptions,
 ): McpServer => {
   const server = new McpServer({ name: "agent-control-plane-hermes", version: "1.3.0" });
+  // The adopted-CEO relay forwards this SDK notification unchanged to Hermes's stdio client.
+  // connect() precedes initialization; only the client's initialized notification opens this door.
+  let toolListAnnounced = false;
+  server.server.oninitialized = () => {
+    if (toolListAnnounced) return;
+    toolListAnnounced = true;
+    void server.server.sendToolListChanged().catch(() => {
+      process.stderr.write("hermes tool list change notification not sent\n");
+    });
+  };
   const anchor = options.provenance;
   if (anchor !== undefined) {
     requireToolProvenance(server, (call, extra) => {
@@ -387,15 +397,14 @@ const createHermesServerFromPort = (
   server.registerTool(
     "bootstrap_plan_attach",
     {
-      description: `Deliver final exact UTF-8 bootstrap input JSON (runId, plan, tasks), at most ${BOOTSTRAP_PLAN_MAX_BYTES} bytes. Input delivery grants no execution approval. Explicit replacesSha256 invalidates previous evidence. Requires authenticated Hermes owner provenance.`,
+      description: `Deliver final exact UTF-8 bootstrap input JSON (runId, plan, tasks), at most ${BOOTSTRAP_PLAN_MAX_BYTES} bytes. Omit planBody and provide stagedBy (PRIMARY_CTO:<projectId>) to explicitly select the non-authoritative upload at exactly (runId, stagedBy, expectedSha256); no cross-slot or latest fallback. Input delivery grants no execution approval. Explicit replacesSha256 invalidates previous evidence. Requires the current CEO identity and authenticated Hermes owner or delegated peer provenance.`,
       // Digest syntax is still strict, but checked after authentication for a structured refusal.
-      inputSchema: { ...mutation, runId: z.string(), planBody: z.string().max(BOOTSTRAP_PLAN_MAX_BYTES), expectedSha256: z.string(),
+      inputSchema: { ...mutation, runId: z.string(), planBody: z.string().max(BOOTSTRAP_PLAN_MAX_BYTES).optional(), expectedSha256: z.string(),
         contractDigest: z.string(), bootstrapOperationId: z.string().min(1),
         projectId: z.string().min(1), repositoryIdentity: z.string().min(1),
-        replacesSha256: z.string().optional() },
+        replacesSha256: z.string().optional(), stagedBy: z.string().optional() },
     },
-    async (args, extra) => writeAsOwner("bootstrap_plan_attach", args, extra,
-      "attaching a PLAN requires authenticated Hermes owner provenance",
+    async (args, extra) => write("bootstrap_plan_attach", args, extra,
       () => {
         const peer = authenticateMcpPeer(authenticate);
         return peer.allowed ? respond(port.attachBootstrapPlan(peer.value, admittedTurnOf(extra), args)) : respond(peer);

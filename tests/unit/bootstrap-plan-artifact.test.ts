@@ -1,3 +1,5 @@
+import { chmodSync } from "node:fs";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -5,20 +7,23 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { allow, deny } from "../../src/core/errors.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { Role, RunKind, RunState } from "../../src/domain/types.ts";
+import { Role, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
+import type { InBandWake } from "../../src/outbox/outbox.ts";
+import { SELF_CLAIM_EXECUTOR_KIND, SELF_CLAIM_PROTOCOL } from "../../src/registry/canonical-self-claim.ts";
 import { HERMES_PROVENANCE_META_KEY } from "../../src/mcp/hermes-provenance.ts";
 import { startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 import { cleanupTempDirs, seedRun, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, dispatchBootstrapRun, makeHarness, reviewerPass } from "../helpers/harness.ts";
+import { openActivationHandoff, producedHandoff } from "../helpers/driven-primary-cto.ts";
 import { bootstrapCoverageKeys } from "../helpers/bootstrap-plan.ts";
 import { genesisFile, genesisPlanFixture } from "../helpers/genesis-github.ts";
 
 afterAll(cleanupTempDirs);
 type Args = Record<string, unknown>;
-async function fixture() {
+async function fixture(principal: "owner" | "peer" = "owner") {
   const h = makeHarness();
   const ceo = bindCeo(h);
   const created = h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: "STANDARD",
@@ -33,17 +38,19 @@ async function fixture() {
   const digest = sha256(body);
   const lineage = digestOf("bootstrap plan approval lineage");
   const anchor = { liveHermesSessionId: "approved-ceo-head", lineageRootDigest: lineage };
-  const meta = { [HERMES_PROVENANCE_META_KEY]: { principal: "owner", session_id: anchor.liveHermesSessionId,
+  const meta = { [HERMES_PROVENANCE_META_KEY]: { principal, ...(principal === "peer" ? { peer_grant: digestOf("grant") } : {}), session_id: anchor.liveHermesSessionId,
     lineage_root_digest: lineage, cron: false, delegation_depth: 0 } };
   const servers: Array<{ close(): Promise<void> }> = [];
   async function connect(kind: "cto" | "hermes", sessionId: string, provenance = true,
-    identity: "complete" | "actor-only" | "session-only" | "incarnation-only" = "complete") {
-    const session = h.cp.sessions.require(sessionId);
-    const auth = () => allow(ReasonCode.OK, { actor: sessionId,
+    identity: "complete" | "actor-only" | "session-only" | "incarnation-only" | "unauthenticated" = "complete", plane = h.cp) {
+    const session = plane.sessions.require(sessionId);
+    const primaryBinding = kind === "cto" ? plane.bindings.activePrimaryCtos().find(b => b.sessionId === sessionId) : undefined;
+    const auth = () => identity === "unauthenticated" ? deny<never>(ReasonCode.MCP_PEER_UNAUTHENTICATED, "fixture unauthenticated connection") : allow(ReasonCode.OK, { actor: sessionId,
+      ...(primaryBinding ? { binding: { roleKey: primaryBinding.roleKey, bindingGeneration: primaryBinding.bindingGeneration } } : {}),
       ...(identity === "complete" || identity === "session-only" ? { sessionId } : {}),
       ...(identity === "complete" || identity === "incarnation-only" ? { sessionIncarnation: session.incarnation } : {}) });
-    const server = kind === "cto" ? createCtoServer(createCtoMcpPort(h.cp), auth)
-      : createHermesServer(createHermesMcpPort(h.cp), auth, provenance ? { provenance: anchor } : {});
+    const server = kind === "cto" ? createCtoServer(createCtoMcpPort(plane), auth)
+      : createHermesServer(createHermesMcpPort(plane), auth, provenance ? { provenance: anchor } : {});
     const [ct, st] = InMemoryTransport.createLinkedPair();
     await server.connect(st);
     const client = new Client({ name: "bootstrap-plan-artifact", version: "1" });
@@ -99,8 +106,8 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
       } finally { await f.close(); }
     });
 
-  it("round-trips a realistic PLAN larger than 22 KB byte for byte, wakes the owner, and submits by approved digest", async () => {
-    const f = await fixture();
+  it.each(["owner", "peer"] as const)("round-trips a realistic PLAN larger than 22 KB byte for byte on a %s turn, wakes the owner, and submits by approved digest", async principal => {
+    const f = await fixture(principal);
     try {
       expect(Buffer.byteLength(f.body)).toBeGreaterThan(22_000);
       const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
@@ -207,19 +214,19 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
     } finally { await f.close(); }
   });
 
-  it("requires current CEO identity and authenticated owner-turn Hermes provenance", async () => {
+  it("requires current CEO identity and authenticated owner-or-peer Hermes provenance", async () => {
     const f = await fixture();
     try {
       const other = await f.connect("hermes", f.run.ownerSessionId!);
       expect(await other("bootstrap_plan_attach", { ...f.attachArgs, idempotencyKey: "other", runId: f.run.runId, planBody: f.body, expectedSha256: f.digest })).toMatchObject({ ok: false, reasonCode: "BINDING_GENERATION_STALE" });
       const bare = await f.connect("hermes", f.ceo, false);
-      expect(await bare("bootstrap_plan_attach", { ...f.attachArgs, idempotencyKey: "bare", runId: f.run.runId, planBody: f.body, expectedSha256: f.digest })).toMatchObject({ ok: false, reasonCode: "OWNER_AUTHORITY_NOT_DELEGABLE" });
+      expect(await bare("bootstrap_plan_attach", { ...f.attachArgs, idempotencyKey: "bare", runId: f.run.runId, planBody: f.body, expectedSha256: f.digest })).toMatchObject({ ok: false, reasonCode: "MCP_PEER_UNAUTHENTICATED" });
       expect(await f.hermes("bootstrap_plan_attach", { ...f.attachArgs, idempotencyKey: "missing-meta", runId: f.run.runId, planBody: f.body, expectedSha256: f.digest }, {})).toMatchObject({ ok: false, reasonCode: "MCP_TOOL_PROVENANCE_REFUSED" });
       const peerMeta = { [HERMES_PROVENANCE_META_KEY]: { principal: "peer", session_id: "approved-ceo-head",
         lineage_root_digest: digestOf("bootstrap plan approval lineage"), cron: false, delegation_depth: 0, peer_grant: digestOf("grant") } };
       expect(await f.hermes("bootstrap_plan_attach", { ...f.attachArgs, idempotencyKey: "peer-turn", runId: f.run.runId, planBody: f.body, expectedSha256: f.digest }, peerMeta))
-        .toMatchObject({ ok: false, reasonCode: "OWNER_AUTHORITY_NOT_DELEGABLE" });
-      expect(f.h.cp.artifacts.list(f.run.runId, "HANDOFF")).toHaveLength(0);
+        .toMatchObject({ ok: true });
+      expect(f.h.cp.artifacts.list(f.run.runId, "HANDOFF")).toHaveLength(1);
     } finally { await f.close(); }
   });
 
@@ -379,8 +386,8 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
     } finally { await f.close(); }
   });
 
-  it("directly refuses a different run even when the CEO supplies an otherwise valid attachment", async () => {
-    const f = await fixture();
+  it.each(["owner", "peer"] as const)("directly refuses a different run even when the CEO supplies an otherwise valid attachment on a %s turn", async principal => {
+    const f = await fixture(principal);
     try {
       const input = JSON.parse(f.body);
       input.runId = "run_wrong";
@@ -397,8 +404,9 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
     } finally { await f.close(); }
   });
 
-  it.each(["contractDigest", "bootstrapOperationId", "projectId", "repositoryIdentity"])("binds attachment metadata to %s", async (field) => {
-    const f = await fixture();
+  it.each((["owner", "peer"] as const).flatMap(principal => ["contractDigest", "bootstrapOperationId", "projectId", "repositoryIdentity"].map(field => ({ principal, field }))))(
+    "binds attachment metadata to $field on a $principal turn", async ({ field, principal }) => {
+    const f = await fixture(principal);
     try {
       const input = JSON.parse(f.body);
       input.plan.requestDigest = sha256("Repo Factory compile request");
@@ -449,8 +457,8 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
     } finally { await f.close(); }
   });
 
-  it("checks owner generation separately from CEO authority, including a cached attach retry", async () => {
-    const f = await fixture();
+  it.each(["owner", "peer"] as const)("checks owner generation separately from CEO authority on a %s turn, including a cached attach retry", async principal => {
+    const f = await fixture(principal);
     try {
       expect(await f.attach()).toMatchObject({ ok: true });
       expect(f.h.cp.runs.transition(f.run.runId, RunState.BLOCKED, "generation fixture").allowed).toBe(true);
@@ -591,6 +599,391 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
       expect(f.h.cp.runs.cancel(f.run.runId, "finished test").allowed).toBe(true);
       expect(await f.attach()).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
       expect(f.h.cp.artifacts.list(f.run.runId, "HANDOFF")).toHaveLength(0);
+    } finally { await f.close(); }
+  });
+});
+
+async function stagingFixture(principal: "owner" | "peer" = "owner") {
+  const f = await fixture(principal);
+  const primary = seedRun({ db: f.h.cp.db, clock: f.h.clock, repoPath: f.h.repoPath, claim: false });
+  const call = await f.connect("cto", primary.sessionId);
+  const stage = (overrides: Args = {}) => call("bootstrap_plan_stage", { ...f.attachArgs, idempotencyKey: "stage", ...overrides });
+  const state = () => ({ artifacts: f.h.cp.artifacts.list(f.run.runId), run: f.h.cp.runs.require(f.run.runId),
+    candidate: f.h.cp.runs.currentCandidate(f.run.runId), application: f.h.cp.bootstrapApplications.get(f.run.runId),
+    audit: f.h.cp.audit.forRun(f.run.runId), outbox: f.h.cp.outbox.listByRun(f.run.runId),
+    receipts: f.h.cp.db.all("SELECT * FROM inbound_messages WHERE channel = 'mcp'") });
+  const attach = (overrides: Args = {}) => f.attach({ stagedBy: primary.roleKey, ...overrides });
+  return { ...f, primary, stage, state, attach };
+}
+
+describe("bounded PRIMARY_CTO bootstrap candidate staging", () => {
+  it.each(["owner", "peer"] as const)("stages inert exact bytes once, then %s-attaches, reads and submits by digest", async principal => {
+    const f = await stagingFixture(principal);
+    try {
+      const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
+      f.h.cp.outbox.attachInBandWake(wake);
+      const before = f.state();
+      expect(await f.stage()).toMatchObject({ ok: true, value: { digest: f.digest } });
+      expect(await f.stage()).toMatchObject({ ok: true, value: { digest: f.digest } });
+      expect(await f.stage({ idempotencyKey: "stage-again" })).toMatchObject({ ok: true });
+      const staged = f.state();
+      expect(staged.artifacts).toHaveLength(before.artifacts.length + 1);
+      expect(staged.audit.filter(e => e.kind === "BOOTSTRAP_PLAN_STAGED")).toHaveLength(1);
+      expect(staged.run).toEqual(before.run);
+      expect(staged.candidate).toEqual(before.candidate);
+      expect(staged.application).toEqual(before.application);
+      expect(staged.outbox).toEqual(before.outbox);
+      expect(f.h.cp.artifacts.latest(f.run.runId, "PLAN")).toBeNull();
+      expect(f.h.cp.artifacts.latest(f.run.runId, "APPROVAL")).toBeNull();
+      expect(wake).not.toHaveBeenCalled();
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId })).toMatchObject({ ok: false, reasonCode: "NOT_FOUND" });
+      expect(await f.cto("plan_submit", { idempotencyKey: "premature", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: false });
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true, value: { digest: f.digest } });
+      await vi.waitFor(() => expect(wake).toHaveBeenCalled());
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId })).toMatchObject({ ok: true, value: { digest: f.digest, planBody: f.body } });
+      expect(await f.cto("plan_submit", { idempotencyKey: "submit-staged", runId: f.run.runId, bootstrapPlanDigest: f.digest })).toMatchObject({ ok: true, value: { digest: f.digest } });
+      const submitted = f.h.cp.artifacts.list(f.run.runId);
+      expect(await f.stage()).toMatchObject({ ok: true, value: { digest: f.digest } });
+      expect(await f.stage({ idempotencyKey: "same-candidate-after-submit" })).toMatchObject({ ok: true });
+      expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(submitted);
+      expect(JSON.stringify(f.h.cp.audit.all())).not.toContain("Implement the agreed product");
+    } finally { await f.close(); }
+  });
+
+  it.each([
+    { contractDigest: sha256("other contract") }, { bootstrapOperationId: "wrong" }, { projectId: "wrong" },
+    { repositoryIdentity: "github:other/repo" }, { expectedSha256: sha256("wrong bytes") },
+    { planBody: "x".repeat(128 * 1024 + 1) }, { planBody: "{private-invalid-json" }, { planBody: "é".repeat(64 * 1024 + 1) }, { planBody: "\ud800" },
+    ...["idempotencyKey", "runId", "contractDigest", "expectedSha256", "bootstrapOperationId", "projectId", "repositoryIdentity"].flatMap(field =>
+      ["\r", "\n", "\x00", "\x7f"].map(control => ({ [field]: `bad${control}id` }))),
+  ])("refuses invalid stage without writes, case %#", async overrides => {
+    const f = await stagingFixture();
+    try {
+      const before = f.state();
+      expect(await f.stage(overrides)).toMatchObject({ ok: false });
+      expect(f.state()).toEqual(before);
+    } finally { await f.close(); }
+  });
+
+  it("refuses other roles, stale primary generations and unrelated run kinds without writes", async () => {
+    const f = await stagingFixture();
+    try {
+      const before = f.state();
+      expect(await f.cto("bootstrap_plan_stage", f.attachArgs)).toMatchObject({ ok: false });
+      expect(await f.hermes("bootstrap_plan_attach", { ...f.attachArgs, planBody: undefined, stagedBy: f.primary.roleKey })).toMatchObject({ ok: false, reasonCode: "NOT_FOUND" });
+      expect(await f.stage({ runId: f.primary.runId })).toMatchObject({ ok: false });
+      expect(f.state()).toEqual(before);
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(f.h.cp.runs.transition(f.primary.runId, RunState.BLOCKED, "revoke primary").allowed).toBe(true);
+      expect(f.h.cp.bindings.revoke(f.primary.roleKey, "revoke primary", { allowBlockedRuns: true }).allowed).toBe(true);
+      expect(f.h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId: f.primary.projectId, sessionId: f.primary.sessionId }).allowed).toBe(true);
+      const stale = f.state();
+      expect(await f.stage()).toMatchObject({ ok: false });
+      expect(await f.stage({ idempotencyKey: "stale-fresh-key" })).toMatchObject({ ok: false });
+      expect(f.state()).toEqual(stale);
+    } finally { await f.close(); }
+  });
+
+  it("never overwrites a candidate, even with a new key", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      const before = f.state();
+      const body = f.body + " ";
+      expect(await f.stage({ idempotencyKey: "different", planBody: body, expectedSha256: sha256(body) })).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+      expect(f.state()).toEqual(before);
+    } finally { await f.close(); }
+  });
+
+  it.each(["contractDigest", "bootstrapOperationId", "projectId", "repositoryIdentity"])("revalidates staged %s on owner attach", async field => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      const before = f.state();
+      expect(await f.attach({ planBody: undefined, [field]: field === "contractDigest" ? sha256("changed") : "changed" })).toMatchObject({ ok: false });
+      expect(f.state()).toEqual(before);
+    } finally { await f.close(); }
+  });
+});
+
+
+describe("staged bootstrap PLAN boundaries and inline parity", () => {
+  it("produces byte-identical attachment content, audit evidence and dispatch payload to inline attach", async () => {
+    const f = await stagingFixture();
+    const cloneRoot = tempDir("bootstrap-parity-");
+    const raw = new Database(join(f.h.root, "state.sqlite"));
+    await raw.backup(join(cloneRoot, "state.sqlite"));
+    raw.close();
+    chmodSync(join(cloneRoot, "state.sqlite"), 0o600);
+    const inline = makeHarness({ root: cloneRoot, repoPath: f.h.repoPath });
+    try {
+      const inlineCall = await f.connect("hermes", f.ceo, true, "complete", inline.cp);
+      const stagedWake = vi.fn<InBandWake>(async () => allow(ReasonCode.OK, undefined));
+      const inlineWake = vi.fn<InBandWake>(async () => allow(ReasonCode.OK, undefined));
+      f.h.cp.outbox.attachInBandWake(stagedWake);
+      inline.cp.outbox.attachInBandWake(inlineWake);
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(stagedWake).not.toHaveBeenCalled();
+      expect(await inlineCall("bootstrap_plan_attach", f.attachArgs)).toMatchObject({ ok: true });
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true });
+      await vi.waitFor(() => { expect(stagedWake).toHaveBeenCalled(); expect(inlineWake).toHaveBeenCalled(); });
+      const attachment = (cp: typeof inline.cp) => cp.artifacts.list<Args>(f.run.runId, "HANDOFF")
+        .find(a => a.content.schema === "acp.bootstrap-plan-input.v1")!;
+      const staged = attachment(f.h.cp);
+      const direct = attachment(inline.cp);
+      const { artifactId: _stagedArtifactId, ...stagedArtifact } = staged;
+      const { artifactId: _directArtifactId, ...directArtifact } = direct;
+      expect(stagedArtifact).toEqual(directArtifact);
+      expect(staged.digest).toBe(direct.digest);
+      expect(Buffer.from(JSON.stringify(staged.content))).toEqual(Buffer.from(JSON.stringify(direct.content)));
+      expect(Buffer.from(staged.content.bodyBase64 as string, "base64")).toEqual(Buffer.from(f.body));
+      const audit = (cp: typeof inline.cp) => cp.audit.forRun(f.run.runId).find(e => e.kind === "BOOTSTRAP_PLAN_ATTACHED")!;
+      // Row ids differ; all attachment audit fields and evidence are identical.
+      const { eventId: _stagedId, ...stagedAudit } = audit(f.h.cp);
+      const { eventId: _inlineId, ...inlineAudit } = audit(inline.cp);
+      expect(Buffer.from(JSON.stringify(stagedAudit))).toEqual(Buffer.from(JSON.stringify(inlineAudit)));
+      const dispatch = (cp: typeof inline.cp) => cp.outbox.listByRun(f.run.runId).find(m => (m.payload as Args).bootstrapPlanDigest === f.digest)!;
+      const a = dispatch(f.h.cp), b = dispatch(inline.cp);
+      expect(Buffer.from(JSON.stringify(a.payload))).toEqual(Buffer.from(JSON.stringify(b.payload)));
+      expect([a.roleKey, a.bindingGeneration, a.targetSessionId, a.kind, a.runId, a.idempotencyKey])
+        .toEqual([b.roleKey, b.bindingGeneration, b.targetSessionId, b.kind, b.runId, b.idempotencyKey]);
+      expect(stagedWake).toHaveBeenCalledWith(f.run.ownerRoleKey, expect.any(Array));
+      expect(inlineWake).toHaveBeenCalledWith(f.run.ownerRoleKey, expect.any(Array));
+      expect(stagedWake).toHaveBeenCalledTimes(inlineWake.mock.calls.length);
+      const wakes = (wake: typeof stagedWake, messageId: string) => wake.mock.calls.map(([role, ids]) =>
+        [role, ids?.map(id => id === messageId ? "attachment-dispatch-id" : id)]);
+      expect(wakes(stagedWake, a.messageId)).toEqual(wakes(inlineWake, b.messageId));
+    } finally { await f.close(); inline.cp.close(); }
+  });
+
+  it("does not resolve a different run's same-digest candidate and admits a valid peer attach", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      const created = f.h.cp.runs.create({ kind: RunKind.PROJECT_BOOTSTRAP, executionMode: "STANDARD",
+        contract: { goal: "another bootstrap", why: "test", scope: [], nonGoals: [], priority: "NORMAL", humanGate: [], references: [], acceptance: ["test"] } });
+      if (!created.allowed) throw new Error(created.message);
+      const other = await dispatchBootstrapRun(f.h.cp, f.h.clock, created.value.runId);
+      const before = f.state();
+      expect(await f.attach({ planBody: undefined, runId: other.runId, contractDigest: other.contractDigest }))
+        .toMatchObject({ ok: false, reasonCode: "NOT_FOUND" });
+      expect(f.h.cp.artifacts.list(other.runId, "HANDOFF")).toHaveLength(0);
+      expect(f.state()).toEqual(before);
+      const peerMeta = { [HERMES_PROVENANCE_META_KEY]: { principal: "peer", session_id: "approved-ceo-head",
+        lineage_root_digest: digestOf("bootstrap plan approval lineage"), cron: false, delegation_depth: 0, peer_grant: digestOf("grant") } };
+      expect(await f.hermes("bootstrap_plan_attach", { ...f.attachArgs, planBody: undefined, stagedBy: f.primary.roleKey }, peerMeta))
+        .toMatchObject({ ok: true, value: { digest: f.digest } });
+    } finally { await f.close(); }
+  });
+
+  it("refuses stale owner pins on stage replay and digest-only attach", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(f.h.cp.runs.transition(f.run.runId, RunState.BLOCKED, "owner stale").allowed).toBe(true);
+      expect(f.h.cp.bindings.revoke(f.run.ownerRoleKey!, "owner stale", { allowBlockedRuns: true }).allowed).toBe(true);
+      const before = f.state();
+      expect(await f.stage()).toMatchObject({ ok: false, reasonCode: "BINDING_GENERATION_STALE" });
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: false, reasonCode: "BINDING_GENERATION_STALE" });
+      expect(f.state()).toEqual(before);
+    } finally { await f.close(); }
+  });
+
+  it("attaches a staged candidate after a same-session owner renewal and re-stages identical bytes idempotently", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(f.h.cp.runs.transition(f.run.runId, RunState.BLOCKED, "renew owner").allowed).toBe(true);
+      expect(f.h.cp.bindings.revoke(f.run.ownerRoleKey!, "renew owner", { allowBlockedRuns: true }).allowed).toBe(true);
+      const renewed = f.h.cp.bindings.bind({ role: Role.BOOTSTRAP_CTO, runId: f.run.runId, sessionId: f.run.ownerSessionId! });
+      if (!renewed.allowed) throw new Error(renewed.message);
+      expect(f.h.cp.runs.restoreRecoveredBootstrapOwner(f.run.runId, renewed.value, f.run.ownerBindingGeneration!).allowed).toBe(true);
+      const before = f.h.cp.artifacts.list(f.run.runId);
+      expect(await f.stage()).toMatchObject({ ok: true, value: { digest: f.digest } });
+      expect(await f.stage({ idempotencyKey: "restage-after-renewal" })).toMatchObject({ ok: true });
+      expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(before);
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true, value: { digest: f.digest } });
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId })).toMatchObject({ ok: true, value: { digest: f.digest, planBody: f.body } });
+    } finally { await f.close(); }
+  });
+
+  it("rolls back staged artifact and audit when staging audit refuses", async () => {
+    const f = await stagingFixture();
+    try {
+      const record = f.h.cp.audit.record.bind(f.h.cp.audit);
+      vi.spyOn(f.h.cp.audit, "record").mockImplementation(input => input.kind === "BOOTSTRAP_PLAN_STAGED"
+        ? deny(ReasonCode.CONFLICT, "test refused staging audit") : record(input));
+      const before = f.state();
+      expect(await f.stage()).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+      const { receipts: _beforeReceipts, ...beforeDomain } = before;
+      const { receipts: _afterReceipts, ...afterDomain } = f.state();
+      expect(afterDomain).toEqual(beforeDomain);
+    } finally { await f.close(); }
+  });
+});
+
+
+describe("B1 delegated bootstrap PLAN admission", () => {
+  const meta = (principal: "owner" | "peer", overrides: Args = {}) => ({ [HERMES_PROVENANCE_META_KEY]: {
+    principal, session_id: "approved-ceo-head", lineage_root_digest: digestOf("bootstrap plan approval lineage"),
+    cron: false, delegation_depth: 0, ...(principal === "peer" ? { peer_grant: digestOf("grant") } : {}), ...overrides,
+  } });
+  it.each(["owner", "peer"] as const)("preserves complete CEO authentication before digests for %s calls, with no writes", async principal => {
+    const f = await stagingFixture(principal);
+    try {
+      const before = f.state();
+      for (const identity of ["unauthenticated", "actor-only", "session-only", "incarnation-only"] as const) {
+        const call = await f.connect("hermes", f.ceo, true, identity);
+        for (const expectedSha256 of [f.digest, "bad-digest", "bad\rid"]) {
+          expect(await call("bootstrap_plan_attach", { ...f.attachArgs, expectedSha256 }, meta(principal)))
+            .toMatchObject({ ok: false, reasonCode: identity === "session-only" ? "BINDING_GENERATION_STALE" : "MCP_PEER_UNAUTHENTICATED" });
+          expect(f.state()).toEqual(before);
+        }
+      }
+      const other = await f.connect("hermes", f.run.ownerSessionId!);
+      expect(await other("bootstrap_plan_attach", f.attachArgs, meta(principal))).toMatchObject({ ok: false });
+      expect(await f.attach({ runId: f.primary.runId })).toMatchObject({ ok: false });
+      expect(await f.attach({ runId: "run_other" })).toMatchObject({ ok: false });
+      expect(f.state()).toEqual(before);
+      expect(f.h.cp.bindings.revoke("CEO", "stale CEO").allowed).toBe(true);
+      const stale = f.state();
+      expect(await f.attach()).toMatchObject({ ok: false });
+      expect(f.state()).toEqual(stale);
+    } finally { await f.close(); }
+  });
+
+  it.each([
+    { cron: true }, { delegation_depth: 1 }, { lineage_root_digest: digestOf("wrong lineage") },
+    { session_id: "wrong-session" }, { peer_grant: undefined }, { principal: "admin" },
+  ])("refuses bad peer provenance case %# without writes", async overrides => {
+    const f = await stagingFixture();
+    try {
+      const before = f.state();
+      expect(await f.hermes("bootstrap_plan_attach", f.attachArgs, meta("peer", overrides)))
+        .toMatchObject({ ok: false, reasonCode: "MCP_TOOL_PROVENANCE_REFUSED" });
+      expect(await f.hermes("bootstrap_plan_attach", f.attachArgs, {}))
+        .toMatchObject({ ok: false, reasonCode: "MCP_TOOL_PROVENANCE_REFUSED" });
+      expect(f.state()).toEqual(before);
+    } finally { await f.close(); }
+  });
+
+  it("records the peer grant, fences its replay fingerprint, and keeps owner decisions and suspension owner-only", async () => {
+    const f = await stagingFixture("peer");
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      expect(f.h.cp.audit.byKind("BOOTSTRAP_PLAN_ATTACHED")[0]?.evidence)
+        .toMatchObject({ hermesPrincipal: "peer", hermesPeerGrant: digestOf("grant") });
+      const before = f.state();
+      expect(await f.hermes("bootstrap_plan_attach", f.attachArgs, meta("peer", { peer_grant: digestOf("other grant") })))
+        .toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+      expect(await f.hermes("owner_decision_submit", { idempotencyKey: "peer-decision", runId: f.run.runId,
+        item: "bootstrap", approved: true }, meta("peer"))).toMatchObject({ ok: false, reasonCode: "OWNER_AUTHORITY_NOT_DELEGABLE" });
+      expect(await f.hermes("cto_suspend", { idempotencyKey: "peer-suspend", projectId: f.primary.projectId,
+        reason: "peer request" }, meta("peer"))).toMatchObject({ ok: false, reasonCode: "OWNER_AUTHORITY_NOT_DELEGABLE" });
+      expect(f.state()).toEqual(before);
+    } finally { await f.close(); }
+  });
+});
+
+
+async function anotherStager(f: Awaited<ReturnType<typeof stagingFixture>>, canonical = false) {
+  const projectId = "prj_other_stager";
+  const project = f.h.cp.projects.register({ projectId, name: "another stager" });
+  if (!project.allowed) throw new Error(project.message);
+  const session = f.h.cp.sessions.create({ provider: "claude", model: "opus" });
+  f.h.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "another stager");
+  const targetLocator = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const claimed = { executorKind: SELF_CLAIM_EXECUTOR_KIND, targetLocator, targetLocatorDigest: sha256(targetLocator) };
+  const binding = f.h.cp.bindings.bind({ role: Role.PRIMARY_CTO, projectId, sessionId: session.sessionId,
+    ...(canonical ? { authenticatedTarget: { claimed, protocolVersion: SELF_CLAIM_PROTOCOL, attestationDigest: digestOf(claimed), verify: () => claimed } } : {}) });
+  if (!binding.allowed) throw new Error(binding.message);
+  const call = await f.connect("cto", session.sessionId);
+  const body = f.body + " ";
+  const digest = sha256(body);
+  const stage = (overrides: Args = {}) => call("bootstrap_plan_stage", { ...f.attachArgs, idempotencyKey: "other-stage",
+    planBody: body, expectedSha256: digest, ...overrides });
+  return { call, stage, body, digest, roleKey: binding.value.roleKey, projectId, sessionId: session.sessionId };
+}
+
+describe("B2 candidates are non-authoritative uploads selected by run, stager and digest", () => {
+  it("keeps stager slots independent and derives identity from authentication even when arguments name another role", async () => {
+    const f = await stagingFixture();
+    try {
+      const other = await anotherStager(f);
+      expect(await other.stage()).toMatchObject({ ok: true, value: { digest: other.digest, stagedBy: other.roleKey } });
+      expect(await f.stage({ stagedBy: other.roleKey, roleKey: other.roleKey }))
+        .toMatchObject({ ok: true, value: { digest: f.digest, stagedBy: f.primary.roleKey } });
+      const candidates = f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF");
+      expect(candidates).toHaveLength(2);
+      expect(candidates.map(a => a.content.stagedBy).sort()).toEqual([f.primary.roleKey, other.roleKey].sort());
+      expect(candidates.every(a => !("ownerPin" in a.content))).toBe(true);
+      const before = f.state();
+      // Forging the other identity never writes that slot, nor returns its bytes.
+      expect(await f.stage({ idempotencyKey: "forged-overwrite", stagedBy: other.roleKey,
+        planBody: other.body, expectedSha256: other.digest })).toMatchObject({ ok: false });
+      expect(await other.call("bootstrap_plan_get", { runId: f.run.runId })).toMatchObject({ ok: false });
+      expect(f.state()).toEqual(before);
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true, value: { digest: f.digest } });
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId })).toMatchObject({ ok: true, value: { planBody: f.body } });
+    } finally { await f.close(); }
+  });
+
+  it("lets the CEO explicitly select another stager's candidate without a latest or cross-slot fallback", async () => {
+    const f = await stagingFixture();
+    try {
+      const other = await anotherStager(f);
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(await other.stage()).toMatchObject({ ok: true });
+      const before = f.state();
+      for (const selection of [
+        { stagedBy: undefined }, { stagedBy: "BOOTSTRAP_CTO:wrong" }, { stagedBy: "PRIMARY_CTO:" },
+        { stagedBy: "PRIMARY_CTO:missing" }, { stagedBy: `PRIMARY_CTO:bad\rkey` },
+        { stagedBy: f.primary.roleKey, expectedSha256: other.digest },
+        { stagedBy: other.roleKey, expectedSha256: f.digest },
+      ]) {
+        expect(await f.attach({ planBody: undefined, ...selection })).toMatchObject({ ok: false });
+        expect(f.state()).toEqual(before);
+      }
+      expect(await f.attach({ planBody: undefined, stagedBy: other.roleKey, expectedSha256: other.digest }))
+        .toMatchObject({ ok: true, value: { digest: other.digest } });
+      expect(await f.cto("bootstrap_plan_get", { runId: f.run.runId }))
+        .toMatchObject({ ok: true, value: { digest: other.digest, planBody: other.body } });
+      expect(await f.cto("plan_submit", { idempotencyKey: "selected-other", runId: f.run.runId, bootstrapPlanDigest: other.digest }))
+        .toMatchObject({ ok: true });
+    } finally { await f.close(); }
+  });
+
+  it("never treats staged candidates or attached PLAN input as an activation or resident handoff package", async () => {
+    const f = await stagingFixture();
+    try {
+      expect(await f.stage()).toMatchObject({ ok: true });
+      expect(await f.attach({ planBody: undefined })).toMatchObject({ ok: true });
+      const recipient = await anotherStager(f, true);
+      const fixture = { harness: f.h } as Parameters<typeof producedHandoff>[0];
+      const handoff = producedHandoff(fixture, f.run.runId, recipient.projectId);
+      const open = openActivationHandoff(fixture);
+      const opened = open(recipient.projectId, f.run.runId, recipient.sessionId, handoff);
+      expect(opened).toMatchObject({ allowed: true });
+      if (!opened.allowed) throw new Error(opened.message);
+      expect(open(recipient.projectId, f.run.runId, recipient.sessionId, handoff))
+        .toMatchObject({ allowed: true, value: { handoffId: opened.value.handoffId } });
+      const reader = f.h.cp.bootstrap as unknown as { activationHandoff(runId: string): { content: Args } | null };
+      expect(reader.activationHandoff(f.run.runId)?.content.handoffId).toBe(opened.value.handoffId);
+      const message = f.h.cp.outbox.byIdempotencyKey(`bootstrap-handoff:${opened.value.handoffId}`)!;
+      expect(await recipient.call("role_dispatch_pending", {})).toMatchObject({ ok: true,
+        value: { messages: [expect.objectContaining({ messageId: message.messageId, kind: "HANDOFF_PACKAGE" })] } });
+      expect(await recipient.call("handoff_ack", { idempotencyKey: "real-handoff-ack", handoffId: opened.value.handoffId,
+        messageId: message.messageId, bindingGeneration: message.bindingGeneration, payloadDigest: message.payloadDigest }))
+        .toMatchObject({ ok: true });
+      expect(f.h.cp.outbox.get(message.messageId)?.status).toBe("ACKED");
+      const port = createCtoMcpPort(f.h.cp);
+      for (const input of f.h.cp.artifacts.list<Args>(f.run.runId, "HANDOFF").filter(a => a.content.schema)) {
+        expect(port.handoffKind(input.artifactId)).toBeNull();
+        expect(port.handoffKind(input.digest)).toBeNull();
+        expect(await f.cto("handoff_ack", { idempotencyKey: `input-not-handoff-${input.artifactId}`,
+          handoffId: input.artifactId, messageId: "missing", payloadDigest: input.digest, bindingGeneration: 1 }))
+          .toMatchObject({ ok: false, reasonCode: "NOT_FOUND" });
+      }
     } finally { await f.close(); }
   });
 });
