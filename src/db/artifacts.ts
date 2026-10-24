@@ -501,6 +501,12 @@ export class ArtifactStore {
     }
   }
 
+  /** Explicit input/PLAN revision withdraws currency; immutable bytes and digest remain intact. */
+  supersede(runId: string, kind: "PLAN" | "HANDOFF", digest: string): void {
+    this.db.run(`UPDATE run_artifacts SET superseded = 1
+      WHERE run_id = ? AND kind = ? AND digest = ? AND superseded = 0`, [runId, kind, digest]);
+  }
+
   latest<T>(runId: string, kind: ArtifactKind): StoredArtifact<T> | null {
     const row = this.db.get<RawArtifact>(
       `SELECT * FROM run_artifacts WHERE run_id = ? AND kind = ? AND superseded = 0

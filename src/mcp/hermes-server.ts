@@ -1,6 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
+import { attachBootstrapPlan, bootstrapPlanAttachAccess, bootstrapPlanAttachAuthority, validateBootstrapPlanDigests, BOOTSTRAP_PLAN_MAX_BYTES, type BootstrapPlanAttachInput } from "../bootstrap/bootstrap-plan-artifact.ts";
+import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
+import type { ArtifactStore } from "../db/artifacts.ts";
+import type { AuditLog } from "../db/audit.ts";
+import type { Outbox } from "../outbox/outbox.ts";
 import type { CapacityMonitor } from "../capacity/capacity-monitor.ts";
 import type { RepoFactoryBootstrapRunner } from "../bootstrap/repo-factory-bootstrap-run.ts";
 import {
@@ -65,6 +70,10 @@ const mutation = { idempotencyKey: z.string().min(1) };
  */
 export interface HermesMcpSource extends McpMutationSource {
   readonly db: Db;
+  readonly artifacts: ArtifactStore;
+  readonly bootstrapApplications: Pick<BootstrapApplications, "assertNotFrozen">;
+  readonly audit: AuditLog;
+  readonly outbox: Outbox;
   readonly clock: Clock;
   readonly capacity: CapacityMonitor;
   readonly ceo: ProductionGate;
@@ -104,6 +113,11 @@ export const createHermesMcpPort = (
       }
       return allow(ReasonCode.OK, { roleKey: binding.roleKey, bindingGeneration: binding.bindingGeneration });
     },
+    attachBootstrapPlan: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined, input: BootstrapPlanAttachInput) =>
+      attachBootstrapPlan(source, peer, turn, input),
+    bootstrapPlanAttachAuthority: (peer: AuthenticatedMcpPeer, turn: HermesAdmittedTurn | undefined) =>
+      bootstrapPlanAttachAuthority(source, peer, turn),
+    bootstrapPlanAttachAccess: (input: BootstrapPlanAttachInput) => bootstrapPlanAttachAccess(source, input),
     createRun: (input: Parameters<RunEngine["create"]>[0]) => source.runs.create(input),
     dispatchRun: (runId: string, hermesTurn?: HermesAdmittedTurn) =>
       source.runs.dispatch(runId, hermesTurn === undefined ? {} : { hermesTurn }),
@@ -341,7 +355,15 @@ const createHermesServerFromPort = (
       ...(durableReplay === undefined ? {} : { durableReplay }),
       authority: () => {
         const current = authenticateMcpPeer(authenticate);
-        return current.allowed ? port.peerAuthority(peer.value) : current;
+        const authority = current.allowed ? port.peerAuthority(peer.value) : current;
+        if (!authority.allowed || toolName !== "bootstrap_plan_attach") return authority;
+        const identity = port.bootstrapPlanAttachAuthority(peer.value, admittedTurnOf(extra));
+        if (!identity.allowed) return identity;
+        const digests = validateBootstrapPlanDigests({ contractDigest: args.contractDigest as string,
+          expectedSha256: args.expectedSha256 as string, replacesSha256: args.replacesSha256 as string | undefined });
+        if (!digests.allowed) return digests;
+        const input = port.bootstrapPlanAttachAccess(args as unknown as BootstrapPlanAttachInput);
+        return input.allowed ? authority : input;
       },
       provenance: anchor === undefined ? null : { ...anchor, ...admittedTurnOf(extra) },
     });
@@ -362,6 +384,23 @@ const createHermesServerFromPort = (
     return write(toolName, args, extra, () => execute(peer.value.actor));
   });
 
+  server.registerTool(
+    "bootstrap_plan_attach",
+    {
+      description: `Deliver final exact UTF-8 bootstrap input JSON (runId, plan, tasks), at most ${BOOTSTRAP_PLAN_MAX_BYTES} bytes. Input delivery grants no execution approval. Explicit replacesSha256 invalidates previous evidence. Requires authenticated Hermes owner provenance.`,
+      // Digest syntax is still strict, but checked after authentication for a structured refusal.
+      inputSchema: { ...mutation, runId: z.string(), planBody: z.string().max(BOOTSTRAP_PLAN_MAX_BYTES), expectedSha256: z.string(),
+        contractDigest: z.string(), bootstrapOperationId: z.string().min(1),
+        projectId: z.string().min(1), repositoryIdentity: z.string().min(1),
+        replacesSha256: z.string().optional() },
+    },
+    async (args, extra) => writeAsOwner("bootstrap_plan_attach", args, extra,
+      "attaching a PLAN requires authenticated Hermes owner provenance",
+      () => {
+        const peer = authenticateMcpPeer(authenticate);
+        return peer.allowed ? respond(port.attachBootstrapPlan(peer.value, admittedTurnOf(extra), args)) : respond(peer);
+      }),
+  );
   server.registerTool(
     "run_create",
     {

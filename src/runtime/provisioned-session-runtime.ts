@@ -891,7 +891,7 @@ export const PLAN_SUBMISSIONS_PER_TURN = 4;
  * `bootstrapPlanGuide`, and a refused PLAN is corrected from the refusal's own evidence.
  */
 const PLAN_STEPS =
-  "read mcp__acp-cto__contract_get for that run; write a PLAN that satisfies its contract, following the bootstrapPlanGuide it returns when there is one; " +
+  "read mcp__acp-cto__contract_get for that run; if it carries bootstrapPlanDigest, read mcp__acp-cto__bootstrap_plan_get and submit that digest with runId and idempotencyKey, without plan or tasks; otherwise write a PLAN that satisfies its contract, following the bootstrapPlanGuide it returns when there is one; " +
   "submit the PLAN with mcp__acp-cto__plan_submit; use the same key for an identical retry. " + MCP_MUTATION_RECOVERY + " " +
   `Only after proving non-execution, correct a refused PLAN from its evidence and submit the new request with a new key, at most ${PLAN_SUBMISSIONS_PER_TURN} plan_submit calls for that run in this turn`;
 

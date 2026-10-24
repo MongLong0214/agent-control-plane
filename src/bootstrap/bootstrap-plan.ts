@@ -842,7 +842,8 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
   return {
     schema: BOOTSTRAP_PLAN_GUIDE_SCHEMA_ID,
     submit: [
-      "Call mcp__acp-cto__plan_submit with { idempotencyKey, runId, plan, tasks }.",
+      "If contract_get carries bootstrapPlanDigest, read mcp__acp-cto__bootstrap_plan_get with { runId }, then call mcp__acp-cto__plan_submit with { idempotencyKey, runId, bootstrapPlanDigest }, without plan or tasks. This submits the exact CEO-delivered input; it grants no execution approval.",
+      "Otherwise call mcp__acp-cto__plan_submit with { idempotencyKey, runId, plan, tasks }.",
       "Use the same idempotencyKey for an identical retry. " + MCP_MUTATION_RECOVERY,
       "tasks: at least one task { key, title, category }, for example one implementation task that creates the repository.",
     ],
@@ -850,7 +851,7 @@ export const bootstrapPlanGuide = (): BootstrapPlanGuide => {
       { field:"genesis",carries:"INLINE acp.genesis-bundle.v1 bytes+SHA-256, branches main/dev/genesis, labels/milestones/issues, productIntent with references and ownerInstructions; never local filenames. See genesisExample." },
       { field: "summary", carries: "what this bootstrap creates and why, from the contract" },
       { field: "bootstrapOperationId", carries: "a non-empty id you choose for this bootstrap; keep it unchanged when you resubmit" },
-      { field: "requestDigest", carries: "the run's contractDigest, as contract_get's run.contractDigest states it" },
+      { field: "requestDigest", carries: "the digest of the Repo Factory compile request; independent of ACP's run contractDigest" },
       { field: "githubOperations", carries: "the GitHub operations in the order they run, each with its desiredState; the first is repositoryCreateOperation" },
       { field: "projectManifest", carries: "the full project manifest (manifest); its one repository's remote is the repository the first operation creates" },
       { field: "projectManifestDigest", carries: "the digest of projectManifest (digestRule)" },
