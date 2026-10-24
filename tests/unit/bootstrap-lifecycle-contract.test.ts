@@ -10,6 +10,7 @@ import {
   type BootstrapLifecycleSite,
 } from "../../src/bootstrap/bootstrap-lifecycle.ts";
 import { REPO_FACTORY_RESULT_SCHEMA_ID } from "../../src/bootstrap/repo-factory-result.ts";
+import { genesisPlanFixture } from "../helpers/genesis-github.ts";
 
 /**
  * W2 — each sentence of the post-CONFIRM lifecycle the BOOTSTRAP_PLAN reviewer is shown is tied to
@@ -28,6 +29,7 @@ const source = (file: string): string => readFileSync(`${ROOT}${file}`, "utf8");
  * part of it.
  */
 const definitionOf = (text: string, symbol: string): string | null => {
+  if (symbol === "<module>") return text;
   const lines = text.split("\n");
   const head = new RegExp(
     `^\\s*(?:(?:export|private|public|protected|static|async|readonly)\\s+)*(?:const\\s+)?#?${symbol}\\s*(?:=|\\(|<)`,
@@ -62,6 +64,24 @@ const violations = (text: string, site: BootstrapLifecycleSite): string[] => {
 };
 
 describe("W2: every lifecycle statement is tied to the code that enforces it", () => {
+  it("F5: planned outputs bind the existing dedicated resident Buzz guarantee to its enforcement", () => {
+    const item = BOOTSTRAP_POST_CONFIRM_LIFECYCLE.find((candidate) => candidate.id === "resident-cto-dedicated-buzz");
+    expect(item).toMatchObject({
+      kind: BootstrapLifecycleKind.IMPLEMENTED_GUARANTEE,
+      statement: "For an inline genesis bootstrap, resident provisioning requires the CTO's dedicated Buzz identity and private room, a verified roster and a nonce readable as that identity; activation and CONFIRM require resident provisioning readiness. These are provisioning readbacks, not a guarantee of future message delivery or CTO execution.",
+    });
+    const { outputs } = genesisPlanFixture();
+    expect(outputs).toMatchObject({ lifecycle: expect.arrayContaining([{ id: item!.id, kind: item!.kind, statement: item!.statement }]) });
+    expect(item!.sites.flatMap((site) => violations(source(site.file), site))).toEqual([]);
+    const site = item!.sites.find((candidate) => candidate.symbol === "confirmedRoom")!;
+    expect(violations(source(site.file).replace("buzz.rosterVerified", "true"), site)).not.toEqual([]);
+    expect(violations(source(site.file).replace("buzz.nonceReadable", "true"), site)).not.toEqual([]);
+    const host = item!.sites.find((candidate) => candidate.symbol === "<module>")!;
+    expect(violations(source(host.file).replace("room.visibility === 'private'", "true"), host)).toEqual([
+      `${host.file} ${host.symbol}: missing ${JSON.stringify("room.visibility === 'private'")}`,
+    ]);
+  });
+
   it("the items are distinct, every kind is present, and every item names at least one site", () => {
     const ids = BOOTSTRAP_POST_CONFIRM_LIFECYCLE.map((item) => item.id);
     expect(new Set(ids).size).toBe(ids.length);
