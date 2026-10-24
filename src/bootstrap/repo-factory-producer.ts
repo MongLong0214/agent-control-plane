@@ -143,6 +143,7 @@ export const repoFactoryPlanFixtureSchema = z
     /** Which of `VERIFICATION_KINDS` this producer actually runs. Closed, not free-form argv. */
     verificationKind: z.enum(["CLEAN_TREE", "GENESIS_TEST"]),
     genesis: genesisBundleSchema.optional(),
+    postMergeCommands: z.array(z.string()).optional(),
     ciWorkflows: z.array(z.object({path:z.string(),checkName:z.string(),approvedDigest:z.string()})).optional(),
     verificationCommands: z.array(verificationCommandSchema).optional(),
     /**
@@ -1069,6 +1070,7 @@ export const produceRepoFactoryResult = async (
             },
         approvedTree,
         ciWorkflows: plan.ciWorkflows,
+        postMergeCommands: plan.postMergeCommands,
         prepareGenesis: async (parent) => {
           await gitOrCleanup(["reset","--hard",parent]);
           // Exact reviewed tree; the autoInit README survives only if the bundle includes it.

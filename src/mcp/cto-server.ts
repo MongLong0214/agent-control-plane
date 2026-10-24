@@ -1,3 +1,4 @@
+import { collectBootstrapCeoDecisions } from "../bootstrap/bootstrap-ceo-decisions.ts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -230,6 +231,12 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
         ? contractChangePlanForSubmission(run, plan, (digest) => source.projects.manifest(digest), firstActivationFactsOf(source.db, run))
         : planForSubmission(run, plan);
       if (!admitted.allowed) return admitted as Decision<{ digest: string }>;
+      // The authority field is ACP-owned. Never retain a producer's claim, even with no CEO replies.
+      if (isProjectlessBootstrap(run)) {
+        delete admitted.value["authenticatedCeoDecisions"];
+        const decisions = collectBootstrapCeoDecisions(source.db, runId);
+        if (decisions.length > 0) admitted.value["authenticatedCeoDecisions"] = decisions;
+      }
       const stored = isProjectlessBootstrap(run) && admitted.value["genesis"] !== undefined
         ? {...admitted.value,originatingContract:source.artifacts.latest<unknown>(runId,ArtifactKind.TASK_CONTRACT)?.content ?? null}
         : admitted.value;

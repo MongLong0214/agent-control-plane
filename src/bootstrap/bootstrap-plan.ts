@@ -1,3 +1,4 @@
+import { frozenBootstrapCeoDecisions, type AuthenticatedCeoDecision } from "./bootstrap-ceo-decisions.ts";
 import { MCP_MUTATION_RECOVERY } from "../core/mcp-recovery.ts";
 import { parseGenesis, genesisDigest, bytesDigest, type GenesisBundle } from './genesis-bundle.ts';
 import { z } from "zod";
@@ -94,8 +95,9 @@ export const sameBootstrapPlanBinding = (
 
 /**
  * The activation handoff a CEO-confirmed bootstrap delivers to the project's primary CTO. Nothing
- * on this path supplies one, so it is derived from the approved manifest alone — and is therefore
- * the same package on every call, which `activate` requires of a retry.
+ * on this path supplies one: the base package comes from the approved manifest and genesis. The
+ * planned outputs extend it with the PLAN's frozen ACP CEO records and any stage-split directive,
+ * so every activation retry reloads the same package.
  */
 export const bootstrapActivationHandoff = (manifest: ProjectManifest, genesis?: GenesisBundle): HandoffPackage => ({
   projectStatus: "BOOTSTRAPPED",
@@ -345,7 +347,7 @@ export const bootstrapPlanPreflight = (input: {
       verificationCommandId: command.id,
       verificationKind,
       githubOperations: operations,
-      ...(genesis ? {genesis,ciWorkflows:manifest.ciWorkflows.map(w => ({path:w.path,checkName:w.checkName,approvedDigest:w.approvedDigest!})),verificationCommands:manifest.verificationCommands} : {}),
+      ...(genesis ? {genesis,postMergeCommands:manifest.postMergeCommands,ciWorkflows:manifest.ciWorkflows.filter(w => w.repositoryRole === declared.role).map(w => ({path:w.path,checkName:w.checkName,approvedDigest:w.approvedDigest!})),verificationCommands:manifest.verificationCommands} : {}),
     },
   });
 };
@@ -370,6 +372,8 @@ export interface PlannedBootstrapOutputs {
   genesis?: GenesisBundle;
   verificationCommands?: RepoFactoryPlanFixture["verificationCommands"];
   ciWorkflows?: RepoFactoryPlanFixture["ciWorkflows"];
+  postMergeCommands?: string[];
+  authenticatedCeoDecisions?: AuthenticatedCeoDecision[];
   /** The GitHub operations in the order they run, desired state included. */
   githubOperations: GitHubOperation[];
   verification: { commandId: string; argv: string[]; cwd: string; kind: VerificationKind };
@@ -427,6 +431,24 @@ export const plannedBootstrapOutputs = (
       planned: shape.value.repositoryIdentity,
     });
   }
+  let decisions: AuthenticatedCeoDecision[];
+  try {
+    decisions = frozenBootstrapCeoDecisions(plan.planArtifact?.content);
+  } catch {
+    return refuse(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "CEO_DECISION_RECORD_INVALID", "the PLAN's frozen ACP CEO decision records failed validation");
+  }
+  const handoff = bootstrapActivationHandoff(manifest,executable.genesis);
+  if (executable.genesis && (plan.planArtifact?.content as Record<string,unknown>)["originatingContract"]) {
+    handoff.recentDecisions.push(JSON.stringify({originatingContract:(plan.planArtifact!.content as Record<string,unknown>)["originatingContract"]}));
+  }
+  if (decisions.length > 0) {
+    handoff.recentDecisions.push(...decisions.map(authenticatedCeoDecision => JSON.stringify({authenticatedCeoDecision})));
+    // Seeded issue acceptance belongs to follow-on STANDARD_WORK. State that responsibility on
+    // every authenticated handoff, without guessing which language or wording describes the split.
+    // An empty issue set creates no work; queuedWork's existing reader contract stays unchanged.
+    const issues = executable.genesis?.issues.map(issue => ({repository:shape.value.repositoryIdentity,key:issue.key,title:issue.title,acceptance:issue.body})) ?? [];
+    handoff.recommendedNextAction = "acknowledge this handoff; look up existing runs first and never create duplicates. As resident CTO, create one follow-on STANDARD_WORK run per seeded issue and verify each issue's acceptance there, covering ALL seeded issues: " + JSON.stringify(issues);
+  }
   return allow(ReasonCode.OK, {
     schema: BOOTSTRAP_PLANNED_OUTPUTS_SCHEMA_ID,
     runId: plan.runId,
@@ -443,10 +465,11 @@ export const plannedBootstrapOutputs = (
     defaultBranch,
     // #246 C5 — a create-only plan commits nothing: no file, the bootstrap content file included.
     files: executable.genesis ? executable.genesis.files.map(f => ({path:f.path,mode:f.mode,content:Buffer.from(f.contentBase64,"base64").toString("utf8"),contentBase64:f.contentBase64})) : shape.value.createOnly ? [] : plannedBootstrapFiles(executable),
-    ...(executable.genesis ? {genesis:executable.genesis,verificationCommands:executable.verificationCommands,ciWorkflows:executable.ciWorkflows} : {}),
+    ...(executable.genesis ? {genesis:executable.genesis,verificationCommands:executable.verificationCommands,ciWorkflows:executable.ciWorkflows,postMergeCommands:executable.postMergeCommands} : {}),
     githubOperations: shape.value.operations,
     verification: { commandId: command.id, argv: [...command.argv], cwd: command.cwd, kind: verificationKind },
-    handoff: {...bootstrapActivationHandoff(manifest,executable.genesis),recentDecisions:[...bootstrapActivationHandoff(manifest,executable.genesis).recentDecisions,...(executable.genesis && (plan.planArtifact?.content as Record<string,unknown>)["originatingContract"] ? [JSON.stringify({originatingContract:(plan.planArtifact!.content as Record<string,unknown>)["originatingContract"]})] : [])]},
+    ...(decisions.length > 0 ? {authenticatedCeoDecisions:decisions} : {}),
+    handoff,
   });
 };
 
@@ -465,7 +488,7 @@ export const executablePlanOf = (outputs: PlannedBootstrapOutputs, planDigest: s
   verificationCommandId: outputs.verification.commandId,
   verificationKind: outputs.verification.kind,
   githubOperations: outputs.githubOperations,
-  ...(outputs.genesis ? {genesis:outputs.genesis,verificationCommands:outputs.verificationCommands,ciWorkflows:outputs.ciWorkflows} : {}),
+  ...(outputs.genesis ? {genesis:outputs.genesis,verificationCommands:outputs.verificationCommands,ciWorkflows:outputs.ciWorkflows,postMergeCommands:outputs.postMergeCommands} : {}),
 });
 
 /** A bootstrap run's current plan, reloaded from its PLAN artifact alone. */

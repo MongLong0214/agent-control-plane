@@ -4768,7 +4768,9 @@ export async function proveActionsCheckProvenance(
   }
   const suiteId = check.check_suite?.id;
   const runIdFromUrl = /\/actions\/runs\/(\d+)\/job\/\d+/.exec(check.details_url ?? "")?.[1];
-  if (!suiteId || !runIdFromUrl) {
+  const runId = Number(runIdFromUrl);
+  if (!Number.isSafeInteger(check.id) || check.id < 1 || !Number.isSafeInteger(suiteId) || !suiteId || suiteId < 1 ||
+      !Number.isSafeInteger(runId) || runId < 1) {
     return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "check does not identify an Actions job and suite", {
       checkRunId: check.id,
     });
@@ -4777,13 +4779,24 @@ export async function proveActionsCheckProvenance(
   if (!target.allowed) return target as Decision<{ workflowDigest: string }>;
   const { root, owner, repo } = target.value;
   try {
+    type RepositoryIdentity = { id?: number; full_name?: string };
     const [suite, run] = await Promise.all([
-      client.request<{ head_sha: string; app?: { slug?: string } | null }>("GET", `${root}/check-suites/${suiteId}`),
-      client.request<{ head_sha: string; path?: string; status?: string; conclusion?: string | null }>(
+      client.request<{ id?: number; repository?: RepositoryIdentity; head_sha: string; app?: { slug?: string } | null }>("GET", `${root}/check-suites/${suiteId}`),
+      client.request<{ id?: number; repository?: RepositoryIdentity; check_suite_id?: number; head_sha: string; path?: string; status?: string; conclusion?: string | null }>(
         "GET",
-        `${root}/actions/runs/${runIdFromUrl}`,
+        `${root}/actions/runs/${runId}`,
       ),
     ]);
+    // details_url is only an integrator-supplied lookup hint. Prove the returned GitHub identities
+    // and repository before accepting either successful or legitimately pending provenance.
+    const repositoryName = `${owner}/${repo}`.toLowerCase();
+    if (suite.id !== suiteId || run.id !== runId || run.check_suite_id !== suiteId ||
+        !Number.isSafeInteger(suite.repository?.id) || (suite.repository?.id ?? 0) < 1 ||
+        suite.repository?.id !== run.repository?.id ||
+        suite.repository?.full_name?.toLowerCase() !== repositoryName ||
+        run.repository?.full_name?.toLowerCase() !== repositoryName) {
+      return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "Actions suite/run identity or repository differs from the check", { checkRunId: check.id });
+    }
     if (
       suite.head_sha !== head ||
       suite.app?.slug !== "github-actions" ||
@@ -4796,7 +4809,7 @@ export async function proveActionsCheckProvenance(
       // the one difference a later read can clear; every other difference is a different producer.
       const runIncomplete =
         suite.head_sha === head && suite.app?.slug === "github-actions" && run.head_sha === head &&
-        run.path === workflow.path && run.status !== "completed";
+        run.path === workflow.path && ["queued", "in_progress", "waiting", "requested", "pending"].includes(run.status ?? "");
       return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "Actions suite or run differs from the required check", {
         checkRunId: check.id,
         suiteHead: suite.head_sha,
@@ -4837,19 +4850,24 @@ export type ApprovedWorkflowChecks =
  */
 export async function observeApprovedWorkflowChecks(
   client: GitHubClient,
-  input: { root: string; owner: string; repo: string; head: string; workflows: readonly ApprovedActionsWorkflow[] },
+  input: { root: string; owner: string; repo: string; head: string; workflows: readonly ApprovedActionsWorkflow[]; requiredChecks?: readonly string[] },
 ): Promise<ApprovedWorkflowChecks> {
   if (input.workflows.length === 0) {
     return { state: "refused", checkName: null, reasonCode: ReasonCode.VERIFICATION_GAP, message: "no approved workflow is required" };
   }
   let pending: string | null = null;
-  for (const workflow of input.workflows) {
+  const required = [...new Set([...input.workflows.map(workflow => workflow.checkName), ...(input.requiredChecks ?? [])])];
+  for (const checkName of required) {
+    // Post-merge commands are check names too. They must come from an approved workflow, even
+    // when that workflow declares another primary check name in the manifest.
+    const workflows = input.workflows.filter(workflow => workflow.checkName === checkName);
+    const approved = workflows.length > 0 ? workflows : input.workflows;
     const checks: CheckRun[] = [];
     for (let page = 1; ; page += 1) {
       if (page > 10) {
-        return { state: "refused", checkName: workflow.checkName, reasonCode: ReasonCode.PROBE_FAILED, message: "check-run enumeration exceeded its bound" };
+        return { state: "refused", checkName, reasonCode: ReasonCode.PROBE_FAILED, message: "check-run enumeration exceeded its bound" };
       }
-      const query = new URLSearchParams({ check_name: workflow.checkName, per_page: "100", page: String(page) });
+      const query = new URLSearchParams({ check_name: checkName, per_page: "100", page: String(page) });
       const listed = await client.request<{ check_runs?: CheckRun[] }>(
         "GET",
         `${input.root}/commits/${encodeURIComponent(input.head)}/check-runs?${query.toString()}`,
@@ -4858,39 +4876,49 @@ export async function observeApprovedWorkflowChecks(
       checks.push(...runs);
       if (runs.length < 100) break;
     }
-    const matching = checks.filter((check) => check.name === workflow.checkName);
-    if (matching.some((check) => check.status === "completed" && check.conclusion !== "success")) {
-      return { state: "refused", checkName: workflow.checkName, reasonCode: ReasonCode.VERIFICATION_GAP, message: "a required check failed at this head" };
+    const matching = checks.filter((check) => check.name === checkName);
+    if (matching.some(check => !["queued", "in_progress", "completed", "waiting", "requested", "pending"].includes(check.status))) {
+      return { state: "refused", checkName, reasonCode: ReasonCode.VERIFICATION_GAP, message: "a required check has an unknown status" };
     }
-    if (matching.length === 0 || matching.some((check) => check.status !== "completed")) {
-      pending ??= workflow.checkName;
+    if (matching.some((check) => check.status === "completed" && check.conclusion !== "success")) {
+      return { state: "refused", checkName, reasonCode: ReasonCode.VERIFICATION_GAP, message: "a required check failed at this head" };
+    }
+    if (matching.length === 0) {
+      pending ??= checkName;
       continue;
     }
     for (const check of matching) {
-      const proven = await proveActionsCheckProvenance(client, {
-        head: input.head,
-        check,
-        workflow,
-        root: () => allow(ReasonCode.OK, { root: input.root, owner: input.owner, repo: input.repo }),
-        workflowDigest: async (_target, path) => {
-          const encoded = path.split("/").map(encodeURIComponent).join("/");
-          const file = await client.request<{ type?: string; encoding?: string; content?: string }>(
-            "GET",
-            `${input.root}/contents/${encoded}?ref=${encodeURIComponent(input.head)}`,
-          );
-          if ((file.type !== undefined && file.type !== "file") || file.encoding !== "base64" || typeof file.content !== "string") {
-            return deny(ReasonCode.PROBE_FAILED, "GitHub did not return the exact workflow file", { path, head: input.head });
-          }
-          // Approved over the file's exact bytes, as the genesis bundle's SHA-256 is.
-          return allow(ReasonCode.OK, sha256(Buffer.from(file.content.replace(/\s/g, ""), "base64")));
-        },
-      });
-      if (proven.allowed) continue;
-      if (proven.evidence["runIncomplete"] === true) {
-        pending ??= workflow.checkName;
+      let proven: Decision<{workflowDigest:string}> = deny(ReasonCode.VERIFICATION_GAP, "check has no approved workflow provenance");
+      for (const approvedWorkflow of approved) {
+        proven = await proveActionsCheckProvenance(client, {
+          head: input.head,
+          check,
+          workflow: approvedWorkflow,
+          root: () => allow(ReasonCode.OK, { root: input.root, owner: input.owner, repo: input.repo }),
+          workflowDigest: async (_target, path) => {
+            const encoded = path.split("/").map(encodeURIComponent).join("/");
+            const file = await client.request<{ type?: string; encoding?: string; content?: string }>(
+              "GET",
+              `${input.root}/contents/${encoded}?ref=${encodeURIComponent(input.head)}`,
+            );
+            if ((file.type !== undefined && file.type !== "file") || file.encoding !== "base64" || typeof file.content !== "string") {
+              return deny(ReasonCode.PROBE_FAILED, "GitHub did not return the exact workflow file", { path, head: input.head });
+            }
+            // Approved over the file's exact bytes, as the genesis bundle's SHA-256 is.
+            return allow(ReasonCode.OK, sha256(Buffer.from(file.content.replace(/\s/g, ""), "base64")));
+          },
+        });
+        if (proven.allowed || proven.evidence["runIncomplete"] === true) break;
+      }
+      if (proven.allowed) {
+        if (check.status !== "completed") pending ??= checkName;
         continue;
       }
-      return { state: "refused", checkName: workflow.checkName, reasonCode: proven.reasonCode, message: proven.message };
+      if (proven.evidence["runIncomplete"] === true) {
+        pending ??= checkName;
+        continue;
+      }
+      return { state: "refused", checkName, reasonCode: proven.reasonCode, message: proven.message };
     }
   }
   return pending === null ? { state: "success" } : { state: "pending", checkName: pending };

@@ -75,6 +75,8 @@ export type CiProvenance = "approved" | "other-workflow" | "none";
 export class GenesisGitHub extends FakeGitHub {
   resources: Record<string, unknown> | null = null;
   ciReady = true;
+  mergeCiState: "success" | "pending" | "failure" | "cancelled" | "skipped" | "missing" | "wrong-sha" | "wrong-workflow" | "unknown" | "unrelated-run" | "missing-run-suite" = "success";
+  mergeCiCheckName: string | null = null;
   ciProvenance: CiProvenance = "approved";
   ciHeads: string[] = [];
   pull: GenesisPull | null = null;
@@ -174,6 +176,29 @@ export class GenesisGitHub extends FakeGitHub {
     return checks.state === "success";
   }
 
+  async observeGenesisPostMergeCi(target: Target, head: string, workflows: readonly ApprovedActionsWorkflow[], requiredChecks: readonly string[]) {
+    this.ciHeads.push(head);
+    if (this.mergeCiState === "unknown") throw new Error("CI observation unavailable");
+    const client = this.rest(target);
+    return observeApprovedWorkflowChecks({request: async <T>(method: Parameters<GitHubClient["request"]>[0], path: string, body?: unknown): Promise<T> => {
+      const answer = await client.request<T>(method, path, body);
+      if (path.includes("/check-runs?")) {
+        const result = answer as {check_runs: Array<Record<string, unknown>>};
+        if (this.mergeCiState === "missing") result.check_runs = [];
+        for (const check of result.check_runs) {
+          if (this.mergeCiCheckName !== null && check["name"] !== this.mergeCiCheckName) continue;
+          if (this.mergeCiState === "pending") check["status"] = "in_progress";
+          if (["failure", "cancelled", "skipped"].includes(this.mergeCiState)) check["conclusion"] = this.mergeCiState;
+          if (this.mergeCiState === "wrong-sha") check["head_sha"] = this.pull!.headSha;
+        }
+      }
+      if (path.includes("/actions/runs/") && this.mergeCiState === "unrelated-run") (answer as {check_suite_id:number}).check_suite_id = 19_000;
+      if (path.includes("/actions/runs/") && this.mergeCiState === "missing-run-suite") delete (answer as {check_suite_id?:number}).check_suite_id;
+      if (path.includes("/actions/runs/") && this.mergeCiState === "wrong-workflow") (answer as {path:string}).path = ".github/workflows/unapproved.yml";
+      return answer;
+    }}, {root: `/repos/${target.owner}/${target.name}`, owner: target.owner, repo: target.name, head, workflows, requiredChecks});
+  }
+
   async observeGenesisPull(_target: Target, marker: string) {
     if (this.pull) expect(marker).toBe(this.marker);
     return this.pull && { ...this.pull };
@@ -236,10 +261,10 @@ export class GenesisGitHub extends FakeGitHub {
             ...(this.ciProvenance === "none" ? {} : { check_suite: { id }, details_url: `https://github.com/${target.owner}/${target.name}/actions/runs/${id}/job/${id}` }),
           }] };
         } else if (/^\/check-suites\/\d+$/.test(rest)) {
-          answer = { head_sha: this.suites.get(Number(rest.split("/")[2]))!.head, app: { slug: "github-actions" } };
+          answer = { id:Number(rest.split("/")[2]), repository:{id:42,full_name:`${target.owner}/${target.name}`}, head_sha: this.suites.get(Number(rest.split("/")[2]))!.head, app: { slug: "github-actions" } };
         } else if (/^\/actions\/runs\/\d+$/.test(rest)) {
           const run = this.suites.get(Number(rest.split("/")[3]))!;
-          answer = { head_sha: run.head, path: run.path, status: "completed", conclusion: "success" };
+          answer = { id:Number(rest.split("/")[3]), repository:{id:42,full_name:`${target.owner}/${target.name}`}, check_suite_id:Number(rest.split("/")[3]), head_sha: run.head, path: run.path, status: "completed", conclusion: "success" };
         } else if (rest.startsWith("/contents/")) {
           const [file, query] = rest.slice("/contents/".length).split("?");
           const head = new URLSearchParams(query).get("ref")!;

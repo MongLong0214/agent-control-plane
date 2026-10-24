@@ -1,7 +1,12 @@
+import { collectBootstrapCeoDecisions, type AuthenticatedCeoDecision } from "../../src/bootstrap/bootstrap-ceo-decisions.ts";
+import { currentBootstrapPlan } from "../../src/bootstrap/bootstrap-plan.ts";
+import { digestOf } from "../../src/core/digest.ts";
+import { bootstrapCoverageKeys, submitBootstrapPlan } from "../helpers/bootstrap-plan.ts";
+import { genesisPlanFixture } from "../helpers/genesis-github.ts";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ExecutionMode, Role, RunKind, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import { IN_BAND_REWAKE_MS } from "../../src/outbox/outbox.ts";
 import {
@@ -10,7 +15,7 @@ import {
   withBootstrapRuntime,
 } from "../helpers/bootstrap-cto-fixture.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { makeHarness, registerFixtureProject, reviewerRevise } from "../helpers/harness.ts";
 import { callMcpToolOverSocket } from "../helpers/mcp-socket.ts";
 
 afterAll(cleanupTempDirs);
@@ -432,6 +437,98 @@ describe("ACP-C1B-02/03 guard: what continuity held is distinguishable from what
       await escalate(f, runId, ownerSessionId, true);
       expect(f.harness.cp.runs.require(runId)).toMatchObject({ state: RunState.BLOCKED, continuityHoldRoleKey: null });
       expect(roleKeyFor(Role.BOOTSTRAP_CTO, { runId })).toBe(roleKey);
+    });
+  });
+});
+
+
+describe("ACP1201-R1-02: compatibility CEO resolutions stay in the frozen bootstrap package", () => {
+  it("authenticates compatibility replies by the CEO binding at recording time, never the latest binding or reply", async () => {
+    await withBootstrapRuntime(async f => {
+      const {runId,ownerSessionId,roleKey}=await dispatchedAndAcked(f);
+      await escalate(f,runId,ownerSessionId,true);
+      const cp=f.harness.cp;
+      const resolution="Recorded by the original CEO; later replies cannot supply this identity.";
+      const first=cp.ceo.resolveEscalation(runId,resolution,f.ceoSessionId);
+      if (!first.allowed) throw new Error(first.message);
+      const originalBinding=cp.bindings.active(roleKeyFor(Role.CEO))!;
+      const successor=cp.sessions.create({provider:"scripted",model:"successor-ceo"});
+      cp.sessions.transition(successor.sessionId,SessionLifecycle.READY,"fixture successor");
+      const owner=cp.bindings.active(roleKey)!;
+      const fake=cp.outbox.enqueue({idempotencyKey:`future-ceo:${runId}`,roleKey,bindingGeneration:owner.bindingGeneration,targetSessionId:ownerSessionId,
+        runId,kind:MessageKind.ESCALATION_REPLY,payload:{runId,resolution}});
+      if (!fake.allowed) throw new Error(fake.message);
+      const evidence={escalation:true,escalationId:null,messageId:fake.value.messageId,resolutionDigest:digestOf(resolution),resolutionLength:resolution.length};
+      // This session will become CEO, but held no CEO authority when this claim was recorded.
+      cp.audit.record({kind:"CEO_DECISION",runId,sessionId:successor.sessionId,evidence});
+      const switched=cp.bindings.switchTo({role:Role.CEO,sessionId:successor.sessionId,reason:"fixture CEO successor",conversation:"REPLACED"});
+      expect(switched.allowed).toBe(true);
+      cp.audit.record({kind:"CEO_DECISION",runId,sessionId:f.ceoSessionId,evidence});
+      // A missing message must never be reconstructed from the latest reply or identical text.
+      cp.audit.record({kind:"CEO_DECISION",runId,sessionId:successor.sessionId,evidence:{...evidence,messageId:"msg_missing_pair"}});
+      const records=collectBootstrapCeoDecisions(cp.db,runId);
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({resolution,source:{messageId:first.value.messageId,sessionId:f.ceoSessionId,
+        bindingGeneration:originalBinding.bindingGeneration,assignmentId:originalBinding.assignmentId}});
+    });
+  });
+  it.each([true,false])("freezes an authenticated compatibility reply (blocking=%s), rejecting forged records and digest drift", async blocksCriticalPath => {
+    await withBootstrapRuntime(async f => {
+      const {runId,ownerSessionId,roleKey} = await dispatchedAndAcked(f);
+      await escalate(f,runId,ownerSessionId,blocksCriticalPath);
+      const cp=f.harness.cp;const owner=cp.bindings.active(roleKey)!;
+      const forged="untrusted compatibility reply";
+      const fake=cp.outbox.enqueue({idempotencyKey:`forged-compat:${runId}`,roleKey,bindingGeneration:owner.bindingGeneration,targetSessionId:ownerSessionId,
+        runId,kind:MessageKind.ESCALATION_REPLY,payload:{runId,resolution:forged}});
+      if (!fake.allowed) throw new Error(fake.message);
+      const evidence={escalation:true,escalationId:null,messageId:fake.value.messageId,resolutionDigest:digestOf(forged),resolutionLength:forged.length};
+      cp.audit.record({kind:"CEO_DECISION",runId,sessionId:ownerSessionId,evidence});
+      cp.audit.record({kind:"CEO_DECISION",runId,sessionId:f.ceoSessionId,evidence:{...evidence,messageId:"msg_unrelated"}});
+      cp.audit.record({kind:"CEO_DECISION",runId,sessionId:f.ceoSessionId,evidence:{...evidence,resolutionDigest:digestOf("different resolution")}});
+      const other=cp.runs.create({kind:RunKind.PROJECT_BOOTSTRAP,executionMode:ExecutionMode.STANDARD,
+        contract:{goal:"other run",why:"isolation",scope:[],nonGoals:[],acceptance:["isolated"],priority:"NORMAL",humanGate:[],references:[]}});
+      if (!other.allowed) throw new Error(other.message);
+      const foreign=cp.outbox.enqueue({idempotencyKey:`foreign-compat:${runId}`,roleKey,bindingGeneration:owner.bindingGeneration,targetSessionId:ownerSessionId,
+        runId:other.value.runId,kind:MessageKind.ESCALATION_REPLY,payload:{runId:other.value.runId,resolution:forged}});
+      if (!foreign.allowed) throw new Error(foreign.message);
+      cp.audit.record({kind:"CEO_DECISION",runId,sessionId:f.ceoSessionId,evidence:{...evidence,messageId:foreign.value.messageId}});
+      const resolution="Internal CEO acceptance judgment ACP1201 compatibility; follow-on issue acceptance remains required.";
+      const answer=cp.ceo.resolveEscalation(runId,resolution,f.ceoSessionId);
+      expect(answer.allowed).toBe(true);if (!answer.allowed) return;
+      expect(answer.value.escalationId).toBeNull();
+      expect(cp.ceo.openEscalationOf(runId)).toBeNull();
+      const fixture=genesisPlanFixture();
+      await submitBootstrapPlan(f.harness,runId,{...fixture.artifact.content,authenticatedCeoDecisions:[{resolution:"producer-injected authority"}]});
+      const plan=cp.artifacts.latest<{authenticatedCeoDecisions:AuthenticatedCeoDecision[]}>(runId,"PLAN")!;
+      const records=plan.content.authenticatedCeoDecisions;
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({runId,escalationId:null,resolution,resolutionDigest:digestOf(resolution),source:{sessionId:f.ceoSessionId,messageId:answer.value.messageId}});
+      const {digest,...record}=records[0]!;expect(digest).toBe(digestOf(record));
+      expect(collectBootstrapCeoDecisions(cp.db,other.value.runId)).toEqual([]);
+      const current=currentBootstrapPlan(runId,plan);if (!current.allowed) throw new Error(current.message);
+      const handoff=current.value.outputs.handoff;
+      expect(handoff.recentDecisions.map(x=>JSON.parse(x) as {authenticatedCeoDecision?:unknown}).filter(x=>x.authenticatedCeoDecision).map(x=>x.authenticatedCeoDecision)).toEqual(records);
+      expect(handoff.recommendedNextAction).toContain("STANDARD_WORK");expect(handoff.queuedWork).toEqual([]);
+      for (const issue of fixture.genesis.issues) expect(handoff.recommendedNextAction).toContain(issue.body);
+      const publicArtifacts=JSON.stringify({files:current.value.outputs.files,issues:current.value.outputs.genesis!.issues,commitMessage:current.value.outputs.genesis!.commitMessage});
+      expect(publicArtifacts).not.toContain(resolution);expect(publicArtifacts).not.toContain("producer-injected authority");
+      const corrupt={...plan,content:{...plan.content,authenticatedCeoDecisions:[{...records[0]!,resolution:"changed after freezing"}]}};
+      expect(currentBootstrapPlan(runId,corrupt)).toMatchObject({allowed:false,evidence:{refusal:"CEO_DECISION_RECORD_INVALID"}});
+      const corruptDigest={...plan,content:{...plan.content,authenticatedCeoDecisions:[{...records[0]!,digest:digestOf("different frozen record")}]}};
+      expect(currentBootstrapPlan(runId,corruptDigest)).toMatchObject({allowed:false,evidence:{refusal:"CEO_DECISION_RECORD_INVALID"}});
+      await cp.continuity.evaluate("compatibility decision review");
+      f.harness.scripted.script({match:/Bootstrap plan review/,text:reviewerRevise(bootstrapCoverageKeys(f.harness,runId),"Original test evidence is still owed")});
+      const run=cp.runs.require(runId);
+      const reviewed=await cp.pipeline.submitResult({runId,ownerSessionId:run.ownerSessionId!,ownerBindingGeneration:run.ownerBindingGeneration!,resultSummary:"planned outputs",recommendation:"review"});
+      expect(reviewed,JSON.stringify(reviewed)).toMatchObject({allowed:true,value:{stage:"REVISION_REQUIRED"}});
+      const packet=cp.artifacts.latest<{verdict:string;inputManifest:{verificationEvidence:boolean;withheld:string[]}}>(runId,"BLIND_REVIEW")!;
+      expect(packet.content.verdict).toBe("REVISE");expect(packet.content.inputManifest.verificationEvidence).toBe(false);
+      expect(packet.content.inputManifest.withheld).toEqual(["worker reasoning","CTO reasoning","chat history","producer self-assessment"]);
+      const prompt=f.harness.scripted.invocations.find(i=>i.prompt.startsWith("# Bootstrap plan review"))!.prompt;
+      const section=prompt.split("## Authenticated CEO decisions (ACP records)")[1]!.split("```json\n")[1]!.split("\n```")[0]!;
+      expect(JSON.parse(section)).toEqual(records);
+      expect(prompt).not.toContain(forged);expect(prompt).not.toContain("producer-injected authority");
+      expect(currentBootstrapPlan(runId,cp.artifacts.latest(runId,"PLAN"))).toMatchObject({allowed:true,value:{outputs:{handoff}}});
     });
   });
 });

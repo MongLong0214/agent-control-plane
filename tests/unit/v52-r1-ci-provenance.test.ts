@@ -39,9 +39,9 @@ function scripted(provenance: CiProvenance) {
       else if (p.endsWith("/pulls/1")) answer = { state: merged ? "closed" : "open", merged, merge_commit_sha: merged ? merge : null, head: { ref: "genesis", sha: head, repo: { full_name: "acme/fixture" } }, base: { ref: "main", sha: base } };
       else if (p.endsWith("/protection")) answer = { allow_force_pushes: { enabled: false }, allow_deletions: { enabled: false }, enforce_admins: { enabled: true }, required_status_checks: { strict: true, contexts: ["test"] } };
       else if (p.includes("/check-runs")) answer = { check_runs: [check] };
-      else if (p.includes("/check-suites/9")) answer = { head_sha: head, app: { slug: "github-actions" } };
+      else if (p.includes("/check-suites/9")) answer = { id: 9, repository: {id:42,full_name:"acme/fixture"}, head_sha: head, app: { slug: "github-actions" } };
       // The other workflow's run reports the same check name, at the same head, successfully.
-      else if (p.includes("/actions/runs/11")) answer = { head_sha: head, path: provenance === "other-workflow" ? ".github/workflows/unapproved.yml" : ".github/workflows/ci.yml", status: "completed", conclusion: "success" };
+      else if (p.includes("/actions/runs/11")) answer = { id: 11, repository: {id:42,full_name:"acme/fixture"}, check_suite_id: 9, head_sha: head, path: provenance === "other-workflow" ? ".github/workflows/unapproved.yml" : ".github/workflows/ci.yml", status: "completed", conclusion: "success" };
       else if (p.includes("/contents/")) answer = { type: "file", encoding: "base64", content: Buffer.from(workflowBytes).toString("base64") };
       else if (p.includes("/git/commits/")) answer = { parents: [{ sha: base }, { sha: head }] };
       else if (p.endsWith("/git/ref/heads/main")) answer = { object: { sha: merged ? merge : base } };
