@@ -1024,6 +1024,16 @@ const C65E73B2_DISPATCH_PROMPT_TAIL: readonly string[] = [
 const c65e73b2DispatchPrompt = (firstLine: string): string => [firstLine, ...C65E73B2_DISPATCH_PROMPT_TAIL].join("\n");
 const withoutAdministrativeTeaching = (prompt:string): string => prompt.split("\n").filter(line => !line.startsWith("For an administrative CONTRACT_CHANGE")).join("\n").replace("The resolution never bypasses the blind review", "The resolution never bypasses T3, the blind review");
 
+/** ACP1195 input delivery is a separate amendment; all other dispatch/revision bytes stay frozen. */
+const BOOTSTRAP_PLAN_INPUT_AMENDMENT = "if it carries bootstrapPlanDigest, read mcp__acp-cto__bootstrap_plan_get and submit that digest with runId and idempotencyKey, without plan or tasks; otherwise ";
+const withoutBootstrapPlanInputAmendment = (prompt: string): string => {
+  const lines = prompt.split("\n").filter(line => line.startsWith("A RUN_DISPATCH ") || line.startsWith("A REVISION_REQUEST "));
+  expect(lines).toHaveLength(2);
+  for (const line of lines) expect(line.split(BOOTSTRAP_PLAN_INPUT_AMENDMENT)).toHaveLength(2);
+  expect(prompt.split(BOOTSTRAP_PLAN_INPUT_AMENDMENT)).toHaveLength(3);
+  return prompt.replaceAll(BOOTSTRAP_PLAN_INPUT_AMENDMENT, "");
+};
+
 /** Re-enters the owner as a continuation's wake would: the turn carries that wake's line, and the stand-in remembers no id. */
 const reenter = async (f: BootstrapRuntimeFixture, run: { runId: string; roleKey: string; sessionId: string; taskId: string }, id: string) => {
   const turns = f.finishedTurns(run.sessionId);
@@ -1137,7 +1147,8 @@ describe("R2-01, CEO 07b5b0df — bootstrap and CONTRACT_CHANGE keep c65e73b2 di
         ["run_ack", true],
       ]);
       // The CONTRACT_CHANGE run's RUN_DISPATCH turn: c65e73b2's prompt, byte for byte.
-      expect(withoutAdministrativeTeaching(owner.prompts.at(-1)!)).toBe(c65e73b2DispatchPrompt("You are the PRIMARY_CTO in the agent control plane, at binding generation 1."));
+      expect((await f.cto(sessionId, "contract_get", { runId }))["value"]).not.toHaveProperty("bootstrapPlanDigest");
+      expect(withoutBootstrapPlanInputAmendment(withoutAdministrativeTeaching(owner.prompts.at(-1)!))).toBe(c65e73b2DispatchPrompt("You are the PRIMARY_CTO in the agent control plane, at binding generation 1."));
       expect(real.provision).not.toHaveBeenCalled();
       expect(cp.tasks.executions(runId)).toEqual([]);
       expect(cp.tasks.list(runId).map((task) => task.state)).toEqual([TaskState.READY]);
@@ -1146,7 +1157,7 @@ describe("R2-01, CEO 07b5b0df — bootstrap and CONTRACT_CHANGE keep c65e73b2 di
       // The project's bootstrap run's BOOTSTRAP_CTO dispatch turn, on the same double: c65e73b2's too.
       const bootstrapPrompt = f.claude.turns.find((turn) =>
         turn.relay !== null && turn.prompt.startsWith(`You are the BOOTSTRAP_CTO of run ${bootstrapRunId} `))!.prompt;
-      expect(withoutAdministrativeTeaching(bootstrapPrompt!)).toBe(c65e73b2DispatchPrompt(`You are the BOOTSTRAP_CTO of run ${bootstrapRunId} in the agent control plane, at binding generation 1.`));
+      expect(withoutBootstrapPlanInputAmendment(withoutAdministrativeTeaching(bootstrapPrompt!))).toBe(c65e73b2DispatchPrompt(`You are the BOOTSTRAP_CTO of run ${bootstrapRunId} in the agent control plane, at binding generation 1.`));
     });
   });
 });

@@ -1,5 +1,5 @@
 import type { z } from "zod";
-import { sha256 } from "../core/digest.ts";
+import { isDigest, sha256 } from "../core/digest.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { artifactDigestMatches, type ArtifactStore, type StoredArtifact } from "../db/artifacts.ts";
@@ -52,6 +52,22 @@ const hasAttachmentReceipt = (source: Source, runId: string): boolean =>
   source.audit.forRun(runId).some(e => e.kind === "BOOTSTRAP_PLAN_ATTACHED");
 const bindingOf = (input: PlanBinding): PlanBinding => ({ runId: input.runId, contractDigest: input.contractDigest,
   bootstrapOperationId: input.bootstrapOperationId, projectId: input.projectId, repositoryIdentity: input.repositoryIdentity });
+
+/** Validate inside authenticated MCP authority checks, rather than emitting SDK schema errors. */
+export const validateBootstrapPlanDigests = (input: Record<string, string | undefined>): Decision<void> => {
+  const values = Object.values(input).filter(value => value !== undefined);
+  if (values.some(value => /[\x00-\x1f\x7f]/.test(value))) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "bootstrap PLAN binding identifiers must not contain control characters", {
+      refusal: "BOOTSTRAP_PLAN_BINDING_INVALID",
+    });
+  }
+  if (values.some(value => !isDigest(value))) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "bootstrap PLAN digests must use sha256 followed by 64 lowercase hexadecimal digits", {
+      refusal: "BOOTSTRAP_PLAN_DIGEST_INVALID",
+    });
+  }
+  return allow(ReasonCode.OK, undefined);
+};
 const sameBinding = (a: PlanBinding, b: PlanBinding) =>
   Object.entries(bindingOf(a)).every(([key, value]) => b[key as keyof PlanBinding] === value);
 
@@ -156,6 +172,9 @@ export const attachBootstrapPlan = (
       refusal: "BOOTSTRAP_PLAN_BINDING_INVALID",
     });
   }
+  const digests = validateBootstrapPlanDigests({ contractDigest: input.contractDigest,
+    expectedSha256: input.expectedSha256, replacesSha256: input.replacesSha256 });
+  if (!digests.allowed) return digests;
   const admitted = assertBootstrapPlanAttachable(source, input);
   if (!admitted.allowed) return admitted;
   const run = admitted.value;

@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import { attachBootstrapPlan, bootstrapPlanAttachAccess, BOOTSTRAP_PLAN_MAX_BYTES, type BootstrapPlanAttachInput } from "../bootstrap/bootstrap-plan-artifact.ts";
+import { attachBootstrapPlan, bootstrapPlanAttachAccess, validateBootstrapPlanDigests, BOOTSTRAP_PLAN_MAX_BYTES, type BootstrapPlanAttachInput } from "../bootstrap/bootstrap-plan-artifact.ts";
 import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -355,6 +355,9 @@ const createHermesServerFromPort = (
         const current = authenticateMcpPeer(authenticate);
         const authority = current.allowed ? port.peerAuthority(peer.value) : current;
         if (!authority.allowed || toolName !== "bootstrap_plan_attach") return authority;
+        const digests = validateBootstrapPlanDigests({ contractDigest: args.contractDigest as string,
+          expectedSha256: args.expectedSha256 as string, replacesSha256: args.replacesSha256 as string | undefined });
+        if (!digests.allowed) return digests;
         const input = port.bootstrapPlanAttachAccess(args as unknown as BootstrapPlanAttachInput);
         return input.allowed ? authority : input;
       },
@@ -381,10 +384,11 @@ const createHermesServerFromPort = (
     "bootstrap_plan_attach",
     {
       description: `Deliver final exact UTF-8 bootstrap input JSON (runId, plan, tasks), at most ${BOOTSTRAP_PLAN_MAX_BYTES} bytes. Input delivery grants no execution approval. Explicit replacesSha256 invalidates previous evidence. Requires authenticated Hermes owner provenance.`,
-      inputSchema: { ...mutation, runId: z.string(), planBody: z.string().max(BOOTSTRAP_PLAN_MAX_BYTES), expectedSha256: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-        contractDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/), bootstrapOperationId: z.string().min(1),
+      // Digest syntax is still strict, but checked after authentication for a structured refusal.
+      inputSchema: { ...mutation, runId: z.string(), planBody: z.string().max(BOOTSTRAP_PLAN_MAX_BYTES), expectedSha256: z.string(),
+        contractDigest: z.string(), bootstrapOperationId: z.string().min(1),
         projectId: z.string().min(1), repositoryIdentity: z.string().min(1),
-        replacesSha256: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional() },
+        replacesSha256: z.string().optional() },
     },
     async (args, extra) => writeAsOwner("bootstrap_plan_attach", args, extra,
       "attaching a PLAN requires authenticated Hermes owner provenance",

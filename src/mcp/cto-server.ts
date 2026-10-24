@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { submittedPlanSchema, submittedTasksSchema } from "../bootstrap/plan-input-schema.ts";
-import { readBootstrapPlanAttachment, resolveBootstrapPlanInput, bootstrapInputMutationAuthority } from "../bootstrap/bootstrap-plan-artifact.ts";
+import { readBootstrapPlanAttachment, resolveBootstrapPlanInput, bootstrapInputMutationAuthority, validateBootstrapPlanDigests } from "../bootstrap/bootstrap-plan-artifact.ts";
 import type { BootstrapActivation, BootstrapHandoffReceipt } from "../bootstrap/activation.ts";
 import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { bootstrapPlanGuide, isProjectlessBootstrap, planForSubmission } from "../bootstrap/bootstrap-plan.ts";
@@ -441,6 +441,10 @@ const createCtoServerFromPort = (
       const fenced = owner(peer, args.runId);
       if (fenced.allowed) {
         current = fenced.value;
+        if (toolName === "plan_submit") {
+          const digests = validateBootstrapPlanDigests({ bootstrapPlanDigest: args.bootstrapPlanDigest as string | undefined });
+          if (!digests.allowed) return digests;
+        }
         if (toolName === "plan_submit" || toolName === "result_submit") {
           const input = port.bootstrapInputMutationAuthority(args.runId, toolName === "result_submit");
           return input.allowed ? allow(ReasonCode.OK, { ...fenced.value, ...input.value }) : input;
@@ -555,7 +559,7 @@ const createCtoServerFromPort = (
       description: "Submit the lean plan and dynamic task graph.",
       inputSchema: {
         ...mutation, ...runIdentity,
-        bootstrapPlanDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+        bootstrapPlanDigest: z.string().optional(),
         plan: submittedPlanSchema.optional(),
         tasks: submittedTasksSchema.optional(),
       },

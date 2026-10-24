@@ -105,6 +105,13 @@ const DOOR_R1_TEST = "tests/unit/ceo-escalation-resolve-door-r1.test.ts";
 
 const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witnesses?: RollbackWitness[] }> = [
   {
+    label: "attachBootstrapPlan",
+    file: "bootstrap/bootstrap-plan-artifact.ts",
+    anchor: "): Decision<{ digest: string }> => source.db.txDecision(() => {",
+    witnesses: [{ file: "tests/unit/bootstrap-plan-artifact.test.ts",
+      title: "rolls back attachment artifacts, audit and wake when enqueue or audit refuses" }],
+  },
+  {
     // The opener is concise, so the anchor is the whole line: reverting it to `tx` leaves a body
     // that still writes an audit row and still refuses after it, which is the trap shape.
     label: "CtoBindingDelegation.authorize",

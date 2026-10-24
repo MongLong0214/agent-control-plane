@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { allow } from "../../src/core/errors.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, RunKind, RunState } from "../../src/domain/types.ts";
@@ -123,6 +123,44 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
       expect(await f.attach({ ...args, idempotencyKey: "body-controls-retry" })).toMatchObject({ ok: true, value: { digest } });
       expect(f.h.cp.artifacts.list(f.run.runId)).toEqual(artifacts);
     } finally { await f.close(); }
+  });
+
+  it.each(["\r", "\r\n", "malformed"])("returns a fixed MCP refusal for an invalid submit digest (%j) without writes", async (value) => {
+    const f = await fixture();
+    try {
+      expect(await f.attach()).toMatchObject({ ok: true });
+      const state = () => ({ artifacts: f.h.cp.artifacts.list(f.run.runId), audit: f.h.cp.audit.forRun(f.run.runId),
+        outbox: f.h.cp.outbox.listByRun(f.run.runId), run: f.h.cp.runs.require(f.run.runId) });
+      const before = state();
+      expect(await f.cto("plan_submit", { idempotencyKey: "invalid-submit-digest", runId: f.run.runId,
+        bootstrapPlanDigest: value === "malformed" ? "not-a-digest" : `${f.digest}${value}id` }))
+        .toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT", evidence: {
+          refusal: value === "malformed" ? "BOOTSTRAP_PLAN_DIGEST_INVALID" : "BOOTSTRAP_PLAN_BINDING_INVALID",
+        } });
+      expect(state()).toEqual(before);
+    } finally { await f.close(); }
+  });
+
+  it("rolls back attachment artifacts, audit and wake when enqueue or audit refuses", async () => {
+    for (const stage of ["enqueue", "audit"]) {
+      const f = await fixture();
+      try {
+        const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
+        f.h.cp.outbox.attachInBandWake(wake);
+        const state = () => ({ artifacts: f.h.cp.artifacts.list(f.run.runId), audit: f.h.cp.audit.forRun(f.run.runId),
+          outbox: f.h.cp.outbox.listByRun(f.run.runId), run: f.h.cp.runs.require(f.run.runId) });
+        const before = state();
+        if (stage === "enqueue") vi.spyOn(f.h.cp.outbox, "enqueue").mockReturnValue(deny(ReasonCode.CONFLICT, "test refused enqueue"));
+        else {
+          const record = f.h.cp.audit.record.bind(f.h.cp.audit);
+          vi.spyOn(f.h.cp.audit, "record").mockImplementation(input => input.kind === "BOOTSTRAP_PLAN_ATTACHED"
+            ? deny(ReasonCode.CONFLICT, "test refused audit") : record(input));
+        }
+        expect(await f.attach()).toMatchObject({ ok: false, reasonCode: "CONFLICT" });
+        expect(state()).toEqual(before);
+        expect(wake).not.toHaveBeenCalled();
+      } finally { await f.close(); }
+    }
   });
 
   it("refuses the wrong exact-byte digest without writing or echoing the body", async () => {
@@ -443,14 +481,14 @@ describe("CEO-approved bootstrap PLAN input over real Hermes and CTO MCP servers
           plan: f.h.cp.artifacts.latest(f.run.runId, "PLAN"), run: f.h.cp.runs.require(f.run.runId),
           candidate: f.h.cp.runs.currentCandidate(f.run.runId), application: f.h.cp.bootstrapApplications.get(f.run.runId),
           audit: f.h.cp.audit.forRun(f.run.runId), outbox: f.h.cp.outbox.listByRun(f.run.runId) });
-        // Also test the sealed port: contractDigest already has a strict MCP digest schema,
-        // while every binding field must receive the same domain-level refusal before writes.
+        // Both the sealed port and MCP caller must receive the fixed refusal before writes.
         const rejectWithoutChanges = async (rejected: typeof args & { replacesSha256?: string }) => {
           const before = state();
           expect(createHermesMcpPort(f.h.cp).attachBootstrapPlan({ actor: f.ceo, sessionId: f.ceo,
             sessionIncarnation: f.h.cp.sessions.require(f.ceo).incarnation }, { principal: "owner", peerGrant: null }, rejected as Parameters<ReturnType<typeof createHermesMcpPort>["attachBootstrapPlan"]>[2]))
             .toMatchObject({ allowed: false, reasonCode: "INVALID_ARGUMENT", evidence: { refusal: "BOOTSTRAP_PLAN_BINDING_INVALID" } });
-          expect(await f.attach(rejected)).toMatchObject({ ok: false });
+          expect(await f.attach(rejected)).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT",
+            evidence: { refusal: "BOOTSTRAP_PLAN_BINDING_INVALID" } });
           expect(state()).toEqual(before);
           expect(wake).not.toHaveBeenCalled();
         };

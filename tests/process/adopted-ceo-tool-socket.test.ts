@@ -315,6 +315,40 @@ describe("the adopted CEO tool socket, through the relay", () => {
     expect(await settles(r.exit)).toBe(ATTACH_EXIT.OK);
   });
 
+  it.each(["contractDigest", "expectedSha256", "replacesSha256"].flatMap(field =>
+    ["\r", "\r\n", "malformed"].map(value => ({ field, value }))))(
+    "refuses invalid $field ($value) through the authenticated adopted CEO socket without writes", async ({ field, value }) => {
+      const { fixture, tools } = await started(true);
+      const { h } = fixture;
+      const r = await initialized(tools.socketPath);
+      try {
+        const create = runCreate("invalid-plan-create", OWNER_TURN);
+        create.arguments = { ...(create.arguments as Record<string, unknown>), kind: "PROJECT_BOOTSTRAP", executionMode: "STANDARD" };
+        const created = await r.request("tools/call", create);
+        expect(created.result?.structuredContent).toMatchObject({ ok: true });
+        const runId = (created.result!.structuredContent!.value as { runId: string }).runId;
+        const run = h.cp.runs.require(runId);
+        const plan: Record<string, unknown> = { ...genesisPlanFixture().artifact.content, requestDigest: run.contractDigest };
+        const manifest = plan["projectManifest"] as { projectId: string; repositories: Array<{ remote: string }> };
+        const body = JSON.stringify({ runId, plan, tasks: [{ key: "create", title: "Create repository", category: "implementation" }] });
+        const wake = vi.fn(async () => allow(ReasonCode.OK, undefined));
+        h.cp.outbox.attachInBandWake(wake);
+        const state = () => ({ artifacts: h.cp.artifacts.list(runId), audit: h.cp.audit.forRun(runId), outbox: h.cp.outbox.listByRun(runId) });
+        const before = state();
+        const result = await r.request("tools/call", { name: "bootstrap_plan_attach", _meta: OWNER_TURN, arguments: {
+          idempotencyKey: "invalid-plan-attach", runId, planBody: body, expectedSha256: sha256(body), contractDigest: run.contractDigest,
+          bootstrapOperationId: plan["bootstrapOperationId"], projectId: manifest.projectId, repositoryIdentity: manifest.repositories[0]!.remote,
+          [field]: value === "malformed" ? "not-a-digest" : `${run.contractDigest}${value}id`,
+        } });
+        expect(result.error).toBeUndefined();
+        expect(result.result?.structuredContent).toMatchObject({ ok: false, reasonCode: "INVALID_ARGUMENT", evidence: {
+          refusal: value === "malformed" ? "BOOTSTRAP_PLAN_DIGEST_INVALID" : "BOOTSTRAP_PLAN_BINDING_INVALID",
+        } });
+        expect(state()).toEqual(before);
+        expect(wake).not.toHaveBeenCalled();
+      } finally { r.stdin.end(); await settles(r.exit); }
+    });
+
   it("attaches a bootstrap PLAN through the adopted CEO socket and the owner reads and submits its exact digest", async () => {
     const { fixture, tools } = await started(true);
     const { h } = fixture;
