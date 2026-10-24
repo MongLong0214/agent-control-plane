@@ -105,6 +105,13 @@ const DOOR_R1_TEST = "tests/unit/ceo-escalation-resolve-door-r1.test.ts";
 
 const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string; witnesses?: RollbackWitness[] }> = [
   {
+    label: "stageBootstrapPlan",
+    file: "bootstrap/bootstrap-plan-artifact.ts",
+    anchor: "  : Decision<{ digest: string; stagedBy: string }> => source.db.txDecision(() => {",
+    witnesses: [{ file: "tests/unit/bootstrap-plan-artifact.test.ts",
+      title: "rolls back staged artifact and audit when staging audit refuses" }],
+  },
+  {
     label: "attachBootstrapPlan",
     file: "bootstrap/bootstrap-plan-artifact.ts",
     anchor: "): Decision<{ digest: string }> => source.db.txDecision(() => {",

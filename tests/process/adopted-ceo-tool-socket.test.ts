@@ -1,3 +1,6 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { ToolListChangedNotificationSchema, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -41,7 +44,8 @@ import {
   snapshot,
   type AdoptedCeoFixture,
 } from "../helpers/adopted-ceo.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { callCtoTool } from "../helpers/cto-tool.ts";
+import { cleanupTempDirs, seedRun } from "../helpers/fixtures.ts";
 import { clearSessionMessagingEnv, inheritedSessionMessagingNames, SESSION_MESSAGING_PREFIX } from "../helpers/session-messaging-env.ts";
 
 /**
@@ -349,10 +353,13 @@ describe("the adopted CEO tool socket, through the relay", () => {
       } finally { r.stdin.end(); await settles(r.exit); }
     });
 
-  it("attaches a bootstrap PLAN through the adopted CEO socket and the owner reads and submits its exact digest", async () => {
+  it.each((["owner", "peer"] as const).flatMap(principal => [false, true].map(staged => ({ principal, staged }))))(
+    "attaches a bootstrap PLAN through the adopted CEO socket ($principal, staged=$staged) and the owner reads and submits its exact digest", async ({ principal, staged }) => {
     const { fixture, tools } = await started(true);
     const { h } = fixture;
     bootstrapCtoProvider(h.cp, h.clock);
+    const turn = { [HERMES_PROVENANCE_META_KEY]: { ...OWNER_TURN[HERMES_PROVENANCE_META_KEY], principal,
+      ...(principal === "peer" ? { peer_grant: DIGEST } : {}) } };
     const r = await initialized(tools.socketPath);
     try {
       const create = runCreate("plan-socket-create", OWNER_TURN);
@@ -370,14 +377,26 @@ describe("the adopted CEO tool socket, through the relay", () => {
       const attach = { name: "bootstrap_plan_attach", arguments: { idempotencyKey: "plan-socket-attach", runId,
         planBody: body, expectedSha256: digest, contractDigest: run.contractDigest,
         bootstrapOperationId: plan["bootstrapOperationId"], projectId: manifest.projectId,
-        repositoryIdentity: manifest.repositories[0]!.remote }, _meta: OWNER_TURN };
+        repositoryIdentity: manifest.repositories[0]!.remote }, _meta: turn };
+      if (staged) {
+        const primary = seedRun({ db: h.cp.db, clock: h.clock, repoPath: h.repoPath, claim: false });
+        const before = { run: h.cp.runs.require(runId), outbox: h.cp.outbox.listByRun(runId) };
+        expect(await callCtoTool(h, { sessionId: primary.sessionId, incarnation: h.cp.sessions.require(primary.sessionId).incarnation,
+          binding: { roleKey: primary.roleKey, bindingGeneration: primary.generation } },
+          "bootstrap_plan_stage", { ...attach.arguments, idempotencyKey: "plan-socket-stage" })).toMatchObject({ ok: true, value: { digest } });
+        expect({ run: h.cp.runs.require(runId), outbox: h.cp.outbox.listByRun(runId) }).toEqual(before);
+        (attach.arguments as Record<string, unknown>)["stagedBy"] = primary.roleKey;
+        delete (attach.arguments as Record<string, unknown>)["planBody"];
+      }
       expect((await r.request("tools/call", attach)).result?.structuredContent).toMatchObject({ ok: true, value: { digest } });
       expect((await r.request("tools/call", attach)).result?.structuredContent).toMatchObject({ ok: true, value: { digest } });
       expect((await callCtoToolAsOwner(h, runId, "bootstrap_plan_get", { runId })).body)
         .toMatchObject({ ok: true, value: { digest, planBody: body } });
       expect((await callCtoToolAsOwner(h, runId, "plan_submit", { idempotencyKey: "plan-socket-submit", runId, bootstrapPlanDigest: digest })).body)
         .toMatchObject({ ok: true, value: { digest } });
-      expect(h.cp.artifacts.list(runId, "HANDOFF")).toHaveLength(1);
+      expect(h.cp.artifacts.list(runId, "HANDOFF")).toHaveLength(staged ? 2 : 1);
+      expect(h.cp.audit.byKind("BOOTSTRAP_PLAN_ATTACHED")[0]?.evidence)
+        .toMatchObject({ hermesPrincipal: principal, ...(principal === "peer" ? { hermesPeerGrant: DIGEST } : {}) });
     } finally { r.stdin.end(); await settles(r.exit); }
   });
 
@@ -456,4 +475,63 @@ it("R1154-01: no relay here inherits a CLAUDE_CODE_MESSAGING_* variable, whateve
   expect(inheritedUnknown.startsWith(SESSION_MESSAGING_PREFIX)).toBe(true);
   // Neither this process's environment, which an in-process relay reads, nor a child that inherits it.
   expect(inheritedSessionMessagingNames()).toEqual({ here: [], child: [] });
+});
+
+
+describe("B4 adopted CEO tool rediscovery", () => {
+  it("sends one post-initialization notification per connection through the relay and refreshes an existing SDK client registry on reconnect", async () => {
+    const { tools } = await started(true);
+    let registry = ["run_create"];
+    const client = new Client({ name: "existing-hermes-tool-registry", version: "1" });
+    let refreshes = 0;
+    client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
+      registry = (await client.listTools()).tools.map(tool => tool.name);
+      refreshes += 1;
+    });
+    for (let connection = 0; connection < 2; connection += 1) {
+      const beforeRefreshes = refreshes;
+      const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+      const received: JSONRPCMessage[] = [];
+      let text = "";
+      let initialized: JSONRPCMessage | undefined;
+      let releaseInitialized = false;
+      const transport: Transport = {
+        start: async () => {},
+        send: async message => {
+          if ("method" in message && message.method === "notifications/initialized" && !releaseInitialized) {
+            initialized = message;
+            return;
+          }
+          stdin.write(JSON.stringify(message) + "\n");
+        },
+        close: async () => { stdin.end(); transport.onclose?.(); },
+      };
+      stdout.on("data", (chunk: Buffer) => {
+        text += chunk.toString("utf8");
+        for (let n = text.indexOf("\n"); n >= 0; n = text.indexOf("\n")) {
+          const message = JSON.parse(text.slice(0, n)) as JSONRPCMessage;
+          text = text.slice(n + 1);
+          received.push(message);
+          transport.onmessage?.(message);
+        }
+      });
+      const exit = runAdoptedCeoAttachRelay({ toolSocketPath: tools.socketPath }, { stdin, stdout, stderr });
+      try {
+        registry = registry.filter(name => name !== "bootstrap_plan_attach");
+        await client.connect(transport);
+        await client.ping();
+        expect(initialized).toBeDefined();
+        expect(received.filter(m => "method" in m && m.method === "notifications/tools/list_changed")).toHaveLength(0);
+        expect(registry).not.toContain("bootstrap_plan_attach");
+        releaseInitialized = true;
+        await transport.send(initialized!);
+        await vi.waitFor(() => expect(refreshes).toBe(beforeRefreshes + 1));
+        expect(registry).toContain("bootstrap_plan_attach");
+        await client.notification({ method: "notifications/initialized" });
+        await client.ping();
+        expect(received.filter(m => "method" in m && m.method === "notifications/tools/list_changed")).toHaveLength(1);
+        expect(refreshes).toBe(beforeRefreshes + 1);
+      } finally { await client.close(); expect(await settles(exit)).toBe(ATTACH_EXIT.OK); }
+    }
+  });
 });

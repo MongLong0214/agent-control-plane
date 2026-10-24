@@ -2166,10 +2166,10 @@ export class Outbox {
    * Run when the wake port is attached at startup. Delivery recovery otherwise follows work,
    * registration and transport-availability events. A row whose target no longer holds its role
    * generation is skipped; a wake to a former holder is the mistake `RoleConversationPort.wake` exists to refuse.
-   * Never throws; a wake that fails is audited by `#wakeInBand` and tried again only after the
-   * window, so an unreachable CTO costs one audit row per row per window, not a storm.
+   * A wake that fails is audited by `#wakeInBand`. Global calls respect the re-wake window;
+   * recovery may retry one exact run/owner immediately after restoring its credential.
    */
-  async wakeInBandPending(): Promise<void> {
+  async wakeInBandPending(owner?: HolderIdentity & { runId: string }): Promise<void> {
     if (!this.#inBandWake) return;
     const now = this.clock.nowIso();
     const rows = this.db.all<{ message_id: string; role_key: string }>(
@@ -2177,19 +2177,25 @@ export class Outbox {
         WHERE o.status = 'PENDING'
           AND ${inBandRow("o")}
           AND ${liveDeliveryTarget("o")}
+          ${owner ? `AND o.run_id = ? AND o.role_key = ? AND o.binding_generation = ? AND o.target_session_id = ?
+            AND ${exactHolderTarget("o")}` : ""}
         ORDER BY o.created_at, o.rowid`,
-      [],
+      owner ? [owner.runId, owner.roleKey, owner.bindingGeneration, owner.targetSessionId, owner.sessionIncarnation] : [],
     );
     // The memory follows the queue: a row that left PENDING is forgotten, so it cannot grow.
     const pending = new Set(rows.map((row) => row.message_id));
-    for (const messageId of [...this.#inBandWokenAt.keys()]) {
-      if (!pending.has(messageId)) this.#inBandWokenAt.delete(messageId);
+    if (!owner) {
+      for (const messageId of [...this.#inBandWokenAt.keys()]) {
+        if (!pending.has(messageId)) this.#inBandWokenAt.delete(messageId);
+      }
     }
     const nowMs = Date.parse(now);
     const due = rows
       .filter((row) => {
         const last = this.#inBandWokenAt.get(row.message_id);
-        return last === undefined || nowMs - last >= IN_BAND_REWAKE_MS;
+        // Recovery has just restored this exact owner's credential. Its earlier handover wake
+        // failed before adoption, so retry those rows immediately without changing other throttles.
+        return owner !== undefined || last === undefined || nowMs - last >= IN_BAND_REWAKE_MS;
       })
       .map((row) => ({ messageId: row.message_id, roleKey: row.role_key }));
     await this.#wakeInBand(due, "rewake");

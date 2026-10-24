@@ -5,12 +5,13 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { artifactDigestMatches, type ArtifactStore, type StoredArtifact } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { ArtifactKind, Role, roleKeyFor, RunKind, RunState, type RoleBinding, type RunRow } from "../domain/types.ts";
+import { ArtifactKind, Role, roleKeyFor, RunKind, RunState, SessionLifecycle, type RoleBinding, type RunRow } from "../domain/types.ts";
 import type { AuthenticatedMcpPeer } from "../mcp/shared.ts";
 import type { HermesAdmittedTurn } from "../mcp/hermes-provenance.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { RunEngine } from "../run/run-engine.ts";
+import type { SessionRegistry } from "../session/session-registry.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { BootstrapApplications } from "./bootstrap-applications.ts";
 import { bootstrapPlanInputSchema, type submittedTasksSchema } from "./plan-input-schema.ts";
@@ -26,10 +27,13 @@ interface PlanBinding {
   repositoryIdentity: string;
 }
 export interface BootstrapPlanAttachInput extends PlanBinding {
-  planBody: string;
+  planBody?: string;
   expectedSha256: string;
   replacesSha256?: string;
+  stagedBy?: string;
 }
+export type BootstrapPlanStageInput = Omit<BootstrapPlanAttachInput, "replacesSha256" | "planBody" | "stagedBy"> & { planBody: string; idempotencyKey?: string };
+
 interface PlanAttachment extends PlanBinding {
   schema: typeof BOOTSTRAP_PLAN_INPUT_SCHEMA;
   sha256: string;
@@ -111,6 +115,142 @@ const parseBody = (run: RunRow, body: string, expected: PlanBinding) => {
   return allow(ReasonCode.OK, parsed.data);
 };
 
+export const BOOTSTRAP_PLAN_CANDIDATE_SCHEMA = "acp.bootstrap-plan-candidate.v1";
+interface PlanCandidate extends PlanBinding {
+  schema: typeof BOOTSTRAP_PLAN_CANDIDATE_SCHEMA;
+  sha256: string;
+  bodyBase64: string;
+  stagedBy: string;
+}
+/** Both input subtypes share HANDOFF storage but are never activation handoff packages. */
+export const isBootstrapPlanInputArtifact = (content: unknown): boolean => isBootstrapPlanAttachment(content)
+  || (typeof content === "object" && content !== null && "schema" in content && content.schema === BOOTSTRAP_PLAN_CANDIDATE_SCHEMA);
+const candidatesOf = (source: Source, runId: string, stagedBy: string) => source.artifacts.list<PlanCandidate>(runId, ArtifactKind.HANDOFF)
+  .filter(a => a.content?.schema === BOOTSTRAP_PLAN_CANDIDATE_SCHEMA && a.content.stagedBy === stagedBy);
+const selectedStager = (stagedBy: string | undefined): Decision<string> => {
+  if (stagedBy !== undefined && /[\x00-\x1f\x7f]/.test(stagedBy)) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "bootstrap PLAN binding identifiers must not contain control characters", {
+      refusal: "BOOTSTRAP_PLAN_BINDING_INVALID",
+    });
+  }
+  if (!stagedBy?.startsWith("PRIMARY_CTO:") || stagedBy === "PRIMARY_CTO:") {
+    return deny(ReasonCode.INVALID_ARGUMENT, "digest-only attach requires stagedBy in PRIMARY_CTO:<projectId> format");
+  }
+  return allow(ReasonCode.OK, stagedBy);
+};
+const validIdentifiers = (input: PlanBinding): Decision<void> => Object.values(bindingOf(input)).some(value => /[\x00-\x1f\x7f]/.test(value))
+  ? deny(ReasonCode.INVALID_ARGUMENT, "bootstrap PLAN binding identifiers must not contain control characters", {
+    refusal: "BOOTSTRAP_PLAN_BINDING_INVALID",
+  }) : allow(ReasonCode.OK, undefined);
+const validateBody = (run: RunRow, body: string, input: PlanBinding & { expectedSha256: string }): Decision<Buffer> => {
+  const bytes = Buffer.from(body, "utf8");
+  if (bytes.length > BOOTSTRAP_PLAN_MAX_BYTES || bytes.toString("utf8") !== body) {
+    return deny(ReasonCode.INVALID_ARGUMENT, `PLAN input must be valid UTF-8 of at most ${BOOTSTRAP_PLAN_MAX_BYTES} bytes`);
+  }
+  if (sha256(bytes) !== input.expectedSha256) return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "PLAN input differs from expectedSha256");
+  const parsed = parseBody(run, body, input);
+  return parsed.allowed ? allow(ReasonCode.OK, bytes) : parsed;
+};
+const readCandidate = (source: Source, run: RunRow, input: PlanBinding & { expectedSha256: string; stagedBy?: string }): Decision<string> => {
+  // Always run-scoped. A digest is never a global artifact lookup capability.
+  const stager = selectedStager(input.stagedBy);
+  if (!stager.allowed) return stager;
+  const candidates = candidatesOf(source, run.runId, stager.value);
+  const candidate = candidates.find(a => a.content.sha256 === input.expectedSha256);
+  if (!candidate) return deny(ReasonCode.NOT_FOUND, "the named run/stager slot has no candidate with expectedSha256");
+  const body = Buffer.from(candidate.content.bodyBase64, "base64");
+  const receipt = source.audit.forRun(run.runId).some(e => e.kind === "BOOTSTRAP_PLAN_STAGED" && e.roleKey === stager.value
+    && e.evidence["digest"] === candidate.digest && e.evidence["payloadDigest"] === input.expectedSha256);
+  if (candidates.length !== 1 || candidate.superseded || !receipt || !artifactDigestMatches(candidate)
+      || body.toString("base64") !== candidate.content.bodyBase64 || sha256(body) !== input.expectedSha256
+      || !Buffer.from(body.toString("utf8"), "utf8").equals(body)) {
+    return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "staged PLAN candidate fails its receipt or exact-byte hash");
+  }
+  if (!sameBinding(candidate.content, input)) {
+    return deny(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "staged PLAN candidate differs from current run bindings");
+  }
+  const checked = validateBody(run, body.toString("utf8"), input);
+  return checked.allowed ? allow(ReasonCode.OK, body.toString("utf8")) : checked;
+};
+
+type StageSource = AttachSource & { sessions: Pick<SessionRegistry, "get"> };
+/**
+ * No provenance links a PRIMARY_CTO to a project-less bootstrap run. This is a non-authoritative
+ * upload into the authenticated stager's own immutable slot. Only CEO attach selects run input;
+ * neither the stager's generation nor the run's owner pin is part of the candidate's identity.
+ */
+export const bootstrapPlanStageAccess = (source: StageSource, peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput)
+  : Decision<{ run: RunRow; primary: RoleBinding; bytes: Buffer }> => {
+  const session = peer.sessionId ? source.sessions.get(peer.sessionId) : null;
+  if (!peer.sessionId || !peer.sessionIncarnation || session?.incarnation !== peer.sessionIncarnation || session.lifecycle !== SessionLifecycle.READY) {
+    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "staging requires a current PRIMARY_CTO session");
+  }
+  if (!peer.binding) {
+    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "staging requires an authenticated PRIMARY_CTO binding");
+  }
+  const primary = source.bindings.active(peer.binding.roleKey);
+  if (primary?.role !== Role.PRIMARY_CTO || !primary.projectId
+      || primary.roleKey !== roleKeyFor(Role.PRIMARY_CTO, { projectId: primary.projectId })
+      || primary.sessionId !== peer.sessionId || primary.sessionIncarnation !== peer.sessionIncarnation
+      || primary.bindingGeneration !== peer.binding.bindingGeneration) {
+    return deny(ReasonCode.BINDING_GENERATION_STALE, "staging requires the project's current PRIMARY_CTO binding");
+  }
+  const stager = selectedStager(primary.roleKey);
+  if (!stager.allowed) return stager;
+  const identifiers = validIdentifiers(input);
+  if (!identifiers.allowed) return identifiers;
+  if (input.idempotencyKey !== undefined && /[\x00-\x1f\x7f]/.test(input.idempotencyKey)) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "bootstrap PLAN binding identifiers must not contain control characters", {
+      refusal: "BOOTSTRAP_PLAN_BINDING_INVALID",
+    });
+  }
+  const digests = validateBootstrapPlanDigests({ contractDigest: input.contractDigest, expectedSha256: input.expectedSha256 });
+  if (!digests.allowed) return digests;
+  const current = currentRun(source, input.runId);
+  if (!current.allowed) return current;
+  const run = current.value;
+  if (run.projectId !== null || !run.ownerSessionId || run.ownerRoleKey !== roleKeyFor(Role.BOOTSTRAP_CTO, { runId: run.runId })) {
+    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "staging requires a project-less bootstrap run with its current run-scoped owner");
+  }
+  const checked = validateBody(run, input.planBody, input);
+  if (!checked.allowed) return checked;
+  const candidates = candidatesOf(source, run.runId, primary.roleKey);
+  if (candidates.length || source.audit.forRun(run.runId).some(e => e.kind === "BOOTSTRAP_PLAN_STAGED" && e.roleKey === primary.roleKey)) {
+    if (!candidates.length) return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "recorded staged PLAN candidate is missing or damaged");
+    if (candidates[0]!.content.sha256 !== input.expectedSha256) return deny(ReasonCode.CONFLICT, "this stager already has a different immutable candidate for this run");
+    const prior = readCandidate(source, run, { ...input, stagedBy: primary.roleKey });
+    if (!prior.allowed) return prior;
+    if (prior.value !== input.planBody) return deny(ReasonCode.CONFLICT, "staged PLAN candidate bytes differ");
+  }
+  if (!candidates.length) {
+    const frozen = source.bootstrapApplications.assertNotFrozen(run.runId, "plan_submit");
+    if (!frozen.allowed) return frozen;
+    if (![RunState.ACTIVE, RunState.BLOCKED].some(state => state === run.state) || source.artifacts.latest(run.runId, ArtifactKind.PLAN)) {
+      return deny(ReasonCode.CONFLICT, "this run no longer accepts initial PLAN staging");
+    }
+  }
+  return allow(ReasonCode.OK, { run, primary, bytes: checked.value });
+};
+
+export const stageBootstrapPlan = (source: StageSource, peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput)
+  : Decision<{ digest: string; stagedBy: string }> => source.db.txDecision(() => {
+  const checked = bootstrapPlanStageAccess(source, peer, input);
+  if (!checked.allowed) return checked;
+  const { run, primary, bytes } = checked.value;
+  if (candidatesOf(source, input.runId, primary.roleKey).length) return allow(ReasonCode.OK, { digest: input.expectedSha256, stagedBy: primary.roleKey });
+  const artifact = source.artifacts.put(run.runId, ArtifactKind.HANDOFF, {
+    schema: BOOTSTRAP_PLAN_CANDIDATE_SCHEMA, ...bindingOf(input), sha256: input.expectedSha256,
+    bodyBase64: bytes.toString("base64"), stagedBy: primary.roleKey,
+  });
+  const audit = source.audit.record({ kind: "BOOTSTRAP_PLAN_STAGED", runId: run.runId, sessionId: peer.sessionId,
+    roleKey: primary.roleKey, evidence: { digest: artifact.digest, payloadDigest: input.expectedSha256,
+      contractDigest: input.contractDigest, operationId: input.bootstrapOperationId, projectId: input.projectId,
+      repositoryIdentity: input.repositoryIdentity, byteLength: bytes.length, bindingGeneration: primary.bindingGeneration,
+      stagedBy: primary.roleKey } });
+  if (!audit.allowed) return audit;
+  return allow(ReasonCode.OK, { digest: input.expectedSha256, stagedBy: primary.roleKey });
+});
+
 /** Decoding never reserializes JSON: read returns the very UTF-8 bytes attach hashed. */
 export const readBootstrapPlanAttachment = (source: Source, runId: string): Decision<{ digest: string; planBody: string }> => {
   const run = currentRun(source, runId);
@@ -136,6 +276,12 @@ export const bootstrapPlanAttachAccess = (source: AttachSource, input: Bootstrap
   if (!run.allowed) return run;
   const frozen = source.bootstrapApplications.assertNotFrozen(input.runId, "plan_submit");
   if (!frozen.allowed) return frozen;
+  if (input.planBody === undefined) {
+    const identifiers = validIdentifiers(input);
+    if (!identifiers.allowed) return identifiers;
+    const staged = readCandidate(source, run.value, input);
+    if (!staged.allowed) return staged;
+  }
   const prior = attachmentOf(source, input.runId);
   if (!prior && hasAttachmentReceipt(source, input.runId)) return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "recorded bootstrap input is missing or damaged");
   if (prior) {
@@ -163,8 +309,8 @@ export const bootstrapPlanAttachAuthority = (
 ): Decision<{ ceo: RoleBinding; turn: HermesAdmittedTurn }> => {
   const ceo = source.bindings.active(roleKeyFor(Role.CEO));
   if (!peer.sessionId || !peer.sessionIncarnation || !ceo || ceo.sessionId !== peer.sessionId
-      || ceo.sessionIncarnation !== peer.sessionIncarnation || turn?.principal !== "owner") {
-    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "attaching input requires the current CEO's authenticated Hermes owner turn");
+      || ceo.sessionIncarnation !== peer.sessionIncarnation || (turn?.principal !== "owner" && turn?.principal !== "peer")) {
+    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "attaching input requires the current CEO's authenticated Hermes owner or peer turn");
   }
   return allow(ReasonCode.OK, { ceo, turn });
 };
@@ -177,24 +323,19 @@ export const attachBootstrapPlan = (
   const { ceo, turn: ownerTurn } = identity.value;
   // Canonical artifact JSON normalizes CR/CRLF. Identifiers must survive storage unchanged;
   // use ACP's C0/DEL exclusion for identifiers, without restricting the exact-bytes body.
-  if (Object.values(bindingOf(input)).some(value => /[\x00-\x1f\x7f]/.test(value))) {
-    return deny(ReasonCode.INVALID_ARGUMENT, "bootstrap PLAN binding identifiers must not contain control characters", {
-      refusal: "BOOTSTRAP_PLAN_BINDING_INVALID",
-    });
-  }
+  const identifiers = validIdentifiers(input);
+  if (!identifiers.allowed) return identifiers;
   const digests = validateBootstrapPlanDigests({ contractDigest: input.contractDigest,
     expectedSha256: input.expectedSha256, replacesSha256: input.replacesSha256 });
   if (!digests.allowed) return digests;
   const admitted = assertBootstrapPlanAttachable(source, input);
   if (!admitted.allowed) return admitted;
   const run = admitted.value;
-  const bytes = Buffer.from(input.planBody, "utf8");
-  if (bytes.length > BOOTSTRAP_PLAN_MAX_BYTES || bytes.toString("utf8") !== input.planBody) {
-    return deny(ReasonCode.INVALID_ARGUMENT, `PLAN input must be valid UTF-8 of at most ${BOOTSTRAP_PLAN_MAX_BYTES} bytes`);
-  }
-  if (sha256(bytes) !== input.expectedSha256) return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "PLAN input differs from expectedSha256");
-  const parsed = parseBody(run, input.planBody, input);
-  if (!parsed.allowed) return parsed;
+  const body = input.planBody === undefined ? readCandidate(source, run, input) : allow(ReasonCode.OK, input.planBody);
+  if (!body.allowed) return body;
+  const checked = validateBody(run, body.value, input);
+  if (!checked.allowed) return checked;
+  const bytes = checked.value;
   const prior = attachmentOf(source, run.runId);
   if (prior?.content.sha256 === input.expectedSha256) {
     if (!bytes.equals(Buffer.from(prior.content.bodyBase64, "base64"))) return deny(ReasonCode.CONFLICT, "attachment bytes differ");
@@ -232,7 +373,8 @@ export const attachBootstrapPlan = (
     roleKey: ceo.roleKey, evidence: { digest: artifact.digest, payloadDigest: input.expectedSha256,
       contractDigest: input.contractDigest, operationId: input.bootstrapOperationId, projectId: input.projectId,
       repositoryIdentity: input.repositoryIdentity, replacesSha256: input.replacesSha256 ?? null,
-      byteLength: bytes.length, bindingGeneration: ceo.bindingGeneration, hermesPrincipal: ownerTurn.principal } });
+      byteLength: bytes.length, bindingGeneration: ceo.bindingGeneration, hermesPrincipal: ownerTurn.principal,
+      ...(ownerTurn.principal === "peer" ? { hermesPeerGrant: ownerTurn.peerGrant } : {}) } });
   return audit.allowed ? allow(ReasonCode.OK, { digest: input.expectedSha256 }) : audit;
 });
 

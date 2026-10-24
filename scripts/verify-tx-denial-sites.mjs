@@ -144,6 +144,7 @@ const DENY_PATTERN =
  * owning same-file definition; `label` is the stable operator-facing identity printed below.
  */
 const EXPECTED_CONVERTED_SITES = [
+  { file: "bootstrap/bootstrap-plan-artifact.ts", symbol: "stageBootstrapPlan", label: "stageBootstrapPlan", evidence: "direct" },
   // Input storage, replacement invalidation and notification must roll back if enqueue/audit denies.
   { file: "bootstrap/bootstrap-plan-artifact.ts", symbol: "attachBootstrapPlan", label: "attachBootstrapPlan", evidence: "direct" },
   { file: "verify/verification-engine.ts", symbol: "pinRunScopedCommands", label: "VerificationEngine.pinRunScopedCommands", evidence: "direct" },

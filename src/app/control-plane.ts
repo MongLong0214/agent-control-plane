@@ -721,6 +721,7 @@ export class ControlPlane {
           sessions: this.sessions,
           bindings: this.bindings,
           runs: this.runs,
+          outbox: this.outbox,
         },
       });
       // An ESCALATION_REPLY is held for an owner's renewal only while this recovery can still renew it.

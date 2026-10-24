@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { submittedPlanSchema, submittedTasksSchema } from "../bootstrap/plan-input-schema.ts";
-import { readBootstrapPlanAttachment, resolveBootstrapPlanInput, bootstrapInputMutationAuthority, validateBootstrapPlanDigests } from "../bootstrap/bootstrap-plan-artifact.ts";
+import { readBootstrapPlanAttachment, resolveBootstrapPlanInput, bootstrapInputMutationAuthority, validateBootstrapPlanDigests, bootstrapPlanStageAccess, stageBootstrapPlan, type BootstrapPlanStageInput } from "../bootstrap/bootstrap-plan-artifact.ts";
 import type { BootstrapActivation, BootstrapHandoffReceipt } from "../bootstrap/activation.ts";
 import type { BootstrapApplications } from "../bootstrap/bootstrap-applications.ts";
 import { bootstrapPlanGuide, isProjectlessBootstrap, planForSubmission } from "../bootstrap/bootstrap-plan.ts";
@@ -206,6 +206,12 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
       return run.kind === RunKind.STANDARD_WORK && !plan ? { ...contract, tasks: standardWorkTasks(source, runId) } : contract;
     },
     bootstrapInputMutationAuthority: (runId: string, result: boolean) => bootstrapInputMutationAuthority(source, runId, result),
+    bootstrapPlanStageAuthority: (peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput) => {
+      const checked = bootstrapPlanStageAccess(source, peer, input);
+      return checked.allowed ? allow(ReasonCode.OK, { roleKey: checked.value.primary.roleKey,
+        bindingGeneration: checked.value.primary.bindingGeneration }) : checked;
+    },
+    stageBootstrapPlan: (peer: AuthenticatedMcpPeer, input: BootstrapPlanStageInput) => stageBootstrapPlan(source, peer, input),
     bootstrapPlanForRun: (runId: string) => readBootstrapPlanAttachment(source, runId),
     resolvePlanInput: (runId: string, input: { bootstrapPlanDigest?: string; plan?: Record<string, unknown>; tasks?: z.infer<typeof submittedTasksSchema> }) =>
       resolveBootstrapPlanInput(source, runId, input),
@@ -544,6 +550,16 @@ const createCtoServerFromPort = (
       const fenced = owner(peer, args.runId);
       return fenced.allowed ? ok(port.contractForRun(args.runId)) : respond(fenced);
     }),
+  );
+  server.registerTool(
+    "bootstrap_plan_stage",
+    {
+      description: "Non-authoritative upload of bounded exact UTF-8 PLAN input for a project-less bootstrap run. The server derives stagedBy from the current PRIMARY_CTO roleKey; each stager has its own immutable slot per run. No run authority, approval, delivery, wake or submission. Returns digest and stagedBy for explicit CEO selection at attach.",
+      inputSchema: { ...mutation, ...runIdentity, planBody: z.string(), expectedSha256: z.string(),
+        contractDigest: z.string(), bootstrapOperationId: z.string().min(1), projectId: z.string().min(1), repositoryIdentity: z.string().min(1) },
+    },
+    async args => write("bootstrap_plan_stage", args, peer => respond(port.stageBootstrapPlan(peer, args)),
+      peer => port.bootstrapPlanStageAuthority(peer, args)),
   );
   server.registerTool(
     "bootstrap_plan_get",
